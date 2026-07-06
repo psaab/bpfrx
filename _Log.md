@@ -36153,3 +36153,42 @@ top.
 - **File(s)**: pkg/config/compiler.go,
   pkg/config/compiler_flat_reth_nodeid_4329_test.go,
   docs/ha-cluster-test-plan.md, _Log.md
+
+## 2026-07-06 — #4329 fold: relocate NodeID stamp before fabric derivation
+
+- **Timestamp**: 2026-07-06
+- **Action**: Copilot review of PR #4331 found a REAL incompleteness in the
+  first stamp placement. The stamp ran in `compileConfigForNodeWithOpts` AFTER
+  `compileExpanded` returned, but `compileExpanded` ALREADY derives two
+  NodeID-dependent COMPILE-TIME fabric fields under the stale default NodeID=0
+  (compiler.go fabric fixup, `SlotToNodeID(member) == cc.NodeID`):
+  `InterfaceConfig.LocalFabricMember` (which fab member is local to this node)
+  and the auto-detected `Cluster.FabricInterface` / `Fabric1Interface`. So the
+  first fix corrected reth resolution (RethToPhysical reads NodeID at runtime,
+  after the stamp) but left the fabric fields WRONG on node 1 for a leaf-less
+  flat config — the same class of bug, still present for fabric. Fix: thread
+  the node identity into `compileExpanded` via two new `compileOpts` fields
+  (`nodeAware bool`, `stampNodeID int`), set only by the node-aware entry
+  `compileConfigForNodeWithOpts`, and MOVE the stamp INSIDE `compileExpanded`
+  to run immediately after the top-level child loop (Cluster + interfaces
+  populated) and BEFORE every NodeID-dependent derivation: the fabric fixup
+  AND `validateDeviceMapStrict` (compiler.go, called later, also reads
+  cc.NodeID). Same three guards preserved:
+  `opts.nodeAware && opts.stampNodeID >= 0 && Cluster != nil && !NodeIDSet`
+  (standalone `CompileConfig` leaves nodeAware false → unchanged; never
+  fabricate Cluster → daemon.go EMPTY-config haMode reasoning holds; explicit
+  `chassis cluster node` leaf wins → GROUPS form bit-identical). RethToPhysical
+  and its alphabetical tiebreak are still unchanged (stamp now sets NodeID
+  during compile, so the runtime read still sees the correct value). Added
+  fabric regression test (canonical vSRX fab0=FPC-0 member / fab1=FPC-7 member,
+  NO node leaf): node 0 → fab0.LocalFabricMember=ge-0/0/1 + FabricInterface
+  fab0; node 1 → fab1.LocalFabricMember=ge-7/0/1 + FabricInterface fab1. RED on
+  revert PROVEN for BOTH reth (node 1 → ge-0/0/0) and fabric (node 1 fab1
+  LocalFabricMember empty, FabricInterface picks fab0); the reth/fabric GROUPS
+  forms + explicit-leaf + standalone tests correctly stay GREEN on revert (not
+  falsely coupled). GROUPS form confirmed unaffected (loss cluster carries an
+  explicit `node` leaf per group → NodeIDSet true → stamp skipped → no
+  test-failover impact). Full `go test ./pkg/config/...` +
+  `./pkg/configstore/...` green, gofmt, go vet, `go build ./...` clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go, _Log.md

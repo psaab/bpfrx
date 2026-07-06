@@ -137,6 +137,102 @@ func TestFlatRethGroupsFormUnaffected_4329(t *testing.T) {
 	}
 }
 
+// TestFlatFabricResolvesLocalMemberPerNode_4329 is the fabric sibling of the
+// reth regression: the same NodeID-default bug hits the COMPILE-TIME fabric
+// derivation (LocalFabricMember + FabricInterface auto-detect), which reads
+// cc.NodeID inside compileExpanded. The stamp is relocated to run BEFORE that
+// derivation, so a leaf-less flat config resolves fab0/fab1 to the LOCAL
+// node's member on each node. RED on revert: node 1 resolves fab0 →
+// ge-0/0/1 and FabricInterface "fab0" (the node-0 member), same class of bug.
+func TestFlatFabricResolvesLocalMemberPerNode_4329(t *testing.T) {
+	// Canonical vSRX fabric form: fab0 carries the node-0 member (FPC 0),
+	// fab1 carries the node-1 member (FPC 7); NO `chassis cluster node` leaf.
+	flatFabric := []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster reth-count 2",
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/1",
+		"set interfaces fab0 unit 0 family inet address 10.99.1.1/30",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/1",
+		"set interfaces fab1 unit 0 family inet address 10.99.2.1/30",
+	}
+	tree := buildTree(t, flatFabric)
+
+	// Node 0: fab0's FPC-0 member is local; fab1's FPC-7 member is remote.
+	cfg0, err := CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode(node 0): %v", err)
+	}
+	if got := cfg0.Interfaces.Interfaces["fab0"].LocalFabricMember; got != "ge-0/0/1" {
+		t.Fatalf("node 0: fab0 LocalFabricMember = %q, want ge-0/0/1", got)
+	}
+	if got := cfg0.Interfaces.Interfaces["fab1"].LocalFabricMember; got != "" {
+		t.Fatalf("node 0: fab1 LocalFabricMember = %q, want empty (remote)", got)
+	}
+	if got := cfg0.Chassis.Cluster.FabricInterface; got != "fab0" {
+		t.Fatalf("node 0: FabricInterface = %q, want fab0", got)
+	}
+
+	// Node 1: fab1's FPC-7 member is local; fab0's FPC-0 member is remote.
+	// This is the load-bearing assertion — the compile-time fabric fields
+	// must follow the runtime node identity, not the NodeID=0 default.
+	cfg1, err := CompileConfigForNode(tree, 1)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode(node 1): %v", err)
+	}
+	if got := cfg1.Interfaces.Interfaces["fab1"].LocalFabricMember; got != "ge-7/0/1" {
+		t.Fatalf("node 1: fab1 LocalFabricMember = %q, want ge-7/0/1 (RED-on-revert: pre-fix empty)", got)
+	}
+	if got := cfg1.Interfaces.Interfaces["fab0"].LocalFabricMember; got != "" {
+		t.Fatalf("node 1: fab0 LocalFabricMember = %q, want empty (RED-on-revert: pre-fix binds ge-0/0/1)", got)
+	}
+	if got := cfg1.Chassis.Cluster.FabricInterface; got != "fab1" {
+		t.Fatalf("node 1: FabricInterface = %q, want fab1 (RED-on-revert: pre-fix picks fab0)", got)
+	}
+
+	// ResolveFab (the runtime resolver) must follow the corrected map.
+	if got := cfg1.ResolveFab("fab1"); got != "ge-7/0/1" {
+		t.Fatalf("node 1: ResolveFab(fab1) = %q, want ge-7/0/1", got)
+	}
+}
+
+// TestFlatFabricGroupsFormUnaffected_4329 confirms the GROUPS fabric form (an
+// explicit `node` leaf per group) is bit-identical under the fix: NodeIDSet is
+// true so the stamp is skipped, and each node's expanded config still resolves
+// its own fabric member.
+func TestFlatFabricGroupsFormUnaffected_4329(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set groups node0 chassis cluster node 0",
+		"set groups node1 chassis cluster node 1",
+		`set apply-groups "${node}"`,
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster reth-count 2",
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/1",
+		"set interfaces fab1 fabric-options member-interfaces ge-7/0/1",
+	})
+
+	cfg0, err := CompileConfigForNode(tree, 0)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode(node 0, groups): %v", err)
+	}
+	if !cfg0.Chassis.Cluster.NodeIDSet {
+		t.Error("node 0 groups: NodeIDSet must stay true (explicit leaf)")
+	}
+	if got := cfg0.Interfaces.Interfaces["fab0"].LocalFabricMember; got != "ge-0/0/1" {
+		t.Fatalf("node 0 groups: fab0 LocalFabricMember = %q, want ge-0/0/1", got)
+	}
+
+	cfg1, err := CompileConfigForNode(tree, 1)
+	if err != nil {
+		t.Fatalf("CompileConfigForNode(node 1, groups): %v", err)
+	}
+	if !cfg1.Chassis.Cluster.NodeIDSet {
+		t.Error("node 1 groups: NodeIDSet must stay true (explicit leaf)")
+	}
+	if got := cfg1.Interfaces.Interfaces["fab1"].LocalFabricMember; got != "ge-7/0/1" {
+		t.Fatalf("node 1 groups: fab1 LocalFabricMember = %q, want ge-7/0/1", got)
+	}
+}
+
 // TestFlatRethStandaloneCompileUnchanged_4329 pins that the standalone
 // (non-cluster) compile path is untouched: CompileConfig (nodeID == -1)
 // routes through compileConfigWithOpts, never the node-aware stamp, so a
