@@ -36113,3 +36113,43 @@ top.
 - **File(s)**: pkg/config/compiler_validate_vrf_overlap.go,
   pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+
+## 2026-07-06 — #4329 flat vSRX reth mis-resolves node identity on secondary
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix #4329 — a canonical vSRX chassis-cluster config (both
+  `ge-0/0/0` and `ge-7/0/0` carrying `redundant-parent reth0`, NO groups, NO
+  `chassis cluster node` leaf) silently mis-bound EVERY reth to the node-0
+  physical member on node 1 (wrong VIP placement, wrong HA-group interfaces).
+  Root cause: `Config.RethToPhysical()` scores members by
+  `SlotToNodeID(name) == Cluster.NodeID`, but `Cluster.NodeID` is populated
+  ONLY from the config leaf `chassis cluster node <id>` (guarded NodeIDSet).
+  The leaf-less flat vSRX form left `Cluster.NodeID` at its `0` default on BOTH
+  nodes, and `CompileConfigForNode(tree, nodeID)` used `nodeID` only for the
+  `${node}` group-expansion var, never the compiled cluster identity — so on
+  node 1 both members scored by the node-0 fallback and the alphabetical
+  tiebreak picked `ge-0/0/0` on both nodes. Fix: in
+  `compileConfigForNodeWithOpts` (pkg/config/compiler.go), after
+  `compileExpanded`, STAMP `cfg.Chassis.Cluster.NodeID = nodeID` guarded by
+  `nodeID >= 0 && cfg.Chassis.Cluster != nil && !cfg.Chassis.Cluster.NodeIDSet`.
+  Guard rationale: (1) `nodeID >= 0` — standalone compile routes through
+  `CompileConfig` (nodeID -1) and never reaches this path, so single-node
+  resolution is unchanged; (2) `Cluster != nil` — never fabricate a cluster
+  stanza, so a config-less HA node (node-id present, empty config — the
+  EMPTY-config takeover in pkg/daemon/daemon.go) keeps `Cluster == nil` and the
+  daemon's `haMode` / ~30 `Cluster != nil` gates do not flip on an empty
+  config (a real reth config always carries a `chassis cluster` stanza, so this
+  never suppresses a genuine fix); (3) `!NodeIDSet` — an explicit `chassis
+  cluster node <id>` leaf is the operator SSOT and must win, so the GROUPS form
+  (loss cluster: `groups node0/node1` each carry an explicit `node` leaf) is
+  bit-identical and `test-failover` is unaffected. RethToPhysical's alphabetical
+  tiebreak is left as-is: with the stamp the local member scores strictly higher
+  (2 vs 0), so the tiebreak is never reached for the 2-member case and never
+  decides between two nodes' members. RED-on-revert proven: reverting the stamp
+  makes node-1 bind `ge-0/0/0` (the exact bug); the explicit-leaf / groups /
+  standalone tests correctly stay GREEN on revert (not falsely coupled). Full
+  `go test ./pkg/config/...` + `./pkg/configstore/...` green, gofmt, go vet,
+  `go build ./...` all clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go,
+  docs/ha-cluster-test-plan.md, _Log.md

@@ -1852,6 +1852,41 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	if err != nil {
 		return nil, err
 	}
+
+	// #4329: stamp the compiled cluster node identity from the runtime
+	// node-id (/etc/xpf/node-id, or the `-node-id` flag on `xpfd
+	// check-config`) when the config carries a chassis-cluster stanza but
+	// no explicit `chassis cluster node` leaf. A canonical vSRX
+	// chassis-cluster config encodes node ownership in the FPC slot
+	// (ge-0/0/N=node0, ge-7/0/N=node1) and runs the SAME flat config on both
+	// nodes with no `node` leaf. Without this stamp, Cluster.NodeID sits at
+	// its zero default on BOTH nodes, so RethToPhysical scores every reth
+	// member as node 0 and binds every reth to the node-0 physical member on
+	// node 1 — reth breaks on the secondary (wrong VIP placement, wrong
+	// HA-group interfaces). Stamping makes the compiled identity reflect the
+	// node the config is compiled FOR, so RethToPhysical scores the local
+	// member correctly on both nodes and the flat vSRX form is a drop-in.
+	//
+	// Guards (all three are load-bearing):
+	//   - nodeID >= 0: cluster mode only. A standalone compile passes
+	//     nodeID == -1 through CompileConfig and never reaches this path, so
+	//     single-node resolution is unchanged.
+	//   - Cluster != nil: never fabricate a cluster stanza. A config-less HA
+	//     node (node-id present but empty/no-cluster config — the
+	//     EMPTY-config takeover in pkg/daemon/daemon.go) must keep
+	//     Cluster == nil so the daemon's `haMode` / `Cluster != nil` gates do
+	//     not flip on a config that has no cluster. A real reth config always
+	//     carries a `chassis cluster` stanza (redundant-parent is only
+	//     meaningful under cluster), so this never suppresses a genuine fix.
+	//   - !NodeIDSet: an explicit `chassis cluster node <id>` leaf is the
+	//     operator's SSOT and must win — never clobber it. crossCheckNodeID
+	//     (pkg/configstore) already rejects a leaf that disagrees with the
+	//     runtime node-id, and the GROUPS form (groups node0/node1 each carry
+	//     an explicit `node` leaf) is left bit-identical.
+	if nodeID >= 0 && cfg.Chassis.Cluster != nil && !cfg.Chassis.Cluster.NodeIDSet {
+		cfg.Chassis.Cluster.NodeID = nodeID
+	}
+
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
