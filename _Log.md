@@ -1,3 +1,37 @@
+## 2026-07-06 — #4070 follow-up: exclude token-packed multi-leaves from the union
+
+- **Timestamp**: 2026-07-06
+- **Action**: Hostile review of PR #4367 found a real over-inclusion edge: the
+  `multi:true && children==nil` union discriminator also matched token-packed
+  and multi-token multi-leaves, whose token-level union corrupts them. Two
+  classes: (1) `args>=2` multi leaves (route-filter `<prefix> <match-type>`,
+  address-book `address <name> <prefix>`, `as-path <name> <regex>`, CoS `queue`)
+  mash member tokens into one leaf; (2) `args<=1` leaves that pack a
+  separator/operation keyword — firewall/NAT `destination-port`/`source-port`
+  ranges (`3000 to 4000` packs `to`; merging two ranges → `3000 to 4000 1000
+  2000`, a fail-OPEN discard matcher), policy-options `then community
+  add|set|delete|none` (operation keyword), `then as-path-prepend` (order +
+  repetition sensitive action). Fixed with a schema-context-precise exclusion:
+  added `schemaNode.groupReplace` (opts a specific multi leaf out of union),
+  set it on the 6 args<=1 token-packed leaves (port leaves in schema_cos +
+  schema_security, then community + then as-path-prepend in schema_routing),
+  tightened `isLeafListSchema` to `multi && children==nil && args<=1 &&
+  !groupReplace` (the args<=1 gate excludes the args>=2 class structurally, no
+  per-leaf flag), and added `leafListUnionEligible` + `leafListCarriesRange` (a
+  `to`-separator runtime net as belt-and-braces for any range leaf not flagged).
+  The `from community` MATCH leaf-list still unions — the flag lives on the
+  `then community` node, so the from/then keyword collision is resolved by
+  schema CONTEXT not keyword. New `apply_groups_leaflist_exclude_test.go`:
+  port-range override, then community / then as-path-prepend override, args>=2
+  address no-token-merge, and firewall `from protocol` STILL unions
+  (narrow-exclusion proof). RED-on-revert verified (neutralize the gate → all
+  four exclusion tests fail with the exact corrupted merges). go test
+  ./pkg/config green, go build ./... green, gofmt + go vet clean.
+- **File(s)**: pkg/config/schema.go, pkg/config/schema_cos.go,
+  pkg/config/schema_routing.go, pkg/config/schema_security.go,
+  pkg/config/ast_groups.go, pkg/config/apply_groups_leaflist_exclude_test.go,
+  docs/config-schema.md, _Log.md
+
 ## 2026-07-06 — #4070: apply-groups UNIONs leaf-lists (schema-aware), OVERRIDEs scalars
 
 - **Timestamp**: 2026-07-06

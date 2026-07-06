@@ -249,9 +249,11 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 			}
 			if peer := leafListPeer(*dst, key); peer != nil {
 				// A same-key node already exists inline. UNION when the
-				// statement is a leaf-list; otherwise OVERRIDE (skip the
-				// group value — inline wins).
-				if isLeafListSchema(ancestorPath, key) {
+				// statement is a pure value-list leaf-list; otherwise OVERRIDE
+				// (skip the group value — inline wins). Scalars, args>=2
+				// multi-token leaves, groupReplace token-packed leaves, and
+				// range-bearing leaves all take the override path.
+				if leafListUnionEligible(ancestorPath, key, peer, s) {
 					mergeLeafListInto(peer, s)
 				}
 				continue
@@ -280,7 +282,12 @@ func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 		// containers (["family","inet"]) are never leaf-lists.
 		if len(s.Keys) == 1 && isLeafListSchema(ancestorPath, s.Keys[0]) {
 			if peer := leafListPeer(*dst, s.Keys[0]); peer != nil {
-				mergeLeafListInto(peer, s)
+				if leafListUnionEligible(ancestorPath, s.Keys[0], peer, s) {
+					mergeLeafListInto(peer, s)
+				}
+				// else OVERRIDE: a range-bearing inline peer wins, group block
+				// dropped (a groupReplace leaf never reaches here — its
+				// isLeafListSchema is false, so it takes the container path).
 			} else {
 				*dst = append(*dst, s)
 			}
@@ -371,16 +378,28 @@ func mergeLeafListInto(dst, src *Node) {
 }
 
 // isLeafListSchema reports whether the leaf keyword key, resolved under the
-// schema context ancestorPath, is a Junos leaf-list: a multi-value leaf that
-// models no sub-structure (setSchema `multi:true && children==nil`). Such a
-// statement UNIONs its members under apply-groups inheritance (#4070); a
-// scalar leaf overrides. Returns false when the path or keyword is not modeled
-// in setSchema, so an unmodeled leaf safely keeps the legacy override behavior.
+// schema context ancestorPath, is a PURE single-token Junos leaf-list whose
+// group + inline members UNION under apply-groups inheritance (#4070): a
+// multi-value leaf that models no sub-structure, carries exactly one value
+// token per member, and is not opted out. A scalar leaf, an args>=2 multi leaf
+// (multi-token members), or a groupReplace leaf overrides instead. Returns
+// false when the path or keyword is not modeled in setSchema, so an unmodeled
+// leaf safely keeps the legacy override behavior.
 //
-// The multi:true discriminator already exists (169 leaf-list entries in
-// setSchema), and children==nil excludes multi nodes that carry modifier
-// sub-structure (CoS named containers, static `next-hop [ a b ] { interface
-// x; }`) which are not plain leaf-lists.
+// The gate is `multi:true && children==nil && args<=1 && !groupReplace`:
+//   - multi + children==nil: the leaf-list discriminator (children==nil
+//     excludes multi nodes carrying modifier sub-structure — CoS named
+//     containers, static `next-hop [ a b ] { interface x; }`).
+//   - args<=1: each member is a SINGLE token (application, source-address,
+//     protocol, name-server, from community/as-path, export chains). An
+//     args>=2 multi leaf packs multiple tokens per member (route-filter
+//     `<prefix> <match-type>`, address-book `address <name> <prefix>`,
+//     as-path `<name> <regex>`, CoS `queue <n> <class>`); token-level union
+//     would mash the member tokens together, so it OVERRIDEs instead.
+//   - !groupReplace: a token-packed args<=1 leaf that packs a SEPARATOR or
+//     OPERATION keyword (port range `3000 to 4000`, `then community
+//     add|set|delete|none`, `then as-path-prepend`) is explicitly opted out
+//     (see the schemaNode.groupReplace doc) — union/dedup would corrupt it.
 func isLeafListSchema(ancestorPath [][]string, key string) bool {
 	schema := setSchema
 	for _, pk := range ancestorPath {
@@ -401,7 +420,36 @@ func isLeafListSchema(ancestorPath [][]string, key string) bool {
 		return false
 	}
 	leaf := resolveSchemaChild(schema, key)
-	return leaf != nil && leaf.multi && leaf.children == nil
+	return leaf != nil && leaf.multi && leaf.children == nil &&
+		leaf.args <= 1 && !leaf.groupReplace
+}
+
+// leafListUnionEligible reports whether a group leaf-list node src should UNION
+// into an existing inline node dst (both share Keys[0]==key at schema context
+// ancestorPath), versus fall back to apply-groups OVERRIDE. Union requires the
+// schema to classify key as a pure single-token value-list (isLeafListSchema)
+// AND neither side to carry a range separator. A range like `3000 to 4000`
+// packs the `to` separator onto the value list, so token-level union/dedup
+// would corrupt it (a discard/reject port term would fail OPEN). The range
+// check is a defensive net for any range-bearing leaf not explicitly marked
+// groupReplace; the known port leaves already set the flag.
+func leafListUnionEligible(ancestorPath [][]string, key string, dst, src *Node) bool {
+	if !isLeafListSchema(ancestorPath, key) {
+		return false
+	}
+	return !leafListCarriesRange(dst) && !leafListCarriesRange(src)
+}
+
+// leafListCarriesRange reports whether a leaf-list node packs a Junos range
+// separator ("to", as in a port range `3000 to 4000`) onto its value list.
+// Such a leaf is a range, not a set — union/dedup would corrupt it.
+func leafListCarriesRange(n *Node) bool {
+	for _, v := range firewallMatchValues(n) {
+		if v == "to" {
+			return true
+		}
+	}
+	return false
 }
 
 // keysContainWildcard returns true if any key is the Junos wildcard "<*>".

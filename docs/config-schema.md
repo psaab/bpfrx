@@ -1223,12 +1223,38 @@ but an operator who was (perhaps unknowingly) depending on override to shrink an
 inherited list must now scope the group narrower or not inherit it for that
 object.
 
+**Exclusions — token-packed / multi-token leaves OVERRIDE (not union).** The
+`multi:true && children==nil` discriminator over-includes leaves that pack a
+SEPARATOR/OPERATION keyword onto the value list, or that carry multiple tokens
+per member. Token-level union would corrupt these, so they revert to the safe
+pre-#4070 OVERRIDE. `isLeafListSchema` therefore requires `multi && children==nil
+&& args<=1 && !groupReplace`:
+
+- **`args<=1`** — a member must be a SINGLE token. An `args>=2` multi leaf packs
+  multiple tokens per member: route-filter (`<prefix> <match-type>`),
+  address-book `address <name> <prefix>`, policy-options `as-path <name>
+  <regex>`, CoS `queue <n> <class>`. Unioning them token-flattens the members
+  into one mashed leaf (`address net-a 10.0.0.0/24 net-b 10.0.1.0/24`). Excluded
+  structurally — no per-leaf flag needed.
+- **`!groupReplace`** — an `args<=1` leaf that packs a separator/operation
+  keyword is opted out explicitly via the `schemaNode.groupReplace` flag:
+  firewall/NAT `destination-port`/`source-port`(`-except`) carry a range `to`
+  separator (`3000 to 4000`); merging two ranges yields `3000 to 4000 1000 2000`,
+  a fail-OPEN matcher on a discard/reject term. policy-options `then community
+  add|set|delete|none` packs an operation keyword, and `then as-path-prepend` is
+  order+repetition sensitive — both are ACTIONS, not match-list members. A
+  belt-and-braces `leafListCarriesRange` net (values containing `to`) blocks the
+  union even if a range-bearing leaf is not flagged. `from community` (a MATCH
+  leaf-list) still unions — the flag lives on the `then community` node, so the
+  from/then keyword collision is resolved by schema CONTEXT, not by keyword.
+
 **Implementation.** `mergeNodes(dst, src, ancestorPath)` threads the from-root
 key path (the same `ancestorPath` `expandGroupsRecursive` already builds for
 group-context walking). `isLeafListSchema(ancestorPath, key)` walks `setSchema`
 down that path (reusing `resolveSchemaChild` + `consumeNodeKeys` for
 args/compoundKey/wildcard descent) and returns true iff the leaf is
-`multi && children==nil`. `mergeLeafListInto(dst, src)` reads both sides'
+`multi && children==nil && args<=1 && !groupReplace`; `leafListUnionEligible`
+adds the range-separator net. `mergeLeafListInto(dst, src)` reads both sides'
 members via the #2419 dual-shape SSOT `firewallMatchValues` (Keys[1:] AND child
 leaves), preserves the dst node's shape (collapsed leaf grows on Keys, block
 container gains one child leaf per added member), and dedups. Scalar leaves and
@@ -1236,6 +1262,10 @@ multi-key hierarchical containers (`family inet` / `family inet6`) are never
 unioned. Covered by `pkg/config/apply_groups_leaflist_test.go` (all four shape
 combinations, flat-set + dedup, the L-8 policy-match compile-level union, and
 scalar-still-overrides) plus the mixed-shape no-duplicate invariant from #4325.
+The exclusions are covered by `pkg/config/apply_groups_leaflist_exclude_test.go`
+(port-range override, `then community` / `then as-path-prepend` override, the
+args>=2 `address` no-token-merge, and — the narrow-exclusion proof — firewall
+`from protocol` in the same subtree STILL unions).
 
 ## `then community` operations: add / delete / set / none (#2848)
 
