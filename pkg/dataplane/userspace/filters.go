@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"log/slog"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -381,6 +382,31 @@ func resolvePrefixListAddrs(
 // a control-plane lockout risk on the lo0 host filter (#3433 H01).
 func filterAddrIsReal(a string) bool { return a != "" && a != "any" }
 
+// addrsAllMatchAny reports whether EVERY entry of a positive address list is the
+// match-any universe — an empty list, or only `0.0.0.0/0` / `::/0` CIDRs. It
+// backs the #4338 "any except X" compose in ResolveFilterPrefixListAddrs: a
+// positive set that is nothing but the universe, alongside an `except`
+// prefix-list, reduces to the sole-`except` representation ("any addr not in X").
+// A single SPECIFIC positive entry makes it false, so the mixed
+// specific-positive + except term falls through to the fail-safe positive-wins
+// path instead. An unparseable entry makes it false too (treated as specific) so
+// a malformed literal never widens the term to match-all.
+func addrsAllMatchAny(addrs []string) bool {
+	for _, a := range addrs {
+		if a == "" || a == "any" {
+			continue
+		}
+		_, ipnet, err := net.ParseCIDR(a)
+		if err != nil {
+			return false
+		}
+		if ones, _ := ipnet.Mask.Size(); ones != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // portsHaveReal reports whether a port-match list carries at least one real
 // (non-empty) entry, mirroring the Rust matcher's port_is_real
 // (userspace-dp/src/filter/compiler.rs). It backs the #3406 mixed positive +
@@ -472,7 +498,19 @@ func ResolveFilterPrefixListAddrs(
 	// holds even when the except list resolved EMPTY — the direction is
 	// constrained and except is set, so the matcher's empty guard returns
 	// `except` (= match ALL), the Junos "not in {}" semantic.
-	if hasExcept && len(positive) == 0 && !hasPositiveRef {
+	//
+	// #4338: a match-any positive literal (`0.0.0.0/0` / `::/0`) alongside an
+	// `except` prefix-list (and NO positive prefix-list) is the canonical Junos
+	// "match any EXCEPT the listed prefixes" lockdown idiom. The match-any is the
+	// universe, so `any AND NOT X` reduces to the sole-`except` case: DROP the
+	// redundant match-any from the positive set and emit the term as `except`
+	// over X. Without this the term below folds positive-wins (match-any wins →
+	// the term matches ALL, never excluding X) — a fail-OPEN that defeats the
+	// lockdown. config.validateFilterAddressExceptStrict accepts this exact shape
+	// (#4338); a SPECIFIC positive literal + except is still rejected at commit
+	// and only reaches here on the lenient path, where positive-wins keeps it
+	// fail-safe.
+	if hasExcept && !hasPositiveRef && addrsAllMatchAny(positive) {
 		return exceptPrefixes, true, true
 	}
 
