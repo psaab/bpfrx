@@ -33,10 +33,7 @@ pub(super) fn reject_duplicate_zone_ids(
     let mut owner: std::collections::HashMap<u16, &str> =
         std::collections::HashMap::with_capacity(snapshot.zones.len());
     for zone in &snapshot.zones {
-        if zone.id == 0
-            || zone.name.is_empty()
-            || zone.id >= crate::policy::ZONE_ID_RESERVED_MIN
-        {
+        if zone.id == 0 || zone.name.is_empty() || zone.id >= crate::policy::ZONE_ID_RESERVED_MIN {
             continue;
         }
         match owner.get(&zone.id) {
@@ -120,6 +117,20 @@ pub(super) fn populate_zones(snapshot: &ConfigSnapshot, state: &mut ForwardingSt
         state
             .zone_host_inbound
             .insert(zone.id, zone_host_inbound_from_snapshot(zone));
+        // #3618: one per-zone `reject`-reply rate-limit bucket per KNOWN zone,
+        // keyed by the SAME validated zone id. Before #3618 a single
+        // process-global bucket rate-limited every generated reject, so a
+        // rejected-flow flood ingressing one zone drained it and starved
+        // legitimate reject-generation in another zone. Building one bucket per
+        // CONFIGURED zone here (not per-packet) bounds cardinality to the
+        // configured zone set and gives each ingress zone an independent budget.
+        // An unzoned / unknown from-zone (id 0, never in this table) falls back
+        // to the shared `REJECT_FALLBACK_BUCKET` at the gate. Fresh buckets on
+        // every build = reset-on-commit, accepted for a diagnostic limiter.
+        state.reject_buckets.insert(
+            zone.id,
+            std::sync::Arc::new(crate::afxdp::icmp_ratelimit::TokenBucket::new()),
+        );
         // #3071: record the per-zone Junos `tcp-rst` knob keyed by zone id so
         // the policy-deny hot path can answer a denied TCP flow whose ingress
         // (from) zone has tcp-rst with a RST instead of a silent drop. Only

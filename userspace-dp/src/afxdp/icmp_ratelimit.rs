@@ -20,10 +20,25 @@
 // This adds the missing limiter, modelled on Linux's ICMP rate limiting
 // (`net.ipv4.icmp_msgs_per_sec` — a GLOBAL per-host burst, default 1000/s —
 // plus `net.ipv4.icmp_ratelimit`). We use the simple, bounded-state half of
-// that model: a GLOBAL-per-reason token bucket (no per-source / per-destination
-// map, so there is no attacker-driven map growth). Each reason has its own
-// bucket so a TTL-exceeded flood cannot starve the PTB or reject reasons (and
-// vice-versa) — per-reason isolation.
+// that model: a per-reason token bucket (no per-source / per-destination map,
+// so there is no attacker-driven map growth). Each reason has its own bucket so
+// a TTL-exceeded flood cannot starve the PTB or reject reasons (and vice-versa)
+// — per-reason isolation.
+//
+// #3618: the Reject reason is further split PER INGRESS (from) ZONE — one
+// bucket per configured zone, held in `ForwardingState::reject_buckets` and
+// resolved at the reject call site (`poll_descriptor::reject_reply`), with a
+// process-global `REJECT_FALLBACK_BUCKET` for an unzoned/unknown zone. This
+// removes the cross-zone starvation the single global Reject bucket had: a
+// rejected-flow flood ingressing one zone can no longer drain the bucket and
+// suppress a legitimate reject in another zone. TimeExceeded / PacketTooBig
+// keep their single global-per-reason bucket (their generator sites lack a
+// clean ingress zone id — see `docs/generated-reply-rate-limit.md`). The
+// observable aggregate `reject_rate_limited_total` stays a SINGLE atomic
+// (`REJECT_RATE_LIMITED_TOTAL`) bumped on any per-zone deny, so the coordinator
+// status / Prometheus metric format is unchanged. Cardinality is
+// config-bounded (configured zones, Go-capped ≤ 65533), so there is still no
+// attacker-driven map growth.
 //
 // Hot-path: the check is a single CAS loop over ONE atomic word (a GCRA
 // theoretical-arrival-time; #2955 collapsed the prior split token-count +
@@ -39,6 +54,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::neighbor::monotonic_nanos;
+use crate::afxdp::types::ForwardingState;
 
 /// The locally-generated error reasons that share this limiter. Each variant
 /// indexes an independent token bucket, so exhausting one reason never blocks
@@ -89,7 +105,17 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 /// `interval`. Because `tat` is the entire state, there is no second field to
 /// tear against — the single CAS atomically refills AND consumes. This is the
 /// same single-TAT pattern used by `event_stream/producer.rs`.
-struct TokenBucket {
+///
+/// #3618: exposed as `pub(in crate::afxdp)` so `ForwardingState` can hold a
+/// per-zone map of these for the Reject reason (`reject_buckets`). The fields
+/// stay private to this module; the only cross-module entry points are
+/// `TokenBucket::new()` (to build a fresh per-zone bucket at config apply) and
+/// the `allow_generated_reject*` gates below (which do the `try_take` +
+/// counter bump). Held behind an `Arc` in `ForwardingState` so the shared
+/// atomics survive `ForwardingState::clone()` (fabric refresh re-stores a
+/// clone at runtime cadence — see `forwarding.rs`).
+#[derive(Debug)]
+pub(in crate::afxdp) struct TokenBucket {
     /// Theoretical arrival time (monotonic nanos). The whole limiter state.
     /// Initialised to 0 so the first `burst` calls after boot pass (an
     /// effectively-full bucket: `0 - horizon` saturates to 0 <= any `now`).
@@ -99,7 +125,7 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    const fn new() -> Self {
+    pub(in crate::afxdp) const fn new() -> Self {
         TokenBucket {
             theoretical_arrival_ns: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
@@ -127,8 +153,7 @@ impl TokenBucket {
         // interval = nanos between admitted tokens at the steady rate. Round up
         // so a high rate never collapses to a zero interval (which would admit
         // unboundedly). A burst of 0 is treated as 1 (no negative horizon).
-        let interval_ns =
-            (NANOS_PER_SEC.saturating_add(rate_per_sec - 1) / rate_per_sec).max(1);
+        let interval_ns = (NANOS_PER_SEC.saturating_add(rate_per_sec - 1) / rate_per_sec).max(1);
         let burst_horizon_ns = interval_ns.saturating_mul(burst.saturating_sub(1));
 
         let mut tat = self.theoretical_arrival_ns.load(Ordering::Relaxed);
@@ -162,13 +187,39 @@ impl TokenBucket {
 
 static TIME_EXCEEDED_BUCKET: TokenBucket = TokenBucket::new();
 static PACKET_TOO_BIG_BUCKET: TokenBucket = TokenBucket::new();
-static REJECT_BUCKET: TokenBucket = TokenBucket::new();
 
+/// #3618: shared fallback Reject bucket used when a reject's ingress (from)
+/// zone has NO per-zone bucket — an unzoned (id 0) or otherwise-unknown zone
+/// id. It is a REAL bucket (never a fail-open skip), so an unzoned/unknown
+/// reject is still rate-limited; such rejects all share this one budget (the
+/// rare/degenerate case, not a per-zone diagnostic). This replaces the former
+/// single global `REJECT_BUCKET`: the per-zone buckets now live in
+/// `ForwardingState::reject_buckets` (built from the configured zone set), so a
+/// rejected-flow flood on one zone can no longer drain a single global bucket
+/// and starve reject-generation in another zone.
+static REJECT_FALLBACK_BUCKET: TokenBucket = TokenBucket::new();
+
+/// #3618: process-global aggregate count of Reject replies dropped because the
+/// (per-zone OR fallback) bucket was empty. A SINGLE atomic bumped on ANY
+/// per-zone deny — NOT a sum over the per-zone buckets' `rate_limited` fields —
+/// so `rate_limited_count(Reject)` stays an O(1) atomic load and the
+/// coordinator status / Prometheus `reject_rate_limited_total` wire contract is
+/// UNCHANGED by the per-zone split. Each per-zone `TokenBucket` keeps its own
+/// `rate_limited` field for OPTIONAL future per-zone attribution; the aggregate
+/// metric never reads those fields.
+static REJECT_RATE_LIMITED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// TE / PTB keep their single global-per-reason bucket. For the Reject reason
+/// this returns the shared `REJECT_FALLBACK_BUCKET`: it is the bucket the
+/// non-zone-keyed `allow_generated_error(Reject)` back-compat entry point and
+/// the test reset/drain helpers operate on. The zone-keyed reject path
+/// (`allow_generated_reject*`) resolves a per-zone bucket first and falls back
+/// to this same static, so both stay consistent.
 fn bucket_for(reason: GeneratedErrorReason) -> &'static TokenBucket {
     match reason {
         GeneratedErrorReason::TimeExceeded => &TIME_EXCEEDED_BUCKET,
         GeneratedErrorReason::PacketTooBig => &PACKET_TOO_BIG_BUCKET,
-        GeneratedErrorReason::Reject => &REJECT_BUCKET,
+        GeneratedErrorReason::Reject => &REJECT_FALLBACK_BUCKET,
     }
 }
 
@@ -181,7 +232,12 @@ fn bucket_for(reason: GeneratedErrorReason) -> &'static TokenBucket {
 /// is global-per-reason (no per-source state), matching Linux's
 /// `icmp_msgs_per_sec` model.
 pub(in crate::afxdp) fn allow_generated_error(reason: GeneratedErrorReason) -> bool {
-    allow_generated_error_at(reason, monotonic_nanos(), DEFAULT_RATE_PER_SEC, DEFAULT_BURST)
+    allow_generated_error_at(
+        reason,
+        monotonic_nanos(),
+        DEFAULT_RATE_PER_SEC,
+        DEFAULT_BURST,
+    )
 }
 
 /// Testable core of [`allow_generated_error`] with an injected clock + rate /
@@ -197,15 +253,81 @@ pub(in crate::afxdp) fn allow_generated_error_at(
     let allowed = bucket.try_take(now_ns, rate_per_sec, burst);
     if !allowed {
         bucket.rate_limited.fetch_add(1, Ordering::Relaxed);
+        // #3618: keep the aggregate Reject counter authoritative regardless of
+        // which entry point denied. `rate_limited_count(Reject)` now reads the
+        // dedicated `REJECT_RATE_LIMITED_TOTAL`, so this back-compat entry point
+        // (still reachable via `allow_generated_error(Reject)` + the test
+        // drain/reset helpers, which operate on `REJECT_FALLBACK_BUCKET`) must
+        // bump it too. TE/PTB keep their per-bucket field as the aggregate.
+        if reason == GeneratedErrorReason::Reject {
+            REJECT_RATE_LIMITED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    allowed
+}
+
+/// #3618: zone-scoped variant of the Reject gate. Returns true when a
+/// locally-generated reject reply whose ingress (from) zone is `from_zone_id`
+/// MAY be sent (its per-zone bucket had a token), false when it MUST be dropped
+/// because that zone's bucket is empty. The per-zone bucket comes from
+/// `forwarding.reject_buckets` (built from the configured zone set at config
+/// apply); an unzoned (id 0) or otherwise-unknown zone id falls back to the
+/// shared process-global `REJECT_FALLBACK_BUCKET` — a real bucket, so the gate
+/// is NEVER fail-open and never panics on a missing key. On a deny the single
+/// aggregate `REJECT_RATE_LIMITED_TOTAL` is bumped (metric unchanged) alongside
+/// the bucket's own `rate_limited` field (optional per-zone attribution).
+///
+/// TimeExceeded / PacketTooBig stay on the global-per-reason
+/// `allow_generated_error` — they lack a clean ingress zone at their generator
+/// sites (see `docs/generated-reply-rate-limit.md`).
+pub(in crate::afxdp) fn allow_generated_reject(
+    forwarding: &ForwardingState,
+    from_zone_id: u16,
+) -> bool {
+    allow_generated_reject_at(
+        forwarding,
+        from_zone_id,
+        monotonic_nanos(),
+        DEFAULT_RATE_PER_SEC,
+        DEFAULT_BURST,
+    )
+}
+
+/// Testable core of [`allow_generated_reject`] with an injected clock + rate /
+/// burst, so the unit tests can drive a deterministic per-zone burst-then-drain
+/// sequence without sleeping.
+pub(in crate::afxdp) fn allow_generated_reject_at(
+    forwarding: &ForwardingState,
+    from_zone_id: u16,
+    now_ns: u64,
+    rate_per_sec: u64,
+    burst: u64,
+) -> bool {
+    let bucket = forwarding
+        .reject_bucket(from_zone_id)
+        .unwrap_or(&REJECT_FALLBACK_BUCKET);
+    let allowed = bucket.try_take(now_ns, rate_per_sec, burst);
+    if !allowed {
+        // Per-zone attribution (optional future accessor).
+        bucket.rate_limited.fetch_add(1, Ordering::Relaxed);
+        // Aggregate metric — a single atomic, bumped on every per-zone deny.
+        REJECT_RATE_LIMITED_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
     allowed
 }
 
 /// Observable per-reason count of generated error replies dropped because the
 /// reason's token bucket was empty. Surfaced via the coordinator status
-/// (`*_rate_limited_total`).
+/// (`*_rate_limited_total`). #3618: the Reject reason reads the dedicated
+/// process-global aggregate (`REJECT_RATE_LIMITED_TOTAL`), which is bumped on
+/// every per-zone (and fallback) deny — an O(1) atomic load, never a sum over
+/// the per-zone buckets, so the wire/metric format is unchanged. TE/PTB still
+/// read their single bucket's `rate_limited` field.
 pub(in crate::afxdp) fn rate_limited_count(reason: GeneratedErrorReason) -> u64 {
-    bucket_for(reason).rate_limited.load(Ordering::Relaxed)
+    match reason {
+        GeneratedErrorReason::Reject => REJECT_RATE_LIMITED_TOTAL.load(Ordering::Relaxed),
+        _ => bucket_for(reason).rate_limited.load(Ordering::Relaxed),
+    }
 }
 
 /// #2955: serialises every test that drives the GLOBAL per-reason buckets.
@@ -222,8 +344,7 @@ pub(in crate::afxdp) fn rate_limited_count(reason: GeneratedErrorReason) -> u64 
 /// body. (Tests using a LOCAL `TokenBucket` — the #2955 concurrency guards —
 /// touch no shared state and do not take the lock.)
 #[cfg(test)]
-pub(in crate::afxdp) fn global_bucket_test_lock()
--> std::sync::MutexGuard<'static, ()> {
+pub(in crate::afxdp) fn global_bucket_test_lock() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::Mutex;
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -241,6 +362,12 @@ pub(in crate::afxdp) fn reset_bucket_for_test(reason: GeneratedErrorReason, now_
         .theoretical_arrival_ns
         .store(now_ns, Ordering::Relaxed);
     bucket.rate_limited.store(0, Ordering::Relaxed);
+    // #3618: also clear the dedicated aggregate so a test that asserts an exact
+    // `rate_limited_count(Reject)` starts from a clean slate (the Reject
+    // aggregate is a separate atomic from the fallback bucket's field).
+    if reason == GeneratedErrorReason::Reject {
+        REJECT_RATE_LIMITED_TOTAL.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +574,130 @@ mod tests {
             rate_limited_count(reason),
             before,
             "a disabled limiter must never bump the rate-limited counter"
+        );
+    }
+
+    use crate::afxdp::types::FastMap;
+    use std::sync::Arc;
+
+    /// Build a `ForwardingState` carrying a fresh per-zone Reject bucket for
+    /// each given zone id (#3618 test helper).
+    fn forwarding_with_reject_zones(zone_ids: &[u16]) -> ForwardingState {
+        let mut reject_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+        for &id in zone_ids {
+            reject_buckets.insert(id, Arc::new(TokenBucket::new()));
+        }
+        ForwardingState {
+            reject_buckets,
+            ..ForwardingState::default()
+        }
+    }
+
+    /// #3618 HEADLINE fail-on-revert: a rejected-flow flood that drains ZONE A's
+    /// per-zone Reject bucket must NOT prevent ZONE B from generating its
+    /// reject. Reverting to a SINGLE global Reject bucket makes draining A empty
+    /// the one shared bucket, so B is then denied and this assertion goes RED.
+    /// This is the direct proof of the #3618 per-zone isolation fix — one
+    /// ingress zone can no longer starve another's reject-generation.
+    #[test]
+    fn reject_per_zone_flood_does_not_starve_other_zone_3618() {
+        let _g = global_bucket_test_lock();
+        // Sparse, realistic stable-name-hash zone ids (NOT dense 1,2).
+        let zone_a = 41_337u16;
+        let zone_b = 9_002u16;
+        let t0 = 3_000_000_000u64;
+        let forwarding = forwarding_with_reject_zones(&[zone_a, zone_b]);
+        // Drain zone A at a frozen instant (burst = 4).
+        for i in 0..4 {
+            assert!(
+                allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 4),
+                "zone A token {i} within burst must pass"
+            );
+        }
+        assert!(
+            !allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 4),
+            "zone A bucket must be drained after its burst"
+        );
+        // Zone B, under no load, still generates its reject at the SAME instant.
+        assert!(
+            allow_generated_reject_at(&forwarding, zone_b, t0, 1000, 4),
+            "zone B must NOT be starved by zone A's flood (per-zone isolation)"
+        );
+    }
+
+    /// #3618: an unzoned (id 0) or otherwise-unknown from-zone id has no
+    /// per-zone bucket, so the gate falls back to the shared process-global
+    /// `REJECT_FALLBACK_BUCKET` — a real bucket (never fail-open) that still
+    /// rate-limits and never panics on the absent key. Both an unknown id and
+    /// id 0 SHARE the one fallback budget.
+    #[test]
+    fn reject_unknown_and_unzoned_share_fallback_bucket_3618() {
+        let _g = global_bucket_test_lock();
+        let t0 = 6_000_000_000u64;
+        // Reset the fallback bucket (+ aggregate) to full at epoch t0.
+        reset_bucket_for_test(GeneratedErrorReason::Reject, t0);
+        // Empty map: every zone id resolves to the fallback.
+        let forwarding = ForwardingState::default();
+        let unknown = 55_555u16;
+        // burst = 2 on the shared fallback: an unknown-id reject and an
+        // unzoned (id 0) reject each take one token; the third is denied.
+        assert!(allow_generated_reject_at(&forwarding, unknown, t0, 1000, 2));
+        assert!(allow_generated_reject_at(&forwarding, 0, t0, 1000, 2));
+        assert!(
+            !allow_generated_reject_at(&forwarding, unknown, t0, 1000, 2),
+            "unknown / unzoned rejects share and are bounded by the fallback bucket"
+        );
+    }
+
+    /// #3618 metric-preservation fail-on-revert: the aggregate
+    /// `reject_rate_limited_total` (a SINGLE global atomic, NOT a per-zone sum)
+    /// is bumped on EVERY per-zone deny, so the coordinator status / Prometheus
+    /// contract is unchanged by the per-zone split. Drain two zones by K1 and K2
+    /// and assert the aggregate advanced by exactly K1 + K2.
+    #[test]
+    fn reject_aggregate_counter_sums_across_zones_3618() {
+        let _g = global_bucket_test_lock();
+        let t0 = 8_000_000_000u64;
+        reset_bucket_for_test(GeneratedErrorReason::Reject, t0); // aggregate -> 0
+        let zone_a = 111u16;
+        let zone_b = 222u16;
+        let forwarding = forwarding_with_reject_zones(&[zone_a, zone_b]);
+        let before = rate_limited_count(GeneratedErrorReason::Reject);
+        let k1 = 3u64;
+        let k2 = 5u64;
+        // burst = 1 per zone: one pass, then K denies each.
+        assert!(allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+        for _ in 0..k1 {
+            assert!(!allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+        }
+        assert!(allow_generated_reject_at(&forwarding, zone_b, t0, 1000, 1));
+        for _ in 0..k2 {
+            assert!(!allow_generated_reject_at(&forwarding, zone_b, t0, 1000, 1));
+        }
+        assert_eq!(
+            rate_limited_count(GeneratedErrorReason::Reject),
+            before + k1 + k2,
+            "aggregate reject_rate_limited_total must sum every per-zone deny (metric unchanged)"
+        );
+    }
+
+    /// #3618: per-zone Reject buckets stay isolated from the TimeExceeded /
+    /// PacketTooBig reasons (reason isolation, #2472). Draining a zone's Reject
+    /// bucket must not affect the TE/PTB global buckets, and vice-versa.
+    #[test]
+    fn reject_per_zone_isolated_from_other_reasons_3618() {
+        let _g = global_bucket_test_lock();
+        let t0 = 10_000_000_000u64;
+        reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, t0);
+        let zone_a = 700u16;
+        let forwarding = forwarding_with_reject_zones(&[zone_a]);
+        // Drain zone A's Reject bucket (burst = 1).
+        assert!(allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+        assert!(!allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+        // TimeExceeded (a different reason, global bucket) is untouched.
+        assert!(
+            allow_generated_error_at(GeneratedErrorReason::TimeExceeded, t0, 1000, 1),
+            "TE bucket must be independent of a zone's Reject exhaustion"
         );
     }
 }
