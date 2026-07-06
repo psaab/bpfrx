@@ -45,7 +45,24 @@ type schemaNode struct {
 	// (the bracket list) while STILL descending into the container when the
 	// next token names a known child (the `interface` modifier). Only next-hop
 	// sets it; every other multi+children node is unchanged.
-	valueList    bool
+	valueList bool
+
+	// groupReplace opts a multi leaf OUT of apply-groups leaf-list UNION
+	// (#4070). By default a `multi:true && children==nil && args<=1` leaf is a
+	// pure single-token value-list whose group + inline members UNION under
+	// apply-groups (name-server, match application/source-address, from
+	// protocol, export chains). A multi leaf that instead packs a SEPARATOR or
+	// OPERATION keyword onto its value list — a port RANGE (`3000 to 4000`
+	// packs `to`), `then community add|delete|set|none <value>`, or
+	// `then as-path-prepend` (order + repetition are the mechanism) — is NOT a
+	// set: token-level union/dedup would corrupt it (a discard/reject port term
+	// would fail OPEN). Setting groupReplace makes such a leaf REVERT to the
+	// safe pre-#4070 OVERRIDE (inline wins, group value dropped). Multi leaves
+	// with args>=2 (route-filter, address-book `address <name> <prefix>`,
+	// as-path `<name> <regex>`, CoS `queue`) are multi-token by nature and are
+	// excluded by the args<=1 gate in isLeafListSchema without a flag.
+	groupReplace bool
+
 	scalar       bool      // true = fixed-arity scalar value leaf (keyword + exactly `args` value tokens, NO body); rejects trailing tokens at commit (#3332). Opt-in; see isScalarValueLeaf.
 	valueHint    ValueHint // hint for dynamic value completion (when args > 0)
 	desc         string    // description shown in completion help

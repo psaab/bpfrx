@@ -188,7 +188,7 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			if tagInherited {
 				tagNodesInherited(cloned, name)
 			}
-			mergeNodes(nodes, cloned)
+			mergeNodes(nodes, cloned, ancestorPath)
 		}
 
 		delete(seen, name)
@@ -218,17 +218,48 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 	return nil
 }
 
-// mergeNodes merges src nodes into dst. For container nodes with matching keys,
-// children are merged recursively. For leaf nodes or new containers, they are
-// appended (group values don't override existing explicit config — existing
-// config takes precedence via ordering, since the compiler uses first-match).
-func mergeNodes(dst *[]*Node, src []*Node) {
+// mergeNodes merges src (apply-group) nodes into dst (inline stanza) at the
+// schema level named by ancestorPath (the Keys path from root to this level,
+// same convention expandGroupsRecursive threads for group context walking).
+// For container nodes with matching keys, children are merged recursively.
+//
+// apply-groups inheritance is TYPED per Junos, not shape-based (#4070):
+//   - LEAF-LIST statement (schema `multi:true && children==nil`, e.g.
+//     name-server, policy `match application` / `source-address`, firewall
+//     `from protocol`, routing export/import chains): the group's members are
+//     inherited IN ADDITION to the inline members — UNION. Inline members keep
+//     precedence and order; group members not already present are appended,
+//     deduplicated. This holds across BOTH AST shapes (collapsed leaf and block
+//     container) on either side, and yields exactly ONE node for the key.
+//   - SCALAR leaf (host-name, ...): inline OVERRIDES the group value (the
+//     explicit stanza wins via first-match ordering — unchanged).
+//   - Unmodeled leaf (not resolvable in setSchema): OVERRIDE, the safe
+//     non-regressing fallback (matches the incremental schema-coverage posture).
+//
+// Before #4070 the merge keyed on AST SHAPE — collapsed+collapsed OVERRODE,
+// block+block UNIONED — so an inline `match application junos-http` that
+// inherited a group's `match application junos-https` silently DROPPED
+// junos-https (fable-164 L-8), narrowing a `then deny` to junos-http only.
+func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 	for _, s := range src {
 		if s.IsLeaf {
-			// Only add leaf if no matching leaf exists.
-			if !hasMatchingLeaf(*dst, s.Keys) {
-				*dst = append(*dst, s)
+			key := ""
+			if len(s.Keys) > 0 {
+				key = s.Keys[0]
 			}
+			if peer := leafListPeer(*dst, key); peer != nil {
+				// A same-key node already exists inline. UNION when the
+				// statement is a pure value-list leaf-list; otherwise OVERRIDE
+				// (skip the group value — inline wins). Scalars, args>=2
+				// multi-token leaves, groupReplace token-packed leaves, and
+				// range-bearing leaves all take the override path.
+				if leafListUnionEligible(ancestorPath, key, peer, s) {
+					mergeLeafListInto(peer, s)
+				}
+				continue
+			}
+			// No inline value for this key: adopt the group leaf.
+			*dst = append(*dst, s)
 			continue
 		}
 
@@ -238,8 +269,27 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 			for _, d := range *dst {
 				if !d.IsLeaf && keysMatchWildcard(d.Keys, s.Keys) {
 					cloned := cloneNodes(s.Children)
-					mergeNodes(&d.Children, cloned)
+					mergeNodes(&d.Children, cloned, appendPath(ancestorPath, d.Keys))
 				}
+			}
+			continue
+		}
+
+		// A single-key group container that the schema classifies as a
+		// leaf-list is the BLOCK shape of a leaf-list ("name-server { 1; 2; }").
+		// UNION its members into an existing inline leaf-list (either shape),
+		// rather than recursing as a real hierarchical container. Multi-key
+		// containers (["family","inet"]) are never leaf-lists.
+		if len(s.Keys) == 1 && isLeafListSchema(ancestorPath, s.Keys[0]) {
+			if peer := leafListPeer(*dst, s.Keys[0]); peer != nil {
+				if leafListUnionEligible(ancestorPath, s.Keys[0], peer, s) {
+					mergeLeafListInto(peer, s)
+				}
+				// else OVERRIDE: a range-bearing inline peer wins, group block
+				// dropped (a groupReplace leaf never reaches here — its
+				// isLeafListSchema is false, so it takes the container path).
+			} else {
+				*dst = append(*dst, s)
 			}
 			continue
 		}
@@ -249,28 +299,157 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 		for _, d := range *dst {
 			if !d.IsLeaf && keysEqual(d.Keys, s.Keys) {
 				// Merge children recursively.
-				mergeNodes(&d.Children, s.Children)
+				mergeNodes(&d.Children, s.Children, appendPath(ancestorPath, d.Keys))
 				found = true
 				break
 			}
 		}
 		if !found {
-			// Cross-shape guard (#4070): a single-key group container is a
-			// leaf-list expressed in BLOCK shape (Keys == ["name-server"]).
-			// If the destination already holds the same leaf-list as a
-			// COLLAPSED leaf sharing Keys[0] (e.g. "name-server 9.9.9.9"),
-			// the two express the SAME statement in different shapes. The
-			// explicit stanza value wins (same precedence rule as
-			// hasMatchingLeaf), so skip the group container instead of
-			// appending a duplicate second node for the same key. Multi-key
-			// containers (e.g. ["family","inet"]) are real hierarchical
-			// nodes, never leaf-lists, so they are never cross-suppressed.
+			// Cross-shape guard (#4325): a single-key group container whose
+			// leaf-list counterpart exists inline as a collapsed leaf sharing
+			// Keys[0]. Leaf-list keys are handled by the union path above, so
+			// this now only fires for a single-key container NOT modeled as a
+			// leaf-list — keep the no-duplicate invariant (skip rather than
+			// append a second node for the same key).
 			if len(s.Keys) == 1 && hasMatchingLeaf(*dst, s.Keys) {
 				continue
 			}
 			*dst = append(*dst, s)
 		}
 	}
+}
+
+// appendPath returns a fresh copy of base with keys appended, so recursive
+// mergeNodes calls never alias or clobber a shared ancestorPath backing array.
+func appendPath(base [][]string, keys []string) [][]string {
+	out := make([][]string, len(base)+1)
+	copy(out, base)
+	out[len(base)] = keys
+	return out
+}
+
+// leafListPeer returns the first dst node that expresses the leaf-list keyed
+// by key — either a COLLAPSED leaf ("name-server 9.9.9.9") or a single-key
+// BLOCK container ("name-server { 9.9.9.9; }"). It mirrors hasMatchingLeaf's
+// match rule so union and override agree on what counts as "the same key".
+func leafListPeer(dst []*Node, key string) *Node {
+	if key == "" {
+		return nil
+	}
+	for _, n := range dst {
+		if len(n.Keys) == 0 || n.Keys[0] != key {
+			continue
+		}
+		if n.IsLeaf || len(n.Keys) == 1 {
+			return n
+		}
+	}
+	return nil
+}
+
+// mergeLeafListInto unions the members of a group leaf-list node src into an
+// existing inline leaf-list node dst. Members are read across both AST shapes
+// via the #2419 firewallMatchValues SSOT (Keys[1:] AND child leaves). Inline
+// members keep their position; group members not already present are appended
+// in group order, deduplicated. The dst node's shape is preserved — a
+// collapsed leaf grows on Keys, a block container gains one child leaf per
+// added member — so the result is exactly ONE node for the key regardless of
+// the two inputs' shapes.
+func mergeLeafListInto(dst, src *Node) {
+	seen := make(map[string]bool)
+	for _, v := range firewallMatchValues(dst) {
+		seen[v] = true
+	}
+	for _, v := range firewallMatchValues(src) {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		if dst.IsLeaf {
+			dst.Keys = append(dst.Keys, v)
+		} else {
+			dst.Children = append(dst.Children, &Node{
+				Keys:          []string{v},
+				IsLeaf:        true,
+				InheritedFrom: src.InheritedFrom,
+			})
+		}
+	}
+}
+
+// isLeafListSchema reports whether the leaf keyword key, resolved under the
+// schema context ancestorPath, is a PURE single-token Junos leaf-list whose
+// group + inline members UNION under apply-groups inheritance (#4070): a
+// multi-value leaf that models no sub-structure, carries exactly one value
+// token per member, and is not opted out. A scalar leaf, an args>=2 multi leaf
+// (multi-token members), or a groupReplace leaf overrides instead. Returns
+// false when the path or keyword is not modeled in setSchema, so an unmodeled
+// leaf safely keeps the legacy override behavior.
+//
+// The gate is `multi:true && children==nil && args<=1 && !groupReplace`:
+//   - multi + children==nil: the leaf-list discriminator (children==nil
+//     excludes multi nodes carrying modifier sub-structure — CoS named
+//     containers, static `next-hop [ a b ] { interface x; }`).
+//   - args<=1: each member is a SINGLE token (application, source-address,
+//     protocol, name-server, from community/as-path, export chains). An
+//     args>=2 multi leaf packs multiple tokens per member (route-filter
+//     `<prefix> <match-type>`, address-book `address <name> <prefix>`,
+//     as-path `<name> <regex>`, CoS `queue <n> <class>`); token-level union
+//     would mash the member tokens together, so it OVERRIDEs instead.
+//   - !groupReplace: a token-packed args<=1 leaf that packs a SEPARATOR or
+//     OPERATION keyword (port range `3000 to 4000`, `then community
+//     add|set|delete|none`, `then as-path-prepend`) is explicitly opted out
+//     (see the schemaNode.groupReplace doc) — union/dedup would corrupt it.
+func isLeafListSchema(ancestorPath [][]string, key string) bool {
+	schema := setSchema
+	for _, pk := range ancestorPath {
+		if schema == nil || len(pk) == 0 {
+			return false
+		}
+		child := resolveSchemaChild(schema, pk[0])
+		if child == nil {
+			return false
+		}
+		// consumeNodeKeys descends a compoundKey sub-token (family inet6) so
+		// the leaf lookup lands at the correct level; args/midKeyword tokens
+		// are identity values that do not change the schema level.
+		_, child = consumeNodeKeys(pk, child)
+		schema = child
+	}
+	if schema == nil {
+		return false
+	}
+	leaf := resolveSchemaChild(schema, key)
+	return leaf != nil && leaf.multi && leaf.children == nil &&
+		leaf.args <= 1 && !leaf.groupReplace
+}
+
+// leafListUnionEligible reports whether a group leaf-list node src should UNION
+// into an existing inline node dst (both share Keys[0]==key at schema context
+// ancestorPath), versus fall back to apply-groups OVERRIDE. Union requires the
+// schema to classify key as a pure single-token value-list (isLeafListSchema)
+// AND neither side to carry a range separator. A range like `3000 to 4000`
+// packs the `to` separator onto the value list, so token-level union/dedup
+// would corrupt it (a discard/reject port term would fail OPEN). The range
+// check is a defensive net for any range-bearing leaf not explicitly marked
+// groupReplace; the known port leaves already set the flag.
+func leafListUnionEligible(ancestorPath [][]string, key string, dst, src *Node) bool {
+	if !isLeafListSchema(ancestorPath, key) {
+		return false
+	}
+	return !leafListCarriesRange(dst) && !leafListCarriesRange(src)
+}
+
+// leafListCarriesRange reports whether a leaf-list node packs a Junos range
+// separator ("to", as in a port range `3000 to 4000`) onto its value list.
+// Such a leaf is a range, not a set — union/dedup would corrupt it.
+func leafListCarriesRange(n *Node) bool {
+	for _, v := range firewallMatchValues(n) {
+		if v == "to" {
+			return true
+		}
+	}
+	return false
 }
 
 // keysContainWildcard returns true if any key is the Junos wildcard "<*>".

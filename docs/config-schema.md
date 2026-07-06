@@ -1180,6 +1180,93 @@ map-reuse merge keeps both. Fail-on-revert covered by
 `TestPrefixListMergeDuplicateBlocksHierarchical`
 (`compiler_prefix_list_merge_2641_test.go`).
 
+## apply-groups leaf-list UNION vs scalar OVERRIDE (#4070)
+
+apply-groups inheritance (`pkg/config/ast_groups.go`, `mergeNodes`) is TYPED
+the same way the schema classifies leaves — it is discriminated by the
+statement KIND, not by AST shape:
+
+- **Leaf-list** (`setSchema` `multi:true && children==nil` — name-server,
+  domain-search, policy `match application` / `source-address` /
+  `destination-address`, firewall `from protocol` / addresses, routing
+  `export` / `import` chains, …): the group's members are inherited IN
+  ADDITION to the inline members — **UNION**. Inline members keep precedence
+  and order; group members not already present are appended in group order,
+  deduplicated. Exactly ONE node results for the key.
+- **Scalar leaf** (`host-name`, `domain-name`, …): the inline value
+  **OVERRIDES** the group value (the explicit stanza wins via first-match
+  ordering).
+- **Unmodeled leaf** (not resolvable in `setSchema`): OVERRIDE — the safe,
+  non-regressing fallback. As schema leaf-coverage grows, more statements
+  gain the correct union behavior automatically.
+
+**Why this is the Junos behavior.** apply-groups is Juniper's mechanism for a
+common group to CONTRIBUTE statements to many objects; the canonical use is a
+group adding a shared name-server list / export policy / match condition that
+ADDs to per-object config (`show … | display inheritance` shows both). Junos
+unions leaf-lists and only overrides scalars.
+
+**What changed (the #4070 fix).** Before #4070 the merge keyed on AST SHAPE,
+not statement type, so behavior was inconsistent: collapsed+collapsed
+(`name-server 9.9.9.9` inheriting `name-server [ 1.1.1.1 2.2.2.2 ]`) OVERRODE
+while block+block UNIONED. PR-A (#4325) first made the MIXED shape stop
+emitting a duplicate leaf AND container for one key; this PR makes every
+leaf-list UNION regardless of shape. The security-relevant symptom was
+fable-164 L-8: an inline policy `match application junos-http` that inherited a
+group's `match application junos-https` silently DROPPED junos-https, so a
+`then deny` no longer denied junos-https. It now denies both.
+
+**Migration note.** This changes apply-groups merge semantics: a config that
+relied on the OLD collapsed-leaf-list override (inline replaces the group's
+list) now UNIONs instead. This is Junos-parity-correct — a fix, not a break —
+but an operator who was (perhaps unknowingly) depending on override to shrink an
+inherited list must now scope the group narrower or not inherit it for that
+object.
+
+**Exclusions — token-packed / multi-token leaves OVERRIDE (not union).** The
+`multi:true && children==nil` discriminator over-includes leaves that pack a
+SEPARATOR/OPERATION keyword onto the value list, or that carry multiple tokens
+per member. Token-level union would corrupt these, so they revert to the safe
+pre-#4070 OVERRIDE. `isLeafListSchema` therefore requires `multi && children==nil
+&& args<=1 && !groupReplace`:
+
+- **`args<=1`** — a member must be a SINGLE token. An `args>=2` multi leaf packs
+  multiple tokens per member: route-filter (`<prefix> <match-type>`),
+  address-book `address <name> <prefix>`, policy-options `as-path <name>
+  <regex>`, CoS `queue <n> <class>`. Unioning them token-flattens the members
+  into one mashed leaf (`address net-a 10.0.0.0/24 net-b 10.0.1.0/24`). Excluded
+  structurally — no per-leaf flag needed.
+- **`!groupReplace`** — an `args<=1` leaf that packs a separator/operation
+  keyword is opted out explicitly via the `schemaNode.groupReplace` flag:
+  firewall/NAT `destination-port`/`source-port`(`-except`) carry a range `to`
+  separator (`3000 to 4000`); merging two ranges yields `3000 to 4000 1000 2000`,
+  a fail-OPEN matcher on a discard/reject term. policy-options `then community
+  add|set|delete|none` packs an operation keyword, and `then as-path-prepend` is
+  order+repetition sensitive — both are ACTIONS, not match-list members. A
+  belt-and-braces `leafListCarriesRange` net (values containing `to`) blocks the
+  union even if a range-bearing leaf is not flagged. `from community` (a MATCH
+  leaf-list) still unions — the flag lives on the `then community` node, so the
+  from/then keyword collision is resolved by schema CONTEXT, not by keyword.
+
+**Implementation.** `mergeNodes(dst, src, ancestorPath)` threads the from-root
+key path (the same `ancestorPath` `expandGroupsRecursive` already builds for
+group-context walking). `isLeafListSchema(ancestorPath, key)` walks `setSchema`
+down that path (reusing `resolveSchemaChild` + `consumeNodeKeys` for
+args/compoundKey/wildcard descent) and returns true iff the leaf is
+`multi && children==nil && args<=1 && !groupReplace`; `leafListUnionEligible`
+adds the range-separator net. `mergeLeafListInto(dst, src)` reads both sides'
+members via the #2419 dual-shape SSOT `firewallMatchValues` (Keys[1:] AND child
+leaves), preserves the dst node's shape (collapsed leaf grows on Keys, block
+container gains one child leaf per added member), and dedups. Scalar leaves and
+multi-key hierarchical containers (`family inet` / `family inet6`) are never
+unioned. Covered by `pkg/config/apply_groups_leaflist_test.go` (all four shape
+combinations, flat-set + dedup, the L-8 policy-match compile-level union, and
+scalar-still-overrides) plus the mixed-shape no-duplicate invariant from #4325.
+The exclusions are covered by `pkg/config/apply_groups_leaflist_exclude_test.go`
+(port-range override, `then community` / `then as-path-prepend` override, the
+args>=2 `address` no-token-merge, and — the narrow-exclusion proof — firewall
+`from protocol` in the same subtree STILL unions).
+
 ## `then community` operations: add / delete / set / none (#2848)
 
 The policy-term action `then community` supports the Junos/vSRX community

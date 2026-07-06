@@ -433,7 +433,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 						"source-address-name":      {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 						"destination-address":      {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"destination-address-name": {desc: "Destination address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
-						"destination-port":         {desc: "Destination port to match", args: 1, multi: true, placeholder: "<port>", children: nil},
+						"destination-port":         {desc: "Destination port to match", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
 						"application":              {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
 					}},
 					// #4313: NOT closed-world (unlike the destination-NAT then
@@ -477,7 +477,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 						"source-address-name":      {desc: "Source address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
 						"destination-address":      {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"destination-address-name": {desc: "Destination address book entry to match", args: 1, multi: true, placeholder: "<address-name>", children: nil},
-						"destination-port":         {desc: "Destination port or range to match", args: 1, multi: true, placeholder: "<port>", children: nil},
+						"destination-port":         {desc: "Destination port or range to match", args: 1, multi: true, groupReplace: true, placeholder: "<port>", children: nil},
 						"protocol":                 {desc: "IP protocol to match", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 						"application":              {desc: "Application to match", args: 1, multi: true, placeholder: "<application>", children: nil},
 					}},
