@@ -4763,16 +4763,29 @@ func validateFilterPortExceptStrict(cfg *Config) error {
 }
 
 // validateFilterAddressExceptStrict hard-rejects any firewall-filter term that
-// mixes a POSITIVE address match (a literal `source-address`/`destination-address`
-// OR a non-except `source-prefix-list`/`destination-prefix-list`) with an
-// `except` prefix-list in the SAME direction — #3359.
+// mixes a SPECIFIC positive address match (a non-match-any literal
+// `source-address`/`destination-address` OR a non-except
+// `source-prefix-list`/`destination-prefix-list`) with an `except` prefix-list
+// in the SAME direction — #3359, relaxed for the match-any case in #4338.
 //
-// Junos treats a positive address match and an `except` prefix-list as mutually
-// exclusive in one term and rejects the combination at commit. xpf's parser,
-// however, lands literal addresses on term.SourceAddresses / term.DestAddresses
-// and prefix-list references (positive AND except) on term.SourcePrefixLists /
+// The mixed SPECIFIC-positive + except shape has no faithful single-term
+// representation in xpf's boolean-inversion matcher (one direction would need
+// both a positive set AND a negated set), so it is rejected. xpf's parser lands
+// literal addresses on term.SourceAddresses / term.DestAddresses and prefix-list
+// references (positive AND except) on term.SourcePrefixLists /
 // term.DestPrefixLists (compileFilterFrom), so a positive set and an except set
 // can coexist on one direction of one term.
+//
+// #4338 (match-any composes): the canonical Junos lockdown idiom `from {
+// source-address 0.0.0.0/0; source-prefix-list mgmt except; }` (match any source
+// EXCEPT the management prefixes, then reject) is ACCEPTED by Junos and is NOT
+// rejected here. A match-any positive (`0.0.0.0/0` / `::/0` / `any`) does not
+// constrain the positive set, so `any AND NOT X` reduces exactly to the
+// sole-`except` representation ("any address not in X"). The runtime lowering
+// (ResolveFilterPrefixListAddrs) drops the redundant match-any universe and
+// emits the term as `except=true` over X, so the compiled semantics match the
+// operator's intent. Pre-#4338 this idiom was rejected with an error that
+// wrongly claimed "Junos rejects this" (false for the 0/0+except shape).
 //
 // The userspace lowering (pkg/dataplane/userspace/filters.go
 // resolvePrefixListAddrs) has no single boolean-inversion representation for the
@@ -4817,6 +4830,36 @@ func validateFilterAddressExceptStrict(cfg *Config) error {
 		}
 		return false
 	}
+	// hasSpecificAddr reports whether the literal address list carries a
+	// CONSTRAINING positive match — i.e. any literal that is NOT the match-any
+	// universe. A match-any literal (`0.0.0.0/0`, `::/0`, or the `any` / empty
+	// placeholder) does NOT constrain the positive set, so it COMPOSES with an
+	// `except` prefix-list rather than conflicting with it (#4338): the term
+	// `source-address 0.0.0.0/0; source-prefix-list X except;` is the canonical
+	// Junos "match any EXCEPT the listed prefixes" lockdown idiom, which lowers
+	// cleanly to the sole-`except` representation (the universe AND-NOT X = "any
+	// address not in X"). Only a SPECIFIC positive literal (e.g. 10.0.0.0/8)
+	// alongside an except list is a genuine conflict — it would require both a
+	// positive set and a negated set in one direction, which the boolean-
+	// inversion matcher cannot represent, so that shape stays rejected.
+	hasSpecificAddr := func(addrs []string) bool {
+		for _, a := range addrs {
+			if a == "" || a == "any" {
+				continue
+			}
+			_, ipnet, err := net.ParseCIDR(a)
+			if err != nil {
+				// Not a parseable CIDR — a malformed literal is caught by
+				// validateFilterAddressLiteralsStrict; treat it as specific
+				// (constraining) here so this gate never masks it.
+				return true
+			}
+			if ones, _ := ipnet.Mask.Size(); ones != 0 {
+				return true
+			}
+		}
+		return false
+	}
 	check := func(family string, filters map[string]*FirewallFilter) error {
 		names := make([]string, 0, len(filters))
 		for name := range filters {
@@ -4832,28 +4875,35 @@ func validateFilterAddressExceptStrict(cfg *Config) error {
 				if term == nil {
 					continue
 				}
-				srcPositive := len(term.SourceAddresses) > 0 || hasPositiveRef(term.SourcePrefixLists)
+				srcPositive := hasSpecificAddr(term.SourceAddresses) || hasPositiveRef(term.SourcePrefixLists)
 				if srcPositive && hasExcept(term.SourcePrefixLists) {
 					return fmt.Errorf(
-						"firewall family %s filter %q term %q: a positive source "+
-							"address match (`from source-address` or a non-except "+
-							"`from source-prefix-list`) and an `except` "+
-							"source-prefix-list are mutually exclusive in the same "+
-							"term (Junos rejects this; split into separate terms — the "+
-							"mixed shape cannot be enforced faithfully and would "+
-							"fail open for discard/reject)",
+						"firewall family %s filter %q term %q: a SPECIFIC positive "+
+							"source address match (a non-match-any `from source-address` "+
+							"or a non-except `from source-prefix-list`) and an `except` "+
+							"source-prefix-list have no faithful single-term "+
+							"representation in xpf (the direction would need both a "+
+							"positive and a negated set) and would fail open for "+
+							"discard/reject; split into separate terms. A match-any "+
+							"`from source-address 0.0.0.0/0`/`::/0` combined with an "+
+							"`except` source-prefix-list IS accepted — it composes to "+
+							"\"any source except the listed prefixes\"",
 						family, name, term.Name)
 				}
-				dstPositive := len(term.DestAddresses) > 0 || hasPositiveRef(term.DestPrefixLists)
+				dstPositive := hasSpecificAddr(term.DestAddresses) || hasPositiveRef(term.DestPrefixLists)
 				if dstPositive && hasExcept(term.DestPrefixLists) {
 					return fmt.Errorf(
-						"firewall family %s filter %q term %q: a positive destination "+
-							"address match (`from destination-address` or a non-except "+
-							"`from destination-prefix-list`) and an `except` "+
-							"destination-prefix-list are mutually exclusive in the same "+
-							"term (Junos rejects this; split into separate terms — the "+
-							"mixed shape cannot be enforced faithfully and would "+
-							"fail open for discard/reject)",
+						"firewall family %s filter %q term %q: a SPECIFIC positive "+
+							"destination address match (a non-match-any `from "+
+							"destination-address` or a non-except `from "+
+							"destination-prefix-list`) and an `except` "+
+							"destination-prefix-list have no faithful single-term "+
+							"representation in xpf (the direction would need both a "+
+							"positive and a negated set) and would fail open for "+
+							"discard/reject; split into separate terms. A match-any "+
+							"`from destination-address 0.0.0.0/0`/`::/0` combined with "+
+							"an `except` destination-prefix-list IS accepted — it "+
+							"composes to \"any destination except the listed prefixes\"",
 						family, name, term.Name)
 				}
 			}

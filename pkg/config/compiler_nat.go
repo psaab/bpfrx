@@ -677,8 +677,26 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 
 			// #2241: overlap rejection. Check the internal (outbound) and
 			// external (inbound) prefixes independently against prior rules.
+			//
+			// #4339: a rule is NEVER compared against itself. A single NPTv6
+			// rule in a rule-set with MULTIPLE from-scopes (`from zone A; from
+			// zone B`, or several interfaces) is scope-expanded by
+			// compileNATStatic into one StaticNATRuleSet entry PER scope, all
+			// sharing the rule-set name AND the rule name (they are one logical
+			// rule; only the from-scope differs). The seen lists span every
+			// rule-set, so the second scope-expansion's prefixes matched the
+			// first's exactly and the rule was reported as overlapping ITSELF —
+			// blocking ANY NPTv6 mapping whose rule-set had more than one
+			// from-scope. Skip the same (rule-set, rule) identity so only
+			// DISTINCT rules are compared for a genuine, order-dependent overlap.
+			sameRule := func(prev seenPrefix) bool {
+				return prev.ruleSetName == rs.Name && prev.ruleName == rule.Name
+			}
 			overlapFound := false
 			for _, prev := range internalSeen {
+				if sameRule(prev) {
+					continue
+				}
 				if overlaps(prev.net, intNet) {
 					overlapFound = true
 					if err := emit(fmt.Sprintf(
@@ -690,6 +708,9 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				}
 			}
 			for _, prev := range externalSeen {
+				if sameRule(prev) {
+					continue
+				}
 				if overlaps(prev.net, extNet) {
 					overlapFound = true
 					if err := emit(fmt.Sprintf(

@@ -36384,3 +36384,37 @@ top.
   go build ./... all clean.
 - **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go,
   pkg/config/schema_walk_internal_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix two vSRX drop-in blockers (#4338 filter 0/0+except
+  over-strict, #4339 NPTv6 self-overlap). #4338: relaxed the #3359
+  firewall-filter positive-vs-except ADDRESS mutual-exclusion gate
+  (validateFilterAddressExceptStrict) so a MATCH-ANY positive
+  (`source-address 0.0.0.0/0` / `::/0` / `any`) combined with an
+  `except` prefix-list is ACCEPTED — it composes to "any address NOT in
+  X" (the canonical Junos lockdown idiom). A SPECIFIC positive literal
+  (10.0.0.0/8) or a positive prefix-list + except stays rejected (no
+  faithful single-term representation). Fixed the reject wording that
+  falsely claimed "Junos rejects this". The runtime lowering
+  (ResolveFilterPrefixListAddrs, addrsAllMatchAny) now DROPS the
+  redundant match-any universe and emits the term as except=true over X
+  — without this the term folded positive-wins (0/0 wins → match ALL,
+  fail-OPEN). #4339: validateNPTv6Strict now SKIPS comparing a rule
+  against itself. A single NPTv6 rule bound to >1 from-scope
+  (`from zone A; from zone B`) is scope-expanded by compileNATStatic
+  into one StaticNATRuleSet entry per scope (shared rule-set + rule
+  name); the shared seen-lists made the second expansion match the
+  first exactly → "rule map-v6-neutral overlaps rule-set NPTv6-INBOUND
+  rule map-v6-neutral" (overlaps itself). Skip the same (rule-set,rule)
+  identity; genuine overlaps between DISTINCT rules still detected.
+  RED-on-revert proven for all three: config accept (#4338), runtime
+  compose (#4338), NPTv6 multi-scope commit (#4339). Full pkg/config +
+  pkg/dataplane suites, gofmt, vet, go build ./... clean.
+- **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/dataplane/userspace/filters.go,
+  pkg/config/firewall_address_except_matchany_4338_test.go,
+  pkg/config/compiler_nptv6_self_overlap_4339_test.go,
+  pkg/config/firewall_address_except_mutex_3359_test.go,
+  pkg/dataplane/userspace/filters_address_matchany_except_4338_test.go,
+  docs/feature-coverage.md, _Log.md
