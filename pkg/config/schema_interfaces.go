@@ -99,12 +99,19 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 			validator:     ValidateInteger(1, 4094),
 			children:      nil,
 		},
+		// inner-vlan-id stays typed (range-validated) so a malformed value
+		// still reports a clean error, but a well-formed inner tag is
+		// HARD-REJECTED at commit by the #2354 honest-posture gate
+		// (validateUnsupportedInterfaceStanzasAST): the AF_XDP dataplane does
+		// not enforce QinQ / stacked-VLAN transit, so committing an inner tag
+		// would be a false promise. Single 802.1Q tagging via vlan-id is
+		// supported.
 		"inner-vlan-id": {
-			desc:          "Inner VLAN ID",
+			desc:          "Inner VLAN ID (QinQ; NOT enforced — rejected at commit, #2354)",
 			args:          1,
 			placeholder:   "<number>",
 			valueType:     ValueInteger,
-			valueDesc:     "Inner (QinQ) 802.1Q VLAN ID (1..4094)",
+			valueDesc:     "Inner (QinQ) 802.1Q VLAN ID (1..4094) — stacked-VLAN transit not enforced (#2354)",
 			valueExamples: []string{"100"},
 			validator:     ValidateInteger(1, 4094),
 			children:      nil,
