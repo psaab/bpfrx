@@ -84,6 +84,55 @@ A single-fabric cluster leaves `fabricRefreshCh1` nil; the non-blocking send
 falls through its `default` arm, so `triggerFabricRefresh()` is a no-op for
 the absent fabric.
 
+**Dual-fabric egress selection by parent up-state (#4082):** the
+cross-chassis redirect egresses over a fabric parent ifindex, but the
+Rust selection (`resolve_fabric_redirect_from_list`,
+`userspace-dp/src/afxdp/forwarding/mod.rs`) historically picked the FIRST
+fabric with a valid parent ifindex — functionally `fab0` (the list is
+Go-sorted by name). A DOWN `fab0` still has a nonzero parent ifindex (and
+a stale/permanent neighbor entry can keep its peer MAC resolved), so the
+redirect stayed pinned to `fab0` and blackholed instead of failing over to
+an UP `fab1`. The data-path thus lacked the fabric redundancy the
+control-plane session-sync path already has (`activeConnLocked`,
+`pkg/cluster/sync_conn.go`, prefers conn0/fab0 and falls back to conn1/fab1).
+
+The fix threads a per-fabric `up` flag end to end:
+
+- **Go source of truth.** `buildFabricSnapshots`
+  (`pkg/dataplane/userspace/fabric.go`) stamps `FabricSnapshot.Up` from
+  `fabricParentUp(parentLinux)`, which reads the parent netdev's live
+  oper-state via `netlink.LinkByName`. Detection fails toward "up": only a
+  definite kernel down state (admin-down, `OperDown`, `OperLowerLayerDown`,
+  `OperNotPresent`) reports not-up; `OperUnknown`/`OperDormant` (common for
+  virtual/overlay parents with a live carrier) count as up, so a healthy
+  fabric is never mis-marked down. The wire field is `"up"` WITHOUT
+  `omitempty` — a genuinely-down fabric must serialize `"up":false`, not
+  drop the field.
+- **Sub-second propagation, no new monitor.** A carrier change on the
+  parent is an `RTM_NEWLINK` oper-state delta that `monitorFabricState`
+  (#124) already subscribes to → `triggerFabricRefresh()` →
+  `SyncFabricState` → `buildFabricSnapshots` re-push, with the 30s
+  safety-net tick as backstop. No userspace link-state monitor is added.
+- **Rust selection.** `resolve_fabric_redirect_from_list` prefers the
+  first fabric with `parent_ifindex > 0 && up`, walking the stable
+  Go-sorted order so both nodes deterministically favor `fab0` while it is
+  up (revert-to-primary on recovery, mirroring `activeConnLocked`). If NO
+  fabric reports up it falls back to the first resolvable fabric —
+  **fail-open**: a blackhole is no worse than a drop, and this preserves
+  the pre-#4082 behavior for a genuine all-fabrics-down state.
+- **Rolling-upgrade back-compat.** The Rust `FabricSnapshot.up` decodes
+  with `#[serde(default = "default_true")]`, so a stale daemon that omits
+  the field leaves every fabric reading up=true — bit-identical to the
+  pre-#4082 pin-to-first behavior.
+
+Single-fabric clusters are unaffected: one fabric in the list is selected
+whether or not its `up` flag is momentarily false (fail-open). **Validation
+gap:** the tested loss cluster and the standalone VM both run a single
+`fab0`, so no harness currently exercises the live `fab0`-down/`fab1`-up
+failover; the unit test (`fabric_redirect_prefers_up_fabric_4082`) covers
+the selection logic, but end-to-end dual-fabric failover needs a
+two-parent cluster build-out.
+
 ### Fix 2: VRRP Coordinated Preemption (Defense-in-depth)
 
 **Concept:** All VRRP instances preempt simultaneously when `ReleaseSyncHold()`

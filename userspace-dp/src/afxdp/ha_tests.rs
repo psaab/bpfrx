@@ -212,6 +212,7 @@ fn test_forwarding_state_with_fabric() -> ForwardingState {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
         peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
         local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
     });
     forwarding
 }

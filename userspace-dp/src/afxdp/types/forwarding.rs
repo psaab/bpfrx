@@ -719,6 +719,11 @@ pub(in crate::afxdp) struct FabricLink {
     pub(in crate::afxdp) peer_addr: IpAddr,
     pub(in crate::afxdp) peer_mac: [u8; 6],
     pub(in crate::afxdp) local_mac: [u8; 6],
+    /// #4082: the local fabric parent link's carrier/oper state, threaded from
+    /// `FabricSnapshot.up`. `resolve_fabric_redirect_from_list` prefers a fabric
+    /// with `up == true` so a dual-fabric cluster fails the cross-chassis
+    /// redirect over to the secondary when the primary parent carrier drops.
+    pub(in crate::afxdp) up: bool,
 }
 
 /// #3773 (M13): why a configured fabric link was skipped during a forwarding

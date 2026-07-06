@@ -463,6 +463,21 @@ pub(crate) struct FabricSnapshot {
     pub local_mac: String,
     #[serde(rename = "peer_mac", default)]
     pub peer_mac: String,
+    /// #4082: the local fabric parent link's carrier/oper state. The Go daemon
+    /// stamps this from the parent netdev's live oper-state so a dual-fabric
+    /// cluster can fail the cross-chassis redirect over to a secondary fabric
+    /// when the primary parent goes DOWN. `default = "default_true"` keeps a
+    /// STALE daemon that omits the field bit-identical to pre-#4082: an absent
+    /// `up` deserializes to `true`, so every fabric from an old peer reads up
+    /// and selection is unchanged (fail-open). The Go producer must NOT use
+    /// `omitempty` — a genuinely-down fabric must serialize `"up":false`, not
+    /// drop the field (which would default back to true here).
+    #[serde(rename = "up", default = "default_true")]
+    pub up: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

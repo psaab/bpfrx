@@ -950,6 +950,7 @@ fn queue_planner_includes_fabric_parent_interface() {
             peer_address: "10.99.13.2".to_string(),
             local_mac: String::new(),
             peer_mac: String::new(),
+            up: true,
         }],
         ..Default::default()
     };
@@ -988,6 +989,7 @@ fn queue_planner_deduplicates_fabric_parent_already_in_interfaces() {
             peer_address: "10.99.13.2".to_string(),
             local_mac: String::new(),
             peer_mac: String::new(),
+            up: true,
         }],
         ..Default::default()
     };

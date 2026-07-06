@@ -173,6 +173,10 @@ pub(in crate::afxdp) fn build_fabric_link_or_skip(
         peer_addr,
         peer_mac,
         local_mac,
+        // #4082: carry the parent carrier/oper state through so the redirect can
+        // prefer an UP fabric. An old daemon that omits the wire field defaults
+        // to true (fail-open) via `FabricSnapshot::default_true`.
+        up: fabric.up,
     })
 }
 
@@ -588,9 +592,21 @@ pub(super) fn resolve_fabric_redirect(
 pub(super) fn resolve_fabric_redirect_from_list(
     fabrics: &[FabricLink],
 ) -> Option<ForwardingResolution> {
+    // #4082: prefer the FIRST fabric whose local parent carrier is UP so a
+    // dual-fabric cluster fails the cross-chassis redirect over to fab1 when
+    // fab0's parent link goes down. The fabric list arrives in a stable
+    // Go-sorted-by-name order (pkg/dataplane/userspace/fabric.go), so both
+    // nodes deterministically prefer fab0 while it is up — no hash/round-robin,
+    // matching the control-plane `activeConnLocked` fab0-preferred failover.
+    // If NO fabric reports up (a stale peer that omits the `up` field defaults
+    // every fabric to up=true, so this only triggers on a genuine all-down
+    // state), fall back to the first resolvable fabric — fail-open, never worse
+    // than the pre-#4082 pin-to-first behavior (a blackhole is no worse than
+    // dropping).
     let fabric = fabrics
         .iter()
-        .find(|fabric| fabric.parent_ifindex > 0)
+        .find(|fabric| fabric.parent_ifindex > 0 && fabric.up)
+        .or_else(|| fabrics.iter().find(|fabric| fabric.parent_ifindex > 0))
         .copied()?;
     Some(ForwardingResolution {
         disposition: ForwardingDisposition::FabricRedirect,

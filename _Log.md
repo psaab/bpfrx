@@ -37129,3 +37129,49 @@ top.
   pkg/config/compiler_validate_strict.go,
   pkg/config/parser_class_of_service_test.go,
   userspace-dp/src/afxdp/types/cos.rs, _Log.md
+
+- **Timestamp**: 2026-07-06
+  **Action**: #4082 — cross-chassis fabric redirect selects an UP fabric
+  instead of pinning to the first resolvable one (dual-fabric failover).
+  The userspace-dp `resolve_fabric_redirect_from_list` picked the first
+  fabric with a valid parent ifindex — functionally `fab0`, since the Go
+  list is name-sorted. A DOWN `fab0` keeps a nonzero parent ifindex (and
+  a stale/permanent neighbor keeps its peer MAC), so the redirect stayed
+  pinned to `fab0` and blackholed instead of failing over to an UP
+  `fab1`. Threaded a per-fabric `up` flag end to end: (1) Rust wire field
+  `FabricSnapshot.up` with `#[serde(default = "default_true")]` so a
+  stale daemon omitting it reads up=true (fail-open, bit-identical to
+  today); (2) Go `FabricSnapshot.Up` (`json:"up"`, NO omitempty — a
+  down fabric must serialize `"up":false`) populated from
+  `fabricParentUp(parentLinux)` reading the parent netdev oper-state via
+  netlink (fails toward up on OperUnknown/Dormant so a healthy fabric is
+  never mis-marked down); (3) selection prefers the first
+  `parent_ifindex > 0 && up` in the stable sorted order (deterministic,
+  revert-to-primary), else falls back to the first resolvable fabric
+  (fail-open). Sub-second propagation rides the existing
+  `monitorFabricState` (#124) RTM_NEWLINK path — no new Rust link-state
+  monitor. Tests: Rust `fabric_redirect_prefers_up_fabric_4082`
+  (RED-on-revert: fab0-down/fab1-up selects fab1; both-up selects fab0;
+  both-down fails open to fab0; up-fabric selected irrespective of list
+  slot) + `fabric_snapshot_up_serde_default_true_4082` (absent field →
+  true, explicit false/true honored). Go
+  `TestFabricSnapshotUpWireField4082` (up not omitempty, round-trips) +
+  `TestFabricParentUpUnresolvable4082`. Updated all FabricLink /
+  FabricSnapshot test literals with `up: true`. Doc: docs/fabric-cross-
+  chassis-fwd.md dual-fabric egress selection subsection (+ the live
+  dual-fabric validation gap — no two-parent harness exists). HA
+  fabric-forwarding change → parent runs test-failover before merge.
+  **File(s)**: userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/fabric_up_4082_test.go,
+  docs/fabric-cross-chassis-fwd.md, _Log.md
