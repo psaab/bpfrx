@@ -1,3 +1,32 @@
+## 2026-07-06 — #4335: parser prunes an INLINE `inactive:` token (drop-in blocker)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed the parser so an INLINE `inactive:` marker (mid-statement,
+  not just leading) is pruned. Junos collapses a deactivated sub-statement onto
+  its parent statement's line, e.g. a destination-NAT pool address with a
+  deactivated port: `address 2001:559:8585:80::7aef/128 inactive: port 32400;`.
+  The lexer tokenizes `inactive:` as one identifier, so an inline marker landed
+  mid-`Keys` (`[address, 2001:...::7aef/128, inactive:, port, 32400]`); the
+  DNAT-pool compiler (`parseDNATPoolAddress`) then overwrote `pool.Address` with
+  the literal `"inactive:"` token, hard-rejecting a valid drop-in vSRX config
+  with "destination-nat pool: address inactive: is not a single host address".
+  The leading-only pruning (keys[0]=="inactive:") already lifted the whole
+  statement into `Node.Inactive`; extended `parseStatement` to also detect an
+  inline marker (index > 0) and drop the marker plus every token it governs (the
+  remainder of the statement) from the active `Keys`. A leaf carries one
+  `Inactive` flag and cannot mark part of its identity inactive, so — per the
+  #2008 H1 "deactivated == absent" doctrine — the governed sub-statement (the
+  port) is dropped: the address stays active as the pool member, the port
+  collapses to preserve-destination-port. Semantics: inline `inactive:`
+  deactivates the FOLLOWING sub-statement/modifier, NOT the parent statement.
+- **File(s)**: pkg/config/parser.go (parseStatement inline-marker branch),
+  pkg/config/inline_inactive_4335_test.go (new, RED-on-revert),
+  docs/config-schema.md ("Inline `inactive:` (mid-statement, #4335)").
+- **Validation**: `go test ./pkg/config/...` green; RED-on-revert proven
+  (neutralizing the branch fails the DNAT-pool commit + generic-prune tests
+  while the active-port and leading-marker control tests stay green);
+  `go build ./...`, gofmt, `go vet ./pkg/config/` clean.
+
 ## 2026-07-06 — #4328 follow-up: non-reth Junos-name kernel resolution + comment/speed nits
 
 - **Timestamp**: 2026-07-06
