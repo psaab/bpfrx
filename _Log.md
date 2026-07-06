@@ -36063,6 +36063,36 @@ top.
   docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
 
 - **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A — first authenticated cluster control channel + config
+  foundation for the PSK/HMAC program (F1-stronger + F23). Config: added the
+  `set chassis cluster authentication-key <key>` leaf (schema_chassis.go),
+  `ClusterConfig.ControlLinkAuthKey config.Secret` (types_chassis.go), and the
+  Secret compile (compiler_system.go). Redaction is inherited free — the
+  `authentication-key` keyword is already in ast_redact.go's secret set
+  (##SECRET-DATA## in raw-AST renders) and the Secret type redacts JSON/YAML/
+  String(). Heartbeat/election channel authed: MarshalHeartbeatAuth appends a
+  52-byte trailer (magic XPFA + session + monotonic counter + HMAC-SHA256 over
+  the whole frame) after the version trailer (additive, legacy-parseable). The
+  receiver rejects a forged/tampered/replayed heartbeat BEFORE lastSeen refresh
+  or handlePeerHeartbeat. Dual-accept (heartbeatAuthDecision) mirrors the #4126
+  VRRP-checksum migration: no key → accept all; key + present → enforce HMAC +
+  anti-replay; key + absent + peer-never-authed → accept; key + absent +
+  peerAuthSeen (sticky, set only by a verified frame) → reject (downgrade).
+  Anti-replay (heartbeatAuthReplay) is strict within a session and re-anchors on
+  a new random session id, so a reboot/restart (test-failover) is never a false
+  replay. Key plumbed via Manager.UpdateConfig → controlLinkAuthKey(); raw
+  bytes, never logged; fetched fresh each send/recv so a commit takes effect
+  without a heartbeat restart. RED-on-revert proven: neutering
+  heartbeatAuthDecision to always-accept turns bad-hmac / replay / downgrade /
+  forged-frame assertions RED. go test ./pkg/config/... ./pkg/cluster/... green
+  (incl. -race); go build ./..., gofmt, go vet clean. Follow-up channels
+  (session-sync frames, fabric gRPC) reuse the same ControlLinkAuthKey.
+- **File(s)**: pkg/config/schema_chassis.go, pkg/config/types_chassis.go,
+  pkg/config/compiler_system.go, pkg/config/compiler_cluster_authkey_4107_test.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/manager.go, pkg/cluster/group_state.go,
+  pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
 - **Action**: #4070 PR-A — fix the mixed-shape apply-groups leaf-list
   DUPLICATE-NODE bug (CASE-D). A leaf-list can be expressed as a COLLAPSED
   leaf (`name-server 1.1.1.1 2.2.2.2`, Keys[0]=="name-server") or a BLOCK
@@ -36087,6 +36117,27 @@ top.
   pkg/config/apply_groups_leaflist_test.go
 
 - **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A hardening fold (hostile-review) — close the
+  silent-downgrade-to-unsigned edge. MarshalHeartbeatAuth previously fell back
+  to emitting an UNSIGNED frame when body+52 > maxHeartbeatSize (an extreme
+  ~monitor-heavy config), which an ENFORCING peer would reject → dual-primary.
+  Fix: extracted marshalHeartbeatBody(pkt, tailReserve) from MarshalHeartbeat
+  (MarshalHeartbeat is now a tailReserve=0 wrapper, byte-identical); when a key
+  is configured MarshalHeartbeatAuth reserves heartbeatAuthTrailerSize up front
+  so the best-effort monitor section is truncated to make room while the
+  election-critical header/RG groups are always kept — the signed frame ALWAYS
+  fits its HMAC. Invariant: once a key is configured a heartbeat is NEVER
+  emitted unsigned. The residual overflow guard is unreachable at the
+  uint8-bounded RG count and fails LOUD (slog.Error) instead of emitting
+  cleartext. Added TestMarshalHeartbeatAuth_NeverUnsignedWhenKeyed (300 long-name
+  monitors overflow the cap → frame still SIGNED + verifies, groups survive,
+  monitors truncated). RED-on-revert proven: dropping the reserve re-introduces
+  the unsigned-fallback → test fails "emitted UNSIGNED under frame overflow".
+  go test ./pkg/config/... ./pkg/cluster/... green (incl. -race); go build,
+  gofmt, vet clean. Also merged origin/master (#4070/#4325 advanced); _Log.md
+  union.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/README.md, _Log.md
 - **Action**: #2387 Track A.1 + A.3 (PR-A) — add a commit-time WARNING when two
   DISTINCT routing-instances carry overlapping L3 address space, and document
   the not-session-isolated limitation. The userspace-dp session/flow identity is

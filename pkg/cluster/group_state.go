@@ -62,6 +62,16 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 		m.controlInterface = cfg.ControlInterface
 	}
 
+	// #4107: plumb the control-channel PSK. Reveal() reads the cleartext
+	// secret; it is stored as raw bytes and NEVER logged. Empty clears it
+	// (reverts to legacy dual-accept). The slice is replaced, not mutated, so
+	// the RLock read in controlLinkAuthKey() stays race-free.
+	if k := cfg.ControlLinkAuthKey.Reveal(); k != "" {
+		m.controlAuthKey = []byte(k)
+	} else {
+		m.controlAuthKey = nil
+	}
+
 	// Update peer fencing config.
 	m.peerFencing = cfg.PeerFencing
 
