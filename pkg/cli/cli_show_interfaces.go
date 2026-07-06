@@ -194,7 +194,12 @@ func (c *CLI) showInterfaces(args []string) error {
 		group := physGroups[physName]
 
 		_, rethMember, isReth := rethMaps.LookupReth(physName)
-		kernelLookup := physName
+		// A config/zone-ref name is Junos-form ("ge-0/0/2") or an alias, while
+		// the kernel netdev is "ge-0-0-2" — resolve to the kernel ifname before
+		// the lookup so a valid non-reth interface does not render "Not present"
+		// (mirrors Server.GetInterfaces, #3460 / #4328 Copilot follow-up). A
+		// reth is resolved to its local physical member instead.
+		kernelLookup := cfg.ResolveKernelIfName(physName)
 		if isReth {
 			kernelLookup = config.LinuxIfName(rethMember)
 		}
@@ -251,10 +256,13 @@ func (c *CLI) showInterfaces(args []string) error {
 
 		linkType := "Ethernet"
 		var linkDetails []string
-		if speed := readLinkSpeed(physName); speed > 0 {
+		// Read speed/duplex from the resolved kernel device (#4341): the reth
+		// aggregate has no /sys/class/net/reth0, and a Junos-form physName has
+		// no sysfs entry either — kernelLookup is the real netdev.
+		if speed := readLinkSpeed(kernelLookup); speed > 0 {
 			linkDetails = append(linkDetails, "Speed: "+formatSpeed(speed))
 		}
-		if duplex := readLinkDuplex(physName); duplex != "" {
+		if duplex := readLinkDuplex(kernelLookup); duplex != "" {
 			linkDetails = append(linkDetails, "Link-mode: "+formatDuplex(duplex))
 		}
 		extra := ""
@@ -460,8 +468,8 @@ func (c *CLI) showInterfaces(args []string) error {
 
 // rethMemberLinkState returns the admin/link ("up"/"down") state for a reth's
 // physical member, best-effort from the kernel. When the device is absent (a
-// peer-owned member, or a test host with no such netdev) both are reported
-// "down"/absent — matching the terse handler (#4328).
+// peer-owned member, or a test host with no such netdev) admin stays "up" and
+// only link is reported "down" — matching the terse handler (#4328).
 func rethMemberLinkState(member string) (admin, link string) {
 	admin, link = "up", "up"
 	kernelIf := config.LinuxIfName(member)

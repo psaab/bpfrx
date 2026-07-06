@@ -1,10 +1,35 @@
 package cli
 
 import (
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
+
+// dashNamedKernelIface finds a real host interface whose kernel name contains a
+// '-' and round-trips through LinuxIfName from its slash form, so a config name
+// authored in Junos form ("bpfrx/wan") resolves to a real netdev
+// ("bpfrx-wan"). Returns (junosName, kernelName, true) or skips.
+func dashNamedKernelIface(t *testing.T) (junos, kernel string, ok bool) {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", "", false
+	}
+	for _, in := range ifaces {
+		if in.Name == "lo" || !strings.Contains(in.Name, "-") || strings.Contains(in.Name, "/") {
+			continue
+		}
+		j := strings.ReplaceAll(in.Name, "-", "/")
+		if config.LinuxIfName(j) == in.Name {
+			return j, in.Name, true
+		}
+	}
+	return "", "", false
+}
 
 // #4328: every operational `show interfaces` variant EXCEPT `terse` failed to
 // resolve a bondless reth — the reth has no kernel netdev of its own (no link
@@ -177,6 +202,47 @@ func TestShowInterfacesRethMemberSummary4328(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("member summary missing %q\n%s", want, out)
 		}
+	}
+}
+
+// A NON-reth interface authored in Junos slash form ("bpfrx/wan") must resolve
+// to its kernel netdev ("bpfrx-wan") — the raw config-name lookup returned
+// "Not present" for a valid interface (#4328 Copilot follow-up; the same class
+// of name-resolution gap #3460 fixed for the structured GetInterfaces RPC).
+//
+// RED-on-revert: routing the summary lookup back through the raw `physName`
+// (LinkByName("bpfrx/wan") — no such kernel device) prints "Not present".
+func TestShowInterfacesNonRethKernelName4328(t *testing.T) {
+	junos, kernel, ok := dashNamedKernelIface(t)
+	if !ok {
+		t.Skip("no dash-named host interface available to exercise slash->kernel resolution")
+	}
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if err := store.LoadOverride(`
+interfaces {
+    ` + junos + ` { unit 0 { family inet { address 10.9.9.9/24; } } }
+}
+security { zones { security-zone z { interfaces { ` + junos + `.0; } } } }
+`); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	c := &CLI{store: store}
+	out := captureStdout(t, func() {
+		if err := c.showInterfaces([]string{junos}); err != nil {
+			t.Fatalf("showInterfaces(%s): %v", junos, err)
+		}
+	})
+	if strings.Contains(out, "Not present") {
+		t.Errorf("valid interface %s (kernel %s) rendered Not present:\n%s", junos, kernel, out)
+	}
+	if !strings.Contains(out, junos) {
+		t.Errorf("summary missing interface name %s:\n%s", junos, out)
 	}
 }
 

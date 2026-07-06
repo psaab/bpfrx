@@ -2,12 +2,35 @@ package grpcapi
 
 import (
 	"context"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
+
+// dashNamedKernelIface finds a real host interface whose kernel name contains a
+// '-' and round-trips through LinuxIfName from its slash form, so a Junos-form
+// config name resolves to a real netdev. Returns (junos, kernel, true) or skips.
+func dashNamedKernelIface(t *testing.T) (junos, kernel string, ok bool) {
+	t.Helper()
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", "", false
+	}
+	for _, in := range ifaces {
+		if in.Name == "lo" || !strings.Contains(in.Name, "-") || strings.Contains(in.Name, "/") {
+			continue
+		}
+		j := strings.ReplaceAll(in.Name, "-", "/")
+		if config.LinuxIfName(j) == in.Name {
+			return j, in.Name, true
+		}
+	}
+	return "", "", false
+}
 
 // #4328: the gRPC text `show interfaces` twins mirror the CLI bug — only the
 // terse handler resolved a bondless reth. `ShowInterfacesDetail` (the bare
@@ -117,6 +140,43 @@ func TestShowInterfacesTextDetailReth4328(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("reth0 text detail missing %q\n%s", want, out)
 		}
+	}
+}
+
+// A NON-reth interface authored in Junos slash form must resolve to its kernel
+// netdev on the ShowInterfacesDetail RPC (#4328 Copilot follow-up). RED-on
+// -revert: the raw config-name lookup prints "Not present".
+func TestShowInterfacesDetailRPCNonRethKernelName4328(t *testing.T) {
+	junos, kernel, ok := dashNamedKernelIface(t)
+	if !ok {
+		t.Skip("no dash-named host interface available to exercise slash->kernel resolution")
+	}
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if err := store.LoadOverride(`
+interfaces {
+    ` + junos + ` { unit 0 { family inet { address 10.9.9.9/24; } } }
+}
+security { zones { security-zone z { interfaces { ` + junos + `.0; } } } }
+`); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	s := &Server{store: store}
+	resp, err := s.ShowInterfacesDetail(context.Background(), &pb.ShowInterfacesDetailRequest{Filter: junos})
+	if err != nil {
+		t.Fatalf("ShowInterfacesDetail(%s): %v", junos, err)
+	}
+	out := resp.GetOutput()
+	if strings.Contains(out, "Not present") {
+		t.Errorf("valid interface %s (kernel %s) rendered Not present:\n%s", junos, kernel, out)
+	}
+	if !strings.Contains(out, junos) {
+		t.Errorf("RPC output missing interface name %s:\n%s", junos, out)
 	}
 }
 

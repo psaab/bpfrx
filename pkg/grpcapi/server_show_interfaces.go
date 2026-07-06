@@ -157,7 +157,12 @@ func (s *Server) ShowInterfacesDetail(_ context.Context, req *pb.ShowInterfacesD
 		group := physGroups[physName]
 
 		_, rethMember, isReth := rethMaps.LookupReth(physName)
-		kernelLookup := physName
+		// A config/zone-ref name is Junos-form ("ge-0/0/2") or an alias, while
+		// the kernel netdev is "ge-0-0-2" — resolve to the kernel ifname before
+		// the lookup so a valid non-reth interface does not render "Not present"
+		// (mirrors GetInterfaces, #3460 / #4328 Copilot follow-up). A reth is
+		// resolved to its local physical member instead.
+		kernelLookup := cfg.ResolveKernelIfName(physName)
 		if isReth {
 			kernelLookup = config.LinuxIfName(rethMember)
 		}

@@ -1,3 +1,35 @@
+## 2026-07-06 — #4328 follow-up: non-reth Junos-name kernel resolution + comment/speed nits
+
+- **Timestamp**: 2026-07-06
+- **Action**: Copilot review of PR #4333 found a real RELATED bug at the same
+  lookup sites: for a NON-reth interface the summary/detail lookup used the raw
+  config `physName` (Junos-form "ge-0/0/2" or an alias), but
+  netlink.LinkByName / net.InterfaceByName need the Linux kernel ifname
+  ("ge-0-0-2") — so a VALID interface authored in Junos form rendered
+  "Physical interface: <name>, Not present". Verified the bug MANIFESTS
+  (zone/interface refs are stored verbatim slash-form; nothing normalized
+  upstream). Fixed both physical-lookup sites to resolve via
+  `cfg.ResolveKernelIfName(physName)` — the same helper Server.GetInterfaces
+  uses (#3460) — before the netlink lookup, keeping the reth branch's
+  member resolution: pkg/cli/cli_show_interfaces.go showInterfaces (summary),
+  pkg/grpcapi/server_show_interfaces.go ShowInterfacesDetail. Also (#4341)
+  the CLI summary's readLinkSpeed/readLinkDuplex now read from the resolved
+  kernel name (a reth has no /sys/class/net/reth0, and a Junos-form physName
+  has no sysfs entry either) — the gRPC summary already read speed/duplex
+  from kernelLookup. Fixed the rethMemberLinkState doc comment to match the
+  impl (absent device → admin stays "up", only link "down"; the comment said
+  both "down"). Added portable RED-on-revert tests (pkg/cli + pkg/grpcapi)
+  that discover a real dash-named host interface, reference it via its
+  Junos-slash form, and assert the summary / RPC do NOT render "Not present"
+  (skip when no dash-named netdev exists); reverting the resolution to raw
+  physName reproduces "Not present". go build ./... clean; gofmt clean;
+  go test ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... green. Merged
+  origin/master (#4331/#4334 etc.) cleanly into the branch first.
+- **File(s)**: pkg/cli/cli_show_interfaces.go,
+  pkg/grpcapi/server_show_interfaces.go,
+  pkg/cli/cli_show_interfaces_reth_4328_test.go,
+  pkg/grpcapi/server_show_interfaces_reth_4328_test.go
+
 ## 2026-07-06 — #4328: teach all `show interfaces` text surfaces to resolve a bondless reth
 
 - **Timestamp**: 2026-07-06
