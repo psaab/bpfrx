@@ -200,10 +200,16 @@ impl TokenBucket {
     ///
     /// `now_ns` is the batch-cached `CLOCK_MONOTONIC` nanosecond already read
     /// once per poll loop (`loop_now_ns`); there is no per-packet clock read.
-    /// A non-monotonic `now_ns` (`< last_refill_ns`) is absorbed with
-    /// `saturating_sub` (no underflow; that event simply accrues no refill).
-    /// `threshold` is passed per call (a config change needs no realloc), so
-    /// the capacity clamp always tracks the live threshold.
+    /// A non-monotonic `now_ns` (`< last_refill_ns`) accrues no refill
+    /// (`saturating_sub` yields 0 elapsed) AND does NOT move `last_refill_ns`
+    /// backwards: the field is a MONOTONIC high-water mark
+    /// (`last_refill_ns = last_refill_ns.max(now_ns)`). Were it allowed to dip
+    /// to the backwards sample, the next forward `now_ns` would compute a large
+    /// elapsed against the dip and over-credit the bucket — a clock glitch
+    /// would reset the burst allowance and let a flood through in exactly the
+    /// scenario this limiter hardens. `threshold` is passed per call (a config
+    /// change needs no realloc), so the capacity clamp always tracks the live
+    /// threshold.
     pub(super) fn admit_is_over(&mut self, now_ns: u64, threshold: u32) -> bool {
         if self.last_refill_ns == 0 {
             // Cold start: begin FULL so a fresh zone admits the first
@@ -223,7 +229,10 @@ impl TokenBucket {
                 .tokens_q
                 .saturating_add(refill_q(elapsed, threshold))
                 .min(capacity_q(threshold));
-            self.last_refill_ns = now_ns.max(1);
+            // Keep `last_refill_ns` monotonic (high-water mark): a backwards
+            // `now_ns` accrued 0 refill above and must NOT rewind the mark, or a
+            // later forward step would over-credit against the dip.
+            self.last_refill_ns = self.last_refill_ns.max(now_ns);
         }
         if self.tokens_q >= ONE {
             self.tokens_q -= ONE; // consume only on admit
@@ -530,6 +539,45 @@ mod tests {
         assert!(
             tb.admit_is_over(1, THRESHOLD),
             "no spurious refill from a backwards clock"
+        );
+    }
+
+    /// RED-ON-REVERT (Copilot #4321): a backwards clock step must not rewind
+    /// the refill high-water mark, or a later forward step over-credits the
+    /// bucket and the rate limit is weakened by a clock glitch. Drain at
+    /// `base`, step BACKWARDS 5s (refills 0 — must NOT move `last_refill_ns` to
+    /// the dip), then step forward only 1us past `base`. With the monotonic
+    /// high-water mark the elapsed since the true last refill is ~1us (~0
+    /// refill) so the bucket stays limited. On the buggy code `last_refill_ns`
+    /// dipped to `base-5s`, so the forward call sees ~5s elapsed (capped at 1s
+    /// == a FULL capacity refill) and admits a fresh budget — RED.
+    #[test]
+    fn token_bucket_backwards_clock_does_not_over_credit() {
+        const THRESHOLD: u32 = 10;
+        let mut tb = TokenBucket::default();
+        let base = 10 * NS;
+        // Drain the bucket at `base`.
+        for _ in 0..(THRESHOLD * 2) {
+            tb.admit_is_over(base, THRESHOLD);
+        }
+        assert!(tb.admit_is_over(base, THRESHOLD), "bucket drained at base");
+        // Backwards clock step (5s earlier): 0 refill AND no rewind of the mark.
+        assert!(
+            tb.admit_is_over(base - 5 * NS, THRESHOLD),
+            "backwards step refills nothing — still limited"
+        );
+        // Forward again, only 1us after `base`: ~0 elapsed since the true last
+        // refill, so the bucket must STILL be limited (0 admitted).
+        let mut admitted = 0u32;
+        for _ in 0..THRESHOLD {
+            if !tb.admit_is_over(base + 1_000, THRESHOLD) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 0,
+            "a backwards-then-forward clock step must not refill the bucket \
+             (monotonic high-water mark): got {admitted} admitted"
         );
     }
 
