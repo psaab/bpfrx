@@ -18,7 +18,7 @@ therefore staged by capability, not by vendor.
 | #1434 | Multi-PEER per WG interface (N peers on one listen port) | **DONE (#1434 B1a+B1b)** — Go config `TunnelConfig.WgPeers []WgPeerConfig` (named-instance `peer <pubkey>` schema + dual-AST compiler + commit gate; the commit gate also validates the tunnel's LOCAL identity — `listen-port` in `[1,65535]` and a 64-hex `private-key` — so a value the Rust `hydrate_wg_identity` would drop the WHOLE row on can never commit clean into a silent dead tunnel, #3863), wire slice `wg_peers`, Rust engine fed N peers (RX/decap already multi-peer), egress generalized: encap LPM-selects the peer by inner-dst AllowedIPs (`frame/wg.rs` + `engine.peer_for_dest`), the WG control thread keeps per-peer effective-endpoint + per-peer handshake attempt + per-peer keepalive/rekey timers (`timer_pass_for_peer`), and per-peer status rows. The LIVE multi-peer handshake / Ubiquiti interop validation is #1703. KNOWN LIMITATION: the worker-driven NoSession/rekey REQUEST edges are still engine-wide (single edge), not per-peer — the per-peer T6/T7/T8 timers ARE per-peer; per-peer request edges ride #1703. |
 | S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | **timers + keepalives DONE (#1888/#1889)** — full whitepaper §6.1 timer machine (REKEY_AFTER_TIME 120s initiator-only, 165s receive horizon, REJECT_AFTER_TIME 180s per-use + expiry teardown, 5s/90s retry discipline, 10s passive + configured persistent keepalives, post-msg2 key-confirmation keepalive) on a blocking-poll(2) control loop; design of record `docs/research/1888-wg-timers/plan.md`. Authenticated-datagram endpoint LEARNING shipped in S2a/#1888 (keepalives now count); engine-level roam API + TAI64N disk persistence remain pending. #2961: the handshake attempt machine's GIVE-UP branch (`drive_attempt_machine`, after the 90s `REKEY_ATTEMPT_TIME` window) now advances the T8 pacing anchor (`note_t8_attempt(now)`), so a permanently-unreachable persistent-keepalive peer waits a full keepalive interval before the next `KeepaliveNoSession` initiation instead of re-firing a fresh 90s window every ~1s tick — the gap between failed-handshake windows is now ≥ keepalive_interval (matching wireguard-go, which stops re-initiating after `REKEY_ATTEMPT_TIME` until a new send/keepalive is due). A peer that comes back to life re-anchors T8 on fresh authenticated traffic (`anchor = max(last_send_any, last_recv_any, t8_last_attempt)`), so the cooldown is a floor, not a penalty on the live/successful path |
 | S6 | Junos config surface (grammar + compiler + snapshot population, base64↔hex keys) | pending |
-| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). **RESPONDER CookieReply + MAC2 under-load DoS mitigation DONE (#4094 PR-A)** — a per-tunnel rotating secret `Rm` (120 s, one-window previous-secret carry), an inbound-initiation fixed-window load gate, and MAC2 verification bind an initiation to the source that received the responder's type-3 CookieReply, so a valid-MAC1 flood (attacker knows our public key) no longer forces a Noise handshake per forged datagram. See "Responder cookie / MAC2 under-load DoS mitigation" below. The INITIATOR-side CookieReply *consume* (decrypt the cookie + re-initiate with a real MAC2 against a peer that is itself under load) is PR-B. IPv6 outer encap still pending |
+| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). **RESPONDER CookieReply + MAC2 under-load DoS mitigation DONE (#4094 PR-A)** — a per-tunnel rotating secret `Rm` (120 s, one-window previous-secret carry), an inbound-initiation fixed-window load gate, and MAC2 verification bind an initiation to the source that received the responder's type-3 CookieReply, so a valid-MAC1 flood (attacker knows our public key) no longer forces a Noise handshake per forged datagram. See "Responder cookie / MAC2 under-load DoS mitigation" below. **INITIATOR-side CookieReply *consume* DONE (#4094 PR-B)** — an inbound type-3 is decrypted (responder pubkey-derived key + our last-sent MAC1 as AAD), the cookie stored per-peer, and our NEXT initiation carries a real MAC2 (honoring the 120 s cookie TTL), so xpf-as-initiator now completes a handshake against a peer that is itself under load. IPv6 outer encap still pending |
 | S8 | HA RG WG-session migration | pending |
 
 ## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303 / #2329)
@@ -437,7 +437,10 @@ S1 makes xpf's WireGuard **handshake bytes** standards-compliant:
   type-1 MessageInitiation (148 bytes) and type-2 MessageResponse (92 bytes)
   on-wire framing — type byte, reserved, sender/receiver index, and
   `MAC1 = keyed-BLAKE2s-128(BLAKE2s-256("mac1----" || recipient_static_pub),
-  msg[0..offsetof(mac1)])`. MAC2 is emitted as zeros on build; on parse it is
+  msg[0..offsetof(mac1)])`. MAC2 is emitted as zeros on build UNLESS the
+  initiator holds a fresh cookie for the peer (#4094 PR-B — see below), in
+  which case `create_initiation` stamps
+  `MAC2 = keyed-BLAKE2s-128(cookie, msg[0..offsetof(mac2)])`; on parse it is
   skip-verified when NOT under load (spec-correct) and validated against the
   responder cookie when under load (#4094 PR-A — see below).
 
@@ -514,12 +517,51 @@ is exactly that layer.
   `xpf_userspace_wg_cookie_replies_total{event}` +
   `xpf_userspace_wg_handshake_rx_drops_total{reason=under_load_no_mac2|cookie_reply_budget}`).
 
-**Not in PR-A (→ PR-B):** the INITIATOR-side consume of an inbound type-3
-CookieReply (decrypt the cookie, store it per-peer, re-initiate with a real
-MAC2). Until PR-B, an inbound type-3 is still dropped (`hs_rx_cookie_unsupported`),
-so xpf-as-initiator cannot yet complete a handshake against a peer that is
-itself under load. The `#[cfg(test)] CookieChecker::decrypt_cookie_reply`
-mirror is the PR-B reference and proves the reply is well-formed.
+## Initiator cookie-reply consume (#4094 PR-B)
+
+PR-A gave the RESPONDER half; PR-B completes the interop by teaching the
+INITIATOR to answer a cookie challenge. Without it, an inbound type-3 was
+dropped and xpf-as-initiator could never complete a handshake against a peer
+that was itself under load (the responder keeps challenging; the initiator
+keeps sending zero-MAC2 initiations). The initiator half mirrors wireguard-go
+`CookieGenerator` and lives in `cookie::InitiatorCookie` (per-peer state held
+in `WgEngine::cookie_gen`, keyed by responder pubkey):
+
+- **On every outbound initiation** (`create_initiation` →
+  `WgEngine::add_initiator_macs` → `InitiatorCookie::add_macs`, run AFTER
+  `build_initiation` writes MAC1 and zeroes MAC2): record the message's MAC1 as
+  the AEAD AAD for a future cookie-reply, and — if we hold a cookie younger than
+  `COOKIE_ROTATION_TIME_NS` (the same 120 s TTL as the responder secret) — stamp
+  `MAC2 = keyed-BLAKE2s-128(cookie, msg[0..offsetof(mac2)])`. No cookie, or an
+  expired one, leaves MAC2 zero (spec-correct).
+- **On an inbound type-3 CookieReply** (`wg_control::dispatch_inbound` →
+  `WgEngine::consume_cookie_reply`): the reply's `receiver_index` echoes the
+  `sender_index` of the initiation that triggered it, which is the key of a
+  pending initiator handshake — look it up to attribute the reply to a peer,
+  decrypt the sealed cookie with that peer's (the responder's) public-key-derived
+  key and our stored last-sent MAC1 as the AAD
+  (`CookieChecker::decrypt_cookie_reply`, now production, not a test mirror), and
+  store the cookie + receive time. Fails CLOSED (no state change, no panic) for a
+  reply we cannot attribute (no matching in-flight initiation) or cannot decrypt
+  (wrong key / bad AAD / tampered ciphertext). A cookie-reply is XChaCha-sealed
+  under our own public-key-derived key and proves nothing about whether the
+  source holds the peer's keys, so it is NOT authenticated for endpoint-learning.
+- **Counters** — `hs_rx_cookie_consumed` (Prometheus:
+  `xpf_userspace_wg_cookie_replies_total{event=consumed}`) on a successful
+  decrypt+store; `hs_rx_cookie_unsupported` (its former S7-placeholder wire name,
+  now a real drop-by-reason site) on an unattributable / undecryptable reply.
+
+**RED-on-revert (PR-B):** `cookie.rs`
+`initiator_cookie_roundtrip_stamps_accepted_mac2` (a responder cookie-reply is
+consumed by the initiator and the retried MAC2 verifies against the responder's
+own `verify_initiation_mac2` — and is rejected from a different source),
+`initiator_expired_cookie_yields_zero_mac2` (a cookie past the 120 s TTL is not
+used), `initiator_drops_undecryptable_cookie_reply` (tampered/wrong-key reply is
+dropped fail-closed), `initiator_ignores_cookie_reply_before_any_initiation`; and
+the engine-wired end-to-end `initiator_consume_completes_handshake_under_load`
+(an initiator challenged by a responder under load consumes the cookie-reply and
+its retried `create_initiation` is admitted as `Process`). Neutering the MAC2
+stamp makes the stamping tests fail (retried MAC2 stays zero / re-challenged).
 
 **RED-on-revert:** `classify_initiation_under_load_requires_mac2` (drives a
 synthetic initiation flood past the threshold, then asserts a spoofed/unprimed

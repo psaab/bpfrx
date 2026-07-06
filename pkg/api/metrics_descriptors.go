@@ -1756,7 +1756,7 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		wgCookieRepliesTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_cookie_replies_total",
-			"WireGuard responder cookie mechanism (#4094 PR-A) by event: sent = type-3 CookieReply challenges emitted under load to valid-MAC1 initiations lacking a valid MAC2; mac2_ok = under-load initiations that carried a valid MAC2 (a primed peer) and were allowed through to the Noise handshake.",
+			"WireGuard cookie mechanism (#4094) by event: sent = type-3 CookieReply challenges the RESPONDER emitted under load to valid-MAC1 initiations lacking a valid MAC2; mac2_ok = under-load initiations that carried a valid MAC2 (a primed peer) and were allowed through to the Noise handshake; consumed = cookie-replies the INITIATOR decrypted and stored (PR-B) to arm a valid MAC2 on its next initiation.",
 			[]string{"tunnel", "event"}, nil,
 		),
 		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(

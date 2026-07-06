@@ -60,6 +60,52 @@
   `pkg/grpcapi/server_fabric_auth_4107_test.go` (new),
   `pkg/cluster/manager.go`, `docs/architecture.md`,
   `pkg/cluster/README.md`, `_Log.md`
+## 2026-07-06 — #4094 PR-B: WireGuard INITIATOR-side cookie-reply consume
+
+- **Timestamp**: 2026-07-06
+- **Action**: Completed #4094 (PR-A #4330 shipped the RESPONDER half). Taught
+  the INITIATOR to consume an inbound type-3 CookieReply and attach a real MAC2
+  to its retried handshake-init, so xpf-as-initiator now completes a handshake
+  against a peer that is itself under load. Added `cookie::InitiatorCookie` (the
+  wireguard-go `CookieGenerator` analog): per-peer state (last-sent MAC1 + last
+  decrypted cookie + receive time) held in `WgEngine::cookie_gen`
+  (`Mutex<FxHashMap<pubkey, InitiatorCookie>>`). `InitiatorCookie::add_macs`,
+  called from `create_initiation` AFTER `build_initiation` writes MAC1 + zeroes
+  MAC2, records the MAC1 (the AEAD AAD for a future reply) and — if we hold a
+  cookie younger than `COOKIE_ROTATION_TIME_NS` (120 s, reusing PR-A's constant)
+  — stamps `MAC2 = keyed-BLAKE2s-128(cookie, msg[0..132])`; an expired/absent
+  cookie leaves MAC2 zero. `WgEngine::consume_cookie_reply` (wired in
+  `dispatch_inbound`'s `WG_TYPE_COOKIE` arm, replacing the S7 drop stub) parses
+  the reply's `receiver_index`, looks it up in `pending` to attribute the reply
+  to a peer, decrypts via `CookieChecker::decrypt_cookie_reply` (promoted from a
+  `#[cfg(test)]` mirror to production) with the peer's pubkey-derived key + the
+  stored last-MAC1 as AAD, and stores the cookie. Fails CLOSED (no state change,
+  no panic) for an unattributable or undecryptable reply; a cookie-reply is not
+  authenticated for endpoint-learning. Counters: new `hs_rx_cookie_consumed` on
+  success (Prometheus `xpf_userspace_wg_cookie_replies_total{event=consumed}`),
+  and `hs_rx_cookie_unsupported` (its former S7-placeholder wire name) now a real
+  drop site. Counter bump lives inside `consume_cookie_reply` (mirroring
+  `classify_initiation`'s self-contained counter discipline) so the engine
+  method is self-testable. Tests (all RED-on-revert): 4 cookie.rs unit tests
+  (round-trip stamps-accepted MAC2 + source-binding, expired→zero MAC2,
+  undecryptable→fail-closed, reply-before-any-send ignored) + engine-wired
+  end-to-end `initiator_consume_completes_handshake_under_load`. Neutering the
+  MAC2 stamp fails the 3 stamping tests (verified). FULL cargo serial + Go
+  build/tests green.
+- **File(s)**: userspace-dp/src/afxdp/wg/cookie.rs (`InitiatorCookie` struct +
+  `add_macs`/`consume_reply`, `decrypt_cookie_reply` un-gated to production, 4
+  unit tests), userspace-dp/src/afxdp/wg/handshake_session.rs
+  (`add_initiator_macs`, `consume_cookie_reply` + `_inner`,
+  `peer_for_pending_index`, `create_initiation_inner` stamp call),
+  userspace-dp/src/afxdp/coordinator/wg_control.rs (`WG_TYPE_COOKIE` arm),
+  userspace-dp/src/afxdp/wg/engine.rs (`cookie_gen` field + init),
+  userspace-dp/src/afxdp/wg/engine_tests.rs (end-to-end interop test),
+  userspace-dp/src/afxdp/wg/counters.rs (`hs_rx_cookie_consumed` + docs),
+  userspace-dp/src/afxdp/coordinator/status.rs + userspace-dp/src/protocol/
+  control.rs + userspace-dp/src/protocol/tests.rs (wire field),
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics_userspace.go +
+  metrics_descriptors.go + metrics_wireguard_test.go (Prometheus `consumed`
+  event), docs/wireguard-interop.md.
 
 ## 2026-07-06 — #4332: WireGuard per-SOURCE cookie-reply token bucket
 

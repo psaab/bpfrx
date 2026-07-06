@@ -312,6 +312,12 @@ impl WgEngine {
             self.release_pending(local_index);
             return Err(e.into());
         }
+        // #4094 PR-B: record this initiation's MAC1 (the AEAD AAD for a
+        // future cookie-reply) and, if we already hold a fresh cookie for
+        // this peer, stamp a valid MAC2 — so a retried initiation after a
+        // cookie challenge is admitted by a responder under load. build_
+        // initiation left MAC2 zero; this is the sole site that stamps it.
+        self.add_initiator_macs(peer_pubkey, out, self.now_ns());
         // Stash the real (post-write) snow state into the pending entry so
         // `consume_response` can resume it.
         {
@@ -325,6 +331,76 @@ impl WgEngine {
             }
         }
         Ok(local_index)
+    }
+
+    /// #4094 PR-B: record the just-built outbound initiation's MAC1 and
+    /// stamp MAC2 if we hold a fresh cookie for `peer_pubkey`. Delegates to
+    /// the per-peer [`super::cookie::InitiatorCookie`]. Called from
+    /// `create_initiation_inner` after `build_initiation` has written MAC1
+    /// and zeroed MAC2. Slow path (control thread only).
+    fn add_initiator_macs(&self, peer_pubkey: &[u8; WG_KEY_LEN], out: &mut [u8], now_ns: u64) {
+        let mut cg = self.cookie_gen.lock().unwrap();
+        let entry = cg
+            .entry(*peer_pubkey)
+            .or_insert_with(super::cookie::InitiatorCookie::new);
+        entry.add_macs(out, now_ns);
+    }
+
+    /// #4094 PR-B: consume an inbound WG type-3 cookie-reply. A responder
+    /// under load answers our valid-MAC1 initiation with a cookie-reply
+    /// instead of a handshake response; this decrypts it and stores the
+    /// cookie so our NEXT initiation to that peer carries a valid MAC2.
+    ///
+    /// The reply's `receiver_index` (bytes 4..8, LE) echoes the
+    /// `sender_index` of the initiation that triggered it — the key of a
+    /// pending initiator handshake — so we look it up to attribute the reply
+    /// to a peer, then decrypt with that peer's static public key (the
+    /// responder key that derives the cookie AEAD key) and OUR stored
+    /// last-sent MAC1 as the AEAD AAD. Returns `true` iff a cookie was
+    /// decrypted and stored. Fails closed (`false`) for a wrong-length
+    /// reply, a `receiver_index` with no matching in-flight initiation, or a
+    /// decryption/authentication failure.
+    ///
+    /// Counts internally (mirroring `classify_initiation`'s self-contained
+    /// counter discipline): `hs_rx_cookie_consumed` on success,
+    /// `hs_rx_cookie_unsupported` on any drop. Slow path (control thread
+    /// only).
+    pub(crate) fn consume_cookie_reply(&self, reply: &[u8], now_ns: u64) -> bool {
+        let ok = self.consume_cookie_reply_inner(reply, now_ns);
+        if ok {
+            super::counters::WgCounters::bump(&self.counters.hs_rx_cookie_consumed);
+        } else {
+            super::counters::WgCounters::bump(&self.counters.hs_rx_cookie_unsupported);
+        }
+        ok
+    }
+
+    fn consume_cookie_reply_inner(&self, reply: &[u8], now_ns: u64) -> bool {
+        if reply.len() != super::cookie::WG_MSG_COOKIE_LEN {
+            return false;
+        }
+        let recv_index = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]);
+        let Some(peer_pubkey) = self.peer_for_pending_index(recv_index) else {
+            return false;
+        };
+        let mut cg = self.cookie_gen.lock().unwrap();
+        let entry = cg
+            .entry(peer_pubkey)
+            .or_insert_with(super::cookie::InitiatorCookie::new);
+        entry.consume_reply(reply, &peer_pubkey, now_ns)
+    }
+
+    /// The peer a pending initiator handshake with local index `index` is
+    /// with, if any. Used by `consume_cookie_reply` to attribute an inbound
+    /// cookie-reply (whose `receiver_index` echoes our `sender_index`) to a
+    /// peer. Defined here because `PendingHandshake`'s fields are private to
+    /// this module.
+    fn peer_for_pending_index(&self, index: u32) -> Option<[u8; WG_KEY_LEN]> {
+        self.pending
+            .read()
+            .unwrap()
+            .get(&index)
+            .map(|ph| ph.peer_pubkey)
     }
 
     /// Consume a peer's framed WG type-2 response, complete the initiator
