@@ -1,3 +1,30 @@
+## 2026-07-06 — #4313 PR-B: first production closed-world subtree flip (destination-NAT then)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Flipped `closedWorld: true` on the destination-NAT rule
+  then-action container (`security nat destination rule-set <rs> rule <r>
+  then`), the FIRST production subtree to opt in to the #4334 (#4313 PR-A)
+  closed-world mechanism. Leaf-completeness verified first: the Junos DNAT
+  then-action is exactly `destination-nat { off | pool <name> }` — every
+  keyword at every level below `then` is modeled and the compiler
+  (`compileNATDestination`) reads only these, so closing carries no
+  false-reject risk. An unmodeled keyword (typo like `poool`, or garbage)
+  is now REJECTED at strict commit (`SchemaValidate`) instead of committing
+  clean and being silently dropped; the tolerant Load/SyncApply path
+  downgrades to a warning (#1960), so stored/peer-synced configs are not
+  bricked. The sibling SOURCE-NAT then was deliberately NOT flipped: Junos
+  permits `then source-nat pool <name> persistent-nat { … }` at the rule
+  level (xpf models persistent-nat per-pool), so closing it would
+  false-reject a valid Junos config (#4191 class) — deferred as a follow-up.
+- **File(s)**: `pkg/config/schema_security.go` (flip + deferral comment on
+  source-NAT then), `pkg/config/schema_closedworld_nat_then_4313_test.go`
+  (new — RED-on-revert reject tests + valid-keyword + source-NAT-still-open
+  guard), `docs/config-schema.md` (#4313 section: first production flip +
+  remaining subtrees).
+- **Validation**: `go test ./pkg/config/...` and `./pkg/configstore/...`
+  green; RED-on-revert confirmed (reject tests FAIL without the flag);
+  `go build ./...`, `gofmt -l`, `go vet ./pkg/config/` clean.
+
 ## 2026-07-06 — #2354: QinQ inner-vlan-id honest-posture gate
 
 - **Timestamp**: 2026-07-06
