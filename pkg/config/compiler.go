@@ -495,6 +495,21 @@ type compileOpts struct {
 	// last-write-wins map compileFirewall always produced. Same doctrine as
 	// lenientApplicationNameCollisions.
 	lenientFirewallFilterFamilyCollisions bool
+
+	// lenientFirewallFilterFamilyAnyMatches (#4296, fable-review-167 F-1
+	// residual) downgrades the firewall-filter family-any specific-match gate
+	// (validateFirewallFilterFamilyAnyMatchesAST) from a hard compile error to a
+	// cfg.Warnings entry. #4287 dual-compiles a `family any` filter into BOTH the
+	// inet and inet6 pools; a family-specific match under `family any` (a v4/v6
+	// source/destination-address literal or a per-family icmp-type/icmp-code) is
+	// then dual-compiled verbatim and can never match the other family — an
+	// imperfect v6 under-block. The strict commit / commit-check path hard-rejects
+	// it (pointing the operator at family inet/inet6); the tolerant load / peer-
+	// sync paths downgrade to a warning so an already-persisted or peer-synced
+	// config an older binary silently accepted still BOOTS (#1960 no-brick),
+	// keeping the existing dual-compile behavior. Same doctrine as
+	// lenientFirewallFilterFamilyCollisions.
+	lenientFirewallFilterFamilyAnyMatches bool
 	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
 	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1471,6 +1486,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
 		lenientFirewallFilterFamilyCollisions:  true,
+		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1656,6 +1672,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
 		lenientFirewallFilterFamilyCollisions:  true,
+		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1966,6 +1983,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #4296 firewall-filter family-any specific-match gate. #4287 dual-compiles a
+	// `family any` filter into BOTH the inet and inet6 pools; a family-specific
+	// match under `family any` (a v4/v6 source/destination-address literal or a
+	// per-family icmp-type/icmp-code) is then dual-compiled verbatim and can never
+	// match the other family — an imperfect v6 under-block. Strict (commit /
+	// commit-check): the first such match hard-rejects, pointing at family
+	// inet/inet6. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config an older binary silently accepted still BOOTS (#1960).
+	// Runs on the group-expanded, inactive-pruned AST for the same reason as the
+	// collision gate above — only the raw AST still carries the family-any match.
+	fwFilterFamilyAnyWarnings, err := validateFirewallFilterFamilyAnyMatchesAST(
+		tree.Children, opts.lenientFirewallFilterFamilyAnyMatches)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3096: the #3079 interim NAT rule-set scope reject is LIFTED. A
 	// `security nat {source|destination|static}` rule-set whose `from`/`to`
 	// clause scopes traffic by `interface` or `routing-instance` is now
@@ -2180,6 +2213,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyWarnings...)
+	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyAnyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, ipsecTSWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)

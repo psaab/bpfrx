@@ -35784,3 +35784,29 @@ top.
   go test ./pkg/snmp/ green; go build ./pkg/snmp/ clean.
 - **File(s)**: pkg/snmp/agent.go, pkg/snmp/agent_secret_log_4302_test.go,
   _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4296 (fable-167 F-1 residual) firewall family-any specific-match
+  gate. #4287 dual-compiles a `family any` filter into BOTH FiltersInet and
+  FiltersInet6; a family-specific match under `family any` (a v4/v6
+  source/destination-address literal or a per-family icmp-type/icmp-code) was
+  dual-compiled VERBATIM, so the copy in the wrong pool never matches — the
+  v6 term falls through to the implicit ACCEPT (imperfect v6 under-block).
+  Added validateFirewallFilterFamilyAnyMatchesAST in compiler_firewall.go
+  (mirrors validateFirewallFilterFamilyCollisionsAST's strict-reject /
+  lenient-warn #1960/#3261 split), invoked in compiler.go right after the
+  collision gate; new lenientFirewallFilterFamilyAnyMatches flag set on both
+  lenient paths. Flagged leaves: source-address, destination-address,
+  icmp-type, icmp-code (next-header + prefix-lists deliberately excluded).
+  Gate fires BEFORE validateFilterAddressLiteralsStrict (#3433) so the address
+  case gets the clearer family-any message; icmp-type/icmp-code is the genuine
+  new coverage (#3433 does not check icmp).
+- **Validation**: compiler_firewall_family_any_match_4296_test.go — strict
+  reject of v4 source-address + symbolic icmp-type, lenient warn, family-
+  agnostic protocol under family any commits into both pools, single-family
+  address literals not flagged. Proven RED under gate-neuter: icmp-type went
+  nil (no other gate catches it); source-address error text reverted to the
+  #3433 message. go test ./pkg/config/... green; go build ./... clean.
+- **File(s)**: pkg/config/compiler_firewall.go, pkg/config/compiler.go,
+  pkg/config/compiler_firewall_family_any_match_4296_test.go,
+  docs/config-schema.md, _Log.md

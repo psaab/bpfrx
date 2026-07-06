@@ -425,6 +425,116 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 	return warnings, nil
 }
 
+// familyAnySpecificMatches is the set of firewall-filter `from` match leaves
+// that only make sense for ONE address family and must not appear under a
+// `family any` filter (#4296):
+//
+//   - source-address / destination-address: a firewall-filter address match is
+//     always an IP prefix LITERAL (v4 or v6), which binds to exactly one family.
+//   - icmp-type / icmp-code: ICMPv4 and ICMPv6 use DIFFERENT numeric type/code
+//     tables (echo-request is 8 for v4, 128 for v6); compileFilterFrom resolves
+//     the symbolic name via the ICMPv4 table for af=="any" (filter_match_resolve.go),
+//     so the resulting numeric is correct for at most one family.
+//
+// (next-header is the inet6 spelling of `protocol` and matches family-agnostic
+// L4 protocol NUMBERS, so it is NOT family-specific and is deliberately absent.
+// source-prefix-list / destination-prefix-list reference NAMED prefix-lists that
+// may legitimately mix v4 and v6 prefixes, so they are also not flagged here.)
+var familyAnySpecificMatches = map[string]bool{
+	"source-address":      true,
+	"destination-address": true,
+	"icmp-type":           true,
+	"icmp-code":           true,
+}
+
+// validateFirewallFilterFamilyAnyMatchesAST walks every top-level `firewall`
+// node and rejects a `family any` filter term whose `from` block carries a
+// FAMILY-SPECIFIC match leaf (#4296, fable-review-167 F-1 residual).
+//
+// #4287 fixed the original fail-open (a `family any` deny compiled into the
+// IPv4 pool only, silently letting IPv6 through) by dual-compiling a `family
+// any` filter into BOTH FiltersInet and FiltersInet6. But a family-specific
+// match under `family any` is dual-compiled VERBATIM: a v4 `source-address` (or
+// a symbolic icmp-type that resolves via the ICMPv4 table for af=="any") lands
+// in the FiltersInet6 pool as a predicate that can NEVER match a v6 packet, so
+// the v6 term falls through to the implicit ACCEPT — an imperfect v6 UNDER-block
+// (it degrades to the pre-#4287 state for that term; never an over-block, so no
+// legitimate v6 traffic is broken). These configs are also non-Junos (Junos
+// disallows family-specific matches under `family any`) and only reachable via a
+// hierarchical config-file / peer-synced AST, since the flat `set` schema does
+// not model `family any`.
+//
+// Rather than silently dual-compile a match that cannot work for one family,
+// this gate REJECTS it at commit with a message pointing the operator at
+// `family inet` / `family inet6`. Strict path (commit / commit-check,
+// lenient=false): the first offending match is a hard compile error. Lenient
+// path (load / peer-sync, lenient=true): every offending match is returned as a
+// warning and compilation continues with the existing dual-compile behavior, so
+// an already-persisted or peer-synced config that an older binary silently
+// accepted still BOOTS (#1960 / #3261 fail-closed-on-load doctrine).
+//
+// The traversal mirrors compileFirewall's family/filter/term/from walk exactly
+// (BOTH AST shapes) and aggregates across every top-level `firewall {}` block.
+func validateFirewallFilterFamilyAnyMatchesAST(nodes []*Node, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, fwNode := range nodes {
+		if fwNode.Name() != "firewall" {
+			continue
+		}
+		for _, familyNode := range fwNode.FindChildren("family") {
+			var afNodes []*Node
+			var afName string
+			if len(familyNode.Keys) >= 2 {
+				// Hierarchical: family any { ... }
+				afName = familyNode.Keys[1]
+				afNodes = []*Node{familyNode}
+			} else {
+				// Set-command shape: family { any { ... } }
+				afNodes = append(afNodes, familyNode.Children...)
+			}
+			for _, afNode := range afNodes {
+				af := afName
+				if af == "" {
+					af = afNode.Keys[0]
+					if len(afNode.Keys) >= 2 {
+						af = afNode.Keys[1]
+					}
+				}
+				if af != "any" {
+					continue
+				}
+				for _, filterInst := range namedInstances(afNode.FindChildren("filter")) {
+					if filterInst.name == "" {
+						continue
+					}
+					for _, termInst := range namedInstances(filterInst.node.FindChildren("term")) {
+						for _, fromNode := range termInst.node.FindChildren("from") {
+							for _, child := range fromNode.Children {
+								mname := child.Name()
+								if !familyAnySpecificMatches[mname] {
+									continue
+								}
+								detail := mname
+								if vals := firewallMatchValues(child); len(vals) > 0 {
+									detail = mname + " " + vals[0]
+								}
+								msg := fmt.Sprintf(
+									"firewall filter %q term %q: `from %s` is a family-specific match not allowed under `family any` — a family any filter compiles into BOTH the inet (v4) and inet6 (v6) pools (#4287), and a single-family match (a v4/v6 address literal or a per-family icmp type/code) can never match the other family, silently under-blocking it; use `family inet` or `family inet6` (#4296)",
+									filterInst.name, termInst.name, detail)
+								if !lenient {
+									return nil, fmt.Errorf("%s", msg)
+								}
+								warnings = append(warnings, msg)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return warnings, nil
+}
+
 // firewallMatchValues extracts every value carried by a `from` match-criterion
 // node, across BOTH parser AST shapes (#2545):
 //
