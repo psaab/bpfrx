@@ -29,6 +29,16 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 		return nil
 	}
 
+	// #4344: read the whole policy set from ONE snapshot (O(P+C), one brief
+	// dataplane lock) via the #3965 bulk reader instead of a per-policy
+	// ReadPolicyCounters loop that rebuilt the ruleID->counter index and
+	// rescanned the config under the policy mutex on every rule. The reader
+	// falls back to the per-policy read for dataplanes without the bulk
+	// snapshot (test fakes / retired eBPF), so the displayed values are
+	// identical. cfg is the config walked below, so the snapshot's handles
+	// line up with the handles computed here.
+	readPolicy := dpuserspace.NewPolicyCounterReader(c.dp, cfg, c.dp.ReadPolicyCounters)
+
 	// Honor `set security policy-stats system-wide enable` (#2008 M4 /
 	// #2118): per-policy hit counters are maintained and displayed only
 	// when policy-stats is enabled system-wide (default off). The
@@ -78,7 +88,7 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
 			if statsEnabled || pol.Count {
-				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+				if counters, err := readPolicy(ruleID); err == nil {
 					count = counters.Packets
 				} else if readErr == nil {
 					readErr = err
@@ -116,7 +126,7 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
 			if statsEnabled || pol.Count {
-				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+				if counters, err := readPolicy(ruleID); err == nil {
 					count = counters.Packets
 				} else if readErr == nil {
 					readErr = err
@@ -154,7 +164,7 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 		}
 		var defCount uint64
 		if statsEnabled {
-			if counters, err := c.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+			if counters, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
 				defCount = counters.Packets
 			} else if readErr == nil {
 				readErr = err

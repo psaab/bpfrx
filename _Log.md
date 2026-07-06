@@ -1,3 +1,45 @@
+## 2026-07-06 — #4344 migrate remaining policy-counter display surfaces to the bulk reader (H05/M02/M07)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Some policy-counter DISPLAY surfaces still called
+  `dp.ReadPolicyCounters` per-policy in a loop despite the #3965 bulk
+  reader (`dpuserspace.NewPolicyCounterReader`) existing — O(policies)
+  latency, each read rebuilding the ruleID->counter index and rescanning
+  the config under the dataplane policy mutex. Migrated every remaining
+  surface onto the shared reader, mirroring the `pkg/api/security.go:161`
+  reference: build `readPolicy := dpuserspace.NewPolicyCounterReader(dp,
+  cfg, dp.ReadPolicyCounters)` ONCE per render (guarded by
+  `dp.IsLoaded()`), then replace each in-loop `dp.ReadPolicyCounters(h)`
+  with `readPolicy(h)`. Surfaces migrated: CLI `showPoliciesHitCount`
+  (zone-pair + global + default-policy sentinel rows) and the `policies
+  brief` view; gRPC `showPoliciesHitCount`, `showPoliciesDetail`, and
+  structured `GetPolicies` (zone-pair + global + default rows). M02: the
+  REST `GET /api/v1/security/policies` default-policy row had bypassed the
+  reader with a standalone `s.dp.ReadPolicyCounters(sentinel)` call even
+  though the configured rows used it — routed it through the same
+  `readPolicy`. The bulk snapshot already includes the sentinel handle
+  (`ReadAllPolicyCounters` puts `DefaultPolicySentinelID`), so values are
+  identical. NO interface change (reader falls back to the per-policy read
+  for dataplanes without the bulk snapshot — test fakes / retired eBPF —
+  so existing fakes exercise the unchanged path). Value identity is pinned
+  by the existing `TestReadAllPolicyCountersMatchesPerPolicy`. Added
+  per-surface canary tests: a fake dp implementing BOTH the bulk map (with
+  authoritative values) and a poisoned per-policy fallback proves each
+  surface renders the bulk value AND never invokes the fallback
+  (`perPolicyCalls == 0`). Added an L08 static canary per package that
+  fails if a display-surface source file makes a direct `.ReadPolicyCounters(`
+  call. Docs: pkg/api/README.md + pkg/grpcapi/README.md note the completed
+  migration. `go build ./...`, gofmt, vet, and the full pkg/cli + pkg/api +
+  pkg/grpcapi suites clean.
+- **File(s)**: pkg/cli/cli_show_security.go,
+  pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_zones.go, pkg/api/security.go,
+  pkg/cli/cli_show_policies_bulk_reader_test.go,
+  pkg/grpcapi/policies_bulk_reader_test.go,
+  pkg/api/policies_bulk_reader_test.go, pkg/api/README.md,
+  pkg/grpcapi/README.md, _Log.md
+
 ## 2026-07-06 — #4340 allow "/" in address-object names (vSRX prefix-in-name drop-in blocker)
 
 - **Timestamp**: 2026-07-06
