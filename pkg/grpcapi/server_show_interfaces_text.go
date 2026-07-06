@@ -44,7 +44,11 @@ func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builde
 	// Build config lookup for description/speed/duplex/zone
 	ifCfgMap := make(map[string]*config.InterfaceConfig)
 	ifZoneMap := make(map[string]string)
+	// #4328: reth resolution — synthesize bondless reth aggregates (no kernel
+	// netdev) and annotate physical members with their aenet aggregation.
+	var rethMaps config.RethShowMaps
 	if cfg != nil {
+		rethMaps = cfg.RethShowMaps()
 		for _, ifc := range cfg.Interfaces.Interfaces {
 			ifCfgMap[ifc.Name] = ifc
 		}
@@ -86,6 +90,14 @@ func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builde
 		}
 		if zone, ok := ifZoneMap[attrs.Name]; ok {
 			fmt.Fprintf(buf, "  Security zone: %s\n", zone)
+		}
+		// #4328: annotate a physical reth member with its aenet aggregation.
+		if rethName, ok := rethMaps.LookupMember(attrs.Name); ok && cfg != nil {
+			fmt.Fprintf(buf, "  Redundant-ethernet: member of %s\n", rethName)
+			for _, ru := range cfg.RethShowUnits(rethName) {
+				fmt.Fprintf(buf, "  Logical interface %s.%d --> aenet %s.%d\n",
+					attrs.Name, ru.Unit, rethName, ru.Unit)
+			}
 		}
 		// Speed/duplex from sysfs
 		var linkExtras []string
@@ -136,6 +148,11 @@ func (s *Server) showInterfacesExtensive(cfg *config.Config, buf *strings.Builde
 		}
 		fmt.Fprintln(buf)
 	}
+
+	// #4328: bondless reth aggregates have no kernel netdev — append them.
+	if cfg != nil {
+		writeRethDetail(buf, cfg, rethMaps, "", false)
+	}
 	return nil
 }
 
@@ -151,7 +168,13 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 	})
 	ifZoneMap := make(map[string]string)
 	ifDescMap := make(map[string]string)
+	// #4328: reth resolution — a bondless reth has no kernel netdev, so the
+	// netlink walk never emits it. Build the shared maps to synthesize the
+	// aggregate from config and annotate physical members with their aenet
+	// aggregation.
+	var rethMaps config.RethShowMaps
 	if cfg != nil {
+		rethMaps = cfg.RethShowMaps()
 		for _, z := range cfg.Security.Zones {
 			if z == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
 				continue
@@ -166,6 +189,7 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 			}
 		}
 	}
+	found := false
 	for _, link := range linksList {
 		attrs := link.Attrs()
 		if attrs.Name == "lo" {
@@ -174,6 +198,7 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 		if filter != "" && attrs.Name != filter {
 			continue
 		}
+		found = true
 		adminUp := attrs.Flags&net.FlagUp != 0
 		operUp := attrs.OperState == netlink.OperUp
 		adminStr := "Disabled"
@@ -222,6 +247,14 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 			fmt.Fprintf(buf, "  Security zone: %s\n", zone)
 		}
 		fmt.Fprintf(buf, "  Logical interface %s.0\n", attrs.Name)
+		// #4328: annotate a physical reth member with its aenet aggregation.
+		if rethName, ok := rethMaps.LookupMember(attrs.Name); ok && cfg != nil {
+			fmt.Fprintf(buf, "    Redundant-ethernet: member of %s\n", rethName)
+			for _, ru := range cfg.RethShowUnits(rethName) {
+				fmt.Fprintf(buf, "    Logical interface %s.%d --> aenet %s.%d\n",
+					attrs.Name, ru.Unit, rethName, ru.Unit)
+			}
+		}
 		addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
 		if len(addrs) > 0 {
 			fmt.Fprintf(buf, "    Addresses:\n")
@@ -239,6 +272,11 @@ func (s *Server) showInterfacesDetail(cfg *config.Config, filter string, buf *st
 			fmt.Fprintf(buf, "    Output errors:              %12d\n", st.TxErrors)
 		}
 		fmt.Fprintln(buf)
+	}
+
+	// #4328: bondless reth aggregates + absent-device members.
+	if cfg != nil {
+		writeRethDetail(buf, cfg, rethMaps, filter, found)
 	}
 	return nil
 }
