@@ -36612,3 +36612,48 @@ top.
   pkg/config/firewall_address_except_mutex_3359_test.go,
   pkg/dataplane/userspace/filters_address_matchany_except_4338_test.go,
   docs/feature-coverage.md, _Log.md
+
+## 2026-07-06
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4114 — fix INVERTED screen port-scan/ip-sweep `threshold`
+  semantics (Option-1, full Junos parity). Junos: `threshold` = a
+  configurable MICROSECOND detection WINDOW; the detection COUNT is a fixed
+  10. Pre-#4114 xpf had these swapped — a configurable COUNT over a
+  hard-coded 10-second window — so a copied Junos `threshold 5000` was
+  misread as a count and clamped to never-fire (`maxScanSweepThreshold`
+  1023), and the default-armed sweep false-dropped normal browsing (11
+  distinct dests over 10s). RUST (`userspace-dp/src/screen/scan.rs`): added
+  `SCAN_DETECT_COUNT = 10` (SSOT, mirrors Go); `ScanCore::check` now takes
+  `now_micros`/`window_micros` instead of `now_secs`/`threshold`; window
+  reset keys off `window_micros`; verdict is `set.len() >=
+  SCAN_DETECT_COUNT`; removed the `MAX_UNIQUE_PER_SOURCE-1` fail-closed
+  clamp + `threshold_clamped` counter (moot — count is fixed, well under the
+  1024 memory cap). Threaded µs through `evict_stalest_in_zone` and the
+  wrappers; `cleanup` uses a `CLEANUP_WINDOW_MICROS` (1s = Junos max) floor;
+  `mod.rs scan_sweep_drop_on_new_flow` takes `now_micros` and derives secs
+  for the 30s cleanup throttle; `poll_descriptor` passes `now_ns / 1000`.
+  GO: `compiler_security_screen.go` defaults 10→5000 (Junos default µs
+  window); replaced `maxScanSweepThreshold` clamp-warn with a Junos-range
+  advisory (`validateScreenScanSweepWindows`, [1000,1000000] µs, never a
+  reject — count->window migration net); `show security screen` (CLI +
+  gRPC) labels now read "... window (…) N us". RED-on-revert PROVEN: with
+  the window reset reverted to a fixed window, spread-beyond-window probes
+  accumulate to the count and fire → `no_detect_when_dests_spread_beyond_window`
+  FAILS; restored → passes. FULL `cargo test --release` 3692 passed / 0
+  failed (screen:: 201/0, install_session_serializes ran clean, no hang).
+  `go test ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/... ./pkg/dataplane/...`
+  green; regenerated the gRPC show golden (label-only diff). Dataplane
+  screen change — a cluster screen-smoke (low window, fast scan detected /
+  normal browse not dropped) is warranted before production.
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/screen/packet.rs, userspace-dp/src/protocol/security.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md,
+  pkg/config/compiler_security_screen.go, pkg/config/compiler.go,
+  pkg/config/types_security.go, pkg/config/parser_security_test.go,
+  pkg/cli/cli_show_security_screen.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/grpcapi/testdata/server_show_golden.json,
+  docs/feature-gaps.md, docs/syn-cookie-flood-protection.md, _Log.md
