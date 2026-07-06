@@ -303,29 +303,39 @@ type SessionSync struct {
 	// IsPrimaryFn reports whether the local node is primary for the default sync scope.
 	IsPrimaryFn func() bool
 	// IsPrimaryForRGFn reports whether the local node is primary for a given RG.
-	IsPrimaryForRGFn           func(rgID int) bool
-	lastSweepTime              uint64
-	syncBackfillNeeded         atomic.Bool
-	lastNewCounter             uint64
-	lastClosedCounter          uint64
-	lastSweepEmpty             bool
-	vrfDevice                  string
-	peerClockOffset            atomic.Int64
-	clockSynced                atomic.Bool
-	zoneRGMu                   sync.RWMutex
-	zoneRGMap                  map[uint16]int
-	deleteJournalMu            sync.Mutex
-	deleteJournal              [][]byte
-	deleteJournalCap           int
-	lastPeerRxMono             atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
-	peerHeartbeatAckEver       atomic.Bool
-	readDeadline               time.Duration
-	peerSilenceLimit           time.Duration
-	bulkSendMu                 sync.Mutex
-	bulkSendNext               atomic.Uint64
-	pendingBulkAckEpoch        atomic.Uint64
-	pendingBulkAckSince        atomic.Int64
-	bulkEverCompleted          atomic.Bool
+	IsPrimaryForRGFn     func(rgID int) bool
+	lastSweepTime        uint64
+	syncBackfillNeeded   atomic.Bool
+	lastNewCounter       uint64
+	lastClosedCounter    uint64
+	lastSweepEmpty       bool
+	vrfDevice            string
+	peerClockOffset      atomic.Int64
+	clockSynced          atomic.Bool
+	zoneRGMu             sync.RWMutex
+	zoneRGMap            map[uint16]int
+	deleteJournalMu      sync.Mutex
+	deleteJournal        [][]byte
+	deleteJournalCap     int
+	lastPeerRxMono       atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+	peerHeartbeatAckEver atomic.Bool
+	readDeadline         time.Duration
+	peerSilenceLimit     time.Duration
+	bulkSendMu           sync.Mutex
+	bulkSendNext         atomic.Uint64
+	pendingBulkAckEpoch  atomic.Uint64
+	pendingBulkAckSince  atomic.Int64
+	bulkEverCompleted    atomic.Bool
+	// bulkRedriveInFlight guards the survivor-fabric cold-start bulk
+	// re-drive (#4090). A single fabric dropping mid-cold-start-bulk while
+	// the other fabric is up leaves the bulk stranded — pinned to the dead
+	// conn, never retried, and not re-triggered on the survivor (the
+	// wasDisconnected/bulkEverCompleted gate in handleNewConnection needs
+	// BOTH fabrics to have dropped). handleDisconnect schedules ONE
+	// debounced goroutine to re-run doBulkSync over the survivor; this CAS
+	// flag bounds it to a single in-flight re-drive so a survivor that ALSO
+	// flaps cannot cause a re-drive storm.
+	bulkRedriveInFlight        atomic.Bool
 	bulkMu                     sync.Mutex
 	bulkInProgress             bool
 	bulkRecvEpoch              uint64

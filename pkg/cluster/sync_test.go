@@ -4345,3 +4345,247 @@ func TestReceiveLoopKeepsConnectionAliveWithHeartbeatAck(t *testing.T) {
 		t.Fatalf("server loop failed: %v", err)
 	}
 }
+
+// readSyncFrame reads one framed sync message (header + payload) from conn and
+// returns its message type and payload. Used by the #4090 survivor re-drive
+// tests to observe what a peer fabric actually receives on the wire.
+func readSyncFrame(conn net.Conn) (msgType uint8, payload []byte, err error) {
+	hdr := make([]byte, syncHeaderSize)
+	if _, err = io.ReadFull(conn, hdr); err != nil {
+		return 0, nil, err
+	}
+	if string(hdr[0:4]) != "BPSY" {
+		return 0, nil, fmt.Errorf("bad magic: %x", hdr[0:4])
+	}
+	msgType = hdr[4]
+	pLen := binary.LittleEndian.Uint32(hdr[8:12])
+	if pLen > 1<<20 {
+		return 0, nil, fmt.Errorf("unreasonable payload length: %d", pLen)
+	}
+	if pLen > 0 {
+		payload = make([]byte, pLen)
+		if _, err = io.ReadFull(conn, payload); err != nil {
+			return 0, nil, err
+		}
+	}
+	return msgType, payload, nil
+}
+
+// TestBulkSyncRedriveOnSurvivorFabric is the #4090 RED-on-revert test: a
+// cold-start bulk streams over fabric 0, fabric 0 drops mid-bulk while fabric 1
+// is up, and the bulk must be re-driven over the survivor so the standby ends
+// with the COMPLETE session table. On revert (no re-drive path) the survivor
+// receives nothing and this test times out.
+//
+// It also proves the no-deadlock property: the re-drive is scheduled on a
+// goroutine, NOT inline. handleDisconnect holds s.mu and doBulkSync ->
+// getActiveConn re-locks s.mu, so an inline re-drive self-deadlocks inside the
+// first BulkSync — which this test detects as a hung first BulkSync.
+func TestBulkSyncRedriveOnSurvivorFabric(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, DstIP: [4]byte{10, 0, 2, 1}, Protocol: 6, SrcPort: 1001, DstPort: 80}: {IsReverse: 0, IngressZone: 1},
+			{SrcIP: [4]byte{10, 0, 1, 2}, DstIP: [4]byte{10, 0, 2, 2}, Protocol: 6, SrcPort: 1002, DstPort: 80}: {IsReverse: 0, IngressZone: 1},
+			{SrcIP: [4]byte{10, 0, 1, 3}, DstIP: [4]byte{10, 0, 2, 3}, Protocol: 6, SrcPort: 1003, DstPort: 80}: {IsReverse: 0, IngressZone: 1},
+		},
+	}
+	const wantSessions = 3
+
+	c0local, c0peer := net.Pipe()
+	c1local, c1peer := net.Pipe()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.mu.Lock()
+	ss.conn0 = c0local
+	ss.conn1 = c1local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	// Fabric 0 peer: read exactly two frames (BulkStart + one session) then
+	// close, forcing the bulk write to fail mid-stream on fabric 0.
+	go func() {
+		_, _, _ = readSyncFrame(c0peer)
+		_, _, _ = readSyncFrame(c0peer)
+		c0peer.Close()
+	}()
+
+	// Fabric 1 peer (the survivor): drain the re-driven bulk and report the
+	// session count once BulkEnd arrives.
+	type recvResult struct {
+		sessions int
+		bulkEnd  bool
+	}
+	done := make(chan recvResult, 1)
+	go func() {
+		var res recvResult
+		for {
+			msgType, _, err := readSyncFrame(c1peer)
+			if err != nil {
+				done <- res
+				return
+			}
+			switch msgType {
+			case syncMsgSessionV4:
+				res.sessions++
+			case syncMsgBulkEnd:
+				res.bulkEnd = true
+				done <- res
+				return
+			}
+		}
+	}()
+
+	// First bulk fails on fabric 0; it must return (not deadlock) and schedule
+	// the survivor re-drive.
+	bulkDone := make(chan error, 1)
+	go func() { bulkDone <- ss.BulkSync() }()
+	select {
+	case err := <-bulkDone:
+		if err == nil {
+			t.Fatal("first BulkSync over the dropped fabric 0 should have returned an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first BulkSync hung — an inline re-drive would deadlock on s.mu (#4090 no-deadlock regression)")
+	}
+
+	select {
+	case res := <-done:
+		if !res.bulkEnd {
+			t.Fatal("survivor fabric never received BulkEnd — re-drive incomplete (#4090)")
+		}
+		if res.sessions != wantSessions {
+			t.Fatalf("survivor received %d sessions, want %d — cold-start bulk not fully re-driven (#4090)", res.sessions, wantSessions)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cold-start bulk was not re-driven over the survivor fabric (#4090 RED-on-revert)")
+	}
+
+	ss.Stop()
+	c1peer.Close()
+}
+
+// TestBulkSyncNoRedriveWhenAlreadyCompleted verifies that a single-fabric drop
+// AFTER the cold-start bulk already completed does NOT re-drive (#4090). Once
+// bulkEverCompleted is set, the steady-state incremental stream already fails
+// over via the send loop, so a re-bulk would be redundant.
+func TestBulkSyncNoRedriveWhenAlreadyCompleted(t *testing.T) {
+	c0local, c0peer := net.Pipe()
+	defer c0peer.Close()
+	c1local, c1peer := net.Pipe()
+	defer c1peer.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", &mockSweepDP{})
+	ss.IsPrimaryFn = func() bool { return true }
+	var mu sync.Mutex
+	redrives := 0
+	ss.BulkSyncOverride = func() error {
+		mu.Lock()
+		redrives++
+		mu.Unlock()
+		return nil
+	}
+	ss.bulkEverCompleted.Store(true)
+	ss.mu.Lock()
+	ss.conn0 = c0local
+	ss.conn1 = c1local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	ss.handleDisconnect(c0local)
+
+	if ss.bulkRedriveInFlight.Load() {
+		t.Fatal("re-drive was scheduled after the bulk already completed (#4090)")
+	}
+	// Give any (erroneously spawned) goroutine a moment to run.
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	got := redrives
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("doBulkSync ran %d times after completion, want 0 (#4090)", got)
+	}
+	if !ss.IsConnected() {
+		t.Fatal("survivor fabric 1 should keep the sync connected")
+	}
+}
+
+// TestBulkSyncRedriveInFlightGuard verifies the CAS in-flight guard: while one
+// survivor re-drive is running, a second fabric flap does NOT spawn a second
+// re-drive (#4090 storm prevention).
+func TestBulkSyncRedriveInFlightGuard(t *testing.T) {
+	c0localA, c0peerA := net.Pipe()
+	c0localB, c0peerB := net.Pipe()
+	c1local, c1peer := net.Pipe()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", &mockSweepDP{})
+	ss.IsPrimaryFn = func() bool { return true }
+
+	entered := make(chan struct{}, 4)
+	release := make(chan struct{})
+	ss.BulkSyncOverride = func() error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	}
+
+	// Survivor drainer so the post-release sendBulkMarkers write completes.
+	go func() {
+		for {
+			if _, _, err := readSyncFrame(c1peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	ss.mu.Lock()
+	ss.conn0 = c0localA
+	ss.conn1 = c1local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	// First flap: fabric 0 (conn A) drops with fabric 1 up -> schedules the
+	// re-drive, which sets bulkRedriveInFlight synchronously and then blocks in
+	// the override.
+	ss.handleDisconnect(c0localA)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first survivor re-drive never started (#4090)")
+	}
+	if !ss.bulkRedriveInFlight.Load() {
+		t.Fatal("re-drive in-flight flag should be set while a re-drive is running")
+	}
+
+	// Reconnect fabric 0 (conn B) so two fabrics are up again, then flap it
+	// while the first re-drive is still in flight. The CAS guard must refuse a
+	// second re-drive.
+	ss.mu.Lock()
+	ss.conn0 = c0localB
+	ss.mu.Unlock()
+	ss.handleDisconnect(c0localB)
+
+	select {
+	case <-entered:
+		t.Fatal("a second re-drive was spawned while one was in-flight (#4090 storm)")
+	case <-time.After(200 * time.Millisecond):
+		// good — no second re-drive
+	}
+
+	// Let the in-flight re-drive finish and confirm the flag resets.
+	close(release)
+	deadline := time.After(5 * time.Second)
+	for ss.bulkRedriveInFlight.Load() {
+		select {
+		case <-deadline:
+			t.Fatal("in-flight flag never reset after re-drive completed (#4090)")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	ss.Stop()
+	c0peerA.Close()
+	c0peerB.Close()
+	c1peer.Close()
+}

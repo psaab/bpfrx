@@ -1742,5 +1742,42 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()
 		}
+	} else if !s.bulkEverCompleted.Load() {
+		// #4090: a survivor fabric is still up but the cold-start bulk
+		// never completed. The bulk streams over a SINGLE connection
+		// (BulkSync/sendBulkMarkers pin s.getActiveConn once); if that
+		// connection dropped mid-stream the bulk is stranded — it is not
+		// retried on the survivor and handleNewConnection will not
+		// re-trigger it (its wasDisconnected gate needs BOTH fabrics to
+		// have dropped). Re-drive doBulkSync over the survivor.
+		//
+		// This MUST be a goroutine, not inline: handleDisconnect holds
+		// s.mu, and doBulkSync -> BulkSync/sendBulkMarkers -> getActiveConn
+		// re-locks s.mu (self-deadlock if run inline). The CAS guard bounds
+		// re-drives to one in-flight at a time so a survivor that also flaps
+		// (its own write failure re-entering handleDisconnect) cannot spawn a
+		// storm; the flag is reset when the re-drive goroutine returns.
+		if s.bulkRedriveInFlight.CompareAndSwap(false, true) {
+			slog.Info("cluster sync: scheduling cold-start bulk re-drive on survivor fabric",
+				"had_conn0", s.conn0 != nil, "had_conn1", s.conn1 != nil)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer s.bulkRedriveInFlight.Store(false)
+				// A concurrent reconnect (both-fabric drop then reconnect)
+				// may have already re-primed via handleNewConnection.
+				if s.bulkEverCompleted.Load() {
+					return
+				}
+				// Reset the stranded pending-ack epoch so the re-run's fresh
+				// epoch supersedes it (a latched phantom pending epoch would
+				// block manual failover, #3912).
+				s.pendingBulkAckEpoch.Store(0)
+				s.pendingBulkAckSince.Store(0)
+				if err := s.doBulkSync(); err != nil {
+					slog.Warn("cluster sync: cold-start bulk re-drive failed", "err", err)
+				}
+			}()
+		}
 	}
 }
