@@ -1,3 +1,22 @@
+## 2026-07-06 — #4282 part (a): lock CoS-submit owner TX accounting (tx_packets/tx_bytes)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Verified at HEAD (origin/master f7d3b2367) that every CoS
+  packet-ship settle boundary bumps the owner binding's
+  `live.tx_packets` / `live.tx_bytes` — no genuine gap, so part (a) is a
+  regression LOCK, not a fix. The three code-level `fetch_add` sites are
+  `submit_local` (CoSBatch::Local non-exact batch), `submit_prepared`
+  (CoSBatch::Prepared non-exact batch), and `apply_direct_exact_send_result`
+  (the single funnel for the four exact direct-service settle sites in
+  `service.rs` — local|prepared × FIFO|flow-fair). Added three RED-on-revert
+  unit tests that call each site directly and assert the exact
+  (tx_packets, tx_bytes) pair, so a future refactor that drops the counter
+  fails on revert. Full `cargo test --release` = 3679 passed / 0 failed.
+  Part (b) (no dehydrate counterpart to `rehydrate_worker_active_count`)
+  recorded as a PLAN-DEFER-to-/research comment on #4282 — the issue stays
+  OPEN to track that deferred worker-lifecycle-accounting design pass.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/tests.rs
+
 ## 2026-07-05 — #3607: screen flood token bucket (Option B) — fix RateCounter sustained-at-threshold over-throttle
 
 - **Timestamp**: 2026-07-05
