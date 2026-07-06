@@ -704,6 +704,26 @@ under the daemon's errgroup. Nothing else imports this package.
   are omitted for a non-scheduled (always-on) policy. The gRPC
   `MatchPoliciesResponse.description` (field 18), `scheduler_name` (field 19),
   and `scheduler_active` (field 20) mirror these.
+- #3627 B1a: a `to-zone junos-host` query also carries the structured
+  `host_inbound` object — WHICH host-inbound-traffic system-service / protocol
+  token admits the host-bound tuple, or that the box denies / globally accepts /
+  cannot classify it. It is the REST projection of the shared
+  `policymatch.Result.HostInbound` (`dataplane/userspace.HostInboundAdmission`),
+  the SAME classifier the local CLI `show security match-policies` host-inbound
+  line renders (the merged #4352) and the gRPC `host_inbound` message (field 21)
+  carries, so the three surfaces cannot drift (#3375). Fields: `status`
+  (`token-admit` / `global-accept` / `denied` / `indeterminate`), `token` and
+  `kind` (`system-services` / `protocols`, set only for `token-admit`), and
+  `description` (the one-line CLI explanation, so a JSON client renders the same
+  sentence without re-deriving it). The classifier reads the same structured
+  token->tuple SSOT the kernel-nft builder renders from
+  (`config.HostInboundServiceMatch` / `HostInboundProtocolMatch`), so a reported
+  token can never claim a port the box does not open. Present ONLY for a
+  host-bound query — on both the `host_inbound_unmatched` verdict and a matched
+  `to-zone junos-host` policy (the host-inbound gate is a separate admission
+  stage); OMITTED for every transit / global / default / content-rejected
+  verdict, which has no host-inbound gate. It is additional context and never
+  changes `matched` / `host_inbound_unmatched`.
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

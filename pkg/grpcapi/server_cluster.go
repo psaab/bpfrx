@@ -10,6 +10,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
 	"github.com/psaab/xpf/pkg/routing"
@@ -258,6 +259,11 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 			// matched-policy scope to fill from_zone/to_zone).
 			QueriedFromZone: req.FromZone,
 			QueriedToZone:   req.ToZone,
+			// #3627 B1a: name the admitting host-inbound-traffic token (or report
+			// deny / global-accept / indeterminate) so a gRPC client sees WHICH
+			// system-service/protocol governs local delivery for this tuple, the
+			// same detail the local CLI prints (#4352). nil off-host / not-computed.
+			HostInbound: hostInboundToProto(res.HostInbound),
 		}, nil
 	}
 	if !res.Matched {
@@ -310,6 +316,11 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		SrcAddresses:    res.SrcAddresses,
 		DstAddresses:    res.DstAddresses,
 		Applications:    res.Applications,
+		// #3627 B1a: a matched `to-zone junos-host` policy still passes through
+		// the separate host-inbound-traffic admission gate, so carry the
+		// classifier verdict here too (present for any host-bound query; nil for
+		// a transit/global match, which has no host gate).
+		HostInbound: hostInboundToProto(res.HostInbound),
 	}, nil
 }
 
@@ -326,6 +337,45 @@ func grpcICMPValue(v *uint32) (*uint8, error) {
 	}
 	u := uint8(*v)
 	return &u, nil
+}
+
+// hostInboundToProto projects the shared host-inbound-traffic classifier verdict
+// (policymatch.Result.HostInbound, #3627 B1a) onto the structured proto message
+// so a gRPC MatchPolicies caller sees WHICH host-inbound-traffic
+// system-service/protocol token admits a host-bound tuple — the same detail the
+// local CLI `show security match-policies` prints (#4352). It reads the same
+// SSOT-backed classifier the CLI and REST surfaces read, so the three cannot
+// drift (#3375). Returns nil (field omitted on the wire) for a nil admission (an
+// off-host query has no host-inbound gate) or a not-computed status (no meaningful
+// admission to report), matching the CLI, which prints nothing in those cases.
+func hostInboundToProto(a *dpuserspace.HostInboundAdmission) *pb.HostInboundAdmission {
+	if a == nil || a.Status == dpuserspace.HostInboundNotComputed {
+		return nil
+	}
+	return &pb.HostInboundAdmission{
+		Status:      hostInboundStatusToProto(a.Status),
+		Token:       a.Token,
+		Kind:        a.Kind,
+		Description: a.Describe(),
+	}
+}
+
+// hostInboundStatusToProto maps the Go classifier status enum to the proto enum
+// explicitly (rather than trusting numeric coincidence) so a future reordering
+// of either enum fails to compile here instead of silently mislabeling a verdict.
+func hostInboundStatusToProto(s dpuserspace.HostInboundStatus) pb.HostInboundAdmissionStatus {
+	switch s {
+	case dpuserspace.HostInboundIndeterminate:
+		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_INDETERMINATE
+	case dpuserspace.HostInboundGlobalAccept:
+		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_GLOBAL_ACCEPT
+	case dpuserspace.HostInboundTokenAdmit:
+		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_TOKEN_ADMIT
+	case dpuserspace.HostInboundDenied:
+		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_DENIED
+	default:
+		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_NOT_COMPUTED
+	}
 }
 
 // grpcResolveAddress looks up a named address in the global address book and returns its CIDR suffix.

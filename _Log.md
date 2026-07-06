@@ -1,3 +1,33 @@
+## 2026-07-06 — #3627 B1a: surface host-inbound admission on REST + gRPC match-policies
+
+- **Timestamp**: 2026-07-06
+- **Action**: Completed the #3627 B1a SSOT the merged #4352 established (CLI
+  already done) by surfacing the structured host-inbound-traffic admission on
+  the REST and gRPC `match-policies` surfaces. Both read the SAME
+  `policymatch.Result.HostInbound`
+  (`dataplane/userspace.HostInboundAdmission{Status,Token,Kind}`) the CLI
+  renders, so a REST/gRPC caller now sees WHICH system-service/protocol token
+  admits a host-bound tuple (or deny / global-accept / indeterminate) instead of
+  only the verdict. Added proto enum `HostInboundAdmissionStatus` + message
+  `HostInboundAdmission` and `MatchPoliciesResponse.host_inbound` (field 21),
+  regenerated the Go bindings, populated it from the gRPC handler
+  (`hostInboundToProto` / `hostInboundStatusToProto` — explicit enum map so a
+  reorder fails to compile), added the mirrored REST `MatchPoliciesResult.
+  HostInbound` (`MatchPoliciesHostInbound`) + `hostInboundToREST`. Present only
+  for a host-bound query (host_inbound_unmatched OR a matched to-zone junos-host
+  policy — separate admission stage); omitted for transit/global/default/
+  content-rejected. REST + gRPC landed TOGETHER to avoid a #3375 divergence.
+  RED-on-revert verified on both packages (neutralized the helper → host_inbound
+  nil → token assertions fail); CLI/gRPC/REST value-parity proven against the
+  same `policymatch.Match` result the CLI uses. Rust per-tuple parity test is a
+  separate follow-up (kept Go-only; set-level `TestHostInboundRustClassifier
+  MatchesGoSSOT` still holds).
+- **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go
+  (regenerated), pkg/grpcapi/server_cluster.go, pkg/api/security.go,
+  pkg/api/types.go, pkg/api/README.md, pkg/grpcapi/README.md,
+  pkg/grpcapi/server_matchpolicies_hostinbound_3627_test.go (new),
+  pkg/api/security_matchpolicies_hostinbound_3627_test.go (new)
+
 ## 2026-07-06 — #4313 PR-C: three more closed-world IPsec subtree flips
 
 - **Timestamp**: 2026-07-06
