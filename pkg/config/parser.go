@@ -191,6 +191,12 @@ func (p *Parser) skipToBlockClose() {
 // tokenizes `inactive:` as a single identifier; the parser detects it as
 // the leading key of a statement and lifts it into Node.Inactive rather
 // than letting it mangle the node's identity (Keys[0]).
+//
+// The marker is recognized ONLY when the source token is a bare
+// TokenIdentifier. A QUOTED `"inactive:"` (TokenString) is a literal value
+// that merely equals the marker text (e.g. `description "inactive:";`) and
+// must be preserved, so parseStatement gates both the leading and inline
+// marker checks on the parallel token-kind slice from parseKeys (#4348).
 const inactiveMarker = "inactive:"
 
 // parseStatement parses one statement: keys followed by ; or { block }.
@@ -199,7 +205,7 @@ const inactiveMarker = "inactive:"
 // and key matching, schema walks, and group merge keep working unmodified.
 func (p *Parser) parseStatement() *Node {
 	statementStart := p.lexer.Peek()
-	keys := p.parseKeys()
+	keys, kinds := p.parseKeys()
 	if len(keys) == 0 {
 		// Recovery: skip unexpected token
 		tok := p.lexer.Next()
@@ -212,12 +218,16 @@ func (p *Parser) parseStatement() *Node {
 
 	// Detect a leading `inactive:` deactivation marker and lift it off the
 	// keys. A lone `inactive:` with no following statement is a parse error
-	// (Junos requires a statement to deactivate).
+	// (Junos requires a statement to deactivate). The marker is recognized
+	// ONLY as a bare identifier token — a QUOTED `"inactive:"` (TokenString)
+	// is a literal value (e.g. `description "inactive:";`) and must be
+	// preserved, never treated as a deactivation marker (#4348).
 	inactive := false
 	markerLine, markerCol := statementStart.Line, statementStart.Column
-	if keys[0] == inactiveMarker {
+	if kinds[0] == TokenIdentifier && keys[0] == inactiveMarker {
 		inactive = true
 		keys = keys[1:]
+		kinds = kinds[1:]
 		if len(keys) == 0 {
 			p.addError(markerLine, markerCol,
 				"inactive: marker must be followed by a statement")
@@ -244,8 +254,10 @@ func (p *Parser) parseStatement() *Node {
 	// as a deactivated leaf would be for compilation. A leading marker is
 	// already lifted above, so any remaining marker is strictly inline (index
 	// > 0) and leaves at least the statement's identity key intact.
+	// As with the leading marker, only a bare identifier `inactive:` counts;
+	// a quoted `"inactive:"` value (TokenString) is preserved (#4348).
 	for i, k := range keys {
-		if i > 0 && k == inactiveMarker {
+		if i > 0 && kinds[i] == TokenIdentifier && k == inactiveMarker {
 			keys = keys[:i]
 			// The governed tokens were only on the key line of a leaf; a
 			// trailing `{ ... }` cannot follow an inline marker in valid
@@ -319,18 +331,25 @@ func (p *Parser) skipStatementBody() {
 }
 
 // parseKeys reads one or more identifiers/strings until { or ; or } or EOF.
-func (p *Parser) parseKeys() []string {
+// It returns the token VALUES and a parallel slice of the source token KINDS
+// (TokenIdentifier vs TokenString). The kinds let the caller distinguish a
+// bare identifier `inactive:` (a deactivation marker) from a quoted
+// `"inactive:"` value that happens to equal the marker text (#4348) — the
+// []string alone flattens the two into an indistinguishable string.
+func (p *Parser) parseKeys() ([]string, []TokenType) {
 	var keys []string
+	var kinds []TokenType
 	for {
 		tok := p.lexer.Peek()
 		if tok.Type == TokenIdentifier || tok.Type == TokenString {
 			p.lexer.Next()
 			keys = append(keys, tok.Value)
+			kinds = append(kinds, tok.Type)
 		} else {
 			break
 		}
 	}
-	return keys
+	return keys, kinds
 }
 
 func (p *Parser) addError(line, col int, msg string) {

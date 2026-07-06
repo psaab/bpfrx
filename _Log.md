@@ -32,6 +32,26 @@
   accepts inner-vlan-id with nil error, lenient emits no warning); single-tag
   negative passes with and without the gate; `go build ./...`, `go vet
   ./pkg/config/`, gofmt on modified files all clean.
+## 2026-07-06 — #4348: gate the `inactive:` marker on TokenIdentifier not TokenString
+
+- **Timestamp**: 2026-07-06
+- **Action**: Follow-up to #4335/#4347. `parseKeys` flattened `TokenString`
+  and `TokenIdentifier` into one `[]string`, so a QUOTED value exactly equal
+  to `inactive:` (e.g. `description "inactive:";`) was indistinguishable from
+  a bare deactivation marker and got silently truncated — the value dropped
+  and the statement wrongly deactivated. This hit BOTH the leading (index 0)
+  and the inline (index > 0, added by #4347) marker handlers. Fix:
+  `parseKeys` now returns a parallel `[]TokenType` (token-kind) slice, and
+  both marker checks in `parseStatement` require
+  `kinds[i] == TokenIdentifier && keys[i] == inactiveMarker`. A quoted
+  `"inactive:"` (TokenString) is preserved verbatim as a literal value; a
+  bare identifier `inactive:` still deactivates (leading) or drops its
+  governed tokens (inline) exactly as before. RED-on-revert regression in
+  `quoted_inactive_4348_test.go` (leading + inline quoted-value preserved;
+  bare leading/inline unchanged; normal quoted value unaffected).
+- **File(s)**: `pkg/config/parser.go`,
+  `pkg/config/quoted_inactive_4348_test.go`, `docs/config-schema.md`,
+  `_Log.md`
 
 ## 2026-07-06 — #4342 / #4343: session-invalidation residuals (default-policy + scheduler)
 
