@@ -35765,3 +35765,22 @@ top.
   gofmt + vet clean.
 - **File(s)**: pkg/cli/cli_request_policies_check.go,
   pkg/cli/cli_request_policies_check_test.go, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4302 (follow-up to #4289 S-3) SNMP v2c community secret-leak
+  scrub. Two pre-existing debug log lines in pkg/snmp/agent.go echoed the
+  v2c community string (the shared secret): the invalid-community drop in
+  handleV2cPacket (`slog.Debug("SNMP: invalid community", "community",
+  string(community))`) and the read-only SET denial in handleSet. Scrubbed
+  both to log the request SOURCE instead of the secret, matching the #4289
+  source-denied log. handleSet now takes srcIP (threaded from
+  handleV2cPacket) so the denial is correlatable by source; the invalid-
+  community line logs `known_community=false`. The community value is only
+  used to echo back in the response varbind (buildResponse), never logged.
+- **Validation**: new agent_secret_log_4302_test.go captures Debug-level
+  slog output and asserts the community secret is ABSENT and the source IP
+  present for both paths; proven RED under revert (old lines leaked
+  s3cr3t-unknown-community / s3cr3t-readonly-community into the record).
+  go test ./pkg/snmp/ green; go build ./pkg/snmp/ clean.
+- **File(s)**: pkg/snmp/agent.go, pkg/snmp/agent_secret_log_4302_test.go,
+  _Log.md
