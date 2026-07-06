@@ -255,6 +255,19 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 			}
 		}
 		if !found {
+			// Cross-shape guard (#4070): a single-key group container is a
+			// leaf-list expressed in BLOCK shape (Keys == ["name-server"]).
+			// If the destination already holds the same leaf-list as a
+			// COLLAPSED leaf sharing Keys[0] (e.g. "name-server 9.9.9.9"),
+			// the two express the SAME statement in different shapes. The
+			// explicit stanza value wins (same precedence rule as
+			// hasMatchingLeaf), so skip the group container instead of
+			// appending a duplicate second node for the same key. Multi-key
+			// containers (e.g. ["family","inet"]) are real hierarchical
+			// nodes, never leaf-lists, so they are never cross-suppressed.
+			if len(s.Keys) == 1 && hasMatchingLeaf(*dst, s.Keys) {
+				continue
+			}
 			*dst = append(*dst, s)
 		}
 	}
@@ -287,12 +300,29 @@ func keysMatchWildcard(dst, src []string) bool {
 // hasMatchingLeaf returns true if nodes contains a leaf whose first key
 // matches. This prevents group values from overriding explicit config
 // (e.g., if "host-name explicit" already exists, "host-name group" is skipped).
+//
+// It ALSO matches a single-key CONTAINER whose Keys[0] equals keys[0]
+// (#4070). A leaf-list can be expressed either as a collapsed leaf
+// ("name-server 1.1.1.1 2.2.2.2", Keys[0]=="name-server") or as a block
+// container ("name-server { 1.1.1.1; 2.2.2.2; }", Keys==["name-server"]).
+// Recognizing the block container here lets a collapsed group leaf and an
+// existing block stanza (or vice versa) be treated as the SAME leaf-list
+// instead of emitting both a leaf AND a container for one key. Only
+// single-key containers cross-match: multi-key containers (e.g.
+// ["family","inet"]) are real hierarchical nodes, never leaf-lists, and a
+// leaf sharing only Keys[0] must not be confused with them.
 func hasMatchingLeaf(nodes []*Node, keys []string) bool {
 	if len(keys) == 0 {
 		return false
 	}
 	for _, n := range nodes {
-		if n.IsLeaf && len(n.Keys) > 0 && n.Keys[0] == keys[0] {
+		if len(n.Keys) == 0 || n.Keys[0] != keys[0] {
+			continue
+		}
+		if n.IsLeaf {
+			return true
+		}
+		if len(n.Keys) == 1 {
 			return true
 		}
 	}

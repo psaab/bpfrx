@@ -36107,3 +36107,106 @@ top.
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
   pkg/api/metrics_userspace.go, pkg/api/metrics_wireguard_test.go,
   docs/wireguard-interop.md, docs/wg-interop-runbook.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A — first authenticated cluster control channel + config
+  foundation for the PSK/HMAC program (F1-stronger + F23). Config: added the
+  `set chassis cluster authentication-key <key>` leaf (schema_chassis.go),
+  `ClusterConfig.ControlLinkAuthKey config.Secret` (types_chassis.go), and the
+  Secret compile (compiler_system.go). Redaction is inherited free — the
+  `authentication-key` keyword is already in ast_redact.go's secret set
+  (##SECRET-DATA## in raw-AST renders) and the Secret type redacts JSON/YAML/
+  String(). Heartbeat/election channel authed: MarshalHeartbeatAuth appends a
+  52-byte trailer (magic XPFA + session + monotonic counter + HMAC-SHA256 over
+  the whole frame) after the version trailer (additive, legacy-parseable). The
+  receiver rejects a forged/tampered/replayed heartbeat BEFORE lastSeen refresh
+  or handlePeerHeartbeat. Dual-accept (heartbeatAuthDecision) mirrors the #4126
+  VRRP-checksum migration: no key → accept all; key + present → enforce HMAC +
+  anti-replay; key + absent + peer-never-authed → accept; key + absent +
+  peerAuthSeen (sticky, set only by a verified frame) → reject (downgrade).
+  Anti-replay (heartbeatAuthReplay) is strict within a session and re-anchors on
+  a new random session id, so a reboot/restart (test-failover) is never a false
+  replay. Key plumbed via Manager.UpdateConfig → controlLinkAuthKey(); raw
+  bytes, never logged; fetched fresh each send/recv so a commit takes effect
+  without a heartbeat restart. RED-on-revert proven: neutering
+  heartbeatAuthDecision to always-accept turns bad-hmac / replay / downgrade /
+  forged-frame assertions RED. go test ./pkg/config/... ./pkg/cluster/... green
+  (incl. -race); go build ./..., gofmt, go vet clean. Follow-up channels
+  (session-sync frames, fabric gRPC) reuse the same ControlLinkAuthKey.
+- **File(s)**: pkg/config/schema_chassis.go, pkg/config/types_chassis.go,
+  pkg/config/compiler_system.go, pkg/config/compiler_cluster_authkey_4107_test.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/manager.go, pkg/cluster/group_state.go,
+  pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4070 PR-A — fix the mixed-shape apply-groups leaf-list
+  DUPLICATE-NODE bug (CASE-D). A leaf-list can be expressed as a COLLAPSED
+  leaf (`name-server 1.1.1.1 2.2.2.2`, Keys[0]=="name-server") or a BLOCK
+  container (`name-server { 1.1.1.1; 2.2.2.2; }`, Keys==["name-server"]).
+  Before the fix, `mergeNodes` only cross-recognized the SAME shape
+  (leaf-vs-leaf override, container-vs-container union); a MIXED shape for
+  the same key emitted BOTH a leaf AND a container — a duplicate that is
+  never correct. Made the group-inheritance merge shape-agnostic on Keys[0]:
+  broadened `hasMatchingLeaf` to also match a single-key CONTAINER sharing
+  Keys[0] (a block-shaped leaf-list), and added a symmetric guard in the
+  container branch so a group block container is suppressed when the stanza
+  already holds the same leaf-list as a collapsed leaf. Multi-key containers
+  (e.g. `["family","inet"]`) are never cross-suppressed (len==1 gate). Only
+  the DUPLICATE-NODE bug is fixed; the union-vs-override VALUE decision for
+  SAME-shape leaf-lists (CASE-B override / CASE-C union preserved unchanged)
+  remains the deferred half of #4070. Added dual-shape RED-on-revert tests
+  (both mixed orderings collapse to ONE node; same-shape override/union
+  unchanged; multi-key sibling containers both survive). Verified RED on
+  Edit-revert (2 nodes) and GREEN with the fix; full pkg/config suite,
+  gofmt, vet, and `go build ./...` all clean.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/apply_groups_leaflist_test.go
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4107 PR-A hardening fold (hostile-review) — close the
+  silent-downgrade-to-unsigned edge. MarshalHeartbeatAuth previously fell back
+  to emitting an UNSIGNED frame when body+52 > maxHeartbeatSize (an extreme
+  ~monitor-heavy config), which an ENFORCING peer would reject → dual-primary.
+  Fix: extracted marshalHeartbeatBody(pkt, tailReserve) from MarshalHeartbeat
+  (MarshalHeartbeat is now a tailReserve=0 wrapper, byte-identical); when a key
+  is configured MarshalHeartbeatAuth reserves heartbeatAuthTrailerSize up front
+  so the best-effort monitor section is truncated to make room while the
+  election-critical header/RG groups are always kept — the signed frame ALWAYS
+  fits its HMAC. Invariant: once a key is configured a heartbeat is NEVER
+  emitted unsigned. The residual overflow guard is unreachable at the
+  uint8-bounded RG count and fails LOUD (slog.Error) instead of emitting
+  cleartext. Added TestMarshalHeartbeatAuth_NeverUnsignedWhenKeyed (300 long-name
+  monitors overflow the cap → frame still SIGNED + verifies, groups survive,
+  monitors truncated). RED-on-revert proven: dropping the reserve re-introduces
+  the unsigned-fallback → test fails "emitted UNSIGNED under frame overflow".
+  go test ./pkg/config/... ./pkg/cluster/... green (incl. -race); go build,
+  gofmt, vet clean. Also merged origin/master (#4070/#4325 advanced); _Log.md
+  union.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/README.md, _Log.md
+- **Action**: #2387 Track A.1 + A.3 (PR-A) — add a commit-time WARNING when two
+  DISTINCT routing-instances carry overlapping L3 address space, and document
+  the not-session-isolated limitation. The userspace-dp session/flow identity is
+  the bare 5-tuple (userspace-dp/src/session/key.rs) with no VRF discriminator,
+  so overlapping-address flows in different routing-instances collide in the
+  conntrack map — LIVE under PBR `then routing-instance` (the established-session
+  fast path runs before the PBR table override, so a second colliding flow
+  inherits the first's cached egress / NAT / policy). New validator
+  validateVRFOverlap mirrors validateScreenScanSweepThresholds: deterministic
+  []string, sorted RI names / filter names / prefixes. Builds RI -> prefix set
+  from BOTH native RI membership (ri.Interfaces -> unit Addresses) AND PBR
+  `then routing-instance` filter terms (source/dest match prefixes), then
+  compares every distinct RI pair for net/netip Prefix.Overlaps. WARNING, never a
+  reject — overlapping-subnet multi-tenant PBR VRF is a legitimate working
+  design. Wired into the compiler.go warnings aggregation next to
+  validateScreenScanSweepThresholds. A.3: forwarding/README.md records the
+  single-forwarding-domain / not-session-isolated limitation + the #3096
+  NAT-scope-vs-session-cache coherence contract. The VRF-aware session key
+  (Track B — SessionKey widening + FlowCacheLookup + reverse-key transforms + HA
+  wire bump) is the deferred real fix; #2387 stays open for it. RED-on-revert
+  proven (removing the validateVRFOverlap call -> 0 warnings -> positive tests
+  FAIL; restored -> GREEN). Full pkg/config suite, gofmt, vet, go build ./... all
+  clean.
+- **File(s)**: pkg/config/compiler_validate_vrf_overlap.go,
+  pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
+  userspace-dp/src/afxdp/forwarding/README.md, _Log.md
