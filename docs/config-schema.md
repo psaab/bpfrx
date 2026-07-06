@@ -4606,6 +4606,22 @@ the DNAT-pool compiler read the literal `inactive:` token as the pool
 address, hard-rejecting a valid drop-in vSRX config
 (`inline_inactive_4335_test.go`).
 
+**Quoted `"inactive:"` is a value, not a marker (#4348).** The marker
+detection is gated on the source TOKEN KIND, not just the token text. A
+bare `inactive:` lexes as a `TokenIdentifier`; a quoted `"inactive:"` (e.g.
+`description "inactive:";`) lexes as a `TokenString`. `parseKeys` returns a
+parallel token-kind slice alongside the key values, and BOTH the leading
+(index 0) and inline (index > 0) marker checks require
+`kinds[i] == TokenIdentifier && keys[i] == inactiveMarker`. Without the
+kind gate the flattened `[]string` made a quoted value equal to the marker
+text indistinguishable from a bare marker, so the value was silently
+truncated (leading: the whole statement wrongly deactivated and the value
+dropped; inline: the value and everything after it dropped from `Keys`). A
+quoted `"inactive:"` is now preserved verbatim as a literal value
+(`quoted_inactive_4348_test.go`). Real-world impact is near-zero — no Junos
+leaf's value is the bare token `inactive:` — but the parser no longer loses
+data for a value that merely equals the marker text.
+
 **Strip-before-validate / strip-before-compile contract.** A deactivated
 statement must be excluded from BOTH the typed-leaf gate and the compiler,
 and Junos accepts a deactivated leaf even when its value would be rejected
