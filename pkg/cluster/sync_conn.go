@@ -474,6 +474,28 @@ func configureSessionSyncConn(conn net.Conn) {
 
 func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
 	configureSessionSyncConn(conn)
+
+	// #4107 F23: authenticate the stream at connection setup before any session
+	// frame flows. A dropped handshake (bad PSK proof / downgrade attempt / I/O)
+	// closes the connection; the accept/connect loops retry, so this never
+	// bricks a keyed↔keyed reconnect during failover (both nodes are up and
+	// keyed → the handshake completes in milliseconds).
+	mode, frameKey, pending, err := s.performSyncHandshake(conn)
+	if err != nil {
+		slog.Warn("cluster sync: auth handshake failed, dropping connection",
+			"fabric", fabricIdx, "remote", connRemoteAddrString(conn), "err", err)
+		conn.Close()
+		return
+	}
+	// Wrap so writeFull seals and receiveLoop verifies per-frame auth when the
+	// connection authenticated; an unauthenticated wrapper is a pass-through.
+	conn = s.wrapSyncConn(fabricIdx, conn, mode, frameKey)
+	// A legacy/unkeyed peer's first real frame was consumed by the handshake
+	// read — process it before the receive loop starts so no message is lost.
+	if pending != nil {
+		s.handleMessage(conn, pending.typ, pending.payload)
+	}
+
 	s.mu.Lock()
 	wasDisconnected := s.conn0 == nil && s.conn1 == nil
 	activeBefore := -1
@@ -1301,6 +1323,26 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 			payload = make([]byte, hdr.Length)
 			if _, err := io.ReadFull(conn, payload); err != nil {
+				return
+			}
+		}
+		// #4107 F23: on an authenticated connection every frame carries a
+		// per-connection sequence + HMAC trailer. Read and verify it before the
+		// message is trusted; a bad HMAC (forgery/tamper) or a non-increasing
+		// sequence (replay/regression) drops the connection.
+		if ac, ok := conn.(*authConn); ok && ac.authed() {
+			trailer := make([]byte, syncAuthFrameTrailerSize)
+			if _, err := io.ReadFull(conn, trailer); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				slog.Debug("cluster sync: read auth trailer error", "err", err)
+				return
+			}
+			if err := ac.verifyFrame(hdrBuf, payload, trailer); err != nil {
+				slog.Warn("cluster sync: frame authentication failed, dropping connection",
+					"local", connLocalAddrString(conn), "remote", connRemoteAddrString(conn), "err", err)
+				s.stats.Errors.Add(1)
 				return
 			}
 		}

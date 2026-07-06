@@ -45,7 +45,18 @@ func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
 
 // writeFull loops until all bytes are written or an error occurs, handling
 // short writes from TCP backpressure.
+//
+// writeFull is the single chokepoint through which every outgoing sync frame
+// passes (writeMsg builds a frame then calls writeFull; the send loop calls it
+// with pre-encoded frames). On an AUTHENTICATED connection (#4107 F23) it seals
+// each complete frame with a per-connection sequence + HMAC trailer here, once,
+// so the seal covers all writers uniformly. All callers hold s.writeMu, so the
+// assigned sequence order equals the on-wire order. Frames on an
+// unauthenticated (dual-accept) connection are written unchanged.
 func writeFull(conn net.Conn, buf []byte) error {
+	if ac, ok := conn.(*authConn); ok && ac.authed() {
+		buf = ac.sealFrame(buf)
+	}
 	if err := conn.SetWriteDeadline(time.Now().Add(syncWriteDeadline)); err != nil {
 		return err
 	}
