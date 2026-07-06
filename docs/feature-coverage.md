@@ -46,6 +46,17 @@ the userspace dataplane admission boundary is in
   zone reaps on the operator's window instead of the global default. It is
   node-local config-derived state (re-derived per HA node, never on the
   session-sync wire); the #3315 accepted-but-inert commit warning is removed.
+  **Flood shaper token bucket (#3607)**: the ICMP/UDP flood per-zone
+  aggregates, the standby SYN-cookie ACK validation budget, and the SYN-flood
+  aggregate DROP path when `syn-cookie` is OFF use a monotonic-ns fixed-point
+  `TokenBucket` (`screen/rate.rs`, 16 B, integer refill, no per-packet clock
+  read) so a sustained sender parked at exactly the threshold is admitted at
+  the configured rate instead of being throttled to ~0 after the first second
+  (the fixed-window over-throttle), while a sub-ms burst is still bounded to
+  the capacity (#2937). The SYN-flood aggregate that ACTIVATES cookies when
+  `syn-cookie` is ON, the alarm-threshold measurement, and the #3315 sketch
+  deliberately stay on the count-all sliding-window `RateCounter` (there
+  "admitted" means "skip the cookie / alarm / per-IP cap").
 - **Firewall filters**: policer (token bucket + three-color), lo0 filter,
   flexible match, port ranges, hit counters, logging, forwarding-class
   DSCP rewrite.

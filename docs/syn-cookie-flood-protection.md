@@ -328,13 +328,25 @@ because they all map to the same 64-second epoch. The epoch leaf
 seconds and never touches the clock. A standby peer
 accepts a valid cookie ACK even when it has not locally observed the flood
 threshold; ACKs outside the transmitted-epoch window are prefiltered before
-SipHash, and plausible standby ACKs are rate-limited per zone over a sliding
-1-second window. The limiter (`screen/rate.rs`) is a two-bucket sliding-window
-counter rather than a fixed wall-second window: the immediately preceding
-second's tally still contributes for the whole of the current second, so an
-attacker cannot double the plausible-ACK validation budget by straddling a
-wall-second boundary (#2937). The same counter type gates the ICMP/UDP/SYN
-flood screens.
+SipHash, and plausible standby ACKs are rate-limited per zone. That limiter is
+a monotonic-nanosecond **token bucket** (`screen/rate.rs::TokenBucket`, #3607;
+capacity = refill = the per-second budget): it admits a legitimate returning
+client parked at exactly the budget rate — critical right after a failover,
+when the two-bucket sliding-window counter it replaced throttled such clients
+to ~0 until a fully idle second (the #3607 over-throttle) — while a
+sub-millisecond boundary straddle still sees at most `budget` tokens, so an
+attacker cannot double the plausible-ACK validation budget across a wall-second
+boundary (#2937 preserved). The same token bucket is the drop authority for the
+ICMP/UDP flood per-zone aggregates and for the SYN-flood aggregate DROP path
+when `syn-cookie` is OFF (with no cookie to bypass, a sustained-at-threshold
+legitimate SYN stream must be admitted, so the bucket — not the count-all
+counter — is the sole drop gate on every initial SYN). The SYN-flood aggregate
+that ACTIVATES cookies when `syn-cookie` is ON, the alarm-threshold arrival-rate
+measurement, and the #3315 per-source/per-destination sketch deliberately stay
+on the count-all sliding-window `RateCounter`: there "admitted" means "skip a
+security response" (the cookie challenge, the alarm, the per-IP cap), so the
+sustained-at-threshold over-throttle is protective or benign rather than a bug
+(see `screen/rate.rs` and `docs/research/3607-screen-rate/plan.md`).
 Invalid ACKs outside a local active flood window remain ordinary session-miss
 traffic instead of being counted as cookie failures.
 
