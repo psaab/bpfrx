@@ -100,18 +100,27 @@ type ClusterConfig struct {
 	// cluster stanza but no explicit `node` leaf must NOT be treated as
 	// "node 0" when reconciling against the /etc/xpf/node-id file, or an
 	// absent leaf on a node-1 box would false-reject as a mismatch.
-	NodeIDSet             bool
-	RethCount             int
-	HeartbeatInterval     int    // milliseconds, 0=default(1000)
-	HeartbeatThreshold    int    // missed heartbeats before lost, 0=default(3)
-	ControlInterface      string // interface for heartbeat traffic (e.g. "hb0")
-	PeerAddress           string // peer node's control link IP (e.g. "10.99.0.2")
-	FabricInterface       string // interface for session/config sync (e.g. "fab0")
-	FabricPeerAddress     string // peer's fabric link IP (e.g. "10.99.1.2")
-	Fabric1Interface      string // secondary fabric interface (e.g. "fab1")
-	Fabric1PeerAddress    string // peer's secondary fabric IP
-	ConfigSync            bool   // enable config synchronization to peer on commit
-	ControlLinkRecovery   bool   // enable control-link-recovery
+	NodeIDSet           bool
+	RethCount           int
+	HeartbeatInterval   int    // milliseconds, 0=default(1000)
+	HeartbeatThreshold  int    // missed heartbeats before lost, 0=default(3)
+	ControlInterface    string // interface for heartbeat traffic (e.g. "hb0")
+	PeerAddress         string // peer node's control link IP (e.g. "10.99.0.2")
+	FabricInterface     string // interface for session/config sync (e.g. "fab0")
+	FabricPeerAddress   string // peer's fabric link IP (e.g. "10.99.1.2")
+	Fabric1Interface    string // secondary fabric interface (e.g. "fab1")
+	Fabric1PeerAddress  string // peer's secondary fabric IP
+	ConfigSync          bool   // enable config synchronization to peer on commit
+	ControlLinkRecovery bool   // enable control-link-recovery
+	// ControlLinkAuthKey is the #4107 shared PSK that authenticates cluster
+	// control-channel messages. When set, the heartbeat/election channel is
+	// signed with HMAC-SHA256; a forged or unauthenticated heartbeat is
+	// rejected once BOTH nodes carry the key (dual-accept during a rolling
+	// upgrade so a mixed-version cluster does not split-brain). ${node}-
+	// agnostic: the SAME key on both nodes, synced by config-sync. Secret-
+	// typed so it is redacted on every show/log/JSON/YAML path and never
+	// echoed into an error string.
+	ControlLinkAuthKey    Secret
 	NATStateSync          bool   // enable NAT state synchronization (session sync with NAT fields)
 	IPsecSASync           bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
 	DHCPLeaseSync         bool   // enable DHCP-server lease synchronization (#2239 PATH C: lease state held on standby, seeded into Kea on takeover)
