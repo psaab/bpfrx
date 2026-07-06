@@ -306,11 +306,22 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	// are captured but currently inert (see CoSTrafficControlProfile).
 	for _, inst := range namedInstances(node.FindChildren("traffic-control-profiles")) {
 		tcp := &CoSTrafficControlProfile{Name: inst.name}
-		if shapingNode := inst.node.FindChild("shaping-rate"); shapingNode != nil {
-			// #4228 Gap 2: shaping-rate is an absolute bandwidth OR `percent <n>`.
+		// #4228 Gap 2: shaping-rate is an absolute bandwidth OR `percent <n>`.
+		// Iterate ALL shaping-rate statements (not just FindChild's first): the
+		// flat-set percent form (`shaping-rate percent 90`) lands as a SEPARATE
+		// sibling node from an absolute `shaping-rate 1g`, so reading only the
+		// first would be order-dependent AND would silently ignore a conflicting
+		// second statement. Accumulating both fields lets
+		// validateClassOfServiceStrict catch the bytes+percent conflict (mirrors
+		// the transmit-rate per-child accumulation). Copilot #4320.
+		for _, shapingNode := range inst.node.FindChildren("shaping-rate") {
 			rate, percent := parseCoSShapingRate(shapingNode)
-			tcp.ShapingRateBytes = rate
-			tcp.ShapingRatePercent = percent
+			if rate > 0 {
+				tcp.ShapingRateBytes = rate
+			}
+			if percent > 0 {
+				tcp.ShapingRatePercent = percent
+			}
 		}
 		if grNode := inst.node.FindChild("guaranteed-rate"); grNode != nil {
 			if v := nodeVal(grNode); v != "" {

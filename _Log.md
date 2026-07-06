@@ -1,3 +1,42 @@
+## 2026-07-06 — config/daemon: PR #4320 Copilot review folds (4 edges)
+
+- **Timestamp**: 2026-07-06
+  - **Action**: Folded 4 Copilot findings on PR #4320 before merge.
+    (FIX 1, silent partial clear) `clearSessionsForPolicyIDs`
+    (daemon_policy_invalidate.go) discarded the `ForEachV4/V6` enumerate
+    errors — a failed iteration produced a partial/empty clear while logging an
+    apparently-successful invalidation. Now captures both errors; on non-nil it
+    logs `slog.Error` ("clear is PARTIAL") and SUPPRESSES the Info success line,
+    while still clearing whatever was gathered (partial beats none). Shared core,
+    so both the deleted- and modified-policy paths benefit.
+    (FIX 2/3, NaN bypass) `validateClassOfServiceStrict`
+    (compiler_validate_strict.go) percent range checks `< 0 || > 100` let NaN
+    through (NaN compares false to both bounds). Added `math.IsNaN` + `math.IsInf`
+    guards to BOTH the transmit-rate and shaping-rate checks (added `math`
+    import). A constructed/peer-synced/rollback config with a non-finite percent
+    is now rejected.
+    (FIX 4, order-dependent shaping-rate) tcp shaping-rate read via
+    `FindChild("shaping-rate")` (compiler_class_of_service.go) — the flat-set
+    `percent` form lands as a SEPARATE sibling node, so FindChild picked
+    whichever came first and silently ignored a conflicting second statement,
+    defeating the bytes+percent conflict check. Now iterates
+    `FindChildren("shaping-rate")` and accumulates both fields (mirrors the
+    transmit-rate per-child handling), so validateClassOfServiceStrict reliably
+    rejects `shaping-rate 1g; shaping-rate percent 90;` regardless of order.
+  - **Action**: Tests. New internal `compiler_cos_rate_percent_strict_4320_test.go`
+    (NaN/Inf transmit + shaping rejected; finite accepted). Added
+    `TestCoSShapingRateBytesAndPercentConflict_Rejected` (both orders) to the
+    external CoS test. Added `TestClearSessionsForPolicyIDs_EnumerateErrorNotSilent`
+    (slog-capture: Error logged, Info suppressed, partial clear proceeds) +
+    `iterErr` field on the mock DP. RED-on-revert verified for all 4.
+  - **File(s)**: pkg/daemon/daemon_policy_invalidate.go,
+    pkg/daemon/daemon_policy_invalidate_test.go,
+    pkg/daemon/daemon_policy_modified_4234_test.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_class_of_service.go,
+    pkg/config/compiler_cos_rate_percent_strict_4320_test.go,
+    pkg/config/schema_validate_cos_rate_percent_4228_test.go
+
 ## 2026-07-05 — config/daemon: #4228 Gap 2 (transmit-rate/shaping-rate percent) + #4234 modified-policy session re-eval
 
 - **Timestamp**: 2026-07-05

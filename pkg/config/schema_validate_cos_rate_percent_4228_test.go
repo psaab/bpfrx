@@ -175,6 +175,45 @@ func TestCoSShapingRateRemainder_Rejected(t *testing.T) {
 	}
 }
 
+// Copilot #4320 FIX 4: a traffic-control-profile carrying BOTH an absolute
+// shaping-rate and a `percent` shaping-rate (separate flat-set sibling nodes)
+// must be REJECTED at compile, not silently resolved order-dependently. The
+// compiler iterates ALL shaping-rate statements and merges both fields so
+// validateClassOfServiceStrict catches the conflict. RED on revert: FindChild
+// reads only the first statement, so bytes+percent never coexist and the
+// conflict goes undetected.
+func TestCoSShapingRateBytesAndPercentConflict_Rejected(t *testing.T) {
+	orders := [][]string{
+		{
+			"set class-of-service traffic-control-profiles p1 shaping-rate 1g",
+			"set class-of-service traffic-control-profiles p1 shaping-rate percent 90",
+		},
+		{ // reverse order must be equally rejected (order-independence)
+			"set class-of-service traffic-control-profiles p1 shaping-rate percent 90",
+			"set class-of-service traffic-control-profiles p1 shaping-rate 1g",
+		},
+	}
+	for i, cmds := range orders {
+		tree := &config.ConfigTree{}
+		for _, cmd := range cmds {
+			path, err := config.ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("order %d ParseSetCommand(%q): %v", i, cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("order %d SetPath(%q): %v", i, cmd, err)
+			}
+		}
+		_, err := config.CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("order %d: bytes+percent shaping-rate conflict was not rejected", i)
+		}
+		if !strings.Contains(err.Error(), "shaping-rate") {
+			t.Fatalf("order %d: error should reference shaping-rate: %v", i, err)
+		}
+	}
+}
+
 // Advisory: a percent transmit-rate is accepted but flagged inert.
 func TestCoSTransmitRatePercent_EmitsInertAdvisory(t *testing.T) {
 	cfg := mustCompileSet4228(t,

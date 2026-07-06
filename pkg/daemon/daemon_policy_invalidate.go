@@ -173,8 +173,14 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	// reverse + DNAT companions. A reverse entry carries the SAME policy_id as
 	// its forward, so including it would double-delete the same session and, for
 	// a NAT'd flow, target the translated tuple instead of the install key.
+	//
+	// Capture the enumerate error: a failed iteration yields a partial (or empty)
+	// entry set, so clearing what we gathered would silently leave should-be-
+	// cleared sessions forwarding while logging an apparently-clean invalidation.
+	// Surface it loudly and suppress the success line so the partial clear is
+	// observable, not masked (Copilot #4320).
 	var v4Entries []dataplane.SessionEntryV4
-	_ = store.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	v4EnumErr := store.ForEachV4(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -185,7 +191,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	})
 
 	var v6Entries []dataplane.SessionEntryV6
-	_ = store.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	v6EnumErr := store.ForEachV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
@@ -194,6 +200,15 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		}
 		return true
 	})
+	if v4EnumErr != nil || v6EnumErr != nil {
+		slog.Error("policy session invalidation: session-table enumerate failed; clear is PARTIAL — some sessions of changed policies may keep forwarding",
+			"change", what, "reason", reason, "policies", len(ids),
+			"v4_err", v4EnumErr, "v6_err", v6EnumErr,
+			"v4_matched", len(v4Entries), "v6_matched", len(v6Entries))
+		// Fall through to clear what we DID enumerate — a partial clear is
+		// strictly better than none — but the error log above ensures the
+		// partial state is visible and the success line below is skipped.
+	}
 
 	if len(v4Entries) == 0 && len(v6Entries) == 0 {
 		return
@@ -230,13 +245,18 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	}
 
 	// One-time state transition, not a per-session/per-tick event — slog.Info is
-	// the right level (project logging rules).
-	slog.Info("cleared sessions of changed policies at commit",
-		"change", what,
-		"policies", len(ids),
-		"v4_cleared", v4Cleared,
-		"v6_cleared", v6Cleared,
-		"ha_sync", syncPeer)
+	// the right level (project logging rules). Suppress the success line when the
+	// enumerate failed: the counts describe only what we managed to gather, so an
+	// Info "cleared" line would misreport a partial clear as complete (the Error
+	// line above already recorded it).
+	if v4EnumErr == nil && v6EnumErr == nil {
+		slog.Info("cleared sessions of changed policies at commit",
+			"change", what,
+			"policies", len(ids),
+			"v4_cleared", v4Cleared,
+			"v6_cleared", v6Cleared,
+			"ha_sync", syncPeer)
+	}
 }
 
 // changedPolicyRuntimeIDs returns the OLD numeric runtime IDs of policies that

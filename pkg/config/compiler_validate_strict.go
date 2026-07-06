@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"sort"
@@ -5470,9 +5471,14 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 				"class-of-service scheduler %q transmit-rate: set exactly one of an absolute rate, `percent <n>`, or `remainder`",
 				sched.Name)
 		}
-		if sched.TransmitRatePercent < 0 || sched.TransmitRatePercent > 100 {
+		// Reject non-finite explicitly: NaN compares false to BOTH range bounds,
+		// so a constructed/peer-synced config could smuggle a NaN percent past a
+		// bare `< 0 || > 100` check (Copilot #4320). Inf is caught by `> 100`,
+		// but guard it too for a clear message.
+		if math.IsNaN(sched.TransmitRatePercent) || math.IsInf(sched.TransmitRatePercent, 0) ||
+			sched.TransmitRatePercent < 0 || sched.TransmitRatePercent > 100 {
 			return fmt.Errorf(
-				"class-of-service scheduler %q transmit-rate percent %.4g is out of range (0,100]",
+				"class-of-service scheduler %q transmit-rate percent %.4g is not a finite value in range (0,100]",
 				sched.Name, sched.TransmitRatePercent)
 		}
 		// Both buffer-size forms set simultaneously is ambiguous. The compiler
@@ -5500,9 +5506,12 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 				"class-of-service traffic-control-profiles %q shaping-rate: set exactly one of an absolute rate or `percent <n>`",
 				tcp.Name)
 		}
-		if tcp.ShapingRatePercent < 0 || tcp.ShapingRatePercent > 100 {
+		// Reject non-finite explicitly (NaN slips past a bare range check —
+		// Copilot #4320).
+		if math.IsNaN(tcp.ShapingRatePercent) || math.IsInf(tcp.ShapingRatePercent, 0) ||
+			tcp.ShapingRatePercent < 0 || tcp.ShapingRatePercent > 100 {
 			return fmt.Errorf(
-				"class-of-service traffic-control-profiles %q shaping-rate percent %.4g is out of range (0,100]",
+				"class-of-service traffic-control-profiles %q shaping-rate percent %.4g is not a finite value in range (0,100]",
 				tcp.Name, tcp.ShapingRatePercent)
 		}
 	}

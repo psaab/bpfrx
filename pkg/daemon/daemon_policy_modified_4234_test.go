@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"bytes"
+	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -163,4 +166,41 @@ func TestClearSessionsForModifiedPolicies(t *testing.T) {
 			t.Errorf("without policy-rematch the session table must not be scanned (%d iterate calls)", dp.iterateCalls)
 		}
 	})
+}
+
+// TestClearSessionsForPolicyIDs_EnumerateErrorNotSilent is the FIX 1 test
+// (Copilot #4320): when the session-table enumeration fails, the shared clear
+// core must NOT log an apparently-successful "cleared sessions" line — a
+// partial clear has to be observable as an error, not masked. It still clears
+// whatever it managed to gather (a partial clear beats none). RED on revert:
+// with the ForEachV4/V6 error discarded, the success Info line fires and no
+// error is surfaced.
+func TestClearSessionsForPolicyIDs_EnumerateErrorNotSilent(t *testing.T) {
+	sess := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 40001, DstPort: 80, Protocol: 6}
+	dp := &policyInvalTestDP{
+		v4: map[dataplane.SessionKey]dataplane.SessionValue{
+			sess: {State: dataplane.SessStateEstablished, PolicyID: 7},
+		},
+		iterErr: errors.New("dataplane iterator failed"),
+	}
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	d := &Daemon{dp: dp}
+	d.clearSessionsForPolicyIDs(map[uint32]struct{}{7: {}}, dataplane.DeleteReasonPolicyModified, "modified (test)")
+
+	out := buf.String()
+	if !bytes.Contains([]byte(out), []byte("enumerate failed")) {
+		t.Fatalf("expected an ERROR log about the failed enumerate, got:\n%s", out)
+	}
+	if bytes.Contains([]byte(out), []byte("cleared sessions of changed policies at commit")) {
+		t.Fatalf("success line must be suppressed on enumerate error, got:\n%s", out)
+	}
+	// A partial clear still proceeds for what WAS enumerated.
+	if _, ok := dp.v4[sess]; ok {
+		t.Errorf("the gathered session should still be cleared (partial clear), but it survived")
+	}
 }

@@ -269,6 +269,10 @@ type policyInvalTestDP struct {
 	v4           map[dataplane.SessionKey]dataplane.SessionValue
 	v6           map[dataplane.SessionKeyV6]dataplane.SessionValueV6
 	iterateCalls int
+	// iterErr, when non-nil, is returned by BatchIterateSessions AFTER yielding
+	// its entries — models a dataplane iterator that fails partway, exercising
+	// the enumerate-error path in clearSessionsForPolicyIDs (Copilot #4320).
+	iterErr error
 }
 
 func (d *policyInvalTestDP) Start(context.Context) error { return nil }
@@ -297,7 +301,7 @@ func (d *policyInvalTestDP) BatchIterateSessions(fn func(dataplane.SessionKey, d
 			break
 		}
 	}
-	return nil
+	return d.iterErr
 }
 
 func (d *policyInvalTestDP) BatchIterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
