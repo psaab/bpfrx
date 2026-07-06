@@ -4563,6 +4563,24 @@ modifier never appears in the node's identity, the `setSchema` walk, the
 flat-set token grouping, and the value-slot `?` completion are all
 unaffected — they continue to see the node's real keyword.
 
+**Inline `inactive:` (mid-statement, #4335).** Junos also collapses a
+deactivated *sub-statement* onto its parent statement's line, e.g. a
+destination-NAT pool address with a deactivated port:
+`address 2001:db8::7aef/128 inactive: port 32400;`. Here `inactive:`
+deactivates the `port 32400` modifier, not the address. Because `:` is an
+identifier character the lexer tokenizes `inactive:` as one identifier, so
+an inline marker lands mid-`Keys` rather than leading. A node carries a
+single `Inactive` flag for its whole identity and cannot mark only part of
+a flat leaf inactive, so `parseStatement` drops the inline marker and every
+token it governs (the remainder of that statement) from the active `Keys` —
+consistent with the doctrine that a deactivated statement behaves as if it
+were absent. The parent statement (the address) stays active; the governed
+sub-statement (the port) is simply absent for compilation, exactly as a
+deactivated leaf would be. Before this fix the marker leaked mid-`Keys` and
+the DNAT-pool compiler read the literal `inactive:` token as the pool
+address, hard-rejecting a valid drop-in vSRX config
+(`inline_inactive_4335_test.go`).
+
 **Strip-before-validate / strip-before-compile contract.** A deactivated
 statement must be excluded from BOTH the typed-leaf gate and the compiler,
 and Junos accepts a deactivated leaf even when its value would be rejected
