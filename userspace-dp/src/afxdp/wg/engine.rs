@@ -608,7 +608,14 @@ impl WgEngine {
             return InitiationAction::Process;
         }
         // Valid MAC1, under load, no valid MAC2 → challenge with a cookie
-        // reply (budget-gated) and drop the initiation.
+        // reply. #4332: gate on the per-SOURCE bucket FIRST so a flood from one
+        // source throttles only itself and cannot drain the global per-window
+        // budget away from a legit peer at a different source. BOTH the
+        // per-source bucket and the global budget must pass.
+        if !self.cookie.source_reply_allowed(from.ip(), now_ns) {
+            WgCounters::bump(&self.counters.hs_cookie_reply_budget_drops);
+            return InitiationAction::Drop;
+        }
         if !self.cookie.reply_budget_available(now_ns) {
             WgCounters::bump(&self.counters.hs_cookie_reply_budget_drops);
             return InitiationAction::Drop;

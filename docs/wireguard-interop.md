@@ -490,6 +490,25 @@ is exactly that layer.
   generated replies themselves a CPU/socket sink (the WG analog of the
   syn-cookie reply-budget discipline). WG cookie replies leave via the
   tunnel's UDP socket, not the AF_XDP TX ring.
+- **Per-source reply bucket (#4332)** — the reply budget above is GLOBAL per
+  tunnel, so a determined valid-MAC1 flood from ONE source could drain the
+  shared budget and budget-suppress a legit peer's FIRST cookie challenge from a
+  DIFFERENT source. `CookieChecker::source_reply_allowed(src_ip, now)` adds a
+  small per-SOURCE token bucket (`SOURCE_REPLIES_PER_SEC` 20/s sustained,
+  `SOURCE_REPLY_BURST` 5 burst, `PACKET_COST_NS`/`MAX_TOKENS_NS` accrued-time
+  credit), mirroring wireguard-go `device/ratelimiter.go`. It is layered BEFORE
+  the global budget in `classify_initiation` — **both** gates must pass — so a
+  flood from one source throttles only its own bucket and cannot starve another
+  source's challenge. The table is GC-swept every `SOURCE_GC_INTERVAL_NS` (1 s;
+  idle buckets dropped) and hard-capped at `SOURCE_TABLE_MAX` (2048): a NEW
+  source that would overflow the cap is DENIED (fail CLOSED, no reply), never
+  inserted, bounding the map against the spoofed-source-IP memory-amplification
+  vector this hardening could otherwise introduce. The refill obeys the same
+  monotonic-clock discipline as the SYN-cookie token bucket (#4330/#4321): a
+  backwards `now_ns` credits nothing (`saturating_sub`) and never lowers a
+  bucket's `last_ns` high-water mark, so a clock glitch cannot be replayed into
+  an over-credit. Per-source throttle drops (and the full-table fail-closed) are
+  counted with the global-budget family under `hs_cookie_reply_budget_drops`.
 - **Counters** — `hs_cookie_replies_sent`, `hs_rx_under_load_no_mac2`,
   `hs_rx_under_load_mac2_ok`, `hs_cookie_reply_budget_drops` (Prometheus:
   `xpf_userspace_wg_cookie_replies_total{event}` +
@@ -507,7 +526,12 @@ synthetic initiation flood past the threshold, then asserts a spoofed/unprimed
 initiation without a valid MAC2 is cookie-challenged and NOT handshaked, while
 one echoing a decrypted-cookie MAC2 IS processed, and a stolen MAC2 from a
 different source is re-challenged). Reverting the gate makes it `Process` for
-every initiation and the test fails.
+every initiation and the test fails. #4332 adds
+`classify_initiation_per_source_budget_isolation` (a flood from one source past
+the global budget must NOT budget-suppress a legit peer's challenge from another
+source) plus the `cookie.rs` unit tests `source_bucket_burst_then_throttle`,
+`source_bucket_isolates_sources`, `source_table_cap_fails_closed`,
+`source_gc_reclaims_idle_buckets`, and `source_bucket_ignores_backwards_clock`.
 - **Engine orchestration**
   (`userspace-dp/src/afxdp/wg/handshake_session.rs`): `create_initiation`,
   `consume_response`, and `consume_initiation_create_response` compose snow +

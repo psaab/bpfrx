@@ -744,7 +744,8 @@ pub(crate) struct WgTunnelStatus {
     /// accounting: cookie replies emitted, under-load initiations dropped
     /// for a missing/bad MAC2 (challenged), under-load initiations that
     /// carried a valid MAC2 and proceeded, and cookie replies suppressed by
-    /// the per-window emission budget.
+    /// the per-window emission budget (`hs_cookie_reply_budget_drops` also
+    /// folds in the #4332 per-source token-bucket throttle drops).
     #[serde(rename = "hs_cookie_replies_sent", default)]
     pub hs_cookie_replies_sent: u64,
     #[serde(rename = "hs_rx_under_load_no_mac2", default)]
