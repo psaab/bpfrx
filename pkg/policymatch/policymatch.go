@@ -612,6 +612,19 @@ type Result struct {
 	SourceAddressExcluded      bool
 	DestinationAddressExcluded bool
 	Applications               []string
+
+	// HostInbound reports how the ingress zone's host-inbound-traffic admission
+	// gate treats a host-bound (to-zone junos-host) query tuple (#3627 B1a): the
+	// admitting system-service / protocol token, a global accept (ICMP error/ND,
+	// ESP/AH), a default-deny, or indeterminate. It is set ONLY on the host path
+	// (ToZone == junos-host); nil for every transit / default / content-rejected
+	// verdict. It is ADDITIONAL context, not a verdict tier — the host gate has
+	// no transit fallback (#3285), and this does not change Matched /
+	// HostInboundUnmatched. The classifier reads the SAME structured host-inbound
+	// SSOT the kernel-nft builder renders from (config.HostInboundServiceMatch /
+	// HostInboundProtocolMatch), so the reported token cannot drift from the port
+	// the kernel actually opens.
+	HostInbound *dpuserspace.HostInboundAdmission
 }
 
 // HostInboundActionString is the operator-facing verdict rendered for a
@@ -836,6 +849,19 @@ func Match(cfg *config.Config, q Query) Result {
 // path, matching the runtime gate — only a global explicitly scoped to
 // `to-zone junos-host` is consulted.
 func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Result {
+	// #3627 B1a: classify the ingress zone's host-inbound-traffic admission for
+	// this tuple ONCE and attach it to every Result this host path returns, so a
+	// host-inbound verdict names the admitting service/protocol token (or reports
+	// deny / global-accept / indeterminate) rather than the fixed
+	// "subject to host-inbound-traffic" string. This is additional context, not a
+	// verdict tier — it never changes the match outcome (#3285 host gate has no
+	// transit fallback).
+	hi := hostInboundAdmission(cfg, q)
+	withHI := func(r Result) Result {
+		r.HostInbound = hi
+		return r
+	}
+
 	// #3355: evaluate_junos_host_policy returns None for from_id == 0 (the
 	// unknown/undefined ingress zone), mirroring the #3110 unzoned guard. An
 	// undefined query from-zone therefore matches no host-bound rule; local
@@ -843,7 +869,7 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 	// HostInboundUnmatched rather than running the host tiers against an
 	// unresolved ingress zone.
 	if !zoneKnown(cfg, q.FromZone) {
-		return Result{HostInboundUnmatched: true}
+		return withHI(Result{HostInboundUnmatched: true})
 	}
 	// Exact ingress -> junos-host.
 	for setIdx, zpp := range cfg.Security.Policies {
@@ -852,7 +878,7 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 		}
 		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
+				return withHI(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
 			}
 		}
 	}
@@ -863,7 +889,7 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 		}
 		for sliceIdx, pol := range zpp.Policies {
 			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
+				return withHI(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
 			}
 		}
 	}
@@ -888,12 +914,42 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 			continue
 		}
 		if ruleMatches(cfg, q, pol) {
-			return matchedResult(ids, pol, true, pol.Match.FromZone, pol.Match.ToZone, globalSetIdx, sliceIdx)
+			return withHI(matchedResult(ids, pol, true, pol.Match.FromZone, pol.Match.ToZone, globalSetIdx, sliceIdx))
 		}
 	}
 	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
 	// to the transit default — the dataplane host gate returns None here.
-	return Result{HostInboundUnmatched: true}
+	return withHI(Result{HostInboundUnmatched: true})
+}
+
+// hostInboundAdmission classifies the ingress zone's host-inbound-traffic
+// admission for a host-bound query tuple (#3627 B1a). It resolves the query's
+// protocol via appid.ProtocolNumber (empty = unspecified) and the address family
+// from the destination (then source) IP, and delegates to the SSOT-backed
+// dataplane/userspace classifier. Returns nil for a nil config.
+func hostInboundAdmission(cfg *config.Config, q Query) *dpuserspace.HostInboundAdmission {
+	if cfg == nil {
+		return nil
+	}
+	proto, hasProto := appid.ProtocolNumber(q.Protocol)
+	family := ""
+	switch {
+	case q.DstIP != nil:
+		family = ipFamily(q.DstIP)
+	case q.SrcIP != nil:
+		family = ipFamily(q.SrcIP)
+	}
+	adm := dpuserspace.ClassifyHostInbound(cfg, q.FromZone, proto, hasProto, q.DstPort, q.ICMPType, family)
+	return &adm
+}
+
+// ipFamily returns the nft-style family token ("ip" / "ip6") for an IP, matching
+// the family spelling the host-inbound SSOT and views use.
+func ipFamily(ip net.IP) string {
+	if ip.To4() != nil {
+		return "ip"
+	}
+	return "ip6"
 }
 
 // GlobalPolicyAppliesToZonePair reports whether a global policy (#3148) with the

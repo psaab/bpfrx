@@ -527,7 +527,17 @@ never lock an operator out of a remote box it manages.
   are accepted before any deny; a configured zone that resolves to zero
   recognized matches fails OPEN (no deny) rather than locking the zone out.
   Token→nft mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`)
-  mirrors the Rust classifier and must stay in sync. The authoritative
+  mirrors the Rust classifier and must stay in sync. **Structured SSOT (#3627
+  B1a):** since #3627 these two functions no longer carry their own hard-coded
+  nft strings — they RENDER (`renderHostInboundMatches`) the single structured
+  token→tuple SSOT `config.HostInboundServiceMatch` / `HostInboundProtocolMatch`
+  (`[]config.L4Match{Proto, Ports, ICMPType, Reject}`). The same table backs the
+  `request security match-policies` host-inbound classifier
+  (`dataplane/userspace.ClassifyHostInbound`), so the reported admitting token
+  cannot drift from the port the kernel opens. The render is byte-identical to
+  the pre-#3627 strings, proven by
+  `TestHostInboundNftRenderGoldenByteIdentical`; a per-tuple Rust parity test is
+  a deferred follow-up (the domain-parity guards still hold). The authoritative
   operator-facing token→port matrix across all three surfaces (Go SSOT allowlist,
   this nft mirror, the Rust AF_XDP classifier), including the deliberate
   narrowings and the ident-reset divergence, is

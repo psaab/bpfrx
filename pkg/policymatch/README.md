@@ -303,6 +303,25 @@ shared SSOT `Result.DisplayAction()` (#3375), which returns
 transit/global/default policy NOT applied)". Routing both transports through one
 method keeps them from diverging and prevents a blank verdict on the host path.
 
+**Admitting host-inbound token (#3627 B1a).** For a `to-zone junos-host` query,
+`Match` additionally classifies the ingress zone's `host-inbound-traffic`
+admission for the query tuple and attaches it as `Result.HostInbound`
+(`*dataplane/userspace.HostInboundAdmission`; `nil` off the host path). It
+reports WHICH system-service/protocol token admits the packet (`token-admit` +
+`Token`/`Kind`), a `global-accept` (ICMP error/PMTUD, IPv6 ND, or ESP/AH — the
+top-of-chain nft accepts, #3171), a `denied` (post-#3405 default-deny — the box
+drops it), or `indeterminate` (the query omits the protocol, or the
+destination-port / icmp-type a port/ICMP token needs). The classifier
+(`ClassifyHostInbound`) reads the SAME structured token→tuple SSOT the kernel-nft
+builder renders from (`config.HostInboundServiceMatch` /
+`HostInboundProtocolMatch`), so the reported token cannot claim a port the kernel
+does not open. `ident-reset` is reported as NOT admitting (it resets, #3310).
+This is ADDITIONAL context, not a verdict tier — it never changes `Matched` /
+`HostInboundUnmatched` (the host gate has no transit fallback, #3285). The local
+CLI `show security match-policies` prints it after `HostInboundShowLine`;
+surfacing it on the REST/gRPC responses (a presence-safe `host_inbound` object /
+proto message) and a per-tuple Rust parity test are deferred follow-ups.
+
 Address matching honors literal CIDRs, address
 books (recursive set expansion), `any`/`any-ipv4`/`any-ipv6`, source/destination
 exclusion (the #2008 empty-excluded fail-closed rule, hardened in #3356 to run
