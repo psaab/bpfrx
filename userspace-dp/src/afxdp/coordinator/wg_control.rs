@@ -1322,6 +1322,36 @@ fn dispatch_inbound(
     };
     match wg_type {
         crate::afxdp::wg::WG_TYPE_INITIATION => {
+            // #4094 PR-A: responder under-load cookie gate. Before spending
+            // a Noise handshake, classify the initiation — under load a
+            // valid-MAC1 initiation without a valid MAC2 is answered with a
+            // type-3 cookie challenge and dropped (no crypto), defeating a
+            // spoofed-source initiation flood. `classify_initiation` writes
+            // the cookie into `response_buf` only on the SendCookie arm, so
+            // the buffer is free for the response on the Process arm.
+            let now = engine.now_ns();
+            match engine.classify_initiation(datagram, from, response_buf, now) {
+                crate::afxdp::wg::InitiationAction::SendCookie(len) => {
+                    // Challenge the real source; DROP the initiation. Not
+                    // authenticated for endpoint-learning (a cookie reply is
+                    // not proof the source holds the keys).
+                    if let Err(e) = wg_send_to(socket, socket_is_v6, &response_buf[..len], from) {
+                        WgCounters::bump(&engine.counters().hs_send_errors);
+                        record_local_tunnel_exception(
+                            recent_exceptions,
+                            tunnel_name,
+                            format!("wg_cookie_send:{from}:{e}"),
+                        );
+                    }
+                    return InboundOutcome::Unauthenticated;
+                }
+                crate::afxdp::wg::InitiationAction::Drop => {
+                    // Under load, cookie-reply budget exhausted — drop
+                    // silently (the counter recorded it).
+                    return InboundOutcome::Unauthenticated;
+                }
+                crate::afxdp::wg::InitiationAction::Process => {}
+            }
             match engine.consume_initiation_create_response(datagram, response_buf) {
                 Ok((peer_pubkey, _local_index)) => {
                     let len = crate::afxdp::wg::WG_MSG_RESPONSE_LEN;

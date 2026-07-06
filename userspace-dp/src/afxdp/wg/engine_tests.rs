@@ -1009,3 +1009,162 @@ fn wg_config_secret_carriers_are_zeroizing() {
     let cloned: zeroize::Zeroizing<[u8; 32]> = cfg.local_private_key.clone();
     assert_eq!(*cloned, [1u8; 32]);
 }
+
+// ===================================================================
+// #4094 PR-A: responder under-load cookie / MAC2 anti-flood gate.
+// classify_initiation is the DoS-mitigation seam that decides whether
+// an inbound type-1 initiation reaches the expensive Noise handshake.
+// ===================================================================
+
+/// Build an engine whose responder static pubkey is known to the test,
+/// plus a synthetic VALID-MAC1 initiation toward it (MAC2 = zeros, as a
+/// not-yet-challenged initiator sends). The Noise body is a fixed pattern
+/// — classify_initiation never runs snow, it only inspects MAC1/MAC2, so a
+/// real snow body is unnecessary here (the handshake path itself is
+/// covered by the interop tests).
+fn under_load_fixture() -> (WgEngine, [u8; 32], [u8; super::super::WG_MSG_INIT_LEN]) {
+    let (priv_k, _pub_k) = keypair();
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: priv_k.into(),
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: [0x99u8; 32],
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32].into(),
+        }],
+    });
+    let our_pub = engine.local_public_key();
+    let noise = [0x3Cu8; crate::afxdp::wg::handshake::MSG_INIT_NOISE_LEN];
+    let mut init = [0u8; super::super::WG_MSG_INIT_LEN];
+    crate::afxdp::wg::handshake::build_initiation(&mut init, 0xCAFE_1234, &noise, &our_pub)
+        .unwrap();
+    (engine, our_pub, init)
+}
+
+/// RED-on-revert: under a simulated initiation flood the responder MUST
+/// answer a spoofed/unprimed initiation (valid MAC1, no valid MAC2) with a
+/// cookie challenge and NOT run the Noise handshake. On revert (no cookie
+/// gate) classify_initiation would return `Process` for every initiation —
+/// the CPU-exhaustion DoS. An initiation that echoes a valid MAC2 (derived
+/// from the cookie the responder issued to its real source) IS processed,
+/// and a peer that never crossed the load threshold is processed with no
+/// challenge (no regression on the normal path).
+#[test]
+fn classify_initiation_under_load_requires_mac2() {
+    use crate::afxdp::wg::cookie::{
+        CookieChecker, INITIATIONS_UNDER_LOAD_THRESHOLD, stamp_initiation_mac2,
+    };
+    use std::net::SocketAddr;
+
+    let (engine, our_pub, init) = under_load_fixture();
+    let now = 10_000_000_000u64; // 10 s (nonzero: engages the mock clock)
+    engine.set_mock_now_ns(now);
+    let from: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let mut out = [0u8; 256];
+
+    // Normal load: a valid initiation is processed WITHOUT a challenge —
+    // the not-under-load path is byte-identical to today (skip-verify).
+    assert_eq!(
+        engine.classify_initiation(&init, from, &mut out, now),
+        InitiationAction::Process,
+        "under threshold, a normal initiation must proceed with no cookie"
+    );
+
+    // Drive the arrival rate past the threshold within the same 1 s window.
+    for _ in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
+        engine.classify_initiation(&init, from, &mut out, now);
+    }
+
+    // Under load, an initiation with NO valid MAC2 is cookie-challenged and
+    // DROPPED — the Noise handshake is never spent. This is the RED-on-
+    // revert assertion (reverting the gate makes this `Process`).
+    let action = engine.classify_initiation(&init, from, &mut out, now);
+    let cookie_len = match action {
+        InitiationAction::SendCookie(len) => len,
+        other => panic!("under-load init without MAC2 must be cookie-challenged, got {other:?}"),
+    };
+    assert_eq!(cookie_len, crate::afxdp::wg::cookie::WG_MSG_COOKIE_LEN);
+    assert_eq!(out[0], crate::afxdp::wg::WG_TYPE_COOKIE);
+
+    // A real initiator decrypts the cookie (PR-B mirror) using our pubkey +
+    // the initiation's MAC1 as AAD, then stamps a valid MAC2 over the same
+    // source. That initiation IS processed under load.
+    let aad_mac1 = &init[116..132];
+    let cookie = CookieChecker::decrypt_cookie_reply(&out[..cookie_len], &our_pub, aad_mac1)
+        .expect("cookie reply must decrypt");
+    let mut primed = init;
+    stamp_initiation_mac2(&mut primed, &cookie);
+    assert_eq!(
+        engine.classify_initiation(&primed, from, &mut out, now),
+        InitiationAction::Process,
+        "under load, an initiation with a VALID MAC2 must reach the handshake"
+    );
+
+    // The SAME MAC2 replayed from a DIFFERENT source is still challenged:
+    // the cookie binds to the source that received the reply, so a spoofed
+    // source cannot borrow another endpoint's MAC2.
+    let spoof: SocketAddr = "198.51.100.7:51820".parse().unwrap();
+    assert!(
+        matches!(
+            engine.classify_initiation(&primed, spoof, &mut out, now),
+            InitiationAction::SendCookie(_)
+        ),
+        "a stolen MAC2 must not authorize a handshake from a different source"
+    );
+
+    // The DoS-mitigation counters moved.
+    let c = engine.counters();
+    assert!(
+        c.hs_cookie_replies_sent.load(Ordering::Relaxed) >= 2,
+        "cookie replies issued for the unprimed + spoofed initiations"
+    );
+    assert!(
+        c.hs_rx_under_load_mac2_ok.load(Ordering::Relaxed) >= 1,
+        "the primed initiation counted as an under-load MAC2 pass"
+    );
+    assert!(c.hs_rx_under_load_no_mac2.load(Ordering::Relaxed) >= 2);
+}
+
+/// A bad-MAC1 initiation under load is NOT reflected: it returns `Process`
+/// so the consume path drops it cheaply (before any crypto) with the
+/// mac1_mismatch counter, and NO cookie reply is emitted — a random /
+/// bad-MAC1 flood cannot turn the responder into a reflector.
+#[test]
+fn classify_initiation_bad_mac1_under_load_no_reflection() {
+    use crate::afxdp::wg::cookie::INITIATIONS_UNDER_LOAD_THRESHOLD;
+    use std::net::SocketAddr;
+
+    let (engine, _our_pub, good) = under_load_fixture();
+    let now = 20_000_000_000u64;
+    engine.set_mock_now_ns(now);
+    let from: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+    let mut out = [0u8; 256];
+
+    // Corrupt the MAC1 field (msg[116..132]) so parse_initiation rejects it.
+    let mut bad = good;
+    bad[116] ^= 0xFF;
+
+    for _ in 0..(INITIATIONS_UNDER_LOAD_THRESHOLD + 4) {
+        engine.classify_initiation(&good, from, &mut out, now);
+    }
+    let before = engine
+        .counters()
+        .hs_cookie_replies_sent
+        .load(Ordering::Relaxed);
+    // Under load, a bad-MAC1 init falls through to the cheap consume drop.
+    assert_eq!(
+        engine.classify_initiation(&bad, from, &mut out, now),
+        InitiationAction::Process,
+        "bad-MAC1 under load must not be challenged (no reflection)"
+    );
+    assert_eq!(
+        engine
+            .counters()
+            .hs_cookie_replies_sent
+            .load(Ordering::Relaxed),
+        before,
+        "no cookie reply is emitted for a bad-MAC1 initiation"
+    );
+}

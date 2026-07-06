@@ -71,7 +71,7 @@ use curve25519_dalek::MontgomeryPoint;
 use rustc_hash::FxHashMap;
 use snow::{Builder, HandshakeState};
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use zeroize::Zeroizing;
 
@@ -101,6 +101,32 @@ pub(crate) struct EncapOutcome {
     pub(crate) receiver_index: u32,
     /// The counter value used (engine-chosen). Useful for tracing.
     pub(crate) counter: u64,
+}
+
+/// What the coordinator should do with an inbound WG type-1 initiation,
+/// decided by [`WgEngine::classify_initiation`] BEFORE the expensive Noise
+/// responder path (#4094 PR-A). The under-load cookie gate lives here so
+/// the security-critical ordering (MAC2-good → process; MAC1-good +
+/// MAC2-missing → challenge; otherwise cheap drop) is auditable in one
+/// place and cannot be reordered at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitiationAction {
+    /// Run the full Noise handshake (`consume_initiation_create_response`).
+    /// Reached when the responder is NOT under load (spec-correct
+    /// skip-verify of MAC2), when an under-load initiation carries a VALID
+    /// MAC2, or when the datagram is malformed / MAC1-bad (so the consume
+    /// path drops it cheaply, before any crypto, with the correct
+    /// per-reason counter and no cookie reply).
+    Process,
+    /// Under load with no valid MAC2 but a valid MAC1: a WG type-3
+    /// CookieReply of this many bytes was written to the caller's output
+    /// buffer. Send it to the initiation's real source and DROP the
+    /// initiation (no Noise crypto spent).
+    SendCookie(usize),
+    /// Drop the initiation with no reply and no further processing
+    /// (under-load, MAC1-valid, MAC2-missing, but the cookie-reply budget
+    /// for this window is exhausted).
+    Drop,
 }
 
 /// Errors that can fail the slow-path session install.
@@ -435,6 +461,12 @@ pub(crate) struct WgEngine {
     /// consumed by the control loop's attempt machine, which initiates
     /// WITHOUT the confirmed-session gate. See wg/timers.rs.
     pub(in crate::afxdp::wg) rekey_request_pending: std::sync::atomic::AtomicBool,
+    /// #4094 PR-A: responder cookie-reply / MAC2 under-load DoS mitigation
+    /// — a per-tunnel rotating secret, an inbound-initiation load gate, a
+    /// cookie-reply emission budget, and MAC2 verification, all keyed on
+    /// this engine's responder static public key. Consulted by
+    /// `classify_initiation` before the expensive Noise responder path.
+    pub(in crate::afxdp::wg) cookie: super::cookie::CookieChecker,
     /// #1888 S5 test hook: when nonzero, `now_ns()` returns this value
     /// instead of CLOCK_MONOTONIC, making the timer semantics
     /// deterministically testable. Compiled out of release builds.
@@ -481,6 +513,7 @@ impl WgEngine {
             handshake_request_last_ns: std::sync::atomic::AtomicU64::new(0),
             counters: WgCounters::default(),
             rekey_request_pending: std::sync::atomic::AtomicBool::new(false),
+            cookie: super::cookie::CookieChecker::new(&local_public_key),
             #[cfg(test)]
             mock_now_ns: std::sync::atomic::AtomicU64::new(0),
         };
@@ -526,6 +559,72 @@ impl WgEngine {
     /// through this accessor; engine-internal paths count directly.
     pub(crate) fn counters(&self) -> &WgCounters {
         &self.counters
+    }
+
+    /// #4094 PR-A: decide how to handle an inbound WG type-1 initiation
+    /// `msg` that arrived from `from` (the ACTUAL datagram source), BEFORE
+    /// spending a Noise responder handshake. Records the arrival on the
+    /// load gate and, when under load, requires a valid MAC2 (a cookie the
+    /// initiator can only hold if it received our cookie reply at its real
+    /// source) — otherwise it issues a budget-gated cookie challenge and
+    /// drops the initiation. `out` receives the type-3 CookieReply on the
+    /// [`InitiationAction::SendCookie`] arm; it is untouched otherwise, so
+    /// the caller may reuse the same buffer for `consume_...`'s response.
+    ///
+    /// Ordering mirrors wireguard-go `device/receive.go`:
+    /// 1. Not under load → `Process` (skip-verify MAC2, spec-correct).
+    /// 2. Under load + valid MAC2 → `Process` (the peer proved liveness).
+    /// 3. Under load + MAC1 invalid / malformed → `Process` so the consume
+    ///    path drops it cheaply (no crypto) with the right counter and NO
+    ///    reply — a random / bad-MAC1 flood cannot turn us into a reflector.
+    /// 4. Under load + MAC1 valid + MAC2 missing/bad → `SendCookie` (budget
+    ///    permitting) else `Drop`.
+    pub(crate) fn classify_initiation(
+        &self,
+        msg: &[u8],
+        from: SocketAddr,
+        out: &mut [u8],
+        now_ns: u64,
+    ) -> InitiationAction {
+        // Every inbound type-1 counts toward load, including malformed ones
+        // (they still cost us). Conservative: trips under-load sooner.
+        let under_load = self.cookie.note_initiation(now_ns);
+        if !under_load {
+            return InitiationAction::Process;
+        }
+        // Under load. A valid MAC2 (peer holds a fresh cookie bound to this
+        // exact source) authorizes the expensive handshake.
+        if self.cookie.verify_initiation_mac2(msg, from, now_ns) {
+            WgCounters::bump(&self.counters.hs_rx_under_load_mac2_ok);
+            return InitiationAction::Process;
+        }
+        // No valid MAC2. Only spend a cookie reply on a message that passes
+        // MAC1 (proves the sender knows our public key). A malformed or
+        // bad-MAC1 datagram falls through to the cheap consume-path drop
+        // (parse fails before any Noise crypto, correct per-reason counter)
+        // with NO reply — so a spoofed / bad-MAC1 flood cannot make us a
+        // reflector.
+        if super::handshake::parse_initiation(msg, &self.local_public_key).is_err() {
+            return InitiationAction::Process;
+        }
+        // Valid MAC1, under load, no valid MAC2 → challenge with a cookie
+        // reply (budget-gated) and drop the initiation.
+        if !self.cookie.reply_budget_available(now_ns) {
+            WgCounters::bump(&self.counters.hs_cookie_reply_budget_drops);
+            return InitiationAction::Drop;
+        }
+        match self.cookie.build_cookie_reply(msg, from, now_ns, out) {
+            Ok(len) => {
+                WgCounters::bump(&self.counters.hs_cookie_replies_sent);
+                WgCounters::bump(&self.counters.hs_rx_under_load_no_mac2);
+                InitiationAction::SendCookie(len)
+            }
+            // A build failure (buffer / length) means we can't challenge;
+            // drop without a reply. `out` is >= WG_MSG_RESPONSE_LEN (92) at
+            // the sole caller, and the init length is already type-gated, so
+            // this arm is defensive.
+            Err(_) => InitiationAction::Drop,
+        }
     }
 
     /// Control side of the NoSession edge. Returns `true` if a handshake

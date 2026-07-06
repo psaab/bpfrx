@@ -40,6 +40,13 @@ pub(crate) mod allowed_ips;
 // reserved-reason list (tai64n-replay, rate-limit — no increment
 // sites until responder hardening).
 pub(crate) mod counters;
+// WireGuard responder-side cookie-reply / MAC2 under-load DoS mitigation
+// (#4094 PR-A). Per-tunnel secret rotation + inbound-initiation load gate
+// + cookie-reply build + MAC2 verify. Kept out of engine.rs (WATCH-tier)
+// so the security-critical cookie crypto is auditable in isolation. The
+// initiator-side cookie-reply CONSUME (parse + re-initiate with a real
+// MAC2) is PR-B; the inbound type-3 arm stays drop-only here.
+pub(crate) mod cookie;
 pub(crate) mod dscp;
 pub(crate) mod engine;
 pub(crate) mod framing;
@@ -76,8 +83,8 @@ pub(crate) mod timers;
 mod tests;
 
 pub(crate) use engine::{
-    DecapError, DecapOutcome, EncapError, EncapOutcome, InstallSessionError, WgEngine,
-    WgEngineConfig, WgPeerConfig,
+    DecapError, DecapOutcome, EncapError, EncapOutcome, InitiationAction, InstallSessionError,
+    WgEngine, WgEngineConfig, WgPeerConfig,
 };
 pub(crate) use scratch::WgWorkerScratch;
 
