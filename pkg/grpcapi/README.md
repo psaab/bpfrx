@@ -215,7 +215,15 @@ contract.
   global (group still `*`), and structured `GetPolicies` populates the
   per-rule `match_from_zone`/`match_to_zone` proto fields (empty for an
   unscoped global). Showing the group `*`/`*` but dropping the per-rule
-  scope is the #3286 blind spot.
+  scope is the #3286 blind spot. #4344: `showPoliciesHitCount`,
+  `showPoliciesDetail`, and structured `GetPolicies` read every per-rule
+  counter (zone-pair, global, and the default-policy sentinel row) through
+  the shared `dpuserspace.NewPolicyCounterReader` bulk snapshot — one brief
+  dataplane lock for the whole set — instead of a per-policy
+  `ReadPolicyCounters` loop; the reader falls back to the per-policy read
+  for a dataplane without the bulk snapshot, so the rendered values are
+  identical. A static canary in the test package forbids a direct per-rule
+  `ReadPolicyCounters` call in these files.
 - `GetZones` enumerates security zones (`ZoneInfo`). The host-inbound
   admission set is surfaced distinctly (#3328): `host_inbound_configured`
   is the dataplane posture bit (mirrors `ZoneSnapshot.HostInboundConfigured`,

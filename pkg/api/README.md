@@ -66,6 +66,17 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
     lock; a dataplane without the bulk snapshot (test fakes / retired eBPF)
     transparently falls back to the per-policy read, and the skip-and-bump
     (#3345/#3408) / HTTP-500 degraded-read contracts are unchanged.
+    #4344: the migration is now complete across EVERY policy-counter display
+    surface — this endpoint's default-policy row (which had bypassed the
+    reader with a standalone sentinel read, M02), the CLI `show security
+    policies hit-count` / `brief` tables, and the gRPC `show security
+    policies hit-count` / `detail` text renderers plus the structured
+    `GetPolicies` RPC all read through the same `NewPolicyCounterReader`
+    snapshot. The returned counter values are identical to the per-policy
+    read (`ReadAllPolicyCounters` is a batching layer, not a semantic
+    change — pinned by `TestReadAllPolicyCountersMatchesPerPolicy`); a
+    per-surface static canary forbids a new show surface from regressing to
+    a direct per-rule `ReadPolicyCounters` call.
     The first rule of the first zone-pair set legitimately has runtime id
     0 (`policySetID*MaxRulesPerPolicy + ruleIndex = 0`), and since #3057
     the implicit default policy uses a distinct sentinel (`0xFFFFFFFF`),
