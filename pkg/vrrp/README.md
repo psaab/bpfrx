@@ -471,6 +471,25 @@ dataplane reuses this Go walker, and do NOT try to consolidate them.
 
 - Use the **non-VIP** primary IP as source on advertisements. Sourcing
   from the VIP would self-filter peer adverts.
+- **`accept-data` is accepted for Junos config compatibility but is a
+  no-op (#4080).** The leaf parses and compiles into `AcceptData`
+  (`schema_interfaces.go`, `compiler_interfaces.go`), but no non-test
+  code reads it to gate behavior. xpf uses a **VIP-as-real-address**
+  model: on MASTER, `addVIPs()` installs each VIP as a genuine local
+  kernel address via `netlink.AddrAdd` (`instance.go`), so the Linux
+  stack itself answers ARP/ND and replies to ICMP echo / accepts
+  host-inbound traffic addressed to the VIP — regardless of the flag.
+  That is exactly RFC 5798 §6.1 `Accept_Mode=on` (a pingable VIP, the
+  common operator default), so `accept-data` on/off cannot change
+  today's behavior. `accept-data=off` (the RFC default,
+  don't-respond-unless-owner) is a **deferred non-default**: it would
+  require NOT installing the VIP as a real kernel address — which
+  directly conflicts with the `bpf_fib_lookup` dependency in
+  `becomeMaster` and the VIP install/reconcile machinery
+  (`ReconcileVIPs`, `KeepConfiguration=static`, GARP epoch/dampener) —
+  plus the dataplane taking over ARP/ND and dropping VIP-addressed
+  host-inbound traffic. That is a dataplane + control-plane redesign,
+  not a wired gate; see #4080.
 - RETH virtual MAC per node: `02:bf:72:CC:RR:NN`. Programmed via link
   DOWN → set MAC → link UP. This bounces all kernel addresses; VIPs are
   re-added by `ReconcileVIPs()` immediately afterwards, and the advert
