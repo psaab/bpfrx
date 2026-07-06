@@ -954,6 +954,39 @@ Fail-on-revert: `pkg/config/compiler_firewall_family_any_4287_test.go` (both
 pools populated for a `family any` discard; strict reject + lenient warn for
 the any+inet6 collision; lone `family any` no-false-reject).
 
+### Family-specific matches under `family any` are rejected (#4296)
+
+The #4287 dual-compile has a residual: a `family any` term whose `from` block
+carries a **family-specific** match is dual-compiled **verbatim** into both
+pools, so the copy in the "wrong" pool can never match. A v4/v6
+`source-address`/`destination-address` literal or a per-family
+`icmp-type`/`icmp-code` (`echo-request` resolves to ICMPv4 type 8 for
+`af=="any"`, which never matches an IPv6 ICMP packet whose echo-request is
+type 128) leaves the inet6 (or inet) arm with a never-matching predicate — the
+term falls through to the implicit ACCEPT for that family, an imperfect v6
+UNDER-block (it degrades to the pre-#4287 state for that term; never an
+over-block, so no legitimate v6 traffic is broken). These configs are also
+non-Junos (Junos disallows family-specific matches under `family any`).
+
+`validateFirewallFilterFamilyAnyMatchesAST` (`compiler_firewall.go`, invoked in
+`compiler.go` right after the collision gate) **rejects** such a term at strict
+commit / commit-check with a message pointing the operator at `family inet` /
+`family inet6`, and **warns** on the tolerant load / peer-sync path
+(`lenientFirewallFilterFamilyAnyMatches`, same #1960 no-brick doctrine). The
+flagged leaves are exactly `source-address`, `destination-address`,
+`icmp-type`, `icmp-code`. `next-header` (the inet6 spelling of `protocol`,
+matching family-agnostic L4 protocol numbers) and `source-prefix-list` /
+`destination-prefix-list` (named prefix-lists may legitimately mix v4+v6) are
+deliberately NOT flagged. The gate fires **before**
+`validateFilterAddressLiteralsStrict` (#3433), which also rejects a wrong-family
+address literal but with a less specific message; for the address case the
+#4296 gate wins the first-error slot with the clearer diagnostic, and for the
+`icmp-type`/`icmp-code` case it is the ONLY gate that catches the residual.
+Fail-on-revert: `pkg/config/compiler_firewall_family_any_match_4296_test.go`
+(strict reject of a v4 source-address and a symbolic icmp-type; lenient warn;
+family-agnostic `protocol` under `family any` still commits into both pools;
+single-family filters with address literals not flagged).
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list

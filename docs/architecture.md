@@ -146,6 +146,30 @@ editing cmdtree.
   the deferred half of #4107.)
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
+  - **Off-loopback bind requires api-auth (#4047).** The REST/config API
+    serves the mutating endpoints (`config set/delete/commit/commit-confirmed/
+    rollback/load/activate`, `system/action`) with **no** auth middleware
+    unless `system services web-management api-auth {user … | api-key …}`
+    is configured (`pkg/api/server.go` wires the middleware only when
+    `cfg.Auth != nil`). The default loopback bind is safe; a
+    `web-management http|https interface <mgmt-if>` stanza rebinds the API
+    to a routable address, so binding off-loopback **without** api-auth would
+    expose every mutating config RPC to the network. This is now closed at
+    two layers: (A) a **commit-time hard-reject**
+    (`validateWebManagementAuthStrict`, `pkg/config/compiler.go`) refuses a
+    new config that binds off-loopback without api-auth (downgraded to a
+    warning on the tolerant load / peer-sync path so an already-persisted
+    config still boots — #1960); and (B) a **runtime fail-safe clamp**
+    (`clampBindToLoopback` in `pkg/daemon`, applied in `daemon_run.go`) that,
+    when the resolved bind is non-loopback and `apiCfg.Auth == nil`, pulls the
+    bind back to a same-family loopback (`127.0.0.1` for IPv4, `::1` for IPv6,
+    port preserved) and WARNs — so a leniently-loaded vulnerable config comes up
+    on loopback (console/SSH remain the lifeline) instead of exposed. The bind
+    address is built with `net.JoinHostPort` so an IPv6 mgmt address is bracketed
+    and both the clamp and `net.Listen` parse it. Adding api-auth and recommitting
+    restores the off-loopback bind. HTTPS is covered by the same rule
+    (transport encryption without authentication still lets any reachable
+    client mutate config).
   - **`/metrics` posture (#4162).** The Prometheus endpoint is
     unauthenticated on the loopback default bind — the standard Prometheus
     posture. When `system services web-management http interface <if>`

@@ -1340,7 +1340,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// Bind HTTP to configured interface
 			if wm.HTTPInterface != "" {
 				bindIP := resolveInterfaceAddr(wm.HTTPInterface, "127.0.0.1")
-				apiCfg.Addr = bindIP + ":8080"
+				// net.JoinHostPort (not string-concat) so an IPv6 interface
+				// address is bracketed ("[2001:db8::1]:8080") — a bare
+				// "2001:db8::1:8080" is unparseable by net.SplitHostPort (the
+				// clamp below) and net.Listen, blackholing an IPv6-only mgmt bind.
+				apiCfg.Addr = net.JoinHostPort(bindIP, "8080")
 				slog.Info("HTTP API bound to interface", "interface", wm.HTTPInterface, "addr", apiCfg.Addr)
 			}
 			// Enable HTTPS if configured
@@ -1348,10 +1352,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 				httpsBindIP := "127.0.0.1"
 				if wm.HTTPSInterface != "" {
 					httpsBindIP = resolveInterfaceAddr(wm.HTTPSInterface, "127.0.0.1")
-					slog.Info("HTTPS API bound to interface", "interface", wm.HTTPSInterface, "addr", httpsBindIP+":8443")
+					slog.Info("HTTPS API bound to interface", "interface", wm.HTTPSInterface, "addr", net.JoinHostPort(httpsBindIP, "8443"))
 				}
 				apiCfg.TLS = true
-				apiCfg.HTTPSAddr = httpsBindIP + ":8443"
+				apiCfg.HTTPSAddr = net.JoinHostPort(httpsBindIP, "8443")
 			}
 			// API authentication
 			if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
@@ -1367,6 +1371,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				apiCfg.Auth = authCfg
 				slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
+			}
+			// #4047 part B: runtime fail-safe clamp. The commit gate
+			// (validateWebManagementAuthStrict, pkg/config) rejects a NEW
+			// web-management config that binds the unauthenticated REST/config API
+			// off-loopback without api-auth, but an ALREADY-PERSISTED such config
+			// is lenient-loaded (warn, no brick — #1960) and would still bind
+			// non-loopback UNAUTHENTICATED after upgrade, exposing the mutating
+			// config endpoints (set / commit / rollback / system action) to the
+			// network. clampBindToLoopback pulls a non-loopback + no-auth bind back
+			// to a loopback of the same family and WARNs: the daemon still boots,
+			// the web API stays reachable on loopback, and the console/SSH remain
+			// the lifeline (device-map §9.6 posture) until the operator adds
+			// api-auth (which restores the non-loopback bind).
+			hasAuth := apiCfg.Auth != nil
+			if clamped, ok := clampBindToLoopback(apiCfg.Addr, hasAuth); ok {
+				slog.Warn("web-management HTTP bind is non-loopback without api-auth; clamping to loopback (add `set system services web-management api-auth` to bind off-loopback) — #4047",
+					"requested", apiCfg.Addr, "clamped", clamped)
+				apiCfg.Addr = clamped
+			}
+			if apiCfg.TLS {
+				if clamped, ok := clampBindToLoopback(apiCfg.HTTPSAddr, hasAuth); ok {
+					slog.Warn("web-management HTTPS bind is non-loopback without api-auth; clamping to loopback — #4047",
+						"requested", apiCfg.HTTPSAddr, "clamped", clamped)
+					apiCfg.HTTPSAddr = clamped
+				}
 			}
 		}
 		srv := api.NewServer(apiCfg)

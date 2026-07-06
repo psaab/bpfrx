@@ -495,6 +495,21 @@ type compileOpts struct {
 	// last-write-wins map compileFirewall always produced. Same doctrine as
 	// lenientApplicationNameCollisions.
 	lenientFirewallFilterFamilyCollisions bool
+
+	// lenientFirewallFilterFamilyAnyMatches (#4296, fable-review-167 F-1
+	// residual) downgrades the firewall-filter family-any specific-match gate
+	// (validateFirewallFilterFamilyAnyMatchesAST) from a hard compile error to a
+	// cfg.Warnings entry. #4287 dual-compiles a `family any` filter into BOTH the
+	// inet and inet6 pools; a family-specific match under `family any` (a v4/v6
+	// source/destination-address literal or a per-family icmp-type/icmp-code) is
+	// then dual-compiled verbatim and can never match the other family — an
+	// imperfect v6 under-block. The strict commit / commit-check path hard-rejects
+	// it (pointing the operator at family inet/inet6); the tolerant load / peer-
+	// sync paths downgrade to a warning so an already-persisted or peer-synced
+	// config an older binary silently accepted still BOOTS (#1960 no-brick),
+	// keeping the existing dual-compile behavior. Same doctrine as
+	// lenientFirewallFilterFamilyCollisions.
+	lenientFirewallFilterFamilyAnyMatches bool
 	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
 	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -867,6 +882,20 @@ type compileOpts struct {
 	// warning so an already-persisted or peer-synced config an older binary
 	// accepted still BOOTS (#1960 no-brick). Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneCount bool
+	// lenientWebManagementAuth (#4047, fable-161 F-155) downgrades the
+	// web-management REST-auth gate (validateWebManagementAuthStrict) from a hard
+	// compile error to a cfg.Warnings entry. The REST/config API is unauthenticated
+	// unless `system services web-management api-auth` is configured; binding it to
+	// a non-loopback address (`web-management http|https interface <mgmt-if>`)
+	// without api-auth exposes the mutating config endpoints (set / commit /
+	// rollback / system action) to the network. The strict commit / commit-check
+	// path hard-rejects such a config; the tolerant load / peer-sync paths downgrade
+	// to a warning so an already-persisted or peer-synced config an older binary
+	// accepted still BOOTS (#1960 no-brick). The daemon's runtime bind path
+	// independently clamps a non-loopback + no-auth bind back to loopback (part B,
+	// daemon_run.go), so a leniently-loaded vulnerable config is not left exposed.
+	// Same doctrine as lenientZoneCount.
+	lenientWebManagementAuth bool
 	// lenientZoneIDCollision (#3075) downgrades the stable-zone-id collision
 	// gate (validateZoneIDCollisionAST) from a hard compile error to a
 	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
@@ -1471,6 +1500,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
 		lenientFirewallFilterFamilyCollisions:  true,
+		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1496,6 +1526,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,
 		lenientZoneCount:                       true,
+		lenientWebManagementAuth:               true,
 		lenientZoneIDCollision:                 true,
 		lenientRoutingInstanceTableIDCollision: true,
 		lenientAddressBookNames:                true,
@@ -1531,6 +1562,62 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDNATToScope:                     true,
 		lenientEventWithinTrigger:              true,
 	})
+}
+
+// validateWebManagementAuthStrict hard-rejects a `system services
+// web-management` config that binds the REST / config API to a NON-LOOPBACK
+// address without any REST authentication configured (#4047, fable-161 F-155).
+//
+// The REST server (pkg/api) serves the mutating config endpoints — POST
+// /api/v1/config/{set,delete,commit,commit-confirmed,rollback,load,activate}
+// and /api/v1/system/action — with NO auth middleware unless api-auth is set:
+// pkg/api/server.go wires the auth middleware only when cfg.Auth != nil, and
+// the daemon (daemon_run.go) sets apiCfg.Auth only when web-management api-auth
+// carries at least one user or api-key. The default bind is loopback
+// 127.0.0.1:8080 (safe); a `web-management http|https interface <mgmt-if>`
+// stanza resolves to the interface's routable address (daemon_run.go ->
+// resolveInterfaceAddr), so binding off-loopback WITHOUT api-auth exposes every
+// mutating config RPC to any host that can reach the management address — a
+// network attacker can reconfigure the firewall unauthenticated.
+//
+// A non-loopback bind is signalled by a non-empty HTTPInterface or
+// HTTPSInterface (the only way web-management moves the REST server off
+// loopback). "Authenticated" means APIAuth carries at least one user OR
+// api-key — the same predicate daemon_run.go uses to actually wire the auth
+// middleware, so this gate rejects exactly the configs that would bind
+// unauthenticated. HTTPS is covered too: transport encryption without
+// authentication still lets any reachable client mutate config.
+//
+// Strict on the commit / commit-check path (hard-reject). Downgraded to a
+// cfg.Warnings entry on the tolerant load / peer-sync paths
+// (lenientWebManagementAuth) so an already-persisted or peer-synced config that
+// an older binary accepted still BOOTS (#1960 fail-closed-on-load). The daemon's
+// runtime bind path independently CLAMPS a non-loopback + no-auth bind back to
+// loopback (part B, daemon_run.go), so the leniently-loaded config is preserved
+// but not left exposed — the operator adds api-auth and recommits to restore the
+// non-loopback bind.
+func validateWebManagementAuthStrict(cfg *Config) error {
+	if cfg == nil || cfg.System.Services == nil || cfg.System.Services.WebManagement == nil {
+		return nil
+	}
+	wm := cfg.System.Services.WebManagement
+	var binds []string
+	if wm.HTTPInterface != "" {
+		binds = append(binds, fmt.Sprintf("http interface %q", wm.HTTPInterface))
+	}
+	if wm.HTTPSInterface != "" {
+		binds = append(binds, fmt.Sprintf("https interface %q", wm.HTTPSInterface))
+	}
+	if len(binds) == 0 {
+		return nil // loopback bind (default) — safe without auth
+	}
+	authed := wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0)
+	if authed {
+		return nil
+	}
+	return fmt.Errorf(
+		"system services web-management binds the REST/config API off-loopback (%s) without api-auth — the REST API is UNAUTHENTICATED, so an off-loopback bind exposes the mutating config endpoints (set / commit / rollback / system action) to the network; configure `set system services web-management api-auth {user <name> password <pw> | api-key <key>}` or remove the interface binding to keep the API on loopback (#4047)",
+		strings.Join(binds, ", "))
 }
 
 func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
@@ -1656,6 +1743,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientApplicationSpecs:                true,
 		lenientApplicationNameCollisions:       true,
 		lenientFirewallFilterFamilyCollisions:  true,
+		lenientFirewallFilterFamilyAnyMatches:  true,
 		lenientFilterProtocols:                 true,
 		lenientFilterCrossField:                true,
 		lenientFilterActions:                   true,
@@ -1681,6 +1769,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,
 		lenientZoneCount:                       true,
+		lenientWebManagementAuth:               true,
 		lenientZoneIDCollision:                 true,
 		lenientRoutingInstanceTableIDCollision: true,
 		lenientAddressBookNames:                true,
@@ -1966,6 +2055,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #4296 firewall-filter family-any specific-match gate. #4287 dual-compiles a
+	// `family any` filter into BOTH the inet and inet6 pools; a family-specific
+	// match under `family any` (a v4/v6 source/destination-address literal or a
+	// per-family icmp-type/icmp-code) is then dual-compiled verbatim and can never
+	// match the other family — an imperfect v6 under-block. Strict (commit /
+	// commit-check): the first such match hard-rejects, pointing at family
+	// inet/inet6. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config an older binary silently accepted still BOOTS (#1960).
+	// Runs on the group-expanded, inactive-pruned AST for the same reason as the
+	// collision gate above — only the raw AST still carries the family-any match.
+	fwFilterFamilyAnyWarnings, err := validateFirewallFilterFamilyAnyMatchesAST(
+		tree.Children, opts.lenientFirewallFilterFamilyAnyMatches)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3096: the #3079 interim NAT rule-set scope reject is LIFTED. A
 	// `security nat {source|destination|static}` rule-set whose `from`/`to`
 	// clause scopes traffic by `interface` or `routing-instance` is now
@@ -2180,6 +2285,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, appCollisionWarnings...)
 	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyWarnings...)
+	cfg.Warnings = append(cfg.Warnings, fwFilterFamilyAnyWarnings...)
 	cfg.Warnings = append(cfg.Warnings, bindIfaceWarnings...)
 	cfg.Warnings = append(cfg.Warnings, ipsecTSWarnings...)
 	cfg.Warnings = append(cfg.Warnings, policyMatchWarnings...)
@@ -2473,6 +2579,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientDeviceMap {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("device-map (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #4047 web-management REST-auth gate. Strict on commit / commit-check
+	// (hard-reject a web-management config that binds the unauthenticated REST /
+	// config API off-loopback without api-auth — exposing the mutating config
+	// endpoints to the network); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960; the daemon's
+	// runtime bind path clamps such a bind back to loopback, so the leniently-
+	// loaded config is preserved but not left exposed).
+	if err := validateWebManagementAuthStrict(cfg); err != nil {
+		if opts.lenientWebManagementAuth {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("web-management auth (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
