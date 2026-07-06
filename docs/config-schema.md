@@ -697,14 +697,50 @@ false-reject that valid Junos config (the #4191 class). It is a follow-up:
 model the rule-level persistent-nat leaves (or make an accept-with-advisory
 decision) FIRST, then flip.
 
+**More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
+Three additional `security` subtrees now set `closedWorld:true`
+(`schema_security.go`), each after the same leaf-completeness audit — the
+modeled child set equals the full Junos grammar AND equals the exact keyword
+set the compiler (`compiler_ipsec.go`) reads, so closing carries no
+false-reject risk:
+
+- `security ipsec vpn <v> traffic-selector <ts>` — the entire Junos grammar is
+  `local-ip <prefix>` and `remote-ip <prefix>` (both modeled); the compiler
+  traffic-selector loop reads only those two. A typo (`local-op`) would
+  silently drop the selector prefix and negotiate the wrong crypto proxy-id;
+  it is now rejected at commit.
+- `security ipsec vpn <v> vpn-monitor` — the full grammar is `source-interface`,
+  `destination-ip`, and `optimized` (all modeled); the compiler `vpn-monitor`
+  arm reads only those three. (The feature itself is accepted-but-not-enforced
+  advisory, but the flip still catches typos.)
+- `security {ike,ipsec} gateway <gw> dead-peer-detection` (both identical copies
+  of the block are flipped) — the full grammar is `always-send`, `optimized`,
+  `probe-idle-tunnel`, `interval <seconds>`, and `threshold <count>` (all
+  modeled); `parseDeadPeerDetectionNode` reads only those five. A typo
+  (`intervl`) would silently keep the Junos default; it is now rejected.
+
+Every value leaf in these subtrees (`local-ip`/`remote-ip`,
+`source-interface`/`destination-ip`, `interval`/`threshold`) carries its value
+on the same statement line — there is no nested value block in Junos — so
+closed-world never descends into an AST child of a value leaf in EITHER parser
+shape, and cannot false-reject a valid config. As with PR-B, the reject fires
+only on the strict commit path; `compileTreeLenient` downgrades it to a warning
+on `Store.Load` / `SyncApply`. Production tests:
+`schema_closedworld_ipsec_4313_test.go` (RED on revert of each flag).
+
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
-`closedWorld` on for the other umbrella candidates (`security ipsec`, `snmp
-community`, `protocols {ospf,bgp} interface`, `interfaces … family`, and the
-deferred source-NAT then above) is only safe once that subtree is LEAF-COMPLETE
-— every valid Junos keyword under it is modeled — otherwise the flip
-false-rejects a valid config. Each flip is its own follow-up gated on a
-Junos-leaf completeness audit for that subtree. Do NOT set `closedWorld` on a
-subtree without that audit.
+`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
+Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;
+`security ipsec proposal` / `security ike proposal` — INCOMPLETE: Junos allows a
+`description` leaf, unmodeled; `security nat static … then static-nat` —
+UNSAFE: `static-nat` is a free-form leaf and the Junos hierarchical form
+`static-nat { prefix { … } }` would false-reject under closed-world; `security
+screen ids-option` — INCOMPLETE, deliberately open-world; `protocols {ospf,bgp}
+interface`, `interfaces … family`, and the deferred source-NAT then above) is
+only safe once that subtree is LEAF-COMPLETE — every valid Junos keyword under
+it is modeled — otherwise the flip false-rejects a valid config. Each flip is
+its own follow-up gated on a Junos-leaf completeness audit for that subtree. Do
+NOT set `closedWorld` on a subtree without that audit.
 
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 

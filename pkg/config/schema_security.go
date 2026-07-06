@@ -883,7 +883,22 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueEnumOf, valueDesc: "NAT traversal (UDP encapsulation) mode",
 				valueExamples: []string{"enable", "disable", "force"},
 				validator:     ValidateEnum([]string{"enable", "disable", "force"}), children: nil},
-			"dead-peer-detection": {desc: "Dead peer detection", children: map[string]*schemaNode{
+			// #4313 PR-C — closed-world flip (both the `security ike gateway`
+			// and `security ipsec gateway` copies of this identical block). The
+			// Junos `dead-peer-detection` grammar is LEAF-COMPLETE: exactly
+			// `always-send`, `optimized`, `probe-idle-tunnel`, `interval
+			// <seconds>`, and `threshold <count>` (all modeled), and the
+			// compiler (compiler_ipsec.go parseDeadPeerDetectionNode) reads ONLY
+			// these five keywords. always-send/optimized/probe-idle-tunnel are
+			// bare flags; interval/threshold carry their value on the same
+			// statement line (no nested block), so closed-world never descends
+			// into an AST child — it cannot false-reject a valid config (#4191
+			// class). A typo (`intervl`) or garbage keyword under DPD is now
+			// REJECTED at strict commit instead of silently dropped (the #4313
+			// bug — a fat-fingered interval/threshold would silently keep the
+			// Junos default); the tolerant Load/SyncApply path downgrades to a
+			// warning (#1960).
+			"dead-peer-detection": {desc: "Dead peer detection", closedWorld: true, children: map[string]*schemaNode{
 				"always-send":       {desc: "Send DPD probes regardless of traffic", children: nil},
 				"optimized":         {desc: "Optimized DPD probing", children: nil},
 				"probe-idle-tunnel": {desc: "Probe idle tunnels", children: nil},
@@ -961,7 +976,22 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				valueType: ValueEnumOf, valueDesc: "NAT traversal (UDP encapsulation) mode",
 				valueExamples: []string{"enable", "disable", "force"},
 				validator:     ValidateEnum([]string{"enable", "disable", "force"}), children: nil},
-			"dead-peer-detection": {desc: "Dead peer detection", children: map[string]*schemaNode{
+			// #4313 PR-C — closed-world flip (both the `security ike gateway`
+			// and `security ipsec gateway` copies of this identical block). The
+			// Junos `dead-peer-detection` grammar is LEAF-COMPLETE: exactly
+			// `always-send`, `optimized`, `probe-idle-tunnel`, `interval
+			// <seconds>`, and `threshold <count>` (all modeled), and the
+			// compiler (compiler_ipsec.go parseDeadPeerDetectionNode) reads ONLY
+			// these five keywords. always-send/optimized/probe-idle-tunnel are
+			// bare flags; interval/threshold carry their value on the same
+			// statement line (no nested block), so closed-world never descends
+			// into an AST child — it cannot false-reject a valid config (#4191
+			// class). A typo (`intervl`) or garbage keyword under DPD is now
+			// REJECTED at strict commit instead of silently dropped (the #4313
+			// bug — a fat-fingered interval/threshold would silently keep the
+			// Junos default); the tolerant Load/SyncApply path downgrades to a
+			// warning (#1960).
+			"dead-peer-detection": {desc: "Dead peer detection", closedWorld: true, children: map[string]*schemaNode{
 				"always-send":       {desc: "Send DPD probes regardless of traffic", children: nil},
 				"optimized":         {desc: "Optimized DPD probing", children: nil},
 				"probe-idle-tunnel": {desc: "Probe idle tunnels", children: nil},
@@ -1000,7 +1030,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			// #4299 (V-3): vpn-monitor. Accepted-but-not-enforced — captured so
 			// ValidateConfig emits an advisory; xpf has no ICMP-probe liveness /
 			// st0 interface-state coupling yet.
-			"vpn-monitor": {desc: "Tunnel liveness monitoring (accepted-but-not-enforced advisory)", children: map[string]*schemaNode{
+			//
+			// #4313 PR-C — closed-world flip. The Junos `vpn-monitor` block is
+			// LEAF-COMPLETE: its entire grammar is exactly `source-interface`,
+			// `destination-ip`, and `optimized` (all modeled), and the compiler
+			// (compiler_ipsec.go vpn-monitor arm ~line 478) reads ONLY these
+			// three keywords. source-interface/destination-ip are value leaves
+			// whose value rides on the same statement line and optimized is a
+			// bare flag, so closed-world never descends into an AST child — it
+			// cannot false-reject a valid config (#4191 class). A typo under
+			// vpn-monitor is now REJECTED at strict commit instead of silently
+			// dropped (the #4313 bug); the tolerant Load/SyncApply path
+			// downgrades to a warning (#1960).
+			"vpn-monitor": {desc: "Tunnel liveness monitoring (accepted-but-not-enforced advisory)", closedWorld: true, children: map[string]*schemaNode{
 				"source-interface": {desc: "Probe source interface", args: 1, placeholder: "<interface-name>", children: nil},
 				"destination-ip":   {desc: "Probe destination IP", args: 1, placeholder: "<address>", children: nil},
 				"optimized":        {desc: "Send probes only when there is no outbound traffic", children: nil},
@@ -1009,7 +1051,25 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"remote-identity": {desc: "Remote identity (default remote traffic selector)", args: 1, placeholder: "<identity>", children: nil},
 			"pre-shared-key":  {desc: "Pre-shared key for this VPN", args: 1, placeholder: "<key>", children: nil},
 			"local-address":   {desc: "Local tunnel endpoint address", args: 1, placeholder: "<address>", children: nil},
-			"traffic-selector": {desc: "Traffic selector name", args: 1, placeholder: "<selector-name>", children: map[string]*schemaNode{
+			// #4313 PR-C — closed-world flip. The Junos IPsec
+			// `traffic-selector <name>` block is LEAF-COMPLETE: its entire
+			// grammar is exactly `local-ip <prefix>` and `remote-ip <prefix>`
+			// (both modeled), and the compiler (compiler_ipsec.go, the
+			// traffic-selector loop ~line 495) reads ONLY these two keywords.
+			// Each is a value leaf whose prefix rides on the same statement
+			// line (no nested block in Junos), so closed-world never descends
+			// into an AST child of local-ip/remote-ip in either parser shape —
+			// it cannot false-reject a valid config (the #4191 class the
+			// umbrella warns about). closedWorld is inherited down every
+			// descendant level by walkSchemaNode's childClosed fold, so a typo
+			// (`local-op`) or garbage keyword under the selector is REJECTED at
+			// strict operator commit (SchemaValidate) instead of committing
+			// clean and being silently dropped — the #4313 silent-inert bug
+			// (a malformed selector would apply the wrong crypto proxy-id). The
+			// tolerant Load/SyncApply path downgrades the reject to a warning
+			// (#1960, configstore compileTreeLenient), so a stored or
+			// peer-synced config is never bricked.
+			"traffic-selector": {desc: "Traffic selector name", args: 1, placeholder: "<selector-name>", closedWorld: true, children: map[string]*schemaNode{
 				"local-ip":  {desc: "Local traffic selector prefix", args: 1, placeholder: "<prefix>", children: nil},
 				"remote-ip": {desc: "Remote traffic selector prefix", args: 1, placeholder: "<prefix>", children: nil},
 			}},
