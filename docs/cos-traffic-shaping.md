@@ -1084,7 +1084,9 @@ Notes for this specific test:
 - DSCP rewrite-rules can also be attached under
   `class-of-service interfaces ... unit ... rewrite-rules dscp <name>` on
   shaped userspace egress interfaces; they apply after queue selection and act
-  as a fallback behind any explicit firewall-filter DSCP rewrite action
+  as a fallback behind any explicit firewall-filter DSCP rewrite action. The
+  rewrite is keyed on `(forwarding-class, loss-priority)` (#3995) — see the
+  loss-priority note below
 - 802.1p BA classifiers are also available as a fallback queue selector on
   userspace interfaces; they use the ingress VLAN PCP preserved from tagged
   XDP traffic, including priority-tagged frames with VLAN ID 0
@@ -1166,10 +1168,26 @@ Notes for this specific test:
   missed — and the measurement-only
   `xpf_fairness_equal_flow_unsampled_active_workers` estimator gauge
   (#1304) is unrelated to the removed cap.
-- `loss-priority` on CoS DSCP / 802.1p classifiers is accepted for syntax
-  compatibility but is not enforced yet
-- `loss-priority` on CoS DSCP rewrite-rules is accepted for syntax
-  compatibility but is not enforced yet
+- `loss-priority` on CoS DSCP rewrite-rules is **enforced** (#3995): the
+  userspace dataplane keys the egress DSCP rewrite on
+  `(forwarding-class, loss-priority)`, so a rule that rewrites
+  `<fc> low` and `<fc> high` to different code-points produces the
+  LOW code-point for a low-loss-priority flow and the HIGH code-point
+  for a high-loss-priority flow of that class. A rewrite entry with no
+  explicit `loss-priority` is a wildcard that applies to every
+  loss-priority (backward-compat). The loss-priority is taken from the
+  egress interface's DSCP / 802.1p classifier assignment for the flow's
+  ingress code-point (Junos default LOW when unclassified); it is
+  resolved once per flow and cached, exactly like the firewall-filter
+  DSCP rewrite. A single, loss-priority-uniform rewrite (or a wildcard)
+  is additionally baked into the per-queue drain fallback; differentiated
+  rules resolve per flow at classification time.
+- `loss-priority` on CoS DSCP / 802.1p classifiers now drives the egress
+  rewrite-rule selection above, but is still **not** enforced for
+  drop-precedence / WRED buffer management (a commit warning names the
+  remaining gap). Note the loss-priority is resolved per flow from the
+  seed packet's ingress code-point; a flow that changes its marking
+  mid-stream keeps the seed loss-priority for its cached rewrite.
 
 Suggested verification commands:
 

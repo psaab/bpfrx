@@ -1030,15 +1030,28 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
     let iface = state.interfaces.get(&42).expect("missing CoS interface");
     assert_eq!(iface.dscp_classifier, "wan-classifier");
     assert_eq!(iface.ieee8021_classifier, "wan-pcp");
+    // #3995: a single (voice, low) rewrite is loss-priority-DIFFERENTIATED
+    // (only LOW is set), so it is NOT baked into the per-queue drain fallback
+    // (which is uniform-only); it resolves per-flow via `lp_rewrite` instead.
     assert_eq!(
         iface
             .queues
             .iter()
             .find(|queue| queue.queue_id == 5)
             .and_then(|queue| queue.dscp_rewrite),
-        Some(46)
+        None
     );
     assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
+    // #3995: voice (queue 5) is classified LOW (index 0) for DSCP 46, and the
+    // rewrite-rule maps (voice, low) -> 46, so the loss-priority matrix carries
+    // (queue 5, low) -> 46.
+    let lp_rewrite = state
+        .lp_rewrite
+        .get(&42)
+        .expect("missing lp_rewrite for CoS interface");
+    assert_eq!(lp_rewrite.dscp_rewrite_by_queue_lp.get(&(5, 0)), Some(&46));
+    assert_eq!(lp_rewrite.dscp_lp_by_dscp[46], 0);
+    assert_eq!(lp_rewrite.dscp_lp_by_dscp[0], 0);
     let classifier = state
         .dscp_classifiers
         .get("wan-classifier")

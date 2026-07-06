@@ -120,6 +120,125 @@ fn build_cos_ieee8021_queue_table(
     Ok(table)
 }
 
+/// #3995: map a Junos loss-priority string to an internal index
+/// (low=0, medium-low=1, medium-high=2, high=3). Returns `None` for an empty
+/// or unrecognized value; callers treat that as the default LOW (classifier)
+/// or a wildcard applying to every loss-priority (rewrite-rule).
+pub(super) fn cos_loss_priority_index(value: &str) -> Option<u8> {
+    match value {
+        "low" => Some(0),
+        "medium-low" => Some(1),
+        "medium-high" => Some(2),
+        "high" => Some(3),
+        _ => None,
+    }
+}
+
+/// #3995: flatten a DSCP classifier's `lp_by_dscp` into a fixed 64-entry table
+/// (index = DSCP code-point). `u8::MAX` marks an unclassified code-point
+/// (resolves to the default LOW loss-priority at classification time). Fails
+/// the snapshot CLOSED on an out-of-range code-point, mirroring
+/// `build_cos_dscp_queue_table` (#2447).
+fn build_cos_dscp_lp_table(
+    classifier_name: &str,
+    classifiers: &FastMap<String, CoSDSCPClassifierConfig>,
+) -> Result<[u8; 64], crate::policy::SnapshotIntegrityError> {
+    let mut table = [u8::MAX; 64];
+    if classifier_name.is_empty() {
+        return Ok(table);
+    }
+    if let Some(classifier) = classifiers.get(classifier_name) {
+        for (&dscp, &lp) in &classifier.lp_by_dscp {
+            let Some(slot) = table.get_mut(usize::from(dscp)) else {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::CosDscpCodePointOutOfRange {
+                        classifier: classifier_name.to_string(),
+                        dscp,
+                    },
+                );
+            };
+            *slot = lp;
+        }
+    }
+    Ok(table)
+}
+
+/// #3995: flatten an 802.1p classifier's `lp_by_pcp` into a fixed 8-entry
+/// table. `u8::MAX` marks an unclassified code-point.
+fn build_cos_ieee8021_lp_table(
+    classifier_name: &str,
+    classifiers: &FastMap<String, CoSIEEE8021ClassifierConfig>,
+) -> Result<[u8; 8], crate::policy::SnapshotIntegrityError> {
+    let mut table = [u8::MAX; 8];
+    if classifier_name.is_empty() {
+        return Ok(table);
+    }
+    if let Some(classifier) = classifiers.get(classifier_name) {
+        for (&pcp, &lp) in &classifier.lp_by_pcp {
+            let Some(slot) = table.get_mut(usize::from(pcp)) else {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::CosIeee8021CodePointOutOfRange {
+                        classifier: classifier_name.to_string(),
+                        pcp,
+                    },
+                );
+            };
+            *slot = lp;
+        }
+    }
+    Ok(table)
+}
+
+/// #3995: the loss-priority-INDEPENDENT rewrite for a forwarding-class, or
+/// `None`. `Some(v)` only when EVERY loss-priority maps to the same code-point
+/// `v` (a single-value / wildcard rule), so the per-queue drain fallback can
+/// apply it regardless of a packet's loss-priority without misapplying it.
+/// Loss-priority-differentiated (or partial) rules return `None` and are
+/// resolved per-flow at classification time.
+fn uniform_fc_rewrite(rule: &CoSDSCPRewriteRuleConfig, forwarding_class: &str) -> Option<u8> {
+    let first = rule
+        .dscp_by_fc_lp
+        .get(&(forwarding_class.to_string(), 0))
+        .copied()?;
+    (1..COS_LOSS_PRIORITY_LEVELS)
+        .all(|lp| {
+            rule.dscp_by_fc_lp
+                .get(&(forwarding_class.to_string(), lp))
+                .copied()
+                == Some(first)
+        })
+        .then_some(first)
+}
+
+/// #3995: build the per-egress-interface loss-priority classification + rewrite
+/// tables. Flattens the interface's classifiers into DSCP/PCP → loss-priority
+/// tables and builds the `(queue_id, loss_priority)` → code-point matrix from
+/// the interface's rewrite-rule over its materialized queues.
+fn build_cos_lp_rewrite(
+    iface: &InterfaceSnapshot,
+    cfg: &CoSInterfaceConfig,
+    tables: &ClassifierTables<'_>,
+) -> Result<CoSLossPriorityRewrite, crate::policy::SnapshotIntegrityError> {
+    let dscp_lp_by_dscp = build_cos_dscp_lp_table(&cfg.dscp_classifier, &tables.dscp_classifiers)?;
+    let ieee8021_lp_by_pcp =
+        build_cos_ieee8021_lp_table(&cfg.ieee8021_classifier, &tables.ieee8021_classifiers)?;
+    let mut dscp_rewrite_by_queue_lp: FastMap<(u8, u8), u8> = FastMap::default();
+    if let Some(rule) = tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule) {
+        for queue in &cfg.queues {
+            for lp in 0..COS_LOSS_PRIORITY_LEVELS {
+                if let Some(&dscp) = rule.dscp_by_fc_lp.get(&(queue.forwarding_class.clone(), lp)) {
+                    dscp_rewrite_by_queue_lp.insert((queue.queue_id, lp), dscp);
+                }
+            }
+        }
+    }
+    Ok(CoSLossPriorityRewrite {
+        dscp_lp_by_dscp,
+        ieee8021_lp_by_pcp,
+        dscp_rewrite_by_queue_lp,
+    })
+}
+
 /// Default burst size when interface or scheduler did not specify
 /// one. 1% of the rate floored at 64×1500 (~96 KB).
 ///
@@ -220,6 +339,7 @@ pub(super) fn build_cos_classifier_tables(
         .filter(|classifier| !classifier.name.is_empty())
         .map(|classifier| {
             let mut queue_by_dscp = FastMap::default();
+            let mut lp_by_dscp = FastMap::default();
             for entry in &classifier.entries {
                 if entry.forwarding_class.is_empty() {
                     continue;
@@ -227,13 +347,20 @@ pub(super) fn build_cos_classifier_tables(
                 let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
                     continue;
                 };
+                // #3995: a classifier entry with no explicit loss-priority
+                // defaults to LOW (the Junos default drop-precedence).
+                let lp = cos_loss_priority_index(&entry.loss_priority).unwrap_or(0);
                 for dscp in &entry.dscp_values {
                     queue_by_dscp.insert(*dscp, queue_id);
+                    lp_by_dscp.insert(*dscp, lp);
                 }
             }
             (
                 classifier.name.clone(),
-                CoSDSCPClassifierConfig { queue_by_dscp },
+                CoSDSCPClassifierConfig {
+                    queue_by_dscp,
+                    lp_by_dscp,
+                },
             )
         })
         .collect::<FastMap<_, _>>();
@@ -243,6 +370,7 @@ pub(super) fn build_cos_classifier_tables(
         .filter(|classifier| !classifier.name.is_empty())
         .map(|classifier| {
             let mut queue_by_pcp = FastMap::default();
+            let mut lp_by_pcp = FastMap::default();
             for entry in &classifier.entries {
                 if entry.forwarding_class.is_empty() {
                     continue;
@@ -250,13 +378,18 @@ pub(super) fn build_cos_classifier_tables(
                 let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
                     continue;
                 };
+                let lp = cos_loss_priority_index(&entry.loss_priority).unwrap_or(0);
                 for pcp in &entry.code_points {
                     queue_by_pcp.insert(*pcp, queue_id);
+                    lp_by_pcp.insert(*pcp, lp);
                 }
             }
             (
                 classifier.name.clone(),
-                CoSIEEE8021ClassifierConfig { queue_by_pcp },
+                CoSIEEE8021ClassifierConfig {
+                    queue_by_pcp,
+                    lp_by_pcp,
+                },
             )
         })
         .collect::<FastMap<_, _>>();
@@ -265,20 +398,40 @@ pub(super) fn build_cos_classifier_tables(
         .iter()
         .filter(|rewrite_rule| !rewrite_rule.name.is_empty())
         .map(|rewrite_rule| {
-            let mut dscp_by_forwarding_class = FastMap::default();
+            // #3995: key the rewrite on (forwarding-class, loss-priority). Two
+            // passes so a specific loss-priority entry always wins over a
+            // wildcard (no explicit loss-priority) one regardless of config
+            // order.
+            let mut dscp_by_fc_lp: FastMap<(String, u8), u8> = FastMap::default();
+            // Pass 1: entries WITH an explicit loss-priority.
             for entry in &rewrite_rule.entries {
                 if entry.forwarding_class.is_empty() {
                     continue;
                 }
-                dscp_by_forwarding_class
-                    .entry(entry.forwarding_class.clone())
-                    .or_insert(entry.dscp_value);
+                if let Some(lp) = cos_loss_priority_index(&entry.loss_priority) {
+                    dscp_by_fc_lp
+                        .entry((entry.forwarding_class.clone(), lp))
+                        .or_insert(entry.dscp_value);
+                }
+            }
+            // Pass 2: an entry with NO explicit loss-priority is a wildcard that
+            // applies to ALL loss-priorities (backward-compat) — filling only
+            // the slots a specific entry did not already claim.
+            for entry in &rewrite_rule.entries {
+                if entry.forwarding_class.is_empty() {
+                    continue;
+                }
+                if cos_loss_priority_index(&entry.loss_priority).is_none() {
+                    for lp in 0..COS_LOSS_PRIORITY_LEVELS {
+                        dscp_by_fc_lp
+                            .entry((entry.forwarding_class.clone(), lp))
+                            .or_insert(entry.dscp_value);
+                    }
+                }
             }
             (
                 rewrite_rule.name.clone(),
-                CoSDSCPRewriteRuleConfig {
-                    dscp_by_forwarding_class,
-                },
+                CoSDSCPRewriteRuleConfig { dscp_by_fc_lp },
             )
         })
         .collect::<FastMap<_, _>>();
@@ -445,12 +598,11 @@ pub(super) fn build_cos_iface_config(
                     burst_bytes,
                     transmit_rate_bytes,
                 ),
-                dscp_rewrite: dscp_rewrite_rule.and_then(|rewrite_rule| {
-                    rewrite_rule
-                        .dscp_by_forwarding_class
-                        .get(&entry.forwarding_class)
-                        .copied()
-                }),
+                // #3995: only the loss-priority-UNIFORM rewrite is baked into
+                // the per-queue drain fallback; differentiated rewrites are
+                // resolved per-flow at classification (see `uniform_fc_rewrite`).
+                dscp_rewrite: dscp_rewrite_rule
+                    .and_then(|rewrite_rule| uniform_fc_rewrite(rewrite_rule, &entry.forwarding_class)),
                 // #1614 A3: per-queue CoDel target from scheduler. 0
                 // disables CoDel for the queue (current default).
                 codel_target_ns: scheduler
@@ -502,9 +654,9 @@ pub(super) fn build_cos_iface_config(
         .unwrap_or(false);
     let dscp_rewrite_targets_iface_class = dscp_rewrite_rule
         .map(|r| {
-            r.dscp_by_forwarding_class
+            r.dscp_by_fc_lp
                 .keys()
-                .any(|fc| iface_classes.contains(&fc.as_str()))
+                .any(|(fc, _lp)| iface_classes.contains(&fc.as_str()))
         })
         .unwrap_or(false);
 
@@ -534,11 +686,9 @@ pub(super) fn build_cos_iface_config(
             equal_flow_target_policy: EqualFlowTargetPolicy::default(),
             surplus_weight: 1,
             buffer_bytes: burst_bytes,
+            // #3995: uniform-only fallback (see the scheduler-map queue above).
             dscp_rewrite: dscp_rewrite_rule
-                .and_then(|rewrite_rule| {
-                    rewrite_rule.dscp_by_forwarding_class.get("best-effort")
-                })
-                .copied(),
+                .and_then(|rewrite_rule| uniform_fc_rewrite(rewrite_rule, "best-effort")),
             // #1614 A3: synthetic best-effort queue has no scheduler;
             // CoDel disabled by default (0 = off).
             codel_target_ns: 0,
@@ -644,6 +794,11 @@ pub(super) fn build_cos_state(
             continue;
         }
         if let Some(cfg) = build_cos_iface_config(iface, &tables)? {
+            // #3995: build the per-interface loss-priority classification +
+            // rewrite tables alongside the interface config so the DSCP rewrite
+            // resolves on (forwarding-class, loss-priority) at TX time.
+            let lp_rewrite = build_cos_lp_rewrite(iface, &cfg, &tables)?;
+            state.lp_rewrite.insert(iface.ifindex, lp_rewrite);
             state.interfaces.insert(iface.ifindex, cfg);
         }
     }

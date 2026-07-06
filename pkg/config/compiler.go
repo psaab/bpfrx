@@ -265,6 +265,21 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientSchedulerMapRef bool
 
+	// lenientCoSLossPriority (#3995) downgrades the class-of-service
+	// classifier / rewrite-rule loss-priority value check
+	// (validateClassOfServiceLossPriorityStrict) from a hard error to a
+	// warning on the tolerant load / peer-sync paths. An unrecognized
+	// loss-priority (an operator typo like `medum-low`) is rejected at
+	// commit / commit-check so it is LOUD rather than silently applied as
+	// the default LOW / a wildcard by the dataplane, but a config
+	// persisted by an older binary — or synced from a peer — must still
+	// boot through it (warn) rather than fail-closed-on-load (#1960
+	// class). The dataplane's parse (cos_loss_priority_index in
+	// userspace-dp forwarding_build/cos.rs) maps an unrecognized value to
+	// the SAFE default, preserving the fail-SAFE posture on that boot.
+	// Same doctrine as lenientSchedulerMapRef.
+	lenientCoSLossPriority bool
+
 	// lenientIPsecGatewayRefs (#2074) downgrades the IPsec VPN -> IKE
 	// gateway cross-reference check from a hard error to a warning on the
 	// tolerant load / peer-sync paths (CompileConfigLenient /
@@ -1496,6 +1511,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientEventAttributesMatch:            true,
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
+		lenientCoSLossPriority:                 true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
@@ -1739,6 +1755,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientEventAttributesMatch:            true,
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
+		lenientCoSLossPriority:                 true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
@@ -2628,6 +2645,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientSchedulerMapRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("class-of-service scheduler-map reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #3995 class-of-service loss-priority value gate. Strict on commit /
+	// commit-check (hard-reject an unrecognized loss-priority such as an
+	// operator typo `medum-low`, which the dataplane would otherwise apply
+	// as the SAFE default LOW / wildcard — silently wrong QoS). Lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config
+	// still boots — #1960 no-brick; the dataplane applies the SAFE default
+	// on that boot).
+	if err := validateClassOfServiceLossPriorityStrict(cfg.ClassOfService); err != nil {
+		if opts.lenientCoSLossPriority {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("class-of-service loss-priority (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

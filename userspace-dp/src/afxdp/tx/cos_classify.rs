@@ -112,19 +112,32 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
         // an EF fragment lands in its BA queue instead of straddling the
         // default queue. Filter forwarding-class / rewrite needs the flow
         // key, so those stay unset (as before).
+        let queue_id = iface.map(|iface| {
+            resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                .or_else(|| {
+                    resolve_cos_ieee8021_classifier_queue_id(
+                        iface,
+                        meta.ingress_pcp,
+                        meta.ingress_vlan_present != 0,
+                    )
+                })
+                .unwrap_or(iface.default_queue)
+        });
+        // #3995: flowless packets still resolve the loss-priority-aware CoS
+        // rewrite from their own DSCP/PCP (default LOW when unclassified).
+        let dscp_rewrite = queue_id.and_then(|queue_id| {
+            resolve_cos_queue_lp_rewrite(
+                forwarding,
+                egress_ifindex,
+                queue_id,
+                meta.dscp,
+                meta.ingress_pcp,
+                meta.ingress_vlan_present != 0,
+            )
+        });
         return CachedTxSelectionDescriptor {
-            queue_id: iface.map(|iface| {
-                resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
-                    .or_else(|| {
-                        resolve_cos_ieee8021_classifier_queue_id(
-                            iface,
-                            meta.ingress_pcp,
-                            meta.ingress_vlan_present != 0,
-                        )
-                    })
-                    .unwrap_or(iface.default_queue)
-            }),
-            dscp_rewrite: None,
+            queue_id,
+            dscp_rewrite,
             drop: false,
             reject: false,
             filter_counters: crate::filter::CachedFilterCounters::default(),
@@ -281,9 +294,27 @@ pub(in crate::afxdp) fn resolve_cached_cos_tx_selection(
             !iface.dscp_classifier.is_empty() || !iface.ieee8021_classifier.is_empty()
         });
 
+    // #3995: fold the loss-priority-aware CoS rewrite-rule DSCP for the chosen
+    // queue (filter DSCP rewrite keeps precedence). The loss-priority derives
+    // from the seed packet's ingress DSCP/PCP; for a BA-reclassify flow the
+    // frozen queue may shift per packet, so the resolved rewrite reflects the
+    // seed packet's queue/loss-priority (correct for the common stable-marking
+    // flow; a mixed-marking flow keeps the seed rewrite rather than tracking
+    // every packet's loss-priority).
+    let cos_rewrite = queue_id.and_then(|queue_id| {
+        resolve_cos_queue_lp_rewrite(
+            forwarding,
+            egress_ifindex,
+            queue_id,
+            meta.dscp,
+            meta.ingress_pcp,
+            meta.ingress_vlan_present != 0,
+        )
+    });
+
     CachedTxSelectionDescriptor {
         queue_id,
-        dscp_rewrite: effective_dscp_rewrite,
+        dscp_rewrite: effective_dscp_rewrite.or(cos_rewrite),
         drop: output_result.action != crate::filter::FilterAction::Accept,
         // #3608: the cached-descriptor `drop` above is the OUTPUT filter's
         // terminal action only (the three-color policer runs separately at
@@ -405,19 +436,32 @@ fn resolve_cos_tx_selection_internal(
         // 5-tuple-independent behavior-aggregate (DSCP / 802.1p) lookup from
         // `meta` so a marked fragment lands in its BA queue rather than the
         // default queue. Mirrors the cached-path None branch.
+        let queue_id = iface.map(|iface| {
+            resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                .or_else(|| {
+                    resolve_cos_ieee8021_classifier_queue_id(
+                        iface,
+                        meta.ingress_pcp,
+                        meta.ingress_vlan_present != 0,
+                    )
+                })
+                .unwrap_or(iface.default_queue)
+        });
+        // #3995: flowless packets still resolve the loss-priority-aware CoS
+        // rewrite from their own DSCP/PCP (default LOW when unclassified).
+        let dscp_rewrite = queue_id.and_then(|queue_id| {
+            resolve_cos_queue_lp_rewrite(
+                forwarding,
+                egress_ifindex,
+                queue_id,
+                meta.dscp,
+                meta.ingress_pcp,
+                meta.ingress_vlan_present != 0,
+            )
+        });
         return CoSTxSelection {
-            queue_id: iface.map(|iface| {
-                resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
-                    .or_else(|| {
-                        resolve_cos_ieee8021_classifier_queue_id(
-                            iface,
-                            meta.ingress_pcp,
-                            meta.ingress_vlan_present != 0,
-                        )
-                    })
-                    .unwrap_or(iface.default_queue)
-            }),
-            dscp_rewrite: None,
+            queue_id,
+            dscp_rewrite,
             drop: false,
             reject: false,
             filter_log: None,
@@ -603,57 +647,89 @@ fn resolve_cos_tx_selection_internal(
             filter_log,
         };
     };
-    if let Some(forwarding_class) = output_result.forwarding_class {
-        if let Some(queue_id) = iface.queue_by_forwarding_class.get(forwarding_class) {
-            return CoSTxSelection {
-                queue_id: Some(*queue_id),
-                dscp_rewrite: effective_dscp_rewrite,
-                drop,
-                reject,
-                filter_log,
-            };
-        }
-    }
-    if let Some(forwarding_class) = ingress_forwarding_class {
-        if let Some(queue_id) = iface.queue_by_forwarding_class.get(forwarding_class) {
-            return CoSTxSelection {
-                queue_id: Some(*queue_id),
-                dscp_rewrite: effective_dscp_rewrite,
-                drop,
-                reject,
-                filter_log,
-            };
-        }
-    }
-    if let Some(queue_id) = resolve_cos_dscp_classifier_queue_id(iface, meta.dscp) {
-        return CoSTxSelection {
-            queue_id: Some(queue_id),
-            dscp_rewrite: effective_dscp_rewrite,
-            drop,
-            reject,
-            filter_log,
-        };
-    }
-    if let Some(queue_id) = resolve_cos_ieee8021_classifier_queue_id(
-        iface,
+    // Queue selection precedence: the output-filter forwarding-class, then the
+    // ingress input-filter forwarding-class, then the DSCP behavior-aggregate
+    // classifier, then the 802.1p classifier, then the interface default queue.
+    let queue_id = output_result
+        .forwarding_class
+        .and_then(|forwarding_class| iface.queue_by_forwarding_class.get(forwarding_class).copied())
+        .or_else(|| {
+            ingress_forwarding_class.and_then(|forwarding_class| {
+                iface.queue_by_forwarding_class.get(forwarding_class).copied()
+            })
+        })
+        .or_else(|| resolve_cos_dscp_classifier_queue_id(iface, meta.dscp))
+        .or_else(|| {
+            resolve_cos_ieee8021_classifier_queue_id(
+                iface,
+                meta.ingress_pcp,
+                meta.ingress_vlan_present != 0,
+            )
+        })
+        .unwrap_or(iface.default_queue);
+    // #3995: fold the loss-priority-aware CoS rewrite-rule DSCP for the chosen
+    // queue. A filter DSCP rewrite (`effective_dscp_rewrite`) still takes
+    // precedence; the CoS rewrite-rule only fills the gap, matching the drain
+    // ordering `req.dscp_rewrite.or(queue_dscp_rewrite)` this replaces.
+    let cos_rewrite = resolve_cos_queue_lp_rewrite(
+        forwarding,
+        egress_ifindex,
+        queue_id,
+        meta.dscp,
         meta.ingress_pcp,
         meta.ingress_vlan_present != 0,
-    ) {
-        return CoSTxSelection {
-            queue_id: Some(queue_id),
-            dscp_rewrite: effective_dscp_rewrite,
-            drop,
-            reject,
-            filter_log,
-        };
-    }
+    );
     CoSTxSelection {
-        queue_id: Some(iface.default_queue),
-        dscp_rewrite: effective_dscp_rewrite,
+        queue_id: Some(queue_id),
+        dscp_rewrite: effective_dscp_rewrite.or(cos_rewrite),
         drop,
         reject,
         filter_log,
     }
+}
+
+/// #3995: resolve THIS packet's classifier-assigned loss-priority on the egress
+/// interface (index 0=low .. 3=high). Mirrors the BA queue-selection order —
+/// the DSCP classifier first, then 802.1p (when the frame carries a VLAN tag),
+/// then the Junos default LOW for an unclassified code-point.
+fn resolve_cos_loss_priority(
+    lp: &CoSLossPriorityRewrite,
+    dscp: u8,
+    ingress_pcp: u8,
+    vlan_present: bool,
+) -> u8 {
+    let dscp_lp = lp.dscp_lp_by_dscp[usize::from(dscp & 0x3f)];
+    if dscp_lp != u8::MAX {
+        return dscp_lp;
+    }
+    if vlan_present {
+        if let Some(&pcp_lp) = lp.ieee8021_lp_by_pcp.get(usize::from(ingress_pcp)) {
+            if pcp_lp != u8::MAX {
+                return pcp_lp;
+            }
+        }
+    }
+    0
+}
+
+/// #3995: resolve the egress DSCP rewrite for (this packet's egress queue, this
+/// packet's classifier loss-priority). Returns `None` when the interface has no
+/// loss-priority rewrite tables, or the (queue, loss-priority) pair has no
+/// configured code-point — so the caller keeps any filter DSCP rewrite / no
+/// rewrite. This is deterministic per flow (the loss-priority derives from the
+/// flow's ingress code-point) and is therefore cached per-flow exactly like the
+/// pre-existing filter DSCP rewrite.
+fn resolve_cos_queue_lp_rewrite(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    queue_id: u8,
+    dscp: u8,
+    ingress_pcp: u8,
+    vlan_present: bool,
+) -> Option<u8> {
+    let lp = forwarding.cos.lp_rewrite.get(&egress_ifindex)?;
+    let plp = resolve_cos_loss_priority(lp, dscp, ingress_pcp, vlan_present);
+    lp.dscp_rewrite_by_queue_lp.get(&(queue_id, plp)).copied()
 }
 
 fn resolve_cos_dscp_classifier_queue_id(iface: &CoSInterfaceConfig, dscp: u8) -> Option<u8> {

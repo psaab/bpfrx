@@ -238,6 +238,115 @@ func validateClassOfServiceSchedulerMapRefsStrict(cos *ClassOfServiceConfig) err
 	return nil
 }
 
+// cosLossPriorityValues is the set of loss-priority values Junos accepts on a
+// class-of-service DSCP / 802.1p classifier or DSCP rewrite-rule. It mirrors
+// cos_loss_priority_index in userspace-dp forwarding_build/cos.rs.
+var cosLossPriorityValues = map[string]struct{}{
+	"low":         {},
+	"medium-low":  {},
+	"medium-high": {},
+	"high":        {},
+}
+
+// validateClassOfServiceLossPriorityStrict hard-rejects a class-of-service
+// classifier or DSCP rewrite-rule entry whose `loss-priority` value is not one
+// of the four Junos levels (low, medium-low, medium-high, high) — an operator
+// typo like `medum-low` (#3995). Junos rejects an unknown loss-priority at
+// commit; before this gate the raw string was threaded through to the
+// dataplane, where `cos_loss_priority_index` maps an unrecognized value to the
+// SAFE default (LOW for the classifier, a wildcard-over-all-loss-priorities for
+// the rewrite-rule). That default is correct for fail-safe boot but WRONG for a
+// fresh operator edit: the typo silently applies the wrong QoS class instead of
+// surfacing the mistake. Reject it loudly at commit / commit-check.
+//
+// An EMPTY loss-priority is skipped: it is the legitimate "no explicit
+// loss-priority" case (the rewrite-rule wildcard / classifier default), the
+// same placeholder the other CoS validators skip.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientCoSLossPriority) so a config persisted by an older
+// binary — or synced from a peer — still boots (#1960 no-brick); the dataplane
+// applies the SAFE default on that boot. Entries are visited in sorted order so
+// commit-check surfaces a STABLE first-error message.
+func validateClassOfServiceLossPriorityStrict(cos *ClassOfServiceConfig) error {
+	if cos == nil {
+		return nil
+	}
+	checkEntry := func(kind, ruleName, className, lossPriority string) error {
+		if lossPriority == "" {
+			return nil
+		}
+		if _, ok := cosLossPriorityValues[lossPriority]; ok {
+			return nil
+		}
+		return fmt.Errorf(
+			"class-of-service %s %q forwarding-class %q has unrecognized loss-priority %q "+
+				"(must be one of: low, medium-low, medium-high, high)",
+			kind, ruleName, className, lossPriority)
+	}
+
+	dscpNames := make([]string, 0, len(cos.DSCPClassifiers))
+	for name := range cos.DSCPClassifiers {
+		dscpNames = append(dscpNames, name)
+	}
+	sort.Strings(dscpNames)
+	for _, name := range dscpNames {
+		classifier := cos.DSCPClassifiers[name]
+		if classifier == nil {
+			continue
+		}
+		for _, entry := range classifier.Entries {
+			if entry == nil {
+				continue
+			}
+			if err := checkEntry("classifiers dscp", classifier.Name, entry.ForwardingClass, entry.LossPriority); err != nil {
+				return err
+			}
+		}
+	}
+
+	ieeeNames := make([]string, 0, len(cos.IEEE8021Classifiers))
+	for name := range cos.IEEE8021Classifiers {
+		ieeeNames = append(ieeeNames, name)
+	}
+	sort.Strings(ieeeNames)
+	for _, name := range ieeeNames {
+		classifier := cos.IEEE8021Classifiers[name]
+		if classifier == nil {
+			continue
+		}
+		for _, entry := range classifier.Entries {
+			if entry == nil {
+				continue
+			}
+			if err := checkEntry("classifiers ieee-802.1", classifier.Name, entry.ForwardingClass, entry.LossPriority); err != nil {
+				return err
+			}
+		}
+	}
+
+	rewriteNames := make([]string, 0, len(cos.DSCPRewriteRules))
+	for name := range cos.DSCPRewriteRules {
+		rewriteNames = append(rewriteNames, name)
+	}
+	sort.Strings(rewriteNames)
+	for _, name := range rewriteNames {
+		rewriteRule := cos.DSCPRewriteRules[name]
+		if rewriteRule == nil {
+			continue
+		}
+		for _, entry := range rewriteRule.Entries {
+			if entry == nil {
+				continue
+			}
+			if err := checkEntry("rewrite-rules dscp", rewriteRule.Name, entry.ForwardingClass, entry.LossPriority); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // validateIPsecPolicyProposalReferencesStrict hard-rejects an IPsec
 // (Phase 2) policy whose `proposals` reference does not resolve to a
 // defined IPsec proposal (#2073). resolveESPSettings (pkg/ipsec/ike.go)
