@@ -2027,6 +2027,7 @@ fn queue_warm_pass_warms_fabric_peer_over_parent_ifindex() {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 0, 2)),
         peer_mac: [0; 6],
         local_mac: [0; 6],
+        up: true,
     });
     coord.queue_warm_pass(false);
     let item = rx.try_recv().expect("fabric peer warm item");

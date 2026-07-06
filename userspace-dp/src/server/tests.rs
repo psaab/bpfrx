@@ -1757,6 +1757,7 @@ fn update_fabrics_persists_resolved_fabric_set() {
         peer_address: "10.99.13.2".into(),
         local_mac: "02:bf:72:ff:00:01".into(),
         peer_mac: "00:aa:bb:cc:dd:ee".into(),
+        up: true,
     };
     {
         let mut request = req("update_fabrics");
@@ -1806,6 +1807,7 @@ fn update_fabrics_unchanged_set_does_not_rewrite_state_file() {
         peer_address: "10.99.13.2".into(),
         local_mac: "02:bf:72:ff:00:01".into(),
         peer_mac: "00:aa:bb:cc:dd:ee".into(),
+        up: true,
     };
     let state = new_state(ProcessStatus::default());
     let state_file = unique_state_file("fabric-nochurn");

@@ -413,6 +413,14 @@ type FabricSnapshot struct {
 	PeerAddress     string `json:"peer_address,omitempty"`
 	LocalMAC        string `json:"local_mac,omitempty"`
 	PeerMAC         string `json:"peer_mac,omitempty"`
+	// Up is the local fabric parent link's carrier/oper state (#4082). The
+	// Rust dataplane prefers an UP fabric when resolving the cross-chassis
+	// redirect, so a dual-fabric cluster fails over to the secondary when the
+	// primary parent drops. This field MUST NOT be omitempty: a genuinely-down
+	// fabric has to serialize "up":false, not drop the field — the Rust decoder
+	// defaults an absent field to true (fail-open), so dropping it on down
+	// would defeat the failover.
+	Up bool `json:"up"`
 }
 
 type TunnelEndpointSnapshot struct {

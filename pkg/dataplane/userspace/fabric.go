@@ -56,12 +56,47 @@ func buildFabricSnapshots(cfg *config.Config) []FabricSnapshot {
 			PeerAddress:     in.peer,
 			LocalMAC:        parentMAC,
 			PeerMAC:         peerMAC,
+			Up:              fabricParentUp(parentLinux),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Name < out[j].Name
 	})
 	return out
+}
+
+// fabricParentUp reports whether the fabric parent link's carrier/oper state is
+// usable for forwarding (#4082). The cross-chassis redirect egresses over the
+// parent ifindex, so a DOWN parent means the redirect would blackhole; the Rust
+// selection prefers a fabric whose parent reports up. Detection fails toward
+// "up": only a definite kernel down state (admin-down, oper-down, or
+// lower-layer-down) returns false. Many virtual/overlay parents report
+// OperUnknown even with a live carrier, and mis-marking a healthy fabric down
+// would wrongly divert a dual-fabric cluster to its secondary — so an
+// indeterminate oper-state is treated as up. An empty name or a link that fails
+// to resolve returns false (the fabric is skipped in Rust on ifindex<=0 anyway).
+func fabricParentUp(linuxName string) bool {
+	if linuxName == "" {
+		return false
+	}
+	link, err := netlink.LinkByName(linuxName)
+	if err != nil || link == nil {
+		return false
+	}
+	attrs := link.Attrs()
+	// An administratively-down parent can never forward.
+	if attrs.Flags&net.FlagUp == 0 {
+		return false
+	}
+	switch attrs.OperState {
+	case netlink.OperDown, netlink.OperLowerLayerDown, netlink.OperNotPresent:
+		return false
+	default:
+		// OperUp, OperUnknown, OperDormant, OperTesting: treat as up. Fail
+		// toward "up" at the detection layer (the Rust selection also fails
+		// open when no fabric reports up).
+		return true
+	}
 }
 
 func buildFabricPeerMAC(overlayIfindex, parentIfindex int, peer string) string {

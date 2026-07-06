@@ -350,6 +350,7 @@ fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
         peer_address: "10.99.13.2".to_string(),
         local_mac: "02:bf:72:ff:00:01".to_string(),
         peer_mac: "00:aa:bb:cc:dd:ee".to_string(),
+        up: true,
     }];
     let state = build_forwarding_state(&snapshot);
     let redirect = resolve_fabric_redirect(&state).expect("fabric redirect");
@@ -755,6 +756,7 @@ fn cluster_peer_return_fast_path_allows_sfmix_to_lan_reply() {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
         peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
         local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
     });
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     dynamic_neighbors.insert(
@@ -801,6 +803,7 @@ fn cluster_peer_return_fast_path_skips_pure_tcp_syn() {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
         peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
         local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
     });
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let meta = UserspaceDpMeta {
@@ -832,6 +835,7 @@ fn cluster_peer_return_fast_path_skips_icmp_echo_request() {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
         peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
         local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
     });
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let meta = UserspaceDpMeta {
@@ -864,6 +868,7 @@ fn cluster_peer_return_fast_path_skips_icmpv6_echo_request() {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
         peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
         local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
     });
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let meta = UserspaceDpMeta {
@@ -887,6 +892,98 @@ fn cluster_peer_return_fast_path_skips_icmpv6_echo_request() {
     );
 }
 
+// #4082: the cross-chassis fabric redirect must prefer a fabric whose local
+// parent carrier is UP so a dual-fabric cluster fails over to the secondary
+// when the primary parent goes down. RED-on-revert: reverting the selection to
+// the pre-#4082 pin-to-first-resolvable makes the fab0-DOWN case pick fab0 and
+// blackhole.
+#[test]
+fn fabric_redirect_prefers_up_fabric_4082() {
+    let fab0 = FabricLink {
+        parent_ifindex: 21,
+        overlay_ifindex: 101,
+        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
+    };
+    let fab1 = FabricLink {
+        parent_ifindex: 22,
+        overlay_ifindex: 102,
+        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 14, 2)),
+        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xef],
+        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x02],
+        up: true,
+    };
+
+    // fab0 DOWN, fab1 UP → select fab1. This is the failover the fix delivers;
+    // reverting to the pin-to-first-resolvable selects fab0 (ifindex 21) here
+    // and the redirect blackholes.
+    let mut d0 = fab0;
+    d0.up = false;
+    let r = resolve_fabric_redirect_from_list(&[d0, fab1]).expect("redirect");
+    assert_eq!(
+        r.egress_ifindex, 22,
+        "down primary must fail the redirect over to fab1"
+    );
+    assert_eq!(r.tx_ifindex, 22);
+    assert_eq!(r.next_hop, Some(fab1.peer_addr));
+
+    // Both UP → select fab0 (first in the stable Go-sorted order). No behavior
+    // change for the common single- or dual-fabric-both-up case.
+    let r = resolve_fabric_redirect_from_list(&[fab0, fab1]).expect("redirect");
+    assert_eq!(
+        r.egress_ifindex, 21,
+        "both up selects the primary fab0 (unchanged from pre-#4082)"
+    );
+
+    // Both DOWN → fail-open to the first resolvable fabric (fab0). A blackhole
+    // is no worse than a drop, and this preserves the pre-#4082 behavior for a
+    // genuine all-fabrics-down state.
+    let mut a = fab0;
+    let mut b = fab1;
+    a.up = false;
+    b.up = false;
+    let r = resolve_fabric_redirect_from_list(&[a, b]).expect("redirect");
+    assert_eq!(
+        r.egress_ifindex, 21,
+        "all fabrics down falls open to the first resolvable fabric"
+    );
+
+    // Reversed order with fab1 the only up link still selects fab1 regardless of
+    // position — selection is by up-state, not slot.
+    let mut d1 = fab1;
+    d1.up = false;
+    let r = resolve_fabric_redirect_from_list(&[d1, fab0]).expect("redirect");
+    assert_eq!(
+        r.egress_ifindex, 21,
+        "the up fabric is selected irrespective of list position"
+    );
+}
+
+// #4082: a snapshot from a STALE daemon that omits the `up` wire field must
+// deserialize to up=true (fail-open back-compat), while an explicit `up:false`
+// is honored.
+#[test]
+fn fabric_snapshot_up_serde_default_true_4082() {
+    let absent: FabricSnapshot =
+        serde_json::from_str(r#"{"name":"fab0","parent_ifindex":21}"#).expect("parse absent up");
+    assert!(
+        absent.up,
+        "an absent `up` field defaults to true (stale-daemon fail-open)"
+    );
+
+    let down: FabricSnapshot =
+        serde_json::from_str(r#"{"name":"fab0","parent_ifindex":21,"up":false}"#)
+            .expect("parse up=false");
+    assert!(!down.up, "an explicit up=false is honored");
+
+    let up: FabricSnapshot =
+        serde_json::from_str(r#"{"name":"fab0","parent_ifindex":21,"up":true}"#)
+            .expect("parse up=true");
+    assert!(up.up, "an explicit up=true is honored");
+}
+
 #[test]
 fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
     let mut state = build_forwarding_state(&native_gre_pbr_snapshot(false));
@@ -896,6 +993,7 @@ fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
         peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
         peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
         local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
     });
     let decision = SessionDecision {
         resolution: ForwardingResolution {
@@ -4040,6 +4138,7 @@ fn fabric_snapshot_template() -> FabricSnapshot {
         peer_address: "10.99.13.2".into(),
         local_mac: "02:bf:72:ff:00:01".into(),
         peer_mac: "00:aa:bb:cc:dd:ee".into(),
+        up: true,
     }
 }
 

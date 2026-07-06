@@ -505,7 +505,8 @@
     "parent_linux_name": "",
     "peer_address": "",
     "peer_mac": "",
-    "rx_queues": 0
+    "rx_queues": 0,
+    "up": false
   },
   "firewall_filter_snapshot": {
     "family": "",
