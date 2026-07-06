@@ -203,22 +203,63 @@ fabric RPCs `Unauthenticated` until corrected — a > 30s inter-node skew is
 an operational NTP fault (NTP is already a cluster prerequisite for
 heartbeat clock-sync and session-timestamp rebasing).
 
-**Remaining follow-up (F23).** The **session-sync stream** frames
-(`sync.go` / `sync_conn.go` / `sync_protocol.go`) are still
-unauthenticated cleartext. Unlike the UDP heartbeat (where an appended
-trailer is transparently ignored by a legacy reader that parses from the
-front), the session-sync stream frames by a length-prefixed header, so a
-legacy peer would mis-frame a trailing HMAC as the next header — a
-stream-safe dual-accept needs an auth **capability handshake at
-connection setup** (negotiate signing before the first data frame) rather
-than a per-frame trailer, and it touches every `writeMsg` /
-`encode*Message` / `writeFull` site plus per-connection replay state and
-MUST pass `make test-failover` (it is the path that keeps TCP alive
-across failover). It is filed as the F23 follow-up on #4107 and is LOW
-severity (matches Juniper's own unauthenticated direct-cable control-link
-posture; the acute HIGH lever — the full-service fabric gRPC surface — is
-closed by PR-B). The shared `ControlLinkAuthKey` and dual-accept helpers
-land here so F23 reuses them.
+**Session-sync stream auth (F23, done — `sync_auth.go`).** The
+**session-sync stream** frames (`sync.go` / `sync_conn.go` /
+`sync_protocol.go`) are now authenticated with the SAME control-link PSK.
+The heartbeat's trailing-HMAC does NOT work here: the stream is
+length-framed, so a legacy reader would mis-frame an appended HMAC as the
+next header. F23 instead uses an auth **capability handshake at connection
+setup** that negotiates — BEFORE any session frame flows — whether the
+connection is authenticated, then seals every subsequent frame.
+
+- **Handshake (`performSyncHandshake`).** Only a node that holds the PSK
+  initiates it. Each keyed side sends a HELLO (`syncMsgAuthHello`, type 27)
+  advertising a fresh 32-byte challenge nonce; when BOTH peers are keyed
+  each proves possession with `syncMsgAuthProof` (type 28) =
+  `HMAC-SHA256(key, tag ‖ peer-nonce)` (mutual challenge-response). Fresh
+  per-connection nonces make the proof replay-safe at setup. HELLO/PROOF
+  are written CONCURRENTLY with reading the peer's frame so the handshake
+  does not deadlock on a fully-synchronous transport (`net.Pipe` in tests /
+  a strict write-then-read on two symmetric peers). Types 27/28 sit above
+  the legacy set so an old peer ignores them (default receive case).
+- **Per-frame seal (`authConn.sealFrame` / `verifyFrame`).** On an
+  AUTHENTICATED connection every frame gets an 8-byte per-connection
+  monotonic sequence + a 32-byte HMAC keyed by a per-connection key derived
+  from the PSK and BOTH handshake nonces (`syncDeriveFrameKey`, canonical
+  nonce order so both peers derive the same key). The receiver rejects a bad
+  HMAC (forgery/tamper) or a non-increasing sequence (replay/regression) and
+  drops the connection. `writeFull` is the single chokepoint that seals (all
+  writers hold `s.writeMu`, so sequence order equals wire order);
+  `receiveLoop` is the single reader that strips + verifies the trailer.
+  Chose a signed per-frame trailer over a bare sequence because a sequence
+  without a MAC is forgeable (an on-path attacker just uses seq+1); the MAC
+  cost is negligible at realistic session-sync rates.
+- **Dual-accept (rolling upgrade).** A node with no key never handshakes
+  and is byte-for-byte a legacy peer; a keyed node that sees a
+  legacy/unkeyed peer (no HELLO, or `keyed=0`) negotiates
+  UNAUTHENTICATED — the stream stays legacy-compatible (no brick). The
+  legacy peer's first real frame, consumed by the handshake read, is
+  preserved as a `pendingFrame` and processed before the receive loop
+  starts. Enforcement engages only once BOTH nodes are keyed and signing.
+- **Downgrade-guard (`syncAuthDecision`, mirrors `heartbeatAuthDecision`).**
+  Once the peer has authenticated on the sync channel (sticky
+  `syncAuthedEver`) OR the heartbeat channel (`HeartbeatPeerAuthSeen`, arms
+  within ~200ms of a keyed peer coming up), a later UNAUTHENTICATED
+  connection from it is REJECTED — a downgrade to cleartext once both nodes
+  are known-keyed is an attack. Consulting the heartbeat closes the window
+  after a keyed node restarts before the first sync auth.
+- **Wiring.** `SessionSync.SetAuthProvider(*Manager)` (`daemon_ha_sync.go`)
+  supplies both `ControlLinkAuthKey()` and `HeartbeatPeerAuthSeen()`. No new
+  config leaf — the same `set chassis cluster authentication-key` secret
+  authenticates the heartbeat (PR-A), the fabric gRPC (PR-B/#4357), and now
+  the session-sync stream. LOW severity (matches Juniper's own
+  unauthenticated direct-cable control-link posture); the acute HIGH lever
+  (the full-service fabric gRPC surface) was closed by #4357.
+- **Failover.** The handshake happens at connect and a reconnect during
+  failover re-handshakes; a keyed↔keyed reconnect completes in
+  milliseconds. A dropped handshake closes the connection and the
+  accept/connect loops retry (~1s) — it never bricks. MUST pass
+  `make test-failover` (the path that keeps TCP alive across failover).
 
 ## DHCP-server lease sync (#2239)
 

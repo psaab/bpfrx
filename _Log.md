@@ -37131,6 +37131,46 @@ top.
   userspace-dp/src/afxdp/types/cos.rs, _Log.md
 
 - **Timestamp**: 2026-07-06
+  **Action**: #4107 F23 — authenticate the cluster session-sync STREAM with
+  the control-link PSK (F1 already closed by #4357). The length-framed sync
+  stream (session state + election/failover control) carried plaintext with
+  no auth. The heartbeat's trailing-HMAC does not work on a length-framed
+  stream (a legacy reader mis-frames a trailing HMAC as the next header), so
+  F23 uses an auth-capability HANDSHAKE at connection setup + a per-frame
+  seal. DESIGN (new `pkg/cluster/sync_auth.go`): (1) `performSyncHandshake`
+  — only a keyed node initiates; each keyed side sends a HELLO
+  (`syncMsgAuthHello`, type 27) with a fresh 32-byte nonce, and when BOTH are
+  keyed each proves PSK possession with `syncMsgAuthProof` (type 28) =
+  HMAC(key, tag‖peer-nonce) (mutual challenge-response, replay-safe via fresh
+  per-connection nonces). HELLO/PROOF are written CONCURRENTLY with the read
+  so the handshake does not deadlock on net.Pipe / two symmetric peers. (2)
+  Per-frame seal: on an authenticated connection every frame gets an 8-byte
+  monotonic sequence + 32-byte HMAC keyed by a per-connection key derived
+  from the PSK + both nonces (`sealFrame`/`verifyFrame`); the receiver drops
+  the conn on a bad HMAC (forgery) or non-increasing sequence (replay).
+  `writeFull` is the single seal chokepoint (all writers hold `s.writeMu`);
+  `receiveLoop` is the single verify point. Chose signed per-frame trailer
+  over bare sequence (a sequence without a MAC is forgeable; MAC cost is
+  negligible). (3) Dual-accept: a no-key node never handshakes (byte-identical
+  legacy peer); a keyed node seeing a legacy/unkeyed peer negotiates
+  UNAUTHENTICATED and preserves the peer's first real frame as a
+  `pendingFrame`. (4) Downgrade-guard (`syncAuthDecision`, mirrors
+  `heartbeatAuthDecision`): once the peer authed on the sync channel (sticky
+  `syncAuthedEver`) OR the heartbeat (`HeartbeatPeerAuthSeen`), a later
+  unauthenticated connection is rejected. Wired via
+  `SessionSync.SetAuthProvider(*Manager)` in daemon_ha_sync.go — same
+  `set chassis cluster authentication-key` secret, no new config leaf.
+  Tests (RED-on-revert verified by neutralizing enforcement → 5 test
+  functions fail): both-keyed authenticates + sealed frame round-trips;
+  mismatched-key rejected; dual-accept legacy peer; downgrade-guard rejects;
+  seal/verify replay+tamper+wrong-key; decision matrix; proof/derived-key
+  construction. Full `go test ./pkg/cluster/ -race` green; go build ./...,
+  go vet, gofmt clean. NOTE: HA session-sync stream — the parent runs
+  `make test-failover` before merge (a reconnect during failover must
+  re-handshake + succeed).
+  **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync_auth_test.go,
+  pkg/cluster/sync.go, pkg/cluster/sync_protocol.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/README.md, pkg/daemon/daemon_ha_sync.go, _Log.md
   **Action**: #3618 — per-zone `reject`-reply rate-limit buckets
   (userspace-dp). Replaced the SINGLE process-global Reject `TokenBucket`
   with ONE bucket per configured ingress (from) zone so a rejected-flow

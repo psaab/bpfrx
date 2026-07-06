@@ -232,22 +232,29 @@ func (s TransferReadinessSnapshot) Reason() string {
 // SessionSync manages TCP-based session state replication between cluster
 // peers for stateful failover.
 type SessionSync struct {
-	localAddr  string
-	peerAddr   string
-	sessions   dataplane.SessionStore
-	telemetry  dataplane.Telemetry
-	stats      SyncStats
-	mu         sync.Mutex
-	conn0      net.Conn
-	conn1      net.Conn
-	writeMu    sync.Mutex
-	listener   net.Listener
-	localAddr1 string
-	peerAddr1  string
-	listener1  net.Listener
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	sendCh     chan []byte // buffered channel for outgoing messages
+	localAddr string
+	peerAddr  string
+	sessions  dataplane.SessionStore
+	telemetry dataplane.Telemetry
+	stats     SyncStats
+	mu        sync.Mutex
+	conn0     net.Conn
+	conn1     net.Conn
+	writeMu   sync.Mutex
+	// authProvider supplies the shared control-link PSK + the cross-channel
+	// downgrade-guard signal for #4107 F23 session-sync stream auth. Optional:
+	// nil (or an empty key) ⇒ legacy unauthenticated stream (dual-accept).
+	authProvider atomic.Pointer[syncAuthProviderBox]
+	// syncAuthedEver is the sticky sync-channel downgrade-guard: once any sync
+	// connection authenticates, a later unauthenticated connection is rejected.
+	syncAuthedEver atomic.Bool
+	listener       net.Listener
+	localAddr1     string
+	peerAddr1      string
+	listener1      net.Listener
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	sendCh         chan []byte // buffered channel for outgoing messages
 
 	// incrementalPauseDepth temporarily pauses background incremental producers
 	// during ordered handoff operations.
