@@ -794,13 +794,63 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     }
 }
 
+/// The synthetic `LocalDelivery` decision Stage 11 hands to the
+/// slow-path reinjector for host-terminated IPsec passthrough
+/// (ESP/AH/IKE).
+///
+/// `local_ifindex`/`egress_ifindex`/`tx_ifindex` are deliberately `0`
+/// and MUST stay `0` (#3616). `maybe_reinject_slow_path_from_frame`
+/// routes a `LocalDelivery` reinject with `local_ifindex > 0` into the
+/// GRE `local_tunnel_deliveries` channel (`tx/dispatch/slow_path.rs`),
+/// diverting it away from the generic kernel TUN injector. Carrying a
+/// real ingress ifindex here would therefore MIS-DELIVER IPsec-to-self,
+/// not enforce host-inbound — Stage 11 short-circuits with
+/// `RecycleAndContinue` before `host_inbound_admits_iface` is ever
+/// reached, so the passthrough is exempt from the per-zone host-inbound
+/// gate by design (see `forwarding/README.md`, "Host-terminated IPsec
+/// passthrough"). Telemetry carries the real ingress ifindex via `meta`
+/// on the exception record, never through this routing decision.
+///
+/// A per-zone host-inbound gate for NEW IKE / inner-ESP at Stage 11 is
+/// deferred hardening (#3616 Option B): it must reproduce the kernel
+/// chain's `ct established,related accept`-first ordering and resolve
+/// the logical / GRE-inner ingress zone, or it drops return/established
+/// and tunnelled IPsec.
+fn ipsec_passthrough_decision() -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::LocalDelivery,
+            local_ifindex: 0,
+            egress_ifindex: 0,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
 /// Stage 11 — IPsec passthrough.
 ///
-/// ESP (proto 50) and IKE (UDP 500/4500) must transit the kernel
-/// XFRM subsystem. On a match, this stage builds a synthetic
-/// `SessionDecision` with `LocalDelivery` disposition and
-/// reinjects the packet via the slow-path TUN device, then signals
-/// `RecycleAndContinue` so the caller drops the UMEM frame.
+/// ESP (proto 50), AH (proto 51, IPv4) and IKE (UDP 500/4500) must
+/// transit the kernel XFRM subsystem. On a match, this stage builds a
+/// synthetic `SessionDecision` with `LocalDelivery` disposition
+/// (`ipsec_passthrough_decision`) and reinjects the packet via the
+/// slow-path TUN device, then signals `RecycleAndContinue` so the
+/// caller drops the UMEM frame.
+///
+/// This passthrough runs BEFORE the per-zone host-inbound admission
+/// gate and is EXEMPT from it — the ratified userspace-dataplane
+/// semantic (#3616 Option A). Direct host-bound IPsec-to-self is
+/// enforced on the PRIMARY path by the kernel nftables host-inbound
+/// chain (`pkg/daemon/daemon_nft.go`), which gates NEW inbound IKE on
+/// `system-services ike`/`ipsec` while accepting raw ESP/AH globally and
+/// letting established/return IKE ride `ct established,related accept`.
+/// Gating NEW IKE / inner-ESP on this SECONDARY AF_XDP path is deferred
+/// (Option B — see `ipsec_passthrough_decision`).
 ///
 /// Non-IPsec packets fall through unchanged.
 #[inline]
@@ -817,20 +867,7 @@ pub(super) fn stage_ipsec_passthrough_check(
     if !is_ipsec_traffic(meta.protocol, flow.forward_key.dst_port) {
         return StageOutcome::Continue(());
     }
-    let ipsec_decision = SessionDecision {
-        resolution: ForwardingResolution {
-            disposition: ForwardingDisposition::LocalDelivery,
-            local_ifindex: 0,
-            egress_ifindex: 0,
-            tx_ifindex: 0,
-            tunnel_endpoint_id: 0,
-            next_hop: None,
-            neighbor_mac: None,
-            src_mac: None,
-            tx_vlan_id: 0,
-        },
-        nat: NatDecision::default(),
-    };
+    let ipsec_decision = ipsec_passthrough_decision();
     maybe_reinject_slow_path_from_frame(
         &worker_ctx.ident,
         binding_live,
@@ -2791,6 +2828,197 @@ mod tests {
         assert!(
             d3 && c3 == 1,
             "3rd direct packet crosses udp-flood threshold 2 and DROPS"
+        );
+    }
+
+    // --- #3616: Stage 11 IPsec passthrough ratified host-inbound exemption ---
+    //
+    // Stage 11 recognizes host-terminated IPsec (ESP/AH/IKE) and reinjects it
+    // toward the kernel XFRM stack BEFORE the per-zone host-inbound admission
+    // gate, so the passthrough is EXEMPT from that gate — the ratified
+    // userspace-dataplane semantic (#3616 Option A). The genuine parity gate
+    // for NEW inbound IKE lives on the PRIMARY kernel nftables path
+    // (`pkg/daemon/daemon_nft.go`): it gates NEW IKE on `system-services
+    // ike`/`ipsec`, accepts raw ESP/AH globally, and rides established/return
+    // IKE on `ct established,related accept`. Gating NEW IKE / inner-ESP at
+    // Stage 11 (this SECONDARY AF_XDP path) is deferred hardening (Option B).
+    //
+    // These pins fail-on-revert on BOTH halves of the ratified decision:
+    //   1. the synthetic reinject decision keeps `local_ifindex` (and the other
+    //      routing ifindexes) at 0 — a non-zero value diverts the reinject into
+    //      the GRE `local_tunnel_deliveries` channel and mis-delivers
+    //      IPsec-to-self (it does NOT enforce host-inbound); and
+    //   2. the stage intercepts every IPsec class with `RecycleAndContinue`
+    //      and leaves non-IPsec traffic untouched (`Continue`).
+    // If Option B is ever implemented these tests must be updated deliberately.
+
+    fn ipsec_flow(family: i32, protocol: u8, dst_port: u16) -> SessionFlow {
+        let (src_ip, dst_ip) = if family == libc::AF_INET6 {
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10)),
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1)),
+            )
+        } else {
+            (
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            )
+        };
+        SessionFlow {
+            src_ip,
+            dst_ip,
+            forward_key: SessionKey {
+                addr_family: family as u8,
+                protocol,
+                src_ip,
+                dst_ip,
+                src_port: 40000,
+                dst_port,
+            },
+        }
+    }
+
+    #[test]
+    fn ipsec_passthrough_decision_keeps_local_ifindex_zero_3616() {
+        let decision = ipsec_passthrough_decision();
+        assert_eq!(
+            decision.resolution.disposition,
+            ForwardingDisposition::LocalDelivery
+        );
+        // #3616: these MUST stay 0. A non-zero `local_ifindex` makes
+        // `maybe_reinject_slow_path_from_frame` route the reinject through the
+        // GRE `local_tunnel_deliveries` channel instead of the generic kernel
+        // TUN injector (`tx/dispatch/slow_path.rs`), mis-delivering
+        // IPsec-to-self. Carrying a real ingress ifindex here does NOT enforce
+        // host-inbound — Stage 11 short-circuits before the gate.
+        assert_eq!(decision.resolution.local_ifindex, 0);
+        assert_eq!(decision.resolution.egress_ifindex, 0);
+        assert_eq!(decision.resolution.tx_ifindex, 0);
+        assert_eq!(decision.resolution.tunnel_endpoint_id, 0);
+    }
+
+    #[test]
+    fn stage_ipsec_passthrough_exempts_all_classes_3616() {
+        // Full worker-context harness (slow_path: None — the reinject records a
+        // slow-path exception, but the stage's return value is what we pin).
+        let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+        let ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("reth1.0"),
+            ifindex: 24,
+        };
+        let live = BindingLiveState::new();
+        let binding_lookup = WorkerBindingLookup::default();
+        let mirror_targets = MirrorTargetMap::default();
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let last_resolution = Arc::new(Mutex::new(None));
+        let peer_worker_commands = Vec::new();
+        let dnat_fds = DnatTableFds::default();
+        let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+        let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+            8,
+            DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        let worker_ctx = WorkerContext {
+            ident: &ident,
+            binding_lookup: &binding_lookup,
+            mirror_targets: &mirror_targets,
+            forwarding: &forwarding,
+            ha_state: &ha_state,
+            dynamic_neighbors: &dynamic_neighbors,
+            neighbor_resolver: None,
+            shared_sessions: &shared_sessions,
+            shared_nat_sessions: &shared_nat_sessions,
+            shared_forward_wire_sessions: &shared_forward_wire_sessions,
+            shared_owner_rg_indexes: &shared_owner_rg_indexes,
+            slow_path: None,
+            event_stream: Some(&event_handle),
+            local_tunnel_deliveries: &local_tunnel_deliveries,
+            recent_exceptions: &recent_exceptions,
+            last_resolution: &last_resolution,
+            peer_worker_commands: &peer_worker_commands,
+            dnat_fds: &dnat_fds,
+            rg_epochs: &rg_epochs,
+            cold_path_sample_mask: 0xff,
+        };
+
+        // A benign IPv4 frame; classification keys on `meta.protocol` +
+        // `flow.forward_key.dst_port`, not on the frame bytes, and the stage
+        // returns `RecycleAndContinue` regardless of whether the reinject
+        // succeeds — so the exact frame is immaterial to the pin.
+        let frame = tcp_v4_frame(
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(198, 51, 100, 1),
+            40000,
+            500,
+            TCP_FLAG_ACK,
+            1,
+            1,
+        );
+
+        // Ratified-EXEMPT classes: each is passed through (reinjected)
+        // regardless of the zone host-inbound config. The `nat_snapshot`
+        // fixture zones are host-inbound ENFORCING (`system-services all`); the
+        // exemption would hold identically on a zone that OMITS ike/ipsec —
+        // Stage 11 never consults the host-inbound set. AH is v4-only (the shim
+        // walks the IPv6 NEXTHDR_AUTH header, see README). (family, proto, dst).
+        let exempt = [
+            (libc::AF_INET, PROTO_ESP, 0u16),     // IPv4 ESP
+            (libc::AF_INET, PROTO_AH, 0u16),      // IPv4 AH (v4-only)
+            (libc::AF_INET, PROTO_UDP, 500u16),   // IPv4 IKE
+            (libc::AF_INET, PROTO_UDP, 4500u16),  // IPv4 NAT-T
+            (libc::AF_INET6, PROTO_ESP, 0u16),    // IPv6 ESP
+            (libc::AF_INET6, PROTO_UDP, 500u16),  // IPv6 IKE
+            (libc::AF_INET6, PROTO_UDP, 4500u16), // IPv6 NAT-T
+        ];
+        for (family, protocol, dst_port) in exempt {
+            let flow = ipsec_flow(family, protocol, dst_port);
+            let mut meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
+            meta.addr_family = family as u8;
+            meta.protocol = protocol;
+            let outcome =
+                stage_ipsec_passthrough_check(Some(&flow), &frame, meta, &live, &worker_ctx);
+            assert!(
+                matches!(outcome, StageOutcome::RecycleAndContinue),
+                "Stage 11 must exempt IPsec (family {family}, proto {protocol}, \
+                 dst_port {dst_port}) from host-inbound and reinject it \
+                 (RecycleAndContinue) — ratified #3616 Option A"
+            );
+        }
+
+        // Non-IPsec traffic is NOT intercepted — it falls through Stage 11
+        // unchanged (`Continue`).
+        let non_ipsec = ipsec_flow(libc::AF_INET, PROTO_UDP, 443);
+        let mut meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
+        meta.protocol = PROTO_UDP;
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(Some(&non_ipsec), &frame, meta, &live, &worker_ctx),
+                StageOutcome::Continue(())
+            ),
+            "non-IPsec UDP (dst_port 443) must fall through Stage 11 unchanged"
+        );
+
+        // A flowless packet (no SessionFlow) is never claimed by Stage 11.
+        let meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(None, &frame, meta, &live, &worker_ctx),
+                StageOutcome::Continue(())
+            ),
+            "a flowless packet is not claimed by Stage 11"
         );
     }
 }

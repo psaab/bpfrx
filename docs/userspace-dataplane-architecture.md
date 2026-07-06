@@ -1415,7 +1415,23 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
 - ARP, NDP, local management traffic, and other kernel-owned packets are passed
   to cpumap/kernel handling.
 - IPsec/XFRM and GRE transit use kernel/pass-through or tunnel-specific
-  handling where required.
+  handling where required. Host-terminated IPsec (ESP/AH/IKE) is
+  recognized by `stage_ipsec_passthrough_check` (Stage 11) and reinjected
+  toward the kernel XFRM stack. Stage 11 runs BEFORE the per-zone
+  host-inbound admission gate and is **exempt** from it — a ratified
+  userspace-dataplane semantic (#3616 Option A). The PRIMARY host-inbound
+  enforcement for direct IPsec-to-self is the kernel nftables chain
+  (`pkg/daemon/daemon_nft.go`), which gates NEW inbound IKE on
+  `system-services ike`/`ipsec`, accepts raw ESP/AH globally (the SA is
+  the authorization), and rides established/return IKE on `ct
+  established,related accept`. The synthetic Stage-11 reinject decision
+  keeps `local_ifindex` = 0 (a non-zero value would divert it into the
+  GRE local-tunnel-delivery channel and mis-deliver IPsec-to-self, not
+  enforce host-inbound). Gating NEW IKE / inner-ESP at Stage 11 on the
+  SECONDARY AF_XDP path (DNAT-to-self, native-GRE inner) is deferred
+  hardening (Option B) — see
+  `userspace-dp/src/afxdp/forwarding/README.md` and
+  `docs/research/3616-ipsec-host-inbound/plan.md`.
 - Packets failing forwarding resolution can enter the bounded slow path,
   but ONLY for the slow-path-eligible dispositions: `LocalDelivery`,
   `NoRoute`, `MissingNeighbor`, and `NextTableUnsupported`

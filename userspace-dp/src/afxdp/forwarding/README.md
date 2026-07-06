@@ -520,3 +520,48 @@ regression-guarded in `tests.rs`. Giving this predicate true IPv6 AH
 coverage would require the shim to surface an "AH present" signal
 instead of walking past the header — out of scope here, and
 unnecessary given the local-dest shunt.
+
+### Host-inbound ordering: IPsec passthrough is EXEMPT (ratified — #3616)
+
+Stage 11 runs BEFORE the per-zone host-inbound admission gate
+(`host_inbound_admits_iface`) and short-circuits with
+`RecycleAndContinue`, so a packet it claims never reaches that gate.
+IPsec passthrough is therefore **exempt** from `host-inbound-traffic
+system-services ike`/`ipsec` on the AF_XDP path. This is a **ratified**
+userspace-dataplane semantic (#3616 Option A), not an accident:
+
+- **Two enforcement paths.** The PRIMARY host-inbound enforcement for
+  IPsec-to-self is the kernel nftables chain
+  (`pkg/daemon/daemon_nft.go`). The XDP shim shunts direct
+  local-destination IPsec to the kernel BEFORE userspace-dp sees it —
+  raw outer ESP is shunted unconditionally
+  (`userspace-xdp/src/lib.rs`), and IKE/AH to a local address ride the
+  `is_local_destination` shunt. That chain accepts raw ESP/AH globally
+  (the SA is the authorization — Junos parity), gates NEW inbound IKE on
+  `system-services ike`/`ipsec`, and lets established/return IKE ride
+  `ct established,related accept` first. `TestHostInboundFilterExempts
+  IPsecAndV6Errors` guards that ordering.
+- **The SECONDARY AF_XDP path** (Stage 11) is reached only when IPsec is
+  NOT shunted to the kernel: DNAT/static-NAT-to-self IKE, native-GRE
+  inner IPsec whose inner destination is a firewall-local address
+  (redirected to the XSK and decapped in userspace), and transit/NAT
+  IPv4 AH. On this path Stage 11 exempts IPsec from host-inbound.
+- **The synthetic reinject decision keeps `local_ifindex` = 0**
+  (`ipsec_passthrough_decision`). It MUST: a non-zero `local_ifindex`
+  makes `maybe_reinject_slow_path_from_frame` route the reinject through
+  the GRE `local_tunnel_deliveries` channel instead of the generic
+  kernel TUN injector (`tx/dispatch/slow_path.rs`), mis-delivering
+  IPsec-to-self. Carrying a real ingress ifindex here would NOT enforce
+  host-inbound (the gate is never reached); the real ingress ifindex is
+  carried only in telemetry via `meta`.
+
+**Deferred hardening (Option B).** A per-zone host-inbound gate for NEW
+IKE / inner-ESP at Stage 11 is a scoped, low-priority follow-up. To be
+correct it must reproduce the kernel chain's `ct established,related
+accept`-first ordering (else it drops return/established IKE — e.g. the
+reply for a firewall-initiated tunnel) and resolve the correct logical /
+GRE-inner ingress zone (not a raw physical-ifindex zone lookup). The
+exposure it would close is real but config-gated (native GRE + inner
+IPsec-to-self, or DNAT-to-self IKE, on a zone omitting `ike`/`ipsec`),
+so it is deferred rather than shipped. See
+`docs/research/3616-ipsec-host-inbound/plan.md`.

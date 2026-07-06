@@ -36020,3 +36020,25 @@ top.
   vet clean.
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/daemon_cluster_bind.go,
   pkg/daemon/web_management_clamp_4047_test.go, docs/architecture.md, _Log.md
+
+## 2026-07-05 — #3616 IPsec Stage-11 host-inbound (Option A shipped)
+
+- **Timestamp**: 2026-07-05
+- **Action**: Ship #3616 Option A (ratify + document + telemetry-pin + per-class
+  pinning tests) for the userspace-dp Stage-11 IPsec passthrough host-inbound
+  exemption. Extracted the synthetic reinject decision into
+  `poll_stages::ipsec_passthrough_decision` documenting/pinning
+  `local_ifindex`/`egress_ifindex`/`tx_ifindex` = 0 (R4/L15 — a non-zero value
+  diverts the reinject into the GRE local-tunnel-delivery channel and
+  mis-delivers IPsec-to-self; it does NOT enforce host-inbound because Stage 11
+  short-circuits before the gate). Added fail-on-revert pins for the ratified
+  exempt behavior (ESP/AH/IKE v4 + ESP/IKE v6). Documented the two-path model
+  (kernel-primary gates NEW IKE + established-first; AF_XDP-secondary exempts)
+  in README / architecture doc / host_inbound.rs comment. Deferred Option B
+  (the Stage-11 IKE/inner-ESP gate — needs established-first ordering +
+  logical/GRE-inner zone).
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  docs/userspace-dataplane-architecture.md,
+  docs/research/3616-ipsec-host-inbound/*.md (materialized + status stamp).
