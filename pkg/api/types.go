@@ -588,6 +588,40 @@ type MatchPoliciesResult struct {
 	// can differ from FromZone/ToZone.
 	QueriedFromZone string `json:"queried_from_zone,omitempty"`
 	QueriedToZone   string `json:"queried_to_zone,omitempty"`
+	// HostInbound is the structured host-inbound-traffic admission for a
+	// `to-zone junos-host` query (#3627 B1a) — WHICH system-service / protocol
+	// token admits this host-bound tuple, or that the box denies / globally
+	// accepts / cannot classify it. It mirrors the gRPC host_inbound message and
+	// the local CLI `show security match-policies` host-inbound line (#4352),
+	// reading the SAME SSOT-backed classifier, so the three surfaces cannot drift
+	// (#3375). Present (non-nil) only for a host-bound query — on both the
+	// HostInboundUnmatched verdict and a matched to-zone junos-host policy;
+	// omitted (nil) for every transit / global / default / content-rejected
+	// verdict, which has no host-inbound gate. Additional context, never a
+	// verdict — it does not change Matched / HostInboundUnmatched.
+	HostInbound *MatchPoliciesHostInbound `json:"host_inbound,omitempty"`
+}
+
+// MatchPoliciesHostInbound is the REST projection of the host-inbound-traffic
+// classifier verdict (dataplane/userspace.HostInboundAdmission, #3627 B1a) on a
+// match-policies host-bound query. Token/Kind are meaningful only when
+// Status == "token-admit".
+type MatchPoliciesHostInbound struct {
+	// Status is the admission class: "token-admit", "global-accept", "denied",
+	// or "indeterminate" (the "not-computed" zero value is rendered as an absent
+	// host_inbound object, never emitted here). It is the String() of
+	// dataplane/userspace.HostInboundStatus, matching the gRPC enum's semantics.
+	Status string `json:"status"`
+	// Token is the admitting host-inbound-traffic token (e.g. "ssh", "bgp",
+	// "all"); set only for "token-admit".
+	Token string `json:"token,omitempty"`
+	// Kind is the stanza the token belongs to ("system-services" or
+	// "protocols"); set only for "token-admit".
+	Kind string `json:"kind,omitempty"`
+	// Description is the human-readable one-line explanation the local CLI prints
+	// for this admission (HostInboundAdmission.Describe()), so a JSON client can
+	// render the SAME sentence the CLI shows without re-deriving it.
+	Description string `json:"description,omitempty"`
 }
 
 // ClearSessionsResult holds session clear results.

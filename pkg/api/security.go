@@ -481,6 +481,27 @@ func parseEventZoneFilter(s string) (uint16, bool) {
 	return uint16(n), true
 }
 
+// hostInboundToREST projects the shared host-inbound-traffic classifier verdict
+// (policymatch.Result.HostInbound, #3627 B1a) onto the REST JSON struct so a
+// match-policies caller sees WHICH host-inbound-traffic system-service/protocol
+// token admits a host-bound tuple — the same detail the gRPC host_inbound field
+// and the local CLI `show security match-policies` line carry (#4352). It reads
+// the same SSOT-backed classifier, so the three surfaces cannot drift (#3375).
+// Returns nil (field omitted from the JSON) for a nil admission (an off-host
+// query has no host-inbound gate) or a not-computed status, matching the CLI,
+// which prints nothing in those cases.
+func hostInboundToREST(a *dpuserspace.HostInboundAdmission) *MatchPoliciesHostInbound {
+	if a == nil || a.Status == dpuserspace.HostInboundNotComputed {
+		return nil
+	}
+	return &MatchPoliciesHostInbound{
+		Status:      a.Status.String(),
+		Token:       a.Token,
+		Kind:        a.Kind,
+		Description: a.Describe(),
+	}
+}
+
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	// #3709: validate request grammar BEFORE the cfg == nil verdict so a
 	// malformed / duplicate / missing-zone query fails the SAME way during the
@@ -679,6 +700,11 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 			// matched-policy scope to fill FromZone/ToZone).
 			QueriedFromZone: fromZone,
 			QueriedToZone:   toZone,
+			// #3627 B1a: name the admitting host-inbound-traffic token (or report
+			// deny / global-accept / indeterminate) so a REST client sees WHICH
+			// system-service/protocol governs local delivery for this tuple, the
+			// same detail the gRPC surface + local CLI carry (#4352). nil off-host.
+			HostInbound: hostInboundToREST(res.HostInbound),
 		})
 		return
 	}
@@ -732,6 +758,11 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		SourceAddressExcluded:      res.SourceAddressExcluded,
 		DestinationAddressExcluded: res.DestinationAddressExcluded,
 		Applications:               res.Applications,
+		// #3627 B1a: a matched `to-zone junos-host` policy still passes through
+		// the separate host-inbound-traffic admission gate, so carry the
+		// classifier verdict here too (present for any host-bound query; nil for
+		// a transit/global match, which has no host gate).
+		HostInbound: hostInboundToREST(res.HostInbound),
 	})
 }
 
