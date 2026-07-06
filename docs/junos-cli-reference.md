@@ -1511,6 +1511,16 @@ Physical interface: reth0, Enabled, Physical link is Up
   - Each counter: 6-space indent, name padded, colon, right-aligned number.
 - **Protocol blocks:** `Protocol inet, MTU: 1500` and `Protocol inet6, MTU: 1500`.
   - Address entries under each protocol.
+- **Bondless reth resolution (#4328):** a reth (`reth0`) has no kernel netdev
+  of its own, so `show interfaces reth0`, `show interfaces reth0 detail`, and
+  `... extensive` render the aggregate over its local physical member — link
+  state / MAC / counters from the member, addresses/units from config — with a
+  `Redundant-ethernet: aggregate over member <ge-...>` line naming the member.
+  A physical reth member queried by name shows its `aenet --> reth<N>.<unit>`
+  aggregation. Previously only `show interfaces terse` was reth-aware; the
+  other variants reported `Not present` / empty / `not found`. All four
+  surfaces (summary, detail, extensive, terse) now build the same reth maps via
+  `config.RethShowMaps` (CLI + gRPC) so they cannot drift again.
 
 ---
 

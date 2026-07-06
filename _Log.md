@@ -1,3 +1,39 @@
+## 2026-07-06 — #4328: teach all `show interfaces` text surfaces to resolve a bondless reth
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed operator-visibility bug where every operational
+  `show interfaces` variant EXCEPT `terse` failed to find a bondless reth
+  (no kernel netdev is named `reth0`). Root cause: `cfg.RethToPhysical()` /
+  the physical<->reth reverse map was built in EXACTLY ONE place — the terse
+  handler; every other path did a raw kernel-netdev lookup that could not
+  resolve a reth, so `show interfaces reth0` → "Not present",
+  `reth0 detail` → empty, `reth0 extensive` → "not found". Extracted the
+  terse map-building into a shared resolver `config.RethShowMaps` +
+  `LookupReth`/`LookupMember`/`RethShowUnits` (new `pkg/config/reth_show.go`,
+  dual-keyed Junos + kernel ifname). Taught the four text surfaces to
+  synthesize the reth aggregate over its local physical member (link
+  state/MAC from the member netdev, addresses/units from config) and to
+  annotate a physical member with its `aenet --> reth<N>.<unit>` aggregation:
+  CLI summary/detail/extensive (`pkg/cli/cli_show_interfaces.go`), the gRPC
+  `ShowInterfacesDetail` RPC + its ShowText detail/extensive twins
+  (`pkg/grpcapi/server_show_interfaces.go`,
+  `server_show_interfaces_text.go`). Refactored both terse handlers (CLI +
+  gRPC) to consume the same shared maps so they cannot drift again. Rendering
+  works when the member kernel device is absent (peer-owned member or a unit
+  test host) — mirrors terse's config-sourced addresses. Did NOT touch the
+  structured `GetInterfaces` RPC (#3460 fixed that surface separately). Added
+  RED-on-revert unit tests in pkg/cli + pkg/grpcapi (a 2-unit reth over member
+  ge-0/0/2); neutralizing `RethShowMaps` reproduces the exact issue symptoms
+  ("Not present"/"not found"/empty). Normal non-reth interface show verified
+  unchanged. `go build ./...` clean; gofmt clean;
+  `go test ./pkg/config/... ./pkg/cli/... ./pkg/grpcapi/...` green.
+- **File(s)**: pkg/config/reth_show.go (new),
+  pkg/cli/cli_show_interfaces.go, pkg/grpcapi/server_show_interfaces.go,
+  pkg/grpcapi/server_show_interfaces_text.go,
+  pkg/cli/cli_show_interfaces_reth_4328_test.go (new),
+  pkg/grpcapi/server_show_interfaces_reth_4328_test.go (new),
+  docs/junos-cli-reference.md
+
 ## 2026-07-06 — #4282 part (a): lock CoS-submit owner TX accounting (tx_packets/tx_bytes)
 
 - **Timestamp**: 2026-07-06
