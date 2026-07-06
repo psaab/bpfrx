@@ -97,6 +97,18 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 			children:      nil,
 		},
 		"control-link-recovery": {desc: "Control link recovery (accepted for Junos compatibility; no runtime effect)", children: nil},
+		// #4107: shared PSK authenticating the cluster control channel.
+		// When set on BOTH nodes, cluster heartbeat/election messages are
+		// signed with HMAC-SHA256 and a forged/unauthenticated heartbeat
+		// is rejected (dual-accept during a rolling upgrade so a
+		// mixed-version cluster does not split). The SAME key on both
+		// nodes — ${node}-agnostic, synced by config-sync. Secret-typed
+		// (compiler_system.go) so it is redacted in every show/log/JSON
+		// path; the value token is masked as ##SECRET-DATA## in raw-AST
+		// renders because the leaf keyword is `authentication-key`
+		// (ast_redact.go). Untyped value slot, mirroring the OSPF/IS-IS/
+		// RIP/interface authentication-key leaves.
+		"authentication-key": {desc: "Shared PSK authenticating cluster control messages (HMAC-SHA256; same key on both nodes)", args: 1, placeholder: "<key>", children: nil},
 		// control-ports fpc/port: NOT typed — compileChassis never
 		// reads control-ports (compiled-leaf-only invariant).
 		"control-ports": {desc: "Control port assignments (accepted for Junos compatibility; ignored)", children: map[string]*schemaNode{

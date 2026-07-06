@@ -1594,6 +1594,15 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	if clusterNode.FindChild("control-link-recovery") != nil {
 		ch.Cluster.ControlLinkRecovery = true
 	}
+	// #4107: compile the cluster control-channel PSK into a Secret so it is
+	// redacted on every render/log path (mirrors the IKE/interface/routing
+	// Secret compile sites). nodeVal reads the raw leaf value; it is never
+	// logged here.
+	if n := clusterNode.FindChild("authentication-key"); n != nil {
+		if v := nodeVal(n); v != "" {
+			ch.Cluster.ControlLinkAuthKey = Secret(v)
+		}
+	}
 	if n := clusterNode.FindChild("control-interface"); n != nil {
 		if v := nodeVal(n); v != "" {
 			ch.Cluster.ControlInterface = v

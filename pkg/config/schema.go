@@ -54,6 +54,22 @@ type schemaNode struct {
 	midKeywordAt int       // 1-based arg position where midKeyword appears (e.g., 2 for "from-zone X to-zone Y")
 	compoundKey  bool      // children form compound key (e.g., "family inet6" → Keys=["family","inet6"])
 
+	// closedWorld opts this subtree in to closed-world validation: when
+	// true, an unmodeled child keyword under this subtree is REJECTED at
+	// strict commit instead of silently dropped (opt-in per subtree,
+	// #4313). The default (false) preserves the legacy opt-in behaviour —
+	// SchemaValidate leaves unmodeled keywords to the compiler and never
+	// rejects them, so a leaf the schema does not model commits clean and
+	// is silently discarded. Flipping this on a subtree is only safe once
+	// that subtree is LEAF-COMPLETE (every valid Junos keyword under it is
+	// modeled), otherwise it false-rejects a valid-but-not-yet-modeled
+	// config. The flag is threaded down the walker (walkSchemaNode's
+	// `closed` param): once a subtree sets it, every descendant level
+	// inherits closed-world enforcement. No production subtree sets this
+	// yet — the per-subtree flips are follow-ups gated on a leaf-
+	// completeness audit (see docs/config-schema.md).
+	closedWorld bool
+
 	// Typed-leaf metadata (#1319). The zero value (valueType==ValueAny,
 	// validator==nil) is the legacy behaviour: any string accepted, no
 	// schema-time validation, no value-slot examples in `?` completion.
