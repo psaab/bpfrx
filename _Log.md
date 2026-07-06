@@ -29,6 +29,87 @@
   per-source gate), userspace-dp/src/afxdp/wg/engine_tests.rs (isolation test),
   userspace-dp/src/afxdp/wg/counters.rs + userspace-dp/src/protocol/control.rs
   (counter doc), docs/wireguard-interop.md.
+## 2026-07-06 — #4313 PR-B: first production closed-world subtree flip (destination-NAT then)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Flipped `closedWorld: true` on the destination-NAT rule
+  then-action container (`security nat destination rule-set <rs> rule <r>
+  then`), the FIRST production subtree to opt in to the #4334 (#4313 PR-A)
+  closed-world mechanism. Leaf-completeness verified first: the Junos DNAT
+  then-action is exactly `destination-nat { off | pool <name> }` — every
+  keyword at every level below `then` is modeled and the compiler
+  (`compileNATDestination`) reads only these, so closing carries no
+  false-reject risk. An unmodeled keyword (typo like `poool`, or garbage)
+  is now REJECTED at strict commit (`SchemaValidate`) instead of committing
+  clean and being silently dropped; the tolerant Load/SyncApply path
+  downgrades to a warning (#1960), so stored/peer-synced configs are not
+  bricked. The sibling SOURCE-NAT then was deliberately NOT flipped: Junos
+  permits `then source-nat pool <name> persistent-nat { … }` at the rule
+  level (xpf models persistent-nat per-pool), so closing it would
+  false-reject a valid Junos config (#4191 class) — deferred as a follow-up.
+- **File(s)**: `pkg/config/schema_security.go` (flip + deferral comment on
+  source-NAT then), `pkg/config/schema_closedworld_nat_then_4313_test.go`
+  (new — RED-on-revert reject tests + valid-keyword + source-NAT-still-open
+  guard), `docs/config-schema.md` (#4313 section: first production flip +
+  remaining subtrees).
+- **Validation**: `go test ./pkg/config/...` and `./pkg/configstore/...`
+  green; RED-on-revert confirmed (reject tests FAIL without the flag);
+  `go build ./...`, `gofmt -l`, `go vet ./pkg/config/` clean.
+
+## 2026-07-06 — #2354: QinQ inner-vlan-id honest-posture gate
+
+- **Timestamp**: 2026-07-06
+- **Action**: Added the #2354 honest-posture reject gate for QinQ /
+  stacked-VLAN inner tags, extending the #2008 H9/H10 doctrine in
+  `validateUnsupportedInterfaceStanzasAST`. `interfaces <if> unit <n>
+  inner-vlan-id <x>` is PARSED into `Unit.InnerVlanID` but has ZERO
+  dataplane consumers: the AF_XDP shim's parse_l2 unwinds exactly ONE
+  VLAN tag, so a double-tagged frame keeps eth_proto=0x8100 → dispatch
+  `_` arm → `pass_non_ip_l2_direct` = XDP_PASS to the kernel, never
+  firewalled. A committed inner-vlan-id is therefore a false promise of
+  firewalled stacked-VLAN transit. The gate HARD-REJECTS it at commit /
+  commit-check (lenient=false), naming the interface/unit path, and
+  WARNS (does not fail, does not prune — it is a no-op) on the tolerant
+  load / peer-sync path (#1960 fail-closed-on-load class). Keyed strictly
+  on `inner-vlan-id`: single 802.1Q / 802.1ad tagging via `vlan-id` and
+  `flexible-vlan-tagging` WITHOUT an inner tag stay ACCEPTED (correct per
+  #2346 — Junos-parity single-tag transit). This resolves the
+  honest-posture half of #2354; the multi-layer QinQ feature build
+  (two-tag parse/deliver/serialize + networkd stacked netdev + inner-tag
+  zone binding) stays plan-deferred pending operator demand (4-PR
+  decomposition recorded in the issue).
+- **File(s)**: pkg/config/compiler_interfaces_unsupported.go (gate +
+  doc), pkg/config/compiler_interfaces_unsupported_test.go (strict-reject
+  flat+hier, lenient-warn, single-tag negative), pkg/config/schema_interfaces.go
+  (inner-vlan-id leaf desc: honest signal at `?`-completion),
+  pkg/config/parser_services_test.go (two flexible-vlan-tagging tests
+  switched to CompileConfigLenient — strict path now rejects inner-vlan-id),
+  docs/feature-gaps.md (QinQ entry: honest-posture gate documented).
+- **Validation**: `go test ./pkg/config/...` green; RED-on-revert confirmed
+  (removing the gate → the three reject/warn tests fail: strict compile
+  accepts inner-vlan-id with nil error, lenient emits no warning); single-tag
+  negative passes with and without the gate; `go build ./...`, `go vet
+  ./pkg/config/`, gofmt on modified files all clean.
+## 2026-07-06 — #4348: gate the `inactive:` marker on TokenIdentifier not TokenString
+
+- **Timestamp**: 2026-07-06
+- **Action**: Follow-up to #4335/#4347. `parseKeys` flattened `TokenString`
+  and `TokenIdentifier` into one `[]string`, so a QUOTED value exactly equal
+  to `inactive:` (e.g. `description "inactive:";`) was indistinguishable from
+  a bare deactivation marker and got silently truncated — the value dropped
+  and the statement wrongly deactivated. This hit BOTH the leading (index 0)
+  and the inline (index > 0, added by #4347) marker handlers. Fix:
+  `parseKeys` now returns a parallel `[]TokenType` (token-kind) slice, and
+  both marker checks in `parseStatement` require
+  `kinds[i] == TokenIdentifier && keys[i] == inactiveMarker`. A quoted
+  `"inactive:"` (TokenString) is preserved verbatim as a literal value; a
+  bare identifier `inactive:` still deactivates (leading) or drops its
+  governed tokens (inline) exactly as before. RED-on-revert regression in
+  `quoted_inactive_4348_test.go` (leading + inline quoted-value preserved;
+  bare leading/inline unchanged; normal quoted value unaffected).
+- **File(s)**: `pkg/config/parser.go`,
+  `pkg/config/quoted_inactive_4348_test.go`, `docs/config-schema.md`,
+  `_Log.md`
 
 ## 2026-07-06 — #4342 / #4343: session-invalidation residuals (default-policy + scheduler)
 

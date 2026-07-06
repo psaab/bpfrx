@@ -658,22 +658,53 @@ dormant MECHANISM in PR-A:
   production subtree today — behaviour is byte-identical to pre-#4313
   (return nil, silent-accept).
 
-**No production subtree sets `closedWorld` in PR-A.** The mechanism is dormant:
-every existing config validates identically, so PR-A carries zero false-reject
-risk. It is white-box tested with a SYNTHETIC subtree
+PR-A landed the mechanism DORMANT (no production subtree set `closedWorld`,
+zero false-reject risk). It is white-box tested with a SYNTHETIC subtree
 (`schema_walk_internal_test.go`, `TestClosedWorld_*`): an unmodeled keyword
 under a `closedWorld:true` node is rejected; the same shape under a default
 (open-world) node is still silently accepted; a modeled keyword under the
 closed node passes; and closed-world inherits into modeled descendant
 containers.
 
-**Deferred, per-subtree flips (PR-B..N).** Turning `closedWorld` on for a real
-subtree (candidates: `security ipsec`, `security nat … then`, `snmp community`,
-`protocols {ospf,bgp} interface`, `interfaces … family`) is only safe once that
-subtree is LEAF-COMPLETE — every valid Junos keyword under it is modeled —
-otherwise the flip false-rejects a valid config. Each flip is its own follow-up
-gated on a Junos-leaf completeness audit for that subtree, tracked on #4313. Do
-NOT set `closedWorld` on a subtree without that audit.
+**First production flip — destination-NAT rule then-action (PR-B, #4313).**
+`security nat destination rule-set <rs> rule <r> then` now sets
+`closedWorld:true` (`schema_security.go`). It is the first production subtree
+to opt in. The completeness audit that gates the flip:
+
+- The Junos DNAT rule then-action is exactly `destination-nat { off | pool
+  <pool-name> }`. Directly under `then` the only valid keyword is
+  `destination-nat`; directly under `destination-nat` the only valid keywords
+  are `off` and `pool`; `off` is a value-less leaf and `pool <name>` is a
+  terminal pool reference with no sub-block (there is no rule-level
+  persistent-nat for destination NAT — that is a source-NAT feature). Every
+  keyword at every level below `then` is modeled, and the compiler
+  (`compileNATDestination`) reads only these same keywords, so closing carries
+  no false-reject risk.
+- The reject fires on the STRICT operator commit path (`SchemaValidate`); the
+  tolerant `Store.Load` / `SyncApply` path downgrades it to a warning
+  (`compileTreeLenient`, #1960), so a stored or peer-synced config is never
+  bricked. A typo (`then destination-nat poool dp`) or garbage keyword now
+  fails the commit with a "closed-world subtree" error instead of committing
+  clean and being silently dropped. Production tests:
+  `schema_closedworld_nat_then_4313_test.go` (RED on revert of the flag).
+
+**NOT flipped — source-NAT rule then-action.** The sibling `security nat source
+… rule … then` is deliberately left open-world. Junos permits `then source-nat
+pool <name> persistent-nat { … }` at the RULE level, which xpf instead models
+per-pool (`security nat source pool <name> persistent-nat`). Flipping the
+source-NAT then would inherit closed-world down to its `pool` leaf and
+false-reject that valid Junos config (the #4191 class). It is a follow-up:
+model the rule-level persistent-nat leaves (or make an accept-with-advisory
+decision) FIRST, then flip.
+
+**Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
+`closedWorld` on for the other umbrella candidates (`security ipsec`, `snmp
+community`, `protocols {ospf,bgp} interface`, `interfaces … family`, and the
+deferred source-NAT then above) is only safe once that subtree is LEAF-COMPLETE
+— every valid Junos keyword under it is modeled — otherwise the flip
+false-rejects a valid config. Each flip is its own follow-up gated on a
+Junos-leaf completeness audit for that subtree. Do NOT set `closedWorld` on a
+subtree without that audit.
 
 ### `firewall ... from tcp-flags` — semantic validation, not just a list (#3076)
 
@@ -4605,6 +4636,22 @@ deactivated leaf would be. Before this fix the marker leaked mid-`Keys` and
 the DNAT-pool compiler read the literal `inactive:` token as the pool
 address, hard-rejecting a valid drop-in vSRX config
 (`inline_inactive_4335_test.go`).
+
+**Quoted `"inactive:"` is a value, not a marker (#4348).** The marker
+detection is gated on the source TOKEN KIND, not just the token text. A
+bare `inactive:` lexes as a `TokenIdentifier`; a quoted `"inactive:"` (e.g.
+`description "inactive:";`) lexes as a `TokenString`. `parseKeys` returns a
+parallel token-kind slice alongside the key values, and BOTH the leading
+(index 0) and inline (index > 0) marker checks require
+`kinds[i] == TokenIdentifier && keys[i] == inactiveMarker`. Without the
+kind gate the flattened `[]string` made a quoted value equal to the marker
+text indistinguishable from a bare marker, so the value was silently
+truncated (leading: the whole statement wrongly deactivated and the value
+dropped; inline: the value and everything after it dropped from `Keys`). A
+quoted `"inactive:"` is now preserved verbatim as a literal value
+(`quoted_inactive_4348_test.go`). Real-world impact is near-zero — no Junos
+leaf's value is the bare token `inactive:` — but the parser no longer loses
+data for a value that merely equals the marker text.
 
 **Strip-before-validate / strip-before-compile contract.** A deactivated
 statement must be excluded from BOTH the typed-leaf gate and the compiler,

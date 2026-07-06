@@ -23,6 +23,22 @@ import "fmt"
 //     node (programRethMAC, 02:bf:72:CC:RR:NN) and Junos treats the
 //     interface MAC as read-only, so a static override is both
 //     unimplemented and divergent.
+//   - #2354: `interfaces <if> unit <n> inner-vlan-id <x>` — a QinQ /
+//     stacked-VLAN (802.1ad S-tag + 802.1Q C-tag) inner tag. The parser
+//     accepts it and the compiler stores it in Unit.InnerVlanID, but that
+//     field has ZERO dataplane consumers: the AF_XDP shim's parse_l2
+//     unwinds exactly ONE VLAN tag, so a double-tagged frame keeps
+//     eth_proto=0x8100 → the dispatch `_` arm XDP_PASSes it to the kernel
+//     forwarding path, never reaching the userspace firewall. A committed
+//     inner-vlan-id is therefore a false promise of firewalled stacked-
+//     VLAN transit. This gate is the honest-posture half of #2354; the
+//     multi-layer QinQ feature build (two-tag parse/deliver/serialize +
+//     networkd stacked netdev + zone binding on the inner tag) stays
+//     plan-deferred pending operator demand (see the 4-PR decomposition
+//     in the issue). Single 802.1Q / single 802.1ad tagging via `vlan-id`
+//     is fully supported and CORRECT (#2346) — this gate keys strictly on
+//     `inner-vlan-id`, so `flexible-vlan-tagging` WITHOUT an inner tag is
+//     never tripped (Junos-parity, single-tag transit works).
 //
 // Why reject at commit (vs the warn-only M1 persist-groups-inheritance
 // or the PR #659 import-compat warnings): M1 is a daemon-behaviour knob
@@ -49,7 +65,8 @@ import "fmt"
 // and an `inactive:` stanza is ignored (#2008 H1 doctrine) for free.
 
 // validateUnsupportedInterfaceStanzasAST walks the `interfaces` subtree
-// of the group-expanded AST and rejects the H9/H10 silent-drop stanzas.
+// of the group-expanded AST and rejects the H9/H10/#2354 silent-drop
+// stanzas.
 //
 // Strict path (commit / commit-check, lenient=false): the first offending
 // stanza is a hard compile error, naming the exact interface/unit path.
@@ -124,6 +141,30 @@ func validateUnsupportedInterfaceStanzasAST(nodes []*Node, lenient bool) ([]stri
 							"RETH it is computed deterministically per node) — "+
 							"remove it (#2008 H10)",
 						ifName, unitID); err != nil {
+						return nil, err
+					}
+				}
+			}
+
+			// #2354: a QinQ / stacked-VLAN inner tag on the unit. The
+			// AF_XDP shim parses exactly one VLAN tag, so a double-tagged
+			// (S-tag + C-tag) frame is XDP_PASSed to the kernel and never
+			// firewalled — Unit.InnerVlanID has no dataplane consumer.
+			// Committing it is a false promise of firewalled stacked-VLAN
+			// transit. Keyed strictly on `inner-vlan-id` so single-tag
+			// `vlan-id` / `flexible-vlan-tagging` (both supported, #2346)
+			// are never tripped.
+			for _, c := range unit.Children {
+				if c.Name() == "inner-vlan-id" {
+					iv := nodeVal(c)
+					if err := emit(
+						"interfaces %s unit %s: `inner-vlan-id %s` (QinQ / "+
+							"stacked-VLAN inner tag) is not enforced by the AF_XDP "+
+							"dataplane — a double-tagged (802.1ad S-tag + 802.1Q "+
+							"C-tag) frame is parsed as a single tag and falls to the "+
+							"kernel forwarding path, never firewalled; single 802.1Q "+
+							"tagging via `vlan-id` is supported — remove it (#2354)",
+						ifName, unitID, iv); err != nil {
 						return nil, err
 					}
 				}

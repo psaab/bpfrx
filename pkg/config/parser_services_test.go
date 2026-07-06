@@ -651,7 +651,13 @@ interfaces {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
+	// inner-vlan-id (QinQ) is hard-rejected on the strict commit path by the
+	// #2354 honest-posture gate (the AF_XDP dataplane does not enforce
+	// stacked-VLAN transit). The parse-to-field still runs on the tolerant
+	// load / peer-sync path, so use CompileConfigLenient here to verify the
+	// parser populates the vlan-id / inner-vlan-id / flexible-vlan-tagging
+	// fields. Strict rejection is covered by TestQinQInnerVlanID*.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
 		t.Fatalf("compile error: %v", err)
 	}
@@ -692,7 +698,11 @@ func TestFlexibleVlanTaggingSetSyntax(t *testing.T) {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
+	// inner-vlan-id (QinQ) is hard-rejected on the strict commit path by the
+	// #2354 honest-posture gate; the parse-to-field still runs on the
+	// tolerant load / peer-sync path, so use CompileConfigLenient to verify
+	// the parser populates the fields. Strict rejection: TestQinQInnerVlanID*.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
 		t.Fatalf("compile error: %v", err)
 	}
