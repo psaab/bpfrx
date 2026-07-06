@@ -26,6 +26,13 @@ const (
 	// `security policies policy-rematch` is set (#4234 modified-policy re-eval).
 	// A documentary label only.
 	DeleteReasonPolicyModified DeleteReason = "policy-modified"
+	// DeleteReasonDefaultPolicyChanged labels the commit-time invalidation of a
+	// default-PERMIT session (stamped DefaultPolicySentinelID, 0xFFFFFFFF) when
+	// the implicit default-policy's verdict changed (permit->deny/reject) or,
+	// under `policy-rematch`, its session-logging intent flipped (#4342). Like
+	// the other reasons it is a documentary label — DeleteBatchKnownV4/V6 ignore
+	// it — but it names the call site.
+	DeleteReasonDefaultPolicyChanged DeleteReason = "default-policy-changed"
 )
 
 const sessionDeleteBatchSize = 64

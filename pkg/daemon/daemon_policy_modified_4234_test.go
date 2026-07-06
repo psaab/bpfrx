@@ -33,7 +33,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 	t.Run("gate: no policy-rematch means empty even when a policy changed", func(t *testing.T) {
 		newCfg := twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"})
 		newCfg.Security.Policies[0].Policies[1].Action = config.PolicyDeny // p-web permit->deny
-		if got := changedPolicyRuntimeIDs(old, newCfg); len(got) != 0 {
+		if got := changedPolicyRuntimeIDs(old, newCfg, nil, nil); len(got) != 0 {
 			t.Fatalf("without policy-rematch the changed set must be empty, got %v", got)
 		}
 	})
@@ -42,7 +42,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 		newCfg := withPolicyRematch(
 			twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"}), false)
 		newCfg.Security.Policies[0].Policies[1].Action = config.PolicyDeny // p-web permit->deny
-		got := changedPolicyRuntimeIDs(old, newCfg)
+		got := changedPolicyRuntimeIDs(old, newCfg, nil, nil)
 		if _, ok := got[webID]; !ok {
 			t.Errorf("changed set %v missing p-web old id %d after action change", got, webID)
 		}
@@ -55,7 +55,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 		newCfg := withPolicyRematch(
 			twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"}), false)
 		newCfg.Security.Policies[0].Policies[1].Match.SourceAddresses = []string{"10.0.0.0/8"}
-		got := changedPolicyRuntimeIDs(old, newCfg)
+		got := changedPolicyRuntimeIDs(old, newCfg, nil, nil)
 		if _, ok := got[webID]; !ok {
 			t.Errorf("changed set %v missing p-web after match change", got)
 		}
@@ -66,7 +66,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 		old2.Security.Policies[0].Policies[0].Match.SourceAddresses = []string{"a", "b", "c"}
 		newCfg := withPolicyRematch(twoPolicyConfig([]string{"p-a"}, nil), false)
 		newCfg.Security.Policies[0].Policies[0].Match.SourceAddresses = []string{"c", "a", "b"}
-		if got := changedPolicyRuntimeIDs(old2, newCfg); len(got) != 0 {
+		if got := changedPolicyRuntimeIDs(old2, newCfg, nil, nil); len(got) != 0 {
 			t.Fatalf("reordered address list wrongly reported as changed: %v", got)
 		}
 	})
@@ -74,7 +74,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 	t.Run("deleted policy is NOT reported here (deletion-clear owns it)", func(t *testing.T) {
 		newCfg := withPolicyRematch(
 			twoPolicyConfig([]string{"p-first", "p-ssh"}, []string{"glob-a"}), false) // p-web deleted
-		got := changedPolicyRuntimeIDs(old, newCfg)
+		got := changedPolicyRuntimeIDs(old, newCfg, nil, nil)
 		if _, ok := got[webID]; ok {
 			t.Errorf("changed set %v wrongly contains DELETED p-web id %d", got, webID)
 		}
@@ -84,7 +84,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 		newCfg := withPolicyRematch(
 			twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"}), false)
 		newCfg.Security.GlobalPolicies[0].Action = config.PolicyDeny
-		got := changedPolicyRuntimeIDs(old, newCfg)
+		got := changedPolicyRuntimeIDs(old, newCfg, nil, nil)
 		if _, ok := got[globID]; !ok {
 			t.Errorf("changed set %v missing changed global glob-a id %d", got, globID)
 		}
@@ -93,7 +93,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 	t.Run("identical config changes nothing", func(t *testing.T) {
 		newCfg := withPolicyRematch(
 			twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"}), false)
-		if got := changedPolicyRuntimeIDs(old, newCfg); len(got) != 0 {
+		if got := changedPolicyRuntimeIDs(old, newCfg, nil, nil); len(got) != 0 {
 			t.Fatalf("identical config produced changed set %v", got)
 		}
 	})
@@ -102,7 +102,7 @@ func TestChangedPolicyRuntimeIDs(t *testing.T) {
 		newCfg := withPolicyRematch(
 			twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, []string{"glob-a"}), false)
 		newCfg.Security.Policies[0].Policies[0].Action = config.PolicyDeny // p-first (id 0) changed
-		if _, ok := changedPolicyRuntimeIDs(old, newCfg)[0]; ok {
+		if _, ok := changedPolicyRuntimeIDs(old, newCfg, nil, nil)[0]; ok {
 			t.Fatalf("changing the first policy wrongly put overloaded id 0 in the changed set")
 		}
 	})
