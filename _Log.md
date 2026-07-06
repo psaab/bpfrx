@@ -35867,3 +35867,27 @@ top.
   pkg/config/web_management_auth_4047_test.go,
   pkg/config/parser_system_test.go, pkg/daemon/daemon_run.go,
   pkg/daemon/daemon_cluster_bind.go, docs/architecture.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4047 review fold (PR #4319 MERGE-READY, 2 non-blocking items).
+  (1) IPv6 bind fix: daemon_run.go built the REST bind by string-concat
+  (`bindIP + ":8080"` / `httpsBindIP + ":8443"`), broken for an IPv6
+  interface address (no brackets -> net.SplitHostPort + net.Listen fail ->
+  the part-B clamp no-ops and the listener blackholes for an IPv6-only mgmt
+  interface). Changed both to net.JoinHostPort. (2) Part-B clamp refactored
+  into a pure testable helper clampBindToLoopback(addr, hasAuth) ->
+  (effectiveAddr, clamped) in daemon_cluster_bind.go, called from BOTH the
+  HTTP and HTTPS bind sites; clamps a non-loopback + no-auth bind to a
+  SAME-FAMILY loopback (::1 for IPv6, 127.0.0.1 for IPv4, port preserved).
+  Added web_management_clamp_4047_test.go: hostIsLoopback table (v4/v6
+  loopback + 127/8 + routable + wildcard + empty/unparseable-as-safe) and
+  clampBindToLoopback decision table (off-loopback+no-auth clamps same-family
+  incl [2001:db8::1]:8080 -> [::1]:8080; off-loopback+auth NOT clamped;
+  loopback untouched; wildcard 0.0.0.0 clamps; unparseable untouched).
+  Updated architecture.md part-B note (same-family loopback + JoinHostPort).
+  Merged origin/master (#4318 docs; _Log.md auto-merged, no conflict).
+- **Validation**: go test ./pkg/config/... ./pkg/snmp/... ./pkg/daemon/...
+  green (incl new clamp/hostIsLoopback tests); go build ./... clean; gofmt +
+  vet clean.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/daemon_cluster_bind.go,
+  pkg/daemon/web_management_clamp_4047_test.go, docs/architecture.md, _Log.md
