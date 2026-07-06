@@ -152,10 +152,20 @@ editing cmdtree.
   the gap where any host on the shared control segment could invoke the
   allowlisted read/monitor/`ClearSessions`/cross-node-failover RPCs with no
   credential. Dual-accept (mirroring the heartbeat, `fabricAuthDecision`):
-  a node with no key configured accepts everything; once a valid token is
-  seen the peer must keep signing (a tokenless call is then a downgrade
-  attack and is rejected `Unauthenticated`); a tokenless call before the
-  peer has ever authenticated is allowed as a key-rollout grace. The
+  a node with no key configured accepts everything; once enforcement is
+  armed the peer must keep signing (a tokenless call is then a downgrade
+  attack and is rejected `Unauthenticated`); a tokenless call before
+  enforcement arms is allowed as a key-rollout grace. **Enforcement arms
+  off EITHER a prior valid fabric token OR the heartbeat authenticating
+  the peer** (`Manager.HeartbeatPeerAuthSeen`): the heartbeat flows
+  continuously (~200ms), so after a keyed node restarts the guard arms
+  within one interval instead of waiting for the next on-demand fabric RPC
+  — closing the post-restart window in which the fabric would otherwise
+  grace-accept tokenless `ClearSessions`/failover. In a rolling upgrade
+  the not-yet-keyed peer signs neither channel, so the grace still holds.
+  (Residual: a >30s wall-clock skew between nodes exceeds the ±1-window
+  token tolerance and fails cross-node fabric RPCs `Unauthenticated` until
+  corrected — an operational NTP fault, not a bug.) The
   interceptors are installed on the fabric listener only; the loopback
   listener keeps the full service. The **same PSK** authenticates the
   heartbeat (#4326); it shares the `chassis cluster authentication-key`

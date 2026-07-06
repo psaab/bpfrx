@@ -1,3 +1,33 @@
+## 2026-07-06 — #4107 F1 fold: arm the fabric downgrade-guard off the heartbeat (post-restart window)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Hostile-review fold on PR #4357. The fabric downgrade-guard
+  (`fabricPeerAuthSeen`) armed ONLY when the peer proxied an on-demand fabric
+  RPC (operator show/clear/failover). Unlike the heartbeat — which arms its own
+  `peerAuthSeen` within ~200ms because heartbeats flow continuously — nothing
+  periodically dials the fabric listener, so after EVERY restart of a keyed node
+  there was a window (until the next cross-node command) where the fabric
+  GRACE-ACCEPTED tokenless calls (incl. `ClearSessions` / cross-node failover)
+  from any on-segment host. Fix: arm fabric enforcement off the heartbeat too.
+  Converted `heartbeatReceiver.peerAuthSeen` bool → `atomic.Bool` (now read
+  cross-goroutine), added `heartbeatReceiver.peerAuthenticated()` +
+  `Manager.HeartbeatPeerAuthSeen()` (reads `m.hbReceiver` under `m.mu`, nil →
+  false). In `checkFabricAuth` the tokenless-reject gate now fires when EITHER
+  the fabric sticky flag OR `HeartbeatPeerAuthSeen()` is armed, so enforcement
+  engages within ~one heartbeat interval of the peer coming up. Dual-accept
+  preserved: a not-yet-keyed peer signs neither channel, so the rolling-upgrade
+  grace still holds. No-key path unchanged. Documented residual #2 (clock skew
+  >30s exceeds the ±1-window tolerance → cross-node fabric RPCs fail
+  `Unauthenticated`; an operational NTP fault). New RED-on-revert test
+  (`TestFabricAuthUnary_HeartbeatArmsDowngradeGuard`: tokenless rejected when
+  heartbeat-armed even with fabric sticky NOT armed; grace holds when not armed)
+  + cluster accessor test (`TestManagerHeartbeatPeerAuthSeen`). `-race` clean on
+  both packages.
+- **File(s)**: `pkg/cluster/heartbeat.go`, `pkg/cluster/peer_state.go`,
+  `pkg/cluster/heartbeat_auth_test.go`, `pkg/grpcapi/fabric_auth.go`,
+  `pkg/grpcapi/server.go`, `pkg/grpcapi/server_fabric_auth_4107_test.go`,
+  `docs/architecture.md`, `pkg/cluster/README.md`, `_Log.md`
+
 ## 2026-07-06 — #4107 F1: authenticate the cluster fabric gRPC listener with the control-link PSK
 
 - **Timestamp**: 2026-07-06

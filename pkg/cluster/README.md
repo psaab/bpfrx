@@ -183,6 +183,26 @@ listener" and the F1 half of #4107). The fabric path reuses this
 package's dual-accept posture (`fabricAuthDecision` mirrors
 `heartbeatAuthDecision`).
 
+The fabric downgrade-guard arms off the heartbeat, not just the fabric
+channel. This package exposes `Manager.HeartbeatPeerAuthSeen()` — true
+once the receiver accepts a valid authed heartbeat from the peer (the
+sticky `heartbeatReceiver.peerAuthSeen`, now an `atomic.Bool` because it
+is read cross-goroutine). The gRPC interceptor rejects a tokenless fabric
+call when EITHER a prior valid fabric token OR the heartbeat has armed
+enforcement. Rationale: nothing periodically dials the fabric listener,
+so arming only off an on-demand fabric RPC would leave a window after
+EVERY restart of a keyed node — until the next cross-node command — where
+any on-segment host could drive tokenless `ClearSessions` / cross-node
+failover. Heartbeats flow every ~200ms, so arming off them closes that
+window to one interval. Dual-accept is preserved: a not-yet-keyed peer
+signs neither channel, so neither source arms during a rolling upgrade.
+Two residuals are accepted, not bugs: (1) the ~1-window token replay
+horizon (removed only by mTLS with per-node certs, deferred with #4047);
+(2) a wall-clock skew > the ±1-window tolerance (~60–90s) fails cross-node
+fabric RPCs `Unauthenticated` until corrected — a > 30s inter-node skew is
+an operational NTP fault (NTP is already a cluster prerequisite for
+heartbeat clock-sync and session-timestamp rebasing).
+
 **Remaining follow-up (F23).** The **session-sync stream** frames
 (`sync.go` / `sync_conn.go` / `sync_protocol.go`) are still
 unauthenticated cleartext. Unlike the UDP heartbeat (where an appended

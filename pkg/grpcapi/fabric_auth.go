@@ -39,12 +39,24 @@ import (
 //     node). Standalone nodes never start a fabric listener anyway.
 //   - Local key + valid token: accept, and record that the peer holds the key.
 //   - Local key + present-but-invalid token: reject (Unauthenticated).
-//   - Local key + no token + peer never authenticated: accept (grace window
-//     while the config-synced key propagates to the peer).
-//   - Local key + no token + peer HAS authenticated: reject — a downgrade to
+//   - Local key + no token + enforcement NOT armed: accept (grace window while
+//     the config-synced key propagates to the peer).
+//   - Local key + no token + enforcement armed: reject — a downgrade to
 //     tokenless once both nodes are keyed is an attack.
 //
-// Replay: the token is HMAC(PSK, window) where window = unix_time /
+// ARMING SOURCE (the #4107 fold): the downgrade-guard arms off EITHER a prior
+// valid fabric token OR the heartbeat having authenticated the peer
+// (cluster.Manager.HeartbeatPeerAuthSeen). Arming only off the fabric token
+// would be LAZY: nothing periodically dials the fabric listener, so after a
+// keyed node restarts there is a window — until the peer next proxies an
+// on-demand RPC (operator show/clear/failover) — where the fabric would
+// grace-accept tokenless ClearSessions / cross-node-failover from any
+// on-segment host. Heartbeats flow continuously at ~200ms, so arming off the
+// heartbeat closes that window to ~one interval. The rolling-upgrade grace is
+// preserved: a not-yet-keyed peer is not signing heartbeats either, so neither
+// source arms during the transition.
+//
+// Residual 1 (replay): the token is HMAC(PSK, window) where window = unix_time /
 // fabricAuthWindowSeconds. A captured token is therefore replayable only within
 // its window (plus one window of clock-skew tolerance on each side) — a bounded
 // residual that trades the statelessness of a per-RPC nonce (which gRPC's
@@ -54,6 +66,15 @@ import (
 // (#4047 convergence); this PSK layer closes the "no auth at all" HIGH hole
 // with zero cert-lifecycle machinery, reusing the key the operator already
 // provisions for the heartbeat.
+//
+// Residual 2 (clock skew): because the token is time-windowed, a wall-clock skew
+// between the two nodes larger than the tolerance (window ± 1 = ~60–90s across a
+// boundary) makes the peer's token verify against no accepted window, so
+// cross-node fabric RPCs fail Unauthenticated until the skew is corrected. A
+// >30s skew between cluster nodes is an operational fault (NTP is a cluster
+// prerequisite — the heartbeat clock-sync and session timestamp rebasing assume
+// it), so this is an accepted tradeoff rather than a bug; the ±1-window
+// tolerance already absorbs ordinary NTP jitter.
 
 const (
 	// fabricAuthMetadataKey is the gRPC metadata header carrying the hex token.
@@ -141,10 +162,12 @@ func fabricAuthTokenFromMetadata(ctx context.Context) (token string, present boo
 //	keyConfigured — the local ControlLinkAuthKey is set (we can verify).
 //	present       — the caller sent an auth token.
 //	tokenOK       — the token verified (only meaningful when present).
-//	peerAuthSeen  — we have previously accepted a valid token on the fabric
-//	                (sticky: proves the peer holds the key, so a subsequent
-//	                tokenless call is a downgrade attack, not a rollout).
-func fabricAuthDecision(keyConfigured, present, tokenOK, peerAuthSeen bool) (bool, string) {
+//	enforceArmed  — the downgrade-guard is armed: the peer has proven it holds
+//	                the key, via EITHER a prior valid fabric token OR an
+//	                authenticated heartbeat (see checkFabricAuth). Once armed, a
+//	                subsequent tokenless call is a downgrade attack, not a
+//	                rollout gap.
+func fabricAuthDecision(keyConfigured, present, tokenOK, enforceArmed bool) (bool, string) {
 	if !keyConfigured {
 		return true, ""
 	}
@@ -154,7 +177,7 @@ func fabricAuthDecision(keyConfigured, present, tokenOK, peerAuthSeen bool) (boo
 		}
 		return true, ""
 	}
-	if peerAuthSeen {
+	if enforceArmed {
 		return false, "missing auth token (enforced: peer previously authenticated)"
 	}
 	return true, ""
@@ -173,6 +196,24 @@ func (s *Server) fabricAuthKey() []byte {
 	return nil
 }
 
+// heartbeatPeerAuthSeen reports whether the cluster heartbeat receiver has
+// accepted a valid authenticated heartbeat from the peer — the FAST arming
+// signal for the fabric downgrade-guard. Heartbeats flow continuously (~200ms),
+// so this arms within one interval of a keyed peer coming up, whereas the
+// fabric's own sticky flag arms only when the peer next dials an on-demand RPC
+// (an operator show/clear/failover) — which may be a long time, leaving a
+// post-restart window where the fabric would grace-accept tokenless calls.
+// heartbeatAuthSeenFn is a test seam; production reads the cluster manager.
+func (s *Server) heartbeatPeerAuthSeen() bool {
+	if s.heartbeatAuthSeenFn != nil {
+		return s.heartbeatAuthSeenFn()
+	}
+	if s.cluster != nil {
+		return s.cluster.HeartbeatPeerAuthSeen()
+	}
+	return false
+}
+
 // checkFabricAuth authenticates one inbound fabric RPC by its metadata token.
 // Returns a codes.Unauthenticated status when the call is rejected; nil to
 // admit it. The key is never logged.
@@ -181,11 +222,20 @@ func (s *Server) checkFabricAuth(ctx context.Context, method string) error {
 	token, present := fabricAuthTokenFromMetadata(ctx)
 	tokenOK := present && verifyFabricAuthToken(key, token)
 	if tokenOK {
-		// Sticky: once the peer proves it holds the key, a later tokenless call
-		// is a downgrade attack, not a rollout gap.
+		// Sticky: once the peer proves it holds the key on the fabric channel,
+		// a later tokenless call is a downgrade attack, not a rollout gap.
 		s.fabricPeerAuthSeen.Store(true)
 	}
-	accept, reason := fabricAuthDecision(len(key) > 0, present, tokenOK, s.fabricPeerAuthSeen.Load())
+	// The downgrade-guard is armed by EITHER a prior valid fabric token OR the
+	// heartbeat having authenticated the peer. The heartbeat path is what closes
+	// the post-restart window: after a keyed node restarts, nothing dials its
+	// fabric listener on-demand to arm the sticky flag, but its heartbeat
+	// receiver re-authenticates the peer within ~one interval and arms
+	// enforcement immediately. In a rolling upgrade where the peer is not yet
+	// keyed, the peer is not signing heartbeats either, so neither source arms
+	// and the dual-accept grace still holds.
+	armed := s.fabricPeerAuthSeen.Load() || s.heartbeatPeerAuthSeen()
+	accept, reason := fabricAuthDecision(len(key) > 0, present, tokenOK, armed)
 	if !accept {
 		slog.Warn("fabric gRPC listener rejected call: authentication failed", "method", method, "reason", reason)
 		return status.Errorf(codes.Unauthenticated, "fabric RPC authentication failed: %s", reason)

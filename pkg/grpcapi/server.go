@@ -157,6 +157,11 @@ type Server struct {
 	// key from the cluster manager; a unit test wires it to inject a key
 	// without building a full cluster.Manager.
 	fabricAuthKeyFn func() []byte
+	// heartbeatAuthSeenFn is a test seam for the #4107 fabric downgrade-guard
+	// arming signal. Production leaves it nil and heartbeatPeerAuthSeen() reads
+	// cluster.Manager.HeartbeatPeerAuthSeen(); a unit test wires it to drive the
+	// heartbeat-armed state without a live heartbeat receiver.
+	heartbeatAuthSeenFn func() bool
 	// fabricPeerAuthSeen is the sticky #4107 downgrade guard: set true once a
 	// valid PSK token has authenticated on the fabric listener. After that, a
 	// tokenless fabric RPC is rejected (a downgrade to cleartext once both
