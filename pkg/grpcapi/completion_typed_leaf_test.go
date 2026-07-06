@@ -12,19 +12,20 @@ import (
 // setSchema, so both must surface the typed-leaf value examples.
 
 // Symptom-1 demonstration on the gRPC path: `set class-of-service
-// schedulers be transmit-rate ?` surfaces <rate> + examples.
+// schedulers be transmit-rate ?` surfaces the rate-or-percent placeholder +
+// examples (the percent/remainder forms landed in #4228 Gap 2).
 func TestCompleteConfigPairs_TransmitRate_ShowsRatePlaceholderAndExamples(t *testing.T) {
 	s := &Server{}
 	pairs := s.completeConfigPairs(
 		[]string{"set", "class-of-service", "schedulers", "be", "transmit-rate"},
 		"",
 	)
-	if !hasPairName(pairs, "<rate>") {
-		t.Fatalf("expected <rate> placeholder at value slot, got %#v", pairs)
+	if !hasPairName(pairs, "<rate|percent|remainder>") {
+		t.Fatalf("expected <rate|percent|remainder> placeholder at value slot, got %#v", pairs)
 	}
-	for _, ex := range []string{"100k", "10m", "1g", "10g"} {
+	for _, ex := range []string{"100k", "10m", "1g", "10g", "percent", "remainder"} {
 		if !hasPairName(pairs, ex) {
-			t.Fatalf("expected rate example %q, got %#v", ex, pairs)
+			t.Fatalf("expected transmit-rate example %q, got %#v", ex, pairs)
 		}
 	}
 }

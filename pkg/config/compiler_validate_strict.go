@@ -5448,6 +5448,33 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 				"class-of-service scheduler %q equal-flow-target-policy %q is not one of slowest | mean | ideal-share",
 				sched.Name, sched.EqualFlowTargetPolicy)
 		}
+		// #4228 Gap 2: transmit-rate accepts EITHER an absolute rate,
+		// `percent <n>`, or `remainder`. The schema tailValidator enforces
+		// mutual exclusivity on the operator commit path; re-check here so an
+		// externally-assembled config (Load / HA SyncApply) cannot smuggle a
+		// combination the dataplane would resolve ambiguously. The percent
+		// operand range is likewise re-validated (the tail path checks it on
+		// commit; a constructed config bypasses it).
+		trHead := 0
+		if sched.TransmitRateBytes > 0 {
+			trHead++
+		}
+		if sched.TransmitRatePercent > 0 {
+			trHead++
+		}
+		if sched.TransmitRateRemainder {
+			trHead++
+		}
+		if trHead > 1 {
+			return fmt.Errorf(
+				"class-of-service scheduler %q transmit-rate: set exactly one of an absolute rate, `percent <n>`, or `remainder`",
+				sched.Name)
+		}
+		if sched.TransmitRatePercent < 0 || sched.TransmitRatePercent > 100 {
+			return fmt.Errorf(
+				"class-of-service scheduler %q transmit-rate percent %.4g is out of range (0,100]",
+				sched.Name, sched.TransmitRatePercent)
+		}
 		// Both buffer-size forms set simultaneously is ambiguous. The compiler
 		// always clears the unused field (see compiler_class_of_service.go
 		// buffer-size case), so this can only arise in constructed or
@@ -5458,6 +5485,25 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 				"class-of-service scheduler %q has both buffer-size bytes (%d) "+
 					"and buffer-size percent (%.4g%%) set; use one form only",
 				sched.Name, sched.BufferSizeBytes, sched.BufferSizePercent)
+		}
+	}
+	// #4228 Gap 2: a traffic-control-profile shaping-rate is EITHER an absolute
+	// rate or `percent <n>`. The schema tailValidator enforces this on commit;
+	// re-check for externally-assembled configs and re-validate the percent
+	// operand range.
+	for _, tcp := range cos.TrafficControlProfiles {
+		if tcp == nil {
+			continue
+		}
+		if tcp.ShapingRateBytes > 0 && tcp.ShapingRatePercent > 0 {
+			return fmt.Errorf(
+				"class-of-service traffic-control-profiles %q shaping-rate: set exactly one of an absolute rate or `percent <n>`",
+				tcp.Name)
+		}
+		if tcp.ShapingRatePercent < 0 || tcp.ShapingRatePercent > 100 {
+			return fmt.Errorf(
+				"class-of-service traffic-control-profiles %q shaping-rate percent %.4g is out of range (0,100]",
+				tcp.Name, tcp.ShapingRatePercent)
 		}
 	}
 	// Aggregate percent check: Junos does not allow per-queue buffer

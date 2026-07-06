@@ -1148,6 +1148,22 @@ Rules:
   hierarchical block list (`name-server { 1.1.1.1; 8.8.8.8; }`) — the
   walker's `validateMultiValueLeaf` validates each block child's FIRST
   token, exactly what the compilers read.
+- **Whole-tail leaves (`tailValidator`) for irregular grammars.** A leaf
+  whose value/modifier tail is heterogeneous — the first token is EITHER a
+  value OR a keyword — cannot be validated token-by-token. CoS
+  `transmit-rate (rate | percent <n> | remainder) [exact]` and `shaping-rate
+  (rate | percent <n>)` are the cases (#4228 Gap 2). Set a `tailValidator`
+  (leave `validator` nil); `keyword percent <n>` groups in flat-set as a
+  container plus a child leaf while the hierarchical parser packs it onto one
+  node's Keys, so the walker's `validateTailLeaf` gathers the whole tail with
+  `gatherLeafTailTokens` (Keys[1:] plus every descendant leaf's Keys) and
+  hands the flattened slice — plus the same-keyword sibling tails, so a
+  split-set modifier-only line (`transmit-rate exact` beside `transmit-rate
+  1g`) is still accepted — to the validator. `valueType` may still be set for
+  `?` completion. The compiler reads the SAME tail via `gatherLeafTailTokens`
+  (`parseCoSTransmitRate` / `parseCoSShapingRate`) so validation and
+  compilation never drift. Percent/remainder are accepted-but-inert (see
+  `docs/cos-traffic-shaping.md`).
 - The generic walker (`schema_walk.go`) needs **no** changes per leaf — it
   descends `setSchema` and validates any typed leaf it finds. Walker rows it
   handles: container/args/compoundKey/midKeyword/wildcard, the standard

@@ -21,6 +21,11 @@ const (
 	// Junos-default deletion-clear). Like the other reasons it is a documentary
 	// label — DeleteBatchKnownV4/V6 ignore it — but it names the call site.
 	DeleteReasonPolicyDeleted DeleteReason = "policy-deleted"
+	// DeleteReasonPolicyModified labels the commit-time invalidation of a
+	// session whose admitting policy had its MATCH or ACTION changed while
+	// `security policies policy-rematch` is set (#4234 modified-policy re-eval).
+	// A documentary label only.
+	DeleteReasonPolicyModified DeleteReason = "policy-modified"
 )
 
 const sessionDeleteBatchSize = 64

@@ -1,3 +1,51 @@
+## 2026-07-05 — config/daemon: #4228 Gap 2 (transmit-rate/shaping-rate percent) + #4234 modified-policy session re-eval
+
+- **Timestamp**: 2026-07-05
+  - **Action**: #4228 Gap 2 — CoS `transmit-rate` and traffic-control-profiles
+    `shaping-rate` now accept the Junos `percent <n>` / `remainder` value forms
+    in addition to an absolute k/m/g rate (the single most common imported vSRX
+    scheduler idiom). Added a `tailValidator` schema mechanism (schema.go,
+    schema_walk.go `validateTailLeaf` + `gatherLeafTailTokens`) so the
+    heterogeneous tail (first token is EITHER a value OR the keyword
+    `percent`/`remainder`) is validated as a unit — the standard typed-leaf path
+    cannot express it. Validators `ValidateCoSTransmitRateTail` /
+    `ValidateCoSShapingRateTail` (schema_validators.go) keep garbage rejected
+    loud (percent range, `percent 150`, `transmit-rate asd`) and stay
+    sibling-aware for the split-set `transmit-rate exact` line. Compiler parses
+    the SAME tail (`parseCoSTransmitRate`/`parseCoSShapingRate`, both via
+    `gatherLeafTailTokens`) into new fields TransmitRatePercent/
+    TransmitRateRemainder (CoSScheduler) and ShapingRatePercent
+    (CoSTrafficControlProfile). ACCEPTED-BUT-INERT: the dataplane consumes an
+    absolute byte/sec rate; percent/remainder resolution against interface speed
+    is a multi-pass follow-up — a commit advisory (compiler_validate_warn.go)
+    surfaces it. Mutual-exclusivity + range re-checked in
+    validateClassOfServiceStrict for externally-assembled configs. Other 6 gaps
+    of #4228 left OPEN (see PR + issue re-scope comment).
+  - **Action**: #4234 — MODIFIED-policy session re-evaluation (the residual half;
+    deletion-clear already shipped). When `security policies policy-rematch` is
+    set, a commit that changes a surviving policy's MATCH or ACTION now clears
+    that policy's live sessions so the tightened policy re-evaluates traffic.
+    `changedPolicyRuntimeIDs` diffs old-vs-new by stable key
+    (PoliciesByStableKey, new in policies.go), reports the OLD numeric id (what
+    live sessions carry), excludes overloaded id 0, and skips deletions (the
+    deletion-clear owns them). `clearSessionsForModifiedPolicies` reuses the
+    shared clear core (refactored `clearSessionsForPolicyIDs` — companion-aware
+    delete + #2468 HA delete-sync). Wired at all 3 apply sites (commit / sync /
+    rollback). policy-rematch advisory flipped: bare knob now enforced (no
+    warn); only `extensive` (re-eval of UNCHANGED-policy sessions on object
+    change) stays deferred + advisory.
+  - **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go,
+    pkg/config/schema_validators.go, pkg/config/value_type.go,
+    pkg/config/schema_cos.go, pkg/config/types_cos.go,
+    pkg/config/compiler_class_of_service.go,
+    pkg/config/compiler_validate_strict.go, pkg/config/compiler_validate_warn.go,
+    pkg/config/policy_rematch_advisory_test.go (updated),
+    pkg/config/schema_validate_cos_rate_percent_4228_test.go (new),
+    pkg/daemon/daemon_policy_invalidate.go, pkg/daemon/daemon_apply.go,
+    pkg/daemon/daemon_policy_modified_4234_test.go (new),
+    pkg/dataplane/session_store.go, pkg/dataplane/userspace/policies.go,
+    docs/cos-traffic-shaping.md, docs/config-schema.md, docs/feature-gaps.md
+
 ## 2026-07-05 — system: fable-167 PR #4311 review fixes (S-2 priv-esc + deny-commands advisory + S-4 sshd -t gate)
 
 - **Timestamp**: 2026-07-05

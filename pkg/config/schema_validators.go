@@ -64,6 +64,115 @@ func ValidateByteSize(raw string, _ *Config) error {
 	return nil
 }
 
+// ValidateCoSTransmitRateTail validates the whole tail of a CoS scheduler
+// `transmit-rate` leaf (#4228 Gap 2). Junos accepts three mutually-exclusive
+// heads — a bandwidth (10m), `percent <n>`, or `remainder` — each optionally
+// followed by the `exact` modifier. The percent/remainder forms are accepted
+// for vSRX-config import parity; they compile to a stored percent/flag that
+// the userspace dataplane does not yet resolve to an absolute rate (a commit
+// advisory surfaces the inertness).
+func ValidateCoSTransmitRateTail(tokens []string, siblingTails [][]string) error {
+	return validateCoSRateTail(tokens, siblingTails, true /*allowRemainder*/, true /*allowExact*/)
+}
+
+// ValidateCoSShapingRateTail validates the tail of a CoS `shaping-rate` leaf
+// (traffic-control-profiles, #4228 Gap 2): a bandwidth (10m) or `percent <n>`.
+// Junos shaping-rate has no `remainder` or `exact` modifier, so both are
+// rejected here.
+func ValidateCoSShapingRateTail(tokens []string, siblingTails [][]string) error {
+	return validateCoSRateTail(tokens, siblingTails, false /*allowRemainder*/, false /*allowExact*/)
+}
+
+// validateCoSRateTail is the shared grammar check for transmit-rate /
+// shaping-rate. It rejects garbage loud at commit (preserving the #4217
+// silent-zero protection) while accepting the percent/remainder forms.
+func validateCoSRateTail(tokens []string, siblingTails [][]string, allowRemainder, allowExact bool) error {
+	forms := "a bandwidth (e.g. 10m) or `percent <n>`"
+	if allowRemainder {
+		forms = "a bandwidth (e.g. 10m), `percent <n>`, or `remainder`"
+	}
+	if len(tokens) == 0 {
+		return fmt.Errorf("missing value (expected %s)", forms)
+	}
+	head := tokens[0]
+	rest := tokens[1:]
+	switch {
+	case head == "percent":
+		if len(rest) == 0 {
+			return fmt.Errorf("percent requires a value (e.g. percent 50)")
+		}
+		if err := validateCoSPercentValue(rest[0]); err != nil {
+			return err
+		}
+		rest = rest[1:]
+	case allowRemainder && head == "remainder":
+		// remainder takes no operand.
+	case allowExact && head == "exact":
+		// Modifier-only split-set line (`transmit-rate exact` beside a
+		// sibling `transmit-rate 1g`). Accept iff a sibling supplies a value
+		// head; otherwise `exact` alone is meaningless.
+		if coSRateSiblingSuppliesValue(siblingTails, allowRemainder) {
+			return nil
+		}
+		return fmt.Errorf("exact requires a rate (e.g. a sibling transmit-rate <value>)")
+	default:
+		if err := ValidateRate(head, nil); err != nil {
+			return fmt.Errorf("not a valid rate (expected %s): %w", forms, err)
+		}
+	}
+	// Only `exact` may trail the value (transmit-rate); shaping-rate allows no
+	// trailing modifier.
+	for _, t := range rest {
+		if allowExact && t == "exact" {
+			continue
+		}
+		return fmt.Errorf("unknown modifier %q", t)
+	}
+	return nil
+}
+
+// validateCoSPercentValue accepts a percent operand in the range (0, 100].
+// 0% is rejected because a zero rate compiles indistinguishably from "unset".
+func validateCoSPercentValue(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("percent requires a value (e.g. percent 50)")
+	}
+	v, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return fmt.Errorf("invalid percent %q: not a number", raw)
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fmt.Errorf("invalid percent %q: non-finite", raw)
+	}
+	if v <= 0 || v > 100 {
+		return fmt.Errorf("percent out of range (0,100] (got %s)", raw)
+	}
+	return nil
+}
+
+// coSRateSiblingSuppliesValue reports whether any sibling tail begins with a
+// value head (a bandwidth, `percent`, or — when allowed — `remainder`), used to
+// accept a modifier-only `exact` split-set line.
+func coSRateSiblingSuppliesValue(siblingTails [][]string, allowRemainder bool) bool {
+	for _, tail := range siblingTails {
+		if len(tail) == 0 {
+			continue
+		}
+		head := tail[0]
+		if head == "percent" {
+			return true
+		}
+		if allowRemainder && head == "remainder" {
+			return true
+		}
+		if ValidateRate(head, nil) == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateByteSizeOrPercent accepts the two scheduler buffer-size forms
 // that the CoS runtime can represent: explicit byte sizes with k/m/g
 // suffixes, or Junos percent values with a trailing percent sign. Bare
