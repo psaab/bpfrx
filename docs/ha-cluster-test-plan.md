@@ -30,6 +30,39 @@ per-node configuration from a single source file.
 Config sync "just works" — the primary sends the **unexpanded** config text (with groups
 intact) to the secondary. Each node compiles it with its own `${node}` expansion.
 
+### Flat vSRX config drop-in (no groups) — #4329
+
+The `groups` / `apply-groups "${node}"` pattern above is the xpf-native form. A
+**canonical vSRX chassis-cluster config also works as a drop-in with no changes** —
+the form where both members carry `redundant-parent reth0` at the top level (e.g.
+`ge-0/0/0` and `ge-7/0/0`), with **no `groups` and no `chassis cluster node` leaf**:
+
+```
+chassis { cluster { cluster-id 1; reth-count 2; ... } }
+interfaces {
+    ge-0/0/0 { gigether-options { redundant-parent reth0; } }   # node 0 member (FPC 0)
+    ge-7/0/0 { gigether-options { redundant-parent reth0; } }   # node 1 member (FPC 7)
+    reth0 { redundant-ether-options { redundancy-group 1; } }
+}
+```
+
+vSRX encodes node ownership in the **FPC slot** (`ge-0/0/N` → node 0, `ge-7/0/N` →
+node 1, via `SlotToNodeID`) and runs the identical flat config on both nodes. The
+node identity comes from the runtime SSOT (`/etc/xpf/node-id`, or `-node-id` on
+`xpfd check-config`), not from a config leaf. At compile time
+`CompileConfigForNode(tree, nodeID)` **stamps** `Cluster.NodeID` from that runtime
+node-id whenever the config carries a cluster stanza but no explicit `chassis
+cluster node` leaf, so `RethToPhysical` scores and binds each reth to the **local**
+FPC member on both nodes — `reth0` → `ge-0/0/0` on node 0 and `reth0` → `ge-7/0/0`
+on node 1.
+
+The stamp only fills a **leaf-less** config: an explicit `chassis cluster node <id>`
+leaf (as the `groups node0/node1` form carries) remains the operator's SSOT and is
+never overwritten — so the groups form above is bit-identical. Before #4329,
+`Cluster.NodeID` defaulted to `0` on both nodes for the leaf-less flat form, so the
+secondary silently mis-bound every reth to the node-0 member (wrong VIP placement,
+wrong HA-group interfaces).
+
 ### Interface Naming Convention
 
 xpf uses vSRX-style interface names:

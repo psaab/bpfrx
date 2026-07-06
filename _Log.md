@@ -36165,6 +36165,85 @@ top.
   pkg/config/compiler_validate_vrf_overlap_2387_test.go, pkg/config/compiler.go,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
 
+## 2026-07-06 — #4329 flat vSRX reth mis-resolves node identity on secondary
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix #4329 — a canonical vSRX chassis-cluster config (both
+  `ge-0/0/0` and `ge-7/0/0` carrying `redundant-parent reth0`, NO groups, NO
+  `chassis cluster node` leaf) silently mis-bound EVERY reth to the node-0
+  physical member on node 1 (wrong VIP placement, wrong HA-group interfaces).
+  Root cause: `Config.RethToPhysical()` scores members by
+  `SlotToNodeID(name) == Cluster.NodeID`, but `Cluster.NodeID` is populated
+  ONLY from the config leaf `chassis cluster node <id>` (guarded NodeIDSet).
+  The leaf-less flat vSRX form left `Cluster.NodeID` at its `0` default on BOTH
+  nodes, and `CompileConfigForNode(tree, nodeID)` used `nodeID` only for the
+  `${node}` group-expansion var, never the compiled cluster identity — so on
+  node 1 both members scored by the node-0 fallback and the alphabetical
+  tiebreak picked `ge-0/0/0` on both nodes. Fix: in
+  `compileConfigForNodeWithOpts` (pkg/config/compiler.go), after
+  `compileExpanded`, STAMP `cfg.Chassis.Cluster.NodeID = nodeID` guarded by
+  `nodeID >= 0 && cfg.Chassis.Cluster != nil && !cfg.Chassis.Cluster.NodeIDSet`.
+  Guard rationale: (1) `nodeID >= 0` — standalone compile routes through
+  `CompileConfig` (nodeID -1) and never reaches this path, so single-node
+  resolution is unchanged; (2) `Cluster != nil` — never fabricate a cluster
+  stanza, so a config-less HA node (node-id present, empty config — the
+  EMPTY-config takeover in pkg/daemon/daemon.go) keeps `Cluster == nil` and the
+  daemon's `haMode` / ~30 `Cluster != nil` gates do not flip on an empty
+  config (a real reth config always carries a `chassis cluster` stanza, so this
+  never suppresses a genuine fix); (3) `!NodeIDSet` — an explicit `chassis
+  cluster node <id>` leaf is the operator SSOT and must win, so the GROUPS form
+  (loss cluster: `groups node0/node1` each carry an explicit `node` leaf) is
+  bit-identical and `test-failover` is unaffected. RethToPhysical's alphabetical
+  tiebreak is left as-is: with the stamp the local member scores strictly higher
+  (2 vs 0), so the tiebreak is never reached for the 2-member case and never
+  decides between two nodes' members. RED-on-revert proven: reverting the stamp
+  makes node-1 bind `ge-0/0/0` (the exact bug); the explicit-leaf / groups /
+  standalone tests correctly stay GREEN on revert (not falsely coupled). Full
+  `go test ./pkg/config/...` + `./pkg/configstore/...` green, gofmt, go vet,
+  `go build ./...` all clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go,
+  docs/ha-cluster-test-plan.md, _Log.md
+
+## 2026-07-06 — #4329 fold: relocate NodeID stamp before fabric derivation
+
+- **Timestamp**: 2026-07-06
+- **Action**: Copilot review of PR #4331 found a REAL incompleteness in the
+  first stamp placement. The stamp ran in `compileConfigForNodeWithOpts` AFTER
+  `compileExpanded` returned, but `compileExpanded` ALREADY derives two
+  NodeID-dependent COMPILE-TIME fabric fields under the stale default NodeID=0
+  (compiler.go fabric fixup, `SlotToNodeID(member) == cc.NodeID`):
+  `InterfaceConfig.LocalFabricMember` (which fab member is local to this node)
+  and the auto-detected `Cluster.FabricInterface` / `Fabric1Interface`. So the
+  first fix corrected reth resolution (RethToPhysical reads NodeID at runtime,
+  after the stamp) but left the fabric fields WRONG on node 1 for a leaf-less
+  flat config — the same class of bug, still present for fabric. Fix: thread
+  the node identity into `compileExpanded` via two new `compileOpts` fields
+  (`nodeAware bool`, `stampNodeID int`), set only by the node-aware entry
+  `compileConfigForNodeWithOpts`, and MOVE the stamp INSIDE `compileExpanded`
+  to run immediately after the top-level child loop (Cluster + interfaces
+  populated) and BEFORE every NodeID-dependent derivation: the fabric fixup
+  AND `validateDeviceMapStrict` (compiler.go, called later, also reads
+  cc.NodeID). Same three guards preserved:
+  `opts.nodeAware && opts.stampNodeID >= 0 && Cluster != nil && !NodeIDSet`
+  (standalone `CompileConfig` leaves nodeAware false → unchanged; never
+  fabricate Cluster → daemon.go EMPTY-config haMode reasoning holds; explicit
+  `chassis cluster node` leaf wins → GROUPS form bit-identical). RethToPhysical
+  and its alphabetical tiebreak are still unchanged (stamp now sets NodeID
+  during compile, so the runtime read still sees the correct value). Added
+  fabric regression test (canonical vSRX fab0=FPC-0 member / fab1=FPC-7 member,
+  NO node leaf): node 0 → fab0.LocalFabricMember=ge-0/0/1 + FabricInterface
+  fab0; node 1 → fab1.LocalFabricMember=ge-7/0/1 + FabricInterface fab1. RED on
+  revert PROVEN for BOTH reth (node 1 → ge-0/0/0) and fabric (node 1 fab1
+  LocalFabricMember empty, FabricInterface picks fab0); the reth/fabric GROUPS
+  forms + explicit-leaf + standalone tests correctly stay GREEN on revert (not
+  falsely coupled). GROUPS form confirmed unaffected (loss cluster carries an
+  explicit `node` leaf per group → NodeIDSet true → stamp skipped → no
+  test-failover impact). Full `go test ./pkg/config/...` +
+  `./pkg/configstore/...` green, gofmt, go vet, `go build ./...` clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_flat_reth_nodeid_4329_test.go, _Log.md
+
 - **Timestamp**: 2026-07-06
 - **Action**: #4313 PR-A — land the per-subtree closed-world validation
   MECHANISM in the schema walker (mechanism only; no production subtree
