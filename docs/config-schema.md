@@ -4373,55 +4373,82 @@ gaps lived under that opacity:
   commit. A custom application term accepts only `protocol` / `source-port` /
   `destination-port` / `inactivity-timeout` / `timeout` / `icmp-type` /
   `icmp-code` / `alg`.
-- **#3353 — unsupported per-application `alg`.** The `alg` leaf was a raw
-  `args:1` string with no validator, so a typo (`alg ftpp`) committed cleanly
-  and the operator believed an ALG was pinned when none existed (a silent no-op
-  on a security knob). `validateApplicationSpecsStrict` now validates the name
-  against `supportedApplicationALGs` (`compiler_applications.go`) — the SSOT
-  set `dns`/`ftp`/`sip`/`tftp`, MIRRORING the global `security alg <proto>`
-  control (`algDisableFlags`, `pkg/dataplane/userspace/flow.go`). The same gate
-  covers the top-level `app.ALG` and the inline-term `alg` (the term app carries
-  it). The match is case-insensitive.
+- **#3353 → #4337 — per-application `alg` accept-with-advisory (relaxed from a
+  hard reject).** The `alg` leaf was a raw `args:1` string with no validator, so
+  a typo (`alg ftpp`) committed cleanly and the operator believed an ALG was
+  pinned when none existed. #3353 first made an unsupported name (outside the
+  SSOT set `dns`/`ftp`/`sip`/`tftp`) a hard commit error. **#4337 relaxes that
+  to an accepted-but-inert advisory**: a per-application ALG is NOT carried into
+  the userspace dataplane snapshot at all (the only ALG signal on the wire is
+  the *global* `alg_disable_flags` bitfield, `userspace-dp` `snapshot.rs`), so
+  even a KNOWN name is informational today — hard-rejecting an UNKNOWN one
+  blocked real vSRX drop-in configs that tag applications with ALGs xpf does not
+  implement (e.g. `alg ssh`) for a knob with no functional effect. The unknown
+  name now commits, and `ValidateConfig` (`compiler_validate_warn.go`) emits an
+  advisory naming the unenforced alg — `application <a>: alg "<name>" accepted
+  but not enforced …` — mirroring the global `security alg` accepted-but-inert
+  advisory (#4232). A KNOWN name (case-insensitive, via
+  `supportedApplicationALGs` in `compiler_applications.go`) commits silently and
+  keeps its (informational) behavior. This covers both the top-level `app.ALG`
+  and the inline-term `alg` (the term app carries it).
 
-  **#3353 is VALIDATION only — enforcement is deferred.** A per-application ALG
-  is recorded on `Application.ALG` but is NOT carried into the userspace
-  dataplane snapshot: the only ALG signal on the wire is the *global*
-  `alg_disable_flags` bitfield (`userspace-dp` `snapshot.rs`), with no
-  per-application ALG / custom-port pin. Wiring per-application ALG (e.g. `alg
-  ftp destination-port 2121`) through to enforcement needs a new snapshot field
-  plus Rust session-metadata handling — a genuine dataplane fork that is the
+  **Enforcement remains deferred.** Wiring per-application ALG (e.g. `alg ftp
+  destination-port 2121`) through to enforcement needs a new snapshot field plus
+  Rust session-metadata handling — a genuine dataplane fork that is the
   per-application slice of the broader ALG parity tracked under **#2008**, and
-  is deliberately not built here. Until then this gate makes an unsupported
-  name an operator-visible commit error instead of a silent no-op.
+  is deliberately not built here.
 
-**Scope — ALL user-defined applications, referenced or not.** These two checks
-live in a SEPARATE pass, `validateApplicationSyntaxStrict`, that iterates every
-entry in `cfg.Applications.Applications`, NOT the reference-scoped
+**Scope — ALL user-defined applications, referenced or not.** The unknown
+term-leaf hard reject (#3352) lives in a SEPARATE pass,
+`validateApplicationSyntaxStrict`, that iterates every entry in
+`cfg.Applications.Applications`, NOT the reference-scoped
 `applicationsToValidateStrict` subset that `validateApplicationSpecsStrict` uses
 for its port / protocol / icmp / timeout checks. The reference scope is correct
 for those SEMANTIC checks (an unreferenced malformed-port app cannot break a
 live policy decision, so it stays a warning so an operator iterating on a
 not-yet-wired application library is not blocked). But an unknown term statement
-and an unsupported `alg` are SYNTACTIC / enum violations — the config names a
-statement or an ALG that does not exist — which Junos rejects at commit
-regardless of policy wiring; deferring them until reference would let a typo'd
-term-leaf silently widen a term, or a bogus `alg` silently no-op, from the
-moment the app is defined. `cfg.Applications.Applications` holds ONLY
-user-defined applications (and the per-term apps they generate); PREDEFINED
-junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the separate
-`PredefinedApplications` table and are never in this map, so the `alg` check
-never false-rejects a predefined app that legitimately carries an
-out-of-supported-set ALG.
+is a SYNTACTIC violation — the config names a statement that does not exist —
+which Junos rejects at commit regardless of policy wiring; deferring it until
+reference would let a typo'd term-leaf silently widen a term from the moment the
+app is defined. The per-application `alg` advisory (#4337) likewise applies to
+every entry (`ValidateConfig` iterates all user apps). `cfg.Applications.
+Applications` holds ONLY user-defined applications (and the per-term apps they
+generate); PREDEFINED junos-* apps (`junos-rtsp`, `junos-h323`, ...) live in the
+separate `PredefinedApplications` table and are never in this map, so neither
+the term-leaf gate nor the `alg` advisory ever touches a predefined app that
+legitimately carries an out-of-supported-set ALG.
 
-Both checks are STRICT on the commit / commit-check path and downgrade to a
-`cfg.Warnings` entry on the tolerant load / HA peer-sync path
+The #3352 term-leaf gate is STRICT on the commit / commit-check path and
+downgrades to a `cfg.Warnings` entry on the tolerant load / HA peer-sync path
 (`lenientApplicationSpecs`, #1960 no-brick), the same discipline as the #3320 /
-#3348 application gates. Regression coverage:
+#3348 application gates; the #4337 alg check is always an advisory (never a
+commit error). Regression coverage:
 `pkg/config/compiler_application_term_alg_3352_3353_test.go` (unknown term leaf
 rejected referenced AND unreferenced, well-formed term keeps its port
-constraint, unknown alg rejected top-level + inline-term + unreferenced,
-supported alg names accepted on both paths, predefined-app reference not
-rejected).
+constraint, unknown alg accepted-with-advisory top-level + inline-term +
+unreferenced, supported alg names accepted on both paths, predefined-app
+reference not rejected).
+
+### #4336 — application `source-port` / `destination-port` `0-N` range floor
+
+Junos accepts `0` as the FLOOR of an application port range. Real vSRX
+multi-term application defs routinely split a port space as `0-N` /
+`N+1-65535` (e.g. FaceTime `term 0_41640 { source-port 0-41640; }`). xpf
+hard-rejected the low half with `source-port: invalid port 0: must be
+1-65535` — a pure drop-in blocker. `resolveAppPort` (`compiler_applications.go`,
+the single canonicalization chokepoint for BOTH direct-match and inline-term
+ports) now normalizes a range floor of `0` to `1`. Port 0 never appears on the
+wire, so `0-N` matches identically to `1-N`; normalizing at this one point keeps
+the config, `validatePortSpec`, the `userspacePortSpecRepresentable` #2124
+capability gate, and the Rust `parse_port_spec` all in agreement (the latter two
+both reject a raw `0` floor, so accepting `0-N` WITHOUT normalizing would create
+a commit-succeeds / apply-fails split). A bare single port `0` (no hyphen) stays
+invalid, matching Junos, and an out-of-range / non-numeric endpoint still
+hard-rejects on the referenced (strict) path. Regression coverage:
+`pkg/config/compiler_application_port_range_zero_4336_test.go` (source-port,
+destination-port, and inline-term `0-N` normalized to `1-N`; normal `1-N`
+unchanged; garbage still rejected) plus the `FaceTime-0_41640` assertion in
+`TestMultiTermApplication`.
 
 ### #3366 — application EITHER direct OR term-based; conflicting duplicate term leaf
 

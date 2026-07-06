@@ -532,6 +532,24 @@ func resolveAppPort(spec string) string {
 	if lo, hi, found := strings.Cut(trimmed, "-"); found {
 		l, ok1 := resolveSinglePort(lo)
 		h, ok2 := resolveSinglePort(hi)
+		// #4336: Junos accepts 0 as the FLOOR of a port range. Real vSRX
+		// multi-term application defs routinely split a port space as
+		// `0-N` / `N+1-65535` (e.g. FaceTime `source-port 0-41640`).
+		// resolveSinglePort rejects the literal "0" (it clamps to [1,65535]),
+		// which left the raw `0-N` spec to be hard-rejected by validatePortSpec
+		// ("invalid port 0: must be 1-65535") — a pure drop-in blocker. Port 0
+		// never appears on the wire, so `0-N` matches identically to `1-N`;
+		// normalize the floor to 1 here, at the SINGLE canonicalization
+		// chokepoint for both direct-match and inline-term ports, so the
+		// resulting spec passes validatePortSpec AND is representable by the
+		// userspace dataplane (the Rust parse_port_spec and the Go #2124
+		// userspacePortSpecRepresentable gate both reject a 0 floor). A bare
+		// single port 0 (no hyphen) stays invalid, matching Junos.
+		if !ok1 {
+			if n, err := parseCanonicalPort(strings.TrimSpace(lo)); err == nil && n == 0 {
+				l, ok1 = 1, true
+			}
+		}
 		if ok1 && ok2 && l <= h {
 			return fmt.Sprintf("%d-%d", l, h)
 		}

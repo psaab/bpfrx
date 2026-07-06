@@ -4040,26 +4040,20 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 					"with its value, widening the term to match more than intended)",
 				name, app.UnknownTermLeaves[0])
 		}
-		// #3353: a per-application `alg` name that is not one xpf supports. The
-		// `alg` leaf is a raw string with no schema validator, so a typo
-		// (`alg ftpp`) committed cleanly and the operator believed an ALG was
-		// pinned when none existed (a silent no-op on a security knob). Validate
-		// it against supportedApplicationALGs — the same DNS/FTP/SIP/TFTP set the
-		// global `security alg` control exposes. This is VALIDATION only: the
-		// per-application ALG is still not carried to the userspace dataplane
-		// (the wire has only the global alg_disable_flags bitfield), so a valid
-		// `alg` name remains informational until the enforcement half lands. That
-		// dataplane half is a genuine fork (new snapshot field + Rust) tracked as
-		// the per-application slice of #2008.
-		if app.ALG != "" && !validApplicationALG(app.ALG) {
-			return fmt.Errorf(
-				"application %q: unknown alg %q; supported application ALGs are "+
-					"dns/ftp/sip/tftp (the same set the global `security alg` control "+
-					"exposes). NOTE: a per-application alg is validated at commit but "+
-					"is not yet enforced by the userspace dataplane — enforcement is "+
-					"deferred to the per-application ALG slice of #2008",
-				name, app.ALG)
-		}
+		// #4337: a per-application `alg <name>` outside the four xpf implements
+		// (dns/ftp/sip/tftp) is NO LONGER hard-rejected here. The #3353 commit
+		// reject is deliberately relaxed to an accepted-but-inert advisory
+		// (ValidateConfig, compiler_validate_warn.go). Rationale: the
+		// per-application ALG is NOT carried into the userspace dataplane
+		// snapshot (the only ALG signal on the wire is the GLOBAL
+		// alg_disable_flags bitfield), so even a KNOWN name is informational
+		// today — rejecting an UNKNOWN one blocked real vSRX drop-in configs
+		// that tag applications with ALGs xpf does not implement (e.g.
+		// `alg ssh`) for a knob with no functional effect. The unknown name now
+		// commits with an advisory naming the unenforced alg so a typo is still
+		// surfaced; a KNOWN name commits silently, keeping its (informational)
+		// behavior. Enforcement of the per-application ALG is deferred to the
+		// per-application slice of #2008.
 	}
 	// #3890: an unrecognized member statement inside an opaque application-set
 	// body. The schema declares `application-set` as an args:1 leaf

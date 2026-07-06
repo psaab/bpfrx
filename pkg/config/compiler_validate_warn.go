@@ -144,6 +144,24 @@ func ValidateConfig(cfg *Config) []string {
 				warnings = append(warnings, fmt.Sprintf("application %s: %v", name, err))
 			}
 		}
+		// #4337: a per-application `alg <name>` outside the four the dataplane
+		// implements (dns/ftp/sip/tftp) is accepted-but-inert, not hard-rejected
+		// (relaxed from the #3353 commit reject — real vSRX app defs tag apps
+		// with ALGs xpf does not implement, e.g. `alg ssh`, a pure drop-in
+		// blocker). The per-application ALG is not carried into the userspace
+		// snapshot (the wire has only the global alg_disable_flags bitfield), so
+		// even a KNOWN name is informational; warn only for an UNKNOWN one so a
+		// typo is still surfaced. Mirrors the global `security alg`
+		// accepted-but-inert advisory (#4232). Enforcement deferred to the
+		// per-application ALG slice of #2008.
+		if app.ALG != "" && !validApplicationALG(app.ALG) {
+			warnings = append(warnings, fmt.Sprintf(
+				"application %s: alg %q accepted but not enforced — xpf implements "+
+					"per-application ALG control only for dns/ftp/sip/tftp; an "+
+					"unrecognized alg name commits but has no effect (enforcement "+
+					"deferred to the per-application ALG slice of #2008)",
+				name, app.ALG))
+		}
 	}
 
 	// Validate policies. Exempt the reserved special-zone tokens (`any`,
