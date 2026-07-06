@@ -551,6 +551,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			} else {
 				d.sessionSync = cluster.NewSessionSync(syncLocal, syncPeer, nil)
 			}
+			// #4107 F23: authenticate the session-sync stream with the same
+			// control-link PSK the heartbeat + fabric-gRPC use (#4357). The
+			// cluster Manager supplies both the key and the heartbeat
+			// downgrade-guard signal (HeartbeatPeerAuthSeen). With no key
+			// configured the stream stays legacy unauthenticated (dual-accept).
+			d.sessionSync.SetAuthProvider(d.cluster)
 
 			d.cluster.SetSyncTransport(syncTransport)
 
