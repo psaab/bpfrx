@@ -9,9 +9,10 @@ use crate::afxdp::types::SharedCoSExactBacklog;
 use crate::filter::TermMatchExtra;
 use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
-    CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
-    CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
-    FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot,
+    CoSDSCPRewriteRuleEntrySnapshot, CoSDSCPRewriteRuleSnapshot, CoSForwardingClassSnapshot,
+    CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot, CoSSchedulerMapEntrySnapshot,
+    CoSSchedulerMapSnapshot, CoSSchedulerSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
+    ThreeColorPolicerSnapshot,
 };
 
 // #hb166 T-4: an explicit request for a queue this interface does NOT
@@ -2613,6 +2614,223 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
 
     assert_eq!(selection.queue_id, Some(7));
     assert_eq!(selection.dscp_rewrite, Some(46));
+}
+
+// #3995: a CoS DSCP rewrite-rule keys on (forwarding-class, loss-priority).
+// A rule that rewrites `voice low` and `voice high` to DIFFERENT code-points
+// must produce the LOW code-point for a low-loss-priority flow and the HIGH
+// code-point for a high-loss-priority flow of the same forwarding-class. A
+// rewrite entry with NO explicit loss-priority is a wildcard that applies to
+// every loss-priority (backward-compat).
+//
+// FAIL-ON-REVERT: the pre-fix code keyed the rewrite on forwarding-class only
+// (`dscp_by_forwarding_class` + `.or_insert`), collapsing (voice, low) and
+// (voice, high) to whichever appeared first — so BOTH flows would resolve to
+// the SAME code-point and the `21 != 31` distinction (asserted below) would
+// vanish. Reverting also drops the rewrite out of `CoSTxSelection.dscp_rewrite`
+// entirely (it was applied at drain), flipping the `Some(..)` assertions to
+// `None`.
+#[test]
+fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            cos_dscp_classifier: "ba".into(),
+            cos_dscp_rewrite_rule: "rw".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "voice".into(),
+                    queue: 1,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "data".into(),
+                    queue: 2,
+                },
+            ],
+            // The egress DSCP classifier assigns BOTH the queue (via
+            // forwarding-class) AND the loss-priority per code-point.
+            dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                name: "ba".into(),
+                entries: vec![
+                    CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        dscp_values: vec![10],
+                    },
+                    CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "high".into(),
+                        dscp_values: vec![46],
+                    },
+                    CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "data".into(),
+                        loss_priority: "low".into(),
+                        dscp_values: vec![18],
+                    },
+                    CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "data".into(),
+                        loss_priority: "high".into(),
+                        dscp_values: vec![20],
+                    },
+                ],
+            }],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![CoSDSCPRewriteRuleSnapshot {
+                name: "rw".into(),
+                entries: vec![
+                    // voice: loss-priority-DIFFERENTIATED.
+                    CoSDSCPRewriteRuleEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        dscp_value: 21,
+                    },
+                    CoSDSCPRewriteRuleEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "high".into(),
+                        dscp_value: 31,
+                    },
+                    // data: NO explicit loss-priority → wildcard (all LPs).
+                    CoSDSCPRewriteRuleEntrySnapshot {
+                        forwarding_class: "data".into(),
+                        loss_priority: String::new(),
+                        dscp_value: 40,
+                    },
+                ],
+            }],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 2_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "voice-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "strict-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "data-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "medium-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        scheduler: "voice-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "data".into(),
+                        scheduler: "data-sched".into(),
+                    },
+                ],
+            }],
+        }),
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+
+    // Resolve the egress DSCP rewrite for a flow whose ingress DSCP is `dscp`.
+    let rewrite_for = |dscp: u8| -> Option<u8> {
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            addr_family: libc::AF_INET as u8,
+            dscp,
+            ..Default::default()
+        };
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        };
+        let selection =
+            resolve_cos_tx_selection(&forwarding, 202, meta, Some(&key), TermMatchExtra::default());
+        // The cached-descriptor path must resolve identically.
+        let cached = resolve_cached_cos_tx_selection(&forwarding, 202, meta, Some(&key));
+        assert_eq!(
+            selection.dscp_rewrite, cached.dscp_rewrite,
+            "runtime and cached CoS rewrite must agree for DSCP {dscp}",
+        );
+        selection.dscp_rewrite
+    };
+
+    // voice/low (DSCP 10) → 21, voice/high (DSCP 46) → 31. The two MUST differ
+    // — the whole point of loss-priority keying.
+    let voice_low = rewrite_for(10);
+    let voice_high = rewrite_for(46);
+    assert_eq!(voice_low, Some(21), "voice low-loss-priority rewrite");
+    assert_eq!(voice_high, Some(31), "voice high-loss-priority rewrite");
+    assert_ne!(
+        voice_low, voice_high,
+        "#3995: loss-priority must NOT collapse (fc, low) and (fc, high)",
+    );
+
+    // data has a wildcard (no loss-priority) rewrite → the SAME code-point for
+    // low and high loss-priority (backward-compat).
+    assert_eq!(rewrite_for(18), Some(40), "data low → wildcard rewrite");
+    assert_eq!(rewrite_for(20), Some(40), "data high → wildcard rewrite");
+
+    // The uniform-only per-queue drain fallback must be None for the
+    // differentiated voice class and Some(40) for the wildcard data class.
+    let iface = forwarding
+        .cos
+        .interfaces
+        .get(&202)
+        .expect("missing CoS interface");
+    let voice_queue = iface
+        .queues
+        .iter()
+        .find(|q| q.forwarding_class == "voice")
+        .expect("missing voice queue");
+    assert_eq!(voice_queue.dscp_rewrite, None);
+    let data_queue = iface
+        .queues
+        .iter()
+        .find(|q| q.forwarding_class == "data")
+        .expect("missing data queue");
+    assert_eq!(data_queue.dscp_rewrite, Some(40));
 }
 
 // #1829 Phase 1: `enqueue_cos_item` is the single CoS admission choke

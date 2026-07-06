@@ -1078,11 +1078,15 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	if !strings.Contains(warnings, `dscp rewrite-rule "edge-rewrite" references undefined forwarding-class "missing-class"`) {
 		t.Fatalf("expected undefined dscp rewrite-rule forwarding-class warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced") {
+	// #3995: classifier loss-priority now drives egress rewrite selection but
+	// still warns about the remaining drop-precedence / WRED gap.
+	if !strings.Contains(warnings, "classifier loss-priority now drives egress dscp rewrite-rule selection") {
 		t.Fatalf("expected classifier loss-priority warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced") {
-		t.Fatalf("expected rewrite-rule loss-priority warning, got: %s", warnings)
+	// #3995: rewrite-rule loss-priority is now ENFORCED, so its old
+	// accepted-but-inert warning must NOT appear.
+	if strings.Contains(warnings, "dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced") {
+		t.Fatalf("did not expect the stale rewrite-rule loss-priority warning, got: %s", warnings)
 	}
 	if strings.Contains(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane") {
 		t.Fatalf("unexpected dataplane warning for default userspace path: %s", warnings)
@@ -1168,6 +1172,106 @@ func TestSchedulerMapDanglingSchedulerRejectedStrict(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(validCfg.Warnings, "\n"), "references undefined scheduler") {
 		t.Fatalf("unexpected undefined-scheduler warning for a defined scheduler: %v", validCfg.Warnings)
+	}
+}
+
+// #3995: an operator typo in a class-of-service loss-priority value (e.g.
+// `medum-low` for `medium-low`) must be REJECTED at commit / commit-check, not
+// silently threaded to the dataplane and applied as the SAFE default LOW /
+// wildcard (wrong QoS, silently). The tolerant load / peer-sync path downgrades
+// it to a warning so an already-persisted config still boots (#1960 no-brick).
+//
+// FAIL-ON-REVERT: without validateClassOfServiceLossPriorityStrict the strict
+// CompileConfig would ACCEPT `medum-low` (it was never validated), and the
+// dataplane's cos_loss_priority_index would silently map it to LOW.
+func TestCoSLossPriorityTypoRejectedStrict(t *testing.T) {
+	compile := func(t *testing.T, input string) *ConfigTree {
+		t.Helper()
+		tree, errs := NewParser(input).Parse()
+		if len(errs) > 0 {
+			t.Fatalf("parse errors: %v", errs)
+		}
+		return tree
+	}
+
+	cases := []struct {
+		name    string
+		block   string
+		errFrag string
+	}{
+		{
+			name: "rewrite-rule",
+			block: `    rewrite-rules {
+        dscp rw {
+            forwarding-class voice {
+                loss-priority medum-low {
+                    code-point ef;
+                }
+            }
+        }
+    }`,
+			errFrag: `rewrite-rules dscp "rw" forwarding-class "voice" has unrecognized loss-priority "medum-low"`,
+		},
+		{
+			name: "dscp-classifier",
+			block: `    classifiers {
+        dscp ba {
+            forwarding-class voice {
+                loss-priority medum-low code-points ef;
+            }
+        }
+    }`,
+			errFrag: `classifiers dscp "ba" forwarding-class "voice" has unrecognized loss-priority "medum-low"`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := "class-of-service {\n" +
+				"    forwarding-classes {\n" +
+				"        queue 0 best-effort;\n" +
+				"        queue 5 voice;\n" +
+				"    }\n" +
+				tc.block + "\n}\n"
+
+			// Strict commit path rejects the typo, naming the bad value and the
+			// valid set.
+			_, err := CompileConfig(compile(t, input))
+			if err == nil {
+				t.Fatal("CompileConfig accepted an unrecognized loss-priority; want rejection")
+			}
+			if !strings.Contains(err.Error(), tc.errFrag) {
+				t.Fatalf("strict error missing the typo substring: %q", err.Error())
+			}
+			if !strings.Contains(err.Error(), "must be one of: low, medium-low, medium-high, high") {
+				t.Fatalf("strict error missing the valid-value set: %q", err.Error())
+			}
+
+			// Tolerant load path downgrades to a warning and still compiles
+			// (#1960 no-brick).
+			cfg, err := CompileConfigLenient(compile(t, input))
+			if err != nil {
+				t.Fatalf("CompileConfigLenient rejected a persistable config with a bad loss-priority (#1960 brick): %v", err)
+			}
+			warnings := strings.Join(cfg.Warnings, "\n")
+			if !strings.Contains(warnings, "loss-priority (downgraded to warning on tolerant path)") ||
+				!strings.Contains(warnings, "unrecognized loss-priority") {
+				t.Fatalf("lenient path missing the downgraded loss-priority warning, got: %s", warnings)
+			}
+
+			// A valid loss-priority is unchanged on BOTH paths.
+			validInput := strings.Replace(input, "medum-low", "medium-low", 1)
+			if _, err := CompileConfig(compile(t, validInput)); err != nil {
+				t.Fatalf("CompileConfig rejected a VALID loss-priority medium-low: %v", err)
+			}
+			validCfg, err := CompileConfigLenient(compile(t, validInput))
+			if err != nil {
+				t.Fatalf("CompileConfigLenient rejected a valid loss-priority: %v", err)
+			}
+			if strings.Contains(strings.Join(validCfg.Warnings, "\n"), "unrecognized loss-priority") {
+				t.Fatalf("unexpected unrecognized-loss-priority warning for a valid value: %v", validCfg.Warnings)
+			}
+		})
 	}
 }
 
