@@ -141,6 +141,18 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	statsEnabled := cfg.Security.PolicyStatsEnabled
 	// #3408: surface a per-policy counter read failure as codes.Internal.
 	var readErr error
+	// #4344: read the whole policy set from ONE snapshot (O(P+C), one brief
+	// dataplane lock) via the #3965 bulk reader instead of a per-policy
+	// ReadPolicyCounters loop that rebuilt the ruleID->counter index and
+	// rescanned the config under the policy mutex on every rule. Built only
+	// when the dataplane is loaded; falls back to the per-policy read for
+	// dataplanes without the bulk snapshot (test fakes / retired eBPF), so the
+	// returned HitPackets/HitBytes are identical. cfg is the config walked
+	// below, so the snapshot's handles line up with the handles computed here.
+	var readPolicy func(uint32) (dataplane.CounterValue, error)
+	if s.dp != nil && s.dp.IsLoaded() {
+		readPolicy = dpuserspace.NewPolicyCounterReader(s.dp, cfg, s.dp.ReadPolicyCounters)
+	}
 	resp := &pb.GetPoliciesResponse{}
 	// #3336: span-accumulated runtime/RT_FLOW policy IDs, keyed
 	// [policySetID, sliceIndex] — the same identity the event path logs, so
@@ -213,9 +225,9 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			if pr.Applications == nil {
 				pr.Applications = []string{}
 			}
-			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || rule.Count) && readPolicy != nil {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
+				if ctrs, err := readPolicy(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
 				} else if readErr == nil {
@@ -285,9 +297,9 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			if pr.Applications == nil {
 				pr.Applications = []string{}
 			}
-			if (statsEnabled || rule.Count) && s.dp != nil && s.dp.IsLoaded() {
+			if (statsEnabled || rule.Count) && readPolicy != nil {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
+				if ctrs, err := readPolicy(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
 					pr.HitBytes = ctrs.Bytes
 				} else if readErr == nil {
@@ -330,8 +342,8 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			PolicyId: proto.Uint32(dataplane.DefaultPolicySentinelID),
 			RuleId:   dataplane.DefaultPolicyName,
 		}
-		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
-			if ctrs, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+		if statsEnabled && readPolicy != nil {
+			if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
 				defRule.HitPackets = ctrs.Packets
 				defRule.HitBytes = ctrs.Bytes
 			} else if readErr == nil {

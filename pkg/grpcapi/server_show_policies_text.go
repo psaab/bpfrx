@@ -112,6 +112,16 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	// #3408: surface a per-policy counter read failure as a warning AFTER all
 	// reads rather than printing clean-zero hit counts.
 	var readErr error
+	// #4344: read the whole policy set from ONE snapshot (O(P+C), one brief
+	// dataplane lock) via the #3965 bulk reader instead of a per-policy
+	// ReadPolicyCounters loop. Built only when the dataplane is loaded; falls
+	// back to the per-policy read for dataplanes without the bulk snapshot
+	// (test fakes / retired eBPF), so the displayed counts are identical. cfg
+	// is the config walked below, so the snapshot's handles line up.
+	var readPolicy func(uint32) (dataplane.CounterValue, error)
+	if s.dp != nil && s.dp.IsLoaded() {
+		readPolicy = dpuserspace.NewPolicyCounterReader(s.dp, cfg, s.dp.ReadPolicyCounters)
+	}
 	fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
 		"From zone", "To zone", "Policy", "Action", "Packets", "Bytes")
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
@@ -143,8 +153,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
-			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
-				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+			if (statsEnabled || pol.Count) && readPolicy != nil {
+				if counters, err := readPolicy(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
 				} else if readErr == nil {
@@ -192,8 +202,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
-			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
-				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+			if (statsEnabled || pol.Count) && readPolicy != nil {
+				if counters, err := readPolicy(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
 				} else if readErr == nil {
@@ -230,8 +240,8 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			defAction = "reject"
 		}
 		var pkts, bytes uint64
-		if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
-			if counters, err := s.dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID); err == nil {
+		if statsEnabled && readPolicy != nil {
+			if counters, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
 				pkts = counters.Packets
 				bytes = counters.Bytes
 			} else if readErr == nil {
@@ -277,6 +287,15 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	// the "Session statistics" block is per-policy hit-count display, so
 	// it must honor the knob for cross-surface consistency.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
+	// #4344: same #3965 bulk-reader migration as showPoliciesHitCount — read the
+	// policy set from ONE snapshot instead of a per-policy ReadPolicyCounters
+	// loop for the "Session statistics" block. Built only when the dataplane is
+	// loaded; falls back to the per-policy read for non-bulk dataplanes, so the
+	// rendered values are identical. cfg is the config walked below.
+	var readPolicy func(uint32) (dataplane.CounterValue, error)
+	if s.dp != nil && s.dp.IsLoaded() {
+		readPolicy = dpuserspace.NewPolicyCounterReader(s.dp, cfg, s.dp.ReadPolicyCounters)
+	}
 	schedActive, haveSched := s.policySchedulerActiveState()
 	// #3667 (H05): the displayed Index must equal the runtime/RT_FLOW policy ID
 	// so a remote operator can map a policy-deny/RT_FLOW log line (which carries
@@ -366,8 +385,8 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
 			}
-			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
-				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+			if (statsEnabled || pol.Count) && readPolicy != nil {
+				if counters, err := readPolicy(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
 				} else if readErr == nil {
@@ -442,8 +461,8 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
 			}
-			if (statsEnabled || pol.Count) && s.dp != nil && s.dp.IsLoaded() {
-				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
+			if (statsEnabled || pol.Count) && readPolicy != nil {
+				if counters, err := readPolicy(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
 				} else if readErr == nil {
