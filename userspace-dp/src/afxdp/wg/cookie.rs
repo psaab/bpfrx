@@ -55,7 +55,8 @@
 //! mutability, not cross-thread contention. NEVER log a secret, a cookie,
 //! or the encryption key.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
 use blake2::Blake2s256;
@@ -106,6 +107,35 @@ pub(crate) const INITIATIONS_UNDER_LOAD_THRESHOLD: u64 = 25;
 /// UDP socket (not the AF_XDP TX ring), so this bounds CPU/socket load
 /// rather than TX-ring descriptors.
 pub(crate) const COOKIE_REPLY_BUDGET_PER_WINDOW: u64 = 40;
+
+/// #4332 per-SOURCE cookie-reply token bucket. The [`COOKIE_REPLY_BUDGET_PER_WINDOW`]
+/// cap above is GLOBAL per tunnel, so a determined valid-MAC1 flood from ONE
+/// source can drain the shared budget and budget-suppress a legit peer's first
+/// cookie challenge from a DIFFERENT source. These constants mirror
+/// wireguard-go `device/ratelimiter.go` (`packetsPerSecond` /
+/// `packetsBurstable` / `packetCost` / `maxTokens` / `garbageCollectTime`) so a
+/// flood from one source throttles only itself. Sustained rate and burst:
+pub(crate) const SOURCE_REPLIES_PER_SEC: u64 = 20;
+/// Burst depth: how many replies a fresh source may draw back-to-back before
+/// the sustained [`SOURCE_REPLIES_PER_SEC`] rate applies.
+pub(crate) const SOURCE_REPLY_BURST: u64 = 5;
+/// Token cost of one reply, in nanoseconds of accrued time
+/// (`1e9 / SOURCE_REPLIES_PER_SEC` = 50 ms). One second of idle accrues exactly
+/// `SOURCE_REPLIES_PER_SEC` tokens.
+pub(crate) const PACKET_COST_NS: u64 = 1_000_000_000 / SOURCE_REPLIES_PER_SEC;
+/// Token ceiling: a bucket never accrues more than one burst's worth of tokens
+/// (`PACKET_COST_NS * SOURCE_REPLY_BURST` = 250 ms). Signed to make the
+/// refill/spend arithmetic and the monotonic-clock guard total.
+pub(crate) const MAX_TOKENS_NS: i64 = (PACKET_COST_NS * SOURCE_REPLY_BURST) as i64;
+/// Run the per-source table GC at most this often (mirrors wireguard-go
+/// `garbageCollectTime`, 1 s); a bucket idle for a full interval is dropped.
+const SOURCE_GC_INTERVAL_NS: u64 = 1_000_000_000;
+/// Hard cap on distinct source IPs tracked at once. Bounds the map against a
+/// SPOOFED-source-IP flood (the memory-amplification vector this hardening must
+/// not itself introduce): a NEW source that would overflow the cap is DENIED
+/// (fail closed), never inserted. Idle buckets are GC-reclaimed, so the cap
+/// only bites during an active flood of > `SOURCE_TABLE_MAX` live sources.
+const SOURCE_TABLE_MAX: usize = 2048;
 
 /// Cookie MAC length (keyed-BLAKE2s-128 output).
 pub(crate) const WG_COOKIE_LEN: usize = 16;
@@ -246,6 +276,23 @@ struct BudgetState {
     emitted: u64,
 }
 
+/// #4332 per-source token bucket. `last_ns` is a MONOTONIC high-water mark of
+/// the last refill (never lowered by a backwards clock step — #4330/#4321),
+/// `tokens_ns` the accrued-time credit (signed, capped at [`MAX_TOKENS_NS`]).
+struct SourceBucket {
+    last_ns: u64,
+    tokens_ns: i64,
+}
+
+/// #4332 bounded per-source-IP reply-bucket table + its GC clock, guarded as a
+/// unit by one mutex so a sweep and an admit never observe a torn table.
+/// `last_gc_ns` is an `Option` (not a 0 sentinel) for the same #4094 BUG-1
+/// reason as [`LoadState`]: `now_ns == 0` is a legitimate first sweep time.
+struct SourceTable {
+    buckets: HashMap<IpAddr, SourceBucket>,
+    last_gc_ns: Option<u64>,
+}
+
 /// Responder cookie checker: secret rotation + load detection + reply
 /// budget + MAC2 verification, all keyed to one tunnel's responder static
 /// key. One per [`super::WgEngine`].
@@ -256,6 +303,10 @@ pub(crate) struct CookieChecker {
     secret: Mutex<SecretState>,
     load: Mutex<LoadState>,
     budget: Mutex<BudgetState>,
+    /// #4332 per-source cookie-reply token buckets, layered BEFORE the global
+    /// `budget` so one flooding source cannot drain the shared per-window cap
+    /// away from a legit peer at a different source.
+    per_source: Mutex<SourceTable>,
     /// Test hook: when true, [`Self::draw_random`] simulates a `getrandom`
     /// failure so the #4094 BUG-2 fail-closed path is exercisable without
     /// mocking the OS CSPRNG. Compiled out of release builds.
@@ -299,6 +350,10 @@ impl CookieChecker {
             budget: Mutex::new(BudgetState {
                 window_start_ns: None,
                 emitted: 0,
+            }),
+            per_source: Mutex::new(SourceTable {
+                buckets: HashMap::new(),
+                last_gc_ns: None,
             }),
             #[cfg(test)]
             rng_fail: std::sync::atomic::AtomicBool::new(false),
@@ -356,6 +411,71 @@ impl CookieChecker {
         }
         b.emitted += 1;
         true
+    }
+
+    /// #4332: per-SOURCE cookie-reply admission. A small token bucket keyed by
+    /// the initiation's source IP (mirrors wireguard-go `device/ratelimiter.go`)
+    /// that admits at most [`SOURCE_REPLIES_PER_SEC`] replies/s per source with a
+    /// [`SOURCE_REPLY_BURST`] burst. Layered BEFORE the GLOBAL per-window
+    /// [`Self::reply_budget_available`] in the cookie-reply path (BOTH must
+    /// pass), so a flood from ONE source throttles only its OWN bucket and
+    /// cannot drain the shared budget away from a legit peer at a DIFFERENT
+    /// source (the isolation #4332 adds over #4330's global-only cap).
+    ///
+    /// Fail CLOSED against the amplification vector this very hardening could
+    /// introduce: the table is GC-swept every [`SOURCE_GC_INTERVAL_NS`] (idle
+    /// buckets dropped) and hard-capped at [`SOURCE_TABLE_MAX`] — a NEW source
+    /// that would overflow the cap is DENIED (no reply) rather than growing the
+    /// map without bound under a spoofed-source-IP flood.
+    ///
+    /// Monotonic-clock discipline mirrors #4330/#4321: elapsed is
+    /// `saturating_sub` (a backwards `now_ns` credits nothing) and `last_ns` is
+    /// a high-water mark (`.max(now_ns)`, never lowered), so a clock glitch
+    /// cannot be replayed into an over-credit to the ceiling on the next forward
+    /// step — the exact weakening that guard prevents.
+    pub(crate) fn source_reply_allowed(&self, src_ip: IpAddr, now_ns: u64) -> bool {
+        let mut t = self.per_source.lock().unwrap();
+
+        // Periodic GC — at most once per interval — drops buckets idle for a
+        // full GC interval, so a transient spoofed-IP burst does not keep the
+        // table full once it stops. Runs BEFORE the cap check so reclaimed
+        // slots are available to a legit new source in the same call.
+        let gc_due = match t.last_gc_ns {
+            None => true,
+            Some(last) => now_ns.saturating_sub(last) >= SOURCE_GC_INTERVAL_NS,
+        };
+        if gc_due {
+            t.last_gc_ns = Some(now_ns);
+            t.buckets
+                .retain(|_, b| now_ns.saturating_sub(b.last_ns) < SOURCE_GC_INTERVAL_NS);
+        }
+
+        // Table cap: a NEW source that would overflow the bound is denied
+        // WITHOUT inserting — fail closed against a spoofed-source-IP flood.
+        // An already-tracked source is never refused here (it is one of the
+        // bounded set and gets its normal token check below).
+        if !t.buckets.contains_key(&src_ip) && t.buckets.len() >= SOURCE_TABLE_MAX {
+            return false;
+        }
+
+        // A fresh bucket starts full (one whole burst of credit) so a legit
+        // source's first challenge is never throttled by table churn.
+        let bucket = t.buckets.entry(src_ip).or_insert(SourceBucket {
+            last_ns: now_ns,
+            tokens_ns: MAX_TOKENS_NS,
+        });
+        // Refill by elapsed time (never negative — saturating_sub), cap at the
+        // burst ceiling; keep last_ns a monotonic high-water mark.
+        let elapsed = now_ns.saturating_sub(bucket.last_ns) as i64;
+        bucket.last_ns = bucket.last_ns.max(now_ns);
+        bucket.tokens_ns = (bucket.tokens_ns + elapsed).min(MAX_TOKENS_NS);
+        let cost = PACKET_COST_NS as i64;
+        if bucket.tokens_ns >= cost {
+            bucket.tokens_ns -= cost;
+            true
+        } else {
+            false
+        }
     }
 
     /// Rotate the secret if `current` is older than one rotation window,
@@ -571,6 +691,20 @@ impl CookieChecker {
             s.has_previous = false;
             s.generated_at_ns = None;
         }
+    }
+
+    /// #4332 test hook: number of distinct source IPs currently tracked in the
+    /// per-source reply-bucket table (asserts the [`SOURCE_TABLE_MAX`] bound and
+    /// GC reclaim).
+    #[cfg(test)]
+    pub(crate) fn source_table_len_for_test(&self) -> usize {
+        self.per_source.lock().unwrap().buckets.len()
+    }
+
+    /// #4332 test hook: whether a specific source IP has a live bucket.
+    #[cfg(test)]
+    pub(crate) fn source_contains_for_test(&self, ip: IpAddr) -> bool {
+        self.per_source.lock().unwrap().buckets.contains_key(&ip)
     }
 }
 
@@ -885,5 +1019,156 @@ mod tests {
         assert!(fill_random(&mut b));
         assert_ne!(a, [0u8; 32], "a healthy CSPRNG does not yield all-zero");
         assert_ne!(a, b, "two draws differ");
+    }
+
+    // ===================================================================
+    // #4332 per-SOURCE cookie-reply token bucket.
+    // ===================================================================
+
+    fn ipv4(a: u8) -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, a))
+    }
+
+    /// A fresh source draws exactly [`SOURCE_REPLY_BURST`] replies back-to-back
+    /// (same instant, no refill) and is then throttled; one [`PACKET_COST_NS`]
+    /// of accrued time refills exactly one token.
+    #[test]
+    fn source_bucket_burst_then_throttle() {
+        let cc = CookieChecker::new(&[0x81u8; 32]);
+        let now = 10_000_000_000u64;
+        let s = ipv4(1);
+        let mut granted = 0u64;
+        for _ in 0..(SOURCE_REPLY_BURST + 10) {
+            if cc.source_reply_allowed(s, now) {
+                granted += 1;
+            }
+        }
+        assert_eq!(
+            granted, SOURCE_REPLY_BURST,
+            "a source may burst exactly SOURCE_REPLY_BURST replies, then throttles"
+        );
+        // One packet-cost of accrued time → exactly one more token, then dry.
+        assert!(cc.source_reply_allowed(s, now + PACKET_COST_NS));
+        assert!(!cc.source_reply_allowed(s, now + PACKET_COST_NS));
+    }
+
+    /// The isolation #4332 buys over the global-only budget: a source that has
+    /// exhausted its bucket does NOT starve a DIFFERENT source, which still
+    /// draws its full burst. RED on revert (no per-source layer, the direct
+    /// method disappears; and at the engine level A's flood drains the shared
+    /// budget — see `classify_initiation_per_source_budget_isolation`).
+    #[test]
+    fn source_bucket_isolates_sources() {
+        let cc = CookieChecker::new(&[0x82u8; 32]);
+        let now = 10_000_000_000u64;
+        let a = ipv4(1);
+        let b = ipv4(2);
+        for _ in 0..(SOURCE_REPLY_BURST + 5) {
+            cc.source_reply_allowed(a, now);
+        }
+        assert!(
+            !cc.source_reply_allowed(a, now),
+            "source A is throttled after exhausting its own bucket"
+        );
+        let mut granted_b = 0u64;
+        for _ in 0..(SOURCE_REPLY_BURST + 5) {
+            if cc.source_reply_allowed(b, now) {
+                granted_b += 1;
+            }
+        }
+        assert_eq!(
+            granted_b, SOURCE_REPLY_BURST,
+            "a different source is unaffected by A's flood (per-source isolation)"
+        );
+    }
+
+    /// The table is hard-capped at [`SOURCE_TABLE_MAX`]: a spoofed-source-IP
+    /// flood cannot grow the map without bound. A NEW source over the cap fails
+    /// CLOSED (no reply, not inserted); an already-tracked source is still
+    /// served.
+    #[test]
+    fn source_table_cap_fails_closed() {
+        let cc = CookieChecker::new(&[0x83u8; 32]);
+        let now = 10_000_000_000u64;
+        // Fill to the cap with distinct sources, all within one GC interval
+        // (same `now`) so none are reclaimed.
+        for i in 0..SOURCE_TABLE_MAX {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000u32 + i as u32));
+            assert!(
+                cc.source_reply_allowed(ip, now),
+                "a fresh source under the cap is admitted"
+            );
+        }
+        assert_eq!(cc.source_table_len_for_test(), SOURCE_TABLE_MAX);
+        // A NEW source over the cap is DENIED and NOT inserted — fail closed
+        // against the memory-amplification vector.
+        let overflow = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        assert!(
+            !cc.source_reply_allowed(overflow, now),
+            "a new source over the table cap fails closed (denied, no reply)"
+        );
+        assert!(!cc.source_contains_for_test(overflow));
+        assert_eq!(
+            cc.source_table_len_for_test(),
+            SOURCE_TABLE_MAX,
+            "the table never grows past its cap under a spoofed-IP flood"
+        );
+        // An already-tracked source (drew 1 of its burst) is still served.
+        let tracked = IpAddr::V4(std::net::Ipv4Addr::from(0x0A00_0000u32));
+        assert!(
+            cc.source_reply_allowed(tracked, now),
+            "an already-tracked source is not refused by the cap"
+        );
+    }
+
+    /// GC reclaims buckets idle for a full [`SOURCE_GC_INTERVAL_NS`]: as
+    /// spoofed sources come and go the table shrinks back, so a burst of
+    /// short-lived sources does not permanently pin the map at its cap.
+    #[test]
+    fn source_gc_reclaims_idle_buckets() {
+        let cc = CookieChecker::new(&[0x84u8; 32]);
+        let base = 10_000_000_000u64;
+        let idle = ipv4(1);
+        let active = ipv4(2);
+        assert!(cc.source_reply_allowed(idle, base));
+        assert_eq!(cc.source_table_len_for_test(), 1);
+        // A full GC interval later a DIFFERENT source sends: the sweep drops
+        // the idle bucket before admitting the active one.
+        let later = base + SOURCE_GC_INTERVAL_NS + 1;
+        assert!(cc.source_reply_allowed(active, later));
+        assert_eq!(
+            cc.source_table_len_for_test(),
+            1,
+            "the idle source was GC-reclaimed; only the active source remains"
+        );
+        assert!(!cc.source_contains_for_test(idle));
+        assert!(cc.source_contains_for_test(active));
+    }
+
+    /// Monotonic-clock discipline (#4330/#4321): a backwards `now_ns` credits
+    /// nothing and never lowers the bucket's `last_ns` high-water mark, so the
+    /// glitch cannot be replayed into an over-credit on the next forward step.
+    #[test]
+    fn source_bucket_ignores_backwards_clock() {
+        let cc = CookieChecker::new(&[0x85u8; 32]);
+        let s = ipv4(1);
+        let t_hi = 10_000_000_000u64;
+        // Drain the burst at t_hi.
+        for _ in 0..SOURCE_REPLY_BURST {
+            assert!(cc.source_reply_allowed(s, t_hi));
+        }
+        assert!(!cc.source_reply_allowed(s, t_hi), "burst exhausted at t_hi");
+        // A backwards step must NOT credit (saturating_sub → 0 elapsed) and must
+        // NOT lower last_ns — else the following forward jump back to t_hi would
+        // credit the whole (t_hi - t_lo) span and refill to the ceiling.
+        let t_lo = t_hi - 5 * SOURCE_GC_INTERVAL_NS;
+        assert!(
+            !cc.source_reply_allowed(s, t_lo),
+            "a backwards clock step credits nothing"
+        );
+        assert!(
+            !cc.source_reply_allowed(s, t_hi),
+            "the forward jump after a backwards step is not replayed into an over-credit"
+        );
     }
 }

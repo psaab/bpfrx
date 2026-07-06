@@ -1,3 +1,34 @@
+## 2026-07-06 — #4332: WireGuard per-SOURCE cookie-reply token bucket
+
+- **Timestamp**: 2026-07-06
+- **Action**: Followed up #4094/#4330. The responder cookie-reply budget
+  (`COOKIE_REPLY_BUDGET_PER_WINDOW`, 40) is GLOBAL per tunnel, so a determined
+  valid-MAC1 flood from ONE source could drain the shared budget and
+  budget-suppress a legit peer's first cookie challenge from a DIFFERENT source.
+  Added a per-SOURCE token bucket (`CookieChecker::source_reply_allowed`,
+  mirroring wireguard-go `device/ratelimiter.go`): `SOURCE_REPLIES_PER_SEC` 20/s
+  sustained, `SOURCE_REPLY_BURST` 5 burst, `PACKET_COST_NS`/`MAX_TOKENS_NS`
+  accrued-time credit. Layered BEFORE the global budget in
+  `classify_initiation` (both gates must pass), so a flood from one source
+  throttles only its own bucket. The `HashMap<IpAddr, SourceBucket>` table is
+  GC-swept every `SOURCE_GC_INTERVAL_NS` (1 s; idle buckets dropped) and
+  hard-capped at `SOURCE_TABLE_MAX` (2048): a NEW source over the cap is DENIED
+  (fail closed, no reply), never inserted — bounding the map against the
+  spoofed-source-IP amplification vector this hardening could otherwise
+  introduce. Refill obeys the #4330/#4321 monotonic-clock discipline: a
+  backwards `now_ns` credits nothing (`saturating_sub`) and never lowers the
+  bucket's `last_ns` high-water mark (`.max(now_ns)`). Per-source throttle drops
+  and the full-table fail-closed are counted under the existing
+  `hs_cookie_reply_budget_drops` family (no new control-protocol field). Tests:
+  engine-level `classify_initiation_per_source_budget_isolation` (RED on revert —
+  A's flood drains the global budget from B) plus cookie.rs unit tests for burst,
+  isolation, table-cap fail-closed, GC reclaim, and the backwards-clock guard.
+- **File(s)**: userspace-dp/src/afxdp/wg/cookie.rs (constants, `SourceBucket`/
+  `SourceTable`, `CookieChecker.per_source`, `source_reply_allowed`, test hooks +
+  5 unit tests), userspace-dp/src/afxdp/wg/engine.rs (`classify_initiation`
+  per-source gate), userspace-dp/src/afxdp/wg/engine_tests.rs (isolation test),
+  userspace-dp/src/afxdp/wg/counters.rs + userspace-dp/src/protocol/control.rs
+  (counter doc), docs/wireguard-interop.md.
 ## 2026-07-06 — #4313 PR-B: first production closed-world subtree flip (destination-NAT then)
 
 - **Timestamp**: 2026-07-06
