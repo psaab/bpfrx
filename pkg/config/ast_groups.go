@@ -188,7 +188,7 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			if tagInherited {
 				tagNodesInherited(cloned, name)
 			}
-			mergeNodes(nodes, cloned)
+			mergeNodes(nodes, cloned, ancestorPath)
 		}
 
 		delete(seen, name)
@@ -218,17 +218,46 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 	return nil
 }
 
-// mergeNodes merges src nodes into dst. For container nodes with matching keys,
-// children are merged recursively. For leaf nodes or new containers, they are
-// appended (group values don't override existing explicit config — existing
-// config takes precedence via ordering, since the compiler uses first-match).
-func mergeNodes(dst *[]*Node, src []*Node) {
+// mergeNodes merges src (apply-group) nodes into dst (inline stanza) at the
+// schema level named by ancestorPath (the Keys path from root to this level,
+// same convention expandGroupsRecursive threads for group context walking).
+// For container nodes with matching keys, children are merged recursively.
+//
+// apply-groups inheritance is TYPED per Junos, not shape-based (#4070):
+//   - LEAF-LIST statement (schema `multi:true && children==nil`, e.g.
+//     name-server, policy `match application` / `source-address`, firewall
+//     `from protocol`, routing export/import chains): the group's members are
+//     inherited IN ADDITION to the inline members — UNION. Inline members keep
+//     precedence and order; group members not already present are appended,
+//     deduplicated. This holds across BOTH AST shapes (collapsed leaf and block
+//     container) on either side, and yields exactly ONE node for the key.
+//   - SCALAR leaf (host-name, ...): inline OVERRIDES the group value (the
+//     explicit stanza wins via first-match ordering — unchanged).
+//   - Unmodeled leaf (not resolvable in setSchema): OVERRIDE, the safe
+//     non-regressing fallback (matches the incremental schema-coverage posture).
+//
+// Before #4070 the merge keyed on AST SHAPE — collapsed+collapsed OVERRODE,
+// block+block UNIONED — so an inline `match application junos-http` that
+// inherited a group's `match application junos-https` silently DROPPED
+// junos-https (fable-164 L-8), narrowing a `then deny` to junos-http only.
+func mergeNodes(dst *[]*Node, src []*Node, ancestorPath [][]string) {
 	for _, s := range src {
 		if s.IsLeaf {
-			// Only add leaf if no matching leaf exists.
-			if !hasMatchingLeaf(*dst, s.Keys) {
-				*dst = append(*dst, s)
+			key := ""
+			if len(s.Keys) > 0 {
+				key = s.Keys[0]
 			}
+			if peer := leafListPeer(*dst, key); peer != nil {
+				// A same-key node already exists inline. UNION when the
+				// statement is a leaf-list; otherwise OVERRIDE (skip the
+				// group value — inline wins).
+				if isLeafListSchema(ancestorPath, key) {
+					mergeLeafListInto(peer, s)
+				}
+				continue
+			}
+			// No inline value for this key: adopt the group leaf.
+			*dst = append(*dst, s)
 			continue
 		}
 
@@ -238,8 +267,22 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 			for _, d := range *dst {
 				if !d.IsLeaf && keysMatchWildcard(d.Keys, s.Keys) {
 					cloned := cloneNodes(s.Children)
-					mergeNodes(&d.Children, cloned)
+					mergeNodes(&d.Children, cloned, appendPath(ancestorPath, d.Keys))
 				}
+			}
+			continue
+		}
+
+		// A single-key group container that the schema classifies as a
+		// leaf-list is the BLOCK shape of a leaf-list ("name-server { 1; 2; }").
+		// UNION its members into an existing inline leaf-list (either shape),
+		// rather than recursing as a real hierarchical container. Multi-key
+		// containers (["family","inet"]) are never leaf-lists.
+		if len(s.Keys) == 1 && isLeafListSchema(ancestorPath, s.Keys[0]) {
+			if peer := leafListPeer(*dst, s.Keys[0]); peer != nil {
+				mergeLeafListInto(peer, s)
+			} else {
+				*dst = append(*dst, s)
 			}
 			continue
 		}
@@ -249,28 +292,116 @@ func mergeNodes(dst *[]*Node, src []*Node) {
 		for _, d := range *dst {
 			if !d.IsLeaf && keysEqual(d.Keys, s.Keys) {
 				// Merge children recursively.
-				mergeNodes(&d.Children, s.Children)
+				mergeNodes(&d.Children, s.Children, appendPath(ancestorPath, d.Keys))
 				found = true
 				break
 			}
 		}
 		if !found {
-			// Cross-shape guard (#4070): a single-key group container is a
-			// leaf-list expressed in BLOCK shape (Keys == ["name-server"]).
-			// If the destination already holds the same leaf-list as a
-			// COLLAPSED leaf sharing Keys[0] (e.g. "name-server 9.9.9.9"),
-			// the two express the SAME statement in different shapes. The
-			// explicit stanza value wins (same precedence rule as
-			// hasMatchingLeaf), so skip the group container instead of
-			// appending a duplicate second node for the same key. Multi-key
-			// containers (e.g. ["family","inet"]) are real hierarchical
-			// nodes, never leaf-lists, so they are never cross-suppressed.
+			// Cross-shape guard (#4325): a single-key group container whose
+			// leaf-list counterpart exists inline as a collapsed leaf sharing
+			// Keys[0]. Leaf-list keys are handled by the union path above, so
+			// this now only fires for a single-key container NOT modeled as a
+			// leaf-list — keep the no-duplicate invariant (skip rather than
+			// append a second node for the same key).
 			if len(s.Keys) == 1 && hasMatchingLeaf(*dst, s.Keys) {
 				continue
 			}
 			*dst = append(*dst, s)
 		}
 	}
+}
+
+// appendPath returns a fresh copy of base with keys appended, so recursive
+// mergeNodes calls never alias or clobber a shared ancestorPath backing array.
+func appendPath(base [][]string, keys []string) [][]string {
+	out := make([][]string, len(base)+1)
+	copy(out, base)
+	out[len(base)] = keys
+	return out
+}
+
+// leafListPeer returns the first dst node that expresses the leaf-list keyed
+// by key — either a COLLAPSED leaf ("name-server 9.9.9.9") or a single-key
+// BLOCK container ("name-server { 9.9.9.9; }"). It mirrors hasMatchingLeaf's
+// match rule so union and override agree on what counts as "the same key".
+func leafListPeer(dst []*Node, key string) *Node {
+	if key == "" {
+		return nil
+	}
+	for _, n := range dst {
+		if len(n.Keys) == 0 || n.Keys[0] != key {
+			continue
+		}
+		if n.IsLeaf || len(n.Keys) == 1 {
+			return n
+		}
+	}
+	return nil
+}
+
+// mergeLeafListInto unions the members of a group leaf-list node src into an
+// existing inline leaf-list node dst. Members are read across both AST shapes
+// via the #2419 firewallMatchValues SSOT (Keys[1:] AND child leaves). Inline
+// members keep their position; group members not already present are appended
+// in group order, deduplicated. The dst node's shape is preserved — a
+// collapsed leaf grows on Keys, a block container gains one child leaf per
+// added member — so the result is exactly ONE node for the key regardless of
+// the two inputs' shapes.
+func mergeLeafListInto(dst, src *Node) {
+	seen := make(map[string]bool)
+	for _, v := range firewallMatchValues(dst) {
+		seen[v] = true
+	}
+	for _, v := range firewallMatchValues(src) {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		if dst.IsLeaf {
+			dst.Keys = append(dst.Keys, v)
+		} else {
+			dst.Children = append(dst.Children, &Node{
+				Keys:          []string{v},
+				IsLeaf:        true,
+				InheritedFrom: src.InheritedFrom,
+			})
+		}
+	}
+}
+
+// isLeafListSchema reports whether the leaf keyword key, resolved under the
+// schema context ancestorPath, is a Junos leaf-list: a multi-value leaf that
+// models no sub-structure (setSchema `multi:true && children==nil`). Such a
+// statement UNIONs its members under apply-groups inheritance (#4070); a
+// scalar leaf overrides. Returns false when the path or keyword is not modeled
+// in setSchema, so an unmodeled leaf safely keeps the legacy override behavior.
+//
+// The multi:true discriminator already exists (169 leaf-list entries in
+// setSchema), and children==nil excludes multi nodes that carry modifier
+// sub-structure (CoS named containers, static `next-hop [ a b ] { interface
+// x; }`) which are not plain leaf-lists.
+func isLeafListSchema(ancestorPath [][]string, key string) bool {
+	schema := setSchema
+	for _, pk := range ancestorPath {
+		if schema == nil || len(pk) == 0 {
+			return false
+		}
+		child := resolveSchemaChild(schema, pk[0])
+		if child == nil {
+			return false
+		}
+		// consumeNodeKeys descends a compoundKey sub-token (family inet6) so
+		// the leaf lookup lands at the correct level; args/midKeyword tokens
+		// are identity values that do not change the schema level.
+		_, child = consumeNodeKeys(pk, child)
+		schema = child
+	}
+	if schema == nil {
+		return false
+	}
+	leaf := resolveSchemaChild(schema, key)
+	return leaf != nil && leaf.multi && leaf.children == nil
 }
 
 // keysContainWildcard returns true if any key is the Junos wildcard "<*>".

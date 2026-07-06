@@ -1,3 +1,31 @@
+## 2026-07-06 — #4070: apply-groups UNIONs leaf-lists (schema-aware), OVERRIDEs scalars
+
+- **Timestamp**: 2026-07-06
+- **Action**: Implemented the VALUE half of #4070 (the shape-dup half merged as
+  #4325). apply-groups inheritance is now TYPED by statement kind, not AST
+  shape: a leaf-list (`setSchema` `multi:true && children==nil`) UNIONs the
+  group's members with the inline members (inline precedence + order, group
+  additions deduped), while a scalar leaf keeps the OVERRIDE behavior and an
+  unmodeled leaf falls back to override (safe, non-regressing). Reworked
+  `mergeNodes` to thread the from-root `ancestorPath` (already built by
+  `expandGroupsRecursive`), added `isLeafListSchema` (walks `setSchema` via the
+  existing `resolveSchemaChild` + `consumeNodeKeys` helpers to classify the
+  leaf), `leafListPeer` (finds the same-key inline node in either shape),
+  `mergeLeafListInto` (unions members read via the #2419 `firewallMatchValues`
+  SSOT, preserving the dst node's shape → exactly ONE node), and `appendPath`
+  (alias-safe ancestorPath extension). Fixes fable-164 L-8: an inline policy
+  `match application junos-http` inheriting a group's `match application
+  junos-https` now matches BOTH (was silently narrowed to junos-http, defeating
+  a `then deny`). Behavior change is Junos-parity-correct: a config relying on
+  the OLD collapsed-leaf-list override now unions (noted as a migration in the
+  PR + docs). Rewrote the leaf-list test file to assert union across all four
+  shape combinations + flat-set/dedup + the L-8 compile-level union + scalar
+  override; RED-on-revert verified (git show origin/master:ast_groups.go →
+  4 union tests fail). go test ./pkg/config green, go build ./... green,
+  gofmt + go vet clean.
+- **File(s)**: pkg/config/ast_groups.go, pkg/config/apply_groups_leaflist_test.go,
+  docs/config-schema.md, _Log.md
+
 ## 2026-07-06 — #3627 B1a: surface host-inbound admission on REST + gRPC match-policies
 
 - **Timestamp**: 2026-07-06
