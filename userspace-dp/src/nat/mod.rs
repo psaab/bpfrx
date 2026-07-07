@@ -50,6 +50,9 @@ mod tests_counter;
 #[cfg(test)]
 #[path = "tests_dnat_proto.rs"]
 mod tests_dnat_proto;
+#[cfg(test)]
+#[path = "tests_scope.rs"]
+mod tests_scope;
 
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches
