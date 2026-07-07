@@ -1,3 +1,39 @@
+## 2026-07-07 — #4479 routing: skip PBR/FBF band in userspace FIB snapshot ingest
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed opus-172 M-2 (fail-open-adjacent). The userspace route
+  snapshot builder (`buildRouteSnapshots`) mirrors kernel ip rules whose Dst
+  maps to a routing-instance table into per-prefix `next-table` leaks so the
+  userspace FIB can cross-reference VRF tables. It applied NO priority filter,
+  so a policy-based-routing / filter-based-forwarding (FBF) rule in the PBR
+  band (31000-31999) — which carries Src/Tos/IPProto/Sport/Dport SELECTORS in
+  addition to a Dst — was ingested as a BARE dst-only NextTable leak, dropping
+  every selector and widening a constrained, source-scoped steer into an
+  unconditional VRF leak (the userspace twin of the #3730 kernel over-steer).
+  Added a PBR-band skip in the ingest loop: rules in
+  `[config.PBRRulePriorityBase, +config.PBRRuleWindow)` are left out of the
+  userspace FIB (fail-CLOSED — the kernel still applies the real,
+  fully-qualified PBR rule; the snapshot just does not wrongly widen it). The
+  next-table (100-199, priority 0 in tests) and rib-group per-prefix import
+  (30000-30999) leak bands carry a pure per-prefix Dst with no selectors and
+  are still ingested — no regression to inter-VRF leaking. Moved the PBR band
+  constants to `pkg/config` (`PBRRulePriorityBase`, `PBRRuleWindow`) as the
+  SSOT so the install cap (`pkg/routing` `pbrRulePriority`/`maxPBRRules`) and
+  the snapshot skip cannot drift.
+- **Validation**: RED-on-revert test `TestBuildRouteSnapshotsSkipsPBRBandRule`
+  (PBR-band rule with Src+Sport+Dst NOT ingested — fails RED when the skip is
+  removed) plus no-regression `TestBuildRouteSnapshotsIngestsRouteLeakBandRule`
+  (next-table-band rule still ingested — stays green on revert). Existing
+  #3768 / #3876 ingest tests still pass. `go test ./pkg/routing/...
+  ./pkg/dataplane/userspace/... ./pkg/config/...` green; `go build ./...`;
+  gofmt + vet clean.
+- **File(s)**: `pkg/dataplane/userspace/routes.go` (PBR-band skip in the
+  ip-rule ingest loop), `pkg/config/types_system.go` (`PBRRulePriorityBase` /
+  `PBRRuleWindow` SSOT constants), `pkg/routing/rules.go` (`pbrRulePriority` /
+  `maxPBRRules` aliased to the config SSOT),
+  `pkg/dataplane/userspace/routes_pbr_priority_4479_test.go` (new RED-on-revert
+  + no-regression tests), `pkg/routing/README.md` (userspace-snapshot skip note
+  under the PBR band bullet).
 ## 2026-07-07 — #4476 configstore: idle-lease reaper for the config lock
 
 - **Timestamp**: 2026-07-07

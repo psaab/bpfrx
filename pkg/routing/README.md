@@ -135,6 +135,20 @@ delegate to the owning domain. Exported types:
   and the userspace filter path still enforces the term exactly. The
   degraded error is returned to the daemon (`daemon_apply.go` step 3d) and
   logged; the buildable rules are still installed.
+  **Userspace FIB snapshot skips this band (#4479).** The userspace
+  route-snapshot builder (`buildRouteSnapshots`,
+  `pkg/dataplane/userspace/routes.go`) mirrors kernel ip rules whose Dst maps
+  to a routing-instance table into per-prefix `next-table` leaks so the
+  userspace FIB can cross-reference VRF tables. A PBR rule's Dst also maps to a
+  routing-instance table, but the rule carries selectors (`Src`, DSCP,
+  protocol, `Sport`/`Dport`) the synthetic `NextTable` snapshot cannot express.
+  Ingesting it would drop those selectors and widen the FBF steer into a
+  dst-only VRF leak — the userspace twin of the #3730 over-steer. The builder
+  therefore SKIPS any rule in `[PBRRulePriorityBase, +PBRRuleWindow)` and
+  fails closed: the userspace FIB simply omits the leak while the kernel keeps
+  applying the real, fully-qualified rule. `PBRRulePriorityBase` /
+  `PBRRuleWindow` are the SSOT in `pkg/config`, shared by the install cap
+  (`maxPBRRules`) here and the snapshot skip there so the two cannot drift.
 - `33000–33099`: rib-group inter-VRF leaking (`from all lookup
   <table>`). `ribGroupManager.Apply` only installs a leak rule when an
   instance's `interface-routes` rib-group imports a rib that resolves to

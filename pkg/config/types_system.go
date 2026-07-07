@@ -852,6 +852,25 @@ const (
 	// ProbeRulePriorityBase is the first ip-rule priority of the
 	// probe-pin band (50-99).
 	ProbeRulePriorityBase = 50
+	// PBRRulePriorityBase is the first ip-rule priority of the
+	// policy-based-routing / filter-based-forwarding (FBF) band
+	// (31000-31999): firewall-filter `then routing-instance` actions
+	// installed by pkg/routing's pbrManager. These rules carry match
+	// SELECTORS (source/dest address, DSCP, protocol, source/dest port)
+	// in addition to a Dst, so — unlike the pure per-prefix next-table /
+	// rib-group leak bands — they MUST NOT be mirrored into the userspace
+	// next-table FIB snapshot as a bare dst-only leak (that drops the
+	// selectors and re-opens the #3730 over-steer; see #4479 and
+	// pkg/dataplane/userspace/routes.go buildRouteSnapshots). Both
+	// pkg/routing (install side) and pkg/dataplane/userspace (snapshot
+	// ingest side) consume these, so they live here as the single source
+	// of truth alongside ProbeRulePriorityBase.
+	PBRRulePriorityBase = 31000
+	// PBRRuleWindow is the size of the PBR band; the band is
+	// [PBRRulePriorityBase, PBRRulePriorityBase+PBRRuleWindow) = 31000-31999.
+	// It also bounds the number of PBR ip rules the applier installs
+	// (pkg/routing maxPBRRules) and the priority window clear() scans.
+	PBRRuleWindow = 1000
 )
 
 // RPMTest defines a test within an RPM probe.
