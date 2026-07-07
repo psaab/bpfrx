@@ -324,6 +324,91 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	return out
 }
 
+// UnzonedHostInboundZoneLabel is the sentinel zone label under which the kernel
+// host-inbound catch-all deny for firewall-local addresses on interfaces
+// assigned to NO security zone is counted (#4420 HI-2). It reuses the reserved
+// Junos self-traffic context token "junos-host": that token can NEVER name an
+// operator-defined security zone (validateReservedZoneNamesStrict rejects it),
+// so the nft named-counter object it yields (nftables.HostInboundDenyCounterName)
+// can never collide with a real per-zone deny counter, and the #3361 scraper
+// (ParseHostInboundDenyCounterName) recovers a stable, self-explanatory
+// zone="junos-host" label for these "traffic to the host with no source zone"
+// host-inbound drops.
+const UnzonedHostInboundZoneLabel = "junos-host"
+
+// BuildUnzonedHostInboundAddrs returns the firewall-local host addresses (bare
+// IPs, prefix stripped, split by family) of interfaces that carry an address but
+// are assigned to NO security zone (#4420 HI-2).
+//
+// xpfd applies an interface's configured / leased address regardless of zone
+// membership (pkg/dataplane/compiler_iface.go builds the networkd managed set
+// from cfg.Interfaces, not from zones), yet BuildZoneHostInboundViews scopes the
+// kernel host-inbound default-deny ONLY to ZONED addresses. The kernel
+// `xpf_hostinbound` chain runs with `policy accept`, so host-bound traffic to an
+// addressed-but-unzoned interface falls through to accept — the host stack is
+// exposed on it with no host-inbound admission. That is a fail-open, and a
+// deviation from Junos, where an interface not in a security zone passes no
+// flow / host-inbound traffic at all. This builder collects those addresses so
+// the daemon can emit a catch-all DROP scoping them, restoring the Junos
+// fail-closed posture and mirroring the #3405 per-zone default-deny.
+//
+// Scope / safety:
+//   - Only meaningful when the operator uses the zone model at all (>= 1 zone):
+//     a zone-less bootstrap / degenerate config is left untouched (nil), so this
+//     never turns a no-zones box into deny-all host-inbound.
+//   - Management / cluster-control LIFELINE interfaces (fxp0 / em0 / fab*, plus
+//     the configured control / fabric links) are excluded exactly as the zone
+//     path excludes them, so the deny can never strand management or break HA.
+//   - Addresses already scoped by a zone view are subtracted, so a (mis)config
+//     placing one firewall-local address on both a zoned and an unzoned
+//     interface never yields a duplicate / conflicting rule for the same daddr.
+//   - Unzoned interfaces are NOT AF_XDP-bound (only zoned dataplane interfaces
+//     get the shim), so their host-bound traffic is delivered entirely through
+//     the kernel; the kernel nft deny is the sole and sufficient enforcement
+//     point and no userspace-dp (AF_XDP) change is required.
+func BuildUnzonedHostInboundAddrs(cfg *config.Config) (v4, v6 []string) {
+	if cfg == nil || len(cfg.Security.Zones) == 0 || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil, nil
+	}
+	lifelines := hostInboundLifelineSet(cfg)
+	// Addresses already covered by a zone deny — exclude so the unzoned catch-all
+	// never duplicates or conflicts with a zone rule for the same daddr.
+	zoned := map[string]bool{}
+	for _, view := range BuildZoneHostInboundViews(cfg) {
+		for _, a := range view.V4Addrs {
+			zoned[a] = true
+		}
+		for _, a := range view.V6Addrs {
+			zoned[a] = true
+		}
+	}
+	seen4 := map[string]bool{}
+	seen6 := map[string]bool{}
+	for _, snap := range buildInterfaceSnapshots(cfg) {
+		if snap.Zone != "" || hostInboundLifelineInterface(snap.Name, lifelines) {
+			continue
+		}
+		for _, a := range snap.Addresses {
+			host := hostIPFromCIDR(a.Address)
+			if host == "" || zoned[host] {
+				continue
+			}
+			if strings.Contains(host, ":") {
+				if !seen6[host] {
+					seen6[host] = true
+					v6 = append(v6, host)
+				}
+			} else if !seen4[host] {
+				seen4[host] = true
+				v4 = append(v4, host)
+			}
+		}
+	}
+	sort.Strings(v4)
+	sort.Strings(v6)
+	return v4, v6
+}
+
 // AddresslessEnforcingZone names a configured host-inbound-ENFORCING security
 // zone that currently resolves NO firewall-local address across its non-lifeline
 // interfaces (#3698). Such a zone contributes nothing to the kernel-nft

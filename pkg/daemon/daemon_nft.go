@@ -241,6 +241,16 @@ func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string
 // nft failure cannot brick startup; the next clean commit re-renders.
 func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)
+	// #4420 HI-2: firewall-local addresses on interfaces assigned to NO security
+	// zone. xpfd applies an interface's address regardless of zone membership,
+	// but the per-zone views above scope the default-deny to ZONED addresses
+	// only, so host-bound traffic to an addressed-but-unzoned interface would
+	// fall through the chain's `policy accept` and reach the host stack with no
+	// host-inbound admission (fail-open; Junos passes no traffic on an unzoned
+	// interface). These get their own catch-all DROP below. Lifelines are
+	// excluded and zoned addresses are subtracted by the builder, so this can
+	// never strand management or conflict with a zone rule.
+	unzonedV4, unzonedV6 := dpuserspace.BuildUnzonedHostInboundAddrs(cfg)
 	// #3698: surface the transient fail-open admit window. A configured
 	// host-inbound-enforcing zone whose non-lifeline interfaces have no
 	// resolvable address yet (DHCP WAN before its first lease, backup node before
@@ -265,25 +275,27 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// peer-synced load can slip one through, and it is NOT self-healing — so log
 	// the state transition and export it as xpf_host_inbound_ambiguous_addresses.
 	d.logHostInboundAmbiguousTransitions(cfg)
-	if !hostInboundHasEnforceableView(views) {
-		// No host-inbound-configured zone with a resolvable address — nothing to
-		// enforce. Remove any stale table. nftDeleteTable is idempotent (an
-		// add-then-delete payload, so no error when the table is absent — the
-		// common case), so a non-nil error here is a REAL teardown failure that
-		// left a stale deny in the kernel: surface it so the commit fails closed
-		// rather than reporting that host-inbound was relaxed when it was not.
+	if !hostInboundHasEnforceableView(views) && len(unzonedV4) == 0 && len(unzonedV6) == 0 {
+		// No host-inbound-configured zone with a resolvable address AND no
+		// addressed-but-unzoned interface (#4420 HI-2) — nothing to enforce.
+		// Remove any stale table. nftDeleteTable is idempotent (an add-then-delete
+		// payload, so no error when the table is absent — the common case), so a
+		// non-nil error here is a REAL teardown failure that left a stale deny in
+		// the kernel: surface it so the commit fails closed rather than reporting
+		// that host-inbound was relaxed when it was not.
 		if out, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
 			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
 			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
 		}
 		return nil
 	}
-	nftConf := buildHostInboundFilterPayload(views)
+	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6)
 	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
-	slog.Info("host-inbound filter applied", "zones", len(views))
+	slog.Info("host-inbound filter applied", "zones", len(views),
+		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6))
 	return nil
 }
 
@@ -447,7 +459,7 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     the table body and scraped per zone/family into the
 //     xpf_host_inbound_kernel_denies_total metric (#3361) — distinct from the
 //     userspace-dp xpf_host_inbound_denies_total path (#3326).
-func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) string {
+func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string) string {
 	// Pre-pass: collect the named DROP counters the chain will reference, so they
 	// can be declared at the top of the table body BEFORE the chain. A counter is
 	// emitted exactly when emitHostInboundZone emits a catch-all drop
@@ -482,6 +494,15 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 		if hostInboundEmitsDrop(v, v.V6Addrs) {
 			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip6"))
 		}
+	}
+	// #4420 HI-2: the addressed-but-unzoned catch-all DROP references its own
+	// named counter under the reserved junos-host sentinel label (declared here
+	// exactly once, matching the per-zone declaration contract above).
+	if len(unzonedV4) > 0 {
+		addCounter(xnft.HostInboundDenyCounterName(dpuserspace.UnzonedHostInboundZoneLabel, "ip"))
+	}
+	if len(unzonedV6) > 0 {
+		addCounter(xnft.HostInboundDenyCounterName(dpuserspace.UnzonedHostInboundZoneLabel, "ip6"))
 	}
 
 	var rules []string
@@ -533,9 +554,31 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView) stri
 		emitHostInboundZone(&rules, v, "ip", v.V4Addrs)
 		emitHostInboundZone(&rules, v, "ip6", v.V6Addrs)
 	}
+	// #4420 HI-2: catch-all DROP for firewall-local addresses on interfaces in NO
+	// security zone. Emitted AFTER the per-zone rules and the global
+	// established / ESP-AH / ND / PMTUD accepts, so those still admit their
+	// traffic on an unzoned interface (a decrypted host-terminated tunnel, ND,
+	// PMTUD) while every other host-bound service/protocol is denied — the Junos
+	// fail-closed posture for an interface with no zone. The address set is
+	// already lifeline-excluded and zone-subtracted by BuildUnzonedHostInboundAddrs.
+	emitUnzonedHostInboundDeny(&rules, "ip", unzonedV4)
+	emitUnzonedHostInboundDeny(&rules, "ip6", unzonedV6)
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
 	return strings.Join(rules, "\n") + "\n"
+}
+
+// emitUnzonedHostInboundDeny appends the #4420 HI-2 catch-all DROP for the given
+// family's addressed-but-unzoned firewall-local addresses. It is a pure
+// destination-scoped silent drop (Junos default-deny to the host) counted under
+// the reserved junos-host sentinel label, so the #3361 kernel-deny scraper picks
+// it up as zone="junos-host". No-op when the family has no unzoned address.
+func emitUnzonedHostInboundDeny(rules *[]string, family string, addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+	cn := xnft.HostInboundDenyCounterName(dpuserspace.UnzonedHostInboundZoneLabel, family)
+	*rules = append(*rules, "    "+family+" daddr "+nftAddrSet(addrs)+" counter name \""+cn+"\" drop")
 }
 
 // hostInboundEmitsDrop reports whether emitHostInboundZone will emit a catch-all
