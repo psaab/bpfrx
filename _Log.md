@@ -37972,3 +37972,39 @@ top.
 - **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/engine_4423_test.go,
   pkg/config/ast_edit.go, pkg/config/compiler_services.go,
   pkg/config/event_options_4423_test.go, pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 eventengine — review follow-up (MERGE-NEEDS-MINOR). Fixed a
+  BLOCKING regression the M9 change introduced + a bonus map-prune, rebased onto
+  current master (#4431 nat-tests).
+  - **M9 regression (container-miss delete aborted the batch) — FIXED.** The M9
+    change switched `applyOnce`'s tolerated-missing-delete carve-out from
+    `strings.Contains(err.Error(), "path not found")` to
+    `errors.Is(err, config.ErrPathNotFound)`, but I had wrapped only THREE of the
+    four not-found returns reachable from `DeletePath`. The fourth —
+    `deletePath` intermediate-container miss (ast_edit.go:530,
+    `"path not found: container %q does not exist"`) — fires for `delete <subtree>`
+    when the parent container is not configured (the most common defensive
+    remediation shape, e.g. `delete system services ssh` /
+    `delete routing-options static route 0.0.0.0/0`). The old substring match
+    tolerated it; `errors.Is` returned false → the whole batch aborted. Wrapped
+    it with `%w` + `ErrPathNotFound` (message text preserved). The 3 sibling
+    "container does not exist"/"no node matching"/"no member" returns at 625/637/
+    801 are in the DEACTIVATE/ACTIVATE helpers (`setInactiveAtPath`,
+    `markMatchingNodeInactive`, `markMultiLeafMembersInactive`), NOT reachable
+    from `DeletePath` and never invoked by `applyOnce` — correctly left
+    unwrapped.
+  - RED-on-revert: `TestDeletePathContainerMissWrapsErrPathNotFound` (config —
+    errors.Is false on unwrap) + `TestBatchContainerMissDeleteIsTolerated`
+    (engine — the batch aborts / `Committed` never reached, remediation rejected
+    with the container-miss error, on unwrap). Both verified RED.
+  - **Bonus (M11 map prune) — done.** `Apply` now drops `invalidWarnAt` entries
+    for policies no longer present (bounded to the live policy set). Lock order
+    matches the evaluate path (e.mu already held → invalidWarnMu leaf lock).
+  - Rebased onto origin/master (`adedbeed3`) — clean merge (master only touched
+    userspace-dp nat tests). Validation: `go test ./pkg/eventengine/...
+    ./pkg/config/... ./pkg/configstore/...` green (incl. -race on eventengine);
+    `go build ./...`; gofmt/vet clean on touched files.
+- **File(s)**: pkg/config/ast_edit.go, pkg/config/event_options_4423_test.go,
+  pkg/eventengine/engine.go, pkg/eventengine/engine_4423_test.go,
+  pkg/eventengine/README.md, _Log.md

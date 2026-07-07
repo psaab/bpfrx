@@ -33,6 +33,35 @@ func TestDeletePathWrapsErrPathNotFound(t *testing.T) {
 	}
 }
 
+// #4423 M9 (regression): a delete whose INTERMEDIATE container is absent (more
+// tokens remain past a schema container that is not configured) is the fourth
+// not-found site in deletePath — distinct from the leaf-miss (removeMatchingNode)
+// and member-miss (removeMultiLeafMembers) the other tests cover. It is the most
+// common defensive-remediation shape (`delete <subtree>` when the parent is not
+// configured) and MUST wrap ErrPathNotFound, or applyOnce's errors.Is tolerance
+// aborts the batch.
+func TestDeletePathContainerMissWrapsErrPathNotFound(t *testing.T) {
+	tree := &ConfigTree{}
+	set, err := ParseSetCommand("set system host-name base")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := tree.SetPath(set); err != nil {
+		t.Fatalf("setpath: %v", err)
+	}
+	// routing-options is not configured: an absent intermediate container.
+	err = tree.DeletePath([]string{"routing-options", "static", "route", "0.0.0.0/0"})
+	if err == nil {
+		t.Fatal("deleting under an absent container should error")
+	}
+	if !errors.Is(err, ErrPathNotFound) {
+		t.Fatalf("container-miss delete error %v does not wrap ErrPathNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected the container-miss return, got %q", err.Error())
+	}
+}
+
 // #4423 M9: a member-delete that names an absent value of a multi-leaf also
 // wraps ErrPathNotFound.
 func TestDeletePathMissingMemberWrapsErrPathNotFound(t *testing.T) {

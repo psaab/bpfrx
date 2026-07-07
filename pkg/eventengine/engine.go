@@ -364,6 +364,20 @@ func (e *Engine) Apply(policies []*config.EventPolicy) {
 	e.runtime = nextRuntime
 	e.semRev = nextRev
 
+	// #4423 (review follow-up): drop the per-policy invalid-warning throttle
+	// entries for policies no longer present, so the map stays bounded to the
+	// live policy set instead of accumulating a stamp per name ever seen. The
+	// map is config-name-bounded either way; this keeps it tidy across churn.
+	// Lock order matches the evaluate path (e.mu already held, then
+	// invalidWarnMu — a leaf lock never held while acquiring e.mu).
+	e.invalidWarnMu.Lock()
+	for name := range e.invalidWarnAt {
+		if _, ok := nextRev[name]; !ok {
+			delete(e.invalidWarnAt, name)
+		}
+	}
+	e.invalidWarnMu.Unlock()
+
 	e.regexCache = make(map[string]*regexp.Regexp)
 	for _, pol := range policies {
 		if pol == nil {

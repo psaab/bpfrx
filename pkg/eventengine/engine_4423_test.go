@@ -239,6 +239,43 @@ func TestEventIndexRoutingAndDedup(t *testing.T) {
 	}
 }
 
+// #4423 M9 (regression): a change-configuration batch whose `delete` targets a
+// subtree under an ABSENT intermediate container must TOLERATE the missing
+// delete (Junos semantics) and still commit the rest — not abort. This is the
+// deletePath container-miss shape (the most common defensive remediation:
+// `delete <subtree>` when the parent is not configured). Before the line-521
+// ErrPathNotFound wrap, applyOnce's errors.Is check returned false for this
+// shape and the whole batch aborted, so the trailing valid set never applied.
+func TestBatchContainerMissDeleteIsTolerated(t *testing.T) {
+	s := newStore(t)
+	pol := &config.EventPolicy{
+		Name:   "p",
+		Events: []string{"ping_test_failed"},
+		ThenCommands: []string{
+			// routing-options is not configured -> container-miss, must be tolerated.
+			"delete routing-options static route 0.0.0.0/0",
+			// A valid set that only commits if the batch was NOT aborted.
+			"set system domain-name applied",
+		},
+	}
+	e := New(s, nil) // nil commitFn: store.Commit path
+	defer e.Close()
+	e.Apply([]*config.EventPolicy{pol})
+
+	e.HandleEvent(eventFor("ping_test_failed"))
+
+	waitFor(t, "committed counter", func() bool { return e.Stats().Committed >= 1 })
+
+	active := s.ActiveConfig()
+	if active.System.DomainName != "applied" {
+		t.Fatalf("domain-name=%q; the batch must COMMIT despite the tolerated "+
+			"container-miss delete (M9 regression)", active.System.DomainName)
+	}
+	if got := e.Stats().Rejected; got != 0 {
+		t.Fatalf("Rejected=%d; a tolerated container-miss delete must not reject the batch", got)
+	}
+}
+
 // capturingHandler is a minimal slog.Handler that reports the "policy" attribute
 // of WARN records to a callback, for the M11 throttle test.
 type capturingHandler struct {

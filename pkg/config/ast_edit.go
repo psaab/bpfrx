@@ -518,7 +518,16 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 		}
 	}
 
-	return fmt.Errorf("path not found: container %q does not exist", strings.Join(nodeKeys, " "))
+	// #4423 M9: wrap ErrPathNotFound here too. This return fires when an
+	// INTERMEDIATE container in the delete path is absent (more tokens remain
+	// past a schema-matched container that is not configured) — the most common
+	// defensive-remediation shape, e.g. `delete system services ssh` when
+	// `system services` is not configured. The message text still starts with
+	// "path not found: ...", but the tolerated-missing-delete carve-out in the
+	// event-options batch now matches with errors.Is, so this MUST wrap the
+	// sentinel or the container-miss delete aborts the batch (the exact
+	// regression M9 exists to prevent).
+	return fmt.Errorf("%w: container %q does not exist", ErrPathNotFound, strings.Join(nodeKeys, " "))
 }
 
 // DeactivatePath marks the node at the given path inactive (#2008 H1),

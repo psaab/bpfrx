@@ -318,8 +318,16 @@ dispositions (`gh issue view 4423`):
   `config.ErrPathNotFound` sentinel (message text unchanged), and the
   tolerated-missing-delete carve-out matches it with `errors.Is` instead of a
   substring match — a future error reword can no longer silently turn a
-  tolerated missing-delete into a batch-aborting reject. Locked by
-  `TestDeletePathWrapsErrPathNotFound` / `...MissingMember...`.
+  tolerated missing-delete into a batch-aborting reject. ALL FOUR of
+  `deletePath`'s not-found returns wrap the sentinel — the top-of-recursion
+  miss, the **intermediate-container miss** (`delete <subtree>` when the parent
+  container is not configured — the most common defensive-remediation shape),
+  the leaf-miss (`removeMatchingNode`), and the member-miss
+  (`removeMultiLeafMembers`) — so every shape the old `strings.Contains("path
+  not found")` tolerated stays tolerated. Locked by
+  `TestDeletePathWrapsErrPathNotFound`, `...ContainerMiss...`,
+  `...MissingMember...`, and the engine-level
+  `TestBatchContainerMissDeleteIsTolerated`.
 - **Regex cache back-fill (M10).** A pattern that reaches `attributesMatch`
   without an `Apply`-time cache entry (legacy lenient-load path) is compiled
   once and cached, not recompiled per event. Locked by
