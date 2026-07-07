@@ -260,6 +260,42 @@ ESTABLISHED already, so the gate is a no-op there); cross-companion close
 on a cluster is carried by the peer's Close-delta session-sync rather than
 re-derived locally.
 
+**Idle-companion retention (#4380).** The #4109 propagation above mirrors
+TCP *close/promote* state, but nothing propagated plain *idle* activity, and
+for UDP there is no propagation at all. Because forward and reverse are two
+independent entries that age independently — the read path re-stamps
+`last_seen_ns` only on the ONE entry a packet's wire tuple resolves
+(`touch` / `touch_if_stale` / `lookup`), and `account_packet` folds both
+directions' COUNTERS onto the forward entry WITHOUT touching either
+`last_seen_ns` — a flow active on only one direction (a one-way UDP feed, or
+a download whose forward ACKs have gone quiet) would reap its quiet half
+mid-flow. That left a half-open session and, under NAT, let a later packet
+re-create a session with a DIFFERENT translation while the surviving half
+still mapped the old one. Junos measures a session's idle time from the last
+activity in EITHER direction, so the quiet half must survive while the other
+is active.
+
+`SessionTable::companion_keeps_alive` (`expire.rs`, called from the Case-3
+idle-crossed arm just before `remove_entry`) enforces this off the hot path:
+when an entry crosses its idle timeout it probes its forward↔reverse companion
+(recovered by `reverse_session_key` on the entry's OWN key + nat, its own
+inverse, exactly as `account_packet` hops reverse↔forward). If the companion
+is itself still within its idle window (the exact complement of the wheel's
+strict-`>` expiry test), this half is re-stamped from the companion's REAL
+`last_seen_ns` and `rebucket_alive_entry`'d instead of removed, and the
+`kept_alive_by_companion` `WheelPopStats` counter is bumped. Bounded and
+terminating: the re-stamp copies the companion's real timestamp (never
+`now_ns`), so once BOTH halves stop receiving packets their timestamps freeze,
+both cross the timeout, the probe fails, and the flow reaps within one timeout
+window of its last activity in either direction — so the HA Close delta +
+RT_FLOW harvest fire only when the WHOLE flow goes idle. A single-entry flow
+(no companion — e.g. a `FabricRedirect` half with no local reverse, or a half
+already independently reaped) is a no-op reap, the same fail-open posture as
+`account_packet`'s reverse hop. The cost is one extra `key_to_handle` probe
+per idle-crossed entry, in the GC pass only — the per-packet forwarding path is
+unchanged (the alternative, refreshing the companion on every reverse packet,
+would add a hot-path re-bucket).
+
 **Seconds→nanoseconds bound (#2441).** Configured TCP/UDP/ICMP timeouts
 arrive in the snapshot as `u64` seconds and are converted in
 `SessionTimeouts::from_seconds`. The conversion uses `checked_mul` and

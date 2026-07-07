@@ -39646,3 +39646,7 @@ top.
   pkg/dataplane/userspace/manager_ha.go,
   pkg/dataplane/userspace/manager_test.go,
   docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4380 — symmetric forward↔reverse session idle timer (Junos single-session semantics). Forward and reverse are two independent conntrack entries that aged independently (touch/touch_if_stale/lookup re-stamp only the entry a packet's wire tuple resolves; account_packet folds counters both ways onto the forward entry but never re-stamps last_seen_ns; propagate_tcp_state_to_companion only mirrors TCP close/promote, no idle path). A flow active on only one direction reaped its quiet half mid-flow → half-open session + NAT-remap on re-create. Fix: GC-time companion probe `companion_keeps_alive` (expire.rs) before remove_entry — if the forward↔reverse companion is still within its idle window, re-stamp this half from the companion's real last_seen and rebucket instead of removing; a genuinely-idle flow (both quiet) still reaps. Off the hot path (one extra key_to_handle probe per idle-crossed entry, GC pass only). Added `WheelPopStats.kept_alive_by_companion` counter + 3 tests (RED-on-revert reverse-only keep-alive, both-idle-expire, symmetric-unaffected). FULL cargo serial green (main bin 3680/0, session::tests 160/0, aux 54/8/22/1).
+- **File(s)**: userspace-dp/src/session/expire.rs, userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md, _Log.md

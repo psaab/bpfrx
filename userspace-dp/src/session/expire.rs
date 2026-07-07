@@ -178,6 +178,12 @@ impl SessionTable {
                     let e_expires_after_ns = entry.expires_after_ns;
                     let e_first_held_ns = entry.first_held_ns;
                     let e_seen_rg_epoch = entry.seen_rg_epoch;
+                    // #4380: the entry's OWN nat decision recovers its
+                    // forward↔reverse companion key (`reverse_session_key`,
+                    // its own inverse) for the idle-companion retention check
+                    // just below. Snapshot it (Copy) before the immutable
+                    // `entry` borrow is dropped.
+                    let e_nat = entry.decision.nat;
                     if let Some(ha) = ha {
                         match self.standby_gate_decision(
                             ha,
@@ -265,6 +271,30 @@ impl SessionTable {
                                 // fall through to remove_entry below
                             }
                         }
+                    }
+                    // #4380: Junos single-session idle semantics. Forward and
+                    // reverse are two independent entries that age
+                    // independently — the read path re-stamps `last_seen_ns`
+                    // only on the ONE entry a packet's wire tuple resolves
+                    // (touch/touch_if_stale/lookup), and `account_packet` folds
+                    // both directions' COUNTERS onto the forward entry without
+                    // touching either `last_seen_ns`. So a flow active on only
+                    // one direction (a one-way UDP feed, or a download whose
+                    // forward ACKs have gone quiet) would reap its quiet half
+                    // mid-flow — leaving a half-open session and, under NAT, a
+                    // later packet re-creating a session with a DIFFERENT
+                    // translation while the surviving half still maps the old
+                    // one. Before reaping this idle-crossed half, probe its
+                    // companion: if the companion is itself still within its
+                    // idle window (the whole flow is active), re-stamp THIS
+                    // half from the companion and keep both alive, so the HA
+                    // Close delta + RT_FLOW harvest fire only when the WHOLE
+                    // flow goes idle. Off the hot path: one extra
+                    // `key_to_handle` probe per idle-crossed entry, in the GC
+                    // pass only.
+                    if self.companion_keeps_alive(&key, e_nat, now_ns) {
+                        self.last_pop_stats.kept_alive_by_companion += 1;
+                        continue;
                     }
                     if let Some(removed) = self.remove_entry(&key) {
                         self.last_pop_stats.expired += 1;
@@ -405,6 +435,64 @@ impl SessionTable {
             scheduled_tick: new_target_tick,
         });
         self.last_pop_stats.re_bucketed += 1;
+    }
+
+    /// #4380: keep an idle-crossed entry alive if its forward↔reverse
+    /// companion is still active, implementing Junos single-session idle
+    /// semantics (idle time is measured from the last activity in EITHER
+    /// direction). Returns `true` when the entry was kept (re-stamped +
+    /// re-bucketed); the caller then skips `remove_entry`.
+    ///
+    /// The companion key is recovered exactly as `account_packet` and
+    /// `propagate_tcp_state_to_companion` hop reverse↔forward:
+    /// `reverse_session_key(key, entry_nat)` where `key` is the entry's OWN
+    /// canonical key and `entry_nat` its OWN nat decision (the transform is
+    /// its own inverse given the reversed decision, so it works from either
+    /// half). "Still active" uses the SAME predicate the wheel applies for
+    /// expiry (`now - last_seen <= expires_after`, the exact complement of the
+    /// Case-3 strict-`>` expiry test) so a genuinely idle session — both halves
+    /// quiet past the timeout — still reaps: when this half crosses, the
+    /// companion has crossed too, the probe fails, and the caller removes.
+    ///
+    /// This only DELAYS a reap; it never manufactures freshness. The re-stamp
+    /// copies the companion's REAL `last_seen_ns` (not `now_ns`), so once the
+    /// companion also stops receiving packets both halves' timestamps freeze,
+    /// both cross the timeout, and the flow reaps within one timeout window of
+    /// its last activity in either direction (bounded, terminating).
+    fn companion_keeps_alive(
+        &mut self,
+        key: &SessionKey,
+        entry_nat: NatDecision,
+        now_ns: u64,
+    ) -> bool {
+        let companion_key = reverse_session_key(key, entry_nat);
+        let companion_last_seen = match self.entry_by_key(&companion_key) {
+            Some(companion) => {
+                // Companion still within ITS idle window (complement of the
+                // Case-3 `> expires_after` expiry test) → the whole flow is
+                // active; keep this half. Otherwise fall through: both halves
+                // are idle, this one reaps normally.
+                if now_ns.saturating_sub(companion.last_seen_ns) > companion.expires_after_ns {
+                    return false;
+                }
+                companion.last_seen_ns
+            }
+            // No companion (single-entry flow, e.g. a FabricRedirect half with
+            // no local reverse, or a half already independently reaped) → no
+            // retention; reap normally. Same fail-open posture as
+            // `account_packet`'s reverse hop.
+            None => return false,
+        };
+        // Re-stamp THIS half from the companion's real last activity so the
+        // whole session ages from the last packet in either direction (and the
+        // HA session-sync of `last_seen_ns` carries the true idle to the peer),
+        // then re-bucket so the GC re-examines it at the companion-derived tick.
+        let Some(em) = self.entry_by_key_mut(key) else {
+            return false;
+        };
+        em.last_seen_ns = companion_last_seen;
+        self.rebucket_alive_entry(key, now_ns);
+        true
     }
 
     /// #2120: the standby retention decision for an idle-crossed entry.
