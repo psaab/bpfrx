@@ -43,6 +43,46 @@
 - **File(s)**: pkg/config/compiler_firewall.go,
   pkg/config/compiler_firewall_family_any_prefixlist_4426_test.go,
   docs/config-schema.md, _Log.md
+## 2026-07-06 — #4423 (flow-cache H7/H8/M3/M4/M7): verify-first + docs
+
+- **Timestamp**: 2026-07-06
+- **Action**: Verify-first triage of the codex flow-cache audit sub-items on
+  the flow-cache-hit fast path. Outcome: the two HIGHs are not-material on
+  origin/master and the two MEDs are a deliberate caching approximation /
+  benign no-op, so the fix is documentation + disposition, no behavior change.
+    - **H7 (charges/logs before TTL) — NOT-A-BUG**: already fixed by #3779
+      (origin/master `8b384777d`). In
+      `poll_descriptor/flow_cache_hit.rs` the TTL/hop-limit check
+      (lines 151-179) precedes ALL egress side effects — filter counters
+      (182-198), policy hit counter (210-215), three-color policers
+      (216-220), input/output filter logs (221-259), and the terminal drop
+      (260-263).
+    - **H8 (observed_bytes/active-flow before TTL) — NOT-A-BUG (deliberate)**:
+      `lookup_counted` stamps `last_used_epoch` + `observed_bytes`
+      (`flow_cache.rs:918-919`) at lookup time, before the TTL check. This is
+      the DOCUMENTED design decision at `afxdp/README.md` (#3779 note):
+      `observed_bytes`/active-epoch count the packet as SEEN — flow-activity
+      telemetry, not forwarded-byte accounting. Session byte/packet counters
+      (the forwarded-byte reference) DO sit after the TTL check
+      (`account_packet` at 303-308), matching the slow path.
+    - **M3/M4 (silent DSCP-rewrite failure) — NOT-MATERIAL as framed**:
+      `apply_dscp_rewrite_to_frame` `None` = "frame has no IP DSCP field"
+      (non-IP/ARP or too-short), a benign no-op. `assign_*_dscp_rewrite`
+      stamps the queue rewrite onto all items incl. non-IP frames, so a
+      blanket failure counter would false-positive; the genuine-error subset
+      is unreachable on the pre-parsed TX path. Documented the `None`
+      contract on the function + README rather than adding a misinforming
+      counter.
+    - **M7 (cached filter-log first-packet only) — DOCUMENTED**: the cached
+      input/output filter-log replay is seed-captured (single
+      `FilterLogMatch`); per-packet re-evaluation would defeat the cache and
+      is not justified for a `then log` term. Documented the limitation
+      (task-offered resolution) alongside the #3778 frozen-queue precedent.
+- **File(s)**: userspace-dp/src/afxdp/README.md,
+  userspace-dp/src/afxdp/frame/mod.rs, _Log.md
+- **Validation**: `cargo test --release -- --test-threads=1` (full suite).
+  No dataplane forwarding behavior changed (doc + rustdoc only) — no smoke
+  required.
 
 ## 2026-07-06 — #4399: nat_reverse_index 1:N multimap + validate-on-lookup
 
