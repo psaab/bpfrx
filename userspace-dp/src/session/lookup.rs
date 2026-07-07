@@ -54,10 +54,15 @@ impl SessionTable {
         // #964 Step 1: resolve handle from key. Direct-primary path
         // looks up via key_to_handle; alias path (NAT-translated
         // reverse key) goes via reverse_translated_index.
+        // #4438: reverse_translated_index is a 1:N multimap — walk the bucket
+        // and pick the reverse entry whose translated tuple matches THIS key
+        // (validate-on-lookup) so a translated-key collision no longer resolves
+        // to a displaced/wrong session. The in-borrow alias check below
+        // re-validates the same predicate as a stale-index guard.
         let (handle, via_alias) = match self.key_to_handle.get(key) {
             Some(h) => (*h, false),
-            None => match self.reverse_translated_index.get(key) {
-                Some(h) => (*h, true),
+            None => match self.resolve_reverse_translated_handle(key) {
+                Some(h) => (h, true),
                 None => return None,
             },
         };
@@ -247,22 +252,65 @@ impl SessionTable {
         &self,
         wire_key: &SessionKey,
     ) -> Option<(ForwardSessionMatch, SessionOrigin)> {
-        let handle = *self.forward_wire_index.get(wire_key)?;
-        let record = self.entries.get(handle as usize)?;
-        let entry = &record.entry;
-        if entry.metadata.is_reverse
-            || forward_wire_key(&record.key, entry.decision.nat) != *wire_key
-        {
-            return None;
+        // #4438: `forward_wire_index` is a 1:N multimap — a forward-wire key
+        // collision (interface-mode SNAT with no port translation and the other
+        // non-bijective NAT classes; interface SNAT collapses both the reverse-
+        // wire AND the forward-wire tuples) parks BOTH colliding forward handles
+        // in one bucket. Walk the candidates and return the first whose forward
+        // session actually maps to THIS wire key (validate-on-lookup): the
+        // pre-#4438 single-value map returned only the last-installed handle, so
+        // a displaced session's wire lookup was mis-delivered (hijacked). The
+        // common (bijective / non-colliding) case is a len-1 bucket — one
+        // validate, zero heap (SmallVec inline) — so the pool-mode-SNAT fast
+        // path is unchanged.
+        let bucket = self.forward_wire_index.get(wire_key)?;
+        for &handle in bucket.iter() {
+            let Some(record) = self.entries.get(handle as usize) else {
+                continue;
+            };
+            let entry = &record.entry;
+            if entry.metadata.is_reverse
+                || forward_wire_key(&record.key, entry.decision.nat) != *wire_key
+            {
+                continue;
+            }
+            return Some((
+                ForwardSessionMatch {
+                    key: record.key.clone(),
+                    decision: entry.decision,
+                    metadata: entry.metadata.clone(),
+                },
+                entry.origin,
+            ));
         }
-        Some((
-            ForwardSessionMatch {
-                key: record.key.clone(),
-                decision: entry.decision,
-                metadata: entry.metadata.clone(),
-            },
-            entry.origin,
-        ))
+        None
+    }
+
+    /// #4438: resolve the reverse entry whose translated (alias) tuple equals
+    /// `key` from the 1:N `reverse_translated_index` bucket. A translated-key
+    /// collision (non-bijective NAT: DNAT-to-shared-backend / NAT64 /
+    /// interface-mode SNAT) parks multiple reverse handles under one translated
+    /// key; the pre-#4438 single-value map returned only the last-installed, so
+    /// a displaced reverse session's inbound alias lookup mis-resolved. Validate
+    /// each candidate against the full tuple AND its `is_reverse` flag — the
+    /// same check `lookup_with_origin` re-applies inside its `&mut` borrow as a
+    /// stale-index guard. The common non-colliding case is a len-1 bucket (one
+    /// validate, zero heap), so the fast path is unchanged. Returns the matching
+    /// handle, or `None` when no live reverse entry aliases to `key`.
+    fn resolve_reverse_translated_handle(&self, key: &SessionKey) -> Option<u32> {
+        let bucket = self.reverse_translated_index.get(key)?;
+        for &handle in bucket.iter() {
+            let Some(record) = self.entries.get(handle as usize) else {
+                continue;
+            };
+            let entry = &record.entry;
+            if entry.metadata.is_reverse
+                && translated_session_key(&record.key, entry.decision.nat) == *key
+            {
+                return Some(handle);
+            }
+        }
+        None
     }
 
     pub fn entry_with_origin(

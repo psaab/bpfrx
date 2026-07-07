@@ -38057,3 +38057,32 @@ top.
 - **File(s)**: pkg/config/ast_edit.go, pkg/config/event_options_4423_test.go,
   pkg/eventengine/engine.go, pkg/eventengine/engine_4423_test.go,
   pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4438 — extend the #4399 1:N multimap + validate-on-lookup
+  discipline to the OTHER two NAT session indexes. Verify-first confirmed
+  `forward_wire_index` and `reverse_translated_index` were STILL single-value
+  `SeededKeyMap<u32>` on origin/master (only #4399's `nat_reverse_index` was
+  fixed), so a colliding session still DISPLACED an earlier one → session
+  hijack on the forward-wire / translated-alias path (interface-mode SNAT /
+  DNAT-shared-backend / NAT64 non-bijective classes). Both are now
+  `HashMap<key, SmallVec<[u32; 2]>>` (shared `NatIndexBucket`): install appends
+  + dedups + bumps the shared collision counter (`nat_index_bucket_push`);
+  lookup walks the bucket and validates each candidate against the full tuple
+  (`find_forward_wire_match_with_origin` for the forward-wire tuple,
+  `resolve_reverse_translated_handle` for the translated tuple in
+  `lookup_with_origin`'s alias branch); delete drops the specific handle
+  (`nat_index_bucket_remove`), dropping the key only when the bucket empties.
+  Pool-mode SNAT stays a len-1 inline bucket on every index (zero heap, one
+  validate — fast path unchanged). #4399's `nat_reverse_index_push/remove`
+  methods were folded into the two shared free helpers. Collision telemetry
+  reuses the existing plumbed `nat_reverse_key_collisions` (now aggregates all
+  three indexes — doc updated); two #4399 exact-count assertions updated to the
+  aggregate. 6 new RED-on-revert tests (2 forward-wire + 2 reverse-translated
+  preserve/delete-specific, 2 pool-mode fast-path len-1). Full cargo serial:
+  3736 passed / 0 failed (lib 3651, fairness-eval 54, integration 8+22+1);
+  session subset 167/0, nat subset 613/0. NOTE: dataplane NAT/session change —
+  cluster smoke (test-failover) warranted before merge.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
