@@ -13,78 +13,16 @@ fn refill_scaled(rate_bytes_per_sec: u64, elapsed_ns: u64) -> u128 {
 }
 
 #[inline]
-fn refill_scaled_bits(rate_bits_per_sec: u64, elapsed_ns: u64) -> u128 {
-    u128::from(rate_bits_per_sec) * u128::from(elapsed_ns) / 8
-}
-
-#[inline]
 fn capped_add(tokens: u128, add: u128, cap: u128) -> u128 {
     tokens.saturating_add(add).min(cap)
 }
 
-/// Token-bucket policer state.
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct PolicerState {
-    pub(crate) name: String,
-    /// Refill rate in bits per second.
-    pub(crate) rate_bits_per_sec: u64,
-    /// Maximum bucket size in bytes.
-    pub(crate) burst_bytes: u64,
-    /// Current token count in bytes scaled by `TOKEN_SCALE`.
-    pub(crate) tokens: u128,
-    /// Last refill timestamp (monotonic nanoseconds).
-    pub(crate) last_refill_ns: u64,
-    /// Whether to discard excess traffic (vs. mark).
-    pub(crate) discard_excess: bool,
-    /// Whether the policer has been initialized with the first packet time.
-    initialized: bool,
-}
-
-impl PolicerState {
-    pub(crate) fn new(
-        name: String,
-        bandwidth_bps: u64,
-        burst_bytes: u64,
-        discard_excess: bool,
-    ) -> Self {
-        Self {
-            name,
-            rate_bits_per_sec: bandwidth_bps,
-            burst_bytes,
-            tokens: scaled_bytes(burst_bytes),
-            last_refill_ns: 0,
-            discard_excess,
-            initialized: false,
-        }
-    }
-
-    /// Refill tokens based on elapsed time and try to consume `packet_bytes`.
-    /// Returns true if the packet is within the rate limit (conforming).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn consume(&mut self, now_ns: u64, packet_bytes: u64) -> bool {
-        if !self.initialized {
-            self.initialized = true;
-            self.last_refill_ns = now_ns;
-            self.tokens = scaled_bytes(self.burst_bytes);
-        }
-        // Refill tokens
-        if now_ns > self.last_refill_ns {
-            let elapsed_ns = now_ns - self.last_refill_ns;
-            let refill = refill_scaled_bits(self.rate_bits_per_sec, elapsed_ns);
-            self.tokens = capped_add(self.tokens, refill, scaled_bytes(self.burst_bytes));
-            self.last_refill_ns = now_ns;
-        }
-        // Try to consume
-        let cost = scaled_bytes(packet_bytes);
-        if self.tokens >= cost {
-            self.tokens -= cost;
-            true
-        } else {
-            false
-        }
-    }
-}
+// #4514: the standalone single-rate `PolicerState` token bucket (and its dead
+// `consume`) was removed. Legacy `firewall policer` token buckets are now
+// lowered into the RFC 2697 srTCM `ThreeColorPolicerState` below at compile
+// (see `filter/compiler.rs::build_single_rate_policer_state`), so they share the
+// tested metering, drop-on-exceed, flow-cache handle+replay, and status export
+// path instead of a never-consumed name-keyed map.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PacketColor {

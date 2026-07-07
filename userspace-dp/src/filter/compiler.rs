@@ -62,28 +62,48 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
 ) -> Result<FilterState, SnapshotIntegrityError> {
     let mut state = FilterState::default();
 
-    // Parse legacy token-bucket policers.
-    for snap in policers {
-        state.policers.insert(
-            snap.name.clone(),
-            PolicerState::new(
-                snap.name.clone(),
-                snap.bandwidth_bps,
-                snap.burst_bytes,
-                snap.discard_excess,
-            ),
-        );
-    }
-
     // Parse three-color policers by stable name order. Runtime IDs are
     // name-derived so inserting a lower-sorted policer does not reset
     // unchanged existing runtimes.
     let mut three_color = three_color_policers.iter().collect::<Vec<_>>();
     three_color.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut used_three_color_ids = rustc_hash::FxHashSet::default();
+    let mut used_runtime_ids = rustc_hash::FxHashSet::default();
     for snap in three_color {
-        let id = unique_three_color_policer_runtime_id(&snap.name, &mut used_three_color_ids);
+        let id = unique_three_color_policer_runtime_id(&snap.name, &mut used_runtime_ids);
         let Some(runtime) = parse_three_color_policer(snap, id, previous) else {
+            continue;
+        };
+        state
+            .three_color_policer_by_name
+            .insert(runtime.name.to_string(), runtime.clone());
+        state.three_color_policers.push(runtime);
+    }
+
+    // #4514: lower legacy single-rate `firewall policer` token buckets into the
+    // SAME metered three-color runtime the terms already resolve against, by
+    // name. Before #4514 these policers were parsed into a `state.policers`
+    // map that NOTHING consumed — `PolicerState::consume` had zero non-test
+    // call sites — so a configured `then policer X` (e.g. a DoS-mitigation
+    // rate-limit) was silently UNENFORCED (a fail-open of the rate limit) even
+    // though the capability doc claimed support. A single-rate token bucket
+    // with `then discard` is exactly an srTCM committed bucket (CIR=bandwidth,
+    // CBS=burst) where only in-rate (green) packets pass and everything above
+    // the bucket drops; reusing the three-color runtime gives it metering,
+    // drop-on-exceed, flow-cache handle+replay, and status export for free.
+    // Sorted for the same stable-ID property as the three-color loop.
+    let mut single_rate = policers.iter().collect::<Vec<_>>();
+    single_rate.sort_by(|a, b| a.name.cmp(&b.name));
+    for snap in single_rate {
+        // A three-color policer of the same name already claimed this name and
+        // takes precedence (distinct config stanzas; collision only on drift).
+        if state.three_color_policer_by_name.contains_key(&snap.name) {
+            continue;
+        }
+        let id = unique_runtime_id(
+            single_rate_policer_runtime_id(&snap.name),
+            &mut used_runtime_ids,
+        );
+        let Some(runtime) = parse_single_rate_policer_runtime(snap, id, previous) else {
             continue;
         };
         state
@@ -341,7 +361,14 @@ fn unique_three_color_policer_runtime_id(
     name: &str,
     used_ids: &mut rustc_hash::FxHashSet<u32>,
 ) -> u32 {
-    let mut id = three_color_policer_runtime_id(name);
+    unique_runtime_id(three_color_policer_runtime_id(name), used_ids)
+}
+
+/// Ensure `id` is not already taken in `used_ids`, probing forward (skipping 0)
+/// until a free slot is found, then reserving it. Shared by the three-color and
+/// #4514 single-rate lowering loops so their name-derived runtime IDs never
+/// collide with one another.
+fn unique_runtime_id(mut id: u32, used_ids: &mut rustc_hash::FxHashSet<u32>) -> u32 {
     while !used_ids.insert(id) {
         id = id.wrapping_add(1);
         if id == 0 {
@@ -351,17 +378,101 @@ fn unique_three_color_policer_runtime_id(
     id
 }
 
-pub(crate) fn three_color_policer_runtime_id(name: &str) -> u32 {
+fn fnv_runtime_id(namespace: &[u8], name: &str) -> u32 {
     const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
     const FNV_PRIME: u32 = 0x0100_0193;
-    const NAMESPACE: &[u8] = b"xpf-three-color-policer-v1:";
 
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in NAMESPACE.iter().chain(name.as_bytes()) {
+    for byte in namespace.iter().chain(name.as_bytes()) {
         hash ^= u32::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     if hash == 0 { 1 } else { hash }
+}
+
+pub(crate) fn three_color_policer_runtime_id(name: &str) -> u32 {
+    fnv_runtime_id(b"xpf-three-color-policer-v1:", name)
+}
+
+/// #4514: single-rate policers live in a DISTINCT ID namespace from
+/// three-color policers so a same-named policer of each kind (only reachable via
+/// snapshot drift) cannot alias to one runtime handle.
+fn single_rate_policer_runtime_id(name: &str) -> u32 {
+    fnv_runtime_id(b"xpf-single-rate-policer-v1:", name)
+}
+
+/// #4514: build the metered three-color runtime that enforces a legacy
+/// single-rate `firewall policer`, preserving compatible token/counter state
+/// across snapshot refreshes exactly like `parse_three_color_policer`. Returns
+/// `None` only when the policer has nothing to enforce (a degenerate non-discard
+/// meter-only policer with zero rate/burst — see `build_single_rate_policer_state`).
+fn parse_single_rate_policer_runtime(
+    snap: &PolicerSnapshot,
+    id: u32,
+    previous: Option<&FilterState>,
+) -> Option<Arc<ThreeColorPolicerRuntime>> {
+    let state = match build_single_rate_policer_state(snap) {
+        Some(state) => state,
+        // A `then discard` policer with a degenerate (zero) rate/burst admits no
+        // traffic — fail CLOSED (drop all) rather than leave the rate-limit
+        // silently unenforced, mirroring the three-color unsupported-snapshot
+        // backstop. A degenerate non-discard (meter-only) policer has no action
+        // to enforce, so skip it.
+        None if snap.discard_excess => ThreeColorPolicerState::fail_closed(true),
+        None => return None,
+    };
+    if let Some(previous_runtime) =
+        previous.and_then(|prev| prev.three_color_policer_by_name.get(&snap.name))
+    {
+        if previous_runtime.reusable_for(id, &state) {
+            return Some(Arc::clone(previous_runtime));
+        }
+    }
+    Some(Arc::new(ThreeColorPolicerRuntime::new(
+        id,
+        snap.name.clone(),
+        state,
+    )))
+}
+
+/// #4514: map a legacy single-rate token-bucket policer to an srTCM state.
+///
+/// `bandwidth-limit` is bits/sec (the pre-#4514 `PolicerState` bits/sec
+/// constructor contract); the srTCM committed bucket is bytes/sec, so divide by
+/// 8. The committed bucket (CIR=bandwidth, CBS=burst) IS the single-rate token
+/// bucket. For `then discard`, only in-rate GREEN packets pass — YELLOW and RED
+/// both drop, so the (required, non-zero) excess bucket is irrelevant to the
+/// pass/drop decision and CBS is reused as EBS. `color-blind` is always true: a
+/// single-rate policer has no notion of inherited packet color.
+///
+/// A non-discard policer (`then loss-priority` / `then forwarding-class`) is
+/// METERED but not acted upon — the marking action is not wired here (same
+/// limitation as three-color `then loss-priority`, documented in the module
+/// README). Returns `None` for a zero rate/burst so the caller can fail-closed
+/// (discard) or skip (meter-only).
+fn build_single_rate_policer_state(snap: &PolicerSnapshot) -> Option<ThreeColorPolicerState> {
+    let committed_rate_bytes_per_sec = snap.bandwidth_bps / 8;
+    let burst_bytes = snap.burst_bytes;
+    if committed_rate_bytes_per_sec == 0 || burst_bytes == 0 {
+        return None;
+    }
+    let treatments = if snap.discard_excess {
+        ThreeColorTreatments {
+            green: ColorTreatment::default(),
+            yellow: ColorTreatment::drop(),
+            red: ColorTreatment::drop(),
+        }
+    } else {
+        ThreeColorTreatments::default()
+    };
+    ThreeColorPolicerState::sr_tcm_with_treatments(
+        committed_rate_bytes_per_sec,
+        burst_bytes,
+        burst_bytes,
+        true,
+        treatments,
+    )
+    .ok()
 }
 
 fn build_three_color_policer_state(
