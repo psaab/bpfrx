@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -1308,11 +1309,63 @@ func (d *Daemon) clusterConfig() *config.ClusterConfig {
 	return cfg.Chassis.Cluster
 }
 
+// ipsecSAFingerprint returns a stable, order-independent fingerprint of an
+// active IPsec connection-name set. The empty set maps to the empty string so
+// a never-up node and a torn-down node share the same sentinel (see
+// ipsecSASyncAdvertise).
+func ipsecSAFingerprint(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, "\n")
+}
+
+// ipsecSASyncAdvertise decides whether the primary should advertise the current
+// active IPsec connection-name set to the standby, given the fingerprint of the
+// set it last advertised (lastFP; the empty string means the last advertised
+// set was empty or nothing has been advertised yet). It returns whether to push
+// and the fingerprint to remember for the next tick.
+//
+// #4385: a NON-EMPTY set is advertised every tick — a heartbeat re-push so a
+// freshly reconnected/restarted standby relearns the full set within one
+// interval (this is the ONLY mechanism that seeds a new standby's peer set, so
+// it preserves the pre-#4385 reconnect-safety behavior). An EMPTY set is
+// advertised exactly ONCE, on the transition down from a previously non-empty
+// set — a tunnel was administratively downed or all its SAs were torn down — so
+// the standby CLEARS its stale peer set instead of resurrecting the tunnel on
+// takeover (reinitiateIPsecSAs). A steady empty set, INCLUDING a node that
+// never brought an SA up, is never advertised: no 30s empty-heartbeat churn,
+// and the standby's default peer set is already empty so there is nothing to
+// clear.
+func ipsecSASyncAdvertise(names []string, lastFP string) (push bool, newFP string) {
+	fp := ipsecSAFingerprint(names)
+	if len(names) > 0 {
+		return true, fp
+	}
+	// Empty set: advertise once to clear the standby ONLY if we previously
+	// advertised a non-empty set (downed-but-was-up, not never-up).
+	if lastFP != "" {
+		return true, ""
+	}
+	return false, ""
+}
+
 // syncIPsecSAPeriodic runs on the primary node, periodically syncing active IPsec
-// connection names to the secondary via the session sync channel.
+// connection names to the secondary via the session sync channel. It advertises
+// the current active set every tick when non-empty (heartbeat re-push) and, per
+// #4385, advertises the empty set once when the active set drops to zero so the
+// standby does not resurrect an administratively-downed tunnel on takeover.
 func (d *Daemon) syncIPsecSAPeriodic(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	// lastFP tracks the fingerprint of the last set advertised to the standby
+	// (empty string = last advertised set was empty / nothing advertised yet).
+	// This goroutine is single-instance per comms lifetime (started once in
+	// daemon_ha_sync.go and re-created with a fresh commsCtx only on a
+	// transport-field change), so the local is safe without a lock.
+	var lastFP string
 	for {
 		select {
 		case <-ctx.Done():
@@ -1330,8 +1383,10 @@ func (d *Daemon) syncIPsecSAPeriodic(ctx context.Context) {
 				slog.Debug("cluster: failed to get IPsec connection names", "err", err)
 				continue
 			}
-			if len(names) > 0 && d.sessionSync != nil {
+			push, fp := ipsecSASyncAdvertise(names, lastFP)
+			if push && d.sessionSync != nil {
 				d.sessionSync.QueueIPsecSA(names)
+				lastFP = fp
 			}
 		}
 	}

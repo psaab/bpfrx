@@ -37501,3 +37501,30 @@ top.
 - **File(s)**: userspace-dp/src/session/mod.rs,
   userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
   docs/pr/2134-screen-session-limit-enforce/self-review.md, _Log.md
+
+- **Timestamp**: 2026-07-07T01:54Z
+- **Action**: Fix #4385 — IPsec SA sync never advertised the empty set, so an
+  administratively-downed tunnel (active SA set drops to zero) left the standby
+  holding the last non-empty snapshot; on RG0 takeover `reinitiateIPsecSAs`
+  re-initiated the stale names and resurrected the downed tunnel. Root cause:
+  `syncIPsecSAPeriodic` guarded the push with `if len(names) > 0`, suppressing
+  the drop-to-zero advertisement (the standby overwrites `peerIPsecSAs`
+  wholesale, so it never cleared). Fix: extract the push decision into
+  `ipsecSASyncAdvertise(names, lastFP)` — a NON-EMPTY set is advertised every
+  tick (heartbeat re-push; the only mechanism that seeds a reconnected standby,
+  so reconnect-safety is preserved), an EMPTY set is advertised exactly ONCE on
+  the drop-to-zero transition from a previously non-empty set (standby clears
+  its stale peer set), and a steady/never-up empty set is never advertised (no
+  empty-heartbeat churn). `syncIPsecSAPeriodic` keeps a goroutine-local `lastFP`
+  fingerprint (single-instance per comms lifetime). Tests: new pkg/daemon
+  `TestIPsecSASyncAdvertise` (RED-on-revert of the len(names)>0 guard — the
+  downed-tunnel case fails) and pkg/cluster `TestIPsecSAEmptyPushClearsPeer`
+  (empty push clears the receiver's `peerIPsecSAs` + `OnIPsecSAReceived`).
+  Verified RED-on-revert by temporarily restoring the guard (downed-tunnel
+  assertion fails), then restored. go test ./pkg/cluster/... ./pkg/ipsec/...
+  ./pkg/daemon/... green; go build ./...; gofmt + vet clean. HA IPsec SA sync ->
+  parent must run make test-failover before merge (a downed tunnel must NOT
+  resurrect on failover).
+- **File(s)**: pkg/daemon/daemon_ha.go,
+  pkg/daemon/ipsec_sa_sync_empty_4385_test.go, pkg/cluster/sync_test.go,
+  pkg/cluster/README.md, _Log.md

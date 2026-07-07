@@ -289,6 +289,35 @@ connection is authenticated, then seals every subsequent frame.
   accept/connect loops retry (~1s) — it never bricks. MUST pass
   `make test-failover` (the path that keeps TCP alive across failover).
 
+## IPsec SA sync
+
+Active IKE/child-SA connection names ride the session-sync channel so the
+standby can re-initiate the primary's tunnels on takeover:
+
+- **Send** — `syncIPsecSAPeriodic` (`pkg/daemon/daemon_ha.go`) runs on the
+  RG0-primary and, every 30s, reads the active set from
+  `ipsec.ActiveConnectionNames()` (live `swanctl --list-sas`) and advertises it
+  via `SessionSync.QueueIPsecSA` (wire type `syncMsgIPsecSA`,
+  `encode/decodeIPsecSAPayload`).
+- **Hold** — the standby stores the peer's set wholesale in `peerIPsecSAs`
+  (`sync_conn.go` overwrites, not merges), readable via `PeerIPsecSAs()`.
+- **Re-initiate on takeover** — `reinitiateIPsecSAs` reads `PeerIPsecSAs()` and
+  `InitiateConnection`s each name when this node becomes RG0-primary.
+- **Empty-set / tunnel-down handling (#4385)** — a NON-EMPTY set is advertised
+  every tick (a heartbeat re-push — the only mechanism that seeds a freshly
+  reconnected/restarted standby, so it must keep pushing even when unchanged).
+  An EMPTY set is advertised exactly ONCE, on the drop-to-zero transition from a
+  previously non-empty set — a tunnel was administratively downed or all its SAs
+  were torn down — so the standby CLEARS its stale `peerIPsecSAs` instead of
+  resurrecting the tunnel on takeover. A steady empty set, INCLUDING a node that
+  never brought an SA up, is never advertised (no empty-heartbeat churn; the
+  standby's default set is already empty). The decision is
+  `ipsecSASyncAdvertise` (goroutine-local `lastFP` fingerprint, empty string =
+  last advertised set was empty / nothing advertised yet). Before #4385 the push
+  was guarded by `if len(names) > 0`, so a drop-to-zero was never advertised and
+  the standby resurrected the downed tunnel on failover. Mirrors the DHCP
+  `maybePushFamily` change-detect precedent below.
+
 ## DHCP-server lease sync (#2239)
 
 DHCP-server (Kea) leases ride the SAME session-sync channel and follow the
