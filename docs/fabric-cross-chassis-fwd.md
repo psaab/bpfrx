@@ -539,3 +539,64 @@ ICMP-reply test uses — returns `Some` on revert, `None` with the fix)
 alongside the preserved `_allows_sfmix_to_lan_reply`,
 `_skips_udp_new_flow_4439`, `_skips_pure_tcp_syn`, and
 `_skips_icmp_echo_request`.
+
+## Every markerless protocol must be excluded, not just UDP (#4414)
+
+#4439 excluded UDP and #4453 excluded the bare TCP RST/FIN, but the guard was
+still enumerated protocol-by-protocol. Its own stated invariant — *fire only
+for provably-return traffic, and every protocol without a flow-initiator
+marker (like UDP) can open a NEW flow so must be excluded* — was applied to
+UDP alone. **Every other markerless L4 was left adopted:** ESP, AH, GRE, SCTP,
+OSPF, and any other IP protocol that is neither TCP nor ICMP/ICMPv6 has no
+"non-initiating" form, exactly like UDP.
+
+**The bug.** A session-less packet of such a protocol — a genuinely NEW
+forward flow (e.g. an outbound ESP/GRE/SCTP flow that ingressed the
+locally-**HAInactive** node and was fabric-redirected to the RG owner) —
+reached `cluster_peer_return_fast_path`, resolved to a `ForwardCandidate`, and
+was adopted as return traffic. The two #4439 failures followed on the owner,
+now for the whole non-TCP/non-ICMP protocol space:
+
+1. **NAT bypass.** The reverse seed carried `NatDecision::default()`, and the
+   redirecting node keeps `apply_nat_on_fabric = false` (it forwards the
+   original pre-NAT frame, deferring NAT to the owner), so the source-NAT a
+   new outbound flow requires was applied by *neither* node — the internal
+   source address/port left on the wire.
+2. **Session-state corruption.** The owner installed a **reverse-keyed**
+   (`SessionOrigin::ReverseFlow`) session for what was actually a forward
+   flow, so subsequent packets and the real reply resolved against a
+   mis-directioned session.
+
+Both failures share one root cause: a NON-return flow taking the return fast
+path. Confirmed 2× (opus-review-171 M-3 / ps-review-017 P7).
+
+**The fix.** `cluster_peer_return_fast_path` now returns `None` for any
+`meta.protocol` that is not `PROTO_TCP`, `PROTO_ICMP`, or `PROTO_ICMPV6`
+(subsuming the #4439 UDP-only guard). Only TCP and ICMP/ICMPv6 carry a
+distinguishable initiator form — TCP excludes the initial SYN and bare RST/FIN,
+ICMP excludes the echo REQUEST — so the surviving admitted set is exactly the
+provably-return forms: established TCP (non-SYN, non-closing) and ICMP/ICMPv6
+echo-reply / error responses. A markerless-protocol packet falls through to
+the owner's normal forward decision, where — because the RG owner resolves it
+to a `ForwardCandidate` (not a `FabricRedirect`) — source-NAT is applied
+(`apply_nat = !fabric_redirect || apply_nat_on_fabric` is `true` for a
+non-redirect egress) and a FORWARD session is installed. This closes BOTH the
+NAT bypass and the reverse-seed corruption in one change, since both stem from
+the single "non-return flow on the return fast path" root cause.
+
+The legitimate fabric-forward for an established synced session is untouched:
+it is served by `resolve_flow_session_decision` (the synced session + #2120
+standby retention) before this session-less fast path, so it is a session HIT.
+
+This completes the flow-initiator-exclusion invariant as a positive
+allow-list rather than a growing deny-list: the fast path fires ONLY for TCP
+and ICMP/ICMPv6 in their return forms, and refuses UDP and every other
+markerless protocol.
+
+RED-on-revert coverage: `forwarding/tests.rs`
+`cluster_peer_return_fast_path_skips_markerless_proto_new_flow_4414` (ESP / AH
+/ GRE / SCTP / OSPF against the same ForwardCandidate-resolving target the
+ICMP-reply test uses — returns `Some` on revert, `None` with the fix)
+alongside the preserved `_allows_sfmix_to_lan_reply`,
+`_skips_udp_new_flow_4439`, `_skips_bare_rst_fin_4453`, `_skips_pure_tcp_syn`,
+and `_skips_icmp_echo_request`.
