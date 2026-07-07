@@ -1,3 +1,26 @@
+## 2026-07-07 — #4406 step 2: extract P4 section dispatch from compileExpanded
+
+- **Timestamp**: 2026-07-07
+- **Action**: Step 2 of the #4406 compileExpanded god-orchestrator
+  decomposition (after step 1 extracted P1 runPreWalkGates). Extracted the P4
+  "section-compile dispatch" phase — the `for _, node := range tree.Children`
+  switch that routes each root child (in author order) to its already-extracted
+  section compiler (compileSecurity / compileInterfaces / … / compileSNMP /
+  compileBridgeDomains) — into a new free function
+  `compileSections(tree *ConfigTree, cfg *Config, opts compileOpts) error`
+  (compiler_dispatch.go:31, mirroring step 1's runPreWalkGates free-function
+  pattern). compileExpanded now calls it in the SAME position/order between the
+  P3 warning append and the P5 #4329 NodeID stamp. Behavior-preserving
+  code-motion of orchestration glue: same section order, same first-error slot
+  (each `<section>: %w` wrap unchanged), same tree/cfg threading. Net compiler.go
+  −72/+8 (73-line inline switch → 11-line call block with rationale comment).
+- **File(s)**: pkg/config/compiler_dispatch.go (new), pkg/config/compiler.go
+- **Validation**: gofmt clean, go vet clean, `go build ./...` clean.
+  `go test ./pkg/config/ -run Golden4406` PASSED byte-identical WITHOUT a
+  baseline update (no GOLDEN_4406_UPDATE, no golden_4406.actual.json written,
+  testdata/ untouched) — proving P4 has no hidden side effect. Full
+  `go test ./pkg/config/...` green.
+
 ## 2026-07-07 — #4449: correct stale NAT64 policy-tuple rationale comments in afxdp/tests.rs
 
 - **Timestamp**: 2026-07-07
