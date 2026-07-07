@@ -1,3 +1,41 @@
+## 2026-07-07 — #4453: gate bare RST/FIN out of the cluster-peer return fast path
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed #4453 (residual from #4400/#4439, from the #4451
+  hostile review). `cluster_peer_return_fast_path`
+  (`userspace-dp/src/afxdp/forwarding/mod.rs`) excluded the TCP initial
+  SYN, the ICMP echo-request, and (per #4439) all UDP from its
+  provably-return fast path, but NOT a bare TCP RST/FIN
+  (`is_closing && !has_syn`). A transit bare RST/FIN to a locally
+  HAInactive RG is downgraded to a `FabricRedirect` and forwarded to the
+  peer, where it arrives as fabric ingress, misses every session scope,
+  and was fast-pathed into a NAT-less `SessionOrigin::ReverseFlow` seed —
+  installing on the peer, via the trusted fabric path, exactly the
+  phantom-closing session the peer's own #4400 guard prevents locally.
+  - **Fix**: added a third initiator-exclusion arm to
+    `cluster_peer_return_fast_path` (right after the initial-SYN check):
+    `PROTO_TCP && is_closing(tcp_flags) && !has_syn(tcp_flags)` returns
+    `None` — the SAME predicate #4400 uses locally
+    (`strict_syn_check_drops_new_flow`). The bare RST/FIN falls through to
+    the peer's normal forward decision, whose own session-miss #4400 guard
+    drops it. The legitimate synced-session fabric-forward is untouched
+    (served by `resolve_flow_session_decision` before the fast path — a
+    session HIT, not session-less). This completes the fast-path
+    invariant: fire ONLY for provably-return traffic (exclude TCP-SYN,
+    ICMP-echo-request, all UDP, AND the bare RST/FIN).
+  - **Validation**: RED-on-revert
+    `forwarding/tests.rs::cluster_peer_return_fast_path_skips_bare_rst_fin_4453`
+    — bare RST / FIN / FIN|ACK / RST|ACK against the same
+    ForwardCandidate-resolving target the ICMP-reply test uses; returns
+    `Some` (reverse seed) with the arm neutralized, `None` with the fix
+    (verified by neutralizing the arm — bare RST 0x04 panicked "must not
+    fast-path a reverse seed"). Preserved `_allows_sfmix_to_lan_reply`,
+    `_skips_udp_new_flow_4439`, `_skips_pure_tcp_syn`,
+    `_skips_icmp_echo_request`. Full cargo suite serial (see PR).
+  - **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+    `userspace-dp/src/afxdp/forwarding/tests.rs`,
+    `docs/fabric-cross-chassis-fwd.md`, `_Log.md`.
+
 ## 2026-07-07 — #4400: strict-syn-check drop for bare RST/FIN on session-miss
 
 - **Timestamp**: 2026-07-07

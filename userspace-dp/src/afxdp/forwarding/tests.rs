@@ -844,6 +844,65 @@ fn cluster_peer_return_fast_path_skips_udp_new_flow_4439() {
 }
 
 #[test]
+fn cluster_peer_return_fast_path_skips_bare_rst_fin_4453() {
+    // #4453: a bare TCP RST/FIN (closing flags, no SYN) arriving on the
+    // fabric is a session-less phantom-closing packet with no return value —
+    // the exact packet the LOCAL #4400 strict-syn-check drops on a session
+    // miss. It MUST fall through to the owner's forward decision (where the
+    // peer's own session-miss guard drops it), NOT be fast-pathed into a
+    // NAT-less `SessionOrigin::ReverseFlow` seed. This is the same
+    // `_allows_sfmix_to_lan_reply` setup (whose target resolves to a
+    // ForwardCandidate) with a bare RST / FIN / FIN|ACK: on revert the fast
+    // path returns Some (the reverse seed installed on the peer via the
+    // fabric path), so asserting None is RED-on-revert. The ICMP-reply test
+    // above proves the legitimate return-traffic fast path is preserved, and
+    // the SYN test below proves the initial-SYN exclusion is untouched.
+    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+    state.fabrics.push(FabricLink {
+        parent_ifindex: 4,
+        overlay_ifindex: 104,
+        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
+    });
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    dynamic_neighbors.insert(
+        (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+        NeighborEntry {
+            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        },
+    );
+    for flags in [
+        crate::tcp_flags::TCP_RST,
+        crate::tcp_flags::TCP_FIN,
+        crate::tcp_flags::TCP_FIN | crate::tcp_flags::TCP_ACK,
+        crate::tcp_flags::TCP_RST | crate::tcp_flags::TCP_ACK,
+    ] {
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_TCP,
+            tcp_flags: flags,
+            l4_offset: 0,
+            ..UserspaceDpMeta::default()
+        };
+        let packet_frame = [0u8];
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some(TEST_SFMIX_ZONE_ID),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            )
+            .is_none(),
+            "bare closing flags {flags:#04x} must not fast-path a reverse seed"
+        );
+    }
+}
+
+#[test]
 fn cluster_peer_return_fast_path_skips_pure_tcp_syn() {
     let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
     state.fabrics.push(FabricLink {
