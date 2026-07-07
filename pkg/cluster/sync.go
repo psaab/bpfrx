@@ -885,10 +885,18 @@ func (s *SessionSync) PeerIPsecSAs() []string {
 	return cp
 }
 
-func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
+// QueueIPsecSA advertises the active IPsec connection-name set to the peer over
+// the sync channel. It returns whether the frame was actually queued to an
+// ACTIVE connection: false when there is no active conn (nothing sent) or the
+// write failed (conn dropped). The #4385 caller uses this to advance its
+// last-sent fingerprint ONLY on a confirmed send, so a drop-to-zero (empty)
+// advertisement that lands during a reconnect gap is RETRIED on the next tick
+// instead of being silently lost (which would leave the standby holding a stale
+// set that resurrects the tunnel on takeover).
+func (s *SessionSync) QueueIPsecSA(connectionNames []string) bool {
 	conn := s.getActiveConn()
 	if conn == nil {
-		return
+		return false
 	}
 	payload := encodeIPsecSAPayload(connectionNames)
 	s.writeMu.Lock()
@@ -898,10 +906,11 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
 		slog.Warn("cluster sync: IPsec SA send error", "err", err)
 		s.stats.Errors.Add(1)
 		s.handleDisconnect(conn)
-		return
+		return false
 	}
 	s.stats.IPsecSASent.Add(1)
 	slog.Debug("cluster sync: IPsec SA list sent", "count", len(connectionNames))
+	return true
 }
 
 // RecordDHCPLeasesSeeded adds n to the seeded-leases counter (#2239). The

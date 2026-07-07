@@ -536,6 +536,37 @@ func TestIPsecSAEmptyPushClearsPeer(t *testing.T) {
 	}
 }
 
+// TestQueueIPsecSAConfirmedSend pins the #4385 confirmed-send report:
+// QueueIPsecSA returns false when there is no active conn (nothing sent) and
+// true when the frame is written to an active conn. The daemon advances its
+// last-sent fingerprint only on a confirmed send, so a drop-to-zero (empty)
+// advertisement that lands during a reconnect gap is retried instead of lost.
+func TestQueueIPsecSAConfirmedSend(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	// No active conn: both a live-set and an empty advertisement report an
+	// unconfirmed send.
+	if ss.QueueIPsecSA([]string{"vpn-a"}) {
+		t.Fatal("QueueIPsecSA with no active conn must report an unconfirmed send")
+	}
+	if ss.QueueIPsecSA(nil) {
+		t.Fatal("QueueIPsecSA(empty) with no active conn must report an unconfirmed send")
+	}
+
+	// With an active conn the send is confirmed (empty payload included — the
+	// empty-clear must be confirmable).
+	cw := &countingWriter{}
+	ss.mu.Lock()
+	ss.conn0 = cw
+	ss.mu.Unlock()
+	if !ss.QueueIPsecSA([]string{"vpn-a"}) {
+		t.Fatal("QueueIPsecSA with an active conn must report a confirmed send")
+	}
+	if !ss.QueueIPsecSA(nil) {
+		t.Fatal("QueueIPsecSA(empty) with an active conn must report a confirmed send")
+	}
+}
+
 func TestSetDataPlane(t *testing.T) {
 	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
 	if ss.sessions != nil {

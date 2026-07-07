@@ -37528,3 +37528,37 @@ top.
 - **File(s)**: pkg/daemon/daemon_ha.go,
   pkg/daemon/ipsec_sa_sync_empty_4385_test.go, pkg/cluster/sync_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06T[fold]Z
+- **Action**: Fold #4385 hostile-review residual (MERGE-NEEDS-MINOR) — the
+  one-shot empty push could be MISSED, leaving a stale set that resurrects the
+  tunnel on takeover across a reconnect gap. Two robustness guards, mirroring
+  the DHCP precedent: (1) CONFIRMED-SEND RETRY — `QueueIPsecSA` now returns
+  whether the frame reached an ACTIVE conn (false on nil/dropped conn); the new
+  `ipsecSANextFP` advances the goroutine-local `lastFP` ONLY on a confirmed
+  send, so a drop-to-zero empty push that no-ops during a reconnect gap leaves
+  `lastFP` non-empty and RETRIES next tick instead of being silently marked
+  sent (the un-fixed advance-on-noop stranded the standby's stale set). (2)
+  PEER-CONNECT RE-ADVERTISE — `OnPeerConnected` nudges the new `ipsecSANudgeCh`
+  (`nudgeIPsecSASync`) and `syncIPsecSAPeriodic` handles it with a FORCED
+  advertise (`advertiseIPsecSAOnce(force=true)` -> `ipsecSASyncAdvertise` force
+  branch) of the current set, empty or not, so a reconnected standby (or a
+  same-process standby that retained its set across a blip) converges
+  immediately instead of waiting up to 30s. Deliberately did NOT clear
+  `peerIPsecSAs` on disconnect — a real primary death (standby never reconnects)
+  must keep the last-known set for `reinitiateIPsecSAs` on takeover; convergence
+  is primary-driven. Verified reconnect-safety BOTH directions (force re-seeds
+  non-empty, force clears empty). Tests: pkg/daemon `TestIPsecSAMissedEmptyRetries`
+  (RED on revert of the confirmed-send gate — `lastFP` wrongly advances to ""
+  and the empty is never retried), `TestIPsecSASyncForceReadvertise` (RED on
+  revert of the force branch), updated `TestIPsecSASyncAdvertise` for the new
+  `force` param; pkg/cluster `TestQueueIPsecSAConfirmedSend` (false on nil conn,
+  true on active conn incl. empty payload). Both reverts verified RED then
+  restored. Master already at branch base (no rebase). go test
+  ./pkg/daemon/... ./pkg/cluster/... ./pkg/ipsec/... green; go build ./...;
+  gofmt + vet clean. HA IPsec SA sync -> parent composes test-failover with
+  #4393 before merge.
+- **File(s)**: pkg/cluster/sync.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/ipsec_sa_sync_empty_4385_test.go, pkg/cluster/sync_test.go,
+  pkg/cluster/README.md, _Log.md

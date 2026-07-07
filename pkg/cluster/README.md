@@ -317,6 +317,29 @@ standby can re-initiate the primary's tunnels on takeover:
   was guarded by `if len(names) > 0`, so a drop-to-zero was never advertised and
   the standby resurrected the downed tunnel on failover. Mirrors the DHCP
   `maybePushFamily` change-detect precedent below.
+- **Reconnect robustness (#4385)** — the one-shot empty push must survive a
+  disconnect gap, so two guards back it:
+  - **Confirmed-send retry.** `QueueIPsecSA` returns whether the frame reached an
+    ACTIVE conn; `ipsecSANextFP` advances `lastFP` ONLY on a confirmed send. An
+    empty advertisement that no-ops on a nil/dropped conn (a drop-to-zero landing
+    during a reconnect gap) leaves `lastFP` non-empty, so it RETRIES next tick
+    instead of being silently marked sent — without this, `lastFP` would advance
+    to empty and the empty would never be re-advertised, stranding the standby's
+    stale set.
+  - **Peer-connect re-advertise.** `OnPeerConnected` nudges `ipsecSANudgeCh`
+    (`nudgeIPsecSASync`), and `syncIPsecSAPeriodic` handles it with a FORCED
+    advertise (`advertiseIPsecSAOnce(force=true)` -> `ipsecSASyncAdvertise` force
+    branch) of the current set, empty or not. A reconnected standby that missed
+    the one-shot empty, or a same-process standby that retained its peer set
+    across a blip, converges immediately (empty -> clears; non-empty ->
+    re-seeds) rather than waiting up to the 30s tick. Mirrors the DHCP
+    peer-connect `nudgeDHCPLeaseSync` (#2239 Q7).
+
+  Note: `peerIPsecSAs` is deliberately NOT cleared on disconnect — a real
+  primary death (the standby never reconnects) must leave the last-known set in
+  place for `reinitiateIPsecSAs` to re-initiate on takeover. Convergence to an
+  empty/updated set is driven by the primary re-advertising, not by the standby
+  self-clearing.
 
 ## DHCP-server lease sync (#2239)
 

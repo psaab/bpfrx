@@ -614,6 +614,15 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync {
 					d.nudgeDHCPLeaseSync()
 				}
+				// #4385: a peer that just (re)connected may have missed the
+				// one-shot empty IPsec SA advertisement during the gap, or (a
+				// same-process standby) retained a stale peer set across the
+				// blip. Nudge a forced re-advertise of the current set (empty or
+				// not) so it converges — gated on primary + IPsecSASync inside
+				// advertiseIPsecSAOnce, so it is safe regardless of this branch.
+				if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync {
+					d.nudgeIPsecSASync()
+				}
 				if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
 					slog.Info("cluster: skipping config push (not RG0 primary)")
 					return
