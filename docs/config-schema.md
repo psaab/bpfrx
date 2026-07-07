@@ -2626,7 +2626,16 @@ reserved for whole-dataplane selection where a rewrite shim
   `tsig-algorithm`, or an incomplete TSIG tuple (`tsig-key` without
   `tsig-secret`, or `tsig-secret` without `tsig-key`) each emit a WARN-only
   commit message (#2666) — never a hard reject, and the backend degrades
-  safely at runtime. `tsig-secret` is
+  safely at runtime. An `update-server` set with NO `tsig-key` at all also
+  warns (#4483): TSIG is the only authenticator on this path, so an unsigned
+  UPDATE trusts a forgeable response rcode — a spoofed `NOERROR` records a name
+  as published though the server wrote nothing (silent blackhole) and a spoofed
+  `REFUSED` suppresses a legitimate publish. The same no-`tsig-key` warning is
+  emitted for the Surface A provider catalog by `validateSurfaceADDNSWarnings`.
+  Both are WARN-only (a hard reject would brick a previously-inert config); the
+  backend also emits a once-per-update-server runtime `slog.Warn`
+  (`warnUnsignedOnce` in `pkg/ddns/backend_rfc2136.go`) the first time it
+  actually sends an unsigned UPDATE. `tsig-secret` is
   SENSITIVE: it is redacted in `DHCPDynamicDNSConfig.String()` (logging) AND,
   since #2053, by its `config.Secret` field type on every JSON/YAML marshal
   (so the compiled-config dump on `GET /api/v1/config` never leaks it — see

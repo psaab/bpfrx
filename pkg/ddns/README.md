@@ -262,6 +262,25 @@ no change in those packages:
   `xpf_ddns_surface_a_degraded` Prometheus gauge, and on `SurfaceAStats.Degraded`
   / `DegradedReason`.
 - **No secret in any error string** (TSIG secret revealed only at construction).
+- **Unsigned (no-TSIG) UPDATEs are warned, not silent (#4483)** — TSIG is the
+  ONLY authenticator on this path. When `tsig-key` is unset the RFC 2136 UPDATE
+  is sent unsigned (`exchange()` is UDP-first), and the publish/ownership
+  verdict keys on `resp.Rcode` — an UNAUTHENTICATED, forgeable field. An on-path
+  (or ID+port-guessing off-path) attacker can forge a `NOERROR` so the manager
+  records a name as published though the server wrote nothing (silent
+  blackhole), or forge a `REFUSED` to suppress a legitimate publish. The gap is
+  fully closed by configuring `tsig-key`/`tsig-secret` (miekg then verifies the
+  response MAC and rejects a forgery). Because a hard reject would brick a
+  previously-inert config, the weakened posture is surfaced rather than
+  forbidden: a COMMIT-time warning (`validateDDNSBackendWarnings` for DHCP DDNS,
+  `validateSurfaceADDNSWarnings` for the Surface A provider catalog — both in
+  `pkg/config/compiler_validate_warn.go`) whenever an `update-server` is set
+  with no `tsig-key`, AND a once-per-update-server RUNTIME `slog.Warn`
+  (`warnUnsignedOnce` in `backend_rfc2136.go`, deduped in the package-level
+  `unsignedUpdateWarned` map so the per-cycle backend rebuild does not re-warn)
+  the first time an unsigned UPDATE is actually sent. Forcing TCP or an explicit
+  `no-tsig` opt-in acknowledgment are possible follow-ups; the warn is the
+  minimum that makes the operator aware.
 
 The HA writer gate (`ddnsWriterGateOpen`) stays in `pkg/daemon/daemon_ddns.go`
 (it reads cluster RG state); P1a did not move or change it.
