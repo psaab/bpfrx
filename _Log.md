@@ -1,3 +1,41 @@
+## 2026-07-06 — #4439: fabric-return fast path must not adopt NEW UDP flows
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed #4439 (ps-013/014/015, HIGH, confirmed 3×). A NEW
+  non-TCP (UDP) flow fabric-redirected from the inactive node to the RG
+  owner was fast-pathed as RETURN traffic on the owner by
+  `cluster_peer_return_fast_path`, which built a NAT-less
+  (`NatDecision::default()`) reverse-keyed (`is_reverse: true`) seed →
+  SNAT skipped (NAT bypass) + a reverse session installed for a forward
+  flow (session-state corruption).
+  - **Root cause**: the fast path may fire only for provably-RETURN
+    traffic and excludes each protocol's flow-initiator (TCP initial
+    SYN, ICMP echo REQUEST), but UDP has no non-initiating form and was
+    allowed. It is reached only after `resolve_flow_session_decision`
+    misses every scope, so any UDP packet landing here is session-less =
+    a NEW forward flow, not return traffic.
+  - **Fix**: `cluster_peer_return_fast_path` (forwarding/mod.rs) now
+    returns `None` for `PROTO_UDP`, completing the initiator-exclusion
+    invariant. The session-less UDP packet falls through to the normal
+    forward decision on the owner, which resolves it to a
+    `ForwardCandidate` (not a `FabricRedirect`) → `apply_nat` is `true` →
+    source-NAT applied + a FORWARD session installed. No
+    `apply_nat_on_fabric` change: the non-owner keeps redirecting the
+    original pre-NAT frame (Fix-1 design); the owner's forward pipeline
+    already anticipates fabric-ingress session-miss packets (#4155).
+  - **Preserved**: established synced-session return traffic is served by
+    `resolve_flow_session_decision` (synced session + #2120 retention),
+    not this fast path; TCP (non-SYN) and ICMP (echo-reply) still
+    fast-path.
+  - **RED-on-revert**: `forwarding/tests.rs`
+    `cluster_peer_return_fast_path_skips_udp_new_flow_4439` — UDP against
+    the same ForwardCandidate-resolving target the ICMP-reply test uses
+    (returns `Some` on revert, `None` with the fix); the preserved
+    `_allows_sfmix_to_lan_reply` (ICMP reply) proves the legit path.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  docs/fabric-cross-chassis-fwd.md, _Log.md
+
 ## 2026-07-06 — #4433: fail the commit closed when IPsec render/reload fails
 
 - **Timestamp**: 2026-07-06

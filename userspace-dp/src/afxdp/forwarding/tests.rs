@@ -795,6 +795,55 @@ fn cluster_peer_return_fast_path_allows_sfmix_to_lan_reply() {
 }
 
 #[test]
+fn cluster_peer_return_fast_path_skips_udp_new_flow_4439() {
+    // #4439: a session-less UDP datagram arriving on the fabric is a NEW
+    // forward flow, not return traffic (UDP has no packet-level initiator
+    // marker like TCP SYN / ICMP echo-request). It MUST fall through to the
+    // owner's forward decision — source-NAT applied + a FORWARD session
+    // installed — not be fast-pathed as a NAT-less reverse seed. This is the
+    // exact `_allows_sfmix_to_lan_reply` setup (whose ICMP-reply target
+    // resolves to a ForwardCandidate) with the protocol flipped to UDP: on
+    // revert the fast path returns Some (the reverse seed / NAT bypass), so
+    // asserting None is RED-on-revert. The ICMP-reply test above proves the
+    // legitimate return-traffic fast path is preserved.
+    let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+    state.fabrics.push(FabricLink {
+        parent_ifindex: 4,
+        overlay_ifindex: 104,
+        peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+        peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
+    });
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    dynamic_neighbors.insert(
+        (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+        NeighborEntry {
+            mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        },
+    );
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 4,
+        protocol: PROTO_UDP,
+        l4_offset: 0,
+        ..UserspaceDpMeta::default()
+    };
+    let packet_frame = [0u8];
+
+    assert!(
+        cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &packet_frame,
+            meta,
+            Some(TEST_SFMIX_ZONE_ID),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn cluster_peer_return_fast_path_skips_pure_tcp_syn() {
     let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
     state.fabrics.push(FabricLink {
