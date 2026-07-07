@@ -4341,16 +4341,22 @@ gate EXACTLY (shared predicate `isHostMaskAddress`):
   `net.ParseCIDR` silently masks the address to the prefix length, so a prefix
   with bits set beyond the prefix length (e.g. `2001:db8:1:2::/48`) would
   otherwise compile as a DIFFERENT prefix (`2001:db8:1::/48`) than the operator
-  wrote, with no feedback; the Rust `parse_prefix` (`userspace-dp/src/nptv6.rs`)
-  discards the same extra words. Both planes agree on the masked result (no
-  traffic-correctness bug), but Junos rejects host bits on a prefix and so does
-  the strict gate. `parse_prefix` carries a `debug_assert!` tripwire that aborts
-  a debug build if a host-bits-bearing prefix ever reaches the helper (i.e. if
-  the Go gate is weakened); release builds keep the historical masking. This
-  routes through the SAME strict/lenient `emit` as the other NPTv6 checks: a
-  hard commit error under strict, a `cfg.Warnings` entry under
-  `CompileConfigLenient` (the helper independently rejects the snapshot and
-  keeps the prior live state).
+  wrote, with no feedback. Junos rejects host bits on a prefix and so does the
+  strict gate. This routes through the SAME strict/lenient `emit` as the other
+  NPTv6 checks: a hard commit error under strict, a `cfg.Warnings` entry under
+  `CompileConfigLenient`. **#4519 — the Rust helper now fails CLOSED on host
+  bits too.** `parse_prefix` (`userspace-dp/src/nptv6.rs`) previously carried
+  only a `debug_assert!` (compiled out in release) and then MASKED the extra
+  words, returning `Some`, so a leniently-loaded / peer-synced pre-#2380 rule
+  with host bits INSTALLED the silently-widened over-broad prefix in a release
+  helper — contradicting the lenient warning that promises the helper rejects
+  the snapshot and keeps the prior live state. `parse_prefix` now returns `None`
+  on host bits, so `Nptv6State::try_from_snapshots` rejects the WHOLE snapshot
+  (a `SnapshotIntegrityError`) and the apply preflight keeps the previous live
+  forwarding state — the lenient warning's promise now holds in every build.
+  This is the helper-boundary backstop in the #2124/#2142/#2173/#2212
+  fail-closed family; the `None`-return is the sole enforcement (no release-
+  compiled-out `debug_assert!`).
 - **Strict (`commit` / `commit check`):** a non-host mask is a HARD commit error
   naming the rule-set, rule, slot, and offending prefix.
 - **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /

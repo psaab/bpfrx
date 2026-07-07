@@ -25,15 +25,23 @@
 //! * **Fail CLOSED on an unparseable config rule (#2240).**
 //!   [`Nptv6State::try_from_snapshots`] rejects the whole snapshot (returning a
 //!   [`crate::policy::SnapshotIntegrityError`]) on an empty/malformed prefix, an
-//!   unsupported prefix length (not /48 or /64), or a mismatched internal/
-//!   external prefix-length pair — one bad rule fails the snapshot rather than
-//!   being silently filtered. The pre-fix parser silently `continue`d past a bad
-//!   rule, and the Go dataplane compiler then deleted stale entries over only
-//!   the VALID subset, so editing one previously-good rule into an invalid one
-//!   tore down its working translation with no replacement. The apply preflight
+//!   unsupported prefix length (not /48 or /64), a mismatched internal/external
+//!   prefix-length pair, or host bits set beyond the prefix length (#4519) — one
+//!   bad rule fails the snapshot rather than being silently filtered. The
+//!   pre-fix parser silently `continue`d past a bad rule, and the Go dataplane
+//!   compiler then deleted stale entries over only the VALID subset, so editing
+//!   one previously-good rule into an invalid one tore down its working
+//!   translation with no replacement. **Host bits (#4519):** [`parse_prefix`]
+//!   used to `debug_assert!` (compiled out in release) then MASK the host bits
+//!   and return `Some`, so a leniently-loaded / peer-synced pre-#2380 rule with
+//!   host bits (`...:2::/48`) INSTALLED the silently-widened (`...::/48`)
+//!   over-broad prefix in release — directly contradicting the Go lenient-load
+//!   warning that promises the helper rejects the snapshot and keeps the prior
+//!   state. `parse_prefix` now returns `None` on host bits so the snapshot is
+//!   genuinely rejected and the warning's promise holds. The apply preflight
 //!   keeps the previous live forwarding state on this Err. This is the
 //!   helper-boundary backstop to the Go commit-time gate
-//!   (`pkg/config/compiler_nat.go`, #2240), consistent with the
+//!   (`pkg/config/compiler_nat.go`, #2240/#2380), consistent with the
 //!   #2124/#2142/#2173/#2212 fail-closed family.
 //! * **Reject overlapping prefixes — deterministic translation (#2241).**
 //!   `translate_inbound`/`translate_outbound` resolve a match by FIRST hit in
@@ -150,7 +158,8 @@ fn words_to_ipv6(words: &[u16; 8]) -> Ipv6Addr {
 }
 
 /// Parse a prefix string like "2001:db8:1::/48" into ([u16; 4], prefix_len).
-/// Returns None if parsing fails or prefix length is not /48 or /64.
+/// Returns None if parsing fails, the prefix length is not /48 or /64, OR host
+/// bits are set beyond the prefix length (#4519 — fail closed, do NOT mask).
 fn parse_prefix(s: &str) -> Option<([u16; 4], usize)> {
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() != 2 {
@@ -164,18 +173,26 @@ fn parse_prefix(s: &str) -> Option<([u16; 4], usize)> {
     };
     let addr: Ipv6Addr = parts[0].parse().ok()?;
     let words = ipv6_to_words(&addr);
-    // #2380: the Go commit-time validator (validateNPTv6Strict in
-    // pkg/config/compiler_nat.go) rejects a prefix with any bit set beyond the
-    // prefix length, so a snapshot reaching the helper must already be
-    // host-bits-clean. This debug_assert is a fail-on-revert tripwire: if the
-    // Go gate is ever weakened, the next NPTv6 snapshot in a debug build will
-    // abort here instead of silently discarding the extra words. Release
-    // builds keep the historical masking behavior (the words are dropped).
-    debug_assert!(
-        words[prefix_words..8].iter().all(|&w| w == 0),
-        "nptv6 prefix {s} has host bits set beyond /{prefix_len} \
-         (Go commit gate should have rejected this)"
-    );
+    // #4519: fail CLOSED on host bits set beyond the prefix length — do NOT
+    // mask-and-accept. The Go commit-time validator (validateNPTv6Strict in
+    // pkg/config/compiler_nat.go, #2380) hard-rejects a prefix with any bit set
+    // beyond its length, but the LENIENT tolerant-load / peer-sync path
+    // (compiler.go lenientNPTv6, for a config committed before that gate existed
+    // or synced from a peer) only WARNS — and that warning literally promises
+    // "the helper rejects the whole NPTv6 snapshot and the previous state is
+    // kept". Returning `Some` after masking `words[prefix_words..]` would make
+    // that promise FALSE: `try_from_snapshots` would INSTALL the silently-
+    // widened (masked) prefix, over-translating a broader range than the
+    // operator authored (e.g. `...:2::/48` -> the wider `...::/48`). Returning
+    // `None` makes `try_from_snapshots` reject the WHOLE snapshot so the apply
+    // preflight keeps the previous live forwarding state exactly as the warning
+    // claims — the helper-boundary backstop in the #2124/#2142/#2173/#2212
+    // fail-closed family. This `None`-return is the SOLE enforcement now (the
+    // prior `debug_assert!` was compiled out in release, leaving no runtime
+    // enforcement); it fails closed uniformly in both debug and release builds.
+    if words[prefix_words..8].iter().any(|&w| w != 0) {
+        return None;
+    }
     let mut prefix = [0u16; 4];
     for i in 0..prefix_words {
         prefix[i] = words[i];
@@ -217,7 +234,7 @@ impl Nptv6State {
                     return Err(SnapshotIntegrityError::Nptv6UnparseableRule {
                         rule_name: snap.name.clone(),
                         field: format!(
-                            "internal/nptv6 prefix {:?} (must be a valid IPv6 /48 or /64)",
+                            "internal/nptv6 prefix {:?} (must be a valid IPv6 /48 or /64 with host bits clear)",
                             snap.internal_prefix
                         ),
                     });
@@ -229,7 +246,7 @@ impl Nptv6State {
                     return Err(SnapshotIntegrityError::Nptv6UnparseableRule {
                         rule_name: snap.name.clone(),
                         field: format!(
-                            "external/match prefix {:?} (must be a valid IPv6 /48 or /64)",
+                            "external/match prefix {:?} (must be a valid IPv6 /48 or /64 with host bits clear)",
                             snap.external_prefix
                         ),
                     });

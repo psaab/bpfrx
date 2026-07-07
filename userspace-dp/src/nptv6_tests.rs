@@ -32,30 +32,27 @@ fn parse_prefix_unsupported_length() {
     assert!(parse_prefix("2001:db8:1:2:3:4::/96").is_none());
 }
 
-// #2380: a /48 prefix with the 4th word set carries host/subnet bits the
-// parser silently discards. The Go commit gate rejects this, so in a debug
-// build the helper-side debug_assert is a fail-on-revert tripwire that aborts
-// if the Go gate is ever weakened. Release builds keep the historical masking
-// behavior (the extra word is dropped), so this test only asserts the panic
-// when debug assertions are compiled in.
+// #4519 fail-on-revert: a prefix with host/subnet bits set beyond the prefix
+// length must FAIL CLOSED (`None`) in ALL builds — NOT mask-and-accept. The
+// prior code `debug_assert!`d (compiled out in release) then masked the extra
+// words and returned `Some`, so a leniently-loaded / peer-synced host-bits rule
+// installed a silently-WIDENED prefix in release, contradicting the Go
+// lenient-load warning that promises the helper rejects the snapshot. Now
+// `parse_prefix` returns `None`, so `try_from_snapshots` rejects the whole
+// snapshot and the prior live state is kept. Revert (mask + `Some`) -> the /48
+// with a word-3 bit and the /64 with a word-4 bit parse as narrower prefixes
+// instead of `None`, and these asserts go RED.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "host bits set")]
-fn parse_prefix_48_host_bits_panics_in_debug() {
-    let _ = parse_prefix("2001:db8:1:2::/48");
-}
-
-// In a release build (debug_assert compiled out) the parser keeps masking:
-// the 4th word is dropped, yielding the same prefix as a clean /48.
-#[test]
-#[cfg(not(debug_assertions))]
-fn parse_prefix_48_host_bits_masked_in_release() {
-    let (prefix, words) = parse_prefix("2001:db8:1:2::/48").unwrap();
-    assert_eq!(words, 3);
-    assert_eq!(prefix[0], 0x2001);
-    assert_eq!(prefix[1], 0x0db8);
-    assert_eq!(prefix[2], 0x0001);
-    assert_eq!(prefix[3], 0);
+fn parse_prefix_rejects_host_bits() {
+    // /48 with a bit set in word 3 (beyond the prefix).
+    assert!(parse_prefix("2001:db8:1:2::/48").is_none());
+    assert!(parse_prefix("2001:db8:0:2::/48").is_none());
+    // /64 with a bit set in word 4 (beyond the prefix).
+    assert!(parse_prefix("2001:db8:1:2:3::/64").is_none());
+    assert!(parse_prefix("2001:db8:1:2:0:0:0:1/64").is_none());
+    // Host-bits-clean prefixes still parse (no false rejection).
+    assert!(parse_prefix("2001:db8:1::/48").is_some());
+    assert!(parse_prefix("2001:db8:1:2::/64").is_some());
 }
 
 #[test]
@@ -354,6 +351,60 @@ fn invalid_snapshot_rejected_fail_closed() {
         .expect("all-valid snapshot must build");
     assert_eq!(ok.inbound.len(), 2);
     assert_eq!(ok.outbound.len(), 2);
+}
+
+#[test]
+fn host_bits_snapshot_rejected_fail_closed() {
+    // #4519 fail-on-revert: an NPTv6 rule whose prefix carries host bits beyond
+    // the prefix length must REJECT the WHOLE snapshot so the apply preflight
+    // keeps the previous live state — making the Go lenient-load warning's
+    // promise ("the helper rejects the whole NPTv6 snapshot and the previous
+    // state is kept") TRUE. On revert (`parse_prefix` masks + returns `Some`)
+    // the over-broad masked prefix (`2001:db8::/48` for a `2001:db8:0:2::/48`
+    // rule) INSTALLS instead, over-translating a wider range than authored.
+    let good = Nptv6RuleSnapshot {
+        name: "good".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    };
+
+    // Host bits in the INTERNAL (nptv6-prefix / outbound) slot — word 3 set on a
+    // /48.
+    let host_bits_internal = Nptv6RuleSnapshot {
+        name: "host-bits-internal".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "2001:db8:0:2::/48".to_string(),
+        external_prefix: "2602:fd41:70::/48".to_string(),
+    };
+    let err = Nptv6State::try_from_snapshots(&[good.clone(), host_bits_internal])
+        .expect_err("a host-bits internal NPTv6 prefix must reject the whole snapshot");
+    match err {
+        SnapshotIntegrityError::Nptv6UnparseableRule { rule_name, .. } => {
+            assert_eq!(rule_name, "host-bits-internal");
+        }
+        other => panic!("expected Nptv6UnparseableRule, got {other:?}"),
+    }
+
+    // Host bits in the EXTERNAL (match / inbound) slot — word 4 set on a /64.
+    let host_bits_external = Nptv6RuleSnapshot {
+        name: "host-bits-external".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:2:3:4::/64".to_string(),
+        external_prefix: "2001:db8:5:6:0:0:0:1/64".to_string(),
+    };
+    let err = Nptv6State::try_from_snapshots(&[good.clone(), host_bits_external])
+        .expect_err("a host-bits external NPTv6 prefix must reject the whole snapshot");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6UnparseableRule { .. }),
+        "expected Nptv6UnparseableRule, got {err:?}"
+    );
+
+    // Control: the host-bits-clean rule still installs (no false rejection).
+    let ok = Nptv6State::try_from_snapshots(&[good])
+        .expect("host-bits-clean snapshot must build");
+    assert_eq!(ok.inbound.len(), 1);
+    assert_eq!(ok.outbound.len(), 1);
 }
 
 #[test]
