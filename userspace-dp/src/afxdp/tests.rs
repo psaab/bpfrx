@@ -8749,16 +8749,35 @@ fn txn_nat64_translation_bumps_counter_both_directions() {
         "the admitted v6->v4 translation must bump the counter exactly once"
     );
 
-    // Reverse: the v4 server reply (8.8.8.8:443 -> 172.16.80.50:12345 — the
-    // SNAT pool address, port preserved because forward_decision keeps the
-    // source port) hits the reverse session and translates v4->v6, bumping
-    // the counter again.
+    // Reverse: the v4 server reply hits the reverse session and translates
+    // v4->v6, bumping the counter again.
+    //
+    // #4381: the forward flow's source port is now TRANSLATED to a UNIQUE pool
+    // port (RFC 6146 BIB) instead of being preserved, so the server replies to
+    // the TRANSLATED port and the reverse session keys on it. Discover the
+    // translated port from the installed reverse (v4) session rather than
+    // assuming the original 12345 is preserved.
     let pool_v4: Ipv4Addr = "172.16.80.50".parse().expect("pool v4");
     let dst_v4: Ipv4Addr = "8.8.8.8".parse().expect("dst v4");
+    let mut translated_port = 0u16;
+    sessions.iter_with_origin(|key, _decision, _metadata, _origin| {
+        if key.addr_family == libc::AF_INET as u8 {
+            translated_port = key.dst_port;
+        }
+    });
+    assert_ne!(
+        translated_port, 0,
+        "the reverse NAT64 (v4) session must key on a translated port"
+    );
+    assert_ne!(
+        translated_port, 12345,
+        "#4381: the source port must be translated, not preserved"
+    );
     // SYN-ACK = SYN (0x02) | ACK (0x10). TCP_FLAG_ACK is not exported at the
     // afxdp module level, so spell the ACK bit inline.
     const ACK: u8 = 0x10;
-    let reply_frame = build_txn_tcp_syn_frame_v4(dst_v4, pool_v4, 443, 12345, TCP_FLAG_SYN | ACK);
+    let reply_frame =
+        build_txn_tcp_syn_frame_v4(dst_v4, pool_v4, 443, translated_port, TCP_FLAG_SYN | ACK);
     let reply_meta = txn_meta_v4(24, TCP_FLAG_SYN | ACK, (reply_frame.len() - 14) as u16);
     let (rev_batch, _rev_dbg) = txn_run_descriptor(
         &mut binding,

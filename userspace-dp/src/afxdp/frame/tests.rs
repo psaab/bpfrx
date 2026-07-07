@@ -2366,6 +2366,143 @@ fn rewrite_forwarded_frame_in_place_translates_icmpv4_echo_identifier() {
     );
 }
 
+// #4381 FAIL-ON-REVERT (RFC 6146 BIB): the NAT64 frame builder rewrites the L4
+// SOURCE port to the unique translated value on the forward (v6->v4) path, and
+// restores the ORIGINAL client port on the reverse (v4->v6) reply. Reverting
+// `apply_nat64_port_translation` (or the `forward_decision` /
+// `NatDecision::reverse` port carriage) leaves the forward src port at the
+// original value and the reverse dst port at the translated value — the
+// port-translation assertions go RED and the reverse tuple collides.
+fn nat64_forward_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+fn nat64_reverse_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+#[test]
+fn nat64_4381_forward_frame_translates_l4_source_port() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap(); // ::8.8.8.8
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let orig_sport = 5000u16;
+    let translated = 40001u16;
+
+    let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, orig_sport, 443, 1460);
+    let decision = icmp_test_decision(Nat64State::forward_decision(pool, server, translated));
+    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false)
+        .expect("forward NAT64 frame");
+
+    // Output is IPv4 (eth 14 + ip 20 => L4 at 34); src IP @26..30, TCP src
+    // port @34..36, dst port @36..38.
+    assert_eq!(&out[26..30], &pool.octets(), "src IP translated to pool");
+    assert_eq!(&out[30..34], &server.octets(), "dst IP is the real server");
+    assert_eq!(
+        u16::from_be_bytes([out[34], out[35]]),
+        translated,
+        "#4381: L4 source port rewritten to the unique translated port"
+    );
+    assert_eq!(
+        u16::from_be_bytes([out[36], out[37]]),
+        443,
+        "destination port unchanged"
+    );
+    // The TCP checksum after the incremental port+address delta equals a full
+    // recompute (one's-complement exactness).
+    let mut recomputed = out.clone();
+    recompute_l4_checksum_ipv4(&mut recomputed[14..], 20, PROTO_TCP, false).expect("v4 sum");
+    assert_eq!(
+        &out[50..52],
+        &recomputed[50..52],
+        "TCP checksum valid after forward port translation"
+    );
+}
+
+#[test]
+fn nat64_4381_reverse_frame_restores_each_clients_original_port() {
+    // Two clients behind ONE pool address, distinct translated ports; each
+    // reply must restore its OWN original client port (no cross-talk).
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let cases: [(Ipv6Addr, u16, u16); 2] = [
+        ("2001:db8::1".parse().unwrap(), 5000, 40001),
+        ("2001:db8::2".parse().unwrap(), 5000, 40002),
+    ];
+    for (client, orig_sport, translated) in cases {
+        // Reply: server:443 -> pool:translated (what the server replied to).
+        let reply = build_ipv4_tcp_frame(
+            server,
+            pool,
+            443,
+            translated,
+            1,
+            1,
+            crate::tcp_flags::TCP_ACK,
+        );
+        // Reverse decision = forward decision inverted (as poll_descriptor does).
+        let fwd = Nat64State::forward_decision(pool, server, translated);
+        let rev = fwd.reverse(IpAddr::V6(client), IpAddr::V6(synthetic), orig_sport, 443);
+        let decision = icmp_test_decision(rev);
+        let info = Nat64ReverseInfo {
+            orig_src_v6: client,
+            orig_dst_v6: synthetic,
+        };
+        let out = build_nat64_forwarded_frame(
+            &reply,
+            nat64_reverse_meta(),
+            &decision,
+            Some(&info),
+            false,
+        )
+        .expect("reverse NAT64 frame");
+
+        // Output is IPv6 (eth 14 + ip 40 => L4 at 54); dst IP @38..54, TCP
+        // src port @54..56, dst port @56..58.
+        assert_eq!(
+            &out[38..54],
+            &client.octets(),
+            "reply delivered to the correct original client"
+        );
+        assert_eq!(
+            u16::from_be_bytes([out[54], out[55]]),
+            443,
+            "source (server) port unchanged"
+        );
+        assert_eq!(
+            u16::from_be_bytes([out[56], out[57]]),
+            orig_sport,
+            "#4381: reply dst port restored to THIS client's original source port"
+        );
+        // Checksum valid after the reverse (dst-port + address) delta.
+        let mut recomputed = out.clone();
+        recompute_l4_checksum_ipv6(&mut recomputed[14..], 40, PROTO_TCP).expect("v6 sum");
+        assert_eq!(
+            &out[70..72],
+            &recomputed[70..72],
+            "TCP checksum valid after reverse port restoration"
+        );
+    }
+}
+
 #[test]
 fn rewrite_forwarded_frame_in_place_translates_icmpv6_echo_identifier() {
     let host = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();

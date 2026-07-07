@@ -251,7 +251,7 @@ pub(super) fn build_nat64_forwarded_frame(
                 Some(IpAddr::V4(v4)) => v4,
                 _ => return None,
             };
-            crate::nat64::build_nat64_v6_to_v4_frame(
+            let mut out = crate::nat64::build_nat64_v6_to_v4_frame(
                 frame,
                 snat_v4,
                 dst_v4,
@@ -259,23 +259,72 @@ pub(super) fn build_nat64_forwarded_frame(
                 src_mac,
                 vlan_id,
                 no_v6_frag_header,
-            )
+            )?;
+            // #4381: rewrite the L4 SOURCE port / ICMP identifier to the unique
+            // translated value the forward decision carries in `rewrite_src_port`
+            // (RFC 6146 BIB). The output is IPv4; ICMPv6 mapped to ICMPv4.
+            let out_protocol = if meta.protocol == PROTO_ICMPV6 {
+                PROTO_ICMP
+            } else {
+                meta.protocol
+            };
+            apply_nat64_port_translation(&mut out, libc::AF_INET as u8, out_protocol, decision.nat)?;
+            Some(out)
         }
         libc::AF_INET => {
             // Reverse direction: IPv4 → IPv6 (reply from server).
             let info = nat64_reverse?;
             // Reply: src_v6 = original dst (NAT64 prefix + server), dst_v6 = original client
-            crate::nat64::build_nat64_v4_to_v6_frame(
+            let mut out = crate::nat64::build_nat64_v4_to_v6_frame(
                 frame,
                 info.orig_dst_v6,
                 info.orig_src_v6,
                 dst_mac,
                 src_mac,
                 vlan_id,
-            )
+            )?;
+            // #4381: restore the ORIGINAL client L4 field. The reply arrived with
+            // the translated source port/id as its DESTINATION (that is what the
+            // server replied to), so the reverse session's decision — produced by
+            // `NatDecision::reverse` — carries the original in `rewrite_dst_port`,
+            // and the port/identifier rewriters map it back on the L4 DESTINATION.
+            // The output is IPv6; ICMPv4 mapped to ICMPv6.
+            let out_protocol = if meta.protocol == PROTO_ICMP {
+                PROTO_ICMPV6
+            } else {
+                meta.protocol
+            };
+            apply_nat64_port_translation(&mut out, libc::AF_INET6 as u8, out_protocol, decision.nat)?;
+            Some(out)
         }
         _ => None,
     }
+}
+
+/// #4381: apply the NAT64 translated L4 port / ICMP-identifier rewrite to an
+/// already address-translated output frame, reusing the same-family
+/// `apply_nat_port_rewrite` / `apply_nat_icmp_identifier_rewrite` (and their
+/// incremental-checksum handling) rather than a NAT64-private port rewriter.
+///
+/// The port/identifier value is carried on `nat`: the FORWARD decision sets the
+/// unique translated value in `rewrite_src_port` (rewrites the L4 SOURCE); the
+/// REVERSE decision — produced by `NatDecision::reverse` — sets the original in
+/// `rewrite_dst_port` (rewrites the L4 DESTINATION). Both rewriters no-op when
+/// their field is unset or the protocol carries no port/identifier, so a NAT64
+/// flow with no translatable L4 field (e.g. an ICMP error) is untouched. The
+/// address delta was already folded into the L4 checksum by the translator; the
+/// port/id delta is a further incremental fold, so the result is exact.
+fn apply_nat64_port_translation(
+    out: &mut [u8],
+    out_addr_family: u8,
+    out_protocol: u8,
+    nat: NatDecision,
+) -> Option<()> {
+    let family = checksum_family_of(out_addr_family)?;
+    let l4_off = frame_l4_offset(out, out_addr_family)?;
+    apply_nat_port_rewrite(out, l4_off, out_protocol, family, nat)?;
+    apply_nat_icmp_identifier_rewrite(out, l4_off, out_protocol, family, nat)?;
+    Some(())
 }
 
 pub(super) fn build_forwarded_frame_from_frame(

@@ -1515,12 +1515,15 @@ pub(super) fn poll_binding_process_descriptor(
                             if let IpAddr::V6(dst_v6) = resolution_target {
                                 match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
                                     crate::nat64::Nat64Match::NoPrefixMatch => None,
+                                    // #4381: the source `(snat_v4, port)` is no
+                                    // longer allocated here — it is allocated
+                                    // per-flow at the Permit branch below so a
+                                    // denied flow never consumes a pool port.
                                     crate::nat64::Nat64Match::MatchReady {
                                         prefix_idx,
                                         dst_v4,
-                                        snat_v4,
                                         dst_v6,
-                                    } => Some((prefix_idx, dst_v4, snat_v4, dst_v6)),
+                                    } => Some((prefix_idx, dst_v4, dst_v6)),
                                     crate::nat64::Nat64Match::MatchUnavailable => {
                                         // Fail closed: a NAT64 prefix matched
                                         // but the source pool is empty/exhausted.
@@ -1539,7 +1542,7 @@ pub(super) fn poll_binding_process_descriptor(
                         };
 
                         let effective_resolution_target =
-                            if let Some((_, dst_v4, _, _)) = &nat64_match {
+                            if let Some((_, dst_v4, _)) = &nat64_match {
                                 IpAddr::V4(*dst_v4)
                             } else if let Some(internal_dst) = nptv6_inbound {
                                 IpAddr::V6(internal_dst)
@@ -2617,17 +2620,54 @@ pub(super) fn poll_binding_process_descriptor(
                                             meta.addr_family,
                                         )
                                 };
-                                let nat64_info = if let Some((_, dst_v4, snat_v4, orig_dst_v6)) =
+                                let nat64_info = if let Some((prefix_idx, dst_v4, orig_dst_v6)) =
                                     nat64_match
                                 {
-                                    decision.nat = Nat64State::forward_decision(snat_v4, dst_v4);
-                                    Some(Nat64ReverseInfo {
-                                        orig_src_v6: match flow.src_ip {
-                                            IpAddr::V6(v6) => v6,
-                                            _ => std::net::Ipv6Addr::UNSPECIFIED,
-                                        },
-                                        orig_dst_v6: orig_dst_v6,
-                                    })
+                                    // #4381: allocate a UNIQUE translated
+                                    // (pool v4 source, L4 port/identifier) for
+                                    // this admitted forward flow, reusing the
+                                    // pool-mode SNAT PortAllocator (RFC 6146
+                                    // BIB). Two v6 clients behind one pool
+                                    // address that share a source port/echo id
+                                    // now get distinct translated values, so
+                                    // their reverse (v4->v6) tuples never
+                                    // collide.
+                                    let orig_src_v6 = match flow.src_ip {
+                                        IpAddr::V6(v6) => v6,
+                                        _ => std::net::Ipv6Addr::UNSPECIFIED,
+                                    };
+                                    match worker_ctx.forwarding.nat64.allocate_source(
+                                        prefix_idx,
+                                        meta.protocol,
+                                        orig_src_v6,
+                                        dst_v4,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                        now_ns,
+                                    ) {
+                                        Ok((snat_v4, translated_port)) => {
+                                            decision.nat = Nat64State::forward_decision(
+                                                snat_v4,
+                                                dst_v4,
+                                                translated_port,
+                                            );
+                                            Some(Nat64ReverseInfo {
+                                                orig_src_v6,
+                                                orig_dst_v6,
+                                            })
+                                        }
+                                        Err(_) => {
+                                            // Fail closed: the pool is exhausted
+                                            // (no free translated port). Drop
+                                            // rather than emit a colliding
+                                            // translation. Nothing was allocated
+                                            // or installed yet on this flow, so a
+                                            // bare recycle is a clean bail.
+                                            telemetry.counters.nat64_no_source_pool += 1;
+                                            binding.scratch.scratch_recycle.push(desc.addr);
+                                            continue;
+                                        }
+                                    }
                                 } else {
                                     // Check NPTv6 outbound, then static NAT SNAT, then interface SNAT.
                                     // Use merge() to combine with any pre-routing DNAT
@@ -2742,6 +2782,18 @@ pub(super) fn poll_binding_process_descriptor(
                                             now_ns,
                                         );
                                     }
+                                    // #4381: a NAT64 forward flow whose hop-limit
+                                    // expired allocated a translated pool port at
+                                    // the branch above; roll it back so the
+                                    // ICMP-TE bounce does not leak it (self-gated
+                                    // on `nat.nat64`).
+                                    crate::nat64::rollback_nat64_allocation(
+                                        &worker_ctx.forwarding.nat64,
+                                        &flow.forward_key,
+                                        decision.nat,
+                                        false,
+                                        now_ns,
+                                    );
                                     binding.scratch.scratch_forwards.push(request);
                                     recycle_now = false;
                                 } else {
@@ -2788,6 +2840,15 @@ pub(super) fn poll_binding_process_descriptor(
                                             source_nat_release_key
                                                 .as_ref()
                                                 .unwrap_or(&flow.forward_key),
+                                            decision.nat,
+                                            false,
+                                            now_ns,
+                                        );
+                                        // #4381: also roll back any NAT64 pool
+                                        // port (self-gated on `nat.nat64`).
+                                        crate::nat64::rollback_nat64_allocation(
+                                            &worker_ctx.forwarding.nat64,
+                                            &flow.forward_key,
                                             decision.nat,
                                             false,
                                             now_ns,
@@ -2877,6 +2938,15 @@ pub(super) fn poll_binding_process_descriptor(
                                             source_nat_release_key
                                                 .as_ref()
                                                 .unwrap_or(&flow.forward_key),
+                                            decision.nat,
+                                            false,
+                                            now_ns,
+                                        );
+                                        // #4381: also roll back any NAT64 pool
+                                        // port (self-gated on `nat.nat64`).
+                                        crate::nat64::rollback_nat64_allocation(
+                                            &worker_ctx.forwarding.nat64,
+                                            &flow.forward_key,
                                             decision.nat,
                                             false,
                                             now_ns,
@@ -2983,6 +3053,16 @@ pub(super) fn poll_binding_process_descriptor(
                                             false,
                                             now_ns,
                                         );
+                                        // #4381: also release any NAT64 pool port
+                                        // when no session anchors it (self-gated
+                                        // on `nat.nat64`).
+                                        crate::nat64::rollback_nat64_allocation(
+                                            &worker_ctx.forwarding.nat64,
+                                            &flow.forward_key,
+                                            decision.nat,
+                                            false,
+                                            now_ns,
+                                        );
                                     }
                                     let reverse_resolution = reverse_resolution_for_session(
                                         worker_ctx.forwarding,
@@ -3028,17 +3108,27 @@ pub(super) fn poll_binding_process_descriptor(
                                             PROTO_ICMPV6 => PROTO_ICMP,
                                             p => p,
                                         };
+                                        // #4381: the reply's L4 field the server
+                                        // replies TO is the UNIQUE translated
+                                        // source port / echo identifier (carried
+                                        // in `rewrite_src_port`), NOT the
+                                        // original v6 client value. The reverse
+                                        // key must therefore key on the
+                                        // translated value or the reply misses
+                                        // the session. For TCP/UDP the reply's
+                                        // destination port is the translated
+                                        // port; for ICMP echo the reply's
+                                        // identifier (mapped to `src_port` by
+                                        // `parse_flow_ports`) is the translated
+                                        // id.
+                                        let translated_l4 = nat
+                                            .rewrite_src_port
+                                            .unwrap_or(flow.forward_key.src_port);
                                         let (src_port, dst_port) =
                                             if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                                                (
-                                                    flow.forward_key.src_port,
-                                                    flow.forward_key.dst_port,
-                                                )
+                                                (translated_l4, flow.forward_key.dst_port)
                                             } else {
-                                                (
-                                                    flow.forward_key.dst_port,
-                                                    flow.forward_key.src_port,
-                                                )
+                                                (flow.forward_key.dst_port, translated_l4)
                                             };
                                         (
                                             SessionKey {

@@ -29,6 +29,18 @@ pub(in crate::afxdp::session_glue) fn handle_delete_synced(
             lookup.metadata.is_reverse,
             now_ns,
         );
+        // #4381: mirror for NAT64. A standby imports the NAT64 decision without
+        // calling `allocate_source`, so this is a no-op today (the local NAT64
+        // allocator holds no record); it keeps the release symmetric with the
+        // reap/purge sites and is correct if a NAT64 synced-port reservation is
+        // added later.
+        crate::nat64::release_nat64_allocation(
+            &forwarding.nat64,
+            &key,
+            lookup.decision.nat,
+            lookup.metadata.is_reverse,
+            now_ns,
+        );
         delete_session_map_entry_for_removed_session(
             session_map_fd,
             &key,
