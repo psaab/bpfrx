@@ -27,279 +27,22 @@ import (
 // import cycle.
 type LeafValidator func(raw string, cfg *Config) error
 
-// validateRate accepts a Junos bandwidth value (bits/sec) like
-// "100k", "10m", "1g", or a bare positive integer. Empty input is
-// rejected — a typed leaf with no value is meaningless. Values below
-// 8 bps are rejected because the compiler stores scheduler rates in
-// bytes/sec; accepting 1..7 bps would round-trip as 0 and silently
-// disable the configured rate.
-func ValidateRate(raw string, _ *Config) error {
-	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("missing value (expected bandwidth, e.g. 100k, 10m, 1g)")
+// validateEnum returns a closure that accepts only one of the listed
+// names (case-sensitive, exact match).
+func ValidateEnum(allowed []string) LeafValidator {
+	sorted := append([]string(nil), allowed...)
+	sort.Strings(sorted)
+	set := make(map[string]struct{}, len(sorted))
+	for _, a := range sorted {
+		set[a] = struct{}{}
 	}
-	bps, err := parseScaledDecimalUnitStrict(raw)
-	if err != nil {
-		return fmt.Errorf("not a valid bandwidth (expected k/m/g suffix, e.g. 10m): %w", err)
-	}
-	if bps < 8 {
-		return fmt.Errorf("bandwidth must be at least 8 bps so it compiles to a non-zero byte/sec rate (got %q)", raw)
-	}
-	return nil
-}
-
-// validateByteSize accepts the byte-size form the current CoS compiler
-// consumes. Reject bare integers here so `buffer-size 50` cannot pass
-// validation and compile as a 50-byte queue.
-func ValidateByteSize(raw string, _ *Config) error {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return fmt.Errorf("missing value (expected byte-size with k/m/g suffix, e.g. 16m)")
-	}
-	if _, err := strconv.ParseUint(trimmed, 10, 64); err == nil {
-		return fmt.Errorf("bare byte-size %q is ambiguous; use an explicit suffix like 50k or 16m", raw)
-	}
-	if _, err := parseBurstSizeLimitStrict(trimmed); err != nil {
-		return fmt.Errorf("not a valid byte-size (expected 16m, 256k, or 1g): %w", err)
-	}
-	return nil
-}
-
-// ValidateCoSTransmitRateTail validates the whole tail of a CoS scheduler
-// `transmit-rate` leaf (#4228 Gap 2). Junos accepts three mutually-exclusive
-// heads — a bandwidth (10m), `percent <n>`, or `remainder` — each optionally
-// followed by the `exact` modifier. The percent/remainder forms are accepted
-// for vSRX-config import parity; they compile to a stored percent/flag that
-// the userspace dataplane does not yet resolve to an absolute rate (a commit
-// advisory surfaces the inertness).
-func ValidateCoSTransmitRateTail(tokens []string, siblingTails [][]string) error {
-	return validateCoSRateTail(tokens, siblingTails, true /*allowRemainder*/, true /*allowExact*/)
-}
-
-// ValidateCoSShapingRateTail validates the tail of a CoS `shaping-rate` leaf
-// (traffic-control-profiles, #4228 Gap 2): a bandwidth (10m) or `percent <n>`.
-// Junos shaping-rate has no `remainder` or `exact` modifier, so both are
-// rejected here.
-func ValidateCoSShapingRateTail(tokens []string, siblingTails [][]string) error {
-	return validateCoSRateTail(tokens, siblingTails, false /*allowRemainder*/, false /*allowExact*/)
-}
-
-// validateCoSRateTail is the shared grammar check for transmit-rate /
-// shaping-rate. It rejects garbage loud at commit (preserving the #4217
-// silent-zero protection) while accepting the percent/remainder forms.
-func validateCoSRateTail(tokens []string, siblingTails [][]string, allowRemainder, allowExact bool) error {
-	forms := "a bandwidth (e.g. 10m) or `percent <n>`"
-	if allowRemainder {
-		forms = "a bandwidth (e.g. 10m), `percent <n>`, or `remainder`"
-	}
-	if len(tokens) == 0 {
-		return fmt.Errorf("missing value (expected %s)", forms)
-	}
-	head := tokens[0]
-	rest := tokens[1:]
-	switch {
-	case head == "percent":
-		if len(rest) == 0 {
-			return fmt.Errorf("percent requires a value (e.g. percent 50)")
-		}
-		if err := validateCoSPercentValue(rest[0]); err != nil {
-			return err
-		}
-		rest = rest[1:]
-	case allowRemainder && head == "remainder":
-		// remainder takes no operand.
-	case allowExact && head == "exact":
-		// Modifier-only split-set line (`transmit-rate exact` beside a
-		// sibling `transmit-rate 1g`). Accept iff a sibling supplies a value
-		// head; otherwise `exact` alone is meaningless.
-		if coSRateSiblingSuppliesValue(siblingTails, allowRemainder) {
+	return func(raw string, _ *Config) error {
+		if _, ok := set[raw]; ok {
 			return nil
 		}
-		return fmt.Errorf("exact requires a rate (e.g. a sibling transmit-rate <value>)")
-	default:
-		if err := ValidateRate(head, nil); err != nil {
-			return fmt.Errorf("not a valid rate (expected %s): %w", forms, err)
-		}
+		return fmt.Errorf("invalid value %q (expected one of: %s)", raw, strings.Join(sorted, ", "))
 	}
-	// Only `exact` may trail the value (transmit-rate); shaping-rate allows no
-	// trailing modifier.
-	for _, t := range rest {
-		if allowExact && t == "exact" {
-			continue
-		}
-		return fmt.Errorf("unknown modifier %q", t)
-	}
-	return nil
 }
-
-// validateCoSPercentValue accepts a percent operand in the range (0, 100].
-// 0% is rejected because a zero rate compiles indistinguishably from "unset".
-func validateCoSPercentValue(raw string) error {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return fmt.Errorf("percent requires a value (e.g. percent 50)")
-	}
-	v, err := strconv.ParseFloat(trimmed, 64)
-	if err != nil {
-		return fmt.Errorf("invalid percent %q: not a number", raw)
-	}
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return fmt.Errorf("invalid percent %q: non-finite", raw)
-	}
-	if v <= 0 || v > 100 {
-		return fmt.Errorf("percent out of range (0,100] (got %s)", raw)
-	}
-	return nil
-}
-
-// coSRateSiblingSuppliesValue reports whether any sibling tail begins with a
-// value head (a bandwidth, `percent`, or — when allowed — `remainder`), used to
-// accept a modifier-only `exact` split-set line.
-func coSRateSiblingSuppliesValue(siblingTails [][]string, allowRemainder bool) bool {
-	for _, tail := range siblingTails {
-		if len(tail) == 0 {
-			continue
-		}
-		head := tail[0]
-		if head == "percent" {
-			return true
-		}
-		if allowRemainder && head == "remainder" {
-			return true
-		}
-		if ValidateRate(head, nil) == nil {
-			return true
-		}
-	}
-	return false
-}
-
-// ValidateByteSizeOrPercent accepts the two scheduler buffer-size forms
-// that the CoS runtime can represent: explicit byte sizes with k/m/g
-// suffixes, or Junos percent values with a trailing percent sign. Bare
-// integers stay rejected because they are ambiguous between bytes and
-// percent.
-func ValidateByteSizeOrPercent(raw string, _ *Config) error {
-	trimmed := strings.TrimSpace(raw)
-	if strings.HasSuffix(trimmed, "%") {
-		if _, err := parsePercentWithSuffixStrict(trimmed); err != nil {
-			return fmt.Errorf("not a valid percent buffer-size (expected >0%%..100%%; xpf rejects Junos 0%% because zero is the legacy absent-field value): %w", err)
-		}
-		return nil
-	}
-	return ValidateByteSize(raw, nil)
-}
-
-func parsePercentWithSuffixStrict(raw string) (float64, error) {
-	orig := raw
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return 0, fmt.Errorf("empty value")
-	}
-	if !strings.HasSuffix(trimmed, "%") {
-		return 0, fmt.Errorf("missing percent suffix in %q", orig)
-	}
-	number := strings.TrimSpace(strings.TrimSuffix(trimmed, "%"))
-	if number == "" {
-		return 0, fmt.Errorf("empty percent in %q", orig)
-	}
-	v, err := strconv.ParseFloat(number, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid percent %q: %w", orig, err)
-	}
-	if math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0, fmt.Errorf("invalid percent %q: non-finite", orig)
-	}
-	// xpf intentionally rejects 0% even though Junos allows it.
-	// A 0% buffer allocation compiles to zero bytes at runtime and is
-	// indistinguishable from "no buffer-size configured" -- the runtime
-	// would silently fall back to the default 10 ms burst calculation.
-	// Using the default path directly is unambiguous; disallowing 0%
-	// avoids silent no-op configs that look correct but do nothing.
-	if v <= 0 || v > 100 {
-		return 0, fmt.Errorf("percent out of range (0,100] (got %s); note: 0%% is not supported -- omit buffer-size to use the default burst", orig)
-	}
-	return v, nil
-}
-
-// MaxDurationMillis is the largest millisecond count that survives the
-// runtime's `time.Duration(ms) * time.Millisecond` conversion without
-// int64 overflow (math.MaxInt64 / 1e6 = 9223372036854). Above this, a
-// configured millisecond knob converts to a negative Duration — e.g. the
-// cluster heartbeat sender ticker panics on a non-positive interval. Used
-// as the honest runtime-derived upper bound for millisecond typed leaves
-// whose runtime otherwise accepts any positive value (#1319 PR 2; Codex
-// review on PR #1845: no schema-only caps).
-const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
-
-// MaxDurationSeconds is the seconds analogue of MaxDurationMillis: the
-// largest second count that survives `time.Duration(n) * time.Second`
-// without int64 overflow (math.MaxInt64 / 1e9 = 9223372036). Used for
-// second-denominated typed leaves whose runtime otherwise accepts any
-// non-negative value (e.g. services ip-monitoring hold-down,
-// pkg/ipmon/ipmon.go:480 — an overflowed negative hold would silently
-// invert the damping behaviour).
-const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
-
-// MaxRingEntries is the inclusive upper bound for the AF_XDP `ring-entries`
-// per-queue knob (#2524). The Rust helper preallocates UMEM frames directly
-// from this value: per bind.rs binding_frame_count_for_driver, a virtio_net
-// binding reserves ~3×ring_entries frames at UMEM_FRAME_SIZE=4096, i.e.
-// ~96 MB per binding at ring_entries=8192 (×queues ×interfaces). With no
-// ceiling a fat-fingered or malicious value drove an enormous preallocation
-// and OOM'd at bring-up instead of failing as a clean commit/startup error.
-// 16384 is double the documented 8192 example (~192 MB/binding worst case)
-// and is the largest value we consider sane on a router; it must agree with
-// the Rust backstop (afxdp/coordinator/reconcile/bringup.rs clamps to the
-// same ceiling). The value must additionally be a power of two — the helper
-// rounds ring sizes up to a power of two (xsk_ffi.rs next_power_of_two), so
-// requiring it at commit keeps the configured number honest about the size
-// actually allocated.
-const MaxRingEntries = int64(16384)
-
-// ValidateRingEntries accepts a bare integer in [1, MaxRingEntries] that is
-// also a power of two. It is the typed-leaf gate for `system dataplane
-// ring-entries` (#2524). Before #2524 the leaf used ValidateIntegerMin(1):
-// any large value committed and was passed to the dataplane, where it sized
-// per-binding UMEM preallocations and could OOM at bring-up. The power-of-two
-// requirement matches the helper's own rounding so the operator-visible
-// number equals the allocated ring depth.
-func ValidateRingEntries(raw string, _ *Config) error {
-	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("missing value (expected integer)")
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return fmt.Errorf("not an integer: %q", raw)
-	}
-	if v < 1 || v > MaxRingEntries {
-		return fmt.Errorf("ring-entries out of range [1..%d] (got %d)", MaxRingEntries, v)
-	}
-	if v&(v-1) != 0 {
-		return fmt.Errorf("ring-entries must be a power of two in [1..%d] (got %d)", MaxRingEntries, v)
-	}
-	return nil
-}
-
-// maxWireU16 / maxWireU32 are the inclusive ceilings for typed leaves
-// whose value lands in a Rust u16 / u32 wire field. #1979 Layer B uses
-// these so the commit-time range gate agrees EXACTLY with the build-time
-// coercion in pkg/dataplane/userspace/flow.go (Layer A, #1977): a value
-// Layer B accepts is one Layer A leaves unchanged, and a value Layer B
-// rejects is one Layer A would have coerced. (math.MaxUint16 /
-// math.MaxUint32 are untyped constants; naming them keeps the schema
-// aspect files import-free and the bound self-documenting.)
-const (
-	maxWireU16 = int64(math.MaxUint16)
-	maxWireU32 = int64(math.MaxUint32)
-	// maxWireI32 is the inclusive ceiling for a typed leaf whose value lands
-	// in a Rust i32 wire field (e.g. RouteSnapshot.preference, #3771). Junos
-	// route preference is a non-negative admin distance whose documented range
-	// runs to 2^32-1, but the snapshot serializes it as i32, so the
-	// wire-representable non-negative ceiling is math.MaxInt32 — a value above
-	// it would overflow the Rust i32 decode (failing the whole snapshot). The
-	// Rust helper backstops the lower bound too (RoutePreferenceOutOfRange).
-	maxWireI32 = int64(math.MaxInt32)
-)
 
 // ValidateIntegerMin returns a closure that accepts any bare integer
 // >= min — the "no upper bound" spelling for typed leaves whose runtime
@@ -342,73 +85,63 @@ func ValidateInteger(min, max int64) LeafValidator {
 	}
 }
 
-// ValidateBGPHoldTime accepts a BGP hold-time in seconds: 0, or 3..65535.
-// FRR (and RFC 4271 §4.2 / §10) require the hold-time to be either 0
-// (hold timer disabled) or at least 3 seconds — the keepalive interval is
-// hold-time/3, so a hold-time of 1 or 2 yields a sub-second/zero keepalive
-// that FRR's `neighbor X timers <keepalive> <hold>` command REJECTS, and a
-// rejected line fails the WHOLE frr-reload (a single `vtysh -f` add-batch
-// exits non-zero on any CMD_WARNING_CONFIG_FAILED) — one bad leaf takes
-// down every routing change on that reload. The renderer treats 0 as "unset"
-// via its `> 0` gate (no `timers` line), an accepted documented tradeoff, so
-// 0 is permitted here; 1 and 2 are the values that must be rejected at commit
-// before they can reach frr-reload. Upper bound is the 16-bit on-wire max.
-func ValidateBGPHoldTime(raw string, _ *Config) error {
-	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("missing value (expected integer)")
-	}
-	v, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return fmt.Errorf("not an integer: %q", raw)
-	}
-	if v != 0 && (v < 3 || v > 65535) {
-		return fmt.Errorf("BGP hold-time must be 0 or 3..65535 seconds (got %d); FRR rejects 1/2 and a rejected timers line fails the whole reload", v)
-	}
-	return nil
-}
-
-// ValidateDHGroup accepts a Diffie-Hellman group as either a bare integer
-// (e.g. "14") or the Junos "group<N>" spelling (e.g. "group14") — both are
-// configured in the wild and both compile (compiler_ipsec.go strips the
-// "group" prefix then Atoi's the remainder). The group number must be a
-// positive integer: the compiler leaves DHGroup at 0 on a parse failure,
-// and a 0/garbage group silently drops the modp term from the swanctl
-// proposal (pkg/ipsec/ipsec.go buildIKEProposal / buildESPProposal gate on
-// DHGroup > 0), so an invalid value commits and then quietly weakens the
-// negotiated proposal. This validator closes that silent-drop while staying
-// faithful to the two spellings the compiler already accepts.
-func ValidateDHGroup(raw string, _ *Config) error {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return fmt.Errorf("missing value (expected a DH group, e.g. 14 or group14)")
-	}
-	num := strings.TrimPrefix(trimmed, "group")
-	v, err := strconv.Atoi(num)
-	if err != nil {
-		return fmt.Errorf("not a valid DH group (got %q; expected an integer like 14 or group14)", raw)
-	}
-	if v < 1 {
-		return fmt.Errorf("DH group must be a positive integer (got %d); 0 silently drops the modp term from the negotiated proposal", v)
-	}
-	return nil
-}
-
-// validateEnum returns a closure that accepts only one of the listed
-// names (case-sensitive, exact match).
-func ValidateEnum(allowed []string) LeafValidator {
-	sorted := append([]string(nil), allowed...)
-	sort.Strings(sorted)
-	set := make(map[string]struct{}, len(sorted))
-	for _, a := range sorted {
-		set[a] = struct{}{}
-	}
+// validatePercent returns a closure that accepts a real number in
+// [min, max] inclusive. The input must parse as a float.
+func ValidatePercent(min, max float64) LeafValidator {
 	return func(raw string, _ *Config) error {
-		if _, ok := set[raw]; ok {
-			return nil
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("missing value (expected percent %.0f..%.0f)", min, max)
 		}
-		return fmt.Errorf("invalid value %q (expected one of: %s)", raw, strings.Join(sorted, ", "))
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return fmt.Errorf("not a number: %q", raw)
+		}
+		if v < min || v > max {
+			return fmt.Errorf("percent out of range [%.2f..%.2f] (got %s)", min, max, raw)
+		}
+		return nil
 	}
 }
+
+// MaxDurationMillis is the largest millisecond count that survives the
+// runtime's `time.Duration(ms) * time.Millisecond` conversion without
+// int64 overflow (math.MaxInt64 / 1e6 = 9223372036854). Above this, a
+// configured millisecond knob converts to a negative Duration — e.g. the
+// cluster heartbeat sender ticker panics on a non-positive interval. Used
+// as the honest runtime-derived upper bound for millisecond typed leaves
+// whose runtime otherwise accepts any positive value (#1319 PR 2; Codex
+// review on PR #1845: no schema-only caps).
+const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
+
+// MaxDurationSeconds is the seconds analogue of MaxDurationMillis: the
+// largest second count that survives `time.Duration(n) * time.Second`
+// without int64 overflow (math.MaxInt64 / 1e9 = 9223372036). Used for
+// second-denominated typed leaves whose runtime otherwise accepts any
+// non-negative value (e.g. services ip-monitoring hold-down,
+// pkg/ipmon/ipmon.go:480 — an overflowed negative hold would silently
+// invert the damping behaviour).
+const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
+
+// maxWireU16 / maxWireU32 are the inclusive ceilings for typed leaves
+// whose value lands in a Rust u16 / u32 wire field. #1979 Layer B uses
+// these so the commit-time range gate agrees EXACTLY with the build-time
+// coercion in pkg/dataplane/userspace/flow.go (Layer A, #1977): a value
+// Layer B accepts is one Layer A leaves unchanged, and a value Layer B
+// rejects is one Layer A would have coerced. (math.MaxUint16 /
+// math.MaxUint32 are untyped constants; naming them keeps the schema
+// aspect files import-free and the bound self-documenting.)
+const (
+	maxWireU16 = int64(math.MaxUint16)
+	maxWireU32 = int64(math.MaxUint32)
+	// maxWireI32 is the inclusive ceiling for a typed leaf whose value lands
+	// in a Rust i32 wire field (e.g. RouteSnapshot.preference, #3771). Junos
+	// route preference is a non-negative admin distance whose documented range
+	// runs to 2^32-1, but the snapshot serializes it as i32, so the
+	// wire-representable non-negative ceiling is math.MaxInt32 — a value above
+	// it would overflow the Rust i32 decode (failing the whole snapshot). The
+	// Rust helper backstops the lower bound too (RoutePreferenceOutOfRange).
+	maxWireI32 = int64(math.MaxInt32)
+)
 
 // IP / CIDR validators (#1319 PR 3, interfaces subsystem). They reuse the
 // net package parsers the runtime consumers use (net.ParseIP /
@@ -544,6 +277,31 @@ func parseCIDRStrict(raw, example string) (net.IP, error) {
 		return nil, fmt.Errorf("not a valid address/prefix-length (expected e.g. %s): %v", example, err)
 	}
 	return ip, nil
+}
+
+// ValidateBGPHoldTime accepts a BGP hold-time in seconds: 0, or 3..65535.
+// FRR (and RFC 4271 §4.2 / §10) require the hold-time to be either 0
+// (hold timer disabled) or at least 3 seconds — the keepalive interval is
+// hold-time/3, so a hold-time of 1 or 2 yields a sub-second/zero keepalive
+// that FRR's `neighbor X timers <keepalive> <hold>` command REJECTS, and a
+// rejected line fails the WHOLE frr-reload (a single `vtysh -f` add-batch
+// exits non-zero on any CMD_WARNING_CONFIG_FAILED) — one bad leaf takes
+// down every routing change on that reload. The renderer treats 0 as "unset"
+// via its `> 0` gate (no `timers` line), an accepted documented tradeoff, so
+// 0 is permitted here; 1 and 2 are the values that must be rejected at commit
+// before they can reach frr-reload. Upper bound is the 16-bit on-wire max.
+func ValidateBGPHoldTime(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected integer)")
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("not an integer: %q", raw)
+	}
+	if v != 0 && (v < 3 || v > 65535) {
+		return fmt.Errorf("BGP hold-time must be 0 or 3..65535 seconds (got %d); FRR rejects 1/2 and a rejected timers line fails the whole reload", v)
+	}
+	return nil
 }
 
 // routeFilterMatchTypes are the match-type keywords accepted in a
@@ -716,41 +474,30 @@ func plausibleInterfaceName(s string) bool {
 	return hasLetter
 }
 
-// validateForwardingClassRef is the #1319 PR 3 tree-based
-// cross-reference validator for `firewall family inet/inet6 filter
-// <f> term <t> then forwarding-class <name>`. The dataplane resolves
-// the name with a map lookup against the CONFIGURED forwarding classes
-// (queue_by_forwarding_class, userspace-dp
-// src/afxdp/tx/cos_classify.rs:371) and silently leaves the packet on
-// the default queue when it misses — a dangling reference commits fine
-// and then does nothing. The reference is valid when:
-//
-//   - the name is defined via `class-of-service forwarding-classes
-//     queue <n> <name>` anywhere in the candidate tree (collected by
-//     collectSchemaRefs from the SAME tree being committed, so a
-//     definition + reference in one commit validates atomically), or
-//   - the name is "best-effort": when no forwarding-classes are
-//     configured the dataplane synthesizes a best-effort queue
-//     (forwarding_build/cos.rs:404-407), so that name is always
-//     resolvable.
-//
-// xpf-DIVERGENT from Junos: the other three Junos default classes
-// (expedited-forwarding, assured-forwarding, network-control) are NOT
-// implicitly defined by the xpf runtime — referencing them without a
-// definition is exactly the silent no-op this gate exists to close.
-func validateForwardingClassRef(raw string, refs *schemaRefs) error {
-	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("missing value (expected a forwarding-class name)")
+// ValidateDHGroup accepts a Diffie-Hellman group as either a bare integer
+// (e.g. "14") or the Junos "group<N>" spelling (e.g. "group14") — both are
+// configured in the wild and both compile (compiler_ipsec.go strips the
+// "group" prefix then Atoi's the remainder). The group number must be a
+// positive integer: the compiler leaves DHGroup at 0 on a parse failure,
+// and a 0/garbage group silently drops the modp term from the swanctl
+// proposal (pkg/ipsec/ipsec.go buildIKEProposal / buildESPProposal gate on
+// DHGroup > 0), so an invalid value commits and then quietly weakens the
+// negotiated proposal. This validator closes that silent-drop while staying
+// faithful to the two spellings the compiler already accepts.
+func ValidateDHGroup(raw string, _ *Config) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("missing value (expected a DH group, e.g. 14 or group14)")
 	}
-	if raw == "best-effort" {
-		return nil
+	num := strings.TrimPrefix(trimmed, "group")
+	v, err := strconv.Atoi(num)
+	if err != nil {
+		return fmt.Errorf("not a valid DH group (got %q; expected an integer like 14 or group14)", raw)
 	}
-	if refs != nil {
-		if _, ok := refs.forwardingClasses[raw]; ok {
-			return nil
-		}
+	if v < 1 {
+		return fmt.Errorf("DH group must be a positive integer (got %d); 0 silently drops the modp term from the negotiated proposal", v)
 	}
-	return fmt.Errorf("forwarding-class %q is not defined; add `set class-of-service forwarding-classes queue <queue-id> %s` in the same commit (xpf does not implicitly define the Junos default classes other than best-effort)", raw, raw)
+	return nil
 }
 
 // validateLoginClassRef accepts a `system login user <n> class <c>` value that
@@ -773,24 +520,6 @@ func validateLoginClassRef(raw string, refs *schemaRefs) error {
 	}
 	return fmt.Errorf("login class %q is not defined; use a system-defined class (one of: %s) or add `set system login class %s permissions <...>` in the same commit",
 		raw, strings.Join(ValidLoginClasses(), ", "), raw)
-}
-
-// validatePercent returns a closure that accepts a real number in
-// [min, max] inclusive. The input must parse as a float.
-func ValidatePercent(min, max float64) LeafValidator {
-	return func(raw string, _ *Config) error {
-		if strings.TrimSpace(raw) == "" {
-			return fmt.Errorf("missing value (expected percent %.0f..%.0f)", min, max)
-		}
-		v, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return fmt.Errorf("not a number: %q", raw)
-		}
-		if v < min || v > max {
-			return fmt.Errorf("percent out of range [%.2f..%.2f] (got %s)", min, max, raw)
-		}
-		return nil
-	}
 }
 
 // cryptModularIDs is the set of crypt(3) modular-hash identifiers xpf
@@ -907,6 +636,46 @@ func ValidateCryptHash(raw string, _ *Config) error {
 				return fmt.Errorf("invalid character %q in crypt hash %q", r, raw)
 			}
 		}
+	}
+	return nil
+}
+
+// MaxRingEntries is the inclusive upper bound for the AF_XDP `ring-entries`
+// per-queue knob (#2524). The Rust helper preallocates UMEM frames directly
+// from this value: per bind.rs binding_frame_count_for_driver, a virtio_net
+// binding reserves ~3×ring_entries frames at UMEM_FRAME_SIZE=4096, i.e.
+// ~96 MB per binding at ring_entries=8192 (×queues ×interfaces). With no
+// ceiling a fat-fingered or malicious value drove an enormous preallocation
+// and OOM'd at bring-up instead of failing as a clean commit/startup error.
+// 16384 is double the documented 8192 example (~192 MB/binding worst case)
+// and is the largest value we consider sane on a router; it must agree with
+// the Rust backstop (afxdp/coordinator/reconcile/bringup.rs clamps to the
+// same ceiling). The value must additionally be a power of two — the helper
+// rounds ring sizes up to a power of two (xsk_ffi.rs next_power_of_two), so
+// requiring it at commit keeps the configured number honest about the size
+// actually allocated.
+const MaxRingEntries = int64(16384)
+
+// ValidateRingEntries accepts a bare integer in [1, MaxRingEntries] that is
+// also a power of two. It is the typed-leaf gate for `system dataplane
+// ring-entries` (#2524). Before #2524 the leaf used ValidateIntegerMin(1):
+// any large value committed and was passed to the dataplane, where it sized
+// per-binding UMEM preallocations and could OOM at bring-up. The power-of-two
+// requirement matches the helper's own rounding so the operator-visible
+// number equals the allocated ring depth.
+func ValidateRingEntries(raw string, _ *Config) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected integer)")
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("not an integer: %q", raw)
+	}
+	if v < 1 || v > MaxRingEntries {
+		return fmt.Errorf("ring-entries out of range [1..%d] (got %d)", MaxRingEntries, v)
+	}
+	if v&(v-1) != 0 {
+		return fmt.Errorf("ring-entries must be a power of two in [1..%d] (got %d)", MaxRingEntries, v)
 	}
 	return nil
 }
