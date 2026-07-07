@@ -97,7 +97,10 @@ func TestParseMonitorTrafficMultiTokenFilter(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			iface, filter, count := parseMonitorTrafficArgs(tt.args)
+			iface, filter, count, err := parseMonitorTrafficArgs(tt.args)
+			if err != nil {
+				t.Fatalf("parseMonitorTrafficArgs(%v) unexpected error: %v", tt.args, err)
+			}
 			if iface != tt.wantIface {
 				t.Errorf("iface = %q, want %q", iface, tt.wantIface)
 			}
@@ -117,9 +120,12 @@ func TestParseMonitorTrafficMultiTokenFilter(t *testing.T) {
 // consumes a filter. Goes RED on revert — the truncated filter would
 // place only `tcp` (or `"tcp`) after the interface flags.
 func TestBuildMonitorTrafficArgvFilterReachesTcpdump(t *testing.T) {
-	iface, filter, count := parseMonitorTrafficArgs(
+	iface, filter, count, err := parseMonitorTrafficArgs(
 		[]string{"interface", "ge-0-0-0", "matching", `"tcp`, "port", `80"`, "count", "20"},
 	)
+	if err != nil {
+		t.Fatalf("parseMonitorTrafficArgs unexpected error: %v", err)
+	}
 	argv := buildMonitorTrafficArgv(iface, filter, count)
 	// The filter follows an explicit "--" end-of-options separator (#4524).
 	want := []string{"tcpdump", "-i", "ge-0-0-0", "-n", "-l", "-c", "20", "--", "tcp", "port", "80"}

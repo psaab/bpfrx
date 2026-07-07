@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,10 +45,32 @@ type apiRuntimeDataPlane interface {
 	GetMapStats() []dataplane.MapStats
 }
 
+// writeJSON encodes v and writes it as the response body with the given
+// status. It marshals to a buffer FIRST so a marshal failure becomes a
+// clean 500 instead of a truncated 200: the old form set the 200 status
+// line and Content-Type before json.NewEncoder(w).Encode(v) ran, so an
+// Encode error (a partial write, already committed to the 200 status) left
+// the client with a truncated body under a success code (#4541). Buffering
+// first keeps the header uncommitted until the encode is known to succeed.
+//
+// The success path is byte-identical to the previous behavior: json.Marshal
+// produces the same bytes as Encoder.Encode minus its trailing newline, so
+// the '\n' is re-appended to preserve the exact wire body.
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	buf, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("api: failed to encode JSON response", "err", err, "status", status)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		// Static body: v itself failed to marshal, so nothing derived from
+		// it can be safely encoded here.
+		w.Write([]byte(`{"success":false,"error":"internal server error: response encoding failed"}` + "\n"))
+		return
+	}
+	buf = append(buf, '\n')
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	w.Write(buf)
 }
 
 func writeOK(w http.ResponseWriter, data any) {
