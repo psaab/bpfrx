@@ -21,7 +21,7 @@ func TestUserspaceStartupUsesShimLoaderBoundary(t *testing.T) {
 		t.Fatalf("userspace Load must not call legacy Manager.Load:\n%s", loadSrc)
 	}
 
-	compileSrc := goFunctionSource(t, "manager.go", "Compile")
+	compileSrc := goFunctionSource(t, "manager_compile.go", "Compile")
 	if !strings.Contains(compileSrc, "CompileUserspaceShim") {
 		t.Fatalf("userspace Compile must use CompileUserspaceShim, got:\n%s", compileSrc)
 	}

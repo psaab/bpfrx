@@ -1,0 +1,231 @@
+package userspace
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
+	status.DataplaneMode = m.mode.String()
+	status.ConfiguredMode = m.configuredMode.String()
+	status.EntryPrograms = m.entryProgramsLocked()
+	status.DegradedPathCounters = m.readDegradedPathStatsLocked()
+	// #3261: stamp the manager-owned snapshot-reject diagnostic onto the status
+	// the helper round-trip cannot carry (the helper has no PolicyContentRejected
+	// field and strips it on decode). This keeps the rejected-snapshot state
+	// observable in `show`/metrics even though the helper reports the
+	// previous-good capabilities.
+	status.LastSnapshotRejectReasons = append([]string(nil), m.lastSnapshotRejectReasons...)
+	// #3719: stamp the manager-owned zone-id-collision diagnostic (the helper
+	// cannot carry it — the colliding zone was dropped before the wire) so the
+	// degraded zone-isolation state is observable in `show`/metrics.
+	status.ZoneIDCollisions = append([]string(nil), m.lastZoneIDCollisions...)
+	if m.eventStream != nil {
+		es := m.eventStream.Status()
+		status.EventStream = &es
+	}
+	m.lastStatus = *status
+}
+
+func (m *Manager) Status() (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		if m.lastStatus.PID != 0 {
+			return m.lastStatus, nil
+		}
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err != nil {
+		if m.lastStatus.PID != 0 {
+			return m.lastStatus, err
+		}
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+// CachedStatus returns the most recent ProcessStatus captured by a
+// control-socket round-trip (primarily the 1 Hz statusLoop, which
+// refreshes m.lastStatus every second via applyHelperStatusLocked),
+// WITHOUT issuing a new control-socket request. The bool is false
+// when no status has been captured yet (helper not started or never
+// polled), in which case the caller should hold its previous values.
+//
+// This exists so low-priority periodic consumers -- specifically the
+// fwdstatus CPU sampler -- can read worker telemetry off the shared
+// status poll instead of issuing their own redundant 1 Hz "status"
+// request, which would double the control-socket status rate and
+// starve session installs during bulk sync (#3970; CLAUDE.md
+// "Control socket contention"). Unlike Status(), this MUST NOT touch
+// the control socket.
+func (m *Manager) CachedStatus() (ProcessStatus, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastStatus.PID == 0 {
+		return ProcessStatus{}, false
+	}
+	return m.lastStatus, true
+}
+
+func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	if armed && !m.lastStatus.Capabilities.ForwardingSupported {
+		if len(m.lastStatus.Capabilities.UnsupportedReasons) == 0 {
+			return m.lastStatus, errors.New("userspace live forwarding is not supported for the current configuration")
+		}
+		return m.lastStatus, fmt.Errorf(
+			"userspace live forwarding is not supported: %s",
+			strings.Join(m.lastStatus.Capabilities.UnsupportedReasons, "; "),
+		)
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_forwarding_state",
+		Forwarding: &ForwardingControlRequest{
+			Armed: armed,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) SetQueueState(queueID uint32, registered, armed bool) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_queue_state",
+		Queue: &QueueControlRequest{
+			QueueID:    queueID,
+			Registered: registered,
+			Armed:      armed,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) SetBindingState(slot uint32, registered, armed bool) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "set_binding_state",
+		Binding: &BindingControlRequest{
+			Slot:       slot,
+			Registered: registered,
+			Armed:      armed,
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) InjectPacket(req InjectPacketRequest) (ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	if err := validateInjectPacketRequestForHelper(req, m.lastStatus); err != nil {
+		return ProcessStatus{}, err
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "inject_packet", Packet: &req}, &status); err != nil {
+		return ProcessStatus{}, err
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return status, err
+	}
+	return status, nil
+}
+
+func (m *Manager) DrainSessionDeltas(max uint32) ([]SessionDeltaInfo, ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return nil, ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	resp, err := m.requestDetailedLocked(ControlRequest{
+		Type: "drain_session_deltas",
+		SessionDeltas: &SessionDeltaDrainRequest{
+			Max: max,
+		},
+	})
+	if err != nil {
+		return nil, ProcessStatus{}, err
+	}
+	var status ProcessStatus
+	if resp.Status != nil {
+		status = *resp.Status
+		if err := m.applyHelperStatusLocked(&status); err != nil {
+			return resp.SessionDeltas, status, err
+		}
+	}
+	return resp.SessionDeltas, status, nil
+}
+
+func (m *Manager) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]SessionDeltaInfo, ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return nil, ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	resp, err := m.requestDetailedLocked(ControlRequest{
+		Type: "export_owner_rg_sessions",
+		SessionExport: &SessionExportRequest{
+			OwnerRGs: rgIDs,
+			Max:      max,
+		},
+	})
+	if err != nil {
+		return nil, ProcessStatus{}, err
+	}
+	var status ProcessStatus
+	if resp.Status != nil {
+		status = *resp.Status
+		if err := m.applyHelperStatusLocked(&status); err != nil {
+			return resp.SessionDeltas, status, err
+		}
+	}
+	return resp.SessionDeltas, status, nil
+}

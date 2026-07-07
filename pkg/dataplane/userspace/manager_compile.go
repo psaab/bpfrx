@@ -1,0 +1,622 @@
+package userspace
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+)
+
+var ErrPolicySchedulerProtocolIncompatible = errors.New("userspace policy scheduler snapshot protocol incompatible")
+
+var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persistent source NAT snapshot protocol incompatible")
+
+// requiredProtocolGateSentinels enumerates every "this config cannot be
+// committed against the helper's current ConfigSnapshotProtocolVersion"
+// sentinel produced by ensureRequiredSnapshotProtocolLocked. ApplyConfig
+// disarms the helper (Armed=false, fail-closed) and returns one of these
+// when the running helper is too old to honor the committed config. A
+// commit that hits any of them MUST abort — i.e. the daemon must surface a
+// failed commit to the operator rather than report success against a
+// disarmed dataplane (#2138).
+//
+// The lenient-load doctrine (#1960) is unaffected, because abort changes
+// behavior ONLY for daemon callers that surface the apply error to a human:
+//   - Boot/restart of an already-persisted config goes through the void
+//     applyConfig wrapper, which logs slog.Warn and swallows the error —
+//     the node boots through (warn, not brick).
+//   - Peer config-sync goes through syncAndApply, which DOES propagate the
+//     error; its caller (handleConfigSync) logs slog.Error and returns the
+//     error to configApplyLoop, which counts ConfigsApplyFailed and leaves the
+//     config high-water mark UNADVANCED so the primary's re-push re-converges
+//     the standby (M-2/#4151). When SyncApply already promoted the store, the
+//     re-push short-circuits on the "already matches active" check and heals
+//     the high-water; the node stays consistent with the peer (helper
+//     disarmed, not bricked).
+//
+// Only the operator-facing commit path (commitAndApply /
+// commitConfirmedAndApply) returns the abort to the committer.
+//
+// Every future ensureRequiredSnapshotProtocolLocked gate MUST add its
+// sentinel here so the commit-abort policy can never silently omit it
+// (the omission this list exists to prevent was exactly #2138: the
+// persistent-source-NAT gate disarmed the helper but was missing from the
+// daemon's abort set).
+var requiredProtocolGateSentinels = []error{
+	ErrPolicySchedulerProtocolIncompatible,
+	ErrPersistentSourceNATProtocolIncompatible,
+}
+
+// IsRequiredProtocolGateError reports whether err is (or wraps) any
+// required helper-protocol gate sentinel — the set that must abort a
+// commit. The daemon commit policy (compileErrorMustAbortApply) delegates
+// to this so the abort set has a single source of truth co-located with
+// the sentinels and the ensureRequiredSnapshotProtocolLocked gate that
+// emits them.
+func IsRequiredProtocolGateError(err error) bool {
+	for _, sentinel := range requiredProtocolGateSentinels {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
+const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source pool leases are not HA-synchronized"
+
+// recordPolicyContentRejectionLocked tracks the #3261 diagnostic for the
+// just-built snapshot: the reasons (if any) it carries unrepresentable policy
+// content that the helper integrity preflight will reject. It is called at the
+// snapshot-build site BEFORE the publish so it is recorded even when the
+// publish is rejected (the helper keeps previous-good / default-deny while
+// staying armed — never fail-open). A one-shot slog line fires only on a
+// transition (per the logging rules — NOT per apply): a Warn when content
+// becomes unrepresentable (the operator must see the snapshot is being
+// rejected) and an Info when it becomes representable again.
+func (m *Manager) recordPolicyContentRejectionLocked(reasons []string) {
+	had := len(m.lastSnapshotRejectReasons) > 0
+	now := len(reasons) > 0
+	m.lastSnapshotRejectReasons = append([]string(nil), reasons...)
+	switch {
+	case now && !had:
+		slog.Warn(
+			"userspace: snapshot carries unrepresentable policy content; the helper integrity preflight rejects it and retains the previous-good state (fresh boot: default-deny). Helper stays armed — no kernel fail-open. Edit out the offending application/address and re-commit to restore enforcement.",
+			"reasons", reasons,
+		)
+	case had && !now:
+		slog.Info("userspace: policy content is representable again; snapshot will publish normally")
+	}
+}
+
+// recordZoneIDCollisionsLocked stores the #3719 zone-id-collision diagnostic
+// from the last snapshot build and fires a one-shot operator alarm on a
+// transition (per the logging rules — NOT per apply). A collision reaches this
+// only on the LENIENT path (a tolerant load, an HA sync from an un-upgraded
+// peer, or a config a pre-#3075 binary persisted); the strict commit path
+// rejects it. The builder already QUARANTINED the later-sorting colliding zone
+// (dropped from the wire, its interfaces unzoned, its policies removed), so the
+// dataplane is fail-closed and never merges two zones — but zone isolation is
+// DEGRADED (the quarantined zone forwards nothing) until an operator renames
+// one zone, so this is a loud Error naming both zones.
+func (m *Manager) recordZoneIDCollisionsLocked(collisions []ZoneIDCollision) {
+	had := len(m.lastZoneIDCollisions) > 0
+	msgs := make([]string, 0, len(collisions))
+	for _, c := range collisions {
+		msgs = append(msgs, c.String())
+	}
+	now := len(msgs) > 0
+	m.lastZoneIDCollisions = msgs
+	switch {
+	case now && !had:
+		slog.Error(
+			"userspace: security-zone id collision — two zone names fold to the same StableZoneID; the later-sorting zone is QUARANTINED (dropped from the dataplane, its interfaces unzoned and its traffic denied) so two zones never share an id. Zone isolation is DEGRADED until one zone is renamed and the config re-committed.",
+			"collisions", msgs,
+		)
+	case had && !now:
+		slog.Info("userspace: security-zone id collision cleared; all zones install with distinct ids")
+	}
+}
+
+func copyPolicySchedulerActiveState(activeState map[string]bool) map[string]bool {
+	if activeState == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(activeState))
+	for name, active := range activeState {
+		out[name] = active
+	}
+	return out
+}
+
+func (m *Manager) policySchedulerActiveStateSnapshot() map[string]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return copyPolicySchedulerActiveState(m.policySchedulerActive)
+}
+
+// PolicySchedulerActiveState returns a copy of the daemon-maintained
+// per-scheduler active-state map (scheduler name -> currently active).
+// Read-only show surfaces (#3062 CLI/gRPC policy detail) consult it via
+// PolicyInactive to render runtime scheduler-driven policy state without
+// recomputing wall-clock schedule windows. A nil result means no
+// scheduler state has been published yet.
+func (m *Manager) PolicySchedulerActiveState() map[string]bool {
+	return m.policySchedulerActiveStateSnapshot()
+}
+
+// SetPolicySchedulerActiveState seeds the active-state map used by the next
+// full snapshot build. The daemon calls this while holding applySem so config
+// commits and scheduler flips cannot publish hybrid policy snapshots.
+func (m *Manager) SetPolicySchedulerActiveState(activeState map[string]bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.policySchedulerActive = copyPolicySchedulerActiveState(activeState)
+}
+
+func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
+	// Delete XDP link pins BEFORE CompileUserspaceShim() so AttachXDP does
+	// a fresh attach. This is critical for zero-copy: fresh attach
+	// triggers mlx5 to initialize XSK buffer pool from fill ring.
+	// Pinned link reuse (l.Update) only swaps the program without
+	// reinitializing XSK RQs, leaving the fill ring unconsumed.
+	if linkPinDir := "/sys/fs/bpf/xpf/links"; true {
+		entries, _ := os.ReadDir(linkPinDir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "xdp_") {
+				path := filepath.Join(linkPinDir, e.Name())
+				_ = os.Remove(path)
+			}
+		}
+	}
+	caps := deriveUserspaceCapabilities(cfg)
+	_ = caps // used below for helper config
+	// Userspace mode always attaches the retained XDP shim. The shim
+	// redirects to XSK when ctrl=1; when ctrl=0 it only passes proven
+	// local/control traffic to the kernel and drops transit. Do not swap to
+	// xdp_main_prog for unsupported capabilities or failed XSK liveness: the
+	// userspace runtime must not require the legacy main XDP pipeline.
+	m.bpfShim.SelectUserspaceXDPShimEntryProgram()
+	result, err := m.bpfShim.CompileUserspaceShim(cfg)
+	if err != nil {
+		return nil, err
+	}
+	ucfg := deriveUserspaceConfig(cfg)
+	activeState := m.policySchedulerActiveStateSnapshot()
+	// #1827: include the cached ip-monitoring route overlay so a full
+	// apply (operator commit) while a policy is FAILED preserves the
+	// injected route instead of reverting traffic to the dead uplink.
+	// #2514: a config-shaped input (e.g. address-book content-ID
+	// collision) must reject the apply with an error rather than panic
+	// the daemon. buildSnapshot* returns the error up here; ApplyConfig
+	// fails closed and the previously published snapshot / dataplane state
+	// is retained (m.lastSnapshot is not advanced on the error path).
+	snap, err := buildSnapshotWithSchedulerStateAndNATCounters(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot(), m.feedSnapshotOverlay(), result.NATCounterIDs)
+	if err != nil {
+		return nil, fmt.Errorf("userspace: build config snapshot: %w", err)
+	}
+	// #1620: stamp the cold-path sample mask onto the snapshot. The
+	// daemon called SetColdPathSampleMask once at startup with the
+	// validated CLI flag value (or nil for "use default"). A nil
+	// pointer here leaves the wire field absent (omitempty), which
+	// the Rust receiver unwrap_or-s to 0xff per plan §4.3.
+	m.mu.Lock()
+	snap.ColdPathSampleMask = m.coldPathSampleMask
+	m.mu.Unlock()
+	m.syncInterfaceAttachments(result, snap)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// #3261: record whether this snapshot carries unrepresentable policy
+	// content BEFORE the publish, so the diagnostic is captured even when the
+	// helper rejects the snapshot (the publish path returns early on the
+	// integrity error, before recordApplyResultLocked). The helper stays armed
+	// for this class; the reject retains previous-good (or leaves the fresh-boot
+	// default-deny), never fail-open.
+	m.recordPolicyContentRejectionLocked(snap.Capabilities.PolicyContentRejected)
+	// #3719: record + alarm any StableZoneID collision the builder quarantined
+	// (lenient / HA-sync / pre-#3075-persisted path). The colliding zone was
+	// already dropped from snap; this surfaces the degraded-isolation state.
+	m.recordZoneIDCollisionsLocked(snap.zoneIDCollisions)
+	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
+	m.seedHAGroupInventoryLocked(cfg)
+	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
+	newPlanKey := snapshotBindingPlanKey(snap)
+	pendingXSKStartup := m.proc != nil &&
+		m.proc.Process != nil &&
+		m.publishedSnapshot != 0 &&
+		!m.xskLivenessProven &&
+		!m.xskLivenessFailed
+	samePlanRefresh := m.proc != nil &&
+		m.proc.Process != nil &&
+		prevPlanKey != "" &&
+		prevPlanKey == newPlanKey
+	publishedPlanChangedDuringStartup := pendingXSKStartup &&
+		m.publishedPlanKey != "" &&
+		m.publishedPlanKey != newPlanKey
+	if publishedPlanChangedDuringStartup {
+		slog.Info(
+			"userspace: restarting helper during XSK startup for binding plan change",
+			"generation", snap.Generation,
+			"fib_generation", snap.FIBGeneration,
+		)
+		m.stopLocked()
+		pendingXSKStartup = false
+		samePlanRefresh = false
+	}
+	// #1197 v4 (Codex code-review v3 #1+#2): rebuild listener
+	// caches ONLY after a successful apply_snapshot. Doing it
+	// here (before publish) leaves the listener thinking
+	// userspace-dp has entries it doesn't if apply_snapshot fails.
+	// Moved to the post-success path below (after line 343).
+	if pendingXSKStartup {
+		if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+			if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
+				return result, errors.Join(err, disarmErr)
+			}
+			return result, err
+		}
+		if err := m.syncUserspaceClassifierMapsFailClosedLocked(snap); err != nil {
+			return result, err
+		}
+		// #1928 (Codex review Q1): the deferred-publish resume path
+		// (syncSnapshotLocked in process.go) never syncs HA state, so a
+		// cluster->standalone reconfig that lands during the XSK-startup
+		// deferral window would leave stale HA groups in the helper and
+		// re-arm the HAInactive transit-drop gate. seedHAGroupInventoryLocked
+		// already cleared m.haGroups for the non-cluster case above; clear the
+		// helper side here too so the standalone state is consistent
+		// regardless of which apply path runs. (Idempotent empty update.)
+		if !m.clusterHA {
+			if err := m.clearHelperHAStateLocked(); err != nil {
+				return result, fmt.Errorf("clear userspace HA state (deferred startup): %w", err)
+			}
+		}
+		m.lastSnapshot = snap
+		m.cfg = ucfg
+		m.recordApplyResultLocked(dataplane.ApplyResultFromCompileResult(result), caps, snap.Generation)
+		slog.Info(
+			"userspace: deferring snapshot publish during XSK startup",
+			"generation", snap.Generation,
+			"fib_generation", snap.FIBGeneration,
+			"same_plan", samePlanRefresh,
+		)
+		return result, nil
+	}
+	if samePlanRefresh {
+		if err := m.syncUserspaceClassifierMapsFailClosedLocked(snap); err != nil {
+			return result, err
+		}
+	} else {
+		if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
+			return result, err
+		}
+	}
+	if err := m.ensureProcessLocked(ucfg); err != nil {
+		return result, err
+	}
+	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
+			return result, errors.Join(err, disarmErr)
+		}
+		return result, err
+	}
+	if m.deferWorkers {
+		snap.DeferWorkers = true
+	}
+	var status ProcessStatus
+	if err := m.disarmBeforeUnsupportedPublishLocked(snap); err != nil {
+		return result, err
+	}
+	// #1197 v5 (Codex code-review v4 #2): apply_snapshot must
+	// send publishable-only neighbors to match the
+	// update_neighbors path. Otherwise Rust's full-snapshot
+	// build accepts state="none" entries Go's predicate rejects,
+	// and Go can't track removal of those entries via the index.
+	publishSnap := *snap
+	publishSnap.Neighbors = filterPublishableNeighbors(snap.Neighbors)
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
+		return result, fmt.Errorf("publish userspace snapshot: %w", err)
+	}
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "apply")
+	m.lastSnapshot = snap
+	// #1197 v4: apply_snapshot succeeded — userspace-dp has the
+	// new neighbors. NOW rebuild listener caches; before this
+	// point the index would shadow events for entries the
+	// dataplane hadn't accepted.
+	m.rebuildNeighborIndex()
+	m.rebuildMonitoredIfindexes()
+	m.publishedSnapshot = snap.Generation
+	m.publishedPlanKey = newPlanKey
+	// #2079: this full apply_snapshot succeeded — record the applied
+	// (config, generation) for the NAT pool-utilization-alarm monitor.
+	m.markAppliedSnapshotLocked()
+	if h, ok := snapshotContentHash(snap); ok {
+		m.lastSnapshotHash = h
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return result, fmt.Errorf("sync helper status: %w", err)
+	}
+	// #1928: HA group state must only be replayed/published for chassis-cluster
+	// members. The rg_active map is a fixed-size ARRAY (16 entries, keys 0-15)
+	// so it is ALWAYS fully populated — even on a standalone firewall with no
+	// redundancy groups, where every entry is inactive. On standalone the old
+	// unconditional refreshHAStateFromMapsLocked() therefore fabricated 16
+	// inactive HA groups and shipped them to the helper; the helper's per-packet
+	// HA gate (enforce_ha_resolution_snapshot) then treats every transit
+	// ForwardCandidate as HAInactive (owner_rg_id<=0 && !ha_state.is_empty())
+	// and drops it — a total transit forwarding outage on non-cluster nodes. The
+	// periodic status poll already guards the refresh with m.clusterHA (see
+	// process.go); the startup path must match.
+	if m.clusterHA {
+		if err := m.refreshHAStateFromMapsLocked(); err != nil {
+			return result, fmt.Errorf("replay userspace HA state from maps: %w", err)
+		}
+		if err := m.syncHAStateLocked(); err != nil {
+			return result, fmt.Errorf("publish userspace HA state: %w", err)
+		}
+	} else if err := m.clearHelperHAStateLocked(); err != nil {
+		// Non-cluster node: ensure neither the manager nor the helper retains
+		// HA groups. seedHAGroupInventoryLocked already cleared m.haGroups
+		// above; this also clears any groups a prior clustered apply pushed to
+		// the helper (cluster->standalone live reconfig), which would otherwise
+		// keep the HAInactive transit-drop gate armed (Codex review #1928 Q3).
+		return result, fmt.Errorf("clear userspace HA state: %w", err)
+	}
+	if err := m.syncDesiredForwardingStateLocked(); err != nil {
+		return result, fmt.Errorf("sync userspace forwarding state: %w", err)
+	}
+	m.ensureStatusLoopLocked()
+	m.cfg = ucfg
+	m.recordApplyResultLocked(dataplane.ApplyResultFromCompileResult(result), caps, snap.Generation)
+	return result, nil
+}
+
+// UpdatePolicyScheduleState republishes the userspace policy snapshot with one
+// coherent inactive-bit view. This shadows the embedded eBPF manager method;
+// scheduled userspace policies must not update the policy_rules BPF map.
+func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[string]bool) error {
+	activeCopy := copyPolicySchedulerActiveState(activeState)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.policySchedulerActive = activeCopy
+	if cfg == nil {
+		if m.lastSnapshot == nil {
+			// #3780: no snapshot ever published — nothing to
+			// republish, and no live enforcement to go stale. The
+			// next full apply publishes the initial state. Converged.
+			return nil
+		}
+		cfg = m.lastSnapshot.Config
+	}
+	if cfg == nil || m.lastSnapshot == nil {
+		return nil
+	}
+	if m.proc == nil || m.proc.Process == nil {
+		// #3780: the helper is not running, so no snapshot is being
+		// enforced — there is no stale permit to converge. The helper
+		// restart path re-applies the last snapshot. Converged.
+		return nil
+	}
+
+	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
+			slog.Warn("userspace: failed to disarm helper after refusing snapshot publish",
+				"protocol_err", err, "err", disarmErr)
+		}
+		slog.Warn("userspace: refusing snapshot publish to incompatible helper", "err", err)
+		// #3780: the intended new inactive-bit view was NOT applied.
+		// Report failure so the daemon retries on the next scheduler
+		// tick and surfaces the stale-enforcement metric.
+		return fmt.Errorf("userspace: refusing snapshot publish to incompatible helper: %w", err)
+	}
+	next := *m.lastSnapshot
+	nextGeneration := m.generation + 1
+	next.Generation = nextGeneration
+	next.FIBGeneration = m.readFIBGeneration()
+	next.GeneratedAt = time.Now().UTC()
+	next.Config = cfg
+	// #2049: thread the cached dynamic-address feed overlay through the
+	// scheduler-only republish so a CoS scheduler-state change does not
+	// drop feed enforcement until the next full apply. m.mu is already
+	// held here, so read m.feedOverlay directly via cloneFeedOverlay
+	// rather than feedSnapshotOverlay() (which re-locks m.mu and would
+	// deadlock). Matches how the full snapshot build reads the overlay.
+	feedOverlay := cloneFeedOverlay(m.feedOverlay)
+	// #2514: an unresolvable address-book content-ID collision must not
+	// panic the daemon. Abort the scheduler-only republish and retain the
+	// last published snapshot (fail-closed) — the next full apply will
+	// surface the same error to the operator at commit time.
+	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeCopy, feedOverlay)
+	if err != nil {
+		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
+		// #3780: the prior snapshot is retained, which for a CLOSING
+		// window means the old permit stays live. Report failure so the
+		// transition is retried until the rebuild succeeds and converges.
+		return fmt.Errorf("userspace: policy snapshot rebuild for scheduler republish: %w", err)
+	}
+	next.Policies = policies
+	// #3261: the policies were rebuilt, so recompute the (feed-aware)
+	// content-rejection diagnostic from the new rules' sentinels; the copied
+	// lastSnapshot value would be stale. Class (ii) (ForwardingSupported /
+	// UnsupportedReasons) is unchanged by a scheduler-only republish.
+	next.Capabilities.PolicyContentRejected = collectPolicyContentRejections(policies)
+	// #1606: refresh the address-book table alongside the policies
+	// so book IDs cited in the new policies always resolve on the
+	// dataplane side.
+	books, _, err := buildAddressBookTableWithFeeds(cfg, feedOverlay)
+	if err != nil {
+		slog.Warn("userspace: skipping policy-scheduler republish; retaining prior snapshot", "err", err)
+		// #3780: same fail-safe as the policy rebuild above — retry.
+		return fmt.Errorf("userspace: address-book rebuild for scheduler republish: %w", err)
+	}
+	next.AddressBooks = books
+
+	publishSnap := next
+	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
+	var status ProcessStatus
+	// #2124: disarm before publishing an unsupported-config snapshot (see
+	// disarmBeforeUnsupportedPublishLocked). cfg is this snapshot's config.
+	if err := m.disarmBeforeUnsupportedPublishLocked(&publishSnap); err != nil {
+		slog.Warn("userspace: failed to disarm before unsupported-config policy scheduler publish", "err", err)
+		// #3780: disarm failed and the new snapshot was not published —
+		// report failure so the transition retries.
+		return fmt.Errorf("userspace: disarm before unsupported-config policy scheduler publish: %w", err)
+	}
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
+		slog.Warn("userspace: failed to publish policy scheduler state", "err", err)
+		// #3780: THE fail-open path from the issue. apply_snapshot did
+		// not land, so the helper keeps the OLD inactive bits — a permit
+		// past its window stays live. Report failure so the daemon
+		// retries autonomously on the next scheduler tick.
+		return fmt.Errorf("userspace: publish policy scheduler snapshot: %w", err)
+	}
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "policy-scheduler")
+	m.generation = nextGeneration
+	m.lastSnapshot = &next
+	m.rebuildNeighborIndex()
+	m.rebuildMonitoredIfindexes()
+	m.publishedSnapshot = next.Generation
+	m.publishedPlanKey = snapshotBindingPlanKey(&next)
+	// #2079: full apply_snapshot succeeded — record the applied snapshot.
+	m.markAppliedSnapshotLocked()
+	if h, ok := snapshotContentHash(&next); ok {
+		m.lastSnapshotHash = h
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		// #3780: the snapshot DID land (generation bumped, lastSnapshot
+		// updated above) — the schedule transition converged. A status
+		// re-sync failure is observability only; do NOT force a retry
+		// that would churn an identical snapshot.
+		slog.Warn("userspace: failed to sync helper status after policy scheduler publish", "err", err)
+	}
+	return nil
+}
+
+func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snapshot *ConfigSnapshot) {
+	if result == nil {
+		return
+	}
+	allowed := make(map[int]bool)
+	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
+		allowed[int(ifindex)] = true
+	}
+	for ifindex := range m.bpfShim.XDPLinks() {
+		if allowed[ifindex] {
+			continue
+		}
+		if err := m.bpfShim.DetachXDP(ifindex); err != nil {
+			slog.Warn("userspace: detach XDP from non-data interface failed", "ifindex", ifindex, "err", err)
+		}
+	}
+	for ifindex := range m.bpfShim.TCLinks() {
+		if allowed[ifindex] {
+			continue
+		}
+		if err := m.bpfShim.DetachTC(ifindex); err != nil {
+			slog.Warn("userspace: detach TC from non-data interface failed", "ifindex", ifindex, "err", err)
+		}
+	}
+}
+
+func configHasScheduledPolicy(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol != nil && pol.SchedulerName != "" {
+				return true
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol != nil && pol.SchedulerName != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error {
+	if !configHasScheduledPolicy(cfg) {
+		return nil
+	}
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d < required %d for policy scheduler snapshots",
+		ErrPolicySchedulerProtocolIncompatible,
+		m.lastStatus.ConfigSnapshotProtocolVersion,
+		ProtocolVersion,
+	)
+}
+
+func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) error {
+	if !userspaceConfigUsesPersistentSourceNAT(cfg) {
+		return nil
+	}
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d < required %d for persistent source NAT snapshots",
+		ErrPersistentSourceNATProtocolIncompatible,
+		m.lastStatus.ConfigSnapshotProtocolVersion,
+		ProtocolVersion,
+	)
+}
+
+func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error {
+	if err := m.ensurePolicySchedulerProtocolLocked(cfg); err != nil {
+		return err
+	}
+	return m.ensurePersistentSourceNATProtocolLocked(cfg)
+}
+
+func (m *Manager) disarmSnapshotProtocolFailureLocked(protocolErr error) error {
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	req := ControlRequest{
+		Type: "set_forwarding_state",
+		Forwarding: &ForwardingControlRequest{
+			Armed: false,
+		},
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(req, &status); err != nil {
+		return fmt.Errorf("userspace: disarm helper after snapshot protocol error: %w", err)
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		m.recordHelperStatusLocked(&status)
+		return fmt.Errorf("userspace: sync helper status after snapshot protocol fail-closed disarm: %w", err)
+	}
+	slog.Warn("userspace: disarmed helper after snapshot protocol error", "err", protocolErr)
+	return nil
+}
