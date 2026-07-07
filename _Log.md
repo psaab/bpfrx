@@ -22,6 +22,47 @@
   process.go:PrepareLinkCycle]" on origin/master, passes after the repoint.
   Verified: `go test ./pkg/dataplane/...` green, go build + vet + gofmt clean.
 - **File(s)**: pkg/dataplane/retirement_boundary_canary_test.go, _Log.md
+## 2026-07-07 — #4487 (ps-017 P6b) userspace-dp: bare RST/FIN to a host IP no longer seeds a LocalDelivery session
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the residual #4400 (P6a) left. #4400 added the transit
+  strict-syn-check (`strict_syn_check_drops_new_flow`, `is_closing && !has_syn`)
+  to the ForwardCandidate / MissingNeighbor session-miss path and deliberately
+  EXEMPTED LocalDelivery from the DROP (so a peer RST tearing down a firewall-
+  originated BGP/IKE/mgmt flow still reaches the local stack). But the
+  LocalDelivery session-miss INSTALL gate
+  (`should_cache_local_delivery_session_on_miss`,
+  `userspace-dp/src/afxdp/forwarding/mod.rs`) only declined to cache off an
+  ACK-without-SYN (#2151) — a bare RST (0x04) or bare FIN (0x01) with no ACK
+  slipped through and seeded an immediately-`closing` host-local session:
+  host-IP session-table DoS (RST/FIN flood) + policy-evaluation skip (a later
+  real SYN HITs the closing seed instead of re-evaluating host-inbound /
+  junos-host). Fix: extend the gate with the SAME predicate #4400 uses
+  (`is_closing(tcp_flags) && !has_syn(tcp_flags)` → return false / don't cache),
+  but the ACTION differs by disposition exactly as #4400 chose — transit DROPS,
+  host-inbound only declines to CACHE. The packet is still delivered to the host
+  via the LocalDelivery reinject chokepoint (line 4115, unconditional), so a
+  peer RST/FIN or connection-refused RST for a firewall-originated flow whose
+  dataplane session was GC'd is NOT lost. No `record_screen_drop` counter:
+  nothing is dropped, so counting a "screen drop" would corrupt the flow-stats
+  tally — the sibling #2151 don't-cache case is likewise silent. Single install
+  site (`install_helper_local_session_on_miss` at mod.rs:2291, gated by the
+  function at 2214) — the whole LocalDelivery install surface is covered by the
+  one-function change. The 2740 transit block sets
+  `track_in_userspace = disposition != LocalDelivery`, so it never installs a
+  LocalDelivery session.
+- **Validation**: New RED-on-revert test
+  `bare_rst_fin_session_miss_does_not_cache_local_delivery`
+  (`userspace-dp/src/afxdp/forwarding/tests.rs`) over BOTH LocalDelivery
+  resolvers (interface-NAT-local + ingress-interface-local): bare RST / bare FIN
+  / FIN|ACK / RST|ACK do NOT cache; SYN / SYN|ACK still cache; a non-
+  LocalDelivery disposition never caches. FULL cargo serial
+  (`--test-threads=1`).
+- **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`
+  (`should_cache_local_delivery_session_on_miss` +#4487 guard),
+  `userspace-dp/src/afxdp/forwarding/tests.rs` (RED-on-revert test),
+  `docs/host-inbound-service-matrix.md` (new P6b section), `CLAUDE.md`
+  (Flow feature-coverage line), `_Log.md`.
 
 ## 2026-07-07 — #4375 (avo-review-007 H3): firewall-filter conflicting terminating actions rejected at commit
 
