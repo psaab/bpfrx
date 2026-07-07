@@ -210,15 +210,39 @@ optionally followed by `exact`:
 `shaping-rate` (traffic-control-profiles) accepts an absolute bandwidth or
 `shaping-rate percent <n>`. These forms are accepted so imported vSRX
 configs commit unchanged (the percent form is the most common Junos
-scheduler idiom). **The percent / remainder forms are currently
-ACCEPTED-BUT-INERT:** the userspace dataplane consumes an absolute byte/sec
-rate, and xpf does not yet resolve a percent/remainder against the bound
-interface's rate — a scheduler can be mapped onto interfaces of different
-speeds, so resolution is a multi-pass follow-up. A commit advisory
-(`ValidateConfig`) surfaces the inertness; a queue with only a percent/
-remainder `transmit-rate` gets no explicit rate until resolution lands, and
-a `shaping-rate percent` leaves the unit unshaped. The commit gate still
-rejects garbage (`transmit-rate percent 150`, `transmit-rate asd`).
+scheduler idiom).
+
+**Percent resolution (#4228 Gap 2 — now ENFORCED).** Both percent forms
+resolve to an absolute byte/sec rate, mirroring the `buffer-size percent`
+resolution exactly (same `ceil` rounding, same clamp to `[1, MaxUint64]`):
+
+- **`transmit-rate percent <n>`** resolves PER INTERFACE, in the Rust
+  `forwarding_build::cos` builder, against the bound interface's root
+  shaping-rate (`cos_shaping_rate_bytes_per_sec`). A named scheduler mapped
+  onto interfaces of different shaping rates materializes a *different*
+  absolute rate on each — which is why the percent is carried to the
+  dataplane (not pre-resolved) on the shared scheduler snapshot. A resolved
+  percent drives the queue guarantee, surplus weight, and token bucket just
+  like an absolute `transmit-rate`. Residual inert cases: a scheduler not
+  bound (via a scheduler-map) to an interface with a root shaping-rate, or an
+  interface with a transparent root (no shaping-rate) — there is no base to
+  resolve against, so the queue gets no explicit rate (a `ValidateConfig`
+  advisory flags the unbound case).
+- **`shaping-rate percent <n>`** (traffic-control-profiles) resolves in the
+  Go compiler (`resolveCoSTrafficControlProfiles`) against the bound
+  interface's configured line rate (`set interfaces <if> speed <rate>` or
+  `bandwidth`) — Junos resolves shaping-rate percent against the interface
+  speed. The resolved absolute rate is folded into the unit's root shaper
+  exactly as an absolute `shaping-rate` would be. Resolution is per-binding:
+  the same profile bound to interfaces of different speeds folds a different
+  rate onto each. If the interface has no configured speed/bandwidth the
+  percent cannot resolve and the unit is left unshaped; a per-binding
+  `ValidateConfig` advisory names the interface and the fix.
+
+**Still inert:** `transmit-rate remainder` (leftover-bandwidth resolution is
+a follow-up) — a `ValidateConfig` advisory surfaces it. The commit gate still
+rejects garbage (`transmit-rate percent 150`, `transmit-rate asd`) and a
+both-forms-set config (an absolute rate AND a percent).
 
 ### First-Pass Fairness Boundary
 
@@ -892,6 +916,9 @@ materializes exactly as if the operator had set `shaping-rate` /
 `scheduler-map` directly on the unit. A **direct unit-level knob wins** over
 the profile (Junos precedence), and an interface-level
 `output-traffic-control-profile` applies to every configured logical unit.
+A profile `shaping-rate percent <n>` resolves against the bound interface's
+configured line rate before the fold (see the percent-resolution note under
+"`transmit-rate` / `shaping-rate` value forms" above, #4228 Gap 2).
 
 Before #4315 both `traffic-control-profiles` and
 `output-traffic-control-profile` were unmodeled: the binding committed

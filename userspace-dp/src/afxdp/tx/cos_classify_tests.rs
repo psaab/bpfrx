@@ -776,6 +776,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -788,6 +789,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -888,6 +890,7 @@ fn flowless_packet_gets_ba_classification_from_dscp() {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -900,6 +903,7 @@ fn flowless_packet_gets_ba_classification_from_dscp() {
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -1002,6 +1006,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                 CoSSchedulerSnapshot {
                     name: "scheduler-be".into(),
                     transmit_rate_bytes: 100_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: true,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -1014,6 +1019,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                 CoSSchedulerSnapshot {
                     name: "scheduler-iperf-a".into(),
                     transmit_rate_bytes: 1_000_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: true,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -1154,6 +1160,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -1166,6 +1173,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -1275,6 +1283,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -1287,6 +1296,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -1392,6 +1402,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -1404,6 +1415,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -1493,6 +1505,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 4_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -1575,6 +1588,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 4_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -1798,6 +1812,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -1810,6 +1825,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -1910,6 +1926,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 10_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -2057,6 +2074,7 @@ fn resolve_cos_queue_id_falls_back_to_default_queue_without_filter_match() {
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 10_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -2142,6 +2160,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -2154,6 +2173,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -2240,6 +2260,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -2252,6 +2273,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -2340,6 +2362,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -2352,6 +2375,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                 CoSSchedulerSnapshot {
                     name: "bulk-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -2467,6 +2491,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 10_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -2479,6 +2504,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 10_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 128_000,
@@ -2570,6 +2596,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
             schedulers: vec![CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 10_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -2713,6 +2740,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 2_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 64_000,
@@ -2725,6 +2753,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -2737,6 +2766,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                 CoSSchedulerSnapshot {
                     name: "data-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "medium-high".into(),
                     buffer_size_bytes: 64_000,
@@ -3141,6 +3171,7 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
                 CoSSchedulerSnapshot {
                     name: "be".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -3153,6 +3184,7 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
                 CoSSchedulerSnapshot {
                     name: "a".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 64_000,
@@ -3493,6 +3525,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -3505,6 +3538,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -3692,6 +3726,7 @@ fn pbr_classify_then_route_snapshot() -> ConfigSnapshot {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -3704,6 +3739,7 @@ fn pbr_classify_then_route_snapshot() -> ConfigSnapshot {
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,
@@ -3858,6 +3894,7 @@ fn count_fc_two_class_service() -> ClassOfServiceSnapshot {
             CoSSchedulerSnapshot {
                 name: "be-sched".into(),
                 transmit_rate_bytes: 4_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "low".into(),
                 buffer_size_bytes: 128_000,
@@ -3870,6 +3907,7 @@ fn count_fc_two_class_service() -> ClassOfServiceSnapshot {
             CoSSchedulerSnapshot {
                 name: "ef-sched".into(),
                 transmit_rate_bytes: 6_000_000,
+                transmit_rate_percent: 0.0,
                 transmit_rate_exact: false,
                 priority: "strict-high".into(),
                 buffer_size_bytes: 64_000,
@@ -4427,6 +4465,7 @@ fn hb166_t3_middle_case_snapshot() -> ConfigSnapshot {
                 CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
@@ -4439,6 +4478,7 @@ fn hb166_t3_middle_case_snapshot() -> ConfigSnapshot {
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
                     transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
                     transmit_rate_exact: false,
                     priority: "strict-high".into(),
                     buffer_size_bytes: 64_000,

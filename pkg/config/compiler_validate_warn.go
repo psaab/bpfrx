@@ -933,15 +933,33 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service traffic-control-profiles guaranteed-rate / delay-buffer-rate are accepted for compatibility but inert: the userspace dataplane enforces only the profile's shaping-rate and scheduler-map on the bound unit (#4315), so those values have no runtime effect")
 				warnedTCPInert = true
 			}
-			// #4228 Gap 2: shaping-rate percent is typed + stored but inert —
-			// the dataplane folds an ABSOLUTE shaping-rate into the bound unit's
-			// root shaper, and xpf does not yet resolve a percent against the
-			// interface speed, so a percent-only shaping-rate leaves the unit
-			// unshaped. Warn per profile so the operator is not misled.
-			if tcp.ShapingRatePercent > 0 {
-				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service traffic-control-profiles %q shaping-rate percent is accepted for Junos compatibility but inert: the userspace dataplane enforces an absolute shaping-rate and xpf does not yet resolve the percent against the bound interface's speed, so the unit is left unshaped (#4228 Gap 2)",
-					tcp.Name))
+		}
+		// #4228 Gap 2: a `shaping-rate percent <n>` traffic-control-profile now
+		// RESOLVES against the bound interface's configured line rate
+		// (resolveCoSTrafficControlProfiles folds the resolved absolute rate
+		// into unit.ShapingRateBytes). Warn only per-BINDING for the residual
+		// inert case: a percent-only profile bound to an interface with no
+		// configured `speed`/`bandwidth`, where the percent could not resolve
+		// (unit.ShapingRateBytes stayed 0) and the unit is left unshaped.
+		warnShapingPercentInert := func(unit *CoSInterfaceUnit, ifaceName string) {
+			if unit == nil || unit.OutputTrafficControlProfile == "" || unit.ShapingRateBytes > 0 {
+				return
+			}
+			tcp := cos.TrafficControlProfiles[unit.OutputTrafficControlProfile]
+			if tcp == nil || tcp.ShapingRatePercent <= 0 || tcp.ShapingRateBytes > 0 {
+				return
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"class-of-service traffic-control-profiles %q shaping-rate percent %.4g%% bound on interface %q has no effect: the interface has no configured speed/bandwidth, so xpf cannot resolve the percent against a line rate and the unit is left unshaped (set `interfaces %s speed <rate>` to enable it) (#4228 Gap 2)",
+				tcp.Name, tcp.ShapingRatePercent, ifaceName, ifaceName))
+		}
+		for _, iface := range cos.Interfaces {
+			if iface == nil {
+				continue
+			}
+			warnShapingPercentInert(iface.Level, iface.Name)
+			for _, unit := range iface.Units {
+				warnShapingPercentInert(unit, iface.Name)
 			}
 		}
 		// #4316 (fable-167 F-3b): inet-precedence classifiers/rewrite and exp
@@ -970,6 +988,10 @@ func ValidateConfig(cfg *Config) []string {
 					class.Name, class.Queue))
 			}
 		}
+		// #4228 Gap 2: schedulers whose transmit-rate percent resolves (bound
+		// via a scheduler-map to an interface with a root shaping-rate). Used
+		// below to warn only for a percent that has no base to resolve against.
+		schedulersResolvingPercent := cosSchedulersWithShapedBinding(cos)
 		// #915: surplus-sharing is meaningful only on transmit-rate
 		// exact schedulers; warn-and-strip when set without exact so
 		// the runtime never sees the no-op flag (see #1183 lesson).
@@ -1016,22 +1038,23 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
 					sched.Name))
 			}
-			// #4228 Gap 2: transmit-rate percent/remainder is typed + stored
-			// (so garbage is rejected at commit) but currently inert — the
-			// userspace dataplane consumes an absolute byte/sec transmit-rate,
-			// and xpf does not yet resolve the percent/remainder against the
-			// bound interface's rate (that resolution is multi-pass: a scheduler
-			// can be mapped onto interfaces of different speeds). Warn so an
-			// operator is not misled into believing the queue got an explicit
-			// rate. Mirrors the accepted-but-inert doctrine.
-			if sched.TransmitRatePercent > 0 || sched.TransmitRateRemainder {
-				form := "percent"
-				if sched.TransmitRateRemainder {
-					form = "remainder"
-				}
+			// #4228 Gap 2: transmit-rate percent now RESOLVES per-interface —
+			// forwarding_build/cos.rs computes the absolute byte/sec rate
+			// against the bound interface's shaping-rate (the multi-pass
+			// concern is handled by carrying the percent to the dataplane and
+			// materializing it per interface). Warn only for the residual inert
+			// cases: `remainder` (leftover-bandwidth resolution is still a
+			// follow-up) and a `percent` scheduler with no shaping base to
+			// resolve against — i.e. not bound via a scheduler-map to an
+			// interface that has a root shaping-rate.
+			if sched.TransmitRateRemainder {
 				warnings = append(warnings, fmt.Sprintf(
-					"class-of-service scheduler %q transmit-rate %s is accepted for Junos compatibility but inert: the userspace dataplane consumes an absolute byte/sec rate and xpf does not yet resolve the percent/remainder against the bound interface's rate, so the queue gets no explicit transmit-rate (#4228 Gap 2)",
-					sched.Name, form))
+					"class-of-service scheduler %q transmit-rate remainder is accepted for Junos compatibility but inert: the userspace dataplane consumes an absolute byte/sec rate and xpf does not yet resolve `remainder` against the leftover interface bandwidth, so the queue gets no explicit transmit-rate (#4228 Gap 2)",
+					sched.Name))
+			} else if sched.TransmitRatePercent > 0 && !schedulersResolvingPercent[sched.Name] {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service scheduler %q transmit-rate percent %.4g%% is accepted but has no effect: the scheduler is not bound via a scheduler-map to an interface with a root shaping-rate, so there is no base to resolve the percent against (#4228 Gap 2)",
+					sched.Name, sched.TransmitRatePercent))
 			}
 		}
 		for _, schedMap := range cos.SchedulerMaps {

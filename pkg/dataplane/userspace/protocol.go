@@ -364,9 +364,17 @@ type CoSDSCPRewriteRuleEntrySnapshot struct {
 type CoSSchedulerSnapshot struct {
 	Name              string `json:"name"`
 	TransmitRateBytes uint64 `json:"transmit_rate_bytes,omitempty"`
-	TransmitRateExact bool   `json:"transmit_rate_exact,omitempty"`
-	Priority          string `json:"priority,omitempty"`
-	BufferSizeBytes   uint64 `json:"buffer_size_bytes,omitempty"`
+	// TransmitRatePercent (#4228 Gap 2) carries the Junos `transmit-rate
+	// percent <n>` share (0,100]. Additive to preserve the legacy
+	// transmit_rate_bytes wire contract: an older dataplane ignores it; a
+	// newer dataplane resolves it PER-INTERFACE (forwarding_build/cos.rs)
+	// against the bound interface's cos_shaping_rate_bytes_per_sec when no
+	// absolute transmit_rate_bytes is set. omitempty keeps the wire
+	// byte-identical for configs that use an absolute rate.
+	TransmitRatePercent float64 `json:"transmit_rate_percent,omitempty"`
+	TransmitRateExact   bool    `json:"transmit_rate_exact,omitempty"`
+	Priority            string  `json:"priority,omitempty"`
+	BufferSizeBytes     uint64  `json:"buffer_size_bytes,omitempty"`
 	// BufferSizePercent is additive to preserve the legacy
 	// buffer_size_bytes wire contract. Older dataplanes ignore it;
 	// newer dataplanes use it only when buffer_size_bytes is absent.

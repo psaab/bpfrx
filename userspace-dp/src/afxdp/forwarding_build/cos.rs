@@ -285,6 +285,38 @@ fn cos_percent_buffer_bytes(pool_bytes: u64, percent: f64) -> Option<u64> {
     }
 }
 
+/// #4228 Gap 2: resolve a Junos `transmit-rate percent <n>` share against a
+/// base rate in bytes/sec. Mirrors `cos_percent_buffer_bytes` EXACTLY — same
+/// (0,100] domain guard, same `ceil` rounding, same clamp to [1, u64::MAX] —
+/// so a scheduler's transmit-rate percent and buffer-size percent round
+/// identically. Returns `None` when the base is unknown (0, e.g. a transparent
+/// root with no interface shaping-rate) or the percent is out of range; the
+/// caller then leaves the queue without an explicit transmit-rate (the
+/// documented inert fallback, matching the buffer-size None->default path).
+fn cos_percent_rate_bytes(base_rate_bytes: u64, percent: f64) -> Option<u64> {
+    cos_percent_buffer_bytes(base_rate_bytes, percent)
+}
+
+/// #4228 Gap 2: the effective absolute transmit-rate for a scheduler bound to
+/// an interface whose root shaping rate is `iface_shaping_rate_bytes`. An
+/// explicit absolute `transmit_rate_bytes` wins; otherwise a `transmit_rate
+/// percent <n>` resolves against the interface's shaping rate. `None` means no
+/// explicit guarantee (transparent / best-effort), preserving the historical
+/// behavior for schedulers with neither form set.
+fn cos_effective_transmit_rate_bytes(
+    scheduler: Option<&CoSSchedulerSnapshot>,
+    iface_shaping_rate_bytes: u64,
+) -> Option<u64> {
+    let sched = scheduler?;
+    if sched.transmit_rate_bytes > 0 {
+        return Some(sched.transmit_rate_bytes);
+    }
+    if sched.transmit_rate_percent > 0.0 {
+        return cos_percent_rate_bytes(iface_shaping_rate_bytes, sched.transmit_rate_percent);
+    }
+    None
+}
+
 fn cos_surplus_weight(rate_bytes: u64, root_rate_bytes: u64) -> u32 {
     if rate_bytes == 0 || root_rate_bytes == 0 {
         return 1;
@@ -518,9 +550,18 @@ pub(super) fn build_cos_iface_config(
             // transmit-rate keeps its `surplus_weight = 16` (scheduler is
             // Some), unchanged.
             let scheduler_unresolved = scheduler.is_none();
-            let explicit_transmit_rate_bytes = scheduler.and_then(|sched| {
-                (sched.transmit_rate_bytes > 0).then_some(sched.transmit_rate_bytes)
-            });
+            // #4228 Gap 2: resolve the scheduler's transmit-rate to an absolute
+            // byte/sec rate PER INTERFACE. An explicit absolute rate wins; a
+            // `percent <n>` form resolves against THIS interface's shaping rate
+            // (`cos_shaping_rate_bytes_per_sec`) — the same interface-shaping
+            // base family buffer-size percent uses — so the previously
+            // accepted-but-inert percent now drives the guarantee, surplus
+            // weight, and token bucket. A named scheduler mapped onto interfaces
+            // of different shaping rates materializes a different absolute rate
+            // on each, which is exactly why the percent is carried (not
+            // pre-resolved) on the shared snapshot.
+            let explicit_transmit_rate_bytes =
+                cos_effective_transmit_rate_bytes(scheduler, iface.cos_shaping_rate_bytes_per_sec);
             let guarantee_enabled = explicit_transmit_rate_bytes.is_some();
             let transmit_rate_bytes =
                 explicit_transmit_rate_bytes.unwrap_or(iface.cos_shaping_rate_bytes_per_sec);

@@ -690,15 +690,53 @@ impl SessionTable {
     /// decrement paths, so without this the maps would freeze at stale,
     /// over-counted values and a later re-enable would resume from wrong
     /// values and spuriously block an under-limit IP. Mirrors the
-    /// `ScreenState::update_profiles` retain discipline. On a re-enable
-    /// the maps start empty and re-populate from new installs;
-    /// pre-existing live sessions are NOT back-counted (benign,
-    /// Junos-approximate — Junos likewise does not retroactively count
-    /// pre-existing flows when a screen option is enabled).
+    /// `ScreenState::update_profiles` retain discipline.
+    ///
+    /// #4377 back-count-on-enable: on the OFF->ON edge the maps are
+    /// REBUILT from the live slab so they reflect EVERY session that will
+    /// later fire the decrement. Not back-counting is NOT benign for the
+    /// decrement side: the sole removal sink (`remove_entry`) decrements
+    /// for any forward non-seed entry whenever the gate is active at
+    /// removal, with no per-entry record of whether the entry was ever
+    /// counted. A forward session installed while the gate was OFF (or
+    /// after a disable cleared the maps) is therefore uncounted, yet its
+    /// teardown while ON still decrements — an increment-less decrement
+    /// that drives `count[X]` BELOW the live counted-session count for X.
+    /// `saturating_sub` + evict-at-0 hide the underflow, so X's count can
+    /// reach 0 while sessions are live and X is handed a fresh full
+    /// allotment (cap bypass). Rebuilding on enable makes every decrement
+    /// balance an increment. The walk uses the same origin-agnostic
+    /// counted-class predicate as the install/decrement sinks
+    /// (`!is_reverse && !origin.is_transient_local_seed()` — #3122:
+    /// peer-SYNCED sessions ARE counted, only reverse + transient-local
+    /// seed are excluded), so back-counting includes imported sessions
+    /// exactly as their later teardown will decrement them. O(N) once per
+    /// rare enable, no per-entry memory cost.
     pub fn set_session_limit_active(&mut self, active: bool) {
         if !active {
             self.session_limit_src_counts.clear();
             self.session_limit_dst_counts.clear();
+        } else if !self.session_limit_active {
+            // #4377: OFF->ON edge — rebuild the count maps from every live
+            // counted-class session so decrements always balance an
+            // increment. Walk via `key_to_handle` (the authoritative
+            // primary index, matching `iter_with_origin`) so an orphan
+            // slab record without a forward-key mapping is skipped.
+            // Disjoint-field borrows (`key_to_handle` / `entries` read,
+            // count maps mutated) — inline the increment rather than call
+            // `session_limit_inc`, which would take `&mut self` whole.
+            for (key, handle) in &self.key_to_handle {
+                if let Some(record) = self.entries.get(*handle as usize) {
+                    if !record.entry.metadata.is_reverse
+                        && !record.entry.origin.is_transient_local_seed()
+                    {
+                        let c = self.session_limit_src_counts.entry(key.src_ip).or_insert(0);
+                        *c = c.saturating_add(1);
+                        let c = self.session_limit_dst_counts.entry(key.dst_ip).or_insert(0);
+                        *c = c.saturating_add(1);
+                    }
+                }
+            }
         }
         self.session_limit_active = active;
     }
