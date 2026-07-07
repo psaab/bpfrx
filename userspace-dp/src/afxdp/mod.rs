@@ -214,6 +214,21 @@ pub(crate) use self::frame::write_eth_header_slice;
 pub(crate) use self::frame::MAX_IPV6_EXT_HEADERS;
 use self::umem::*;
 
+// #4435 (test-only): a thin `pub(crate)` wrapper over the canonical
+// `pub(in crate::afxdp)` L4/ext-header walker so the NAT64 parity test in
+// `crate::nat64` can assert nat64's private walker and the canonical
+// forwarding walker agree at the exact-`MAX_IPV6_EXT_HEADERS` boundary
+// (both fail closed). A `pub(crate) use` re-export cannot widen the
+// walker's `pub(in crate::afxdp)` visibility, and the walker stays
+// afxdp-private in production — this wrapper exists only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) fn packet_rel_l4_offset_and_protocol_for_test(
+    packet: &[u8],
+    addr_family: u8,
+) -> Option<(usize, u8)> {
+    self::frame::packet_rel_l4_offset_and_protocol(packet, addr_family)
+}
+
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 4;
 const UMEM_FRAME_SIZE: u32 = 4096;

@@ -1,3 +1,50 @@
+## 2026-07-07 — #4435 (review follow-up): fail-closed post-loop return for m=8 parity
+
+- **Timestamp**: 2026-07-07
+- **Action**: Addressed the MERGE-NEEDS-MINOR residual the PR #4458
+  hostile review found. The first commit reconciled the loop BOUND
+  (`0..MAX_IPV6_EXT_HEADERS`) but not the POST-LOOP return:
+  `ipv6_l4_offset_and_protocol` still returned `Some((offset, protocol))`
+  after the loop, while the canonical
+  `packet_rel_l4_offset_and_protocol` (inspect.rs, #2292) post-loops to
+  `None` (deliberate fail-closed at the bound). Empirically the skew was
+  not removed, only moved from the old 6-bound to the 8-bound: a chain of
+  EXACTLY `MAX_IPV6_EXT_HEADERS` (8) ext headers resolved on the nat64
+  walker (`Some((104,17))`) but dropped on the canonical walker (`None`)
+  — contradicting the PR's "exact parity / matching the canonical cap"
+  claim.
+  - **Root cause**: nat64.rs:~630 post-loop `Some((offset, protocol))`.
+    Reaching the post-loop means the chain is STILL on an ext header
+    after 8 iterations, so `protocol` is an unconsumed ext-header type,
+    not a real L4. Verified the OTHER two walkers already post-loop safe:
+    `ipv6_is_non_first_fragment` returns `false`, `ipv6_fragment_header`
+    returns `None` — only `ipv6_l4_offset_and_protocol` diverged.
+  - **Fix**: changed the nat64.rs:~630 post-loop from
+    `Some((offset, protocol))` to `None`, mirroring the canonical #2292
+    fail-closed-at-bound. m=8 now DROPS on both walkers (true parity, no
+    skew at any header count). Does NOT regress the m=7 fix (a 7-ext-hdr
+    chain terminates WITHIN the loop via the in-loop `_ => Some(...)`,
+    before the post-loop). Updated the walker doc-comment. Both callers
+    (`write_v6_to_v4_into`, `translate_embedded_v6_to_v4`) already handle
+    `None` via `?`.
+  - **Tests**: added `nat64_v6_to_v4_exactly_max_ext_headers_parity_both_drop`
+    — asserts BOTH the nat64 walker AND the canonical
+    `packet_rel_l4_offset_and_protocol` return `None` at exactly
+    `MAX_IPV6_EXT_HEADERS` (locks the cap parity; the m=9 `oversized`
+    test never exercised the exact boundary). Exposed the canonical
+    walker via a `#[cfg(test)]`-only `pub(crate)` re-export in
+    afxdp/mod.rs (established `fabric_queue_hash_seeded` pattern; no
+    production API change). Updated the `oversized` (m=9) test: the walk
+    now returns `None` at the post-loop (was `Some((104,60))`), so it
+    asserts `.is_none()`. The 4 prior tests stay green (m=7 translate,
+    embedded m=7 translate, m=9 drop, m=2 unaffected).
+  - **Validation**: FULL `cargo test --release -- --test-threads=1` — see
+    PR. Hand-verified changed lines fmt-clean (no whole-crate drift;
+    master isn't rustfmt-clean under edition 2024). Merged current
+    origin/master (#4457 split Go NAT files — disjoint, clean).
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/mod.rs, _Log.md
+
 ## 2026-07-07 — #4435: NAT64 ext-header walkers share canonical MAX_IPV6_EXT_HEADERS bound
 
 - **Timestamp**: 2026-07-07

@@ -2248,11 +2248,9 @@ fn nat64_v6_to_v4_seven_ext_headers_translates() {
 #[test]
 fn nat64_v6_to_v4_oversized_ext_chain_fails_closed() {
     // #4435: a chain LONGER than MAX_IPV6_EXT_HEADERS must still fail closed
-    // (drop), matching the canonical parser's cap. After consuming the bound's
-    // worth of ext headers the walk is still on an ext header (60), a non-L4
-    // protocol, so the translator drops. This preserves the fail-closed
-    // semantics — the fix widens the accepted chain from 6 to 8, it does not
-    // remove the cap.
+    // (drop), matching the canonical parser's cap. After the bound the walk is
+    // still on an ext header, so it fails closed at the post-loop (`None`) —
+    // the fix widens the accepted chain to 8, it does not remove the cap.
     let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
     let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
     let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
@@ -2268,12 +2266,50 @@ fn nat64_v6_to_v4_oversized_ext_chain_fails_closed() {
         &udp,
     );
 
-    // The walk surrenders on a non-terminal ext-header protocol, never the L4.
-    let (_, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("walk returns the surrender tuple");
-    assert_ne!(proto, PROTO_UDP, "oversized chain must NOT resolve the terminal L4");
+    // The walk fails closed at the bound — it never returns an L4 tuple.
+    assert!(
+        ipv6_l4_offset_and_protocol(&pkt).is_none(),
+        "oversized chain must fail closed at the walk (None), never resolve an L4"
+    );
     assert!(
         translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
         "oversized ext-header chain must fail closed (drop), matching the canonical cap"
+    );
+}
+
+#[test]
+fn nat64_v6_to_v4_exactly_max_ext_headers_parity_both_drop() {
+    // #4435 cap parity (locks the residual the const-share alone left): a chain
+    // of EXACTLY MAX_IPV6_EXT_HEADERS ext headers must fail closed on BOTH the
+    // NAT64 private walker AND the canonical forwarding walker. Before the
+    // post-loop `None` change, nat64 RESOLVED this (post-loop `Some`) while the
+    // canonical walker (inspect.rs, #2292) DROPPED it — a one-header skew at the
+    // bound, merely moved from the old 6-bound to the 8-bound. The 9-header
+    // `oversized` test does not exercise this exact boundary.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let udp = nat64_probe_udp();
+
+    let pkt =
+        build_v6_with_n_ext_then_l4(src_v6, dst_v6, MAX_IPV6_EXT_HEADERS, PROTO_UDP, 64, &udp);
+
+    // NAT64 private walker: fail closed at the bound (post-loop `None`).
+    assert!(
+        ipv6_l4_offset_and_protocol(&pkt).is_none(),
+        "nat64 walker must drop an exactly-MAX_IPV6_EXT_HEADERS chain"
+    );
+    // Canonical forwarding walker: SAME verdict — the parity this test locks.
+    assert!(
+        crate::afxdp::packet_rel_l4_offset_and_protocol_for_test(&pkt, libc::AF_INET6 as u8)
+            .is_none(),
+        "canonical walker must ALSO drop it — true cap parity, no m=8 skew"
+    );
+    // End to end: the translator drops the datagram.
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "exactly-MAX_IPV6_EXT_HEADERS chain must be NAT64-dropped"
     );
 }
 
