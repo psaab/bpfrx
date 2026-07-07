@@ -711,22 +711,24 @@ func Match(cfg *config.Config, q Query) Result {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
 	}
 
-	// #3727: the runtime snapshot builder fails the WHOLE snapshot closed when
-	// any policy references an application-set that cannot be expanded — the
-	// builder (pkg/dataplane/userspace expandUserspacePolicyApplications ->
-	// resolveUserspaceApplicationNames) emits the reserved __unsupported__
-	// sentinel term, which the helper integrity preflight rejects
-	// (SnapshotIntegrityError), so the dataplane retains its previous-good
-	// snapshot or fresh-boots default-deny and enforces none of this config.
-	// matchApp used to SILENTLY SKIP the malformed set (`continue`) and fall
-	// through to a later rule / default-policy, so the simulator reported a
-	// permit/deny/default verdict the dataplane never certifies — under a
-	// default-permit it under-reported a fail-closed config as PERMIT. Detect the
-	// same fail-closed condition up front, config-wide (mirroring the
-	// whole-snapshot rejection), BEFORE any per-tier / host-gate evaluation, so
-	// every query for the config reports the runtime's retention rather than a
-	// fabricated answer.
-	if reasons := policyContentRejectionReasons(cfg); len(reasons) > 0 {
+	// #3727/#4394: the runtime snapshot builder fails the WHOLE snapshot closed
+	// when any policy references content the userspace matcher cannot represent —
+	// an unexpandable application-set (#3727), a protocol-less application, an
+	// unrepresentable protocol/port, an undefined application reference, or an
+	// unresolvable address (#4394). In every such case the builder poisons the
+	// rule with the reserved __unsupported__ / __unsupported_address__ sentinel
+	// (or the app-catalog build errors), which the helper integrity preflight
+	// rejects (SnapshotIntegrityError), so the dataplane retains its
+	// previous-good snapshot or fresh-boots default-deny and enforces NONE of
+	// this config. matchApp/matchAddr used to SILENTLY SKIP the unrepresentable
+	// term (a per-term no-match) and fall through to a later rule / default-policy,
+	// so the simulator reported a permit/deny/default verdict the dataplane never
+	// certifies — under a default-permit it under-reported a fail-closed config as
+	// PERMIT. Detect the same fail-closed set up front, config-wide (the shared
+	// dpuserspace.PolicyContentRejectionReasons SSOT, feed-aware via q.FeedOverlay),
+	// BEFORE any per-tier / host-gate evaluation, so every query for the config
+	// reports the runtime's retention rather than a fabricated answer.
+	if reasons := policyContentRejectionReasons(cfg, q.FeedOverlay); len(reasons) > 0 {
 		return Result{ContentRejected: true, ContentRejectionReasons: reasons, Action: config.PolicyDeny}
 	}
 
@@ -1326,109 +1328,33 @@ func expandBookName(cfg *config.Config, overlay map[string][]string, name string
 // protocol IS supplied, matchSingleApp constrains by protocol (and ICMP
 // type/code for a type-constrained term) exactly as before; a non-empty but
 // UNRESOLVABLE protocol fails closed for every protocol-constrained app term.
-// policyContentRejectionReasons detects the config-level condition under which
-// the userspace snapshot builder fails the WHOLE snapshot closed because a
-// policy references an application-SET that cannot be expanded (#3727). Two
-// runtime paths fail closed on the SAME malformed set, so the dataplane never
-// enforces the config:
+// policyContentRejectionReasons detects the config-level conditions under which
+// the userspace snapshot builder fails the WHOLE snapshot closed and enforces
+// NONE of the config, so the simulator must report that fail-closed retention
+// rather than a fabricated permit/deny/default verdict. It delegates to the
+// shared dpuserspace.PolicyContentRejectionReasons SSOT (the exact detection
+// buildSnapshot uses), covering every fail-closed policy-content axis:
 //
-//   - the app catalog builder (pkg/appid BuildCatalog, consumed by
-//     buildAppCatalogSnapshot) returns an ExpandApplicationSet error, so
-//     buildSnapshot itself returns an error and the apply path retains the prior
-//     dataplane state (#3438);
-//   - the policy snapshot builder (pkg/dataplane/userspace
-//     expandUserspacePolicyApplications -> resolveUserspaceApplicationNames)
-//     poisons the rule with the reserved __unsupported__ sentinel term, which
-//     the helper integrity preflight rejects (SnapshotIntegrityError), so the
-//     helper keeps its previous-good snapshot or fresh-boots default-deny
-//     (#3261).
+//   - an unexpandable application-SET (#3727) — the app catalog build errors
+//     (order-insensitive, so `[ any bad-set ]` is caught too) OR the per-rule
+//     application expansion poisons the rule with the __unsupported__ sentinel;
+//   - a protocol-less application (#3323) — proto == "" is unrepresentable;
+//   - an unrepresentable protocol/port (#2124/#4345) — appid.ProtocolNumber /
+//     userspacePortSpecRepresentable rejects it;
+//   - an undefined application reference — resolveUserspaceApplicationNames fails;
+//   - an unresolvable address (#3261) — an undefined address-book / prefix-list
+//     name, or a defined book/set whose value is a non-literal dns-name /
+//     wildcard / range (or resolves to no concrete prefix), poisons the rule
+//     with the __unsupported_address__ sentinel.
 //
-// Either way the config is NEVER enforced, so the simulator must report the
-// fail-closed retention rather than the silent-skip-then-fall-through verdict
-// matchApp's old `continue` fabricated. Every zone-pair and global policy is
-// scanned (regardless of scheduler state — the runtime builds and expands every
-// rule's applications) because the runtime fails the ENTIRE snapshot on the
-// first unrepresentable rule; a single malformed set anywhere makes every
-// verdict for the config fail-closed, not just a query that would hit the bad
-// rule.
-//
-// SCOPE: only the application-SET expansion ERROR — the #3727 gap. A
-// protocol-less member app (#3323), an unrepresentable protocol/port (#2124),
-// or a bare undefined application NAME (a term-level matchSingleApp no-match)
-// still expand a set fine, so they are NOT flagged here and keep their existing
-// simulator behavior; those are separate, already-decided axes.
-func policyContentRejectionReasons(cfg *config.Config) []string {
-	var reasons []string
-	scan := func(scope string, apps []string) {
-		if reason, bad := appSetExpansionRejects(cfg, apps); bad {
-			reasons = append(reasons, fmt.Sprintf(
-				"policy %s names content the userspace matcher cannot represent: %s", scope, reason))
-		}
-	}
-	for _, zpp := range cfg.Security.Policies {
-		if zpp == nil {
-			continue
-		}
-		for _, pol := range zpp.Policies {
-			if pol == nil {
-				continue
-			}
-			scan(fmt.Sprintf("%s->%s/%s", zpp.FromZone, zpp.ToZone, pol.Name), pol.Match.Applications)
-		}
-	}
-	for _, pol := range cfg.Security.GlobalPolicies {
-		if pol == nil {
-			continue
-		}
-		scan(globalPolicyRejectionScope(pol), pol.Match.Applications)
-	}
-	return reasons
-}
-
-// appSetExpansionRejects reports whether the runtime would fail this policy's
-// application list closed because it names an application-set that
-// ExpandApplicationSet cannot expand (member-not-found, nesting-too-deep, or a
-// missing set) (#3727). The detection is ORDER-INSENSITIVE, mirroring the
-// dominant runtime fail-close: pkg/appid BuildCatalog walks EVERY application
-// token and errors on the first unexpandable set regardless of any `any`/empty
-// token in the list (an `any` token is simply skipped for that reference, it
-// does NOT short-circuit the rule), so buildSnapshot returns an error and the
-// dataplane retains the prior state for BOTH `[ bad-set any ]` (the M01 shape,
-// where the simulator previously returned a confident positive match) AND
-// `[ any bad-set ]`. A token that is not an application-set is left to the
-// unchanged bare-application path (matchSingleApp). A well-formed set that
-// expands cleanly is never flagged.
-func appSetExpansionRejects(cfg *config.Config, apps []string) (string, bool) {
-	for _, a := range apps {
-		if _, isSet := cfg.Applications.ApplicationSets[a]; !isSet {
-			continue
-		}
-		if _, err := config.ExpandApplicationSet(a, &cfg.Applications); err != nil {
-			return fmt.Sprintf("application-set %q cannot be expanded: %v", a, err), true
-		}
-	}
-	return "", false
-}
-
-// globalPolicyRejectionScope renders the scope-qualified identity of a global
-// policy for a #3727 content-rejection reason, mirroring the userspace builder's
-// policyRejectionScope: "global/<name>", or "global(<from>-><to>)/<name>" when
-// the policy carries a `match from-zone`/`match to-zone` scope (empty rendered
-// as "any"). The bare name alone is ambiguous because duplicate policy names
-// across scopes are legal.
-func globalPolicyRejectionScope(pol *config.Policy) string {
-	if pol.Match.FromZone != "" || pol.Match.ToZone != "" {
-		from := pol.Match.FromZone
-		if from == "" {
-			from = "any"
-		}
-		to := pol.Match.ToZone
-		if to == "" {
-			to = "any"
-		}
-		return fmt.Sprintf("global(%s->%s)/%s", from, to, pol.Name)
-	}
-	return fmt.Sprintf("global/%s", pol.Name)
+// A single unrepresentable rule anywhere fails the ENTIRE snapshot closed, so
+// every query for the config reports the fail-closed verdict, not just one that
+// would hit the offending rule. The detection is feed-aware (feedOverlay): a
+// healthy dynamic-address feed policy resolves through the overlay and is not
+// falsely flagged — callers pass q.FeedOverlay, the same overlay the production
+// builder uses, so the simulator agrees with the helper on feed-backed names.
+func policyContentRejectionReasons(cfg *config.Config, feedOverlay map[string][]string) []string {
+	return dpuserspace.PolicyContentRejectionReasons(cfg, feedOverlay)
 }
 
 func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
@@ -1480,20 +1406,24 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	// ("89"/"ospf") and a named/numeric query protocol agree (the old EqualFold
 	// string compare failed "89" vs "ospf").
 	//
-	// #3323: a protocol-less named app is NOT match-any — it fails closed. The
-	// dataplane cannot represent such an app and never enforces it: the snapshot
-	// builder fails closed (deriveUserspaceCapabilities,
+	// #3323/#4394: a protocol-less named app is NOT match-any — it fails closed.
+	// The dataplane cannot represent such an app and never enforces it: the
+	// snapshot builder fails closed (deriveUserspaceCapabilities,
 	// pkg/dataplane/userspace/capabilities.go returns ok=false for proto=="" →
 	// the reserved __unsupported__ sentinel → whole-snapshot reject, #3261) and
 	// strict commit hard-rejects it (pkg/config/compiler_validate_strict.go:
 	// "cannot represent a protocol-less application"). A protocol-less named app
 	// can therefore only exist via a lenient/HA-loaded config, where the runtime
-	// STILL never enforces it; reporting it as a concrete match-any would
-	// over-report vs the runtime — the exact simulator divergence #3323 closes.
-	// appid.ProtocolNumber("") is (0,false), so an empty app.Protocol makes appOK
-	// false and the term fails closed. The literal `application any` token never
-	// reaches matchSingleApp (matchApp short-circuits a == "any"), so this does
-	// not affect the genuine match-any case.
+	// STILL never enforces it. #4394: Match now gates a protocol-less CONFIG app
+	// as a config-wide ContentRejected (the whole-snapshot fail-close) BEFORE any
+	// rule is evaluated, so this per-term guard is unreachable for a config with a
+	// protocol-less app — it is kept defensive so that even if the config-wide
+	// gate were bypassed, reporting the app as a concrete match-any (which the
+	// dataplane never produces) can never happen. appid.ProtocolNumber("") is
+	// (0,false), so an empty app.Protocol makes appOK false and the term fails
+	// closed. The literal `application any` token never reaches matchSingleApp
+	// (matchApp short-circuits a == "any"), so this does not affect the genuine
+	// match-any case.
 	appProto, appOK := appid.ProtocolNumber(app.Protocol)
 	if !appOK || !queryProtoOK || appProto != queryProto {
 		return false

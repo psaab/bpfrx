@@ -1,3 +1,45 @@
+## 2026-07-06 — #4394: match-policies simulator reports ContentRejected for the dataplane's full fail-closed set
+
+- **Timestamp**: 2026-07-06
+- **Action**: The `request security match-policies` simulator (pkg/policymatch)
+  only detected content-rejection for an UNEXPANDABLE application-set (#3727).
+  The DATAPLANE (userspace-dp/src/policy.rs) ALSO fails the WHOLE snapshot CLOSED
+  on a protocol-less application, an unrepresentable protocol/port, an undefined
+  application reference, and an unresolvable address — in those cases the
+  simulator SKIPPED the term (a per-term no-match) and fell through to a later
+  rule / the configured default-policy, FABRICATING a permit/deny/default verdict
+  the dataplane never enforces (under a default-permit it answered PERMIT while
+  the dataplane denies fail-closed → operator misled). Fix: extended the
+  simulator's config-wide ContentRejected gate to the full fail-closed set by
+  reusing the dataplane SSOT. Added exported
+  `dpuserspace.PolicyContentRejectionReasons(cfg, feedOverlay)` — the exact
+  detection `buildSnapshot` uses (per-rule `__unsupported__` /
+  `__unsupported_address__` sentinels via `collectPolicyContentRejections`, plus
+  the order-insensitive app-catalog build for a `[ any bad-set ]` policy the
+  per-rule scan misses) — and replaced policymatch's app-set-only
+  `policyContentRejectionReasons` with a thin delegate that threads
+  `q.FeedOverlay` so a healthy dynamic-address feed policy does NOT
+  false-positive. The #3323 protocol-less-app test flipped from a fabricated
+  default-deny to ContentRejected (the behavior #4394 mandates). Fixed a latent
+  parity gap the SSOT reuse exposed: the Go `addrRepresentable` gate omitted the
+  Junos `any-ipv4` / `any-ipv6` keywords (only `any4` / `any6`), which the Rust
+  matcher accepts as family wildcards (policy.rs parse_v3_literal_set) — a raw
+  `any-ipv4` policy token on the lenient/HA/hand-built path would emit a spurious
+  `__unsupported_address__` sentinel; added them to the accepted set.
+  RED-on-revert: neutralizing the gate reverts each of the four conditions to a
+  fabricated permit/default (and the whole-config poison case to a positive
+  `clean-http` match). No-over-report control: a fully-representable config still
+  reports its real permit verdict. Go-only (pkg/policymatch + pkg/dataplane/
+  userspace), no cargo.
+- **File(s)**: pkg/dataplane/userspace/policies.go,
+  pkg/policymatch/policymatch.go,
+  pkg/policymatch/content_reject_4394_test.go,
+  pkg/policymatch/protocol_omitted_3323_test.go,
+  pkg/policymatch/app_set_failclosed_3727_test.go,
+  pkg/policymatch/README.md,
+  docs/junos-cli-reference.md,
+  _Log.md
+
 ## 2026-07-06 — #4378: confirm pending commit-confirmed on RG0 demotion
 
 - **Timestamp**: 2026-07-06
