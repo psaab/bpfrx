@@ -1146,6 +1146,38 @@ func applyStaticNATFromScope(rs *StaticNATRuleSet, s natMatchScope) {
 	}
 }
 
+// appendPoolAddresses parses a source-NAT pool `address` token stream and
+// appends every IP onto pool.Addresses, expanding any `<low> to <high>`
+// sub-range in place. The token stream is the multi-value form of the
+// #2419 dual-AST-shape class: a bracket list `[ a b c ]`, a range
+// `a to b`, or a mix `a b to c d` all collapse onto one Keys slice, and a
+// hierarchical block passes each child node's Keys. Reading the FULL token
+// stream (not just the first token) is the #4521 fix — the previous code
+// read only Keys[1], truncating a bracket list to its first IP.
+func appendPoolAddresses(pool *NATPool, tokens []string) error {
+	for i := 0; i < len(tokens); {
+		tok := tokens[i]
+		if tok == "" {
+			i++
+			continue
+		}
+		// Range: "<low> to <high>" — three consecutive tokens with a
+		// following high address present.
+		if i+2 < len(tokens) && tokens[i+1] == "to" {
+			expanded, err := expandAddressRange(tok, tokens[i+2])
+			if err != nil {
+				return fmt.Errorf("pool %q address range: %w", pool.Name, err)
+			}
+			pool.Addresses = append(pool.Addresses, expanded...)
+			i += 3
+			continue
+		}
+		pool.Addresses = append(pool.Addresses, tok)
+		i++
+	}
+	return nil
+}
+
 // expandAddressRange expands "low/mask to high/mask" into individual IP strings.
 // Both low and high must be /32 CIDRs. Max 256 IPs.
 func expandAddressRange(low, high string) ([]string, error) {
@@ -1342,30 +1374,42 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "address":
-				// Check for address range: "addr1 to addr2"
-				if len(prop.Keys) >= 4 && prop.Keys[2] == "to" {
-					expanded, err := expandAddressRange(prop.Keys[1], prop.Keys[3])
-					if err != nil {
-						return fmt.Errorf("pool %q address range: %w", pool.Name, err)
-					}
-					pool.Addresses = append(pool.Addresses, expanded...)
-				} else if len(prop.Keys) >= 2 && prop.Keys[1] != "" {
-					// Inline value form ("address <prefix>;" / flat set).
-					// Deliberately NOT nodeVal: its Children[0] fallback
-					// would double-append the block form, whose children
-					// are walked below (#1808).
-					pool.Addresses = append(pool.Addresses, prop.Keys[1])
+				// A source pool `address` value carries EVERY IP the
+				// SNAT allocator may draw from. It arrives in four
+				// shapes (#2419 dual-AST-shape class — mirror
+				// firewallMatchValues):
+				//
+				//   discrete set lines : one `address <ip>;` prop per IP
+				//   bracket list       : `address [ a b c ]` — UNMODELED
+				//                        in schema (schema_security.go
+				//                        pool children), so SetPath's
+				//                        unmodeled-leaf path collapses
+				//                        every trailing token onto ONE
+				//                        node: Keys=["address","a","b","c"]
+				//   range              : `address <low> to <high>`
+				//                        Keys=["address",low,"to",high]
+				//   hierarchical block : `address { a; b to c; }` — one
+				//                        child node per entry
+				//                        (Keys=["a"] / ["b","to","c"])
+				//
+				// Before #4521 the inline branch read only prop.Keys[1]
+				// and the range branch required Keys[2]=="to", so a
+				// bracket list silently kept ONLY the first IP → the
+				// pool shrank to one address → premature source-port
+				// exhaustion. Read the whole Keys[1:] token stream
+				// (plus the block children), expanding any `<low> to
+				// <high>` sub-range in place. Keys[1:] and Children are
+				// mutually exclusive per the #2419 pattern: the inline
+				// form has no children and the block form has no inline
+				// Keys value, so reading both cannot double-append.
+				if err := appendPoolAddresses(pool, prop.Keys[1:]); err != nil {
+					return err
 				}
-				// Also handle children for hierarchical syntax
 				for _, addrChild := range prop.Children {
-					if len(addrChild.Keys) >= 3 && addrChild.Keys[1] == "to" {
-						expanded, err := expandAddressRange(addrChild.Keys[0], addrChild.Keys[2])
-						if err != nil {
-							return fmt.Errorf("pool %q address range: %w", pool.Name, err)
-						}
-						pool.Addresses = append(pool.Addresses, expanded...)
-					} else if addrChild.IsLeaf && len(addrChild.Keys) >= 1 {
-						pool.Addresses = append(pool.Addresses, addrChild.Keys[0])
+					// A block child's own Keys are the address token
+					// stream (Keys[0] is the IP, not the property name).
+					if err := appendPoolAddresses(pool, addrChild.Keys); err != nil {
+						return err
 					}
 				}
 			case "port":
