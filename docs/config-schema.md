@@ -1340,6 +1340,42 @@ The exclusions are covered by `pkg/config/apply_groups_leaflist_exclude_test.go`
 args>=2 `address` no-token-merge, and — the narrow-exclusion proof — firewall
 `from protocol` in the same subtree STILL unions).
 
+### Transitive (nested) apply-groups (#4474)
+
+A group body may itself contain `apply-groups G2` — a NESTED-group template, a
+standard Junos idiom where a group composes other groups (`grpA { apply-groups
+grpB; }` applied at the top with `apply-groups grpA`). `grpB`'s content must be
+inherited transitively.
+
+Before #4474 this SILENTLY DROPPED `grpB`. `expandGroupsRecursive` captured the
+top-level `applyNames` (`[grpA]`) BEFORE merging, merged `grpA`'s body — which
+contains the `apply-groups grpB` leaf — into the top level, then stripped ALL
+`apply-groups` nodes at that level before recursing. `grpB` was never in
+`applyNames` and its merged-in reference was stripped, so a security zone or
+policy authored behind `grpB` VANISHED with a CLEAN commit (config fail-open, a
+HIGH-severity parity gap: a stanza the operator wrote is silently not enforced).
+
+**The fix** expands each group's OWN `apply-groups` to a FIXED POINT before
+merging its body. In `expandGroupsRecursive`, after cloning a group's
+context-walked children (`srcChildren`), it recursively calls
+`expandGroupsRecursive` on the clone (same `groups` map, same `ancestorPath`,
+same `seen` set) so any nested `apply-groups` inside the group body are resolved
+first; only then does `mergeNodes` splice the fully-expanded body into the
+parent. This composes to arbitrary depth (`grpA -> grpB -> grpC`).
+
+Cycles are fail-CLOSED: the existing `seen` circular-reference guard already
+marks `name` before the pre-merge expansion, so `grpA -> grpB -> grpA` surfaces
+the same `apply-groups circular reference` error as a direct self-cycle rather
+than recursing forever — a rejected commit beats a silently-dropped zone.
+
+`| display inheritance` attribution stays correct: `tagNodesInherited(cloned,
+name)` runs BEFORE the nested expansion, so it tags only the outer group's own
+body; nodes contributed by the nested group are tagged by the recursive call
+with THAT nested group's name (not the outer one). Covered by
+`pkg/config/apply_groups_transitive_4474_test.go` (headline zone present,
+outer-own-content-kept, three-deep chain, cycle-terminates, and tagged
+inheritance attribution).
+
 ## `then community` operations: add / delete / set / none (#2848)
 
 The policy-term action `then community` supports the Junos/vSRX community

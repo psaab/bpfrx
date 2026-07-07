@@ -1,3 +1,30 @@
+## 2026-07-07 — #4474 (opus-172 H-1): transitive apply-groups fail-open
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the transitive/nested apply-groups silent-drop
+  (config fail-open, HIGH). A group whose body references another group
+  (`grpA { apply-groups grpB; }`, applied via top-level `apply-groups
+  grpA`) had grpB's content silently dropped, so a security zone/policy
+  authored behind grpB vanished with a CLEAN commit (no error/warning).
+  Root cause: `expandGroupsRecursive` captured the top-level `applyNames`
+  BEFORE merging grpA's body, merged grpA's `apply-groups grpB` leaf into
+  the top level, then stripped ALL apply-groups nodes before recursing —
+  grpB was never expanded. Fix: expand each group's OWN apply-groups to a
+  FIXED POINT before merging its body — after cloning `srcChildren`, call
+  `expandGroupsRecursive` on the clone (same groups map / ancestorPath /
+  `seen` set), then mergeNodes the fully-expanded body. Composes to
+  arbitrary depth; the existing `seen` circular guard (name marked before
+  the pre-merge expansion) makes cycles fail-CLOSED with the same
+  circular-reference error as a direct self-cycle. tagNodesInherited runs
+  BEFORE the nested expansion so `| display inheritance` attributes nested
+  content to the nested group. Validation: 5 new tests (headline zone
+  present, outer-own-content kept, three-deep chain, cycle terminates,
+  tagged inheritance) — all RED on revert of the fix, GREEN with it; full
+  `go test ./pkg/config/...` green; go build/gofmt/vet clean.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/apply_groups_transitive_4474_test.go, docs/config-schema.md,
+  _Log.md
+
 ## 2026-07-07 — #4407 Phase A: group tail reconcile dispatches (steps 8–21)
 
 - **Timestamp**: 2026-07-07

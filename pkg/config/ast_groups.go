@@ -188,6 +188,20 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			if tagInherited {
 				tagNodesInherited(cloned, name)
 			}
+			// Transitive apply-groups (#4474): a group body may itself say
+			// `apply-groups G2` (a nested-group template, a standard Junos
+			// idiom). Expand the group's OWN references to a fixed point BEFORE
+			// merging its body, so G2's content is inherited rather than
+			// silently dropped when the outer strip-and-recurse removes the
+			// merged-in `apply-groups G2` node. The `seen` guard — `name` is
+			// already marked above — breaks cycles (grpA->grpB->grpA returns a
+			// circular-reference error, same as a direct self-cycle). Nodes
+			// inherited FROM the nested group are tagged with THAT group's name:
+			// tagNodesInherited above ran before this call, so it tags only the
+			// outer group's own body and does not clobber the nested tags.
+			if err := expandGroupsRecursive(&cloned, groups, ancestorPath, seen, tagInherited, vars); err != nil {
+				return err
+			}
 			mergeNodes(nodes, cloned, ancestorPath)
 		}
 
