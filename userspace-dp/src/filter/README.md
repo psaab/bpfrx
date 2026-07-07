@@ -222,6 +222,21 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   `affects_route_lookup`; that under-counted to zero on the discard/reject
   and session-hit exits, where the routing evaluator is never the counter.)
 
+- **A routing-instance term that ALSO carries `reject`/`discard` is a DENY
+  (#4392).** The non-PBR precheck DEFERS any matched routing-instance term
+  (`eval.rs`: a matched term with a non-empty `routing_instance` returns the
+  default `Accept` result), so a `then { routing-instance X; reject; }` term
+  reaches the routing evaluator via `ingress_route_table_override`, NOT the
+  precheck's terminal discard/reject exit above. The routing evaluator carries
+  the term's `action`; when it is `reject`/`discard` the override is now GATED
+  — `ingress_route_table_override` returns `RouteOverride::Drop` instead of a
+  forward table, so the caller drops (synthesizing the reject reply on the
+  flow-backed session-miss path, silent otherwise) rather than steering the
+  packet into VRF X. Before #4392 the override was applied unconditionally and
+  the deny was silently FORWARDED into the routing instance (a VRF leak + false
+  audit). Counter ownership is unchanged: the routing evaluator still counts the
+  matched term on this defer exit.
+
   **The CoS TX-selection INGRESS leg is counter-suppressed (#4085).** An
   interface INPUT filter is action-evaluated for its `then count` exactly
   once (the #2620 precheck above / the DSCP-sensitive session-hit re-eval).

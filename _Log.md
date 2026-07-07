@@ -1,3 +1,41 @@
+## 2026-07-06 — #4392 PBR `then routing-instance X; reject/discard` FORWARDED instead of dropping
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed a CRITICAL security bypass (ps-review-008 P3). A firewall
+  filter / PBR term `from { ... } then { routing-instance X; reject | discard; }`
+  carries BOTH a routing-instance override AND a terminating drop action.
+  `ingress_route_table_override` (userspace-dp/src/afxdp/forwarding/mod.rs)
+  captured the term action but used it ONLY for filter-log normalization and
+  ALWAYS returned `Some(routing_instance)`, so the caller route-looked-up and
+  FORWARDED the packet into VRF X — a VRF leak plus a false audit (the filter
+  log recorded a deny while the data plane forwarded). Changed the function to
+  return a three-way `RouteOverride { None | Table(<ri>) | Drop }`: a matched
+  routing-instance term whose action is `Reject`/`Discard` returns `Drop`.
+  Both callers (poll_descriptor/mod.rs — the flow-backed session-miss arm AND
+  the flowless arm) now `match` the result: on `Drop` they recycle the frame
+  and skip the route-lookup/forward. On the session-miss path a `PbrRejectSink`
+  (tx pipeline + counters) is passed, so a `reject` synthesizes the TCP RST /
+  ICMP-unreachable reply inside the override (reusing the existing
+  `enqueue_filter_reject_reply`, byte-identical to a non-PBR `then reject`) and
+  the filter log reports the truthful REJECT; a `discard`, and the whole
+  flowless path (no L4 header to reflect), drop silently. An accept-only
+  routing-instance term still returns `Table(<ri>)` and forwards — normal PBR
+  is unchanged. Added a `native_gre_pbr_action_snapshot(action)` fixture (v4 +
+  inet6 routing-instance terms) and 4 tests: reject/discard DROP on v4 and v6
+  (flowless/sink-less path), accept-still-forwards no-regression (v4 + v6), and
+  session-miss reply synthesis (budget-0 → `filter_reject_reply_budget_drops`
+  bumps, proving the reply was attempted). RED-on-revert verified: with the
+  drop gate disabled all 3 drop tests FAIL (they get `Table` = forward). Full
+  cargo serial suite green. Docs: forwarding/README.md, filter/README.md,
+  afxdp/README.md (the PBR + reject/discard drop-gate interaction).
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/frame/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/filter/README.md, userspace-dp/src/afxdp/README.md,
+  _Log.md
+
 ## 2026-07-06 — #4228 Gap 2: resolve CoS transmit-rate / shaping-rate percent
 
 - **Timestamp**: 2026-07-06

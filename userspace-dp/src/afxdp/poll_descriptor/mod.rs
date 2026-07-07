@@ -1637,7 +1637,13 @@ pub(super) fn poll_binding_process_descriptor(
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
-                        let route_table_override = ingress_route_table_override(
+                        // #4392: a PBR `then { routing-instance X; reject |
+                        // discard; }` term is a DENY, not a forward. Pass the
+                        // reject sink so a flow-backed `reject` synthesizes the
+                        // RST/ICMP reply (byte-identical to a non-PBR
+                        // `then reject`); on `RouteOverride::Drop` recycle the
+                        // frame and skip the route-lookup/forward entirely.
+                        let route_table_override = match ingress_route_table_override(
                             worker_ctx.forwarding,
                             packet_frame,
                             meta,
@@ -1645,7 +1651,19 @@ pub(super) fn poll_binding_process_descriptor(
                             ingress_zone_override,
                             worker_ctx.event_stream,
                             now_ns,
-                        );
+                            Some(PbrRejectSink {
+                                tx_pipeline: &mut binding.tx_pipeline,
+                                ingress_ifindex: binding.ifindex,
+                                counters: &mut *telemetry.counters,
+                            }),
+                        ) {
+                            RouteOverride::Drop => {
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                            RouteOverride::Table(table) => Some(table),
+                            RouteOverride::None => None,
+                        };
 
                         let resolution = if should_block_tunnel_interface_nat_session_miss(
                             worker_ctx.forwarding,
@@ -3307,17 +3325,36 @@ pub(super) fn poll_binding_process_descriptor(
                     //     term must reach LocalDelivery, NOT be steered into an
                     //     override table that has no local route (→ NoRoute →
                     //     drop). The override governs only the transit fallback.
-                    let route_override = l3_ctx.as_ref().and_then(|l3_flow| {
-                        ingress_route_table_override(
-                            worker_ctx.forwarding,
-                            packet_frame,
-                            meta,
-                            l3_flow,
-                            ingress_zone_override,
-                            worker_ctx.event_stream,
-                            now_ns,
-                        )
-                    });
+                    // #4392: on the flowless path a PBR `then { routing-instance
+                    // X; reject | discard; }` term is still a DENY. Pass no
+                    // reject sink — a flowless deny is a silent drop (a non-first
+                    // fragment / L3-only packet has no L4 header to reflect),
+                    // identical to the flowless non-PBR input-filter deny above.
+                    // On `RouteOverride::Drop` recycle the frame and skip the
+                    // override/route-lookup/forward.
+                    let route_table_override = match l3_ctx
+                        .as_ref()
+                        .map(|l3_flow| {
+                            ingress_route_table_override(
+                                worker_ctx.forwarding,
+                                packet_frame,
+                                meta,
+                                l3_flow,
+                                ingress_zone_override,
+                                worker_ctx.event_stream,
+                                now_ns,
+                                None,
+                            )
+                        })
+                        .unwrap_or(RouteOverride::None)
+                    {
+                        RouteOverride::Drop => {
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                        RouteOverride::Table(table) => Some(table),
+                        RouteOverride::None => None,
+                    };
                     let base_resolution = match l3_ctx.as_ref() {
                         Some(l3_flow) => flowless_base_resolution(
                             worker_ctx.forwarding,
@@ -3328,7 +3365,7 @@ pub(super) fn poll_binding_process_descriptor(
                             meta.ingress_vlan_id,
                             meta.protocol,
                             l3_flow.dst_ip,
-                            route_override.as_deref(),
+                            route_table_override.as_deref(),
                         ),
                         None => enforce_ha_resolution_snapshot(
                             worker_ctx.forwarding,
