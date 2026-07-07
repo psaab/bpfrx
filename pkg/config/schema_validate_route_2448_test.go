@@ -151,6 +151,40 @@ func TestSchema2448_ValidateStaticNextHop_AtSpec(t *testing.T) {
 	}
 }
 
+// TestStaticNextHop_ZoneIDPercentRejected_4423 pins the #4423 routing-audit
+// L3 disposition (NOT-A-BUG): the RFC 4007 "scoped address" zone-id form
+// `fe80::1%iface` — a Linux getaddrinfo() / `ip route` convention — is NOT a
+// Junos next-hop spelling and must NOT be accepted. In Junos (and xpf) an
+// IPv6 link-local gateway is written with an explicit egress clause,
+// `next-hop fe80::1 interface reth0.50`, which the compiler encodes for the
+// Rust FIB as the internal `ip@interface` spec (routes.go buildRouteSnapshots
+// → forwarding_build/fib.rs split_once('@')). There is no `%` producer or
+// consumer anywhere in the pipeline, so accepting `%iface` would create a
+// second, silently-degrading link-local syntax (net.ParseIP rejects the
+// zone-id, so the FIB would drop the gateway to ifindex 0). ValidateStaticNextHop
+// (schema_validators.go) already rejects it because `%` is neither part of a
+// parseable IP nor an allowed interface-name character; this test locks that
+// contract so a well-meaning "accept %iface" change cannot regress it.
+func TestStaticNextHop_ZoneIDPercentRejected_4423(t *testing.T) {
+	for _, nh := range []string{
+		"fe80::1%reth0",        // v6 link-local + zone-id (the finding's exact form)
+		"fe80::1%eth0",         // kernel-name zone-id
+		"fe80::1%reth0.50",     // sub-interface zone-id
+		"192.168.1.1%ge-0-0-0", // v4 with a stray '%' — also not a real form
+	} {
+		if err := config.ValidateStaticNextHop(nh, nil); err == nil {
+			t.Fatalf("ValidateStaticNextHop(%q) accepted an RFC-4007 zone-id form; "+
+				"xpf is Junos-syntax and expects `next-hop <ll> interface <if>`, "+
+				"not the Linux %%iface convention", nh)
+		}
+	}
+	// The correct Junos link-local spelling and the internal @iface encoding
+	// stay accepted — the rejection above must not over-reach.
+	if err := config.ValidateStaticNextHop("fe80::1@reth0.50", nil); err != nil {
+		t.Fatalf("Junos-encoded link-local next-hop fe80::1@reth0.50 must be accepted: %v", err)
+	}
+}
+
 func TestSchema2448_NextHop_AcceptsValidForms(t *testing.T) {
 	for _, nh := range []string{
 		"192.168.1.1", // bare IPv4

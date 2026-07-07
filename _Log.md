@@ -35,6 +35,39 @@
 - **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   docs/fabric-cross-chassis-fwd.md, _Log.md
+## 2026-07-06 — #4437: DDNS Surface-A cached HTTP client fails closed on source-bind error
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed C172-M01 (#4437). The Surface A HTTP publish path
+  (`resolveSurfaceABackend`, cached-client branch) swallowed a
+  cached-client source-bind error and threaded the UNBOUND default
+  client into the backend constructor — so a provider that configured a
+  `source-address` that could not be honored (a malformed address)
+  silently published from the DEFAULT ROUTE (the wrong source /
+  interface the operator explicitly overrode). Verify-first confirmed
+  the bug lived ONLY on the cached path: `httpClientCache.clientFor`
+  returns `(unbound client, err)`, and the old `httpClientFor` closure
+  dropped that error after a warning. The nil-cache path already failed
+  closed (`newProviderHTTPClient` surfaces the same error from inside
+  the constructor, `backend_dyndns2.go:85`), and the checkip observer
+  already failed closed via `CheckIPBound` (#3733). Fix: resolve the
+  source-bound client BEFORE building the backend and PROPAGATE the bind
+  error, so `newSurfaceAHTTP` degrades to the no-op publisher and the
+  reconcile SKIPS the publish (never a withdraw — the record stays as it
+  was on the wire, re-attempted next cycle once the leaf is corrected).
+  A publish with a configured `source-address` that cannot be honored is
+  an error, not a silent use-default. This is defense-in-depth: a non-IP
+  `source-address` is also rejected at commit
+  (`schema_validate_ddns_source_address_2780_test.go`), matching the
+  #3733 posture.
+- **Validation**: RED-on-revert confirmed — reverting the error
+  propagation makes `TestResolveSurfaceABackendFailsClosedOnCachedSourceBindError`
+  fail (returns a live `*dyndns2Backend` on the unbound client) while the
+  no-source happy-path test stays green. `go test ./pkg/ddns/...` green,
+  `go build`, gofmt + `go vet` clean on touched files.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/backend_http.go,
+  pkg/ddns/surface_a_sourcebind_failclosed_4437_test.go,
+  pkg/ddns/README.md, _Log.md
 
 ## 2026-07-06 — #4433: fail the commit closed when IPsec render/reload fails
 
@@ -38128,6 +38161,35 @@ top.
 - **File(s)**: pkg/config/ast_edit.go, pkg/config/event_options_4423_test.go,
   pkg/eventengine/engine.go, pkg/eventengine/engine_4423_test.go,
   pkg/eventengine/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4438 — extend the #4399 1:N multimap + validate-on-lookup
+  discipline to the OTHER two NAT session indexes. Verify-first confirmed
+  `forward_wire_index` and `reverse_translated_index` were STILL single-value
+  `SeededKeyMap<u32>` on origin/master (only #4399's `nat_reverse_index` was
+  fixed), so a colliding session still DISPLACED an earlier one → session
+  hijack on the forward-wire / translated-alias path (interface-mode SNAT /
+  DNAT-shared-backend / NAT64 non-bijective classes). Both are now
+  `HashMap<key, SmallVec<[u32; 2]>>` (shared `NatIndexBucket`): install appends
+  + dedups + bumps the shared collision counter (`nat_index_bucket_push`);
+  lookup walks the bucket and validates each candidate against the full tuple
+  (`find_forward_wire_match_with_origin` for the forward-wire tuple,
+  `resolve_reverse_translated_handle` for the translated tuple in
+  `lookup_with_origin`'s alias branch); delete drops the specific handle
+  (`nat_index_bucket_remove`), dropping the key only when the bucket empties.
+  Pool-mode SNAT stays a len-1 inline bucket on every index (zero heap, one
+  validate — fast path unchanged). #4399's `nat_reverse_index_push/remove`
+  methods were folded into the two shared free helpers. Collision telemetry
+  reuses the existing plumbed `nat_reverse_key_collisions` (now aggregates all
+  three indexes — doc updated); two #4399 exact-count assertions updated to the
+  aggregate. 6 new RED-on-revert tests (2 forward-wire + 2 reverse-translated
+  preserve/delete-specific, 2 pool-mode fast-path len-1). Full cargo serial:
+  3736 passed / 0 failed (lib 3651, fairness-eval 54, integration 8+22+1);
+  session subset 167/0, nat subset 613/0. NOTE: dataplane NAT/session change —
+  cluster smoke (test-failover) warranted before merge.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
 ---
 - **Timestamp**: 2026-07-06
 - **Action**: #4423 ip-monitoring (services ip-monitoring / #1827 preferred-route
@@ -38206,6 +38268,59 @@ top.
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
   pkg/api/server.go, pkg/daemon/daemon_run.go, docs/multi-wan.md, _Log.md
 
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 routing sub-items (M3 / L2 / L3 / L6) — verify-first triage
+  (final #4423 subsystem sweep). PR: `fix/4423-routing`. GO-only, no cargo. The
+  four "routing" findings turned out to live in the userspace forwarding
+  pipeline (`pkg/dataplane/userspace/routes.go` Go builder + the Rust FIB
+  `userspace-dp/src/afxdp/forwarding_build/fib.rs` / `forwarding/mod.rs`), NOT
+  in `pkg/routing`. Dispositions:
+  - **M3 (static next-hop gateway inference is global, not table-scoped) —
+    GENUINE, DEFERRED to a Rust/cargo slice.** `resolve_route_next_hops_v4/_v6`
+    infer a bare-gateway static route's egress ifindex via
+    `infer_connected_route_target_v4/_v6`, which scans `state.connected_v4`
+    GLOBALLY and never filters by the route's own table — although every
+    `ConnectedRouteV4` already carries its owning `table` (added by #2388 for
+    the lookup-site filter). The wrong ifindex is baked into
+    `RouteEntryV4.next_hops` at build time and used verbatim at lookup
+    (`forwarding/mod.rs` static arm), so the #2388 lookup-time filter does NOT
+    correct it. In a multi-VRF setup with overlapping gateway subnets a static
+    route in instance A can egress on instance B's interface. Two `fib.rs` doc
+    comments contradict each other (`resolve_route_next_hops_v4` claims
+    "#2388 table-scoped"; `infer_connected_route_target_v4` says "intentionally
+    NOT table-scoped" — the code matches the latter). Turnkey fix recorded in
+    `docs/rib-group-route-leaking.md`: thread the canonical table into the
+    inference and filter `entry.table == table`, mirroring the lookup site; fix
+    the stale doc. It is a `userspace-dp` change requiring the serial cargo
+    build + `make test-failover`, so it is deferred out of this Go-only slice.
+  - **L2 (`canonical_route_table` silently rewrites cross-family names) —
+    NOT-A-BUG.** The helper only swaps the family suffix (`.inet.0` ↔
+    `.inet6.0`) and always PRESERVES the VRF prefix, so it can only normalize a
+    name into the same instance's correct family-specific table, never a wrong
+    VRF. Go already emits correct-family install tables
+    (`normalizeRouteSnapshotFamily`) and `next-table` targets are reduced to a
+    bare instance name (`parseNextTableInstance`) with no family to drift.
+    Locked by `TestNormalizeRouteSnapshotFamily_VRFPreserving_4423`.
+  - **L3 (link-local next-hop needs `%iface`) — NOT-A-BUG.** xpf is
+    Junos-syntax: `next-hop fe80::1 interface reth0.50` (internally encoded as
+    the `ip@interface` FIB spec). `%iface` (RFC 4007 zone-id) has no producer or
+    consumer in the pipeline; `ValidateStaticNextHop` correctly rejects it at
+    commit. Locked by `TestStaticNextHop_ZoneIDPercentRejected_4423`.
+  - **L6 (overlay cannot express an ECMP preferred route) — DEFER (feature).**
+    `applyRouteOverlay` deliberately does whole-entry replacement with a single
+    next-hop — the correct #1827 WAN-failover semantics, pinned by the existing
+    `TestRouteOverlayWholeEntryReplacement`. ECMP preferred routes would be a new
+    feature (RouteOverlayEntry.NextHop → list + config schema + ipmon
+    winner-resolution); recorded plan in `docs/rib-group-route-leaking.md`.
+  - Validation: `go test ./pkg/config/ ./pkg/dataplane/userspace/` green
+    (new lock-in tests + surrounding suites); `go build ./...`; gofmt/vet clean
+    on touched files. No Go code fix was warranted (M3 is Rust/deferred; L2/L3
+    not-a-bug; L6 deferred feature) — this slice delivers the verify-first
+    dispositions, two lock-in tests encoding the L2/L3 disproofs, and the
+    turnkey M3 plan.
+- **File(s)**: pkg/config/schema_validate_route_2448_test.go,
+  pkg/dataplane/userspace/routes_family_normalize_4423_test.go,
+  docs/rib-group-route-leaking.md, _Log.md
 ## 2026-07-06 — #4434 HA heartbeat redundancy-group wire-width cap (codex-172 C172-H02)
 
 - **Timestamp**: 2026-07-06

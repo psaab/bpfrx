@@ -102,3 +102,97 @@ prefixes.
 - **Dynamically learned (DHCP) source addresses** — per-prefix cannot enumerate
   them at commit; warned now, would need Phase-2 route-copy or a runtime
   address-watch.
+
+## #4423 routing audit — FIB table-scoping dispositions
+
+The codex routing audit (tracked in issue #4423) raised four static-route /
+FIB-table findings against the userspace forwarding pipeline. Verify-first
+triage against `origin/master` classified them as follows. The relevant code
+is the Go route-snapshot builder (`pkg/dataplane/userspace/routes.go`) and the
+Rust FIB (`userspace-dp/src/afxdp/forwarding_build/fib.rs`,
+`userspace-dp/src/afxdp/forwarding/mod.rs`) — **not** `pkg/routing` (which owns
+netlink VRF/tunnel/ip-rule reconciliation, not FIB next-hop resolution).
+
+### M3 — static next-hop gateway inference is global, not table-scoped — GENUINE (deferred to a Rust slice)
+
+`resolve_route_next_hops_v4` / `resolve_route_next_hops_v6` resolve a static
+route's egress ifindex at FIB-build time. When a next-hop carries an explicit
+`@interface`, the ifindex comes from that interface; otherwise it is **inferred**
+from the connected prefix that contains the gateway IP via
+`infer_connected_route_target_v4`/`_v6`. That inference does a **global** scan of
+`state.connected_v4` and returns the first `prefix.contains(gateway)` match —
+**it never filters by the route's own table**, even though every `ConnectedRouteV4`
+already carries its owning `table` (added by #2388 exactly so the *lookup* site
+can filter — `forwarding/mod.rs` `entry.table == table`).
+
+Consequence: in a multi-VRF deployment with overlapping gateway subnets across
+routing-instances (a normal reason to use VRFs), a bare-gateway static route in
+instance A can bind the egress interface of instance B's overlapping connected
+prefix. The wrong ifindex is baked into `RouteEntryV4.next_hops` at build time
+and consumed verbatim at lookup (`forwarding/mod.rs`, the `ResolvedRouteV4::Static`
+arm uses `nh.ifindex` directly), so the #2388 lookup-time connected filter does
+**not** correct it — that filter only re-scopes connected-route *destination*
+matches, not a static route's pre-resolved next-hops.
+
+Two doc comments in `fib.rs` currently **contradict** each other on this point:
+`resolve_route_next_hops_v4`'s doc claims the inference is "scoped to the route's
+own table (#2388)", while `infer_connected_route_target_v4`'s own doc says it is
+"intentionally NOT table-scoped". The code matches the latter; the former is
+stale/aspirational and should be corrected alongside the fix.
+
+**Turnkey fix (Rust, needs `cargo` — out of the Go-only slice scope):** thread
+the route's canonical install table (already computed as
+`canonical_route_table(&route.table, is_ipv6)` at the `populate_routes` call
+site) into `resolve_route_next_hops_v4`/`_v6` → `resolve_next_hop_target_v4`/`_v6`
+→ `infer_connected_route_target_v4`/`_v6`, and filter the connected scan on
+`entry.table == table`, mirroring the existing #2388 lookup-site predicate. Add a
+Rust unit test with two routing-instances that own overlapping connected
+prefixes and assert a bare-gateway static route in instance A resolves to A's
+ifindex (RED on the current global scan). Fix the two contradictory doc comments.
+This is a dataplane (`userspace-dp`) change and must go through the serial cargo
+build + `make test-failover` gate, so it is deferred out of this Go-only triage.
+
+### L2 — `canonical_route_table` "silently rewrites cross-family table names" — NOT-A-BUG
+
+The premise ("rewritten into the wrong table → operator confusion") does not
+hold. `canonical_route_table` (`forwarding/mod.rs`) only swaps the **family half**
+of the table suffix (`.inet.0` ↔ `.inet6.0`, or bare `inet.0` ↔ `inet6.0`) and
+**always preserves the VRF prefix** — it can only ever normalize a name into the
+same routing-instance's correct family-specific table, never a different VRF.
+The Go side already emits correct-family install-table names
+(`normalizeRouteSnapshotFamily`, driven by the destination family and the
+static-list bucket), and static `next-table` targets are reduced to a bare
+routing-instance name (`parseNextTableInstance`, `pkg/config/compiler_routing.go`)
+that carries no family suffix to drift. The rewrite is a VRF-preserving
+normalization safety net, not a silent corruption. Locked by
+`TestNormalizeRouteSnapshotFamily_VRFPreserving_4423`
+(`pkg/dataplane/userspace/routes_family_normalize_4423_test.go`).
+
+### L3 — IPv6 link-local next-hop needs `%iface`, not `addr@interface` — NOT-A-BUG
+
+xpf is a Junos-syntax firewall. The operator writes a link-local gateway as
+`next-hop fe80::1 interface reth0.50` (separate `interface` clause); the compiler
+encodes it for the Rust FIB as the internal `ip@interface` spec (`routes.go`
+`buildRouteSnapshots` → `fib.rs` `split_once('@')`). The `%iface` RFC 4007
+zone-id form is a Linux getaddrinfo()/`ip route` convention with **no producer or
+consumer** anywhere in the xpf pipeline; `ValidateStaticNextHop`
+(`pkg/config/schema_validators.go`) correctly rejects it at commit (`net.ParseIP`
+does not accept a zone-id and `%` is not an allowed interface-name character).
+Accepting `%iface` would introduce a second, silently-degrading link-local
+syntax for no gain. Locked by `TestStaticNextHop_ZoneIDPercentRejected_4423`.
+
+### L6 — the #1827 ip-monitoring overlay cannot express an ECMP preferred route — DEFER (feature, not a bug)
+
+`applyRouteOverlay` (`routes.go`) intentionally **replaces the entire
+(table, family, prefix) entry set** with the single overlay next-hop — a
+whole-entry replacement, documented in the function contract and pinned by
+`TestRouteOverlayWholeEntryReplacement` ("the ECMP next-hop set is gone, not
+half-merged"). This is the correct #1827 WAN-failover semantics: when a probe
+selects a preferred path, steer *all* traffic for that prefix to the single
+preferred gateway; on withdrawal the original (possibly ECMP) config route
+returns. A multi-next-hop preferred route is a **new feature**, not a bug fix:
+it would require `config.RouteOverlayEntry.NextHop` → `NextHops []string`, a
+config-schema change to let `services ip-monitoring policy … then preferred-route
+… next-hop` take a list, and matching winner-resolution in `pkg/ipmon`. Deferred
+with this plan; the Rust FIB already carries multiple next-hops per route
+(`RouteEntryV4.next_hops`), so only the Go overlay/config surface needs the work.

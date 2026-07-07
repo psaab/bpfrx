@@ -164,9 +164,13 @@ func bindCacheKey(p *config.DDNSProvider) string {
 
 // clientFor returns the cached bound *http.Client for the provider's source
 // binding, building and caching it on first use. The bind-resolution error (a
-// malformed source-address) is returned alongside the UNBOUND default client
-// (fail-open, matching newProviderHTTPClient); the error path is NOT cached so a
-// corrected source-address on the next commit rebuilds cleanly.
+// malformed source-address) is returned alongside the UNBOUND default client;
+// the error path is NOT cached so a corrected source-address on the next commit
+// rebuilds cleanly. Returning the unbound client is a convenience for the
+// no-source caller — a NON-nil error means the source could NOT be honored, and
+// every caller MUST fail CLOSED on it (skip the publish / probe) rather than
+// egress from that unbound client: the publish resolver (resolveSurfaceABackend,
+// #4437) and the checkip observer (CheckIPBound, #3733) both do.
 func (c *httpClientCache) clientFor(p *config.DDNSProvider) (*http.Client, error) {
 	b, err := resolveProviderBindConfig(p)
 	if err != nil {
