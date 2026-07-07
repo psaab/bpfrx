@@ -37,6 +37,20 @@ const (
 // getPriority (track.go — the owner is also exempt from track-down demotion).
 const addressOwnerPriority = 255
 
+// minLearnedMasterAdverInterval is the absolute lower bound applied to a
+// Master_Adver_Interval learned from a peer advertisement (recordMasterAdvert,
+// #4548). It matches the schema minimum for `chassis cluster
+// reth-advertise-interval` (10 ms; pkg/config/schema_chassis.go) — the smallest
+// cadence the system will ever legitimately run at. It is only the backstop for
+// the degenerate case where the local configured interval is somehow unset; the
+// primary floor is the node's own configured advertise interval (see
+// masterAdverFloor). RFC 5798 §6.1/§6.4.2 requires a BACKUP to time its master
+// out on the master's advertised cadence, but a buggy or misconfigured peer that
+// advertises Max Adver Int=1 (10 ms) must not be allowed to drive a 30 ms RETH
+// node's Master_Down_Interval down to ~30 ms and flap mastership on ordinary
+// scheduling/network jitter.
+const minLearnedMasterAdverInterval = 10 * time.Millisecond
+
 func (s VRRPState) String() string {
 	switch s {
 	case StateInitialize:
@@ -1503,9 +1517,37 @@ func (vi *vrrpInstance) recordMasterAdvert(pkt *VRRPPacket) {
 	// masterDownInterval falls back to the local interval rather than computing
 	// a zero (flapping) master-down timer from a malformed advert.
 	if pkt.MaxAdvertInt > 0 {
-		vi.masterAdverInterval = time.Duration(pkt.MaxAdvertInt) * 10 * time.Millisecond
+		learned := time.Duration(pkt.MaxAdvertInt) * 10 * time.Millisecond
+		// Clamp a pathologically-low learned interval up to a safe floor
+		// (#4548). A BACKUP must never time its master out FASTER than its own
+		// configured advertise cadence: a buggy or misconfigured peer that
+		// advertises Max Adver Int=1 (10 ms) would otherwise collapse
+		// masterDownInterval (and the preempt-gate staleness horizons) to
+		// ~30 ms (3*10ms + skew) on a 30 ms RETH node and flap mastership on
+		// ordinary jitter. The floor is the node's own configured advertise
+		// interval; a SLOWER master (learned >= floor, the #4061
+		// anti-premature-failover case) is adopted unchanged — only the low
+		// side is clamped, so the 30 ms RETH fast-failover default is preserved
+		// exactly (floor == 30 ms == learned → no change).
+		if floor := vi.masterAdverFloor(); learned < floor {
+			learned = floor
+		}
+		vi.masterAdverInterval = learned
 	}
 	vi.mu.Unlock()
+}
+
+// masterAdverFloor is the minimum interval a learned Master_Adver_Interval may
+// take (#4548). It is the node's own configured advertise interval
+// (cfg.AdvertiseInterval, defaulting to 1000 ms when unset — see advertInterval)
+// with an absolute minLearnedMasterAdverInterval backstop. Reads cfg, which is
+// immutable after construction, so it is safe to call while holding vi.mu.
+func (vi *vrrpInstance) masterAdverFloor() time.Duration {
+	floor := vi.advertInterval()
+	if floor < minLearnedMasterAdverInterval {
+		floor = minLearnedMasterAdverInterval
+	}
+	return floor
 }
 
 // handleBackupRx processes a received advertisement while in Backup state.
