@@ -1,3 +1,23 @@
+## 2026-07-07 — #4362 wg: drain cookie_gen on peer removal in reconcile_peers
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the #4094-PR-B follow-up leak. `WgEngine::reconcile_peers`
+  drained a removed peer's `sessions_by_local_index` demux entries and its
+  `pending`/`pending_by_peer` handshake reservations, but NOT `cookie_gen`
+  (the per-peer initiator-cookie state, keyed by peer pubkey and living
+  OUTSIDE the atomically-swapped `PeerTable`). A removed peer therefore left
+  a stale `InitiatorCookie` (~56 bytes) unreachable but resident until process
+  restart. Added a `cookie_gen.lock()` drain block over the removed pubkeys
+  right after the `pending`/`pending_by_peer` block (same removed-peer test:
+  `old.peer_index_by_pubkey.keys()` minus `new_index`). Verified `cookie_gen`
+  is the ONLY per-pubkey engine side-map not already drained on removal
+  (`peer_index_by_pubkey` is rebuilt wholesale in the new table;
+  `CookieChecker.buckets` is keyed by source `IpAddr` and self-ages).
+- **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs` (drain block + reconcile
+  doc-comment), `userspace-dp/src/afxdp/wg/engine_tests.rs` (RED-on-revert
+  `reconcile_peers_drains_dropped_peer_cookie_gen`), `docs/wireguard-interop.md`
+  (PR-B lifecycle/peer-removal note).
+
 ## 2026-07-07 — #4407 Phase A: group tail reconcile dispatches (steps 8–21)
 
 - **Timestamp**: 2026-07-07
