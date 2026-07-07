@@ -37811,3 +37811,87 @@ top.
   rustfmt does not touch the new lines).
 - **File(s)**: userspace-dp/src/screen/scan.rs,
   userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs, _Log.md
+
+## 2026-07-06 — flowexport collector-stall hardening (#4423 H07/M09/M10/M13)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Verify-first + drive the flowexport audit backlog (#4423,
+  originally codex flowexport H07 + M09/M10/M13). Three genuine bugs fixed,
+  one disproved not-material.
+  - **H07 (HIGH, GENUINE)** — one blocking collector write stalled ALL
+    collectors + template refresh + batch flush + shutdown drain.
+    `collectorConns.writeAll` (transport.go) is a serial loop over the group's
+    connections in the ONE per-exporter `Run` goroutine, and set no write
+    deadline; a connected-UDP `Write` can block indefinitely on a full send
+    buffer (ENOBUFS / congested / down path). Fix: each write sets
+    `SetWriteDeadline(now + collectorWriteTimeout)` (2s default `var`), so a
+    stuck collector times out (datagram dropped, marked unhealthy #2464)
+    instead of parking the goroutine. RED-on-revert:
+    `TestWriteAll_SlowCollectorDoesNotStallOthers` (blocking fake conn;
+    without the deadline writeAll never returns → 3s guard fires).
+  - **M09 (NOT-MATERIAL)** — "BuildExportConfig drops all but the first
+    template group." Disproved: `BuildExportConfig`/`BuildIPFIXExportConfig`
+    (manager.go:530/539, return groups[0]) have NO production caller — the
+    daemon uses `ResolveV9TemplateGroups`/`ResolveIPFIXTemplateGroups`
+    (daemon_flowexport.go:120/136), which return ALL groups and start one
+    exporter per group. The single-group return is documented/intentional for
+    a retained single-aggregate helper. No fix; recorded on #4423.
+  - **M10 (GENUINE robustness)** — `Run` built its template ticker with
+    `time.NewTicker(cfg.TemplateRefreshRate)`, which panics on `<= 0` (fatal
+    under `go e.Run`). Reachable via the public `NewExporter`/`NewIPFIXExporter`
+    constructors with a hand-built zero-rate ExportConfig. Fix:
+    `templateRefreshInterval` clamps non-positive → `defaultTemplateRefreshRate`
+    (60s), used by both v9 and IPFIX `Run`. RED-on-revert:
+    `TestTemplateRefreshInterval_ClampsNonPositive` +
+    `TestExporterRun_ZeroRefreshRateNoPanic`.
+  - **M13 (GENUINE, v9-only)** — NetFlow v9 `bootTime` was `time.Now()` at
+    exporter construction, so after a daemon restart a session that started
+    before the restart had `StartTime < bootTime` and `uptimeMs` clamped its
+    `FirstSwitched` to 0 (flow age truncated to "at boot"). Fix: `bootTime =
+    systemBootTime()` (now − `CLOCK_BOOTTIME`), the real device boot instant,
+    via a `bootTimeFunc` test seam. IPFIX unaffected (absolute
+    flowStart/EndMilliseconds). RED-on-revert:
+    `TestExporterBootTimeAnchorsAtDeviceBoot`.
+  - Validation: `go test ./pkg/flowexport/...` green; `go build`/vet/gofmt
+    clean; `pkg/daemon` builds + tests green. Each fix verified RED-on-revert
+    individually.
+- **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/flowexport/collector_health_test.go,
+  pkg/flowexport/collector_stall_4423_test.go, pkg/flowexport/README.md,
+  _Log.md
+
+## 2026-07-06 — flowexport #4423 fold: unhealthy-collector backoff + wording (Copilot review)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fold 3 Copilot findings on PR #4428 before merge.
+  - **Copilot #2 (REAL steady-state gap)** — the H07 write deadline bounds a
+    SINGLE stall to `collectorWriteTimeout` (2s) but a PERSISTENTLY-blocked
+    collector still ate a fresh 2s write attempt on EVERY flush/template-refresh,
+    delaying the healthy collectors + the flush/refresh cadence forever. Fix: a
+    per-collector `nextRetryAt` backoff gate in `writeAll` (transport.go) SKIPS
+    an unhealthy collector until `unhealthyProbeInterval` (30s, a `var`) elapses,
+    then re-probes; a successful probe clears the gate and resumes per-flush
+    writes. Steady-state cost of a dead collector drops from 2s/100ms-flush to
+    one bounded probe/30s. Skips are counted (`collectorConn.skipped` →
+    `CollectorHealth.WriteSkipped`) and surfaced in `show services
+    flow-monitoring` (gRPC + CLI) and the new Prometheus counter
+    `xpf_flow_export_collector_write_skipped_total` — not a silent drop.
+  - **Copilot #1 + #3 (wording overpromise)** — the `collectorWriteTimeout` /
+    `writeAll` comments said a slow collector "cannot stall" the goroutine and
+    the README said "instead of blocking the pipeline," but a write still blocks
+    up to the timeout per attempt. Reworded: the deadline BOUNDS (caps) the
+    stall, does not eliminate it; the backoff then skips an unhealthy collector
+    between probes.
+  - RED-on-revert: `TestWriteAll_UnhealthyCollectorSkippedDuringBackoff` (skip
+    during backoff + recovery-probe resume; without the gate the unhealthy
+    collector's attempts climb with the flush count → RED, verified). Existing
+    `TestCollectorHealth_StateChangeEdges` /
+    `..._StateChangeCallbackOncePerTransition` set `unhealthyProbeInterval = 0`
+    (they assert consecutive-write edge detection, orthogonal to backoff).
+  - Validation: `go test -race ./pkg/flowexport/...` green; `go build ./...`;
+    gofmt/vet clean on touched files (pre-existing metrics_wireguard_test.go
+    gofmt drift + cli.go:503 vet warning are on origin/master, untouched).
+- **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/collector_health_test.go,
+  pkg/flowexport/collector_stall_4423_test.go, pkg/flowexport/README.md,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/grpcapi/server_show_flow.go, pkg/cli/cli_show_flow.go, _Log.md

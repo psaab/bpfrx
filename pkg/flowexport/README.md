@@ -691,6 +691,56 @@ group; emitted before the dataplane gate — exporters are control-plane). A
 climbing `dropped_total`, or a sustained nonzero `depth`, is the operator
 signal that the export drain cannot keep up.
 
+## Export-pipeline resiliency (#4423)
+
+Three hardening fixes to the exporter goroutine and its sysUptime clock.
+
+- **Per-collector write deadline + unhealthy-collector backoff (H07).**
+  `writeAll` (`transport.go`) fans a packet out to every collector in the group
+  SERIALLY, in the ONE per-exporter `Run` goroutine that also drives the
+  template refresh, the 100 ms batch flush, and the shutdown drain. A
+  connected-UDP `Write` is normally instantaneous but can block indefinitely on
+  a full socket send buffer (ENOBUFS / a congested or down egress path parks
+  the goroutine in the netpoller until the buffer drains). One blocked write
+  therefore stalled ALL of the above INDEFINITELY — the other collectors
+  starved, templates stopped refreshing, the batch backed up (see #3747, which
+  bounds the resulting memory growth but does not un-stall the drain), and
+  ctx-cancel shutdown hung past the unit `TimeoutStopSec`.
+
+  Two bounds are applied. (1) Each ATTEMPTED write sets `SetWriteDeadline(now +
+  collectorWriteTimeout)` (default 2 s): this does NOT eliminate the stall — it
+  CAPS it, so a slow collector blocks the shared goroutine by at most the
+  timeout per attempt, never indefinitely (the datagram is then dropped,
+  best-effort UDP, and the collector is marked unhealthy #2464). (2) A
+  per-collector `nextRetryAt` backoff gate then SKIPS an already-unhealthy
+  collector until `unhealthyProbeInterval` (default 30 s) elapses, so a
+  PERSISTENTLY-dead collector costs one bounded probe per interval instead of a
+  fresh timeout on every flush — without which a dead collector would still
+  delay the healthy collectors + the template/flush cadence by up to 2 s every
+  100 ms forever. A successful re-probe clears the gate and resumes normal
+  per-flush writes. Skipped writes are counted (`skipped` →
+  `CollectorHealth.WriteSkipped` → `show services flow-monitoring` +
+  `xpf_flow_export_collector_write_skipped_total`) so the backoff is
+  observable, not a silent drop. `collectorWriteTimeout` and
+  `unhealthyProbeInterval` are package `var`s so tests shrink them.
+- **Template-refresh ticker clamp (M10).** `Run` built its template ticker with
+  `time.NewTicker(cfg.TemplateRefreshRate)`, which PANICS on a `<= 0` duration
+  — fatal under `go e.Run(ctx)`. The production resolver always fills at least
+  60 s, but the public `NewExporter` / `NewIPFIXExporter` constructors accept
+  any `*ExportConfig`. `templateRefreshInterval` (`transport.go`) now clamps a
+  non-positive rate to `defaultTemplateRefreshRate` (60 s).
+- **sysUptime anchored at device boot (M13).** The NetFlow v9 header
+  `SysUptime` and the record `FirstSwitched`/`LastSwitched` fields are all
+  "system uptime" relative (RFC 3954). The exporter anchored them at
+  `time.Now()` taken when the exporter was CONSTRUCTED, so after a daemon
+  restart (commit, crash recovery, HA failback) any flow that started before
+  the restart had `StartTime` earlier than the anchor and `uptimeMs` clamped
+  its `FirstSwitched` to 0 — truncating the flow age to "at boot". `bootTime`
+  is now `systemBootTime()` (now − `CLOCK_BOOTTIME`), the real device boot
+  instant which predates every session, via the `bootTimeFunc` seam (tests
+  inject a deterministic boot). IPFIX is unaffected — it exports absolute
+  `flowStart/EndMilliseconds`, not an uptime-relative value.
+
 ## Entry points
 
 NetFlow v9:

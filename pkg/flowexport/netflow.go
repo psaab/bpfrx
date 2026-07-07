@@ -9,7 +9,41 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/logging"
+	"golang.org/x/sys/unix"
 )
+
+// bootTimeFunc resolves the device boot instant used as the NetFlow v9
+// sysUptime reference (the NetFlow v9 header SysUptime and the FirstSwitched /
+// LastSwitched record fields are all "system uptime" relative — RFC 3954 §5.1
+// / §8). It is a seam so tests can inject a deterministic boot time. Defaults
+// to systemBootTime; overridden only by tests.
+var bootTimeFunc = systemBootTime
+
+// systemBootTime returns the wall-clock instant the machine booted, computed
+// from CLOCK_BOOTTIME (seconds-since-boot) subtracted from now (#4423 M13).
+//
+// The exporter previously anchored sysUptime at time.Now() taken when the
+// exporter was CONSTRUCTED. After a daemon restart (config commit, crash
+// recovery, HA failback) that anchor moves forward to the restart instant, so
+// any flow that STARTED before the restart — a long-lived session, an
+// HA-synced session carrying an earlier creation timestamp — has StartTime
+// earlier than the anchor and uptimeMs clamps its FirstSwitched to 0,
+// truncating the flow age to "at boot". Anchoring at the real device boot
+// (which predates every session) makes FirstSwitched/LastSwitched and the
+// header SysUptime carry the true device-relative uptime instead. On the rare
+// error path we fall back to time.Now() (the pre-fix behaviour), never a zero
+// time.
+func systemBootTime() time.Time {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		return time.Now()
+	}
+	uptime := time.Duration(ts.Sec)*time.Second + time.Duration(ts.Nsec)*time.Nanosecond
+	if uptime <= 0 {
+		return time.Now()
+	}
+	return time.Now().Add(-uptime)
+}
 
 // NetFlow v9 field type IDs (RFC 3954).
 const (
@@ -526,8 +560,11 @@ type Exporter struct {
 // callback so there is exactly one counter per exporter.
 func NewExporter(cfg *ExportConfig) (*Exporter, error) {
 	e := &Exporter{
-		cfg:      cfg,
-		bootTime: time.Now(),
+		cfg: cfg,
+		// #4423 M13: anchor sysUptime at real device boot, not exporter-
+		// construction time, so a session that started before a daemon restart
+		// is not truncated to FirstSwitched=0.
+		bootTime: bootTimeFunc(),
 		// #3740: stable per-group SourceID (RFC 3954 §5.1) derived from the
 		// config identity so two same-collector groups no longer collide on
 		// SourceID=1. HA-symmetric (pure function of config-synced fields).
@@ -554,7 +591,8 @@ func (e *Exporter) Run(ctx context.Context) {
 	// Send initial template
 	e.sendTemplates()
 
-	templateTicker := time.NewTicker(e.cfg.TemplateRefreshRate)
+	// #4423 M10: clamp a non-positive refresh rate so NewTicker never panics.
+	templateTicker := time.NewTicker(templateRefreshInterval(e.cfg.TemplateRefreshRate))
 	defer templateTicker.Stop()
 
 	batchTicker := time.NewTicker(100 * time.Millisecond)

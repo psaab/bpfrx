@@ -807,7 +807,8 @@ func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
 func (e *IPFIXExporter) Run(ctx context.Context) {
 	e.sendTemplates()
 
-	templateTicker := time.NewTicker(e.cfg.TemplateRefreshRate)
+	// #4423 M10: clamp a non-positive refresh rate so NewTicker never panics.
+	templateTicker := time.NewTicker(templateRefreshInterval(e.cfg.TemplateRefreshRate))
 	defer templateTicker.Stop()
 
 	batchTicker := time.NewTicker(100 * time.Millisecond)

@@ -147,6 +147,8 @@ func (c *xpfCollector) collectFlowExportMetrics(ch chan<- prometheus.Metric) {
 			prometheus.CounterValue, float64(h.WriteAttempts), h.Protocol, h.Instance, h.Template, h.Address, h.SourceAddress)
 		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorWriteFailuresTotal,
 			prometheus.CounterValue, float64(h.WriteFailures), h.Protocol, h.Instance, h.Template, h.Address, h.SourceAddress)
+		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorWriteSkippedTotal,
+			prometheus.CounterValue, float64(h.WriteSkipped), h.Protocol, h.Instance, h.Template, h.Address, h.SourceAddress)
 		healthy := 0.0
 		if h.Healthy {
 			healthy = 1

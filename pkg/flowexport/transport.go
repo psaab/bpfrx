@@ -33,6 +33,12 @@ type collectorConn struct {
 
 	attempts atomic.Uint64
 	failures atomic.Uint64
+	// skipped counts writes NOT attempted because the collector is unhealthy
+	// and still inside its probe-backoff window (#4423 H07 follow-up). It makes
+	// the backoff observable: a persistently-dead collector's skipped count
+	// climbs while attempts/failures do not, distinguishing "skipped for
+	// backoff" from a real per-flush failure.
+	skipped atomic.Uint64
 
 	mu              sync.Mutex
 	lastError       string
@@ -46,6 +52,12 @@ type collectorConn struct {
 	// the recovery edge is unambiguous.
 	healthy    bool
 	consecFail uint64
+	// nextRetryAt is the earliest time writeAll will re-probe this collector
+	// after a failed write (#4423 H07 follow-up). While unhealthy and before
+	// nextRetryAt the collector is SKIPPED, so a persistently-blocked collector
+	// costs one bounded probe per unhealthyProbeInterval instead of a full
+	// collectorWriteTimeout stall on every flush. Zero on a healthy collector.
+	nextRetryAt time.Time
 }
 
 // ExporterCollectorHealth is one collector's write-health snapshot
@@ -72,9 +84,14 @@ type CollectorHealth struct {
 	// disambiguates two same-family collectors that bind distinct
 	// sources (#3745) so a source-bound connection failure is
 	// identifiable in the CLI / REST / Prometheus surfaces.
-	SourceAddress   string    `json:"source_address,omitempty"`
-	WriteAttempts   uint64    `json:"write_attempts"`
-	WriteFailures   uint64    `json:"write_failures"`
+	SourceAddress string `json:"source_address,omitempty"`
+	WriteAttempts uint64 `json:"write_attempts"`
+	WriteFailures uint64 `json:"write_failures"`
+	// WriteSkipped is the count of writes NOT attempted because the collector
+	// was unhealthy and still inside its probe-backoff window (#4423). A
+	// climbing value (while attempts/failures hold) is the signal that a dead
+	// collector is being skipped rather than re-attempted every flush.
+	WriteSkipped    uint64    `json:"write_skipped"`
 	Healthy         bool      `json:"healthy"`
 	LastError       string    `json:"last_error,omitempty"`
 	LastErrorTime   time.Time `json:"last_error_time,omitempty"`
@@ -150,6 +167,63 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 	return cc, nil
 }
 
+// collectorWriteTimeout BOUNDS how long a single collector write may block
+// before it is abandoned as a failure (#4423 H07). writeAll runs in the ONE
+// per-exporter Run goroutine that ALSO drives every other collector in the
+// group, the periodic template refresh, the 100ms batch flush, and the
+// shutdown drain. A connected-UDP Write is normally instantaneous, but it can
+// block indefinitely on a full socket send buffer (ENOBUFS / a congested or
+// down egress path parks the goroutine in the netpoller until the buffer
+// drains). Without a deadline that single blocked write stalls ALL of the
+// above INDEFINITELY — the other collectors starve, templates stop refreshing,
+// the batch backs up, and ctx-cancel shutdown hangs past the unit
+// TimeoutStopSec.
+//
+// The deadline does NOT eliminate the stall — it caps it: a slow collector can
+// still block the shared goroutine by AT MOST collectorWriteTimeout per
+// ATTEMPTED write (the datagram is then dropped, best-effort UDP, and the
+// collector is marked unhealthy #2464). The per-flush steady-state cost of a
+// PERSISTENTLY-dead collector is then bounded further by the unhealthyProbe-
+// Interval backoff below, which SKIPS an unhealthy collector between probes so
+// it does not eat a fresh collectorWriteTimeout on every flush.
+//
+// A var, not a const, so tests can shrink it. 2s is far above any healthy UDP
+// write yet well within the 20s systemd stop timeout even for several hung
+// collectors.
+var collectorWriteTimeout = 2 * time.Second
+
+// unhealthyProbeInterval is how long a collector that failed a write is SKIPPED
+// before writeAll re-probes it (#4423 H07 follow-up). Without this gate a
+// persistently-blocked collector (its send buffer stays full) costs a fresh
+// collectorWriteTimeout stall on EVERY flush/template-refresh, delaying the
+// healthy collectors and the template/flush cadence forever — the deadline
+// bounds a SINGLE stall but not the steady-state cost of a dead collector.
+// Skipping an unhealthy collector until nextRetryAt drops that steady-state
+// cost to one bounded probe per interval (a 2s-bounded write every 30s, not a
+// 2s stall every 100ms). A recovered probe resumes normal per-flush writes. A
+// var so tests can shrink it.
+var unhealthyProbeInterval = 30 * time.Second
+
+// defaultTemplateRefreshRate is the fallback template-refresh cadence used when
+// an ExportConfig carries a non-positive TemplateRefreshRate (#4423 M10). The
+// production resolver always fills at least 60s, but the public NewExporter /
+// NewIPFIXExporter constructors accept any *ExportConfig, and time.NewTicker
+// panics on a <= 0 duration.
+const defaultTemplateRefreshRate = 60 * time.Second
+
+// templateRefreshInterval clamps a template-refresh rate to a strictly
+// positive duration so time.NewTicker never panics on a zero/negative rate
+// (#4423 M10). A hand-built ExportConfig (tests, external callers) that left
+// TemplateRefreshRate at 0 falls back to the default cadence instead of
+// crashing the Run goroutine — and a panic there is fatal (it runs under
+// `go e.Run(ctx)`).
+func templateRefreshInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultTemplateRefreshRate
+	}
+	return d
+}
+
 // writeAll transmits pkt to every collector connection and records the
 // per-collector write-health (#2464). A failure to one collector does
 // not stop delivery to the others (the export DATA path is unchanged —
@@ -157,6 +231,15 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 // non-fatal). The change is observability: each write bumps the
 // attempt counter, a success refreshes LastSuccessTime, and a failure
 // records LastError/LastErrorTime + the failure counter.
+//
+// Each attempted write is BOUNDED by collectorWriteTimeout (#4423 H07) so a
+// slow or blocked collector stalls the shared export goroutine — which also
+// drives the other collectors, the template refresh, the batch flush, and the
+// shutdown drain — by at most that timeout per attempt, never indefinitely.
+// An already-unhealthy collector is additionally SKIPPED between probes
+// (unhealthyProbeInterval), so its steady-state cost is one bounded probe per
+// interval rather than a fresh timeout on every flush; skipped writes are
+// counted (skipped) for observability.
 //
 // Logging is RATE-LIMITED to the unhealthy<->healthy EDGE, not every
 // write: writeAll runs once per export flush (the v9/IPFIX batch ticker
@@ -168,6 +251,22 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 // (template vs data) in the debug line kept for deep tracing.
 func (cc *collectorConns) writeAll(pkt []byte, errMsg string) {
 	for _, c := range cc.conns {
+		// Backoff gate: an unhealthy collector still inside its probe window is
+		// SKIPPED, so a persistently-blocked collector does not cost a fresh
+		// collectorWriteTimeout stall on every flush (#4423 H07 follow-up).
+		c.mu.Lock()
+		if !c.healthy && time.Now().Before(c.nextRetryAt) {
+			c.mu.Unlock()
+			c.skipped.Add(1)
+			continue
+		}
+		c.mu.Unlock()
+
+		// Bound the write so a full send buffer on one collector cannot park
+		// the shared goroutine indefinitely (#4423 H07). A write that trips
+		// the deadline returns a timeout error handled by the failure branch
+		// below, exactly like any other unreachable-collector error.
+		_ = c.conn.SetWriteDeadline(time.Now().Add(collectorWriteTimeout))
 		_, err := c.conn.Write(pkt)
 		c.attempts.Add(1)
 		now := time.Now()
@@ -178,6 +277,9 @@ func (cc *collectorConns) writeAll(pkt []byte, errMsg string) {
 			c.lastErrorTime = now
 			c.lastFailureTime = now
 			c.consecFail++
+			// Arm the backoff: skip this collector until the probe interval
+			// elapses so the next flushes don't each eat a full timeout.
+			c.nextRetryAt = now.Add(unhealthyProbeInterval)
 			wasHealthy := c.healthy
 			c.healthy = false
 			c.mu.Unlock()
@@ -192,6 +294,8 @@ func (cc *collectorConns) writeAll(pkt []byte, errMsg string) {
 		}
 		c.mu.Lock()
 		c.lastSuccessTime = now
+		// A successful (re)probe clears the backoff and resumes per-flush writes.
+		c.nextRetryAt = time.Time{}
 		wasUnhealthy := !c.healthy
 		c.healthy = true
 		c.consecFail = 0
@@ -217,6 +321,7 @@ func (cc *collectorConns) health() []CollectorHealth {
 			SourceAddress:   c.srcAddr,
 			WriteAttempts:   c.attempts.Load(),
 			WriteFailures:   c.failures.Load(),
+			WriteSkipped:    c.skipped.Load(),
 			Healthy:         c.healthy,
 			LastError:       c.lastError,
 			LastErrorTime:   c.lastErrorTime,
