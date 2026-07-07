@@ -819,14 +819,17 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 	// #3308 firewall-filter routing-instance-vs-discard/reject mutual-exclusion
 	// gate. Strict on commit / commit-check (hard-reject a term that co-locates
 	// `then routing-instance <x>` with a terminating `then discard`/`then
-	// reject`). Such a term is contradictory: the PBR runtime
-	// (ingress_route_table_override) logs the deny/reject but UNCONDITIONALLY
-	// returns the routing table, so the packet is routed while the audit stream
-	// records it as denied (the audit lies; fail-open PBR). Lenient on load /
-	// peer-sync (warn so an already-persisted or peer-synced config still boots —
-	// #1960 no-brick; the runtime routes-and-mislogs independently). Runs on the
-	// fully-compiled *Config so the typed term list (RoutingInstance + Action
-	// populated by compileFilterThen) is available.
+	// reject`). Such a term is contradictory: it asks the dataplane to BOTH steer
+	// the packet into <x> AND drop/reject it. Both forwarding paths now resolve
+	// the contradiction to the DENY — the userspace PBR runtime
+	// (ingress_route_table_override) returns RouteOverride::Drop (#4392) and the
+	// kernel `ip rule` mirror (buildPBRFromFilter, pkg/routing) skips the steering
+	// rule (#4534). This gate stays strict at commit so the operator never
+	// authors the contradiction, but is lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick; both
+	// runtimes drop the term independently). Runs on the fully-compiled *Config so
+	// the typed term list (RoutingInstance + Action populated by compileFilterThen)
+	// is available.
 	if err := validateFilterRoutingInstanceConflictStrict(cfg); err != nil {
 		if opts.lenientFilterRoutingInstanceConflict {
 			cfg.Warnings = append(cfg.Warnings,
