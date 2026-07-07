@@ -1813,6 +1813,119 @@ fn tcp_syn_session_miss_still_caches_interface_nat_local_delivery() {
     ));
 }
 
+/// #4487 (residual of P6 / #4400): a bare TCP RST / FIN on the LocalDelivery
+/// session-MISS path must NOT seed a firewall-local session (host-IP
+/// session-table DoS + policy-evaluation skip). The #2151 ACK-only gate caught
+/// FIN|ACK / RST|ACK but missed the bare RST (0x04) and bare FIN (0x01) with no
+/// ACK bit — the exact residual. RED on revert: without the `is_closing &&
+/// !has_syn` guard the bare-RST / bare-FIN asserts flip to `true` (a closing
+/// session is cached). The packet itself is still DELIVERED to the host (the
+/// LocalDelivery disposition reinjects it) — this gate only declines to CACHE,
+/// so a peer RST tearing down a firewall-originated flow still reaches the
+/// local stack (the #4400 LocalDelivery drop-exemption).
+#[test]
+fn bare_rst_fin_session_miss_does_not_cache_local_delivery() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let target = "172.16.80.8";
+    // Model both LocalDelivery resolvers the poll loop feeds this gate:
+    // interface-NAT-local and ingress-interface-local. Both must decline to
+    // cache a bare teardown segment.
+    let resolvers: [ForwardingResolution; 2] = [
+        interface_nat_local_resolution_on_session_miss(
+            &state,
+            target.parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp nat local delivery"),
+        ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            target.parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp ingress local delivery"),
+    ];
+    for resolution in resolvers {
+        // Bare RST (0x04) and bare FIN (0x01) — no ACK, no SYN: the #4487
+        // residual the #2151 ACK-only gate let through. RED on revert.
+        assert!(
+            !should_cache_local_delivery_session_on_miss(
+                &state,
+                target.parse().expect("v4"),
+                resolution,
+                PROTO_TCP,
+                0x04,
+            ),
+            "bare RST must not seed a host-local session"
+        );
+        assert!(
+            !should_cache_local_delivery_session_on_miss(
+                &state,
+                target.parse().expect("v4"),
+                resolution,
+                PROTO_TCP,
+                0x01,
+            ),
+            "bare FIN must not seed a host-local session"
+        );
+        // FIN|ACK (0x11) and RST|ACK (0x14) — already declined by the #2151
+        // ACK gate; the #4487 predicate keeps them declined (consistency).
+        assert!(!should_cache_local_delivery_session_on_miss(
+            &state,
+            target.parse().expect("v4"),
+            resolution,
+            PROTO_TCP,
+            0x11,
+        ));
+        assert!(!should_cache_local_delivery_session_on_miss(
+            &state,
+            target.parse().expect("v4"),
+            resolution,
+            PROTO_TCP,
+            0x14,
+        ));
+        // PRESERVED: a bare SYN (0x02) to a firewall host service still seeds
+        // the session — a legitimate inbound connection open is unaffected.
+        assert!(
+            should_cache_local_delivery_session_on_miss(
+                &state,
+                target.parse().expect("v4"),
+                resolution,
+                PROTO_TCP,
+                0x02,
+            ),
+            "a SYN to a host service must still create a session"
+        );
+        // PRESERVED: a SYN|ACK (0x12) — a firewall-originated flow's inbound
+        // handshake response — still seeds the host-local session.
+        assert!(should_cache_local_delivery_session_on_miss(
+            &state,
+            target.parse().expect("v4"),
+            resolution,
+            PROTO_TCP,
+            0x12,
+        ));
+    }
+    // A non-LocalDelivery disposition never caches here regardless of flags —
+    // the guard is scoped to host-inbound, and an ESTABLISHED-session packet is
+    // a session HIT that never consults this MISS-only gate in the first place.
+    let mut transit = interface_nat_local_resolution_on_session_miss(
+        &state,
+        target.parse().expect("v4"),
+        PROTO_TCP,
+    )
+    .expect("tcp nat local delivery");
+    transit.disposition = ForwardingDisposition::ForwardCandidate;
+    assert!(!should_cache_local_delivery_session_on_miss(
+        &state,
+        target.parse().expect("v4"),
+        transit,
+        PROTO_TCP,
+        0x02,
+    ));
+}
+
 #[test]
 fn tunnel_session_miss_blocks_interface_nat_local_delivery() {
     let mut snapshot = native_gre_snapshot(true);
