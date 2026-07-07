@@ -1,3 +1,42 @@
+## 2026-07-07 — #4400: strict-syn-check drop for bare RST/FIN on session-miss
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed #4400 (ps-009/013/015/016, P6/HIGH, confirmed 4×). A
+  TCP RST or FIN that MISSED the session table (no existing session) was
+  run through the ordinary new-flow install path, so
+  `install_with_protocol_with_origin` seeded a fresh entry that
+  `session/install.rs` immediately marked `closing`/`reset` from the
+  packet's flags — pure session-table churn and a cheap RST/FIN-flood
+  DoS surface with no strict-syn-check parity.
+  - **Root cause**: the session-MISS cold path in
+    `afxdp/poll_descriptor` had no first-packet-SYN enforcement; a bare
+    RST/FIN reached both transit install sites (`ForwardCandidate`
+    forward install and `MissingNeighbor` seed) with `meta.tcp_flags`.
+  - **Fix**: added `strict_syn_check_drops_new_flow(protocol, tcp_flags)`
+    (`= PROTO_TCP && is_closing(flags) && !has_syn(flags)`) and a guard
+    at the single session-miss choke point (right after
+    `finalize_new_flow_ha_resolution`, before both install sites). A bare
+    RST/FIN on a `ForwardCandidate` / `MissingNeighbor` miss is DROPPED
+    (frame recycled, no session installed, aggregate `screen_drops`
+    bumped, no per-packet event → no log storm).
+  - **Default, not a knob**: a stray RST/FIN opening a closing session is
+    never useful regardless of Junos `security flow tcp-session
+    strict-syn-check`, so the drop is unconditional. The looser Junos
+    no-syn-check default is preserved: a bare SYN still installs, a
+    SYN-ACK / bare ACK / data first packet still opens an ESTABLISHED
+    session (#3152 asymmetric-routing mid-stream pickup).
+  - **Exemptions**: LocalDelivery (host-inbound RST tearing down a
+    firewall-originated BGP/IKE/SSH session must reach the local stack);
+    legitimate cross-chassis teardowns take `cluster_peer_return_fast_path`
+    earlier and exit before the guard, so no fabric exemption is needed.
+  - **Validation**: 4 new tests in `strict_syn_check_tests` (predicate
+    matrix + behavioral install/no-install + existing-session-unaffected);
+    RED-on-revert confirmed (neutralizing the predicate fails the
+    bare-RST/FIN and predicate assertions, guard-independent SYN/ACK +
+    existing-session tests stay green). Full cargo suite serial.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md, CLAUDE.md, _Log.md
+
 ## 2026-07-06 — #4439: fabric-return fast path must not adopt NEW UDP flows
 
 - **Timestamp**: 2026-07-06

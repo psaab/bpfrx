@@ -581,6 +581,42 @@ fn new_flow_session_limit_drop(
     None
 }
 
+/// #4400: strict-syn-check-style guard for the TCP session-MISS install
+/// path.
+///
+/// Junos `security flow tcp-session strict-syn-check` requires the FIRST
+/// packet of a TCP flow to be a SYN and drops a non-SYN first packet. xpf
+/// deliberately keeps the looser Junos default (no-syn-check) so a SYN-ACK /
+/// bare ACK / data first packet may still open an ESTABLISHED session
+/// (#3152), preserving asymmetric-routing mid-stream pickup. A bare RST/FIN,
+/// however — a connection-CLOSING control bit (FIN or RST) with NO SYN — can
+/// never legitimately OPEN a connection: a real flow starts with a SYN, and
+/// a RST/FIN for a flow this node does not track is either a late segment for
+/// an already-GC'd session or an attack. Installing a session for it (which
+/// the ForwardCandidate / MissingNeighbor session-miss install sites would
+/// otherwise do, seeding an immediately-`closing`/`reset` entry — see
+/// `session/install.rs` lines that set `closing` / `reset` from `tcp_flags`)
+/// provides no forwarding value and lets a RST/FIN flood churn the per-worker
+/// session table (a real DoS surface, #4400, confirmed 4x).
+///
+/// This predicate returns true for exactly that pathological case (TCP, FIN
+/// or RST set, SYN clear); the session-MISS cold path drops such a packet
+/// before it reaches an install site. Non-TCP traffic and any SYN-bearing
+/// segment (bare SYN, SYN-ACK, the malformed SYN-FIN the `tcp-syn-fin` screen
+/// check owns) return false — unchanged behavior. Applied unconditionally
+/// (no config knob): a stray RST/FIN opening a closing session is never
+/// useful regardless of the operator's strict-syn-check setting, so this is
+/// the safe stateful-firewall default. Host-inbound (LocalDelivery) traffic
+/// is exempt at the call site so a peer RST tearing down a firewall-
+/// originated TCP session (BGP, IKE, management) still reaches the local
+/// stack.
+#[inline]
+fn strict_syn_check_drops_new_flow(protocol: u8, tcp_flags: u8) -> bool {
+    matches!(protocol, crate::ip_proto::PROTO_TCP)
+        && crate::tcp_flags::is_closing(tcp_flags)
+        && !crate::tcp_flags::has_syn(tcp_flags)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
@@ -1909,6 +1945,46 @@ pub(super) fn poll_binding_process_descriptor(
                             from_zone_id,
                             ha_startup_grace_until_secs,
                         );
+                        // #4400: strict-syn-check drop. A bare TCP RST/FIN (a
+                        // connection-closing control bit with no SYN) that
+                        // MISSES the session table can never legitimately open
+                        // a connection — a real flow starts with a SYN, and a
+                        // RST/FIN for a flow this node does not track is a late
+                        // segment for an already-GC'd session or an attack.
+                        // Dropping it here, before the ForwardCandidate /
+                        // MissingNeighbor install sites below, keeps a RST/FIN
+                        // flood from churning the per-worker session table with
+                        // immediately-`closing` seed entries (P6, confirmed 4x).
+                        // A SYN-ACK / bare ACK / data first packet is NOT
+                        // dropped, preserving the Junos no-syn-check default and
+                        // #3152 asymmetric-routing mid-stream pickup. Only the
+                        // two TRANSIT dispositions that seed a new local session
+                        // from this packet's flags are gated: LocalDelivery
+                        // (host-inbound to the RE) is deliberately exempt so a
+                        // peer RST tearing down a firewall-originated TCP session
+                        // (BGP, IKE, management) still reaches the local stack,
+                        // and NoRoute / FabricRedirect / HAInactive never seed a
+                        // local session from this packet. Legitimate cross-
+                        // chassis teardowns for a peer-owned session take the
+                        // `cluster_peer_return_fast_path` above (which exits
+                        // before this point), so no fabric exemption is needed.
+                        // Counted in the aggregate `screen_drops` flow-statistics
+                        // tally (no per-reason ordinal — that array mirrors the
+                        // Junos SCREEN checks, and strict-syn-check is a flow
+                        // tcp-session control, not a screen check; joins the
+                        // syn-cookie / icmp-fragment aggregate-only class). No
+                        // per-packet event is emitted: a RST/FIN flood must not
+                        // become a log storm.
+                        if matches!(
+                            decision.resolution.disposition,
+                            ForwardingDisposition::ForwardCandidate
+                                | ForwardingDisposition::MissingNeighbor
+                        ) && strict_syn_check_drops_new_flow(meta.protocol, meta.tcp_flags)
+                        {
+                            telemetry.counters.record_screen_drop("strict-syn-check");
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
                         // Debug: log session miss with flow details (throttled)
                         if cfg!(feature = "debug-log") {
                             if session_miss_debug_log_allowed(telemetry.dbg.session_miss) {
@@ -5448,6 +5524,164 @@ mod new_flow_session_limit_tests {
         }
         assert_eq!(table.session_limit_src_map_len(), 0);
         assert_eq!(table.session_limit_dst_map_len(), 0);
+    }
+}
+
+/// #4400: strict-syn-check drop on the TCP session-MISS install path. A bare
+/// RST/FIN (a closing control bit with no SYN) can never open a connection, so
+/// the session-miss cold path drops it before it seeds an immediately-`closing`
+/// session (P6, confirmed 4x). These drive the extracted decision predicate
+/// `strict_syn_check_drops_new_flow` and model the guarded install directly
+/// against a real `SessionTable` (the poll loop body is un-callable). RED on
+/// revert: without the guard a bare RST/FIN installs a closing session, so the
+/// `table.len() == 0` assertions fail.
+#[cfg(test)]
+mod strict_syn_check_tests {
+    use super::*;
+    use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
+    use crate::session::{SessionDecision, SessionKey, SessionMetadata, SessionOrigin};
+    use crate::tcp_flags::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn tcp_key(src_port: u16) -> SessionKey {
+        SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            src_port,
+            dst_port: 443,
+        }
+    }
+
+    fn fwd_meta() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
+            policy_id: 0,
+            inactivity_timeout_ns: None,
+            policy_counter_idx: 0,
+            policy_counter: None,
+        }
+    }
+
+    fn fwd_decision() -> SessionDecision {
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+                neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: crate::nat::NatDecision::default(),
+        }
+    }
+
+    /// Model the poll_descriptor session-MISS guard for a ForwardCandidate
+    /// transit new flow: a bare RST/FIN first packet is DROPPED (no install);
+    /// any other first packet installs. Returns true iff a session was
+    /// installed. Byte-for-byte the same predicate gate the production path
+    /// applies before `install_with_protocol_with_origin`.
+    fn install_on_miss(table: &mut SessionTable, key: SessionKey, flags: u8) -> bool {
+        if strict_syn_check_drops_new_flow(PROTO_TCP, flags) {
+            return false;
+        }
+        table.install_with_protocol_with_origin(
+            key,
+            fwd_decision(),
+            fwd_meta(),
+            SessionOrigin::ForwardFlow,
+            1_000_000_000,
+            PROTO_TCP,
+            flags,
+        )
+    }
+
+    #[test]
+    fn predicate_drops_only_bare_rst_fin() {
+        // A closing control bit (FIN or RST) with NO SYN -> DROP.
+        assert!(strict_syn_check_drops_new_flow(PROTO_TCP, TCP_RST));
+        assert!(strict_syn_check_drops_new_flow(PROTO_TCP, TCP_FIN));
+        assert!(strict_syn_check_drops_new_flow(PROTO_TCP, TCP_FIN | TCP_ACK));
+        assert!(strict_syn_check_drops_new_flow(PROTO_TCP, TCP_RST | TCP_ACK));
+        // SYN-bearing (bare SYN, SYN-ACK, malformed SYN-FIN owned by the
+        // tcp-syn-fin screen check) and bare ACK / data -> NOT dropped, so
+        // legitimate opens and #3152 asymmetric-routing mid-stream pickup are
+        // preserved.
+        assert!(!strict_syn_check_drops_new_flow(PROTO_TCP, TCP_SYN));
+        assert!(!strict_syn_check_drops_new_flow(PROTO_TCP, TCP_SYN | TCP_ACK));
+        assert!(!strict_syn_check_drops_new_flow(PROTO_TCP, TCP_SYN | TCP_FIN));
+        assert!(!strict_syn_check_drops_new_flow(PROTO_TCP, TCP_ACK));
+        assert!(!strict_syn_check_drops_new_flow(PROTO_TCP, 0));
+        // Non-TCP is never gated.
+        assert!(!strict_syn_check_drops_new_flow(PROTO_UDP, TCP_RST));
+        assert!(!strict_syn_check_drops_new_flow(PROTO_UDP, TCP_FIN));
+    }
+
+    #[test]
+    fn bare_rst_fin_on_miss_installs_no_session() {
+        let mut table = SessionTable::new();
+        // RED on revert: without the guard each of these seeds an immediately-
+        // closing session; with it, nothing is installed.
+        assert!(!install_on_miss(&mut table, tcp_key(40000), TCP_RST));
+        assert!(!install_on_miss(&mut table, tcp_key(40001), TCP_FIN));
+        assert!(!install_on_miss(&mut table, tcp_key(40002), TCP_FIN | TCP_ACK));
+        assert!(!install_on_miss(&mut table, tcp_key(40003), TCP_RST | TCP_ACK));
+        assert_eq!(
+            table.len(),
+            0,
+            "a bare RST/FIN session-miss must not seed a session"
+        );
+    }
+
+    #[test]
+    fn syn_and_midstream_first_packet_still_install() {
+        let mut table = SessionTable::new();
+        // A legitimate connection open (bare SYN) still installs.
+        assert!(install_on_miss(&mut table, tcp_key(40100), TCP_SYN));
+        // Asymmetric routing: a SYN-ACK on miss installs per existing policy.
+        assert!(install_on_miss(&mut table, tcp_key(40101), TCP_SYN | TCP_ACK));
+        // Mid-stream pickup: a bare ACK / data first packet still installs.
+        assert!(install_on_miss(&mut table, tcp_key(40102), TCP_ACK));
+        assert_eq!(table.len(), 3);
+    }
+
+    #[test]
+    fn rst_for_existing_session_is_unaffected() {
+        // The guard gates ONLY the session-MISS install path. A RST for a flow
+        // that already has a session is a session HIT (normal teardown) and
+        // never consults the guard. Model the established in-place teardown
+        // refresh by installing directly (as the hit path does), NOT through
+        // `install_on_miss`.
+        let mut table = SessionTable::new();
+        let key = tcp_key(40200);
+        assert!(install_on_miss(&mut table, key.clone(), TCP_SYN));
+        assert_eq!(table.len(), 1);
+        assert!(table.install_with_protocol_with_origin(
+            key,
+            fwd_decision(),
+            fwd_meta(),
+            SessionOrigin::ForwardFlow,
+            2_000_000_000,
+            PROTO_TCP,
+            TCP_RST,
+        ));
+        assert_eq!(
+            table.len(),
+            1,
+            "a RST on an existing session tears it down in place, never dropped as a miss"
+        );
     }
 }
 
