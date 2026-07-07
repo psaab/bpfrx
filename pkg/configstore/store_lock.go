@@ -28,6 +28,60 @@ func (s *Store) ensureWritableLocked() error {
 	return nil
 }
 
+// configLockLeaseTTL bounds how long a config lock may sit idle — with no edit
+// activity — before a new entrant may reclaim it. #4476: the REST config-enter
+// path (POST /api/v1/config/enter) is stateless and has NO disconnect hook,
+// unlike the gRPC configLockInterceptor (pkg/grpcapi/server.go) which
+// auto-releases the lock when a client's connection drops. A REST client that
+// takes the lock and never calls /config/exit would otherwise wedge every
+// CLI/gRPC/REST config edit until `clear system config-lock` or a daemon
+// restart — a management-plane config-edit DoS. Every config mutation refreshes
+// the lease (touchConfigLockLocked), so this TTL only ever reclaims a lock that
+// has seen no edit for the full window; an actively-edited lock, including a
+// long hand-composed change, is never stolen. Kept as a package var so tests
+// can shrink it.
+var configLockLeaseTTL = 10 * time.Minute
+
+// touchConfigLockLocked refreshes the config-lock idle lease on a mutation
+// (#4476). Both transports funnel config edits through the store's mutating
+// methods (REST and gRPC both go via SetFromInput/DeleteFromInput/Commit/...),
+// so refreshing here keeps an active holder's lease fresh regardless of which
+// mode acquired it or whether a session identifier was recorded. Reads
+// (show/status polls) deliberately do NOT refresh, so a lock held by a client
+// that stops editing eventually becomes reclaimable. No-op when not in config
+// mode. Callers MUST hold s.mu.
+func (s *Store) touchConfigLockLocked() {
+	if s.configDir {
+		s.configLockAt = time.Now()
+	}
+}
+
+// reclaimStaleLockLocked releases the current config lock IFF it has been idle
+// (no edit activity) for longer than configLockLeaseTTL, and reports whether it
+// did. It mirrors ForceExitConfigure's teardown but is gated on the idle lease,
+// so an active holder is never disturbed. This is the check-on-acquire reaper
+// for #4476: EnterConfigureSession / EnterConfigureExclusive call it before
+// rejecting a would-be entrant with ErrConfigLocked, so a wedged REST lock is
+// reclaimed exactly when another session needs it (the only moment a stuck lock
+// causes harm). Callers MUST hold s.mu and MUST have already confirmed
+// s.configDir.
+func (s *Store) reclaimStaleLockLocked() bool {
+	if time.Since(s.configLockAt) < configLockLeaseTTL {
+		return false
+	}
+	slog.Warn("reclaiming stale config lock past idle lease",
+		"holder", s.effectiveHolderLocked(),
+		"idle_for", time.Since(s.configLockAt).Round(time.Second),
+		"lease_ttl", configLockLeaseTTL)
+	s.candidate = nil
+	s.configDir = false
+	s.dirty = false
+	s.exclusiveHolder = ""
+	s.configHolder = ""
+	s.editPath = nil
+	return true
+}
+
 // EnterConfigure enters configuration mode by cloning the active config.
 // Returns an error if another session is already in config mode.
 func (s *Store) EnterConfigure() error {
@@ -43,20 +97,34 @@ func (s *Store) EnterConfigureSession(sessionID string) error {
 		return err
 	}
 	if s.configDir {
-		// Allow re-entry by same session.
+		// Allow re-entry by same session — and treat it as activity, so a
+		// long-lived interactive session refreshes its idle lease (#4476)
+		// rather than being reclaimed out from under itself.
 		if sessionID != "" && s.configHolder == sessionID {
+			s.configLockAt = time.Now()
 			return nil
 		}
-		// #2157: return the ErrConfigLocked sentinel (wrapping the plain
-		// message) so deferrable callers (the event-options action worker)
-		// can errors.Is it and retry instead of string-matching.
-		return fmt.Errorf("%w", ErrConfigLocked)
+		// #4476: reclaim a stale lease before rejecting. The current holder may
+		// be a REST client that took the lock and never released it — the
+		// stateless REST path has no disconnect hook like the gRPC
+		// configLockInterceptor — which would otherwise wedge every config edit
+		// forever. reclaimStaleLockLocked only fires on a lock idle past the
+		// lease TTL; an actively-edited lock refreshes configLockAt on every
+		// mutation and is never stolen.
+		if !s.reclaimStaleLockLocked() {
+			// #2157: return the ErrConfigLocked sentinel (wrapping the plain
+			// message) so deferrable callers (the event-options action worker)
+			// can errors.Is it and retry instead of string-matching.
+			return fmt.Errorf("%w", ErrConfigLocked)
+		}
 	}
 	s.candidate = s.active.Clone()
 	s.configDir = true
 	s.dirty = false
+	s.exclusiveHolder = ""
 	s.configHolder = sessionID
 	s.configLockAt = time.Now()
+	s.editPath = nil
 	return nil
 }
 
@@ -68,13 +136,19 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 		return err
 	}
 	if s.configDir {
-		return fmt.Errorf("%w", ErrConfigLocked)
+		// #4476: reclaim a stale lease before rejecting, same idle-lease
+		// contract as EnterConfigureSession.
+		if !s.reclaimStaleLockLocked() {
+			return fmt.Errorf("%w", ErrConfigLocked)
+		}
 	}
 	s.candidate = s.active.Clone()
 	s.configDir = true
 	s.dirty = false
+	s.configHolder = ""
 	s.exclusiveHolder = holder
 	s.configLockAt = time.Now()
+	s.editPath = nil
 	return nil
 }
 
