@@ -2463,6 +2463,14 @@ type BindingStatus struct {
 	// destination was dropped rather than route-looked-up as IPv6. omitempty +
 	// Rust serde `default` keep the same cross-version wire safety.
 	Nat64NoSourcePool uint64 `json:"nat64_no_source_pool,omitempty"`
+	// #4520: transient NAT64 pool-exhaustion drops — a prefix matched and its
+	// pool was non-empty, but no free translated port could be allocated
+	// (AllocatorExhausted). The transient sibling of Nat64NoSourcePool
+	// (config/empty): a full pool under load (add capacity) is now
+	// distinguishable from a misconfigured/empty pool (fix config). omitempty +
+	// the Rust serde `default` keep cross-version wire safety (an older helper
+	// omits it → 0).
+	Nat64PoolExhausted uint64 `json:"nat64_pool_exhausted,omitempty"`
 	// #4477: source-NAT allocation failures (a source-NAT rule matched but no
 	// translated mapping could be allocated — missing/empty/invalid/exhausted
 	// pool, wrong family, or a non-first fragment on a port-translating rule);

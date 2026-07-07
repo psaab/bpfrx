@@ -508,7 +508,21 @@ pub(in crate::afxdp) struct BatchCounters {
     // IPv6 destination was DROPPED rather than route-looked-up as ordinary
     // IPv6 (the pre-fix fail-open). Flushed to
     // BindingLiveState.nat64_no_source_pool.
+    //
+    // #4520: this slot now covers ONLY the config/empty/missing pool case
+    // (the classify-time `MatchUnavailable`, and any non-exhaustion
+    // `allocate_source` error). Transient port exhaustion under load is
+    // split out into `nat64_pool_exhausted` below so a full pool (add
+    // capacity) is distinguishable from a misconfigured/empty pool (fix
+    // config) — mirroring source-NAT's `pool_empty`/`pool_exhausted` split.
     nat64_no_source_pool: u64,
+    // #4520: transient NAT64 pool-exhaustion drops — a NAT64 prefix matched
+    // and its pool was non-empty, but `allocate_source` returned
+    // `AllocatorExhausted` (no free translated port). Flushed to
+    // BindingLiveState.nat64_pool_exhausted and surfaced as the
+    // `NAT64 pool-exhausted drops` operator counter, the transient sibling
+    // of `nat64_no_source_pool` (config/empty).
+    nat64_pool_exhausted: u64,
     // #4477: source-NAT allocation failures — a source-NAT rule matched but no
     // translated mapping could be allocated (missing/empty/invalid pool,
     // exhausted port allocator, wrong family, or a non-first fragment on a
@@ -619,6 +633,30 @@ impl BatchCounters {
         }
     }
 
+    /// #4520: attribute a NAT64 forward-flow source-allocation failure to the
+    /// right drop counter. Transient port exhaustion (`AllocatorExhausted` —
+    /// the pool is full, add capacity) bumps `nat64_pool_exhausted`; every
+    /// other reason (missing/empty/invalid pool, wrong family — fix config)
+    /// bumps `nat64_no_source_pool`. Mirrors source-NAT's
+    /// `pool_empty`/`pool_exhausted` split so a full pool under load is
+    /// distinguishable on the dashboard from a misconfigured one — opposite
+    /// remedies.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_source_failure(
+        &mut self,
+        reason: crate::nat::SourceNatFailureReason,
+    ) {
+        self.touched = true;
+        match reason {
+            crate::nat::SourceNatFailureReason::AllocatorExhausted => {
+                self.nat64_pool_exhausted += 1;
+            }
+            _ => {
+                self.nat64_no_source_pool += 1;
+            }
+        }
+    }
+
     fn flush(&mut self, live: &BindingLiveState) {
         if !self.touched {
             return;
@@ -691,6 +729,13 @@ impl BatchCounters {
             live.nat64_no_source_pool
                 .fetch_add(self.nat64_no_source_pool, Ordering::Relaxed);
             self.nat64_no_source_pool = 0;
+        }
+        // #4520: transient NAT64 pool-exhaustion tally, batched like its
+        // config/empty sibling above.
+        if self.nat64_pool_exhausted != 0 {
+            live.nat64_pool_exhausted
+                .fetch_add(self.nat64_pool_exhausted, Ordering::Relaxed);
+            self.nat64_pool_exhausted = 0;
         }
         // #4477: source-NAT allocation-failure tally.
         if self.nat_alloc_fail != 0 {

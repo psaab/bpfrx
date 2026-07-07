@@ -174,6 +174,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var dnatPackets uint64
 	var nat64Translations uint64
 	var nat64NoSourcePool uint64
+	var nat64PoolExhausted uint64
 	var txPackets uint64
 	var txBytes uint64
 	var txErrors uint64
@@ -279,6 +280,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		dnatPackets += binding.DNATPackets
 		nat64Translations += binding.Nat64Translations
 		nat64NoSourcePool += binding.Nat64NoSourcePool
+		nat64PoolExhausted += binding.Nat64PoolExhausted
 		txPackets += binding.TXPackets
 		txBytes += binding.TXBytes
 		txErrors += binding.TXErrors
@@ -531,6 +533,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)
 	fmt.Fprintf(&b, "  NAT64 translations:        %d\n", nat64Translations)
 	fmt.Fprintf(&b, "  NAT64 no-source-pool drops:%d\n", nat64NoSourcePool)
+	fmt.Fprintf(&b, "  NAT64 pool-exhausted drops:%d\n", nat64PoolExhausted)
 	if len(status.SourceNATPools) > 0 {
 		rows := append([]userspace.SourceNATPoolStatus(nil), status.SourceNATPools...)
 		sort.Slice(rows, func(i, j int) bool {

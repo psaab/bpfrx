@@ -8952,6 +8952,76 @@ fn nat64_no_source_pool_flushes_to_live_and_snapshot() {
     );
 }
 
+// #4520: the transient NAT64 pool-exhaustion drop counter must flush
+// BatchCounters -> BindingLiveState -> snapshot the same way as its
+// config/empty sibling nat64_no_source_pool, so an operator can see the
+// transient drops and a dropped flush/snapshot line is caught at build/test
+// time.
+#[test]
+fn nat64_pool_exhausted_flushes_to_live_and_snapshot() {
+    let live = BindingLiveState::new();
+    let mut batch = BatchCounters::default();
+    batch.touched = true;
+    batch.nat64_pool_exhausted = 7;
+    batch.flush(&live);
+    assert_eq!(
+        batch.nat64_pool_exhausted, 0,
+        "flush must zero the batched pool-exhausted drop count"
+    );
+    let snap = live.snapshot();
+    assert_eq!(
+        snap.nat64_pool_exhausted, 7,
+        "the live atomic + snapshot must carry the flushed pool-exhausted count"
+    );
+    assert_eq!(
+        snap.nat64_no_source_pool, 0,
+        "the config/empty sibling must NOT be touched by a pool-exhaustion drop"
+    );
+}
+
+// #4520: the NAT64 source-allocation failure reason must be attributed to the
+// RIGHT counter — transient port exhaustion (add capacity) split from a
+// config/empty pool (fix config), mirroring source-NAT. FAIL-ON-REVERT:
+// collapsing both arms back onto nat64_no_source_pool (the pre-#4520
+// `Err(_) => nat64_no_source_pool += 1`) makes the AllocatorExhausted
+// assertion below fail RED.
+#[test]
+fn record_nat64_source_failure_splits_exhaustion_from_config() {
+    use crate::nat::SourceNatFailureReason;
+
+    // Transient exhaustion -> nat64_pool_exhausted, NOT nat64_no_source_pool.
+    let mut batch = BatchCounters::default();
+    batch.record_nat64_source_failure(SourceNatFailureReason::AllocatorExhausted);
+    assert_eq!(
+        batch.nat64_pool_exhausted, 1,
+        "AllocatorExhausted must bump nat64_pool_exhausted (transient)"
+    );
+    assert_eq!(
+        batch.nat64_no_source_pool, 0,
+        "AllocatorExhausted must NOT bump nat64_no_source_pool (config/empty)"
+    );
+    assert!(batch.touched, "recording a drop must mark the batch touched");
+
+    // Every non-exhaustion reason -> nat64_no_source_pool (config/empty).
+    for reason in [
+        SourceNatFailureReason::MissingPool,
+        SourceNatFailureReason::EmptyPool,
+        SourceNatFailureReason::InvalidPool,
+        SourceNatFailureReason::WrongAddressFamily,
+    ] {
+        let mut b = BatchCounters::default();
+        b.record_nat64_source_failure(reason);
+        assert_eq!(
+            b.nat64_no_source_pool, 1,
+            "{reason:?} must bump nat64_no_source_pool (config/empty)"
+        );
+        assert_eq!(
+            b.nat64_pool_exhausted, 0,
+            "{reason:?} must NOT bump nat64_pool_exhausted (transient)"
+        );
+    }
+}
+
 // === #1873 R-C: blanket tunnel gate at the slow-path chokepoint ===
 
 fn tunnel_gate_test_fixture() -> (
