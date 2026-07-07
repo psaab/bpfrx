@@ -1368,13 +1368,33 @@ marks `name` before the pre-merge expansion, so `grpA -> grpB -> grpA` surfaces
 the same `apply-groups circular reference` error as a direct self-cycle rather
 than recursing forever — a rejected commit beats a silently-dropped zone.
 
+**Bounding the fan-out (memoization).** The `seen` guard bounds only CYCLES, not
+fan-out: `delete(seen, name)` runs per branch, so a group reached via N distinct
+paths would be re-expanded N times. A converging DAG (a diamond lattice — each
+level referencing the next via two edges) has 2^depth root->leaf paths, so the
+naive fixed-point recursion is EXPONENTIAL (a machine-generated deep
+nested-group DAG hung the synchronous commit for tens of seconds). The bound is
+a `memo map[string][]*Node` threaded through the whole expansion, keyed by
+`(group name, ancestor-context)` — the two inputs the expansion actually depends
+on (`walkGroupToContext` and the nested-expansion context both use
+`ancestorPath`; `tagInherited`/`vars` are constant per `ExpandGroups` call). A
+completed memo entry is a fully-resolved, cycle-free body (a cyclic expansion
+errors out BEFORE it is cached), so reusing it is always correct; a diamond
+re-uses the memo instead of re-expanding, and `mergeNodes`'s same-key merge
+still folds every path's copy to a single instance (count-once). The memo and
+the cycle guard do not conflict — the guard tracks IN-PROGRESS recursion, the
+memo tracks COMPLETED expansions. Because `mergeNodes` mutates its `src`
+argument, the cache holds a pristine `cloneNodes` copy and every use (store and
+reuse) is a fresh clone. Net cost is O(distinct groups x distinct contexts).
+
 `| display inheritance` attribution stays correct: `tagNodesInherited(cloned,
 name)` runs BEFORE the nested expansion, so it tags only the outer group's own
 body; nodes contributed by the nested group are tagged by the recursive call
 with THAT nested group's name (not the outer one). Covered by
 `pkg/config/apply_groups_transitive_4474_test.go` (headline zone present,
-outer-own-content-kept, three-deep chain, cycle-terminates, and tagged
-inheritance attribution).
+outer-own-content-kept, three-deep chain, cycle-terminates, tagged inheritance
+attribution, and a depth-22 converging diamond lattice that expands in
+sub-millisecond memoized but times out / runs for tens of seconds un-memoized).
 
 ## `then community` operations: add / delete / set / none (#2848)
 

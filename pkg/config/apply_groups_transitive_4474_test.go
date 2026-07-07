@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+	"time"
+)
 
 // #4474 (opus-172 H-1): TRANSITIVE apply-groups — a group whose body itself
 // references another group (`grpA { apply-groups grpB; }`) must inherit grpB's
@@ -149,4 +153,77 @@ func TestApplyGroupsTransitiveTaggedInheritance(t *testing.T) {
 		t.Errorf("ZONE_TRANSITIVE InheritedFrom = %q, want %q (nested group)",
 			z.InheritedFrom, "grpB")
 	}
+}
+
+// TestApplyGroupsTransitiveDiamondLattice guards the #4474 fix against an
+// exponential fan-out. Each level has TWO groups (A{k}, B{k}) that each
+// reference BOTH groups of the next level — a converging diamond DAG with
+// 2^depth distinct root->leaf paths but only O(depth) distinct groups. Because
+// the transitive expansion runs `delete(seen,name)` per branch, the `seen`
+// cycle guard does NOT bound the fan-out: without memoization every one of the
+// 2^depth paths re-expands the shared subtree, going exponential (measured
+// tens of seconds at depth ~22). WITH the (name,context) memo each group is
+// expanded ONCE, so this completes in well under the budget below AND the
+// leaf zone (reached by every path) appears EXACTLY ONCE (count-once via
+// mergeNodes). RED on revert of the memo: the expansion does not finish inside
+// the budget (times out / runs for tens of seconds).
+func TestApplyGroupsTransitiveDiamondLattice(t *testing.T) {
+	const depth = 22
+
+	var cmds []string
+	for k := 0; k < depth; k++ {
+		// Both nodes at level k reference both nodes at level k+1 (full
+		// bipartite) — the converging diamond that multiplies paths.
+		cmds = append(cmds, fmt.Sprintf("set groups A%d apply-groups [ A%d B%d ]", k, k+1, k+1))
+		cmds = append(cmds, fmt.Sprintf("set groups B%d apply-groups [ A%d B%d ]", k, k+1, k+1))
+	}
+	// Both leaf groups define the SAME zone, so every path converges on one
+	// zone that must dedup to a single instance.
+	cmds = append(cmds, fmt.Sprintf("set groups A%d security zones security-zone ZONE_LEAF host-inbound-traffic system-services ping", depth))
+	cmds = append(cmds, fmt.Sprintf("set groups B%d security zones security-zone ZONE_LEAF host-inbound-traffic system-services ping", depth))
+	cmds = append(cmds, "set apply-groups A0")
+
+	tree := &ConfigTree{}
+	for _, c := range cmds {
+		path, err := ParseSetCommand(c)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", c, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+
+	// Run the expansion in a goroutine with a hard wall-clock budget so the
+	// un-memoized exponential blow-up FAILS FAST here instead of hanging the
+	// whole `go test` run.
+	const budget = 3 * time.Second
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- tree.ExpandGroups() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ExpandGroups on depth-%d diamond lattice: %v", depth, err)
+		}
+	case <-time.After(budget):
+		t.Fatalf("depth-%d diamond lattice did NOT finish within %v — "+
+			"apply-groups fan-out is not bounded (memoization missing/broken)",
+			depth, budget)
+	}
+	elapsed := time.Since(start)
+
+	// Correctness: the leaf zone, reached by all 2^depth paths, must appear
+	// EXACTLY ONCE after expansion (converging paths count-once via mergeNodes).
+	leaves := 0
+	for _, z := range findNodesByKey(tree.Children, "security-zone") {
+		if len(z.Keys) > 1 && z.Keys[1] == "ZONE_LEAF" {
+			leaves++
+		}
+	}
+	if leaves != 1 {
+		t.Errorf("depth-%d lattice: want exactly 1 ZONE_LEAF instance, got %d "+
+			"(fan-out duplicated the merged content)", depth, leaves)
+	}
+	t.Logf("depth-%d diamond lattice expanded in %v (memoized O(depth))", depth, elapsed)
 }

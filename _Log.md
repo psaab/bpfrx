@@ -17,9 +17,23 @@
   the pre-merge expansion) makes cycles fail-CLOSED with the same
   circular-reference error as a direct self-cycle. tagNodesInherited runs
   BEFORE the nested expansion so `| display inheritance` attributes nested
-  content to the nested group. Validation: 5 new tests (headline zone
-  present, outer-own-content kept, three-deep chain, cycle terminates,
-  tagged inheritance) — all RED on revert of the fix, GREEN with it; full
+  content to the nested group.
+  Fan-out bound (memoization): the `seen` guard bounds only CYCLES, not
+  fan-out — `delete(seen,name)` runs per branch, so a converging DAG
+  (diamond lattice, 2^depth paths) re-expanded a shared subtree once per
+  path → EXPONENTIAL, hanging the synchronous commit for tens of seconds.
+  Added a `memo map[string][]*Node` threaded through the recursion, keyed
+  by `(group name, ancestor-context)` — the only inputs the expansion
+  depends on (walkGroupToContext + nested context use ancestorPath;
+  tagInherited/vars constant per call). A completed memo entry is a
+  cycle-free fully-resolved body (a cyclic expansion errors before it is
+  cached), so reuse is always correct; mergeNodes folds every path's copy
+  to a single instance. Cache holds a pristine cloneNodes copy (mergeNodes
+  mutates src). Net O(distinct groups x contexts).
+  Validation: 6 new tests (headline zone present, outer-own-content kept,
+  three-deep chain, cycle terminates, tagged inheritance, and a depth-22
+  converging diamond lattice: 0.4ms memoized, times out un-memoized) —
+  all RED on revert of the respective fix, GREEN with it; full
   `go test ./pkg/config/...` green; go build/gofmt/vet clean.
 - **File(s)**: pkg/config/ast_groups.go,
   pkg/config/apply_groups_transitive_4474_test.go, docs/config-schema.md,
