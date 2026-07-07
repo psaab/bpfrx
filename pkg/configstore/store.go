@@ -286,6 +286,9 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := crossCheckNodeID(compiled, nodeID); err != nil {
 		return nil, err
 	}
+	if err := crossCheckRAIntervals(compiled); err != nil {
+		return nil, err
+	}
 	return compiled, nil
 }
 
@@ -323,6 +326,51 @@ func crossCheckNodeID(compiled *config.Config, nodeID int) error {
 			"'chassis cluster node' resolves to %d after ${node} expansion — these MUST agree "+
 			"(the file drives ${node} apply-group expansion and boot class; the leaf drives FPC "+
 			"naming and heartbeat identity). Fix one so both name the same node", nodeID, cc.NodeID)
+	}
+	return nil
+}
+
+// crossCheckRAIntervals enforces the one RFC 4861 §6.2.1 constraint the
+// per-leaf schema validators cannot express: when a router-advertisement
+// interface configures BOTH min- and max-advertisement-interval,
+// MinRtrAdvInterval MUST be <= 0.75 * MaxRtrAdvInterval (#4525). The
+// per-leaf gate (schema_routing.go) already bounds each leaf on its own —
+// max in [4,1800], min in [3,1350] per RFC 4861 §6.2.1 — but only the
+// compiled view sees both siblings together, so the ratio check lives here
+// (mirroring crossCheckNodeID's strict-only placement). An inverted or
+// over-narrowed window (min > 0.75*max) is the config that motivated #4525:
+// max-advertisement-interval 1|2 let the sender draw a 0-second periodic
+// delay and hot-loop; even within the new per-leaf floors an operator could
+// still author min close to max, which RFC 4861 forbids because it defeats
+// the desynchronizing jitter.
+//
+// Absent leaves (value 0 = "use default") never cross-check: a lone max or a
+// lone min is completed by the RA sender's own derivation (pkg/ra
+// randomAdvInterval), which is safe. Only an explicit min > 0.75*max pairing
+// is rejected.
+//
+// Strict on the operator commit / commit-check path (compileTreeStrict);
+// downgraded to a warning on the tolerant Store.Load / Store.SyncApply
+// ingress (compileTreeLenient) so a legacy or peer-synced config cannot
+// blackout-boot the node or alarm-loop HA config sync (#1960 doctrine). The
+// runtime floor in pkg/ra randomAdvInterval is the belt for anything that
+// reaches the sender through the lenient path.
+func crossCheckRAIntervals(compiled *config.Config) error {
+	if compiled == nil {
+		return nil
+	}
+	for _, ra := range compiled.Protocols.RouterAdvertisement {
+		if ra == nil || ra.MinAdvInterval <= 0 || ra.MaxAdvInterval <= 0 {
+			continue
+		}
+		// Integer form of min <= 0.75 * max (avoids float rounding):
+		// min*4 <= max*3.
+		if ra.MinAdvInterval*4 > ra.MaxAdvInterval*3 {
+			return fmt.Errorf("router-advertisement interface %q: min-advertisement-interval "+
+				"%d must be <= 0.75 * max-advertisement-interval %d per RFC 4861 §6.2.1 — "+
+				"lower min-advertisement-interval or raise max-advertisement-interval",
+				ra.Interface, ra.MinAdvInterval, ra.MaxAdvInterval)
+		}
 	}
 	return nil
 }
@@ -383,6 +431,11 @@ func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, err
 			slog.Warn("node identity mismatch in tolerated config; continuing (a strict commit would "+
 				"reject this) — heartbeat identity and FPC naming may diverge from ${node} expansion",
 				"err", mismatch, "issue", "#4185")
+		}
+		if raErr := crossCheckRAIntervals(compiled); raErr != nil {
+			slog.Warn("router-advertisement interval violation in tolerated config; continuing "+
+				"(a strict commit would reject this) — the RA sender floors the periodic timer at 1s",
+				"err", raErr, "issue", "#4525")
 		}
 	}
 	return compiled, err

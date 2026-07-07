@@ -25,6 +25,17 @@ const (
 	defaultMaxAdvInterval = 600  // seconds
 	defaultRouterLifetime = 1800 // seconds
 
+	// minAdvInterval is the hard runtime floor for the unsolicited periodic
+	// RA timer (#4525). RFC 4861 §6.2.1 requires MinRtrAdvInterval >= 3s, but
+	// a legacy/mis-typed config (e.g. max-advertisement-interval 1 committed
+	// before the schema floor existed, so minI derives to 0) could otherwise
+	// draw a 0-second delay. advTimer.Reset(0) fires immediately → sendRA →
+	// re-arm → CPU spin + RA/ND flood. Flooring the drawn interval at 1s makes
+	// the hot-loop unreachable regardless of how the config reaches the sender
+	// (commit, tolerant load, or HA peer-sync). The RFC-4861 §6.2.1 [4,1800]
+	// commit-time schema floor is the primary guard; this is the belt.
+	minAdvInterval = 1 * time.Second
+
 	// RFC 4861 §6.2.6: minimum delay between multicast RAs triggered by RS.
 	minRAMulticastDelay = 3 * time.Second
 
@@ -874,7 +885,18 @@ func (s *sender) randomAdvInterval() time.Duration {
 	}
 
 	interval := minI + rand.IntN(maxI-minI+1)
-	return time.Duration(interval) * time.Second
+	d := time.Duration(interval) * time.Second
+	// #4525: never arm the periodic timer with a 0 (or sub-second) delay. A
+	// drawn 0 — reachable when a legacy/mis-typed max-advertisement-interval
+	// of 1-2s made minI derive to 0 — would Reset the advTimer to fire
+	// immediately, spinning sendRA in a tight loop and flooding RA/ND. The
+	// RFC-4861 §6.2.1 commit-time schema floor now rejects such values, but
+	// floor here too so a config that bypassed the strict gate (tolerant load
+	// / HA peer-sync of a stale config) still cannot hot-loop.
+	if d < minAdvInterval {
+		d = minAdvInterval
+	}
+	return d
 }
 
 // eui64LinkLocal derives the EUI-64 IPv6 link-local address (fe80::/64) from a
