@@ -1191,7 +1191,24 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener, fabricIdx
 			}
 		}
 		slog.Info("cluster sync: peer connected", "remote", conn.RemoteAddr(), "fabric", fabricIdx)
-		s.handleNewConnection(ctx, fabricIdx, conn)
+		// #4370: run connection setup (the auth handshake + wire-up + cold-start
+		// bulk sync inside handleNewConnection) in a per-connection goroutine so
+		// a slow or hung handshake on ONE connection cannot stall accepting the
+		// NEXT for up to syncHandshakeTimeout. An active control-link attacker
+		// could otherwise open connections that each serially block the accept
+		// loop for the full handshake bound. The auth gate is preserved because
+		// the connection is not wired into conn0/conn1 (and no session frame is
+		// read from it) until performSyncHandshake succeeds INSIDE the goroutine;
+		// a failed handshake closes the connection and returns. The goroutine is
+		// tracked by s.wg (this loop already holds a wg token, so Add is safe)
+		// so Stop() waits for in-flight setup. The outbound fabricConnectLoop
+		// stays synchronous — it is a dedicated per-fabric dialer that must not
+		// redial while a connection is being handled.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleNewConnection(ctx, fabricIdx, conn)
+		}()
 	}
 }
 
