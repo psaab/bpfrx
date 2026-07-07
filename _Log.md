@@ -1,3 +1,99 @@
+## 2026-07-07 — #4435 (review follow-up): fail-closed post-loop return for m=8 parity
+
+- **Timestamp**: 2026-07-07
+- **Action**: Addressed the MERGE-NEEDS-MINOR residual the PR #4458
+  hostile review found. The first commit reconciled the loop BOUND
+  (`0..MAX_IPV6_EXT_HEADERS`) but not the POST-LOOP return:
+  `ipv6_l4_offset_and_protocol` still returned `Some((offset, protocol))`
+  after the loop, while the canonical
+  `packet_rel_l4_offset_and_protocol` (inspect.rs, #2292) post-loops to
+  `None` (deliberate fail-closed at the bound). Empirically the skew was
+  not removed, only moved from the old 6-bound to the 8-bound: a chain of
+  EXACTLY `MAX_IPV6_EXT_HEADERS` (8) ext headers resolved on the nat64
+  walker (`Some((104,17))`) but dropped on the canonical walker (`None`)
+  — contradicting the PR's "exact parity / matching the canonical cap"
+  claim.
+  - **Root cause**: nat64.rs:~630 post-loop `Some((offset, protocol))`.
+    Reaching the post-loop means the chain is STILL on an ext header
+    after 8 iterations, so `protocol` is an unconsumed ext-header type,
+    not a real L4. Verified the OTHER two walkers already post-loop safe:
+    `ipv6_is_non_first_fragment` returns `false`, `ipv6_fragment_header`
+    returns `None` — only `ipv6_l4_offset_and_protocol` diverged.
+  - **Fix**: changed the nat64.rs:~630 post-loop from
+    `Some((offset, protocol))` to `None`, mirroring the canonical #2292
+    fail-closed-at-bound. m=8 now DROPS on both walkers (true parity, no
+    skew at any header count). Does NOT regress the m=7 fix (a 7-ext-hdr
+    chain terminates WITHIN the loop via the in-loop `_ => Some(...)`,
+    before the post-loop). Updated the walker doc-comment. Both callers
+    (`write_v6_to_v4_into`, `translate_embedded_v6_to_v4`) already handle
+    `None` via `?`.
+  - **Tests**: added `nat64_v6_to_v4_exactly_max_ext_headers_parity_both_drop`
+    — asserts BOTH the nat64 walker AND the canonical
+    `packet_rel_l4_offset_and_protocol` return `None` at exactly
+    `MAX_IPV6_EXT_HEADERS` (locks the cap parity; the m=9 `oversized`
+    test never exercised the exact boundary). Exposed the canonical
+    walker via a `#[cfg(test)]`-only `pub(crate)` re-export in
+    afxdp/mod.rs (established `fabric_queue_hash_seeded` pattern; no
+    production API change). Updated the `oversized` (m=9) test: the walk
+    now returns `None` at the post-loop (was `Some((104,60))`), so it
+    asserts `.is_none()`. The 4 prior tests stay green (m=7 translate,
+    embedded m=7 translate, m=9 drop, m=2 unaffected).
+  - **Validation**: FULL `cargo test --release -- --test-threads=1` — see
+    PR. Hand-verified changed lines fmt-clean (no whole-crate drift;
+    master isn't rustfmt-clean under edition 2024). Merged current
+    origin/master (#4457 split Go NAT files — disjoint, clean).
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/mod.rs, _Log.md
+
+## 2026-07-07 — #4435: NAT64 ext-header walkers share canonical MAX_IPV6_EXT_HEADERS bound
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed #4435 (codex-172 C172-M02, MED). The NAT64
+  translator's three private IPv6 extension-header walkers in
+  `nat64.rs` (`ipv6_l4_offset_and_protocol`, `ipv6_is_non_first_fragment`,
+  `ipv6_fragment_header`) surrendered at a hardcoded 6-iteration bound
+  while the canonical forwarding/screen walkers use
+  `MAX_IPV6_EXT_HEADERS = 8` (`afxdp/frame/inspect.rs`). Verified the
+  6-vs-8 skew on master: an IPv6 packet with 7 resolvable ext headers to
+  a NAT64 prefix was DROPPED by the NAT64 path (walk returned the 7th,
+  unconsumed ext-header type as a bogus L4 protocol → the translator's
+  `_ => return None`) while the forwarding path accepted the same packet.
+  The embedded-ICMP translator (`translate_embedded_v6_to_v4`) reuses
+  these walkers, so ICMPv6 errors quoting a 7-ext-header original were
+  also dropped (traceroute/PMTUD blackhole).
+  - **Fix**: broadened the canonical const to `pub(crate)` in
+    `afxdp/frame/inspect.rs` and re-exported it at the `crate::afxdp`
+    level (mirroring the existing `write_eth_header_slice` re-export
+    chain: `frame/mod.rs` → `afxdp/mod.rs`), then imported it into
+    `nat64.rs` and replaced all three `for _ in 0..6` with
+    `for _ in 0..MAX_IPV6_EXT_HEADERS`. The walk LOGIC stays local (the
+    dependency direction afxdp→nat64 is unchanged; only the BOUND value
+    is now a single SSOT). Fail-closed behaviour is preserved: a chain
+    longer than the bound still leaves the walk on a non-terminal
+    ext-header type → the translator drops (matching the canonical cap).
+    Updated the stale nat64.rs walker doc-comment (was "bounded to 6
+    iterations" / "#2292 tracked separately, not a prerequisite"); the
+    full walker-function unification remains #2292.
+  - **Validation**: RED-on-revert confirmed — with the loops reverted to
+    `0..6`, `nat64_v6_to_v4_seven_ext_headers_translates` fails (walk
+    offset 88 vs expected 96) and
+    `nat64_v6_to_v4_embedded_icmp_seven_ext_headers_translates` fails
+    (drop), while the oversized/2-header sanity tests still pass. Added 4
+    tests + 2 helpers in `nat64_tests.rs`. FULL
+    `cargo test --release -- --test-threads=1`: see PR (nat64 subset all
+    green). Did NOT run `cargo fmt` — master is not rustfmt-clean under
+    edition 2024; hand-verified my changed lines are fmt-clean (they
+    appear only as diff context around pre-existing drift) to avoid
+    whole-crate drift.
+  - **Docs**: module doc-comments in `inspect.rs` + `nat64.rs` updated
+    (the walker's own documentation). No user-facing doc change needed —
+    `docs/feature-coverage.md` already claims RFC 7915 ext-header-bearing
+    NAT64 translation since #2290; this is an off-by-two bound edge, not
+    a new capability.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs, _Log.md
+
 ## 2026-07-07 — #4400: strict-syn-check drop for bare RST/FIN on session-miss
 
 - **Timestamp**: 2026-07-07
