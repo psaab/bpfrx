@@ -1757,6 +1757,12 @@ Interface Monitoring:
 - Status format: `Up   / Up` or `Down  /  Down` (variable spacing around `/`).
 - Fixed-width columns within each section.
 - Trailing spaces after values for column padding.
+- A monitored interface whose live link-state is not yet available (the
+  routing interface-monitor sweep has produced no result for its redundancy
+  group) renders `Down`, not `Up` (#4480). The display never asserts a
+  monitor is healthy on missing data — the same honest default the peer-owned
+  (config-only) monitors already use. This is a display convention only; the
+  failover decision reads the live link-state, not this fallback.
 
 ---
 

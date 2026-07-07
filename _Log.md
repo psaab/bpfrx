@@ -1,3 +1,28 @@
+## 2026-07-07 — #4480 grpcapi: interface-monitor display honest on missing live status
+
+- **Timestamp**: 2026-07-07T14:24Z
+- **Action**: Fixed opus-172 M-3 (observability lie, display path only).
+  `buildInterfacesInput` (server_cluster.go) builds the `show chassis cluster
+  interfaces` monitor rows. When the routing interface-monitor sweep had NOT
+  produced a live link-state result for a redundancy group, the LOCAL branch
+  fell back to hardcoding `Up: true`, so a DOWN monitored uplink rendered as
+  healthy — while the PEER branch in the same function honestly filled
+  config-only monitors as `Up: false`. Changed the local config-only fallback
+  to `Up: false` so unknown link-state surfaces as Down, matching the peer
+  branch. `InterfaceMonitorInfo.Up` is a plain bool (no tri-state), so false
+  is the honest boolean. This is display-only — the failover decision reads
+  the live routing statuses (`InterfaceMonitorStatuses`), not this fallback,
+  so the weight/priority demotion logic is untouched. Added two grpcapi tests:
+  the fallback-honest test (RED-on-revert: local monitor with unavailable live
+  status must be Up=false; reverting to Up=true fails it) and a guard test
+  proving the live-status branch still copies an actually-up monitor as Up and
+  the peer branch still reports Up=false. Verified: `go test ./pkg/grpcapi/...`
+  green, go build + vet + gofmt clean. Doc: docs/junos-cli-reference.md
+  Interface Monitoring format-details note.
+- **File(s)**: pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_cluster_monitor_status_4480_test.go,
+  docs/junos-cli-reference.md, _Log.md
+
 ## 2026-07-07 — #4479 routing: skip PBR/FBF band in userspace FIB snapshot ingest
 
 - **Timestamp**: 2026-07-07
