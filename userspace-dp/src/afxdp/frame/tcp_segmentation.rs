@@ -194,25 +194,6 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
 
         match meta.addr_family as i32 {
             libc::AF_INET => {
-                // Capture pre-modification IPs and ports for incremental
-                // L4 checksum adjustment (avoids O(payload) full recompute).
-                let pre_src_ip;
-                let pre_dst_ip;
-                let pre_src_port;
-                let pre_dst_port;
-                {
-                    let packet = frame_out.get(eth_len..)?;
-                    pre_src_ip = [packet[12], packet[13], packet[14], packet[15]];
-                    pre_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
-                    pre_src_port = u16::from_be_bytes([
-                        *packet.get(ip_header_len)?,
-                        *packet.get(ip_header_len + 1)?,
-                    ]);
-                    pre_dst_port = u16::from_be_bytes([
-                        *packet.get(ip_header_len + 2)?,
-                        *packet.get(ip_header_len + 3)?,
-                    ]);
-                }
                 {
                     let packet = frame_out.get_mut(eth_len..)?;
                     packet
@@ -257,74 +238,21 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                 packet
                     .get_mut(10..12)?
                     .copy_from_slice(&ip_sum.to_be_bytes());
-                // L4 checksum: incremental adjustment for NAT and TTL
-                // changes instead of full payload recompute. O(1) vs
-                // O(payload_size) — saves ~3.6% CPU at fabric throughput.
-                let _post_src_ip = [packet[12], packet[13], packet[14], packet[15]];
-                let _post_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
-                // L4 checksum: use incremental adjustment when
-                // enforce_expected_ports was a no-op (the common fabric
-                // case where expected_ports=None). This is O(1) vs
-                // O(payload_size) — saves ~3.6% CPU.
-                // When enforce_expected_ports DID run (expected_ports is
-                // Some), fall back to full recompute because the
-                // interaction between NAT port changes, port enforcement,
-                // and checksum adjustments is complex.
-                if enforced_ports.is_none() {
-                    let post_src_ip = [packet[12], packet[13], packet[14], packet[15]];
-                    let post_dst_ip = [packet[16], packet[17], packet[18], packet[19]];
-                    let post_src_port = u16::from_be_bytes([
-                        *packet.get(ip_header_len)?,
-                        *packet.get(ip_header_len + 1)?,
-                    ]);
-                    let post_dst_port = u16::from_be_bytes([
-                        *packet.get(ip_header_len + 2)?,
-                        *packet.get(ip_header_len + 3)?,
-                    ]);
-                    let has_changes = pre_src_ip != post_src_ip
-                        || pre_dst_ip != post_dst_ip
-                        || pre_src_port != post_src_port
-                        || pre_dst_port != post_dst_port;
-                    if has_changes {
-                        let csum_off = match meta.protocol {
-                            PROTO_TCP => ip_header_len + 16,
-                            PROTO_UDP => ip_header_len + 6,
-                            _ => 0,
-                        };
-                        if csum_off > 0 && packet.len() > csum_off + 1 {
-                            let current =
-                                u16::from_be_bytes([packet[csum_off], packet[csum_off + 1]]);
-                            let mut updated = checksum16_adjust(
-                                current,
-                                &ipv4_words(Ipv4Addr::from(pre_src_ip)),
-                                &ipv4_words(Ipv4Addr::from(post_src_ip)),
-                            );
-                            updated = checksum16_adjust(
-                                updated,
-                                &ipv4_words(Ipv4Addr::from(pre_dst_ip)),
-                                &ipv4_words(Ipv4Addr::from(post_dst_ip)),
-                            );
-                            if pre_src_port != post_src_port {
-                                updated =
-                                    checksum16_adjust(updated, &[pre_src_port], &[post_src_port]);
-                            }
-                            if pre_dst_port != post_dst_port {
-                                updated =
-                                    checksum16_adjust(updated, &[pre_dst_port], &[post_dst_port]);
-                            }
-                            if matches!(meta.protocol, PROTO_UDP) && updated == 0 {
-                                updated = 0xffff;
-                            }
-                            packet
-                                .get_mut(csum_off..csum_off + 2)?
-                                .copy_from_slice(&updated.to_be_bytes());
-                        }
-                    }
-                } else {
-                    // Full L4 checksum recompute when enforce_expected_ports
-                    // may have modified ports and adjusted the checksum.
-                    recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
-                }
+                // L4 checksum: full recompute over the pseudo-header and
+                // this segment's actual L4 bytes. A per-segment incremental
+                // adjustment from the copied original-frame checksum is
+                // never valid (#4384): each segment carries a different
+                // payload chunk, a rewritten seq (above), a cleared PSH on
+                // non-final segments, and a different pseudo-header length,
+                // none of which a NAT IP/port delta can capture — and the
+                // NAT delta itself was already folded in by apply_nat_ipv4.
+                // The removed incremental branch was gated on
+                // `enforced_ports.is_none()`, which is unreachable for any
+                // valid segmentable frame (live_frame_ports_from_meta_bytes
+                // always resolves ports), so it was dead-but-wrong: a latent
+                // corruption landmine had a refactor ever flipped the gate.
+                // Mirror the AF_INET6 arm below, which always recomputes.
+                recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
             }
             libc::AF_INET6 => {
                 {
@@ -874,6 +802,107 @@ mod mode_aware_segmentation_tests {
             out.is_none(),
             "missing tunnel endpoint row must fail closed (drop)"
         );
+    }
+
+    // ------- (c) #4384 per-segment L4 checksum correctness ----------
+
+    /// Non-tunnel (plain L2) forwarding resolution so segments come out as
+    /// eth + IPv4 + TCP with no encap wrapper — the simplest frame to
+    /// re-verify a TCP checksum over.
+    fn plain_resolution() -> ForwardingResolution {
+        ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 12,
+            egress_ifindex: EGRESS_IFINDEX,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))),
+            neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+            tx_vlan_id: 0,
+        }
+    }
+
+    /// A correct IPv4 TCP checksum has the property that summing the
+    /// pseudo-header plus the L4 bytes WITH the checksum field left in place
+    /// folds to zero. Verify each segment independently of the code under
+    /// test (the segmenter computes `!sum` and writes it; here we confirm
+    /// the on-wire result verifies to 0).
+    fn tcp_checksum_verifies_v4(segment: &[u8]) -> bool {
+        let eth = 14usize; // no VLAN in these fixtures
+        let ihl = ((segment[eth] & 0x0f) as usize) * 4;
+        let src = Ipv4Addr::new(
+            segment[eth + 12],
+            segment[eth + 13],
+            segment[eth + 14],
+            segment[eth + 15],
+        );
+        let dst = Ipv4Addr::new(
+            segment[eth + 16],
+            segment[eth + 17],
+            segment[eth + 18],
+            segment[eth + 19],
+        );
+        let l4 = &segment[eth + ihl..];
+        checksum16_ipv4(src, dst, PROTO_TCP, l4) == 0
+    }
+
+    /// #4384: every emitted segment of a NAT'd (source-NAT) multi-segment
+    /// IPv4 TCP flow must carry a per-segment-correct TCP checksum. This
+    /// locks the fix that deleted the dead-but-wrong incremental branch and
+    /// made the AF_INET arm always full-recompute (mirroring AF_INET6). The
+    /// removed branch seeded each segment's checksum from the copied
+    /// whole-frame checksum and never accounted for the per-segment payload
+    /// chunk, the rewritten seq, the cleared PSH, or the per-segment
+    /// pseudo-header length — so any change that flipped its dead gate live
+    /// would corrupt every segment. This test would go RED on such a change.
+    #[test]
+    fn natd_multi_segment_ipv4_tcp_has_correct_per_segment_checksums() {
+        let mtu = 1280usize;
+        let mut state = ForwardingState::default();
+        state.egress.insert(EGRESS_IFINDEX, egress_iface(mtu));
+
+        let decision = SessionDecision {
+            resolution: plain_resolution(),
+            // Source-NAT the flow (10.0.0.5 -> 203.0.113.7) so the checksum
+            // must reflect the rewritten pseudo-header source as well as the
+            // per-segment payload/seq/PSH/length changes.
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+                ..NatDecision::default()
+            },
+        };
+
+        // 2000 bytes of data over a 1280 MTU (1240-byte segment payload)
+        // forces >= 2 segments, so at least one non-final segment (PSH
+        // cleared, non-zero seq offset) is exercised.
+        let frame = ipv4_tcp_frame(2000);
+        let segments = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta_v4(),
+            &decision,
+            &state,
+            false,
+            None,
+        )
+        .expect("plain IPv4 segmentation must produce frames");
+        assert!(
+            segments.len() >= 2,
+            "2000 bytes over a 1280 MTU must split into multiple segments"
+        );
+
+        for (idx, seg) in segments.iter().enumerate() {
+            // The source-NAT must have been applied to every segment.
+            assert_eq!(
+                &seg[14 + 12..14 + 16],
+                &[203, 0, 113, 7],
+                "segment {idx} must carry the NAT'd source address"
+            );
+            assert!(
+                tcp_checksum_verifies_v4(seg),
+                "segment {idx} TCP checksum must verify to zero (per-segment recompute)"
+            );
+        }
     }
 
     // ------- decap helper -------------------------------------------

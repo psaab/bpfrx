@@ -1,3 +1,40 @@
+## 2026-07-07 — #4384 (opus-171 L-3): delete dead-but-wrong incremental TCP checksum in the segmentation path
+
+- **Timestamp**: 2026-07-07T18:30Z
+- **Action**: The AF_INET arm of `segment_forwarded_tcp_frames_from_frame`
+  had an incremental L4-checksum branch gated on `enforced_ports.is_none()`.
+  It was DEAD — `enforced_ports = expected_ports.or(live_frame_ports_from_meta_bytes(...))`
+  (tcp_segmentation.rs:156) is always `Some` for any valid segmentable TCP
+  frame (inspect.rs:1122 resolves ports via the meta path or the
+  `live_frame_ports_bytes` fallback), so the `else` full-recompute always
+  ran. It was also WRONG: each segment's checksum field is copied verbatim
+  from the ORIGINAL whole-frame TCP header (covered the whole payload,
+  original seq, original PSH, whole-packet pseudo-header length), yet the
+  branch only adjusted for NAT src/dst-IP and port deltas — never the
+  per-segment chunk, the rewritten seq, the cleared PSH, or the per-segment
+  length; and it double-counted NAT (`apply_nat_ipv4` already folded the IP/
+  port delta into the L4 checksum). A dead-but-wrong latent corruption
+  landmine if a refactor ever flipped the gate live. Removed the branch, the
+  `pre_*` captures and `_post_*` reads that only fed it, and call
+  `recompute_l4_checksum_ipv4` unconditionally — mirroring the AF_INET6 arm
+  which already always full-recomputes. Removed the now-unused `ipv4_words`
+  re-export from `frame/mod.rs` (warning-neutral; the pre-existing
+  test-only `checksum16_ipv4`/`adjust_l4_checksum_ipv4_words` re-exports are
+  untouched). Documented the rationale in
+  `docs/fabric-performance-optimizations.md` so the incremental trick is not
+  re-introduced on the segmentation path.
+- **Validation**: added a positive landmine-guard test
+  (`natd_multi_segment_ipv4_tcp_has_correct_per_segment_checksums`) — a
+  source-NAT'd 2000-byte flow split over a 1280 MTU must produce >= 2
+  segments each with a TCP checksum that verifies to zero. Proven to have
+  teeth: temporarily neutering the v4 recompute (simulating a live wrong
+  segment checksum) makes it FAIL on "segment 0 TCP checksum must verify to
+  zero". FULL `cargo test --release -- --test-threads=1`: 3774 passed, 0
+  failed. Rust-only, no test-failover.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  docs/fabric-performance-optimizations.md
+
 ## 2026-07-07 — #4475 (opus-172 H-2): harden data-path neighbor learning against on-link poisoning/MITM
 
 - **Timestamp**: 2026-07-07T17:30Z
