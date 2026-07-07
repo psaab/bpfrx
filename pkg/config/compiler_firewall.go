@@ -156,6 +156,27 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 		}
 	}
 
+	// #4535: a three-color policer with NEITHER `color-blind` nor
+	// `color-aware` configured defaults to COLOR-BLIND mode, matching
+	// Junos (which accepts and enforces such a policer). Without this
+	// default the snapshot carries color_blind=false, which the userspace
+	// capability gate (userspaceSupportsThreeColorPolicers) treats as
+	// unsupported color-aware mode and disarms the WHOLE dataplane
+	// (ForwardingSupported=false) — refusing a valid Junos config outright.
+	// Applied after all instances merge so a color statement split across
+	// set-lines / firewall blocks is fully observed first. Only the
+	// UNSPECIFIED case changes: explicit `color-aware` keeps ColorBlind
+	// false (its documented unsupported-mode disarm is unchanged),
+	// explicit `color-blind` keeps it true.
+	for _, tcp := range fw.ThreeColorPolicers {
+		if tcp == nil {
+			continue
+		}
+		if !tcp.ColorBlindConfigured && !tcp.ColorAwareConfigured {
+			tcp.ColorBlind = true
+		}
+	}
+
 	for _, familyNode := range node.FindChildren("family") {
 		var afNodes []*Node
 		var afName string

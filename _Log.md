@@ -1,3 +1,34 @@
+## 2026-07-07 — #4535 three-color policer unspecified color mode defaults to color-blind (Junos parity)
+
+- **Timestamp**: 2026-07-07T15:30Z
+- **Action**: A `firewall three-color-policer` with NEITHER `color-blind`
+  nor `color-aware` configured left `ColorBlind=false` in the compiled
+  struct (the only two `ColorBlind=true` writes are inside the explicit
+  `color-blind` branch, compiler_firewall.go). That value drove
+  `userspaceSupportsThreeColorPolicers` (pkg/dataplane/userspace/
+  capabilities.go:137) to return false → `deriveUserspaceCapabilities`
+  set `ForwardingSupported=false` with a VISIBLE reason ("userspace
+  three-color policers require color-blind mode and then discard"), so an
+  operator porting a valid Junos `three-color-policer { single-rate {...} }`
+  (no color statement) committed clean but xpf REFUSED to forward — a
+  whole-dataplane disarm for a config Junos accepts and enforces (Junos
+  defaults such a policer to color-blind). Fix: after all three-color
+  instances merge, default `tcp.ColorBlind=true` when NEITHER
+  `ColorBlindConfigured` NOR `ColorAwareConfigured` is set. Only the
+  unspecified case changes; explicit `color-aware` keeps `ColorBlind=false`
+  (its documented unsupported-mode disarm is unchanged), explicit
+  `color-blind` keeps it true. Updated the ColorBlind struct-field comment
+  (was "default: color-aware", now the Junos color-blind default). RED-on-
+  revert tests: pkg/config asserts compiled `ColorBlind=true` for the
+  unspecified case (false→disarm on revert) plus color-aware→false and
+  color-blind→true unchanged; pkg/dataplane/userspace asserts
+  `ForwardingSupported` stays true for the unspecified case and still
+  disarms for explicit color-aware.
+- **Files**: pkg/config/compiler_firewall.go, pkg/config/types_system.go,
+  pkg/config/compiler_three_color_default_4535_test.go,
+  pkg/dataplane/userspace/three_color_default_4535_test.go,
+  docs/userspace-dataplane-gaps.md, docs/feature-gaps.md
+
 ## 2026-07-07 — #4526 DHCP renewalTimers int64 overflow (cleanliness)
 
 - **Timestamp**: 2026-07-07T00:00Z
