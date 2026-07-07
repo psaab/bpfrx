@@ -413,9 +413,12 @@ type SurfaceAManager struct {
 // manager is still constructible (the daemon starts) but Reconcile refuses to
 // publish or withdraw any record until the operator resolves the bad file
 // (corrupt/unsupported files are quarantined aside). A MISSING file (first boot)
-// is NOT degraded — a fresh node publishes normally. It resolves the live RFC
-// 2136 backend per provider at reconcile time. The runtime cache is seeded from
-// the durable store so a restart does not republish an unchanged address.
+// is NOT degraded — a fresh node publishes normally. It resolves the live
+// backend per provider at reconcile time (resolve-per-Reconcile): the RFC 2136
+// dynamic-DNS UPDATE backend OR one of the HTTP providers — dyndns2, duckdns,
+// cloudflare, route53, generic — all siblings behind the same DNSUpdater
+// interface (see resolveSurfaceABackend). The runtime cache is seeded from the
+// durable store so a restart does not republish an unchanged address.
 func NewSurfaceAManager() *SurfaceAManager {
 	st, degraded, reason := loadStateOrDegrade(defaultSurfaceAStatePath, time.Now)
 	m := &SurfaceAManager{
