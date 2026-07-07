@@ -1320,8 +1320,10 @@ impl ScreenState {
     /// across the operator's window EVADED detection (fail-open). Each tracker
     /// is reaped at the LONGEST window configured for its check across all live
     /// profiles, so state survives for the full configured window (the reap
-    /// floor is clamped to a documented ceiling inside `cleanup`, and memory
-    /// stays bounded by the per-source/zone caps regardless).
+    /// floor is clamped to a documented ceiling inside `cleanup` — #4418 raised
+    /// that ceiling to the u32 `threshold` type maximum so it never bites a
+    /// configurable window, closing the >5min residual; memory stays bounded by
+    /// the per-source/zone caps regardless).
     fn maybe_cleanup_trackers(&mut self, now_micros: u64) {
         let now_secs = now_micros / 1_000_000;
         if now_secs.saturating_sub(self.last_cleanup_secs) >= 30 {
@@ -1341,8 +1343,10 @@ impl ScreenState {
     /// of 0 (feature disabled for that zone) contributes nothing; if every
     /// profile disables a check the floor is 0 and cleanup reclaims all of that
     /// tracker's now-idle state. `cleanup` clamps each floor to
-    /// `MAX_CLEANUP_WINDOW_MICROS` so a pathological window cannot retain dead
-    /// weight indefinitely.
+    /// `MAX_CLEANUP_WINDOW_MICROS` (the u32 `threshold` type maximum, #4418) so
+    /// a floor beyond any configurable window cannot retain dead weight
+    /// indefinitely; a configured window is never clamped, so the >5min
+    /// slow-scan evasion residual is closed.
     fn scan_cleanup_floors(&self) -> (u64, u64) {
         let mut port_scan_floor = 0u64;
         let mut ip_sweep_floor = 0u64;
@@ -1361,11 +1365,11 @@ impl ScreenState {
         self.port_scan.skipped_pressure() + self.ip_sweep.skipped_pressure()
     }
 
-    /// #2234: total stalest-evictions on the scan/sweep source-saturation
+    /// #2234/#4418: total bounded evictions on the scan/sweep source-saturation
     /// path. A non-zero value means the per-zone source table hit its cap and
-    /// the detector displaced stale sources to keep a fresh real scanner
-    /// trackable (it no longer silently drops new sources on a full table).
-    /// Pure observability; never affects a verdict.
+    /// the detector displaced the least-suspicious sources to keep a fresh real
+    /// scanner trackable (it no longer silently drops new sources on a full
+    /// table). Pure observability; never affects a verdict.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn scan_sweep_evicted_pressure(&self) -> u64 {
         self.port_scan.evicted_pressure() + self.ip_sweep.evicted_pressure()

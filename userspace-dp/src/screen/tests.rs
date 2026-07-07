@@ -4398,10 +4398,11 @@ fn scan_sweep_state_bounded_and_records_pressure() {
             None
         );
     }
-    // #2234: over-cap sources are now ADMITTED by bounded stalest-eviction
-    // (the table stays bounded but a fresh source is no longer silently
-    // dropped on a full table), recorded as eviction pressure — NOT skip
-    // pressure. The single-zone flood never falls back to skip.
+    // #2234/#4418: over-cap sources are now ADMITTED by bounded
+    // least-suspicious eviction (the table stays bounded but a fresh source is
+    // no longer silently dropped on a full table), recorded as eviction
+    // pressure — NOT skip pressure. The single-zone flood never falls back to
+    // skip.
     assert!(
         state.scan_sweep_evicted_pressure() >= 200,
         "over-cap sources must record eviction pressure, got {}",
@@ -4419,7 +4420,8 @@ fn scan_sweep_state_bounded_and_records_pressure() {
 /// saturated the per-zone source table must STILL be tracked and dropped.
 /// Pre-#2234 the new source was skipped on a full table (returns None
 /// forever), so the spoofed flood suppressed detection of the real scanner —
-/// a detection-DoS. Reverting the bounded stalest-eviction breaks this test.
+/// a detection-DoS. Reverting the bounded least-suspicious eviction breaks
+/// this test.
 #[test]
 fn fresh_scanner_detected_after_source_flood_at_screen_state() {
     let mut profile = ScreenProfile::default();
