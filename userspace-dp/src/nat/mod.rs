@@ -27,9 +27,32 @@ mod source;
 mod static_nat;
 mod status;
 
+// Tests split out of nat/tests.rs into per-subject sibling files
+// (#4409, pure code motion); each is a `#[path]` child module of `nat`.
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "tests_source.rs"]
+mod tests_source;
+#[cfg(test)]
+#[path = "tests_static.rs"]
+mod tests_static;
+#[cfg(test)]
+#[path = "tests_destination.rs"]
+mod tests_destination;
+#[cfg(test)]
+#[path = "tests_pool.rs"]
+mod tests_pool;
+#[cfg(test)]
+#[path = "tests_counter.rs"]
+mod tests_counter;
+#[cfg(test)]
+#[path = "tests_dnat_proto.rs"]
+mod tests_dnat_proto;
+#[cfg(test)]
+#[path = "tests_scope.rs"]
+mod tests_scope;
+#[cfg(test)]
+#[path = "tests_l4_match.rs"]
+mod tests_l4_match;
 
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches
