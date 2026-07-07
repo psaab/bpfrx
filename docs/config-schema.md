@@ -1148,12 +1148,29 @@ prefix-list reference against the candidate tree's `policy-options prefix-list`
 definitions (via `firewallPrefixListFamilies`, which mirrors
 `compilePolicyOptions`' #3996 dual-shape prefix read so the family verdict
 matches what the compiler loads). Coverage is aggregated **per direction**
-across every `from` block of the term: if a direction's referenced prefix-lists
-collectively cover **exactly one** family, the term is rejected at strict commit
-/ warned on the lenient load path with a message naming the under-blocked arm
-and the offending lists. Accepted (not flagged):
+across every `from` block of the term, tracking **positive** and **`except`**
+references separately (`hasPos`/`hasExc`, `posFam`/`excFam`) because they fail
+in **opposite** ways under `family any`, mirroring `resolvePrefixListAddrs`
+(#4338):
 
-- a **mixed-family** prefix-list (v4 AND v6 prefixes in one list),
+- A single-family **positive** list (`from source-prefix-list v4-only`) leaves
+  the missing-family arm with no matching prefixes → matches **nothing** → falls
+  through to the implicit ACCEPT → a silent **under-block**.
+- A single-family **`except`** list (`from source-prefix-list v4-only except`)
+  is the clean-except case: the missing-family arm evaluates `except` over a set
+  with no entries for that family = **match ALL** → an **over-block** on `then
+  discard`, a fail-**open** over-accept on `then accept` — the *opposite* of an
+  under-block. (A defined positive ref makes the direction positive-wins and any
+  `except` ref is dropped, so the except branch only fires for a *sole* `except`
+  reference — exactly the runtime's clean-except path.)
+
+Each is rejected at strict commit / warned on the lenient load path with a
+message describing the **correct** failure mode (an inverted "under-block"
+message for the `except` case would be misinformation worse than the gap).
+Accepted (not flagged):
+
+- a **mixed-family** prefix-list (v4 AND v6 prefixes in one list — positive or
+  `except`),
 - **two single-family lists** in one direction that together cover both
   families (`source-prefix-list { v4-only; v6-only; }`),
 - an **empty** list (both-families-absent → left to the empty-set match
@@ -1163,9 +1180,11 @@ and the offending lists. Accepted (not flagged):
 Same reachability as #4287/#4296 (hierarchical / peer-synced AST only; the flat
 `set` grammar does not model `family any`). Fail-on-revert:
 `pkg/config/compiler_firewall_family_any_prefixlist_4426_test.go` (strict reject
-of a v4-only and a v6-only list; lenient warn preserving the dual-compile;
-mixed-family and two-list-both-families commit; single-family filters with
-single-family lists not flagged).
+of a v4-only and a v6-only positive list with the under-block message; strict
+reject of a v4-only `except` list — and an `except`+`accept` fail-open — with
+the over-match message, NOT the under-block wording; lenient warn preserving the
+dual-compile; mixed-family, mixed-family-except, and two-list-both-families
+commit; single-family filters with single-family lists not flagged).
 
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 

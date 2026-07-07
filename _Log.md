@@ -25,6 +25,18 @@
   province of `validateFirewallPrefixListReferencesStrict`).
   RED-on-revert proven: v4-only + v6-only reject tests and the lenient
   warn test all go RED on the origin/master `compiler_firewall.go`.
+  Coordinator-review fold: the gate now tracks POSITIVE vs `except`
+  refs separately (`hasPos`/`hasExc`, `posFam`/`excFam`) because they
+  fail in OPPOSITE ways under `family any` — a single-family positive
+  list under-blocks the missing family (arm matches nothing) while a
+  sole single-family `except` list OVER-matches it (arm is `except` over
+  an empty set = match ALL; the clean-except branch of
+  resolvePrefixListAddrs, #4338). The two cases now emit DIFFERENT
+  messages (an inverted "under-block" message for the `except` case
+  would be misinformation worse than the gap). Verified the
+  `except`+`accept` fail-open (v6 arm accepts EVERY v6 packet) is caught
+  with the over-accept wording. RED-on-revert also proven for the except
+  branch (the pre-fold version emits the inverted under-block message).
   `go build ./...`, `go vet`, `gofmt`, and the full `pkg/config` +
   `pkg/dataplane` suites are green. Commit-path only (no dataplane wire
   change) — no cluster smoke required.

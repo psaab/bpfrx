@@ -593,10 +593,18 @@ func validateFirewallFilterFamilyAnyMatchesAST(nodes []*Node, lenient bool) ([]s
 						continue
 					}
 					for _, termInst := range namedInstances(filterInst.node.FindChildren("term")) {
-						// Per-direction prefix-list family coverage, accumulated
-						// across every `from` block of the term (#4426). Index 0 =
-						// source, 1 = destination.
-						var dirFam [2]plFamily
+						// Per-direction prefix-list coverage, accumulated across
+						// every `from` block of the term (#4426). Index 0 = source,
+						// 1 = destination. POSITIVE (`source-prefix-list X`) and
+						// EXCEPT (`source-prefix-list X except`) refs are tracked
+						// SEPARATELY because they fail differently under `family
+						// any`: a single-family POSITIVE list under-blocks the
+						// missing family (its arm matches nothing), while a
+						// single-family EXCEPT list OVER-matches the missing family
+						// (that arm is `except` over an empty set = match ALL — the
+						// clean-except branch of resolvePrefixListAddrs, #4338).
+						var posFam, excFam [2]plFamily
+						var hasPos, hasExc [2]bool
 						var dirNames [2][]string
 						for _, fromNode := range termInst.node.FindChildren("from") {
 							for _, child := range fromNode.Children {
@@ -619,13 +627,24 @@ func validateFirewallFilterFamilyAnyMatchesAST(nodes []*Node, lenient bool) ([]s
 											// validateFirewallPrefixListReferencesStrict.
 											continue
 										}
-										if fam.hasV4 {
-											dirFam[dir].hasV4 = true
-										}
-										if fam.hasV6 {
-											dirFam[dir].hasV6 = true
-										}
 										dirNames[dir] = append(dirNames[dir], ref.Name)
+										if ref.Except {
+											hasExc[dir] = true
+											if fam.hasV4 {
+												excFam[dir].hasV4 = true
+											}
+											if fam.hasV6 {
+												excFam[dir].hasV6 = true
+											}
+										} else {
+											hasPos[dir] = true
+											if fam.hasV4 {
+												posFam[dir].hasV4 = true
+											}
+											if fam.hasV6 {
+												posFam[dir].hasV6 = true
+											}
+										}
 									}
 									continue
 								}
@@ -645,25 +664,62 @@ func validateFirewallFilterFamilyAnyMatchesAST(nodes []*Node, lenient bool) ([]s
 								warnings = append(warnings, msg)
 							}
 						}
-						// #4426: a direction whose referenced prefix-lists together
-						// cover exactly ONE family under `family any` under-blocks the
-						// other family (the missing-family arm matches nothing / falls
-						// through). Reject strict / warn lenient, mirroring the #4296
-						// remedy. Both-families and empty coverage are fine.
+						// #4426: a direction whose referenced prefix-lists cover
+						// exactly ONE family under `family any` is a commit-time
+						// surprise — but the failure mode (and so the message) differs
+						// by whether the coverage is POSITIVE or EXCEPT. Reject strict /
+						// warn lenient in both cases, mirroring the #4296 remedy.
+						// Both-families and empty coverage are fine.
 						for dir, keyword := range [2]string{"source-prefix-list", "destination-prefix-list"} {
-							fam := dirFam[dir]
+							// Effective match semantics for this direction, mirroring
+							// resolvePrefixListAddrs (#4338): a DEFINED positive ref
+							// makes the direction positive-wins (any `except` ref is
+							// dropped, warned separately); only a SOLE `except` (no
+							// positive ref) uses the clean-except match-ALL semantics.
+							var fam plFamily
+							except := false
+							switch {
+							case hasPos[dir]:
+								fam = posFam[dir] // positive-wins; except refs ignored
+							case hasExc[dir]:
+								fam = excFam[dir]
+								except = true
+							default:
+								continue // no defined refs in this direction
+							}
 							if fam.hasV4 == fam.hasV6 {
 								// both (legit mixed / dual-list) or neither (empty).
 								continue
 							}
-							haveFam, missFam := "inet (v4)", "inet6 (v6)"
-							if fam.hasV6 {
-								haveFam, missFam = "inet6 (v6)", "inet (v4)"
+							names := strings.Join(dirNames[dir], " ")
+							var msg string
+							if except {
+								// Single-family `except` list: the arm for the family
+								// the list does NOT cover evaluates `except` over an
+								// empty set = MATCH ALL — an over-block on `then
+								// discard`, a fail-OPEN over-accept on `then accept`.
+								// This is the OPPOSITE of an under-block, so it needs
+								// its own message (#4426, coordinator review).
+								haveFam, overFam := "inet (v4)", "inet6 (v6)"
+								if fam.hasV6 {
+									haveFam, overFam = "inet6 (v6)", "inet (v4)"
+								}
+								msg = fmt.Sprintf(
+									"firewall filter %q term %q: `from %s %s except` references only %s prefixes under `family any` — a family any filter compiles into BOTH the inet (v4) and inet6 (v6) pools (#4287), and an `except` over a prefix set with no %s entries matches EVERY %s packet (an over-block on `then discard`, a fail-open over-accept on `then accept`); use `family inet` / `family inet6`, or an except prefix-list covering both families (#4426)",
+									filterInst.name, termInst.name, keyword, names, haveFam, overFam, overFam)
+							} else {
+								// Single-family POSITIVE list: the arm for the missing
+								// family has no matching prefixes → matches nothing →
+								// falls through to the implicit ACCEPT (silent
+								// under-block).
+								haveFam, missFam := "inet (v4)", "inet6 (v6)"
+								if fam.hasV6 {
+									haveFam, missFam = "inet6 (v6)", "inet (v4)"
+								}
+								msg = fmt.Sprintf(
+									"firewall filter %q term %q: `from %s %s` references only %s prefixes under `family any` — a family any filter compiles into BOTH the inet (v4) and inet6 (v6) pools (#4287), so the %s arm has no matching prefixes and silently under-blocks that family; use `family inet` / `family inet6`, or a prefix-list covering both families (#4426)",
+									filterInst.name, termInst.name, keyword, names, haveFam, missFam)
 							}
-							msg := fmt.Sprintf(
-								"firewall filter %q term %q: `from %s %s` references only %s prefixes under `family any` — a family any filter compiles into BOTH the inet (v4) and inet6 (v6) pools (#4287), so the %s arm has no matching prefixes and silently under-blocks that family; use `family inet` / `family inet6`, or a prefix-list covering both families (#4426)",
-								filterInst.name, termInst.name, keyword,
-								strings.Join(dirNames[dir], " "), haveFam, missFam)
 							if !lenient {
 								return nil, fmt.Errorf("%s", msg)
 							}

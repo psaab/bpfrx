@@ -98,6 +98,170 @@ firewall {
 	}
 }
 
+// RED-on-revert (coordinator review): a SOLE `except` single-family list under
+// family any is a DIFFERENT failure from the positive case. The runtime
+// clean-except lowering (resolvePrefixListAddrs, #4338) treats `except` over a
+// prefix set with no v6 entries as MATCH-ALL for the v6 arm, so a v4-only
+// `except` OVER-blocks v6 (discards every v6 packet) — never "under-blocks / no
+// matching prefixes". The reject is kept (a real commit-time surprise), but the
+// message must describe the OVER-match, not an under-block.
+func TestFirewallFilterFamilyAnyExceptV4OnlyOverMatch(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list mgmt-v4 {
+        10.0.0.0/8;
+    }
+}
+firewall {
+    family any {
+        filter lockdown {
+            term t {
+                from {
+                    source-prefix-list {
+                        mgmt-v4 except;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of a v4-only except prefix-list under family any, got nil")
+	}
+	e := err.Error()
+	if !strings.Contains(e, "lockdown") || !strings.Contains(e, "#4426") ||
+		!strings.Contains(e, "except") || !strings.Contains(e, "mgmt-v4") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+	// Must describe the OVER-match of the v6 arm, NOT an under-block.
+	if !strings.Contains(e, "matches EVERY inet6 (v6)") {
+		t.Fatalf("except message must describe the v6 over-match: %v", err)
+	}
+	if strings.Contains(e, "under-block") || strings.Contains(e, "no matching prefixes") {
+		t.Fatalf("except message must NOT claim an under-block (factually inverted): %v", err)
+	}
+}
+
+// The except+accept fail-open specifically: `from source-prefix-list mgmt-v4
+// except; then accept` under family any → the v6 arm accepts EVERY v6 packet (a
+// security fail-OPEN). The gate must catch it and describe the over-accept.
+func TestFirewallFilterFamilyAnyExceptAcceptFailOpenCaught(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list mgmt-v4 {
+        10.0.0.0/8;
+    }
+}
+firewall {
+    family any {
+        filter permitMgmt {
+            term t {
+                from {
+                    source-prefix-list {
+                        mgmt-v4 except;
+                    }
+                }
+                then {
+                    accept;
+                }
+            }
+        }
+    }
+}
+`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: except+accept fail-open under family any must be rejected, got nil")
+	}
+	e := err.Error()
+	if !strings.Contains(e, "permitMgmt") || !strings.Contains(e, "#4426") ||
+		!strings.Contains(e, "matches EVERY inet6 (v6)") || !strings.Contains(e, "over-accept") {
+		t.Fatalf("except+accept message must describe the v6 over-accept fail-open: %v", err)
+	}
+}
+
+// The positive case must STILL produce the under-block message (regression guard
+// that the except branch did not change the positive wording).
+func TestFirewallFilterFamilyAnyPositiveKeepsUnderBlockMessage(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list v4-blocks {
+        10.0.0.0/8;
+    }
+}
+firewall {
+    family any {
+        filter blockNet {
+            term t {
+                from {
+                    source-prefix-list {
+                        v4-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of a positive v4-only prefix-list, got nil")
+	}
+	e := err.Error()
+	if !strings.Contains(e, "under-blocks") || !strings.Contains(e, "no matching prefixes") {
+		t.Fatalf("positive message must keep the under-block wording: %v", err)
+	}
+	if strings.Contains(e, "matches EVERY") {
+		t.Fatalf("positive message must NOT use the over-match wording: %v", err)
+	}
+}
+
+// A MIXED-family `except` list under family any is symmetric (each arm excludes
+// its own family's prefixes and matches the rest) — must NOT be flagged.
+func TestFirewallFilterFamilyAnyExceptMixedCommits(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list dual {
+        10.0.0.0/8;
+        2001:db8::/32;
+    }
+}
+firewall {
+    family any {
+        filter lockdown {
+            term t {
+                from {
+                    source-prefix-list {
+                        dual except;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: a mixed-family except list under family any must commit, got: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#4426") {
+			t.Fatalf("unexpected #4426 warning on a mixed-family except config: %q", w)
+		}
+	}
+}
+
 // A MIXED-family prefix-list (v4 AND v6 prefixes in one list) under family any
 // is legitimate — both arms have matching prefixes — and must NOT be flagged.
 func TestFirewallFilterFamilyAnyMixedPrefixListCommits(t *testing.T) {
