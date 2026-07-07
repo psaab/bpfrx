@@ -38167,3 +38167,57 @@ top.
 - **File(s)**: pkg/ipmon/ipmon.go, pkg/ipmon/ipmon_test.go, pkg/ipmon/README.md,
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
   pkg/api/server.go, pkg/daemon/daemon_run.go, docs/multi-wan.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 routing sub-items (M3 / L2 / L3 / L6) — verify-first triage
+  (final #4423 subsystem sweep). PR: `fix/4423-routing`. GO-only, no cargo. The
+  four "routing" findings turned out to live in the userspace forwarding
+  pipeline (`pkg/dataplane/userspace/routes.go` Go builder + the Rust FIB
+  `userspace-dp/src/afxdp/forwarding_build/fib.rs` / `forwarding/mod.rs`), NOT
+  in `pkg/routing`. Dispositions:
+  - **M3 (static next-hop gateway inference is global, not table-scoped) —
+    GENUINE, DEFERRED to a Rust/cargo slice.** `resolve_route_next_hops_v4/_v6`
+    infer a bare-gateway static route's egress ifindex via
+    `infer_connected_route_target_v4/_v6`, which scans `state.connected_v4`
+    GLOBALLY and never filters by the route's own table — although every
+    `ConnectedRouteV4` already carries its owning `table` (added by #2388 for
+    the lookup-site filter). The wrong ifindex is baked into
+    `RouteEntryV4.next_hops` at build time and used verbatim at lookup
+    (`forwarding/mod.rs` static arm), so the #2388 lookup-time filter does NOT
+    correct it. In a multi-VRF setup with overlapping gateway subnets a static
+    route in instance A can egress on instance B's interface. Two `fib.rs` doc
+    comments contradict each other (`resolve_route_next_hops_v4` claims
+    "#2388 table-scoped"; `infer_connected_route_target_v4` says "intentionally
+    NOT table-scoped" — the code matches the latter). Turnkey fix recorded in
+    `docs/rib-group-route-leaking.md`: thread the canonical table into the
+    inference and filter `entry.table == table`, mirroring the lookup site; fix
+    the stale doc. It is a `userspace-dp` change requiring the serial cargo
+    build + `make test-failover`, so it is deferred out of this Go-only slice.
+  - **L2 (`canonical_route_table` silently rewrites cross-family names) —
+    NOT-A-BUG.** The helper only swaps the family suffix (`.inet.0` ↔
+    `.inet6.0`) and always PRESERVES the VRF prefix, so it can only normalize a
+    name into the same instance's correct family-specific table, never a wrong
+    VRF. Go already emits correct-family install tables
+    (`normalizeRouteSnapshotFamily`) and `next-table` targets are reduced to a
+    bare instance name (`parseNextTableInstance`) with no family to drift.
+    Locked by `TestNormalizeRouteSnapshotFamily_VRFPreserving_4423`.
+  - **L3 (link-local next-hop needs `%iface`) — NOT-A-BUG.** xpf is
+    Junos-syntax: `next-hop fe80::1 interface reth0.50` (internally encoded as
+    the `ip@interface` FIB spec). `%iface` (RFC 4007 zone-id) has no producer or
+    consumer in the pipeline; `ValidateStaticNextHop` correctly rejects it at
+    commit. Locked by `TestStaticNextHop_ZoneIDPercentRejected_4423`.
+  - **L6 (overlay cannot express an ECMP preferred route) — DEFER (feature).**
+    `applyRouteOverlay` deliberately does whole-entry replacement with a single
+    next-hop — the correct #1827 WAN-failover semantics, pinned by the existing
+    `TestRouteOverlayWholeEntryReplacement`. ECMP preferred routes would be a new
+    feature (RouteOverlayEntry.NextHop → list + config schema + ipmon
+    winner-resolution); recorded plan in `docs/rib-group-route-leaking.md`.
+  - Validation: `go test ./pkg/config/ ./pkg/dataplane/userspace/` green
+    (new lock-in tests + surrounding suites); `go build ./...`; gofmt/vet clean
+    on touched files. No Go code fix was warranted (M3 is Rust/deferred; L2/L3
+    not-a-bug; L6 deferred feature) — this slice delivers the verify-first
+    dispositions, two lock-in tests encoding the L2/L3 disproofs, and the
+    turnkey M3 plan.
+- **File(s)**: pkg/config/schema_validate_route_2448_test.go,
+  pkg/dataplane/userspace/routes_family_normalize_4423_test.go,
+  docs/rib-group-route-leaking.md, _Log.md
