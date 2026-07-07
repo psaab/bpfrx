@@ -74,6 +74,24 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
         },
         allow_replace_local,
     ) {
+        // #4388: reserve the synced session's translated NAT pool port in this
+        // node's LOCAL source-NAT allocator. The standby imports the active
+        // node's pre-computed NAT decision but never runs `allocate_translation`,
+        // so without this its allocator does not know `(pool_addr, port)` is in
+        // use — post-failover a new local flow could reuse it, colliding two
+        // sessions on one NAT source tuple. Only forward, peer-synced entries
+        // reserve (a reverse entry carries the destination rewrite, not the
+        // pool source port; a local-origin entry already allocated its port on
+        // the active path). The reservation is freed by the standard teardown
+        // (`release_source_nat_allocation`) on reap or delete-sync.
+        if entry.origin.is_peer_synced() && !metadata.is_reverse {
+            reserve_synced_source_nat_allocation(
+                &forwarding.source_nat_rules,
+                &key,
+                entry.decision.nat,
+                metadata.is_reverse,
+            );
+        }
         publish_worker_session_map_entry(
             session_map_fd,
             forwarding,

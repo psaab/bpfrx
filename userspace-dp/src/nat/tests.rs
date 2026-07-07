@@ -5,7 +5,7 @@
 
 use super::allocator::{
     ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
-    sticky_pool_index,
+    TranslatedTuple, sticky_pool_index,
 };
 use super::source::{PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFlowKey};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
@@ -8459,4 +8459,227 @@ fn nat_counter_clear_zeroes_when_uncontended_3830() {
     let after = counter.snapshot(42);
     assert_eq!(after.packets, 0, "clear zeroes packets when uncontended");
     assert_eq!(after.bytes, 0, "clear zeroes bytes when uncontended");
+}
+
+// #4388 FAIL-ON-REVERT: a peer-synced session's translated NAT pool port must
+// be RESERVED in the standby's LOCAL source-NAT allocator, so a post-failover
+// local allocation cannot hand the SAME (pool_addr, port) to a new flow — two
+// sessions colliding on one NAT source tuple (reply mis-delivery / session
+// hijack surface).
+//
+// The standby imports the active node's pre-computed NAT decision but never
+// calls `allocate_translation`, so before the fix its allocator had no record
+// that (pool_addr, port) was in use and a fresh local flow reused it. Reverting
+// `reserve_synced_source_nat_allocation` (or its call site at
+// `handle_upsert_synced`) makes the "new flow must NOT get the synced port"
+// assertion RED.
+#[test]
+fn synced_session_reserves_nat_pool_port_4388() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    // 2-port pool [10000, 10001] so a single sequential allocation spends the
+    // range and forces the post-release reuse through the recycled queue.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10001,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    // A peer-synced session the active node translated to (203.0.113.1, 10000).
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(pool_ip)),
+        rewrite_src_port: Some(10000),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false);
+
+    // The reservation is visible as an owned translated tuple.
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert!(
+            live.addr_index_by_translated
+                .contains_key(&TranslatedTuple {
+                    ip: IpAddr::V4(pool_ip),
+                    port: 10000,
+                }),
+            "synced NAT pool port must be reserved in the local allocator"
+        );
+    }
+
+    // A NEW local flow allocates from the same pool: it MUST skip the reserved
+    // 10000 and hand out 10001. On revert (no reservation) it returns 10000 —
+    // a collision with the still-active synced session.
+    let addrs = rules[0].pool_addresses_v4.clone();
+    let new_flow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.51".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40001,
+        dst_port: 443,
+    };
+    let translated = rules[0]
+        .pool_allocator
+        .allocate_translation(
+            new_flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+        )
+        .expect("the second pool port must be available");
+    assert_eq!(
+        translated.port, 10001,
+        "a post-failover local flow must NOT reuse the synced session's \
+         reserved port 10000 (#4388 collision)"
+    );
+
+    // Deleting the synced session releases the reservation (mirror of the
+    // standby teardown: `handle_delete_synced` / reap call
+    // `release_source_nat_allocation`).
+    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+    {
+        let live = rules[0].pool_allocator.debug_live();
+        assert!(
+            !live
+                .addr_index_by_translated
+                .contains_key(&TranslatedTuple {
+                    ip: IpAddr::V4(pool_ip),
+                    port: 10000,
+                }),
+            "releasing the synced session must free its reserved pool port"
+        );
+    }
+
+    // Prove reusability: with the sequential range spent (10001 taken above),
+    // the next allocation drains the recycled queue and reuses the freed 10000.
+    let reuse_flow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.52".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40002,
+        dst_port: 443,
+    };
+    let reused = rules[0]
+        .pool_allocator
+        .allocate_translation(
+            reuse_flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            3_000,
+        )
+        .expect("the freed port must be reusable after release");
+    assert_eq!(
+        reused.port, 10000,
+        "the released synced port must be reusable by a later local flow"
+    );
+}
+
+// #4388: a peer-synced session WITHOUT a source-NAT translation (no
+// rewrite_src / rewrite_src_port — plain forwarding, address-only, or `port
+// no-translation`) reserves nothing. The allocator stays empty and a new flow
+// gets the first pool port.
+#[test]
+fn synced_session_without_nat_reserves_nothing_4388() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10005,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    // No translation carried on the synced decision.
+    reserve_synced_source_nat_allocation(&rules, &synced_key, NatDecision::default(), false);
+
+    let live = rules[0].pool_allocator.debug_live();
+    assert!(
+        live.addr_index_by_translated.is_empty(),
+        "a synced session with no NAT translation must reserve nothing"
+    );
+}
+
+// #4388: if the synced pool address is not a member of ANY local pool (config
+// drift between HA nodes), the reserve is skipped gracefully — no panic,
+// nothing reserved on the wrong pool.
+#[test]
+fn synced_session_foreign_pool_addr_skips_reserve_4388() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10005,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    // 198.51.100.9 is NOT in the local pool (config drift).
+    let foreign_nat = NatDecision {
+        rewrite_src: Some("198.51.100.9".parse().unwrap()),
+        rewrite_src_port: Some(10000),
+        ..NatDecision::default()
+    };
+    reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false);
+
+    let live = rules[0].pool_allocator.debug_live();
+    assert!(
+        live.addr_index_by_translated.is_empty(),
+        "a synced pool address not in any local pool must not reserve anything"
+    );
+}
+
+// #4388: a peer-synced REVERSE entry carries the destination rewrite, not the
+// pool source port, and must reserve nothing (mirrors the is_reverse guard on
+// the release path). The forward entry alone owns the pool-port reservation.
+#[test]
+fn synced_reverse_entry_reserves_nothing_4388() {
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10005,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(pool_ip)),
+        rewrite_src_port: Some(10000),
+        ..NatDecision::default()
+    };
+    // is_reverse = true: the reserve is a no-op.
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true);
+
+    let live = rules[0].pool_allocator.debug_live();
+    assert!(
+        live.addr_index_by_translated.is_empty(),
+        "a reverse synced entry must not reserve a pool source port"
+    );
 }

@@ -316,6 +316,41 @@ follow-up.
 
 ## Userspace Session Integration
 
+### NAT Pool Port Reservation for Synced Sessions (#4388)
+
+When the helper installs a peer-synced session that carries a pool-mode
+source-NAT translation, it **reserves** the translated `(pool_addr, port)` in
+this node's LOCAL source-NAT allocator. The active node picks the pool port via
+`allocate_translation` and syncs the completed NAT decision over the fabric; the
+standby imports that pre-computed decision and never runs `allocate_translation`
+itself, so without an explicit reservation its allocator has no record that the
+port is in use. Post-failover the standby-turned-active would then hand the SAME
+`(pool_addr, port)` to a fresh local flow — two sessions colliding on one NAT
+source tuple (reply mis-delivery / a session-hijack surface).
+
+- **Reserve site:** `handle_upsert_synced`
+  (`afxdp/session_glue/commands/upsert_synced.rs`) calls
+  `reserve_synced_source_nat_allocation` (`nat/source.rs`) for every forward,
+  peer-synced entry that carries `rewrite_src` + `rewrite_src_port`. It resolves
+  the pool address to its allocator index and marks the port owned via
+  `PortAllocator::reserve_flow` (`nat/allocator.rs`) — the same
+  `owner_by_translated` / `addr_index_by_translated` / `live_by_flow` state a
+  normal allocation writes, keyed by the synced session's flow. The sequential
+  port cursor (`claim_free_port_locked`) then skips the reserved port, exactly
+  as it already skips a live local allocation (#3047 forward-probe).
+- **Release site:** the reservation uses the synced flow key, so the standard
+  teardown — `release_source_nat_allocation`, already called on GC reap
+  (`reap_expired_sessions`), on a peer delete-sync (`handle_delete_synced`), and
+  on DSCP-filter purge — frees it with no new delete path. A reverse synced
+  entry, an address-only / `port no-translation` decision, or a session with no
+  source NAT reserves nothing.
+- **Config-drift edge:** if the synced pool address is not a member of any local
+  pool (the two nodes' pool config diverged), the reserve is skipped gracefully
+  — never a panic, never a reservation on the wrong pool.
+- **Idempotent:** re-reserving the same synced flow on a refresh is a no-op; the
+  allocator is process-global (`Arc<PortAllocatorShared>`), so the reservation
+  is visible to every worker regardless of which one imported the session.
+
 ### Event Stream (Primary Path)
 
 The Rust helper pushes session events over a persistent binary-framed Unix

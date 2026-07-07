@@ -1,3 +1,45 @@
+## 2026-07-06 — #4388: reserve a peer-synced session's NAT pool port on the standby
+
+- **Timestamp**: 2026-07-06
+- **Action**: A peer-synced session installed on the HA standby did NOT reserve
+  its pool-mode source-NAT translated port in the standby's LOCAL allocator. The
+  active node allocates the pool port (`allocate_translation`) and syncs the
+  finished NAT decision; the standby imports the decision but never calls
+  `allocate_translation`, so its allocator had no record the `(pool_addr, port)`
+  was in use. Post-failover a fresh local flow could reuse that exact
+  `(pool_addr, port)` — two sessions colliding on one NAT source tuple (reply
+  mis-delivery / session-hijack surface). Fix: added
+  `PortAllocator::reserve_flow` (`nat/allocator.rs`) which marks a specific
+  `(ip, port)` owned for a flow WITHOUT running the round-robin cursor, storing
+  the same `owner_by_translated` / `addr_index_by_translated` / `live_by_flow`
+  state a normal allocation writes; and `reserve_synced_source_nat_allocation`
+  (`nat/source.rs`) which mirrors `release_source_nat_allocation`'s flow-key /
+  translated-tuple construction so the EXISTING teardown
+  (`release_source_nat_allocation` on reap / delete-sync / purge) frees it with
+  the same key — no new delete path. Reserve is called from `handle_upsert_synced`
+  (forward, peer-synced entries with a translated source port only); the delete
+  release was wired into `handle_delete_synced` (added a `forwarding` param).
+  Config-drift edge (synced pool addr not in any local pool) is skipped
+  gracefully; reverse entries / no-NAT / address-only reserve nothing;
+  idempotent on refresh (allocator is process-global via Arc). The #3122
+  origin-agnostic session-count invariant is untouched (no `install.rs` change).
+  RED-on-revert Rust tests: a synced session reserves its port so a new local
+  allocation skips it (returns 10001 not the reserved 10000); delete releases it
+  (reusable); no-NAT / foreign-pool / reverse reserve nothing. Full cargo serial:
+  nat:: + session:: subset pass; overall 3633 + 54 + 8 + 22 + 1 passed / 0
+  failed, 2 ignored. RUST (userspace-dp) — cargo. HA post-failover NAT-pool
+  collision — parent runs `make test-failover` (a NAT-pool session synced across
+  failover, then a new session must NOT reuse the synced port) before merge.
+  Composes with #4393 (dnat_table sync) as the same synced-install-incompleteness
+  class.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/commands/delete_synced.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  docs/session-sync-architecture.md, _Log.md
+
 ## 2026-07-06 — #4378: confirm pending commit-confirmed on RG0 demotion
 
 - **Timestamp**: 2026-07-06

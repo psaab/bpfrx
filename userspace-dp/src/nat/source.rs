@@ -727,6 +727,78 @@ fn release_source_nat_allocation_with_mode(
     }
 }
 
+/// #4388: reserve a peer-synced session's translated pool port in THIS node's
+/// local source-NAT allocator so a post-failover local allocation cannot hand
+/// the same `(pool_addr, port)` to a new flow (NAT source collision / session
+/// hijack surface).
+///
+/// The standby imports the active node's pre-computed NAT decision but never
+/// calls `allocate_translation`, so its allocator has no record that
+/// `(pool_addr, port)` is in use. Mirror `release_source_nat_allocation`'s
+/// flow-key / translated-tuple construction EXACTLY so the same-key
+/// `release_flow` / `rollback_flow` on the standard teardown path
+/// (`release_source_nat_allocation`, already called for every reaped or
+/// delete-synced session) frees the reservation — no new delete site.
+///
+/// A synced session WITHOUT a translated source port (no source NAT, or
+/// address-only / `port no-translation`) reserves nothing. If the synced pool
+/// address is not a member of ANY local pool (config drift between nodes), the
+/// reserve is skipped gracefully — it never panics and never fabricates a
+/// reservation on the wrong pool.
+pub(crate) fn reserve_synced_source_nat_allocation(
+    rules: &[SourceNatRule],
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+) {
+    if is_reverse {
+        return;
+    }
+    let Some(rewrite_src) = nat.rewrite_src else {
+        return;
+    };
+    let Some(rewrite_src_port) = nat.rewrite_src_port else {
+        return;
+    };
+    let translated = TranslatedTuple {
+        ip: rewrite_src,
+        port: rewrite_src_port,
+    };
+    let flow = SourceNatFlowKey {
+        protocol: key.protocol,
+        src_ip: key.src_ip,
+        dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
+        src_port: key.src_port,
+        dst_port: key.dst_port,
+    };
+    for rule in rules {
+        if !rule.pool_mode {
+            continue;
+        }
+        // The absolute allocator address index mirrors the allocation path:
+        // v4 addresses occupy `[0, len_v4)`, v6 addresses follow at
+        // `[len_v4, len_v4 + len_v6)` (see `address_index` / the v6_offset in
+        // `match_source_nat_result_for_tuple`).
+        let addr_index = match rewrite_src {
+            IpAddr::V4(v4) => rule.pool_addresses_v4.iter().position(|a| *a == v4),
+            IpAddr::V6(v6) => rule
+                .pool_addresses_v6
+                .iter()
+                .position(|a| *a == v6)
+                .map(|i| rule.pool_addresses_v4.len() + i),
+        };
+        let Some(addr_index) = addr_index else {
+            continue;
+        };
+        if rule
+            .pool_allocator
+            .reserve_flow(flow, translated, addr_index)
+        {
+            break;
+        }
+    }
+}
+
 pub(crate) fn match_source_nat(
     rules: &[SourceNatRule],
     scope: &NatScopeCtx,

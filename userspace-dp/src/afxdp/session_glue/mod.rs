@@ -693,7 +693,7 @@ pub(super) fn apply_worker_commands(
                 let _ = installed;
             }
             WorkerCommand::DeleteSynced(key) => {
-                commands::handle_delete_synced(sessions, session_map_fd, key, now_ns);
+                commands::handle_delete_synced(sessions, session_map_fd, forwarding, key, now_ns);
             }
             WorkerCommand::EnqueueShapedLocal(req) => {
                 // Trivial variant — kept inline (#1346 plan v2 §4.1).

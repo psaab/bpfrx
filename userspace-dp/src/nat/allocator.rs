@@ -696,6 +696,75 @@ impl PortAllocator {
         true
     }
 
+    /// #4388: reserve a SPECIFIC translated `(ip, port)` for `flow` WITHOUT
+    /// running the round-robin allocator, so a peer-synced session's NAT pool
+    /// port is marked allocated in this node's LOCAL allocator. Without this,
+    /// the standby never learns that the active node handed `(pool_ip, port)`
+    /// to a synced session (the standby imports the pre-computed NAT decision;
+    /// it never calls `allocate_translation`), so post-failover a fresh local
+    /// flow could `allocate_translation` the SAME `(pool_ip, port)` — two
+    /// sessions colliding on one NAT source tuple (reply mis-delivery / session
+    /// hijack surface).
+    ///
+    /// The reservation is stored EXACTLY like a normal allocation
+    /// (`owner_by_translated` + `addr_index_by_translated` + `live_by_flow`)
+    /// using the synced session's flow key, so:
+    ///   - `claim_free_port_locked` skips the port when the sequential cursor
+    ///     later reaches it (the #3047 forward-probe), and
+    ///   - the EXISTING teardown path (`release_flow` / `rollback_flow` via
+    ///     `release_source_nat_allocation`, already called for every reaped or
+    ///     delete-synced session) frees it with the SAME flow key — no new
+    ///     release site is needed.
+    ///
+    /// Idempotent: re-reserving the same `(flow, translated)` (a synced-session
+    /// refresh) is a no-op that returns `true`. Returns `false` and leaves the
+    /// incumbent untouched if the port is already owned by a DIFFERENT live
+    /// allocation (a local flow raced ahead of the sync on the standby) — the
+    /// caller then tries the next pool rule.
+    pub(super) fn reserve_flow(
+        &self,
+        flow: SourceNatFlowKey,
+        translated: TranslatedTuple,
+        addr_index: usize,
+    ) -> bool {
+        if addr_index >= self.shared.counters.len() {
+            return false;
+        }
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        // A refresh of the same synced flow: if it already holds this exact
+        // translated tuple, it is reserved — nothing to do. If the tuple
+        // changed (should not happen on a stable sync), drop the stale
+        // reservation first so we do not leak the old port's owner slot.
+        if let Some(existing) = live.live_by_flow.get(&flow).copied() {
+            if existing.translated == translated {
+                return true;
+            }
+            live.live_by_flow.remove(&flow);
+            self.release_translated_locked(&mut live, existing.translated);
+        }
+        // Never steal a port owned by a DIFFERENT live allocation. The synced
+        // decision is authoritative on the wire, but on a healthy standby the
+        // owning RG is passive so no local flow should hold the port; if one
+        // does, leaving the incumbent (and skipping the reserve) is the safe
+        // choice — the caller falls through to the next rule.
+        if let Some(owner) = live.owner_by_translated.get(&translated)
+            && *owner != AllocationOwner::Flow(flow)
+        {
+            return false;
+        }
+        live.owner_by_translated
+            .insert(translated, AllocationOwner::Flow(flow));
+        live.addr_index_by_translated.insert(translated, addr_index);
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated,
+                persistent_key: None,
+            },
+        );
+        true
+    }
+
     pub(super) fn snapshot(&self) -> PortAllocatorSnapshot {
         let live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
         PortAllocatorSnapshot {
