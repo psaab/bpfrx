@@ -7354,6 +7354,44 @@ fn disposition_counters_hot_screen_drops_accumulate_in_batch() {
     );
 }
 
+// #4477: source-NAT allocation failures accumulate in the per-poll batch, flush
+// into the live atomic, and surface through snapshot() so the Go control plane
+// can bridge them into GlobalCtrNATAllocFail / GlobalCtrDrops. FAIL-ON-REVERT:
+// dropping the nat_alloc_fail flush block (or the snapshot field) leaves the
+// live atomic / snapshot at 0 and the dead-counter observability lie returns.
+#[test]
+fn nat_alloc_fail_flushes_and_snapshots() {
+    let live = BindingLiveState::new();
+    let mut counters = BatchCounters::default();
+
+    for _ in 0..4 {
+        counters.touched = true;
+        counters.nat_alloc_fail += 1;
+    }
+    assert_eq!(counters.nat_alloc_fail, 4);
+    assert_eq!(
+        live.nat_alloc_fail.load(Ordering::Relaxed),
+        0,
+        "live must be 0 before flush"
+    );
+
+    counters.flush(&live);
+    assert_eq!(counters.nat_alloc_fail, 0, "batch must clear after flush");
+    assert_eq!(
+        live.nat_alloc_fail.load(Ordering::Relaxed),
+        4,
+        "live must receive the count after flush"
+    );
+
+    // snapshot() must surface the live value so refresh_bindings can copy it
+    // onto the wire BindingStatus.
+    assert_eq!(
+        live.snapshot().nat_alloc_fail,
+        4,
+        "snapshot must surface nat_alloc_fail for the wire bridge"
+    );
+}
+
 // #3343: record_screen_drop bumps BOTH the aggregate and the matching
 // per-reason ordinal, and the per-reason slots flush element-wise into the
 // live atomics + snapshot. FAIL-ON-REVERT: dropping the per-reason bump in

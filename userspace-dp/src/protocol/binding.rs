@@ -512,6 +512,14 @@ pub(crate) struct BindingStatus {
     // keeps the same cross-version wire safety as nat64_translations above.
     #[serde(rename = "nat64_no_source_pool", default)]
     pub nat64_no_source_pool: u64,
+    /// #4477: source-NAT allocation failures (rule matched, no translated
+    /// mapping could be allocated → packet dropped). `default` keeps the same
+    /// cross-version wire safety as the siblings above (an older helper omits it
+    /// and Go/Rust read 0). The Go control plane bridges this into the
+    /// `GlobalCtrNATAllocFail` global counter (`NAT allocation failures`) and,
+    /// with the other enforcement drops, into `GlobalCtrDrops`.
+    #[serde(rename = "nat_alloc_fail", default)]
+    pub nat_alloc_fail: u64,
     #[serde(rename = "slow_path_packets", default)]
     pub slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]

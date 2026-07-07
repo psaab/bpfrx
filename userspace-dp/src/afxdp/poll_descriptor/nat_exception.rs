@@ -105,6 +105,11 @@ pub(super) fn record_source_nat_failure(
 ) {
     telemetry.counters.touched = true;
     telemetry.counters.exception_packets += 1;
+    // #4477: this is the single source-NAT allocation-failure chokepoint (every
+    // `SourceNatLookup::Unavailable` funnels here). Tally it so the dead
+    // `GlobalCtrNATAllocFail` counter surfaced by `show security flow
+    // statistics`, REST, Prometheus, and the CLI reports a real, non-zero value.
+    telemetry.counters.nat_alloc_fail += 1;
     let mut debug = ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow);
     debug.from_zone = Some(from_zone_id);
     debug.to_zone = Some(to_zone_id);

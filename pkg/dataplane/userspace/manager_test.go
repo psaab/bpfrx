@@ -5946,6 +5946,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SNATPackets:         20,
 				DNATPackets:         15,
 				Nat64Translations:   9,
+				NatAllocFail:        8,
 			},
 			{
 				RXPackets:                200,
@@ -5964,6 +5965,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SNATPackets:              40,
 				DNATPackets:              30,
 				Nat64Translations:        21,
+				NatAllocFail:             16,
 			},
 		},
 	}
@@ -6017,6 +6019,18 @@ func TestSumBindingCounters(t *testing.T) {
 	// snat/dnat and pushed into GlobalCtrNAT64Xlate by syncBPFCountersLocked.
 	if s.nat64Translations != 30 {
 		t.Fatalf("nat64Translations = %d, want 30", s.nat64Translations)
+	}
+	// #4477: source-NAT allocation failures aggregate across bindings and are
+	// pushed into GlobalCtrNATAllocFail by syncBPFCountersLocked. RED if the
+	// `s.natAllocFail += b.NatAllocFail` line is reverted.
+	if s.natAllocFail != 24 {
+		t.Fatalf("natAllocFail = %d, want 24", s.natAllocFail)
+	}
+	// #4477: totalDrops() is the aggregate "Packets dropped" figure pushed into
+	// GlobalCtrDrops: policyDenied(10) + screenDrops(6) + hostInboundDenied(20) +
+	// natAllocFail(24) = 60.
+	if s.totalDrops() != 60 {
+		t.Fatalf("totalDrops() = %d, want 60", s.totalDrops())
 	}
 	// #3343: per-reason screen drops sum element-wise across bindings. RED if
 	// the `s.screenReasonDrops[i] += b.ScreenReasonDrops[i]` loop is reverted
@@ -6080,6 +6094,74 @@ func TestSyncBPFCountersPushesPerScreenReason(t *testing.T) {
 	// push (the helper bumps the aggregate separately via b.ScreenDrops).
 	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrScreenDrops); got != 0 {
 		t.Fatalf("aggregate GlobalCtrScreenDrops = %d, want 0 (per-reason push must not touch it)", got)
+	}
+}
+
+// TestSyncBPFCountersPushesDropAndNATAllocFail is the #4477 fail-on-revert
+// guard: the userspace helper reports source-NAT allocation failures in
+// BindingStatus.NatAllocFail, and syncBPFCountersLocked must push their delta
+// into dataplane.GlobalCtrNATAllocFail AND fold them (with policy deny + screen
+// + host-inbound deny) into the aggregate dataplane.GlobalCtrDrops. Before
+// #4477 neither index was ever written, so `show security flow statistics`
+// ("Packets dropped" / "NAT allocation failures"), REST, Prometheus, and the
+// CLI printed a permanent, false 0. Reverting either delta drops the counter
+// back to 0 and fails the ReadUserspaceCounterOffset assertions below.
+func TestSyncBPFCountersPushesDropAndNATAllocFail(t *testing.T) {
+	m := New()
+	status := &ProcessStatus{
+		Bindings: []BindingStatus{
+			{
+				Slot:                     0,
+				PolicyDeniedPackets:      3,
+				ScreenDrops:              2,
+				HostInboundDeniedPackets: 6,
+				NatAllocFail:             8,
+			},
+			{
+				Slot:                     1,
+				PolicyDeniedPackets:      7,
+				ScreenDrops:              4,
+				HostInboundDeniedPackets: 14,
+				NatAllocFail:             16,
+			},
+		},
+	}
+
+	m.mu.Lock()
+	m.syncBPFCountersLocked(status)
+	m.mu.Unlock()
+
+	// GlobalCtrNATAllocFail = sum of NatAllocFail across bindings (8 + 16 = 24).
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrNATAllocFail); got != 24 {
+		t.Fatalf("GlobalCtrNATAllocFail = %d, want 24 (NAT-alloc-fail bridge reverted?)", got)
+	}
+	// GlobalCtrDrops = policyDeny(10) + screen(6) + host-inbound(20) + NAT-alloc(24) = 60.
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrDrops); got != 60 {
+		t.Fatalf("GlobalCtrDrops = %d, want 60 (aggregate-drops bridge reverted?)", got)
+	}
+
+	// A second poll with the same cumulative totals produces a zero delta, so
+	// the counters must stay put (no double count).
+	m.mu.Lock()
+	m.syncBPFCountersLocked(status)
+	m.mu.Unlock()
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrNATAllocFail); got != 24 {
+		t.Fatalf("GlobalCtrNATAllocFail after idempotent re-poll = %d, want 24", got)
+	}
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrDrops); got != 60 {
+		t.Fatalf("GlobalCtrDrops after idempotent re-poll = %d, want 60", got)
+	}
+
+	// A subsequent poll with higher cumulative totals advances by the delta.
+	status.Bindings[0].NatAllocFail = 18 // +10 over the prior 8
+	m.mu.Lock()
+	m.syncBPFCountersLocked(status)
+	m.mu.Unlock()
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrNATAllocFail); got != 34 {
+		t.Fatalf("GlobalCtrNATAllocFail after +10 = %d, want 34", got)
+	}
+	if got := m.bpfShim.ReadUserspaceCounterOffset(dataplane.GlobalCtrDrops); got != 70 {
+		t.Fatalf("GlobalCtrDrops after +10 = %d, want 70", got)
 	}
 }
 

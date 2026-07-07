@@ -39592,3 +39592,57 @@ top.
 - **File(s)**: userspace-dp/src/screen/syn_rate.rs,
   docs/syn-cookie-flood-protection.md, docs/userspace-dataplane-architecture.md,
   _Log.md
+## 2026-07-07 — #4477 (opus-172 H-4): bridge dead Packets-dropped / NAT-alloc-fail flow-stat counters
+
+- **Timestamp**: 2026-07-07T16:40Z
+- **Action**: `show security flow statistics` "Packets dropped"
+  (`GlobalCtrDrops`, idx 2) and "NAT allocation failures"
+  (`GlobalCtrNATAllocFail`, idx 7) were dead counters — the userspace
+  counter bridge `syncBPFCountersLocked` never wrote either index, so
+  `ReadGlobalCounter` returned a clean `(0, nil)` (the #3345
+  `ErrCounterNotPopulated` disclosure never fired) and the CLI, gRPC,
+  REST (`drops` / `nat_alloc_fails`), and Prometheus (`xpf_drops_total` /
+  `xpf_nat_alloc_fails_total`) surfaces printed a false, always-0 value —
+  security telemetry blind during an attack (observability lie). Fix is
+  MIXED (Rust exposes the count + Go bridges it): the Rust helper now
+  tallies each source-NAT allocation failure at the single
+  `record_source_nat_failure` chokepoint (every `SourceNatLookup::
+  Unavailable` funnels there — missing/empty/invalid/exhausted pool,
+  wrong family, non-first fragment on a port-translating rule; the packet
+  is dropped) into a new per-worker batch counter `nat_alloc_fail`,
+  flushed to `BindingLiveState.nat_alloc_fail`, snapshotted, copied onto
+  the wire `BindingStatus.nat_alloc_fail` (new serde field
+  `#[serde(rename="nat_alloc_fail", default)]`, Go `omitempty`). The Go
+  manager sums it across bindings and pushes the per-poll delta into
+  `GlobalCtrNATAllocFail`, and folds it — with policy denies, screen
+  drops, and host-inbound denies — into the aggregate "Packets dropped"
+  figure (`userspaceCounterSnapshot.totalDrops()`) pushed into
+  `GlobalCtrDrops` (a total whose breakdown is exactly the four rows
+  rendered beneath it), mirroring the host-inbound/NAT64/per-screen-reason
+  plumbing. Once bridged the counters carry real values, so the #3345
+  disclosure correctly stays silent for them. Wire fixture regenerated
+  (one new `nat_alloc_fail` key in `binding_status`); the
+  `wire_invariant_default_specimens` cross-language contract test passes.
+  RED-on-revert: Go `TestSyncBPFCountersPushesDropAndNATAllocFail`
+  (idx 2 → 60, idx 7 → 24; both snap to 0 if either delta is reverted) +
+  the extended `sumBindingCounters` sum/totalDrops asserts; Rust
+  `nat_alloc_fail_flushes_and_snapshots` (batch→flush→live→snapshot).
+  Validation: FULL cargo SERIAL green (3674 unit + 54+8+22+1 integration,
+  0 failed); `go test ./pkg/dataplane/... ./pkg/api/... ./pkg/grpcapi/...
+  ./pkg/cli/...` green. Dataplane counter change — a live smoke (a real
+  NAT-pool exhaustion / policy-deny flood shows a non-zero "Packets
+  dropped" / "NAT allocation failures") is a nice-to-have, not run here.
+- **File(s)**: userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/afxdp/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_test.go,
+  docs/junos-cli-reference.md, _Log.md

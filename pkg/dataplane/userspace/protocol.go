@@ -2462,7 +2462,18 @@ type BindingStatus struct {
 	// could be allocated (empty/exhausted pool), so the synthetic IPv6
 	// destination was dropped rather than route-looked-up as IPv6. omitempty +
 	// Rust serde `default` keep the same cross-version wire safety.
-	Nat64NoSourcePool              uint64 `json:"nat64_no_source_pool,omitempty"`
+	Nat64NoSourcePool uint64 `json:"nat64_no_source_pool,omitempty"`
+	// #4477: source-NAT allocation failures (a source-NAT rule matched but no
+	// translated mapping could be allocated — missing/empty/invalid/exhausted
+	// pool, wrong family, or a non-first fragment on a port-translating rule);
+	// the packet is dropped. Summed across bindings and pushed into
+	// dataplane.GlobalCtrNATAllocFail (and, with the other enforcement drops,
+	// GlobalCtrDrops) by syncBPFCountersLocked so `show security flow
+	// statistics` ("NAT allocation failures" / "Packets dropped"), REST
+	// (nat_alloc_fails / drops), and Prometheus (xpf_nat_alloc_fails_total /
+	// xpf_drops_total) stop reading a permanent 0. omitempty + the Rust serde
+	// `default` keep cross-version wire safety (an older helper omits it → 0).
+	NatAllocFail                   uint64 `json:"nat_alloc_fail,omitempty"`
 	SlowPathPackets                uint64 `json:"slow_path_packets,omitempty"`
 	SlowPathBytes                  uint64 `json:"slow_path_bytes,omitempty"`
 	SlowPathLocalDeliveryPackets   uint64 `json:"slow_path_local_delivery_packets,omitempty"`
