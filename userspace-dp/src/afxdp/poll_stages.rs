@@ -178,6 +178,30 @@ pub(super) fn stage_link_layer_classify(
         && !worker_ctx.forwarding.owns_configured_ip(na.target_ip)
     {
         let ifindex = learn_ifindex();
+        // #4475 (opus-172 H-2): honor the RFC 4861 §7.2.5 Override (O)
+        // flag. An NA with Override=0 MUST NOT overwrite a cached neighbor
+        // entry that maps to a DIFFERENT link-layer address — that is the
+        // unsolicited-NA next-hop hijack primitive (a local attacker
+        // claiming the WAN gateway's IPv6 with its own MAC). A legitimate
+        // host announcing a link-layer-address change sets Override=1
+        // (§7.2.6), so this blocks the poison while preserving legit
+        // MAC-change propagation (#3048): an Override=0 NA is allowed only
+        // to create a FIRST-TIME entry (no cached MAC) or refresh the SAME
+        // LLA; a live differing LLA is left untouched (the NA frame still
+        // transits — we fall through to `Continue`). This reads the
+        // per-worker `dynamic_neighbors` snapshot and the `insert_if_changed`
+        // below re-locks the shard, so it is a best-effort gate; the worker
+        // is the sole data-path writer for this key, and the kernel STALE
+        // install (see `DATA_PATH_NEIGH_STATE`) is the second line of
+        // defense for any residual race.
+        if !na.override_flag
+            && worker_ctx
+                .dynamic_neighbors
+                .get(&(ifindex, na.target_ip))
+                .is_some_and(|existing| existing.mac != mac)
+        {
+            return StageOutcome::Continue(());
+        }
         // #3048: same change-detecting learn for NDP NA — a target-MAC
         // change observed on the data path must bump mac_change_epoch and
         // evict stale cached dst_macs (see the ARP-reply arm above).
@@ -1999,6 +2023,109 @@ mod tests {
             neighbors.get(&(24, good_target)).map(|e| e.mac),
             Some(good_mac),
             "a legitimate non-own NDP NA neighbor must still be learned"
+        );
+    }
+
+    /// Flip the RFC 4861 §4.4 Override (O) bit ON in an already-built NA
+    /// frame and re-stamp its ICMPv6 checksum (the strict parser rejects a
+    /// bad checksum). The flags byte sits at `l4_start + 4` = 58 for the
+    /// untagged `ndp_na_frame_with_target` layout (l3=14, l4=54).
+    fn set_na_override(frame: &mut [u8]) {
+        frame[58] |= 0x20;
+        super::super::test_fixtures::stamp_icmpv6_checksum(frame, 14, 54, 86);
+    }
+
+    /// #4475 fail-on-revert (NDP NA Override honoring). An NA with
+    /// Override=0 MUST NOT overwrite a cached neighbor entry that maps to a
+    /// DIFFERENT link-layer address — the unsolicited-NA next-hop hijack
+    /// primitive. An NA with Override=1 (a legitimate link-layer-address
+    /// change announcement per §7.2.6) still updates it. Reverting the
+    /// `!na.override_flag && existing-differing` skip in
+    /// `stage_link_layer_classify` lets the Override=0 NA overwrite the
+    /// live entry, failing the "unchanged" assert RED.
+    #[test]
+    fn ndp_na_override0_does_not_overwrite_live_differing_lla_4475() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+        let meta = link_layer_meta(24, 0);
+
+        // Default NA target fe80::abcd:ef01:0:42 (non-own, learnable),
+        // advertised LLA aa:bb:cc:dd:ee:ff.
+        let (frame_ov0, target, na_mac) = ndp_na_frame();
+        assert!(!forwarding.owns_configured_ip(target));
+
+        // Pre-seed a LIVE entry with a DIFFERENT MAC (a legitimately
+        // resolved gateway) — the entry a poison would try to hijack.
+        let live_mac = [0x02, 0x00, 0x00, 0x00, 0x0a, 0x0a];
+        assert_ne!(live_mac, na_mac);
+        neighbors.insert((24, target), NeighborEntry { mac: live_mac });
+
+        // 1) Override=0 (default) NA advertising a DIFFERENT MAC — must be
+        //    refused; the live entry is left untouched. The NA frame still
+        //    transits (Continue).
+        let outcome = stage_link_layer_classify(&frame_ov0, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::Continue(())));
+        assert_eq!(
+            neighbors.get(&(24, target)).map(|e| e.mac),
+            Some(live_mac),
+            "an Override=0 NA must NOT overwrite a live entry with a \
+             different LLA (#4475 next-hop hijack gate)"
+        );
+
+        // 2) Override=1 NA (legitimate §7.2.6 LLA-change announcement) —
+        //    must update the binding.
+        let mut frame_ov1 = frame_ov0.clone();
+        set_na_override(&mut frame_ov1);
+        assert!(
+            parser::parse_ndp_neighbor_advert(&frame_ov1)
+                .expect("override NA parses")
+                .override_flag,
+            "test frame must carry Override=1"
+        );
+        let outcome = stage_link_layer_classify(&frame_ov1, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::Continue(())));
+        assert_eq!(
+            neighbors.get(&(24, target)).map(|e| e.mac),
+            Some(na_mac),
+            "an Override=1 NA must update the binding (legit LLA change)"
+        );
+    }
+
+    /// #4475 companion: the Override honor must NOT break legitimate
+    /// resolution. An Override=0 NA for an ABSENT neighbor (no cached
+    /// entry) still creates it — the anti-hijack skip only fires when a
+    /// live entry with a DIFFERENT LLA already exists.
+    #[test]
+    fn ndp_na_override0_first_time_learn_still_creates_4475() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+        let meta = link_layer_meta(24, 0);
+
+        // A different non-own learnable target with no pre-seeded entry.
+        let target_bytes = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x43,
+        ];
+        let (frame, target, na_mac) = ndp_na_frame_with_target(target_bytes);
+        assert!(!forwarding.owns_configured_ip(target));
+        assert!(neighbors.get(&(24, target)).is_none());
+        assert!(
+            !parser::parse_ndp_neighbor_advert(&frame)
+                .expect("NA parses")
+                .override_flag,
+            "the base frame is Override=0"
+        );
+
+        let outcome = stage_link_layer_classify(&frame, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::Continue(())));
+        assert_eq!(
+            neighbors.get(&(24, target)).map(|e| e.mac),
+            Some(na_mac),
+            "a first-time Override=0 NA learn must still create the entry \
+             (#4475 gate must not over-reject legit resolution)"
         );
     }
 

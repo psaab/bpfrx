@@ -189,6 +189,48 @@ sync.
     the router actually owns. `local_v*` continues to drive the
     `LocalDelivery` to-self disposition unchanged — only the anti-poison
     predicate switched sets.
+  - **STALE install + NDP Override honor (`#4475`, opus-172 H-2, RFC 4861
+    §7.2.5):** the own-IP gate above only protects addresses the router
+    OWNS. Every OTHER same-segment next-hop — including the WAN gateway —
+    is still learnable from the data path, so an unsolicited advertisement
+    (gratuitous ARP reply / unsolicited NA claiming a live next-hop with
+    the attacker's MAC) is an on-link neighbor-cache poisoning / MITM
+    primitive. Two bounded gates shrink that blast radius:
+      - **Kernel entry is installed `NUD_STALE`, not `NUD_REACHABLE`**
+        (`neighbor.rs::DATA_PATH_NEIGH_STATE`, consumed by
+        `add_kernel_neighbor`). REACHABLE forced the kernel to trust the
+        learned binding for the full reachable-time window with NO
+        revalidation; STALE keeps the entry usable (STALE entries forward
+        immediately) but runs the kernel's normal neighbor-validation state
+        machine — a unicast PROBE / upper-layer reachability confirmation
+        must succeed before the entry is promoted to REACHABLE, and a
+        fire-and-forget poison ages out on its own. This matches Linux
+        `arp_accept=0` gratuitous-ARP handling (refresh to STALE, never
+        blind-promote) and PRESERVES #3048: a legitimate upstream
+        VRRP-failover MAC change observed on the wire still updates the
+        binding, just as STALE so the kernel confirms it.
+      - **NDP NA honors the Override (O) flag** (`parser.rs`
+        `NdpNeighborAdvert::override_flag` → the `stage_link_layer_classify`
+        NA arm). An NA with Override=0 is NOT allowed to overwrite a cached
+        entry that maps to a DIFFERENT link-layer address; it may only
+        create a first-time entry or refresh the same LLA. A legitimate
+        link-layer-address-change announcement sets Override=1 (§7.2.6), so
+        this blocks the Override=0 hijack subclass while preserving legit
+        MAC-change propagation. The check reads the per-worker
+        `dynamic_neighbors` snapshot (best-effort; the worker is the sole
+        data-path writer for the key) and the STALE install is the second
+        line of defense for any residual race.
+    ARP replies carry no Override bit, so the ARP arm relies on the STALE
+    install (kernel revalidation) rather than a no-overwrite gate — a
+    stricter no-overwrite would break gratuitous-ARP gateway failover
+    (#3048). **Solicited-only learning** — caching a reply/NA ONLY when it
+    answers a probe the router actually sent — is the stronger fix but
+    needs a shared pending-solicitation table plumbed from the neighbor
+    warmer (`neighbor.rs::neighbor_warmer_loop`'s `last_probed`, today
+    confined to the warmer thread and an incomplete record of kernel-driven
+    solicitations) into the per-worker learn path; it is DEFERRED as a
+    follow-up. STALE + the Override honor already remove the
+    forced-REACHABLE hijack window, which was the core of #4475.
 - `neighbor.rs` — netlink neighbor monitor (`neigh_monitor_thread`),
   startup dump (`initial_neighbor_dump` / `process_dump_batch`), the
   on-demand resolver glue, and `worker::pin_current_thread`. The monitor

@@ -265,6 +265,43 @@ fn parse_ndp_na_without_tlla() {
     assert!(r.target_mac.is_none());
 }
 
+/// #4475: the parser exposes the RFC 4861 §4.4 Override (O) flag (bit
+/// 0x20 of the flags byte at `l4_start + 4` = 58 in the untagged layout)
+/// so the learn site can honor §7.2.5. The default builder writes all-zero
+/// flags (Override=0); flipping the bit + re-stamping the checksum yields
+/// Override=1.
+#[test]
+fn parse_ndp_na_reports_override_flag() {
+    let f0 = build_eth_ndp_na(false, true);
+    assert!(
+        !parse_ndp_neighbor_advert(&f0)
+            .expect("NA parses")
+            .override_flag,
+        "default NA flags are zero → Override=0"
+    );
+
+    let mut f1 = build_eth_ndp_na(false, true);
+    f1[14 + 40 + 4] |= 0x20; // set the O bit in the flags byte
+    stamp_icmpv6_checksum(&mut f1, 14, 14 + 40, 14 + 40 + 32);
+    assert!(
+        parse_ndp_neighbor_advert(&f1)
+            .expect("override NA parses")
+            .override_flag,
+        "the O bit must be reported as Override=1"
+    );
+    // Setting only the Solicited (0x40) / Router (0x80) bits must NOT read
+    // as Override.
+    let mut f2 = build_eth_ndp_na(false, true);
+    f2[14 + 40 + 4] |= 0x40 | 0x80;
+    stamp_icmpv6_checksum(&mut f2, 14, 14 + 40, 14 + 40 + 32);
+    assert!(
+        !parse_ndp_neighbor_advert(&f2)
+            .expect("NA parses")
+            .override_flag,
+        "Solicited/Router bits must not be mistaken for Override"
+    );
+}
+
 #[test]
 fn parse_ndp_na_rejects_non_icmpv6_next_header() {
     let mut f = build_eth_ndp_na(false, true);

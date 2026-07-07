@@ -357,18 +357,64 @@ pub(super) fn neighbor_warmer_loop(
     }
 }
 
-/// Add a neighbor entry to the kernel's neighbor table via raw netlink.
-/// This ensures the kernel can forward IPv6 (and IPv4) traffic to hosts
-/// whose ARP/NDP replies were captured by XSK instead of reaching the kernel.
-pub(super) fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
-    // RTM_NEWNEIGH = 28, NLM_F_REQUEST=1, NLM_F_CREATE=0x400, NLM_F_REPLACE=0x100
-    const RTM_NEWNEIGH: u16 = 28;
-    const NLM_F_REQUEST: u16 = 1;
-    const NLM_F_CREATE: u16 = 0x400;
-    const NLM_F_REPLACE: u16 = 0x100;
-    const NDA_DST: u16 = 1;
-    const NDA_LLADDR: u16 = 2;
-    const NUD_REACHABLE: u16 = 0x02;
+// RTM_NEWNEIGH = 28, NLM_F_REQUEST=1, NLM_F_CREATE=0x400, NLM_F_REPLACE=0x100.
+pub(super) const RTM_NEWNEIGH: u16 = 28;
+pub(super) const NLM_F_REQUEST: u16 = 1;
+pub(super) const NLM_F_CREATE: u16 = 0x400;
+pub(super) const NLM_F_REPLACE: u16 = 0x100;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+/// NUD states (`include/uapi/linux/neighbour.h`).
+pub(super) const NUD_REACHABLE: u16 = 0x02;
+pub(super) const NUD_STALE: u16 = 0x04;
+
+/// NUD state installed for a DATA-PATH neighbor learn (an ARP reply /
+/// NDP NA captured by XSK, see `poll_stages::stage_link_layer_classify`).
+///
+/// #4475 (opus-172 H-2, security hardening): this MUST be `NUD_STALE`,
+/// NEVER `NUD_REACHABLE`. A data-path learn is driven by an UNSOLICITED
+/// advertisement from the L2 segment — we did not necessarily probe for
+/// it. Installing `NUD_REACHABLE` forced the kernel to trust the learned
+/// `(ifindex, ip) -> mac` binding for the full reachable-time window with
+/// NO revalidation, so a host emitting a gratuitous ARP reply / unsolicited
+/// NA claiming a live next-hop (e.g. the WAN gateway) could silently
+/// hijack transit + originated traffic to its own MAC (on-link neighbor-
+/// cache poisoning / MITM). Installing `NUD_STALE` instead keeps the entry
+/// USABLE (STALE entries forward immediately) but makes the kernel run its
+/// normal neighbor-validation state machine — it revalidates (unicast
+/// PROBE / upper-layer reachability confirmation) before treating the entry
+/// as REACHABLE, and a fire-and-forget poison ages out on its own. This
+/// also matches Linux `arp_accept=0` gratuitous-ARP handling (an existing
+/// entry is refreshed to STALE, not blindly promoted). It preserves #3048
+/// (a legitimate upstream VRRP-failover MAC change observed on the wire
+/// still updates the binding — just as STALE, so the kernel confirms it).
+///
+/// Learning ONLY solicited replies (probe-driven) is the stronger fix but
+/// needs a shared pending-solicitation table plumbed from the neighbor
+/// warmer into the per-worker learn path; it is tracked as a follow-up and
+/// is NOT required — STALE + the NDP Override honor already remove the
+/// forced-REACHABLE hijack window.
+pub(super) const DATA_PATH_NEIGH_STATE: u16 = NUD_STALE;
+
+/// Serialize an `RTM_NEWNEIGH` netlink request installing
+/// `(ifindex, ip) -> mac` with the given NUD `state`. Split out of
+/// `add_kernel_neighbor` (#4475) so the wire encoding — in particular the
+/// NUD state byte — is unit-testable without a privileged netlink socket.
+///
+/// `NLM_F_CREATE | NLM_F_REPLACE` semantics are unchanged: a data-path
+/// learn that survives the `stage_link_layer_classify` gates (own-IP,
+/// hop-limit, and the #4475 NDP Override honor) is a legitimate binding to
+/// (create-or-)refresh. The anti-hijack decision — refusing to overwrite a
+/// live entry that maps to a DIFFERENT LLA from an unsolicited NDP NA — is
+/// enforced UPSTREAM at the learn site (it skips this call entirely), not
+/// by dropping `NLM_F_REPLACE` here, because ARP replies and Override=1 NAs
+/// must still update the binding (to STALE) for #3048 failover propagation.
+pub(super) fn build_newneigh_request(
+    ifindex: i32,
+    ip: IpAddr,
+    mac: [u8; 6],
+    state: u16,
+) -> Vec<u8> {
     let (family, ip_bytes): (u8, Vec<u8>) = match ip {
         IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
         IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
@@ -390,7 +436,7 @@ pub(super) fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
     // ndmsg
     buf[16] = family;
     buf[20..24].copy_from_slice(&ifindex.to_ne_bytes());
-    buf[24..26].copy_from_slice(&NUD_REACHABLE.to_ne_bytes());
+    buf[24..26].copy_from_slice(&state.to_ne_bytes());
     // NDA_DST attribute
     let off = 16 + ndmsg_len;
     buf[off..off + 2].copy_from_slice(&(ip_attr_len as u16).to_ne_bytes());
@@ -401,6 +447,17 @@ pub(super) fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
     buf[off2..off2 + 2].copy_from_slice(&(mac_attr_len as u16).to_ne_bytes());
     buf[off2 + 2..off2 + 4].copy_from_slice(&NDA_LLADDR.to_ne_bytes());
     buf[off2 + 4..off2 + 10].copy_from_slice(&mac);
+    buf
+}
+
+/// Add a neighbor entry to the kernel's neighbor table via raw netlink.
+/// This ensures the kernel can forward IPv6 (and IPv4) traffic to hosts
+/// whose ARP/NDP replies were captured by XSK instead of reaching the kernel.
+///
+/// The entry is installed `NUD_STALE`, not `NUD_REACHABLE` (#4475) — see
+/// [`DATA_PATH_NEIGH_STATE`] for the anti-poisoning rationale.
+pub(super) fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
+    let buf = build_newneigh_request(ifindex, ip, mac, DATA_PATH_NEIGH_STATE);
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return;
@@ -417,6 +474,84 @@ pub(super) fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
             core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
         );
         libc::close(fd);
+    }
+}
+
+#[cfg(test)]
+mod newneigh_request_tests {
+    use super::{
+        build_newneigh_request, DATA_PATH_NEIGH_STATE, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
+        NUD_REACHABLE, NUD_STALE, RTM_NEWNEIGH,
+    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // ndmsg NUD state is at byte offset 24..26 of the RTM_NEWNEIGH buffer
+    // (nlmsghdr(16) + family(1) + pad(3) + ifindex(4) = 24).
+    fn state_of(buf: &[u8]) -> u16 {
+        u16::from_ne_bytes([buf[24], buf[25]])
+    }
+    fn nlmsg_flags_of(buf: &[u8]) -> u16 {
+        u16::from_ne_bytes([buf[6], buf[7]])
+    }
+
+    /// #4475 FAIL-ON-REVERT (the core of the hardening). A data-path
+    /// neighbor learn MUST install `NUD_STALE`, never `NUD_REACHABLE`, so
+    /// the kernel revalidates a learned `(ifindex, ip) -> mac` binding
+    /// instead of trusting an unsolicited ARP/NA for the full reachable-
+    /// time window (on-link neighbor-cache poisoning / MITM). Reverting
+    /// `DATA_PATH_NEIGH_STATE` to `NUD_REACHABLE` makes `state_of == 0x02`,
+    /// failing both asserts RED.
+    #[test]
+    fn data_path_learn_installs_stale_not_reachable_4475() {
+        assert_eq!(NUD_STALE, 0x04);
+        assert_eq!(NUD_REACHABLE, 0x02);
+        // The constant the data path actually passes to add_kernel_neighbor.
+        assert_eq!(
+            DATA_PATH_NEIGH_STATE, NUD_STALE,
+            "data-path neighbor learns must install NUD_STALE (#4475), not \
+             NUD_REACHABLE — the forced-reachable window is the poison"
+        );
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50)),
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0xabcd, 0xef01, 0, 0x42)),
+        ] {
+            let buf =
+                build_newneigh_request(24, ip, [0xde, 0xad, 0xbe, 0xef, 0x00, 0x18], DATA_PATH_NEIGH_STATE);
+            assert_eq!(
+                state_of(&buf),
+                NUD_STALE,
+                "the encoded ndmsg state for a data-path learn ({ip}) must be NUD_STALE"
+            );
+            assert_ne!(
+                state_of(&buf),
+                NUD_REACHABLE,
+                "a data-path learn ({ip}) must NOT install NUD_REACHABLE"
+            );
+            // The message stays a create-or-replace RTM_NEWNEIGH — only the
+            // NUD state changed (the anti-hijack no-overwrite decision is
+            // enforced upstream at the learn site, not by dropping REPLACE).
+            assert_eq!(u16::from_ne_bytes([buf[4], buf[5]]), RTM_NEWNEIGH);
+            assert_eq!(
+                nlmsg_flags_of(&buf),
+                NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE
+            );
+        }
+    }
+
+    /// The builder faithfully encodes whatever NUD state it is handed, so
+    /// the STALE guarantee above is a property of `DATA_PATH_NEIGH_STATE`,
+    /// not of a hard-coded builder constant.
+    #[test]
+    fn build_newneigh_request_encodes_requested_state() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(
+            state_of(&build_newneigh_request(3, ip, [1, 2, 3, 4, 5, 6], NUD_REACHABLE)),
+            NUD_REACHABLE
+        );
+        assert_eq!(
+            state_of(&build_newneigh_request(3, ip, [1, 2, 3, 4, 5, 6], NUD_STALE)),
+            NUD_STALE
+        );
     }
 }
 
