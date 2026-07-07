@@ -1,3 +1,89 @@
+## 2026-07-06 — #4426: reject single-family prefix-lists under `family any`
+
+- **Timestamp**: 2026-07-06
+- **Action**: Closed the C164-H04 audit residual (#4426). #4296 rejects a
+  static family-specific match (address literal, per-family icmp
+  type/code) under `family any` but deliberately excludes
+  `source-prefix-list` / `destination-prefix-list` because a NAMED
+  prefix-list may mix families. Verify-first (probe test on
+  origin/master) confirmed the gap is live: a `family any` filter with a
+  v4-only `source-prefix-list` compiles cleanly into BOTH the inet and
+  inet6 pools (#4287 dual-compile), leaving the v6 arm constrained by a
+  v4-only list — it matches no v6 packet and falls through to the
+  implicit ACCEPT (silent v6 under-block). Extended
+  `validateFirewallFilterFamilyAnyMatchesAST` to resolve each
+  prefix-list reference against the candidate tree's `policy-options
+  prefix-list` definitions (new `firewallPrefixListFamilies` /
+  `prefixFamily`, mirroring `compilePolicyOptions`' #3996 dual-shape
+  read). Coverage is aggregated PER DIRECTION across every `from` block:
+  a direction whose referenced prefix-lists collectively cover exactly
+  ONE family is rejected at strict commit / warned on the lenient
+  load-sync path, matching the #4296 remedy (reject-at-commit pointing
+  the operator at `family inet`/`family inet6`). A mixed-family list, two
+  single-family lists that together cover both families, an empty list,
+  and an undefined reference are all NOT flagged (undefined stays the
+  province of `validateFirewallPrefixListReferencesStrict`).
+  RED-on-revert proven: v4-only + v6-only reject tests and the lenient
+  warn test all go RED on the origin/master `compiler_firewall.go`.
+  Coordinator-review fold: the gate now tracks POSITIVE vs `except`
+  refs separately (`hasPos`/`hasExc`, `posFam`/`excFam`) because they
+  fail in OPPOSITE ways under `family any` — a single-family positive
+  list under-blocks the missing family (arm matches nothing) while a
+  sole single-family `except` list OVER-matches it (arm is `except` over
+  an empty set = match ALL; the clean-except branch of
+  resolvePrefixListAddrs, #4338). The two cases now emit DIFFERENT
+  messages (an inverted "under-block" message for the `except` case
+  would be misinformation worse than the gap). Verified the
+  `except`+`accept` fail-open (v6 arm accepts EVERY v6 packet) is caught
+  with the over-accept wording. RED-on-revert also proven for the except
+  branch (the pre-fold version emits the inverted under-block message).
+  `go build ./...`, `go vet`, `gofmt`, and the full `pkg/config` +
+  `pkg/dataplane` suites are green. Commit-path only (no dataplane wire
+  change) — no cluster smoke required.
+- **File(s)**: pkg/config/compiler_firewall.go,
+  pkg/config/compiler_firewall_family_any_prefixlist_4426_test.go,
+  docs/config-schema.md, _Log.md
+## 2026-07-06 — #4423 (flow-cache H7/H8/M3/M4/M7): verify-first + docs
+
+- **Timestamp**: 2026-07-06
+- **Action**: Verify-first triage of the codex flow-cache audit sub-items on
+  the flow-cache-hit fast path. Outcome: the two HIGHs are not-material on
+  origin/master and the two MEDs are a deliberate caching approximation /
+  benign no-op, so the fix is documentation + disposition, no behavior change.
+    - **H7 (charges/logs before TTL) — NOT-A-BUG**: already fixed by #3779
+      (origin/master `8b384777d`). In
+      `poll_descriptor/flow_cache_hit.rs` the TTL/hop-limit check
+      (lines 151-179) precedes ALL egress side effects — filter counters
+      (182-198), policy hit counter (210-215), three-color policers
+      (216-220), input/output filter logs (221-259), and the terminal drop
+      (260-263).
+    - **H8 (observed_bytes/active-flow before TTL) — NOT-A-BUG (deliberate)**:
+      `lookup_counted` stamps `last_used_epoch` + `observed_bytes`
+      (`flow_cache.rs:918-919`) at lookup time, before the TTL check. This is
+      the DOCUMENTED design decision at `afxdp/README.md` (#3779 note):
+      `observed_bytes`/active-epoch count the packet as SEEN — flow-activity
+      telemetry, not forwarded-byte accounting. Session byte/packet counters
+      (the forwarded-byte reference) DO sit after the TTL check
+      (`account_packet` at 303-308), matching the slow path.
+    - **M3/M4 (silent DSCP-rewrite failure) — NOT-MATERIAL as framed**:
+      `apply_dscp_rewrite_to_frame` `None` = "frame has no IP DSCP field"
+      (non-IP/ARP or too-short), a benign no-op. `assign_*_dscp_rewrite`
+      stamps the queue rewrite onto all items incl. non-IP frames, so a
+      blanket failure counter would false-positive; the genuine-error subset
+      is unreachable on the pre-parsed TX path. Documented the `None`
+      contract on the function + README rather than adding a misinforming
+      counter.
+    - **M7 (cached filter-log first-packet only) — DOCUMENTED**: the cached
+      input/output filter-log replay is seed-captured (single
+      `FilterLogMatch`); per-packet re-evaluation would defeat the cache and
+      is not justified for a `then log` term. Documented the limitation
+      (task-offered resolution) alongside the #3778 frozen-queue precedent.
+- **File(s)**: userspace-dp/src/afxdp/README.md,
+  userspace-dp/src/afxdp/frame/mod.rs, _Log.md
+- **Validation**: `cargo test --release -- --test-threads=1` (full suite).
+  No dataplane forwarding behavior changed (doc + rustdoc only) — no smoke
+  required.
+
 ## 2026-07-06 — #4399: nat_reverse_index 1:N multimap + validate-on-lookup
 
 - **Timestamp**: 2026-07-06

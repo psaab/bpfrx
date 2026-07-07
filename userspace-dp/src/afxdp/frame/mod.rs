@@ -149,6 +149,17 @@ pub(in crate::afxdp) fn v6_rel_l4_offset(
     }
 }
 
+/// Rewrite the DSCP (IPv4 TOS high 6 bits / IPv6 traffic-class high 6 bits) of
+/// `frame` in place, incrementally fixing the IPv4 header checksum.
+///
+/// Returns `Some(())` when the DSCP was written (or already matched, a no-op
+/// success). Returns `None` when the frame has no IPv4/IPv6 DSCP field to
+/// rewrite: a non-IP frame (ARP and friends) or one too short to hold its L3
+/// header. `None` is a benign "not applicable" outcome, NOT a forwarding error
+/// — TX-path callers `let _` it because a per-CoS-queue DSCP rewrite is stamped
+/// onto every queued item and non-IP frames legitimately co-reside in a
+/// DSCP-rewrite queue. The frame is transmitted either way; see the "#4423
+/// M3/M4" note in `afxdp/README.md`.
 pub(in crate::afxdp) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
     let dscp = dscp & 0x3f;
     let l3 = frame_l3_offset(frame)?;

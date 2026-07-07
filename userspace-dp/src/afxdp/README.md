@@ -611,6 +611,36 @@ sync.
   moves. `observed_bytes`/active-epoch stamping in `lookup_counted` still counts
   the packet as SEEN (deliberate — it is flow-activity telemetry, not
   forwarded-byte accounting).
+  **Cached filter-log replay is seed-captured (first-packet term, #4423 M7):**
+  `emit_cached_input_filter_log` / `emit_cached_output_filter_log` replay the
+  single `FilterLogMatch` (`cached_descriptor.input_filter_log` /
+  `tx_selection.filter_log`) frozen when the flow was cached from its SEED
+  packet, so every hit logs the seed's matched `then log` term. This is a
+  deliberate caching approximation in the same family as the frozen SEED queue
+  (#3778): the flow-cache key excludes DSCP/PCP, so a filter whose `then log`
+  term selection turns on a per-packet field (DSCP) logs the seed's term for
+  the whole cached flow rather than re-evaluating the filter on each hit. The
+  5-tuple-stable common case is exact; re-running the cold-path filter
+  evaluation per packet purely to correct a `then log` term would defeat the
+  cache. Contrast the `then count` side, which #2573 (output) and #3777 (input)
+  fixed to replay EVERY matched counter — a count is a cheap handle bump, a log
+  is a full RT_FLOW event, so the count/log asymmetry is intentional. Per-packet
+  BA-classifier queue selection is already corrected (#3778, above); the
+  per-packet filter-log term is not.
+  **DSCP-rewrite `let _` is a benign no-op, not a silent failure (#4423
+  M3/M4):** `apply_dscp_rewrite_to_frame` (`frame/mod.rs`) returns `None` when
+  the frame has no IPv4/IPv6 DSCP field to rewrite — a non-IP frame (ARP, etc.)
+  or one too short to hold its L3 header. The TX-path callers
+  (`tx/transmit/rewrite.rs` prepared-TX, `tx/transmit/mod.rs` local-TX, the
+  `cos/queue_service/drain.rs` CoS drains) `let _` the result deliberately:
+  `assign_local_dscp_rewrite` / `assign_prepared_dscp_rewrite` stamp the
+  per-CoS-queue rewrite onto ALL queued items, including any non-IP frame that
+  co-resides in a DSCP-rewrite queue, so `None` there is the correct
+  "not applicable" outcome — not a dropped/mis-marked IP packet. A blanket
+  failure counter would false-positive on every legitimate non-IP frame; the
+  only genuine-error subset (an IP frame too short for its own header) is
+  unreachable on this path because TX frames are already-parsed forwarded IP
+  packets. The frame egresses either way; nothing is dropped.
   Producers must use the event-stream worker handle so rate limiting,
   queue-budget accounting, replay, and daemon callback ACK behavior stay
   centralized in `event_stream/`.
