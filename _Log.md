@@ -40,6 +40,171 @@
   `docs/host-inbound-service-matrix.md` (new P6b section), `CLAUDE.md`
   (Flow feature-coverage line), `_Log.md`.
 
+## 2026-07-07 — #4375 (avo-review-007 H3): firewall-filter conflicting terminating actions rejected at commit
+
+- **Timestamp**: 2026-07-07T07:50Z
+- **Action**: Fixed #4375. A firewall-filter term specifying more than one
+  terminating action (`then accept` + `then reject`, accept+discard,
+  reject+discard) was silently accepted. `compileFilterThen` writes the action
+  onto the single-valued `FirewallFilterTerm.Action`, overwriting last-write-wins,
+  so a contradictory term compiled to whichever keyword came last with a clean
+  commit — the operator's intent was ambiguous and the compiled behavior did not
+  necessarily match what they wrote. Junos treats accept/reject/discard as
+  mutually exclusive (one terminating action per term). FIX: `compileFilterThen`
+  now records every terminating keyword on a new `FirewallFilterTerm.Terminal-
+  Actions` slice (both leaf and child AST shapes), and new
+  `validateFilterTerminalConflictStrict` hard-rejects any term whose DISTINCT
+  terminal count exceeds one, naming family/filter/term + the conflicting
+  actions. Non-terminal modifiers (count/log/forwarding-class/loss-priority/dscp/
+  traffic-class/policer/routing-instance) coexist with a terminal and are NOT
+  flagged; repeating the same terminal (redundancy) is allowed. Strict on commit,
+  downgraded to a warning on the tolerant load / peer-sync path
+  (`lenientFilterTerminalConflict`, #1960 no-brick; last-wins Action drives the
+  dataplane). Gate wired immediately after the #3308 routing-instance conflict
+  gate. RED-on-revert: `firewall_terminal_conflict_4375_test.go` — the 4 conflict
+  tests go RED (silently accepted) without the gate; the count+terminal, single-
+  terminal, and duplicate-same-terminal tests confirm no over-reject. Verified:
+  `go test ./pkg/config/...` green (regenerated the #4406 golden baseline — the
+  only diff was the new TerminalActions field, either null or ["accept"]), go
+  build ./... + vet + gofmt clean. Pre-existing unrelated failure:
+  `TestUserspaceLinkCycleDoesNotReenterLegacyLoader` (pkg/dataplane canary,
+  fails identically on clean origin/master). Docs: docs/config-schema.md #4375
+  section.
+- **File(s)**: pkg/config/compiler_firewall.go, pkg/config/types_system.go,
+  pkg/config/compiler_validate_strict_filter.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/firewall_terminal_conflict_4375_test.go,
+  pkg/config/testdata/golden_4406.json, docs/config-schema.md, _Log.md
+
+## 2026-07-07 — #4483 (opus-172 M-6): DDNS unsigned-UPDATE forgeable-rcode warn
+
+- **Timestamp**: 2026-07-07T15:40Z
+- **Action**: Fixed opus-172 M-6 (DDNS hardening / observability gap). The RFC
+  2136 backend wires TSIG only when `tsig-key` is set, `exchange()` is UDP-first,
+  and the publish/ownership verdict keys on `resp.Rcode`. With an `update-server`
+  set and no `tsig-key`, the UPDATE goes out unsigned and the rcode is
+  unauthenticated + forgeable — a spoofed `NOERROR` records a name as published
+  though the server wrote nothing (silent blackhole); a spoofed `REFUSED`
+  suppresses a legit publish. Added a WARN-only surface for the weakened posture
+  (a hard reject would brick a previously-inert config): (a) COMMIT-time warning
+  when an `update-server` is set with no `tsig-key`, in
+  `validateDDNSBackendWarnings` (DHCP DDNS) and `validateSurfaceADDNSWarnings`
+  (Surface A provider catalog); (b) once-per-update-server RUNTIME `slog.Warn`
+  the first time an unsigned UPDATE is actually sent (`warnUnsignedOnce` +
+  package-level `unsignedUpdateWarned` sync.Map keyed by server, so the
+  per-Reconcile backend rebuild does not re-warn). Warn-only; TCP-forcing / an
+  explicit `no-tsig` opt-in are noted as follow-ups. RED-on-revert: neutralizing
+  the commit branches makes the config tests report empty warnings; stubbing the
+  runtime call emits 0 WARNs. Verified: `go test ./pkg/ddns/... ./pkg/config/...
+  ./pkg/dhcpserver/... ./pkg/daemon/...` green, go build ./... + vet + gofmt
+  clean. Docs: pkg/ddns/README.md invariant, docs/config-schema.md DDNS warn note.
+- **File(s)**: pkg/ddns/backend_rfc2136.go,
+  pkg/ddns/backend_rfc2136_test.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/config/compiler_surface_a_ddns_test.go, pkg/ddns/README.md,
+  docs/config-schema.md, _Log.md
+
+## 2026-07-07 — #4480 grpcapi: interface-monitor display honest on missing live status
+
+- **Timestamp**: 2026-07-07T14:24Z
+- **Action**: Fixed opus-172 M-3 (observability lie, display path only).
+  `buildInterfacesInput` (server_cluster.go) builds the `show chassis cluster
+  interfaces` monitor rows. When the routing interface-monitor sweep had NOT
+  produced a live link-state result for a redundancy group, the LOCAL branch
+  fell back to hardcoding `Up: true`, so a DOWN monitored uplink rendered as
+  healthy — while the PEER branch in the same function honestly filled
+  config-only monitors as `Up: false`. Changed the local config-only fallback
+  to `Up: false` so unknown link-state surfaces as Down, matching the peer
+  branch. `InterfaceMonitorInfo.Up` is a plain bool (no tri-state), so false
+  is the honest boolean. This is display-only — the failover decision reads
+  the live routing statuses (`InterfaceMonitorStatuses`), not this fallback,
+  so the weight/priority demotion logic is untouched. Added two grpcapi tests:
+  the fallback-honest test (RED-on-revert: local monitor with unavailable live
+  status must be Up=false; reverting to Up=true fails it) and a guard test
+  proving the live-status branch still copies an actually-up monitor as Up and
+  the peer branch still reports Up=false. Verified: `go test ./pkg/grpcapi/...`
+  green, go build + vet + gofmt clean. Doc: docs/junos-cli-reference.md
+  Interface Monitoring format-details note.
+- **File(s)**: pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_cluster_monitor_status_4480_test.go,
+  docs/junos-cli-reference.md, _Log.md
+## 2026-07-07 — #4474 (opus-172 H-1): transitive apply-groups fail-open
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the transitive/nested apply-groups silent-drop
+  (config fail-open, HIGH). A group whose body references another group
+  (`grpA { apply-groups grpB; }`, applied via top-level `apply-groups
+  grpA`) had grpB's content silently dropped, so a security zone/policy
+  authored behind grpB vanished with a CLEAN commit (no error/warning).
+  Root cause: `expandGroupsRecursive` captured the top-level `applyNames`
+  BEFORE merging grpA's body, merged grpA's `apply-groups grpB` leaf into
+  the top level, then stripped ALL apply-groups nodes before recursing —
+  grpB was never expanded. Fix: expand each group's OWN apply-groups to a
+  FIXED POINT before merging its body — after cloning `srcChildren`, call
+  `expandGroupsRecursive` on the clone (same groups map / ancestorPath /
+  `seen` set), then mergeNodes the fully-expanded body. Composes to
+  arbitrary depth; the existing `seen` circular guard (name marked before
+  the pre-merge expansion) makes cycles fail-CLOSED with the same
+  circular-reference error as a direct self-cycle. tagNodesInherited runs
+  BEFORE the nested expansion so `| display inheritance` attributes nested
+  content to the nested group.
+  Fan-out bound (memoization): the `seen` guard bounds only CYCLES, not
+  fan-out — `delete(seen,name)` runs per branch, so a converging DAG
+  (diamond lattice, 2^depth paths) re-expanded a shared subtree once per
+  path → EXPONENTIAL, hanging the synchronous commit for tens of seconds.
+  Added a `memo map[string][]*Node` threaded through the recursion, keyed
+  by `(group name, ancestor-context)` — the only inputs the expansion
+  depends on (walkGroupToContext + nested context use ancestorPath;
+  tagInherited/vars constant per call). A completed memo entry is a
+  cycle-free fully-resolved body (a cyclic expansion errors before it is
+  cached), so reuse is always correct; mergeNodes folds every path's copy
+  to a single instance. Cache holds a pristine cloneNodes copy (mergeNodes
+  mutates src). Net O(distinct groups x contexts).
+  Validation: 6 new tests (headline zone present, outer-own-content kept,
+  three-deep chain, cycle terminates, tagged inheritance, and a depth-22
+  converging diamond lattice: 0.4ms memoized, times out un-memoized) —
+  all RED on revert of the respective fix, GREEN with it; full
+  `go test ./pkg/config/...` green; go build/gofmt/vet clean.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/apply_groups_transitive_4474_test.go, docs/config-schema.md,
+  _Log.md
+
+## 2026-07-07 — #4479 routing: skip PBR/FBF band in userspace FIB snapshot ingest
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed opus-172 M-2 (fail-open-adjacent). The userspace route
+  snapshot builder (`buildRouteSnapshots`) mirrors kernel ip rules whose Dst
+  maps to a routing-instance table into per-prefix `next-table` leaks so the
+  userspace FIB can cross-reference VRF tables. It applied NO priority filter,
+  so a policy-based-routing / filter-based-forwarding (FBF) rule in the PBR
+  band (31000-31999) — which carries Src/Tos/IPProto/Sport/Dport SELECTORS in
+  addition to a Dst — was ingested as a BARE dst-only NextTable leak, dropping
+  every selector and widening a constrained, source-scoped steer into an
+  unconditional VRF leak (the userspace twin of the #3730 kernel over-steer).
+  Added a PBR-band skip in the ingest loop: rules in
+  `[config.PBRRulePriorityBase, +config.PBRRuleWindow)` are left out of the
+  userspace FIB (fail-CLOSED — the kernel still applies the real,
+  fully-qualified PBR rule; the snapshot just does not wrongly widen it). The
+  next-table (100-199, priority 0 in tests) and rib-group per-prefix import
+  (30000-30999) leak bands carry a pure per-prefix Dst with no selectors and
+  are still ingested — no regression to inter-VRF leaking. Moved the PBR band
+  constants to `pkg/config` (`PBRRulePriorityBase`, `PBRRuleWindow`) as the
+  SSOT so the install cap (`pkg/routing` `pbrRulePriority`/`maxPBRRules`) and
+  the snapshot skip cannot drift.
+- **Validation**: RED-on-revert test `TestBuildRouteSnapshotsSkipsPBRBandRule`
+  (PBR-band rule with Src+Sport+Dst NOT ingested — fails RED when the skip is
+  removed) plus no-regression `TestBuildRouteSnapshotsIngestsRouteLeakBandRule`
+  (next-table-band rule still ingested — stays green on revert). Existing
+  #3768 / #3876 ingest tests still pass. `go test ./pkg/routing/...
+  ./pkg/dataplane/userspace/... ./pkg/config/...` green; `go build ./...`;
+  gofmt + vet clean.
+- **File(s)**: `pkg/dataplane/userspace/routes.go` (PBR-band skip in the
+  ip-rule ingest loop), `pkg/config/types_system.go` (`PBRRulePriorityBase` /
+  `PBRRuleWindow` SSOT constants), `pkg/routing/rules.go` (`pbrRulePriority` /
+  `maxPBRRules` aliased to the config SSOT),
+  `pkg/dataplane/userspace/routes_pbr_priority_4479_test.go` (new RED-on-revert
+  + no-regression tests), `pkg/routing/README.md` (userspace-snapshot skip note
+  under the PBR band bullet).
 ## 2026-07-07 — #4476 configstore: idle-lease reaper for the config lock
 
 - **Timestamp**: 2026-07-07

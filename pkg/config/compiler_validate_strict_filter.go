@@ -1283,6 +1283,83 @@ func validateFilterRoutingInstanceConflictStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterTerminalConflictStrict hard-rejects a firewall-filter term that
+// specifies more than one DISTINCT terminating action (accept / reject /
+// discard) — #4375 (avo-review-007 H3).
+//
+// Junos treats accept/reject/discard as mutually exclusive: a term has exactly
+// ONE terminating action. xpf stores the action on the single-valued field
+// term.Action, which compileFilterThen overwrites last-write-wins, so a term
+// with `then accept` AND `then reject` (whether in one `then {}` block or across
+// two — #3850 applies every block) silently compiled to whichever keyword came
+// last. The operator's intent was ambiguous and the compiled behavior did not
+// necessarily match what they wrote — a silent misconfiguration.
+//
+// compileFilterThen now records every terminating keyword it sees on
+// term.TerminalActions (in order, with duplicates). This gate reports the
+// conflict when the term carries more than one DISTINCT terminal. Repeating the
+// SAME terminal (e.g. two `then discard` blocks) is a redundancy, not a
+// conflict, and is allowed. The non-terminating modifiers (count/log/
+// forwarding-class/loss-priority/dscp/traffic-class/policer/routing-instance)
+// are not terminals and coexist with a terminal — a term with `then count X
+// accept` is valid. (`then routing-instance` co-located with a terminating
+// discard/reject is a separate contradiction handled by
+// validateFilterRoutingInstanceConflictStrict, #3308.)
+//
+// The walk is deterministic (filters sorted by name, terms in config order) so
+// the first-reported error is stable across runs. On the tolerant load /
+// peer-sync path the caller downgrades the returned error to a warning (#1960
+// no-brick); the last-wins term.Action still drives the dataplane, so a
+// leniently-loaded contradictory term forwards deterministically — but the
+// operator never reaches that state through a commit. Mirrors
+// validateFilterRoutingInstanceConflictStrict.
+func validateFilterTerminalConflictStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || len(term.TerminalActions) < 2 {
+					continue
+				}
+				// Collect distinct terminals in first-seen order so the error
+				// is stable and reads in the order the operator wrote them.
+				seen := make(map[string]bool, len(term.TerminalActions))
+				distinct := make([]string, 0, len(term.TerminalActions))
+				for _, a := range term.TerminalActions {
+					if !seen[a] {
+						seen[a] = true
+						distinct = append(distinct, a)
+					}
+				}
+				if len(distinct) > 1 {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: conflicting "+
+							"terminating actions %s — a term may have at most one "+
+							"terminating action (accept/reject/discard are mutually "+
+							"exclusive)",
+						family, name, term.Name, strings.Join(distinct, " and "))
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFilterDSCPStrict hard-rejects a firewall-filter term whose
 // `from dscp` / `from traffic-class` MATCH token or `then dscp` /
 // `then traffic-class` REWRITE token is neither a known DSCP code-point name nor

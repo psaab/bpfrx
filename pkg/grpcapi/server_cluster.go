@@ -79,11 +79,19 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 				localMonMap[st.Interface] = true
 			}
 		} else {
+			// #4480: no live status available for this RG's monitors —
+			// the routing interface-monitor sweep has not (yet) produced a
+			// link-state result. Surface the honest "unknown as Down"
+			// (Up:false) rather than the observability lie of Up:true, which
+			// let a DOWN monitored uplink render as healthy. This matches the
+			// peer branch's config-only fill below, which already reports
+			// Up:false. Display path only — the failover decision reads the
+			// live routing statuses, not this fallback.
 			for _, mon := range rg.InterfaceMonitors {
 				input.Monitors = append(input.Monitors, cluster.InterfaceMonitorInfo{
 					Interface:       mon.Interface,
 					Weight:          mon.Weight,
-					Up:              true,
+					Up:              false,
 					RedundancyGroup: rg.ID,
 				})
 				localMonMap[mon.Interface] = true

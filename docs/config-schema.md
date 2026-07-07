@@ -1340,6 +1340,62 @@ The exclusions are covered by `pkg/config/apply_groups_leaflist_exclude_test.go`
 args>=2 `address` no-token-merge, and — the narrow-exclusion proof — firewall
 `from protocol` in the same subtree STILL unions).
 
+### Transitive (nested) apply-groups (#4474)
+
+A group body may itself contain `apply-groups G2` — a NESTED-group template, a
+standard Junos idiom where a group composes other groups (`grpA { apply-groups
+grpB; }` applied at the top with `apply-groups grpA`). `grpB`'s content must be
+inherited transitively.
+
+Before #4474 this SILENTLY DROPPED `grpB`. `expandGroupsRecursive` captured the
+top-level `applyNames` (`[grpA]`) BEFORE merging, merged `grpA`'s body — which
+contains the `apply-groups grpB` leaf — into the top level, then stripped ALL
+`apply-groups` nodes at that level before recursing. `grpB` was never in
+`applyNames` and its merged-in reference was stripped, so a security zone or
+policy authored behind `grpB` VANISHED with a CLEAN commit (config fail-open, a
+HIGH-severity parity gap: a stanza the operator wrote is silently not enforced).
+
+**The fix** expands each group's OWN `apply-groups` to a FIXED POINT before
+merging its body. In `expandGroupsRecursive`, after cloning a group's
+context-walked children (`srcChildren`), it recursively calls
+`expandGroupsRecursive` on the clone (same `groups` map, same `ancestorPath`,
+same `seen` set) so any nested `apply-groups` inside the group body are resolved
+first; only then does `mergeNodes` splice the fully-expanded body into the
+parent. This composes to arbitrary depth (`grpA -> grpB -> grpC`).
+
+Cycles are fail-CLOSED: the existing `seen` circular-reference guard already
+marks `name` before the pre-merge expansion, so `grpA -> grpB -> grpA` surfaces
+the same `apply-groups circular reference` error as a direct self-cycle rather
+than recursing forever — a rejected commit beats a silently-dropped zone.
+
+**Bounding the fan-out (memoization).** The `seen` guard bounds only CYCLES, not
+fan-out: `delete(seen, name)` runs per branch, so a group reached via N distinct
+paths would be re-expanded N times. A converging DAG (a diamond lattice — each
+level referencing the next via two edges) has 2^depth root->leaf paths, so the
+naive fixed-point recursion is EXPONENTIAL (a machine-generated deep
+nested-group DAG hung the synchronous commit for tens of seconds). The bound is
+a `memo map[string][]*Node` threaded through the whole expansion, keyed by
+`(group name, ancestor-context)` — the two inputs the expansion actually depends
+on (`walkGroupToContext` and the nested-expansion context both use
+`ancestorPath`; `tagInherited`/`vars` are constant per `ExpandGroups` call). A
+completed memo entry is a fully-resolved, cycle-free body (a cyclic expansion
+errors out BEFORE it is cached), so reusing it is always correct; a diamond
+re-uses the memo instead of re-expanding, and `mergeNodes`'s same-key merge
+still folds every path's copy to a single instance (count-once). The memo and
+the cycle guard do not conflict — the guard tracks IN-PROGRESS recursion, the
+memo tracks COMPLETED expansions. Because `mergeNodes` mutates its `src`
+argument, the cache holds a pristine `cloneNodes` copy and every use (store and
+reuse) is a fresh clone. Net cost is O(distinct groups x distinct contexts).
+
+`| display inheritance` attribution stays correct: `tagNodesInherited(cloned,
+name)` runs BEFORE the nested expansion, so it tags only the outer group's own
+body; nodes contributed by the nested group are tagged by the recursive call
+with THAT nested group's name (not the outer one). Covered by
+`pkg/config/apply_groups_transitive_4474_test.go` (headline zone present,
+outer-own-content-kept, three-deep chain, cycle-terminates, tagged inheritance
+attribution, and a depth-22 converging diamond lattice that expands in
+sub-millisecond memoized but times out / runs for tens of seconds un-memoized).
+
 ## `then community` operations: add / delete / set / none (#2848)
 
 The policy-term action `then community` supports the Junos/vSRX community
@@ -2570,7 +2626,16 @@ reserved for whole-dataplane selection where a rewrite shim
   `tsig-algorithm`, or an incomplete TSIG tuple (`tsig-key` without
   `tsig-secret`, or `tsig-secret` without `tsig-key`) each emit a WARN-only
   commit message (#2666) — never a hard reject, and the backend degrades
-  safely at runtime. `tsig-secret` is
+  safely at runtime. An `update-server` set with NO `tsig-key` at all also
+  warns (#4483): TSIG is the only authenticator on this path, so an unsigned
+  UPDATE trusts a forgeable response rcode — a spoofed `NOERROR` records a name
+  as published though the server wrote nothing (silent blackhole) and a spoofed
+  `REFUSED` suppresses a legitimate publish. The same no-`tsig-key` warning is
+  emitted for the Surface A provider catalog by `validateSurfaceADDNSWarnings`.
+  Both are WARN-only (a hard reject would brick a previously-inert config); the
+  backend also emits a once-per-update-server runtime `slog.Warn`
+  (`warnUnsignedOnce` in `pkg/ddns/backend_rfc2136.go`) the first time it
+  actually sends an unsigned UPDATE. `tsig-secret` is
   SENSITIVE: it is redacted in `DHCPDynamicDNSConfig.String()` (logging) AND,
   since #2053, by its `config.Secret` field type on every JSON/YAML marshal
   (so the compiled-config dump on `GET /api/v1/config` never leaks it — see
@@ -3701,6 +3766,45 @@ reject still rejects, `TestFilterAction_Unknown_LenientWarns`,
 `userspace-dp/src/filter/tests.rs`
 (`unknown_nonempty_action_fails_closed_discard`,
 `empty_action_falls_through_to_accept`).
+
+### #4375 — firewall-filter conflicting terminating actions (commit fail-closed)
+
+Junos treats the three terminating actions `accept` / `reject` / `discard`
+as **mutually exclusive**: a filter term has at most ONE terminating action.
+xpf stores the resolved action on the single-valued `FirewallFilterTerm.Action`,
+which `compileFilterThen` overwrites **last-write-wins** — so a term carrying
+BOTH `then accept` AND `then reject` (in one `then {}` block or across two, since
+#3850 applies every block) silently compiled to whichever keyword appeared last.
+Commit reported SUCCESS, the operator's intent was ambiguous, and the compiled
+behavior did not necessarily match what they wrote — a silent misconfiguration.
+Provenance: avo-review-007 H3.
+
+`compileFilterThen` now records EVERY terminating keyword it sees on
+`FirewallFilterTerm.TerminalActions` (in order, with duplicates), and
+**`validateFilterTerminalConflictStrict`** (`compiler_validate_strict_filter.go`)
+hard-rejects any term whose **distinct**-terminal count exceeds one, naming the
+family / filter / term / the conflicting actions. Two constructs are explicitly
+NOT flagged so a real config is not over-rejected: repeating the SAME terminal
+(e.g. two `then discard` blocks — a redundancy, one distinct terminal), and a
+non-terminating modifier co-located with exactly one terminal (`then count X
+accept` — `count`/`log`/`forwarding-class`/`loss-priority`/`dscp`/
+`traffic-class`/`policer`/`routing-instance` are NOT terminals and coexist with
+one). `then routing-instance` co-located with a terminating `discard`/`reject`
+is a separate contradiction handled by `validateFilterRoutingInstanceConflict-
+Strict` (#3308); `next term` is a fall-through control, not a terminating action.
+
+**Strict/lenient split (flag `lenientFilterTerminalConflict`, sibling of
+`lenientFilterRoutingInstanceConflict`):** strict on the commit / commit-check
+path (`CompileConfig` — hard-reject), downgraded to a `cfg.Warnings` entry on the
+tolerant load / peer-sync paths (`CompileConfigLenient` /
+`CompileConfigForNodeLenient`) so an already-persisted or peer-synced config
+carrying a contradictory term still BOOTS (#1960 fail-closed-on-load doctrine) —
+the last-wins `Action` drives the dataplane deterministically on that boot. The
+gate runs immediately after `validateFilterRoutingInstanceConflictStrict`.
+Regression coverage: `pkg/config/firewall_terminal_conflict_4375_test.go`
+(accept/reject, accept/discard, reject/discard conflicts + inet6 — fail-on-revert
+guards; `then count X log accept`, a single terminal, and duplicate-same-terminal
+accepted — anti-over-reject; lenient path does not hard-fail).
 
 ### #3445 — lo0 input-filter `then` modifiers: nft-mirror support policy (commit warning)
 

@@ -508,3 +508,71 @@ func TestDHCPDDNSSchemaRejectsBadEnumAndTTL(t *testing.T) {
 		})
 	}
 }
+
+// TestDHCPDDNSNoTSIGUnsignedWarning is the #4483 commit-warn fail-on-revert
+// proof: a DHCP dynamic-dns update-server configured with NO tsig-key must
+// warn that DNS UPDATEs are sent unsigned and the response rcode is forgeable.
+// A config WITH a complete TSIG tuple must NOT emit that warning. Reverting the
+// no-tsig branch in validateDDNSBackendWarnings makes the first subtest go red.
+func TestDHCPDDNSNoTSIGUnsignedWarning(t *testing.T) {
+	hasWarn := func(ws []string, substr string) bool {
+		for _, w := range ws {
+			if strings.Contains(w, "dhcp dynamic-dns") && strings.Contains(w, substr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("update-server without tsig-key warns unsigned/forgeable", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig must NOT error on a no-TSIG update-server: %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		if !hasWarn(ws, "unsigned") {
+			t.Fatalf("an update-server with no tsig-key must warn that updates are unsigned: %v", ws)
+		}
+		if !hasWarn(ws, "forgeable") {
+			t.Fatalf("the warn must name the forgeable-response consequence: %v", ws)
+		}
+	})
+
+	t.Run("complete TSIG tuple emits no unsigned warning", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+			"set system services dhcp-local-server dynamic-dns tsig-algorithm hmac-sha256",
+			"set system services dhcp-local-server dynamic-dns tsig-secret c2VjcmV0",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		if hasWarn(ws, "unsigned") {
+			t.Fatalf("a configured tsig-key must NOT warn about unsigned updates: %v", ws)
+		}
+	})
+
+	t.Run("no update-server does not emit the unsigned warning", func(t *testing.T) {
+		// The "no update-server" warning already covers this config; the
+		// unsigned-posture warning is scoped to a SET update-server so the two
+		// do not double-fire on an incomplete config.
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		if hasWarn(ValidateConfig(cfg), "unsigned") {
+			t.Fatal("with no update-server the unsigned-posture warning must not fire")
+		}
+	})
+}

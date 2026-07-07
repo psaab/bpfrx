@@ -852,6 +852,25 @@ const (
 	// ProbeRulePriorityBase is the first ip-rule priority of the
 	// probe-pin band (50-99).
 	ProbeRulePriorityBase = 50
+	// PBRRulePriorityBase is the first ip-rule priority of the
+	// policy-based-routing / filter-based-forwarding (FBF) band
+	// (31000-31999): firewall-filter `then routing-instance` actions
+	// installed by pkg/routing's pbrManager. These rules carry match
+	// SELECTORS (source/dest address, DSCP, protocol, source/dest port)
+	// in addition to a Dst, so — unlike the pure per-prefix next-table /
+	// rib-group leak bands — they MUST NOT be mirrored into the userspace
+	// next-table FIB snapshot as a bare dst-only leak (that drops the
+	// selectors and re-opens the #3730 over-steer; see #4479 and
+	// pkg/dataplane/userspace/routes.go buildRouteSnapshots). Both
+	// pkg/routing (install side) and pkg/dataplane/userspace (snapshot
+	// ingest side) consume these, so they live here as the single source
+	// of truth alongside ProbeRulePriorityBase.
+	PBRRulePriorityBase = 31000
+	// PBRRuleWindow is the size of the PBR band; the band is
+	// [PBRRulePriorityBase, PBRRulePriorityBase+PBRRuleWindow) = 31000-31999.
+	// It also bounds the number of PBR ip rules the applier installs
+	// (pkg/routing maxPBRRules) and the priority window clear() scans.
+	PBRRuleWindow = 1000
 )
 
 // RPMTest defines a test within an RPM probe.
@@ -1201,6 +1220,22 @@ type FirewallFilterTerm struct {
 	TCPFlags         []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
 	IsFragment       bool     // match IP fragments
 	Action           string   // "accept", "reject", "discard", ""
+	// TerminalActions records EVERY terminating action keyword
+	// (accept/reject/discard) compileFilterThen encountered across all of the
+	// term's `then` blocks, in order and including duplicates. Action itself is
+	// single-valued and last-write-wins, so a term with `then accept` AND `then
+	// reject` would silently resolve to whichever came last — the operator's
+	// intent was ambiguous and the compiled behavior did not necessarily match
+	// what they wrote (#4375, avo-review-007 H3). This slice is the
+	// mutual-exclusion channel: validateFilterTerminalConflictStrict hard-rejects
+	// any term whose distinct-terminal count exceeds one; the tolerant load /
+	// peer-sync path downgrades to a warning (#1960 no-brick) and the last-wins
+	// Action still drives the dataplane. Junos treats accept/reject/discard as
+	// mutually exclusive (a term has exactly one terminating action); the
+	// non-terminating modifiers (count/log/forwarding-class/loss-priority/dscp/
+	// traffic-class/policer/routing-instance) coexist with a terminal and are NOT
+	// recorded here.
+	TerminalActions []string
 	// UnknownActions records `then` tokens that are neither a recognized
 	// terminating action nor a recognized modifier (#2399 finding 032-16).
 	// An unknown or misspelled action would otherwise be silently dropped

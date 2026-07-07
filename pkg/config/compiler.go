@@ -669,6 +669,20 @@ type compileOpts struct {
 	// no-brick); the runtime routes-and-mislogs the term independently. Same
 	// doctrine as lenientFilterPortExcept.
 	lenientFilterRoutingInstanceConflict bool
+	// lenientFilterTerminalConflict (#4375, avo-review-007 H3) downgrades the
+	// firewall-filter conflicting-terminal-actions gate
+	// (validateFilterTerminalConflictStrict) from a hard compile error to a
+	// cfg.Warnings entry. The strict commit / commit-check path hard-rejects a
+	// term that specifies more than one DISTINCT terminating action
+	// (accept/reject/discard — mutually exclusive in Junos). Before this gate
+	// compileFilterThen wrote each keyword onto the single-valued term.Action
+	// (last-write-wins), so a term with `then accept` AND `then reject` silently
+	// compiled to whichever came last — an ambiguous config accepted with one
+	// side of the operator's intent lost. The tolerant load / peer-sync paths
+	// downgrade to a warning so an already-persisted or peer-synced config still
+	// BOOTS (#1960 no-brick); the last-wins Action drives the dataplane
+	// deterministically. Sibling of lenientFilterRoutingInstanceConflict (#3308).
+	lenientFilterTerminalConflict bool
 	// lenientFilterDSCP (#3309) downgrades the firewall-filter DSCP /
 	// traffic-class range gate (validateFilterDSCPStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1552,6 +1566,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterFromMatch:                 true,
 		lenientFilterAddressLiterals:           true,
 		lenientFilterRoutingInstanceConflict:   true,
+		lenientFilterTerminalConflict:          true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
 		lenientNAT64Prefix:                     true,
@@ -1797,6 +1812,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterFromMatch:                 true,
 		lenientFilterAddressLiterals:           true,
 		lenientFilterRoutingInstanceConflict:   true,
+		lenientFilterTerminalConflict:          true,
 		lenientFilterDSCP:                      true,
 		lenientNPTv6:                           true,
 		lenientNAT64Prefix:                     true,

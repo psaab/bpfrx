@@ -6,9 +6,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -983,12 +985,47 @@ func (u *rfc2136Updater) sendRemoveForward(ctx context.Context, zone string, rr 
 	}
 }
 
+// unsignedUpdateWarned dedups the #4483 once-per-provider runtime warning
+// emitted the first time this process sends an UNSIGNED (no-TSIG) DNS UPDATE to
+// a given update server. It is keyed by the server host:port because the
+// manager rebuilds the rfc2136Updater every Reconcile cycle
+// (NewProductionManager resolves the backend from the policy at the start of
+// each pass), so a per-updater sync.Once would re-warn every cycle. The map
+// only ever grows by the small, bounded number of distinct update servers
+// configured across DHCP DDNS + Surface A providers.
+var unsignedUpdateWarned sync.Map // server string -> struct{}
+
+// warnUnsignedOnce logs a single WARN — the first time this process sends an
+// unsigned update to u.server — that the update is unauthenticated and the
+// server's response rcode is forgeable (#4483). Subsequent unsigned updates to
+// the same server are silent. Configuring tsig-key/tsig-secret closes the gap
+// (miekg verifies the response MAC), so the message points the operator there.
+func (u *rfc2136Updater) warnUnsignedOnce() {
+	if _, loaded := unsignedUpdateWarned.LoadOrStore(u.server, struct{}{}); loaded {
+		return
+	}
+	slog.Warn("ddns: sending UNSIGNED DNS UPDATE (no tsig-key configured); "+
+		"the update is unauthenticated and the server's response rcode is "+
+		"forgeable — a spoofed NOERROR records a name as published though the "+
+		"server wrote nothing (silent blackhole) and a spoofed REFUSED "+
+		"suppresses a legitimate publish. Configure tsig-key/tsig-secret to "+
+		"authenticate updates.",
+		"server", u.server)
+}
+
 // exchange signs (when TSIG configured) and sends a message UDP-first,
 // retrying over TCP on a truncated response. The per-call context bounds
 // the network I/O.
 func (u *rfc2136Updater) exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
 	if u.tsigKeyName != "" {
 		m.SetTsig(u.tsigKeyName, u.tsigAlgo, 300, time.Now().Unix())
+	} else {
+		// #4483: no TSIG key configured. The UPDATE is sent unsigned and the
+		// publish/ownership verdict below keys on an UNAUTHENTICATED, forgeable
+		// response rcode. Warn once per update server so the operator sees the
+		// weakened posture (the commit-time check already warned; this catches
+		// the runtime path too).
+		u.warnUnsignedOnce()
 	}
 	if u.timeout > 0 {
 		var cancel context.CancelFunc
