@@ -272,8 +272,25 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					// historical global behaviour). These leaves exist ONLY
 					// under global policy match — zone-pair policies take
 					// their zones from the from-zone/to-zone stanza.
-					"from-zone": {desc: "Restrict this global policy to packets from this zone", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
-					"to-zone":   {desc: "Restrict this global policy to packets to this zone", args: 1, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					//
+					// #4415 L12: tagged `scalar: true` so a list / trailing
+					// token is REJECTED at commit rather than silently
+					// dropped. The compiler
+					// (compiler_security_policy.go from-zone/to-zone cases)
+					// reads only the FIRST value token (Keys[1] or
+					// Children[0]) into the single-string Match.FromZone /
+					// Match.ToZone, so `match from-zone [ trust dmz ]`
+					// (which the #2419 lexer collapses to
+					// Keys=["from-zone","trust","dmz"]) would silently keep
+					// only "trust" and discard "dmz" — a security-relevant
+					// scope narrowing the operator never sees. Junos accepts
+					// a zone LIST here; modeling that is the deferred
+					// multi-zone-scope work (#4415 M03). Until then the
+					// fail-closed behavior is to reject the list with a clear
+					// error (validateScalarValueLeaf, #3332) so no zone is
+					// dropped without notice.
+					"from-zone": {desc: "Restrict this global policy to packets from this zone", args: 1, scalar: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"to-zone":   {desc: "Restrict this global policy to packets to this zone", args: 1, scalar: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 				}},
 				"then": {desc: "Action", children: policyThenSchemaChildren()},
 				// #3117: scheduler-name on global policies — same compiler +
