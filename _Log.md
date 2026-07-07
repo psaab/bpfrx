@@ -1,3 +1,29 @@
+## 2026-07-07 — #4412 (avo-review-007 backlog E3): document flow-based FBF/PBR
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the avo-review-007 dropped-findings backlog (#4412).
+  Verified each of E2/E3/E5/E7/H1/H4/H6 against origin/master. Only E3
+  needed a change: it is a verified-CORRECT documentation gap — the FBF
+  (`then routing-instance`) steer is decided on the first packet of a
+  flow and cached in the session (`ingress_route_table_override` runs on
+  the session miss; `resolve_flow_session_decision` returns the cached
+  egress/VRF on every hit without re-running the filter, per
+  `userspace-dp/src/afxdp/forwarding/README.md:226-233`). Editing the
+  FBF filter therefore does NOT re-steer live flows, a firewall-filter
+  commit does not clear sessions (only `policy-rematch` re-evaluates
+  security POLICIES), and per-packet-L4 FBF terms (tcp-flags /
+  is-fragment / icmp-*) are the cache-sensitive exception. This was only
+  in the dataplane dev README; added an operator-facing note to the FBF
+  section of `docs/multi-wan.md`.
+  Dispositions of the rest (recorded on #4412): E5 ALREADY-FIXED
+  (`TestMatchPoliciesGRPCHostInboundOffHostOmitted` +
+  `TestMatchPoliciesDefaultUsedTyped`); E2/E7/H1/H4/H6 are userspace-dp
+  Rust dataplane test-coverage items (afxdp/filter cargo suites) — filed
+  as follow-ups (cargo lane busy, not run here).
+- **File(s)**: docs/multi-wan.md, _Log.md
+- **Validation**: docs-only change; `go build ./...` + `go vet` green
+  (no Go source touched); gofmt clean.
+
 ## 2026-07-07 — #4482 (opus-172 M-5): FRR set-clause/prefix-list sanitize-belt bypass
 
 - **Timestamp**: 2026-07-07
