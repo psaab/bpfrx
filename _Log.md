@@ -1,3 +1,34 @@
+## 2026-07-07 — #4406 step 3: extract P7 tail gates from compileExpanded
+
+- **Timestamp**: 2026-07-07
+- **Action**: Step 3 of the #4406 compileExpanded god-orchestrator
+  decomposition (after step 1 extracted P1 runPreWalkGates and step 2 extracted
+  P4 compileSections). Extracted the P7 "tail gates" phase — the contiguous
+  trailing validation / finalization sequence at the very end of compileExpanded
+  (ValidateConfig structural warnings, then the interleaved warn/err gates:
+  vrrpTrackConfigWarnings, validatePoolUtilizationAlarm, validateBackupRouterDst,
+  validateVRRPVirtualAddressSubnet, validateScreenScanSweepWindows,
+  validateScreenSynFloodSubThresholds, validateVRFOverlap, validateNATHostMaskStrict,
+  validateNPTv6Strict, validateNAT64PrefixStrict, validateWireguardPeersStrict,
+  userspaceRetiredKnobWarnings, loginClassAdvisoryWarnings,
+  sshHardeningAdvisoryWarnings) — into a new free function
+  `runTailGates(cfg *Config, opts compileOpts) error` (compiler_tailgates.go:22,
+  mirroring the step 1/2 free-function pattern). compileExpanded now calls it in
+  the SAME position — LAST, after the P6b uniform gates and before the final
+  `return cfg, nil`. The strict gates' `return nil, err` became `return err` to
+  match the helper's single-error return; every gate order, warning-append order,
+  and opts-lenient flag threading is a verbatim lift. The #1539 DPDK
+  structural-invariant comment (no code) stays in compileExpanded at the return
+  site. Net compiler.go −162/+8 (154-line tail block → 8-line call block with
+  rationale comment).
+- **File(s)**: pkg/config/compiler_tailgates.go (new), pkg/config/compiler.go
+- **Validation**: gofmt clean, go vet clean, `go build ./...` clean.
+  `go test ./pkg/config/ -run TestCompileGolden4406` PASSED byte-identical
+  WITHOUT a baseline update (no GOLDEN_4406_UPDATE, no golden_4406.actual.json
+  written, testdata/ untouched per git status) — proving P7 has no hidden side
+  effect and the strict first-error slot + tolerant-path warning order are
+  preserved. Full `go test ./pkg/config/...` green.
+
 ## 2026-07-07 — #4406 step 2: extract P4 section dispatch from compileExpanded
 
 - **Timestamp**: 2026-07-07
