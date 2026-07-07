@@ -1,3 +1,30 @@
+## 2026-07-07 — #4476 configstore: idle-lease reaper for the config lock
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed opus-172 H-3, a management-plane config-edit DoS. The REST
+  config-enter path (`POST /api/v1/config/enter` -> `EnterConfigure`, empty
+  holder) has no disconnect hook — unlike the gRPC `configLockInterceptor` — so
+  a stateless HTTP client that never called `/config/exit` wedged the global
+  config lock, and every CLI/gRPC/REST edit returned `ErrConfigLocked` until
+  `clear system config-lock` or a daemon restart. `configLockAt` was recorded
+  at acquire but read only by a log line — no reaper. Added an idle-lease
+  reaper: `configLockLeaseTTL` (10 min) + `reclaimStaleLockLocked()` (check-on-
+  acquire reclaim in `EnterConfigureSession`/`EnterConfigureExclusive`, gated on
+  `time.Since(configLockAt) >= TTL`) + `touchConfigLockLocked()` (refresh-on-
+  activity, stamped by every mutating store method and same-session re-entry).
+  An actively-edited lock refreshes its lease and is never reclaimed; only a
+  genuinely-idle lock is reclaimed, exactly when another session needs it (no
+  background goroutine). Internal `SyncApply` / `PromoteRollback` paths do not
+  refresh (not user activity). Noted L-1/#4484 (REST clear-config-lock) as a
+  companion, not implemented here.
+- **File(s)**: `pkg/configstore/store_lock.go` (TTL var + reaper/refresh helpers
+  + reclaim wiring in both Enter* methods), `pkg/configstore/store_command.go`
+  (touch in Set/Delete/Deactivate/Activate/Copy/Rename/Insert/Annotate/Load*),
+  `pkg/configstore/store_commit.go` (touch in Commit/CommitConfirmed/Rollback),
+  `pkg/configstore/store_lock_lease_4476_test.go` (RED-on-revert: stale
+  reclaimed, active/refreshed preserved, exclusive stale reclaimed, re-entry
+  refreshes), `pkg/configstore/README.md` (idle-lease reaper section).
+
 ## 2026-07-07 — #4362 wg: drain cookie_gen on peer removal in reconcile_peers
 
 - **Timestamp**: 2026-07-07

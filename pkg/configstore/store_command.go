@@ -22,6 +22,7 @@ func (s *Store) Set(path []string) error {
 	if err := s.candidate.SetPath(path); err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -50,6 +51,7 @@ func (s *Store) Delete(path []string) error {
 	if err := s.candidate.DeletePath(path); err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -86,6 +88,7 @@ func (s *Store) DeactivateFromInput(input string) error {
 	if err := applyEditLine(s.candidate, "deactivate "+input); err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -106,6 +109,7 @@ func (s *Store) ActivateFromInput(input string) error {
 	if err := applyEditLine(s.candidate, "activate "+input); err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -123,6 +127,7 @@ func (s *Store) Copy(srcPath, dstPath []string) error {
 	if err := s.candidate.CopyPath(srcPath, dstPath); err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -140,6 +145,7 @@ func (s *Store) Rename(srcPath, dstPath []string) error {
 	if err := s.candidate.RenamePath(srcPath, dstPath); err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -164,6 +170,7 @@ func (s *Store) Insert(elementPath, refPath []string, before bool) error {
 	if err != nil {
 		return err
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -212,6 +219,7 @@ func (s *Store) Annotate(path []string, comment string) error {
 	}
 
 	target.Annotation = comment
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -238,6 +246,7 @@ func (s *Store) LoadOverride(content string) error {
 	}
 
 	s.candidate = tree
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -313,6 +322,7 @@ func (s *Store) LoadMerge(content string) error {
 		}
 	}
 
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
 }
@@ -417,6 +427,7 @@ func (s *Store) LoadSet(content string) (int, error) {
 		}
 		count++
 	}
+	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return count, nil
 }
