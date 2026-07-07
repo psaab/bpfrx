@@ -141,6 +141,7 @@ type Daemon struct {
 	// ONLY to Kea's own socket + the cluster channel — never the
 	// userspace-helper control socket (CLAUDE.md rule).
 	dhcpLeaseSyncNowCh    chan struct{} // nudge: grant/commit/MASTER takeover
+	ipsecSANudgeCh        chan struct{} // nudge: peer (re)connect -> IPsec SA re-advertise (#4385)
 	dhcpLeaseSyncInFlight atomic.Bool   // no-freeze skip-if-in-flight guard
 	dhcpLeaseLastSentMu   sync.Mutex
 	dhcpLeaseLastSent4    string // last-pushed v4 set fingerprint (change-detect)
@@ -793,6 +794,7 @@ func New(opts Options) (*Daemon, error) {
 		ddnsReconcileNowCh:         make(chan struct{}, 1),
 		surfaceAReconcileNowCh:     make(chan struct{}, 1),
 		dhcpLeaseSyncNowCh:         make(chan struct{}, 1),
+		ipsecSANudgeCh:             make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},
