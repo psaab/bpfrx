@@ -433,3 +433,64 @@ RED-on-revert coverage: `screen/tests.rs`
 scope guards) and `afxdp/poll_stages.rs`
 (`fabric_ingress_skips_rate_flood_direct_still_counts_4155`, driving the live
 `stage_screen_check`).
+
+## The cluster-peer return fast path must not adopt NEW UDP flows (#4439)
+
+`cluster_peer_return_fast_path` (`userspace-dp/src/afxdp/forwarding/mod.rs`,
+called from the session-MISS decision in `poll_descriptor/mod.rs`) exists for
+the sync-race sub-window: a packet the active RG owner already
+policy/NAT-validated is fabric-redirected to the peer, arrives before the
+synced session installs, and must still be handed to the local egress instead
+of being treated as a brand-new flow. It builds a NAT-less
+(`NatDecision::default()`), reverse-keyed (`is_reverse: true`) seed and
+forwards the packet.
+
+It is reached **only after** `resolve_flow_session_decision` misses in every
+scope (local + synced forward key + forward-NAT reply key), so a genuine
+established flow's return packet — including the whole failback-preservation
+case above — is served by the synced session and never lands here. Anything
+reaching this fast path is therefore **session-less**.
+
+**The bug.** This fast path may fire ONLY for packets that are provably RETURN
+traffic. Every protocol with a packet-level flow-initiator marker is excluded:
+TCP excludes the initial SYN, ICMP excludes the echo REQUEST. **UDP has no such
+marker** — any datagram can open a new flow, and there is no "non-initiating
+UDP" form. Before #4439 a session-less UDP datagram that was a genuinely NEW
+forward flow (e.g. an outbound flow that ingressed the non-owner node and was
+fabric-redirected to the RG owner) was adopted by this fast path as return
+traffic. Two failures followed on the owner:
+
+1. **NAT bypass.** The reverse seed carried `NatDecision::default()`, so the
+   **source-NAT** a new outbound flow requires was never applied — the packet
+   left with its private source address/port.
+2. **Session-state corruption.** The owner installed a **reverse-keyed**
+   (`SessionOrigin::ReverseFlow`) session for what was actually a forward flow,
+   so subsequent packets and the real reply resolved against a mis-directioned
+   session.
+
+Confirmed 3× (ps-013/014/015).
+
+**The fix.** `cluster_peer_return_fast_path` now returns `None` for
+`meta.protocol == PROTO_UDP`, completing the flow-initiator-exclusion
+invariant (TCP-SYN, ICMP-echo-request, and now all UDP). A session-less UDP
+packet falls through to the normal forward decision, where — because the RG
+owner resolves it to a `ForwardCandidate` (not a `FabricRedirect`) — source-NAT
+is applied (`apply_nat = !fabric_redirect || apply_nat_on_fabric` is `true` for
+a non-redirect egress) and a FORWARD session is installed. The session-miss
+forward path already anticipates fabric-ingress packets (the #4155 sync-race
+`packet_fabric_ingress` handling), so no other change is required; the
+non-owner keeps redirecting the original pre-NAT frame (`apply_nat_on_fabric`
+stays `false`), matching the Fix 1 "peer processes it through its full
+pipeline" design.
+
+The legitimate fabric-forward for an established synced session is untouched:
+it is served by `resolve_flow_session_decision` (the synced session + #2120
+standby retention), not by this session-less fast path. TCP (non-SYN) and ICMP
+(echo-reply) return traffic continue to fast-path as before.
+
+RED-on-revert coverage: `forwarding/tests.rs`
+`cluster_peer_return_fast_path_skips_udp_new_flow_4439` (UDP against the same
+ForwardCandidate-resolving target the ICMP-reply test uses — returns `Some` on
+revert, `None` with the fix) alongside the preserved
+`cluster_peer_return_fast_path_allows_sfmix_to_lan_reply` (ICMP echo reply
+still fast-paths) and `_skips_pure_tcp_syn` / `_skips_icmp_echo_request`.

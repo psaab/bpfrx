@@ -731,6 +731,24 @@ pub(super) fn cluster_peer_return_fast_path(
     if meta.protocol == PROTO_TCP && crate::tcp_flags::is_initial_syn(meta.tcp_flags) {
         return None;
     }
+    // #4439: this fast path may fire ONLY for packets that are provably
+    // RETURN traffic — the reverse direction of a flow the active owner
+    // already policy/NAT-validated. Every other protocol carries a
+    // packet-level flow-initiator marker we exclude above: TCP excludes the
+    // initial SYN, ICMP excludes the echo REQUEST. UDP has NO such marker —
+    // any UDP datagram can open a new flow, and there is no "non-initiating
+    // UDP" form. A session-less UDP packet reaching here (a real established
+    // UDP reply is served by the synced session in
+    // `resolve_flow_session_decision` before this point) is therefore a NEW
+    // forward flow, NOT return traffic. Fast-pathing it built a NAT-less,
+    // reverse-keyed session for a forward flow — the source-NAT that a new
+    // outbound flow requires was skipped (NAT bypass) and the owner recorded
+    // the flow in the wrong direction (session-state corruption). Fall
+    // through instead so the RG owner runs the packet through its normal
+    // forward decision: source-NAT applied and a FORWARD session installed.
+    if meta.protocol == PROTO_UDP {
+        return None;
+    }
 
     let fabric_return_resolution =
         lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, resolution_target);
