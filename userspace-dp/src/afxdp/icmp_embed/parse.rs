@@ -113,7 +113,14 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6_l4(packet: &[u8]) -> Optio
     let mut offset = 40usize;
     for _ in 0..6 {
         match protocol {
-            0 | 43 | 60 => {
+            // #4517: generic length-prefixed IPv6 extension headers —
+            // HbH (0) / Routing (43) / DestOpt (60) / Mobility (135) /
+            // HIP (139) / Shim6 (140) / experimental (253/254), all with
+            // the `(HdrExtLen + 1) * 8` advance. Kept in parity with
+            // `packet_rel_l4_offset_and_protocol` so an ICMPv6 error that
+            // quotes an exotic-EH inner packet still resolves the embedded
+            // L4 and matches its session. ESP (50) stays unwalked.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                 let opt = packet.get(offset..offset + 2)?;
                 protocol = opt[0];
                 offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
@@ -272,6 +279,26 @@ mod embedded_v6_parse_tests {
         assert_eq!(hdr.proto, PROTO_TCP);
         assert_eq!(hdr.l4_off, 48);
         assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
+    }
+
+    #[test]
+    fn embedded_mobility_hip_shim6_headers_recover_true_proto() {
+        // #4517: an ICMPv6 error that quotes an inner packet whose chain
+        // hides the L4 behind a Mobility (135) / HIP (139) / Shim6 (140)
+        // extension header must still resolve the embedded TCP so the
+        // return-path session/NAT match can form. Before #4517 the walk
+        // stopped at type 135/139/140 and reported proto=135 with garbage
+        // ports (parity gap vs the canonical afxdp walker).
+        for exotic in [135u8, 139u8, 140u8] {
+            let eh = (exotic, vec![0u8, 0, 0, 0, 0, 0, 0, 0]); // 8-byte generic EH
+            let p = embedded_v6(&[eh], PROTO_TCP);
+            let (rel, proto) = parse_embedded_v6_l4(&p)
+                .unwrap_or_else(|| panic!("walk past EH type {exotic} must succeed"));
+            assert_eq!((rel, proto), (48, PROTO_TCP));
+            let hdr = parse_embedded_v6(&p, 0).expect("parse succeeds");
+            assert_eq!(hdr.proto, PROTO_TCP);
+            assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
+        }
     }
 
     #[test]
