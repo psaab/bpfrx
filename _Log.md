@@ -1,3 +1,44 @@
+## 2026-07-07 — #4543 screen: fail closed on a malformed IPv4 option TLV (source-route bypass)
+
+- **Timestamp**: 2026-07-07T17:15Z
+- **Action**: The IPv4 options TLV walk in `extract_screen_info`
+  (userspace-dp/src/screen/extract.rs) `break`d out of the scan on a
+  MALFORMED length-prefixed option (a length byte at the very end of the
+  options region, a declared length `< 2`, or one running past the
+  options end). Because the `kind == LSRR/SSRR` test necessarily precedes
+  the length check, a `break` on a bad option ABORTED the walk before an
+  LSRR(131)/SSRR(137) placed AFTER it could be seen, leaving
+  `saw_ipv4_source_route=false` → `check_source_route` returned Pass. An
+  attacker could prepend `[type=0x44,len=0x01]` to an LSRR (IHL>5) and
+  transit the `source-route` screen the operator enabled to drop it. #4167
+  added TRUNCATION fail-closed for the IPv4 header but not MALFORMED-OPTION
+  fail-closed — an inconsistency with its own contract. Fix: the two
+  malformed-option arms now `return Err(ScreenParseError::
+  TruncatedIpv4Header)` (the "ip-malformed" drop reason) instead of
+  `break`, so the caller (poll_stages.rs / poll_descriptor) fail-closes
+  and DROPS the frame, mirroring #4167's truncation fail-closed and vSRX,
+  which drops malformed IP options / source-route regardless of option
+  order. A well-formed options list (including a well-formed LSRR/SSRR
+  after a benign option) is unaffected — every option's length is
+  consistent so the walk advances normally and the LSRR/SSRR arm still
+  fires; a no-options packet is unaffected. No new error variant was
+  needed — `TruncatedIpv4Header` already maps to "ip-malformed"
+  (SCREEN_IP_MALFORMED, 1<<18) and matches the semantic. No standalone
+  doc changed: the fail-closed contract lives in the extract.rs
+  doc-comment block (updated with a #4543 note), matching how #4167
+  documented itself (code comment + _Log.md, no separate markdown doc).
+- **File(s)**: userspace-dp/src/screen/extract.rs (two malformed-option
+  arms → `return Err`; function doc-comment #4543 note),
+  userspace-dp/src/screen/tests.rs (three RED-on-revert tests), _Log.md
+- **Validation**: RED-on-revert verified — reverting BOTH malformed arms
+  to `break` fails `extract_screen_info_ipv4_malformed_option_before_lsrr_
+  fails_closed` (returns Ok with `saw_ipv4_source_route=false`) and
+  `extract_screen_info_ipv4_option_length_overruns_region_fails_closed`,
+  while `extract_screen_info_ipv4_wellformed_lsrr_after_benign_option_
+  trips` (over-drop guard) stays green. FULL cargo test --release
+  --test-threads=1: 3704 + 54 + 8 + 22 + 1 = 3789 passed, 0 failed, 2
+  ignored (215 screen tests within the main-binary count).
+
 ## 2026-07-07 — #4535 three-color policer unspecified color mode defaults to color-blind (Junos parity)
 
 - **Timestamp**: 2026-07-07T15:30Z

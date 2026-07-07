@@ -29,6 +29,16 @@ use super::packet::{PROTO_TCP, ScreenPacketInfo, ScreenParseError};
 /// `check_icmp_fragment`/`check_source_route` — the IPv4 mirror of the
 /// IPv6 fail-open the #2146 hardening closed.
 ///
+/// #4543: the IPv4 options TLV walk is now fail-closed on a MALFORMED
+/// option too, not only on a truncated header. A length-prefixed option
+/// whose length byte is missing, is `< 2`, or runs past the options
+/// region returns `Err(TruncatedIpv4Header)` instead of `break`ing. The
+/// LSRR/SSRR kind test precedes the length check, so the old `break`
+/// aborted the scan before a source-route option placed AFTER a bad
+/// option could be seen — a `source-route` screen bypass. This completes
+/// #4167's fail-closed contract for the option region and matches vSRX,
+/// which drops malformed IP options / source-route regardless of order.
+///
 /// #3120: the IPv6 walk now CONTINUES past the Fragment header for a
 /// FIRST fragment (fragment offset == 0) instead of stopping at it, so a
 /// `Fragment → Destination-Options → TCP` chain (RFC 8200 permits an
@@ -128,6 +138,25 @@ pub(crate) fn extract_screen_info(
         // NOP(1) is one byte, every other option is length-prefixed.
         // The options region is guaranteed captured by the fail-closed
         // `l3_offset + ihl_bytes > frame.len()` check above.
+        //
+        // FAIL-CLOSED (#4543): a MALFORMED length-prefixed option (a
+        // length byte at the very end of the options region with no room
+        // for the length field, or a declared length < 2, or one that
+        // runs past the options end) returns `Err(TruncatedIpv4Header)`
+        // instead of `break`. The kind==LSRR/SSRR test necessarily
+        // precedes the length check, so a `break` on a malformed option
+        // ABORTED the walk before a source-route option placed AFTER it
+        // could be seen — leaving `saw_ipv4_source_route=false` so
+        // `check_source_route` passed a packet the extractor could not
+        // fully parse. An attacker could prepend `[type=0x44,len=0x01]`
+        // to an LSRR and evade the `source-route` screen the operator
+        // enabled. Dropping the malformed frame mirrors #4167's
+        // truncation fail-closed contract and vSRX, which drops malformed
+        // IP options / source-route regardless of option ordering. A
+        // WELL-FORMED options list (including a well-formed LSRR/SSRR the
+        // screen must catch) is unaffected: every option's length is
+        // consistent, so the walk advances normally and the LSRR/SSRR arm
+        // still fires.
         if info.ip_ihl > 5 {
             const IPOPT_EOOL: u8 = 0;
             const IPOPT_NOP: u8 = 1;
@@ -150,14 +179,20 @@ pub(crate) fn extract_screen_info(
                 }
                 // Length-prefixed option: byte at pos+1 is the total
                 // option length (including the kind/length bytes). A
-                // malformed length (<2 or running past the options end)
-                // ends the walk to avoid an infinite/over-read loop.
+                // length byte at the very end of the options region (no
+                // room to read it) is a MALFORMED option — fail closed
+                // (#4543) rather than `break`, which would let an LSRR/
+                // SSRR placed AFTER the bad option evade the source-route
+                // screen.
                 if pos + 1 >= opt_end {
-                    break;
+                    return Err(ScreenParseError::TruncatedIpv4Header);
                 }
                 let opt_len = frame[pos + 1] as usize;
+                // A declared length < 2 (impossible for a length-prefixed
+                // option) or one running past the options end is MALFORMED
+                // — fail closed (#4543), same reasoning as above.
                 if opt_len < 2 || pos + opt_len > opt_end {
-                    break;
+                    return Err(ScreenParseError::TruncatedIpv4Header);
                 }
                 pos += opt_len;
             }
