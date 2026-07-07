@@ -608,6 +608,27 @@ validate, zero heap — so the pool-mode-SNAT fast path is unchanged. The
 bumps whenever a bucket grows past one handle, quantifying how often the
 collision path is exercised.
 
+**All three NAT session indexes are 1:N (#4438).** #4399 fixed only
+`nat_reverse_index`; the other two secondary indexes — `forward_wire_index`
+(forward-wire-tuple → forward handle, used by `find_forward_wire_match`) and
+`reverse_translated_index` (translated/alias-tuple → reverse handle, the alias
+branch of `lookup`) — still stored one handle per key and DISPLACED on the same
+non-bijective collision, re-opening the exact hijack on the forward and
+translated-lookup paths (interface-mode SNAT collapses the forward-wire tuple
+just as it collapses the reverse-wire tuple, and DNAT-to-shared-backend / NAT64
+collapse two reverse entries onto one translated tuple). #4438 makes both
+multimaps with the identical discipline: a shared `NatIndexBucket =
+SmallVec<[handle; 2]>`, append-not-displace on install (`nat_index_bucket_push`,
+dedup on the per-packet refresh), validate-each-candidate-against-the-full-tuple
+on lookup (`find_forward_wire_match_with_origin` and
+`resolve_reverse_translated_handle` walk the bucket), and per-handle delete that
+drops the key only when its bucket empties (`nat_index_bucket_remove`). Pool-mode
+SNAT stays a length-1 inline bucket on every index (zero heap, one validate).
+The `nat_reverse_key_collisions` counter now aggregates bucket-growth across all
+three indexes; because one non-bijective flow-pair collides on several indexes
+at once, it can bump more than once per pair — reinforcing its documented
+upper-bound, not-a-pair-census character.
+
 **Protocol timeouts:**
 | Protocol | Active | Closing (FIN/RST) |
 |----------|--------|-------------------|

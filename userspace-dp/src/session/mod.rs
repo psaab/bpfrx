@@ -23,21 +23,25 @@ use std::net::IpAddr;
 type SeededKeyMap<V> = HashMap<SessionKey, V, FxSeededState>;
 type SeededIpMap<V> = HashMap<IpAddr, V, FxSeededState>;
 
-/// #4399: bucket type for the reverse-NAT lookup index (`nat_reverse_index`).
-/// It is a 1:N multimap — one reverse wire/canonical key can legitimately map
-/// to more than one forward session when NAT is non-bijective (interface-mode
-/// SNAT with no port translation, DNAT-to-shared-backend, NAT64, non-bijective
-/// static NAT — the latent #1758 collision). Inline capacity 2 keeps the
-/// common case — one handle per reverse key (pool-mode SNAT is bijective; most
-/// deployments never collide) — ZERO-alloc, and absorbs the typical 2-way
-/// collision without spilling to the heap. Two inline `u32` slots cost the
-/// same as one: the heap variant `(ptr, cap)` dominates the SmallVec union
-/// size, so N=2 is free relative to N=1. Before #4399 this was a single-value
-/// `SeededKeyMap<u32>`: a colliding install DISPLACED the earlier handle, so
-/// the displaced session's reply was mis-delivered or (once the later session
-/// closed) dropped.
-type ReverseIndexBucket = SmallVec<[u32; 2]>;
-type SeededReverseIndex = HashMap<SessionKey, ReverseIndexBucket, FxSeededState>;
+/// #4399/#4438: the 1:N bucket type shared by ALL THREE NAT session lookup
+/// indexes — `nat_reverse_index`, `forward_wire_index`, and
+/// `reverse_translated_index`. Each is a multimap because NAT can be
+/// non-bijective: one reverse / forward-wire / translated key legitimately maps
+/// to more than one session under interface-mode SNAT with no port translation,
+/// DNAT-to-shared-backend, NAT64, or non-bijective static NAT — the latent
+/// #1758 collision (pool-mode SNAT is bijective, so its buckets stay length 1).
+/// Inline capacity 2 keeps the common non-colliding case — one handle per key,
+/// which most deployments never exceed — ZERO-alloc, and absorbs the typical
+/// 2-way collision without spilling to the heap. Two inline `u32` slots cost
+/// the same as one: the heap variant `(ptr, cap)` dominates the SmallVec union
+/// size, so N=2 is free relative to N=1. Before #4399/#4438 each index was a
+/// single-value `SeededKeyMap<u32>`: a colliding install DISPLACED the earlier
+/// handle, so the displaced session's traffic was mis-delivered (a session
+/// hijack) or (once the later session closed) dropped.
+type NatIndexBucket = SmallVec<[u32; 2]>;
+type SeededReverseIndex = HashMap<SessionKey, NatIndexBucket, FxSeededState>;
+type SeededForwardWireIndex = HashMap<SessionKey, NatIndexBucket, FxSeededState>;
+type SeededReverseTranslatedIndex = HashMap<SessionKey, NatIndexBucket, FxSeededState>;
 
 // #1047 P2: SessionKey and the key-transform helpers (forward_wire_key,
 // translated_session_key, reverse_canonical_key, reverse_wire_key,
@@ -500,8 +504,22 @@ pub(crate) struct SessionTable {
     /// earlier one. `find_forward_nat_match` validates each candidate against
     /// the full reply tuple.
     nat_reverse_index: SeededReverseIndex,
-    forward_wire_index: SeededKeyMap<u32>,
-    reverse_translated_index: SeededKeyMap<u32>,
+    /// #4438: `forward_wire_index` is a 1:N multimap (`SeededForwardWireIndex`)
+    /// — a bucket of forward handles per forward-wire key — so a forward-wire
+    /// collision (interface-mode SNAT with no port translation, and the other
+    /// non-bijective NAT classes) keeps BOTH colliding forward sessions
+    /// resolvable instead of displacing the earlier one.
+    /// `find_forward_wire_match_with_origin` validates each candidate against
+    /// the full forward-wire tuple.
+    forward_wire_index: SeededForwardWireIndex,
+    /// #4438: `reverse_translated_index` is a 1:N multimap
+    /// (`SeededReverseTranslatedIndex`) — a bucket of reverse handles per
+    /// translated (alias) key — so a translated-key collision keeps BOTH
+    /// colliding reverse sessions resolvable instead of displacing the earlier
+    /// one. The alias branch of `lookup_with_origin` resolves the bucket via
+    /// `resolve_reverse_translated_handle`, validating each candidate against
+    /// the full translated tuple.
+    reverse_translated_index: SeededReverseTranslatedIndex,
     /// #964 Step 1: owner-RG sets keyed by handle (was Key).
     owner_rg_sessions: FxHashMap<i32, FxHashSet<u32>>,
     deltas: VecDeque<SessionDelta>,
@@ -569,11 +587,17 @@ pub(crate) struct SessionTable {
     /// strong evidence the collision never fires; a nonzero value quantifies
     /// how often two forward sessions shared one reverse key.
     ///
-    /// #4399: the structural mitigation now ships — `nat_reverse_index` is a
-    /// 1:N multimap, so a collision no longer DISPLACES the earlier session;
-    /// both handles coexist in the bucket and `find_forward_nat_match` walks
-    /// them, validating each against the full reply tuple. This counter is
-    /// retained as observability (how often the collision path is exercised).
+    /// #4399/#4438: the structural mitigation now ships — all three NAT
+    /// session indexes (`nat_reverse_index`, `forward_wire_index`,
+    /// `reverse_translated_index`) are 1:N multimaps, so a collision no longer
+    /// DISPLACES the earlier session; both handles coexist in the bucket and
+    /// the lookup walks them, validating each against the full tuple. This
+    /// counter is retained as observability and, as of #4438, AGGREGATES
+    /// bucket-growth across ALL THREE indexes (it was reverse-index-only
+    /// before). Because one non-bijective flow-pair collides on several indexes
+    /// at once (e.g. interface-mode SNAT collapses both `reverse_wire` and
+    /// `forward_wire`), a single logical collision can bump this counter more
+    /// than once — reinforcing its upper-bound, not-a-pair-census character.
     /// Worker-owned, single-threaded — plain u64, no atomics (mirrors
     /// `create_drops`).
     nat_reverse_key_collisions: u64,
@@ -1726,25 +1750,57 @@ impl SessionTable {
         if is_reverse {
             let translated = translated_session_key(key, nat);
             if translated != *key {
-                self.reverse_translated_index.insert(translated, handle);
+                // #4438: APPEND to the translated (alias) bucket (1:N multimap)
+                // instead of DISPLACING a prior occupant. Two reverse sessions
+                // whose translated tuples collide (DNAT-to-shared-backend,
+                // NAT64, interface-mode SNAT — the non-bijective classes) now
+                // coexist, so the earlier reverse session's inbound alias
+                // lookup is no longer stolen by the later install.
+                nat_index_bucket_push(
+                    &mut self.reverse_translated_index,
+                    &mut self.nat_reverse_key_collisions,
+                    translated,
+                    handle,
+                );
             }
         } else {
             // #4399: APPEND `handle` to the reverse-key bucket (1:N multimap)
             // instead of DISPLACING a prior occupant (#1758/#1760). A
             // different handle already present in the bucket means a distinct
             // session previously resolved to this reverse key K — the latent
-            // 1:N collision. `nat_reverse_index_push` keeps BOTH handles (so
-            // the earlier session's reply is no longer lost), dedups a
-            // re-assert of the same handle on the per-packet refresh (#1753),
-            // and bumps `nat_reverse_key_collisions` when the bucket grows.
-            self.nat_reverse_index_push(reverse_wire_key(key, nat), handle);
+            // 1:N collision. The push keeps BOTH handles (so the earlier
+            // session's reply is no longer lost), dedups a re-assert of the
+            // same handle on the per-packet refresh (#1753), and bumps
+            // `nat_reverse_key_collisions` when the bucket grows.
+            nat_index_bucket_push(
+                &mut self.nat_reverse_index,
+                &mut self.nat_reverse_key_collisions,
+                reverse_wire_key(key, nat),
+                handle,
+            );
             let reverse_canonical = reverse_canonical_key(key, nat);
             if reverse_canonical != *key {
-                self.nat_reverse_index_push(reverse_canonical, handle);
+                nat_index_bucket_push(
+                    &mut self.nat_reverse_index,
+                    &mut self.nat_reverse_key_collisions,
+                    reverse_canonical,
+                    handle,
+                );
             }
             let forward_wire = forward_wire_key(key, nat);
             if forward_wire != *key {
-                self.forward_wire_index.insert(forward_wire, handle);
+                // #4438: forward_wire_index is now a 1:N multimap too — the
+                // forward-wire key collides under the SAME non-bijective NAT
+                // (interface-mode SNAT collapses both the reverse-wire and the
+                // forward-wire tuples), so it needs the identical append-not-
+                // displace discipline. `find_forward_wire_match_with_origin`
+                // validates each bucket candidate against the full tuple.
+                nat_index_bucket_push(
+                    &mut self.forward_wire_index,
+                    &mut self.nat_reverse_key_collisions,
+                    forward_wire,
+                    handle,
+                );
             }
         }
         if owner_rg_id > 0 {
@@ -1781,13 +1837,17 @@ impl SessionTable {
         is_reverse: bool,
     ) {
         if is_reverse {
-            let translated = translated_session_key(key, nat);
-            if matches!(
-                self.reverse_translated_index.get(&translated),
-                Some(stored) if *stored == handle
-            ) {
-                self.reverse_translated_index.remove(&translated);
-            }
+            // #4438: per-HANDLE removal from the 1:N translated (alias)
+            // bucket. A colliding sibling reverse session in the same bucket is
+            // untouched; the key drops only once its bucket empties — so
+            // closing one of two reverse sessions that share a translated key
+            // leaves the survivor's inbound alias lookup intact (the
+            // single-value map wiped the whole key and stranded it).
+            nat_index_bucket_remove(
+                &mut self.reverse_translated_index,
+                &translated_session_key(key, nat),
+                handle,
+            );
             return;
         }
         // #4399: value-guarded per-HANDLE removal from the 1:N reverse-key
@@ -1795,48 +1855,18 @@ impl SessionTable {
         // key is dropped only once its bucket empties. This is what leaves a
         // surviving colliding session's return path intact when the other
         // closes (the single-value map wiped the whole key and stranded it).
-        self.nat_reverse_index_remove(&reverse_wire_key(key, nat), handle);
-        self.nat_reverse_index_remove(&reverse_canonical_key(key, nat), handle);
-        let forward_wire = forward_wire_key(key, nat);
-        if matches!(self.forward_wire_index.get(&forward_wire), Some(stored) if *stored == handle) {
-            self.forward_wire_index.remove(&forward_wire);
-        }
-    }
-
-    /// #4399: append `handle` to the reverse-key bucket for `key`, growing
-    /// the 1:N multimap instead of DISPLACING a prior occupant. A re-assert
-    /// of a handle already present is a no-op (dedup), so the per-packet
-    /// refresh re-index (#1753) neither double-inserts nor mis-counts. When
-    /// the bucket already holds a DIFFERENT handle, the append records a
-    /// genuine reverse-key 1:N collision (#1758/#1760) on the
-    /// `nat_reverse_key_collisions` telemetry counter — the earlier session's
-    /// return path is now PRESERVED alongside the later one rather than lost.
-    fn nat_reverse_index_push(&mut self, key: SessionKey, handle: u32) {
-        let bucket = self.nat_reverse_index.entry(key).or_default();
-        if bucket.contains(&handle) {
-            // Idempotent re-assert (refresh / reject re-add). No growth, no
-            // new collision — the handle already owns this reverse key.
-            return;
-        }
-        let collided = !bucket.is_empty();
-        bucket.push(handle);
-        if collided {
-            self.nat_reverse_key_collisions = self.nat_reverse_key_collisions.saturating_add(1);
-        }
-    }
-
-    /// #4399: remove ONLY `handle` from the reverse-key bucket for `key`,
-    /// dropping the key entirely once its bucket empties. Value-guarded per
-    /// handle: a colliding sibling in the same bucket is untouched, so
-    /// closing one of two sessions that share a reverse key leaves the
-    /// survivor's return path intact (the single-value map stranded it).
-    fn nat_reverse_index_remove(&mut self, key: &SessionKey, handle: u32) {
-        if let Some(bucket) = self.nat_reverse_index.get_mut(key) {
-            bucket.retain(|h| *h != handle);
-            if bucket.is_empty() {
-                self.nat_reverse_index.remove(key);
-            }
-        }
+        nat_index_bucket_remove(&mut self.nat_reverse_index, &reverse_wire_key(key, nat), handle);
+        nat_index_bucket_remove(
+            &mut self.nat_reverse_index,
+            &reverse_canonical_key(key, nat),
+            handle,
+        );
+        // #4438: forward_wire_index gets the identical per-handle removal.
+        nat_index_bucket_remove(
+            &mut self.forward_wire_index,
+            &forward_wire_key(key, nat),
+            handle,
+        );
     }
 
     /// #964 Step 1 mandatory debug assertion: scan every
@@ -1847,14 +1877,21 @@ impl SessionTable {
     #[cfg(debug_assertions)]
     fn no_index_points_at(&self, handle: u32) -> bool {
         !self.key_to_handle.values().any(|h| *h == handle)
-            // #4399: buckets hold multiple handles — the freed handle must be
-            // absent from EVERY reverse-key bucket, not just the stored scalar.
+            // #4399/#4438: all three NAT indexes hold multiple handles per key
+            // — the freed handle must be absent from EVERY bucket, not just a
+            // stored scalar.
             && !self
                 .nat_reverse_index
                 .values()
                 .any(|bucket| bucket.contains(&handle))
-            && !self.forward_wire_index.values().any(|h| *h == handle)
-            && !self.reverse_translated_index.values().any(|h| *h == handle)
+            && !self
+                .forward_wire_index
+                .values()
+                .any(|bucket| bucket.contains(&handle))
+            && !self
+                .reverse_translated_index
+                .values()
+                .any(|bucket| bucket.contains(&handle))
             && !self
                 .owner_rg_sessions
                 .values()
@@ -1884,6 +1921,56 @@ fn remove_owner_rg_index_entry(
         entries.remove(&handle);
         if entries.is_empty() {
             index.remove(&owner_rg_id);
+        }
+    }
+}
+
+/// #4399/#4438: append `handle` to the 1:N bucket for `key` in one of the NAT
+/// session lookup indexes (`nat_reverse_index`, `forward_wire_index`,
+/// `reverse_translated_index`), growing the multimap instead of DISPLACING a
+/// prior occupant (#1758/#1760). A re-assert of a handle already present is a
+/// no-op (dedup), so the per-packet refresh re-index (#1753) neither
+/// double-inserts nor mis-counts. When the bucket already holds a DIFFERENT
+/// handle the append records a genuine 1:N collision by bumping `collisions`
+/// (the shared `nat_reverse_key_collisions` telemetry) — both handles now
+/// coexist and the lookup validates each candidate against the full tuple, so
+/// the earlier session's traffic is PRESERVED alongside the later one rather
+/// than hijacked or dropped. A free function (not a method) so the caller can
+/// pass disjoint `&mut` borrows of the specific index map and the counter.
+fn nat_index_bucket_push(
+    map: &mut HashMap<SessionKey, NatIndexBucket, FxSeededState>,
+    collisions: &mut u64,
+    key: SessionKey,
+    handle: u32,
+) {
+    let bucket = map.entry(key).or_default();
+    if bucket.contains(&handle) {
+        // Idempotent re-assert (refresh / reject re-add). No growth, no new
+        // collision — the handle already owns this key.
+        return;
+    }
+    let collided = !bucket.is_empty();
+    bucket.push(handle);
+    if collided {
+        *collisions = collisions.saturating_add(1);
+    }
+}
+
+/// #4399/#4438: remove ONLY `handle` from the 1:N bucket for `key` in one of
+/// the NAT session lookup indexes, dropping the key entirely once its bucket
+/// empties. Value-guarded per handle: a colliding sibling in the same bucket is
+/// untouched, so closing one of two sessions that share a key leaves the
+/// survivor's lookup path intact (the single-value map wiped the whole key and
+/// stranded it). No-op when the key is absent.
+fn nat_index_bucket_remove(
+    map: &mut HashMap<SessionKey, NatIndexBucket, FxSeededState>,
+    key: &SessionKey,
+    handle: u32,
+) {
+    if let Some(bucket) = map.get_mut(key) {
+        bucket.retain(|h| *h != handle);
+        if bucket.is_empty() {
+            map.remove(key);
         }
     }
 }

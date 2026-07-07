@@ -3771,16 +3771,22 @@ fn nat_reverse_key_collision_counter_increments_on_displacement() {
         "a single install with no prior K occupant must not count",
     );
 
-    // Second install: K -> S2 displaces the live S1 -> one collision.
+    // Second install: K -> S2 collides with the live S1. #4438: interface-mode
+    // SNAT collapses BOTH the reverse-wire key AND the forward-wire key, and
+    // the collision counter now aggregates bucket-growth across all three NAT
+    // indexes — so this one logical flow-pair bumps it twice (reverse_wire +
+    // forward_wire; reverse_canonical does NOT collide here, the internal src
+    // IPs differ). It is an upper-bound "collision path exercised" signal, not
+    // a pair census.
     assert!(table.install_with_protocol(s2.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
     assert_eq!(
         table.nat_reverse_key_collisions(),
-        1,
-        "S2 install displacing live S1 on shared K must count exactly once",
+        2,
+        "S2 colliding with live S1 bumps reverse_wire + forward_wire (#4438)",
     );
 
     // Re-asserting S2's own ownership (refresh re-asserts the same handle)
-    // must NOT count — the displaced handle equals the installing handle.
+    // must NOT count — the append dedups when the handle already owns the key.
     let refresh_ns = now + 2 * WHEEL_TICK_NS;
     let req = SessionUpdate {
         key: &s2,
@@ -3794,8 +3800,8 @@ fn nat_reverse_key_collision_counter_increments_on_displacement() {
     assert!(table.update_session(req, false));
     assert_eq!(
         table.nat_reverse_key_collisions(),
-        1,
-        "S2 re-asserting its own K ownership must not count (old == handle)",
+        2,
+        "S2 re-asserting its own ownership must not count (dedup on re-add)",
     );
 }
 
@@ -3882,8 +3888,9 @@ fn nat_reverse_1n_collision_preserves_displaced_return_path() {
     );
     assert_eq!(
         table.nat_reverse_key_collisions(),
-        1,
-        "the reverse-key collision must be counted exactly once",
+        2,
+        "#4438: interface SNAT collides both reverse_wire and forward_wire, so \
+         the aggregate collision counter bumps twice for this one flow-pair",
     );
 
     // A reply on K resolves to a LIVE forward session. Both validate — the
@@ -3983,6 +3990,302 @@ fn nat_reverse_1n_pool_snat_fast_path_stays_single_value() {
         table.find_forward_nat_match(&reply).map(|m| m.key),
         Some(s1.clone()),
         "the pool-mode reply resolves through the single-value fast path",
+    );
+}
+
+// ── #4438: 1:N forward_wire_index + reverse_translated_index multimaps ─
+//
+// #4399 fixed only nat_reverse_index. The OTHER two NAT session indexes
+// still DISPLACED on a 1:N collision, so a colliding session hijacked an
+// earlier one on the forward-wire or translated-alias path. These tests
+// extend the #4399 discipline (bucket + validate-on-lookup + per-handle
+// delete + pool-mode len-1 fast path) to both. They are RED on the
+// pre-#4438 single-value implementation.
+
+fn forward_wire_bucket_len(table: &SessionTable, wire_key: &SessionKey) -> usize {
+    table
+        .forward_wire_index
+        .get(wire_key)
+        .map_or(0, |bucket| bucket.len())
+}
+
+fn reverse_translated_bucket_len(table: &SessionTable, translated_key: &SessionKey) -> usize {
+    table
+        .reverse_translated_index
+        .get(translated_key)
+        .map_or(0, |bucket| bucket.len())
+}
+
+#[test]
+fn forward_wire_1n_collision_preserves_displaced_session() {
+    // Two interface-mode SNAT flows from DIFFERENT internal hosts using the
+    // SAME ephemeral source port to the SAME external server collapse to the
+    // SAME forward-wire key W (source-IP-only rewrite, no port translation ->
+    // non-bijective, the #1758 collision; interface SNAT collides the
+    // forward-wire tuple just as it collides the reverse-wire tuple). The
+    // single-value index displaced S1 the moment S2 installed; the 1:N
+    // multimap keeps BOTH handles resolvable.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let dec = iface_snat_decision(Ipv4Addr::new(203, 0, 113, 9));
+
+    let mut s1 = key_v4();
+    s1.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    s1.src_port = 5555;
+    let mut s2 = key_v4();
+    s2.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    s2.src_port = 5555;
+
+    let wire = forward_wire_key(&s1, dec.nat);
+    assert_eq!(
+        wire,
+        forward_wire_key(&s2, dec.nat),
+        "interface SNAT must make the two flows share forward-wire key W",
+    );
+    // The forward-wire key genuinely differs from each untranslated key, so
+    // the index is populated for both (index gate: forward_wire != key).
+    assert_ne!(wire, s1);
+    assert_ne!(wire, s2);
+
+    assert!(table.install_with_protocol(s1.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(s2.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+
+    assert_eq!(
+        forward_wire_bucket_len(&table, &wire),
+        2,
+        "both colliding forward handles must share the forward-wire bucket",
+    );
+    // #4438: interface SNAT collides both reverse_wire and forward_wire, so the
+    // aggregate collision counter bumps twice for this one flow-pair.
+    assert_eq!(table.nat_reverse_key_collisions(), 2);
+
+    // A forward-wire lookup on W resolves to a LIVE session. Both validate --
+    // the wire tuple is genuinely ambiguous under no-PAT interface SNAT -- so
+    // the multimap returns the first-installed S1 deterministically instead of
+    // "whatever was written last".
+    assert_eq!(
+        table.find_forward_wire_match(&wire).map(|m| m.key),
+        Some(s1.clone()),
+        "forward-wire lookup on W resolves to the first-installed session",
+    );
+
+    // RED-on-revert: close S2 (the LAST-installed). The single-value map stored
+    // W -> S2, so removing S2 wiped W entirely and STRANDED S1's wire lookup
+    // (find -> None). The multimap removes ONLY S2's handle.
+    table.delete(&s2);
+    assert_eq!(
+        forward_wire_bucket_len(&table, &wire),
+        1,
+        "delete removes only S2's handle; S1's entry remains in the bucket",
+    );
+    assert_eq!(
+        table.find_forward_wire_match(&wire).map(|m| m.key),
+        Some(s1.clone()),
+        "surviving S1 must still resolve after colliding S2 closes \
+         (single-value map returned None here)",
+    );
+
+    // Closing S1 too empties the bucket and drops the forward-wire key.
+    table.delete(&s1);
+    assert_eq!(
+        forward_wire_bucket_len(&table, &wire),
+        0,
+        "the forward-wire key is dropped once its bucket empties",
+    );
+    assert!(table.find_forward_wire_match(&wire).is_none());
+}
+
+#[test]
+fn forward_wire_1n_delete_removes_specific_handle_not_the_key() {
+    // Symmetric: closing the FIRST-installed session leaves the SECOND
+    // resolvable. Proves the forward-wire delete is per-handle, not per-key.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let dec = iface_snat_decision(Ipv4Addr::new(203, 0, 113, 9));
+
+    let mut s1 = key_v4();
+    s1.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    s1.src_port = 7777;
+    let mut s2 = key_v4();
+    s2.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    s2.src_port = 7777;
+    let wire = forward_wire_key(&s1, dec.nat);
+
+    assert!(table.install_with_protocol(s1.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(s2.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(forward_wire_bucket_len(&table, &wire), 2);
+
+    // Close S1 (first-installed). S2 must survive and resolve on W.
+    table.delete(&s1);
+    assert_eq!(forward_wire_bucket_len(&table, &wire), 1);
+    assert_eq!(
+        table.find_forward_wire_match(&wire).map(|m| m.key),
+        Some(s2.clone()),
+        "surviving S2 resolves on W after the first-installed S1 closes",
+    );
+}
+
+#[test]
+fn forward_wire_1n_pool_snat_fast_path_stays_single_value() {
+    // Pool-mode SNAT translates the source port (PAT) -> bijective -> two
+    // distinct flows never share a forward-wire key, so every bucket stays
+    // len 1 (the zero-collision fast path the throughput path depends on).
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let dec = nat_rewrite(); // rewrite_src + rewrite_src_port (PAT)
+
+    let mut s1 = key_v4();
+    s1.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    s1.src_port = 5555;
+    let wire = forward_wire_key(&s1, dec.nat);
+
+    assert!(table.install_with_protocol(s1.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(
+        forward_wire_bucket_len(&table, &wire),
+        1,
+        "a bijective pool-mode SNAT forward-wire key stays a len-1 bucket",
+    );
+    assert_eq!(
+        table.find_forward_wire_match(&wire).map(|m| m.key),
+        Some(s1.clone()),
+        "the pool-mode forward-wire lookup resolves through the len-1 fast path",
+    );
+}
+
+/// Build a reverse (reply-direction) SessionDecision whose NAT rewrites the
+/// destination to a shared backend and a reverse metadata carrying the given
+/// `zone` (used only to distinguish which reverse session resolved).
+fn shared_backend_reverse(backend: IpAddr, zone: u16) -> (SessionDecision, SessionMetadata) {
+    let decision = SessionDecision {
+        resolution: resolution(),
+        nat: NatDecision {
+            rewrite_dst: Some(backend),
+            ..NatDecision::default()
+        },
+    };
+    let mut md = metadata();
+    md.is_reverse = true;
+    md.ingress_zone = zone;
+    (decision, md)
+}
+
+#[test]
+fn reverse_translated_1n_collision_preserves_displaced_alias() {
+    // DNAT-to-shared-backend: client C reaches two external VIPs that both DNAT
+    // to the SAME backend B. Each reverse entry's translated (alias) tuple
+    // overwrites dst -> B, so the two DISTINCT reverse keys collapse to the
+    // SAME translated key T (the non-bijective #1758 class). The single-value
+    // index displaced R1 the moment R2 installed; the 1:N multimap keeps BOTH
+    // aliases resolvable.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    let backend = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50));
+    let (rev_dec, r1_meta) = shared_backend_reverse(backend, 101);
+    let (_, r2_meta) = shared_backend_reverse(backend, 202);
+
+    let r1 = SessionKey {
+        addr_family: 2,
+        protocol: PROTO_TCP,
+        src_ip: client,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+        src_port: 40001,
+        dst_port: 443,
+    };
+    let mut r2 = r1.clone();
+    r2.dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+
+    let t = translated_session_key(&r1, rev_dec.nat);
+    assert_eq!(
+        t,
+        translated_session_key(&r2, rev_dec.nat),
+        "both reverse sessions must share the translated alias key T",
+    );
+    // T differs from each stored reverse key (index gate: translated != key)
+    // and from every primary key, so the T lookup takes the alias path.
+    assert_ne!(t, r1);
+    assert_ne!(t, r2);
+
+    assert!(table.install_with_protocol(r1.clone(), rev_dec, r1_meta, now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(r2.clone(), rev_dec, r2_meta, now, PROTO_TCP, 0x10));
+
+    assert_eq!(
+        reverse_translated_bucket_len(&table, &t),
+        2,
+        "both colliding reverse handles must share the translated-key bucket",
+    );
+    assert_eq!(
+        table.nat_reverse_key_collisions(),
+        1,
+        "the translated-key collision must be counted exactly once",
+    );
+
+    // Alias lookup on T resolves to the first-installed R1 deterministically
+    // (distinguished by ingress_zone) instead of "whatever was written last".
+    assert_eq!(
+        table
+            .lookup(&t, now + WHEEL_TICK_NS, 0x10)
+            .map(|l| l.metadata.ingress_zone),
+        Some(101),
+        "alias lookup on T resolves to the first-installed reverse session",
+    );
+
+    // RED-on-revert: close R2 (the LAST-installed). The single-value map stored
+    // T -> R2, so removing R2 wiped T entirely and STRANDED R1's alias lookup
+    // (lookup -> None). The multimap removes ONLY R2's handle.
+    table.delete(&r2);
+    assert_eq!(reverse_translated_bucket_len(&table, &t), 1);
+    assert_eq!(
+        table
+            .lookup(&t, now + 2 * WHEEL_TICK_NS, 0x10)
+            .map(|l| l.metadata.ingress_zone),
+        Some(101),
+        "surviving R1 must still resolve via T after colliding R2 closes \
+         (single-value map returned None here)",
+    );
+
+    // Closing R1 too empties the bucket and drops the translated key.
+    table.delete(&r1);
+    assert_eq!(reverse_translated_bucket_len(&table, &t), 0);
+    assert!(table.lookup(&t, now + 3 * WHEEL_TICK_NS, 0x10).is_none());
+}
+
+#[test]
+fn reverse_translated_1n_delete_removes_specific_handle_not_the_key() {
+    // Symmetric: closing the FIRST-installed reverse session leaves the SECOND
+    // resolvable via the shared translated key. Per-handle delete, not per-key.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let client = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+    let backend = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 50));
+    let (rev_dec, r1_meta) = shared_backend_reverse(backend, 101);
+    let (_, r2_meta) = shared_backend_reverse(backend, 202);
+
+    let r1 = SessionKey {
+        addr_family: 2,
+        protocol: PROTO_TCP,
+        src_ip: client,
+        dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+        src_port: 50002,
+        dst_port: 8443,
+    };
+    let mut r2 = r1.clone();
+    r2.dst_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2));
+    let t = translated_session_key(&r1, rev_dec.nat);
+
+    assert!(table.install_with_protocol(r1.clone(), rev_dec, r1_meta, now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(r2.clone(), rev_dec, r2_meta, now, PROTO_TCP, 0x10));
+    assert_eq!(reverse_translated_bucket_len(&table, &t), 2);
+
+    // Close R1 (first-installed). R2 must survive and resolve via T.
+    table.delete(&r1);
+    assert_eq!(reverse_translated_bucket_len(&table, &t), 1);
+    assert_eq!(
+        table
+            .lookup(&t, now + WHEEL_TICK_NS, 0x10)
+            .map(|l| l.metadata.ingress_zone),
+        Some(202),
+        "surviving R2 resolves via T after the first-installed R1 closes",
     );
 }
 
