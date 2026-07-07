@@ -1753,6 +1753,32 @@ pub(super) fn should_cache_local_delivery_session_on_miss(
     if crate::tcp_flags::has_ack(tcp_flags) && !crate::tcp_flags::has_syn(tcp_flags) {
         return false;
     }
+    // #4487 (residual of P6 / #4400): a bare TCP RST/FIN (a connection-closing
+    // control bit with SYN clear) that MISSES the session table must not seed a
+    // firewall-local session. Such a stray teardown segment opening an
+    // immediately-`closing` host-local session is a session-table DoS surface
+    // (a RST/FIN flood to a firewall IP churns the per-worker table) and a
+    // policy-evaluation skip (a later real SYN would HIT the closing seed
+    // instead of being re-evaluated by the host-inbound / junos-host gates).
+    //
+    // This is the SAME predicate the #4400 transit strict-syn-check applies
+    // (`is_closing && !has_syn`, i.e. `strict_syn_check_drops_new_flow`), but
+    // the ACTION differs BY DISPOSITION, exactly as #4400 deliberately chose:
+    // the two TRANSIT dispositions (ForwardCandidate / MissingNeighbor) DROP
+    // the packet, whereas host-inbound LocalDelivery must NOT drop it. A peer
+    // RST/FIN tearing down a firewall-ORIGINATED TCP flow (BGP-active,
+    // syslog-TCP/TLS, feed/RPM fetches, DNS-over-TCP), or a connection-refused
+    // RST for the firewall's own outbound SYN, arrives as a session-MISS on
+    // LocalDelivery and MUST still reach the local stack so the kernel socket
+    // tears down promptly — the #4400 LocalDelivery drop-exemption. Declining
+    // to CACHE (not dropping) closes the DoS + policy-skip while the
+    // LocalDelivery disposition still delivers the packet to the host via the
+    // reinject chokepoint. This subsumes the #2151 gate for the FIN|ACK /
+    // RST|ACK cases and additionally catches the bare RST / bare FIN (no ACK)
+    // that the ACK-only #2151 gate missed — the exact #4487 residual.
+    if crate::tcp_flags::is_closing(tcp_flags) && !crate::tcp_flags::has_syn(tcp_flags) {
+        return false;
+    }
     let _ = state;
     let _ = resolution_target;
     true

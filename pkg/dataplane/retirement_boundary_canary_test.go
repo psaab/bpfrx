@@ -509,7 +509,10 @@ type linkCycleLegacyLoaderTarget struct {
 func productionLinkCycleLegacyLoaderTargets() []linkCycleLegacyLoaderTarget {
 	return []linkCycleLegacyLoaderTarget{
 		{
-			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "process.go"),
+			// #4462 split moved the Manager link-cycle methods
+			// (PrepareLinkCycle/NotifyLinkCycle) out of process.go into
+			// process_linkcycle.go.
+			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "process_linkcycle.go"),
 			receiver: "Manager",
 			methods: map[string]bool{
 				"PrepareLinkCycle": false,

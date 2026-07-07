@@ -490,6 +490,37 @@ security-vs-availability decision, not a mechanical fix, so it stays open on #41
   gap, and it doubles the enforcement SSOT. The right long-term parity answer, but
   needs an nft-representability spec.
 
+## Bare RST/FIN on the LocalDelivery session-miss install (#4487, P6b)
+
+The XSK `LocalDelivery` arm may CACHE a firewall-local session on a session
+miss so subsequent established packets bypass userspace and return straight to
+the kernel (`should_cache_local_delivery_session_on_miss` →
+`install_helper_local_session_on_miss`, `userspace-dp/src/afxdp/forwarding/mod.rs`).
+That install is gated so a stray TCP teardown segment never seeds a host-local
+session:
+
+- **#2151** already declined to cache off a bare/established **ACK** (ACK set,
+  SYN clear) — only the handshake seeds a session.
+- **#4487** closes the residual the ACK-only gate missed: a **bare RST or bare
+  FIN with no ACK bit** (`is_closing(flags) && !has_syn(flags)`). Without it a
+  RST/FIN flood to a firewall interface IP churns the per-worker session table
+  (a cheap host-IP session-table DoS) and a later real SYN would HIT the
+  immediately-`closing` seed instead of being re-evaluated by the host-inbound /
+  junos-host gates (a policy-evaluation skip).
+
+This is the **same predicate** the transit strict-syn-check applies (#4400,
+`strict_syn_check_drops_new_flow`), but the **action differs by disposition**,
+exactly as #4400 chose. Transit dispositions (ForwardCandidate / MissingNeighbor)
+**DROP** the packet. Host-inbound `LocalDelivery` must **NOT** drop it: a peer
+RST/FIN tearing down a firewall-**originated** TCP flow (BGP-active, syslog-TCP/
+TLS, feed/RPM fetches, DNS-over-TCP), or a connection-refused RST for the
+firewall's own outbound SYN whose dataplane session was already GC'd, arrives as
+a session MISS and must still reach the local stack so the kernel socket tears
+down promptly (the #4400 LocalDelivery drop-exemption). So the guard here only
+declines to **cache**; the `LocalDelivery` disposition still delivers the packet
+to the host via the reinject chokepoint. An established-session RST/FIN is a
+session HIT and never consults this miss-only gate.
+
 ## Adding a new host-inbound service
 
 Adding or changing a token is a coordinated edit across all three surfaces so the

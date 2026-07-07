@@ -979,6 +979,7 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "",
+                "TerminalActions": null,
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -1013,6 +1014,9 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "accept",
+                "TerminalActions": [
+                  "accept"
+                ],
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -2211,6 +2215,7 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "",
+                "TerminalActions": null,
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -2245,6 +2250,9 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "accept",
+                "TerminalActions": [
+                  "accept"
+                ],
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -3441,6 +3449,7 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "",
+                "TerminalActions": null,
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -3475,6 +3484,9 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "accept",
+                "TerminalActions": [
+                  "accept"
+                ],
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -4671,6 +4683,7 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "",
+                "TerminalActions": null,
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -4705,6 +4718,9 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "accept",
+                "TerminalActions": [
+                  "accept"
+                ],
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -5903,6 +5919,7 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "",
+                "TerminalActions": null,
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -5937,6 +5954,9 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "accept",
+                "TerminalActions": [
+                  "accept"
+                ],
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -7133,6 +7153,7 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "",
+                "TerminalActions": null,
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,
@@ -7167,6 +7188,9 @@
                 "TCPFlags": null,
                 "IsFragment": false,
                 "Action": "accept",
+                "TerminalActions": [
+                  "accept"
+                ],
                 "UnknownActions": null,
                 "RejectMessageType": "",
                 "NextTerm": false,

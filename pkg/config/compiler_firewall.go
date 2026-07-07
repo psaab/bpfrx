@@ -1054,8 +1054,10 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			switch k {
 			case "accept":
 				term.Action = "accept"
+				term.TerminalActions = append(term.TerminalActions, "accept")
 			case "reject":
 				term.Action = "reject"
+				term.TerminalActions = append(term.TerminalActions, "reject")
 				// Junos `then reject <message-type>`: the term is a plain
 				// reject; capture a KNOWN message-type for fidelity. Only
 				// consume the following token if it is a recognized type — a
@@ -1067,6 +1069,7 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 				}
 			case "discard":
 				term.Action = "discard"
+				term.TerminalActions = append(term.TerminalActions, "discard")
 			case "next":
 				// `then next term` / bare `then next` — explicit fall-through
 				// to the next term (a no-op terminating-wise). Consume an
@@ -1118,8 +1121,10 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 		switch child.Name() {
 		case "accept":
 			term.Action = "accept"
+			term.TerminalActions = append(term.TerminalActions, "accept")
 		case "reject":
 			term.Action = "reject"
+			term.TerminalActions = append(term.TerminalActions, "reject")
 			// `then reject <message-type>` — capture a KNOWN type for fidelity;
 			// a typo after reject is flagged (see leaf-form note above). The
 			// message-type is the second key (block form) or a single child.
@@ -1141,6 +1146,7 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			}
 		case "discard":
 			term.Action = "discard"
+			term.TerminalActions = append(term.TerminalActions, "discard")
 		case "next":
 			// `then next term` / bare `then next` — explicit fall-through.
 			term.NextTerm = true
