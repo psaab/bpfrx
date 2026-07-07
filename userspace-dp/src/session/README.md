@@ -276,8 +276,16 @@ activity in EITHER direction, so the quiet half must survive while the other
 is active.
 
 `SessionTable::companion_keeps_alive` (`expire.rs`, called from the Case-3
-idle-crossed arm just before `remove_entry`) enforces this off the hot path:
-when an entry crosses its idle timeout it probes its forward↔reverse companion
+idle-crossed arm just before `remove_entry`, and ONLY on the owner-side
+idle-expiry path — the `Age` HA decision or the `ha == None` standalone path,
+gated by `companion_eligible`) enforces this off the hot path. The two
+deliberate HA reaps do NOT consult it: `ReapStaleSynced` (the bounded
+lost-primary-delete leak ceiling) and `AgedOwnerRgZeroActiveNode` (the known
+active/active `owner_rg<=0` residual) both clear `companion_eligible` after
+bumping their own counter, so the probe can neither override the leak ceiling
+nor miscount them; and on a standby the `Hold` arm already retains BOTH halves
+(it `continue`s before the probe is reached), making the probe redundant there.
+When an entry crosses its idle timeout it probes its forward↔reverse companion
 (recovered by `reverse_session_key` on the entry's OWN key + nat, its own
 inverse, exactly as `account_packet` hops reverse↔forward). If the companion
 is itself still within its idle window (the exact complement of the wheel's

@@ -184,6 +184,19 @@ impl SessionTable {
                     // just below. Snapshot it (Copy) before the immutable
                     // `entry` borrow is dropped.
                     let e_nat = entry.decision.nat;
+                    // #4380: the companion idle-retention probe applies ONLY to
+                    // the owner-side idle-expiry path — the `Age` HA decision or
+                    // the `ha == None` standalone path (both start eligible). The
+                    // two DELIBERATE-reap HA arms below (ReapStaleSynced,
+                    // AgedOwnerRgZeroActiveNode) clear this: they are bounded
+                    // reaps (the stale-synced lost-primary-delete leak ceiling,
+                    // and the known active/active owner_rg<=0 residual) whose
+                    // stats are ALSO already bumped in-arm, so letting the probe
+                    // keep the entry there would both override the ceiling and
+                    // miscount. On the standby the HOLD arm already retains BOTH
+                    // halves (it `continue`s before this point), so the probe is
+                    // redundant there regardless.
+                    let mut companion_eligible = true;
                     if let Some(ha) = ha {
                         match self.standby_gate_decision(
                             ha,
@@ -261,10 +274,18 @@ impl SessionTable {
                             }
                             StandbyGateDecision::ReapStaleSynced => {
                                 self.last_pop_stats.reaped_stale_synced += 1;
+                                // #4380: a deliberate bounded reap (leak
+                                // ceiling) — the companion probe must NOT keep
+                                // this entry alive past the ceiling.
+                                companion_eligible = false;
                                 // fall through to remove_entry below
                             }
                             StandbyGateDecision::AgedOwnerRgZeroActiveNode => {
                                 self.last_pop_stats.aged_owner_rg_zero_active_node += 1;
+                                // #4380: a deliberate reap of the known
+                                // active/active owner_rg<=0 residual — the
+                                // companion probe must NOT override it.
+                                companion_eligible = false;
                                 // fall through to remove_entry below
                             }
                             StandbyGateDecision::Age => {
@@ -291,8 +312,10 @@ impl SessionTable {
                     // Close delta + RT_FLOW harvest fire only when the WHOLE
                     // flow goes idle. Off the hot path: one extra
                     // `key_to_handle` probe per idle-crossed entry, in the GC
-                    // pass only.
-                    if self.companion_keeps_alive(&key, e_nat, now_ns) {
+                    // pass only. Gated to the owner-side Age / no-HA path
+                    // (`companion_eligible`): the deliberate stale-synced /
+                    // aged-owner reaps do not consult it.
+                    if companion_eligible && self.companion_keeps_alive(&key, e_nat, now_ns) {
                         self.last_pop_stats.kept_alive_by_companion += 1;
                         continue;
                     }

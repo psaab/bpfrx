@@ -339,6 +339,99 @@ fn symmetric_flow_unaffected_by_companion_retention() {
     );
 }
 
+/// #4380 headline scenario, under NAT: a pool-SNAT'd flow active on ONLY the
+/// reverse direction keeps its forward half alive, and a later forward packet
+/// resolves the RETAINED entry with its ORIGINAL translation — NOT a re-create
+/// that would hand the flow a different NAT mapping (the corruption the PR
+/// closes). The forward entry carries the SNAT decision; the reverse companion
+/// carries its `NatDecision::reverse`, so the companion probe must round-trip
+/// through the reversed-nat key to find the sibling. RED on revert: without the
+/// probe the forward half is reaped and the lookup below misses.
+#[test]
+fn nat_flow_reverse_activity_keeps_forward_half_alive() {
+    let mut table = SessionTable::new();
+    let forward = key_v4(); // TCP 10.0.0.1:12345 -> 8.8.8.8:443
+    let then = 1_000_000_000u64;
+
+    // Pool SNAT: source-translate 10.0.0.1:12345 -> 203.0.113.5:50000.
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+        rewrite_src_port: Some(50000),
+        ..NatDecision::default()
+    };
+    let fwd_decision = SessionDecision {
+        resolution: resolution(),
+        nat: fwd_nat,
+    };
+    assert!(table.install_with_protocol(
+        forward.clone(),
+        fwd_decision,
+        metadata(),
+        then,
+        PROTO_TCP,
+        TCP_ACK,
+    ));
+
+    // Reverse companion: keyed on the reply wire tuple and carrying the
+    // reversed decision, exactly as the forwarding path builds it. The reverse
+    // key round-trips back to the forward key under the reversed nat.
+    let reverse = reverse_session_key(&forward, fwd_nat);
+    let reverse_nat = fwd_nat.reverse(
+        forward.src_ip,
+        forward.dst_ip,
+        forward.src_port,
+        forward.dst_port,
+    );
+    assert_eq!(
+        reverse_session_key(&reverse, reverse_nat),
+        forward,
+        "reversed-nat companion key must round-trip back to the forward key",
+    );
+    let mut reverse_metadata = metadata();
+    reverse_metadata.is_reverse = true;
+    let reverse_decision = SessionDecision {
+        resolution: resolution(),
+        nat: reverse_nat,
+    };
+    assert!(table.install_with_protocol(
+        reverse.clone(),
+        reverse_decision,
+        reverse_metadata,
+        then,
+        PROTO_TCP,
+        TCP_ACK,
+    ));
+    let _ = table.drain_deltas(8);
+
+    // Reverse-only traffic: only the reverse (reply) half is refreshed.
+    let t_rev = then + 250_000_000_000; // 250 s
+    table.touch(&reverse, t_rev);
+    // GC past the forward half's 300 s idle timeout while the reverse is fresh.
+    let now = then + 310_000_000_000; // 310 s
+    table.last_gc_ns = now - 2_000_000_000;
+    let expired = table.expire_stale_entries(now);
+    assert!(
+        expired.is_empty(),
+        "the NAT'd flow's quiet forward half must not reap while the reverse half is active",
+    );
+    assert_eq!(table.len(), 2, "both NAT'd halves must survive");
+    assert_eq!(
+        table.last_pop_stats().kept_alive_by_companion,
+        1,
+        "the forward half is retained via the reversed-nat companion probe",
+    );
+    // The RETAINED forward entry still carries its ORIGINAL SNAT translation —
+    // a later forward packet resolves the same entry, not a re-created session
+    // with a different mapping.
+    let hit = table
+        .lookup(&forward, now, TCP_ACK)
+        .expect("the SNAT'd forward half must survive and resolve");
+    assert_eq!(
+        hit.decision.nat, fwd_nat,
+        "the retained forward entry must keep its original SNAT translation",
+    );
+}
+
 // === #3227 per-application inactivity-timeout tests =========
 
 /// `metadata()` with a custom per-application inactivity (idle) timeout stamped
