@@ -155,17 +155,22 @@ type vrrpInstance struct {
 	ipv6Send func(data []byte, cm *ipv6.ControlMessage, dst net.Addr) error
 
 	// ipv6Recv is the seam used by receiverIPv6 to read an IPv6 advert together
-	// with its arrival interface (the per-packet control message). It returns
-	// the byte count, the arrival ifindex (0 if the platform did not report
-	// one), and the source address. Production leaves it nil and receiverIPv6
-	// lazily builds a wrapper over ipv6.NewPacketConn(ipv6Conn) with
-	// FlagInterface enabled; tests override it to inject synthetic adverts with
-	// a chosen arrival ifindex (the #2886 cross-VLAN filter seam). Capturing the
-	// arrival ifindex is required because the IPv6 raw socket on a VLAN
-	// sub-interface is wildcard-bound (no SO_BINDTODEVICE — see manager.go), so
-	// the kernel fans a proto-112 frame out to every sibling-VLAN socket; the
-	// VRID/TTL/self gates alone let same-VRID siblings cross-process (#2886).
-	ipv6Recv func(buf []byte) (n int, ifindex int, src net.Addr, err error)
+	// with its arrival interface and IPv6 hop limit (the per-packet control
+	// message). It returns the byte count, the arrival ifindex (0 if the
+	// platform did not report one), the received hop limit (0 if the platform
+	// did not report one), and the source address. Production leaves it nil and
+	// receiverIPv6 lazily builds a wrapper over ipv6.NewPacketConn(ipv6Conn)
+	// with FlagInterface and FlagHopLimit enabled; tests override it to inject
+	// synthetic adverts with a chosen arrival ifindex and hop limit (the #2886
+	// cross-VLAN filter seam and the GTSM hop-limit gate). Capturing the arrival
+	// ifindex is required because the IPv6 raw socket on a VLAN sub-interface is
+	// wildcard-bound (no SO_BINDTODEVICE — see manager.go), so the kernel fans a
+	// proto-112 frame out to every sibling-VLAN socket; the VRID/hop-limit/self
+	// gates alone let same-VRID siblings cross-process (#2886). Capturing the
+	// hop limit is required to enforce RFC 5798 §5.1.2.3 (hop limit MUST be 255)
+	// — the kernel strips the IPv6 header on a raw ip6:112 socket, so the value
+	// is only reachable via the IPV6_RECVHOPLIMIT control message (#4549 F8).
+	ipv6Recv func(buf []byte) (n int, ifindex int, hopLimit int, src net.Addr, err error)
 
 	// AF_PACKET socket for receiving on VLAN sub-interfaces.
 	// Raw IP sockets don't reliably receive multicast on VLAN
@@ -1165,17 +1170,25 @@ func (vi *vrrpInstance) receiverIPv6() {
 	recv := vi.ipv6Recv
 	if recv == nil {
 		pc := ipv6.NewPacketConn(vi.ipv6Conn)
-		if err := pc.SetControlMessage(ipv6.FlagInterface, true); err != nil {
+		// FlagInterface → arrival ifindex (#2886 cross-VLAN filter).
+		// FlagHopLimit → IPV6_RECVHOPLIMIT so the received hop limit is
+		// carried in the control message; the kernel strips the IPv6 header
+		// on a raw ip6:112 socket, so this is the only way to enforce the
+		// RFC 5798 §5.1.2.3 GTSM hop-limit==255 check on this fallback path
+		// (#4549 F8).
+		if err := pc.SetControlMessage(ipv6.FlagInterface|ipv6.FlagHopLimit, true); err != nil {
 			slog.Debug("vrrp: set ipv6 control message failed", "key", vi.key(), "err", err)
 		}
-		recv = func(b []byte) (int, int, net.Addr, error) {
+		recv = func(b []byte) (int, int, int, net.Addr, error) {
 			vi.ipv6Conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 			n, cm, src, err := pc.ReadFrom(b)
 			ifindex := 0
+			hopLimit := 0
 			if cm != nil {
 				ifindex = cm.IfIndex
+				hopLimit = cm.HopLimit
 			}
-			return n, ifindex, src, err
+			return n, ifindex, hopLimit, src, err
 		}
 	}
 
@@ -1186,7 +1199,7 @@ func (vi *vrrpInstance) receiverIPv6() {
 		default:
 		}
 
-		n, arrivalIf, addr, err := recv(buf)
+		n, arrivalIf, hopLimit, addr, err := recv(buf)
 		if err != nil {
 			select {
 			case <-vi.stopCh:
@@ -1200,6 +1213,16 @@ func (vi *vrrpInstance) receiverIPv6() {
 		}
 
 		if n < vrrpHeaderLen {
+			continue
+		}
+
+		// Verify hop limit == 255 (RFC 5798 §5.1.2.3, GTSM). The AF_PACKET and
+		// IPv4-raw paths already enforce this; the raw IPv6 fallback strips the
+		// header, so the value arrives via the IPV6_RECVHOPLIMIT control message
+		// (#4549 F8). Reject anything that was routed (hop limit decremented).
+		if hopLimit != 255 {
+			slog.Debug("vrrp: ipv6 advert rejected on hop limit",
+				"key", vi.key(), "hopLimit", hopLimit)
 			continue
 		}
 

@@ -364,6 +364,19 @@ load/peer-sync compile paths.
   inject a synthetic arrival ifindex without `CAP_NET_RAW`. Only the
   AF_PACKET-unavailable fallback is affected; the default
   `receiverAfPacket` tap already binds to a single ifindex.
+- **GTSM hop-limit gate on the raw-IPv6 fallback (#4549 F8).** RFC 5798
+  §5.1.2.3 requires VRRPv3 advertisements to carry an IPv6 hop limit of
+  255 so a routed (off-link) advert is rejected. The AF_PACKET path
+  (`parseAfPacketIPv6`, reads `ip6[7]`) and the IPv4-raw path (`hdr.TTL`)
+  already enforce this, but the raw `ip6:112` fallback socket strips the
+  IPv6 header, so the hop limit is not in the payload. `receiverIPv6` now
+  enables `ipv6.FlagHopLimit` (`IPV6_RECVHOPLIMIT`) alongside
+  `FlagInterface`, reads the hop limit from the per-packet control
+  message via the `ipv6Recv` seam, and drops any advert whose hop limit
+  is not 255. The seam therefore returns `(n, ifindex, hopLimit, src,
+  err)`. Exploitability is near-nil (VRRPv3 IPv6 uses link-local
+  multicast `ff02::12`, unroutable off-link), so this is defense-in-depth
+  parity with the other two receive paths.
 - The AF_PACKET capture fd is created `SOCK_RAW|SOCK_CLOEXEC` so it is set
   close-on-exec atomically at creation (#2476). A raw `unix.Socket` does NOT
   inherit CLOEXEC the way Go `net` sockets do, so without this the raw VRRP
