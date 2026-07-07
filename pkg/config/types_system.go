@@ -1143,7 +1143,7 @@ type PolicerConfig struct {
 type ThreeColorPolicerConfig struct {
 	Name       string
 	TwoRate    bool // true=two-rate (RFC 2698), false=single-rate (RFC 2697)
-	ColorBlind bool // color-blind mode (default: color-aware)
+	ColorBlind bool // color-blind mode (Junos default when no color statement; #4535)
 	// Explicit mode/color markers are retained for commit-time ambiguity
 	// checks. The dataplane snapshot still carries only the canonical mode.
 	SingleRateConfigured bool
