@@ -135,6 +135,19 @@ delegate to the owning domain. Exported types:
   and the userspace filter path still enforces the term exactly. The
   degraded error is returned to the daemon (`daemon_apply.go` step 3d) and
   logged; the buildable rules are still installed.
+  **Contradictory deny terms are not steered (#4534).** A term that
+  co-locates `then routing-instance <x>` with a terminating `then discard` /
+  `then reject` is contradictory — it asks the dataplane to BOTH steer the
+  packet into `<x>` AND drop it. The deny wins on BOTH forwarding paths: the
+  userspace runtime returns `RouteOverride::Drop` (#4392,
+  `ingress_route_table_override`) and `buildPBRFromFilter` SKIPS the steering
+  `ip rule` (records a degraded error). Without the kernel skip the global
+  `ip rule` (no `iif` selector) would fail OPEN — steering slow-path /
+  `XDP_PASS` / unfiltered-interface traffic into the VRF that userspace drops.
+  The strict commit gate (`validateFilterRoutingInstanceConflictStrict`,
+  #3308) rejects such a term at commit, but is lenient on load / peer-sync
+  (#1960 no-brick), so a persisted / peer-synced contradiction can still reach
+  the builder — hence the runtime skip.
   **Userspace FIB snapshot skips this band (#4479).** The userspace
   route-snapshot builder (`buildRouteSnapshots`,
   `pkg/dataplane/userspace/routes.go`) mirrors kernel ip rules whose Dst maps

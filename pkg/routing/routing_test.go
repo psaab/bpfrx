@@ -861,6 +861,68 @@ func TestBuildPBRRules(t *testing.T) {
 		}
 	})
 
+	// === #4534 RED-on-revert coverage ===
+	//
+	// A term that co-locates `then routing-instance X` with a terminating
+	// `then discard`/`then reject` is CONTRADICTORY — the deny wins (mirroring
+	// the userspace RouteOverride::Drop, #4392). buildPBRFromFilter must NOT
+	// build a steering ip rule for it, else the kernel mirror fails OPEN and
+	// steers slow-path / XDP_PASS / unfiltered-interface traffic into the VRF
+	// that userspace drops. Pre-fix the builder keyed only on RoutingInstance
+	// and emitted a steering rule regardless of the deny action.
+	for _, action := range []string{"discard", "reject"} {
+		action := action
+		t.Run("routing-instance with "+action+" not steered", func(t *testing.T) {
+			filter := &config.FirewallFilter{
+				Name: "deny-" + action,
+				Terms: []*config.FirewallFilterTerm{
+					{
+						Name:            "contradictory",
+						DSCPs:           []string{"ef"},
+						SourceAddresses: []string{"10.0.1.0/24"},
+						RoutingInstance: "ATT",
+						Action:          action,
+					},
+				},
+			}
+			rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+			if len(rules) != 0 {
+				t.Fatalf("expected 0 PBR rules for routing-instance+%s (contradictory deny), got %d", action, len(rules))
+			}
+			// The skip is degraded (surfaced) rather than silent.
+			if err == nil {
+				t.Errorf("expected a degraded error reporting the skipped contradictory term, got nil")
+			}
+		})
+	}
+
+	// A plain routing-instance term (no discard/reject) still steers — the fix
+	// must not regress the legitimate filter-based-forwarding case.
+	t.Run("routing-instance without deny still steered", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "plain-fbf",
+			Terms: []*config.FirewallFilterTerm{
+				{
+					Name:            "steer",
+					SourceAddresses: []string{"10.0.1.0/24"},
+					RoutingInstance: "ATT",
+				},
+				// `then accept` is the explicit legitimate FBF terminal; it must
+				// still steer (only discard/reject suppress the ip rule).
+				{
+					Name:            "steer-accept",
+					SourceAddresses: []string{"10.0.2.0/24"},
+					RoutingInstance: "ATT",
+					Action:          "accept",
+				},
+			},
+		}
+		rules, _ := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+		if len(rules) != 2 {
+			t.Fatalf("expected 2 PBR rules for plain/accept routing-instance terms, got %d", len(rules))
+		}
+	})
+
 	t.Run("multi-address cross product", func(t *testing.T) {
 		filter := &config.FirewallFilter{
 			Name: "multi",

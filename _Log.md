@@ -1,3 +1,38 @@
+## 2026-07-07 — #4534 PBR kernel-mirror steers a routing-instance term even with discard/reject (fail-open VRF-steer)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4534 — `buildPBRFromFilter` (pkg/routing/rules.go) looped
+  `filter.Terms`, keyed only on `term.RoutingInstance != ""`, and NEVER read
+  `term.Action`. So a contradictory FBF term (`then routing-instance X;
+  discard`/`reject`) built a steering `ip rule`. The userspace forwarding path
+  was already fixed (#4392: `ingress_route_table_override` returns
+  `RouteOverride::Drop` when `routing_result.action` is Reject|Discard), so
+  userspace DROPS on the filtered interface while the kernel PBR mirror still
+  STEERED — the `ip rule` is global (no `iif` selector), so slow-path /
+  `XDP_PASS` / unfiltered-interface traffic that should DROP was steered into
+  the target VRF (fail-open VRF-steer). The strict conflict gate
+  (`validateFilterRoutingInstanceConflictStrict`, #3308) rejects such a term at
+  commit but is LENIENT on load / peer-sync (#1960 no-brick), so an
+  already-persisted or peer-synced contradiction survives and reaches the
+  builder. FIX: in `buildPBRFromFilter`, right after the `RoutingInstance ==
+  ""` skip, `continue` (record a degraded build error, do NOT build the ip
+  rule) when `term.Action == "discard" || term.Action == "reject"` — mirroring
+  the userspace `is_drop` gate. `term.Action` is one of "accept"/"reject"/
+  "discard"/"" (set by `compileFilterThen`, types_system.go). A plain
+  routing-instance term (no deny, or explicit `then accept`) still builds its
+  steering rule. Also refreshed the STALE present-tense comments that claimed
+  userspace "UNCONDITIONALLY returns the routing table" (pre-#4392) in
+  compiler_uniformgates.go, compiler_validate_strict_filter.go, and
+  firewall_ri_conflict_3308_test.go — both paths now resolve the contradiction
+  to the DENY. RED-on-revert (revert rules.go only, keep the new test): the
+  discard and reject subtests go RED (`got 1` steering rule) while the plain/
+  accept subtest stays GREEN. go test ./pkg/routing/... and the config
+  Filter/RoutingInstance/3308 suites green; gofmt/vet/build clean.
+- **File(s)**: pkg/routing/rules.go, pkg/routing/routing_test.go,
+  pkg/routing/README.md, pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_validate_strict_filter.go,
+  pkg/config/firewall_ri_conflict_3308_test.go, _Log.md
+
 ## 2026-07-07 — #4526 DHCP renewalTimers int64 overflow (cleanliness)
 
 - **Timestamp**: 2026-07-07T00:00Z

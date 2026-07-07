@@ -1225,14 +1225,16 @@ func validateFilterFromMatchStrict(cfg *Config) error {
 // `then discard` / `then reject` — #3308.
 //
 // Such a term is contradictory: it asks the dataplane to BOTH route the packet
-// via the named instance AND drop/reject it. There was no commit-time
-// mutual-exclusion gate, and on the PBR runtime path the deny/reject was reduced
-// to a LOG-ONLY event — ingress_route_table_override (userspace-dp/src/afxdp/
-// forwarding/mod.rs) logs routing_result.action (the discard/reject) and then
-// UNCONDITIONALLY returns the routing-table string, so the packet is still
-// forwarded through <x>.inet.0 / <x>.inet6.0. The audit/syslog stream records
-// the packet as DENY/REJECT while it was actually routed — worse than a syntax
-// gap: the audit trail lies and the security intent is defeated (fail-open PBR).
+// via the named instance AND drop/reject it. Historically there was no
+// commit-time mutual-exclusion gate AND both forwarding paths honored the steer
+// while only logging the deny — a fail-open PBR whose audit trail lied. Both
+// paths now resolve the contradiction to the DENY: the userspace PBR runtime
+// (ingress_route_table_override, userspace-dp/src/afxdp/forwarding/mod.rs)
+// returns RouteOverride::Drop for a reject/discard term (#4392), and the kernel
+// `ip rule` mirror (buildPBRFromFilter, pkg/routing/rules.go) skips the steering
+// rule (#4534). This gate keeps the operator from authoring the contradiction at
+// commit; on the tolerant load / peer-sync path it warns and both runtimes drop
+// the term independently.
 //
 // The conflict is on the typed fields term.RoutingInstance (the
 // `then routing-instance` value) and term.Action ("discard" / "reject", set by
