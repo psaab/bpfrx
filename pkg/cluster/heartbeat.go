@@ -729,8 +729,15 @@ func (r *heartbeatReceiver) readLoop() {
 			continue
 		}
 
-		// Ignore our own heartbeats (shouldn't happen with unicast, but be safe).
+		// A same-cluster heartbeat carrying OUR node-id is not a loopback on a
+		// unicast point-to-point control link (a node never receives its own
+		// frame) — it is a peer misconfigured with a duplicate node-id, an
+		// INVALID cluster (#4549 F11). Surface it (rate-limited) so the
+		// operator fixes /etc/xpf/node-id, then discard it: it cannot be told
+		// apart from a stray loopback and a duplicate-node-id cluster is
+		// unresolvable at runtime, so it must never drive election.
 		if int(pkt.NodeID) == r.mgr.NodeID() {
+			r.mgr.NoteDuplicateNodeIDHeartbeat()
 			continue
 		}
 

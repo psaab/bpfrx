@@ -177,8 +177,17 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 				if rg.State != StateSecondary {
 					return electLocalSecondary, "Higher node ID loses tie"
 				}
+			} else {
+				// Same node ID → INVALID cluster (duplicate node-id, #4549
+				// F11). No asymmetric tie-break exists, so fail CLOSED to
+				// SECONDARY rather than leaving the incumbent primary — if
+				// both nodes are primary the previous "no change" left the
+				// split-brain unresolved. Surfaced loudly for the operator.
+				m.warnDuplicateNodeIDLocked()
+				if rg.State != StateSecondary {
+					return electLocalSecondary, "Preempt: duplicate node-id yields (invalid config)"
+				}
 			}
-			// Same node ID (shouldn't happen) — no change.
 		}
 		return electNoChange, ""
 	}
@@ -195,6 +204,18 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 			}
 			if localEff == peerEff && m.nodeID > m.peerNodeID {
 				return electLocalSecondary, "Dual-active: higher node ID yields"
+			}
+			// Same effective priority AND same node ID is an INVALID cluster
+			// (two chassis sharing a node-id, #4549 F11). No asymmetric
+			// discriminator remains — both nodes run this identical code and
+			// would compute the same result, so no single primary can be
+			// deterministically elected. Fail CLOSED: yield to SECONDARY so we
+			// never leave both nodes primary (a dual-primary split-brain =
+			// duplicate VIP / ARP conflict). Surfaced loudly so the operator
+			// fixes the duplicate node-id.
+			if localEff == peerEff && m.nodeID == m.peerNodeID {
+				m.warnDuplicateNodeIDLocked()
+				return electLocalSecondary, "Dual-active: duplicate node-id yields (invalid config)"
 			}
 			return electNoChange, "Dual-active: winner stays"
 		}
@@ -221,11 +242,56 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 		if m.nodeID < m.peerNodeID {
 			return electLocalPrimary, "Lower node ID wins tie"
 		}
+		// Same node ID → duplicate-node-id misconfig (#4549 F11). The
+		// higher-node-ID-loses fall-through already yields to SECONDARY here
+		// (fail closed — both nodes stay secondary, no split-brain), but the
+		// misconfig is otherwise silent, so surface it.
+		if m.nodeID == m.peerNodeID {
+			m.warnDuplicateNodeIDLocked()
+		}
 		if rg.State != StateSecondary {
 			return electLocalSecondary, "Higher node ID loses tie"
 		}
 	}
 	return electNoChange, ""
+}
+
+// warnDuplicateNodeIDLocked emits a rate-limited (>=30s) error when the peer
+// advertises the local node's own node-id. Two chassis sharing a node-id is an
+// invalid cluster configuration: the HA protocol carries no per-node identity
+// other than the node-id, so election has no asymmetric discriminator to elect
+// a single primary — the condition cannot be resolved at runtime and both nodes
+// fail closed to SECONDARY. The only remedy is correcting /etc/xpf/node-id on
+// one chassis. Must be called with m.mu held.
+func (m *Manager) warnDuplicateNodeIDLocked() {
+	now := time.Now()
+	if !m.lastDupNodeIDWarn.IsZero() && now.Sub(m.lastDupNodeIDWarn) < 30*time.Second {
+		return
+	}
+	m.lastDupNodeIDWarn = now
+	slog.Error("cluster: duplicate node-id detected — the peer advertises the "+
+		"same node-id as this node; this is an INVALID cluster configuration "+
+		"(two chassis cannot share a node-id). Election has no way to resolve "+
+		"it, so both nodes fail closed to SECONDARY. Correct /etc/xpf/node-id "+
+		"on one node.",
+		"node_id", m.nodeID)
+	if m.history != nil {
+		m.history.Record(EventRG, -1, "duplicate node-id: invalid cluster configuration")
+	}
+}
+
+// NoteDuplicateNodeIDHeartbeat records that a heartbeat arrived carrying the
+// local node's own node-id. On a unicast point-to-point control link a node
+// never receives its own frame, so a same-cluster frame with our node-id is a
+// peer misconfigured with a duplicate node-id — an invalid cluster (#4549 F11).
+// The receiver still discards the frame (it cannot be told apart from a stray
+// loopback and a duplicate-node-id cluster is unresolvable at runtime), but the
+// rate-limited warning surfaces the misconfiguration for the operator. Takes
+// m.mu.
+func (m *Manager) NoteDuplicateNodeIDHeartbeat() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.warnDuplicateNodeIDLocked()
 }
 
 // runElection evaluates all RGs using current peer state and applies transitions.
