@@ -15,7 +15,16 @@ the apply path pays no fsync (the file is regenerated on every apply).
   `/etc/swanctl/conf.d`.
 - `Apply(ipsecCfg *config.IPsecConfig) error` — `manager.go`. Generate
   config and reload strongSwan, then terminate the live SAs of any
-  connection deleted since the last Apply (#3941).
+  connection deleted since the last Apply (#3941). **The returned error is
+  load-bearing (#4433):** a render/write/`swanctl --load-all` failure leaves
+  the previously-loaded strongSwan config (the OLD tunnels) active, so the
+  commit path (`daemon_apply.go` step 6) MUST surface this error rather than
+  swallow it at WARN — otherwise a new config is reported committed while the
+  enforced IPsec runtime is stale. The daemon joins it into the
+  `applyConfigLocked` tail result alongside networkd / Kea / host-inbound /
+  lo0 (fail-closed on commit); the config stays promoted + peer-synced and the
+  remaining reconcile steps still run, so the operator sees a degraded-state
+  error instead of a false success.
 - `Clear() error` — `manager.go`. Remove the xpf snippet, reload, and
   terminate every previously-applied connection's live SAs (#3941).
 - `SAStatus`, `TerminateAllSAs`, `InitiateConnection`, `GetSAStatus`,

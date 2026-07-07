@@ -1333,9 +1333,21 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// 6. Apply IPsec config
 	// Always call Apply so stale swanctl config is removed when VPNs are
 	// deleted from config.
+	//
+	// #4433: a swanctl render/reload failure must fail the commit closed
+	// rather than be swallowed at WARN — otherwise the OLD tunnels stay
+	// active (swanctl --load-all leaves the previously-loaded config in
+	// place on failure) while a NEW config is reported committed, so the
+	// enforced IPsec runtime silently diverges from the committed policy.
+	// The error is joined into the commit result at the tail (alongside
+	// networkdErr / dhcpServerErr / hostInboundErr / lo0Err); the remaining
+	// apply steps still run and the config stays promoted + peer-synced, so
+	// the operator SEES the degraded IPsec state instead of a false success.
+	var ipsecErr error
 	if d.ipsec != nil {
 		if err := d.ipsec.Apply(ipsec.PrepareConfig(cfg)); err != nil {
 			slog.Warn("failed to apply IPsec config", "err", err)
+			ipsecErr = fmt.Errorf("apply IPsec config: %w", err)
 		}
 	}
 
@@ -1664,12 +1676,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	// #1778 + #2987: deferred reconcile failures — every reconcile step
-	// above has run; surface the networkd write failure and the Kea
-	// restart/stop failure through the commit so a write that left stale
-	// kernel state fails the commit (fail-closed) instead of reporting
-	// success. Both are joined so neither masks the other.
-	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err)
+	// #1778 + #2987 + #4433: deferred reconcile failures — every reconcile
+	// step above has run; surface the networkd write failure, the Kea
+	// restart/stop failure, and the IPsec render/reload failure through the
+	// commit so a step that left stale kernel/swanctl state fails the commit
+	// (fail-closed) instead of reporting success. All are joined so none
+	// masks the other.
+	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error
