@@ -39527,3 +39527,36 @@ top.
   Go-only pass. README updated with the new lock's description.
 - **File(s)**: pkg/policymatch/global_scope_regression_4365_test.go (new),
   pkg/policymatch/README.md, _Log.md
+
+## 2026-07-07 — #4414 fabric return fast path excludes ALL markerless protos
+- **Timestamp**: 2026-07-07 15:48 UTC
+- **Action**: Generalized the `cluster_peer_return_fast_path` flow-initiator
+  exclusion (`userspace-dp/src/afxdp/forwarding/mod.rs`). The fast path fires
+  ONLY on a session MISS (from the session-miss decision in
+  `poll_descriptor/mod.rs`) and builds a NAT-less (`NatDecision::default()`),
+  reverse-keyed (`SessionOrigin::ReverseFlow`) seed — so it must fire only for
+  provably-RETURN traffic. #4439 excluded UDP and #4453 excluded the bare TCP
+  RST/FIN, but the guard was still an enumerated deny-list that left every
+  OTHER markerless L4 (ESP, AH, GRE, SCTP, OSPF, …) adopted. A NEW forward flow
+  of such a protocol that ingressed the HAInactive node and was fabric-
+  redirected to the RG owner was fast-pathed on the owner into a NAT-less
+  reverse seed: source-NAT skipped (internal IP on the wire — NAT bypass) and
+  the flow recorded in the wrong direction (reverse seed for a forward flow —
+  session corruption). Replaced the `meta.protocol == PROTO_UDP` guard with a
+  positive allow-list `!matches!(meta.protocol, PROTO_TCP | PROTO_ICMP |
+  PROTO_ICMPV6)` (subsumes the #4439 UDP arm). TCP and ICMP/ICMPv6 are the only
+  protocols with a distinguishable initiator form (TCP SYN + bare RST/FIN
+  excluded; ICMP echo-request excluded), so the admitted set is exactly the
+  provably-return forms. Every markerless protocol now falls through to the
+  owner's normal forward decision, which applies source-NAT and installs a
+  FORWARD session — closing BOTH the NAT bypass and the reverse-seed corruption
+  (same root cause: a non-return flow on the return fast path). Fix B (the
+  principled initiator-exclusion generalization), not the issue's literal Fix A
+  (`apply_nat_on_fabric=true`), which would double-NAT with the owner and leave
+  the reverse-seed corruption unfixed. New RED-on-revert test
+  `cluster_peer_return_fast_path_skips_markerless_proto_new_flow_4414` (ESP / AH
+  / GRE / SCTP / OSPF → None; Some on revert). NOTE: fabric/HA change —
+  `make test-failover` REQUIRED before merge.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs, docs/fabric-cross-chassis-fwd.md,
+  _Log.md

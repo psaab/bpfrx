@@ -753,22 +753,26 @@ pub(super) fn cluster_peer_return_fast_path(
     {
         return None;
     }
-    // #4439: this fast path may fire ONLY for packets that are provably
+    // #4439/#4414: this fast path may fire ONLY for packets that are provably
     // RETURN traffic — the reverse direction of a flow the active owner
-    // already policy/NAT-validated. Every other protocol carries a
-    // packet-level flow-initiator marker we exclude above: TCP excludes the
-    // initial SYN, ICMP excludes the echo REQUEST. UDP has NO such marker —
-    // any UDP datagram can open a new flow, and there is no "non-initiating
-    // UDP" form. A session-less UDP packet reaching here (a real established
-    // UDP reply is served by the synced session in
-    // `resolve_flow_session_decision` before this point) is therefore a NEW
-    // forward flow, NOT return traffic. Fast-pathing it built a NAT-less,
-    // reverse-keyed session for a forward flow — the source-NAT that a new
-    // outbound flow requires was skipped (NAT bypass) and the owner recorded
-    // the flow in the wrong direction (session-state corruption). Fall
-    // through instead so the RG owner runs the packet through its normal
-    // forward decision: source-NAT applied and a FORWARD session installed.
-    if meta.protocol == PROTO_UDP {
+    // already policy/NAT-validated. That requires a protocol with a
+    // packet-level flow-initiator marker so the initiating (forward) form can
+    // be told apart from the return form, and the initiator is excluded above:
+    // TCP excludes the initial SYN (and the bare RST/FIN, #4453); ICMP/ICMPv6
+    // exclude the echo REQUEST. Every OTHER protocol — UDP (#4439), and
+    // likewise ESP/AH/GRE/SCTP/OSPF/… (the #4414 residual) — has NO such
+    // marker: any datagram can open a new flow, and there is no
+    // "non-initiating" form to key on. A session-less packet of one of these
+    // protocols reaching here (a real established reply is served by the
+    // synced session in `resolve_flow_session_decision` before this point) is
+    // therefore a NEW forward flow, NOT return traffic. Fast-pathing it built
+    // a NAT-less, reverse-keyed session for a forward flow — the source-NAT a
+    // new outbound flow requires was skipped (NAT bypass) and the owner
+    // recorded the flow in the wrong direction (session-state corruption).
+    // Refuse every protocol that is not TCP or ICMP/ICMPv6 so it falls through
+    // to the RG owner's normal forward decision: source-NAT applied and a
+    // FORWARD session installed. (Subsumes the #4439 UDP-only guard.)
+    if !matches!(meta.protocol, PROTO_TCP | PROTO_ICMP | PROTO_ICMPV6) {
         return None;
     }
 
