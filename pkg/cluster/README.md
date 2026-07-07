@@ -289,6 +289,58 @@ connection is authenticated, then seals every subsequent frame.
   accept/connect loops retry (~1s) — it never bricks. MUST pass
   `make test-failover` (the path that keeps TCP alive across failover).
 
+## IPsec SA sync
+
+Active IKE/child-SA connection names ride the session-sync channel so the
+standby can re-initiate the primary's tunnels on takeover:
+
+- **Send** — `syncIPsecSAPeriodic` (`pkg/daemon/daemon_ha.go`) runs on the
+  RG0-primary and, every 30s, reads the active set from
+  `ipsec.ActiveConnectionNames()` (live `swanctl --list-sas`) and advertises it
+  via `SessionSync.QueueIPsecSA` (wire type `syncMsgIPsecSA`,
+  `encode/decodeIPsecSAPayload`).
+- **Hold** — the standby stores the peer's set wholesale in `peerIPsecSAs`
+  (`sync_conn.go` overwrites, not merges), readable via `PeerIPsecSAs()`.
+- **Re-initiate on takeover** — `reinitiateIPsecSAs` reads `PeerIPsecSAs()` and
+  `InitiateConnection`s each name when this node becomes RG0-primary.
+- **Empty-set / tunnel-down handling (#4385)** — a NON-EMPTY set is advertised
+  every tick (a heartbeat re-push — the only mechanism that seeds a freshly
+  reconnected/restarted standby, so it must keep pushing even when unchanged).
+  An EMPTY set is advertised exactly ONCE, on the drop-to-zero transition from a
+  previously non-empty set — a tunnel was administratively downed or all its SAs
+  were torn down — so the standby CLEARS its stale `peerIPsecSAs` instead of
+  resurrecting the tunnel on takeover. A steady empty set, INCLUDING a node that
+  never brought an SA up, is never advertised (no empty-heartbeat churn; the
+  standby's default set is already empty). The decision is
+  `ipsecSASyncAdvertise` (goroutine-local `lastFP` fingerprint, empty string =
+  last advertised set was empty / nothing advertised yet). Before #4385 the push
+  was guarded by `if len(names) > 0`, so a drop-to-zero was never advertised and
+  the standby resurrected the downed tunnel on failover. Mirrors the DHCP
+  `maybePushFamily` change-detect precedent below.
+- **Reconnect robustness (#4385)** — the one-shot empty push must survive a
+  disconnect gap, so two guards back it:
+  - **Confirmed-send retry.** `QueueIPsecSA` returns whether the frame reached an
+    ACTIVE conn; `ipsecSANextFP` advances `lastFP` ONLY on a confirmed send. An
+    empty advertisement that no-ops on a nil/dropped conn (a drop-to-zero landing
+    during a reconnect gap) leaves `lastFP` non-empty, so it RETRIES next tick
+    instead of being silently marked sent — without this, `lastFP` would advance
+    to empty and the empty would never be re-advertised, stranding the standby's
+    stale set.
+  - **Peer-connect re-advertise.** `OnPeerConnected` nudges `ipsecSANudgeCh`
+    (`nudgeIPsecSASync`), and `syncIPsecSAPeriodic` handles it with a FORCED
+    advertise (`advertiseIPsecSAOnce(force=true)` -> `ipsecSASyncAdvertise` force
+    branch) of the current set, empty or not. A reconnected standby that missed
+    the one-shot empty, or a same-process standby that retained its peer set
+    across a blip, converges immediately (empty -> clears; non-empty ->
+    re-seeds) rather than waiting up to the 30s tick. Mirrors the DHCP
+    peer-connect `nudgeDHCPLeaseSync` (#2239 Q7).
+
+  Note: `peerIPsecSAs` is deliberately NOT cleared on disconnect — a real
+  primary death (the standby never reconnects) must leave the last-known set in
+  place for `reinitiateIPsecSAs` to re-initiate on takeover. Convergence to an
+  empty/updated set is driven by the primary re-advertising, not by the standby
+  self-clearing.
+
 ## DHCP-server lease sync (#2239)
 
 DHCP-server (Kea) leases ride the SAME session-sync channel and follow the

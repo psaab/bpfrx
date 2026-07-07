@@ -48,6 +48,33 @@
   passed / 0 failed, 2 ignored. HA post-failover embedded-ICMP behavior —
   parent to run `make test-failover` (a synced SNAT session + a PMTUD ICMP after
   failover reverse-translates) before merge.
+## 2026-07-06 — #4383: DHCPv6 IA_NA multi-address deterministic selection
+
+- **Timestamp**: 2026-07-06
+- **Action**: The DHCPv6 IA_NA extraction loop in `parseV6Reply`
+  (`pkg/dhcp/dhcp.go`) did a last-wins overwrite of `addr`/`validLT` for
+  every IAADDR option, so a reply carrying multiple IAADDR options (RFC
+  8415 §21.4 permits several per IA_NA, and multiple IA_NA per reply)
+  installed whichever address enumerated last and paired the whole lease
+  with that address's valid-lifetime — an order-dependent choice that
+  could prefer a deprecated address and carry a stale lifetime. Fix:
+  extracted the selection into a pure helper `selectIANAAddress` that
+  skips any IAADDR with valid-lifetime 0 (expired/declined, RFC 8415
+  §12.1 — ties into F-264), then picks the longest preferred-lifetime,
+  tie-broken by first-seen (strict greater-than over option order), and
+  returns the CHOSEN address's own valid-lifetime so `lease.LeaseTime` is
+  never paired with a stale value. `parseV6Reply` now calls the helper.
+  Also added a nil-guard to `discoverIPv6Router` (consistent with the
+  existing nil-nlHandle guards) so `parseV6Reply` is unit-testable with a
+  bare `Manager`. Tests (`dhcpv6_iana_test.go`): multi-IAADDR selects the
+  longest-preferred + LeaseTime = its valid-lifetime; single-address
+  unchanged; valid-lifetime-0 skipped; all-zero => no usable IA_NA error;
+  tie-break first-seen; selection scans across multiple IA_NA options. All
+  four deterministic subtests go RED when the helper is reverted to
+  last-wins (verified via in-place Edit-revert, restored). `go test
+  ./pkg/dhcp/...` green; `go build ./...`, gofmt, vet clean.
+- **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/dhcpv6_iana_test.go,
+  pkg/dhcp/README.md, _Log.md
 
 ## 2026-07-06 — #4388: reserve a peer-synced session's NAT pool port on the standby
 
@@ -37552,3 +37579,64 @@ top.
 - **File(s)**: userspace-dp/src/session/mod.rs,
   userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
   docs/pr/2134-screen-session-limit-enforce/self-review.md, _Log.md
+
+- **Timestamp**: 2026-07-07T01:54Z
+- **Action**: Fix #4385 — IPsec SA sync never advertised the empty set, so an
+  administratively-downed tunnel (active SA set drops to zero) left the standby
+  holding the last non-empty snapshot; on RG0 takeover `reinitiateIPsecSAs`
+  re-initiated the stale names and resurrected the downed tunnel. Root cause:
+  `syncIPsecSAPeriodic` guarded the push with `if len(names) > 0`, suppressing
+  the drop-to-zero advertisement (the standby overwrites `peerIPsecSAs`
+  wholesale, so it never cleared). Fix: extract the push decision into
+  `ipsecSASyncAdvertise(names, lastFP)` — a NON-EMPTY set is advertised every
+  tick (heartbeat re-push; the only mechanism that seeds a reconnected standby,
+  so reconnect-safety is preserved), an EMPTY set is advertised exactly ONCE on
+  the drop-to-zero transition from a previously non-empty set (standby clears
+  its stale peer set), and a steady/never-up empty set is never advertised (no
+  empty-heartbeat churn). `syncIPsecSAPeriodic` keeps a goroutine-local `lastFP`
+  fingerprint (single-instance per comms lifetime). Tests: new pkg/daemon
+  `TestIPsecSASyncAdvertise` (RED-on-revert of the len(names)>0 guard — the
+  downed-tunnel case fails) and pkg/cluster `TestIPsecSAEmptyPushClearsPeer`
+  (empty push clears the receiver's `peerIPsecSAs` + `OnIPsecSAReceived`).
+  Verified RED-on-revert by temporarily restoring the guard (downed-tunnel
+  assertion fails), then restored. go test ./pkg/cluster/... ./pkg/ipsec/...
+  ./pkg/daemon/... green; go build ./...; gofmt + vet clean. HA IPsec SA sync ->
+  parent must run make test-failover before merge (a downed tunnel must NOT
+  resurrect on failover).
+- **File(s)**: pkg/daemon/daemon_ha.go,
+  pkg/daemon/ipsec_sa_sync_empty_4385_test.go, pkg/cluster/sync_test.go,
+  pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06T[fold]Z
+- **Action**: Fold #4385 hostile-review residual (MERGE-NEEDS-MINOR) — the
+  one-shot empty push could be MISSED, leaving a stale set that resurrects the
+  tunnel on takeover across a reconnect gap. Two robustness guards, mirroring
+  the DHCP precedent: (1) CONFIRMED-SEND RETRY — `QueueIPsecSA` now returns
+  whether the frame reached an ACTIVE conn (false on nil/dropped conn); the new
+  `ipsecSANextFP` advances the goroutine-local `lastFP` ONLY on a confirmed
+  send, so a drop-to-zero empty push that no-ops during a reconnect gap leaves
+  `lastFP` non-empty and RETRIES next tick instead of being silently marked
+  sent (the un-fixed advance-on-noop stranded the standby's stale set). (2)
+  PEER-CONNECT RE-ADVERTISE — `OnPeerConnected` nudges the new `ipsecSANudgeCh`
+  (`nudgeIPsecSASync`) and `syncIPsecSAPeriodic` handles it with a FORCED
+  advertise (`advertiseIPsecSAOnce(force=true)` -> `ipsecSASyncAdvertise` force
+  branch) of the current set, empty or not, so a reconnected standby (or a
+  same-process standby that retained its set across a blip) converges
+  immediately instead of waiting up to 30s. Deliberately did NOT clear
+  `peerIPsecSAs` on disconnect — a real primary death (standby never reconnects)
+  must keep the last-known set for `reinitiateIPsecSAs` on takeover; convergence
+  is primary-driven. Verified reconnect-safety BOTH directions (force re-seeds
+  non-empty, force clears empty). Tests: pkg/daemon `TestIPsecSAMissedEmptyRetries`
+  (RED on revert of the confirmed-send gate — `lastFP` wrongly advances to ""
+  and the empty is never retried), `TestIPsecSASyncForceReadvertise` (RED on
+  revert of the force branch), updated `TestIPsecSASyncAdvertise` for the new
+  `force` param; pkg/cluster `TestQueueIPsecSAConfirmedSend` (false on nil conn,
+  true on active conn incl. empty payload). Both reverts verified RED then
+  restored. Master already at branch base (no rebase). go test
+  ./pkg/daemon/... ./pkg/cluster/... ./pkg/ipsec/... green; go build ./...;
+  gofmt + vet clean. HA IPsec SA sync -> parent composes test-failover with
+  #4393 before merge.
+- **File(s)**: pkg/cluster/sync.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/ipsec_sa_sync_empty_4385_test.go, pkg/cluster/sync_test.go,
+  pkg/cluster/README.md, _Log.md

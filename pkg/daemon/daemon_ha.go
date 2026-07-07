@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -1308,31 +1309,140 @@ func (d *Daemon) clusterConfig() *config.ClusterConfig {
 	return cfg.Chassis.Cluster
 }
 
+// ipsecSAFingerprint returns a stable, order-independent fingerprint of an
+// active IPsec connection-name set. The empty set maps to the empty string so
+// a never-up node and a torn-down node share the same sentinel (see
+// ipsecSASyncAdvertise).
+func ipsecSAFingerprint(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), names...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, "\n")
+}
+
+// ipsecSASyncAdvertise decides whether the primary should advertise the current
+// active IPsec connection-name set to the standby, given the fingerprint of the
+// set it last advertised (lastFP; the empty string means the last advertised
+// set was empty or nothing has been advertised yet). It returns whether to push
+// and the fingerprint to remember for the next tick.
+//
+// #4385: a NON-EMPTY set is advertised every tick — a heartbeat re-push so a
+// freshly reconnected/restarted standby relearns the full set within one
+// interval (this is the ONLY mechanism that seeds a new standby's peer set, so
+// it preserves the pre-#4385 reconnect-safety behavior). An EMPTY set is
+// advertised exactly ONCE, on the transition down from a previously non-empty
+// set — a tunnel was administratively downed or all its SAs were torn down — so
+// the standby CLEARS its stale peer set instead of resurrecting the tunnel on
+// takeover (reinitiateIPsecSAs). A steady empty set, INCLUDING a node that
+// never brought an SA up, is never advertised: no 30s empty-heartbeat churn,
+// and the standby's default peer set is already empty so there is nothing to
+// clear.
+//
+// force=true (a peer (re)connected) advertises the CURRENT set regardless —
+// empty or not — so a standby that missed the one-shot empty during a
+// disconnect gap, or that retained a stale peer set across a same-process blip,
+// converges to our actual state immediately (empty -> it clears; non-empty ->
+// it re-seeds). This mirrors the DHCP peer-connect nudge (force=true re-push).
+func ipsecSASyncAdvertise(names []string, lastFP string, force bool) (push bool, newFP string) {
+	fp := ipsecSAFingerprint(names)
+	if force {
+		return true, fp
+	}
+	if len(names) > 0 {
+		return true, fp
+	}
+	// Empty set: advertise once to clear the standby ONLY if we previously
+	// advertised a non-empty set (downed-but-was-up, not never-up).
+	if lastFP != "" {
+		return true, ""
+	}
+	return false, ""
+}
+
+// ipsecSANextFP returns the fingerprint to remember after one advertise attempt.
+// The last-sent fingerprint advances ONLY when a push was due AND the send was
+// confirmed to an active conn (#4385). A push that no-ops on a nil/dropped conn
+// leaves lastFP unchanged, so the (empty or changed) advertisement RETRIES on
+// the next tick rather than being silently marked as sent — the fix for the
+// window where a drop-to-zero empty push lands during a reconnect gap, the
+// fingerprint advances anyway, and the standby is left holding a stale set that
+// resurrects the tunnel on takeover.
+func ipsecSANextFP(push, sendConfirmed bool, fp, lastFP string) string {
+	if push && sendConfirmed {
+		return fp
+	}
+	return lastFP
+}
+
+// advertiseIPsecSAOnce runs one IPsec SA advertise pass on the primary and
+// returns the fingerprint to carry into the next pass. force=true (a peer
+// (re)connect nudge) re-advertises the current set regardless of change. It is
+// a no-op (returns lastFP unchanged) on a non-primary node, when the feature is
+// disabled, when the active-SA read fails, or when the send does not reach an
+// active conn.
+func (d *Daemon) advertiseIPsecSAOnce(lastFP string, force bool) string {
+	if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
+		return lastFP
+	}
+	cc := d.clusterConfig()
+	if cc == nil || !cc.IPsecSASync {
+		return lastFP
+	}
+	names, err := d.ipsec.ActiveConnectionNames()
+	if err != nil {
+		slog.Debug("cluster: failed to get IPsec connection names", "err", err)
+		return lastFP
+	}
+	push, fp := ipsecSASyncAdvertise(names, lastFP, force)
+	sendConfirmed := false
+	if push && d.sessionSync != nil {
+		sendConfirmed = d.sessionSync.QueueIPsecSA(names)
+	}
+	return ipsecSANextFP(push, sendConfirmed, fp, lastFP)
+}
+
+// nudgeIPsecSASync requests an immediate IPsec SA re-advertise (fired when a
+// peer sync connection is established). Non-blocking depth-1 send that coalesces
+// a burst; safe before the loop starts.
+func (d *Daemon) nudgeIPsecSASync() {
+	if d.ipsecSANudgeCh == nil {
+		return
+	}
+	select {
+	case d.ipsecSANudgeCh <- struct{}{}:
+	default:
+	}
+}
+
 // syncIPsecSAPeriodic runs on the primary node, periodically syncing active IPsec
-// connection names to the secondary via the session sync channel.
+// connection names to the secondary via the session sync channel. It advertises
+// the current active set every tick when non-empty (heartbeat re-push) and, per
+// #4385, advertises the empty set once when the active set drops to zero so the
+// standby does not resurrect an administratively-downed tunnel on takeover. A
+// peer-connect nudge forces a re-advertise of the current set (empty or not) so
+// a reconnected standby converges even if it missed the one-shot empty.
 func (d *Daemon) syncIPsecSAPeriodic(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	// lastFP tracks the fingerprint of the last set advertised to the standby
+	// (empty string = last advertised set was empty / nothing advertised yet).
+	// This goroutine is single-instance per comms lifetime (started once in
+	// daemon_ha_sync.go and re-created with a fresh commsCtx only on a
+	// transport-field change), so the local is safe without a lock.
+	var lastFP string
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
-				continue
-			}
-			cc := d.clusterConfig()
-			if cc == nil || !cc.IPsecSASync {
-				continue
-			}
-			names, err := d.ipsec.ActiveConnectionNames()
-			if err != nil {
-				slog.Debug("cluster: failed to get IPsec connection names", "err", err)
-				continue
-			}
-			if len(names) > 0 && d.sessionSync != nil {
-				d.sessionSync.QueueIPsecSA(names)
-			}
+			lastFP = d.advertiseIPsecSAOnce(lastFP, false)
+		case <-d.ipsecSANudgeCh:
+			// A peer sync connection was (re)established: force a re-advertise
+			// of the CURRENT set so a standby that missed the one-shot empty
+			// during the gap (or retained a stale set across a blip) converges.
+			lastFP = d.advertiseIPsecSAOnce(lastFP, true)
 		}
 	}
 }

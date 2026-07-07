@@ -1362,6 +1362,63 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string, mode dhcpExcha
 	return m.parseV6Reply(ctx, ifaceName, adv, v6opts)
 }
 
+// selectIANAAddress chooses a single, deterministic IA_NA address from a
+// DHCPv6 reply. RFC 8415 §21.4 permits an IA_NA to carry more than one
+// IAADDR option, and a reply may carry more than one IA_NA; xpf's lease
+// model holds exactly one address, so enumeration order must NOT decide
+// which one is installed (#4383). The previous last-wins overwrite kept
+// whichever IAADDR enumerated last and paired the lease lifetime with
+// that address's valid-lifetime, so a deprecated address could win over a
+// preferred one and the lease could carry a stale lifetime.
+//
+// Selection is deterministic:
+//   - skip any IAADDR with valid-lifetime 0 — RFC 8415 §12.1 treats a
+//     zero valid-lifetime as an expired/declined address (F-264);
+//   - among the rest, prefer the longest preferred-lifetime;
+//   - ties are broken by first-seen (option order).
+//
+// The returned valid-lifetime belongs to the CHOSEN address, so the
+// caller pairs lease.LeaseTime with the right lifetime rather than a
+// stale one from a different IAADDR. Returns an invalid Addr and zero
+// duration when the reply carries no usable IA_NA address.
+func selectIANAAddress(adv *dhcpv6.Message) (netip.Addr, time.Duration) {
+	var (
+		best      netip.Addr
+		bestValid time.Duration
+		bestPref  time.Duration
+		found     bool
+	)
+	for _, opt := range adv.Options.Options {
+		ianaOpt, ok := opt.(*dhcpv6.OptIANA)
+		if !ok {
+			continue
+		}
+		for _, subOpt := range ianaOpt.Options.Options {
+			iaaddr, ok := subOpt.(*dhcpv6.OptIAAddress)
+			if !ok {
+				continue
+			}
+			// Expired/declined address — never install it (F-264).
+			if iaaddr.ValidLifetime == 0 {
+				continue
+			}
+			a, ok := netip.AddrFromSlice(iaaddr.IPv6Addr)
+			if !ok {
+				continue
+			}
+			// Strict greater-than keeps the FIRST address at the maximum
+			// preferred-lifetime (first-seen tie-break).
+			if !found || iaaddr.PreferredLifetime > bestPref {
+				best = a
+				bestValid = iaaddr.ValidLifetime
+				bestPref = iaaddr.PreferredLifetime
+				found = true
+			}
+		}
+	}
+	return best, bestValid
+}
+
 // parseV6Reply extracts the lease (IA_NA address, lifetime, DNS, gateway)
 // and any delegated prefixes (IA_PD) from a DHCPv6 Reply/Advertise. It is
 // shared by the solicit, renew, and rebind paths (#2994); the server DUID
@@ -1385,23 +1442,17 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 		}
 	}
 
-	// Extract IA_NA addresses
+	// Extract the IA_NA address. A reply may carry multiple IAADDR
+	// options (and multiple IA_NA options); selectIANAAddress chooses one
+	// deterministically — longest preferred-lifetime, tie-broken by
+	// first-seen, expired valid-lifetime-0 addresses skipped — and returns
+	// that address's own valid-lifetime so the lease lifetime is never
+	// paired with a stale value from a different address (#4383).
 	var addr netip.Addr
 	var validLT time.Duration
 
 	if wantNA {
-		for _, opt := range adv.Options.Options {
-			if ianaOpt, ok := opt.(*dhcpv6.OptIANA); ok {
-				for _, subOpt := range ianaOpt.Options.Options {
-					if iaaddr, ok := subOpt.(*dhcpv6.OptIAAddress); ok {
-						if a, ok2 := netip.AddrFromSlice(iaaddr.IPv6Addr); ok2 {
-							addr = a
-							validLT = iaaddr.ValidLifetime
-						}
-					}
-				}
-			}
-		}
+		addr, validLT = selectIANAAddress(adv)
 	}
 
 	// Extract IA_PD delegated prefixes
@@ -1578,6 +1629,9 @@ func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Ti
 // the NTF_ROUTER flag (learned from Router Advertisements).
 // Retries a few times since RAs may not have been processed yet.
 func (m *Manager) discoverIPv6Router(ctx context.Context, ifaceName string) netip.Addr {
+	if m.nlHandle == nil {
+		return netip.Addr{}
+	}
 	link, err := m.nlHandle.LinkByName(ifaceName)
 	if err != nil {
 		return netip.Addr{}
