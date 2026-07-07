@@ -1,3 +1,23 @@
+## 2026-07-07 — #4526 DHCP renewalTimers int64 overflow (cleanliness)
+
+- **Timestamp**: 2026-07-07T00:00Z
+- **Action**: `renewalTimers` (pkg/dhcp/commit.go) computed the T2
+  remainder as `leaseTime*7/8 - leaseTime/2`. `leaseTime` is a
+  `time.Duration` (int64 ns); for a lease above ~41.8yr (MaxInt64/7 ns) —
+  notably the 0xFFFFFFFF-second RFC infinite-lease sentinel, which
+  IPAddressLeaseTime passes through uncapped (dhcp.go) — the `leaseTime*7`
+  intermediate overflows int64, wraps negative, and the result clamps to
+  the 1s floor. Impact is effectively nil (in that regime t1 = leaseTime/2
+  is decades out and fires first, so there is no rebind storm), so this is
+  a cleanliness fix. Reordered to divide-before-multiply
+  `leaseTime / 8 * 3` — algebraically the same 37.5% remainder with no
+  intermediate above the lease itself. The two forms are bit-identical for
+  every whole-second lease (1e9 ns is divisible by 8, no rounding
+  divergence; verified for 3600/60/40/2/0/86400s). Added a RED-on-revert
+  test case (`max-uint32 infinite-lease sentinel`): with the old form it
+  fails `t2Remaining = 1s, want 447392h25m35.625s`; other cases stay green.
+- **Files**: pkg/dhcp/commit.go, pkg/dhcp/commit_test.go
+
 ## 2026-07-07 — Revert R-04 `@` isIdentChar (broke #4099 rescue-config fail-closed test)
 
 - **Timestamp**: 2026-07-07T13:50Z

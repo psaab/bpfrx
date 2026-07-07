@@ -40,16 +40,24 @@ import (
 // renewalTimers computes the two waits of one renewal cycle from a
 // lease duration: t1 is the wait until the renew attempt (50% of the
 // lease time, clamped to a 30s minimum), t2Remaining is the additional
-// wait from T1 to the rebind attempt (87.5% − 50% of the lease time,
-// clamped to a 1s minimum). The formulas are unchanged from the
-// pre-#1777 inline code; they are extracted so both families share one
-// definition and tests can pin the clamps.
+// wait from T1 to the rebind attempt (87.5% − 50% = 37.5% of the lease
+// time, clamped to a 1s minimum). The remainder is computed as
+// leaseTime/8*3 (divide-before-multiply) rather than the algebraically
+// equal leaseTime*7/8 - leaseTime/2: the latter overflows int64 for a
+// lease above ~41.8yr (MaxInt64/7 ns) — notably the 0xFFFFFFFF-second
+// RFC infinite sentinel — wrapping negative and clamping T2 to 1s
+// (#4526). The divide-first form has no intermediate above the lease
+// itself. For every whole-second lease the two forms are bit-identical
+// (1e9 ns is divisible by 8, so no rounding divergence). The 50%/37.5%
+// split and clamps are unchanged from the pre-#1777 inline code; they
+// are extracted so both families share one definition and tests can pin
+// the clamps.
 func renewalTimers(leaseTime time.Duration) (t1, t2Remaining time.Duration) {
 	t1 = leaseTime / 2
 	if t1 < 30*time.Second {
 		t1 = 30 * time.Second
 	}
-	t2Remaining = leaseTime*7/8 - leaseTime/2
+	t2Remaining = leaseTime / 8 * 3
 	if t2Remaining < time.Second {
 		t2Remaining = time.Second
 	}
