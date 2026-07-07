@@ -84,21 +84,29 @@ func TestProtoConstrainedAppWrongProtoNoMatch(t *testing.T) {
 
 // TestProtocolLessNamedAppNeverMatches pins the parity contract for a NAMED
 // application that carries NO protocol. The dataplane cannot represent such an
-// app and never enforces it: the snapshot builder fails closed
-// (deriveUserspaceCapabilities, pkg/dataplane/userspace/capabilities.go returns
-// ok=false for proto=="" → the __unsupported__ sentinel → whole-snapshot reject,
-// #3261) and strict commit hard-rejects it
+// app and never enforces it: the snapshot builder fails the WHOLE snapshot
+// closed (expandUserspacePolicyApplications returns ok=false for proto=="" →
+// the __unsupported__ sentinel → the Rust integrity preflight rejects the whole
+// snapshot, #3261/#3323) and strict commit hard-rejects it
 // (pkg/config/compiler_validate_strict.go). A protocol-less named app can only
-// exist via a lenient/HA-loaded config, where the runtime STILL never enforces
-// it. The simulator must therefore NOT report it as a concrete match — reporting
-// a match-any the dataplane would never produce is the simulator-vs-runtime
-// divergence #3323 is about. It must fall through to the configured
-// default-policy, EVEN when the query supplies a concrete protocol (the app is
-// unrepresentable regardless of the query).
+// exist via a lenient/HA-loaded config, where the runtime retains its
+// previous-good snapshot (or fresh-boots default-deny) and enforces NONE of the
+// config.
 //
-// FAIL-ON-REVERT: restoring the `if app.Protocol != "" { ... }` guard (skipping
-// the protocol gate for an empty app.Protocol) makes a protocol-less named app
-// match-any (Matched=true, permit), failing the want-default-deny assertions.
+// #4394: the simulator must therefore report ContentRejected — NOT a fabricated
+// default-policy verdict. The pre-#4394 simulator fell through to the configured
+// default-policy (a "default verdict"), which is itself a divergence: under a
+// default-PERMIT it would report PERMIT for a config the dataplane fail-closes,
+// and under a default-DENY that retained a previous-good PERMIT snapshot it
+// would report DENY while the dataplane still PERMITS. The config-wide
+// ContentRejected gate mirrors the whole-snapshot fail-close for EVERY query,
+// with or without a concrete query protocol (the app is unrepresentable
+// regardless of the query).
+//
+// FAIL-ON-REVERT: dropping the #4394 config-wide gate (or the
+// dpuserspace.PolicyContentRejectionReasons detection of proto=="") makes the
+// protocol-less named app fall through to default-deny (DefaultUsed=true,
+// ContentRejected=false), failing the want-ContentRejected assertions.
 func TestProtocolLessNamedAppNeverMatches(t *testing.T) {
 	sec := config.SecurityConfig{
 		DefaultPolicy: config.PolicyDeny,
@@ -129,23 +137,23 @@ func TestProtocolLessNamedAppNeverMatches(t *testing.T) {
 	}
 	cfg := cfgWith(sec, apps)
 
-	// Omitted query protocol: must not match.
+	// Omitted query protocol: the whole config is content-rejected.
 	res := Match(cfg, Query{FromZone: "trust", ToZone: "untrust"})
-	if res.Matched {
-		t.Fatalf("protocol-less named app matched an omitted query protocol; res = %+v", res)
+	if !res.ContentRejected {
+		t.Fatalf("want ContentRejected for a protocol-less named app (dataplane fails the snapshot closed), got %+v", res)
 	}
-	if !res.DefaultUsed || res.Action != config.PolicyDeny {
-		t.Fatalf("want default-policy deny for a protocol-less named app, got %+v", res)
+	if res.Matched || res.DefaultUsed {
+		t.Fatalf("Matched=%v DefaultUsed=%v, want both false for a ContentRejected verdict; res = %+v", res.Matched, res.DefaultUsed, res)
 	}
 
-	// Concrete query protocol: still must not match — the app is unrepresentable
-	// regardless of the query, mirroring the dataplane reject.
+	// Concrete query protocol: still ContentRejected — the app is unrepresentable
+	// regardless of the query, mirroring the whole-snapshot dataplane reject.
 	res = Match(cfg, Query{FromZone: "trust", ToZone: "untrust", Protocol: "tcp", DstPort: 80})
-	if res.Matched {
-		t.Fatalf("protocol-less named app matched a concrete query (dataplane rejects it); res = %+v", res)
+	if !res.ContentRejected {
+		t.Fatalf("want ContentRejected for a protocol-less named app with a concrete query, got %+v", res)
 	}
-	if !res.DefaultUsed || res.Action != config.PolicyDeny {
-		t.Fatalf("want default-policy deny for a protocol-less named app, got %+v", res)
+	if res.Matched || res.DefaultUsed {
+		t.Fatalf("Matched=%v DefaultUsed=%v, want both false for a ContentRejected verdict; res = %+v", res.Matched, res.DefaultUsed, res)
 	}
 }
 

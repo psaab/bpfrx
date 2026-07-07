@@ -316,6 +316,36 @@ func (s *Store) ConfirmCommit() error {
 	return nil
 }
 
+// ConfirmPendingOnDemotion confirms any pending `commit confirmed` window
+// because this node is being DEMOTED from RG0 primary (#4378). It is the
+// demotion-event analogue of #3861's confirm-on-plain-commit / confirm-on-sync:
+// it cancels the armed rollback timer and bumps confirmGen (via
+// clearPendingConfirmLocked) so an already-fired-but-blocked callback no-ops in
+// PromoteRollback, and returns true iff a pending window was cleared. Unlike
+// ConfirmCommit it does NOT return an error when nothing is pending — demotion
+// fires on every clean weight-based failover and the common case is no pending
+// commit-confirmed.
+//
+// CONFIRM (keep the committed config), not roll back: the committing node
+// pushed the committed config to the peer via config-sync at commit-confirmed
+// time (commitConfirmedAndApply -> applyAndSyncCommitted ->
+// pushCommittedConfigToPeer). The peer — now RG0 primary — is therefore
+// already running that committed config. Rolling THIS node's store back to the
+// pre-confirm tree while the primary keeps the commit would diverge the two
+// nodes (the #4378 bug, surfacing at the next failover). Confirming keeps both
+// nodes converged on the committed config.
+func (s *Store) ConfirmPendingOnDemotion() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.clearPendingConfirmLocked() {
+		return false
+	}
+
+	slog.Info("commit confirmed: confirmed on RG0 demotion (peer holds the synced config)")
+	return true
+}
+
 // IsConfirmPending returns true if a commit confirmed is awaiting confirmation.
 func (s *Store) IsConfirmPending() bool {
 	s.mu.RLock()

@@ -145,7 +145,18 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 	// under-denying it.
 	addrRepresentable := func(tok string) bool {
 		switch tok {
-		case "", "any", "any4", "any6":
+		// `any4`/`any6` are the internal short forms; `any-ipv4`/`any-ipv6` are
+		// the Junos config keywords. A committed config never carries the Junos
+		// keywords raw — compilePolicy rewrites them to 0.0.0.0/0 // ::/0
+		// (compiler_security_policy.go normalizePolicyAddrToken) — but a lenient /
+		// HA-synced / hand-built snapshot can, and the Rust matcher accepts the
+		// WHOLE set as a family wildcard (policy.rs parse_v3_literal_set:
+		// `"any4" | "any-ipv4" => any_v4`). Accept the same set so the
+		// representability gate never emits a false __unsupported_address__
+		// sentinel (a spurious whole-snapshot fail-close) for a token the matcher
+		// actually honors — which would also make the #4394 match-policies
+		// simulator falsely report ContentRejected for a raw `any-ipv4` policy.
+		case "", "any", "any4", "any6", "any-ipv4", "any-ipv6":
 			return true
 		}
 		if isUserspaceLiteralAddress(tok) {
@@ -549,6 +560,75 @@ func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
 		}
 		reasons = append(reasons, fmt.Sprintf("policy %s names content the userspace matcher cannot represent: %s",
 			policyRejectionScope(rule), strings.Join(causes, "; ")))
+	}
+	return reasons
+}
+
+// PolicyContentRejectionReasons is the config-level SSOT for "the userspace
+// helper would fail this config's policy snapshot CLOSED and enforce NONE of
+// it". It is the single mirror of the runtime fail-closed policy-content set,
+// shared with the `request security match-policies` simulator (pkg/policymatch)
+// so the simulator reports the dataplane's fail-closed retention instead of a
+// fabricated permit/deny/default verdict (#4394) — the same SSOT-reuse pattern
+// as RuntimePolicyIDs and ClassifyHostInbound (#4352).
+//
+// It reproduces buildSnapshot's two policy-content fail-close paths exactly:
+//
+//   - PER-RULE SENTINELS (collectPolicyContentRejections over the BUILT rules):
+//     the policy snapshot builder poisons a rule with the __unsupported__
+//     application term or the __unsupported_address__ literal when it names
+//
+//   - a protocol-less application (proto == "" ->
+//     expandUserspacePolicyApplications ok=false, #3323),
+//
+//   - an unrepresentable protocol or port (appid.ProtocolNumber /
+//     userspacePortSpecRepresentable rejects it, #2124/#4345),
+//
+//   - an undefined application reference (resolveUserspaceApplicationNames
+//     ok=false),
+//
+//   - an unresolvable address (an undefined address-book / prefix-list name,
+//     or a defined book/set whose value is a non-literal dns-name / wildcard
+//     / range or resolves to no concrete prefix — addrRepresentable false,
+//     #3261).
+//     The Rust integrity preflight rejects any such rule
+//     (UnrepresentableApplicationProtocol / UnrepresentableAddress), so the
+//     helper retains its previous-good snapshot or fresh-boots default-deny.
+//     This scan is feed-aware — a healthy dynamic-address feed policy resolves
+//     through feedOverlay and does NOT false-positive.
+//
+//   - APP-CATALOG BUILD (buildAppCatalogSnapshot): pkg/appid BuildCatalog walks
+//     EVERY configured application-set and errors on the first it cannot expand,
+//     which fails the whole snapshot closed REGARDLESS of a leading `any` token
+//     in the referencing policy (the per-rule scan short-circuits on `any`, so a
+//     `match application [ any bad-set ]` policy is missed there but still fails
+//     closed here). It is consulted only when the per-rule scan is empty, so a
+//     bad set already named with a scoped per-rule reason is not double-reported.
+//
+// A non-empty result means the dataplane enforces NONE of this config; an empty
+// result means every policy rule is representable. feedOverlay is the live
+// dynamic-address feed-prefix overlay (nil = no live feeds); callers MUST pass
+// the same overlay the production builder uses so the simulator agrees with the
+// helper on feed-backed address-names.
+func PolicyContentRejectionReasons(cfg *config.Config, feedOverlay map[string][]string) []string {
+	if cfg == nil {
+		return nil
+	}
+	policies, err := buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, feedOverlay)
+	if err != nil {
+		// A policy-snapshot build error (e.g. the #2514 address-book content-ID
+		// collision, or a MaxRulesPerPolicy overflow) is itself a fail-closed
+		// condition: buildSnapshot returns the error, the apply path rejects the
+		// config, and the helper retains the prior dataplane state. Report it so
+		// the simulator does not fabricate a verdict the dataplane never enforces.
+		return []string{fmt.Sprintf("policy snapshot cannot be built (fail-closed): %v", err)}
+	}
+	reasons := collectPolicyContentRejections(policies)
+	if len(reasons) == 0 {
+		if _, cerr := buildAppCatalogSnapshot(cfg); cerr != nil {
+			reasons = append(reasons, fmt.Sprintf(
+				"application catalog cannot be built (fail-closed): %v", cerr))
+		}
 	}
 	return reasons
 }

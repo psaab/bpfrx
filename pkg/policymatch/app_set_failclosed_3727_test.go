@@ -211,7 +211,7 @@ func TestNoAppSetNoRejection(t *testing.T) {
 				config.PolicyMatch{Applications: []string{"junos-http"}})),
 		},
 	}, config.ApplicationsConfig{})
-	if reasons := policyContentRejectionReasons(cfg); len(reasons) != 0 {
+	if reasons := policyContentRejectionReasons(cfg, nil); len(reasons) != 0 {
 		t.Fatalf("policyContentRejectionReasons = %v, want empty for a config with no application-sets", reasons)
 	}
 }
