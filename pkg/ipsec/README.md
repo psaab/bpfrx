@@ -263,6 +263,19 @@ all files stay in `package ipsec`, so the public API is unchanged.
     timeout / NXDOMAIN / SERVFAIL it returns family 0 (agnostic) — a slow or
     unreachable resolver degrades to the interface-decides path and NEVER
     stalls `commit` / apply for the full glibc resolver timeout.
+  - **Concurrent hint resolution (#4547):** the per-gateway family hints are
+    resolved CONCURRENTLY by `resolveGatewayFamilyHints` (`policy.go`) before
+    the gateway copy loop, through a bounded worker pool
+    (`resolveFamilyHintConcurrency = 8`). Because each dynamic-hostname lookup
+    can block for up to the 2s timeout, resolving N gateways sequentially
+    stalled the ordered commit apply up to N×2s under DNS failure; the bounded
+    pool keeps wall-clock cost at ~one timeout regardless of gateway count. The
+    hint is per-gateway and order-independent, so the concurrent result is
+    identical to the former inline sequential lookup — only the scheduling
+    changed. Only gateways that resolve `local_addrs` from an
+    `external-interface` (no explicit `local-address`) are looked up; the cap
+    also bounds concurrent resolver goroutines / file descriptors for a
+    pathologically large dynamic-hostname set.
   - **IPv6 link-local local binds (#2885):** the candidate filter
     `matchFamily` (`policy.go`) admits an IPv6 link-local unicast source
     (`fe80::/10`) when the gateway family hint is IPv6 (family 6). The

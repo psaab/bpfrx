@@ -1,9 +1,11 @@
 package ipsec
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1466,6 +1468,117 @@ func TestPrepareConfig_DynamicHostnameFamilyFallback(t *testing.T) {
 	prepared := PrepareConfig(cfg)
 	if got := prepared.Gateways["gw"].LocalAddress; got != "198.51.100.1" {
 		t.Fatalf("IPv6-peer/IPv4-only-iface local-address = %q, want 198.51.100.1 (fallback)", got)
+	}
+}
+
+// multiDynamicHostnameCfg builds a config with a single dual-stack external
+// interface and n dynamic-hostname gateways (each LocalAddress unset, so
+// PrepareConfig resolves the local-address per gateway via a family hint). The
+// interface carries both an IPv4 and an IPv6 address so the resolved
+// local-address directly reflects the per-gateway family hint: family 4 →
+// 198.51.100.1, family 6 → 2001:db8:1::1.
+func multiDynamicHostnameCfg(n int) *config.Config {
+	gws := make(map[string]*config.IPsecGateway, n)
+	vpns := make(map[string]*config.IPsecVPN, n)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("gw%d", i)
+		gws[name] = &config.IPsecGateway{
+			Name:            name,
+			DynamicHostname: fmt.Sprintf("peer%d.example.com", i),
+			ExternalIface:   "wan0.0",
+		}
+		vpns[fmt.Sprintf("tun%d", i)] = &config.IPsecVPN{Gateway: name}
+	}
+	return &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"wan0": {
+					Name: "wan0",
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{
+							"198.51.100.1/24",
+							"2001:db8:1::1/64",
+						}},
+					},
+				},
+			},
+		},
+		Security: config.SecurityConfig{
+			IPsec: config.IPsecConfig{Gateways: gws, VPNs: vpns},
+		},
+	}
+}
+
+// TestPrepareConfig_DynamicHostnameParallelResolve is the #4547 fail-on-revert
+// guard. Dynamic-hostname gateways resolve a family hint via a DNS lookup
+// bounded by resolveHostFamilyTimeout. Resolving N such gateways SEQUENTIALLY
+// in the commit apply stalls the commit up to N×timeout under a slow/failing
+// resolver; PrepareConfig now resolves the per-gateway hints concurrently
+// (bounded pool), so N gateways cost ~one lookup of wall-clock, not N.
+//
+// The injected resolver sleeps perLookup per call. With n gateways under the
+// concurrency cap, a parallel resolve completes in ~perLookup; a sequential
+// resolve needs ~n×perLookup. The deadline below (n/2 × perLookup) is safely
+// above the parallel time and safely below the sequential time, so reverting
+// the parallelization (back to an inline per-gateway lookup) makes this RED.
+// The test also asserts each gateway's family hint is applied correctly and is
+// identical to what the sequential per-gateway lookup produced, and that
+// exactly one lookup happened per gateway (no redundant or dropped lookups).
+func TestPrepareConfig_DynamicHostnameParallelResolve(t *testing.T) {
+	orig := resolveHostFamily
+	t.Cleanup(func() { resolveHostFamily = orig })
+
+	const (
+		n         = 6 // under resolveFamilyHintConcurrency (8) → all run at once
+		perLookup = 150 * time.Millisecond
+	)
+
+	var calls int64
+	// Deterministic per-host family: even index → IPv4, odd index → IPv6.
+	// The stub is invoked concurrently, so it must be goroutine-safe (it reads
+	// only its host argument and an atomic counter).
+	resolveHostFamily = func(host string) int {
+		atomic.AddInt64(&calls, 1)
+		time.Sleep(perLookup)
+		var idx int
+		if _, err := fmt.Sscanf(host, "peer%d.example.com", &idx); err != nil {
+			return -1 // unexpected host → forces a mismatch assertion below
+		}
+		if idx%2 == 0 {
+			return 4
+		}
+		return 6
+	}
+
+	cfg := multiDynamicHostnameCfg(n)
+
+	start := time.Now()
+	prepared := PrepareConfig(cfg)
+	elapsed := time.Since(start)
+
+	deadline := (n / 2) * perLookup
+	if elapsed >= deadline {
+		t.Fatalf("PrepareConfig took %v for %d dynamic-hostname gateways; "+
+			"want < %v (parallel). Sequential per-gateway lookup regressed (#4547)",
+			elapsed, n, deadline)
+	}
+
+	if got := atomic.LoadInt64(&calls); got != n {
+		t.Fatalf("resolver called %d times, want exactly %d (one per gateway)", got, n)
+	}
+
+	// Each gateway's local-address must reflect its own family hint, identical
+	// to the sequential resolution: even → IPv4 (198.51.100.1), odd → IPv6.
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("gw%d", i)
+		want := "2001:db8:1::1"
+		if i%2 == 0 {
+			want = "198.51.100.1"
+		}
+		if got := prepared.Gateways[name].LocalAddress; got != want {
+			t.Fatalf("gateway %s local-address = %q, want %q (family hint mismatch)",
+				name, got, want)
+		}
 	}
 }
 
