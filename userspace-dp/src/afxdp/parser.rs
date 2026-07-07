@@ -178,6 +178,16 @@ pub(super) struct NdpNeighborAdvert {
     /// from a host whose router knows the LLA already), but we can't
     /// learn a MAC from those.
     pub target_mac: Option<[u8; 6]>,
+    /// RFC 4861 §4.4 Override (O) flag from the NA flags byte. When 0, the
+    /// advertisement MUST NOT overwrite a cached neighbor entry that maps
+    /// to a DIFFERENT link-layer address (§7.2.5) — that is exactly the
+    /// unsolicited-NA next-hop hijack primitive. The learn site
+    /// (`poll_stages::stage_link_layer_classify`) honors this (#4475): a
+    /// legitimate host announcing a link-layer-address change sets
+    /// Override=1 (§7.2.6), so an Override=0 NA is only allowed to create a
+    /// first-time entry or refresh the same LLA, never to replace a live
+    /// differing one.
+    pub override_flag: bool,
 }
 
 /// Parse an IPv6 Neighbor Advertisement. Returns `None` if the frame
@@ -262,6 +272,14 @@ pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborA
     }
     let target_ip = IpAddr::V6(Ipv6Addr::from(target_bytes));
 
+    // RFC 4861 §4.4: the NA flags byte sits immediately after the 4-byte
+    // ICMPv6 header (type/code/checksum), i.e. at `l4_start + 4`. Bit 0x20
+    // is the Override (O) flag. `l4_start + 4` is in bounds — the header
+    // length check above already required `raw_frame.len() >= l4_start +
+    // ICMPV6_NA_HDR_LEN` (24). Read it so the learn site can honor §7.2.5
+    // (#4475: do not let an Override=0 NA overwrite a live differing LLA).
+    let override_flag = raw_frame[l4_start + 4] & 0x20 != 0;
+
     // ICMPv6 checksum over the IPv6 pseudo-header + the ICMPv6 message
     // (`l4_start..packet_end`). A valid packet sums (including its own
     // checksum field) to zero in 16-bit one's complement, i.e. the
@@ -299,6 +317,7 @@ pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborA
     Some(NdpNeighborAdvert {
         target_ip,
         target_mac,
+        override_flag,
     })
 }
 

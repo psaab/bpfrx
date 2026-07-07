@@ -1,3 +1,36 @@
+## 2026-07-07 — #4475 (opus-172 H-2): harden data-path neighbor learning against on-link poisoning/MITM
+
+- **Timestamp**: 2026-07-07T17:30Z
+- **Action**: Data-path neighbor learns (ARP reply / NDP NA captured by
+  XSK) installed the kernel entry as `NUD_REACHABLE` and unconditionally
+  overwrote any existing `(ifindex, ip)` — so an unsolicited advertisement
+  claiming a live next-hop (incl the WAN gateway) hijacked traffic with no
+  revalidation (neighbor-cache poisoning / MITM). Bounded hardening
+  (Option A): (1) install `NUD_STALE` not `NUD_REACHABLE` for data-path
+  learns so the kernel revalidates before trusting the binding and a
+  fire-and-forget poison ages out — matches Linux `arp_accept=0`
+  gratuitous-ARP handling and preserves the #3048 VRRP-failover MAC-change
+  propagation; (2) honor the RFC 4861 §7.2.5 NDP NA Override flag — an
+  Override=0 NA may only create a first-time entry or refresh the same LLA,
+  never replace a live DIFFERING LLA. Refactored `add_kernel_neighbor` into
+  a pure, testable `build_newneigh_request` + `DATA_PATH_NEIGH_STATE`
+  const. Parser now exposes `NdpNeighborAdvert::override_flag`. The #2851
+  own-IP + hop-limit-255 gates are unchanged. Solicited-only learning
+  (Option B) DEFERRED: the `last_probed` table is confined to the warmer
+  thread and is an incomplete record of solicitations; gating on it would
+  drop legit learns and needs new cross-thread plumbing. STALE + Override
+  already remove the forced-REACHABLE hijack window.
+- **Validation**: RED-on-revert Rust tests — STALE-not-REACHABLE encode
+  (`neighbor.rs`), Override=0 no-overwrite-of-live-differing + Override=1
+  updates + first-time Override=0 still creates (`poll_stages.rs`), parser
+  override_flag extraction (`parser_tests.rs`). FULL `cargo test --release
+  -- --test-threads=1`. Light cluster smoke (forwarding to gateway + a
+  gratuitous ARP does not hijack a live entry) flagged as warranted.
+- **File(s)**: userspace-dp/src/afxdp/neighbor.rs,
+  userspace-dp/src/afxdp/parser.rs, userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/parser_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+
 ## 2026-07-07 — Fix TestUserspaceLinkCycleDoesNotReenterLegacyLoader stale file target after #4462 process.go split
 
 - **Timestamp**: 2026-07-07T16:20Z
