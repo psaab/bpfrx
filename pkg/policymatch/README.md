@@ -366,43 +366,65 @@ unaffected. The surfaces accept the type/code as `icmp_type`/`icmp_code` (REST
 query, gRPC `MatchPolicies` optional fields), `icmp-type`/`icmp-code` (CLI
 tokens), and `ictype=`/`iccode=` (gRPC `test policy` topic).
 
-## Content-rejected verdict (#3727)
+## Content-rejected verdict (#3727, #4394)
 
-A policy that references an application-SET the runtime cannot expand
-(`config.ExpandApplicationSet` errors — a member that does not resolve, nesting
-deeper than the max, or a missing set) makes the runtime fail the WHOLE snapshot
-closed: the app catalog builder (`pkg/appid.BuildCatalog`, consumed by
-`buildAppCatalogSnapshot`) returns an error so `buildSnapshot` itself errors and
-the apply path retains the prior dataplane state (#3438), and the policy
-snapshot builder (`expandUserspacePolicyApplications` →
-`resolveUserspaceApplicationNames`) poisons the rule with the `__unsupported__`
-sentinel the helper integrity preflight rejects (#3261). Either way the
-dataplane retains its previous-good snapshot or fresh-boots default-deny and
-enforces NONE of the config.
-
-Before #3727 `matchApp` SILENTLY SKIPPED the malformed set (a bare `continue`)
-and fell through to a later rule / the configured default-policy — so under a
-`default-policy permit-all` the simulator reported PERMIT for a config the
-dataplane fail-closes (and `match application [ bad-set any ]` returned a
-confident positive match, review M01). `Match` now detects the same condition up
-front, config-wide, BEFORE any per-tier or host-gate evaluation, and returns a
-first-class `Result.ContentRejected` verdict carrying
-`ContentRejectionReasons` that name the offending policy + application-set.
+A policy that references content the userspace matcher cannot represent makes the
+runtime fail the WHOLE snapshot closed — the helper retains its previous-good
+snapshot or fresh-boots default-deny and enforces NONE of the config. `Match`
+detects the SAME fail-closed set up front, config-wide, BEFORE any per-tier or
+host-gate evaluation, and returns a first-class `Result.ContentRejected` verdict
+carrying `ContentRejectionReasons` that name the offending policy + object.
 `DisplayAction` renders the dedicated `ContentRejectedActionString` (the SSOT
 shared by REST/gRPC), and the CLI / `test policy` text surfaces print
-`ContentRejectedShowLine` plus the reasons. The detection is ORDER-INSENSITIVE
-(both `[ bad-set any ]` and `[ any bad-set ]` fail closed, mirroring the
-order-insensitive `BuildCatalog` walk) and config-wide (a malformed set in ANY
-policy fails EVERY query for the config, mirroring the whole-snapshot rejection —
-a query whose own zone pair has a clean rule is still reported content-rejected
-because that clean rule is not enforced either). Scope is only the application-
-SET expansion error; a protocol-less member app (#3323), an unrepresentable
-protocol/port (#2124), and a bare undefined application NAME keep their existing
-term-level behavior. The runtime reference is pinned in
-`pkg/dataplane/userspace/app_set_reject_3727_test.go`
-(`buildSnapshot` errors or records `PolicyContentRejected` for the same input);
-the simulator fail-on-revert artifacts are in
-`app_set_failclosed_3727_test.go`.
+`ContentRejectedShowLine` plus the reasons.
+
+The detection delegates to the single dataplane SSOT
+`dpuserspace.PolicyContentRejectionReasons(cfg, feedOverlay)` — the EXACT
+fail-close set `buildSnapshot` enforces — so the simulator can never drift from
+the helper. It covers every fail-closed policy-content axis:
+
+- **Unexpandable application-SET (#3727)** — `config.ExpandApplicationSet` errors
+  (a member that does not resolve, nesting deeper than the max, or a missing
+  set). Two runtime paths fail closed on it: the app catalog builder
+  (`pkg/appid.BuildCatalog`, consumed by `buildAppCatalogSnapshot`) errors so
+  `buildSnapshot` itself errors (#3438), and the policy snapshot builder poisons
+  the rule with the `__unsupported__` sentinel the helper integrity preflight
+  rejects (#3261). The catalog path is ORDER-INSENSITIVE, so `[ any bad-set ]`
+  fails closed too (the per-rule scan short-circuits a leading `any`).
+- **Protocol-less application (#3323)** — a named app with no protocol
+  (`proto == ""`) is unrepresentable (`expandUserspacePolicyApplications` returns
+  `ok=false` → `__unsupported__`).
+- **Unrepresentable protocol or port (#2124/#4345)** — `appid.ProtocolNumber` or
+  `userspacePortSpecRepresentable` rejects it (e.g. a bogus protocol name, or a
+  destination-port outside the u16 wire space).
+- **Undefined application reference** — `match application X` where X is neither
+  a defined application nor an application-set
+  (`resolveUserspaceApplicationNames` returns `ok=false`).
+- **Unresolvable address (#3261)** — an undefined address-book / prefix-list
+  name, or a defined book/set whose value is a non-literal (Junos dns-name /
+  wildcard-address / range-address) or resolves to no concrete prefix
+  (`addrRepresentable` false → `__unsupported_address__`). The scan is feed-aware
+  (`q.FeedOverlay`): a healthy dynamic-address feed policy resolves through the
+  overlay and is NOT falsely flagged.
+
+Before this, `matchApp` / `matchAddr` SILENTLY SKIPPED the unrepresentable term
+(a per-term no-match) and fell through to a later rule / the configured
+default-policy — so under a `default-policy permit-all` the simulator reported
+PERMIT for a config the dataplane fail-closes (and `match application
+[ bad-set any ]` returned a confident positive match, review M01). #3727 fixed
+the application-SET axis; #4394 extended the gate to the remaining four axes
+above, which the pre-#4394 simulator reported as a fabricated permit/deny/default
+verdict. The detection is config-wide: a single unrepresentable rule anywhere
+fails EVERY query for the config, mirroring the whole-snapshot rejection — a
+query whose own zone pair has a clean rule is still reported content-rejected
+because that clean rule is not enforced either.
+
+The runtime reference is pinned in
+`pkg/dataplane/userspace/app_set_reject_3727_test.go` (`buildSnapshot` errors or
+records `PolicyContentRejected` for the same input); the simulator
+fail-on-revert artifacts are in `app_set_failclosed_3727_test.go` (#3727) and
+`content_reject_4394_test.go` (#4394 — the four extended axes plus the
+no-over-report control).
 
 Where the runtime and the old simulators disagreed, the runtime wins.
 

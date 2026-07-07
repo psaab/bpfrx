@@ -904,6 +904,22 @@ check, so a malformed request (e.g. `dst_port=abc`) returned 200 during the
 boot window monitors poll but 400 once a config was active. A well-formed
 boot-window query still returns the 200 fail-closed default-deny.
 
+**Content-rejected verdict (#3727, #4394).** When the ACTIVE config names policy
+content the userspace dataplane cannot represent, the helper fails the WHOLE
+snapshot closed — it retains its previous-good snapshot or fresh-boots
+default-deny and enforces NONE of the config. The simulator reports this as a
+first-class `policy content rejected by dataplane (fail-closed)` verdict (naming
+the offending policy + object), NOT a permit/deny/default verdict — matching the
+dataplane instead of misleading the operator (under a default-permit the pre-fix
+simulator answered PERMIT while the dataplane denied). The detection is the
+single dataplane SSOT `dpuserspace.PolicyContentRejectionReasons` and covers: an
+unexpandable application-set (#3727), a protocol-less application, an
+unrepresentable protocol/port, an undefined application reference, and an
+unresolvable address (undefined address-book / prefix-list name, or a book whose
+value is a non-literal dns-name / wildcard / range) (#4394). A single
+unrepresentable rule content-rejects EVERY query for the config (whole-snapshot
+semantics); a healthy config is never flagged.
+
 ---
 
 ## Security: Zones
