@@ -126,6 +126,14 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
             InterfaceSnapshot {
                 name: "gr-0/0/0.0".to_string(),
                 zone: "sfmix".to_string(),
+                // #4446: the GRE inner interface belongs to the sfmix
+                // routing-instance (real config: `set routing-instances
+                // sfmix interface gr-0/0/0.0`), so its connected /30 lands in
+                // sfmix.inet.0 — the SAME table as the bare-gateway static
+                // route below. The build-time gateway inference is now
+                // table-scoped, so the connected route MUST be in the route's
+                // table (mirrors the #2388 lookup-site filter).
+                routing_instance: "sfmix".to_string(),
                 linux_name: "gr-0-0-0".to_string(),
                 ifindex: 362,
                 mtu: 1476,

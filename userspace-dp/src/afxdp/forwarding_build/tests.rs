@@ -2597,6 +2597,230 @@ fn route_nonnegative_preference_builds() {
     .expect("non-negative preferences must build");
 }
 
+// ---------------------------------------------------------------------
+// #4446: static bare-gateway next-hop ifindex inference is table-scoped.
+// A bare-gateway static route infers its egress ifindex ONLY from a
+// connected prefix in the route's OWN routing-instance table, never a
+// different instance's overlapping connected prefix. Reverting the fix
+// restores the GLOBAL connected scan, which binds the first
+// prefix.contains() match regardless of table -> cross-VRF wrong egress.
+// ---------------------------------------------------------------------
+
+/// #4446: two routing instances ("red", "blue") own the SAME connected
+/// subnet 192.168.0.0/24 on different interfaces (a normal reason to use
+/// VRFs). A bare-gateway static route in each instance resolves its gateway
+/// to its OWN instance's interface at FIB-build time.
+///
+/// RED-on-revert: the pre-#4446 global `connected_v4` scan returns the FIRST
+/// `prefix.contains()` match. "blue" is inserted first, so the global scan
+/// binds blue's ifindex (102) into red's route — this `assert_eq!(101)`
+/// goes red. The single-table case is unaffected (each route already
+/// resolves to the sole in-table connected interface); only the
+/// overlapping-VRF case regresses.
+#[test]
+fn static_bare_gateway_infers_ifindex_in_own_table_v4() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            // BLUE inserted FIRST so its connected prefix LEADS the global
+            // scan order — the pre-fix global inference would bind it to
+            // red's route. The table-scoped fix filters it out for red.
+            InterfaceSnapshot {
+                name: "ge-0-0-2".into(),
+                ifindex: 102,
+                routing_instance: "blue".into(),
+                hardware_addr: "02:00:00:00:00:02".into(),
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "192.168.0.2/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0-0-1".into(),
+                ifindex: 101,
+                routing_instance: "red".into(),
+                hardware_addr: "02:00:00:00:00:01".into(),
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "192.168.0.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            // Bare-gateway static route in RED; gateway 192.168.0.254 is in
+            // BOTH instances' overlapping 192.168.0.0/24.
+            crate::RouteSnapshot {
+                table: "red.inet.0".into(),
+                family: "inet".into(),
+                destination: "10.0.0.0/8".into(),
+                next_hops: vec!["192.168.0.254".into()],
+                ..Default::default()
+            },
+            // ...and in BLUE, same gateway, different instance.
+            crate::RouteSnapshot {
+                table: "blue.inet.0".into(),
+                family: "inet".into(),
+                destination: "10.0.0.0/8".into(),
+                next_hops: vec!["192.168.0.254".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    let red = state.routes_v4.get("red.inet.0").expect("red.inet.0 table");
+    assert_eq!(
+        red[0].next_hops[0].ifindex, 101,
+        "red's bare-gateway route must egress red's interface, not blue's overlapping prefix"
+    );
+
+    let blue = state
+        .routes_v4
+        .get("blue.inet.0")
+        .expect("blue.inet.0 table");
+    assert_eq!(
+        blue[0].next_hops[0].ifindex, 102,
+        "blue's bare-gateway route must egress blue's interface"
+    );
+}
+
+/// #4446: v6 twin — the same table-scoped inference for IPv6 bare-gateway
+/// routes (`infer_connected_route_target_v6`). "blue" leads the global scan;
+/// red's route must still bind red's ifindex.
+#[test]
+fn static_bare_gateway_infers_ifindex_in_own_table_v6() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0-0-2".into(),
+                ifindex: 102,
+                routing_instance: "blue".into(),
+                hardware_addr: "02:00:00:00:00:02".into(),
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8::2/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0-0-1".into(),
+                ifindex: 101,
+                routing_instance: "red".into(),
+                hardware_addr: "02:00:00:00:00:01".into(),
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "red.inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:beef::/48".into(),
+                next_hops: vec!["2001:db8::254".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "blue.inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:beef::/48".into(),
+                next_hops: vec!["2001:db8::254".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+
+    let red = state
+        .routes_v6
+        .get("red.inet6.0")
+        .expect("red.inet6.0 table");
+    assert_eq!(
+        red[0].next_hops[0].ifindex, 101,
+        "red's v6 bare-gateway route must egress red's interface"
+    );
+
+    let blue = state
+        .routes_v6
+        .get("blue.inet6.0")
+        .expect("blue.inet6.0 table");
+    assert_eq!(
+        blue[0].next_hops[0].ifindex, 102,
+        "blue's v6 bare-gateway route must egress blue's interface"
+    );
+}
+
+/// #4446 anti-regression: the common single-table (default-instance) case is
+/// unaffected — a bare-gateway static route still resolves its gateway to the
+/// sole connected interface. A legitimate cross-table reach is expressed as a
+/// `next-table` route (no forwarding next-hop, so it never touches this
+/// inference) and is likewise unaffected: its `next_hops` stay empty.
+#[test]
+fn static_bare_gateway_single_table_still_resolves() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0-0-1".into(),
+            ifindex: 201,
+            hardware_addr: "02:00:00:00:02:01".into(),
+            addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                family: "inet".into(),
+                address: "192.168.0.1/24".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.0.0.0/8".into(),
+                next_hops: vec!["192.168.0.254".into()],
+                ..Default::default()
+            },
+            // A next-table leak: no forwarding next-hop, so the inference is
+            // never exercised and `next_hops` stays empty.
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "172.16.0.0/12".into(),
+                next_table: "blue.inet.0".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let state = build_forwarding_state(&snapshot);
+    let table = state.routes_v4.get("inet.0").expect("inet.0 table");
+    let bare = table
+        .iter()
+        .find(|r| r.prefix.contains("10.0.0.0".parse().unwrap()))
+        .expect("bare-gateway route");
+    assert_eq!(
+        bare.next_hops[0].ifindex, 201,
+        "single-table bare-gateway route still resolves to its connected interface"
+    );
+    let leak = table
+        .iter()
+        .find(|r| !r.next_table.is_empty())
+        .expect("next-table route");
+    assert!(
+        leak.next_hops.is_empty(),
+        "a next-table leak carries no forwarding next-hop (inference untouched)"
+    );
+}
+
 /// #3771 (M11): a neighbor declaring family="inet" with an IPv6 IP fails the
 /// snapshot CLOSED via `NeighborFamilyMismatch`. fail-on-revert: restoring the
 /// family-ignoring `populate_neighbors` installs the neighbor and the build

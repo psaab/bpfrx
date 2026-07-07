@@ -789,10 +789,16 @@ fn native_gre_logical_egress_retains_zone_without_mac() {
 #[test]
 fn owner_rg_for_resolution_uses_native_gre_endpoint_group() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
-    let resolved = lookup_forwarding_resolution_with_dynamic(
+    // #4446: the GRE inner interface lives in the sfmix routing-instance, so
+    // its connected /30 (which owns the tunnel peer 10.255.192.41) is in
+    // sfmix.inet.0. Resolve in that table to reach the tunnel — a default
+    // (inet.0) lookup no longer sees the sfmix-scoped connected prefix
+    // (table-scoped inference; mirrors the #2388 lookup filter).
+    let resolved = lookup_forwarding_resolution_in_table_with_dynamic(
         &state,
         &Default::default(),
         IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+        Some("sfmix.inet.0"),
     );
     assert_eq!(resolved.tunnel_endpoint_id, 1);
     assert_eq!(owner_rg_for_resolution(&state, resolved), 1);
