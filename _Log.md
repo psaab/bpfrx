@@ -1,3 +1,42 @@
+## 2026-07-07 — #4406 step 6 (FINAL): extract P6a early-strict + folds from compileExpanded
+
+- **Timestamp**: 2026-07-07
+- **Action**: Step 6 — the plan's RISKY final phase — of the #4406
+  compileExpanded god-orchestrator decomposition (after step 1 P1
+  runPreWalkGates, step 2 P4 compileSections, step 3 P7 runTailGates, step 4
+  P6b runUniformGates, step 5 P5 resolveDerivedConfig). Extracted the P6a
+  "early-strict + folds" phase — the block between resolveDerivedConfig (P5)
+  and runUniformGates (P6b) — into a new free function
+  `runEarlyStrictAndFolds(cfg *Config, opts compileOpts) error`
+  (compiler_earlystrict.go). The plan flags P6a RISKY because it interleaves
+  validation with two cfg-mutations whose output is consumed non-locally in
+  P6b, plus a fail-fast gate and an errors.Join accumulator. Verified
+  extractable, NOT deferred: the `strictErrs` accumulator is FULLY CONTAINED
+  within P6a (declared, appended by the five #1538 independent strict families,
+  errors.Join'd + returned there) and is NOT threaded into runUniformGates, so
+  the DEFER trigger (accumulator threaded across the P6a/P6b boundary) does not
+  hold. The two folds (resolveZoneLocalAddressBooks,
+  resolveStaticNATThenPrefixNames) mutate cfg.Security by pointer and persist
+  across the helper boundary because cfg is threaded by pointer and the helper
+  runs BEFORE runUniformGates — so validateStaticNATThenTargetStrict and the
+  policy match-address validators in P6b (invariant #5) still see the folded
+  book. Internal order preserved VERBATIM: validateDataplaneTypeStrict
+  (fail-fast, #1526 first-error slot) -> validateAddressBookEntryNamesStrict on
+  the pristine book (#3061/#4340, lenient-downgrade append to cfg.Warnings) ->
+  zone-local fold -> static-NAT prefix-name fold -> the five-family errors.Join
+  accumulator. Each `return nil, err` in the block became `return err` in the
+  helper; compileExpanded now calls `if err := runEarlyStrictAndFolds(cfg,
+  opts); err != nil { return nil, err }`. compileExpanded is now FULLY
+  decomposed into named phase helpers (P1..P7) — a ~15-line orchestrator.
+  GOLDEN GATE: TestCompileGolden4406 passes BYTE-IDENTICAL with NO baseline
+  update (testdata/golden_4406.json untouched, no .actual.json written); full
+  pkg/config suite green; the non-local-consumer tests
+  (StaticNATThen/AddressBook/ZoneLocal/DataplaneType/IPMonitoring/
+  ClassOfServiceStrict) green; go build ./cmd/xpfd + go vet + gofmt clean. Net
+  78 lines lifted out of compiler.go (93 deletions / 15 insertions).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_earlystrict.go,
+  _Log.md
+
 ## 2026-07-07 — #4406 step 5: extract P5 cross-section derivations from compileExpanded
 
 - **Timestamp**: 2026-07-07
