@@ -22,6 +22,46 @@
 - **File(s)**: pkg/grpcapi/server_cluster.go,
   pkg/grpcapi/server_cluster_monitor_status_4480_test.go,
   docs/junos-cli-reference.md, _Log.md
+## 2026-07-07 — #4474 (opus-172 H-1): transitive apply-groups fail-open
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the transitive/nested apply-groups silent-drop
+  (config fail-open, HIGH). A group whose body references another group
+  (`grpA { apply-groups grpB; }`, applied via top-level `apply-groups
+  grpA`) had grpB's content silently dropped, so a security zone/policy
+  authored behind grpB vanished with a CLEAN commit (no error/warning).
+  Root cause: `expandGroupsRecursive` captured the top-level `applyNames`
+  BEFORE merging grpA's body, merged grpA's `apply-groups grpB` leaf into
+  the top level, then stripped ALL apply-groups nodes before recursing —
+  grpB was never expanded. Fix: expand each group's OWN apply-groups to a
+  FIXED POINT before merging its body — after cloning `srcChildren`, call
+  `expandGroupsRecursive` on the clone (same groups map / ancestorPath /
+  `seen` set), then mergeNodes the fully-expanded body. Composes to
+  arbitrary depth; the existing `seen` circular guard (name marked before
+  the pre-merge expansion) makes cycles fail-CLOSED with the same
+  circular-reference error as a direct self-cycle. tagNodesInherited runs
+  BEFORE the nested expansion so `| display inheritance` attributes nested
+  content to the nested group.
+  Fan-out bound (memoization): the `seen` guard bounds only CYCLES, not
+  fan-out — `delete(seen,name)` runs per branch, so a converging DAG
+  (diamond lattice, 2^depth paths) re-expanded a shared subtree once per
+  path → EXPONENTIAL, hanging the synchronous commit for tens of seconds.
+  Added a `memo map[string][]*Node` threaded through the recursion, keyed
+  by `(group name, ancestor-context)` — the only inputs the expansion
+  depends on (walkGroupToContext + nested context use ancestorPath;
+  tagInherited/vars constant per call). A completed memo entry is a
+  cycle-free fully-resolved body (a cyclic expansion errors before it is
+  cached), so reuse is always correct; mergeNodes folds every path's copy
+  to a single instance. Cache holds a pristine cloneNodes copy (mergeNodes
+  mutates src). Net O(distinct groups x contexts).
+  Validation: 6 new tests (headline zone present, outer-own-content kept,
+  three-deep chain, cycle terminates, tagged inheritance, and a depth-22
+  converging diamond lattice: 0.4ms memoized, times out un-memoized) —
+  all RED on revert of the respective fix, GREEN with it; full
+  `go test ./pkg/config/...` green; go build/gofmt/vet clean.
+- **File(s)**: pkg/config/ast_groups.go,
+  pkg/config/apply_groups_transitive_4474_test.go, docs/config-schema.md,
+  _Log.md
 
 ## 2026-07-07 — #4479 routing: skip PBR/FBF band in userspace FIB snapshot ingest
 
