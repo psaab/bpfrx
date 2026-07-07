@@ -731,6 +731,28 @@ pub(super) fn cluster_peer_return_fast_path(
     if meta.protocol == PROTO_TCP && crate::tcp_flags::is_initial_syn(meta.tcp_flags) {
         return None;
     }
+    // #4453: a bare TCP RST/FIN (closing flags, SYN clear) is the same
+    // session-less phantom-closing packet the LOCAL session-miss path drops
+    // via the #4400 strict-syn-check (`strict_syn_check_drops_new_flow` ==
+    // PROTO_TCP && is_closing && !has_syn). It carries no return value: a real
+    // established flow's RST/FIN is served by the synced session in
+    // `resolve_flow_session_decision` before this point. Without this arm, a
+    // transit bare RST/FIN to a locally-HAInactive RG is converted to a
+    // FabricRedirect (safety net) and forwarded to the peer, where it arrives
+    // as fabric ingress and gets fast-pathed into a NAT-less
+    // `SessionOrigin::ReverseFlow` seed — installing on the peer, via the
+    // trusted fabric path, exactly the immediately-closing session the peer's
+    // own #4400 guard prevents locally. Exclude it here (SAME predicate as
+    // #4400) so it falls through to the peer's normal forward decision, whose
+    // session-miss guard drops it — no reverse seed. This completes the
+    // fast-path invariant: fire ONLY for provably-return traffic (exclude the
+    // TCP initial SYN, the ICMP echo request, all UDP, AND the bare RST/FIN).
+    if meta.protocol == PROTO_TCP
+        && crate::tcp_flags::is_closing(meta.tcp_flags)
+        && !crate::tcp_flags::has_syn(meta.tcp_flags)
+    {
+        return None;
+    }
     // #4439: this fast path may fire ONLY for packets that are provably
     // RETURN traffic — the reverse direction of a flow the active owner
     // already policy/NAT-validated. Every other protocol carries a

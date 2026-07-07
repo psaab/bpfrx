@@ -494,3 +494,48 @@ ForwardCandidate-resolving target the ICMP-reply test uses — returns `Some` on
 revert, `None` with the fix) alongside the preserved
 `cluster_peer_return_fast_path_allows_sfmix_to_lan_reply` (ICMP echo reply
 still fast-paths) and `_skips_pure_tcp_syn` / `_skips_icmp_echo_request`.
+
+## The return fast path must not adopt a bare RST/FIN either (#4453)
+
+The #4439 UDP exclusion left one class of session-less packet still adopted:
+a **bare TCP RST/FIN** (`is_closing(flags) && !has_syn(flags)`). It is NOT an
+initial SYN, so the `is_initial_syn` exclusion above misses it, and it is not
+UDP. Reaching this fast path it was therefore fast-pathed into a NAT-less,
+reverse-keyed seed — the same seed-a-closing-session failure the local
+session-miss path already rejects.
+
+**The bug.** #4400 added `strict_syn_check_drops_new_flow(protocol, flags) ==
+PROTO_TCP && is_closing(flags) && !has_syn(flags)` and dropped a bare RST/FIN
+on the LOCAL session-MISS cold path — an immediately-closing session has no
+forwarding value (pure churn, a cheap RST/FIN-flood DoS surface). But the
+fabric return fast path had no equivalent guard. A transit bare RST/FIN to a
+locally-**HAInactive** RG is converted to a `FabricRedirect` by the safety net
+(`resolve_fabric_redirect` / the HAInactive downgrade in
+`enforce_ha_resolution_snapshot`) and forwarded to the peer. On the peer it
+arrives as **fabric ingress**, misses every session scope, and
+`cluster_peer_return_fast_path` adopted it — installing on the peer, **via the
+trusted fabric path**, exactly the phantom-closing session the peer's own
+#4400 guard prevents locally. It is gated behind the trusted internal fabric
+link (not externally forgeable without targeting an HAInactive RG), so the
+impact is per-worker session-table churn on the peer, not a data-plane
+compromise — but it defeats the #4400 invariant across the fabric.
+
+**The fix.** `cluster_peer_return_fast_path` now returns `None` for
+`PROTO_TCP && is_closing(flags) && !has_syn(flags)` (the SAME predicate as
+#4400). A bare RST/FIN falls through to the peer's normal forward decision,
+whose own session-miss #4400 guard drops it — no reverse seed installed. This
+completes the fast-path flow-initiator-exclusion invariant: it fires ONLY for
+provably-return traffic, excluding the TCP initial SYN, the ICMP echo request,
+all UDP, AND the bare TCP RST/FIN. The legitimate fabric-forward for an
+established synced session is untouched — an established flow's real RST/FIN is
+served by `resolve_flow_session_decision` (the synced session) before this
+point, so it is a session HIT, never session-less. TCP data (non-SYN,
+non-closing) and ICMP echo-reply return traffic continue to fast-path.
+
+RED-on-revert coverage: `forwarding/tests.rs`
+`cluster_peer_return_fast_path_skips_bare_rst_fin_4453` (bare RST / FIN /
+FIN|ACK / RST|ACK against the same ForwardCandidate-resolving target the
+ICMP-reply test uses — returns `Some` on revert, `None` with the fix)
+alongside the preserved `_allows_sfmix_to_lan_reply`,
+`_skips_udp_new_flow_4439`, `_skips_pure_tcp_syn`, and
+`_skips_icmp_echo_request`.
