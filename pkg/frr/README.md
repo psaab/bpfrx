@@ -402,6 +402,22 @@ also carries operator content:
   is added. (NOTE: a Junos→FRR as-path regex *syntax* translation is still
   absent — Junos regex operates on whole AS-number terms, FRR uses POSIX ERE
   over the space-separated AS string — tracked separately, not part of #4097.)
+- **The render-side belt now covers the route-map `set` clauses and
+  prefix-list entries too (#4482).** #4097 wrapped only the community-list /
+  as-path-list DEFINITIONS; the route-map `set community` / `set community …
+  additive` / `set comm-list … delete` / `set as-path prepend` clauses, the
+  `match community` / `match as-path` names, and the `ip/ipv6 prefix-list …
+  permit <prefix>` entries (both the top-level `policy-options prefix-list`
+  and the inline route-filter lists) still emitted their value with a bare
+  `%s` — a residual bypass on the TOLERANT-load path (peer-sync / rollback /
+  lenient load, where the strict #1798 commit gate only warns, #1960). All of
+  those slots now pass through `sanitizeFRRValue`, so ALL FRR-rendered
+  free-text is sanitized regardless of load path. Like the #4097 values these
+  take a rest-of-line token, so a legitimate space (a multi-AS `set as-path
+  prepend`, a multi-word regex) survives while a `\n` collapses to a space and
+  cannot inject a standalone frr.conf command. Guarded by
+  `TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482` (fail on
+  revert of any wrapped site).
 - **Group address-family flags are gated by neighbor address version
   (#2454).** When `compiler_protocols.go` copies a BGP group's `family inet`
   / `family inet6` flags down to each neighbor, it parses the neighbor's

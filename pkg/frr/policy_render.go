@@ -1260,9 +1260,9 @@ func renderRouteFilterEntry(b *strings.Builder, plName string, idx int, rf *conf
 		return false
 	}
 	if isV6 {
-		fmt.Fprintf(b, "ipv6 prefix-list %s seq %d permit %s", plName, (idx+1)*5, rf.Prefix)
+		fmt.Fprintf(b, "ipv6 prefix-list %s seq %d permit %s", plName, (idx+1)*5, sanitizeFRRValue(rf.Prefix))
 	} else {
-		fmt.Fprintf(b, "ip prefix-list %s seq %d permit %s", plName, (idx+1)*5, rf.Prefix)
+		fmt.Fprintf(b, "ip prefix-list %s seq %d permit %s", plName, (idx+1)*5, sanitizeFRRValue(rf.Prefix))
 	}
 	if matchStr != "" {
 		fmt.Fprintf(b, " %s", matchStr)
@@ -1400,10 +1400,18 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 	for _, name := range names {
 		pl := po.PrefixLists[name]
 		for i, prefix := range pl.Prefixes {
+			// #4482: sanitize the prefix so an embedded newline from a
+			// leniently-loaded / peer-synced / rolled-back stored value cannot
+			// inject an extra frr.conf line. #4097 added this render-side belt
+			// to the community-list / as-path-list definitions but MISSED the
+			// prefix-list slots and the route-map `set` clauses below, which
+			// still rendered with a bare %s — a residual bypass on the tolerant
+			// load path (the strict #1798 commit control-char gate rejects it,
+			// but the peer-sync / rollback path only warns, #1960).
 			if strings.Contains(prefix, ":") {
-				fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s\n", name, (i+1)*5, prefix)
+				fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s\n", name, (i+1)*5, sanitizeFRRValue(prefix))
 			} else {
-				fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s\n", name, (i+1)*5, prefix)
+				fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s\n", name, (i+1)*5, sanitizeFRRValue(prefix))
 			}
 		}
 	}
@@ -1685,11 +1693,11 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 			// (route_map_add_match replaces same-type), so OR is expressed
 			// by emitting one SEQUENCE per entry (dispatch loop below).
 			if fromCommunity != "" {
-				fmt.Fprintf(&b, " match community %s\n", fromCommunity)
+				fmt.Fprintf(&b, " match community %s\n", sanitizeFRRValue(fromCommunity))
 			}
 
 			if fromASPath != "" {
-				fmt.Fprintf(&b, " match as-path %s\n", fromASPath)
+				fmt.Fprintf(&b, " match as-path %s\n", sanitizeFRRValue(fromASPath))
 			}
 
 			// then actions
@@ -1748,7 +1756,13 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 			// append/delete/strip in addition to whole-attribute replace;
 			// emitting only the replace clause wiped upstream-set
 			// communities. Map each Junos operation to its FRR route-map
-			// set clause:
+			// set clause. #4482: every free-text value below (set community,
+			// set comm-list delete name, set as-path prepend, and the match
+			// community / as-path names) is routed through sanitizeFRRValue —
+			// the same #4097 render-side belt the community-list / as-path-list
+			// definitions use — so a tolerant-load / peer-synced / rolled-back
+			// value with an embedded newline cannot inject an extra frr.conf
+			// line regardless of load path.
 			//   - add    → `set community <v> additive` (append)
 			//   - delete → `set comm-list <name> delete` (strip by list)
 			//   - none   → `set community none` (strip all)
@@ -1758,7 +1772,7 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 				b.WriteString(" set community none\n")
 			case "add":
 				if term.CommunityAdd != "" {
-					fmt.Fprintf(&b, " set community %s additive\n", term.CommunityAdd)
+					fmt.Fprintf(&b, " set community %s additive\n", sanitizeFRRValue(term.CommunityAdd))
 				}
 			case "delete":
 				// FRR's `set comm-list <name> delete` strips ONE
@@ -1767,12 +1781,12 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 				// per referenced list — every name in order (#2902).
 				for _, name := range term.CommunityDelete {
 					if name != "" {
-						fmt.Fprintf(&b, " set comm-list %s delete\n", name)
+						fmt.Fprintf(&b, " set comm-list %s delete\n", sanitizeFRRValue(name))
 					}
 				}
 			default: // "" or "set" — whole-attribute replace
 				if term.Community != "" {
-					fmt.Fprintf(&b, " set community %s\n", term.Community)
+					fmt.Fprintf(&b, " set community %s\n", sanitizeFRRValue(term.Community))
 				}
 			}
 			// AS-path prepend (#2892). Junos `then as-path-prepend
@@ -1782,7 +1796,7 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 			// order (repetition is the mechanism) on a single clause; skip
 			// entirely when no ASNs were configured.
 			if len(term.ASPathPrepend) > 0 {
-				fmt.Fprintf(&b, " set as-path prepend %s\n", strings.Join(term.ASPathPrepend, " "))
+				fmt.Fprintf(&b, " set as-path prepend %s\n", sanitizeFRRValue(strings.Join(term.ASPathPrepend, " ")))
 			}
 			if term.Origin != "" {
 				fmt.Fprintf(&b, " set origin %s\n", term.Origin)

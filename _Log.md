@@ -1,3 +1,29 @@
+## 2026-07-07 — #4482 (opus-172 M-5): FRR set-clause/prefix-list sanitize-belt bypass
+
+- **Timestamp**: 2026-07-07
+- **Action**: Closed the residual #4097 sanitize-belt bypass on the
+  tolerant-load path (Medium, config-injection). #4097 wrapped the
+  `bgp community-list` / `bgp as-path access-list` DEFINITIONS in
+  sanitizeFRRValue but left the route-map `set community` /
+  `set community additive` / `set comm-list delete` / `set as-path
+  prepend` clauses, the `match community` / `match as-path` names, and
+  the `ip/ipv6 prefix-list ... permit <prefix>` entries (top-level and
+  inline route-filter) rendering with a bare %s — so a leniently-loaded /
+  peer-synced / rolled-back value with an embedded newline could inject a
+  standalone frr.conf command (the strict #1798 commit gate only warns on
+  those paths, #1960). Routed ALL those free-text slots through
+  sanitizeFRRValue, so every FRR-rendered value is sanitized regardless of
+  load path. No-op for clean values (rest-of-line tokens keep legitimate
+  spaces), so existing output is byte-identical.
+- **File(s)**: pkg/frr/policy_render.go,
+  pkg/frr/policy_setclause_injection_4482_test.go, pkg/frr/README.md
+- **Validation**: RED-on-revert unit test
+  (`TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482`) —
+  set-community / set-as-path-prepend / prefix-list injection payloads
+  collapse onto their single directive lines with no standalone
+  `router bgp` / `neighbor` line; reverting any wrapped site turns it RED.
+  Full pkg/frr suite green, go build, gofmt + vet clean.
+
 ## 2026-07-07 — #4481 (opus-172 M-4): FRR cross-context route-map default-action leak
 
 - **Timestamp**: 2026-07-07
