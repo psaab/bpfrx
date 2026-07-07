@@ -1352,6 +1352,15 @@ fn reap_expired_sessions(
             expired_entry.metadata.is_reverse,
             now_ns,
         );
+        // #4381: return the reaped NAT64 forward flow's translated pool port to
+        // its allocator (self-gated on the forward NAT64 entry).
+        crate::nat64::release_nat64_allocation(
+            &forwarding.nat64,
+            &expired_entry.key,
+            expired_entry.decision.nat,
+            expired_entry.metadata.is_reverse,
+            now_ns,
+        );
         delete_session_map_entry_for_removed_session_with_origin(
             session_map_fd,
             &expired_entry.key,

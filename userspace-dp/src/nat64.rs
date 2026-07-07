@@ -119,9 +119,19 @@ use crate::afxdp::write_eth_header_slice;
 // instead of a hardcoded 6 so a valid 7-ext-header packet is not
 // NAT64-dropped while the forwarding path accepts it.
 use crate::afxdp::MAX_IPV6_EXT_HEADERS;
-use crate::nat::NatDecision;
+use crate::nat::{
+    NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey, allocate_nat64_pool_port,
+    release_nat64_pool_port,
+};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// #4381: NAT64 translated-port allocation range. RFC 6146 does not mandate a
+/// specific range; the ephemeral 1024..=65535 window (matching the pool-mode
+/// SNAT default) maximizes the distinct-flow capacity behind a single pool
+/// address while staying clear of the well-known ports.
+const NAT64_PORT_LOW: u16 = 1024;
+const NAT64_PORT_HIGH: u16 = 65535;
 
 /// NAT64 prefix configuration — one per `security nat nat64` rule.
 #[derive(Debug)]
@@ -131,7 +141,20 @@ pub(crate) struct Nat64Prefix {
     /// IPv4 source pool addresses for SNAT.
     pub(crate) pool_v4: Vec<Ipv4Addr>,
     /// Round-robin index for pool allocation (atomic for thread safety).
+    ///
+    /// #4381: retained for the empty-pool / liveness probe only. The
+    /// authoritative source selection is now the stateful `port_allocator`,
+    /// which picks the pool address AND a unique translated port together.
     pool_index: AtomicUsize,
+    /// #4381: stateful pool-mode allocator that hands every NAT64 forward flow
+    /// a UNIQUE `(pool v4 address, translated L4 port / ICMP identifier)`. Two
+    /// v6 clients sharing a source port behind one pool address get distinct
+    /// translated ports, so their reverse (v4→v6) tuples never collide (the
+    /// RFC 6146 BIB). Reuses the exact `PortAllocator` the pool-mode source-NAT
+    /// path uses (`nat/allocator.rs`); the `Arc`-backed live state is SHARED
+    /// across the per-worker `Nat64State` clones, so a port claimed on one
+    /// worker is visible to every other worker.
+    pub(crate) port_allocator: PortAllocator,
 }
 
 impl Clone for Nat64Prefix {
@@ -140,6 +163,8 @@ impl Clone for Nat64Prefix {
             prefix_bytes: self.prefix_bytes,
             pool_v4: self.pool_v4.clone(),
             pool_index: AtomicUsize::new(self.pool_index.load(Ordering::Relaxed)),
+            // Clone shares the Arc-backed allocator state (see field doc).
+            port_allocator: self.port_allocator.clone(),
         }
     }
 }
@@ -184,20 +209,27 @@ pub(crate) enum Nat64Match {
     /// The destination does not match any configured NAT64 prefix — continue
     /// ordinary IPv6 route lookup. This is the ONLY arm that routes as IPv6.
     NoPrefixMatch,
-    /// A prefix matched AND a source IPv4 was allocated — translate.
+    /// A prefix matched AND its source pool is non-empty — translate.
+    ///
+    /// #4381: this no longer PRE-ALLOCATES a source address. The pre-fix code
+    /// round-robin-picked a pool address here (before the security policy ran),
+    /// but the authoritative selection is now the stateful per-flow allocation
+    /// at the Permit branch (`Nat64State::allocate_source`), which picks the
+    /// pool address AND a unique translated port/identifier together — only
+    /// after the flow is admitted. This arm now just confirms the prefix
+    /// matched and a pool exists; the route lookup keys on `dst_v4` (the
+    /// destination), not the source, so no source is needed this early.
     MatchReady {
         /// Index of the matched NAT64 prefix in `prefixes`.
         prefix_idx: usize,
         /// IPv4 destination extracted from the synthetic NAT64 address.
         dst_v4: Ipv4Addr,
-        /// Allocated IPv4 SNAT source from the matched prefix's pool.
-        snat_v4: Ipv4Addr,
         /// Original synthetic IPv6 destination (kept for the reverse path).
         dst_v6: Ipv6Addr,
     },
-    /// A prefix matched but NO IPv4 source could be allocated (empty /
-    /// exhausted pool — a legitimate wire state the Go side emits for a
-    /// no-source-pool rule). The packet MUST be dropped, not routed as IPv6.
+    /// A prefix matched but its source pool is empty (a legitimate wire state
+    /// the Go side emits for a no-source-pool rule) OR the stateful allocator
+    /// is exhausted. The packet MUST be dropped, not routed as IPv6.
     MatchUnavailable,
 }
 
@@ -325,10 +357,23 @@ impl Nat64State {
                     }
                 }
             }
+            // #4381: one stateful port allocator per prefix, sized to the pool.
+            // An empty pool yields a zero-capacity allocator (allocate returns
+            // AllocatorExhausted), which the fail-closed classify path treats
+            // exactly like the historical empty-pool `MatchUnavailable`. NOTE:
+            // this allocator is rebuilt fresh on every config commit (like the
+            // pre-#4381 `pool_index` reset), so live NAT64 port reservations do
+            // NOT survive a snapshot rebuild — a bounded overlap window until
+            // pre-reload sessions age out, matching the existing round-robin
+            // reset. Preserving allocations across reload (the source-NAT
+            // `reuse_pool_allocator` treatment) is a scoped follow-up.
+            let port_allocator =
+                PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH);
             prefixes.push(Nat64Prefix {
                 prefix_bytes,
                 pool_v4,
                 pool_index: AtomicUsize::new(0),
+                port_allocator,
             });
         }
         Self {
@@ -369,19 +414,25 @@ impl Nat64State {
     pub(crate) fn classify_ipv6_dest(&self, dst: Ipv6Addr) -> Nat64Match {
         match self.match_ipv6_dest(dst) {
             None => Nat64Match::NoPrefixMatch,
-            Some((prefix_idx, dst_v4)) => match self.allocate_v4_source(prefix_idx) {
-                Some(snat_v4) => Nat64Match::MatchReady {
+            Some((prefix_idx, dst_v4)) => match self.prefixes.get(prefix_idx) {
+                // #4381: liveness probe only — a non-empty pool means a source
+                // CAN be allocated at Permit; the actual `(snat_v4, port)`
+                // allocation is deferred to `allocate_source` so a denied flow
+                // never consumes a pool port. An empty pool fails closed.
+                Some(prefix) if !prefix.pool_v4.is_empty() => Nat64Match::MatchReady {
                     prefix_idx,
                     dst_v4,
-                    snat_v4,
                     dst_v6: dst,
                 },
-                None => Nat64Match::MatchUnavailable,
+                _ => Nat64Match::MatchUnavailable,
             },
         }
     }
 
-    /// Round-robin allocation of an IPv4 source address from the pool.
+    /// #4381: test-only round-robin address pick, retained so the pre-existing
+    /// pool-selection tests still exercise the pool wiring. Production source
+    /// selection now goes through `allocate_source` (stateful, port-unique).
+    #[cfg(test)]
     pub(crate) fn allocate_v4_source(&self, prefix_idx: usize) -> Option<Ipv4Addr> {
         let prefix = self.prefixes.get(prefix_idx)?;
         if prefix.pool_v4.is_empty() {
@@ -392,18 +443,131 @@ impl Nat64State {
         Some(addr)
     }
 
+    /// #4381: allocate a UNIQUE translated `(pool v4 source, L4 port/identifier)`
+    /// for a NAT64 forward flow, reusing the pool-mode SNAT `PortAllocator`
+    /// (RFC 6146 BIB). Called at the Permit branch — after the flow is admitted
+    /// — so a denied flow never consumes a pool port.
+    ///
+    /// `protocol` / `src_port` / `dst_port` are the ORIGINAL IPv6 forward-flow
+    /// L4 tuple (for ICMP echo, `src_port` is the query identifier and
+    /// `dst_port` is 0, per `parse_flow_ports`); `dst_v4` is the extracted IPv4
+    /// destination. The returned `(snat_v4, translated)` becomes the forward
+    /// decision's `rewrite_src` / `rewrite_src_port`. The reverse (v4→v6) path
+    /// maps the translated value back via `NatDecision::reverse` on the reverse
+    /// session's decision.
+    pub(crate) fn allocate_source(
+        &self,
+        prefix_idx: usize,
+        protocol: u8,
+        src_v6: Ipv6Addr,
+        dst_v4: Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        now_ns: u64,
+    ) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
+        let prefix = self
+            .prefixes
+            .get(prefix_idx)
+            .ok_or(SourceNatFailureReason::AllocatorExhausted)?;
+        let flow = SourceNatFlowKey {
+            protocol,
+            src_ip: IpAddr::V6(src_v6),
+            dst_ip: IpAddr::V4(dst_v4),
+            src_port,
+            dst_port,
+        };
+        allocate_nat64_pool_port(&prefix.port_allocator, flow, &prefix.pool_v4, now_ns)
+    }
+
     /// Create a NAT64 forward decision: IPv6 packet → IPv4 translated.
-    /// `snat_v4` is the SNAT pool address, `dst_v4` is extracted from the prefix.
-    pub(crate) fn forward_decision(snat_v4: Ipv4Addr, dst_v4: Ipv4Addr) -> NatDecision {
+    /// `snat_v4` is the SNAT pool address, `dst_v4` is extracted from the
+    /// prefix, and `translated_port` (#4381) is the unique per-flow translated
+    /// TCP/UDP source port or ICMP echo identifier carried in `rewrite_src_port`
+    /// so the frame builder rewrites the L4 field on the forward path and
+    /// `NatDecision::reverse` restores the original on the reverse path.
+    pub(crate) fn forward_decision(
+        snat_v4: Ipv4Addr,
+        dst_v4: Ipv4Addr,
+        translated_port: u16,
+    ) -> NatDecision {
         NatDecision {
             rewrite_src: Some(IpAddr::V4(snat_v4)),
             rewrite_dst: Some(IpAddr::V4(dst_v4)),
-            rewrite_src_port: None,
+            rewrite_src_port: Some(translated_port),
             rewrite_dst_port: None,
             nat64: true,
             nptv6: false,
         }
     }
+}
+
+/// #4381: release (`rollback == false`) or roll back (`rollback == true`) a
+/// NAT64 forward flow's translated pool port on session teardown / install
+/// failure, mirroring `crate::nat::release_source_nat_allocation`.
+///
+/// A no-op unless this is the FORWARD entry of a NAT64 flow carrying a
+/// translated source port (`is_reverse == false && nat.nat64 &&
+/// rewrite_src == V4 && rewrite_src_port.is_some()`). The flow key is rebuilt
+/// EXACTLY as `Nat64State::allocate_source` built it — `dst_ip` is the
+/// translated IPv4 destination (`nat.rewrite_dst`), NOT the synthetic v6
+/// destination stored on the session key — so the same-key `release_flow` /
+/// `rollback_flow` frees the port the forward flow reserved. Every prefix's
+/// allocator is tried; the one that owns the flow frees it and the loop breaks.
+fn release_nat64_allocation_with_mode(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+    rollback: bool,
+) {
+    if is_reverse || !nat.nat64 {
+        return;
+    }
+    let Some(IpAddr::V4(snat_v4)) = nat.rewrite_src else {
+        return;
+    };
+    let Some(port) = nat.rewrite_src_port else {
+        return;
+    };
+    let flow = SourceNatFlowKey {
+        protocol: key.protocol,
+        src_ip: key.src_ip,
+        dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
+        src_port: key.src_port,
+        dst_port: key.dst_port,
+    };
+    for prefix in &nat64.prefixes {
+        if release_nat64_pool_port(&prefix.port_allocator, flow, snat_v4, port, now_ns, rollback) {
+            break;
+        }
+    }
+}
+
+/// #4381: release a NAT64 forward flow's translated pool port on session
+/// teardown (reap / purge / delete-sync), mirroring
+/// `release_source_nat_allocation`.
+pub(crate) fn release_nat64_allocation(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+) {
+    release_nat64_allocation_with_mode(nat64, key, nat, is_reverse, now_ns, false);
+}
+
+/// #4381: roll back a NAT64 forward flow's translated pool port on an
+/// install-failure / admission-refusal / ICMP-error-bounce path, mirroring
+/// `rollback_source_nat_allocation`.
+pub(crate) fn rollback_nat64_allocation(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+) {
+    release_nat64_allocation_with_mode(nat64, key, nat, is_reverse, now_ns, true);
 }
 
 // ---------------------------------------------------------------------------

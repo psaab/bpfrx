@@ -799,6 +799,66 @@ pub(crate) fn reserve_synced_source_nat_allocation(
     }
 }
 
+/// #4381: allocate a UNIQUE translated `(pool v4 address, L4 port/identifier)`
+/// for a NAT64 forward flow, reusing the pool-mode SNAT [`PortAllocator`].
+///
+/// NAT64 is a many-to-one (v6→v4) translation exactly like pool-mode source
+/// NAT: several IPv6 clients are hidden behind one IPv4 pool address, so two
+/// clients that share a source port (TCP/UDP) or ICMP echo identifier MUST get
+/// DISTINCT translated values or their reverse (v4→v6) 5-tuples collide and the
+/// server's replies are mis-associated — the missing RFC 6146 BIB. Rather than
+/// hand-roll a parallel allocator, the crate-root `nat64` module drives the
+/// same collision-free `PortAllocator` the pool-mode SNAT path uses.
+///
+/// This thin wrapper keeps the module-private `TranslatedTuple` /
+/// `PoolAddressFamily` types out of `nat64.rs`. NAT64 never uses persistent NAT
+/// or address-persistent stickiness, so those knobs are fixed off.
+pub(crate) fn allocate_nat64_pool_port(
+    allocator: &PortAllocator,
+    flow: SourceNatFlowKey,
+    pool_v4: &[Ipv4Addr],
+    now_ns: u64,
+) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
+    let translated = allocator.allocate_translation(
+        flow,
+        PoolAddressFamily::V4(pool_v4),
+        0,     // family_offset — the v4 pool starts at index 0
+        false, // address_persistent
+        false, // persistent_nat
+        PersistentNatPermit::default(),
+        0, // persistent_nat_timeout_ns — unused when persistent_nat is false
+        now_ns,
+    )?;
+    match translated.ip {
+        IpAddr::V4(v4) => Ok((v4, translated.port)),
+        // The pool is always v4 for NAT64, so this is unreachable; fail closed.
+        IpAddr::V6(_) => Err(SourceNatFailureReason::WrongAddressFamily),
+    }
+}
+
+/// #4381: release (or roll back) a NAT64 forward flow's translated pool port,
+/// mirroring [`release_source_nat_allocation`]'s flow-key / translated-tuple
+/// construction so the SAME `release_flow` / `rollback_flow` frees the port the
+/// forward flow allocated. Returns whether the allocation was found and freed.
+pub(crate) fn release_nat64_pool_port(
+    allocator: &PortAllocator,
+    flow: SourceNatFlowKey,
+    snat_v4: Ipv4Addr,
+    port: u16,
+    now_ns: u64,
+    rollback: bool,
+) -> bool {
+    let translated = TranslatedTuple {
+        ip: IpAddr::V4(snat_v4),
+        port,
+    };
+    if rollback {
+        allocator.rollback_flow(flow, translated, now_ns)
+    } else {
+        allocator.release_flow(flow, translated, now_ns)
+    }
+}
+
 pub(crate) fn match_source_nat(
     rules: &[SourceNatRule],
     scope: &NatScopeCtx,

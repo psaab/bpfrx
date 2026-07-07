@@ -359,6 +359,15 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
             metadata.is_reverse,
             now_ns,
         );
+        // #4381: also return the purged NAT64 forward flow's translated pool
+        // port (self-gated on the forward NAT64 entry).
+        crate::nat64::release_nat64_allocation(
+            &forwarding.nat64,
+            &key,
+            decision.nat,
+            metadata.is_reverse,
+            now_ns,
+        );
         delete_terminal_filtered_session(
             sessions,
             session_map_fd,

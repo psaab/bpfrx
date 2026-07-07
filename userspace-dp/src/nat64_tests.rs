@@ -591,13 +591,21 @@ fn packet_size_delta() {
 
 #[test]
 fn forward_decision_sets_nat64_flag() {
-    let d = Nat64State::forward_decision(Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(8, 8, 8, 8));
+    // #4381: forward_decision now carries the unique translated source port in
+    // rewrite_src_port.
+    let d = Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        40000,
+    );
     assert!(d.nat64);
     assert_eq!(
         d.rewrite_src,
         Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)))
     );
     assert_eq!(d.rewrite_dst, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    assert_eq!(d.rewrite_src_port, Some(40000));
+    assert_eq!(d.rewrite_dst_port, None);
 }
 
 #[test]
@@ -2754,19 +2762,16 @@ fn classify_match_ready_when_pool_has_source() {
     let state = Nat64State::from_snapshots(&[well_known_prefix()]);
     let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap(); // ::198.51.100.50
     match state.classify_ipv6_dest(dst) {
+        // #4381: MatchReady no longer pre-allocates a source; it just confirms
+        // the prefix matched and a pool exists. The `(snat_v4, port)` is
+        // allocated per-flow at the Permit branch via `allocate_source`.
         Nat64Match::MatchReady {
             prefix_idx,
             dst_v4,
-            snat_v4,
             dst_v6,
         } => {
             assert_eq!(prefix_idx, 0);
             assert_eq!(dst_v4, Ipv4Addr::new(198, 51, 100, 50));
-            assert!(
-                snat_v4 == Ipv4Addr::new(198, 51, 100, 1)
-                    || snat_v4 == Ipv4Addr::new(198, 51, 100, 2),
-                "snat from configured pool"
-            );
             assert_eq!(dst_v6, dst);
         }
         other => panic!("expected MatchReady, got {other:?}"),
@@ -2804,6 +2809,178 @@ fn classify_match_unavailable_on_empty_pool_fails_closed() {
         result,
         Nat64Match::NoPrefixMatch,
         "must NOT be treated as no-match (would IPv6-route the synthetic dest)"
+    );
+}
+
+// ===========================================================================
+// #4381: RFC 6146 BIB — NAT64 allocates a UNIQUE translated source port / ICMP
+// identifier per flow, reusing the pool-mode SNAT PortAllocator, so two v6
+// clients hidden behind ONE pool v4 address never collide on the reverse
+// (v4->v6) tuple. Pre-#4381 `forward_decision` set `rewrite_src_port = None`
+// and the source was a bare round-robin over the pool with no (addr, port)
+// uniqueness, so two clients sharing a source port produced an identical
+// reverse tuple and the second install collided.
+// ===========================================================================
+
+fn single_addr_prefix() -> NAT64RuleSnapshot {
+    NAT64RuleSnapshot {
+        name: "nat64-single".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        // A one-address pool is the sharpest collision case: every client maps
+        // to the SAME snat_v4, so ONLY the translated port can disambiguate.
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }
+}
+
+// FAIL-ON-REVERT: reverting the per-flow port allocation (forward_decision
+// carrying no translated port) lets two clients that share a source port map to
+// the SAME (snat_v4, port), producing an identical reverse tuple — the
+// distinct-port assertion goes RED.
+#[test]
+fn nat64_4381_shared_src_port_gets_distinct_translated_ports() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let c2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    // Both clients: source port 5000 -> server 443. One-address pool, so the
+    // snat_v4 is identical and the translated PORTS must differ.
+    let (s1, p1) = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c1, dst_v4, 5000, 443, 1)
+        .expect("alloc c1");
+    let (s2, p2) = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c2, dst_v4, 5000, 443, 1)
+        .expect("alloc c2");
+    assert_eq!(s1, Ipv4Addr::new(198, 51, 100, 1));
+    assert_eq!(s2, s1, "single-address pool => same snat_v4");
+    assert_ne!(
+        p1, p2,
+        "#4381: two clients sharing a source port MUST get distinct translated ports"
+    );
+    // The reverse tuples (server, snat_v4, server_port, translated_port) differ.
+    assert_ne!((s1, 443u16, p1), (s2, 443u16, p2));
+    // Translated ports come from the configured 1024..=65535 range.
+    assert!(p1 >= 1024 && p2 >= 1024, "translated ports in ephemeral range");
+}
+
+// Idempotency: re-allocating the SAME forward flow returns the SAME mapping (a
+// retransmit before the session installs must not consume a second port).
+#[test]
+fn nat64_4381_same_flow_reuses_mapping() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let a = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 1)
+        .unwrap();
+    let b = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 1)
+        .unwrap();
+    assert_eq!(a, b, "same flow reuses its translated mapping");
+}
+
+// Release un-tracks the flow so its port returns to the pool. Before release a
+// re-allocation is idempotent (returns the live mapping); after release the
+// live entry is gone, so a fresh allocation is issued.
+#[test]
+fn nat64_4381_release_untracks_flow() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let (snat, pa) = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 1)
+        .unwrap();
+    // Idempotent while live.
+    assert_eq!(
+        state
+            .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 1)
+            .unwrap(),
+        (snat, pa)
+    );
+    // The forward session key + decision the teardown release path reconstructs.
+    let key = crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(c),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        src_port: 5000,
+        dst_port: 443,
+    };
+    release_nat64_allocation(
+        &state,
+        &key,
+        Nat64State::forward_decision(snat, dst_v4, pa),
+        false,
+        2,
+    );
+    // Flow no longer live: a fresh allocation is issued (NOT the cached live
+    // entry), proving the release removed the tracking.
+    let (snat2, pb) = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 3)
+        .unwrap();
+    assert_eq!(snat2, snat);
+    assert_ne!(
+        pb, pa,
+        "post-release allocation is fresh, not the released live entry"
+    );
+}
+
+// A NAT64 forward flow's reverse entry (is_reverse == true) must NOT trigger a
+// release — only the forward entry owns the allocation.
+#[test]
+fn nat64_4381_reverse_entry_release_is_noop() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let (snat, pa) = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 1)
+        .unwrap();
+    let key = crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(c),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        src_port: 5000,
+        dst_port: 443,
+    };
+    // is_reverse == true: no-op, so the mapping stays live and idempotent.
+    release_nat64_allocation(
+        &state,
+        &key,
+        Nat64State::forward_decision(snat, dst_v4, pa),
+        true,
+        2,
+    );
+    assert_eq!(
+        state
+            .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 3)
+            .unwrap(),
+        (snat, pa),
+        "reverse-entry release must not free the forward flow's port"
+    );
+}
+
+// ICMP echo identifiers are translated uniquely too: two clients pinging the
+// same target with the same echo id, behind one pool address, get distinct
+// translated identifiers so their reverse (v4->v6) tuples never collide.
+#[test]
+fn nat64_4381_shared_icmp_identifier_gets_distinct_translated_ids() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let c2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    // ICMP echo: `parse_flow_ports` lifts the identifier into `src_port` with
+    // `dst_port == 0`.
+    let id = 0x1234u16;
+    let (_, t1) = state
+        .allocate_source(0, crate::ip_proto::PROTO_ICMPV6, c1, dst_v4, id, 0, 1)
+        .expect("alloc icmp c1");
+    let (_, t2) = state
+        .allocate_source(0, crate::ip_proto::PROTO_ICMPV6, c2, dst_v4, id, 0, 1)
+        .expect("alloc icmp c2");
+    assert_ne!(
+        t1, t2,
+        "#4381: shared ICMP echo id must map to distinct translated ids"
     );
 }
 
