@@ -1,3 +1,29 @@
+## 2026-07-06 — #4378: confirm pending commit-confirmed on RG0 demotion
+
+- **Timestamp**: 2026-07-06
+- **Action**: A node running an unconfirmed `commit confirmed` that is DEMOTED
+  from RG0 primary (StateSecondary/StateSecondaryHold) before the operator
+  confirms left its armed rollback timer running. `PromoteRollback` has no
+  cluster-read-only guard, so the timer still fired on the now-standby node and
+  reverted its store + dataplane to the pre-confirm tree while the new primary
+  kept the committed config → config divergence surfacing at the next failover.
+  Fix: on RG0 demotion, CONFIRM the pending window (cancel the timer + bump
+  confirmGen) via a new `store.ConfirmPendingOnDemotion()` called from the
+  demotion branch. CONFIRM (not roll back) is correct because the committed
+  config was already pushed to the peer via config-sync at commit-confirmed time
+  (`commitConfirmedAndApply` → `applyAndSyncCommitted` → `pushCommittedConfigToPeer`),
+  so the peer/new-primary already runs it; confirming keeps both nodes
+  converged. Extracted the inline RG0 ownership switch into a testable
+  `applyRG0OwnershipTransition(cluster.NodeState)` method. RED-on-revert tests
+  added at both layers (configstore + daemon): dropping the confirm leaves the
+  armed timer to revert the demoted node to the pre-confirm tree. Go-only, no
+  cargo. HA demotion-transition change — parent runs `make test-failover`
+  before merge.
+- **File(s)**: pkg/configstore/store_commit.go,
+  pkg/daemon/daemon_ha.go,
+  pkg/configstore/commit_confirm_demote_4378_test.go,
+  pkg/daemon/commit_confirm_demote_4378_test.go,
+  docs/ha-cluster-test-plan.md, _Log.md
 ## 2026-07-06 — #4386 cold-boot split-brain: never-seen heartbeat startup floor
 
 - **Timestamp**: 2026-07-06

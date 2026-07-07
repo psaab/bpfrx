@@ -326,32 +326,54 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 
 			// RG0-specific: config ownership and IPsec SA re-initiation.
 			if ev.GroupID == 0 {
-				switch ev.NewState {
-				case cluster.StatePrimary:
-					slog.Info("cluster: became primary for RG0, enabling config writes")
-					d.store.SetClusterReadOnly(false)
-
-					// On failover to primary: re-initiate synced IPsec SAs.
-					if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
-						go d.reinitiateIPsecSAs()
-					}
-
-					// #2239: on failover to primary, nudge the lease-sync push
-					// loop so this node begins replicating its (now owned)
-					// lease set. The actual Kea pre-seed + post-start lease-add
-					// seed are tied to the per-RG Kea start in
-					// applyRethServicesForRG (where Kea is restarted on the
-					// VRRP MASTER transition).
-					if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.dhcpServer != nil && d.sessionSync != nil {
-						d.nudgeDHCPLeaseSync()
-					}
-
-				case cluster.StateSecondary, cluster.StateSecondaryHold:
-					slog.Info("cluster: became secondary for RG0, disabling config writes")
-					d.store.SetClusterReadOnly(true)
-				}
+				d.applyRG0OwnershipTransition(ev.NewState)
 			}
 		}
+	}
+}
+
+// applyRG0OwnershipTransition reacts to a RG0 ownership change: it toggles the
+// store's cluster read-only gate (only RG0 primary may write config) and, on
+// promotion, re-initiates synced IPsec SAs and nudges DHCP lease-sync.
+//
+// #4378: on DEMOTION it also confirms any in-flight `commit confirmed` window
+// BEFORE going read-only. The committing node had already pushed the committed
+// config to the peer (now RG0 primary) via config-sync
+// (commitConfirmedAndApply -> applyAndSyncCommitted -> pushCommittedConfigToPeer),
+// so the primary is running that config. Confirming keeps both nodes on it.
+// Without this, the armed rollback timer would still fire on the demoted
+// standby (PromoteRollback carries no read-only guard), reverting its
+// store+dataplane to the pre-confirm tree while the primary keeps the commit —
+// config divergence that surfaces at the next failover.
+func (d *Daemon) applyRG0OwnershipTransition(newState cluster.NodeState) {
+	switch newState {
+	case cluster.StatePrimary:
+		slog.Info("cluster: became primary for RG0, enabling config writes")
+		d.store.SetClusterReadOnly(false)
+
+		// On failover to primary: re-initiate synced IPsec SAs.
+		if cc := d.clusterConfig(); cc != nil && cc.IPsecSASync && d.ipsec != nil && d.sessionSync != nil {
+			go d.reinitiateIPsecSAs()
+		}
+
+		// #2239: on failover to primary, nudge the lease-sync push loop so
+		// this node begins replicating its (now owned) lease set. The actual
+		// Kea pre-seed + post-start lease-add seed are tied to the per-RG Kea
+		// start in applyRethServicesForRG (where Kea is restarted on the VRRP
+		// MASTER transition).
+		if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.dhcpServer != nil && d.sessionSync != nil {
+			d.nudgeDHCPLeaseSync()
+		}
+
+	case cluster.StateSecondary, cluster.StateSecondaryHold:
+		slog.Info("cluster: became secondary for RG0, disabling config writes")
+		// #4378: confirm any pending commit-confirmed before going read-only
+		// so its rollback timer does not fire on the demoted standby and
+		// diverge from the peer that holds the synced committed config.
+		if d.store.ConfirmPendingOnDemotion() {
+			slog.Info("cluster: confirmed pending commit-confirmed on RG0 demotion")
+		}
+		d.store.SetClusterReadOnly(true)
 	}
 }
 

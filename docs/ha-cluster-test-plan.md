@@ -682,6 +682,63 @@ printf 'show configuration | display set\nexit\n' | incus exec xpf-fw1 -- cli
   RED-on-revert (the non-fatal case drops to zero peer pushes if the fix is
   reverted).
 
+### TC-5d: Commit-Confirmed Straddling a Failover Confirms on the Demoted Node (#4378)
+
+**Objective:** Verify that when a node running an unconfirmed `commit confirmed`
+is DEMOTED from RG0 primary (weight-based failover, planned failover, or
+sync-hold) BEFORE the operator confirms, the pending rollback timer does NOT
+fire on the now-standby node and revert its config — both nodes stay converged
+on the committed config.
+
+Background: distinct from the TC-5b *timeout* case. Here the window never times
+out on the original primary — it is demoted first. At `commit confirmed` time
+the committed config was already pushed to the peer via config-sync
+(`commitConfirmedAndApply` → `applyAndSyncCommitted` → `pushCommittedConfigToPeer`),
+so the peer — now RG0 primary — is already running it. Before #4378 the RG0
+demotion branch (`applyRG0OwnershipTransition`, `StateSecondary`/
+`StateSecondaryHold`) called ONLY `SetClusterReadOnly(true)` and left the armed
+rollback timer running; `PromoteRollback` has no read-only guard, so the timer
+still fired on the demoted standby and reverted its store + dataplane to the
+pre-confirm tree while the new primary kept the commit → config divergence,
+surfacing as a mismatch at the NEXT failover. The fix confirms the pending
+window on demotion (`store.ConfirmPendingOnDemotion`, which cancels the timer
+and bumps `confirmGen` so an already-fired-but-blocked callback no-ops in
+`PromoteRollback`). CONFIRM — not roll back — is correct precisely because the
+peer already holds the committed config; rolling back only the standby is what
+creates the divergence.
+
+```bash
+# 1. On fw0 (RG0 primary), commit-confirmed a distinctive change WITHOUT
+#    confirming (long timeout so the window is still open at demotion):
+printf 'configure\nset security policies from-zone lan to-zone wan policy test-demote match source-address any destination-address any application any then permit\ncommit confirmed 5\nexit\nexit\n' | incus exec xpf-fw0 -- cli
+
+# 2. Verify the UNCONFIRMED policy replicated to fw1:
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw1 -- cli   # test-demote present
+
+# 3. Fail RG0 over to fw1 (demotes fw0 while the window is still open):
+printf 'request chassis cluster failover redundancy-group 0 node 1\nexit\n' | incus exec xpf-fw0 -- cli
+
+# 4. Wait past the ORIGINAL confirm window (well over 5 minutes is not needed —
+#    the timer is cancelled on demotion; give it a slack minute) and verify
+#    BOTH nodes still carry test-demote (no rollback fired on demoted fw0):
+sleep 90
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw0 -- cli   # test-demote STILL present
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw1 -- cli   # test-demote present
+```
+
+**Pass criteria:**
+- After the demotion, `test-demote` is present on BOTH the demoted node and the
+  new primary — the standby did not roll back.
+- fw0's journal shows `cluster: confirmed pending commit-confirmed on RG0
+  demotion` and NO `commit confirmed timed out` entry.
+- A subsequent failover back serves the committed config, not the pre-confirm
+  tree.
+- Unit tests pin the behavior with RED-on-revert:
+  `pkg/configstore/commit_confirm_demote_4378_test.go` and
+  `pkg/daemon/commit_confirm_demote_4378_test.go` (drop
+  `ConfirmPendingOnDemotion` from the demotion branch and the armed timer
+  reverts the demoted node to the pre-confirm tree).
+
 ### TC-6: Session Synchronization
 
 **Objective:** Verify active sessions are synced to secondary for hitless failover.
