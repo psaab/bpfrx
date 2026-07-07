@@ -441,6 +441,14 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		}
 		return nil
 	}
+	// #4373 (E4/H2/H7): if the destination is multicast/broadcast/unspecified/
+	// loopback the forwarding path drops it at route lookup before policy runs,
+	// so the verdict below (and a `then accept; then log` filter for the same
+	// tuple) does not describe real forwarding. Print the advisory ahead of the
+	// verdict so the operator reads the caveat, not just the permit/deny.
+	if note := res.RouteDropNote(); note != "" {
+		fmt.Printf("  %s\n", note)
+	}
 	if !res.Matched {
 		fmt.Printf("No matching policy found for %s -> %s (default %s)\n",
 			fromZone, toZone, policymatch.ActionString(res.Action))

@@ -190,6 +190,24 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 		// fail-closed family — term-dropping is fail-open for deny rules) and is
 		// tracked separately in #3261.
 		if app.Protocol == "" {
+			// #4410 (F4): a protocol-less application that ALSO carries an
+			// icmp-type / icmp-code constraint gets a targeted hint naming that
+			// constraint. An operator who set `icmp-type <n>` (or `icmp-code <n>`)
+			// but omitted `protocol` almost certainly meant `protocol icmp` (or
+			// icmpv6) — an ICMP type/code is meaningful only on an ICMP protocol
+			// (see the protocolIsICMPFamily gate below for the protocol-present
+			// case). The generic "no protocol" message ignored the icmp-type they
+			// had already typed; naming it turns the reject into an actionable
+			// "you set icmp-type N — add `protocol icmp`/`icmpv6`" instead of a
+			// bare "set a protocol".
+			icmpHint := ""
+			if desc := icmpConstraintDesc(app); desc != "" {
+				icmpHint = fmt.Sprintf(
+					" (this application sets %s but no protocol; an ICMP "+
+						"type/code constraint is meaningful only on `protocol icmp` "+
+						"or `protocol icmpv6` — add one of those)",
+					desc)
+			}
 			return fmt.Errorf(
 				"application %q: no protocol specified; an application referenced by "+
 					"a security policy or NAT rule (or any application when "+
@@ -199,8 +217,8 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 					"keys on protocol+port and cannot represent a protocol-less "+
 					"application — accepting it would disarm the userspace dataplane "+
 					"for the whole config (the referencing policy's enforcement falls "+
-					"to the kernel slow path)",
-				name)
+					"to the kernel slow path)%s",
+				name, icmpHint)
 		}
 		// #3150: resolve the protocol against the SAME authority the dataplane
 		// uses (appid.ProtocolNumber, mirrored by filterProtocolResolvable) — NOT
@@ -637,6 +655,26 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 		}
 	}
 	return out
+}
+
+// icmpConstraintDesc renders the ICMP type/code constraint an application
+// carries as a human-readable `icmp-type N [icmp-code M]` token for use in a
+// commit-reject message (#4410 F4). It returns "" when the application has no
+// ICMP constraint, so callers can treat the empty string as "no hint to add".
+func icmpConstraintDesc(app *Application) string {
+	if app == nil {
+		return ""
+	}
+	switch {
+	case app.ICMPType != nil && app.ICMPCode != nil:
+		return fmt.Sprintf("icmp-type %d icmp-code %d", *app.ICMPType, *app.ICMPCode)
+	case app.ICMPType != nil:
+		return fmt.Sprintf("icmp-type %d", *app.ICMPType)
+	case app.ICMPCode != nil:
+		return fmt.Sprintf("icmp-code %d", *app.ICMPCode)
+	default:
+		return ""
+	}
 }
 
 // ApplicationsToValidateStrict exposes the strict-validation reference set

@@ -121,7 +121,7 @@ var knownRedistProtocols = map[string]bool{
 //     load / peer-sync path, opts.lenientRoutingExportRef in pkg/config).
 //     The strict validator REJECTS this case at commit; only the lenient
 //     load/peer-sync path can reach the renderer with such a name.
-func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig, self string) string {
+func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig, self string, bgpAcceptDefault map[string]bool) string {
 	// Junos spells directly-connected routes "direct"; FRR's redistribute
 	// keyword is "connected". A bare `export direct` must render
 	// `redistribute connected`, not the FRR-invalid `redistribute direct`
@@ -171,9 +171,19 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 					sorted = append(sorted, p)
 				}
 				sort.Strings(sorted)
+				// #4481: if this policy is ALSO applied as a BGP route-map
+				// in/out with no explicit default, its shared route-map carries
+				// a trailing PERMIT (Junos BGP default-accept, #2998). That
+				// permit must NOT govern the redistribute default (Junos
+				// redistribute defaults to REJECT), so reference the fail-closed
+				// per-use-site alias generatePolicyOptions emits for it.
+				rmName := export
+				if policyNeedsRedistAlias(export, ps, bgpAcceptDefault) {
+					rmName = redistFailClosedRouteMap(export)
+				}
 				var sb strings.Builder
 				for _, proto := range sorted {
-					fmt.Fprintf(&sb, " redistribute %s route-map %s\n", proto, export)
+					fmt.Fprintf(&sb, " redistribute %s route-map %s\n", proto, rmName)
 				}
 				return sb.String()
 			}
@@ -478,7 +488,7 @@ func bfdProfileName(interval, multiplier int) string {
 // shared section is passed (direct callers / unit tests), it falls back to
 // a function-local section emitted at the end, preserving the historical
 // single-instance behavior byte-for-byte.
-func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPFv3Config, bgp *config.BGPConfig, rip *config.RIPConfig, isis *config.ISISConfig, vrfName string, ecmpMaxPaths int, policyOptions *config.PolicyOptionsConfig, shared ...*bfdSection) string {
+func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPFv3Config, bgp *config.BGPConfig, rip *config.RIPConfig, isis *config.ISISConfig, vrfName string, ecmpMaxPaths int, policyOptions *config.PolicyOptionsConfig, bgpAcceptDefault map[string]bool, shared ...*bfdSection) string {
 	var b strings.Builder
 	var bfd *bfdSection
 	emitLocal := false
@@ -539,7 +549,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " maximum-paths %d\n", ecmpMaxPaths)
 		}
 		for _, export := range ospf.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf"))
+			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf", bgpAcceptDefault))
 		}
 		b.WriteString("exit\n!\n")
 		// OSPF interface settings + per-interface area activation. The
@@ -618,7 +628,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " maximum-paths %d\n", ecmpMaxPaths)
 		}
 		for _, export := range ospfv3.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf6"))
+			b.WriteString(m.resolveRedistribute(export, policyOptions, "ospf6", bgpAcceptDefault))
 		}
 		b.WriteString("exit\n!\n")
 		for _, area := range ospfv3.Areas {
@@ -813,7 +823,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// redistribute. resolveRedistribute normalizes direct→
 				// connected and refuses to emit an invalid bare-name
 				// line (#2223), and drops a self-redistribute (#2943).
-				b.WriteString(m.resolveRedistribute(e, policyOptions, "bgp"))
+				b.WriteString(m.resolveRedistribute(e, policyOptions, "bgp", bgpAcceptDefault))
 			}
 		}
 
@@ -994,7 +1004,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " passive-interface %s\n", iface)
 		}
 		for _, r := range rip.Redistribute {
-			b.WriteString(m.resolveRedistribute(r, policyOptions, "rip"))
+			b.WriteString(m.resolveRedistribute(r, policyOptions, "rip", bgpAcceptDefault))
 		}
 		b.WriteString("exit\n!\n")
 		// RIP per-interface authentication
@@ -1030,7 +1040,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(" is-type level-1-2\n")
 		}
 		for _, export := range isis.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions, "isis"))
+			b.WriteString(m.resolveRedistribute(export, policyOptions, "isis", bgpAcceptDefault))
 		}
 		if isis.WideMetricsOnly {
 			b.WriteString(" metric-style wide\n")
@@ -1250,9 +1260,9 @@ func renderRouteFilterEntry(b *strings.Builder, plName string, idx int, rf *conf
 		return false
 	}
 	if isV6 {
-		fmt.Fprintf(b, "ipv6 prefix-list %s seq %d permit %s", plName, (idx+1)*5, rf.Prefix)
+		fmt.Fprintf(b, "ipv6 prefix-list %s seq %d permit %s", plName, (idx+1)*5, sanitizeFRRValue(rf.Prefix))
 	} else {
-		fmt.Fprintf(b, "ip prefix-list %s seq %d permit %s", plName, (idx+1)*5, rf.Prefix)
+		fmt.Fprintf(b, "ip prefix-list %s seq %d permit %s", plName, (idx+1)*5, sanitizeFRRValue(rf.Prefix))
 	}
 	if matchStr != "" {
 		fmt.Fprintf(b, " %s", matchStr)
@@ -1312,6 +1322,57 @@ func communityMemberIsRegex(member string) bool {
 	return strings.ContainsAny(member, communityRegexChars)
 }
 
+// redistFailClosedRouteMap derives the per-use-site route-map name that IGP
+// redistribute references for a policy that is ALSO applied as a BGP route-map
+// in/out with no explicit default action. The base route-map keeps the Junos
+// BGP default-accept trailing permit (#2998); this alias carries the fail-closed
+// trailing deny the redistribute / forwarding-table context requires, so the
+// BGP permit default never leaks into the IGP through FRR's single name-keyed
+// route-map object (#4481). The "-xpf-redist" suffix is reserved: an operator
+// policy-statement of that exact derived name would collide — the same
+// non-injective-name caveat as F-220 (prefix-list names), which stays
+// vanishingly unlikely and is documented in the module README.
+func redistFailClosedRouteMap(name string) string {
+	return name + "-xpf-redist"
+}
+
+// policyNeedsRedistAlias reports whether policy-statement name renders a
+// BGP-default-accept trailing permit that must NOT be shared with an IGP
+// redistribute use of the same name (#4481). It is true only when the policy is
+// applied as a BGP route-map in/out (bgpAcceptDefault carries these names, per
+// collectBGPRouteMapPolicies) AND carries no explicit policy-level default
+// action — the exact case in which policyTrailingAction returns "permit" for a
+// route that matches no term. An explicit `then accept` / `then reject` renders
+// the same trailing action in every context, so no alias is needed.
+func policyNeedsRedistAlias(name string, ps *config.PolicyStatement, bgpAcceptDefault map[string]bool) bool {
+	return ps != nil && bgpAcceptDefault[name] &&
+		ps.DefaultAction != "accept" && ps.DefaultAction != "reject"
+}
+
+// policyTrailingAction resolves the trailing default-sequence action
+// (permit/deny) for a policy-statement route-map, applying the #2998
+// BGP-default-accept fallback:
+//
+//   - explicit `then accept`  → permit (Junos-explicit)
+//   - explicit `then reject`  → deny   (Junos-explicit)
+//   - no policy default + BGP route-map in/out context → permit
+//     (BGP default-accept; bgpAcceptDefault carries these names)
+//   - no policy default elsewhere (redistribute / forwarding-table export /
+//     standalone) → deny (fail-closed, matches the OSPF/redistribute Junos
+//     default and FRR's implicit deny)
+func policyTrailingAction(name string, ps *config.PolicyStatement, bgpAcceptDefault map[string]bool) string {
+	switch {
+	case ps.DefaultAction == "accept":
+		return "permit"
+	case ps.DefaultAction == "reject":
+		return "deny"
+	case bgpAcceptDefault[name]:
+		return "permit"
+	default:
+		return "deny"
+	}
+}
+
 // generatePolicyOptions emits FRR prefix-list / route-map / community-list /
 // as-path-access-list config from the typed Junos policy-options.
 //
@@ -1339,10 +1400,18 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 	for _, name := range names {
 		pl := po.PrefixLists[name]
 		for i, prefix := range pl.Prefixes {
+			// #4482: sanitize the prefix so an embedded newline from a
+			// leniently-loaded / peer-synced / rolled-back stored value cannot
+			// inject an extra frr.conf line. #4097 added this render-side belt
+			// to the community-list / as-path-list definitions but MISSED the
+			// prefix-list slots and the route-map `set` clauses below, which
+			// still rendered with a bare %s — a residual bypass on the tolerant
+			// load path (the strict #1798 commit control-char gate rejects it,
+			// but the peer-sync / rollback path only warns, #1960).
 			if strings.Contains(prefix, ":") {
-				fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s\n", name, (i+1)*5, prefix)
+				fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s\n", name, (i+1)*5, sanitizeFRRValue(prefix))
 			} else {
-				fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s\n", name, (i+1)*5, prefix)
+				fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s\n", name, (i+1)*5, sanitizeFRRValue(prefix))
 			}
 		}
 	}
@@ -1418,410 +1487,420 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 	sort.Strings(psNames)
 	for _, name := range psNames {
 		ps := po.PolicyStatements[name]
-		seq := 10
-		for _, term := range ps.Terms {
-			action := "permit"
-			if term.Action == "reject" {
-				action = "deny"
-			}
-
-			// Junos evaluates a policy's terms sequentially and a term that
-			// carries NO terminating action (no `then accept`/`then reject`,
-			// i.e. term.Action == "") APPLIES its modifications and FALLS
-			// THROUGH to the next term. FRR, by contrast, stops a route-map
-			// after the first sequence whose match clauses pass and that is a
-			// `permit` — once the `set` clauses run the route-map evaluation
-			// ends. Without an explicit continuation a Junos policy whose early
-			// terms do non-terminating set work (community add, local-preference,
-			// ...) and rely on a later term to accept/reject is silently
-			// TRUNCATED — the later terms never execute (#2451).
-			//
-			// FRR's `on-match next` makes a permit sequence run its `set`
-			// clauses and then CONTINUE evaluating the following sequences,
-			// which is exactly Junos fall-through. We emit it for every
-			// non-terminating term (rendered as `permit` above). A terminating
-			// term — `then accept` (permit, stop) or `then reject` (deny, stop)
-			// — must NOT get `on-match next`, so its FRR semantics match Junos
-			// terminating semantics. The `on-match next` line is written after
-			// the term's match/set clauses, immediately before `exit`, below.
-			//
-			// `on-match next` only fires on a MATCHED sequence: if a term's
-			// match clauses fail, FRR moves to the next sequence regardless, so
-			// emitting it on a non-terminating term never changes the behavior
-			// of a non-matching term. Falling off the end of all terms still
-			// hits the policy's default-action sequence (emitted after this
-			// loop), preserving the overall default behavior.
-			nonTerminating := term.Action != "accept" && term.Action != "reject"
-
-			// emitTermBody renders one route-map SEQUENCE for this term: the
-			// header, this term's family-specific route-filter match line, the
-			// family-agnostic match clauses (source-protocol/community/as-path),
-			// the optional `from prefix-list` clause, the `set`/then actions,
-			// and `on-match next`/`exit`. seqFam scopes which family-specific
-			// clauses are emitted:
-			//   - ""   single (unsplit) sequence — the term has homogeneous or
-			//          no route-filters; ALL clauses emit (byte-identical to the
-			//          pre-#2607 render).
-			//   - "v4" / "v6" one half of a SPLIT mixed-family route-filter
-			//          term — only that family's route-filter entries + match
-			//          line are emitted, and `from prefix-list` is emitted only
-			//          when the referenced list's family matches seqFam.
-			//
-			// Why split rather than emit both `match ip` and `match ipv6` in
-			// ONE sequence: FRR ANDs match clauses of DIFFERENT types within a
-			// single route-map index (lib/routemap.c route_map_apply_match
-			// invokes EVERY match rule with no AF pre-filter; `match ip
-			// address` and `match ipv6 address` are different rule types). A
-			// route is exclusively v4 or v6, so a v4 route NOMATCHes the ipv6
-			// clause and a v6 route NOMATCHes the ip clause → MATCH + NOMATCH =
-			// NOMATCH AND's the index to a silent deny for BOTH families. Two
-			// SEPARATE sequences (one per family, each carrying the full term
-			// body) is the only structure where each family's routes hit a
-			// sequence they can satisfy (#2607; the same AND finding that
-			// drove #2071's single-matcher decision).
-			emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName, fromPrefixList, fromCommunity, fromASPath string) {
-				fmt.Fprintf(&b, "route-map %s %s %d\n", name, action, seqNum)
-
-				// Inline prefix-list for this sequence's route-filters.
-				if len(term.RouteFilters) > 0 {
-					// matchV6 selects the address family of the
-					// "match ip/ipv6 address prefix-list" line. For a split
-					// sequence the family is fixed by seqFam. For a single
-					// sequence it is taken from the first EMITTED entry, else
-					// the first parseable route-filter (a #2103-skipped /32
-					// longer still names a real family), else v4 — mirroring
-					// the term.PrefixList branch's "unknown/empty defaults to
-					// IPv4". The match line is ALWAYS emitted (fail-closed
-					// against an undefined list, see below).
-					matchV6 := seqFam == "v6"
-					matchFamilyKnown := seqFam != ""
-					// emitted counts the prefix-list entries actually written.
-					// A #2103-skipped (/32 longer, empty set) or #2105-malformed
-					// entry writes NO "ip prefix-list" line, so the list may end
-					// up with zero entries — and we intentionally never
-					// materialise a count==0 list (FRR treats a count==0
-					// prefix-list as PREFIX_PERMIT / match-ALL). The match line
-					// still references the (then-undefined) list name: FRR
-					// resolves an undefined prefix-list to NULL → RMAP_NOMATCH
-					// (DENY), so an all-skipped term matches NOTHING and stays
-					// fail-closed. Suppressing the match line would leave a bare
-					// "route-map … permit <seq>" with no match clauses, which
-					// FRR treats as match-ALL — flipping "/32 longer" from the
-					// empty set to permit-everything (Copilot #2110).
-					emitted := 0
-					for _, irf := range rfs {
-						// Family hint for the single-sequence case: the first
-						// PARSEABLE route-filter sets it (even if later skipped),
-						// the first EMITTED entry overrides. For a split sequence
-						// seqFam already fixed it.
-						if seqFam == "" && !matchFamilyKnown {
-							if _, _, err := net.ParseCIDR(irf.rf.Prefix); err == nil {
-								matchV6 = strings.Contains(irf.rf.Prefix, ":")
-								matchFamilyKnown = true
-							}
-						}
-						if renderRouteFilterEntry(&b, plName, irf.idx, irf.rf) {
-							if emitted == 0 && seqFam == "" {
-								matchV6 = strings.Contains(irf.rf.Prefix, ":")
-								matchFamilyKnown = true
-							}
-							emitted++
-						}
-					}
-					if matchV6 {
-						fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
-					} else {
-						fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
-					}
-				}
-
-				if fromPrefixList != "" {
-					// Choose the address-family matcher from the referenced
-					// prefix-list's entries, mirroring the route-filter match
-					// branch above. FRR keeps `ip` and `ipv6` prefix-lists in
-					// independent namespaces; emitting `match ip address` for an
-					// IPv6 list makes the filter a silent no-op in an IPv6
-					// routing-policy context (#2071). Emit exactly one matcher;
-					// any IPv6 entry selects the IPv6 matcher. A mixed (v4+v6)
-					// list therefore renders the IPv6 matcher — the same
-					// homogeneous-family limitation #2071 documented as a TRADE.
-					// Unknown/empty lists default to IPv4.
-					//
-					// In a SPLIT mixed-route-filter term (seqFam != "") the
-					// prefix-list match is emitted ONLY in the sequence whose
-					// family matches the list, so the off-family sequence does
-					// not pick up a `match ip/ipv6` clause that would AND-NOMATCH
-					// its own family's routes (the #2071 co-resident collision,
-					// avoided by construction here).
-					//
-					// fromPrefixList is ONE entry of a possibly multi-valued
-					// `from prefix-list` set (#2642). Multiple entries match
-					// with OR ("any") semantics, but FRR's route_map_add_match
-					// REPLACES a same-type rule (lib/routemap.c), so two `match
-					// ip address prefix-list` lines in one index keep only the
-					// last. OR is therefore expressed by one route-map SEQUENCE
-					// per entry (the dispatch loop below), each carrying the full
-					// term body — exactly the #2607 split structure.
-					matchKW := "ip"
-					if pl := po.PrefixLists[fromPrefixList]; pl != nil {
-						for _, p := range pl.Prefixes {
-							if strings.Contains(p, ":") {
-								matchKW = "ipv6"
-								break
-							}
-						}
-					}
-					if seqFam == "" || (seqFam == "v6" && matchKW == "ipv6") || (seqFam == "v4" && matchKW == "ip") {
-						fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
-					}
-				}
-
-				// Junos "from protocol [ bgp ospf static ]" matches ANY listed
-				// protocol. FRR's "match source-protocol" only accepts a single
-				// protocol per line, but repeated lines within one route-map entry
-				// are OR'd, so render one line per protocol.
-				for _, proto := range term.FromProtocols {
-					if proto == "direct" {
-						proto = "connected"
-					}
-					fmt.Fprintf(&b, " match source-protocol %s\n", proto)
-				}
-
-				// fromCommunity / fromASPath are ONE entry of a possibly
-				// multi-valued `from community` / `from as-path` set (#2642).
-				// Junos OR's repeated same-type matches; FRR can hold only one
-				// `match community` / `match as-path` rule per route-map index
-				// (route_map_add_match replaces same-type), so OR is expressed
-				// by emitting one SEQUENCE per entry (dispatch loop below).
-				if fromCommunity != "" {
-					fmt.Fprintf(&b, " match community %s\n", fromCommunity)
-				}
-
-				if fromASPath != "" {
-					fmt.Fprintf(&b, " match as-path %s\n", fromASPath)
-				}
-
-				// then actions
-				if term.NextHop != "" {
-					if term.NextHop == "peer-address" {
-						// Junos "next-hop peer-address" → FRR. The session AF is not
-						// known here, so emit both forms; FRR applies each only to
-						// the matching address family of the carrying BGP session.
-						fmt.Fprintf(&b, " set ip next-hop peer-address\n")
-						fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
-					} else if term.NextHop == "self" {
-						// Junos "next-hop self" has NO route-map set-clause
-						// equivalent: FRR rejects a literal `set ip next-hop self`
-						// (the parser fails and takes the whole route-map down).
-						// The next-hop-self rewrite is instead emitted as the
-						// per-neighbor / per-address-family `neighbor <peer>
-						// next-hop-self` knob in the neighbor loop below, gated on
-						// policyStatementHasNextHopSelf against the neighbor's
-						// effective EXPORT policy. Emitting nothing HERE (so the
-						// route-map stays valid) but ALSO nothing at the neighbor
-						// was the #2977 silent no-op that blackholed iBGP/RR peers.
-					} else if strings.Contains(term.NextHop, ":") {
-						// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
-						// v6 address (whole route-map fails to parse); v6 uses the
-						// dedicated "set ipv6 next-hop global" form. Mirror the
-						// AF detection used by the prefix-list renderer above.
-						fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", term.NextHop)
-					} else {
-						fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
-					}
-				}
-
-				if term.LoadBalance != "" {
-					// FRR handles ECMP load balancing via forwarding-table export
-					// The route-map just needs to be a permit
-				}
-
-				// Emit on PRESENCE, not value: local-preference 0 is a
-				// valid BGP value (maximally deprioritize a route within
-				// the AS). Gating on LocalPreference > 0 silently dropped
-				// `set local-preference 0` (#2857).
-				if term.HasLocalPreference {
-					fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
-				}
-				// Emit on PRESENCE, not value: metric/MED 0 is a valid
-				// traffic-engineering value (advertise a highly preferred
-				// route). Gating on Metric > 0 silently dropped `set metric
-				// 0` (#2847).
-				if term.HasMetric {
-					fmt.Fprintf(&b, " set metric %d\n", term.Metric)
-				}
-				if term.MetricType == 1 || term.MetricType == 2 {
-					fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
-				}
-				// BGP community operations (#2848). Junos/vSRX supports
-				// append/delete/strip in addition to whole-attribute replace;
-				// emitting only the replace clause wiped upstream-set
-				// communities. Map each Junos operation to its FRR route-map
-				// set clause:
-				//   - add    → `set community <v> additive` (append)
-				//   - delete → `set comm-list <name> delete` (strip by list)
-				//   - none   → `set community none` (strip all)
-				//   - set/"" → `set community <v>` (replace; legacy bare form)
-				switch term.CommunityOp {
-				case "none":
-					b.WriteString(" set community none\n")
-				case "add":
-					if term.CommunityAdd != "" {
-						fmt.Fprintf(&b, " set community %s additive\n", term.CommunityAdd)
-					}
-				case "delete":
-					// FRR's `set comm-list <name> delete` strips ONE
-					// community-list per line, so a multi-list
-					// `then community delete [ listA listB ]` emits one clause
-					// per referenced list — every name in order (#2902).
-					for _, name := range term.CommunityDelete {
-						if name != "" {
-							fmt.Fprintf(&b, " set comm-list %s delete\n", name)
-						}
-					}
-				default: // "" or "set" — whole-attribute replace
-					if term.Community != "" {
-						fmt.Fprintf(&b, " set community %s\n", term.Community)
-					}
-				}
-				// AS-path prepend (#2892). Junos `then as-path-prepend
-				// "<asn> <asn> ..."` → FRR `set as-path prepend <asn> <asn>
-				// ...`. The repeated ASNs lengthen the advertised AS_PATH so
-				// peers prefer a shorter alternate path. Emit every ASN in
-				// order (repetition is the mechanism) on a single clause; skip
-				// entirely when no ASNs were configured.
-				if len(term.ASPathPrepend) > 0 {
-					fmt.Fprintf(&b, " set as-path prepend %s\n", strings.Join(term.ASPathPrepend, " "))
-				}
-				if term.Origin != "" {
-					fmt.Fprintf(&b, " set origin %s\n", term.Origin)
-				}
-
-				// Non-terminating term: fall through to the next sequence after
-				// running this term's set clauses (Junos fall-through; #2451).
-				// In a SPLIT term BOTH per-family sequences carry on-match next
-				// for a non-terminating term — each is its own permit sequence
-				// and must continue to later terms. A terminating term gets none
-				// in either half (the v4-route case stops at the v4 sequence; the
-				// v6-route case stops at the v6 sequence).
-				if nonTerminating {
-					b.WriteString(" on-match next\n")
-				}
-
-				b.WriteString("exit\n")
-			}
-
-			// Decide single vs split. A term splits ONLY when its route-filters
-			// genuinely mix families (at least one v4 AND one v6 prefix). A
-			// homogeneous or empty route-filter set renders as today — ONE
-			// sequence, ONE plName, byte-identical output (no churn for the
-			// common case).
-			// Two independent OR-dimensions can each multiply the number of
-			// emitted sequences:
-			//   (a) route-filters that genuinely mix families (#2607) - one
-			//       sequence per family; and
-			//   (b) repeated same-type `from prefix-list` / `from community`
-			//       / `from as-path` matches (#2642) - Junos OR's them, but
-			//       FRR holds only one rule of each match TYPE per route-map
-			//       index (route_map_add_match replaces same-type), so OR is
-			//       expressed as one sequence per value.
-			// Different match types must AND, the same type must OR. The
-			// correct structure is the CARTESIAN PRODUCT of the OR-sets: each
-			// emitted sequence carries exactly one prefix-list, one community,
-			// one as-path (plus its family's route-filter match, all
-			// source-protocol lines, and all set actions). A route that
-			// satisfies (any prefix-list) AND (any community) AND (any as-path)
-			// reaches at least one sequence it fully matches - the Junos
-			// "(p1|p2) AND (c1|c2) AND ..." semantics.
-			//
-			// The common single-valued / no-match case collapses to ONE
-			// sequence with the historical plName, byte-identical to master:
-			// each OR-set defaults to a single "" sentinel.
-			plName := name + "-" + term.Name
-			v4rf, v6rf := partitionRouteFiltersByFamily(term.RouteFilters)
-			mixedFamily := len(term.RouteFilters) > 0 && len(v4rf) > 0 && len(v6rf) > 0
-
-			// orElseEmpty yields the OR-set to iterate: the field's values, or
-			// a single "" sentinel so a missing match still emits one sequence
-			// (the per-clause guards skip the empty value).
-			orElseEmpty := func(vs []string) []string {
-				if len(vs) == 0 {
-					return []string{""}
-				}
-				return vs
-			}
-
-			// emitVariants emits the cross-product of the three from-* OR sets
-			// for one route-filter family group (seqFam/rfs/famPL), advancing
-			// seq by 10 per sequence. The iteration order (prefix-list,
-			// community, as-path) is fixed, so output is deterministic.
-			emitVariants := func(seqFam string, rfs []indexedRouteFilter, famPL string) {
-				for _, pl := range orElseEmpty(term.PrefixList) {
-					for _, comm := range orElseEmpty(term.FromCommunity) {
-						for _, asp := range orElseEmpty(term.FromASPath) {
-							emitTermBody(seqFam, seq, rfs, famPL, pl, comm, asp)
-							seq += 10
-						}
-					}
-				}
-			}
-
-			if mixedFamily {
-				// Mixed-family route-filters: split into a v4 group and a v6
-				// group (#2607), each carrying its own family's route-filter
-				// entries into a per-family prefix-list (plName_v4 / plName_v6 -
-				// FRR `ip` vs `ipv6` prefix-lists are separate namespaces anyway,
-				// but the distinct NAME keeps the two match lines referencing
-				// disjoint single-family lists). Within each group the from-* OR
-				// cross-product is emitted; v4 first.
-				emitVariants("v4", v4rf, plName+"_v4")
-				emitVariants("v6", v6rf, plName+"_v6")
-			} else {
-				// Homogeneous or no route-filters: one family group. Pass the
-				// full (possibly empty) indexed route-filter set and the
-				// historical plName. With no repeated from-* matches this is a
-				// single sequence, byte-identical to master.
-				all := make([]indexedRouteFilter, len(term.RouteFilters))
-				for i, rf := range term.RouteFilters {
-					all[i] = indexedRouteFilter{i, rf}
-				}
-				emitVariants("", all, plName)
-			}
-		}
-
-		// Default action. A Junos policy-statement that reaches its end
-		// without a terminating term falls through to the PROTOCOL default
-		// policy, which is application-specific: BGP import AND export both
-		// default-ACCEPT the unmatched route, while a redistribute /
-		// forwarding-table export policy defaults to REJECT. FRR route-maps
-		// carry an implicit trailing deny, so a BGP policy that only tweaks
-		// attributes on a few terms and expects the rest to pass unmodified
-		// would blackhole every non-matching route under a blanket trailing
-		// `deny` (#2998).
-		//
-		//   - explicit `then accept`  → permit (Junos-explicit)
-		//   - explicit `then reject`  → deny   (Junos-explicit)
-		//   - no policy default + BGP route-map in/out context → permit
-		//     (BGP default-accept; bgpAcceptDefault carries these names)
-		//   - no policy default elsewhere (redistribute / forwarding-table
-		//     export / standalone) → deny (fail-closed, matches the OSPF/
-		//     redistribute Junos default and FRR's implicit deny)
-		switch {
-		case ps.DefaultAction == "accept":
-			fmt.Fprintf(&b, "route-map %s permit %d\n", name, seq)
-			b.WriteString("exit\n")
-		case ps.DefaultAction == "reject":
-			fmt.Fprintf(&b, "route-map %s deny %d\n", name, seq)
-			b.WriteString("exit\n")
-		case bgpAcceptDefault[name]:
-			fmt.Fprintf(&b, "route-map %s permit %d\n", name, seq)
-			b.WriteString("exit\n")
-		default:
-			fmt.Fprintf(&b, "route-map %s deny %d\n", name, seq)
-			b.WriteString("exit\n")
-		}
+		// Base route-map: Junos BGP default-accept (#2998) vs the fail-closed
+		// redistribute/forwarding-table default, resolved per use context.
+		b.WriteString(m.renderRouteMapForPolicy(po, name, ps, policyTrailingAction(name, ps, bgpAcceptDefault)))
 		b.WriteString("!\n")
+		// #4481: FRR route-maps are keyed by NAME — one object shared by every
+		// use site. A policy applied as a BGP route-map in/out with no explicit
+		// default renders a trailing PERMIT (Junos BGP default-accept, #2998).
+		// If the SAME policy is also used for an IGP redistribute, that permit
+		// would leak every non-matching route into the IGP. Emit a per-use-site
+		// fail-closed alias for the redistribute contexts; resolveRedistribute
+		// references it instead of the shared permit-default map.
+		if policyNeedsRedistAlias(name, ps, bgpAcceptDefault) {
+			b.WriteString(m.renderRouteMapForPolicy(po, redistFailClosedRouteMap(name), ps, "deny"))
+			b.WriteString("!\n")
+		}
 	}
 
+	return b.String()
+}
+
+// renderRouteMapForPolicy renders ONE FRR route-map for policy-statement ps
+// under emitName, appending the caller-supplied trailing default action. The
+// body — terms, match/set clauses, and inline route-filter prefix-lists whose
+// names derive from emitName — is identical across use sites; only the header
+// name and the trailing default differ. That lets a BGP-default-accept policy
+// ALSO be rendered under a fail-closed per-use-site alias for redistribute
+// without leaking its permit default across FRR's name-keyed route-map object
+// (#4481 / #2998 / #2607 / #2642).
+func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitName string, ps *config.PolicyStatement, trailingAction string) string {
+	var b strings.Builder
+	seq := 10
+	for _, term := range ps.Terms {
+		action := "permit"
+		if term.Action == "reject" {
+			action = "deny"
+		}
+
+		// Junos evaluates a policy's terms sequentially and a term that
+		// carries NO terminating action (no `then accept`/`then reject`,
+		// i.e. term.Action == "") APPLIES its modifications and FALLS
+		// THROUGH to the next term. FRR, by contrast, stops a route-map
+		// after the first sequence whose match clauses pass and that is a
+		// `permit` — once the `set` clauses run the route-map evaluation
+		// ends. Without an explicit continuation a Junos policy whose early
+		// terms do non-terminating set work (community add, local-preference,
+		// ...) and rely on a later term to accept/reject is silently
+		// TRUNCATED — the later terms never execute (#2451).
+		//
+		// FRR's `on-match next` makes a permit sequence run its `set`
+		// clauses and then CONTINUE evaluating the following sequences,
+		// which is exactly Junos fall-through. We emit it for every
+		// non-terminating term (rendered as `permit` above). A terminating
+		// term — `then accept` (permit, stop) or `then reject` (deny, stop)
+		// — must NOT get `on-match next`, so its FRR semantics match Junos
+		// terminating semantics. The `on-match next` line is written after
+		// the term's match/set clauses, immediately before `exit`, below.
+		//
+		// `on-match next` only fires on a MATCHED sequence: if a term's
+		// match clauses fail, FRR moves to the next sequence regardless, so
+		// emitting it on a non-terminating term never changes the behavior
+		// of a non-matching term. Falling off the end of all terms still
+		// hits the policy's default-action sequence (emitted after this
+		// loop), preserving the overall default behavior.
+		nonTerminating := term.Action != "accept" && term.Action != "reject"
+
+		// emitTermBody renders one route-map SEQUENCE for this term: the
+		// header, this term's family-specific route-filter match line, the
+		// family-agnostic match clauses (source-protocol/community/as-path),
+		// the optional `from prefix-list` clause, the `set`/then actions,
+		// and `on-match next`/`exit`. seqFam scopes which family-specific
+		// clauses are emitted:
+		//   - ""   single (unsplit) sequence — the term has homogeneous or
+		//          no route-filters; ALL clauses emit (byte-identical to the
+		//          pre-#2607 render).
+		//   - "v4" / "v6" one half of a SPLIT mixed-family route-filter
+		//          term — only that family's route-filter entries + match
+		//          line are emitted, and `from prefix-list` is emitted only
+		//          when the referenced list's family matches seqFam.
+		//
+		// Why split rather than emit both `match ip` and `match ipv6` in
+		// ONE sequence: FRR ANDs match clauses of DIFFERENT types within a
+		// single route-map index (lib/routemap.c route_map_apply_match
+		// invokes EVERY match rule with no AF pre-filter; `match ip
+		// address` and `match ipv6 address` are different rule types). A
+		// route is exclusively v4 or v6, so a v4 route NOMATCHes the ipv6
+		// clause and a v6 route NOMATCHes the ip clause → MATCH + NOMATCH =
+		// NOMATCH AND's the index to a silent deny for BOTH families. Two
+		// SEPARATE sequences (one per family, each carrying the full term
+		// body) is the only structure where each family's routes hit a
+		// sequence they can satisfy (#2607; the same AND finding that
+		// drove #2071's single-matcher decision).
+		emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName, fromPrefixList, fromCommunity, fromASPath string) {
+			fmt.Fprintf(&b, "route-map %s %s %d\n", emitName, action, seqNum)
+
+			// Inline prefix-list for this sequence's route-filters.
+			if len(term.RouteFilters) > 0 {
+				// matchV6 selects the address family of the
+				// "match ip/ipv6 address prefix-list" line. For a split
+				// sequence the family is fixed by seqFam. For a single
+				// sequence it is taken from the first EMITTED entry, else
+				// the first parseable route-filter (a #2103-skipped /32
+				// longer still names a real family), else v4 — mirroring
+				// the term.PrefixList branch's "unknown/empty defaults to
+				// IPv4". The match line is ALWAYS emitted (fail-closed
+				// against an undefined list, see below).
+				matchV6 := seqFam == "v6"
+				matchFamilyKnown := seqFam != ""
+				// emitted counts the prefix-list entries actually written.
+				// A #2103-skipped (/32 longer, empty set) or #2105-malformed
+				// entry writes NO "ip prefix-list" line, so the list may end
+				// up with zero entries — and we intentionally never
+				// materialise a count==0 list (FRR treats a count==0
+				// prefix-list as PREFIX_PERMIT / match-ALL). The match line
+				// still references the (then-undefined) list name: FRR
+				// resolves an undefined prefix-list to NULL → RMAP_NOMATCH
+				// (DENY), so an all-skipped term matches NOTHING and stays
+				// fail-closed. Suppressing the match line would leave a bare
+				// "route-map … permit <seq>" with no match clauses, which
+				// FRR treats as match-ALL — flipping "/32 longer" from the
+				// empty set to permit-everything (Copilot #2110).
+				emitted := 0
+				for _, irf := range rfs {
+					// Family hint for the single-sequence case: the first
+					// PARSEABLE route-filter sets it (even if later skipped),
+					// the first EMITTED entry overrides. For a split sequence
+					// seqFam already fixed it.
+					if seqFam == "" && !matchFamilyKnown {
+						if _, _, err := net.ParseCIDR(irf.rf.Prefix); err == nil {
+							matchV6 = strings.Contains(irf.rf.Prefix, ":")
+							matchFamilyKnown = true
+						}
+					}
+					if renderRouteFilterEntry(&b, plName, irf.idx, irf.rf) {
+						if emitted == 0 && seqFam == "" {
+							matchV6 = strings.Contains(irf.rf.Prefix, ":")
+							matchFamilyKnown = true
+						}
+						emitted++
+					}
+				}
+				if matchV6 {
+					fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
+				} else {
+					fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
+				}
+			}
+
+			if fromPrefixList != "" {
+				// Choose the address-family matcher from the referenced
+				// prefix-list's entries, mirroring the route-filter match
+				// branch above. FRR keeps `ip` and `ipv6` prefix-lists in
+				// independent namespaces; emitting `match ip address` for an
+				// IPv6 list makes the filter a silent no-op in an IPv6
+				// routing-policy context (#2071). Emit exactly one matcher;
+				// any IPv6 entry selects the IPv6 matcher. A mixed (v4+v6)
+				// list therefore renders the IPv6 matcher — the same
+				// homogeneous-family limitation #2071 documented as a TRADE.
+				// Unknown/empty lists default to IPv4.
+				//
+				// In a SPLIT mixed-route-filter term (seqFam != "") the
+				// prefix-list match is emitted ONLY in the sequence whose
+				// family matches the list, so the off-family sequence does
+				// not pick up a `match ip/ipv6` clause that would AND-NOMATCH
+				// its own family's routes (the #2071 co-resident collision,
+				// avoided by construction here).
+				//
+				// fromPrefixList is ONE entry of a possibly multi-valued
+				// `from prefix-list` set (#2642). Multiple entries match
+				// with OR ("any") semantics, but FRR's route_map_add_match
+				// REPLACES a same-type rule (lib/routemap.c), so two `match
+				// ip address prefix-list` lines in one index keep only the
+				// last. OR is therefore expressed by one route-map SEQUENCE
+				// per entry (the dispatch loop below), each carrying the full
+				// term body — exactly the #2607 split structure.
+				matchKW := "ip"
+				if pl := po.PrefixLists[fromPrefixList]; pl != nil {
+					for _, p := range pl.Prefixes {
+						if strings.Contains(p, ":") {
+							matchKW = "ipv6"
+							break
+						}
+					}
+				}
+				if seqFam == "" || (seqFam == "v6" && matchKW == "ipv6") || (seqFam == "v4" && matchKW == "ip") {
+					fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
+				}
+			}
+
+			// Junos "from protocol [ bgp ospf static ]" matches ANY listed
+			// protocol. FRR's "match source-protocol" only accepts a single
+			// protocol per line, but repeated lines within one route-map entry
+			// are OR'd, so render one line per protocol.
+			for _, proto := range term.FromProtocols {
+				if proto == "direct" {
+					proto = "connected"
+				}
+				fmt.Fprintf(&b, " match source-protocol %s\n", proto)
+			}
+
+			// fromCommunity / fromASPath are ONE entry of a possibly
+			// multi-valued `from community` / `from as-path` set (#2642).
+			// Junos OR's repeated same-type matches; FRR can hold only one
+			// `match community` / `match as-path` rule per route-map index
+			// (route_map_add_match replaces same-type), so OR is expressed
+			// by emitting one SEQUENCE per entry (dispatch loop below).
+			if fromCommunity != "" {
+				fmt.Fprintf(&b, " match community %s\n", sanitizeFRRValue(fromCommunity))
+			}
+
+			if fromASPath != "" {
+				fmt.Fprintf(&b, " match as-path %s\n", sanitizeFRRValue(fromASPath))
+			}
+
+			// then actions
+			if term.NextHop != "" {
+				if term.NextHop == "peer-address" {
+					// Junos "next-hop peer-address" → FRR. The session AF is not
+					// known here, so emit both forms; FRR applies each only to
+					// the matching address family of the carrying BGP session.
+					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
+					fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
+				} else if term.NextHop == "self" {
+					// Junos "next-hop self" has NO route-map set-clause
+					// equivalent: FRR rejects a literal `set ip next-hop self`
+					// (the parser fails and takes the whole route-map down).
+					// The next-hop-self rewrite is instead emitted as the
+					// per-neighbor / per-address-family `neighbor <peer>
+					// next-hop-self` knob in the neighbor loop below, gated on
+					// policyStatementHasNextHopSelf against the neighbor's
+					// effective EXPORT policy. Emitting nothing HERE (so the
+					// route-map stays valid) but ALSO nothing at the neighbor
+					// was the #2977 silent no-op that blackholed iBGP/RR peers.
+				} else if strings.Contains(term.NextHop, ":") {
+					// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
+					// v6 address (whole route-map fails to parse); v6 uses the
+					// dedicated "set ipv6 next-hop global" form. Mirror the
+					// AF detection used by the prefix-list renderer above.
+					fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", term.NextHop)
+				} else {
+					fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
+				}
+			}
+
+			if term.LoadBalance != "" {
+				// FRR handles ECMP load balancing via forwarding-table export
+				// The route-map just needs to be a permit
+			}
+
+			// Emit on PRESENCE, not value: local-preference 0 is a
+			// valid BGP value (maximally deprioritize a route within
+			// the AS). Gating on LocalPreference > 0 silently dropped
+			// `set local-preference 0` (#2857).
+			if term.HasLocalPreference {
+				fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
+			}
+			// Emit on PRESENCE, not value: metric/MED 0 is a valid
+			// traffic-engineering value (advertise a highly preferred
+			// route). Gating on Metric > 0 silently dropped `set metric
+			// 0` (#2847).
+			if term.HasMetric {
+				fmt.Fprintf(&b, " set metric %d\n", term.Metric)
+			}
+			if term.MetricType == 1 || term.MetricType == 2 {
+				fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
+			}
+			// BGP community operations (#2848). Junos/vSRX supports
+			// append/delete/strip in addition to whole-attribute replace;
+			// emitting only the replace clause wiped upstream-set
+			// communities. Map each Junos operation to its FRR route-map
+			// set clause. #4482: every free-text value below (set community,
+			// set comm-list delete name, set as-path prepend, and the match
+			// community / as-path names) is routed through sanitizeFRRValue —
+			// the same #4097 render-side belt the community-list / as-path-list
+			// definitions use — so a tolerant-load / peer-synced / rolled-back
+			// value with an embedded newline cannot inject an extra frr.conf
+			// line regardless of load path.
+			//   - add    → `set community <v> additive` (append)
+			//   - delete → `set comm-list <name> delete` (strip by list)
+			//   - none   → `set community none` (strip all)
+			//   - set/"" → `set community <v>` (replace; legacy bare form)
+			switch term.CommunityOp {
+			case "none":
+				b.WriteString(" set community none\n")
+			case "add":
+				if term.CommunityAdd != "" {
+					fmt.Fprintf(&b, " set community %s additive\n", sanitizeFRRValue(term.CommunityAdd))
+				}
+			case "delete":
+				// FRR's `set comm-list <name> delete` strips ONE
+				// community-list per line, so a multi-list
+				// `then community delete [ listA listB ]` emits one clause
+				// per referenced list — every name in order (#2902).
+				for _, name := range term.CommunityDelete {
+					if name != "" {
+						fmt.Fprintf(&b, " set comm-list %s delete\n", sanitizeFRRValue(name))
+					}
+				}
+			default: // "" or "set" — whole-attribute replace
+				if term.Community != "" {
+					fmt.Fprintf(&b, " set community %s\n", sanitizeFRRValue(term.Community))
+				}
+			}
+			// AS-path prepend (#2892). Junos `then as-path-prepend
+			// "<asn> <asn> ..."` → FRR `set as-path prepend <asn> <asn>
+			// ...`. The repeated ASNs lengthen the advertised AS_PATH so
+			// peers prefer a shorter alternate path. Emit every ASN in
+			// order (repetition is the mechanism) on a single clause; skip
+			// entirely when no ASNs were configured.
+			if len(term.ASPathPrepend) > 0 {
+				fmt.Fprintf(&b, " set as-path prepend %s\n", sanitizeFRRValue(strings.Join(term.ASPathPrepend, " ")))
+			}
+			if term.Origin != "" {
+				fmt.Fprintf(&b, " set origin %s\n", term.Origin)
+			}
+
+			// Non-terminating term: fall through to the next sequence after
+			// running this term's set clauses (Junos fall-through; #2451).
+			// In a SPLIT term BOTH per-family sequences carry on-match next
+			// for a non-terminating term — each is its own permit sequence
+			// and must continue to later terms. A terminating term gets none
+			// in either half (the v4-route case stops at the v4 sequence; the
+			// v6-route case stops at the v6 sequence).
+			if nonTerminating {
+				b.WriteString(" on-match next\n")
+			}
+
+			b.WriteString("exit\n")
+		}
+
+		// Decide single vs split. A term splits ONLY when its route-filters
+		// genuinely mix families (at least one v4 AND one v6 prefix). A
+		// homogeneous or empty route-filter set renders as today — ONE
+		// sequence, ONE plName, byte-identical output (no churn for the
+		// common case).
+		// Two independent OR-dimensions can each multiply the number of
+		// emitted sequences:
+		//   (a) route-filters that genuinely mix families (#2607) - one
+		//       sequence per family; and
+		//   (b) repeated same-type `from prefix-list` / `from community`
+		//       / `from as-path` matches (#2642) - Junos OR's them, but
+		//       FRR holds only one rule of each match TYPE per route-map
+		//       index (route_map_add_match replaces same-type), so OR is
+		//       expressed as one sequence per value.
+		// Different match types must AND, the same type must OR. The
+		// correct structure is the CARTESIAN PRODUCT of the OR-sets: each
+		// emitted sequence carries exactly one prefix-list, one community,
+		// one as-path (plus its family's route-filter match, all
+		// source-protocol lines, and all set actions). A route that
+		// satisfies (any prefix-list) AND (any community) AND (any as-path)
+		// reaches at least one sequence it fully matches - the Junos
+		// "(p1|p2) AND (c1|c2) AND ..." semantics.
+		//
+		// The common single-valued / no-match case collapses to ONE
+		// sequence with the historical plName, byte-identical to master:
+		// each OR-set defaults to a single "" sentinel.
+		plName := emitName + "-" + term.Name
+		v4rf, v6rf := partitionRouteFiltersByFamily(term.RouteFilters)
+		mixedFamily := len(term.RouteFilters) > 0 && len(v4rf) > 0 && len(v6rf) > 0
+
+		// orElseEmpty yields the OR-set to iterate: the field's values, or
+		// a single "" sentinel so a missing match still emits one sequence
+		// (the per-clause guards skip the empty value).
+		orElseEmpty := func(vs []string) []string {
+			if len(vs) == 0 {
+				return []string{""}
+			}
+			return vs
+		}
+
+		// emitVariants emits the cross-product of the three from-* OR sets
+		// for one route-filter family group (seqFam/rfs/famPL), advancing
+		// seq by 10 per sequence. The iteration order (prefix-list,
+		// community, as-path) is fixed, so output is deterministic.
+		emitVariants := func(seqFam string, rfs []indexedRouteFilter, famPL string) {
+			for _, pl := range orElseEmpty(term.PrefixList) {
+				for _, comm := range orElseEmpty(term.FromCommunity) {
+					for _, asp := range orElseEmpty(term.FromASPath) {
+						emitTermBody(seqFam, seq, rfs, famPL, pl, comm, asp)
+						seq += 10
+					}
+				}
+			}
+		}
+
+		if mixedFamily {
+			// Mixed-family route-filters: split into a v4 group and a v6
+			// group (#2607), each carrying its own family's route-filter
+			// entries into a per-family prefix-list (plName_v4 / plName_v6 -
+			// FRR `ip` vs `ipv6` prefix-lists are separate namespaces anyway,
+			// but the distinct NAME keeps the two match lines referencing
+			// disjoint single-family lists). Within each group the from-* OR
+			// cross-product is emitted; v4 first.
+			emitVariants("v4", v4rf, plName+"_v4")
+			emitVariants("v6", v6rf, plName+"_v6")
+		} else {
+			// Homogeneous or no route-filters: one family group. Pass the
+			// full (possibly empty) indexed route-filter set and the
+			// historical plName. With no repeated from-* matches this is a
+			// single sequence, byte-identical to master.
+			all := make([]indexedRouteFilter, len(term.RouteFilters))
+			for i, rf := range term.RouteFilters {
+				all[i] = indexedRouteFilter{i, rf}
+			}
+			emitVariants("", all, plName)
+		}
+	}
+
+	// Trailing default action, resolved by the caller — Junos BGP
+	// default-accept (#2998) or the fail-closed redistribute /
+	// forwarding-table default — and passed in so the SAME body can render
+	// under a per-use-site alias with a different trailing default, never
+	// mutating FRR's name-keyed shared route-map object (#4481). See
+	// policyTrailingAction for the case matrix.
+	fmt.Fprintf(&b, "route-map %s %s %d\n", emitName, trailingAction, seq)
+	b.WriteString("exit\n")
 	return b.String()
 }

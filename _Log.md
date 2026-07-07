@@ -30,6 +30,249 @@
   userspace-dp/src/afxdp/parser.rs, userspace-dp/src/afxdp/poll_stages.rs,
   userspace-dp/src/afxdp/parser_tests.rs,
   userspace-dp/src/afxdp/README.md, _Log.md
+## 2026-07-07 — #4415 (codex-164 backlog, L12): reject zone LIST on scoped global policy
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the one GENUINE GO bug in the codex-review-164 unfiled
+  backlog (#4415). A scoped global policy's `match from-zone` / `match to-zone`
+  (#3148) is modeled by a SINGLE-STRING `config.PolicyMatch.FromZone`/`.ToZone`,
+  and the compiler fills it from only the first value token. A Junos zone LIST
+  (`match from-zone [ trust dmz ]`) collapses via the #2419 lexer onto one leaf's
+  Keys (`["from-zone","trust","dmz"]`), so the compiler kept `trust` and SILENTLY
+  DROPPED `dmz` — a security-relevant scope narrowing with no operator-visible
+  signal (verified: `SchemaValidate` returned nil, `Match.FromZone == "trust"`).
+  Tagged both leaves `scalar: true` in `pkg/config/schema_security.go` so
+  `SchemaValidate`'s #3332 `validateScalarValueLeaf` guard REJECTS the list at
+  commit with a clear "the extra token would be silently dropped" error, instead
+  of dropping a zone. Single-zone scope still validates. Modeling a real
+  multi-zone scope (Junos accepts a list here) is deferred as #4415 M03.
+- **File(s)**: `pkg/config/schema_security.go` (scalar: true on global
+  from-zone/to-zone), `pkg/config/schema_global_zone_list_4415_test.go` (new
+  RED-on-revert test), `docs/config-schema.md` (#4415 L12 note in the #3332
+  scalar section).
+- **Other codex-164 items (dispositions, no code):** H02 policy_id-0 exclusion =
+  DELIBERATE, documented in `daemon_policy_invalidate.go` (overloaded wire value,
+  fail-safe under-clear). M01 single-read bpfShim add = DELIBERATE, documented in
+  `policycounters.go:201` (bpfShim never incremented in userspace mode →
+  contributes zero; retained for legacy API parity). M05/L10/L15 host-inbound
+  exotic-zone counter collision + hash-suffix/side-table = DELIBERATE, documented
+  in `nftables/host_inbound_counters.go` (hash suffix explicitly rejected;
+  bounded metric-aggregation artifact, no forwarding/security impact). M07
+  bulk-reader migration = ALREADY-COMPLETE (all six observability surfaces use
+  `NewPolicyCounterReader`). L08 static canary = ALREADY-DONE
+  (`policies_bulk_reader_test.go` x3 across api/cli/grpcapi). M03/L01 multi-zone
+  scope + reserve-id-0 = NEEDS-RESEARCH (deferred). L02/L03 loss-cluster smokes =
+  lab-blocked. L06/L07/L14 = refactors (out of scope this pass).
+
+## 2026-07-07 — #4373 (Phase-0, E4/H2/H7): match-policies route-drop-before-policy advisory
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the Go-side Phase-0 slice of #4373 (reject/filter/PBR log
+  confusion). The driveable Go item is the E4/H2/H7 "same remedy" simulator
+  half: `show security match-policies` / `test policy` / REST / gRPC returned a
+  permit/deny verdict for a destination the transit forwarding path drops at
+  ROUTE LOOKUP before policy runs (multicast / limited broadcast / unspecified /
+  loopback), so the verdict — and a filter `then accept; then log` for the same
+  tuple — over-promised forwarding the dataplane never performs.
+  - Added `Result.RouteDropBeforePolicy` + `RouteDropClass` + `RouteDropNote()`
+    SSOT + `routeDropClass()` helper in `pkg/policymatch/policymatch.go`; `Match`
+    became a named-return and stamps the advisory on EVERY transit verdict path
+    (matched + default + content-rejected) via a defer. `to-zone junos-host` is
+    exempt (local-delivery gate, not transit route lookup); a nil dst (omitted
+    selector) is NOT classified as `0.0.0.0`.
+  - Surfaced the advisory on all four live surfaces from one wording: local CLI
+    (`pkg/cli/cli_show_security.go`, `cli_request.go`), remote CLI
+    (`cmd/cli/show.go`), REST (`pkg/api/types.go` + `security.go`,
+    `route_drop_*` JSON fields), gRPC (`proto` fields 22-24 +
+    `pkg/grpcapi/server_cluster.go`).
+  - VERIFIED already-handled (disproving file:line): E1 (reject vs
+    session-close) does NOT reproduce — `pkg/logging/ringbuf.go` renders
+    `FILTER_LOG` with `action=reject` + `source=pbr|input|output`
+    (`actionName`/`filterLogSourceName`), `SESSION_CLOSE` omits `action`
+    (#2513), and `POLICY_DENY` carries a distinct `reason` (#3610), so
+    filter-reject / policy-deny / teardown are already distinguishable.
+  - DEFERRED to Rust (cargo lane busy, do-not-run): the dataplane NoRoute/martian
+    drop COUNTER for E4/H2/H7 (so a live filter-accept log has a matching
+    visible drop) — the userspace-dp half of the same remedy.
+  - RED-on-revert: `pkg/policymatch/route_drop_4373_test.go` — neutralizing the
+    Match stamping reddens the multicast/broadcast/unspecified/loopback rows.
+    `go test` green (policymatch, cli, cmd/cli, api, grpcapi, logging); gofmt
+    clean; `make proto` regen additive-only.
+- **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/route_drop_4373_test.go (new), pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, cmd/cli/show.go, pkg/api/types.go, pkg/api/security.go,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, docs/junos-cli-reference.md, _Log.md
+## 2026-07-07 — #4410 (avo-review-001 F4/F8): app protocol-less ICMP reject hint + wildcard config-order test
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the four dropped avo-review-001 findings (F4/F5/F7/F8) to
+  terminal, verifying each against origin/master first (the review source is
+  historically ~98% low-signal, so each was weight-verified hard).
+  - **F4 (Low, GENUINE — fixed)**: a protocol-less `applications application`
+    that carries an `icmp-type` / `icmp-code` constraint is rejected by the
+    #3109 "no protocol specified" gate (`validateApplicationSpecsStrict`,
+    compiler_validate_strict_application.go), but the message did NOT name the
+    icmp-type the operator had already set — it just said "set a protocol".
+    Added an `icmpConstraintDesc` helper and appended a targeted hint naming
+    the concrete `icmp-type N [icmp-code M]` and pointing at `protocol icmp` /
+    `icmpv6`. Non-ICMP protocol-less apps get the byte-identical message
+    (empty hint). RED-on-revert test
+    `TestApplicationProtocolLessICMPType_RejectNamesConstraint` (the bare
+    message never contains "icmp-type 8").
+  - **F5 (Low, ALREADY-FIXED by #3363)**: the implicit default-policy hit
+    counter IS emitted as a Prometheus `xpf_policy_hits_total` series labeled
+    `-`/`-`/`default-policy` (metrics_counters.go collectPolicyCounters, read
+    via `dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID)`). No change.
+  - **F7 (Low, NOT-MATERIAL)**: `pkg/policymatch.normalizePortAlias` is
+    case-sensitive, but `resolveAppPort` (compiler_applications.go) canonicalizes
+    EVERY named port alias to its numeric value at compile time,
+    case-insensitively (`junosServicePorts[strings.ToLower(...)]`) — for both
+    direct-match and inline-term ports. By the time `portMatches` reads
+    `app.DestinationPort`/`app.SourcePort` the value is numeric ("443"), so the
+    alias branch is never reached. Verified empirically
+    (resolveAppPort("HTTPS")=="443"). No change.
+  - **F8 (test-coverage, GENUINE — added)**: the single-wildcard tier
+    (`from-zone any to-zone X` + `from-zone X to-zone any`) merges in config
+    order, but the only existing test's winner was ALSO config-first — equally
+    consistent with a buggy "from-any bucket always wins". Added the SWAPPED
+    companion case to `TestWildcardZoneAndScopedGlobalPrecedence`
+    (wildcard_scoped_test.go) pinning genuine config-order interleaving.
+    Verified it goes RED under a two-pass (from-any-first) merge while the
+    prior case stays green.
+- **File(s)**: pkg/config/compiler_validate_strict_application.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/policymatch/wildcard_scoped_test.go, _Log.md
+- **Validation**: `go test ./pkg/config/ ./pkg/policymatch/` green; `go build
+  ./...`, `go vet`, `gofmt -l` all clean. No docs change: the exact reject
+  strings are not enumerated in docs/ (config-schema.md's icmp-type section
+  covers firewall filters, #3205, a different gate).
+
+## 2026-07-07 — #4411 (avo-review-002 A4/A6): host-inbound + policymatch test-coverage locks
+
+- **Timestamp**: 2026-07-07
+- **Action**: Closed the two GO-testable test-coverage gaps from #4411
+  (avo-review-002 dropped findings A2/A4/A5/A6). Verified each vs
+  origin/master first.
+  - A4 (Go, ADDED): `host-inbound-traffic protocols all` + `system-services
+    ssh` boundary was untested at the `ClassifyHostInbound` classifier.
+    `protocols all` is deliberately NOT a full admit (#3199) — it expands to the
+    routing-protocol set, not arbitrary L4 ports. New test asserts ssh (tcp/22)
+    admits via system-services, bgp (tcp/179) admits via `protocols all`
+    (token "all"/protocols), and tcp/9999 is DENIED — the negative boundary that
+    `protocols all` does not over-admit. Mutation-verified: making
+    `HostInboundProtocolMatch("all")` a catch-all TCP match reddens the denied
+    row. Existing host_inbound_classify_3627_test.go covered ssh+ping+bgp and
+    `system-services all` full-admit, but never paired `protocols all` with a
+    service.
+  - A6 (Go, ADDED): a `test security match-policies` query that OMITS a
+    from-zone/to-zone selector passes an EMPTY-STRING zone to
+    policymatch.Match; it must fall through the `!zoneKnown` guard to the
+    configured default-policy, never be read as wildcard-any and match a
+    `from-zone any to-zone any` rule. New table-driven test (both empty / from
+    empty / to empty + a defined-pair positive control) locks it. Mutation-
+    verified: making zoneKnown treat "" as known routes the empty-zone cases into
+    the Tier 3 both-any permit -> RED. undefined_zone_3355_test.go covered
+    non-empty undefined zones and the empty-Zones config but not the empty-string
+    selector class.
+  - A2 (Rust follow-up, NOT done here): asserting the `then reject` ICMP output
+    bytes (type 3 code 13 / ICMPv6 type 1 code 1, TCP RST) is a userspace-dp
+    behavior (afxdp/icmp.rs build_reject_icmp_unreachable); its existing tests
+    assert is_some/is_none, not the emitted type/code. Needs a cargo test.
+  - A5 (Rust follow-up, NOT done here): NAT64 port preservation feeding the
+    app-catalog lookup is a pure userspace-dp integration (nat64.rs translation
+    + AppCatalog::lookup); no Go seam. Needs a cargo test.
+  Tests-only, no production change (no bug surfaced — regression-safety-net
+  gaps). go test green on pkg/policymatch, pkg/dataplane/userspace, pkg/config;
+  go build ./... clean; gofmt/vet clean.
+- **File(s)**: pkg/dataplane/userspace/host_inbound_protocols_all_4411_test.go
+  (new), pkg/policymatch/empty_zone_4411_test.go (new), _Log.md
+## 2026-07-07 — #4412 (avo-review-007 backlog E3): document flow-based FBF/PBR
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the avo-review-007 dropped-findings backlog (#4412).
+  Verified each of E2/E3/E5/E7/H1/H4/H6 against origin/master. Only E3
+  needed a change: it is a verified-CORRECT documentation gap — the FBF
+  (`then routing-instance`) steer is decided on the first packet of a
+  flow and cached in the session (`ingress_route_table_override` runs on
+  the session miss; `resolve_flow_session_decision` returns the cached
+  egress/VRF on every hit without re-running the filter, per
+  `userspace-dp/src/afxdp/forwarding/README.md:226-233`). Editing the
+  FBF filter therefore does NOT re-steer live flows, a firewall-filter
+  commit does not clear sessions (only `policy-rematch` re-evaluates
+  security POLICIES), and per-packet-L4 FBF terms (tcp-flags /
+  is-fragment / icmp-*) are the cache-sensitive exception. This was only
+  in the dataplane dev README; added an operator-facing note to the FBF
+  section of `docs/multi-wan.md`.
+  Dispositions of the rest (recorded on #4412): E5 ALREADY-FIXED
+  (`TestMatchPoliciesGRPCHostInboundOffHostOmitted` +
+  `TestMatchPoliciesDefaultUsedTyped`); E2/E7/H1/H4/H6 are userspace-dp
+  Rust dataplane test-coverage items (afxdp/filter cargo suites) — filed
+  as follow-ups (cargo lane busy, not run here).
+- **File(s)**: docs/multi-wan.md, _Log.md
+- **Validation**: docs-only change; `go build ./...` + `go vet` green
+  (no Go source touched); gofmt clean.
+
+## 2026-07-07 — #4482 (opus-172 M-5): FRR set-clause/prefix-list sanitize-belt bypass
+
+- **Timestamp**: 2026-07-07
+- **Action**: Closed the residual #4097 sanitize-belt bypass on the
+  tolerant-load path (Medium, config-injection). #4097 wrapped the
+  `bgp community-list` / `bgp as-path access-list` DEFINITIONS in
+  sanitizeFRRValue but left the route-map `set community` /
+  `set community additive` / `set comm-list delete` / `set as-path
+  prepend` clauses, the `match community` / `match as-path` names, and
+  the `ip/ipv6 prefix-list ... permit <prefix>` entries (top-level and
+  inline route-filter) rendering with a bare %s — so a leniently-loaded /
+  peer-synced / rolled-back value with an embedded newline could inject a
+  standalone frr.conf command (the strict #1798 commit gate only warns on
+  those paths, #1960). Routed ALL those free-text slots through
+  sanitizeFRRValue, so every FRR-rendered value is sanitized regardless of
+  load path. No-op for clean values (rest-of-line tokens keep legitimate
+  spaces), so existing output is byte-identical.
+- **File(s)**: pkg/frr/policy_render.go,
+  pkg/frr/policy_setclause_injection_4482_test.go, pkg/frr/README.md
+- **Validation**: RED-on-revert unit test
+  (`TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482`) —
+  set-community / set-as-path-prepend / prefix-list injection payloads
+  collapse onto their single directive lines with no standalone
+  `router bgp` / `neighbor` line; reverting any wrapped site turns it RED.
+  Full pkg/frr suite green, go build, gofmt + vet clean.
+
+## 2026-07-07 — #4481 (opus-172 M-4): FRR cross-context route-map default-action leak
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the FRR cross-context route-map default-action leak
+  (Medium). FRR route-maps are keyed by NAME — one object shared across
+  every use site — so a policy-statement applied BOTH as a BGP route-map
+  in/out (trailing PERMIT, Junos BGP default-accept #2998) AND as an IGP
+  `redistribute` export (Junos default REJECT) let the BGP accept-all
+  govern the redistribute too, leaking every non-matching prefix into the
+  IGP. Fix renders a per-use-site fail-closed alias: `generatePolicyOptions`
+  emits the base `route-map <name>` (permit default for BGP) AND, when
+  `policyNeedsRedistAlias` holds (name in the GLOBAL `bgpAcceptDefault`
+  union with no explicit default), a second `route-map <name>-xpf-redist`
+  with the fail-closed trailing `deny`; `resolveRedistribute` points the
+  `redistribute <proto> route-map` line at that alias while the BGP
+  neighbor keeps referencing the permit-default base. Extracted the
+  ~400-line per-policy body into `renderRouteMapForPolicy(po, emitName,
+  ps, trailingAction)` so base + alias share identical terms/match/set
+  clauses (inline route-filter prefix-lists derive from `emitName`, so the
+  alias is self-contained) and differ only in header name + trailing
+  default; existing #2607/#2642/#2998 output stays byte-identical.
+  `buildManagedSection` computes the GLOBAL `bgpAcceptDefault` union once
+  (default instance + every VRF) and threads it into BOTH
+  `generatePolicyOptions` AND `generateProtocols`→`resolveRedistribute`
+  (new param), so cross-instance dual-use aliases correctly.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/manager.go,
+  pkg/frr/policy_routemap_leak_4481_test.go, pkg/frr/README.md,
+  ~90 test-caller signature updates in pkg/frr/*_test.go
+- **Validation**: RED-on-revert unit test
+  (`TestBuildManagedSection_CrossContextRouteMapNoLeak_4481`) —
+  redistribute references the fail-closed `SHARED-xpf-redist` alias, base
+  BGP map keeps its trailing permit; reverting the alias reference +
+  emission turns it RED. `go test ./pkg/frr/...` green, `go build`,
+  gofmt + vet clean.
 
 ## 2026-07-07 — Fix TestUserspaceLinkCycleDoesNotReenterLegacyLoader stale file target after #4462 process.go split
 
@@ -39256,3 +39499,31 @@ top.
   vet + gofmt clean. Doc: docs/sync-protocol.md #4090 re-drive section.
 - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
   pkg/cluster/sync_test.go, docs/sync-protocol.md, _Log.md
+
+## 2026-07-07 — #4365 global-policy scope tier cross-language regression matrix (Go)
+- **Timestamp**: 2026-07-07
+- **Action**: Added a mirror-ready SSOT regression matrix locking the #3148
+  global-policy `match from-zone`/`match to-zone` scope tier (Tier 4,
+  `globalScopeMatches`) in the shared policymatch simulator. avo-review-001 F1
+  flagged that `TestSharedMatcherRegressionMatrix` had ZERO global-scope cases,
+  so a future change to the Go simulator OR the Rust dataplane
+  (`userspace-dp/src/policy.rs GlobalZoneScope::matches`) could silently diverge
+  — the simulator backs `show security match-policies` while the Rust path is
+  the only forwarding path. New sibling table-driven test
+  `TestSharedMatcherGlobalScopeRegressionMatrix` asserts the FULL verdict
+  contract (Matched/Global/Action/PolicyName, the #3331 from/to-zone SCOPE, and
+  the shared `RuntimePolicyIDs` PolicyID at the matched rule's [set,slice]
+  coordinate) across: (a) both-axis scope match permits; (a') global-set index
+  tracks len(Policies) with a provably nonzero ID behind a preceding zone-pair
+  set; (b/b') non-matching from-/to-zone scope falls to default; (b'')
+  undefined/typo'd scope fails CLOSED; (c) empty scope == any; (c') explicit
+  any/any preserved in scope; (c''/c''') partial from-zone-only scope; (d) exact
+  zone-pair (Tier 1) outranks a matching scoped global; (d') both-any wildcard
+  (Tier 3) outranks a matching global (the "precedence after both-any" lock).
+  Tests-only, no production change (no bug surfaced — the scope logic is
+  correct; this is a regression-safety-net gap). Mutation-verified load-bearing:
+  widening `globalScopeMatches` to always-match turns the non-matching-scope
+  cases RED. F2 (Rust mirror) and F3 (CLI ICMP query) are out of scope for this
+  Go-only pass. README updated with the new lock's description.
+- **File(s)**: pkg/policymatch/global_scope_regression_4365_test.go (new),
+  pkg/policymatch/README.md, _Log.md

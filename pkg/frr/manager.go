@@ -427,8 +427,13 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	// + every VRF) so a BGP policy with no explicit default action renders a
 	// terminating `permit` (Junos BGP default-accept) rather than FRR's
 	// implicit deny — preventing a non-matching-route blackhole (#2998).
+	// bgpAcceptDefault is the GLOBAL union (default instance + every VRF) of
+	// policy-statements applied as a BGP route-map in/out. It drives both the
+	// #2998 trailing-permit default AND the #4481 per-use-site fail-closed
+	// redistribute alias, so it is computed once here and threaded into
+	// generatePolicyOptions AND generateProtocols (resolveRedistribute) below.
+	bgpAcceptDefault := make(map[string]bool)
 	if fc.PolicyOptions != nil {
-		bgpAcceptDefault := make(map[string]bool)
 		collectBGPRouteMapPolicies(fc.BGP, fc.PolicyOptions, bgpAcceptDefault)
 		for _, inst := range fc.Instances {
 			collectBGPRouteMapPolicies(inst.BGP, fc.PolicyOptions, bgpAcceptDefault)
@@ -452,13 +457,13 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 
 	// 11. Global dynamic protocols
 	if fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil {
-		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions, bfdSec))
+		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions, bgpAcceptDefault, bfdSec))
 	}
 
 	// 12. Per-VRF dynamic protocols
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil {
-			b.WriteString(m.generateProtocols(inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS, inst.VRFName, ecmpMaxPaths, fc.PolicyOptions, bfdSec))
+			b.WriteString(m.generateProtocols(inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS, inst.VRFName, ecmpMaxPaths, fc.PolicyOptions, bgpAcceptDefault, bfdSec))
 		}
 	}
 

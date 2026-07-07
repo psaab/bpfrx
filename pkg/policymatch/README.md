@@ -438,3 +438,15 @@ The regression matrix from the issue is pinned in `policymatch_test.go`
 (`TestSharedMatcherRegressionMatrix`), and `TestOldNarrowMatcherDiverges` is
 the concrete fail-on-revert artifact proving the old per-surface logic returns
 the opposite verdict on the affected cases.
+
+The #3148 global-policy `match from-zone`/`match to-zone` scope tier (Tier 4)
+has its own cross-language SSOT lock in
+`global_scope_regression_4365_test.go` (`TestSharedMatcherGlobalScopeRegression`
+`Matrix`, #4365): a table of vectors that assert the full verdict contract
+(`Matched`/`Global`/`Action`/`PolicyName`, the #3331 from/to-zone SCOPE, and the
+`RuntimePolicyIDs` `PolicyID`) for a matching scope, a non-matching scope
+(from-, to-, and undefined/fail-closed), an empty/`any` scope spanning all
+zones, and tier precedence (a matching exact zone-pair and a matching both-any
+wildcard each outrank a matching scoped global). The Rust dataplane
+(`userspace-dp/src/policy.rs` `GlobalZoneScope::matches`) mirrors these vectors
+so the simulator and the wire cannot diverge on the scoped-global tier.

@@ -378,6 +378,43 @@ counted on the PBR fast path and exported as
 `xpf_filter_hits_total{filter,family,term}` — the steering-volume
 counter per FBF policy.
 
+### FBF is flow-based — the steer is decided once, on the first packet
+
+The FBF (`then routing-instance`) decision is made on the **first
+packet of a flow** (the session miss), when the ingress filter runs and
+`ingress_route_table_override` selects the routing-instance. That
+egress/VRF resolution is cached in the session; every subsequent packet
+of the same flow takes the established fast path
+(`resolve_flow_session_decision`), which returns the cached decision
+**without re-running the filter**. Consequences the operator should
+expect:
+
+- **Editing the FBF filter (or the steered instance's routes) does NOT
+  retroactively re-steer live flows.** An established session keeps the
+  routing-instance it was assigned at flow start until it ages out at
+  the inactivity timeout or is cleared. Only NEW flows pick up the new
+  steering. This is deliberate flow-based behavior, identical in
+  substance to the ip-monitoring case in *Session behavior on uplink
+  transition* below — SRX behaves the same way.
+- **A firewall-filter commit does not clear sessions.** `policy-rematch`
+  re-evaluates security POLICIES, not FBF filters, so there is no
+  session invalidation on a filter change. `clear security flow
+  session` (e.g. `... zone <ingress>` or a NAT-pool / 5-tuple filter)
+  is THE mechanism to force live flows onto a changed FBF steer.
+- **Exception — per-packet-L4 FBF terms are cache-sensitive.** A steer
+  whose `from` carries `tcp-flags` / `is-fragment` / `icmp-type` /
+  `icmp-code` declines the flow cache and is re-evaluated per packet
+  (`docs/feature-gaps.md`, path (b) of the #1431 runbook); a config
+  rotation purges those affected sessions, so they DO pick up a changed
+  steer. A steer matching only on the 5-tuple / DSCP is the cached case
+  above.
+- **After HA failover the FBF decision is preserved.** A peer-synced
+  session carries the primary's FBF-derived egress, so the new primary
+  keeps steering the flow to the same routing-instance (the synced
+  session resolves lookup-first but inherits the stored PBR-derived
+  egress zone from the primary). New flows on the new primary use its
+  own FBF config.
+
 ### Two-upstream lab (test/incus)
 
 `test/incus/fbf-two-upstream-config.set` layers the recipe above onto

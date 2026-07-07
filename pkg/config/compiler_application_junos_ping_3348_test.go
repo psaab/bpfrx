@@ -156,6 +156,40 @@ func TestApplicationICMPCodeWithoutType_Rejected(t *testing.T) {
 	}
 }
 
+// #4410 (F4): a protocol-less application that carries an icmp-type / icmp-code
+// constraint is rejected by the #3109 "no protocol specified" gate. The reject
+// message must NAME the icmp-type/icmp-code the operator already set — an
+// operator who typed `icmp-type 8` and forgot `protocol` should be pointed at
+// `protocol icmp` / `icmpv6`, not just told to "set a protocol". Fail-on-revert:
+// without the icmpConstraintDesc hint the message omits the concrete
+// `icmp-type 8` token and these assertions go RED (the bare "no protocol"
+// message never contains "icmp-type 8").
+func TestApplicationProtocolLessICMPType_RejectNamesConstraint(t *testing.T) {
+	cases := []struct {
+		name  string
+		props []string
+		want  string
+	}{
+		{"icmp-type only", []string{"icmp-type 8"}, "icmp-type 8"},
+		{"icmp-type + icmp-code", []string{"icmp-type 8", "icmp-code 0"}, "icmp-type 8 icmp-code 0"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tree := flatTreeFromSets(t, refApp("pinglike", c.props...)...)
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("expected commit to REJECT protocol-less icmp-type application")
+			}
+			if !strings.Contains(err.Error(), "no protocol specified") {
+				t.Fatalf("error should still be the no-protocol reject, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("reject message must name the ICMP constraint %q, got: %v", c.want, err)
+			}
+		})
+	}
+}
+
 // #3348 inline-term edge case 1 (widening INVERSION): an inline term that
 // lists BOTH a junos-ping alias AND an unconstrained ICMP alias normalizes both
 // to "icmp" and dedups to ONE term. The union of "echo" and "all-ICMP" is
