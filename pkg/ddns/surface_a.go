@@ -506,19 +506,43 @@ func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients 
 		return nopUpdater{}, nil
 	}
 	// httpClientFor pulls the cached bound client for this provider's binding
-	// when a cache is present, else returns nil (the constructor then builds its
-	// own). A bind-resolution error fails open to the unbound client AND is
-	// logged here once; the constructor degrades the same way it did pre-cache.
-	httpClientFor := func() *http.Client {
+	// when a cache is present, else returns (nil, nil) so the backend constructor
+	// builds — and fail-closes on — its own client via newProviderHTTPClient.
+	//
+	// FAIL-CLOSED on a cached-client source-bind error (#4437): clients.clientFor
+	// returns the UNBOUND default client ALONGSIDE the bind-resolution error (a
+	// malformed / unusable source-address). Earlier this path swallowed that
+	// error, logged a warning, and threaded the unbound client into the backend —
+	// so a provider that configured a `source-address` silently published from the
+	// DEFAULT ROUTE (the wrong source / interface the operator explicitly
+	// overrode). The error is now PROPAGATED, not swallowed: httpBackend turns it
+	// into the no-op publisher (newSurfaceAHTTP) and the reconcile SKIPS the
+	// publish — never a withdraw — exactly as the nil-cache path already does
+	// (newProviderHTTPClient surfaces the same error from inside the constructor)
+	// and as the checkip observer's CheckIPBound gate (#3733). A publish with a
+	// configured source-address that cannot be honored is an error, not a silent
+	// use-default.
+	httpClientFor := func() (*http.Client, error) {
 		if clients == nil {
-			return nil
+			return nil, nil
 		}
-		cl, err := clients.clientFor(p)
-		if err != nil {
-			slog.Warn("ddns surface-a: HTTP source bind unusable; using unbound client",
-				"provider", p.Name, "err", err)
-		}
-		return cl
+		return clients.clientFor(p)
+	}
+	// httpBackend resolves the source-bound client FIRST (fail-closed on a bind
+	// error) and only then builds the HTTP backend. Resolving the client before
+	// the constructor is what keeps the unbound fail-open client from ever being
+	// threaded in: on a bind error the constructor is never reached, so
+	// newSurfaceAHTTP degrades to the no-op backend and the publish is skipped.
+	httpBackend := func(build func(*http.Client) (DNSUpdater, error)) (DNSUpdater, error) {
+		return newSurfaceAHTTP(p, func() (DNSUpdater, error) {
+			cl, err := httpClientFor()
+			if err != nil {
+				return nil, fmt.Errorf("ddns surface-a: provider %q source bind "+
+					"unusable; refusing to publish from the unbound default route: %w",
+					p.Name, err)
+			}
+			return build(cl)
+		})
 	}
 	switch p.Backend {
 	case "rfc2136", "":
@@ -527,15 +551,15 @@ func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients 
 		}
 		return newSurfaceARFC2136(p, fqdn)
 	case "dyndns2":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDyndns2Backend(p, httpClientFor()) })
+		return httpBackend(func(cl *http.Client) (DNSUpdater, error) { return newDyndns2Backend(p, cl) })
 	case "duckdns":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newDuckDNSBackend(p, httpClientFor()) })
+		return httpBackend(func(cl *http.Client) (DNSUpdater, error) { return newDuckDNSBackend(p, cl) })
 	case "cloudflare":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newCloudflareBackend(p, httpClientFor()) })
+		return httpBackend(func(cl *http.Client) (DNSUpdater, error) { return newCloudflareBackend(p, cl) })
 	case "route53":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newRoute53Backend(p, httpClientFor()) })
+		return httpBackend(func(cl *http.Client) (DNSUpdater, error) { return newRoute53Backend(p, cl) })
 	case "generic":
-		return newSurfaceAHTTP(p, func() (DNSUpdater, error) { return newGenericBackend(p, httpClientFor()) })
+		return httpBackend(func(cl *http.Client) (DNSUpdater, error) { return newGenericBackend(p, cl) })
 	default:
 		slog.Warn("ddns surface-a: unknown provider backend; publishing nothing",
 			"provider", p.Name, "backend", p.Backend)
