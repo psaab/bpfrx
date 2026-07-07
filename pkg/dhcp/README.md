@@ -164,6 +164,16 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   address reconciliation on DHCP-marked interfaces.
 - DHCP-learned default routes go into FRR with admin distance 200 — lower
   priority than static routes, so a configured static default wins.
+- **DHCPv6 IA_NA holds one address, selected deterministically** (#4383):
+  a reply may carry multiple IAADDR options within an IA_NA (and multiple
+  IA_NA options), but xpf's `Lease` model installs a single `/128`.
+  `selectIANAAddress` (`dhcp.go`) chooses one — it skips any IAADDR whose
+  valid-lifetime is 0 (an expired/declined address, RFC 8415 §12.1;
+  ties into F-264), then prefers the longest preferred-lifetime,
+  tie-broken by first-seen (option order). `lease.LeaseTime` is paired
+  with the CHOSEN address's own valid-lifetime, never a stale value from
+  a different IAADDR. This replaced a last-wins overwrite that installed
+  whichever address enumerated last. Pinned by `dhcpv6_iana_test.go`.
 - **RFC 3442 classless static routes (option 121 / legacy 249, #4118).**
   `leaseFromACKv4` parses option 121 (the standard `ClasslessStaticRoute`
   accessor) and falls back to the legacy Microsoft option 249 (raw
