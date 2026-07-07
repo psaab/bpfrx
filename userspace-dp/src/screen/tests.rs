@@ -3997,6 +3997,40 @@ const ZID: u16 = 7;
 /// (#4114). The detection COUNT is the fixed `super::scan::SCAN_DETECT_COUNT`.
 const SWEEP_W: u32 = 5_000;
 
+/// #4379: the window-aware cleanup reap floor is the LONGEST configured
+/// detection window across ALL live profiles, computed independently per check
+/// (port-scan vs ip-sweep). This locks the wiring that feeds
+/// `PortScanTracker::cleanup` / `IpSweepTracker::cleanup` their reap floor so a
+/// slow scan within an operator window > 1s is not reaped early (the #4379
+/// evasion). A disabled check (window 0) contributes nothing.
+#[test]
+fn scan_cleanup_floors_are_max_configured_window() {
+    let mut state = ScreenState::new();
+    let mut profiles = FxHashMap::default();
+    // zone "a": port-scan 5s, ip-sweep 2s.
+    let mut a = ScreenProfile::default();
+    a.port_scan_threshold = 5_000_000;
+    a.ip_sweep_threshold = 2_000_000;
+    profiles.insert("a".to_string(), a);
+    // zone "b": port-scan 1s, ip-sweep 9s. The floor must be the MAX across
+    // zones per check: port=5s (from a), sweep=9s (from b).
+    let mut b = ScreenProfile::default();
+    b.port_scan_threshold = 1_000_000;
+    b.ip_sweep_threshold = 9_000_000;
+    profiles.insert("b".to_string(), b);
+    // zone "c": both disabled — must not lower the max.
+    profiles.insert("c".to_string(), ScreenProfile::default());
+    state.update_profiles(profiles);
+
+    let (port_floor, sweep_floor) = state.scan_cleanup_floors();
+    assert_eq!(port_floor, 5_000_000, "port floor = max port_scan window");
+    assert_eq!(sweep_floor, 9_000_000, "sweep floor = max ip_sweep window");
+
+    // No profiles at all → both floors 0 (cleanup then reclaims idle state).
+    state.update_profiles(FxHashMap::default());
+    assert_eq!(state.scan_cleanup_floors(), (0, 0));
+}
+
 #[test]
 fn port_scan_detected() {
     let mut profile = ScreenProfile::default();

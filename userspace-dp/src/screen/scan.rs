@@ -58,12 +58,21 @@
 //!   `scan-table-pressure` screen event (see `take_pressure_event`) so the
 //!   operator is told the detector is saturated — never a per-flow log.
 //!
-//! - **Budgeted cleanup.** The periodic sweep walks the source table
-//!   (`HashMap::retain`, O(sources)) but removes at most `CLEANUP_BUDGET`
-//!   expired entries per call, so the per-tick MUTATION cost is bounded even
-//!   though the scan is not. The real ceiling on the walk is the
-//!   `MAX_SOURCES_PER_ZONE` per-zone source cap, which bounds the table size
-//!   itself; the budget just spreads reclamation across ticks.
+//! - **Budgeted, window-aware cleanup (#4353/#4379).** The periodic sweep
+//!   walks the source table (`HashMap::retain`, O(sources)) but removes at
+//!   most `CLEANUP_BUDGET` expired entries per call, so the per-tick MUTATION
+//!   cost is bounded even though the scan is not. The real ceiling on the walk
+//!   is the `MAX_SOURCES_PER_ZONE` per-zone source cap, which bounds the table
+//!   size itself; the budget just spreads reclamation across ticks. The reap
+//!   floor is WINDOW-AWARE: #4353 made the `threshold` a configurable
+//!   MICROSECOND detection window that the compiler PRESERVES even above the
+//!   Junos 1s max, so cleanup is passed the LONGEST configured window across
+//!   the live profiles (clamped to `MAX_CLEANUP_WINDOW_MICROS`) as its floor.
+//!   A fixed 1s floor (the pre-#4379 shape) reaped an accumulating
+//!   distinct-destination set before the detection count was reached for any
+//!   operator window > 1s, so a slow scan spread across the configured window
+//!   EVADED detection (fail-open); the window-aware floor retains state for
+//!   the full configured window.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::IpAddr;
@@ -117,15 +126,27 @@ const EVICT_SCAN_LIMIT: usize = 64;
 /// `pkg/config/compiler_security_screen.go`. The two MUST stay in sync.
 pub(super) const SCAN_DETECT_COUNT: usize = 10;
 
-/// Conservative upper bound (microseconds) on any configurable detection
-/// window, used ONLY by the periodic, zone-agnostic [`ScanCore::cleanup`] to
-/// decide an entry is dead weight. It equals the Junos maximum `threshold`
-/// (1_000_000 us = 1s); an entry untouched for longer than this is expired
-/// under every in-range per-zone window, so cleanup can reclaim it without
-/// knowing each entry's per-zone window. The inline window reset in
-/// [`ScanCore::check`] and the eviction path use the exact per-zone
-/// `window_micros`; this constant is only the cleanup floor.
-const CLEANUP_WINDOW_MICROS: u64 = 1_000_000;
+/// Documented UPPER BOUND (microseconds) on the window-aware cleanup reap
+/// floor (#4379). The periodic, zone-agnostic [`ScanCore::cleanup`] is now
+/// passed the LONGEST configured detection window across the live screen
+/// profiles as its reap floor (so a legitimate multi-second slow-scan window
+/// is not reaped early — the #4379 evasion), but that floor is clamped here so
+/// a fat-fingered / absurd window cannot make the sweep retain dead-weight
+/// state for an unbounded time.
+///
+/// Why a ceiling is safe: the detection `threshold` is operator-configurable
+/// and the compiler warns-but-PRESERVES values above the Junos 1s maximum
+/// (`pkg/config/compiler_security_screen.go`), so a config could name a
+/// u32-max (~71 min) window. Honouring that verbatim as a reap floor would let
+/// dead-weight entries linger for over an hour. 5 minutes comfortably exceeds
+/// any realistic scan/sweep detection window (the Junos in-range max is 1s;
+/// even a preserved multi-second slow-scan window is far under this) while
+/// bounding the pathological case. This is a RECLAMATION-TIMING bound only:
+/// the per-source / per-zone memory caps ([`MAX_UNIQUE_PER_SOURCE`] /
+/// [`MAX_SOURCES_PER_ZONE`]) bound memory regardless of the window, and the
+/// exact per-zone `window_micros` still governs the inline reset/verdict in
+/// [`ScanCore::check`] and the eviction path.
+const MAX_CLEANUP_WINDOW_MICROS: u64 = 300_000_000;
 
 /// Compile-time guard: the eviction sample must be smaller than the per-zone
 /// source cap, otherwise the "sample a prefix" bound would be meaningless
@@ -346,21 +367,29 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     /// decremented for each removed key so the eviction cap test stays exact.
     ///
     /// `now_micros` is the monotonic microsecond clock. This periodic sweep is
-    /// zone-agnostic (it has no single per-zone `window_micros`), so it uses
-    /// the conservative [`CLEANUP_WINDOW_MICROS`] floor: an entry untouched for
-    /// longer than the Junos maximum window is dead under every in-range
-    /// per-zone window. The exact per-zone window still governs the inline
-    /// reset/verdict in [`ScanCore::check`]; cleanup only reclaims memory.
+    /// zone-agnostic (it has no single per-zone `window_micros`), so the caller
+    /// passes `reap_floor_micros` — the LONGEST configured detection window
+    /// across the live screen profiles (#4379). An entry untouched for longer
+    /// than the longest window is dead under EVERY per-zone window, so cleanup
+    /// can reclaim it. Using the fixed 1s Junos-max floor (the pre-#4379 shape)
+    /// reaped an accumulating set before the detection count was reached for
+    /// any operator window > 1s → a slow scan spread across the configured
+    /// window EVADED detection (fail-open). The floor is clamped to
+    /// [`MAX_CLEANUP_WINDOW_MICROS`] so a pathological (fat-fingered) window
+    /// cannot make the sweep retain dead weight indefinitely; memory is
+    /// independently bounded by the per-source/zone caps regardless. The exact
+    /// per-zone window still governs the inline reset/verdict in
+    /// [`ScanCore::check`]; cleanup only reclaims memory.
     #[inline]
-    fn cleanup(&mut self, now_micros: u64) {
+    fn cleanup(&mut self, now_micros: u64, reap_floor_micros: u64) {
+        let floor = reap_floor_micros.min(MAX_CLEANUP_WINDOW_MICROS);
         let mut removed = 0usize;
         let per_zone_count = &mut self.per_zone_count;
         self.per_src.retain(|key, (start, set)| {
             if removed >= CLEANUP_BUDGET {
                 return true; // budget exhausted — keep the rest for next tick
             }
-            let expired =
-                now_micros.saturating_sub(*start) >= CLEANUP_WINDOW_MICROS || set.is_empty();
+            let expired = now_micros.saturating_sub(*start) >= floor || set.is_empty();
             if expired {
                 removed += 1;
                 if let Some(c) = per_zone_count.get_mut(&key.0) {
@@ -426,9 +455,10 @@ impl PortScanTracker {
     }
 
     /// Remove expired entries (budgeted periodic cleanup). `now_micros` is a
-    /// monotonic microsecond clock.
-    pub(super) fn cleanup(&mut self, now_micros: u64) {
-        self.core.cleanup(now_micros);
+    /// monotonic microsecond clock; `reap_floor_micros` is the window-aware
+    /// reap floor (longest configured port-scan window across profiles, #4379).
+    pub(super) fn cleanup(&mut self, now_micros: u64, reap_floor_micros: u64) {
+        self.core.cleanup(now_micros, reap_floor_micros);
     }
 
     /// Records skipped due to a per-source unique-entry cap or a failed
@@ -480,9 +510,10 @@ impl IpSweepTracker {
     }
 
     /// Remove expired entries (budgeted periodic cleanup). `now_micros` is a
-    /// monotonic microsecond clock.
-    pub(super) fn cleanup(&mut self, now_micros: u64) {
-        self.core.cleanup(now_micros);
+    /// monotonic microsecond clock; `reap_floor_micros` is the window-aware
+    /// reap floor (longest configured ip-sweep window across profiles, #4379).
+    pub(super) fn cleanup(&mut self, now_micros: u64, reap_floor_micros: u64) {
+        self.core.cleanup(now_micros, reap_floor_micros);
     }
 
     /// Records skipped due to a per-source unique-entry cap or a failed
@@ -520,6 +551,12 @@ mod scan_tests {
 
     /// Junos default window (microseconds) used across the windowing tests.
     const W: u64 = 5_000;
+
+    /// The pre-#4379 fixed cleanup floor (the Junos in-range max window, 1s).
+    /// Retained as a test anchor: the budgeted/count cleanup tests age entries
+    /// relative to it and pass it explicitly as the (now window-aware) reap
+    /// floor argument.
+    const OLD_CLEANUP_FLOOR: u64 = 1_000_000;
 
     #[test]
     fn port_scan_keyed_per_zone_no_cross_count() {
@@ -685,7 +722,7 @@ mod scan_tests {
         assert_eq!(t.tracked_sources(), seed);
         // Far past the cleanup window — all are expired, but one sweep removes
         // only up to the budget.
-        t.cleanup(2 * CLEANUP_WINDOW_MICROS);
+        t.cleanup(2 * OLD_CLEANUP_FLOOR, OLD_CLEANUP_FLOOR);
         assert_eq!(t.tracked_sources(), seed - CLEANUP_BUDGET);
     }
 
@@ -854,7 +891,7 @@ mod scan_tests {
         }
         assert_eq!(core.zone_count(5), 10);
         // Age everything out; cleanup removes them and the count follows.
-        core.cleanup(2 * CLEANUP_WINDOW_MICROS);
+        core.cleanup(2 * OLD_CLEANUP_FLOOR, OLD_CLEANUP_FLOOR);
         assert_eq!(core.zone_count(5), 0, "count decremented on cleanup");
         assert_eq!(core.per_src.len(), 0);
     }
@@ -877,6 +914,132 @@ mod scan_tests {
         assert_eq!(
             events, 10,
             "pressure events must be logarithmic in eviction count, got {events}"
+        );
+    }
+
+    /// #4379 fail-on-revert: with an operator-configured detection window LONGER
+    /// than the old fixed 1s cleanup floor, a SLOW scan whose distinct
+    /// destinations are spread across that window (each within the window, the
+    /// span > 1s) must still be DETECTED — the periodic cleanup must NOT reap
+    /// the accumulating tracker state at the old fixed 1s floor. Pre-#4379,
+    /// `cleanup` reaped any entry older than a fixed 1s floor (the historical
+    /// `CLEANUP_WINDOW_MICROS`), so a probe landing >1s after the window opened
+    /// found its distinct-destination set already reclaimed, the count reset to
+    /// 1, and the scan EVADED detection (fail-open). The window-aware floor
+    /// (the configured window) retains the state for the full window. RED on
+    /// revert: the tracker never fires because cleanup drops the state at 1s.
+    #[test]
+    fn slow_scan_within_window_survives_cleanup_reap() {
+        let mut t = IpSweepTracker::default();
+        let src = v4(1);
+        // Operator-configured 5s window (> the old 1s cleanup floor). This is
+        // what #4379 passes to cleanup as the window-aware reap floor.
+        let window = 5_000_000u64;
+        let mut now = 1_000_000u64;
+        let mut fired = false;
+        for i in 0..SCAN_DETECT_COUNT as u32 {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0e00_0000u32 + i));
+            if t.check(0, src, dst, now, window) {
+                fired = true;
+            }
+            // A periodic cleanup fires between probes (production runs it every
+            // >=30s from the new-flow hook). With the window-aware floor the
+            // live entry survives; with the pre-#4379 fixed 1s floor it is
+            // reaped once `now - start >= 1s`, resetting the distinct count.
+            t.cleanup(now, window);
+            now += 250_000; // 250ms between probes → the 10 probes span ~2.25s
+        }
+        assert!(
+            fired,
+            "a slow scan spread across the configured window must be detected: \
+             the cleanup must not reap live tracker state at the old 1s floor"
+        );
+        // Control: reaping at the OLD fixed 1s floor DOES lose the state — this
+        // is exactly the evasion the window-aware floor closes. A fresh tracker
+        // fed the same slow scan but cleaned at the 1s floor never fires.
+        let mut evaded = IpSweepTracker::default();
+        let mut now2 = 1_000_000u64;
+        let mut fired2 = false;
+        for i in 0..SCAN_DETECT_COUNT as u32 {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0e00_0000u32 + i));
+            if evaded.check(0, src, dst, now2, window) {
+                fired2 = true;
+            }
+            evaded.cleanup(now2, OLD_CLEANUP_FLOOR); // pre-#4379 fixed floor
+            now2 += 250_000;
+        }
+        assert!(
+            !fired2,
+            "control: reaping at the fixed 1s floor loses the accumulating set \
+             so the slow scan evades — this is the #4379 fail-open"
+        );
+    }
+
+    /// #4379: a SUB-1s configured window reaps at the WINDOW, not at the old
+    /// fixed 1s floor — idle state is not held longer than the operator's
+    /// window needs. RED on revert: the fixed 1s floor would retain the entry
+    /// (6ms < 1s), so this asserts the floor genuinely tracks the window.
+    #[test]
+    fn small_window_reaps_at_window_not_old_floor() {
+        let mut t = IpSweepTracker::default();
+        let src = v4(1);
+        let window = W; // 5ms — a sub-1s window
+        t.check(0, src, v4(9), 1_000_000, window);
+        assert_eq!(t.tracked_sources(), 1);
+        // 6ms later: past the 5ms window but far under the old 1s floor. The
+        // window-aware floor reaps; the pre-#4379 fixed floor would retain.
+        t.cleanup(1_000_000 + window + 1_000, window);
+        assert_eq!(
+            t.tracked_sources(),
+            0,
+            "a sub-1s window must reap at the window, not be held to the 1s floor"
+        );
+    }
+
+    /// #4379 upper bound: an ABSURD configured window (u32-max, ~71 min) does
+    /// NOT make cleanup retain dead weight indefinitely — the reap floor is
+    /// clamped to `MAX_CLEANUP_WINDOW_MICROS`. An entry older than the ceiling
+    /// is reclaimed even though the raw window is far larger. (Memory is
+    /// independently bounded by the per-source/zone caps regardless; this only
+    /// bounds reclamation TIMING.) Guards against a no-clamp regression: a raw
+    /// 71min floor would retain the entry at now=5min+ε.
+    #[test]
+    fn cleanup_floor_clamped_to_ceiling() {
+        let mut t = IpSweepTracker::default();
+        let src = v4(1);
+        let absurd_window = u64::from(u32::MAX); // ~4295s ~ 71min
+        t.check(0, src, v4(9), 0, absurd_window);
+        assert_eq!(t.tracked_sources(), 1);
+        // now just past the CEILING but far under the raw window: the clamp
+        // makes the entry expired; without the clamp it would survive.
+        t.cleanup(MAX_CLEANUP_WINDOW_MICROS + 1, absurd_window);
+        assert_eq!(
+            t.tracked_sources(),
+            0,
+            "the reap floor must be clamped to the ceiling so an absurd window \
+             cannot retain dead-weight state indefinitely"
+        );
+    }
+
+    /// #4379: the memory caps still bound state independently of the
+    /// window-aware cleanup floor. Even with a huge window (so cleanup would
+    /// retain everything), a single source's unique-entry set is capped at
+    /// `MAX_UNIQUE_PER_SOURCE` and the surplus is counted as pressure — the
+    /// cleanup floor change does not unbound memory.
+    #[test]
+    fn memory_caps_bound_state_under_wide_window() {
+        let mut t = IpSweepTracker::default();
+        let src = v4(1);
+        let wide = MAX_CLEANUP_WINDOW_MICROS; // nothing resets or reaps in-test
+        for i in 0..(MAX_UNIQUE_PER_SOURCE + 50) {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0c10_0000u32 + i as u32));
+            t.check(9, src, dst, 100, wide);
+        }
+        assert_eq!(t.tracked_sources(), 1);
+        assert!(
+            t.skipped_pressure() >= 50,
+            "the per-source set stays capped even under a wide window: {}",
+            t.skipped_pressure()
         );
     }
 }
