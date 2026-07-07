@@ -39223,3 +39223,31 @@ top.
   vet + gofmt clean. Doc: docs/sync-protocol.md #4090 re-drive section.
 - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
   pkg/cluster/sync_test.go, docs/sync-protocol.md, _Log.md
+
+## 2026-07-07 — #4365 global-policy scope tier cross-language regression matrix (Go)
+- **Timestamp**: 2026-07-07
+- **Action**: Added a mirror-ready SSOT regression matrix locking the #3148
+  global-policy `match from-zone`/`match to-zone` scope tier (Tier 4,
+  `globalScopeMatches`) in the shared policymatch simulator. avo-review-001 F1
+  flagged that `TestSharedMatcherRegressionMatrix` had ZERO global-scope cases,
+  so a future change to the Go simulator OR the Rust dataplane
+  (`userspace-dp/src/policy.rs GlobalZoneScope::matches`) could silently diverge
+  — the simulator backs `show security match-policies` while the Rust path is
+  the only forwarding path. New sibling table-driven test
+  `TestSharedMatcherGlobalScopeRegressionMatrix` asserts the FULL verdict
+  contract (Matched/Global/Action/PolicyName, the #3331 from/to-zone SCOPE, and
+  the shared `RuntimePolicyIDs` PolicyID at the matched rule's [set,slice]
+  coordinate) across: (a) both-axis scope match permits; (a') global-set index
+  tracks len(Policies) with a provably nonzero ID behind a preceding zone-pair
+  set; (b/b') non-matching from-/to-zone scope falls to default; (b'')
+  undefined/typo'd scope fails CLOSED; (c) empty scope == any; (c') explicit
+  any/any preserved in scope; (c''/c''') partial from-zone-only scope; (d) exact
+  zone-pair (Tier 1) outranks a matching scoped global; (d') both-any wildcard
+  (Tier 3) outranks a matching global (the "precedence after both-any" lock).
+  Tests-only, no production change (no bug surfaced — the scope logic is
+  correct; this is a regression-safety-net gap). Mutation-verified load-bearing:
+  widening `globalScopeMatches` to always-match turns the non-matching-scope
+  cases RED. F2 (Rust mirror) and F3 (CLI ICMP query) are out of scope for this
+  Go-only pass. README updated with the new lock's description.
+- **File(s)**: pkg/policymatch/global_scope_regression_4365_test.go (new),
+  pkg/policymatch/README.md, _Log.md
