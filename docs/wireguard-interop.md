@@ -550,6 +550,14 @@ in `WgEngine::cookie_gen`, keyed by responder pubkey):
   `xpf_userspace_wg_cookie_replies_total{event=consumed}`) on a successful
   decrypt+store; `hs_rx_cookie_unsupported` (its former S7-placeholder wire name,
   now a real drop-by-reason site) on an unattributable / undecryptable reply.
+- **Lifecycle / peer removal (#4362)** — `cookie_gen` is keyed by peer pubkey
+  and, like `pending_by_peer`, lives OUTSIDE the atomically-swapped `PeerTable`.
+  `WgEngine::reconcile_peers` therefore drains a removed peer's `cookie_gen`
+  entry alongside its `sessions_by_local_index` demux entries and pending
+  handshake reservations — otherwise each peer removal would leak a stale
+  `InitiatorCookie` (~56 bytes) until process restart. A kept peer's entry is
+  left untouched. RED-on-revert: `engine_tests.rs`
+  `reconcile_peers_drains_dropped_peer_cookie_gen`.
 
 **RED-on-revert (PR-B):** `cookie.rs`
 `initiator_cookie_roundtrip_stamps_accepted_mac2` (a responder cookie-reply is

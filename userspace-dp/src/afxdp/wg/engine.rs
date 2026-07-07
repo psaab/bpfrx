@@ -825,7 +825,11 @@ impl WgEngine {
     ///      successfully (the session Arc is still in the demux map),
     ///      then fail the AllowedIPs gate because the peer is no
     ///      longer in the index, and the demux entry would leak
-    ///      forever.
+    ///      forever. Removal also drains the removed peers' other
+    ///      per-pubkey side maps that live outside `PeerTable`:
+    ///      `pending`/`pending_by_peer` (in-flight handshake
+    ///      reservations) and `cookie_gen` (#4362, initiator cookie
+    ///      state) — otherwise each removal leaks a stale entry.
     ///   3. `ArcSwap::store` publishes the new `PeerTable` in one
     ///      release-store. Subsequent `.load()` calls observe either
     ///      the entire old table or the entire new one — never a mix.
@@ -936,6 +940,27 @@ impl WgEngine {
                 if let Some(reserved_idx) = by_peer.remove(pubkey) {
                     pending.remove(&reserved_idx);
                 }
+            }
+        }
+        // #4362: drain per-peer INITIATOR COOKIE state for removed peers.
+        // `cookie_gen` (#4094 PR-B) holds each peer's last-decrypted
+        // responder cookie plus the MAC1 of our last-sent initiation to it,
+        // keyed by peer pubkey. Like `pending_by_peer` above it is NOT part
+        // of the atomically-swapped `PeerTable`, so without an explicit
+        // drain a removed peer leaves a stale `InitiatorCookie` entry that
+        // is unreachable (no `Peer` in the table) yet lives until process
+        // restart — a small per-removal leak bounded by config-churn
+        // history. Drain it here alongside the other per-peer cleanups so
+        // peer removal is complete. Still under `reconcile_lock`; the
+        // `consume_cookie_reply` slow path releases its `pending` read lock
+        // before taking `cookie_gen`, so there is no lock-order coupling.
+        {
+            let mut cg = self.cookie_gen.lock().unwrap();
+            for pubkey in old.peer_index_by_pubkey.keys() {
+                if new_index.contains_key(pubkey) {
+                    continue;
+                }
+                cg.remove(pubkey);
             }
         }
         // Publish the new table. Atomic release-store; any reader

@@ -481,6 +481,67 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
     );
 }
 
+/// #4362 regression: `reconcile_peers` must drain a removed peer's
+/// per-pubkey `cookie_gen` (initiator cookie state, #4094 PR-B) and
+/// leave a kept peer's entry intact. `cookie_gen` is keyed by peer
+/// pubkey and lives OUTSIDE the atomically-swapped `PeerTable`, so
+/// without an explicit drain (matching `pending_by_peer`) a removed
+/// peer leaks a stale `InitiatorCookie` until process restart. RED on
+/// revert: dropping the `cookie_gen.remove` block leaves peer A's
+/// entry present after reconcile.
+#[test]
+fn reconcile_peers_drains_dropped_peer_cookie_gen() {
+    let (init_priv, _init_pub) = keypair();
+    let (_peer_a_priv, peer_a_pub) = keypair();
+    let (_peer_b_priv, peer_b_pub) = keypair();
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv.into(),
+        listen_port: 51820,
+        peers: vec![
+            WgPeerConfig {
+                pubkey: peer_a_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+            WgPeerConfig {
+                pubkey: peer_b_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+                preshared_key: [0u8; 32].into(),
+            },
+        ],
+    });
+    // Seed initiator-cookie state for both peers, as `add_initiator_macs`
+    // / `consume_cookie_reply` would after a real cookie-reply exchange.
+    {
+        let mut cg = engine.cookie_gen.lock().unwrap();
+        cg.insert(peer_a_pub, crate::afxdp::wg::cookie::InitiatorCookie::new());
+        cg.insert(peer_b_pub, crate::afxdp::wg::cookie::InitiatorCookie::new());
+        assert!(cg.contains_key(&peer_a_pub));
+        assert!(cg.contains_key(&peer_b_pub));
+    }
+    // Reconcile dropping only peer A.
+    engine.reconcile_peers(&[WgPeerConfig {
+        pubkey: peer_b_pub,
+        endpoint: None,
+        persistent_keepalive: 0,
+        allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+        preshared_key: [0u8; 32].into(),
+    }]);
+    let cg = engine.cookie_gen.lock().unwrap();
+    assert!(
+        !cg.contains_key(&peer_a_pub),
+        "dropped peer's cookie_gen entry must be drained on reconcile (#4362)"
+    );
+    assert!(
+        cg.contains_key(&peer_b_pub),
+        "kept peer's cookie_gen entry must survive an unrelated peer removal"
+    );
+}
+
 /// r5 regression: hot-path readers must observe a torn-free
 /// snapshot across `reconcile_peers`. A concurrent
 /// reconcile/hot-read interleaving where the reader sees
