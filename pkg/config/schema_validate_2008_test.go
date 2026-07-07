@@ -329,6 +329,70 @@ func TestSchema2008_RAPrefixLifetime_AcceptsZero(t *testing.T) {
 	}
 }
 
+// --- #4525: RA interval RFC 4861 §6.2.1 range floors ---------------------
+
+// The old ValidateIntegerMin(1) let max-advertisement-interval 1|2|3 commit,
+// and the RA sender then drew a 0-second periodic delay (minI = maxI/3 = 0)
+// and hot-looped. RFC 4861 §6.2.1 requires MaxRtrAdvInterval in [4,1800].
+// RED on revert: each below-floor value is accepted (Min(1) passes 1..3).
+func TestSchema4525_RAMaxInterval_RejectsBelowRFCFloor(t *testing.T) {
+	for _, bad := range []string{"1", "2", "3", "0", "1801"} {
+		err := flatSchemaCheck(t,
+			"set protocols router-advertisement interface ge-0-0-0 max-advertisement-interval "+bad)
+		if err == nil {
+			t.Fatalf("expected error for max-advertisement-interval %s (RFC 4861 §6.2.1 range [4,1800]), got nil", bad)
+		}
+		if !strings.Contains(err.Error(), "max-advertisement-interval") {
+			t.Fatalf("error should reference max-advertisement-interval: %v", err)
+		}
+	}
+}
+
+func TestSchema4525_RAMaxInterval_AcceptsInRange(t *testing.T) {
+	// 4 = RFC floor, 200 = canonical, 600 = default, 1800 = RFC ceiling.
+	for _, good := range []string{"4", "200", "600", "1800"} {
+		if err := flatSchemaCheck(t,
+			"set protocols router-advertisement interface ge-0-0-0 max-advertisement-interval "+good); err != nil {
+			t.Fatalf("max-advertisement-interval %s should be accepted: %v", good, err)
+		}
+	}
+}
+
+// RFC 4861 §6.2.1 requires MinRtrAdvInterval >= 3 (and <= 0.75*max, checked
+// cross-field in configstore). RED on revert: 1|2 accepted under Min(1).
+func TestSchema4525_RAMinInterval_RejectsBelowRFCFloor(t *testing.T) {
+	for _, bad := range []string{"1", "2", "0", "1351"} {
+		err := flatSchemaCheck(t,
+			"set protocols router-advertisement interface ge-0-0-0 min-advertisement-interval "+bad)
+		if err == nil {
+			t.Fatalf("expected error for min-advertisement-interval %s (RFC 4861 §6.2.1 range [3,1350]), got nil", bad)
+		}
+		if !strings.Contains(err.Error(), "min-advertisement-interval") {
+			t.Fatalf("error should reference min-advertisement-interval: %v", err)
+		}
+	}
+}
+
+func TestSchema4525_RAMinInterval_AcceptsInRange(t *testing.T) {
+	for _, good := range []string{"3", "10", "200", "1350"} {
+		if err := flatSchemaCheck(t,
+			"set protocols router-advertisement interface ge-0-0-0 min-advertisement-interval "+good); err != nil {
+			t.Fatalf("min-advertisement-interval %s should be accepted: %v", good, err)
+		}
+	}
+}
+
+// The canonical HA config (docs/ha-cluster-userspace.conf) uses max 30 /
+// min 10 — both in range and 10 <= 0.75*30. Guard against a false-reject of
+// the shipped config.
+func TestSchema4525_RACanonicalIntervals_Accepted(t *testing.T) {
+	if err := flatSchemaCheck(t,
+		"set protocols router-advertisement interface ge-0-0-0 max-advertisement-interval 30",
+		"set protocols router-advertisement interface ge-0-0-0 min-advertisement-interval 10"); err != nil {
+		t.Fatalf("canonical max=30/min=10 should validate: %v", err)
+	}
+}
+
 // --- syslog: system syslog facility/severity pairs ----------------------
 
 func TestSchema2008_SyslogSeverity_RejectsBad(t *testing.T) {
