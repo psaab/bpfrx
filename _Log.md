@@ -38898,3 +38898,26 @@ top.
 - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_prewalk.go,
   pkg/config/compile_golden_4406_test.go,
   pkg/config/testdata/golden_4406.json, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4360 — HA session-sync survivor-fabric re-drive gate keyed on
+  the SHARED `bulkEverCompleted` flag. That flag is set by EITHER an inbound
+  `BulkEnd` (peer->us) OR an outbound `BulkAck` (us->peer), so a small inbound
+  bulk completing first suppressed re-driving a stranded OUTBOUND bulk: the
+  peer kept an incomplete view of our sessions. Added a dedicated
+  `outboundBulkAcked atomic.Bool` set ONLY in the `syncMsgBulkAck` path
+  (pkg/cluster/sync_conn.go) and re-pointed BOTH the `handleDisconnect`
+  re-drive gate and its in-goroutine re-check from `bulkEverCompleted` to
+  `outboundBulkAcked` (the inner re-check MUST also flip, else it bails on a
+  set `bulkEverCompleted` and the fix is inert). The `coldStart` gate in
+  `handleNewConnection` is intentionally left on `bulkEverCompleted` (a
+  both-fabrics-down reconnect is a separate path). `outboundBulkAcked` is
+  sticky (never reset), matching `bulkEverCompleted`. Added RED-on-revert test
+  `TestBulkSyncRedriveWhenOnlyInboundCompleted` (inbound-completes-first +
+  single-fabric drop must still re-drive) and updated
+  `TestBulkSyncNoRedriveWhenAlreadyCompleted` to set `outboundBulkAcked`.
+  Verified: new test FAILS with the gate reverted to `bulkEverCompleted`,
+  passes with the fix; `go test ./pkg/cluster/... -race` green; go build +
+  vet + gofmt clean. Doc: docs/sync-protocol.md #4090 re-drive section.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync_test.go, docs/sync-protocol.md, _Log.md
