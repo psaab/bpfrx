@@ -38920,6 +38920,30 @@ top.
   pkg/config/testdata/golden_4406.json, _Log.md
 
 - **Timestamp**: 2026-07-07
+- **Action**: #4370 — the session-sync auth handshake ran SYNCHRONOUSLY in
+  the inbound accept loop (`acceptLoop` → `handleNewConnection` →
+  `performSyncHandshake`), so a slow/hung handshake on ONE connection stalled
+  accepting the NEXT for up to `syncHandshakeTimeout` (an active control-link
+  peer could serially block accepts). TWO fixes: (1) shortened
+  `syncHandshakeTimeout` 10s→3s (the keyed↔keyed challenge-response is
+  sub-millisecond; 3s only bounds a hung/absent peer and keeps a stalled
+  handshake goroutine inside the 5s `Stop` budget); (2) moved connection setup
+  off the accept loop — `acceptLoop` now runs `handleNewConnection` in a
+  per-connection, `s.wg`-tracked goroutine, so a stalled handshake no longer
+  blocks accepting OTHERS. Auth gate preserved: the conn is not wired into
+  `conn0`/`conn1` and no session frame is read until `performSyncHandshake`
+  succeeds INSIDE the goroutine; a failed handshake closes it. The outbound
+  `fabricConnectLoop` stays synchronous (dedicated per-fabric dialer).
+  Concurrent setup is safe: `conn0`/`conn1` assignment is `s.mu`-guarded with
+  close-old semantics, `doBulkSync` serializes via `bulkSendMu`. Tests:
+  `TestAcceptLoopHandshakeDoesNotBlockOthers` (A stalls after reading the
+  server HELLO, B must still receive its HELLO within ms — RED on revert: B's
+  read times out because the loop is parked on A) and
+  `TestSyncHandshakeTimeoutIsShort` (pins the [1s,3s] bound — RED on revert to
+  10s). Both RED-on-revert verified. `go build ./...`, `go vet ./pkg/cluster/`,
+  gofmt clean; `go test ./pkg/cluster/ -race` green.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_auth.go,
+  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
 - **Action**: #4360 — HA session-sync survivor-fabric re-drive gate keyed on
   the SHARED `bulkEverCompleted` flag. That flag is set by EITHER an inbound
   `BulkEnd` (peer->us) OR an outbound `BulkAck` (us->peer), so a small inbound

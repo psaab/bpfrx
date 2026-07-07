@@ -288,6 +288,22 @@ connection is authenticated, then seals every subsequent frame.
   milliseconds. A dropped handshake closes the connection and the
   accept/connect loops retry (~1s) — it never bricks. MUST pass
   `make test-failover` (the path that keeps TCP alive across failover).
+- **Accept-loop isolation + short bound (#4370).** The inbound
+  `acceptLoop` runs each connection's setup (handshake + wire-up +
+  cold-start bulk sync, inside `handleNewConnection`) in a
+  per-connection goroutine — a slow or hung handshake on ONE connection
+  can no longer stall accepting the NEXT for up to `syncHandshakeTimeout`
+  (previously an active control-link peer could serially block accepts).
+  The auth gate is unchanged: the connection is not wired into
+  `conn0`/`conn1` and no session frame is read from it until
+  `performSyncHandshake` succeeds INSIDE the goroutine; a failed
+  handshake closes it. The goroutine is `s.wg`-tracked so `Stop()` waits
+  for in-flight setup. The outbound `fabricConnectLoop` stays synchronous
+  (a dedicated per-fabric dialer that must not redial mid-handling).
+  `syncHandshakeTimeout` is **3s** (was 10s): the keyed↔keyed path is
+  sub-millisecond, so the bound only covers a hung/absent peer, and a
+  shorter bound keeps a stalled handshake goroutine within the 5s `Stop`
+  budget.
 
 ## IPsec SA sync
 
