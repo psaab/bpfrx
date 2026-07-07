@@ -1,3 +1,28 @@
+## 2026-07-07 — Fix TestUserspaceLinkCycleDoesNotReenterLegacyLoader stale file target after #4462 process.go split
+
+- **Timestamp**: 2026-07-07T16:20Z
+- **Action**: Repointed the retirement-boundary link-cycle canary. The test
+  `TestUserspaceLinkCycleDoesNotReenterLegacyLoader` in
+  `pkg/dataplane/retirement_boundary_canary_test.go` parses named production
+  source files and asserts the `Manager` link-cycle entrypoints
+  (`PrepareLinkCycle`/`NotifyLinkCycle`) exist AND do not re-enter the legacy
+  loader or touch `xdp_main_prog` controls (#1476 invariant). `productionLink
+  CycleLegacyLoaderTargets()` pinned the `Manager` receiver to
+  `pkg/dataplane/userspace/process.go`, but #4462 split those methods out into
+  `process_linkcycle.go`. The parse still found process.go, but neither method
+  was there, so the `missing` branch fired — the canary was RED on clean
+  origin/master (recorded as a pre-existing failure in prior _Log entries).
+  This is a stale source-scanning file target, not a real invariant breach
+  (same class as the #4464 shim_loader_boundary_test.go repoint). FIX: retarget
+  the `Manager` entry to `process_linkcycle.go` where the methods now live; the
+  body-inspection invariant check is unchanged and now scans the real function
+  bodies. RED-before/GREEN-after confirmed:
+  `go test ./pkg/dataplane -run TestUserspaceLinkCycleDoesNotReenterLegacyLoader`
+  failed with "methods not found: [process.go:NotifyLinkCycle
+  process.go:PrepareLinkCycle]" on origin/master, passes after the repoint.
+  Verified: `go test ./pkg/dataplane/...` green, go build + vet + gofmt clean.
+- **File(s)**: pkg/dataplane/retirement_boundary_canary_test.go, _Log.md
+
 ## 2026-07-07 — #4375 (avo-review-007 H3): firewall-filter conflicting terminating actions rejected at commit
 
 - **Timestamp**: 2026-07-07T07:50Z
