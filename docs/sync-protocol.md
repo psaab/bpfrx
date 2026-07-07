@@ -417,8 +417,8 @@ session table until BOTH fabrics happened to drop together.
 
 `handleDisconnect` now closes that gap. After clearing the dropped conn and
 computing `connected := conn0 != nil || conn1 != nil`, when a survivor is still
-up AND `!bulkEverCompleted.Load()` (the cold-start bulk never completed), it
-schedules a single re-drive of `doBulkSync()` over the survivor:
+up AND `!outboundBulkAcked.Load()` (our outbound bulk was never acked by the
+peer), it schedules a single re-drive of `doBulkSync()` over the survivor:
 
 - **Goroutine, not inline.** `handleDisconnect` holds `s.mu`, and
   `doBulkSync → BulkSync/sendBulkMarkers → getActiveConn` re-locks `s.mu`; an
@@ -436,10 +436,27 @@ schedules a single re-drive of `doBulkSync()` over the survivor:
   `BulkEnd` runs `reconcileStaleSessions`, so the re-driven bulk cleanly
   re-primes the standby.
 
-Once any bulk exchange completes (`bulkEverCompleted` set on a received
-`BulkEnd`/`BulkAck`), the gate closes: steady-state incremental sync already
-fails over via the send loop, so no re-drive is needed and a normal
-post-cold-start single-fabric drop does not re-bulk.
+Once the peer acks **our outbound** bulk (`outboundBulkAcked` set on a received
+`BulkAck`), the gate closes: steady-state incremental sync already fails over
+via the send loop, so no re-drive is needed and a normal post-cold-start
+single-fabric drop does not re-bulk.
+
+**#4360 — gate on the outbound-only flag, not the shared one.** The re-drive
+exists to guarantee the peer received *our* table, so its gate keys on
+`outboundBulkAcked`, which is set **only** by an inbound `BulkAck` (the peer
+acknowledging our outbound bulk). It is distinct from `bulkEverCompleted`, which
+is *also* set by an inbound `BulkEnd` (the peer's bulk arriving at us). If the
+gate used the shared `bulkEverCompleted`, a small **inbound** bulk completing
+first would set it and wrongly suppress re-driving a **stranded outbound** bulk,
+leaving the peer with an incomplete view of our sessions. The inner re-check
+inside the re-drive goroutine (the "a concurrent reconnect may have already
+re-primed" early-out) uses the same `outboundBulkAcked` flag for the same
+reason — keying it on `bulkEverCompleted` there would re-open the bug by bailing
+whenever an inbound bulk had completed. `outboundBulkAcked` is sticky (never
+reset): once the peer holds our full table, incremental sync keeps it fresh
+across reconnects. `handleNewConnection`'s `coldStart` gate is unchanged and
+still keys on `bulkEverCompleted` — a both-fabrics-down reconnect is a separate
+path from the survivor re-drive.
 
 ### 2. Periodic Sync Sweep (1s interval, new sessions)
 
