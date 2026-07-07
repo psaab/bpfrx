@@ -1,0 +1,236 @@
+package userspace
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+)
+
+func (m *Manager) syncSnapshotLocked() error {
+	if m.proc == nil || m.proc.Process == nil || m.lastSnapshot == nil {
+		return nil
+	}
+	planKey := snapshotBindingPlanKey(m.lastSnapshot)
+	if m.publishedSnapshot >= m.lastSnapshot.Generation {
+		return nil
+	}
+	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
+		// #1197 v7 (Codex code-review v6): status-loop catch-up
+		// path. Helper has the snapshot; mirror the FULL
+		// successful-apply_snapshot bookkeeping, otherwise
+		// downstream paths see stale publishedPlanKey /
+		// lastSnapshotHash and may force unnecessary refreshes
+		// or break the same-plan-during-XSK-startup exception.
+		hash, hashOK := snapshotContentHash(m.lastSnapshot)
+		m.publishedSnapshot = m.lastSnapshot.Generation
+		m.publishedPlanKey = planKey
+		// #2079: the helper already reports this generation as applied
+		// (status.LastSnapshotGeneration >= m.lastSnapshot.Generation
+		// gated this branch), so it IS the applied snapshot.
+		m.markAppliedSnapshotLocked()
+		if hashOK {
+			m.lastSnapshotHash = hash
+		}
+		m.rebuildNeighborIndex()
+		m.rebuildMonitoredIfindexes()
+		return nil
+	}
+	// Publish the initial snapshot immediately so the helper can plan its
+	// bindings. After that, defer newer snapshots until the first XSK
+	// liveness outcome is known. HA startup can emit several snapshots in
+	// quick succession as VIPs and routes converge; pushing every one of
+	// them forces back-to-back full AF_XDP reconciles and self-collides.
+	//
+	// EXCEPTION: allow same-plan refreshes (FIB-only updates) through even
+	// during XSK startup. These don't trigger XSK rebinding — they only
+	// update routes and neighbors. Blocking them creates a deadlock: XSK
+	// liveness needs RX traffic, but transit traffic needs FIB data that
+	// hasn't been published yet.
+	if m.publishedSnapshot != 0 && !m.xskLivenessProven && !m.xskLivenessFailed {
+		samePlan := m.publishedPlanKey != "" && m.publishedPlanKey == planKey
+		if !samePlan {
+			return nil
+		}
+		slog.Info("userspace: publishing deferred same-plan snapshot during XSK startup",
+			"generation", m.lastSnapshot.Generation,
+			"fib_generation", m.lastSnapshot.FIBGeneration,
+			"published", m.publishedSnapshot)
+	}
+	if m.publishedSnapshot != 0 && m.publishedPlanKey != "" && m.publishedPlanKey != planKey {
+		slog.Info(
+			"userspace: restarting helper for binding plan change",
+			"generation", m.lastSnapshot.Generation,
+			"fib_generation", m.lastSnapshot.FIBGeneration,
+		)
+		cfg := m.cfg
+		m.stopLocked()
+		if err := m.ensureProcessLocked(cfg); err != nil {
+			return fmt.Errorf("restart userspace helper for binding plan change: %w", err)
+		}
+	}
+	// Content-hash dedup: skip the control socket publish if the snapshot's
+	// forwarding-relevant content hasn't changed since the last publish.
+	// This eliminates redundant publishes during route convergence where
+	// BumpFIBGeneration fires repeatedly but routes/neighbors are unchanged.
+	hash, hashOK := snapshotContentHash(m.lastSnapshot)
+	if hashOK && hash == m.lastSnapshotHash && m.publishedSnapshot != 0 {
+		// Still update the published generation so subsequent checks pass.
+		m.publishedSnapshot = m.lastSnapshot.Generation
+		return nil
+	}
+	// #1197 v5 (Codex code-review v4 #2): publishable-only filter
+	// for parity with update_neighbors path.
+	publishSnap := *m.lastSnapshot
+	publishSnap.Neighbors = filterPublishableNeighbors(m.lastSnapshot.Neighbors)
+	if err := m.ensureRequiredSnapshotProtocolLocked(publishSnap.Config); err != nil {
+		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
+			return errors.Join(err, disarmErr)
+		}
+		return err
+	}
+	// #2124: this is the XSK-startup deferred same-plan publish path, which
+	// publishes apply_snapshot independently of Compile(). Disarm before
+	// publishing an unsupported-config snapshot here too, so an old
+	// same-protocol-version helper that drops the `__unsupported__` sentinel
+	// cannot process the resulting match-any rule while still armed.
+	if err := m.disarmBeforeUnsupportedPublishLocked(&publishSnap); err != nil {
+		return err
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
+		return fmt.Errorf("publish userspace snapshot: %w", err)
+	}
+	// #1197 v5 (Codex code-review v4 #1): rebuild listener
+	// caches AFTER successful publish on the deferred-publish
+	// path too. Compile() defers when XSK is starting up; this
+	// is where the snapshot actually lands in userspace-dp.
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "deferred-sync")
+	m.rebuildNeighborIndex()
+	m.rebuildMonitoredIfindexes()
+	m.publishedSnapshot = m.lastSnapshot.Generation
+	m.publishedPlanKey = planKey
+	// #2079: deferred full apply_snapshot succeeded — record applied.
+	m.markAppliedSnapshotLocked()
+	if hashOK {
+		m.lastSnapshotHash = hash
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return fmt.Errorf("sync helper status: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) ensureStatusLoopLocked() {
+	if m.syncCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.syncCancel = cancel
+	go m.statusLoop(ctx)
+}
+
+func (m *Manager) statusLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	startTime := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.mu.Lock()
+			if m.proc == nil {
+				m.mu.Unlock()
+				return
+			}
+			prevActiveSig := activeHAGroupSignature(m.haGroups)
+			var status ProcessStatus
+			if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+				if err := m.applyHelperStatusLocked(&status); err != nil {
+					slog.Warn("userspace dataplane status sync failed", "err", err)
+				} else {
+					// Bindings watchdog (#473): verify the BPF map matches
+					// the helper's reported state. Only run after a successful
+					// status update — stale m.lastStatus could cause incorrect
+					// repairs.
+					repaired := m.verifyBindingsMapLocked()
+					m.maybeAutoRebindBusyBindingsLocked(time.Now(), repaired)
+				}
+				if m.lastSnapshot != nil && m.publishedSnapshot < m.lastSnapshot.Generation {
+					if err := m.syncSnapshotLocked(); err != nil {
+						slog.Warn("userspace dataplane snapshot sync failed", "err", err)
+					}
+				}
+				helperActiveSig := activeHAGroupSignatureSlice(status.HAGroups)
+				if m.clusterHA {
+					_ = m.refreshHAStateFromMapsLocked()
+				}
+				newActiveSig := activeHAGroupSignature(m.haGroups)
+				if m.clusterHA && newActiveSig != "" && time.Since(m.lastRGActivateTime) >= 2*time.Second {
+					// Only sync watchdog updates to the helper from the poll.
+					// Do NOT sync active/inactive transitions here — that's
+					// handled by UpdateRGActive which must be the sole source
+					// of demotion/activation deltas. If the poll syncs first,
+					// the helper sees no delta and skips FlushFlowCaches.
+					// Skip entirely for 2s after UpdateRGActive to avoid
+					// control socket contention during post-transition work.
+					if helperActiveSig != newActiveSig || newActiveSig != prevActiveSig {
+						// Sync watchdog timestamps only (HA state update
+						// without active/inactive change detection).
+						// Throttle to every 5s to avoid control socket
+						// contention with session installs during bulk sync.
+						if time.Since(m.lastHASyncTime) >= 5*time.Second {
+							if err := m.syncHAWatchdogOnlyLocked(); err != nil {
+								slog.Warn("userspace dataplane HA watchdog sync failed", "err", err)
+							}
+							m.lastHASyncTime = time.Now()
+						}
+					}
+					// Do not bootstrap NAPI queues or kick neighbor repair on
+					// HA ownership changes. By the time UpdateRGActive runs, the
+					// standby must already be forwarding-ready; otherwise
+					// TakeoverReady() should have blocked the handoff earlier.
+				}
+				if err := m.syncDesiredForwardingStateLocked(); err != nil {
+					slog.Warn("userspace dataplane forwarding sync failed", "err", err)
+				}
+			} else {
+				slog.Warn("userspace dataplane status poll failed", "err", err)
+			}
+			// Keep the targeted kernel prewarm during initial startup. After
+			// startup, continue a throttled standby-only neighbor prewarm so HA
+			// standby nodes already have WAN next-hop resolution before the
+			// first redirected packets arrive.
+			now := time.Now()
+			if now.Sub(startTime) < 60*time.Second && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+				m.proactiveNeighborResolveAsyncLocked()
+			} else if m.shouldStandbyNeighborPrewarmLocked(now) {
+				m.lastStandbyNeighResolve = now
+				m.proactiveNeighborResolveAsyncLocked()
+			}
+			m.mu.Unlock()
+		}
+	}
+}
+
+func (m *Manager) shouldStandbyNeighborPrewarmLocked(now time.Time) bool {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return false
+	}
+	if !m.clusterHA || !m.configHasDataRGLocked() || m.hasActiveDataRGLocked() {
+		return false
+	}
+	if m.proc == nil || m.proc.Process == nil {
+		return false
+	}
+	if !m.lastStatus.Enabled || !m.lastStatus.ForwardingArmed || !m.lastStatus.Capabilities.ForwardingSupported {
+		return false
+	}
+	if !m.lastStandbyNeighResolve.IsZero() && now.Sub(m.lastStandbyNeighResolve) < 10*time.Second {
+		return false
+	}
+	return true
+}
