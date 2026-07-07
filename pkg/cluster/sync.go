@@ -333,6 +333,17 @@ type SessionSync struct {
 	pendingBulkAckEpoch  atomic.Uint64
 	pendingBulkAckSince  atomic.Int64
 	bulkEverCompleted    atomic.Bool
+	// outboundBulkAcked is set ONLY when the peer acks OUR outbound bulk
+	// (syncMsgBulkAck), i.e. the peer has received our complete session
+	// table. It is DISTINCT from bulkEverCompleted, which is also set by an
+	// inbound BulkEnd (peer->us). The survivor-fabric re-drive
+	// (handleDisconnect, #4090) exists to guarantee the peer got OUR outbound
+	// bulk, so its gate must key on this outbound-only flag: a small INBOUND
+	// bulk completing first must not suppress re-driving a stranded OUTBOUND
+	// bulk (#4360). Like bulkEverCompleted it is sticky — once acked the peer
+	// holds our full table and incremental sync keeps it fresh across
+	// reconnects, so it is never reset.
+	outboundBulkAcked atomic.Bool
 	// bulkRedriveInFlight guards the survivor-fabric cold-start bulk
 	// re-drive (#4090). A single fabric dropping mid-cold-start-bulk while
 	// the other fabric is up leaves the bulk stranded — pinned to the dead

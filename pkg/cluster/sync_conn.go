@@ -1510,6 +1510,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			s.pendingBulkAckSince.Store(0)
 		}
 		s.bulkEverCompleted.Store(true)
+		// #4360: the peer acked OUR outbound bulk — record it on the
+		// outbound-only flag so a stranded outbound bulk can be re-driven on a
+		// survivor fabric independently of whether an inbound bulk (which also
+		// sets bulkEverCompleted at syncMsgBulkEnd) completed first.
+		s.outboundBulkAcked.Store(true)
 		if s.OnBulkSyncAckReceived != nil {
 			go s.OnBulkSyncAckReceived()
 		}
@@ -1801,7 +1806,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()
 		}
-	} else if !s.bulkEverCompleted.Load() {
+	} else if !s.outboundBulkAcked.Load() {
 		// #4090: a survivor fabric is still up but the cold-start bulk
 		// never completed. The bulk streams over a SINGLE connection
 		// (BulkSync/sendBulkMarkers pin s.getActiveConn once); if that
@@ -1809,6 +1814,13 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// retried on the survivor and handleNewConnection will not
 		// re-trigger it (its wasDisconnected gate needs BOTH fabrics to
 		// have dropped). Re-drive doBulkSync over the survivor.
+		//
+		// #4360: this gates on outboundBulkAcked, NOT bulkEverCompleted.
+		// The re-drive's job is to get OUR outbound bulk to the peer; a
+		// small INBOUND bulk (peer->us) completing first sets
+		// bulkEverCompleted but says nothing about whether the peer
+		// received our table, so keying on the shared flag would wrongly
+		// suppress the re-drive of a stranded outbound bulk.
 		//
 		// This MUST be a goroutine, not inline: handleDisconnect holds
 		// s.mu, and doBulkSync -> BulkSync/sendBulkMarkers -> getActiveConn
@@ -1825,7 +1837,11 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 				defer s.bulkRedriveInFlight.Store(false)
 				// A concurrent reconnect (both-fabric drop then reconnect)
 				// may have already re-primed via handleNewConnection.
-				if s.bulkEverCompleted.Load() {
+				// #4360: re-check the SAME outbound-only flag the gate above
+				// used — bulkEverCompleted may be true from an inbound bulk
+				// while our outbound bulk is still un-acked, and bailing on
+				// it here would make the fix inert.
+				if s.outboundBulkAcked.Load() {
 					return
 				}
 				// Reset the stranded pending-ack epoch so the re-run's fresh

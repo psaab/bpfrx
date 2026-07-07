@@ -4529,9 +4529,10 @@ func TestBulkSyncRedriveOnSurvivorFabric(t *testing.T) {
 }
 
 // TestBulkSyncNoRedriveWhenAlreadyCompleted verifies that a single-fabric drop
-// AFTER the cold-start bulk already completed does NOT re-drive (#4090). Once
-// bulkEverCompleted is set, the steady-state incremental stream already fails
-// over via the send loop, so a re-bulk would be redundant.
+// AFTER our outbound cold-start bulk was acked does NOT re-drive (#4090). Once
+// the peer has acked our table (outboundBulkAcked, #4360), the steady-state
+// incremental stream already fails over via the send loop, so a re-bulk would
+// be redundant.
 func TestBulkSyncNoRedriveWhenAlreadyCompleted(t *testing.T) {
 	c0local, c0peer := net.Pipe()
 	defer c0peer.Close()
@@ -4548,7 +4549,10 @@ func TestBulkSyncNoRedriveWhenAlreadyCompleted(t *testing.T) {
 		mu.Unlock()
 		return nil
 	}
+	// Steady state after a completed cold start: both flags set (an inbound
+	// BulkEnd set bulkEverCompleted AND the peer acked our outbound bulk).
 	ss.bulkEverCompleted.Store(true)
+	ss.outboundBulkAcked.Store(true)
 	ss.mu.Lock()
 	ss.conn0 = c0local
 	ss.conn1 = c1local
@@ -4571,6 +4575,65 @@ func TestBulkSyncNoRedriveWhenAlreadyCompleted(t *testing.T) {
 	if !ss.IsConnected() {
 		t.Fatal("survivor fabric 1 should keep the sync connected")
 	}
+}
+
+// TestBulkSyncRedriveWhenOnlyInboundCompleted is the #4360 RED-on-revert test.
+// An INBOUND bulk (peer->us) completing first sets the SHARED bulkEverCompleted
+// flag, but our OUTBOUND bulk was never acked (outboundBulkAcked stays false).
+// A fabric drop while the outbound bulk is stranded must STILL re-drive it over
+// the survivor so the peer ends with our COMPLETE table. On revert (the gate
+// keyed on the shared bulkEverCompleted flag) the re-drive is wrongly
+// suppressed and this test times out.
+func TestBulkSyncRedriveWhenOnlyInboundCompleted(t *testing.T) {
+	c0local, c0peer := net.Pipe()
+	defer c0peer.Close()
+	c1local, c1peer := net.Pipe()
+	defer c1peer.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", &mockSweepDP{})
+	ss.IsPrimaryFn = func() bool { return true }
+
+	redriven := make(chan struct{}, 1)
+	ss.BulkSyncOverride = func() error {
+		select {
+		case redriven <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	// Inbound bulk completed first — it set the SHARED flag — but the peer has
+	// NOT acked our outbound bulk. outboundBulkAcked is deliberately left false.
+	ss.bulkEverCompleted.Store(true)
+
+	ss.mu.Lock()
+	ss.conn0 = c0local
+	ss.conn1 = c1local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	// Drain the survivor so the re-drive's post-override sendBulkMarkers write
+	// (BulkStart/BulkEnd) completes and its goroutine returns cleanly.
+	go func() {
+		for {
+			if _, _, err := readSyncFrame(c1peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Fabric 0 drops; fabric 1 survives. The outbound bulk was stranded, so the
+	// re-drive MUST fire even though bulkEverCompleted is set from the inbound
+	// bulk.
+	ss.handleDisconnect(c0local)
+
+	select {
+	case <-redriven:
+		// Re-drive fired over the survivor — correct.
+	case <-time.After(5 * time.Second):
+		t.Fatal("outbound bulk re-drive was suppressed by the shared bulkEverCompleted flag — a stranded outbound bulk never reaches the peer (#4360 RED-on-revert)")
+	}
+
+	ss.Stop()
 }
 
 // TestBulkSyncRedriveInFlightGuard verifies the CAS in-flight guard: while one
