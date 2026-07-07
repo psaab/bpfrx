@@ -1830,6 +1830,131 @@ fn extract_screen_info_ipv4_lsrr_detected() {
 }
 
 #[test]
+fn extract_screen_info_ipv4_malformed_option_before_lsrr_fails_closed() {
+    // #4543 (ps-027 S-03): a MALFORMED option placed BEFORE an LSRR must
+    // NOT let the source-route option evade the screen. The kind==LSRR
+    // test precedes the length check, so the pre-fix `break`-on-malformed
+    // aborted the walk at the bad option, leaving saw_ipv4_source_route=
+    // false → check_source_route passed the packet. The fix returns
+    // Err(TruncatedIpv4Header) so the malformed frame is DROPPED (the
+    // "ip-malformed" fail-closed path, mirroring #4167). Layout: version=4,
+    // ihl=9 (36 bytes = 20 base + 16 options); options = a bad
+    // length-prefixed option {type=0x44, len=0x01} (len < 2 → malformed),
+    // then an LSRR {131, len=7, ...}. Goes RED on revert (the packet would
+    // parse Ok with saw_ipv4_source_route=false).
+    let ihl_words = 9u8;
+    let hdr_len = (ihl_words as usize) * 4; // 36
+    let mut frame = vec![0u8; 14 + hdr_len + 20];
+    let ip = 14;
+    frame[ip] = 0x40 | ihl_words; // version=4, ihl=9
+    frame[ip + 2..ip + 4].copy_from_slice(&((hdr_len + 20) as u16).to_be_bytes());
+    frame[ip + 9] = 6; // TCP
+    let opt = ip + 20;
+    // Malformed option: a length-prefixed type with a declared length of
+    // 1 (< 2, impossible for a length-prefixed option).
+    frame[opt] = 0x44; // type (not EOOL/NOP/LSRR/SSRR)
+    frame[opt + 1] = 0x01; // malformed length
+    // An LSRR placed AFTER the malformed option — the source-route the
+    // operator's screen is meant to catch.
+    frame[opt + 2] = 131; // LSRR
+    frame[opt + 3] = 7; // option length
+    frame[opt + 4] = 4; // pointer
+    let res = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        (hdr_len + 20) as u16,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    );
+    assert_eq!(
+        res.expect_err("malformed IPv4 option before LSRR must fail closed"),
+        ScreenParseError::TruncatedIpv4Header
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv4_option_length_overruns_region_fails_closed() {
+    // #4543: a length-prefixed option whose declared length runs PAST the
+    // options region is malformed and must fail closed (not `break`).
+    // Layout: version=4, ihl=6 (24 bytes = 20 base + 4 options); a single
+    // option {type=7 (record-route), len=8} — but only 4 option bytes
+    // exist, so the length overruns opt_end. Goes RED on revert.
+    let ihl_words = 6u8;
+    let hdr_len = (ihl_words as usize) * 4; // 24
+    let mut frame = vec![0u8; 14 + hdr_len + 20];
+    let ip = 14;
+    frame[ip] = 0x40 | ihl_words;
+    frame[ip + 2..ip + 4].copy_from_slice(&((hdr_len + 20) as u16).to_be_bytes());
+    frame[ip + 9] = 6;
+    let opt = ip + 20;
+    frame[opt] = 7; // record-route (length-prefixed)
+    frame[opt + 1] = 8; // declares 8 bytes but only 4 remain → overruns
+    let res = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        (hdr_len + 20) as u16,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    );
+    assert_eq!(
+        res.expect_err("IPv4 option length overrunning region must fail closed"),
+        ScreenParseError::TruncatedIpv4Header
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv4_wellformed_lsrr_after_benign_option_trips() {
+    // #4543 over-drop guard: a WELL-FORMED options list where an LSRR
+    // follows a benign length-prefixed option (router-alert, type 148,
+    // len 4) must STILL set saw_ipv4_source_route — the fail-closed fix
+    // must not disturb valid multi-option walks. Layout: version=4, ihl=10
+    // (40 bytes = 20 base + 20 options); router-alert {148, len=4}, then
+    // LSRR {131, len=7, ptr=4, ...}, then EOOL/pad.
+    let ihl_words = 10u8;
+    let hdr_len = (ihl_words as usize) * 4; // 40
+    let mut frame = vec![0u8; 14 + hdr_len + 20];
+    let ip = 14;
+    frame[ip] = 0x40 | ihl_words;
+    frame[ip + 2..ip + 4].copy_from_slice(&((hdr_len + 20) as u16).to_be_bytes());
+    frame[ip + 9] = 6; // TCP
+    let opt = ip + 20;
+    frame[opt] = 148; // router-alert (benign)
+    frame[opt + 1] = 4; // length
+    // LSRR follows at opt+4.
+    frame[opt + 4] = 131; // LSRR
+    frame[opt + 5] = 7; // option length
+    frame[opt + 6] = 4; // pointer
+    // remaining bytes zeroed (route data / EOOL padding)
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET as u8,
+        6,
+        0x02,
+        (hdr_len + 20) as u16,
+        IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+        12345,
+        80,
+        14,
+    )
+    .expect("well-formed router-alert + LSRR packet must parse Ok");
+    assert!(
+        info.saw_ipv4_source_route,
+        "LSRR after a well-formed benign option must still trip the source-route screen"
+    );
+}
+
+#[test]
 fn extract_screen_info_ipv4_router_alert_not_source_route() {
     // #2973 fail-on-revert: an IPv4 header with a benign router-alert
     // option (148, length 4) must NOT set saw_ipv4_source_route.
