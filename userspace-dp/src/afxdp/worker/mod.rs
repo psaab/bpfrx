@@ -1410,8 +1410,12 @@ pub(crate) struct BindingLiveSnapshot {
     /// #2161: cumulative NAT64 translations snapshotted from BindingLiveState.
     pub(crate) nat64_translations: u64,
     /// #2291: cumulative fail-closed NAT64 drops (prefix matched, no source
-    /// pool available) snapshotted from BindingLiveState.
+    /// pool available) snapshotted from BindingLiveState. #4520: config/empty
+    /// pool case only; transient exhaustion is `nat64_pool_exhausted`.
     pub(crate) nat64_no_source_pool: u64,
+    /// #4520: cumulative transient NAT64 pool-exhaustion drops snapshotted
+    /// from BindingLiveState (prefix matched, pool full, no free port).
+    pub(crate) nat64_pool_exhausted: u64,
     /// #4477: cumulative source-NAT allocation failures snapshotted from
     /// BindingLiveState. Bridged into `GlobalCtrNATAllocFail` (Go side).
     pub(crate) nat_alloc_fail: u64,

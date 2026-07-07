@@ -447,7 +447,16 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// the `NAT64 no-source-pool drops` operator counter; a non-zero value
     /// flags a misconfigured/exhausted source pool that would otherwise have
     /// leaked the synthetic IPv6 destination upstream (the pre-fix fail-open).
+    /// #4520: now scoped to the config/empty/missing pool case only; transient
+    /// port exhaustion is counted by `nat64_pool_exhausted`.
     pub(super) nat64_no_source_pool: AtomicU64,
+    /// #4520: cumulative transient NAT64 pool-exhaustion drops — a prefix
+    /// matched and its pool was non-empty, but no free translated port could
+    /// be allocated (`AllocatorExhausted`). Surfaced as the `NAT64
+    /// pool-exhausted drops` operator counter; a non-zero value flags a pool
+    /// too small for the offered load (add capacity), distinct from the
+    /// config/empty case in `nat64_no_source_pool` (fix config).
+    pub(super) nat64_pool_exhausted: AtomicU64,
     /// #4477: cumulative source-NAT allocation failures (rule matched, no
     /// translated mapping could be allocated — missing/empty/invalid/exhausted
     /// pool, wrong family, or a non-first fragment on a port-translating rule).
@@ -860,6 +869,7 @@ impl BindingLiveState {
             dnat_packets: AtomicU64::new(0),
             nat64_translations: AtomicU64::new(0),
             nat64_no_source_pool: AtomicU64::new(0),
+            nat64_pool_exhausted: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),

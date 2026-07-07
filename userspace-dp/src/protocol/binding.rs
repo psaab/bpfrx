@@ -512,6 +512,13 @@ pub(crate) struct BindingStatus {
     // keeps the same cross-version wire safety as nat64_translations above.
     #[serde(rename = "nat64_no_source_pool", default)]
     pub nat64_no_source_pool: u64,
+    /// #4520: transient NAT64 pool-exhaustion drops — a prefix matched and its
+    /// pool was non-empty, but no free translated port could be allocated
+    /// (`AllocatorExhausted`). The transient sibling of `nat64_no_source_pool`
+    /// (config/empty). `default` keeps the same cross-version wire safety (an
+    /// older helper omits it and Go/Rust read 0).
+    #[serde(rename = "nat64_pool_exhausted", default)]
+    pub nat64_pool_exhausted: u64,
     /// #4477: source-NAT allocation failures (rule matched, no translated
     /// mapping could be allocated → packet dropped). `default` keeps the same
     /// cross-version wire safety as the siblings above (an older helper omits it
