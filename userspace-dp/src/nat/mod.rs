@@ -38,6 +38,9 @@ mod tests_source;
 #[cfg(test)]
 #[path = "tests_static.rs"]
 mod tests_static;
+#[cfg(test)]
+#[path = "tests_destination.rs"]
+mod tests_destination;
 
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches
