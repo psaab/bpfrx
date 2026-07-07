@@ -21,7 +21,14 @@ use super::*;
 /// surrendered open at the bound (returned `Some(offset)` with the
 /// unconsumed ext-header type as a bogus "L4 protocol"), so a 7th ext
 /// header was classified one way by screen and another by forwarding.
-pub(in crate::afxdp) const MAX_IPV6_EXT_HEADERS: usize = 8;
+///
+/// #4435: exposed `pub(crate)` (re-exported at `crate::afxdp` level,
+/// like `write_eth_header_slice`) so the NAT64 translator's own private
+/// ext-header walkers in `crate::nat64` share this exact bound instead
+/// of hardcoding a stale 6. Keeping one const removes the 6-vs-8 skew
+/// where a 7-ext-header packet was NAT64-dropped but accepted by the
+/// forwarding/screen paths.
+pub(crate) const MAX_IPV6_EXT_HEADERS: usize = 8;
 
 pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {

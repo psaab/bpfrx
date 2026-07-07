@@ -208,6 +208,10 @@ pub(crate) use self::types::{ForwardingDisposition, ForwardingResolution, Neighb
 // VLAN/TPID/PCP/DEI/ethertype change in the shared module propagates
 // to NAT64 automatically.
 pub(crate) use self::frame::write_eth_header_slice;
+// #4435: same rationale as the writer above — expose the canonical
+// IPv6 ext-header loop bound so `crate::nat64`'s private walkers stay
+// in lockstep with the forwarding/screen paths (one const, no skew).
+pub(crate) use self::frame::MAX_IPV6_EXT_HEADERS;
 use self::umem::*;
 
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;

@@ -61,8 +61,12 @@ pub(in crate::afxdp) use checksum::{
 // reached for from afxdp.rs / tx/transmit.rs / tx/dispatch.rs /
 // cos/queue_service.rs, so they go out at `pub(in crate::afxdp)`. The
 // rest stay at `pub(super)` (afxdp-only callers in sibling files).
+// #4435: re-exported `pub(crate)` (like `write_eth_header_slice` above)
+// so `crate::nat64`'s private ext-header walkers share the single
+// canonical bound instead of hardcoding a stale 6.
+pub(crate) use inspect::MAX_IPV6_EXT_HEADERS;
 pub(super) use inspect::{
-    MAX_IPV6_EXT_HEADERS, frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
+    frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
     live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,
     metadata_tuple_complete, packet_rel_l4_offset, packet_rel_l4_offset_and_protocol,
     parse_flow_ports, parse_ipv4_session_flow_from_frame, parse_packet_destination_from_frame,

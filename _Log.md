@@ -1,3 +1,52 @@
+## 2026-07-07 — #4435: NAT64 ext-header walkers share canonical MAX_IPV6_EXT_HEADERS bound
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed #4435 (codex-172 C172-M02, MED). The NAT64
+  translator's three private IPv6 extension-header walkers in
+  `nat64.rs` (`ipv6_l4_offset_and_protocol`, `ipv6_is_non_first_fragment`,
+  `ipv6_fragment_header`) surrendered at a hardcoded 6-iteration bound
+  while the canonical forwarding/screen walkers use
+  `MAX_IPV6_EXT_HEADERS = 8` (`afxdp/frame/inspect.rs`). Verified the
+  6-vs-8 skew on master: an IPv6 packet with 7 resolvable ext headers to
+  a NAT64 prefix was DROPPED by the NAT64 path (walk returned the 7th,
+  unconsumed ext-header type as a bogus L4 protocol → the translator's
+  `_ => return None`) while the forwarding path accepted the same packet.
+  The embedded-ICMP translator (`translate_embedded_v6_to_v4`) reuses
+  these walkers, so ICMPv6 errors quoting a 7-ext-header original were
+  also dropped (traceroute/PMTUD blackhole).
+  - **Fix**: broadened the canonical const to `pub(crate)` in
+    `afxdp/frame/inspect.rs` and re-exported it at the `crate::afxdp`
+    level (mirroring the existing `write_eth_header_slice` re-export
+    chain: `frame/mod.rs` → `afxdp/mod.rs`), then imported it into
+    `nat64.rs` and replaced all three `for _ in 0..6` with
+    `for _ in 0..MAX_IPV6_EXT_HEADERS`. The walk LOGIC stays local (the
+    dependency direction afxdp→nat64 is unchanged; only the BOUND value
+    is now a single SSOT). Fail-closed behaviour is preserved: a chain
+    longer than the bound still leaves the walk on a non-terminal
+    ext-header type → the translator drops (matching the canonical cap).
+    Updated the stale nat64.rs walker doc-comment (was "bounded to 6
+    iterations" / "#2292 tracked separately, not a prerequisite"); the
+    full walker-function unification remains #2292.
+  - **Validation**: RED-on-revert confirmed — with the loops reverted to
+    `0..6`, `nat64_v6_to_v4_seven_ext_headers_translates` fails (walk
+    offset 88 vs expected 96) and
+    `nat64_v6_to_v4_embedded_icmp_seven_ext_headers_translates` fails
+    (drop), while the oversized/2-header sanity tests still pass. Added 4
+    tests + 2 helpers in `nat64_tests.rs`. FULL
+    `cargo test --release -- --test-threads=1`: see PR (nat64 subset all
+    green). Did NOT run `cargo fmt` — master is not rustfmt-clean under
+    edition 2024; hand-verified my changed lines are fmt-clean (they
+    appear only as diff context around pre-existing drift) to avoid
+    whole-crate drift.
+  - **Docs**: module doc-comments in `inspect.rs` + `nat64.rs` updated
+    (the walker's own documentation). No user-facing doc change needed —
+    `docs/feature-coverage.md` already claims RFC 7915 ext-header-bearing
+    NAT64 translation since #2290; this is an off-by-two bound edge, not
+    a new capability.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs, _Log.md
+
 ## 2026-07-07 — #4400: strict-syn-check drop for bare RST/FIN on session-miss
 
 - **Timestamp**: 2026-07-07

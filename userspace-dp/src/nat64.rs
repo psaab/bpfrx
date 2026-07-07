@@ -114,6 +114,11 @@ use crate::NAT64RuleSnapshot;
 // the whole dataplane). Re-exported `pub(crate)` from `crate::afxdp`
 // because NAT64 lives outside `crate::afxdp`.
 use crate::afxdp::write_eth_header_slice;
+// #4435: the single canonical IPv6 extension-header loop bound, shared
+// with the forwarding/screen paths. The private walkers below use this
+// instead of a hardcoded 6 so a valid 7-ext-header packet is not
+// NAT64-dropped while the forwarding path accepts it.
+use crate::afxdp::MAX_IPV6_EXT_HEADERS;
 use crate::nat::NatDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -560,15 +565,21 @@ pub(crate) fn translate_v6_to_v4(
 /// the real transport header (TCP/UDP/ICMPv6/...) measured from the start of
 /// the IPv6 header, and `l4_protocol` is its protocol number. Walks
 /// Hop-by-Hop (0), Routing (43), Destination Options (60), AH (51), and
-/// Fragment (44) headers, bounded to 6 iterations (RFC 8200 §4.1 — a
-/// fixed-order chain rarely exceeds a handful). No-Next-Header (59) and a
-/// chain that runs off the end of the packet return `None`.
+/// Fragment (44) headers, bounded to `MAX_IPV6_EXT_HEADERS` iterations
+/// (RFC 8200 §4.1 — a fixed-order chain rarely exceeds a handful).
+/// No-Next-Header (59) and a chain that runs off the end of the packet
+/// return `None`.
 ///
-/// This is the NAT64 translator's own bounded walk; it deliberately does NOT
-/// reach into `crate::afxdp` (which itself depends on `crate::nat64`). It
-/// mirrors `afxdp::frame::inspect::packet_rel_l4_offset_and_protocol`; the
-/// unification onto a single shared walker is tracked separately (#2292) and
-/// is not a prerequisite for this fix.
+/// This is the NAT64 translator's own bounded walk. The loop LOGIC is kept
+/// local (the private walk deliberately does not call into `crate::afxdp`,
+/// which itself depends on `crate::nat64`), but the BOUND is now the single
+/// canonical `MAX_IPV6_EXT_HEADERS` (8) imported from `crate::afxdp` — the
+/// same const the forwarding/screen walkers use (#4435). Before #4435 this
+/// walker surrendered at 6, so a valid 7-ext-header packet to a NAT64 prefix
+/// was dropped here while `afxdp::frame::inspect` accepted it. Sharing the
+/// const removes that skew; the full walker-function unification onto a
+/// single shared implementation remains tracked separately (#2292) and is
+/// not a prerequisite for the bound alignment.
 ///
 /// The returned offset is only the START of the L4 header; the caller is
 /// responsible for the non-first-fragment check (a non-first fragment carries
@@ -579,7 +590,7 @@ fn ipv6_l4_offset_and_protocol(packet: &[u8]) -> Option<(usize, u8)> {
     }
     let mut protocol = packet[6];
     let mut offset = 40usize;
-    for _ in 0..6 {
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
             // Hop-by-Hop / Routing / Destination Options: length in 8-byte
             // units, NOT counting the first 8 bytes (RFC 8200).
@@ -634,7 +645,7 @@ fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
     }
     let mut protocol = packet[6];
     let mut offset = 40usize;
-    for _ in 0..6 {
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
             0 | 43 | 60 => {
                 let Some(opt) = packet.get(offset..offset + 2) else {
@@ -701,7 +712,7 @@ fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
     }
     let mut protocol = packet[6];
     let mut offset = 40usize;
-    for _ in 0..6 {
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
             0 | 43 | 60 => {
                 let opt = packet.get(offset..offset + 2)?;

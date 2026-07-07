@@ -2154,6 +2154,182 @@ fn translate_v6_to_v4_non_first_fragment_dropped() {
     );
 }
 
+// ===========================================================================
+// #4435: the NAT64 private ext-header walkers must share the canonical
+// forwarding/screen bound `MAX_IPV6_EXT_HEADERS` (8), not a stale 6. Before
+// #4435 a valid 7-ext-header packet to a NAT64 prefix was DROPPED here while
+// the forwarding path accepted it. These are FAIL-ON-REVERT: reverting the
+// bound to 6 makes the 7-header packet surrender (`ipv6_l4_offset_and_protocol`
+// returns the non-terminal ext-header type -> the translator's `_ => None`),
+// so the walk assertion / `expect("translate")` below panics.
+// ===========================================================================
+
+/// Build an IPv6 packet carrying `n` back-to-back 8-byte Destination-Options
+/// (60) extension headers before the terminal L4 (`l4_proto` / `l4` bytes).
+/// Each Dest-Opts header is the minimum 8 octets (Hdr Ext Len = 0). Used to
+/// drive the walk bound: the walkers resolve up to `MAX_IPV6_EXT_HEADERS`
+/// headers and fail closed beyond it.
+fn build_v6_with_n_ext_then_l4(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    n: usize,
+    l4_proto: u8,
+    hl: u8,
+    l4: &[u8],
+) -> Vec<u8> {
+    let ext_total = n * 8;
+    let mut p = vec![0u8; 40 + ext_total + l4.len()];
+    p[0] = 0x60;
+    // IPv6 payload_len covers the whole ext-header chain + L4.
+    p[4..6].copy_from_slice(&((ext_total + l4.len()) as u16).to_be_bytes());
+    p[6] = if n == 0 { l4_proto } else { 60 }; // base next-header
+    p[7] = hl;
+    p[8..24].copy_from_slice(&src.octets());
+    p[24..40].copy_from_slice(&dst.octets());
+    // Chain of Dest-Opts headers; each next-header points at the following
+    // ext header, and the LAST points at the terminal L4.
+    for i in 0..n {
+        let off = 40 + i * 8;
+        p[off] = if i + 1 == n { l4_proto } else { 60 }; // next-header
+        p[off + 1] = 0; // Hdr Ext Len = 0 -> minimal 8-byte header
+        // off+2..off+8 are option/padding bytes (left zero).
+    }
+    let l4_off = 40 + ext_total;
+    p[l4_off..l4_off + l4.len()].copy_from_slice(l4);
+    p
+}
+
+fn nat64_probe_udp() -> Vec<u8> {
+    let mut udp = vec![0u8; 8 + 4];
+    udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&12u16.to_be_bytes()); // UDP length
+    udp[8..12].copy_from_slice(b"data");
+    udp
+}
+
+#[test]
+fn nat64_v6_to_v4_seven_ext_headers_translates() {
+    // #4435 FAIL-ON-REVERT: a chain of 7 resolvable ext headers before UDP.
+    // The canonical bound MAX_IPV6_EXT_HEADERS (8) resolves 7 ext headers +
+    // the terminal L4 (the 8th loop iteration consumes the terminal). On the
+    // stale 6-bound the walk surrenders after 6 headers -> protocol=60 (the
+    // 7th, unconsumed) -> `_ => return None` drop.
+    assert!(
+        MAX_IPV6_EXT_HEADERS >= 8,
+        "canonical bound must resolve a 7-ext-header chain"
+    );
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let udp = nat64_probe_udp();
+
+    let pkt = build_v6_with_n_ext_then_l4(src_v6, dst_v6, 7, PROTO_UDP, 64, &udp);
+
+    // The walk resolves the terminal UDP after 7 8-byte ext headers.
+    let (off, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("walk must find L4");
+    assert_eq!(off, 40 + 7 * 8, "UDP starts after 7 8-byte ext headers");
+    assert_eq!(proto, PROTO_UDP);
+
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false)
+        .expect("UDP behind 7 ext headers must translate, not drop (#4435)");
+    assert_eq!(v4[9], PROTO_UDP, "protocol must be the terminal L4");
+    assert_eq!(
+        v4.len(),
+        20 + udp.len(),
+        "all 7 ext headers stripped from output"
+    );
+    assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 5353);
+    assert_eq!(u16::from_be_bytes([v4[22], v4[23]]), 53);
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum valid");
+}
+
+#[test]
+fn nat64_v6_to_v4_oversized_ext_chain_fails_closed() {
+    // #4435: a chain LONGER than MAX_IPV6_EXT_HEADERS must still fail closed
+    // (drop), matching the canonical parser's cap. After consuming the bound's
+    // worth of ext headers the walk is still on an ext header (60), a non-L4
+    // protocol, so the translator drops. This preserves the fail-closed
+    // semantics — the fix widens the accepted chain from 6 to 8, it does not
+    // remove the cap.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let udp = nat64_probe_udp();
+
+    let pkt = build_v6_with_n_ext_then_l4(
+        src_v6,
+        dst_v6,
+        MAX_IPV6_EXT_HEADERS + 1,
+        PROTO_UDP,
+        64,
+        &udp,
+    );
+
+    // The walk surrenders on a non-terminal ext-header protocol, never the L4.
+    let (_, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("walk returns the surrender tuple");
+    assert_ne!(proto, PROTO_UDP, "oversized chain must NOT resolve the terminal L4");
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "oversized ext-header chain must fail closed (drop), matching the canonical cap"
+    );
+}
+
+#[test]
+fn nat64_v6_to_v4_two_ext_headers_unaffected() {
+    // #4435 sanity: a normal short chain (2 ext headers) resolves identically
+    // under the 6- and 8-bound — the fix must not perturb the common case.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let udp = nat64_probe_udp();
+
+    let pkt = build_v6_with_n_ext_then_l4(src_v6, dst_v6, 2, PROTO_UDP, 64, &udp);
+    let (off, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("walk finds L4");
+    assert_eq!(off, 40 + 2 * 8);
+    assert_eq!(proto, PROTO_UDP);
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("2-ext-header UDP translates");
+    assert_eq!(v4[9], PROTO_UDP);
+    assert_eq!(v4.len(), 20 + udp.len());
+}
+
+#[test]
+fn nat64_v6_to_v4_embedded_icmp_seven_ext_headers_translates() {
+    // #4435 FAIL-ON-REVERT (embedded-ICMP path): an ICMPv6 Time-Exceeded whose
+    // quoted original packet carries 7 ext headers before TCP. The embedded
+    // translator reuses `ipv6_l4_offset_and_protocol`; on the stale 6-bound it
+    // surrenders at the 7th header and drops the whole error (traceroute/PMTUD
+    // blackhole). With the shared bound the quoted packet is translated.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // Quoted original = v6 packet with 7 ext headers then 8 bytes of TCP.
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0x09, 0x08, 0x07, 0x06];
+    let embedded = build_v6_with_n_ext_then_l4(client_v6, dst_v6, 7, PROTO_TCP, 1, &inner_l4);
+    let icmp = build_icmpv6_error(3, 0, [0, 0, 0, 0], &embedded);
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, client_v6, PROTO_ICMPV6_C, 64, &icmp);
+    v6_pkt[42..44].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, client_v6, PROTO_ICMPV6_C, &v6_pkt[40..]);
+    v6_pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&v6_pkt, snat_v4, dst_v4, false)
+        .expect("ICMPv6 error quoting 7-ext-header TCP must translate, not drop (#4435)");
+    assert_eq!(v4[20], 11, "outer ICMPv4 Time Exceeded type");
+    assert_eq!(checksum16(&v4[..20]), 0);
+    // Embedded translated IPv4 header starts at v4[28] (20 outer IP + 8 ICMP).
+    let emb = &v4[28..];
+    assert_eq!(emb[9], PROTO_TCP, "embedded protocol = TCP, ext headers stripped");
+    assert_eq!(&emb[12..16], &dst_v4.octets(), "embedded src mapped to dst_v4");
+    assert_eq!(&emb[16..20], &snat_v4.octets(), "embedded dst mapped to snat_v4");
+    assert_eq!(checksum16(&emb[..20]), 0, "embedded IPv4 header checksum valid");
+}
+
 #[test]
 fn translate_v6_to_v4_first_fragment_still_translates() {
     // A FIRST fragment (offset 0) carries the real L4 header and must still
