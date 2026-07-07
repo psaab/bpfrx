@@ -1,0 +1,422 @@
+package userspace
+
+import (
+	"log/slog"
+	"sort"
+
+	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+)
+
+// buildSourceNATSnapshots is the static-only convenience wrapper retained for
+// callers that carry no dynamic-address feed overlay (tests, legacy paths). The
+// production snapshot path uses buildSourceNATSnapshotsWithFeeds so feed-backed
+// `match {source,destination}-address-name` references resolve their live feed
+// prefixes (#3303).
+func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []SourceNATRuleSnapshot {
+	return buildSourceNATSnapshotsWithFeeds(cfg, natCounterIDs, nil)
+}
+
+func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[string]uint32, feedOverlay map[string][]string) []SourceNATRuleSnapshot {
+	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
+		return nil
+	}
+	out := make([]SourceNATRuleSnapshot, 0)
+	for _, rs := range cfg.Security.NAT.Source {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			sourceAddrs := append([]string(nil), rule.Match.SourceAddresses...)
+			if len(sourceAddrs) == 0 && rule.Match.SourceAddress != "" {
+				sourceAddrs = append(sourceAddrs, rule.Match.SourceAddress)
+			}
+			// #2416: resolve `match source-address-name` for SNAT too — same
+			// builder gap as DNAT (the source list only carried literal
+			// prefixes). See appendNATSourceAddressName.
+			// #3431: resolve EVERY name of a bracket list / repeated leaf.
+			for _, name := range rule.Match.SourceAddressNameList() {
+				sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, name)
+			}
+			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
+			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
+				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
+			}
+			// #3229: resolve `match destination-address-name` the same way the
+			// source path resolves source-address-name — without this a
+			// name-scoped destination constraint published an EMPTY list =
+			// match-any destination (fail-open).
+			// #3431: resolve EVERY name of a bracket list / repeated leaf.
+			for _, name := range rule.Match.DestinationAddressNameList() {
+				destAddrs = appendNATDestinationAddressName(cfg, feedOverlay, destAddrs, name)
+			}
+			var poolAddresses []string
+			var portLow, portHigh uint16
+			var poolNoTranslation bool
+			var persistentNAT bool
+			var persistentNATPermitAnyRemoteHost bool
+			var persistentNATPermit string
+			var persistentNATInactivityTimeout int
+			var poolUnusable bool
+			var poolUnusableReason string
+			if rule.Then.PoolName != "" {
+				pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
+				if !ok || pool == nil {
+					slog.Warn("userspace snapshot: marking source NAT rule with missing pool unusable",
+						"rule", rule.Name, "pool", rule.Then.PoolName)
+					poolUnusable = true
+					poolUnusableReason = "missing_pool"
+				} else {
+					if pool.Address != "" {
+						poolAddresses = append(poolAddresses, pool.Address)
+					}
+					poolAddresses = append(poolAddresses, pool.Addresses...)
+					if len(poolAddresses) == 0 {
+						slog.Warn("userspace snapshot: marking source NAT rule with empty pool unusable",
+							"rule", rule.Name, "pool", rule.Then.PoolName)
+						poolUnusable = true
+						poolUnusableReason = "empty_pool"
+					}
+					// #3906: `port no-translation` preserves the source port.
+					// The dataplane takes the address-only path and ignores the
+					// port range in this mode, so a defaulted/valid range is
+					// fine even when no-translation is set.
+					poolNoTranslation = pool.PortNoTranslation
+					var valid bool
+					portLow, portHigh, valid = sourceNATPoolPortRange(pool)
+					if !valid {
+						slog.Warn("userspace snapshot: marking source NAT rule with invalid pool port range unusable",
+							"rule", rule.Name, "pool", rule.Then.PoolName,
+							"port_low", pool.PortLow, "port_high", pool.PortHigh)
+						poolUnusable = true
+						poolUnusableReason = "invalid_port_range"
+					}
+					if pool.PersistentNAT != nil {
+						persistentNAT = true
+						// #2823: carry the full three-way permit enum. Default
+						// an unset mode to target-host-port (the pre-#2823
+						// false-flag (dst_ip, dst_port) keying) so existing
+						// configs stay byte-identical. The
+						// PermitAnyRemoteHost bool is kept on the wire for
+						// back-compat with an older helper that predates the
+						// enum (#1961 wire-skew discipline).
+						permit := pool.PersistentNAT.Permit
+						if permit == "" {
+							permit = config.PersistentNATPermitTargetHostPort
+						}
+						persistentNATPermit = string(permit)
+						persistentNATPermitAnyRemoteHost = permit == config.PersistentNATPermitAnyRemoteHost
+						persistentNATInactivityTimeout = pool.PersistentNAT.InactivityTimeout
+						if persistentNATInactivityTimeout <= 0 {
+							persistentNATInactivityTimeout = 300
+						}
+					}
+				}
+			}
+			// #3429: carry the source-NAT L4 match constraints to the
+			// dataplane. `match destination-port` becomes a set of inclusive
+			// port ranges; `match application` is pre-expanded to (protocol,
+			// port-range) terms (an application-set yields one term per resolved
+			// member). The Rust matcher enforces these before translating AND
+			// before applying a `then source-nat off` exemption, so a
+			// port/app-scoped rule no longer silently widens to every port.
+			matchDestPorts := sourceNATDestPortRanges(rule.Match.DestinationPorts, rule.Match.InvalidDestinationPorts)
+			matchApps := buildSourceNATAppTerms(cfg, rule.Match.ApplicationList())
+
+			out = append(out, SourceNATRuleSnapshot{
+				Name:                             rule.Name,
+				FromZone:                         rs.FromZone,
+				ToZone:                           rs.ToZone,
+				FromInterface:                    rs.FromInterface,
+				ToInterface:                      rs.ToInterface,
+				FromRoutingInstance:              rs.FromRoutingInstance,
+				ToRoutingInstance:                rs.ToRoutingInstance,
+				SourceAddresses:                  sourceAddrs,
+				DestinationAddresses:             destAddrs,
+				InterfaceMode:                    rule.Then.Interface,
+				Off:                              rule.Then.Off,
+				PoolName:                         rule.Then.PoolName,
+				PoolAddresses:                    poolAddresses,
+				PortLow:                          portLow,
+				PortHigh:                         portHigh,
+				PoolNoTranslation:                poolNoTranslation,
+				AddressPersistent:                cfg.Security.NAT.AddressPersistent,
+				PersistentNAT:                    persistentNAT,
+				PersistentNATPermitAnyRemoteHost: persistentNATPermitAnyRemoteHost,
+				PersistentNATPermit:              persistentNATPermit,
+				PersistentNATInactivityTimeout:   persistentNATInactivityTimeout,
+				PoolUnusable:                     poolUnusable,
+				PoolUnusableReason:               poolUnusableReason,
+				MatchDestinationPorts:            matchDestPorts,
+				MatchApplications:                matchApps,
+				CounterID:                        natCounterID(natCounterIDs, dataplane.NATCounterTypeSource, rs.Name, rule.Name),
+			})
+		}
+	}
+	// #4161: Junos source-NAT rule-set precedence is MOST-SPECIFIC-SCOPE-WINS,
+	// not config-order first-match. Among overlapping rule-sets whose scopes
+	// all match a flow, Junos selects by the specificity of the match context
+	// — interface > zone > routing-instance (interface most specific) — and
+	// only then applies within-set rule order. The Rust matcher
+	// (userspace-dp/src/nat/source.rs match_source_nat_result_for_tuple) is
+	// first-match on slice order, so we make "first match" == "most-specific
+	// match" by STABLE-sorting the emitted snapshot by context tier here. A
+	// stable sort keeps config order WITHIN a tier (Junos within-rule-set order
+	// plus equal-specificity rule-set-definition order) and keeps each
+	// rule-set's rules contiguous, so rule-sets never interleave. The tier is a
+	// pure function of the six scope fields already stamped above — no new wire
+	// plumbing (they were carried since #3096). This is why the Rust first-match
+	// loop is deliberately left unchanged: it reads a pre-tiered Vec.
+	//
+	// Scope note: DNAT (destination.rs match_entries) and static
+	// (static_nat.rs pick_scoped) tier only zone-SCOPED vs zone-WILDCARD — a
+	// narrower axis that does NOT rank interface above zone. Extending this full
+	// interface>zone>routing-instance hierarchy to them is a separate,
+	// out-of-scope follow-up.
+	sort.SliceStable(out, func(i, j int) bool {
+		return sourceNATScopeTier(out[i]) < sourceNATScopeTier(out[j])
+	})
+	return out
+}
+
+// Source-NAT context-specificity tiers (#4161). LOWER = more specific = higher
+// precedence, matching Junos rule-set selection (interface most specific).
+const (
+	snatTierInterface       = 0
+	snatTierZone            = 1
+	snatTierRoutingInstance = 2
+	snatTierUnscoped        = 3
+)
+
+// sourceNATScopeTier returns the Junos context-specificity tier of a
+// source-NAT rule-set snapshot (#4161). A rule-set may carry both a `from` and
+// a `to` context, and they may be of different kinds; either context narrows
+// the match, so the MORE-SPECIFIC of the two governs the rule-set's
+// precedence: tier = MIN(from-tier, to-tier). This MIN default is the
+// vSRX-pinned semantic (confirmed by the L-9 overlap tests).
+func sourceNATScopeTier(s SourceNATRuleSnapshot) int {
+	from := scopeContextTier(s.FromInterface, s.FromZone, s.FromRoutingInstance)
+	to := scopeContextTier(s.ToInterface, s.ToZone, s.ToRoutingInstance)
+	if to < from {
+		return to
+	}
+	return from
+}
+
+// scopeContextTier maps a single from/to context to its specificity tier
+// (#4161): interface=0, zone=1, routing-instance=2.
+//
+// The wildcard / match-any context is the EMPTY string on every axis (all
+// three args ""), which falls through to snatTierUnscoped (3). That empty
+// value is exactly what the compiler emits for an absent `from`/`to` clause:
+// collectNATScopes (pkg/config/compiler_nat.go:1083-1088) defaults a missing
+// side to {kind:"zone", value:""} → FromZone/ToZone "" — the legacy
+// global/match-any scope. So "wildcard" here means empty, NOT a zone named
+// "any": a NON-EMPTY zone (tier 1) is always a SPECIFIC zone, and a literal
+// `from zone any` is FromZone="any", a specific zone literally named "any", not
+// a wildcard. This is CONSISTENT with the Rust eligibility check
+// (source.rs scope_matches: `!from_zone.is_empty() && from_zone != ingress`),
+// which only special-cases the empty string and matches "any" literally. NAT
+// rule-set from/to-contexts do NOT treat "any" as a wildcard (unlike security
+// policies' from-zone/to-zone). A future maintainer must not special-case
+// "any" as tier-unscoped — that would diverge from the matcher and mis-tier a
+// legitimately-named zone.
+//
+// A Junos from/to clause names exactly one kind of context; a hostile config
+// that sets more than one is ranked by its most-specific present field (the
+// Rust scope_matches AND-filters every set field regardless, so this only
+// affects precedence, never eligibility).
+func scopeContextTier(iface, zone, routingInstance string) int {
+	switch {
+	case iface != "":
+		return snatTierInterface
+	case zone != "":
+		return snatTierZone
+	case routingInstance != "":
+		return snatTierRoutingInstance
+	default:
+		return snatTierUnscoped
+	}
+}
+
+// natProtoAny is the source-NAT match-term protocol wildcard, mirroring the
+// Rust SOURCE_NAT_PROTO_ANY (256): outside the 0-255 protocol range so it never
+// aliases protocol 0 (HOPOPT). It denotes a GENUINELY unconstrained term and
+// must never be used as a fallback for an unresolvable protocol (that is a
+// fail-open widen — Codex finding on PR #3471; see natAppProtoNumber). The
+// builder does not currently emit it: an application always constrains protocol,
+// and an unconstrained `match application` (empty / "any") produces NO term at
+// all rather than an any-protocol term. Kept defined to document the wire
+// wildcard the Rust matcher honors and to keep the two sides legible. #3429.
+const natProtoAny uint16 = 256
+
+var _ = natProtoAny // reserved wire wildcard; see doc above (not emitted today)
+
+// natProtoNever is a reserved protocol sentinel that can never equal a real
+// 0-255 protocol and is not the wildcard, so a term carrying it matches no flow
+// (#3429). Emitted for a `match application` that was configured but resolved to
+// ZERO terms (a typo / dangling reference / empty application-set) so the rule
+// fails CLOSED — it matches nothing — rather than silently widening to every
+// protocol/port. The commit-time strict gate (#2187) rejects the typo so this
+// is only the lenient load / peer-sync backstop.
+const natProtoNever uint16 = 0xFFFF
+
+// sourceNATDestPortRanges coalesces a configured source-NAT `match
+// destination-port` list to wire ranges, failing CLOSED when the constraint was
+// specified but nothing is representable (#3429, #3546). The two inputs mirror
+// the parser's two signals (parseDNATPortList): `ports` is every numeric token
+// (out-of-range values included, dropped by coalescePortRanges) and `invalid`
+// is the raw non-numeric tokens (`http`, garbage) the parser preserved on
+// NATMatch.InvalidDestinationPorts. A constraint is CONSIDERED CONFIGURED when
+// either list is non-empty. An all-empty input (no constraint configured) stays
+// empty — a legitimate match-any-port wildcard. A configured constraint that
+// coalesces to nothing — every numeric out of 1..65535, OR an all-nonnumeric
+// list whose only tokens are invalid (#3546) — returns the never-match sentinel
+// so the rule matches NOTHING instead of widening to every port. A mix of one
+// valid port and invalid tokens (`[ http 8080 ]`) keeps the valid port (8080),
+// matching the lenient DNAT builder. The strict commit gate
+// (validateNATMatchDestinationPortStrict) rejects both the out-of-range and the
+// nonnumeric case at commit; this guard hardens the #1960 tolerant-load /
+// peer-sync path, where the bad rule would otherwise reach the dataplane.
+//
+// Before #3546 this builder consulted only `ports` and ignored `invalid`, so an
+// all-nonnumeric source-NAT dest-port (e.g. `http`) parsed to an EMPTY `ports`
+// list, coalesced to nothing, and — with no configured-numeric to trip the
+// existing fail-closed branch — returned empty = unconstrained match-any-port
+// (the AGY/Codex fail-open residual split out of #3446). The DNAT builder
+// already failed closed on this case via InvalidDestinationPorts.
+//
+// NOTE: source NAT has no `match source-port` grammar (the SNAT parser only
+// reads source/destination address(-name), destination-port, and application),
+// so there is no source-port coalesce path to guard symmetrically.
+func sourceNATDestPortRanges(ports []int, invalid []string) []NatPortRangeWire {
+	ranges := coalescePortRanges(ports)
+	if (len(ports) > 0 || len(invalid) > 0) && len(ranges) == 0 {
+		return []NatPortRangeWire{natNeverMatchPortRange}
+	}
+	return ranges
+}
+
+// natAppProtoNumber resolves an application's protocol token to its IANA number
+// for the source-NAT match wire (#3429). A resolvable token — including a
+// numeric "0" (HOPOPT) — maps to its IANA value via the appid SSOT
+// (appid.ProtocolNumber, the same resolver the policy path uses). An EMPTY or
+// unresolvable protocol returns natProtoNever (0xFFFF), a never-match sentinel:
+// a Junos application ALWAYS constrains protocol, so a term whose protocol
+// cannot be resolved must match NOTHING. Returning natProtoAny (256, the
+// wildcard) here would widen the app-scoped rule to EVERY protocol — a fail-open
+// of the same class #3429 closes (Codex finding on PR #3471). natProtoAny is
+// reserved for a genuinely unconstrained term, which the app path never produces
+// (the "any" / empty app name short-circuits to no terms before this is called).
+func natAppProtoNumber(proto string) uint16 {
+	if n, ok := appid.ProtocolNumber(proto); ok {
+		return uint16(n)
+	}
+	return natProtoNever
+}
+
+// buildSourceNATAppTerms resolves a source-NAT `match application [ <name>... ]`
+// into (protocol, destination-port range, source-port range) terms for the
+// dataplane match (#3429, #3491). A single user/predefined application yields
+// one term; an application-set yields one term per resolved member; #3431 a
+// multi-value list yields the UNION of every member's terms (match ANY). The
+// empty list (or a sole "any") is unconstrained and yields no terms. A term's
+// Ports are the application's destination-port spec coalesced to ranges and
+// SrcPorts its source-port spec; an application with no destination (resp.
+// source) port leaves that axis empty (unconstrained on it). When EVERY
+// configured reference resolves to nothing, a single never-match term is
+// emitted so the rule fails closed (see natProtoNever); an unresolvable member
+// in a list that has at least one good member just contributes nothing (the
+// strict commit gate rejects the typo — this is the lenient/peer-sync path).
+func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermWire {
+	if cfg == nil {
+		return nil
+	}
+	// Collapse a list that carries only the unconstrained "any" / empty
+	// tokens to "no constraint" (nil terms). A real app alongside "any" is
+	// kept verbatim — "any" then resolves to nothing per the loop below.
+	configured := false
+	for _, n := range appNames {
+		if n != "" && n != "any" {
+			configured = true
+			break
+		}
+	}
+	if !configured {
+		return nil
+	}
+	userApps := cfg.Applications.Applications
+	var terms []NatAppTermWire
+	addApp := func(a *config.Application) {
+		if a == nil {
+			return
+		}
+		ports := coalescePortRanges(appPortsFromSpec(a.DestinationPort))
+		if a.DestinationPort != "" && len(ports) == 0 {
+			// #3429: the application carried a destination-port spec but none of
+			// it is representable (out of 1..65535) — fail CLOSED so the term
+			// matches nothing rather than silently demoting to a protocol-only
+			// (any-port) match. An app with NO destination-port keeps Ports empty
+			// (a legitimate protocol-only match).
+			ports = []NatPortRangeWire{natNeverMatchPortRange}
+		}
+		// #3491: the application's source-port constraint, dropped before this
+		// fix. Same fail-CLOSED guard as the destination-port axis: an app that
+		// configured a source-port but coalesces to nothing (all out of
+		// 1..65535) gets the never-match sentinel rather than widening to any
+		// source port. An app with NO source-port keeps SrcPorts empty (a
+		// legitimate source-port-unconstrained match — the common case).
+		srcPorts := coalescePortRanges(appPortsFromSpec(a.SourcePort))
+		if a.SourcePort != "" && len(srcPorts) == 0 {
+			srcPorts = []NatPortRangeWire{natNeverMatchPortRange}
+		}
+		terms = append(terms, NatAppTermWire{
+			Protocol: natAppProtoNumber(a.Protocol),
+			Ports:    ports,
+			SrcPorts: srcPorts,
+		})
+	}
+	for _, appName := range appNames {
+		if appName == "" || appName == "any" {
+			continue
+		}
+		if app, found := config.ResolveApplication(appName, userApps); found {
+			addApp(app)
+		} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+			if expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications); err == nil {
+				for _, termName := range expanded {
+					if a, ok := config.ResolveApplication(termName, userApps); ok {
+						addApp(a)
+					}
+				}
+			}
+		}
+	}
+	if len(terms) == 0 {
+		// Every configured app reference resolved to nothing -> fail closed.
+		terms = []NatAppTermWire{{Protocol: natProtoNever}}
+	}
+	return terms
+}
+
+func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
+	if pool == nil {
+		return 0, 0, false
+	}
+	low := pool.PortLow
+	if low == 0 {
+		low = 1024
+	}
+	high := pool.PortHigh
+	if high == 0 {
+		high = 65535
+	}
+	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
+		return 0, 0, false
+	}
+	return uint16(low), uint16(high), true
+}
