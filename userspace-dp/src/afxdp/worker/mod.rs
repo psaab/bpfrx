@@ -1412,6 +1412,9 @@ pub(crate) struct BindingLiveSnapshot {
     /// #2291: cumulative fail-closed NAT64 drops (prefix matched, no source
     /// pool available) snapshotted from BindingLiveState.
     pub(crate) nat64_no_source_pool: u64,
+    /// #4477: cumulative source-NAT allocation failures snapshotted from
+    /// BindingLiveState. Bridged into `GlobalCtrNATAllocFail` (Go side).
+    pub(crate) nat_alloc_fail: u64,
     pub(crate) slow_path_packets: u64,
     pub(crate) slow_path_bytes: u64,
     pub(crate) slow_path_local_delivery_packets: u64,

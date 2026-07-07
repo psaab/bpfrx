@@ -409,6 +409,27 @@ From zone: guest, To zone: lan
     labeled Prometheus series `xpf_screen_drops_by_reason_total{reason=...}`
     exposes the breakdown for alerting; the aggregate `xpf_screen_drops_total`
     is unchanged.
+  - **Packets-dropped / NAT-allocation-failure accounting (#4477):** the
+    `Packets dropped` (`dataplane.GlobalCtrDrops`) and `NAT allocation failures`
+    (`dataplane.GlobalCtrNATAllocFail`) rows of `show security flow statistics`
+    were dead counters — the userspace counter bridge never wrote either index,
+    so `ReadGlobalCounter` returned a clean `(0, nil)` (the #3345
+    `ErrCounterNotPopulated` disclosure never fired) and the CLI, gRPC, REST
+    (`drops` / `nat_alloc_fails`), and Prometheus (`xpf_drops_total` /
+    `xpf_nat_alloc_fails_total`) surfaces printed a false, always-0 value even
+    while the firewall was actively dropping traffic under attack. The Rust
+    helper now counts each source-NAT allocation failure per worker at the single
+    `record_source_nat_failure` chokepoint (`BindingStatus.nat_alloc_fail` — a
+    rule matched but no translated mapping could be allocated: missing/empty/
+    invalid/exhausted pool, wrong family, or a non-first fragment on a
+    port-translating rule; the packet is dropped). The Go manager sums it across
+    bindings and pushes the per-poll delta into `GlobalCtrNATAllocFail`, and
+    folds it — together with policy denies, screen/IDS drops, and host-inbound
+    denies — into the aggregate `Packets dropped` figure pushed into
+    `GlobalCtrDrops` (a total whose breakdown is exactly the four rows rendered
+    beneath it), mirroring the host-inbound / NAT64 / per-screen-reason plumbing.
+    Once bridged the counters carry real values, so the #3345 disclosure
+    correctly stays silent for them.
   - **Token validation (#3200):** `host-inbound-traffic system-services
     <tok>` / `protocols <tok>` is now validated at commit against the
     recognized-token SSOT (`pkg/config/host_inbound_tokens.go`:

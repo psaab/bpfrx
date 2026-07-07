@@ -115,6 +115,7 @@
     "mirrored_packets": 0,
     "nat64_no_source_pool": 0,
     "nat64_translations": 0,
+    "nat_alloc_fail": 0,
     "neighbor_miss_packets": 0,
     "next_table_packets": 0,
     "outstanding_tx": 0,

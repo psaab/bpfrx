@@ -448,6 +448,12 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// flags a misconfigured/exhausted source pool that would otherwise have
     /// leaked the synthetic IPv6 destination upstream (the pre-fix fail-open).
     pub(super) nat64_no_source_pool: AtomicU64,
+    /// #4477: cumulative source-NAT allocation failures (rule matched, no
+    /// translated mapping could be allocated — missing/empty/invalid/exhausted
+    /// pool, wrong family, or a non-first fragment on a port-translating rule).
+    /// The packet is dropped. Bridged into `GlobalCtrNATAllocFail` (Go side) so
+    /// the `NAT allocation failures` operator counter is no longer a dead 0.
+    pub(super) nat_alloc_fail: AtomicU64,
     pub(super) slow_path_packets: AtomicU64,
     pub(super) slow_path_bytes: AtomicU64,
     pub(super) slow_path_local_delivery_packets: AtomicU64,
@@ -854,6 +860,7 @@ impl BindingLiveState {
             dnat_packets: AtomicU64::new(0),
             nat64_translations: AtomicU64::new(0),
             nat64_no_source_pool: AtomicU64::new(0),
+            nat_alloc_fail: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
             slow_path_local_delivery_packets: AtomicU64::new(0),

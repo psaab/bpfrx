@@ -509,6 +509,16 @@ pub(in crate::afxdp) struct BatchCounters {
     // IPv6 (the pre-fix fail-open). Flushed to
     // BindingLiveState.nat64_no_source_pool.
     nat64_no_source_pool: u64,
+    // #4477: source-NAT allocation failures — a source-NAT rule matched but no
+    // translated mapping could be allocated (missing/empty/invalid pool,
+    // exhausted port allocator, wrong family, or a non-first fragment on a
+    // port-translating rule). The packet is dropped. Bumped at the cold
+    // `record_source_nat_failure` site and flushed to
+    // BindingLiveState.nat_alloc_fail; the Go control plane bridges it into the
+    // `GlobalCtrNATAllocFail` counter that `show security flow statistics`
+    // ("NAT allocation failures"), the REST/Prometheus surfaces, and the CLI
+    // read — dead-counter fix for the observability lie.
+    nat_alloc_fail: u64,
     // #1187: 8 disposition-path counters added to eliminate per-packet
     // MESI thrash on BindingLiveState atomics during DDoS / config-
     // reload windows. See docs/pr/1187-telemetry-double-buffer/plan.md
@@ -681,6 +691,12 @@ impl BatchCounters {
             live.nat64_no_source_pool
                 .fetch_add(self.nat64_no_source_pool, Ordering::Relaxed);
             self.nat64_no_source_pool = 0;
+        }
+        // #4477: source-NAT allocation-failure tally.
+        if self.nat_alloc_fail != 0 {
+            live.nat_alloc_fail
+                .fetch_add(self.nat_alloc_fail, Ordering::Relaxed);
+            self.nat_alloc_fail = 0;
         }
         // #1187 disposition-path counters
         if self.screen_drops != 0 {

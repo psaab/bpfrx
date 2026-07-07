@@ -134,6 +134,7 @@ impl BindingLiveState {
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             nat64_translations: self.nat64_translations.load(Ordering::Relaxed),
             nat64_no_source_pool: self.nat64_no_source_pool.load(Ordering::Relaxed),
+            nat_alloc_fail: self.nat_alloc_fail.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
             slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
             slow_path_local_delivery_packets: self

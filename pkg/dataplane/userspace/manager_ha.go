@@ -680,6 +680,22 @@ type userspaceCounterSnapshot struct {
 	snatPackets       uint64
 	dnatPackets       uint64
 	nat64Translations uint64
+	// #4477: source-NAT allocation failures, summed across bindings. Pushed
+	// into dataplane.GlobalCtrNATAllocFail; also a term of the aggregate
+	// "Packets dropped" total pushed into dataplane.GlobalCtrDrops.
+	natAllocFail uint64
+}
+
+// totalDrops (#4477) is the aggregate "Packets dropped" figure surfaced by
+// GlobalCtrDrops. It sums the firewall's enforcement/discard drops — policy
+// denies, screen/IDS drops, host-inbound admission denies, and source-NAT
+// allocation failures. These are exactly the four breakdown lines rendered
+// beneath "Packets dropped" in `show security flow statistics`, so the
+// aggregate equals the sum of its parts (a total-with-breakdown, not a
+// double count into any single reason's own index). Before #4477 GlobalCtrDrops
+// was never written and printed a false, always-0 value.
+func (s userspaceCounterSnapshot) totalDrops() uint64 {
+	return s.policyDenied + s.screenDrops + s.hostInboundDenied + s.natAllocFail
 }
 
 // sumBindingCounters aggregates counters across all bindings in a status response.
@@ -708,6 +724,7 @@ func sumBindingCounters(status *ProcessStatus) userspaceCounterSnapshot {
 		s.snatPackets += b.SNATPackets
 		s.dnatPackets += b.DNATPackets
 		s.nat64Translations += b.Nat64Translations
+		s.natAllocFail += b.NatAllocFail
 	}
 	return s
 }
@@ -734,6 +751,16 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 		{dataplane.GlobalCtrTxPackets, safeDelta(cur.txPackets, prev.txPackets)},
 		{dataplane.GlobalCtrSessionsNew, safeDelta(cur.sessionCreates, prev.sessionCreates)},
 		{dataplane.GlobalCtrSessionsClosed, safeDelta(cur.sessionExpires, prev.sessionExpires)},
+		// #4477: bridge the aggregate "Packets dropped" total (policy deny +
+		// screen + host-inbound deny + NAT-alloc-fail) into GlobalCtrDrops and
+		// source-NAT allocation failures into GlobalCtrNATAllocFail. Both
+		// indices were never written before #4477 — ReadGlobalCounter returned a
+		// clean (0, nil) so `show security flow statistics` ("Packets dropped" /
+		// "NAT allocation failures"), REST, Prometheus, and the CLI printed a
+		// false 0 with no #3345 ErrCounterNotPopulated disclosure. Bridging real
+		// deltas populates them so the disclosure correctly stays silent.
+		{dataplane.GlobalCtrDrops, safeDelta(cur.totalDrops(), prev.totalDrops())},
+		{dataplane.GlobalCtrNATAllocFail, safeDelta(cur.natAllocFail, prev.natAllocFail)},
 		{dataplane.GlobalCtrPolicyDeny, safeDelta(cur.policyDenied, prev.policyDenied)},
 		// #3326: surface host-inbound admission denies into the counter the CLI,
 		// gRPC status, REST, and Prometheus collector already read

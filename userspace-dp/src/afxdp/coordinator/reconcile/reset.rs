@@ -49,6 +49,7 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.dnat_packets = 0;
         binding.nat64_translations = 0;
         binding.nat64_no_source_pool = 0;
+        binding.nat_alloc_fail = 0;
         binding.slow_path_packets = 0;
         binding.slow_path_bytes = 0;
         binding.slow_path_local_delivery_packets = 0;
