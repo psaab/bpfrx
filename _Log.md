@@ -38435,3 +38435,47 @@ top.
   pkg/config/compiler_validate_strict_chassis_4434_test.go,
   pkg/config/compiler.go, pkg/cluster/heartbeat.go,
   pkg/cluster/heartbeat_rg_cap_4434_test.go, docs/config-schema.md, _Log.md
+
+## 2026-07-07 — #4420 HI-2 host-inbound fail-open: addressed-but-unzoned interface default-deny (HI-1 verified + deferred)
+- **Timestamp**: 2026-07-07
+- **Action**: Close the #4420 HI-2 host-inbound fail-open. An interface that
+  carries an address but is assigned to NO security zone had its address applied
+  (networkd managed set is built from `cfg.Interfaces`, not zones) yet was NOT
+  scoped by any per-zone host-inbound deny, so host-bound traffic fell through
+  the kernel `xpf_hostinbound` chain's `policy accept` to the host stack with no
+  admission — a fail-open, and a deviation from Junos (an unzoned interface
+  passes no flow / host-inbound traffic). Verified reachable: no commit gate
+  rejects it (`show security zones` even renders "not assigned to any security
+  zone"), and a strict commit-reject was ruled out because 21+ existing tests +
+  real operator workflows legitimately set an interface address before zoning.
+  - **Fix**: new `userspace.BuildUnzonedHostInboundAddrs(cfg)` collects the
+    firewall-local addresses of non-lifeline interfaces in no zone (zoned
+    addresses subtracted, lifelines fxp0/em0/fab* excluded, only when >= 1 zone
+    so a bootstrap/zoneless box is untouched). `daemon_nft.go`
+    `buildHostInboundFilterPayload` now emits a catch-all DROP scoping them
+    (`emitUnzonedHostInboundDeny`), after the global established/ESP-AH/ND/PMTUD
+    accepts, counted under the reserved `junos-host` sentinel label so the #3361
+    kernel-deny scraper reports `zone="junos-host"`. Kernel-only (unzoned
+    interfaces are not AF_XDP-bound), no userspace-dp/Rust change. Mirrors the
+    #3405 per-zone default-deny.
+  - **HI-1 (verified GENUINE, DEFERRED)**: the same chain matches destination
+    address only, so host-bound multicast/broadcast (OSPF/RIP/VRRP/PIM
+    link-local groups, limited/directed broadcast) is not scoped by any `daddr`
+    set and falls through `policy accept` — not subjected to per-zone
+    host-inbound protocols admission (daemon_nft.go `policy accept` +
+    daddr-scoped drops). Correct fix needs per-zone ingress-interface (iifname)
+    multicast admission in lockstep with the Rust classifier AND is a
+    behavior/hardening change (a zone running a routing protocol in FRR without
+    the matching `host-inbound-traffic protocols` knob relies on today's
+    accept). Deferred to a follow-up; documented as a known limitation.
+  - **RED-on-revert**: neutering `emitUnzonedHostInboundDeny` → the payload test
+    fails (missing the unzoned DROP + sentinel counter). Restored; touched Go
+    suites (daemon, dataplane/userspace, config, nftables) green, `go build
+    ./...`, gofmt + vet clean.
+- **File(s)**: pkg/dataplane/userspace/zones.go,
+  pkg/dataplane/userspace/host_inbound_unzoned_4420_test.go,
+  pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_unzoned_4420_test.go,
+  pkg/daemon/host_inbound_nft_test.go,
+  pkg/daemon/host_inbound_per_iface_3362_test.go,
+  pkg/daemon/nft_chain_priority_test.go, pkg/daemon/README.md, _Log.md

@@ -526,6 +526,29 @@ never lock an operator out of a remote box it manages.
   HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages
   are accepted before any deny; a configured zone that resolves to zero
   recognized matches fails OPEN (no deny) rather than locking the zone out.
+  **Unzoned interfaces (#4420 HI-2):** an interface that carries an address but
+  is assigned to NO security zone is not covered by any per-zone view above, so
+  before #4420 its firewall-local addresses fell through the chain's
+  `policy accept` to the host stack with NO host-inbound admission — a fail-open,
+  and a deviation from Junos (an interface not in a zone passes no flow /
+  host-inbound traffic at all). `applyHostInboundFilter` now also scopes a
+  catch-all DROP to those addresses (`userspace.BuildUnzonedHostInboundAddrs`,
+  counted under the reserved `junos-host` sentinel label so the #3361 scraper
+  reports them as `zone="junos-host"`). Lifelines are excluded and zoned
+  addresses subtracted, so it can never strand management or conflict with a zone
+  rule; it is emitted only when the zone model is in use (>= 1 zone), so a
+  bootstrap / zoneless box is left untouched. Unzoned interfaces are not
+  AF_XDP-bound, so the kernel nft deny is the sole and sufficient enforcement
+  point (no userspace-dp change). **Known limitation (#4420 HI-1):** the chain
+  matches destination address only, so host-bound MULTICAST / BROADCAST (OSPF /
+  RIP / VRRP / PIM link-local groups, limited / directed broadcast) is not scoped
+  by any `daddr` set and still falls through `policy accept` — it is NOT
+  subjected to the per-zone host-inbound protocols admission (a Junos-parity
+  gap). Closing it needs per-zone ingress-interface (`iifname`) multicast
+  admission in lockstep with the Rust classifier and is a behavior / hardening
+  change (a zone running a routing protocol in FRR without the matching
+  `host-inbound-traffic protocols` knob relies on today's accept), so it is
+  tracked separately rather than folded here.
   Token→nft mapping (`hostInboundServiceMatches`/`hostInboundProtocolMatches`)
   mirrors the Rust classifier and must stay in sync. **Structured SSOT (#3627
   B1a):** since #3627 these two functions no longer carry their own hard-coded
