@@ -169,6 +169,14 @@ pub(crate) struct WheelPopStats {
     /// residual (plan §4.4 / A2#4); counted so it is OBSERVABLE in the
     /// field rather than a silent drop.
     pub(crate) aged_owner_rg_zero_active_node: usize,
+    /// #4380: idle-crossed entries KEPT ALIVE because their forward↔reverse
+    /// companion is still within its idle window — Junos single-session
+    /// semantics (a session's idle time is measured from the last activity
+    /// in EITHER direction, so a flow active on only one direction must not
+    /// reap its quiet half). Re-stamped from the companion and re-bucketed
+    /// instead of removed; counted so the asymmetric-flow retention is
+    /// observable rather than a silent divergence from the raw wheel.
+    pub(crate) kept_alive_by_companion: usize,
 }
 
 /// #2441: largest configured session timeout (in seconds) that survives the
