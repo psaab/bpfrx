@@ -38167,3 +38167,44 @@ top.
 - **File(s)**: pkg/ipmon/ipmon.go, pkg/ipmon/ipmon_test.go, pkg/ipmon/README.md,
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
   pkg/api/server.go, pkg/daemon/daemon_run.go, docs/multi-wan.md, _Log.md
+
+## 2026-07-06 — #4434 HA heartbeat redundancy-group wire-width cap (codex-172 C172-H02)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Cap chassis-cluster redundancy-group cardinality and id to the
+  single-byte HA heartbeat wire fields; add a defensive marshaler cap.
+  - **Root cause (verified on origin/master)**: the heartbeat group-count field
+    is `buf[8] = uint8(len(pkt.Groups))` (heartbeat.go marshalHeartbeatBody) and
+    each per-group id is `HeartbeatGroup.GroupID uint8`, populated via
+    `uint8(rg.GroupID)` (heartbeat_manager.go buildHeartbeat). The chassis
+    schema does NOT validate the `redundancy-group <id>` instance slot
+    (schema_chassis.go documents it as an unvalidated identity token) and
+    `compileChassis` parses the id with `strconv.Atoi` under no bound. So 256+
+    RGs advertised a count byte of 0 while 256 records were still written (wire
+    desync), a GroupID >255 truncated and collided, and ~293 RGs indexed past
+    the fixed 1472-byte frame and panicked the marshaler. No pre-existing cap
+    existed anywhere — real uncapped wire-safety bug, DRIVEN.
+  - **Fix (commit gate)**: new `validateChassisClusterStrict` in
+    `pkg/config/compiler_validate_strict_chassis.go` hard-rejects at
+    commit / commit-check when `len(RedundancyGroups) > 255` or any
+    `RedundancyGroup.ID` is outside `0..255`, with wire-width-explaining
+    messages. Dispatched from `compileExpanded` (compiler.go) right after
+    `validateFlowAgingStrict`, following the established lenient-downgrade
+    doctrine: strict on commit, warn on the tolerant Load / peer-sync paths
+    (new `lenientChassisRG` opt, set in `CompileConfigLenient` and
+    `CompileConfigForNodeLenient`) so an already-persisted / peer-synced
+    config still boots (#1960 no-brick).
+  - **Fix (marshaler guard)**: `marshalHeartbeatBody` now bounds the group
+    section to `maxHeartbeatGroups = 255`, keeping the count byte consistent
+    with the records written and guaranteeing no index-out-of-range panic even
+    if an over-size config slips past the gate (lenient path). One-shot
+    `slog.Warn` via `sync.Once` so the per-send hot path never floods journald.
+  - **RED-on-revert**: neutralizing the gate → both config subtests accept the
+    bad config (nil error); neutralizing the marshaler cap → 400-group marshal
+    panics `index out of range [1472] with length 1472` and the 256-group count
+    byte wraps to 0. Restored; full `pkg/config` + `pkg/cluster` suites green,
+    `go build ./...`, gofmt + vet clean on touched files.
+- **File(s)**: pkg/config/compiler_validate_strict_chassis.go,
+  pkg/config/compiler_validate_strict_chassis_4434_test.go,
+  pkg/config/compiler.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_rg_cap_4434_test.go, docs/config-schema.md, _Log.md

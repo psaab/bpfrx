@@ -154,7 +154,27 @@ const heartbeatHeaderSize = 9
 // heartbeatGroupSize is GroupID(1) + Priority(2) + Weight(1) + State(1).
 const heartbeatGroupSize = 5
 
+// maxHeartbeatGroups is the largest number of redundancy-group entries the
+// heartbeat wire format can carry. The group-count field (buf[8]) and every
+// per-group id byte are uint8, so a 256th group would overflow the count to 0
+// and desync it from the records still written; and the frame is a fixed
+// maxHeartbeatSize buffer written as 9 + N*5 bytes, so ~293 groups index past
+// it and panic. 255 is the binding uint8 count limit and also fits the buffer
+// (9 + 255*5 = 1284 <= maxHeartbeatSize). The commit-time gate
+// config.validateChassisClusterStrict rejects any config above this; the
+// marshaler caps here as a defensive backstop so it stays panic-safe and the
+// count byte always matches the body even on a leniently-loaded / peer-synced
+// config (#4434).
+const maxHeartbeatGroups = 255
+
 const maxHeartbeatSoftwareVersionSize = 255
+
+// oversizeHeartbeatGroupsWarn logs the defensive group-count truncation in
+// marshalHeartbeatBody at most once per process. Once
+// config.validateChassisClusterStrict gates commits this path should never
+// fire, but the heartbeat sender runs every heartbeat-interval, so an
+// unguarded per-send log would flood journald (#4434).
+var oversizeHeartbeatGroupsWarn sync.Once
 
 func normalizeHAProtocolVersion(version uint16) uint16 {
 	if version == 0 {
@@ -189,10 +209,26 @@ func marshalHeartbeatBody(pkt *HeartbeatPacket, tailReserve int) []byte {
 	buf[4] = heartbeatVersion
 	buf[5] = pkt.NodeID
 	binary.LittleEndian.PutUint16(buf[6:8], pkt.ClusterID)
-	buf[8] = uint8(len(pkt.Groups))
+	// #4434: bound the group section to the heartbeat wire limit. The count
+	// byte and each per-group id byte are uint8 and the frame is a fixed
+	// buffer, so an over-size redundancy-group set would overflow the count
+	// (256 -> 0, desyncing it from the records actually written) or index
+	// past the buffer and panic. The commit gate rejects such a config; this
+	// defensive cap keeps a leniently-loaded / peer-synced config panic-safe
+	// and the count byte consistent with the body.
+	groups := pkt.Groups
+	if len(groups) > maxHeartbeatGroups {
+		oversizeHeartbeatGroupsWarn.Do(func() {
+			slog.Warn("cluster: redundancy-group count exceeds heartbeat wire "+
+				"limit; advertising only the first groups",
+				"groups", len(pkt.Groups), "wire_limit", maxHeartbeatGroups)
+		})
+		groups = groups[:maxHeartbeatGroups]
+	}
+	buf[8] = uint8(len(groups))
 
 	off := heartbeatHeaderSize
-	for _, g := range pkt.Groups {
+	for _, g := range groups {
 		buf[off] = g.GroupID
 		binary.LittleEndian.PutUint16(buf[off+1:off+3], g.Priority)
 		buf[off+3] = g.Weight

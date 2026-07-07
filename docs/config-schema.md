@@ -1565,7 +1565,16 @@ reserved for whole-dataplane selection where a rewrite shim
   NOT typed, with reasons in the `schema_chassis.go` comments: the
   `redundancy-group <id>` / RG-scoped `node <id>` instance-name slots
   (the walker's compiler-faithful contract consumes identity tokens
-  without validation — typing them needs a new walker feature),
+  without validation — typing them needs a new walker feature; note
+  #4434 added a *semantic* commit-time cap on redundancy-group
+  cardinality and id — `validateChassisClusterStrict` in
+  `compiler_validate_strict.go`'s sibling
+  `compiler_validate_strict_chassis.go` — because the HA heartbeat wire
+  encodes both the group COUNT and each GroupID as a single byte
+  (`pkg/cluster/heartbeat.go`): >255 groups wrap the count byte to 0 and
+  desync the wire, an id >255 truncates and collides. That gate runs on
+  the compiled `*Config`, NOT through the schema walker, so it does not
+  change the identity-token typing decision above),
   `interface-monitor <if> weight <n>` (tokens pack inline into a
   `children==nil` leaf; typing the weight needs a children map, which
   would flip SetPath grouping), `control-ports` (not compiled), and the
