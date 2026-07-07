@@ -41,8 +41,10 @@
 //!   makes BOUNDED room instead of skipping: it scans a FIXED PREFIX of the
 //!   source table (`iter().take(EVICT_SCAN_LIMIT)` — the budget counts EVERY
 //!   iterated entry, same-zone or not), reclaims the first expired same-zone
-//!   window it finds, and if none is expired evicts the stalest (oldest
-//!   `window_start`) same-zone entry within that prefix. Because this branch
+//!   window it finds, and if none is expired evicts a live same-zone entry
+//!   within that prefix (originally the stalest `window_start`; #4418 changed
+//!   the live-victim choice to the least-suspicious entry — see below). Because
+//!   this branch
 //!   only runs when the TARGET zone alone holds `>= MAX_SOURCES_PER_ZONE`
 //!   keys, same-zone entries are dense in the table and the prefix reliably
 //!   contains a victim, so a fresh real scanner is admissible. The
@@ -72,7 +74,26 @@
 //!   distinct-destination set before the detection count was reached for any
 //!   operator window > 1s, so a slow scan spread across the configured window
 //!   EVADED detection (fail-open); the window-aware floor retains state for
-//!   the full configured window.
+//!   the full configured window. #4418 raised the `MAX_CLEANUP_WINDOW_MICROS`
+//!   ceiling to the u32 `threshold` type maximum (~71.6 min) so the clamp can
+//!   NEVER bite a configurable window — the pre-#4418 5-min ceiling reopened
+//!   the same evasion for any window > 5 min. Memory stays bounded by the
+//!   per-source/zone caps regardless (the ceiling is a reclamation-timing
+//!   bound, never a memory bound).
+//!
+//! - **Least-suspicious source-saturation eviction (#4418).** When a zone is
+//!   at `MAX_SOURCES_PER_ZONE` and a brand-new source arrives, the bounded
+//!   eviction (below) now displaces the LEAST-suspicious live same-zone entry
+//!   — the one with the FEWEST accumulated distinct destinations — rather than
+//!   the one with the oldest `window_start`. A near-threshold slow scanner
+//!   (high count, old-but-live window) is therefore NOT evicted by a flood of
+//!   fresh decoy sources (each at count 1); the decoys are reclaimed first.
+//!   The pre-#4418 stalest-by-`window_start` policy let an attacker evict a
+//!   near-threshold slow scanner by keeping the table full of fresher decoys,
+//!   reopening the evasion on the source-saturation axis. Ties on count fall
+//!   back to the stalest `window_start` so old low-count churn is still
+//!   reclaimed (#2234), the cost stays O(`EVICT_SCAN_LIMIT`), and a fresh real
+//!   scanner is still always admissible under a flood.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::IpAddr;
@@ -126,27 +147,36 @@ const EVICT_SCAN_LIMIT: usize = 64;
 /// `pkg/config/compiler_security_screen.go`. The two MUST stay in sync.
 pub(super) const SCAN_DETECT_COUNT: usize = 10;
 
-/// Documented UPPER BOUND (microseconds) on the window-aware cleanup reap
-/// floor (#4379). The periodic, zone-agnostic [`ScanCore::cleanup`] is now
-/// passed the LONGEST configured detection window across the live screen
-/// profiles as its reap floor (so a legitimate multi-second slow-scan window
-/// is not reaped early — the #4379 evasion), but that floor is clamped here so
-/// a fat-fingered / absurd window cannot make the sweep retain dead-weight
-/// state for an unbounded time.
+/// Defensive UPPER BOUND (microseconds) on the window-aware cleanup reap floor
+/// (#4379/#4418). The periodic, zone-agnostic [`ScanCore::cleanup`] is passed
+/// the LONGEST configured detection window across the live screen profiles as
+/// its reap floor (so a legitimate slow-scan window is not reaped early — the
+/// #4379 evasion). This ceiling only clamps a floor that EXCEEDS the largest
+/// value a configured `threshold` can express.
 ///
-/// Why a ceiling is safe: the detection `threshold` is operator-configurable
-/// and the compiler warns-but-PRESERVES values above the Junos 1s maximum
-/// (`pkg/config/compiler_security_screen.go`), so a config could name a
-/// u32-max (~71 min) window. Honouring that verbatim as a reap floor would let
-/// dead-weight entries linger for over an hour. 5 minutes comfortably exceeds
-/// any realistic scan/sweep detection window (the Junos in-range max is 1s;
-/// even a preserved multi-second slow-scan window is far under this) while
-/// bounding the pathological case. This is a RECLAMATION-TIMING bound only:
-/// the per-source / per-zone memory caps ([`MAX_UNIQUE_PER_SOURCE`] /
-/// [`MAX_SOURCES_PER_ZONE`]) bound memory regardless of the window, and the
-/// exact per-zone `window_micros` still governs the inline reset/verdict in
+/// #4418: the ceiling is the u32 `threshold` type's maximum (~71.6 min), so it
+/// NEVER clamps a value an operator can actually configure. The pre-#4418
+/// ceiling was 5 minutes, which reaped an accumulating distinct-destination set
+/// at 300s for any configured window > 5 min BEFORE that window elapsed — the
+/// slow-scan evasion reopened for that pathological band (a >5min window is far
+/// outside the Junos [1000, 1000000] us range and already draws a commit-time
+/// advisory from `validateScreenScanSweepWindows`, but the dataplane must not
+/// silently reopen the evasion for a value the operator was merely WARNED
+/// about, not rejected). Raising the ceiling to the type maximum closes the
+/// evasion for EVERY configurable window while keeping the floor provably
+/// bounded (defence against a future where the reap floor could exceed the u32
+/// range — e.g. a wider threshold type).
+///
+/// Why raising the ceiling is safe: this is a RECLAMATION-TIMING bound ONLY,
+/// never a memory bound. The per-source / per-zone caps
+/// ([`MAX_UNIQUE_PER_SOURCE`] / [`MAX_SOURCES_PER_ZONE`]) are enforced by
+/// [`ScanCore::check`] at INSERT time, so the table is bounded regardless of
+/// the window — a longer floor only defers reclamation of idle entries, it
+/// cannot grow the ceiling. The 71-min worst case is bounded by the SAME
+/// 4096-source / 1024-entry caps as a 5-min or 5-second window. The exact
+/// per-zone `window_micros` still governs the inline reset/verdict in
 /// [`ScanCore::check`] and the eviction path.
-const MAX_CLEANUP_WINDOW_MICROS: u64 = 300_000_000;
+const MAX_CLEANUP_WINDOW_MICROS: u64 = u32::MAX as u64;
 
 /// Compile-time guard: the eviction sample must be smaller than the per-zone
 /// source cap, otherwise the "sample a prefix" bound would be meaningless
@@ -233,11 +263,12 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     ///
     /// Bounds (fail-safe, never fail-OPEN):
     /// - a brand-new source key for a zone already holding
-    ///   `MAX_SOURCES_PER_ZONE` keys triggers a BOUNDED stalest-eviction
-    ///   (#2234): the stalest (or any expired) entry within an
-    ///   `EVICT_SCAN_LIMIT`-sized sample of the zone is removed to admit the
-    ///   fresh source, so a real scanner is always trackable. Only if the
-    ///   bounded sample finds no same-zone victim (pathological many-zone
+    ///   `MAX_SOURCES_PER_ZONE` keys triggers a BOUNDED eviction (#2234/#4418):
+    ///   the LEAST-suspicious (fewest distinct destinations, or any expired)
+    ///   entry within an `EVICT_SCAN_LIMIT`-sized sample of the zone is removed
+    ///   to admit the fresh source, so a real scanner is always trackable AND a
+    ///   near-threshold slow scanner is not displaced by a decoy flood. Only if
+    ///   the bounded sample finds no same-zone victim (pathological many-zone
     ///   interleave) does it fall back to skip-on-full (bumps
     ///   `skipped_pressure`, returns `false`) — still bounded, never
     ///   fail-open;
@@ -311,9 +342,22 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     /// Evict one same-zone source so a fresh source can be admitted under
     /// source-axis saturation (#2234). Examines at most `EVICT_SCAN_LIMIT`
     /// `per_src` entries TOTAL (a FIXED prefix of the iterator, NOT the whole
-    /// table) and removes the FIRST expired same-zone entry it finds, or —
-    /// failing that — the STALEST (oldest `window_start`) same-zone entry
-    /// within the sample.
+    /// table) and removes the FIRST expired-or-empty same-zone entry it finds,
+    /// or — failing that — the LEAST-SUSPICIOUS live same-zone entry within the
+    /// sample.
+    ///
+    /// Victim selection among LIVE (non-expired, non-empty) candidates is by
+    /// FEWEST accumulated distinct destinations (#4418), with the STALEST
+    /// (oldest `window_start`) as the tiebreak on equal counts. A brand-new
+    /// decoy source sits at count 1, while a slow scanner that has already
+    /// probed several destinations sits near the detection count — so a flood
+    /// of fresh decoys evicts one another (or the lowest-count live entry)
+    /// and CANNOT displace a near-threshold slow scanner. The pre-#4418 policy
+    /// evicted the stalest `window_start` regardless of count, which let an
+    /// attacker keeping the table full of fresher decoys evict a slow scanner
+    /// whose window opened earlier (its old-but-LIVE window made it "stalest")
+    /// — reopening the slow-scan evasion on the source-saturation axis. The
+    /// stalest tiebreak preserves #2234's reclamation of old low-count churn.
     ///
     /// Cost: O(`EVICT_SCAN_LIMIT`), independent of the table size, because the
     /// budget counts EVERY iterated entry (same-zone or not) — so even a
@@ -327,8 +371,9 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     /// `evicted_pressure` bumped), `false` otherwise.
     #[inline]
     fn evict_stalest_in_zone(&mut self, zone_id: u16, now_micros: u64, window_micros: u64) -> bool {
-        let mut stalest_key: Option<ScanKey> = None;
-        let mut stalest_start = u64::MAX;
+        let mut victim_key: Option<ScanKey> = None;
+        let mut victim_count = usize::MAX;
+        let mut victim_start = u64::MAX;
         let mut expired_victim: Option<ScanKey> = None;
         // Hard total-iteration bound: take a fixed prefix of the iterator.
         for (k, (start, set)) in self.per_src.iter().take(EVICT_SCAN_LIMIT) {
@@ -340,12 +385,16 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
                 expired_victim = Some(*k);
                 break;
             }
-            if *start < stalest_start {
-                stalest_start = *start;
-                stalest_key = Some(*k);
+            // Least-suspicious first: fewest distinct destinations, then the
+            // stalest window on a tie (#4418 / #2234).
+            let count = set.len();
+            if count < victim_count || (count == victim_count && *start < victim_start) {
+                victim_count = count;
+                victim_start = *start;
+                victim_key = Some(*k);
             }
         }
-        let victim = expired_victim.or(stalest_key);
+        let victim = expired_victim.or(victim_key);
         if let Some(victim) = victim {
             if self.per_src.remove(&victim).is_some() {
                 if let Some(c) = self.per_zone_count.get_mut(&zone_id) {
@@ -772,13 +821,14 @@ mod scan_tests {
         assert!(t.evicted_pressure() >= 1, "admission recorded an eviction");
     }
 
-    /// #2234: eviction must prefer the STALEST (oldest `window_start`) entry
-    /// over fresher ones when no entry is expired. We fill a small synthetic
-    /// zone to the cap is too expensive here, so exercise the victim-choice
-    /// logic on `ScanCore` directly via the public `check` path with a cap
-    /// reduced by construction is not possible (the cap is a const) — instead
-    /// assert the property on the eviction helper through a saturated table:
-    /// the source whose window is oldest is the one removed.
+    /// #2234/#4418: on a tie in accumulated distinct-destination count,
+    /// eviction must prefer the STALEST (oldest `window_start`) entry over
+    /// fresher ones when no entry is expired. Every entry here holds exactly
+    /// one distinct destination (count 1), so the least-suspicious selection
+    /// (#4418) is a tie on count and the stalest tiebreak decides — the source
+    /// whose window is oldest is the one removed. (Exercising the victim-choice
+    /// logic on `ScanCore` directly keeps this O(few) instead of filling the
+    /// 4096-entry cap.)
     #[test]
     fn eviction_prefers_stalest_window() {
         let mut core: ScanCore<u16> = ScanCore::default();
@@ -840,6 +890,61 @@ mod scan_tests {
         assert!(
             !core.per_src.contains_key(&(9, expired_src)),
             "the EXPIRED entry must be reclaimed first"
+        );
+    }
+
+    /// #4418 fail-on-revert (source-saturation eviction): a near-threshold slow
+    /// scanner (many accumulated distinct destinations, an OLD but still-LIVE
+    /// window) must NOT be evicted by a flood of fresher decoy sources (each at
+    /// count 1) that keeps the per-zone source table full. The pre-#4418 policy
+    /// evicted the STALEST `window_start` regardless of count, so the slow
+    /// scanner — whose window opened FIRST — was the victim: its accumulated
+    /// count was lost and it re-seeded at count 1 on its next probe → evasion.
+    /// The least-suspicious policy evicts a count-1 decoy instead, so the slow
+    /// scanner survives and trips. RED on revert: the stalest-by-window policy
+    /// evicts the slow scanner and the trip assertion fails.
+    #[test]
+    fn slow_scanner_survives_decoy_flood_eviction() {
+        let mut core: ScanCore<u16> = ScanCore::default();
+        let zone = 9u16;
+        let window = 1_000_000u64; // 1s — every seeded entry is LIVE below
+        // The slow scanner opened its window FIRST (oldest start=100) and has
+        // already probed SCAN_DETECT_COUNT-1 distinct ports (near threshold).
+        let scanner = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let mut scanner_set = FxHashSet::default();
+        for p in 0..(SCAN_DETECT_COUNT as u16 - 1) {
+            scanner_set.insert(8000 + p);
+        }
+        core.per_src.insert((zone, scanner), (100, scanner_set));
+        // Fill the rest of a full bounded sample with FRESHER decoys at count 1
+        // (a high-cardinality spoofed flood: one probe each, later windows).
+        for i in 1..EVICT_SCAN_LIMIT as u64 {
+            let d = IpAddr::V4(Ipv4Addr::from(0x0a09_0000u32 + i as u32));
+            let mut s = FxHashSet::default();
+            s.insert(1u16);
+            core.per_src.insert((zone, d), (100 + i, s)); // fresher than scanner
+        }
+        *core.per_zone_count.entry(zone).or_insert(0) = core.per_src.len() as u32;
+        // `now` after every start but well within the 1s window → nothing is
+        // expired; the victim is decided purely by the least-suspicious rule.
+        let now = 100_000u64;
+        assert!(
+            core.evict_stalest_in_zone(zone, now, window),
+            "a same-zone victim must be found in the full sample"
+        );
+        assert!(
+            core.per_src.contains_key(&(zone, scanner)),
+            "the near-threshold slow scanner must NOT be evicted by a decoy \
+             flood (pre-#4418 the stalest-by-window policy evicted it)"
+        );
+        assert_eq!(core.evicted_pressure, 1, "exactly one decoy evicted");
+        // Having survived the flood, the scanner trips on its
+        // SCAN_DETECT_COUNT-th distinct port (its window is still live, so the
+        // accumulated set is intact — no eviction is triggered for an existing
+        // key, and the zone is well under the source cap).
+        assert!(
+            core.check(zone, scanner, 8999, now, window),
+            "the surviving slow scanner must trip on its 10th distinct port"
         );
     }
 
@@ -996,28 +1101,91 @@ mod scan_tests {
         );
     }
 
-    /// #4379 upper bound: an ABSURD configured window (u32-max, ~71 min) does
-    /// NOT make cleanup retain dead weight indefinitely — the reap floor is
-    /// clamped to `MAX_CLEANUP_WINDOW_MICROS`. An entry older than the ceiling
-    /// is reclaimed even though the raw window is far larger. (Memory is
-    /// independently bounded by the per-source/zone caps regardless; this only
-    /// bounds reclamation TIMING.) Guards against a no-clamp regression: a raw
-    /// 71min floor would retain the entry at now=5min+ε.
+    /// #4418 fail-on-revert (cleanup 5-min cap): an operator window LONGER than
+    /// 5 minutes must retain its accumulating distinct-destination set for the
+    /// FULL window — the periodic cleanup must NOT reap it at the pre-#4418
+    /// `MAX_CLEANUP_WINDOW_MICROS = 300s` ceiling. Pre-#4418 the reap floor was
+    /// clamped to 300s, so a slow scan spread across a >5min window found its
+    /// set reclaimed at the 5-min mark, the distinct count reset, and the scan
+    /// EVADED detection (fail-open) for that pathological band. Raising the
+    /// ceiling to the u32 `threshold` type maximum closes it. RED on revert:
+    /// the tracker never fires because cleanup drops the state at 300s.
     #[test]
-    fn cleanup_floor_clamped_to_ceiling() {
+    fn slow_scan_survives_cleanup_beyond_five_min_cap() {
         let mut t = IpSweepTracker::default();
         let src = v4(1);
-        let absurd_window = u64::from(u32::MAX); // ~4295s ~ 71min
-        t.check(0, src, v4(9), 0, absurd_window);
+        // A 10-minute operator window (> the pre-#4418 5-min cleanup cap). This
+        // is what #4379/#4418 passes to cleanup as the window-aware reap floor.
+        let window = 600_000_000u64; // 10 min
+        // Ten distinct probes spread one per minute → the span (9 min) exceeds
+        // the old 5-min cap but stays inside the 10-min window, so every probe
+        // is within the window and the count must accumulate to the trip.
+        let step = 60_000_000u64; // 1 min between probes
+        let mut now = 1_000_000u64;
+        let mut fired = false;
+        for i in 0..SCAN_DETECT_COUNT as u32 {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0e10_0000u32 + i));
+            if t.check(0, src, dst, now, window) {
+                fired = true;
+            }
+            // Periodic cleanup fires between probes (production runs it every
+            // >=30s). With the type-max ceiling the live entry survives past
+            // the 5-min mark; with the pre-#4418 300s cap it is reaped once
+            // `now - start >= 300s`, resetting the distinct count.
+            t.cleanup(now, window);
+            now += step;
+        }
+        assert!(
+            fired,
+            "a slow scan spread across a >5min configured window must be \
+             detected: cleanup must not reap live state at the old 300s cap"
+        );
+
+        // Control: reaping at the OLD fixed 300s ceiling DOES lose the state —
+        // this is exactly the evasion the #4418 fix closes. A fresh tracker fed
+        // the same slow scan but cleaned with the floor clamped at 300s never
+        // fires.
+        const OLD_CEILING: u64 = 300_000_000; // pre-#4418 MAX_CLEANUP_WINDOW_MICROS
+        let mut evaded = IpSweepTracker::default();
+        let mut now2 = 1_000_000u64;
+        let mut fired2 = false;
+        for i in 0..SCAN_DETECT_COUNT as u32 {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0e10_0000u32 + i));
+            if evaded.check(0, src, dst, now2, window) {
+                fired2 = true;
+            }
+            // Emulate the pre-#4418 clamp: never let the floor exceed 300s.
+            evaded.cleanup(now2, window.min(OLD_CEILING));
+            now2 += step;
+        }
+        assert!(
+            !fired2,
+            "control: clamping the reap floor at 300s loses the accumulating \
+             set past 5 min so the slow scan evades — the #4418 fail-open"
+        );
+    }
+
+    /// #4418 upper bound: the reap floor is still provably bounded. A floor
+    /// LARGER than the u32 `threshold` type can express (a value no real config
+    /// can produce, guarding a future wider-threshold regression) is clamped to
+    /// `MAX_CLEANUP_WINDOW_MICROS` so cleanup cannot retain dead weight for an
+    /// unbounded time. (Memory is independently bounded by the per-source/zone
+    /// caps regardless; this only bounds reclamation TIMING.)
+    #[test]
+    fn cleanup_floor_clamped_above_type_max() {
+        let mut t = IpSweepTracker::default();
+        let src = v4(1);
+        // An entry opened at t=0 under a floor far beyond the ceiling.
+        t.check(0, src, v4(9), 0, u64::MAX);
         assert_eq!(t.tracked_sources(), 1);
-        // now just past the CEILING but far under the raw window: the clamp
+        // now just past the CEILING but far under the raw floor: the clamp
         // makes the entry expired; without the clamp it would survive.
-        t.cleanup(MAX_CLEANUP_WINDOW_MICROS + 1, absurd_window);
+        t.cleanup(MAX_CLEANUP_WINDOW_MICROS + 1, u64::MAX);
         assert_eq!(
             t.tracked_sources(),
             0,
-            "the reap floor must be clamped to the ceiling so an absurd window \
-             cannot retain dead-weight state indefinitely"
+            "a reap floor above the type maximum must be clamped to the ceiling \
+             so it cannot retain dead-weight state indefinitely"
         );
     }
 

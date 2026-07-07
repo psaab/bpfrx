@@ -111,8 +111,9 @@ the values on `child.Keys[1:]` (with the hierarchical-block-with-children
 shape still possible for nested forms), a compiler reading a multi-value leaf
 MUST read BOTH `child.Keys[1:]` AND `child.Children` and ACCUMULATE — never
 read only `child.Keys[1]`. `firewallMatchValues` (`compiler_firewall.go`) is
-the canonical helper; `parseDNATPortList` (`compiler_nat.go`) and
-`descriptionText` (`compiler_security.go`) parse the unified single-leaf
+the canonical helper; `parseDNATPortList` and `appendPoolAddresses`
+(`compiler_nat.go`, the latter the source-NAT-pool `address` reader, #4521)
+and `descriptionText` (`compiler_security.go`) parse the unified single-leaf
 shape directly off the node keys. `parseZoneList` (`compiler_nat.go`, the
 static/source/destination-NAT `from`/`to` zone reader) and the WireGuard
 peer `allowed-ips` reader (`parseTunnelWireguardPeer`,
@@ -389,6 +390,25 @@ nat.go`) expand the union — one DNAT entry per protocol, one app term per
 resolved application (an application-set still expands to its members). Coverage:
 `compiler_nat_match_multivalue_3431_test.go` (both AST shapes, all axes) and
 `nat_match_multivalue_3431_test.go` (snapshot expansion).
+
+**A source-NAT pool `address` is multi-value (#4521).** A source pool's
+`address` value carries EVERY IP the SNAT allocator may draw from, in four
+shapes: discrete `set` lines (one `address <ip>;` per IP), a bracket list
+`address [ a b c ]`, a range `address <low> to <high>`, and a hierarchical
+block `address { a; b; c }`. `address` under a source pool is UNMODELED in the
+schema (`schema_security.go` pool children are port / persistent-nat /
+port-overloading-factor / routing-instance), so SetPath's unmodeled-leaf path
+collapses the whole bracket list onto ONE node key (`Keys=["address","a","b",
+"c"]`) — the classic #2419 collapse. Before #4521 `compileNATSource`
+(`compiler_nat.go`) read only `prop.Keys[1]` (and the range branch required
+`Keys[2]=="to"`), so a discrete bracket list with no `to` silently kept ONLY
+the first IP → the pool shrank to one address → premature source-port
+exhaustion under load. The fix reads the FULL `prop.Keys[1:]` token stream
+(plus the block `prop.Children`) via `appendPoolAddresses`, expanding any
+`<low> to <high>` sub-range in place — the #2419 dual-shape read pattern
+(mirroring `firewallMatchValues`), so every shape (discrete, bracket, range,
+mixed `[ a b to c ]`, block) accumulates every address. Coverage:
+`compiler_nat_source_pool_address_4521_test.go`.
 
 **Security host-inbound and session-log surfaces are multi-value (#3703).** The
 same #2419 collapse class recurred on four security leaves that #2419 never

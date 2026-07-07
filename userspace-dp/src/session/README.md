@@ -1022,11 +1022,20 @@ new `(zone, src_ip)` arrives at a full zone, the tracker scans a FIXED PREFIX
 of the source table (`iter().take(EVICT_SCAN_LIMIT)`, `EVICT_SCAN_LIMIT = 64`
 — the budget counts EVERY iterated entry, same-zone or not), reclaims the
 first expired same-zone window it finds, and if none is expired evicts the
-STALEST (oldest `window_start`) same-zone entry within that prefix. This
-branch only runs when the TARGET zone alone holds `>= MAX_SOURCES_PER_ZONE`
-keys, so same-zone entries are dense in the table and the prefix reliably
-contains a victim — a fresh real scanner is therefore admissible and the
-detection-suppression cliff is gone. The per-new-flow worst case is
+LEAST-SUSPICIOUS live same-zone entry within that prefix — the one with the
+FEWEST accumulated distinct destinations, breaking ties on the stalest
+`window_start` (#4418). A brand-new decoy source sits at count 1, while a slow
+scanner that has already probed several destinations sits near the detection
+count, so a flood of fresh decoys evicts one another (or the lowest-count live
+entry) and CANNOT displace a near-threshold slow scanner. The pre-#4418 policy
+evicted the stalest `window_start` regardless of count, which let an attacker
+keeping the table full of fresher decoys evict a slow scanner whose window
+opened earlier (its old-but-LIVE window made it "stalest") — reopening the
+slow-scan evasion on the source-saturation axis. This branch only runs when
+the TARGET zone alone holds `>= MAX_SOURCES_PER_ZONE` keys, so same-zone
+entries are dense in the table and the prefix reliably contains a victim — a
+fresh real scanner is therefore admissible and the detection-suppression cliff
+is gone. The per-new-flow worst case is
 O(`EVICT_SCAN_LIMIT`), NOT an O(sources) min-scan over 4096 entries, which
 under a saturation flood would itself be an O(n)-per-packet amplifier. The
 per-zone source count is maintained incrementally (`per_zone_count`) so the
@@ -1043,6 +1052,30 @@ saturated — at a handful of alarms under a sustained flood, never per-flow
 (honouring the no-per-packet-logging rule). Defence-in-depth mitigations still
 apply: anti-spoofing / uRPF upstream reduces the spoofed-source axis, and the
 `skipped_pressure` / `evicted_pressure` signals surface the pressure.
+
+**Window-aware cleanup floor — no time-cap evasion (#4379/#4418).** The
+periodic budgeted cleanup (above) reaps an entry only once it has been idle
+longer than the reap FLOOR. That floor is the LONGEST detection window
+(`threshold`, microseconds) configured across the live screen profiles
+(`scan_cleanup_floors` in `screen/mod.rs`), so an accumulating
+distinct-destination set is never reclaimed before the operator's own
+detection window could still fire on it. A pre-#4379 fixed 1s floor reaped the
+set for any window > 1s → a slow scan spread across the window EVADED
+detection (fail-open). The floor is clamped to `MAX_CLEANUP_WINDOW_MICROS` so a
+floor beyond any configurable window cannot retain dead weight forever; #4418
+raised that ceiling from a 5-minute cap to the u32 `threshold` type maximum
+(~71.6 min), because the 5-minute cap re-reaped an accumulating set at 300s for
+any configured window > 5 min — reopening the same evasion for that pathological
+band. A >5min window is far outside the Junos `[1000, 1000000]` us range and
+already draws a commit-time advisory (`validateScreenScanSweepWindows`), but the
+dataplane must not silently reopen the evasion for a value the operator was
+merely WARNED about, not rejected. Because a `threshold` is a `u32`, the u32-max
+ceiling never clamps a configurable window, so the evasion is closed for EVERY
+configurable window. This is a RECLAMATION-TIMING bound only: `MAX_SOURCES_PER_
+ZONE` / `MAX_UNIQUE_PER_SOURCE` are enforced at INSERT time, so the table stays
+bounded regardless of the window — a 71-min worst case is bounded by the SAME
+4096-source / 1024-entry caps as a 5-second window; a longer floor only defers
+reclamation of idle entries.
 
 ## Strict-syn-check drop on the new-flow path (#4400)
 
