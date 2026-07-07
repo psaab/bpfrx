@@ -1,3 +1,45 @@
+## 2026-07-07 — #4418: close scan/sweep slow-scan evasion on the cleanup 5-min cap AND the source-saturation eviction
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4418 (opus-171 M-1 residual from #4416). Two evasion axes let a
+  bounded-table reclamation reset a near-threshold slow scanner's accumulated
+  distinct-destination count before it crossed `SCAN_DETECT_COUNT` (10).
+  (1) CLEANUP TIME-CAP: `cleanup` clamped the window-aware reap floor to
+  `MAX_CLEANUP_WINDOW_MICROS = 300_000_000` (5 min), so a configured detection
+  `threshold` window > 5 min had its accumulating set reaped at 300s BEFORE the
+  window elapsed → slow scan evaded (fail-open) for that band. Raised the
+  ceiling to `u32::MAX as u64` (~71.6 min) — the `threshold` is a `u32`, so the
+  ceiling now NEVER clamps a configurable window (evasion closed for EVERY
+  window) while staying a provable defensive bound for a floor beyond the type
+  range. This is a reclamation-TIMING bound only: `check()` enforces
+  `MAX_SOURCES_PER_ZONE` (4096) / `MAX_UNIQUE_PER_SOURCE` (1024) at INSERT, so
+  the table is bounded regardless of window — a 71-min worst case is bounded by
+  the SAME caps as a 5-second window (verify-first confirmed). No new Go warning
+  needed: `validateScreenScanSweepWindows` already advises any window outside
+  the Junos [1000, 1000000] us range, which covers every >5min value.
+  (2) SOURCE-SATURATION EVICTION: `evict_stalest_in_zone` picked the stalest
+  `window_start` among live same-zone entries, so a decoy flood keeping the
+  4096-source table full (fresher windows) could evict a near-threshold slow
+  scanner (old-but-LIVE window = "stalest") → count lost → evasion. Changed the
+  live-victim choice to LEAST-SUSPICIOUS: fewest accumulated distinct
+  destinations, stalest `window_start` as the tie-break. A count-1 decoy is
+  evicted before a count-9 slow scanner; #2234's fresh-scanner admission and
+  O(EVICT_SCAN_LIMIT) cost are preserved (equal-count tie-break is still
+  stalest). Expired/empty entries are still reclaimed first.
+  Tests: `slow_scan_survives_cleanup_beyond_five_min_cap` (10-min window, probes
+  spanning >5min, cleanup between each → survives + trips; control clamped at
+  300s evades) and `slow_scanner_survives_decoy_flood_eviction` (near-threshold
+  scanner not evicted by a full sample of fresher count-1 decoys, then trips);
+  both RED-on-revert verified (reverting each logic change fails the matching
+  test). `cleanup_floor_clamped_above_type_max` guards the defensive ceiling;
+  existing #2234 stalest-tie-break + fast-scanner + bounded-table tests still
+  pass. FULL cargo serial: 54/0 + 3691/0 (2 ign) + 8/0 + 22/0 + 1/0 green;
+  scan/screen subset 33/0. rustfmt: changed lines clean (scan.rs fully clean;
+  mod.rs/tests.rs pre-existing drift untouched).
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/session/README.md, _Log.md
+
 ## 2026-07-07 — #4384 (opus-171 L-3): delete dead-but-wrong incremental TCP checksum in the segmentation path
 
 - **Timestamp**: 2026-07-07T18:30Z
