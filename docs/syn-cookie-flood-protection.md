@@ -190,7 +190,25 @@ implemented as the AND of the per-row results, never OR/MAX). No eviction means
 no Hot-Set-Lockout / Cold-Start-Eviction-Race starvation (a victim is always
 tracked and its cells only increase within the sliding window). Collisions can
 only OVER-count (fail-closed: never a false-negative; the only error is a
-false-positive bounded by `~(load)^ROWS`). Each sketch is allocated PER
+false-positive bounded by `~(load)^ROWS`).
+
+**Per-boot seeded cell hash (#4382).** The `ROWS` row hashes fold in a per-boot
+secret seed (`SynRateSketch::seed`, drawn once from
+`hot_hash_seed::hot_path_hash_seed` — the same #2364 per-process secret the
+session indices / flow-cache set index / ECMP / CoS SFQ hashes use) ALONGSIDE
+the public per-row `ROW_SEEDS`. The row constants give row INDEPENDENCE; the
+per-boot seed gives SECRECY. Without it, `cell_index`/`cell_index_ip_port` would
+be a public deterministic function of the source IP, so an off-box attacker
+(within their own BCP38-permitted range) could precompute which source IPs land
+in a chosen victim's four cells and drive them over `source-threshold` to
+throttle the victim's legitimate SYNs — a targeted false-positive. Folding the
+per-boot seed makes the source→cell mapping unknowable offline and reshuffles it
+on every restart, so no colliding source-IP set can be constructed. The seed is
+stable for the process lifetime (a key maps to a stable cell across its whole
+window — counting behaviour, thresholds, and detection are unchanged) and is
+node-local (never wire/HA-synced; each node reseeds independently).
+
+Each sketch is allocated PER
 THRESHOLD, not per zone: the per-destination sketch only when
 `destination-threshold > 0`, the per-source sketch only when
 `source-threshold > 0` (`update_profiles`, `screen/mod.rs` ~333/345), and each
