@@ -41,10 +41,19 @@ Route metadata crosses the Go→Rust snapshot boundary as `RouteSnapshot`
   `routing_instance` (`""` = default → `inet.0`/`inet6.0`; a named
   instance → `<ri>.inet.0`/`<ri>.inet6.0`). The lookup filters connected
   candidates on the resolving table, so a per-VRF / `next-table` lookup
-  never matches another routing-instance's connected prefix. (Gateway →
-  egress inference at build time, `infer_connected_route_target_*`,
-  stays global — that resolves "which interface reaches this gateway IP",
-  not a destination egress.)
+  never matches another routing-instance's connected prefix. Gateway →
+  egress inference at build time (`infer_connected_route_target_*`,
+  "which interface reaches this bare-gateway IP") is **also** table-scoped
+  (#4446): it filters `connected_v[46]` on the route's own canonical
+  install table before the prefix match, so a bare-gateway static route in
+  VRF A never binds VRF B's overlapping connected prefix. The inferred
+  ifindex is baked into `RouteEntryV*.next_hops` and consumed verbatim at
+  lookup, so this scoping MUST happen at build time — the lookup-time
+  #2388 connected filter cannot re-scope an already-resolved next-hop. A
+  route-leak / `next-table` cross-VRF reach is unaffected: a leaked route
+  carries no forwarding next-hop (it is a `NextTable` snapshot), so it
+  never reaches this inference and is re-resolved in the target table's
+  own scope by the recursion.
   - **Local-delivery (to-self) attribution is table-scoped too (#3151).**
     The `lookup_forwarding_resolution_inner_ecmp` shortcut for a
     destination in `local_v[46]` resolves `local_ifindex` /

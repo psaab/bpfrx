@@ -113,7 +113,32 @@ Rust FIB (`userspace-dp/src/afxdp/forwarding_build/fib.rs`,
 `userspace-dp/src/afxdp/forwarding/mod.rs`) — **not** `pkg/routing` (which owns
 netlink VRF/tunnel/ip-rule reconciliation, not FIB next-hop resolution).
 
-### M3 — static next-hop gateway inference is global, not table-scoped — GENUINE (deferred to a Rust slice)
+### M3 — static next-hop gateway inference is global, not table-scoped — FIXED (#4446)
+
+**Resolved in #4446.** The build-time inference is now table-scoped: the
+route's canonical install table is threaded from `populate_routes` through
+`resolve_route_next_hops_v[46]` → `resolve_next_hop_target_v[46]` →
+`infer_connected_route_target_v[46]`, which filters the connected scan on
+`entry.table == table` (mirroring the #2388 lookup-site predicate, but at
+BUILD time so the correct ifindex is baked into `RouteEntryV*.next_hops`).
+The two contradictory `fib.rs` doc comments are reconciled (both now state
+the inference is table-scoped) and the `forwarding/README.md` "stays global"
+note is corrected. A route-leak / `next-table` cross-VRF reach is unaffected
+— a leaked route is a `NextTable` snapshot with no forwarding next-hop, so
+it never touches this inference and is re-resolved in the target table's own
+scope by the recursion. Locked by
+`static_bare_gateway_infers_ifindex_in_own_table_v4` / `_v6` (RED on the
+global scan: with "blue" leading the scan order, red's route bound blue's
+ifindex 102 instead of red's 101) plus the
+`static_bare_gateway_single_table_still_resolves` anti-regression
+(`forwarding_build/tests.rs`). The `native_gre*` fixtures were made
+config-realistic — the GRE inner interface now carries
+`routing_instance = "sfmix"`, so its connected /30 lands in `sfmix.inet.0`,
+the same table as the bare-gateway route it backs.
+
+The original triage write-up follows.
+
+
 
 `resolve_route_next_hops_v4` / `resolve_route_next_hops_v6` resolve a static
 route's egress ifindex at FIB-build time. When a next-hop carries an explicit
