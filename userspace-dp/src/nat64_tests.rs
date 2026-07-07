@@ -2129,6 +2129,35 @@ fn translate_v6_to_v4_udp_behind_hop_by_hop() {
 }
 
 #[test]
+fn translate_v6_to_v4_udp_behind_mobility_header() {
+    // #4517 FAIL-ON-REVERT: UDP behind a Mobility (135) extension header.
+    // Mobility is a generic length-prefixed EH (RFC 6275), so the NAT64
+    // walker must traverse it to the terminal UDP — parity with the
+    // canonical afxdp walkers. Before #4517 the nat64 walker enumerated
+    // only {0,43,44,51,60} and STOPPED at type 135, surrendering proto=135
+    // so the translation dropped or mis-parsed the packet.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let mut udp = vec![0u8; 8 + 4];
+    udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&(12u16).to_be_bytes()); // UDP length
+    udp[8..12].copy_from_slice(b"data");
+
+    let ipv6_pkt = build_v6_with_ext_then_l4(src_v6, dst_v6, 135, &[0u8; 6], PROTO_UDP, 64, &udp);
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false)
+        .expect("UDP behind a Mobility header must translate, not drop");
+
+    assert_eq!(v4[9], PROTO_UDP, "protocol must be the terminal L4, not 135");
+    assert_eq!(v4.len(), 20 + 12, "Mobility header stripped");
+    assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 5353);
+    assert_eq!(u16::from_be_bytes([v4[22], v4[23]]), 53);
+}
+
+#[test]
 fn translate_v6_to_v4_non_first_fragment_dropped() {
     // A non-first fragment carries no L4 header. The walker must NOT read its
     // payload bytes as a transport header — fail closed (drop).

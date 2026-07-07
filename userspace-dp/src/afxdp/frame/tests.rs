@@ -7697,3 +7697,137 @@ fn gre_in_falls_back_to_all_tcp() {
         "gre-in with no gre-in value falls back to all-tcp"
     );
 }
+
+/// #4517: build an L3-relative IPv6 packet — 40-byte base header + a chain
+/// of minimal 8-byte extension headers + an L4 header. Each ext header is
+/// `(next_header_type, frag_off)`; `frag_off` is `Some` only for a
+/// Fragment header (44). A generic EH with `HdrExtLen = 0` is 8 bytes
+/// `(0+1)*8`, AH with `len = 0` is 8 bytes `(0+2)*4`, and Fragment is a
+/// fixed 8 bytes — so every descriptor here is exactly one 8-byte header.
+fn v6_eh_chain(ehs: &[(u8, Option<u16>)], l4_proto: u8, l4: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 40];
+    p[0] = 0x60; // version 6
+    p[7] = 64; // hop limit
+    p[8..24].copy_from_slice(&[0x20; 16]); // src
+    p[24..40].copy_from_slice(&[0x30; 16]); // dst
+    p[6] = ehs.first().map(|(t, _)| *t).unwrap_or(l4_proto);
+    for (i, (_ty, frag_off)) in ehs.iter().enumerate() {
+        let next = ehs.get(i + 1).map(|(t, _)| *t).unwrap_or(l4_proto);
+        let mut hdr = [0u8; 8];
+        hdr[0] = next; // this EH's next-header field
+        hdr[1] = 0; // HdrExtLen = 0
+        if let Some(off) = frag_off {
+            hdr[2..4].copy_from_slice(&off.to_be_bytes());
+            hdr[4..8].copy_from_slice(&0xdead_beefu32.to_be_bytes()); // frag id
+        }
+        p.extend_from_slice(&hdr);
+    }
+    let plen = (p.len() - 40 + l4.len()) as u16;
+    p[4..6].copy_from_slice(&plen.to_be_bytes());
+    p.extend_from_slice(l4);
+    p
+}
+
+/// #4517: all five `inspect` IPv6 ext-header walkers must traverse the
+/// exotic-but-length-prefixed extension headers (Mobility 135, HIP 139,
+/// Shim6 140, experimental 253/254) exactly like Hop-by-Hop/DestOpt, so a
+/// chain that hides the L4/fragment status behind one of them is still
+/// resolved. Before #4517 the walkers stopped at type 135/139/140 (the
+/// terminal `_` arm) and reported proto=135 with no L4 — an ext-header
+/// IDS evasion where the screens and forwarding never saw the SYN.
+///
+/// RED-on-revert: against the pre-#4517 `0 | 43 | 60` arms
+/// `packet_rel_l4_offset_and_protocol` returns `(48, 135)` (STOPS at the
+/// Mobility header, proto=135, no L4) instead of `(64, 6)`, and
+/// `ipv6_is_any_fragment` returns `false` (never reaches the Fragment
+/// header) — both assertions flip.
+#[test]
+fn inspect_walkers_traverse_exotic_length_prefixed_ext_headers() {
+    const HOP: u8 = 0;
+    const MOBILITY: u8 = 135;
+    const HIP: u8 = 139;
+    const SHIM6: u8 = 140;
+    const FRAGMENT: u8 = 44;
+    const ESP: u8 = 50;
+    const TCP: u8 = 6;
+    // A 20-byte TCP header with the SYN flag set at byte 13.
+    let mut tcp = [0u8; 20];
+    tcp[13] = 0x02; // SYN
+    tcp[12] = 0x50; // data offset = 5 words
+
+    // Chain: base → HOP → MOBILITY → FRAGMENT(offset 0, first fragment) → TCP.
+    // Offsets: base 40 + HOP 8 + MOBILITY 8 + FRAGMENT 8 = 64 → TCP.
+    let pkt = v6_eh_chain(
+        &[(HOP, None), (MOBILITY, None), (FRAGMENT, Some(0x0001))],
+        TCP,
+        &tcp,
+    );
+    assert_eq!(
+        packet_rel_l4_offset(&pkt, libc::AF_INET6 as u8),
+        Some(64),
+        "packet_rel_l4_offset must walk past MOBILITY to the TCP header"
+    );
+    assert_eq!(
+        packet_rel_l4_offset_and_protocol(&pkt, libc::AF_INET6 as u8),
+        Some((64, TCP)),
+        "the meta walker must resolve proto=TCP past MOBILITY, not proto=135"
+    );
+    assert!(
+        !ipv6_is_non_first_fragment(&pkt),
+        "MF=1, offset=0 → this is the FIRST fragment (carries the L4)"
+    );
+    assert!(
+        ipv6_is_any_fragment(&pkt),
+        "a Fragment header behind MOBILITY must still count as a fragment"
+    );
+    // frame_l4_offset takes a full frame (with the 14-byte L2 header).
+    let mut frame = vec![0u8; 14];
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    frame.extend_from_slice(&pkt);
+    assert_eq!(
+        frame_l4_offset(&frame, libc::AF_INET6 as u8),
+        Some(14 + 64),
+        "frame_l4_offset must agree with the packet-relative walkers"
+    );
+
+    // A NON-FIRST fragment behind MOBILITY: offset>0 → no L4 here, but it
+    // is still a fragment. Both fragment predicates must agree.
+    let nonfirst = v6_eh_chain(
+        &[(HOP, None), (MOBILITY, None), (FRAGMENT, Some(0x0009))], // off=1, MF=1
+        TCP,
+        &tcp,
+    );
+    assert!(
+        ipv6_is_non_first_fragment(&nonfirst),
+        "offset>0 behind MOBILITY → non-first fragment"
+    );
+    assert!(ipv6_is_any_fragment(&nonfirst), "still any-fragment");
+
+    // HIP and Shim6 chains resolve the real TCP just like MOBILITY.
+    for exotic in [HIP, SHIM6] {
+        let p = v6_eh_chain(&[(HOP, None), (exotic, None)], TCP, &tcp);
+        assert_eq!(
+            packet_rel_l4_offset_and_protocol(&p, libc::AF_INET6 as u8),
+            Some((56, TCP)),
+            "HIP/Shim6 (type {exotic}) must be walked as a generic EH"
+        );
+    }
+
+    // ESP (50) is NOT walked (encrypted, non-walkable): the walk STOPS at
+    // the ESP header and surfaces proto=50 at its offset — it must never be
+    // parsed as a generic EH.
+    let esp = v6_eh_chain(&[(HOP, None), (ESP, None)], TCP, &tcp);
+    assert_eq!(
+        packet_rel_l4_offset_and_protocol(&esp, libc::AF_INET6 as u8),
+        Some((48, ESP)),
+        "ESP must terminate the walk (proto=50), not be walked"
+    );
+
+    // A genuine TCP with no extension headers is unaffected.
+    let plain = v6_eh_chain(&[], TCP, &tcp);
+    assert_eq!(
+        packet_rel_l4_offset_and_protocol(&plain, libc::AF_INET6 as u8),
+        Some((40, TCP)),
+        "no-EH TCP resolves at the base-header end"
+    );
+}

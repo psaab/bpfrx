@@ -844,9 +844,15 @@ fn ipv6_l4_offset_and_protocol(packet: &[u8]) -> Option<(usize, u8)> {
     let mut offset = 40usize;
     for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
-            // Hop-by-Hop / Routing / Destination Options: length in 8-byte
-            // units, NOT counting the first 8 bytes (RFC 8200).
-            0 | 43 | 60 => {
+            // #4517: generic length-prefixed IPv6 extension headers —
+            // Hop-by-Hop (0) / Routing (43) / Destination Options (60) /
+            // Mobility (135) / HIP (139) / Shim6 (140) / experimental
+            // (253/254): length in 8-byte units, NOT counting the first 8
+            // bytes (RFC 8200 / 6275 / 7401 / 5533 / 3692). Kept in parity
+            // with the canonical afxdp::frame::inspect walkers so NAT64
+            // resolves the same L4 as the forwarding/screen paths. ESP (50)
+            // stays unwalked (encrypted, non-walkable).
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                 let opt = packet.get(offset..offset + 2)?;
                 protocol = opt[0];
                 offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
@@ -911,7 +917,9 @@ fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
     let mut offset = 40usize;
     for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
-            0 | 43 | 60 => {
+            // #4517: generic length-prefixed EHs (see the first walker's
+            // comment) — HbH/Routing/DestOpt + Mobility/HIP/Shim6/experimental.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                 let Some(opt) = packet.get(offset..offset + 2) else {
                     return false;
                 };
@@ -978,7 +986,9 @@ fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
     let mut offset = 40usize;
     for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
-            0 | 43 | 60 => {
+            // #4517: generic length-prefixed EHs (see the first walker's
+            // comment) — HbH/Routing/DestOpt + Mobility/HIP/Shim6/experimental.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                 let opt = packet.get(offset..offset + 2)?;
                 protocol = opt[0];
                 offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
