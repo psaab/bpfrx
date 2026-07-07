@@ -1482,6 +1482,42 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
     }
 }
 
+/// #4392: a reject-reply sink for the flow-backed PBR drop path. Present on the
+/// flow-backed session-miss path, which carries a full L4 header and can
+/// synthesize a TCP RST / ICMP-unreachable exactly like a non-PBR `then reject`.
+/// `None` on the flowless path (a non-first fragment / L3-only packet has no L4
+/// header to reflect), where a PBR `reject`/`discard` degrades to a silent drop
+/// — identical to the flowless non-PBR input-filter deny.
+pub(super) struct PbrRejectSink<'a> {
+    pub(super) tx_pipeline: &'a mut crate::afxdp::worker::WorkerTxPipeline,
+    pub(super) ingress_ifindex: i32,
+    pub(super) counters: &'a mut crate::afxdp::BatchCounters,
+}
+
+/// #4392: the route-lookup decision returned by `ingress_route_table_override`.
+///
+/// A PBR term `from { ... } then { routing-instance X; reject | discard; }`
+/// carries BOTH a routing-instance override AND a drop action. Before this fix
+/// the override was applied unconditionally and the packet was FORWARDED into
+/// VRF X — a VRF leak plus a false audit (the filter log recorded a deny while
+/// the data plane forwarded). The drop action now gates the override.
+pub(super) enum RouteOverride {
+    /// No interface input filter affects route lookup here, or no PBR
+    /// routing-instance term matched. Use the default route table.
+    None,
+    /// A PBR routing-instance term matched with a non-drop (accept) action.
+    /// Steer the route lookup to this override table (`<ri>.inet[6].0`) and
+    /// forward — normal policy-based routing, unchanged.
+    Table(String),
+    /// A PBR routing-instance term matched with a `reject`/`discard` action.
+    /// The caller MUST DROP: do NOT apply the override, do NOT route-lookup or
+    /// forward. Any reject reply (TCP RST / ICMP unreachable) has already been
+    /// synthesized inside `ingress_route_table_override` when a `PbrRejectSink`
+    /// was supplied and the action is `reject`; `discard`, and the flowless
+    /// (sink-less) path, drop silently.
+    Drop,
+}
+
 pub(super) fn ingress_route_table_override(
     forwarding: &ForwardingState,
     frame: &[u8],
@@ -1490,7 +1526,8 @@ pub(super) fn ingress_route_table_override(
     ingress_zone_override: Option<u16>,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     now_ns: u64,
-) -> Option<String> {
+    reject_sink: Option<PbrRejectSink<'_>>,
+) -> RouteOverride {
     let ingress_ifindex = resolve_ingress_logical_ifindex(
         forwarding,
         meta.ingress_ifindex as i32,
@@ -1503,26 +1540,56 @@ pub(super) fn ingress_route_table_override(
         ingress_ifindex,
         is_v6,
     ) {
-        return None;
+        return RouteOverride::None;
     }
     // #2362: PBR terms may carry per-packet L4 match conditions (tcp-flags /
     // is-fragment / icmp-type / icmp-code); build the extra inputs so a
     // `from { tcp-flags ...; } then routing-instance ...` term matches exactly
     // the authored packets.
     let extra = crate::afxdp::frame::term_match_extra_from_frame(frame, meta);
-    let routing_result = crate::filter::evaluate_interface_filter_routing_instance_event_counted(
-        &forwarding.filter_state,
-        ingress_ifindex,
-        is_v6,
-        flow.src_ip,
-        flow.dst_ip,
-        meta.protocol,
-        flow.forward_key.src_port,
-        flow.forward_key.dst_port,
-        meta.dscp,
-        extra,
-        meta.pkt_len as u64,
-    )?;
+    let routing_result =
+        match crate::filter::evaluate_interface_filter_routing_instance_event_counted(
+            &forwarding.filter_state,
+            ingress_ifindex,
+            is_v6,
+            flow.src_ip,
+            flow.dst_ip,
+            meta.protocol,
+            flow.forward_key.src_port,
+            flow.forward_key.dst_port,
+            meta.dscp,
+            extra,
+            meta.pkt_len as u64,
+        ) {
+            Some(result) => result,
+            None => return RouteOverride::None,
+        };
+    // #4392: a matched PBR routing-instance term may ALSO carry a drop action
+    // (`then { routing-instance X; reject | discard; }`). Such a term is a DENY,
+    // NOT a forward: the routing-instance override must NOT be applied. On the
+    // flow-backed session-miss path a `PbrRejectSink` is supplied, so a `reject`
+    // synthesizes the TCP RST / ICMP-unreachable reply here — byte-identical to
+    // a non-PBR `then reject` — and its ACTUAL outcome is threaded into the
+    // filter log (#3615) below. A `discard`, and the flowless (sink-less) path,
+    // drop silently.
+    let is_drop = matches!(
+        routing_result.action,
+        crate::filter::FilterAction::Reject | crate::filter::FilterAction::Discard
+    );
+    let reject_reply_enqueued = match (routing_result.action, reject_sink) {
+        (crate::filter::FilterAction::Reject, Some(sink)) => {
+            crate::afxdp::poll_descriptor::reject_reply::enqueue_filter_reject_reply(
+                sink.tx_pipeline,
+                forwarding,
+                sink.ingress_ifindex,
+                frame,
+                meta,
+                flow,
+                sink.counters,
+            )
+        }
+        _ => false,
+    };
     // #2619: emit the accumulated log_match — it captures fall-through
     // `then { log; next term; }` terms ahead of the routing-instance term that
     // the PBR path previously dropped, AND the routing-instance term's own log
@@ -1551,15 +1618,22 @@ pub(super) fn ingress_route_table_override(
             FilterLogSource::Pbr,
             // #2520: AppID via the hot-path app_catalog.lookup.
             resolve_flow_app_id(&forwarding.app_catalog, flow),
-            // #3615: the PBR (routing-instance) filter path synthesizes NO
-            // reject reply, so a `then reject` term logs the truthful DENY
-            // (silent drop) rather than claiming an active reject was sent.
-            false,
+            // #3615/#4392: report the TRUTHFUL reject outcome. A forward
+            // (non-drop) PBR term never rejects (false). A `then reject` on the
+            // flow-backed session-miss path synthesizes an RST/ICMP reply above
+            // and logs REJECT; a `discard`, or the flowless (sink-less) path,
+            // logs the truthful DENY (silent drop).
+            reject_reply_enqueued,
             now_ns,
         );
     }
+    if is_drop {
+        // #4392: reject/discard PBR term — the caller must drop; do NOT apply
+        // the routing-instance override or route-lookup/forward.
+        return RouteOverride::Drop;
+    }
     let routing_instance = routing_result.routing_instance;
-    Some(if is_v6 {
+    RouteOverride::Table(if is_v6 {
         format!("{routing_instance}.inet6.0")
     } else {
         format!("{routing_instance}.inet.0")

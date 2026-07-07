@@ -511,9 +511,14 @@ fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
             burst: 0,
         },
     );
-    let override_table =
-        ingress_route_table_override(&state, &[], meta, &flow, None, Some(&event_handle), 99);
-    assert_eq!(override_table.as_deref(), Some("sfmix.inet.0"));
+    // #4392: an accept (non-drop) routing-instance term still forwards via the
+    // override table — RouteOverride::Table, not Drop.
+    let RouteOverride::Table(override_table) =
+        ingress_route_table_override(&state, &[], meta, &flow, None, Some(&event_handle), 99, None)
+    else {
+        panic!("accept routing-instance term must forward via override table");
+    };
+    assert_eq!(override_table, "sfmix.inet.0");
     let filter_event = event_rx
         .try_recv()
         .expect("filter-log event")
@@ -529,7 +534,7 @@ fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
         &state,
         &Default::default(),
         flow.dst_ip,
-        override_table.as_deref(),
+        Some(override_table.as_str()),
     );
     assert_eq!(
         resolved.disposition,
@@ -538,6 +543,239 @@ fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
     assert_eq!(resolved.egress_ifindex, 362);
     assert_eq!(resolved.tx_ifindex, 6);
     assert_eq!(resolved.tunnel_endpoint_id, 1);
+}
+
+// #4392: a PBR `from { ... } then { routing-instance X; reject | discard; }`
+// term is a DENY, not a forward. Before the fix the routing-instance override
+// was applied unconditionally and the packet was FORWARDED into VRF X (a VRF
+// leak + false audit). The drop action must now gate the override:
+// reject/discard -> RouteOverride::Drop; accept-only -> RouteOverride::Table.
+
+fn pbr_v4_flow() -> SessionFlow {
+    SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            src_port: 0,
+            dst_port: 0,
+        },
+    }
+}
+
+fn pbr_v4_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..Default::default()
+    }
+}
+
+fn pbr_v6_flow() -> SessionFlow {
+    let src: std::net::Ipv6Addr = "2001:559:8585:61::100".parse().expect("v6 src");
+    let dst: std::net::Ipv6Addr = "2001:559:8585:80::200".parse().expect("v6 dst");
+    SessionFlow {
+        src_ip: IpAddr::V6(src),
+        dst_ip: IpAddr::V6(dst),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: crate::ip_proto::PROTO_ICMPV6,
+            src_ip: IpAddr::V6(src),
+            dst_ip: IpAddr::V6(dst),
+            src_port: 0,
+            dst_port: 0,
+        },
+    }
+}
+
+fn pbr_v6_meta() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_ICMPV6,
+        ..Default::default()
+    }
+}
+
+/// #4392: build a `WorkerTxPipeline` with a fixed TX-frame budget so the reject
+/// reply either enqueues (budget available) or fails closed onto the
+/// `filter_reject_reply_budget_drops` counter (budget == 0). Mirrors the
+/// reject_reply.rs test helper; all fields are `pub(crate)`.
+fn pbr_reject_tx_pipeline(max_pending_tx: usize) -> crate::afxdp::worker::WorkerTxPipeline {
+    crate::afxdp::worker::WorkerTxPipeline {
+        free_tx_frames: std::collections::VecDeque::new(),
+        pending_tx_prepared: std::collections::VecDeque::new(),
+        pending_tx_local: std::collections::VecDeque::new(),
+        max_pending_tx,
+        outstanding_tx: 0,
+        pending_fill_frames: std::collections::VecDeque::new(),
+        in_flight_prepared_recycles: FastMap::default(),
+        tx_submit_ns: Vec::new().into_boxed_slice(),
+    }
+}
+
+#[test]
+fn pbr_routing_instance_reject_or_discard_drops_not_forwards_v4() {
+    // Flowless (sink-less) path: a reject/discard PBR term must DROP, never
+    // return an override table to forward into. RED-on-revert: the pre-fix code
+    // returns Some("sfmix.inet.0") == RouteOverride::Table, forwarding the deny.
+    let flow = pbr_v4_flow();
+    let meta = pbr_v4_meta();
+    for action in ["reject", "discard"] {
+        let state = build_forwarding_state(&native_gre_pbr_action_snapshot(action));
+        let result = ingress_route_table_override(&state, &[], meta, &flow, None, None, 0, None);
+        assert!(
+            matches!(result, RouteOverride::Drop),
+            "v4 PBR `then routing-instance sfmix; {action}` must DROP, not forward"
+        );
+    }
+}
+
+#[test]
+fn pbr_routing_instance_reject_or_discard_drops_not_forwards_v6() {
+    let flow = pbr_v6_flow();
+    let meta = pbr_v6_meta();
+    for action in ["reject", "discard"] {
+        let state = build_forwarding_state(&native_gre_pbr_action_snapshot(action));
+        let result = ingress_route_table_override(&state, &[], meta, &flow, None, None, 0, None);
+        assert!(
+            matches!(result, RouteOverride::Drop),
+            "v6 PBR `then routing-instance sfmix; {action}` must DROP, not forward"
+        );
+    }
+}
+
+#[test]
+fn pbr_routing_instance_accept_still_forwards_no_regression() {
+    // An accept-only routing-instance term (no drop action) must STILL steer
+    // the route lookup into the override table — normal PBR is unchanged.
+    let state = build_forwarding_state(&native_gre_pbr_action_snapshot(""));
+
+    let v4 = ingress_route_table_override(
+        &state,
+        &[],
+        pbr_v4_meta(),
+        &pbr_v4_flow(),
+        None,
+        None,
+        0,
+        None,
+    );
+    match v4 {
+        RouteOverride::Table(table) => assert_eq!(table, "sfmix.inet.0"),
+        _ => panic!("accept v4 routing-instance term must forward via sfmix.inet.0"),
+    }
+
+    let v6 = ingress_route_table_override(
+        &state,
+        &[],
+        pbr_v6_meta(),
+        &pbr_v6_flow(),
+        None,
+        None,
+        0,
+        None,
+    );
+    match v6 {
+        RouteOverride::Table(table) => assert_eq!(table, "sfmix.inet6.0"),
+        _ => panic!("accept v6 routing-instance term must forward via sfmix.inet6.0"),
+    }
+}
+
+#[test]
+fn pbr_routing_instance_reject_synthesizes_reply_on_session_miss() {
+    // Flow-backed session-miss path: a `reject` PBR term supplies a reject sink,
+    // so the drop synthesizes an RST/ICMP reply exactly like a non-PBR
+    // `then reject`. Drive the TX-frame budget to 0 so the reply attempt is
+    // OBSERVABLE via `filter_reject_reply_budget_drops` without needing a valid
+    // egress/neighbor — the budget gate is reached only for a BUILDABLE reply,
+    // so a bump proves the reply was actually synthesized and attempted.
+    let state = build_forwarding_state(&native_gre_pbr_action_snapshot("reject"));
+    let frame = build_ipv4_tcp_frame(
+        Ipv4Addr::new(10, 0, 61, 100),
+        Ipv4Addr::new(10, 255, 192, 41),
+        49152,
+        443,
+        1,
+        0,
+        TCP_FLAG_SYN,
+    );
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        pkt_len: (frame.len() - 14) as u16,
+        ..Default::default()
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            src_port: 49152,
+            dst_port: 443,
+        },
+    };
+    let mut pipeline = pbr_reject_tx_pipeline(0);
+    let mut counters = crate::afxdp::BatchCounters::default();
+    let result = ingress_route_table_override(
+        &state,
+        &frame,
+        meta,
+        &flow,
+        None,
+        None,
+        0,
+        Some(PbrRejectSink {
+            tx_pipeline: &mut pipeline,
+            ingress_ifindex: 5,
+            counters: &mut counters,
+        }),
+    );
+    assert!(
+        matches!(result, RouteOverride::Drop),
+        "session-miss reject PBR term must DROP"
+    );
+    assert_eq!(
+        counters.filter_reject_reply_budget_drops, 1,
+        "a reject reply must be synthesized and attempted on the session-miss path"
+    );
+
+    // No-regression: an accept-only term with a sink attempts NO reply.
+    let accept_state = build_forwarding_state(&native_gre_pbr_action_snapshot(""));
+    let mut accept_pipeline = pbr_reject_tx_pipeline(0);
+    let mut accept_counters = crate::afxdp::BatchCounters::default();
+    let accept = ingress_route_table_override(
+        &accept_state,
+        &frame,
+        meta,
+        &flow,
+        None,
+        None,
+        0,
+        Some(PbrRejectSink {
+            tx_pipeline: &mut accept_pipeline,
+            ingress_ifindex: 5,
+            counters: &mut accept_counters,
+        }),
+    );
+    assert!(
+        matches!(accept, RouteOverride::Table(_)),
+        "accept routing-instance term must forward"
+    );
+    assert_eq!(
+        accept_counters.filter_reject_reply_budget_drops, 0,
+        "an accept PBR term must NOT synthesize a reject reply"
+    );
 }
 
 #[test]
