@@ -68,6 +68,15 @@ func TestRenewalTimers(t *testing.T) {
 		{"t2 remainder clamped to 1s", 2 * time.Second, 30 * time.Second, time.Second},
 		{"zero lease time", 0, 30 * time.Second, time.Second},
 		{"60s lease", 60 * time.Second, 30 * time.Second, 22500 * time.Millisecond},
+		// #4526: the 0xFFFFFFFF-second RFC infinite-lease sentinel. The
+		// old leaseTime*7/8 - leaseTime/2 form overflows int64 here and
+		// wraps negative → T2 was clamped to 1s. The divide-first form
+		// yields a sane ~37.5% remainder (3/8 of the lease). RED on
+		// revert: this asserts the large positive value, not the 1s clamp.
+		{"max-uint32 infinite-lease sentinel",
+			0xFFFFFFFF * time.Second,
+			0xFFFFFFFF * time.Second / 2,
+			0xFFFFFFFF * time.Second / 8 * 3},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
