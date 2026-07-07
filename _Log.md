@@ -1,3 +1,31 @@
+## 2026-07-07 — #4521: source-NAT pool `address [ a b c ]` bracket-list no longer truncates to the first IP
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4521 (ps-022 R-02, #2419-class silent-truncation). A source-NAT
+  pool `address` value carries every IP the SNAT allocator may draw from, but
+  `address` is UNMODELED under a source pool in the schema, so SetPath's
+  unmodeled-leaf path collapses a bracket list onto ONE node key
+  (`Keys=["address","a","b","c"]`). `compileNATSource` read only `prop.Keys[1]`
+  (and the range branch required `Keys[2]=="to"`), so a discrete bracket list
+  `set security nat source pool P address [ a b c ]` silently kept ONLY the
+  first IP → the pool shrank to one address → premature source-port exhaustion
+  under load. Added `appendPoolAddresses` (compiler_nat.go), which walks the
+  full `prop.Keys[1:]` token stream (plus the block `prop.Children`) and
+  expands any `<low> to <high>` sub-range in place — the #2419 dual-shape read
+  pattern mirroring `firewallMatchValues`. Now every shape accumulates every
+  address: discrete `set` lines, bracket list, range, mixed `[ a b to c ]`,
+  and the hierarchical `address { ... }` block. Ride-along R-04: added
+  `ch == '@'` to `isIdentChar`/`IsIdentRune` (lexer.go) for unquoted
+  URL/userinfo (`user@host`) completeness — no live failure, the quoted form
+  already worked.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/lexer.go,
+  pkg/config/compiler_nat_source_pool_address_4521_test.go,
+  docs/config-schema.md, _Log.md
+- **Validation**: `go test ./pkg/config/...` green; go build ./..., gofmt,
+  go vet clean. RED-on-revert proven: reverting to the `Keys[1]`-only read
+  fails the bracket-list test (1 of 3) and the mixed-range test (1 of 4),
+  while discrete/range/block stay green (those shapes always worked).
+
 ## 2026-07-07 — #4418: close scan/sweep slow-scan evasion on the cleanup 5-min cap AND the source-saturation eviction
 
 - **Timestamp**: 2026-07-07
