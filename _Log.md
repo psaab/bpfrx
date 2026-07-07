@@ -1,3 +1,37 @@
+## 2026-07-06 — #4437: DDNS Surface-A cached HTTP client fails closed on source-bind error
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed C172-M01 (#4437). The Surface A HTTP publish path
+  (`resolveSurfaceABackend`, cached-client branch) swallowed a
+  cached-client source-bind error and threaded the UNBOUND default
+  client into the backend constructor — so a provider that configured a
+  `source-address` that could not be honored (a malformed address)
+  silently published from the DEFAULT ROUTE (the wrong source /
+  interface the operator explicitly overrode). Verify-first confirmed
+  the bug lived ONLY on the cached path: `httpClientCache.clientFor`
+  returns `(unbound client, err)`, and the old `httpClientFor` closure
+  dropped that error after a warning. The nil-cache path already failed
+  closed (`newProviderHTTPClient` surfaces the same error from inside
+  the constructor, `backend_dyndns2.go:85`), and the checkip observer
+  already failed closed via `CheckIPBound` (#3733). Fix: resolve the
+  source-bound client BEFORE building the backend and PROPAGATE the bind
+  error, so `newSurfaceAHTTP` degrades to the no-op publisher and the
+  reconcile SKIPS the publish (never a withdraw — the record stays as it
+  was on the wire, re-attempted next cycle once the leaf is corrected).
+  A publish with a configured `source-address` that cannot be honored is
+  an error, not a silent use-default. This is defense-in-depth: a non-IP
+  `source-address` is also rejected at commit
+  (`schema_validate_ddns_source_address_2780_test.go`), matching the
+  #3733 posture.
+- **Validation**: RED-on-revert confirmed — reverting the error
+  propagation makes `TestResolveSurfaceABackendFailsClosedOnCachedSourceBindError`
+  fail (returns a live `*dyndns2Backend` on the unbound client) while the
+  no-source happy-path test stays green. `go test ./pkg/ddns/...` green,
+  `go build`, gofmt + `go vet` clean on touched files.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/backend_http.go,
+  pkg/ddns/surface_a_sourcebind_failclosed_4437_test.go,
+  pkg/ddns/README.md, _Log.md
+
 ## 2026-07-06 — #4433: fail the commit closed when IPsec render/reload fails
 
 - **Timestamp**: 2026-07-06

@@ -369,9 +369,10 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   adapts them onto the same `resolveBindConfig` discipline. When no
   `source-address` is set the Transport gets no `DialContext` override — the
   default-route behaviour is byte-for-byte unchanged. A malformed `source-address`
-  is a hard error so the backend constructor degrades to no-op (and the checkip
-  client falls back to the unbound default + logs), matching the rfc2136
-  fail-open posture.
+  is a hard error: the backend constructor degrades to the no-op publisher and the
+  publish is SKIPPED — it must NOT fall back to the unbound default and egress from
+  the wrong source (fail-closed; the publish path via the cached client is #4437,
+  the checkip probe is #3733's `CheckIPBound` gate — see the two bullets below).
 
 - **HTTP client / connection-pool reuse across reconcile passes (#2904)** — the
   Surface A engine rebuilds the lightweight backend OBJECT every reconcile pass
@@ -395,6 +396,24 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   configured bindings. Backed by the FAIL-ON-REVERT suite
   `surface_a_httpcache_2904_test.go` (same-binding reuse, cross-provider
   same-binding reuse, per-leaf invalidation, checkip↔update shared pool).
+- **Cached-client source-bind fail-closed (#4437)** — `httpClientCache.clientFor`
+  returns the UNBOUND default client ALONGSIDE the bind-resolution error for a
+  malformed `source-address` (the error path is deliberately not cached so a
+  corrected leaf on the next commit rebuilds cleanly). `resolveSurfaceABackend`
+  used to swallow that error, log a warning, and thread the unbound client into
+  the backend constructor — so a provider that configured a `source-address`
+  silently published from the DEFAULT ROUTE (the wrong source / interface the
+  operator explicitly overrode). The resolver now PROPAGATES the bind error: it
+  resolves the source-bound client BEFORE building the backend, so on a bind error
+  the constructor is never reached, `newSurfaceAHTTP` degrades to the no-op
+  publisher, and the reconcile SKIPS the publish (never a withdraw — the record
+  stays as it was on the wire, re-attempted next cycle once the leaf is corrected).
+  This matches the nil-cache path (which already surfaced the same error from
+  inside `newProviderHTTPClient`) and the checkip observer's #3733 `CheckIPBound`
+  fail-closed gate: a publish with a configured `source-address` that cannot be
+  honored is an error, not a silent use-default. Backed by the FAIL-ON-REVERT suite
+  `surface_a_sourcebind_failclosed_4437_test.go` (cached bind error → no-op +
+  uncached; no-source provider → live backend on the default client).
 - **Superseded-transport reap (#2956)** — the stale entry left behind by a
   binding-leaf change (above) was never looked up again but also never released,
   and the `SurfaceAManager` lives for the whole daemon lifetime, so distinct
