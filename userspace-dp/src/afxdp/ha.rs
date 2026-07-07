@@ -314,6 +314,41 @@ impl super::Coordinator {
             &self.sessions.owner_rg_indexes,
             &entry,
         );
+        // #4393: publish the reverse-SNAT `dnat_table` BPF-map entry for a
+        // peer-synced forward SNAT session. The active node populates this
+        // steering map from the worker poll path when it forwards the first
+        // SNAT'd packet (`poll_descriptor`), but the standby never forwards
+        // that packet — it imports the pre-computed NAT decision here. Without
+        // this publish the standby has no `dnat_table` entry, so after failover
+        // the shim does not steer an inbound embedded-ICMP error (PMTUD
+        // Too-Big / traceroute Time-Exceeded) whose quoted inner packet carries
+        // the SNAT pool `(addr, port)` into the helper's slow path — the error
+        // is passed to the kernel (no NAT state) instead of reverse-NAT'd back
+        // to the original client, so the client never learns the PMTU (TCP
+        // stalls on large packets) and traceroute breaks. Mirrors the primary's
+        // `publish_dnat_table_entry` call site exactly (forward entry only; a
+        // reverse companion carries no SNAT source rewrite). Published
+        // unconditionally (NOT gated on `synced_entry_allows_local_replace`,
+        // unlike the forward session-map publish below): the `dnat_table` is a
+        // passive reverse-NAT steering map that must be ready the instant this
+        // node becomes active, and inbound SNAT-return traffic does not reach
+        // the standby anyway, so an early entry is inert until failover. The
+        // matching delete is `delete_synced_session_gen`'s teardown. The
+        // process-global `dnat_table` map is a single shared object, so this
+        // once-per-synced-session publish (not per worker) mirrors the primary.
+        if !entry.metadata.is_reverse {
+            let dnat_fds = DnatTableFds {
+                v4: self.bpf_maps.dnat_table_fd.as_ref().map(|fd| fd.fd),
+                v6: self.bpf_maps.dnat_table_v6_fd.as_ref().map(|fd| fd.fd),
+            };
+            if !publish_dnat_table_entry(&dnat_fds, &entry.key, entry.decision.nat) {
+                // #4393/#2244: a failed publish (map at capacity / kernel
+                // resource exhaustion) silently loses the reverse-NAT steering
+                // entry. Count it via the shared static (no per-binding context
+                // here) so `dnat_publish_errors_total` stays honest.
+                DNAT_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Keep the immediate BPF publish aligned with the worker-side
         // ownership guard so XSK redirect state cannot get ahead of what
         // the local SessionTable would actually accept.
@@ -428,6 +463,22 @@ impl super::Coordinator {
                     entry.decision,
                     &entry.metadata,
                 );
+            }
+            // #4393: release the reverse-SNAT `dnat_table` entry published for
+            // this peer-synced forward SNAT session at `upsert_synced_session`
+            // so it does not leak (the maps are non-LRU HASH with
+            // `max_entries = MAX_SESSIONS`; every un-deleted entry burns a slot
+            // until publishes start failing) or steer a stale inbound ICMP
+            // error after the session is gone. Keyed on the SAME
+            // `dnat_v4_key_bytes` / `dnat_v6_key_bytes` helpers the publish path
+            // used, so it byte-matches the insert key; a non-SNAT / reverse
+            // entry is a no-op.
+            if !entry.metadata.is_reverse {
+                let dnat_fds = DnatTableFds {
+                    v4: self.bpf_maps.dnat_table_fd.as_ref().map(|fd| fd.fd),
+                    v6: self.bpf_maps.dnat_table_v6_fd.as_ref().map(|fd| fd.fd),
+                };
+                delete_dnat_table_entry(&dnat_fds, &entry.key, entry.decision.nat);
             }
         }
         remove_shared_session(

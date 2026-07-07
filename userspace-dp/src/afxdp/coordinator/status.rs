@@ -154,19 +154,23 @@ impl super::Coordinator {
     /// #2244: total failed `dnat_table` reverse-SNAT BPF-map publishes.
     /// Sum of the per-binding `dnat_publish_errors` atomics bumped on the
     /// two worker poll-path `publish_dnat_table_entry` call sites whose
-    /// `bpf_map_update_elem` return code was previously discarded. The
-    /// `dnat_table` backs embedded-ICMP NAT reversal (PMTUD / traceroute
-    /// inbound ICMP errors mapped back to the pre-NAT source); a failed
-    /// publish silently drops the reverse record, so a nonzero value is
-    /// the cause-side signal for `dnat_table` capacity pressure or kernel
-    /// resource exhaustion. Surfaced as
+    /// `bpf_map_update_elem` return code was previously discarded, PLUS the
+    /// shared `DNAT_PUBLISH_ERRORS_SHARED` static bumped on the coordinator's
+    /// peer-synced install path (`upsert_synced_session`, #4393), which has no
+    /// per-binding context. The `dnat_table` backs embedded-ICMP NAT reversal
+    /// (PMTUD / traceroute inbound ICMP errors mapped back to the pre-NAT
+    /// source); a failed publish silently drops the reverse record, so a
+    /// nonzero value is the cause-side signal for `dnat_table` capacity
+    /// pressure or kernel resource exhaustion. Surfaced as
     /// `xpf_userspace_dnat_publish_errors_total`.
     pub fn dnat_publish_errors_total(&self) -> u64 {
-        self.workers
+        let per_binding: u64 = self
+            .workers
             .live
             .values()
             .map(|live| live.dnat_publish_errors.load(Ordering::Relaxed))
-            .sum()
+            .sum();
+        per_binding.saturating_add(DNAT_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
     /// #2170: total stale-generation installs refused by the helper's
