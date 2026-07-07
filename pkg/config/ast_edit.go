@@ -1,9 +1,21 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrPathNotFound is the sentinel every DeletePath "target does not exist"
+// error wraps (#4423 M9). Callers that TOLERATE a missing delete — notably the
+// event-options change-configuration batch, whose Junos semantics treat a
+// delete of an absent path as a no-op rather than a failure — must test it with
+// errors.Is(err, config.ErrPathNotFound) rather than substring-matching the
+// message text, so a future reword of the human-readable detail cannot silently
+// turn a tolerated missing-delete into a batch-aborting hard reject. The
+// wrapped messages keep their original "path not found: ..." prefix, so any
+// remaining string matchers continue to work during the transition.
+var ErrPathNotFound = errors.New("path not found")
 
 // CopyPath copies a subtree from src to dst path.
 // The destination's last N keys (where N = len(sourceNode.Keys)) replace the source keys.
@@ -426,7 +438,7 @@ func (t *ConfigTree) DeletePath(path []string) error {
 
 func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) error {
 	if i >= len(path) {
-		return fmt.Errorf("path not found")
+		return ErrPathNotFound
 	}
 
 	keyword := path[i]
@@ -634,7 +646,7 @@ func removeMatchingNode(nodes *[]*Node, targetKeys []string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("path not found: no node matching %q", strings.Join(targetKeys, " "))
+	return fmt.Errorf("%w: no node matching %q", ErrPathNotFound, strings.Join(targetKeys, " "))
 }
 
 // removeMultiLeafMembers implements member-specific deletion for a value-list
@@ -717,8 +729,8 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, mo
 	}
 	*nodes = out
 	if !removedAny {
-		return fmt.Errorf("path not found: no member %q of %q",
-			strings.Join(members, " "), keyword)
+		return fmt.Errorf("%w: no member %q of %q",
+			ErrPathNotFound, strings.Join(members, " "), keyword)
 	}
 	return nil
 }

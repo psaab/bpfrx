@@ -204,6 +204,14 @@ type Engine struct {
 	// downgrades an invalid persisted pattern to a warning.
 	regexCache map[string]*regexp.Regexp
 
+	// eventIndex maps an event NAME to the policies that list it, built once at
+	// Apply so evaluateEvent scans only the policies relevant to the fired event
+	// instead of every policy on every event (#4423 M6: linear policy scan per
+	// event). Rebuilt whenever the policy set changes; read under e.mu. A policy
+	// appears at most once per distinct event name it lists, preserving the
+	// pre-index "match once, in config order" firing semantics.
+	eventIndex map[string][]*config.EventPolicy
+
 	counters engineCounters
 
 	// Action queue + single worker (#2157). actions is bounded; the worker is
@@ -224,9 +232,15 @@ type Engine struct {
 	lifeCtx    context.Context
 	lifeCancel context.CancelFunc
 
-	// throttle for the runtime fail-closed warning so a flapping probe with a
-	// legacy malformed line cannot flood the log.
-	lastInvalidWarn atomic.Int64
+	// Per-policy throttle for the runtime fail-closed warning so a flapping
+	// probe with a legacy malformed line cannot flood the log. Keyed by policy
+	// name (#4423 M11): a single global throttle let a bad line on ONE policy
+	// swallow the FIRST warning about a DIFFERENT policy's distinct bad line, so
+	// a real second problem could stay silent for the whole 10s window. Guarded
+	// by its own mutex (not e.mu) so it is safe even when attributesMatch is
+	// exercised directly by a matcher-only test that does not hold e.mu.
+	invalidWarnMu sync.Mutex
+	invalidWarnAt map[string]int64
 
 	// Injectable clock for tests; nil means time.Now.
 	nowFn func() time.Time
@@ -278,15 +292,17 @@ func (e *Engine) lockRetryDeadline() time.Duration {
 func New(store *configstore.Store, commitFn CommitFn) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		store:      store,
-		commitFn:   commitFn,
-		runtime:    make(map[string]*policyRuntime),
-		semRev:     make(map[string]string),
-		regexCache: make(map[string]*regexp.Regexp),
-		actions:    make(chan plannedAction, actionQueueDepth),
-		stopCh:     make(chan struct{}),
-		lifeCtx:    ctx,
-		lifeCancel: cancel,
+		store:         store,
+		commitFn:      commitFn,
+		runtime:       make(map[string]*policyRuntime),
+		semRev:        make(map[string]string),
+		regexCache:    make(map[string]*regexp.Regexp),
+		eventIndex:    make(map[string][]*config.EventPolicy),
+		invalidWarnAt: make(map[string]int64),
+		actions:       make(chan plannedAction, actionQueueDepth),
+		stopCh:        make(chan struct{}),
+		lifeCtx:       ctx,
+		lifeCancel:    cancel,
 	}
 }
 
@@ -373,6 +389,25 @@ func (e *Engine) Apply(policies []*config.EventPolicy) {
 			e.regexCache[pattern] = re
 		}
 	}
+
+	// Rebuild the event-name -> policies index (#4423 M6) so evaluateEvent
+	// touches only the policies that list the fired event. Dedup per policy so a
+	// policy that (legacy config) lists the same event name twice is still
+	// evaluated once — matching the old eventMatches "return on first match".
+	e.eventIndex = make(map[string][]*config.EventPolicy)
+	for _, pol := range policies {
+		if pol == nil {
+			continue
+		}
+		seen := make(map[string]struct{}, len(pol.Events))
+		for _, ev := range pol.Events {
+			if _, dup := seen[ev]; dup {
+				continue
+			}
+			seen[ev] = struct{}{}
+			e.eventIndex[ev] = append(e.eventIndex[ev], pol)
+		}
+	}
 }
 
 // policySemanticRevision is a cheap deterministic hash of the match/action
@@ -391,7 +426,15 @@ func policySemanticRevision(pol *config.EventPolicy) string {
 		h.Write([]byte(s))
 	}
 	writeField("events")
-	for _, ev := range pol.Events {
+	// Sort the event names before hashing (#4423 L4): the event list is a SET —
+	// `events [ a b ]` and `events [ b a ]` are the same policy — so a bare
+	// reorder must NOT change the semantic revision and re-arm (wiping the live
+	// cooldown/window state carried forward across an Apply). This mirrors the
+	// AttributesMatch treatment below; ThenCommands stay ordered because command
+	// order IS semantic.
+	events := append([]string(nil), pol.Events...)
+	sort.Strings(events)
+	for _, ev := range events {
 		writeField(ev)
 	}
 	writeField("attrs")
@@ -676,6 +719,14 @@ func (e *Engine) commitContext() context.Context {
 }
 
 func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
+	// #4423 L7: a matcher-only Engine (New(nil, nil)) has no store. A policy
+	// that both matches AND triggers would otherwise nil-panic on EnterConfigure
+	// inside the worker goroutine, taking down the daemon on a config an operator
+	// could plausibly commit. Fail the batch permanently (counted rejected)
+	// instead — a store is required to mutate config.
+	if e.store == nil {
+		return errBatch("no config store: cannot apply event-options remediation")
+	}
 	if err := e.store.EnterConfigure(); err != nil {
 		// Lock-held is the retryable case; bubble it up verbatim so the
 		// caller can errors.Is it. Any other EnterConfigure error (read-only
@@ -702,8 +753,12 @@ func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 				// A delete of a missing path is a TOLERATED exception (Junos
 				// change-configuration semantics; #2139 documented carve-out):
 				// it is not a half-applied batch. Any other delete error
-				// aborts the batch.
-				if strings.Contains(err.Error(), "path not found") {
+				// aborts the batch. #4423 M9: match the typed sentinel
+				// config.ErrPathNotFound (which DeletePath now wraps) instead of
+				// substring-matching the error text — a future reword of the
+				// message no longer silently turns a tolerated missing-delete
+				// into a batch-aborting hard reject.
+				if errors.Is(err, config.ErrPathNotFound) {
 					slog.Debug("event-options: delete skipped (path not found)",
 						"policy", a.policyName, "cmd", op.raw)
 					continue
@@ -873,11 +928,13 @@ func (e *Engine) evaluateEvent(ev rpm.Event) []triggeredPolicy {
 
 	var triggered []triggeredPolicy
 	now := e.now()
-	for _, pol := range e.policies {
+	// #4423 M6/M5: scan only the policies that list this event (index built at
+	// Apply), not every policy on every event. The index guarantees the event
+	// matches, so the per-policy eventMatches scan is gone; the remaining
+	// per-matching-policy attributes/within work is inherent and bounded by the
+	// pruned window.
+	for _, pol := range e.eventIndex[ev.Name] {
 		if pol == nil {
-			continue
-		}
-		if !e.eventMatches(pol, ev) {
 			continue
 		}
 
@@ -930,16 +987,6 @@ func (e *Engine) evaluateEvent(ev rpm.Event) []triggeredPolicy {
 		triggered = append(triggered, triggeredPolicy{pol: pol, semRev: e.semRev[pol.Name]})
 	}
 	return triggered
-}
-
-// eventMatches checks if the event name is in the policy's event list.
-func (e *Engine) eventMatches(pol *config.EventPolicy, ev rpm.Event) bool {
-	for _, name := range pol.Events {
-		if name == ev.Name {
-			return true
-		}
-	}
-	return false
 }
 
 // attributesMatch checks if the event attributes match the policy's filters.
@@ -1016,6 +1063,14 @@ func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 				return false
 			}
 			re = compiled
+			// #4423 M10: back-fill the cache so a pattern that slipped past the
+			// Apply-time build (legacy lenient-load path) is compiled ONCE, not
+			// on every event. Production callers reach here under e.mu, which
+			// also guards the Apply-time rebuild, so the write is serialized.
+			if e.regexCache == nil {
+				e.regexCache = make(map[string]*regexp.Regexp)
+			}
+			e.regexCache[pattern] = re
 		}
 
 		if !re.MatchString(value) {
@@ -1026,16 +1081,25 @@ func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 }
 
 // flagAttributesInvalid bumps the counter and emits a throttled warning when a
-// malformed/unknown attributes-match line is hit at runtime (#2141).
+// malformed/unknown attributes-match line is hit at runtime (#2141). The
+// throttle is PER POLICY (#4423 M11): a flapping bad line on one policy must
+// not swallow the first warning about a distinct bad line on another policy.
 func (e *Engine) flagAttributesInvalid(policy, attr, reason string) {
 	e.counters.attributesInvalid.Add(1)
 	now := e.now().UnixNano()
-	last := e.lastInvalidWarn.Load()
-	if now-last >= int64(10*time.Second) {
-		if e.lastInvalidWarn.CompareAndSwap(last, now) {
-			slog.Warn("event-options: attributes-match invalid, policy fails closed (will not fire)",
-				"policy", policy, "line", attr, "reason", reason)
-		}
+	e.invalidWarnMu.Lock()
+	if e.invalidWarnAt == nil {
+		e.invalidWarnAt = make(map[string]int64)
+	}
+	last := e.invalidWarnAt[policy]
+	warn := last == 0 || now-last >= int64(10*time.Second)
+	if warn {
+		e.invalidWarnAt[policy] = now
+	}
+	e.invalidWarnMu.Unlock()
+	if warn {
+		slog.Warn("event-options: attributes-match invalid, policy fails closed (will not fire)",
+			"policy", policy, "line", attr, "reason", reason)
 	}
 }
 
@@ -1055,6 +1119,13 @@ func policyHasTriggerOn(pol *config.EventPolicy) bool {
 // window.
 // "within N { trigger on M }" — fires when M events happen within N seconds.
 // "within N { trigger until M }" — fires until M events happen within N seconds, then stops.
+//
+// MULTIPLE within clauses are combined with AND (#4423 M3): the loop below
+// returns false the moment ANY clause is unsatisfied, so the policy fires only
+// when EVERY within clause passes for this event. A policy that wants
+// OR-of-conditions must be written as separate policies. This AND semantics is
+// the documented contract (pkg/eventengine/README.md) and is covered by
+// TestWithinMultipleClausesAreANDed.
 func (e *Engine) withinMatches(pol *config.EventPolicy, rt *policyRuntime, eventName string, now time.Time) bool {
 	if len(pol.WithinClauses) == 0 {
 		return true // no temporal filter
@@ -1157,6 +1228,18 @@ func (e *Engine) pruneWindow(pol *config.EventPolicy, eventName string, now time
 		if now.Sub(ts) <= maxWindow {
 			pruned = append(pruned, ts)
 		}
+	}
+	// #4423 M4: the in-place compaction above reuses the SAME backing array, so
+	// its capacity stays pinned at the burst high-water mark forever — a single
+	// storm of a rapidly-flapping probe permanently retains that memory even
+	// after the window drains back to a handful of entries. When the retained
+	// capacity dwarfs the live length, copy into a right-sized slice so the old
+	// backing array can be collected. The threshold keeps steady-state churn
+	// cheap (no realloc for a window oscillating near its typical size).
+	if cap(pruned) >= 64 && cap(pruned) > 4*len(pruned) {
+		shrunk := make([]time.Time, len(pruned))
+		copy(shrunk, pruned)
+		pruned = shrunk
 	}
 	rt.windows[eventName] = pruned
 }

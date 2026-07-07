@@ -37895,3 +37895,80 @@ top.
   pkg/flowexport/collector_stall_4423_test.go, pkg/flowexport/README.md,
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
   pkg/grpcapi/server_show_flow.go, pkg/cli/cli_show_flow.go, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 eventengine mediums M3-M12 / L1-L7 — verify-first triage +
+  fixes. Drove the confirmed-genuine ones; recorded evidence-backed dispositions
+  for the not-material / deferred ones.
+  - **M3 (multiple `within` clauses undocumented AND) — GENUINE (doc gap),
+    documented + tested.** `withinMatches` (engine.go) already returns false on
+    the first unsatisfied clause (AND), but the contract was undocumented. Added
+    the AND semantics to the function doc + README; RED-lock-in
+    `TestWithinMultipleClausesAreANDed`.
+  - **M4 (window pruning retains burst capacity forever) — GENUINE, fixed.**
+    `pruneWindow` compacted in place (`timestamps[:0]`), so the backing array
+    stayed pinned at the burst high-water mark. Added a right-size copy when the
+    retained cap dwarfs the live len (`cap >= 64 && cap > 4*len`). RED-on-revert
+    `TestPruneWindowReleasesBurstCapacity` (burst=682, drained cap stays 682 on
+    revert).
+  - **M5 (evaluateEvent O(policies*clauses*window) under one mutex) — reduced by
+    M6.** The per-policy scan is gone (index); the remaining per-matching-policy
+    within-window scan is inherent and bounded by the pruned window. Documented.
+  - **M6 (policy lookup linear scan per event) — GENUINE, fixed.** `Apply` now
+    builds `eventIndex` (event name → policies, deduped per policy);
+    `evaluateEvent` scans only matching policies (removed the dead
+    `eventMatches`). RED-on-revert `TestEventIndexRoutingAndDedup` (dup-event
+    policy records 2 window entries without the dedup).
+  - **M7 (double compile on commit) — DELIBERATE, no change.** The engine's
+    `CommitCheck` rejects a doomed batch BEFORE taking the daemon apply
+    semaphore; the second/third compile (`CompileCandidate` device-map preflight
+    + `Commit`) is the daemon `commitAndApply` path, not the engine's.
+    Remediations are rare; the early check is worth one cheap compile.
+  - **M8 (config lock held across apply-semaphore wait) — NOT-MATERIAL.** No
+    deadlock: `configDir` is a non-blocking try-lock (`store_lock.go:53` returns
+    `ErrConfigLocked` immediately; the worker retries with backoff), so nothing
+    ever blocks WAITING for it — there is no wait-for cycle. Holding it across
+    `CommitFn` is required (Commit reads the candidate staged under that lock;
+    releasing first discards the batch) and mirrors the ordinary operator commit
+    path (frontend EnterConfigure → commit → applySem.Acquire).
+  - **M9 (missing-delete tolerance uses a string match) — GENUINE, fixed.**
+    Added `config.ErrPathNotFound` sentinel (message text preserved so existing
+    substring matchers keep working); `DeletePath`'s three not-found returns wrap
+    it; `applyOnce` now uses `errors.Is(err, config.ErrPathNotFound)`.
+    RED-on-revert `TestDeletePathWrapsErrPathNotFound` /
+    `...MissingMemberWrapsErrPathNotFound`.
+  - **M10 (attributes-match cache miss recompiles every event) — GENUINE,
+    fixed.** `attributesMatch` back-fills `regexCache` on a compile-on-demand
+    miss. RED-on-revert `TestAttributesMatchCacheBackfillOnMiss`.
+  - **M11 (global invalid-attributes warning throttle hides distinct policies) —
+    GENUINE, fixed.** Replaced the single `lastInvalidWarn` atomic with a
+    per-policy `invalidWarnAt` map (own mutex). RED-on-revert
+    `TestFlagAttributesInvalidPerPolicyThrottle` (policy B suppressed by A's
+    throttle on revert).
+  - **M12 (metrics global not policy-labelled) — DEFER-with-plan.** Per-policy
+    labels on `xpf_event_actions_*` need a metric-schema decision (additive
+    series vs relabel + cardinality). Recorded in README; not folded in.
+  - **L1 (duplicate policy names not validated) — GENUINE, fixed.** Confirmed
+    hierarchical `policy foo {} policy foo {}` yields two same-named
+    EventPolicy structs (flat-set already merges); the engine keys runtime by
+    name so the second clobbers the first's revision and the first's remediation
+    is silently dropped as "redefined". `compileEventOptions` now MERGES by name
+    (Junos semantics). RED-on-revert
+    `TestCompileEventOptionsMergesDuplicatePolicyBlocks`.
+  - **L4 (reorder resets cooldown) — GENUINE, fixed.** Sorted `Events` in
+    `policySemanticRevision` (event list is a set). RED-on-revert
+    `TestPolicySemanticRevisionEventOrderStable`.
+  - **L7 (nil-store panic) — GENUINE, fixed.** `applyOnce` guards `e.store == nil`
+    (permanent reject, counted) instead of nil-panicking in the worker.
+    RED-on-revert `TestApplyOnceNilStoreDoesNotPanic` (worker goroutine panic
+    crashes the process on revert).
+  - **L2/L3/L5 — not driven.** L2 (empty stanzas commit silently) and L3
+    (within-0) are already gated: within-0 is rejected at commit
+    (`validateEventOptionsWithinAST`, #3751) and fails closed at runtime; L5
+    (hard-coded `actionQueueDepth = 64`) is documented + intentional. Left as-is.
+  - Validation: `go test ./pkg/eventengine/... ./pkg/config/...` green;
+    regression-checked `./pkg/configstore/... ./pkg/api/... ./pkg/daemon/...`
+    green; `go build ./...`; gofmt/vet clean on touched files.
+- **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/engine_4423_test.go,
+  pkg/config/ast_edit.go, pkg/config/compiler_services.go,
+  pkg/config/event_options_4423_test.go, pkg/eventengine/README.md, _Log.md

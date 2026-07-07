@@ -83,8 +83,11 @@ held in a `policyRuntime` record separate from the immutable policy config.
 `pkg/ipmon` pattern): for each policy it carries the previous runtime forward
 when `(policy name, semantic revision)` is unchanged, and resets it when the
 policy is new, removed, or semantically changed. The semantic revision is a
-hash of the match/action fields (`Events`, sorted `AttributesMatch`,
-`WithinClauses`, `ThenCommands`); the policy name is the stable identity.
+hash of the match/action fields (sorted `Events`, sorted `AttributesMatch`,
+`WithinClauses`, ordered `ThenCommands`); the policy name is the stable
+identity. `Events` and `AttributesMatch` are sorted because they are SETS (a
+bare reorder is not a redefine, #4423 L4); `ThenCommands` stay ordered because
+command order is semantic.
 
 This fixes the self-wipe: the daemon calls `Apply` on every commit, including
 the engine's own remediation commit. With the old recreate-on-Apply, a policy
@@ -294,6 +297,73 @@ Junos reading in `withinMatches` (`engine.go`):
   `until 1` made the first event `count == 1 >= 1` and NEVER fired, and
   `until N` fired only on events 1..N-1. Regression-locked by
   `TestInclusiveUntil_*_3756`.
+- **Multiple `within` clauses are combined with AND (#4423 M3).**
+  `withinMatches` returns false the moment ANY clause is unsatisfied, so a
+  policy with two `within` clauses fires only when EVERY clause passes for the
+  current event. There is no OR; express an OR-of-conditions as separate
+  policies. Regression-locked by `TestWithinMultipleClausesAreANDed`.
+
+## Audit hardening (#4423)
+
+A backlog re-audit of the event-options engine produced these fixes and
+dispositions (`gh issue view 4423`):
+
+- **Event-name index (M6, part of M5).** `Apply` builds `eventIndex`
+  (`event name → policies listing it`, deduped per policy) so `evaluateEvent`
+  scans only the policies relevant to the fired event instead of every policy
+  on every event. The remaining per-matching-policy attributes/`within` work is
+  inherent and bounded by the pruned window. Locked by
+  `TestEventIndexRoutingAndDedup`.
+- **Typed missing-delete tolerance (M9).** `config.DeletePath` now wraps the
+  `config.ErrPathNotFound` sentinel (message text unchanged), and the
+  tolerated-missing-delete carve-out matches it with `errors.Is` instead of a
+  substring match — a future error reword can no longer silently turn a
+  tolerated missing-delete into a batch-aborting reject. Locked by
+  `TestDeletePathWrapsErrPathNotFound` / `...MissingMember...`.
+- **Regex cache back-fill (M10).** A pattern that reaches `attributesMatch`
+  without an `Apply`-time cache entry (legacy lenient-load path) is compiled
+  once and cached, not recompiled per event. Locked by
+  `TestAttributesMatchCacheBackfillOnMiss`.
+- **Per-policy invalid-attributes throttle (M11).** The fail-closed warning
+  throttle is keyed by policy name, so a flapping bad line on one policy no
+  longer swallows the first warning about a distinct bad line on another. Locked
+  by `TestFlagAttributesInvalidPerPolicyThrottle`.
+- **Duplicate policy-name merge (L1).** Two hierarchical `policy foo { ... }`
+  blocks MERGE into one policy in `compileEventOptions` (matching flat-set and
+  Junos merge semantics) instead of producing two same-named `EventPolicy`
+  structs that clobber each other's runtime/cooldown/`semRev` state. Locked by
+  `TestCompileEventOptionsMergesDuplicatePolicyBlocks`.
+- **Event-list reorder is not a redefine (L4).** `policySemanticRevision` sorts
+  the event names before hashing (the event list is a set), so a bare reorder no
+  longer re-arms and wipes the carried-forward cooldown. Locked by
+  `TestPolicySemanticRevisionEventOrderStable`.
+- **Nil-store guard (L7).** A matcher-only `New(nil, nil)` engine whose policy
+  actually triggers now fails the batch permanently (counted rejected) instead
+  of nil-panicking in the worker goroutine. Locked by
+  `TestApplyOnceNilStoreDoesNotPanic`.
+
+Dispositions with no code change (verified against master):
+
+- **M7 (double compile on commit) — deliberate.** `applyOnce` runs
+  `CommitCheck()` to reject a semantically-invalid batch BEFORE it acquires the
+  daemon apply semaphore in `CommitFn`; the subsequent compile inside
+  `commitAndApply` (`CompileCandidate` device-map preflight + `Commit`) is the
+  daemon's own path, not the engine's. Keeping the early check avoids taking
+  `applySem` for a doomed batch; the extra compile is cheap and rare
+  (remediations are infrequent).
+- **M8 (config lock held across the apply-semaphore wait) — not a deadlock.**
+  The config lock (`configDir`) is a non-blocking try-lock:
+  `store.EnterConfigure` returns `ErrConfigLocked` immediately when held
+  (`configstore/store_lock.go`), and the worker retries with backoff — nothing
+  ever blocks *waiting* for it, so no wait-for cycle exists. The engine holds it
+  across `CommitFn` because `Commit` reads the candidate the engine staged under
+  that lock (releasing it first would discard the batch). This mirrors the
+  ordinary operator commit path (frontend `EnterConfigure` → commit →
+  `commitAndApply` → `applySem.Acquire`).
+- **M12 (metrics are global, not per-policy) — deferred.** Per-policy labels on
+  `xpf_event_actions_*` need a metric-schema decision (additive per-policy series
+  vs relabeling the existing global counters, plus cardinality bounds). Tracked
+  for a follow-up rather than folded in here.
 
 ## Gotchas
 
@@ -309,7 +379,12 @@ Junos reading in `withinMatches` (`engine.go`):
   flagged: a no-within policy (bounded to the 60s default horizon) and a
   `within N { trigger on M }` policy whose threshold is never met (bounded to
   the clause horizon). Pruning is NOT gated behind the trigger-success path.
-  Regression-locked by `TestWindow_*_2216A`.
+  Regression-locked by `TestWindow_*_2216A`. The prune also **releases the
+  burst high-water capacity** (#4423 M4): the in-place compaction reuses the
+  same backing array, so `pruneWindow` copies into a right-sized slice once the
+  retained capacity dwarfs the live length — a one-off event storm no longer
+  pins that memory forever. Regression-locked by
+  `TestPruneWindowReleasesBurstCapacity`.
 - A single event that matches several policies fires EVERY matching policy's
   action — `HandleEvent` enqueues each triggered policy onto the single worker,
   which applies them serially, so none is dropped racing the config lock (the

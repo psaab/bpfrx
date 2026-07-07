@@ -1687,9 +1687,24 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 }
 
 func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
+	// #4423 L1: two same-named policy stanzas must MERGE into one policy, not
+	// coexist as duplicates. Flat-set / display-set config already merges (the
+	// AST collapses same-keyed siblings), but a hierarchical config with two
+	// `policy foo { ... }` blocks yields two separate nodes here. Left
+	// unmerged they produce two EventPolicy structs with the same Name; the
+	// engine keys its runtime/cooldown/semRev maps by Name, so the second
+	// clobbers the first's revision and the first policy's remediation is then
+	// silently dropped as "policy redefined" at commit. Accumulate by name so
+	// both AST shapes behave identically and match Junos merge semantics.
+	byName := make(map[string]*EventPolicy)
 	for _, pInst := range namedInstances(node.FindChildren("policy")) {
-		ep := &EventPolicy{
-			Name: pInst.name,
+		ep := byName[pInst.name]
+		if ep == nil {
+			ep = &EventPolicy{
+				Name: pInst.name,
+			}
+			byName[pInst.name] = ep
+			*policies = append(*policies, ep)
 		}
 
 		for _, child := range pInst.node.Children {
@@ -1759,8 +1774,6 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 				}
 			}
 		}
-
-		*policies = append(*policies, ep)
 	}
 	return nil
 }
