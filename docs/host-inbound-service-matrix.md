@@ -350,6 +350,48 @@ fact inherited a physical override.
 mirrors the same additive resolution and quarantine, so the
 `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
 
+## Repeated host-inbound-traffic blocks merge (#4544)
+
+Junos MERGES two literal `host-inbound-traffic { ... }` blocks authored under
+one `security-zone` (or one interface) into a single effective stanza — the
+union of their `system-services` / `protocols`. xpf now matches that at both
+the zone level and the #3362 per-interface level.
+
+Where this bites is **`load override`** of a hand-authored file. The three
+config-arrival paths differ in how they treat two same-key blocks:
+
+- **flat-set** (`set ... host-inbound-traffic system-services ssh` then
+  `... protocols ospf`) — `ConfigTree.SetPath` reuses the existing same-key
+  container, so the two lines land under ONE node. Structurally immune.
+- **`load merge`** — routes through `FormatSet` (a flat-set round-trip), so it
+  merges for the same reason.
+- **`load override`** (`store_command.go`, `s.candidate = tree`) — splices the
+  RAW hierarchical parse straight into the candidate and commits it with no
+  FormatSet round-trip. The hierarchical parser (`parseStatements`) keeps two
+  literal `host-inbound-traffic { ... }` blocks as **separate same-key
+  siblings** — it does not merge them — and there is no duplicate-block schema
+  rejection.
+
+Before #4544 the compiler dropped every block but one on the load-override path:
+the zone-level `case "host-inbound-traffic"` OVERWROTE (`zone.HostInboundTraffic
+= parseHostInboundNode(prop)`, last block wins) and the interface-level reader
+used `FindChild` (first block wins). Either way the operator's authored
+admission set silently narrowed — a service DoS — or fail-opened if the dropped
+block was the restrictive one. A Junos-EXPORTED config always shows one already-
+merged block, so the trigger is a hand-authored duplicate + `load override`.
+
+The fix (`mergeHostInbound`, `pkg/config/compiler_security_zones.go`) accumulates
+across **all** `FindChildren("host-inbound-traffic")` at both levels and unions
+their token sets, deduplicated (first-seen order). A **single** block is
+byte-identical to the pre-#4544 behaviour — the first parse is returned
+unchanged, with no dedup, so a single block keeps its exact token multiset;
+dedup applies only when a second block is actually merged. RED-on-revert guards:
+`pkg/config/host_inbound_dup_block_4544_test.go`.
+
+This is orthogonal to the "Per-interface override precedence (#3362, #3720)"
+union above, which merges host-inbound authored at DIFFERENT granularities
+(zone ∪ physical ∪ unit). #4544 merges repeated blocks at the SAME granularity.
+
 ## Duplicate host-local-address ambiguity (#3718, Option B)
 
 The kernel host-inbound chain matches on **destination address only** — every

@@ -2536,6 +2536,34 @@ reserved for whole-dataplane selection where a rewrite shim
   bit-identical guards; identical-permit merge + permit/reject-still-rejected for
   the dedup — built with `NewParser` for the `LoadOverride` shape, driving
   `compileNAT`/`compileFirewall`/`compileSecurity` directly).
+- **#4544 (the host-inbound analogue of #3842/#3915/#3850 — duplicate
+  `host-inbound-traffic {}` blocks UNDER ONE zone or interface):** `compileZones`
+  (`compiler_security_zones.go`) read the zone-level block with a bare `=`
+  assignment (`zone.HostInboundTraffic = parseHostInboundNode(prop)` — the switch
+  case fires once per block, so the LAST block wins) and the #3362 per-interface
+  override with `iface.FindChild("host-inbound-traffic")` (FIRST block wins).
+  `parseStatements` appends a repeated hierarchical block as a same-key sibling,
+  so a `LoadOverride` of a hand-authored config with two literal
+  `host-inbound-traffic { ... }` blocks under one zone/interface — e.g.
+  `host-inbound-traffic { system-services ssh; }` then
+  `host-inbound-traffic { protocols ospf; }` — had the extra block silently
+  dropped: host-inbound admission NARROWED (a service DoS) or fail-opened if the
+  dropped block was the restrictive one, with a clean commit. Junos MERGES the
+  blocks. The fix accumulates over EVERY `FindChildren("host-inbound-traffic")`
+  at both levels via `mergeHostInbound` (`compiler_security_zones.go`), which
+  UNIONS the SystemServices/Protocols and dedups (first-seen order). A single
+  block returns the first parse UNCHANGED (no dedup, no copy — byte-identical to
+  the pre-#4544 read). Flat-set `SetPath` and `load merge` (FormatSet round-trip)
+  both merge two same-key lines onto ONE node, so — like every entry in this
+  cluster — the fail-open was reachable ONLY via the hierarchical `NewParser` /
+  `LoadOverride` shape. Distinct from the #3362/#3720 union, which merges
+  host-inbound authored at DIFFERENT granularities (zone ∪ physical ∪ unit);
+  #4544 merges repeated blocks at the SAME granularity. Regression coverage:
+  `pkg/config/host_inbound_dup_block_4544_test.go` (zone + interface two-block
+  merge, cross-block dedup, single-block byte-identical guard — built with
+  `NewParser` for the `LoadOverride` shape); operator doc:
+  `docs/host-inbound-service-matrix.md` "Repeated host-inbound-traffic blocks
+  merge (#4544)".
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same
