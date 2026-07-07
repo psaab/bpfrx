@@ -224,3 +224,38 @@ func TestSurfaceADDNSWarnsCheckIPSourceWithoutURL(t *testing.T) {
 		t.Fatalf("a provider WITH a checkip-url must not be flagged, got:\n%s", joined)
 	}
 }
+
+// TestSurfaceADDNSWarnsNoTSIG is the #4483 commit-warn fail-on-revert proof for
+// the Surface A provider catalog: an rfc2136 provider with an update-server but
+// NO tsig-key must warn that UPDATEs are sent unsigned and the response rcode is
+// forgeable. A provider with a complete TSIG tuple must NOT emit that warning.
+func TestSurfaceADDNSWarnsNoTSIG(t *testing.T) {
+	tree := buildTree(t, []string{
+		// rfc2136 provider WITH update-server but no tsig-key → unsigned warn.
+		"set system services dynamic-dns provider nokey backend rfc2136",
+		"set system services dynamic-dns provider nokey update-server 192.0.2.53",
+		"set interfaces ge-0-0-2 unit 50 family inet dynamic-dns provider nokey",
+		"set interfaces ge-0-0-2 unit 50 family inet dynamic-dns hostname wan.example.net",
+		// rfc2136 provider with a COMPLETE TSIG tuple → no unsigned warn.
+		"set system services dynamic-dns provider withkey backend rfc2136",
+		"set system services dynamic-dns provider withkey update-server 192.0.2.53",
+		"set system services dynamic-dns provider withkey tsig-key k1",
+		"set system services dynamic-dns provider withkey tsig-algorithm hmac-sha256",
+		"set system services dynamic-dns provider withkey tsig-secret c2VjcmV0",
+		"set interfaces ge-0-0-3 unit 0 family inet dynamic-dns provider withkey",
+		"set interfaces ge-0-0-3 unit 0 family inet dynamic-dns hostname wan2.example.net",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	joined := strings.Join(validateSurfaceADDNSWarnings(cfg), "\n")
+	if !strings.Contains(joined, "provider \"nokey\"") ||
+		!strings.Contains(joined, "no tsig-key") || !strings.Contains(joined, "forgeable") {
+		t.Fatalf("provider nokey (update-server, no tsig-key) must warn unsigned/forgeable, got:\n%s", joined)
+	}
+	// The complete-tuple provider must not be dragged into the unsigned warning.
+	if strings.Contains(joined, "provider \"withkey\"") && strings.Contains(joined, "no tsig-key") {
+		t.Fatalf("a provider WITH a tsig-key must not warn about unsigned updates, got:\n%s", joined)
+	}
+}

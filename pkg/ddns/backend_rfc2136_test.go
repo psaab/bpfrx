@@ -1,8 +1,10 @@
 package ddns
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/netip"
 	"strings"
@@ -1054,4 +1056,74 @@ func TestExchangeTCPRetryHonorsCallerCancellation(t *testing.T) {
 	if elapsed > time.Second {
 		t.Errorf("caller deadline was not honored: took %v (stall is 2s) — err=%v", elapsed, err)
 	}
+}
+
+// TestRFC2136UnsignedUpdateWarnsOncePerProvider is the #4483 runtime-warn
+// fail-on-revert proof: an updater with NO TSIG key must emit a single WARN,
+// the first time it sends an unsigned UPDATE to a given server, that the update
+// is unauthenticated and the response rcode is forgeable. The warning is
+// deduped per update server (keyed by host:port) across the per-cycle backend
+// rebuilds, so a second UpsertLease to the same server stays silent. An updater
+// WITH a TSIG key must NOT warn.
+func TestRFC2136UnsignedUpdateWarnsOncePerProvider(t *testing.T) {
+	t.Run("no tsig warns exactly once", func(t *testing.T) {
+		srv := newFakeDNSServer(t, nil) // no TSIG on the server side either
+		var ptr, conf int
+		u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{Enabled: true, Domain: "example.com"}, &ptr, &conf)
+		if u.tsigKeyName != "" {
+			t.Fatalf("precondition: updater must have no TSIG key, got %q", u.tsigKeyName)
+		}
+
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+
+		// First upsert sends a forward + reverse UPDATE (two unsigned
+		// exchanges); the once-per-provider dedup must collapse them to one WARN.
+		if err := u.UpsertLease(context.Background(), recV4("laptop.example.com", "10.0.1.5", 300)); err != nil {
+			t.Fatalf("UpsertLease #1: %v", err)
+		}
+		// A second upsert to the SAME server must not re-warn.
+		if err := u.UpsertLease(context.Background(), recV4("phone.example.com", "10.0.1.6", 300)); err != nil {
+			t.Fatalf("UpsertLease #2: %v", err)
+		}
+
+		out := buf.String()
+		n := strings.Count(out, "UNSIGNED DNS UPDATE")
+		if n != 1 {
+			t.Fatalf("want exactly one unsigned-update WARN across two upserts, got %d; log=%q", n, out)
+		}
+		if !strings.Contains(out, "forgeable") || !strings.Contains(out, "server="+srv.addrUDP) {
+			t.Fatalf("the WARN must name the forgeable posture and the server; log=%q", out)
+		}
+	})
+
+	t.Run("tsig-signed updater does not warn", func(t *testing.T) {
+		secret := map[string]string{"k1.": "c2VjcmV0"}
+		srv := newFakeDNSServer(t, secret)
+		var ptr, conf int
+		u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
+			Enabled:       true,
+			Domain:        "example.com",
+			TSIGKeyName:   "k1",
+			TSIGAlgorithm: "hmac-sha256",
+			TSIGSecret:    config.Secret("c2VjcmV0"),
+		}, &ptr, &conf)
+		if u.tsigKeyName == "" {
+			t.Fatal("precondition: updater must have a TSIG key")
+		}
+
+		var buf bytes.Buffer
+		prev := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		defer slog.SetDefault(prev)
+
+		if err := u.UpsertLease(context.Background(), recV4("laptop.example.com", "10.0.1.5", 300)); err != nil {
+			t.Fatalf("UpsertLease: %v", err)
+		}
+		if strings.Contains(buf.String(), "UNSIGNED DNS UPDATE") {
+			t.Fatalf("a TSIG-signed updater must not warn unsigned; log=%q", buf.String())
+		}
+	})
 }

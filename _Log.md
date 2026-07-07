@@ -1,3 +1,31 @@
+## 2026-07-07 — #4483 (opus-172 M-6): DDNS unsigned-UPDATE forgeable-rcode warn
+
+- **Timestamp**: 2026-07-07T15:40Z
+- **Action**: Fixed opus-172 M-6 (DDNS hardening / observability gap). The RFC
+  2136 backend wires TSIG only when `tsig-key` is set, `exchange()` is UDP-first,
+  and the publish/ownership verdict keys on `resp.Rcode`. With an `update-server`
+  set and no `tsig-key`, the UPDATE goes out unsigned and the rcode is
+  unauthenticated + forgeable — a spoofed `NOERROR` records a name as published
+  though the server wrote nothing (silent blackhole); a spoofed `REFUSED`
+  suppresses a legit publish. Added a WARN-only surface for the weakened posture
+  (a hard reject would brick a previously-inert config): (a) COMMIT-time warning
+  when an `update-server` is set with no `tsig-key`, in
+  `validateDDNSBackendWarnings` (DHCP DDNS) and `validateSurfaceADDNSWarnings`
+  (Surface A provider catalog); (b) once-per-update-server RUNTIME `slog.Warn`
+  the first time an unsigned UPDATE is actually sent (`warnUnsignedOnce` +
+  package-level `unsignedUpdateWarned` sync.Map keyed by server, so the
+  per-Reconcile backend rebuild does not re-warn). Warn-only; TCP-forcing / an
+  explicit `no-tsig` opt-in are noted as follow-ups. RED-on-revert: neutralizing
+  the commit branches makes the config tests report empty warnings; stubbing the
+  runtime call emits 0 WARNs. Verified: `go test ./pkg/ddns/... ./pkg/config/...
+  ./pkg/dhcpserver/... ./pkg/daemon/...` green, go build ./... + vet + gofmt
+  clean. Docs: pkg/ddns/README.md invariant, docs/config-schema.md DDNS warn note.
+- **File(s)**: pkg/ddns/backend_rfc2136.go,
+  pkg/ddns/backend_rfc2136_test.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/config/compiler_surface_a_ddns_test.go, pkg/ddns/README.md,
+  docs/config-schema.md, _Log.md
+
 ## 2026-07-07 — #4480 grpcapi: interface-monitor display honest on missing live status
 
 - **Timestamp**: 2026-07-07T14:24Z

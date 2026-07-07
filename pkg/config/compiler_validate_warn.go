@@ -2071,6 +2071,20 @@ func validateDDNSBackendWarnings(cfg *Config) []string {
 				"update-server %q is not a valid host or host:port; the backend "+
 				"will fail to send updates", d.UpdateServer))
 		}
+		// #4483: an update-server with NO tsig-key sends unsigned UPDATEs and
+		// trusts an UNAUTHENTICATED, forgeable response rcode — a spoofed
+		// NOERROR records a name as published though the server wrote nothing
+		// (silent blackhole), and a spoofed REFUSED suppresses a legitimate
+		// publish. WARN-only so a previously-inert config still commits; the
+		// fix is to configure tsig-key/tsig-secret (miekg then verifies the MAC).
+		if d.UpdateServer != "" && d.TSIGKeyName == "" {
+			warnings = append(warnings, "dhcp dynamic-dns update-server is "+
+				"configured without a tsig-key; DNS UPDATEs are sent unsigned and "+
+				"the server's response rcode is unauthenticated and forgeable — a "+
+				"spoofed NOERROR can record a name as published though nothing was "+
+				"written (silent blackhole) and a spoofed REFUSED can suppress a "+
+				"legitimate publish. Set tsig-key/tsig-secret to authenticate updates")
+		}
 		if d.TSIGKeyName != "" && !ddnsTSIGAlgorithmSupported(d.TSIGAlgorithm) {
 			warnings = append(warnings, fmt.Sprintf("dhcp dynamic-dns "+
 				"tsig-algorithm %q is not supported (use hmac-sha1, hmac-sha224, "+
@@ -2307,6 +2321,19 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			} else if !ddnsUpdateServerParseable(p.UpdateServer) {
 				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
 					"provider %q update-server %q is not a valid host or host:port", name, p.UpdateServer))
+			}
+			// #4483: an update-server with NO tsig-key sends unsigned UPDATEs
+			// and trusts an unauthenticated, forgeable response rcode (spoofed
+			// NOERROR → silent blackhole; spoofed REFUSED → suppressed publish).
+			// WARN-only; the fix is tsig-key/tsig-secret (miekg verifies the MAC).
+			if p.UpdateServer != "" && p.TSIGKeyName == "" {
+				warnings = append(warnings, fmt.Sprintf("system services dynamic-dns "+
+					"provider %q (backend rfc2136) has an update-server but no tsig-key; "+
+					"DNS UPDATEs are sent unsigned and the server's response rcode is "+
+					"unauthenticated and forgeable — a spoofed NOERROR can record a name "+
+					"as published though nothing was written (silent blackhole) and a "+
+					"spoofed REFUSED can suppress a legitimate publish. Set tsig-key/"+
+					"tsig-secret to authenticate updates", name))
 			}
 			keySet := p.TSIGKeyName != ""
 			secretSet := p.TSIGSecret.Reveal() != ""
