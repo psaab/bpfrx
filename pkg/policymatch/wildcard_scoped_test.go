@@ -103,6 +103,32 @@ func TestWildcardZoneAndScopedGlobalPrecedence(t *testing.T) {
 			wantAction: config.PolicyDeny, wantName: "any-to-trust-deny",
 		},
 		{
+			// #4410 (F8): the SWAPPED companion of the case above. With the two
+			// single-wildcard sets in the OPPOSITE config order —
+			// `from-zone untrust to-zone any permit` BEFORE `from-zone any
+			// to-zone trust deny` — the SAME untrust->trust query must now flip to
+			// the PERMIT. The prior case alone cannot prove the merge honors config
+			// order: its winner (the from-any deny) is ALSO the config-first rule,
+			// so it is equally consistent with a buggy "from-any bucket always
+			// outranks to-any" precedence. This swapped pair pins genuine
+			// config-order interleaving across the from-any / to-any boundary —
+			// the winner is whichever wildcard set appears first, not a fixed
+			// from-any/to-any tier. A regression that split the merge into two
+			// ordered passes (all from-any, then all to-any, or vice versa) would
+			// keep the earlier case green and turn THIS one RED.
+			name: "single-wildcard tier honors config order (swapped: to-any first)",
+			cfg: cfgWith(config.SecurityConfig{
+				DefaultPolicy: config.PolicyDeny,
+				Zones:         zones("trust", "untrust"),
+				Policies: []*config.ZonePairPolicies{
+					zonePair("untrust", "any", permit("untrust-to-any-permit", config.PolicyMatch{})),
+					zonePair("any", "trust", deny("any-to-trust-deny", config.PolicyMatch{})),
+				},
+			}, config.ApplicationsConfig{}),
+			q:          Query{FromZone: "untrust", ToZone: "trust"},
+			wantAction: config.PolicyPermit, wantName: "untrust-to-any-permit",
+		},
+		{
 			// #3283 example 2: a zone-scoped global must NOT apply outside its
 			// scope. The old simulator applied every global unconditionally.
 			name: "scoped global does NOT apply to non-matching zone",
