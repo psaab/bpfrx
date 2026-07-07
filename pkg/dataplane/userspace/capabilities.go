@@ -87,11 +87,19 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	if cfg.Chassis.Cluster != nil && userspaceConfigUsesPersistentSourceNAT(cfg) {
 		addReason(persistentSourceNATHAUnsupportedReason)
 	}
-	// Firewall filters and legacy policers are supported in the userspace
-	// dataplane. Three-color policers are supported for the color-blind
-	// `then discard` runtime slice above; unsupported color-aware and
-	// non-drop actions remain fail-closed so the dataplane does not silently
-	// promote inherited color or ignore configured treatment.
+	// Firewall filters are supported in the userspace dataplane. Legacy
+	// single-rate `firewall policer` token buckets are ENFORCED as of #4514:
+	// a `then discard` policer is lowered at compile into the metered
+	// three-color srTCM runtime (committed bucket == the token bucket,
+	// CIR=bandwidth-limit, CBS=burst-size-limit) so traffic above the rate is
+	// discarded, with metering + drop counters + flow-cache re-metering. A
+	// single-rate policer with a non-discard action (`then loss-priority` /
+	// `then forwarding-class`) is metered but the marking is not yet acted
+	// upon (same limitation as three-color `then loss-priority`). Three-color
+	// policers are supported for the color-blind `then discard` runtime slice
+	// above; unsupported color-aware and non-drop actions remain fail-closed
+	// so the dataplane does not silently promote inherited color or ignore
+	// configured treatment.
 	// IPsec: kernel XFRM handles ESP encryption/decryption; the userspace
 	// dataplane passes ESP/IKE traffic to the kernel via the slow-path.
 	// GRE transit is now modeled as native userspace tunnel endpoints on the

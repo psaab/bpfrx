@@ -452,12 +452,24 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			// (Atoi error path), so type them as positive integers.
 			"managed-configuration":        {desc: "Set the Managed Address Configuration (M) flag", children: nil},
 			"other-stateful-configuration": {desc: "Set the Other Stateful Configuration (O) flag", children: nil},
+			// #4525: RFC 4861 §6.2.1 bounds. MaxRtrAdvInterval MUST be in
+			// [4, 1800] seconds; MinRtrAdvInterval MUST be >= 3 seconds and
+			// <= 0.75 * MaxRtrAdvInterval. The old ValidateIntegerMin(1) let
+			// max-advertisement-interval 1|2 commit — the RA sender then drew
+			// a 0-second periodic delay (minI derives to maxI/3 = 0) and
+			// hot-looped sendRA (RA/ND flood + CPU spin). The per-leaf ranges
+			// here reject the safety-critical low end at commit; the
+			// cross-field min <= 0.75*max relation is enforced in the compiler
+			// (crossCheckRAIntervals) where both values are in scope. 1350 is
+			// the RFC ceiling for min (0.75 * 1800). The runtime floor in
+			// pkg/ra randomAdvInterval is the belt if a stale config bypasses
+			// this strict gate via the tolerant load / HA peer-sync path.
 			"max-advertisement-interval": {desc: "Maximum time between unsolicited RAs (seconds)", args: 1, placeholder: "<seconds>",
-				valueType: ValueInteger, valueDesc: "max RA interval in seconds",
-				valueExamples: []string{"600", "1800"}, validator: ValidateIntegerMin(1), children: nil},
+				valueType: ValueInteger, valueDesc: "max RA interval in seconds (RFC 4861 §6.2.1: 4..1800)",
+				valueExamples: []string{"600", "1800"}, validator: ValidateInteger(4, 1800), children: nil},
 			"min-advertisement-interval": {desc: "Minimum time between unsolicited RAs (seconds)", args: 1, placeholder: "<seconds>",
-				valueType: ValueInteger, valueDesc: "min RA interval in seconds",
-				valueExamples: []string{"200", "600"}, validator: ValidateIntegerMin(1), children: nil},
+				valueType: ValueInteger, valueDesc: "min RA interval in seconds (RFC 4861 §6.2.1: 3..1350, and <= 0.75*max)",
+				valueExamples: []string{"200", "600"}, validator: ValidateInteger(3, 1350), children: nil},
 			// #3895: bound the router lifetime at the RFC 4861 §4.2 16-bit
 			// field maximum. A larger value silently wraps in the RA sender's
 			// ndp uint16(lifetime) (65536 -> 0 = "not a default router"), so

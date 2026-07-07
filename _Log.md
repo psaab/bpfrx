@@ -1,3 +1,67 @@
+## 2026-07-07 — #4524 (ps-023 13-02, HIGH): neutralize `monitor traffic ... matching` tcpdump option injection
+
+- **Timestamp**: 2026-07-07T21:30Z
+- **Action**: `monitor traffic interface <if> matching <filter>` appended the
+  operator-supplied filter tokens to the root `tcpdump` argv with NO `--`
+  end-of-options separator (`buildMonitorTrafficArgv`, pkg/cli/cli_request.go).
+  The `matching` clause greedily absorbs every token up to the next keyword,
+  so `matching -w /etc/cron.d/x` or `matching -z <cmd>` reached tcpdump as the
+  `-w` (arbitrary file write) / `-z` (post-rotate command exec) OPTION under
+  glibc getopt argv permutation — escalating a control-level (not super-user)
+  login class to root file-write / command-exec past the capture-only RBAC
+  gate (PermControl, #4067), and violating the capture-only contract even for
+  super-user. Fixed by inserting an explicit `"--"` separator before the
+  filter tokens (mirroring the diagcmd ping/traceroute #2084 treatment) so
+  getopt stops scanning for options and every filter token is a pcap filter
+  EXPRESSION operand — an injected `-w`/`-z` becomes a libpcap compile error,
+  not a tcpdump option. Added defense-in-depth `validateMonitorFilter` +
+  `monitorFilterOptionToken` that reject any option-looking filter token (a
+  term starting with `-`, other than a bare `-`) up front with a clear error,
+  wired into `handleMonitorTraffic`. Legitimate pcap filters (`host X and port
+  N`, `tcp port 80`, `not arp`) are unaffected.
+- **Validation**: New `monitor_traffic_injection_4524_test.go` — `-w`/`-z`/
+  `-r`/`--postrotate-command` all land AFTER `--` (neutralized); RED on revert
+  of the `--` insertion (verified: injected tokens precede no separator);
+  `validateMonitorFilter` rejects option tokens and accepts legit filters;
+  legit multi-token filter survives intact after `--`. Updated the #4005
+  argv-shape test to expect the `--` separator. `go test ./pkg/cli/...` green,
+  `go build ./...`, gofmt clean.
+- **File(s)**: pkg/cli/cli_request.go, pkg/cli/monitor_traffic_injection_4524_test.go,
+  pkg/cli/monitor_traffic_filter_4005_test.go, docs/system-login.md, _Log.md
+
+## 2026-07-07 — #4514 (ps-020 F5): enforce single-rate `then policer` on the userspace dataplane
+
+- **Timestamp**: 2026-07-07T20:00Z
+- **Action**: A single-rate `firewall policer` applied via a filter term
+  (`then policer X`, `then discard`) was SILENTLY UNENFORCED on the
+  userspace dataplane — a fail-open of a DoS-mitigation/rate-limit control.
+  The policer config was parsed into a `state.policers` map whose
+  `PolicerState::consume` had ZERO non-test call sites; only the three-color
+  runtime was ever metered. Fixed by lowering legacy single-rate policers
+  into the SAME metered three-color srTCM runtime the terms already resolve
+  against (by name), at the Rust compile layer: `then discard` maps to
+  `CIR=bandwidth-limit` (bits/sec → bytes/sec), `CBS=burst-size-limit`,
+  color-blind, treatments GREEN=pass / YELLOW=drop / RED=drop. The committed
+  bucket IS the single-rate token bucket, so only in-rate traffic passes and
+  excess is discarded — reusing the tested metering, drop-on-exceed,
+  flow-cache handle+replay, and status export instead of hand-mirroring a
+  parallel policer path. Removed the now-dead `PolicerState` type,
+  `state.policers` field, `refill_scaled_bits`, and the `token_bucket_policer`
+  test. Corrected the `capabilities.go` comment that falsely claimed legacy
+  policers were "supported". Degenerate zero-rate/burst `then discard` fails
+  closed; non-discard (loss-priority/forwarding-class) single-rate policers
+  are metered but their marking is inert (documented).
+- **File(s)**: `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/policer.rs`, `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/tests.rs`, `userspace-dp/src/filter/README.md`,
+  `pkg/dataplane/userspace/capabilities.go`, `docs/feature-gaps.md`, `_Log.md`
+- **Validation**: new `single_rate_policer_discard_is_enforced` filter test —
+  in-rate packet passes, over-rate packet drops, a non-policed term is
+  unaffected, and the cached TX-selection descriptor carries the runtime
+  handle (re-metered per hit, not a frozen verdict). RED-on-revert proven:
+  disabling the lowering fails the test at the `has_three_color_policer_terms`
+  assertion. Full `cargo test --release --test-threads=1` + `go test
+  ./pkg/dataplane/...` green.
 ## 2026-07-07 — #4521: source-NAT pool `address [ a b c ]` bracket-list no longer truncates to the first IP
 
 - **Timestamp**: 2026-07-07
@@ -39769,3 +39833,5 @@ top.
 - **Timestamp**: 2026-07-07
 - **Action**: #4518 — NAT64 port-allocator durability across a same-node config reload. The #4381 per-prefix stateful `PortAllocator` was rebuilt FRESH (port-offset 0) on every forwarding rebuild, so a config commit while NAT64 sessions were live let the first post-commit flows reclaim the LOW translated ports still owned by pre-reload sessions → the (now 1:N) reverse index bucket held two handles → v4→v6 reply mis-demux until the stale session aged out. Fix mirrors source-NAT's `parse_source_nat_rules_with_previous` + `previous_allocators`: new `Nat64State::from_snapshots_with_previous(snaps, Option<&Nat64State>)` (nat64.rs) REUSES the previous prefix's Arc-backed `PortAllocator` (live tuple-ownership set carries over) when `(prefix bytes, source pool)` is byte-identical via `reuse_allocator`; a changed pool (addresses added/removed/reordered — order-sensitive Vec equality) resets to a fresh allocator because the round-robin counters are pool-position indexed. `from_snapshots` kept as a thin `None` wrapper (all existing callers/tests unchanged). Caller `forwarding_build/mod.rs:324` now passes `previous.map(|p| &p.nat64)` — the reconcile preflight (`build_reconcile_forwarding`) already threads `Some(&coord.forwarding)`. NOT the HA cross-node failover path (#4512 — sync `Nat64ReverseInfo` + reserve-on-standby); this is same-node reload only, cross-referenced in the module doc + bugs.md. Tests: RED-on-revert `nat64_4518_allocator_survives_config_reload` (a NEW post-reload flow must NOT reclaim a live pre-reload port — verified RED with reuse neutralized: `assert_ne!(pb, pa)` fails) + same-flow idempotency durability proof + `nat64_4518_pool_change_resets_allocator` (fresh on pool change) + `nat64_4518_new_rule_has_no_previous_to_reuse`. rustfmt applied to changed lines only (project pins a different rustfmt than local 1.9.0; master isn't clean under local — did NOT run whole-crate cargo fmt). FULL cargo serial: OVERALL 3779 passed / 0 failed / 2 ignored; nat64:: subset 100/0, nat:: subset 203/0.
 - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs, userspace-dp/src/afxdp/forwarding_build/mod.rs, docs/bugs.md, _Log.md
+- **Action**: #4525 — RA randomAdvInterval could return 0 → RA hot-loop (RA/ND flood + CPU spin). For max-advertisement-interval maxI=1, minI derived to maxI/3=0 and `minI + rand.IntN(maxI-minI+1)` drew 0 (~50% of ticks); `advTimer.Reset(0)` fired immediately → sendRA → re-arm tight loop. The schema's `ValidateIntegerMin(1)` allowed the value. min-advertisement-interval is separately configured (compiler_protocols.go), not derived — the sender only derives a fallback when it is <=0. Belt + suspenders fix: (1) RUNTIME FLOOR — `randomAdvInterval` now floors the drawn delay at `minAdvInterval` (1s), so no config reaching the sender (commit, tolerant load, or HA peer-sync) can arm a 0-delay timer (pkg/ra/sender.go). (2) SCHEMA per-leaf — max-advertisement-interval `ValidateInteger(4,1800)`, min-advertisement-interval `ValidateInteger(3,1350)` per RFC 4861 §6.2.1 (schema_routing.go), strict-on-commit + lenient-on-load automatically via the SchemaValidate gate. (3) CROSS-FIELD — `crossCheckRAIntervals` (configstore/store.go, mirrors crossCheckNodeID) rejects min > 0.75*max (integer form min*4 > max*3) strictly on compileTreeStrict, warns on compileTreeLenient (#1960 no-brick). Canonical HA config max=30/min=10 validates (30 in [4,1800]; 10 in [3,1350]; 40 <= 90). RED-on-revert verified for all three (floor: draw 0s at maxI=1; schema: 1/2/3 accepted under Min(1); cross-field: max=4/min=4 accepted). go test ./pkg/ra/... ./pkg/config/... green; new configstore RA tests green (one PRE-EXISTING unrelated parser failure, TestLoadRescueConfigRedactedFailClosedOnParseError, fails identically on clean origin/master). gofmt/vet/build clean.
+- **File(s)**: pkg/ra/sender.go, pkg/config/schema_routing.go, pkg/configstore/store.go, pkg/ra/sender_interval_4525_test.go, pkg/config/schema_validate_2008_test.go, pkg/configstore/ra_interval_4525_test.go, docs/embedded-radvd.md, _Log.md

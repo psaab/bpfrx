@@ -352,13 +352,39 @@ Total withdraw latency: ~100ms (vs ~600ms+ with external radvd).
 
 The RFC specifies randomized RA intervals to prevent synchronization:
 
-| Parameter | Default | xpf Config |
-|-----------|---------|-------------|
-| `MaxRtrAdvInterval` | 600s | `RAInterfaceConfig.MaxAdvInterval` |
-| `MinRtrAdvInterval` | 0.33 * Max | `RAInterfaceConfig.MinAdvInterval` |
-| `AdvDefaultLifetime` | 3 * Max (max 9000s) | `RAInterfaceConfig.DefaultLifetime` |
+| Parameter | Default | Valid range (RFC 4861 §6.2.1) | xpf Config |
+|-----------|---------|-------------------------------|-------------|
+| `MaxRtrAdvInterval` | 600s | 4 .. 1800 s | `RAInterfaceConfig.MaxAdvInterval` |
+| `MinRtrAdvInterval` | 0.33 * Max | 3 s .. 0.75 * Max (ceiling 1350 s) | `RAInterfaceConfig.MinAdvInterval` |
+| `AdvDefaultLifetime` | 3 * Max (max 9000s) | 0 .. 9000 s | `RAInterfaceConfig.DefaultLifetime` |
 
 Each periodic RA uses a random delay in `[MinRtrAdvInterval, MaxRtrAdvInterval]`.
+
+**Interval validation (#4525).** `max-advertisement-interval` and
+`min-advertisement-interval` are range-checked at commit against the
+RFC 4861 §6.2.1 bounds above:
+
+- `max-advertisement-interval` — `ValidateInteger(4, 1800)` (was
+  `ValidateIntegerMin(1)`, which let `1`/`2` commit).
+- `min-advertisement-interval` — `ValidateInteger(3, 1350)` per-leaf, plus a
+  cross-field commit check that `min <= 0.75 * max`
+  (`crossCheckRAIntervals`, `pkg/configstore/store.go`). Both siblings must
+  be present for the ratio check to fire; a lone leaf is completed by the
+  sender's own derivation.
+
+These are strict on the operator commit / `commit check` / `xpfd
+check-config` path and downgraded to a warning on the tolerant `Store.Load`
+/ HA `SyncApply` ingress (the #1960 no-brick doctrine), so a legacy or
+peer-synced config that predates the tightened range cannot blackout-boot the
+node — the operator's next strict commit rejects it.
+
+**Runtime floor (belt).** `randomAdvInterval` (`pkg/ra/sender.go`) floors the
+drawn periodic delay at `minAdvInterval` (1 s). Before #4525, a legacy
+`max-advertisement-interval 1` derived `minI = maxI/3 = 0`, so the draw could
+be `0`; `advTimer.Reset(0)` fired immediately and spun `sendRA` in a tight
+loop (RA/ND flood + CPU spin). The commit-time schema floor is the primary
+guard; the runtime floor makes the hot-loop unreachable even for a config
+that arrives through the tolerant load / peer-sync path.
 
 For RS-triggered RAs, RFC 4861 §6.2.6 specifies:
 - Delay response by random `[0, MAX_RA_DELAY_TIME]` (0.5s)

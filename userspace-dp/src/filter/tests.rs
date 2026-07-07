@@ -715,33 +715,119 @@ fn dscp_rewrite_action_allows_default_zero() {
     assert_eq!(result.dscp_rewrite, Some(0));
 }
 
+// #4514: a legacy single-rate `firewall policer` with `then discard` must be
+// ENFORCED on the dataplane — traffic above the committed token bucket is
+// dropped, in-rate traffic passes, and the metered term is flow-cache-safe (the
+// runtime handle is cached and re-metered, never frozen as a static verdict).
+// Before #4514 the term's policer was parsed into a `state.policers` map that
+// nothing consumed, so the rate-limit was silently unenforced (fail-open). This
+// test drops with the compiler lowering removed (RED on revert).
 #[test]
-fn token_bucket_policer() {
-    let mut policer = PolicerState::new(
-        "1mbps".into(),
-        1_000_000, // 1 Mbps = 125,000 bytes/sec
-        125_000,   // burst = 125KB
-        true,
+fn single_rate_policer_discard_is_enforced() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "rl".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "meter".into(),
+                    // Fall-through modifier-only term (`then policer P`): the
+                    // policer meters every matched (UDP) packet.
+                    protocols: vec!["udp".into()],
+                    policer: "rl-1kbps".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "unpoliced".into(),
+                    protocols: vec!["tcp".into()],
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[PolicerSnapshot {
+            name: "rl-1kbps".into(),
+            bandwidth_bps: 8_000, // 1000 bytes/sec committed rate
+            burst_bytes: 1_000,   // 1000-byte bucket
+            discard_excess: true,
+        }],
     );
 
-    // First packet at t=0 — should be within burst
-    let conforming = policer.consume(0, 1000);
-    assert!(conforming, "first packet within burst should conform");
-
-    // Consume most of the burst
-    let conforming = policer.consume(0, 120_000);
-    assert!(conforming, "second packet within burst should conform");
-
-    // This should exceed burst (only ~4000 tokens left)
-    let conforming = policer.consume(0, 10_000);
+    let filter = state.filters.get("inet:rl").expect("compiled filter");
+    // The single-rate policer is lowered into the metered three-color runtime.
     assert!(
-        !conforming,
-        "packet exceeding burst should be non-conforming"
+        filter.has_three_color_policer_terms,
+        "single-rate policer must link a metered runtime"
     );
 
-    // After 1 second, tokens should have refilled
-    let conforming = policer.consume(1_000_000_000, 1000);
-    assert!(conforming, "packet after refill should conform");
+    let meter = |bytes: u64| {
+        evaluate_filter_ref_tx_selection_runtime_counted(
+            filter,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            PROTO_UDP,
+            12345,
+            5000,
+            0,
+            TermMatchExtra::default(),
+            bytes,
+            0, // now_ns fixed so no refill between packets
+        )
+    };
+
+    // First packet drains most of the 1000-byte bucket — conforming (passes).
+    let first = meter(900);
+    assert!(!first.policer_drop, "in-rate packet must pass");
+    // Next packet exceeds the remaining ~100 tokens — non-conforming (dropped).
+    let second = meter(900);
+    assert!(
+        second.policer_drop,
+        "traffic above the committed rate must be discarded"
+    );
+
+    // A non-policed term is unaffected: TCP matches the second term (no policer)
+    // and is accepted without a policer drop.
+    let unpoliced = evaluate_filter_ref_tx_selection_runtime_counted(
+        filter,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        12345,
+        5000,
+        0,
+        TermMatchExtra::default(),
+        9_000,
+        0,
+    );
+    assert!(
+        !unpoliced.policer_drop,
+        "a non-policed term must not be policed"
+    );
+    assert_eq!(unpoliced.action, FilterAction::Accept);
+
+    // The metered term is NOT flow-cached as a static verdict: the cached
+    // TX-selection descriptor carries the policer runtime handle so it re-meters
+    // on every hit (mirrors three-color cache treatment).
+    let cached = evaluate_filter_ref_tx_selection_cached(
+        filter,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_UDP,
+        12345,
+        5000,
+        0,
+    );
+    assert_eq!(
+        cached.three_color_policers.len(),
+        1,
+        "policed term must cache the runtime handle for per-hit re-metering"
+    );
+
+    // Status exposes the lowered runtime as a single-rate policer.
+    let status = state.three_color_policer_statuses();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].mode, "single-rate");
+    assert!(status[0].drop_packets >= 1, "a drop must be counted");
 }
 
 #[test]

@@ -750,9 +750,10 @@ pub(crate) use policer::*;
 pub(crate) struct FilterState {
     /// Named filters keyed by "family:name" (e.g. "inet:protect-RE").
     pub(crate) filters: rustc_hash::FxHashMap<String, Arc<Filter>>,
-    /// Named policer states keyed by policer name.
-    pub(crate) policers: rustc_hash::FxHashMap<String, PolicerState>,
-    /// Stable three-color policer runtimes keyed by policer name.
+    /// Stable three-color policer runtimes keyed by policer name. #4514:
+    /// legacy single-rate `firewall policer` token buckets are lowered into
+    /// this same set at compile so `then policer X` is metered/enforced through
+    /// the three-color runtime rather than the dead `PolicerState` map.
     pub(crate) three_color_policer_by_name:
         rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
     /// Name-derived ID-indexed three-color policer runtimes.
