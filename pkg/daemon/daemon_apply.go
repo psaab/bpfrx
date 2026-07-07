@@ -1433,6 +1433,36 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// active before a newly started client puts DHCP packets on the wire.
 	d.reconcileDHCPClients(cfg)
 
+	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
+	// login/SSH, archival, observability, cluster runtime, host tunables).
+	// Extracted into applyTailReconciles (#4407 Phase A). The head above
+	// (steps 0–7) is ordering-entangled and stays inline; the tail is
+	// independent per-subsystem dispatch reading only cfg (+ nil-guarded
+	// managers), so grouping it here is a behavior-preserving mechanical
+	// move. The three head-produced deferred errors are threaded in; the
+	// helper creates lo0Err/hostInboundErr and returns the identical
+	// five-way errors.Join.
+	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyTailReconciles runs steps 8–21 of applyConfigLocked — the tail of the
+// commit/apply pipeline that dispatches to independent subsystems after the
+// ordering-entangled head (VRF/tunnel/IPVLAN/dataplane/RETH-MAC/networkd/FRR,
+// steps 0–7). Each step reads only the compiled config (+ nil-guarded
+// subsystems); none feeds a later head step, so grouping them here is a
+// behavior-preserving mechanical move (#4407 Phase A). The helper runs
+// synchronously in the caller's goroutine under d.applySem (the caller holds
+// it), so the lock discipline of the inline body is preserved; the few
+// intentionally-async callbacks the apply body spawns all live in the head,
+// not here.
+//
+// Error-join contract: the five deferred reconcile errors accumulate across
+// the whole apply body but are joined only at this tail (fail-closed — every
+// step still runs). networkdErr/dhcpServerErr/ipsecErr originate in the head
+// and are threaded in as parameters; lo0Err/hostInboundErr originate in step
+// 9.5 below. The returned errors.Join preserves the exact operand order the
+// inline tail used (#1778/#2987/#4433).
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServerErr, ipsecErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
