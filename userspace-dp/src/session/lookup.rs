@@ -208,19 +208,34 @@ impl SessionTable {
     }
 
     pub fn find_forward_nat_match(&self, reply_key: &SessionKey) -> Option<ForwardSessionMatch> {
-        let handle = *self.nat_reverse_index.get(reply_key)?;
-        let record = self.entries.get(handle as usize)?;
-        let entry = &record.entry;
-        if entry.metadata.is_reverse
-            || !reply_matches_forward_session(&record.key, entry.decision.nat, reply_key)
-        {
-            return None;
+        // #4399: `nat_reverse_index` is a 1:N multimap — a reverse-key
+        // collision (interface-mode SNAT / DNAT-to-shared-backend / NAT64 /
+        // non-bijective static NAT, the #1758 latent collision) parks BOTH
+        // colliding forward handles in one bucket. Walk the candidates and
+        // return the first whose forward session actually reverse-maps to
+        // THIS reply (validate-on-lookup): the pre-#4399 single-value map
+        // returned only the last-installed handle, so a displaced session's
+        // reply was mis-delivered or dropped. The common (bijective /
+        // non-colliding) case is a len-1 bucket — one validate, zero heap
+        // (SmallVec inline) — so the pool-mode-SNAT fast path is unchanged.
+        let bucket = self.nat_reverse_index.get(reply_key)?;
+        for &handle in bucket.iter() {
+            let Some(record) = self.entries.get(handle as usize) else {
+                continue;
+            };
+            let entry = &record.entry;
+            if entry.metadata.is_reverse
+                || !reply_matches_forward_session(&record.key, entry.decision.nat, reply_key)
+            {
+                continue;
+            }
+            return Some(ForwardSessionMatch {
+                key: record.key.clone(),
+                decision: entry.decision,
+                metadata: entry.metadata.clone(),
+            });
         }
-        Some(ForwardSessionMatch {
-            key: record.key.clone(),
-            decision: entry.decision,
-            metadata: entry.metadata.clone(),
-        })
+        None
     }
 
     pub fn find_forward_wire_match(&self, wire_key: &SessionKey) -> Option<ForwardSessionMatch> {

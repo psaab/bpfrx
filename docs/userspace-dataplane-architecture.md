@@ -589,6 +589,25 @@ forward session keys. When a reply packet arrives (e.g., from a SNAT'd
 connection), the reverse index resolves the original session without
 full table scan.
 
+The index is a **1:N multimap** (`nat_reverse_index: reverse-key →
+`SmallVec<[handle; 2]>`, #4399). NAT is not always bijective: interface-mode
+SNAT with no port translation, DNAT-to-shared-backend, NAT64, and
+non-bijective static NAT can map two distinct forward sessions to the SAME
+external reverse tuple (the #1758 latent collision; pool-mode SNAT is immune
+because PAT makes it bijective). Before #4399 the index stored one handle
+per key, so a colliding install DISPLACED the earlier session — its reply
+was mis-delivered to the wrong internal host, or dropped once the displacing
+session closed and the key was wiped. Now both colliding handles coexist in
+the bucket, `find_forward_nat_match` walks the candidates and returns the
+first whose forward session reverse-maps to THIS exact reply
+(validate-on-lookup), and delete removes only the closing session's handle
+(the key is dropped only when its bucket empties). The common,
+non-colliding case is a length-1 bucket held inline in the `SmallVec` — one
+validate, zero heap — so the pool-mode-SNAT fast path is unchanged. The
+`nat_reverse_key_collisions` telemetry counter (published per worker) still
+bumps whenever a bucket grows past one handle, quantifying how often the
+collision path is exercised.
+
 **Protocol timeouts:**
 | Protocol | Active | Closing (FIN/RST) |
 |----------|--------|-------------------|

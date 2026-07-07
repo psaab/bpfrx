@@ -1,3 +1,32 @@
+## 2026-07-06 — #4399: nat_reverse_index 1:N multimap + validate-on-lookup
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed the reverse-NAT lookup index displacing the earlier
+  session on a 1:N reverse-key collision (the #1758 latent collision:
+  interface-mode SNAT with no port translation, DNAT-to-shared-backend,
+  NAT64, non-bijective static NAT). Changed `nat_reverse_index` from a
+  single-value `SeededKeyMap<u32>` to a 1:N multimap
+  `HashMap<SessionKey, SmallVec<[u32; 2]>>` (`SeededReverseIndex`). Insert
+  now APPENDS the handle to the bucket (dedup on re-assert; bumps
+  `nat_reverse_key_collisions` when the bucket grows past one) via the new
+  `nat_reverse_index_push`. Delete removes ONLY the closing session's handle
+  and drops the key when the bucket empties via `nat_reverse_index_remove`.
+  `find_forward_nat_match` walks the bucket and returns the first candidate
+  whose forward session reverse-maps to THIS reply (validate-on-lookup).
+  Pool-mode SNAT is bijective -> len-1 bucket -> single validate, zero heap
+  (SmallVec inline) -> throughput fast path unchanged. Added RED-on-revert
+  tests: (1) two interface-SNAT sessions sharing reverse key K both stay
+  resolvable, and closing the LAST-installed leaves the survivor resolvable
+  (single-value map stranded it -> None); (2) closing the first-installed
+  leaves the second (per-handle delete); (3) pool-mode PAT stays a len-1
+  bucket. Updated the two existing displaced-collision reassert tests to the
+  SmallVec value type and `no_index_points_at` to scan bucket membership.
+  Docs: architecture doc reverse-index section, field/counter doc comments.
+  Dataplane NAT change -> cluster smoke (test-failover) may be warranted.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/lookup.rs, userspace-dp/src/session/tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
 ## 2026-07-06 — #4393: publish reverse-SNAT dnat_table entry for synced SNAT sessions
 
 - **Timestamp**: 2026-07-06
