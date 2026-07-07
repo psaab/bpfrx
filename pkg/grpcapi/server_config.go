@@ -319,6 +319,16 @@ func (s *Server) ShowCompare(_ context.Context, req *pb.ShowCompareRequest) (*pb
 }
 
 func (s *Server) ShowRollback(_ context.Context, req *pb.ShowRollbackRequest) (*pb.ShowRollbackResponse, error) {
+	// #4556 M-01: n selects a 1-based rollback slot. A non-positive n
+	// (0 or a negative wire value) maps to history.Get(n-1) =
+	// history.Get(<0) → the opaque store error "history position -1 out
+	// of range". Reject it up front with a clear positive-integer
+	// message, mirroring the REST show-rollback leg and the ShowCompare
+	// rollback_n guard (#3443 M6).
+	if req.N <= 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid n %d: rollback index must be a positive integer", req.N)
+	}
 	var output string
 	var err error
 	if req.Format == pb.ConfigFormat_SET {
