@@ -11683,12 +11683,23 @@ fn publish_dnat_table_entry_v6_attempts_publish() {
 // If the policy lookup reverts to the pre-translation tuple/zone these
 // tests flip and fail.
 //
-// NAT64 is DELIBERATELY EXCLUDED from post-translation matching. It is a
-// cross-family translation (IPv6 source, IPv4 destination) and the policy
-// matcher requires same-family src+dst, so NAT64 policy is matched on the
-// SYNTHETIC IPv6 destination (the only same-family tuple available at the
-// policy-eval site), NOT the extracted IPv4 destination. The NAT64 tests
-// below pin that synthetic-IPv6 behavior.
+// NAT64 (#2358): the PRIMARY (ForwardCandidate) path now ALSO matches on
+// the POST-translation destination — the EXTRACTED real IPv4 host the
+// synthetic NAT64 address decodes to, NOT the synthetic IPv6 dst. NAT64 is
+// a cross-family translation (IPv6 source, IPv4 destination), so the
+// forwarding path feeds a mixed (V6 src, V4 dst) tuple and
+// `policy.rs::try_match_rule` carries a dedicated (V6 src, V4 dst) arm that
+// matches the source against the rule's IPv6 source set and the destination
+// against the rule's IPv4 destination set. The permit/deny tests below use
+// whole-prefix `64:ff9b::/96` destination rules that still PERMIT/DENY the
+// flow — but via the extracted IPv4 dst: a v6-only destination set (no v4
+// prefix) compiles to IPv4-match-any under the legacy address-set
+// convention, so it matches the extracted v4 dst on the match-any path, NOT
+// via any synthetic-IPv6 match. The MissingNeighbor cold-path arm is the
+// one exception — it does NOT re-classify NAT64, so it retains a synthetic
+// IPv6 fallback (see that test's comment below). The test function names
+// still say `synthetic_v6`, a pre-#2358 misnomer. See
+// `docs/next-features/twice-nat.md`.
 // =====================================================================
 
 /// v6 ingress meta for the txn harness (TCP, ingress on `ifindex`).
@@ -12054,15 +12065,17 @@ fn lan_to_wan_permit(dst: &str, name: &str) -> PolicyRuleSnapshot {
     }
 }
 
-/// NAT64: a policy permitting ONLY the EXTRACTED IPv4 server (8.8.8.8/32)
-/// NAT64 (DELIBERATELY EXCLUDED from the #2345 post-translation tuple, see
-/// the long comment at the policy-tuple binding in poll_descriptor): NAT64
-/// is cross-family (V6 src, V4 dst) and xpf's policy matcher requires
-/// same-family src+dst, so feeding the extracted IPv4 destination would
-/// match no rule and break ALL NAT64 connectivity. NAT64 therefore keeps
-/// its historical behavior: policy matches on the SYNTHETIC IPv6 dst (the
-/// only same-family tuple available). This test pins that a policy on the
-/// synthetic IPv6 prefix permits + forwards the NAT64 flow.
+/// NAT64 (#2358): the inbound policy is evaluated on the EXTRACTED real IPv4
+/// destination (8.8.8.8, decoded from the synthetic `64:ff9b::808:808` dst),
+/// NOT the synthetic IPv6 dst. On the ForwardCandidate path `policy_dst_ip`
+/// = `effective_resolution_target` = the extracted IPv4, and
+/// `policy.rs::try_match_rule` matches it via the cross-family (V6 src, V4
+/// dst) arm. This test permits on the whole `64:ff9b::/96` prefix and still
+/// forwards the flow — but only because a v6-only destination set (no v4
+/// prefix) compiles to IPv4-match-any under the legacy address-set
+/// convention, so the rule matches the extracted v4 dst on the match-any
+/// path (a whole-prefix NAT64 rule, NOT a synthetic-IPv6 match). The
+/// `synthetic_v6` in the test name is a pre-#2358 misnomer.
 #[test]
 fn policy_inbound_nat64_matches_synthetic_v6_destination_permit() {
     let snapshot = nat64_snapshot(lan_to_wan_permit("64:ff9b::/96", "permit-synthetic-v6"));
@@ -12096,12 +12109,15 @@ fn policy_inbound_nat64_matches_synthetic_v6_destination_permit() {
     assert_eq!(sessions.len(), 2, "NAT64 forward + reverse install");
 }
 
-/// NAT64 fail-on-revert: an explicit DENY on the synthetic IPv6 NAT64
-/// destination prefix must DROP the flow. This proves the NAT64 policy
-/// match runs on the synthetic IPv6 destination (the documented #2345
-/// NAT64 behavior): if NAT64 were folded onto the extracted IPv4 tuple,
-/// the V6 deny rule would no longer match (cross-family) and the flow would
-/// fall to the default policy, changing the verdict.
+/// NAT64 fail-on-revert (#2358): an explicit DENY whose destination is the
+/// whole `64:ff9b::/96` NAT64 prefix must DROP the flow; a trailing
+/// permit-any is the only other rule, so the deny is the ONLY thing that can
+/// drop it. On the ForwardCandidate path the inbound policy is evaluated on
+/// the EXTRACTED IPv4 destination, and the v6-only `64:ff9b::/96` destination
+/// set compiles to IPv4-match-any (legacy convention), so the cross-family
+/// (V6 src, V4 dst) arm matches the extracted v4 dst and the deny wins over
+/// the trailing permit-any. If the post-translation match tuple regressed,
+/// the verdict would change and this test would fail.
 #[test]
 fn policy_inbound_nat64_denies_on_synthetic_v6_deny_rule() {
     let mut deny = lan_to_wan_permit("64:ff9b::/96", "deny-synthetic-v6");
@@ -12389,14 +12405,18 @@ fn policy_inbound_nptv6_missing_neighbor_denies_when_only_external_prefix_permit
 /// NAT64 MissingNeighbor: directly pins that Copilot's feared "NAT64
 /// default-deny at MissingNeighbor" does NOT happen. With the IPv4 server's
 /// next-hop neighbor (172.16.80.1) unresolved, the NAT64 flow takes the
-/// MissingNeighbor arm; the policy on the SYNTHETIC IPv6 prefix permits it
-/// (NOT default-denied). This holds because at the MissingNeighbor site
-/// NAT64 populates neither nptv6_nat nor pre_routing_dnat, so
-/// `decision.nat.rewrite_dst` is None and `policy_dst_ip` falls back to
-/// `flow.dst_ip` (the synthetic IPv6 dst) — exactly the ForwardCandidate
-/// NAT64 exclusion. If the fallback were reverted to unconditionally feed
-/// the extracted IPv4 dst, the synthetic-V6 policy would no longer match
-/// (cross-family) and this flow would default-deny — failing this test.
+/// MissingNeighbor cold-path arm; the policy on the synthetic IPv6 prefix
+/// permits it (NOT default-denied). Unlike the #2358 ForwardCandidate path
+/// (which matches NAT64 on the EXTRACTED real IPv4 dst), this arm does NOT
+/// re-classify NAT64: it populates neither nptv6_nat nor pre_routing_dnat,
+/// so `decision.nat.rewrite_dst` is None and `policy_dst_ip` falls back to
+/// `flow.dst_ip` — the synthetic IPv6 dst — which the same-family (V6 src,
+/// V6 dst) arm matches against the `64:ff9b::/96` rule (see the retained
+/// synthetic-v6 fallback comment at the MissingNeighbor policy binding in
+/// poll_descriptor). If that fallback were reverted to unconditionally feed
+/// the extracted IPv4 dst WITHOUT reconstructing the NAT64 v4 tuple here, the
+/// synthetic-V6 policy would no longer match and this flow would
+/// default-deny — failing this test.
 #[test]
 fn policy_inbound_nat64_missing_neighbor_permits_on_synthetic_v6_not_default_deny() {
     let mut snapshot =

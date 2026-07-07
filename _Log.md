@@ -1,3 +1,37 @@
+## 2026-07-07 — #4449: correct stale NAT64 policy-tuple rationale comments in afxdp/tests.rs
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed #4449 (comment-only, deferred from #4440's verify-first).
+  The NAT64 policy-tuple rationale comments in
+  `userspace-dp/src/afxdp/tests.rs` still described the PRE-#2358 behavior
+  ("NAT64 policy is matched on the SYNTHETIC IPv6 destination, NOT the
+  extracted IPv4 destination"). This is factually stale: #2358 (commit
+  `09d0a929b`) made the primary ForwardCandidate path feed
+  `policy_dst_ip = effective_resolution_target` = the EXTRACTED real IPv4
+  destination for NAT64, matched by the cross-family (V6 src, V4 dst) arm in
+  `policy.rs::try_match_rule` (mod.rs L1541-1591; policy.rs L3893-3939). The
+  `64:ff9b::/96` whole-prefix permit/deny tests stay green only because a
+  v6-only destination set (no v4 prefix) compiles to IPv4-match-any under the
+  legacy address-set convention, so it matches the extracted v4 dst on the
+  match-any path — not via any synthetic-IPv6 match.
+  - **Verify-first nuance**: the MissingNeighbor cold-path arm (mod.rs
+    L4232-4263) genuinely RETAINS synthetic-v6 matching for NAT64 — it does
+    NOT re-classify NAT64, so `decision.nat.rewrite_dst` is None and
+    `policy_dst_ip` falls back to `flow.dst_ip` (the synthetic IPv6 dst). The
+    4th comment's synthetic-v6 description is therefore CORRECT; only its
+    stale "exactly the ForwardCandidate NAT64 exclusion" claim was fixed to
+    note the divergence from #2358's ForwardCandidate path. Rewriting it to
+    "extracted IPv4" would have introduced a FALSE statement.
+  - **Scope**: comment-only. No assertion, test-logic, or function-name
+    change (function names still say `synthetic_v6`, a pre-#2358 misnomer,
+    noted in the comments). Four `//`/`///` blocks updated: the header block
+    (~L11686), the permit-test doc, the deny-test doc, and the
+    MissingNeighbor-test doc.
+  - **Validation**: `cargo test --no-run --release` (compile-check of the
+    `#[cfg(test)]` test target — a `cargo build --release` alone does not
+    compile tests.rs). Comment-only, no full test run needed.
+- **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
+
 ## 2026-07-07 — #4453: gate bare RST/FIN out of the cluster-peer return fast path
 
 - **Timestamp**: 2026-07-07
