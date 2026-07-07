@@ -1,3 +1,29 @@
+## 2026-07-07 — #4406 step 4: extract P6b uniform gates from compileExpanded
+
+- **Timestamp**: 2026-07-07
+- **Action**: Step 4 of the #4406 compileExpanded god-orchestrator
+  decomposition (after step 1 extracted P1 runPreWalkGates, step 2 extracted
+  P4 compileSections, step 3 extracted P7 runTailGates). Extracted the P6b
+  "uniform fail-open gate" phase — the long contiguous run of ~75 independent
+  validation gates between P6a's early-strict + folds `errors.Join` accumulator
+  and the P7 tail gates — into runUniformGates (compiler_uniformgates.go).
+  compileExpanded now calls runUniformGates(tree, cfg, opts) in the SAME
+  position, SAME order. Verbatim contiguous lift: each gate's `return nil, err`
+  became `return err` for the helper's single-error return; warn/err threading
+  is otherwise byte-identical. Verified P6b is truly uniform before lifting: 74
+  single-return `if err := validateXxx(cfg)` gates + 1 two-return
+  `validateEventOptionsWithinAST(tree.Children, ...)` AST pre-walk gate, ZERO
+  cfg-field mutations, ZERO resolve/apply/fold calls (all such tokens are in
+  comments). The one `tree.Children` read is why the helper takes `tree
+  *ConfigTree` as well as cfg/opts. Only real import is `fmt`. Source order of
+  every gate preserved (invariant #6 first-error slot, invariant #7 warning
+  accumulation order). compiler.go shrinks by 1534 net lines (12 ins / 1546
+  del). Golden gate (TestCompileGolden4406) passes BYTE-IDENTICAL with NO
+  baseline update — testdata/golden_4406.json untouched (git status clean).
+  gofmt clean, go vet clean, go build ./... + full pkg/config suite green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_uniformgates.go,
+  _Log.md
+
 ## 2026-07-07 — #4406 step 3: extract P7 tail gates from compileExpanded
 
 - **Timestamp**: 2026-07-07
