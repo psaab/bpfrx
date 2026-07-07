@@ -282,11 +282,10 @@ func (l *Lexer) readIdentifier(line, col int) Token {
 
 // isIdentChar returns true if ch is valid in a Junos identifier.
 // Junos identifiers can contain letters, digits, hyphens, underscores,
-// dots, slashes, colons, asterisks, plus signs, percent signs, at signs,
-// and angle brackets.
+// dots, slashes, colons, asterisks, plus signs, percent signs, and angle
+// brackets.
 // This handles IP addresses (10.0.1.0/24), interface names (eth0.0),
-// wildcards (*), group wildcards (<*>), and unquoted URLs / userinfo
-// (user@host — #4521 R-04).
+// wildcards (*), and group wildcards (<*>).
 func isIdentChar(ch byte) bool {
 	return (ch >= 'a' && ch <= 'z') ||
 		(ch >= 'A' && ch <= 'Z') ||
@@ -294,7 +293,7 @@ func isIdentChar(ch byte) bool {
 		ch == '-' || ch == '_' || ch == '.' ||
 		ch == '/' || ch == ':' || ch == '*' || ch == '+' ||
 		ch == '%' || ch == '=' || ch == ',' ||
-		ch == '<' || ch == '>' || ch == '@'
+		ch == '<' || ch == '>'
 }
 
 // IsIdentRune is the rune version for use in tab completion.
@@ -303,5 +302,5 @@ func IsIdentRune(r rune) bool {
 		r == '-' || r == '_' || r == '.' ||
 		r == '/' || r == ':' || r == '*' || r == '+' ||
 		r == '%' || r == '=' || r == ',' ||
-		r == '<' || r == '>' || r == '@'
+		r == '<' || r == '>'
 }
