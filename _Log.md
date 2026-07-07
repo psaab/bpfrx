@@ -39560,3 +39560,35 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs, docs/fabric-cross-chassis-fwd.md,
   _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4382 — screen SYN-flood count-min sketch: fold a per-boot
+  random seed into the cell hash so the per-source mapping is not offline-
+  predictable (targeted false-positive throttling). VERIFY-FIRST on
+  origin/master b7cc73f61: `SynRateSketch::cell_index`/`cell_index_ip_port`
+  (userspace-dp/src/screen/syn_rate.rs) hashed only the public compile-time
+  `ROW_SEEDS[row]` + IP octets via `FxHasher` — no per-boot secret. Because the
+  seeds+hash are public and deterministic, an off-box attacker within a
+  BCP38-permitted range could precompute which source IPs land in a chosen
+  victim's `ROWS` cells and drive them over `source-threshold`, throttling the
+  victim's legit SYNs. FIX: added a `seed: u64` field to `SynRateSketch`, drawn
+  once at construction from `hot_hash_seed::hot_path_hash_seed()` (the #2364
+  per-process secret that the session indices / flow-cache set index / ECMP /
+  CoS SFQ hashes already use — one audited getrandom entropy path), and folded
+  it into BOTH `cell_index` and `cell_index_ip_port` alongside `ROW_SEEDS[row]`
+  (`h.write_u64(self.seed)`). Row independence still comes from `ROW_SEEDS`; the
+  per-boot seed adds secrecy — the source→cell mapping is unknowable offline and
+  reshuffles on every restart. Counting behaviour (thresholds, AND/MIN trip,
+  detection) is unchanged: the seed only changes WHICH cell a key maps to, and
+  it is stable for the process lifetime so a key maps to a stable cell across
+  its window. Split `with_cols` into a seed-parameterized `with_cols_seeded`
+  core (mirrors `FlowCache::set_index_seeded`) so tests can pin a seed;
+  production draws the process-global seed. Tests: `cell_mapping_stable_
+  within_one_seed` (intra-seed stability), `cell_mapping_depends_on_per_boot_
+  seed` (RED-on-revert: no seed diverges across 4095 seeds when the fold is
+  removed), `single_source_flood_trips_under_pinned_seed` (detection
+  preserved). RED-on-revert VERIFIED: removing the `cell_index` fold makes
+  `cell_mapping_depends_on_per_boot_seed` FAIL while stability stays green.
+- **File(s)**: userspace-dp/src/screen/syn_rate.rs,
+  docs/syn-cookie-flood-protection.md, docs/userspace-dataplane-architecture.md,
+  _Log.md

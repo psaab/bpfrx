@@ -101,10 +101,17 @@ const _: () = assert!(DST_COLS.is_power_of_two() && SRC_COLS.is_power_of_two());
 /// Independent per-row seeds. Distinct values so the `ROWS` rows hash
 /// independently — same-seed rows would collapse the sketch to a single row and
 /// inflate the false-positive rate (it never affects the fail-closed bias).
-/// Fixed (not random) so they are deterministic across workers and easy to
-/// reason about in tests; the seeded hash still resists hash-flooding because
-/// the attacker cannot choose source IPs to collide a specific victim's cells
-/// across all rows without also tripping the aggregate.
+///
+/// These fixed per-row constants provide row INDEPENDENCE, not secrecy: they are
+/// public, so on their own they do NOT stop an off-box attacker from precomputing
+/// which source IPs land in a chosen victim's `ROWS` cells and driving those cells
+/// over `source-threshold` to throttle a victim's legit SYNs (a targeted
+/// false-positive, #4382). Secrecy comes from the PER-BOOT `SynRateSketch::seed`
+/// (drawn once from `hot_hash_seed::hot_path_hash_seed`, #2364) that
+/// `cell_index`/`cell_index_ip_port` fold in ALONGSIDE `ROW_SEEDS[row]`: the
+/// source→cell mapping is unknowable offline and reshuffles on every restart, so
+/// the attacker cannot construct a colliding IP set — exactly as the flow
+/// cache / session map / ECMP / CoS hashes already do.
 const ROW_SEEDS: [u64; ROWS] = [
     0x9E37_79B9_7F4A_7C15,
     0xC2B2_AE3D_27D4_EB4F,
@@ -119,10 +126,26 @@ pub(super) struct SynRateSketch {
     rows: Box<[Box<[RateCounter]>]>,
     /// Index mask (`cols - 1`); `cols` is a power of two.
     mask: usize,
+    /// Per-boot secret folded into the cell hash alongside `ROW_SEEDS[row]`
+    /// (#4382). Drawn once from `hot_hash_seed::hot_path_hash_seed()` at
+    /// construction and stable for the process lifetime, so a given key maps to
+    /// a stable cell across its whole window (counting behaviour unchanged) while
+    /// the key→cell mapping is unpredictable off-box and reshuffles on every
+    /// restart — the attacker cannot precompute a colliding source-IP set.
+    seed: u64,
 }
 
 impl SynRateSketch {
     fn with_cols(cols: usize) -> Self {
+        Self::with_cols_seeded(cols, crate::hot_hash_seed::hot_path_hash_seed())
+    }
+
+    /// Seed-parameterized core of `with_cols`. Split out so adversarial tests can
+    /// pin the seed and assert (a) intra-seed stability of the key→cell mapping
+    /// and (b) cross-seed reshuffling — mirroring `FlowCache::set_index_seeded`.
+    /// Production always calls through `with_cols`, which supplies the per-boot
+    /// process seed.
+    fn with_cols_seeded(cols: usize, seed: u64) -> Self {
         debug_assert!(
             cols.is_power_of_two(),
             "SynRateSketch cols must be a power of two"
@@ -134,6 +157,7 @@ impl SynRateSketch {
         Self {
             rows,
             mask: cols - 1,
+            seed,
         }
     }
 
@@ -153,6 +177,7 @@ impl SynRateSketch {
     fn cell_index(&self, row: usize, ip: &IpAddr) -> usize {
         let mut h = FxHasher::default();
         h.write_u64(ROW_SEEDS[row]);
+        h.write_u64(self.seed);
         match ip {
             IpAddr::V4(a) => h.write(&a.octets()),
             IpAddr::V6(a) => h.write(&a.octets()),
@@ -187,6 +212,7 @@ impl SynRateSketch {
     fn cell_index_ip_port(&self, row: usize, ip: &IpAddr, port: u16) -> usize {
         let mut h = FxHasher::default();
         h.write_u64(ROW_SEEDS[row]);
+        h.write_u64(self.seed);
         match ip {
             IpAddr::V4(a) => h.write(&a.octets()),
             IpAddr::V6(a) => h.write(&a.octets()),
@@ -335,11 +361,12 @@ mod tests {
 
     /// Independent per-row seeds: a single IP does not map to the same column in
     /// every row (which would collapse the sketch to one effective row). Not a
-    /// hard guarantee for every IP, but the fixed seeds make this deterministic
-    /// for a sampled address.
+    /// hard guarantee for every IP; a pinned seed makes this deterministic for a
+    /// sampled address (production additionally folds the per-boot seed in — row
+    /// independence still comes from the per-row `ROW_SEEDS`).
     #[test]
     fn rows_use_independent_seeds() {
-        let s = SynRateSketch::for_src();
+        let s = SynRateSketch::with_cols_seeded(SRC_COLS, 0x1234_5678_9ABC_DEF0);
         let idx = s.cell_indices(&v4(203, 0, 113, 7));
         let all_same = idx.iter().all(|&c| c == idx[0]);
         assert!(
@@ -384,5 +411,93 @@ mod tests {
             tripped,
             "a flooded destination trips per-dest regardless of source spread"
         );
+    }
+
+    /// A fixed set of source IPs used to compare cell mappings across seeds.
+    fn sample_ips(n: u32) -> Vec<IpAddr> {
+        (0..n)
+            .map(|i| v4(203, 0, (i >> 8) as u8, (i & 0xff) as u8))
+            .collect()
+    }
+
+    /// The `ROWS` cell indices each IP maps to, under a pinned seed. Equal
+    /// vectors ⇒ identical key→cell mapping.
+    fn cell_distribution(seed: u64, ips: &[IpAddr]) -> Vec<[usize; ROWS]> {
+        let s = SynRateSketch::with_cols_seeded(SRC_COLS, seed);
+        ips.iter().map(|ip| s.cell_indices(ip)).collect()
+    }
+
+    /// #4382 (counting consistency): the key→cell mapping MUST be stable for a
+    /// fixed seed, or a key's SYNs scatter across cells within its own window and
+    /// the count-min counters never accumulate. Repeat under one pinned seed and
+    /// demand byte-identical mappings.
+    #[test]
+    fn cell_mapping_stable_within_one_seed() {
+        let ips = sample_ips(64);
+        let seed = 0x0123_4567_89AB_CDEF;
+        let first = cell_distribution(seed, &ips);
+        for _ in 0..64 {
+            assert_eq!(
+                first,
+                cell_distribution(seed, &ips),
+                "cell mapping must be stable for a fixed seed"
+            );
+        }
+    }
+
+    /// #4382 (hardening / RED-on-revert): the source→cell mapping must NOT be an
+    /// externally probeable pure function of the source IP. Two different
+    /// per-boot seeds must produce a DIFFERENT cell distribution for the SAME
+    /// attacker IP set, so an off-box attacker cannot precompute a colliding
+    /// source-IP set to drive a victim's cells over `source-threshold`. With the
+    /// per-boot `seed` dropped from `cell_index` (the reverted state) the
+    /// distribution is seed-independent and NO seed diverges → this FAILS.
+    #[test]
+    fn cell_mapping_depends_on_per_boot_seed() {
+        let ips = sample_ips(128);
+        let ref_seed = 0xA5A5_0000_C3C3_FFFFu64;
+        let reference = cell_distribution(ref_seed, &ips);
+        // Under a uniform seeded hash an entire 128-element distribution matching
+        // the reference by accident is vanishingly unlikely; one differing seed
+        // is essentially immediate. Bound the loop so a truly seed-independent
+        // hash (the reverted state) FAILS rather than hangs.
+        let mut diverged = false;
+        for seed in 1u64..4096u64 {
+            if seed == ref_seed {
+                continue;
+            }
+            if cell_distribution(seed, &ips) != reference {
+                diverged = true;
+                break;
+            }
+        }
+        assert!(
+            diverged,
+            "sketch cell distribution did not change across seeds — cell_index \
+             is per-boot-seed-independent (#4382 regression)"
+        );
+    }
+
+    /// #4382 (detection preserved): the per-boot seed changes only WHICH cells a
+    /// key maps to, never the counting. A real single-source flood still crosses
+    /// `source-threshold` under an arbitrary pinned seed — same thresholds, same
+    /// trip behaviour as `single_key_trips_above_threshold`.
+    #[test]
+    fn single_source_flood_trips_under_pinned_seed() {
+        for &seed in &[1u64, 0xDEAD_BEEF_CAFE_F00D, u64::MAX] {
+            let mut s = SynRateSketch::with_cols_seeded(SRC_COLS, seed);
+            let attacker = v4(198, 51, 100, 7);
+            const T: u32 = 5;
+            for _ in 0..T {
+                assert!(
+                    !s.increment(&attacker, 100, T),
+                    "first {T} SYNs admitted (seed {seed:#x})"
+                );
+            }
+            assert!(
+                s.increment(&attacker, 100, T),
+                "over-threshold SYN trips (seed {seed:#x})"
+            );
+        }
     }
 }

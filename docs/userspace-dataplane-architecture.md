@@ -524,8 +524,11 @@ non-cryptographic hash keyed by a per-boot secret).
 > (`SessionKey`-keyed `key_to_handle` / `nat_reverse_index` /
 > `forward_wire_index` / `reverse_translated_index`, plus the per-IP
 > `session_limit_{src,dst}_counts`), the flow-cache set index
-> (`FlowCache::set_index`), and the fabric queue hash
-> (`worker::fabric_queue_hash`) — fold in a per-process secret seed
+> (`FlowCache::set_index`), the fabric queue hash
+> (`worker::fabric_queue_hash`), and the screen SYN/ICMP/UDP-flood
+> per-source/per-destination count-min sketch cell index
+> (`SynRateSketch::cell_index` / `cell_index_ip_port`, #4382) — fold in a
+> per-process secret seed
 > (`crate::hot_hash_seed::hot_path_hash_seed`, drawn once at first use via
 > the same `getrandom(2)` + CLOCK_MONOTONIC/pid/stack fallback +
 > never-zero path that backs the CoS SFQ seed). The seed is:
