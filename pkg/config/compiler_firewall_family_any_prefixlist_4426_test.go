@@ -1,0 +1,283 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+// #4426 (audit codex-164 C164-H04): #4296 rejects a static family-specific
+// match (address literal, per-family icmp type/code) under `family any`, but a
+// `source-prefix-list` / `destination-prefix-list` reference is NOT a static
+// family keyword — it was deliberately excluded because a named prefix-list may
+// mix families. A reference whose RESOLVED prefixes cover only ONE family
+// reproduces the exact same under-block: `family any` dual-compiles the term
+// into BOTH the inet and inet6 pools (#4287), and the arm for the family the
+// list does not cover has no matching prefixes, matches nothing, and falls
+// through to the implicit ACCEPT — a silent under-block of that family.
+//
+// These configs are non-Junos and reach compileFirewall's structured path only
+// via a HIERARCHICAL config-file / peer-synced AST (the flat `set` schema does
+// not model `family any`), so the fixtures use parseHier.
+
+// RED-on-revert: a `family any` filter whose source-prefix-list resolves to
+// IPv4-only prefixes must be REJECTED at strict commit. On revert of the #4426
+// content-aware check this goes GREEN (compiles cleanly) — the v6 arm is
+// constrained by a v4-only list, matches no v6 packet, and falls through to
+// ACCEPT (fail-open v6 under-block).
+func TestFirewallFilterFamilyAnyV4OnlyPrefixListRejected(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list v4-blocks {
+        10.0.0.0/8;
+        192.168.0.0/16;
+    }
+}
+firewall {
+    family any {
+        filter blockNet {
+            term t {
+                from {
+                    source-prefix-list {
+                        v4-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of a v4-only source-prefix-list under family any, got nil")
+	}
+	if !strings.Contains(err.Error(), "blockNet") || !strings.Contains(err.Error(), "family any") ||
+		!strings.Contains(err.Error(), "#4426") || !strings.Contains(err.Error(), "v4-blocks") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "inet6 (v6)") {
+		t.Fatalf("error should name the under-blocked inet6 arm: %v", err)
+	}
+}
+
+// The mirror case: a v6-only destination-prefix-list under family any
+// under-blocks the inet (v4) arm and is rejected.
+func TestFirewallFilterFamilyAnyV6OnlyPrefixListRejected(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list v6-blocks {
+        2001:db8::/32;
+    }
+}
+firewall {
+    family any {
+        filter blockNet6 {
+            term t {
+                from {
+                    destination-prefix-list {
+                        v6-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of a v6-only destination-prefix-list under family any, got nil")
+	}
+	if !strings.Contains(err.Error(), "blockNet6") || !strings.Contains(err.Error(), "#4426") ||
+		!strings.Contains(err.Error(), "destination-prefix-list") || !strings.Contains(err.Error(), "inet (v4)") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// A MIXED-family prefix-list (v4 AND v6 prefixes in one list) under family any
+// is legitimate — both arms have matching prefixes — and must NOT be flagged.
+func TestFirewallFilterFamilyAnyMixedPrefixListCommits(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list dual {
+        10.0.0.0/8;
+        2001:db8::/32;
+    }
+}
+firewall {
+    family any {
+        filter blockDual {
+            term t {
+                from {
+                    source-prefix-list {
+                        dual;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: a mixed-family prefix-list under family any must commit, got: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#4426") {
+			t.Fatalf("unexpected #4426 warning on a valid mixed-family config: %q", w)
+		}
+	}
+	if cfg.Firewall.FiltersInet["blockDual"] == nil || cfg.Firewall.FiltersInet6["blockDual"] == nil {
+		t.Fatal("family any blockDual must land in both pools (#4287)")
+	}
+}
+
+// Two SEPARATE single-family prefix-lists in ONE direction together cover both
+// families — the term is correct for both arms and must NOT be flagged.
+func TestFirewallFilterFamilyAnyTwoSingleFamilyListsCommit(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list v4-blocks {
+        10.0.0.0/8;
+    }
+    prefix-list v6-blocks {
+        2001:db8::/32;
+    }
+}
+firewall {
+    family any {
+        filter blockBoth {
+            term t {
+                from {
+                    source-prefix-list {
+                        v4-blocks;
+                        v6-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: two single-family lists covering both families must commit, got: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#4426") {
+			t.Fatalf("unexpected #4426 warning when both families are covered: %q", w)
+		}
+	}
+}
+
+// Lenient (load / peer-sync): a v4-only prefix-list under family any downgrades
+// to a warning so an already-persisted or peer-synced config still boots — the
+// dual-compile behavior is preserved (the v6 arm merely never matches).
+func TestFirewallFilterFamilyAnyV4OnlyPrefixListLenientWarns(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list v4-blocks {
+        10.0.0.0/8;
+    }
+}
+firewall {
+    family any {
+        filter blockNet {
+            term t {
+                from {
+                    source-prefix-list {
+                        v4-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: a v4-only family-any prefix-list must downgrade to a warning, got error: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "blockNet") && strings.Contains(w, "#4426") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a #4426 family-any prefix-list warning on the lenient path, got: %v", cfg.Warnings)
+	}
+	// Behavior preserved: both pools still carry the filter.
+	if cfg.Firewall.FiltersInet["blockNet"] == nil || cfg.Firewall.FiltersInet6["blockNet"] == nil {
+		t.Fatal("lenient path must preserve the #4287 dual-compile")
+	}
+}
+
+// A single-family prefix-list under a NORMAL single-family filter (family inet
+// with a v4-only list) is legitimate and must NOT be flagged — the gate is
+// scoped to `family any` only.
+func TestFirewallFilterSingleFamilyPrefixListNotFlagged(t *testing.T) {
+	tree := parseHier(t, `
+policy-options {
+    prefix-list v4-blocks {
+        10.0.0.0/8;
+    }
+    prefix-list v6-blocks {
+        2001:db8::/32;
+    }
+}
+firewall {
+    family inet {
+        filter v4 {
+            term t {
+                from {
+                    source-prefix-list {
+                        v4-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+    family inet6 {
+        filter v6 {
+            term t {
+                from {
+                    source-prefix-list {
+                        v6-blocks;
+                    }
+                }
+                then {
+                    discard;
+                }
+            }
+        }
+    }
+}
+`)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: single-family filters with single-family prefix-lists must commit, got: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#4426") {
+			t.Fatalf("unexpected #4426 warning on a valid single-family config: %q", w)
+		}
+	}
+}

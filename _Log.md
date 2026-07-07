@@ -1,3 +1,37 @@
+## 2026-07-06 — #4426: reject single-family prefix-lists under `family any`
+
+- **Timestamp**: 2026-07-06
+- **Action**: Closed the C164-H04 audit residual (#4426). #4296 rejects a
+  static family-specific match (address literal, per-family icmp
+  type/code) under `family any` but deliberately excludes
+  `source-prefix-list` / `destination-prefix-list` because a NAMED
+  prefix-list may mix families. Verify-first (probe test on
+  origin/master) confirmed the gap is live: a `family any` filter with a
+  v4-only `source-prefix-list` compiles cleanly into BOTH the inet and
+  inet6 pools (#4287 dual-compile), leaving the v6 arm constrained by a
+  v4-only list — it matches no v6 packet and falls through to the
+  implicit ACCEPT (silent v6 under-block). Extended
+  `validateFirewallFilterFamilyAnyMatchesAST` to resolve each
+  prefix-list reference against the candidate tree's `policy-options
+  prefix-list` definitions (new `firewallPrefixListFamilies` /
+  `prefixFamily`, mirroring `compilePolicyOptions`' #3996 dual-shape
+  read). Coverage is aggregated PER DIRECTION across every `from` block:
+  a direction whose referenced prefix-lists collectively cover exactly
+  ONE family is rejected at strict commit / warned on the lenient
+  load-sync path, matching the #4296 remedy (reject-at-commit pointing
+  the operator at `family inet`/`family inet6`). A mixed-family list, two
+  single-family lists that together cover both families, an empty list,
+  and an undefined reference are all NOT flagged (undefined stays the
+  province of `validateFirewallPrefixListReferencesStrict`).
+  RED-on-revert proven: v4-only + v6-only reject tests and the lenient
+  warn test all go RED on the origin/master `compiler_firewall.go`.
+  `go build ./...`, `go vet`, `gofmt`, and the full `pkg/config` +
+  `pkg/dataplane` suites are green. Commit-path only (no dataplane wire
+  change) — no cluster smoke required.
+- **File(s)**: pkg/config/compiler_firewall.go,
+  pkg/config/compiler_firewall_family_any_prefixlist_4426_test.go,
+  docs/config-schema.md, _Log.md
+
 ## 2026-07-06 — #4399: nat_reverse_index 1:N multimap + validate-on-lookup
 
 - **Timestamp**: 2026-07-06

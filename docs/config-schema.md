@@ -1132,6 +1132,41 @@ Fail-on-revert: `pkg/config/compiler_firewall_family_any_match_4296_test.go`
 family-agnostic `protocol` under `family any` still commits into both pools;
 single-family filters with address literals not flagged).
 
+### Single-family prefix-lists under `family any` are rejected (#4426)
+
+The #4296 gate deliberately leaves `source-prefix-list` /
+`destination-prefix-list` alone because a *named* prefix-list MAY mix v4+v6 —
+its family content is not knowable from the leaf keyword. But a reference whose
+**resolved** prefixes cover only ONE family reproduces the exact same
+under-block (audit codex-164 C164-H04): `from source-prefix-list v4-only then
+discard` under `family any` dual-compiles the v4-only list into the inet6 pool,
+where the v6 arm has zero v6 prefixes, matches nothing, and falls through to the
+implicit ACCEPT — a silent v6 under-block.
+
+`validateFirewallFilterFamilyAnyMatchesAST` therefore also resolves every
+prefix-list reference against the candidate tree's `policy-options prefix-list`
+definitions (via `firewallPrefixListFamilies`, which mirrors
+`compilePolicyOptions`' #3996 dual-shape prefix read so the family verdict
+matches what the compiler loads). Coverage is aggregated **per direction**
+across every `from` block of the term: if a direction's referenced prefix-lists
+collectively cover **exactly one** family, the term is rejected at strict commit
+/ warned on the lenient load path with a message naming the under-blocked arm
+and the offending lists. Accepted (not flagged):
+
+- a **mixed-family** prefix-list (v4 AND v6 prefixes in one list),
+- **two single-family lists** in one direction that together cover both
+  families (`source-prefix-list { v4-only; v6-only; }`),
+- an **empty** list (both-families-absent → left to the empty-set match
+  semantics), and an **undefined** reference (left to
+  `validateFirewallPrefixListReferencesStrict`).
+
+Same reachability as #4287/#4296 (hierarchical / peer-synced AST only; the flat
+`set` grammar does not model `family any`). Fail-on-revert:
+`pkg/config/compiler_firewall_family_any_prefixlist_4426_test.go` (strict reject
+of a v4-only and a v6-only list; lenient warn preserving the dual-compile;
+mixed-family and two-list-both-families commit; single-family filters with
+single-family lists not flagged).
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list
