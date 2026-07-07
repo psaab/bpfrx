@@ -1,3 +1,28 @@
+## 2026-07-07 — Revert R-04 `@` isIdentChar (broke #4099 rescue-config fail-closed test)
+
+- **Timestamp**: 2026-07-07T13:50Z
+- **Action**: #4523/#4521's R-04 ride-along added `@` to the config lexer's
+  `isIdentChar` + `IsIdentRune` (speculative "unquoted URL / userinfo
+  completeness"). That changed parse-error semantics: a token like
+  `SENTINEL@` now lexes as one clean identifier instead of producing a
+  ParseError. The #4099 rescue-config redaction test
+  (`TestLoadRescueConfigRedactedFailClosedOnParseError`) relies on `@`
+  triggering a ParseError whose message embeds a secret sentinel — its
+  precondition ("malformed rescue.conf parses to an error") broke, turning
+  the test RED on origin/master. Reverted the R-04 add: removed
+  `ch == '@'` from `isIdentChar` and `r == '@'` from `IsIdentRune`, plus
+  the accompanying doc-comment change. URLs with `@` must be quoted in
+  Junos anyway, so no live regression. No R-04 test asserted the `@`
+  behavior (the commit added only the lexer change + a NAT pool-address
+  test); the pre-existing `@` tests (schema_validate_route_2448,
+  schema_validate_ddns_hostname_2779) all rely on `@` being rejected/
+  dropped and stay green.
+- **Files**: pkg/config/lexer.go
+- **Validation**: `go test ./pkg/configstore/ -run
+  TestLoadRescueConfigRedactedFailClosedOnParseError` RED before -> GREEN
+  after; full `go test ./pkg/config/... ./pkg/configstore/...` green;
+  go build ./..., gofmt, go vet clean.
+
 ## 2026-07-07 — #4524 (ps-023 13-02, HIGH): neutralize `monitor traffic ... matching` tcpdump option injection
 
 - **Timestamp**: 2026-07-07T21:30Z
