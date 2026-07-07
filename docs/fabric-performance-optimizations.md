@@ -80,7 +80,14 @@ Server 172.16.80.200:5201 -> 172.16.80.8:43446
   `recompute_l4_checksum_ipv4` for IPv4 NAT plus port-enforcement cases on the
   generic path.
 - `segment_forwarded_tcp_frames_from_frame()` has to rebuild TCP checksums per
-  segment.
+  segment. Both the IPv4 and IPv6 arms full-recompute
+  (`recompute_l4_checksum_ipv4`/`_ipv6`) — the incremental-adjust trick that
+  the non-segmented path (item 2 below) uses is **never** valid per segment:
+  each segment carries a different payload chunk, a rewritten seq, a cleared
+  PSH on non-final segments, and a different pseudo-header length, none of
+  which a NAT IP/port delta can capture. A dead-but-wrong incremental IPv4
+  branch here was removed in #4384 before it could become a live corruption
+  landmine.
 - Cache hits still recompute the fabric target binding lookup even though the
   descriptor structure already has space to cache it.
 
