@@ -644,6 +644,19 @@ func newCollector(srv *Server) *xpfCollector {
 				"is NOT injected.",
 			nil, nil,
 		),
+		ipmonActuationFailures: prometheus.NewDesc(
+			"xpf_ipmon_actuation_failures_total",
+			"Cumulative ip-monitoring route-overlay actuations that did "+
+				"NOT converge — a hard FRR reload error, a snapshot-publish "+
+				"failure, an unconfirmed FIB-generation bump (#3757), or a "+
+				"bounded-timeout/shutdown abort (#3758, #4423). The engine "+
+				"retries autonomously (throttle-paced), so a steadily "+
+				"climbing value means ip-monitoring cannot commit its "+
+				"overlay and failover protection is degraded — pair it with "+
+				"a sustained xpf_ipmon_routes_desired > xpf_ipmon_routes_applied "+
+				"gap.",
+			nil, nil,
+		),
 
 		// #709: owner-profile telemetry. Labels:
 		//   ifindex:      interface ifindex as string

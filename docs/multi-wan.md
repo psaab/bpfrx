@@ -517,7 +517,8 @@ clear can match sessions allocated from the other pool.
 - Prometheus: `xpf_ipmon_policy_failed{policy}`,
   `xpf_ipmon_policy_transitions_total{policy}`,
   `xpf_ipmon_routes_applied`, `xpf_ipmon_routes_desired`,
-  `xpf_ipmon_unresolved_next_hops`.
+  `xpf_ipmon_unresolved_next_hops`,
+  `xpf_ipmon_actuation_failures_total`.
   - `xpf_ipmon_routes_applied` counts routes **actually applied** — the
     last CONVERGED actuation's overlay live in the FIBs (#3761 H8), NOT
     the desired set. `xpf_ipmon_routes_desired` counts what the engine
@@ -528,6 +529,13 @@ clear can match sessions allocated from the other pool.
     routes skipped for a missing DHCP gateway (#1844); non-zero during a
     failover means the backup uplink's lease is missing and its route is
     NOT injected.
+  - `xpf_ipmon_actuation_failures_total` counts route-overlay actuations
+    that did not converge — a hard FRR reload error, a snapshot-publish
+    failure, an unconfirmed FIB-generation bump, or a bounded-timeout /
+    shutdown abort (#3757/#3758/#4423). The engine retries autonomously
+    (throttle-paced), so a steadily-climbing value — especially paired
+    with a `desired > applied` gap — means ip-monitoring cannot commit
+    its overlay and failover protection is degraded.
 - Transitions log at Info; per-probe detail at Debug.
 
 ## HA model (chassis cluster)
