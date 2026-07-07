@@ -62,8 +62,10 @@ func (t *ConfigTree) expandGroups(tagInherited bool, vars map[string]string) err
 	}
 
 	// Recursively resolve apply-groups at all levels.
-	// The nil ancestorPath means we're at the top level.
-	if err := expandGroupsRecursive(&t.Children, groups, nil, nil, tagInherited, vars); err != nil {
+	// The nil ancestorPath means we're at the top level. The memo map is
+	// created once here and threaded through the whole recursion so a group
+	// reachable via many paths (a converging DAG) is expanded ONCE (#4474).
+	if err := expandGroupsRecursive(&t.Children, groups, nil, nil, make(map[string][]*Node), tagInherited, vars); err != nil {
 		return err
 	}
 
@@ -77,6 +79,29 @@ func (t *ConfigTree) expandGroups(tagInherited bool, vars map[string]string) err
 	t.Children = filtered
 
 	return nil
+}
+
+// ancestorPathKey serializes an ancestor context path ([][]string) into a
+// stable string for the group-expansion memo (#4474). Control-char separators
+// (\x1e between path elements, \x1f between the keys of one element) keep it
+// collision-free — config tokens never contain those bytes.
+func ancestorPathKey(ancestorPath [][]string) string {
+	if len(ancestorPath) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, keys := range ancestorPath {
+		if i > 0 {
+			b.WriteByte('\x1e')
+		}
+		for j, k := range keys {
+			if j > 0 {
+				b.WriteByte('\x1f')
+			}
+			b.WriteString(k)
+		}
+	}
+	return b.String()
 }
 
 // tagNodesInherited recursively sets InheritedFrom on all nodes.
@@ -144,9 +169,11 @@ func walkGroupToContext(groupChildren []*Node, ancestorPath [][]string) []*Node 
 // ancestorPath tracks the key path from root to the current level, enabling
 // groups to be walked down to the matching context for nested apply-groups.
 // seen tracks group names being expanded to detect circular references.
+// memo caches the fully-expanded body of a group keyed by (name, ancestor
+// context) so a converging DAG expands each group once (#4474 fan-out fix).
 // If tagInherited is true, merged nodes get InheritedFrom set to the group name.
 // vars provides ${var} replacements for group names (may be nil).
-func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath [][]string, seen map[string]bool, tagInherited bool, vars map[string]string) error {
+func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath [][]string, seen map[string]bool, memo map[string][]*Node, tagInherited bool, vars map[string]string) error {
 	// First, collect apply-groups references at this level.
 	// Support bracket-list syntax: apply-groups [ name1 name2 ] produces
 	// Keys = ["apply-groups", "name1", "name2"].
@@ -166,6 +193,26 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			return fmt.Errorf("apply-groups references undefined group %q", name)
 		}
 
+		// Memoization (#4474 fan-out fix): the fully-expanded body of a group
+		// is a function ONLY of (group name, ancestor context) within one
+		// ExpandGroups call — walkGroupToContext AND the nested-expansion
+		// context both depend on ancestorPath, while tagInherited/vars are
+		// constant for the call. A completed memo entry is a fully-resolved,
+		// cycle-free body (a cyclic expansion errors out before it is cached),
+		// so reusing it is always correct. Without this, a converging DAG
+		// re-expands a shared group once PER PATH — delete(seen,name) runs per
+		// branch, so the `seen` cycle guard does NOT bound the fan-out — and a
+		// machine-generated deep nested-group DAG goes exponential (~2x/level).
+		// mergeNodes MUTATES its src argument, so store and hand out fresh
+		// clones and keep the cached copy pristine.
+		memoKey := name + "\x00" + ancestorPathKey(ancestorPath)
+		if cached, hit := memo[memoKey]; hit {
+			if cached != nil {
+				mergeNodes(nodes, cloneNodes(cached), ancestorPath)
+			}
+			continue
+		}
+
 		if seen == nil {
 			seen = make(map[string]bool)
 		}
@@ -183,12 +230,35 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			srcChildren = walkGroupToContext(g.Children, ancestorPath)
 		}
 
+		var expanded []*Node
 		if srcChildren != nil {
 			cloned := cloneNodes(srcChildren)
 			if tagInherited {
 				tagNodesInherited(cloned, name)
 			}
-			mergeNodes(nodes, cloned, ancestorPath)
+			// Transitive apply-groups (#4474): a group body may itself say
+			// `apply-groups G2` (a nested-group template, a standard Junos
+			// idiom). Expand the group's OWN references to a fixed point BEFORE
+			// merging its body, so G2's content is inherited rather than
+			// silently dropped when the outer strip-and-recurse removes the
+			// merged-in `apply-groups G2` node. The `seen` guard — `name` is
+			// already marked above — breaks cycles (grpA->grpB->grpA returns a
+			// circular-reference error, same as a direct self-cycle). Nodes
+			// inherited FROM the nested group are tagged with THAT group's name:
+			// tagNodesInherited above ran before this call, so it tags only the
+			// outer group's own body and does not clobber the nested tags.
+			if err := expandGroupsRecursive(&cloned, groups, ancestorPath, seen, memo, tagInherited, vars); err != nil {
+				return err
+			}
+			expanded = cloned
+		}
+
+		// Cache a pristine copy of the completed expansion (even an empty one,
+		// so a group with no matching context subtree is not re-walked), then
+		// merge a SEPARATE clone into the parent so the cache is never mutated.
+		memo[memoKey] = cloneNodes(expanded)
+		if expanded != nil {
+			mergeNodes(nodes, expanded, ancestorPath)
 		}
 
 		delete(seen, name)
@@ -209,7 +279,7 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			childPath := make([][]string, len(ancestorPath)+1)
 			copy(childPath, ancestorPath)
 			childPath[len(ancestorPath)] = n.Keys
-			if err := expandGroupsRecursive(&n.Children, groups, childPath, seen, tagInherited, vars); err != nil {
+			if err := expandGroupsRecursive(&n.Children, groups, childPath, seen, memo, tagInherited, vars); err != nil {
 				return err
 			}
 		}
