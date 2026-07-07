@@ -321,7 +321,15 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // NAT64 rule from a mixed-version peer-sync or corrupt snapshot. The Go
     // commit-time gate (#2173/#3886) remains the primary defense; this scopes
     // the helper-boundary backstop's blast radius to the one NAT64 rule.
-    state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
+    // #4518: thread the previous live NAT64 state so a same-node config reload
+    // REUSES each unchanged prefix's Arc-backed port allocator — pre-reload
+    // NAT64 sessions keep owning their translated ports, so post-commit flows do
+    // not collide at port-offset 0 and mis-demux the (1:N) reverse index. A
+    // changed pool resets to a fresh allocator inside `reuse_allocator`. Mirrors
+    // the source-NAT `parse_source_nat_rules_with_previous` reuse above. The
+    // complementary HA cross-node failover reservation sync is #4512.
+    state.nat64 =
+        Nat64State::from_snapshots_with_previous(&snapshot.nat64_rules, previous.map(|p| &p.nat64));
     // #2240: fail CLOSED on an unparseable / unsupported / mismatched NPTv6
     // rule. The preflight in the reconcile/refresh apply paths catches this
     // Err and keeps the previous live forwarding state rather than installing a

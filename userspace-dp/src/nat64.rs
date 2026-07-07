@@ -108,6 +108,29 @@
 //! frame module now propagates to NAT64 automatically instead of silently
 //! drifting. Pinned by the byte-identical fail-on-revert test
 //! `nat64_eth_header_is_ssot_byte_identical`.
+//!
+//! ## Port-allocator durability across a config reload (#4518)
+//!
+//! A config commit rebuilds the whole forwarding state, and #4381 gave each
+//! NAT64 prefix a stateful [`PortAllocator`] (RFC 6146 BIB) so every forward
+//! flow claims a UNIQUE translated `(pool v4 address, L4 port / ICMP id)`.
+//! Building that allocator FRESH on every rebuild reset it to port-offset 0, so
+//! the first flows after any commit deterministically reclaimed the LOW
+//! translated ports still owned by live pre-reload sessions. When the colliding
+//! port mapped to the same v4 remote, the 1:N reverse index bucket held two
+//! handles and v4→v6 replies mis-demuxed until the old session aged out.
+//!
+//! [`Nat64State::from_snapshots_with_previous`] closes this: the reconcile
+//! preflight threads the previous live `Nat64State` in, and each new prefix
+//! whose `(prefix bytes, source pool)` is byte-identical REUSES the previous
+//! allocator (an `Arc`-backed clone whose live tuple-ownership set carries over)
+//! instead of resetting. A pool that changed (addresses added / removed /
+//! reordered) still gets a fresh allocator — the old reservations reference a
+//! different pool. This mirrors source NAT's `previous_allocators` reuse in
+//! `parse_source_nat_rules_with_previous`. The COMPLEMENTARY cross-node
+//! HA-failover reservation sync (`Nat64ReverseInfo` + reserve-on-standby) is
+//! tracked in #4512; this is the same-node reload path only. Pinned by the
+//! fail-on-revert test `nat64_4518_allocator_survives_config_reload`.
 
 use crate::NAT64RuleSnapshot;
 // #2844: shared SSOT in-place Ethernet-header writer (one writer for
@@ -283,6 +306,38 @@ impl Nat64State {
     /// an error and installs a poolless prefix as before: only a pool that was
     /// non-empty on the wire but had an UNPARSEABLE entry drops its rule.
     pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
+        Self::from_snapshots_with_previous(snaps, None)
+    }
+
+    /// #4518: build the NAT64 state, PRESERVING live translated-port
+    /// reservations across a same-node config reload/commit.
+    ///
+    /// Identical to [`from_snapshots`] except that, for each new NAT64 prefix
+    /// whose `(prefix bytes, source pool)` is byte-identical to a prefix in
+    /// `previous`, it REUSES that prefix's `PortAllocator` (an `Arc`-backed
+    /// clone) instead of building a fresh one at port-offset 0. The allocator's
+    /// live tuple-ownership set lives behind the `Arc`, so the reservations held
+    /// by pre-reload NAT64 sessions carry into the rebuilt state: the first
+    /// post-commit flows no longer deterministically reclaim the LOW translated
+    /// ports still owned by live sessions, which previously double-populated the
+    /// (1:N) reverse index bucket and mis-demuxed v4→v6 replies until the old
+    /// session aged out.
+    ///
+    /// The reuse is keyed on the EXACT pool (order-sensitive `Vec` equality):
+    /// the allocator's per-address round-robin counters are indexed by pool
+    /// position, so a pool with addresses added, removed, or reordered gets a
+    /// FRESH allocator — the old reservations reference a different pool and
+    /// starting clean is correct. This mirrors source NAT's
+    /// `parse_source_nat_rules_with_previous` + `previous_allocators`
+    /// (`nat/source.rs`), where an unchanged pool reuses the live allocator and
+    /// a changed pool resets. The COMPLEMENTARY HA-failover path — syncing
+    /// `Nat64ReverseInfo` and reserving the translated port on the standby so
+    /// the reservation survives a cross-node failover — is tracked separately in
+    /// #4512; this fix is the same-node reload path only.
+    pub(crate) fn from_snapshots_with_previous(
+        snaps: &[NAT64RuleSnapshot],
+        previous: Option<&Nat64State>,
+    ) -> Self {
         let mut prefixes = Vec::with_capacity(snaps.len());
         // The natv6v4 no-v6-frag-header option is global; the Go side stamps it
         // onto every rule snapshot. Treat the state as enabled if any rule
@@ -360,15 +415,22 @@ impl Nat64State {
             // #4381: one stateful port allocator per prefix, sized to the pool.
             // An empty pool yields a zero-capacity allocator (allocate returns
             // AllocatorExhausted), which the fail-closed classify path treats
-            // exactly like the historical empty-pool `MatchUnavailable`. NOTE:
-            // this allocator is rebuilt fresh on every config commit (like the
-            // pre-#4381 `pool_index` reset), so live NAT64 port reservations do
-            // NOT survive a snapshot rebuild — a bounded overlap window until
-            // pre-reload sessions age out, matching the existing round-robin
-            // reset. Preserving allocations across reload (the source-NAT
-            // `reuse_pool_allocator` treatment) is a scoped follow-up.
-            let port_allocator =
-                PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH);
+            // exactly like the historical empty-pool `MatchUnavailable`.
+            //
+            // #4518: on a config reload, REUSE the previous prefix's allocator
+            // (an `Arc`-backed clone carrying the live tuple-ownership set) when
+            // the pool is byte-identical, so pre-reload NAT64 sessions keep
+            // owning their translated ports and new flows do not collide with
+            // them at port-offset 0. A changed pool (addresses added / removed /
+            // reordered) falls through to a fresh allocator — the round-robin
+            // counters are pool-position indexed, so stale reservations against
+            // a different pool must not be replayed. Mirrors source NAT's
+            // `previous_allocators` reuse in `parse_source_nat_rules_with_previous`.
+            let port_allocator = previous
+                .and_then(|prev| prev.reuse_allocator(&prefix_bytes, &pool_v4))
+                .unwrap_or_else(|| {
+                    PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH)
+                });
             prefixes.push(Nat64Prefix {
                 prefix_bytes,
                 pool_v4,
@@ -380,6 +442,27 @@ impl Nat64State {
             prefixes,
             no_v6_frag_header,
         }
+    }
+
+    /// #4518: find a previous NAT64 prefix whose prefix bytes AND source pool
+    /// are byte-identical, returning its `Arc`-backed [`PortAllocator`] so live
+    /// translated-port reservations survive a config reload.
+    ///
+    /// Order-sensitive `Vec` equality on `pool_v4` is deliberate: the
+    /// allocator's per-address counters are indexed by pool position, so any
+    /// change to the pool set OR its order must NOT reuse the old allocator (see
+    /// [`from_snapshots_with_previous`]). Returns `None` when no compatible
+    /// prefix exists (rule added, prefix changed, or pool changed) — the caller
+    /// then builds a fresh allocator.
+    fn reuse_allocator(
+        &self,
+        prefix_bytes: &[u8; 12],
+        pool_v4: &[Ipv4Addr],
+    ) -> Option<PortAllocator> {
+        self.prefixes
+            .iter()
+            .find(|p| p.prefix_bytes == *prefix_bytes && p.pool_v4.as_slice() == pool_v4)
+            .map(|p| p.port_allocator.clone())
     }
 
     /// Returns true if any NAT64 prefixes are configured.

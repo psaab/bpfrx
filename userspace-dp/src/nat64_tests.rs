@@ -2984,6 +2984,134 @@ fn nat64_4381_shared_icmp_identifier_gets_distinct_translated_ids() {
     );
 }
 
+// ===========================================================================
+// #4518: NAT64 port-allocator durability across a same-node config reload.
+//
+// A config commit rebuilds the forwarding state. Pre-#4518 the NAT64
+// PortAllocator was rebuilt FRESH at port-offset 0, so the first post-commit
+// flow reclaimed the LOW translated port still owned by a live pre-reload
+// session — the (1:N) reverse index bucket then held two handles and v4->v6
+// replies mis-demuxed until the old session aged out.
+// `from_snapshots_with_previous` REUSES the previous prefix's Arc-backed
+// allocator when the pool is unchanged, so live reservations survive; a
+// changed pool resets to a fresh allocator.
+// ===========================================================================
+
+// A DIFFERENT single-address pool, same prefix, used to prove that a pool
+// CHANGE does NOT reuse the previous allocator (fresh start is correct).
+fn single_addr_prefix_alt_pool() -> NAT64RuleSnapshot {
+    NAT64RuleSnapshot {
+        name: "nat64-single".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["203.0.113.9".to_string()],
+        no_v6_frag_header: false,
+    }
+}
+
+// FAIL-ON-REVERT: with the allocator rebuilt fresh (revert of the reuse), the
+// post-reload flow reclaims the SAME low port the live pre-reload flow still
+// owns, so `assert_ne!(pb, pa)` goes RED. The same-flow idempotency assertion
+// also proves the live reservation carried across the reload.
+#[test]
+fn nat64_4518_allocator_survives_config_reload() {
+    let state1 = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let c2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    // Live pre-reload flow A claims the first (lowest) translated port.
+    let (sa, pa) = state1
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c1, dst_v4, 5000, 443, 1)
+        .expect("alloc A");
+    assert_eq!(sa, Ipv4Addr::new(198, 51, 100, 1));
+
+    // Config reload with the SAME pool: the allocator (and its live tuple
+    // ownership + monotonic cursor) must carry over.
+    let state2 = Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&state1));
+
+    // No-collision proof FIRST (before any flow-A touch, so a reverted fresh
+    // allocator cannot be masked by flow A re-consuming the low port): a NEW
+    // flow B on the reloaded state must NOT reclaim flow A's still-owned
+    // translated port. With the reuse it gets the NEXT port; on a reverted
+    // (fresh) allocator B is the first allocation and deterministically
+    // reclaims the low port `pa` — the collision this fix prevents.
+    let (sb, pb) = state2
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c2, dst_v4, 5000, 443, 2)
+        .expect("alloc B after reload");
+    assert_eq!(sb, sa, "single-address pool => same snat_v4");
+    assert_ne!(
+        pb, pa,
+        "#4518: post-reload flow must not collide with a live pre-reload port"
+    );
+
+    // Direct durability proof: re-allocating flow A on the RELOADED state
+    // returns its ORIGINAL live mapping idempotently (the reservation survived).
+    // On a reverted fresh allocator flow A is no longer live and would be
+    // issued a different port here.
+    assert_eq!(
+        state2
+            .allocate_source(0, crate::ip_proto::PROTO_TCP, c1, dst_v4, 5000, 443, 2)
+            .expect("re-alloc A after reload"),
+        (sa, pa),
+        "#4518: live pre-reload reservation must survive the config reload"
+    );
+}
+
+// A pool CHANGE (addresses added/removed/reordered) must NOT reuse the old
+// allocator — the round-robin counters are pool-position indexed, so stale
+// reservations against a different pool must not be replayed. The new flow
+// therefore starts fresh at the low port on the new pool address.
+#[test]
+fn nat64_4518_pool_change_resets_allocator() {
+    let state1 = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c1: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let c2: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let (_sa, pa) = state1
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c1, dst_v4, 5000, 443, 1)
+        .expect("alloc A");
+
+    // Reload with a DIFFERENT pool address: pool differs => fresh allocator.
+    let state3 =
+        Nat64State::from_snapshots_with_previous(&[single_addr_prefix_alt_pool()], Some(&state1));
+    let (sb, pb) = state3
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c2, dst_v4, 5000, 443, 2)
+        .expect("alloc B on changed pool");
+    assert_eq!(
+        sb,
+        Ipv4Addr::new(203, 0, 113, 9),
+        "#4518: changed pool must translate to the NEW pool address"
+    );
+    assert_eq!(
+        pb, pa,
+        "#4518: a changed pool starts a fresh allocator at the low port"
+    );
+
+    // And flow A's original mapping is NOT resurrected on the changed pool.
+    assert_ne!(
+        state3
+            .allocate_source(0, crate::ip_proto::PROTO_TCP, c1, dst_v4, 5000, 443, 2)
+            .expect("re-alloc A on changed pool")
+            .0,
+        Ipv4Addr::new(198, 51, 100, 1),
+        "#4518: the old pool address is gone after a pool change"
+    );
+}
+
+// A NEW NAT64 rule with no previous counterpart (previous state present but no
+// matching prefix) builds a fresh allocator, exactly as a cold start would.
+#[test]
+fn nat64_4518_new_rule_has_no_previous_to_reuse() {
+    let empty = Nat64State::default();
+    let state = Nat64State::from_snapshots_with_previous(&[single_addr_prefix()], Some(&empty));
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let c: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let (snat, port) = state
+        .allocate_source(0, crate::ip_proto::PROTO_TCP, c, dst_v4, 5000, 443, 1)
+        .expect("alloc on fresh rule");
+    assert_eq!(snat, Ipv4Addr::new(198, 51, 100, 1));
+    assert_eq!(port, 1024, "a rule with no previous match starts fresh");
+}
+
 // ---------------------------------------------------------------------------
 // #2333: NAT64 v6->v4 UDP checksum 0x0000 -> 0xFFFF mapping (RFC 768/1624).
 //

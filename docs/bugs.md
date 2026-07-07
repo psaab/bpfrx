@@ -166,6 +166,39 @@
   for the malformed-length clamp
 - **File:** `userspace-dp/src/nat64.rs`
 
+### NAT64 port allocator reset to offset-0 on config reload (#4518)
+- **Severity:** MEDIUM — post-commit reverse-reply mis-demux until the
+  pre-reload session ages out
+- **Symptom:** A config commit while NAT64 sessions are live let the
+  first post-commit flows reuse the LOW translated ports still owned by
+  pre-reload sessions. When a colliding port mapped to the same v4
+  remote, the (now 1:N) reverse index bucket held two handles and the
+  v4→v6 reply mis-demuxed/hijacked until the stale session expired
+- **Root cause:** `Nat64State::from_snapshots` built each prefix's
+  stateful `PortAllocator` (#4381) FRESH on every forwarding rebuild
+  (port-offset 0), dropping the previous allocator and its live
+  tuple-ownership set. Source NAT already preserved live allocations
+  across reload via `parse_source_nat_rules_with_previous` +
+  `previous_allocators`; NAT64 did not
+- **Fix:** `from_snapshots_with_previous(snaps, previous)` REUSES the
+  previous prefix's Arc-backed `PortAllocator` (live reservations carry
+  over) when `(prefix bytes, source pool)` is byte-identical; a changed
+  pool (addresses added/removed/reordered) resets to a fresh allocator
+  because the round-robin counters are pool-position indexed. The
+  reconcile preflight (`build_reconcile_forwarding`) already threads the
+  previous live `ForwardingState`, so the caller passes
+  `previous.map(|p| &p.nat64)`
+- **Relationship:** The COMPLEMENTARY cross-node HA-failover reservation
+  sync (`Nat64ReverseInfo` + reserve-on-standby) is tracked in #4512;
+  this fix is the same-node reload path only
+- **Regression test:** `nat64_tests.rs`
+  `nat64_4518_allocator_survives_config_reload` (fail-on-revert: a new
+  post-reload flow must not reclaim a live pre-reload port) +
+  `nat64_4518_pool_change_resets_allocator` +
+  `nat64_4518_new_rule_has_no_previous_to_reuse`
+- **File:** `userspace-dp/src/nat64.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/mod.rs`
+
 ### ipToUint32BE byte order
 - `binary.BigEndian.Uint32(ip4)` produced wrong bytes when cilium/ebpf serializes as native-endian
 - **Fix:** Use `binary.NativeEndian.Uint32(ip4)` so bytes match raw network order BPF writes to `__be32`
