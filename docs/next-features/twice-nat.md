@@ -98,6 +98,26 @@ unintended match-all. Only the ForwardCandidate (primary) NAT64 path
 classifies NAT64 and feeds the v4 tuple; the MissingNeighbor cold path
 does not classify NAT64 and is not the NAT64 forwarding path.
 
+**Policy IS enforced on NAT64 flows — the synthetic IPv6 destination is
+NOT blanket-permitted (verify, #4440 / codex-172).** A NAT64-translated
+flow goes through the normal zone-policy evaluation with a real,
+deny-able destination tuple; there is no bypass. The forwarding path
+binds `policy_dst_ip = effective_resolution_target` (the extracted real
+IPv4 destination for a NAT64 match) at
+`userspace-dp/src/afxdp/poll_descriptor/mod.rs` (the `effective_resolution_target`
+NAT64 arm ~L1505-1555) and feeds it to `evaluate_policy_result_with_icmp`
+(~L2467), which matches via the `(V6 src, V4 dst)` cross-family arm in
+`userspace-dp/src/policy.rs::try_match_rule` (~L3907). An explicit `deny`
+rule matching the NAT64 destination DROPS the flow — pinned by
+`policy_inbound_nat64_denies_on_synthetic_v6_deny_rule`
+(`userspace-dp/src/afxdp/tests.rs`), and a rule scoped to a
+NON-matching real IPv4 host (e.g. `9.9.9.9/32` when the extracted dst is
+`8.8.8.8`) does NOT permit — it falls to the deny default. The only
+reason a policy authored against the whole synthetic prefix
+(`64:ff9b::/96`) still permits is the IPv4-match-any convention above (a
+v6-only destination set with no v4 prefix), NOT a NAT64-specific
+policy-skip.
+
 ### 2. Add end-to-end coverage
 Add explicit tests for:
 

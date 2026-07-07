@@ -36,6 +36,41 @@
     existing-session tests stay green). Full cargo suite serial.
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/session/README.md, CLAUDE.md, _Log.md
+## 2026-07-07 — #4440: codex-172 lows (DDNS Surface-A doc + NAT64 policy verify)
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove OPEN issue #4440 (codex-172 low-severity, two parts).
+  (1) DOC: the Surface-A manager constructor `NewSurfaceAManager`
+  doc-comment still described RFC-2136-only backend resolution ("It
+  resolves the live RFC 2136 backend per provider at reconcile time"),
+  but Surface A now resolves HTTP providers too (dyndns2, duckdns,
+  cloudflare, route53, generic) via `resolveSurfaceABackend`. Rewrote the
+  comment to state resolve-per-Reconcile picks the RFC 2136 UPDATE backend
+  OR one of the HTTP providers, all siblings behind the same DNSUpdater
+  interface. Comment-only; `go build`/`go test ./pkg/ddns/...` green,
+  gofmt + vet clean.
+  (2) VERIFY (NAT64 synthetic-IPv6-dest "blanket-permit" concern):
+  DISPROVEN — NAT64 flows ARE policy-enforced on the extracted real IPv4
+  destination (#2358), not blanket-permitted. Confirmed empirically by
+  running the userspace-dp NAT64 policy tests + a scratch discriminator
+  (reverted): `policy_dst_ip = effective_resolution_target` = extracted
+  IPv4 (poll_descriptor/mod.rs ~L1505-1555, fed to
+  evaluate_policy_result_with_icmp ~L2467), matched via the #2358
+  `(V6 src, V4 dst)` cross-family arm in policy.rs::try_match_rule ~L3907.
+  A rule scoped to a NON-covering IPv4 host (`9.9.9.9/32` vs extracted
+  `8.8.8.8`) DENIES the flow (falls to deny default); a `64:ff9b::/96`
+  whole-prefix rule permits only via the v6-only-set → IPv4-match-any
+  convention, NOT a NAT64 policy-skip. Added a "Policy IS enforced on
+  NAT64 flows" note with the disproving file:line to
+  docs/next-features/twice-nat.md (#2358 section). SECONDARY (deferred to
+  a separate Rust follow-up per Go/docs-PR scope): the afxdp/tests.rs
+  rationale comments (~L11683-11692, L12057-12065, L12099-12104) still
+  claim NAT64 is "DELIBERATELY EXCLUDED from post-translation matching /
+  matched on the SYNTHETIC IPv6 destination, NOT the extracted IPv4" —
+  stale pre-#2358 wording (the tests still pass; only the comments are
+  wrong).
+- **File(s)**: pkg/ddns/surface_a.go, docs/next-features/twice-nat.md,
+  _Log.md
 
 ## 2026-07-06 — #4439: fabric-return fast path must not adopt NEW UDP flows
 
