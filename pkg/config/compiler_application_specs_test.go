@@ -239,7 +239,7 @@ func TestApplicationSpec_ReferencedBad_LenientWarns(t *testing.T) {
 
 // #3109: a custom application with a port (or any spec) but NO `protocol` was
 // accepted at commit (validateApplicationSpecsStrict only checked a NON-empty
-// protocol, compiler_validate_strict.go), then was unrepresentable at runtime: the
+// protocol, compiler_validate_strict_application.go), then was unrepresentable at runtime: the
 // Go capability gate (normalizeUserspaceApplicationProtocol("") → ok=false) trips
 // #2124's refuse-to-arm and sets ForwardingSupported=false for the WHOLE userspace
 // dataplane, so ONE protocol-less app silently disabled security-policy enforcement

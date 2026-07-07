@@ -20,7 +20,7 @@ import (
 //     rejects a malformed TOP-LEVEL value at commit-check via SchemaValidate
 //     (downgraded to a warning on the tolerant load / peer-sync path by
 //     compileTreeLenient). Covers every application, referenced or not.
-//   - validateApplicationSpecsStrict (compiler_validate_strict.go): rejects a
+//   - validateApplicationSpecsStrict (compiler_validate_strict_application.go): rejects a
 //     malformed top-level OR inline-term timeout of a REFERENCED application via
 //     the recorded Application.UnknownTimeouts (the inline-term shape is opaque
 //     to the schema walk, so the compiler gate is what covers it), downgraded to

@@ -2,7 +2,7 @@ package config
 
 // #3117: a security-policy `scheduler-name <name>` is compiled
 // (compiler_security.go) and strict-validated against the defined
-// class-of-service schedulers (compiler_validate_strict.go
+// class-of-service schedulers (compiler_validate_strict_cos.go
 // validatePolicySchedulerReferencesStrict), but it was ABSENT from
 // setSchema — so the leaf had no structural / `?` completion, violating
 // the two-SSOT rule that every compiled + validated leaf lives in the
