@@ -38479,3 +38479,48 @@ top.
   pkg/daemon/host_inbound_nft_test.go,
   pkg/daemon/host_inbound_per_iface_3362_test.go,
   pkg/daemon/nft_chain_priority_test.go, pkg/daemon/README.md, _Log.md
+- **Timestamp**: 2026-07-07
+- **Action**: #4446 — table-scope the userspace-dp FIB static bare-gateway
+  next-hop ifindex inference (audit #4423 M3, GENUINE HIGH).
+  - **Root cause**: `infer_connected_route_target_v4`/`_v6`
+    (`userspace-dp/src/afxdp/forwarding_build/fib.rs`) scanned
+    `state.connected_v[46]` GLOBALLY, returning the first
+    `prefix.contains(gateway)` match regardless of table. The wrong ifindex
+    was baked into `RouteEntryV*.next_hops` at BUILD time and consumed
+    verbatim at lookup (`forwarding/mod.rs`, `ResolvedRouteV*::Static` arm),
+    so the #2388 lookup-time connected filter could not correct it → in a
+    multi-VRF setup with overlapping gateway subnets a route in VRF A could
+    egress on VRF B's interface. Two `fib.rs` doc comments contradicted.
+  - **Fix**: thread the route's canonical install table
+    (`canonical_route_table(&route.table, is_ipv6)`, computed in
+    `populate_routes` BEFORE next-hop resolution) through
+    `resolve_route_next_hops_v[46]` → `resolve_next_hop_target_v[46]` →
+    `infer_connected_route_target_v[46]`, and filter the connected scan on
+    `entry.table == table` (mirrors the #2388 lookup-site predicate at build
+    time so the correct ifindex is baked in). Cross-table leak preserved: a
+    route-leak / next-table reach is a `NextTable` snapshot with no
+    forwarding next-hop, so it never touches this inference (re-resolved in
+    the target table by the recursion). Reconciled both contradicting
+    `fib.rs` doc comments + the `forwarding/README.md` "stays global" note.
+  - **RED-on-revert**: `static_bare_gateway_infers_ifindex_in_own_table_v4`
+    / `_v6` — two instances ("red"/"blue") own the same 192.168.0.0/24 (and
+    2001:db8::/64); "blue" leads the scan order, so the global scan bound
+    blue's ifindex 102 into red's route (assert 101 → RED). Verified by
+    temporarily reverting the filter: both fail (left 102, right 101);
+    `static_bare_gateway_single_table_still_resolves` stays green
+    (single-table + next-table leak unaffected). `native_gre*` fixtures made
+    config-realistic (GRE inner iface `routing_instance = "sfmix"`); test B
+    `owner_rg_for_resolution_uses_native_gre_endpoint_group` resolves in
+    `sfmix.inet.0`.
+  - **Validation**: FULL `cargo test --release -- --test-threads=1` = 3744
+    passed / 0 failed / 2 ignored (3659 main bin + 54 + 8 + 22 + 1);
+    fib/forwarding/tunnel subset 127/0. rustfmt applied to changed lines
+    (edition-2024; reverted the two unrelated pre-existing whole-file drifts
+    in fib.rs). NOTE: multi-VRF routing change — a routing smoke /
+    `make test-failover` is warranted (dataplane forwarding path).
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/fib.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/frame/tests.rs,
+  docs/rib-group-route-leaking.md, _Log.md

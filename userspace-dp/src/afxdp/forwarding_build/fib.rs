@@ -65,13 +65,19 @@ pub(super) fn populate_routes(
                     family: route.family.clone(),
                 });
             }
+            // #4446: compute the route's canonical install table BEFORE
+            // resolving its next-hops, so a bare-gateway static route infers
+            // its egress ifindex ONLY from a connected prefix in its OWN
+            // table (mirrors the #2388 lookup-site connected filter, but at
+            // BUILD time so the correct ifindex is baked into RouteEntryV4).
+            let table = canonical_route_table(&route.table, false);
             let next_hops = resolve_route_next_hops_v4(
                 route,
                 &iface_ctx.name_to_ifindex,
                 &iface_ctx.linux_to_ifindex,
                 state,
+                &table,
             );
-            let table = canonical_route_table(&route.table, false);
             state
                 .routes_v4
                 .entry(table)
@@ -95,13 +101,17 @@ pub(super) fn populate_routes(
                     family: route.family.clone(),
                 });
             }
+            // #4446: canonical install table computed before next-hop
+            // resolution (see the v4 arm) so the connected-prefix inference
+            // is scoped to the route's own table.
+            let table = canonical_route_table(&route.table, true);
             let next_hops = resolve_route_next_hops_v6(
                 route,
                 &iface_ctx.name_to_ifindex,
                 &iface_ctx.linux_to_ifindex,
                 state,
+                &table,
             );
-            let table = canonical_route_table(&route.table, true);
             state
                 .routes_v6
                 .entry(table)
@@ -259,15 +269,20 @@ pub(super) fn populate_fabrics(
 /// forwarding next-hop (returns empty). Each candidate resolves its egress
 /// ifindex from an explicit `@interface` spec, else by inferring the
 /// connected interface that contains the gateway IP — scoped to the
-/// route's own table (#2388) so a gateway is never resolved against
-/// another routing-instance's connected prefix. Candidates whose interface
-/// fails to resolve are still retained with ifindex 0 (matching the
-/// pre-#2389 single-next-hop fallback, which kept next_hop with ifindex 0).
+/// route's own canonical `table` (#4446) so a gateway is never resolved
+/// against another routing-instance's overlapping connected prefix. This
+/// mirrors the #2388 lookup-site connected filter, applied here at BUILD
+/// time so the correct ifindex is baked into `RouteEntryV4.next_hops` (the
+/// lookup consumes `nh.ifindex` verbatim, so a wrong build-time bind could
+/// not be corrected at lookup). Candidates whose interface fails to resolve
+/// are still retained with ifindex 0 (matching the pre-#2389 single-next-hop
+/// fallback, which kept next_hop with ifindex 0).
 pub(in crate::afxdp) fn resolve_route_next_hops_v4(
     route: &RouteSnapshot,
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
+    table: &str,
 ) -> Vec<RouteNextHopV4> {
     if route.discard || !route.next_table.is_empty() {
         return Vec::new();
@@ -283,6 +298,7 @@ pub(in crate::afxdp) fn resolve_route_next_hops_v4(
                 names,
                 linux_names,
                 state,
+                table,
             );
             RouteNextHopV4 {
                 next_hop,
@@ -293,11 +309,16 @@ pub(in crate::afxdp) fn resolve_route_next_hops_v4(
         .collect()
 }
 
+/// #2389/#4446: v6 twin of [`resolve_route_next_hops_v4`]. `table` is the
+/// route's canonical install table; a bare-gateway static route infers its
+/// egress ifindex only from a connected prefix in that table (never a
+/// different routing-instance's overlapping prefix).
 pub(in crate::afxdp) fn resolve_route_next_hops_v6(
     route: &RouteSnapshot,
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
+    table: &str,
 ) -> Vec<RouteNextHopV6> {
     if route.discard || !route.next_table.is_empty() {
         return Vec::new();
@@ -313,6 +334,7 @@ pub(in crate::afxdp) fn resolve_route_next_hops_v6(
                 names,
                 linux_names,
                 state,
+                table,
             );
             RouteNextHopV6 {
                 next_hop,
@@ -329,6 +351,7 @@ fn resolve_next_hop_target_v4(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
+    table: &str,
 ) -> (i32, u16) {
     interface
         .and_then(|name| resolve_ifindex(name, names, linux_names))
@@ -342,7 +365,7 @@ fn resolve_next_hop_target_v4(
                     .unwrap_or(0),
             )
         })
-        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v4(state, ip)))
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v4(state, ip, table)))
         .unwrap_or((0, 0))
 }
 
@@ -352,6 +375,7 @@ fn resolve_next_hop_target_v6(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
+    table: &str,
 ) -> (i32, u16) {
     interface
         .and_then(|name| resolve_ifindex(name, names, linux_names))
@@ -365,7 +389,7 @@ fn resolve_next_hop_target_v6(
                     .unwrap_or(0),
             )
         })
-        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v6(state, ip)))
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v6(state, ip, table)))
         .unwrap_or((0, 0))
 }
 
@@ -421,28 +445,39 @@ pub(in crate::afxdp) fn resolve_ifindex(
 pub(in crate::afxdp) fn infer_connected_route_target_v4(
     state: &ForwardingState,
     ip: Ipv4Addr,
+    table: &str,
 ) -> Option<(i32, u16)> {
-    // Gateway -> egress-interface inference at FIB-build time: "which
-    // interface can reach this next-hop gateway IP". This is a global
-    // connected-prefix match and is intentionally NOT table-scoped — a
-    // route's configured gateway resolves to whatever connected interface
-    // contains it. The #2388 cross-VRF leak is a LOOKUP-time concern
-    // (which connected prefix a destination egresses on) and is fixed at
-    // the lookup site by filtering connected_v4 on the resolving table.
+    // #4446: Gateway -> egress-interface inference at FIB-build time:
+    // "which interface in the ROUTE'S OWN table can reach this next-hop
+    // gateway IP". The connected scan is filtered on `entry.table == table`
+    // (the canonical install table threaded from `populate_routes`),
+    // mirroring the #2388 lookup-site connected filter. Without the filter
+    // the scan was GLOBAL and a bare-gateway static route in VRF A could
+    // bind VRF B's overlapping connected prefix -> cross-VRF wrong egress:
+    // the inferred ifindex is baked into `RouteEntryV4.next_hops` and used
+    // verbatim at lookup, so the lookup-time #2388 filter could NOT correct
+    // it. A route-leak / next-table cross-VRF reach is not affected: a
+    // leaked route is emitted as a `NextTable` snapshot with no forwarding
+    // next-hop (never reaches this inference), and the recursion re-resolves
+    // in the target table's own scope. `connected_v4` is sorted
+    // longest-prefix-first, so the first in-table match is the most specific.
     state
         .connected_v4
         .iter()
-        .find(|entry| entry.prefix.contains(ip))
+        .find(|entry| entry.table == table && entry.prefix.contains(ip))
         .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
 
 pub(in crate::afxdp) fn infer_connected_route_target_v6(
     state: &ForwardingState,
     ip: Ipv6Addr,
+    table: &str,
 ) -> Option<(i32, u16)> {
+    // #4446: table-scoped gateway inference — see
+    // `infer_connected_route_target_v4` for the full rationale.
     state
         .connected_v6
         .iter()
-        .find(|entry| entry.prefix.contains(ip))
+        .find(|entry| entry.table == table && entry.prefix.contains(ip))
         .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
