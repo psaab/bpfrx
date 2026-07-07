@@ -1,3 +1,37 @@
+## 2026-07-07 — #4415 (codex-164 backlog, L12): reject zone LIST on scoped global policy
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the one GENUINE GO bug in the codex-review-164 unfiled
+  backlog (#4415). A scoped global policy's `match from-zone` / `match to-zone`
+  (#3148) is modeled by a SINGLE-STRING `config.PolicyMatch.FromZone`/`.ToZone`,
+  and the compiler fills it from only the first value token. A Junos zone LIST
+  (`match from-zone [ trust dmz ]`) collapses via the #2419 lexer onto one leaf's
+  Keys (`["from-zone","trust","dmz"]`), so the compiler kept `trust` and SILENTLY
+  DROPPED `dmz` — a security-relevant scope narrowing with no operator-visible
+  signal (verified: `SchemaValidate` returned nil, `Match.FromZone == "trust"`).
+  Tagged both leaves `scalar: true` in `pkg/config/schema_security.go` so
+  `SchemaValidate`'s #3332 `validateScalarValueLeaf` guard REJECTS the list at
+  commit with a clear "the extra token would be silently dropped" error, instead
+  of dropping a zone. Single-zone scope still validates. Modeling a real
+  multi-zone scope (Junos accepts a list here) is deferred as #4415 M03.
+- **File(s)**: `pkg/config/schema_security.go` (scalar: true on global
+  from-zone/to-zone), `pkg/config/schema_global_zone_list_4415_test.go` (new
+  RED-on-revert test), `docs/config-schema.md` (#4415 L12 note in the #3332
+  scalar section).
+- **Other codex-164 items (dispositions, no code):** H02 policy_id-0 exclusion =
+  DELIBERATE, documented in `daemon_policy_invalidate.go` (overloaded wire value,
+  fail-safe under-clear). M01 single-read bpfShim add = DELIBERATE, documented in
+  `policycounters.go:201` (bpfShim never incremented in userspace mode →
+  contributes zero; retained for legacy API parity). M05/L10/L15 host-inbound
+  exotic-zone counter collision + hash-suffix/side-table = DELIBERATE, documented
+  in `nftables/host_inbound_counters.go` (hash suffix explicitly rejected;
+  bounded metric-aggregation artifact, no forwarding/security impact). M07
+  bulk-reader migration = ALREADY-COMPLETE (all six observability surfaces use
+  `NewPolicyCounterReader`). L08 static canary = ALREADY-DONE
+  (`policies_bulk_reader_test.go` x3 across api/cli/grpcapi). M03/L01 multi-zone
+  scope + reserve-id-0 = NEEDS-RESEARCH (deferred). L02/L03 loss-cluster smokes =
+  lab-blocked. L06/L07/L14 = refactors (out of scope this pass).
+
 ## 2026-07-07 — #4373 (Phase-0, E4/H2/H7): match-policies route-drop-before-policy advisory
 
 - **Timestamp**: 2026-07-07

@@ -579,6 +579,21 @@ tag, asserted only on leaves audited to take a fixed value and NO body
 `hostname`). This is the "design pass on the value-arity contract" the #3332
 body called for; new scalar leaves opt in as they are audited.
 
+**#4415 L12 — scoped global-policy `from-zone`/`to-zone`.** A Junos global
+policy may carry an optional `match from-zone` / `match to-zone` to scope it
+to a chosen zone pair (#3148). The typed model behind it —
+`config.PolicyMatch.FromZone` / `.ToZone` — is a single string, and the
+compiler (`compiler_security_policy.go`) fills it from only the FIRST value
+token. A zone LIST (`match from-zone [ trust dmz ]`) collapses via the #2419
+lexer onto one leaf's Keys (`["from-zone","trust","dmz"]`), so the compiler
+kept `trust` and silently DROPPED `dmz` — a security-relevant scope
+narrowing with no operator-visible signal. Both leaves are now tagged
+`scalar: true`, so `SchemaValidate` rejects the list at commit instead of
+dropping a zone. Modeling a real multi-zone scope (Junos accepts a list here)
+is deferred as #4415 M03; until then the fail-closed rejection is the correct
+behavior. Pinned by
+`pkg/config/schema_global_zone_list_4415_test.go`.
+
 `isScalarValueLeaf` also carries belt-and-braces structural guards, so a
 future mis-tag on a node that is actually multi / typed / a container
 degrades to a no-op rather than a surprise rejection. It exempts:
