@@ -59,6 +59,16 @@ const (
 	// DefaultThrottle is the minimum spacing between consecutive
 	// actuations (frr-reload cooling window).
 	DefaultThrottle = 3 * time.Second
+	// DefaultActuateTimeout bounds a single actuation so a wedged
+	// consumer (an apply semaphore never released by a stuck operator
+	// commit) cannot hold the run loop off its next retry indefinitely
+	// while the daemon is still up (#4423 L). It aborts only the
+	// ctx-checked wait (the apply-semaphore acquire, #3758) — a live FRR
+	// reload past that point is never interrupted mid-apply — and a
+	// timed-out actuation returns false so the engine keeps the state
+	// dirty and retries on the next throttle-paced sweep. Chosen well
+	// above a legitimate FRR reload + snapshot publish.
+	DefaultActuateTimeout = 30 * time.Second
 )
 
 // UnresolvedRoute describes a FAILED policy's interface-typed preferred
@@ -170,6 +180,15 @@ type Engine struct {
 	// so a change that lands DURING an actuation (last-writer-wins) is
 	// not lost, and a failed actuation stays dirty for retry (#3757).
 	dirtyGen uint64
+	// actuationFailures counts route-overlay actuations that did not
+	// converge (a hard FRR reload error, a snapshot-publish failure, an
+	// unconfirmed FIB-generation bump, or a bounded-timeout/shutdown
+	// abort). Monotonic; feeds xpf_ipmon_actuation_failures_total so the
+	// otherwise-silent #3757 self-heal retry loop is observable — a
+	// steadily-climbing value means ip-monitoring cannot commit its
+	// overlay and failover protection is degraded (#4423 L). Read/written
+	// only under mu.
+	actuationFailures uint64
 
 	// actuate is the daemon route-overlay actuator; called WITHOUT mu
 	// held. It returns true when the overlay converged consistently
@@ -184,13 +203,19 @@ type Engine struct {
 	// (return false) WITHOUT half-actuating.
 	actuate func(ctx context.Context) bool
 	// resolveNextHop resolves interface-typed next-hops at overlay
-	// computation (#1844). Set once via SetNextHopResolver before
-	// Start; nil ⇒ interface-typed candidates always skip (defensive —
+	// computation (#1844). Written by SetNextHopResolver and read by
+	// computeOverlayLocked, both under mu (#4423 L closes the prior
+	// unsynchronized-field race); the daemon still wires it once before
+	// Start. nil ⇒ interface-typed candidates always skip (defensive —
 	// the daemon always wires it).
 	resolveNextHop NextHopResolver
 	now            func() time.Time
 	debounce       time.Duration
 	throttle       time.Duration
+	// actuateTimeout bounds a single actuate() call (0 ⇒ unbounded). Set
+	// once before Start (like debounce/throttle) and read by the run-loop
+	// goroutine without further synchronization (#4423 L).
+	actuateTimeout time.Duration
 
 	kick chan struct{}
 	stop chan struct{}
@@ -234,6 +259,7 @@ func New(actuate func(ctx context.Context) bool) *Engine {
 		now:            time.Now,
 		debounce:       DefaultDebounce,
 		throttle:       DefaultThrottle,
+		actuateTimeout: DefaultActuateTimeout,
 		kick:           make(chan struct{}, 1),
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -243,10 +269,13 @@ func New(actuate func(ctx context.Context) bool) *Engine {
 }
 
 // SetNextHopResolver injects the interface-typed next-hop resolver
-// (#1844). Must be called before Start() — the field is read by the
-// run-loop goroutine without further synchronization.
+// (#1844). The daemon calls it once before Start(); it takes mu so a
+// late call (a test, or a future re-wire) cannot race the run loop's
+// resolver read in computeOverlayLocked (#4423 L).
 func (e *Engine) SetNextHopResolver(r NextHopResolver) {
+	e.mu.Lock()
 	e.resolveNextHop = r
+	e.mu.Unlock()
 }
 
 // NotifyNextHopChange is the DHCP gateway-change trigger (#1844): it
@@ -262,18 +291,26 @@ func (e *Engine) SetNextHopResolver(r NextHopResolver) {
 func (e *Engine) NotifyNextHopChange() {
 	e.mu.Lock()
 	relevant := false
-	for _, st := range e.policies {
-		if !st.failed {
-			continue
-		}
-		for _, pr := range st.cfg.PreferredRoutes {
-			if pr != nil && pr.NextHopInterface != "" {
-				relevant = true
+	// While publication is gated off (HA standby, §4.4) the effective
+	// overlay is the baseline (nil) regardless of any DHCP-learned
+	// gateway, so a lease change cannot alter what this node publishes —
+	// scheduling an actuation would only churn an frr-reload + snapshot
+	// publish for a no-op on the standby (#4423 M4). SetPublishEnabled(true)
+	// on takeover re-actuates and the overlay then follows the fresh lease.
+	if e.publishEnabled {
+		for _, st := range e.policies {
+			if !st.failed {
+				continue
+			}
+			for _, pr := range st.cfg.PreferredRoutes {
+				if pr != nil && pr.NextHopInterface != "" {
+					relevant = true
+					break
+				}
+			}
+			if relevant {
 				break
 			}
-		}
-		if relevant {
-			break
 		}
 	}
 	if relevant {
@@ -671,12 +708,32 @@ func (e *Engine) RoutesApplied() int {
 	return len(e.appliedOverlay)
 }
 
+// ActuationFailures reports the cumulative number of route-overlay
+// actuations that did not converge — a hard FRR reload error, a
+// snapshot-publish failure, an unconfirmed FIB-generation bump (#3757),
+// or a bounded-timeout/shutdown abort (#3758/#4423 L). It is monotonic;
+// the engine retries a failed actuation autonomously (throttle-paced),
+// so a steadily-climbing value means ip-monitoring cannot commit its
+// overlay and failover protection is degraded. Feeds
+// xpf_ipmon_actuation_failures_total.
+func (e *Engine) ActuationFailures() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.actuationFailures
+}
+
 // seedResultsLocked rebuilds per-test fail state from a results
-// snapshot.
+// snapshot. A nil snapshot is treated identically to an empty one: it
+// CLEARS all known test state (no probe data ⇒ nothing failing) rather
+// than preserving a stale FAIL — keeping a policy FAILED (and its
+// failover route injected) off results the caller no longer has is wrong
+// (#4423 M8). Both production callers pass a full authoritative,
+// non-nil snapshot (Apply from rpm.Results(), always a non-nil slice;
+// HandleTransition from rpm's per-transition snapshot), so nil arrives
+// only from a direct package/API caller with no results — which now
+// resets cleanly to UNKNOWN instead of silently carrying the last
+// failure forward.
 func (e *Engine) seedResultsLocked(results []*rpm.ProbeResult) {
-	if results == nil {
-		return
-	}
 	fresh := make(map[string]map[string]bool)
 	for _, r := range results {
 		if r == nil {
@@ -794,10 +851,22 @@ func (e *Engine) run() {
 			// Outside the lock; the actuator reads ActiveOverlay() itself,
 			// so it publishes the freshest state (last-writer-wins under
 			// flap storms). A nil actuator (tests that drive the state
-			// machine directly) is a converged no-op.
+			// machine directly) is a converged no-op. The actuation runs
+			// under a bounded child of e.actuateCtx so a wedged consumer
+			// cannot hold the loop off its next retry indefinitely while
+			// the daemon is up (#4423 L); Stop still cancels e.actuateCtx
+			// (the parent), so shutdown abort (#3758) is unaffected.
 			ok := true
 			if e.actuate != nil {
-				ok = e.actuate(e.actuateCtx)
+				actCtx := e.actuateCtx
+				var cancel context.CancelFunc
+				if e.actuateTimeout > 0 {
+					actCtx, cancel = context.WithTimeout(e.actuateCtx, e.actuateTimeout)
+				}
+				ok = e.actuate(actCtx)
+				if cancel != nil {
+					cancel()
+				}
 			}
 			e.mu.Lock()
 			if ok && e.dirtyGen == actuatingGen {
@@ -812,6 +881,12 @@ func (e *Engine) run() {
 				// read via ActiveOverlay); record it as the applied state
 				// so status/metrics report applied, not desired (#3761 H8).
 				e.appliedOverlay = e.activeOverlayLocked()
+			}
+			if !ok {
+				// Non-convergence (a consumer failed, or the bounded
+				// timeout/shutdown aborted the wait): count it so the
+				// otherwise-silent self-heal retry is observable (#4423 L).
+				e.actuationFailures++
 			}
 			e.mu.Unlock()
 		}

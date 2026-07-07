@@ -242,6 +242,14 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.ipmonUnresolvedNextHops,
 			prometheus.GaugeValue, float64(unresolved))
 	}
+	// #4423 L: ip-monitoring actuation-failure counter — surfaces the
+	// otherwise-silent #3757 self-heal retry loop so a stuck overlay
+	// actuation (degraded failover) is observable. Independent of
+	// ipmonStatusFn: it is meaningful even with zero FAILED policies.
+	if c.srv.ipmonActuationFailuresFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.ipmonActuationFailures,
+			prometheus.CounterValue, float64(c.srv.ipmonActuationFailuresFn()))
+	}
 
 	// #2157: event-options remediation action observability. Makes the
 	// previously-silent loss (drop on held config lock) visible.

@@ -151,6 +151,11 @@ type Config struct {
 	// the xpf_ipmon_* metrics (#1827). Optional; if nil, the family is
 	// omitted.
 	IPMonStatusFn func() []ipmon.PolicyStatus
+	// IPMonActuationFailuresFn surfaces the cumulative count of
+	// ip-monitoring route-overlay actuations that did not converge, for
+	// the xpf_ipmon_actuation_failures_total counter (#4423 L). Optional;
+	// if nil the metric is omitted.
+	IPMonActuationFailuresFn func() uint64
 	// EventActionStatsFn surfaces event-options remediation action
 	// counters for the xpf_event_actions_* / xpf_event_action_queue_depth
 	// metrics (#2157). Optional; if nil, the family is omitted.
@@ -277,6 +282,7 @@ type Server struct {
 	schedulerRepublishFailedFn       func() bool
 	schedulerRepublishStaleSecondsFn func() float64
 	ipmonStatusFn                    func() []ipmon.PolicyStatus
+	ipmonActuationFailuresFn         func() uint64
 	eventActionStatsFn               func() eventengine.Stats
 	rpmPinFailedFn                   func() float64
 	feedsFn                          func() map[string]feeds.FeedInfo
@@ -360,6 +366,7 @@ func NewServer(cfg Config) *Server {
 		schedulerRepublishFailedFn:       cfg.SchedulerRepublishFailedFn,
 		schedulerRepublishStaleSecondsFn: cfg.SchedulerRepublishStaleSecondsFn,
 		ipmonStatusFn:                    cfg.IPMonStatusFn,
+		ipmonActuationFailuresFn:         cfg.IPMonActuationFailuresFn,
 		eventActionStatsFn:               cfg.EventActionStatsFn,
 		rpmPinFailedFn:                   cfg.RPMPinFailedFn,
 		feedsFn:                          cfg.FeedsFn,

@@ -71,6 +71,22 @@ future config change is required to recover.
   `dirtyGen` before actuating and clears `dirtySince` only when the
   actuation converged AND no newer change landed meanwhile
   (last-writer-wins preserved).
+- **Bounded per-actuation timeout (#4423 L):** each `actuate()` call
+  runs under a `DefaultActuateTimeout` (30 s) child of the shutdown
+  context, so a wedged consumer — an apply semaphore never released by a
+  stuck operator commit — cannot hold the run loop off its next retry
+  indefinitely while the daemon is up. It bounds only the ctx-checked
+  wait (the semaphore acquire, #3758); a live FRR reload past that point
+  is never interrupted mid-apply. A timed-out actuation returns `false`,
+  so it folds into the same self-heal retry. `Stop` still cancels the
+  parent context, so shutdown abort is unaffected.
+- **Actuation-failure counter (#4423 L):** every non-converged actuation
+  (any of H1/H2/H3 above, or a timeout/shutdown abort) increments a
+  monotonic counter exported as `xpf_ipmon_actuation_failures_total`
+  (`ActuationFailures()`), making the otherwise-silent retry loop
+  observable — a steadily-climbing value means the overlay cannot commit
+  and failover protection is degraded. Pair it with a sustained
+  `xpf_ipmon_routes_desired > xpf_ipmon_routes_applied` gap.
 
 ## HA
 
@@ -80,6 +96,13 @@ and re-derives from fresh probe results within seconds of a takeover.
 the config baseline — while the state machine keeps tracking
 underneath. Primary-only probing/publication scope is computed in
 `pkg/daemon` (`filterRPMForHAGating`, `ipmonPublishAllowed`).
+
+While gated off, `NotifyNextHopChange` is a no-op (#4423 M4): the
+published overlay is the baseline regardless of any DHCP-learned
+gateway, so a lease change on the standby cannot alter what this node
+publishes — scheduling an actuation would only churn a no-op
+frr-reload + snapshot. `SetPublishEnabled(true)` on takeover re-actuates
+and the overlay then follows the fresh lease.
 
 ## DHCP-tracked next-hops (#1844)
 
@@ -149,10 +172,15 @@ FRR DHCP default route; see the RFC 2131 coupling rule in
   The actuator returns `true` on a consistent, converged actuation and
   `false` to keep the state dirty for an autonomous retry (#3757).
 - `Apply(cfg, results)` — install committed policies, preserving FAIL
-  state for surviving (name, probe) pairs.
+  state for surviving (name, probe) pairs. `results` is a full
+  authoritative snapshot; a nil snapshot is treated identically to an
+  empty one — it resets known test state to UNKNOWN rather than carrying
+  a stale FAIL forward (#4423 M8). The daemon always passes a non-nil
+  slice (`rpm.Results()`), so nil only reaches a direct package caller.
 - `HandleTransition(rpm.Transition)` — the sensor input (wired to
   `rpm.Manager.SetTransitionCallback`).
-- `SetNextHopResolver(NextHopResolver)` (before `Start`) and
+- `SetNextHopResolver(NextHopResolver)` (before `Start`; mu-guarded so a
+  late call cannot race the run loop's resolver read, #4423 L) and
   `NotifyNextHopChange()` — the #1844 DHCP next-hop seam (above).
 - `ActiveOverlay() []config.RouteOverlayEntry`.
 - `Status() []PolicyStatus`, `FormatStatus` (`display.go`) — shared by
