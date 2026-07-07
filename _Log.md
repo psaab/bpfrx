@@ -1,3 +1,70 @@
+## 2026-07-06 — #4437: DDNS Surface-A cached HTTP client fails closed on source-bind error
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed C172-M01 (#4437). The Surface A HTTP publish path
+  (`resolveSurfaceABackend`, cached-client branch) swallowed a
+  cached-client source-bind error and threaded the UNBOUND default
+  client into the backend constructor — so a provider that configured a
+  `source-address` that could not be honored (a malformed address)
+  silently published from the DEFAULT ROUTE (the wrong source /
+  interface the operator explicitly overrode). Verify-first confirmed
+  the bug lived ONLY on the cached path: `httpClientCache.clientFor`
+  returns `(unbound client, err)`, and the old `httpClientFor` closure
+  dropped that error after a warning. The nil-cache path already failed
+  closed (`newProviderHTTPClient` surfaces the same error from inside
+  the constructor, `backend_dyndns2.go:85`), and the checkip observer
+  already failed closed via `CheckIPBound` (#3733). Fix: resolve the
+  source-bound client BEFORE building the backend and PROPAGATE the bind
+  error, so `newSurfaceAHTTP` degrades to the no-op publisher and the
+  reconcile SKIPS the publish (never a withdraw — the record stays as it
+  was on the wire, re-attempted next cycle once the leaf is corrected).
+  A publish with a configured `source-address` that cannot be honored is
+  an error, not a silent use-default. This is defense-in-depth: a non-IP
+  `source-address` is also rejected at commit
+  (`schema_validate_ddns_source_address_2780_test.go`), matching the
+  #3733 posture.
+- **Validation**: RED-on-revert confirmed — reverting the error
+  propagation makes `TestResolveSurfaceABackendFailsClosedOnCachedSourceBindError`
+  fail (returns a live `*dyndns2Backend` on the unbound client) while the
+  no-source happy-path test stays green. `go test ./pkg/ddns/...` green,
+  `go build`, gofmt + `go vet` clean on touched files.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/backend_http.go,
+  pkg/ddns/surface_a_sourcebind_failclosed_4437_test.go,
+  pkg/ddns/README.md, _Log.md
+
+## 2026-07-06 — #4433: fail the commit closed when IPsec render/reload fails
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed C172-H01 (#4433). The commit/apply path swallowed the
+  `d.ipsec.Apply()` error at WARN (`daemon_apply.go` step 6), so a swanctl
+  render/write/`--load-all` failure was logged and IGNORED. Because
+  `swanctl --load-all` leaves the previously-loaded config in place on
+  failure, the OLD tunnels stayed active while a NEW config was reported
+  committed — the enforced IPsec runtime silently diverged from the
+  committed policy (stale security runtime). Verify-first confirmed the
+  Manager side was already correct: `applyConfig`/`reload` return the error
+  up through `Manager.Apply`; the bug was purely the daemon swallow.
+  Fix: capture the error into `ipsecErr` and join it into the
+  `applyConfigLocked` tail result alongside `networkdErr` / `dhcpServerErr`
+  / `hostInboundErr` / `lo0Err` (the established fail-closed-on-commit
+  pattern, #1778/#2987/#3333/#3392). The config stays promoted + peer-synced
+  and every remaining reconcile step still runs (non-fatal best-effort
+  error class per `applyErrSkipsPeerSync`), so the operator sees a
+  degraded-state error surfaced by `commitAndApply` instead of a false
+  success. The DHCP-lease re-render path (`reapplyIPsecForLeaseChange`) is a
+  fire-and-forget event handler with no operator-facing commit result and is
+  intentionally left logging at WARN.
+- **RED-on-revert**: `TestApplyConfigLocked_IPsecApplyErrorFailsCommit`
+  (pkg/daemon) drives `applyConfigLocked` with the swanctl configDir pointed
+  at an unwritable path and asserts the return mentions "IPsec"; verified RED
+  (returns nil, error swallowed) when the fix is reverted. Companion
+  `TestApplyReloadErrorPropagates` (pkg/ipsec) documents the Manager reload
+  contract via the swanctl seam. `go test ./pkg/ipsec/... ./pkg/daemon/...`
+  green; `go build ./...`; gofmt/vet clean.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_ipsec_apply_test.go,
+  pkg/ipsec/reload_error_4433_test.go, pkg/ipsec/README.md, _Log.md
+
 ## 2026-07-06 — #4426: reject single-family prefix-lists under `family any`
 
 - **Timestamp**: 2026-07-06
@@ -38086,3 +38153,174 @@ top.
 - **File(s)**: userspace-dp/src/session/mod.rs,
   userspace-dp/src/session/lookup.rs, userspace-dp/src/session/tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+---
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 ip-monitoring (services ip-monitoring / #1827 preferred-route
+  WAN-failover engine) M3-M8 + L verify-first triage. Branch fix/4423-ipmon.
+  - **M8 — GENUINE (latent), fixed.** `seedResultsLocked(nil)` early-returned,
+    PRESERVING stale FAIL state; a caller with no probe data kept a policy
+    FAILED and its failover route injected off results it no longer has.
+    Now nil is treated identically to an empty snapshot (clear → UNKNOWN).
+    Production callers always pass non-nil (`rpm.Results()` is a non-nil slice;
+    `fireTransition` always sets `Results: m.Results()`), so this only affected
+    direct package/API callers — a correctness hardening. RED-on-revert
+    `TestApplyNilResultsClearsStaleFailState`.
+  - **M4 — GENUINE, fixed.** `NotifyNextHopChange` scheduled an actuation on a
+    DHCP gateway change even while publication was HA-gated off (standby),
+    where the published overlay is the baseline (nil) regardless of the lease
+    — wasted no-op frr-reload + snapshot churn. Gated the relevance scan on
+    `e.publishEnabled`; takeover (`SetPublishEnabled(true)`) re-actuates and
+    the overlay then follows the fresh lease. RED-on-revert
+    `TestNotifyNextHopChangeGatedOffStandby`. HA-adjacent (publication gating)
+    but no forwarding/failover-path change — pure standby-side no-op
+    suppression, so `make test-failover` is not warranted (flagged in the
+    PR).
+  - **L (bounded actuator timeout) — GENUINE, fixed.** The actuator ran under
+    the un-timed shutdown context, so a wedged apply-semaphore acquire (a stuck
+    operator commit) held the run loop off its retry until `Stop`. Added
+    `DefaultActuateTimeout` (30 s) child ctx per actuation — bounds only the
+    ctx-checked semaphore wait (#3758), never a live FRR reload; a timeout
+    returns false and folds into the #3757 self-heal retry. RED-on-revert
+    `TestActuationTimeoutRetriesWithoutStop`.
+  - **L (racy SetNextHopResolver) — GENUINE (latent), fixed.** The resolver
+    field was written without mu while `computeOverlayLocked` reads it under
+    mu; safe in prod (set before Start) but a latent race. Now written under
+    mu. Covered by `-race`.
+  - **L (no actuator-failure metric) — GENUINE gap, fixed.** Added
+    `actuationFailures` counter (incremented on every non-converged actuation)
+    + `ActuationFailures()` getter, exported as
+    `xpf_ipmon_actuation_failures_total`, surfacing the otherwise-silent #3757
+    self-heal retry loop. Wired through api.Config → collector.
+  - **M5 — NOT-MATERIAL.** "DHCP resolver under Engine.mu blocks transition
+    ingestion + status." The resolver is a microsecond map copy-out
+    (`resolveDHCPNextHop` → `dhcp.Manager.LeaseFor`, dhcp.go:652-662 — lock,
+    copy, unlock); NO dhcp `m.mu` critical section spans network I/O (DORA /
+    renewal run outside the lock). The Engine.mu → dhcp.mu order is documented
+    one-way + acyclic (ipmon.go NextHopResolver doc). No material stall.
+  - **M6 — NOT-MATERIAL as framed ("compute once").** `Apply` computes
+    overlayBefore (old policies) AND overlayAfter (new policies) to detect
+    whether an edit/removal changed the effective overlay (HIGH-1 re-injection,
+    ipmon.go:390-394) — the two are semantically distinct, so they cannot
+    collapse to one; overlayAfter is already short-circuited when `changed==true`
+    (the common fail/recover path). The only duplication is the resolver
+    consulted twice for the same lease keys = the same microsecond map read
+    disproved in M5.
+  - **M3 — DEFER (documented residual, #3764).** `rpmProbeGatingRGs`
+    (daemon_rpm.go:133,140) defaults a policy-referenced-but-RETH-unbound probe
+    to the lowest data RG. This is already documented as deferred in
+    `daemon_ipmon.go:376-379` (Layer-2 plan: a per-policy publish allow-set or
+    a commit-check requiring HA-gated probes to bind a RETH). Sane default for
+    the single-data-RG common case; the multi-data-RG split-primary residual is
+    the recorded follow-up. Not force-driven.
+  - **L (unbounded PreferredMetric) — NOT-MATERIAL.** Never rendered to FRR
+    (`renderPreferredRoutes` hardcodes `Preference: 1`, config_render.go:343);
+    it is purely the engine's winner-resolution comparison key (int compare, no
+    arithmetic/overflow) and negatives are already rejected at commit
+    (`setMetric` n<0, compiler_services.go:857). A cap would only risk
+    rejecting a currently-valid config.
+  - **L (wall-clock FormatStatus) — DEFER (cosmetic).** `display.go` uses
+    `time.Until`/`Format` on a human-facing render; in production `e.now ==
+    time.Now`, so the hold-down countdown is correct. Threading the engine
+    clock into the CLI/gRPC render surface is out of scope for a display-only
+    nicety.
+  - Validation: `go test -race ./pkg/ipmon/...` green; `go test
+    ./pkg/api/... ./pkg/daemon/...` green; `go build ./...`; gofmt/vet clean on
+    touched files (pre-existing metrics_wireguard_test.go gofmt drift is on
+    origin/master, untouched). Each of the four fixes verified RED-on-revert.
+- **File(s)**: pkg/ipmon/ipmon.go, pkg/ipmon/ipmon_test.go, pkg/ipmon/README.md,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/api/server.go, pkg/daemon/daemon_run.go, docs/multi-wan.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 routing sub-items (M3 / L2 / L3 / L6) — verify-first triage
+  (final #4423 subsystem sweep). PR: `fix/4423-routing`. GO-only, no cargo. The
+  four "routing" findings turned out to live in the userspace forwarding
+  pipeline (`pkg/dataplane/userspace/routes.go` Go builder + the Rust FIB
+  `userspace-dp/src/afxdp/forwarding_build/fib.rs` / `forwarding/mod.rs`), NOT
+  in `pkg/routing`. Dispositions:
+  - **M3 (static next-hop gateway inference is global, not table-scoped) —
+    GENUINE, DEFERRED to a Rust/cargo slice.** `resolve_route_next_hops_v4/_v6`
+    infer a bare-gateway static route's egress ifindex via
+    `infer_connected_route_target_v4/_v6`, which scans `state.connected_v4`
+    GLOBALLY and never filters by the route's own table — although every
+    `ConnectedRouteV4` already carries its owning `table` (added by #2388 for
+    the lookup-site filter). The wrong ifindex is baked into
+    `RouteEntryV4.next_hops` at build time and used verbatim at lookup
+    (`forwarding/mod.rs` static arm), so the #2388 lookup-time filter does NOT
+    correct it. In a multi-VRF setup with overlapping gateway subnets a static
+    route in instance A can egress on instance B's interface. Two `fib.rs` doc
+    comments contradict each other (`resolve_route_next_hops_v4` claims
+    "#2388 table-scoped"; `infer_connected_route_target_v4` says "intentionally
+    NOT table-scoped" — the code matches the latter). Turnkey fix recorded in
+    `docs/rib-group-route-leaking.md`: thread the canonical table into the
+    inference and filter `entry.table == table`, mirroring the lookup site; fix
+    the stale doc. It is a `userspace-dp` change requiring the serial cargo
+    build + `make test-failover`, so it is deferred out of this Go-only slice.
+  - **L2 (`canonical_route_table` silently rewrites cross-family names) —
+    NOT-A-BUG.** The helper only swaps the family suffix (`.inet.0` ↔
+    `.inet6.0`) and always PRESERVES the VRF prefix, so it can only normalize a
+    name into the same instance's correct family-specific table, never a wrong
+    VRF. Go already emits correct-family install tables
+    (`normalizeRouteSnapshotFamily`) and `next-table` targets are reduced to a
+    bare instance name (`parseNextTableInstance`) with no family to drift.
+    Locked by `TestNormalizeRouteSnapshotFamily_VRFPreserving_4423`.
+  - **L3 (link-local next-hop needs `%iface`) — NOT-A-BUG.** xpf is
+    Junos-syntax: `next-hop fe80::1 interface reth0.50` (internally encoded as
+    the `ip@interface` FIB spec). `%iface` (RFC 4007 zone-id) has no producer or
+    consumer in the pipeline; `ValidateStaticNextHop` correctly rejects it at
+    commit. Locked by `TestStaticNextHop_ZoneIDPercentRejected_4423`.
+  - **L6 (overlay cannot express an ECMP preferred route) — DEFER (feature).**
+    `applyRouteOverlay` deliberately does whole-entry replacement with a single
+    next-hop — the correct #1827 WAN-failover semantics, pinned by the existing
+    `TestRouteOverlayWholeEntryReplacement`. ECMP preferred routes would be a new
+    feature (RouteOverlayEntry.NextHop → list + config schema + ipmon
+    winner-resolution); recorded plan in `docs/rib-group-route-leaking.md`.
+  - Validation: `go test ./pkg/config/ ./pkg/dataplane/userspace/` green
+    (new lock-in tests + surrounding suites); `go build ./...`; gofmt/vet clean
+    on touched files. No Go code fix was warranted (M3 is Rust/deferred; L2/L3
+    not-a-bug; L6 deferred feature) — this slice delivers the verify-first
+    dispositions, two lock-in tests encoding the L2/L3 disproofs, and the
+    turnkey M3 plan.
+- **File(s)**: pkg/config/schema_validate_route_2448_test.go,
+  pkg/dataplane/userspace/routes_family_normalize_4423_test.go,
+  docs/rib-group-route-leaking.md, _Log.md
+## 2026-07-06 — #4434 HA heartbeat redundancy-group wire-width cap (codex-172 C172-H02)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Cap chassis-cluster redundancy-group cardinality and id to the
+  single-byte HA heartbeat wire fields; add a defensive marshaler cap.
+  - **Root cause (verified on origin/master)**: the heartbeat group-count field
+    is `buf[8] = uint8(len(pkt.Groups))` (heartbeat.go marshalHeartbeatBody) and
+    each per-group id is `HeartbeatGroup.GroupID uint8`, populated via
+    `uint8(rg.GroupID)` (heartbeat_manager.go buildHeartbeat). The chassis
+    schema does NOT validate the `redundancy-group <id>` instance slot
+    (schema_chassis.go documents it as an unvalidated identity token) and
+    `compileChassis` parses the id with `strconv.Atoi` under no bound. So 256+
+    RGs advertised a count byte of 0 while 256 records were still written (wire
+    desync), a GroupID >255 truncated and collided, and ~293 RGs indexed past
+    the fixed 1472-byte frame and panicked the marshaler. No pre-existing cap
+    existed anywhere — real uncapped wire-safety bug, DRIVEN.
+  - **Fix (commit gate)**: new `validateChassisClusterStrict` in
+    `pkg/config/compiler_validate_strict_chassis.go` hard-rejects at
+    commit / commit-check when `len(RedundancyGroups) > 255` or any
+    `RedundancyGroup.ID` is outside `0..255`, with wire-width-explaining
+    messages. Dispatched from `compileExpanded` (compiler.go) right after
+    `validateFlowAgingStrict`, following the established lenient-downgrade
+    doctrine: strict on commit, warn on the tolerant Load / peer-sync paths
+    (new `lenientChassisRG` opt, set in `CompileConfigLenient` and
+    `CompileConfigForNodeLenient`) so an already-persisted / peer-synced
+    config still boots (#1960 no-brick).
+  - **Fix (marshaler guard)**: `marshalHeartbeatBody` now bounds the group
+    section to `maxHeartbeatGroups = 255`, keeping the count byte consistent
+    with the records written and guaranteeing no index-out-of-range panic even
+    if an over-size config slips past the gate (lenient path). One-shot
+    `slog.Warn` via `sync.Once` so the per-send hot path never floods journald.
+  - **RED-on-revert**: neutralizing the gate → both config subtests accept the
+    bad config (nil error); neutralizing the marshaler cap → 400-group marshal
+    panics `index out of range [1472] with length 1472` and the 256-group count
+    byte wraps to 0. Restored; full `pkg/config` + `pkg/cluster` suites green,
+    `go build ./...`, gofmt + vet clean on touched files.
+- **File(s)**: pkg/config/compiler_validate_strict_chassis.go,
+  pkg/config/compiler_validate_strict_chassis_4434_test.go,
+  pkg/config/compiler.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_rg_cap_4434_test.go, docs/config-schema.md, _Log.md

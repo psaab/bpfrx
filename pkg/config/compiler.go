@@ -1239,6 +1239,19 @@ type compileOpts struct {
 	// anyway (#3440 H1), so a leniently-loaded bad value is inert. Same
 	// doctrine as lenientScreenUnknown.
 	lenientFlowAging bool
+	// lenientChassisRG (#4434) downgrades the chassis-cluster heartbeat
+	// wire-width gate (validateChassisClusterStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a redundancy-group cardinality or id that exceeds the
+	// single-byte heartbeat count / GroupID fields (256 RGs advertise as a
+	// count of 0 and desync the wire; an id > 255 truncates and collides).
+	// The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config still BOOTS (#1960 no-brick);
+	// the heartbeat marshaler independently caps the group section to the
+	// wire limit (pkg/cluster/heartbeat.go maxHeartbeatGroups), so a
+	// leniently-loaded over-size config is bounded on the wire, not a panic.
+	// Same doctrine as lenientFlowAging.
+	lenientChassisRG bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1577,6 +1590,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientScreenUnknown:                   true,
 		lenientTrailingTokens:                  true,
 		lenientFlowAging:                       true,
+		lenientChassisRG:                       true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -1821,6 +1835,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientScreenUnknown:                   true,
 		lenientTrailingTokens:                  true,
 		lenientFlowAging:                       true,
+		lenientChassisRG:                       true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -2894,6 +2909,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFlowAging {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("flow aging (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #4434 chassis-cluster heartbeat wire-width gate. Strict on commit /
+	// commit-check (hard-reject a redundancy-group cardinality or id that
+	// exceeds the single-byte heartbeat count / GroupID fields — 256 RGs
+	// advertise as a count of 0 and desync the wire, an id > 255 truncates
+	// and collides with another group). Lenient on load / peer-sync (warn so
+	// an already-persisted or peer-synced config still boots — #1960
+	// no-brick; the heartbeat marshaler independently caps the group section
+	// to the wire limit, marshalHeartbeatBody, so a leniently-loaded
+	// over-size config is bounded, not a panic). Runs on the fully-compiled
+	// *Config (RedundancyGroups populated by compileChassis).
+	if err := validateChassisClusterStrict(cfg); err != nil {
+		if opts.lenientChassisRG {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("chassis cluster redundancy-group (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

@@ -1220,6 +1220,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #4423 L: ip-monitoring actuation-failure counter
+			// (xpf_ipmon_actuation_failures_total) — surfaces the silent
+			// #3757 self-heal retry loop so a degraded failover is visible.
+			IPMonActuationFailuresFn: func() uint64 {
+				if d.ipmon != nil {
+					return d.ipmon.ActuationFailures()
+				}
+				return 0
+			},
 			// #2157: event-options remediation action counters for the
 			// xpf_event_actions_* / xpf_event_action_queue_depth family.
 			EventActionStatsFn: func() eventengine.Stats {

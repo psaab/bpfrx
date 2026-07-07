@@ -659,6 +659,144 @@ func TestApplyPreservesFailedStateAcrossCommit(t *testing.T) {
 	}
 }
 
+// TestApplyNilResultsClearsStaleFailState is the #4423 M8 regression:
+// seedResultsLocked must treat a nil results snapshot as an EMPTY one
+// (clear all test state) rather than preserving a stale FAIL. A caller
+// with no probe data must not keep a policy FAILED — and its failover
+// route injected — off results it no longer has. On revert (the
+// `if results == nil { return }` early-return) the FAIL and the overlay
+// survive the nil-results apply and all three assertions go RED.
+func TestApplyNilResultsClearsStaleFailState(t *testing.T) {
+	e, _ := newTestEngine(nil)
+	e.Apply(testPolicyConfig(), passResults())
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	if !e.Status()[0].Failed {
+		t.Fatal("setup: policy not FAILED after a failing probe")
+	}
+	if len(e.ActiveOverlay()) == 0 {
+		t.Fatal("setup: no overlay after failure")
+	}
+
+	// Re-apply the same policy set with NO results snapshot (nil).
+	e.Apply(testPolicyConfig(), nil)
+	if e.Status()[0].Failed {
+		t.Fatal("stale FAIL preserved across Apply(cfg, nil) — M8 regression")
+	}
+	if got := e.ActiveOverlay(); got != nil {
+		t.Fatalf("overlay = %+v after nil-results apply, want withdrawn", got)
+	}
+	if e.Status()[0].Known {
+		t.Fatal("policy still reported Known after results reset to nil/empty")
+	}
+
+	// nil and empty-slice snapshots are equivalent: an empty snapshot
+	// already cleared today, and nil must match.
+	e.Apply(testPolicyConfig(), passResults())
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	if !e.Status()[0].Failed {
+		t.Fatal("setup: re-fail did not take")
+	}
+	e.Apply(testPolicyConfig(), []*rpm.ProbeResult{})
+	if e.Status()[0].Failed {
+		t.Fatal("empty-slice snapshot did not clear FAIL")
+	}
+}
+
+// TestNotifyNextHopChangeGatedOffStandby is the #4423 M4 regression:
+// while publication is gated off (HA standby) a DHCP gateway change must
+// NOT schedule an actuation — the published overlay is the baseline
+// (nil) regardless of the lease, so recomputing/actuating is wasted
+// frr-reload + snapshot churn on the standby. On revert (NotifyNextHopChange
+// ignores publishEnabled) the gated-off gateway change actuates and the
+// "no new actuation" assertion goes RED.
+func TestNotifyNextHopChangeGatedOffStandby(t *testing.T) {
+	var actuations atomic.Int32
+	e := New(func(context.Context) bool { actuations.Add(1); return true })
+	e.debounce = 5 * time.Millisecond
+	e.throttle = 5 * time.Millisecond
+	r := &fakeResolver{}
+	r.set("ge-0-0-3", "198.51.100.1")
+	e.SetNextHopResolver(r.resolve)
+	e.Apply(dhcpPolicyConfig(), passResults())
+	e.Start()
+	defer e.Stop()
+
+	// Fail an interface-typed policy, then gate publication off (standby).
+	failWAN(e)
+	e.SetPublishEnabled(false)
+	time.Sleep(50 * time.Millisecond) // let the failure + gate-off actuations settle
+	base := actuations.Load()
+
+	// A DHCP gateway change while gated off must not actuate.
+	r.set("ge-0-0-3", "198.51.100.254")
+	for i := 0; i < 3; i++ {
+		e.NotifyNextHopChange()
+	}
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got != base {
+		t.Fatalf("NotifyNextHopChange actuated while publication gated off: %d -> %d (M4)", base, got)
+	}
+
+	// On takeover the overlay follows the fresh lease again.
+	e.SetPublishEnabled(true)
+	deadline := time.Now().Add(2 * time.Second)
+	for actuations.Load() == base && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if actuations.Load() == base {
+		t.Fatal("takeover did not actuate after a gated-off gateway change")
+	}
+}
+
+// TestActuationTimeoutRetriesWithoutStop is the #4423 L (bounded actuator
+// timeout) regression: a wedged actuation must be aborted by the bounded
+// per-actuation timeout and retried WITHOUT waiting for Stop, so a stuck
+// consumer cannot hold the run loop off its retry indefinitely while the
+// daemon is up. On revert (actuate runs under the un-timed e.actuateCtx)
+// the first actuation blocks until Stop and the second attempt never
+// happens — attempts stays 1 and the retry assertion goes RED. It also
+// asserts the failure counter climbs across the wedged retries.
+func TestActuationTimeoutRetriesWithoutStop(t *testing.T) {
+	var attempts atomic.Int32
+	var unblock atomic.Bool
+	e := New(func(ctx context.Context) bool {
+		attempts.Add(1)
+		if unblock.Load() {
+			return true
+		}
+		<-ctx.Done() // wedged: unblocks only on the bounded timeout (or Stop)
+		return false
+	})
+	e.debounce = 2 * time.Millisecond
+	e.throttle = 5 * time.Millisecond
+	e.actuateTimeout = 20 * time.Millisecond
+	e.Apply(testPolicyConfig(), passResults())
+	e.Start()
+	defer e.Stop()
+
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for attempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Fatalf("attempts = %d — bounded actuation timeout did not fire, no retry without Stop", got)
+	}
+	if e.ActuationFailures() == 0 {
+		t.Fatal("ActuationFailures still 0 while actuations kept timing out")
+	}
+
+	// Convergence quiesces the loop.
+	unblock.Store(true)
+	time.Sleep(120 * time.Millisecond)
+	settled := attempts.Load()
+	time.Sleep(120 * time.Millisecond)
+	if extra := attempts.Load() - settled; extra > 1 {
+		t.Fatalf("kept firing after convergence: +%d attempts, want quiescent", extra)
+	}
+}
+
 // TestFilterOverlayForConfig is the Codex PR #1843 HIGH-1 regression
 // test: a commit that removes a policy or edits its preferred-route
 // spec must not republish the stale overlay entries on the commit's
