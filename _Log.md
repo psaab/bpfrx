@@ -1,3 +1,36 @@
+## 2026-07-07 — #4406 step 5: extract P5 cross-section derivations from compileExpanded
+
+- **Timestamp**: 2026-07-07
+- **Action**: Step 5 (the plan's MODERATE phase) of the #4406 compileExpanded
+  god-orchestrator decomposition (after step 1 P1 runPreWalkGates, step 2 P4
+  compileSections, step 3 P7 runTailGates, step 4 P6b runUniformGates). Extracted
+  the P5 "cross-section derivations" phase — the contiguous, NON-reorderable block
+  of post-dispatch mutations between the P4 section dispatch and the P6a
+  early-strict folds (validateDataplaneTypeStrict) — into a new free function
+  `resolveDerivedConfig(cfg *Config, opts compileOpts)` (compiler_derivations.go:53).
+  compileExpanded now calls it in the SAME position, SAME internal order. This
+  phase runs NO validation and returns NO error (unlike the pre-walk / gate
+  phases): it is pure cross-section mutation, so the helper takes cfg+opts and
+  returns nothing — matching the real block, which never returned an error nor
+  threaded warnings. It does NOT read `tree` (all six sub-steps read only cfg +
+  opts), so `tree` is deliberately not a parameter. Load-bearing internal order
+  preserved verbatim: (1) #4329 NodeID stamp — MUST precede the fabric fixup AND
+  validateDeviceMapStrict (P6b), both of which read cc.NodeID; (2)
+  resolveBGPAutonomousSystem; (3) lo0 unit-0 input-filter extract into
+  SystemConfig; (4) applyCoSInterfaceLevelBindings; (5)
+  resolveCoSTrafficControlProfiles — MUST follow the interface-level fold (4);
+  (6) fabric member/interface fixup (LocalFabricMember / FabricInterface /
+  Fabric1Interface / Fabric1PeerAddress auto-detect). P6a folds
+  (resolveZoneLocalAddressBooks / resolveStaticNATThenPrefixNames) stay INLINE —
+  they belong to the separate, deferred P6a step. compiler.go shrinks 125 net
+  lines (15 ins / 125 del). Golden gate (TestCompileGolden4406) passes
+  BYTE-IDENTICAL with NO baseline update — testdata/golden_4406.json untouched
+  (git status clean). Non-local consumer tests green (TestFlatFabric*_4329,
+  TestDeviceMap*, TestStaticNATThen*, CoS traffic-control, BGP-AS, lo0-filter).
+  gofmt clean, go vet clean, go build ./... + full pkg/config suite green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_derivations.go,
+  _Log.md
+
 ## 2026-07-07 — #4406 step 4: extract P6b uniform gates from compileExpanded
 
 - **Timestamp**: 2026-07-07
