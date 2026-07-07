@@ -37697,3 +37697,31 @@ top.
   pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go,
   pkg/daemon/ipsec_sa_sync_empty_4385_test.go, pkg/cluster/sync_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-07-06
+- **Action**: #4379 (opus-171 M-1) — window-aware scan/sweep cleanup reap
+  floor. The periodic scan/sweep tracker cleanup used a FIXED 1s floor
+  (`CLEANUP_WINDOW_MICROS`) to reap idle tracker state, but #4353/#4114 made
+  the port-scan / ip-sweep `threshold` a configurable MICROSECOND detection
+  window the compiler PRESERVES even above the Junos 1s max. An operator
+  window > 1s (e.g. 5s) had its accumulating distinct-destination set reaped
+  at 1s before the detection count was reached → a slow scan spread across the
+  configured window EVADED detection (fail-open). Fix: `ScanCore::cleanup` /
+  `PortScanTracker::cleanup` / `IpSweepTracker::cleanup` now take a
+  `reap_floor_micros` argument; `maybe_cleanup_trackers` computes the LONGEST
+  configured window per check across all live profiles
+  (`scan_cleanup_floors`) and passes it as the floor, so state survives for
+  the full configured window. The floor is clamped to a documented ceiling
+  `MAX_CLEANUP_WINDOW_MICROS` (300s / 5min) so a pathological (u32-max ~71min)
+  window cannot retain dead weight indefinitely; the per-source
+  (`MAX_UNIQUE_PER_SOURCE`) / per-zone (`MAX_SOURCES_PER_ZONE`) caps bound
+  memory regardless. RED-on-revert tracker test
+  (`slow_scan_within_window_survives_cleanup_reap`, with an in-test control
+  proving the old 1s floor evades) + sub-1s-reaps-at-window, ceiling-clamp,
+  memory-cap, and ScreenState-level max-window wiring tests. Full cargo
+  release serial: lib 3643 passed / 0 failed / 2 ignored; screen:: subset 206
+  passed / 0 failed (incl. 5 new). All other test binaries 0 failed. Only
+  rustfmt-clean changed lines (repo-wide `cargo fmt` drift reverted; verified
+  rustfmt does not touch the new lines).
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs, _Log.md

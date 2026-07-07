@@ -1310,13 +1310,47 @@ impl ScreenState {
     /// from the new-flow hook so it is co-located with the only site that
     /// mutates the trackers. `now_micros` is a monotonic microsecond clock;
     /// the 30s throttle derives seconds from it (#4114).
+    ///
+    /// #4379: the reap floor is WINDOW-AWARE. The `threshold` is a per-zone
+    /// configurable MICROSECOND detection window that the compiler PRESERVES
+    /// even above the Junos 1s max (warn-only, no clamp — see
+    /// `pkg/config/compiler_security_screen.go`). A fixed 1s cleanup floor
+    /// reaped an accumulating distinct-destination set before the detection
+    /// count was reached for any operator window > 1s, so a slow scan spread
+    /// across the operator's window EVADED detection (fail-open). Each tracker
+    /// is reaped at the LONGEST window configured for its check across all live
+    /// profiles, so state survives for the full configured window (the reap
+    /// floor is clamped to a documented ceiling inside `cleanup`, and memory
+    /// stays bounded by the per-source/zone caps regardless).
     fn maybe_cleanup_trackers(&mut self, now_micros: u64) {
         let now_secs = now_micros / 1_000_000;
         if now_secs.saturating_sub(self.last_cleanup_secs) >= 30 {
-            self.port_scan.cleanup(now_micros);
-            self.ip_sweep.cleanup(now_micros);
+            let (port_scan_floor, ip_sweep_floor) = self.scan_cleanup_floors();
+            self.port_scan.cleanup(now_micros, port_scan_floor);
+            self.ip_sweep.cleanup(now_micros, ip_sweep_floor);
             self.last_cleanup_secs = now_secs;
         }
+    }
+
+    /// #4379: compute the window-aware cleanup reap floors — the LONGEST
+    /// configured port-scan and ip-sweep detection windows (microseconds)
+    /// across all live screen profiles. A tracker's state must survive for at
+    /// least the longest window that could still detect a slow scan; reaping
+    /// earlier (the pre-#4379 fixed 1s floor) discards an in-progress
+    /// distinct-destination set and lets a slow scan evade detection. A window
+    /// of 0 (feature disabled for that zone) contributes nothing; if every
+    /// profile disables a check the floor is 0 and cleanup reclaims all of that
+    /// tracker's now-idle state. `cleanup` clamps each floor to
+    /// `MAX_CLEANUP_WINDOW_MICROS` so a pathological window cannot retain dead
+    /// weight indefinitely.
+    fn scan_cleanup_floors(&self) -> (u64, u64) {
+        let mut port_scan_floor = 0u64;
+        let mut ip_sweep_floor = 0u64;
+        for profile in self.profiles.values() {
+            port_scan_floor = port_scan_floor.max(u64::from(profile.port_scan_threshold));
+            ip_sweep_floor = ip_sweep_floor.max(u64::from(profile.ip_sweep_threshold));
+        }
+        (port_scan_floor, ip_sweep_floor)
     }
 
     /// #2209: total scan/sweep records skipped because a per-zone source
