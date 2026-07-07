@@ -836,6 +836,26 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #4375 (avo-review-007 H3) firewall-filter conflicting-terminal-actions gate.
+	// Strict on commit / commit-check (hard-reject a term that specifies more than
+	// one DISTINCT terminating action — accept/reject/discard are mutually
+	// exclusive in Junos). Before this gate compileFilterThen wrote each keyword
+	// onto the single-valued term.Action (last-write-wins), so a term with `then
+	// accept` AND `then reject` silently compiled to whichever came last — the
+	// operator's intent was ambiguous. Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick; the
+	// last-wins Action drives the dataplane independently). Runs on the
+	// fully-compiled *Config so the typed term list (TerminalActions populated by
+	// compileFilterThen) is available.
+	if err := validateFilterTerminalConflictStrict(cfg); err != nil {
+		if opts.lenientFilterTerminalConflict {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter terminal-action conflict (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3309 firewall-filter DSCP / traffic-class range gate. Strict on commit /
 	// commit-check (hard-reject a `from dscp`/`from traffic-class` match or a
 	// `then dscp`/`then traffic-class` rewrite token that is neither a known

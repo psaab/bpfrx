@@ -3767,6 +3767,45 @@ reject still rejects, `TestFilterAction_Unknown_LenientWarns`,
 (`unknown_nonempty_action_fails_closed_discard`,
 `empty_action_falls_through_to_accept`).
 
+### #4375 — firewall-filter conflicting terminating actions (commit fail-closed)
+
+Junos treats the three terminating actions `accept` / `reject` / `discard`
+as **mutually exclusive**: a filter term has at most ONE terminating action.
+xpf stores the resolved action on the single-valued `FirewallFilterTerm.Action`,
+which `compileFilterThen` overwrites **last-write-wins** — so a term carrying
+BOTH `then accept` AND `then reject` (in one `then {}` block or across two, since
+#3850 applies every block) silently compiled to whichever keyword appeared last.
+Commit reported SUCCESS, the operator's intent was ambiguous, and the compiled
+behavior did not necessarily match what they wrote — a silent misconfiguration.
+Provenance: avo-review-007 H3.
+
+`compileFilterThen` now records EVERY terminating keyword it sees on
+`FirewallFilterTerm.TerminalActions` (in order, with duplicates), and
+**`validateFilterTerminalConflictStrict`** (`compiler_validate_strict_filter.go`)
+hard-rejects any term whose **distinct**-terminal count exceeds one, naming the
+family / filter / term / the conflicting actions. Two constructs are explicitly
+NOT flagged so a real config is not over-rejected: repeating the SAME terminal
+(e.g. two `then discard` blocks — a redundancy, one distinct terminal), and a
+non-terminating modifier co-located with exactly one terminal (`then count X
+accept` — `count`/`log`/`forwarding-class`/`loss-priority`/`dscp`/
+`traffic-class`/`policer`/`routing-instance` are NOT terminals and coexist with
+one). `then routing-instance` co-located with a terminating `discard`/`reject`
+is a separate contradiction handled by `validateFilterRoutingInstanceConflict-
+Strict` (#3308); `next term` is a fall-through control, not a terminating action.
+
+**Strict/lenient split (flag `lenientFilterTerminalConflict`, sibling of
+`lenientFilterRoutingInstanceConflict`):** strict on the commit / commit-check
+path (`CompileConfig` — hard-reject), downgraded to a `cfg.Warnings` entry on the
+tolerant load / peer-sync paths (`CompileConfigLenient` /
+`CompileConfigForNodeLenient`) so an already-persisted or peer-synced config
+carrying a contradictory term still BOOTS (#1960 fail-closed-on-load doctrine) —
+the last-wins `Action` drives the dataplane deterministically on that boot. The
+gate runs immediately after `validateFilterRoutingInstanceConflictStrict`.
+Regression coverage: `pkg/config/firewall_terminal_conflict_4375_test.go`
+(accept/reject, accept/discard, reject/discard conflicts + inet6 — fail-on-revert
+guards; `then count X log accept`, a single terminal, and duplicate-same-terminal
+accepted — anti-over-reject; lenient path does not hard-fail).
+
 ### #3445 — lo0 input-filter `then` modifiers: nft-mirror support policy (commit warning)
 
 The lo0.0 input filter (`interfaces lo0 unit 0 family inet[6] filter input

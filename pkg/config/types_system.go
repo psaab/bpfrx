@@ -1220,6 +1220,22 @@ type FirewallFilterTerm struct {
 	TCPFlags         []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
 	IsFragment       bool     // match IP fragments
 	Action           string   // "accept", "reject", "discard", ""
+	// TerminalActions records EVERY terminating action keyword
+	// (accept/reject/discard) compileFilterThen encountered across all of the
+	// term's `then` blocks, in order and including duplicates. Action itself is
+	// single-valued and last-write-wins, so a term with `then accept` AND `then
+	// reject` would silently resolve to whichever came last — the operator's
+	// intent was ambiguous and the compiled behavior did not necessarily match
+	// what they wrote (#4375, avo-review-007 H3). This slice is the
+	// mutual-exclusion channel: validateFilterTerminalConflictStrict hard-rejects
+	// any term whose distinct-terminal count exceeds one; the tolerant load /
+	// peer-sync path downgrades to a warning (#1960 no-brick) and the last-wins
+	// Action still drives the dataplane. Junos treats accept/reject/discard as
+	// mutually exclusive (a term has exactly one terminating action); the
+	// non-terminating modifiers (count/log/forwarding-class/loss-priority/dscp/
+	// traffic-class/policer/routing-instance) coexist with a terminal and are NOT
+	// recorded here.
+	TerminalActions []string
 	// UnknownActions records `then` tokens that are neither a recognized
 	// terminating action nor a recognized modifier (#2399 finding 032-16).
 	// An unknown or misspelled action would otherwise be silently dropped
