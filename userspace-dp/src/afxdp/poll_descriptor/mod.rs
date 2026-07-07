@@ -2656,14 +2656,21 @@ pub(super) fn poll_binding_process_descriptor(
                                                 orig_dst_v6,
                                             })
                                         }
-                                        Err(_) => {
-                                            // Fail closed: the pool is exhausted
-                                            // (no free translated port). Drop
-                                            // rather than emit a colliding
-                                            // translation. Nothing was allocated
-                                            // or installed yet on this flow, so a
-                                            // bare recycle is a clean bail.
-                                            telemetry.counters.nat64_no_source_pool += 1;
+                                        Err(reason) => {
+                                            // Fail closed: no translated source
+                                            // could be allocated. Drop rather
+                                            // than emit a colliding translation.
+                                            // Nothing was allocated or installed
+                                            // yet on this flow, so a bare recycle
+                                            // is a clean bail. #4520: attribute
+                                            // transient port exhaustion
+                                            // (nat64_pool_exhausted) distinctly
+                                            // from a config/empty pool
+                                            // (nat64_no_source_pool) — the reason
+                                            // is carried on the Err.
+                                            telemetry
+                                                .counters
+                                                .record_nat64_source_failure(reason);
                                             binding.scratch.scratch_recycle.push(desc.addr);
                                             continue;
                                         }

@@ -209,6 +209,29 @@ func TestFormatStatusSummaryShowsNAT64Translations(t *testing.T) {
 	}
 }
 
+// #4520: the status summary surfaces the transient NAT64 pool-exhaustion drop
+// counter as a distinct row from the config/empty no-source-pool drops, so a
+// full pool under load (add capacity) is distinguishable from a misconfigured
+// or empty pool (fix config) — opposite remedies.
+func TestFormatStatusSummaryShowsNAT64PoolExhausted(t *testing.T) {
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
+			{Slot: 0, Nat64NoSourcePool: 3, Nat64PoolExhausted: 5},
+			{Slot: 1, Nat64NoSourcePool: 0, Nat64PoolExhausted: 9},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	for _, want := range []string{
+		"NAT64 no-source-pool drops:3",
+		"NAT64 pool-exhausted drops:14",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("summary missing NAT64 drop row %q:\n%s", want, out)
+		}
+	}
+}
+
 // #3657 (H13/H14) / #3661 (M02): the status summary surfaces the per-source
 // reject reply SUCCESS ("Generated-reply sent"), the TX-frame reply-budget
 // suppression ("Generated-reply budget drops"), and the rate-limit
