@@ -24,6 +24,50 @@
   pkg/configstore/commit_confirm_demote_4378_test.go,
   pkg/daemon/commit_confirm_demote_4378_test.go,
   docs/ha-cluster-test-plan.md, _Log.md
+## 2026-07-06 — #4386 cold-boot split-brain: never-seen heartbeat startup floor
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed the cluster heartbeat "peer never seen" path promoting after
+  only threshold*interval (~500ms), which skipped the 30s config-apply grace and
+  caused dual-primary on a simultaneous cold boot. The config apply phase (FRR
+  reload, fabric creation, RETH MAC down/up) disrupts control-link RX for 10-15s,
+  so first heartbeats drop and lastSeen stays 0 on BOTH nodes → both promoted and
+  claimed the RETH virtual MAC. Extracted the per-tick evaluation into a testable
+  `heartbeatReceiver.checkTimeout` seam, added the shared `heartbeatStartupGrace`
+  (30s) const (reused for both the seen-then-lost grace and the never-seen floor),
+  and gated the never-seen promotion behind `neverSeenConfirmed(sinceStart,
+  grace)`. A genuinely-absent peer still promotes once the grace elapses (floor
+  delays, never blocks) so single-node deployments are unaffected. RED-on-revert:
+  restoring the old `> timeout` check promotes a never-seen peer at 5s (mid
+  config-apply window) → the within-grace test fails. go test ./pkg/cluster/...
+  green (incl -race), go build/vet/gofmt clean.
+  **File(s)**: pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_neverseen_floor_test.go, pkg/cluster/README.md, _Log.md
+## 2026-07-06 — #4376: VRRP dual-stack equal-priority tie-break family-consistency
+
+- **Timestamp**: 2026-07-06 16:53 PDT
+- **Action**: Fixed the dual-stack VRRP equal-priority tie-break split. The old
+  `handleMasterRx` tie-break keyed off the ARRIVING advert's family (v4 advert
+  vs `getLocalIP`, v6 advert vs `getLocalIPv6` link-local). A single instance is
+  dual-stack (`CollectRethInstances` puts v4+v6 on one instance; `sendAdvert`
+  emits BOTH a v4 and a v6 advert from unrelated sources), so two equal-priority
+  nodes with DISAGREEING v4-vs-v6 orderings each stepped down on the other
+  family's advert → both BACKUP → both masterDown timers expire → both MASTER →
+  permanent no-master oscillation (RG outage, #4376). Replaced the inline
+  branch with `resolveEqualPriorityMaster`, which anchors the tie-break to ONE
+  family via `hasIPv4VIP()` (classified from the immutable configured VIP set):
+  a v4-bearing (dual-stack or v4-only) instance decides ONLY off v4 adverts and
+  ignores v6-family adverts; a v6-only instance decides off the link-local v6
+  advert — both nodes then compare the same pair. Also fixed the secondary
+  defect: a nil (unresolved) local source now YIELDS (`becomeBackup`) instead of
+  defaulting to stay-MASTER (the old "treat unresolved as we-win"); no
+  oscillation because a node that cannot resolve its source cannot put a valid
+  same-family advert on the wire. Added 4 unit tests (3 RED on revert to the
+  family-split code, verified). Updated `pkg/vrrp/README.md` with a new
+  "Equal-priority tie-break — dual-stack family-consistency (#4376)" section.
+  HA VRRP state-machine change — parent runs `make test-failover` before merge.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/vrrp_test.go, pkg/vrrp/README.md,
+  _Log.md
 
 ## 2026-07-06 — #4228 Gap 2: resolve CoS transmit-rate / shaping-rate percent
 
@@ -37305,3 +37349,36 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
   userspace-dp/src/afxdp/README.md, docs/generated-reply-rate-limit.md,
   _Log.md
+
+## 2026-07-06 — #4377: session limit-session per-IP cap enable-transition back-count
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix the per-IP `limit-session` cap-bypass on the OFF->ON enable
+  edge (opus-171 H-1). The install increment and the sole-sink `remove_entry`
+  decrement share the origin-agnostic counted-class predicate
+  (`!is_reverse && !origin.is_transient_local_seed()`) but keep no per-entry
+  record of whether an entry was actually charged; each is gated only on
+  `session_limit_active` at the moment of the op. `set_session_limit_active`
+  cleared both count maps on ON->OFF but did NOTHING on OFF->ON, so a forward
+  session installed while the gate was OFF (or after a disable cleared the
+  maps) was uncounted, yet its teardown while ON still decremented — an
+  increment-less decrement that drives `count[X]` below the live counted count;
+  `saturating_sub` + evict-at-0 hide the underflow, so `count[X]` can reach 0
+  while sessions are live and X gets a fresh full allotment (cap bypass). Fix:
+  back-count-on-enable — on the OFF->ON edge walk the live slab via
+  `key_to_handle` (matching `iter_with_origin`) and increment the per-IP maps
+  for every counted-class entry, using the SAME predicate as the sinks so #3122
+  peer-SYNCED sessions are back-counted exactly as their teardown will
+  decrement. O(N) once per rare enable, no per-entry memory. Corrected the
+  mod.rs doc that called not-back-counting "benign" (wrong for the decrement
+  side). New RED-on-revert test
+  `session_limit_backcount_on_enable_covers_preexisting_sessions` (install N
+  while INACTIVE + 1 synced import -> enable -> src count == N+1 incl. synced;
+  new install caps; teardown of pre-existing decrements a real increment; count
+  never below live) and updated `session_limit_clear_on_disable` (re-enable
+  back-counts the 3 live sessions -> 3, then 4). Both RED with the back-count
+  disabled. Full cargo serial: session:: subset 149 passed / 0 failed; overall
+  3629 + 54 + 8 + 22 + 1 = 3714 passed / 0 failed, 2 ignored.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  docs/pr/2134-screen-session-limit-enforce/self-review.md, _Log.md

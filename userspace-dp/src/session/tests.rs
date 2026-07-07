@@ -5289,8 +5289,20 @@ fn session_limit_clear_on_disable() {
     assert_eq!(table.session_limit_src_map_len(), 0, "src map must clear on disable");
     assert_eq!(table.session_limit_dst_map_len(), 0, "dst map must clear on disable");
 
-    // Re-enable: a fresh flow starts the count from 0 (not stale 3).
+    // #4377 back-count-on-enable: the 3 sessions are STILL live, so
+    // re-enabling must REBUILD the maps from them — count == 3, NOT the
+    // old (buggy) "restart from 0". Clear-on-disable + back-count-on-enable
+    // is idempotent: if clear-on-disable were omitted, the re-enable walk
+    // would double-count to 6, so this still guards clear-on-disable.
     table.set_session_limit_active(true);
+    assert_eq!(
+        table.session_limit_src_count(src),
+        3,
+        "re-enable must back-count the 3 live sessions, not restart from 0"
+    );
+
+    // A fresh flow from the same IP adds to the back-counted total — the
+    // cap now sees the true live count instead of a fresh empty allotment.
     let key = SessionKey {
         src_ip: src,
         src_port: 52999,
@@ -5307,8 +5319,152 @@ fn session_limit_clear_on_disable() {
     ));
     assert_eq!(
         table.session_limit_src_count(src),
+        4,
+        "new install must add to the back-counted 3, not to a stale 0"
+    );
+}
+
+/// #4377 FAIL-ON-REVERT: the per-IP session-limit maps must be REBUILT
+/// on the OFF->ON enable edge from the live slab, so a session installed
+/// while the gate was INACTIVE is counted the moment the gate turns on —
+/// its later teardown decrements a real increment instead of driving the
+/// count below the live counted-session count (the #4377 cap bypass).
+///
+/// REVERT SIGNATURE: without the back-count, re-enable restarts the count
+/// at 0; the pre-existing sessions' teardown then saturating_sub's below
+/// 0 (hidden as 0) while sessions are still live, and the IP is handed a
+/// fresh full allotment — a cap bypass. This test drives that exact path
+/// and asserts the corrected counts at every step. It FAILS (the first
+/// count assertion sees 0, not N) if `set_session_limit_active`'s
+/// OFF->ON back-count is reverted.
+#[test]
+fn session_limit_backcount_on_enable_covers_preexisting_sessions() {
+    let mut table = SessionTable::new();
+    // Gate starts OFF (default). Install N forward sessions from one IP
+    // while INACTIVE — none are counted (the OFF-gate skips the increment).
+    let n = 4u32;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40));
+    let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 40));
+    let now = 1_000_000_000u64;
+    let mut keys: Vec<SessionKey> = Vec::new();
+    for i in 0..n {
+        let key = SessionKey {
+            src_ip: src,
+            dst_ip: dst,
+            src_port: 54000 + i as u16,
+            ..limit_key(40, 40, 0)
+        };
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            metadata(),
+            SessionOrigin::ForwardFlow,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        keys.push(key);
+    }
+    // #3122 invariant: also import ONE peer-synced session from the same
+    // src IP (different dst so we can watch src back-count include it).
+    let synced_dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 41));
+    let synced_key = SessionKey {
+        src_ip: src,
+        dst_ip: synced_dst,
+        src_port: 54900,
+        ..limit_key(40, 41, 0)
+    };
+    let mut synced_meta = metadata();
+    synced_meta.owner_rg_id = 1;
+    let _ = table.upsert_synced_with_origin(
+        SessionInstall {
+            key: synced_key.clone(),
+            decision: decision(),
+            metadata: synced_meta,
+            origin: SessionOrigin::SyncImport,
+            now_ns: now,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        },
+        false,
+    );
+    // Gate OFF: nothing counted yet (the maps are empty).
+    assert_eq!(table.session_limit_src_count(src), 0, "OFF: no count maintained");
+    assert_eq!(table.session_limit_src_map_len(), 0);
+
+    // OFF->ON edge: back-count. src has N local + 1 synced = N+1 live
+    // counted sessions; both dst IPs get their own counted entries. The
+    // #3122 synced session MUST be included (origin-agnostic predicate).
+    table.set_session_limit_active(true);
+    assert_eq!(
+        table.session_limit_src_count(src),
+        n + 1,
+        "OFF->ON must back-count all live counted sessions incl. the #3122 synced import"
+    );
+    assert_eq!(
+        table.session_limit_dst_count(dst),
+        n,
+        "dst back-count must equal the N forward sessions to that dst"
+    );
+    assert_eq!(
+        table.session_limit_dst_count(synced_dst),
         1,
-        "re-enable must start from 0, not the stale pre-disable count"
+        "the #3122 synced session's dst must be back-counted too"
+    );
+
+    // Enforcement is now correct: a new flow from src sees the true live
+    // count (N+1), not a fresh 0 allotment.
+    let over_key = SessionKey {
+        src_ip: src,
+        dst_ip: dst,
+        src_port: 54990,
+        ..limit_key(40, 40, 0)
+    };
+    assert!(table.install_with_protocol_with_origin(
+        over_key,
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        now + 1_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(
+        table.session_limit_src_count(src),
+        n + 2,
+        "new install adds to the back-counted total"
+    );
+
+    // Teardown of a PRE-EXISTING (installed-while-off) session decrements
+    // from the back-counted total — it never drives the count below the
+    // live counted-session count. Delete all N pre-existing forward
+    // sessions one at a time and watch the count step down correctly.
+    let mut expected = n + 2; // (N back-counted forward) + 1 synced + 1 new install
+    for key in &keys {
+        table.delete(key);
+        expected -= 1;
+        assert_eq!(
+            table.session_limit_src_count(src),
+            expected,
+            "teardown of a pre-existing session must decrement a real increment"
+        );
+    }
+    // After draining the N pre-existing forward sessions, src still has
+    // the 1 synced + 1 new-install = 2 live counted sessions.
+    assert_eq!(table.session_limit_src_count(src), 2);
+
+    // The invariant the whole fix defends: the per-IP count equals the
+    // number of live counted entries for that IP — never below it.
+    let mut live_src = 0u32;
+    table.iter_with_origin(|k, _d, md, origin| {
+        if k.src_ip == src && !md.is_reverse && !origin.is_transient_local_seed() {
+            live_src += 1;
+        }
+    });
+    assert_eq!(
+        table.session_limit_src_count(src),
+        live_src,
+        "count must equal live counted entries — never dropped below (the #4377 bypass)"
     );
 }
 

@@ -43,10 +43,13 @@ choke point every create/remove already passes through.
   The new-flow check fires once per new flow, before its session exists,
   via a non-mutating query, and emits the `session-limit-{src,dst}`
   screen-drop event + counter.
-- **OFF-gate + clear-on-disable**: `set_session_limit_active` driven from
-  the applied screen-profile snapshot (startup + runtime reload). OFF =
-  zero maintenance cost. ON→OFF clears the maps so a re-enable can't
-  resume from stale over-counted values (reviewer-B r2 MAJOR).
+- **OFF-gate + clear-on-disable + back-count-on-enable**:
+  `set_session_limit_active` driven from the applied screen-profile
+  snapshot (startup + runtime reload). OFF = zero maintenance cost. ON→OFF
+  clears the maps so a re-enable can't resume from stale over-counted
+  values (reviewer-B r2 MAJOR). OFF→ON (#4377) REBUILDS the maps from the
+  live slab so every pre-existing counted session is charged before its
+  teardown can decrement — see "back-count-on-enable" below.
 
 ## Hot-path shape
 
@@ -105,9 +108,35 @@ drop was rewritten to prove the same property via the port-scan check
 
 - Per-worker scoping (worst-case N×limit dilution when one IP spreads
   across N RX queues) — pre-existing, same under the eBPF per-CPU map.
-- OFF→ON re-enable does not back-count pre-existing live sessions —
-  benign, Junos-approximate (documented in `session/README.md`).
 - Global per-IP (not per-zone-per-IP) — matches Junos per-IP counting.
+
+### back-count-on-enable (#4377)
+
+The original design left OFF→ON re-enable NOT back-counting pre-existing
+live sessions, described as "benign, Junos-approximate". That was WRONG
+for the DECREMENT side and was fixed in #4377. The increment (install)
+and decrement (`remove_entry`, the sole removal sink) use the same
+origin-agnostic presence predicate but keep no per-entry record of
+whether the entry was actually counted — they are gated only on
+`session_limit_active` at the moment of the op. A session installed while
+the gate was OFF (or after a disable cleared the maps) is uncounted, but
+its teardown while ON still decrements. That increment-less decrement
+drives `count[X]` below the live counted-session count; `saturating_sub` +
+evict-at-0 hide the underflow, so `count[X]` can reach 0 while sessions
+are live and X is handed a fresh full allotment — a cap bypass on the
+enable edge (and on any disable→enable toggle). Only a runtime enable on
+an already-forwarding box is exposed, and it self-heals once the
+pre-existing uncounted sessions drain, but the exposure is real.
+
+Fix: `set_session_limit_active` walks the live slab on the OFF→ON edge
+(via `key_to_handle`, matching `iter_with_origin`) and increments the
+per-IP maps for every counted-class entry
+(`!is_reverse && !origin.is_transient_local_seed()`). The predicate is
+identical to the install/decrement sinks, so the back-count includes
+#3122 peer-SYNCED sessions exactly as their teardown will decrement them.
+O(N) once per rare enable, no per-entry memory cost. Regression:
+`session_limit_backcount_on_enable_covers_preexisting_sessions` (+ the
+updated `session_limit_clear_on_disable`).
 
 ## Validation
 
