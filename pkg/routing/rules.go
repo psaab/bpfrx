@@ -65,8 +65,10 @@ const mainTableID = 254
 // pbrRulePriority is the base priority for policy-based routing ip rules.
 // BEFORE the main table (32766) so the kernel also honors PBR for XDP_PASS'd
 // packets (e.g. SNAT'd traffic destined for a VRF/GRE tunnel).
-// We use 31000-31999 range.
-const pbrRulePriority = 31000
+// We use 31000-31999 range. The band constant is the SSOT in pkg/config so
+// the userspace FIB snapshot ingest (pkg/dataplane/userspace/routes.go) can
+// skip this same band without drifting from the install side (#4479).
+const pbrRulePriority = config.PBRRulePriorityBase
 
 // nextTableManager reconciles next-table inter-VRF route-leak ip rules.
 // Stateless apart from the borrowed ruleOps; it reconciles against live
@@ -504,8 +506,10 @@ func (r *PBRPortRange) String() string {
 // install, matching the pbrRulePriority window (clear() scans
 // [pbrRulePriority, pbrRulePriority+1000)). A larger DSCP×src×dst expansion
 // is truncated and reported as a degraded build (#3430 M3) rather than
-// silently dropping later terms' steering.
-const maxPBRRules = 1000
+// silently dropping later terms' steering. Window size is the SSOT in
+// pkg/config (PBRRuleWindow) so the install cap and the userspace snapshot
+// skip band cannot drift (#4479).
+const maxPBRRules = config.PBRRuleWindow
 
 // pbrManager reconciles policy-based routing ip rules. Stateless apart
 // from the borrowed ruleOps.

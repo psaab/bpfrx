@@ -102,6 +102,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	s.candidate = s.active.Clone()
 	s.compiled = compiled
 	s.dirty = false
+	s.touchConfigLockLocked() // #4476: a commit is activity — refresh the lease
 
 	// #3861: a PLAIN commit during a pending commit-confirmed window is
 	// the confirmation (Junos semantics: any subsequent explicit commit
@@ -250,6 +251,7 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.candidate = s.active.Clone()
 	s.compiled = compiled
 	s.dirty = false
+	s.touchConfigLockLocked() // #4476: a commit is activity — refresh the lease
 
 	// Log to journal
 	s.journalLog(&JournalEntry{
@@ -507,6 +509,7 @@ func (s *Store) Rollback(n int) error {
 	if s.candidate == nil {
 		return fmt.Errorf("not in configuration mode")
 	}
+	s.touchConfigLockLocked() // #4476: a rollback is activity — refresh the lease
 
 	if n == 0 {
 		s.candidate = s.active.Clone()

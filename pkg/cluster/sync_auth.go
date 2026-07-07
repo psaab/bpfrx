@@ -77,7 +77,14 @@ const (
 	// peer drops the connection; fabricConnectLoop retries after ~1s, so a
 	// transient handshake failure only delays reconnect — it never bricks
 	// (dual-accept keeps a rolling upgrade alive without the handshake).
-	syncHandshakeTimeout = 10 * time.Second
+	//
+	// The keyed↔keyed challenge-response completes in milliseconds when both
+	// nodes are up; this bound only covers a hung or absent peer. It is kept
+	// short (#4370) because the accepting node runs the handshake per inbound
+	// connection — a longer bound lets a stalled connection tie up a handshake
+	// goroutine (and, on Stop, keep it inside the 5s shutdown budget). 3s is
+	// ample headroom over the sub-millisecond keyed path.
+	syncHandshakeTimeout = 3 * time.Second
 )
 
 // Domain-separation tags — bound into every HMAC so a value produced for one

@@ -289,6 +289,53 @@ holder still blocks other sessions (`EnterConfigure*` rejects with
 cannot steal the lock. `ForceExitConfigure` (`clear system config-lock`)
 remains the unconditional operator override.
 
+### Config lock: idle-lease reaper (#4476)
+
+The gRPC config path auto-releases the lock when a client disconnects
+(`configLockInterceptor` in `pkg/grpcapi/server.go` calls
+`ExitConfigureSession` once `ctx.Err() != nil`). The **REST** config
+path has no such hook: `POST /api/v1/config/enter`
+(`configEnterHandler`) takes the global lock with an empty holder, and a
+stateless HTTP client that never calls `/config/exit` leaves it held. On
+its own that wedged every CLI/gRPC/REST config edit with `ErrConfigLocked`
+until `clear system config-lock` or a daemon restart — a management-plane
+config-edit DoS.
+
+`configLockAt` (recorded at acquire) now backs an **idle-lease reaper**:
+
+- **Refresh on activity** — every config mutation calls
+  `touchConfigLockLocked()` (`store_lock.go`), which stamps
+  `configLockAt = now` while `configDir` is set. Both transports funnel
+  edits through the store's mutating methods (`Set`/`Delete`/`Deactivate`/
+  `Activate`/`Copy`/`Rename`/`Insert`/`Annotate`/`Load*` in
+  `store_command.go`; `Commit`/`CommitConfirmed`/`Rollback` in
+  `store_commit.go`), and same-session re-entry refreshes too. Reads
+  (`show`/status polls) deliberately do **not** refresh, so a lock whose
+  holder stops editing ages out. The internal HA-sync ingress
+  (`SyncApply`) and the commit-confirmed timeout revert
+  (`PromoteRollback`) are timer/peer paths, not user activity, and do not
+  refresh.
+- **Reclaim on acquire** — `EnterConfigureSession` /
+  `EnterConfigureExclusive` call `reclaimStaleLockLocked()` before
+  rejecting a would-be entrant. It releases the current lock (mirroring
+  `ForceExitConfigure`'s teardown, including `exclusiveHolder` /
+  `editPath`) **only** when `time.Since(configLockAt) >=
+  configLockLeaseTTL`, then the caller enters cleanly. A stale lock is
+  therefore reclaimed exactly when another session needs it — the only
+  moment a stuck lock causes harm — so no background goroutine is
+  required.
+
+`configLockLeaseTTL` defaults to **10 minutes**: long enough that an
+operator hand-composing a change (each `set`/`delete` refreshes the
+lease) is never reclaimed mid-edit, short enough to bound a wedged REST
+lock. An actively-edited lock is never stolen; only a genuinely-idle one
+is. The tests in `store_lock_lease_4476_test.go` cover both directions
+(stale lock reclaimed, active/refreshed lock preserved) and are the
+RED-on-revert guard. Note that recovery still surfaces the lock while it
+is stale — a companion REST clear-config-lock action (L-1 / #4484) would
+let a REST operator release it explicitly without waiting for the next
+entrant; that is tracked separately.
+
 ### Cluster read-only gate (#3893)
 
 On an HA chassis cluster the RG0 primary is the sole config authority;

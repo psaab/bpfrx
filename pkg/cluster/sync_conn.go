@@ -1191,7 +1191,24 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener, fabricIdx
 			}
 		}
 		slog.Info("cluster sync: peer connected", "remote", conn.RemoteAddr(), "fabric", fabricIdx)
-		s.handleNewConnection(ctx, fabricIdx, conn)
+		// #4370: run connection setup (the auth handshake + wire-up + cold-start
+		// bulk sync inside handleNewConnection) in a per-connection goroutine so
+		// a slow or hung handshake on ONE connection cannot stall accepting the
+		// NEXT for up to syncHandshakeTimeout. An active control-link attacker
+		// could otherwise open connections that each serially block the accept
+		// loop for the full handshake bound. The auth gate is preserved because
+		// the connection is not wired into conn0/conn1 (and no session frame is
+		// read from it) until performSyncHandshake succeeds INSIDE the goroutine;
+		// a failed handshake closes the connection and returns. The goroutine is
+		// tracked by s.wg (this loop already holds a wg token, so Add is safe)
+		// so Stop() waits for in-flight setup. The outbound fabricConnectLoop
+		// stays synchronous — it is a dedicated per-fabric dialer that must not
+		// redial while a connection is being handled.
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleNewConnection(ctx, fabricIdx, conn)
+		}()
 	}
 }
 
@@ -1493,6 +1510,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			s.pendingBulkAckSince.Store(0)
 		}
 		s.bulkEverCompleted.Store(true)
+		// #4360: the peer acked OUR outbound bulk — record it on the
+		// outbound-only flag so a stranded outbound bulk can be re-driven on a
+		// survivor fabric independently of whether an inbound bulk (which also
+		// sets bulkEverCompleted at syncMsgBulkEnd) completed first.
+		s.outboundBulkAcked.Store(true)
 		if s.OnBulkSyncAckReceived != nil {
 			go s.OnBulkSyncAckReceived()
 		}
@@ -1784,7 +1806,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()
 		}
-	} else if !s.bulkEverCompleted.Load() {
+	} else if !s.outboundBulkAcked.Load() {
 		// #4090: a survivor fabric is still up but the cold-start bulk
 		// never completed. The bulk streams over a SINGLE connection
 		// (BulkSync/sendBulkMarkers pin s.getActiveConn once); if that
@@ -1792,6 +1814,13 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// retried on the survivor and handleNewConnection will not
 		// re-trigger it (its wasDisconnected gate needs BOTH fabrics to
 		// have dropped). Re-drive doBulkSync over the survivor.
+		//
+		// #4360: this gates on outboundBulkAcked, NOT bulkEverCompleted.
+		// The re-drive's job is to get OUR outbound bulk to the peer; a
+		// small INBOUND bulk (peer->us) completing first sets
+		// bulkEverCompleted but says nothing about whether the peer
+		// received our table, so keying on the shared flag would wrongly
+		// suppress the re-drive of a stranded outbound bulk.
 		//
 		// This MUST be a goroutine, not inline: handleDisconnect holds
 		// s.mu, and doBulkSync -> BulkSync/sendBulkMarkers -> getActiveConn
@@ -1808,7 +1837,11 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 				defer s.bulkRedriveInFlight.Store(false)
 				// A concurrent reconnect (both-fabric drop then reconnect)
 				// may have already re-primed via handleNewConnection.
-				if s.bulkEverCompleted.Load() {
+				// #4360: re-check the SAME outbound-only flag the gate above
+				// used — bulkEverCompleted may be true from an inbound bulk
+				// while our outbound bulk is still un-acked, and bailing on
+				// it here would make the fix inert.
+				if s.outboundBulkAcked.Load() {
 					return
 				}
 				// Reset the stranded pending-ack epoch so the re-run's fresh

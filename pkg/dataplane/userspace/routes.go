@@ -167,6 +167,28 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 			if rule.Dst == nil || rule.Table <= 0 {
 				continue
 			}
+			// #4479 (opus-172 M-2): SKIP policy-based-routing / filter-based-
+			// forwarding rules. xpf installs FBF `then routing-instance`
+			// filter actions as ip rules in the PBR priority band
+			// (config.PBRRulePriorityBase, 31000-31999; pkg/routing
+			// pbrRulePriority) that carry match SELECTORS — source/dest
+			// address, DSCP, protocol, source/dest port — IN ADDITION to a
+			// Dst that happens to point at a routing-instance table. This
+			// synthetic snapshot can only express a bare per-prefix NextTable
+			// leak, so ingesting a PBR rule here would DROP every selector and
+			// widen a constrained, source-scoped steer into an unconditional
+			// dst-only VRF leak — the exact fail-open the kernel FBF path was
+			// hardened against in #3730. Fail CLOSED instead: leave the PBR
+			// rule out of the userspace FIB entirely. The kernel still applies
+			// the real, fully-qualified PBR rule (and the userspace filter
+			// path enforces the term), so the leak is not lost — it just is
+			// not wrongly widened. Only xpf's own pure per-prefix leak bands
+			// (next-table 100-199, rib-group per-prefix import 30000-30999)
+			// carry a Dst with no selectors and are safe to mirror below.
+			if rule.Priority >= config.PBRRulePriorityBase &&
+				rule.Priority < config.PBRRulePriorityBase+config.PBRRuleWindow {
+				continue
+			}
 			instName, ok := tableIDToInst[rule.Table]
 			if !ok {
 				continue

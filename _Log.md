@@ -39,6 +39,89 @@
   pkg/config/apply_groups_transitive_4474_test.go, docs/config-schema.md,
   _Log.md
 
+## 2026-07-07 — #4479 routing: skip PBR/FBF band in userspace FIB snapshot ingest
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed opus-172 M-2 (fail-open-adjacent). The userspace route
+  snapshot builder (`buildRouteSnapshots`) mirrors kernel ip rules whose Dst
+  maps to a routing-instance table into per-prefix `next-table` leaks so the
+  userspace FIB can cross-reference VRF tables. It applied NO priority filter,
+  so a policy-based-routing / filter-based-forwarding (FBF) rule in the PBR
+  band (31000-31999) — which carries Src/Tos/IPProto/Sport/Dport SELECTORS in
+  addition to a Dst — was ingested as a BARE dst-only NextTable leak, dropping
+  every selector and widening a constrained, source-scoped steer into an
+  unconditional VRF leak (the userspace twin of the #3730 kernel over-steer).
+  Added a PBR-band skip in the ingest loop: rules in
+  `[config.PBRRulePriorityBase, +config.PBRRuleWindow)` are left out of the
+  userspace FIB (fail-CLOSED — the kernel still applies the real,
+  fully-qualified PBR rule; the snapshot just does not wrongly widen it). The
+  next-table (100-199, priority 0 in tests) and rib-group per-prefix import
+  (30000-30999) leak bands carry a pure per-prefix Dst with no selectors and
+  are still ingested — no regression to inter-VRF leaking. Moved the PBR band
+  constants to `pkg/config` (`PBRRulePriorityBase`, `PBRRuleWindow`) as the
+  SSOT so the install cap (`pkg/routing` `pbrRulePriority`/`maxPBRRules`) and
+  the snapshot skip cannot drift.
+- **Validation**: RED-on-revert test `TestBuildRouteSnapshotsSkipsPBRBandRule`
+  (PBR-band rule with Src+Sport+Dst NOT ingested — fails RED when the skip is
+  removed) plus no-regression `TestBuildRouteSnapshotsIngestsRouteLeakBandRule`
+  (next-table-band rule still ingested — stays green on revert). Existing
+  #3768 / #3876 ingest tests still pass. `go test ./pkg/routing/...
+  ./pkg/dataplane/userspace/... ./pkg/config/...` green; `go build ./...`;
+  gofmt + vet clean.
+- **File(s)**: `pkg/dataplane/userspace/routes.go` (PBR-band skip in the
+  ip-rule ingest loop), `pkg/config/types_system.go` (`PBRRulePriorityBase` /
+  `PBRRuleWindow` SSOT constants), `pkg/routing/rules.go` (`pbrRulePriority` /
+  `maxPBRRules` aliased to the config SSOT),
+  `pkg/dataplane/userspace/routes_pbr_priority_4479_test.go` (new RED-on-revert
+  + no-regression tests), `pkg/routing/README.md` (userspace-snapshot skip note
+  under the PBR band bullet).
+## 2026-07-07 — #4476 configstore: idle-lease reaper for the config lock
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed opus-172 H-3, a management-plane config-edit DoS. The REST
+  config-enter path (`POST /api/v1/config/enter` -> `EnterConfigure`, empty
+  holder) has no disconnect hook — unlike the gRPC `configLockInterceptor` — so
+  a stateless HTTP client that never called `/config/exit` wedged the global
+  config lock, and every CLI/gRPC/REST edit returned `ErrConfigLocked` until
+  `clear system config-lock` or a daemon restart. `configLockAt` was recorded
+  at acquire but read only by a log line — no reaper. Added an idle-lease
+  reaper: `configLockLeaseTTL` (10 min) + `reclaimStaleLockLocked()` (check-on-
+  acquire reclaim in `EnterConfigureSession`/`EnterConfigureExclusive`, gated on
+  `time.Since(configLockAt) >= TTL`) + `touchConfigLockLocked()` (refresh-on-
+  activity, stamped by every mutating store method and same-session re-entry).
+  An actively-edited lock refreshes its lease and is never reclaimed; only a
+  genuinely-idle lock is reclaimed, exactly when another session needs it (no
+  background goroutine). Internal `SyncApply` / `PromoteRollback` paths do not
+  refresh (not user activity). Noted L-1/#4484 (REST clear-config-lock) as a
+  companion, not implemented here.
+- **File(s)**: `pkg/configstore/store_lock.go` (TTL var + reaper/refresh helpers
+  + reclaim wiring in both Enter* methods), `pkg/configstore/store_command.go`
+  (touch in Set/Delete/Deactivate/Activate/Copy/Rename/Insert/Annotate/Load*),
+  `pkg/configstore/store_commit.go` (touch in Commit/CommitConfirmed/Rollback),
+  `pkg/configstore/store_lock_lease_4476_test.go` (RED-on-revert: stale
+  reclaimed, active/refreshed preserved, exclusive stale reclaimed, re-entry
+  refreshes), `pkg/configstore/README.md` (idle-lease reaper section).
+
+## 2026-07-07 — #4362 wg: drain cookie_gen on peer removal in reconcile_peers
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the #4094-PR-B follow-up leak. `WgEngine::reconcile_peers`
+  drained a removed peer's `sessions_by_local_index` demux entries and its
+  `pending`/`pending_by_peer` handshake reservations, but NOT `cookie_gen`
+  (the per-peer initiator-cookie state, keyed by peer pubkey and living
+  OUTSIDE the atomically-swapped `PeerTable`). A removed peer therefore left
+  a stale `InitiatorCookie` (~56 bytes) unreachable but resident until process
+  restart. Added a `cookie_gen.lock()` drain block over the removed pubkeys
+  right after the `pending`/`pending_by_peer` block (same removed-peer test:
+  `old.peer_index_by_pubkey.keys()` minus `new_index`). Verified `cookie_gen`
+  is the ONLY per-pubkey engine side-map not already drained on removal
+  (`peer_index_by_pubkey` is rebuilt wholesale in the new table;
+  `CookieChecker.buckets` is keyed by source `IpAddr` and self-ages).
+- **File(s)**: `userspace-dp/src/afxdp/wg/engine.rs` (drain block + reconcile
+  doc-comment), `userspace-dp/src/afxdp/wg/engine_tests.rs` (RED-on-revert
+  `reconcile_peers_drains_dropped_peer_cookie_gen`), `docs/wireguard-interop.md`
+  (PR-B lifecycle/peer-removal note).
+
 ## 2026-07-07 — #4407 Phase A: group tail reconcile dispatches (steps 8–21)
 
 - **Timestamp**: 2026-07-07
@@ -38939,3 +39022,50 @@ top.
 - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_prewalk.go,
   pkg/config/compile_golden_4406_test.go,
   pkg/config/testdata/golden_4406.json, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4370 — the session-sync auth handshake ran SYNCHRONOUSLY in
+  the inbound accept loop (`acceptLoop` → `handleNewConnection` →
+  `performSyncHandshake`), so a slow/hung handshake on ONE connection stalled
+  accepting the NEXT for up to `syncHandshakeTimeout` (an active control-link
+  peer could serially block accepts). TWO fixes: (1) shortened
+  `syncHandshakeTimeout` 10s→3s (the keyed↔keyed challenge-response is
+  sub-millisecond; 3s only bounds a hung/absent peer and keeps a stalled
+  handshake goroutine inside the 5s `Stop` budget); (2) moved connection setup
+  off the accept loop — `acceptLoop` now runs `handleNewConnection` in a
+  per-connection, `s.wg`-tracked goroutine, so a stalled handshake no longer
+  blocks accepting OTHERS. Auth gate preserved: the conn is not wired into
+  `conn0`/`conn1` and no session frame is read until `performSyncHandshake`
+  succeeds INSIDE the goroutine; a failed handshake closes it. The outbound
+  `fabricConnectLoop` stays synchronous (dedicated per-fabric dialer).
+  Concurrent setup is safe: `conn0`/`conn1` assignment is `s.mu`-guarded with
+  close-old semantics, `doBulkSync` serializes via `bulkSendMu`. Tests:
+  `TestAcceptLoopHandshakeDoesNotBlockOthers` (A stalls after reading the
+  server HELLO, B must still receive its HELLO within ms — RED on revert: B's
+  read times out because the loop is parked on A) and
+  `TestSyncHandshakeTimeoutIsShort` (pins the [1s,3s] bound — RED on revert to
+  10s). Both RED-on-revert verified. `go build ./...`, `go vet ./pkg/cluster/`,
+  gofmt clean; `go test ./pkg/cluster/ -race` green.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_auth.go,
+  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
+- **Action**: #4360 — HA session-sync survivor-fabric re-drive gate keyed on
+  the SHARED `bulkEverCompleted` flag. That flag is set by EITHER an inbound
+  `BulkEnd` (peer->us) OR an outbound `BulkAck` (us->peer), so a small inbound
+  bulk completing first suppressed re-driving a stranded OUTBOUND bulk: the
+  peer kept an incomplete view of our sessions. Added a dedicated
+  `outboundBulkAcked atomic.Bool` set ONLY in the `syncMsgBulkAck` path
+  (pkg/cluster/sync_conn.go) and re-pointed BOTH the `handleDisconnect`
+  re-drive gate and its in-goroutine re-check from `bulkEverCompleted` to
+  `outboundBulkAcked` (the inner re-check MUST also flip, else it bails on a
+  set `bulkEverCompleted` and the fix is inert). The `coldStart` gate in
+  `handleNewConnection` is intentionally left on `bulkEverCompleted` (a
+  both-fabrics-down reconnect is a separate path). `outboundBulkAcked` is
+  sticky (never reset), matching `bulkEverCompleted`. Added RED-on-revert test
+  `TestBulkSyncRedriveWhenOnlyInboundCompleted` (inbound-completes-first +
+  single-fabric drop must still re-drive) and updated
+  `TestBulkSyncNoRedriveWhenAlreadyCompleted` to set `outboundBulkAcked`.
+  Verified: new test FAILS with the gate reverted to `bulkEverCompleted`,
+  passes with the fix; `go test ./pkg/cluster/... -race` green; go build +
+  vet + gofmt clean. Doc: docs/sync-protocol.md #4090 re-drive section.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync_test.go, docs/sync-protocol.md, _Log.md
