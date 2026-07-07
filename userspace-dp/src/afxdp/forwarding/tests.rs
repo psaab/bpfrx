@@ -1986,6 +1986,112 @@ fn bare_rst_fin_session_miss_does_not_cache_local_delivery() {
     ));
 }
 
+/// #4539 (gate-consistency hardening; subsumes #2151 + #4487): the
+/// LocalDelivery session-MISS cache gate must seed a host-local TCP session
+/// ONLY off the handshake. A `has_syn` positive predicate now replaces the two
+/// prior narrow decline-gates, closing the residual where a NON-handshake,
+/// non-ACK, non-closing first packet — pure PSH (0x08), a null segment (0x00),
+/// pure URG (0x20), an ECE-only (0x40) or CWR-only (0x80) segment — fell
+/// through to the default `true` and seeded a 300s host-local session. RED on
+/// revert: with the old two-gate form these anomalous first packets assert
+/// `true` (cached). The fix is TCP-only: non-TCP (UDP/ICMP) LocalDelivery still
+/// caches unconditionally.
+#[test]
+fn non_handshake_tcp_session_miss_does_not_cache_local_delivery() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let target = "172.16.80.8";
+    let resolvers: [ForwardingResolution; 2] = [
+        interface_nat_local_resolution_on_session_miss(
+            &state,
+            target.parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp nat local delivery"),
+        ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            target.parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp ingress local delivery"),
+    ];
+    for resolution in resolvers {
+        // The #4539 residual: non-handshake anomalous / crafted first packets
+        // that are neither ACK-set (#2151) nor closing (#4487). Each must now
+        // be DECLINED. RED on revert (old default-`true` cached them).
+        for (flags, label) in [
+            (0x08u8, "pure PSH"),
+            (0x00u8, "null segment"),
+            (0x20u8, "pure URG"),
+            (0x40u8, "ECE-only"),
+            (0x80u8, "CWR-only"),
+            (0x28u8, "PSH|URG"),
+        ] {
+            assert!(
+                !should_cache_local_delivery_session_on_miss(
+                    &state,
+                    target.parse().expect("v4"),
+                    resolution,
+                    PROTO_TCP,
+                    flags,
+                ),
+                "non-handshake first packet ({label}, 0x{flags:02x}) must not seed a host-local session"
+            );
+        }
+        // PRESERVED: SYN (0x02), SYN|ACK (0x12), and a data-carrying SYN|PSH
+        // (0x0a) still cache — a legitimate handshake open is unaffected.
+        for (flags, label) in [(0x02u8, "SYN"), (0x12u8, "SYN|ACK"), (0x0au8, "SYN|PSH")] {
+            assert!(
+                should_cache_local_delivery_session_on_miss(
+                    &state,
+                    target.parse().expect("v4"),
+                    resolution,
+                    PROTO_TCP,
+                    flags,
+                ),
+                "a handshake first packet ({label}, 0x{flags:02x}) must still seed a session"
+            );
+        }
+        // SUBSUMED: the #2151 bare-ACK and #4487 bare-RST/FIN declines still
+        // decline under the single has_syn gate.
+        for (flags, label) in [
+            (0x10u8, "#2151 bare ACK"),
+            (0x04u8, "#4487 bare RST"),
+            (0x01u8, "#4487 bare FIN"),
+        ] {
+            assert!(
+                !should_cache_local_delivery_session_on_miss(
+                    &state,
+                    target.parse().expect("v4"),
+                    resolution,
+                    PROTO_TCP,
+                    flags,
+                ),
+                "{label} (0x{flags:02x}) must remain declined"
+            );
+        }
+        // PRESERVED (fix is TCP-only): a non-TCP (UDP, ICMP) LocalDelivery
+        // first packet still caches unconditionally — the tcp_flags byte is
+        // meaningless for these protocols and must not gate them, even for a
+        // flag pattern that would be declined as TCP (0x00 null / 0x08 PSH).
+        for proto in [PROTO_UDP, PROTO_ICMP] {
+            for flags in [0x00u8, 0x08u8, 0x10u8] {
+                assert!(
+                    should_cache_local_delivery_session_on_miss(
+                        &state,
+                        target.parse().expect("v4"),
+                        resolution,
+                        proto,
+                        flags,
+                    ),
+                    "non-TCP proto {proto} LocalDelivery must cache regardless of the tcp_flags byte (0x{flags:02x})"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn tunnel_session_miss_blocks_interface_nat_local_delivery() {
     let mut snapshot = native_gre_snapshot(true);

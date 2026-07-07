@@ -1,3 +1,44 @@
+## 2026-07-07 — #4539 session: cache host-inbound TCP LocalDelivery only off the handshake (single has_syn gate)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `should_cache_local_delivery_session_on_miss`
+  (userspace-dp/src/afxdp/forwarding/mod.rs) previously gated the
+  host-inbound TCP session-miss cache with two NARROW decline-gates —
+  bare/established ACK (`has_ack && !has_syn`, #2151) and bare RST/FIN
+  (`is_closing && !has_syn`, #4487) — and defaulted to `true` for
+  everything else, so a non-handshake anomalous / crafted first packet
+  that is neither ACK-set nor closing (pure PSH 0x08, null 0x00, pure
+  URG 0x20, ECE/CWR-only) fell through and seeded a 300s host-local
+  session (`is_initial_syn` false at install → `established = true`).
+  Not exploitable for policy-skip (poll_descriptor re-runs the junos-host
+  mandatory-teardown gate on EVERY LocalDelivery session hit) — value is
+  gate-consistency/hardening (LOW). Fix: replaced the two decline-gates
+  with a SINGLE POSITIVE predicate — for TCP, cache iff
+  `crate::tcp_flags::has_syn(tcp_flags)`. This subsumes both #2151 and
+  #4487 (both are `!has_syn` cases) AND closes the pure-PSH/null/URG
+  residual, aligning the gate with its "only off the handshake" intent.
+  TCP-only: the `!matches!(protocol, PROTO_TCP) => true` early return is
+  preserved, so non-TCP (ICMP/UDP) LocalDelivery still caches
+  unconditionally. New test
+  `non_handshake_tcp_session_miss_does_not_cache_local_delivery`
+  (forwarding/tests.rs): PSH/null/URG/ECE/CWR/PSH|URG → declined
+  (RED-on-revert: the old default-`true` cached them); SYN / SYN|ACK /
+  SYN|PSH → cached (preserved); bare ACK / bare RST / bare FIN → still
+  declined (subsumed); UDP/ICMP with any tcp_flags byte → still cached
+  (non-TCP preserved). rustfmt: hand-written lines already clean (mod.rs
+  "no diff", tests.rs insert range untouched); did NOT run whole-crate
+  cargo fmt (it recurses module decls and reflows the untracked-format
+  afxdp subtree). FULL cargo serial (`--release --test-threads=1`):
+  main bin 3705/0/2 ignored + fairness-eval 54/0 + cos_doc_drift
+  self-tests 8/0 + fairness_eval_blackbox 22/0 + snat_contract_doc_guard
+  1/0. RED-on-revert verified: reverting mod.rs to the old two-gate form
+  (keeping the test) fails at the pure-PSH (0x08) assert
+  ("non-handshake first packet (pure PSH, 0x08) must not seed a
+  host-local session").
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  docs/host-inbound-service-matrix.md, CLAUDE.md, _Log.md
+
 ## 2026-07-07 — #4543 screen: fail closed on a malformed IPv4 option TLV (source-route bypass)
 
 - **Timestamp**: 2026-07-07T17:15Z

@@ -490,36 +490,53 @@ security-vs-availability decision, not a mechanical fix, so it stays open on #41
   gap, and it doubles the enforcement SSOT. The right long-term parity answer, but
   needs an nft-representability spec.
 
-## Bare RST/FIN on the LocalDelivery session-miss install (#4487, P6b)
+## Non-handshake TCP first packet on the LocalDelivery session-miss install (#2151 / #4487 / #4539)
 
 The XSK `LocalDelivery` arm may CACHE a firewall-local session on a session
 miss so subsequent established packets bypass userspace and return straight to
 the kernel (`should_cache_local_delivery_session_on_miss` →
 `install_helper_local_session_on_miss`, `userspace-dp/src/afxdp/forwarding/mod.rs`).
-That install is gated so a stray TCP teardown segment never seeds a host-local
-session:
+That install is gated so a **TCP** session is seeded only off the handshake — a
+first packet that carries **SYN** (an initial SYN, or the SYN|ACK inbound leg of
+a firewall-originated flow). The gate is a **single positive predicate**:
+`crate::tcp_flags::has_syn(tcp_flags)`. Non-TCP (ICMP / UDP) LocalDelivery is
+unaffected — the `has_syn` gate is TCP-only and those protocols always cache.
 
-- **#2151** already declined to cache off a bare/established **ACK** (ACK set,
-  SYN clear) — only the handshake seeds a session.
-- **#4487** closes the residual the ACK-only gate missed: a **bare RST or bare
-  FIN with no ACK bit** (`is_closing(flags) && !has_syn(flags)`). Without it a
-  RST/FIN flood to a firewall interface IP churns the per-worker session table
-  (a cheap host-IP session-table DoS) and a later real SYN would HIT the
-  immediately-`closing` seed instead of being re-evaluated by the host-inbound /
-  junos-host gates (a policy-evaluation skip).
+That single `has_syn` predicate (#4539) subsumes two earlier NARROW
+decline-gates and closes the residual they left open:
 
-This is the **same predicate** the transit strict-syn-check applies (#4400,
-`strict_syn_check_drops_new_flow`), but the **action differs by disposition**,
-exactly as #4400 chose. Transit dispositions (ForwardCandidate / MissingNeighbor)
-**DROP** the packet. Host-inbound `LocalDelivery` must **NOT** drop it: a peer
-RST/FIN tearing down a firewall-**originated** TCP flow (BGP-active, syslog-TCP/
-TLS, feed/RPM fetches, DNS-over-TCP), or a connection-refused RST for the
-firewall's own outbound SYN whose dataplane session was already GC'd, arrives as
-a session MISS and must still reach the local stack so the kernel socket tears
-down promptly (the #4400 LocalDelivery drop-exemption). So the guard here only
-declines to **cache**; the `LocalDelivery` disposition still delivers the packet
-to the host via the reinject chokepoint. An established-session RST/FIN is a
-session HIT and never consults this miss-only gate.
+- **#2151** declined to cache off a bare/established **ACK** (`has_ack &&
+  !has_syn`, ACK set / SYN clear). Still declined — it is a `!has_syn` case.
+- **#4487** declined a **bare RST or bare FIN with no ACK bit** (`is_closing &&
+  !has_syn`). Still declined — also `!has_syn`. Without it a RST/FIN flood to a
+  firewall interface IP churns the per-worker session table (a cheap host-IP
+  session-table DoS) and a later real SYN would HIT the immediately-`closing`
+  seed instead of being re-evaluated by the host-inbound / junos-host gates (a
+  policy-evaluation skip).
+- **#4539** (gate-consistency hardening, LOW) closes the residual the two
+  decline-gates missed: a non-handshake anomalous / crafted first packet that is
+  **neither ACK-set nor closing** — **pure PSH (0x08), a null segment (0x00),
+  pure URG (0x20), or an ECE/CWR-only** segment. Under the old two-gate form
+  these fell through to the default `true` and seeded a 300s host-local session
+  (`is_initial_syn` false at install → `established = true`). Aligning on
+  `has_syn` matches the gate to its stated "only off the handshake" intent.
+
+The `!has_syn` decline is the **same predicate** the transit strict-syn-check
+applies (#4400, `strict_syn_check_drops_new_flow`), but the **action differs by
+disposition**, exactly as #4400 chose. Transit dispositions (ForwardCandidate /
+MissingNeighbor) **DROP** the packet. Host-inbound `LocalDelivery` must **NOT**
+drop it: a peer RST/FIN tearing down a firewall-**originated** TCP flow
+(BGP-active, syslog-TCP/TLS, feed/RPM fetches, DNS-over-TCP), or a
+connection-refused RST for the firewall's own outbound SYN whose dataplane
+session was already GC'd, arrives as a session MISS and must still reach the
+local stack so the kernel socket tears down promptly (the #4400 LocalDelivery
+drop-exemption). So the guard here only declines to **cache**; the
+`LocalDelivery` disposition still delivers the declined packet to the host via
+the reinject chokepoint. An established-session packet is a session HIT and
+never consults this miss-only gate; and any later real SYN is re-evaluated by
+the `to-zone junos-host` mandatory-teardown gate that runs on EVERY
+LocalDelivery session hit (`poll_descriptor`), so declining to cache never skips
+policy.
 
 ## Adding a new host-inbound service
 

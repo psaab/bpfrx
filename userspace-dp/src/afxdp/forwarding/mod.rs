@@ -1748,44 +1748,49 @@ pub(super) fn should_cache_local_delivery_session_on_miss(
     if resolution.disposition != ForwardingDisposition::LocalDelivery {
         return false;
     }
+    // Non-TCP (ICMP / UDP) LocalDelivery always caches — the handshake gate
+    // below is TCP-only and MUST NOT change non-TCP behavior.
     if !matches!(protocol, PROTO_TCP) {
         return true;
     }
-    // #2151: prior inline `(tcp_flags & ACK) != 0 && (tcp_flags & SYN) == 0`
-    // — do not cache a local-delivery session off a bare/established ACK
-    // (no SYN), only off the handshake.
-    if crate::tcp_flags::has_ack(tcp_flags) && !crate::tcp_flags::has_syn(tcp_flags) {
-        return false;
-    }
-    // #4487 (residual of P6 / #4400): a bare TCP RST/FIN (a connection-closing
-    // control bit with SYN clear) that MISSES the session table must not seed a
-    // firewall-local session. Such a stray teardown segment opening an
-    // immediately-`closing` host-local session is a session-table DoS surface
-    // (a RST/FIN flood to a firewall IP churns the per-worker table) and a
-    // policy-evaluation skip (a later real SYN would HIT the closing seed
-    // instead of being re-evaluated by the host-inbound / junos-host gates).
-    //
-    // This is the SAME predicate the #4400 transit strict-syn-check applies
-    // (`is_closing && !has_syn`, i.e. `strict_syn_check_drops_new_flow`), but
-    // the ACTION differs BY DISPOSITION, exactly as #4400 deliberately chose:
-    // the two TRANSIT dispositions (ForwardCandidate / MissingNeighbor) DROP
-    // the packet, whereas host-inbound LocalDelivery must NOT drop it. A peer
-    // RST/FIN tearing down a firewall-ORIGINATED TCP flow (BGP-active,
-    // syslog-TCP/TLS, feed/RPM fetches, DNS-over-TCP), or a connection-refused
-    // RST for the firewall's own outbound SYN, arrives as a session-MISS on
-    // LocalDelivery and MUST still reach the local stack so the kernel socket
-    // tears down promptly — the #4400 LocalDelivery drop-exemption. Declining
-    // to CACHE (not dropping) closes the DoS + policy-skip while the
-    // LocalDelivery disposition still delivers the packet to the host via the
-    // reinject chokepoint. This subsumes the #2151 gate for the FIN|ACK /
-    // RST|ACK cases and additionally catches the bare RST / bare FIN (no ACK)
-    // that the ACK-only #2151 gate missed — the exact #4487 residual.
-    if crate::tcp_flags::is_closing(tcp_flags) && !crate::tcp_flags::has_syn(tcp_flags) {
-        return false;
-    }
     let _ = state;
     let _ = resolution_target;
-    true
+    // #4539 (gate-consistency hardening; subsumes #2151 + #4487): cache a
+    // host-inbound TCP session ONLY off the handshake — a first packet that
+    // carries SYN (an initial SYN, or a SYN|ACK for the inbound leg of a
+    // firewall-originated flow). Decline every other non-SYN TCP first packet.
+    //
+    // A SINGLE POSITIVE `has_syn` predicate replaces the two prior NARROW
+    // decline-gates that this subsumes:
+    //   - #2151 declined a bare/established ACK (`has_ack && !has_syn`) — the
+    //     prior inline `(tcp_flags & ACK) != 0 && (tcp_flags & SYN) == 0`.
+    //   - #4487 (residual of P6 / #4400) declined a bare RST / FIN closing
+    //     segment (`is_closing && !has_syn`) — a session-table DoS surface (a
+    //     RST/FIN flood to a firewall IP churns the per-worker table) plus a
+    //     policy-evaluation skip (a stray teardown seeding an immediately
+    //     `closing` host-local session).
+    // Both are `!has_syn` cases, so a single `has_syn` gate subsumes them. It
+    // ADDITIONALLY closes the residual the two decline-gates left open: a
+    // non-handshake anomalous / crafted first packet that is neither ACK-set
+    // nor closing — pure PSH (0x08), a null segment (0x00), pure URG (0x20),
+    // or an ECE/CWR-only segment — which previously fell through to the
+    // default `true` and seeded a 300s host-local LocalDelivery session
+    // (`is_initial_syn` false at install → `established = true`). Aligning on
+    // `has_syn` matches the gate to its stated "only off the handshake" intent.
+    //
+    // The packet is NOT dropped: a declined non-SYN first packet still reaches
+    // the host via the LocalDelivery reinject chokepoint (the #4400
+    // drop-exemption for host-inbound — the ACTION differs BY DISPOSITION, as
+    // #4400 deliberately chose: the TRANSIT dispositions DROP a bare teardown,
+    // host-inbound LocalDelivery must NOT). A peer RST/FIN tearing down a
+    // firewall-ORIGINATED TCP flow (BGP-active, syslog-TCP/TLS, feed/RPM
+    // fetches, DNS-over-TCP), or a connection-refused RST for the firewall's
+    // own outbound SYN, therefore still reaches the local stack so the kernel
+    // socket tears down promptly — this gate only declines to CACHE. A later
+    // real SYN hitting a firewall IP is re-evaluated by the `to-zone
+    // junos-host` mandatory-teardown gate that runs on EVERY LocalDelivery
+    // session hit (poll_descriptor), so declining to cache never skips policy.
+    crate::tcp_flags::has_syn(tcp_flags)
 }
 
 pub(super) fn install_helper_local_session_on_miss(
