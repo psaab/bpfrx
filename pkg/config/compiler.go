@@ -1958,78 +1958,14 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, preWalkWarnings...)
 
-	for _, node := range tree.Children {
-		switch node.Name() {
-		case "security":
-			if err := compileSecurity(node, &cfg.Security); err != nil {
-				return nil, fmt.Errorf("security: %w", err)
-			}
-		case "interfaces":
-			if err := compileInterfaces(node, &cfg.Interfaces); err != nil {
-				return nil, fmt.Errorf("interfaces: %w", err)
-			}
-		case "applications":
-			if err := compileApplications(node, &cfg.Applications); err != nil {
-				return nil, fmt.Errorf("applications: %w", err)
-			}
-		case "routing-options":
-			if err := compileRoutingOptions(node, &cfg.RoutingOptions); err != nil {
-				return nil, fmt.Errorf("routing-options: %w", err)
-			}
-		case "protocols":
-			if err := compileProtocols(node, &cfg.Protocols); err != nil {
-				return nil, fmt.Errorf("protocols: %w", err)
-			}
-		case "routing-instances":
-			if err := compileRoutingInstances(node, cfg); err != nil {
-				return nil, fmt.Errorf("routing-instances: %w", err)
-			}
-		case "firewall":
-			if err := compileFirewall(node, &cfg.Firewall); err != nil {
-				return nil, fmt.Errorf("firewall: %w", err)
-			}
-		case "class-of-service":
-			if err := compileClassOfService(node, cfg.ClassOfService); err != nil {
-				return nil, fmt.Errorf("class-of-service: %w", err)
-			}
-		case "services":
-			if err := compileServices(node, &cfg.Services); err != nil {
-				return nil, fmt.Errorf("services: %w", err)
-			}
-		case "forwarding-options":
-			if err := compileForwardingOptions(node, &cfg.ForwardingOptions); err != nil {
-				return nil, fmt.Errorf("forwarding-options: %w", err)
-			}
-		case "system":
-			if err := compileSystem(node, &cfg.System, cfg, opts); err != nil {
-				return nil, fmt.Errorf("system: %w", err)
-			}
-		case "schedulers":
-			if err := compileSchedulers(node, cfg); err != nil {
-				return nil, fmt.Errorf("schedulers: %w", err)
-			}
-		case "policy-options":
-			if err := compilePolicyOptions(node, &cfg.PolicyOptions); err != nil {
-				return nil, fmt.Errorf("policy-options: %w", err)
-			}
-		case "chassis":
-			if err := compileChassis(node, &cfg.Chassis); err != nil {
-				return nil, fmt.Errorf("chassis: %w", err)
-			}
-		case "event-options":
-			if err := compileEventOptions(node, &cfg.EventOptions); err != nil {
-				return nil, fmt.Errorf("event-options: %w", err)
-			}
-		case "snmp":
-			// Top-level snmp stanza (same format as system { snmp { ... } })
-			if err := compileSNMP(node, &cfg.System, cfg, opts.lenientSNMPTrapGroup); err != nil {
-				return nil, fmt.Errorf("snmp: %w", err)
-			}
-		case "bridge-domains":
-			if err := compileBridgeDomains(node, &cfg.BridgeDomains); err != nil {
-				return nil, fmt.Errorf("bridge-domains: %w", err)
-			}
-		}
+	// P4 (#4406 step 2): section-compile dispatch. Extracted into
+	// compileSections (compiler_dispatch.go) — the ordered per-section
+	// dispatch that routes each root child (in author order) to its
+	// already-extracted section compiler and returns the FIRST section error.
+	// Behavior-preserving lift; do NOT reorder P4 relative to P3 above or the
+	// P5 cross-section derivations below.
+	if err := compileSections(tree, cfg, opts); err != nil {
+		return nil, err
 	}
 
 	// #4329: stamp the compiled cluster node identity from the runtime
