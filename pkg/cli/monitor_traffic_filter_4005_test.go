@@ -121,20 +121,20 @@ func TestBuildMonitorTrafficArgvFilterReachesTcpdump(t *testing.T) {
 		[]string{"interface", "ge-0-0-0", "matching", `"tcp`, "port", `80"`, "count", "20"},
 	)
 	argv := buildMonitorTrafficArgv(iface, filter, count)
-	want := []string{"tcpdump", "-i", "ge-0-0-0", "-n", "-l", "-c", "20", "tcp", "port", "80"}
+	// The filter follows an explicit "--" end-of-options separator (#4524).
+	want := []string{"tcpdump", "-i", "ge-0-0-0", "-n", "-l", "-c", "20", "--", "tcp", "port", "80"}
 	if !reflect.DeepEqual(argv, want) {
 		t.Fatalf("buildMonitorTrafficArgv =\n  %v\nwant\n  %v", argv, want)
 	}
 
 	// The full filter expression must be present as a contiguous trailing
-	// run — assert the joined tail equals the intended BPF filter.
-	dashL := indexOf(argv, "-l")
-	tail := argv[dashL+1:]
-	// Skip the -c <count> option to isolate the filter tail.
-	if len(tail) >= 2 && tail[0] == "-c" {
-		tail = tail[2:]
+	// run after the "--" separator — assert the joined tail equals the
+	// intended BPF filter.
+	sep := indexOf(argv, "--")
+	if sep < 0 {
+		t.Fatalf("argv %v: missing \"--\" end-of-options separator", argv)
 	}
-	if got := strings.Join(tail, " "); got != "tcp port 80" {
+	if got := strings.Join(argv[sep+1:], " "); got != "tcp port 80" {
 		t.Fatalf("filter tail = %q, want %q", got, "tcp port 80")
 	}
 }

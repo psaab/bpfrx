@@ -564,19 +564,63 @@ func stripSurroundingQuotes(s string) string {
 
 // buildMonitorTrafficArgv assembles the tcpdump argv for a live capture.
 // The full filter expression is passed as trailing arguments exactly as
-// tcpdump/libpcap expects a filter (all tokens, verbatim).
+// tcpdump/libpcap expects a filter (all tokens, verbatim), but only AFTER
+// an explicit "--" end-of-options separator so no filter token can be
+// interpreted as a tcpdump option.
 func buildMonitorTrafficArgv(iface, filter, count string) []string {
 	cmdArgs := []string{"tcpdump", "-i", iface, "-n", "-l"}
 	if count != "0" {
 		cmdArgs = append(cmdArgs, "-c", count)
 	}
 	if filter != "" {
+		// Insert a "--" end-of-options separator before the operator-supplied
+		// filter (#4524), mirroring the diagcmd ping/traceroute #2084
+		// treatment. The `matching <filter>` clause greedily absorbs every
+		// token up to the next keyword, so without the separator a filter
+		// like `-w /etc/cron.d/x` or `-z <cmd>` reaches tcpdump as an OPTION
+		// under glibc getopt argv permutation — arbitrary root file-write
+		// (-w) or post-rotate command execution (-z) past the capture-only
+		// RBAC boundary. After "--", getopt stops scanning for options and
+		// tcpdump treats every remaining token as part of the pcap filter
+		// EXPRESSION, so an injected `-w`/`-z` becomes a (harmless) filter
+		// operand that libpcap rejects at compile time rather than an option.
+		//
 		// tcpdump accepts the filter expression as separate argv tokens;
 		// splitting on whitespace keeps a multi-token filter intact and
 		// matches how tcpdump joins its own trailing filter arguments.
+		cmdArgs = append(cmdArgs, "--")
 		cmdArgs = append(cmdArgs, strings.Fields(filter)...)
 	}
 	return cmdArgs
+}
+
+// monitorFilterOptionToken reports whether tok would be interpreted by
+// tcpdump/getopt as an option flag rather than as a pcap filter primitive.
+// A legitimate pcap filter expression never begins a term with an option
+// flag (`-w`, `-z`, `-r`, `--postrotate-command`, ...): filter primitives
+// are keywords (host/port/tcp/udp/net/...), addresses, numbers, boolean
+// operators (and/or/not) and parentheses. Such an option-looking token can
+// therefore only be an attempt to smuggle a tcpdump option past the
+// capture-only contract (#4524). A bare "-" (getopt's stdin sentinel, not
+// an option) is allowed so an arithmetic subtraction term is never falsely
+// rejected. This is defense-in-depth: the "--" separator in
+// buildMonitorTrafficArgv already neutralizes the option, but rejecting the
+// token here gives the operator a clear error instead of an opaque libpcap
+// compile failure.
+func monitorFilterOptionToken(tok string) bool {
+	return len(tok) > 1 && tok[0] == '-'
+}
+
+// validateMonitorFilter rejects a pcap filter that contains an
+// option-looking token (see monitorFilterOptionToken). Returns nil for an
+// empty filter or any legitimate pcap expression.
+func validateMonitorFilter(filter string) error {
+	for _, tok := range strings.Fields(filter) {
+		if monitorFilterOptionToken(tok) {
+			return fmt.Errorf("invalid filter token %q: a capture filter cannot contain a tcpdump option flag", tok)
+		}
+	}
+	return nil
 }
 
 // handleMonitorTraffic wraps tcpdump for live packet capture.
@@ -586,6 +630,14 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 	if iface == "" {
 		fmt.Println("usage: monitor traffic interface <name> [matching <filter>] [count <N>]")
 		return nil
+	}
+
+	// Defense-in-depth (#4524): reject a filter that smuggles a tcpdump
+	// option (`-w`, `-z`, ...) before it can reach the argv. The "--"
+	// separator in buildMonitorTrafficArgv already neutralizes it, but a
+	// clear rejection beats an opaque libpcap syntax error.
+	if err := validateMonitorFilter(filter); err != nil {
+		return err
 	}
 
 	// Resolve fabric IPVLAN overlays to physical parent (#136).

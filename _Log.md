@@ -1,3 +1,34 @@
+## 2026-07-07 — #4524 (ps-023 13-02, HIGH): neutralize `monitor traffic ... matching` tcpdump option injection
+
+- **Timestamp**: 2026-07-07T21:30Z
+- **Action**: `monitor traffic interface <if> matching <filter>` appended the
+  operator-supplied filter tokens to the root `tcpdump` argv with NO `--`
+  end-of-options separator (`buildMonitorTrafficArgv`, pkg/cli/cli_request.go).
+  The `matching` clause greedily absorbs every token up to the next keyword,
+  so `matching -w /etc/cron.d/x` or `matching -z <cmd>` reached tcpdump as the
+  `-w` (arbitrary file write) / `-z` (post-rotate command exec) OPTION under
+  glibc getopt argv permutation — escalating a control-level (not super-user)
+  login class to root file-write / command-exec past the capture-only RBAC
+  gate (PermControl, #4067), and violating the capture-only contract even for
+  super-user. Fixed by inserting an explicit `"--"` separator before the
+  filter tokens (mirroring the diagcmd ping/traceroute #2084 treatment) so
+  getopt stops scanning for options and every filter token is a pcap filter
+  EXPRESSION operand — an injected `-w`/`-z` becomes a libpcap compile error,
+  not a tcpdump option. Added defense-in-depth `validateMonitorFilter` +
+  `monitorFilterOptionToken` that reject any option-looking filter token (a
+  term starting with `-`, other than a bare `-`) up front with a clear error,
+  wired into `handleMonitorTraffic`. Legitimate pcap filters (`host X and port
+  N`, `tcp port 80`, `not arp`) are unaffected.
+- **Validation**: New `monitor_traffic_injection_4524_test.go` — `-w`/`-z`/
+  `-r`/`--postrotate-command` all land AFTER `--` (neutralized); RED on revert
+  of the `--` insertion (verified: injected tokens precede no separator);
+  `validateMonitorFilter` rejects option tokens and accepts legit filters;
+  legit multi-token filter survives intact after `--`. Updated the #4005
+  argv-shape test to expect the `--` separator. `go test ./pkg/cli/...` green,
+  `go build ./...`, gofmt clean.
+- **File(s)**: pkg/cli/cli_request.go, pkg/cli/monitor_traffic_injection_4524_test.go,
+  pkg/cli/monitor_traffic_filter_4005_test.go, docs/system-login.md, _Log.md
+
 ## 2026-07-07 — #4514 (ps-020 F5): enforce single-rate `then policer` on the userspace dataplane
 
 - **Timestamp**: 2026-07-07T20:00Z

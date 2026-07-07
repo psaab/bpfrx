@@ -169,6 +169,25 @@ matcher the dispatcher uses, so an abbreviated `monitor tr` is gated
 identically to the fully-spelled form and cannot bypass the gate. Other
 `monitor` subcommands and read-only `show` commands are unaffected.
 
+**Filter option-injection hardening — `monitor traffic ... matching` (#4524).**
+The `matching <filter>` clause greedily consumes every token up to the next
+grammar keyword and passes them to the root `tcpdump` capture. Without an
+end-of-options guard a filter such as `matching -w /etc/cron.d/x` or
+`matching -z <cmd>` reaches tcpdump as the `-w` (arbitrary file write) or `-z`
+(post-rotate command execution) **option** under glibc getopt argv
+permutation — escalating a control-level capture privilege to root
+file-write / command-exec, and violating the capture-only contract even for
+`super-user`. `buildMonitorTrafficArgv` (`pkg/cli/cli_request.go`) now inserts
+an explicit `--` end-of-options separator before the filter tokens (mirroring
+the diagcmd ping/traceroute #2084 treatment), so getopt stops scanning for
+options and every filter token is parsed as part of the pcap filter
+**expression** — an injected `-w`/`-z` becomes a filter operand that libpcap
+rejects at compile time rather than a tcpdump option. A defense-in-depth
+`validateMonitorFilter` check additionally rejects any option-looking filter
+token (a term beginning with `-`, other than a bare `-`) up front with a clear
+error. Legitimate pcap filters (`host 10.0.0.1 and port 22`, `tcp port 80`,
+`not arp`) are unaffected.
+
 **Secret redaction in `show configuration` (#4099).** The on-box interactive
 CLI config-render show paths — `show configuration` (hierarchical / `| display
 set` / `| display json` / `| display xml` / `| display inheritance`, including
