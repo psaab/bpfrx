@@ -37725,3 +37725,51 @@ top.
   rustfmt does not touch the new lines).
 - **File(s)**: userspace-dp/src/screen/scan.rs,
   userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs, _Log.md
+
+## 2026-07-06 — flowexport collector-stall hardening (#4423 H07/M09/M10/M13)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Verify-first + drive the flowexport audit backlog (#4423,
+  originally codex flowexport H07 + M09/M10/M13). Three genuine bugs fixed,
+  one disproved not-material.
+  - **H07 (HIGH, GENUINE)** — one blocking collector write stalled ALL
+    collectors + template refresh + batch flush + shutdown drain.
+    `collectorConns.writeAll` (transport.go) is a serial loop over the group's
+    connections in the ONE per-exporter `Run` goroutine, and set no write
+    deadline; a connected-UDP `Write` can block indefinitely on a full send
+    buffer (ENOBUFS / congested / down path). Fix: each write sets
+    `SetWriteDeadline(now + collectorWriteTimeout)` (2s default `var`), so a
+    stuck collector times out (datagram dropped, marked unhealthy #2464)
+    instead of parking the goroutine. RED-on-revert:
+    `TestWriteAll_SlowCollectorDoesNotStallOthers` (blocking fake conn;
+    without the deadline writeAll never returns → 3s guard fires).
+  - **M09 (NOT-MATERIAL)** — "BuildExportConfig drops all but the first
+    template group." Disproved: `BuildExportConfig`/`BuildIPFIXExportConfig`
+    (manager.go:530/539, return groups[0]) have NO production caller — the
+    daemon uses `ResolveV9TemplateGroups`/`ResolveIPFIXTemplateGroups`
+    (daemon_flowexport.go:120/136), which return ALL groups and start one
+    exporter per group. The single-group return is documented/intentional for
+    a retained single-aggregate helper. No fix; recorded on #4423.
+  - **M10 (GENUINE robustness)** — `Run` built its template ticker with
+    `time.NewTicker(cfg.TemplateRefreshRate)`, which panics on `<= 0` (fatal
+    under `go e.Run`). Reachable via the public `NewExporter`/`NewIPFIXExporter`
+    constructors with a hand-built zero-rate ExportConfig. Fix:
+    `templateRefreshInterval` clamps non-positive → `defaultTemplateRefreshRate`
+    (60s), used by both v9 and IPFIX `Run`. RED-on-revert:
+    `TestTemplateRefreshInterval_ClampsNonPositive` +
+    `TestExporterRun_ZeroRefreshRateNoPanic`.
+  - **M13 (GENUINE, v9-only)** — NetFlow v9 `bootTime` was `time.Now()` at
+    exporter construction, so after a daemon restart a session that started
+    before the restart had `StartTime < bootTime` and `uptimeMs` clamped its
+    `FirstSwitched` to 0 (flow age truncated to "at boot"). Fix: `bootTime =
+    systemBootTime()` (now − `CLOCK_BOOTTIME`), the real device boot instant,
+    via a `bootTimeFunc` test seam. IPFIX unaffected (absolute
+    flowStart/EndMilliseconds). RED-on-revert:
+    `TestExporterBootTimeAnchorsAtDeviceBoot`.
+  - Validation: `go test ./pkg/flowexport/...` green; `go build`/vet/gofmt
+    clean; `pkg/daemon` builds + tests green. Each fix verified RED-on-revert
+    individually.
+- **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/netflow.go,
+  pkg/flowexport/ipfix.go, pkg/flowexport/collector_health_test.go,
+  pkg/flowexport/collector_stall_4423_test.go, pkg/flowexport/README.md,
+  _Log.md

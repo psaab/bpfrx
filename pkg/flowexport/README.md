@@ -691,6 +691,43 @@ group; emitted before the dataplane gate — exporters are control-plane). A
 climbing `dropped_total`, or a sustained nonzero `depth`, is the operator
 signal that the export drain cannot keep up.
 
+## Export-pipeline resiliency (#4423)
+
+Three hardening fixes to the exporter goroutine and its sysUptime clock.
+
+- **Per-collector write deadline (H07).** `writeAll` (`transport.go`) fans a
+  packet out to every collector in the group SERIALLY, in the ONE per-exporter
+  `Run` goroutine that also drives the template refresh, the 100 ms batch
+  flush, and the shutdown drain. A connected-UDP `Write` is normally
+  instantaneous but can block indefinitely on a full socket send buffer
+  (ENOBUFS / a congested or down egress path parks the goroutine in the
+  netpoller until the buffer drains). One blocked write therefore stalled ALL
+  of the above — the other collectors starved, templates stopped refreshing,
+  the batch backed up (see #3747, which bounds the resulting memory growth but
+  does not un-stall the drain), and ctx-cancel shutdown hung past the unit
+  `TimeoutStopSec`. Each write now sets `SetWriteDeadline(now +
+  collectorWriteTimeout)` (default 2 s), so a stuck write times out, the
+  datagram is dropped (best-effort UDP) and the collector is marked unhealthy
+  (#2464) instead of blocking the pipeline. `collectorWriteTimeout` is a
+  package `var` so tests shrink it.
+- **Template-refresh ticker clamp (M10).** `Run` built its template ticker with
+  `time.NewTicker(cfg.TemplateRefreshRate)`, which PANICS on a `<= 0` duration
+  — fatal under `go e.Run(ctx)`. The production resolver always fills at least
+  60 s, but the public `NewExporter` / `NewIPFIXExporter` constructors accept
+  any `*ExportConfig`. `templateRefreshInterval` (`transport.go`) now clamps a
+  non-positive rate to `defaultTemplateRefreshRate` (60 s).
+- **sysUptime anchored at device boot (M13).** The NetFlow v9 header
+  `SysUptime` and the record `FirstSwitched`/`LastSwitched` fields are all
+  "system uptime" relative (RFC 3954). The exporter anchored them at
+  `time.Now()` taken when the exporter was CONSTRUCTED, so after a daemon
+  restart (commit, crash recovery, HA failback) any flow that started before
+  the restart had `StartTime` earlier than the anchor and `uptimeMs` clamped
+  its `FirstSwitched` to 0 — truncating the flow age to "at boot". `bootTime`
+  is now `systemBootTime()` (now − `CLOCK_BOOTTIME`), the real device boot
+  instant which predates every session, via the `bootTimeFunc` seam (tests
+  inject a deterministic boot). IPFIX is unaffected — it exports absolute
+  `flowStart/EndMilliseconds`, not an uptime-relative value.
+
 ## Entry points
 
 NetFlow v9:

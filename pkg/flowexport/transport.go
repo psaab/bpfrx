@@ -150,6 +150,43 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 	return cc, nil
 }
 
+// collectorWriteTimeout bounds how long a single collector write may block
+// before it is abandoned as a failure (#4423 H07). writeAll runs in the ONE
+// per-exporter Run goroutine that ALSO drives every other collector in the
+// group, the periodic template refresh, the 100ms batch flush, and the
+// shutdown drain. A connected-UDP Write is normally instantaneous, but it can
+// block indefinitely on a full socket send buffer (ENOBUFS / a congested or
+// down egress path parks the goroutine in the netpoller until the buffer
+// drains). Without a deadline that single blocked write stalls ALL of the
+// above — the other collectors starve, templates stop refreshing, the batch
+// backs up, and ctx-cancel shutdown hangs past the unit TimeoutStopSec. The
+// deadline makes a stuck write time out (the datagram is dropped, best-effort
+// UDP, and the collector is marked unhealthy) instead of blocking the pipeline.
+// A var, not a const, so tests can shrink it. 2s is far above any healthy UDP
+// write yet well within the 20s systemd stop timeout even for several hung
+// collectors.
+var collectorWriteTimeout = 2 * time.Second
+
+// defaultTemplateRefreshRate is the fallback template-refresh cadence used when
+// an ExportConfig carries a non-positive TemplateRefreshRate (#4423 M10). The
+// production resolver always fills at least 60s, but the public NewExporter /
+// NewIPFIXExporter constructors accept any *ExportConfig, and time.NewTicker
+// panics on a <= 0 duration.
+const defaultTemplateRefreshRate = 60 * time.Second
+
+// templateRefreshInterval clamps a template-refresh rate to a strictly
+// positive duration so time.NewTicker never panics on a zero/negative rate
+// (#4423 M10). A hand-built ExportConfig (tests, external callers) that left
+// TemplateRefreshRate at 0 falls back to the default cadence instead of
+// crashing the Run goroutine — and a panic there is fatal (it runs under
+// `go e.Run(ctx)`).
+func templateRefreshInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultTemplateRefreshRate
+	}
+	return d
+}
+
 // writeAll transmits pkt to every collector connection and records the
 // per-collector write-health (#2464). A failure to one collector does
 // not stop delivery to the others (the export DATA path is unchanged —
@@ -157,6 +194,11 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 // non-fatal). The change is observability: each write bumps the
 // attempt counter, a success refreshes LastSuccessTime, and a failure
 // records LastError/LastErrorTime + the failure counter.
+//
+// Each write is bounded by collectorWriteTimeout (#4423 H07) so one slow or
+// blocked collector cannot stall the shared export goroutine — which also
+// drives the other collectors, the template refresh, the batch flush, and the
+// shutdown drain.
 //
 // Logging is RATE-LIMITED to the unhealthy<->healthy EDGE, not every
 // write: writeAll runs once per export flush (the v9/IPFIX batch ticker
@@ -168,6 +210,11 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 // (template vs data) in the debug line kept for deep tracing.
 func (cc *collectorConns) writeAll(pkt []byte, errMsg string) {
 	for _, c := range cc.conns {
+		// Bound the write so a full send buffer on one collector cannot park
+		// the shared goroutine indefinitely (#4423 H07). A write that trips
+		// the deadline returns a timeout error handled by the failure branch
+		// below, exactly like any other unreachable-collector error.
+		_ = c.conn.SetWriteDeadline(time.Now().Add(collectorWriteTimeout))
 		_, err := c.conn.Write(pkt)
 		c.attempts.Add(1)
 		now := time.Now()

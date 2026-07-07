@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 // writeFakeConn is a net.Conn fake whose Write returns a programmable
@@ -26,6 +27,10 @@ func (c *writeFakeConn) Write(b []byte) (int, error) {
 }
 
 func (c *writeFakeConn) Close() error { return nil }
+
+// SetWriteDeadline is a no-op; writeAll sets a per-write deadline (#4423 H07)
+// and the embedded nil net.Conn's promoted method would otherwise panic.
+func (c *writeFakeConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (c *writeFakeConn) setErr(err error) {
 	c.mu.Lock()
