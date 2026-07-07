@@ -773,6 +773,36 @@ on `set ...`/`load set`, even though the compiler reads all of them via
 them keyed-list + read via `firewallMatchValues`), not a renderer change, and
 is tracked separately.
 
+**Path-scoped `show`/`display set` descends into ALL same-prefix siblings,
+not just the first (#4562 — the intermediate-descent twin of the #3980
+terminal fix):** #3980 fixed the case where a display path *ends* on a
+repeated keyword. `navigatePath` also has two INTERMEDIATE-descent branches
+that walk *past* a matched level to resolve the rest of the path: the
+multi-key branch (`current = matched[0].Children`) and the single-key branch
+(`current = n.Children` for the first matching node). Both previously
+descended into only the FIRST matching sibling's subtree. When a
+hand-authored HIERARCHICAL config carries a DUPLICATE context block — two
+identical 4-key `from-zone untrust to-zone trust { ... }` policy contexts, or
+two identical single-key `interfaces { ... }` blocks — AND the display path
+continues deeper (`... from-zone untrust to-zone trust policy B`), the second
+duplicate-context block's statements were dropped from the path-scoped
+`show` and its `| display set`, so a scoped display-set backup silently lost
+them on restore. The fix descends into the UNION of every same-prefix (or
+same-keyword) sibling's children via `unionChildren` before continuing —
+mirroring the #3980 terminal read-all-siblings behavior onto the descent
+(same #3842 / #2419 read-all-siblings class). Single-match is unchanged
+(`unionChildren` returns the one node's children directly), so a normal
+non-duplicate path and a single-context config render byte-identical.
+`navigatePath` is DISPLAY-ONLY (all callers are `FormatPath*` in
+`ast_format.go`; the compiler reads the full AST directly), so the hidden
+statement was still ENFORCED — the impact was a display / scoped-backup gap,
+not a forwarding or security bypass. Preconditions are narrow: flat-set
+`SetPath` MERGES same-key containers, so only a hand-authored duplicate-
+context config plus a path-SCOPED display command triggers it (an unscoped
+`show configuration` renders the whole tree fine). Regression coverage:
+`pkg/config/show_config_dup_context_4562_test.go` (multi-key + single-key
+duplicate-context descent, single-context no-regression control).
+
 **Security policies missing a required `match` criterion are rejected at commit
 (#3044 — codex-review-061 finding 061-03):** Junos/vSRX requires every security
 policy `match` clause to specify all three core dimensions — `source-address`,

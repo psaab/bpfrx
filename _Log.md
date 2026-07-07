@@ -1,3 +1,34 @@
+## 2026-07-07 — #4562 config: navigatePath intermediate descent walks ALL same-prefix siblings (display-only)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `navigatePath` (pkg/config/ast.go) intermediate-descent
+  branches previously walked only the FIRST matching sibling's subtree —
+  `current = matched[0].Children` (multi-key branch ~:211) and
+  `current = n.Children` for the first matching node (single-key branch
+  ~:242). When a hand-authored HIERARCHICAL config carries a DUPLICATE
+  context block (two identical 4-key
+  `from-zone untrust to-zone trust { ... }` policy contexts, or two
+  identical single-key `interfaces { ... }` blocks) AND the display path
+  descends deeper (`... policy B`), the second duplicate-context block's
+  statements were dropped from a path-scoped `show` / `| display set`, so
+  a scoped display-set backup silently lost them on restore. Fix: both
+  intermediate-descent branches now descend into the UNION of every
+  same-prefix / same-keyword sibling's children via a new `unionChildren`
+  helper, mirroring the #3980 terminal read-all-siblings fix onto the
+  descent (same #3842 / #2419 class). Single-match is byte-identical
+  (`unionChildren` returns the one node's children directly). DISPLAY-ONLY
+  (all callers are `FormatPath*` in ast_format.go; the compiler reads the
+  full AST directly) — the hidden statement was still ENFORCED, so LOW /
+  display + scoped-backup gap, not a forwarding/security bypass. The
+  terminal #3980 branch is untouched.
+- **File(s)**: pkg/config/ast.go,
+  pkg/config/show_config_dup_context_4562_test.go (RED-on-revert:
+  both-blocks-shown for multi-key + single-key duplicate contexts,
+  single-context control byte-identical), pkg/config/README.md, _Log.md
+- **Validation**: `go test ./pkg/config/` green (incl. #3980 terminal
+  suite); RED-on-revert verified for BOTH branches (revert → policy B /
+  mtu 9000 dropped); gofmt clean, go vet clean, go build ./... clean.
+
 ## 2026-07-07 — #4539 session: cache host-inbound TCP LocalDelivery only off the handshake (single has_syn gate)
 
 - **Timestamp**: 2026-07-07

@@ -208,47 +208,85 @@ func navigatePath(nodes []*Node, path []string) []*Node {
 				if i >= len(path) {
 					return matched
 				}
-				current = matched[0].Children
+				// Intermediate descent: continue against the UNION of
+				// every same-prefix sibling's children, not just
+				// matched[0]'s. When more than one sibling shares the
+				// full multi-key prefix AND the display path continues
+				// deeper (e.g. two identical
+				// `from-zone untrust to-zone trust { ... }` policy
+				// contexts, then `... policy B`), descending into only
+				// the first block's children dropped statements held
+				// under the second duplicate-context sibling from a
+				// path-scoped `show` / `| display set` (#4562). This is
+				// the intermediate-descent twin of the #3980 terminal
+				// read-all-siblings fix (same #3842 / #2419 class).
+				// Single-match is unchanged: one sibling → its children.
+				current = unionChildren(matched)
 				continue
 			}
 		}
 		// Single-key match.
-		found := false
+		if i+1 >= len(path) {
+			// Terminal path element on a bare keyword: return EVERY
+			// sibling sharing this leading keyword (#3980), not just the
+			// first. A hierarchy level may hold multiple DISTINCT
+			// statements with the same leading keyword — e.g.
+			// `ntp server 1.1.1.1` / `ntp server 2.2.2.2`, several
+			// `from-zone` policy contexts, repeated `archive-sites`.
+			// Returning only the first hid the rest from a path-scoped
+			// `show configuration <path>` and, worse, from its
+			// `| display set`, so a scoped display-set backup silently
+			// dropped the hidden statements on restore. FindChildren-not-
+			// FindChild, the display-side sibling of the #3842 / #2419
+			// read-all-siblings class.
+			var all []*Node
+			for _, sib := range current {
+				if len(sib.Keys) > 0 && sib.Keys[0] == keyword {
+					all = append(all, sib)
+				}
+			}
+			if len(all) == 0 {
+				return nil
+			}
+			return all
+		}
+		// Intermediate single-key descent: continue against the UNION of
+		// every same-keyword sibling's children, not just the first, so a
+		// deeper path resolves across all duplicate same-keyword blocks
+		// (#4562) — the descent-side twin of the terminal #3980 read-all-
+		// siblings fix. Single-match is unchanged: one sibling → its
+		// children.
+		var sibs []*Node
 		for _, n := range current {
 			if len(n.Keys) > 0 && n.Keys[0] == keyword {
-				if i+1 >= len(path) {
-					// Terminal path element on a bare keyword: return
-					// EVERY sibling sharing this leading keyword (#3980),
-					// not just the first. A hierarchy level may hold
-					// multiple DISTINCT statements with the same leading
-					// keyword — e.g. `ntp server 1.1.1.1` /
-					// `ntp server 2.2.2.2`, several `from-zone` policy
-					// contexts, repeated `archive-sites`. Returning only
-					// the first hid the rest from a path-scoped
-					// `show configuration <path>` and, worse, from its
-					// `| display set`, so a scoped display-set backup
-					// silently dropped the hidden statements on restore.
-					// FindChildren-not-FindChild, the display-side sibling
-					// of the #3842 / #2419 read-all-siblings class.
-					var all []*Node
-					for _, sib := range current {
-						if len(sib.Keys) > 0 && sib.Keys[0] == keyword {
-							all = append(all, sib)
-						}
-					}
-					return all
-				}
-				i++
-				current = n.Children
-				found = true
-				break
+				sibs = append(sibs, n)
 			}
 		}
-		if !found {
+		if len(sibs) == 0 {
 			return nil
 		}
+		i++
+		current = unionChildren(sibs)
 	}
 	return nil
+}
+
+// unionChildren concatenates the children of every node in sibling order.
+// It backs navigatePath's intermediate-descent read-all-siblings behavior
+// (#4562): when a display path descends past a level that holds multiple
+// identical same-prefix (or same-keyword) siblings, the deeper lookup must
+// resolve against the union of all those siblings' children, not just the
+// first's. For a single node it returns that node's children unchanged (a
+// shallow copy), so the common single-match path renders identically.
+func unionChildren(nodes []*Node) []*Node {
+	if len(nodes) == 1 {
+		return nodes[0].Children
+	}
+	var out []*Node
+	for _, n := range nodes {
+		out = append(out, n.Children...)
+	}
+	return out
 }
 
 // matchNodeKeys checks if a node's Keys match path elements starting at pos.
