@@ -1,3 +1,42 @@
+## 2026-07-07 — #4411 (avo-review-002 A4/A6): host-inbound + policymatch test-coverage locks
+
+- **Timestamp**: 2026-07-07
+- **Action**: Closed the two GO-testable test-coverage gaps from #4411
+  (avo-review-002 dropped findings A2/A4/A5/A6). Verified each vs
+  origin/master first.
+  - A4 (Go, ADDED): `host-inbound-traffic protocols all` + `system-services
+    ssh` boundary was untested at the `ClassifyHostInbound` classifier.
+    `protocols all` is deliberately NOT a full admit (#3199) — it expands to the
+    routing-protocol set, not arbitrary L4 ports. New test asserts ssh (tcp/22)
+    admits via system-services, bgp (tcp/179) admits via `protocols all`
+    (token "all"/protocols), and tcp/9999 is DENIED — the negative boundary that
+    `protocols all` does not over-admit. Mutation-verified: making
+    `HostInboundProtocolMatch("all")` a catch-all TCP match reddens the denied
+    row. Existing host_inbound_classify_3627_test.go covered ssh+ping+bgp and
+    `system-services all` full-admit, but never paired `protocols all` with a
+    service.
+  - A6 (Go, ADDED): a `test security match-policies` query that OMITS a
+    from-zone/to-zone selector passes an EMPTY-STRING zone to
+    policymatch.Match; it must fall through the `!zoneKnown` guard to the
+    configured default-policy, never be read as wildcard-any and match a
+    `from-zone any to-zone any` rule. New table-driven test (both empty / from
+    empty / to empty + a defined-pair positive control) locks it. Mutation-
+    verified: making zoneKnown treat "" as known routes the empty-zone cases into
+    the Tier 3 both-any permit -> RED. undefined_zone_3355_test.go covered
+    non-empty undefined zones and the empty-Zones config but not the empty-string
+    selector class.
+  - A2 (Rust follow-up, NOT done here): asserting the `then reject` ICMP output
+    bytes (type 3 code 13 / ICMPv6 type 1 code 1, TCP RST) is a userspace-dp
+    behavior (afxdp/icmp.rs build_reject_icmp_unreachable); its existing tests
+    assert is_some/is_none, not the emitted type/code. Needs a cargo test.
+  - A5 (Rust follow-up, NOT done here): NAT64 port preservation feeding the
+    app-catalog lookup is a pure userspace-dp integration (nat64.rs translation
+    + AppCatalog::lookup); no Go seam. Needs a cargo test.
+  Tests-only, no production change (no bug surfaced — regression-safety-net
+  gaps). go test green on pkg/policymatch, pkg/dataplane/userspace, pkg/config;
+  go build ./... clean; gofmt/vet clean.
+- **File(s)**: pkg/dataplane/userspace/host_inbound_protocols_all_4411_test.go
+  (new), pkg/policymatch/empty_zone_4411_test.go (new), _Log.md
 ## 2026-07-07 — #4412 (avo-review-007 backlog E3): document flow-based FBF/PBR
 
 - **Timestamp**: 2026-07-07
