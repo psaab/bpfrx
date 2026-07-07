@@ -52,7 +52,7 @@ pub(crate) use source::{
     SourceNatFailure, SourceNatFailureReason, SourceNatFlowKey, SourceNatLookup, SourceNatRule,
     match_source_nat, match_source_nat_result, match_source_nat_result_for_tuple,
     parse_source_nat_rules, parse_source_nat_rules_with_previous, release_source_nat_allocation,
-    rollback_source_nat_allocation,
+    reserve_synced_source_nat_allocation, rollback_source_nat_allocation,
 };
 pub(crate) use static_nat::{StaticNatEntry, StaticNatTable};
 pub(crate) use status::source_nat_pool_statuses;
