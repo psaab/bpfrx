@@ -335,6 +335,44 @@ pub(super) fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot 
     snapshot
 }
 
+/// #4392: a snapshot whose reth1.0 input filter carries a PBR
+/// `then { routing-instance sfmix; <action>; }` term for BOTH inet and inet6,
+/// where `action` is `"reject"` / `"discard"` (a DROP term) or `""` (an
+/// accept-only routing-instance override, the no-regression forward case).
+/// Used to prove the drop-action gate on `ingress_route_table_override`: a
+/// reject/discard term must return `RouteOverride::Drop`, an accept term must
+/// still return `RouteOverride::Table("sfmix.inet[6].0")`.
+pub(super) fn native_gre_pbr_action_snapshot(action: &str) -> ConfigSnapshot {
+    let mut snapshot = native_gre_pbr_snapshot(true);
+    // Stamp the action onto the existing v4 routing-instance term
+    // (`sfmix-route`, the first term of the first filter).
+    snapshot.filters[0].terms[0].action = action.to_string();
+    // Wire an inet6 sibling filter so the v6 path exercises the same gate.
+    if let Some(iface) = snapshot.interfaces.iter_mut().find(|i| i.name == "reth1.0") {
+        iface.filter_input_v6 = "sfmix-pbr6".to_string();
+    }
+    snapshot.filters.push(FirewallFilterSnapshot {
+        name: "sfmix-pbr6".to_string(),
+        family: "inet6".to_string(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "sfmix-route6".to_string(),
+                destination_addresses: vec!["2001:559:8585:80::/64".to_string()],
+                routing_instance: "sfmix".to_string(),
+                action: action.to_string(),
+                log: true,
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "default".to_string(),
+                action: "accept".to_string(),
+                ..Default::default()
+            },
+        ],
+    });
+    snapshot
+}
+
 pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> ConfigSnapshot {
     ConfigSnapshot {
         // #2391: the interface references "wan"; define it so the forwarding

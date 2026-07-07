@@ -279,7 +279,11 @@ sync.
     (the frame `TermMatchExtra` carries `is_fragment` + `l4_present = false`,
     so an `is-fragment` term matches while tcp-flags / icmp-type / flex
     predicates fail closed); (2) `ingress_route_table_override` PBR, then a
-    route lookup against the override table when a PBR term matched;
+    route lookup against the override table when a PBR term matched — a
+    routing-instance term that also carries `reject`/`discard` returns
+    `RouteOverride::Drop` (#4392) and the packet is recycled here (silently,
+    no reject reply is synthesized on the flowless path), NEVER forwarded into
+    the routing instance;
     (3) zone policy via `evaluate_policy_result_l3_aware(.., l4_present =
     false)` — gated to `ForwardCandidate` (transit) so host-inbound
     (#3292) / NoRoute / fabric arms are untouched. The `MissingNeighbor`

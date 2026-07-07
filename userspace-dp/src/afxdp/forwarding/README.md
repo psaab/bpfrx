@@ -199,11 +199,26 @@ limitation, tracked by #2387.
   interface's native `routing_instance` selects only the connected-route
   table NAME (#2388 above) — it does NOT scope a transit packet's
   destination-FIB lookup. Only a PBR interface filter's
-  `ingress_route_table_override` (`forwarding/mod.rs`, sole caller in
+  `ingress_route_table_override` (`forwarding/mod.rs`, callers in
   `poll_descriptor/mod.rs`) actually steers a transit packet to a per-VRF
   table. In default (non-PBR) mode the destination FIB is the global
   `inet.0`/`inet6.0` and local-delivery uses the global `local_v[46]` sets,
   so overlapping-address multi-VRF does not forward correctly there at all.
+- **PBR `routing-instance` + a drop action is a DENY, not a forward (#4392).**
+  A term `from { ... } then { routing-instance X; reject | discard; }` carries
+  BOTH a routing-instance override AND a terminating drop action. Before #4392
+  `ingress_route_table_override` applied the override unconditionally and the
+  packet was FORWARDED into VRF X — a VRF leak plus a false audit (the filter
+  log recorded a deny while the data plane forwarded). It now returns a
+  three-way `RouteOverride { None | Table(<ri>) | Drop }`: a `reject`/`discard`
+  action returns `Drop`, so the caller recycles the frame and never
+  route-looks-up/forwards. On the flow-backed session-miss path a
+  `PbrRejectSink` is supplied, so a `reject` synthesizes the TCP RST /
+  ICMP-unreachable reply exactly like a non-PBR `then reject` (and the filter
+  log reports the truthful REJECT); a `discard`, and the flowless path (a
+  non-first fragment / L3-only packet has no L4 header to reflect), drop
+  silently. An accept-only routing-instance term still returns `Table(<ri>)`
+  and forwards — normal PBR is unchanged.
 - **PBR per-VRF forwarding is NOT session-isolated.** Because the identity
   is the bare 5-tuple, the established-session fast path
   (`resolve_flow_session_decision`) runs BEFORE the PBR table override, so
