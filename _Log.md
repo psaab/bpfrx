@@ -1,3 +1,36 @@
+## 2026-07-06 — #4433: fail the commit closed when IPsec render/reload fails
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed C172-H01 (#4433). The commit/apply path swallowed the
+  `d.ipsec.Apply()` error at WARN (`daemon_apply.go` step 6), so a swanctl
+  render/write/`--load-all` failure was logged and IGNORED. Because
+  `swanctl --load-all` leaves the previously-loaded config in place on
+  failure, the OLD tunnels stayed active while a NEW config was reported
+  committed — the enforced IPsec runtime silently diverged from the
+  committed policy (stale security runtime). Verify-first confirmed the
+  Manager side was already correct: `applyConfig`/`reload` return the error
+  up through `Manager.Apply`; the bug was purely the daemon swallow.
+  Fix: capture the error into `ipsecErr` and join it into the
+  `applyConfigLocked` tail result alongside `networkdErr` / `dhcpServerErr`
+  / `hostInboundErr` / `lo0Err` (the established fail-closed-on-commit
+  pattern, #1778/#2987/#3333/#3392). The config stays promoted + peer-synced
+  and every remaining reconcile step still runs (non-fatal best-effort
+  error class per `applyErrSkipsPeerSync`), so the operator sees a
+  degraded-state error surfaced by `commitAndApply` instead of a false
+  success. The DHCP-lease re-render path (`reapplyIPsecForLeaseChange`) is a
+  fire-and-forget event handler with no operator-facing commit result and is
+  intentionally left logging at WARN.
+- **RED-on-revert**: `TestApplyConfigLocked_IPsecApplyErrorFailsCommit`
+  (pkg/daemon) drives `applyConfigLocked` with the swanctl configDir pointed
+  at an unwritable path and asserts the return mentions "IPsec"; verified RED
+  (returns nil, error swallowed) when the fix is reverted. Companion
+  `TestApplyReloadErrorPropagates` (pkg/ipsec) documents the Manager reload
+  contract via the swanctl seam. `go test ./pkg/ipsec/... ./pkg/daemon/...`
+  green; `go build ./...`; gofmt/vet clean.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_ipsec_apply_test.go,
+  pkg/ipsec/reload_error_4433_test.go, pkg/ipsec/README.md, _Log.md
+
 ## 2026-07-06 — #4426: reject single-family prefix-lists under `family any`
 
 - **Timestamp**: 2026-07-06
