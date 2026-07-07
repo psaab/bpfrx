@@ -289,6 +289,17 @@ pub(super) fn delete_dnat_table_entry(
 pub(super) static DNAT_DELETE_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// #4393 fail-on-revert instrumentation: counts `publish_dnat_table_entry`
+// syscall attempts (an SNAT flow with a live table fd). Used by the
+// coordinator peer-synced-install wiring test in afxdp/ha_tests.rs to prove
+// `upsert_synced_session` publishes the reverse-SNAT `dnat_table` entry for a
+// synced SNAT session — RED if the publish call is removed from
+// `upsert_synced_session` (the standby loses the embedded-ICMP steering entry
+// and PMTUD blackholes after failover). Test-only; mirrors DNAT_DELETE_ATTEMPTS.
+#[cfg(test)]
+pub(super) static DNAT_PUBLISH_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[must_use]
 pub(super) fn publish_dnat_table_entry(
     fds: &DnatTableFds,
@@ -319,6 +330,11 @@ pub(super) fn publish_dnat_table_entry(
             dv[4..6].copy_from_slice(&key.src_port.to_be_bytes());
             dv[6] = 0;
 
+            // #4393: count the keyed publish attempt so the synced-install
+            // wiring is testable without a real BPF map (test-only, no-op in
+            // release). Mirrors DNAT_DELETE_ATTEMPTS on the delete side.
+            #[cfg(test)]
+            DNAT_PUBLISH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rc = unsafe {
                 libbpf_sys::bpf_map_update_elem(
                     fd,
@@ -363,6 +379,9 @@ pub(super) fn publish_dnat_table_entry(
             };
             let (dk, dv) = dnat_v6_entry_bytes(key.protocol, snat_v6, snat_port, orig_v6, key.src_port);
 
+            // #4393: count the keyed publish attempt (test-only; see the v4 arm).
+            #[cfg(test)]
+            DNAT_PUBLISH_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rc = unsafe {
                 libbpf_sys::bpf_map_update_elem(
                     fd,

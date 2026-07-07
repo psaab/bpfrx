@@ -762,6 +762,104 @@ fn delete_synced_session_zero_generation_is_unconditional() {
     );
 }
 
+// --- #4393 peer-synced SNAT reverse-NAT dnat_table publish/delete wiring ----
+
+fn synced_snat_entry() -> SyncedSessionEntry {
+    let mut decision = test_decision();
+    // Forward SNAT: the client source is rewritten to the WAN pool
+    // (addr, port) — exactly what the primary published into dnat_table.
+    decision.nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        rewrite_src_port: Some(54321),
+        ..NatDecision::default()
+    };
+    SyncedSessionEntry {
+        key: test_key(),
+        decision,
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+        generation: 0,
+    }
+}
+
+/// #4393 FAIL-ON-REVERT: installing a peer-synced forward SNAT session on the
+/// standby must publish the reverse-SNAT `dnat_table` entry (the embedded-ICMP
+/// steering map), and deleting the session must release it. Without the publish
+/// the standby has no reverse-NAT steering entry, so after failover an inbound
+/// embedded-ICMP error (PMTUD Too-Big / traceroute Time-Exceeded) quoting the
+/// NATed inner packet is not steered to the helper and is never reverse-NAT'd
+/// back to the original client (PMTUD blackhole).
+///
+/// Real BPF maps cannot be created under `cargo test` (the host runs with
+/// `kernel.unprivileged_bpf_disabled`), so the publish/delete are observed via
+/// the test-only `DNAT_PUBLISH_ATTEMPTS` / `DNAT_DELETE_ATTEMPTS` counters bumped
+/// inside `publish_dnat_table_entry` / `delete_dnat_table_entry` whenever a
+/// keyed syscall is issued. The fd is `-1` (EBADF after the keyed attempt is
+/// counted). RED on revert: remove the publish from `upsert_synced_session` and
+/// the SNAT publish assertion fails; remove the delete from
+/// `delete_synced_session_gen` and the SNAT delete assertion fails. The
+/// non-SNAT control guards against publishing/deleting for flows that carry no
+/// source rewrite.
+#[test]
+fn synced_snat_install_publishes_and_delete_releases_dnat_table_entry() {
+    use crate::afxdp::checksum::{DNAT_DELETE_ATTEMPTS, DNAT_PUBLISH_ATTEMPTS};
+
+    // Serialize against any other test touching the process-global counters.
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = GUARD.lock().expect("counter guard");
+
+    let mut coordinator = Coordinator::new();
+    // A live v4 dnat_table fd so the publish/delete path is reached; -1 makes
+    // the syscall a harmless EBADF after the keyed attempt is counted.
+    coordinator.bpf_maps.dnat_table_fd = Some(OwnedFd { fd: -1 });
+    let key = test_key();
+
+    // Forward SNAT synced install must publish the reverse-SNAT entry.
+    let before_pub = DNAT_PUBLISH_ATTEMPTS.load(Ordering::Relaxed);
+    coordinator.upsert_synced_session(synced_snat_entry());
+    let after_pub = DNAT_PUBLISH_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_pub - before_pub,
+        1,
+        "peer-synced forward SNAT install must publish the reverse-SNAT dnat_table entry \
+         (#4393); got {} attempts",
+        after_pub - before_pub
+    );
+
+    // Deleting the synced SNAT session must release the reverse-SNAT entry.
+    let before_del = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    coordinator.delete_synced_session(key.clone());
+    let after_del = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_del - before_del,
+        1,
+        "deleting the synced SNAT session must release its reverse-SNAT dnat_table entry \
+         (#4393); got {} attempts",
+        after_del - before_del
+    );
+
+    // Non-SNAT control: a plain synced session (test_decision -> no source
+    // rewrite) publishes and deletes nothing.
+    let before_pub2 = DNAT_PUBLISH_ATTEMPTS.load(Ordering::Relaxed);
+    coordinator.upsert_synced_session(synced_entry_with_generation(0));
+    let after_pub2 = DNAT_PUBLISH_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_pub2 - before_pub2,
+        0,
+        "a non-SNAT synced install must not publish a dnat_table entry"
+    );
+    let before_del2 = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    coordinator.delete_synced_session(key);
+    let after_del2 = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_del2 - before_del2,
+        0,
+        "deleting a non-SNAT synced session must not attempt a dnat_table delete"
+    );
+}
+
 // #2962: kicking an export for an EMPTY owner-RG set is a no-op — it must
 // not consume an export sequence and the wait must drain nothing, preserving
 // the pre-split early return semantics.

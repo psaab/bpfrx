@@ -351,6 +351,50 @@ source tuple (reply mis-delivery / a session-hijack surface).
   allocator is process-global (`Arc<PortAllocatorShared>`), so the reservation
   is visible to every worker regardless of which one imported the session.
 
+### Reverse-SNAT `dnat_table` Publish for Synced Sessions (#4393)
+
+The `dnat_table` / `dnat_table_v6` BPF maps are the **embedded-ICMP reverse-NAT
+steering** maps. When an inbound ICMP error (PMTUD Packet-Too-Big, traceroute
+Time-Exceeded) quotes a NATed inner packet whose source is a source-NAT pool
+`(addr, port)`, the AF_XDP shim looks that tuple up in `dnat_table` to decide the
+packet must be handed to the helper's slow path, where `try_embedded_icmp_nat_match`
+reverse-translates the error back to the original pre-NAT client. Without the
+`dnat_table` entry the shim passes the error to the kernel (which has no NAT
+state) — the client never learns the PMTU, TCP stalls on large packets, and
+traceroute breaks.
+
+The active node populates `dnat_table` from the worker poll path
+(`poll_descriptor`, `publish_dnat_table_entry`) when it forwards the first SNAT'd
+packet of a flow. The standby never forwards that packet — it imports the
+pre-computed NAT decision over the fabric — so before #4393 the standby held no
+`dnat_table` entry for synced SNAT sessions. Post-failover the standby-turned-active
+could not steer the inbound embedded-ICMP error into the helper, so PMTUD
+blackholed for exactly the flows that survived the failover.
+
+- **Publish site:** `Coordinator::upsert_synced_session` (`afxdp/ha.rs`) calls
+  `publish_dnat_table_entry` for every forward peer-synced entry, immediately
+  after the `publish_shared_session` that populates the (also process-global)
+  `shared_nat_sessions` reverse-NAT map. `dnat_table` is a **single shared BPF
+  map** (opened once, its fds cloned to every worker), so this is a
+  once-per-synced-session publish, mirroring the primary's single publish rather
+  than a redundant per-worker write. It is **not** gated on
+  `synced_entry_allows_local_replace` (unlike the forward session-map publish):
+  the `dnat_table` is a passive steering map that must be ready the instant this
+  node becomes active, and inbound SNAT-return traffic never reaches the standby,
+  so an early entry is inert until failover. A reverse companion carries no
+  source rewrite and publishes nothing.
+- **Release site:** `Coordinator::delete_synced_session_gen` (`afxdp/ha.rs`)
+  calls `delete_dnat_table_entry` alongside the session-map delete, keyed on the
+  same `dnat_v4_key_bytes` / `dnat_v6_key_bytes` SSOT the publish used, so the
+  delete byte-matches the insert. The maps are non-LRU `HASH`
+  (`max_entries = MAX_SESSIONS`, `BPF_F_NO_PREALLOC`); a missing delete leaks one
+  slot per removed synced SNAT session. A non-SNAT / reverse entry is a no-op.
+- **Observability:** a failed publish from this coordinator path (no per-binding
+  `BindingLiveState`) bumps the shared `DNAT_PUBLISH_ERRORS_SHARED` static, which
+  `Coordinator::dnat_publish_errors_total()` folds into the existing per-binding
+  sum for `xpf_userspace_dnat_publish_errors_total` — so map-pressure reverse-NAT
+  loss stays operator-visible on the standby path too (#2244 parity).
+
 ### Event Stream (Primary Path)
 
 The Rust helper pushes session events over a persistent binary-framed Unix

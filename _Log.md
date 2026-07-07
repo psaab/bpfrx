@@ -1,3 +1,54 @@
+## 2026-07-06 — #4393: publish reverse-SNAT dnat_table entry for synced SNAT sessions
+
+- **Timestamp**: 2026-07-06
+- **Action**: After failover, a synced SNAT session's embedded-ICMP error
+  (PMTUD Packet-Too-Big / traceroute Time-Exceeded, quoting the NATed inner
+  packet) could not be reverse-NAT'd back to the original client, because the
+  SECONDARY never published the `dnat_table` / `dnat_table_v6` BPF-map entry for
+  the synced SNAT session. The `dnat_table` is the embedded-ICMP reverse-NAT
+  STEERING map: the AF_XDP shim looks up the inbound error's inner
+  `(proto, snat_addr, snat_port)` there to decide the packet must go to the
+  helper's slow path (`try_embedded_icmp_nat_match`). The active node populates
+  it from the worker poll path (`poll_descriptor`, `publish_dnat_table_entry`)
+  when it forwards the first SNAT'd packet; the standby imports the pre-computed
+  NAT decision and never forwards that packet, so it held no `dnat_table` entry
+  — post-failover the inbound ICMP error was passed to the kernel (no NAT state)
+  instead of reverse-NAT'd, so the client never saw the PMTU (TCP stalls on
+  large packets) and traceroute broke (PMTUD blackhole). Fix: publish the
+  reverse-SNAT `dnat_table` entry once per synced forward SNAT session in the
+  coordinator `Coordinator::upsert_synced_session` (`afxdp/ha.rs`), immediately
+  after the existing `publish_shared_session` that populates the process-global
+  `shared_nat_sessions` reverse-NAT map — the `dnat_table` is likewise a single
+  global map, so a once-per-session coordinator publish mirrors the primary's
+  single publish (not a redundant per-worker write). Published unconditionally
+  (NOT gated on `synced_entry_allows_local_replace`, unlike the forward
+  session-map publish) so it is ready the instant this node becomes active; the
+  standby never receives inbound SNAT-return traffic, so an early entry is inert.
+  The matching delete (`delete_dnat_table_entry`, same `dnat_v4/v6_key_bytes`
+  SSOT) runs in `Coordinator::delete_synced_session_gen` alongside the
+  session-map delete, so a peer delete-sync / GC reap frees the entry (non-LRU
+  HASH maps leak one slot per un-deleted SNAT session otherwise). Added shared
+  `DNAT_PUBLISH_ERRORS_SHARED` counter (folded into
+  `dnat_publish_errors_total` → `xpf_userspace_dnat_publish_errors_total`) so a
+  failed coordinator publish stays operator-visible (#2244 parity, no
+  per-binding context on this path). Added test-only `DNAT_PUBLISH_ATTEMPTS`
+  counter (mirrors `DNAT_DELETE_ATTEMPTS`) for the RED-on-revert wiring test.
+- **File(s)**: `userspace-dp/src/afxdp/ha.rs`,
+  `userspace-dp/src/afxdp/checksum.rs`,
+  `userspace-dp/src/afxdp/bpf_map/metrics.rs`,
+  `userspace-dp/src/afxdp/coordinator/status.rs`,
+  `userspace-dp/src/afxdp/ha_tests.rs`, `docs/session-sync-architecture.md`
+- **Validation**: RED-on-revert Rust test
+  `synced_snat_install_publishes_and_delete_releases_dnat_table_entry`
+  (`afxdp/ha_tests.rs`): a peer-synced forward SNAT install attempts exactly one
+  `dnat_table` publish; the delete attempts exactly one keyed delete; a non-SNAT
+  synced session publishes/deletes nothing. RED verified by neutralizing the
+  publish (`got 0 attempts`). Full cargo serial
+  (`cargo test --release -- --test-threads=1`): 3638 + 54 + 8 + 22 + 1
+  passed / 0 failed, 2 ignored. HA post-failover embedded-ICMP behavior —
+  parent to run `make test-failover` (a synced SNAT session + a PMTUD ICMP after
+  failover reverse-translates) before merge.
+
 ## 2026-07-06 — #4388: reserve a peer-synced session's NAT pool port on the standby
 
 - **Timestamp**: 2026-07-06
