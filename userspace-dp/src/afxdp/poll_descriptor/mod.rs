@@ -1964,10 +1964,15 @@ pub(super) fn poll_binding_process_descriptor(
                         // peer RST tearing down a firewall-originated TCP session
                         // (BGP, IKE, management) still reaches the local stack,
                         // and NoRoute / FabricRedirect / HAInactive never seed a
-                        // local session from this packet. Legitimate cross-
-                        // chassis teardowns for a peer-owned session take the
-                        // `cluster_peer_return_fast_path` above (which exits
-                        // before this point), so no fabric exemption is needed.
+                        // local session from this packet. Legitimate teardowns
+                        // for a SYNCED peer-owned session are session HITs served
+                        // by `resolve_flow_session_decision` before the fast path;
+                        // a session-MISS fabric-ingress bare RST/FIN now falls
+                        // through `cluster_peer_return_fast_path` (which REFUSES
+                        // it per #4453) and is dropped RIGHT HERE by this
+                        // strict-syn-check — so the local guard and the #4453
+                        // fabric arm give consistent bare-RST/FIN handling on
+                        // both the local and fabric-ingress paths.
                         // Counted in the aggregate `screen_drops` flow-statistics
                         // tally (no per-reason ordinal — that array mirrors the
                         // Junos SCREEN checks, and strict-syn-check is a flow
