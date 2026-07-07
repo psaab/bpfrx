@@ -624,6 +624,18 @@ func buildMonitorTrafficArgv(iface, filter, count string) []string {
 // token here gives the operator a clear error instead of an opaque libpcap
 // compile failure.
 func monitorFilterOptionToken(tok string) bool {
+	// #4556 N-01: a mismatched-quote wrapper (e.g. `'-w ...` / `"-z ...`)
+	// can leave a literal leading quote on the token, so tok[0] is `'`/`"`
+	// instead of `-` and a smuggled option would slip past the tok[0]=='-'
+	// check. Peel one leading quote before testing. The "--" separator in
+	// buildMonitorTrafficArgv already neutralizes any such option downstream
+	// (#4527), so this only closes a defense-in-depth validator gap — but it
+	// keeps the operator error clear rather than opaque. A legitimate pcap
+	// filter primitive never begins with a quote, so peeling one is a no-op
+	// for normal tokens (host/port/tcp/... and a bare "-").
+	if len(tok) > 0 && (tok[0] == '\'' || tok[0] == '"') {
+		tok = tok[1:]
+	}
 	return len(tok) > 1 && tok[0] == '-'
 }
 

@@ -650,8 +650,10 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 // come from BOTH spellings the compilers read:
 //
 //   - packed Keys (`name-server 1.1.1.1`, bracketed `[ a b ]` lists,
-//     and ranges where the fixed mid-token `to` is a separator:
-//     `destination-port 20000 to 20003`), and
+//     and — only on a leaf that opts in via rangeSeparator — ranges
+//     where the fixed mid-token `to` is a separator:
+//     `destination-port 20000 to 20003`. On every other typed multi
+//     leaf `to` is validated as an ordinary value, #4556 L-01), and
 //   - the hierarchical block-list shape, one child node per value
 //     (`name-server { 1.1.1.1; 8.8.8.8; }`). Only each child's FIRST
 //     token is validated — the compilers read exactly that
@@ -670,7 +672,13 @@ func validateMultiValueLeaf(node *Node, leafSchema *schemaNode, parentPath []str
 	validatedAny := false
 	lastWasSeparator := false
 	for _, tok := range node.Keys[1:] {
-		if tok == "to" {
+		// #4556 L-01: the fixed mid-token `to` is only a RANGE separator
+		// for a leaf that opts in via rangeSeparator (port-range /
+		// NAT-pool-address). For every other typed multi leaf — the
+		// IP/CIDR and session-log-flag leaves that actually reach this
+		// walker — `to` is an ordinary value token and is validated (and
+		// rejected) as such, not silently skipped.
+		if leafSchema.rangeSeparator && tok == "to" {
 			if !validatedAny || lastWasSeparator {
 				return typedLeafErrorf(path, "missing value")
 			}

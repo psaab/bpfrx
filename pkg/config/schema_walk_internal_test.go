@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -17,12 +18,16 @@ import (
 func runMultiValueTail(t *testing.T, leafKeys []string) error {
 	t.Helper()
 	// Typed multi leaf accepting bare integers in [0..65535] (port-like),
-	// no schema children → value-tail/range shape.
+	// no schema children → value-tail/range shape. rangeSeparator opts it
+	// in to `<a> to <b>` range handling — this synthetic leaf models a
+	// port-range leaf, the only class for which `to` is a separator
+	// (#4556 L-01).
 	leafSchema := &schemaNode{
-		args:      1,
-		multi:     true,
-		valueType: ValueInteger,
-		validator: ValidateInteger(0, 65535),
+		args:           1,
+		multi:          true,
+		valueType:      ValueInteger,
+		validator:      ValidateInteger(0, 65535),
+		rangeSeparator: true,
 	}
 	parent := &schemaNode{children: map[string]*schemaNode{
 		"destination-port": leafSchema,
@@ -91,6 +96,49 @@ func TestWalker_MultiValueTail_RejectsDanglingSeparator(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "missing value") {
 			t.Fatalf("error should describe missing value for %v: %v", keys, err)
+		}
+	}
+}
+
+// runMultiValueNoRange drives validateMultiValueLeaf on a typed multi leaf
+// that does NOT opt in to rangeSeparator (the class of every production leaf
+// that actually reaches this walker — name-server, virtual-address,
+// dns-server-address, session-log flags). Its validator accepts any non-empty
+// token so a value literally spelled "to" is a legitimate member, letting us
+// pin that `to` is NOT special-cased as a range separator here (#4556 L-01).
+func runMultiValueNoRange(t *testing.T, leafKeys []string) error {
+	t.Helper()
+	leafSchema := &schemaNode{
+		args:      1,
+		multi:     true,
+		valueType: ValueIdentifier,
+		validator: func(raw string, _ *Config) error {
+			if raw == "" {
+				return fmt.Errorf("empty value")
+			}
+			return nil
+		},
+	}
+	parent := &schemaNode{children: map[string]*schemaNode{
+		"member": leafSchema,
+	}}
+	node := &Node{Keys: leafKeys, IsLeaf: true}
+	return walkSchemaNode(node, parent, nil, nil, []*Node{node}, false)
+}
+
+// TestWalker_MultiValueTail_NonRangeToNotFalseRejected is the #4556 L-01
+// RED-on-revert discriminator: on a leaf WITHOUT rangeSeparator, a value token
+// literally "to" is validated as an ordinary member and accepted, not treated
+// as a range separator. On revert of the gate, `to` is caught as a separator
+// so `["to"]` and `["a","to"]` fail with "missing value" → RED.
+func TestWalker_MultiValueTail_NonRangeToNotFalseRejected(t *testing.T) {
+	for _, keys := range [][]string{
+		{"member", "to"},
+		{"member", "alpha", "to"},
+		{"member", "to", "beta"},
+	} {
+		if err := runMultiValueNoRange(t, keys); err != nil {
+			t.Fatalf("non-range leaf with member %v must accept a literal \"to\" value, got %v", keys, err)
 		}
 	}
 }
