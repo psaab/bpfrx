@@ -1,3 +1,36 @@
+## 2026-07-07 — #4407 Phase A: group tail reconcile dispatches (steps 8–21)
+
+- **Timestamp**: 2026-07-07
+- **Action**: Phase A of the #4407 `applyConfigLocked` decomposition
+  (PLAN-READY per the converged plan). Grouped the TAIL reconcile
+  dispatches — steps 8–21 (VRRP UpdateInstances, DNS/NTP, hostname/
+  timezone/kernel + lo0/host-inbound nft, ssh-known-hosts, syslog,
+  login+sudoers, ssh, root-auth, syslog-files/config, archive+archival+
+  archive-timer, flow-trace/exporters/dhcp-relay/lldp, event-options/rpm/
+  ipmon, interface-monitors, cluster UpdateConfig+monitor-weight,
+  transport-change restart, RSS reshape + step0 tunables) — into a new
+  helper `applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr) error`.
+  The ordering-entangled HEAD (steps 0–7: VRF/tunnel/IPVLAN/dataplane/
+  RETH-MAC/networkd/FRR) stays INLINE (Phases B/C, deferred to
+  /triple-review). This is a behavior-preserving mechanical move: the diff
+  is a pure +30-line insertion at the head/tail seam — zero lines of the
+  step 8–21 block moved. The tail reads only cfg (+ nil-guarded managers);
+  no tail step feeds a later head step. Error-join threading: the three
+  head-produced deferred errors (networkdErr/dhcpServerErr/ipsecErr) are
+  passed in as parameters; lo0Err/hostInboundErr are created inside the
+  helper at step 9.5; the helper returns the identical
+  `errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr)`
+  in the exact original operand order. Helper runs synchronously in the
+  caller's goroutine under d.applySem (caller holds it) — lock discipline
+  preserved; the async apply callbacks all live in the head.
+- **File(s)**: pkg/daemon/daemon_apply.go, _Log.md
+- **Validation**: gofmt clean, `go build ./...` green, `go vet ./pkg/daemon/`
+  clean, `go test ./pkg/daemon/...` green — including all 6 named
+  characterization tests (snmp/flowexport/dhcprelay/policy-scheduler/
+  persistent-snat/runtime-result). NOTE: HA reconcile/apply path — a
+  cluster-smoke (test-failover: deploy + apply config + confirm no reconcile
+  regression) is warranted before merge.
+
 ## 2026-07-07 — #4406 step 6 (FINAL): extract P6a early-strict + folds from compileExpanded
 
 - **Timestamp**: 2026-07-07
