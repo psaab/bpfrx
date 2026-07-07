@@ -1,3 +1,39 @@
+## 2026-07-07 — #4375 (avo-review-007 H3): firewall-filter conflicting terminating actions rejected at commit
+
+- **Timestamp**: 2026-07-07T07:50Z
+- **Action**: Fixed #4375. A firewall-filter term specifying more than one
+  terminating action (`then accept` + `then reject`, accept+discard,
+  reject+discard) was silently accepted. `compileFilterThen` writes the action
+  onto the single-valued `FirewallFilterTerm.Action`, overwriting last-write-wins,
+  so a contradictory term compiled to whichever keyword came last with a clean
+  commit — the operator's intent was ambiguous and the compiled behavior did not
+  necessarily match what they wrote. Junos treats accept/reject/discard as
+  mutually exclusive (one terminating action per term). FIX: `compileFilterThen`
+  now records every terminating keyword on a new `FirewallFilterTerm.Terminal-
+  Actions` slice (both leaf and child AST shapes), and new
+  `validateFilterTerminalConflictStrict` hard-rejects any term whose DISTINCT
+  terminal count exceeds one, naming family/filter/term + the conflicting
+  actions. Non-terminal modifiers (count/log/forwarding-class/loss-priority/dscp/
+  traffic-class/policer/routing-instance) coexist with a terminal and are NOT
+  flagged; repeating the same terminal (redundancy) is allowed. Strict on commit,
+  downgraded to a warning on the tolerant load / peer-sync path
+  (`lenientFilterTerminalConflict`, #1960 no-brick; last-wins Action drives the
+  dataplane). Gate wired immediately after the #3308 routing-instance conflict
+  gate. RED-on-revert: `firewall_terminal_conflict_4375_test.go` — the 4 conflict
+  tests go RED (silently accepted) without the gate; the count+terminal, single-
+  terminal, and duplicate-same-terminal tests confirm no over-reject. Verified:
+  `go test ./pkg/config/...` green (regenerated the #4406 golden baseline — the
+  only diff was the new TerminalActions field, either null or ["accept"]), go
+  build ./... + vet + gofmt clean. Pre-existing unrelated failure:
+  `TestUserspaceLinkCycleDoesNotReenterLegacyLoader` (pkg/dataplane canary,
+  fails identically on clean origin/master). Docs: docs/config-schema.md #4375
+  section.
+- **File(s)**: pkg/config/compiler_firewall.go, pkg/config/types_system.go,
+  pkg/config/compiler_validate_strict_filter.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/firewall_terminal_conflict_4375_test.go,
+  pkg/config/testdata/golden_4406.json, docs/config-schema.md, _Log.md
+
 ## 2026-07-07 — #4483 (opus-172 M-6): DDNS unsigned-UPDATE forgeable-rcode warn
 
 - **Timestamp**: 2026-07-07T15:40Z
