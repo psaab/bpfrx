@@ -127,10 +127,36 @@
 //! instead of resetting. A pool that changed (addresses added / removed /
 //! reordered) still gets a fresh allocator — the old reservations reference a
 //! different pool. This mirrors source NAT's `previous_allocators` reuse in
-//! `parse_source_nat_rules_with_previous`. The COMPLEMENTARY cross-node
-//! HA-failover reservation sync (`Nat64ReverseInfo` + reserve-on-standby) is
-//! tracked in #4512; this is the same-node reload path only. Pinned by the
-//! fail-on-revert test `nat64_4518_allocator_survives_config_reload`.
+//! `parse_source_nat_rules_with_previous`. Pinned by the fail-on-revert test
+//! `nat64_4518_allocator_survives_config_reload`.
+//!
+//! ## Port-reservation sync across a cross-node HA failover (#4512)
+//!
+//! The COMPLEMENTARY case to the reload path above: a NAT64 forward flow's
+//! translated `(pool v4, port)` is picked by `allocate_source` on the ACTIVE
+//! node and synced to the standby inside the [`NatDecision`] (`rewrite_src_port`
+//! rides the wire — no new field). But the standby imports that pre-computed
+//! decision and never runs `allocate_source`, so its NAT64 allocator has no
+//! record the port is in use. Post-failover the standby-turned-active would
+//! then `allocate_source` the SAME `(snat_v4, port)` for a fresh local flow —
+//! two forward flows colliding on one translated source, the same RFC 6146 BIB
+//! violation #4381 closed for the same-node case, reappearing across a failover
+//! (1:N reverse index → v4→v6 reply mis-demux).
+//!
+//! [`reserve_synced_nat64_allocation`] closes this by applying #4388's
+//! source-NAT `reserve_synced_source_nat_allocation` treatment to NAT64: on the
+//! standby, `handle_upsert_synced` reserves the synced forward flow's translated
+//! port in the local NAT64 allocator (via `reserve_nat64_pool_port` →
+//! `PortAllocator::reserve_flow`, without advancing the round-robin cursor), and
+//! the EXISTING teardown path (`release_nat64_allocation` on reap / purge /
+//! delete-sync) frees it with the same flow key. Pinned by the fail-on-revert
+//! test `nat64_4512_synced_session_reserves_translated_port`.
+//!
+//! Scope: this closes the port-COLLISION harm. Reverse-TRANSLATION of a
+//! promoted synced NAT64 session (restoring the original client v6 address)
+//! still needs `Nat64ReverseInfo` — `orig_src_v6` / `orig_dst_v6`, which are NOT
+//! reconstructible from `NatDecision` — to ride the sync payload; that is a
+//! separate wire-field follow-up (`ha.rs` sets `nat64_reverse: None`).
 
 use crate::NAT64RuleSnapshot;
 // #2844: shared SSOT in-place Ethernet-header writer (one writer for
@@ -144,7 +170,7 @@ use crate::afxdp::write_eth_header_slice;
 use crate::afxdp::MAX_IPV6_EXT_HEADERS;
 use crate::nat::{
     NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey, allocate_nat64_pool_port,
-    release_nat64_pool_port,
+    release_nat64_pool_port, reserve_nat64_pool_port,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -651,6 +677,69 @@ pub(crate) fn rollback_nat64_allocation(
     now_ns: u64,
 ) {
     release_nat64_allocation_with_mode(nat64, key, nat, is_reverse, now_ns, true);
+}
+
+/// #4512: reserve a peer-synced NAT64 forward flow's translated pool port in
+/// THIS node's NAT64 allocator so a post-failover local allocation cannot hand
+/// the same `(snat_v4, port/identifier)` to a fresh flow — the #4388 treatment
+/// applied to NAT64.
+///
+/// The active node picks the translated `(pool v4, port)` via `allocate_source`
+/// and syncs the finished [`NatDecision`] over the fabric (the translated port
+/// rides `rewrite_src_port`, which IS synced — no new wire field). The standby
+/// imports that pre-computed decision and never runs `allocate_source` itself,
+/// so its NAT64 allocator has no record that `(snat_v4, port)` is in use.
+/// Post-failover the standby-turned-active would then `allocate_source` the
+/// SAME tuple for a new local flow — two forward flows colliding on one
+/// translated source, so the 1:N reverse (v4→v6) index bucket mis-demuxes the
+/// server's replies (reply mis-delivery / session-hijack surface, the exact
+/// RFC 6146 BIB violation #4381 closed for the same-node case).
+///
+/// This is a no-op unless this is the FORWARD entry of a NAT64 flow carrying a
+/// translated source port (`is_reverse == false && nat.nat64 &&
+/// rewrite_src == V4 && rewrite_src_port.is_some()`). The flow key is rebuilt
+/// EXACTLY as `Nat64State::allocate_source` built it and
+/// `release_nat64_allocation` frees it — `dst_ip` is the translated IPv4
+/// destination (`nat.rewrite_dst`), NOT the synthetic v6 destination on the
+/// session key — so the SAME-key release on the standard teardown path
+/// (`handle_delete_synced` / reap / purge, already calling
+/// `release_nat64_allocation`) returns the reservation with no new delete site.
+/// If the synced pool address is not a member of ANY local NAT64 pool (config
+/// drift between nodes) the reserve is skipped gracefully — no panic, no
+/// reservation on the wrong pool.
+pub(crate) fn reserve_synced_nat64_allocation(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+) {
+    if is_reverse || !nat.nat64 {
+        return;
+    }
+    let Some(IpAddr::V4(snat_v4)) = nat.rewrite_src else {
+        return;
+    };
+    let Some(port) = nat.rewrite_src_port else {
+        return;
+    };
+    let flow = SourceNatFlowKey {
+        protocol: key.protocol,
+        src_ip: key.src_ip,
+        dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
+        src_port: key.src_port,
+        dst_port: key.dst_port,
+    };
+    for prefix in &nat64.prefixes {
+        // The NAT64 allocator is sized to `pool_v4.len()` with
+        // `family_offset == 0`, so the absolute allocator index equals the
+        // address's position in `pool_v4` (mirrors `allocate_nat64_pool_port`).
+        let Some(addr_index) = prefix.pool_v4.iter().position(|a| *a == snat_v4) else {
+            continue;
+        };
+        if reserve_nat64_pool_port(&prefix.port_allocator, flow, snat_v4, port, addr_index) {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

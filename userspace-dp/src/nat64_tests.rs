@@ -2989,6 +2989,177 @@ fn nat64_4381_reverse_entry_release_is_noop() {
     );
 }
 
+// === #4512: cross-node HA-failover port-reservation sync ===
+//
+// The synthetic v6 destination the forward NAT64 session key carries; the
+// reserve/allocate flow key uses the TRANSLATED v4 destination
+// (`nat.rewrite_dst`) instead, so this exact value is not load-bearing.
+fn nat64_synced_key(client: &str) -> crate::session::SessionKey {
+    crate::session::SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V6(client.parse().unwrap()),
+        dst_ip: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        src_port: 5000,
+        dst_port: 443,
+    }
+}
+
+// A fresh local NAT64 flow from a distinct client to 8.8.8.8, used to probe
+// whether a prior reservation forced the sequential allocator to skip a port.
+fn nat64_probe_alloc(state: &Nat64State) -> (Ipv4Addr, u16) {
+    state
+        .allocate_source(
+            0,
+            crate::ip_proto::PROTO_TCP,
+            "2001:db8::2".parse().unwrap(),
+            Ipv4Addr::new(8, 8, 8, 8),
+            5000,
+            443,
+            1,
+        )
+        .expect("probe flow allocates")
+}
+
+// #4512 FAIL-ON-REVERT: a peer-synced NAT64 forward flow's translated pool port
+// must be RESERVED in the standby's LOCAL NAT64 allocator, so a post-failover
+// local `allocate_source` cannot hand the SAME (snat_v4, port) to a new flow —
+// two forward flows colliding on one translated source, the RFC 6146 BIB
+// violation (#4381) reappearing across a cross-node failover.
+//
+// The standby imports the active node's pre-computed NAT64 decision but never
+// runs `allocate_source`, so before the fix its allocator had no record that
+// (snat_v4, port) was in use and a fresh local flow reused it. Reverting
+// `reserve_synced_nat64_allocation` (or its call site at `handle_upsert_synced`)
+// makes the "new flow must NOT get the synced port" assertion RED.
+#[test]
+fn nat64_4512_synced_session_reserves_translated_port() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // The active node translated a synced flow to (198.51.100.1, 1024) — 1024 is
+    // the FIRST sequential NAT64 port, the sharpest collision case: a fresh
+    // allocation's cursor picks it first unless the reservation forces a skip.
+    let key = nat64_synced_key("2001:db8::1");
+    let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
+    reserve_synced_nat64_allocation(&state, &key, synced, false);
+
+    // A NEW local flow (different client) allocates from the same one-address
+    // pool: it MUST skip the reserved 1024 and hand out 1025. On revert (no
+    // reservation) it returns 1024 — a collision with the still-live synced
+    // session.
+    let (snat2, port2) = nat64_probe_alloc(&state);
+    assert_eq!(snat2, snat, "single-address pool => same snat_v4");
+    assert_eq!(
+        port2, 1025,
+        "a post-failover local flow must NOT reuse the synced session's \
+         reserved port 1024 (#4512 collision)"
+    );
+}
+
+// #4512: a peer-synced REVERSE entry carries the destination rewrite, not the
+// translated source port, and must reserve nothing (mirrors the is_reverse
+// guard on the release path). A fresh flow then gets the first port 1024.
+#[test]
+fn nat64_4512_reverse_entry_reserves_nothing() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let key = nat64_synced_key("2001:db8::1");
+    // is_reverse = true: the reserve is a no-op.
+    let synced = Nat64State::forward_decision(snat, dst_v4, 1024);
+    reserve_synced_nat64_allocation(&state, &key, synced, true);
+    let (_, port) = nat64_probe_alloc(&state);
+    assert_eq!(port, 1024, "a reverse synced entry must not reserve a port");
+}
+
+// #4512: a non-NAT64 synced decision (e.g. a pool-mode source-NAT session,
+// whose port is reserved via `reserve_synced_source_nat_allocation`) must NOT
+// touch the NAT64 allocator — the `nat.nat64` guard keeps the two allocators
+// disjoint even when the source-NAT pool address happens to match a NAT64 pool.
+#[test]
+fn nat64_4512_non_nat64_decision_reserves_nothing() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let key = nat64_synced_key("2001:db8::1");
+    // A source-NAT-shaped decision: nat64 == false, but it carries the same
+    // translated (snat, port). The NAT64 reserve must ignore it.
+    let source_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(snat)),
+        rewrite_dst: Some(IpAddr::V4(dst_v4)),
+        rewrite_src_port: Some(1024),
+        rewrite_dst_port: None,
+        nat64: false,
+        nptv6: false,
+    };
+    reserve_synced_nat64_allocation(&state, &key, source_nat, false);
+    let (_, port) = nat64_probe_alloc(&state);
+    assert_eq!(
+        port, 1024,
+        "a non-NAT64 decision must not reserve on the NAT64 allocator"
+    );
+}
+
+// #4512: if the synced pool address is not a member of ANY local NAT64 pool
+// (config drift between HA nodes), the reserve is skipped gracefully — no panic,
+// nothing reserved, so a fresh flow gets the first port on the real pool.
+#[test]
+fn nat64_4512_foreign_pool_addr_skips_reserve() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let key = nat64_synced_key("2001:db8::1");
+    // 203.0.113.9 is NOT in the local pool [198.51.100.1] (config drift).
+    let foreign = Nat64State::forward_decision(Ipv4Addr::new(203, 0, 113, 9), dst_v4, 1024);
+    reserve_synced_nat64_allocation(&state, &key, foreign, false);
+    let (snat, port) = nat64_probe_alloc(&state);
+    assert_eq!(snat, Ipv4Addr::new(198, 51, 100, 1));
+    assert_eq!(
+        port, 1024,
+        "a foreign pool address must reserve nothing on the local pool"
+    );
+}
+
+// #4512: the low-level reserve/release wrappers are a symmetric pair. A reserve
+// marks (snat, port) owned for a flow; a SECOND reserve for a DIFFERENT flow on
+// the same port refuses to steal it (returns false); the standard teardown
+// release frees it so a later flow can re-own it. This pins the standby-side
+// reserve/release contract the session-sync install/delete paths depend on.
+#[test]
+fn nat64_4512_reserve_release_wrapper_symmetry() {
+    let state = Nat64State::from_snapshots(&[single_addr_prefix()]);
+    let alloc = &state.prefixes[0].port_allocator;
+    let snat = Ipv4Addr::new(198, 51, 100, 1);
+    let flow1 = SourceNatFlowKey {
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "2001:db8::1".parse().unwrap(),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        src_port: 5000,
+        dst_port: 443,
+    };
+    let flow2 = SourceNatFlowKey {
+        src_ip: "2001:db8::2".parse().unwrap(),
+        ..flow1
+    };
+    assert!(
+        reserve_nat64_pool_port(alloc, flow1, snat, 1024, 0),
+        "first reserve of an unowned port must take"
+    );
+    assert!(
+        !reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0),
+        "a second flow must NOT steal a port owned by a live reservation"
+    );
+    assert!(
+        release_nat64_pool_port(alloc, flow1, snat, 1024, 1, false),
+        "release must free the reservation for the owning flow"
+    );
+    assert!(
+        reserve_nat64_pool_port(alloc, flow2, snat, 1024, 0),
+        "after release the port is free and a later flow can re-own it"
+    );
+}
+
 // ICMP echo identifiers are translated uniquely too: two clients pinging the
 // same target with the same echo id, behind one pool address, get distinct
 // translated identifiers so their reverse (v4->v6) tuples never collide.

@@ -351,6 +351,41 @@ source tuple (reply mis-delivery / a session-hijack surface).
   allocator is process-global (`Arc<PortAllocatorShared>`), so the reservation
   is visible to every worker regardless of which one imported the session.
 
+### NAT64 Translated-Port Reservation for Synced Sessions (#4512)
+
+NAT64 (RFC 6146 stateful v6→v4) has the identical exposure. Each `Nat64Prefix`
+owns a `PortAllocator` (#4381, the same pool-mode allocator source NAT uses) and
+`Nat64State::allocate_source` hands every admitted forward flow a unique
+translated `(pool v4, port / ICMP identifier)`. The translated port rides the
+synced `NatDecision` on `rewrite_src_port` (no new wire field), but the standby
+imports the pre-computed decision without running `allocate_source`, so its NAT64
+allocator has no record the port is in use. Post-failover the promoted node could
+`allocate_source` the SAME `(snat_v4, port)` for a fresh local flow — two forward
+flows on one translated source, so the 1:N reverse (v4→v6) index bucket mis-demuxes
+the server's replies (the exact BIB collision #4381 closed for the same-node case).
+
+- **Reserve site:** `handle_upsert_synced` calls
+  `crate::nat64::reserve_synced_nat64_allocation` (`nat64.rs`) alongside the
+  source-NAT reserve, for every forward, peer-synced entry whose decision is a
+  NAT64 translation (`nat.nat64 && rewrite_src == V4 && rewrite_src_port`). It
+  reconstructs the flow key EXACTLY as `allocate_source` built it (`dst_ip` is the
+  translated v4 destination `nat.rewrite_dst`, not the synthetic v6 key), resolves
+  `snat_v4` to its `pool_v4` position (the NAT64 allocator uses `family_offset ==
+  0`, so the pool position IS the absolute index), and marks it owned via
+  `reserve_nat64_pool_port` → `PortAllocator::reserve_flow`. The `nat.nat64` guard
+  keeps the NAT64 and source-NAT reserves disjoint even if a pool address is shared.
+- **Release site:** the reservation uses the synced flow key, so the standard
+  teardown `release_nat64_allocation` — already called on GC reap
+  (`reap_expired_sessions`), on delete-sync (`handle_delete_synced`), and on
+  DSCP-filter purge — frees it with no new delete path. A reverse entry or a
+  non-NAT64 decision reserves nothing.
+- **Config-drift / scope:** a synced pool address not in any local NAT64 pool is
+  skipped gracefully (no panic). This closes the port-COLLISION harm only;
+  reverse-TRANSLATION of a promoted synced NAT64 session still needs
+  `Nat64ReverseInfo` (the original client v6 address, NOT reconstructible from
+  `NatDecision`) to ride the sync payload — a separate wire-field follow-up
+  (`ha.rs` currently sets `nat64_reverse: None`).
+
 ### Reverse-SNAT `dnat_table` Publish for Synced Sessions (#4393)
 
 The `dnat_table` / `dnat_table_v6` BPF maps are the **embedded-ICMP reverse-NAT

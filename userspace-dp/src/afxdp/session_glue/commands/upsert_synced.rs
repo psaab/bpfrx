@@ -91,6 +91,20 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
                 entry.decision.nat,
                 metadata.is_reverse,
             );
+            // #4512: same treatment for NAT64. The translated `(pool v4, port)`
+            // rides the synced `NatDecision` (`rewrite_src_port`), but the
+            // standby never runs `allocate_source`, so without this its NAT64
+            // allocator does not know the port is in use — post-failover a
+            // fresh local NAT64 flow could reuse it, two flows colliding on one
+            // translated source (RFC 6146 BIB violation across a cross-node
+            // failover). No-op for a non-NAT64 decision. Freed by the same
+            // `release_nat64_allocation` on reap / delete-sync.
+            crate::nat64::reserve_synced_nat64_allocation(
+                &forwarding.nat64,
+                &key,
+                entry.decision.nat,
+                metadata.is_reverse,
+            );
         }
         publish_worker_session_map_entry(
             session_map_fd,

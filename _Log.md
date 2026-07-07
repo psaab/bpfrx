@@ -1,3 +1,40 @@
+## 2026-07-07 — #4512 nat64: reserve a peer-synced session's translated pool port on the standby (cross-node HA)
+
+- **Timestamp**: 2026-07-07
+- **Action**: Applied #4388's source-NAT `reserve_synced_source_nat_allocation`
+  treatment to NAT64 for the cross-node HA-failover path (the complement to
+  #4518's same-node reload durability). A NAT64 forward flow's translated
+  `(pool v4, port)` rides the synced `NatDecision` (`rewrite_src_port`), but the
+  standby imported the pre-computed decision without running `allocate_source`,
+  so its NAT64 allocator did not know the port was in use — post-failover a
+  fresh local flow could `allocate_source` the SAME tuple, two forward flows
+  colliding on one translated source (the RFC 6146 BIB violation #4381 closed
+  for the same-node case). Added `reserve_nat64_pool_port` wrapper
+  (`nat/source.rs`, exported from `nat/mod.rs`) around
+  `PortAllocator::reserve_flow`, and `reserve_synced_nat64_allocation`
+  (`nat64.rs`) that rebuilds the flow key EXACTLY as `allocate_source` /
+  `release_nat64_allocation` do and reserves the port on each matching prefix.
+  Wired into `handle_upsert_synced` (`upsert_synced.rs`) alongside the source-NAT
+  reserve, guarded to forward peer-synced entries. No new delete site: the
+  existing `release_nat64_allocation` on reap / purge / delete-sync (already
+  present, previously a no-op) frees the reservation with the same flow key;
+  updated the now-live `delete_synced.rs` comment. No wire-protocol change —
+  the port already synced on `NatDecision`.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/commands/delete_synced.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/FEATURES.md,
+  docs/session-sync-architecture.md
+- **Validation**: RED-on-revert test
+  `nat64_4512_synced_session_reserves_translated_port` (neutering the reserve
+  yields the collision port 1024 instead of the skipped 1025) + reverse /
+  non-NAT64 / foreign-pool no-op guards + reserve/release wrapper symmetry.
+  Full cargo serial green: 3711 + 54 + 8 + 22 + 1 passed / 0 failed, 2 ignored.
+  `go test ./pkg/cluster/... ./pkg/dataplane/...` green. Touches HA session
+  sync — MUST pass `make test-failover` before merge (a NAT64 session synced
+  across failover, then a new NAT64 flow that must not reuse the synced port).
+
 ## 2026-07-07 — #4539 session: cache host-inbound TCP LocalDelivery only off the handshake (single has_syn gate)
 
 - **Timestamp**: 2026-07-07
