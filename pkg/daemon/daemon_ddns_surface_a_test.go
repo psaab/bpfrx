@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +42,7 @@ func TestBuildSurfaceAScopesFromConfig(t *testing.T) {
 	})
 	d := &Daemon{store: store}
 	cfg := d.store.ActiveConfig()
-	scopes := d.buildSurfaceAScopes(cfg)
+	scopes, _ := d.buildSurfaceAScopes(cfg)
 
 	byFQDN := map[string]ddns.SurfaceAScope{}
 	for _, s := range scopes {
@@ -92,7 +93,7 @@ func TestBuildSurfaceAScopesAttributesRG(t *testing.T) {
 	})
 	d := &Daemon{store: store, cluster: cluster.NewManager(0, 1)}
 	cfg := d.store.ActiveConfig()
-	scopes := d.buildSurfaceAScopes(cfg)
+	scopes, _ := d.buildSurfaceAScopes(cfg)
 	if len(scopes) != 1 {
 		t.Fatalf("expected one reth scope, got %d", len(scopes))
 	}
@@ -762,5 +763,191 @@ func TestSurfaceAObserverCheckIPHonorsReconcileContext(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("checkip observer ignored the reconcile ctx deadline and blocked on the hung endpoint " +
 			"(context.Background regression, #3736)")
+	}
+}
+
+// TestSurfaceACheckIPNoURLDoesNotFallBackToInterface is the #4423 H08
+// fail-on-revert proof: a binding that selects `address-source checkip` while
+// its provider has NO checkip-url must NOT silently fall back to the interface
+// address (which would publish the WRONG address for a behind-NAT / multi-WAN
+// router). The scope must keep Source=checkip, and the observer must return a
+// transient miss (ok=false) — it must NOT read and publish the interface
+// address even when the interface has a perfectly public one.
+//
+// RED-on-revert: restore `if prov.CheckIPURL != "" { src = checkip }` in
+// buildSurfaceAScopes and the scope becomes Source=interface; the observer then
+// reads the seeded 8.8.8.8 interface address and returns it (ok=true).
+func TestSurfaceACheckIPNoURLDoesNotFallBackToInterface(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set system services dynamic-dns provider nourl backend rfc2136",
+		"set system services dynamic-dns provider nourl update-server 192.0.2.53",
+		"set interfaces ge-0/0/2 unit 50 family inet dynamic-dns provider nourl",
+		"set interfaces ge-0/0/2 unit 50 family inet dynamic-dns hostname wan.example.net",
+		"set interfaces ge-0/0/2 unit 50 family inet dynamic-dns address-source checkip",
+	})
+	d := &Daemon{store: store}
+	cfg := d.store.ActiveConfig()
+	scopes, _ := d.buildSurfaceAScopes(cfg)
+	if len(scopes) != 1 {
+		t.Fatalf("expected one scope, got %d", len(scopes))
+	}
+	if scopes[0].Source != ddns.AddressSourceCheckIP {
+		t.Fatalf("checkip binding with a urlless provider must KEEP source=checkip, got %q "+
+			"(silent fallback to interface = #4423 H08)", scopes[0].Source)
+	}
+
+	// The interface has a genuinely public address. The observer must still NOT
+	// publish it — a missing checkip-url is fail-closed, not a fallback.
+	origLink := netlinkLinkByName
+	origAddr := netlinkAddrList
+	defer func() { netlinkLinkByName = origLink; netlinkAddrList = origAddr }()
+	netlinkLinkByName = func(string) (netlink.Link, error) { return &netlink.Dummy{}, nil }
+	netlinkAddrList = func(netlink.Link, int) ([]netlink.Addr, error) {
+		return []netlink.Addr{mkAddr("8.8.8.8/24", 0)}, nil
+	}
+
+	obs, ok := d.surfaceAObserver(cfg)(context.Background(), scopes[0])
+	if ok {
+		t.Fatalf("a checkip scope with no checkip-url must be a transient miss (ok=false); "+
+			"got ok=true addr=%v (interface fallback = #4423 H08)", obs.Addr)
+	}
+}
+
+// TestBuildSurfaceAScopesInvalidBindingsVisible is the #4423 M09 fail-on-revert
+// proof: a structurally-incomplete binding (no hostname / no provider /
+// undefined provider) builds no scope but must NOT vanish — it is returned as a
+// synthesized `invalid` status row so the operator can still see it. RED-on-
+// revert: drop the noteInvalid calls in buildSurfaceAScopes and the invalid
+// slice comes back empty.
+func TestBuildSurfaceAScopesInvalidBindingsVisible(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set system services dynamic-dns provider corp-2136 backend rfc2136",
+		"set system services dynamic-dns provider corp-2136 update-server 192.0.2.53",
+		// undefined provider
+		"set interfaces ge-0/0/3 unit 0 family inet dynamic-dns provider ghost",
+		"set interfaces ge-0/0/3 unit 0 family inet dynamic-dns hostname ghost.example.net",
+		// missing hostname (valid provider)
+		"set interfaces ge-0/0/4 unit 0 family inet dynamic-dns provider corp-2136",
+	})
+	d := &Daemon{store: store}
+	cfg := d.store.ActiveConfig()
+	scopes, invalid := d.buildSurfaceAScopes(cfg)
+	if len(scopes) != 0 {
+		t.Fatalf("neither incomplete binding may build a scope; got %d scopes", len(scopes))
+	}
+	byFQDN := map[string]ddns.SurfaceAStatusView{}
+	byProv := map[string]ddns.SurfaceAStatusView{}
+	for _, v := range invalid {
+		if v.State != ddns.SurfaceAStateInvalid {
+			t.Fatalf("invalid row must have state %q, got %q", ddns.SurfaceAStateInvalid, v.State)
+		}
+		byFQDN[v.FQDN] = v
+		byProv[v.Provider] = v
+	}
+	if len(invalid) != 2 {
+		t.Fatalf("both incomplete bindings must be surfaced; got %d invalid rows: %+v", len(invalid), invalid)
+	}
+	ghost, ok := byFQDN["ghost.example.net"]
+	if !ok || !strings.Contains(ghost.LastError, "undefined provider") {
+		t.Fatalf("undefined-provider binding must be visible with a reason; got %+v", ghost)
+	}
+	// missing-hostname binding: FQDN is "", provider corp-2136.
+	mh, ok := byProv["corp-2136"]
+	if !ok || !strings.Contains(mh.LastError, "no hostname") {
+		t.Fatalf("missing-hostname binding must be visible with a reason; got %+v", mh)
+	}
+}
+
+// TestSurfaceAObserverDHCPTransientGapNoWithdraw is the #4423 M10 fail-on-revert
+// proof: a missing DHCP lease is a DEFINITIVE loss (withdraw) ONLY when the unit
+// is no longer DHCP-configured for the family. While the unit is still
+// DHCP-configured, a missing lease is a TRANSIENT gap (bring-up / renewal /
+// client-restart on an option change) and must be observed ok=false — never a
+// withdraw — so a benign DHCP option change does not blackhole the record.
+//
+// RED-on-revert: restore the unconditional `return {..DHCP}, true` on lease==nil
+// and the DHCP-configured case below flips to a definitive (ok=true) loss.
+func TestSurfaceAObserverDHCPTransientGapNoWithdraw(t *testing.T) {
+	// (a) Unit IS DHCP-configured (family inet dhcp) but has no lease yet.
+	storeDHCP := testStoreWithSetConfig(t, []string{
+		"set interfaces ge-0/0/2 unit 0 family inet dhcp",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns hostname wan.example.net",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns address-source dhcp",
+		"set system services dynamic-dns provider p backend rfc2136",
+		"set system services dynamic-dns provider p update-server 192.0.2.53",
+	})
+	cfgDHCP := storeDHCP.ActiveConfig()
+	d1 := &Daemon{store: storeDHCP, dhcp: dhcp.NewManagerForTesting(nil)} // no lease seeded
+	scope := ddns.SurfaceAScope{
+		Key:    ddns.ScopeKey{Family: ddns.FamilyV4, Interface: "ge-0/0/2", Unit: 0},
+		Source: ddns.AddressSourceDHCP,
+		FQDN:   "wan.example.net",
+	}
+	if _, ok := d1.surfaceAObserver(cfgDHCP)(context.Background(), scope); ok {
+		t.Fatal("a missing lease while the unit is STILL DHCP-configured must be a TRANSIENT " +
+			"observation (ok=false), never a definitive withdraw (#4423 M10)")
+	}
+
+	// (b) Same binding, but the unit is NOT DHCP-configured (no family inet dhcp).
+	// A missing lease is now definitive (interface reconfigured away from DHCP).
+	storeNoDHCP := testStoreWithSetConfig(t, []string{
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns hostname wan.example.net",
+		"set interfaces ge-0/0/2 unit 0 family inet dynamic-dns address-source dhcp",
+		"set system services dynamic-dns provider p backend rfc2136",
+		"set system services dynamic-dns provider p update-server 192.0.2.53",
+	})
+	cfgNoDHCP := storeNoDHCP.ActiveConfig()
+	d2 := &Daemon{store: storeNoDHCP, dhcp: dhcp.NewManagerForTesting(nil)}
+	obs, ok := d2.surfaceAObserver(cfgNoDHCP)(context.Background(), scope)
+	if !ok {
+		t.Fatal("a missing lease when the unit is NOT DHCP-configured must be a DEFINITIVE " +
+			"observation (ok=true) so a stale record is withdrawn")
+	}
+	if obs.Addr.IsValid() {
+		t.Fatalf("definitive no-lease observation must carry no address; got %v", obs.Addr)
+	}
+}
+
+// TestBuildSurfaceAScopesDeterministicOrder is the #4423 M12 fail-on-revert
+// proof: the scope slice must arrive in a deterministic (sorted) order, not the
+// Go-map-iteration-random order of the interface walk. Reconcile processes
+// scopes in slice order, and two scopes targeting the same FQDN resolve to a
+// nondeterministic winner without a stable order. RED-on-revert: remove the
+// sort.Slice at the end of buildSurfaceAScopes and repeated calls yield varying
+// orders (this test's determinism check fails on some run).
+func TestBuildSurfaceAScopesDeterministicOrder(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set system services dynamic-dns provider p backend rfc2136",
+		"set system services dynamic-dns provider p update-server 192.0.2.53",
+		"set interfaces ge-0/0/4 unit 0 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/4 unit 0 family inet dynamic-dns hostname d.example.net",
+		"set interfaces ge-0/0/1 unit 0 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/1 unit 0 family inet dynamic-dns hostname a.example.net",
+		"set interfaces ge-0/0/2 unit 7 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/2 unit 7 family inet dynamic-dns hostname b7.example.net",
+		"set interfaces ge-0/0/2 unit 3 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/2 unit 3 family inet dynamic-dns hostname b3.example.net",
+		"set interfaces ge-0/0/3 unit 0 family inet dynamic-dns provider p",
+		"set interfaces ge-0/0/3 unit 0 family inet dynamic-dns hostname c.example.net",
+	})
+	d := &Daemon{store: store}
+	cfg := d.store.ActiveConfig()
+
+	key := func(scopes []ddns.SurfaceAScope) string {
+		var b strings.Builder
+		for _, s := range scopes {
+			fmt.Fprintf(&b, "%s/%d;", s.Key.Interface, s.Key.Unit)
+		}
+		return b.String()
+	}
+	// Explicit total-order expectation (interface, then unit).
+	want := "ge-0/0/1/0;ge-0/0/2/3;ge-0/0/2/7;ge-0/0/3/0;ge-0/0/4/0;"
+	for i := 0; i < 40; i++ {
+		scopes, _ := d.buildSurfaceAScopes(cfg)
+		if got := key(scopes); got != want {
+			t.Fatalf("run %d: scope order = %q, want deterministic %q (#4423 M12)", i, got, want)
+		}
 	}
 }

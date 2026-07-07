@@ -165,8 +165,17 @@ type surfaceAState struct {
 	// after a failure (error backoff). Zero ⇒ eligible now.
 	nextEligible time.Time
 	backoff      time.Duration
-	lastErr      string
-	lastErrAt    time.Time
+	// backoffFromWithdraw records whether the armed backoff came from a failed
+	// WITHDRAW (true) or a failed PUBLISH (false) (#4423 M03). The backoff window
+	// gates only the wire op it was armed for: a publish-failure backoff must NOT
+	// delay a newly-observed address-LOSS withdraw (leaving the record live at a
+	// now-dead address is a blackhole), and a withdraw-failure backoff must not
+	// delay re-publishing a recovered address. The op that fires re-arms its own
+	// backoff on failure, so a persistently-failing wire op still backs off — no
+	// hammering. Meaningless when nextEligible is zero.
+	backoffFromWithdraw bool
+	lastErr             string
+	lastErrAt           time.Time
 	// noBackend records that the most recent reconcile resolved the scope's
 	// provider to the no-op backend (errSurfaceANoBackend — a half-configured
 	// provider). Unlike lastErr it arms NO backoff (nothing was attempted on the
@@ -254,6 +263,15 @@ const (
 	// because auto-withdrawal is deferred (the old creds are redacted and the old
 	// endpoint is usually gone). The operator must clean the stale record by hand.
 	SurfaceAStateOrphaned = "orphaned"
+	// SurfaceAStateInvalid — the binding is configured but STRUCTURALLY incomplete
+	// so no scope can be built from it: it has no hostname, no provider, or names a
+	// provider that is not in the catalog (#4423 M09). Such a binding never becomes
+	// a reconcile scope (it cannot publish), so before this it vanished entirely
+	// from the operator status surface even though the operator had typed it — the
+	// commit warning was the only trace. The daemon now synthesizes an `invalid`
+	// row (LastError carries the specific defect) so a broken binding stays visible
+	// in `show system services dynamic-dns`.
+	SurfaceAStateInvalid = "invalid"
 )
 
 // SurfaceAStatusView is a read-only projection of one Surface A scope's
@@ -866,12 +884,16 @@ func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope,
 			continue
 		}
 		if err != nil {
-			m.recordScopeError(rt, owned.FQDN, 0, err, now)
+			m.recordScopeError(rt, owned.FQDN, 0, err, now, true)
 			noteErr(err)
 			continue
 		}
-		if !rt.nextEligible.IsZero() && now.Before(rt.nextEligible) {
-			// Still inside the error-backoff window — skip the wire delete this pass.
+		if !rt.nextEligible.IsZero() && now.Before(rt.nextEligible) && rt.backoffFromWithdraw {
+			// Still inside a WITHDRAW-origin backoff window — skip the wire delete
+			// this pass (a persistently-failing withdraw backs off). A PUBLISH-origin
+			// backoff (a failed publish before the binding was removed) must NOT delay
+			// this gone-from-config withdraw (#4423 M03) — the record should come down
+			// promptly, and the withdraw re-arms its own backoff on failure.
 			m.backedOff++
 			slog.Debug("ddns surface-a: gone-from-config scope in withdraw backoff; skipping this pass",
 				"fqdn", owned.FQDN, "next-eligible", rt.nextEligible)
@@ -898,21 +920,22 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		m.runtime[sid] = rt
 	}
 
-	// Error backoff (inadyn idea #8): a scope still in its backoff window is
-	// skipped this pass so a failing provider is not hammered (ban-avoidance).
-	if !rt.nextEligible.IsZero() && now.Before(rt.nextEligible) {
-		m.backedOff++
-		slog.Debug("ddns surface-a: scope in error backoff; skipping this pass",
-			"fqdn", sc.FQDN, "next-eligible", rt.nextEligible)
-		return nil
-	}
-
-	// Observe the scope's current address with m.mu RELEASED and the reconcile
-	// ctx threaded (#3736): for a checkip source `observe` is a blocking external
-	// HTTP GET, so holding the mutex across it would block StatusViews/Stats and
-	// serialize other scopes behind a hung endpoint, and ignoring ctx would hang
-	// shutdown behind an in-flight probe. The backoff-window check above already
-	// ran under the lock, so a backed-off scope never reaches this HTTP call.
+	// Observe FIRST, before the error-backoff window is consulted (#4423 M03).
+	// Observation is a cheap netlink/DHCP-lease read (or, for a checkip source, an
+	// HTTP GET against the checkip endpoint — a DIFFERENT server than the DNS
+	// provider the backoff protects), so running it every pass does not hammer the
+	// backed-off provider. Observing first is what lets a newly-detected address
+	// LOSS trigger a withdraw even while a prior PUBLISH failure is in its backoff
+	// window: leaving the record live at a now-dead address for the whole backoff
+	// (up to the cap) is a blackhole. The window is still honored PER WIRE OP below
+	// (a publish-armed backoff gates publishing; a withdraw-armed backoff gates
+	// withdrawing), and each op re-arms its own backoff on failure, so a
+	// persistently-failing op still backs off — no hammering.
+	//
+	// The observe runs with m.mu RELEASED and the reconcile ctx threaded (#3736):
+	// holding the mutex across a blocking checkip GET would block StatusViews/Stats
+	// and serialize other scopes; ignoring ctx would hang shutdown behind an
+	// in-flight probe.
 	var (
 		obs AddressObservation
 		ok  bool
@@ -925,6 +948,11 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		return nil
 	}
 
+	// inBackoffWindow reports whether the scope is still inside an armed error
+	// backoff. It is consulted per-intent below (#4423 M03) so one wire op's
+	// backoff never delays the other.
+	inBackoffWindow := !rt.nextEligible.IsZero() && now.Before(rt.nextEligible)
+
 	if !obs.Addr.IsValid() {
 		// The scope lost its address (interface down / lease gone). If we own a
 		// record for it, withdraw it (the address really is gone — this is the
@@ -934,6 +962,17 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 		// #2691 P2 MAJOR-2 fix; backendForOwned is only needed for the gone-from-
 		// config Pass 2 withdraw where the scope no longer exists).
 		if owned, exists := m.state.get(sc.effectiveKey(), surfaceAIdentity, ""); exists {
+			// Honor the backoff window ONLY when it was armed by a prior WITHDRAW
+			// failure (#4423 M03): a persistently-failing withdraw still backs off,
+			// but a PUBLISH-failure backoff must not delay this fresh address-loss
+			// withdraw (that would keep the record live at a dead address for the
+			// whole publish backoff — a blackhole).
+			if inBackoffWindow && rt.backoffFromWithdraw {
+				m.backedOff++
+				slog.Debug("ddns surface-a: scope in withdraw backoff; skipping this pass",
+					"fqdn", sc.FQDN, "next-eligible", rt.nextEligible)
+				return nil
+			}
 			if rt.withdrawUnsupported {
 				// Terminal: the resolved backend has no withdraw verb (#2813). Do not
 				// re-attempt the wire delete every sweep — keep ownership (the RR is
@@ -946,10 +985,11 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 			if err != nil {
 				// Could not even build the backend: arm the SAME per-scope backoff the
 				// publish path uses (#2813) so a persistent resolve failure backs off
-				// instead of re-attempting (and warning) every 30s sweep. The backoff
-				// window check at the top of reconcileScopeLocked skips the next sweeps.
+				// instead of re-attempting (and warning) every 30s sweep. Tagged as a
+				// withdraw-origin backoff so the withdraw-intent window check above
+				// skips the next sweeps (#4423 M03).
 				m.deleteFail++
-				m.recordScopeError(rt, sc.FQDN, sc.ErrorBackoffMax, err, now)
+				m.recordScopeError(rt, sc.FQDN, sc.ErrorBackoffMax, err, now, true)
 				return err
 			}
 			// withdrawScopeLocked drives the delete under the shared backoff machinery:
@@ -961,6 +1001,19 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	}
 
 	addr := obs.Addr.Unmap()
+
+	// Honor the backoff window ONLY when it was armed by a prior PUBLISH failure
+	// (#4423 M03): a persistently-failing publish still backs off (ban-avoidance),
+	// but a WITHDRAW-failure backoff must not delay re-publishing a recovered
+	// address. Placed before change-detection so a backed-off scope is counted as
+	// a backed-off skip (not an unchanged skip), preserving the pre-#4423 counter
+	// semantics of the removed top-of-function window check.
+	if inBackoffWindow && !rt.backoffFromWithdraw {
+		m.backedOff++
+		slog.Debug("ddns surface-a: scope in publish backoff; skipping this pass",
+			"fqdn", sc.FQDN, "next-eligible", rt.nextEligible)
+		return nil
+	}
 
 	// Change detection + forced-refresh (inadyn ideas #4/#7): fire a wire
 	// UPDATE when the address changed OR the forced-refresh floor elapsed since
@@ -1012,7 +1065,7 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 			// would resurrect a stale map entry, so we swallow without touching rt.
 			return nil
 		}
-		m.recordScopeError(rt, sc.FQDN, sc.ErrorBackoffMax, err, now)
+		m.recordScopeError(rt, sc.FQDN, sc.ErrorBackoffMax, err, now, false)
 		return err
 	}
 	// Success: clear backoff, update the last-published cache.
@@ -1020,6 +1073,7 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	rt.lastPublished = now
 	rt.nextEligible = time.Time{}
 	rt.backoff = 0
+	rt.backoffFromWithdraw = false
 	rt.lastErr = ""
 	rt.lastErrAt = time.Time{}
 	rt.noBackend = false
@@ -1534,8 +1588,10 @@ func (m *SurfaceAManager) clearOrphan(owned ownedRecord) {
 // publish OR a withdraw candidate at one time, so one per-scope backoff slot is
 // correct. fqdn is for the log line; maxBackoff is the per-binding cap (0 ⇒ the
 // package default, which is what the gone-from-config withdraw uses since its
-// binding — and its configured cap — is gone).
-func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, fqdn string, maxBackoff time.Duration, err error, now time.Time) {
+// binding — and its configured cap — is gone). fromWithdraw tags which wire op
+// armed the backoff (#4423 M03) so the window gates only that op and does not
+// delay the OTHER op when the observed intent flips.
+func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, fqdn string, maxBackoff time.Duration, err error, now time.Time, fromWithdraw bool) {
 	if maxBackoff <= 0 {
 		maxBackoff = defaultErrorBackoffMax
 	}
@@ -1548,6 +1604,7 @@ func (m *SurfaceAManager) recordScopeError(rt *surfaceAState, fqdn string, maxBa
 		rt.backoff = maxBackoff
 	}
 	rt.nextEligible = now.Add(rt.backoff)
+	rt.backoffFromWithdraw = fromWithdraw
 	rt.lastErr = err.Error()
 	rt.lastErrAt = now
 	rt.noBackend = false
@@ -1580,7 +1637,7 @@ func (m *SurfaceAManager) withdrawScopeLocked(ctx context.Context, owned ownedRe
 		m.markWithdrawUnsupported(rt, fqdn, now)
 		return nil
 	}
-	m.recordScopeError(rt, fqdn, maxBackoff, err, now)
+	m.recordScopeError(rt, fqdn, maxBackoff, err, now, true)
 	return err
 }
 
@@ -1717,13 +1774,45 @@ func (m *SurfaceAManager) StatusViews(scopes []SurfaceAScope) []SurfaceAStatusVi
 		})
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].FQDN != out[j].FQDN {
-			return out[i].FQDN < out[j].FQDN
-		}
-		return out[i].Family < out[j].Family
-	})
+	SortSurfaceAStatusViews(out)
 	return out
+}
+
+// SortSurfaceAStatusViews orders status rows by a TOTAL key so the operator
+// surface (CLI/gRPC/REST) is byte-stable across calls (#4423 M11). The old
+// comparator keyed only on {FQDN, Family}, which is NOT a total order over the
+// rows: two rows can legitimately share an FQDN AND a family — e.g. the same
+// hostname published from two interfaces/units, or a configured row plus a
+// withdraw-pending / orphaned row for the same name+family under a different
+// scope. On such a tie sort.Slice (not stable) left the order to the input/map
+// iteration order, so `show system services dynamic-dns` flapped between calls
+// and any golden-output test was non-deterministic. Extending the key to
+// {FQDN, Family, Interface, Unit, Provider, State, Published} breaks every tie
+// deterministically. Exported so the daemon re-sorts the combined engine +
+// synthesized-invalid-binding row set (#4423 M09) with the identical ordering.
+func SortSurfaceAStatusViews(out []SurfaceAStatusView) {
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.FQDN != b.FQDN {
+			return a.FQDN < b.FQDN
+		}
+		if a.Family != b.Family {
+			return a.Family < b.Family
+		}
+		if a.Interface != b.Interface {
+			return a.Interface < b.Interface
+		}
+		if a.Unit != b.Unit {
+			return a.Unit < b.Unit
+		}
+		if a.Provider != b.Provider {
+			return a.Provider < b.Provider
+		}
+		if a.State != b.State {
+			return a.State < b.State
+		}
+		return a.Published < b.Published
+	})
 }
 
 // SurfaceAStats is the counter snapshot for `show` + Prometheus (plan §5.5).

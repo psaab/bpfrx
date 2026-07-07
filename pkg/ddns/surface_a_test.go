@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -706,5 +707,96 @@ func TestSurfaceARenumberLogReadsAddrText(t *testing.T) {
 	}
 	if !strings.Contains(out, "old=203.0.113.5") || !strings.Contains(out, "new=198.51.100.7") {
 		t.Fatalf("renumber log must carry old (from AddrText) + new address; log=%q", out)
+	}
+}
+
+// TestSurfaceAPublishBackoffDoesNotDelayWithdraw is the #4423 M03 fail-on-revert
+// proof: a PUBLISH-failure backoff must NOT delay a newly-observed address-LOSS
+// withdraw. Before the fix the error-backoff window was checked at the TOP of
+// reconcileScopeLocked and gated BOTH wire ops, so a scope whose publish failed
+// (armed backoff) would skip the whole pass on a later address loss — leaving
+// the record live at a now-dead address for the whole backoff window (a
+// blackhole). The fix observes first and gates the window PER wire op (a
+// publish backoff no longer blocks a withdraw). RED-on-revert: restore the
+// top-of-function unconditional backoff check and the withdraw below never fires.
+func TestSurfaceAPublishBackoffDoesNotDelayWithdraw(t *testing.T) {
+	fu := newFakeUpdater()
+	now := time.Unix(1_700_000_000, 0)
+	m := newSurfaceATestManager(t, fu, func() time.Time { return now })
+	sc := surfaceAScope("wan.example.net", FamilyV4, 0)
+
+	obsAddr := netip.MustParseAddr("203.0.113.5")
+	obsOK := true
+	observe := func(context.Context, SurfaceAScope) (AddressObservation, bool) {
+		if !obsOK {
+			return AddressObservation{}, false
+		}
+		return AddressObservation{Addr: obsAddr, Source: AddressSourceDHCP}, true
+	}
+
+	// 1. Publish the initial address (record owned at 203.0.113.5).
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, observe, nil, nil); err != nil {
+		t.Fatalf("Reconcile(publish): %v", err)
+	}
+
+	// 2. A new address fails to publish → arms a PUBLISH-origin backoff. The
+	//    record rolls back to the previous address (still owned).
+	fu.failUpd["wan.example.net"] = true
+	obsAddr = netip.MustParseAddr("203.0.113.9")
+	now = now.Add(time.Second)
+	if err := m.Reconcile(context.Background(), []SurfaceAScope{sc}, observe, nil, nil); err == nil {
+		t.Fatal("expected the failed publish to return an error and arm backoff")
+	}
+	if len(fu.deletes) != 0 {
+		t.Fatalf("no withdraw should have happened yet; got %d deletes", len(fu.deletes))
+	}
+
+	// 3. Address is LOST while still inside the (publish-origin) backoff window.
+	//    The withdraw MUST proceed — it is a different intent than the failed
+	//    publish, and leaving the record live at a dead address is a blackhole.
+	obsAddr = netip.Addr{} // definitive loss
+	now = now.Add(time.Second)
+	_ = m.Reconcile(context.Background(), []SurfaceAScope{sc}, observe, nil, nil)
+	if len(fu.deletes) != 1 {
+		t.Fatalf("a publish-origin backoff must NOT delay an address-loss withdraw (#4423 M03); "+
+			"got %d deletes, want 1", len(fu.deletes))
+	}
+}
+
+// TestSortSurfaceAStatusViewsTotalOrder is the #4423 M11 fail-on-revert proof:
+// status rows must sort by a TOTAL key so the operator surface is byte-stable.
+// The pre-fix comparator keyed only on {FQDN, Family}; rows that legitimately
+// tie on both (same hostname from different interfaces/units, or a configured +
+// withdraw-pending/orphaned row for the same name+family) were left in input
+// order by the non-stable sort. Comparing the sorted output against the explicit
+// total-order expectation goes RED if the comparator only breaks {FQDN, Family}.
+func TestSortSurfaceAStatusViewsTotalOrder(t *testing.T) {
+	mk := func(fqdn string, fam int, iface string, unit int, prov, state, pub string) SurfaceAStatusView {
+		return SurfaceAStatusView{FQDN: fqdn, Family: fam, Interface: iface, Unit: unit, Provider: prov, State: state, Published: pub}
+	}
+	// Three rows tie on {wan.example.net, family 4}; they must order by
+	// interface then unit. A second FQDN and a family-6 row round out the key.
+	want := []SurfaceAStatusView{
+		mk("a.example.net", 4, "ge-0-0-1", 0, "q", "pending", ""),
+		mk("wan.example.net", 4, "ge-0-0-1", 0, "p", "published", "203.0.113.1"),
+		mk("wan.example.net", 4, "ge-0-0-1", 5, "p", "published", "203.0.113.5"),
+		mk("wan.example.net", 4, "ge-0-0-9", 0, "p", "published", "203.0.113.9"),
+		mk("wan.example.net", 6, "ge-0-0-1", 0, "p", "published", "2001:db8::1"),
+	}
+	// Several permutations of the same rows must all sort to `want`.
+	perms := [][]int{
+		{3, 1, 4, 2, 0}, // interface/unit ties out of order
+		{4, 3, 2, 1, 0}, // reversed
+		{2, 0, 4, 1, 3}, // shuffled
+	}
+	for i, order := range perms {
+		in := make([]SurfaceAStatusView, len(order))
+		for j, idx := range order {
+			in[j] = want[idx]
+		}
+		SortSurfaceAStatusViews(in)
+		if !reflect.DeepEqual(in, want) {
+			t.Fatalf("permutation %d did not sort to the total order (#4423 M11):\n got=%+v\nwant=%+v", i, in, want)
+		}
 	}
 }
