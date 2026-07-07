@@ -191,6 +191,24 @@ pub(crate) fn extract_screen_info(
         const NEXTHDR_FRAGMENT: u8 = 44;
         const NEXTHDR_DEST: u8 = 60;
         const NEXTHDR_AUTH: u8 = 51;
+        // #4517: the remaining IANA-assigned IPv6 extension headers that
+        // share the generic length-prefixed layout (byte 0 = next header,
+        // byte 1 = HdrExtLen in 8-octet units excluding the first 8) —
+        // Mobility (135, RFC 6275 §6.1), HIP (139, RFC 7401 §5.1), Shim6
+        // (140, RFC 5533 §5.1), and the two experimental/testing values
+        // (253/254, RFC 3692 / RFC 4727). Before #4517 these fell to the
+        // terminal `_ => break` arm, so a chain such as
+        // `HOP → MOBILITY → FRAGMENT → TCP(SYN)` STOPPED at the Mobility
+        // header: `is_fragment`/`is_first_fragment` stayed false and the
+        // SYN was never reached, so the `syn-frag`/teardrop/ping-of-death
+        // fragment screens could not fire — an ext-header IDS evasion. ESP
+        // (50) is deliberately NOT walked: its payload is encrypted and the
+        // inner next-header is unreadable, so stopping there is correct.
+        const NEXTHDR_MOBILITY: u8 = 135;
+        const NEXTHDR_HIP: u8 = 139;
+        const NEXTHDR_SHIM6: u8 = 140;
+        const NEXTHDR_EXP1: u8 = 253;
+        const NEXTHDR_EXP2: u8 = 254;
         let mut nexthdr = frame[l3_offset + 6];
         let mut offset = l3_offset + 40;
         for _ in 0..8 {
@@ -228,7 +246,8 @@ pub(crate) fn extract_screen_info(
                     nexthdr = frame[offset];
                     offset += (frame[offset + 1] as usize + 1) * 8;
                 }
-                NEXTHDR_HOP | NEXTHDR_DEST => {
+                NEXTHDR_HOP | NEXTHDR_DEST | NEXTHDR_MOBILITY | NEXTHDR_HIP | NEXTHDR_SHIM6
+                | NEXTHDR_EXP1 | NEXTHDR_EXP2 => {
                     if offset + 2 > frame.len() {
                         return Err(ScreenParseError::TruncatedIpv6ExtChain);
                     }

@@ -1258,6 +1258,82 @@ fn extract_screen_info_ipv6_first_fragment_extheader_after_fragment_extracts_tcp
 }
 
 #[test]
+fn extract_screen_info_ipv6_mobility_before_fragment_extracts_tcp() {
+    // #4517 ext-header IDS evasion: an IPv6 FIRST fragment whose chain is
+    // `HOP → MOBILITY(135) → FRAGMENT(offset 0) → TCP(SYN)`. Mobility (135)
+    // is a length-prefixed extension header (RFC 6275), but before #4517
+    // the screen walk enumerated only {0,43,44,51,60} and STOPPED at type
+    // 135 (`_ => break`) — leaving `is_fragment`/`is_first_fragment` false
+    // and `tcp_offset` None, so the SYN behind the Mobility header was
+    // hidden from the `syn-frag` (and teardrop/ping-of-death) screens. The
+    // fix walks Mobility/HIP/Shim6/experimental as generic EHs, so the
+    // FRAGMENT header and the real TCP header are reached.
+    //
+    // Layout (l3_offset = 14):
+    //   14+0   = 14  IPv6 base (40), NextHdr = 0 (HOP)
+    //   14+40  = 54  Hop-by-Hop (8): NextHdr = 135 (MOBILITY), len = 0
+    //   54+8   = 62  Mobility (8):   NextHdr = 44  (FRAGMENT), len = 0
+    //   62+8   = 70  Fragment (8):   NextHdr = 6   (TCP), MF=1 off=0
+    //   70+8   = 78  TCP (20 + 4-byte MSS option)
+    let mut frame = vec![0u8; 14 + 40 + 8 + 8 + 8 + 24];
+    frame[14] = 0x60; // version 6
+    frame[14 + 6] = 0; // base NextHdr = HOP-BY-HOP
+    frame[54] = 135; // HOP NextHdr = MOBILITY, HdrExtLen(55)=0 → 8 bytes
+    frame[62] = 44; // MOBILITY NextHdr = FRAGMENT, HdrExtLen(63)=0 → 8 bytes
+    frame[70] = 6; // FRAGMENT NextHdr = TCP
+    let frag_off_pos = 70 + 2;
+    frame[frag_off_pos..frag_off_pos + 2].copy_from_slice(&0x0001u16.to_be_bytes()); // MF=1, off=0
+    let tcp = 78;
+    frame[tcp + 4..tcp + 8].copy_from_slice(&0x1122_3344u32.to_be_bytes()); // seq
+    frame[tcp + 12] = 0x60; // data offset = 6 words = 24 bytes
+    frame[tcp + 20] = 2; // MSS option kind
+    frame[tcp + 21] = 4; // MSS option len
+    frame[tcp + 22..tcp + 24].copy_from_slice(&1400u16.to_be_bytes());
+
+    // The meta walker (inspect.rs, also fixed by #4517) resolves proto=TCP
+    // and the SYN flag; pass those in as the production caller would.
+    let info = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,    // TCP — what the fixed meta walker now reports (was 135)
+        0x02, // SYN
+        (frame.len() - 14) as u16,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        22,
+        14,
+    )
+    .expect("MOBILITY-before-fragment chain must parse");
+
+    // On revert the walk stops at MOBILITY: is_first_fragment=false and
+    // tcp_offset=None, so all three assertions flip.
+    assert!(info.is_fragment, "Fragment header behind MOBILITY → is_fragment");
+    assert!(
+        info.is_first_fragment,
+        "MF=1 && offset==0 behind MOBILITY → is_first_fragment"
+    );
+    assert_eq!(
+        info.tcp_seq, 0x1122_3344,
+        "TCP seq extracted past the MOBILITY + FRAGMENT chain"
+    );
+    assert_eq!(
+        info.tcp_mss, 1400,
+        "TCP MSS option extracted past the ext-header chain"
+    );
+
+    // End-to-end: the extracted info must now trigger the `syn-frag` screen
+    // (a SYN on a first fragment). Before #4517 this MOBILITY-hidden SYN
+    // was Passed unscreened.
+    let mut state = make_state("trust", default_profile());
+    assert_eq!(
+        state.check_packet("trust", &info, 1),
+        ScreenVerdict::Drop("syn-frag"),
+        "the MOBILITY-hidden fragmented SYN must trip the syn-frag screen"
+    );
+}
+
+#[test]
 fn extract_screen_info_ipv6_nonfirst_fragment_extheader_stays_flowless() {
     // #3120 non-regression (#2344/#3064): a NON-FIRST fragment (offset>0)
     // with the same `Fragment → Dest-Options → TCP` chain shape carries no

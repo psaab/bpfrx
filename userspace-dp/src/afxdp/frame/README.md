@@ -231,9 +231,22 @@ inspect or rewrite a packet sitting in a UMEM frame.
     is out of scope (tracked: #2354). NOTE: earlier revisions of this file
     said the shim "drops" QinQ-double frames — that was inaccurate; it
     XDP_PASSes them to the kernel.
-  - **IPv6 ext-headers**: walk the chain (shared #2148 engine, 6-iteration
+  - **IPv6 ext-headers**: walk the chain (shared #2148 engine, `MAX_IPV6_EXT_HEADERS`
     bound) to the terminal L4 offset + protocol; do NOT assume L4 at a fixed
-    L3+40.
+    L3+40. The extension-header SET every walker recognizes is Hop-by-Hop (0),
+    Routing (43), Fragment (44), AH (51), Destination Options (60), and — since
+    **#4517** — Mobility (135, RFC 6275), HIP (139, RFC 7401), Shim6 (140, RFC
+    5533), and the experimental/testing values (253/254, RFC 3692 / RFC 4727),
+    all of which share the generic `(HdrExtLen + 1) * 8` advance. ESP (50) is
+    deliberately NOT walked (encrypted payload, unreadable inner next-header) —
+    the walk STOPS at it. Before #4517 the exotic length-prefixed headers fell
+    to the terminal `_` arm, so a chain like `HOP → MOBILITY → FRAGMENT → TCP`
+    was classified proto=135 with no L4/fragment status — the screens never saw
+    the SYN and forwarding never saw the flow (an ext-header IDS evasion). All
+    walkers (the five in `inspect.rs`, `screen/extract.rs`, the three in
+    `nat64.rs`, and `icmp_embed/parse.rs::parse_embedded_v6_l4`) MUST keep the
+    SAME set or the screen, meta, forwarding, and NAT64 paths disagree on the
+    same packet.
   PR-1 of #2150 fixed the three parsers that DISAGREED on a single 0x88a8
   tag / ext-headered NDP (`parse_eth_offsets` treated 0x88a8 as the inner
   ethertype → l3=14; `nat64::frame_l3_offset` treated it as untagged →

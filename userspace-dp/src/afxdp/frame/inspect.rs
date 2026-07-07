@@ -30,6 +30,28 @@ use super::*;
 /// forwarding/screen paths.
 pub(crate) const MAX_IPV6_EXT_HEADERS: usize = 8;
 
+// #4517: the IPv6 extension-header types every walker in this file treats
+// as a generic length-prefixed header (byte 0 = next header, byte 1 =
+// HdrExtLen in 8-octet units excluding the first 8, advance
+// `(HdrExtLen + 1) * 8`). The match arms below spell them as
+// `0 | 43 | 60 | 135 | 139 | 140 | 253 | 254`:
+//   0   Hop-by-Hop Options  (RFC 8200 §4.3)
+//   43  Routing             (RFC 8200 §4.4)
+//   60  Destination Options (RFC 8200 §4.6)
+//   135 Mobility            (RFC 6275 §6.1)
+//   139 HIP                 (RFC 7401 §5.1)
+//   140 Shim6               (RFC 5533 §5.1)
+//   253/254 experimental/testing (RFC 3692 / RFC 4727)
+// AH (51) keeps its own arm (RFC 4302 `(len + 2) * 4` arithmetic) and
+// Fragment (44) its fixed 8-byte arm. ESP (50) is deliberately NOT
+// walked: the payload is encrypted and the inner next-header is
+// unreadable, so stopping there is correct. Before #4517 the exotic
+// types (135/139/140/253/254) fell to the terminal `_` arm, so a chain
+// like `HOP → MOBILITY → FRAGMENT → TCP` was classified proto=135 with
+// no L4/fragment status — hiding the SYN from the screens and the flow
+// from forwarding (an ext-header IDS evasion). All walkers here MUST
+// keep the same set so the screen, meta, and fragment paths agree.
+
 pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
         return None;
@@ -67,7 +89,10 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
             let mut offset = l3 + 40;
             for _ in 0..MAX_IPV6_EXT_HEADERS {
                 match protocol {
-                    0 | 43 | 60 => {
+                    // #4517: generic length-prefixed EHs (see the set at
+                    // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
+                    // Mobility/HIP/Shim6/experimental.
+                    0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                         let opt = frame.get(offset..offset + 2)?;
                         protocol = opt[0];
                         offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
@@ -126,7 +151,10 @@ pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> 
             let mut offset = 40usize;
             for _ in 0..MAX_IPV6_EXT_HEADERS {
                 match protocol {
-                    0 | 43 | 60 => {
+                    // #4517: generic length-prefixed EHs (see the set at
+                    // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
+                    // Mobility/HIP/Shim6/experimental.
+                    0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                         let opt = packet.get(offset..offset + 2)?;
                         protocol = opt[0];
                         offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
@@ -189,7 +217,10 @@ pub(in crate::afxdp) fn packet_rel_l4_offset_and_protocol(
             let mut offset = 40usize;
             for _ in 0..MAX_IPV6_EXT_HEADERS {
                 match protocol {
-                    0 | 43 | 60 => {
+                    // #4517: generic length-prefixed EHs (see the set at
+                    // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
+                    // Mobility/HIP/Shim6/experimental.
+                    0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                         let opt = packet.get(offset..offset + 2)?;
                         protocol = opt[0];
                         offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
@@ -263,7 +294,10 @@ pub(in crate::afxdp) fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
     let mut offset = 40usize;
     for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
-            0 | 43 | 60 => {
+            // #4517: generic length-prefixed EHs (see the set at
+            // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
+            // Mobility/HIP/Shim6/experimental.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                 let Some(opt) = packet.get(offset..offset + 2) else {
                     return false;
                 };
@@ -345,7 +379,10 @@ pub(in crate::afxdp) fn ipv6_is_any_fragment(packet: &[u8]) -> bool {
     let mut offset = 40usize;
     for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
-            0 | 43 | 60 => {
+            // #4517: generic length-prefixed EHs (see the set at
+            // MAX_IPV6_EXT_HEADERS): HbH/Routing/DestOpt +
+            // Mobility/HIP/Shim6/experimental.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
                 let Some(opt) = packet.get(offset..offset + 2) else {
                     return false;
                 };
