@@ -6,12 +6,13 @@ import (
 )
 
 // #3308: a firewall-filter term that co-locates `then routing-instance <x>`
-// with a terminating `then discard` / `then reject` is contradictory. The PBR
-// runtime (ingress_route_table_override) logs the deny/reject but
-// unconditionally returns the routing table, so the packet is ROUTED while the
-// audit stream records it as denied (the audit trail lies; fail-open PBR).
-// validateFilterRoutingInstanceConflictStrict makes it an operator-visible
-// commit error.
+// with a terminating `then discard` / `then reject` is contradictory — it asks
+// the dataplane to BOTH steer the packet into <x> AND drop it. Both forwarding
+// paths now resolve the contradiction to the DENY: the userspace PBR runtime
+// (ingress_route_table_override) returns RouteOverride::Drop (#4392) and the
+// kernel `ip rule` mirror (buildPBRFromFilter) skips the steering rule (#4534).
+// validateFilterRoutingInstanceConflictStrict still makes it an operator-visible
+// commit error so the contradiction is never authored in the first place.
 //
 // FAIL-ON-REVERT: remove the validateFilterRoutingInstanceConflictStrict
 // invocation (or the function's reject) and these strict-path tests go RED —

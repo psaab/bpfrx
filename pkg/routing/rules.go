@@ -774,6 +774,28 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		if term.RoutingInstance == "" {
 			continue
 		}
+
+		// #4534: a term that co-locates `then routing-instance <x>` with a
+		// terminating `then discard` / `then reject` is CONTRADICTORY — it asks
+		// the dataplane to BOTH steer the packet into <x> AND drop/reject it. The
+		// deny wins: the userspace forwarding path (ingress_route_table_override,
+		// userspace-dp/src/afxdp/forwarding/mod.rs) returns RouteOverride::Drop for
+		// such a term (#4392). The kernel `ip rule` mirror must match that
+		// disposition — building a steering rule here would fail OPEN, steering
+		// slow-path / XDP_PASS / unfiltered-interface traffic (the ip rule is
+		// global, no iif selector) into the target VRF that userspace drops. The
+		// strict commit gate (validateFilterRoutingInstanceConflictStrict) rejects
+		// this term, but is LENIENT on load / peer-sync (#1960 no-brick), so a
+		// contradictory term can still reach here — skip it (do NOT steer).
+		if term.Action == "discard" || term.Action == "reject" {
+			errs = append(errs, fmt.Errorf(
+				"PBR filter %s term %s co-locates routing-instance %q with a terminating "+
+					"%q action; the deny wins (mirroring the userspace drop, #4392) — no "+
+					"steering ip rule is built for this contradictory term",
+				filter.Name, term.Name, term.RoutingInstance, term.Action))
+			continue
+		}
+
 		tableID, ok := tableIDs[term.RoutingInstance]
 		if !ok {
 			slog.Warn("PBR: routing-instance not found",
