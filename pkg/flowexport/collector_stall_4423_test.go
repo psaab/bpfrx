@@ -2,6 +2,7 @@ package flowexport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -104,6 +105,86 @@ func TestWriteAll_SlowCollectorDoesNotStallOthers(t *testing.T) {
 	if h[0].WriteFailures != 1 || h[0].Healthy {
 		t.Fatalf("blocked collector: failures=%d healthy=%v, want 1/false",
 			h[0].WriteFailures, h[0].Healthy)
+	}
+}
+
+// TestWriteAll_UnhealthyCollectorSkippedDuringBackoff is the #4423 H07-follow-up
+// (Copilot #2) fail-on-revert guard: once a collector fails a write it must be
+// SKIPPED on subsequent flushes until the probe interval elapses, so a
+// persistently-dead collector does not cost a fresh (potentially full-timeout)
+// write attempt on every flush and thereby keep delaying the healthy
+// collectors. A healthy collector is written on every flush; a recovered
+// collector resumes normal per-flush writes.
+//
+// Against the pre-backoff code every flush re-attempts the unhealthy collector,
+// so its WriteAttempts climbs with the flush count and WriteSkipped stays 0 —
+// the assertions below flip RED.
+func TestWriteAll_UnhealthyCollectorSkippedDuringBackoff(t *testing.T) {
+	origProbe := unhealthyProbeInterval
+	unhealthyProbeInterval = 30 * time.Second
+	t.Cleanup(func() { unhealthyProbeInterval = origProbe })
+
+	bad := &writeFakeConn{err: errors.New("connection refused")}
+	good := &writeFakeConn{}
+	cc := newHealthTestConns(
+		[]string{"10.0.0.1:2055", "10.0.0.2:2055"},
+		[]*writeFakeConn{bad, good},
+	)
+
+	// Flush 1: bad is healthy -> attempted -> fails -> unhealthy + backoff armed.
+	// Flushes 2 and 3: bad is unhealthy and within the window -> SKIPPED.
+	cc.writeAll([]byte("1"), "send")
+	cc.writeAll([]byte("2"), "send")
+	cc.writeAll([]byte("3"), "send")
+
+	h := cc.health()
+	badH, goodH := h[0], h[1]
+	if badH.WriteAttempts != 1 {
+		t.Fatalf("unhealthy collector attempts = %d, want 1 (must be SKIPPED during "+
+			"backoff, not re-attempted every flush) — #4423 Copilot #2", badH.WriteAttempts)
+	}
+	if badH.WriteFailures != 1 {
+		t.Fatalf("unhealthy collector failures = %d, want 1", badH.WriteFailures)
+	}
+	if badH.WriteSkipped != 2 {
+		t.Fatalf("unhealthy collector skipped = %d, want 2 (flushes 2 and 3)", badH.WriteSkipped)
+	}
+	if badH.Healthy {
+		t.Fatal("unhealthy collector should still be unhealthy during backoff")
+	}
+	// The healthy collector is written on every flush regardless.
+	if goodH.WriteAttempts != 3 {
+		t.Fatalf("healthy collector attempts = %d, want 3 (always written, never "+
+			"starved by the unhealthy collector)", goodH.WriteAttempts)
+	}
+	if goodH.WriteSkipped != 0 {
+		t.Fatalf("healthy collector skipped = %d, want 0", goodH.WriteSkipped)
+	}
+
+	// Recovery: clear the error and expire the backoff window, then flush. The
+	// collector is re-probed, the probe succeeds, and it becomes healthy again.
+	bad.setErr(nil)
+	cc.conns[0].mu.Lock()
+	cc.conns[0].nextRetryAt = time.Now().Add(-time.Second) // window elapsed
+	cc.conns[0].mu.Unlock()
+
+	cc.writeAll([]byte("4"), "send") // probe -> success -> healthy
+	if h = cc.health(); !h[0].Healthy {
+		t.Fatal("collector should recover after a successful probe past the backoff window")
+	}
+	if h[0].WriteAttempts != 2 {
+		t.Fatalf("attempts after recovery probe = %d, want 2", h[0].WriteAttempts)
+	}
+
+	// Flush 5: now healthy -> written every flush again (no more skips).
+	cc.writeAll([]byte("5"), "send")
+	if h = cc.health(); h[0].WriteAttempts != 3 {
+		t.Fatalf("attempts after resume = %d, want 3 (healthy collector written every flush)",
+			h[0].WriteAttempts)
+	}
+	if h[0].WriteSkipped != 2 {
+		t.Fatalf("skipped after resume = %d, want 2 (unchanged — only the two backoff "+
+			"flushes were skipped)", h[0].WriteSkipped)
 	}
 }
 

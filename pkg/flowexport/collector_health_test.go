@@ -119,6 +119,13 @@ func TestCollectorHealth_FailureTracksLastError(t *testing.T) {
 // FAIL-ON-REVERT: master has no Healthy field; the test cannot compile
 // against it, and the edge semantics it asserts do not exist pre-fix.
 func TestCollectorHealth_StateChangeEdges(t *testing.T) {
+	// Disable the #4423 probe backoff so every write is attempted — this test
+	// asserts edge detection across CONSECUTIVE failed writes, which the
+	// backoff would otherwise skip.
+	origProbe := unhealthyProbeInterval
+	unhealthyProbeInterval = 0
+	t.Cleanup(func() { unhealthyProbeInterval = origProbe })
+
 	sentinel := errors.New("no route to host")
 	fc := &writeFakeConn{}
 	cc := newHealthTestConns([]string{"10.0.0.9:4739"}, []*writeFakeConn{fc})
@@ -171,6 +178,13 @@ func TestCollectorHealth_StateChangeEdges(t *testing.T) {
 // flag observed before/after each writeAll, mirroring exactly what the
 // warn/info log in writeAll keys off. #2464.
 func TestCollectorHealth_StateChangeCallbackOncePerTransition(t *testing.T) {
+	// Disable the #4423 probe backoff so every write is attempted (this test
+	// steps through consecutive failures then successes — the backoff would
+	// skip the intermediate unhealthy writes and never reach the recovery).
+	origProbe := unhealthyProbeInterval
+	unhealthyProbeInterval = 0
+	t.Cleanup(func() { unhealthyProbeInterval = origProbe })
+
 	sentinel := errors.New("unreachable")
 	fc := &writeFakeConn{}
 	cc := newHealthTestConns([]string{"10.0.0.20:2055"}, []*writeFakeConn{fc})

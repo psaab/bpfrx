@@ -78,6 +78,9 @@ func (s *Server) showFlowMonitoringStatistics(buf *strings.Builder) {
 		fmt.Fprintf(buf, "    State:          %s\n", state)
 		fmt.Fprintf(buf, "    Write attempts: %d\n", h.WriteAttempts)
 		fmt.Fprintf(buf, "    Write failures: %d\n", h.WriteFailures)
+		if h.WriteSkipped > 0 {
+			fmt.Fprintf(buf, "    Write skipped:  %d (unhealthy backoff)\n", h.WriteSkipped)
+		}
 		if !h.LastSuccessTime.IsZero() {
 			fmt.Fprintf(buf, "    Last success:   %s\n", h.LastSuccessTime.Format("2006-01-02 15:04:05"))
 		}

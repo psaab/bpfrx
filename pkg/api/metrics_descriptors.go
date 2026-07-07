@@ -1831,6 +1831,11 @@ func newCollector(srv *Server) *xpfCollector {
 			"Total NetFlow v9 / IPFIX UDP write failures per collector (a climbing value while attempts climb means the collector is unreachable and flow records are being silently dropped). Labeled by instance and template as well as collector and source, so a failing template group sharing a collector address is attributable, not hidden (#3741).",
 			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
 		),
+		flowExportCollectorWriteSkippedTotal: prometheus.NewDesc(
+			"xpf_flow_export_collector_write_skipped_total",
+			"Total NetFlow v9 / IPFIX writes SKIPPED per collector because it was unhealthy and still inside its probe-backoff window (#4423). A climbing value (while attempts/failures hold) means a persistently-dead collector is being skipped between probes rather than re-attempted every flush — the deliberate steady-state cost cap for a dead collector. Same label set as attempts/failures.",
+			[]string{"protocol", "instance", "template", "collector", "source"}, nil,
+		),
 		flowExportCollectorHealthy: prometheus.NewDesc(
 			"xpf_flow_export_collector_healthy",
 			"1 when the last write to this flow-export collector succeeded, 0 when the last write failed. Labeled by instance and template as well as collector and source (#3741).",

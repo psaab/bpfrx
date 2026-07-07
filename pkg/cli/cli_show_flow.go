@@ -1226,6 +1226,9 @@ func (c *CLI) showFlowMonitoringStatistics() error {
 		fmt.Printf("    State:          %s\n", state)
 		fmt.Printf("    Write attempts: %d\n", h.WriteAttempts)
 		fmt.Printf("    Write failures: %d\n", h.WriteFailures)
+		if h.WriteSkipped > 0 {
+			fmt.Printf("    Write skipped:  %d (unhealthy backoff)\n", h.WriteSkipped)
+		}
 		if !h.LastSuccessTime.IsZero() {
 			fmt.Printf("    Last success:   %s\n", h.LastSuccessTime.Format("2006-01-02 15:04:05"))
 		}

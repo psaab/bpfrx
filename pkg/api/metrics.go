@@ -554,6 +554,7 @@ type xpfCollector struct {
 	// collector address (bounded — one per configured flow-server).
 	flowExportCollectorWriteAttemptsTotal *prometheus.Desc
 	flowExportCollectorWriteFailuresTotal *prometheus.Desc
+	flowExportCollectorWriteSkippedTotal  *prometheus.Desc
 	flowExportCollectorHealthy            *prometheus.Desc
 	flowExportCollectorLastSuccessSeconds *prometheus.Desc
 	flowExportCollectorLastFailureSeconds *prometheus.Desc
@@ -846,6 +847,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.wgHandshakeAttemptsAbortedTotal
 	ch <- c.flowExportCollectorWriteAttemptsTotal
 	ch <- c.flowExportCollectorWriteFailuresTotal
+	ch <- c.flowExportCollectorWriteSkippedTotal
 	ch <- c.flowExportCollectorHealthy
 	ch <- c.flowExportCollectorLastSuccessSeconds
 	ch <- c.flowExportCollectorLastFailureSeconds

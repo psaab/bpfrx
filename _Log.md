@@ -37773,3 +37773,39 @@ top.
   pkg/flowexport/ipfix.go, pkg/flowexport/collector_health_test.go,
   pkg/flowexport/collector_stall_4423_test.go, pkg/flowexport/README.md,
   _Log.md
+
+## 2026-07-06 — flowexport #4423 fold: unhealthy-collector backoff + wording (Copilot review)
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fold 3 Copilot findings on PR #4428 before merge.
+  - **Copilot #2 (REAL steady-state gap)** — the H07 write deadline bounds a
+    SINGLE stall to `collectorWriteTimeout` (2s) but a PERSISTENTLY-blocked
+    collector still ate a fresh 2s write attempt on EVERY flush/template-refresh,
+    delaying the healthy collectors + the flush/refresh cadence forever. Fix: a
+    per-collector `nextRetryAt` backoff gate in `writeAll` (transport.go) SKIPS
+    an unhealthy collector until `unhealthyProbeInterval` (30s, a `var`) elapses,
+    then re-probes; a successful probe clears the gate and resumes per-flush
+    writes. Steady-state cost of a dead collector drops from 2s/100ms-flush to
+    one bounded probe/30s. Skips are counted (`collectorConn.skipped` →
+    `CollectorHealth.WriteSkipped`) and surfaced in `show services
+    flow-monitoring` (gRPC + CLI) and the new Prometheus counter
+    `xpf_flow_export_collector_write_skipped_total` — not a silent drop.
+  - **Copilot #1 + #3 (wording overpromise)** — the `collectorWriteTimeout` /
+    `writeAll` comments said a slow collector "cannot stall" the goroutine and
+    the README said "instead of blocking the pipeline," but a write still blocks
+    up to the timeout per attempt. Reworded: the deadline BOUNDS (caps) the
+    stall, does not eliminate it; the backoff then skips an unhealthy collector
+    between probes.
+  - RED-on-revert: `TestWriteAll_UnhealthyCollectorSkippedDuringBackoff` (skip
+    during backoff + recovery-probe resume; without the gate the unhealthy
+    collector's attempts climb with the flush count → RED, verified). Existing
+    `TestCollectorHealth_StateChangeEdges` /
+    `..._StateChangeCallbackOncePerTransition` set `unhealthyProbeInterval = 0`
+    (they assert consecutive-write edge detection, orthogonal to backoff).
+  - Validation: `go test -race ./pkg/flowexport/...` green; `go build ./...`;
+    gofmt/vet clean on touched files (pre-existing metrics_wireguard_test.go
+    gofmt drift + cli.go:503 vet warning are on origin/master, untouched).
+- **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/collector_health_test.go,
+  pkg/flowexport/collector_stall_4423_test.go, pkg/flowexport/README.md,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/grpcapi/server_show_flow.go, pkg/cli/cli_show_flow.go, _Log.md
