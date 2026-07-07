@@ -55,6 +55,24 @@ const (
 	// DefaultHeartbeatThreshold is the default missed heartbeat count before peer is lost.
 	DefaultHeartbeatThreshold = 5
 
+	// heartbeatStartupGrace is the cold-boot config-apply grace window. For
+	// this long after a receiver starts, the local config apply phase (VRF
+	// binding, FRR reload, fabric creation, RETH MAC down/up) can disrupt the
+	// control-link UDP receive path for 10-15+ seconds. BOTH peer-liveness
+	// decisions hold behind this floor so a simultaneous cold boot cannot
+	// split-brain:
+	//   - seen-then-lost: suppress peer-lost entirely — a recovering node must
+	//     not declare a live peer dead on the first dropped heartbeat.
+	//   - never-seen-at-boot: suppress single-node promotion (#4386). Deciding
+	//     a peer NEVER EXISTED is different from a peer that WAS seen then went
+	//     silent: on a simultaneous boot the first heartbeats from a live peer
+	//     are dropped and lastSeen stays 0 on BOTH nodes, so promoting at
+	//     threshold*interval (~500ms) makes BOTH claim the RETH virtual MAC.
+	//     The floor lets a slow-to-appear peer be heard first while a
+	//     genuinely-absent peer (single-node deployment) still promotes once it
+	//     elapses.
+	heartbeatStartupGrace = 30 * time.Second
+
 	// heartbeatAuthMagic marks the optional #4107 PSK/HMAC auth trailer.
 	// Distinct from heartbeatMagic ("BPFX") so a reader can unambiguously
 	// detect a trailer at the tail of a frame. The trailer is appended AFTER
@@ -715,7 +733,6 @@ func (r *heartbeatReceiver) readLoop() {
 
 func (r *heartbeatReceiver) timeoutLoop() {
 	defer r.wg.Done()
-	timeout := time.Duration(r.threshold) * r.interval
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
@@ -724,38 +741,66 @@ func (r *heartbeatReceiver) timeoutLoop() {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
-			lastNano := r.lastSeen.Load()
-			if lastNano == 0 {
-				// No heartbeat ever received. Once we've waited the full
-				// timeout, declare peer absent so the election can proceed
-				// (non-preempt nodes start as secondary and need this to
-				// take primary when the peer is truly down).
-				if time.Since(r.startedAt) > timeout {
-					r.mgr.handlePeerNeverSeen()
-				}
-				continue
-			}
-			// During the first 30 seconds after startup, suppress
-			// peer-lost entirely. The config apply phase (VRF binding,
-			// FRR reload, fabric creation, RETH MAC) can disrupt the
-			// UDP receive path on the control link for 10-15+ seconds.
-			// Without this grace, the recovering node sees one peer
-			// heartbeat then declares peer lost — creating split-brain.
-			// (r.startedAt is a direct time.Time, so time.Since uses
-			// its embedded monotonic reading — already step-safe.)
-			if time.Since(r.startedAt) < 30*time.Second {
-				continue
-			}
-			// Compare in the CLOCK_MONOTONIC domain. The previous
-			// time.Unix(0, lastNano) round-trip produced a Time with
-			// no monotonic reading, making time.Since pure wall-clock
-			// — a forward step > timeout fired a false peer-lost on
-			// a healthy cluster (#1792).
-			if heartbeatStale(lastNano, MonotonicNanos(), timeout) {
-				r.mgr.handlePeerTimeout()
-			}
+			r.checkTimeout()
 		}
 	}
+}
+
+// checkTimeout runs one peer-liveness evaluation tick. Split out of
+// timeoutLoop so the cold-boot never-seen floor and the steady-state
+// staleness decision are unit testable without driving the ticker goroutine.
+func (r *heartbeatReceiver) checkTimeout() {
+	timeout := time.Duration(r.threshold) * r.interval
+	lastNano := r.lastSeen.Load()
+	if lastNano == 0 {
+		// No heartbeat ever received. Deciding a peer NEVER EXISTED at boot
+		// is not the same as a peer that WAS seen then went silent: on a
+		// simultaneous cold boot the local config apply phase disrupts the
+		// control-link RX for 10-15+ seconds, so the first heartbeats from a
+		// live peer are dropped and lastSeen stays 0 on BOTH nodes. Promoting
+		// at threshold*interval (~500ms) would then make BOTH claim primary
+		// and the RETH virtual MAC — split-brain (#4386). Hold the never-seen
+		// promotion behind the SAME cold-boot grace the seen-then-lost path
+		// uses below. A genuinely-absent peer (single-node deployment, or a
+		// peer that will never come up) still promotes once the grace elapses,
+		// so this delays the decision, it never blocks it.
+		// (r.startedAt is a direct time.Time, so time.Since uses its embedded
+		// monotonic reading — already step-safe.)
+		if neverSeenConfirmed(time.Since(r.startedAt), heartbeatStartupGrace) {
+			r.mgr.handlePeerNeverSeen()
+		}
+		return
+	}
+	// During the cold-boot grace, suppress peer-lost entirely. The config
+	// apply phase (VRF binding, FRR reload, fabric creation, RETH MAC) can
+	// disrupt the UDP receive path on the control link for 10-15+ seconds.
+	// Without this grace, the recovering node sees one peer heartbeat then
+	// declares peer lost — creating split-brain. (r.startedAt is a direct
+	// time.Time, so time.Since uses its embedded monotonic reading — already
+	// step-safe.)
+	if time.Since(r.startedAt) < heartbeatStartupGrace {
+		return
+	}
+	// Compare in the CLOCK_MONOTONIC domain. The previous
+	// time.Unix(0, lastNano) round-trip produced a Time with no monotonic
+	// reading, making time.Since pure wall-clock — a forward step > timeout
+	// fired a false peer-lost on a healthy cluster (#1792).
+	if heartbeatStale(lastNano, MonotonicNanos(), timeout) {
+		r.mgr.handlePeerTimeout()
+	}
+}
+
+// neverSeenConfirmed reports whether a receiver that has never seen a peer
+// heartbeat (lastSeen == 0) has waited out the cold-boot config-apply grace
+// and may now confirm the peer absent to drive single-node election. It is a
+// startup FLOOR, not a steady-state timeout: threshold*interval (~500ms) is
+// correct for a peer that WAS seen then went silent, but far too aggressive
+// for deciding a peer never existed at boot, where the first heartbeats are
+// commonly dropped by the local config apply disruption (#4386). Returning
+// true once sinceStart >= grace guarantees a genuinely-absent peer still
+// promotes — the floor delays the never-seen decision, it never blocks it.
+func neverSeenConfirmed(sinceStart, grace time.Duration) bool {
+	return sinceStart >= grace
 }
 
 // heartbeatStale reports whether the last peer heartbeat is older than

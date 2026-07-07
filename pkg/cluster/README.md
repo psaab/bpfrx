@@ -109,6 +109,34 @@ The primary consumer of the `Manager.Events()` channel is
 publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
 state-handler method, not the event-channel consumer.
 
+## Peer-liveness cold-boot grace (#4386)
+
+`heartbeatReceiver.checkTimeout` (`heartbeat.go`) makes both peer-liveness
+decisions, and both are gated behind a single cold-boot floor,
+`heartbeatStartupGrace` (30s). For that window after a receiver starts, the
+local config apply phase — VRF binding, FRR reload, fabric creation, RETH MAC
+down/up — can disrupt the control-link UDP receive path for 10-15+ seconds:
+
+- **Seen-then-lost** (`lastSeen != 0`): peer-lost is suppressed entirely inside
+  the grace, so a recovering node does not declare a still-live peer dead on
+  the first dropped heartbeat. After the grace, staleness (`heartbeatStale`,
+  `threshold*interval`) drives `handlePeerTimeout`.
+- **Never-seen-at-boot** (`lastSeen == 0`): single-node promotion is held
+  behind the SAME floor via `neverSeenConfirmed(sinceStart, grace)`. Deciding a
+  peer NEVER EXISTED is different from a peer that WAS seen then went silent —
+  on a **simultaneous cold boot** the first heartbeats from a live peer are
+  dropped and `lastSeen` stays 0 on BOTH nodes. Promoting at
+  `threshold*interval` (~500ms) would then make BOTH claim primary and the RETH
+  virtual MAC — a 10-15s split-brain until the link recovers and dual-active
+  resolution demotes one. The floor lets a slow-to-appear peer be heard first.
+
+The floor DELAYS the never-seen decision; it never blocks it. A genuinely
+absent peer — a single-node deployment, or a peer that will never come up —
+still promotes once the grace elapses (`neverSeenConfirmed` returns true at
+`sinceStart >= grace`), so there is no permanent no-master. `handlePeerNeverSeen`
+sets `peerEverSeen` and runs `electSingleNode`; `election.go` bypasses the
+readiness gate when `!peerAlive`, so the surviving node takes over.
+
 ## Control-channel authentication (#4107, PR-A)
 
 The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds

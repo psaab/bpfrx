@@ -1,3 +1,22 @@
+## 2026-07-06 — #4386 cold-boot split-brain: never-seen heartbeat startup floor
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fixed the cluster heartbeat "peer never seen" path promoting after
+  only threshold*interval (~500ms), which skipped the 30s config-apply grace and
+  caused dual-primary on a simultaneous cold boot. The config apply phase (FRR
+  reload, fabric creation, RETH MAC down/up) disrupts control-link RX for 10-15s,
+  so first heartbeats drop and lastSeen stays 0 on BOTH nodes → both promoted and
+  claimed the RETH virtual MAC. Extracted the per-tick evaluation into a testable
+  `heartbeatReceiver.checkTimeout` seam, added the shared `heartbeatStartupGrace`
+  (30s) const (reused for both the seen-then-lost grace and the never-seen floor),
+  and gated the never-seen promotion behind `neverSeenConfirmed(sinceStart,
+  grace)`. A genuinely-absent peer still promotes once the grace elapses (floor
+  delays, never blocks) so single-node deployments are unaffected. RED-on-revert:
+  restoring the old `> timeout` check promotes a never-seen peer at 5s (mid
+  config-apply window) → the within-grace test fails. go test ./pkg/cluster/...
+  green (incl -race), go build/vet/gofmt clean.
+  **File(s)**: pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_neverseen_floor_test.go, pkg/cluster/README.md, _Log.md
 ## 2026-07-06 — #4376: VRRP dual-stack equal-priority tie-break family-consistency
 
 - **Timestamp**: 2026-07-06 16:53 PDT
