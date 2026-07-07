@@ -1,3 +1,64 @@
+## 2026-07-07 — #4482 (opus-172 M-5): FRR set-clause/prefix-list sanitize-belt bypass
+
+- **Timestamp**: 2026-07-07
+- **Action**: Closed the residual #4097 sanitize-belt bypass on the
+  tolerant-load path (Medium, config-injection). #4097 wrapped the
+  `bgp community-list` / `bgp as-path access-list` DEFINITIONS in
+  sanitizeFRRValue but left the route-map `set community` /
+  `set community additive` / `set comm-list delete` / `set as-path
+  prepend` clauses, the `match community` / `match as-path` names, and
+  the `ip/ipv6 prefix-list ... permit <prefix>` entries (top-level and
+  inline route-filter) rendering with a bare %s — so a leniently-loaded /
+  peer-synced / rolled-back value with an embedded newline could inject a
+  standalone frr.conf command (the strict #1798 commit gate only warns on
+  those paths, #1960). Routed ALL those free-text slots through
+  sanitizeFRRValue, so every FRR-rendered value is sanitized regardless of
+  load path. No-op for clean values (rest-of-line tokens keep legitimate
+  spaces), so existing output is byte-identical.
+- **File(s)**: pkg/frr/policy_render.go,
+  pkg/frr/policy_setclause_injection_4482_test.go, pkg/frr/README.md
+- **Validation**: RED-on-revert unit test
+  (`TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482`) —
+  set-community / set-as-path-prepend / prefix-list injection payloads
+  collapse onto their single directive lines with no standalone
+  `router bgp` / `neighbor` line; reverting any wrapped site turns it RED.
+  Full pkg/frr suite green, go build, gofmt + vet clean.
+
+## 2026-07-07 — #4481 (opus-172 M-4): FRR cross-context route-map default-action leak
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fixed the FRR cross-context route-map default-action leak
+  (Medium). FRR route-maps are keyed by NAME — one object shared across
+  every use site — so a policy-statement applied BOTH as a BGP route-map
+  in/out (trailing PERMIT, Junos BGP default-accept #2998) AND as an IGP
+  `redistribute` export (Junos default REJECT) let the BGP accept-all
+  govern the redistribute too, leaking every non-matching prefix into the
+  IGP. Fix renders a per-use-site fail-closed alias: `generatePolicyOptions`
+  emits the base `route-map <name>` (permit default for BGP) AND, when
+  `policyNeedsRedistAlias` holds (name in the GLOBAL `bgpAcceptDefault`
+  union with no explicit default), a second `route-map <name>-xpf-redist`
+  with the fail-closed trailing `deny`; `resolveRedistribute` points the
+  `redistribute <proto> route-map` line at that alias while the BGP
+  neighbor keeps referencing the permit-default base. Extracted the
+  ~400-line per-policy body into `renderRouteMapForPolicy(po, emitName,
+  ps, trailingAction)` so base + alias share identical terms/match/set
+  clauses (inline route-filter prefix-lists derive from `emitName`, so the
+  alias is self-contained) and differ only in header name + trailing
+  default; existing #2607/#2642/#2998 output stays byte-identical.
+  `buildManagedSection` computes the GLOBAL `bgpAcceptDefault` union once
+  (default instance + every VRF) and threads it into BOTH
+  `generatePolicyOptions` AND `generateProtocols`→`resolveRedistribute`
+  (new param), so cross-instance dual-use aliases correctly.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/manager.go,
+  pkg/frr/policy_routemap_leak_4481_test.go, pkg/frr/README.md,
+  ~90 test-caller signature updates in pkg/frr/*_test.go
+- **Validation**: RED-on-revert unit test
+  (`TestBuildManagedSection_CrossContextRouteMapNoLeak_4481`) —
+  redistribute references the fail-closed `SHARED-xpf-redist` alias, base
+  BGP map keeps its trailing permit; reverting the alias reference +
+  emission turns it RED. `go test ./pkg/frr/...` green, `go build`,
+  gofmt + vet clean.
+
 ## 2026-07-07 — Fix TestUserspaceLinkCycleDoesNotReenterLegacyLoader stale file target after #4462 process.go split
 
 - **Timestamp**: 2026-07-07T16:20Z

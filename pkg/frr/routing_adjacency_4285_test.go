@@ -56,7 +56,7 @@ func TestGenerateProtocols_OSPFInterfaceTimersAndPriority(t *testing.T) {
 		},
 	}
 
-	got := m.generateProtocols(ospf, ospfv3, nil, nil, nil, "", 0, nil)
+	got := m.generateProtocols(ospf, ospfv3, nil, nil, nil, "", 0, nil, nil)
 
 	for _, want := range []string{
 		" ip ospf hello-interval 1\n",
@@ -86,7 +86,7 @@ func TestGenerateProtocols_OSPFPriorityUnsetOmitted(t *testing.T) {
 		},
 	}
 
-	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, nil)
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, nil, nil)
 	if strings.Contains(got, "ip ospf priority") {
 		t.Errorf("renderer emitted an OSPF priority line for an unset priority; output:\n%s", got)
 	}
@@ -117,7 +117,7 @@ func TestGenerateProtocols_BGPUpdateSourcePassiveHoldTimeLocalAS(t *testing.T) {
 		},
 	}
 
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil, nil)
 
 	for _, want := range []string{
 		" neighbor 10.255.0.2 update-source 10.255.0.1\n",

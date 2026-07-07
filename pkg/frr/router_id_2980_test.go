@@ -31,7 +31,7 @@ func TestGenerateProtocols_InvalidRouterIDSkipped(t *testing.T) {
 		},
 	}
 
-	got := m.generateProtocols(ospf, ospfv3, bgp, nil, nil, "", 0, nil)
+	got := m.generateProtocols(ospf, ospfv3, bgp, nil, nil, "", 0, nil, nil)
 
 	for _, bad := range []string{
 		"ospf router-id not-an-ip",
@@ -45,7 +45,7 @@ func TestGenerateProtocols_InvalidRouterIDSkipped(t *testing.T) {
 
 	// A valid router-id still renders.
 	valid := m.generateProtocols(
-		&config.OSPFConfig{RouterID: "10.0.0.1"}, nil, nil, nil, nil, "", 0, nil)
+		&config.OSPFConfig{RouterID: "10.0.0.1"}, nil, nil, nil, nil, "", 0, nil, nil)
 	if !strings.Contains(valid, "ospf router-id 10.0.0.1\n") {
 		t.Errorf("renderer dropped a valid OSPF router-id; output:\n%s", valid)
 	}

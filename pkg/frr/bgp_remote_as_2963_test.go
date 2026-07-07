@@ -28,7 +28,7 @@ func TestGenerateProtocols_BGPRemoteAS0Skipped(t *testing.T) {
 			{Address: "10.0.3.1", PeerAS: 65003},                        // valid
 		},
 	}
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil, nil)
 	if strings.Contains(got, "remote-as 0") {
 		t.Errorf("renderer emitted reserved 'remote-as 0' (RFC 7607); output:\n%s", got)
 	}
