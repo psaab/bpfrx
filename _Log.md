@@ -26,6 +26,34 @@
 - **File(s)**: userspace-dp/src/session/mod.rs,
   userspace-dp/src/session/lookup.rs, userspace-dp/src/session/tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+## 2026-07-06 — #4405: split compiler_validate_strict.go into per-domain files
+
+- **Timestamp**: 2026-07-06
+- **Action**: Pure code-motion refactor. Split the 6,997-LOC
+  `pkg/config/compiler_validate_strict.go` monolith (116 top-level
+  declarations, 60+ strict commit-time validators) into ten per-domain
+  files by validator name prefix: `_observability.go`, `_cos.go`,
+  `_ipsec.go`, `_routing.go`, `_filter.go`, `_application.go`,
+  `_policy.go`, `_nat.go`, `_zones.go`, `_screen.go`. Each domain's
+  validators plus its domain-local helpers/consts/vars moved verbatim;
+  the residual `compiler_validate_strict.go` (478 LOC) keeps the
+  system/dataplane group (dataplane-type, managed-process names,
+  userspace SYN-cookie, DHCP static bindings, VRRP virtual-address,
+  flow aging, trailing tokens). Committed one domain at a time, each
+  building and testing green. No validator logic, signature, or name
+  changed — verified by (a) the sorted top-level declaration-name set
+  being identical before/after (empty diff, 116 decls), (b) a
+  format-normalized per-declaration AST comparison finding all 116
+  bodies byte-identical, and (c) `go build ./...` + `go test
+  ./pkg/config/...` green. Repointed the path-based #3393 filter-protocol
+  Go<->Rust parity test and four stale doc locators (comment-only) at the
+  new files.
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_validate_strict_{observability,cos,ipsec,routing,filter,application,policy,nat,zones,screen}.go,
+  pkg/config/filter_protocol_rust_mirror_3393_test.go,
+  pkg/config/schema_scheduler_name_3117_test.go, pkg/config/schema_security.go,
+  pkg/config/compiler_application_specs_test.go,
+  pkg/config/compiler_application_timeout_3320_test.go, _Log.md
 
 ## 2026-07-06 — #4393: publish reverse-SNAT dnat_table entry for synced SNAT sessions
 

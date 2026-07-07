@@ -27,7 +27,7 @@ import (
 // Go arm would simply go un-exercised, leaving the Rust mirror silently stale.
 // This test closes that hole MECHANICALLY: it parses the literal named-token set
 // out of BOTH the Go gate source (filterProtocolResolvable's switch arms in
-// compiler_validate_strict.go) and the Rust mirror's `for token in [...]` array,
+// compiler_validate_strict_filter.go) and the Rust mirror's `for token in [...]` array,
 // and asserts the two sets are identical. Add or remove a named protocol on
 // either side without the matching change on the other and this goes RED,
 // naming the offending token(s).
@@ -81,12 +81,12 @@ func TestFilterProtocolNamedSetMatchesRustMirror(t *testing.T) {
 
 // parseGoFilterProtocolNamedSet extracts the NAMED (non-numeric) tokens
 // filterProtocolResolvable accepts by reading its switch arms from the Go source
-// (compiler_validate_strict.go in this package). It anchors on the function
+// (compiler_validate_strict_filter.go in this package). It anchors on the function
 // signature and collects quoted strings up to the `default:` arm (the numeric
 // fallthrough), so it captures exactly the named case labels.
 func parseGoFilterProtocolNamedSet(t *testing.T) map[string]bool {
 	t.Helper()
-	const src = "compiler_validate_strict.go"
+	const src = "compiler_validate_strict_filter.go"
 	data, err := os.ReadFile(src)
 	if err != nil {
 		t.Fatalf("read %s: %v", src, err)

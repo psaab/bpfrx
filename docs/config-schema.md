@@ -47,6 +47,25 @@ Because completion (3) and validation (4) read the SAME node, they cannot
 drift — typing a leaf fixes both `set ... ?` help and `commit check`
 rejection together.
 
+## Strict commit-time validators → `pkg/config/compiler_validate_strict_*.go`
+
+The typed per-leaf `SchemaValidate` walk (4) cannot express cross-field or
+cross-stanza rules (e.g. "this `then policer` names a defined policer",
+"this VIP falls inside the interface subnet"). Those rules live in the
+strict `validate*Strict(cfg *Config) error` family, dispatched from the
+typed-config phase of `compileExpanded` (`compiler.go`) — strict on the
+operator commit / commit-check path, lenient (warn, #1960 no-brick) on the
+tolerant load / peer-sync ingress. #4405 split the former ~7k-LOC
+`compiler_validate_strict.go` monolith by domain into sibling files
+(`compiler_validate_strict_{observability,cos,ipsec,routing,filter,application,policy,nat,zones,screen}.go`),
+mirroring the #1891 `schema_*.go` layout; the residual
+`compiler_validate_strict.go` keeps the system/dataplane group
+(dataplane-type, managed-process names, SYN-cookie, DHCP static bindings,
+VRRP virtual-address, flow aging, trailing tokens). It was a pure
+code-motion split — every `(compiler_validate_strict.go)` locator
+elsewhere in this document still names the correct, unchanged function, now
+in whichever sibling file holds it (grep the function name to find it).
+
 The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 `pkg/grpcapi` `completeConfigPairs` — route `set` paths through
 `config.CompleteSetPathWithValues` over `setSchema`. `cmdtree.ConfigTopLevel`

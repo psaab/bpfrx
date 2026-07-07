@@ -245,7 +245,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				// scheduler to the policy. The compiler reads it as a plain
 				// string (compiler_security.go: polInst.node.FindChild(
 				// "scheduler-name") → nodeVal) and the strict validator
-				// rejects an undefined reference (compiler_validate_strict.go
+				// rejects an undefined reference (compiler_validate_strict_cos.go
 				// validatePolicySchedulerReferencesStrict). It was absent from
 				// setSchema, so the leaf had no structural/`?` completion —
 				// inconsistent with the two-SSOT rule that every compiled +
