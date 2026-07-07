@@ -1102,9 +1102,10 @@ func TestHandleMasterRx_LowerPriority_StaysMaster(t *testing.T) {
 func TestHandleMasterRx_EqualPriority_HigherPeerIP_StepsDown(t *testing.T) {
 	eventCh := make(chan VRRPEvent, 16)
 	vi := newInstance(Instance{
-		Interface: "eth0",
-		GroupID:   101,
-		Priority:  200,
+		Interface:        "eth0",
+		GroupID:          101,
+		Priority:         200,
+		VirtualAddresses: []string{"10.0.0.100/24"}, // v4-bearing
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.setLocalIP(net.IPv4(10, 0, 0, 1)) // lower IP
 	vi.setState(StateMaster)
@@ -1128,9 +1129,10 @@ func TestHandleMasterRx_EqualPriority_HigherPeerIP_StepsDown(t *testing.T) {
 func TestHandleMasterRx_EqualPriority_LowerPeerIP_StaysMaster(t *testing.T) {
 	eventCh := make(chan VRRPEvent, 16)
 	vi := newInstance(Instance{
-		Interface: "eth0",
-		GroupID:   101,
-		Priority:  200,
+		Interface:        "eth0",
+		GroupID:          101,
+		Priority:         200,
+		VirtualAddresses: []string{"10.0.0.100/24"}, // v4-bearing
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
 	vi.setLocalIP(net.IPv4(10, 0, 0, 2)) // higher IP
 	vi.setState(StateMaster)
@@ -1253,6 +1255,158 @@ func TestHandleMasterRx_EqualPriority_LowerPeerIPv6_StaysMaster(t *testing.T) {
 
 	if vi.getState() != StateMaster {
 		t.Errorf("state = %s, want MASTER (equal priority, we have higher IPv6)", vi.getState())
+	}
+}
+
+// TestHandleMasterRx_DualStack_DisagreeingOrderings_ConvergeOneMaster proves the
+// #4376 fix: two equal-priority dual-stack nodes whose v4 and v6 source orderings
+// DISAGREE must converge to exactly ONE master. Node A has the higher v4 but the
+// lower link-local; node B has the lower v4 but the higher link-local. Each node
+// emits BOTH a v4 and a v6 advert. With the family-split tie-break (pre-fix) A
+// steps down on B's higher-v6 advert while B steps down on A's higher-v4 advert —
+// both go BACKUP and oscillate. The family-consistent tie-break anchors on v4, so
+// the lower-v4 node (B) backs down and the higher-v4 node (A) stays master.
+func TestHandleMasterRx_DualStack_DisagreeingOrderings_ConvergeOneMaster(t *testing.T) {
+	vips := []string{"10.0.0.100/24", "2001:db8::100/64"} // dual-stack
+
+	newMaster := func(v4, v6 net.IP) *vrrpInstance {
+		eventCh := make(chan VRRPEvent, 16)
+		vi := newInstance(Instance{
+			Interface:        "eth0",
+			GroupID:          101,
+			Priority:         200,
+			VirtualAddresses: vips,
+		}, &net.Interface{Name: "eth0"}, eventCh, nil)
+		vi.setLocalIP(v4)
+		vi.setLocalIPv6(v6)
+		vi.setState(StateMaster)
+		return vi
+	}
+
+	// Node A: higher v4 (.2), lower link-local (fe80::1).
+	nodeA := newMaster(net.IPv4(10, 0, 0, 2), net.ParseIP("fe80::1"))
+	// Node B: lower v4 (.1), higher link-local (fe80::2).
+	nodeB := newMaster(net.IPv4(10, 0, 0, 1), net.ParseIP("fe80::2"))
+
+	// Adverts each node emits, one per family from its own source addresses.
+	aV4 := &VRRPPacket{Priority: 200, SrcIP: net.IPv4(10, 0, 0, 2)}
+	aV6 := &VRRPPacket{Priority: 200, SrcIP: net.ParseIP("fe80::1")}
+	bV4 := &VRRPPacket{Priority: 200, SrcIP: net.IPv4(10, 0, 0, 1)}
+	bV6 := &VRRPPacket{Priority: 200, SrcIP: net.ParseIP("fe80::2")}
+
+	newTimers := func() (*time.Timer, *time.Timer) {
+		return time.NewTimer(time.Hour), time.NewTimer(time.Hour)
+	}
+
+	// Feed A the peer's v6 advert FIRST (the order that triggered the old bug),
+	// then the v4 advert. Only feed while still MASTER (production invariant:
+	// handleMasterRx runs in MASTER state only).
+	amd, aad := newTimers()
+	defer amd.Stop()
+	defer aad.Stop()
+	nodeA.handleMasterRx(bV6, amd, aad)
+	if nodeA.getState() == StateMaster {
+		nodeA.handleMasterRx(bV4, amd, aad)
+	}
+
+	// Feed B the peer's v4 advert first, then v6.
+	bmd, bad := newTimers()
+	defer bmd.Stop()
+	defer bad.Stop()
+	nodeB.handleMasterRx(aV4, bmd, bad)
+	if nodeB.getState() == StateMaster {
+		nodeB.handleMasterRx(aV6, bmd, bad)
+	}
+
+	if nodeA.getState() != StateMaster {
+		t.Errorf("node A (higher v4) state = %s, want MASTER", nodeA.getState())
+	}
+	if nodeB.getState() != StateBackup {
+		t.Errorf("node B (lower v4) state = %s, want BACKUP", nodeB.getState())
+	}
+}
+
+// TestHandleMasterRx_DualStack_IgnoresV6Advert proves a dual-stack master does
+// NOT step down on a higher-v6 advert — the v6 family is not the tie-break anchor
+// (#4376). Pre-fix this stepped down (family-split), the root of the oscillation.
+func TestHandleMasterRx_DualStack_IgnoresV6Advert(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface:        "eth0",
+		GroupID:          101,
+		Priority:         200,
+		VirtualAddresses: []string{"10.0.0.100/24", "2001:db8::100/64"}, // dual-stack
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
+	vi.setLocalIP(net.IPv4(10, 0, 0, 2))    // higher v4 → we win the v4 anchor
+	vi.setLocalIPv6(net.ParseIP("fe80::1")) // lower link-local
+	vi.setState(StateMaster)
+
+	md := time.NewTimer(time.Hour)
+	defer md.Stop()
+	ad := time.NewTimer(time.Hour)
+	defer ad.Stop()
+
+	// Higher-v6 peer advert must be ignored for the tie-break.
+	pkt := &VRRPPacket{Priority: 200, SrcIP: net.ParseIP("fe80::2")}
+	vi.handleMasterRx(pkt, md, ad)
+
+	if vi.getState() != StateMaster {
+		t.Errorf("state = %s, want MASTER (dual-stack must ignore v6 advert for tie-break)", vi.getState())
+	}
+}
+
+// TestHandleMasterRx_V6Only_TieBreaksOnLinkLocal proves a v6-only instance (no v4
+// VIP) still resolves the equal-priority tie-break on the link-local v6 address
+// (#4376 keeps the v6-only path intact).
+func TestHandleMasterRx_V6Only_TieBreaksOnLinkLocal(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface:        "eth0",
+		GroupID:          101,
+		Priority:         200,
+		VirtualAddresses: []string{"2001:db8::100/64"}, // v6-only
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
+	vi.setLocalIPv6(net.ParseIP("fe80::1")) // lower link-local
+	vi.setState(StateMaster)
+
+	md := time.NewTimer(time.Hour)
+	defer md.Stop()
+	ad := time.NewTimer(time.Hour)
+	defer ad.Stop()
+
+	pkt := &VRRPPacket{Priority: 200, SrcIP: net.ParseIP("fe80::2")} // higher
+	vi.handleMasterRx(pkt, md, ad)
+
+	if vi.getState() != StateBackup {
+		t.Errorf("state = %s, want BACKUP (v6-only, peer link-local higher)", vi.getState())
+	}
+}
+
+// TestHandleMasterRx_NilLocal_DoesNotStayMaster proves the #4376 secondary fix: a
+// v4-bearing master whose local source address is unresolved (nil) must NOT treat
+// that as "we win". It yields to the actively advertising equal-priority peer
+// instead of holding the VIP forever.
+func TestHandleMasterRx_NilLocal_DoesNotStayMaster(t *testing.T) {
+	eventCh := make(chan VRRPEvent, 16)
+	vi := newInstance(Instance{
+		Interface:        "eth0",
+		GroupID:          101,
+		Priority:         200,
+		VirtualAddresses: []string{"10.0.0.100/24"}, // v4-bearing
+	}, &net.Interface{Name: "eth0"}, eventCh, nil)
+	// Deliberately do NOT setLocalIP — local source unresolved.
+	vi.setState(StateMaster)
+
+	md := time.NewTimer(time.Hour)
+	defer md.Stop()
+	ad := time.NewTimer(time.Hour)
+	defer ad.Stop()
+
+	pkt := &VRRPPacket{Priority: 200, SrcIP: net.IPv4(10, 0, 0, 2)}
+	vi.handleMasterRx(pkt, md, ad)
+
+	if vi.getState() != StateBackup {
+		t.Errorf("state = %s, want BACKUP (nil local must not default to stay-master)", vi.getState())
 	}
 }
 
