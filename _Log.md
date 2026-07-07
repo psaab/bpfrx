@@ -38691,3 +38691,25 @@ top.
   userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/src/afxdp/frame/tests.rs,
   docs/rib-group-route-leaking.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4406 step 1 — extract the P1 "AST pre-walk" phase of
+  compileExpanded into runPreWalkGates (compiler_prewalk.go) and add the
+  reusable golden-output behavior-preservation harness. compileExpanded is a
+  god-orchestrator (ps-review-011 / codex-173 #4); the sections and validators
+  are already sibling-extracted, so the decomposition is behavior-preserving
+  code-motion of the call-glue, gated by an OUTPUT-level golden proof. Step 1
+  lifts the contiguous SAFE first phase (~22 AST gates + expandInterfaceRanges
+  #4027 tree mutation) verbatim; compileExpanded now calls runPreWalkGates
+  FIRST and does a single `cfg.Warnings = append(cfg.Warnings,
+  preWalkWarnings...)` (same source order). Golden gate: 24-case corpus
+  (broad multi-section + flat vSRX cluster node0/node1 + multi-strict-violation
+  + many-lenient-downgrade) x strict/lenient x generic/node0/node1;
+  json.Marshal(*Config incl. Warnings) + error string, byte-compared to a
+  baseline captured on origin/master. Proof: golden regenerated on a pristine
+  origin/master checkout is sha256-identical (0c581ee...) to the extraction
+  branch, and the extracted code passes the gate. go build ./... + go vet +
+  full pkg/config suite green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_prewalk.go,
+  pkg/config/compile_golden_4406_test.go,
+  pkg/config/testdata/golden_4406.json, _Log.md
