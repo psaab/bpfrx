@@ -37278,3 +37278,36 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
   userspace-dp/src/afxdp/README.md, docs/generated-reply-rate-limit.md,
   _Log.md
+
+## 2026-07-06 — #4377: session limit-session per-IP cap enable-transition back-count
+
+- **Timestamp**: 2026-07-06
+- **Action**: Fix the per-IP `limit-session` cap-bypass on the OFF->ON enable
+  edge (opus-171 H-1). The install increment and the sole-sink `remove_entry`
+  decrement share the origin-agnostic counted-class predicate
+  (`!is_reverse && !origin.is_transient_local_seed()`) but keep no per-entry
+  record of whether an entry was actually charged; each is gated only on
+  `session_limit_active` at the moment of the op. `set_session_limit_active`
+  cleared both count maps on ON->OFF but did NOTHING on OFF->ON, so a forward
+  session installed while the gate was OFF (or after a disable cleared the
+  maps) was uncounted, yet its teardown while ON still decremented — an
+  increment-less decrement that drives `count[X]` below the live counted count;
+  `saturating_sub` + evict-at-0 hide the underflow, so `count[X]` can reach 0
+  while sessions are live and X gets a fresh full allotment (cap bypass). Fix:
+  back-count-on-enable — on the OFF->ON edge walk the live slab via
+  `key_to_handle` (matching `iter_with_origin`) and increment the per-IP maps
+  for every counted-class entry, using the SAME predicate as the sinks so #3122
+  peer-SYNCED sessions are back-counted exactly as their teardown will
+  decrement. O(N) once per rare enable, no per-entry memory. Corrected the
+  mod.rs doc that called not-back-counting "benign" (wrong for the decrement
+  side). New RED-on-revert test
+  `session_limit_backcount_on_enable_covers_preexisting_sessions` (install N
+  while INACTIVE + 1 synced import -> enable -> src count == N+1 incl. synced;
+  new install caps; teardown of pre-existing decrements a real increment; count
+  never below live) and updated `session_limit_clear_on_disable` (re-enable
+  back-counts the 3 live sessions -> 3, then 4). Both RED with the back-count
+  disabled. Full cargo serial: session:: subset 149 passed / 0 failed; overall
+  3629 + 54 + 8 + 22 + 1 = 3714 passed / 0 failed, 2 ignored.
+- **File(s)**: userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs, userspace-dp/src/session/README.md,
+  docs/pr/2134-screen-session-limit-enforce/self-review.md, _Log.md

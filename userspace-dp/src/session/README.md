@@ -845,17 +845,38 @@ per new flow, before its session exists, via a non-mutating
 `session_limit_{src,dst}_count` query, and emits the
 `session-limit-src` / `session-limit-dst` screen-drop event + counter.
 
-**OFF-gate + clear-on-disable.** `set_session_limit_active(active)` is
-driven from the applied screen-profile snapshot (startup +
-runtime-reload, next to `set_timeouts` /
-`ScreenState::update_profiles`). When no zone configures `limit-session`
+**OFF-gate + clear-on-disable + back-count-on-enable (#4377).**
+`set_session_limit_active(active)` is driven from the applied
+screen-profile snapshot (startup + runtime-reload, next to `set_timeouts`
+/ `ScreenState::update_profiles`). When no zone configures `limit-session`
 the gate is OFF and every maintenance op short-circuits, so the ~99% of
 deployments pay nothing. On an ON→OFF runtime transition the gate setter
 **clears both count maps** — otherwise the decrement paths stop firing
 and a later re-enable would resume from stale, over-counted values and
-spuriously block an under-limit IP. After a re-enable the maps start
-empty and re-populate from new installs; pre-existing live sessions are
-not back-counted (benign, Junos-approximate).
+spuriously block an under-limit IP.
+
+On an OFF→ON transition the gate setter **rebuilds both count maps from
+the live slab** (#4377). This is NOT optional / benign: install and
+`remove_entry` share the same presence predicate but keep no per-entry
+record of whether the entry was actually charged — each is gated only on
+`session_limit_active` at the moment of the op. A forward session
+installed while the gate was OFF (or after a disable cleared the maps) is
+uncounted, yet its teardown while ON still fires the sole-sink decrement.
+That increment-less decrement drives `count[X]` BELOW the live
+counted-session count; `saturating_sub` + evict-at-0 hide the underflow,
+so `count[X]` can reach 0 while sessions are live and X is handed a fresh
+full allotment — a **cap bypass** on the enable edge (or any
+disable→enable toggle). The back-count walks `key_to_handle` (the
+authoritative primary index, matching `iter_with_origin`) and increments
+the per-IP maps for every counted-class entry
+(`!is_reverse && !origin.is_transient_local_seed()`), using the SAME
+origin-agnostic predicate as the install/decrement sinks so #3122
+peer-SYNCED sessions are back-counted exactly as their later teardown
+will decrement them. Now every decrement balances an increment and the
+cap enforces on the true live count. O(N) once per rare enable, no
+per-entry memory. Regression:
+`session_limit_backcount_on_enable_covers_preexisting_sessions` and the
+`session_limit_clear_on_disable` re-enable assertions.
 
 **Per-worker scoping — the effective cap is `configured × num_workers`
 (#2186).** Each worker owns its `SessionTable` by value, so the per-IP
