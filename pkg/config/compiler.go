@@ -1984,99 +1984,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// sub-steps.
 	resolveDerivedConfig(cfg, opts)
 
-	// #1526 — reject retired dataplane backends at commit time.
-	// Placed BEFORE the other strict validators so that an operator
-	// editing a candidate that has BOTH a retired dataplane-type and
-	// an unrelated structural error (CoS, policers, scheduler-map)
-	// sees the migration message first. The retirement is the
-	// documented migration path; the other errors only become
-	// actionable after migration. This precheck stays fail-fast
-	// (the no-leak contract is pinned by
-	// TestDataplaneTypeDPDKRejectedAtCommitFiresFirst in
-	// parser_ast_test.go).
-	//
-	// Store.Load and Store.SyncApply tolerate retired-backend
-	// configs via rewriteRetiredDataplaneType which strips the
-	// retired leaf from the AST before compile (#1373 ebpf +
-	// #1525 dpdk handle both this way). See
-	// pkg/configstore/dataplane_retire.go.
-	if err := validateDataplaneTypeStrict(cfg); err != nil {
-		return nil, err
-	}
-
-	// #3061 (narrowed in #4340) — enforce the two naming invariants that keep
-	// the synthetic zone-local/<zone>/<name> internal names minted by
-	// resolveZoneLocalAddressBooks collision-proof, BEFORE folding zone-local
-	// books: an operator address-book entry name may not begin with the reserved
-	// `zone-local/` prefix, and a security-zone name may not contain `/`. A `/`
-	// elsewhere in an entry name (net_10.0.0.0/8) is permitted — the
-	// prefix-in-name convention real vSRX configs use (#4340). This MUST run on
-	// the pristine global book — i.e. before the fold injects the `/`-bearing
-	// synthetic names — so it is placed here rather than in the post-fold
-	// accumulator. Strict on commit / commit-check (hard-reject); tolerant load /
-	// peer-sync downgrade to a warning (#1960 no-brick; the fold's no-clobber
-	// guard keeps it from silently overwriting an operator entry).
-	if err := validateAddressBookEntryNamesStrict(cfg); err != nil {
-		if opts.lenientAddressBookNames {
-			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("address-book/zone name (downgraded to warning on tolerant path): %v", err))
-		} else {
-			return nil, err
-		}
-	}
-	// #3061 — fold zone-local address books into the global book under
-	// zone-qualified internal names and rewrite policy match tokens. Runs after
-	// the name gate (above) and before the policy match-address resolution
-	// validators (validatePolicyMatchAddressesStrict /
-	// validatePolicyMatchAddressSetMembersStrict), which depend on the rewritten
-	// tokens and synthetic global entries.
-	resolveZoneLocalAddressBooks(&cfg.Security)
-
-	// #4290 — resolve `then static-nat prefix-name <name>` translation targets
-	// into their literal prefix now that the global address book is fully
-	// folded (compileNAT can run before compileAddressBook within a `security {}`
-	// root, so this cannot happen inline in the then switch). An unresolvable
-	// reference leaves Then=="" and is rejected below by
-	// validateStaticNATThenTargetStrict (warn on the tolerant path).
-	resolveStaticNATThenPrefixNames(&cfg.Security)
-
-	// #1538 — accumulate independent strict-validator families so
-	// `commit check` surfaces one error per family in a single
-	// response. This saves operator round-trips on first-touch
-	// upgrades from legacy candidates that carry several dormant
-	// structural findings at once. Validators in this group MUST
-	// remain independent: each reads its own typed sub-struct of
-	// *Config and does not depend on another's success. Each
-	// validator still fail-fasts INTERNALLY (one error per family
-	// in a single response), which is sufficient for the upgrade
-	// UX win; full intra-validator accumulation is deliberately
-	// out of scope. If a future validator depends on another's
-	// success it must be added as a separate post-accumulator
-	// step with its own guard rather than slotted in alongside
-	// the independent set.
-	var strictErrs []error
-	if err := validateClassOfServiceStrict(cfg.ClassOfService); err != nil {
-		strictErrs = append(strictErrs, err)
-	}
-	if err := validateThreeColorPolicersStrict(cfg.Firewall.ThreeColorPolicers); err != nil {
-		strictErrs = append(strictErrs, err)
-	}
-	if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
-		strictErrs = append(strictErrs, err)
-	}
-	if err := validateRPMProbePinsStrict(cfg); err != nil {
-		strictErrs = append(strictErrs, err)
-	}
-	if err := validateIPMonitoringStrict(cfg); err != nil {
-		strictErrs = append(strictErrs, err)
-	}
-	// #1830 (e): the #1733 equal-flow worker-cap validator
-	// (validateEqualFlowWorkerCapStrict / MaxEqualFlowWorkers) is retired.
-	// The v8 lease rotation now sizes its per-worker scratch from the true
-	// worker count (heap scratch in rotate_epoch_v8.rs), so
-	// equal-flow-enforcement no longer fail-opens above 32 workers and the
-	// commit-time rejection has nothing left to guard.
-	if err := errors.Join(strictErrs...); err != nil {
+	// P6a (#4406 step 6, FINAL): early-strict validation + the two folds.
+	// Extracted into runEarlyStrictAndFolds (compiler_earlystrict.go) — the
+	// RISKY entangled phase that interleaves validation with two cfg-mutations
+	// whose output is consumed non-locally in P6b: the fail-fast
+	// validateDataplaneTypeStrict (#1526, wins the first-error slot), the
+	// pristine-book address-book/zone name gate (#3061/#4340, before the fold
+	// injects `/`-bearing synthetic names), the resolveZoneLocalAddressBooks and
+	// resolveStaticNATThenPrefixNames folds (MUT cfg.Security, read by the P6b
+	// policy match-address + validateStaticNATThenTargetStrict gates — invariant
+	// #5), and the #1538 errors.Join independent-strict-family accumulator (fully
+	// CONTAINED here — NOT threaded into P6b). Behavior-preserving lift; runs
+	// AFTER the P5 derivations above and BEFORE the P6b uniform gates below, so
+	// the strict first-error slot (invariant #6) and the tolerant-path warning
+	// order (invariant #7) are unchanged. Do NOT reorder the interleave.
+	if err := runEarlyStrictAndFolds(cfg, opts); err != nil {
 		return nil, err
 	}
 
