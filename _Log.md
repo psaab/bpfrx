@@ -37,6 +37,50 @@
   pkg/cli/cli_request.go, cmd/cli/show.go, pkg/api/types.go, pkg/api/security.go,
   proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
   pkg/grpcapi/server_cluster.go, docs/junos-cli-reference.md, _Log.md
+## 2026-07-07 — #4410 (avo-review-001 F4/F8): app protocol-less ICMP reject hint + wildcard config-order test
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the four dropped avo-review-001 findings (F4/F5/F7/F8) to
+  terminal, verifying each against origin/master first (the review source is
+  historically ~98% low-signal, so each was weight-verified hard).
+  - **F4 (Low, GENUINE — fixed)**: a protocol-less `applications application`
+    that carries an `icmp-type` / `icmp-code` constraint is rejected by the
+    #3109 "no protocol specified" gate (`validateApplicationSpecsStrict`,
+    compiler_validate_strict_application.go), but the message did NOT name the
+    icmp-type the operator had already set — it just said "set a protocol".
+    Added an `icmpConstraintDesc` helper and appended a targeted hint naming
+    the concrete `icmp-type N [icmp-code M]` and pointing at `protocol icmp` /
+    `icmpv6`. Non-ICMP protocol-less apps get the byte-identical message
+    (empty hint). RED-on-revert test
+    `TestApplicationProtocolLessICMPType_RejectNamesConstraint` (the bare
+    message never contains "icmp-type 8").
+  - **F5 (Low, ALREADY-FIXED by #3363)**: the implicit default-policy hit
+    counter IS emitted as a Prometheus `xpf_policy_hits_total` series labeled
+    `-`/`-`/`default-policy` (metrics_counters.go collectPolicyCounters, read
+    via `dp.ReadPolicyCounters(dataplane.DefaultPolicySentinelID)`). No change.
+  - **F7 (Low, NOT-MATERIAL)**: `pkg/policymatch.normalizePortAlias` is
+    case-sensitive, but `resolveAppPort` (compiler_applications.go) canonicalizes
+    EVERY named port alias to its numeric value at compile time,
+    case-insensitively (`junosServicePorts[strings.ToLower(...)]`) — for both
+    direct-match and inline-term ports. By the time `portMatches` reads
+    `app.DestinationPort`/`app.SourcePort` the value is numeric ("443"), so the
+    alias branch is never reached. Verified empirically
+    (resolveAppPort("HTTPS")=="443"). No change.
+  - **F8 (test-coverage, GENUINE — added)**: the single-wildcard tier
+    (`from-zone any to-zone X` + `from-zone X to-zone any`) merges in config
+    order, but the only existing test's winner was ALSO config-first — equally
+    consistent with a buggy "from-any bucket always wins". Added the SWAPPED
+    companion case to `TestWildcardZoneAndScopedGlobalPrecedence`
+    (wildcard_scoped_test.go) pinning genuine config-order interleaving.
+    Verified it goes RED under a two-pass (from-any-first) merge while the
+    prior case stays green.
+- **File(s)**: pkg/config/compiler_validate_strict_application.go,
+  pkg/config/compiler_application_junos_ping_3348_test.go,
+  pkg/policymatch/wildcard_scoped_test.go, _Log.md
+- **Validation**: `go test ./pkg/config/ ./pkg/policymatch/` green; `go build
+  ./...`, `go vet`, `gofmt -l` all clean. No docs change: the exact reject
+  strings are not enumerated in docs/ (config-schema.md's icmp-type section
+  covers firewall filters, #3205, a different gate).
 
 ## 2026-07-07 — #4411 (avo-review-002 A4/A6): host-inbound + policymatch test-coverage locks
 
