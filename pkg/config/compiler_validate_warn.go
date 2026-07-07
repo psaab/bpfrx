@@ -2490,6 +2490,19 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 						warnings = append(warnings, fmt.Sprintf("%s references undefined provider %q "+
 							"(define it under system services dynamic-dns provider)", loc, d.Provider))
 					}
+					// #4423 H08: a binding that selects `address-source checkip` needs
+					// its provider to carry a checkip-url. Without one the runtime fails
+					// CLOSED and publishes NOTHING for this scope — it does NOT fall back
+					// to the interface address (that silent fallback published the WRONG
+					// address for a behind-NAT / multi-WAN router). Warn at commit so the
+					// operator is not surprised by a scope that never publishes.
+					if d.AddressSource == "checkip" && d.Provider != "" && catalog != nil {
+						if p, ok := catalog[d.Provider]; ok && p != nil && p.CheckIPURL == "" {
+							warnings = append(warnings, fmt.Sprintf("%s selects address-source "+
+								"checkip but provider %q has no checkip-url; this scope publishes "+
+								"nothing (it will NOT fall back to the interface address)", loc, d.Provider))
+						}
+					}
 					// #2960: record DuckDNS (provider, FQDN) bindings per family so a
 					// dual-stack DuckDNS name (the clobber topology) is flagged below.
 					if d.Hostname != "" && isDuckDNS(d.Provider) {

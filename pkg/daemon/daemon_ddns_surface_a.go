@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/netip"
+	"sort"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -104,7 +106,7 @@ func (d *Daemon) reconcileSurfaceAOnce(ctx context.Context) {
 		slog.Debug("ddns surface-a: skipping reconcile — node is not MASTER for any RG")
 		return
 	}
-	scopes := d.buildSurfaceAScopes(cfg)
+	scopes, _ := d.buildSurfaceAScopes(cfg)
 	rctx, cancel := context.WithTimeout(ctx, surfaceAReconcileTimeout)
 	defer cancel()
 	observe := d.surfaceAObserver(cfg)
@@ -126,12 +128,20 @@ func (d *Daemon) reconcileSurfaceAOnce(ctx context.Context) {
 // ddns.SurfaceAScope per per-interface per-family `dynamic-dns` binding (#2691
 // P2, plan §5.9). It resolves the referenced provider-catalog entry, applies a
 // per-binding source-address override, and attributes the scope to its owning
-// redundancy group (so the per-RG HA gate keys on it). A binding with no
-// hostname or an unresolved provider is SKIPPED (the commit warning already
-// told the operator; runtime degrades to nothing for that scope).
-func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
+// redundancy group (so the per-RG HA gate keys on it).
+//
+// A binding with no hostname, no provider, or an unresolved provider can build
+// no scope (it cannot publish), but it does NOT vanish: it is returned in the
+// second result as a synthesized `invalid` status row (#4423 M09) so a broken
+// binding stays visible in `show system services dynamic-dns` instead of being
+// silently omitted (the commit warning was previously its only trace).
+//
+// The returned scope slice is sorted by a deterministic key (#4423 M12) so the
+// reconcile order — and any behavior that depends on it, e.g. two scopes that
+// target the same FQDN — is reproducible rather than Go-map-iteration-random.
+func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) ([]ddns.SurfaceAScope, []ddns.SurfaceAStatusView) {
 	if cfg == nil || cfg.Interfaces.Interfaces == nil {
-		return nil
+		return nil, nil
 	}
 	var catalog map[string]*config.DDNSProvider
 	var forced, backoff time.Duration
@@ -147,17 +157,42 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
 	}
 
 	var out []ddns.SurfaceAScope
+	var invalid []ddns.SurfaceAStatusView
+	noteInvalid := func(ifName string, un int, family ddns.Family, b *config.InterfaceDynamicDNSConfig, reason string) {
+		invalid = append(invalid, ddns.SurfaceAStatusView{
+			Interface: ifName,
+			Unit:      un,
+			Family:    int(family),
+			FQDN:      b.Hostname,
+			Provider:  b.Provider,
+			State:     ddns.SurfaceAStateInvalid,
+			LastError: reason,
+		})
+	}
 	add := func(ifName string, ifc *config.InterfaceConfig, un int, family ddns.Family, b *config.InterfaceDynamicDNSConfig) {
 		if b == nil {
 			return
 		}
 		if b.Hostname == "" || b.Provider == "" {
+			// #4423 M09: structurally incomplete — no scope can be built, but keep
+			// the binding visible on the status surface (do not silently drop it).
+			switch {
+			case b.Hostname == "" && b.Provider == "":
+				noteInvalid(ifName, un, family, b, "binding has no hostname and no provider set; nothing will be published")
+			case b.Hostname == "":
+				noteInvalid(ifName, un, family, b, "binding has no hostname set; nothing will be published")
+			default:
+				noteInvalid(ifName, un, family, b, "binding has no provider set; nothing will be published")
+			}
 			return
 		}
 		prov, ok := catalog[b.Provider]
 		if !ok || prov == nil {
 			slog.Debug("ddns surface-a: binding references undefined provider; skipping",
 				"iface", ifName, "unit", un, "family", int(family), "provider", b.Provider)
+			// #4423 M09: surface the undefined-provider binding instead of omitting it.
+			noteInvalid(ifName, un, family, b, fmt.Sprintf(
+				"references undefined provider %q (define it under system services dynamic-dns provider)", b.Provider))
 			return
 		}
 		// A per-binding source-address overrides the provider's default.
@@ -170,12 +205,18 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
 		case string(ddns.AddressSourceDHCP):
 			src = ddns.AddressSourceDHCP
 		case string(ddns.AddressSourceCheckIP):
-			// checkip is opt-in and requires the provider to carry a checkip-url;
-			// without it, fall back to interface observation (the commit warning
-			// flags the missing url).
-			if prov.CheckIPURL != "" {
-				src = ddns.AddressSourceCheckIP
-			}
+			// #4423 H08: the operator EXPLICITLY selected the checkip source. Honor
+			// that selection even when the provider carries no checkip-url — do NOT
+			// silently fall back to the interface address. The interface address is
+			// exactly what a behind-NAT / multi-WAN deployment must NOT publish (it
+			// is the private or wrong-WAN address, not the checkip-discovered public
+			// IP). With the source kept as checkip, the observer's missing-url guard
+			// returns a TRANSIENT observation (ok=false): the scope is skipped (no
+			// publish, never a withdraw) and surfaces as pending rather than
+			// publishing the wrong address. The observer logs the missing-url
+			// condition once per provider, and the commit-time validator warns too
+			// (validateSurfaceADDNSWarnings).
+			src = ddns.AddressSourceCheckIP
 		}
 		ttl := b.TTLSeconds
 		key := ddns.ScopeKey{
@@ -214,7 +255,28 @@ func (d *Daemon) buildSurfaceAScopes(cfg *config.Config) []ddns.SurfaceAScope {
 			add(ifName, ifc, un, ddns.FamilyV6, unit.DynamicDNSInet6)
 		}
 	}
-	return out
+	// #4423 M12: the interface/unit walk above iterates a Go map, so `out` arrives
+	// in a random order. Reconcile processes scopes in slice order, and where two
+	// scopes publish the SAME FQDN the processing order decides which address ends
+	// up live at the provider — a nondeterministic winner. Sort by a total key so
+	// the reconcile order (and its logs/tests) is reproducible.
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i].Key, out[j].Key
+		if a.Interface != b.Interface {
+			return a.Interface < b.Interface
+		}
+		if a.Unit != b.Unit {
+			return a.Unit < b.Unit
+		}
+		if a.Family != b.Family {
+			return a.Family < b.Family
+		}
+		if a.PolicyID != b.PolicyID {
+			return a.PolicyID < b.PolicyID
+		}
+		return a.FQDN < b.FQDN
+	})
+	return out, invalid
 }
 
 // surfaceAObserver builds the AddressObserver for one reconcile pass (plan
@@ -249,6 +311,20 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			// allowlist. A fetch failure is a TRANSIENT observation failure
 			// (ok=false) — never a withdraw.
 			if scope.Provider == nil || scope.Provider.CheckIPURL == "" {
+				// #4423 H08: the operator selected `address-source checkip` but the
+				// provider has no checkip-url, so there is nothing to probe. FAIL
+				// CLOSED (transient ok=false) — do NOT publish the interface address
+				// (that silent fallback published the WRONG address). Surface it once
+				// per provider so the running daemon shows why nothing publishes (the
+				// commit validator also warns). Skip the log when Provider is nil (an
+				// unresolved provider is already covered by the invalid-binding row).
+				if scope.Provider != nil {
+					if _, dup := d.surfaceACheckIPNoURLWarned.LoadOrStore(scope.Provider.Name, struct{}{}); !dup {
+						slog.Warn("ddns surface-a: address-source checkip selected but provider has no "+
+							"checkip-url; skipping (fail-closed, NOT falling back to the interface address)",
+							"provider", scope.Provider.Name, "fqdn", scope.FQDN)
+					}
+				}
 				return ddns.AddressObservation{}, false
 			}
 			// Bound the single probe by surfaceACheckIPTimeout BUT derive it from
@@ -318,8 +394,26 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			}
 			lease := d.dhcp.LeaseFor(linuxName, af)
 			if lease == nil {
-				// No lease for this family yet: definitively no address. Withdraw
-				// any previously-published record (the lease is gone).
+				// #4423 M10: distinguish a TRANSIENT manager gap from a definitive
+				// loss. When the unit is STILL DHCP-configured for this family, a
+				// missing lease is a bring-up / renewal / client-RESTART gap — the DHCP
+				// manager stops and restarts the client on any option change
+				// (dhcp.Manager.Reconcile), removing the address and deleting the lease
+				// for the whole DORA re-acquire window. Treating that as a definitive
+				// loss WITHDRAWS the public record on every benign DHCP option change
+				// and re-publishes seconds later — a blackhole flap. Treat it as a
+				// TRANSIENT observation (ok=false): leave the scope untouched (never
+				// withdraw on transient — the never-blackhole rule). Only when the unit
+				// is no longer DHCP-configured for this family (interface reconfigured
+				// away from DHCP) is the absence definitive → withdraw. Reading the
+				// committed config flag is race-free (unlike probing the live client
+				// registry, which has a stop→start window during a restart).
+				dhcpConfigured := unit != nil && ((af4 && unit.DHCP) || (!af4 && unit.DHCPv6))
+				if dhcpConfigured {
+					return ddns.AddressObservation{}, false
+				}
+				// No lease and the unit no longer runs DHCP for this family:
+				// definitively no address. Withdraw any previously-published record.
 				return ddns.AddressObservation{Source: ddns.AddressSourceDHCP}, true
 			}
 			a := lease.Address.Addr().Unmap()
@@ -679,8 +773,19 @@ func (d *Daemon) SurfaceAStatus() []ddns.SurfaceAStatusView {
 	// not just the durably-owned ones (#2843). A nil cfg yields only the
 	// withdraw-pending (orphaned-ownership) rows.
 	var scopes []ddns.SurfaceAScope
+	var invalid []ddns.SurfaceAStatusView
 	if cfg := d.store.ActiveConfig(); cfg != nil {
-		scopes = d.buildSurfaceAScopes(cfg)
+		scopes, invalid = d.buildSurfaceAScopes(cfg)
 	}
-	return d.surfaceA.StatusViews(scopes)
+	views := d.surfaceA.StatusViews(scopes)
+	if len(invalid) > 0 {
+		// #4423 M09: fold the structurally-invalid bindings (no hostname / no
+		// provider / undefined provider) into the operator status so a broken
+		// binding stays visible. They build no scope, so the engine's StatusViews
+		// never sees them. Re-sort the combined set with the SAME total-order
+		// comparator the engine uses so the output stays byte-stable (#4423 M11).
+		views = append(views, invalid...)
+		ddns.SortSurfaceAStatusViews(views)
+	}
+	return views
 }

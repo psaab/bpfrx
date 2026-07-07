@@ -513,6 +513,15 @@ its OWN learned address — on top of the SAME spine, without forking the engine
     CLI.
   - **flat error backoff** — on a transient failure a scope backs off
     (30s → cap, default 1h) so a failing provider is not hammered (ban-avoidance).
+    The backoff window is tagged with the wire op that armed it (publish vs
+    withdraw) and gates ONLY that op (#4423 M03): a PUBLISH-failure backoff must
+    not delay a newly-observed address-LOSS withdraw (leaving the record live at a
+    dead address is a blackhole), and a WITHDRAW-failure backoff must not delay
+    re-publishing a recovered address. Observation now runs BEFORE the window is
+    consulted (a cheap netlink/DHCP read, or a checkip GET against a different
+    server than the DNS provider the backoff protects), so a definitive address
+    loss is acted on promptly; each op re-arms its own backoff on failure, so a
+    persistently-failing op still backs off (`TestSurfaceAPublishBackoffDoesNotDelayWithdraw`).
   - **replace, never withdraw-then-add, on address change** — a scope owns
     exactly ONE record (keyed `{scope, "router-self", ""}`); an address change is
     the atomic self-owned in-place replace described above (no blackhole gap).
@@ -583,6 +592,42 @@ its OWN learned address — on top of the SAME spine, without forking the engine
   ignored in selection before). A per-family `preferred-address` operator
   override for multi-address interfaces (the issue's secondary ask) remains a
   future refinement.
+  **checkip source is fail-closed on a missing checkip-url (#4423 H08).** When a
+  binding selects `address-source checkip`, `buildSurfaceAScopes` keeps the scope
+  source as `checkip` even if the referenced provider carries NO `checkip-url` —
+  it does NOT silently fall back to the interface address. The interface address
+  is exactly what a behind-NAT / multi-WAN router must NOT publish (it is the
+  private or wrong-WAN address, not the checkip-discovered public IP), so the
+  old fallback published the WRONG address. With the source kept as `checkip`
+  the observer's missing-url guard returns a TRANSIENT miss (`ok=false`): the
+  scope is skipped (no publish, never a withdraw) and shows as `pending`. The
+  daemon logs the condition once per provider, and `config.validateSurfaceADDNSWarnings`
+  warns at commit (`TestSurfaceACheckIPNoURLDoesNotFallBackToInterface`,
+  `TestSurfaceADDNSWarnsCheckIPSourceWithoutURL`).
+  **DHCP no-lease: transient gap vs definitive loss (#4423 M10).** A missing DHCP
+  lease is treated as a DEFINITIVE address loss (→ withdraw) ONLY when the unit is
+  no longer DHCP-configured for the family. While the unit is still DHCP-configured
+  (`unit.DHCP` / `unit.DHCPv6`), a missing lease is a TRANSIENT gap — bring-up,
+  renewal, or the DHCP client RESTART that `dhcp.Manager.Reconcile` performs on any
+  option change (it stops the client, removing the address + lease, then re-DORAs).
+  Treating that as definitive withdrew the public record on every benign DHCP
+  option change and re-published seconds later (a blackhole flap); it is now an
+  `ok=false` transient (never-blackhole). Reading the committed config flag is
+  race-free, unlike probing the live client registry which has a stop→start window
+  (`TestSurfaceAObserverDHCPTransientGapNoWithdraw`).
+  **Invalid bindings stay visible (#4423 M09).** A structurally-incomplete binding
+  (no hostname / no provider / undefined provider) builds no reconcile scope, but
+  `buildSurfaceAScopes` returns it as a synthesized `SurfaceAStateInvalid` status
+  row (with the specific defect in `LastError`) so a broken binding is still shown
+  in `show system services dynamic-dns` instead of vanishing — the commit warning
+  was previously its only trace (`TestBuildSurfaceAScopesInvalidBindingsVisible`).
+  **Deterministic ordering (#4423 M11/M12).** `buildSurfaceAScopes` sorts the scope
+  slice by `{interface, unit, family, provider, FQDN}` so the reconcile order (and
+  any behavior that depends on it, e.g. two scopes targeting the same FQDN) is
+  reproducible rather than Go-map-iteration-random; `SortSurfaceAStatusViews`
+  orders the operator status rows by a TOTAL key so the surface is byte-stable even
+  when rows tie on `{FQDN, family}` (`TestBuildSurfaceAScopesDeterministicOrder`,
+  `TestSortSurfaceAStatusViewsTotalOrder`).
 - **HA gate** is the SAME per-RG `ScopeGate` (a router record on a reth/virtual
   interface publishes only on the RG master; stop-writing-never-withdraw
   otherwise). Standalone (nil gate) always publishes.

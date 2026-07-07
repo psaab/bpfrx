@@ -187,3 +187,40 @@ func TestSurfaceADDNSWarnsOnUndefinedProviderAndMissingHostname(t *testing.T) {
 		t.Fatalf("expected provider-no-update-server warning, got:\n%s", joined)
 	}
 }
+
+// TestSurfaceADDNSWarnsCheckIPSourceWithoutURL is the #4423 H08 commit-warning
+// gate: a binding that selects `address-source checkip` while its provider
+// carries NO checkip-url must be flagged at commit — the runtime fails closed
+// and publishes nothing for the scope (it must NOT fall back to the interface
+// address). A binding whose provider DOES carry a checkip-url is not flagged.
+// RED-on-revert: drop the H08 warn block in compiler_validate_warn.go and the
+// urlless binding is no longer flagged.
+func TestSurfaceADDNSWarnsCheckIPSourceWithoutURL(t *testing.T) {
+	tree := buildTree(t, []string{
+		// Provider WITHOUT a checkip-url; a binding selects address-source checkip.
+		"set system services dynamic-dns provider nourl backend rfc2136",
+		"set system services dynamic-dns provider nourl update-server 192.0.2.53",
+		"set interfaces ge-0-0-2 unit 50 family inet dynamic-dns provider nourl",
+		"set interfaces ge-0-0-2 unit 50 family inet dynamic-dns hostname wan.example.net",
+		"set interfaces ge-0-0-2 unit 50 family inet dynamic-dns address-source checkip",
+		// Provider WITH a checkip-url; its checkip binding must NOT be flagged.
+		"set system services dynamic-dns provider withurl backend rfc2136",
+		"set system services dynamic-dns provider withurl update-server 192.0.2.53",
+		"set system services dynamic-dns provider withurl checkip-url https://ip.example.net",
+		"set interfaces ge-0-0-3 unit 0 family inet dynamic-dns provider withurl",
+		"set interfaces ge-0-0-3 unit 0 family inet dynamic-dns hostname ok.example.net",
+		"set interfaces ge-0-0-3 unit 0 family inet dynamic-dns address-source checkip",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warnings := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "address-source checkip but provider \"nourl\" has no checkip-url") {
+		t.Fatalf("expected checkip-without-url warning for provider nourl, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "provider \"withurl\" has no checkip-url") {
+		t.Fatalf("a provider WITH a checkip-url must not be flagged, got:\n%s", joined)
+	}
+}

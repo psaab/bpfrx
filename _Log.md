@@ -37896,6 +37896,55 @@ top.
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
   pkg/grpcapi/server_show_flow.go, pkg/cli/cli_show_flow.go, _Log.md
 
+---
+- **Timestamp**: 2026-07-06
+- **Action**: #4423 ddns Surface-A slice — drive H08 (checkip silent
+  interface-fallback) + M03/M09/M10/M11/M12; verify-first M01 as NOT-MATERIAL.
+  - **H08 (HIGH, GENUINE, fixed)**: `buildSurfaceAScopes`
+    (pkg/daemon/daemon_ddns_surface_a.go) silently fell back to
+    `AddressSourceInterface` when a `address-source checkip` binding's provider
+    had no `checkip-url` → published the WRONG address (interface IP, not the
+    checkip-discovered public IP) for a behind-NAT/multi-WAN router. There was
+    also NO commit warning for the missing-url case (only for a MALFORMED url).
+    Fix: keep `src = checkip` unconditionally so the observer's missing-url guard
+    returns a transient miss (no publish, never withdraw); added a once-per-provider
+    runtime WARN and a commit-time warning (validateSurfaceADDNSWarnings).
+  - **M03 (MED, GENUINE, fixed)**: error-backoff window was checked at the TOP of
+    reconcileScopeLocked, gating BOTH publish and withdraw → a publish-failure
+    backoff delayed an address-LOSS withdraw (record left live at a dead address =
+    blackhole). Fix: observe first; tag the backoff with its origin op
+    (`backoffFromWithdraw`) and gate the window PER intent. Same gate applied to
+    the Pass-2 gone-from-config withdraw.
+  - **M09 (MED, GENUINE, fixed)**: undefined-provider / missing-hostname bindings
+    built no scope → vanished from `show`. Fix: buildSurfaceAScopes returns them
+    as synthesized `SurfaceAStateInvalid` status rows; SurfaceAStatus folds + re-sorts.
+  - **M10 (MED, GENUINE, fixed)**: DHCP observer treated ANY `LeaseFor==nil` as a
+    definitive loss → withdrew the public record on every benign DHCP client
+    restart (dhcp.Manager.Reconcile stops+restarts the client on an option change,
+    deleting the lease for the DORA window). Fix: while the unit is still
+    DHCP-configured (`unit.DHCP`/`unit.DHCPv6`) a missing lease is TRANSIENT
+    (ok=false); definitive only when de-configured (race-free config-flag read).
+  - **M11 (MED, GENUINE, fixed)**: StatusViews sorted only by {FQDN, Family} — not
+    a total order (ties on same name+family from different interfaces/units left
+    nondeterministic by the unstable sort). Fix: exported `SortSurfaceAStatusViews`
+    total-order comparator {FQDN, Family, Interface, Unit, Provider, State, Published}.
+  - **M12 (MED, GENUINE, fixed)**: buildSurfaceAScopes returned scopes in Go
+    map-iteration order → nondeterministic reconcile order (same-FQDN winner
+    races). Fix: deterministic sort of the scope slice.
+  - **M01 (NOT-MATERIAL, disproving evidence)**: publishLocked's rollback-after-
+    wire-failure `_ = m.state.save()` (surface_a.go ~1226) swallows its error, but
+    the end-of-pass save (surface_a.go:883-886) re-persists the rolled-back
+    in-memory state AND reports/logs a persistent failure via noteErr + slog.Warn.
+    The `_=` flush is best-effort; its failure is always superseded (disk corrected
+    by 883) or reported (both fail → 883 logs it). Crash-durability is unchanged
+    (the write-ahead at ~1165 is identical regardless). Not fixed; documented.
+  - Validation: RED-on-revert confirmed for ALL SEVEN new tests (each fix reverted
+    in isolation → its test FAILS, restored → green). `go test ./pkg/ddns/...
+    ./pkg/daemon/... ./pkg/config/...` green; `go build`; gofmt + vet clean.
+- **File(s)**: pkg/ddns/surface_a.go, pkg/ddns/surface_a_test.go, pkg/ddns/README.md,
+  pkg/daemon/daemon_ddns_surface_a.go, pkg/daemon/daemon_ddns_surface_a_test.go,
+  pkg/daemon/daemon.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_surface_a_ddns_test.go, _Log.md
 - **Timestamp**: 2026-07-06
 - **Action**: #4423 eventengine mediums M3-M12 / L1-L7 — verify-first triage +
   fixes. Drove the confirmed-genuine ones; recorded evidence-backed dispositions

@@ -133,6 +133,14 @@ type Daemon struct {
 	// persistent misconfig must not log every tick. Keyed by
 	// "<provider>\x00<bind-error>" so a corrected commit re-arms the warning.
 	surfaceACheckIPSourceBindWarned sync.Map
+	// surfaceACheckIPNoURLWarned dedups the once-per-provider runtime log emitted
+	// when a binding selects `address-source checkip` but the referenced provider
+	// carries no checkip-url (#4423 H08). Before the fix the runtime silently fell
+	// back to the interface address (publishing the WRONG address); now the source
+	// stays checkip and the observer skips (fail-closed) while surfacing this WARN
+	// once per provider so the operator sees why nothing publishes. Keyed by the
+	// provider name so a corrected commit (url added) re-arms the warning.
+	surfaceACheckIPNoURLWarned sync.Map
 	// #2239 HA DHCP-server lease sync (PATH C). The push loop runs on the
 	// RG-MASTER, reads the active lease set (Kea control socket → memfile
 	// fallback), and replicates it over the cluster sync channel. The standby
