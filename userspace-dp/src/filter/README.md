@@ -258,11 +258,15 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   `tx_selection.filter_counters` (deduped against the dedicated
   `input_filter_counters` set at seed, #3777), so miss (action-eval) + hits
   (cached replay) still total exactly one per packet.
-- `policer.rs` — token-bucket implementation plus the #1375 RFC
-  2697/2698 three-color meter core. Token math is integer-only:
-  the legacy token bucket keeps its bits/sec constructor contract, and
-  the three-color core uses byte/sec rates; both refill scaled `u128`
-  token buckets from monotonic nanosecond timestamps.
+- `policer.rs` — the #1375 RFC 2697/2698 three-color meter core. Token
+  math is integer-only (byte/sec rates refilling a scaled `u128` bucket
+  from monotonic nanosecond timestamps). #4514 removed the standalone
+  single-rate `PolicerState` token bucket (its `consume` had zero
+  non-test call sites, so `then policer X` was silently unenforced);
+  legacy single-rate `firewall policer`s are now lowered at compile into
+  this same srTCM core (see `compiler.rs::build_single_rate_policer_state`)
+  so they share the metering, drop-on-exceed, flow-cache handle+replay,
+  and status export path.
 - `tests.rs` — co-located unit tests covering matching ports, prefix
   vectors, TCP flags.
 
@@ -314,6 +318,16 @@ Implemented here:
   expose green/yellow/red packet and byte counters plus drop counters.
 - `deriveUserspaceCapabilities()` no longer rejects the color-blind `then
   discard` `firewall three-color-policer` runtime slice.
+- #4514: legacy single-rate `firewall policer`s are lowered into this
+  runtime at compile. A `then discard` policer maps to an srTCM state with
+  `CIR = bandwidth-limit` (bits/sec → bytes/sec), `CBS = burst-size-limit`,
+  `color-blind`, and per-color treatments GREEN=pass / YELLOW=drop /
+  RED=drop — so only in-rate packets pass and everything above the committed
+  bucket is discarded (the committed bucket IS the single-rate token bucket;
+  the required non-zero excess bucket is irrelevant because yellow also
+  drops). A degenerate zero rate/burst `then discard` policer fails closed
+  (drop all). A non-discard single-rate policer is metered but its marking
+  action is inert (same limitation as three-color `then loss-priority`).
 
 Remaining limitations:
 

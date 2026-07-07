@@ -1,3 +1,36 @@
+## 2026-07-07 — #4514 (ps-020 F5): enforce single-rate `then policer` on the userspace dataplane
+
+- **Timestamp**: 2026-07-07T20:00Z
+- **Action**: A single-rate `firewall policer` applied via a filter term
+  (`then policer X`, `then discard`) was SILENTLY UNENFORCED on the
+  userspace dataplane — a fail-open of a DoS-mitigation/rate-limit control.
+  The policer config was parsed into a `state.policers` map whose
+  `PolicerState::consume` had ZERO non-test call sites; only the three-color
+  runtime was ever metered. Fixed by lowering legacy single-rate policers
+  into the SAME metered three-color srTCM runtime the terms already resolve
+  against (by name), at the Rust compile layer: `then discard` maps to
+  `CIR=bandwidth-limit` (bits/sec → bytes/sec), `CBS=burst-size-limit`,
+  color-blind, treatments GREEN=pass / YELLOW=drop / RED=drop. The committed
+  bucket IS the single-rate token bucket, so only in-rate traffic passes and
+  excess is discarded — reusing the tested metering, drop-on-exceed,
+  flow-cache handle+replay, and status export instead of hand-mirroring a
+  parallel policer path. Removed the now-dead `PolicerState` type,
+  `state.policers` field, `refill_scaled_bits`, and the `token_bucket_policer`
+  test. Corrected the `capabilities.go` comment that falsely claimed legacy
+  policers were "supported". Degenerate zero-rate/burst `then discard` fails
+  closed; non-discard (loss-priority/forwarding-class) single-rate policers
+  are metered but their marking is inert (documented).
+- **File(s)**: `userspace-dp/src/filter/compiler.rs`,
+  `userspace-dp/src/filter/policer.rs`, `userspace-dp/src/filter/mod.rs`,
+  `userspace-dp/src/filter/tests.rs`, `userspace-dp/src/filter/README.md`,
+  `pkg/dataplane/userspace/capabilities.go`, `docs/feature-gaps.md`, `_Log.md`
+- **Validation**: new `single_rate_policer_discard_is_enforced` filter test —
+  in-rate packet passes, over-rate packet drops, a non-policed term is
+  unaffected, and the cached TX-selection descriptor carries the runtime
+  handle (re-metered per hit, not a frozen verdict). RED-on-revert proven:
+  disabling the lowering fails the test at the `has_three_color_policer_terms`
+  assertion. Full `cargo test --release --test-threads=1` + `go test
+  ./pkg/dataplane/...` green.
 ## 2026-07-07 — #4521: source-NAT pool `address [ a b c ]` bracket-list no longer truncates to the first IP
 
 - **Timestamp**: 2026-07-07
