@@ -625,6 +625,88 @@ type Result struct {
 	// HostInboundProtocolMatch), so the reported token cannot drift from the port
 	// the kernel actually opens.
 	HostInbound *dpuserspace.HostInboundAdmission
+
+	// RouteDropBeforePolicy is true when the query's DESTINATION address is a
+	// class the transit forwarding path drops at ROUTE LOOKUP, before the
+	// security-policy engine ever runs (#4373 E4/H2/H7): IPv4/IPv6 multicast,
+	// the IPv4 limited broadcast 255.255.255.255, the unspecified address, or a
+	// loopback address. For such a destination the dataplane has no forwarding
+	// route to reach policy evaluation, so the permit/deny verdict this Result
+	// carries does NOT describe what happens to real traffic — the packet is
+	// dropped at route regardless of any policy that "matches". A firewall
+	// filter `then accept; then log` for the same tuple likewise logs an ACCEPT
+	// the packet never survives (the E4 "filter-accept log but the flow is
+	// dropped at route" confusion). This is ADVISORY context, exactly like
+	// HostInbound: it does NOT change Matched / Action / DefaultUsed. Every
+	// operator surface (CLI show, `test policy`, REST) must surface RouteDropNote
+	// so a simulator verdict cannot over-promise forwarding for a
+	// non-transit-routable destination. Only a TRANSIT query is annotated; a
+	// `to-zone junos-host` query takes the local-delivery gate, not the transit
+	// route lookup, so it is never stamped. The route-drop itself is enforced in
+	// userspace-dp; a dataplane NoRoute/martian drop COUNTER (so a live filter-
+	// accept log has a matching visible drop) is the deferred Rust half of the
+	// same remedy.
+	RouteDropBeforePolicy bool
+	// RouteDropClass names the destination address class ("multicast",
+	// "broadcast", "unspecified", or "loopback") when RouteDropBeforePolicy is
+	// set; empty otherwise. It feeds RouteDropNote so the operator sees WHICH
+	// class triggered the route-drop advisory.
+	RouteDropClass string
+}
+
+// RouteDropNotePrefix is the stable leading token of the route-drop advisory
+// (#4373), kept as an SSOT so every match-policies surface (CLI show, `test
+// policy`, REST) and its tests share one wording and cannot drift. A caller
+// renders RouteDropNote(), never a hand-built string.
+const RouteDropNotePrefix = "route-drop advisory:"
+
+// RouteDropNote returns the operator-facing advisory line for a Result whose
+// destination address is dropped at route lookup before policy evaluation
+// (#4373 E4/H2/H7), or "" when the Result carries no route-drop condition. The
+// line states plainly that the verdict does not describe real forwarding, so an
+// operator does not read a permit/deny for a multicast/broadcast/unspecified/
+// loopback destination as if the flow is actually forwarded. It is ADVISORY —
+// it does not alter the verdict — and mirrors the HostInboundShowLine /
+// ContentRejectedShowLine SSOT pattern so the surfaces stay in lock-step.
+func (r Result) RouteDropNote() string {
+	if !r.RouteDropBeforePolicy {
+		return ""
+	}
+	class := r.RouteDropClass
+	if class == "" {
+		class = "non-routable"
+	}
+	return fmt.Sprintf("%s destination is %s — transit traffic to this address is "+
+		"dropped at route lookup BEFORE security-policy evaluation, so this verdict "+
+		"does not describe real forwarding (the packet is dropped at route regardless "+
+		"of the matching policy / filter-accept log)", RouteDropNotePrefix, class)
+}
+
+// routeDropClass classifies a query DESTINATION address into the transit
+// forwarding class that is dropped at route lookup before policy evaluation
+// (#4373 E4/H2/H7), or "" for an ordinary unicast destination that reaches the
+// policy engine. Multicast (IPv4 224.0.0.0/4, IPv6 ff00::/8), the IPv4 limited
+// broadcast 255.255.255.255, the unspecified address (0.0.0.0 / ::), and
+// loopback (127.0.0.0/8 / ::1) are all destinations the transit forwarding path
+// has no route to hand to policy. A nil dst (the "unspecified destination"
+// simulator wildcard) is NOT classified: it means the operator did not pin a
+// destination, not that the destination is 0.0.0.0.
+func routeDropClass(dst net.IP) string {
+	if dst == nil {
+		return ""
+	}
+	switch {
+	case dst.IsMulticast():
+		return "multicast"
+	case dst.Equal(net.IPv4bcast):
+		return "broadcast"
+	case dst.IsUnspecified():
+		return "unspecified"
+	case dst.IsLoopback():
+		return "loopback"
+	default:
+		return ""
+	}
 }
 
 // HostInboundActionString is the operator-facing verdict rendered for a
@@ -706,7 +788,25 @@ func (r Result) DisplayAction() string {
 // A `to-zone junos-host` query is host-bound and takes the separate host-gate
 // path (matchJunosHost, #3285): exact ingress->junos-host then
 // `from-zone any`->junos-host, with NO global/default transit fallback.
-func Match(cfg *config.Config, q Query) Result {
+func Match(cfg *config.Config, q Query) (res Result) {
+	// #4373 (E4/H2/H7): a TRANSIT destination that is multicast / broadcast /
+	// unspecified / loopback is dropped by the forwarding path at ROUTE LOOKUP,
+	// before the policy engine runs, so any permit/deny verdict below (and a
+	// firewall `then accept; then log` for the same tuple) over-promises
+	// forwarding the dataplane never performs. Classify the destination up front
+	// and stamp the advisory onto whatever Result the tier chain returns via a
+	// defer, so EVERY return path (default, matched, content-rejected) carries it
+	// without threading the flag through each construction. Host-bound
+	// (junos-host) queries take the local-delivery gate, not transit route
+	// lookup, so they are exempt — matchJunosHost never sees this stamp.
+	if q.ToZone != JunosHostZone {
+		if class := routeDropClass(q.DstIP); class != "" {
+			defer func() {
+				res.RouteDropBeforePolicy = true
+				res.RouteDropClass = class
+			}()
+		}
+	}
 	if cfg == nil {
 		return Result{DefaultUsed: true, Action: config.PolicyDeny}
 	}

@@ -847,6 +847,24 @@ message MatchPoliciesResponse {
   // which has no host-inbound gate. It is additional context, never a verdict:
   // it does not change `matched` / `host_inbound_unmatched`.
   HostInboundAdmission host_inbound = 21;
+  // #4373 (E4/H2/H7): route_drop_before_policy is true when the query
+  // DESTINATION is a class the transit forwarding path drops at ROUTE LOOKUP
+  // before the policy engine runs — multicast, the IPv4 limited broadcast
+  // 255.255.255.255, the unspecified address, or loopback. For such a
+  // destination the permit/deny `action` does NOT describe real forwarding: the
+  // packet is dropped at route regardless of the matching policy (and a
+  // firewall `then accept; then log` for the same tuple logs an accept the flow
+  // never survives — the E4 confusion). route_drop_class names the class and
+  // route_drop_note carries the SSOT operator advisory string
+  // (policymatch.RouteDropNote) so gRPC / remote-CLI clients state the caveat
+  // identically to the local CLI + REST surfaces. ADVISORY, like host_inbound —
+  // it does not change `matched` / `action` / `default_used`. Populated on the
+  // transit verdict paths (matched + no-match/default); omitted for an ordinary
+  // unicast destination and for a host-bound query (which takes the
+  // local-delivery gate, not transit route lookup).
+  bool route_drop_before_policy = 22;
+  string route_drop_class = 23;
+  string route_drop_note = 24;
 }
 
 // HostInboundAdmissionStatus classifies how the ingress zone's

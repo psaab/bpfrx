@@ -246,6 +246,12 @@ func (c *CLI) testPolicy(args []string) error {
 		fmt.Printf("  %s\n", policymatch.HostInboundShowLine)
 		return nil
 	}
+	// #4373 (E4/H2/H7): a multicast/broadcast/unspecified/loopback destination is
+	// dropped at route lookup before policy runs — surface the advisory so the
+	// `test policy` verdict below is not read as real forwarding.
+	if note := res.RouteDropNote(); note != "" {
+		fmt.Printf("  %s\n", note)
+	}
 	if !res.Matched {
 		fmt.Printf("Default %s (no matching policy for %s -> %s)\n",
 			policymatch.ActionString(res.Action), fromZone, toZone)

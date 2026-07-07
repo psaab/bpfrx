@@ -284,6 +284,12 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 			// tested (from_zone/to_zone carry matched-policy scope, unset here).
 			QueriedFromZone: req.FromZone,
 			QueriedToZone:   req.ToZone,
+			// #4373 (E4/H2/H7): a multicast/broadcast/unspecified/loopback
+			// destination is dropped at route before policy, so even the default
+			// verdict does not describe real forwarding — carry the advisory.
+			RouteDropBeforePolicy: res.RouteDropBeforePolicy,
+			RouteDropClass:        res.RouteDropClass,
+			RouteDropNote:         res.RouteDropNote(),
 		}, nil
 	}
 	return &pb.MatchPoliciesResponse{
@@ -329,6 +335,13 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		// classifier verdict here too (present for any host-bound query; nil for
 		// a transit/global match, which has no host gate).
 		HostInbound: hostInboundToProto(res.HostInbound),
+		// #4373 (E4/H2/H7): a matched policy for a multicast/broadcast/
+		// unspecified/loopback destination still does not forward — the flow is
+		// dropped at route before policy. Carry the advisory so a positive match
+		// verdict is not read as real forwarding.
+		RouteDropBeforePolicy: res.RouteDropBeforePolicy,
+		RouteDropClass:        res.RouteDropClass,
+		RouteDropNote:         res.RouteDropNote(),
 	}, nil
 }
 

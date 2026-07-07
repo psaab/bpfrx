@@ -6673,9 +6673,27 @@ type MatchPoliciesResponse struct {
 	// (nil) for every transit / global / default / content-rejected verdict,
 	// which has no host-inbound gate. It is additional context, never a verdict:
 	// it does not change `matched` / `host_inbound_unmatched`.
-	HostInbound   *HostInboundAdmission `protobuf:"bytes,21,opt,name=host_inbound,json=hostInbound,proto3" json:"host_inbound,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	HostInbound *HostInboundAdmission `protobuf:"bytes,21,opt,name=host_inbound,json=hostInbound,proto3" json:"host_inbound,omitempty"`
+	// #4373 (E4/H2/H7): route_drop_before_policy is true when the query
+	// DESTINATION is a class the transit forwarding path drops at ROUTE LOOKUP
+	// before the policy engine runs — multicast, the IPv4 limited broadcast
+	// 255.255.255.255, the unspecified address, or loopback. For such a
+	// destination the permit/deny `action` does NOT describe real forwarding: the
+	// packet is dropped at route regardless of the matching policy (and a
+	// firewall `then accept; then log` for the same tuple logs an accept the flow
+	// never survives — the E4 confusion). route_drop_class names the class and
+	// route_drop_note carries the SSOT operator advisory string
+	// (policymatch.RouteDropNote) so gRPC / remote-CLI clients state the caveat
+	// identically to the local CLI + REST surfaces. ADVISORY, like host_inbound —
+	// it does not change `matched` / `action` / `default_used`. Populated on the
+	// transit verdict paths (matched + no-match/default); omitted for an ordinary
+	// unicast destination and for a host-bound query (which takes the
+	// local-delivery gate, not transit route lookup).
+	RouteDropBeforePolicy bool   `protobuf:"varint,22,opt,name=route_drop_before_policy,json=routeDropBeforePolicy,proto3" json:"route_drop_before_policy,omitempty"`
+	RouteDropClass        string `protobuf:"bytes,23,opt,name=route_drop_class,json=routeDropClass,proto3" json:"route_drop_class,omitempty"`
+	RouteDropNote         string `protobuf:"bytes,24,opt,name=route_drop_note,json=routeDropNote,proto3" json:"route_drop_note,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -6853,6 +6871,27 @@ func (x *MatchPoliciesResponse) GetHostInbound() *HostInboundAdmission {
 		return x.HostInbound
 	}
 	return nil
+}
+
+func (x *MatchPoliciesResponse) GetRouteDropBeforePolicy() bool {
+	if x != nil {
+		return x.RouteDropBeforePolicy
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetRouteDropClass() string {
+	if x != nil {
+		return x.RouteDropClass
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetRouteDropNote() string {
+	if x != nil {
+		return x.RouteDropNote
+	}
+	return ""
 }
 
 // HostInboundAdmission is the structured host-inbound-traffic classifier verdict
@@ -8465,7 +8504,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\xcb\x06\n" +
+	"_icmp_code\"\xd6\a\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -8489,7 +8528,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\vdescription\x18\x12 \x01(\tR\vdescription\x12%\n" +
 	"\x0escheduler_name\x18\x13 \x01(\tR\rschedulerName\x12)\n" +
 	"\x10scheduler_active\x18\x14 \x01(\bR\x0fschedulerActive\x12?\n" +
-	"\fhost_inbound\x18\x15 \x01(\v2\x1c.xpf.v1.HostInboundAdmissionR\vhostInboundB\f\n" +
+	"\fhost_inbound\x18\x15 \x01(\v2\x1c.xpf.v1.HostInboundAdmissionR\vhostInbound\x127\n" +
+	"\x18route_drop_before_policy\x18\x16 \x01(\bR\x15routeDropBeforePolicy\x12(\n" +
+	"\x10route_drop_class\x18\x17 \x01(\tR\x0erouteDropClass\x12&\n" +
+	"\x0froute_drop_note\x18\x18 \x01(\tR\rrouteDropNoteB\f\n" +
 	"\n" +
 	"_policy_id\"\x9e\x01\n" +
 	"\x14HostInboundAdmission\x12:\n" +
