@@ -1,7 +1,10 @@
-// Tests for the nat/ module. Moved into nat/tests.rs as part of the
-// #1542 split. White-box tests reach into allocator internals via the
-// `debug_live()` accessor and the `pub(super)` items promoted in
-// allocator.rs / destination.rs.
+// NAT L4 (application / port) match-constraint tests (source and
+// destination) for the nat/ module.
+//
+// Split out of nat/tests.rs (#4409) as a sibling `#[path]` test module
+// loaded from nat/mod.rs. Pure code motion: every #[test] fn and
+// test-local helper is moved verbatim.
+#![allow(unused_imports)]
 
 use super::allocator::{
     ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
