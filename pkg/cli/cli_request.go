@@ -516,16 +516,23 @@ var monitorTrafficKeywords = map[string]bool{
 // surrounding quotes the operator typed. Reading only the first token
 // truncated `tcp port 80` down to `tcp` and silently captured far more
 // traffic than requested (#4005).
-func parseMonitorTrafficArgs(args []string) (iface, filter, count string) {
+func parseMonitorTrafficArgs(args []string) (iface, filter, count string, err error) {
 	count = "0" // 0 = unlimited
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				iface = args[i]
+			// The value after `interface` must be a real interface name,
+			// not a missing value or another grammar keyword. Without this
+			// guard `interface matching tcp port 80` consumed `matching` as
+			// the interface name → tcpdump "no such device" or an
+			// unfiltered capture; a trailing bare `interface` consumed
+			// nothing and fell through to the usage message (#4540).
+			if i+1 >= len(args) || monitorTrafficKeywords[args[i+1]] {
+				return "", "", "", fmt.Errorf("monitor traffic: 'interface' requires a value")
 			}
+			i++
+			iface = args[i]
 		case "matching":
 			rest := make([]string, 0, len(args)-i-1)
 			for j := i + 1; j < len(args); j++ {
@@ -537,13 +544,22 @@ func parseMonitorTrafficArgs(args []string) (iface, filter, count string) {
 			i += len(rest)
 			filter = stripSurroundingQuotes(strings.Join(rest, " "))
 		case "count":
-			if i+1 < len(args) {
-				i++
-				count = args[i]
+			// `count` needs a numeric value. A missing value (a trailing
+			// bare `count`, or a following grammar keyword) previously left
+			// count at "0" = unlimited, silently ignoring the operator's
+			// intent to bound the capture; a non-numeric value reached
+			// tcpdump's `-c` and produced an opaque error (#4540).
+			if i+1 >= len(args) || monitorTrafficKeywords[args[i+1]] {
+				return "", "", "", fmt.Errorf("monitor traffic: 'count' requires a value")
+			}
+			i++
+			count = args[i]
+			if _, cerr := strconv.Atoi(count); cerr != nil {
+				return "", "", "", fmt.Errorf("monitor traffic: 'count' requires a numeric value, got %q", count)
 			}
 		}
 	}
-	return iface, filter, count
+	return iface, filter, count, nil
 }
 
 // stripSurroundingQuotes removes one layer of matching leading/trailing
@@ -625,7 +641,10 @@ func validateMonitorFilter(filter string) error {
 
 // handleMonitorTraffic wraps tcpdump for live packet capture.
 func (c *CLI) handleMonitorTraffic(args []string) error {
-	iface, filter, count := parseMonitorTrafficArgs(args)
+	iface, filter, count, err := parseMonitorTrafficArgs(args)
+	if err != nil {
+		return err
+	}
 
 	if iface == "" {
 		fmt.Println("usage: monitor traffic interface <name> [matching <filter>] [count <N>]")
@@ -669,7 +688,7 @@ func (c *CLI) handleMonitorTraffic(args []string) error {
 	cmd := exec.CommandContext(ctx, cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if ctx.Err() != nil {
 		fmt.Println() // newline after ^C
 		return nil

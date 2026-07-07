@@ -51,7 +51,10 @@ func TestBuildMonitorTrafficArgvNeutralizesOptionInjection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := append([]string{"interface", "ge-0-0-0", "matching"}, tt.matcher...)
-			iface, filter, count := parseMonitorTrafficArgs(args)
+			iface, filter, count, err := parseMonitorTrafficArgs(args)
+			if err != nil {
+				t.Fatalf("parseMonitorTrafficArgs(%v) unexpected error: %v", args, err)
+			}
 			argv := buildMonitorTrafficArgv(iface, filter, count)
 
 			sep := indexOf(argv, "--")
@@ -113,7 +116,10 @@ func TestValidateMonitorFilterAcceptsLegitimateFilters(t *testing.T) {
 // after the "--" separator (`host 10.0.0.1 and port 22`).
 func TestBuildMonitorTrafficArgvLegitimateFilterAfterSeparator(t *testing.T) {
 	args := []string{"interface", "ge-0-0-0", "matching", "host", "10.0.0.1", "and", "port", "22"}
-	iface, filter, count := parseMonitorTrafficArgs(args)
+	iface, filter, count, err := parseMonitorTrafficArgs(args)
+	if err != nil {
+		t.Fatalf("parseMonitorTrafficArgs(%v) unexpected error: %v", args, err)
+	}
 	if err := validateMonitorFilter(filter); err != nil {
 		t.Fatalf("legitimate filter %q rejected: %v", filter, err)
 	}
