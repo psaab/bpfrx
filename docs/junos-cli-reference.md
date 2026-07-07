@@ -920,6 +920,45 @@ value is a non-literal dns-name / wildcard / range) (#4394). A single
 unrepresentable rule content-rejects EVERY query for the config (whole-snapshot
 semantics); a healthy config is never flagged.
 
+**Route-drop-before-policy advisory (#4373 E4/H2/H7).** A transit query whose
+`destination-ip` is a class the forwarding path drops at ROUTE LOOKUP *before*
+the policy engine runs — IPv4/IPv6 multicast, the IPv4 limited broadcast
+`255.255.255.255`, the unspecified address (`0.0.0.0` / `::`), or loopback
+(`127.0.0.0/8` / `::1`) — now carries an advisory line next to the verdict:
+
+```
+route-drop advisory: destination is multicast — transit traffic to this
+address is dropped at route lookup BEFORE security-policy evaluation, so this
+verdict does not describe real forwarding (the packet is dropped at route
+regardless of the matching policy / filter-accept log)
+```
+
+This closes an operator-confusion class: without it the simulator (and a
+firewall filter `then accept; then log` for the same tuple) reports a PERMIT
+the dataplane never forwards — the packet is silently dropped at route with no
+session and no policy eval, so the operator sees a permit/accept verdict but no
+traffic. The advisory is **additive** — it does NOT change the permit/deny
+verdict, `Matched`, or `default_used` — and rides both a positive match and the
+default-policy fall-through. It is emitted on all four live surfaces from one
+SSOT wording (`policymatch.RouteDropNote`): local + remote CLI `show security
+match-policies` / `test policy`, REST `match-policies`
+(`route_drop_before_policy` / `route_drop_class` / `route_drop_note` JSON
+fields), and the gRPC `MatchPolicies` RPC (fields 22–24). A `to-zone
+junos-host` query is exempt (it takes the local-delivery gate, not the transit
+route lookup), and an OMITTED `destination-ip` is never classified (nil dst
+means "any destination", not `0.0.0.0`).
+
+Note the two remaining halves of the same #4373 class: (1) the runtime
+RT_FLOW/event log already distinguishes a filter action from a teardown — a
+`then reject` emits a `FILTER_LOG`/`POLICY_DENY` with `action=reject` (and a
+`FILTER_LOG` `source=pbr|input|output`), while a `SESSION_CLOSE` deliberately
+omits `action` and carries a close `reason` (#2513/#3610), so a filter-reject,
+a policy-deny, and a session-teardown are already tellable apart in the log
+(the E1 confusion does not reproduce). (2) A dataplane NoRoute/martian drop
+COUNTER — so a *live* filter-accept log has a matching visible drop on the box —
+is the DEFERRED userspace-dp (Rust) half of the E4/H2/H7 remedy, tracked in
+#4373; the Go simulator advisory above is the control-plane half.
+
 ---
 
 ## Security: Zones

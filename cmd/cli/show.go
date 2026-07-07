@@ -1302,6 +1302,14 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		// surfaces, which already report resp.Action.
 		fmt.Printf("No matching policy found for %s -> %s (%s)\n", req.FromZone, req.ToZone, resp.Action)
 	}
+	// #4373 (E4/H2/H7): the server flags a multicast/broadcast/unspecified/
+	// loopback destination that the forwarding path drops at route lookup before
+	// policy runs. Print the SSOT advisory it carries so a remote-CLI verdict is
+	// not read as real forwarding — parity with the local CLI + REST surfaces
+	// over the same policymatch.RouteDropNote wording.
+	if note := resp.GetRouteDropNote(); note != "" {
+		fmt.Printf("  %s\n", note)
+	}
 	return nil
 }
 

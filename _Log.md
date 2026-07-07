@@ -1,3 +1,43 @@
+## 2026-07-07 — #4373 (Phase-0, E4/H2/H7): match-policies route-drop-before-policy advisory
+
+- **Timestamp**: 2026-07-07
+- **Action**: Drove the Go-side Phase-0 slice of #4373 (reject/filter/PBR log
+  confusion). The driveable Go item is the E4/H2/H7 "same remedy" simulator
+  half: `show security match-policies` / `test policy` / REST / gRPC returned a
+  permit/deny verdict for a destination the transit forwarding path drops at
+  ROUTE LOOKUP before policy runs (multicast / limited broadcast / unspecified /
+  loopback), so the verdict — and a filter `then accept; then log` for the same
+  tuple — over-promised forwarding the dataplane never performs.
+  - Added `Result.RouteDropBeforePolicy` + `RouteDropClass` + `RouteDropNote()`
+    SSOT + `routeDropClass()` helper in `pkg/policymatch/policymatch.go`; `Match`
+    became a named-return and stamps the advisory on EVERY transit verdict path
+    (matched + default + content-rejected) via a defer. `to-zone junos-host` is
+    exempt (local-delivery gate, not transit route lookup); a nil dst (omitted
+    selector) is NOT classified as `0.0.0.0`.
+  - Surfaced the advisory on all four live surfaces from one wording: local CLI
+    (`pkg/cli/cli_show_security.go`, `cli_request.go`), remote CLI
+    (`cmd/cli/show.go`), REST (`pkg/api/types.go` + `security.go`,
+    `route_drop_*` JSON fields), gRPC (`proto` fields 22-24 +
+    `pkg/grpcapi/server_cluster.go`).
+  - VERIFIED already-handled (disproving file:line): E1 (reject vs
+    session-close) does NOT reproduce — `pkg/logging/ringbuf.go` renders
+    `FILTER_LOG` with `action=reject` + `source=pbr|input|output`
+    (`actionName`/`filterLogSourceName`), `SESSION_CLOSE` omits `action`
+    (#2513), and `POLICY_DENY` carries a distinct `reason` (#3610), so
+    filter-reject / policy-deny / teardown are already distinguishable.
+  - DEFERRED to Rust (cargo lane busy, do-not-run): the dataplane NoRoute/martian
+    drop COUNTER for E4/H2/H7 (so a live filter-accept log has a matching
+    visible drop) — the userspace-dp half of the same remedy.
+  - RED-on-revert: `pkg/policymatch/route_drop_4373_test.go` — neutralizing the
+    Match stamping reddens the multicast/broadcast/unspecified/loopback rows.
+    `go test` green (policymatch, cli, cmd/cli, api, grpcapi, logging); gofmt
+    clean; `make proto` regen additive-only.
+- **File(s)**: pkg/policymatch/policymatch.go,
+  pkg/policymatch/route_drop_4373_test.go (new), pkg/cli/cli_show_security.go,
+  pkg/cli/cli_request.go, cmd/cli/show.go, pkg/api/types.go, pkg/api/security.go,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, docs/junos-cli-reference.md, _Log.md
+
 ## 2026-07-07 — #4411 (avo-review-002 A4/A6): host-inbound + policymatch test-coverage locks
 
 - **Timestamp**: 2026-07-07
