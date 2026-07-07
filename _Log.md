@@ -1,3 +1,31 @@
+## 2026-07-06 — #4383: DHCPv6 IA_NA multi-address deterministic selection
+
+- **Timestamp**: 2026-07-06
+- **Action**: The DHCPv6 IA_NA extraction loop in `parseV6Reply`
+  (`pkg/dhcp/dhcp.go`) did a last-wins overwrite of `addr`/`validLT` for
+  every IAADDR option, so a reply carrying multiple IAADDR options (RFC
+  8415 §21.4 permits several per IA_NA, and multiple IA_NA per reply)
+  installed whichever address enumerated last and paired the whole lease
+  with that address's valid-lifetime — an order-dependent choice that
+  could prefer a deprecated address and carry a stale lifetime. Fix:
+  extracted the selection into a pure helper `selectIANAAddress` that
+  skips any IAADDR with valid-lifetime 0 (expired/declined, RFC 8415
+  §12.1 — ties into F-264), then picks the longest preferred-lifetime,
+  tie-broken by first-seen (strict greater-than over option order), and
+  returns the CHOSEN address's own valid-lifetime so `lease.LeaseTime` is
+  never paired with a stale value. `parseV6Reply` now calls the helper.
+  Also added a nil-guard to `discoverIPv6Router` (consistent with the
+  existing nil-nlHandle guards) so `parseV6Reply` is unit-testable with a
+  bare `Manager`. Tests (`dhcpv6_iana_test.go`): multi-IAADDR selects the
+  longest-preferred + LeaseTime = its valid-lifetime; single-address
+  unchanged; valid-lifetime-0 skipped; all-zero => no usable IA_NA error;
+  tie-break first-seen; selection scans across multiple IA_NA options. All
+  four deterministic subtests go RED when the helper is reverted to
+  last-wins (verified via in-place Edit-revert, restored). `go test
+  ./pkg/dhcp/...` green; `go build ./...`, gofmt, vet clean.
+- **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/dhcpv6_iana_test.go,
+  pkg/dhcp/README.md, _Log.md
+
 ## 2026-07-06 — #4388: reserve a peer-synced session's NAT pool port on the standby
 
 - **Timestamp**: 2026-07-06
