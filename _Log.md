@@ -40592,6 +40592,37 @@ top.
 - **File(s)**: pkg/config/ast.go, pkg/configstore/store_command.go,
   pkg/configstore/store_test.go, docs/config-schema.md, _Log.md
 
+## 2026-07-07 — #4598 zeroize tears down provisioned OS login accounts (SECURITY HIGH)
+- **Timestamp**: 2026-07-07
+- **Action**: SECURITY follow-up to #4576/#4585. The OS login accounts xpf
+  provisions live OUTSIDE /etc/xpf and SURVIVED zeroize — /etc/shadow
+  password hashes (reconcileUserPassword), SSH authorized_keys under
+  /home/<user>/.ssh (applySystemLogin), and /etc/sudoers.d/xpf-<user>
+  NOPASSWD grants (reconcileSudoers). applySystemLogin runs only inside the
+  boot-time applyConfig, which a post-zeroize boot SKIPS (bootstrap /
+  nil-active-config), and a full reconcile early-returns on empty config and
+  never userdel's, so a re-tenanted/RMA'd/resold device granted the prior
+  tenant interactive LOGIN + passwordless SUDO — a bigger leak than a
+  config-secret read. Added zeroizeLoginAccounts to performZeroizeWipe (after
+  the #4585 rendered-config erasure, error folded into the surfaced result
+  like #4576/#4585). Marker-aware teardown keyed on the #1944 UID-keyed
+  provenance marker (/var/lib/xpf/provisioned-users/<user>, content = UID at
+  provision time): (A) sweep the whole /etc/sudoers.d/xpf-* namespace
+  unconditionally (operator drop-ins without the prefix untouched); (B) for
+  each marker, userdel -r ONLY when the current /etc/passwd UID still equals
+  the recorded UID — an operator's own account (no marker), root/system
+  accounts (no marker), and an out-of-band recreate (UID mismatch) are NEVER
+  touched. authorized_keys removed BEFORE userdel (SSH vector dies even if
+  userdel fails); marker RETAINED on userdel failure so a retried zeroize
+  re-attempts + the error is surfaced (codes.Internal at the RPC boundary).
+  pkg/grpcapi can't import pkg/daemon (daemon_run.go imports grpcapi → cycle),
+  so the prod paths are mirrored as test-injectable package vars + a
+  zeroizeUserdel seam. RED-on-revert test proven against a neutered body
+  (removal/userdel/error-surfacing assertions fail; the never-touch-non-xpf
+  assertPresent safety checks stay green). go build ./... + go vet + full
+  pkg/grpcapi test green; gofmt clean.
+- **File(s)**: pkg/grpcapi/server_diag.go,
+  pkg/grpcapi/zeroize_login_4598_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-07-07 (#4594)
 - **Action**: class-of-service forwarding-class queue outside 0..255 was
   warn-only (`ValidateConfig`) and COMMITTED, while the userspace helper

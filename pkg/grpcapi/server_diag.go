@@ -908,12 +908,207 @@ func zeroizeRenderedConfigs(frrConf, swanctlSnippet, kea4, kea6 string) error {
 	return firstErr
 }
 
+// zeroize login-account teardown paths (#4598). These mirror the production
+// paths the daemon provisions OS login accounts under (pkg/daemon:
+// provisionedUsersDir, sudoersDir/sudoersPrefix, passwdPath, /home/<user>).
+// They cannot be imported — pkg/daemon imports pkg/grpcapi (daemon_run.go),
+// so a shared symbol would create an import cycle, the same reason the exec
+// timeout helper is duplicated here. They are package vars only so a test can
+// point the teardown at a throwaway tree instead of the real /etc + /home +
+// /var/lib.
+var (
+	// zeroizeProvisionedUsersDir is the per-account provenance-marker directory
+	// (pkg/daemon.provisionedUsersDir). Each file is named for an xpf-created
+	// login account and CONTAINS that account's UID at provision time — the
+	// UID-keyed ownership marker of #1944. It is the authoritative registry of
+	// "which OS users did xpf provision", so the wipe walks it to know exactly
+	// which accounts are safe to remove.
+	zeroizeProvisionedUsersDir = "/var/lib/xpf/provisioned-users"
+	// zeroizeSudoersDir + zeroizeSudoersPrefix mirror pkg/daemon.sudoersDir /
+	// sudoersPrefix — the exclusive namespace of xpf-managed NOPASSWD sudo
+	// drop-ins. Only files with the prefix are ever removed; operator-authored
+	// drop-ins in the same directory are left untouched.
+	zeroizeSudoersDir    = "/etc/sudoers.d"
+	zeroizeSudoersPrefix = "xpf-"
+	// zeroizePasswdPath is /etc/passwd, read to resolve an account's CURRENT
+	// UID so a userdel only ever fires when the live UID still matches the
+	// marker (never on an out-of-band recreate). Mirrors pkg/daemon.passwdPath.
+	zeroizePasswdPath = "/etc/passwd"
+	// zeroizeHomeBase is the home-directory root; authorized_keys lives at
+	// <base>/<user>/.ssh/authorized_keys.
+	zeroizeHomeBase = "/home"
+	// zeroizeUserdel removes an OS account, its /etc/shadow + /etc/passwd
+	// entries, and its home tree (-r). It is a seam so tests can record the
+	// removal without touching real accounts. context.Background(): a client
+	// disconnect must not abort a confirmed factory reset (mirrors runTimeout's
+	// power-action rationale).
+	zeroizeUserdel = func(name string) ([]byte, error) {
+		return combinedOutputTimeout(context.Background(), "userdel", "-r", name)
+	}
+)
+
+// zeroizeLookupUID returns the current numeric UID for name by parsing
+// zeroizePasswdPath directly (cgo-free, mirroring pkg/daemon.lookupUID). It
+// returns (uid, true) on success and (0, false) if the file is unreadable, the
+// account is absent, or the UID field does not parse — the "not our account"
+// disposition that suppresses a userdel.
+func zeroizeLookupUID(name string) (int, bool) {
+	data, err := os.ReadFile(zeroizePasswdPath)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] == name {
+			uid, err := strconv.Atoi(fields[2])
+			if err != nil {
+				return 0, false
+			}
+			return uid, true
+		}
+	}
+	return 0, false
+}
+
+// zeroizeLoginAccounts tears down the OS LOGIN accounts xpf provisioned as part
+// of a factory reset (#4598, follow-up to #4576/#4585). These are the biggest
+// re-tenant leak of the three because they grant INTERACTIVE LOGIN + SUDO, not
+// just a config-secret read:
+//
+//   - /etc/shadow password hashes (pkg/daemon.reconcileUserPassword)
+//   - SSH authorized_keys under /home/<user>/.ssh (pkg/daemon.applySystemLogin)
+//   - /etc/sudoers.d/xpf-<user> NOPASSWD grants (pkg/daemon.reconcileSudoers)
+//
+// All three live OUTSIDE /etc/xpf and SURVIVE the config wipe: applySystemLogin
+// runs only inside the boot-time applyConfig, which a post-zeroize boot SKIPS
+// (bootstrap mode / nil active config — the same boot-skip #4585 documents), and
+// even a full reconcile early-returns on an empty config and never userdel's. So
+// without this teardown a re-tenanted / RMA'd / resold device still carries the
+// prior tenant's login accounts, SSH keys, and passwordless sudo.
+//
+// Ownership discipline — NEVER touch a non-xpf account (the core safety
+// invariant, #1944 §5.4):
+//   - Sudoers: only the xpf-<user> namespace is swept. Operator-authored
+//     drop-ins (no xpf- prefix) are left untouched. The whole namespace is
+//     removed unconditionally — at factory reset nothing is desired — so no
+//     passwordless-root grant survives even if a marker is missing.
+//   - Users: a userdel fires ONLY for an account that has a provenance marker
+//     AND whose CURRENT /etc/passwd UID still equals the marker's recorded UID.
+//     An operator's own account (no marker) is never iterated; a system account
+//     or root (no marker) is never touched; an out-of-band userdel+recreate with
+//     a different UID (marker mismatch) is left alone — exactly the #1944
+//     leave-then-rejoin vs recreate distinction, so the wipe can never nuke the
+//     wrong account or strand access.
+//
+// authorized_keys is removed BEFORE userdel so the SSH-key login vector dies
+// even if userdel later fails; the marker is retained on a userdel FAILURE so a
+// retried zeroize re-attempts the removal (and the failure is surfaced, so the
+// device is not reported safe to re-tenant while a live account remains).
+//
+// Discipline mirrors zeroizeConfigDir / zeroizeRenderedConfigs: os.ErrNotExist
+// is never an error (an already-absent artifact is the goal), removal is
+// best-effort past a single failure, but the FIRST real error is returned so a
+// silently-incomplete teardown is never reported as a clean factory reset.
+func zeroizeLoginAccounts() error {
+	var firstErr error
+	fail := func(err error) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// (A) Sweep the xpf sudoers namespace. Removing every xpf-<user> drop-in
+	// guarantees no passwordless-root grant survives, independent of the marker
+	// registry. Operator drop-ins without the prefix are never touched.
+	if entries, err := os.ReadDir(zeroizeSudoersDir); err != nil {
+		fail(err) // a real ReadDir error (absent dir is ErrNotExist → excluded)
+	} else {
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() || !strings.HasPrefix(name, zeroizeSudoersPrefix) {
+				continue
+			}
+			fail(os.Remove(filepath.Join(zeroizeSudoersDir, name)))
+		}
+	}
+
+	// (B) Tear down each xpf-provisioned OS user, gated on the UID-keyed marker.
+	entries, err := os.ReadDir(zeroizeProvisionedUsersDir)
+	if err != nil {
+		// Absent dir = xpf never provisioned a login account: nothing to do.
+		// Any other read error is surfaced (we cannot prove the accounts gone).
+		fail(err)
+		return firstErr
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name() // marker filename == account name (Base'd on write)
+		markerFile := filepath.Join(zeroizeProvisionedUsersDir, name)
+
+		recordedUID, uidErr := readProvisionedMarkerUID(markerFile)
+		curUID, curOK := zeroizeLookupUID(name)
+		keysFile := filepath.Join(zeroizeHomeBase, name, ".ssh", "authorized_keys")
+
+		removeMarker := true
+		switch {
+		case !curOK:
+			// Account already absent from /etc/passwd — it cannot authenticate.
+			// Best-effort clean up any orphaned key residue; nothing to userdel.
+			fail(os.Remove(keysFile))
+		case uidErr != nil || curUID != recordedUID:
+			// Corrupt marker OR out-of-band recreate (UID changed): NOT the
+			// account xpf provisioned. Never userdel or touch its home — the
+			// current owner is someone else. Drop our stale marker only.
+		default:
+			// curUID == recordedUID → the exact account xpf provisioned. Kill
+			// the SSH-key vector first (survives a userdel failure), then remove
+			// the account (userdel -r drops /etc/shadow + /etc/passwd + home).
+			fail(os.Remove(keysFile))
+			if out, derr := zeroizeUserdel(name); derr != nil {
+				slog.Error("zeroize: failed to remove xpf-provisioned login account",
+					"user", name, "err", derr, "output", strings.TrimSpace(string(out)))
+				fail(derr)
+				removeMarker = false // keep the marker so a retry re-attempts
+			} else {
+				slog.Info("zeroize: removed xpf-provisioned login account", "user", name)
+			}
+		}
+		if removeMarker {
+			fail(os.Remove(markerFile))
+		}
+	}
+	// Drop the now-empty marker directory (best-effort; ENOTEMPTY after a
+	// retained marker is fine and must not gate the factory reset).
+	_ = os.Remove(zeroizeProvisionedUsersDir)
+	return firstErr
+}
+
+// readProvisionedMarkerUID reads a provenance marker file and returns the UID
+// it records (pkg/daemon.markProvisioned writes the account's UID as decimal
+// text). A read or parse error yields the "not our account" disposition in
+// zeroizeLoginAccounts (no userdel).
+func readProvisionedMarkerUID(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
 // performZeroizeWipe erases the on-disk config, rendered service-config
-// secrets, BPF pins, and managed networkd files (factory reset). It is a
-// package var so a test can drive the `zeroize` SystemAction verb (to assert
-// the #4108 F8 journal wiring) WITHOUT wiping a real /etc/xpf on the
-// developer/appliance box. It returns a non-nil error when a security-critical
-// erasure did not fully complete (#4576/#4585).
+// secrets, provisioned login accounts, BPF pins, and managed networkd files
+// (factory reset). It is a package var so a test can drive the `zeroize`
+// SystemAction verb (to assert the #4108 F8 journal wiring) WITHOUT wiping a
+// real /etc/xpf on the developer/appliance box. It returns a non-nil error when
+// a security-critical erasure did not fully complete (#4576/#4585/#4598).
 var performZeroizeWipe = func() error {
 	// Config state FIRST — the security-critical erasure. A failure here can
 	// leave prior-tenant config/secrets on disk, so it is surfaced to the
@@ -932,6 +1127,18 @@ var performZeroizeWipe = func() error {
 		dhcpserver.DefaultKea4ConfPath,
 		dhcpserver.DefaultKea6ConfPath,
 	); e != nil && err == nil {
+		err = e
+	}
+
+	// Provisioned login accounts (#4598): the OS users xpf created — their
+	// /etc/shadow hashes, SSH authorized_keys, and /etc/sudoers.d/xpf-* grants —
+	// live OUTSIDE /etc/xpf and SURVIVE the config wipe (applySystemLogin runs
+	// only inside the boot-time applyConfig, which a post-zeroize boot SKIPS), so
+	// a re-tenanted device would otherwise grant the prior tenant interactive
+	// login + passwordless sudo. Marker-aware teardown (UID-keyed provenance
+	// marker, #1944) so a non-xpf admin/system/operator account is NEVER touched.
+	// Also security-critical, so fold its first error into the surfaced result.
+	if e := zeroizeLoginAccounts(); e != nil && err == nil {
 		err = e
 	}
 
