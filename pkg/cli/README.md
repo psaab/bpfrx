@@ -40,6 +40,32 @@ sibling files (same package, so unexported helpers stay reachable):
 The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
 argv builders (#2084 / #4524 / #4527) moved verbatim.
 
+## `show interfaces` render files (#4654)
+
+The `show interfaces` presenters were historically one 1396-line
+`cli_show_interfaces.go`, where the RETH/member display logic repeated
+across the summary/terse/detail/extensive modes and drifted (the #4328
+family of fixes). They are split per render mode plus a shared
+RETH/kernel-query helper file (same package, so the unexported helpers
+stay reachable). Pure code motion — the netlink/sysfs query order and the
+visible output are byte-identical:
+
+- `cli_show_interfaces.go` — the `showInterfaces` dispatch + summary
+  renderer, `showInterfacesRethMemberSummary`, and `showTunnelInterfaces`.
+- `cli_show_interfaces_terse.go` — `showInterfacesTerse` (the tabular
+  `show interfaces terse` view, cluster-peer aware).
+- `cli_show_interfaces_detail.go` — `showInterfacesDetail` plus
+  `showInterfacesRethDetail`, the synthesized bondless-reth aggregate /
+  absent-member block reused by the extensive view.
+- `cli_show_interfaces_extensive.go` — `showInterfacesExtensive` /
+  `showInterfacesExtensiveFiltered`.
+- `cli_show_interfaces_stats.go` — `showInterfacesStatistics` and
+  `showVlans` (the two small tabular summaries).
+- `cli_show_interfaces_shared.go` — the shared RETH/kernel-query helpers
+  `dhcpLease`, `rethMemberLinkState`, `rethMemberAttrs`, and `baseIfName`,
+  so the four render modes resolve reth link state / member attrs / lease
+  data through one place and can no longer drift.
+
 ## Callers
 
 `cmd/cli` (remote client), `cmd/xpfd` (when stdin is a TTY).
