@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
@@ -139,9 +140,17 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 			}
 		}
 	default:
-		// "received-routes:<ip>" for neighbor received routes
+		// "received-routes:<ip>" for neighbor received routes.
+		// Validate the IP at the trust boundary (this handler is reachable
+		// over the UNAUTHENTICATED local gRPC listener) so a malformed or
+		// newline-bearing token is rejected with InvalidArgument before it
+		// reaches the vtysh command line. The frr wrappers re-check as the
+		// load-bearing belt (#4588).
 		if strings.HasPrefix(req.Type, "received-routes:") {
 			ip := strings.TrimPrefix(req.Type, "received-routes:")
+			if net.ParseIP(ip) == nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid neighbor IP %q", ip)
+			}
 			output, err := s.frr.GetBGPNeighborReceivedRoutes(ip)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "%v", err)
@@ -151,17 +160,25 @@ func (s *Server) GetBGPStatus(_ context.Context, req *pb.GetBGPStatusRequest) (*
 		// "advertised-routes:<ip>" for neighbor advertised routes
 		if strings.HasPrefix(req.Type, "advertised-routes:") {
 			ip := strings.TrimPrefix(req.Type, "advertised-routes:")
+			if net.ParseIP(ip) == nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid neighbor IP %q", ip)
+			}
 			output, err := s.frr.GetBGPNeighborAdvertisedRoutes(ip)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "%v", err)
 			}
 			return &pb.GetBGPStatusResponse{Output: output}, nil
 		}
-		// "neighbor" or "neighbor:<ip>" for detailed neighbor info
+		// "neighbor" or "neighbor:<ip>" for detailed neighbor info.
+		// An empty ip selects every neighbor (legal); a non-empty ip must
+		// parse as an IP address before it reaches vtysh (#4588).
 		if req.Type == "neighbor" || strings.HasPrefix(req.Type, "neighbor:") {
 			ip := ""
 			if strings.HasPrefix(req.Type, "neighbor:") {
 				ip = strings.TrimPrefix(req.Type, "neighbor:")
+			}
+			if ip != "" && net.ParseIP(ip) == nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid neighbor IP %q", ip)
 			}
 			output, err := s.frr.GetBGPNeighborDetail(ip)
 			if err != nil {

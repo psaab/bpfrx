@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os/exec"
 	"syscall"
 	"time"
@@ -189,26 +190,46 @@ func (m *Manager) GetOSPFRoutes() (string, error) {
 }
 
 // GetBGPNeighborReceivedRoutes returns received routes for a BGP neighbor.
+//
+// The neighbor IP is concatenated straight into the `vtysh -c` command,
+// so it MUST be a syntactically valid IP address. This is the belt that
+// keeps a raw, newline- or space-bearing token off the vtysh command
+// line: the show path is reachable over the UNAUTHENTICATED local gRPC
+// channel (GetBGPStatus, 127.0.0.1:50051) and, unlike the config path
+// (sanitizeFRRValue/validateNodesControlChars, #4097/#1798), never went
+// through a sanitizer. net.ParseIP rejects empty, spaces, and embedded
+// newlines while accepting both IPv4 and IPv6 neighbors (#4588).
 func (m *Manager) GetBGPNeighborReceivedRoutes(ip string) (string, error) {
-	if ip == "" {
-		return "", fmt.Errorf("neighbor IP required")
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid neighbor IP %q", ip)
 	}
 	return m.executor().Vtysh("show bgp neighbor " + ip + " received-routes")
 }
 
 // GetBGPNeighborAdvertisedRoutes returns advertised routes for a BGP neighbor.
+//
+// The neighbor IP is validated with net.ParseIP before it reaches the
+// vtysh command line — see GetBGPNeighborReceivedRoutes for the rationale
+// (unauthenticated local gRPC show path, no config-style sanitizer, #4588).
 func (m *Manager) GetBGPNeighborAdvertisedRoutes(ip string) (string, error) {
-	if ip == "" {
-		return "", fmt.Errorf("neighbor IP required")
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid neighbor IP %q", ip)
 	}
 	return m.executor().Vtysh("show bgp neighbor " + ip + " advertised-routes")
 }
 
 // GetBGPNeighborDetail returns detailed info for a specific BGP neighbor,
 // or all neighbors if ip is empty.
+//
+// An empty ip is legal (it selects every neighbor). A non-empty ip is
+// validated with net.ParseIP so no raw token reaches the vtysh command
+// line — see GetBGPNeighborReceivedRoutes for the rationale (#4588).
 func (m *Manager) GetBGPNeighborDetail(ip string) (string, error) {
 	cmd := "show bgp neighbor"
 	if ip != "" {
+		if net.ParseIP(ip) == nil {
+			return "", fmt.Errorf("invalid neighbor IP %q", ip)
+		}
 		cmd += " " + ip
 	}
 	return m.executor().Vtysh(cmd)
