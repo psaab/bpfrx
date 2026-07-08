@@ -1107,18 +1107,39 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 	d.nudgeSurfaceADDNSReconcile()
 }
 
+// stripUntaggedUnitSuffix normalizes a resolved Linux interface name by
+// removing a trailing ".0" unit suffix. An untagged reth unit (e.g. `reth1.0`)
+// resolves via ResolveReth to "ge-0-0-1.0", but the real kernel interface Kea
+// binds to — and the name rethInterfacesForRG emits for a VlanID==0 unit — is
+// the bare member "ge-0-0-1" (there is NO ".0" VLAN device for an untagged
+// unit). A tagged unit (".100") is left intact so it only matches its tagged
+// member.
+//
+// #4647: the master-RG DHCP filter compared the resolved group interface
+// ("ge-0-0-1.0") against the bare master-RG member ("ge-0-0-1") with an exact
+// string compare, so the canonical `interface reth1.0` config never matched,
+// the group was dropped, and clearFamilyLocked wiped the Kea config even though
+// the RG was MASTER — DHCP-server-in-cluster was non-functional. Normalizing the
+// untagged ".0" on both sides restores the match while keeping tagged units
+// bound to their VLAN member.
+func stripUntaggedUnitSuffix(iface string) string {
+	return strings.TrimSuffix(iface, ".0")
+}
+
 // filterDHCPConfigForMasterRGs returns a DHCP config containing only groups
 // whose interfaces belong to RGs that are currently MASTER. Returns nil if
 // no groups match.
 func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPServerConfig {
-	// Collect all interfaces belonging to master RGs.
+	// Collect all interfaces belonging to master RGs. Normalize the untagged
+	// ".0" suffix (#4647) so the set is keyed by the bare member name that the
+	// resolved group interface also normalizes to below.
 	masterIfaces := make(map[string]bool)
 	for rgID, isMaster := range d.snapshotRethMasterState() {
 		if !isMaster {
 			continue
 		}
 		for _, n := range rethInterfacesForRG(cfg, rgID) {
-			masterIfaces[n] = true
+			masterIfaces[stripUntaggedUnitSuffix(n)] = true
 		}
 	}
 
@@ -1133,8 +1154,15 @@ func (d *Daemon) filterDHCPConfigForMasterRGs(cfg *config.Config) *config.DHCPSe
 		for name, group := range groups {
 			var kept []string
 			for _, iface := range group.Interfaces {
-				if masterIfaces[iface] {
-					kept = append(kept, iface)
+				// #4647: normalize the untagged ".0" so a `reth1.0`
+				// group (resolved to "ge-0-0-1.0") matches its master RG
+				// member ("ge-0-0-1"). Keep the NORMALIZED name — the
+				// bare member is the real kernel interface Kea binds to;
+				// "ge-0-0-1.0" is not a device. Tagged units keep their
+				// ".<vlan>" and match only the tagged member.
+				norm := stripUntaggedUnitSuffix(iface)
+				if masterIfaces[norm] {
+					kept = append(kept, norm)
 				}
 			}
 			if len(kept) > 0 {
