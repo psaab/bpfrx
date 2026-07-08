@@ -687,13 +687,27 @@ type userspaceCounterSnapshot struct {
 }
 
 // totalDrops (#4477) is the aggregate "Packets dropped" figure surfaced by
-// GlobalCtrDrops. It sums the firewall's enforcement/discard drops — policy
+// GlobalCtrDrops. It sums the firewall's ENFORCEMENT drops — policy
 // denies, screen/IDS drops, host-inbound admission denies, and source-NAT
 // allocation failures. These are exactly the four breakdown lines rendered
 // beneath "Packets dropped" in `show security flow statistics`, so the
 // aggregate equals the sum of its parts (a total-with-breakdown, not a
 // double count into any single reason's own index). Before #4477 GlobalCtrDrops
 // was never written and printed a false, always-0 value.
+//
+// #4508: this is ENFORCEMENT drops only, NOT the literal total of every packet
+// the dataplane discards. Deliberately EXCLUDED (counted elsewhere or not
+// folded here), so "Packets dropped" UNDERCOUNTS total discards:
+//   - no-route / missing-neighbor drops — bumped as route_miss_packets /
+//     neighbor_miss_packets and surfaced separately as "Route misses:" in the
+//     helper status (see pkg/dataplane/userspace/format/status.go);
+//   - fabric-forwarding drops (dataplane.GlobalCtrFabricFwdDrop, idx 32);
+//   - VLAN-push failures (dataplane.GlobalCtrVlanPushFail, idx 40);
+//   - NAT64 fail-closed drops (distinct from source-NAT alloc failure).
+//
+// If a true total is ever wanted, extend this sum to include those indices —
+// but keep the display label verbatim for vSRX parity. Doc: the "Packets
+// dropped scope" caveat in docs/junos-cli-reference.md.
 func (s userspaceCounterSnapshot) totalDrops() uint64 {
 	return s.policyDenied + s.screenDrops + s.hostInboundDenied + s.natAllocFail
 }

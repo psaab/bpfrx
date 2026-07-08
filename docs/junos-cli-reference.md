@@ -202,6 +202,15 @@ Maximum-sessions: 4194304
 - Every line indented 4 spaces.
 - Key-value with colon separator.
 - All numbers right-aligned (no fixed width, just the number).
+- **`Packets dropped` = ENFORCEMENT drops only (#4508).** This figure sums
+  policy denies, screen/IDS drops, host-inbound denies, and source-NAT
+  allocation failures — it is NOT the literal total of every discarded
+  packet. No-route / missing-neighbor drops (helper status `Route misses:`),
+  fabric-forwarding drops, VLAN-push failures, and NAT64 fail-closed drops
+  are counted separately and are excluded here, so `Packets dropped`
+  undercounts total discards. See the `Packets dropped` scope caveat
+  (#4477/#4508) in the counter-accounting notes further below for the full
+  breakdown of excluded paths and their counter indices.
 
 ---
 
@@ -430,6 +439,29 @@ From zone: guest, To zone: lan
     beneath it), mirroring the host-inbound / NAT64 / per-screen-reason plumbing.
     Once bridged the counters carry real values, so the #3345 disclosure
     correctly stays silent for them.
+  - **`Packets dropped` scope — ENFORCEMENT drops only (#4508):** the
+    `Packets dropped` counter is the sum of the four ENFORCEMENT/discard
+    reasons above (policy deny + screen/IDS + host-inbound deny + source-NAT
+    allocation failure). It is deliberately **not** the literal total of every
+    packet the dataplane discards. Other real drop paths are counted
+    elsewhere or not folded into this figure, so `Packets dropped`
+    **undercounts** total discards. Excluded paths and where to read them:
+    - **No-route** (userspace has no route to the destination) and
+      **missing-neighbor** (route resolved but ARP/ND unresolved) drops are
+      counted per binding as `route_miss_packets` / `neighbor_miss_packets`
+      and surfaced separately as the `Route misses:` line in the userspace
+      helper status (`pkg/dataplane/userspace/format/status.go`) — never in
+      `Packets dropped`.
+    - **Fabric-forwarding drops** (`GlobalCtrFabricFwdDrop`, index 32) — a
+      peer-owned synced session whose fabric redirect could not be completed.
+    - **VLAN-push failures** (`GlobalCtrVlanPushFail`, index 40).
+    - **NAT64 fail-closed drops** — the NAT64 translator dropping a packet it
+      cannot safely translate (distinct from the source-NAT allocation
+      failure that IS in the total).
+    This is the vSRX `show security flow statistics` field name, so the label
+    is kept verbatim for Junos parity; the caveat lives here rather than in a
+    relabel. The Prometheus mirror `xpf_drops_total` carries the same scope in
+    its help text (`enforcement drops … does NOT include no-route`).
   - **Token validation (#3200):** `host-inbound-traffic system-services
     <tok>` / `protocols <tok>` is now validated at commit against the
     recognized-token SSOT (`pkg/config/host_inbound_tokens.go`:

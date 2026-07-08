@@ -28,6 +28,38 @@
 - **File(s)**: pkg/config/compiler_validate_warn.go,
   pkg/config/host_inbound_fulladmit_warn_3226_test.go,
   docs/host-inbound-service-matrix.md, _Log.md
+## 2026-07-07 — #4508 doc: clarify `Packets dropped` = enforcement drops (undercounts no-route/fabric/vlan/NAT64)
+
+- **Timestamp**: 2026-07-07
+- **Action**: DOC + label clarification. `Packets dropped`
+  (`dataplane.GlobalCtrDrops`, bridged by `totalDrops()` since #4477) is the
+  sum of the FOUR ENFORCEMENT drop reasons only — policy deny + screen/IDS +
+  host-inbound deny + source-NAT alloc fail. It is NOT the literal total of
+  every discarded packet: no-route/missing-neighbor (surfaced separately as
+  the helper status `Route misses:`, from `route_miss_packets`/
+  `neighbor_miss_packets`), fabric-forwarding drops (`GlobalCtrFabricFwdDrop`
+  idx 32), VLAN-push failures (`GlobalCtrVlanPushFail` idx 40), and NAT64
+  fail-closed drops are all EXCLUDED, so the figure undercounts total
+  discards. Documented the scope + excluded paths in
+  `docs/junos-cli-reference.md` (flow-statistics Format Details + the #4477
+  accounting bullet), extended the `totalDrops()` godoc in
+  `pkg/dataplane/userspace/manager_ha.go`, and clarified the free-form
+  Prometheus `xpf_drops_total` help text in `pkg/api/metrics_descriptors.go`.
+  KEPT the CLI display string `Packets dropped:` verbatim — it is the vSRX
+  `show security flow statistics` field name and relabeling would break the
+  Junos CLI parity this doc exists to guarantee (no test pins the string; the
+  caveat lives in the doc/help-text instead). Added a RED-on-revert test
+  `TestDropsTotalHelpDeclaresEnforcementScope` asserting the clarified help
+  text names `enforcement`/`no-route`/`undercounts` and no longer carries the
+  misleading `Total packets dropped.` wording.
+- **File(s)**: `docs/junos-cli-reference.md`,
+  `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/api/metrics_descriptors.go`,
+  `pkg/api/metrics_drops_scope_4508_test.go`, `_Log.md`
+- **Validation**: `gofmt -l` clean, `go vet ./pkg/api/ ./pkg/dataplane/
+  userspace/` clean, `go build ./...` OK, `go test ./pkg/api/ ./pkg/dataplane/
+  userspace/` green; verified the new test fails RED when
+  `metrics_descriptors.go` is reverted to `origin/master`.
 
 ## 2026-07-07 — #4607 event_stream: seed queue budget in the #2875 telemetry-eviction test
 
@@ -40850,6 +40882,36 @@ top.
   masked) and routed the two CIDR compares through it. RED-on-revert verified.
 - **File(s)**: pkg/ra/ra.go, pkg/ra/ra_test.go, pkg/ra/README.md, _Log.md
 
+- **Timestamp**: 2026-07-07
+- **Action**: #4569 (ps-036-c7 F-001, RUST, userspace-dp policy) — a non-first
+  fragment bypassed a port-bearing DENY when a later permit-any existed. On the
+  flowless transit path `evaluate_policy_result_l3_aware` is called with
+  `l4_present=false` (#2344 makes a non-first fragment flowless, dst_port=0), so
+  `ApplicationMatcher::matches` gated a port-bearing DENY term (junos-https) off
+  → the DENY returned None ("rule does not apply") → first-match fell through to
+  a later `permit any` → the fragment forwarded, bypassing the DENY (fail-open
+  twin of the #3291/#4024 deny-all fix). Fix (minimal, Junos fragment-
+  association fail-closed): while walking rules in first-match precedence order,
+  `note_skipped_frag_deny` remembers the FIRST port-bearing DENY (`deny`/
+  `reject`) whose L3 (zone fixed by the tier bucket + src/dst address) OVERLAPS
+  the fragment but was skipped ONLY because `l4_present=false`
+  (`rule_is_skipped_frag_ambiguous_deny` + new `CompiledApplications::
+  has_l4_constrained_term`); if the walk then lands on a PERMIT or default-
+  permit, `apply_frag_deny_override` OVERRIDES to DROP and attributes the
+  PolicyDeny event to that DENY. Scoped narrowly: a fragment with NO overlapping
+  skipped DENY still forwards; the L4 (`l4_present=true`) path is byte-identical
+  (note/override inert). Documented over-drop trade-off (a legit non-denied-port
+  fragment from the same L3 is dropped — the Junos secure default); the
+  fragment-association cache is the deferred principled fix. Extracted the L3
+  address-match block from `try_match_rule` into `rule_l3_matches` so the
+  overlap check uses the EXACT same logic (incl. *-excluded / NAT64 arm).
+  RED-on-revert verified (neutered `note_skipped_frag_deny` → flowless fragment
+  returns Permit). Full cargo bin suite 3720/0 (one WG frame test,
+  `wg_encap_frame_resolves_outer_route_once_v4`, flaked once under parallelism
+  then passed isolated + on rerun — a pre-existing test-isolation flake in an
+  unrelated subsystem, no code path touches policy).
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  docs/feature-gaps.md, _Log.md
 - **Timestamp**: 2026-07-08
 - **Action**: #4498 (FRR sanitize-belt residual + #4482 test completeness, GO,
   pkg/frr) — the #4494 hostile review flagged three route-map free-text slots
