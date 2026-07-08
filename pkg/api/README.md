@@ -439,7 +439,8 @@ under the daemon's errgroup. Nothing else imports this package.
   per-zone volume + flood-event counts from the Rust helper) is DEFERRED; the
   sparse offset map's setters are the populate hook. See
   `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE) and
-  the follow-up enhancement issue. Pinned by
+  the deferred POPULATE tracker #3651 (the Rust per-zone counter-publish is the
+  outstanding prerequisite). Pinned by
   `pkg/dataplane/zone_flood_counters_hide_test.go`,
   `pkg/api/zone_counters_hide_test.go`,
   `pkg/cli/zone_flood_counters_hide_test.go`, and
