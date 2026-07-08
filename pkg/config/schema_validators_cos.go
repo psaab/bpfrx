@@ -169,6 +169,60 @@ func ValidateByteSizeOrPercent(raw string, _ *Config) error {
 	return ValidateByteSize(raw, nil)
 }
 
+// ValidateCoSBufferSizeTail validates the whole tail of a CoS scheduler
+// `buffer-size` leaf (#4228 Gap 2 follow-up). Junos accepts three
+// mutually-exclusive forms: an absolute byte-size (16m), a percent of the
+// interface buffer pool (10%), or `temporal <microseconds>` (size the buffer
+// by target queue delay). The byte/percent forms preserve the #4217 silent-
+// zero protection (garbage rejected loud); the temporal form is accepted for
+// vSRX-config import parity and compiles to a stored microsecond value the
+// dataplane does not yet resolve to bytes (a commit advisory surfaces the
+// inertness).
+func ValidateCoSBufferSizeTail(tokens []string, _ [][]string) error {
+	const forms = "a byte-size (e.g. 16m), a percent (e.g. 10%), or `temporal <microseconds>`"
+	if len(tokens) == 0 {
+		return fmt.Errorf("missing value (expected %s)", forms)
+	}
+	if tokens[0] == "temporal" {
+		rest := tokens[1:]
+		if len(rest) == 0 {
+			return fmt.Errorf("temporal requires a value in microseconds (e.g. temporal 50000)")
+		}
+		if err := validateCoSTemporalValue(rest[0]); err != nil {
+			return err
+		}
+		for _, t := range rest[1:] {
+			return fmt.Errorf("unknown modifier %q after temporal", t)
+		}
+		return nil
+	}
+	if err := ValidateByteSizeOrPercent(tokens[0], nil); err != nil {
+		return fmt.Errorf("not a valid buffer-size (expected %s): %w", forms, err)
+	}
+	for _, t := range tokens[1:] {
+		return fmt.Errorf("unknown modifier %q", t)
+	}
+	return nil
+}
+
+// validateCoSTemporalValue accepts a `buffer-size temporal` operand: a positive
+// integer number of microseconds. 0 is rejected because a zero delay compiles
+// indistinguishably from "unset"; a non-integer or negative value is garbage.
+func validateCoSTemporalValue(raw string) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("temporal requires a value in microseconds (e.g. temporal 50000)")
+	}
+	v, err := strconv.ParseUint(trimmed, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid temporal %q: expected a whole number of microseconds (e.g. 50000)", raw)
+	}
+	if v == 0 {
+		return fmt.Errorf("temporal must be a positive number of microseconds (0 compiles the same as unset)")
+	}
+	return nil
+}
+
 func parsePercentWithSuffixStrict(raw string) (float64, error) {
 	orig := raw
 	trimmed := strings.TrimSpace(raw)

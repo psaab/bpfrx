@@ -1136,6 +1136,19 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
 					sched.Name))
 			}
+			// #4228 Gap 2 follow-up: buffer-size temporal <us> is typed + stored
+			// (BufferSizeTemporalUS) so garbage is rejected at commit, but the
+			// microsecond target is NOT yet resolved to a byte-size by the
+			// dataplane (that needs the queue's transmit rate, which itself may
+			// be a per-interface percent). Warn so an operator who sets it is not
+			// misled into believing the queue buffer is sized. Mirrors the
+			// accepted-but-inert doctrine used for codel-target and the percent
+			// rate forms.
+			if sched.BufferSizeTemporalUS > 0 {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service scheduler %q buffer-size temporal is accepted for Junos compatibility but inert: xpf does not yet resolve the microsecond target to a byte-size (it needs the queue's transmit rate), so the queue buffer falls back to the default sizing (#4228 Gap 2)",
+					sched.Name))
+			}
 			// #4228 Gap 2: transmit-rate percent now RESOLVES per-interface —
 			// forwarding_build/cos.rs computes the absolute byte/sec rate
 			// against the bound interface's shaping-rate (the multi-pass

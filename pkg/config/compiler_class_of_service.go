@@ -312,7 +312,21 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			case "priority":
 				sched.Priority = nodeVal(child)
 			case "buffer-size":
-				if v := nodeVal(child); v != "" {
+				// #4228 Gap 2 follow-up: `buffer-size temporal <us>` groups the
+				// keyword + value onto the tail (gatherLeafTailTokens flattens the
+				// flat-set container+child), so detect it before the byte/percent
+				// path. temporal is accepted-but-inert — the microsecond value is
+				// stored but not yet resolved to bytes (commit advisory).
+				toks := gatherLeafTailTokens(child)
+				if len(toks) >= 1 && toks[0] == "temporal" {
+					if len(toks) >= 2 {
+						if us, err := strconv.ParseUint(toks[1], 10, 64); err == nil && us > 0 {
+							sched.BufferSizeTemporalUS = us
+							sched.BufferSizeBytes = 0
+							sched.BufferSizePercent = 0
+						}
+					}
+				} else if v := nodeVal(child); v != "" {
 					if percent, err := parsePercentWithSuffixStrict(v); err == nil {
 						sched.BufferSizeBytes = 0
 						sched.BufferSizePercent = percent

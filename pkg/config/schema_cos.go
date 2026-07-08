@@ -123,14 +123,27 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			}),
 			children: nil,
 		},
+		// #4228 Gap 2 follow-up: buffer-size accepts an absolute byte-size
+		// (16m), a percent of the interface buffer pool (10%), OR the Junos
+		// `temporal <microseconds>` form (size the buffer by target queue
+		// delay). The heterogeneous tail is validated as a unit (tailValidator)
+		// because the first token is EITHER a value or the `temporal` keyword —
+		// the generic typed-leaf path cannot express that. temporal compiles to
+		// a stored microsecond value that the dataplane does not yet resolve to
+		// bytes (commit advisory, compiler_validate_warn.go). valueType drives
+		// `?` completion only; validator MUST stay nil so the tail path owns
+		// acceptance. `temporal` is declared as a child purely so `set ...
+		// buffer-size ?` surfaces it.
 		"buffer-size": {
-			desc:          "Queue buffer size (bytes with k/m/g suffix, or percent of the interface buffer pool; percents in one scheduler-map must not exceed 100%)",
+			desc:          "Queue buffer size: bytes (16m), a percent of the interface buffer pool (10%), or `temporal <microseconds>` (target queue delay)",
 			args:          1,
 			valueType:     ValueByteSizeOrPercent,
-			valueDesc:     "Byte-size with explicit k/m/g suffix, or percent of interface CoS burst pool (e.g. 16m, 256k, 10%)",
-			valueExamples: []string{"16m", "256k", "10%"},
-			validator:     ValidateByteSizeOrPercent,
-			children:      nil,
+			valueDesc:     "Byte-size (16m, 256k), percent of interface CoS burst pool (10%), or `temporal <microseconds>`",
+			valueExamples: []string{"16m", "256k", "10%", "temporal"},
+			tailValidator: ValidateCoSBufferSizeTail,
+			children: map[string]*schemaNode{
+				"temporal": {desc: "Size the buffer by target queue delay in microseconds (accepted for Junos compatibility; NOT yet resolved to bytes by the dataplane)", args: 1, placeholder: "<microseconds>", children: nil},
+			},
 		},
 		// `surplus-sharing` (#915) and `equal-flow-enforcement` are
 		// presence-only flags — no value to validate.

@@ -1,3 +1,33 @@
+## 2026-07-07 — #4228 Gap 2 follow-up: accept `buffer-size temporal <us>`
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4228 Gap 2 follow-up — Junos `class-of-service schedulers <s>
+  buffer-size temporal <microseconds>` (size the queue buffer by target delay)
+  was rejected at commit: buffer-size was a plain typed leaf accepting only a
+  byte-size / percent, so the value token `temporal` failed the validator.
+  Converted buffer-size to a whole-tail leaf (mirror of transmit-rate):
+  `tailValidator: ValidateCoSBufferSizeTail` accepts a byte-size (16m), a
+  percent (10%), OR `temporal <us>`, with a `temporal` child for `?`
+  completion. Compiler detects the temporal head via gatherLeafTailTokens and
+  stores `BufferSizeTemporalUS` (new CoSScheduler field); the byte/percent
+  paths are byte-unchanged. ACCEPTED-BUT-INERT — resolving us->bytes needs the
+  queue's transmit rate (which may be a per-interface percent), so a commit
+  advisory surfaces the inertness. golden_4406 UNCHANGED (the corpus has no
+  schedulers, so the new CoSScheduler field never serializes).
+- **File(s)**: pkg/config/types_cos.go, pkg/config/schema_cos.go,
+  pkg/config/schema_validators_cos.go,
+  pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_cos_buffer_temporal_4228_test.go (new),
+  docs/cos-traffic-shaping.md, docs/config-schema.md (stale "temporal NOT
+  carried" note corrected), _Log.md
+- **Validation**: `go test ./pkg/config/...` green (existing buffer-size
+  byte/percent/reject tests still pass after the leaf-shape change);
+  go build ./... clean; gofmt + go vet clean. New RED-on-revert test:
+  `temporal 50000` compiles into BufferSizeTemporalUS (bytes/percent stay 0),
+  the inert advisory fires, byte/percent forms still compile, and `temporal 0`
+  / `temporal abc` / bare `temporal` are rejected at commit.
+
 ## 2026-07-07 — #4228 Gap 4: model `rewrite-rules ieee-802.1` (802.1p PCP egress rewrite)
 
 - **Timestamp**: 2026-07-07

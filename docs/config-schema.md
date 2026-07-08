@@ -1720,8 +1720,12 @@ Rules:
 - **Only type a leaf the compiler actually consumes.** Typing a leaf the
   compiler ignores would make `commit check` reject config the compiler
   would have silently dropped — a behaviour change beyond completion/
-  validation. (This is why scheduler `buffer-size temporal` was NOT carried
-  over: the compiler never reads it.)
+  validation. A leaf the compiler stores into a typed field but the
+  dataplane cannot yet enforce is fine (accepted-but-inert) as long as a
+  commit advisory flags the inertness — e.g. scheduler `buffer-size
+  temporal` (#4228 Gap 2 follow-up) is now carried into
+  `BufferSizeTemporalUS` with an advisory; what the rule forbids is typing a
+  leaf that is silently dropped with no field and no advisory.
 - **Validators live in `pkg/config/schema_validators.go`** and are stateless
   string-checkers reusing the compiler's parsers. Add a generic one
   (`ValidateInteger(min,max)`, `ValidateEnum([...])`, the IP family

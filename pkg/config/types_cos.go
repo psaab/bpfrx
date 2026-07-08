@@ -159,6 +159,15 @@ type CoSScheduler struct {
 	// userspace resolves the scheduler buffer against the interface CoS
 	// burst pool when the scheduler is bound to a queue.
 	BufferSizePercent float64
+	// BufferSizeTemporalUS (#4228 Gap 2 follow-up) carries the Junos
+	// `buffer-size temporal <microseconds>` form: size the queue buffer by a
+	// target queue delay rather than an absolute byte-size or percent. It is
+	// accepted for vSRX-config import parity but ACCEPTED-BUT-INERT — resolving
+	// microseconds to bytes needs the queue's transmit rate (which itself may
+	// be a percent resolved per bound interface), so xpf does not yet
+	// materialize a byte-size from it (a commit advisory surfaces the
+	// inertness). Mutually exclusive with BufferSizeBytes / BufferSizePercent.
+	BufferSizeTemporalUS uint64
 	// SurplusSharing (#915) lifts the surplus-phase skip on
 	// transmit-rate exact queues so they can draw from the root
 	// shaper's surplus tokens once their own bucket is empty.
