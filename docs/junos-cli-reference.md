@@ -1149,7 +1149,12 @@ its logging/inversion intent (#3684):
   - `log <modes>` -- the session-log triggers (`at-create`, `at-close`) via
     the shared `PolicyLog.SessionLogModes` SSOT (#3667). The `[default]` row
     reflects `default-policy-log session-init/session-close` (#3534), the log
-    posture for flows that hit the implicit default verdict (M13).
+    posture for flows that hit the implicit default verdict (M13). NOTE: this
+    line shows the CONFIGURED modes even on a `then deny`/`then reject` policy,
+    where they are inert -- a deny/reject installs no session, so no
+    session-init/session-close record fires (the deny is logged via the
+    policy-deny RT_FLOW record). Commit emits a WARN naming the inert selection
+    (#4373); `then log` session records fire only for a `then permit` policy.
   - `count` -- the policy has `then count` hit-count accounting.
   - `source-address (except)` / `destination-address (except)` -- a Junos
     `source-address-excluded` / `destination-address-excluded` inverted match
