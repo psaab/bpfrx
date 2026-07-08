@@ -844,7 +844,34 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// identically. This is the deliberate asymmetry with the Phase-2
 		// IPsec proposal below, whose compiler does NOT strip the prefix
 		// and therefore validates dh-group as a plain positive integer.
-		"proposal": {desc: "IKE proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
+		// #4313 — closed-world flip (Phase-1 IKE proposal crypto). The Junos
+		// `security ike proposal <name>` grammar is LEAF-COMPLETE after adding
+		// `description` below: the full keyword set is exactly
+		// authentication-method, authentication-algorithm, dh-group,
+		// encryption-algorithm, lifetime-seconds, and description — all modeled
+		// here. The compiler (compiler_ipsec.go, the IKE proposal loop) reads a
+		// STRICT SUBSET of those (authentication-method / encryption-algorithm /
+		// authentication-algorithm / dh-group / lifetime-seconds); `description`
+		// is cosmetic and compiler-ignored. Every modeled leaf carries its value
+		// on the same statement line (no nested value block in Junos), so
+		// closed-world never descends into an AST child of a value leaf in
+		// EITHER parser shape — it cannot false-reject a valid config (the #4191
+		// class the umbrella warns about). Phase-1 has no lifetime-kilobytes
+		// (that is a Phase-2/ESP volume-rekey knob), so — unlike the sibling
+		// `security ipsec proposal` — this subtree is complete with description
+		// alone.
+		//
+		// Silent-drop here FAILS OPEN on crypto: a fat-fingered
+		// `encryption-algorith aes-256-cbc` or `authentication-algoritm sha-256`
+		// used to commit clean, the compiler then found no such child, and the
+		// IKE Phase-1 SA negotiated WITHOUT the operator's chosen cipher/hash —
+		// a silent downgrade to whatever the proposal (or a proposal-set
+		// default) still carried, believed to be aes-256 while it was not. The
+		// flip REJECTS the typo at strict operator commit (SchemaValidate); the
+		// tolerant Store.Load / SyncApply path downgrades the reject to a warning
+		// (#1960, configstore compileTreeLenient), so a stored or peer-synced
+		// config is never bricked.
+		"proposal": {desc: "IKE proposal name", args: 1, placeholder: "<proposal-name>", closedWorld: true, children: map[string]*schemaNode{
 			"authentication-method": {desc: "IKE authentication method", args: 1, placeholder: "<method>",
 				valueType: ValueEnumOf, valueDesc: "IKE phase 1 authentication method",
 				valueExamples: []string{"pre-shared-keys", "rsa-signatures", "ecdsa-signatures"},
@@ -857,6 +884,13 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"lifetime-seconds": {desc: "IKE SA lifetime in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "IKE SA lifetime in seconds",
 				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},
+			// #4313: modeled so the closed-world flip is LEAF-COMPLETE. Junos
+			// allows a cosmetic `description` on an IKE proposal; xpf ignores it
+			// at compile (the IKE proposal loop has no case for it), but it MUST
+			// be modeled or closed-world would false-reject a valid config that
+			// carries it. scalar:true rejects a trailing token (#3332) — a
+			// multi-word description must be quoted.
+			"description": {desc: "Proposal description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		}},
 		"policy": {desc: "IKE policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 			// #3896: type mode/version/nat-traversal so a typo fails closed at

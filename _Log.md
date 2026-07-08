@@ -1,3 +1,61 @@
+## 2026-07-07 — #4373 (E1): WARN when `then log session-close` is inert on a deny/reject policy
+
+- **Timestamp**: 2026-07-07
+- **Action**: avo-review-007 E1 — an operator who writes a named/global policy
+  `then reject; then log session-close` expecting a close record is confused
+  when none appears: a deny/reject verdict installs NO session, so the RT_FLOW
+  SESSION_CREATE/SESSION_CLOSE records those flags request never fire (the deny
+  is logged unconditionally via the policy-deny RT_FLOW record —
+  `userspace-dp` `emit_policy_deny_event` fires on every non-permit verdict,
+  never gated on a per-policy log flag; VERIFIED in the Rust source). The log
+  RENDERING side was already unambiguous (SESSION_CLOSE omits the action byte
+  #2513; POLICY_DENY carries a distinct reason #3610). The GAP was config-time:
+  the default-policy analog (`validateDefaultPolicyLogWarnings`, #3534) warns on
+  a deny-all/reject-all default, but there was NO per-policy equivalent. Added
+  `validatePolicyLogInertOnDenyWarnings` — a WARN-only commit advisory for each
+  named or global policy with action deny/reject that carries a
+  session-init/session-close `then log` selection, naming the inert mode(s) and
+  verdict. WARN-only (valid Junos; #1960 no-brick). Wired into `ValidateConfig`
+  right after the #3534 default-policy analog.
+- **File(s)**: pkg/config/compiler_validate_warn.go (new
+  `validatePolicyLogInertOnDenyWarnings` + ValidateConfig wiring),
+  pkg/config/compiler_policy_log_inert_deny_4373_test.go (new),
+  docs/config-schema.md (#4373 subsection), docs/junos-cli-reference.md
+  (`show security zones` log-modes note), _Log.md
+- **Validation**: `go test ./pkg/config/ ./pkg/logging/` green;
+  RED-on-revert confirmed (removing the ValidateConfig append →
+  TestPolicyLogInertOnDenyWarns FAILs on all 4 deny/reject cases; permit +
+  no-log negatives stay green); `go build`, gofmt, `go vet` clean. Rust
+  dataplane unchanged — the E4/H2/H7 live NoRoute/martian drop counter remains
+  a deferred `userspace-dp` (Rust) slice (E4/H2/H7 Go simulator half shipped in
+  #4504); E6 ext-header-denied counter is likewise a Rust concern.
+
+## 2026-07-07 — #4621 fsatomic canary: convert archive staging write to WriteFileAtomic
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fix BROKEN-MASTER — `pkg/fsatomic/TestNoDirectOsWriteFile`
+  (the #1916 repo-wide AST canary) failed on clean master, flagging a direct
+  `os.WriteFile` at `pkg/daemon/daemon_flow.go:327` in
+  `Daemon.archiveToSites`. DIAGNOSIS: that write stages the CURRENT active
+  config (`store.ShowActive()`, may contain encrypted secrets → 0600) into a
+  fresh `os.MkdirTemp` dir, then SCPs it to the archive-sites and deletes the
+  temp dir after all uploads finish. It is NOT DurableState (deleted after
+  transfer; power-loss fsync is pointless on a transient copy) and NOT a
+  BestEffortKernelKnob (a regular tmpfs file — rename works; the allowlist is
+  strictly reserved for procfs/sysfs/bind-mount where rename is impossible by
+  construction). It is AtomicGeneratedConfig. FIX: converted the call to
+  `fsatomic.WriteFileAtomic` (temp-sibling `.<base>.tmp-*` + rename, NO fsync).
+  The rename target IS `srcPath`, so the historical remote basename (default
+  `xpf.conf`) is preserved and a reader never observes a torn file. Added a
+  rationale comment at the call site documenting the classification. Added
+  `TestArchiveConfigStagesAtomically` pinning (a) the historical basename
+  survives the rename and (b) no `.xpf.conf.tmp-*` scratch sibling leaks.
+- **File(s)**: pkg/daemon/daemon_flow.go (import + call),
+  pkg/daemon/archive_atomic_4621_test.go (new), _Log.md
+- **Validation**: `go test ./pkg/fsatomic/ -run TestNoDirectOsWriteFile` now
+  GREEN (was RED on master); `go test ./pkg/daemon/... ./pkg/fsatomic/` green;
+  `go build ./...`, gofmt, `go vet` clean.
+
 ## 2026-07-07 — #2562 NAT64 fail-closed ICMP/ICMPv6 fragment drop + `nat64_frag_dropped` counter
 
 - **Timestamp**: 2026-07-07
@@ -41233,3 +41291,65 @@ top.
     3732/0.
   - **File(s)**: userspace-dp/src/afxdp/frame/tests.rs,
     userspace-dp/src/filter/tests.rs, _Log.md
+## 2026-07-07 — #4313 closed-world flip: security ike proposal (Phase-1 crypto)
+
+- **Timestamp**: 2026-07-07
+- **Action**: Extended the #4313 per-subtree closed-world closure (after PR-B
+  destination-NAT then, PR-C IPsec option containers, #4578 master-password) by
+  flipping the Phase-1 IKE proposal container
+  (`security ike proposal <name>`) to `closedWorld: true`. First modeled the one
+  missing Junos leaf (`description`, cosmetic/compiler-ignored, scalar) so the
+  subtree is LEAF-COMPLETE: full grammar = authentication-method /
+  authentication-algorithm / dh-group / encryption-algorithm / lifetime-seconds
+  / description, all modeled; the compiler (compiler_ipsec.go IKE proposal loop)
+  reads a strict subset. Phase-1 has no lifetime-kilobytes (a Phase-2/ESP knob),
+  so — unlike the sibling `security ipsec proposal`, which stays deferred pending
+  both description AND lifetime-kilobytes — description alone completes it.
+  Silent-drop here FAILS OPEN on crypto: a typo'd encryption/authentication
+  algorithm used to commit clean and negotiate the IKE SA WITHOUT the operator's
+  chosen cipher/hash (silent downgrade). The flip rejects the typo at strict
+  commit (SchemaValidate); the tolerant Store.Load / SyncApply path downgrades
+  to a warning (compileTreeLenient, #1960 — verified no-brick). RED-on-revert
+  verified: with closedWorld reverted, the reject/typo/lenient-precondition
+  tests fail (silently accepted) while AcceptsValid stays green (no
+  false-reject). go test ./pkg/config/... ./pkg/configstore/... green (golden
+  4406 unchanged — schema-only + compiler-ignored child); go build ./... clean;
+  gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go,
+  pkg/config/schema_closedworld_ike_proposal_4313_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #3651 — per-zone traffic + flood counter POPULATE. VERIFY-FIRST
+  on master: the userspace dataplane does NOT publish per-zone counters over
+  the wire (`ProcessStatus` carries no per-zone block;
+  `SetZoneCounterOffset`/`SetFloodCounterOffset` populate hook is wired on
+  `loader.go`/`maps_counters.go`/`maps_screen.go` but sourced only by tests).
+  So the populate needs the deferred Rust counter-publish (out of scope; cargo
+  lane busy) — the Go-only slice is DOC + surfacing-what's-available. Found the
+  real gap: four production files (pkg/api/README.md,
+  pkg/api/metrics_counters.go, pkg/api/types.go, pkg/dataplane/loader.go) cite
+  `docs/research/3643-dead-counters/plan.md §5A/§5B`, but that doc lived only on
+  the unmerged research/3643-dead-counters branch — dangling on master.
+  Restored the whole research dir (convention: plan.md + reviewer transcripts +
+  reviewer-ids.md, matching every other docs/research/<n>/), prepended a
+  "§0 Status update" to plan.md (HIDE shipped #3643; POPULATE deferred #3651;
+  substitutes; DERIVE-rejected). Added an operator-facing "Deferred
+  Observability — per-zone traffic + flood counters (#3651)" subsection to
+  docs/userspace-dataplane-gaps.md (current not-available state, the wired
+  populate hook, the §5A wire-plumbing design, live substitutes: global +
+  per-interface Bindings RX/TX + per-policy #2118 + per-screen-reason #3343).
+  Sharpened README's vague "follow-up enhancement issue" -> tracker #3651. Added
+  a RED-on-revert guard (pkg/api/zone_counter_doc_ref_test.go): the cited design
+  doc must exist on master with its §5A/§5B/#3651 anchors — deleting it (which
+  re-dangles the four in-code refs) fails the test. RED-on-revert verified (doc
+  hidden -> FAIL; restored -> PASS). No render-text churn: the HIDE surfaces
+  already render a consistent, honest "not available" across CLI/gRPC/REST, and
+  the only per-zone stat available on the Go side is the rejected DERIVE, so the
+  surfacing is the doc's substitute pointers. go test
+  ./pkg/cli/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/dataplane/ green; go build
+  clean; gofmt clean (pre-existing cli.go:503 vet note untouched).
+- **File(s)**: docs/research/3643-dead-counters/plan.md (+ agy-r1.md,
+  codex-r1.md, claude-smr-plan-r1.md, reviewer-ids.md restored),
+  docs/userspace-dataplane-gaps.md, pkg/api/README.md,
+  pkg/api/zone_counter_doc_ref_test.go, _Log.md

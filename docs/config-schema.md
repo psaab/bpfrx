@@ -936,11 +936,51 @@ AND the value validator). As with the other flips, the reject fires only on the
 strict commit path; `compileTreeLenient` downgrades it to a warning on
 `Store.Load` / `SyncApply`.
 
+**More production flips — `security ike proposal` (Phase-1 crypto, #4313).**
+The Phase-1 IKE proposal container (`security ike proposal <name>`) now sets
+`closedWorld:true` (`schema_security.go`) after adding the one missing leaf
+that made it leaf-complete. The completeness audit that gates the flip:
+
+- The full Junos `security ike proposal <name>` grammar is exactly
+  `authentication-method`, `authentication-algorithm`, `dh-group`,
+  `encryption-algorithm`, `lifetime-seconds`, and `description`. The first five
+  were already modeled; this change models `description` (cosmetic, scalar,
+  compiler-ignored) so the closed subtree does not false-reject a valid proposal
+  that carries it. The compiler (`compiler_ipsec.go`, the IKE proposal loop)
+  reads a STRICT SUBSET of the modeled set (the five crypto leaves; description
+  falls through its switch), so closing carries no false-reject risk (the #4191
+  class). Phase-1 has **no** `lifetime-kilobytes` — that is a Phase-2/ESP
+  volume-rekey knob — so, unlike the sibling `security ipsec proposal`, this
+  subtree is complete with `description` alone.
+- Every modeled leaf carries its value on the same statement line (no nested
+  value block in Junos), so closed-world never descends into an AST child of a
+  value leaf in EITHER parser shape.
+- Silent-drop here FAILS OPEN on crypto: a fat-fingered `encryption-algorith`
+  or `authentication-algoritm` used to commit clean, the compiler then found no
+  such child, and the Phase-1 SA negotiated WITHOUT the operator's chosen
+  cipher/hash — a silent downgrade to whatever the proposal (or a proposal-set
+  default) still carried, believed to be aes-256 while it was not. The flip
+  rejects the typo at strict commit; the tolerant `Store.Load` / `SyncApply`
+  path downgrades it to a warning (`compileTreeLenient`, #1960). Production
+  tests: `schema_closedworld_ike_proposal_4313_test.go` (RED on revert of the
+  flag; the lenient-no-brick case is covered too).
+
+**The systematic per-subtree closure continues (#4313).** Each of the flips
+above (destination-NAT then, the three IPsec option containers, master-password,
+now the Phase-1 IKE proposal) closes one leaf-complete high-risk subtree; the
+blanket-default flip stays deferred (it would break the deliberately-lenient
+accept-with-advisory knobs #2078/#4231 and false-reject valid-but-unmodeled
+Junos, the #4191 class). Both the remaining per-subtree flips and the
+blanket-flip doctrine decision remain tracked on #4313.
+
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
 `closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
 Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;
-`security ipsec proposal` / `security ike proposal` — INCOMPLETE: Junos allows a
-`description` leaf, unmodeled; `security nat static … then static-nat` —
+`security ipsec proposal` — INCOMPLETE: Junos allows a `description` leaf AND a
+`lifetime-kilobytes` volume-rekey leaf, both unmodeled (the Phase-1 IKE proposal
+above is now closed — it has no `lifetime-kilobytes`, so `description` alone
+completed it, but the Phase-2 ESP proposal needs both modeled first);
+`security nat static … then static-nat` —
 UNSAFE: `static-nat` is a free-form leaf and the Junos hierarchical form
 `static-nat { prefix { … } }` would false-reject under closed-world; `security
 screen ids-option` — INCOMPLETE, deliberately open-world; `protocols {ospf,bgp}
@@ -3359,6 +3399,43 @@ Regression coverage: `pkg/config/compiler_default_policy_log_3534_test.go`
 and Rust `policy::tests::default_verdict_carries_default_policy_log_flags` +
 `afxdp::tests::build_forwarding_state_threads_default_policy_log_flags` +
 the `wire_invariant_default_specimens` fixture.
+
+### #4373 — `then log session-init|session-close` inert on a deny/reject policy (WARN)
+
+avo-review-007 E1. The per-policy analog of the #3534 default-policy advisory
+above. An operator writes a NAMED or GLOBAL policy `then reject; then log
+session-close` expecting an RT_FLOW close record when the flow is rejected — but
+a **deny/reject verdict installs no session**, so the requested
+RT_FLOW_SESSION_CREATE / RT_FLOW_SESSION_CLOSE records never fire (session-close
+has no session to close). The deny is logged unconditionally via the RT_FLOW
+**policy-deny** record instead (`userspace-dp` `emit_policy_deny_event` fires on
+every non-permit verdict, never gated on a per-policy log flag), so `then log
+session-init` is redundant and `then log session-close` is inert. Per-policy
+`then log` session records fire only for a **`then permit`** policy, whose
+admitted session the dataplane stamps the log flags onto at install (the #2508
+path). Without a signal the policy REPORTS session-close logging on every
+operator surface (REST/gRPC/CLI) yet produces no close record — a silent
+observability gap that reads as a bug.
+
+**Advisory (WARN):** `validatePolicyLogInertOnDenyWarnings`
+(`compiler_validate_warn.go`) emits a WARN-only commit-time message for each
+named/global policy whose action is deny/reject and that carries a
+session-init/session-close `then log` selection, naming the inert mode(s) and
+the verdict. Never an error — `then log` on a deny/reject is valid Junos and a
+hard reject would brick a previously-committed config (#1960 no-brick). This is
+distinct from the bare-`then log` gate (`validatePolicyLogActionStrict`, #3060),
+which still hard-rejects a `then log` naming neither mode. The log RENDERING side
+of the same confusion (a reject is logged as `POLICY_DENY` / `FILTER_LOG
+action=reject`, never a misleading `SESSION_CLOSE`) was already unambiguous —
+`SESSION_CLOSE` omits the action byte (#2513) and `POLICY_DENY` carries a
+distinct reason (#3610); this advisory closes the remaining CONFIG-time
+confusion. The E4/H2/H7 route-drop-before-policy half of avo-review-007 shipped
+separately (#4504); the live NoRoute/martian drop counter remains a deferred
+`userspace-dp` (Rust) slice.
+
+Regression coverage: `pkg/config/compiler_policy_log_inert_deny_4373_test.go`
+(zone-pair + global deny/reject warn fail-on-revert; permit + no-log negative
+gates).
 
 ### #2401 — Security-policy undefined-zone references (commit fail-closed)
 
