@@ -107,7 +107,116 @@ func (s *Store) Load() error {
 	s.active = tree
 	s.compiled = compiled
 	s.loadRollbackHistory()
+	s.recoverPendingConfirmLocked()
 	return nil
+}
+
+// recoverPendingConfirmLocked restores a commit-confirmed window that was
+// still pending when the daemon last stopped (#4577). The in-memory
+// time.AfterFunc rollback timer does not survive a process restart, so without
+// this an UNCONFIRMED config that the operator armed with `commit confirmed`
+// (relying on it to auto-revert) becomes PERMANENT after a crash/reboot inside
+// the window — the safety hatch is silently lost and a management-stranding
+// config can lock the operator out. Junos persists the pending confirm across
+// a reboot and rolls back if it is not confirmed; this gives xpf the same
+// property.
+//
+// Runs at the tail of a SUCCESSFUL Load (active.json read+compiled), under
+// s.mu. Two outcomes:
+//   - deadline already passed during downtime -> roll back to the persisted
+//     prev tree NOW (the operator never confirmed) exactly as the in-memory
+//     PromoteRollback would have, including the #1922 Item 1b first-commit
+//     never-committed marker, then clear the state.
+//   - deadline still in the future -> re-arm the timer for the REMAINING
+//     duration so the original auto-rollback still fires; a clean restart
+//     inside the window therefore also keeps the hatch.
+func (s *Store) recoverPendingConfirmLocked() {
+	if s.db == nil {
+		return
+	}
+	rec, err := s.db.ReadConfirm()
+	if err != nil {
+		slog.Warn("failed to read persisted commit-confirmed state; cannot restore the "+
+			"pending auto-rollback window", "err", err, "issue", "#4577")
+		return
+	}
+	if rec == nil {
+		return
+	}
+	prevTree := rec.PrevTree
+	if prevTree == nil {
+		prevTree = &config.ConfigTree{}
+	}
+
+	if time.Now().After(rec.Deadline) {
+		// Expired during downtime: the operator never confirmed, so the
+		// unconfirmed config on disk must NOT stand. Revert to the prev tree
+		// with the same persistence semantics as PromoteRollback.
+		s.active = prevTree
+		var perr error
+		if rec.FirstCommit {
+			// #1922 Item 1b: the rollback target is the empty bootstrap tree;
+			// persist committed=0 and clear everCommitted so a later restart
+			// re-classifies into bootstrap, not operator-committed-empty.
+			s.compiled = nil
+			s.persistMarkerCommitted = false
+			s.everCommitted = false
+			perr = s.writeActiveMarker(prevTree, false)
+		} else {
+			compiled, cerr := s.compileTreeLenient(prevTree)
+			if cerr != nil {
+				slog.Warn("recovered commit-confirmed rollback target failed to compile; "+
+					"continuing with the reverted tree", "err", cerr, "issue", "#4577")
+			}
+			s.compiled = compiled
+			s.persistMarkerCommitted = true
+			s.everCommitted = true
+			perr = s.writeActive(prevTree)
+		}
+		if perr != nil {
+			s.noteActivePersistFailureLocked("confirm_recovery_rollback", perr)
+		} else {
+			s.persistDegraded = false
+		}
+		if s.candidate != nil {
+			s.candidate = s.active.Clone()
+		}
+		s.removeConfirmState()
+		s.journalLog(&JournalEntry{
+			Action:     "auto_rollback",
+			Detail:     "commit-confirmed window expired during daemon downtime; reverted on boot (#4577)",
+			ConfigHash: journalConfigHash(s.active),
+		})
+		slog.Warn("commit-confirmed window expired while the daemon was down; configuration "+
+			"rolled back to the pre-confirm state on boot", "issue", "#4577")
+		return
+	}
+
+	// Still within the window: re-arm the timer for the remaining duration so
+	// the original auto-rollback still fires. The active config loaded above
+	// stays the unconfirmed tree; only confirmPrevTree/confirmPrevCfg (the
+	// rollback target) are restored so a subsequent expiry / plain-commit /
+	// sync resolves correctly. confirm.json is left in place until the window
+	// is resolved.
+	remaining := time.Until(rec.Deadline)
+	s.confirmPrevTree = prevTree
+	if rec.FirstCommit {
+		s.confirmPrevCfg = nil
+	} else {
+		compiled, cerr := s.compileTreeLenient(prevTree)
+		if cerr != nil {
+			slog.Warn("recovered commit-confirmed rollback target failed to compile; the "+
+				"pending auto-rollback will revert store state only", "err", cerr, "issue", "#4577")
+		}
+		s.confirmPrevCfg = compiled
+	}
+	s.confirmGen++
+	gen := s.confirmGen
+	s.confirmTimer = time.AfterFunc(remaining, func() {
+		s.fireConfirmTimer(gen)
+	})
+	slog.Info("restored pending commit-confirmed window after restart; auto-rollback re-armed",
+		"remaining", remaining.String(), "issue", "#4577")
 }
 
 // Save persists the active configuration to disk.

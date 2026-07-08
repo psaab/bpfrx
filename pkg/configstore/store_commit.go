@@ -266,12 +266,55 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	// performAutoRollback.
 	s.confirmGen++
 	gen := s.confirmGen
+	deadline := time.Now().Add(time.Duration(minutes) * time.Minute)
 	s.confirmTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
 		s.fireConfirmTimer(gen)
 	})
 
+	// #4577: persist the pending-confirm state so the auto-rollback deadline
+	// survives a daemon crash/reboot inside the window. The in-memory timer
+	// above is lost on restart; without confirm.json the just-promoted (and
+	// still UNCONFIRMED) config would become permanent. Written AFTER the
+	// successful writeActive+promote so a FAILED commit-confirmed never leaves
+	// a confirm.json (persist-before-promote already returned above on
+	// failure). PrevTree is confirmPrevTree — the ORIGINAL last-confirmed tree
+	// for a nested re-arm; firstCommit mirrors the confirmPrevCfg==nil #1922
+	// Item 1b path. A residual crash window remains between the writeActive
+	// syscall and this write (microseconds vs. the whole multi-minute window
+	// before this fix).
+	s.writeConfirmState(s.confirmPrevTree, deadline, s.confirmPrevCfg == nil)
+
 	slog.Info("commit confirmed started", "timeout_minutes", minutes)
 	return compiled, nil
+}
+
+// writeConfirmState persists the pending commit-confirmed state (#4577) so the
+// auto-rollback deadline + rollback target survive a daemon crash/reboot.
+// Best-effort: a failure is logged, not fatal — the in-memory timer still
+// covers the no-crash case (the #1799 degrade-not-fail doctrine). Caller holds
+// s.mu.
+func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Time, firstCommit bool) {
+	if s.db == nil {
+		return
+	}
+	rec := &confirmRecord{Deadline: deadline, PrevTree: prevTree, FirstCommit: firstCommit}
+	if err := s.db.WriteConfirm(rec); err != nil {
+		slog.Warn("failed to persist commit-confirmed state; auto-rollback will not "+
+			"survive a crash within the confirm window", "err", err, "issue", "#4577")
+	}
+}
+
+// removeConfirmState deletes the persisted pending commit-confirmed state
+// (#4577). Called whenever a pending confirm is RESOLVED — confirmed (plain
+// commit / HA sync / explicit confirm / demotion) or rolled back (timer
+// fired). Best-effort; caller holds s.mu.
+func (s *Store) removeConfirmState() {
+	if s.db == nil {
+		return
+	}
+	if err := s.db.DeleteConfirm(); err != nil {
+		slog.Warn("failed to remove persisted commit-confirmed state", "err", err, "issue", "#4577")
+	}
 }
 
 // clearPendingConfirmLocked cancels an armed commit-confirmed rollback
@@ -302,6 +345,13 @@ func (s *Store) clearPendingConfirmLocked() bool {
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
 	s.confirmPrevCfg = nil
+	// #4577: the pending confirm is now confirmed (plain commit / HA sync /
+	// explicit confirm / demotion) — drop the persisted crash-recovery state
+	// so a later restart does not resurrect a stale rollback window. A nested
+	// confirmed re-arm does NOT pass through here (it re-writes confirm.json
+	// with the extended deadline in CommitConfirmed), so this only fires on a
+	// genuine confirmation.
+	s.removeConfirmState()
 	return true
 }
 
@@ -469,6 +519,14 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	} else {
 		s.persistDegraded = false
 	}
+
+	// #4577: the confirm window is resolved (rolled back) — drop the persisted
+	// crash-recovery state so a restart does not re-arm/re-roll a completed
+	// window. Idempotent: a crash between the writeActive above and this
+	// remove leaves a confirm.json whose deadline has passed and whose
+	// rollback target equals the now-persisted active, so a Load recovery
+	// re-runs the rollback as a no-op.
+	s.removeConfirmState()
 
 	// Log to journal
 	s.journalLog(&JournalEntry{

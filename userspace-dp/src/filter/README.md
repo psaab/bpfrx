@@ -128,6 +128,27 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   matched count term (the earlier fall-through count terms were silently
   under-counted on the cached path only).
 
+  The same accumulate-all-fall-through-terms contract applies to
+  three-color policers via `CachedThreeColorPolicers`. Every matched
+  fall-through term's `then policer` runtime is folded into the cached
+  TX-selection result (deduped by policer `id`) and re-metered on each
+  cached replay (`apply_cached_three_color_policers` → `for_each`), so a
+  flow escapes NO term's committed/peak rate limit on the cached path.
+  Like `CachedFilterCounters`, the container is a `SmallVec<[_; 2]>`
+  (built once at flow-cache install, only `for_each`-read on the
+  per-packet replay), so the common single/dual-policer case records with
+  no heap allocation and any spill to the heap for >2 policers happens off
+  the packet hot path. **Before #4566 this was a fixed two-`Option`
+  (`first`/`second`) layout that SILENTLY DROPPED the 3rd (and beyond)
+  fall-through policer on the cached path** — a flow with >=3 fall-through
+  three-color policer terms escaped the 3rd+ term's rate limit on every
+  cached packet (rate-limit slack, not a permit/deny bypass; the uncached
+  full-eval path always metered each). Growing the array (option a) was
+  chosen over declining the flow-cache for such flows (option b): the
+  cached-path replay already iterates a variable count via `for_each`, the
+  spill is off the hot path, and this keeps the cached and live paths
+  meter-identical for ALL policer counts rather than diverging above two.
+
   **No-match default is implicit ACCEPT — a deliberate divergence from
   Junos (#3295).** When a packet matches NO term in a filter, the
   evaluation returns `FilterResult::default()`, whose action is

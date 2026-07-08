@@ -17,8 +17,13 @@ package config
 // the compiler silently drop the instance, but these ids are
 // cross-referenced from other subsystems — e.g. class-of-service
 // `interfaces <if> unit <n>` — and deserve one dedicated pass that
-// types every referencing slot together), `track-interface
-// priority-cost`
+// types every referencing slot together). NOTE (#4573): the SCHEMA
+// deferral above is only safe for NON-numeric garbage; an
+// OUT-OF-RANGE NUMERIC `vrrp-group <id>` is bounded by a semantic
+// commit gate on the compiled *Config — `validateVRRPGroupIDStrict`
+// (`compiler_validate_strict_vrrp.go`), the RFC 5798 VRID-range 1..255
+// analog of the chassis `validateChassisClusterStrict` (#4434) — NOT
+// through this schema walker. `track-interface priority-cost`
 // (already strict-rejected by the #1814 AST pre-walk in the
 // compiler — typing here would shadow those curated errors), the
 // dhcp/dhcpv6 client knobs and tunnel keepalives (deferred:

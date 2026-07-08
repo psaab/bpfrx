@@ -1710,7 +1710,32 @@ reserved for whole-dataplane selection where a rewrite shim
   groups are keyed `<address-CIDR>_grp<id>`, so a dual-stack unit may
   carry an `inet` AND an `inet6` vrrp-group with the SAME group id without
   collision (the address strings differ → two distinct
-  `unit.VRRPGroups` entries). **#2850 — `preempt hold-time`:** the
+  `unit.VRRPGroups` entries). **#4573 — VRRP VRID range gate:** the
+  `vrrp-group <id>` instance-name slot stays an unvalidated identity
+  token in the schema (same deferral class as `redundancy-group <id>`),
+  but a *semantic* commit-time cap now bounds it —
+  `validateVRRPGroupIDStrict` in `compiler_validate_strict_vrrp.go`,
+  the exact sibling of the chassis `validateChassisClusterStrict`
+  (#4434). The VRRP VRID is a single wire byte (RFC 5798 §5.2.3, valid
+  range 1..255): the native engine truncates the configured id onto it
+  (`uint8(vi.cfg.GroupID)`, `pkg/vrrp/instance.go`), so `vrrp-group 256`
+  wrapped to the RESERVED VRID 0 (a strict RFC peer such as Juniper
+  discards the advert → the VIP never masters → HA cold-boot blackhole)
+  and 257 aliased VRID 1 onto an unrelated group. Non-numeric garbage was
+  always dropped by `parseVRRPGroups`, but an out-of-range NUMERIC id
+  used to produce a live wrong-VRID instance — that asymmetry is closed.
+  Like the #4434 gate it runs on the compiled `*Config`, NOT the schema
+  walker (so it does not change the identity-token typing decision), and
+  the tolerant load / peer-sync path downgrades it to a warning
+  (`lenientVRRPGroupID`, #1960 no-brick) with a defensive runtime range
+  check at instance creation (`pkg/vrrp` `MinVRID`/`MaxVRID`,
+  `manager.go UpdateInstances`) that refuses to advertise an
+  out-of-range VRID for a value that slips through the lenient path.
+  B-002 companion: the `priority`/`preempt hold-time`/`advertise-interval`
+  parse in `parseVRRPGroups` no longer swallows an `strconv.Atoi` error
+  with `_ =` — a bad parse kept the constructor default (priority 100)
+  instead of silently resetting to 0 (the RFC 5798 resignation value).
+  **#2850 — `preempt hold-time`:** the
   `vrrp-group <id> preempt` leaf gained a nested `hold-time <seconds>`
   child (`schema_interfaces.go`, typed `ValidateInteger(1, 3600)`), Junos
   `set interfaces <if> unit <n> family inet vrrp-group <id> preempt

@@ -728,7 +728,14 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 			case "priority":
 				if i+1 < len(keys) {
 					i++
-					vg.Priority, _ = strconv.Atoi(keys[i])
+					// #4573: only overwrite on a clean parse. A swallowed
+					// Atoi error (`_ =`) used to reset Priority to 0 — the
+					// RFC 5798 resignation value — on the lenient / HA-sync
+					// path; keep the constructor default (100) or the prior
+					// value instead of silently resigning the group.
+					if n, err := strconv.Atoi(keys[i]); err == nil {
+						vg.Priority = n
+					}
 				}
 			case "preempt":
 				vg.Preempt = true
@@ -737,7 +744,10 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 				// shape: ... preempt hold-time 30. Consume the
 				// optional `hold-time <n>` pair when present.
 				if i+2 < len(keys) && keys[i+1] == "hold-time" {
-					vg.PreemptHoldTime, _ = strconv.Atoi(keys[i+2])
+					// #4573: keep the prior value on a bad parse (`_ =`).
+					if n, err := strconv.Atoi(keys[i+2]); err == nil {
+						vg.PreemptHoldTime = n
+					}
 					i += 2
 				}
 			case "accept-data":
@@ -745,7 +755,10 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 			case "advertise-interval":
 				if i+1 < len(keys) {
 					i++
-					vg.AdvertiseInterval, _ = strconv.Atoi(keys[i])
+					// #4573: keep the prior value on a bad parse (`_ =`).
+					if n, err := strconv.Atoi(keys[i]); err == nil {
+						vg.AdvertiseInterval = n
+					}
 				}
 			case "authentication-type":
 				if i+1 < len(keys) {
@@ -814,7 +827,12 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 				}
 			case "priority":
 				if v := nodeVal(prop); v != "" {
-					vg.Priority, _ = strconv.Atoi(v)
+					// #4573: only overwrite on a clean parse — see the
+					// flat-set arm above (a swallowed Atoi would resign the
+					// group at priority 0 on the lenient path).
+					if n, err := strconv.Atoi(v); err == nil {
+						vg.Priority = n
+					}
 				}
 			case "preempt":
 				vg.Preempt = true
@@ -826,16 +844,24 @@ func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
 				// (immediate).
 				if ht := prop.FindChild("hold-time"); ht != nil {
 					if v := nodeVal(ht); v != "" {
-						vg.PreemptHoldTime, _ = strconv.Atoi(v)
+						// #4573: keep the prior value on a bad parse (`_ =`).
+						if n, err := strconv.Atoi(v); err == nil {
+							vg.PreemptHoldTime = n
+						}
 					}
 				} else if len(prop.Keys) >= 3 && prop.Keys[1] == "hold-time" {
-					vg.PreemptHoldTime, _ = strconv.Atoi(prop.Keys[2])
+					if n, err := strconv.Atoi(prop.Keys[2]); err == nil {
+						vg.PreemptHoldTime = n
+					}
 				}
 			case "accept-data":
 				vg.AcceptData = true
 			case "advertise-interval":
 				if v := nodeVal(prop); v != "" {
-					vg.AdvertiseInterval, _ = strconv.Atoi(v)
+					// #4573: keep the prior value on a bad parse (`_ =`).
+					if n, err := strconv.Atoi(v); err == nil {
+						vg.AdvertiseInterval = n
+					}
 				}
 			case "authentication-type":
 				vg.AuthType = nodeVal(prop)
