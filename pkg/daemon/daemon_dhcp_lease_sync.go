@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -53,6 +55,23 @@ const (
 	// before seeding on takeover.
 	dhcpLeaseSeedSocketWait = 10 * time.Second
 )
+
+// dhcpLeaseSyncState groups the #2239 HA DHCP-server lease-sync (PATH C)
+// runtime state that used to live as flat dhcpLease* fields on Daemon
+// (#4407 god-struct decomposition, increment 1). The push loop runs on the
+// RG-MASTER, reads the active lease set (Kea control socket → memfile
+// fallback), and replicates it over the cluster sync channel; the standby
+// holds the peer set in SessionSync.peerDHCPLeases{4,6} and seeds Kea on
+// takeover. The loop talks ONLY to Kea's own socket + the cluster channel —
+// never the userspace-helper control socket (CLAUDE.md rule). Grouping only;
+// no field semantics, locking, or lifecycle changed.
+type dhcpLeaseSyncState struct {
+	nowCh      chan struct{} // nudge: grant/commit/MASTER takeover
+	inFlight   atomic.Bool   // no-freeze skip-if-in-flight guard
+	lastSentMu sync.Mutex
+	lastSent4  string // last-pushed v4 set fingerprint (change-detect)
+	lastSent6  string // last-pushed v6 set fingerprint (change-detect)
+}
 
 // dhcpLeaseSyncEnabled reports whether #2239 lease sync is configured for this
 // commit: a cluster with the `dhcp-lease-synchronization` knob set. Standalone
@@ -107,7 +126,7 @@ func (d *Daemon) runDHCPLeaseSyncLoop(ctx context.Context) {
 			d.dispatchDHCPLeasePush(ctx, true)
 		case <-change.C:
 			d.dispatchDHCPLeasePush(ctx, false)
-		case <-d.dhcpLeaseSyncNowCh:
+		case <-d.dhcpLeaseSync.nowCh:
 			// Nudge: commit or MASTER takeover or peer-connected → push now.
 			d.dispatchDHCPLeasePush(ctx, true)
 		}
@@ -119,11 +138,11 @@ func (d *Daemon) runDHCPLeaseSyncLoop(ctx context.Context) {
 // read can never wedge the loop. force=true bypasses the change-detect (full
 // re-push); force=false pushes only when the set changed since the last push.
 func (d *Daemon) dispatchDHCPLeasePush(ctx context.Context, force bool) {
-	if !d.dhcpLeaseSyncInFlight.CompareAndSwap(false, true) {
+	if !d.dhcpLeaseSync.inFlight.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
-		defer d.dhcpLeaseSyncInFlight.Store(false)
+		defer d.dhcpLeaseSync.inFlight.Store(false)
 		d.pushDHCPLeasesOnce(ctx, force)
 	}()
 }
@@ -175,20 +194,20 @@ func (d *Daemon) pushDHCPLeasesOnce(ctx context.Context, force bool) {
 // on-grant push, while the heartbeat (force=true) carries refreshed Remaining.
 func (d *Daemon) maybePushFamily(family int, leases []dhcpserver.SyncLease, force bool) {
 	fp := dhcpLeaseSetFingerprint(leases)
-	d.dhcpLeaseLastSentMu.Lock()
-	prev := d.dhcpLeaseLastSent4
+	d.dhcpLeaseSync.lastSentMu.Lock()
+	prev := d.dhcpLeaseSync.lastSent4
 	if family == 6 {
-		prev = d.dhcpLeaseLastSent6
+		prev = d.dhcpLeaseSync.lastSent6
 	}
 	changed := fp != prev
 	if force || changed {
 		if family == 6 {
-			d.dhcpLeaseLastSent6 = fp
+			d.dhcpLeaseSync.lastSent6 = fp
 		} else {
-			d.dhcpLeaseLastSent4 = fp
+			d.dhcpLeaseSync.lastSent4 = fp
 		}
 	}
-	d.dhcpLeaseLastSentMu.Unlock()
+	d.dhcpLeaseSync.lastSentMu.Unlock()
 	if !force && !changed {
 		return
 	}
@@ -215,11 +234,11 @@ func dhcpLeaseSetFingerprint(leases []dhcpserver.SyncLease) string {
 // MASTER takeover, peer reconnect). Non-blocking depth-1 send, coalescing a
 // burst. Safe before the loop starts.
 func (d *Daemon) nudgeDHCPLeaseSync() {
-	if d.dhcpLeaseSyncNowCh == nil {
+	if d.dhcpLeaseSync.nowCh == nil {
 		return
 	}
 	select {
-	case d.dhcpLeaseSyncNowCh <- struct{}{}:
+	case d.dhcpLeaseSync.nowCh <- struct{}{}:
 	default:
 	}
 }

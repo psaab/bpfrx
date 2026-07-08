@@ -1,3 +1,106 @@
+## 2026-07-08 — #4407 increment 3: extract archiveTimerState sub-struct
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 Daemon god-struct decomposition, increment 3. Grouped the
+  four flat periodic configuration-archival timer fields (#4078:
+  `archiveTimerMu`, `archiveTimerKey`, `archiveTimerStop`, `archiveNewTicker`)
+  into a new `archiveTimerState` sub-struct defined in
+  `daemon_archive_timer.go` (the file that owns the reconcile/run/stop
+  lifecycle), reached as `d.archiveTimer.*` with the fields renamed
+  `mu`/`key`/`stop`/`newTicker`. Pure code motion — no behavior/locking
+  change; the fields keep their exact types. Renaming the field to
+  `d.archiveTimer.key` also removes the prior confusing collision between the
+  old `archiveTimerKey` field and the package-level `archiveTimerKey(interval,
+  sites)` hash-gate helper (kept as-is). `archiveTransfer` stayed flat (the
+  one-shot transfer-on-commit upload seam used in `daemon_flow.go`, a different
+  mechanism), mirroring increment 1's `ipsecSANudgeCh` / increment 2's
+  `lastStandbyNeighborRefresh` decisions.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_archive_timer.go,
+  pkg/daemon/archive_timer_4078_test.go, pkg/daemon/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/...` clean;
+  `go test -race ./pkg/daemon/...` green; gofmt clean on the touched files.
+
+## 2026-07-08 — #4407 increment 2: extract neighborPeriodicGuards sub-struct
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 Daemon god-struct decomposition, increment 2. Grouped the
+  nine flat `runPeriodicNeighborResolution` supervision fields (#1780 Path A:
+  `neighborWarmupInFlight`, `resolveNeighborsInFlight`, `forceProbeInFlight`,
+  `cleanFailedInFlight`, the four `*LastSuccessNanos`, and
+  `neighborPeriodicLoopStarted`) into a new `neighborPeriodicGuards` sub-struct
+  defined in `daemon_neighbor.go` (the file that owns the supervision loop),
+  reached as `d.neighborGuards.*`. Dropped the now-redundant name prefixes
+  (`neighborWarmupInFlight`→`warmInFlight`, `resolveNeighborsInFlight`→
+  `resolveInFlight`, `neighborPeriodicLoopStarted`→`loopStarted`). Pure code
+  motion — no behavior/locking change; `runGuardedNeighborPhase` still takes
+  `&`-pointers to the addressable struct fields. `lastStandbyNeighborRefresh`
+  stayed flat (standby-refresh rate limit in `daemon_health.go`, a different
+  mechanism), mirroring increment 1's `ipsecSANudgeCh` decision.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_neighbor.go,
+  pkg/daemon/neighbor_periodic_guard_test.go, pkg/daemon/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/` clean;
+  `go test -race ./pkg/daemon/...` green; gofmt clean on the touched files.
+
+## 2026-07-07 — #4228 Gap 2 follow-up: accept `buffer-size temporal <us>`
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4228 Gap 2 follow-up — Junos `class-of-service schedulers <s>
+  buffer-size temporal <microseconds>` (size the queue buffer by target delay)
+  was rejected at commit: buffer-size was a plain typed leaf accepting only a
+  byte-size / percent, so the value token `temporal` failed the validator.
+  Converted buffer-size to a whole-tail leaf (mirror of transmit-rate):
+  `tailValidator: ValidateCoSBufferSizeTail` accepts a byte-size (16m), a
+  percent (10%), OR `temporal <us>`, with a `temporal` child for `?`
+  completion. Compiler detects the temporal head via gatherLeafTailTokens and
+  stores `BufferSizeTemporalUS` (new CoSScheduler field); the byte/percent
+  paths are byte-unchanged. ACCEPTED-BUT-INERT — resolving us->bytes needs the
+  queue's transmit rate (which may be a per-interface percent), so a commit
+  advisory surfaces the inertness. golden_4406 UNCHANGED (the corpus has no
+  schedulers, so the new CoSScheduler field never serializes).
+- **File(s)**: pkg/config/types_cos.go, pkg/config/schema_cos.go,
+  pkg/config/schema_validators_cos.go,
+  pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_cos_buffer_temporal_4228_test.go (new),
+  docs/cos-traffic-shaping.md, docs/config-schema.md (stale "temporal NOT
+  carried" note corrected), _Log.md
+- **Validation**: `go test ./pkg/config/...` green (existing buffer-size
+  byte/percent/reject tests still pass after the leaf-shape change);
+  go build ./... clean; gofmt + go vet clean. New RED-on-revert test:
+  `temporal 50000` compiles into BufferSizeTemporalUS (bytes/percent stay 0),
+  the inert advisory fires, byte/percent forms still compile, and `temporal 0`
+  / `temporal abc` / bare `temporal` are rejected at commit.
+
+## 2026-07-07 — #4228 Gap 4: model `rewrite-rules ieee-802.1` (802.1p PCP egress rewrite)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4228 Gap 4 — Junos `class-of-service rewrite-rules ieee-802.1
+  <name> { forwarding-class <fc> { loss-priority <lp> code-point <0..7>; } }`
+  was an UNKNOWN leaf under the opt-in CoS grammar, so an imported vSRX config
+  with an 802.1p PCP rewrite was REJECTED at commit. Modeled it fully (mirror
+  of the DSCP rewrite): new schema node + interface-unit / interface-level
+  `rewrite-rules ieee-802.1 <name>` binding; compiler parses into
+  `IEEE8021RewriteRules` (`CoSIEEE8021RewriteRule` /
+  `CoSIEEE8021RewriteRuleEntry`, PCP domain 0..7 via new
+  `collectCoS8021RewriteCodePoint`); loss-priority typo gate extended to the
+  new rules; dangling forwarding-class + dangling unit-binding warns added.
+  ACCEPTED-BUT-INERT — the dataplane rewrites dscp on egress only and does not
+  yet own the 802.1Q tag write, so a commit advisory surfaces the inertness
+  (the classifier side `classifiers ieee-802.1` is already enforced). Egress
+  PCP write = Rust TX follow-up. golden_4406 regenerated (only the new
+  `IEEE8021RewriteRules` field appears in the serialized Config; 0 other diffs).
+- **File(s)**: pkg/config/types_cos.go, pkg/config/schema_cos.go,
+  pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_validate_strict_cos.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_cos_ieee8021_rewrite_4228_test.go (new),
+  pkg/config/testdata/golden_4406.json (regenerated),
+  docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
+- **Validation**: `go test ./pkg/config/...` green; go build ./... clean;
+  gofmt + go vet clean. New RED-on-revert test: the rewrite parses/compiles
+  into the typed map, the unit binding is captured, the inert advisory fires,
+  and code-point 8 / a `medum-low` loss-priority typo are rejected at commit.
+
 ## 2026-07-07 — #4373 (E1): WARN when `then log session-close` is inert on a deny/reject policy
 
 - **Timestamp**: 2026-07-07
@@ -41409,3 +41512,58 @@ top.
   ./pkg/cluster/... ./pkg/dataplane/... green. RED-on-revert proven (Rust
   helpers rebuild; Go cluster round-trip). NEEDS `make test-failover` before
   merge (HA session-sync + NAT64 path) — PARENT runs it.
+- **Timestamp**: 2026-07-07
+- **Action**: #4422 high-value Go test-cov batch. Triaged the ~120-item LOW
+  test-coverage tracker: verified the named Go domains (filter cross-field /
+  port-except / actions / flex-match, NAT reversed-range + dport + pools, appid
+  tuple-overflow/source-port, flowexport multi-group wire-collision #3740,
+  observability descriptor/host-inbound/scoped-global, ddns, host-inbound
+  per-interface #3362, FBF ref/direction, ipsec/log/dhcp/sampling refs) are
+  ALREADY covered by this session's #4517-#4625 work — every strict gate and
+  secondary branch checked has a fail-on-revert test. Added the two genuinely
+  non-redundant contract tests: (1) TestEveryStrictCommitGateIsWired — a go/ast
+  completeness canary asserting every top-level validate*Strict(cfg *Config)
+  error gate (~80) is actually invoked in the compile path (catches the
+  "add-a-gate, forget-the-wire" silent commit-gate loss no per-issue test
+  catches; mirrors pkg/api TestCollectorDescriptorCoverage); (2)
+  TestPolicyZoneMatrixCompilesActionsIndependently — the #4422 policy
+  zone-matrix composition guard: mixed permit/deny/reject policies coexisting
+  in one transit zone-pair each keep their own action in config order, the
+  untrust->junos-host host-inbound context stays isolated, and the deny
+  no-match default is orthogonal. Both verified fail-on-revert (unwired
+  validateSourceNATPoolStrict -> canary RED naming it; reject->permit mapping
+  mutation -> matrix RED on t-reject). Rescoped #4422 to the concrete
+  remainder (Rust-cargo flow-cache dataplane tests; lab/smoke host-inbound
+  VLAN/dup-addr/HA + PBR multi-WAN live cells; doc/parity-label items).
+  go test ./pkg/config/ green; gofmt + vet clean. Doc: config-schema.md
+  "Strict commit-time validators" now documents the wiring canary.
+- **File(s)**: pkg/config/strict_gate_wiring_canary_test.go,
+  pkg/config/policy_zone_matrix_4422_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 increment 1 — extract the #2239 DHCP-server lease-sync
+  (PATH C) fields out of the Daemon god-struct into a named sub-struct.
+  Pure code motion, no behavior/locking/lifecycle change (Go compiler
+  enforces completeness). Moved the 5 flat fields dhcpLeaseSyncNowCh,
+  dhcpLeaseSyncInFlight, dhcpLeaseLastSentMu, dhcpLeaseLastSent4,
+  dhcpLeaseLastSent6 into a new dhcpLeaseSyncState{nowCh, inFlight,
+  lastSentMu, lastSent4, lastSent6} defined in daemon_dhcp_lease_sync.go
+  (co-located with the push/seed orchestration it backs). Access is now
+  d.dhcpLeaseSync.<field>. Chose this cluster because it has the cleanest
+  boundary of all candidate groups: all production access lives in ONE
+  file (daemon_dhcp_lease_sync.go) plus the single constructor in
+  daemon.go and one test composite literal — versus the fabric cluster
+  (15 fields across 5 files, ~96 refs) or the SNMP-reconcile cluster
+  (touches the ordering-sensitive daemon_apply.go the issue warns about).
+  Used a named sub-field (not an embed) since the access sites are bounded
+  — the explicit d.dhcpLeaseSync. qualifier is clearer than promotion.
+  IMPORTANT: left ipsecSANudgeCh (which was interleaved among the lease
+  fields) as a flat Daemon field — it is IPsec-SA-sync state, not
+  lease-sync. Validation: go build ./... clean; go vet ./pkg/daemon/...
+  clean; gofmt clean; go test ./pkg/daemon/... green (4.3s); race test of
+  the lease-sync suite green. Remaining #4407 increments (fabric, SNMP,
+  flowexport, DDNS-surfaceA, neighbor, archive, host-inbound, ...) tracked
+  on the issue; applyConfigLocked reconcile-ordering split deferred to a
+  /triple-review increment per the issue's warning.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_dhcp_lease_sync.go,
+  pkg/daemon/daemon_dhcp_lease_sync_test.go, pkg/daemon/README.md, _Log.md

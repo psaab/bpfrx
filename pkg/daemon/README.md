@@ -41,6 +41,57 @@ the primary compile/apply gate.
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 
+### Struct decomposition (#4407, in progress)
+
+The `Daemon` struct historically fused 150+ flat fields spanning ~15
+subsystems. It is being decomposed incrementally into per-subsystem
+sub-structs — pure code motion, no behavior/locking/lifecycle change (the
+Go compiler enforces completeness). Each increment groups one cohesive,
+self-contained field cluster and lands as its own reviewable PR; the
+tracker issue #4407 carries the remaining increments.
+
+- **Increment 1 — DHCP-server lease sync (PATH C, #2239):** the flat
+  `dhcpLeaseSync*` / `dhcpLeaseLast*` fields moved into
+  `dhcpLeaseSyncState` (defined in `daemon_dhcp_lease_sync.go`, the file
+  that owns the push/seed orchestration), reached as `d.dhcpLeaseSync.*`.
+  A named sub-field (not an embed) was used because the access sites are
+  bounded to that one file — the explicit `d.dhcpLeaseSync.` qualifier is
+  clearer than field promotion. `ipsecSANudgeCh` stayed a flat `Daemon`
+  field (it is IPsec-SA-sync state, not lease-sync).
+- **Increment 2 — periodic neighbor-resolution guards (#1780 Path A):** the
+  nine flat supervision fields for `runPeriodicNeighborResolution` (the
+  per-phase in-flight overlap guards, the per-phase last-success UnixNano
+  timestamps feeding the `neighbor_periodic_last_success_age_seconds{phase}`
+  gauge, the loop-started gate, and the `warmNeighborCache` warmup guard)
+  moved into `neighborPeriodicGuards` (defined in `daemon_neighbor.go`, the
+  file that owns the supervision loop), reached as `d.neighborGuards.*`. The
+  fields keep their exact `atomic.Bool` / `atomic.Int64` types (dropping the
+  now-redundant `neighbor`/`Neighbor`/`Periodic` name prefixes), and
+  `runGuardedNeighborPhase` still takes `&`-pointers to the addressable struct
+  fields, so this is pure code motion — no behavior/locking change. A named
+  sub-field (not an embed) matches increment 1: every non-test access site is
+  bounded to `daemon_neighbor.go`. `lastStandbyNeighborRefresh` stayed a flat
+  `Daemon` field (like increment 1's `ipsecSANudgeCh`) — it is the
+  standby-side refresh rate limit read in `daemon_health.go`, a different
+  mechanism from the periodic-resolution supervision grouped here.
+- **Increment 3 — periodic configuration-archival timer (#4078):** the four
+  flat supervision fields for the `system archival configuration
+  transfer-interval` timer (`archiveTimerMu`, `archiveTimerKey`,
+  `archiveTimerStop`, `archiveNewTicker`) moved into `archiveTimerState`
+  (defined in `daemon_archive_timer.go`, the file that owns the
+  reconcile/run/stop lifecycle), reached as `d.archiveTimer.*` (fields renamed
+  `mu`/`key`/`stop`/`newTicker`). The fields keep their exact types, so this is
+  pure code motion — no behavior/locking change. A named sub-field (not an
+  embed) matches increments 1 and 2: every access site is bounded to
+  `daemon_archive_timer.go` (plus its `archive_timer_4078_test.go`), and the
+  `d.archiveTimer.key` qualifier additionally removes the prior confusing
+  collision between the old `archiveTimerKey` field and the still-flat
+  package-level `archiveTimerKey(interval, sites)` hash-gate helper.
+  `archiveTransfer` stayed a flat `Daemon` field (like increment 1's
+  `ipsecSANudgeCh` and increment 2's `lastStandbyNeighborRefresh`) — it is the
+  one-shot transfer-on-commit upload seam used by `archiveConfig` in
+  `daemon_flow.go`, a different mechanism from the periodic timer grouped here.
+
 ## Cluster mode
 
 Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).

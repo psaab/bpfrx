@@ -36,8 +36,10 @@ func storeWithHost(t *testing.T, host string) (*Daemon, chan string, chan time.T
 	d := &Daemon{
 		store: store,
 		opts:  Options{ConfigFile: filepath.Join(dir, "xpf.conf")},
-		archiveNewTicker: func(time.Duration) (<-chan time.Time, func()) {
-			return tickCh, func() {}
+		archiveTimer: archiveTimerState{
+			newTicker: func(time.Duration) (<-chan time.Time, func()) {
+				return tickCh, func() {}
+			},
 		},
 		archiveTransfer: func(_ context.Context, srcPath, _ string) error {
 			b, _ := os.ReadFile(srcPath)
@@ -71,9 +73,9 @@ func TestArchiveTimerFiresPeriodicArchive(t *testing.T) {
 	d.reconcileArchiveTimer(cfg)
 	t.Cleanup(d.stopArchiveTimer)
 
-	d.archiveTimerMu.Lock()
-	armed := d.archiveTimerStop != nil
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	armed := d.archiveTimer.stop != nil
+	d.archiveTimer.mu.Unlock()
 	if !armed {
 		t.Fatal("timer not armed for transfer-interval + sites")
 	}
@@ -115,18 +117,18 @@ func TestArchiveTimerReschedulesAndStops(t *testing.T) {
 	}
 	d.reconcileArchiveTimer(cfg1)
 
-	d.archiveTimerMu.Lock()
-	gen1 := d.archiveTimerStop
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	gen1 := d.archiveTimer.stop
+	d.archiveTimer.mu.Unlock()
 	if gen1 == nil {
 		t.Fatal("timer not armed by cfg1")
 	}
 
 	// Unchanged config → same generation, no bounce.
 	d.reconcileArchiveTimer(cfg1)
-	d.archiveTimerMu.Lock()
-	same := d.archiveTimerStop
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	same := d.archiveTimer.stop
+	d.archiveTimer.mu.Unlock()
 	if same != gen1 {
 		t.Fatal("healthy timer bounced on an unchanged config (hash gate broken)")
 	}
@@ -143,9 +145,9 @@ func TestArchiveTimerReschedulesAndStops(t *testing.T) {
 	default:
 		t.Fatal("old timer not stopped on reschedule")
 	}
-	d.archiveTimerMu.Lock()
-	gen2 := d.archiveTimerStop
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	gen2 := d.archiveTimer.stop
+	d.archiveTimer.mu.Unlock()
 	if gen2 == nil || gen2 == gen1 {
 		t.Fatal("no fresh timer armed after reschedule")
 	}
@@ -157,9 +159,9 @@ func TestArchiveTimerReschedulesAndStops(t *testing.T) {
 	default:
 		t.Fatal("timer not stopped when transfer-interval removed")
 	}
-	d.archiveTimerMu.Lock()
-	after := d.archiveTimerStop
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	after := d.archiveTimer.stop
+	d.archiveTimer.mu.Unlock()
 	if after != nil {
 		t.Fatal("timer still armed after removal")
 	}
@@ -177,9 +179,9 @@ func TestArchiveTimerRequiresSitesAndPositiveInterval(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.System.Archival = &config.ArchivalConfig{TransferInterval: 30}
 	d.reconcileArchiveTimer(cfg)
-	d.archiveTimerMu.Lock()
-	armed := d.archiveTimerStop != nil
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	armed := d.archiveTimer.stop != nil
+	d.archiveTimer.mu.Unlock()
 	if armed {
 		t.Fatal("timer armed with no archive-sites")
 	}
@@ -191,9 +193,9 @@ func TestArchiveTimerRequiresSitesAndPositiveInterval(t *testing.T) {
 		ArchiveSites:     []string{"scp://user@host:/archive/"},
 	}
 	d.reconcileArchiveTimer(cfg2)
-	d.archiveTimerMu.Lock()
-	armed2 := d.archiveTimerStop != nil
-	d.archiveTimerMu.Unlock()
+	d.archiveTimer.mu.Lock()
+	armed2 := d.archiveTimer.stop != nil
+	d.archiveTimer.mu.Unlock()
 	if armed2 {
 		t.Fatal("timer armed for transfer-on-commit-only (interval 0)")
 	}
