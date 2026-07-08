@@ -1,3 +1,25 @@
+## 2026-07-07 — #4599 zeroize: erase self-signed REST-API TLS pair under /etc/xpf/tls
+
+- **Timestamp**: 2026-07-07
+- **Action**: `zeroizeConfigDir` (`pkg/grpcapi/server_diag.go`) removed the
+  `.configdb` SSOT + top-level `.conf`/rollback/journal artifacts but never
+  recursed into the `tls/` subdir, so `/etc/xpf/tls/key.pem` (the
+  device-generated self-signed localhost REST-API private key) and its
+  `cert.pem` SURVIVED a factory reset — a re-tenant leak (LOW: device-generated,
+  self-signed, localhost-only). The top-level ReadDir loop uses `os.Remove`,
+  which cannot delete a non-empty dir and never matched the "tls" name anyway.
+  Added an explicit `fail(os.RemoveAll(filepath.Join(configDir, "tls")))` after
+  the `.configdb` removal, folded into the same first-error surfacing (→
+  codes.Internal). Safe because `generateSelfSignedCertAt` (`pkg/api/server.go`)
+  regenerates a fresh pair on absence at the next boot (LoadX509KeyPair fails →
+  regen). RED-on-revert test `TestZeroizeConfigDirWipesTLSKey`
+  (`pkg/grpcapi/zeroize_tls_4599_test.go`): tls/key.pem + cert.pem + tls/ absent
+  after wipe, existing SSOT/rollback/journal removals still hold, non-xpf
+  bystander untouched. Doc: `docs/system-login.md` #4576 erased-paths list.
+- **File(s)**: `pkg/grpcapi/server_diag.go`,
+  `pkg/grpcapi/zeroize_tls_4599_test.go`, `docs/system-login.md`, `_Log.md`
+- Closes #4599.
+
 ## 2026-07-07 — #4589 A10-b2 F-01 ddns+config: reject empty-host DDNS generic url-template
 
 - **Timestamp**: 2026-07-07
