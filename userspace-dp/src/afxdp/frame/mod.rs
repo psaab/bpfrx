@@ -251,6 +251,20 @@ pub(super) fn build_nat64_forwarded_frame(
                 Some(IpAddr::V4(v4)) => v4,
                 _ => return None,
             };
+            // #2562: a NON-first fragment has no L4 header — translate L3-only
+            // (payload copied verbatim, no L4/port rewrite). `decision.nat`
+            // (snat_v4/dst_v4) is the first fragment's translation, carried here
+            // by the fragment-association cache consult. Reached only for a
+            // non-first fragment whose first fragment installed an association;
+            // an unassociated non-first fragment never gets a NAT64 decision and
+            // is dropped fail-closed upstream (#4617).
+            if let Some(l3) = frame_l3_offset(frame)
+                && is_non_first_fragment(frame.get(l3..)?, libc::AF_INET6 as u8)
+            {
+                return crate::nat64::build_nat64_v6_to_v4_nonfirst_frame(
+                    frame, snat_v4, dst_v4, dst_mac, src_mac, vlan_id,
+                );
+            }
             let mut out = crate::nat64::build_nat64_v6_to_v4_frame(
                 frame,
                 snat_v4,
@@ -274,6 +288,24 @@ pub(super) fn build_nat64_forwarded_frame(
         libc::AF_INET => {
             // Reverse direction: IPv4 → IPv6 (reply from server).
             let info = nat64_reverse?;
+            // #2562: a NON-first reply fragment has no L4 header — translate
+            // L3-only (payload verbatim, no L4/port rewrite) using the reverse
+            // association (`orig_dst_v6`/`orig_src_v6`) the first reply fragment
+            // installed. Reached only when the reverse fragment-association
+            // consult supplies `nat64_reverse`; an unassociated non-first reply
+            // fragment is dropped fail-closed upstream (#4617).
+            if let Some(l3) = frame_l3_offset(frame)
+                && is_non_first_fragment(frame.get(l3..)?, libc::AF_INET as u8)
+            {
+                return crate::nat64::build_nat64_v4_to_v6_nonfirst_frame(
+                    frame,
+                    info.orig_dst_v6,
+                    info.orig_src_v6,
+                    dst_mac,
+                    src_mac,
+                    vlan_id,
+                );
+            }
             // Reply: src_v6 = original dst (NAT64 prefix + server), dst_v6 = original client
             let mut out = crate::nat64::build_nat64_v4_to_v6_frame(
                 frame,

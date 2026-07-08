@@ -172,8 +172,10 @@ use crate::nat::{
     NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey, allocate_nat64_pool_port,
     release_nat64_pool_port, reserve_nat64_pool_port,
 };
+use crate::session::SessionDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// #4381: NAT64 translated-port allocation range. RFC 6146 does not mandate a
 /// specific range; the ephemeral 1024..=65535 window (matching the pool-mode
@@ -229,6 +231,13 @@ pub(crate) struct Nat64State {
     /// replicates it onto every NAT64 rule snapshot, so any rule carrying it
     /// enables it globally.
     pub(crate) no_v6_frag_header: bool,
+    /// #2562: cross-family fragment-association cache. Lets non-first NAT64
+    /// fragments inherit the first fragment's translation instead of being
+    /// dropped fail-closed (#4617). Arc-backed, so all per-worker clones share
+    /// one cache (cross-worker visible) and it survives a config reload (the
+    /// Arc is threaded in `from_snapshots_with_previous`). NOT rebuilt from the
+    /// snapshot — fragment associations are runtime state, not config.
+    pub(crate) frag_assoc: Nat64FragAssoc,
 }
 
 /// Reverse-direction state stored with NAT64 sessions so IPv4 replies can be
@@ -237,6 +246,309 @@ pub(crate) struct Nat64State {
 pub(crate) struct Nat64ReverseInfo {
     pub(crate) orig_src_v6: Ipv6Addr,
     pub(crate) orig_dst_v6: Ipv6Addr,
+}
+
+// ===========================================================================
+// #2562 / #3291-stage-4: stateful cross-family fragment-association cache.
+//
+// A non-first NAT64 fragment carries NO L4 header, so it cannot find the
+// flow/session that holds the translation the FIRST fragment resolved (the
+// SNAT source v6->v4, or the original v6 addresses v4->v6). Without an
+// association it is dropped fail-closed (#4617). This cache lets a non-first
+// fragment INHERIT the first fragment's decision so the whole datagram
+// traverses NAT64 end-to-end and reassembles at the receiver.
+//
+// Design (converged /research pass; see issue #2562 / PR #4686):
+//   * Key is PORT-FREE `(addr_family, src, dst, ip_id)` so ALL fragments of one
+//     datagram co-locate (the #2344 invariant — payload bytes are NEVER read as
+//     L4 ports).
+//   * Value is the first fragment's FULL, per-flow `SessionDecision`
+//     (resolution + NatDecision) — data-sufficient for the forward direction
+//     (`decision.nat` carries this flow's snat_v4/dst_v4) — plus the optional
+//     `Nat64ReverseInfo` for the reverse direction, plus a monotonic-ns
+//     deadline. NOTE the value is per-FLOW, not per-(src,dst): the pool SNAT
+//     source is round-robin (`address_persistent = false`), so two flows that
+//     share (src_v6,dst_v6) but differ in L4 port can be assigned DIFFERENT
+//     pool source addresses. Since the key is port-free, a non-first fragment
+//     could in principle inherit a *sibling* flow's snat_v4.
+//   * CORRECTNESS / why the port-free key is safe: RFC 8200 §4.5 requires a
+//     source to use a UNIQUE Fragment Identification per (source, destination)
+//     for the maximum lifetime a fragment may exist. So for a CONFORMANT sender
+//     exactly one datagram — hence one flow — owns a given (src,dst,ip_id)
+//     within our 2s TTL, and the inherited snat_v4 is that flow's own. The only
+//     residual is a sender that DELIBERATELY reuses one ident across two
+//     concurrent flows to the same (src,dst); its worst case is fail-SAFE: the
+//     non-first fragment may translate to the sibling flow's pool SOURCE, so
+//     the receiver cannot reassemble (fragments arrive from different sources)
+//     and DROPS — it is NEVER mistranslated to a wrong DESTINATION (dst is in
+//     the key and derives the synthetic-prefix v4 dst identically for both).
+//     This is the same inherent NAT + fragmentation + ident-reuse hazard
+//     RFC 6864 describes, not a new exposure.
+//   * ONLY a first fragment (offset 0, MF=1, admitted + resolved) INSTALLS an
+//     entry. Non-first fragments only CONSULT — the load-bearing DoS property:
+//     an attacker cannot grow the table with cheap headerless fragments.
+//   * BOUNDED: a fixed shard count x a fixed per-shard cap, LRU eviction, no
+//     growth. Short TTL (~2s): we ASSOCIATE, we do not RFC-reassemble — real
+//     fragments of one datagram arrive within microseconds-milliseconds; the
+//     short TTL covers reorder/jitter while evicting attack residue fast.
+//   * CROSS-WORKER visible for free: the cache rides `Nat64State`, which is
+//     shared across all workers behind `Arc<ForwardingState>` (ArcSwap) and
+//     threaded across config reloads by `from_snapshots_with_previous` — the
+//     same Arc-sharing pattern the `PortAllocator` uses. No new sharded mutex,
+//     no session-sync/control-socket traffic (HA does NOT sync it: transient,
+//     sub-second; on failover an in-flight fragmented datagram is dropped ->
+//     retransmitted, documented + bounded).
+//
+// Miss (reorder / orphan / eviction / cross-node failover) falls to the #4617
+// fail-closed drop (`nat64_frag_dropped`), never a wrong-source forward.
+// ===========================================================================
+
+/// Number of independent shards. Power of two so the shard index is a mask.
+const NAT64_FRAG_SHARDS: usize = 16;
+/// Fixed per-shard entry cap (LRU eviction on overflow). Total ceiling is
+/// `NAT64_FRAG_SHARDS * NAT64_FRAG_CAP_PER_SHARD` = 1024 entries; each entry is
+/// a `Copy` `SessionDecision` + an optional `Nat64ReverseInfo` + a deadline —
+/// a few hundred bytes, so a few hundred KB fixed ceiling. No payload bytes are
+/// stored (no amplification by datagram size).
+const NAT64_FRAG_CAP_PER_SHARD: usize = 64;
+/// Association lifetime. Deliberately SHORT (2s, not the RFC-6864 60s
+/// reassembly timeout): we associate a first fragment's decision with its
+/// non-first fragments, which arrive on the fast path within
+/// microseconds-milliseconds. Refreshed on every hit.
+const NAT64_FRAG_TTL_NS: u64 = 2_000_000_000;
+
+/// Port-free fragment-association key (#2562). Identical shape for both NAT64
+/// directions; the family byte distinguishes a v6->v4 forward association from
+/// a v4->v6 reverse one, so a forward and a reverse datagram that happen to
+/// share addresses/ident never alias.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Nat64FragKey {
+    pub(crate) addr_family: u8,
+    pub(crate) src: IpAddr,
+    pub(crate) dst: IpAddr,
+    /// IPv6 Fragment Header 32-bit Identification (v6 side) or the IPv4 16-bit
+    /// Identification zero-extended (v4 side). The SAME value labels every
+    /// fragment of one datagram, so it co-locates them under one key.
+    pub(crate) ident: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Nat64FragEntry {
+    key: Nat64FragKey,
+    decision: SessionDecision,
+    reverse: Option<Nat64ReverseInfo>,
+    deadline_ns: u64,
+}
+
+/// Cross-family fragment-association cache (#2562). Cheap to `Clone` (shares the
+/// Arc-backed shards across every per-worker `Nat64State`), so a first fragment
+/// that translates on any worker is visible to a non-first fragment that lands
+/// on any other worker.
+#[derive(Clone)]
+pub(crate) struct Nat64FragAssoc {
+    shards: Arc<Vec<Mutex<Vec<Nat64FragEntry>>>>,
+}
+
+impl std::fmt::Debug for Nat64FragAssoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Nat64FragAssoc")
+    }
+}
+
+impl Default for Nat64FragAssoc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn ip_octets(ip: IpAddr, out: &mut [u8; 16]) -> usize {
+    match ip {
+        IpAddr::V4(v4) => {
+            out[..4].copy_from_slice(&v4.octets());
+            4
+        }
+        IpAddr::V6(v6) => {
+            out.copy_from_slice(&v6.octets());
+            16
+        }
+    }
+}
+
+/// FNV-1a over the port-free key -> shard index. Deterministic so the same key
+/// always maps to the same shard on install and consult (across workers).
+fn nat64_frag_shard_index(key: &Nat64FragKey) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |b: u8| {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(key.addr_family);
+    let mut buf = [0u8; 16];
+    let n = ip_octets(key.src, &mut buf);
+    for &b in &buf[..n] {
+        mix(b);
+    }
+    let n = ip_octets(key.dst, &mut buf);
+    for &b in &buf[..n] {
+        mix(b);
+    }
+    for b in key.ident.to_be_bytes() {
+        mix(b);
+    }
+    (h as usize) & (NAT64_FRAG_SHARDS - 1)
+}
+
+impl Nat64FragAssoc {
+    pub(crate) fn new() -> Self {
+        let mut shards = Vec::with_capacity(NAT64_FRAG_SHARDS);
+        for _ in 0..NAT64_FRAG_SHARDS {
+            shards.push(Mutex::new(Vec::with_capacity(NAT64_FRAG_CAP_PER_SHARD)));
+        }
+        Self {
+            shards: Arc::new(shards),
+        }
+    }
+
+    /// Install (or refresh) the association a FIRST fragment established. Only a
+    /// first fragment reaches this (the caller gates on offset 0 / MF=1 + an
+    /// admitted, resolved decision), so non-first fragments can never grow the
+    /// table. On a full shard the OLDEST (front) entry is evicted -> hard,
+    /// fixed memory ceiling. A repeat install of the same key refreshes the
+    /// deadline and moves the entry to the back (most-recently-used).
+    pub(crate) fn install(
+        &self,
+        key: Nat64FragKey,
+        decision: SessionDecision,
+        reverse: Option<Nat64ReverseInfo>,
+        now_ns: u64,
+    ) {
+        let deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        let idx = nat64_frag_shard_index(&key);
+        let mut shard = self.shards[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pos) = shard.iter().position(|e| e.key == key) {
+            let mut e = shard.remove(pos);
+            e.decision = decision;
+            e.reverse = reverse;
+            e.deadline_ns = deadline_ns;
+            shard.push(e);
+            return;
+        }
+        if shard.len() >= NAT64_FRAG_CAP_PER_SHARD {
+            shard.remove(0);
+        }
+        shard.push(Nat64FragEntry {
+            key,
+            decision,
+            reverse,
+            deadline_ns,
+        });
+    }
+
+    /// Consult the association for a NON-first fragment. Prunes expired entries
+    /// lazily, then, on a live hit, refreshes the deadline + moves the entry to
+    /// the back (LRU) and returns a copy of the first fragment's decision +
+    /// reverse info. A miss (never installed / expired / evicted) returns
+    /// `None`, and the caller drops fail-closed (#4617).
+    pub(crate) fn lookup(
+        &self,
+        key: &Nat64FragKey,
+        now_ns: u64,
+    ) -> Option<(SessionDecision, Option<Nat64ReverseInfo>)> {
+        let idx = nat64_frag_shard_index(key);
+        let mut shard = self.shards[idx]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shard.retain(|e| e.deadline_ns > now_ns);
+        let pos = shard.iter().position(|e| e.key == *key)?;
+        let mut e = shard.remove(pos);
+        e.deadline_ns = now_ns.saturating_add(NAT64_FRAG_TTL_NS);
+        let value = (e.decision, e.reverse);
+        shard.push(e);
+        Some(value)
+    }
+
+    /// Total live entry count across all shards (test-only; backs the bound /
+    /// eviction / TTL RED-on-revert tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum()
+    }
+}
+
+/// Parse the port-free fragment fields from an L3-relative packet: the
+/// `(key, more, offset_units)` triple. `addr_family` selects the family. Shared
+/// by [`nat64_first_fragment_key`] and [`nat64_nonfirst_fragment_key`] so the
+/// install and consult key derivations are byte-identical.
+fn nat64_fragment_fields(packet: &[u8], addr_family: i32) -> Option<(Nat64FragKey, bool, u16)> {
+    match addr_family {
+        libc::AF_INET6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let frag = ipv6_fragment_header(packet)?;
+            let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?);
+            let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
+            let key = Nat64FragKey {
+                addr_family: libc::AF_INET6 as u8,
+                src: IpAddr::V6(src),
+                dst: IpAddr::V6(dst),
+                ident: frag.ident,
+            };
+            Some((key, frag.more, frag.offset_units))
+        }
+        libc::AF_INET => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let frag_word = u16::from_be_bytes([packet[6], packet[7]]);
+            let more = (frag_word & 0x2000) != 0;
+            let offset_units = frag_word & 0x1FFF;
+            let ident = u16::from_be_bytes([packet[4], packet[5]]);
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            let key = Nat64FragKey {
+                addr_family: libc::AF_INET as u8,
+                src: IpAddr::V4(src),
+                dst: IpAddr::V4(dst),
+                ident: u32::from(ident),
+            };
+            Some((key, more, offset_units))
+        }
+        _ => None,
+    }
+}
+
+/// Association key for a FIRST fragment (offset 0, MF=1) — the fragment that
+/// INSTALLS the entry. Returns `None` for a non-first fragment, an atomic
+/// fragment (MF=0, offset 0), or a non-fragmented packet.
+pub(crate) fn nat64_first_fragment_key(packet: &[u8], addr_family: i32) -> Option<Nat64FragKey> {
+    let (key, more, offset_units) = nat64_fragment_fields(packet, addr_family)?;
+    if more && offset_units == 0 {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// Association key for a NON-first fragment (offset > 0) — the fragment that
+/// CONSULTS the entry. Returns `None` for a first / atomic / non-fragmented
+/// packet.
+pub(crate) fn nat64_nonfirst_fragment_key(packet: &[u8], addr_family: i32) -> Option<Nat64FragKey> {
+    let (key, _more, offset_units) = nat64_fragment_fields(packet, addr_family)?;
+    if offset_units != 0 {
+        Some(key)
+    } else {
+        None
+    }
 }
 
 /// Tri-state result of a NAT64 destination lookup (#2291).
@@ -467,6 +779,13 @@ impl Nat64State {
         Self {
             prefixes,
             no_v6_frag_header,
+            // #2562: preserve the live fragment-association cache across a
+            // config reload (share the Arc) so in-flight fragmented datagrams
+            // keep translating; a first commit with no previous state starts a
+            // fresh (empty) cache.
+            frag_assoc: previous
+                .map(|prev| prev.frag_assoc.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -2416,6 +2735,194 @@ fn adjust_l4_checksum_v4_to_v6_incremental(
 // ---------------------------------------------------------------------------
 // Frame building helpers for NAT64
 // ---------------------------------------------------------------------------
+
+/// #2562: translate a NON-first IPv6 fragment to IPv4, L3-only.
+///
+/// A non-first fragment (Fragment Header present, offset > 0) has NO L4 header —
+/// every byte after the Fragment Header is opaque payload. This is the sibling
+/// of [`write_v6_to_v4_into`] for that case: it does NOT parse or checksum an L4
+/// header (there is none). It strips the IPv6 base + extension + Fragment
+/// headers, emits a 20-byte IPv4 header whose fragmentation fields are copied
+/// from the IPv6 Fragment Header (DF=0, MF from the M flag, the 13-bit offset
+/// verbatim in 8-byte units, and **IPv4 Identification = the low 16 bits of the
+/// IPv6 32-bit Identification** — the SAME truncation the first fragment used,
+/// which is load-bearing for reassembly at the receiver), copies the payload
+/// verbatim, and recomputes ONLY the IPv4 header checksum.
+///
+/// The `snat_v4`/`dst_v4` come from the FIRST fragment's cached association
+/// (`Nat64FragAssoc`), so all fragments translate to the same source and
+/// reassemble. Fragmented ICMPv6 is NOT handled here (the ICMP checksum covers
+/// the whole datagram and cannot be recomputed from a fragment) — it stays the
+/// #4617 fail-closed drop, so only TCP/UDP are accepted.
+pub(crate) fn write_v6_to_v4_nonfirst_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+) -> Option<usize> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let traffic_class = ((packet[0] & 0x0f) << 4) | (packet[1] >> 4);
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let hop_limit = packet[7];
+    if hop_limit <= 1 {
+        return None; // TTL expired
+    }
+    // `ipv6_l4_offset_and_protocol` walks the chain and, for a non-first
+    // fragment, returns the offset of the byte AFTER the Fragment Header (where
+    // the opaque payload starts) and the Fragment Header's Next Header (the real
+    // upper-layer protocol) — exactly what we need.
+    let (payload_off, l4_protocol) = ipv6_l4_offset_and_protocol(packet)?;
+    let frag = ipv6_fragment_header(packet)?;
+    if frag.offset_units == 0 {
+        return None; // not a non-first fragment — caller must use the first path
+    }
+    // TCP/UDP only. ICMPv6 fragments stay the #4617 fail-closed drop.
+    let ipv4_protocol = match l4_protocol {
+        PROTO_TCP | PROTO_UDP => l4_protocol,
+        _ => return None,
+    };
+    let l4_end = 40usize.checked_add(payload_len)?;
+    if payload_off > l4_end {
+        return None; // ext-header chain overran the advertised payload
+    }
+    let payload = packet.get(payload_off..l4_end)?;
+    let total_len = 20usize.checked_add(payload.len())?;
+    let out = dst.get_mut(..total_len)?;
+    out[0] = 0x45; // version=4, IHL=5
+    out[1] = traffic_class;
+    out[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    let ident = (frag.ident & 0xFFFF) as u16;
+    out[4..6].copy_from_slice(&ident.to_be_bytes());
+    let mf = if frag.more { 0x2000u16 } else { 0 };
+    let frag_word = mf | (frag.offset_units & 0x1FFF);
+    out[6..8].copy_from_slice(&frag_word.to_be_bytes());
+    out[8] = hop_limit - 1;
+    out[9] = ipv4_protocol;
+    out[10..12].copy_from_slice(&[0, 0]); // header checksum (computed below)
+    out[12..16].copy_from_slice(&snat_v4.octets());
+    out[16..20].copy_from_slice(&dst_v4.octets());
+    out[20..total_len].copy_from_slice(payload);
+    let hdr_sum = checksum16(&out[..20]);
+    out[10..12].copy_from_slice(&hdr_sum.to_be_bytes());
+    Some(total_len)
+}
+
+/// #2562: translate a NON-first IPv4 fragment to IPv6, L3-only.
+///
+/// Sibling of [`write_v4_to_v6_into`] for a non-first IPv4 fragment (offset > 0,
+/// no L4 header). Emits a 40-byte IPv6 header + an 8-byte Fragment Header whose
+/// M flag / 13-bit offset are copied from the IPv4 fragmentation word and whose
+/// **32-bit Identification is the IPv4 16-bit Identification zero-extended** (the
+/// SAME extension the first fragment used), copies the payload verbatim, and
+/// touches NO L4 checksum (there is no L4 header). `src_v6`/`dst_v6` come from
+/// the first fragment's cached reverse association. TCP/UDP only — a fragmented
+/// ICMP stays the #4617 fail-closed drop.
+pub(crate) fn write_v4_to_v6_nonfirst_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+) -> Option<usize> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    let tos = packet[1];
+    let ttl = packet[8];
+    if ttl <= 1 {
+        return None; // TTL expired
+    }
+    let protocol = packet[9];
+    let ipv4_total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if ipv4_total_len < ihl || ipv4_total_len > packet.len() {
+        return None;
+    }
+    let payload = packet.get(ihl..ipv4_total_len)?;
+    let frag_word = u16::from_be_bytes([packet[6], packet[7]]);
+    let more = (frag_word & 0x2000) != 0;
+    let offset_units = frag_word & 0x1FFF;
+    if offset_units == 0 {
+        return None; // not a non-first fragment — caller must use the first path
+    }
+    // TCP/UDP only. ICMP fragments stay the #4617 fail-closed drop.
+    let next_header = match protocol {
+        PROTO_TCP | PROTO_UDP => protocol,
+        _ => return None,
+    };
+    let v4_ident = u16::from_be_bytes([packet[4], packet[5]]);
+    let ipv6_payload_len = 8usize.checked_add(payload.len())?;
+    let total_len = 40usize.checked_add(ipv6_payload_len)?;
+    let out = dst.get_mut(..total_len)?;
+    out[0] = 0x60 | (tos >> 4); // version=6 | TC[7:4]
+    out[1] = (tos & 0x0f) << 4; // TC[3:0] | flow-label high nibble (0)
+    out[2] = 0; // flow label
+    out[3] = 0; // flow label
+    out[4..6].copy_from_slice(&(ipv6_payload_len as u16).to_be_bytes());
+    out[6] = 44; // next header = Fragment
+    out[7] = ttl - 1;
+    out[8..24].copy_from_slice(&src_v6.octets());
+    out[24..40].copy_from_slice(&dst_v6.octets());
+    // 8-byte IPv6 Fragment Header (RFC 8200 §4.5).
+    out[40] = next_header;
+    out[41] = 0; // reserved
+    let v6_frag_word = (offset_units << 3) | u16::from(more);
+    out[42..44].copy_from_slice(&v6_frag_word.to_be_bytes());
+    out[44..48].copy_from_slice(&u32::from(v4_ident).to_be_bytes());
+    out[48..total_len].copy_from_slice(payload);
+    Some(total_len)
+}
+
+/// #2562: Ethernet + IPv4 frame for a NON-first IPv6 fragment (forward NAT64).
+/// Mirrors [`build_nat64_v6_to_v4_frame`] but calls the L3-only non-first
+/// translator (no L4 header, no `no_v6_frag_header` policy — the fragmentation
+/// fields come from the packet's Fragment Header).
+pub(crate) fn build_nat64_v6_to_v4_nonfirst_frame(
+    frame: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    vlan_id: u16,
+) -> Option<Vec<u8>> {
+    let l3 = frame_l3_offset(frame)?;
+    let ipv6_packet = frame.get(l3..)?;
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out = vec![0u8; eth_len + ipv6_packet.len()];
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x0800)?;
+    let written = write_v6_to_v4_nonfirst_into(&mut out[eth_len..], ipv6_packet, snat_v4, dst_v4)?;
+    out.truncate(eth_len + written);
+    Some(out)
+}
+
+/// #2562: Ethernet + IPv6 frame for a NON-first IPv4 fragment (reverse NAT64).
+/// Mirrors [`build_nat64_v4_to_v6_frame`] but calls the L3-only non-first
+/// translator. The IPv4->IPv6 non-first output grows by 28 bytes (40+8 IPv6
+/// header vs 20 IPv4 header); the `2 * NAT64_HEADER_DELTA` over-allocation is a
+/// safe upper bound (there is no ICMP-error embedded-packet growth on a
+/// TCP/UDP fragment) and the result is truncated to the exact length.
+pub(crate) fn build_nat64_v4_to_v6_nonfirst_frame(
+    frame: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+    eth_dst: [u8; 6],
+    eth_src: [u8; 6],
+    vlan_id: u16,
+) -> Option<Vec<u8>> {
+    let l3 = frame_l3_offset(frame)?;
+    let ipv4_packet = frame.get(l3..)?;
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let mut out =
+        vec![0u8; eth_len + ipv4_packet.len().saturating_add(2 * NAT64_HEADER_DELTA as usize)];
+    write_eth_header_slice(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
+    let written = write_v4_to_v6_nonfirst_into(&mut out[eth_len..], ipv4_packet, src_v6, dst_v6)?;
+    out.truncate(eth_len + written);
+    Some(out)
+}
 
 /// Build a complete Ethernet + IPv4 frame from an Ethernet + IPv6 frame.
 /// Used for forward NAT64 (IPv6→IPv4): frame shrinks by 20 bytes.

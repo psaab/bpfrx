@@ -2894,6 +2894,57 @@ fn nat64_4381_forward_frame_translates_l4_source_port() {
 }
 
 #[test]
+fn nat64_2562_forward_nonfirst_fragment_frame_translates_l3_only() {
+    // #2562: build_nat64_forwarded_frame must L3-translate a NON-first v6
+    // fragment (no L4 header) using the association-carried decision, instead of
+    // dropping it. Frame = eth(14) + v6(40) + Fragment Header(8) + payload.
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap(); // ::8.8.8.8
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let ident: u32 = 0x0001_2345;
+    let payload: &[u8] = &[0x5Au8; 24];
+
+    let mut frame = vec![0u8; 14 + 40 + 8 + payload.len()];
+    // Ethernet: dst/src MAC arbitrary, ethertype IPv6.
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    // IPv6 header.
+    frame[14] = 0x60;
+    let v6_payload_len = (8 + payload.len()) as u16;
+    frame[18..20].copy_from_slice(&v6_payload_len.to_be_bytes());
+    frame[20] = 44; // next header = Fragment
+    frame[21] = 64; // hop limit
+    frame[22..38].copy_from_slice(&client.octets());
+    frame[38..54].copy_from_slice(&synthetic.octets());
+    // Fragment Header (offset 100 units => non-first, MF=0).
+    frame[54] = PROTO_UDP; // next header
+    let word: u16 = (100u16 << 3) | 0;
+    frame[56..58].copy_from_slice(&word.to_be_bytes());
+    frame[58..62].copy_from_slice(&ident.to_be_bytes());
+    frame[62..].copy_from_slice(payload);
+
+    let decision = icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false)
+        .expect("#2562: non-first v6 fragment L3-translates, not dropped");
+
+    // Output is eth(14) + IPv4(20) + payload; NO L4 rewrite.
+    assert_eq!(out[14] >> 4, 4, "output is IPv4");
+    assert_eq!(&out[26..30], &pool.octets(), "inherited SNAT source");
+    assert_eq!(&out[30..34], &server.octets(), "inherited v4 destination");
+    // v4 ident = low 16 of the v6 ident; offset preserved; MF=0; DF=0.
+    assert_eq!(
+        u16::from_be_bytes([out[18], out[19]]),
+        (ident & 0xFFFF) as u16
+    );
+    let fw = u16::from_be_bytes([out[20], out[21]]);
+    assert_eq!(fw & 0x1FFF, 100, "fragment offset preserved");
+    assert_eq!(fw & 0x2000, 0, "MF=0 (last fragment)");
+    assert_eq!(fw & 0x4000, 0, "DF cleared");
+    // Payload copied verbatim.
+    assert_eq!(&out[34..], payload, "payload verbatim, no L4 touch");
+}
+
+#[test]
 fn nat64_4381_reverse_frame_restores_each_clients_original_port() {
     // Two clients behind ONE pool address, distinct translated ports; each
     // reply must restore its OWN original client port (no cross-talk).

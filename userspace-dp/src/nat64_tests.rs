@@ -3982,3 +3982,267 @@ fn nat64_3025_incremental_helper_wrong_delta_breaks() {
         "a wrong address delta must NOT validate against the real v4 addresses"
     );
 }
+
+// ===========================================================================
+// #2562: stateful cross-family fragment-association cache. A non-first NAT64
+// fragment inherits the FIRST fragment's translation (via the cache) and
+// translates L3-only instead of dropping fail-closed (#4617). RED-on-revert:
+// reverting the non-first translators to `return None`, dropping the cache LRU
+// cap, or dropping the TTL prune makes these tests fail.
+// ===========================================================================
+
+/// Minimal `SessionDecision` with a forwardable resolution for cache tests.
+fn frag_test_decision(nat: NatDecision) -> SessionDecision {
+    SessionDecision {
+        resolution: crate::afxdp::ForwardingResolution {
+            disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 2,
+            tx_ifindex: 2,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: Some([2, 0, 0, 0, 0, 2]),
+            src_mac: Some([2, 0, 0, 0, 0, 1]),
+            tx_vlan_id: 0,
+        },
+        nat,
+    }
+}
+
+#[test]
+fn nat64_frag_assoc_v6_to_v4_nonfirst_inherits_and_translates() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let ident: u32 = 0x0000_ABCD;
+
+    // Payload lengths are multiples of 8 so the fragment offsets are sane.
+    let first = make_ipv6_frag_udp(src_v6, dst_v6, 1000, 53, &[0xAAu8; 16], 0, true, ident);
+    let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0xBBu8; 24], 185, false, ident);
+
+    // Port-free key co-location: first and non-first share ONE key so the
+    // non-first fragment finds the first fragment's association.
+    let kf = nat64_first_fragment_key(&first, libc::AF_INET6).expect("first-fragment key");
+    let kn =
+        nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6).expect("non-first-fragment key");
+    assert_eq!(
+        kf, kn,
+        "first and non-first fragments must share the port-free key"
+    );
+    // DoS property: a non-first fragment can NEVER produce a first-fragment key
+    // (so it can never INSTALL into the cache).
+    assert!(nat64_first_fragment_key(&nonfirst, libc::AF_INET6).is_none());
+    // An atomic fragment (MF=0, offset 0) is not a first fragment either.
+    let atomic = make_ipv6_frag_udp(src_v6, dst_v6, 1, 2, &[0u8; 8], 0, false, ident);
+    assert!(nat64_first_fragment_key(&atomic, libc::AF_INET6).is_none());
+
+    // Install the first fragment's decision; the non-first fragment inherits it.
+    let cache = Nat64FragAssoc::new();
+    let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, dst_v4, 5000));
+    cache.install(kf, decision, None, 1_000);
+    let (hit, reverse) = cache
+        .lookup(&kn, 1_500)
+        .expect("non-first inherits association");
+    assert!(
+        reverse.is_none(),
+        "forward association carries no reverse info"
+    );
+    assert_eq!(hit.nat.rewrite_src, Some(IpAddr::V4(snat_v4)));
+    assert_eq!(hit.nat.rewrite_dst, Some(IpAddr::V4(dst_v4)));
+    assert!(hit.nat.nat64);
+
+    // Translate the non-first fragment L3-only using the inherited snat/dst.
+    // RED-on-revert: forcing `write_v6_to_v4_nonfirst_into` back to `None` fails.
+    let mut out = vec![0u8; nonfirst.len()];
+    let n = write_v6_to_v4_nonfirst_into(&mut out, &nonfirst, snat_v4, dst_v4)
+        .expect("non-first v6 fragment translates (inherited)");
+    let v4 = &out[..n];
+    assert_eq!(v4[0] >> 4, 4, "output is IPv4");
+    assert_eq!(&v4[12..16], &snat_v4.octets(), "inherited SNAT source");
+    assert_eq!(&v4[16..20], &dst_v4.octets(), "inherited v4 destination");
+    // frag word: offset preserved (185, 8-byte units), MF=0, DF=0.
+    let fw = u16::from_be_bytes([v4[6], v4[7]]);
+    assert_eq!(fw & 0x1FFF, 185, "fragment offset preserved verbatim");
+    assert_eq!(fw & 0x2000, 0, "MF copied (last fragment)");
+    assert_eq!(fw & 0x4000, 0, "DF cleared for a real fragment");
+    // Payload copied verbatim (everything after the v6 base(40)+Fragment(8)).
+    assert_eq!(
+        &v4[20..n],
+        &nonfirst[48..],
+        "payload copied verbatim, no L4 touch"
+    );
+
+    // Ident-equality invariant: the FIRST fragment's translated v4 ident equals
+    // the non-first fragment's (both are the low 16 bits of the v6 32-bit ident).
+    // Without this, the fragments never reassemble at the receiver.
+    let first_v4 =
+        translate_v6_to_v4(&first, snat_v4, dst_v4, false).expect("first fragment translates");
+    assert_eq!(
+        u16::from_be_bytes([first_v4[4], first_v4[5]]),
+        u16::from_be_bytes([v4[4], v4[5]]),
+        "first and non-first translated v4 idents must match"
+    );
+    assert_eq!(
+        u16::from_be_bytes([v4[4], v4[5]]),
+        (ident & 0xFFFF) as u16,
+        "v4 ident = low 16 bits of the v6 32-bit ident",
+    );
+}
+
+#[test]
+fn nat64_frag_assoc_v4_to_v6_nonfirst_inherits_and_translates() {
+    let orig_client_v6: Ipv6Addr = "2001:db8::9".parse().unwrap();
+    let orig_dst_v6: Ipv6Addr = "64:ff9b::c000:0209".parse().unwrap(); // prefix::server
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 9);
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 9);
+    let ident: u16 = 0x4242;
+
+    // Reply datagram: src = server, dst = the pool SNAT address.
+    let first = make_ipv4_frag_udp(server_v4, snat_v4, 53, 1000, &[0xCCu8; 16], 0, true, ident);
+    let nonfirst = make_ipv4_frag_udp(server_v4, snat_v4, 0, 0, &[0xDDu8; 24], 120, false, ident);
+
+    let kf = nat64_first_fragment_key(&first, libc::AF_INET).expect("first key");
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET).expect("non-first key");
+    assert_eq!(kf, kn, "reverse fragments share the port-free key");
+    assert_eq!(
+        kf.ident,
+        u32::from(ident),
+        "v4 ident zero-extended into the key"
+    );
+
+    // Reverse association carries the original v6 addresses (the frame builder's
+    // v4->v6 branch reads these; `decision.nat` value is not consulted here).
+    let cache = Nat64FragAssoc::new();
+    let reverse = Nat64ReverseInfo {
+        orig_src_v6: orig_client_v6,
+        orig_dst_v6,
+    };
+    let decision = frag_test_decision(Nat64State::forward_decision(snat_v4, server_v4, 5000));
+    cache.install(kf, decision, Some(reverse), 2_000);
+    let (_hit, rev) = cache
+        .lookup(&kn, 2_400)
+        .expect("reverse non-first inherits");
+    assert_eq!(
+        rev,
+        Some(reverse),
+        "non-first reply fragment inherits reverse info"
+    );
+
+    // Translate the non-first reply fragment L3-only. RED-on-revert: forcing
+    // `write_v4_to_v6_nonfirst_into` back to `None` fails this.
+    let mut out = vec![0u8; nonfirst.len() + 64];
+    let n = write_v4_to_v6_nonfirst_into(&mut out, &nonfirst, orig_dst_v6, orig_client_v6)
+        .expect("non-first v4 fragment translates (inherited)");
+    let v6 = &out[..n];
+    assert_eq!(v6[0] >> 4, 6, "output is IPv6");
+    assert_eq!(
+        &v6[8..24],
+        &orig_dst_v6.octets(),
+        "reply src = prefix::server"
+    );
+    assert_eq!(
+        &v6[24..40],
+        &orig_client_v6.octets(),
+        "reply dst = original client"
+    );
+    assert_eq!(v6[6], 44, "Fragment Header inserted");
+    assert_eq!(
+        u32::from_be_bytes([v6[44], v6[45], v6[46], v6[47]]),
+        u32::from(ident),
+        "v6 ident = v4 16-bit ident zero-extended",
+    );
+    let fw = u16::from_be_bytes([v6[42], v6[43]]);
+    assert_eq!(fw >> 3, 120, "offset preserved verbatim");
+    assert_eq!(fw & 1, 0, "MF copied (last fragment)");
+    // Payload copied verbatim (everything after the v4 20-byte header).
+    assert_eq!(
+        &v6[48..n],
+        &nonfirst[20..],
+        "payload copied verbatim, no L4 touch"
+    );
+}
+
+#[test]
+fn nat64_frag_assoc_nonfirst_without_first_misses_and_drops() {
+    // A non-first fragment with NO installed first fragment MISSES -> the caller
+    // drops it fail-closed (#4617). The existing first-path translator also
+    // still drops a non-first fragment (no association => never L3-translated).
+    let cache = Nat64FragAssoc::new();
+    let src_v6: Ipv6Addr = "2001:db8::5".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 0, 0, &[0u8; 16], 100, false, 0x9999);
+    let kn = nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6).expect("key");
+    assert!(
+        cache.lookup(&kn, 10).is_none(),
+        "orphan non-first fragment misses"
+    );
+    let snat = Ipv4Addr::new(198, 51, 100, 5);
+    let dst = Ipv4Addr::new(192, 0, 2, 5);
+    assert!(
+        translate_v6_to_v4(&nonfirst, snat, dst, false).is_none(),
+        "an unassociated non-first fragment is still dropped by the first-path translator",
+    );
+}
+
+#[test]
+fn nat64_frag_assoc_cache_is_bounded() {
+    // No unbounded growth: inserting far more distinct keys than the fixed
+    // ceiling must NOT exceed it (LRU eviction). RED-on-revert: dropping the
+    // `if shard.len() >= CAP { remove(0) }` eviction lets the cache grow without
+    // bound.
+    let cache = Nat64FragAssoc::new();
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+    let ceiling = NAT64_FRAG_SHARDS * NAT64_FRAG_CAP_PER_SHARD;
+    for i in 0..(ceiling * 4) as u32 {
+        let key = Nat64FragKey {
+            addr_family: libc::AF_INET6 as u8,
+            src: IpAddr::V6(src_v6),
+            dst: IpAddr::V6(dst_v6),
+            ident: i,
+        };
+        cache.install(key, decision, None, 1_000);
+    }
+    assert!(
+        cache.len() <= ceiling,
+        "cache must be bounded to {} entries; got {}",
+        ceiling,
+        cache.len(),
+    );
+}
+
+#[test]
+fn nat64_frag_assoc_ttl_evicts() {
+    // The association expires after the short TTL and is pruned on the next
+    // consult. RED-on-revert: dropping the `retain(deadline > now)` prune (or the
+    // deadline field) makes the expired entry still hit.
+    let cache = Nat64FragAssoc::new();
+    let key = Nat64FragKey {
+        addr_family: libc::AF_INET6 as u8,
+        src: IpAddr::V6("2001:db8::1".parse().unwrap()),
+        dst: IpAddr::V6("64:ff9b::0808:0808".parse().unwrap()),
+        ident: 7,
+    };
+    let decision = frag_test_decision(Nat64State::forward_decision(
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(8, 8, 8, 8),
+        5000,
+    ));
+    cache.install(key, decision, None, 1_000);
+    assert_eq!(cache.len(), 1);
+    // Still within the TTL window: hit.
+    assert!(cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS - 1).is_some());
+    // Past the (refreshed) TTL with no intervening hit: pruned + miss.
+    cache.install(key, decision, None, 1_000);
+    assert!(
+        cache.lookup(&key, 1_000 + NAT64_FRAG_TTL_NS + 1).is_none(),
+        "expired association must miss",
+    );
+    assert_eq!(cache.len(), 0, "expired entry pruned");
+}

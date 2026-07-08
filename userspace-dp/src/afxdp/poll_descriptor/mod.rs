@@ -67,6 +67,61 @@ use filter::{
 /// `term_match_extra_from_frame` (the same one the firewall-filter icmp-type
 /// terms consume), so the policy and filter planes agree on which type/code a
 /// frame carries. Cold-path only (policy is evaluated on session miss).
+/// #2562: on a FIRST NAT64 fragment that translated and will forward, install
+/// the fragment association keyed by `(family, src, dst, ip_id)` so its
+/// non-first fragments inherit `decision` (see `nat64::Nat64FragAssoc`). Gated
+/// on a resolved ForwardCandidate — a decision that will NOT forward (no route,
+/// missing neighbor) is never cached, so a non-first fragment then misses and
+/// drops fail-closed. Only a first fragment (offset 0, MF=1) installs; a
+/// non-first fragment can never populate the table.
+#[inline]
+fn nat64_install_forward_fragment_assoc(
+    forwarding: &ForwardingState,
+    l3_packet: &[u8],
+    addr_family: i32,
+    decision: &SessionDecision,
+    now_ns: u64,
+) {
+    if decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
+        || decision.resolution.neighbor_mac.is_none()
+    {
+        return;
+    }
+    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family) {
+        forwarding
+            .nat64
+            .frag_assoc
+            .install(key, *decision, None, now_ns);
+    }
+}
+
+/// #2562: consult the fragment association for a NON-first NAT64 forward
+/// fragment (v6->v4). On a hit whose cached decision is a NAT64 translation,
+/// return that decision (resolution + `decision.nat` carrying snat_v4/dst_v4) so
+/// the flowless arm inherits the first fragment's permitted verdict + egress and
+/// the TX path L3-translates the fragment. A miss returns `None` and the caller
+/// falls through to the ordinary flowless drop (fail-closed, #4617). The reverse
+/// (v4->v6) consult/install is the deferred increment (see the #2562 PR notes).
+#[inline]
+fn nat64_consult_forward_fragment_assoc(
+    forwarding: &ForwardingState,
+    l3_packet: &[u8],
+    addr_family: i32,
+    now_ns: u64,
+) -> Option<SessionDecision> {
+    if addr_family != libc::AF_INET6 {
+        return None;
+    }
+    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family)?;
+    let (decision, _reverse) = forwarding.nat64.frag_assoc.lookup(&key, now_ns)?;
+    // Only a genuine NAT64 forward decision (nat64=true, rewrite_src/dst set)
+    // routes to the NAT64 frame builder.
+    if !decision.nat.nat64 {
+        return None;
+    }
+    Some(decision)
+}
+
 #[inline]
 fn policy_packet_icmp(packet_frame: &[u8], meta: UserspaceDpMeta) -> Option<(u8, u8)> {
     if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
@@ -2659,6 +2714,24 @@ pub(super) fn poll_binding_process_descriptor(
                                                 dst_v4,
                                                 translated_port,
                                             );
+                                            // #2562: if THIS is a first fragment
+                                            // (offset 0, MF=1), install the
+                                            // fragment association so its
+                                            // non-first fragments inherit this
+                                            // translation instead of dropping
+                                            // fail-closed (#4617). No-op for a
+                                            // non-fragmented / atomic packet.
+                                            if let Some(l3_packet) =
+                                                packet_frame.get(meta.l3_offset as usize..)
+                                            {
+                                                nat64_install_forward_fragment_assoc(
+                                                    worker_ctx.forwarding,
+                                                    l3_packet,
+                                                    meta.addr_family as i32,
+                                                    &decision,
+                                                    now_ns,
+                                                );
+                                            }
                                             Some(Nat64ReverseInfo {
                                                 orig_src_v6,
                                                 orig_dst_v6,
@@ -3437,6 +3510,30 @@ pub(super) fn poll_binding_process_descriptor(
                         }
                         decision
                     }
+                } else if let Some(hit) = packet_frame
+                    .get(meta.l3_offset as usize..)
+                    .and_then(|l3| {
+                        // #2562: NAT64 forward non-first fragment fast path. A
+                        // cached association (installed by the FIRST fragment on
+                        // the cold path above) lets this non-first fragment
+                        // inherit the first fragment's permitted verdict, egress
+                        // resolution, AND NAT64 translation, so the whole
+                        // datagram traverses NAT64 and reassembles at the
+                        // receiver instead of the non-first fragments dropping
+                        // fail-closed (#4617). A MISS falls through to the normal
+                        // flowless L3 enforcement below (which drops an
+                        // unassociated NAT64 fragment fail-closed). The consult is
+                        // gated on a non-first fragment carrying a NAT64-decision
+                        // cache hit, so no other flowless traffic is touched.
+                        nat64_consult_forward_fragment_assoc(
+                            worker_ctx.forwarding,
+                            l3,
+                            meta.addr_family as i32,
+                            now_ns,
+                        )
+                    })
+                {
+                    hit
                 } else {
                     // #3291: flowless transit enforcement. A non-first fragment
                     // / no-L4 transit packet (#2344 makes it flowless so payload
