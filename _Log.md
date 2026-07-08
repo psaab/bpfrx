@@ -40818,3 +40818,34 @@ top.
   string fallback when either side is unparseable so a genuine change is never
   masked) and routed the two CIDR compares through it. RED-on-revert verified.
 - **File(s)**: pkg/ra/ra.go, pkg/ra/ra_test.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4569 (ps-036-c7 F-001, RUST, userspace-dp policy) — a non-first
+  fragment bypassed a port-bearing DENY when a later permit-any existed. On the
+  flowless transit path `evaluate_policy_result_l3_aware` is called with
+  `l4_present=false` (#2344 makes a non-first fragment flowless, dst_port=0), so
+  `ApplicationMatcher::matches` gated a port-bearing DENY term (junos-https) off
+  → the DENY returned None ("rule does not apply") → first-match fell through to
+  a later `permit any` → the fragment forwarded, bypassing the DENY (fail-open
+  twin of the #3291/#4024 deny-all fix). Fix (minimal, Junos fragment-
+  association fail-closed): while walking rules in first-match precedence order,
+  `note_skipped_frag_deny` remembers the FIRST port-bearing DENY (`deny`/
+  `reject`) whose L3 (zone fixed by the tier bucket + src/dst address) OVERLAPS
+  the fragment but was skipped ONLY because `l4_present=false`
+  (`rule_is_skipped_frag_ambiguous_deny` + new `CompiledApplications::
+  has_l4_constrained_term`); if the walk then lands on a PERMIT or default-
+  permit, `apply_frag_deny_override` OVERRIDES to DROP and attributes the
+  PolicyDeny event to that DENY. Scoped narrowly: a fragment with NO overlapping
+  skipped DENY still forwards; the L4 (`l4_present=true`) path is byte-identical
+  (note/override inert). Documented over-drop trade-off (a legit non-denied-port
+  fragment from the same L3 is dropped — the Junos secure default); the
+  fragment-association cache is the deferred principled fix. Extracted the L3
+  address-match block from `try_match_rule` into `rule_l3_matches` so the
+  overlap check uses the EXACT same logic (incl. *-excluded / NAT64 arm).
+  RED-on-revert verified (neutered `note_skipped_frag_deny` → flowless fragment
+  returns Permit). Full cargo bin suite 3720/0 (one WG frame test,
+  `wg_encap_frame_resolves_outer_route_once_v4`, flaked once under parallelism
+  then passed isolated + on rerun — a pre-existing test-isolation flake in an
+  unrelated subsystem, no code path touches policy).
+- **File(s)**: userspace-dp/src/policy.rs, userspace-dp/src/policy_tests.rs,
+  docs/feature-gaps.md, _Log.md

@@ -4767,6 +4767,162 @@ fn junos_host_l3_aware_any_app_matches_regardless_of_l4_presence() {
     );
 }
 
+// ── #4569: fragment-association fail-closed (transit zone policy) ─────
+//
+// A trust->untrust policy that DENIES a port-bearing app (junos-https =
+// tcp/443) from 10.0.0.0/8, FOLLOWED by a permit-any. On the flowless path a
+// non-first fragment (l4_present = false, dst_port = 0) cannot be classified
+// into the port-bearing deny, so before #4569 first-match fell through to the
+// permit and the fragment was FORWARDED — bypassing the deny. The guard now
+// remembers the skipped overlapping deny and overrides the permit to a DROP.
+fn frag_deny_https_snapshot() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        policy_id: 7,
+        name: "deny-https-10".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: "untrust".to_string(),
+        source_addresses: vec!["10.0.0.0/8".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["junos-https".to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: "junos-https".to_string(),
+            protocol: "tcp".to_string(),
+            source_port: String::new(),
+            destination_port: "443".to_string(),
+            icmp_type: None,
+            icmp_code: None,
+            inactivity_timeout: None,
+        }],
+        action: "deny".to_string(),
+        ..Default::default()
+    }
+}
+
+fn frag_permit_any_snapshot() -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        policy_id: 8,
+        name: "permit-rest".to_string(),
+        from_zone: "trust".to_string(),
+        to_zone: "untrust".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn flowless_fragment_fails_closed_against_skipped_port_bearing_deny_4569() {
+    let state = parse_policy_state(
+        "deny",
+        &[frag_deny_https_snapshot(), frag_permit_any_snapshot()],
+        &test_zone_name_to_id(),
+    );
+    // Overlaps the deny's source 10.0.0.0/8.
+    let denied_src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3));
+    // Does NOT overlap the deny's source.
+    let other_src = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1));
+    let dst = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5));
+
+    // (a) FIRST / atomic fragment (l4_present = true, dst_port = 443): the
+    //     junos-https deny matches on the real port -> Deny. Unchanged behavior;
+    //     anchors that the deny's port term itself matches.
+    assert_eq!(
+        evaluate_policy_result_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            denied_src,
+            dst,
+            PROTO_TCP,
+            40000,
+            443,
+            None,
+            64,
+            true,
+        )
+        .action,
+        PolicyAction::Deny,
+        "first fragment (l4_present) must hit the junos-https deny on the real port",
+    );
+
+    // (b) FULL L4 packet on a DIFFERENT port (dst_port = 80) from the SAME L3:
+    //     the deny's 443 term does not match -> falls to permit -> Permit. Proves
+    //     the guard does NOT over-drop L4-present traffic (it is flowless-only).
+    assert_eq!(
+        evaluate_policy_result_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            denied_src,
+            dst,
+            PROTO_TCP,
+            40000,
+            80,
+            None,
+            64,
+            true,
+        )
+        .action,
+        PolicyAction::Permit,
+        "an L4-present packet on a non-denied port must still be permitted",
+    );
+
+    // (c) NON-FIRST fragment (l4_present = false, dst_port = 0) from 10.0.0.0/8:
+    //     the port-bearing junos-https deny is skipped for l4_present == false and
+    //     the walk would fall to permit-any -> OVERRIDE to Deny (fail closed).
+    //     RED ON REVERT: without the guard this returns Permit (fragment
+    //     forwarded), bypassing the deny.
+    let frag = evaluate_policy_result_l3_aware(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+        denied_src,
+        dst,
+        PROTO_TCP,
+        0,
+        0,
+        None,
+        64,
+        false,
+    );
+    assert_eq!(
+        frag.action,
+        PolicyAction::Deny,
+        "a flowless fragment overlapping a skipped port-bearing deny must fail closed",
+    );
+    // The drop is attributed to the skipped junos-https deny rule (policy_id 7),
+    // not to the implicit default-policy sentinel.
+    assert_eq!(
+        frag.policy_id, 7,
+        "the fragment drop must be attributed to the skipped deny rule",
+    );
+
+    // (d) NON-FIRST fragment from an L3 with NO overlapping deny (192.168.1.1):
+    //     the deny does not overlap -> not a skipped-overlap -> the permit stands
+    //     -> forwarded. Proves the guard is scoped to overlapping denies only and
+    //     does not over-drop unrelated fragments.
+    assert_eq!(
+        evaluate_policy_result_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            other_src,
+            dst,
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        )
+        .action,
+        PolicyAction::Permit,
+        "a flowless fragment with no overlapping deny must forward normally",
+    );
+}
+
 // ── #3073: established-session policy hit-count (per-packet) ──────────
 //
 // Before #3073 the per-rule packet/byte hit counter was incremented
