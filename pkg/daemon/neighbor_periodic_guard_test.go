@@ -119,7 +119,7 @@ func TestNeighborPeriodicLoopKeepsTickingWhilePhaseWedged(t *testing.T) {
 	// resolveTick dispatches a phase that wedges forever (models a stuck
 	// netlink syscall) through the real guarded-goroutine helper.
 	resolveTick := func() {
-		d.runGuardedNeighborPhase(&d.resolveNeighborsInFlight, &d.resolveLastSuccessNanos, func() {
+		d.runGuardedNeighborPhase(&d.neighborGuards.resolveInFlight, &d.neighborGuards.resolveLastSuccessNanos, func() {
 			resolveStarted.Store(true)
 			<-release
 		})
@@ -138,7 +138,7 @@ func TestNeighborPeriodicLoopKeepsTickingWhilePhaseWedged(t *testing.T) {
 	}
 	// The wedged resolve phase stayed in flight — no relaunch, no panic, and
 	// crucially the loop kept servicing the clean ticker.
-	if !d.resolveNeighborsInFlight.Load() {
+	if !d.neighborGuards.resolveInFlight.Load() {
 		t.Fatal("expected the wedged resolve phase to remain in-flight")
 	}
 
@@ -156,7 +156,7 @@ func TestNeighborPeriodicPhaseAgesReflectsStall(t *testing.T) {
 		t.Fatalf("expected nil phase ages before loop start, got %v", ages)
 	}
 
-	d.neighborPeriodicLoopStarted.Store(true)
+	d.neighborGuards.loopStarted.Store(true)
 
 	// All phases never-run: each reports ~age-since-start (~30s), proving a
 	// phase that never completes still flags rather than reading zero. warm is
@@ -176,7 +176,7 @@ func TestNeighborPeriodicPhaseAgesReflectsStall(t *testing.T) {
 	// Mark resolve just-completed; its age drops near zero while the others
 	// keep climbing from start — the healthy-vs-stalled contrast operators
 	// read off the gauge.
-	d.resolveLastSuccessNanos.Store(time.Now().UnixNano())
+	d.neighborGuards.resolveLastSuccessNanos.Store(time.Now().UnixNano())
 	ages = d.NeighborPeriodicPhaseAges()
 	if ages["resolve"] > 2 {
 		t.Fatalf("just-completed resolve phase reported age %.1fs; want ~0", ages["resolve"])
@@ -187,7 +187,7 @@ func TestNeighborPeriodicPhaseAgesReflectsStall(t *testing.T) {
 
 	// A last-success timestamp in the future (models a backward clock step)
 	// must clamp to 0, not report a negative age (Copilot #1781 r2).
-	d.cleanFailedLastSuccessNanos.Store(time.Now().Add(10 * time.Second).UnixNano())
+	d.neighborGuards.cleanFailedLastSuccessNanos.Store(time.Now().Add(10 * time.Second).UnixNano())
 	if got := d.NeighborPeriodicPhaseAges()["clean_failed"]; got < 0 {
 		t.Fatalf("backward-clock-step age not clamped: got %.3fs, want >= 0", got)
 	}

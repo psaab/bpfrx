@@ -286,37 +286,24 @@ type Daemon struct {
 	syncPeerBulkPrimed               atomic.Bool
 	syncPeerConnected                atomic.Bool
 	lastStandbyNeighborRefresh       atomic.Int64
-	neighborWarmupInFlight           atomic.Bool
-	// #1780 Path A: per-phase supervision of runPeriodicNeighborResolution.
-	// Each periodic phase runs in a guarded goroutine so a hung netlink/probe
-	// syscall in one phase can never freeze the for-select loop (the observed
-	// 17.5h stall). In-flight bools skip a phase while a prior pass is still
-	// running (no overlap / netlink-socket leak — a stuck syscall can't be
-	// cancelled, so we leak at most one goroutine per phase, never a growing
-	// pile). The last-success UnixNano feeds the
-	// neighbor_periodic_last_success_age_seconds{phase} gauge so a stalled
-	// phase is observable. neighborWarmupInFlight (above) already follows this
-	// pattern for warmNeighborCache.
-	resolveNeighborsInFlight    atomic.Bool
-	forceProbeInFlight          atomic.Bool
-	cleanFailedInFlight         atomic.Bool
-	resolveLastSuccessNanos     atomic.Int64
-	forceProbeLastSuccessNanos  atomic.Int64
-	cleanFailedLastSuccessNanos atomic.Int64
-	warmLastSuccessNanos        atomic.Int64
-	// neighborPeriodicLoopStarted gates the phase-age gauge: it is set
-	// once runPeriodicNeighborResolution actually starts (the loop only
-	// runs when the dataplane is enabled with active config). Without it,
-	// a daemon that never starts the loop would report every phase as a
-	// forever-climbing "wedged" age — a false positive (Codex #1781 r1).
-	neighborPeriodicLoopStarted atomic.Bool
-	hbSuppressStart             atomic.Int64 // CLOCK_MONOTONIC nanos of first heartbeat suppression; 0 = inactive (#1792)
-	syncPrimeRetryGen           atomic.Uint64
-	syncReadyTimerGen           atomic.Uint64
-	syncReadyTimerMu            sync.Mutex
-	syncReadyTimer              *time.Timer
-	syncReadyTimeout            time.Duration
-	slogHandler                 *logging.SyslogSlogHandler
+	// neighborGuards groups the #1780 Path A per-phase supervision state for
+	// runPeriodicNeighborResolution (in-flight overlap guards, last-success
+	// timestamps, loop-started gate, plus the warmNeighborCache warmup guard).
+	// See neighborPeriodicGuards in daemon_neighbor.go. This is increment 2 of
+	// the #4407 Daemon god-struct decomposition — pure field grouping, no
+	// behavior/locking change; the fields keep their exact atomic types and are
+	// reached as d.neighborGuards.<field>. lastStandbyNeighborRefresh (above)
+	// stays a flat Daemon field: it is the standby-side refresh rate limit read
+	// in daemon_health.go, a different mechanism from the periodic-resolution
+	// supervision grouped here.
+	neighborGuards    neighborPeriodicGuards
+	hbSuppressStart   atomic.Int64 // CLOCK_MONOTONIC nanos of first heartbeat suppression; 0 = inactive (#1792)
+	syncPrimeRetryGen atomic.Uint64
+	syncReadyTimerGen atomic.Uint64
+	syncReadyTimerMu  sync.Mutex
+	syncReadyTimer    *time.Timer
+	syncReadyTimeout  time.Duration
+	slogHandler       *logging.SyslogSlogHandler
 	// #3932: the flow-traceoptions writer is published through an atomic
 	// pointer read lock-free by a SINGLE stable EventReader callback that
 	// traceCBOnce registers exactly once. Each commit that changes
