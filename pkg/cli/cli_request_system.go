@@ -1,0 +1,210 @@
+package cli
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+)
+
+func (c *CLI) handleRequestSystem(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children))
+		return nil
+	}
+
+	switch args[0] {
+	case "reboot":
+		fmt.Print("Reboot the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Reboot cancelled")
+			return nil
+		}
+		fmt.Println("System going down for reboot NOW!")
+		cmd := exec.Command("systemctl", "reboot")
+		return cmd.Run()
+
+	case "halt":
+		fmt.Print("Halt the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Halt cancelled")
+			return nil
+		}
+		fmt.Println("System halting NOW!")
+		cmd := exec.Command("systemctl", "halt")
+		return cmd.Run()
+
+	case "power-off":
+		fmt.Print("Power off the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Power-off cancelled")
+			return nil
+		}
+		fmt.Println("System powering off NOW!")
+		cmd := exec.Command("systemctl", "poweroff")
+		return cmd.Run()
+
+	case "zeroize":
+		fmt.Println("WARNING: This will erase all configuration and return to factory defaults.")
+		fmt.Print("Zeroize the system? [yes,no] (no) ")
+		c.rl.SetPrompt("")
+		line, err := c.rl.Readline()
+		c.rl.SetPrompt(c.operationalPrompt())
+		if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+			fmt.Println("Zeroize cancelled")
+			return nil
+		}
+
+		// Remove active and candidate configs, rollback history
+		configDir := "/etc/xpf"
+		files, _ := os.ReadDir(configDir)
+		for _, f := range files {
+			if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
+				os.Remove(configDir + "/" + f.Name())
+			}
+		}
+
+		// Remove BPF pins
+		os.RemoveAll("/sys/fs/bpf/xpf")
+
+		// Remove managed networkd files
+		ndFiles, _ := os.ReadDir("/etc/systemd/network")
+		for _, f := range ndFiles {
+			if strings.HasPrefix(f.Name(), "10-xpf-") {
+				os.Remove("/etc/systemd/network/" + f.Name())
+			}
+		}
+
+		// Remove FRR managed section
+		exec.Command("systemctl", "stop", "xpfd").Run()
+
+		fmt.Println("System zeroized. Configuration erased.")
+		fmt.Println("Reboot to complete factory reset.")
+		return nil
+
+	case "configuration":
+		return c.handleRequestSystemConfiguration(args[1:])
+
+	case "software":
+		return c.handleRequestSystemSoftware(args[1:])
+
+	case "dynamic-dns":
+		return c.handleRequestSystemDynamicDNS(args[1:])
+
+	default:
+		return fmt.Errorf("unknown request system command: %s", args[0])
+	}
+}
+
+// handleRequestSystemDynamicDNS implements `request system dynamic-dns
+// update|check` (#3276): an operator force-now / check-now verb that triggers an
+// immediate DDNS publish out-of-band of the poll cycle. `update` re-asserts
+// every owned record now (force); `check` re-observes and publishes only changed
+// records. Both honor the per-RG owner gate — on a node that masters no RG the
+// daemon returns a clear "not the active node" message and takes no action.
+func (c *CLI) handleRequestSystemDynamicDNS(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system dynamic-dns:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["dynamic-dns"].Children))
+		return nil
+	}
+	if c.surfaceADDNSForceFn == nil {
+		return fmt.Errorf("dynamic-dns: DDNS engine not running")
+	}
+	switch args[0] {
+	case "update":
+		_, msg := c.surfaceADDNSForceFn(true)
+		fmt.Println(msg)
+		return nil
+	case "check":
+		_, msg := c.surfaceADDNSForceFn(false)
+		fmt.Println(msg)
+		return nil
+	default:
+		return fmt.Errorf("unknown request system dynamic-dns command: %s", args[0])
+	}
+}
+
+func (c *CLI) handleRequestSystemSoftware(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system software:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["software"].Children))
+		return nil
+	}
+
+	if args[0] != "in-service-upgrade" {
+		return fmt.Errorf("unknown request system software command: %s", args[0])
+	}
+
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+
+	fmt.Println("WARNING: This will force this node to secondary for all redundancy groups.")
+	fmt.Print("Proceed with in-service upgrade? [yes,no] (no) ")
+	c.rl.SetPrompt("")
+	line, err := c.rl.Readline()
+	c.rl.SetPrompt(c.operationalPrompt())
+	if err != nil || strings.TrimSpace(strings.ToLower(line)) != "yes" {
+		fmt.Println("ISSU cancelled")
+		return nil
+	}
+
+	if err := c.cluster.ForceSecondary(); err != nil {
+		return fmt.Errorf("ISSU: %v", err)
+	}
+
+	fmt.Println("Node is now secondary for all redundancy groups.")
+	fmt.Println("Traffic has been drained to peer.")
+	fmt.Println("You may now replace the binary and restart the service:")
+	fmt.Println("  systemctl stop xpfd && <replace binary> && systemctl start xpfd")
+	return nil
+}
+
+func (c *CLI) handleRequestSystemConfiguration(args []string) error {
+	if len(args) == 0 {
+		fmt.Println("request system configuration:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["configuration"].Children))
+		return nil
+	}
+
+	if args[0] != "rescue" {
+		return fmt.Errorf("unknown request system configuration command: %s", args[0])
+	}
+
+	if len(args) < 2 {
+		fmt.Println("request system configuration rescue:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["system"].Children["configuration"].Children["rescue"].Children))
+		return nil
+	}
+
+	switch args[1] {
+	case "save":
+		if err := c.store.SaveRescueConfig(); err != nil {
+			return err
+		}
+		fmt.Println("Rescue configuration saved")
+		return nil
+
+	case "delete":
+		if err := c.store.DeleteRescueConfig(); err != nil {
+			return err
+		}
+		fmt.Println("Rescue configuration deleted")
+		return nil
+
+	default:
+		return fmt.Errorf("unknown request system configuration rescue command: %s", args[1])
+	}
+}
