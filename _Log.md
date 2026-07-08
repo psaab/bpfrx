@@ -41012,3 +41012,31 @@ top.
   gofmt+vet clean.
 - **File(s)**: pkg/cluster/heartbeat_manager.go,
   pkg/cluster/heartbeat_family_4549_test.go, docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-07-08T05:27Z
+- **Action**: #2261 — add a GOLDEN external-ground-truth test pinning the Kea
+  3.0.x memfile CSV schema so the standby pre-seed header can never silently
+  drift and break the live loader on failover. The pre-existing memfile tests
+  are self-referential: `TestPreSeedMemfile6_EmitsHWAddress` derives its
+  expected columns from `keaMemfileHeader6` itself (`strings.Split(...)`) and
+  the writer emits that same const, so a CO-DRIFT of the const AND the writer
+  still passes them — yet a reordered/renamed column breaks the LIVE Kea 3.0.3
+  loader when the promoted node reads the standby's pre-seeded memfile
+  (positional CSV; the #2261 byte-exactness residual). New
+  `TestKeaMemfileHeadersMatchKea30xSchema` (pkg/dhcpserver/lease_sync_test.go)
+  hard-codes the exact Kea 3.0.x lease4 (12-col) and lease6 (18-col) headers as
+  LITERAL strings — NOT built from the production const — and asserts
+  `keaMemfileHeader{4,6}` equal them byte-for-byte, plus writes one lease per
+  family and counts the emitted columns against the golden (catches a
+  writer+const co-drift). RED-on-revert VERIFIED: swapping the two trailing
+  empty columns (`hwtype`<->`hwaddr_source`) in the production const — count
+  stays 18, hwaddr stays index 12 — leaves the OLD self-referential test
+  PASSING but FAILS the new golden test (proving it is external ground truth,
+  not a tautology). Also authored `test/incus/dhcp-lease-failover.sh` codifying
+  the lab-gated live smoke steps (knob-ON, dhcp-local-server, client lease,
+  standby memfile byte-exactness gate, hard failover, retention + no-dup-alloc
+  asserts) — NOT wired into `make test`/CI (reboots a shared-cluster node,
+  needs a DHCP-client fixture); the live lease-survives-failover acceptance
+  stays plan-deferred-lab on #2261. go test ./pkg/dhcpserver/... green; go
+  build ./... clean; gofmt + vet clean; bash -n + shellcheck clean.
+- **File(s)**: pkg/dhcpserver/lease_sync_test.go,
+  test/incus/dhcp-lease-failover.sh, pkg/dhcpserver/README.md, _Log.md
