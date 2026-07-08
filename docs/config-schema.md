@@ -66,6 +66,19 @@ code-motion split — every `(compiler_validate_strict.go)` locator
 elsewhere in this document still names the correct, unchanged function, now
 in whichever sibling file holds it (grep the function name to find it).
 
+Each gate is a hand-wired `if err := validate<X>Strict(cfg); err != nil {
+... }` line in `runUniformGates` (`compiler_uniformgates.go`) / `compiler.go`.
+Adding a gate function without adding that invocation line leaves it DEAD —
+it compiles, its own unit test may still pass if it calls the function
+directly, yet the commit path never runs it and the misconfiguration it
+guards silently ships. `TestEveryStrictCommitGateIsWired`
+(`pkg/config/strict_gate_wiring_canary_test.go`, #4422) is the completeness
+canary that closes that gap: it parses the package source (`go/ast`),
+collects every top-level `func validate*Strict(cfg *Config) error`, and fails
+if any is never invoked in a non-test file. It mirrors the metrics-side
+`pkg/api` `TestCollectorDescriptorCoverage` idiom. So: define a new strict
+gate AND wire it into `runUniformGates`, or the canary goes red naming it.
+
 The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 `pkg/grpcapi` `completeConfigPairs` — route `set` paths through
 `config.CompleteSetPathWithValues` over `setSchema`. `cmdtree.ConfigTopLevel`
