@@ -41273,6 +41273,24 @@ top.
   pkg/frr/frr_test.go, pkg/api/README.md, pkg/logging/README.md,
   pkg/frr/README.md, _Log.md
 
+- **Timestamp**: 2026-07-07
+  - **Action**: #4499 Rust test-coverage follow-ups from #4412 (avo-007).
+    Added focused RED-on-revert unit tests for the enumerated dataplane
+    paths that lacked coverage: E7 (PBR routing-instance override survives
+    NAT64 cross-family translation, no VRF leak to the base table), H1
+    (output filter applied on the PBR-selected egress, not the base egress —
+    no output-filter bypass via PBR), H6 (IPv6 PBR `destination-port` term
+    matches / fails CLOSED to base routing on a non-matching port), and the
+    H4 Rust kernel (output filter is re-evaluated per egress packet from
+    egress config, never synced session state). E2/E5 were verified
+    already-covered; E3 was doc-fixed in #4412; H6's IPv6 ext-header L4-offset
+    walk is already pinned by #4517. No production change (test-only). Each
+    new test's load-bearing production logic was mutation-verified RED
+    (canonical_route_table inet6->inet, the empty-routing-instance fail-closed
+    short-circuit, and output-filter egress-ifindex keying). Full cargo suite
+    3732/0.
+  - **File(s)**: userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/filter/tests.rs, _Log.md
 ## 2026-07-07 — #4313 closed-world flip: security ike proposal (Phase-1 crypto)
 
 - **Timestamp**: 2026-07-07
