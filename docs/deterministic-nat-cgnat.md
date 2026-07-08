@@ -10,6 +10,23 @@ overhead.
 
 **Commits:** `74e1d17` (IPv4 CGNAT), `439cd3f` (IPv6/NAPT64 extension)
 
+## Runtime status (userspace dataplane)
+
+> The original block allocator (`74e1d17`, `439cd3f`) lived only in the eBPF
+> plane, which was retired in #1373/#1476. After #1476 a deterministic pool
+> committed clean but SILENTLY round-robined on the userspace dataplane (the
+> only runtime). #4560 added a commit-time advisory; **#4559 ports the IPv4
+> (mode 1) block allocator to `userspace-dp`.**
+
+| Path | Status |
+|------|--------|
+| **IPv4 subscriber (mode 1)** | **ENFORCED** on the userspace dataplane (#4559). The Go builder carries the block/host params; the Rust allocator maps each in-range subscriber IPv4 to a fixed external pool address + port block, reversible from `(external IP, port)` with no per-flow state. |
+| **IPv6 subscriber / NAPT64 (mode 2)** | **Deferred.** Config-accepted + validated, but the userspace allocator does not yet implement it — the pool round-robins for IPv6 subscribers and the commit-time advisory (`ValidateConfig`, #4559) surfaces the gap. |
+
+See "Userspace Dataplane Implementation (#4559)" below. The "BPF
+Implementation" section is retained for historical reference only — that source
+was deleted in #1476.
+
 ## Configuration
 
 ### IPv4 Subscribers (Deterministic Mode 1)
@@ -166,7 +183,41 @@ subscriber = ntohl(host_base) + sub_idx        # subscriber IP
 This allows ISP logging of just `(public_ip, port_range, subscriber)` tuples
 at pool configuration time, instead of per-session SNAT logs.
 
+## Userspace Dataplane Implementation (#4559)
+
+The IPv4 (mode 1) path is implemented in the Rust AF_XDP dataplane. The
+external-IP + port-block assignment is byte-for-byte the same deterministic,
+reversible mapping the eBPF plane used (Algorithm above); the userspace version
+additionally tracks live flows so a port is not reused while a session is alive.
+
+| Component | Change |
+|-----------|--------|
+| `pkg/dataplane/userspace/nat_source.go` | `deterministicSourceNATFields()` precomputes `mode`/`block_size`/`blocks_per_ip`/`host_base` (host-order u32)/`host_count` from the pool + the defaulted port range, and stamps them on `SourceNATRuleSnapshot`. IPv4 host → mode 1; IPv6 host → mode 0 (deferred). |
+| `pkg/dataplane/userspace/protocol.go` | `SourceNATRuleSnapshot` gains the five additive `deterministic_*` wire fields (omitempty, #1961 skew-safe). |
+| `userspace-dp/src/protocol/nat.rs` | Rust mirror of the wire fields (`#[serde(default)]` — an old control plane omits them → round-robin). |
+| `userspace-dp/src/nat/allocator.rs` | `DeterministicV4` params; `deterministic_indices_v4()` (subscriber IPv4 → `(ip_idx, block_idx)`); `allocate_deterministic_v4()` (claims the first free port in the subscriber's block against the live owner map, collision-free); `reverse_deterministic_v4()` (`(external IP, port)` → subscriber IPv4, no per-flow state). A deterministic allocation is NOT recycled on release (its block is re-scanned directly), so a deterministic-only pool never grows the recycle queue. |
+| `userspace-dp/src/nat/source.rs` | Builds `SourceNatRule.deterministic_v4` from the snapshot (mode 1 only) and routes a deterministic-pool match through `allocate_deterministic_v4` instead of the round-robin allocator. An out-of-range subscriber fails CLOSED (`DeterministicSubscriberOutOfRange`) rather than silently round-robining. |
+| `pkg/config/compiler_validate_warn.go` | The #4560 advisory is narrowed to IPv6-host (mode 2) pools only — an IPv4-host deterministic pool is now enforced and does not warn. |
+
+**Difference from the retired eBPF version:** the eBPF allocator picked the
+port within a block with a single per-pool `counter++ % block_size` and kept no
+per-flow state. The userspace allocator instead claims the first *free* port in
+the block (checked against the shared live-owner map) and records the flow, so
+two concurrent sessions from one subscriber never collide on a translated tuple
+and a flow re-allocates its own tuple on retransmit. The subscriber→block→IP
+assignment (the part that must be deterministic and reversible for compliance
+logging) is identical.
+
+**Deferred (still tracked in #4559):**
+- IPv6 subscriber / NAPT64 (mode 2) block allocation.
+- Block-based pool-utilization for deterministic pools (the #2079 alarm still
+  skips them — `UsedPorts` is not the right numerator for block allocation).
+
 ## BPF Implementation
+
+> Historical: this source was deleted in #1476 (eBPF dataplane retirement). It
+> is retained here as the reference the userspace port (#4559) reproduces. The
+> live implementation is "Userspace Dataplane Implementation (#4559)" above.
 
 ### C Struct Extension
 

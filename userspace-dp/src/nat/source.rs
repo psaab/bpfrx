@@ -17,7 +17,8 @@
 // because the rewriters gate every L4 write on `has_l4_ports`).
 
 use super::allocator::{
-    NS_PER_SEC, PersistentSourceKey, PoolAddressFamily, PortAllocator, TranslatedTuple,
+    DeterministicV4, NS_PER_SEC, PersistentSourceKey, PoolAddressFamily, PortAllocator,
+    TranslatedTuple, deterministic_indices_v4,
 };
 use super::{NatCounterStore, NatDecision, NatRuleCounter, NatScopeCtx};
 use crate::SourceNATRuleSnapshot;
@@ -72,6 +73,12 @@ pub(crate) enum SourceNatFailureReason {
     /// per fragment and corrupt payload. Without datapath reassembly the
     /// fragment cannot be correctly port-mapped, so it is dropped.
     NonFirstFragment,
+    /// #4559: a deterministic CGNAT pool matched a flow whose subscriber IPv4 is
+    /// outside the configured `host address` range (or the pool's parameters are
+    /// degenerate). Deterministic NAT reserves a fixed block per in-range
+    /// subscriber; an out-of-range source has no reserved block, so the
+    /// allocation fails closed rather than silently round-robining it.
+    DeterministicSubscriberOutOfRange,
 }
 
 impl SourceNatFailureReason {
@@ -84,6 +91,9 @@ impl SourceNatFailureReason {
             Self::WrongAddressFamily => "source_nat_pool_wrong_family",
             Self::AllocatorExhausted => "source_nat_pool_exhausted",
             Self::NonFirstFragment => "source_nat_non_first_fragment",
+            Self::DeterministicSubscriberOutOfRange => {
+                "source_nat_deterministic_subscriber_out_of_range"
+            }
         }
     }
 }
@@ -266,6 +276,14 @@ pub(crate) struct SourceNatRule {
     pub(crate) persistent_nat_timeout_ns: u64,
     pub(crate) pool_addresses_v4: Vec<Ipv4Addr>,
     pub(crate) pool_addresses_v6: Vec<Ipv6Addr>,
+    /// #4559: deterministic CGNAT (mode 1, IPv4 subscriber) block-allocation
+    /// parameters. `Some` => this rule's pool maps each in-range subscriber IPv4
+    /// to a fixed external IP + port block (`allocate_deterministic_v4`) instead
+    /// of round-robin/sticky PAT. `None` => the pre-#4559 behaviour (unchanged).
+    /// Mode 2 (IPv6 subscriber / NAT64) is deferred — the Go compiler does not
+    /// set the snapshot fields for it, so it stays `None` and round-robins with
+    /// the commit-time advisory still surfacing the gap.
+    pub(crate) deterministic_v4: Option<DeterministicV4>,
     pub(crate) pool_allocator: PortAllocator,
     /// #2218: per-rule translation hit counter, shared from the
     /// coordinator's `NatCounterStore`. `None` when the rule carries no
@@ -625,6 +643,29 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             });
         } else if rule.pool_mode && port_low > port_high {
             rule.pool_failure = Some(SourceNatFailureReason::InvalidPortRange);
+        }
+        // #4559: deterministic CGNAT (mode 1, IPv4 subscriber). The Go compiler
+        // precomputes block_size / blocks_per_ip / host_base / host_count against
+        // the SAME defaulted port range this snapshot carries, so block
+        // boundaries align. Only mode 1 is wired here; an unknown mode (2 = IPv6
+        // subscriber / NAT64, deferred) leaves `deterministic_v4` None so the
+        // pool round-robins as before (the commit-time advisory covers the gap).
+        // Guard against a degenerate snapshot (blocks_per_ip 0 / block_size 0):
+        // treat it as non-deterministic rather than build a pool that fails every
+        // allocation.
+        if snap.deterministic_mode == 1
+            && snap.deterministic_block_size > 0
+            && snap.deterministic_blocks_per_ip > 0
+            && snap.deterministic_host_count > 0
+            && !rule.pool_addresses_v4.is_empty()
+            && rule.pool_failure.is_none()
+        {
+            rule.deterministic_v4 = Some(DeterministicV4 {
+                block_size: snap.deterministic_block_size,
+                blocks_per_ip: snap.deterministic_blocks_per_ip,
+                host_base: snap.deterministic_host_base,
+                host_count: snap.deterministic_host_count,
+            });
         }
         if total_pool > 0 {
             rule.pool_allocator = PortAllocator::new(total_pool, port_low, port_high);
@@ -1099,7 +1140,71 @@ pub(crate) fn match_source_nat_result_for_tuple(
         // like the port-less path.
         let address_only = port_less || tuple_unknown || rule.no_translation;
         match src_ip {
-            IpAddr::V4(_) if !rule.pool_addresses_v4.is_empty() => {
+            IpAddr::V4(src_v4) if !rule.pool_addresses_v4.is_empty() => {
+                // #4559: deterministic CGNAT (mode 1). The subscriber's internal
+                // IPv4 fixes both the external pool address and the port block, so
+                // no per-flow log is needed to reverse (external IP, port) back to
+                // the subscriber. Address-only cases (port-less / no-translation /
+                // tuple-unknown) still pick the DETERMINISTIC external address; the
+                // PAT case additionally allocates a port inside the subscriber's
+                // fixed block. An out-of-range subscriber fails closed rather than
+                // silently round-robining.
+                if let Some(det) = rule.deterministic_v4 {
+                    if address_only {
+                        let Some((ip_idx, _)) = deterministic_indices_v4(&det, src_v4) else {
+                            return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                                rule,
+                                SourceNatFailureReason::DeterministicSubscriberOutOfRange,
+                            ));
+                        };
+                        if ip_idx >= rule.pool_addresses_v4.len() {
+                            return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                                rule,
+                                SourceNatFailureReason::AllocatorExhausted,
+                            ));
+                        }
+                        let pool_addr = rule.pool_addresses_v4[ip_idx];
+                        let port = if tuple_unknown && !rule.no_translation {
+                            match rule.pool_allocator.try_next_port(ip_idx) {
+                                Ok(port) => Some(port),
+                                Err(reason) => {
+                                    return SourceNatLookup::Unavailable(
+                                        SourceNatFailure::for_rule(rule, reason),
+                                    );
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        return SourceNatLookup::Matched(NatDecision {
+                            rewrite_src: Some(IpAddr::V4(pool_addr)),
+                            rewrite_dst: None,
+                            rewrite_src_port: port,
+                            rewrite_dst_port: None,
+                            ..NatDecision::default()
+                        });
+                    }
+                    let translated = match rule.pool_allocator.allocate_deterministic_v4(
+                        flow,
+                        &rule.pool_addresses_v4,
+                        det,
+                        src_v4,
+                    ) {
+                        Ok(translated) => translated,
+                        Err(reason) => {
+                            return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                                rule, reason,
+                            ));
+                        }
+                    };
+                    return SourceNatLookup::Matched(NatDecision {
+                        rewrite_src: Some(translated.ip),
+                        rewrite_dst: None,
+                        rewrite_src_port: Some(translated.port),
+                        rewrite_dst_port: None,
+                        ..NatDecision::default()
+                    });
+                }
                 if address_only {
                     let addr_idx = rule.pool_allocator.address_index(
                         src_ip,

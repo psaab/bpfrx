@@ -7,8 +7,8 @@
 #![allow(unused_imports)]
 
 use super::allocator::{
-    ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, PoolAddressFamily,
-    TranslatedTuple, sticky_pool_index,
+    ALLOCATION_GC_BUDGET, DeterministicV4, NS_PER_SEC, PersistentLease, PersistentSourceKey,
+    PoolAddressFamily, TranslatedTuple, reverse_deterministic_v4, sticky_pool_index,
 };
 use super::source::{PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFlowKey};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
@@ -3380,5 +3380,185 @@ fn synced_reverse_entry_reserves_nothing_4388() {
     assert!(
         live.addr_index_by_translated.is_empty(),
         "a reverse synced entry must not reserve a pool source port"
+    );
+}
+
+// #4559 deterministic CGNAT (mode 1, IPv4 subscriber) block allocation.
+//
+// A deterministic-NAT pool maps each in-range subscriber IPv4 to a FIXED
+// external pool address + port block, computed purely from the subscriber's
+// internal address (no per-flow state). The mapping is reversible: from the
+// translated (external IP, port) alone the CGN operator recovers the subscriber
+// IP for lawful-intercept / audit WITHOUT per-connection logs — the whole point
+// of deterministic NAT.
+//
+// RED-ON-REVERT: revert the source.rs deterministic branch (so a deterministic
+// pool falls through to `allocate_translation` round-robin) and:
+//   - the first allocation lands at the round-robin cursor start (port_low =
+//     1024), NOT in subscriber A's computed block [3584, 4095] -> the
+//     "port in block" assertions turn RED;
+//   - `rules[0].deterministic_v4` becomes `None` (revert the source.rs parse
+//     wiring) -> the gating assertion turns RED;
+//   - the two subscribers no longer land on their deterministic external
+//     addresses / blocks -> the reverse-mapping assertions turn RED.
+#[test]
+fn deterministic_cgnat_v4_fixed_block_per_subscriber_reversible() {
+    // Pool of 4 external addresses, port range 1024..=65535 (64512 ports).
+    // block_size 512 -> blocks_per_ip = 126. Host CIDR 100.64.0.0/22 ->
+    // host_count 1024 (a /22).
+    let pool = [
+        Ipv4Addr::new(203, 0, 113, 1),
+        Ipv4Addr::new(203, 0, 113, 2),
+        Ipv4Addr::new(203, 0, 113, 3),
+        Ipv4Addr::new(203, 0, 113, 4),
+    ];
+    let host_base = u32::from(Ipv4Addr::new(100, 64, 0, 0));
+    let det = DeterministicV4 {
+        block_size: 512,
+        blocks_per_ip: 126,
+        host_base,
+        host_count: 1024,
+    };
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "cgnat".to_string(),
+        from_zone: "subs".to_string(),
+        to_zone: "inet".to_string(),
+        source_addresses: vec!["100.64.0.0/22".to_string()],
+        pool_name: "cgn-pool".to_string(),
+        pool_addresses: pool.iter().map(|a| format!("{a}/32")).collect(),
+        port_low: 1024,
+        port_high: 65535,
+        deterministic_mode: 1,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_base: host_base,
+        deterministic_host_count: 1024,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    // Gating: a mode-1 IPv4 deterministic snapshot builds a deterministic rule.
+    assert!(
+        rules[0].deterministic_v4.is_some(),
+        "mode-1 IPv4 deterministic snapshot must build a deterministic rule"
+    );
+
+    let alloc = |src: &str, dst: &str, sport: u16| -> (Ipv4Addr, u16) {
+        let mut counter = None;
+        let d = expect_snat_decision(match_source_nat_result_for_tuple(
+            &rules,
+            &NatScopeCtx::default(),
+            "subs",
+            "inet",
+            src.parse().expect("src"),
+            dst.parse().expect("dst"),
+            PROTO_TCP,
+            sport,
+            443,
+            None,
+            None,
+            0,
+            false,
+            false,
+            &mut counter,
+        ));
+        let ip = match d.rewrite_src.expect("rewrite_src") {
+            IpAddr::V4(v4) => v4,
+            other => panic!("expected v4 pool address, got {other}"),
+        };
+        (ip, d.rewrite_src_port.expect("deterministic PAT must allocate a port"))
+    };
+
+    // Subscriber A = 100.64.0.5 -> sub_idx 5, ip_idx 0, block_idx 5,
+    // block [1024 + 5*512, ..+511] = [3584, 4095], external pool[0].
+    let (a_ip, a_port) = alloc("100.64.0.5", "8.8.8.8", 10001);
+    assert_eq!(a_ip, pool[0], "subscriber A must map to its deterministic pool IP");
+    assert!(
+        (3584..=4095).contains(&a_port),
+        "subscriber A port {a_port} must fall in its deterministic block [3584,4095]"
+    );
+
+    // Same subscriber, a DIFFERENT flow (new remote) -> SAME external IP and the
+    // SAME block; a distinct free port inside the block (collision-free).
+    let (a2_ip, a2_port) = alloc("100.64.0.5", "9.9.9.9", 10002);
+    assert_eq!(a2_ip, pool[0], "same subscriber must keep the same deterministic IP");
+    assert!(
+        (3584..=4095).contains(&a2_port),
+        "same subscriber's second flow port {a2_port} must stay in block [3584,4095]"
+    );
+    assert_ne!(a_port, a2_port, "two live flows in one block must get distinct ports");
+
+    // Reverse: (external IP, port) -> subscriber, no per-flow state.
+    assert_eq!(
+        reverse_deterministic_v4(&det, &pool, 1024, a_ip, a_port),
+        Some(Ipv4Addr::new(100, 64, 0, 5)),
+        "reverse must recover subscriber A from (external IP, port) alone"
+    );
+    assert_eq!(
+        reverse_deterministic_v4(&det, &pool, 1024, a2_ip, a2_port),
+        Some(Ipv4Addr::new(100, 64, 0, 5)),
+        "the second flow reverses to the same subscriber A"
+    );
+
+    // Subscriber B = 100.64.1.0 -> sub_idx 256, ip_idx 2, block_idx 4,
+    // block [1024 + 4*512, ..+511] = [3072, 3583], external pool[2].
+    let (b_ip, b_port) = alloc("100.64.1.0", "8.8.8.8", 20001);
+    assert_eq!(b_ip, pool[2], "subscriber B must map to a DIFFERENT deterministic pool IP");
+    assert!(
+        (3072..=3583).contains(&b_port),
+        "subscriber B port {b_port} must fall in its deterministic block [3072,3583]"
+    );
+    assert_eq!(
+        reverse_deterministic_v4(&det, &pool, 1024, b_ip, b_port),
+        Some(Ipv4Addr::new(100, 64, 1, 0)),
+        "reverse must recover subscriber B"
+    );
+}
+
+// #4559 companion: a pool WITHOUT the deterministic mode is unchanged — it
+// builds a non-deterministic rule (`deterministic_v4 == None`) and round-robins
+// as before. Guards the gate so the deterministic path never engages for a
+// plain source-NAT pool.
+#[test]
+fn deterministic_cgnat_absent_leaves_round_robin_pool_unchanged() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "plain".to_string(),
+        from_zone: "subs".to_string(),
+        to_zone: "inet".to_string(),
+        source_addresses: vec!["100.64.0.0/22".to_string()],
+        pool_name: "plain-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string(), "203.0.113.2/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        // No deterministic_* fields.
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert!(
+        rules[0].deterministic_v4.is_none(),
+        "a pool without `port deterministic` must not build a deterministic rule"
+    );
+    let mut counter = None;
+    let d = expect_snat_decision(match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "subs",
+        "inet",
+        "100.64.0.5".parse().expect("src"),
+        "8.8.8.8".parse().expect("dst"),
+        PROTO_TCP,
+        10001,
+        443,
+        None,
+        None,
+        0,
+        false,
+        false,
+        &mut counter,
+    ));
+    // Round-robin allocator hands out the cursor-start port (port_low), which is
+    // NOT subscriber A's deterministic block — confirming the deterministic path
+    // did not engage.
+    assert_eq!(
+        d.rewrite_src_port,
+        Some(1024),
+        "a non-deterministic pool allocates from the round-robin cursor (port_low)"
     );
 }

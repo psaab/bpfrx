@@ -121,6 +121,37 @@ pub(crate) struct SourceNATRuleSnapshot {
     /// one term. Additive wire field, same skew semantics.
     #[serde(rename = "match_applications", default)]
     pub match_applications: Vec<NatAppTermWire>,
+    /// #4559: deterministic CGNAT port-block allocation mode. 0 = off (regular
+    /// round-robin/sticky PAT, the pre-#4559 behaviour). 1 = IPv4-subscriber
+    /// deterministic block allocation (mode 1): the subscriber's internal IPv4
+    /// address deterministically maps to a fixed external IP + port block, so
+    /// the (external IP, port) → subscriber reverse mapping needs no per-flow
+    /// log (lawful-intercept / CGN audit). Mode 2 (IPv6 subscriber / NAT64) is
+    /// carried by the Go compiler but NOT yet implemented here — an unknown
+    /// mode falls back to round-robin (the commit-time advisory still fires).
+    /// Additive wire field (#1961 skew-safe): an older control plane omits it
+    /// and `#[serde(default)]` leaves it 0 (round-robin).
+    #[serde(rename = "deterministic_mode", default)]
+    pub deterministic_mode: u8,
+    /// #4559: per-subscriber port block size (Junos `block-size`, e.g. 2016).
+    /// Only meaningful when `deterministic_mode != 0`.
+    #[serde(rename = "deterministic_block_size", default)]
+    pub deterministic_block_size: u16,
+    /// #4559: number of blocks each external pool address carries
+    /// (`(port_high - port_low + 1) / block_size`). Precomputed by the Go
+    /// builder against the SAME defaulted port range this snapshot carries, so
+    /// block boundaries align between compiler and dataplane.
+    #[serde(rename = "deterministic_blocks_per_ip", default)]
+    pub deterministic_blocks_per_ip: u16,
+    /// #4559: subscriber-CIDR network address as a host-order u32 (IPv4). The
+    /// subscriber index is `host_order(src) - host_base`.
+    #[serde(rename = "deterministic_host_base", default)]
+    pub deterministic_host_base: u32,
+    /// #4559: number of subscriber addresses in the host CIDR
+    /// (`1 << (32 - prefix_len)` for IPv4). A source whose index is `>=` this is
+    /// outside the deterministic range and the allocation fails closed.
+    #[serde(rename = "deterministic_host_count", default)]
+    pub deterministic_host_count: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -593,6 +593,33 @@ type SourceNATRuleSnapshot struct {
 	// per resolved member. Additive wire field, same skew semantics as
 	// MatchDestinationPorts.
 	MatchApplications []NatAppTermWire `json:"match_applications,omitempty"`
+	// DeterministicMode carries the source-pool `port deterministic block-size`
+	// CGNAT mode (#4559). 0 = off (round-robin/sticky PAT, the pre-#4559
+	// behaviour). 1 = IPv4-subscriber deterministic block allocation: each
+	// in-range subscriber IPv4 maps to a fixed external pool address + port
+	// block, so the (external IP, port) -> subscriber reverse mapping needs no
+	// per-flow log (lawful-intercept / CGN audit). Mode 2 (IPv6 subscriber /
+	// NAT64) is not yet enforced by the dataplane; the builder leaves this 0 for
+	// an IPv6 host so the pool round-robins and the commit-time advisory
+	// (compiler_validate_warn.go) still surfaces the gap. Additive wire field
+	// (#1961 skew-safe): an old helper ignores it and round-robins.
+	DeterministicMode uint8 `json:"deterministic_mode,omitempty"`
+	// DeterministicBlockSize is the per-subscriber port block size (Junos
+	// `block-size`, e.g. 2016). Meaningful only when DeterministicMode != 0.
+	DeterministicBlockSize uint16 `json:"deterministic_block_size,omitempty"`
+	// DeterministicBlocksPerIP is how many blocks each external pool address
+	// carries ((PortHigh-PortLow+1)/BlockSize), precomputed against the SAME
+	// defaulted port range this snapshot carries so block boundaries align
+	// between the compiler and the dataplane (#4559).
+	DeterministicBlocksPerIP uint16 `json:"deterministic_blocks_per_ip,omitempty"`
+	// DeterministicHostBase is the subscriber-CIDR network address as a
+	// host-order uint32 (IPv4). The subscriber index is
+	// host_order(src) - DeterministicHostBase (#4559).
+	DeterministicHostBase uint32 `json:"deterministic_host_base,omitempty"`
+	// DeterministicHostCount is the number of subscriber addresses in the host
+	// CIDR (1 << (32-prefix_len) for IPv4). A source whose index is >= this is
+	// outside the deterministic range and the allocation fails closed (#4559).
+	DeterministicHostCount uint32 `json:"deterministic_host_count,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). The userspace
 	// dataplane attributes each SNAT translation on this rule to this slot, and

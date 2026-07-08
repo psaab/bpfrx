@@ -1,7 +1,9 @@
 package userspace
 
 import (
+	"encoding/binary"
 	"log/slog"
+	"net"
 	"sort"
 
 	"github.com/psaab/xpf/pkg/appid"
@@ -63,6 +65,13 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 			var persistentNATInactivityTimeout int
 			var poolUnusable bool
 			var poolUnusableReason string
+			// #4559: deterministic CGNAT (mode 1, IPv4 subscriber) block-alloc
+			// params. Zero when the pool is not deterministic OR the subscriber
+			// host is IPv6 (mode 2, not yet enforced) — the dataplane then
+			// round-robins and the commit-time advisory surfaces the gap.
+			var detMode uint8
+			var detBlockSize, detBlocksPerIP uint16
+			var detHostBase, detHostCount uint32
 			if rule.Then.PoolName != "" {
 				pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
 				if !ok || pool == nil {
@@ -115,6 +124,13 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 							persistentNATInactivityTimeout = 300
 						}
 					}
+					// #4559: deterministic CGNAT block-allocation params. Only
+					// meaningful for a usable pool with a valid port range; a
+					// zero mode leaves the dataplane on the round-robin path.
+					if !poolUnusable {
+						detMode, detBlockSize, detBlocksPerIP, detHostBase, detHostCount =
+							deterministicSourceNATFields(pool, portLow, portHigh)
+					}
 				}
 			}
 			// #3429: carry the source-NAT L4 match constraints to the
@@ -153,6 +169,11 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 				PoolUnusableReason:               poolUnusableReason,
 				MatchDestinationPorts:            matchDestPorts,
 				MatchApplications:                matchApps,
+				DeterministicMode:                detMode,
+				DeterministicBlockSize:           detBlockSize,
+				DeterministicBlocksPerIP:         detBlocksPerIP,
+				DeterministicHostBase:            detHostBase,
+				DeterministicHostCount:           detHostCount,
 				CounterID:                        natCounterID(natCounterIDs, dataplane.NATCounterTypeSource, rs.Name, rule.Name),
 			})
 		}
@@ -401,6 +422,65 @@ func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermW
 		terms = []NatAppTermWire{{Protocol: natProtoNever}}
 	}
 	return terms
+}
+
+// deterministicSourceNATFields computes the IPv4 (mode 1) deterministic CGNAT
+// block-allocation parameters for a source pool (#4559). It returns the wire
+// fields the dataplane's allocate_deterministic_v4 needs:
+//   - mode: 1 for an IPv4 host CIDR, 0 otherwise (round-robin fallback)
+//   - blockSize: per-subscriber port block size (Junos `block-size`)
+//   - blocksPerIP: (portHigh-portLow+1)/blockSize, computed against the SAME
+//     defaulted port range the snapshot carries so block boundaries align with
+//     the Rust allocator
+//   - hostBase: subscriber-CIDR network address as a host-order uint32
+//   - hostCount: subscriber count in the host CIDR (1 << (32-prefix_len))
+//
+// Only an IPv4 host CIDR yields mode 1. An IPv6 host (Junos mode 2 / NAT64) is
+// NOT yet enforced by the userspace dataplane, so this returns mode 0 and the
+// pool round-robins with the commit-time advisory (compiler_validate_warn.go)
+// surfacing the still-unenforced gap. A degenerate block-size / port range also
+// returns mode 0 (the commit validator already rejects these for a committed
+// config; this is defence in depth for the lenient/reload path).
+func deterministicSourceNATFields(pool *config.NATPool, portLow, portHigh uint16) (mode uint8, blockSize, blocksPerIP uint16, hostBase, hostCount uint32) {
+	if pool == nil || pool.Deterministic == nil {
+		return 0, 0, 0, 0, 0
+	}
+	det := pool.Deterministic
+	if det.BlockSize <= 0 || det.HostAddress == "" {
+		return 0, 0, 0, 0, 0
+	}
+	_, hostNet, err := net.ParseCIDR(det.HostAddress)
+	if err != nil {
+		return 0, 0, 0, 0, 0
+	}
+	ones, bits := hostNet.Mask.Size()
+	if bits != 32 {
+		// IPv6 subscriber (mode 2, NAT64) — deferred, not yet enforced.
+		return 0, 0, 0, 0, 0
+	}
+	base := hostNet.IP.To4()
+	if base == nil {
+		return 0, 0, 0, 0, 0
+	}
+	if portHigh < portLow {
+		return 0, 0, 0, 0, 0
+	}
+	portRange := int(portHigh) - int(portLow) + 1
+	if det.BlockSize > portRange {
+		return 0, 0, 0, 0, 0
+	}
+	bpi := portRange / det.BlockSize
+	if bpi <= 0 || bpi > 0xFFFF {
+		return 0, 0, 0, 0, 0
+	}
+	hostBits := uint(bits - ones)
+	if hostBits >= 32 {
+		// A /0 subscriber range (>= 2^32 subscribers) is not a realistic CGNAT
+		// deployment and the uint32 shift would overflow — fall back.
+		return 0, 0, 0, 0, 0
+	}
+	hc := uint32(1) << hostBits
+	return 1, uint16(det.BlockSize), uint16(bpi), binary.BigEndian.Uint32(base), hc
 }
 
 func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
