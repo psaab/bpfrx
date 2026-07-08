@@ -406,6 +406,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// be restarted on config change (#87) without cancelling the daemon ctx.
 	commsCtx, commsCancel := context.WithCancel(ctx)
 	d.clusterCommsCancel = commsCancel
+	d.clusterCommsCtx = commsCtx
 	d.activeClusterTransport = clusterTransportFromConfig(cfg)
 
 	// Determine VRF device if control/fabric interfaces are in mgmt VRF.
@@ -811,10 +812,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// #2239: start the DHCP-server lease-sync push loop if enabled.
 			// The loop is gated on the RG-MASTER node-level gate internally;
 			// on the BACKUP it pushes nothing and the standby holds the peer
-			// set via OnDHCPLeasesReceived.
-			if cc.DHCPLeaseSync && d.dhcpServer != nil {
-				go d.runDHCPLeaseSyncLoop(commsCtx)
-			}
+			// set via OnDHCPLeasesReceived. Routed through the idempotent
+			// starter (#4647) so a later `dhcp-lease-synchronization` knob
+			// toggle from the apply path shares this same launch/stop path
+			// (and cannot double-launch).
+			d.ensureDHCPLeaseSyncLoop(cc.DHCPLeaseSync)
 
 			// Initialize per-fabric refresh channels for event-driven
 			// updates (#124). Each fabric owns its own channel so a
@@ -975,6 +977,11 @@ func (d *Daemon) stopClusterComms() {
 		d.clusterCommsCancel()
 		d.clusterCommsCancel = nil
 	}
+	d.clusterCommsCtx = nil
+	// #4647: the lease-sync loop is scoped to the comms context just
+	// cancelled, so it is already stopping; clear the cancel handle so the
+	// next comms session's connect-time launch starts a fresh loop.
+	d.resetDHCPLeaseSyncLoop()
 	if d.cluster != nil {
 		d.cluster.StopHeartbeat()
 	}

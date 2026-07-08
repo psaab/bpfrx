@@ -25,7 +25,7 @@
 #
 # Usage:
 #   ./test/incus/dhcp-lease-failover.sh
-#   DHCP_CLIENT_IFACE=eth1 ./test/incus/dhcp-lease-failover.sh
+#   DHCP_CLIENT_IFACE=eth1 ./test/incus/dhcp-lease-failover.sh   # override iface
 
 set -euo pipefail
 
@@ -45,7 +45,9 @@ source "${SCRIPT_DIR}/cluster-env.sh"
 # The default smoke LAN host is a STATIC address; a lab run points this at a
 # host configured to DHCP off the firewall's dhcp-local-server pool.
 DHCP_CLIENT="${DHCP_CLIENT:-$CLUSTER_LAN_HOST}"
-DHCP_CLIENT_IFACE="${DHCP_CLIENT_IFACE:-eth1}"
+# Default eth0 (the loss LAN host presents its DHCP client on eth0, not eth1);
+# override with DHCP_CLIENT_IFACE=<if> for a fixture that uses a different NIC.
+DHCP_CLIENT_IFACE="${DHCP_CLIENT_IFACE:-eth0}"
 # Kea memfile paths on the firewall nodes (see pkg/dhcpserver leaseFile()).
 KEA_MEMFILE4="${KEA_MEMFILE4:-/var/lib/kea/kea-leases4.csv}"
 KEA_MEMFILE6="${KEA_MEMFILE6:-/var/lib/kea/kea-leases6.csv}"
@@ -74,7 +76,7 @@ ssh_fw() { incus exec "$1" -- bash -lc "$2"; }
 preflight() {
 	info "Preflight: knob-ON + dhcp-local-server + a DHCP client fixture"
 	local cfg
-	cfg="$(ssh_fw "$FW0" 'xpf-cli -c "show configuration chassis cluster" 2>/dev/null' || true)"
+	cfg="$(ssh_fw "$FW0" '/usr/local/sbin/cli -c "show configuration chassis cluster" 2>/dev/null' || true)"
 	if ! grep -q "dhcp-lease-synchronization" <<<"$cfg"; then
 		cat >&2 <<EOF
 LAB PREREQUISITE MISSING: dhcp-lease-synchronization is not enabled.

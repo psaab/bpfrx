@@ -439,6 +439,13 @@ type Daemon struct {
 	// on config change (#87).
 	clusterCommsCancel context.CancelFunc
 
+	// clusterCommsCtx is the currently-live cluster comms sub-context (the
+	// context clusterCommsCancel cancels). Held so runtime knob toggles can
+	// (re)launch comms-scoped loops — e.g. the #2239 DHCP lease-sync push loop
+	// started on a `dhcp-lease-synchronization` commit (#4647) — against the
+	// same lifetime as the connect-time launch. Nil when comms are stopped.
+	clusterCommsCtx context.Context
+
 	// activeClusterTransport stores the transport config used by the
 	// currently running cluster comms. Compared on each applyConfig to
 	// detect changes that require a comms restart (#87).
