@@ -5816,6 +5816,254 @@ fn global_policy_explicit_any_matches_all_zones() {
     assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Permit);
     assert_eq!(eval(&state, TEST_UNTRUST_ZONE_ID, TEST_TRUST_ZONE_ID), PolicyAction::Permit);
 }
+
+/// #4365 F2: the Rust mirror of the Go
+/// `TestSharedMatcherGlobalScopeRegressionMatrix`
+/// (pkg/policymatch/global_scope_regression_4365_test.go). The #3148
+/// global-policy `match from-zone`/`match to-zone` scope tier (Tier 4) runs in
+/// BOTH the Go simulator (which backs `show security match-policies`) and this
+/// Rust dataplane (`GlobalZoneScope::matches` in the global-tier loop of
+/// `evaluate_policy_result_l3_aware`, the only forwarding path). The two MUST
+/// agree or the operator's test output permits/denies differently than the
+/// wire. The Go file is the Go half of that cross-language SSOT lock; this test
+/// is the Rust half — the same matrix, case-for-case.
+///
+/// The Rust `PolicyEvaluationResult` carries the WIRE verdict (`action`,
+/// `policy_id`, and the 1-based `policy_counter_idx` = the matched rule's
+/// position in `state.rules` + 1), not the Go simulator's display-only
+/// `Global`/`PolicyName`/`FromZone`/`ToZone` fields. So each case here asserts
+/// the action AND, for a rule match, the matched rule's `(policy_id,
+/// counter_idx)` — the same "which rule fired, in which tier" contract the Go
+/// vectors pin via `Result.PolicyID`. A default verdict is asserted by the
+/// reserved `DEFAULT_POLICY_SENTINEL_ID` / `DEFAULT_POLICY_COUNTER_IDX` the
+/// cold path stamps.
+///
+/// Fail-on-revert: deleting the
+/// `!rule.global_from_zone.matches(from_id) || !rule.global_to_zone.matches(to_id)`
+/// scope skip in the global-tier loop makes the scoped global match EVERY zone
+/// pair, so the mismatch cases (b)/(b')/(c''') stop falling through to the
+/// default and go RED; the tier-precedence cases (d)/(d') exercise a different
+/// lever (loop ORDER) and stay green, matching "other tiers unaffected".
+///
+/// Cross-language divergence, case (b''): an undefined/typo'd scope. The Go
+/// simulator operates on already-committed config and fails CLOSED to the
+/// default at eval time; this dataplane fails CLOSED at snapshot BUILD (#3402,
+/// `SnapshotIntegrityError::UnresolvableZoneReference`) — a typo can never
+/// commit, so neither path ever actually serves a typo scope. That arm is
+/// asserted separately below (it is a parse-time `Err`, not an eval verdict).
+#[test]
+fn global_policy_zone_scope_tier_ordering() {
+    // Explicit policy_ids so the matched-rule identity is provable (the Go
+    // vectors draw PolicyID from the shared RuntimePolicyIDs SSOT; here the id
+    // rides on the snapshot and the counter_idx pins its tier position).
+    const GLOBAL_PID: u32 = 100;
+    const ZP_PID: u32 = 10;
+    const WILD_PID: u32 = 20;
+    const UNREL_PID: u32 = 5;
+
+    let global = |name: &str, from: &str, to: &str, action: &str, pid: u32| PolicyRuleSnapshot {
+        policy_id: pid,
+        ..global_zone_rule(name, from, to, action)
+    };
+    let pair = |name: &str, from: &str, to: &str, action: &str, pid: u32| PolicyRuleSnapshot {
+        policy_id: pid,
+        ..wildcard_rule(name, from, to, action)
+    };
+
+    // `Some((policy_id, counter_idx))` == the expected matched rule; `None` ==
+    // the implicit default policy fired (no rule matched).
+    struct Case {
+        name: &'static str,
+        default_policy: &'static str,
+        rules: Vec<PolicyRuleSnapshot>,
+        from: u16,
+        to: u16,
+        want_action: PolicyAction,
+        want_match: Option<(u32, u32)>,
+    }
+
+    let cases = vec![
+        // (a) BOTH from-zone and to-zone scope match -> the scoped global fires.
+        Case {
+            name: "scoped global matches when both from and to scope match",
+            default_policy: "deny",
+            rules: vec![global("g-scoped", "trust", "untrust", "permit", GLOBAL_PID)],
+            from: TEST_TRUST_ZONE_ID,
+            to: TEST_UNTRUST_ZONE_ID,
+            want_action: PolicyAction::Permit,
+            want_match: Some((GLOBAL_PID, 1)),
+        },
+        // (a') Same scoped global preceded by an UNRELATED exact zone-pair set.
+        // The global is now rules[1], so its 1-based counter handle is 2 (NOT a
+        // hard-coded 1) — the Rust analog of the Go "global-set index tracks
+        // len(Policies), not a fixed 0" lock.
+        Case {
+            name: "scoped global counter handle tracks rule position",
+            default_policy: "deny",
+            rules: vec![
+                // lan->wan never matches a trust->untrust query; only shifts idx.
+                pair("unrelated", "lan", "wan", "permit", UNREL_PID),
+                global("g-scoped", "trust", "untrust", "permit", GLOBAL_PID),
+            ],
+            from: TEST_TRUST_ZONE_ID,
+            to: TEST_UNTRUST_ZONE_ID,
+            want_action: PolicyAction::Permit,
+            want_match: Some((GLOBAL_PID, 2)),
+        },
+        // (b) from-zone scope does NOT match -> default. (Go dmz->untrust; the
+        // Rust test zone map has no `dmz`, so `lan` stands in as the unrelated
+        // ingress zone; the scope check is identical.)
+        Case {
+            name: "scoped global from-zone mismatch falls through to default",
+            default_policy: "permit",
+            rules: vec![global("g-trust-only", "trust", "", "deny", GLOBAL_PID)],
+            from: TEST_LAN_ZONE_ID,
+            to: TEST_UNTRUST_ZONE_ID,
+            want_action: PolicyAction::Permit,
+            want_match: None,
+        },
+        // (b') to-zone scope does NOT match -> default.
+        Case {
+            name: "scoped global to-zone mismatch falls through to default",
+            default_policy: "permit",
+            rules: vec![global("g-to-untrust", "", "untrust", "deny", GLOBAL_PID)],
+            from: TEST_TRUST_ZONE_ID,
+            to: TEST_WAN_ZONE_ID,
+            want_action: PolicyAction::Permit,
+            want_match: None,
+        },
+        // (c) An empty (unset) scope applies to EVERY zone pair.
+        Case {
+            name: "empty scope global applies to any zone pair",
+            default_policy: "permit",
+            rules: vec![global("g-any", "", "", "deny", GLOBAL_PID)],
+            from: TEST_LAN_ZONE_ID,
+            to: TEST_WAN_ZONE_ID,
+            want_action: PolicyAction::Deny,
+            want_match: Some((GLOBAL_PID, 1)),
+        },
+        // (c') An explicit `any`/`any` scope ALSO applies everywhere.
+        Case {
+            name: "explicit any scope global applies everywhere",
+            default_policy: "permit",
+            rules: vec![global("g-anyany", "any", "any", "deny", GLOBAL_PID)],
+            from: TEST_LAN_ZONE_ID,
+            to: TEST_WAN_ZONE_ID,
+            want_action: PolicyAction::Deny,
+            want_match: Some((GLOBAL_PID, 1)),
+        },
+        // (c'') Partial scope: from-zone constrained, to-zone empty (== any).
+        Case {
+            name: "partial scope from-zone-only matches any to-zone",
+            default_policy: "deny",
+            rules: vec![global("g-from-trust", "trust", "", "permit", GLOBAL_PID)],
+            from: TEST_TRUST_ZONE_ID,
+            to: TEST_WAN_ZONE_ID,
+            want_action: PolicyAction::Permit,
+            want_match: Some((GLOBAL_PID, 1)),
+        },
+        // (c''') Same partial-scope global, non-matching from-zone -> default.
+        Case {
+            name: "partial scope from-zone-only rejects non-matching from-zone",
+            default_policy: "deny",
+            rules: vec![global("g-from-trust", "trust", "", "permit", GLOBAL_PID)],
+            from: TEST_LAN_ZONE_ID,
+            to: TEST_WAN_ZONE_ID,
+            want_action: PolicyAction::Deny,
+            want_match: None,
+        },
+        // (d) TIER PRECEDENCE: an exact zone-pair (Tier 1) OUTRANKS a scoped
+        // global (Tier 4) that also matches the same tuple. The zone-pair permit
+        // (rules[0]) wins; the global-deny never fires.
+        Case {
+            name: "exact zone-pair outranks matching scoped global",
+            default_policy: "deny",
+            rules: vec![
+                pair("zp-allow", "trust", "untrust", "permit", ZP_PID),
+                global("g-scoped-deny", "trust", "untrust", "deny", GLOBAL_PID),
+            ],
+            from: TEST_TRUST_ZONE_ID,
+            to: TEST_UNTRUST_ZONE_ID,
+            want_action: PolicyAction::Permit,
+            want_match: Some((ZP_PID, 1)),
+        },
+        // (d') TIER PRECEDENCE after the both-any wildcard tier: a both-any
+        // (`from-zone any to-zone any`) rule (Tier 3) OUTRANKS an unscoped global
+        // (Tier 4). The both-any deny (rules[0]) wins; the global permit never
+        // fires — the global tier is consulted ONLY after the wildcard tiers.
+        Case {
+            name: "both-any wildcard outranks matching global",
+            default_policy: "permit",
+            rules: vec![
+                pair("wild-deny", "any", "any", "deny", WILD_PID),
+                global("g-allow", "", "", "permit", GLOBAL_PID),
+            ],
+            from: TEST_TRUST_ZONE_ID,
+            to: TEST_UNTRUST_ZONE_ID,
+            want_action: PolicyAction::Deny,
+            want_match: Some((WILD_PID, 1)),
+        },
+    ];
+
+    for case in &cases {
+        let state = parse_policy_state(case.default_policy, &case.rules, &test_zone_name_to_id());
+        let res = evaluate_policy_result_with_len(
+            &state,
+            case.from,
+            case.to,
+            "10.0.0.1".parse().expect("src"),
+            "10.0.0.2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            443,
+            0,
+        );
+        assert_eq!(res.action, case.want_action, "{}: action", case.name);
+        match case.want_match {
+            Some((policy_id, counter_idx)) => {
+                assert_eq!(res.policy_id, policy_id, "{}: matched policy_id", case.name);
+                assert_eq!(
+                    res.policy_counter_idx, counter_idx,
+                    "{}: matched counter_idx (tier position)",
+                    case.name
+                );
+            }
+            None => {
+                assert_eq!(
+                    res.policy_id, DEFAULT_POLICY_SENTINEL_ID,
+                    "{}: default verdict must carry the reserved sentinel id, not a rule id",
+                    case.name
+                );
+                assert_eq!(
+                    res.policy_counter_idx, DEFAULT_POLICY_COUNTER_IDX,
+                    "{}: default verdict must carry the reserved default counter handle",
+                    case.name
+                );
+            }
+        }
+    }
+
+    // (b'') Cross-language divergence: an undefined/typo'd scope. Unlike the Go
+    // simulator (which fails closed to the default at eval), this dataplane
+    // fails the WHOLE snapshot closed at build (#3402) — a typo can never
+    // commit, so it never reaches the eval path. Assert the parse-time Err.
+    let store = PolicyCounterStore::default();
+    match parse_policy_state_with_counters(
+        "permit",
+        &[global("g-typo", "trsut", "untrust", "deny", GLOBAL_PID)], // typo
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    ) {
+        Err(SnapshotIntegrityError::UnresolvableZoneReference { rule_id, zone }) => {
+            assert!(rule_id.ends_with("/g-typo"), "rule_id={rule_id}");
+            assert_eq!(zone, "trsut");
+        }
+        other => {
+            panic!("expected UnresolvableZoneReference for a typo'd global scope, got {other:?}")
+        }
+    }
+}
 // === #2358: NAT64 inbound cross-family (V6 src, V4 dst) policy matching ===
 //
 // For an inbound NAT64 flow the source remains the IPv6 client while the

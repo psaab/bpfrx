@@ -893,6 +893,21 @@ no zone context keeps the historical all-zones behaviour. The Go commit gate
 (downgraded to a warning on the tolerant load path); the dataplane independently
 fails closed (`Unresolved` matches nothing).
 
+This scope tier is pinned as a **cross-language SSOT regression matrix** (#4365):
+the Go simulator half (which backs `show security match-policies`) is
+`TestSharedMatcherGlobalScopeRegressionMatrix`
+(`pkg/policymatch/global_scope_regression_4365_test.go`) and the Rust dataplane
+half is `global_policy_zone_scope_tier_ordering`
+(`userspace-dp/src/policy_tests.rs`, #4497 F2). The two assert the same matrix
+case-for-case — both-sides-match fires the scoped global, a mismatched side
+falls through to the default, empty/explicit-`any` applies to every pair, and an
+exact zone-pair (Tier 1) or a both-any wildcard (Tier 3) OUTRANKS a matching
+global (Tier 4) — so the operator's test output can never permit/deny
+differently than the wire. One deliberate divergence: a typo'd (undefined) scope
+fails closed to the default in the Go simulator (which runs on
+already-committed config) but fails the whole snapshot closed at build in Rust
+(#3402); a typo can never commit, so neither path ever serves it.
+
 **Unknown-zone guard (#3110).** Zone id `0` is the reserved "unknown / no
 zone" sentinel — assigned to interfaces not bound to any security zone. (The
 former #2391 over-cap collapse-to-0 path is retired: #3075 made zone ids a

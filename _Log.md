@@ -1,3 +1,40 @@
+## 2026-07-08 — #4497 F2: mirror global-scope matrix into Rust policy.rs
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4497 F2 (avo-001 follow-up). Mirrored the Go
+  `TestSharedMatcherGlobalScopeRegressionMatrix`
+  (`pkg/policymatch/global_scope_regression_4365_test.go`, added by #4365/#4496
+  F1) into a new Rust dataplane test
+  `global_policy_zone_scope_tier_ordering` in
+  `userspace-dp/src/policy_tests.rs`, completing the cross-language SSOT lock
+  on the #3148 global-policy from-zone/to-zone scope tier (Tier 4). The Rust
+  half asserts the WIRE verdict the Go `PolicyID` pins — action plus, for a
+  rule match, the matched rule's `(policy_id, policy_counter_idx)` (the 1-based
+  tier position). Cases: both-sides-match fires the scoped global; a mismatched
+  from/to side falls through to the default; empty and explicit-`any` scopes
+  apply to every pair; a partial (single-side) scope matches any other side; an
+  exact zone-pair (Tier 1) and a both-any wildcard (Tier 3) each outrank a
+  matching global (Tier 4). One deliberate cross-language divergence, asserted
+  separately: a typo'd/undefined scope fails closed to the default in the Go
+  simulator but fails the whole snapshot closed at build in Rust (#3402,
+  `SnapshotIntegrityError::UnresolvableZoneReference`).
+- **Verify-first**: the Rust evaluation logic (`GlobalZoneScope::matches` +
+  the global-tier scope-skip guard) already existed and is correct; F2 is a
+  TEST-mirror task, not a logic fix. Distinct from #4415 L12 (config-side
+  reject of a zone LIST on a scoped global) and #4626 (multi-zone model,
+  PLAN-DEFER) — the matrix uses single-zone scopes only, which are fully
+  supported. `global_policy_zone_scope_tier_ordering` did not exist on master.
+- **RED-on-revert**: neutralizing the scope-skip guard
+  (`!rule.global_from_zone.matches(from_id) || !rule.global_to_zone.matches(to_id)`,
+  policy.rs:3622) turns the mismatch cases (b)/(b')/(c''') RED (the scoped
+  global over-matches every pair) while the tier-precedence cases (d)/(d') —
+  which exercise loop ORDER, a different lever — stay green.
+- **Validation**: FULL `cargo test` — policy module 176/0, main bin 3737/0
+  (2 ignored), integration bins 60/0 + 8/0 + 22/0 + 1/0. rustfmt applied to the
+  added block only (master is not clean under local rustfmt 1.9.0).
+- **File(s)**: userspace-dp/src/policy_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
 ## 2026-07-08 — #4413 ps-review-007 dropped findings: driveable test-coverage
 
 - **Timestamp**: 2026-07-08
