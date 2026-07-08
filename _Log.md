@@ -40658,6 +40658,32 @@ top.
   pkg/config/schema_lldp_ttl_4596_test.go, pkg/lldp/lldp.go,
   pkg/lldp/lldp_test.go, docs/config-schema.md, _Log.md
 
+- **Timestamp**: 2026-07-07 (#4579 A4-02 / A4-06 driven; A4-05 skipped)
+- **Action**: configstore A4 LOW hardening batch (ps-037-A4). A4-02:
+  tightened the audit journal `.config.journal` from world-readable 0644
+  to owner-only 0600 (`journal/journal.go Log`). The journal is
+  metadata-only, but its `Detail` field carries the operator's free-text
+  commit comment verbatim (a comment can name a credential), so it now
+  matches the 0600 posture of the rest of the config surface (#4056);
+  folded into the #4056 secret-sweep test. A4-06: added a one-time
+  `slog.Warn` in `db.go readTreeMeta` when a stored config is read back as
+  UNENCRYPTED plaintext while its tree still declares a `master-password`
+  — a downgrade / unencrypted-restore / tamper signal that would otherwise
+  load cleartext secrets silently. `maybeDecryptTreeJSON` now returns a
+  `decrypted bool`; the two call sites were updated. A4-05 (bind the GCM
+  envelope header as AAD) was SKIPPED: the scheme already fails closed on
+  any header swap (HKDF binds PRF+salt → wrong key → tag failure), and
+  switching from nil AAD to a bound AAD is a ciphertext-format change that
+  would fail to `Open` an `active.json` sealed by an older build →
+  upgrade-brick. Non-exploitable gap does not justify the brick risk.
+  RED-on-revert: journal test fails at 0644; plaintext-downgrade test
+  fails with the warn neutralized. Negative controls (encrypted
+  round-trip, plaintext-without-master-password) stay silent. go test
+  ./pkg/configstore/... green; go build ./... green; gofmt+vet clean.
+- **File(s)**: pkg/configstore/journal/journal.go, pkg/configstore/crypto.go,
+  pkg/configstore/db.go, pkg/configstore/file_perms_4056_test.go,
+  pkg/configstore/plaintext_downgrade_warn_4579_test.go,
+  pkg/configstore/README.md, _Log.md
 - **Timestamp**: 2026-07-07 (#4578)
 - **Action**: `system master-password pseudorandom-function <fn>` typo silently
   disabled at-rest config encryption. `configstore.masterPasswordPRF` reads the

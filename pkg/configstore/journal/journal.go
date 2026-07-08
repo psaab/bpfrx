@@ -10,9 +10,14 @@
 // Detail, and full config trees already live in the rollback slots with
 // explicit retention.
 //
-// v2 entries are compact metadata only. Reads are reverse tail scans
-// bounded by the requested limit; the file rotates by size with a
-// keep-N segment policy; appends are fsynced (operator-paced — the
+// v2 entries are compact metadata only and the file is written
+// owner-only 0600 (#4579 A4-02): although the metadata is not itself a
+// secret store, Detail carries the operator's free-text commit comment
+// verbatim, so the journal matches the 0600 posture of the rest of the
+// config surface (#4056) instead of sitting world-readable. Reads are
+// reverse tail scans bounded by the requested limit; the file rotates
+// by size with a keep-N segment policy; appends are fsynced
+// (operator-paced — the
 // commit path already pays several fsyncs for active.json and rollback
 // slot 1, see #1894). Legacy fat v1 lines decode tolerantly (unknown
 // JSON fields are ignored), and the first append after upgrade rotates
@@ -177,7 +182,18 @@ func (j *Journal) Log(entry *Entry) error {
 
 	// O_RDWR (not O_WRONLY): the torn-tail check below reads the
 	// last byte through the same fd.
-	f, err := os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	//
+	// Owner-only 0600 (#4579 A4-02): v2 entries are metadata only
+	// (Timestamp/Action/ConfigHash plus a free-text Detail), so the
+	// journal is not a secret store the way active.json is. But Detail
+	// carries the operator-supplied commit comment verbatim, and an
+	// operator can put anything there — including, by mistake, a
+	// credential ("rotated the vpn psk to hunter2"). The rest of the
+	// .configdb-adjacent config surface is already 0600 (#4056); the
+	// journal is written next to it and should match rather than sit
+	// world-readable as a defense-in-depth gap. The daemon owns the file,
+	// so 0600 does not affect append or tail read-back.
+	f, err := os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("open journal: %w", err)
 	}

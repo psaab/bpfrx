@@ -4,6 +4,7 @@ package configstore
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -217,7 +218,7 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 		}
 		return nil, fmt.Errorf("read confirm state: %w", err)
 	}
-	data, err = db.maybeDecryptTreeJSON(data)
+	data, _, err = db.maybeDecryptTreeJSON(data)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt confirm state: %w", err)
 	}
@@ -266,7 +267,7 @@ func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
 		committed = hdr.Committed
 	}
 
-	data, err = db.maybeDecryptTreeJSON(data)
+	data, decrypted, err := db.maybeDecryptTreeJSON(data)
 	if err != nil {
 		return nil, true, fmt.Errorf("decrypt %s: %w", path, err)
 	}
@@ -274,6 +275,25 @@ func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
 	tree := &config.ConfigTree{}
 	if err := json.Unmarshal(data, tree); err != nil {
 		return nil, true, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	// Unexpected-plaintext warning (#4579 A4-06). When master-password is
+	// set, every write path encrypts the body (maybeEncryptTreeJSON keyed
+	// off the tree's master-password leaf), so a config that DECLARES a
+	// master-password should never be read back as plaintext. If it is,
+	// the file was written without the AES-GCM envelope — a downgrade to
+	// an older build, a restore from an unencrypted backup, or tampering.
+	// Reaching this state needs write access to the 0600/0700 .configdb
+	// (root/owner), so it is not a privilege-escalation vector; the warn
+	// makes the silent at-rest exposure visible instead of loading the
+	// cleartext secrets without a trace. Boot-time / commit-paced read, so
+	// a one-time slog.Warn is safe (never in a per-packet/-session loop).
+	if !decrypted && masterPasswordPRF(tree) != "" {
+		slog.Warn("configuration declares a master-password but was read as "+
+			"UNENCRYPTED plaintext (expected an AES-GCM envelope) — the config "+
+			"may have been downgraded, restored from an unencrypted backup, or "+
+			"tampered with; secrets are exposed at rest",
+			"path", path, "issue", "#4579")
 	}
 	return tree, committed, nil
 }
