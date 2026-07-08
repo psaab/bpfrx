@@ -859,6 +859,40 @@ pub(crate) fn release_nat64_pool_port(
     }
 }
 
+/// #4512: reserve a peer-synced NAT64 forward flow's translated `(pool v4,
+/// port/identifier)` in THIS node's NAT64 [`PortAllocator`] WITHOUT running the
+/// round-robin cursor, mirroring [`reserve_synced_source_nat_allocation`] for
+/// the pool-mode SNAT allocator (#4388).
+///
+/// The standby imports the active node's pre-computed NAT64 decision but never
+/// calls `allocate_source`, so without this its allocator has no record that
+/// `(snat_v4, port)` is in use — post-failover a fresh local NAT64 flow could
+/// `allocate_source` the SAME tuple, two flows colliding on one translated
+/// source (the exact RFC 6146 BIB violation #4381 closed, reappearing across a
+/// cross-node failover). The reservation is stored EXACTLY like a normal
+/// allocation and freed by the SAME `release_nat64_pool_port` on the standard
+/// teardown path (`release_nat64_allocation`, already called on reap / purge /
+/// delete-sync), so no new delete site is needed.
+///
+/// `addr_index` is the position of `snat_v4` in the prefix's `pool_v4` — the
+/// NAT64 allocator uses `family_offset == 0`, so the absolute allocator index
+/// equals the pool position. Returns whether the reservation took (`false` if
+/// the port is already owned by a DIFFERENT live allocation — the caller then
+/// tries the next prefix).
+pub(crate) fn reserve_nat64_pool_port(
+    allocator: &PortAllocator,
+    flow: SourceNatFlowKey,
+    snat_v4: Ipv4Addr,
+    port: u16,
+    addr_index: usize,
+) -> bool {
+    let translated = TranslatedTuple {
+        ip: IpAddr::V4(snat_v4),
+        port,
+    };
+    allocator.reserve_flow(flow, translated, addr_index)
+}
+
 pub(crate) fn match_source_nat(
     rules: &[SourceNatRule],
     scope: &NatScopeCtx,

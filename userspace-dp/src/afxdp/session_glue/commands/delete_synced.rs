@@ -29,11 +29,13 @@ pub(in crate::afxdp::session_glue) fn handle_delete_synced(
             lookup.metadata.is_reverse,
             now_ns,
         );
-        // #4381: mirror for NAT64. A standby imports the NAT64 decision without
-        // calling `allocate_source`, so this is a no-op today (the local NAT64
-        // allocator holds no record); it keeps the release symmetric with the
-        // reap/purge sites and is correct if a NAT64 synced-port reservation is
-        // added later.
+        // #4512: mirror for NAT64. `handle_upsert_synced` now RESERVES a
+        // peer-synced NAT64 forward flow's translated pool port in this node's
+        // local allocator (`reserve_synced_nat64_allocation`), so this release
+        // frees it on delete-sync with the same flow key — the standby-side
+        // reserve/release pair that stops a post-failover local flow from
+        // reusing the synced port (a no-op for a non-NAT64 / non-reserved
+        // session, mirroring the source-NAT release above).
         crate::nat64::release_nat64_allocation(
             &forwarding.nat64,
             &key,
