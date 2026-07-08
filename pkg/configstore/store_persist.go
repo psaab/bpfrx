@@ -481,13 +481,31 @@ func rotateArchives(dir string, maxArchives int) {
 	// Sort alphabetically (timestamps sort naturally)
 	sort.Strings(archives)
 
-	// Remove oldest
+	// Remove oldest.
 	for i := 0; i < len(archives)-maxArchives; i++ {
 		path := filepath.Join(dir, archives[i])
-		if err := os.Remove(path); err != nil {
+		if err := archiveRemoveErr(path); err != nil {
 			slog.Warn("failed to remove old archive", "path", path, "err", err)
 		}
 	}
+}
+
+// archiveRemoveErr removes a single rotated archive file and returns the error
+// that warrants a warning, or nil when the file was removed or was already
+// gone.
+//
+// ENOENT-tolerant (#4689, mirroring the #3441 L3 cleanupRollbackFiles
+// pattern): rotateArchives is spawned per commit and reads the archive
+// directory without a per-store archive lock, so two rapid back-to-back
+// commits can each pick the same oldest archive and race to remove it. The
+// loser's os.Remove then fails with ENOENT — a benign already-gone, not a real
+// cleanup failure — so it is suppressed. Any other error (e.g. EACCES) is
+// still returned so the caller logs it.
+func archiveRemoveErr(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // rescuePath returns the path for the rescue configuration file.
