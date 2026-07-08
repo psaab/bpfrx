@@ -30,6 +30,7 @@ re-created 0600 on the next commit.
 | File | Path | Mode | Writer |
 |------|------|------|--------|
 | Active / candidate / rollback DB | `.configdb/{active,candidate,rollback.N}.json` | 0600 | `db.go writeTreeMarked` |
+| Pending commit-confirmed state (#4577) | `.configdb/confirm.json` | 0600 | `db.go WriteConfirm` |
 | `master.key` | `.configdb/master.key` | 0600 | `crypto.go readOrCreateMasterKey` |
 | Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
 | Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
@@ -151,6 +152,35 @@ per-path:
   disconnected operator should treat an unanswered commit as
   ambiguous — same as Junos — and inspect `show configuration` after
   reconnecting.
+- **`commit confirmed` survives a crash inside the window (#4577).**
+  The auto-rollback timer is an in-memory `time.AfterFunc` that does NOT
+  outlive the process, so before this fix a daemon crash/reboot inside
+  the confirm window made the UNCONFIRMED config PERMANENT — the
+  safety hatch was silently lost (an operator commits a
+  management-stranding config relying on the auto-revert, the daemon
+  crashes, the box is stranded). `CommitConfirmed` now also persists a
+  `confirm.json` in `.configdb` holding the absolute **deadline**, the
+  **rollback-target tree** (`confirmPrevTree` — the ORIGINAL
+  last-confirmed tree for a nested re-arm), and the **first-commit**
+  flag (`confirmPrevCfg == nil`, the #1922 Item 1b never-committed
+  case). It is written durably (temp+fsync+rename+dir-fsync),
+  encrypted with the same master-password machinery as `active.json`
+  (the target tree may carry secret leaves), 0600, AFTER the successful
+  `writeActive`+promote (a failed commit-confirmed never leaves a
+  `confirm.json`). `Store.Load` (`recoverPendingConfirmLocked`) restores
+  it at boot: if the deadline already passed during downtime it rolls
+  back to the prev tree now (including the Item 1b committed=0 marker on
+  a first-commit target); if the deadline is still in the future it
+  re-arms the timer for the REMAINING duration. Every confirmation path
+  (`clearPendingConfirmLocked` — plain commit / HA sync / explicit
+  confirm / demotion) and the timeout rollback (`PromoteRollback`)
+  remove `confirm.json`; a nested `commit confirmed` re-writes it with
+  the extended deadline. A clean restart inside the window also keeps
+  the hatch (Junos parity: the pending confirm persists across a
+  reboot and rolls back if not confirmed). One residual window remains:
+  a crash in the microseconds between the `writeActive` syscall and the
+  `confirm.json` write leaves no `confirm.json` — vastly smaller than
+  the whole multi-minute window this closes.
 - **`CommitConfirmed` ordering.** Confirm state is only touched after
   the persist succeeds: on failure the rollback timer is NOT armed and
   an existing pending confirm (timer + rollback target) is left fully
