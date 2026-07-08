@@ -40703,3 +40703,22 @@ top.
   pkg/config/schema_master_password_prf_4578_test.go, pkg/configstore/crypto.go,
   pkg/configstore/crypto_prf_sync_4578_test.go, docs/config-schema.md,
   docs/next-features/master-password.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4590 (ps-038-A1 F1/F2, RUST fairness-eval harness) — make the
+  offline `fairness-eval` CI merge gate fail-fast on bad input instead of
+  silently producing a verdict on wrong data. F1: refactored `parse_args`
+  into a testable `parse_args_from` returning `Result<Args, ParseError>`; the
+  four numeric flags (`--warmup-secs`, `--final-burst-secs`, `--n-workers`,
+  `--shaper-rate-bps`) now error (exit 2) on a mistyped/overflowing value via
+  `parse_required_numeric_value` instead of `.unwrap_or(default)`, and
+  `--n-workers 0` is rejected unconditionally (empty per-worker distribution →
+  verdict on no data). F2: `parse_binding_flows_tsv`/`parse_cos_flows_tsv`
+  count skipped malformed rows and print a stderr warning (still lenient by
+  design, but no longer silent). Added unit tests for both (RED-on-revert
+  verified by neutering). Removed now-dead exit-calling arg wrappers. Full
+  cargo suite 3718/1 (the one failure, event_stream ..._2875, is pre-existing
+  on clean origin/master — unrelated to fairness_eval).
+- **File(s)**: userspace-dp/src/fairness_eval/args.rs,
+  userspace-dp/src/fairness_eval/inputs.rs,
+  userspace-dp/src/fairness_eval/README.md, _Log.md
