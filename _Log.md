@@ -1,3 +1,24 @@
+## 2026-07-08 — #4660 refactor: split cmd/cli/show.go by feature family
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4660 refactor — split cmd/cli/show.go (2100 LOC remote-CLI
+  `show` umbrella) by feature family into sibling files. Pure code motion,
+  behavior-identical: all 44 top-level declarations moved verbatim (verified
+  byte-for-byte against origin/master via an AST decl-diff — 44/44, 0 missing,
+  0 extra, 0 bodydiff). The shell (`show.go`, now 449 LOC) keeps the
+  `handleShow` dispatcher, the config-mode `handleConfigShow`, `showRoutes`,
+  and the shared text-proxy helpers (`showText` / `showTextFiltered` /
+  `showSystemInfo`) so the gRPC call sequences and the text-proxy fallthrough
+  are preserved and the remote CLI output stays bit-identical. `go build ./...`
+  clean, `go vet ./cmd/cli/...` unchanged (the pre-existing monitor.go:159 lock-
+  copy warning is on origin/master too), `go test ./cmd/cli/...` green. No new
+  test (pure code motion).
+- **File(s)**: cmd/cli/show.go (trimmed shell), cmd/cli/show_security.go (new),
+  cmd/cli/show_flow.go (new), cmd/cli/show_nat.go (new),
+  cmd/cli/show_interfaces.go (new), cmd/cli/show_protocols.go (new),
+  cmd/cli/show_system.go (new), cmd/cli/show_services.go (new),
+  cmd/cli/show_dhcp.go (new), cmd/cli/README.md, _Log.md
+
 ## 2026-07-08 — #4650 (fable-173 LOW) GO residuals: gRPC egress-iface parity + tunnel lock-scope
 
 - **Timestamp**: 2026-07-08

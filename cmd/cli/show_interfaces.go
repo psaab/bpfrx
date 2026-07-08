@@ -1,0 +1,47 @@
+package main
+
+import (
+	"fmt"
+
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+)
+
+func (c *ctl) showInterfaces(args []string) error {
+	if len(args) > 0 && args[0] == "queue" {
+		// #4228 Gap 7: per-queue CoS statistics, optional interface filter.
+		selector := ""
+		if len(args) > 1 {
+			selector = args[1]
+		}
+		return c.showTextFiltered("interfaces-queue", selector)
+	}
+	if len(args) > 0 && args[0] == "tunnel" {
+		return c.showText("tunnels")
+	}
+	if len(args) > 0 && args[0] == "extensive" {
+		return c.showText("interfaces-extensive")
+	}
+	if len(args) > 0 && args[0] == "statistics" {
+		return c.showText("interfaces-statistics")
+	}
+	if len(args) > 0 && args[0] == "detail" {
+		return c.showText("interfaces-detail")
+	}
+	if len(args) >= 2 && args[len(args)-1] == "detail" {
+		return c.showTextFiltered("interfaces-detail", args[0])
+	}
+	req := &pb.ShowInterfacesDetailRequest{}
+	for _, a := range args {
+		if a == "terse" {
+			req.Terse = true
+		} else {
+			req.Filter = a
+		}
+	}
+	resp, err := c.client.ShowInterfacesDetail(c.ctx(), req)
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Print(resp.Output)
+	return nil
+}
