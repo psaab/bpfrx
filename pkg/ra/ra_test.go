@@ -497,6 +497,43 @@ func TestConfigEqual_DifferentFlags(t *testing.T) {
 	}
 }
 
+// TestConfigEqual_DifferentReachableTime asserts that a commit changing ONLY
+// reachable-time is detected as NOT-equal so Apply restarts the sender and the
+// new value reaches the wire (#4570). RED-on-revert: drop the ReachableTime
+// comparison from configEqual and this fails.
+func TestConfigEqual_DifferentReachableTime(t *testing.T) {
+	a := &config.RAInterfaceConfig{Interface: "trust0", ReachableTime: 30000}
+	b := &config.RAInterfaceConfig{Interface: "trust0", ReachableTime: 60000}
+
+	if configEqual(a, b) {
+		t.Error("different ReachableTime should not be equal (sender must restart)")
+	}
+}
+
+// TestConfigEqual_DifferentRetransTimer asserts that a commit changing ONLY
+// retransmit-timer is detected as NOT-equal (#4570). RED-on-revert: drop the
+// RetransTimer comparison from configEqual and this fails.
+func TestConfigEqual_DifferentRetransTimer(t *testing.T) {
+	a := &config.RAInterfaceConfig{Interface: "trust0", RetransTimer: 1000}
+	b := &config.RAInterfaceConfig{Interface: "trust0", RetransTimer: 2000}
+
+	if configEqual(a, b) {
+		t.Error("different RetransTimer should not be equal (sender must restart)")
+	}
+}
+
+// TestConfigEqual_SameTimers guards against a spurious restart: two configs
+// with identical reachable-time/retransmit-timer (including the 0=unspecified
+// default) stay equal, so a no-op commit does not create an RA gap.
+func TestConfigEqual_SameTimers(t *testing.T) {
+	a := &config.RAInterfaceConfig{Interface: "trust0", ReachableTime: 30000, RetransTimer: 1000}
+	b := &config.RAInterfaceConfig{Interface: "trust0", ReachableTime: 30000, RetransTimer: 1000}
+
+	if !configEqual(a, b) {
+		t.Error("identical timers should be equal (no spurious sender restart)")
+	}
+}
+
 func TestRandomAdvInterval(t *testing.T) {
 	s := &sender{
 		cfg: &config.RAInterfaceConfig{

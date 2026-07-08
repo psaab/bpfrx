@@ -1,3 +1,36 @@
+## 2026-07-07 — #4570 ra: configEqual now compares ReachableTime/RetransTimer so a commit changing only those RA timers restarts the sender
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4570 (ps-036 c12-14, LOW) — `configEqual` (pkg/ra/ra.go) is the
+  change-detector `Apply` gates the sender restart on (ra.go:282 → `continue`
+  when equal), but its scalar comparison list ended at `SourceLinkLocal` and
+  NEVER compared `ReachableTime` / `RetransTimer`. `buildRA` DOES stamp both
+  onto the wire (sender.go:718-719, the #4307 fix), so a day-2 commit changing
+  ONLY `reachable-time` and/or `retransmit-timer` compared EQUAL → the sender
+  was not restarted → the wire kept advertising the OLD RFC 4861 §4.2 ND timer
+  hints until an unrelated RA edit or a daemon restart. A genuine "commit clean
+  = enforced" violation; the codebase's own #4119 `DefaultLifetimeSet` comment
+  flags the identical bug class. Severity LOW: config-authoring trigger only
+  (not attacker-reachable), blast radius = advisory host-side ND timers (no
+  forwarding/security bypass, not fail-open), self-healing on the next
+  unrelated RA edit or restart. Fix: appended
+  `a.ReachableTime != b.ReachableTime || a.RetransTimer != b.RetransTimer` to
+  the scalar list (ra.go, right after SourceLinkLocal). Unlike DefaultLifetime
+  (#4119), 0=unspecified maps DIRECTLY to a zero wire field with no
+  unset/default coercion, so a plain int compare is exact and NO companion
+  "Set" flag is needed. PRESERVED: every existing comparison unchanged; two
+  configs with identical timers still compare equal (no spurious restart / no
+  RA gap). RED-on-revert verified (ra_test.go): reachable-time-only change →
+  NOT-equal (TestConfigEqual_DifferentReachableTime) [RED on revert],
+  retransmit-timer-only change → NOT-equal
+  (TestConfigEqual_DifferentRetransTimer) [RED on revert], identical timers →
+  equal (TestConfigEqual_SameTimers) [PASS on revert — guards no spurious
+  restart]. go test ./pkg/ra/... green; go build ./pkg/ra/ green; gofmt/vet
+  clean. Doc: pkg/ra/README.md gains a "configEqual must track EVERY field
+  buildRA stamps onto the wire" change-detection-contract gotcha cross-refing
+  #4307 (wire-stamping) and #4119 (the DefaultLifetimeSet sibling fix).
+- **File(s)**: pkg/ra/ra.go, pkg/ra/ra_test.go, pkg/ra/README.md, _Log.md
+
 ## 2026-07-07 — #4512 nat64: reserve a peer-synced session's translated pool port on the standby (cross-node HA)
 
 - **Timestamp**: 2026-07-07
