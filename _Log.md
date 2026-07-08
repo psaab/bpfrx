@@ -41335,3 +41335,31 @@ top.
   codex-r1.md, claude-smr-plan-r1.md, reviewer-ids.md restored),
   docs/userspace-dataplane-gaps.md, pkg/api/README.md,
   pkg/api/zone_counter_doc_ref_test.go, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4422 high-value Go test-cov batch. Triaged the ~120-item LOW
+  test-coverage tracker: verified the named Go domains (filter cross-field /
+  port-except / actions / flex-match, NAT reversed-range + dport + pools, appid
+  tuple-overflow/source-port, flowexport multi-group wire-collision #3740,
+  observability descriptor/host-inbound/scoped-global, ddns, host-inbound
+  per-interface #3362, FBF ref/direction, ipsec/log/dhcp/sampling refs) are
+  ALREADY covered by this session's #4517-#4625 work — every strict gate and
+  secondary branch checked has a fail-on-revert test. Added the two genuinely
+  non-redundant contract tests: (1) TestEveryStrictCommitGateIsWired — a go/ast
+  completeness canary asserting every top-level validate*Strict(cfg *Config)
+  error gate (~80) is actually invoked in the compile path (catches the
+  "add-a-gate, forget-the-wire" silent commit-gate loss no per-issue test
+  catches; mirrors pkg/api TestCollectorDescriptorCoverage); (2)
+  TestPolicyZoneMatrixCompilesActionsIndependently — the #4422 policy
+  zone-matrix composition guard: mixed permit/deny/reject policies coexisting
+  in one transit zone-pair each keep their own action in config order, the
+  untrust->junos-host host-inbound context stays isolated, and the deny
+  no-match default is orthogonal. Both verified fail-on-revert (unwired
+  validateSourceNATPoolStrict -> canary RED naming it; reject->permit mapping
+  mutation -> matrix RED on t-reject). Rescoped #4422 to the concrete
+  remainder (Rust-cargo flow-cache dataplane tests; lab/smoke host-inbound
+  VLAN/dup-addr/HA + PBR multi-WAN live cells; doc/parity-label items).
+  go test ./pkg/config/ green; gofmt + vet clean. Doc: config-schema.md
+  "Strict commit-time validators" now documents the wiring canary.
+- **File(s)**: pkg/config/strict_gate_wiring_canary_test.go,
+  pkg/config/policy_zone_matrix_4422_test.go, docs/config-schema.md, _Log.md
