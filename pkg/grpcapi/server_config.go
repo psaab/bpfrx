@@ -250,6 +250,16 @@ func (s *Server) ConfirmCommit(_ context.Context, _ *pb.ConfirmCommitRequest) (*
 }
 
 func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
+	// #4589 A8-01: n==0 is the valid Junos `rollback 0` (revert to active);
+	// n>=1 selects history slot n. A negative n maps to history.Get(n-1) =
+	// history.Get(<-1>) → the opaque store error "history position -1 out of
+	// range". Reject it up front with a clear message. Unlike ShowRollback
+	// (#4556, n<=0) the mutation RPC keeps n==0 valid, so only n<0 is
+	// rejected. Fail-closed either way — no wrong rollback target.
+	if req.N < 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid n %d: rollback index must be non-negative (0 = revert to active)", req.N)
+	}
 	if err := s.store.Rollback(int(req.N)); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}

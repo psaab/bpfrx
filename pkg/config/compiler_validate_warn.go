@@ -2290,7 +2290,22 @@ func ddnsGenericURLTemplateValid(tmpl string) bool {
 	if at := strings.LastIndex(authority, "@"); at >= 0 {
 		authority = authority[at+1:]
 	}
-	return authority != ""
+	// #4589 A10-b2 F-01: require a non-empty HOST after dropping a trailing
+	// :port (and unwrapping a bracketed IPv6 literal). `http://:8080/upd` has
+	// a non-empty authority but an EMPTY host — the old `authority != ""`
+	// check let it warn-clean AND construct-clean. Kept byte-for-byte in
+	// lockstep with pkg/ddns.ddnsTemplateHost (config cannot import pkg/ddns).
+	host := authority
+	if strings.HasPrefix(host, "[") {
+		if end := strings.Index(host, "]"); end >= 0 {
+			host = host[1:end]
+		} else {
+			host = ""
+		}
+	} else if colon := strings.IndexByte(host, ':'); colon >= 0 {
+		host = host[:colon]
+	}
+	return host != ""
 }
 
 // ddnsAllowlistMalformedTokens mirrors pkg/ddns.ParseAllowlistChecked's

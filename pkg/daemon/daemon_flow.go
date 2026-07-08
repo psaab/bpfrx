@@ -364,9 +364,18 @@ func (d *Daemon) archiveToSites(sites []string) {
 // capturing transfer and assert archiveConfig serializes the CURRENT active
 // config rather than the stale boot file (#3867).
 func scpArchiveTransfer(ctx context.Context, srcPath, dest string) error {
+	// #4589 A7 F-02: `--` end-of-options separator before the positional
+	// src/dest. `dest` is an operator-configured `archive-sites` URL taken
+	// verbatim (compiler_system.go); without the separator a leading-dash
+	// value (`-oProxyCommand=...`) is parsed by scp's getopt as an OPTION,
+	// not a destination — CWE-88 argv injection running as the xpfd root
+	// user. After `--`, getopt stops scanning so src/dest are always
+	// positional. Belt-and-suspenders with the commit-time leading-dash
+	// reject in compiler_system.go.
 	out, err := exec.CommandContext(ctx, "scp",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "BatchMode=yes",
+		"--",
 		srcPath, dest,
 	).CombinedOutput()
 	if err != nil {

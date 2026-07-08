@@ -1,3 +1,112 @@
+## 2026-07-07 — #4589 A10-b2 F-01 ddns+config: reject empty-host DDNS generic url-template
+
+- **Timestamp**: 2026-07-07
+- **Action**: The generic-backend url-template validators
+  (`validateGenericURLTemplate` in `pkg/ddns/backend_generic.go` and its
+  commit-time mirror `ddnsGenericURLTemplateValid` in
+  `pkg/config/compiler_validate_warn.go`) only rejected an EMPTY authority,
+  so `http://:8080/upd` — non-empty authority (":8080") but EMPTY host —
+  passed both the commit warning and the runtime constructor (Go's dialer
+  then treats the empty-host URL as localhost). Require a non-empty host
+  after dropping a trailing `:port` and unwrapping a bracketed IPv6 literal,
+  in lockstep across both packages (config cannot import pkg/ddns). Residual
+  of the #2841 empty-authority-only check. RED-on-revert tests
+  `TestGenericURLTemplatePortOnlyHostRejected` (ddns) +
+  `TestP3GenericURLTemplatePortOnlyHostWarns` (config).
+- **File(s)**: pkg/ddns/backend_generic.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/ddns/backend_generic_porthost_4589_test.go,
+  pkg/config/ddns_porthost_4589_test.go, _Log.md
+
+## 2026-07-07 — #4589 A7 F-02 daemon+config: harden scp archive-site argv (leading-dash injection)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `scpArchiveTransfer` (`pkg/daemon/daemon_flow.go`) ran
+  `scp -o ... <srcPath> <dest>` with no `--` separator, and `dest` is an
+  operator-configured `archive-sites` URL taken verbatim
+  (`compiler_system.go`). A leading-dash URL (`-oProxyCommand=...`) is
+  parsed by scp's getopt as an OPTION → arbitrary command exec as the
+  xpfd root user (CWE-88). Two belts: (1) inserted `--` before src/dest so
+  getopt stops scanning; (2) added a commit-time reject of a leading-dash
+  archive-site in BOTH parse shapes (flat-set + hierarchical) in
+  `compileSystem`, since such a URL is never a valid scp destination.
+  Config-commit is already root-equivalent in xpf's coarse login-class
+  model, so this is defense-in-depth hardening, not a privilege
+  escalation. RED-on-revert tests
+  `TestArchivalLeadingDashSiteRejected{FlatSet,Hierarchical}` /
+  `TestArchivalValidSiteAccepted`.
+- **File(s)**: pkg/daemon/daemon_flow.go, pkg/config/compiler_system.go,
+  pkg/config/archival_leading_dash_4589_test.go, _Log.md
+
+## 2026-07-07 — #4589 A8-01 grpcapi+api: guard Rollback against a negative n
+
+- **Timestamp**: 2026-07-07
+- **Action**: The `Rollback` mutation RPC (`pkg/grpcapi/server_config.go`)
+  and its REST leg `configRollbackHandler` (`pkg/api/config.go`) had no
+  `n<0` guard, so a negative n flowed into `store.Rollback(n)` →
+  `history.Get(n-1)` → `history.Get(<0)` → the opaque "history position -1
+  out of range" store error. Fail-closed (no wrong rollback target) but a
+  poor message. Added a `req.N < 0` reject with a clear InvalidArgument /
+  400 message on both surfaces. Unlike ShowRollback (#4556, n<=0) the
+  mutation keeps n==0 valid (Junos `rollback 0` = revert to active), so
+  only n<0 is rejected. RED-on-revert test `TestRollbackRejectsNegativeN`
+  (asserts the clean message + no "out of range" leak) / `...AcceptsZeroN`.
+- **File(s)**: pkg/grpcapi/server_config.go, pkg/api/config.go,
+  pkg/grpcapi/server_rollback_negative_n_4589_test.go, _Log.md
+
+## 2026-07-07 — #4589 A8-b2 F-002 grpcapi: report unknown/malformed test-routing selectors
+
+- **Timestamp**: 2026-07-07
+- **Action**: `showTestRouting` (`pkg/grpcapi/server_show_routes_text.go`)
+  used `if len(parts) != 2 { continue }` + a switch with no default arm,
+  SILENTLY dropping a malformed segment or an unknown selector key. A
+  typo'd `test-routing:dest=...,instnace=dmz` left `instance` at "" so the
+  lookup fell back to the MAIN routing table for what the operator asked
+  as a VRF query — a misleading diagnostic with no warning (parity gap vs
+  the #3696 showTestPolicy hardening). Mirrored the #3696 pattern: track a
+  `parseErr` on a malformed segment (no key=value / empty key or value)
+  and on an unknown key (default arm), and report it before the lookup.
+  Reported before the routing-nil check (a selector grammar error is a
+  client-input error independent of routing-manager availability), which
+  also keeps it testable with the default nil-manager Server. Golden
+  (`test-routing:dest=10.0.2.1`) unaffected. RED-on-revert test
+  `TestShowTestRoutingReportsUnknownSelector`/`...ValidSelectorNotFlagged`.
+- **File(s)**: pkg/grpcapi/server_show_routes_text.go,
+  pkg/grpcapi/server_show_test_routing_unknownkey_4589_test.go, _Log.md
+
+## 2026-07-07 — #4589 A10-01 cli: bound `monitor traffic count` (negative / unbounded)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `parseMonitorTrafficArgs` (`pkg/cli/cli_request.go`) only
+  rejected a non-numeric `count`; `strconv.Atoi("-1")` and a huge value
+  both parsed clean, so `count -1` reached tcpdump's `-c` as an opaque
+  "invalid packet count" error and an unbounded value was silently
+  accepted (redundant with the already-supported `count 0` = unlimited).
+  Bounded the value to `n < 0 || n > 8192` after Atoi, matching the
+  sibling `monitor security packet-drop` cap (1..8192, monitor.go), while
+  keeping 0 as the explicit unlimited mode (buildMonitorTrafficArgv omits
+  `-c`). UX/consistency only — RBAC-gated (PermControl), no injection (the
+  `--` filter fence is intact). RED-on-revert test
+  `TestParseMonitorTrafficCountBounded`/`...InRangeAccepted`.
+- **File(s)**: pkg/cli/cli_request.go,
+  pkg/cli/monitor_traffic_count_bound_4589_test.go, _Log.md
+
+## 2026-07-07 — #4589 A3 F-01 config: range-validate BGP peer-as / top-level local-as (uint32 wrap)
+
+- **Timestamp**: 2026-07-07
+- **Action**: BGP `peer-as` (group + neighbor) and top-level `local-as`
+  carried no upper-bound schema validator, so an out-of-range ASN passed
+  the strict commit schema and the compiler's `Atoi -> uint32(v)` cast
+  silently wrapped it (`peer-as 4294967297` -> `remote-as 1`; `peer-as -1`
+  -> `remote-as 4294967295`) — a wrong-but-valid FRR config Junos rejects.
+  The `PeerAS==0` strict gate (#2963) only catches AS0, not a non-zero
+  wrap. Added `valueType: ValueInteger, validator: ValidateInteger(1,
+  4294967295)` to the two `peer-as` leaves and top-level `local-as` in
+  `schema_routing.go`, mirroring the sibling `local-as` group/neighbor
+  leaves that already had it. RED-on-revert test
+  `TestBGPPeerASRangeRejected`/`...Accepted`.
+- **File(s)**: pkg/config/schema_routing.go,
+  pkg/config/bgp_peeras_range_4589_test.go, _Log.md
 ## 2026-07-07 — #4585 zeroize erases rendered service-config secrets at wipe time (frr.conf routing-auth, swanctl PSK, kea)
 
 - **Timestamp**: 2026-07-07
