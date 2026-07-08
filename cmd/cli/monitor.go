@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/psaab/xpf/pkg/cmdtree"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -211,11 +212,16 @@ func (c *ctl) handleInteractiveMonitorInterfaceSummary(req *pb.MonitorInterfaceR
 			streamCancel()
 		}
 		streamGen++
-		reqCopy := *req
+		// Deep-copy via proto.Clone rather than a shallow struct copy: the
+		// generated message embeds protoimpl.MessageState (a sync.Mutex), so
+		// `reqCopy := *req` is a lock copy (govet copylocks). proto.Clone
+		// yields a fresh message whose per-stream SummaryMode we can set
+		// without aliasing the caller's req (#4697).
+		reqCopy := proto.Clone(req).(*pb.MonitorInterfaceRequest)
 		reqCopy.SummaryMode = mode
 		gen := streamGen
 		streamCtx, cancelStream := context.WithCancel(ctx)
-		stream, err := c.client.MonitorInterface(streamCtx, &reqCopy)
+		stream, err := c.client.MonitorInterface(streamCtx, reqCopy)
 		if err != nil {
 			cancelStream()
 			return err

@@ -42368,3 +42368,21 @@ top.
   taxonomy + sampling), pkg/dataplane/userspace/format/buffers_golden_test.go
   (new), pkg/dataplane/userspace/format/testdata/system_buffers.golden (new),
   _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4697 — fix govet copylocks in cmd/cli monitor.go startStream.
+  The interactive `monitor interface` summary loop's `startStream` closure did
+  `reqCopy := *req` where `req` is a `*pb.MonitorInterfaceRequest` — a generated
+  proto message embedding `protoimpl.MessageState` (which contains a
+  `sync.Mutex`). The shallow struct copy tripped `go vet` copylocks
+  ("assignment copies lock value to reqCopy"). Pre-existing on origin/master
+  (surfaced during #4694, not introduced by #4696). Replaced with
+  `proto.Clone(req).(*pb.MonitorInterfaceRequest)` (deep copy, no lock copy),
+  set the per-stream `SummaryMode` on the clone, and passed the clone pointer
+  directly to `MonitorInterface`. `reqCopy` is only mutated on that one field
+  and then read, so the clone is behaviorally identical. Added the
+  `google.golang.org/protobuf/proto` import (already a direct dep, v1.36.11).
+  Verified: `go vet ./cmd/cli/...` clean (warning gone; returns on revert),
+  `go build ./...`, `go test ./cmd/cli/...` green, gofmt clean. No module-doc
+  change needed — internal remote-CLI fix, no behavior/contract change.
+  **File(s)**: cmd/cli/monitor.go, _Log.md
