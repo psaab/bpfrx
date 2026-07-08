@@ -256,6 +256,30 @@ func validateClassOfServiceLossPriorityStrict(cos *ClassOfServiceConfig) error {
 			}
 		}
 	}
+
+	// #4228 Gap 4: apply the same loss-priority typo gate to ieee-802.1 (PCP)
+	// rewrite-rules. Even though the rule is accepted-but-inert, a `medum-low`
+	// typo should be surfaced at commit consistently with the dscp rewrite and
+	// the classifiers.
+	ieeeRewriteNames := make([]string, 0, len(cos.IEEE8021RewriteRules))
+	for name := range cos.IEEE8021RewriteRules {
+		ieeeRewriteNames = append(ieeeRewriteNames, name)
+	}
+	sort.Strings(ieeeRewriteNames)
+	for _, name := range ieeeRewriteNames {
+		rewriteRule := cos.IEEE8021RewriteRules[name]
+		if rewriteRule == nil {
+			continue
+		}
+		for _, entry := range rewriteRule.Entries {
+			if entry == nil {
+				continue
+			}
+			if err := checkEntry("rewrite-rules ieee-802.1", rewriteRule.Name, entry.ForwardingClass, entry.LossPriority); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

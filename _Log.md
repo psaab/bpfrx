@@ -1,3 +1,63 @@
+## 2026-07-07 — #4228 Gap 2 follow-up: accept `buffer-size temporal <us>`
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4228 Gap 2 follow-up — Junos `class-of-service schedulers <s>
+  buffer-size temporal <microseconds>` (size the queue buffer by target delay)
+  was rejected at commit: buffer-size was a plain typed leaf accepting only a
+  byte-size / percent, so the value token `temporal` failed the validator.
+  Converted buffer-size to a whole-tail leaf (mirror of transmit-rate):
+  `tailValidator: ValidateCoSBufferSizeTail` accepts a byte-size (16m), a
+  percent (10%), OR `temporal <us>`, with a `temporal` child for `?`
+  completion. Compiler detects the temporal head via gatherLeafTailTokens and
+  stores `BufferSizeTemporalUS` (new CoSScheduler field); the byte/percent
+  paths are byte-unchanged. ACCEPTED-BUT-INERT — resolving us->bytes needs the
+  queue's transmit rate (which may be a per-interface percent), so a commit
+  advisory surfaces the inertness. golden_4406 UNCHANGED (the corpus has no
+  schedulers, so the new CoSScheduler field never serializes).
+- **File(s)**: pkg/config/types_cos.go, pkg/config/schema_cos.go,
+  pkg/config/schema_validators_cos.go,
+  pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_cos_buffer_temporal_4228_test.go (new),
+  docs/cos-traffic-shaping.md, docs/config-schema.md (stale "temporal NOT
+  carried" note corrected), _Log.md
+- **Validation**: `go test ./pkg/config/...` green (existing buffer-size
+  byte/percent/reject tests still pass after the leaf-shape change);
+  go build ./... clean; gofmt + go vet clean. New RED-on-revert test:
+  `temporal 50000` compiles into BufferSizeTemporalUS (bytes/percent stay 0),
+  the inert advisory fires, byte/percent forms still compile, and `temporal 0`
+  / `temporal abc` / bare `temporal` are rejected at commit.
+
+## 2026-07-07 — #4228 Gap 4: model `rewrite-rules ieee-802.1` (802.1p PCP egress rewrite)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4228 Gap 4 — Junos `class-of-service rewrite-rules ieee-802.1
+  <name> { forwarding-class <fc> { loss-priority <lp> code-point <0..7>; } }`
+  was an UNKNOWN leaf under the opt-in CoS grammar, so an imported vSRX config
+  with an 802.1p PCP rewrite was REJECTED at commit. Modeled it fully (mirror
+  of the DSCP rewrite): new schema node + interface-unit / interface-level
+  `rewrite-rules ieee-802.1 <name>` binding; compiler parses into
+  `IEEE8021RewriteRules` (`CoSIEEE8021RewriteRule` /
+  `CoSIEEE8021RewriteRuleEntry`, PCP domain 0..7 via new
+  `collectCoS8021RewriteCodePoint`); loss-priority typo gate extended to the
+  new rules; dangling forwarding-class + dangling unit-binding warns added.
+  ACCEPTED-BUT-INERT — the dataplane rewrites dscp on egress only and does not
+  yet own the 802.1Q tag write, so a commit advisory surfaces the inertness
+  (the classifier side `classifiers ieee-802.1` is already enforced). Egress
+  PCP write = Rust TX follow-up. golden_4406 regenerated (only the new
+  `IEEE8021RewriteRules` field appears in the serialized Config; 0 other diffs).
+- **File(s)**: pkg/config/types_cos.go, pkg/config/schema_cos.go,
+  pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_validate_strict_cos.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_cos_ieee8021_rewrite_4228_test.go (new),
+  pkg/config/testdata/golden_4406.json (regenerated),
+  docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
+- **Validation**: `go test ./pkg/config/...` green; go build ./... clean;
+  gofmt + go vet clean. New RED-on-revert test: the rewrite parses/compiles
+  into the typed map, the unit binding is captured, the inert advisory fires,
+  and code-point 8 / a `medum-low` loss-priority typo are rejected at commit.
+
 ## 2026-07-07 — #4373 (E1): WARN when `then log session-close` is inert on a deny/reject policy
 
 - **Timestamp**: 2026-07-07

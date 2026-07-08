@@ -46,6 +46,21 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				}},
 			}},
 		}},
+		// #4228 Gap 4: IEEE 802.1p (PCP) egress rewrite. Fully modeled
+		// (forwarding-class -> loss-priority -> code-point 0..7) so a vSRX
+		// config commits clean and the mapping is validated, but ACCEPTED-BUT-
+		// INERT — the userspace dataplane rewrites only dscp on egress today and
+		// does not yet own the 802.1Q tag write (a commit advisory surfaces the
+		// inertness). Mirrors the `dscp` rewrite subtree; the classifier side
+		// (classifiers ieee-802.1) is already enforced.
+		"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule (accepted for Junos compatibility; NOT yet enforced — the dataplane rewrites dscp only)", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
+			"forwarding-class": {desc: "Forwarding class whose packets get the rewritten code point", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+					"code-point":  {desc: "802.1p PCP code point to write (0..7)", args: 1, placeholder: "<code-point>", children: nil},
+					"code-points": {desc: "802.1p PCP code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
+				}},
+			}},
+		}},
 		// #4316 (fable-167 F-3b): IP-precedence and MPLS EXP egress rewrite.
 		// Accepted for Junos compatibility (completion + ? help) but INERT —
 		// the userspace dataplane rewrites only dscp on egress. Commit advisory.
@@ -108,14 +123,27 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			}),
 			children: nil,
 		},
+		// #4228 Gap 2 follow-up: buffer-size accepts an absolute byte-size
+		// (16m), a percent of the interface buffer pool (10%), OR the Junos
+		// `temporal <microseconds>` form (size the buffer by target queue
+		// delay). The heterogeneous tail is validated as a unit (tailValidator)
+		// because the first token is EITHER a value or the `temporal` keyword —
+		// the generic typed-leaf path cannot express that. temporal compiles to
+		// a stored microsecond value that the dataplane does not yet resolve to
+		// bytes (commit advisory, compiler_validate_warn.go). valueType drives
+		// `?` completion only; validator MUST stay nil so the tail path owns
+		// acceptance. `temporal` is declared as a child purely so `set ...
+		// buffer-size ?` surfaces it.
 		"buffer-size": {
-			desc:          "Queue buffer size (bytes with k/m/g suffix, or percent of the interface buffer pool; percents in one scheduler-map must not exceed 100%)",
+			desc:          "Queue buffer size: bytes (16m), a percent of the interface buffer pool (10%), or `temporal <microseconds>` (target queue delay)",
 			args:          1,
 			valueType:     ValueByteSizeOrPercent,
-			valueDesc:     "Byte-size with explicit k/m/g suffix, or percent of interface CoS burst pool (e.g. 16m, 256k, 10%)",
-			valueExamples: []string{"16m", "256k", "10%"},
-			validator:     ValidateByteSizeOrPercent,
-			children:      nil,
+			valueDesc:     "Byte-size (16m, 256k), percent of interface CoS burst pool (10%), or `temporal <microseconds>`",
+			valueExamples: []string{"16m", "256k", "10%", "temporal"},
+			tailValidator: ValidateCoSBufferSizeTail,
+			children: map[string]*schemaNode{
+				"temporal": {desc: "Size the buffer by target queue delay in microseconds (accepted for Junos compatibility; NOT yet resolved to bytes by the dataplane)", args: 1, placeholder: "<microseconds>", children: nil},
+			},
 		},
 		// `surplus-sharing` (#915) and `equal-flow-enforcement` are
 		// presence-only flags — no value to validate.
@@ -217,7 +245,8 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 			}},
 			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
-				"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+				"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+				"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule to apply (accepted-but-inert; dataplane rewrites dscp only)", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 			}},
 			"shaping-rate":                   cosShapingRateSchema("Shaping rate for this unit in bits per second (k/m/g suffixes)"),
 			"scheduler-map":                  {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
@@ -235,7 +264,8 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 		}},
 		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", children: map[string]*schemaNode{
-			"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+			"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+			"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule to apply (accepted-but-inert; dataplane rewrites dscp only)", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 		}},
 		"shaping-rate":                   cosShapingRateSchema("Shaping rate applied at the interface level in bits per second (k/m/g suffixes)"),
 		"scheduler-map":                  {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},

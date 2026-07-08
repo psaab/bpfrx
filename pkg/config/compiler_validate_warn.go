@@ -1066,6 +1066,16 @@ func ValidateConfig(cfg *Config) []string {
 			warnings = append(warnings,
 				"class-of-service rewrite-rules exp is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only, so MPLS EXP rewrite has no runtime effect")
 		}
+		// #4228 Gap 4: ieee-802.1 (PCP) rewrite-rules are fully modeled and
+		// validated but accepted-but-inert — the dataplane rewrites dscp on
+		// egress only and does not yet own the 802.1Q tag write. Warn once so an
+		// operator who binds one is not misled. The classifier side
+		// (classifiers ieee-802.1) IS enforced; only the egress rewrite waits on
+		// TX 802.1Q tag ownership.
+		if len(cos.IEEE8021RewriteRules) > 0 {
+			warnings = append(warnings,
+				"class-of-service rewrite-rules ieee-802.1 is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only and does not yet own the 802.1Q tag write, so 802.1p PCP rewrite has no runtime effect")
+		}
 		for _, class := range cos.ForwardingClasses {
 			if class == nil {
 				continue
@@ -1124,6 +1134,19 @@ func ValidateConfig(cfg *Config) []string {
 			if sched.CodelTargetNS > 0 {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q codel-target is accepted for compatibility but inert: the userspace dataplane has no CoDel AQM (#1829 Phase 2 not shipped), so the configured target has no runtime effect",
+					sched.Name))
+			}
+			// #4228 Gap 2 follow-up: buffer-size temporal <us> is typed + stored
+			// (BufferSizeTemporalUS) so garbage is rejected at commit, but the
+			// microsecond target is NOT yet resolved to a byte-size by the
+			// dataplane (that needs the queue's transmit rate, which itself may
+			// be a per-interface percent). Warn so an operator who sets it is not
+			// misled into believing the queue buffer is sized. Mirrors the
+			// accepted-but-inert doctrine used for codel-target and the percent
+			// rate forms.
+			if sched.BufferSizeTemporalUS > 0 {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service scheduler %q buffer-size temporal is accepted for Junos compatibility but inert: xpf does not yet resolve the microsecond target to a byte-size (it needs the queue's transmit rate), so the queue buffer falls back to the default sizing (#4228 Gap 2)",
 					sched.Name))
 			}
 			// #4228 Gap 2: transmit-rate percent now RESOLVES per-interface —
@@ -1222,6 +1245,23 @@ func ValidateConfig(cfg *Config) []string {
 				// rewrite-rule loss-priority is ENFORCED — no warning.
 			}
 		}
+		// #4228 Gap 4: mirror the undefined-forwarding-class warn for the
+		// accepted-but-inert ieee-802.1 (PCP) rewrite-rules.
+		for _, rewriteRule := range cos.IEEE8021RewriteRules {
+			if rewriteRule == nil {
+				continue
+			}
+			for _, entry := range rewriteRule.Entries {
+				if entry == nil || entry.ForwardingClass == "" {
+					continue
+				}
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service ieee-802.1 rewrite-rule %q references undefined forwarding-class %q",
+						rewriteRule.Name, entry.ForwardingClass))
+				}
+			}
+		}
 		// #4220 / #4219: priority-low-min-share (#1614 A2) is typed and
 		// stored (PriorityLowMinShareBytes) so garbage is rejected at
 		// commit, but the knob is INERT — it is wire-surface-only and no
@@ -1307,6 +1347,14 @@ func ValidateConfig(cfg *Config) []string {
 						warnings = append(warnings, fmt.Sprintf(
 							"class-of-service interface %s unit %d references undefined dscp rewrite-rule %q",
 							iface.Name, unit.Unit, unit.DSCPRewriteRule))
+					}
+				}
+				// #4228 Gap 4: a dangling ieee-802.1 (PCP) rewrite-rule binding.
+				if unit.IEEE8021RewriteRule != "" {
+					if _, ok := cos.IEEE8021RewriteRules[unit.IEEE8021RewriteRule]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined ieee-802.1 rewrite-rule %q",
+							iface.Name, unit.Unit, unit.IEEE8021RewriteRule))
 					}
 				}
 				// #hb166 T-4: a behavior-aggregate classifier code-point that
