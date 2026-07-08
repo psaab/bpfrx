@@ -1,3 +1,32 @@
+## 2026-07-07 — #4585 zeroize erases rendered service-config secrets at wipe time (frr.conf routing-auth, swanctl PSK, kea)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4585 (SECURITY, follow-up to #4576/#4582). #4582 erases the
+  config STATE (.configdb SSOT + master.key + text rollback + journal), but the
+  RENDERED service configs xpfd writes outside /etc/xpf survived the wipe until
+  the completing reboot's reconcile. VERIFY-FIRST finding (elevates MED→HIGH):
+  a post-zeroize boot has NO committed config, so the daemon enters #1922
+  bootstrap mode (applyConfig suppressed, daemon_run.go:689) or, on an HA node,
+  a normal boot with a nil active config (the boot apply is gated on
+  ActiveConfig() != nil, daemon_run.go:717) — EITHER way the boot SKIPS the
+  FRR/IPsec/Kea reconcile-to-empty. So the rendered secrets are a PERSISTENT
+  residual across the reboot, not transient; /etc/frr/frr.conf is mode 0644
+  world-readable and carries BGP-MD5/OSPF/IS-IS auth keys. Fix: performZeroizeWipe
+  now also calls zeroizeRenderedConfigs — strips the frr.conf xpf-managed section
+  (new standalone frr.StripManagedSectionFile, disk-only no reload; operator
+  content outside the markers preserved, unmanaged frr.conf untouched), removes
+  the /etc/swanctl/conf.d/xpf.conf PSK snippet, removes /etc/kea/kea-dhcp{4,6}.conf.
+  Mirrors #4582 discipline: os.ErrNotExist excluded, first real error folded into
+  the surfaced result (.configdb error takes priority) → codes.Internal, never a
+  false clean-reset. Refactored writeManagedSection's marker-strip into the pure
+  stripManagedSection (single SSOT for the #2908 anchoring + #1646 orphaned-begin
+  invariants). Exported dhcpserver.DefaultKea{4,6}ConfPath. RED-on-revert tests
+  TestZeroizeRenderedConfigsErasesSecrets (secret + managed section gone, operator
+  content preserved, snippet/kea absent) + TestZeroizeRenderedConfigsLeavesUnmanagedFRRUntouched.
+- **File(s)**: pkg/frr/manager.go, pkg/dhcpserver/dhcpserver.go,
+  pkg/grpcapi/server_diag.go, pkg/grpcapi/zeroize_rendered_4585_test.go,
+  docs/system-login.md, _Log.md
+
 ## 2026-07-07 — #4586 deploy: day-0 config ISO written owner-only (0600), no longer world-readable in CWD
 
 - **Timestamp**: 2026-07-07

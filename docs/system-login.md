@@ -170,13 +170,34 @@ the top-level `.conf` files (live config + `rescue.conf`), and `.config.journal`
 (+ rotated segments). A wipe that cannot fully erase this state returns an error
 rather than reporting a clean factory reset.
 
-The wipe erases that SSOT/rollback/journal state **directly**. The **rendered
-service configs** xpfd writes outside `/etc/xpf` — `/etc/frr/frr.conf` (0644,
-BGP-MD5 / OSPF / IS-IS auth secrets), `/etc/swanctl/conf.d/*` (IKE PSKs),
-`/etc/kea/kea-dhcp{4,6}.conf` — are **not** removed by the wipe itself; they are
-reset on the **completing reboot** when the daemon reconciles to the empty
-config. Erasing them in the wipe itself (closing the window between wipe and
-reboot) is tracked as follow-up **#4585**.
+**Rendered service-config erasure (#4585).** The wipe erases that
+SSOT/rollback/journal state directly, but the prior tenant's secrets are ALSO
+rendered into service configs xpfd writes **outside** `/etc/xpf`. `zeroize` now
+erases those at wipe time too (`zeroizeRenderedConfigs`, same key-first /
+error-surfacing discipline):
+
+- **`/etc/frr/frr.conf`** — mode **0644 world-readable**; the `! BEGIN/END BPFRX
+  MANAGED CONFIG` section carries BGP-MD5 / OSPF / IS-IS authentication keys.
+  Only that section is stripped (`frr.StripManagedSectionFile`, disk-only — no
+  FRR reload); operator content outside the markers is preserved and a purely
+  operator-managed `frr.conf` is left untouched.
+- **`/etc/swanctl/conf.d/xpf.conf`** — the IKE PSKs live in this single
+  xpf-owned snippet; it is removed outright.
+- **`/etc/kea/kea-dhcp{4,6}.conf`** — xpf owns these whole files; removed outright.
+
+This must be done by the wipe itself, not deferred to the reconcile on the
+completing reboot: a post-zeroize boot has **no committed config**, so the
+daemon enters **#1922 bootstrap mode** (or, on an HA node, a normal boot with a
+`nil` active config) and **SKIPS** the boot-time `applyConfig` that would
+otherwise reconcile FRR/IPsec/Kea to empty (bootstrap suppresses the apply, and
+the normal-boot apply is gated on `ActiveConfig() != nil`). Without the direct
+wipe the rendered secrets would be a **persistent** residual across the reboot —
+a re-tenanted device would keep the prior tenant's routing-auth keys in a
+world-readable file — not the transient one earlier notes assumed. FRR /
+strongSwan / Kea regenerate their configs from the now-empty xpf config on the
+next `commit`, and the daemon still boots cleanly (bootstrap does not touch
+those services). A failure to erase any of them surfaces as an error rather than
+a clean factory-reset report.
 
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`

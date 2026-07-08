@@ -537,49 +537,9 @@ func (m *Manager) writeManagedSection(section string) error {
 		}
 	}
 
-	// Strip existing managed section.
-	//
-	// A correct file has a begin marker followed by an end marker. But a
-	// prior torn write (os.WriteFile is not atomic — a crash or disk-full
-	// mid-write can truncate after the begin marker) can leave an orphaned
-	// markerBegin with no markerEnd. If we only stripped on the both-found
-	// case, the orphan would survive: we would append a second managed block,
-	// leaving two begin markers. The next write's strings.Index(markerEnd)
-	// then matches the new block's end while content[:start] cuts from the
-	// orphaned begin — deleting everything between them, which may include
-	// unrelated FRR config the operator appended. So we treat a begin with no
-	// end as a corrupt tail and discard it to EOF.
-	//
-	// The end-marker search is anchored AFTER the begin marker (#2908). A
-	// stale end-marker positioned *before* the begin marker (an operator
-	// hand-edit, an interleaved partial copy, or external tooling) must not
-	// be matched: an unanchored strings.Index(content, markerEnd) would
-	// return end < start, and the strip content[:start] + content[end:] would
-	// then DUPLICATE the text between end and start while leaving the live
-	// begin marker in place — corrupting the file with two begin markers and
-	// breaking FRR reload. Anchoring the search keeps the end >= start
-	// invariant, so the slice can never duplicate. (This is distinct from the
-	// #1646 orphaned-begin case handled by the else branch below.)
-	content := string(existing)
-	if start := strings.Index(content, markerBegin); start >= 0 {
-		// Search for the end marker strictly after the begin marker, then map
-		// the relative index back to an absolute offset.
-		searchFrom := start + len(markerBegin)
-		if rel := strings.Index(content[searchFrom:], markerEnd); rel >= 0 {
-			end := searchFrom + rel + len(markerEnd)
-			// Also consume the trailing newline
-			if end < len(content) && content[end] == '\n' {
-				end++
-			}
-			content = content[:start] + content[end:]
-		} else {
-			// Orphaned begin marker (torn write): discard from the begin
-			// marker to EOF. Whatever followed an unterminated managed block
-			// is xpf-generated partial config that must not be preserved, and
-			// keeping the orphan begin would cause the next write to over-cut.
-			content = content[:start]
-		}
-	}
+	// Strip any existing managed section (see stripManagedSection for the
+	// torn-write / stale-marker invariants that logic protects).
+	content, _ := stripManagedSection(string(existing))
 
 	// Append new managed section
 	if section != "" {
@@ -595,6 +555,93 @@ func (m *Manager) writeManagedSection(section string) error {
 	// place). rename(2) within a filesystem is atomic.
 	if err := atomicWriteFile(m.frrConf, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write frr.conf: %w", err)
+	}
+	return nil
+}
+
+// stripManagedSection removes the xpf-managed block (markerBegin..markerEnd)
+// from content, returning the stripped content and whether anything was
+// removed (changed=false means content had no managed section and is returned
+// verbatim). It is the pure core shared by writeManagedSection (which strips
+// before appending the new section) and StripManagedSectionFile.
+//
+// A correct file has a begin marker followed by an end marker. But a prior
+// torn write (the pre-#1894 os.WriteFile was not atomic — a crash or disk-full
+// mid-write can truncate after the begin marker) can leave an orphaned
+// markerBegin with no markerEnd. If we only stripped on the both-found case,
+// the orphan would survive: a caller appending a second managed block would
+// leave two begin markers, and the next write's strings.Index(markerEnd) would
+// match the new block's end while content[:start] cuts from the orphaned begin
+// — deleting everything between them, which may include unrelated FRR config
+// the operator appended. So a begin with no end is treated as a corrupt tail
+// and discarded to EOF.
+//
+// The end-marker search is anchored AFTER the begin marker (#2908). A stale
+// end-marker positioned *before* the begin marker (an operator hand-edit, an
+// interleaved partial copy, or external tooling) must not be matched: an
+// unanchored strings.Index(content, markerEnd) would return end < start, and
+// the strip content[:start] + content[end:] would then DUPLICATE the text
+// between end and start while leaving the live begin marker in place —
+// corrupting the file with two begin markers and breaking FRR reload.
+// Anchoring the search keeps the end >= start invariant, so the slice can
+// never duplicate. (This is distinct from the #1646 orphaned-begin case
+// handled by the else branch.)
+func stripManagedSection(content string) (string, bool) {
+	start := strings.Index(content, markerBegin)
+	if start < 0 {
+		return content, false
+	}
+	// Search for the end marker strictly after the begin marker, then map the
+	// relative index back to an absolute offset.
+	searchFrom := start + len(markerBegin)
+	if rel := strings.Index(content[searchFrom:], markerEnd); rel >= 0 {
+		end := searchFrom + rel + len(markerEnd)
+		// Also consume the trailing newline.
+		if end < len(content) && content[end] == '\n' {
+			end++
+		}
+		return content[:start] + content[end:], true
+	}
+	// Orphaned begin marker (torn write): discard from the begin marker to EOF.
+	// Whatever followed an unterminated managed block is xpf-generated partial
+	// config that must not be preserved, and keeping the orphan begin would
+	// cause the next write to over-cut.
+	return content[:start], true
+}
+
+// StripManagedSectionFile removes the xpf-managed section from the frr.conf at
+// path WITHOUT reloading FRR — the disk-only half of Clear(). It exists so a
+// factory-reset zeroize (#4585) can erase the routing-authentication secrets
+// (BGP MD5 / OSPF / IS-IS keys) that the managed section carries in a
+// world-readable (0644) /etc/frr/frr.conf, without a running FRR or a
+// constructed Manager. A post-zeroize boot enters #1922 bootstrap mode (or, on
+// an HA node, normal boot with a nil active config) and SKIPS the boot-time
+// applyConfig that would otherwise reconcile FRR to empty, so the managed
+// section — and its routing-auth secrets — would otherwise be a PERSISTENT
+// residual on the re-tenanted box, not a transient one.
+//
+// Scope: xpf-owned content only. The managed markers bound the xpf section;
+// operator content outside them is preserved (the same marker-anchored strip
+// writeManagedSection uses). A file with NO managed section is left
+// byte-for-byte untouched (changed=false ⇒ no rewrite), so a purely
+// operator-managed frr.conf is never modified. An absent file is not an error
+// (nothing to strip). The rewrite is atomic and preserves the existing file's
+// mode/symlink (atomicWriteFile), so a crash mid-strip cannot leave a
+// half-written frr.conf.
+func StripManagedSectionFile(path string) error {
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read frr.conf: %w", err)
+	}
+	stripped, changed := stripManagedSection(string(existing))
+	if !changed {
+		return nil
+	}
+	if err := atomicWriteFile(path, []byte(stripped), 0644); err != nil {
+		return fmt.Errorf("strip frr.conf managed section: %w", err)
 	}
 	return nil
 }
