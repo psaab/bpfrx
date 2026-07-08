@@ -212,7 +212,13 @@ inspect or rewrite a packet sitting in a UMEM frame.
   [NAT64], `afxdp/icmp.rs::ingress_reply_l2` [ICMP reply VID]) and THREE IPv6
   extension-header walkers (`inspect.rs::packet_rel_l4_offset_and_protocol`
   [#2148, forwarding/GRE], `screen/extract.rs` [#2189, fail-closed], and
-  `icmp_embed/parse.rs::parse_embedded_v6_l4` [#1838, embedded]). The
+  `icmp_embed/parse.rs::parse_embedded_v6_l4` [#1838, embedded; #4533
+  fail-closed]). All three now share the `MAX_IPV6_EXT_HEADERS` (8) bound
+  AND fail CLOSED when the chain is still on an extension header at that
+  bound — `inspect.rs` returns `None` (#2292), `screen/extract.rs` returns
+  `Err` (drop, #2189), and `parse_embedded_v6_l4` returns `None` (#4533,
+  previously a stale-6 bound with a post-loop `Some((offset, ext_type))`
+  fall-through that surrendered a bogus embedded L4). The
   CANONICAL CONTRACT they MUST agree on:
   - **L2**: untagged → l3 = 14; a single 0x8100 (802.1Q) OR 0x88a8 (802.1ad)
     tag → l3 = 18 (the inner ethertype, possibly still a VLAN TPID for a

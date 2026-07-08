@@ -111,7 +111,7 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6_l4(packet: &[u8]) -> Optio
     }
     let mut protocol = *packet.get(6)?;
     let mut offset = 40usize;
-    for _ in 0..6 {
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
             // #4517: generic length-prefixed IPv6 extension headers —
             // HbH (0) / Routing (43) / DestOpt (60) / Mobility (135) /
@@ -154,7 +154,18 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v6_l4(packet: &[u8]) -> Optio
             _ => return Some((offset, protocol)),
         }
     }
-    Some((offset, protocol))
+    // #4533: still on an extension header at the MAX_IPV6_EXT_HEADERS
+    // bound — fail CLOSED (None) instead of surrendering the ext-header
+    // offset/type as a fake embedded L4. This aligns the embedded-ICMP
+    // walker with the #2292 forwarding walker (`frame/inspect.rs`) and
+    // the #4435 nat64 walkers, all of which return None on an
+    // over-bound chain. A quoted inner packet with more extension
+    // headers than the bound therefore resolves no embedded L4 and
+    // cannot drive a bogus embedded-session/NAT match. The bound was
+    // also bumped from a stale 6 to the shared MAX_IPV6_EXT_HEADERS (8)
+    // so a legitimate quoted packet with up to 7 extension headers still
+    // parses (parity with the siblings).
+    None
 }
 
 /// Parse the embedded IPv6 header starting at `embedded_ip_start`.
@@ -348,6 +359,74 @@ mod embedded_v6_parse_tests {
         assert_eq!(hdr.proto, PROTO_TCP);
         assert_eq!(hdr.l4_off, 40);
         assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
+    }
+
+    #[test]
+    fn embedded_seven_ext_headers_still_resolve() {
+        // #4533: the bound was bumped from a stale 6 to the shared
+        // MAX_IPV6_EXT_HEADERS (8), so a quoted inner packet with up to
+        // 7 extension headers (incl the #4517 Mobility/HIP/Shim6/exp
+        // exotics) still walks to its terminal L4 — parity with the
+        // forwarding/screen/nat64 siblings. The old 6-bound stopped at
+        // the 7th header and reported it as a bogus proto.
+        let ehs: Vec<(u8, Vec<u8>)> = [0u8, 43, 60, 135, 139, 140, 253]
+            .iter()
+            .map(|&t| (t, vec![0u8, 0, 0, 0, 0, 0, 0, 0]))
+            .collect();
+        assert_eq!(ehs.len(), MAX_IPV6_EXT_HEADERS - 1);
+        let p = embedded_v6(&ehs, PROTO_TCP);
+        let (rel, proto) = parse_embedded_v6_l4(&p).expect("7 ext headers within bound resolve");
+        assert_eq!((rel, proto), (40 + 7 * 8, PROTO_TCP));
+        let hdr = parse_embedded_v6(&p, 0).expect("parse succeeds");
+        assert_eq!(hdr.proto, PROTO_TCP);
+        assert_eq!(hdr.l4_off, 40 + 7 * 8);
+        assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
+    }
+
+    #[test]
+    fn embedded_ext_chain_overflow_fails_closed() {
+        // #4533: a quoted inner packet with MORE extension headers than
+        // MAX_IPV6_EXT_HEADERS must FAIL CLOSED (None) rather than
+        // surrendering the ext-header offset/type as a fake embedded L4.
+        // Before #4533 the walk stopped at the 6-iteration bound and fell
+        // through to `Some((offset, ext_type))`, returning a bogus proto
+        // that could not match a real session (fail-SAFE) but diverged
+        // from the #2292/#4435 fail-closed doctrine the siblings enforce.
+        let ehs: Vec<(u8, Vec<u8>)> = [0u8, 43, 60, 135, 139, 140, 253, 254]
+            .iter()
+            .map(|&t| (t, vec![0u8, 0, 0, 0, 0, 0, 0, 0]))
+            .collect();
+        assert_eq!(ehs.len(), MAX_IPV6_EXT_HEADERS);
+        let p = embedded_v6(&ehs, PROTO_TCP);
+        assert_eq!(
+            parse_embedded_v6_l4(&p),
+            None,
+            "a chain longer than MAX_IPV6_EXT_HEADERS must fail closed"
+        );
+        assert!(
+            parse_embedded_v6(&p, 0).is_none(),
+            "parse_embedded_v6 must refuse an over-bound quoted chain"
+        );
+    }
+
+    #[test]
+    fn embedded_esp_stops_walk() {
+        // ESP (50) is deliberately NOT walked (encrypted payload,
+        // unreadable inner next-header): the walk STOPS at it and reports
+        // proto=ESP rather than descending. Preserved across the #4533
+        // bound/fail-closed change — ESP hits the terminal `_` arm and
+        // returns early, before the loop bound or the post-loop None.
+        let esp = crate::ip_proto::PROTO_ESP;
+        // ESP directly after the base header.
+        let (rel, proto) =
+            parse_embedded_v6_l4(&embedded_v6(&[], esp)).expect("ESP resolves at base L4 offset");
+        assert_eq!((rel, proto), (40, esp));
+        // ESP behind one hop-by-hop header — the walk advances through the
+        // EH then STOPS at ESP (offset 48), never reading the payload.
+        let hbh = (0u8, vec![0u8, 0, 0, 0, 0, 0, 0, 0]);
+        let (rel, proto) =
+            parse_embedded_v6_l4(&embedded_v6(&[hbh], esp)).expect("ESP after one EH resolves");
+        assert_eq!((rel, proto), (48, esp));
     }
 }
 
