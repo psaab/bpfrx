@@ -826,6 +826,33 @@ type NAT64RuleSnapshot struct {
 	// Replicated onto every NAT64 rule because the option is configured once at
 	// the natv6v4 level, not per rule-set.
 	NoV6FragHeader bool `json:"no_v6_frag_header,omitempty"`
+	// #4559: IPv6-subscriber deterministic CGNAT (mode 2, NAPT64). These carry
+	// the referenced source pool's `port deterministic` block-allocation params
+	// so the userspace dataplane maps each IPv6 subscriber to a fixed external
+	// IPv4 + port block (reversible from (external IPv4, port) without per-flow
+	// state), enforcing the CGN-compliance mapping instead of round-robin PAT.
+	// Non-zero / non-empty ONLY when the pool has an ENFORCED IPv6 host (a /32 or
+	// /64 subscriber prefix); an unsupported prefix, a v4 host (mode 1, carried
+	// on SourceNATRuleSnapshot), or no deterministic stanza leaves them zero and
+	// the pool round-robins.
+	//
+	// DeterministicBlockSize is the per-subscriber port block size (Junos
+	// `block-size`).
+	DeterministicBlockSize uint16 `json:"deterministic_block_size,omitempty"`
+	// DeterministicBlocksPerIP is how many blocks each external pool address
+	// carries, computed against the FIXED NAT64 translated-port range
+	// (1024..65535, nat64PortLow/High) so block boundaries align with the Rust
+	// NAT64 allocator (which ignores the source pool's own port range).
+	DeterministicBlocksPerIP uint16 `json:"deterministic_blocks_per_ip,omitempty"`
+	// DeterministicHostPrefixLen is the IPv6 subscriber-prefix length: 32 or 64.
+	// It selects the 32-bit subscriber-index word (offset 4 for /32, offset 8 for
+	// /64), mirroring the retired-eBPF nat_pool_alloc_deterministic_v6 split.
+	DeterministicHostPrefixLen uint8 `json:"deterministic_host_prefix_len,omitempty"`
+	// DeterministicHostBaseV6 is the IPv6 subscriber-CIDR network base (canonical
+	// string, e.g. "2001:db8::"). The dataplane parses it to the 16-octet base it
+	// derives the subscriber word from and reverses against. Empty => not a
+	// deterministic NAPT64 pool.
+	DeterministicHostBaseV6 string `json:"deterministic_host_base_v6,omitempty"`
 }
 
 // Nptv6RuleSnapshot captures an NPTv6 (RFC 6296) stateless prefix translation

@@ -17,8 +17,8 @@
 // because the rewriters gate every L4 write on `has_l4_ports`).
 
 use super::allocator::{
-    DeterministicV4, NS_PER_SEC, PersistentSourceKey, PoolAddressFamily, PortAllocator,
-    TranslatedTuple, deterministic_indices_v4,
+    DeterministicV4, DeterministicV6, NS_PER_SEC, PersistentSourceKey, PoolAddressFamily,
+    PortAllocator, TranslatedTuple, deterministic_indices_v4,
 };
 use super::{NatCounterStore, NatDecision, NatRuleCounter, NatScopeCtx};
 use crate::SourceNATRuleSnapshot;
@@ -873,6 +873,28 @@ pub(crate) fn allocate_nat64_pool_port(
     match translated.ip {
         IpAddr::V4(v4) => Ok((v4, translated.port)),
         // The pool is always v4 for NAT64, so this is unreachable; fail closed.
+        IpAddr::V6(_) => Err(SourceNatFailureReason::WrongAddressFamily),
+    }
+}
+
+/// #4559: allocate a DETERMINISTIC translated `(pool v4 address, L4 port)` for
+/// a NAPT64 (mode 2) forward flow — the IPv6 subscriber deterministically maps
+/// to a fixed external IPv4 + port block ([`allocate_deterministic_v6`]).
+/// Thin wrapper mirroring [`allocate_nat64_pool_port`] so the module-private
+/// `TranslatedTuple` stays out of `nat64.rs`; `flow` carries the original IPv6
+/// subscriber (`flow.src_ip`), from which the subscriber block is derived. The
+/// pool is always v4 for NAT64, so a v6 translated tuple is unreachable and
+/// fails closed.
+pub(crate) fn allocate_nat64_pool_port_deterministic_v6(
+    allocator: &PortAllocator,
+    flow: SourceNatFlowKey,
+    pool_v4: &[Ipv4Addr],
+    params: DeterministicV6,
+    src_v6: Ipv6Addr,
+) -> Result<(Ipv4Addr, u16), SourceNatFailureReason> {
+    let translated = allocator.allocate_deterministic_v6(flow, pool_v4, params, src_v6)?;
+    match translated.ip {
+        IpAddr::V4(v4) => Ok((v4, translated.port)),
         IpAddr::V6(_) => Err(SourceNatFailureReason::WrongAddressFamily),
     }
 }

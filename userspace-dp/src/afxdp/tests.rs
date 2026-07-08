@@ -8593,6 +8593,7 @@ fn txn_nat64_refusal_at_cap_drops_translated_packet() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["172.16.80.50".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }];
     let forwarding = build_forwarding_state(&snapshot);
     let ha_state = txn_ha_state();
@@ -8672,6 +8673,7 @@ fn txn_nat64_translation_bumps_counter_both_directions() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["172.16.80.50".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }];
     // The reverse v4->v6 reply forwards back to the v6 client on reth1.0;
     // seed its neighbor so the reverse resolution is a usable ForwardCandidate
@@ -12216,6 +12218,7 @@ fn nat64_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["172.16.80.50".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }];
     snapshot.policies = vec![policy];
     snapshot

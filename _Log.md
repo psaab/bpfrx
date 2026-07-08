@@ -1,3 +1,65 @@
+## 2026-07-08 — #4559 mode 2: enforce deterministic NAPT64 (IPv6 subscriber) block allocation on userspace
+
+- **Timestamp**: 2026-07-08
+- **Action**: Ported the IPv6-subscriber / NAPT64 deterministic CGNAT
+  block allocator (mode 2) to the userspace dataplane, completing #4559
+  (mode-1 IPv4 shipped in #4641). An IPv6 subscriber deterministically
+  maps to a fixed external IPv4 pool address + port block, reversible
+  from `(external IPv4, port)` with no per-flow state — the CGN
+  compliance property, now enforced instead of silently round-robined.
+  The subscriber index is the 32-bit word after the configured prefix
+  (`/32` → octet offset 4, `/64` → octet offset 8), reproducing the
+  retired-eBPF `nat_pool_alloc_deterministic_v6` (commit 439cd3f).
+  Mode 2 lives on the NAT64 forward path (the only v6→v4 translation):
+  Rust `DeterministicV6` + `deterministic_indices_v6` /
+  `allocate_deterministic_v6` / `reverse_deterministic_v6` in
+  `nat/allocator.rs`; `Nat64Prefix.deterministic_v6` built from the
+  snapshot in `nat64.rs` (`host_count` derived pool-bounded from the
+  parsed pool size); `allocate_source` routes through the block
+  allocator when set (out-of-range subscriber fails CLOSED). Block
+  boundaries use the FIXED NAT64 port range (1024-65535), not the source
+  pool's own range. Added 4 additive omitempty wire fields on the Go
+  `NAT64RuleSnapshot` + Rust mirror (`#[serde(default)]`, #1961
+  skew-safe), populated by `deterministicNAT64V6Fields`/`buildNAT64Snapshots`
+  only for a `/32`-or-`/64` IPv6 host referenced by a `nat64` rule-set.
+  Narrowed the #4560 advisory to the residual UNENFORCEABLE cases
+  (`deterministicNAPT64Enforced`): an IPv6-host pool not wired to NAT64,
+  or an unsupported prefix length. Regenerated `protocol_wire_v1.json`.
+  Block-based pool-utilization for deterministic pools (#2079 skip) is
+  assessed and DEFERRED — per-subscriber block exhaustion is not
+  captured by pool-wide `UsedPorts`, and a faithful metric needs new
+  allocator block-occupancy state + a design decision (not a bounded
+  add); recorded in `docs/deterministic-nat-cgnat.md`.
+- **Validation**: RED-on-revert Rust tests
+  `deterministic_napt64_v6_fixed_block_per_subscriber_reversible`
+  (allocator: two subscribers land on their computed external IP + block,
+  a second flow stays in-block on a distinct port, reverse recovers each,
+  out-of-range fails closed, `/64` word offset) and
+  `napt64_deterministic_v6_routes_through_block_allocator` (through
+  `Nat64State::allocate_source` — verified RED with the gate neutralized:
+  panics on the block assertion) + companion gate-guard tests. Go builder
+  tests (`nat64_deterministic_4559_test.go`) + advisory-narrowing tests
+  (`TestDeterministicNAPT64EnforcedNoAdvisory` /
+  `…UnreferencedEmitsAdvisory`). FULL cargo test 3761/0 (nat subset
+  668/0); `go test ./pkg/config/... ./pkg/dataplane/...` green. Cluster
+  smoke (a deterministic NAPT64 pool, confirm on-wire that a subscriber's
+  translated ports fall in its computed block) is a nice-to-have follow-up
+  — the block/IP assignment + reverse mapping are unit-proven and the
+  round-robin path is byte-identical for non-deterministic NAT64 pools.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/nat64_tests.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/frame/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/nat64.go,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/nat64_deterministic_4559_test.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/deterministic_nat_advisory_4559_test.go,
+  docs/deterministic-nat-cgnat.md, docs/feature-gaps.md, docs/vsrx-gaps.md,
+  _Log.md
+
 ## 2026-07-08 — #4657 (codex-review-174 #14, refactor) format/cos.go: split view-model build from render
 
 - **Timestamp**: 2026-07-08

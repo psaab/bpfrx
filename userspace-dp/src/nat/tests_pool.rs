@@ -7,8 +7,9 @@
 #![allow(unused_imports)]
 
 use super::allocator::{
-    ALLOCATION_GC_BUDGET, DeterministicV4, NS_PER_SEC, PersistentLease, PersistentSourceKey,
-    PoolAddressFamily, TranslatedTuple, reverse_deterministic_v4, sticky_pool_index,
+    ALLOCATION_GC_BUDGET, DeterministicV4, DeterministicV6, NS_PER_SEC, PersistentLease,
+    PersistentSourceKey, PoolAddressFamily, TranslatedTuple, deterministic_indices_v6,
+    reverse_deterministic_v4, reverse_deterministic_v6, sticky_pool_index,
 };
 use super::source::{PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFlowKey};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
@@ -3527,6 +3528,125 @@ fn deterministic_cgnat_absent_leaves_round_robin_pool_unchanged() {
         d.rewrite_src_port,
         Some(1024),
         "a non-deterministic pool allocates from the round-robin cursor (port_low)"
+    );
+}
+
+// #4559 mode-2 (NAPT64) RED-on-revert: an IPv6 subscriber deterministically maps
+// to a FIXED external IPv4 + port block computed from the 32-bit word after the
+// configured prefix, reversible from (external IPv4, port) with no per-flow
+// state. Neutralizing `allocate_deterministic_v6` / `deterministic_indices_v6`
+// (e.g. reverting to the round-robin `allocate_nat64_pool_port`) turns this RED:
+// the external IP / port would no longer be the subscriber's computed block and
+// the reverse would not recover the subscriber. Mirrors the mode-1 IPv4 test's
+// block math (sub_idx 5 and 256) so the two paths cross-check.
+#[test]
+fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
+    let pool = [
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 2),
+        Ipv4Addr::new(198, 51, 100, 3),
+        Ipv4Addr::new(198, 51, 100, 4),
+    ];
+    // NAT64 fixed translated-port range 1024..=65535 => 64512 ports.
+    // block_size 512 => blocks_per_ip 126. host_count = pool.len() * bpi = 504.
+    let base: Ipv6Addr = "2001:db8::".parse().unwrap();
+    let det = DeterministicV6 {
+        block_size: 512,
+        blocks_per_ip: 126,
+        host_prefix_len: 32,
+        host_base: base.octets(),
+        host_count: 4 * 126,
+    };
+    // One shared allocator sized like the NAT64 per-prefix allocator.
+    let alloc = PortAllocator::new(pool.len(), 1024, 65535);
+
+    let alloc_for = |src: &str, sport: u16| -> (Ipv4Addr, u16) {
+        let flow = SourceNatFlowKey {
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V6(src.parse().expect("src")),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            src_port: sport,
+            dst_port: 443,
+        };
+        let t = alloc
+            .allocate_deterministic_v6(flow, &pool, det, src.parse().expect("src"))
+            .expect("deterministic v6 allocation");
+        match t.ip {
+            IpAddr::V4(v4) => (v4, t.port),
+            other => panic!("NAT64 pool is always v4, got {other}"),
+        }
+    };
+
+    // Subscriber A = 2001:db8:0:5:: -> word after /32 = 5 -> sub_idx 5,
+    // ip_idx 0, block_idx 5, block [1024+5*512, ..+511] = [3584,4095], pool[0].
+    let (a_ip, a_port) = alloc_for("2001:db8:0:5::", 10001);
+    assert_eq!(a_ip, pool[0], "subscriber A maps to its deterministic pool IP");
+    assert!(
+        (3584..=4095).contains(&a_port),
+        "subscriber A port {a_port} must fall in its deterministic block [3584,4095]"
+    );
+
+    // Same subscriber, a DIFFERENT flow -> SAME external IP + block, distinct port.
+    let (a2_ip, a2_port) = alloc_for("2001:db8:0:5::", 10002);
+    assert_eq!(a2_ip, pool[0], "same subscriber keeps the same deterministic IP");
+    assert!(
+        (3584..=4095).contains(&a2_port),
+        "same subscriber's second flow port {a2_port} stays in block [3584,4095]"
+    );
+    assert_ne!(a_port, a2_port, "two live flows in one block get distinct ports");
+
+    // Reverse: (external IPv4, port) -> subscriber prefix, no per-flow state.
+    assert_eq!(
+        reverse_deterministic_v6(&det, &pool, 1024, a_ip, a_port),
+        Some("2001:db8:0:5::".parse().unwrap()),
+        "reverse must recover subscriber A from (external IPv4, port) alone"
+    );
+    assert_eq!(
+        reverse_deterministic_v6(&det, &pool, 1024, a2_ip, a2_port),
+        Some("2001:db8:0:5::".parse().unwrap()),
+        "the second flow reverses to the same subscriber A"
+    );
+
+    // Subscriber B = 2001:db8:0:100:: -> word 256 -> sub_idx 256, ip_idx 2,
+    // block_idx 4, block [1024+4*512, ..+511] = [3072,3583], pool[2].
+    let (b_ip, b_port) = alloc_for("2001:db8:0:100::", 20001);
+    assert_eq!(b_ip, pool[2], "subscriber B maps to a DIFFERENT deterministic pool IP");
+    assert!(
+        (3072..=3583).contains(&b_port),
+        "subscriber B port {b_port} must fall in its deterministic block [3072,3583]"
+    );
+    assert_eq!(
+        reverse_deterministic_v6(&det, &pool, 1024, b_ip, b_port),
+        Some("2001:db8:0:100::".parse().unwrap()),
+        "reverse must recover subscriber B"
+    );
+
+    // A subscriber beyond the pool-bounded host_count fails CLOSED (never
+    // round-robins). host_count = 504, so sub_idx 504 (word 0x1f8) is one past.
+    let over = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6("2001:db8:0:1f8::".parse().unwrap()),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        src_port: 30001,
+        dst_port: 443,
+    };
+    assert!(
+        alloc
+            .allocate_deterministic_v6(over, &pool, det, "2001:db8:0:1f8::".parse().unwrap())
+            .is_err(),
+        "a subscriber beyond host_count must fail closed, not round-robin"
+    );
+
+    // /64 prefix reads the subscriber word at octet offset 8 (word[2]), not 4.
+    let det64 = DeterministicV6 {
+        host_prefix_len: 64,
+        ..det
+    };
+    // 2001:db8:0:0:0:7:: -> octets[8..12] = 0x00000007 -> sub_idx 7.
+    assert_eq!(
+        deterministic_indices_v6(&det64, "2001:db8::7:0:0".parse().unwrap()),
+        Some((0, 7)),
+        "/64 subscriber index derives from the word after the /64 prefix"
     );
 }
 

@@ -710,6 +710,10 @@
     "rate": 0
   },
   "nat64_rule_snapshot": {
+    "deterministic_block_size": 0,
+    "deterministic_blocks_per_ip": 0,
+    "deterministic_host_base_v6": "",
+    "deterministic_host_prefix_len": 0,
     "name": "",
     "no_v6_frag_header": false,
     "pool_addresses": [],
