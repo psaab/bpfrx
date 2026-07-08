@@ -1,0 +1,654 @@
+package main
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/psaab/xpf/pkg/config"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/policymatch"
+)
+
+func (c *ctl) handleShowSecurity(args []string) error {
+	if len(args) == 0 {
+		printRemoteTreeHelp("show security:", "show", "security")
+		return nil
+	}
+
+	switch args[0] {
+	case "zones":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("zones-detail")
+		}
+		return c.showZones()
+	case "policies":
+		if len(args) >= 2 && args[1] == "brief" {
+			return c.showPoliciesBrief()
+		}
+		if len(args) >= 2 && args[1] == "detail" {
+			var filterParts []string
+			for i := 2; i+1 < len(args); i++ {
+				if args[i] == "from-zone" || args[i] == "to-zone" {
+					filterParts = append(filterParts, args[i], args[i+1])
+					i++
+				}
+			}
+			return c.showTextFiltered("policies-detail", strings.Join(filterParts, " "))
+		}
+		if len(args) >= 2 && args[1] == "hit-count" {
+			var filterParts []string
+			for i := 2; i+1 < len(args); i++ {
+				if args[i] == "from-zone" || args[i] == "to-zone" {
+					filterParts = append(filterParts, args[i], args[i+1])
+					i++
+				}
+			}
+			return c.showTextFiltered("policies-hit-count", strings.Join(filterParts, " "))
+		}
+		var fromZone, toZone string
+		for i := 1; i+1 < len(args); i++ {
+			switch args[i] {
+			case "from-zone":
+				i++
+				fromZone = args[i]
+			case "to-zone":
+				i++
+				toZone = args[i]
+			}
+		}
+		return c.showPoliciesFiltered(fromZone, toZone)
+	case "screen":
+		if len(args) >= 2 && args[1] == "ids-option" && len(args) >= 3 {
+			if len(args) >= 4 && args[3] == "detail" {
+				return c.showText("screen-ids-option-detail:" + args[2])
+			}
+			return c.showText("screen-ids-option:" + args[2])
+		}
+		if len(args) >= 2 && args[1] == "statistics" {
+			if len(args) >= 4 && args[2] == "zone" {
+				return c.showText("screen-statistics:" + args[3])
+			}
+			return c.showText("screen-statistics-all")
+		}
+		return c.showScreen()
+	case "flow":
+		if len(args) >= 2 && args[1] == "session" {
+			return c.showFlowSession(args[2:])
+		}
+		if len(args) >= 2 && args[1] == "traceoptions" {
+			return c.showText("flow-traceoptions")
+		}
+		if len(args) >= 2 && args[1] == "statistics" {
+			return c.showText("flow-statistics")
+		}
+		if len(args) == 1 {
+			return c.showText("flow-timeouts")
+		}
+		return fmt.Errorf("usage: show security flow {session|statistics|traceoptions}")
+	case "nat":
+		return c.handleShowNAT(args[1:])
+	case "log":
+		return c.showEvents(args[1:])
+	case "statistics":
+		detail := len(args) >= 2 && args[1] == "detail"
+		return c.showStatistics(detail)
+	case "ipsec":
+		return c.showIPsec(args[1:])
+	case "ike":
+		return c.showIKE(args[1:])
+	case "match-policies":
+		return c.showMatchPolicies(args[1:])
+	case "vrrp":
+		return c.showVRRP()
+	case "wireguard":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("wireguard-detail")
+		}
+		if len(args) >= 2 && args[1] == "public-key" {
+			return c.showText("wireguard-public-key")
+		}
+		return c.showText("wireguard")
+	case "alarms":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("security-alarms-detail")
+		}
+		return c.showText("security-alarms")
+	case "alg":
+		return c.showText("alg")
+	case "dynamic-address":
+		return c.showText("dynamic-address")
+	case "address-book":
+		return c.showText("address-book")
+	case "applications":
+		return c.showText("applications")
+	default:
+		return fmt.Errorf("unknown show security target: %s", args[0])
+	}
+}
+
+// zoneHostInboundView projects a gRPC ZoneInfo onto the shared host-inbound
+// presenter (#3654). The structured response already carries the split
+// system-services / protocols set and the per-interface overrides (#3328), so
+// the remote CLI renders exactly what the local and gRPC-text surfaces do. The
+// wire response cannot distinguish a no-stanza zone from an explicit empty
+// stanza (both are deny-all with empty lists post-#3405), so ZoneConfigured is
+// left false and the posture line reads "(no stanza)".
+func zoneHostInboundView(z *pb.ZoneInfo) config.HostInboundView {
+	v := config.HostInboundView{
+		ZoneSystemServices: z.GetHostInboundSystemServices(),
+		ZoneProtocols:      z.GetHostInboundProtocols(),
+		// #3682: carry the lifeline-exempt interface list from the structured
+		// response so the remote CLI renders the same "excluded from
+		// host-inbound deny" line as the local and gRPC-text surfaces.
+		LifelineInterfaces: z.GetLifelineInterfaces(),
+	}
+	for _, ih := range z.GetInterfaceHostInbound() {
+		v.Interfaces = append(v.Interfaces, config.InterfaceHostInboundView{
+			Interface:               ih.GetInterface(),
+			SystemServices:          ih.GetSystemServices(),
+			Protocols:               ih.GetProtocols(),
+			EffectiveSystemServices: config.UnionHostInboundTokens(z.GetHostInboundSystemServices(), ih.GetSystemServices()),
+			EffectiveProtocols:      config.UnionHostInboundTokens(z.GetHostInboundProtocols(), ih.GetProtocols()),
+		})
+	}
+	return v
+}
+
+func (c *ctl) showZones() error {
+	resp, err := c.client.GetZones(c.ctx(), &pb.GetZonesRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+
+	// #3669: do NOT swallow the GetPolicies error. GetZones succeeded, so the
+	// zone bodies are valid and worth printing, but if the policy inventory RPC
+	// failed the per-zone "Policies:" references are silently omitted — which
+	// reads identically to "these zones have no policies". On a firewall a
+	// partial policy view must fail loud: an operator (or automation scraping
+	// exit status) must be able to tell a control-plane degradation apart from
+	// genuinely policy-free zones. We render the zones, then surface the error so
+	// the command exits non-zero (see main.go dispatch) and the degraded state
+	// is visible rather than reported as success.
+	polResp, polErr := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
+
+	for _, z := range resp.Zones {
+		if z.Id > 0 {
+			fmt.Printf("Zone: %s (id: %d)\n", z.Name, z.Id)
+		} else {
+			fmt.Printf("Zone: %s\n", z.Name)
+		}
+		if z.Description != "" {
+			fmt.Printf("  Description: %s\n", z.Description)
+		}
+		fmt.Printf("  Interfaces: %s\n", strings.Join(z.Interfaces, ", "))
+		if z.TcpRst {
+			fmt.Println("  TCP RST: enabled")
+		}
+		if z.ScreenProfile != "" {
+			fmt.Printf("  Screen: %s\n", z.ScreenProfile)
+		}
+		// #3654 (H09/M03/M06): consume the structured split system-services /
+		// protocols and per-interface overrides from the gRPC response and
+		// render them through the SAME shared presenter the local/gRPC-text
+		// surfaces use, instead of collapsing everything into one legacy
+		// "Host-inbound services" line that dropped the service-vs-protocol
+		// split, the per-interface overrides, and the default-deny posture.
+		for _, line := range zoneHostInboundView(z).Render(config.HostInboundLabels{
+			Indent:         "  ",
+			Sep:            ", ",
+			ServicesLabel:  "Host-inbound system-services",
+			ProtocolsLabel: "Host-inbound protocols",
+		}) {
+			fmt.Println(line)
+		}
+		if z.IngressPackets > 0 || z.EgressPackets > 0 {
+			fmt.Println("  Traffic statistics:")
+			fmt.Printf("    Input:  %d packets, %d bytes\n", z.IngressPackets, z.IngressBytes)
+			fmt.Printf("    Output: %d packets, %d bytes\n", z.EgressPackets, z.EgressBytes)
+		}
+
+		// #3683 (M01): render all THREE policy tiers the runtime evaluates, in
+		// order — zone-pair, applicable global, then the effective
+		// default-policy catch-all — mirroring the local zone-detail summary
+		// (pkg/cli/cli_show_security_zones.go) and gRPC text
+		// (pkg/grpcapi/server_show_zones_text.go), both from #3658. The old
+		// remote summary listed ONLY zone-pair groups whose group-level zones
+		// matched the zone, so the "*"/"*" global group and the synthetic
+		// default-policy row (#3363) were both hidden — an operator scraping the
+		// ctl binary could miss a global or default-policy rule that governs the
+		// zone's transit.
+		if polResp != nil {
+			fmt.Println("  Policy summary (evaluation order: zone-pair, global, default-policy):")
+			zonePairPolicies := 0
+			globalPolicies := 0
+			var defaultName, defaultAction string
+			for _, pi := range polResp.Policies {
+				switch {
+				case pi.FromZone == "-" && pi.ToZone == "-":
+					// #3363 synthetic default-policy row: from/to zone "-" with a
+					// single rule named dataplane.DefaultPolicyName. Captured here
+					// and printed last so it always closes the summary (M05),
+					// independent of its position in the response.
+					if len(pi.Rules) > 0 {
+						defaultName = pi.Rules[0].Name
+						defaultAction = pi.Rules[0].Action
+					}
+				case pi.FromZone == "*" && pi.ToZone == "*":
+					// #3357 global group: filter PER-RULE by the rule's scope
+					// (#3148 MatchFromZone/MatchToZone). A scoped global narrows
+					// the all-zones group to a zone pair; an unscoped or
+					// explicit-"any" scope is the all-zones wildcard
+					// (config.IsWildcardZone), so the global is listed whenever
+					// the zone can appear on either side of a pair it matches
+					// (config.GlobalPolicyAppliesToZone — the same predicate the
+					// local/gRPC-text tier renderers use).
+					for _, rule := range pi.Rules {
+						if !config.GlobalPolicyAppliesToZone(config.PolicyMatch{
+							FromZone: rule.MatchFromZone,
+							ToZone:   rule.MatchToZone,
+						}, z.Name) {
+							continue
+						}
+						fmt.Printf("    [global] %s -> %s: %s (%s)\n",
+							matchScopeZone(rule.MatchFromZone),
+							matchScopeZone(rule.MatchToZone),
+							rule.Name, rule.Action)
+						globalPolicies++
+					}
+				case pi.FromZone == z.Name || pi.ToZone == z.Name:
+					for _, rule := range pi.Rules {
+						fmt.Printf("    [zone-pair] %s -> %s: %s (%s)\n",
+							pi.FromZone, pi.ToZone, rule.Name, rule.Action)
+						zonePairPolicies++
+					}
+				}
+			}
+			if zonePairPolicies == 0 && globalPolicies == 0 {
+				fmt.Println("    (no zone-pair or global policies affecting this zone)")
+			}
+			// M05: always surface the effective default-policy catch-all when the
+			// inventory carries it, so unmatched-transit disposition is never
+			// hidden behind an absent "(no policies)" line.
+			if defaultName != "" {
+				fmt.Printf("    [default] %s: %s\n", defaultName, defaultAction)
+			}
+		}
+
+		fmt.Println()
+	}
+	if polErr != nil {
+		return fmt.Errorf("policy inventory unavailable (zone policy references omitted): %w", polErr)
+	}
+	return nil
+}
+
+func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
+	resp, err := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	renderRule := func(rule *pb.PolicyRule) {
+		fmt.Printf("  Rule: %s\n", rule.Name)
+		if rule.Description != "" {
+			fmt.Printf("    Description: %s\n", rule.Description)
+		}
+		// #3672 (M01): annotate "(except)" when the match sense is inverted
+		// (source-address-excluded / destination-address-excluded). Without it
+		// an exclusive ("all EXCEPT these") match reads identical to an
+		// inclusive one, inverting the rule's reachability meaning. Mirrors the
+		// local CLI detail "(except)" annotation and the gRPC/REST inventory
+		// booleans.
+		src := fmt.Sprintf("%v", rule.SrcAddresses)
+		if rule.SourceAddressExcluded {
+			src += " (except)"
+		}
+		dst := fmt.Sprintf("%v", rule.DstAddresses)
+		if rule.DestinationAddressExcluded {
+			dst += " (except)"
+		}
+		fmt.Printf("    Match: src=%s dst=%s app=%v\n", src, dst, rule.Applications)
+		fmt.Printf("    Action: %s\n", rule.Action)
+		// #3672 (M02): surface per-rule session logging. The wire carries the
+		// independent init/close modes (#3336); the collapsed `log` bool alone
+		// made a logged permit indistinguishable from an unlogged one and hid
+		// init-only vs close-only. Mirrors the local CLI "Session log:
+		// at-create, at-close".
+		if rule.Log || rule.LogSessionInit || rule.LogSessionClose {
+			var modes []string
+			if rule.LogSessionInit {
+				modes = append(modes, "at-create")
+			}
+			if rule.LogSessionClose {
+				modes = append(modes, "at-close")
+			}
+			if len(modes) > 0 {
+				fmt.Printf("    Log: %s\n", strings.Join(modes, ", "))
+			} else {
+				fmt.Printf("    Log: enabled\n")
+			}
+		}
+		// #3672 (M03): surface scheduler binding and runtime-inactive state
+		// (#3624). A scheduled rule outside its active window prints
+		// "Action: permit" while the dataplane skips/denies it (scheduler
+		// fail-closed) — the inactive annotation makes that visible.
+		switch {
+		case rule.SchedulerName != "" && rule.Inactive:
+			fmt.Printf("    Scheduler: %s (inactive)\n", rule.SchedulerName)
+		case rule.SchedulerName != "":
+			fmt.Printf("    Scheduler: %s\n", rule.SchedulerName)
+		case rule.Inactive:
+			fmt.Printf("    Inactive: true\n")
+		}
+		// #3672 (M04): a "then count" rule prints its hit count even at zero, so
+		// counted-but-idle is distinguishable from not-counted. A rule with hits
+		// prints them regardless (unchanged); an uncounted idle rule prints
+		// nothing (unchanged).
+		if rule.Count || rule.HitPackets > 0 || rule.HitBytes > 0 {
+			fmt.Printf("    Hit count: %d packets, %d bytes\n", rule.HitPackets, rule.HitBytes)
+		}
+	}
+	for _, pi := range resp.Policies {
+		// #3357: the global group is exposed by GetPolicies with the group-level
+		// zones "*"/"*"; the per-rule scope of a scoped global (#3148) is carried
+		// in rule.MatchFromZone/MatchToZone. Filtering the whole group on its
+		// "*"/"*" zones dropped every scoped global from the filtered view — the
+		// exact command an operator uses to prove which rules govern a zone pair.
+		// Detect the global group and filter per-rule, rendering each rule under a
+		// header that shows its effective scope (an unscoped/explicit-any axis is
+		// normalized to "any" via matchScopeZone — #3683 M02).
+		if pi.FromZone == "*" && pi.ToZone == "*" {
+			for _, rule := range pi.Rules {
+				if !policymatch.GlobalPolicyAppliesToZonePair(rule.MatchFromZone, rule.MatchToZone, fromZone, toZone) {
+					continue
+				}
+				// #3683 (M02): render the effective scope through matchScopeZone
+				// (the shared normalizer, empty -> "any") so an unscoped global
+				// prints "From zone: any, To zone: any" — the canonical Junos /
+				// local-CLI / gRPC model — instead of a hand-rolled "*" that reads
+				// like an internal wildcard rather than the explicit policy model.
+				fmt.Printf("From zone: %s, To zone: %s\n",
+					matchScopeZone(rule.MatchFromZone), matchScopeZone(rule.MatchToZone))
+				renderRule(rule)
+				fmt.Println()
+			}
+			continue
+		}
+		if fromZone != "" && pi.FromZone != fromZone {
+			continue
+		}
+		if toZone != "" && pi.ToZone != toZone {
+			continue
+		}
+		fmt.Printf("From zone: %s, To zone: %s\n", pi.FromZone, pi.ToZone)
+		for _, rule := range pi.Rules {
+			renderRule(rule)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *ctl) showScreen() error {
+	return c.showText("screen")
+}
+
+func (c *ctl) showMatchPolicies(args []string) error {
+	// #3696: parse the selector grammar through the single strict SSOT parser
+	// (policymatch.ParseSelectorArgs) shared by the local CLI, the remote CLI,
+	// and the gRPC test-policy bridge. A value-taking selector present WITHOUT a
+	// value, an UNKNOWN selector token, an explicit-empty typed value, and a
+	// malformed IP / port / protocol / icmp value are all HARD ERRORS — the
+	// remote CLI no longer forwards a silently-widened query to the typed
+	// MatchPolicies RPC. Per-value validation (#3354 / #3108 / #3284 / #1711)
+	// now lives in the parser, so this surface fails closed before any RPC.
+	sel, err := policymatch.ParseSelectorArgs(args)
+	if err != nil {
+		return err
+	}
+
+	if sel.FromZone == "" || sel.ToZone == "" {
+		// #3628: shared SSOT selector list (policymatch) — advertise every
+		// selector the request parser accepts, including icmp-type/icmp-code and
+		// protocol by name or number.
+		fmt.Println(policymatch.MatchPoliciesUsage)
+		return nil
+	}
+
+	req := &pb.MatchPoliciesRequest{
+		FromZone:        sel.FromZone,
+		ToZone:          sel.ToZone,
+		SourceIp:        sel.SrcIP,
+		DestinationIp:   sel.DstIP,
+		Protocol:        sel.Protocol,
+		SourcePort:      int32(sel.SrcPort),
+		DestinationPort: int32(sel.DstPort),
+	}
+	if sel.ICMPType != nil {
+		u := uint32(*sel.ICMPType)
+		req.IcmpType = &u
+	}
+	if sel.ICMPCode != nil {
+		u := uint32(*sel.ICMPCode)
+		req.IcmpCode = &u
+	}
+
+	resp, err := c.client.MatchPolicies(c.ctx(), req)
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+
+	if resp.Matched {
+		if resp.Global {
+			fmt.Printf("Matching policy (global):\n")
+		} else {
+			fmt.Printf("Matching policy:\n")
+		}
+		fmt.Printf("  From zone: %s, To zone: %s\n", req.FromZone, req.ToZone)
+		fmt.Printf("  Policy: %s\n", resp.PolicyName)
+		// #3331: identify WHICH scoped/global policy matched so a verdict maps
+		// back to the runtime policy / session-table ID / audit record when the
+		// same policy name repeats across zone pairs or global scope.
+		fmt.Printf("    Policy ID: %d\n", resp.GetPolicyId())
+		// #3668: also print the stable rule identity so a hit joins to the
+		// inventory / logs / tests even after a policy reorder shifts Policy ID.
+		if resp.GetRuleId() != "" {
+			fmt.Printf("    Rule ID: %s\n", resp.GetRuleId())
+		}
+		if resp.Global {
+			fmt.Printf("    Scope: global (match from-zone: %s, to-zone: %s)\n",
+				matchScopeZone(resp.FromZone), matchScopeZone(resp.ToZone))
+		} else {
+			fmt.Printf("    Scope: zone-pair (from-zone: %s, to-zone: %s)\n", resp.FromZone, resp.ToZone)
+		}
+		// #3668: annotate "(except)" for a source/destination-address-excluded
+		// rule so a positive verdict conveys the negation instead of reading as
+		// if the printed address list caused the match. Same SSOT suffix helper
+		// the local CLI uses, so the two surfaces cannot drift.
+		fmt.Printf("    Source addresses%s: %v\n", policymatch.ExceptSuffix(resp.GetSourceAddressExcluded()), resp.SrcAddresses)
+		fmt.Printf("    Destination addresses%s: %v\n", policymatch.ExceptSuffix(resp.GetDestinationAddressExcluded()), resp.DstAddresses)
+		fmt.Printf("    Applications: %v\n", resp.Applications)
+		fmt.Printf("    Action: %s\n", resp.Action)
+	} else if resp.HostInboundUnmatched {
+		// #3285: host-bound traffic — no transit global/default fallback.
+		// #3655: render the SSOT policymatch.HostInboundShowLine (as the local
+		// CLI / REST / gRPC surfaces already do post-#3647) instead of the old
+		// hard-coded "local delivery proceeds" wording. That literal read as an
+		// unconditional admit even though a no-stanza zone now default-DENIES
+		// host-inbound (#3405); the shared const states delivery is subject to
+		// host-inbound-traffic service admission so remote clients see the same
+		// accurate verdict as every other transport.
+		fmt.Printf("No matching to-zone junos-host policy for %s -> junos-host\n", req.FromZone)
+		fmt.Printf("  %s\n", policymatch.HostInboundShowLine)
+	} else {
+		// #3283: render the SERVER-provided default verdict (resp.Action carries
+		// "<action> (default)" from the configured default-policy), NOT a
+		// hard-coded "default deny". Under `default-policy permit-all` the old
+		// literal reported the OPPOSITE of the dataplane — the same simulator
+		// drift class #3283 fixes — and diverged from the local CLI / gRPC text
+		// surfaces, which already report resp.Action.
+		fmt.Printf("No matching policy found for %s -> %s (%s)\n", req.FromZone, req.ToZone, resp.Action)
+	}
+	// #4373 (E4/H2/H7): the server flags a multicast/broadcast/unspecified/
+	// loopback destination that the forwarding path drops at route lookup before
+	// policy runs. Print the SSOT advisory it carries so a remote-CLI verdict is
+	// not read as real forwarding — parity with the local CLI + REST surfaces
+	// over the same policymatch.RouteDropNote wording.
+	if note := resp.GetRouteDropNote(); note != "" {
+		fmt.Printf("  %s\n", note)
+	}
+	return nil
+}
+
+// matchScopeZone renders a global policy's match from-zone/to-zone scope for the
+// match-policies output (#3331). An empty scope means the global policy applies
+// to every zone, shown as "any" to match the Junos / `show policies` convention.
+func matchScopeZone(z string) string {
+	if z == "" {
+		return "any"
+	}
+	return z
+}
+
+func (c *ctl) showVRRP() error {
+	resp, err := c.client.GetVRRPStatus(c.ctx(), &pb.GetVRRPStatusRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+
+	if len(resp.Instances) == 0 {
+		fmt.Println("No VRRP groups configured")
+		return nil
+	}
+
+	if resp.ServiceStatus != "" {
+		fmt.Println(resp.ServiceStatus)
+	}
+
+	fmt.Printf("%-14s %-6s %-8s %-10s %-16s %-8s\n",
+		"Interface", "Group", "State", "Priority", "VIP", "Preempt")
+	for _, inst := range resp.Instances {
+		preempt := "no"
+		if inst.Preempt {
+			preempt = "yes"
+		}
+		vip := strings.Join(inst.VirtualAddresses, ",")
+		fmt.Printf("%-14s %-6d %-8s %-10d %-16s %-8s\n",
+			inst.Interface, inst.GroupId, inst.State, inst.Priority, vip, preempt)
+	}
+	return nil
+}
+
+func (c *ctl) showEvents(args []string) error {
+	// Forward the FULL argument string — count AND any zone/protocol/action
+	// selector — to the daemon, which parses it through the shared
+	// logging.ParseEventFilterArgs (#3547). Before #3547 this only picked out
+	// a numeric count and dropped every other token, so `show security log
+	// zone <name>` (including the unknown/none/0 zone-0 selector #3338) was a
+	// silent no-op on the remote `cli`: the daemon saw an empty filter and
+	// dumped every event, never isolating the requested zone the way the
+	// local CLI does.
+	return c.showTextFiltered("security-log", strings.Join(args, " "))
+}
+
+func (c *ctl) showStatistics(detail bool) error {
+	resp, err := c.client.GetGlobalStats(c.ctx(), &pb.GetGlobalStatsRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Println("Global statistics:")
+	fmt.Printf("  %-25s %d\n", "RX packets:", resp.RxPackets)
+	fmt.Printf("  %-25s %d\n", "TX packets:", resp.TxPackets)
+	fmt.Printf("  %-25s %d\n", "Drops:", resp.Drops)
+	fmt.Printf("  %-25s %d\n", "Sessions created:", resp.SessionsCreated)
+	fmt.Printf("  %-25s %d\n", "Sessions closed:", resp.SessionsClosed)
+	fmt.Printf("  %-25s %d\n", "Screen drops:", resp.ScreenDrops)
+	fmt.Printf("  %-25s %d\n", "Policy denies:", resp.PolicyDenies)
+	fmt.Printf("  %-25s %d\n", "NAT alloc failures:", resp.NatAllocFailures)
+	fmt.Printf("  %-25s %d\n", "Host-inbound denies:", resp.HostInboundDenies)
+	fmt.Printf("  %-25s %d\n", "Host-inbound allowed:", resp.HostInboundAllowed)
+	fmt.Printf("  %-25s %d\n", "TC egress packets:", resp.TcEgressPackets)
+	fmt.Printf("  %-25s %d\n", "NAT64 translations:", resp.Nat64Translations)
+
+	if !detail {
+		return nil
+	}
+
+	if resp.ScreenDrops > 0 {
+		fmt.Printf("\nScreen drop details:\n")
+		for name, count := range resp.ScreenDropDetails {
+			fmt.Printf("  %-25s %d\n", name+":", count)
+		}
+	}
+
+	text, err := c.client.ShowText(c.ctx(), &pb.ShowTextRequest{Topic: "buffers"})
+	if err == nil && text.Output != "" {
+		fmt.Printf("\n%s", text.Output)
+	}
+	return nil
+}
+
+func (c *ctl) showIKE(args []string) error {
+	if len(args) > 0 && args[0] == "security-associations" {
+		resp, err := c.client.GetIPsecSA(c.ctx(), &pb.GetIPsecSARequest{})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		if resp.Output == "" {
+			fmt.Println("No IKE security associations")
+		} else {
+			fmt.Print(resp.Output)
+		}
+		return nil
+	}
+	return c.showText("ike")
+}
+
+func (c *ctl) showIPsec(args []string) error {
+	if len(args) > 0 && args[0] == "security-associations" {
+		resp, err := c.client.GetIPsecSA(c.ctx(), &pb.GetIPsecSARequest{})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Print(resp.Output)
+		return nil
+	}
+	if len(args) > 0 && args[0] == "statistics" {
+		return c.showText("ipsec-statistics")
+	}
+	printRemoteTreeHelp("show security ipsec:", "show", "security", "ipsec")
+	return nil
+}
+
+func (c *ctl) showPoliciesBrief() error {
+	resp, err := c.client.GetPolicies(c.ctx(), &pb.GetPoliciesRequest{})
+	if err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+		"From", "To", "Name", "Action", "Hits")
+	for _, pi := range resp.Policies {
+		for _, rule := range pi.Rules {
+			hits := "-"
+			if rule.HitPackets > 0 {
+				hits = fmt.Sprintf("%d", rule.HitPackets)
+			}
+			// #3357: a scoped global (#3148) is exposed under the global group
+			// (pi.FromZone/ToZone == "*"), but its real zone scope is carried
+			// per-rule in MatchFromZone/MatchToZone. Render the effective scope
+			// so the brief view does not regress a scoped global to "*"/"*",
+			// matching the local-CLI #3286 display. Zone-pair rules and the
+			// default-policy row leave the match-scope empty and fall back to the
+			// group zones (real zones / "-"), so they are unchanged.
+			from, to := pi.FromZone, pi.ToZone
+			if rule.MatchFromZone != "" {
+				from = rule.MatchFromZone
+			}
+			if rule.MatchToZone != "" {
+				to = rule.MatchToZone
+			}
+			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
+				from, to, rule.Name, rule.Action, hits)
+		}
+	}
+	return nil
+}
