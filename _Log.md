@@ -1,3 +1,36 @@
+## 2026-07-07 — #4508 doc: clarify `Packets dropped` = enforcement drops (undercounts no-route/fabric/vlan/NAT64)
+
+- **Timestamp**: 2026-07-07
+- **Action**: DOC + label clarification. `Packets dropped`
+  (`dataplane.GlobalCtrDrops`, bridged by `totalDrops()` since #4477) is the
+  sum of the FOUR ENFORCEMENT drop reasons only — policy deny + screen/IDS +
+  host-inbound deny + source-NAT alloc fail. It is NOT the literal total of
+  every discarded packet: no-route/missing-neighbor (surfaced separately as
+  the helper status `Route misses:`, from `route_miss_packets`/
+  `neighbor_miss_packets`), fabric-forwarding drops (`GlobalCtrFabricFwdDrop`
+  idx 32), VLAN-push failures (`GlobalCtrVlanPushFail` idx 40), and NAT64
+  fail-closed drops are all EXCLUDED, so the figure undercounts total
+  discards. Documented the scope + excluded paths in
+  `docs/junos-cli-reference.md` (flow-statistics Format Details + the #4477
+  accounting bullet), extended the `totalDrops()` godoc in
+  `pkg/dataplane/userspace/manager_ha.go`, and clarified the free-form
+  Prometheus `xpf_drops_total` help text in `pkg/api/metrics_descriptors.go`.
+  KEPT the CLI display string `Packets dropped:` verbatim — it is the vSRX
+  `show security flow statistics` field name and relabeling would break the
+  Junos CLI parity this doc exists to guarantee (no test pins the string; the
+  caveat lives in the doc/help-text instead). Added a RED-on-revert test
+  `TestDropsTotalHelpDeclaresEnforcementScope` asserting the clarified help
+  text names `enforcement`/`no-route`/`undercounts` and no longer carries the
+  misleading `Total packets dropped.` wording.
+- **File(s)**: `docs/junos-cli-reference.md`,
+  `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/api/metrics_descriptors.go`,
+  `pkg/api/metrics_drops_scope_4508_test.go`, `_Log.md`
+- **Validation**: `gofmt -l` clean, `go vet ./pkg/api/ ./pkg/dataplane/
+  userspace/` clean, `go build ./...` OK, `go test ./pkg/api/ ./pkg/dataplane/
+  userspace/` green; verified the new test fails RED when
+  `metrics_descriptors.go` is reverted to `origin/master`.
+
 ## 2026-07-07 — #4607 event_stream: seed queue budget in the #2875 telemetry-eviction test
 
 - **Timestamp**: 2026-07-07

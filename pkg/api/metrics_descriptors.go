@@ -18,7 +18,18 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		dropsTotal: prometheus.NewDesc(
 			"xpf_drops_total",
-			"Total packets dropped.",
+			// #4508: enforcement drops only — policy deny + screen/IDS +
+			// host-inbound deny + source-NAT alloc fail (the GlobalCtrDrops
+			// bridge, #4477). This does NOT include no-route/missing-neighbor,
+			// fabric-forwarding (idx 32), VLAN-push (idx 40), or NAT64
+			// fail-closed drops, so it undercounts total discards. No-route
+			// drops surface separately in the userspace helper status
+			// ("Route misses"). Kept the mirror of the vSRX "Packets dropped"
+			// field name/scope; see docs/junos-cli-reference.md.
+			"Packets dropped by enforcement (policy deny, screen/IDS, "+
+				"host-inbound deny, source-NAT alloc fail). Does NOT include "+
+				"no-route, fabric-forwarding, VLAN-push, or NAT64 fail-closed "+
+				"drops, so it undercounts total discards.",
 			nil, nil,
 		),
 		// #3345/#3408: scrape-error signal for counter reads across the global,
