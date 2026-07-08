@@ -522,6 +522,66 @@ func TestConfigEqual_DifferentRetransTimer(t *testing.T) {
 	}
 }
 
+// TestConfigEqual_EquivalentNAT64Prefix asserts that two textually-different
+// but equivalent NAT64 CIDR forms compare EQUAL, so a cosmetic re-type does
+// not trigger a spurious RA sender restart (#4590 A5-03). RED-on-revert:
+// restore the raw-string `a.NAT64Prefix != b.NAT64Prefix` compare and this
+// fails (the two forms are unequal as strings).
+func TestConfigEqual_EquivalentNAT64Prefix(t *testing.T) {
+	a := &config.RAInterfaceConfig{Interface: "trust0", NAT64Prefix: "64:ff9b::/96"}
+	b := &config.RAInterfaceConfig{Interface: "trust0", NAT64Prefix: "0064:ff9b:0:0::/96"}
+
+	if !configEqual(a, b) {
+		t.Error("equivalent NAT64 prefix forms should be equal (no spurious restart)")
+	}
+}
+
+// TestConfigEqual_DifferentNAT64Prefix asserts a genuine NAT64 prefix change
+// is still detected as NOT-equal (the normalization must not mask real edits).
+func TestConfigEqual_DifferentNAT64Prefix(t *testing.T) {
+	a := &config.RAInterfaceConfig{Interface: "trust0", NAT64Prefix: "64:ff9b::/96"}
+	b := &config.RAInterfaceConfig{Interface: "trust0", NAT64Prefix: "2001:db8::/96"}
+
+	if configEqual(a, b) {
+		t.Error("different NAT64 prefixes should not be equal (sender must restart)")
+	}
+}
+
+// TestConfigEqual_EquivalentAdvertisedPrefix asserts the same normalization
+// applies to advertised on-link prefixes, not just NAT64 (#4590 A5-03).
+func TestConfigEqual_EquivalentAdvertisedPrefix(t *testing.T) {
+	a := &config.RAInterfaceConfig{
+		Interface: "trust0",
+		Prefixes:  []*config.RAPrefix{{Prefix: "2001:db8::/64", OnLink: true, Autonomous: true}},
+	}
+	b := &config.RAInterfaceConfig{
+		Interface: "trust0",
+		Prefixes:  []*config.RAPrefix{{Prefix: "2001:0db8:0:0::/64", OnLink: true, Autonomous: true}},
+	}
+
+	if !configEqual(a, b) {
+		t.Error("equivalent advertised prefix forms should be equal (no spurious restart)")
+	}
+}
+
+// TestPrefixEqual_MalformedFallsBackToStringCompare asserts that when a CIDR
+// fails to parse, prefixEqual falls back to an exact string compare so a real
+// change is never masked (#4590 A5-03).
+func TestPrefixEqual_MalformedFallsBackToStringCompare(t *testing.T) {
+	if prefixEqual("not-a-cidr", "also-not-a-cidr") {
+		t.Error("distinct unparseable strings must not be treated as equal")
+	}
+	if !prefixEqual("", "") {
+		t.Error("two unset (empty) prefixes must be equal")
+	}
+	if !prefixEqual("garbage", "garbage") {
+		t.Error("identical unparseable strings must be equal via string fallback")
+	}
+	if prefixEqual("64:ff9b::/96", "") {
+		t.Error("a set prefix must differ from unset")
+	}
+}
+
 // TestConfigEqual_SameTimers guards against a spurious restart: two configs
 // with identical reachable-time/retransmit-timer (including the 0=unspecified
 // default) stay equal, so a no-op commit does not create an RA gap.

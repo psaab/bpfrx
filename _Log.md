@@ -40722,3 +40722,14 @@ top.
 - **File(s)**: userspace-dp/src/fairness_eval/args.rs,
   userspace-dp/src/fairness_eval/inputs.rs,
   userspace-dp/src/fairness_eval/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4590 (ps-037-A5 A5-03, GO, pkg/ra) — `configEqual` compared
+  `NAT64Prefix` and each advertised `Prefixes[i].Prefix` as raw strings, so an
+  operator re-typing an equivalent-but-non-canonical CIDR (`64:ff9b::/96` →
+  `0064:ff9b::/96`) forced a spurious RA sender restart (sub-second RA gap)
+  even though `buildRA` re-parses via `netip.ParsePrefix` and the wire is
+  identical. Added `prefixEqual` (normalize via `netip.ParsePrefix`, exact
+  string fallback when either side is unparseable so a genuine change is never
+  masked) and routed the two CIDR compares through it. RED-on-revert verified.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/ra_test.go, pkg/ra/README.md, _Log.md
