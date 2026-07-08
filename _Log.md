@@ -40818,3 +40818,26 @@ top.
   string fallback when either side is unparseable so a genuine change is never
   masked) and routed the two CIDR compares through it. RED-on-revert verified.
 - **File(s)**: pkg/ra/ra.go, pkg/ra/ra_test.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4498 (FRR sanitize-belt residual + #4482 test completeness, GO,
+  pkg/frr) — the #4494 hostile review flagged three route-map free-text slots
+  the #4482 sweep missed, still rendering with a bare `%s` on the tolerant-load
+  path (peer-sync / rollback / lenient load, where the strict #1798 commit gate
+  only warns, #1960): `set ip/ipv6 next-hop <term.NextHop>`, `set origin
+  <term.Origin>`, and `match source-protocol <proto>`. All three now pass
+  through `sanitizeFRRValue` (parity with the #4482/#4097 belt) so a value with
+  an embedded newline cannot inject a standalone frr.conf command. Extended
+  `TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482` from 3-of-10
+  wrapped slots to drive an injection payload through EVERY wrapped route-map
+  slot (prefix-list ip+ipv6, match community, match as-path, set community
+  replace/additive, set comm-list delete, set as-path prepend) PLUS the three
+  new #4498 slots (set ip/ipv6 next-hop, set origin, match source-protocol),
+  with a per-slot collapse assertion so a revert of any single site is caught.
+  The inline route-filter slot is fail-closed by the #2105 net.ParseCIDR belt
+  (asserted directly, not via payload collapse). RED-on-revert verified: the
+  generic injection scan fails when all sanitize sites — or only the four new
+  #4498 sites — are unwrapped. go test ./pkg/frr/... ./pkg/config/... green;
+  go build ./...; gofmt+vet clean.
+- **File(s)**: pkg/frr/policy_render.go,
+  pkg/frr/policy_setclause_injection_4482_test.go, pkg/frr/README.md, _Log.md
