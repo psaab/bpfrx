@@ -169,8 +169,9 @@ use crate::afxdp::write_eth_header_slice;
 // NAT64-dropped while the forwarding path accepts it.
 use crate::afxdp::MAX_IPV6_EXT_HEADERS;
 use crate::nat::{
-    NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey, allocate_nat64_pool_port,
-    release_nat64_pool_port, reserve_nat64_pool_port,
+    DeterministicV6, NatDecision, PortAllocator, SourceNatFailureReason, SourceNatFlowKey,
+    allocate_nat64_pool_port, allocate_nat64_pool_port_deterministic_v6, release_nat64_pool_port,
+    reserve_nat64_pool_port,
 };
 use crate::session::SessionDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -206,6 +207,14 @@ pub(crate) struct Nat64Prefix {
     /// across the per-worker `Nat64State` clones, so a port claimed on one
     /// worker is visible to every other worker.
     pub(crate) port_allocator: PortAllocator,
+    /// #4559: IPv6-subscriber deterministic CGNAT (mode 2, NAPT64). `Some` when
+    /// the referenced source pool carries `port deterministic` with an enforced
+    /// IPv6 host (/32 or /64 prefix); the forward `allocate_source` then maps
+    /// each IPv6 subscriber to a fixed external IPv4 + port block
+    /// (`allocate_deterministic_v6`) instead of round-robin PAT, so the
+    /// `(external IPv4, port)` → subscriber reverse needs no per-flow log
+    /// (lawful-intercept / CGN audit). `None` => the pre-#4559 round-robin path.
+    pub(crate) deterministic_v6: Option<DeterministicV6>,
 }
 
 impl Clone for Nat64Prefix {
@@ -216,6 +225,7 @@ impl Clone for Nat64Prefix {
             pool_index: AtomicUsize::new(self.pool_index.load(Ordering::Relaxed)),
             // Clone shares the Arc-backed allocator state (see field doc).
             port_allocator: self.port_allocator.clone(),
+            deterministic_v6: self.deterministic_v6,
         }
     }
 }
@@ -611,6 +621,39 @@ fn parse_pool_v4(s: &str) -> Option<Ipv4Addr> {
     }
 }
 
+/// #4559: build the mode-2 (NAPT64) deterministic block-allocation params for a
+/// NAT64 prefix from its snapshot + the parsed pool size. Returns `None` (the
+/// pre-#4559 round-robin fallback) when the pool is not a deterministic NAPT64
+/// pool (empty base string, zero block size), the base is unparseable, the
+/// prefix length is unsupported (only /32 and /64 map to a subscriber word, per
+/// the retired-eBPF split), the block math is degenerate, or the pool is empty.
+/// `host_count` is bounded by pool capacity (`num_pool_ips * blocks_per_ip`) —
+/// an IPv6 subscriber word extends far beyond the pool, so a subscriber past
+/// that fails closed rather than aliasing another subscriber's block.
+fn build_deterministic_v6(snap: &NAT64RuleSnapshot, num_pool_ips: usize) -> Option<DeterministicV6> {
+    if snap.deterministic_host_base_v6.is_empty() || snap.deterministic_block_size == 0 {
+        return None;
+    }
+    if snap.deterministic_host_prefix_len != 32 && snap.deterministic_host_prefix_len != 64 {
+        return None;
+    }
+    if snap.deterministic_blocks_per_ip == 0 || num_pool_ips == 0 {
+        return None;
+    }
+    let base: Ipv6Addr = snap.deterministic_host_base_v6.parse().ok()?;
+    let host_count = (num_pool_ips as u32).checked_mul(snap.deterministic_blocks_per_ip as u32)?;
+    if host_count == 0 {
+        return None;
+    }
+    Some(DeterministicV6 {
+        block_size: snap.deterministic_block_size,
+        blocks_per_ip: snap.deterministic_blocks_per_ip,
+        host_prefix_len: snap.deterministic_host_prefix_len,
+        host_base: base.octets(),
+        host_count,
+    })
+}
+
 impl Nat64State {
     /// Build from config snapshot NAT64 rules, SKIPPING (fail-scoped) any
     /// unparseable rule (#2212, refined by #3888).
@@ -769,11 +812,22 @@ impl Nat64State {
                 .unwrap_or_else(|| {
                     PortAllocator::new(pool_v4.len(), NAT64_PORT_LOW, NAT64_PORT_HIGH)
                 });
+            // #4559: build the mode-2 (NAPT64) deterministic block-allocation
+            // params when the referenced source pool carried `port deterministic`
+            // with an enforced IPv6 host. The Go builder sends a non-empty base +
+            // block-size + prefix-len (32/64) + blocks-per-ip (computed against
+            // the NAT64 port range); `host_count` is pool-bounded, so it is
+            // derived HERE from the parsed pool (`pool_v4.len() * blocks_per_ip`)
+            // rather than trusted from the wire — the authoritative pool count is
+            // whatever survived `parse_pool_v4`. A malformed base or an
+            // unsupported prefix length leaves it `None` (round-robin fallback).
+            let deterministic_v6 = build_deterministic_v6(snap, pool_v4.len());
             prefixes.push(Nat64Prefix {
                 prefix_bytes,
                 pool_v4,
                 pool_index: AtomicUsize::new(0),
                 port_allocator,
+                deterministic_v6,
             });
         }
         Self {
@@ -904,6 +958,20 @@ impl Nat64State {
             src_port,
             dst_port,
         };
+        // #4559: a deterministic NAPT64 pool maps the IPv6 subscriber to a fixed
+        // external IPv4 + port block (reversible without per-flow state) instead
+        // of the round-robin PAT below. An out-of-range subscriber fails CLOSED
+        // (DeterministicSubscriberOutOfRange) rather than silently round-robining
+        // — the compliance mapping must never quietly degrade.
+        if let Some(det) = prefix.deterministic_v6 {
+            return allocate_nat64_pool_port_deterministic_v6(
+                &prefix.port_allocator,
+                flow,
+                &prefix.pool_v4,
+                det,
+                src_v6,
+            );
+        }
         allocate_nat64_pool_port(&prefix.port_allocator, flow, &prefix.pool_v4, now_ns)
     }
 

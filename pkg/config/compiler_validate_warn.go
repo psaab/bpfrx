@@ -29,6 +29,40 @@ func deterministicIPv4Enforced(det *DeterministicNATConfig) bool {
 	return bits == 32
 }
 
+// deterministicNAPT64Enforced reports whether a deterministic-NAT pool uses the
+// IPv6-subscriber path (mode 2 / NAPT64), which the userspace dataplane now
+// enforces (#4559). Mode 2 is enforced ONLY through the NAT64 forward path, so
+// two conditions must both hold: (1) the host CIDR is a valid IPv6 prefix of a
+// SUPPORTED length (/32 or /64 — the only lengths that map to a 32-bit
+// subscriber word, matching userspace.deterministicNAT64V6Fields and the
+// retired-eBPF split), and (2) the pool is referenced as the source-pool of at
+// least one `security nat nat64` rule-set (a v6→v4 translation only happens
+// there — a plain source-NAT rule cannot translate an IPv6 subscriber to a v4
+// pool). An IPv6-host deterministic pool that meets neither still round-robins
+// and keeps the accepted-but-inert advisory.
+func deterministicNAPT64Enforced(cfg *Config, poolName string, det *DeterministicNATConfig) bool {
+	if det == nil || det.BlockSize <= 0 || det.HostAddress == "" || poolName == "" {
+		return false
+	}
+	ip, hostNet, err := net.ParseCIDR(det.HostAddress)
+	if err != nil {
+		return false
+	}
+	if ip.To4() != nil || ip.To16() == nil {
+		return false // not a genuine IPv6 host (mode 1 / unparseable)
+	}
+	ones, bits := hostNet.Mask.Size()
+	if bits != 128 || (ones != 32 && ones != 64) {
+		return false // unsupported subscriber-prefix length
+	}
+	for _, rs := range cfg.Security.NAT.NAT64 {
+		if rs != nil && rs.SourcePool == poolName {
+			return true
+		}
+	}
+	return false
+}
+
 // sortedPoolNames returns the keys of a NAT pool map in deterministic sorted
 // order, so advisory / warning messages that enumerate pools are stable across
 // compiles (Go map iteration order is randomized). Used by the #4291/#4292
@@ -863,17 +897,19 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	// #4559 (ps-034 M-01): deterministic CGNAT `port deterministic block-size
-	// <n> host address <cidr>`. The IPv4-subscriber path (mode 1) is now
-	// ENFORCED on the userspace dataplane — the Go builder carries the block /
-	// host params (nat_source.go deterministicSourceNATFields) and the Rust
-	// allocator maps each subscriber to a fixed external IP + port block
-	// (allocate_deterministic_v4). Only the IPv6-subscriber path (mode 2 /
-	// NAT64) remains deferred: the builder leaves its snapshot fields zero so
-	// the pool silently round-robins, and the subscriber→fixed-port-block
-	// mapping (lawful-intercept / audit without per-flow logs) is not enforced
-	// for it. Warn ONLY for those deferred pools so the operator is not silently
-	// misled, mirroring the #4291/#4292 accepted-only doctrine. Full IPv6
-	// enforcement remains tracked in #4559.
+	// <n> host address <cidr>`. Both the IPv4-subscriber path (mode 1) and the
+	// IPv6-subscriber / NAPT64 path (mode 2) are now ENFORCED on the userspace
+	// dataplane: mode 1 via the source-NAT snapshot + allocate_deterministic_v4,
+	// mode 2 via the NAT64 forward path (buildNAT64Snapshots carries the block /
+	// host params; nat64.rs allocate_source → allocate_deterministic_v6 maps each
+	// IPv6 subscriber to a fixed external IPv4 + port block). What REMAINS
+	// deferred (and keeps the advisory) is a deterministic pool that the
+	// dataplane cannot map: an IPv6 host of an UNSUPPORTED subscriber-prefix
+	// length (only /32 and /64 map to a 32-bit subscriber word), an IPv6-host
+	// pool NOT referenced by any `security nat nat64` rule-set (a plain
+	// source-NAT rule cannot translate a v6 subscriber to a v4 pool), or a host
+	// address that no longer parses. Warn ONLY for those so the operator is not
+	// silently misled, mirroring the #4291/#4292 accepted-only doctrine.
 	{
 		var detPools []string
 		for _, name := range sortedPoolNames(cfg.Security.NAT.SourcePools) {
@@ -881,21 +917,27 @@ func ValidateConfig(cfg *Config) []string {
 			if p == nil || p.Deterministic == nil {
 				continue
 			}
-			// An IPv4 host CIDR is enforced (mode 1). Anything else (IPv6 host,
-			// or a host address that no longer parses) still falls back to
-			// round-robin, so it keeps the advisory.
+			// Enforced: an IPv4 host CIDR (mode 1) OR an IPv6 host referenced by a
+			// NAT64 rule-set with a supported /32 or /64 prefix (mode 2). Anything
+			// else still falls back to round-robin, so it keeps the advisory.
 			if deterministicIPv4Enforced(p.Deterministic) {
+				continue
+			}
+			if deterministicNAPT64Enforced(cfg, name, p.Deterministic) {
 				continue
 			}
 			detPools = append(detPools, name)
 		}
 		if len(detPools) > 0 {
 			warnings = append(warnings, fmt.Sprintf(
-				"security nat source pool %s: `port deterministic block-size` with "+
-					"an IPv6 (NAT64) subscriber host is accepted but NOT enforced "+
-					"by the userspace dataplane (round-robin/sticky SNAT is used "+
-					"instead); IPv4-subscriber deterministic CGNAT is enforced, IPv6 "+
-					"(mode 2) block allocation is not yet implemented (#4559)",
+				"security nat source pool %s: `port deterministic block-size` is "+
+					"accepted but NOT enforced by the userspace dataplane "+
+					"(round-robin/sticky SNAT is used instead). IPv4-subscriber "+
+					"deterministic CGNAT (mode 1) and IPv6/NAPT64 (mode 2, a /32 or "+
+					"/64 host referenced by a `security nat nat64` rule-set) ARE "+
+					"enforced; this pool is neither (unsupported IPv6 prefix length, "+
+					"not referenced by a nat64 rule-set, or an unparseable host "+
+					"address) (#4559)",
 				strings.Join(detPools, ", ")))
 		}
 	}

@@ -8,20 +8,22 @@ a public IP address. The mapping is purely mathematical -- no per-session state
 is needed for reverse lookup, enabling ISP compliance logging without per-session
 overhead.
 
-**Commits:** `74e1d17` (IPv4 CGNAT), `439cd3f` (IPv6/NAPT64 extension)
+**Commits:** `74e1d17` (IPv4 CGNAT, eBPF — historical), `439cd3f` (IPv6/NAPT64
+extension, eBPF — historical), #4560 (commit-time advisory), #4559 (userspace
+port of BOTH mode 1 and mode 2 — the current runtime path)
 
 ## Runtime status (userspace dataplane)
 
 > The original block allocator (`74e1d17`, `439cd3f`) lived only in the eBPF
 > plane, which was retired in #1373/#1476. After #1476 a deterministic pool
 > committed clean but SILENTLY round-robined on the userspace dataplane (the
-> only runtime). #4560 added a commit-time advisory; **#4559 ports the IPv4
-> (mode 1) block allocator to `userspace-dp`.**
+> only runtime). #4560 added a commit-time advisory; **#4559 ports BOTH the IPv4
+> (mode 1) and the IPv6/NAPT64 (mode 2) block allocators to `userspace-dp`.**
 
 | Path | Status |
 |------|--------|
 | **IPv4 subscriber (mode 1)** | **ENFORCED** on the userspace dataplane (#4559). The Go builder carries the block/host params; the Rust allocator maps each in-range subscriber IPv4 to a fixed external pool address + port block, reversible from `(external IP, port)` with no per-flow state. |
-| **IPv6 subscriber / NAPT64 (mode 2)** | **Deferred.** Config-accepted + validated, but the userspace allocator does not yet implement it — the pool round-robins for IPv6 subscribers and the commit-time advisory (`ValidateConfig`, #4559) surfaces the gap. |
+| **IPv6 subscriber / NAPT64 (mode 2)** | **ENFORCED** on the userspace dataplane (#4559) via the NAT64 forward path. When the source pool referenced by a `security nat nat64` rule-set carries `port deterministic` with a `/32` or `/64` IPv6 host, `buildNAT64Snapshots` carries the block/host params and `nat64.rs allocate_source` maps each IPv6 subscriber (the 32-bit word after the prefix) to a fixed external IPv4 + port block, reversible from `(external IPv4, port)` with no per-flow state. An IPv6-host deterministic pool NOT referenced by a NAT64 rule-set (a plain source-NAT rule cannot translate v6→v4), or with an unsupported subscriber-prefix length, still round-robins and keeps the commit-time advisory (`ValidateConfig`, #4559). |
 
 See "Userspace Dataplane Implementation (#4559)" below. The "BPF
 Implementation" section is retained for historical reference only — that source
@@ -87,7 +89,30 @@ after the configured prefix:
 - `/32` prefix: word[1] (bytes 4-7 of IPv6 address)
 - `/64` prefix: word[2] (bytes 8-11 of IPv6 address)
 
-Only `/32` and `/64` prefix lengths are supported for IPv6 host addresses.
+Only `/32` and `/64` prefix lengths are supported for IPv6 host addresses (any
+other length is hard-rejected at commit: `IPv6 host prefix must be /32 or /64`).
+
+**The pool must be referenced by a `security nat nat64` rule-set as its
+`source-pool`** — mode-2 enforcement lives on the NAT64 forward path (the v6→v4
+translation). A `/32` or `/64` deterministic pool NOT wired to a NAT64 rule-set
+commits but round-robins (the plain source-NAT path has no v6→v4 mode); the
+commit-time advisory surfaces that. Example wiring:
+
+```
+set security nat source pool CGNAT64-POOL address 198.51.100.1/32 to 198.51.100.8/32
+set security nat source pool CGNAT64-POOL port deterministic block-size 2016
+set security nat source pool CGNAT64-POOL port deterministic host address 2001:db8::/32
+set security nat nat64 rule-set rs1 prefix 64:ff9b::/96
+set security nat nat64 rule-set rs1 source-pool CGNAT64-POOL
+```
+
+Block boundaries for mode 2 are computed against the FIXED NAT64 translated-port
+range (1024-65535, the per-prefix allocator range in `userspace-dp/src/nat64.rs`
+`NAT64_PORT_LOW`/`NAT64_PORT_HIGH`), NOT the source pool's own `port` range
+(which the NAT64 allocator ignores). The subscriber count is bounded by pool
+capacity (`num_pool_ips * blocks_per_ip`): an IPv6 subscriber word extends far
+beyond the pool, so a subscriber past that capacity fails CLOSED rather than
+aliasing another subscriber's block.
 
 ### Pool Utilization Alarm (#2079)
 
@@ -147,9 +172,30 @@ window (the helper has accepted the new generation but not yet reconciled its
 forwarding state, so the NAT counters are still the old generation — the applied
 snapshot is recorded only after the post-`NotifyLinkCycle` rebind reconcile),
 and for transiently uncomputable samples (`AddressCount==0` / `PortHigh<PortLow`
-/ capacity 0). Deterministic pools are SKIPPED in this release — `UsedPorts` is
-not the right numerator for block-based allocation; block-based utilization is a
-follow-up.
+/ capacity 0). Deterministic pools are SKIPPED — `UsedPorts` is not the right
+numerator for block-based allocation.
+
+**Block-based utilization for deterministic pools (#4559 assessment — DEFERRED,
+not a bounded add).** With the mode-1/mode-2 allocators now enforced (#4559), a
+deterministic pool's exhaustion mode is fundamentally PER-SUBSCRIBER, not
+pool-wide: each subscriber owns a fixed port block and cannot borrow another's,
+so a subscriber can exhaust its own block (new flows for THAT subscriber fail)
+while the pool's total `UsedPorts / capacity` stays low. A pool-wide total-port
+alarm therefore cannot capture the CGNAT failure it is meant to warn about.
+
+The Junos-faithful metric is block occupancy — distinct subscriber blocks with
+at least one live flow, over `AddressCount * blocks_per_ip` — but the allocator
+does not track it: it holds a global per-address occupancy bitmap and a
+`live_by_flow` map, neither of which is a distinct-occupied-blocks count.
+Deriving it per poll would mean scanning every address bitmap by block range
+(O(AddressCount * portRange) ≈ 16M bit tests for a 256-IP pool) or adding new
+hot-path per-block active-flow counters — a design decision plus new allocator
+state, not a mechanical add. And even block-occupancy does not surface the true
+per-subscriber-block-full condition (that a specific subscriber's block is
+saturated). This is left as a scoped follow-up: pick the metric (occupied-block
+ratio vs per-subscriber-block-full events), add the bounded counter to the
+allocator, thread it through `SourceNATPoolStatus`, and teach `pkg/natpoolalarm`
+to use it for deterministic pools instead of skipping them.
 
 NOTE: the legacy eBPF `nat_port_counters` map (read by `metrics_nat.go` and
 the CLI `show security nat source pool` "Utilization %") is never incremented
@@ -185,19 +231,32 @@ at pool configuration time, instead of per-session SNAT logs.
 
 ## Userspace Dataplane Implementation (#4559)
 
-The IPv4 (mode 1) path is implemented in the Rust AF_XDP dataplane. The
-external-IP + port-block assignment is byte-for-byte the same deterministic,
-reversible mapping the eBPF plane used (Algorithm above); the userspace version
-additionally tracks live flows so a port is not reused while a session is alive.
+Both the IPv4 (mode 1) and the IPv6/NAPT64 (mode 2) paths are implemented in the
+Rust AF_XDP dataplane. The external-IP + port-block assignment is byte-for-byte
+the same deterministic, reversible mapping the eBPF plane used (Algorithm
+above); the userspace version additionally tracks live flows so a port is not
+reused while a session is alive.
+
+### Mode 1 (IPv4 subscriber, plain source NAT)
 
 | Component | Change |
 |-----------|--------|
-| `pkg/dataplane/userspace/nat_source.go` | `deterministicSourceNATFields()` precomputes `mode`/`block_size`/`blocks_per_ip`/`host_base` (host-order u32)/`host_count` from the pool + the defaulted port range, and stamps them on `SourceNATRuleSnapshot`. IPv4 host → mode 1; IPv6 host → mode 0 (deferred). |
+| `pkg/dataplane/userspace/nat_source.go` | `deterministicSourceNATFields()` precomputes `mode`/`block_size`/`blocks_per_ip`/`host_base` (host-order u32)/`host_count` from the pool + the defaulted port range, and stamps them on `SourceNATRuleSnapshot`. IPv4 host → mode 1; an IPv6 host takes the NAT64 (mode 2) path below, not this one. |
 | `pkg/dataplane/userspace/protocol.go` | `SourceNATRuleSnapshot` gains the five additive `deterministic_*` wire fields (omitempty, #1961 skew-safe). |
 | `userspace-dp/src/protocol/nat.rs` | Rust mirror of the wire fields (`#[serde(default)]` — an old control plane omits them → round-robin). |
 | `userspace-dp/src/nat/allocator.rs` | `DeterministicV4` params; `deterministic_indices_v4()` (subscriber IPv4 → `(ip_idx, block_idx)`); `allocate_deterministic_v4()` (claims the first free port in the subscriber's block against the live owner map, collision-free); `reverse_deterministic_v4()` (`(external IP, port)` → subscriber IPv4, no per-flow state). A deterministic allocation is NOT recycled on release (its block is re-scanned directly), so a deterministic-only pool never grows the recycle queue. |
 | `userspace-dp/src/nat/source.rs` | Builds `SourceNatRule.deterministic_v4` from the snapshot (mode 1 only) and routes a deterministic-pool match through `allocate_deterministic_v4` instead of the round-robin allocator. An out-of-range subscriber fails CLOSED (`DeterministicSubscriberOutOfRange`) rather than silently round-robining. |
-| `pkg/config/compiler_validate_warn.go` | The #4560 advisory is narrowed to IPv6-host (mode 2) pools only — an IPv4-host deterministic pool is now enforced and does not warn. |
+
+### Mode 2 (IPv6 subscriber / NAPT64, NAT64 forward path)
+
+| Component | Change |
+|-----------|--------|
+| `pkg/dataplane/userspace/nat64.go` | `deterministicNAT64V6Fields()` computes `block_size`/`blocks_per_ip` (against the FIXED NAT64 range)/`host_prefix_len` (32 or 64)/`host_base_v6` from the referenced source pool, and `buildNAT64Snapshots` stamps them on `NAT64RuleSnapshot`. Only a `/32`-or-`/64` IPv6 host referenced by a NAT64 rule-set yields the params; anything else stays zero (round-robin + advisory). |
+| `pkg/dataplane/userspace/protocol.go` | `NAT64RuleSnapshot` gains the four additive `deterministic_*` wire fields (omitempty, #1961 skew-safe). |
+| `userspace-dp/src/protocol/nat.rs` | Rust mirror of the four NAT64 wire fields (`#[serde(default)]`). |
+| `userspace-dp/src/nat/allocator.rs` | `DeterministicV6` params; `deterministic_indices_v6()` (IPv6 subscriber → `(ip_idx, block_idx)` from the 32-bit word after the prefix — offset 4 for `/32`, offset 8 for `/64`); `allocate_deterministic_v6()` (mirrors the v4 claim, collision-free, not recycled); `reverse_deterministic_v6()` (`(external IPv4, port)` → subscriber IPv6 prefix, no per-flow state). |
+| `userspace-dp/src/nat64.rs` | `Nat64Prefix` gains `deterministic_v6: Option<DeterministicV6>`, built from the snapshot at `from_snapshots` time (`host_count` derived from the parsed pool size, pool-bounded). `allocate_source` routes through `allocate_deterministic_v6` when set. An out-of-range subscriber fails CLOSED. |
+| `pkg/config/compiler_validate_warn.go` | The #4560 advisory is narrowed to residual UNENFORCEABLE deterministic pools only (an IPv6 host not referenced by a NAT64 rule-set, or an unsupported prefix length); an enforced mode-1 or mode-2 pool no longer warns (`deterministicIPv4Enforced` / `deterministicNAPT64Enforced`). |
 
 **Difference from the retired eBPF version:** the eBPF allocator picked the
 port within a block with a single per-pool `counter++ % block_size` and kept no
@@ -206,12 +265,12 @@ the block (checked against the shared live-owner map) and records the flow, so
 two concurrent sessions from one subscriber never collide on a translated tuple
 and a flow re-allocates its own tuple on retransmit. The subscriber→block→IP
 assignment (the part that must be deterministic and reversible for compliance
-logging) is identical.
+logging) is identical for both modes.
 
 **Deferred (still tracked in #4559):**
-- IPv6 subscriber / NAPT64 (mode 2) block allocation.
 - Block-based pool-utilization for deterministic pools (the #2079 alarm still
-  skips them — `UsedPorts` is not the right numerator for block allocation).
+  skips them — `UsedPorts` is not the right numerator for block allocation; see
+  "Pool Utilization Alarm" above for the assessment).
 
 ## BPF Implementation
 

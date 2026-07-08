@@ -11,6 +11,7 @@ fn well_known_prefix() -> NAT64RuleSnapshot {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()],
         no_v6_frag_header: false,
+        ..Default::default()
     }
 }
 
@@ -61,8 +62,118 @@ fn empty_pool_returns_none() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec![],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(state.allocate_v4_source(0).is_none());
+}
+
+// #4559 mode-2 (NAPT64) RED-on-revert: a NAT64 rule whose source pool carries
+// `port deterministic` with an enforced IPv6 host builds a deterministic prefix
+// and `allocate_source` maps each IPv6 subscriber to its FIXED external IPv4 +
+// port block — NOT round-robin. Neutralizing the `deterministic_v6` gate in
+// `allocate_source` (falling back to `allocate_nat64_pool_port`) turns this RED:
+// the first flow would round-robin to a cursor-start port (1024), outside the
+// subscriber's computed block [3584,4095], and subscriber B would not land on
+// its own computed pool IP.
+#[test]
+fn napt64_deterministic_v6_routes_through_block_allocator() {
+    let det_snap = NAT64RuleSnapshot {
+        name: "napt64-cgn".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![
+            "198.51.100.1".to_string(),
+            "198.51.100.2".to_string(),
+            "198.51.100.3".to_string(),
+            "198.51.100.4".to_string(),
+        ],
+        no_v6_frag_header: false,
+        // NAT64 fixed range 1024..=65535 => 64512 ports; block 512 => bpi 126.
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_prefix_len: 32,
+        deterministic_host_base_v6: "2001:db8::".to_string(),
+    };
+    let state = Nat64State::from_snapshots(&[det_snap]);
+    assert!(
+        state.prefixes[0].deterministic_v6.is_some(),
+        "an enforced IPv6-host deterministic NAT64 snapshot must build a deterministic prefix"
+    );
+
+    let dst_v4 = Ipv4Addr::new(203, 0, 113, 9);
+    let alloc = |src: &str, sport: u16| -> (Ipv4Addr, u16) {
+        state
+            .allocate_source(0, PROTO_TCP, src.parse().expect("src"), dst_v4, sport, 443, 0)
+            .expect("deterministic NAPT64 allocation")
+    };
+
+    // Subscriber A = 2001:db8:0:5:: -> word 5 -> ip_idx 0, block_idx 5,
+    // block [3584,4095], pool[0] (198.51.100.1).
+    let (a_ip, a_port) = alloc("2001:db8:0:5::", 40001);
+    assert_eq!(a_ip, Ipv4Addr::new(198, 51, 100, 1), "subscriber A -> deterministic pool IP");
+    assert!(
+        (3584..=4095).contains(&a_port),
+        "subscriber A port {a_port} must fall in its deterministic block [3584,4095] (RED under round-robin)"
+    );
+
+    // Same subscriber, a distinct flow -> same IP + block, distinct port.
+    let (a2_ip, a2_port) = alloc("2001:db8:0:5::", 40002);
+    assert_eq!(a2_ip, a_ip, "same subscriber keeps its deterministic pool IP");
+    assert!((3584..=4095).contains(&a2_port), "second flow stays in block");
+    assert_ne!(a_port, a2_port, "two flows in one block get distinct ports");
+
+    // Subscriber B = 2001:db8:0:100:: -> word 256 -> ip_idx 2, block_idx 4,
+    // block [3072,3583], pool[2] (198.51.100.3).
+    let (b_ip, b_port) = alloc("2001:db8:0:100::", 50001);
+    assert_eq!(b_ip, Ipv4Addr::new(198, 51, 100, 3), "subscriber B -> a DIFFERENT deterministic pool IP");
+    assert!(
+        (3072..=3583).contains(&b_port),
+        "subscriber B port {b_port} must fall in its deterministic block [3072,3583]"
+    );
+}
+
+// #4559 companion: a NAT64 rule whose source pool has NO `port deterministic`
+// stanza builds a NON-deterministic prefix (`deterministic_v6 == None`) and
+// round-robins as before — guards the gate so mode 2 never engages for a plain
+// NAT64 pool.
+#[test]
+fn napt64_without_deterministic_stays_round_robin() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    assert!(
+        state.prefixes[0].deterministic_v6.is_none(),
+        "a NAT64 pool without `port deterministic` must not build a deterministic prefix"
+    );
+    // Round-robin allocate_source hands out a pool member at the cursor-start
+    // port (the pool address is hash-selected from the subscriber, so assert
+    // membership + the port, not a fixed index).
+    let (ip, port) = state
+        .allocate_source(0, PROTO_TCP, "2001:db8::1".parse().unwrap(), Ipv4Addr::new(203, 0, 113, 9), 40001, 443, 0)
+        .expect("round-robin allocation");
+    assert!(
+        [Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(198, 51, 100, 2)].contains(&ip),
+        "round-robin picks a pool member"
+    );
+    assert_eq!(port, 1024, "round-robin allocates from the cursor start (port_low)");
+}
+
+// #4559: an IPv6-host deterministic NAT64 snapshot with an UNSUPPORTED prefix
+// length (only /32 and /64 map to a 32-bit subscriber word) does NOT build a
+// deterministic prefix — it round-robins (the commit-time advisory covers it).
+#[test]
+fn napt64_deterministic_v6_unsupported_prefix_len_falls_back() {
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "napt64-bad-prefix".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+        deterministic_block_size: 512,
+        deterministic_blocks_per_ip: 126,
+        deterministic_host_prefix_len: 48, // unsupported
+        deterministic_host_base_v6: "2001:db8::".to_string(),
+    }]);
+    assert!(
+        state.prefixes[0].deterministic_v6.is_none(),
+        "an unsupported subscriber-prefix length must not build a deterministic prefix"
+    );
 }
 
 #[test]
@@ -80,6 +191,7 @@ fn nat64_pool_with_cidr_mask_yields_nonempty_pool() {
             "100.64.0.2/32".to_string(),
         ],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(state.is_active());
     assert_eq!(
@@ -108,6 +220,7 @@ fn nat64_pool_mixed_bare_and_masked() {
             "198.51.100.5/32".to_string(),
         ],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert_eq!(state.prefixes[0].pool_v4.len(), 2);
     assert!(state.prefixes[0].pool_v4.contains(&Ipv4Addr::new(198, 51, 100, 1)));
@@ -137,6 +250,7 @@ fn nat64_pool_genuinely_invalid_skips_rule() {
             "100.64.0.7/32".to_string(),
         ],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(
         !state.is_active() && state.prefixes.is_empty(),
@@ -160,6 +274,7 @@ fn nat64_pool_non_host_mask_skips_rule() {
             prefix: "64:ff9b::/96".to_string(),
             pool_addresses: vec![bad.to_string(), "100.64.0.9/32".to_string()],
             no_v6_frag_header: false,
+                    ..Default::default()
         }]);
         assert!(
             !state.is_active() && state.prefixes.is_empty(),
@@ -173,6 +288,7 @@ fn nat64_pool_non_host_mask_skips_rule() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["100.64.0.9/32".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert_eq!(ok.prefixes[0].pool_v4, vec![Ipv4Addr::new(100, 64, 0, 9)]);
 }
@@ -186,6 +302,7 @@ fn invalid_prefix_length_skips_rule() {
         prefix: "64:ff9b::/64".to_string(),
         pool_addresses: vec!["1.2.3.4".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(
         !state.is_active() && state.prefixes.is_empty(),
@@ -203,6 +320,7 @@ fn empty_prefix_skips_rule() {
         prefix: String::new(),
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(
         !state.is_active() && state.prefixes.is_empty(),
@@ -220,6 +338,7 @@ fn malformed_prefix_address_skips_rule() {
         prefix: "not:an:ipv6::garbage::x/96".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(!state.is_active() && state.prefixes.is_empty());
 }
@@ -241,6 +360,7 @@ fn extra_slash_prefix_skips_rule() {
         prefix: "64:ff9b::/96/garbage".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(
         !state.is_active() && state.prefixes.is_empty(),
@@ -253,6 +373,7 @@ fn extra_slash_prefix_skips_rule() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     assert!(ok.is_active() && ok.prefixes.len() == 1);
 }
@@ -298,18 +419,21 @@ fn nat64_mixed_good_bad_good_publishes_good_rules() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     };
     let bad = NAT64RuleSnapshot {
         name: "bad".to_string(),
         prefix: "64:ff9b:1::/64".to_string(), // non-/96 => skipped
         pool_addresses: vec!["198.51.100.2".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     };
     let good_b = NAT64RuleSnapshot {
         name: "good-b".to_string(),
         prefix: "2001:db8:64::/96".to_string(),
         pool_addresses: vec!["203.0.113.9".to_string()],
         no_v6_frag_header: false,
+            ..Default::default()
     };
     let state = Nat64State::from_snapshots(&[good_a, bad, good_b]);
     assert!(state.is_active());
@@ -3079,6 +3203,7 @@ fn classify_match_unavailable_on_empty_pool_fails_closed() {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec![],
         no_v6_frag_header: false,
+            ..Default::default()
     }]);
     let dst: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
 
@@ -3120,6 +3245,7 @@ fn single_addr_prefix() -> NAT64RuleSnapshot {
         // to the SAME snat_v4, so ONLY the translated port can disambiguate.
         pool_addresses: vec!["198.51.100.1".to_string()],
         no_v6_frag_header: false,
+        ..Default::default()
     }
 }
 
@@ -3466,6 +3592,7 @@ fn single_addr_prefix_alt_pool() -> NAT64RuleSnapshot {
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["203.0.113.9".to_string()],
         no_v6_frag_header: false,
+        ..Default::default()
     }
 }
 

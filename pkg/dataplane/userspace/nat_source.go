@@ -435,12 +435,13 @@ func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermW
 //   - hostBase: subscriber-CIDR network address as a host-order uint32
 //   - hostCount: subscriber count in the host CIDR (1 << (32-prefix_len))
 //
-// Only an IPv4 host CIDR yields mode 1. An IPv6 host (Junos mode 2 / NAT64) is
-// NOT yet enforced by the userspace dataplane, so this returns mode 0 and the
-// pool round-robins with the commit-time advisory (compiler_validate_warn.go)
-// surfacing the still-unenforced gap. A degenerate block-size / port range also
-// returns mode 0 (the commit validator already rejects these for a committed
-// config; this is defence in depth for the lenient/reload path).
+// Only an IPv4 host CIDR yields mode 1 HERE. An IPv6 host (Junos mode 2 /
+// NAPT64) is a v6→v4 translation the plain source-NAT path never performs, so
+// this function returns mode 0 for it; mode 2 is enforced on the NAT64 forward
+// path instead (buildNAT64Snapshots.deterministicNAT64V6Fields →
+// nat64.rs allocate_deterministic_v6, #4559). A degenerate block-size / port
+// range also returns mode 0 (the commit validator already rejects these for a
+// committed config; this is defence in depth for the lenient/reload path).
 func deterministicSourceNATFields(pool *config.NATPool, portLow, portHigh uint16) (mode uint8, blockSize, blocksPerIP uint16, hostBase, hostCount uint32) {
 	if pool == nil || pool.Deterministic == nil {
 		return 0, 0, 0, 0, 0

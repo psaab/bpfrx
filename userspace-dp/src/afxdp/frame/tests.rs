@@ -871,6 +871,7 @@ fn pbr_nat64_snapshot() -> crate::ConfigSnapshot {
             prefix: "64:ff9b::/96".to_string(),
             pool_addresses: vec!["198.51.100.1".to_string()],
             no_v6_frag_header: false,
+                    ..Default::default()
         }],
         ..Default::default()
     }

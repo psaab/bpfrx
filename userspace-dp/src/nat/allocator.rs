@@ -238,6 +238,135 @@ pub(crate) fn reverse_deterministic_v4(
     Some(Ipv4Addr::from(host))
 }
 
+/// #4559: IPv6-subscriber deterministic CGNAT (mode 2, NAPT64) block-allocation
+/// parameters. An IPv6 subscriber deterministically maps to a fixed external
+/// IPv4 pool address + port block, reversible from `(external IPv4, port)` back
+/// to the subscriber's IPv6 prefix with NO per-flow state — the same
+/// lawful-intercept / CGN-audit property as mode 1, but for the v6→v4 (NAT64)
+/// direction. Reproduces the retired-eBPF `nat_pool_alloc_deterministic_v6`
+/// logic (the deleted bpf/xdp/xdp_policy.c). The difference from mode 1 is the
+/// subscriber-index derivation: the 32-bit word AFTER the configured IPv6
+/// prefix (`/32` → octet offset 4, `/64` → octet offset 8) is the subscriber
+/// index, not an IPv4 host offset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeterministicV6 {
+    /// Ports per subscriber block (Junos `block-size`).
+    pub(crate) block_size: u16,
+    /// Blocks each external pool address carries
+    /// (`(port_high - port_low + 1) / block_size`), computed against the fixed
+    /// NAT64 translated-port range so block boundaries align with the allocator.
+    pub(crate) blocks_per_ip: u16,
+    /// IPv6 subscriber-prefix length: 32 or 64. Selects the subscriber-index
+    /// word offset (32 → octets[4..8], 64 → octets[8..12]).
+    pub(crate) host_prefix_len: u8,
+    /// IPv6 subscriber-CIDR network base, network-order octets. Forward
+    /// extraction reads the subscriber word off `src` at the prefix-selected
+    /// offset relative to this base; the reverse path reconstructs it.
+    pub(crate) host_base: [u8; 16],
+    /// Maximum subscriber index the pool can serve
+    /// (`pool_v4.len() * blocks_per_ip`). An IPv6 subscriber word extends far
+    /// beyond pool capacity, so — unlike mode 1's CIDR-derived count — this is
+    /// bounded by the pool, computed at `Nat64Prefix` build time from the parsed
+    /// pool. A subscriber beyond it fails the allocation closed.
+    pub(crate) host_count: u32,
+}
+
+/// #4559: byte offset of the 32-bit subscriber-index word for a mode-2 prefix
+/// length. `/64` → octets[8..12] (the word after a /64 prefix), everything else
+/// (only `/32` is otherwise built) → octets[4..8]. Mirrors the retired-eBPF
+/// `host_prefix_len == 64 ? +8 : +4` split.
+fn deterministic_v6_word_offset(host_prefix_len: u8) -> usize {
+    if host_prefix_len == 64 { 8 } else { 4 }
+}
+
+/// #4559: map an IPv6 subscriber to its deterministic `(ip_idx, block_idx)` for
+/// mode 2 (NAPT64). `ip_idx` selects the external IPv4 pool address; `block_idx`
+/// selects the port block within it. The subscriber index is the host-order
+/// 32-bit word AFTER the configured prefix minus the base's same word. Returns
+/// `None` when the subscriber is below the base, beyond the pool-bounded
+/// `host_count`, or the parameters are degenerate — the caller fails the
+/// allocation closed rather than silently round-robining.
+pub(crate) fn deterministic_indices_v6(
+    params: &DeterministicV6,
+    src: Ipv6Addr,
+) -> Option<(usize, u32)> {
+    let bpi = params.blocks_per_ip as u32;
+    if bpi == 0 || params.block_size == 0 {
+        return None;
+    }
+    let off = deterministic_v6_word_offset(params.host_prefix_len);
+    let src_octets = src.octets();
+    let src_word = u32::from_be_bytes([
+        src_octets[off],
+        src_octets[off + 1],
+        src_octets[off + 2],
+        src_octets[off + 3],
+    ]);
+    let base_word = u32::from_be_bytes([
+        params.host_base[off],
+        params.host_base[off + 1],
+        params.host_base[off + 2],
+        params.host_base[off + 3],
+    ]);
+    if src_word < base_word {
+        return None;
+    }
+    let sub_idx = src_word - base_word;
+    if sub_idx >= params.host_count {
+        return None;
+    }
+    let ip_idx = (sub_idx / bpi) as usize;
+    let block_idx = sub_idx % bpi;
+    Some((ip_idx, block_idx))
+}
+
+/// #4559: reverse a deterministic translated `(external IPv4 pool address,
+/// port)` back to the subscriber's IPv6 prefix with NO per-flow state — the
+/// CGN-compliance property that motivates deterministic NAPT64. `pool_v4` is
+/// the prefix's ordered external-address list (same order the forward path
+/// indexes); `port_low` is the allocator's low port. The recovered address is
+/// the subscriber PREFIX (network base + subscriber word, trailing
+/// interface-identifier bytes left as the base's — zero for a network base):
+/// the deterministic unit is the subscriber prefix, not the full /128 host.
+/// Returns `None` when the tuple does not fall in the deterministic space.
+pub(crate) fn reverse_deterministic_v6(
+    params: &DeterministicV6,
+    pool_v4: &[Ipv4Addr],
+    port_low: u16,
+    translated_ip: Ipv4Addr,
+    translated_port: u16,
+) -> Option<Ipv6Addr> {
+    if params.block_size == 0 {
+        return None;
+    }
+    let ip_idx = pool_v4.iter().position(|&a| a == translated_ip)?;
+    if translated_port < port_low {
+        return None;
+    }
+    let offset = (translated_port - port_low) as u32;
+    let block_idx = offset / params.block_size as u32;
+    if block_idx >= params.blocks_per_ip as u32 {
+        return None;
+    }
+    let sub_idx = (ip_idx as u32)
+        .checked_mul(params.blocks_per_ip as u32)?
+        .checked_add(block_idx)?;
+    if sub_idx >= params.host_count {
+        return None;
+    }
+    let off = deterministic_v6_word_offset(params.host_prefix_len);
+    let base_word = u32::from_be_bytes([
+        params.host_base[off],
+        params.host_base[off + 1],
+        params.host_base[off + 2],
+        params.host_base[off + 3],
+    ]);
+    let sub_word = base_word.checked_add(sub_idx)?;
+    let mut octets = params.host_base;
+    octets[off..off + 4].copy_from_slice(&sub_word.to_be_bytes());
+    Some(Ipv6Addr::from(octets))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PersistentLease {
     pub(super) translated: TranslatedTuple,
@@ -1152,6 +1281,83 @@ impl PortAllocator {
         // Claim the first free port in the subscriber's block. The block is small
         // (typically a few thousand ports) and this is the cold path (first
         // packet of a flow), so a linear CAS probe is fine.
+        for p in port_start..=port_end {
+            let port = p as u16;
+            if self.shared.occupancy[ip_idx].reserve(port) {
+                let translated = TranslatedTuple {
+                    ip: translated_ip,
+                    port,
+                };
+                live.live_by_flow.insert(
+                    flow,
+                    LiveAllocation {
+                        translated,
+                        persistent_key: None,
+                        addr_index: ip_idx,
+                        deterministic: true,
+                    },
+                );
+                self.shared
+                    .allocations_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(translated);
+            }
+        }
+        // Every port in the subscriber's block is live — the block is full.
+        self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+        Err(SourceNatFailureReason::AllocatorExhausted)
+    }
+
+    /// #4559: allocate a deterministic CGNAT port for a NAPT64 (mode 2) flow
+    /// from the IPv6 subscriber's fixed block. Structurally identical to
+    /// [`allocate_deterministic_v4`] — a live flow re-allocates its tuple, a
+    /// fresh flow claims the first free port in the subscriber's block via the
+    /// occupancy bitmap (collision-free, RFC 6146 BIB), and the freed port is
+    /// not recycled onto the per-address queue — differing ONLY in the
+    /// subscriber-index derivation ([`deterministic_indices_v6`]: the 32-bit
+    /// word after the IPv6 prefix). The external IPv4 pool address and the port
+    /// block are a pure function of the subscriber's IPv6 prefix, so
+    /// [`reverse_deterministic_v6`] recovers it from `(external IPv4, port)`
+    /// with no per-flow log. An out-of-range subscriber fails closed.
+    pub(super) fn allocate_deterministic_v6(
+        &self,
+        flow: SourceNatFlowKey,
+        pool_v4: &[Ipv4Addr],
+        params: DeterministicV6,
+        src: Ipv6Addr,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        use super::source::SourceNatFailureReason;
+        if self.port_low == 0 || self.port_high == 0 || self.port_low > self.port_high {
+            return Err(SourceNatFailureReason::InvalidPortRange);
+        }
+        let (ip_idx, block_idx) = deterministic_indices_v6(&params, src)
+            .ok_or(SourceNatFailureReason::DeterministicSubscriberOutOfRange)?;
+        if ip_idx >= pool_v4.len() || ip_idx >= self.shared.occupancy.len() {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        let translated_ip = IpAddr::V4(pool_v4[ip_idx]);
+        // Block boundaries mirror the v4 path: [port_low + block_idx*block_size,
+        // that + block_size - 1], clamped to port_high. The NAT64 allocator's
+        // port_low/port_high are the fixed NAT64 translated-port range, the same
+        // range the Go builder computes blocks_per_ip against, so boundaries
+        // align.
+        let port_start = self.port_low as u32 + block_idx * params.block_size as u32;
+        if port_start > self.port_high as u32 {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        let port_end = (port_start + params.block_size as u32 - 1).min(self.port_high as u32);
+
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing.translated);
+        }
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
         for p in port_start..=port_end {
             let port = p as u16;
             if self.shared.occupancy[ip_idx].reserve(port) {

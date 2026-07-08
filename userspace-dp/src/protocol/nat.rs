@@ -331,6 +331,30 @@ pub(crate) struct NAT64RuleSnapshot {
     /// instead of the default DF=1 atomic framing.
     #[serde(rename = "no_v6_frag_header", default)]
     pub no_v6_frag_header: bool,
+    /// #4559: IPv6-subscriber deterministic CGNAT (mode 2, NAPT64) per-subscriber
+    /// port block size (Junos `block-size`). Non-zero ONLY when the referenced
+    /// source pool carries `port deterministic` with an IPv6 host and is enforced
+    /// (a /32 or /64 subscriber prefix). Zero => the NAT64 pool round-robins (the
+    /// pre-#4559 behaviour + the commit-time advisory). Additive wire field
+    /// (#1961 skew-safe): an older control plane omits it and `default` leaves it
+    /// 0 (round-robin).
+    #[serde(rename = "deterministic_block_size", default)]
+    pub deterministic_block_size: u16,
+    /// #4559: blocks each external pool address carries, computed by the Go
+    /// builder against the fixed NAT64 translated-port range so block boundaries
+    /// align with the allocator. Meaningful only when `deterministic_block_size
+    /// != 0`.
+    #[serde(rename = "deterministic_blocks_per_ip", default)]
+    pub deterministic_blocks_per_ip: u16,
+    /// #4559: IPv6 subscriber-prefix length (32 or 64). Selects the 32-bit
+    /// subscriber-index word offset (32 → octets[4..8], 64 → octets[8..12]).
+    #[serde(rename = "deterministic_host_prefix_len", default)]
+    pub deterministic_host_prefix_len: u8,
+    /// #4559: IPv6 subscriber-CIDR network base (canonical string). Empty => not
+    /// a deterministic NAPT64 pool. Parsed to the 16-octet base the allocator
+    /// derives the subscriber word from and reverses against.
+    #[serde(rename = "deterministic_host_base_v6", default)]
+    pub deterministic_host_base_v6: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
