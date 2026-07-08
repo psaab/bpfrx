@@ -2537,6 +2537,267 @@ fn make_ipv4_frag_udp(
     pkt
 }
 
+// ---------------------------------------------------------------------------
+// #2562: fail-closed ICMP/ICMPv6 fragment drop. A REAL fragment (Fragment
+// Header present with MF=1 OR offset>0) carrying ICMP/ICMPv6 cannot be
+// translated — the ICMP checksum covers the WHOLE datagram, so translating a
+// single fragment's bytes emits a first fragment with a WRONG checksum the
+// receiver discards. An ATOMIC fragment (MF=0, offset 0) carries the complete
+// message and still translates; a non-fragmented ICMP is unchanged. The
+// stateful frag-association cache (#3291 stage 4) is the deferred principled
+// fix.
+// ---------------------------------------------------------------------------
+
+/// Build a v6 packet carrying a Fragment Header (next-header 44) wrapping an
+/// ICMPv6 Echo Request, with the given fragment offset (8-byte units), M flag
+/// and 32-bit Identification.
+fn make_ipv6_frag_icmpv6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    offset_units: u16,
+    more: bool,
+    frag_id: u32,
+) -> Vec<u8> {
+    let mut icmp = vec![0u8; 8];
+    icmp[0] = ICMPV6_ECHO_REQUEST;
+    icmp[1] = 0; // code
+    icmp[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // id
+    icmp[6..8].copy_from_slice(&0x0001u16.to_be_bytes()); // seq
+    let csum = checksum16_ipv6_pseudo(src, dst, PROTO_ICMPV6, &icmp);
+    icmp[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    let mut frag = vec![0u8; 8 + icmp.len()];
+    frag[0] = PROTO_ICMPV6;
+    let word = (offset_units << 3) | u16::from(more);
+    frag[2..4].copy_from_slice(&word.to_be_bytes());
+    frag[4..8].copy_from_slice(&frag_id.to_be_bytes());
+    frag[8..].copy_from_slice(&icmp);
+
+    let mut pkt = vec![0u8; 40 + frag.len()];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(frag.len() as u16).to_be_bytes());
+    pkt[6] = 44;
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt[40..].copy_from_slice(&frag);
+    pkt
+}
+
+/// Build a v4 ICMP Echo Reply with explicit fragmentation fields.
+fn make_ipv4_frag_icmp(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    offset_units: u16,
+    more: bool,
+    ident: u16,
+) -> Vec<u8> {
+    let icmp_len = 8usize;
+    let total = 20 + icmp_len;
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[4..6].copy_from_slice(&ident.to_be_bytes());
+    let word = (offset_units & 0x1FFF) | if more { 0x2000 } else { 0 };
+    pkt[6..8].copy_from_slice(&word.to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = PROTO_ICMP;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    pkt[20] = ICMP_ECHO_REPLY;
+    pkt[21] = 0;
+    pkt[24..26].copy_from_slice(&0x1234u16.to_be_bytes());
+    pkt[26..28].copy_from_slice(&0x0001u16.to_be_bytes());
+    let icmp_sum = checksum16(&pkt[20..]);
+    pkt[22..24].copy_from_slice(&icmp_sum.to_be_bytes());
+    let ip = checksum16(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip.to_be_bytes());
+    pkt
+}
+
+/// Prepend a bare (non-VLAN) Ethernet header so an L3 packet becomes an L2
+/// frame for the frame-level predicate. `frame_l3_offset` only special-cases
+/// VLAN TPIDs, so any other ethertype yields l3=14.
+fn l2_frame(l3: &[u8], ethertype: u16) -> Vec<u8> {
+    let mut f = vec![0u8; 14 + l3.len()];
+    f[12..14].copy_from_slice(&ethertype.to_be_bytes());
+    f[14..].copy_from_slice(l3);
+    f
+}
+
+#[test]
+fn nat64_v6_to_v4_real_fragment_icmpv6_dropped() {
+    // FAIL-ON-REVERT: a REAL v6 fragment (Fragment Header, MF=1, offset 0)
+    // carrying ICMPv6 must be DROPPED. On revert (no guard) the first fragment
+    // translates to Some(_) with an ICMPv4 checksum computed over only this
+    // fragment's bytes — a wrong checksum the receiver discards.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0201".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(192, 0, 2, 1);
+
+    // First fragment (MF=1, offset 0).
+    let first = make_ipv6_frag_icmpv6(src_v6, dst_v6, 0, true, 0xDEAD_BEEF);
+    assert!(
+        translate_v6_to_v4(&first, snat_v4, dst_v4, false).is_none(),
+        "a real first ICMPv6 fragment must be dropped, not forwarded with a wrong checksum"
+    );
+    // Non-first fragment (offset > 0) — dropped by the pre-existing non-first
+    // guard, and also flagged by the fragment predicate.
+    let nonfirst = make_ipv6_frag_icmpv6(src_v6, dst_v6, 2, false, 0xDEAD_BEEF);
+    assert!(
+        translate_v6_to_v4(&nonfirst, snat_v4, dst_v4, false).is_none(),
+        "a non-first ICMPv6 fragment must be dropped"
+    );
+}
+
+#[test]
+fn nat64_v6_to_v4_atomic_fragment_icmpv6_translates() {
+    // NO-OVER-DROP: an ATOMIC fragment (Fragment Header, MF=0, offset 0)
+    // carries the complete ICMPv6 message and MUST still translate.
+    let src_v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0202".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 2);
+    let dst_v4 = Ipv4Addr::new(192, 0, 2, 2);
+
+    let atomic = make_ipv6_frag_icmpv6(src_v6, dst_v6, 0, false, 0x0000_1234);
+    let v4 = translate_v6_to_v4(&atomic, snat_v4, dst_v4, false)
+        .expect("atomic ICMPv6 fragment must still translate");
+    assert_eq!(v4[9], PROTO_ICMP, "translated to ICMPv4");
+    assert_eq!(v4[20], ICMP_ECHO_REQUEST, "type mapped");
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum verifies");
+    assert_eq!(checksum16(&v4[20..]), 0, "ICMPv4 checksum verifies (complete message)");
+}
+
+#[test]
+fn nat64_v4_to_v6_real_fragment_icmp_dropped() {
+    // FAIL-ON-REVERT (reverse direction): a REAL v4 fragment (MF=1, offset 0)
+    // carrying ICMP must be DROPPED. On revert the first fragment translates
+    // with an ICMPv6 checksum over only this fragment's bytes.
+    let src_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let first = make_ipv4_frag_icmp(src_v4, dst_v4, 0, true, 0x4321);
+    assert!(
+        translate_v4_to_v6(&first, src_v6, dst_v6).is_none(),
+        "a real first ICMP fragment must be dropped, not forwarded with a wrong checksum"
+    );
+    let nonfirst = make_ipv4_frag_icmp(src_v4, dst_v4, 2, false, 0x4321);
+    assert!(
+        translate_v4_to_v6(&nonfirst, src_v6, dst_v6).is_none(),
+        "a non-first ICMP fragment must be dropped"
+    );
+}
+
+#[test]
+fn nat64_v4_to_v6_atomic_fragment_icmp_translates() {
+    // NO-OVER-DROP: an atomic v4 fragment (MF=0, offset 0) carrying a complete
+    // ICMP message MUST still translate.
+    let src_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let atomic = make_ipv4_frag_icmp(src_v4, dst_v4, 0, false, 0x4321);
+    let v6 = translate_v4_to_v6(&atomic, src_v6, dst_v6)
+        .expect("atomic ICMP fragment must still translate");
+    assert_eq!(v6[6], PROTO_ICMPV6, "translated to ICMPv6");
+    assert_eq!(v6[40], ICMPV6_ECHO_REPLY, "type mapped");
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6, &v6[40..]),
+        0,
+        "ICMPv6 checksum verifies (complete message)"
+    );
+}
+
+#[test]
+fn nat64_non_fragmented_icmp_unchanged_by_frag_guard() {
+    // NO-REGRESSION: a non-fragmented ICMP echo still translates both
+    // directions (the fragment guard only fires when a Fragment Header / MF /
+    // offset says the datagram is a real fragment).
+    let src_v6: Ipv6Addr = "2001:db8::9".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 9);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    // v6→v4 (no Fragment Header at all).
+    let mut v6 = vec![0u8; 48];
+    v6[0] = 0x60;
+    v6[4..6].copy_from_slice(&8u16.to_be_bytes());
+    v6[6] = PROTO_ICMPV6;
+    v6[7] = 64;
+    v6[8..24].copy_from_slice(&src_v6.octets());
+    v6[24..40].copy_from_slice(&dst_v6.octets());
+    v6[40] = ICMPV6_ECHO_REQUEST;
+    v6[44..46].copy_from_slice(&0x1234u16.to_be_bytes());
+    v6[46..48].copy_from_slice(&0x0001u16.to_be_bytes());
+    let s = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_ICMPV6, &v6[40..]);
+    v6[42..44].copy_from_slice(&s.to_be_bytes());
+    assert!(
+        translate_v6_to_v4(&v6, snat_v4, dst_v4, false).is_some(),
+        "non-fragmented ICMPv6 must translate"
+    );
+    // v4→v6 (atomic, DF, no MF/offset).
+    let v4 = make_ipv4_frag_icmp(dst_v4, snat_v4, 0, false, 0);
+    assert!(
+        translate_v4_to_v6(&v4, dst_v6, src_v6).is_some(),
+        "non-fragmented ICMP must translate"
+    );
+}
+
+#[test]
+fn nat64_fragment_drop_predicates_match_guards() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0201".parse().unwrap();
+    let src_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+
+    // v6→v4 predicate.
+    let icmp_first = make_ipv6_frag_icmpv6(src_v6, dst_v6, 0, true, 1);
+    let icmp_nonfirst = make_ipv6_frag_icmpv6(src_v6, dst_v6, 3, false, 1);
+    let icmp_atomic = make_ipv6_frag_icmpv6(src_v6, dst_v6, 0, false, 1);
+    let udp_first = make_ipv6_frag_udp(src_v6, dst_v6, 5, 6, b"x", 0, true, 1);
+    let udp_nonfirst = make_ipv6_frag_udp(src_v6, dst_v6, 5, 6, b"x", 3, false, 1);
+    assert!(v6_to_v4_is_fragment_drop(&icmp_first), "real ICMPv6 first fragment drops");
+    assert!(v6_to_v4_is_fragment_drop(&icmp_nonfirst), "ICMPv6 non-first drops");
+    assert!(!v6_to_v4_is_fragment_drop(&icmp_atomic), "atomic ICMPv6 keeps");
+    assert!(!v6_to_v4_is_fragment_drop(&udp_first), "UDP first fragment translates (keep)");
+    assert!(v6_to_v4_is_fragment_drop(&udp_nonfirst), "UDP non-first drops (any protocol)");
+
+    // v4→v6 predicate.
+    let v4_icmp_first = make_ipv4_frag_icmp(src_v4, dst_v4, 0, true, 1);
+    let v4_icmp_atomic = make_ipv4_frag_icmp(src_v4, dst_v4, 0, false, 1);
+    let v4_udp_first = make_ipv4_frag_udp(src_v4, dst_v4, 5, 6, b"x", 0, true, 1);
+    let v4_udp_nonfirst = make_ipv4_frag_udp(src_v4, dst_v4, 5, 6, b"x", 3, false, 1);
+    assert!(v4_to_v6_is_fragment_drop(&v4_icmp_first), "real ICMP first fragment drops");
+    assert!(!v4_to_v6_is_fragment_drop(&v4_icmp_atomic), "atomic ICMP keeps");
+    assert!(!v4_to_v6_is_fragment_drop(&v4_udp_first), "UDP first fragment translates (keep)");
+    assert!(v4_to_v6_is_fragment_drop(&v4_udp_nonfirst), "UDP non-first drops (any protocol)");
+
+    // Frame-level predicate (with an Ethernet header) — the attribution point.
+    assert!(frame_is_nat64_fragment_drop(
+        &l2_frame(&icmp_first, 0x86dd),
+        libc::AF_INET6
+    ));
+    assert!(!frame_is_nat64_fragment_drop(
+        &l2_frame(&icmp_atomic, 0x86dd),
+        libc::AF_INET6
+    ));
+    assert!(frame_is_nat64_fragment_drop(
+        &l2_frame(&v4_icmp_first, 0x0800),
+        libc::AF_INET
+    ));
+    assert!(!frame_is_nat64_fragment_drop(
+        &l2_frame(&v4_icmp_atomic, 0x0800),
+        libc::AF_INET
+    ));
+    // Wrong/unknown family → not attributed.
+    assert!(!frame_is_nat64_fragment_drop(&l2_frame(&icmp_first, 0x86dd), 0));
+}
+
 #[test]
 fn nat64_v6_to_v4_first_fragment_mf_and_id_from_packet() {
     // FAIL-ON-REVERT: a v6 first fragment (Fragment Header offset 0, M=1) must

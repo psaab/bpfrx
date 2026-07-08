@@ -232,6 +232,25 @@ func TestFormatStatusSummaryShowsNAT64PoolExhausted(t *testing.T) {
 	}
 }
 
+// #2562: the status summary surfaces the fail-closed NAT64 fragment-drop
+// counter (a non-first fragment or a real ICMP/ICMPv6 fragment that cannot be
+// safely translated) as its own row, summed across bindings, so an operator
+// can see fragmented-NAT64 drops. The stateful frag-association cache (#3291
+// stage 4) that would let real fragments traverse is deferred.
+func TestFormatStatusSummaryShowsNAT64FragDropped(t *testing.T) {
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
+			{Slot: 0, Nat64FragDropped: 4},
+			{Slot: 1, Nat64FragDropped: 7},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	if !strings.Contains(out, "NAT64 fragment drops:      11") {
+		t.Fatalf("summary missing NAT64 fragment drop row (want 11):\n%s", out)
+	}
+}
+
 // #3657 (H13/H14) / #3661 (M02): the status summary surfaces the per-source
 // reject reply SUCCESS ("Generated-reply sent"), the TX-frame reply-budget
 // suppression ("Generated-reply budget drops"), and the rate-limit

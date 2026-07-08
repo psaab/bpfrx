@@ -1,3 +1,61 @@
+## 2026-07-07 — #2562 NAT64 fail-closed ICMP/ICMPv6 fragment drop + `nat64_frag_dropped` counter
+
+- **Timestamp**: 2026-07-07
+- **Action**: #2562 DRIVEABLE fail-closed slice (the stateful frag-association
+  cache remains the deferred principled fix — #3291 stage 4, never built).
+  BUG: a REAL fragment (IPv6 Fragment Header present with MF=1 OR offset>0, or
+  the IPv4 MF/offset equivalent) carrying ICMP/ICMPv6 forwarded the FIRST
+  fragment through `translate_icmpv6_message_to_icmpv4` /
+  `translate_icmpv4_message_to_icmpv6` (nat64.rs), which recomputes the ICMP
+  checksum over only that fragment's bytes — but the ICMP checksum covers the
+  WHOLE datagram, so the receiver discards the mistranslated fragment (a
+  silent, uncomputable-checksum corruption). FIX (1) fail-closed guards in BOTH
+  `write_v6_to_v4_into` (drop when `l4_protocol==ICMPV6` and the Fragment Header
+  has `more || offset_units!=0`) and `write_v4_to_v6_into` (drop when
+  `protocol==ICMP && is_fragment` [MF=1]); a non-first fragment (offset>0) was
+  already dropped both directions, and an ATOMIC fragment (MF=0/offset0 —
+  RFC 6946) carries the complete message and STILL translates. FIX (2) a new
+  per-binding `nat64_frag_dropped` counter for the today-silent fragment drop,
+  wired through the full #4520 plumbing: `BatchCounters` field +
+  `record_nat64_frag_dropped` + flush, `BindingLiveState` AtomicU64 + init,
+  snapshot, `BindingLiveSnapshot`, refresh_bindings copy+reset, reconcile reset,
+  a tag-matched wire field `nat64_frag_dropped` (Rust serde rename +
+  `default` in protocol/binding.rs, Go `json:"nat64_frag_dropped,omitempty"`
+  in protocol.go), surfaced as the `NAT64 fragment drops` row in
+  format/status.go. The counter is attributed at the TX dispatcher's
+  build-returned-`None` arms (afxdp/tx/dispatch/mod.rs, both the in-place/copy
+  and direct-fallback paths) via the SSOT predicate
+  `nat64::frame_is_nat64_fragment_drop` (which mirrors the translator guards:
+  `v6_to_v4_is_fragment_drop`/`v4_to_v6_is_fragment_drop`) so only a genuine
+  fragment `None` — not an unrelated build failure — is counted. Regenerated
+  `protocol_wire_v1.json` (single new key, alphabetical). Tests: nat64_tests.rs
+  RED-on-revert (verified by neutralizing both ICMP-fragment guards, rebuilding:
+  `nat64_v6_to_v4_real_fragment_icmpv6_dropped` +
+  `nat64_v4_to_v6_real_fragment_icmp_dropped` fail — the first fragment
+  translates with a wrong checksum) plus atomic-translates / non-fragmented-
+  unchanged / predicate-matches-guards (incl. `frame_is_nat64_fragment_drop`
+  with a synthetic L2 frame + wrong-family reject); afxdp/tests.rs
+  `record_nat64_frag_dropped_bumps_counter` +
+  `nat64_frag_dropped_flushes_to_live_and_snapshot`; Go
+  `TestFormatStatusSummaryShowsNAT64FragDropped`. rustfmt: hand-written lines
+  already clean (read-only `--check` flagged only PRE-EXISTING comment/vec
+  reflows under the locally-installed rustfmt); did NOT run whole-crate cargo
+  fmt. FULL cargo serial: main bin 3728/0/2 ignored + cos_doc_drift 8/0 +
+  fairness_eval_blackbox 22/0 + snat_contract_doc_guard 1/0. go test
+  ./pkg/dataplane/... all green. NOTE: the loss cluster has no NAT64 path, so
+  synthetic-packet unit tests are the gate (lab-bound, per the converged
+  /research).
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/FEATURES.md, userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/format/status_test.go, _Log.md
 ## 2026-07-07 — #4455 (HI-1) host-inbound: multicast packet-wide advisory + protocol→group catalog (bounded slice)
 
 - **Timestamp**: 2026-07-07

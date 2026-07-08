@@ -1416,6 +1416,9 @@ pub(crate) struct BindingLiveSnapshot {
     /// #4520: cumulative transient NAT64 pool-exhaustion drops snapshotted
     /// from BindingLiveState (prefix matched, pool full, no free port).
     pub(crate) nat64_pool_exhausted: u64,
+    /// #2562: cumulative fail-closed NAT64 fragment drops snapshotted from
+    /// BindingLiveState (a non-first fragment or a real ICMP/ICMPv6 fragment).
+    pub(crate) nat64_frag_dropped: u64,
     /// #4477: cumulative source-NAT allocation failures snapshotted from
     /// BindingLiveState. Bridged into `GlobalCtrNATAllocFail` (Go side).
     pub(crate) nat_alloc_fail: u64,
