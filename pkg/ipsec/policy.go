@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -585,11 +586,18 @@ func PrepareConfig(cfg *config.Config) *config.IPsecConfig {
 		cp := *pol
 		out.IKEPolicies[name] = &cp
 	}
+	// A dynamic-hostname gateway resolves its remote family hint via a DNS
+	// lookup bounded by resolveHostFamilyTimeout (#2757). Resolving those
+	// hints CONCURRENTLY (bounded pool) keeps a multi-gateway commit at
+	// ~one timeout of wall-clock rather than N×timeout under DNS failure
+	// (#4547). The hint is per-gateway and order-independent, so the result
+	// per gateway is identical to the former sequential resolution.
+	familyHints := resolveGatewayFamilyHints(src.Gateways)
 	for name, gw := range src.Gateways {
 		cp := *gw
 		if cp.LocalAddress == "" && cp.ExternalIface != "" {
 			cp.LocalAddress = resolveInterfaceAddress(
-				cfg, cp.ExternalIface, gatewayRemoteFamilyHint(&cp))
+				cfg, cp.ExternalIface, familyHints[name])
 		}
 		out.Gateways[name] = &cp
 	}
@@ -767,6 +775,69 @@ func defaultResolveHostFamily(host string) int {
 	default:
 		return 0
 	}
+}
+
+// resolveFamilyHintConcurrency bounds how many gateway family-hint lookups run
+// at once inside resolveGatewayFamilyHints. Each dynamic-hostname lookup can
+// block for up to resolveHostFamilyTimeout under DNS failure, so the cap keeps
+// wall-clock cost at ~one timeout while bounding concurrent resolver goroutines
+// (and file descriptors) for a pathologically large gateway set.
+const resolveFamilyHintConcurrency = 8
+
+// resolveGatewayFamilyHints computes the remote address-family hint for every
+// gateway that needs an external-interface local-address resolution
+// (LocalAddress unset, ExternalIface set) CONCURRENTLY, keyed by gateway name.
+//
+// gatewayRemoteFamilyHint performs a bounded (resolveHostFamilyTimeout) DNS
+// lookup per dynamic-hostname gateway (#2757). PrepareConfig runs
+// synchronously in the ordered commit apply, so resolving the hints
+// sequentially stalled a multi-gateway commit up to N×timeout under DNS
+// failure (#4547). The hint is per-gateway and order-independent, so a bounded
+// worker pool that collects results by name is safe and yields the identical
+// per-gateway result as the former inline sequential lookup — only the
+// scheduling changes.
+//
+// Only gateways whose LocalAddress is resolved from ExternalIface are looked up
+// here; gateways with an explicit LocalAddress never consult the hint, so
+// skipping them avoids needless DNS traffic. Gateways with a literal remote
+// Address (or a bare-IP hostname) resolve their hint without touching DNS, so
+// the concurrency cap only matters for genuine dynamic-hostname sets.
+func resolveGatewayFamilyHints(gateways map[string]*config.IPsecGateway) map[string]int {
+	names := make([]string, 0, len(gateways))
+	for name, gw := range gateways {
+		if gw == nil {
+			continue
+		}
+		if gw.LocalAddress == "" && gw.ExternalIface != "" {
+			names = append(names, name)
+		}
+	}
+
+	hints := make(map[string]int, len(names))
+	if len(names) == 0 {
+		return hints
+	}
+
+	// Results land in a per-index slice so no goroutine writes the shared
+	// map — the map is assembled single-threaded after the pool drains.
+	results := make([]int, len(names))
+	sem := make(chan struct{}, resolveFamilyHintConcurrency)
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		sem <- struct{}{} // block until a worker slot frees — bounds concurrency
+		go func(i int, gw *config.IPsecGateway) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = gatewayRemoteFamilyHint(gw)
+		}(i, gateways[name])
+	}
+	wg.Wait()
+
+	for i, name := range names {
+		hints[name] = results[i]
+	}
+	return hints
 }
 
 // gatewayRemoteFamilyHint determines the address family (4, 6, or 0 for

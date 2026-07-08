@@ -1,3 +1,116 @@
+## 2026-07-07 — #4562 config: navigatePath intermediate descent walks ALL same-prefix siblings (display-only)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `navigatePath` (pkg/config/ast.go) intermediate-descent
+  branches previously walked only the FIRST matching sibling's subtree —
+  `current = matched[0].Children` (multi-key branch ~:211) and
+  `current = n.Children` for the first matching node (single-key branch
+  ~:242). When a hand-authored HIERARCHICAL config carries a DUPLICATE
+  context block (two identical 4-key
+  `from-zone untrust to-zone trust { ... }` policy contexts, or two
+  identical single-key `interfaces { ... }` blocks) AND the display path
+  descends deeper (`... policy B`), the second duplicate-context block's
+  statements were dropped from a path-scoped `show` / `| display set`, so
+  a scoped display-set backup silently lost them on restore. Fix: both
+  intermediate-descent branches now descend into the UNION of every
+  same-prefix / same-keyword sibling's children via a new `unionChildren`
+  helper, mirroring the #3980 terminal read-all-siblings fix onto the
+  descent (same #3842 / #2419 class). Single-match is byte-identical
+  (`unionChildren` returns the one node's children directly). DISPLAY-ONLY
+  (all callers are `FormatPath*` in ast_format.go; the compiler reads the
+  full AST directly) — the hidden statement was still ENFORCED, so LOW /
+  display + scoped-backup gap, not a forwarding/security bypass. The
+  terminal #3980 branch is untouched.
+- **File(s)**: pkg/config/ast.go,
+  pkg/config/show_config_dup_context_4562_test.go (RED-on-revert:
+  both-blocks-shown for multi-key + single-key duplicate contexts,
+  single-context control byte-identical), pkg/config/README.md, _Log.md
+- **Validation**: `go test ./pkg/config/` green (incl. #3980 terminal
+  suite); RED-on-revert verified for BOTH branches (revert → policy B /
+  mtu 9000 dropped); gofmt clean, go vet clean, go build ./... clean.
+
+## 2026-07-07 — #4539 session: cache host-inbound TCP LocalDelivery only off the handshake (single has_syn gate)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `should_cache_local_delivery_session_on_miss`
+  (userspace-dp/src/afxdp/forwarding/mod.rs) previously gated the
+  host-inbound TCP session-miss cache with two NARROW decline-gates —
+  bare/established ACK (`has_ack && !has_syn`, #2151) and bare RST/FIN
+  (`is_closing && !has_syn`, #4487) — and defaulted to `true` for
+  everything else, so a non-handshake anomalous / crafted first packet
+  that is neither ACK-set nor closing (pure PSH 0x08, null 0x00, pure
+  URG 0x20, ECE/CWR-only) fell through and seeded a 300s host-local
+  session (`is_initial_syn` false at install → `established = true`).
+  Not exploitable for policy-skip (poll_descriptor re-runs the junos-host
+  mandatory-teardown gate on EVERY LocalDelivery session hit) — value is
+  gate-consistency/hardening (LOW). Fix: replaced the two decline-gates
+  with a SINGLE POSITIVE predicate — for TCP, cache iff
+  `crate::tcp_flags::has_syn(tcp_flags)`. This subsumes both #2151 and
+  #4487 (both are `!has_syn` cases) AND closes the pure-PSH/null/URG
+  residual, aligning the gate with its "only off the handshake" intent.
+  TCP-only: the `!matches!(protocol, PROTO_TCP) => true` early return is
+  preserved, so non-TCP (ICMP/UDP) LocalDelivery still caches
+  unconditionally. New test
+  `non_handshake_tcp_session_miss_does_not_cache_local_delivery`
+  (forwarding/tests.rs): PSH/null/URG/ECE/CWR/PSH|URG → declined
+  (RED-on-revert: the old default-`true` cached them); SYN / SYN|ACK /
+  SYN|PSH → cached (preserved); bare ACK / bare RST / bare FIN → still
+  declined (subsumed); UDP/ICMP with any tcp_flags byte → still cached
+  (non-TCP preserved). rustfmt: hand-written lines already clean (mod.rs
+  "no diff", tests.rs insert range untouched); did NOT run whole-crate
+  cargo fmt (it recurses module decls and reflows the untracked-format
+  afxdp subtree). FULL cargo serial (`--release --test-threads=1`):
+  main bin 3705/0/2 ignored + fairness-eval 54/0 + cos_doc_drift
+  self-tests 8/0 + fairness_eval_blackbox 22/0 + snat_contract_doc_guard
+  1/0. RED-on-revert verified: reverting mod.rs to the old two-gate form
+  (keeping the test) fails at the pure-PSH (0x08) assert
+  ("non-handshake first packet (pure PSH, 0x08) must not seed a
+  host-local session").
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  docs/host-inbound-service-matrix.md, CLAUDE.md, _Log.md
+
+## 2026-07-07 — #4543 screen: fail closed on a malformed IPv4 option TLV (source-route bypass)
+
+- **Timestamp**: 2026-07-07T17:15Z
+- **Action**: The IPv4 options TLV walk in `extract_screen_info`
+  (userspace-dp/src/screen/extract.rs) `break`d out of the scan on a
+  MALFORMED length-prefixed option (a length byte at the very end of the
+  options region, a declared length `< 2`, or one running past the
+  options end). Because the `kind == LSRR/SSRR` test necessarily precedes
+  the length check, a `break` on a bad option ABORTED the walk before an
+  LSRR(131)/SSRR(137) placed AFTER it could be seen, leaving
+  `saw_ipv4_source_route=false` → `check_source_route` returned Pass. An
+  attacker could prepend `[type=0x44,len=0x01]` to an LSRR (IHL>5) and
+  transit the `source-route` screen the operator enabled to drop it. #4167
+  added TRUNCATION fail-closed for the IPv4 header but not MALFORMED-OPTION
+  fail-closed — an inconsistency with its own contract. Fix: the two
+  malformed-option arms now `return Err(ScreenParseError::
+  TruncatedIpv4Header)` (the "ip-malformed" drop reason) instead of
+  `break`, so the caller (poll_stages.rs / poll_descriptor) fail-closes
+  and DROPS the frame, mirroring #4167's truncation fail-closed and vSRX,
+  which drops malformed IP options / source-route regardless of option
+  order. A well-formed options list (including a well-formed LSRR/SSRR
+  after a benign option) is unaffected — every option's length is
+  consistent so the walk advances normally and the LSRR/SSRR arm still
+  fires; a no-options packet is unaffected. No new error variant was
+  needed — `TruncatedIpv4Header` already maps to "ip-malformed"
+  (SCREEN_IP_MALFORMED, 1<<18) and matches the semantic. No standalone
+  doc changed: the fail-closed contract lives in the extract.rs
+  doc-comment block (updated with a #4543 note), matching how #4167
+  documented itself (code comment + _Log.md, no separate markdown doc).
+- **File(s)**: userspace-dp/src/screen/extract.rs (two malformed-option
+  arms → `return Err`; function doc-comment #4543 note),
+  userspace-dp/src/screen/tests.rs (three RED-on-revert tests), _Log.md
+- **Validation**: RED-on-revert verified — reverting BOTH malformed arms
+  to `break` fails `extract_screen_info_ipv4_malformed_option_before_lsrr_
+  fails_closed` (returns Ok with `saw_ipv4_source_route=false`) and
+  `extract_screen_info_ipv4_option_length_overruns_region_fails_closed`,
+  while `extract_screen_info_ipv4_wellformed_lsrr_after_benign_option_
+  trips` (over-drop guard) stays green. FULL cargo test --release
+  --test-threads=1: 3704 + 54 + 8 + 22 + 1 = 3789 passed, 0 failed, 2
+  ignored (215 screen tests within the main-binary count).
+
 ## 2026-07-07 — #4535 three-color policer unspecified color mode defaults to color-blind (Junos parity)
 
 - **Timestamp**: 2026-07-07T15:30Z
@@ -39965,3 +40078,24 @@ top.
 - **Timestamp**: 2026-07-07
 - **Action**: #4548 (ps-031 F5) — VRRP `recordMasterAdvert` (pkg/vrrp/instance.go) adopted the peer-advertised `Master_Adver_Interval` (`Max Adver Int` cs → `time.Duration*10ms`) on ANY `>0` value with NO minimum floor. A buggy/misconfigured peer advertising `Max Adver Int=1` (10 ms) drove `masterDownInterval` — and the #2082/#2850 preempt-gate staleness horizons that share `effectiveAdvertInterval` — down to ~36 ms on a 30 ms RETH node, flapping mastership on ordinary scheduling/network jitter. Fix: clamp the learned interval UP to `masterAdverFloor()` = `max(cfg.AdvertiseInterval, minLearnedMasterAdverInterval=10ms)`. The floor is the node's OWN configured advertise interval (a backup must never time its master out faster than its own cadence), with a 10 ms absolute backstop matching the `reth-advertise-interval` schema minimum (pkg/config/schema_chassis.go). Only the LOW side is clamped: a SLOWER master (learned ≥ floor, the #4061 anti-premature-failover case) is adopted unchanged, and a matching 30 ms advert equals the 30 ms floor so the fast-failover default is preserved exactly; a legit 10 ms-on-both-nodes cluster is not over-clamped. RED-on-revert: new TestMasterAdverInterval_LowIntervalClamped (MaxAdvertInt=1 → asserts learned==30ms + masterDownInterval==30ms-floor value) FAILS when the clamp is removed (adopts 10ms → ~36ms); the preservation tests (FloorPreserves30msFailover / LegitLowConfigNotOverClamped / SlowerMasterNotClamped) stay green both ways. go test ./pkg/vrrp/... green; gofmt/vet/build clean. NOTE: VRRP-timing change — needs `make test-failover` before merge (parent to run).
 - **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_master_interval_test.go, pkg/vrrp/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4547 (ps-031 F3) — IPsec dynamic-hostname gateway DNS family-hint resolution ran SEQUENTIALLY in the ordered commit apply, up to 2s/gateway under DNS failure, so an N-gateway commit stalled up to N×2s. `PrepareConfig` (pkg/ipsec/policy.go) called `gatewayRemoteFamilyHint(&cp)` inline in the gateway copy loop; for a dynamic-hostname gateway (`address` empty, `dynamic hostname <fqdn>` set) that calls `resolveHostFamily` -> `net.Resolver.LookupIPAddr` bounded by the 2s `resolveHostFamilyTimeout`. No cache, no parallelism. Fix: new `resolveGatewayFamilyHints(gateways)` resolves the per-gateway hints CONCURRENTLY through a bounded worker pool (`resolveFamilyHintConcurrency = 8`: `sem`-gated `sync.WaitGroup`, results in a per-index slice so no goroutine writes the shared map) BEFORE the copy loop, keyed by gateway name; the loop then reads `familyHints[name]`. Only gateways that resolve `local_addrs` from an `external-interface` (LocalAddress unset, ExternalIface set) are looked up. The hint is per-gateway and order-independent, so the concurrent result is IDENTICAL to the former inline sequential lookup — only scheduling changed (same LookupIPAddr, same 2s timeout each, resolution semantics + timeout value unchanged). Wall-clock drops from ~N×2s to ~2s under DNS failure. Test: `TestPrepareConfig_DynamicHostnameParallelResolve` (pkg/ipsec/ipsec_test.go) — 6 dynamic-hostname gateways against a dual-stack external interface, stub `resolveHostFamily` sleeps 150ms/lookup; asserts PrepareConfig completes < (n/2)×150ms (450ms), exactly n lookups happen, and each gateway's resolved local-address matches its own family hint (even idx -> IPv4 198.51.100.1, odd -> IPv6 2001:db8:1::1) identical to sequential. RED-on-revert verified by temporarily restoring the inline sequential lookup: took 902ms (6×150ms) > 450ms deadline -> FAIL; parallel path completes in 150ms. go test ./pkg/ipsec/... green; go build ./... green; gofmt/vet clean.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/ipsec_test.go, pkg/ipsec/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4546 (ps-031 F7 = F-271) — WireGuard `peer_has_confirmed_session` ignored REJECT_AFTER_TIME, a bounded ~0-1s rekey blackhole at the session-expiry boundary. `WgEngine::peer_has_confirmed_session` (userspace-dp/src/afxdp/wg/engine.rs) checked ONLY `session.is_confirmed()` (an atomic bool) with NO age check, while the caller `wg_control::drive_attempt_machine` (coordinator/wg_control.rs:798) gates the NoSession-edge rekey trigger on `nosession_edge && !engine.peer_has_confirmed_session(...)`. So a confirmed session aged past REJECT_AFTER_TIME (180s) but not yet torn down by `expire_sessions` (the ~1s GC tick) still reported `confirmed` -> the rekey trigger was SKIPPED until the GC tick fired. `try_encap` independently enforces the T3 REJECT_AFTER_TIME gate (drops the encrypt + arms the rekey edge) and the consumed edge re-arms on the next send, so the blackhole was bounded/self-healing — an availability nit at the rekey edge, not a persistent outage. Fix: `peer_has_confirmed_session` now also checks `now_ns.saturating_sub(session.created_ns) < REJECT_AFTER_TIME_NS`, reading the SAME mock-aware `self.now_ns()` clock that `try_encap`'s T3 gate (engine.rs:1277) uses, so an expired session returns false and the NoSession-edge rekey fires promptly. This makes REJECT_AFTER_TIME honored CONSISTENTLY across all four session-liveness sites: `try_encap` T3, `expire_sessions` GC, `peer_has_usable_session` (keepalive), and now `peer_has_confirmed_session` (rekey gate) — the check mirrors `peer_has_usable_session` (timers.rs:137). PRESERVED: a fresh confirmed session (age < 180s) still returns true; an unconfirmed session still returns false. The `session_confirmed` field in the per-peer status row (coordinator/status.rs:888) inherits the same non-stale semantics (an expired session no longer displays as confirmed) — an improvement, same ~0-1s window. Test (s5_timer_tests, tests.rs): `peer_has_confirmed_session_honors_reject_after_time` drives the mock clock via `pair()` + `set_mock_now_ns` — fresh (t0+1s) -> true, 179s -> true, 181s -> false [RED on revert: the age-blind check returns true at 181s], plus an UNCONFIRMED responder session forced into `current` (new `unconfirmed_responder_in_current` helper using `force_current_for_test`, since the #3882 3-slot model parks natural unconfirmed responders in `next`) -> false. RED-on-revert verified: reverting the age clause makes the 181s assertion fail (returns true). rustfmt: hand-written lines already clean; did NOT run whole-crate cargo fmt (recurses the untracked-format afxdp subtree). FULL cargo serial (`cargo test --release -- --test-threads=1`): main bin 3706/0/2 ignored + fairness-eval 54/0 + cos_doc_drift 8/0 + fairness_eval_blackbox 22/0 + snat_contract_doc_guard 1/0 (overall 3791/0). wg subset (185 `afxdp::wg::` tests incl. `peer_has_confirmed_session_honors_reject_after_time`): all green.
+- **File(s)**: userspace-dp/src/afxdp/wg/engine.rs, userspace-dp/src/afxdp/wg/tests.rs, docs/wireguard-interop.md, _Log.md
+- **Action**: #4544 (ps-027 H-01) — a hand-authored `load override` config with two literal `host-inbound-traffic { ... }` blocks under one security-zone (or interface) silently lost tokens. `compileZones` (pkg/config/compiler_security_zones.go) read the zone-level block with a bare `zone.HostInboundTraffic = parseHostInboundNode(prop)` (the switch case fires once per block → LAST block wins) and the #3362 per-interface override with `iface.FindChild("host-inbound-traffic")` (FIRST block wins). `parseStatements` appends a repeated hierarchical block as a same-key sibling (it does NOT merge), and `load override` splices the raw candidate straight in with no FormatSet round-trip and no dup-block schema rejection — so the extra block was dropped: host-inbound admission NARROWED (service DoS) or fail-opened if the dropped block was restrictive. Junos MERGES the blocks. Flat-set SetPath + `load merge` (FormatSet) both merge same-key lines onto one node → structurally immune; only load-override loses. Fix: new `mergeHostInbound(dst, src)` unions SystemServices/Protocols across ALL `FindChildren("host-inbound-traffic")` at BOTH levels, deduped (first-seen order) via `dedupHostInboundTokens`. A SINGLE block returns the first parse UNCHANGED (no dedup, no copy) so it stays byte-identical to the pre-#4544 read — dedup applies only when a second block is actually merged. RED-on-revert verified (host_inbound_dup_block_4544_test.go): reverting zone→overwrite makes the zone two-block test go RED (system-services=[], ssh lost); reverting interface→FindChild makes the interface test go RED (protocols=[], ospf lost); the merge-dedup test goes RED (https lost); the single-block byte-identical test PASSES on both fixed and reverted (proper negative control). go test ./pkg/config/ green (full suite); go build ./... green; gofmt/vet clean. Handles both AST shapes — the interface reproducer uses the Junos block spelling `interfaces { ifN { ... } }` (the collapsed `interfaces ifN { ... }` embeds the name in the node keys, which the compiler's interface loop doesn't enumerate; the block spelling matches real Junos display / load-override output).
+- **File(s)**: pkg/config/compiler_security_zones.go, pkg/config/host_inbound_dup_block_4544_test.go, docs/host-inbound-service-matrix.md, docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-07-07
+- **Action**: #4559 (ps-034 M-01) — deterministic CGNAT (`security nat source pool P port deterministic block-size N host address CIDR`) is typed + validated (compiler_nat.go:1275/1634-1688, ACCEPTS clean) and was compiled into the retired eBPF plane (pkg/dataplane/compiler_nat.go:473-496, DEAD after #1373/#1476), but was NEVER ported to the userspace dataplane — the only runtime (pkg/dataplane/userspace/nat_source.go has 0 deterministic refs; userspace-dp/src/nat/* has no block-allocation logic). So a deterministic pool COMMITS CLEAN with NO warning and SILENTLY falls back to round-robin/sticky SNAT — the subscriber→fixed-port-block mapping that is the whole point (lawful-intercept/audit without per-flow logs) is not enforced. This is a compliance/parity gap, not a security hole (SNAT still occurs; no packet leak / policy bypass / fail-open). SHORT-TERM honest-fix (mirrors #4291/#4292 accepted-only NAT doctrine): commit-time ADVISORY WARNING, NOT a hard reject (deterministic is valid Junos syntax). Added a block in ValidateConfig (pkg/config/compiler_validate_warn.go, right after the #4292 translation-target-RI block) that iterates SourcePools by sorted name, collects those with `Deterministic != nil`, and appends "security nat source pool <P>: `port deterministic block-size` is accepted but NOT enforced by the userspace dataplane (round-robin/sticky SNAT is used instead); deterministic CGNAT block allocation is not yet implemented (config-only parity, #4559)". Warnings flow ValidateConfig → runTailGates → cfg.Warnings. Doc reconcile: docs/feature-gaps.md:291 said "**Done**" (WRONG) → "Config-accepted, runtime-inert on userspace (#4559)" with the eBPF-retired history; docs/vsrx-gaps.md:121 "Parse-only?" column said "No" (implied fully-working) → "Parse-only (#4559) — validated at commit + advisory, no userspace block allocator". FULL Rust block allocator (userspace-dp/src/nat/allocator.rs + SourceNATRuleSnapshot + nat_source.go subscriber→port-block mapping) remains a feature-sized follow-up, recorded on #4559. RED-on-revert (deterministic_nat_advisory_4559_test.go): a well-formed deterministic pool COMMITS CLEAN (no error) with the advisory PRESENT in cfg.Warnings [verified RED: removing the warning block makes TestDeterministicNATEmitsInertAdvisory fail "got warnings: []"]; a plain non-deterministic pool has NO such warning (scope guard, no cry-wolf). go test ./pkg/config/ green (full suite); go build ./... green; gofmt/vet clean.
+- **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/deterministic_nat_advisory_4559_test.go, docs/feature-gaps.md, docs/vsrx-gaps.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4556 M-01 (ps-034) — REST + gRPC `show rollback n=0` returned the opaque store error instead of a clear positive-integer message, and the gRPC leg had NO non-positive guard at all. `?n=0` (REST configShowRollbackHandler, pkg/api/config.go) is a canonical non-negative uint that clears `queryIntStrict`, then flows to `ShowRollbackRedacted(0)` -> `history.Get(-1)` -> "history position -1 out of range [0, 0)"; the gRPC `ShowRollback` (pkg/grpcapi/server_config.go) passed `req.N` straight to `ShowRollbackRedacted(int(req.N))` with no N<=0 check, so 0 or a negative wire value hit the same opaque error. Fail-closed (no wrong slot, no leak) but confusing. Fix: reject n<=0 up front in BOTH legs — REST writes HTTP 400 "invalid n parameter: rollback index must be a positive integer" (keeps the "invalid n parameter" substring the #3443 test asserts); gRPC returns `codes.InvalidArgument` "invalid n <N>: rollback index must be a positive integer", mirroring the existing ShowCompare rollback_n guard (#3443 M6). PRESERVED: n>=1 unchanged (flows to the store exactly as before); the Junos `rollback 0 = revert candidate to active` is `Store.Rollback(0)` / `ShowCompare` (0 = candidate-vs-active) — a DIFFERENT path, untouched. RED-on-revert verified: dropping the REST guard makes n=0 return "history position -1 out of range" (not the positive-integer message); dropping the gRPC guard returns the same opaque InvalidArgument message. Tests: pkg/api TestConfigShowRollbackHandlerRejectsZeroN + TestConfigShowRollbackHandlerAcceptsSlotOne (real committed slot via Commit()); pkg/grpcapi TestShowRollbackRejectsNonPositiveN ({0,-1,-5}) + TestShowRollbackAcceptsSlotOne. go test ./pkg/api/... ./pkg/grpcapi/... green. No doc change: the 1-based / reject-n<=0 contract is unchanged — this is error-message clarity only.
+- **File(s)**: pkg/api/config.go, pkg/grpcapi/server_config.go, pkg/api/config_rollback_compare_strict_3443_test.go, pkg/grpcapi/server_show_rollback_zero_n_4556_test.go, _Log.md
+- **Action**: #4556 N-01 (ps-034) — `validateMonitorFilter` (pkg/cli/cli_request.go) could be evaded by a leading quote. `monitorFilterOptionToken` tested `tok[0] == '-'`, but a mismatched-quote wrapper (`'-w ...` / `"-z ...`) leaves a literal leading quote so `tok[0]` is `'`/`"`, not `-`, and a smuggled option slips past. NOT exploitable — the always-emitted `--` end-of-options separator in buildMonitorTrafficArgv (#4527) neutralizes it (a smuggled `-w`/`-z` reaches tcpdump as a harmless pcap operand) — but a defense-in-depth validator gap. Fix: `monitorFilterOptionToken` now peels ONE leading quote (`'`/`"`) before the `tok[0]=='-'` test, so a quote-wrapped option is still caught with a clear error. PRESERVED: a legitimate pcap primitive never begins with a quote, so peeling is a no-op for normal tokens (host/port/tcp/...); a bare `-` (getopt stdin sentinel / arithmetic subtraction) stays allowed; the `--` separator is unchanged. RED-on-revert verified (monitor_traffic_quotestrip_4556_test.go): without the strip, `'-w /tmp/x`, `"-z ...`, `'-r /etc/shadow`, `host 10.0.0.1 '-w /tmp/x`, `'--postrotate-command ...` all pass validation -> RED; the preserve test (normal filters + bare `-`) passes on both. go test ./pkg/cli/... green. No doc change: the documented mechanism (the `--` separator, #4524/#4527) is unchanged; this only closes the defense-in-depth layer's gap.
+- **File(s)**: pkg/cli/cli_request.go, pkg/cli/monitor_traffic_quotestrip_4556_test.go, _Log.md
+- **Action**: #4556 L-01 (ps-034) — `validateMultiValueLeaf` (pkg/config/schema_walk.go) treated the literal mid-token `to` as a range separator (`<a> to <b>`) on EVERY typed multi-value leaf, when only port-range / NAT-pool-address leaves use ranges. VERIFY-FIRST (runtime walk of setSchema): the leaves that actually REACH validateMultiValueLeaf are ALL IP/CIDR (`name-server`, VRRP `virtual-address`, RA `dns-server-address`) or session-log-flag leaves — NONE use `<a> to <b>`; the port-range/NAT-pool leaves carry no schema `validator` (compiler-validated) so they never reach this walker (only the white-box schema_walk_internal_test.go synthetic `destination-port` leaf exercises the range path). So the `to` special-casing was over-broad: on those IP/flag leaves it leniently SKIPPED a literal `to` (e.g. `name-server 1.1.1.1 to 8.8.8.8` was wrongly ACCEPTED). Fix: new `rangeSeparator bool` on schemaNode gates the `to`-as-separator branch; when unset, `to` is validated as an ordinary value token and rejected with a clear "invalid value" message. Set on NO production leaf (none reaching the walker use ranges — port-range/NAT-pool stay compiler-validated, untouched) + on the white-box synthetic port-range leaf. PRESERVED: the range leaf still parses `20000 to 20003` (TestWalker_MultiValueTail_AcceptsRange, synthetic leaf now rangeSeparator:true); other typed multi leaves no longer special-case `to`. RED-on-revert verified (revert the gate to unconditional `tok=="to"`): TestWalker_MultiValueTail_NonRangeToNotFalseRejected (non-range leaf must ACCEPT a literal `to` member) + TestSchemaValidate_NameServer_ToNotRangeSeparator (config-level via ParseSetCommand+SetPath: `name-server 1.1.1.1 to 8.8.8.8` must be REJECTED, not skipped) both go RED. go test ./pkg/config/... green. Doc: docs/config-schema.md gains a "the `to` range separator is opt-in (#4556 L-01)" note.
+- **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go, pkg/config/schema_walk_internal_test.go, pkg/config/schema_validate_system_test.go, docs/config-schema.md, _Log.md

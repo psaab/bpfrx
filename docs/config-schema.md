@@ -451,6 +451,23 @@ validation:
   directions — tail-drop and typo-bypass — across bracket / repeated-line /
   hierarchical shapes, plus the value-slot completion pin).
 
+**The `to` range separator in `validateMultiValueLeaf` is opt-in (#4556 L-01).**
+`validateMultiValueLeaf` (`schema_walk.go`) treats the fixed mid-token `to` as
+a range separator (`<a> to <b>`) ONLY for a leaf that sets `rangeSeparator: true`
+on its `schemaNode`. The separator is meaningful solely for a leaf whose value
+domain is a numeric RANGE — port-range and NAT-pool-address. Those production
+leaves are compiler-validated (they carry no schema `validator`), so they never
+reach `validateMultiValueLeaf`; every typed multi leaf that DOES reach it today
+is an IP/CIDR leaf (`name-server`, VRRP `virtual-address`, RA `dns-server-address`)
+or a session-log-flag leaf, where `to` is never a valid member. On those leaves
+`rangeSeparator` stays false, so a literal `to` is validated as an ordinary value
+and rejected with a clear "invalid value" message (e.g. `name-server 1.1.1.1 to
+8.8.8.8` — name-server takes no range — is rejected, not silently accepted by
+skipping `to`). Before the gate, `to` was special-cased on EVERY typed multi
+leaf, leniently skipping it. Only the white-box walker test's synthetic
+port-range leaf sets `rangeSeparator` today (`schema_walk_internal_test.go`);
+`TestSchemaValidate_NameServer_ToNotRangeSeparator` pins the non-range behaviour.
+
 **IKE/IPsec proposals, RIP export/redistribute, and routing-instance interface
 are multi-value (#3904).** Four more leaves of the #2419/#3431/#3703
 bracket-list-truncation class (fable-161 F-040/F-161/F-162/F-163), all fixed by
@@ -2536,6 +2553,34 @@ reserved for whole-dataplane selection where a rewrite shim
   bit-identical guards; identical-permit merge + permit/reject-still-rejected for
   the dedup — built with `NewParser` for the `LoadOverride` shape, driving
   `compileNAT`/`compileFirewall`/`compileSecurity` directly).
+- **#4544 (the host-inbound analogue of #3842/#3915/#3850 — duplicate
+  `host-inbound-traffic {}` blocks UNDER ONE zone or interface):** `compileZones`
+  (`compiler_security_zones.go`) read the zone-level block with a bare `=`
+  assignment (`zone.HostInboundTraffic = parseHostInboundNode(prop)` — the switch
+  case fires once per block, so the LAST block wins) and the #3362 per-interface
+  override with `iface.FindChild("host-inbound-traffic")` (FIRST block wins).
+  `parseStatements` appends a repeated hierarchical block as a same-key sibling,
+  so a `LoadOverride` of a hand-authored config with two literal
+  `host-inbound-traffic { ... }` blocks under one zone/interface — e.g.
+  `host-inbound-traffic { system-services ssh; }` then
+  `host-inbound-traffic { protocols ospf; }` — had the extra block silently
+  dropped: host-inbound admission NARROWED (a service DoS) or fail-opened if the
+  dropped block was the restrictive one, with a clean commit. Junos MERGES the
+  blocks. The fix accumulates over EVERY `FindChildren("host-inbound-traffic")`
+  at both levels via `mergeHostInbound` (`compiler_security_zones.go`), which
+  UNIONS the SystemServices/Protocols and dedups (first-seen order). A single
+  block returns the first parse UNCHANGED (no dedup, no copy — byte-identical to
+  the pre-#4544 read). Flat-set `SetPath` and `load merge` (FormatSet round-trip)
+  both merge two same-key lines onto ONE node, so — like every entry in this
+  cluster — the fail-open was reachable ONLY via the hierarchical `NewParser` /
+  `LoadOverride` shape. Distinct from the #3362/#3720 union, which merges
+  host-inbound authored at DIFFERENT granularities (zone ∪ physical ∪ unit);
+  #4544 merges repeated blocks at the SAME granularity. Regression coverage:
+  `pkg/config/host_inbound_dup_block_4544_test.go` (zone + interface two-block
+  merge, cross-block dedup, single-block byte-identical guard — built with
+  `NewParser` for the `LoadOverride` shape); operator doc:
+  `docs/host-inbound-service-matrix.md` "Repeated host-inbound-traffic blocks
+  merge (#4544)".
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same

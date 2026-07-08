@@ -350,6 +350,48 @@ fact inherited a physical override.
 mirrors the same additive resolution and quarantine, so the
 `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
 
+## Repeated host-inbound-traffic blocks merge (#4544)
+
+Junos MERGES two literal `host-inbound-traffic { ... }` blocks authored under
+one `security-zone` (or one interface) into a single effective stanza — the
+union of their `system-services` / `protocols`. xpf now matches that at both
+the zone level and the #3362 per-interface level.
+
+Where this bites is **`load override`** of a hand-authored file. The three
+config-arrival paths differ in how they treat two same-key blocks:
+
+- **flat-set** (`set ... host-inbound-traffic system-services ssh` then
+  `... protocols ospf`) — `ConfigTree.SetPath` reuses the existing same-key
+  container, so the two lines land under ONE node. Structurally immune.
+- **`load merge`** — routes through `FormatSet` (a flat-set round-trip), so it
+  merges for the same reason.
+- **`load override`** (`store_command.go`, `s.candidate = tree`) — splices the
+  RAW hierarchical parse straight into the candidate and commits it with no
+  FormatSet round-trip. The hierarchical parser (`parseStatements`) keeps two
+  literal `host-inbound-traffic { ... }` blocks as **separate same-key
+  siblings** — it does not merge them — and there is no duplicate-block schema
+  rejection.
+
+Before #4544 the compiler dropped every block but one on the load-override path:
+the zone-level `case "host-inbound-traffic"` OVERWROTE (`zone.HostInboundTraffic
+= parseHostInboundNode(prop)`, last block wins) and the interface-level reader
+used `FindChild` (first block wins). Either way the operator's authored
+admission set silently narrowed — a service DoS — or fail-opened if the dropped
+block was the restrictive one. A Junos-EXPORTED config always shows one already-
+merged block, so the trigger is a hand-authored duplicate + `load override`.
+
+The fix (`mergeHostInbound`, `pkg/config/compiler_security_zones.go`) accumulates
+across **all** `FindChildren("host-inbound-traffic")` at both levels and unions
+their token sets, deduplicated (first-seen order). A **single** block is
+byte-identical to the pre-#4544 behaviour — the first parse is returned
+unchanged, with no dedup, so a single block keeps its exact token multiset;
+dedup applies only when a second block is actually merged. RED-on-revert guards:
+`pkg/config/host_inbound_dup_block_4544_test.go`.
+
+This is orthogonal to the "Per-interface override precedence (#3362, #3720)"
+union above, which merges host-inbound authored at DIFFERENT granularities
+(zone ∪ physical ∪ unit). #4544 merges repeated blocks at the SAME granularity.
+
 ## Duplicate host-local-address ambiguity (#3718, Option B)
 
 The kernel host-inbound chain matches on **destination address only** — every
@@ -490,36 +532,53 @@ security-vs-availability decision, not a mechanical fix, so it stays open on #41
   gap, and it doubles the enforcement SSOT. The right long-term parity answer, but
   needs an nft-representability spec.
 
-## Bare RST/FIN on the LocalDelivery session-miss install (#4487, P6b)
+## Non-handshake TCP first packet on the LocalDelivery session-miss install (#2151 / #4487 / #4539)
 
 The XSK `LocalDelivery` arm may CACHE a firewall-local session on a session
 miss so subsequent established packets bypass userspace and return straight to
 the kernel (`should_cache_local_delivery_session_on_miss` →
 `install_helper_local_session_on_miss`, `userspace-dp/src/afxdp/forwarding/mod.rs`).
-That install is gated so a stray TCP teardown segment never seeds a host-local
-session:
+That install is gated so a **TCP** session is seeded only off the handshake — a
+first packet that carries **SYN** (an initial SYN, or the SYN|ACK inbound leg of
+a firewall-originated flow). The gate is a **single positive predicate**:
+`crate::tcp_flags::has_syn(tcp_flags)`. Non-TCP (ICMP / UDP) LocalDelivery is
+unaffected — the `has_syn` gate is TCP-only and those protocols always cache.
 
-- **#2151** already declined to cache off a bare/established **ACK** (ACK set,
-  SYN clear) — only the handshake seeds a session.
-- **#4487** closes the residual the ACK-only gate missed: a **bare RST or bare
-  FIN with no ACK bit** (`is_closing(flags) && !has_syn(flags)`). Without it a
-  RST/FIN flood to a firewall interface IP churns the per-worker session table
-  (a cheap host-IP session-table DoS) and a later real SYN would HIT the
-  immediately-`closing` seed instead of being re-evaluated by the host-inbound /
-  junos-host gates (a policy-evaluation skip).
+That single `has_syn` predicate (#4539) subsumes two earlier NARROW
+decline-gates and closes the residual they left open:
 
-This is the **same predicate** the transit strict-syn-check applies (#4400,
-`strict_syn_check_drops_new_flow`), but the **action differs by disposition**,
-exactly as #4400 chose. Transit dispositions (ForwardCandidate / MissingNeighbor)
-**DROP** the packet. Host-inbound `LocalDelivery` must **NOT** drop it: a peer
-RST/FIN tearing down a firewall-**originated** TCP flow (BGP-active, syslog-TCP/
-TLS, feed/RPM fetches, DNS-over-TCP), or a connection-refused RST for the
-firewall's own outbound SYN whose dataplane session was already GC'd, arrives as
-a session MISS and must still reach the local stack so the kernel socket tears
-down promptly (the #4400 LocalDelivery drop-exemption). So the guard here only
-declines to **cache**; the `LocalDelivery` disposition still delivers the packet
-to the host via the reinject chokepoint. An established-session RST/FIN is a
-session HIT and never consults this miss-only gate.
+- **#2151** declined to cache off a bare/established **ACK** (`has_ack &&
+  !has_syn`, ACK set / SYN clear). Still declined — it is a `!has_syn` case.
+- **#4487** declined a **bare RST or bare FIN with no ACK bit** (`is_closing &&
+  !has_syn`). Still declined — also `!has_syn`. Without it a RST/FIN flood to a
+  firewall interface IP churns the per-worker session table (a cheap host-IP
+  session-table DoS) and a later real SYN would HIT the immediately-`closing`
+  seed instead of being re-evaluated by the host-inbound / junos-host gates (a
+  policy-evaluation skip).
+- **#4539** (gate-consistency hardening, LOW) closes the residual the two
+  decline-gates missed: a non-handshake anomalous / crafted first packet that is
+  **neither ACK-set nor closing** — **pure PSH (0x08), a null segment (0x00),
+  pure URG (0x20), or an ECE/CWR-only** segment. Under the old two-gate form
+  these fell through to the default `true` and seeded a 300s host-local session
+  (`is_initial_syn` false at install → `established = true`). Aligning on
+  `has_syn` matches the gate to its stated "only off the handshake" intent.
+
+The `!has_syn` decline is the **same predicate** the transit strict-syn-check
+applies (#4400, `strict_syn_check_drops_new_flow`), but the **action differs by
+disposition**, exactly as #4400 chose. Transit dispositions (ForwardCandidate /
+MissingNeighbor) **DROP** the packet. Host-inbound `LocalDelivery` must **NOT**
+drop it: a peer RST/FIN tearing down a firewall-**originated** TCP flow
+(BGP-active, syslog-TCP/TLS, feed/RPM fetches, DNS-over-TCP), or a
+connection-refused RST for the firewall's own outbound SYN whose dataplane
+session was already GC'd, arrives as a session MISS and must still reach the
+local stack so the kernel socket tears down promptly (the #4400 LocalDelivery
+drop-exemption). So the guard here only declines to **cache**; the
+`LocalDelivery` disposition still delivers the declined packet to the host via
+the reinject chokepoint. An established-session packet is a session HIT and
+never consults this miss-only gate; and any later real SYN is re-evaluated by
+the `to-zone junos-host` mandatory-teardown gate that runs on EVERY
+LocalDelivery session hit (`poll_descriptor`), so declining to cache never skips
+policy.
 
 ## Adding a new host-inbound service
 

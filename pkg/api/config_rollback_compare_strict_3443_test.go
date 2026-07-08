@@ -99,3 +99,60 @@ func TestConfigShowRollbackHandlerRejectsMalformedN(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigShowRollbackHandlerRejectsZeroN pins the #4556 M-01 fix: `?n=0`
+// is a canonical non-negative uint that clears queryIntStrict, so the old
+// code passed it to ShowRollbackRedacted(0) → history.Get(-1) → the opaque
+// "history position -1 out of range" error. The handler now rejects n<=0 up
+// front with a clear positive-integer message. RED-on-revert: dropping the
+// n<=0 guard returns the store's out-of-range error, not this message.
+func TestConfigShowRollbackHandlerRejectsZeroN(t *testing.T) {
+	s := newCompareStore(t)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/config/show-rollback?n=0", nil)
+	s.configShowRollbackHandler(rr, req)
+
+	if rr.Code != 400 {
+		t.Fatalf("n=0: status = %d, want 400; body=%s", rr.Code, rr.Body.String())
+	}
+	resp := decodeResponse(t, rr.Body.String())
+	if resp.Success {
+		t.Fatalf("n=0: success=true, want false")
+	}
+	if !strings.Contains(resp.Error, "rollback index must be a positive integer") {
+		t.Fatalf("n=0: error = %q, want substring %q", resp.Error, "rollback index must be a positive integer")
+	}
+	if strings.Contains(resp.Error, "out of range") {
+		t.Fatalf("n=0: error leaked the opaque store message %q", resp.Error)
+	}
+}
+
+// TestConfigShowRollbackHandlerAcceptsSlotOne asserts n=1 is unchanged by the
+// M-01 guard: a real committed rollback slot 1 still renders 200. One Commit()
+// pushes the prior (empty) active into history slot 1, so ShowRollback n=1
+// succeeds.
+func TestConfigShowRollbackHandlerAcceptsSlotOne(t *testing.T) {
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if _, err := store.LoadSet("set system host-name rollback-fixture"); err != nil {
+		t.Fatalf("LoadSet() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	s := &Server{store: store}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/config/show-rollback?n=1", nil)
+	s.configShowRollbackHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("n=1: status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	resp := decodeResponse(t, rr.Body.String())
+	if !resp.Success {
+		t.Fatalf("n=1: success=false, body=%s", rr.Body.String())
+	}
+}

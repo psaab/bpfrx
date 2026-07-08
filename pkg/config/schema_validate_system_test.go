@@ -247,6 +247,23 @@ func TestSchemaValidate_NameServer_BlockListShape(t *testing.T) {
 	}
 }
 
+// #4556 L-01: `to` is a range separator ONLY on a leaf that opts in via
+// rangeSeparator (port-range / NAT-pool-address). name-server's value domain
+// is an IP, not a numeric range, so a literal `to` is now validated as an
+// ordinary value token and rejected — not silently skipped as a separator.
+// RED-on-revert: with the gate removed, `to` is treated as a separator so both
+// IP endpoints validate and the bogus `name-server 1.1.1.1 to 8.8.8.8` is
+// (wrongly) accepted. Uses ParseSetCommand+SetPath (flatSchemaCheck).
+func TestSchemaValidate_NameServer_ToNotRangeSeparator(t *testing.T) {
+	err := flatSchemaCheck(t, "set system name-server 1.1.1.1 to 8.8.8.8")
+	if err == nil {
+		t.Fatal("name-server takes no `a to b` range; a literal `to` must be rejected as an invalid value, not skipped as a separator")
+	}
+	if !strings.Contains(err.Error(), "name-server") {
+		t.Fatalf("error should reference name-server: %v", err)
+	}
+}
+
 // Same block-list shape for the vrrp virtual-address multi leaf
 // (compiler_interfaces.go reads child.Name() entries — #1813).
 func TestSchemaValidate_VirtualAddress_BlockListShape(t *testing.T) {

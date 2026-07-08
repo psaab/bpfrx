@@ -724,15 +724,32 @@ impl WgEngine {
     }
 
     /// Whether the named peer currently has a confirmed (usable for
-    /// egress) transport session. Control thread uses this to decide
-    /// whether to (re-)initiate a handshake. Slow path.
+    /// egress) transport session — key-confirmed AND not yet past
+    /// REJECT_AFTER_TIME. The control thread uses this to decide
+    /// whether to (re-)initiate a handshake on the NoSession edge.
+    ///
+    /// The age gate is load-bearing (#4546): a confirmed session that
+    /// has aged past REJECT_AFTER_TIME (180s) can no longer encrypt —
+    /// `try_encap` refuses it at the T3 gate and `expire_sessions` GCs
+    /// it on the next ~1s tick — so it must NOT report `confirmed` and
+    /// suppress the rekey trigger. Without this check the NoSession-edge
+    /// rekey (`wg_control::drive_attempt_machine`) was skipped for a
+    /// confirmed-but-expired-yet-not-GC'd session, a bounded ~0-1s
+    /// blackhole at the expiry boundary until the GC tick. The check
+    /// mirrors `try_encap`'s T3 gate, `expire_sessions`, and
+    /// `peer_has_usable_session`, reading the same mock-aware `now_ns()`
+    /// clock so every WG age comparison shares one clock domain. Slow
+    /// path.
     pub(crate) fn peer_has_confirmed_session(&self, pubkey: &[u8; 32]) -> bool {
         let Some(peer) = self.peer_arc(pubkey) else {
             return false;
         };
+        let now_ns = self.now_ns();
         matches!(
             peer.current.read().unwrap().as_ref(),
             Some(session) if session.is_confirmed()
+                && now_ns.saturating_sub(session.created_ns)
+                    < super::session::REJECT_AFTER_TIME_NS
         )
     }
 
