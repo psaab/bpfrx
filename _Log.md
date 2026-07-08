@@ -1,3 +1,31 @@
+## 2026-07-07 — #4455 (HI-1) host-inbound: multicast packet-wide advisory + protocol→group catalog (bounded slice)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4455 DRIVEABLE bounded slice (GO-only, no forwarding change).
+  Verify-first on master confirmed host-bound routing multicast is fail-OPEN
+  but BOUNDED: `buildHostInboundFilterPayload` (`pkg/daemon/daemon_nft.go`)
+  matches host-local UNICAST `daddr` only and runs `policy accept`, so a packet
+  to a well-known group (OSPF 224.0.0.5, VRRP 224.0.0.18, PIM 224.0.0.13) falls
+  through packet-wide; the Rust `host_inbound_admits` has no address dimension.
+  Shipped: (1) a protocol→multicast-group catalog SSOT
+  (`pkg/config/host_inbound_multicast.go`) settling deferred decision (2); (2) a
+  WARN-only commit-time advisory (`validateHostInboundMulticastWarnings` in
+  `compiler_validate_warn.go`) mirroring the #3226 pattern — fires when a zone /
+  per-interface override admits a multicast routing protocol (expands
+  `protocols all`), names the zone + concrete groups; (3) design doc
+  `docs/host-inbound-multicast.md` with the group table + fail-open-bounded note
+  + the deferred 4-decision plan. RED-on-revert test
+  `host_inbound_multicast_warn_4455_test.go` (multicast→advisory, unicast bgp/
+  ldp/msdp/bfd→none, system-services-only/no-HIT→none, per-iface override,
+  `protocols all` expansion, catalog SSOT shape). The per-zone iifname
+  enforcement + #1960 migration gating + kernel/Rust lockstep remain DEFERRED.
+- **File(s)**: `pkg/config/host_inbound_multicast.go` (new),
+  `pkg/config/host_inbound_multicast_warn_4455_test.go` (new),
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/testdata/golden_4406.json` (baseline regen: +#4455 advisory on 12
+  cases, no other field changed), `docs/host-inbound-multicast.md` (new),
+  `docs/host-inbound-service-matrix.md`, `_Log.md`.
+
 ## 2026-07-07 — #3226 host-inbound: commit-time advisory for `system-services all` / `any-service` packet-wide full-admit
 
 - **Timestamp**: 2026-07-07
