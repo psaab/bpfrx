@@ -275,6 +275,18 @@ func (t *tunnelManager) keepaliveProber() tunnelProber {
 // probes (legacy non-anchor branch only) are reconciled by identity
 // instead of being restarted every apply.
 func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
+	// mu is held across the WHOLE netlink+exec reconcile deliberately (not
+	// just a small state-read section): the reconcile INTERLEAVES shared-map
+	// reads/writes (ownedNames, appliedAddrs, appliedRI, wgConfigured,
+	// tunnels) with the netlink LinkDel/LinkAdd it drives — per-tunnel
+	// removal/adoption decisions are made FROM the maps and the failure
+	// retries are written BACK into them, and every applyKernelTunnelLocked/
+	// applyAnchorLocked/applyWireguardTunLocked helper requires the lock.
+	// Two concurrent Apply/Clear calls would race both the maps AND the
+	// kernel link state (double-delete, delete-during-recreate), so the wide
+	// scope serializes them. There is no isolable critical section to narrow
+	// to. GetStatus (below) is the counter-case that CAN narrow — it only
+	// snapshots names under the lock, then probes netlink read-only unlocked.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.ensureReconcileStateLocked()
