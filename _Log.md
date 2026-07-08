@@ -40841,3 +40841,25 @@ top.
   go build ./...; gofmt+vet clean.
 - **File(s)**: pkg/frr/policy_render.go,
   pkg/frr/policy_setclause_injection_4482_test.go, pkg/frr/README.md, _Log.md
+- **Timestamp**: 2026-07-07
+- **Action**: #4372 (avo-review-002 A1, GO-only — no Rust/wire change) — the
+  Rust dataplane already published per-color three-color policer counters over
+  the `three_color_policer_counters` status (Prometheus
+  `xpf_userspace_three_color_policer_*_total` and the dataplane status-summary
+  "Three-color policers:" table already surfaced them; the issue's "not in
+  Prometheus" claim was stale). The genuine gap was the Junos-style `show
+  firewall` / `show firewall filter` CLI, which showed only per-term hit counts
+  and never the policer status. Added `BuildThreeColorPolicerStatusIndex`
+  (by-name index, mirroring `BuildFirewallFilterTermCounterIndex`) and a
+  `writeThreeColorPolicerStatus` renderer, then wired both into `showFirewall`
+  and `showFirewallFilter`: each `then policer <name>` term now prints the
+  reference line plus the policer mode / color mode and the green(conform) /
+  yellow(exceed) / red(violate) / dropped packet+byte counters. Legacy
+  single-rate `firewall policer` defs lower into the same runtime (#4514) so
+  both namespaces render. RED-on-revert verified (neutralizing the renderer
+  drops the "Policer ..." block; a no-policer term is unaffected). go
+  build/vet/gofmt clean; pkg/cli, pkg/api, pkg/grpcapi, pkg/dataplane/userspace
+  tests green.
+- **File(s)**: pkg/dataplane/userspace/filtercounters.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_show_firewall_test.go, docs/cos-traffic-shaping.md, _Log.md
