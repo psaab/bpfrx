@@ -258,14 +258,32 @@ pub(crate) struct Nat64ReverseInfo {
 // fragment INHERIT the first fragment's decision so the whole datagram
 // traverses NAT64 end-to-end and reassembles at the receiver.
 //
-// Design (converged /research `docs/research/2562-nat64-frag/plan.md`):
+// Design (converged /research pass; see issue #2562 / PR #4686):
 //   * Key is PORT-FREE `(addr_family, src, dst, ip_id)` so ALL fragments of one
 //     datagram co-locate (the #2344 invariant — payload bytes are NEVER read as
 //     L4 ports).
-//   * Value is the first fragment's `SessionDecision` (resolution + NatDecision)
-//     — data-sufficient for the forward direction (`decision.nat` carries
-//     snat_v4/dst_v4) — plus the optional `Nat64ReverseInfo` for the reverse
-//     direction, plus a monotonic-ns deadline.
+//   * Value is the first fragment's FULL, per-flow `SessionDecision`
+//     (resolution + NatDecision) — data-sufficient for the forward direction
+//     (`decision.nat` carries this flow's snat_v4/dst_v4) — plus the optional
+//     `Nat64ReverseInfo` for the reverse direction, plus a monotonic-ns
+//     deadline. NOTE the value is per-FLOW, not per-(src,dst): the pool SNAT
+//     source is round-robin (`address_persistent = false`), so two flows that
+//     share (src_v6,dst_v6) but differ in L4 port can be assigned DIFFERENT
+//     pool source addresses. Since the key is port-free, a non-first fragment
+//     could in principle inherit a *sibling* flow's snat_v4.
+//   * CORRECTNESS / why the port-free key is safe: RFC 8200 §4.5 requires a
+//     source to use a UNIQUE Fragment Identification per (source, destination)
+//     for the maximum lifetime a fragment may exist. So for a CONFORMANT sender
+//     exactly one datagram — hence one flow — owns a given (src,dst,ip_id)
+//     within our 2s TTL, and the inherited snat_v4 is that flow's own. The only
+//     residual is a sender that DELIBERATELY reuses one ident across two
+//     concurrent flows to the same (src,dst); its worst case is fail-SAFE: the
+//     non-first fragment may translate to the sibling flow's pool SOURCE, so
+//     the receiver cannot reassemble (fragments arrive from different sources)
+//     and DROPS — it is NEVER mistranslated to a wrong DESTINATION (dst is in
+//     the key and derives the synthetic-prefix v4 dst identically for both).
+//     This is the same inherent NAT + fragmentation + ident-reuse hazard
+//     RFC 6864 describes, not a new exposure.
 //   * ONLY a first fragment (offset 0, MF=1, admitted + resolved) INSTALLS an
 //     entry. Non-first fragments only CONSULT — the load-bearing DoS property:
 //     an attacker cannot grow the table with cheap headerless fragments.
