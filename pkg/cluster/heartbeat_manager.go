@@ -5,11 +5,29 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// heartbeatUDPNetwork returns the UDP network string ("udp4" or "udp6") for a
+// literal control-link IP so the heartbeat sockets follow the configured
+// address family. A v4 (or v4-mapped) literal yields "udp4"; a v6 literal
+// yields "udp6". An address that is not a parseable literal falls back to
+// "udp4" — the historical default — so a malformed value fails the same way
+// it always did. The daemon may hand StartHeartbeat an IPv6 control-link
+// address (selectClusterBindAddr honours an IPv6 peer via
+// globalIPv6Candidates), so hardcoding "udp4" made an IPv6 control link
+// unusable (#4549 F9); deriving the family here keeps v4 bit-identical while
+// letting a v6 control link bind.
+func heartbeatUDPNetwork(addr string) string {
+	if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
+		return "udp6"
+	}
+	return "udp4"
+}
 
 // StartHeartbeat launches heartbeat sender and receiver goroutines.
 // localAddr is the local control link IP, peerAddr is the peer control link IP.
@@ -40,29 +58,36 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	threshold := m.hbThreshold
 	m.mu.Unlock()
 
+	// Select the UDP network from the control-link address family so a v6
+	// control link binds; v4 stays "udp4". net.JoinHostPort brackets a v6
+	// literal (fd00::1 -> [fd00::1]:port) — plain "%s:%d" would produce an
+	// unparseable address for IPv6.
+	network := heartbeatUDPNetwork(localAddr)
+	portStr := strconv.Itoa(HeartbeatPort)
+
 	// Resolve peer address.
-	peer, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", peerAddr, HeartbeatPort))
+	peer, err := net.ResolveUDPAddr(network, net.JoinHostPort(peerAddr, portStr))
 	if err != nil {
 		return fmt.Errorf("resolve peer addr: %w", err)
 	}
 
 	// Bind receiver to local address.
-	local, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", localAddr, HeartbeatPort))
+	local, err := net.ResolveUDPAddr(network, net.JoinHostPort(localAddr, portStr))
 	if err != nil {
 		return fmt.Errorf("resolve local addr: %w", err)
 	}
 
 	lc := vrfListenConfig(vrfDevice)
 
-	recvPkt, err := lc.ListenPacket(context.Background(), "udp4", local.String())
+	recvPkt, err := lc.ListenPacket(context.Background(), network, local.String())
 	if err != nil {
 		return fmt.Errorf("listen heartbeat: %w", err)
 	}
 	recvConn := recvPkt.(*net.UDPConn)
 
 	// Create sender socket (bound to local address).
-	sendAddr := fmt.Sprintf("%s:0", localAddr)
-	sendPkt, err := lc.ListenPacket(context.Background(), "udp4", sendAddr)
+	sendAddr := net.JoinHostPort(localAddr, "0")
+	sendPkt, err := lc.ListenPacket(context.Background(), network, sendAddr)
 	if err != nil {
 		recvConn.Close()
 		return fmt.Errorf("sender socket: %w", err)

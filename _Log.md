@@ -56,6 +56,33 @@
   pkg/dataplane/userspace/protocol.go,
   pkg/dataplane/userspace/format/status.go,
   pkg/dataplane/userspace/format/status_test.go, _Log.md
+## 2026-07-07 — #4455 (HI-1) host-inbound: multicast packet-wide advisory + protocol→group catalog (bounded slice)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4455 DRIVEABLE bounded slice (GO-only, no forwarding change).
+  Verify-first on master confirmed host-bound routing multicast is fail-OPEN
+  but BOUNDED: `buildHostInboundFilterPayload` (`pkg/daemon/daemon_nft.go`)
+  matches host-local UNICAST `daddr` only and runs `policy accept`, so a packet
+  to a well-known group (OSPF 224.0.0.5, VRRP 224.0.0.18, PIM 224.0.0.13) falls
+  through packet-wide; the Rust `host_inbound_admits` has no address dimension.
+  Shipped: (1) a protocol→multicast-group catalog SSOT
+  (`pkg/config/host_inbound_multicast.go`) settling deferred decision (2); (2) a
+  WARN-only commit-time advisory (`validateHostInboundMulticastWarnings` in
+  `compiler_validate_warn.go`) mirroring the #3226 pattern — fires when a zone /
+  per-interface override admits a multicast routing protocol (expands
+  `protocols all`), names the zone + concrete groups; (3) design doc
+  `docs/host-inbound-multicast.md` with the group table + fail-open-bounded note
+  + the deferred 4-decision plan. RED-on-revert test
+  `host_inbound_multicast_warn_4455_test.go` (multicast→advisory, unicast bgp/
+  ldp/msdp/bfd→none, system-services-only/no-HIT→none, per-iface override,
+  `protocols all` expansion, catalog SSOT shape). The per-zone iifname
+  enforcement + #1960 migration gating + kernel/Rust lockstep remain DEFERRED.
+- **File(s)**: `pkg/config/host_inbound_multicast.go` (new),
+  `pkg/config/host_inbound_multicast_warn_4455_test.go` (new),
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/testdata/golden_4406.json` (baseline regen: +#4455 advisory on 12
+  cases, no other field changed), `docs/host-inbound-multicast.md` (new),
+  `docs/host-inbound-service-matrix.md`, `_Log.md`.
 
 ## 2026-07-07 — #3226 host-inbound: commit-time advisory for `system-services all` / `any-service` packet-wide full-admit
 
@@ -41015,3 +41042,59 @@ top.
 - **File(s)**: pkg/dataplane/userspace/filtercounters.go,
   pkg/grpcapi/server_show_firewall.go,
   pkg/grpcapi/server_show_firewall_test.go, docs/cos-traffic-shaping.md, _Log.md
+- **Timestamp**: 2026-07-07
+- **Action**: #4549 F9 + F10 (crypto/HA LOW hardening residuals; F8+F11
+  already shipped in #4558). GO-only. F9 (DRIVEN) — HA node-to-node UDP
+  heartbeat was IPv4-only: `StartHeartbeat` hardcoded `"udp4"` in the two
+  `ResolveUDPAddr` + two `ListenPacket` calls and built the address with a
+  bare `"%s:%d"` format. The daemon already resolves an IPv6 control-link
+  bind address (`selectClusterBindAddr` honours an IPv6 peer via
+  `globalIPv6Candidates`), so a v6 control link was unusable. Fix: added
+  `heartbeatUDPNetwork(addr)` — a v6 literal -> `"udp6"`, v4/unparseable ->
+  `"udp4"` (historical default) — and switched all four sockets to that
+  network, building addresses with `net.JoinHostPort` (brackets v6). v4 path
+  is bit-for-bit unchanged; a v6 control link now binds. `RestartHeartbeat`
+  inherits the fix (it re-invokes `StartHeartbeat`). Test-failover flag: this
+  is HA code but the new path is a no-op for a valid v4 config (only a v6
+  control link exercises udp6) — a light test-failover is nice-to-have, not
+  required. F10 (DEFERRED — theater/refactor) — IPsec PSK is a `config.Secret`
+  = immutable Go `string`; a `Reveal()`-then-wipe cannot reliably zero it
+  (interned/GC-copied, no owned mutable backing array, `unsafe` mutation is UB)
+  and the swanctl `secrets {}` block is written 0600 plaintext on disk anyway
+  (strongSwan must read it), so the heap copy is secondary. A real wipe needs
+  `Secret` -> `[]byte` across the whole config tree (40+ fields, `== ""`
+  checks, map keys) with marginal benefit. Not shipped (no fake zeroize).
+  RED-on-revert (F9): reverting to `"udp4"` + `"%s:%d"` makes the v6 test fail
+  with `resolve peer addr: address ::1:4784: too many colons in address`; the
+  v4 test stays green. go build ./pkg/cluster/...; go test ./pkg/cluster/...;
+  gofmt+vet clean.
+- **File(s)**: pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_family_4549_test.go, docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-07-08T05:27Z
+- **Action**: #2261 — add a GOLDEN external-ground-truth test pinning the Kea
+  3.0.x memfile CSV schema so the standby pre-seed header can never silently
+  drift and break the live loader on failover. The pre-existing memfile tests
+  are self-referential: `TestPreSeedMemfile6_EmitsHWAddress` derives its
+  expected columns from `keaMemfileHeader6` itself (`strings.Split(...)`) and
+  the writer emits that same const, so a CO-DRIFT of the const AND the writer
+  still passes them — yet a reordered/renamed column breaks the LIVE Kea 3.0.3
+  loader when the promoted node reads the standby's pre-seeded memfile
+  (positional CSV; the #2261 byte-exactness residual). New
+  `TestKeaMemfileHeadersMatchKea30xSchema` (pkg/dhcpserver/lease_sync_test.go)
+  hard-codes the exact Kea 3.0.x lease4 (12-col) and lease6 (18-col) headers as
+  LITERAL strings — NOT built from the production const — and asserts
+  `keaMemfileHeader{4,6}` equal them byte-for-byte, plus writes one lease per
+  family and counts the emitted columns against the golden (catches a
+  writer+const co-drift). RED-on-revert VERIFIED: swapping the two trailing
+  empty columns (`hwtype`<->`hwaddr_source`) in the production const — count
+  stays 18, hwaddr stays index 12 — leaves the OLD self-referential test
+  PASSING but FAILS the new golden test (proving it is external ground truth,
+  not a tautology). Also authored `test/incus/dhcp-lease-failover.sh` codifying
+  the lab-gated live smoke steps (knob-ON, dhcp-local-server, client lease,
+  standby memfile byte-exactness gate, hard failover, retention + no-dup-alloc
+  asserts) — NOT wired into `make test`/CI (reboots a shared-cluster node,
+  needs a DHCP-client fixture); the live lease-survives-failover acceptance
+  stays plan-deferred-lab on #2261. go test ./pkg/dhcpserver/... green; go
+  build ./... clean; gofmt + vet clean; bash -n + shellcheck clean.
+- **File(s)**: pkg/dhcpserver/lease_sync_test.go,
+  test/incus/dhcp-lease-failover.sh, pkg/dhcpserver/README.md, _Log.md

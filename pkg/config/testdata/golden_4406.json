@@ -1231,6 +1231,8 @@
       "BridgeDomains": null,
       "Warnings": [
         "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -2467,7 +2469,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -3703,7 +3707,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -4940,6 +4946,8 @@
       "BridgeDomains": null,
       "Warnings": [
         "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -6176,7 +6184,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -7412,7 +7422,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -8370,6 +8382,8 @@
       "BridgeDomains": null,
       "Warnings": [
         "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -9327,7 +9341,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -10284,7 +10300,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -11242,6 +11260,8 @@
       "BridgeDomains": null,
       "Warnings": [
         "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -12199,7 +12219,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
@@ -13156,7 +13178,9 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
-        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
+        "zone \"lan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model.",
+        "zone \"wan\" host-inbound-traffic: host-bound routing multicast (router-discovery (IRDP) 224.0.0.1/224.0.0.2) is currently admitted PACKET-WIDE via the kernel input-chain accept fall-through, not scoped to this zone's ingress interface — a known Junos-parity gap (#4455), pending the per-zone iifname multicast admission model."
       ]
     },
     "error": ""
