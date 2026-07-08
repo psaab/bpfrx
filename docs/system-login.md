@@ -159,16 +159,24 @@ pre-execution fsync (an *interrupted* wipe still leaves the record on disk) plus
 any remote syslog collector. See the configstore README "Audit journal" section
 for the record format.
 
-**Factory-reset erasure (#4576).** `zeroize` is a security primitive: it must
-leave no prior-tenant config or secret material on disk (RMA / resale /
-re-tenant). The wipe removes the `.configdb` SSOT (`active.json`,
-`candidate.json`, `rollback.N.json`) and **`master.key` first** (so an
-interrupted wipe cannot leave AES-GCM ciphertext behind next to the key that
-decrypts it), the numbered text rollback slots `<config>.N` (full config text
-with cleartext secret leaves — reloaded at boot by `loadRollbackHistory`), the
-top-level `.conf` files (live config + `rescue.conf`), and `.config.journal`
+**Factory-reset erasure (#4576).** `zeroize` erases the xpf configuration
+**state** so the prior tenant's committed config + secrets are not reloaded on
+the next boot (RMA / resale / re-tenant). The wipe removes the `.configdb` SSOT
+(`active.json`, `candidate.json`, `rollback.N.json`) and **`master.key` first**
+(so an interrupted wipe cannot leave AES-GCM ciphertext behind next to the key
+that decrypts it), the numbered text rollback slots `<config>.N` (full config
+text with cleartext secret leaves — reloaded at boot by `loadRollbackHistory`),
+the top-level `.conf` files (live config + `rescue.conf`), and `.config.journal`
 (+ rotated segments). A wipe that cannot fully erase this state returns an error
 rather than reporting a clean factory reset.
+
+The wipe erases that SSOT/rollback/journal state **directly**. The **rendered
+service configs** xpfd writes outside `/etc/xpf` — `/etc/frr/frr.conf` (0644,
+BGP-MD5 / OSPF / IS-IS auth secrets), `/etc/swanctl/conf.d/*` (IKE PSKs),
+`/etc/kea/kea-dhcp{4,6}.conf` — are **not** removed by the wipe itself; they are
+reset on the **completing reboot** when the daemon reconciles to the empty
+config. Erasing them in the wipe itself (closing the window between wipe and
+reboot) is tracked as follow-up **#4585**.
 
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`

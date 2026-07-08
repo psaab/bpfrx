@@ -763,12 +763,20 @@ const (
 	defaultConfigBase = "xpf.conf"
 )
 
-// zeroizeConfigDir erases every xpf-authored configuration artifact under
-// configDir as part of a factory reset (#4576). This is a security primitive:
-// after it returns cleanly, no prior-tenant config or secret material remains
-// on disk, so a device pulled for RMA / resale / re-tenant does not leak the
-// previous owner's policy, IKE PSKs, WireGuard private keys, or SNMP
-// communities.
+// zeroizeConfigDir erases the xpf configuration STATE under configDir as part
+// of a factory reset (#4576): the .configdb SSOT + master.key, the numbered
+// text rollback slots, the top-level .conf files, and the audit journal — the
+// artifacts that persist the prior tenant's committed policy, IKE PSKs,
+// WireGuard private keys, and SNMP communities and would otherwise be reloaded
+// on the next boot.
+//
+// NOTE (scope, tracked as #4585): this erases the SSOT and rollback/journal
+// state DIRECTLY, but the RENDERED service configs xpfd writes outside
+// configDir — /etc/frr/frr.conf (0644, BGP-MD5/OSPF/ISIS auth), /etc/swanctl/
+// conf.d/* (IKE PSKs), /etc/kea/kea-dhcp{4,6}.conf — are NOT removed here. They
+// are reset on the COMPLETING reboot when the daemon reconciles to the empty
+// config; erasing them in the wipe itself (so the window between wipe and
+// reboot leaks nothing) is the #4585 follow-up.
 //
 // The artifacts removed (configBase is the config file's base name, e.g.
 // "xpf.conf", used to recognize the numbered text rollback slots):
