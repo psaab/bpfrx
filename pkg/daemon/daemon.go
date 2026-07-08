@@ -21,7 +21,6 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
-	"github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcprelay"
 	"github.com/psaab/xpf/pkg/dhcpserver"
@@ -104,43 +103,16 @@ type Daemon struct {
 	// loop) so a hung DNS server can never wedge the loop or starve the
 	// nudge channel.
 	ddnsReconcileInFlight atomic.Bool
-	// surfaceA is the always-on Surface A router/interface-address DDNS manager
-	// (#2691 P2). It publishes THIS firewall's own learned interface addresses
-	// (DHCP-lease / static / netlink) as configured FQDNs through the
-	// `system services dynamic-dns` provider catalog, reusing the pkg/ddns
-	// spine (the same Backend, record, ScopeKey, durable-state primitives). It
-	// is constructed unconditionally so a binding removal always has a running
-	// loop to withdraw; the loop is netlink + DNS-network only (no control
-	// socket), gated to the RG-MASTER per scope, nudged on commit + the #1844
-	// DHCP gateway/address-change hook + MASTER transition.
-	surfaceA *ddns.SurfaceAManager
-	// surfaceAReconcileNowCh / surfaceAReconcileInFlight mirror the ddns* pair:
-	// a depth-1 nudge channel + a no-freeze skip-if-in-flight guard.
-	surfaceAReconcileNowCh    chan struct{}
-	surfaceAReconcileInFlight atomic.Bool
-	// surfaceACheckIPAllowlistWarned dedups the once-per-(provider,allowlist)
-	// runtime log emitted when ddns.ParseAllowlistChecked drops a malformed
-	// checkip-allowlist token (#2839). The observer runs per poll-tick, so the
-	// drop must not log every tick. Keyed by "<provider>\x00<allowlist-string>"
-	// so a corrected commit re-arms the warning.
-	surfaceACheckIPAllowlistWarned sync.Map
-	// surfaceACheckIPSourceBindWarned dedups the once-per-(provider,bind-error)
-	// runtime log emitted when the checkip probe fails CLOSED because the
-	// provider's configured source-address failed to parse (#3733). That parse
-	// failure is the ONLY bind-resolution error CheckIPClient returns; a dead
-	// destination-interface / VRF surfaces later as a dial error inside CheckIP
-	// (already ok=false), not here. The observer runs per poll-tick, so a
-	// persistent misconfig must not log every tick. Keyed by
-	// "<provider>\x00<bind-error>" so a corrected commit re-arms the warning.
-	surfaceACheckIPSourceBindWarned sync.Map
-	// surfaceACheckIPNoURLWarned dedups the once-per-provider runtime log emitted
-	// when a binding selects `address-source checkip` but the referenced provider
-	// carries no checkip-url (#4423 H08). Before the fix the runtime silently fell
-	// back to the interface address (publishing the WRONG address); now the source
-	// stays checkip and the observer skips (fail-closed) while surfacing this WARN
-	// once per provider so the operator sees why nothing publishes. Keyed by the
-	// provider name so a corrected commit (url added) re-arms the warning.
-	surfaceACheckIPNoURLWarned sync.Map
+	// surfaceA groups the always-on Surface A (router/interface-address) DDNS
+	// manager plus its reconcile-supervision + per-warning-dedup state. This is
+	// increment 5 of the #4407 Daemon god-struct decomposition — pure field
+	// grouping, no behavior/locking change; every field keeps its exact type and
+	// access contract and is reached as d.surfaceA.<field>. See surfaceAState in
+	// daemon_ddns_surface_a.go (the file that owns the reconcile loop). Surface B
+	// — the DHCP-lease ddns* manager above — stays a set of flat Daemon fields:
+	// it is a DIFFERENT DDNS mechanism, exactly the two-mechanism split increment
+	// 1's note anticipated when it kept the mirrored ddnsReconcile* fields flat.
+	surfaceA surfaceAState
 	// #2239 HA DHCP-server lease sync (PATH C). These fields were grouped
 	// into dhcpLeaseSyncState (see daemon_dhcp_lease_sync.go) as increment 1
 	// of the #4407 Daemon god-struct decomposition — grouping only, no
@@ -762,7 +734,7 @@ func New(opts Options) (*Daemon, error) {
 		blackholeRoutes:            make(map[int][]netlink.Route),
 		reconcileNowCh:             make(chan struct{}, 1),
 		ddnsReconcileNowCh:         make(chan struct{}, 1),
-		surfaceAReconcileNowCh:     make(chan struct{}, 1),
+		surfaceA:                   surfaceAState{reconcileNowCh: make(chan struct{}, 1)},
 		dhcpLeaseSync:              dhcpLeaseSyncState{nowCh: make(chan struct{}, 1)},
 		ipsecSANudgeCh:             make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
