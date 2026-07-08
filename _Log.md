@@ -42201,3 +42201,56 @@ top.
   pkg/cli/show_services_dhcp.go (new), pkg/cli/show_services_snmp.go (new),
   pkg/cli/show_services_lldp.go (new), pkg/cli/show_services_mirror.go (new),
   pkg/cli/README.md, docs/system-login.md, _Log.md
+
+## 2026-07-08 — #4659 refactor: split pkg/daemon/daemon_ha_userspace.go (1123 LOC)
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4659 refactor — split pkg/daemon/daemon_ha_userspace.go
+  (1123 LOC) by concern. The file interleaved four distinct concerns of
+  the userspace-dataplane HA control path — wire delta<->session
+  conversion, the delta stream/drain/queue loop, bulk session export,
+  and takeover/demotion readiness + failover barriers — which made the
+  ACK/withhold and barrier logic hard to read next to the endian/NAT
+  conversion helpers. This is a class-B HA control path, so the split is
+  PURE code motion: every top-level declaration moved verbatim, no
+  behavior change. Grouped into four sibling files in package daemon —
+  daemon_ha_userspace_convert.go (16 decls: buildZoneIDs + endian/NAT/MAC
+  helpers + userspaceSessionFromDeltaV4/V6 + forward-wire alias/key
+  builders), daemon_ha_userspace_stream.go (11 decls: the drainer/event-
+  stream provider interfaces + shouldSyncUserspaceDelta filter +
+  syncUserspaceSessionDeltas/runUserspaceEventStream/
+  wireUserspaceEventStreamCallbacks/handleEventStreamDelta/
+  handleEventStreamFullResync/eventStreamFallbackLoop +
+  queueUserspaceSessionDeltas + drainUserspaceSessionDeltasWithConfig),
+  daemon_ha_userspace_export.go (4 decls: exporter interfaces +
+  primaryOwnerRGIDs + exportUserspaceOwnerRGSessionsWithConfig), and
+  daemon_ha_userspace_readiness.go (18 decls: mode/takeover/transfer-
+  readiness + HA-protocol-mismatch interfaces + the demotion-prep
+  suppression-window methods + prepareUserspaceRGDemotionWithTimeout
+  barrier + manual-failover wrappers + userspaceDataplaneActive/
+  userspaceRGConfigured/checkUserspaceTakeoverReadiness).
+  daemon_ha_userspace.go stays as the shared shell (3 decls:
+  userspaceXSKBindingController interface, buildZoneRGMap, rgHasRETH).
+  LOAD-BEARING invariants preserved byte-identical: the delta-slice
+  behavior, the ACK/withhold return semantics of handleEventStreamDelta
+  (false only for transient readiness gaps so the helper replays), the
+  userspaceDeltaSyncMu (delta drain) vs userspaceDemotionPrepMu
+  (demotion suppression window) lock separation, and the failover
+  peer-barrier logic — the split moves methods, not the lock discipline.
+  Same package, so all unexported symbols (buildZoneIDs consumed by
+  stream/export, the exporter interfaces used by daemon_ha_sync.go,
+  buildZoneRGMap/rgHasRETH used by daemon_apply.go/daemon_ha_vip.go and
+  tests) stay reachable. Verified byte-for-byte against origin/master via
+  a go/parser decl-diff: 52 top-level declarations, identical=52, 0
+  bodydiff / 0 missing / 0 extra (import lists differ per file as
+  expected and are excluded from the diff). go build ./... clean, go vet
+  ./pkg/daemon/... clean, go test ./pkg/daemon/... green (the userspace-
+  sync + HA-sync semantic tests are the gate — all pass). No design/doc
+  change needed: pkg/daemon/README.md has no per-file layout entry for
+  this file (it describes behavior, not a file index), and the split is
+  behavior-identical.
+  **File(s)**: pkg/daemon/daemon_ha_userspace.go (trimmed to shared
+  shell), pkg/daemon/daemon_ha_userspace_convert.go (new),
+  pkg/daemon/daemon_ha_userspace_stream.go (new),
+  pkg/daemon/daemon_ha_userspace_export.go (new),
+  pkg/daemon/daemon_ha_userspace_readiness.go (new), _Log.md
