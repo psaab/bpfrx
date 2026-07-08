@@ -26,9 +26,18 @@ converged, the fork resolved as recommended:
   `zone_counters_hide_test.go` suites in `pkg/dataplane`, `pkg/api`,
   `pkg/cli`, and `pkg/grpcapi`.
 
-- **POPULATE (§5A) is DEFERRED under #3651** — this document is its design
-  of record. VERIFY-FIRST on master: the userspace dataplane does **not**
-  publish per-zone traffic or flood counters over the wire. `ProcessStatus`
+- **POPULATE traffic (§5A) SHIPPED under #3651; per-zone flood still deferred.**
+  This document is its design of record. The Rust helper now accounts per-zone
+  ingress/egress packet+byte volume on the forward hot path (flat `[u8; 65536]`
+  zone-id → slot LUT + per-worker thread-local coalescer in
+  `userspace-dp/src/afxdp/zone_counters.rs`), pre-sums across workers into the
+  `ProcessStatus.zone_traffic_counters` sparse block (layout version 1), and the
+  Go status poll mirrors it into the zone-counter offset map via
+  `SetZoneCounterOffset` so `show security zones` / REST / Prometheus report
+  live volume; a `clear_zone_counters` IPC resets the helper store. The lower-
+  value per-zone FLOOD half stays deferred (lean on the #3343 aggregate). The
+  historical VERIFY-FIRST note below described the pre-#3651 master where the
+  userspace dataplane did **not** publish per-zone traffic or flood counters. `ProcessStatus`
   (`pkg/dataplane/userspace/protocol.go`) carries no per-zone block, and the
   Go-side POPULATE hook — `SetZoneCounterOffset` / `SetFloodCounterOffset`
   plus the `ClearZoneCounterOffsets` / `ClearFloodCounterOffsets` resets on

@@ -283,6 +283,18 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.policy_rule_counters = state.afxdp.policy_rule_counters();
     state.status.nat_rule_counters = state.afxdp.nat_rule_counters();
     state.status.filter_term_counters = state.afxdp.filter_term_counters();
+    // #3651: publish the pre-summed per-zone traffic block. Stamp the layout
+    // version only when there is data (rows or overflow) so a helper with no
+    // configured/active zones keeps the wire omitted (cold-path convention).
+    state.status.zone_traffic_counters = state.afxdp.zone_traffic_counters();
+    state.status.zone_counter_overflow_active = state.afxdp.zone_counter_overflow_active();
+    state.status.zone_counter_layout_version = if state.status.zone_traffic_counters.is_empty()
+        && !state.status.zone_counter_overflow_active
+    {
+        0
+    } else {
+        state.afxdp.zone_counter_layout_version()
+    };
     state.status.three_color_policer_counters = state.afxdp.three_color_policer_counters();
     state.status.source_nat_pools = state.afxdp.source_nat_pool_statuses();
     let (flow_worker_map, flow_worker_map_truncated) = state.afxdp.flow_worker_map();

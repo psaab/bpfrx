@@ -835,6 +835,21 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 			Bytes:   c.Bytes,
 		})
 	}
+
+	// #3651: mirror the helper's pre-summed per-zone traffic totals into the
+	// bpfShim zone-counter offset map so Manager.ReadZoneCounters (and thus
+	// `show security zones` Traffic statistics, REST /security/zones, and the
+	// Prometheus collector) reports live per-zone volume instead of
+	// ErrCounterNotPopulated ("not available"). The helper reports cumulative
+	// totals keyed by the stable zone id; SetZoneCounterOffset stores them
+	// absolutely (overwrite), reset-safe on helper restart.
+	for i := range status.ZoneTrafficCounters {
+		z := &status.ZoneTrafficCounters[i]
+		m.bpfShim.SetZoneCounterOffset(z.ZoneID,
+			dataplane.CounterValue{Packets: z.IngressPackets, Bytes: z.IngressBytes},
+			dataplane.CounterValue{Packets: z.EgressPackets, Bytes: z.EgressBytes},
+		)
+	}
 }
 
 // safeDelta returns cur - prev. On counter reset (prev > cur), returns cur

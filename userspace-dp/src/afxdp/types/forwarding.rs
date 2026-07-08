@@ -275,6 +275,18 @@ pub(in crate::afxdp) struct ForwardingState {
     /// via `lookup_slot`. Rotated via the ForwardingState ArcSwap.
     pub(in crate::afxdp) cold_path_slot_map:
         std::sync::Arc<crate::afxdp::cold_path_hist::ColdPathSlotMap>,
+    /// #3651: flat zone-id → hot-path slot LUT for per-zone traffic counters,
+    /// rebuilt from the configured zone set at each config apply. Read on every
+    /// forwarded packet via `record_zone_traffic` (two array reads, no hash).
+    /// Rotated via the ForwardingState ArcSwap alongside `cold_path_slot_map`.
+    pub(in crate::afxdp) zone_counter_slot_map:
+        std::sync::Arc<crate::afxdp::zone_counters::ZoneCounterSlotMap>,
+    /// #3651: coordinator-owned cumulative per-zone traffic totals. Keyed by
+    /// stable zone id, `Clone` shares the inner `Arc<Mutex>`, so cloning this
+    /// state (worker publish) and carrying it forward across config applies
+    /// (`forwarding_build`) keeps totals alive until the operator
+    /// `clear_zone_counters` IPC resets them.
+    pub(in crate::afxdp) zone_counter_store: crate::afxdp::zone_counters::ZoneCounterStore,
 }
 
 /// #3070/#3405: a zone's compiled host-inbound-traffic admission set. Built from
@@ -412,6 +424,19 @@ impl ForwardingState {
     /// unconfigured / unknown zone (e.g. `0`) is always tcp-rst off.
     pub(in crate::afxdp) fn zone_tcp_rst_enabled(&self, zone_id: u16) -> bool {
         self.zone_tcp_rst.get(&zone_id).copied().unwrap_or(false)
+    }
+
+    /// #3651: the egress (to) zone id for `egress_ifindex`, or `0` when the
+    /// interface is unknown / unzoned. Mirrors the egress half of
+    /// `zone_pair_ids_for_flow_with_override`; used by the per-zone traffic
+    /// counter (`record_zone_traffic`) on the forward path where only the
+    /// egress ifindex (not zone) is in hand.
+    #[inline]
+    pub(in crate::afxdp) fn egress_zone_id(&self, egress_ifindex: i32) -> u16 {
+        self.egress
+            .get(&egress_ifindex)
+            .map(|iface| iface.zone_id)
+            .unwrap_or(0)
     }
 
     /// #3618: the per-zone `reject` rate-limit bucket for ingress (from) zone

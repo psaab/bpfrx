@@ -921,7 +921,8 @@
     "worker_command_queue_poison_recoveries": 0,
     "worker_heartbeats": [],
     "worker_runtime": [],
-    "workers": 0
+    "workers": 0,
+    "zone_traffic_counters": []
   },
   "queue_control_request": {
     "armed": false,
@@ -1227,5 +1228,12 @@
     "id": 0,
     "name": "",
     "tcp_rst": false
+  },
+  "zone_traffic_counter_status": {
+    "egress_bytes": 0,
+    "egress_packets": 0,
+    "ingress_bytes": 0,
+    "ingress_packets": 0,
+    "zone_id": 0
   }
 }

@@ -364,6 +364,23 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         let (slot_map, _slots_to_zero) = ColdPathSlotMap::build(prev_map, &pairs);
         state.cold_path_slot_map = std::sync::Arc::new(slot_map);
     }
+    // #3651: build the per-zone traffic-counter slot map from the configured
+    // zone set and carry the cumulative store forward from the previous state
+    // (first apply creates it) so totals survive config commits. Unlike the
+    // cold-path histogram, the store is zone-id keyed, so the slot map is a
+    // plain rebuild with no previous-map retention / slot zero-out.
+    {
+        use crate::afxdp::zone_counters::{ZoneCounterSlotMap, ZoneCounterStore};
+        let zone_ids: Vec<u16> = snapshot.zones.iter().map(|z| z.id).collect();
+        state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids));
+        state.zone_counter_store = previous
+            .map(|p| p.zone_counter_store.clone())
+            .unwrap_or_else(ZoneCounterStore::default);
+        // Drop totals for zones no longer configured (memory hygiene; the
+        // status accessor also filters to configured zones).
+        let configured: rustc_hash::FxHashSet<u16> = zone_ids.iter().copied().collect();
+        state.zone_counter_store.reconcile(&configured);
+    }
     // Build filter state from snapshot. #2505: this is fallible — an
     // unresolvable `from protocol` token raises a SnapshotIntegrityError that
     // propagates here, aborting the reconcile preflight (before teardown /

@@ -22,6 +22,28 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 3;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
+/// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level
+/// `zone_traffic_counters` sparse block. `zone_id` is the stable name-hash
+/// zone id (`StableZoneID`, matching `ZoneSnapshot.id`); ingress totals count
+/// packets/bytes that entered the firewall through an interface in the zone,
+/// egress totals count packets/bytes that left through one. Totals are
+/// cumulative since helper start (or the last `clear_zone_counters` IPC). The
+/// Go mirror is `ZoneTrafficCounterStatus` with json tags
+/// `zone_id`/`ingress_packets`/`ingress_bytes`/`egress_packets`/`egress_bytes`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct ZoneTrafficCounterStatus {
+    #[serde(rename = "zone_id", default)]
+    pub zone_id: u16,
+    #[serde(rename = "ingress_packets", default)]
+    pub ingress_packets: u64,
+    #[serde(rename = "ingress_bytes", default)]
+    pub ingress_bytes: u64,
+    #[serde(rename = "egress_packets", default)]
+    pub egress_packets: u64,
+    #[serde(rename = "egress_bytes", default)]
+    pub egress_bytes: u64,
+}
+
 /// Maximum accepted size, in bytes, of a single newline-delimited
 /// control-socket request body before it is decoded (#2523).
 ///
@@ -492,6 +514,32 @@ pub(crate) struct ProcessStatus {
     pub nat_rule_counters: Vec<NatRuleCounterStatus>,
     #[serde(rename = "filter_term_counters", default)]
     pub filter_term_counters: Vec<FirewallFilterTermCounterStatus>,
+    /// #3651: per-zone ingress/egress traffic (packet + byte) volume, summed
+    /// across every worker/binding by the helper (`ProcessStatus`-level
+    /// pre-summed sparse block — one row per zone with nonzero traffic, keyed
+    /// by the stable zone id). The Go control plane mirrors each row into the
+    /// legacy `dataplane.Manager` zone-counter offset map via
+    /// `SetZoneCounterOffset`, so `show security zones` (Traffic statistics),
+    /// the REST `/security/zones` endpoint, and the Prometheus collector report
+    /// live per-zone volume instead of `ErrCounterNotPopulated` ("not
+    /// available"). `zone_counter_layout_version` selects the decode path
+    /// (0/absent = pre-#3651 helper, no per-zone data); a nonzero
+    /// `zone_counter_overflow_active` means the configured zone count exceeded
+    /// the helper's dense hot-path slot capacity and some zones went uncounted.
+    #[serde(
+        rename = "zone_counter_layout_version",
+        default,
+        skip_serializing_if = "crate::protocol::u32_is_zero"
+    )]
+    pub zone_counter_layout_version: u32,
+    #[serde(
+        rename = "zone_counter_overflow_active",
+        default,
+        skip_serializing_if = "crate::protocol::bool_is_false"
+    )]
+    pub zone_counter_overflow_active: bool,
+    #[serde(rename = "zone_traffic_counters", default)]
+    pub zone_traffic_counters: Vec<ZoneTrafficCounterStatus>,
     #[serde(rename = "three_color_policer_counters", default)]
     pub three_color_policer_counters: Vec<ThreeColorPolicerStatus>,
     #[serde(rename = "source_nat_pools", default)]

@@ -1551,6 +1551,64 @@ fn app_catalog_entry_roundtrip() {
 // control-plane consumption gate.
 // ---------------------------------------------------------------------------
 
+// #3651: the per-zone traffic block round-trips both directions and a
+// default (no per-zone data) ProcessStatus omits the layout-version /
+// overflow keys. The Go mirror lives in
+// pkg/dataplane/userspace/zone_counters_status_test.go.
+#[test]
+fn zone_traffic_counters_wire_roundtrip_and_default_omits() {
+    // Default helper: no zone data -> version/overflow omitted from the wire.
+    let default_status = ProcessStatus::default();
+    let body = serde_json::to_string(&default_status).expect("serialize default ProcessStatus");
+    assert!(
+        !body.contains("zone_counter_layout_version"),
+        "default ProcessStatus must omit zone_counter_layout_version: {body}"
+    );
+    assert!(
+        !body.contains("zone_counter_overflow_active"),
+        "default ProcessStatus must omit zone_counter_overflow_active: {body}"
+    );
+
+    // Populated block round-trips (Rust encode -> JSON -> Rust decode).
+    let mut status = ProcessStatus::default();
+    status.zone_counter_layout_version = 1;
+    status.zone_counter_overflow_active = true;
+    status.zone_traffic_counters = vec![ZoneTrafficCounterStatus {
+        zone_id: 40000,
+        ingress_packets: 10,
+        ingress_bytes: 1500,
+        egress_packets: 4,
+        egress_bytes: 600,
+    }];
+    let json = serde_json::to_string(&status).expect("serialize populated ProcessStatus");
+    let back: ProcessStatus = serde_json::from_str(&json).expect("deserialize ProcessStatus");
+    assert_eq!(back.zone_counter_layout_version, 1);
+    assert!(back.zone_counter_overflow_active);
+    assert_eq!(back.zone_traffic_counters.len(), 1);
+    let z = &back.zone_traffic_counters[0];
+    assert_eq!(z.zone_id, 40000);
+    assert_eq!(z.ingress_packets, 10);
+    assert_eq!(z.ingress_bytes, 1500);
+    assert_eq!(z.egress_packets, 4);
+    assert_eq!(z.egress_bytes, 600);
+
+    // A Go-style payload (zone fields injected into an otherwise-default
+    // ProcessStatus so every required field is present) decodes into the zone
+    // struct — mirrors the Go encode side / a mixed-version helper.
+    let mut v = serde_json::to_value(ProcessStatus::default()).expect("default to value");
+    v["zone_counter_layout_version"] = serde_json::json!(1);
+    v["zone_traffic_counters"] = serde_json::json!([
+        {"zone_id": 7, "ingress_packets": 2, "ingress_bytes": 200,
+         "egress_packets": 1, "egress_bytes": 100}
+    ]);
+    let decoded: ProcessStatus =
+        serde_json::from_value(v).expect("decode Go-style zone payload");
+    assert_eq!(decoded.zone_counter_layout_version, 1);
+    assert_eq!(decoded.zone_traffic_counters.len(), 1);
+    assert_eq!(decoded.zone_traffic_counters[0].zone_id, 7);
+    assert_eq!(decoded.zone_traffic_counters[0].egress_bytes, 100);
+}
+
 #[test]
 fn wire_invariant_default_specimens() {
     use serde_json::{Map, Value};
@@ -1633,6 +1691,7 @@ fn wire_invariant_default_specimens() {
     s.insert("userspace_capabilities".into(), dump(&UserspaceCapabilities::default()));
     s.insert("worker_runtime_status".into(), dump(&WorkerRuntimeStatus::default()));
     s.insert("zone_snapshot".into(), dump(&ZoneSnapshot::default()));
+    s.insert("zone_traffic_counter_status".into(), dump(&ZoneTrafficCounterStatus::default()));
     let specimens = Value::Object(s);
 
     let actual = serde_json::to_string_pretty(&specimens)

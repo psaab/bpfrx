@@ -840,6 +840,40 @@ impl Coordinator {
         self.nat_counters.clear();
     }
 
+    /// #3651: per-zone ingress/egress traffic-volume snapshot for
+    /// `ProcessStatus.zone_traffic_counters`, filtered to currently-configured
+    /// zones so a zone removed between the worker fold and this status build
+    /// never surfaces. Empty when no configured zone has moved traffic yet.
+    pub fn zone_traffic_counters(&self) -> Vec<crate::protocol::ZoneTrafficCounterStatus> {
+        let configured = &self.forwarding.zone_id_to_name;
+        self.forwarding
+            .zone_counter_store
+            .snapshot()
+            .into_iter()
+            .filter(|s| configured.contains_key(&s.zone_id))
+            .collect()
+    }
+
+    /// #3651: true when the configured zone count exceeded the hot-path slot
+    /// capacity, so some zones are silently uncounted (surfaced on the wire as
+    /// `zone_counter_overflow_active`).
+    pub fn zone_counter_overflow_active(&self) -> bool {
+        self.forwarding.zone_counter_slot_map.overflow_active
+    }
+
+    /// #3651: the zone-counter wire layout version this helper emits.
+    pub fn zone_counter_layout_version(&self) -> u32 {
+        crate::afxdp::zone_counters::ZONE_COUNTER_LAYOUT_VERSION
+    }
+
+    /// #3651: operator clear of per-zone traffic counters. Resets the helper's
+    /// cumulative store so the Go side's absolute `SetZoneCounterOffset`
+    /// overwrite reports 0 instead of snapping the pre-clear total back on the
+    /// next 1 s status poll (the load-bearing half of the operator clear).
+    pub fn clear_zone_counters(&self) {
+        self.forwarding.zone_counter_store.clear();
+    }
+
     /// Current in-memory FIB generation (the value flow-cache lookups
     /// validate against). Read by the `bump_fib_generation` control handler
     /// to build a rollback-rejection error and by tests.
