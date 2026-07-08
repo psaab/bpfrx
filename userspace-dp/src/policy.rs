@@ -1896,6 +1896,37 @@ impl CompiledApplications {
         }
         best.map(|(_, timeout)| timeout)
     }
+
+    /// #4569: does this app set carry at least one term for `protocol` whose
+    /// match is GATED by L4 presence — i.e. a term that `matches(..)` fails
+    /// closed for a flowless / no-L4 packet (a non-first fragment, l4_present
+    /// == false)? These are: an exact destination-port term, a port-RANGE term
+    /// (non-empty src or dst ranges), or an ICMP/ICMPv6 type[,code] constraint.
+    /// A PROTOCOL-ONLY term (empty ranges) and `application any` are NOT gated
+    /// (they still match a flowless packet on the known protocol), so they
+    /// return `false`.
+    ///
+    /// This is the discriminator the fragment-association fail-closed guard
+    /// (`rule_is_skipped_frag_ambiguous_deny`) uses to tell a DENY that was
+    /// SKIPPED for a flowless fragment ONLY because its L4-constrained term is
+    /// inapplicable (→ fail closed the fragment) from a DENY that genuinely
+    /// does not apply to this protocol at all (→ let the fragment proceed).
+    fn has_l4_constrained_term(&self, protocol: u8) -> bool {
+        if self.match_any {
+            return false;
+        }
+        match self.by_protocol.get(&protocol) {
+            None => false,
+            Some(terms) => {
+                !terms.exact_dst_ports.is_empty()
+                    || terms
+                        .range_terms
+                        .iter()
+                        .any(|(_, src, dst, _)| !(src.is_empty() && dst.is_empty()))
+                    || !terms.icmp_constraints.is_empty()
+            }
+        }
+    }
 }
 
 /// #2008 M5: the L3/L4 application-identification catalog. Resolves a session's
@@ -3415,11 +3446,33 @@ pub(crate) fn evaluate_policy_result_l3_aware(
     // fail-closed (#3065) and wildcard-zone work (#3018); the
     // `junos-global` sentinel (u16::MAX) is a DEFINED global zone, distinct
     // from 0 (unknown), and is unaffected by this guard.
+    //
+    // #4569: fragment-association fail-closed. On the FLOWLESS path
+    // (l4_present == false) a non-first fragment's post-IP bytes are payload,
+    // not an L4 header, so a port-bearing DENY term is gated OFF (matches() ->
+    // None, #3291) and the first-match walk can fall through to a LATER permit
+    // -> the fragment is forwarded, bypassing a DENY the first fragment (with
+    // the real port) WOULD hit. Junos associates a non-first fragment with the
+    // first-fragment's verdict; approximate that secure default: while walking
+    // rules in first-match precedence order below, remember the FIRST
+    // port-bearing DENY whose L3 (zone fixed by the tier bucket + src/dst
+    // address) OVERLAPS this fragment but was skipped ONLY because l4_present ==
+    // false (`note_skipped_frag_deny`). If the walk then lands on a PERMIT (or a
+    // default-permit), OVERRIDE it to DROP and attribute the drop to that DENY
+    // (`apply_frag_deny_override`). Scoped narrowly: a fragment with NO
+    // overlapping skipped DENY still forwards normally, and the L4 path
+    // (l4_present == true) is byte-identical (the note/override are inert). The
+    // documented trade-off is over-drop: a legitimate non-denied-port fragment
+    // from the SAME L3 as an overlapping port-bearing DENY is dropped (the Junos
+    // security-over-availability default). A fragment-association cache keyed on
+    // (src, dst, frag-id) that remembers the first-fragment's exact verdict is
+    // the deferred principled fix (#4569).
+    let mut skipped_frag_deny: Option<SkippedFragDeny> = None;
     if from_id != 0 && to_id != 0 {
         let key = zone_pair_key(from_id, to_id);
         if let Some(indices) = state.zone_pair_index.get(&key) {
             for &idx in indices {
-                if let Some(mut result) = try_match_rule(
+                match try_match_rule(
                     &state.rules[idx],
                     state,
                     src_ip,
@@ -3431,10 +3484,25 @@ pub(crate) fn evaluate_policy_result_l3_aware(
                     packet_len,
                     l4_present,
                 ) {
-                    // #3073: 1-based handle so the fast path can re-count
-                    // every packet of this flow against the same counter.
-                    result.policy_counter_idx = (idx as u32).saturating_add(1);
-                    return result;
+                    Some(mut result) => {
+                        // #3073: 1-based handle so the fast path can re-count
+                        // every packet of this flow against the same counter.
+                        result.policy_counter_idx = (idx as u32).saturating_add(1);
+                        return apply_frag_deny_override(result, skipped_frag_deny);
+                    }
+                    // #4569: remember a port-bearing DENY skipped for this
+                    // flowless fragment so a later PERMIT is failed closed.
+                    None => note_skipped_frag_deny(
+                        &mut skipped_frag_deny,
+                        l4_present,
+                        &state.rules[idx],
+                        idx,
+                        state,
+                        src_ip,
+                        dst_ip,
+                        protocol,
+                        packet_icmp,
+                    ),
                 }
             }
         }
@@ -3479,7 +3547,7 @@ pub(crate) fn evaluate_policy_result_l3_aware(
                 j += 1;
                 v
             };
-            if let Some(mut result) = try_match_rule(
+            match try_match_rule(
                 &state.rules[idx],
                 state,
                 src_ip,
@@ -3491,12 +3559,25 @@ pub(crate) fn evaluate_policy_result_l3_aware(
                 packet_len,
                 l4_present,
             ) {
-                result.policy_counter_idx = (idx as u32).saturating_add(1);
-                return result;
+                Some(mut result) => {
+                    result.policy_counter_idx = (idx as u32).saturating_add(1);
+                    return apply_frag_deny_override(result, skipped_frag_deny);
+                }
+                None => note_skipped_frag_deny(
+                    &mut skipped_frag_deny,
+                    l4_present,
+                    &state.rules[idx],
+                    idx,
+                    state,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    packet_icmp,
+                ),
             }
         }
         for &idx in &state.both_any_indices {
-            if let Some(mut result) = try_match_rule(
+            match try_match_rule(
                 &state.rules[idx],
                 state,
                 src_ip,
@@ -3508,8 +3589,21 @@ pub(crate) fn evaluate_policy_result_l3_aware(
                 packet_len,
                 l4_present,
             ) {
-                result.policy_counter_idx = (idx as u32).saturating_add(1);
-                return result;
+                Some(mut result) => {
+                    result.policy_counter_idx = (idx as u32).saturating_add(1);
+                    return apply_frag_deny_override(result, skipped_frag_deny);
+                }
+                None => note_skipped_frag_deny(
+                    &mut skipped_frag_deny,
+                    l4_present,
+                    &state.rules[idx],
+                    idx,
+                    state,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    packet_icmp,
+                ),
             }
         }
         for &idx in &state.global_indices {
@@ -3528,7 +3622,7 @@ pub(crate) fn evaluate_policy_result_l3_aware(
             if !rule.global_from_zone.matches(from_id) || !rule.global_to_zone.matches(to_id) {
                 continue;
             }
-            if let Some(mut result) = try_match_rule(
+            match try_match_rule(
                 rule,
                 state,
                 src_ip,
@@ -3540,11 +3634,36 @@ pub(crate) fn evaluate_policy_result_l3_aware(
                 packet_len,
                 l4_present,
             ) {
-                // #3073: 1-based handle (see zone-pair branch above).
-                result.policy_counter_idx = (idx as u32).saturating_add(1);
-                return result;
+                Some(mut result) => {
+                    // #3073: 1-based handle (see zone-pair branch above).
+                    result.policy_counter_idx = (idx as u32).saturating_add(1);
+                    return apply_frag_deny_override(result, skipped_frag_deny);
+                }
+                None => note_skipped_frag_deny(
+                    &mut skipped_frag_deny,
+                    l4_present,
+                    rule,
+                    idx,
+                    state,
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    packet_icmp,
+                ),
             }
         }
+    }
+    // #4569: a flowless fragment that reaches the implicit default policy still
+    // fails closed against a port-bearing DENY it skipped. If the default is
+    // PERMIT and an overlapping DENY was skipped for l4_present == false, drop
+    // and attribute to that DENY rather than counting a default-permit. A
+    // default-DENY/REJECT already drops, so the override only matters for
+    // default-permit; when no deny was skipped this is inert (the L4 path never
+    // records one).
+    if let Some(deny) = skipped_frag_deny
+        && matches!(state.default_action, PolicyAction::Permit)
+    {
+        return frag_associated_deny_result(deny);
     }
     // #3363: count the implicit default-policy verdict on the cold path. For
     // default-DENY this is the ONLY count (a denied flow installs no session,
@@ -3778,51 +3897,30 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
     None
 }
 
-/// Try to match a single policy rule against packet fields.
-/// #1606: walks the literal set + every cited book's dense entry
-/// via `state.books[idx]`. Match-any flags short-circuit the
-/// common "any" case.
+/// Does `rule`'s L3 source+destination address match evaluate to true for this
+/// `(src_ip, dst_ip)` pair? Extracted verbatim from `try_match_rule` so the
+/// fragment-association fail-closed overlap check
+/// (`rule_is_skipped_frag_ambiguous_deny`, #4569) uses the EXACT same address
+/// logic the real match uses.
+///
+/// #2008 H2: when a side is `*-excluded`, the rule matches every address EXCEPT
+/// those in the configured set, so the match-any short-circuit must NOT apply
+/// (it would always-match and the inversion would always-FAIL the side).
+/// Compute the raw "address is in the set" predicate, then XOR with the
+/// excluded flag: matched != excluded.
+///
+/// #2008 fail-open hardening: an `*-excluded` side whose configured set is
+/// EMPTY would invert into match-ALL — a silent security bypass (a rule meant
+/// to exclude one address matches everything). Fail CLOSED only when the set is
+/// empty across BOTH families: that is the genuine typo/parse-drop signal.
+/// #3023: when the packet's family list is empty but the OTHER family is
+/// populated, the operator legitimately listed only one family — an address in
+/// the packet's family is then trivially NOT in the excluded set, so the side
+/// matches. Fail-closing on the per-family empty flag alone over-blocked that
+/// legitimate cross-family case (a v6-only exclusion silently dropped all v4
+/// traffic on a permit rule).
 #[inline]
-fn try_match_rule(
-    rule: &PolicyRule,
-    state: &PolicyState,
-    src_ip: IpAddr,
-    dst_ip: IpAddr,
-    protocol: u8,
-    src_port: u16,
-    dst_port: u16,
-    packet_icmp: Option<(u8, u8)>,
-    packet_len: u64,
-    l4_present: bool,
-) -> Option<PolicyEvaluationResult> {
-    if rule.inactive {
-        return None;
-    }
-    // #3227: `matches` now returns the matched application term's optional
-    // inactivity timeout (`None` outer = no app match → rule does not apply).
-    // #3291: `l4_present` fails port-bearing application terms closed for a
-    // flowless / no-L4 packet (a non-first fragment) — see `matches`.
-    let app_inactivity_timeout =
-        rule.compiled_apps
-            .matches(protocol, src_port, dst_port, packet_icmp, l4_present)?;
-    // #2008 H2: when a side is `*-excluded`, the rule matches every
-    // address EXCEPT those in the configured set, so the match-any
-    // short-circuit must NOT apply (it would always-match and the
-    // inversion would always-FAIL the side). Compute the raw
-    // "address is in the set" predicate, then XOR with the excluded
-    // flag: matched != excluded.
-    //
-    // #2008 fail-open hardening: an `*-excluded` side whose configured
-    // set is EMPTY would invert into match-ALL — a silent security
-    // bypass (a rule meant to exclude one address matches everything).
-    // Fail CLOSED only when the set is empty across BOTH families: that
-    // is the genuine typo/parse-drop signal. #3023: when the packet's
-    // family list is empty but the OTHER family is populated, the
-    // operator legitimately listed only one family — an address in the
-    // packet's family is then trivially NOT in the excluded set, so the
-    // side matches. Fail-closing on the per-family empty flag alone
-    // over-blocked that legitimate cross-family case (a v6-only
-    // exclusion silently dropped all v4 traffic on a permit rule).
+fn rule_l3_matches(rule: &PolicyRule, state: &PolicyState, src_ip: IpAddr, dst_ip: IpAddr) -> bool {
     let (src_ok, dst_ok) = match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             let src_ok = if rule.source_excluded {
@@ -3939,9 +4037,170 @@ fn try_match_rule(
         }
         // (V4 src, V6 dst) has no inbound translation that produces it
         // (NAT46 is not supported), so it never matches — fail closed.
-        _ => return None,
+        _ => return false,
     };
-    if src_ok && dst_ok {
+    src_ok && dst_ok
+}
+
+/// #4569: a port-bearing DENY that a flowless non-first fragment SKIPPED,
+/// remembered while walking rules in first-match precedence order so a later
+/// PERMIT verdict can be overridden to DROP (Junos fragment-association: a
+/// non-first fragment inherits the first-fragment's deny). `policy_id` +
+/// `policy_counter_idx` attribute the resulting DROP to the DENY rule for the
+/// emitted `PolicyDeny` event / hit accounting.
+#[derive(Clone, Copy)]
+struct SkippedFragDeny {
+    policy_id: u32,
+    policy_counter_idx: u32,
+}
+
+/// #4569: is `rule` a port-bearing (L4-constrained) DENY that a FLOWLESS
+/// non-first fragment SKIPPED ONLY because `l4_present == false`, and whose L3
+/// identity OVERLAPS the fragment? (The zone side of the L3 identity is already
+/// fixed by the caller's bucket iteration — this rule is in the zone-pair /
+/// wildcard / global tier being walked for this fragment's zone pair — so only
+/// the source/destination ADDRESS overlap is checked here.)
+///
+/// Returns true iff ALL hold:
+///   - the rule is active and its action is DENY or REJECT (a permit is not a
+///     fail-open risk — first-match would forward it anyway);
+///   - it carries an L4-constrained term for the fragment's protocol
+///     (`has_l4_constrained_term`), so it is a term the fragment cannot be
+///     classified into rather than a rule for a different protocol;
+///   - it does NOT already match this flowless fragment
+///     (`matches(.., false).is_none()`) — a protocol-only / `any` DENY term
+///     matches a fragment directly and is handled as a real deny by
+///     `try_match_rule`, never "skipped";
+///   - its source+destination address set OVERLAPS the fragment
+///     (`rule_l3_matches`).
+///
+/// A non-overlapping DENY, a different-protocol DENY, or a permit therefore
+/// leaves the fragment on its normal (forward) path — the guard is scoped to
+/// exactly the fail-open case.
+fn rule_is_skipped_frag_ambiguous_deny(
+    rule: &PolicyRule,
+    state: &PolicyState,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    packet_icmp: Option<(u8, u8)>,
+) -> bool {
+    if rule.inactive {
+        return false;
+    }
+    if !matches!(rule.action, PolicyAction::Deny | PolicyAction::Reject) {
+        return false;
+    }
+    if !rule.compiled_apps.has_l4_constrained_term(protocol) {
+        return false;
+    }
+    // A protocol-only / `any` term would already match flowlessly → the rule is
+    // a real deny match handled by `try_match_rule`, not a skip. Only treat it
+    // as skipped when it does NOT match with l4_present == false.
+    if rule
+        .compiled_apps
+        .matches(protocol, 0, 0, packet_icmp, false)
+        .is_some()
+    {
+        return false;
+    }
+    rule_l3_matches(rule, state, src_ip, dst_ip)
+}
+
+/// #4569: while walking a flowless fragment through the first-match precedence
+/// tiers, record the FIRST port-bearing DENY with overlapping L3 that was
+/// skipped (see `rule_is_skipped_frag_ambiguous_deny`). No-op when
+/// `l4_present == true` (the L4 path is unaffected) or once a deny is already
+/// recorded (first-match precedence — the earliest shadowing deny wins).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn note_skipped_frag_deny(
+    skipped: &mut Option<SkippedFragDeny>,
+    l4_present: bool,
+    rule: &PolicyRule,
+    idx: usize,
+    state: &PolicyState,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    packet_icmp: Option<(u8, u8)>,
+) {
+    if l4_present || skipped.is_some() {
+        return;
+    }
+    if rule_is_skipped_frag_ambiguous_deny(rule, state, src_ip, dst_ip, protocol, packet_icmp) {
+        *skipped = Some(SkippedFragDeny {
+            policy_id: rule.policy_id,
+            policy_counter_idx: (idx as u32).saturating_add(1),
+        });
+    }
+}
+
+/// #4569: build the fail-closed DENY verdict a flowless fragment inherits from
+/// the port-bearing DENY it skipped. A dropped fragment installs no session, so
+/// the log-selection / timeout fields are inert; `policy_id` attributes the
+/// `PolicyDeny` event to the DENY rule. The DENY rule's own hit counter is left
+/// untouched — the fragment did not match that rule's L4 criteria; the drop is
+/// counted by the caller's `telemetry.dbg.policy_deny`.
+fn frag_associated_deny_result(deny: SkippedFragDeny) -> PolicyEvaluationResult {
+    PolicyEvaluationResult {
+        action: PolicyAction::Deny,
+        policy_id: deny.policy_id,
+        log_session_init: false,
+        log_session_close: false,
+        inactivity_timeout: None,
+        policy_counter_idx: deny.policy_counter_idx,
+    }
+}
+
+/// #4569: override a PERMIT verdict to the fragment-associated DENY when a
+/// port-bearing DENY with overlapping L3 was skipped for this flowless
+/// fragment. Any non-PERMIT verdict (an explicit deny/reject already denies) or
+/// the absence of a skipped deny returns `result` unchanged.
+#[inline]
+fn apply_frag_deny_override(
+    result: PolicyEvaluationResult,
+    skipped: Option<SkippedFragDeny>,
+) -> PolicyEvaluationResult {
+    match skipped {
+        Some(deny) if matches!(result.action, PolicyAction::Permit) => {
+            frag_associated_deny_result(deny)
+        }
+        _ => result,
+    }
+}
+
+/// Try to match a single policy rule against packet fields.
+/// #1606: walks the literal set + every cited book's dense entry
+/// via `state.books[idx]`. Match-any flags short-circuit the
+/// common "any" case.
+#[inline]
+fn try_match_rule(
+    rule: &PolicyRule,
+    state: &PolicyState,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    packet_icmp: Option<(u8, u8)>,
+    packet_len: u64,
+    l4_present: bool,
+) -> Option<PolicyEvaluationResult> {
+    if rule.inactive {
+        return None;
+    }
+    // #3227: `matches` now returns the matched application term's optional
+    // inactivity timeout (`None` outer = no app match → rule does not apply).
+    // #3291: `l4_present` fails port-bearing application terms closed for a
+    // flowless / no-L4 packet (a non-first fragment) — see `matches`.
+    let app_inactivity_timeout =
+        rule.compiled_apps
+            .matches(protocol, src_port, dst_port, packet_icmp, l4_present)?;
+    // The rule's L3 (source + destination address) match, including `*-excluded`
+    // inversion, per-family fail-closed, book membership, and the NAT64
+    // cross-family arm — see `rule_l3_matches`.
+    if rule_l3_matches(rule, state, src_ip, dst_ip) {
         rule.hit_counter.add(packet_len);
         Some(PolicyEvaluationResult {
             action: rule.action,
