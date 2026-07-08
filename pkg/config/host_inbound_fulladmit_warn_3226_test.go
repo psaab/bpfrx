@@ -38,6 +38,7 @@ func Test_3226_SystemServicesAllEmitsFullAdmitAdvisory(t *testing.T) {
 	for _, tok := range []string{"all", "any-service"} {
 		t.Run("zone-level-"+tok, func(t *testing.T) {
 			tree := buildTree(t, []string{
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 				"set security zones security-zone trust interfaces ge-0/0/0.0",
 				"set security zones security-zone trust host-inbound-traffic system-services " + tok,
 			})
@@ -64,6 +65,7 @@ func Test_3226_SystemServicesAllEmitsFullAdmitAdvisory(t *testing.T) {
 // packet-wide full-admit and must draw NO #3226 advisory.
 func Test_3226_SpecificServiceNoAdvisory(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 		"set security zones security-zone trust host-inbound-traffic system-services ssh",
 		"set security zones security-zone trust host-inbound-traffic system-services ping",
@@ -82,6 +84,8 @@ func Test_3226_SpecificServiceNoAdvisory(t *testing.T) {
 // must warn and name BOTH the zone and the interface.
 func Test_3226_PerInterfaceFullAdmitAdvisory(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services all",
 		// a sibling interface with a specific service — must NOT warn.
 		"set security zones security-zone wan interfaces ge-0/0/1.0 host-inbound-traffic system-services ssh",

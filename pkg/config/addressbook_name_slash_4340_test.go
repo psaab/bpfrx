@@ -14,6 +14,8 @@ import "testing"
 // definition AND the policy reference failed at commit.
 func TestAddressBookSlashNameCommits(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0-0-0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces ge-0-0-0",
 		"set security zones security-zone untrust interfaces ge-0-0-1",
 		// v4 and v6 objects named after their prefix (a CIDR value + a `/`
@@ -87,6 +89,8 @@ func TestAddressBookSlashNameCommits(t *testing.T) {
 // it correct while permitting the `/`.
 func TestAddressBookSlashNameZoneLocalFoldRoundTrips(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0-0-0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces ge-0-0-0",
 		"set security zones security-zone untrust interfaces ge-0-0-1",
 		"set security zones security-zone trust address-book address net_172.16.0.0/12 172.16.0.0/12",

@@ -34,6 +34,8 @@ func compileDefaultPolicyFromSet(t *testing.T, cmds []string) *Config {
 // goes RED.
 func TestDefaultPolicyFailsClosed(t *testing.T) {
 	cfg := compileDefaultPolicyFromSet(t, []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces eth1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security zones security-zone untrust interfaces eth1",
 		"set security policies from-zone trust to-zone untrust policy allow-web match source-address any",
@@ -62,6 +64,8 @@ func TestDefaultPolicyExplicitOverrides(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.value, func(t *testing.T) {
 			cfg := compileDefaultPolicyFromSet(t, []string{
+				"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+				"set interfaces eth1 unit 0 family inet address 10.0.1.1/24",
 				"set security zones security-zone trust interfaces eth0",
 				"set security zones security-zone untrust interfaces eth1",
 				"set security policies default-policy " + tc.value,

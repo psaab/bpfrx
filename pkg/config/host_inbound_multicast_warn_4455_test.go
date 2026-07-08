@@ -52,6 +52,7 @@ func Test_4455_MulticastProtocolEmitsPacketWideAdvisory(t *testing.T) {
 	for _, tc := range cases {
 		t.Run("zone-level-"+tc.name, func(t *testing.T) {
 			tree := buildTree(t, []string{
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 				"set security zones security-zone trust interfaces ge-0/0/0.0",
 				"set security zones security-zone trust host-inbound-traffic protocols " + tc.token,
 			})
@@ -81,6 +82,7 @@ func Test_4455_UnicastProtocolNoAdvisory(t *testing.T) {
 	for _, tok := range []string{"bgp", "ldp", "msdp", "bfd"} {
 		t.Run(tok, func(t *testing.T) {
 			tree := buildTree(t, []string{
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 				"set security zones security-zone trust interfaces ge-0/0/0.0",
 				"set security zones security-zone trust host-inbound-traffic protocols " + tok,
 			})
@@ -101,6 +103,7 @@ func Test_4455_UnicastProtocolNoAdvisory(t *testing.T) {
 func Test_4455_NoProtocolsNoAdvisory(t *testing.T) {
 	t.Run("system-services-only", func(t *testing.T) {
 		tree := buildTree(t, []string{
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 			"set security zones security-zone trust interfaces ge-0/0/0.0",
 			"set security zones security-zone trust host-inbound-traffic system-services ssh",
 			"set security zones security-zone trust host-inbound-traffic system-services ping",
@@ -115,6 +118,7 @@ func Test_4455_NoProtocolsNoAdvisory(t *testing.T) {
 	})
 	t.Run("no-host-inbound", func(t *testing.T) {
 		tree := buildTree(t, []string{
+			"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 			"set security zones security-zone trust interfaces ge-0/0/0.0",
 		})
 		cfg, err := CompileConfig(tree)
@@ -133,6 +137,7 @@ func Test_4455_NoProtocolsNoAdvisory(t *testing.T) {
 // multicast admission comes from under `all`).
 func Test_4455_ProtocolsAllExpandsToMulticast(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 		"set security zones security-zone trust host-inbound-traffic protocols all",
 	})
@@ -155,6 +160,8 @@ func Test_4455_ProtocolsAllExpandsToMulticast(t *testing.T) {
 // and name BOTH the zone and the interface.
 func Test_4455_PerInterfaceOverrideAdvisory(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic protocols ospf",
 		// a sibling interface with a unicast protocol — must NOT warn.
 		"set security zones security-zone wan interfaces ge-0/0/1.0 host-inbound-traffic protocols bgp",

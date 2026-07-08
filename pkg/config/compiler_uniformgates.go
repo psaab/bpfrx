@@ -405,6 +405,29 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// ps-review-002 F6 (#4515) zone-interface DEFINED gate. Strict on commit /
+	// commit-check (hard-reject a `security zones security-zone <z> interfaces
+	// <if>` entry naming an interface neither configured under `interfaces` nor
+	// materialized as a dynamic interface — lo0 / an IPsec secure-tunnel
+	// bind-interface; Junos rejects such a zone member, xpf previously only
+	// warned then compiled it, so a typo'd member silently carried no traffic).
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the runtime brings the absent
+	// interface DOWN independently, so the leniently-loaded member is inert).
+	// The reference set is the GENEROUS zoneReferenceableInterfaceBases union so
+	// the promotion cannot false-reject a legitimate lo0 / secure-tunnel
+	// reference (the #4191 over-rejection class). Runs AFTER the zone-interface
+	// membership gate so a duplicate-assignment error still wins the first-error
+	// slot.
+	if err := validateZoneInterfaceDefinedStrict(cfg); err != nil {
+		if opts.lenientZoneInterfaceDefined {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("zone interface defined (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3200 host-inbound-traffic token gate. Strict on commit / commit-check
 	// (hard-reject an unknown/typo system-services or protocols token that
 	// would commit but enforce inconsistently — nft kernel mirror fails OPEN

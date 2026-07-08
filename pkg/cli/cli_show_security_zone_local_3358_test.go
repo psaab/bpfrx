@@ -21,6 +21,8 @@ func zoneLocal3358Config(t *testing.T) *config.Config {
 	t.Helper()
 	tree := &config.ConfigTree{}
 	cmds := []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces eth1 unit 0 family inet address 10.0.2.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security zones security-zone untrust interfaces eth1",
 		// Same name 'web' both globally and zone-locally in trust, with

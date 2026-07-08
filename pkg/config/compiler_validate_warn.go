@@ -428,26 +428,22 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Validate zone interface references
+	// Zone interface references (`security zones security-zone <z> interfaces
+	// <if>` naming an interface not defined under `interfaces`) are validated by
+	// the strict commit gate validateZoneInterfaceDefinedStrict (ps-review-002
+	// F6, #4515): hard-reject on commit / commit-check, downgraded to a warning
+	// on the tolerant load / peer-sync path. The strict gate subsumes the
+	// warn-only loop that previously lived here (it would otherwise emit a
+	// duplicate warning alongside the downgraded gate warning on the lenient
+	// path). Its reference set is the GENEROUS zoneReferenceableInterfaceBases
+	// union (lo0 + IPsec secure-tunnel bases + every configured interface), so it
+	// does NOT false-reject a daemon-materialized dynamic-interface reference.
+	//
+	// configuredIfaces (the naive cfg.Interfaces.Interfaces set) is retained for
+	// the routing-instance interface warn below, which stays warn-only.
 	configuredIfaces := make(map[string]bool)
 	for name := range cfg.Interfaces.Interfaces {
 		configuredIfaces[name] = true
-	}
-	for zoneName, zone := range cfg.Security.Zones {
-		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
-			continue
-		}
-		for _, ifName := range zone.Interfaces {
-			// Strip unit suffix (e.g. "trust0.0" -> "trust0")
-			base := ifName
-			if idx := strings.Index(ifName, "."); idx > 0 {
-				base = ifName[:idx]
-			}
-			if !configuredIfaces[base] {
-				warnings = append(warnings, fmt.Sprintf(
-					"zone %q: interface %q not in interfaces config", zoneName, ifName))
-			}
-		}
 	}
 
 	// Validate scheduler references in policies

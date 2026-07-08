@@ -65,6 +65,15 @@ security {
 func TestHostInboundDupBlock4544InterfaceMerges(t *testing.T) {
 	// Junos / load-override interface block spelling (`interfaces { ifN { ... } }`).
 	tree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {
@@ -174,6 +183,15 @@ security {
 
 	// Interface-level single block (Junos block spelling).
 	itree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {

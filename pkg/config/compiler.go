@@ -992,6 +992,24 @@ type compileOpts struct {
 	// loaded config forwards exactly as before, just with an operator-visible
 	// warning. Same doctrine as lenientPolicyZoneRefs.
 	lenientZoneInterfaceMembership bool
+	// lenientZoneInterfaceDefined (ps-review-002 F6, #4515) downgrades the
+	// zone-interface DEFINED gate (validateZoneInterfaceDefinedStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a `security zones security-zone <z>
+	// interfaces <if>` entry that names an interface which is neither configured
+	// under `interfaces` nor a daemon-materialized dynamic interface (lo0 / an
+	// IPsec secure-tunnel bind-interface) — Junos rejects such a zone member,
+	// whereas xpf previously only warned then compiled it (the runtime brings the
+	// absent interface DOWN, so it is fail-closed but silent). The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 no-brick);
+	// on that path behavior is unchanged (the unresolved member carries no
+	// traffic), just with an operator-visible warning. The reference set is the
+	// GENEROUS zoneReferenceableInterfaceBases union (lo0 + IPsec secure-tunnel
+	// bases + every configured interface) so the promotion cannot false-reject a
+	// legitimate dynamic-interface reference (the #4191 over-rejection class).
+	// Same doctrine as lenientZoneInterfaceMembership.
+	lenientZoneInterfaceDefined bool
 	// lenientHostInboundTokens (#3200) downgrades the host-inbound-traffic
 	// token gate (validateHostInboundTokensStrict) from a hard compile error
 	// to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1618,6 +1636,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRoutingInstanceTableIDCollision: true,
 		lenientAddressBookNames:                true,
 		lenientZoneInterfaceMembership:         true,
+		lenientZoneInterfaceDefined:            true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,
 		lenientDestNATAddresses:                true,
@@ -1866,6 +1885,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRoutingInstanceTableIDCollision: true,
 		lenientAddressBookNames:                true,
 		lenientZoneInterfaceMembership:         true,
+		lenientZoneInterfaceDefined:            true,
 		lenientHostInboundTokens:               true,
 		lenientDuplicateHostLocalAddress:       true,
 		lenientDestNATAddresses:                true,

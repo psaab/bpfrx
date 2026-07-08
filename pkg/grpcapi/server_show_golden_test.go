@@ -175,6 +175,8 @@ func newShowGoldenStore(t *testing.T) *configstore.Store {
 // options/instances, VLANs, and login so the corresponding ShowText
 // branches render non-empty output.
 var showGoldenConfigCommands = []string{
+	"interfaces ge-0-0-0 unit 0 family inet address 10.0.0.1/24",
+	"interfaces ge-0-0-1 unit 0 family inet address 10.0.1.1/24",
 	"security zones security-zone trust interfaces ge-0-0-0.0",
 	"security zones security-zone untrust interfaces ge-0-0-1.0",
 	"security screen ids-option untrust-screen tcp syn-flood",

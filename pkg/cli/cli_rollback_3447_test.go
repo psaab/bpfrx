@@ -27,16 +27,19 @@ func buildRollbackHistoryStore(t *testing.T) *configstore.Store {
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
+	store.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	store.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := store.Commit(); err != nil {
 		t.Fatalf("commit 1: %v", err)
 	}
+	store.SetFromInput("interfaces eth1 unit 0 family inet address 10.0.1.1/24")
 	store.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	if _, err := store.Commit(); err != nil {
 		t.Fatalf("commit 2: %v", err)
 	}
 	// Dirty candidate edit on top of active — this is what a malformed
 	// rollback must NOT silently discard.
+	store.SetFromInput("interfaces eth2 unit 0 family inet address 10.0.2.1/24")
 	store.SetFromInput("security zones security-zone dmz interfaces eth2.0")
 	if !store.IsDirty() {
 		t.Fatal("store should be dirty after candidate edit")

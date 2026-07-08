@@ -23,8 +23,8 @@ import (
 // drifts (key renamed, comparison inverted, etc.), this test fails.
 func Test_PeerCallSkipsDialBack(t *testing.T) {
 	cases := []struct {
-		name        string
-		md          metadata.MD
+		name         string
+		md           metadata.MD
 		wantPeerCall bool
 	}{
 		{"empty metadata", metadata.MD{}, false},

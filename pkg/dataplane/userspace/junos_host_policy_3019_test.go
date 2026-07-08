@@ -18,6 +18,8 @@ import (
 func TestJunosHostPolicySnapshotCarriesRule(t *testing.T) {
 	tree := &config.ConfigTree{}
 	cmds := []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces eth1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security zones security-zone untrust interfaces eth1",
 		"set security policies from-zone trust to-zone junos-host policy deny-host match source-address any",

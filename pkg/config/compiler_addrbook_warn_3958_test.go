@@ -63,6 +63,8 @@ func TestValidateWarnAddressRefFormsNoFalsePositive(t *testing.T) {
 		// address-book entry + address-set
 		"set security address-book global address good-host 10.0.0.0/8",
 		"set security address-book global address-set trusted address good-host",
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0-0-2 unit 0 family inet address 10.0.2.1/24",
 		"set security zones security-zone lan interfaces ge-0-0-1.0",
 		"set security zones security-zone wan interfaces ge-0-0-2.0",
 

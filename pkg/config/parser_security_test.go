@@ -1263,7 +1263,11 @@ func TestALGAndFlowOptions(t *testing.T) {
 }
 
 func TestDNATWithProtocol(t *testing.T) {
-	input := `security {
+	input := `interfaces {
+    eth1 { unit 0 { family inet { address 10.0.1.1/24; } } }
+    eth2 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
+security {
     zones {
         security-zone untrust {
             interfaces { eth1.0; }
@@ -2211,7 +2215,14 @@ func TestIPsecNATTraversalFlatSet(t *testing.T) {
 }
 
 func TestHostInboundIPsec(t *testing.T) {
-	input := `security {
+	input := `interfaces {
+    st0 {
+        unit 0 {
+            family inet;
+        }
+    }
+}
+security {
     zones {
         security-zone vpn {
             interfaces { st0; }
@@ -2256,7 +2267,11 @@ func TestHostInboundIPsec(t *testing.T) {
 }
 
 func TestPolicyReject(t *testing.T) {
-	input := `security {
+	input := `interfaces {
+    eth0 { unit 0 { family inet { address 10.0.0.1/24; } } }
+    eth1 { unit 0 { family inet { address 10.0.1.1/24; } } }
+}
+security {
     zones {
         security-zone trust { interfaces { eth0; } }
         security-zone untrust { interfaces { eth1; } }
@@ -2301,7 +2316,7 @@ func TestPolicyReject(t *testing.T) {
 		t.Errorf("expected PolicyReject (%d), got %d", PolicyReject, pol.Action)
 	}
 	tree2 := &ConfigTree{}
-	setCommands := []string{"set security zones security-zone trust interfaces eth0", "set security zones security-zone untrust interfaces eth1", "set security policies from-zone untrust to-zone trust policy block-all match source-address any", "set security policies from-zone untrust to-zone trust policy block-all match destination-address any", "set security policies from-zone untrust to-zone trust policy block-all match application any", "set security policies from-zone untrust to-zone trust policy block-all then reject"}
+	setCommands := []string{"set interfaces eth0 unit 0 family inet address 10.0.0.1/24", "set interfaces eth1 unit 0 family inet address 10.0.1.1/24", "set security zones security-zone trust interfaces eth0", "set security zones security-zone untrust interfaces eth1", "set security policies from-zone untrust to-zone trust policy block-all match source-address any", "set security policies from-zone untrust to-zone trust policy block-all match destination-address any", "set security policies from-zone untrust to-zone trust policy block-all match application any", "set security policies from-zone untrust to-zone trust policy block-all then reject"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -2751,7 +2766,7 @@ func TestIPsecProposalSetSyntax(t *testing.T) {
 
 func TestZoneSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
-	for _, cmd := range []string{"set security zones security-zone trust interfaces trust0", "set security zones security-zone trust interfaces trust1", "set security zones security-zone trust screen untrust-screen", "set security screen ids-option untrust-screen tcp land", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone trust host-inbound-traffic protocols ospf", "set security zones security-zone untrust interfaces untrust0"} {
+	for _, cmd := range []string{"set interfaces trust0 unit 0 family inet address 10.0.0.1/24", "set interfaces trust1 unit 0 family inet address 10.0.1.1/24", "set interfaces untrust0 unit 0 family inet address 10.0.2.1/24", "set security zones security-zone trust interfaces trust0", "set security zones security-zone trust interfaces trust1", "set security zones security-zone trust screen untrust-screen", "set security screen ids-option untrust-screen tcp land", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone trust host-inbound-traffic protocols ospf", "set security zones security-zone untrust interfaces untrust0"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
@@ -3928,6 +3943,22 @@ func TestPolicyCommunityDeleteMultiListCompile(t *testing.T) {
 
 func TestSecurityZoneTCPRst(t *testing.T) {
 	input := `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+    ge-0/0/1 {
+        unit 0 {
+            family inet {
+                address 10.0.1.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {

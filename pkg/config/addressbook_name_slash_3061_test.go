@@ -67,6 +67,7 @@ func TestSecurityZoneNameSlashRejected(t *testing.T) {
 // (10.0.1.0/24) is fine; only the NAME token is checked.
 func TestAddressBookNameSlashNormalConfigUnaffected(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security address-book global address web-server 10.0.1.0/24",
 		"set security address-book global address-set servers address web-server",

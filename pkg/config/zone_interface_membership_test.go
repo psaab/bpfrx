@@ -101,6 +101,8 @@ func TestZoneInterfaceSameZoneRepeatNotFlagged(t *testing.T) {
 // lookups is a first-writer-wins artifact, not a second operator assignment.
 func TestZoneInterfaceDistinctUnitsAcrossZonesNotFlagged(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/0 unit 1 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 		"set security zones security-zone untrust interfaces ge-0/0/0.1",
 	})
@@ -114,6 +116,9 @@ func TestZoneInterfaceDistinctUnitsAcrossZonesNotFlagged(t *testing.T) {
 // (#3072).
 func TestZoneInterfaceOrdinaryConfigUnaffected(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.2.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 		"set security zones security-zone untrust interfaces ge-0/0/1.0",
 		"set security zones security-zone dmz interfaces ge-0/0/2.0",
