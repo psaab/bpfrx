@@ -106,49 +106,55 @@ func (db *DB) maybeEncryptTreeJSON(data []byte, tree *config.ConfigTree) ([]byte
 	return marshalEnvelope(env)
 }
 
-func (db *DB) maybeDecryptTreeJSON(data []byte) ([]byte, error) {
+// maybeDecryptTreeJSON returns the plaintext body of a stored config.
+// The second return value reports whether the input was an AES-GCM
+// envelope that was actually decrypted (true) or was passed through as
+// plaintext because it carried no envelope (false). Callers that know
+// the config declares a master-password use the flag to detect an
+// unexpected plaintext downgrade (#4579 A4-06).
+func (db *DB) maybeDecryptTreeJSON(data []byte) ([]byte, bool, error) {
 	env, ok, err := unmarshalEnvelope(data)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !ok {
-		return data, nil
+		return data, false, nil
 	}
 
 	keyMaterial, err := db.readMasterKey()
 	if err != nil {
-		return nil, fmt.Errorf("encrypted config but master key unavailable: %w", err)
+		return nil, false, fmt.Errorf("encrypted config but master key unavailable: %w", err)
 	}
 	salt, err := base64.StdEncoding.DecodeString(env.Salt)
 	if err != nil {
-		return nil, fmt.Errorf("decode salt: %w", err)
+		return nil, false, fmt.Errorf("decode salt: %w", err)
 	}
 	key, err := deriveEncryptionKeyFromSalt(keyMaterial, env.PRF, salt)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
 	if err != nil {
-		return nil, fmt.Errorf("decode nonce: %w", err)
+		return nil, false, fmt.Errorf("decode nonce: %w", err)
 	}
 	ciphertext, err := base64.StdEncoding.DecodeString(env.Data)
 	if err != nil {
-		return nil, fmt.Errorf("decode ciphertext: %w", err)
+		return nil, false, fmt.Errorf("decode ciphertext: %w", err)
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, fmt.Errorf("create cipher: %w", err)
+		return nil, false, fmt.Errorf("create cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("create GCM: %w", err)
+		return nil, false, fmt.Errorf("create GCM: %w", err)
 	}
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt config tree: %w", err)
+		return nil, false, fmt.Errorf("decrypt config tree: %w", err)
 	}
-	return plaintext, nil
+	return plaintext, true, nil
 }
 
 func marshalEnvelope(env encryptedTreeEnvelope) ([]byte, error) {

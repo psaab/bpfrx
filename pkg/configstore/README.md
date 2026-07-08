@@ -124,6 +124,30 @@ inline archive-site passwords).
   configstore directory. The "master-password" naming is an HKDF
   info string only — it isn't a user-supplied password.
 
+### At-rest crypto hardening notes (#4579 A4-05/A4-06)
+
+- **Unexpected-plaintext warning (A4-06).** Every write path encrypts the
+  body when the tree declares a master-password, so `readTreeMeta` reading
+  a config back as *plaintext* while its tree still declares a
+  master-password means the file was written without the AES-GCM envelope
+  — a downgrade to an older build, a restore from an unencrypted backup, or
+  tampering. `maybeDecryptTreeJSON` reports whether it actually decrypted;
+  `readTreeMeta` logs a one-time `slog.Warn` on the plaintext-with-declared-
+  master-password case so the silent at-rest exposure is visible instead of
+  loading the cleartext secrets without a trace. Reaching that state needs
+  write access to the 0600/0700 `.configdb` (root/owner), so this is a
+  visibility improvement, not a privilege-escalation fix.
+- **GCM AAD binding (A4-05) — deliberately NOT changed.** `Seal`/`Open` pass
+  a nil additional-authenticated-data argument. Binding the envelope header
+  (PRF/salt) as AAD is textbook defense-in-depth, but the scheme already
+  fails *closed* on any header swap: the key is HKDF-derived from the PRF
+  and the stored salt, so tampering with either yields the wrong key and
+  `Open` fails the GCM tag anyway. More importantly, switching to a non-nil
+  AAD is a **ciphertext-format change**: an `active.json` sealed by an older
+  build with nil AAD would fail to open after the change (the tag no longer
+  matches), bricking decryption on upgrade. The non-exploitable gap does not
+  justify an upgrade-brick risk, so the nil AAD is retained.
+
 ## Callers
 
 `pkg/daemon`, `pkg/cli`, `pkg/grpcapi`, `pkg/api`.
