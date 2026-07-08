@@ -18,6 +18,31 @@
   cmd/cli/show_interfaces.go (new), cmd/cli/show_protocols.go (new),
   cmd/cli/show_system.go (new), cmd/cli/show_services.go (new),
   cmd/cli/show_dhcp.go (new), cmd/cli/README.md, _Log.md
+## 2026-07-08 — #4656 (codex-review-174 #13, refactor) format/status.go: split FormatStatusSummary aggregation from rendering
+
+- **Timestamp**: 2026-07-08
+- **Action**: Pure code-motion refactor of the ~600-LOC `FormatStatusSummary`
+  (pkg/dataplane/userspace/format/status.go). Extracted the aggregation pass
+  into `aggregateStatusSummary(status) statusSummaryAggregates` and moved each
+  cohesive rendering block into a `writeXxxSection` helper (overview, event
+  stream, security counters, NAT, source-NAT pools, TX+CoS summary, three-color
+  policers, TX-path counters, slow path, worker runtime). `FormatStatusSummary`
+  is now a 22-line orchestrator calling them in the original top-to-bottom order.
+  Guardrails preserved: ONE pass over `status.Bindings` (the only binding walk
+  lives in `aggregateStatusSummary`; the render helpers read the returned
+  struct, no re-iteration, no extra status fetches), deterministic order, and
+  omit-zero suppression unchanged.
+- **Byte-identity gate**: added `TestFormatStatusSummaryGolden` +
+  `testdata/status_summary.golden`, a full-output golden generated from the
+  pre-refactor code over a fixture that exercises every conditional section
+  (avoiding wall-clock-relative fields). The golden passes byte-for-byte after
+  the split, proving the output text is unchanged; the existing substring tests
+  in status_test.go also stay green. `go build ./...` clean, `go vet` clean,
+  `gofmt -w` applied.
+- **File(s)**: pkg/dataplane/userspace/format/status.go (orchestrator),
+  pkg/dataplane/userspace/format/status_sections.go (new — aggregate struct +
+  section writers), pkg/dataplane/userspace/format/status_golden_test.go (new),
+  pkg/dataplane/userspace/format/testdata/status_summary.golden (new), _Log.md
 
 ## 2026-07-08 — #4650 (fable-173 LOW) GO residuals: gRPC egress-iface parity + tunnel lock-scope
 
