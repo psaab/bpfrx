@@ -40956,3 +40956,31 @@ top.
 - **File(s)**: pkg/dataplane/userspace/filtercounters.go,
   pkg/grpcapi/server_show_firewall.go,
   pkg/grpcapi/server_show_firewall_test.go, docs/cos-traffic-shaping.md, _Log.md
+- **Timestamp**: 2026-07-07
+- **Action**: #4549 F9 + F10 (crypto/HA LOW hardening residuals; F8+F11
+  already shipped in #4558). GO-only. F9 (DRIVEN) — HA node-to-node UDP
+  heartbeat was IPv4-only: `StartHeartbeat` hardcoded `"udp4"` in the two
+  `ResolveUDPAddr` + two `ListenPacket` calls and built the address with a
+  bare `"%s:%d"` format. The daemon already resolves an IPv6 control-link
+  bind address (`selectClusterBindAddr` honours an IPv6 peer via
+  `globalIPv6Candidates`), so a v6 control link was unusable. Fix: added
+  `heartbeatUDPNetwork(addr)` — a v6 literal -> `"udp6"`, v4/unparseable ->
+  `"udp4"` (historical default) — and switched all four sockets to that
+  network, building addresses with `net.JoinHostPort` (brackets v6). v4 path
+  is bit-for-bit unchanged; a v6 control link now binds. `RestartHeartbeat`
+  inherits the fix (it re-invokes `StartHeartbeat`). Test-failover flag: this
+  is HA code but the new path is a no-op for a valid v4 config (only a v6
+  control link exercises udp6) — a light test-failover is nice-to-have, not
+  required. F10 (DEFERRED — theater/refactor) — IPsec PSK is a `config.Secret`
+  = immutable Go `string`; a `Reveal()`-then-wipe cannot reliably zero it
+  (interned/GC-copied, no owned mutable backing array, `unsafe` mutation is UB)
+  and the swanctl `secrets {}` block is written 0600 plaintext on disk anyway
+  (strongSwan must read it), so the heap copy is secondary. A real wipe needs
+  `Secret` -> `[]byte` across the whole config tree (40+ fields, `== ""`
+  checks, map keys) with marginal benefit. Not shipped (no fake zeroize).
+  RED-on-revert (F9): reverting to `"udp4"` + `"%s:%d"` makes the v6 test fail
+  with `resolve peer addr: address ::1:4784: too many colons in address`; the
+  v4 test stays green. go build ./pkg/cluster/...; go test ./pkg/cluster/...;
+  gofmt+vet clean.
+- **File(s)**: pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_family_4549_test.go, docs/feature-gaps.md, _Log.md
