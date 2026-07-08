@@ -400,7 +400,15 @@ cluster-scoped.
   saturates at zero; an underflow (accounting invariant broken) bumps a
   local-only diagnostic counter and logs one stderr line on first hit
   (#1826 — release builds compile out the debug_assert, the counter is
-  intentionally not wire-plumbed).
+  intentionally not wire-plumbed). The invariant is symmetric: every
+  telemetry frame that reaches the replay buffer acquired one budget slot
+  at emit, so its release on eviction/ACK-trim/shutdown is always balanced.
+  A unit test that injects telemetry frames directly (`push_replay_frame`,
+  bypassing `emit`) MUST seed that slot with
+  `DataplaneEventQueueBudget::acquire_for_test()` for each frame, or the
+  eviction's release trips the debug_assert on a zero counter (#4607 — the
+  #2875 telemetry-eviction test bypassed the seed; session-sync frames need
+  no seed because they carry no `dataplane_event_kind()`).
 - The Go daemon must know every helper→daemon frame type that carries a
   sequence number. For RT_FLOW-style dataplane telemetry, the daemon
   decodes valid frames through the same RT_FLOW adapter used for ringbuf

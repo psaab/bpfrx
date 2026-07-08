@@ -2052,6 +2052,27 @@ fn telemetry_seq_frame(seq: u64) -> EventFrame {
     }
 }
 
+// Inject a telemetry frame into the replay buffer AND seed the per-kind queue
+// budget the producer's `emit` would have charged for it (#4607). The #2875
+// tests build the buffer directly via `push_replay_frame`, bypassing `emit`;
+// a telemetry frame (SCREEN_DROP etc.) carries a `dataplane_event_kind()`, so
+// when it is evicted/popped the I/O path calls `release()` on its budget. In
+// production that release balances the acquire taken at emit; without the seed
+// here the release decrements a zero counter and trips the #1826 underflow
+// guard (`decrement_if_positive`) — the actual #4607 panic. Session-sync
+// frames (`replay_seq_frame`) have no `dataplane_event_kind()`, so they never
+// touch the budget and do not need this.
+fn push_budgeted_replay_frame(
+    shared: &Arc<EventStreamShared>,
+    replay_buf: &mut VecDeque<EventFrame>,
+    frame: EventFrame,
+) {
+    if let Some(kind) = frame.dataplane_event_kind() {
+        shared.dataplane_event_queue.acquire_for_test(kind);
+    }
+    push_replay_frame(shared, replay_buf, frame);
+}
+
 // #2875 fail-on-revert guard: pause the helper, overrun the bounded replay
 // buffer so a SESSION-SYNC delta is evicted, then issue DrainRequest. The drain
 // MUST be poisoned — it withholds DrainComplete and emits a FullResync instead,
@@ -2124,11 +2145,13 @@ fn test_paused_telemetry_eviction_does_not_poison_drain_2875() {
     let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
 
     // Fill to capacity with TELEMETRY frames, then evict one while paused.
+    // Each frame is injected with its queue budget seeded (#4607) so the
+    // eviction's `release` is balanced, exactly as production emit/release is.
     for seq in 1..=REPLAY_BUFFER_CAPACITY as u64 {
-        push_replay_frame(&shared, &mut replay_buf, telemetry_seq_frame(seq));
+        push_budgeted_replay_frame(&shared, &mut replay_buf, telemetry_seq_frame(seq));
     }
     shared.paused.store(true, Ordering::Release);
-    push_replay_frame(
+    push_budgeted_replay_frame(
         &shared,
         &mut replay_buf,
         telemetry_seq_frame(REPLAY_BUFFER_CAPACITY as u64 + 1),
