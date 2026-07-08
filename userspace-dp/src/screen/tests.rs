@@ -5127,6 +5127,77 @@ fn udp_flood_flowless_non_first_fragment_drops() {
 }
 
 #[test]
+fn udp_flood_flowless_fragment_folds_into_per_ip_bucket_4567() {
+    // RED-on-revert (#4567): a non-first UDP fragment (flowless, dst_port=0)
+    // must fold its flood count into the per-DESTINATION-IP `increment(dst_ip)`
+    // bucket — the SAME abstraction the ICMP flood path uses — NOT a distinct
+    // `(dst_ip, port=0)` bucket.
+    //
+    // A single-IP fragment stream trips EITHER bucket, so it cannot tell the two
+    // apart. This discriminator pre-saturates ONLY the per-DESTINATION-IP cells
+    // for D and leaves the `(D, 0)` cells fresh, then sends ONE flowless UDP
+    // fragment to D. After the fix `udp_flood_drop` reads the pre-saturated
+    // per-IP cells and Drops on the FIRST fragment; on revert it counts into the
+    // fresh `(D, 0)` cells (the per-IP cells are never consulted) and Passes. The
+    // Drop⟷Pass flips.
+    const T: u32 = 4;
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = T;
+    let mut state = make_state("trust", profile);
+    let d = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    // Drive the per-DESTINATION-IP cells for D over threshold directly (test
+    // seam), leaving the `(D, port=0)` cells untouched.
+    let cells = state.udp_dst_sketch.get("trust").unwrap().cell_indices(&d);
+    let sketch = state.udp_dst_sketch.get_mut("trust").unwrap();
+    for (row, &col) in cells.iter().enumerate() {
+        sketch.saturate_cell(row, col, 100, T);
+    }
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let pkt = flowless_nonfirst_fragment(src, d, PROTO_UDP);
+    assert_eq!(
+        state.check_flowless_screens("trust", &pkt, true, 100),
+        ScreenVerdict::Drop("udp-flood"),
+        "flowless UDP fragment must count into the pre-saturated per-IP bucket, \
+         not a separate (ip,0) bucket"
+    );
+}
+
+#[test]
+fn udp_flood_first_fragment_still_counts_per_ip_port_4567() {
+    // Guard (#4567): folding a trailing fragment into the per-IP bucket must NOT
+    // change where a first/atomic fragment (flow path, real L4 port) counts.
+    // Pre-saturate the per-DESTINATION-IP cells for D, then drive normal UDP
+    // datagrams to `(D, 5001)` via the flow path: they count at `(D, 5001)`,
+    // independent of the per-IP(D) cells, so the first T still Pass (the
+    // pre-saturated per-IP cells are NOT consulted for a real port) and the
+    // (T+1)th trips its OWN `(ip, port)` bucket.
+    const T: u32 = 4;
+    let mut profile = ScreenProfile::default();
+    profile.udp_flood_threshold = T;
+    let mut state = make_state("trust", profile);
+    let d = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let cells = state.udp_dst_sketch.get("trust").unwrap().cell_indices(&d);
+    let sketch = state.udp_dst_sketch.get_mut("trust").unwrap();
+    for (row, &col) in cells.iter().enumerate() {
+        sketch.saturate_cell(row, col, 100, T);
+    }
+    let pkt = udp_pkt(src, d); // dst_port = 5001 (real L4 port, flow path)
+    for i in 0..T {
+        assert_eq!(
+            state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+            ScreenVerdict::Pass,
+            "flow-path UDP datagram #{i} must count at (ip,port), not per-IP(D)"
+        );
+    }
+    assert_eq!(
+        state.check_packet_with_zone_id("trust", 3, &pkt, 100),
+        ScreenVerdict::Drop("udp-flood"),
+        "the (T+1)th datagram trips its own (ip,port) bucket"
+    );
+}
+
+#[test]
 fn teardrop_still_screened_on_flowless_path() {
     // #3064 regression guard: the L3 fragment screens still fire on the
     // flowless path through check_flowless_screens.

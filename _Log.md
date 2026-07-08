@@ -40,6 +40,42 @@
   pkg/config/compiler_interfaces.go, pkg/config/schema_interfaces.go,
   pkg/vrrp/vrrp.go, pkg/vrrp/manager.go, pkg/vrrp/vrid_guard_4573_test.go,
   docs/config-schema.md, _Log.md
+## 2026-07-07 — #4572 dataplane: clamp workers before the heartbeat zero-init loop so a large positive workers value can't wrap uint32 into a multi-billion-iteration apply hang
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4572 (ps-037-A6 F-A6-001, LOW control-plane DoS) —
+  `programBootstrapMapsLocked` (pkg/dataplane/userspace/maps_sync.go) zero-inits
+  the `userspace_heartbeat` Array (`Array<u64>`, max_entries 4096) with
+  `slot < uint32(cfg.Workers)*2*16`. VERIFY-FIRST corrected the issue's
+  headline: the NEGATIVE case (`workers -1` -> `uint32(-1)*32 = 4,294,967,264`
+  iterations) is already defended one layer up — `deriveUserspaceConfig`
+  (capabilities.go:26) coerces `workers<=0 -> 1` before the value reaches the
+  loop, and the sole caller (manager_compile.go:296) always passes that derived
+  ucfg. The LIVE, currently-reachable hang is a large POSITIVE value: the schema
+  leaf is min-only (`ValidateIntegerMin(1)`) and `deriveUserspaceConfig` does
+  NOT cap the upper side, so `workers 999999999` passes strict commit, survives
+  derivation, reaches the loop, and `uint32(999999999)*32` wraps uint32 to
+  ~1.9B iterations of `heartbeatMap.Update` — an apply/commit hang for hours (a
+  DoS, not fail-open; needs a trusted config source). Fix: hoisted
+  `workers := maxInt(cfg.Workers, 1)` before the `userspace_ctrl` struct and
+  used it for both `Workers` (was raw `uint32(cfg.Workers)`, line 154) and
+  `QueueCount` (already clamped, line 155) — restoring the line-154/179
+  consistency the issue flagged; and the loop bound is now
+  `heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())`, a new pure
+  helper that clamps the worker count into `[1, mapCap/heartbeatSlotsPerWorker]`
+  (128 workers at the current 4096-entry map) so the returned slot count can
+  never wrap uint32 or index past the fixed-size Array. PRESERVED: a normal
+  `workers 6` -> `heartbeatZeroSlots(6, 4096) = 192` (6*32), byte-identical to
+  the old `uint32(6)*32`; only <1 (clamped to 1 -> 32) and >128 (clamped to
+  4096) diverge. RED-on-revert verified
+  (maps_sync_heartbeat_slots_4572_test.go): reverting the helper body to raw
+  `uint32(workers)*heartbeatSlotsPerWorker` flips `heartbeatZeroSlots(-1,4096)`
+  to 4,294,967,264 (the exact hang count) and the over-cap / huge-positive
+  cases to out-of-bounds slot counts -> RED, while `six_unchanged` stays green.
+  go build ./... + go vet + go test ./pkg/dataplane/userspace/... green. Doc:
+  docs/config-schema.md gains a "#4572 (workers zero-init loop backstop)" bullet
+  next to the analogous #2524 ring-entries min-only backstop.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/maps_sync_heartbeat_slots_4572_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-07-07 — #4570 ra: configEqual now compares ReachableTime/RetransTimer so a commit changing only those RA timers restarts the sender
 
@@ -40223,3 +40259,43 @@ top.
 - **Timestamp**: 2026-07-07
 - **Action**: #4533 (follow-up to #4517) — the embedded-ICMP IPv6 ext-header walker `parse_embedded_v6_l4` (userspace-dp/src/afxdp/icmp_embed/parse.rs) was the last of the 10 IPv6 EH walkers NOT aligned to the #2292/#4435 fail-closed doctrine: it kept a PRE-EXISTING 6-iteration bound + a post-loop `Some((offset, protocol))` fall-through, so a quoted inner packet with >6 extension headers returned a bogus ext-type proto instead of failing closed. #4517 had already added the exotic-EH set (135/139/140/253/254) to this walker, so this change is purely the fail-closed alignment + bound bump. Fix: post-loop fall-through changed from `Some((offset, protocol))` to `None` (fail CLOSED on EH-overflow, matching frame/inspect.rs #2292 and the nat64.rs #4435 walkers); loop bound bumped `0..6` -> `0..MAX_IPV6_EXT_HEADERS` (8, the shared const re-exported at crate::afxdp) so a legit quoted packet with up to 7 ext headers still parses. Not a live bug pre-fix (a >6-EH quoted packet returned a proto that failed to match any session -> fail-SAFE drop), consistency-only. PRESERVED: ESP (50) still STOPS the walk (terminal `_` arm, returns Some early — unaffected by bound/post-loop); the #1838/#1853 non-first-fragment None guard; the #4517 exotic EH types still walk; ext-free + <=7-EH normal packets parse to the true proto/ports. RED-on-revert verified (parse.rs unit tests): embedded_ext_chain_overflow_fails_closed (8-EH chain -> parse_embedded_v6_l4 None + parse_embedded_v6 None; on revert the 6-bound returns Some((88, 253)) -> RED), embedded_seven_ext_headers_still_resolve (7 EH incl Mobility/HIP/Shim6/exp -> Some((96, TCP)); on the stale-6 bound returns Some((88,253)) -> RED), embedded_esp_stops_walk (base ESP -> Some((40,50)); ESP behind one HbH -> Some((48,50)) — preservation). FULL cargo test --release SERIAL green. Docs: userspace-dp/src/afxdp/frame/README.md canonical-contract walker list annotated with the #4533 fail-closed alignment; docs/research/2150-parser-consolidation/plan.md V6-c row updated (bound 6->8, EH-overflow fail-closed None).
 - **File(s)**: userspace-dp/src/afxdp/icmp_embed/parse.rs, userspace-dp/src/afxdp/frame/README.md, docs/research/2150-parser-consolidation/plan.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4567 (ps-036-c3-4 L-01) — a fragmented UDP flood split its
+  screen count across two count-min-sketch cells. The flow-present UDP flood
+  cap keys on `(dst_ip, dst_port)` (Junos parity, #4112 F18), but a non-first
+  IP fragment carries no L4 header, so the flowless caller
+  (`check_flowless_screens_opts`, poll_stages.rs flowless branch) passes
+  `dst_port == 0`. `udp_flood_drop` (userspace-dp/src/screen/mod.rs) then called
+  `increment_ip_port(dst_ip, 0)`, parking trailing fragments in a stray
+  `(dst_ip, 0)` SENTINEL-port cell — distinct from BOTH the datagram's real
+  `(dst_ip, port)` cell (first/atomic fragments, flow path) AND the
+  per-destination-IP `increment(dst_ip)` cell the ICMP flood path
+  (`icmp_flood_drop`, syn_rate.rs:197) already uses. VERIFY-FIRST confirmed the
+  threshold is read INLINE (the sketch `increment*` return value IS the
+  over-threshold signal), so the bucket incremented is the bucket read — no
+  separate read side to skew. Fix: `udp_flood_drop` branches on `dst_port == 0`
+  and folds the port-less fragment into the per-destination-IP `increment(dst_ip)`
+  bucket (the same abstraction ICMP uses); a first/atomic fragment or normal
+  datagram carries its real port (`dst_port != 0`) and still counts at
+  `(dst_ip, dst_port)`, unchanged; the ICMP path is untouched. Converging a
+  trailing fragment onto its datagram's real `(ip, port)` cell would need
+  reassembly context xpf lacks, so the per-IP fold is the bounded, honest
+  abstraction (LOW: per-port datagram DELIVERY is already capped by
+  first-fragment counting; this only keeps trailing-fragment noise in one
+  consistent per-IP cell instead of a stray `(ip,0)` one). RED-on-revert
+  verified (screen/tests.rs): udp_flood_flowless_fragment_folds_into_per_ip_bucket_4567
+  pre-saturates ONLY the per-IP(D) cells (via cell_indices + saturate_cell test
+  seams) then sends one flowless UDP fragment to D — after the fix it reads the
+  pre-saturated per-IP cells and Drops on the FIRST fragment; on revert it
+  counts the fresh `(D,0)` cells and Passes (Drop⟷Pass flips RED).
+  udp_flood_first_fragment_still_counts_per_ip_port_4567 pre-saturates per-IP(D)
+  then drives flow-path UDP datagrams to `(D,5001)`: first T still Pass, (T+1)th
+  trips its OWN `(ip,port)` bucket — proving the fold does not leak into
+  real-port counting (unchanged by the revert). ICMP unchanged
+  (icmp_flood_drop untouched; existing icmp_flood_flowless_drops guards it).
+  FULL cargo test --release SERIAL green. Docs: udp_flood_drop doc + body,
+  the flowless call-site comment, syn_rate.rs module doc, and the
+  userspace-dp/src/afxdp/README.md #3902 flowless-screens section gained a
+  #4567 note.
+- **File(s)**: userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/syn_rate.rs, userspace-dp/src/screen/tests.rs, userspace-dp/src/afxdp/README.md, _Log.md

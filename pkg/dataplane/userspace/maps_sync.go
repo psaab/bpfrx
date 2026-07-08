@@ -148,11 +148,23 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if wgPort != 0 {
 		ctrlFlags |= userspaceCtrlFlagWgRx
 	}
+	// Clamp the worker count before it feeds the ctrl fields and the
+	// heartbeat zero-init loop below (#4572). deriveUserspaceConfig
+	// already coerces workers<=0 -> 1 (capabilities.go), so the negative
+	// case is defended one layer up; this restores the line-154/179
+	// consistency with the QueueCount clamp on the next line and keeps the
+	// low bound local to the map programmer. The genuinely dangerous input
+	// is a large POSITIVE workers: the schema leaf is min-only
+	// (ValidateIntegerMin(1)) and deriveUserspaceConfig does not cap the
+	// upper side, so e.g. `workers 999999999` reaches the loop below and
+	// uint32(999999999)*32 wraps to ~1.9B iterations that hang the apply
+	// for hours — bounded by heartbeatZeroSlots' map-capacity clamp.
+	workers := maxInt(cfg.Workers, 1)
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
-		Workers:            uint32(cfg.Workers),
-		QueueCount:         uint32(maxInt(cfg.Workers, 1)),
+		Workers:            uint32(workers),
+		QueueCount:         uint32(workers),
 		Flags:              ctrlFlags,
 		WgListenPort:       wgPort,
 		ConfigGeneration:   0,
@@ -176,7 +188,12 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	// XDP shim correctly refuses to redirect until userspace begins updating.
 	{
 		var zeroHB uint64
-		for slot := uint32(0); slot < uint32(cfg.Workers)*2*16; slot++ {
+		// heartbeatZeroSlots clamps the worker count low to 1 and high to
+		// the Array's real capacity, so neither a negative nor an absurd
+		// cfg.Workers can make this loop wrap uint32 or index past the map
+		// (#4572).
+		slots := heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())
+		for slot := uint32(0); slot < slots; slot++ {
 			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}
 	}
@@ -1690,6 +1707,36 @@ func pickInterfaceSnapshotV6(iface InterfaceSnapshot) net.IP {
 		}
 	}
 	return fallback
+}
+
+// heartbeatSlotsPerWorker is the number of userspace_heartbeat Array
+// slots reserved per dataplane worker (2 directions x up to 16 queues).
+// programBootstrapMapsLocked zero-inits workers*heartbeatSlotsPerWorker
+// slots on every apply.
+const heartbeatSlotsPerWorker = 2 * 16
+
+// heartbeatZeroSlots returns how many leading userspace_heartbeat Array
+// slots programBootstrapMapsLocked must zero-init for a configured worker
+// count. It clamps the worker count into [1, mapCap/heartbeatSlotsPerWorker]
+// so the returned slot count can never wrap uint32 or exceed the fixed-size
+// Array, regardless of what cfg.Workers carries.
+//
+// The low clamp mirrors the QueueCount / disabled-ctrl coercions
+// (workers<=0 -> 1). The negative-workers case is already defended by
+// deriveUserspaceConfig (capabilities.go), so the load-bearing guard is
+// the HIGH clamp: `workers` is a min-only schema leaf (ValidateIntegerMin(1))
+// with no upper bound in deriveUserspaceConfig, so a large positive value
+// (e.g. 999999999) reaches this function and a raw
+// uint32(workers)*heartbeatSlotsPerWorker wraps uint32 to ~1.9B loop
+// iterations that hang the apply for hours (#4572). Clamping the worker
+// count to mapCap/heartbeatSlotsPerWorker before the multiply keeps the
+// returned slot count <= mapCap and never wraps.
+func heartbeatZeroSlots(workers int, mapCap uint32) uint32 {
+	w := uint32(maxInt(workers, 1))
+	if maxW := mapCap / heartbeatSlotsPerWorker; w > maxW {
+		w = maxW
+	}
+	return w * heartbeatSlotsPerWorker
 }
 
 func maxInt(a, b int) int {
