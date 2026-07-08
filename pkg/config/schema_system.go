@@ -110,8 +110,23 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			"archive-sites": {desc: "Archive site URL", args: 1, multi: true, placeholder: "<url>", children: nil},
 		}},
 	}},
-	"master-password": {desc: "Master password", children: map[string]*schemaNode{
-		"pseudorandom-function": {desc: "Pseudorandom function", args: 1, placeholder: "<function>", children: nil},
+	// #4578: master-password is the configstore at-rest-encryption policy
+	// knob (configstore.masterPasswordPRF reads the raw AST). The subtree is
+	// closed-world (#4313 mechanism) AND leaf-complete — xpf models and
+	// consumes exactly one leaf, `pseudorandom-function` — so a typo in the
+	// KEYWORD (`pseudo-random-fnuction`) is rejected at commit instead of
+	// committing clean and silently DISABLING encryption (masterPasswordPRF
+	// would find no `pseudorandom-function` child and fall through to its empty
+	// default). The value slot is enum-validated so a typo in the PRF VALUE
+	// (`bogus-prf`) is caught too. Scoped strictly to this subtree — the
+	// broader `system` open-world behaviour (#4515/X-1) is untouched.
+	"master-password": {desc: "Master password", closedWorld: true, children: map[string]*schemaNode{
+		"pseudorandom-function": {desc: "Pseudorandom function", args: 1, placeholder: "<function>",
+			valueType:     ValueEnumOf,
+			valueDesc:     "Master-password key-derivation PRF selector (configstore.prfHash)",
+			valueExamples: []string{"hmac-sha2-256", "sha256", "juniper-prf1"},
+			validator:     ValidateMasterPasswordPRF,
+			children:      nil},
 	}},
 	"license": {desc: "License configuration", children: map[string]*schemaNode{
 		"autoupdate": {desc: "Autoupdate", children: map[string]*schemaNode{

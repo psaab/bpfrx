@@ -43,6 +43,49 @@ func ValidateEnum(allowed []string) LeafValidator {
 	}
 }
 
+// MasterPasswordPRFNames is the set of `system master-password
+// pseudorandom-function <fn>` selector names the configstore key-derivation
+// (configstore.prfHash) understands. prfHash is the SSOT for the
+// name->hash.Hash mapping; this list mirrors only the accepted NAMES so a
+// commit-time typo is caught before it reaches the encrypt path (#4578). Keep
+// the two in sync — a name added to prfHash must be added here. It is exported
+// so a configstore test can drift-guard it against prfHash across the package
+// boundary (config→configstore would be an import cycle, so the guard lives on
+// the configstore side).
+//
+// configstore.prfHash lower-cases its input before matching, so
+// ValidateMasterPasswordPRF matches case-insensitively too: any spelling the
+// runtime would accept commits, and only a genuine typo/unknown selector is
+// rejected.
+var MasterPasswordPRFNames = []string{
+	"juniper-prf1",
+	"hmac-sha2-256", "sha256",
+	"hmac-sha2-384", "sha384",
+	"hmac-sha2-512", "sha512",
+	"hmac-sha1", "sha1",
+}
+
+// ValidateMasterPasswordPRF accepts only a pseudorandom-function selector the
+// configstore master-password key-derivation understands
+// (configstore.prfHash), matched case-insensitively. Without this gate a
+// typo'd selector (e.g. "hmac-sha256" missing the "2-", or "bugus-prf") is
+// accepted open-world, then falls through configstore.masterPasswordPRF's
+// default and silently DISABLES at-rest config encryption — or fails the
+// persisted-tree write with an opaque error. Rejecting it at commit turns a
+// silent security downgrade into a clear commit error (#4578). Pairs with the
+// closedWorld flag on the master-password subtree (schema_system.go), which
+// catches a typo in the KEYWORD (`pseudo-random-fnuction`) rather than the
+// value.
+func ValidateMasterPasswordPRF(raw string, _ *Config) error {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	for _, name := range MasterPasswordPRFNames {
+		if lower == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid pseudorandom-function %q (expected one of: %s)", raw, strings.Join(MasterPasswordPRFNames, ", "))
+}
+
 // ValidateIntegerMin returns a closure that accepts any bare integer
 // >= min — the "no upper bound" spelling for typed leaves whose runtime
 // consumes the full integer range. The representational maximum is

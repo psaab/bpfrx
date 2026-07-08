@@ -40592,6 +40592,37 @@ top.
 - **File(s)**: pkg/config/ast.go, pkg/configstore/store_command.go,
   pkg/configstore/store_test.go, docs/config-schema.md, _Log.md
 
+## 2026-07-07 — #4598 zeroize tears down provisioned OS login accounts (SECURITY HIGH)
+- **Timestamp**: 2026-07-07
+- **Action**: SECURITY follow-up to #4576/#4585. The OS login accounts xpf
+  provisions live OUTSIDE /etc/xpf and SURVIVED zeroize — /etc/shadow
+  password hashes (reconcileUserPassword), SSH authorized_keys under
+  /home/<user>/.ssh (applySystemLogin), and /etc/sudoers.d/xpf-<user>
+  NOPASSWD grants (reconcileSudoers). applySystemLogin runs only inside the
+  boot-time applyConfig, which a post-zeroize boot SKIPS (bootstrap /
+  nil-active-config), and a full reconcile early-returns on empty config and
+  never userdel's, so a re-tenanted/RMA'd/resold device granted the prior
+  tenant interactive LOGIN + passwordless SUDO — a bigger leak than a
+  config-secret read. Added zeroizeLoginAccounts to performZeroizeWipe (after
+  the #4585 rendered-config erasure, error folded into the surfaced result
+  like #4576/#4585). Marker-aware teardown keyed on the #1944 UID-keyed
+  provenance marker (/var/lib/xpf/provisioned-users/<user>, content = UID at
+  provision time): (A) sweep the whole /etc/sudoers.d/xpf-* namespace
+  unconditionally (operator drop-ins without the prefix untouched); (B) for
+  each marker, userdel -r ONLY when the current /etc/passwd UID still equals
+  the recorded UID — an operator's own account (no marker), root/system
+  accounts (no marker), and an out-of-band recreate (UID mismatch) are NEVER
+  touched. authorized_keys removed BEFORE userdel (SSH vector dies even if
+  userdel fails); marker RETAINED on userdel failure so a retried zeroize
+  re-attempts + the error is surfaced (codes.Internal at the RPC boundary).
+  pkg/grpcapi can't import pkg/daemon (daemon_run.go imports grpcapi → cycle),
+  so the prod paths are mirrored as test-injectable package vars + a
+  zeroizeUserdel seam. RED-on-revert test proven against a neutered body
+  (removal/userdel/error-surfacing assertions fail; the never-touch-non-xpf
+  assertPresent safety checks stay green). go build ./... + go vet + full
+  pkg/grpcapi test green; gofmt clean.
+- **File(s)**: pkg/grpcapi/server_diag.go,
+  pkg/grpcapi/zeroize_login_4598_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-07-07 (#4594)
 - **Action**: class-of-service forwarding-class queue outside 0..255 was
   warn-only (`ValidateConfig`) and COMMITTED, while the userspace helper
@@ -40653,3 +40684,22 @@ top.
   pkg/configstore/db.go, pkg/configstore/file_perms_4056_test.go,
   pkg/configstore/plaintext_downgrade_warn_4579_test.go,
   pkg/configstore/README.md, _Log.md
+- **Timestamp**: 2026-07-07 (#4578)
+- **Action**: `system master-password pseudorandom-function <fn>` typo silently
+  disabled at-rest config encryption. `configstore.masterPasswordPRF` reads the
+  raw AST; because `system` is open-world (#4515/X-1) a KEYWORD typo
+  (`pseudo-random-fnuction`) committed clean → no `pseudorandom-function` child
+  → fell through to the empty default → encryption silently OFF. Scoped fix
+  (NOT a blanket `system` closed-world, which would false-reject unmodeled
+  leaves, #4191 class): flipped `master-password` to `closedWorld: true` (#4313
+  mechanism; leaf-complete — xpf models/consumes only `pseudorandom-function`)
+  so the keyword typo is rejected at commit, AND enum-validated the value slot
+  (`ValidateMasterPasswordPRF` against `MasterPasswordPRFNames`, case-insensitive
+  mirror of `configstore.prfHash`) so a VALUE typo (`bogus-prf`) is caught too.
+  RED-on-revert tests confirmed for BOTH guards; valid selectors + the
+  default-unset case still commit. A configstore drift test asserts prfHash
+  honours every advertised name.
+- **File(s)**: pkg/config/schema_system.go, pkg/config/schema_validators.go,
+  pkg/config/schema_master_password_prf_4578_test.go, pkg/configstore/crypto.go,
+  pkg/configstore/crypto_prf_sync_4578_test.go, docs/config-schema.md,
+  docs/next-features/master-password.md, _Log.md
