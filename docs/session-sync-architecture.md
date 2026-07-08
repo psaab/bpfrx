@@ -381,10 +381,57 @@ the server's replies (the exact BIB collision #4381 closed for the same-node cas
   non-NAT64 decision reserves nothing.
 - **Config-drift / scope:** a synced pool address not in any local NAT64 pool is
   skipped gracefully (no panic). This closes the port-COLLISION harm only;
-  reverse-TRANSLATION of a promoted synced NAT64 session still needs
-  `Nat64ReverseInfo` (the original client v6 address, NOT reconstructible from
-  `NatDecision`) to ride the sync payload — a separate wire-field follow-up
-  (`ha.rs` currently sets `nat64_reverse: None`).
+  reverse-TRANSLATION of a promoted synced NAT64 session is completed by #4565
+  (below), which also ARMS this reserve — see the note there.
+
+### NAT64 Reverse-BIB Sync for Promoted Sessions (#4565)
+
+Closes the reverse-TRANSLATION half of the NAT64 HA story #4512 left open, and is
+the change that actually ARMS #4512/#4564's `reserve_synced_nat64_allocation`.
+
+**The gap.** A NAT64 forward flow is keyed on the ORIGINAL IPv6 5-tuple; its
+reverse (v4→v6) reply is keyed on the translated `(server_v4 → snat_v4,
+translated port)` tuple and translated back to IPv6 using the original v6 src/dst
+(`Nat64ReverseInfo`). Pre-#4565, `build_synced_session_entry` (`server/helpers.rs`)
+built the standby's synced entry with `nat64: false` (via `..NatDecision::default()`)
+and `nat64_reverse: None`, and `build_reverse_session_from_forward_match`
+(`afxdp/shared_ops.rs`) hardcoded `nat64_reverse: None`. So a promoted NAT64
+session (a) never reached `build_nat64_forwarded_frame` — TX dispatch keys
+`is_nat64` off `nat.nat64`; (b) could not translate the v4 reply (the frame
+builder hard-requires `nat64_reverse`); and (c) synthesized a WRONG (v6-family)
+reverse companion KEY — `reverse_session_key` derives the reply's v4 address
+family + `(dst_v4 → snat_v4)` tuple from `nat.nat64` + the v4 NAT addresses, so
+without them the server's v4 reply never matched. Because the entry set
+`nat64: false`, #4512/#4564's reserve (gated on `nat.nat64`) was ALSO a silent
+no-op on the real HA path.
+
+**What must ride the wire (verify-first).** The original v6 src/dst ARE the synced
+forward v6 session key (`key.src_ip`/`key.dst_ip` == `orig_src_v6`/`orig_dst_v6`;
+a NAT64 forward flow is keyed on the original tuple and `nat64_match` is gated on
+no-DNAT/no-NPTv6, `<prefix>/96` only), and `dst_v4` is the RFC 6052 /96-embedded
+low 32 bits of the key dst. So the ONE datum the standby cannot reconstruct is
+the translated pool source `snat_v4` (chosen by the active node's
+`allocate_source`, not embedded in the key). A single tag-matched wire field
+carries it (self-signaling — non-empty ⟹ NAT64):
+
+- **Event stream (Rust → Go active):** `FLAG_NAT64` (bit `1<<5`) on the SESSION_OPEN
+  frame + a trailing 4-byte `snat_v4` (after the #3301 fields). Decoded to
+  `SessionDeltaInfo.Nat64` / `Nat64SnatV4` (`eventstream.go`).
+- **Shadow + cluster sync (Go active → Go standby):** stamped onto
+  `SessionValueV6.Nat64SnatV4` (`daemon_ha_userspace.go`), a userspace-sync-only
+  field carried as a length-gated trailing field in `encodeSessionV6Payload`
+  (NOT in the BPF/C conntrack ABI).
+- **Control socket (Go standby → Rust standby):** `SessionSyncRequest.nat64_snat_v4`
+  (Go+Rust, the `protocol_wire_v1.json` / cross-language contract field).
+
+**Rebuild on the standby.** When `nat64_snat_v4` is non-empty,
+`build_synced_session_entry` sets `nat64 = true`, `rewrite_src = snat_v4`,
+`rewrite_dst = dst_v4` (the /96 low 32 of the v6 key dst; the translated port
+already rides `nat_src_port`), and stamps `metadata.nat64_reverse` (orig v6
+src/dst) from the key. `build_reverse_session_from_forward_match` inherits
+`nat64_reverse` onto the synthesized reverse companion, and `reverse_session_key`
+then derives the correct v4 `(server → snat_v4)` reply tuple. Rolling-upgrade
+safe: an old peer omits the field ⇒ not-NAT64 (bit-identical to pre-#4565).
 
 ### Reverse-SNAT `dnat_table` Publish for Synced Sessions (#4393)
 

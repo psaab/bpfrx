@@ -950,6 +950,42 @@ func TestBuildSessionSyncRequestCarriesPolicyFields3301(t *testing.T) {
 	}
 }
 
+// #4565: buildSessionSyncRequestV6 must copy the NAT64 translated pool source
+// (SessionValueV6.Nat64SnatV4) onto the wire as a dotted-quad so the peer helper
+// rebuilds the reverse (v4->v6) BIB after promotion. The JSON key must match the
+// Rust SessionSyncRequest serde(rename = "nat64_snat_v4"). RED-on-revert:
+// dropping the manager_ha.go population leaves req.Nat64SnatV4 empty.
+func TestBuildSessionSyncRequestV6CarriesNat64SnatV4_4565(t *testing.T) {
+	m := &Manager{bpfShim: dataplane.New()}
+	keyV6 := dataplane.SessionKeyV6{Protocol: 6}
+	valV6 := &dataplane.SessionValueV6{
+		IngressZone: 1, EgressZone: 2,
+		Nat64SnatV4: [4]byte{203, 0, 113, 5},
+	}
+	reqV6 := m.buildSessionSyncRequestV6("upsert", keyV6, valV6)
+	if reqV6.Nat64SnatV4 != "203.0.113.5" {
+		t.Fatalf("v6 Nat64SnatV4 = %q, want 203.0.113.5", reqV6.Nat64SnatV4)
+	}
+	js, err := json.Marshal(reqV6)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(js), `"nat64_snat_v4":"203.0.113.5"`) {
+		t.Fatalf("wire JSON missing nat64_snat_v4: %s", js)
+	}
+
+	// A non-NAT64 session leaves the field zero -> omitted from the wire.
+	valPlain := &dataplane.SessionValueV6{IngressZone: 1, EgressZone: 2}
+	reqPlain := m.buildSessionSyncRequestV6("upsert", keyV6, valPlain)
+	if reqPlain.Nat64SnatV4 != "" {
+		t.Fatalf("non-nat64 Nat64SnatV4 = %q, want empty", reqPlain.Nat64SnatV4)
+	}
+	jsPlain, _ := json.Marshal(reqPlain)
+	if strings.Contains(string(jsPlain), "nat64_snat_v4") {
+		t.Fatalf("non-nat64 wire JSON must omit nat64_snat_v4: %s", jsPlain)
+	}
+}
+
 func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
 	m := &Manager{bpfShim: dataplane.New()}
 	key := dataplane.SessionKey{

@@ -938,6 +938,9 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 		// #2785: per-policy log selection from the open-frame flags byte.
 		LogSessionInit:  flags&SessionEventFlagLogSessionInit != 0,
 		LogSessionClose: flags&SessionEventFlagLogSessionClose != 0,
+		// #4565: NAT64 cross-family marker; drives the reverse-BIB rebuild on
+		// the peer-promoted session (see the trailing snat_v4 decode below).
+		Nat64: flags&SessionEventFlagNat64 != 0,
 	}
 
 	// Disposition mapping: 0=Accept, 1=LocalDelivery. #3075: moved [29]->[31].
@@ -984,6 +987,17 @@ func decodeSessionEvent(payload []byte) (SessionDeltaInfo, bool) {
 	}
 	if off+4 <= len(payload) {
 		d.AppTimeout = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	// #4565: trailing NAT64 pool source (4 raw IPv4 octets), length-gated. Only
+	// meaningful when the FLAG_NAT64 bit is set; an old helper omits it (=> 0,
+	// Nat64=false). Carried so a peer-PROMOTED NAT64 session can rebuild its
+	// reverse (v4->v6) BIB after failover — the pool source is the one datum the
+	// standby cannot reconstruct from the synced forward v6 key.
+	if off+4 <= len(payload) {
+		if d.Nat64 && (payload[off] != 0 || payload[off+1] != 0 || payload[off+2] != 0 || payload[off+3] != 0) {
+			d.Nat64SnatV4 = net.IP(payload[off : off+4]).String()
+		}
 		off += 4
 	}
 

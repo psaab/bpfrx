@@ -41457,6 +41457,61 @@ top.
   docs/userspace-dataplane-gaps.md, pkg/api/README.md,
   pkg/api/zone_counter_doc_ref_test.go, _Log.md
 
+## #4565 nat64 HA reverse-translation of promoted synced session (2026-07-08)
+
+- **Timestamp**: 2026-07-08
+- **Action**: VERIFY-FIRST investigation of #4565. Confirmed gap + corrected framing.
+- **Findings**:
+  - The promoted NAT64 session on the standby cannot reverse-translate v4->v6
+    replies: `build_synced_session_entry` (server/helpers.rs) sets
+    `nat64:false` (via `..NatDecision::default()`) and `nat64_reverse:None`;
+    `build_reverse_session_from_forward_match` (shared_ops.rs) hardcodes
+    `nat64_reverse:None`.
+  - Consequence: (a) tx dispatch keys `is_nat64` off `nat.nat64` -> a promoted
+    NAT64 reply takes the plain-forward path, never `build_nat64_forwarded_frame`;
+    (b) even if it did, `nat64_reverse` is None so the v4->v6 frame builder
+    returns None (frame/mod.rs:276) and the reply is dropped; (c) the synthesized
+    reverse companion's KEY (`reverse_session_key`) derives its v4 addr-family +
+    (dst_v4, snat_v4) from `nat.nat64` + the v4 NAT addresses -> without them the
+    reverse key is wrong and the reply never matches. This also silently no-ops
+    #4564's `reserve_synced_nat64_allocation` (its `if !nat.nat64 { return }`).
+  - VERIFY-FIRST correction to the issue framing: the orig v6 src/dst ARE the
+    synced forward v6 session KEY (key.src_ip/key.dst_ip == orig_src_v6/orig_dst_v6;
+    proven at poll_descriptor.rs nat64_match, gated on no-DNAT no-NPTv6 /96 only),
+    so carrying them as a NEW wire field is REDUNDANT. dst_v4 is the /96 low-32
+    of the key dst. The one genuinely un-reconstructable datum is the pool source
+    `snat_v4` (chosen by allocate_source, not in the key) + the nat64 SIGNAL.
+    Design: carry `snat_v4` + a nat64 flag tag-matched Go+Rust; reconstruct the
+    orig v6 addrs + dst_v4 from the forward key on the standby.
+
+- **Timestamp**: 2026-07-08
+- **Action**: Implemented #4565 (nat64 HA reverse-BIB sync). Tag-matched wire
+  field `snat_v4` carries the one un-reconstructable datum; standby rebuilds
+  nat64=true + rewrite_src/dst + nat64_reverse (orig v6 from key). Also ARMS
+  #4512/#4564 (their reserve was a silent no-op without the nat64 flag).
+- **File(s)**:
+    - userspace-dp/src/event_stream/codec.rs (FLAG_NAT64 bit + trailing snat_v4)
+    - userspace-dp/src/event_stream/codec_tests.rs (encode test + #3301 offset fix)
+    - userspace-dp/src/protocol/control.rs (SessionSyncRequest.nat64_snat_v4)
+    - userspace-dp/src/server/helpers.rs (build_nat64_reverse_rebuild + rebuild)
+    - userspace-dp/src/server/tests.rs (RED test)
+    - userspace-dp/src/afxdp/shared_ops.rs (reverse companion inherits nat64_reverse)
+    - userspace-dp/src/afxdp/session_glue/tests.rs (RED test)
+    - userspace-dp/tests/fixtures/protocol_wire_v1.json (regenerated)
+    - pkg/dataplane/userspace/protocol.go (SessionSyncRequest + SessionDeltaInfo + flag)
+    - pkg/dataplane/userspace/eventstream.go (decode FLAG_NAT64 + trailing snat_v4)
+    - pkg/dataplane/userspace/manager_ha.go (buildSessionSyncRequestV6 maps snat_v4)
+    - pkg/dataplane/userspace/manager_test.go (RED test)
+    - pkg/dataplane/userspace/eventstream_test.go (decode RED test)
+    - pkg/dataplane/types.go (SessionValueV6.Nat64SnatV4)
+    - pkg/daemon/daemon_ha_userspace.go (stamp Nat64SnatV4 from delta)
+    - pkg/cluster/sync_protocol.go (encode/decode trailing snat_v4)
+    - pkg/cluster/sync_gen_guard_test.go (RED test + #3301 legacy-trunc fix)
+    - userspace-dp/src/FEATURES.md + docs/session-sync-architecture.md (docs)
+- **Validation**: cargo test 3735/0 (nat64+sync subset 312/0); go test
+  ./pkg/cluster/... ./pkg/dataplane/... green. RED-on-revert proven (Rust
+  helpers rebuild; Go cluster round-trip). NEEDS `make test-failover` before
+  merge (HA session-sync + NAT64 path) — PARENT runs it.
 - **Timestamp**: 2026-07-07
 - **Action**: #4422 high-value Go test-cov batch. Triaged the ~120-item LOW
   test-coverage tracker: verified the named Go domains (filter cross-field /

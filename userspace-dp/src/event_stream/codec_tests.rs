@@ -731,6 +731,53 @@ fn test_encode_session_open_carries_log_flags() {
     assert_eq!(pn[26] & (FLAG_LOG_SESSION_INIT | FLAG_LOG_SESSION_CLOSE), 0);
 }
 
+// #4565: a NAT64 cross-family session must set FLAG_NAT64 (bit 1<<5) on the
+// open frame AND append the translated pool source (snat_v4) as the trailing 4
+// bytes, so a peer-PROMOTED NAT64 session can rebuild its reverse (v4->v6) BIB
+// after failover. Reverting the codec.rs encode drops the flag / pool source
+// and this fails RED.
+#[test]
+fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let zones = test_zone_map();
+    let md = test_metadata();
+
+    // NAT64 forward flow: v6 key, decision rewrites to an IPv4 pool source.
+    let mut decision = test_decision();
+    decision.nat.nat64 = true;
+    decision.nat.rewrite_src = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+    let key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: 6,
+        src_ip: IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        dst_ip: IpAddr::V6("64:ff9b::c0a8:101".parse::<Ipv6Addr>().unwrap()),
+        src_port: 5001,
+        dst_port: 80,
+    };
+    let frame = EventFrame::encode_session_open(1, &key, &decision, &md, &zones, false);
+    let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(
+        payload[26] & FLAG_NAT64,
+        FLAG_NAT64,
+        "nat64 decision must set flags bit 1<<5"
+    );
+    // Trailing 4 bytes are the pool source (appended last).
+    let n = payload.len();
+    assert_eq!(
+        &payload[n - 4..n],
+        &[203, 0, 113, 5],
+        "trailing snat_v4 must be the translated pool source"
+    );
+
+    // A non-NAT64 v4 session: flag clear, trailing snat_v4 all-zero.
+    let frame_plain =
+        EventFrame::encode_session_open(2, &test_key_v4(), &test_decision(), &md, &zones, false);
+    let pp = &frame_plain.data[FRAME_HEADER_SIZE..frame_plain.len as usize];
+    assert_eq!(pp[26] & FLAG_NAT64, 0, "non-nat64 must leave the flag clear");
+    let m = pp.len();
+    assert_eq!(&pp[m - 4..m], &[0, 0, 0, 0], "non-nat64 trailing snat is zero");
+}
+
 // #3301: the admitting policy's firewall metadata (policy_id,
 // policy_counter_idx, inactivity_timeout seconds) rides the open frame as
 // trailing fields after NextHop so a peer-promoted session is correctly
@@ -746,12 +793,13 @@ fn test_encode_session_open_carries_policy_fields_3301() {
     let frame =
         EventFrame::encode_session_open(1, &test_key_v4(), &test_decision(), &md, &zones, false);
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
-    // v4 trailing block is the last 12 bytes: policy_id, policy_counter_idx,
-    // inactivity_timeout (seconds), each u32 LE.
+    // #3301 trailing block: policy_id, policy_counter_idx, inactivity_timeout
+    // (seconds), each u32 LE. #4565 appended a further 4-byte snat_v4 AFTER this
+    // block, so the policy fields are now at [n-16 .. n-4] (snat_v4 = last 4).
     let n = p.len();
-    let policy_id = u32::from_le_bytes(p[n - 12..n - 8].try_into().unwrap());
-    let counter_idx = u32::from_le_bytes(p[n - 8..n - 4].try_into().unwrap());
-    let inact_secs = u32::from_le_bytes(p[n - 4..n].try_into().unwrap());
+    let policy_id = u32::from_le_bytes(p[n - 16..n - 12].try_into().unwrap());
+    let counter_idx = u32::from_le_bytes(p[n - 12..n - 8].try_into().unwrap());
+    let inact_secs = u32::from_le_bytes(p[n - 8..n - 4].try_into().unwrap());
     assert_eq!(policy_id, 42, "policy_id must ride the open frame");
     assert_eq!(counter_idx, 7, "policy_counter_idx must ride the open frame");
     assert_eq!(inact_secs, 30, "inactivity_timeout (ns->s) must ride the open frame");
@@ -767,9 +815,9 @@ fn test_encode_session_open_carries_policy_fields_3301() {
     );
     let pn = &frame_none.data[FRAME_HEADER_SIZE..frame_none.len as usize];
     let m = pn.len();
+    assert_eq!(u32::from_le_bytes(pn[m - 16..m - 12].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(pn[m - 12..m - 8].try_into().unwrap()), 0);
     assert_eq!(u32::from_le_bytes(pn[m - 8..m - 4].try_into().unwrap()), 0);
-    assert_eq!(u32::from_le_bytes(pn[m - 4..m].try_into().unwrap()), 0);
 }
 
 #[test]

@@ -1033,6 +1033,7 @@
     "is_reverse": false,
     "log_session_close": false,
     "log_session_init": false,
+    "nat64_snat_v4": "",
     "nat_dst_ip": "",
     "nat_dst_port": 0,
     "nat_src_ip": "",

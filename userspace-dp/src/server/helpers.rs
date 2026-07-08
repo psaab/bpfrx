@@ -355,6 +355,58 @@ pub(crate) fn build_synced_session_key(
     })
 }
 
+/// #4565: reconstruct the NAT64 cross-family reverse-translation state for a
+/// peer-PROMOTED synced session from the forward v6 `key` + the wire-carried
+/// translated pool source `nat64_snat_v4`.
+///
+/// Returns `Some((snat_v4, dst_v4, Nat64ReverseInfo))` when `snat_v4_str` names
+/// a valid IPv4 pool source AND the forward key is IPv6 (a NAT64 forward flow is
+/// always keyed on the original IPv6 5-tuple); `None` otherwise (not NAT64 / old
+/// peer / malformed). The three outputs are exactly the reverse BIB the standby
+/// cannot otherwise rebuild:
+///   * `snat_v4`  — the translated pool source (the one wire-carried datum).
+///   * `dst_v4`   — the forward v4 destination, the RFC 6052 /96-embedded low 32
+///     bits of the synthetic v6 destination `key.dst_ip` (the codebase only
+///     supports `<prefix>/96`, so the embedded v4 is the trailing 4 octets).
+///   * `Nat64ReverseInfo { orig_src_v6, orig_dst_v6 }` — the original v6 client
+///     source and synthetic v6 destination, which ARE the forward key's src/dst.
+fn build_nat64_reverse_rebuild(
+    key: &crate::session::SessionKey,
+    snat_v4_str: &str,
+) -> Option<(
+    std::net::Ipv4Addr,
+    std::net::Ipv4Addr,
+    crate::nat64::Nat64ReverseInfo,
+)> {
+    if snat_v4_str.is_empty() {
+        return None;
+    }
+    let snat_v4: std::net::Ipv4Addr = snat_v4_str.parse().ok()?;
+    // A NAT64 forward session is keyed on the original IPv6 5-tuple.
+    let (std::net::IpAddr::V6(orig_src_v6), std::net::IpAddr::V6(orig_dst_v6)) =
+        (key.src_ip, key.dst_ip)
+    else {
+        return None;
+    };
+    // RFC 6052 /96: the embedded IPv4 destination is the low 32 bits of the
+    // synthetic IPv6 destination.
+    let dst_octets = orig_dst_v6.octets();
+    let dst_v4 = std::net::Ipv4Addr::new(
+        dst_octets[12],
+        dst_octets[13],
+        dst_octets[14],
+        dst_octets[15],
+    );
+    Some((
+        snat_v4,
+        dst_v4,
+        crate::nat64::Nat64ReverseInfo {
+            orig_src_v6,
+            orig_dst_v6,
+        },
+    ))
+}
+
 pub(crate) fn build_synced_session_entry(
     req: &SessionSyncRequest,
     zone_name_to_id: &rustc_hash::FxHashMap<String, u16>,
@@ -408,6 +460,37 @@ pub(crate) fn build_synced_session_entry(
     } else {
         None
     };
+    // #4565: rebuild a peer-PROMOTED NAT64 session's cross-family NAT decision +
+    // reverse (v4->v6) BIB. A non-empty `nat64_snat_v4` marks a NAT64 forward
+    // session (keyed on the ORIGINAL IPv6 5-tuple = `key.src_ip`/`key.dst_ip`).
+    // The generic `nat_src`/`nat_dst` fields cannot carry a v4 pool source in a
+    // v6 session's slot unambiguously, so on this path they are OVERRIDDEN by
+    // the authoritative reconstruction:
+    //   * `nat64 = true`             -> tx dispatch routes to the NAT64 frame
+    //                                   builder and #4564's standby reserve arms.
+    //   * `rewrite_src = snat_v4`    -> the translated pool source (wire field).
+    //   * `rewrite_dst = dst_v4`     -> the /96-embedded low 32 of the v6 dst.
+    //   * `rewrite_src_port`         -> the translated port (already synced via
+    //                                   `nat_src_port`, kept below).
+    //   * `nat64_reverse`            -> the original v6 src/dst (= the key), which
+    //                                   `build_nat64_forwarded_frame` needs on the
+    //                                   reverse path, and which the synthesized
+    //                                   reverse companion inherits.
+    // `reverse_session_key` then derives the reverse companion's v4 address
+    // family + `(dst_v4 -> snat_v4)` tuple from this decision, so the server's
+    // v4 reply matches after failover. When the field is empty (not NAT64, or an
+    // old peer), the generic decision + `None` reverse are used, bit-identical
+    // to pre-#4565 (rolling-upgrade safe).
+    let nat64_rebuild = build_nat64_reverse_rebuild(&key, &req.nat64_snat_v4);
+    let (nat64_flag, rewrite_src, rewrite_dst, nat64_reverse) = match nat64_rebuild {
+        Some((snat_v4, dst_v4, reverse_info)) => (
+            true,
+            Some(std::net::IpAddr::V4(snat_v4)),
+            Some(std::net::IpAddr::V4(dst_v4)),
+            Some(reverse_info),
+        ),
+        None => (false, nat_src, nat_dst, None),
+    };
     Ok(SyncedSessionEntry {
         protocol: req.protocol,
         tcp_flags: 0,
@@ -432,10 +515,14 @@ pub(crate) fn build_synced_session_entry(
                 tx_vlan_id: req.tx_vlan_id,
             },
             nat: crate::nat::NatDecision {
-                rewrite_src: nat_src,
-                rewrite_dst: nat_dst,
+                rewrite_src,
+                rewrite_dst,
                 rewrite_src_port: nat_src_port,
                 rewrite_dst_port: nat_dst_port,
+                // #4565: set the NAT64 cross-family bit for a promoted NAT64
+                // session so tx dispatch reverse-translates and the reverse key
+                // derives its v4 address family. `nptv6` stays default (false).
+                nat64: nat64_flag,
                 ..crate::nat::NatDecision::default()
             },
         },
@@ -461,7 +548,11 @@ pub(crate) fn build_synced_session_entry(
             owner_rg_id: req.owner_rg_id,
             fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,
-            nat64_reverse: None,
+            // #4565: the original v6 src/dst for the reverse (v4->v6) translation
+            // of a peer-PROMOTED NAT64 session (Some only when nat64_snat_v4 was
+            // carried). The synthesized reverse companion inherits this via
+            // build_reverse_session_from_forward_match.
+            nat64_reverse,
             // #2785: the per-policy `then log` selection is now carried on
             // the HA session-sync wire (open-frame flags bits 1<<3/1<<4 ->
             // SessionSyncRequest.log_session_{init,close}). A synced session

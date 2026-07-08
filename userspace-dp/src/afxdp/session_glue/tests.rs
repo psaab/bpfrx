@@ -3281,6 +3281,84 @@ fn synthesized_synced_reverse_entry_preserves_fabric_ingress_and_reverse_flag() 
     );
 }
 
+// #4565: the synthesized reverse companion of a peer-PROMOTED NAT64 forward
+// session must inherit the forward session's `nat64_reverse` (original v6
+// src/dst). `build_nat64_forwarded_frame`'s reverse (v4->v6) branch hard-
+// requires it — without it the server's v4 reply cannot be translated back to
+// IPv6 and is dropped. RED-on-revert: restoring `nat64_reverse: None` in
+// build_reverse_session_from_forward_match makes the inheritance assertion fail.
+#[test]
+fn synthesized_synced_reverse_entry_inherits_nat64_reverse_4565() {
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+
+    let orig_src_v6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+    let orig_dst_v6 = "64:ff9b::c0a8:101".parse::<Ipv6Addr>().unwrap();
+    let reverse_info = Nat64ReverseInfo {
+        orig_src_v6,
+        orig_dst_v6,
+    };
+
+    let mut metadata = test_metadata();
+    metadata.nat64_reverse = Some(reverse_info);
+
+    // NAT64 forward flow keyed on the original IPv6 5-tuple; the decision
+    // rewrites to an IPv4 pool source + IPv4 destination (nat64 = true).
+    let entry = SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V6(orig_src_v6),
+            dst_ip: IpAddr::V6(orig_dst_v6),
+            src_port: 5001,
+            dst_port: 80,
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+                rewrite_src_port: Some(40000),
+                rewrite_dst_port: None,
+                nat64: true,
+                nptv6: false,
+            },
+        },
+        metadata,
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+    };
+
+    let reverse = synthesized_synced_reverse_entry(
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        &entry,
+        1,
+    )
+    .expect("reverse companion");
+
+    assert!(reverse.metadata.is_reverse);
+    assert_eq!(
+        reverse.metadata.nat64_reverse,
+        Some(reverse_info),
+        "reverse companion must inherit the forward NAT64 reverse info"
+    );
+    assert!(
+        reverse.decision.nat.nat64,
+        "reversed NAT decision keeps the nat64 bit"
+    );
+    // The reverse companion is keyed on the v4 reply tuple (server -> snat_v4).
+    assert_eq!(reverse.key.addr_family, libc::AF_INET as u8);
+    assert_eq!(
+        reverse.key.src_ip,
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))
+    );
+    assert_eq!(reverse.key.dst_ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+}
+
 #[test]
 fn synthesized_synced_reverse_entry_tracks_local_client_when_owner_rg_active() {
     let forwarding = test_forwarding_state();

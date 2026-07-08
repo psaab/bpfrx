@@ -1009,6 +1009,20 @@ pub(crate) struct SessionSyncRequest {
     /// behavior, rolling-upgrade safe).
     #[serde(rename = "inactivity_timeout", default)]
     pub inactivity_timeout: u32,
+    /// #4565: the NAT64 translated pool SOURCE (dotted-quad IPv4 string). A
+    /// non-empty value is the SIGNAL that this synced forward session is a NAT64
+    /// cross-family translation: the receiver sets `nat.nat64`, rewrites the
+    /// forward source to this v4 pool address, reconstructs the forward v4
+    /// destination from the /96-embedded low 32 bits of the (v6) `dst_ip`, and
+    /// rebuilds the RFC 6146 reverse (v4->v6) BIB — the original v6 src/dst are
+    /// the synced forward `src_ip`/`dst_ip` themselves, so only this pool source
+    /// (chosen by the active node's `allocate_source`, not embedded in the key)
+    /// must ride the wire. Enables a peer-PROMOTED NAT64 session to reverse-
+    /// translate its replies after failover, and arms #4564's standby port
+    /// reservation (which gates on `nat.nat64`). `serde(default)` => "" on an
+    /// old peer that omits it, decoding to "not NAT64" (rolling-upgrade safe).
+    #[serde(rename = "nat64_snat_v4", default)]
+    pub nat64_snat_v4: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
