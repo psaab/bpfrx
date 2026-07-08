@@ -98,6 +98,7 @@ func TestDefaultPolicyLogCompiles(t *testing.T) {
 func TestDefaultPolicyLogSchemaValidates(t *testing.T) {
 	for _, flag := range []string{"session-init", "session-close"} {
 		tree := buildDefaultPolicyLogTree(t, []string{
+			"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
 			"set security zones security-zone trust interfaces eth0",
 			"set security policies default-policy permit-all",
 			"set security policies default-policy-log " + flag,

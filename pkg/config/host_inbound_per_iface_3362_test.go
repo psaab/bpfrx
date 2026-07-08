@@ -13,6 +13,8 @@ import (
 // InterfaceHostInbound stays nil — both fail this test.
 func Test_3362_PerInterfaceHostInboundParses(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
 		// zone-level: nothing on the zone, ssh only on the uplink interface.
 		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services ssh",
 		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic protocols ospf",
@@ -73,7 +75,11 @@ func Test_3362_PerInterfaceUnknownTokenFailsCommit(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tree := buildTree(t, tc.cmds)
+			// #4515: define ge-0/0/0 so the strict zone-interface-defined gate is
+			// satisfied and the intended host-inbound-token reject is what fires.
+			tree := buildTree(t, append([]string{
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+			}, tc.cmds...))
 			if _, err := CompileConfig(tree); err == nil {
 				t.Fatal("expected commit to reject an unknown interface-level host-inbound token")
 			} else if !strings.Contains(err.Error(), tc.wantSub) {
@@ -89,6 +95,7 @@ func Test_3362_PerInterfaceUnknownTokenFailsCommit(t *testing.T) {
 // interface-level token (mixed with a zone-level stanza) must commit.
 func Test_3362_PerInterfaceKnownTokenCommits(t *testing.T) {
 	tree := buildTree(t, []string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
 		"set security zones security-zone wan host-inbound-traffic system-services ping",
 		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic system-services ssh",
 		"set security zones security-zone wan interfaces ge-0/0/0.0 host-inbound-traffic protocols all",

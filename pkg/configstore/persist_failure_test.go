@@ -31,6 +31,9 @@ func commitBaseline(t *testing.T, s *Store) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
+	if err := s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24"); err != nil {
+		t.Fatalf("SetFromInput (iface): %v", err)
+	}
 	if err := s.SetFromInput("security zones security-zone trust interfaces eth0.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -52,6 +55,7 @@ func TestCommit_PersistFailureFailsCommitCleanly(t *testing.T) {
 				t.Fatalf("ListCommitHistory: %v", err)
 			}
 
+			s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 			if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
 				t.Fatalf("SetFromInput: %v", err)
 			}
@@ -117,6 +121,7 @@ func TestRestart_AfterFailedOperatorPersistLoadsPreviousConfig(t *testing.T) {
 	s1 := newTestStoreAt(t, path)
 	commitBaseline(t, s1)
 
+	s1.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	if err := s1.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -148,6 +153,7 @@ func TestCommitConfirmed_NotArmedOnPersistFailure(t *testing.T) {
 	s := newTestStore(t)
 	commitBaseline(t, s)
 
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -181,6 +187,7 @@ func TestCommitConfirmed_PersistFailurePreservesExistingConfirmState(t *testing.
 	baseSet := s.ShowActiveSet()
 
 	// Pending confirmed commit 1 (succeeds).
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -194,6 +201,7 @@ func TestCommitConfirmed_PersistFailurePreservesExistingConfirmState(t *testing.
 	timerBefore := s.confirmTimer
 
 	// Commit 2 fails to persist.
+	s.SetFromInput("interfaces eth2 unit 0 family inet address 10.2.0.1/24")
 	if err := s.SetFromInput("security zones security-zone dmz interfaces eth2.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -230,6 +238,7 @@ func TestNestedCommitConfirmed_PreservesLastConfirmedTree(t *testing.T) {
 	baseSet := s.ShowActiveSet()
 
 	// Pending confirmed commit 1 (never confirmed).
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -238,6 +247,7 @@ func TestNestedCommitConfirmed_PreservesLastConfirmedTree(t *testing.T) {
 	}
 
 	// Nested confirmed commit 2 (also never confirmed).
+	s.SetFromInput("interfaces eth2 unit 0 family inet address 10.2.0.1/24")
 	if err := s.SetFromInput("security zones security-zone dmz interfaces eth2.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -261,7 +271,16 @@ func TestNestedCommitConfirmed_PreservesLastConfirmedTree(t *testing.T) {
 	}
 }
 
-const syncContent = "security {\n" +
+const syncContent = "interfaces {\n" +
+	"    eth3 {\n" +
+	"        unit 0 {\n" +
+	"            family inet {\n" +
+	"                address 10.3.0.1/24;\n" +
+	"            }\n" +
+	"        }\n" +
+	"    }\n" +
+	"}\n" +
+	"security {\n" +
 	"    zones {\n" +
 	"        security-zone synced {\n" +
 	"            interfaces {\n" +
@@ -394,6 +413,7 @@ func TestAutoRollback_ProceedsAndFlagsOnPersistFailure(t *testing.T) {
 
 	// Pending confirmed commit (persists fine; disk now holds the
 	// unconfirmed candidate).
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -467,6 +487,7 @@ func TestCommit_SuccessClearsDegradedFlag(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
+	s.SetFromInput("interfaces eth4 unit 0 family inet address 10.4.0.1/24")
 	if err := s.SetFromInput("security zones security-zone trust2 interfaces eth4.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -490,6 +511,7 @@ func TestStaleConfirmTimerCallbackIsNoOp(t *testing.T) {
 	commitBaseline(t, s)
 
 	// Commit 1 confirmed: arms timer generation g1.
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	if err := s.SetFromInput("security zones security-zone confirm1 interfaces eth1.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}
@@ -499,6 +521,7 @@ func TestStaleConfirmTimerCallbackIsNoOp(t *testing.T) {
 	g1 := s.confirmGen
 
 	// Nested commit 2 confirmed: supersedes g1 with g2.
+	s.SetFromInput("interfaces eth2 unit 0 family inet address 10.2.0.1/24")
 	if err := s.SetFromInput("security zones security-zone confirm2 interfaces eth2.0"); err != nil {
 		t.Fatalf("SetFromInput: %v", err)
 	}

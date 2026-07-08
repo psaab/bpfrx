@@ -43,6 +43,8 @@ func junosHostWarnings(t *testing.T, cmds []string) []string {
 // baseZones is the minimal zone/address-book scaffolding the junos-host policy
 // cases reference.
 var junosHostBaseZones = []string{
+	"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+	"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
 	"set security zones security-zone untrust interfaces ge-0/0/1.0",
 	"set security zones security-zone untrust host-inbound-traffic system-services ssh",
 	"set security zones security-zone trust interfaces ge-0/0/0.0",

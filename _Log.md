@@ -84,6 +84,54 @@
   cases, no other field changed), `docs/host-inbound-multicast.md` (new),
   `docs/host-inbound-service-matrix.md`, `_Log.md`.
 
+## 2026-07-07 — #4515 config: promote zone→undefined-interface to a strict commit reject (F6); F11-part2 kept warn-only (deliberate)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4515 (ps-review-002 F6/F11, GO-only, pkg/config). VERIFY-FIRST
+  on current master, then drove F6 and SKIPPED F11-part2 with rationale.
+  F6 — a `security zones security-zone <z> interfaces <if>` entry naming an
+  interface NOT defined under `interfaces` was warn-only; Junos hard-rejects it.
+  Promoted to a strict commit / commit-check reject
+  (`validateZoneInterfaceDefinedStrict`, `compiler_validate_strict_zones.go`,
+  gated in `runUniformGates` after the #3072 membership gate), lenient-downgrade
+  to a warning on the tolerant load / peer-sync path
+  (`opts.lenientZoneInterfaceDefined`, #1960 no-brick). The safeguard against the
+  #4191 over-rejection class is `zoneReferenceableInterfaceBases`: a GENEROUS
+  union of every configured interface + `lo0` (always-materialized loopback) +
+  every IPsec `bind-interface` secure-tunnel base (st0.x materialized at apply
+  time). Removed the old warn loop from `ValidateConfig` (kept `configuredIfaces`
+  for the routing-instance warn, which stays warn-only). RED-on-revert: without
+  the gate the undefined-interface config compiles clean (warn-only) — the new
+  test then FAILS; the lenient path warns not bricks; valid + lo0 + bind-st0.0
+  configs commit clean. F11-part2 (malformed address-book VALUE, e.g.
+  `10.0.1.0/32/24`) kept WARN-ONLY deliberately: the `address` schema leaf is an
+  intentionally-open `multi:true children:nil` leaf and the non-literal Junos
+  forms (dns-name/range-address/wildcard-address) are unmodeled — they and a
+  malformed prefix BOTH compile to an empty prefix and share the same warn, so a
+  strict promotion would false-reject the valid non-literal forms (#4191 class);
+  the residual fail-open is narrow/theoretical (empty prefix is fail-closed for
+  permit rules). Fixed test fixtures across pkg/config that referenced zone
+  interfaces without defining them + one real deploy config
+  (`test/incus/xpf-internet-test.conf`, added `enp6s0`). Cross-package blast
+  radius from the new strict gate fixed the same way (add-only interface defs
+  to fixtures) in pkg/configstore, pkg/cli, pkg/api, pkg/grpcapi,
+  pkg/dataplane/userspace so every commit stays bisect-green. #4406 compile
+  golden baseline UNCHANGED (corpus had 0 undefined-interface warnings; the
+  superset union rejects nothing the warn didn't already flag); grpcapi
+  show-text golden UNCHANGED (interface defs don't alter the captured show
+  topics). go test ./pkg/... green (except the PRE-EXISTING, unrelated
+  pkg/fsatomic `TestNoDirectOsWriteFile` flag on daemon/daemon_flow.go);
+  go build; gofmt+vet clean on all touched files.
+- **File(s)**: pkg/config/compiler_validate_strict_zones.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/zone_interface_defined_4515_test.go,
+  pkg/config/zone_interface_membership_test.go,
+  pkg/config/addressbook_name_slash_4340_test.go,
+  pkg/config/parser_routing_test.go, pkg/config/parser_security_test.go,
+  (+ additional pkg/config *_test.go fixtures), test/incus/xpf-internet-test.conf,
+  docs/config-schema.md, _Log.md
+
 ## 2026-07-07 — #3226 host-inbound: commit-time advisory for `system-services all` / `any-service` packet-wide full-admit
 
 - **Timestamp**: 2026-07-07

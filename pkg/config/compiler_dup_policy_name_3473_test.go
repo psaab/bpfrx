@@ -175,6 +175,8 @@ security {
 func TestDuplicatePolicyNameFlatSetMergesToOnePolicy(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces eth1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security zones security-zone untrust interfaces eth1",
 		"set security policies from-zone trust to-zone untrust policy allow match source-address any",

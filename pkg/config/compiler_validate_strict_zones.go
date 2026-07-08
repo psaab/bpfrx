@@ -294,6 +294,126 @@ func validateZoneInterfaceMembershipStrict(cfg *Config) error {
 	return nil
 }
 
+// zoneReferenceableInterfaceBases returns the set of interface BASE names a
+// `security zones security-zone <z> interfaces <if>` entry may legitimately
+// reference. It is the union validateZoneInterfaceDefinedStrict checks a zone
+// member against, and is DELIBERATELY GENEROUS to avoid the #4191
+// over-rejection class: a false reject would brick an otherwise-valid commit,
+// which is far worse than missing a typo (the daemon already brings an
+// interface that is ABSENT from the config DOWN, so an unresolved zone member
+// is fail-CLOSED for real traffic — a missed typo silently carries no packets,
+// it never fails open).
+//
+// The union is:
+//
+//   - every explicitly-configured interface (cfg.Interfaces.Interfaces) — the
+//     ordinary case; a zone member "ge-0/0/0.0" strips to base "ge-0/0/0".
+//     GRE / IPIP / WireGuard tunnels (`set interfaces gr-0/0/0 tunnel ...`)
+//     and VRF (routing-instance) member interfaces are covered by this term
+//     for free: a tunnel device and a routing-instance member must both be
+//     configured under `interfaces`, so they are already keys of this map.
+//   - "lo0" — the loopback is a reserved, always-present interface in Junos
+//     and is always materialized by the daemon, so a zone may reference it
+//     (host-inbound self-traffic) even with no explicit `set interfaces lo0`.
+//   - every secure-tunnel base derived from an IPsec `bind-interface`
+//     (cfg.Security.IPsec.VPNs[*].BindInterface). `bind-interface st0.0`
+//     materializes the st0 xfrmi device at apply time (daemon_apply
+//     ApplyXfrmi -> routing.ApplyXfrmi) even when the config carries no
+//     explicit `set interfaces st0 unit 0`, so a zone referencing st0.0 is a
+//     valid, daemon-materialized dynamic interface. The base is the bind
+//     string with any ".unit" stripped (st0.0 -> st0, st0 -> st0), so every
+//     unit of a bound secure tunnel is admitted.
+func zoneReferenceableInterfaceBases(cfg *Config) map[string]bool {
+	known := make(map[string]bool, len(cfg.Interfaces.Interfaces)+1)
+	for name := range cfg.Interfaces.Interfaces {
+		known[name] = true
+	}
+	// lo0 is always materialized (loopback); reserved always-present in Junos.
+	known["lo0"] = true
+	// Secure-tunnel devices are materialized from IPsec bind-interface strings
+	// at apply time even without an explicit `set interfaces stN`.
+	for _, vpn := range cfg.Security.IPsec.VPNs {
+		if vpn == nil || vpn.BindInterface == "" {
+			continue
+		}
+		base := vpn.BindInterface
+		if idx := strings.Index(base, "."); idx > 0 {
+			base = base[:idx]
+		}
+		known[base] = true
+	}
+	return known
+}
+
+// validateZoneInterfaceDefinedStrict hard-rejects a `security zones
+// security-zone <z> interfaces <if>` entry that names an interface which is
+// neither configured under `interfaces` nor a daemon-materialized dynamic
+// interface (loopback / IPsec secure-tunnel) — the ps-review-002 F6 parity gap
+// (#4515). Junos hard-rejects a zone member that references an undefined
+// interface; xpf previously only WARNED (compiler_validate_warn.go), then
+// compiled and KEPT the zone. At runtime the referenced interface is absent, so
+// the daemon brings it DOWN (fail-closed for real traffic) — safe, but silent:
+// the operator's typo'd `ge-0/0/99` zone member carries no packets with no
+// commit-time signal. This gate restores the Junos commit-time reject.
+//
+// The reference set is the GENEROUS union zoneReferenceableInterfaceBases
+// builds (see its comment): the naive check that built the set only from
+// cfg.Interfaces.Interfaces is why this gap was left warn-only — it would
+// FALSE-REJECT a zone that legitimately references a daemon-materialized
+// interface such as an IPsec `bind-interface st0.0` secure tunnel or lo0 (the
+// #4191 over-rejection class). Unioning lo0 + the IPsec secure-tunnel bases in
+// first is the safeguard that makes the promotion safe.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject so the
+// operator sees the typo); downgraded to a cfg.Warnings entry on the tolerant
+// load / peer-sync paths (CompileConfigLenient / CompileConfigForNodeLenient,
+// flag lenientZoneInterfaceDefined) so an already-persisted or peer-synced
+// config an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine) — the runtime keeps its existing behavior (the unresolved member
+// carries no traffic), just with an operator-visible warning instead of a hard
+// reject. Zones are walked in sorted name order so the first-reported error is
+// deterministic. Unit suffixes are stripped exactly as the dataplane
+// interface->zone map (and the prior warn loop) do, so a `.0`/`.50` unit
+// reference resolves against its base.
+func validateZoneInterfaceDefinedStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	known := zoneReferenceableInterfaceBases(cfg)
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zoneName := range zoneNames {
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		for _, ifName := range zone.Interfaces {
+			if ifName == "" {
+				continue
+			}
+			base := ifName
+			if idx := strings.Index(ifName, "."); idx > 0 {
+				base = ifName[:idx]
+			}
+			if !known[base] {
+				return fmt.Errorf(
+					"security zone %q references interface %q, which is not "+
+						"defined under `interfaces` (nor materialized as the lo0 "+
+						"loopback or an IPsec secure-tunnel bind-interface); Junos "+
+						"rejects a zone member that names no configured interface — "+
+						"define the interface or fix the typo (the daemon brings an "+
+						"unconfigured interface DOWN, so the zone member silently "+
+						"carries no traffic)",
+					zoneName, ifName)
+			}
+		}
+	}
+	return nil
+}
+
 // validateHostInboundTokensStrict rejects an unknown / typo'd
 // `security zones <z> host-inbound-traffic { system-services <tok>; protocols
 // <tok>; }` token at commit (#3200). The schema models system-services /

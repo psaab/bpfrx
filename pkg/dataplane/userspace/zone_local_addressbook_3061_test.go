@@ -61,6 +61,8 @@ func policyDestAddrs(t *testing.T, snap *ConfigSnapshot, fromZone, toZone, name 
 // revert at the CompileConfig step.
 func TestZoneLocalAddressBookResolves(t *testing.T) {
 	cfg := compileSet(t, []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces eth1 unit 0 family inet address 10.0.2.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security zones security-zone untrust interfaces eth1",
 		"set security zones security-zone trust address-book address web-server 10.0.1.100/32",
@@ -95,6 +97,9 @@ func TestZoneLocalAddressBookResolves(t *testing.T) {
 // to the global 10.9.9.9/32 — the zone-local assertion goes RED.
 func TestZoneLocalAddressBookScoping(t *testing.T) {
 	cfg := compileSet(t, []string{
+		"set interfaces eth0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces eth1 unit 0 family inet address 10.0.2.1/24",
+		"set interfaces eth2 unit 0 family inet address 10.0.3.1/24",
 		"set security zones security-zone trust interfaces eth0",
 		"set security zones security-zone untrust interfaces eth1",
 		"set security zones security-zone dmz interfaces eth2",

@@ -658,6 +658,15 @@ func TestRouterAdvertisement(t *testing.T) {
 
 func TestRoutingInstanceWithZone(t *testing.T) {
 	input := `
+interfaces {
+    enp7s0 {
+        unit 0 {
+            family inet {
+                address 10.0.2.10/24;
+            }
+        }
+    }
+}
 routing-instances {
     isp-a {
         instance-type virtual-router;

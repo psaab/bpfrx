@@ -21,6 +21,11 @@ func lifelineZonesGRPCStore(t *testing.T) *configstore.Store {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}
 	if err := store.LoadOverride(`
+interfaces {
+    em0 { unit 0 { family inet { address 10.0.99.1/24; } } }
+    ge-0/0/0 { unit 0 { family inet { address 10.0.0.1/24; } } }
+    ge-0/0/1 { unit 0 { family inet { address 10.0.1.1/24; } } }
+}
 security {
     zones {
         security-zone mgmt {

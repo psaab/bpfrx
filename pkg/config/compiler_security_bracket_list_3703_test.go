@@ -27,6 +27,14 @@ import (
 func setTree3703(t *testing.T, cmds ...string) *ConfigTree {
 	t.Helper()
 	tree := &ConfigTree{}
+	// #4515: zone members below reference ge-0/0/0 and ge-0/0/1; define them so
+	// the strict zone-interface-defined gate (validateZoneInterfaceDefinedStrict)
+	// is satisfied — this fixture predates that gate and only exercises
+	// host-inbound / policy-log grammar, not interface validation.
+	cmds = append([]string{
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.1.1/24",
+	}, cmds...)
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -128,6 +136,15 @@ func TestHostInbound3703KeepsAllListValues(t *testing.T) {
 // does not regress the block spelling.
 func TestHostInbound3703HierarchicalBlockShape(t *testing.T) {
 	tree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {

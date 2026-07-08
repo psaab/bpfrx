@@ -31,6 +31,8 @@ func feedBase3294() []string {
 		"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
 		"set security dynamic-address address-name bad-actors profile feed-name malware",
 		"set security address-book global address good-host 10.0.0.0/8",
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0-0-2 unit 0 family inet address 10.0.2.1/24",
 		"set security zones security-zone lan interfaces ge-0-0-1.0",
 		"set security zones security-zone wan interfaces ge-0-0-2.0",
 	}

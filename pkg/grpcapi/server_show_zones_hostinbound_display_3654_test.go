@@ -25,6 +25,10 @@ func hostInboundGRPCServer(t *testing.T) *Server {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}
 	if err := store.LoadOverride(`
+interfaces {
+    ge-0/0/9 { unit 0 { family inet { address 10.0.9.1/24; } } }
+    ge-0/0/1 { unit 0 { family inet { address 10.0.1.1/24; } } }
+}
 security {
     zones {
         security-zone trust {

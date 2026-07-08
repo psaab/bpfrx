@@ -245,7 +245,9 @@ func TestSetAndCommit(t *testing.T) {
 
 	// Set outside config mode should fail after exit
 	cmds := []string{
+		"interfaces eth0 unit 0 family inet address 10.0.0.1/24",
 		"security zones security-zone trust interfaces eth0.0",
+		"interfaces eth1 unit 0 family inet address 10.1.0.1/24",
 		"security zones security-zone untrust interfaces eth1.0",
 	}
 	for _, cmd := range cmds {
@@ -302,6 +304,7 @@ func TestSetOutsideConfigMode(t *testing.T) {
 	s := newTestStore(t)
 
 	// Set without entering config mode should fail
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	err := s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if err == nil {
 		t.Error("expected error when setting outside config mode")
@@ -315,8 +318,11 @@ func TestDeletePath(t *testing.T) {
 	}
 
 	cmds := []string{
+		"interfaces eth0 unit 0 family inet address 10.0.0.1/24",
 		"security zones security-zone trust interfaces eth0.0",
+		"interfaces eth1 unit 0 family inet address 10.1.0.1/24",
 		"security zones security-zone trust interfaces eth1.0",
+		"interfaces eth2 unit 0 family inet address 10.2.0.1/24",
 		"security zones security-zone untrust interfaces eth2.0",
 	}
 	for _, cmd := range cmds {
@@ -359,12 +365,14 @@ func TestShowCompare(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Modify candidate
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 
 	diff := s.ShowCompare()
@@ -383,6 +391,7 @@ func TestRollback(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	cfg1, err := s.Commit()
 	if err != nil {
@@ -393,6 +402,7 @@ func TestRollback(t *testing.T) {
 	}
 
 	// Commit 2: add untrust zone
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	cfg2, err := s.Commit()
 	if err != nil {
@@ -429,12 +439,14 @@ func TestRollbackZero(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Modify candidate
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	if !s.IsDirty() {
 		t.Error("should be dirty after modification")
@@ -465,6 +477,7 @@ func TestDirtyFlag(t *testing.T) {
 		t.Error("should not be dirty initially")
 	}
 
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if !s.IsDirty() {
 		t.Error("should be dirty after set")
@@ -485,6 +498,7 @@ func TestCommitConfirmedAutoRollback(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -498,6 +512,7 @@ func TestCommitConfirmedAutoRollback(t *testing.T) {
 	})
 
 	// Commit confirmed with very short timeout (use CommitConfirmed with 1 min)
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 
 	// We can't easily test the real timer with minutes, so verify the state tracking
@@ -640,7 +655,9 @@ func TestLoadAndSave(t *testing.T) {
 	if err := s1.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s1.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s1.SetFromInput("security zones security-zone trust interfaces eth0.0")
+	s1.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s1.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	if _, err := s1.Commit(); err != nil {
 		t.Fatal(err)
@@ -682,12 +699,14 @@ func TestRollbackFilesPersistence(t *testing.T) {
 	}
 
 	// Commit 1
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Commit 2
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -718,12 +737,14 @@ func TestShowRollback(t *testing.T) {
 	}
 
 	// Commit 1
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Commit 2
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -789,13 +810,23 @@ func TestLoadOverride(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Load override replaces entire candidate
-	hierConfig := `security {
+	hierConfig := `interfaces {
+    eth2 {
+        unit 0 {
+            family inet {
+                address 10.2.0.1/24;
+            }
+        }
+    }
+}
+security {
     zones {
         security-zone dmz {
             interfaces {
@@ -840,10 +871,20 @@ func TestLoadMergeHierarchical(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 
 	// Merge hierarchical config — should add untrust without removing trust
-	hierConfig := `security {
+	hierConfig := `interfaces {
+    eth1 {
+        unit 0 {
+            family inet {
+                address 10.1.0.1/24;
+            }
+        }
+    }
+}
+security {
     zones {
         security-zone untrust {
             interfaces {
@@ -879,10 +920,13 @@ func TestLoadMergeSetFormat(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 
 	// Merge set-format commands
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	setConfig := `set security zones security-zone untrust interfaces eth1.0
+set interfaces eth2 unit 0 family inet address 10.2.0.1/24
 set security zones security-zone dmz interfaces eth2.0`
 
 	if err := s.LoadMerge(setConfig); err != nil {
@@ -911,8 +955,10 @@ func TestLoadMergeRejectsGarbageLine(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	setConfig := `set security zones security-zone trust interfaces eth0.0
 not-a-set-line
+set interfaces eth1 unit 0 family inet address 10.1.0.1/24
 set security zones security-zone untrust interfaces eth1.0`
 
 	if err := s.LoadMerge(setConfig); err == nil {
@@ -989,11 +1035,14 @@ func TestLoadMergeWithDelete(t *testing.T) {
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 
 	// Merge with delete command
 	setConfig := `delete security zones security-zone untrust
+set interfaces eth2 unit 0 family inet address 10.2.0.1/24
 set security zones security-zone dmz interfaces eth2.0`
 
 	if err := s.LoadMerge(setConfig); err != nil {
@@ -1017,6 +1066,7 @@ func TestLoadOutsideConfigMode(t *testing.T) {
 		t.Error("expected error when loading outside config mode")
 	}
 
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	err = s.LoadMerge("set security zones security-zone trust interfaces eth0.0")
 	if err == nil {
 		t.Error("expected error when loading outside config mode")
@@ -1030,12 +1080,14 @@ func TestShowCompareRollback(t *testing.T) {
 	}
 
 	// Commit 1: trust zone
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Commit 2: add untrust
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -1059,6 +1111,7 @@ func TestShowActiveSetAndCandidateSet(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -1086,6 +1139,7 @@ func TestExportJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -1110,12 +1164,14 @@ func TestCommitDiffSummary(t *testing.T) {
 	}
 
 	// First commit: add trust zone
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
 	}
 
 	// Second commit: add untrust zone
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 
 	// Check diff summary before commit
@@ -1153,6 +1209,7 @@ func TestListCommitHistory(t *testing.T) {
 	}
 
 	// Commit and check history
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	if _, err := s.Commit(); err != nil {
 		t.Fatal(err)
@@ -1571,6 +1628,7 @@ func TestCommitWithDescription(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	s.SetFromInput("interfaces eth0 unit 0 family inet address 10.0.0.1/24")
 	s.SetFromInput("security zones security-zone trust interfaces eth0.0")
 	cfg, err := s.CommitWithDescription("initial trust zone setup")
 	if err != nil {
@@ -1608,6 +1666,7 @@ func TestCommitWithDescription(t *testing.T) {
 	}
 
 	// Second commit without description should still work
+	s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24")
 	s.SetFromInput("security zones security-zone untrust interfaces eth1.0")
 	cfg2, err := s.Commit()
 	if err != nil {
@@ -1732,6 +1791,7 @@ func TestRenameConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmds := []string{
+		"interfaces eth0 unit 0 family inet address 10.0.0.1/24",
 		"security zones security-zone oldname interfaces eth0.0",
 	}
 	for _, cmd := range cmds {

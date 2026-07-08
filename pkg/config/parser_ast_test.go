@@ -273,7 +273,11 @@ func TestParseHierarchical(t *testing.T) {
 }
 
 func TestCompileConfig(t *testing.T) {
-	input := `security {
+	input := `interfaces {
+    eth0 { unit 0 { family inet { address 10.0.1.1/24; } } }
+    eth1 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
+security {
     zones {
         security-zone trust {
             interfaces {
@@ -461,7 +465,7 @@ func TestFormatSetQuotedKeys(t *testing.T) {
 
 func TestSetPathSchema(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set security zones security-zone trust interfaces eth0.0", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust screen untrust-screen", "set security zones security-zone untrust interfaces eth1.0", "set security policies from-zone trust to-zone untrust policy allow-web match source-address any", "set security policies from-zone trust to-zone untrust policy allow-web match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-web match application junos-http", "set security policies from-zone trust to-zone untrust policy allow-web then permit", "set security policies from-zone trust to-zone untrust policy allow-web then log session-init", "set security policies from-zone trust to-zone untrust policy allow-web then count", "set security screen ids-option myscreen tcp land", "set security screen ids-option myscreen icmp ping-death", "set security screen ids-option untrust-screen tcp land", "set security address-book global address srv1 10.0.1.10/32", "set security address-book global address-set servers address srv1", "set interfaces eth0 unit 0 family inet address 10.0.1.1/24", "set applications application my-app protocol tcp", "set applications application my-app destination-port 8080"}
+	setCommands := []string{"set security zones security-zone trust interfaces eth0.0", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust screen untrust-screen", "set security zones security-zone untrust interfaces eth1.0", "set interfaces eth1 unit 0 family inet address 10.0.2.1/24", "set security policies from-zone trust to-zone untrust policy allow-web match source-address any", "set security policies from-zone trust to-zone untrust policy allow-web match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-web match application junos-http", "set security policies from-zone trust to-zone untrust policy allow-web then permit", "set security policies from-zone trust to-zone untrust policy allow-web then log session-init", "set security policies from-zone trust to-zone untrust policy allow-web then count", "set security screen ids-option myscreen tcp land", "set security screen ids-option myscreen icmp ping-death", "set security screen ids-option untrust-screen tcp land", "set security address-book global address srv1 10.0.1.10/32", "set security address-book global address-set servers address srv1", "set interfaces eth0 unit 0 family inet address 10.0.1.1/24", "set applications application my-app protocol tcp", "set applications application my-app destination-port 8080"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -601,7 +605,7 @@ func TestSetPathSingleValueDedup(t *testing.T) {
 
 func TestDeletePath(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set security zones security-zone trust interfaces eth0.0", "set security zones security-zone trust interfaces eth2.0", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone untrust interfaces eth1.0", "set security address-book global address srv1 10.0.1.10/32", "set security address-book global address srv2 10.0.2.10/32", "set security policies from-zone trust to-zone untrust policy allow-web match source-address any", "set security policies from-zone trust to-zone untrust policy allow-web match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-web match application junos-http", "set security policies from-zone trust to-zone untrust policy allow-web then permit"}
+	setCommands := []string{"set interfaces eth0 unit 0 family inet address 10.0.1.1/24", "set interfaces eth1 unit 0 family inet address 10.0.2.1/24", "set interfaces eth2 unit 0 family inet address 10.0.3.1/24", "set security zones security-zone trust interfaces eth0.0", "set security zones security-zone trust interfaces eth2.0", "set security zones security-zone trust host-inbound-traffic system-services ssh", "set security zones security-zone untrust interfaces eth1.0", "set security address-book global address srv1 10.0.1.10/32", "set security address-book global address srv2 10.0.2.10/32", "set security policies from-zone trust to-zone untrust policy allow-web match source-address any", "set security policies from-zone trust to-zone untrust policy allow-web match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-web match application junos-http", "set security policies from-zone trust to-zone untrust policy allow-web then permit"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -973,6 +977,10 @@ func TestApplicationSet(t *testing.T) {
         application junos-https;
         application my-app;
     }
+}
+interfaces {
+    eth0 { unit 0 { family inet { address 10.0.1.1/24; } } }
+    eth1 { unit 0 { family inet { address 10.0.2.1/24; } } }
 }
 security {
     zones {
@@ -1398,7 +1406,11 @@ func TestRPMRootProbeLimitSetSyntax(t *testing.T) {
 }
 
 func TestMultipleSNATRules(t *testing.T) {
-	input := `security {
+	input := `interfaces {
+    eth0 { unit 0 { family inet { address 10.0.1.1/24; } } }
+    eth1 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
+security {
     zones {
         security-zone trust {
             interfaces { eth0.0; }
@@ -1554,7 +1566,10 @@ func TestEdgeCases(t *testing.T) {
 	if len(cfg.Security.Zones) != 0 {
 		t.Errorf("expected 0 zones from empty block, got %d", len(cfg.Security.Zones))
 	}
-	input2 := `security {
+	input2 := `interfaces {
+    eth0 { unit 0 { family inet { address 10.0.1.1/24; } } }
+}
+security {
     zones {
         security-zone test {
             interfaces {
@@ -1772,13 +1787,18 @@ security {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
+	// #4515: a zone referencing an undefined interface is now a STRICT commit
+	// reject (validateZoneInterfaceDefinedStrict), downgraded to a warning on
+	// the tolerant load / peer-sync path. Compile leniently so both the
+	// downgraded interface warning and the (still warn-only) SNAT missing-pool
+	// warning surface together, preserving this cross-reference test's intent.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	var foundIfaceWarn, foundPoolWarn bool
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "missing-iface") && strings.Contains(w, "not in interfaces") {
+		if strings.Contains(w, "missing-iface") && strings.Contains(w, "not defined under") {
 			foundIfaceWarn = true
 		}
 		if strings.Contains(w, "missing-pool") && strings.Contains(w, "not defined") {
@@ -2129,7 +2149,7 @@ security {
 
 func TestRouterDiscoveryProtocolSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
-	for _, cmd := range []string{"set security zones security-zone trust interfaces trust0", "set security zones security-zone trust host-inbound-traffic protocols router-discovery", "set security zones security-zone trust host-inbound-traffic protocols ospf"} {
+	for _, cmd := range []string{"set interfaces trust0 unit 0 family inet address 10.0.0.1/24", "set security zones security-zone trust interfaces trust0", "set security zones security-zone trust host-inbound-traffic protocols router-discovery", "set security zones security-zone trust host-inbound-traffic protocols ospf"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
@@ -4561,6 +4581,10 @@ groups {
         }
     }
 }
+interfaces {
+    trust0 { unit 0 { family inet { address 10.0.0.1/24; } } }
+    untrust0 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
 security {
     zones {
         security-zone trust {
@@ -4648,6 +4672,10 @@ groups {
         }
     }
 }
+interfaces {
+    trust0 { unit 0 { family inet { address 10.0.0.1/24; } } }
+    untrust0 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
 security {
     zones {
         security-zone trust {
@@ -4731,6 +4759,10 @@ groups {
     }
 }
 apply-groups common;
+interfaces {
+    trust0 { unit 0 { family inet { address 10.0.0.1/24; } } }
+    untrust0 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
 security {
     zones {
         security-zone trust {
@@ -4790,6 +4822,10 @@ groups {
 system {
     host-name explicit;
 }
+interfaces {
+    trust0 { unit 0 { family inet { address 10.0.0.1/24; } } }
+    untrust0 { unit 0 { family inet { address 10.0.2.1/24; } } }
+}
 security {
     zones {
         security-zone trust {
@@ -4842,7 +4878,7 @@ security {
 }
 
 func TestApplyGroupsNestedSetSyntax(t *testing.T) {
-	setCommands := []string{"set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match source-address any", "set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match destination-address any", "set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match application any", "set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out then permit", "set security zones security-zone trust interfaces trust0.0", "set security zones security-zone untrust interfaces untrust0.0", "set security policies from-zone trust to-zone untrust apply-groups allow-out"}
+	setCommands := []string{"set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match source-address any", "set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match destination-address any", "set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out match application any", "set groups allow-out security policies from-zone <*> to-zone <*> policy allow-all-out then permit", "set interfaces trust0 unit 0 family inet address 10.0.0.1/24", "set interfaces untrust0 unit 0 family inet address 10.0.2.1/24", "set security zones security-zone trust interfaces trust0.0", "set security zones security-zone untrust interfaces untrust0.0", "set security policies from-zone trust to-zone untrust apply-groups allow-out"}
 	tree := &ConfigTree{}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
@@ -5135,7 +5171,7 @@ func TestLo0FilterExtractionSet(t *testing.T) {
 }
 
 func TestHostInboundRouterDiscovery(t *testing.T) {
-	lines := []string{"set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust host-inbound-traffic protocols bgp", "set security zones security-zone trust host-inbound-traffic protocols router-discovery", "set security zones security-zone trust interfaces trust0"}
+	lines := []string{"set interfaces trust0 unit 0 family inet address 10.0.0.1/24", "set security zones security-zone trust host-inbound-traffic system-services ping", "set security zones security-zone trust host-inbound-traffic protocols bgp", "set security zones security-zone trust host-inbound-traffic protocols router-discovery", "set security zones security-zone trust interfaces trust0"}
 	tree := &ConfigTree{}
 	for _, line := range lines {
 		cmd, err := ParseSetCommand(line)

@@ -102,6 +102,61 @@ TTL to `[0, 0xffff]` as a defensive backstop so even the in-range IEEE extreme
 (32768 × 10) — and any constructed caller — cannot wrap, matching the standard's
 own `txTTL = min(65535, msgTxInterval × msgTxHold)`.
 
+### `security zones` interface-defined reference (ps-review-002 F6, #4515)
+
+`validateZoneInterfaceDefinedStrict` (`compiler_validate_strict_zones.go`, gated
+in `runUniformGates`) hard-rejects a `security zones security-zone <z> interfaces
+<if>` entry that names an interface which is **not** defined under `interfaces`
+(and is not a daemon-materialized dynamic interface), on the strict commit /
+commit-check path. Junos rejects such a zone member; xpf previously only WARNED
+(`ValidateConfig`) then compiled and kept the zone. At runtime the referenced
+interface is absent, so the daemon brings it DOWN (fail-closed for real traffic)
+— safe but silent: a typo'd `ge-0/0/99` zone member carried no packets with no
+commit-time signal.
+
+The reference set is the **generous** union `zoneReferenceableInterfaceBases`
+builds — this union is the safeguard that makes the promotion safe (the naive
+`cfg.Interfaces.Interfaces`-only set is why the gap was left warn-only; it would
+false-reject a legitimate dynamic-interface reference, the #4191 over-rejection
+class):
+
+- every explicitly-configured interface (`cfg.Interfaces.Interfaces`) — GRE /
+  IPIP / WireGuard tunnels and VRF (routing-instance) member interfaces are
+  covered here for free, because a tunnel device and a routing-instance member
+  must both be configured under `interfaces`;
+- `lo0` — the always-present loopback, a reserved Junos interface a zone may
+  reference (host-inbound self-traffic) with no explicit `set interfaces lo0`;
+- every secure-tunnel base derived from an IPsec `bind-interface`
+  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — `bind-interface st0.0`
+  materializes the st0 xfrmi device at apply time (`daemon_apply` →
+  `routing.ApplyXfrmi`) even with no explicit `set interfaces st0 unit 0`. The
+  base is the bind string with any `.unit` stripped, so every unit of a bound
+  secure tunnel is admitted.
+
+The tolerant load / peer-sync path downgrades to a warning
+(`opts.lenientZoneInterfaceDefined`) so an already-persisted or peer-synced
+config an older binary accepted still boots (#1960 no-brick); runtime behavior on
+that path is unchanged (the unresolved member carries no traffic). Runs AFTER
+`validateZoneInterfaceMembershipStrict` (#3072, the same-interface-in-two-zones
+gate) so a duplicate-assignment error still wins the first-error slot. Covered by
+`pkg/config/zone_interface_defined_4515_test.go`.
+
+Sibling gap **F11-part2** (a malformed address-book VALUE such as
+`10.0.1.0/32/24`) was evaluated in the same issue and kept **warn-only**
+DELIBERATELY: the `security address-book ... address` schema leaf is an
+intentionally-open `multi:true` leaf (`schema_security.go`, `children:nil`) and
+the non-literal Junos forms `dns-name` / `range-address` / `wildcard-address` are
+not modeled — they compile to an empty prefix and warn ("no usable prefix
+configured"). A malformed positional prefix also compiles to an empty prefix
+(the same `looksLikeIPOrCIDR` gate that populates `Address.Value` rejects it), so
+the empty-prefix warn conflates a genuine typo with a valid-but-unmodeled
+non-literal form. Promoting it to a strict reject would false-reject every
+`dns-name`/`range-address`/`wildcard-address` entry (the #4191 over-rejection
+class) unless those forms are modeled first, and the residual fail-open is
+narrow and theoretical (a permit rule referencing an empty-prefix address is
+already fail-CLOSED — it matches nothing; only a deny blocklist entry could fail
+open, the same class as a typo'd address-book NAME). See #4515.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,

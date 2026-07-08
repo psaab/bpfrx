@@ -49,6 +49,15 @@ func zoneHostInboundAPIStore(t *testing.T) *configstore.Store {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}
 	if err := store.LoadOverride(`
+interfaces {
+    ge-0/0/9 {
+        unit 0 {
+            family inet {
+                address 10.0.9.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {

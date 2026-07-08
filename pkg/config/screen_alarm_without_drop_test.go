@@ -21,6 +21,7 @@ func TestScreenAlarmWithoutDropCompiles(t *testing.T) {
 		// A profile with a real check PLUS the profile-wide audit modifier.
 		"set security screen ids-option audit tcp land",
 		"set security screen ids-option audit alarm-without-drop",
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone untrust screen audit",
 		"set security zones security-zone untrust interfaces ge-0-0-1",
 	})
