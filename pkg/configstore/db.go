@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -151,6 +152,87 @@ func (db *DB) DeleteRollback(n int) error {
 	err := os.Remove(db.rollbackPath(n))
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("delete rollback %d: %w", n, err)
+	}
+	return nil
+}
+
+// confirmRecord is the persisted pending commit-confirmed state (#4577). It
+// survives a daemon crash/reboot INSIDE the confirm window so the
+// auto-rollback safety hatch is not silently lost: the in-memory
+// time.AfterFunc rollback timer does not outlive the process, so without this
+// record a crash before the operator confirms would make an UNCONFIRMED config
+// permanent (the classic management-stranding trap). Store.Load re-arms the
+// timer when the deadline is still in the future, or rolls back to PrevTree
+// when it already passed during downtime.
+type confirmRecord struct {
+	// Deadline is the absolute wall-clock time the confirm window expires.
+	Deadline time.Time `json:"deadline"`
+	// PrevTree is the rollback target — the config that was active BEFORE the
+	// still-unconfirmed commit-confirmed. For a NESTED confirmed commit it
+	// stays the ORIGINAL last-confirmed config (mirrors confirmPrevTree).
+	PrevTree *config.ConfigTree `json:"prev_tree"`
+	// FirstCommit records that PrevTree is the empty bootstrap tree (the
+	// commit-confirmed was the first commit on a fresh store, confirmPrevCfg
+	// was nil at arm time). The rollback must then re-enter never-committed
+	// state (committed=0 marker), matching the in-memory PromoteRollback
+	// #1922 Item 1b path — not persist an operator-committed-empty config.
+	FirstCommit bool `json:"first_commit"`
+}
+
+// confirmPath returns the path to the pending commit-confirmed state file.
+func (db *DB) confirmPath() string {
+	return filepath.Join(db.dir, "confirm.json")
+}
+
+// WriteConfirm persists the pending commit-confirmed state durably (#4577):
+// temp + fsync + rename + dir fsync, so the deadline+rollback-target survive
+// power loss. The embedded PrevTree may carry secret leaves (IKE PSK, auth
+// keys), so it is encrypted with the same master-password machinery as
+// active.json (keyed off the prev tree's master-password leaf) and written
+// owner-only 0600. No #1917 compatibility envelope is used — the file is
+// transient recovery state, not a committed config, and confirmRecord evolves
+// via additive JSON fields.
+func (db *DB) WriteConfirm(rec *confirmRecord) error {
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal confirm state: %w", err)
+	}
+	data, err = db.maybeEncryptTreeJSON(data, rec.PrevTree)
+	if err != nil {
+		return fmt.Errorf("encrypt confirm state: %w", err)
+	}
+	if err := fsatomic.WriteFileDurable(db.confirmPath(), data, 0600); err != nil {
+		return fmt.Errorf("persist confirm state: %w", err)
+	}
+	return nil
+}
+
+// ReadConfirm loads the pending commit-confirmed state, or (nil, nil) if none
+// is persisted (#4577).
+func (db *DB) ReadConfirm() (*confirmRecord, error) {
+	data, err := os.ReadFile(db.confirmPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read confirm state: %w", err)
+	}
+	data, err = db.maybeDecryptTreeJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt confirm state: %w", err)
+	}
+	rec := &confirmRecord{}
+	if err := json.Unmarshal(data, rec); err != nil {
+		return nil, fmt.Errorf("parse confirm state: %w", err)
+	}
+	return rec, nil
+}
+
+// DeleteConfirm removes the pending commit-confirmed state file (#4577).
+// Absent is not an error.
+func (db *DB) DeleteConfirm() error {
+	if err := os.Remove(db.confirmPath()); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete confirm state: %w", err)
 	}
 	return nil
 }

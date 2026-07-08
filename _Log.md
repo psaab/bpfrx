@@ -40327,3 +40327,23 @@ top.
   userspace-dp/src/afxdp/README.md #3902 flowless-screens section gained a
   #4567 note.
 - **File(s)**: userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/syn_rate.rs, userspace-dp/src/screen/tests.rs, userspace-dp/src/afxdp/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07 (#4577)
+- **Action**: Persist commit-confirmed pending state so the auto-rollback
+  safety hatch survives a daemon crash/reboot inside the confirm window.
+  The rollback timer was an in-memory `time.AfterFunc` only — a crash in the
+  window made the UNCONFIRMED config permanent (management-stranding trap).
+  `CommitConfirmed` now writes a durable, 0600, master-password-encrypted
+  `.configdb/confirm.json` (absolute deadline + rollback-target tree +
+  first-commit flag) AFTER the successful writeActive+promote. `Store.Load`
+  (`recoverPendingConfirmLocked`) rolls back if the deadline passed during
+  downtime, or re-arms the timer for the remaining duration if still open.
+  Every confirmation path (`clearPendingConfirmLocked`) and the timeout
+  rollback (`PromoteRollback`) remove `confirm.json`; nested re-arm rewrites
+  it. RED-on-revert Go tests (expired→rollback-to-Base, within-window→re-arm,
+  explicit-confirm→permanent, bare-commit→permanent). Junos parity: the
+  pending confirm now survives a reboot and rolls back if not confirmed.
+- **File(s)**: pkg/configstore/db.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_persist.go,
+  pkg/configstore/commit_confirmed_persist_4577_test.go,
+  pkg/configstore/README.md, _Log.md
