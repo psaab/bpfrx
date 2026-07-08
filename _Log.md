@@ -41240,3 +41240,31 @@ top.
   pkg/logging/eventbuf_subscriber_cap_4484_test.go, pkg/frr/policy_render.go,
   pkg/frr/frr_test.go, pkg/api/README.md, pkg/logging/README.md,
   pkg/frr/README.md, _Log.md
+
+## 2026-07-07 — #4313 closed-world flip: security ike proposal (Phase-1 crypto)
+
+- **Timestamp**: 2026-07-07
+- **Action**: Extended the #4313 per-subtree closed-world closure (after PR-B
+  destination-NAT then, PR-C IPsec option containers, #4578 master-password) by
+  flipping the Phase-1 IKE proposal container
+  (`security ike proposal <name>`) to `closedWorld: true`. First modeled the one
+  missing Junos leaf (`description`, cosmetic/compiler-ignored, scalar) so the
+  subtree is LEAF-COMPLETE: full grammar = authentication-method /
+  authentication-algorithm / dh-group / encryption-algorithm / lifetime-seconds
+  / description, all modeled; the compiler (compiler_ipsec.go IKE proposal loop)
+  reads a strict subset. Phase-1 has no lifetime-kilobytes (a Phase-2/ESP knob),
+  so — unlike the sibling `security ipsec proposal`, which stays deferred pending
+  both description AND lifetime-kilobytes — description alone completes it.
+  Silent-drop here FAILS OPEN on crypto: a typo'd encryption/authentication
+  algorithm used to commit clean and negotiate the IKE SA WITHOUT the operator's
+  chosen cipher/hash (silent downgrade). The flip rejects the typo at strict
+  commit (SchemaValidate); the tolerant Store.Load / SyncApply path downgrades
+  to a warning (compileTreeLenient, #1960 — verified no-brick). RED-on-revert
+  verified: with closedWorld reverted, the reject/typo/lenient-precondition
+  tests fail (silently accepted) while AcceptsValid stays green (no
+  false-reject). go test ./pkg/config/... ./pkg/configstore/... green (golden
+  4406 unchanged — schema-only + compiler-ignored child); go build ./... clean;
+  gofmt + vet clean.
+- **File(s)**: pkg/config/schema_security.go,
+  pkg/config/schema_closedworld_ike_proposal_4313_test.go,
+  docs/config-schema.md, _Log.md
