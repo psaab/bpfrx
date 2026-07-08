@@ -42065,3 +42065,17 @@ top.
   pkg/dataplane/userspace/zone_counters_status_test.go (new),
   docs/userspace-dataplane-gaps.md, docs/research/3643-dead-counters/plan.md,
   _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4653 refactor — split pkg/cli/cli_request.go (1328 LOC
+  request/diagnostic grab-bag) by command family into sibling files. Pure
+  code motion, behavior-identical: all 31 top-level declarations moved
+  verbatim (verified byte-for-byte against origin/master), the shell keeps
+  the handleRequest dispatcher + small request dhcp/protocols handlers. The
+  security-sensitive diagcmd/tcpdump argv builders with their `--`
+  end-of-options separators (#2084/#4524/#4527) confirmed byte-identical.
+  go build ./... clean, go test ./pkg/cli/... green.
+  **File(s)**: pkg/cli/cli_request.go (trimmed shell), pkg/cli/cli_request_ping.go
+  (new), pkg/cli/cli_request_testcmd.go (new), pkg/cli/monitor_traffic.go (new),
+  pkg/cli/cli_request_chassis.go (new), pkg/cli/cli_request_system.go (new),
+  pkg/cli/cli_request_security.go (new), pkg/cli/README.md, _Log.md

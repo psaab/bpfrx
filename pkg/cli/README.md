@@ -17,6 +17,29 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   `SetFeedsFn`, `SetLLDPNeighborsFn`, `SetVRRPManager`,
   `SetApplyConfigFn`, `SetCommitFns`, …. All on `*CLI`.
 
+## Request / diagnostic command files (#4653)
+
+The operational request and diagnostic handlers were historically one
+1300-line `cli_request.go` grab-bag. They are split by command family into
+sibling files (same package, so unexported helpers stay reachable):
+
+- `cli_request.go` — the `handleRequest` dispatch shell plus the small
+  `request dhcp` / `request protocols` handlers.
+- `cli_request_ping.go` — `ping` / `traceroute` and their `diagcmd` argv
+  builders (`buildPingArgv`, `buildTracerouteArgv`).
+- `cli_request_testcmd.go` — `test policy` / `test routing` /
+  `test security-zone` (the `policymatch` adapters).
+- `monitor_traffic.go` — `monitor` dispatch + `monitor traffic` tcpdump
+  wrapper (joins the sibling `monitor.go` / `monitor_interface.go`).
+- `cli_request_chassis.go` — `request chassis cluster failover` /
+  `data-plane`.
+- `cli_request_system.go` — `request system reboot|halt|power-off|zeroize`
+  and `software` / `configuration` / `dynamic-dns`.
+- `cli_request_security.go` — `request security ipsec|policies|wireguard`.
+
+The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
+argv builders (#2084 / #4524 / #4527) moved verbatim.
+
 ## Callers
 
 `cmd/cli` (remote client), `cmd/xpfd` (when stdin is a TTY).
