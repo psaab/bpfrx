@@ -351,6 +351,17 @@ func (s *Server) configShowRollbackHandler(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "invalid n parameter: must be a non-negative integer")
 		return
 	}
+	// #4556 M-01: n selects a 1-based rollback slot. 0 is a canonical
+	// non-negative uint that clears queryIntStrict but then maps to
+	// history.Get(n-1) = history.Get(-1) → the opaque store error
+	// "history position -1 out of range". Reject n<=0 up front with a
+	// clear positive-integer message (queryIntStrict already fails a
+	// negative literal, so in practice this catches n=0), mirroring the
+	// gRPC ShowRollback leg and the ShowCompare rollback_n guard.
+	if n <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid n parameter: rollback index must be a positive integer")
+		return
+	}
 	format := r.URL.Query().Get("format")
 
 	var output string

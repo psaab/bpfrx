@@ -63,6 +63,22 @@ type schemaNode struct {
 	// excluded by the args<=1 gate in isLeafListSchema without a flag.
 	groupReplace bool
 
+	// rangeSeparator opts a `multi && children == nil` typed leaf in to
+	// treating the fixed mid-token `to` as a RANGE separator in
+	// validateMultiValueLeaf (`<a> to <b>`), rather than validating it as
+	// an ordinary value token (#4556 L-01). The `to` separator is only
+	// meaningful for a leaf whose value domain is a numeric range —
+	// port-range and NAT-pool-address. Those production leaves are
+	// COMPILER-validated (no schema validator), so they never reach
+	// validateMultiValueLeaf; every typed multi leaf that DOES reach it
+	// today is an IP/CIDR (name-server, virtual-address,
+	// dns-server-address) or session-log-flag leaf where `to` is never a
+	// valid member. Leaving this false on those leaves makes a literal
+	// `to` fail validation with a clear "invalid value" message instead
+	// of being silently skipped as a separator. Only the white-box walker
+	// test's synthetic port-range leaf sets it today.
+	rangeSeparator bool
+
 	scalar       bool      // true = fixed-arity scalar value leaf (keyword + exactly `args` value tokens, NO body); rejects trailing tokens at commit (#3332). Opt-in; see isScalarValueLeaf.
 	valueHint    ValueHint // hint for dynamic value completion (when args > 0)
 	desc         string    // description shown in completion help

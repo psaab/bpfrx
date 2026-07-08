@@ -3204,6 +3204,109 @@ mod s5_timer_tests {
         );
     }
 
+    /// An engine whose peer carries a Responder-role session forced
+    /// into `current` but left UNCONFIRMED, so the `is_confirmed()`
+    /// term of `peer_has_confirmed_session` is exercised with a session
+    /// actually present in `current`. The #3882 3-slot model parks a
+    /// natural unconfirmed responder keypair in `next` (never
+    /// `current`), so `force_current_for_test` is used to reach the
+    /// gate directly. Returns the engine, the peer pubkey, and the
+    /// session's `created_ns` stamp.
+    fn unconfirmed_responder_in_current() -> (WgEngine, [u8; 32], u64) {
+        let (init_priv, init_pub) = super::keypair();
+        let (resp_priv, resp_pub) = super::keypair();
+        let init_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv.into(),
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            }],
+        });
+        let resp_engine = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv.into(),
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32].into(),
+            }],
+        });
+        let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
+        let mut resp_hs = resp_engine.build_responder_handshake().unwrap();
+        let mut buf = [0u8; 1024];
+        let mut sink = [0u8; 1024];
+        let n1 = init_hs.write_message(&[], &mut buf).unwrap();
+        resp_hs.read_message(&buf[..n1], &mut sink).unwrap();
+        let n2 = resp_hs.write_message(&[], &mut buf).unwrap();
+        init_hs.read_message(&buf[..n2], &mut sink).unwrap();
+        let resp_xport = resp_hs.into_stateless_transport_mode().unwrap();
+        let created_ns = monotonic_now_ns();
+        let resp_session = Arc::new(WgSession::new_with_role(
+            resp_xport,
+            0xdead_0001,
+            0xdead_0002,
+            init_pub,
+            SessionRole::Responder,
+            created_ns,
+        ));
+        assert!(
+            !resp_session.is_confirmed(),
+            "responder session starts unconfirmed"
+        );
+        resp_engine.force_current_for_test(&init_pub, resp_session);
+        (resp_engine, init_pub, created_ns)
+    }
+
+    /// #4546: `peer_has_confirmed_session` — the gate the control loop
+    /// consults on the NoSession edge — must honor REJECT_AFTER_TIME so
+    /// a confirmed-but-expired session (aged past 180s but not yet GC'd
+    /// by `expire_sessions`) no longer masquerades as confirmed and
+    /// suppresses the rekey trigger, a bounded ~0-1s blackhole at the
+    /// expiry boundary. The age check uses the same mock-aware
+    /// `now_ns()` clock as `try_encap`'s T3 gate.
+    #[test]
+    fn peer_has_confirmed_session_honors_reject_after_time() {
+        let (init, _resp, _init_pub, resp_pub, t0) = pair();
+
+        // Fresh confirmed initiator session → reports confirmed.
+        init.set_mock_now_ns(t0 + 1 * SEC);
+        assert!(
+            init.peer_has_confirmed_session(&resp_pub),
+            "fresh confirmed session reports confirmed"
+        );
+
+        // 179s (just under REJECT_AFTER_TIME) → still confirmed.
+        init.set_mock_now_ns(t0 + 179 * SEC);
+        assert!(
+            init.peer_has_confirmed_session(&resp_pub),
+            "confirmed session younger than REJECT_AFTER_TIME stays confirmed"
+        );
+
+        // 181s (past REJECT_AFTER_TIME) → NOT confirmed, so the
+        // NoSession-edge rekey fires promptly instead of waiting for the
+        // ~1s GC tick. [RED on revert: the age-blind check returns true.]
+        init.set_mock_now_ns(t0 + 181 * SEC);
+        assert!(
+            !init.peer_has_confirmed_session(&resp_pub),
+            "confirmed session past REJECT_AFTER_TIME must not report confirmed"
+        );
+
+        // A session present in `current` but UNCONFIRMED reports false
+        // regardless of age (the preserved is_confirmed() term).
+        let (unconf, peer_pub, created_ns) = unconfirmed_responder_in_current();
+        unconf.set_mock_now_ns(created_ns + 1 * SEC);
+        assert!(
+            !unconf.peer_has_confirmed_session(&peer_pub),
+            "unconfirmed current session reports false"
+        );
+    }
+
     /// T3 decap: an inbound record addressed to an expired session is
     /// dropped BEFORE AEAD with DecapError::Expired and does NOT arm
     /// the rekey edge (replay at an expired session must not drive our

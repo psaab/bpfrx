@@ -118,7 +118,7 @@ Last updated: 2026-02-13
 | **NAT Rule Ordering** | Explicit rule ordering with priority numbers | Simple | No — xpf uses implicit ordering |
 | **NAT Proxy ARP** | Automatic proxy ARP for NAT pool addresses | Simple | No |
 | **Overflow Pool** | Fallback pool when primary NAT pool is exhausted | Simple | No |
-| **PAT Pool with Address Shifting** | Deterministic NAT (predictable port mapping) | Medium | No |
+| **PAT Pool with Address Shifting** | Deterministic NAT (predictable port mapping) | Medium | Parse-only (#4559) — validated at commit + accepted-but-inert advisory, but no userspace block allocator (the eBPF impl was retired in #1373/#1476); falls back to round-robin/sticky SNAT |
 | **DS-Lite Concentrator** | IPv4-in-IPv6 softwire for carrier-grade NAT | Complex | No — xpf has NAT64 but not DS-Lite |
 
 ---
