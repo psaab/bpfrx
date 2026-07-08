@@ -970,6 +970,147 @@ fn flow_cache_hits_run_three_color_policer() {
     assert_eq!(status[0].drop_packets, 1);
 }
 
+// #4566: three fall-through three-color policer terms on ONE flow. The cached
+// TX-selection replay MUST carry all three policers — the previous two-`Option`
+// layout silently dropped the 3rd, so its rate limit was never enforced on the
+// cached path. RED on revert: `len()` is 2 and `gamma` never meters.
+#[test]
+fn flow_cache_hit_runs_all_three_fall_through_policers() {
+    fn policer(name: &str) -> ThreeColorPolicerSnapshot {
+        ThreeColorPolicerSnapshot {
+            name: name.into(),
+            mode: "single-rate".into(),
+            color_blind: true,
+            // Generous committed burst so a single 100-byte packet is GREEN on
+            // every policer — the assertion checks each one metered, not that it
+            // dropped.
+            committed_rate_bytes_per_sec: 1,
+            committed_burst_bytes: 10_000,
+            peak_or_excess_burst_bytes: 5_000,
+            then_action: "discard".into(),
+            ..Default::default()
+        }
+    }
+    fn fall_through_term(name: &str, policer: &str, terminating: bool) -> FirewallTermSnapshot {
+        FirewallTermSnapshot {
+            name: name.into(),
+            // Empty action => fall-through (continue_term); a terminating
+            // "accept" stops the walk but still merges its own policer first.
+            action: if terminating { "accept".into() } else { String::new() },
+            policer: policer.into(),
+            ..Default::default()
+        }
+    }
+
+    let state = make_filter_state_with_three_color(
+        &[FirewallFilterSnapshot {
+            name: "policed".into(),
+            family: "inet".into(),
+            terms: vec![
+                fall_through_term("t-alpha", "alpha", false),
+                fall_through_term("t-beta", "beta", false),
+                fall_through_term("t-gamma", "gamma", true),
+            ],
+        }],
+        &[policer("alpha"), policer("beta"), policer("gamma")],
+    );
+
+    let filter = state.filters.get("inet:policed").unwrap();
+    let cached = evaluate_filter_ref_tx_selection_cached(
+        filter,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_UDP,
+        12345,
+        5000,
+        0,
+    );
+    // The 3rd policer must NOT be truncated out of the cached set (RED: 2).
+    assert_eq!(
+        cached.three_color_policers.len(),
+        3,
+        "cached path must carry all three fall-through policers"
+    );
+
+    // One cached-path packet must meter ALL THREE policers. On revert `gamma` is
+    // dropped from the cached set and never records a green packet.
+    let action = apply_cached_three_color_policers(&cached.three_color_policers, 0, 100);
+    assert!(!action.drop);
+
+    let status = state.three_color_policer_statuses();
+    for name in ["alpha", "beta", "gamma"] {
+        let item = status
+            .iter()
+            .find(|item| item.name == name)
+            .unwrap_or_else(|| panic!("policer {name} missing from status"));
+        assert_eq!(
+            item.green_packets, 1,
+            "policer {name} must meter the cached-path packet"
+        );
+    }
+}
+
+// #4566 unchanged-behavior guard: a flow with exactly TWO fall-through policer
+// terms still caches both and meters both — identical to pre-fix behavior for
+// the common case (the fix only affects the 3rd+ policer).
+#[test]
+fn flow_cache_hit_runs_both_fall_through_policers() {
+    fn policer(name: &str) -> ThreeColorPolicerSnapshot {
+        ThreeColorPolicerSnapshot {
+            name: name.into(),
+            mode: "single-rate".into(),
+            color_blind: true,
+            committed_rate_bytes_per_sec: 1,
+            committed_burst_bytes: 10_000,
+            peak_or_excess_burst_bytes: 5_000,
+            then_action: "discard".into(),
+            ..Default::default()
+        }
+    }
+
+    let state = make_filter_state_with_three_color(
+        &[FirewallFilterSnapshot {
+            name: "policed".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "t-alpha".into(),
+                    action: String::new(),
+                    policer: "alpha".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "t-beta".into(),
+                    action: "accept".into(),
+                    policer: "beta".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[policer("alpha"), policer("beta")],
+    );
+
+    let filter = state.filters.get("inet:policed").unwrap();
+    let cached = evaluate_filter_ref_tx_selection_cached(
+        filter,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_UDP,
+        12345,
+        5000,
+        0,
+    );
+    assert_eq!(cached.three_color_policers.len(), 2);
+
+    let action = apply_cached_three_color_policers(&cached.three_color_policers, 0, 100);
+    assert!(!action.drop);
+    let status = state.three_color_policer_statuses();
+    for name in ["alpha", "beta"] {
+        let item = status.iter().find(|item| item.name == name).unwrap();
+        assert_eq!(item.green_packets, 1);
+    }
+}
+
 #[test]
 fn equivalent_snapshot_refresh_preserves_three_color_state_and_counters() {
     let filters = [FirewallFilterSnapshot {

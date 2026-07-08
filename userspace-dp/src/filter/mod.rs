@@ -447,63 +447,63 @@ impl PartialEq for ThreeColorPolicerRuntime {
 
 impl Eq for ThreeColorPolicerRuntime {}
 
+/// #2544/#4566: the set of fall-through three-color policer terms a cached
+/// TX-selection decision must re-meter on every flow-cache replay. With #2544
+/// fall-through a single packet can match multiple three-color policer terms;
+/// the previous two-`Option` layout (`first`/`second`) silently DROPPED the 3rd
+/// (and beyond) policer on the cached path, so a flow with >=3 fall-through
+/// policer terms escaped the 3rd+ term's committed/peak rate limit on EVERY
+/// cached packet — the uncached full-eval path meters each (#4566). Now backed
+/// by a `SmallVec` with an inline capacity of 2 (matching the sibling
+/// `CachedFilterCounters`, #2573): the common single- and dual-policer flows
+/// record with NO heap allocation, and any spill to the heap for >2 policers
+/// happens ONCE at flow-cache install, off the per-packet replay (`for_each`)
+/// hot path. Dedup is by policer `id` (`ThreeColorPolicerRuntime` carries an
+/// id) so the same policer referenced by two matched terms is metered once per
+/// packet.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CachedThreeColorPolicers {
-    first: Option<Arc<ThreeColorPolicerRuntime>>,
-    second: Option<Arc<ThreeColorPolicerRuntime>>,
+    policers: smallvec::SmallVec<[Arc<ThreeColorPolicerRuntime>; 2]>,
 }
 
 impl CachedThreeColorPolicers {
     #[inline]
     pub(crate) fn from_option(runtime: Option<Arc<ThreeColorPolicerRuntime>>) -> Self {
-        Self {
-            first: runtime,
-            second: None,
+        let mut policers = smallvec::SmallVec::new();
+        if let Some(runtime) = runtime {
+            policers.push(runtime);
         }
+        Self { policers }
     }
 
     #[inline]
     pub(crate) fn push(&mut self, runtime: Arc<ThreeColorPolicerRuntime>) {
         if self
-            .first
-            .as_ref()
-            .is_some_and(|existing| existing.id == runtime.id)
-            || self
-                .second
-                .as_ref()
-                .is_some_and(|existing| existing.id == runtime.id)
+            .policers
+            .iter()
+            .any(|existing| existing.id == runtime.id)
         {
             return;
         }
-        if self.first.is_none() {
-            self.first = Some(runtime);
-        } else if self.second.is_none() {
-            self.second = Some(runtime);
-        }
+        self.policers.push(runtime);
     }
 
     #[inline]
     pub(crate) fn extend(&mut self, other: Self) {
-        if let Some(runtime) = other.first {
-            self.push(runtime);
-        }
-        if let Some(runtime) = other.second {
+        for runtime in other.policers {
             self.push(runtime);
         }
     }
 
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        usize::from(self.first.is_some()) + usize::from(self.second.is_some())
+        self.policers.len()
     }
 
     #[inline]
     pub(crate) fn for_each(&self, mut f: impl FnMut(&Arc<ThreeColorPolicerRuntime>)) {
-        if let Some(runtime) = self.first.as_ref() {
-            f(runtime);
-        }
-        if let Some(runtime) = self.second.as_ref() {
-            f(runtime);
+        for policer in &self.policers {
+            f(policer);
         }
     }
 }
