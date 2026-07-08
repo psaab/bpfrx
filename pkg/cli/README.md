@@ -66,6 +66,35 @@ visible output are byte-identical:
   so the four render modes resolve reth link state / member attrs / lease
   data through one place and can no longer drift.
 
+## `show services` / `show class-of-service` presenters (#4655)
+
+The service-status presenters were historically one 868-line
+`cli_show_services.go` that mixed unrelated service families —
+CoS, DDNS, DHCP (client/relay/server), SNMP, LLDP, and port
+mirroring — so different owners edited one bucket. They are split
+per service family into sibling files (same package, so the
+unexported `showConfigRedacted`/`userspaceDataplaneStatus` helpers
+and injected `*Fn` hooks stay reachable). Pure code motion — every
+presenter's rendered output is byte-identical:
+
+- `cli_show_services.go` — the `handleShowServices` dispatch shell
+  plus the presenters with no dedicated family file:
+  `showRPMProbeResults`, `showIPMonitoringStatus`,
+  `showApplicationIdentificationStatus`, `showSchedulers`.
+- `show_services_cos.go` — the `show class-of-service` dispatch
+  (`handleShowClassOfService`, `parseCoSClassifierArgs`),
+  `showClassOfServiceInterface`, and `showInterfacesQueue` (the
+  live CoS runtime queue view).
+- `show_services_ddns.go` — the two dynamic-DNS presenters:
+  `showServicesDynamicDNS` (Surface A router/interface-address)
+  and `showDHCPDynamicDNS` (DHCP-server DDNS).
+- `show_services_dhcp.go` — the DHCP client/relay/server family:
+  `showDHCPLeases`, `showDHCPClientIdentifier`, `showDHCPRelay`,
+  and `showDHCPServer`.
+- `show_services_snmp.go` — `showSNMP` and `showSNMPv3`.
+- `show_services_lldp.go` — `showLLDP` and `showLLDPNeighbors`.
+- `show_services_mirror.go` — `showPortMirroring` (SPAN).
+
 ## Callers
 
 `cmd/cli` (remote client), `cmd/xpfd` (when stdin is a TTY).
