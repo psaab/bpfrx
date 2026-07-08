@@ -265,6 +265,69 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #3226: `system-services all` / `any-service` is a packet-wide host-inbound
+	// full-admit, NOT a union of the known system-service tokens. On BOTH
+	// enforcement layers (the nft kernel mirror `hostInboundAllowsAll` →
+	// `<fam> daddr <addrs> accept` with no catch-all drop, and the Rust AF_XDP
+	// classifier `all_services` short-circuit) it accepts EVERY IP protocol/port
+	// — GRE/ESP/AH/OSPF/PIM/VRRP and arbitrary future protocol numbers — to the
+	// zone's local firewall addresses. That is a SUPERSET of the Junos meaning
+	// (`all` = the union of the *named* system-services). The breadth is
+	// deliberate and documented (#3199 kept these two tokens as a full-admit
+	// while scoping the sibling `protocols all` to the routing-protocol set), so
+	// this is a WARNING, never a reject — `system-services all` is valid Junos.
+	// The A-vs-B admission-narrowing posture decision (Junos-strict scoping vs
+	// zero-surprise-on-upgrade) remains deferred (issue #3226,
+	// plan-deferred-operator); this advisory only surfaces the breadth at commit
+	// time, exactly as the issue's Direction requests ("document it as such with
+	// an explicit commit warning"). `HostInboundFullAdmitService` is the SSOT for
+	// which tokens are full-admit (pkg/config/host_inbound_tokens.go). Emitted
+	// for the zone-level stanza AND every per-interface override (#3362); one
+	// advisory per stanza is enough.
+	fullAdmitAdvice := func(where string, svcs []string) {
+		for _, svc := range svcs {
+			if !HostInboundFullAdmitService(svc) {
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: system-services %q is a broad packet-wide full-admit that "+
+					"accepts EVERY IP protocol/port "+
+					"(GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the "+
+					"zone's local addresses — a superset of Junos's per-service "+
+					"union; if you intend only specific services, list them "+
+					"explicitly.", where, svc))
+			return // one advisory per stanza
+		}
+	}
+	hiZoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		hiZoneNames = append(hiZoneNames, name)
+	}
+	sort.Strings(hiZoneNames)
+	for _, name := range hiZoneNames {
+		zone := cfg.Security.Zones[name]
+		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
+		if zone.HostInboundTraffic != nil {
+			fullAdmitAdvice(
+				fmt.Sprintf("zone %q host-inbound-traffic", name),
+				zone.HostInboundTraffic.SystemServices)
+		}
+		// #3362: per-interface overrides carry the same token grammar and the
+		// same packet-wide breadth, so warn on each of them too. Iterated via
+		// the SSOT sorted-refs helper for deterministic advisory ordering.
+		for _, ifRef := range zone.SortedInterfaceHostInboundRefs() {
+			hi := zone.InterfaceHostInbound[ifRef]
+			if hi == nil {
+				continue
+			}
+			fullAdmitAdvice(
+				fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef),
+				hi.SystemServices)
+		}
+	}
+
 	// Validate address-book entries have valid CIDR or IP formats
 	if ab := cfg.Security.AddressBook; ab != nil {
 		for name, entry := range ab.Addresses {

@@ -1,3 +1,33 @@
+## 2026-07-07 — #3226 host-inbound: commit-time advisory for `system-services all` / `any-service` packet-wide full-admit
+
+- **Timestamp**: 2026-07-07
+- **Action**: #3226 DRIVEABLE advisory slice (GO-only, no forwarding change,
+  independent of the deferred A-vs-B admission-narrowing posture). The issue's
+  Direction asks that the non-Junos full-admit be documented "with an explicit
+  commit warning." Added a WARN-only advisory in `ValidateConfig`
+  (`pkg/config/compiler_validate_warn.go`) that iterates every zone's
+  `HostInboundTraffic.SystemServices` AND each per-interface
+  `InterfaceHostInbound[*].SystemServices` override (#3362) in deterministic
+  sorted order and, for any token where `config.HostInboundFullAdmitService`
+  (the SSOT in `pkg/config/host_inbound_tokens.go`) is true (`all` /
+  `any-service`), emits an advisory naming the zone/interface: the token is a
+  broad packet-wide full-admit that accepts EVERY IP protocol/port
+  (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local
+  addresses — a superset of Junos's per-service union. Never a reject
+  (`system-services all` is valid Junos; the breadth is deliberate/documented
+  per #3199). One advisory per stanza. The A-vs-B posture decision remains
+  deferred (#3226, plan-deferred-operator). RED-on-revert test
+  (`host_inbound_fulladmit_warn_3226_test.go`): `all` + `any-service` +
+  per-interface `all` each warn naming the zone (and interface); a specific
+  service (ssh/ping) draws NO advisory; deleting the advisory loop turns the
+  all/any-service/per-interface cases RED while specific-service stays green.
+  Docs: `docs/host-inbound-service-matrix.md` (matrix row note + a dedicated
+  "packet-wide admit (#3226)" section recording the commit advisory AND that
+  the posture decision stays deferred). go test ./pkg/config/... green; go
+  build; gofmt + vet clean.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/host_inbound_fulladmit_warn_3226_test.go,
+  docs/host-inbound-service-matrix.md, _Log.md
 ## 2026-07-07 — #4508 doc: clarify `Packets dropped` = enforcement drops (undercounts no-route/fabric/vlan/NAT64)
 
 - **Timestamp**: 2026-07-07

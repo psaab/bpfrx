@@ -1230,6 +1230,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -2465,7 +2466,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -3699,7 +3702,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -4934,6 +4939,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -6169,7 +6175,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -7403,7 +7411,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -8359,6 +8369,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -9315,7 +9326,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -10270,7 +10283,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -11226,6 +11241,7 @@
       "EventOptions": null,
       "BridgeDomains": null,
       "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly.",
         "apply-groups \"${node}\" resolved using default node0 context during generic compile"
       ]
     },
@@ -12182,7 +12198,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
@@ -13137,7 +13155,9 @@
       },
       "EventOptions": null,
       "BridgeDomains": null,
-      "Warnings": null
+      "Warnings": [
+        "zone \"control\" host-inbound-traffic: system-services \"all\" is a broad packet-wide full-admit that accepts EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers) to the zone's local addresses — a superset of Junos's per-service union; if you intend only specific services, list them explicitly."
+      ]
     },
     "error": ""
   },
