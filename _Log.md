@@ -42125,3 +42125,7 @@ top.
   (new), pkg/cli/cli_request_testcmd.go (new), pkg/cli/monitor_traffic.go (new),
   pkg/cli/cli_request_chassis.go (new), pkg/cli/cli_request_system.go (new),
   pkg/cli/cli_request_security.go (new), pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+  - **Action**: #4658 refactor — split pkg/grpcapi/server_diag.go (1602 LOC) into cohesive sibling files by concern (pure code motion, behavior-identical). Ping/Traceroute/streamDiagCmd → server_diag_ping.go; monitor streams (MonitorPacketDrop, MonitorInterface, proxyMonitorInterface, dataplane glue, summary-mode) → server_diag_monitor.go; SystemAction + proxyPeerSystemAction + logSystemAction + schedulePowerAction → server_diag_system_action.go; the #4582/#4595/#4601 zeroize suite → server_diag_zeroize.go; shared dialPeer stays in the server_diag.go shell. All 30 top-level decls byte-identical (0 bodydiff/missing/extra). go build ./... clean, go vet clean, pkg/grpcapi tests green incl. all TestZeroize*/TestStreamDiag*/TestSystemActionJournals*.
+  - **File(s)**: pkg/grpcapi/server_diag.go, pkg/grpcapi/server_diag_ping.go, pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/server_diag_system_action.go, pkg/grpcapi/server_diag_zeroize.go
