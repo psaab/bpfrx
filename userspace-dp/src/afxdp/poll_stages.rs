@@ -857,39 +857,102 @@ fn ipsec_passthrough_decision() -> SessionDecision {
     }
 }
 
+/// #4323: the outcome of Stage 11 (IPsec passthrough) for the poll loop.
+pub(super) enum IpsecPassthroughOutcome {
+    /// Not IPsec (or no parsed flow) — the packet falls through Stage 11
+    /// unchanged and the caller keeps processing it.
+    NotClaimed,
+    /// IPsec traffic reinjected toward the kernel XFRM stack — the caller
+    /// recycles the UMEM frame and moves to the next descriptor.
+    Passthrough,
+    /// A NEW inbound IKE initiation the ingress zone's host-inbound set does
+    /// NOT permit — a silent drop (Junos host-inbound posture). The caller
+    /// recycles the frame, accounts `host_inbound_denied_packets`, and emits the
+    /// tuple-rich host-inbound deny event on `from_zone_id`.
+    Denied { from_zone_id: u16 },
+}
+
 /// Stage 11 — IPsec passthrough.
 ///
 /// ESP (proto 50), AH (proto 51, IPv4) and IKE (UDP 500/4500) must
 /// transit the kernel XFRM subsystem. On a match, this stage builds a
 /// synthetic `SessionDecision` with `LocalDelivery` disposition
 /// (`ipsec_passthrough_decision`) and reinjects the packet via the
-/// slow-path TUN device, then signals `RecycleAndContinue` so the
-/// caller drops the UMEM frame.
+/// slow-path TUN device, then returns `Passthrough` so the caller drops
+/// the UMEM frame.
 ///
-/// This passthrough runs BEFORE the per-zone host-inbound admission
-/// gate and is EXEMPT from it — the ratified userspace-dataplane
-/// semantic (#3616 Option A). Direct host-bound IPsec-to-self is
-/// enforced on the PRIMARY path by the kernel nftables host-inbound
-/// chain (`pkg/daemon/daemon_nft.go`), which gates NEW inbound IKE on
-/// `system-services ike`/`ipsec` while accepting raw ESP/AH globally and
-/// letting established/return IKE ride `ct established,related accept`.
-/// Gating NEW IKE / inner-ESP on this SECONDARY AF_XDP path is deferred
-/// (Option B — see `ipsec_passthrough_decision`).
+/// #4323 (Option B): a NEW inbound IKE initiation (an ISAKMP header with an
+/// all-zero Responder SPI — see `classify_ipsec_admission`) is first gated on
+/// the ingress zone's host-inbound `ike`/`ipsec` admission. A zone that omits
+/// `ike` drops the unsolicited inbound IKE (`Denied`) so it never reaches the
+/// local IKE daemon; a zone that lists `ike`/`ipsec` admits it. ESP/AH, the
+/// IPsec data plane (ESP-in-UDP / NAT-T keepalive) and every established/reply
+/// IKE packet stay EXEMPT (unconditional passthrough) — the SA is the
+/// authorization, mirroring the kernel chain's global ESP/AH accept and
+/// `ct established,related accept` for return IKE.
 ///
-/// Non-IPsec packets fall through unchanged.
+/// This SECONDARY AF_XDP path is reached by DNAT/static-NAT-to-self IKE and by
+/// native-GRE-inner local IPsec; direct IKE to a firewall interface IP / VIP is
+/// still enforced on the PRIMARY path by the kernel nftables host-inbound chain
+/// (`pkg/daemon/daemon_nft.go`).
+///
+/// Non-IPsec packets fall through unchanged (`NotClaimed`).
 #[inline]
 pub(super) fn stage_ipsec_passthrough_check(
     flow: Option<&SessionFlow>,
     packet_frame: &[u8],
     meta: UserspaceDpMeta,
+    ingress_zone_override: Option<u16>,
     binding_live: &BindingLiveState,
     worker_ctx: &WorkerContext,
-) -> StageOutcome<()> {
+) -> IpsecPassthroughOutcome {
     let Some(flow) = flow else {
-        return StageOutcome::Continue(());
+        return IpsecPassthroughOutcome::NotClaimed;
     };
-    if !is_ipsec_traffic(meta.protocol, flow.forward_key.dst_port) {
-        return StageOutcome::Continue(());
+    let dst_port = flow.forward_key.dst_port;
+    if !is_ipsec_traffic(meta.protocol, dst_port) {
+        return IpsecPassthroughOutcome::NotClaimed;
+    }
+    // #4323 Option B: gate ONLY a NEW inbound IKE initiation; ESP/AH and every
+    // established/related IPsec class stay unconditionally exempt.
+    if let crate::afxdp::forwarding::IpsecAdmissionClass::NewInboundIke =
+        crate::afxdp::forwarding::classify_ipsec_admission(
+            packet_frame,
+            meta.l4_offset as usize,
+            meta.protocol,
+            dst_port,
+        )
+    {
+        // Resolve the LOGICAL ingress ifindex + from-zone exactly as the
+        // local-delivery resolver does (a VLAN sub-interface keys its own unit;
+        // a fabric-ingress packet keys the override zone), then apply the
+        // per-interface / per-zone host-inbound admit check.
+        // `host_inbound_admits_iface` honours a per-interface override where one
+        // exists and otherwise falls back to the from-zone set.
+        let ingress_logical = crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
+        let (from_zone_id, _to_zone_id) =
+            crate::afxdp::forwarding::zone_pair_ids_for_flow_with_override(
+                worker_ctx.forwarding,
+                ingress_logical,
+                ingress_zone_override,
+                0,
+            );
+        if !crate::afxdp::forwarding::host_inbound_admits_iface(
+            worker_ctx.forwarding,
+            ingress_logical,
+            from_zone_id,
+            PROTO_UDP,
+            dst_port,
+            matches!(flow.dst_ip, IpAddr::V6(_)),
+            0,
+        ) {
+            return IpsecPassthroughOutcome::Denied { from_zone_id };
+        }
     }
     let ipsec_decision = ipsec_passthrough_decision();
     maybe_reinject_slow_path_from_frame(
@@ -904,7 +967,7 @@ pub(super) fn stage_ipsec_passthrough_check(
         "slow_path",
         worker_ctx.forwarding,
     );
-    StageOutcome::RecycleAndContinue
+    IpsecPassthroughOutcome::Passthrough
 }
 
 #[cfg(test)]
@@ -3095,20 +3158,20 @@ mod tests {
             1,
         );
 
-        // Ratified-EXEMPT classes: each is passed through (reinjected)
-        // regardless of the zone host-inbound config. The `nat_snapshot`
-        // fixture zones are host-inbound ENFORCING (`system-services all`); the
-        // exemption would hold identically on a zone that OMITS ike/ipsec —
-        // Stage 11 never consults the host-inbound set. AH is v4-only (the shim
-        // walks the IPv6 NEXTHDR_AUTH header, see README). (family, proto, dst).
+        // UNCONDITIONALLY-EXEMPT classes: raw ESP/AH are passed through
+        // (reinjected) regardless of the zone host-inbound config — the
+        // negotiated SA is the authorization, mirroring the kernel chain's global
+        // `meta l4proto { 50, 51 } accept`. The `nat_snapshot` fixture zones
+        // carry `system-services all`, but the ESP/AH exemption holds identically
+        // on a zone that OMITS ike/ipsec (Stage 11 never consults the
+        // host-inbound set for these classes). AH is v4-only (the shim walks the
+        // IPv6 NEXTHDR_AUTH header, see README). IKE (UDP 500/4500) admission is
+        // now GATED on host-inbound (#4323) and is covered separately by
+        // `stage_ipsec_passthrough_gates_new_ike_4323`. (family, proto, dst).
         let exempt = [
-            (libc::AF_INET, PROTO_ESP, 0u16),     // IPv4 ESP
-            (libc::AF_INET, PROTO_AH, 0u16),      // IPv4 AH (v4-only)
-            (libc::AF_INET, PROTO_UDP, 500u16),   // IPv4 IKE
-            (libc::AF_INET, PROTO_UDP, 4500u16),  // IPv4 NAT-T
-            (libc::AF_INET6, PROTO_ESP, 0u16),    // IPv6 ESP
-            (libc::AF_INET6, PROTO_UDP, 500u16),  // IPv6 IKE
-            (libc::AF_INET6, PROTO_UDP, 4500u16), // IPv6 NAT-T
+            (libc::AF_INET, PROTO_ESP, 0u16),  // IPv4 ESP
+            (libc::AF_INET, PROTO_AH, 0u16),   // IPv4 AH (v4-only)
+            (libc::AF_INET6, PROTO_ESP, 0u16), // IPv6 ESP
         ];
         for (family, protocol, dst_port) in exempt {
             let flow = ipsec_flow(family, protocol, dst_port);
@@ -3116,24 +3179,31 @@ mod tests {
             meta.addr_family = family as u8;
             meta.protocol = protocol;
             let outcome =
-                stage_ipsec_passthrough_check(Some(&flow), &frame, meta, &live, &worker_ctx);
+                stage_ipsec_passthrough_check(Some(&flow), &frame, meta, None, &live, &worker_ctx);
             assert!(
-                matches!(outcome, StageOutcome::RecycleAndContinue),
-                "Stage 11 must exempt IPsec (family {family}, proto {protocol}, \
+                matches!(outcome, IpsecPassthroughOutcome::Passthrough),
+                "Stage 11 must exempt raw IPsec (family {family}, proto {protocol}, \
                  dst_port {dst_port}) from host-inbound and reinject it \
-                 (RecycleAndContinue) — ratified #3616 Option A"
+                 (Passthrough) — ratified #3616 Option A / #4323 ESP-AH exemption"
             );
         }
 
         // Non-IPsec traffic is NOT intercepted — it falls through Stage 11
-        // unchanged (`Continue`).
+        // unchanged (`NotClaimed`).
         let non_ipsec = ipsec_flow(libc::AF_INET, PROTO_UDP, 443);
         let mut meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
         meta.protocol = PROTO_UDP;
         assert!(
             matches!(
-                stage_ipsec_passthrough_check(Some(&non_ipsec), &frame, meta, &live, &worker_ctx),
-                StageOutcome::Continue(())
+                stage_ipsec_passthrough_check(
+                    Some(&non_ipsec),
+                    &frame,
+                    meta,
+                    None,
+                    &live,
+                    &worker_ctx
+                ),
+                IpsecPassthroughOutcome::NotClaimed
             ),
             "non-IPsec UDP (dst_port 443) must fall through Stage 11 unchanged"
         );
@@ -3142,10 +3212,316 @@ mod tests {
         let meta = tcp_v4_meta(&frame, TCP_FLAG_ACK);
         assert!(
             matches!(
-                stage_ipsec_passthrough_check(None, &frame, meta, &live, &worker_ctx),
-                StageOutcome::Continue(())
+                stage_ipsec_passthrough_check(None, &frame, meta, None, &live, &worker_ctx),
+                IpsecPassthroughOutcome::NotClaimed
             ),
             "a flowless packet is not claimed by Stage 11"
+        );
+    }
+
+    /// #4323: build a minimal IPv4/UDP frame whose UDP payload (offset 42, after
+    /// a 14-byte Ethernet + 20-byte IPv4 + 8-byte UDP header) carries an ISAKMP
+    /// header. `natt_marker` prepends the RFC 3948 4-byte non-ESP marker (as on
+    /// NAT-T UDP 4500); `responder_spi_zero` controls the Responder SPI — zero
+    /// marks the FIRST packet of a new exchange (a NEW inbound IKE), non-zero an
+    /// established/reply packet. Only the byte layout at/after `l4_offset` matters
+    /// to `classify_ipsec_admission`; the L2/L3/UDP header bytes are filler (the
+    /// stage reads `meta.protocol`, not the IP header, and does not verify
+    /// checksums).
+    fn ike_v4_frame(natt_marker: bool, responder_spi_zero: bool) -> Vec<u8> {
+        let mut frame = vec![0u8; 42];
+        frame[12] = 0x08; // IPv4 ethertype (readability only)
+        frame[13] = 0x00;
+        frame[14] = 0x45; // IPv4 version/IHL
+        frame[23] = PROTO_UDP; // IP protocol (readability only)
+        if natt_marker {
+            frame.extend_from_slice(&[0, 0, 0, 0]); // NAT-T non-ESP marker
+        }
+        // ISAKMP: Initiator SPI (non-zero), Responder SPI (zero or set).
+        frame.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        if responder_spi_zero {
+            frame.extend_from_slice(&[0u8; 8]);
+        } else {
+            frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x00, 0x01]);
+        }
+        // next-payload / version (2.0) / exchange (34 = IKE_SA_INIT) / flags.
+        frame.extend_from_slice(&[0x00, 0x20, 0x22, 0x08]);
+        frame.extend_from_slice(&0u32.to_be_bytes()); // message id
+        frame.extend_from_slice(&0u32.to_be_bytes()); // length (filler)
+        frame
+    }
+
+    /// #4323: an ESP-in-UDP frame on UDP 4500 — the first payload word is a
+    /// NON-zero ESP SPI (NOT the all-zero non-ESP marker), so it is the IPsec
+    /// data plane and must stay EXEMPT, never gated as IKE.
+    fn esp_in_udp_v4_frame() -> Vec<u8> {
+        let mut frame = vec![0u8; 42];
+        frame[12] = 0x08;
+        frame[13] = 0x00;
+        frame[14] = 0x45;
+        frame[23] = PROTO_UDP;
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]); // ESP SPI (non-zero)
+        frame.extend_from_slice(&[0u8; 16]); // ESP seq + start of payload
+        frame
+    }
+
+    fn ike_v4_meta(frame: &[u8], ingress_ifindex: u32) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: (frame.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_UDP,
+            ..UserspaceDpMeta::default()
+        }
+    }
+
+    /// #4323: a snapshot with a DENY zone (`deny-zone`, ifindex 24, host-inbound
+    /// omits `ike`) and a PERMIT zone (`permit-zone`, ifindex 25, host-inbound
+    /// lists `ike`), so the Stage-11 IKE gate can be exercised on both.
+    fn ike_gate_snapshot() -> crate::ConfigSnapshot {
+        use crate::test_zone_ids::{TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID};
+        crate::ConfigSnapshot {
+            zones: vec![
+                crate::ZoneSnapshot {
+                    name: "deny-zone".to_string(),
+                    id: TEST_LAN_ZONE_ID,
+                    host_inbound_configured: true,
+                    // ping only — NO ike/ipsec, so a NEW inbound IKE is denied.
+                    host_inbound_system_services: vec!["ping".to_string()],
+                    ..Default::default()
+                },
+                crate::ZoneSnapshot {
+                    name: "permit-zone".to_string(),
+                    id: TEST_WAN_ZONE_ID,
+                    host_inbound_configured: true,
+                    host_inbound_system_services: vec!["ike".to_string()],
+                    ..Default::default()
+                },
+            ],
+            interfaces: vec![
+                crate::InterfaceSnapshot {
+                    name: "ge-0-0-1".to_string(),
+                    zone: "deny-zone".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 24,
+                    hardware_addr: "02:bf:72:01:00:01".to_string(),
+                    addresses: vec![crate::InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "10.0.61.1/24".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+                crate::InterfaceSnapshot {
+                    name: "ge-0-0-2".to_string(),
+                    zone: "permit-zone".to_string(),
+                    linux_name: "ge-0-0-2".to_string(),
+                    ifindex: 25,
+                    hardware_addr: "02:bf:72:02:00:01".to_string(),
+                    addresses: vec![crate::InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "172.16.80.8/24".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            default_policy: "deny".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// #4323 RED-on-revert: Stage 11 gates a NEW inbound IKE initiation on the
+    /// ingress zone's host-inbound `ike`/`ipsec` admission, while ESP/AH, the
+    /// IPsec data plane (ESP-in-UDP) and every established/reply IKE packet stay
+    /// exempt (unconditional passthrough).
+    ///
+    /// - NEW IKE (Responder SPI == 0) from a zone OMITTING ike  → `Denied`.
+    /// - NEW IKE from a zone LISTING ike                        → `Passthrough`.
+    /// - NEW NAT-T IKE (4500 + non-ESP marker) from deny zone   → `Denied`.
+    /// - established IKE (Responder SPI set) from deny zone      → `Passthrough`.
+    /// - ESP-in-UDP (4500, non-marker) from deny zone           → `Passthrough`.
+    /// - raw ESP from deny zone                                  → `Passthrough`.
+    ///
+    /// Fail-on-revert: drop the `NewInboundIke` gate (always reinject) and the
+    /// two `Denied` assertions flip — a NEW inbound IKE from an unpermitted
+    /// source would reach the local IKE daemon unfiltered.
+    #[test]
+    fn stage_ipsec_passthrough_gates_new_ike_4323() {
+        const DENY_IF: u32 = 24;
+        const PERMIT_IF: u32 = 25;
+
+        let forwarding = build_forwarding_state(&ike_gate_snapshot());
+        let ident = BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: DENY_IF as i32,
+        };
+        let live = BindingLiveState::new();
+        let binding_lookup = WorkerBindingLookup::default();
+        let mirror_targets = MirrorTargetMap::default();
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let last_resolution = Arc::new(Mutex::new(None));
+        let peer_worker_commands = Vec::new();
+        let dnat_fds = DnatTableFds::default();
+        let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+        let (event_handle, _event_rx) = crate::event_stream::test_worker_handle(
+            8,
+            DataplaneEventRateLimitConfig {
+                events_per_second: 0,
+                burst: 0,
+            },
+        );
+        let worker_ctx = WorkerContext {
+            ident: &ident,
+            binding_lookup: &binding_lookup,
+            mirror_targets: &mirror_targets,
+            forwarding: &forwarding,
+            ha_state: &ha_state,
+            dynamic_neighbors: &dynamic_neighbors,
+            neighbor_resolver: None,
+            shared_sessions: &shared_sessions,
+            shared_nat_sessions: &shared_nat_sessions,
+            shared_forward_wire_sessions: &shared_forward_wire_sessions,
+            shared_owner_rg_indexes: &shared_owner_rg_indexes,
+            slow_path: None,
+            event_stream: Some(&event_handle),
+            local_tunnel_deliveries: &local_tunnel_deliveries,
+            recent_exceptions: &recent_exceptions,
+            last_resolution: &last_resolution,
+            peer_worker_commands: &peer_worker_commands,
+            dnat_fds: &dnat_fds,
+            rg_epochs: &rg_epochs,
+            cold_path_sample_mask: 0xff,
+        };
+
+        // NEW inbound IKE (Responder SPI == 0) on the DENY zone → dropped.
+        let new_ike = ike_v4_frame(false, true);
+        let flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 500);
+        let outcome = stage_ipsec_passthrough_check(
+            Some(&flow),
+            &new_ike,
+            ike_v4_meta(&new_ike, DENY_IF),
+            None,
+            &live,
+            &worker_ctx,
+        );
+        assert!(
+            matches!(
+                outcome,
+                IpsecPassthroughOutcome::Denied {
+                    from_zone_id
+                } if from_zone_id == TEST_LAN_ZONE_ID
+            ),
+            "NEW inbound IKE from a zone omitting `ike` must be Denied (silent \
+             drop), not reach the IKE daemon (#4323)",
+        );
+
+        // NEW inbound IKE on the PERMIT zone → admitted (passthrough).
+        let permit_flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 500);
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(
+                    Some(&permit_flow),
+                    &new_ike,
+                    ike_v4_meta(&new_ike, PERMIT_IF),
+                    None,
+                    &live,
+                    &worker_ctx,
+                ),
+                IpsecPassthroughOutcome::Passthrough
+            ),
+            "NEW inbound IKE from a zone listing `ike` must be admitted (Passthrough)",
+        );
+
+        // NEW NAT-T IKE (UDP 4500 + non-ESP marker, Responder SPI == 0) on the
+        // DENY zone → dropped.
+        let new_natt = ike_v4_frame(true, true);
+        let natt_flow = ipsec_flow(libc::AF_INET, PROTO_UDP, 4500);
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(
+                    Some(&natt_flow),
+                    &new_natt,
+                    ike_v4_meta(&new_natt, DENY_IF),
+                    None,
+                    &live,
+                    &worker_ctx,
+                ),
+                IpsecPassthroughOutcome::Denied { .. }
+            ),
+            "NEW inbound NAT-T IKE (4500) from a zone omitting `ike` must be Denied",
+        );
+
+        // ESTABLISHED IKE (Responder SPI set) on the DENY zone → passthrough
+        // (mirrors `ct established,related accept`; return/reply IKE never drops).
+        let est_ike = ike_v4_frame(false, false);
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(
+                    Some(&flow),
+                    &est_ike,
+                    ike_v4_meta(&est_ike, DENY_IF),
+                    None,
+                    &live,
+                    &worker_ctx,
+                ),
+                IpsecPassthroughOutcome::Passthrough
+            ),
+            "established/reply IKE (Responder SPI set) must stay exempt even on a \
+             zone omitting `ike` — established-first ordering (#4323)",
+        );
+
+        // ESP-in-UDP (UDP 4500, first word a non-zero ESP SPI, NOT a marker) on
+        // the DENY zone → passthrough (IPsec data plane, exempt like raw ESP).
+        let esp_udp = esp_in_udp_v4_frame();
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(
+                    Some(&natt_flow),
+                    &esp_udp,
+                    ike_v4_meta(&esp_udp, DENY_IF),
+                    None,
+                    &live,
+                    &worker_ctx,
+                ),
+                IpsecPassthroughOutcome::Passthrough
+            ),
+            "ESP-in-UDP on 4500 must stay exempt (data plane), never gated as IKE",
+        );
+
+        // Raw ESP (proto 50) on the DENY zone → passthrough (SA authorizes).
+        let esp_flow = ipsec_flow(libc::AF_INET, PROTO_ESP, 0);
+        let mut esp_meta = ike_v4_meta(&new_ike, DENY_IF);
+        esp_meta.protocol = PROTO_ESP;
+        assert!(
+            matches!(
+                stage_ipsec_passthrough_check(
+                    Some(&esp_flow),
+                    &new_ike,
+                    esp_meta,
+                    None,
+                    &live,
+                    &worker_ctx,
+                ),
+                IpsecPassthroughOutcome::Passthrough
+            ),
+            "raw ESP must stay unconditionally exempt on any zone (#4323)",
         );
     }
 }

@@ -41567,3 +41567,41 @@ top.
   /triple-review increment per the issue's warning.
 - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_dhcp_lease_sync.go,
   pkg/daemon/daemon_dhcp_lease_sync_test.go, pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4323 — gate NEW inbound IKE at Stage 11 (IPsec passthrough)
+  against per-zone host-inbound (Option B, deferred hardening from #3616).
+  Stage 11 (`stage_ipsec_passthrough_check`) previously reinjected ALL
+  IPsec (ESP/AH/IKE) toward the kernel XFRM stack unconditionally, so an
+  unsolicited inbound IKE on the SECONDARY AF_XDP path (DNAT-to-self /
+  native-GRE-inner) reached strongSwan even on a zone omitting
+  `system-services ike`. Added `classify_ipsec_admission` (forwarding/
+  mod.rs): ESP/AH + IPsec data plane (ESP-in-UDP on 4500, NAT-T
+  keepalive) + every established/reply IKE packet are `Exempt`
+  (unconditional passthrough — the SA authorizes; mirrors the kernel
+  chain's global ESP/AH accept and `ct established,related accept`); only
+  the FIRST packet of a NEW inbound IKE exchange (ISAKMP Responder SPI ==
+  0, with RFC-3948 NAT-T non-ESP-marker demux on 4500) is
+  `NewInboundIke`. The stage gates a `NewInboundIke` on the resolved
+  LOGICAL ingress zone (`resolve_ingress_logical_ifindex` +
+  `zone_pair_ids_for_flow_with_override(ingress_zone_override)` +
+  `host_inbound_admits_iface`); a zone that omits `ike`/`ipsec` yields
+  `Denied` → silent drop, `host_inbound_denied_packets` accounted +
+  `RT_FLOW_CLOSE_REASON_HOST_INBOUND` event (reusing the existing
+  deny plumbing — no new counter/contract surface). OQ5 (established
+  signal) resolved STATELESSLY from the ISAKMP header (no session lookup —
+  the secondary path installs no session for passthrough flows). R4
+  preserved: the gate is a separate admit BEFORE the reinject, NOT a
+  `local_ifindex` change. New RED-on-revert test
+  `stage_ipsec_passthrough_gates_new_ike_4323` (denied-dropped +
+  permitted-admitted + established-unaffected + ESP/ESP-in-UDP exempt);
+  verified RED with the gate neutralized. Docs: forwarding/README.md
+  IPsec section, docs/userspace-dataplane-architecture.md, host_inbound.rs
+  `ike`/`ipsec` arm, plan.md DEFERRED→SHIPPED.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/forwarding/host_inbound.rs,
+  userspace-dp/src/afxdp/forwarding/README.md,
+  docs/userspace-dataplane-architecture.md,
+  docs/research/3616-ipsec-host-inbound/plan.md, _Log.md

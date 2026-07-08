@@ -26,10 +26,10 @@ use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
 use rx_telemetry::record_rx_descriptor_telemetry;
 
 use super::poll_stages::{
-    FabricIngressOutcome, ScreenCheckOutcome, StageOutcome, SynCookieAckOutcome,
-    stage_classify_fabric_ingress, stage_ipsec_passthrough_check, stage_link_layer_classify,
-    stage_native_gre_decap, stage_parse_flow_and_learn, stage_screen_check,
-    stage_screen_syn_cookie_ack_on_session_miss,
+    FabricIngressOutcome, IpsecPassthroughOutcome, ScreenCheckOutcome, StageOutcome,
+    SynCookieAckOutcome, stage_classify_fabric_ingress, stage_ipsec_passthrough_check,
+    stage_link_layer_classify, stage_native_gre_decap, stage_parse_flow_and_learn,
+    stage_screen_check, stage_screen_syn_cookie_ack_on_session_miss,
 };
 use super::*;
 use crate::policy::evaluate_policy_result_with_icmp;
@@ -737,17 +737,43 @@ pub(super) fn poll_binding_process_descriptor(
                     }
                 }
                 // #946 Phase 1 stage 11: IPsec passthrough. ESP
-                // (proto 50) and IKE (UDP 500/4500) reinject via
-                // the slow-path TUN; recycle the UMEM frame.
-                if let StageOutcome::RecycleAndContinue = stage_ipsec_passthrough_check(
+                // (proto 50), AH and the IPsec data plane reinject via
+                // the slow-path TUN; recycle the UMEM frame. #4323: a NEW
+                // inbound IKE initiation the ingress zone's host-inbound
+                // set does not permit is denied here (silent drop) before
+                // it can reach the local IKE daemon.
+                match stage_ipsec_passthrough_check(
                     flow.as_ref(),
                     packet_frame,
                     meta,
+                    ingress_zone_override,
                     &binding.live,
                     worker_ctx,
                 ) {
-                    binding.scratch.scratch_recycle.push(desc.addr);
-                    continue;
+                    IpsecPassthroughOutcome::NotClaimed => {}
+                    IpsecPassthroughOutcome::Passthrough => {
+                        binding.scratch.scratch_recycle.push(desc.addr);
+                        continue;
+                    }
+                    IpsecPassthroughOutcome::Denied { from_zone_id } => {
+                        // #4323: NEW inbound IKE denied by the ingress zone's
+                        // host-inbound set. Emit the tuple-rich deny event and
+                        // account the drop (GlobalCtrHostInboundDeny), then
+                        // recycle the frame — a silent drop, never a reject.
+                        if let Some(flow) = flow.as_ref() {
+                            emit_host_inbound_deny(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                flow,
+                                meta,
+                                from_zone_id,
+                                now_ns,
+                            );
+                        }
+                        telemetry.counters.host_inbound_denied_packets += 1;
+                        binding.scratch.scratch_recycle.push(desc.addr);
+                        continue;
+                    }
                 }
                 // ── Flow cache fast path (#1327 Step 1) ────────────────
                 // Extracted to poll_descriptor/flow_cache_hit.rs. The
