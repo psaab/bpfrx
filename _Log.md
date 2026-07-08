@@ -1,3 +1,31 @@
+## 2026-07-08 — #4413 ps-review-007 dropped findings: driveable test-coverage
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4413 triage of the six ps-review-007 dropped findings. Two were
+  genuine test-coverage gaps and are now covered with RED-on-revert tests; the
+  other four are already-fixed / already-tested / covered-by-note by merged work
+  and are dispositioned on the issue.
+    - Finding 6 (app both source-port AND destination-port ranges must match):
+      added `TestAppSrcAndDstPortRangesBothMustMatch` — a TCP app constrained on
+      source-port range 5000-6000 AND dest-port range 80-90, asserting AND
+      semantics + inclusive bounds. RED-on-revert on either the SourcePort or
+      DestinationPort guard in `matchSingleApp`, and on the inclusive range test
+      in `portMatches`.
+    - Finding 3 (gRPC broadcast route-drop advisory): added
+      `TestMatchPoliciesSurfacesBroadcastRouteDrop` — the gRPC MatchPolicies
+      handler must carry the #4373 RouteDropBeforePolicy/Class/Note advisory for
+      a broadcast destination on BOTH the matched and default-policy verdict
+      paths, and NOT for a unicast destination. RED-on-revert on the plumbing in
+      either return path of `server_cluster.go`.
+    - Findings 1/5 already-fixed (#4517 IPv6 exotic ext-header walkers + #2292
+      fail-closed-at-bound + #1852 non-first-fragment; #4392/#4534 PBR
+      routing-instance + discard/reject = DENY, with v4/v6 + Go kernel-mirror
+      tests). Finding 4 already-tested (#3642 output filter matches post-NAT
+      tuple). Finding 2 covered by the #4373 RouteDropNote text ("filter-accept
+      log").
+- **File(s)**: pkg/policymatch/app_srcdst_port_range_4413_test.go (new),
+  pkg/grpcapi/server_matchpolicies_routedrop_4413_test.go (new), _Log.md
+
 ## 2026-07-08 — #4407 increment 5: extract surfaceAState sub-struct
 
 - **Timestamp**: 2026-07-08
