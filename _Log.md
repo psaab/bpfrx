@@ -1,3 +1,40 @@
+## 2026-07-07 — #4588 frr: validate a BGP-neighbor SHOW command's IP before it reaches vtysh (unauthenticated local gRPC show path)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4588 (ps-037-A7 F-A7-004 + ps-038-A8-b2 F-001, LOW-MED
+  defense-in-depth). `pkg/frr/vtysh.go`
+  `GetBGPNeighborReceivedRoutes`/`GetBGPNeighborAdvertisedRoutes`/
+  `GetBGPNeighborDetail` guarded only `ip == ""` then concatenated the IP
+  straight into `vtysh -c "show bgp neighbor <ip> …"`. The IP is
+  operator-supplied via `GetBGPStatus` (`pkg/grpcapi/server_routing.go`,
+  `received-routes:<ip>`/`advertised-routes:<ip>`/`neighbor:<ip>` selectors,
+  no `net.ParseIP`) + `pkg/cli/cli_show_routing.go`. The local gRPC listener
+  (127.0.0.1:50051) is unauthenticated and — unlike the config-render path
+  (`sanitizeFRRValue`/`validateNodesControlChars`, #4097/#1798) — the SHOW
+  path was never sanitized, so a newline-bearing token
+  (`1.1.1.1\nconfigure terminal…`) could reach `vtysh -c`, which historically
+  splits its argument on newlines = a second raw FRR CLI command with no
+  commit-audit trail. `realExecutor.Vtysh` is `exec.CommandContext` (no OS
+  shell, so shell metacharacters were already inert; the delta is the raw
+  newline vector + stealth). Fix = the load-bearing belt at each wrapper:
+  `if net.ParseIP(ip) == nil { return error }` closest to the exec (received/
+  advertised reject empty too; detail still allows empty = all neighbors) +
+  defense-in-depth at the boundary: `GetBGPStatus` re-validates and returns
+  `codes.InvalidArgument`. `net.ParseIP` accepts both IPv4 and IPv6, so a
+  valid neighbor is unchanged.
+- **File(s)**: pkg/frr/vtysh.go (net import + 3 wrapper guards),
+  pkg/grpcapi/server_routing.go (net import + 3 boundary guards),
+  pkg/frr/bgp_neighbor_ip_guard_4588_test.go (RED-on-revert: newline/space/
+  garbage/empty IP → error + Vtysh NOT invoked [vtyshCalls==0]; valid v4/v6 →
+  exact command built, no newline; empty ip → all-neighbors still works),
+  pkg/grpcapi/server_bgp_status_ip_guard_4588_test.go (boundary: malformed
+  neighbor IP → codes.InvalidArgument; "neighbor"/"neighbor:" all-selectors
+  not rejected), pkg/frr/README.md (#4588 gotcha beside #4097/#4482),
+  pkg/grpcapi/README.md (boundary-validation note), _Log.md.
+- **Validation**: RED-on-revert confirmed (drop both guards → the frr belt
+  test AND the grpcapi boundary test FAIL; restore → green). `go test
+  ./pkg/frr/... ./pkg/grpcapi/...` green; `go build`, `gofmt -l` clean, `go
+  vet` clean.
 ## 2026-07-07 — #4586 deploy: day-0 config ISO written owner-only (0600), no longer world-readable in CWD
 
 - **Timestamp**: 2026-07-07

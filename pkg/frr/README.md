@@ -418,6 +418,29 @@ also carries operator content:
   cannot inject a standalone frr.conf command. Guarded by
   `TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482` (fail on
   revert of any wrapped site).
+- **A BGP-neighbor SHOW command validates its IP before it reaches vtysh
+  (#4588).** The #1798/#4097/#4482 belts above cover the config-RENDER path;
+  the operational SHOW path is a separate surface. `GetBGPNeighborReceivedRoutes`
+  / `GetBGPNeighborAdvertisedRoutes` / `GetBGPNeighborDetail` (`vtysh.go`)
+  concatenate a neighbor IP straight into `vtysh -c "show bgp neighbor <ip> …"`.
+  That IP arrives from the operator via `GetBGPStatus` (`pkg/grpcapi/server_routing.go`,
+  `received-routes:<ip>` / `advertised-routes:<ip>` / `neighbor:<ip>` selectors)
+  and `pkg/cli/cli_show_routing.go` — and unlike the config path it was never
+  sanitized. The local gRPC listener (127.0.0.1:50051) is unauthenticated, so a
+  malformed token (`1.1.1.1\nconfigure terminal…`) could reach the vtysh command
+  line: `realExecutor.Vtysh` is `exec.CommandContext` (no OS shell, so shell
+  metacharacters are inert) but `vtysh -c` historically splits its argument on
+  NEWLINES, which would turn an embedded `\n` into a second raw FRR CLI command
+  with no commit-audit trail. Each wrapper now rejects a non-parseable IP with
+  `net.ParseIP(ip) == nil → error` (the load-bearing belt, closest to the exec);
+  `GetBGPNeighborDetail` still allows an EMPTY ip (selects every neighbor).
+  `GetBGPStatus` re-validates at the trust boundary and returns
+  `codes.InvalidArgument` (defense-in-depth). `net.ParseIP` accepts IPv4 and
+  IPv6 neighbors, so the happy path is unchanged. Guarded by
+  `TestBGPNeighbor*RejectsUnvalidatedIP` / `TestBGPNeighborValidIPsPass`
+  (`bgp_neighbor_ip_guard_4588_test.go`) and
+  `TestGetBGPStatusRejectsUnvalidatedNeighborIP`
+  (`pkg/grpcapi/server_bgp_status_ip_guard_4588_test.go`).
 - **Group address-family flags are gated by neighbor address version
   (#2454).** When `compiler_protocols.go` copies a BGP group's `family inet`
   / `family inet6` flags down to each neighbor, it parses the neighbor's
