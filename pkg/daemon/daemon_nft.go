@@ -299,12 +299,49 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	return nil
 }
 
+// hostInboundFailOpenState groups the three previous-apply host-inbound
+// fail-open / ambiguity sets used purely for low-noise state-transition
+// logging. It is increment 4 of the #4407 Daemon god-struct decomposition —
+// the fields moved verbatim from flat Daemon fields (dropping the redundant
+// hostInbound prefix), no behavior/locking change. Every access site is bounded
+// to this file (the diff/log functions below) plus its 3698/3718 tests, so a
+// named sub-field on Daemon (d.hostInboundFailOpen.<field>) is used rather than
+// an embed. All three maps are written and read only under applySem via
+// applyHostInboundFilter.
+type hostInboundFailOpenState struct {
+	// addresslessZones is the set of configured host-inbound-enforcing zones
+	// observed in the transient fail-open admit window on the PREVIOUS apply
+	// (#3698): a zone with a non-lifeline interface but no resolvable address
+	// yet, so the daemon emits no host-inbound deny for it.
+	addresslessZones map[string]bool
+
+	// addresslessIfaces is the set of {zone, interface-unit, family} host-inbound
+	// fail-open windows observed on the PREVIOUS apply (#3710), keyed as
+	// "<zone>|<iface>|<family>". This is the per-interface/per-family refinement
+	// of addresslessZones: a DHCP/DHCPv6 client on a non-lifeline unit with no
+	// resolved address in that family yet, which the zone-level signal hides in a
+	// MIXED zone (a DHCP-pending unit beside a statically-addressed sibling, or
+	// the v6 side of a dual-stack edge whose v6 lease lands after v4).
+	addresslessIfaces map[string]bool
+
+	// ambiguousAddrs is the set of firewall-local addresses observed on the
+	// PREVIOUS apply that are host-inbound-reachable from more than one security
+	// zone with DIFFERING host-inbound service/protocol sets (#3718 Option B),
+	// keyed as "<family>|<addr>". The kernel host-inbound chain matches
+	// destination address only, so such an address's admission verdict is decided
+	// order-dependently by whichever zone sorts first (and can disagree with the
+	// ingress-scoped userspace-dp path). The strict commit gate rejects this; a
+	// tolerant / peer-synced load (#1960) can slip one through, and unlike the
+	// addressless window it is NOT self-healing.
+	ambiguousAddrs map[string]bool
+}
+
 // logHostInboundAddresslessTransitions emits a state-transition log whenever a
 // configured host-inbound-enforcing zone ENTERS or LEAVES the transient
 // fail-open admit window (#3698) — a zone with a non-lifeline interface but no
 // resolvable address yet, for which the kernel host-inbound chain emits no deny.
 // It compares the current addressless set against the set observed on the
-// previous apply (d.hostInboundAddresslessZones) so a zone that stays addressless
+// previous apply (d.hostInboundFailOpen.addresslessZones) so a zone that stays addressless
 // across repeated commits / DHCP renewals is logged once (on entry), not every
 // apply — the low-noise contract for a self-healing window. Runs under applySem
 // (the sole caller, applyHostInboundFilter, is invoked from applyConfigLocked),
@@ -315,18 +352,18 @@ func (d *Daemon) logHostInboundAddresslessTransitions(cfg *config.Config) {
 	current := make(map[string]bool)
 	for _, z := range dpuserspace.AddresslessEnforcingZones(cfg) {
 		current[z.Zone] = true
-		if !d.hostInboundAddresslessZones[z.Zone] {
+		if !d.hostInboundFailOpen.addresslessZones[z.Zone] {
 			slog.Warn("host-inbound zone has no address yet — host-inbound default-deny NOT enforced for it until an address appears (transient fail-open admit window)",
 				"zone", z.Zone, "interfaces", strings.Join(z.Interfaces, ","))
 		}
 	}
-	for zone := range d.hostInboundAddresslessZones {
+	for zone := range d.hostInboundFailOpen.addresslessZones {
 		if !current[zone] {
 			slog.Info("host-inbound zone now has an address — host-inbound default-deny enforced (fail-open admit window closed)",
 				"zone", zone)
 		}
 	}
-	d.hostInboundAddresslessZones = current
+	d.hostInboundFailOpen.addresslessZones = current
 }
 
 // logHostInboundAddresslessIfaceTransitions emits a state-transition log whenever
@@ -340,7 +377,7 @@ func (d *Daemon) logHostInboundAddresslessTransitions(cfg *config.Config) {
 // (the kernel chain emits `<fam> daddr <set> ... drop` separately for inet and
 // inet6), so those finer gaps are real fail-open windows the zone-level collapse
 // cannot express. It compares the current per-interface set against the set
-// observed on the previous apply (d.hostInboundAddresslessIfaces) so a unit that
+// observed on the previous apply (d.hostInboundFailOpen.addresslessIfaces) so a unit that
 // stays DHCP-pending across repeated commits / renewals is logged once (on
 // entry), not every apply. Runs under applySem (via applyHostInboundFilter), so
 // the map access needs no extra locking. The current set is also exported as the
@@ -350,18 +387,18 @@ func (d *Daemon) logHostInboundAddresslessIfaceTransitions(cfg *config.Config) {
 	for _, i := range dpuserspace.AddresslessEnforcingInterfaces(cfg) {
 		key := i.Zone + "|" + i.Interface + "|" + i.Family
 		current[key] = true
-		if !d.hostInboundAddresslessIfaces[key] {
+		if !d.hostInboundFailOpen.addresslessIfaces[key] {
 			slog.Warn("host-inbound interface has no address in this family yet — host-inbound default-deny NOT enforced for it until a lease arrives (transient fail-open admit window); the zone-level signal is hidden by an addressed sibling / family",
 				"zone", i.Zone, "interface", i.Interface, "family", i.Family, "reason", i.Reason)
 		}
 	}
-	for key := range d.hostInboundAddresslessIfaces {
+	for key := range d.hostInboundFailOpen.addresslessIfaces {
 		if !current[key] {
 			slog.Info("host-inbound interface now has an address in this family — host-inbound default-deny enforced (fail-open admit window closed)",
 				"key", key)
 		}
 	}
-	d.hostInboundAddresslessIfaces = current
+	d.hostInboundFailOpen.addresslessIfaces = current
 }
 
 // logHostInboundAmbiguousTransitions emits a state-transition log whenever a
@@ -376,7 +413,7 @@ func (d *Daemon) logHostInboundAddresslessIfaceTransitions(cfg *config.Config) {
 // / peer-synced load (#1960) can slip one through, and unlike the addressless
 // window it does NOT self-heal, so the warning stands until the operator fixes
 // the config. It compares against the set observed on the previous apply
-// (d.hostInboundAmbiguousAddrs) so a persisting ambiguity is logged once (on
+// (d.hostInboundFailOpen.ambiguousAddrs) so a persisting ambiguity is logged once (on
 // entry), not every apply. Runs under applySem (via applyHostInboundFilter), so
 // the map access needs no extra locking. The current set is also exported as the
 // xpf_host_inbound_ambiguous_addresses gauge (pkg/api), scraped independently.
@@ -385,18 +422,18 @@ func (d *Daemon) logHostInboundAmbiguousTransitions(cfg *config.Config) {
 	for _, a := range dpuserspace.AmbiguousHostInboundAddresses(cfg) {
 		key := a.Family + "|" + a.Address
 		current[key] = true
-		if !d.hostInboundAmbiguousAddrs[key] {
+		if !d.hostInboundFailOpen.ambiguousAddrs[key] {
 			slog.Warn("host-inbound address is reachable from multiple zones with differing host-inbound sets — the kernel destination-address-only verdict is order-dependent and may disagree with the ingress-scoped userspace path (zone-isolation failure); assign the address to one zone or make the host-inbound sets identical (#3718)",
 				"address", a.Address, "family", a.Family, "zones", strings.Join(a.Zones, ","))
 		}
 	}
-	for key := range d.hostInboundAmbiguousAddrs {
+	for key := range d.hostInboundFailOpen.ambiguousAddrs {
 		if !current[key] {
 			slog.Info("host-inbound address ambiguity resolved — the address no longer has an order-dependent host-inbound verdict",
 				"address", key)
 		}
 	}
-	d.hostInboundAmbiguousAddrs = current
+	d.hostInboundFailOpen.ambiguousAddrs = current
 }
 
 // hostInboundHasEnforceableView reports whether at least one view carries a

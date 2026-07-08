@@ -69,8 +69,8 @@ func TestLogHostInboundAmbiguousTransitions(t *testing.T) {
 	if warnsFor("192.0.2.1") != 1 {
 		t.Fatalf("first apply: warns = %d, want 1", warnsFor("192.0.2.1"))
 	}
-	if !d.hostInboundAmbiguousAddrs["inet|192.0.2.1"] {
-		t.Errorf("state not tracked: hostInboundAmbiguousAddrs missing inet|192.0.2.1")
+	if !d.hostInboundFailOpen.ambiguousAddrs["inet|192.0.2.1"] {
+		t.Errorf("state not tracked: hostInboundFailOpen.ambiguousAddrs missing inet|192.0.2.1")
 	}
 
 	// Apply 2: still ambiguous → NO new WARN (state-transition dedup).
@@ -87,7 +87,7 @@ func TestLogHostInboundAmbiguousTransitions(t *testing.T) {
 	if warnsFor("192.0.2.1") != 1 {
 		t.Errorf("recovery must not emit another warn, warns = %d", warnsFor("192.0.2.1"))
 	}
-	if d.hostInboundAmbiguousAddrs["inet|192.0.2.1"] {
+	if d.hostInboundFailOpen.ambiguousAddrs["inet|192.0.2.1"] {
 		t.Errorf("state not cleared after recovery: inet|192.0.2.1 still set")
 	}
 }

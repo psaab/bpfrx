@@ -91,6 +91,23 @@ tracker issue #4407 carries the remaining increments.
   `ipsecSANudgeCh` and increment 2's `lastStandbyNeighborRefresh`) — it is the
   one-shot transfer-on-commit upload seam used by `archiveConfig` in
   `daemon_flow.go`, a different mechanism from the periodic timer grouped here.
+- **Increment 4 — host-inbound fail-open / ambiguity previous-apply sets
+  (#3698 / #3710 / #3718):** the three flat `map[string]bool` fields
+  (`hostInboundAddresslessZones`, `hostInboundAddresslessIfaces`,
+  `hostInboundAmbiguousAddrs`) moved into `hostInboundFailOpenState` (defined in
+  `daemon_nft.go`, the file that owns the three `logHostInbound*Transitions`
+  diff/log functions), reached as `d.hostInboundFailOpen.*` (fields renamed
+  `addresslessZones`/`addresslessIfaces`/`ambiguousAddrs`, dropping the
+  redundant `hostInbound` prefix). All three hold the set observed on the
+  PREVIOUS apply and are diffed against the current set to emit
+  state-transition logs only; they keep their exact `map[string]bool` types and
+  the identical applySem-only access contract, so this is pure code motion — no
+  behavior/locking change. A named sub-field (not an embed) matches increments
+  1–3: every access site is bounded to `daemon_nft.go` (plus the
+  `host_inbound_addressless_3698_test.go` / `host_inbound_ambiguous_3718_test.go`
+  tests). The similarly-named `*prometheus.Desc` fields in `pkg/api` are a
+  SEPARATE collector that scrapes the live window from the active config
+  independently of these logs — they are unrelated to this grouping.
 
 ## Cluster mode
 

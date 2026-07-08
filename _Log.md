@@ -1,3 +1,28 @@
+## 2026-07-08 — #4407 increment 4: extract hostInboundFailOpenState sub-struct
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 Daemon god-struct decomposition, increment 4. Grouped the
+  three flat host-inbound fail-open / ambiguity previous-apply sets
+  (`hostInboundAddresslessZones` #3698, `hostInboundAddresslessIfaces` #3710,
+  `hostInboundAmbiguousAddrs` #3718) into a new `hostInboundFailOpenState`
+  sub-struct defined in `daemon_nft.go` (the file that owns the three
+  `logHostInbound*Transitions` diff/log functions). Fields renamed
+  `addresslessZones`/`addresslessIfaces`/`ambiguousAddrs` (dropping the
+  redundant `hostInbound` prefix), reached as `d.hostInboundFailOpen.*`. Pure
+  code motion — identical `map[string]bool` types + identical applySem-only
+  access contract, no behavior/locking change. Updated the 3 production access
+  sites in `daemon_nft.go` (plus their docstring references) and the 5 test
+  access sites in `host_inbound_addressless_3698_test.go` /
+  `host_inbound_ambiguous_3718_test.go`. The similarly-named `*prometheus.Desc`
+  fields in `pkg/api` are a separate collector (scrapes active config
+  independently) — untouched.
+- **File(s)**: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_nft.go`,
+  `pkg/daemon/host_inbound_addressless_3698_test.go`,
+  `pkg/daemon/host_inbound_ambiguous_3718_test.go`, `pkg/daemon/README.md`,
+  `_Log.md`
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/...` clean;
+  `gofmt -l` clean; `go test -race ./pkg/daemon/...` green.
+
 ## 2026-07-08 — #4407 increment 3: extract archiveTimerState sub-struct
 
 - **Timestamp**: 2026-07-08
