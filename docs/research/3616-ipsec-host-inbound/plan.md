@@ -17,15 +17,22 @@
 >   `docs/userspace-dataplane-architecture.md` record the two-path model and the
 >   ratified exemption.
 >
-> **DEFERRED (Option B):** the NEW-inbound-IKE / inner-ESP host-inbound gate at
-> Stage 11. It must reproduce the kernel chain's `ct established,related accept`-
-> first ordering (OQ5) and resolve the logical / GRE-inner ingress zone (OQ6), or
-> it drops return/established/tunnelled IPsec. Reopen if a real DNAT-to-self-IKE
-> deployment or a stricter parity mandate arrives. NOTE: naively "carrying the
-> real ingress/local context into the synthetic decision so host-inbound is
-> enforced" is Option B, not Option A — and doing it in the routing decision
-> breaks routing (R4), so the gate is a separate `host_inbound_admits_iface` call
-> BEFORE the reinject, not a change to `local_ifindex`.
+> **DEFERRED (Option B) — SHIPPED in #4323.** The NEW-inbound-IKE host-inbound
+> gate at Stage 11 is now implemented (`stage_ipsec_passthrough_check` +
+> `classify_ipsec_admission`). OQ5 (the established/related signal) was resolved
+> STATELESSLY from the ISAKMP header rather than from conntrack: the first packet
+> of a new exchange carries an all-zero Responder SPI (gated on `ike`/`ipsec`),
+> and every later packet carries a set Responder SPI (exempt) — the stateless
+> mirror of `ct established,related accept`-first, so return/reply IKE never
+> drops. This needs no session table (the secondary path installs no session for
+> a passthrough flow). OQ6 (zone resolution) reuses the resolver's logical
+> ingress ifindex + `zone_pair_ids_for_flow_with_override(ingress_zone_override)`.
+> ESP/AH + the IPsec data plane (ESP-in-UDP, NAT-T keepalive) stay unconditionally
+> exempt. The gate is a separate `host_inbound_admits_iface` call BEFORE the
+> reinject, NOT a change to `local_ifindex` (R4 preserved). Residual: a forged
+> non-zero Responder SPI on a NEW packet reads as exempt and reaches strongSwan,
+> which drops it as an unknown SA — the initiation packet that actually
+> establishes a tunnel always carries a zero Responder SPI and is gated.
 
 - Issue: #3616 (`userspace-dp: IPsec/IKE/ESP/AH passthrough (Stage 11) bypasses
   per-zone host-inbound service enforcement — decide + pin vSRX parity`)

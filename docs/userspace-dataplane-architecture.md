@@ -1461,19 +1461,25 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   handling where required. Host-terminated IPsec (ESP/AH/IKE) is
   recognized by `stage_ipsec_passthrough_check` (Stage 11) and reinjected
   toward the kernel XFRM stack. Stage 11 runs BEFORE the per-zone
-  host-inbound admission gate and is **exempt** from it — a ratified
-  userspace-dataplane semantic (#3616 Option A). The PRIMARY host-inbound
-  enforcement for direct IPsec-to-self is the kernel nftables chain
-  (`pkg/daemon/daemon_nft.go`), which gates NEW inbound IKE on
-  `system-services ike`/`ipsec`, accepts raw ESP/AH globally (the SA is
-  the authorization), and rides established/return IKE on `ct
-  established,related accept`. The synthetic Stage-11 reinject decision
-  keeps `local_ifindex` = 0 (a non-zero value would divert it into the
-  GRE local-tunnel-delivery channel and mis-deliver IPsec-to-self, not
-  enforce host-inbound). Gating NEW IKE / inner-ESP at Stage 11 on the
-  SECONDARY AF_XDP path (DNAT-to-self, native-GRE inner) is deferred
-  hardening (Option B) — see
-  `userspace-dp/src/afxdp/forwarding/README.md` and
+  host-inbound admission gate; raw ESP/AH and the IPsec data plane are
+  **exempt** from it (the SA is the authorization — ratified #3616 Option
+  A), but a **NEW inbound IKE initiation is GATED** on the ingress zone's
+  `system-services ike`/`ipsec` (#4323 Option B). `classify_ipsec_admission`
+  splits the two by the ISAKMP Responder SPI: an all-zero Responder SPI is
+  the first packet of a new exchange (gated); a set Responder SPI is an
+  established/reply packet (exempt — the stateless mirror of `ct
+  established,related accept`, so return IKE never drops). A denied NEW IKE
+  is a silent drop (`host_inbound_denied_packets` +
+  `RT_FLOW_CLOSE_REASON_HOST_INBOUND`) so it never reaches the local IKE
+  daemon. The PRIMARY host-inbound enforcement for direct IPsec-to-self is
+  the kernel nftables chain (`pkg/daemon/daemon_nft.go`), with the same
+  ESP/AH-global-accept + NEW-IKE-gate + established-first semantics; the
+  #4323 gate brings the SECONDARY AF_XDP path (DNAT-to-self, native-GRE
+  inner) to parity. The synthetic Stage-11 reinject decision keeps
+  `local_ifindex` = 0 (a non-zero value would divert it into the GRE
+  local-tunnel-delivery channel and mis-deliver IPsec-to-self); the #4323
+  gate is a separate admit check BEFORE the reinject, never a routing-
+  decision change. See `userspace-dp/src/afxdp/forwarding/README.md` and
   `docs/research/3616-ipsec-host-inbound/plan.md`.
 - Packets failing forwarding resolution can enter the bounded slow path,
   but ONLY for the slow-path-eligible dispositions: `LocalDelivery`,

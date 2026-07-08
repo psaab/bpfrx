@@ -595,47 +595,69 @@ coverage would require the shim to surface an "AH present" signal
 instead of walking past the header — out of scope here, and
 unnecessary given the local-dest shunt.
 
-### Host-inbound ordering: IPsec passthrough is EXEMPT (ratified — #3616)
+### Host-inbound ordering: ESP/AH exempt, NEW IKE gated (#3616 Option A + #4323 Option B)
 
 Stage 11 runs BEFORE the per-zone host-inbound admission gate
-(`host_inbound_admits_iface`) and short-circuits with
-`RecycleAndContinue`, so a packet it claims never reaches that gate.
-IPsec passthrough is therefore **exempt** from `host-inbound-traffic
-system-services ike`/`ipsec` on the AF_XDP path. This is a **ratified**
-userspace-dataplane semantic (#3616 Option A), not an accident:
+(`host_inbound_admits_iface`) and, on a match, short-circuits the poll
+loop (`Passthrough`/`Denied`), so a packet it claims never reaches the
+later local-delivery gate. Within Stage 11 the admission split is by
+class (`classify_ipsec_admission`):
 
-- **Two enforcement paths.** The PRIMARY host-inbound enforcement for
-  IPsec-to-self is the kernel nftables chain
-  (`pkg/daemon/daemon_nft.go`). The XDP shim shunts direct
-  local-destination IPsec to the kernel BEFORE userspace-dp sees it —
-  raw outer ESP is shunted unconditionally
-  (`userspace-xdp/src/lib.rs`), and IKE/AH to a local address ride the
-  `is_local_destination` shunt. That chain accepts raw ESP/AH globally
-  (the SA is the authorization — Junos parity), gates NEW inbound IKE on
-  `system-services ike`/`ipsec`, and lets established/return IKE ride
-  `ct established,related accept` first. `TestHostInboundFilterExempts
-  IPsecAndV6Errors` guards that ordering.
-- **The SECONDARY AF_XDP path** (Stage 11) is reached only when IPsec is
-  NOT shunted to the kernel: DNAT/static-NAT-to-self IKE, native-GRE
-  inner IPsec whose inner destination is a firewall-local address
-  (redirected to the XSK and decapped in userspace), and transit/NAT
-  IPv4 AH. On this path Stage 11 exempts IPsec from host-inbound.
-- **The synthetic reinject decision keeps `local_ifindex` = 0**
-  (`ipsec_passthrough_decision`). It MUST: a non-zero `local_ifindex`
-  makes `maybe_reinject_slow_path_from_frame` route the reinject through
-  the GRE `local_tunnel_deliveries` channel instead of the generic
-  kernel TUN injector (`tx/dispatch/slow_path.rs`), mis-delivering
-  IPsec-to-self. Carrying a real ingress ifindex here would NOT enforce
-  host-inbound (the gate is never reached); the real ingress ifindex is
-  carried only in telemetry via `meta`.
+- **ESP (50) / AH (51) and the IPsec data plane are unconditionally
+  EXEMPT** — always passed through (`Passthrough`), regardless of the
+  zone's `host-inbound-traffic system-services ike`/`ipsec`. The
+  negotiated SA is the authorization (Junos parity), mirroring the
+  kernel chain's global `meta l4proto { 50, 51 } accept`. ESP-in-UDP on
+  4500 (a non-zero ESP SPI in the first payload word) and the 1-byte
+  NAT-T keepalive are demuxed as data plane and stay exempt too.
+- **A NEW inbound IKE initiation is GATED (#4323 Option B).** The FIRST
+  packet of a new IKE exchange — an ISAKMP header whose **Responder
+  SPI/cookie is all-zero** (IKEv2 IKE_SA_INIT request / IKEv1 Main- or
+  Aggressive-mode first message; on UDP 4500 the ISAKMP follows the RFC
+  3948 4-byte non-ESP marker) — is admitted only if the resolved ingress
+  zone lists `ike`/`ipsec`. A zone that omits the token DROPS it
+  (`Denied`, silent, `host_inbound_denied_packets` accounted +
+  `RT_FLOW_CLOSE_REASON_HOST_INBOUND` event) so an unsolicited inbound
+  IKE never reaches the local IKE daemon (strongSwan).
+- **Every established/reply IKE packet stays EXEMPT.** Once the exchange
+  is under way the Responder SPI is set, so `classify_ipsec_admission`
+  returns `Exempt` — the stateless mirror of the kernel chain's `ct
+  established,related accept`-first ordering. Return IKE (e.g. the reply
+  for a firewall-initiated tunnel) is never dropped even on a zone that
+  omits `ike`, which is why the gate needs no conntrack state (the
+  secondary path installs no session for a passthrough flow, so a
+  session lookup would be dead). Residual: a forged non-zero Responder
+  SPI on a NEW packet would read as `Exempt` and reach strongSwan, which
+  drops it as an unknown SA — the initiation packet that actually
+  establishes a tunnel always carries a zero Responder SPI and is gated.
 
-**Deferred hardening (Option B).** A per-zone host-inbound gate for NEW
-IKE / inner-ESP at Stage 11 is a scoped, low-priority follow-up. To be
-correct it must reproduce the kernel chain's `ct established,related
-accept`-first ordering (else it drops return/established IKE — e.g. the
-reply for a firewall-initiated tunnel) and resolve the correct logical /
-GRE-inner ingress zone (not a raw physical-ifindex zone lookup). The
-exposure it would close is real but config-gated (native GRE + inner
-IPsec-to-self, or DNAT-to-self IKE, on a zone omitting `ike`/`ipsec`),
-so it is deferred rather than shipped. See
-`docs/research/3616-ipsec-host-inbound/plan.md`.
+**Two enforcement paths.** The PRIMARY host-inbound enforcement for
+IPsec-to-self is the kernel nftables chain (`pkg/daemon/daemon_nft.go`).
+The XDP shim shunts direct local-destination IPsec to the kernel BEFORE
+userspace-dp sees it — raw outer ESP is shunted unconditionally
+(`userspace-xdp/src/lib.rs`), and IKE/AH to a local address ride the
+`is_local_destination` shunt. That chain accepts raw ESP/AH globally,
+gates NEW inbound IKE on `system-services ike`/`ipsec`, and lets
+established/return IKE ride `ct established,related accept` first.
+`TestHostInboundFilterExemptsIPsecAndV6Errors` guards that ordering. The
+SECONDARY AF_XDP path (Stage 11) is reached only when IPsec is NOT
+shunted to the kernel: DNAT/static-NAT-to-self IKE, native-GRE inner
+IPsec whose inner destination is a firewall-local address (redirected to
+the XSK and decapped in userspace), and transit/NAT IPv4 AH. The #4323
+gate closes the NEW-inbound-IKE host-inbound parity gap on this path.
+
+**Zone resolution.** The gate resolves the LOGICAL ingress ifindex +
+from-zone exactly as the local-delivery resolver does
+(`resolve_ingress_logical_ifindex` + `zone_pair_ids_for_flow_with_override`
+with the `ingress_zone_override` from fabric-ingress classification), so
+a VLAN sub-interface keys its own unit and a per-interface host-inbound
+override governs where present — not a raw physical-ifindex zone lookup.
+
+**The synthetic reinject decision keeps `local_ifindex` = 0**
+(`ipsec_passthrough_decision`). It MUST: a non-zero `local_ifindex`
+makes `maybe_reinject_slow_path_from_frame` route the reinject through
+the GRE `local_tunnel_deliveries` channel instead of the generic kernel
+TUN injector (`tx/dispatch/slow_path.rs`), mis-delivering IPsec-to-self.
+The #4323 gate is a SEPARATE admit check BEFORE the reinject, never a
+change to the routing decision's `local_ifindex`. See
+`docs/research/3616-ipsec-host-inbound/plan.md` (Option B).

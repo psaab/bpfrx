@@ -152,13 +152,15 @@ fn classify_system_service(token: &str, hi: &mut ZoneHostInbound) {
         // before host-inbound enforcement, so `ipsec` is effectively a superset
         // of `ike`. Aliased to keep parity with the nft mirror + the #3200 SSOT.
         //
-        // #3616: this admit set gates IKE only on the PRIMARY kernel nftables
-        // host-inbound path (`pkg/daemon/daemon_nft.go`). The SECONDARY AF_XDP
-        // `stage_ipsec_passthrough_check` recognizes ESP/AH/IKE and reinjects
-        // them toward the kernel XFRM stack BEFORE this gate runs, so on that
-        // path the token's udp-500/4500 admit is never consulted — IPsec
-        // passthrough is EXEMPT (ratified #3616 Option A). Gating NEW IKE /
-        // inner-ESP at Stage 11 is deferred hardening (Option B).
+        // #3616/#4323: this admit set gates IKE on BOTH host-inbound paths. On
+        // the PRIMARY kernel nftables path (`pkg/daemon/daemon_nft.go`) it opens
+        // udp 500/4500 per zone. On the SECONDARY AF_XDP path
+        // (`stage_ipsec_passthrough_check`, #4323 Option B) the same udp-500/4500
+        // admit is consulted for a NEW inbound IKE initiation (an ISAKMP header
+        // with an all-zero Responder SPI) via `host_inbound_admits_iface`: a zone
+        // omitting `ike`/`ipsec` drops it before it reaches the local IKE daemon.
+        // Raw ESP/AH and every established/reply IKE packet stay EXEMPT on that
+        // path (ratified #3616 Option A) — the SA is the authorization.
         "ike" | "ipsec" => {
             hi.udp_ports.insert(500);
             hi.udp_ports.insert(4500);
