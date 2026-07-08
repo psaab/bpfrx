@@ -978,9 +978,72 @@ that made it leaf-complete. The completeness audit that gates the flip:
   tests: `schema_closedworld_ike_proposal_4313_test.go` (RED on revert of the
   flag; the lenient-no-brick case is covered too).
 
+**More production flips — `security ipsec proposal` (Phase-2 ESP crypto,
+#4313).** The Phase-2 ESP proposal container (`security ipsec proposal <name>`)
+now sets `closedWorld:true` (`schema_security.go`), the sibling of the closed
+Phase-1 IKE proposal above. The completeness audit that gates the flip:
+
+- The full Junos `security ipsec proposal <name>` grammar is exactly `protocol`,
+  `encryption-algorithm`, `authentication-algorithm`, `dh-group`,
+  `lifetime-seconds`, `lifetime-kilobytes`, and `description`. The first five
+  were already modeled; this change models `lifetime-kilobytes` (the ESP
+  volume-based rekey knob that DISTINGUISHES the Phase-2 proposal from the
+  Phase-1 IKE proposal — Phase-1 has none, which is why `description` alone
+  completed it) and the cosmetic `description`. The compiler (`compiler_ipsec.go`,
+  the IPsec proposal loop) reads `protocol` / `encryption-algorithm` /
+  `authentication-algorithm` / `dh-group` / `lifetime-seconds` /
+  `lifetime-kilobytes` and ignores `description`, i.e. a subset of the modeled
+  set — so closing carries no false-reject risk (the #4191 class).
+- Every modeled leaf carries its value on the same statement line (no nested
+  value block in Junos), so closed-world never descends into an AST child of a
+  value leaf in EITHER parser shape.
+- Silent-drop here FAILS OPEN on crypto exactly like the IKE proposal: a
+  fat-fingered `encryption-algorith` or `authentication-algoritm` used to commit
+  clean, the compiler then found no such child, and the ESP SA negotiated
+  WITHOUT the operator's chosen cipher/hash — a silent downgrade. The flip
+  rejects the typo at strict commit; the tolerant `Store.Load` / `SyncApply`
+  path downgrades it to a warning (`compileTreeLenient`, #1960).
+- `lifetime-kilobytes` is CAPTURED (`IPsecProposal.LifetimeKilobytes`) but
+  accepted-only: the strongSwan renderer emits `rekey_time` (seconds) and no
+  `rekey_bytes`, so volume-based rekey is not yet enforced. `ValidateConfig`
+  emits an accepted-only advisory (`compiler_validate_warn.go`) so an operator
+  is not silently misled into believing the SA rekeys on bytes — strictly
+  better than the pre-flip silent commit-and-drop. Production tests:
+  `schema_closedworld_ipsec_proposal_4313_test.go` (RED on revert of the flag;
+  the lenient-no-brick case and the advisory are covered too).
+
+**More production flips — `security nat nat64` and `security nat natv6v4`
+(xpf-native NAT64 stanzas, #4313).** Both now set `closedWorld:true`
+(`schema_security.go`). These are xpf-NATIVE stanzas (Junos does NAT64 via
+source/destination NAT + `then static-nat inet`, not this spelling), so the
+grammar IS exactly what xpf models and compiles — there is no external Junos
+superset to false-reject, making them leaf-complete by construction:
+
+- `security nat nat64` — the container's only child is `rule-set`, and a
+  rule-set's only children are `prefix` and `source-pool` (both modeled value
+  leaves whose value rides on the same statement line). The compiler
+  (`compileNAT64`) reads ONLY those two and the struct (`NAT64RuleSet`) holds
+  ONLY `Prefix` + `SourcePool`. `closedWorld` is set on the `nat64` container so
+  it is inherited down (the `childClosed` fold): a typo at the nat64 level
+  (`rulset`) OR under a rule-set (`prefx` / `source-pol`) is rejected. Silent-
+  drop was a real footgun: a typo'd `prefx` left `NAT64RuleSet.Prefix` empty,
+  `validateNAT64PrefixStrict` skipped the rule (`Prefix == ""` → continue), and
+  NAT64 translation silently did nothing — IPv6-only clients lost IPv4
+  reachability with no error. Tests: `schema_closedworld_nat64_4313_test.go`.
+- `security nat natv6v4` — its entire grammar is the single flag
+  `no-v6-frag-header` (modeled); the compiler reads ONLY that keyword and the
+  struct (`NATv6v4Config`) holds ONLY `NoV6FragHeader`. A typo
+  (`no-v6-frag-heder`) previously committed clean and silently left the IPv6
+  fragment header in translated packets; it is now rejected at strict commit.
+  Tests: `schema_closedworld_natv6v4_4313_test.go`.
+
+As with every flip, the reject fires only on the strict commit path;
+`compileTreeLenient` downgrades it to a warning on `Store.Load` / `SyncApply`.
+
 **The systematic per-subtree closure continues (#4313).** Each of the flips
 above (destination-NAT then, the three IPsec option containers, master-password,
-now the Phase-1 IKE proposal) closes one leaf-complete high-risk subtree; the
+the Phase-1 IKE proposal, now the Phase-2 IPsec proposal and the two
+xpf-native NAT64 stanzas) closes one leaf-complete high-risk subtree; the
 blanket-default flip stays deferred (it would break the deliberately-lenient
 accept-with-advisory knobs #2078/#4231 and false-reject valid-but-unmodeled
 Junos, the #4191 class). Both the remaining per-subtree flips and the
@@ -989,17 +1052,17 @@ blanket-flip doctrine decision remain tracked on #4313.
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
 `closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
 Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;
-`security ipsec proposal` — INCOMPLETE: Junos allows a `description` leaf AND a
-`lifetime-kilobytes` volume-rekey leaf, both unmodeled (the Phase-1 IKE proposal
-above is now closed — it has no `lifetime-kilobytes`, so `description` alone
-completed it, but the Phase-2 ESP proposal needs both modeled first);
 `security nat static … then static-nat` —
 UNSAFE: `static-nat` is a free-form leaf and the Junos hierarchical form
 `static-nat { prefix { … } }` would false-reject under closed-world; `security
-screen ids-option` — INCOMPLETE, deliberately open-world; `protocols {ospf,bgp}
-interface`, `interfaces … family`, and the deferred source-NAT then above) is
-only safe once that subtree is LEAF-COMPLETE — every valid Junos keyword under
-it is modeled — otherwise the flip false-rejects a valid config. Each flip is
+screen ids-option` — INCOMPLETE, deliberately open-world; `security ipsec vpn
+<v> ike` bindings — INCOMPLETE: Junos allows `proxy-identity` /
+`no-anti-replay`, unmodeled; the source-NAT rule `then` — deferred (rule-level
+persistent-nat, see above); `protocols {ospf,bgp} interface` and `interfaces …
+family`) is only safe once that subtree is LEAF-COMPLETE — every valid Junos
+keyword under it is modeled — otherwise the flip false-rejects a valid config.
+The Phase-2 `security ipsec proposal` is now CLOSED (both `description` and
+`lifetime-kilobytes` were modeled first — see above). Each remaining flip is
 its own follow-up gated on a Junos-leaf completeness audit for that subtree. Do
 NOT set `closedWorld` on a subtree without that audit.
 

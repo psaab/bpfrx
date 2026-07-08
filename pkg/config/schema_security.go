@@ -586,13 +586,39 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				}},
 			}},
 		}},
-		"nat64": {desc: "NAT64 (IPv6-to-IPv4) translation", children: map[string]*schemaNode{
+		// #4313 — closed-world flip. `security nat nat64` is an xpf-NATIVE
+		// stanza (Junos does NAT64 via source/destination NAT + `then static-nat
+		// inet`, not this spelling), so its grammar IS exactly what xpf models
+		// and compiles — there is no external Junos superset to false-reject.
+		// The container's only child is `rule-set`, and a rule-set's only
+		// children are `prefix` and `source-pool` (both modeled, both value
+		// leaves whose value rides on the same statement line). The compiler
+		// (compiler_nat.go compileNAT64) reads ONLY prefix + source-pool and the
+		// struct (NAT64RuleSet) holds ONLY those two — so the subtree is
+		// leaf-complete by construction and closing it cannot false-reject a
+		// valid config. Silent-drop here is a real footgun: a typo'd `prefx`
+		// left NAT64RuleSet.Prefix empty, validateNAT64PrefixStrict skipped the
+		// rule (`Prefix == ""` → continue), and the NAT64 translation silently
+		// did nothing — IPv6-only clients lost IPv4 reachability with no error.
+		// closedWorld inherits down every level (childClosed fold), so a typo at
+		// the nat64 level (`rulset`) OR under a rule-set (`prefx`/`source-pol`)
+		// is REJECTED at strict commit; the tolerant Load/SyncApply path
+		// downgrades to a warning (#1960).
+		"nat64": {desc: "NAT64 (IPv6-to-IPv4) translation", closedWorld: true, children: map[string]*schemaNode{
 			"rule-set": {desc: "NAT64 rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
 				"prefix":      {desc: "NAT64 IPv6 prefix (must be /96)", args: 1, placeholder: "<ipv6-prefix>", children: nil},
 				"source-pool": {desc: "Source NAT pool for the translated IPv4 source", args: 1, placeholder: "<pool-name>", children: nil},
 			}},
 		}},
-		"natv6v4": {desc: "NAT64 IPv6-to-IPv4 options", children: map[string]*schemaNode{
+		// #4313 — closed-world flip. `security nat natv6v4` is an xpf-NATIVE
+		// options stanza whose entire grammar is the single flag
+		// `no-v6-frag-header` (modeled). The compiler (compiler_nat.go) reads
+		// ONLY that keyword and the struct (NATv6v4Config) holds ONLY
+		// NoV6FragHeader, so the subtree is leaf-complete by construction. A
+		// typo (`no-v6-frag-heder`) previously committed clean and silently left
+		// the IPv6 fragment header in translated packets; it is now rejected at
+		// strict commit (lenient path warns, #1960).
+		"natv6v4": {desc: "NAT64 IPv6-to-IPv4 options", closedWorld: true, children: map[string]*schemaNode{
 			"no-v6-frag-header": {desc: "Omit the IPv6 fragment header in translated packets", children: nil},
 		}},
 		"proxy-arp": {desc: "Proxy ARP for NAT pool addresses", children: map[string]*schemaNode{
@@ -981,7 +1007,29 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// that dropped `group14` to DHGroup=0 (silent PFS loss), and this
 		// gate deliberately rejected the prefixed spelling to stay
 		// compiler-faithful; the compiler fix lets both gates accept it.
-		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
+		// #4313 — closed-world flip (Phase-2 ESP crypto), the sibling of the
+		// already-closed Phase-1 `security ike proposal`. The subtree is now
+		// LEAF-COMPLETE: the full Junos `security ipsec proposal <name>` grammar
+		// is exactly protocol, encryption-algorithm, authentication-algorithm,
+		// dh-group, lifetime-seconds, lifetime-kilobytes, and description. The
+		// first five were already modeled; this change models lifetime-kilobytes
+		// (the ESP volume-rekey knob that DISTINGUISHES the Phase-2 proposal from
+		// the Phase-1 IKE proposal — Phase-1 has none) and the cosmetic
+		// description. The compiler (compiler_ipsec.go, the IPsec proposal loop)
+		// reads protocol / encryption-algorithm / authentication-algorithm /
+		// dh-group / lifetime-seconds / lifetime-kilobytes and ignores
+		// description, i.e. a subset of the modeled set — so closing carries no
+		// false-reject risk (the #4191 class). Every leaf carries its value on
+		// the same statement line (no nested value block in Junos), so
+		// closed-world never descends into an AST child of a value leaf in
+		// either parser shape. Silent-drop here FAILS OPEN on crypto exactly
+		// like the IKE proposal: a fat-fingered `encryption-algorith` used to
+		// commit clean and the ESP SA negotiated WITHOUT the operator's cipher
+		// (a silent downgrade). The flip rejects the typo at strict commit; the
+		// tolerant Load/SyncApply path downgrades it to a warning (#1960).
+		// lifetime-kilobytes is captured but accepted-only (not enforced) — see
+		// the ValidateConfig advisory in compiler_validate_warn.go.
+		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", closedWorld: true, children: map[string]*schemaNode{
 			// #4298 (V-2): type the protocol so a typo fails closed. `ah`
 			// is an accepted value here (grammar-valid) but hard-rejected at
 			// commit by validateIPsecProposalProtocolStrict — xpf does not
@@ -999,6 +1047,20 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"lifetime-seconds": {desc: "IPsec SA lifetime in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "IPsec SA lifetime in seconds",
 				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},
+			// #4313: modeled so the closed-world flip is LEAF-COMPLETE. The ESP
+			// volume-based rekey threshold; captured (IPsecProposal.LifetimeKilobytes)
+			// but accepted-only — the renderer does not yet program a byte-based
+			// rekey, so ValidateConfig emits an advisory (compiler_validate_warn.go).
+			"lifetime-kilobytes": {desc: "IPsec SA volume-based rekey threshold in kilobytes (accepted, not enforced)", args: 1, placeholder: "<kilobytes>",
+				valueType: ValueInteger, valueDesc: "IPsec SA lifetime in kilobytes",
+				valueExamples: []string{"100000", "4294967294"}, validator: ValidateIntegerMin(1), children: nil},
+			// #4313: modeled so the closed-world flip is LEAF-COMPLETE. Junos
+			// allows a cosmetic `description` on an IPsec proposal; xpf ignores it
+			// at compile (the IPsec proposal loop has no case for it), but it MUST
+			// be modeled or closed-world would false-reject a valid config that
+			// carries it. scalar:true rejects a trailing token (#3332) — a
+			// multi-word description must be quoted.
+			"description": {desc: "Proposal description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		}},
 		"policy": {desc: "IPsec policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: nil},

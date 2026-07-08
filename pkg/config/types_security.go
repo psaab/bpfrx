@@ -1101,6 +1101,14 @@ type IPsecProposal struct {
 	AuthAlg         string // "hmac-sha-256" (ignored for GCM)
 	DHGroup         int    // DH group number
 	LifetimeSeconds int
+	// LifetimeKilobytes is the Junos ESP volume-based rekey threshold
+	// (`lifetime-kilobytes`). It is CAPTURED so the #4313 closed-world flip
+	// on `security ipsec proposal` is leaf-complete (a valid proposal
+	// carrying it is not false-rejected) and so ValidateConfig can emit the
+	// accepted-only advisory — the userspace dataplane / strongSwan renderer
+	// does not yet program a volume-based rekey, so the value is accepted but
+	// not enforced (config-only parity, #2078/#4231 doctrine).
+	LifetimeKilobytes int
 }
 
 // IPsecPolicyDef defines Phase 2 policy (PFS + proposal reference).
