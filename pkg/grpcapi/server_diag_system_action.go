@@ -337,6 +337,15 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 				if err != nil {
 					return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
 				}
+				// Reject an out-of-range node before the local/proxy routing
+				// decision (#4693, #4125 class). Without this a local caller's
+				// `cluster-failover:<rg>:node99` fell through to the outbound
+				// proxy-dial path (targetNode != NodeID), driving avoidable
+				// peer dials to a node ID that cannot exist. The sibling
+				// cluster-failover-data:node branch already validates this way.
+				if !cluster.IsSupportedClusterNodeID(targetNode) {
+					return nil, status.Errorf(codes.InvalidArgument, "unsupported cluster failover target node %d", targetNode)
+				}
 				if targetNode != s.cluster.NodeID() {
 					if peerForwardedFromContext(ctx) {
 						return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)

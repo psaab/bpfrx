@@ -195,13 +195,31 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				"as-path":      {desc: "AS path", args: 1, multi: true, placeholder: "<name>", children: nil},
 			}},
 			"then": {desc: "Action", children: map[string]*schemaNode{
-				"accept":           {desc: "Accept route", children: nil},
-				"reject":           {desc: "Reject route", children: nil},
-				"next-hop":         {desc: "Next hop", args: 1, placeholder: "<address>", children: nil},
-				"load-balance":     {desc: "Load balance", args: 1, placeholder: "<policy>", children: nil},
-				"local-preference": {desc: "Local preference", args: 1, placeholder: "<value>", children: nil},
-				"metric":           {desc: "Metric", args: 1, placeholder: "<value>", children: nil},
-				"metric-type":      {desc: "Metric type", args: 1, placeholder: "<type>", children: nil},
+				"accept":       {desc: "Accept route", children: nil},
+				"reject":       {desc: "Reject route", children: nil},
+				"next-hop":     {desc: "Next hop", args: 1, placeholder: "<address>", children: nil},
+				"load-balance": {desc: "Load balance", args: 1, placeholder: "<policy>", children: nil},
+				// #4688: type these three `then` leaves. Without a validator a
+				// non-numeric value (`then local-preference abc`) committed
+				// silently — the compiler's strconv.Atoi failed under an
+				// err==nil gate with no else, so HasLocalPreference stayed false
+				// and the FRR clause was never emitted (fail-open, no warning).
+				// A uint32-overflow value (`then local-preference 42949672960`)
+				// parsed as int64 in the compiler, rendered, then FRR (u32)
+				// rejected it at frr-reload and aborted the WHOLE reload
+				// (fable-167 R-1 class). ValidateInteger(0, maxWireU32) gates
+				// local-preference/metric at commit — naming the leaf — so a
+				// bad value never reaches FRR. metric-type is the OSPF external
+				// route type, valid values 1 or 2.
+				"local-preference": {desc: "Local preference", args: 1, placeholder: "<value>",
+					valueType: ValueInteger, valueDesc: "Local preference (0..4294967295)",
+					valueExamples: []string{"100", "200"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+				"metric": {desc: "Metric", args: 1, placeholder: "<value>",
+					valueType: ValueInteger, valueDesc: "Metric (0..4294967295)",
+					valueExamples: []string{"5", "100"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+				"metric-type": {desc: "Metric type", args: 1, placeholder: "<type>",
+					valueType: ValueInteger, valueDesc: "OSPF external metric type (1 or 2)",
+					valueExamples: []string{"1", "2"}, validator: ValidateInteger(1, 2), children: nil},
 				// `then community` supports the Junos community operations
 				// (add | delete | set | none) plus the legacy bare
 				// `then community <value>` (= replace). multi:true packs the

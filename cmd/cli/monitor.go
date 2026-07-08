@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
@@ -28,9 +29,17 @@ type remoteMonitorFrame struct {
 	err   error
 }
 
-// TODO: setMonitorRawMode, restoreMonitorTermMode, and monitorInputIsTTY
-// duplicate helpers in pkg/cli/monitor_interface.go. Extract to a shared
-// package (e.g. pkg/termutil) when the remote CLI gains more terminal ops.
+// TODO: setMonitorRawMode, restoreMonitorTermMode, monitorInputIsTTY,
+// keyReader, and startKeyReader duplicate helpers in
+// pkg/cli/monitor_interface.go. Extract to a shared package (e.g. pkg/termutil)
+// when the remote CLI gains more terminal ops.
+//
+// VMIN=0/VTIME=1 selects a poll-with-timeout read (#3985, #4694): os.Stdin.Read
+// returns immediately when a key is available and otherwise returns (0, nil)
+// after ~100ms with no data. This lets the key-reader goroutine observe its
+// stop signal between reads and return, instead of staying parked forever in a
+// blocking Read after the monitor exits (VMIN=1/VTIME=0 would block
+// indefinitely and steal the operator's next keystroke).
 func setMonitorRawMode(fd int) (*unix.Termios, error) {
 	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 	if err != nil {
@@ -38,8 +47,8 @@ func setMonitorRawMode(fd int) (*unix.Termios, error) {
 	}
 	raw := *old
 	raw.Lflag &^= unix.ECHO | unix.ICANON | unix.ISIG
-	raw.Cc[unix.VMIN] = 1
-	raw.Cc[unix.VTIME] = 0
+	raw.Cc[unix.VMIN] = 0
+	raw.Cc[unix.VTIME] = 1
 	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &raw); err != nil {
 		return nil, err
 	}
@@ -48,6 +57,62 @@ func setMonitorRawMode(fd int) (*unix.Termios, error) {
 
 func restoreMonitorTermMode(fd int, old *unix.Termios) {
 	_ = unix.IoctlSetTermios(fd, unix.TCSETS, old)
+}
+
+// keyReader reads single bytes from r and forwards them on keyCh until done is
+// closed, then returns. r must be a poll-mode reader (a raw tty configured with
+// VMIN=0/VTIME>0 via setMonitorRawMode) so Read returns periodically with n==0
+// when idle, letting the loop observe done and return. Without this the
+// goroutine would remain blocked in Read after the monitor exits and consume
+// the operator's next keystroke (#3985 / #4694). A byte read after done is
+// closed is discarded rather than forwarded, so no stale monitor input reaches
+// a caller.
+func keyReader(r io.Reader, keyCh chan<- byte, done <-chan struct{}) {
+	buf := make([]byte, 1)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		n, err := r.Read(buf)
+		if err != nil {
+			return
+		}
+		if n == 0 {
+			// VTIME poll timeout with no data — loop and re-check done.
+			continue
+		}
+		select {
+		case keyCh <- buf[0]:
+		case <-done:
+			return
+		}
+	}
+}
+
+// startKeyReader launches a keyReader goroutine reading from r and returns the
+// key channel plus a stop function. The stop function closes the done channel
+// and blocks until the goroutine has returned, guaranteeing no reader is left
+// competing for stdin once the monitor exits (#3985 / #4694). Callers defer
+// stop so it runs before the terminal is restored and control returns to the
+// CLI.
+func startKeyReader(r io.Reader) (<-chan byte, func()) {
+	keyCh := make(chan byte, 8)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		keyReader(r, keyCh, done)
+	}()
+	var once sync.Once
+	return keyCh, func() {
+		once.Do(func() {
+			close(done)
+			wg.Wait()
+		})
+	}
 }
 
 func monitorInputIsTTY(fd int) bool {
@@ -125,23 +190,13 @@ func (c *ctl) handleInteractiveMonitorInterfaceSummary(req *pb.MonitorInterfaceR
 	fmt.Print(monitorEnterAltScreen + monitorHideCursor)
 	defer fmt.Print(monitorShowCursor + monitorExitAltScreen)
 
-	keyCh := make(chan byte, 8)
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-	go func() {
-		buf := make([]byte, 1)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil || n == 0 {
-				return
-			}
-			select {
-			case keyCh <- buf[0]:
-			case <-doneCh:
-				return
-			}
-		}
-	}()
+	// Stop the stdin reader before restoring the terminal so no goroutine is
+	// left parked in os.Stdin.Read stealing the next command's key (#3985 /
+	// #4694). The old inline goroutine used a blocking VMIN=1/VTIME=0 read and
+	// returned on the first n==0, so it either blocked forever after the
+	// monitor exited or, under a poll reader, died on the first idle poll.
+	keyCh, stopKeys := startKeyReader(os.Stdin)
+	defer stopKeys()
 
 	frameCh := make(chan remoteMonitorFrame, 16)
 	ctx, cancel := context.WithCancel(c.ctx())

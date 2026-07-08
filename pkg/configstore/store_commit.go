@@ -802,7 +802,14 @@ func (s *Store) loadRollbackHistory() {
 		parser := config.NewParser(string(data))
 		tree, errs := parser.Parse()
 		if len(errs) > 0 {
-			slog.Warn("skipping corrupt rollback file", "path", path, "err", errs[0])
+			// Log POSITION only (#4690, mirroring the #4099 rescue-path
+			// invariant): config.ParseError.Error() embeds ParseError.Message,
+			// which the lexer/parser can populate with the OFFENDING TOKEN
+			// VALUE (e.g. an unterminated `pre-shared-key "SECRET…`). Forwarding
+			// errs[0] / the ParseError text would echo secret file content into
+			// the log. Line/Column are ints and cannot hold a token.
+			slog.Warn("skipping corrupt rollback file",
+				"path", path, "line", errs[0].Line, "column", errs[0].Column)
 			continue
 		}
 		// Use file modification time as timestamp
