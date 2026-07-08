@@ -152,6 +152,94 @@ func TestMasterAdverInterval_ZeroFieldIgnored(t *testing.T) {
 	}
 }
 
+// TestMasterAdverInterval_LowIntervalClamped verifies the #4548 floor: a peer
+// advertising a pathologically-low Max Adver Int (=1 cs = 10 ms) is clamped up
+// to the local node's configured advertise interval, so the backup's
+// Master_Down_Interval (and the preempt-gate staleness horizons that share the
+// same effectiveAdvertInterval math) never collapse below the safe cadence and
+// flap mastership on ordinary jitter.
+//
+// RED-on-revert: dropping the clamp lets masterAdverInterval adopt 10 ms, which
+// drives masterDownInterval to ~36 ms; the exact-equality assertion against the
+// 30 ms-floor computation fails on revert.
+func TestMasterAdverInterval_LowIntervalClamped(t *testing.T) {
+	vi := newMasterIntervalTestInstance(t, 100, 30) // local 30 ms, priority 100
+
+	// Buggy/misconfigured peer advertises Max Adver Int=1 cs = 10 ms.
+	vi.recordMasterAdvert(&VRRPPacket{Priority: 120, MaxAdvertInt: 1})
+
+	// The learned interval is clamped UP to the 30 ms local floor, not 10 ms.
+	vi.mu.RLock()
+	learned := vi.masterAdverInterval
+	vi.mu.RUnlock()
+	if learned != 30*time.Millisecond {
+		t.Fatalf("masterAdverInterval = %v, want 30ms (clamped up from 10ms to local floor)", learned)
+	}
+
+	// masterDownInterval is the 30 ms-floor computation, materially larger than
+	// the ~36 ms an un-clamped 10 ms interval would produce.
+	wantFloored := 3*30*time.Millisecond + time.Duration(256-100)*30*time.Millisecond/256
+	if got := vi.masterDownInterval(); got != wantFloored {
+		t.Fatalf("masterDownInterval() = %v, want %v (from 30ms floor, NOT ~36ms on revert)", got, wantFloored)
+	}
+	revert := 3*10*time.Millisecond + time.Duration(256-100)*10*time.Millisecond/256
+	if wantFloored <= revert {
+		t.Fatalf("test does not discriminate: floored %v <= reverted %v", wantFloored, revert)
+	}
+	if revert >= 90*time.Millisecond {
+		t.Fatalf("sanity: reverted masterDown %v unexpectedly >= 90ms", revert)
+	}
+}
+
+// TestMasterAdverInterval_FloorPreserves30msFailover verifies the clamp does NOT
+// touch the intended 30 ms RETH fast-failover default: a peer advertising the
+// matching 30 ms (3 cs) is adopted unchanged (floor == learned == 30 ms) and the
+// master-down timer is the same value the node runs at without the clamp.
+func TestMasterAdverInterval_FloorPreserves30msFailover(t *testing.T) {
+	vi := newMasterIntervalTestInstance(t, 100, 30)
+	vi.recordMasterAdvert(&VRRPPacket{Priority: 120, MaxAdvertInt: 3}) // 3 cs = 30 ms
+	vi.mu.RLock()
+	learned := vi.masterAdverInterval
+	vi.mu.RUnlock()
+	if learned != 30*time.Millisecond {
+		t.Fatalf("masterAdverInterval = %v, want 30ms unchanged (floor must not alter the RETH default)", learned)
+	}
+	want := 3*30*time.Millisecond + time.Duration(256-100)*30*time.Millisecond/256
+	if got := vi.masterDownInterval(); got != want {
+		t.Fatalf("masterDownInterval() = %v, want %v (30ms failover preserved)", got, want)
+	}
+}
+
+// TestMasterAdverInterval_LegitLowConfigNotOverClamped verifies the floor is the
+// node's OWN configured interval, not a fixed 30 ms: an operator who configures
+// reth-advertise-interval=10 (the schema minimum, pkg/config/schema_chassis.go)
+// on both nodes still runs at 10 ms — a matching 10 ms advert is adopted
+// unchanged, not forced up to 30 ms.
+func TestMasterAdverInterval_LegitLowConfigNotOverClamped(t *testing.T) {
+	vi := newMasterIntervalTestInstance(t, 100, 10)                    // local 10 ms
+	vi.recordMasterAdvert(&VRRPPacket{Priority: 120, MaxAdvertInt: 1}) // 1 cs = 10 ms
+	vi.mu.RLock()
+	learned := vi.masterAdverInterval
+	vi.mu.RUnlock()
+	if learned != 10*time.Millisecond {
+		t.Fatalf("masterAdverInterval = %v, want 10ms (legit 10ms config must not be over-clamped)", learned)
+	}
+}
+
+// TestMasterAdverInterval_SlowerMasterNotClamped verifies the floor only clamps
+// the LOW side: a master advertising SLOWER than the local interval (the #4061
+// anti-premature-failover case) is adopted unchanged.
+func TestMasterAdverInterval_SlowerMasterNotClamped(t *testing.T) {
+	vi := newMasterIntervalTestInstance(t, 100, 30)                      // local 30 ms
+	vi.recordMasterAdvert(&VRRPPacket{Priority: 120, MaxAdvertInt: 100}) // 100 cs = 1000 ms
+	vi.mu.RLock()
+	learned := vi.masterAdverInterval
+	vi.mu.RUnlock()
+	if learned != 1000*time.Millisecond {
+		t.Fatalf("masterAdverInterval = %v, want 1000ms (slower master adopted unchanged, no clamp)", learned)
+	}
+}
+
 // TestMasterAdverInterval_LowerPriorityAdvertNotAdopted verifies that a
 // priority-0 (resignation) advert does not update the learned interval — the
 // recordMasterAdvert contract skips priority-0 (#2082), and a zero interval

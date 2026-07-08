@@ -119,6 +119,20 @@ This is the package that drives chassis-cluster failover.
   mismatch (a rolling `reth-advertise-interval` change, or a misconfig) no
   longer times the master out on the wrong cadence (a shorter local interval
   → premature failover/flapping; a longer one → delayed detection/loss).
+- Learned-interval floor (#4548): `recordMasterAdvert` clamps the learned
+  `Master_Adver_Interval` UP to `masterAdverFloor()` — the node's own
+  configured `cfg.AdvertiseInterval`, with a 10 ms absolute backstop
+  (`minLearnedMasterAdverInterval`, the schema minimum for
+  `reth-advertise-interval`). RFC 5798 §6.1/§6.4.2 has no packet auth, so a
+  buggy or misconfigured peer advertising `Max Adver Int=1` (10 ms) would
+  otherwise collapse `masterDownInterval` (and the preempt-gate staleness
+  horizons) to ~30 ms on a 30 ms RETH node and flap mastership on ordinary
+  scheduling/network jitter. Only the LOW side is clamped: a SLOWER master
+  (learned ≥ floor, the anti-premature-failover case above) is adopted
+  unchanged, and a matching 30 ms advert equals the 30 ms floor so the
+  fast-failover default is preserved exactly. Because the floor is the node's
+  OWN interval, a legitimately-configured low-interval cluster (e.g.
+  `reth-advertise-interval 10` on both nodes) is not over-clamped.
 - Planned shutdown: 3× priority-0 advert burst → peer takeover ~1 ms.
 - Heartbeat 200 ms, threshold 5 (1 s detection).
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a
