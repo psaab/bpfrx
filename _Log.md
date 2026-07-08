@@ -1,3 +1,33 @@
+## 2026-07-08 — #2852 Phase 1: lock-free SNAT port allocation
+
+- **Timestamp**: 2026-07-08
+- **Action**: #2852 Phase 1 (converged v3 plan). Replaced the single
+  `Mutex<PortAllocatorLiveState>` hot-path serialization of SNAT port
+  allocation with a per-pool-address atomic occupancy bitmap
+  (`AddressOccupancy`: `Vec<AtomicU64>` + an atomic fresh-port cursor,
+  `fetch_or` CAS as the ownership token). The non-persistent new-flow hot
+  path now claims its port lock-free and takes the retained mutex only for
+  a tiny reuse-check + exact-cap-check + `live_by_flow` insert. F1
+  conditional bit-clear on release, F2 FIFO recycle preserved (a `VecDeque`
+  behind a per-ADDRESS mutex, exact #3011 ordering; lock order global →
+  recycle, no deadlock — F5 sidestepped), F7 addr_index stored in
+  `LiveAllocation`. F4 global cap kept EXACT via `live_by_flow.len()` under
+  the tiny insert mutex — no `fetch_add`-reserve, so the microbench's
+  M-in-flight overshoot cannot falsely exhaust a tiny pool near capacity.
+  Persistent NAT keeps its lease-decision + claim atomic under the mutex
+  (cold path, `allocate_translation_locked`); deterministic-v4, reserve_flow
+  (#4388 HA reservation), and lease-reuse (#2397/#4643) preserved on the
+  bitmap. Removed `owner_by_translated` / `addr_index_by_translated` /
+  `next_port_offset_by_addr` maps and `AllocationOwner`. Added #[cfg(test)]
+  debug accessors (debug_is_port_occupied / debug_recycled_ports /
+  debug_set_cursor / debug_set_recycled / debug_occupied_count) and
+  rewrote the 10 white-box test sites. Added 4 RED-on-revert concurrency
+  tests. Full `cargo test` 3743/0; NAT suite 209/0. Phase 2 (shard maps)
+  and the loss-cluster new-flow-ceiling measurement remain deferred.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/README.md,
+  docs/research/2852-portalloc/microbench-results.md, _Log.md
+
 ## 2026-07-08 — #4404 increment 1: split debug_log_throttle submodule
 
 - **Timestamp**: 2026-07-08

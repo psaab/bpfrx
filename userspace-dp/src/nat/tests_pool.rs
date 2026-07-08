@@ -935,12 +935,10 @@ fn assert_persistent_expiry_indexes_consistent(rule: &SourceNatRule) {
             lease.addr_index,
             expected_by_addr.len()
         );
-        assert_eq!(
-            live.addr_index_by_translated
-                .get(&lease.translated)
-                .copied(),
-            Some(lease.addr_index),
-            "persistent lease addr index mismatch"
+        assert!(
+            rule.pool_allocator
+                .debug_is_port_occupied(lease.addr_index, lease.translated.port),
+            "persistent lease port must be occupied on its addr index"
         );
         assert_eq!(
             pool_ip_for_addr_index(rule, lease.addr_index),
@@ -1667,11 +1665,8 @@ fn pool_snat_persistent_double_rollback_removes_unused_lease() {
         assert!(live.persistent_by_source.is_empty());
         assert!(live.lease_expirations.is_empty());
         assert!(live.lease_expirations_by_addr[0].is_empty());
-        assert_eq!(
-            live.recycled_ports_by_addr[0].iter().copied().collect::<Vec<_>>(),
-            vec![40000]
-        );
     }
+    assert_eq!(rules[0].pool_allocator.debug_recycled_ports(0), vec![40000]);
 }
 
 #[test]
@@ -1919,7 +1914,7 @@ fn pool_snat_expiry_invariant_rejects_stale_per_address_entry() {
 }
 
 #[test]
-#[should_panic(expected = "persistent lease addr index mismatch")]
+#[should_panic(expected = "persistent lease port must be occupied on its addr index")]
 fn pool_snat_expiry_invariant_rejects_wrong_addr_index() {
     let rules = persistent_pool_rules_with_options(
         300,
@@ -2927,16 +2922,12 @@ fn pool_snat_recycled_collision_retains_port() {
     let addrs = [pool_ip];
     // Range 1024..=1025 (2 ports).
     let alloc = PortAllocator::new(1, 1024, 1025);
-    {
-        let mut live = alloc.debug_live();
-        // Force the sequential cursor past the range so only the recycled
-        // stack is consulted.
-        live.next_port_offset_by_addr[0] = 2;
-        // FIFO queue: pop_front() yields 1025 (collides) first, then 1024
-        // (free). Front-first ordering keeps this exercising the #3047
-        // collision-retain path after the #3011 LIFO->FIFO change.
-        live.recycled_ports_by_addr[0] = std::collections::VecDeque::from(vec![1025, 1024]);
-    }
+    // Force the sequential cursor past the range so only the recycle ring is
+    // consulted. FIFO queue: pop_front() yields 1025 (collides) first, then
+    // 1024 (free). Front-first ordering keeps this exercising the #3047
+    // collision-retain path after the #3011 LIFO->FIFO change.
+    alloc.debug_set_cursor(0, 2);
+    alloc.debug_set_recycled(0, vec![1025, 1024]);
     // 1025 is occupied out-of-band, so the recycled pop of 1025 collides.
     alloc.debug_seed_owner(0, IpAddr::V4(pool_ip), 1025);
 
@@ -2961,18 +2952,15 @@ fn pool_snat_recycled_collision_retains_port() {
     assert_eq!(translated.port, 1024, "must hand out the free recycled port");
 
     // The collided recycled port must NOT have been leaked: it is still on the
-    // recycled stack, so once its out-of-band owner clears it is reusable.
-    {
-        let live = alloc.debug_live();
-        assert!(
-            live.recycled_ports_by_addr[0].contains(&1025),
-            "collided recycled port must be retained, not discarded (leak)"
-        );
-    }
+    // recycle ring, so once its out-of-band owner clears it is reusable.
+    assert!(
+        alloc.debug_recycled_ports(0).contains(&1025),
+        "collided recycled port must be retained, not discarded (leak)"
+    );
 
     // Prove reusability: clear the out-of-band owner and allocate again — the
     // retained port 1025 must be handed out instead of a spurious exhaustion.
-    alloc.debug_clear_owner(IpAddr::V4(pool_ip), 1025);
+    alloc.debug_clear_owner(0, IpAddr::V4(pool_ip), 1025);
     let flow2 = SourceNatFlowKey {
         protocol: 6,
         src_ip: "10.0.61.52".parse().unwrap(),
@@ -3059,17 +3047,11 @@ fn pool_snat_recycle_order_is_fifo_not_lifo() {
             "release of a live flow must succeed"
         );
     }
-    {
-        let live = alloc.debug_live();
-        assert_eq!(
-            live.recycled_ports_by_addr[0]
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![1026, 1024, 1028],
-            "freed ports queue in release order (push_back)"
-        );
-    }
+    assert_eq!(
+        alloc.debug_recycled_ports(0),
+        vec![1026, 1024, 1028],
+        "freed ports queue in release order (push_back)"
+    );
 
     // The next three allocations must reuse the freed ports FIFO: oldest-freed
     // (1026) first, then 1024, then 1028 — NOT the LIFO reverse (1028,1024,1026).
@@ -3199,18 +3181,11 @@ fn synced_session_reserves_nat_pool_port_4388() {
 
     reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false);
 
-    // The reservation is visible as an owned translated tuple.
-    {
-        let live = rules[0].pool_allocator.debug_live();
-        assert!(
-            live.addr_index_by_translated
-                .contains_key(&TranslatedTuple {
-                    ip: IpAddr::V4(pool_ip),
-                    port: 10000,
-                }),
-            "synced NAT pool port must be reserved in the local allocator"
-        );
-    }
+    // The reservation is visible as an occupied translated tuple.
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "synced NAT pool port must be reserved in the local allocator"
+    );
 
     // A NEW local flow allocates from the same pool: it MUST skip the reserved
     // 10000 and hand out 10001. On revert (no reservation) it returns 10000 —
@@ -3246,18 +3221,10 @@ fn synced_session_reserves_nat_pool_port_4388() {
     // standby teardown: `handle_delete_synced` / reap call
     // `release_source_nat_allocation`).
     release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
-    {
-        let live = rules[0].pool_allocator.debug_live();
-        assert!(
-            !live
-                .addr_index_by_translated
-                .contains_key(&TranslatedTuple {
-                    ip: IpAddr::V4(pool_ip),
-                    port: 10000,
-                }),
-            "releasing the synced session must free its reserved pool port"
-        );
-    }
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "releasing the synced session must free its reserved pool port"
+    );
 
     // Prove reusability: with the sequential range spent (10001 taken above),
     // the next allocation drains the recycled queue and reuses the freed 10000.
@@ -3309,9 +3276,9 @@ fn synced_session_without_nat_reserves_nothing_4388() {
     // No translation carried on the synced decision.
     reserve_synced_source_nat_allocation(&rules, &synced_key, NatDecision::default(), false);
 
-    let live = rules[0].pool_allocator.debug_live();
-    assert!(
-        live.addr_index_by_translated.is_empty(),
+    assert_eq!(
+        rules[0].pool_allocator.debug_occupied_count(),
+        0,
         "a synced session with no NAT translation must reserve nothing"
     );
 }
@@ -3342,9 +3309,9 @@ fn synced_session_foreign_pool_addr_skips_reserve_4388() {
     };
     reserve_synced_source_nat_allocation(&rules, &synced_key, foreign_nat, false);
 
-    let live = rules[0].pool_allocator.debug_live();
-    assert!(
-        live.addr_index_by_translated.is_empty(),
+    assert_eq!(
+        rules[0].pool_allocator.debug_occupied_count(),
+        0,
         "a synced pool address not in any local pool must not reserve anything"
     );
 }
@@ -3376,9 +3343,9 @@ fn synced_reverse_entry_reserves_nothing_4388() {
     // is_reverse = true: the reserve is a no-op.
     reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, true);
 
-    let live = rules[0].pool_allocator.debug_live();
-    assert!(
-        live.addr_index_by_translated.is_empty(),
+    assert_eq!(
+        rules[0].pool_allocator.debug_occupied_count(),
+        0,
         "a reverse synced entry must not reserve a pool source port"
     );
 }
@@ -3560,5 +3527,302 @@ fn deterministic_cgnat_absent_leaves_round_robin_pool_unchanged() {
         d.rewrite_src_port,
         Some(1024),
         "a non-deterministic pool allocates from the round-robin cursor (port_low)"
+    );
+}
+
+// === #2852 Phase 1: lock-free port-claim correctness =====================
+
+// #2852 FAIL-ON-REVERT: with the port claim lock-free (per-address atomic
+// occupancy bitmap, CAS is the sole ownership arbiter), M worker threads
+// hammering ONE full-capacity pool must hand out each (ip, port) EXACTLY once:
+//   - no double-allocation  (distinct == successes: the bit CAS never lets two
+//     flows win the same offset), AND
+//   - no false exhaustion / no over-cap (successes == capacity: every port is
+//     handed out, and never more than capacity — the exact `live_by_flow.len()`
+//     cap under the tiny insert mutex, F4, has no M-in-flight overshoot).
+// Reverting the CAS-claim to a non-atomic set, or the exact cap to a racy
+// pre-claim reserve, turns this RED (duplicates appear, or fewer than capacity
+// succeed on a tiny pool near capacity).
+#[test]
+fn pool_snat_lockfree_concurrent_fill_is_exact_and_collision_free() {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    let pool_ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    // 1 address, 64 ports => capacity 64, max_tracked_flows 64.
+    let alloc = PortAllocator::new(1, 30000, 30063);
+    let capacity = 64usize;
+    let m = 8usize;
+    let attempts_per_thread = 200usize; // 1600 attempts >> 64 capacity
+
+    let results = Arc::new(Mutex::new(Vec::<(IpAddr, u16)>::new()));
+    let barrier = Arc::new(Barrier::new(m));
+    let mut handles = Vec::new();
+    for tid in 0..m {
+        let alloc = alloc.clone();
+        let results = results.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            let addrs = [pool_ip];
+            let mut local = Vec::new();
+            barrier.wait();
+            for n in 0..attempts_per_thread {
+                // Globally-unique 5-tuple per (tid, n).
+                let flow = SourceNatFlowKey {
+                    protocol: 6,
+                    src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, tid as u8, (n & 0xff) as u8)),
+                    dst_ip: "8.8.8.8".parse().unwrap(),
+                    src_port: 1024 + n as u16,
+                    dst_port: 443,
+                };
+                if let Ok(t) = alloc.allocate_translation(
+                    flow,
+                    PoolAddressFamily::V4(&addrs),
+                    0,
+                    false,
+                    false,
+                    PersistentNatPermit::TargetHostPort,
+                    0,
+                    1_000,
+                ) {
+                    local.push((t.ip, t.port));
+                }
+            }
+            results.lock().unwrap().extend(local);
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let all = results.lock().unwrap().clone();
+    assert_eq!(
+        all.len(),
+        capacity,
+        "exactly capacity allocations must succeed (no false exhaustion, no over-cap)"
+    );
+    let distinct: HashSet<_> = all.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        capacity,
+        "no (ip, port) may be handed to two flows (no double-allocation)"
+    );
+    for (ip, port) in &all {
+        assert_eq!(*ip, IpAddr::V4(pool_ip));
+        assert!((30000..=30063).contains(port), "port {port} out of pool range");
+    }
+    assert_eq!(alloc.debug_occupied_count(), capacity, "every port bit is set");
+}
+
+// #2852 FAIL-ON-REVERT: concurrent allocate+release churn must (a) never leak a
+// bit, and (b) never hand the SAME (ip, port) to two simultaneously-live flows.
+// M threads each allocate a unique flow then immediately release it, on a pool
+// with ample headroom (never genuinely exhausted) but small enough that the
+// fresh cursor is spent quickly and reuse flows through the recycle ring under
+// contention — the exact path where the CAS-arbiter (a set bit cannot be
+// re-claimed) matters. A shared live-set records every translated tuple while
+// it is live: insert-on-allocate MUST be new (no double-allocation), and the
+// tuple is removed BEFORE `release_flow` clears the bit so a legitimate reuse
+// by a peer is never a false collision. Reverting the CAS-claim (double-alloc)
+// or the bit-clear-on-release (leak / exhaustion) turns this RED.
+#[test]
+fn pool_snat_lockfree_concurrent_churn_no_double_alloc_no_leak() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    let pool_ip: Ipv4Addr = "203.0.113.2".parse().unwrap();
+    // 2 addresses x 32 ports = 64 capacity; <= 8 concurrent outstanding, so the
+    // fresh range is spent almost immediately and reuse hammers the recycle ring.
+    let alloc = PortAllocator::new(2, 20000, 20031);
+    let addrs2 = [pool_ip, "203.0.113.3".parse().unwrap()];
+    let m = 8usize;
+    let iters = 6000usize;
+    let exhausted = Arc::new(AtomicU64::new(0));
+    let live_set = Arc::new(Mutex::new(HashSet::<(IpAddr, u16)>::new()));
+    let barrier = Arc::new(Barrier::new(m));
+    let mut handles = Vec::new();
+    for tid in 0..m {
+        let alloc = alloc.clone();
+        let exhausted = exhausted.clone();
+        let live_set = live_set.clone();
+        let barrier = barrier.clone();
+        let addrs2 = addrs2;
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for it in 0..iters {
+                // Unique 5-tuple per (tid, it): tid in bits 20-22, it in low 20.
+                let host = 0x0a00_0000u32 | ((tid as u32) << 20) | (it as u32);
+                let flow = SourceNatFlowKey {
+                    protocol: 6,
+                    src_ip: IpAddr::V4(Ipv4Addr::from(host)),
+                    dst_ip: "8.8.8.8".parse().unwrap(),
+                    src_port: 1024,
+                    dst_port: 443,
+                };
+                match alloc.allocate_translation(
+                    flow,
+                    PoolAddressFamily::V4(&addrs2),
+                    0,
+                    false,
+                    false,
+                    PersistentNatPermit::TargetHostPort,
+                    0,
+                    1_000,
+                ) {
+                    Ok(t) => {
+                        // No two live flows may hold the same translated tuple:
+                        // the occupancy bit was exclusively ours, so the insert
+                        // must be new.
+                        assert!(
+                            live_set.lock().unwrap().insert((t.ip, t.port)),
+                            "double-allocation: (ip, port) already held by a live flow"
+                        );
+                        // Remove from the live-set BEFORE freeing the bit, so a
+                        // peer's legitimate reuse of the freed port is not a
+                        // false collision.
+                        live_set.lock().unwrap().remove(&(t.ip, t.port));
+                        assert!(alloc.release_flow(flow, t, 2_000), "release of a live flow");
+                    }
+                    Err(_) => {
+                        exhausted.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(
+        exhausted.load(Ordering::Relaxed),
+        0,
+        "a pool with 8x headroom must never exhaust under allocate+release churn"
+    );
+    assert_eq!(
+        alloc.debug_occupied_count(),
+        0,
+        "every allocated port must be freed (no leaked occupancy bit)"
+    );
+}
+
+// #2852 FAIL-ON-REVERT: releasing a flow clears its occupancy bit so the port
+// is reusable. Fill a 2-port pool, confirm the 3rd flow is exhausted, release
+// one, and require the next flow to reuse the freed port. Reverting the
+// bit-clear (or leaving the port unrecycled) turns the reuse assertion RED.
+#[test]
+fn pool_snat_release_frees_bit_and_port_is_reusable() {
+    let pool_ip: Ipv4Addr = "203.0.113.9".parse().unwrap();
+    let addrs = [pool_ip];
+    let alloc = PortAllocator::new(1, 50000, 50001); // 2 ports
+    let mk = |src_port: u16| SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.0.7".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port,
+        dst_port: 443,
+    };
+    let alloc_one = |flow: SourceNatFlowKey| {
+        alloc.allocate_translation(
+            flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+        )
+    };
+
+    let t1 = alloc_one(mk(5001)).expect("first port");
+    let _t2 = alloc_one(mk(5002)).expect("second port");
+    assert_eq!(alloc.debug_occupied_count(), 2);
+    assert!(
+        alloc_one(mk(5003)).is_err(),
+        "a full 2-port pool must exhaust"
+    );
+
+    assert!(
+        alloc.release_flow(mk(5001), t1, 2_000),
+        "release the first flow"
+    );
+    assert_eq!(
+        alloc.debug_occupied_count(),
+        1,
+        "release must clear the bit"
+    );
+
+    let t4 = alloc_one(mk(5004)).expect("freed port must be reusable");
+    assert_eq!(
+        t4.port, t1.port,
+        "the released port must be handed back out"
+    );
+    assert_eq!(alloc.debug_occupied_count(), 2);
+}
+
+// #2852 FAIL-ON-REVERT (F4 exact cap): a tiny pool fills to EXACTLY its capacity
+// with no false exhaustion near the boundary, then the next flow exhausts. The
+// cap is `live_by_flow.len()` re-checked under the tiny insert mutex, so there
+// is no M-in-flight overshoot that would spuriously reject a near-full pool.
+#[test]
+fn pool_snat_fills_to_exact_capacity_then_exhausts() {
+    let pool_ip: Ipv4Addr = "203.0.113.8".parse().unwrap();
+    let addrs = [pool_ip];
+    let cap: u16 = 16;
+    let alloc = PortAllocator::new(1, 40000, 40000 + cap - 1);
+    let mut ports = std::collections::HashSet::new();
+    for i in 0..cap {
+        let flow = SourceNatFlowKey {
+            protocol: 6,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8)),
+            dst_ip: "8.8.8.8".parse().unwrap(),
+            src_port: 1024 + i,
+            dst_port: 443,
+        };
+        let t = alloc
+            .allocate_translation(
+                flow,
+                PoolAddressFamily::V4(&addrs),
+                0,
+                false,
+                false,
+                PersistentNatPermit::TargetHostPort,
+                0,
+                1_000,
+            )
+            .expect("must allocate up to exact capacity without false exhaustion");
+        assert!(
+            ports.insert(t.port),
+            "each allocation up to capacity is a distinct port"
+        );
+    }
+    assert_eq!(ports.len(), cap as usize);
+    assert_eq!(alloc.debug_occupied_count(), cap as usize);
+
+    let overflow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 2048,
+        dst_port: 443,
+    };
+    assert!(
+        alloc
+            .allocate_translation(
+                overflow,
+                PoolAddressFamily::V4(&addrs),
+                0,
+                false,
+                false,
+                PersistentNatPermit::TargetHostPort,
+                0,
+                1_000,
+            )
+            .is_err(),
+        "one flow beyond exact capacity must exhaust"
     );
 }

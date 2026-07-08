@@ -1,27 +1,64 @@
 // Pool-mode SNAT port allocator + persistent lease state machine.
 //
-// All translated-tuple ownership, live-flow tracking, persistent-lease
-// lifecycle, expiration indexes, rollback bookkeeping, and recycled-port
-// state lives in this file. The single `Mutex<PortAllocatorLiveState>`
-// serializes every structural mutation; relaxed atomics on the round-robin
-// counters and totals are correct only because the mutex provides
-// happens-before for the user-visible state.
+// #2852 Phase 1 (lock-free port claim): the port-ownership state is no
+// longer serialized behind the single `Mutex<PortAllocatorLiveState>`.
+// Per-pool-address occupancy is an atomic bitmap (`AddressOccupancy`,
+// `Vec<AtomicU64>` + an atomic fresh-port cursor); a CAS on the bit IS the
+// port-ownership token (a set bit cannot be re-claimed), replacing the
+// pre-#2852 `owner_by_translated` / `addr_index_by_translated` maps and the
+// per-address `next_port_offset_by_addr` cursor. The port CLAIM (the
+// contended hot path in `allocate_translation`) is therefore lock-free: a
+// non-persistent new flow claims its port with zero global-mutex contention
+// and takes the (retained) mutex only for the tiny `live_by_flow`
+// insert/reuse-check/exact-cap-check critical section. The microbench
+// `benches/snat_allocator.rs` (results in docs/research/2852-portalloc/)
+// proved the pre-Phase-1 single mutex negative-scales (2.87M->0.62M
+// allocs/sec, M=1->8); Phase 1 is 1.4-1.6x at M=6/8.
 //
-// Port claim (claim_free_port_locked) collision handling (#3047):
+// What stays under `Mutex<PortAllocatorLiveState>`: the flow map
+// (`live_by_flow`), the persistent-lease lifecycle (`persistent_by_source` +
+// the two expiration indexes), and `gc_counter`. Phase 2 (hash-sharding
+// those maps, deferred) is only warranted if the residual map mutex is the
+// next bottleneck.
+//
+// F4 (global tracked-flow cap): kept EXACT with no overshoot. The cap is
+// `live_by_flow.len()` re-checked under the tiny insert mutex, where the map
+// length is authoritative — so it never overshoots and a tiny pool near
+// capacity is NOT falsely exhausted. This is strictly better than the
+// microbench's atomic `fetch_add`-reserve model (which surfaced an M-in-
+// flight overshoot on tiny pools): that overshoot only exists when the cap
+// is checked OUTSIDE any lock (the Phase-2 sharded world); Phase 1 keeps the
+// maps under one mutex, so the exact `len()` check is available and used.
+//
+// FIFO recycle (#3011): freed ports still recycle oldest-first to spread
+// reuse across the upstream 2MSL/TIME_WAIT window. The queue is a per-ADDRESS
+// `Mutex<VecDeque<u16>>` (`AddressOccupancy::recycle`) — a much smaller,
+// per-address critical section than the pre-#2852 global mutex, and it
+// preserves the EXACT `push_back`/`pop_front` ordering the #3011 tests pin
+// (a fully lock-free MPMC recycle ring is a Phase-2 option; `crossbeam` is
+// not a dependency and a hand-rolled lock-free ring is not worth the risk on
+// this hot NAT path). Lock ordering is always global -> recycle (the recycle
+// mutex is innermost, never held while acquiring the global mutex), so there
+// is no deadlock (plan F5 is sidestepped entirely: Phase 1 has no two-map-
+// shard path).
+//
+// Port claim (AddressOccupancy::claim) collision handling (#3047):
 // - Sequential phase: the monotonic per-address cursor is probed FORWARD,
-//   one offset at a time, until a free port is claimed or the range is
-//   genuinely exhausted. A single collision with an out-of-band occupant
-//   (a persistent lease or an HA-synced install sitting at the cursor's
-//   port) advances past it instead of aborting the whole allocation
-//   (062-05). The common case claims on the first probe.
+//   one offset at a time (a bounded CAS hands each fresh offset to exactly
+//   one claimer and never advances past the range), until a free port is
+//   CAS-claimed or the range is genuinely exhausted. A single collision with
+//   an out-of-band occupant (a persistent lease or an HA-synced install
+//   whose bit sits at the cursor's offset) advances past it instead of
+//   aborting the whole allocation (062-05). The common case claims on the
+//   first probe.
 // - Recycled phase: when the sequential range is spent, recycled ports are
 //   drained FIFO (oldest-freed first, pop_front) so a just-freed port is the
 //   LAST to be reassigned — this spreads port reuse across the upstream's
 //   2MSL/TIME_WAIT window instead of immediately recycling the most recent
-//   port (#3011). A popped port whose owner slot is occupied is RETAINED (re-
+//   port (#3011). A popped port whose bit is already set is RETAINED (re-
 //   queued at the back), never discarded, so a transient collision cannot
-//   permanently shrink the reusable pool (062-10). The retain buffer allocates
-//   lazily only when a collision actually occurs.
+//   permanently shrink the reusable pool (062-10). The retain buffer
+//   allocates lazily only when a collision actually occurs.
 //
 // Cross-submodule visibility (per #1542 plan v3):
 // - PortAllocator and PortAllocatorSnapshot are pub(crate) at definition
@@ -29,11 +66,13 @@
 // - PortAllocator's state-machine methods (try_next_port, address_index,
 //   allocate_translation, release_flow, rollback_flow, snapshot) are
 //   pub(super) so source.rs / status.rs can drive them.
-// - Live state struct + the five fields that white-box tests inspect
-//   (persistent_by_source, lease_expirations, lease_expirations_by_addr,
-//   addr_index_by_translated, recycled_ports_by_addr) are pub(super).
+// - Live state struct + the fields that white-box tests inspect
+//   (persistent_by_source, lease_expirations, lease_expirations_by_addr) are
+//   pub(super). Port-ownership is inspected via the `#[cfg(test)]` debug
+//   accessors (debug_is_port_occupied / debug_recycled_ports /
+//   debug_set_cursor / debug_set_recycled / debug_occupied_count).
 // - PersistentLease + its fields are pub(super) for the same reason.
-// - The remaining types (AllocationOwner, LiveAllocation, PortAllocatorShared
+// - The remaining types (LiveAllocation, AddressOccupancy, PortAllocatorShared
 //   and its private fields, GC constants, capacity/sticky helpers) stay
 //   fully private to this file.
 
@@ -42,10 +81,10 @@ use rustc_hash::FxHashMap;
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::Hasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub(super) const NS_PER_SEC: u64 = 1_000_000_000;
 const MAX_SOURCE_NAT_POOL_TRACKED_FLOWS: usize = 262_144;
@@ -92,24 +131,26 @@ impl PoolAddressFamily<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum AllocationOwner {
-    Flow(SourceNatFlowKey),
-    Persistent(PersistentSourceKey),
-}
-
 #[derive(Clone, Copy, Debug)]
 struct LiveAllocation {
     translated: TranslatedTuple,
     persistent_key: Option<PersistentSourceKey>,
+    // #2852 F7: the pool-address index this translation was claimed on, stored
+    // in the record so release is O(1) — the pre-#2852 `addr_index_by_translated`
+    // reverse map is gone (the occupancy bitmap is per-address, so freeing the
+    // bit needs the address index, and reading it off the record avoids a map
+    // lookup). For a persistent flow the authoritative index is on the lease;
+    // this copy mirrors it so the non-persistent / deterministic release paths
+    // are uniform.
+    addr_index: usize,
     // #4559: a deterministic CGNAT block allocation. Its port is NOT pushed onto
-    // the per-address recycle queue on release (`release_translated_locked`) —
-    // the deterministic claim scans its subscriber block against
-    // `owner_by_translated` directly, so a freed port becomes claimable again the
-    // moment its owner slot clears. Recycling it too would let the queue grow
-    // without bound across per-subscriber flow churn (a deterministic-only pool
-    // never drains the recycle queue). `false` for every round-robin/persistent
-    // allocation (unchanged behaviour).
+    // the per-address recycle queue on release (`free`-path `recycle = false`) —
+    // the deterministic claim scans its subscriber block against the occupancy
+    // bitmap directly, so a freed port becomes claimable again the moment its
+    // bit clears. Recycling it too would let the queue grow without bound across
+    // per-subscriber flow churn (a deterministic-only pool never drains the
+    // recycle queue). `false` for every round-robin/persistent allocation
+    // (unchanged behaviour).
     deterministic: bool,
 }
 
@@ -216,18 +257,9 @@ pub(super) struct PersistentLease {
 #[derive(Debug, Default)]
 pub(super) struct PortAllocatorLiveState {
     live_by_flow: FxHashMap<SourceNatFlowKey, LiveAllocation>,
-    owner_by_translated: FxHashMap<TranslatedTuple, AllocationOwner>,
-    pub(super) addr_index_by_translated: FxHashMap<TranslatedTuple, usize>,
     pub(super) persistent_by_source: FxHashMap<PersistentSourceKey, PersistentLease>,
     pub(super) lease_expirations: BTreeSet<(u64, PersistentSourceKey)>,
     pub(super) lease_expirations_by_addr: Vec<BTreeSet<(u64, PersistentSourceKey)>>,
-    pub(super) next_port_offset_by_addr: Vec<u32>,
-    // #3011: FIFO recycle queue (push_back on release, pop_front on
-    // allocation). FIFO maximizes the wall-clock gap before a freed port is
-    // reassigned, spreading reuse across the upstream's 2MSL/TIME_WAIT window
-    // instead of immediately handing back the just-freed port (the LIFO
-    // worst case). VecDeque keeps both ends O(1) so the hot path is unchanged.
-    pub(super) recycled_ports_by_addr: Vec<VecDeque<u16>>,
     gc_counter: u32,
 }
 
@@ -235,10 +267,184 @@ impl PortAllocatorLiveState {
     fn new(addr_count: usize) -> Self {
         Self {
             lease_expirations_by_addr: vec![BTreeSet::new(); addr_count],
-            next_port_offset_by_addr: vec![0; addr_count],
-            recycled_ports_by_addr: vec![VecDeque::new(); addr_count],
             ..Self::default()
         }
+    }
+}
+
+/// #2852 Phase 1: per-pool-address atomic occupancy for lock-free port claim.
+///
+/// `words` is the occupancy bitmap (bit set => that port offset is claimed);
+/// a `fetch_or` CAS is the sole port-ownership arbiter and replaces the
+/// pre-#2852 `owner_by_translated` map. `cursor` is the monotonic fresh-port
+/// hand-out counter (the pre-#2852 `next_port_offset_by_addr`). `recycle` is
+/// the #3011 FIFO reuse ring, behind a per-ADDRESS mutex (never the global
+/// allocator mutex). `port_low`/`range` map ports to bit offsets.
+#[derive(Debug)]
+struct AddressOccupancy {
+    words: Vec<AtomicU64>,
+    cursor: AtomicU32,
+    recycle: Mutex<VecDeque<u16>>,
+    port_low: u16,
+    range: u32,
+}
+
+impl AddressOccupancy {
+    fn new(port_low: u16, range: u32) -> Self {
+        let nwords = (range as usize).div_ceil(64);
+        let mut words = Vec::with_capacity(nwords);
+        for _ in 0..nwords {
+            words.push(AtomicU64::new(0));
+        }
+        Self {
+            words,
+            cursor: AtomicU32::new(0),
+            recycle: Mutex::new(VecDeque::new()),
+            port_low,
+            range,
+        }
+    }
+
+    #[inline]
+    fn offset_of(&self, port: u16) -> Option<u32> {
+        if port < self.port_low {
+            return None;
+        }
+        let off = (port - self.port_low) as u32;
+        (off < self.range).then_some(off)
+    }
+
+    #[inline]
+    fn port_of(&self, offset: u32) -> u16 {
+        self.port_low + offset as u16
+    }
+
+    /// CAS-set the bit at `offset`. Returns true iff this call transitioned it
+    /// 0 -> 1 (the caller now owns the port). The set bit is the ownership
+    /// token: a held bit cannot be re-claimed, so no separate owner-identity
+    /// check is needed, and it is ABA-safe because the bit is never cleared
+    /// between a claim and its legitimate free.
+    #[inline]
+    fn claim_offset(&self, offset: u32) -> bool {
+        let w = (offset / 64) as usize;
+        let mask = 1u64 << (offset % 64);
+        self.words[w].fetch_or(mask, Ordering::AcqRel) & mask == 0
+    }
+
+    /// Clear the bit at `offset`. Returns true iff it was set (1 -> 0).
+    #[inline]
+    fn free_offset(&self, offset: u32) -> bool {
+        let w = (offset / 64) as usize;
+        let mask = 1u64 << (offset % 64);
+        self.words[w].fetch_and(!mask, Ordering::Release) & mask != 0
+    }
+
+    #[inline]
+    fn is_occupied(&self, offset: u32) -> bool {
+        let w = (offset / 64) as usize;
+        let mask = 1u64 << (offset % 64);
+        self.words[w].load(Ordering::Acquire) & mask != 0
+    }
+
+    /// Claim the next free port: forward-probe the monotonic fresh cursor
+    /// (#3047 skip-occupied-out-of-band), then drain the FIFO recycle ring
+    /// (#3011, retain-on-collision 062-10). Lock-free w.r.t. the global
+    /// allocator mutex (it takes only the per-address recycle mutex, and only
+    /// once the fresh range is spent). Returns the claimed PORT, or None when
+    /// this address is genuinely full.
+    fn claim(&self) -> Option<u16> {
+        // Sequential phase: hand out fresh offsets in ascending order, one per
+        // claimer via a bounded CAS. The cursor never exceeds `range`, so it
+        // does not grow unboundedly once the fresh range is spent.
+        loop {
+            let cur = self.cursor.load(Ordering::Relaxed);
+            if cur >= self.range {
+                break;
+            }
+            if self
+                .cursor
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                // Another claimer advanced the cursor; re-read and retry.
+                continue;
+            }
+            // We own the right to try offset `cur`. Its bit is normally clear
+            // (fresh), but an out-of-band occupant (reserve/persistent/HA) may
+            // have set it — then CAS fails and we advance to the next offset.
+            if self.claim_offset(cur) {
+                return Some(self.port_of(cur));
+            }
+        }
+
+        // Recycled phase: FIFO drain (oldest-freed first). A popped port whose
+        // bit is already set collided with an out-of-band occupant and is
+        // RETAINED (re-queued at the back), never discarded (062-10). The
+        // retain buffer allocates lazily only on an actual collision.
+        let mut recycle = self.recycle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retained: Vec<u16> = Vec::new();
+        let mut claimed = None;
+        while let Some(port) = recycle.pop_front() {
+            match self.offset_of(port) {
+                Some(offset) if self.claim_offset(offset) => {
+                    claimed = Some(port);
+                    break;
+                }
+                // Out-of-range (stale) ports are dropped; occupied ports are
+                // retained so a transient collision cannot shrink the pool.
+                Some(_) => retained.push(port),
+                None => {}
+            }
+        }
+        if !retained.is_empty() {
+            recycle.extend(retained);
+        }
+        claimed
+    }
+
+    /// Free `port`, pushing it onto the FIFO recycle ring (push_back) so it is
+    /// reused oldest-first (#3011). Returns true iff the bit was set.
+    fn free_recycle(&self, port: u16) -> bool {
+        let Some(offset) = self.offset_of(port) else {
+            return false;
+        };
+        if !self.free_offset(offset) {
+            return false;
+        }
+        self.recycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(port);
+        true
+    }
+
+    /// Free `port` WITHOUT recycling it (#4559 deterministic path — the bit is
+    /// the only reuse gate, and a deterministic-only pool never drains the
+    /// recycle queue). Returns true iff the bit was set.
+    fn free_no_recycle(&self, port: u16) -> bool {
+        match self.offset_of(port) {
+            Some(offset) => self.free_offset(offset),
+            None => false,
+        }
+    }
+
+    /// Reserve a SPECIFIC port (CAS-set its exact bit). Returns true iff the
+    /// bit transitioned 0 -> 1 (the caller now owns it); false when the port
+    /// is out of range or already owned (do-not-steal).
+    fn reserve(&self, port: u16) -> bool {
+        match self.offset_of(port) {
+            Some(offset) => self.claim_offset(offset),
+            None => false,
+        }
+    }
+
+    /// Count of currently-occupied ports on this address (popcount over the
+    /// bitmap). Cold path (snapshot / tests only).
+    fn occupied_count(&self) -> usize {
+        self.words
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
+            .sum()
     }
 }
 
@@ -250,12 +456,18 @@ const PRESSURE_GC_BUDGET: usize = 64;
 
 #[derive(Debug)]
 struct PortAllocatorShared {
-    /// One atomic counter per pool address, used for round-robin port allocation.
+    /// One atomic counter per pool address, used for the stateless round-robin
+    /// `try_next_port` (address-only / `port no-translation` paths). Separate
+    /// from `occupancy` (which tracks flow-keyed pool-mode PAT allocation).
     counters: Vec<AtomicU32>,
     /// Index for IPv4 round-robin address selection.
     addr_counter_v4: AtomicU32,
     /// Index for IPv6 round-robin address selection.
     addr_counter_v6: AtomicU32,
+    /// #2852 Phase 1: lock-free per-address occupancy bitmap + recycle ring.
+    /// One entry per pool address; the port claim/free run WITHOUT the global
+    /// `live` mutex.
+    occupancy: Vec<AddressOccupancy>,
     live: Mutex<PortAllocatorLiveState>,
     allocations_total: AtomicU64,
     reuses_total: AtomicU64,
@@ -266,10 +478,11 @@ struct PortAllocatorShared {
 /// Bounded pool-mode SNAT allocator.
 ///
 /// Address selection uses atomics for stable round-robin/sticky starting
-/// points; live translated tuple ownership is tracked under a per-pool mutex
-/// so ports are not reused while sessions are alive. Persistent NAT leases are
-/// keyed by source tuple and retained until their inactivity timeout after the
-/// last live flow releases them.
+/// points; port ownership is a lock-free per-address occupancy bitmap so ports
+/// are not reused while sessions are alive, and only the flow map + persistent
+/// leases are guarded by the per-pool mutex (#2852 Phase 1). Persistent NAT
+/// leases are keyed by source tuple and retained until their inactivity timeout
+/// after the last live flow releases them.
 #[derive(Clone, Debug)]
 pub(crate) struct PortAllocator {
     shared: Arc<PortAllocatorShared>,
@@ -284,6 +497,7 @@ impl Default for PortAllocator {
                 counters: Vec::new(),
                 addr_counter_v4: AtomicU32::new(0),
                 addr_counter_v6: AtomicU32::new(0),
+                occupancy: Vec::new(),
                 live: Mutex::new(PortAllocatorLiveState::default()),
                 allocations_total: AtomicU64::new(0),
                 reuses_total: AtomicU64::new(0),
@@ -299,6 +513,14 @@ impl Default for PortAllocator {
 impl PortAllocator {
     pub(crate) fn new(num_addresses: usize, port_low: u16, port_high: u16) -> Self {
         let counters = (0..num_addresses).map(|_| AtomicU32::new(0)).collect();
+        let range = if port_low == 0 || port_high == 0 || port_low > port_high {
+            0
+        } else {
+            (port_high as u32) - (port_low as u32) + 1
+        };
+        let occupancy = (0..num_addresses)
+            .map(|_| AddressOccupancy::new(port_low, range))
+            .collect();
         let max_tracked_flows = allocator_capacity(num_addresses, port_low, port_high)
             .min(MAX_SOURCE_NAT_POOL_TRACKED_FLOWS);
         Self {
@@ -306,6 +528,7 @@ impl PortAllocator {
                 counters,
                 addr_counter_v4: AtomicU32::new(0),
                 addr_counter_v6: AtomicU32::new(0),
+                occupancy,
                 live: Mutex::new(PortAllocatorLiveState::new(num_addresses)),
                 allocations_total: AtomicU64::new(0),
                 reuses_total: AtomicU64::new(0),
@@ -319,45 +542,89 @@ impl PortAllocator {
 
     /// White-box access to the live state for tests. NOT for production
     /// callers — they should use the typed `allocate_translation` /
-    /// `release_flow` / `rollback_flow` / `snapshot` entry points.
+    /// `release_flow` / `rollback_flow` / `snapshot` entry points. Port
+    /// ownership is inspected via the dedicated debug accessors below (the
+    /// bitmap lives outside this mutex).
     #[cfg(test)]
     pub(super) fn debug_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
         self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Test-only: mark a translated tuple as owned by a synthetic flow without
-    /// advancing the sequential cursor. Models an out-of-band occupant (a
-    /// persistent lease or an HA-synced install) sitting inside the sequential
-    /// port range — the precondition for the #3047 collision/leak paths.
+    /// Test-only: mark a translated tuple as owned (set its occupancy bit)
+    /// without advancing the sequential cursor. Models an out-of-band occupant
+    /// (a persistent lease or an HA-synced install) sitting inside the
+    /// sequential port range — the precondition for the #3047 collision paths.
+    /// `_translated_ip` is retained for call-site clarity; the bitmap is keyed
+    /// by `addr_index`.
     #[cfg(test)]
-    pub(super) fn debug_seed_owner(&self, addr_index: usize, translated_ip: IpAddr, port: u16) {
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
-        let translated = TranslatedTuple {
-            ip: translated_ip,
-            port,
-        };
-        let owner = AllocationOwner::Flow(SourceNatFlowKey {
-            protocol: 6,
-            src_ip: translated_ip,
-            dst_ip: translated_ip,
-            src_port: port,
-            dst_port: 0,
-        });
-        live.owner_by_translated.insert(translated, owner);
-        live.addr_index_by_translated.insert(translated, addr_index);
+    pub(super) fn debug_seed_owner(&self, addr_index: usize, _translated_ip: IpAddr, port: u16) {
+        if let Some(occ) = self.shared.occupancy.get(addr_index) {
+            occ.reserve(port);
+        }
     }
 
-    /// Test-only: release a synthetic owner seeded via `debug_seed_owner`
-    /// without pushing the port onto the recycled queue.
+    /// Test-only: clear a synthetic owner seeded via `debug_seed_owner`
+    /// (clear its occupancy bit) without pushing the port onto the recycle
+    /// queue.
     #[cfg(test)]
-    pub(super) fn debug_clear_owner(&self, translated_ip: IpAddr, port: u16) {
-        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
-        let translated = TranslatedTuple {
-            ip: translated_ip,
-            port,
-        };
-        live.owner_by_translated.remove(&translated);
-        live.addr_index_by_translated.remove(&translated);
+    pub(super) fn debug_clear_owner(&self, addr_index: usize, _translated_ip: IpAddr, port: u16) {
+        if let Some(occ) = self.shared.occupancy.get(addr_index) {
+            occ.free_no_recycle(port);
+        }
+    }
+
+    /// Test-only: is `port` currently occupied on pool address `addr_index`?
+    #[cfg(test)]
+    pub(super) fn debug_is_port_occupied(&self, addr_index: usize, port: u16) -> bool {
+        match self.shared.occupancy.get(addr_index) {
+            Some(occ) => match occ.offset_of(port) {
+                Some(offset) => occ.is_occupied(offset),
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Test-only: total occupied ports across all pool addresses.
+    #[cfg(test)]
+    pub(super) fn debug_occupied_count(&self) -> usize {
+        self.shared
+            .occupancy
+            .iter()
+            .map(AddressOccupancy::occupied_count)
+            .sum()
+    }
+
+    /// Test-only: snapshot the FIFO recycle queue for pool address `addr_index`.
+    #[cfg(test)]
+    pub(super) fn debug_recycled_ports(&self, addr_index: usize) -> Vec<u16> {
+        match self.shared.occupancy.get(addr_index) {
+            Some(occ) => occ
+                .recycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Test-only: replace the FIFO recycle queue for pool address `addr_index`.
+    #[cfg(test)]
+    pub(super) fn debug_set_recycled(&self, addr_index: usize, ports: Vec<u16>) {
+        if let Some(occ) = self.shared.occupancy.get(addr_index) {
+            *occ.recycle.lock().unwrap_or_else(|e| e.into_inner()) = VecDeque::from(ports);
+        }
+    }
+
+    /// Test-only: set the monotonic fresh-port cursor for pool address
+    /// `addr_index` (e.g. push it past the range to force the recycle phase).
+    #[cfg(test)]
+    pub(super) fn debug_set_cursor(&self, addr_index: usize, offset: u32) {
+        if let Some(occ) = self.shared.occupancy.get(addr_index) {
+            occ.cursor.store(offset, Ordering::Relaxed);
+        }
     }
 
     /// Pick a pool address index for the current address family.
@@ -401,6 +668,20 @@ impl PortAllocator {
         Ok(self.port_low + (val % range) as u16)
     }
 
+    /// Free a translated port's occupancy bit. `recycle` pushes the port onto
+    /// the FIFO reuse ring (#3011); the deterministic path passes `false`.
+    /// Returns true iff the bit was set.
+    fn free_translated_port(&self, addr_index: usize, port: u16, recycle: bool) -> bool {
+        let Some(occ) = self.shared.occupancy.get(addr_index) else {
+            return false;
+        };
+        if recycle {
+            occ.free_recycle(port)
+        } else {
+            occ.free_no_recycle(port)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_translation(
         &self,
@@ -426,6 +707,100 @@ impl PortAllocator {
             return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
         }
 
+        // ---- Non-persistent hot path: lock-free port claim, tiny map lock. ----
+        //
+        // The port claim (forward-probe cursor + bitmap CAS + FIFO recycle) runs
+        // WITHOUT the global mutex; the mutex is taken only for the tiny
+        // reuse-check + exact-cap-check + `live_by_flow` insert critical section.
+        // A GC-of-expired-leases-first pass is preserved for the near-capacity
+        // case by falling through to `allocate_translation_locked` when every
+        // target address's bitmap is full (the fast, non-GC'd view).
+        if !persistent_nat {
+            let start_abs =
+                self.address_index(flow.src_ip, family_offset, family_len, address_persistent);
+            let start_rel = start_abs.saturating_sub(family_offset);
+            let address_attempts = if address_persistent { 1 } else { family_len };
+            for offset in 0..address_attempts {
+                let rel = (start_rel + offset) % family_len;
+                let abs = family_offset + rel;
+                let Some(occ) = self.shared.occupancy.get(abs) else {
+                    continue;
+                };
+                let Some(port) = occ.claim() else {
+                    continue;
+                };
+                let translated = TranslatedTuple {
+                    ip: family_addresses.ip_at(rel),
+                    port,
+                };
+                let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+                self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
+                if let Some(existing) = live.live_by_flow.get(&flow) {
+                    // Idempotent re-entry for an already-allocated flow (a second
+                    // packet racing session install). Give back the port we just
+                    // claimed and return the existing translation.
+                    let existing = existing.translated;
+                    self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+                    drop(live);
+                    self.free_translated_port(abs, port, true);
+                    return Ok(existing);
+                }
+                if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+                    // Exact cap (F4): `live_by_flow.len()` under the mutex is
+                    // authoritative — no overshoot. Give back the claimed port.
+                    self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+                    drop(live);
+                    self.free_translated_port(abs, port, true);
+                    return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+                }
+                live.live_by_flow.insert(
+                    flow,
+                    LiveAllocation {
+                        translated,
+                        persistent_key: None,
+                        addr_index: abs,
+                        deterministic: false,
+                    },
+                );
+                self.shared
+                    .allocations_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(translated);
+            }
+            // Every target address's bitmap was full on the fast (non-GC'd)
+            // view. Fall through to the pressured, GC-first locked path.
+        }
+
+        self.allocate_translation_locked(
+            flow,
+            family_addresses,
+            family_offset,
+            address_persistent,
+            persistent_nat,
+            persistent_nat_permit,
+            persistent_nat_timeout_ns,
+            now_ns,
+        )
+    }
+
+    /// The persistent-NAT path (lease decision + claim MUST be atomic so two
+    /// flows sharing a lease cannot both claim a port) and the non-persistent
+    /// near-capacity pressure fallback (bounded expiry GC per address, then
+    /// retry). Both hold the global mutex; the port claim uses the same lock-
+    /// free bitmap (correctness is unaffected by whether the mutex is held).
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_translation_locked(
+        &self,
+        flow: SourceNatFlowKey,
+        family_addresses: PoolAddressFamily<'_>,
+        family_offset: usize,
+        address_persistent: bool,
+        persistent_nat: bool,
+        persistent_nat_permit: super::source::PersistentNatPermit,
+        persistent_nat_timeout_ns: u64,
+        now_ns: u64,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        let family_len = family_addresses.len();
         let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
         self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
 
@@ -459,6 +834,9 @@ impl PortAllocator {
         for offset in 0..address_attempts {
             let rel = (start_rel + offset) % family_len;
             let abs = family_offset + rel;
+            if abs >= self.shared.occupancy.len() {
+                continue;
+            }
             let translated_ip = family_addresses.ip_at(rel);
             if persistent_key.is_some()
                 && live.persistent_by_source.len() >= self.shared.max_tracked_flows
@@ -472,25 +850,22 @@ impl PortAllocator {
                 }
             }
 
-            let mut translated =
-                self.claim_free_port_locked(&mut live, abs, translated_ip, flow, persistent_key);
-            if translated.is_none() {
+            let mut port = self.shared.occupancy[abs].claim();
+            if port.is_none() {
                 // Pressure handling is budgeted, not strict O(1). A
                 // non-address-persistent full family can visit each
                 // family-compatible address and run at most
                 // PRESSURE_GC_BUDGET expiry checks for that selected
                 // address before declaring exhaustion.
                 self.gc_expired_for_addr_locked(&mut live, abs, now_ns, PRESSURE_GC_BUDGET);
-                translated = self.claim_free_port_locked(
-                    &mut live,
-                    abs,
-                    translated_ip,
-                    flow,
-                    persistent_key,
-                );
+                port = self.shared.occupancy[abs].claim();
             }
-            let Some(translated) = translated else {
+            let Some(port) = port else {
                 continue;
+            };
+            let translated = TranslatedTuple {
+                ip: translated_ip,
+                port,
             };
             if let Some(key) = persistent_key {
                 let expires_at_ns =
@@ -515,6 +890,7 @@ impl PortAllocator {
                 LiveAllocation {
                     translated,
                     persistent_key,
+                    addr_index: abs,
                     deterministic: false,
                 },
             );
@@ -529,7 +905,7 @@ impl PortAllocator {
     }
 
     /// #2397 persistent-NAT lease reuse, run under the live-state lock as the
-    /// first persistent-key step of `allocate_translation`.
+    /// first persistent-key step of `allocate_translation_locked`.
     ///
     /// When a lease already exists for `key`:
     ///   - a still-valid lease (an active flow, or one whose inactivity timeout
@@ -545,11 +921,6 @@ impl PortAllocator {
     ///
     /// Returns `None` when no lease exists for `key` or the lease was expired and
     /// reclaimed.
-    ///
-    /// #4409 increment 1: PURE lock-scoped code-motion out of the
-    /// `allocate_translation` god-function — identical mutation order and side
-    /// effects, executed under the caller's already-held `live` lock (the caller
-    /// passes its `MutexGuard` by `&mut`, so the lock scope is unchanged).
     fn reuse_existing_lease_locked(
         &self,
         live: &mut PortAllocatorLiveState,
@@ -567,8 +938,9 @@ impl PortAllocator {
         if let Some(lease) = live.persistent_by_source.get_mut(&key) {
             if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
                 let translated = lease.translated;
+                let addr_index = lease.addr_index;
                 if lease.active_flows == 0 {
-                    remove_expiry = Some(lease.expires_at_ns);
+                    remove_expiry = Some((addr_index, lease.expires_at_ns));
                     lease.activation_saw_completion = false;
                     lease.activation_previous_expires_at_ns = lease.expires_at_ns;
                     lease.activation_had_previous_lease = true;
@@ -577,26 +949,21 @@ impl PortAllocator {
                 let expires_at_ns =
                     now_ns.saturating_add(persistent_nat_timeout_ns.max(NS_PER_SEC));
                 lease.expires_at_ns = expires_at_ns;
-                reusable = Some(translated);
+                reusable = Some((translated, addr_index));
             } else {
                 expired = Some((lease.translated, lease.addr_index, lease.expires_at_ns));
             }
         }
-        if let Some(expires_at_ns) = remove_expiry {
-            if let Some(addr_index) = live
-                .persistent_by_source
-                .get(&key)
-                .map(|lease| lease.addr_index)
-            {
-                Self::remove_lease_expiration_locked(live, addr_index, expires_at_ns, key);
-            }
+        if let Some((addr_index, expires_at_ns)) = remove_expiry {
+            Self::remove_lease_expiration_locked(live, addr_index, expires_at_ns, key);
         }
-        if let Some(translated) = reusable {
+        if let Some((translated, addr_index)) = reusable {
             live.live_by_flow.insert(
                 flow,
                 LiveAllocation {
                     translated,
                     persistent_key: Some(key),
+                    addr_index,
                     deterministic: false,
                 },
             );
@@ -605,136 +972,10 @@ impl PortAllocator {
         }
         if let Some((translated, addr_index, expires_at_ns)) = expired {
             Self::remove_lease_expiration_locked(live, addr_index, expires_at_ns, key);
-            self.release_translated_locked(live, translated);
+            self.free_translated_port(addr_index, translated.port, true);
             live.persistent_by_source.remove(&key);
         }
         None
-    }
-
-    fn claim_free_port_locked(
-        &self,
-        live: &mut PortAllocatorLiveState,
-        addr_index: usize,
-        translated_ip: IpAddr,
-        flow: SourceNatFlowKey,
-        persistent_key: Option<PersistentSourceKey>,
-    ) -> Option<TranslatedTuple> {
-        if addr_index >= self.shared.counters.len() {
-            return None;
-        }
-        let range = (self.port_high as u32).saturating_sub(self.port_low as u32) + 1;
-
-        // #3047 (062-05): probe forward from the monotonic cursor until a free
-        // port is claimed or the sequential range is genuinely exhausted. A
-        // single collision with an out-of-band occupant (e.g. a persistent
-        // lease or HA-synced install sitting at this offset) no longer aborts
-        // the whole allocation — the cursor advances past it and the next free
-        // port is tried. The common case still claims on the first iteration,
-        // so this stays hot-path-cheap.
-        loop {
-            let next_offset = live.next_port_offset_by_addr[addr_index];
-            if next_offset >= range {
-                break;
-            }
-            let port = self.port_low + next_offset as u16;
-            live.next_port_offset_by_addr[addr_index] = next_offset + 1;
-            let translated = TranslatedTuple {
-                ip: translated_ip,
-                port,
-            };
-            if self.assign_owner_locked(live, addr_index, translated, flow, persistent_key) {
-                return Some(translated);
-            }
-        }
-
-        // #3011 + #3047 (062-10): drain the recycled queue FRONT-first (FIFO)
-        // so the OLDEST-freed port is reused first, maximizing the time before
-        // any port is reassigned (avoids the LIFO 2MSL/TIME_WAIT reuse
-        // collision). RETAIN any popped port whose owner slot is occupied (an
-        // out-of-band collision) instead of discarding it: a discarded recycled
-        // port is permanently lost from the pool; re-queueing it keeps the
-        // usable range from shrinking over time. `retained` allocates lazily
-        // only when a collision is actually hit, so the common (first pop
-        // succeeds / queue empty) path stays allocation free. Collided ports
-        // are re-queued at the back — they are not free right now, so FIFO order
-        // among the genuinely-free ports is preserved.
-        let mut retained: Vec<u16> = Vec::new();
-        let mut claimed = None;
-        while let Some(port) = live.recycled_ports_by_addr[addr_index].pop_front() {
-            let translated = TranslatedTuple {
-                ip: translated_ip,
-                port,
-            };
-            if self.assign_owner_locked(live, addr_index, translated, flow, persistent_key) {
-                claimed = Some(translated);
-                break;
-            }
-            retained.push(port);
-        }
-        if !retained.is_empty() {
-            live.recycled_ports_by_addr[addr_index].extend(retained);
-        }
-        claimed
-    }
-
-    fn assign_owner_locked(
-        &self,
-        live: &mut PortAllocatorLiveState,
-        addr_index: usize,
-        translated: TranslatedTuple,
-        flow: SourceNatFlowKey,
-        persistent_key: Option<PersistentSourceKey>,
-    ) -> bool {
-        if live.owner_by_translated.contains_key(&translated) {
-            return false;
-        }
-        let owner = persistent_key
-            .map(AllocationOwner::Persistent)
-            .unwrap_or(AllocationOwner::Flow(flow));
-        live.owner_by_translated.insert(translated, owner);
-        live.addr_index_by_translated.insert(translated, addr_index);
-        true
-    }
-
-    fn release_translated_locked(
-        &self,
-        live: &mut PortAllocatorLiveState,
-        translated: TranslatedTuple,
-    ) -> bool {
-        if live.owner_by_translated.remove(&translated).is_none() {
-            return false;
-        }
-        let Some(addr_index) = live.addr_index_by_translated.remove(&translated) else {
-            return true;
-        };
-        if addr_index >= live.recycled_ports_by_addr.len() {
-            return true;
-        }
-        if translated.port < self.port_low || translated.port > self.port_high {
-            return true;
-        }
-        // #3011: push freed ports to the BACK; allocation pops from the FRONT
-        // (FIFO), so a just-freed port is the LAST recycled port to be reused.
-        live.recycled_ports_by_addr[addr_index].push_back(translated.port);
-        true
-    }
-
-    /// #4559: release a deterministic block allocation WITHOUT recycling its
-    /// port. The deterministic claim path scans its subscriber block against
-    /// `owner_by_translated` directly, so clearing the owner slot is enough to
-    /// make the port claimable again; pushing it onto the recycle queue (which a
-    /// deterministic-only pool never drains) would grow that queue without bound
-    /// across per-subscriber flow churn.
-    fn release_translated_no_recycle_locked(
-        &self,
-        live: &mut PortAllocatorLiveState,
-        translated: TranslatedTuple,
-    ) -> bool {
-        if live.owner_by_translated.remove(&translated).is_none() {
-            return false;
-        }
-        live.addr_index_by_translated.remove(&translated);
-        true
     }
 
     fn insert_lease_expiration_locked(
@@ -792,10 +1033,16 @@ impl PortAllocator {
                 Self::remove_lease_expiration_locked(&mut live, addr_index, old_expires_at_ns, key);
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
-        } else if existing.deterministic {
-            self.release_translated_no_recycle_locked(&mut live, translated);
         } else {
-            self.release_translated_locked(&mut live, translated);
+            // Non-persistent (or deterministic) flow owns its port outright:
+            // free the bit, recycling it unless it is a deterministic block
+            // port (#4559). The persistent case keeps the port on the lease
+            // until the lease itself is torn down.
+            self.free_translated_port(
+                existing.addr_index,
+                translated.port,
+                !existing.deterministic,
+            );
         }
         live.gc_counter = live.gc_counter.wrapping_add(1);
         if live.gc_counter % GC_PERIOD == 0 {
@@ -838,15 +1085,17 @@ impl PortAllocator {
             }
             if remove_lease {
                 live.persistent_by_source.remove(&key);
-                self.release_translated_locked(&mut live, translated);
+                self.free_translated_port(existing.addr_index, translated.port, true);
             }
             if let Some((addr_index, expires_at_ns)) = insert_expiry {
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
-        } else if existing.deterministic {
-            self.release_translated_no_recycle_locked(&mut live, translated);
         } else {
-            self.release_translated_locked(&mut live, translated);
+            self.free_translated_port(
+                existing.addr_index,
+                translated.port,
+                !existing.deterministic,
+            );
         }
         true
     }
@@ -856,13 +1105,13 @@ impl PortAllocator {
     /// subscriber's internal IPv4 address (`deterministic_indices_v4`), so the
     /// `(external IP, port)` → subscriber reverse mapping needs no per-flow log.
     /// A live flow re-allocates its existing tuple (reuse); a fresh flow claims
-    /// the first free port in `[port_start, port_end]` against
-    /// `owner_by_translated` (collision-free within the shared allocator). Unlike
-    /// round-robin PAT this does NOT touch the per-address round-robin counter,
-    /// the recycle queue, or persistent leases — a deterministic pool is
-    /// mutually exclusive with persistent-nat / address-persistent (enforced at
-    /// commit). Returns the subscriber-out-of-range / exhaustion failure to the
-    /// caller instead of silently falling back to round-robin.
+    /// the first free port in `[port_start, port_end]` via the occupancy bitmap
+    /// (collision-free CAS). Unlike round-robin PAT this does NOT touch the
+    /// per-address fresh cursor, the recycle queue, or persistent leases — a
+    /// deterministic pool is mutually exclusive with persistent-nat /
+    /// address-persistent (enforced at commit). Returns the subscriber-out-of-
+    /// range / exhaustion failure to the caller instead of silently falling back
+    /// to round-robin.
     pub(super) fn allocate_deterministic_v4(
         &self,
         flow: SourceNatFlowKey,
@@ -876,7 +1125,7 @@ impl PortAllocator {
         }
         let (ip_idx, block_idx) = deterministic_indices_v4(&params, src)
             .ok_or(SourceNatFailureReason::DeterministicSubscriberOutOfRange)?;
-        if ip_idx >= pool_v4.len() {
+        if ip_idx >= pool_v4.len() || ip_idx >= self.shared.occupancy.len() {
             self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
             return Err(SourceNatFailureReason::AllocatorExhausted);
         }
@@ -902,30 +1151,28 @@ impl PortAllocator {
         }
         // Claim the first free port in the subscriber's block. The block is small
         // (typically a few thousand ports) and this is the cold path (first
-        // packet of a flow), so a linear probe is fine.
+        // packet of a flow), so a linear CAS probe is fine.
         for p in port_start..=port_end {
-            let translated = TranslatedTuple {
-                ip: translated_ip,
-                port: p as u16,
-            };
-            if live.owner_by_translated.contains_key(&translated) {
-                continue;
+            let port = p as u16;
+            if self.shared.occupancy[ip_idx].reserve(port) {
+                let translated = TranslatedTuple {
+                    ip: translated_ip,
+                    port,
+                };
+                live.live_by_flow.insert(
+                    flow,
+                    LiveAllocation {
+                        translated,
+                        persistent_key: None,
+                        addr_index: ip_idx,
+                        deterministic: true,
+                    },
+                );
+                self.shared
+                    .allocations_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(translated);
             }
-            live.owner_by_translated
-                .insert(translated, AllocationOwner::Flow(flow));
-            live.addr_index_by_translated.insert(translated, ip_idx);
-            live.live_by_flow.insert(
-                flow,
-                LiveAllocation {
-                    translated,
-                    persistent_key: None,
-                    deterministic: true,
-                },
-            );
-            self.shared
-                .allocations_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(translated);
         }
         // Every port in the subscriber's block is live — the block is full.
         self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
@@ -942,11 +1189,10 @@ impl PortAllocator {
     /// sessions colliding on one NAT source tuple (reply mis-delivery / session
     /// hijack surface).
     ///
-    /// The reservation is stored EXACTLY like a normal allocation
-    /// (`owner_by_translated` + `addr_index_by_translated` + `live_by_flow`)
-    /// using the synced session's flow key, so:
-    ///   - `claim_free_port_locked` skips the port when the sequential cursor
-    ///     later reaches it (the #3047 forward-probe), and
+    /// The reservation sets the occupancy bit (the ownership token) and records
+    /// `live_by_flow` using the synced session's flow key, so:
+    ///   - the fresh cursor skips the port when it later reaches that offset
+    ///     (the #3047 forward-probe), and
     ///   - the EXISTING teardown path (`release_flow` / `rollback_flow` via
     ///     `release_source_nat_allocation`, already called for every reaped or
     ///     delete-synced session) frees it with the SAME flow key — no new
@@ -955,47 +1201,44 @@ impl PortAllocator {
     /// Idempotent: re-reserving the same `(flow, translated)` (a synced-session
     /// refresh) is a no-op that returns `true`. Returns `false` and leaves the
     /// incumbent untouched if the port is already owned by a DIFFERENT live
-    /// allocation (a local flow raced ahead of the sync on the standby) — the
-    /// caller then tries the next pool rule.
+    /// allocation (the bit is set — a local flow raced ahead of the sync on the
+    /// standby); the caller then tries the next pool rule.
     pub(super) fn reserve_flow(
         &self,
         flow: SourceNatFlowKey,
         translated: TranslatedTuple,
         addr_index: usize,
     ) -> bool {
-        if addr_index >= self.shared.counters.len() {
+        if addr_index >= self.shared.occupancy.len() {
             return false;
         }
         let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
         // A refresh of the same synced flow: if it already holds this exact
         // translated tuple, it is reserved — nothing to do. If the tuple
         // changed (should not happen on a stable sync), drop the stale
-        // reservation first so we do not leak the old port's owner slot.
+        // reservation first so we do not leak the old port's bit.
         if let Some(existing) = live.live_by_flow.get(&flow).copied() {
             if existing.translated == translated {
                 return true;
             }
             live.live_by_flow.remove(&flow);
-            self.release_translated_locked(&mut live, existing.translated);
+            self.free_translated_port(existing.addr_index, existing.translated.port, true);
         }
-        // Never steal a port owned by a DIFFERENT live allocation. The synced
-        // decision is authoritative on the wire, but on a healthy standby the
-        // owning RG is passive so no local flow should hold the port; if one
-        // does, leaving the incumbent (and skipping the reserve) is the safe
-        // choice — the caller falls through to the next rule.
-        if let Some(owner) = live.owner_by_translated.get(&translated)
-            && *owner != AllocationOwner::Flow(flow)
-        {
+        // Never steal a port owned by a DIFFERENT live allocation: the bit CAS
+        // fails when the port is already occupied, so `reserve` returns false
+        // and we leave the incumbent (and the caller falls through to the next
+        // rule). The synced decision is authoritative on the wire, but on a
+        // healthy standby the owning RG is passive so no local flow should hold
+        // the port; if one does, not stealing is the safe choice.
+        if !self.shared.occupancy[addr_index].reserve(translated.port) {
             return false;
         }
-        live.owner_by_translated
-            .insert(translated, AllocationOwner::Flow(flow));
-        live.addr_index_by_translated.insert(translated, addr_index);
         live.live_by_flow.insert(
             flow,
             LiveAllocation {
                 translated,
                 persistent_key: None,
+                addr_index,
                 deterministic: false,
             },
         );
@@ -1004,10 +1247,22 @@ impl PortAllocator {
 
     pub(super) fn snapshot(&self) -> PortAllocatorSnapshot {
         let live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        let live_flows = live.live_by_flow.len() as u64;
+        let persistent_leases = live.persistent_by_source.len() as u64;
+        drop(live);
+        // used_ports is the total set bits across the lock-free occupancy
+        // bitmaps (popcount). Cold path (1/s status poll), so recomputing it
+        // rather than maintaining a hot-path atomic is fine.
+        let used_ports: u64 = self
+            .shared
+            .occupancy
+            .iter()
+            .map(|occ| occ.occupied_count() as u64)
+            .sum();
         PortAllocatorSnapshot {
-            live_flows: live.live_by_flow.len() as u64,
-            used_ports: live.owner_by_translated.len() as u64,
-            persistent_leases: live.persistent_by_source.len() as u64,
+            live_flows,
+            used_ports,
+            persistent_leases,
             max_tracked_flows: self.shared.max_tracked_flows as u64,
             allocations_total: self.shared.allocations_total.load(Ordering::Relaxed),
             reuses_total: self.shared.reuses_total.load(Ordering::Relaxed),
@@ -1088,14 +1343,12 @@ impl PortAllocator {
         if lease.active_flows != 0 || lease.expires_at_ns != expires_at_ns {
             return false;
         }
-        let translated = lease.translated;
+        // The lease still exists and is idle: its occupancy bit is still set
+        // (no other allocation could have claimed it while the lease held it —
+        // the bit is the ownership token). Remove the lease and free its port
+        // (recycle). If the bit was somehow already clear the free is a no-op.
         live.persistent_by_source.remove(&key);
-        match live.owner_by_translated.get(&translated) {
-            Some(AllocationOwner::Persistent(owner)) if *owner == key => {
-                self.release_translated_locked(live, translated)
-            }
-            _ => false,
-        }
+        self.free_translated_port(lease.addr_index, lease.translated.port, true)
     }
 }
 

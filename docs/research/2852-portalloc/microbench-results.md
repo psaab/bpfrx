@@ -165,3 +165,70 @@ complementary cluster new-flow-ceiling measurement on
 `loss:xpf-userspace-fw0/fw1` (a connection-rate generator, distinct from
 the bulk-throughput `perf-test` skill) remains the lab-deferred gate for
 the actual Phase-1/Phase-2 code PR, per the plan.
+
+## Phase-1 shipped (fix/2852-phase1-lockfree)
+
+Phase 1 landed in `userspace-dp/src/nat/allocator.rs`. What changed vs the
+pre-#2852 single-mutex allocator:
+
+- **Port ownership is a lock-free per-address bitmap.** `AddressOccupancy`
+  (`Vec<AtomicU64>` + an atomic fresh-port cursor) replaces the
+  mutex-guarded `owner_by_translated` + `next_port_offset_by_addr` maps.
+  A `fetch_or` CAS on the bit is the sole port-ownership arbiter (a set
+  bit cannot be re-claimed — the ABA-safe ownership token). The
+  non-persistent new-flow hot path claims its port with NO global mutex
+  and takes the retained `Mutex<PortAllocatorLiveState>` only for a tiny
+  reuse-check + exact-cap-check + `live_by_flow` insert.
+- **F1 (conditional bit-clear on release):** `release_flow` /
+  `rollback_flow` only clear the bit after confirming the flow's record
+  still owns that translated tuple (the `live_by_flow` lookup under the
+  mutex is the guard); the clear is idempotent (`fetch_and` returns
+  whether the bit was set).
+- **F2 (FIFO recycle preserved):** freed ports still recycle oldest-first
+  via `AddressOccupancy::recycle`, a `VecDeque` behind a per-ADDRESS
+  mutex (not the global one) — the exact `push_back`/`pop_front` ordering
+  the #3011 tests pin. A fully lock-free MPMC recycle ring is a Phase-2
+  option; `crossbeam` is not a dependency and a hand-rolled lock-free ring
+  is not worth the correctness risk on this hot path. Lock ordering is
+  always global → recycle (recycle is innermost), so there is no deadlock
+  and F5 is sidestepped (Phase 1 has no two-map-shard path).
+- **F7 (addr_index in the record):** `LiveAllocation` carries the
+  pool-address index so release is O(1) — the `addr_index_by_translated`
+  reverse map is gone.
+
+### F4 resolution — the overshoot caveat does not apply to Phase 1
+
+The caveat above worried that a `fetch_add`-reserve global cap overshoots
+by up to M in-flight and falsely exhausts a tiny pool near capacity. The
+shipped Phase 1 does **not** use a pre-claim atomic reserve at all: the cap
+is `live_by_flow.len()` re-checked under the tiny insert mutex, where the
+map length is authoritative. That check is EXACT — it never overshoots, so
+a tiny pool near capacity is never falsely exhausted. This is strictly
+better than release-before-reserve / small-pool-fallback, and it is
+available precisely because Phase 1 keeps the maps under one mutex (the
+overshoot only exists in the Phase-2 sharded world where the cap would be
+checked outside any lock). Covered by
+`pool_snat_fills_to_exact_capacity_then_exhausts` and the concurrent
+`pool_snat_lockfree_concurrent_fill_is_exact_and_collision_free`.
+
+### Merge-gate status
+
+- **Microbench gate:** met (this doc — no PLAN-KILL; the mutex is a
+  measurable bottleneck and Phase 1 is 1.4–1.6× at M=6/8).
+- **Regression:** full `cargo test` green (3743/0); the NAT suite includes
+  the new concurrent no-double-alloc / no-leak / exact-cap RED-on-revert
+  tests plus the preserved #3011 / #3047 / #4388 / #4559 tests.
+- **Cluster new-flow-ceiling on `loss:xpf-userspace-fw0/1`:** still the
+  lab-deferred gate (needs a connection-rate generator, distinct from the
+  bulk-throughput `perf-test` skill) — flagged, not run in this change.
+- **`make test-failover`:** recommended before merge (HA reserve_flow path
+  is exercised by the change); flagged as a nice-to-have cluster smoke.
+
+### Phase 2 (still deferred)
+
+Hash-shard `live_by_flow` and the persistent-lease maps (the residual tiny
+mutex is now the serialization point — the microbench shows NEW also falls
+off with core count). Deferred until the loss-cluster new-flow-ceiling
+measurement shows the residual map mutex is the next bottleneck. Design
+(two-tier shard keys, F5 lock-ordering resolution) is in the converged v3
+plan on the `research/2852-portalloc` branch.
