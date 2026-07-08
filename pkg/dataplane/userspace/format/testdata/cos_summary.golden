@@ -1,0 +1,26 @@
+Interface: reth0.80
+  Scheduler map:            bandwidth-limit
+  DSCP classifier:          wan-classifier
+  IEEE 802.1 classifier:    wan-pcp
+  DSCP rewrite-rule:        -
+  Shaping rate:             15.00 Mb/s
+  Burst size:               64.00 KiB
+  Output filter (inet):     bandwidth-output
+  Owner worker:             7
+  Runtime workers:          2
+  Runtime queues:           nonempty=1 runnable=1
+  Timer wheel sleepers:     level0=1 level1=0
+  Waterfill:                epochs=12 phase1_budget_breaks=3 min_epochs_per_worker=4
+  Binding telemetry:        redirect_p99=2us  owner_pps=12345  peer_pps=6789  post_drain_backup_bytes=4321
+  Queues:
+    Queue  Owner  Class           Priority  Exact  Guarantee  Transmit rate  Buffer     Queued pkts  Queued bytes  Runnable  Parked  Next wake  Surplus deficit
+    0      -      best-effort     0         no     yes        15.00 Mb/s     16.00 KiB  1            1.46 KiB      1         0       -          -
+           Drops: flow_share=0  buffer=0  ecn_marked=0
+    4      7      bandwidth-10mb  1         yes    yes        10.00 Mb/s     32.00 KiB  3            4.00 KiB      1         1       77         2.00 KiB
+           Drops: flow_share=3  buffer=2  ecn_marked=7
+           Sojourn: win_min=800ns  ewma=1.5us  peak=2.0ms
+           Surplus sharing: no
+           Equal-flow:     enforced=yes  policy=strict  target=8.00 Mb/s  max_worker_cap=2.00 KiB  cap_hits=5  suppressed_bytes=900  fail_open=-
+           OwnerProfile: drain_p50=1us  drain_p99=16us  drain_invocations=100
+           DrainShape:   sent_bytes=10000  guarantee=6000  surplus=4000  nonexact_while_exact_backlogged=512  park_root=2  park_queue=1
+           Waterfill:    phase1_admit=40  phase2_admit=12  eligible_visits=55  phase1_no_progress=4
