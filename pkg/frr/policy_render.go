@@ -1249,7 +1249,21 @@ func renderRouteFilterEntry(b *strings.Builder, plName string, idx int, rf *conf
 				case rf.UptoLen > plen && rf.UptoLen <= maxLen:
 					matchStr = fmt.Sprintf("le %d", rf.UptoLen)
 				default:
-					matchStr = fmt.Sprintf("le %d", maxLen)
+					// A nonsensical upto length — below the base prefix
+					// (UptoLen < plen: an EMPTY length range) or above the
+					// family max (UptoLen > maxLen) — has no valid Junos
+					// meaning. The earlier #2072/#2102 code degraded this to
+					// the open-ended "le maxLen", which silently WIDENS the
+					// match to an orlonger-style permit of the base prefix and
+					// every more-specific (#4484 L-12): fail-OPEN on a
+					// route-filter that gates route accept/redistribute. Skip
+					// the entry instead (match-nothing, fail-CLOSED), matching
+					// the #2525 posture the sibling invalid match-types
+					// (prefix-length-range / through / unknown) already use.
+					// Skip emits no line — an FRR-legal seq gap, never the
+					// invalid "le <plen" the #2102 degrade was avoiding — so
+					// the frr-reload-brick concern does not apply.
+					skipEntry = true
 				}
 			}
 		}
