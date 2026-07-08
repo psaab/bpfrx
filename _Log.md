@@ -1,3 +1,20 @@
+## 2026-07-07 — #4589 A3 F-01 config: range-validate BGP peer-as / top-level local-as (uint32 wrap)
+
+- **Timestamp**: 2026-07-07
+- **Action**: BGP `peer-as` (group + neighbor) and top-level `local-as`
+  carried no upper-bound schema validator, so an out-of-range ASN passed
+  the strict commit schema and the compiler's `Atoi -> uint32(v)` cast
+  silently wrapped it (`peer-as 4294967297` -> `remote-as 1`; `peer-as -1`
+  -> `remote-as 4294967295`) — a wrong-but-valid FRR config Junos rejects.
+  The `PeerAS==0` strict gate (#2963) only catches AS0, not a non-zero
+  wrap. Added `valueType: ValueInteger, validator: ValidateInteger(1,
+  4294967295)` to the two `peer-as` leaves and top-level `local-as` in
+  `schema_routing.go`, mirroring the sibling `local-as` group/neighbor
+  leaves that already had it. RED-on-revert test
+  `TestBGPPeerASRangeRejected`/`...Accepted`.
+- **File(s)**: pkg/config/schema_routing.go,
+  pkg/config/bgp_peeras_range_4589_test.go, _Log.md
+
 ## 2026-07-07 — #4588 frr: validate a BGP-neighbor SHOW command's IP before it reaches vtysh (unauthenticated local gRPC show path)
 
 - **Timestamp**: 2026-07-07

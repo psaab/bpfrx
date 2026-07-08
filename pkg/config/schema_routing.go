@@ -315,7 +315,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		}},
 	}},
 	"bgp": {desc: "BGP configuration", children: map[string]*schemaNode{
-		"local-as":         {desc: "Local AS number", args: 1, placeholder: "<as-number>", children: nil},
+		"local-as":         {desc: "Local AS number", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 		"router-id":        {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
 		"cluster-id":       {desc: "Cluster ID", args: 1, placeholder: "<id>", children: nil},
 		"graceful-restart": {desc: "Graceful restart", children: nil},
@@ -333,7 +333,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"export": {desc: "Export policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"import": {desc: "Import policy", args: 1, multi: true, placeholder: "<policy-name>", children: nil},
 		"group": {desc: "BGP group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
-			"peer-as":            {desc: "Peer AS number", args: 1, placeholder: "<as-number>", children: nil},
+			"peer-as":            {desc: "Peer AS number", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 			"local-as":           {desc: "Local AS number for this peering", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 			"local-address":      {desc: "Local address (BGP update-source)", args: 1, placeholder: "<address>", children: nil},
 			"hold-time":          {desc: "Hold time (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateBGPHoldTime, children: nil},
@@ -368,7 +368,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			}},
 			"neighbor": {desc: "BGP neighbor", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 				"description":            {desc: "Description", args: 1, scalar: true, placeholder: "<text>", children: nil},
-				"peer-as":                {desc: "Peer AS number", args: 1, placeholder: "<as-number>", children: nil},
+				"peer-as":                {desc: "Peer AS number", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 				"local-as":               {desc: "Local AS number for this peering", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 				"local-address":          {desc: "Local address (BGP update-source)", args: 1, placeholder: "<address>", children: nil},
 				"hold-time":              {desc: "Hold time (seconds)", args: 1, valueType: ValueInteger, placeholder: "<seconds>", validator: ValidateBGPHoldTime, children: nil},
