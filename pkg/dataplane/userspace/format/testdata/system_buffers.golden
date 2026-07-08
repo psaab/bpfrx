@@ -1,0 +1,120 @@
+=== detail=false ===
+Userspace Buffer Utilization:
+Buffer                   Scope                        Capacity         Used   Usage% Status
+--------------------------------------------------------------------------------------------
+AF_XDP UMEM frames       aggregate/2                      2000          920    46.0% OK
+AF_XDP TX ring           aggregate/2                       200          100    50.0% OK
+CoS queue bytes          aggregate/2                      2000          950    47.5% OK
+Session table entries    aggregate                        1000          920    92.0% CRITICAL
+Flow cache active flows  aggregate/2                      2000         1000    50.0% OK
+Neighbor cache entries   dynamic                            50           42    84.0% WARNING
+
+2 userspace buffer row(s) at high utilization
+
+Userspace Status Counters:
+Counter                          Scope                           Value
+----------------------------------------------------------------------
+NAT reverse-key collisions       aggregate                           6
+NAT reverse-key shared displacements shared                              3
+Pending-neighbor max depth       aggregate                           9
+Pending-neighbor timeout drops   aggregate                           4
+Flow cache collision evict       aggregate                           7
+Pending fill frames              aggregate                           3
+Spare fill frames                aggregate                           5
+Pending TX prepared              aggregate                           7
+Pending TX local                 aggregate                          11
+TX ring full events              aggregate                          13
+sendto ENOBUFS                   aggregate                          17
+Bound pending overflow           aggregate                          19
+CoS queue overflow               aggregate                          23
+RX fill-ring empty descs         aggregate                          37
+Redirect inbox overflow          aggregate                          41
+Pending TX local overflow        aggregate                          43
+TX submit error drops            aggregate                          47
+SYN-cookie challenges            aggregate                          20
+SYN-cookie secret unavailable    aggregate                           1
+SYN-cookie SYN-ACK sent          aggregate                           2
+SYN-cookie ACK RST sent          aggregate                           1
+SYN-cookie budget drops          aggregate                           1
+SYN-cookie ACK valid             aggregate                          46
+SYN-cookie ACK invalid           aggregate                           2
+SYN-cookie bypass                aggregate                           4
+=== detail=true ===
+Userspace Buffer Utilization:
+Buffer                   Scope                        Capacity         Used   Usage% Status
+--------------------------------------------------------------------------------------------
+AF_XDP UMEM frames       aggregate/2                      2000          920    46.0% OK
+AF_XDP TX ring           aggregate/2                       200          100    50.0% OK
+CoS queue bytes          aggregate/2                      2000          950    47.5% OK
+CoS queue bytes          reth0.80/queue 2/ef/worker 2         1000          850    85.0% WARNING
+CoS queue bytes          reth0.80/queue 3/be              1000          100    10.0% OK
+Session table entries    aggregate                        1000          920    92.0% CRITICAL
+Flow cache active flows  aggregate/2                      2000         1000    50.0% OK
+Neighbor cache entries   dynamic                            50           42    84.0% WARNING
+AF_XDP UMEM frames       worker 0/queue 0/slot 0/ge-0-0-1         1000          820    82.0% WARNING
+AF_XDP TX ring           worker 0/queue 0/slot 0/ge-0-0-1          100           90    90.0% CRITICAL
+Flow cache active flows  worker 0/queue 0/slot 0/ge-0-0-1         1000          900    90.0% CRITICAL
+AF_XDP UMEM frames       worker 1/queue 0/slot 1/ge-0-0-2         1000          100    10.0% OK
+AF_XDP TX ring           worker 1/queue 0/slot 1/ge-0-0-2          100           10    10.0% OK
+Flow cache active flows  worker 1/queue 0/slot 1/ge-0-0-2         1000          100    10.0% OK
+
+6 userspace buffer row(s) at high utilization
+
+Userspace Status Counters:
+Counter                          Scope                           Value
+----------------------------------------------------------------------
+NAT reverse-key collisions       aggregate                           6
+NAT reverse-key shared displacements shared                              3
+Pending-neighbor max depth       aggregate                           9
+Pending-neighbor timeout drops   aggregate                           4
+Flow cache collision evict       aggregate                           7
+Pending fill frames              aggregate                           3
+Spare fill frames                aggregate                           5
+Pending TX prepared              aggregate                           7
+Pending TX local                 aggregate                          11
+TX ring full events              aggregate                          13
+sendto ENOBUFS                   aggregate                          17
+Bound pending overflow           aggregate                          19
+CoS queue overflow               aggregate                          23
+RX fill-ring empty descs         aggregate                          37
+Redirect inbox overflow          aggregate                          41
+Pending TX local overflow        aggregate                          43
+TX submit error drops            aggregate                          47
+SYN-cookie challenges            aggregate                          20
+SYN-cookie secret unavailable    aggregate                           1
+SYN-cookie SYN-ACK sent          aggregate                           2
+SYN-cookie ACK RST sent          aggregate                           1
+SYN-cookie budget drops          aggregate                           1
+SYN-cookie ACK valid             aggregate                          46
+SYN-cookie ACK invalid           aggregate                           2
+SYN-cookie bypass                aggregate                           4
+Flow cache collision evict       worker 0/queue 0/slot 0/ge-0-0-1            5
+Pending fill frames              worker 0/queue 0/slot 0/ge-0-0-1            3
+Spare fill frames                worker 0/queue 0/slot 0/ge-0-0-1            5
+Pending TX prepared              worker 0/queue 0/slot 0/ge-0-0-1            7
+Pending TX local                 worker 0/queue 0/slot 0/ge-0-0-1           11
+TX ring full events              worker 0/queue 0/slot 0/ge-0-0-1           13
+sendto ENOBUFS                   worker 0/queue 0/slot 0/ge-0-0-1           17
+Bound pending overflow           worker 0/queue 0/slot 0/ge-0-0-1           19
+CoS queue overflow               worker 0/queue 0/slot 0/ge-0-0-1           23
+RX fill-ring empty descs         worker 0/queue 0/slot 0/ge-0-0-1           37
+Redirect inbox overflow          worker 0/queue 0/slot 0/ge-0-0-1           41
+Pending TX local overflow        worker 0/queue 0/slot 0/ge-0-0-1           43
+TX submit error drops            worker 0/queue 0/slot 0/ge-0-0-1           47
+SYN-cookie challenges            worker 0/queue 0/slot 0/ge-0-0-1            3
+SYN-cookie secret unavailable    worker 0/queue 0/slot 0/ge-0-0-1            1
+SYN-cookie SYN-ACK sent          worker 0/queue 0/slot 0/ge-0-0-1            2
+SYN-cookie ACK RST sent          worker 0/queue 0/slot 0/ge-0-0-1            1
+SYN-cookie budget drops          worker 0/queue 0/slot 0/ge-0-0-1            1
+SYN-cookie ACK valid             worker 0/queue 0/slot 0/ge-0-0-1            5
+SYN-cookie ACK invalid           worker 0/queue 0/slot 0/ge-0-0-1            2
+SYN-cookie bypass                worker 0/queue 0/slot 0/ge-0-0-1            4
+Flow cache collision evict       worker 1/queue 0/slot 1/ge-0-0-2            2
+SYN-cookie challenges            worker 1/queue 0/slot 1/ge-0-0-2           17
+SYN-cookie ACK valid             worker 1/queue 0/slot 1/ge-0-0-2           41
+=== unavailable ===
+Userspace Buffer Utilization:
+  unavailable: helper status does not include bounded userspace capacity gauges
+  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx
+  dynamic status fields: session_table_entries/max_sessions, per_binding[].flow_cache_capacity, neighbor_cache_capacity
+  bindings[] mirrors with the same fields are also accepted

@@ -42284,4 +42284,87 @@ top.
   **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
   userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/frame/tests.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-coverage.md,
+  **Action**: refactor(test) #4669 — split pkg/dataplane/userspace/manager_test.go
+  (6782 LOC, the largest single file) by SUBSYSTEM into sibling
+  manager_<subsystem>_test.go files. Pure code-motion: 179 top-level
+  declarations (Test* funcs + helpers) MOVED verbatim; no test logic
+  change. Shared fixtures / helper-IPC / eBPF-gate setup moved FIRST into
+  manager_testhelpers_test.go (hostToNetwork16, injectShimMap,
+  injectSessionMaps, injectCtrlAndBindingMaps, injectUserspaceSessionMap,
+  skipIfBPFMapUnavailable — the map-injection harness used by both the
+  session-sync and HA tests). Subsystem-local helpers stayed with their
+  tests (sourceNATPoolTestConfig→nat, testStandbyNeighborPrewarmManager +
+  startFakeHAControlHelper + drainUpdateHAStateCount→ha, maxTestVLANID +
+  missing*VLANID* + liveSnapshotParentInterfaces→interfaces). The
+  original file carried NO build tags; eBPF/root gating is per-function
+  (skipIfBPFMapUnavailable + inline rlimit.RemoveMemlock t.Skip) and moves
+  with each test intact. New files: testhelpers(6), sessionsync(20),
+  ha(33), policycounters(6), policy(9), capabilities(18), snapshot(5),
+  nat(5), screens(15), cos(10), flow(5), tunnels(7), interfaces(24),
+  mirrors(5), routes(2), fabric(1), counters(6), misc(2). manager_test.go
+  deleted. Verified: go/parser+go/printer decl-diff vs origin/master =
+  179 old / 179 new, all canonical-identical, 0 missing / 0 extra / 0
+  mismatch (import blocks pruned per-file by goimports, excluded from the
+  decl diff). go build ./... clean, go vet clean, gofmt clean. Full
+  package `go test -v -count=1 ./pkg/dataplane/userspace/` PASS both
+  before (origin/master single-file) and after (split): 896 `=== RUN`
+  lines each, sorted RUN-name diff empty — the SAME tests run, none
+  dropped. No module-contract doc change needed: this is a test-file
+  reorganization with zero production change; pkg/dataplane/README.md
+  documents behavior, not a test-file index.
+  **File(s)**: pkg/dataplane/userspace/manager_test.go (deleted),
+  pkg/dataplane/userspace/manager_testhelpers_test.go (new),
+  manager_sessionsync_test.go, manager_ha_test.go,
+  manager_policycounters_test.go, manager_policy_test.go,
+  manager_capabilities_test.go, manager_snapshot_test.go,
+  manager_nat_test.go, manager_screens_test.go, manager_cos_test.go,
+  manager_flow_test.go, manager_tunnels_test.go,
+  manager_interfaces_test.go, manager_mirrors_test.go,
+  manager_routes_test.go, manager_fabric_test.go,
+  manager_counters_test.go, manager_misc_test.go (all new), _Log.md
+## 2026-07-08 — #4661 refactor: split format/buffers.go model from render (773 LOC)
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4661 refactor — split the `show system buffers` row/taxonomy
+  MODEL out of buffers.go into a new buffers_model.go, mirroring the #4656
+  status_sections.go / #4657 cos_sections.go model-then-render pattern. Pure
+  code motion, output byte-identical. The prior CLI/gRPC/REST buffer-status
+  parity bugs came from FormatSystemBuffers (text, used by CLI + gRPC) and
+  StructuredSystemBufferRows (structured, used by the REST endpoint) each
+  independently building the sample/row/counter set; this factored that
+  duplicated three-call build into one shared `buildSystemBufferModel`
+  returning a `systemBufferModel` (rows + counterRows + knownUMEM/knownTX),
+  so a row or counter added to the taxonomy surfaces in every renderer at
+  once and cannot drift. buffers_model.go holds the taxonomy label consts,
+  the internal sample/row/counter/binding-key types, buildSystemBufferModel,
+  systemBufferRows/systemBufferCoSRows/systemBufferFlowCacheAggregate/
+  systemBufferCounterRows (row build), systemBufferUsage (WARNING/CRITICAL
+  classification), systemBufferSamples + applyBindingStatusFallback (helper
+  status sampling + per-binding fallback), and the scope helpers.
+  buffers.go keeps the two section-heading consts, the exported REST row
+  types (SystemBufferUtilizationRow/SystemBufferCounterRow/SystemBufferRows),
+  the exported API (SystemBufferUtilizationRows/StructuredSystemBufferRows +
+  the exportedSystemBuffer* mappers), and FormatSystemBuffers, now reduced to
+  a build-then-render orchestrator over two new per-section render helpers
+  (writeSystemBufferUtilizationSection / writeSystemBufferCountersSection).
+  The counter-section leading-blank-line spacing (`HasSuffix "\n\n"`) is
+  preserved. No symbol collision with status_sections.go / cos_sections.go
+  (checked: distinct writeSystemBuffer* / buildSystemBufferModel names).
+  Byte-identity gate: new TestFormatSystemBuffersGolden pins the full output
+  of both render modes (detail=false/true) plus the "unavailable" branch for
+  a fixture exercising UMEM/TX/CoS aggregate+detail rows, bounded session/
+  flow-cache/neighbor rows, the WARNING/CRITICAL classes, the high-util
+  warning count, and every status counter with per-binding detail. The
+  golden fixture was generated by running the SAME test on a pristine
+  origin/master (pre-refactor) worktree, then the refactored code was
+  verified to reproduce it byte-for-byte (test passes without -update). Reuses
+  the package-level `updateGolden` flag from status_golden_test.go. go build
+  ./... clean, go vet clean, gofmt clean, go test
+  ./pkg/dataplane/userspace/format/ green. No module-doc change needed: the
+  format package has no README (matches #4656/#4657, which touched only
+  _Log.md + the golden test/fixture), and the split is behavior-identical.
+  **File(s)**: pkg/dataplane/userspace/format/buffers.go (trimmed to render +
+  public API), pkg/dataplane/userspace/format/buffers_model.go (new — model +
+  taxonomy + sampling), pkg/dataplane/userspace/format/buffers_golden_test.go
+  (new), pkg/dataplane/userspace/format/testdata/system_buffers.golden (new),
   _Log.md
