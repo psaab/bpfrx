@@ -252,6 +252,21 @@ best-effort).
     a bad option degrades to "missing that one option" instead of a total RA
     blackout. NDP options are independent on the wire, so per-option probing is
     faithful to how the combined RA marshals.
+- **`configEqual` must track EVERY field `buildRA` stamps onto the wire.**
+  `Apply` gates the sender restart on `configEqual(existing.cfg, cfg)` — an
+  interface whose config compares EQUAL keeps running untouched (no RA gap),
+  so any wire-affecting field that `buildRA` (`sender.go`) reads but
+  `configEqual` (`ra.go`) omits produces a silent "commit clean but not
+  enforced": the operator commits a change, sees no error, yet the wire keeps
+  advertising the old value until an unrelated RA edit or a daemon restart
+  reconciles it. The scalar comparison list is therefore the change-detection
+  contract and must be kept in lockstep with the fields `buildRA` marshals.
+  Two fixes of this exact class: `DefaultLifetimeSet` (#4119 — the set-flag is
+  part of the identity because unset→1800 and explicit-0 marshal DIFFERENT
+  Router Lifetimes) and `ReachableTime` / `RetransTimer` (#4570 — the RFC 4861
+  §4.2 ND timer hints wire-stamped by #4307; here 0=unspecified maps directly
+  to a zero wire field with no unset/default coercion, so a plain int compare
+  is exact and no companion set-flag is needed).
 - IPv6 NODAD is set on the per-instance NDP socket so it doesn't fight
   the kernel's own duplicate-address detection on the link-local
   address.

@@ -810,7 +810,18 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 		a.LinkMTU != b.LinkMTU ||
 		a.NAT64Prefix != b.NAT64Prefix ||
 		a.NAT64PrefixLife != b.NAT64PrefixLife ||
-		a.SourceLinkLocal != b.SourceLinkLocal {
+		a.SourceLinkLocal != b.SourceLinkLocal ||
+		// #4570: reachable-time / retransmit-timer are stamped onto the wire
+		// by buildRA (#4307, sender.go) but were omitted from this
+		// change-detector, so a day-2 commit changing ONLY those two RA-header
+		// timers left configEqual==true → Apply's `continue` skipped the
+		// sender restart → the wire kept advertising the OLD values until an
+		// unrelated RA edit or daemon restart. Unlike DefaultLifetime (#4119),
+		// 0 = "unspecified" maps DIRECTLY to a zero wire field with no
+		// unset/default coercion, so a plain int compare is exact — no "Set"
+		// companion is needed to distinguish absent from explicit-0.
+		a.ReachableTime != b.ReachableTime ||
+		a.RetransTimer != b.RetransTimer {
 		return false
 	}
 
