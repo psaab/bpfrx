@@ -1117,6 +1117,15 @@ Notes for this specific test:
 - 802.1p BA classifiers are also available as a fallback queue selector on
   userspace interfaces; they use the ingress VLAN PCP preserved from tagged
   XDP traffic, including priority-tagged frames with VLAN ID 0
+- `rewrite-rules ieee-802.1 <name>` (802.1p PCP egress rewrite, #4228 Gap 4)
+  is now accepted, fully modeled, validated (loss-priority typo gate +
+  code-point `0..7` range check + dangling-reference warns), and bindable under
+  `class-of-service interfaces ... [unit ...] rewrite-rules ieee-802.1 <name>`
+  — but it is **accepted-but-inert**: the userspace dataplane rewrites `dscp`
+  on egress only and does not yet own the 802.1Q tag write, so a commit
+  advisory surfaces that the PCP rewrite has no runtime effect. The classifier
+  side is enforced; the egress-rewrite half awaits egress 802.1Q tag ownership
+  in the AF_XDP TX path (a Rust follow-up)
 - keep ingress `input` filter classification only as a compatibility fallback
   for existing configs that do not yet attach an egress CoS filter
 - use `set class-of-service schedulers <name> transmit-rate <rate> exact` for

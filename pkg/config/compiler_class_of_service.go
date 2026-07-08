@@ -25,6 +25,9 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	if cos.DSCPRewriteRules == nil {
 		cos.DSCPRewriteRules = make(map[string]*CoSDSCPRewriteRule)
 	}
+	if cos.IEEE8021RewriteRules == nil {
+		cos.IEEE8021RewriteRules = make(map[string]*CoSIEEE8021RewriteRule)
+	}
 	if cos.Schedulers == nil {
 		cos.Schedulers = make(map[string]*CoSScheduler)
 	}
@@ -246,6 +249,46 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			}
 			if len(rewriteRule.Entries) > 0 {
 				cos.DSCPRewriteRules[rewriteRule.Name] = rewriteRule
+			}
+		}
+		// #4228 Gap 4: ieee-802.1 (PCP) rewrite-rules. Fully modeled (mirror of
+		// the dscp rewrite loop, PCP domain 0..7) so the mapping is validated at
+		// commit, but accepted-but-inert — the dataplane rewrites dscp on egress
+		// only (commit advisory).
+		for _, inst := range namedInstances(rewriteRulesNode.FindChildren("ieee-802.1")) {
+			rewriteRule := &CoSIEEE8021RewriteRule{Name: inst.name}
+			for _, fcNode := range inst.node.FindChildren("forwarding-class") {
+				className := ""
+				if len(fcNode.Keys) >= 2 {
+					className = fcNode.Keys[1]
+				}
+				if className == "" {
+					continue
+				}
+				for _, lpNode := range fcNode.FindChildren("loss-priority") {
+					lossPriority := ""
+					if len(lpNode.Keys) >= 2 {
+						lossPriority = lpNode.Keys[1]
+					}
+					if lossPriority == "" {
+						lossPriority = nodeVal(lpNode)
+					}
+					codePoint, ok, err := collectCoS8021RewriteCodePoint(lpNode)
+					if err != nil {
+						return fmt.Errorf("class-of-service rewrite-rules ieee-802.1 %q: %w", rewriteRule.Name, err)
+					}
+					if !ok {
+						continue
+					}
+					rewriteRule.Entries = append(rewriteRule.Entries, &CoSIEEE8021RewriteRuleEntry{
+						ForwardingClass: className,
+						LossPriority:    lossPriority,
+						PCPValue:        codePoint,
+					})
+				}
+			}
+			if len(rewriteRule.Entries) > 0 {
+				cos.IEEE8021RewriteRules[rewriteRule.Name] = rewriteRule
 			}
 		}
 	}
@@ -490,6 +533,9 @@ func parseCoSInterfaceUnitBody(node *Node, unit *CoSInterfaceUnit) {
 		if dscpNode := rewriteRulesNode.FindChild("dscp"); dscpNode != nil {
 			unit.DSCPRewriteRule = nodeVal(dscpNode)
 		}
+		if ieeeNode := rewriteRulesNode.FindChild("ieee-802.1"); ieeeNode != nil {
+			unit.IEEE8021RewriteRule = nodeVal(ieeeNode)
+		}
 	}
 	// #1614 A1: oversubscription-policy { guarantee-rate <X> | proportional }
 	//
@@ -558,7 +604,8 @@ func coSInterfaceUnitHasBinding(unit *CoSInterfaceUnit) bool {
 	}
 	return unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
 		unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
-		unit.DSCPRewriteRule != "" || unit.OversubscriptionPolicy != "" ||
+		unit.DSCPRewriteRule != "" || unit.IEEE8021RewriteRule != "" ||
+		unit.OversubscriptionPolicy != "" ||
 		unit.PriorityLowMinShareBytes > 0 || unit.OutputTrafficControlProfile != ""
 }
 
@@ -640,6 +687,9 @@ func mergeCoSInterfaceLevelInto(unit, level *CoSInterfaceUnit) {
 	}
 	if unit.DSCPRewriteRule == "" {
 		unit.DSCPRewriteRule = level.DSCPRewriteRule
+	}
+	if unit.IEEE8021RewriteRule == "" {
+		unit.IEEE8021RewriteRule = level.IEEE8021RewriteRule
 	}
 	if unit.OversubscriptionPolicy == "" {
 		unit.OversubscriptionPolicy = level.OversubscriptionPolicy
@@ -1023,6 +1073,60 @@ func collectCoSDSCPRewriteCodePoint(node *Node) (uint8, bool, error) {
 			}
 			if len(values) > 0 {
 				return values[0], true, nil
+			}
+		}
+	}
+	return 0, false, nil
+}
+
+// collectCoS8021RewriteCodePoint resolves the single 802.1p PCP code point a
+// rewrite-rule loss-priority entry writes (#4228 Gap 4). It mirrors
+// collectCoSDSCPRewriteCodePoint but over the 3-bit PCP domain (0..7, numeric
+// only — 802.1p has no symbolic aliases). Both the `code-point <n>` and the
+// `code-points <n>` alias spellings are read; the first value wins. A numeric
+// token outside 0..7 is REJECTED at commit rather than silently dropped or
+// masked to a different class (matching collectCoS8021CodePoints on the
+// classifier side).
+func collectCoS8021RewriteCodePoint(node *Node) (uint8, bool, error) {
+	parse := func(raw string) (uint8, bool, error) {
+		raw = strings.TrimSpace(strings.ToLower(raw))
+		if raw == "" {
+			return 0, false, nil
+		}
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			// Non-numeric token: 802.1p has no symbolic aliases; skip it
+			// (preserving the Junos-compatibility tolerance the classifier
+			// path uses for unknown spellings).
+			return 0, false, nil
+		}
+		if v < 0 || v > 7 {
+			return 0, false, fmt.Errorf(
+				"class-of-service ieee-802.1 rewrite-rule code-point %d is out of range (must be 0..7)",
+				v)
+		}
+		return uint8(v), true, nil
+	}
+	for _, child := range node.FindChildren("code-point") {
+		if len(child.Keys) < 2 {
+			continue
+		}
+		value, ok, err := parse(child.Keys[1])
+		if err != nil {
+			return 0, false, err
+		}
+		if ok {
+			return value, true, nil
+		}
+	}
+	for _, child := range node.FindChildren("code-points") {
+		for _, raw := range child.Keys[1:] {
+			value, ok, err := parse(raw)
+			if err != nil {
+				return 0, false, err
+			}
+			if ok {
+				return value, true, nil
 			}
 		}
 	}

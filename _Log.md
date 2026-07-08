@@ -1,3 +1,33 @@
+## 2026-07-07 — #4228 Gap 4: model `rewrite-rules ieee-802.1` (802.1p PCP egress rewrite)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4228 Gap 4 — Junos `class-of-service rewrite-rules ieee-802.1
+  <name> { forwarding-class <fc> { loss-priority <lp> code-point <0..7>; } }`
+  was an UNKNOWN leaf under the opt-in CoS grammar, so an imported vSRX config
+  with an 802.1p PCP rewrite was REJECTED at commit. Modeled it fully (mirror
+  of the DSCP rewrite): new schema node + interface-unit / interface-level
+  `rewrite-rules ieee-802.1 <name>` binding; compiler parses into
+  `IEEE8021RewriteRules` (`CoSIEEE8021RewriteRule` /
+  `CoSIEEE8021RewriteRuleEntry`, PCP domain 0..7 via new
+  `collectCoS8021RewriteCodePoint`); loss-priority typo gate extended to the
+  new rules; dangling forwarding-class + dangling unit-binding warns added.
+  ACCEPTED-BUT-INERT — the dataplane rewrites dscp on egress only and does not
+  yet own the 802.1Q tag write, so a commit advisory surfaces the inertness
+  (the classifier side `classifiers ieee-802.1` is already enforced). Egress
+  PCP write = Rust TX follow-up. golden_4406 regenerated (only the new
+  `IEEE8021RewriteRules` field appears in the serialized Config; 0 other diffs).
+- **File(s)**: pkg/config/types_cos.go, pkg/config/schema_cos.go,
+  pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_validate_strict_cos.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_cos_ieee8021_rewrite_4228_test.go (new),
+  pkg/config/testdata/golden_4406.json (regenerated),
+  docs/config-schema.md, docs/cos-traffic-shaping.md, _Log.md
+- **Validation**: `go test ./pkg/config/...` green; go build ./... clean;
+  gofmt + go vet clean. New RED-on-revert test: the rewrite parses/compiles
+  into the typed map, the unit binding is captured, the inert advisory fires,
+  and code-point 8 / a `medum-low` loss-priority typo are rejected at commit.
+
 ## 2026-07-07 — #4373 (E1): WARN when `then log session-close` is inert on a deny/reject policy
 
 - **Timestamp**: 2026-07-07

@@ -46,6 +46,21 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				}},
 			}},
 		}},
+		// #4228 Gap 4: IEEE 802.1p (PCP) egress rewrite. Fully modeled
+		// (forwarding-class -> loss-priority -> code-point 0..7) so a vSRX
+		// config commits clean and the mapping is validated, but ACCEPTED-BUT-
+		// INERT — the userspace dataplane rewrites only dscp on egress today and
+		// does not yet own the 802.1Q tag write (a commit advisory surfaces the
+		// inertness). Mirrors the `dscp` rewrite subtree; the classifier side
+		// (classifiers ieee-802.1) is already enforced.
+		"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule (accepted for Junos compatibility; NOT yet enforced — the dataplane rewrites dscp only)", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
+			"forwarding-class": {desc: "Forwarding class whose packets get the rewritten code point", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+					"code-point":  {desc: "802.1p PCP code point to write (0..7)", args: 1, placeholder: "<code-point>", children: nil},
+					"code-points": {desc: "802.1p PCP code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
+				}},
+			}},
+		}},
 		// #4316 (fable-167 F-3b): IP-precedence and MPLS EXP egress rewrite.
 		// Accepted for Junos compatibility (completion + ? help) but INERT —
 		// the userspace dataplane rewrites only dscp on egress. Commit advisory.
@@ -217,7 +232,8 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 			}},
 			"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
-				"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+				"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+				"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule to apply (accepted-but-inert; dataplane rewrites dscp only)", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 			}},
 			"shaping-rate":                   cosShapingRateSchema("Shaping rate for this unit in bits per second (k/m/g suffixes)"),
 			"scheduler-map":                  {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
@@ -235,7 +251,8 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 			"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 		}},
 		"rewrite-rules": {desc: "Rewrite rules applied at the interface level (all units)", children: map[string]*schemaNode{
-			"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+			"dscp":       {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
+			"ieee-802.1": {desc: "IEEE 802.1p (PCP) rewrite rule to apply (accepted-but-inert; dataplane rewrites dscp only)", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 		}},
 		"shaping-rate":                   cosShapingRateSchema("Shaping rate applied at the interface level in bits per second (k/m/g suffixes)"),
 		"scheduler-map":                  {desc: "Scheduler map to apply at the interface level (all units)", args: 1, placeholder: "<map-name>", children: nil},

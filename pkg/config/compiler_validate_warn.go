@@ -1066,6 +1066,16 @@ func ValidateConfig(cfg *Config) []string {
 			warnings = append(warnings,
 				"class-of-service rewrite-rules exp is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only, so MPLS EXP rewrite has no runtime effect")
 		}
+		// #4228 Gap 4: ieee-802.1 (PCP) rewrite-rules are fully modeled and
+		// validated but accepted-but-inert — the dataplane rewrites dscp on
+		// egress only and does not yet own the 802.1Q tag write. Warn once so an
+		// operator who binds one is not misled. The classifier side
+		// (classifiers ieee-802.1) IS enforced; only the egress rewrite waits on
+		// TX 802.1Q tag ownership.
+		if len(cos.IEEE8021RewriteRules) > 0 {
+			warnings = append(warnings,
+				"class-of-service rewrite-rules ieee-802.1 is accepted for compatibility but inert: the userspace dataplane rewrites dscp on egress only and does not yet own the 802.1Q tag write, so 802.1p PCP rewrite has no runtime effect")
+		}
 		for _, class := range cos.ForwardingClasses {
 			if class == nil {
 				continue
@@ -1222,6 +1232,23 @@ func ValidateConfig(cfg *Config) []string {
 				// rewrite-rule loss-priority is ENFORCED — no warning.
 			}
 		}
+		// #4228 Gap 4: mirror the undefined-forwarding-class warn for the
+		// accepted-but-inert ieee-802.1 (PCP) rewrite-rules.
+		for _, rewriteRule := range cos.IEEE8021RewriteRules {
+			if rewriteRule == nil {
+				continue
+			}
+			for _, entry := range rewriteRule.Entries {
+				if entry == nil || entry.ForwardingClass == "" {
+					continue
+				}
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service ieee-802.1 rewrite-rule %q references undefined forwarding-class %q",
+						rewriteRule.Name, entry.ForwardingClass))
+				}
+			}
+		}
 		// #4220 / #4219: priority-low-min-share (#1614 A2) is typed and
 		// stored (PriorityLowMinShareBytes) so garbage is rejected at
 		// commit, but the knob is INERT — it is wire-surface-only and no
@@ -1307,6 +1334,14 @@ func ValidateConfig(cfg *Config) []string {
 						warnings = append(warnings, fmt.Sprintf(
 							"class-of-service interface %s unit %d references undefined dscp rewrite-rule %q",
 							iface.Name, unit.Unit, unit.DSCPRewriteRule))
+					}
+				}
+				// #4228 Gap 4: a dangling ieee-802.1 (PCP) rewrite-rule binding.
+				if unit.IEEE8021RewriteRule != "" {
+					if _, ok := cos.IEEE8021RewriteRules[unit.IEEE8021RewriteRule]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined ieee-802.1 rewrite-rule %q",
+							iface.Name, unit.Unit, unit.IEEE8021RewriteRule))
 					}
 				}
 				// #hb166 T-4: a behavior-aggregate classifier code-point that

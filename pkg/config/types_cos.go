@@ -7,10 +7,22 @@ package config
 // ClassOfServiceConfig holds CoS forwarding classes, schedulers,
 // scheduler-maps, and per-interface shaping configuration.
 type ClassOfServiceConfig struct {
-	ForwardingClasses    map[string]*CoSForwardingClass
-	DSCPClassifiers      map[string]*CoSDSCPClassifier
-	IEEE8021Classifiers  map[string]*CoSIEEE8021Classifier
-	DSCPRewriteRules     map[string]*CoSDSCPRewriteRule
+	ForwardingClasses   map[string]*CoSForwardingClass
+	DSCPClassifiers     map[string]*CoSDSCPClassifier
+	IEEE8021Classifiers map[string]*CoSIEEE8021Classifier
+	DSCPRewriteRules    map[string]*CoSDSCPRewriteRule
+	// IEEE8021RewriteRules holds `class-of-service rewrite-rules ieee-802.1
+	// <name>` — the 802.1p PCP egress rewrite (#4228 Gap 4). It fully mirrors
+	// DSCPRewriteRules (forwarding-class -> loss-priority -> code-point 0..7)
+	// so the mapping is modeled and validated at commit, but it is currently
+	// ACCEPTED-BUT-INERT: the userspace dataplane rewrites only DSCP on egress
+	// (cos_classify.rs) and does not yet own the 802.1Q tag write, so the
+	// configured PCP rewrite has no runtime effect. A commit advisory surfaces
+	// the inertness. The classifier side (IEEE8021Classifiers) IS enforced;
+	// this rewrite half awaits egress 802.1Q tag ownership in the AF_XDP TX
+	// path (the Rust follow-up). Modeled here so imported vSRX configs commit
+	// clean instead of being rejected as an unknown leaf.
+	IEEE8021RewriteRules map[string]*CoSIEEE8021RewriteRule
 	Schedulers           map[string]*CoSScheduler
 	SchedulerMaps        map[string]*CoSSchedulerMap
 	Interfaces           map[string]*CoSInterface
@@ -108,6 +120,21 @@ type CoSDSCPRewriteRuleEntry struct {
 	DSCPValue       uint8
 }
 
+// CoSIEEE8021RewriteRule maps forwarding classes to egress 802.1p PCP rewrite
+// values (#4228 Gap 4). Accepted-but-inert — see ClassOfServiceConfig.
+type CoSIEEE8021RewriteRule struct {
+	Name    string
+	Entries []*CoSIEEE8021RewriteRuleEntry
+}
+
+// CoSIEEE8021RewriteRuleEntry assigns an 802.1p PCP rewrite code point (0..7)
+// to a forwarding class.
+type CoSIEEE8021RewriteRuleEntry struct {
+	ForwardingClass string
+	LossPriority    string
+	PCPValue        uint8
+}
+
 // CoSScheduler defines the Phase 1 class scheduler knobs.
 type CoSScheduler struct {
 	Name              string
@@ -202,6 +229,11 @@ type CoSInterfaceUnit struct {
 	DSCPClassifier     string
 	IEEE8021Classifier string
 	DSCPRewriteRule    string
+	// IEEE8021RewriteRule is the `rewrite-rules ieee-802.1 <name>` egress
+	// binding on this unit (#4228 Gap 4). Accepted-but-inert: retained for
+	// `show configuration` fidelity and the undefined-reference advisory, but
+	// the dataplane rewrites only DSCP on egress today.
+	IEEE8021RewriteRule string
 	// OutputTrafficControlProfile is the raw
 	// `output-traffic-control-profile <name>` reference bound to this unit's
 	// egress (fable-167 F-2, #4315). resolveCoSTrafficControlProfiles (run

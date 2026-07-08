@@ -5404,9 +5404,11 @@ range-checked at commit, not silently aliased into a different traffic class.
   resolves through `coSDSCPValues`; a numeric token outside `0..63` is a
   **commit error** (`compileClassOfService`, `expandCoSCodePointToken` in
   `pkg/config/compiler_class_of_service.go`).
-- **802.1p / IEEE 802.1** (`classifiers ieee-802.1 ...`) — domain `0..7` (the
-  3-bit PCP field). A numeric token outside `0..7` is a **commit error**
-  (`collectCoS8021CodePoints`).
+- **802.1p / IEEE 802.1** (`classifiers ieee-802.1 ...`, `rewrite-rules
+  ieee-802.1 ...`) — domain `0..7` (the 3-bit PCP field). A numeric token
+  outside `0..7` is a **commit error** (`collectCoS8021CodePoints` on the
+  classifier side; `collectCoS8021RewriteCodePoint` on the #4228 Gap 4 rewrite
+  side).
 
 Before #2447 these were **silently dropped** at the Go parse layer (no commit
 error) and, on a version/snapshot-drifted helper, the dataplane builder masked
@@ -5648,6 +5650,23 @@ are **accepted-but-inert** — the userspace dataplane classifies / rewrites on
 `ClassOfServiceConfig` (`INetPrecedenceClassifiers` /
 `INetPrecedenceRewriteRules` / `EXPRewriteRules`) solely to drive a commit
 advisory; no runtime structure is built.
+
+**Gap 4 — CoS `rewrite-rules ieee-802.1` (802.1p PCP egress rewrite,
+#4228).** Added `rewrite-rules ieee-802.1 <name> { forwarding-class <fc> {
+loss-priority <lp> code-point <0..7>; } }` to `schemaClassOfService`, plus the
+`rewrite-rules ieee-802.1 <name>` binding at the interface unit and
+interface level. Unlike F-3b (name-only), the mapping is **fully modeled** —
+`compileClassOfService` parses it into `IEEE8021RewriteRules`
+(`CoSIEEE8021RewriteRule` / `CoSIEEE8021RewriteRuleEntry`, mirroring the DSCP
+rewrite), the loss-priority typo gate and the code-point `0..7` range check
+apply, and dangling forwarding-class / rewrite-rule references warn — but it is
+**accepted-but-inert**: the userspace dataplane rewrites `dscp` on egress only
+and does not yet own the 802.1Q tag write, so a commit advisory
+(`compiler_validate_warn.go`) surfaces the inertness. The classifier side
+(`classifiers ieee-802.1`) is already enforced; only the egress rewrite half
+awaits egress 802.1Q tag ownership in the AF_XDP TX path (the Rust follow-up).
+Modeled so imported vSRX configs commit clean instead of being rejected as an
+unknown leaf.
 
 ## System syslog host/file sub-statements (#4303 S-1)
 
