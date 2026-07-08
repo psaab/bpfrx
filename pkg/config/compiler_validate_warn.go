@@ -1438,6 +1438,15 @@ func ValidateConfig(cfg *Config) []string {
 	// must not brick a previously-committed config).
 	warnings = append(warnings, validateDefaultPolicyLogWarnings(cfg)...)
 
+	// #4373 (avo-review-007 E1): the per-policy analog of the default-policy log
+	// advisory above. A NAMED or GLOBAL policy with `then deny`/`then reject` plus
+	// `then log session-init`/`session-close` installs no session, so the RT_FLOW
+	// SESSION_CREATE/CLOSE record never fires — an operator who adds `then reject;
+	// then log session-close` expecting a close record is confused when none
+	// appears. The deny is logged unconditionally via the policy-deny RT_FLOW
+	// record instead. WARN-only (valid Junos; must not brick a committed config).
+	warnings = append(warnings, validatePolicyLogInertOnDenyWarnings(cfg)...)
+
 	// #4146 (H-1 slice c): warn when a `to-zone junos-host` policy expresses a
 	// constraint STRICTER than the coarse kernel host-inbound gate can enforce
 	// on the DIRECT host-bound path. Ordinary traffic to a firewall interface
@@ -1686,6 +1695,84 @@ func validateDefaultPolicyLogWarnings(cfg *Config) []string {
 			"is already logged via the policy-deny RT_FLOW record). These flags "+
 			"take effect only with `default-policy permit-all`",
 		strings.Join(modes, "/"), action)}
+}
+
+// validatePolicyLogInertOnDenyWarnings emits a WARN-only commit-time message
+// for each NAMED or GLOBAL security policy whose terminal action is deny/reject
+// yet configures `then log session-init` and/or `session-close` (#4373 E1,
+// avo-review-007). This is the per-policy analog of the default-policy advisory
+// above (validateDefaultPolicyLogWarnings, #3534).
+//
+// The confusion: an operator writes `then reject; then log session-close`
+// expecting a close record when the flow is rejected. But a deny/reject verdict
+// installs NO session, so the RT_FLOW SESSION_CREATE / SESSION_CLOSE records
+// those flags request never fire — session-close has no session to close.
+// The deny is instead logged unconditionally via the RT_FLOW policy-deny record
+// (userspace-dp emit_policy_deny_event fires on EVERY non-permit verdict, never
+// gated on a per-policy log flag), so `then log session-init` is redundant and
+// `then log session-close` is inert. `then log` session records fire only for a
+// `then permit` policy, whose admitted session the dataplane stamps the log
+// flags onto at install (the #2508 per-policy path). Without this advisory the
+// operator sees a policy that REPORTS session-close logging (REST/gRPC/CLI show
+// the flag) yet produces no close record — a silent observability gap.
+//
+// WARN-only: `then log` on a deny/reject is valid Junos syntax and a hard
+// reject would brick a previously-committed config (#1960 no-brick doctrine).
+// The bare-`then log` gate (validatePolicyLogActionStrict, #3060) still applies
+// independently. Iteration is over the ordered policy slices (zone-pair, then
+// global), so the warnings are stable across commits.
+func validatePolicyLogInertOnDenyWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	check := func(who string, pol *Policy) {
+		if pol == nil || pol.Log == nil {
+			return
+		}
+		if pol.Action != PolicyDeny && pol.Action != PolicyReject {
+			return
+		}
+		if !pol.Log.SessionInit && !pol.Log.SessionClose {
+			return
+		}
+		var modes []string
+		if pol.Log.SessionInit {
+			modes = append(modes, "session-init")
+		}
+		if pol.Log.SessionClose {
+			modes = append(modes, "session-close")
+		}
+		action := "deny"
+		if pol.Action == PolicyReject {
+			action = "reject"
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"security policy %s `then log %s` is inert under `then %s`: a "+
+				"deny/reject verdict installs no session, so no RT_FLOW "+
+				"session-init/session-close record is produced (the verdict is "+
+				"already logged via the policy-deny RT_FLOW record). `then log` "+
+				"session records fire only for a `then permit` policy (#4373)",
+			who, strings.Join(modes, "/"), action))
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if pol == nil {
+				continue
+			}
+			check(fmt.Sprintf("%s->%s/%s", zpp.FromZone, zpp.ToZone, pol.Name), pol)
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if pol == nil {
+			continue
+		}
+		check(fmt.Sprintf("global/%s", pol.Name), pol)
+	}
+	return warnings
 }
 
 // junosHostPolicySourceScoped reports whether a policy match carries a genuine

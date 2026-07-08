@@ -3400,6 +3400,43 @@ and Rust `policy::tests::default_verdict_carries_default_policy_log_flags` +
 `afxdp::tests::build_forwarding_state_threads_default_policy_log_flags` +
 the `wire_invariant_default_specimens` fixture.
 
+### #4373 — `then log session-init|session-close` inert on a deny/reject policy (WARN)
+
+avo-review-007 E1. The per-policy analog of the #3534 default-policy advisory
+above. An operator writes a NAMED or GLOBAL policy `then reject; then log
+session-close` expecting an RT_FLOW close record when the flow is rejected — but
+a **deny/reject verdict installs no session**, so the requested
+RT_FLOW_SESSION_CREATE / RT_FLOW_SESSION_CLOSE records never fire (session-close
+has no session to close). The deny is logged unconditionally via the RT_FLOW
+**policy-deny** record instead (`userspace-dp` `emit_policy_deny_event` fires on
+every non-permit verdict, never gated on a per-policy log flag), so `then log
+session-init` is redundant and `then log session-close` is inert. Per-policy
+`then log` session records fire only for a **`then permit`** policy, whose
+admitted session the dataplane stamps the log flags onto at install (the #2508
+path). Without a signal the policy REPORTS session-close logging on every
+operator surface (REST/gRPC/CLI) yet produces no close record — a silent
+observability gap that reads as a bug.
+
+**Advisory (WARN):** `validatePolicyLogInertOnDenyWarnings`
+(`compiler_validate_warn.go`) emits a WARN-only commit-time message for each
+named/global policy whose action is deny/reject and that carries a
+session-init/session-close `then log` selection, naming the inert mode(s) and
+the verdict. Never an error — `then log` on a deny/reject is valid Junos and a
+hard reject would brick a previously-committed config (#1960 no-brick). This is
+distinct from the bare-`then log` gate (`validatePolicyLogActionStrict`, #3060),
+which still hard-rejects a `then log` naming neither mode. The log RENDERING side
+of the same confusion (a reject is logged as `POLICY_DENY` / `FILTER_LOG
+action=reject`, never a misleading `SESSION_CLOSE`) was already unambiguous —
+`SESSION_CLOSE` omits the action byte (#2513) and `POLICY_DENY` carries a
+distinct reason (#3610); this advisory closes the remaining CONFIG-time
+confusion. The E4/H2/H7 route-drop-before-policy half of avo-review-007 shipped
+separately (#4504); the live NoRoute/martian drop counter remains a deferred
+`userspace-dp` (Rust) slice.
+
+Regression coverage: `pkg/config/compiler_policy_log_inert_deny_4373_test.go`
+(zone-pair + global deny/reject warn fail-on-revert; permit + no-log negative
+gates).
+
 ### #2401 — Security-policy undefined-zone references (commit fail-closed)
 
 A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza

@@ -1,3 +1,35 @@
+## 2026-07-07 — #4373 (E1): WARN when `then log session-close` is inert on a deny/reject policy
+
+- **Timestamp**: 2026-07-07
+- **Action**: avo-review-007 E1 — an operator who writes a named/global policy
+  `then reject; then log session-close` expecting a close record is confused
+  when none appears: a deny/reject verdict installs NO session, so the RT_FLOW
+  SESSION_CREATE/SESSION_CLOSE records those flags request never fire (the deny
+  is logged unconditionally via the policy-deny RT_FLOW record —
+  `userspace-dp` `emit_policy_deny_event` fires on every non-permit verdict,
+  never gated on a per-policy log flag; VERIFIED in the Rust source). The log
+  RENDERING side was already unambiguous (SESSION_CLOSE omits the action byte
+  #2513; POLICY_DENY carries a distinct reason #3610). The GAP was config-time:
+  the default-policy analog (`validateDefaultPolicyLogWarnings`, #3534) warns on
+  a deny-all/reject-all default, but there was NO per-policy equivalent. Added
+  `validatePolicyLogInertOnDenyWarnings` — a WARN-only commit advisory for each
+  named or global policy with action deny/reject that carries a
+  session-init/session-close `then log` selection, naming the inert mode(s) and
+  verdict. WARN-only (valid Junos; #1960 no-brick). Wired into `ValidateConfig`
+  right after the #3534 default-policy analog.
+- **File(s)**: pkg/config/compiler_validate_warn.go (new
+  `validatePolicyLogInertOnDenyWarnings` + ValidateConfig wiring),
+  pkg/config/compiler_policy_log_inert_deny_4373_test.go (new),
+  docs/config-schema.md (#4373 subsection), docs/junos-cli-reference.md
+  (`show security zones` log-modes note), _Log.md
+- **Validation**: `go test ./pkg/config/ ./pkg/logging/` green;
+  RED-on-revert confirmed (removing the ValidateConfig append →
+  TestPolicyLogInertOnDenyWarns FAILs on all 4 deny/reject cases; permit +
+  no-log negatives stay green); `go build`, gofmt, `go vet` clean. Rust
+  dataplane unchanged — the E4/H2/H7 live NoRoute/martian drop counter remains
+  a deferred `userspace-dp` (Rust) slice (E4/H2/H7 Go simulator half shipped in
+  #4504); E6 ext-header-denied counter is likewise a Rust concern.
+
 ## 2026-07-07 — #4621 fsatomic canary: convert archive staging write to WriteFileAtomic
 
 - **Timestamp**: 2026-07-07
