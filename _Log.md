@@ -41725,3 +41725,25 @@ top.
   userspace-dp/src/afxdp/forwarding/README.md,
   docs/userspace-dataplane-architecture.md,
   docs/research/3616-ipsec-host-inbound/plan.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4497 (avo-001 F3) — surface queried ICMP type/code in the
+  local CLI `test policy` query echo. The `testPolicy` verdict echoed
+  `Source: src -> dst:port [proto]` but dropped the ICMP type/code the
+  operator queried, so a `protocol icmp icmp-type 8 icmp-code 0` lookup
+  printed the bare `[icmp]` — hiding WHICH ICMP packet was tested even
+  though the parser already threads type/code into
+  `policymatch.Query.ICMPType/ICMPCode` (#3284) and the simulator matches
+  an icmp-type-constrained application (junos-ping = type 8). Added the
+  shared `formatQueryProtoTail` helper so the echo now reads
+  `[icmp type 8 code 0]`; a non-ICMP query prints the bare `[proto]`
+  unchanged. RED-on-revert test `testpolicy_icmp_4497_test.go`
+  (icmp-echoes-type/code + tcp-control-unaffected + a direct
+  `formatQueryProtoTail` unit table); verified RED with the echo reverted
+  (output regressed to `[icmp]`). F2 (Rust global-scope test mirror) was
+  done in #4639. Display-only Go change; no schema/wire impact. Possible
+  follow-ups (out of scope here): echo the tuple in `show security
+  match-policies` and add `queried_icmp_type/code` to the gRPC
+  `MatchPoliciesResponse` (proto regen; cargo/Rust lane busy).
+- **File(s)**: pkg/cli/cli_request.go,
+  pkg/cli/testpolicy_icmp_4497_test.go, pkg/cli/README.md, _Log.md
