@@ -1,3 +1,36 @@
+## 2026-07-07 — #4607 event_stream: seed queue budget in the #2875 telemetry-eviction test
+
+- **Timestamp**: 2026-07-07
+- **Action**: BROKEN-MASTER fix. `test_paused_telemetry_eviction_does_not_
+  poison_drain_2875` (`userspace-dp/src/event_stream/tests.rs`) panicked on
+  clean master in DEBUG builds — `debug_assert!(false, "dataplane event queue
+  budget underflow")` at `producer.rs:418` — and in RELEASE leaked the
+  `budget underflow (local counter only)` stderr line (the debug_assert is
+  compiled out there, so `decrement_if_positive` just saturated at 0). ROOT
+  CAUSE = TEST DRIFT, not a production bug: the test fills the replay buffer
+  by calling `push_replay_frame` with `telemetry_seq_frame` (`MSG_SCREEN_DROP`)
+  directly, bypassing the producer's `emit`/`try_acquire`. `MSG_SCREEN_DROP`
+  carries a `dataplane_event_kind()`, so evicting the oldest frame calls
+  `release(ScreenDrop)` → `decrement_if_positive` on a per-kind counter that
+  was never acquired → underflow. The sibling
+  `test_paused_session_eviction_poisons_drain_2875` uses `MSG_SESSION_OPEN`,
+  which has no `dataplane_event_kind()`, so it never touches the budget — which
+  is why only the telemetry variant tripped. Production is balanced (every
+  buffered telemetry frame holds a slot from emit to removal) and robust
+  (`decrement_if_positive` saturates); the debug_assert is a correct tripwire
+  the faked test state trips. Also note the test's 4097 same-kind frames are
+  not a production-reachable state — `max_kind_queued` (820) < REPLAY_BUFFER_
+  CAPACITY (4096) caps a single kind at admission. FIX: added a `#[cfg(test)]`
+  `DataplaneEventQueueBudget::acquire_for_test()` (raw counter bump, bypassing
+  the admission cap) + a `push_budgeted_replay_frame` test helper that seeds the
+  slot for any injected frame carrying a `dataplane_event_kind()`, mirroring
+  emit. Test now GREEN in both debug and release; drain still completes
+  (DrainComplete, no spurious FullResync) — the #2875 assertion is unchanged.
+- **File(s)**: `userspace-dp/src/event_stream/producer.rs`,
+  `userspace-dp/src/event_stream/tests.rs`,
+  `userspace-dp/src/event_stream/README.md`, `_Log.md`
+- Closes #4607.
+
 ## 2026-07-07 — #4599 zeroize: erase self-signed REST-API TLS pair under /etc/xpf/tls
 
 - **Timestamp**: 2026-07-07

@@ -176,6 +176,29 @@ impl DataplaneEventQueueBudget {
         decrement_if_positive(&self.kind_queued[kind_index(kind)]);
         decrement_if_positive(&self.total_queued);
     }
+
+    /// Test-only budget seed: increment the per-kind (and total) queue budget
+    /// that a real `emit`/`try_acquire` would have charged for a frame.
+    ///
+    /// The mod-level replay/drain tests build the replay buffer directly (via
+    /// `push_replay_frame`) to construct a full-buffer eviction scenario,
+    /// deliberately bypassing the producer's `emit` path. Any injected frame
+    /// carrying a `dataplane_event_kind()` (telemetry: deny/screen/filter/
+    /// RT_FLOW) is released through `release()` when it is evicted or popped;
+    /// without the matching acquire the release decrements a zero counter and
+    /// trips the #1826 underflow guard (`decrement_if_positive`). Seeding the
+    /// budget here mirrors production, where every buffered telemetry frame
+    /// holds exactly one budget slot from emit until removal.
+    ///
+    /// Bypasses the admission caps on purpose: the direct-injection tests build
+    /// buffer states larger than a single kind's admission budget (which
+    /// `try_acquire` would refuse), so this is a raw counter bump, not an
+    /// admission decision.
+    #[cfg(test)]
+    pub(super) fn acquire_for_test(&self, kind: DataplaneEventKind) {
+        self.total_queued.fetch_add(1, Ordering::Relaxed);
+        self.kind_queued[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
