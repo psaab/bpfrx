@@ -9,6 +9,20 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// MinVRID / MaxVRID bound the VRRP Virtual Router ID that may be advertised on
+// the wire. RFC 5798 §5.2.3 defines the VRID as an 8-bit field with a valid
+// range of 1..255; 0 is not a usable VRID. The state machine truncates the
+// configured GroupID straight onto that byte (instance.go writes
+// `uint8(vi.cfg.GroupID)` into the VRID field), so an out-of-range GroupID that
+// slips past the config-layer commit gate (validateVRRPGroupIDStrict) on a
+// lenient / HA-sync load would otherwise advertise VRID 0 (peer discards) or an
+// aliased VRID. The manager range-checks GroupID against these bounds at
+// instance creation (#4573) and refuses to build such an instance.
+const (
+	MinVRID = 1
+	MaxVRID = 255
+)
+
 // Instance describes a single VRRP instance.
 type Instance struct {
 	Interface         string

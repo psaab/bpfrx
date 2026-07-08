@@ -328,6 +328,20 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	desiredMap := make(map[instanceKey]*Instance, len(desired))
 	desiredIfaces := make(map[string]struct{}, len(desired))
 	for _, inst := range desired {
+		// #4573 defensive VRID range guard. The GroupID is truncated onto the
+		// single VRID wire byte (uint8(vi.cfg.GroupID) in instance.go). An
+		// out-of-range id normally cannot reach here — the config commit gate
+		// (validateVRRPGroupIDStrict) rejects it — but the tolerant load /
+		// HA-sync path downgrades that gate to a warning (#1960 no-brick), so a
+		// bad id could slip through and advertise the reserved VRID 0 (256→0) or
+		// an aliased VRID (257→1). Refuse to build such an instance rather than
+		// emit a wrong-VRID advert that a strict RFC peer discards.
+		if inst.GroupID < MinVRID || inst.GroupID > MaxVRID {
+			slog.Warn("vrrp: skipping instance with out-of-range VRID",
+				"interface", inst.Interface, "group_id", inst.GroupID,
+				"valid_range", fmt.Sprintf("%d..%d", MinVRID, MaxVRID))
+			continue
+		}
 		key := instanceKey{iface: inst.Interface, groupID: inst.GroupID}
 		desiredMap[key] = inst
 		desiredIfaces[inst.Interface] = struct{}{}
