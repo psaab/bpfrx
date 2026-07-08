@@ -122,6 +122,151 @@ fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64
     }
 }
 
+/// Derive the egress-MTU Path-MTU-Discovery reply for a forwarded frame the
+/// TCP-segmentation path did not handle (non-TCP, TCP seg-miss, or
+/// non-segmentable TCP). Pure code-motion split out of
+/// `enqueue_pending_forwards` (#4408 increment 1) — behaviour is identical to
+/// the inline block it replaces.
+///
+/// #2301 + #2330: #2301 handled ONLY plain forwards (size-preserving), where
+/// the egress MTU compared against the SOURCE frame is exact. #2330 closes the
+/// gap for the size-CHANGING paths (NAT64, native GRE, WireGuard): there the
+/// on-wire frame grows (encap) or its header shrinks/grows (NAT64), so a
+/// source-frame-vs-egress comparison is wrong. Instead we derive the
+/// INNER-source MTU (the largest inner IP packet whose TRANSFORMED frame fits
+/// the egress/transport MTU) from the #2300/#2331 SSOT helpers
+/// (`native_gre_inner_mtu` / `wg::mss::wg_inner_mtu` / the NAT64 v6<->v4 header
+/// delta) and compare the SAME inner `source_frame` against THAT.
+///
+/// In all three transformed cases `source_frame` IS the pre-encap /
+/// pre-translation inner packet and `meta.addr_family` is the inner family, so
+/// the existing `build_frag_needed_v4` / `build_packet_too_big_v6` builders
+/// already target the correct inner source — they just carry the inner MTU
+/// instead of the egress MTU. The generated PTB then routes through
+/// `classify_generated_reply` (#2328) at the finalizer, exactly like the plain
+/// path. When `mtu` is 0 (no MTU resolvable / unknown tunnel kind)
+/// `forwarded_egress_mtu_decision` returns `Forward` (fail-open) and the
+/// transformed frame falls through to its normal build (and, for GRE/WG
+/// oversize, the #2331 encap drop guard). This CLOSES the signal #2331
+/// deferred here: an oversized GRE/WG inner now yields a PTB instead of a
+/// silent `GRE_ENCAP_DF_OVERSIZE_DROPS` / `encap_mtu_drops`.
+///
+/// Returns `(ptb_reply, mtu_signalled)`:
+/// - `ptb_reply` — the built ICMP Frag-Needed (v4) / Packet-Too-Big (v6) to
+///   emit back out the ingress interface, or `None` when no PTB is needed, the
+///   reply is RFC/rate-limit suppressed, or the builder returned `None`.
+/// - `mtu_signalled` — `true` when the oversized original MUST be dropped (a
+///   PTB decision fired, whether or not a reply could be built). A `None`
+///   `ptb_reply` with `mtu_signalled == true` is the fail-closed silent drop.
+#[inline]
+fn compute_forwarded_egress_ptb(
+    source_frame: &[u8],
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    is_nat64: bool,
+    uses_native_tunnel: bool,
+    ingress_ident: &BindingIdentity,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) -> (Option<Vec<u8>>, bool) {
+    let mut ptb_reply: Option<Vec<u8>> = None;
+    let mut mtu_signalled = false;
+    let egress_mtu = forwarded_egress_mtu(decision, forwarding);
+    // #2845: derive the inner destination so the WG PTB picks
+    // the SAME peer (and thus the SAME underlay MTU) the encap
+    // path will. `source_frame` IS the pre-encap inner packet
+    // and `meta.addr_family` its family. Only the WG arm
+    // of `post_transform_inner_mtu` consumes this; cheap enough
+    // to always derive.
+    let inner_dst = frame_l3_offset(source_frame)
+        .or_else(|| match meta.l3_offset {
+            14 | 18 => Some(meta.l3_offset as usize),
+            _ => None,
+        })
+        .and_then(|l3| source_frame.get(l3..))
+        .and_then(|pkt| {
+            crate::afxdp::gre::inner_dst_ip(pkt, meta.addr_family)
+        });
+    let mtu = if is_nat64 || uses_native_tunnel {
+        post_transform_inner_mtu(
+            decision,
+            forwarding,
+            is_nat64,
+            meta.addr_family,
+            egress_mtu,
+            inner_dst,
+        )
+    } else {
+        egress_mtu
+    };
+    let ptb_meta: UserspaceDpMeta = meta.into();
+    let l3 = frame_l3_offset(source_frame).or_else(|| {
+        match meta.l3_offset {
+            14 | 18 => Some(meta.l3_offset as usize),
+            _ => None,
+        }
+    });
+    if let Some(l3) = l3 {
+        if let EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } =
+            forwarded_egress_mtu_decision(
+                source_frame,
+                l3,
+                meta.addr_family,
+                mtu,
+            )
+        {
+            // RFC 792 / RFC 4443 suppression: never reply to
+            // a non-first fragment or an inbound ICMP error.
+            // #2472: AND a per-reason token-bucket rate limit —
+            // an oversized-DF / IPv6 flood would otherwise emit
+            // one PTB per trigger packet, unbounded (CPU/TX
+            // amplification + reflection). On bucket-empty the
+            // PTB is suppressed (the `PacketTooBig` rate-limited
+            // counter is bumped inside `allow_generated_error`);
+            // the oversized original is still dropped below
+            // (`mtu_signalled`), so this never falls through to
+            // forward the MTU-violating frame.
+            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding)
+                && allow_generated_error(GeneratedErrorReason::PacketTooBig)
+            {
+                ptb_reply = match meta.addr_family as i32 {
+                    libc::AF_INET => build_frag_needed_v4(
+                        source_frame,
+                        ptb_meta,
+                        ingress_ident.ifindex,
+                        forwarding,
+                        next_hop_mtu,
+                    ),
+                    libc::AF_INET6 => build_packet_too_big_v6(
+                        source_frame,
+                        ptb_meta,
+                        ingress_ident.ifindex,
+                        forwarding,
+                        next_hop_mtu as u32,
+                    ),
+                    _ => None,
+                };
+            }
+            // Drop the oversized original regardless of
+            // whether the PTB could be built (a suppressed
+            // or unbuildable PTB must not fall through to
+            // forward the MTU-violating frame). `ptb_reply`
+            // being None here is the fail-closed silent drop.
+            mtu_signalled = true;
+            record_exception(
+                recent_exceptions,
+                ingress_ident,
+                "egress_mtu_exceeded",
+                source_frame.len() as u32,
+                Some(meta.into()),
+                None,
+                forwarding,
+            );
+        }
+    }
+    (ptb_reply, mtu_signalled)
+}
+
 pub(in crate::afxdp) fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
     ingress_index: usize,
@@ -512,132 +657,22 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
 
-                // #2301 + #2330: the PMTUD decision for forwarded frames the
-                // TCP segmentation path did not handle (non-TCP, TCP
-                // seg-miss, non-segmentable TCP).
-                //
-                // #2301 handled ONLY plain forwards (size-preserving), where
-                // the egress MTU compared against the SOURCE frame is exact.
-                // #2330 closes the gap for the size-CHANGING paths (NAT64,
-                // native GRE, WireGuard): there the on-wire frame grows
-                // (encap) or its header shrinks/grows (NAT64), so a
-                // source-frame-vs-egress comparison is wrong. Instead we
-                // derive the INNER-source MTU (the largest inner IP packet
-                // whose TRANSFORMED frame fits the egress/transport MTU) from
-                // the #2300/#2331 SSOT helpers (`native_gre_inner_mtu` /
-                // `wg::mss::wg_inner_mtu` / the NAT64 v6<->v4 header delta)
-                // and compare the SAME inner `source_frame` against THAT.
-                //
-                // In all three transformed cases `source_frame` IS the
-                // pre-encap / pre-translation inner packet and
-                // `request.meta.addr_family` is the inner family, so the
-                // existing `build_frag_needed_v4` / `build_packet_too_big_v6`
-                // builders already target the correct inner source — they
-                // just carry the inner MTU instead of the egress MTU. The
-                // generated PTB then routes through `classify_generated_reply`
-                // (#2328) at the finalizer below, exactly like the plain
-                // path. When `mtu` is 0 (no MTU resolvable / unknown tunnel
-                // kind) `forwarded_egress_mtu_decision` returns `Forward`
-                // (fail-open) and the transformed frame falls through to its
-                // normal build (and, for GRE/WG oversize, the #2331 encap
-                // drop guard). This CLOSES the signal #2331 deferred here: an
-                // oversized GRE/WG inner now yields a PTB instead of a silent
-                // `GRE_ENCAP_DF_OVERSIZE_DROPS` / `encap_mtu_drops`.
-                {
-                    let egress_mtu = forwarded_egress_mtu(&request.decision, forwarding);
-                    // #2845: derive the inner destination so the WG PTB picks
-                    // the SAME peer (and thus the SAME underlay MTU) the encap
-                    // path will. `source_frame` IS the pre-encap inner packet
-                    // and `request.meta.addr_family` its family. Only the WG arm
-                    // of `post_transform_inner_mtu` consumes this; cheap enough
-                    // to always derive.
-                    let inner_dst = frame_l3_offset(source_frame)
-                        .or_else(|| match request.meta.l3_offset {
-                            14 | 18 => Some(request.meta.l3_offset as usize),
-                            _ => None,
-                        })
-                        .and_then(|l3| source_frame.get(l3..))
-                        .and_then(|pkt| {
-                            crate::afxdp::gre::inner_dst_ip(pkt, request.meta.addr_family)
-                        });
-                    let mtu = if is_nat64 || uses_native_tunnel {
-                        post_transform_inner_mtu(
-                            &request.decision,
-                            forwarding,
-                            is_nat64,
-                            request.meta.addr_family,
-                            egress_mtu,
-                            inner_dst,
-                        )
-                    } else {
-                        egress_mtu
-                    };
-                    let ptb_meta: UserspaceDpMeta = request.meta.into();
-                    let l3 = frame_l3_offset(source_frame).or_else(|| {
-                        match request.meta.l3_offset {
-                            14 | 18 => Some(request.meta.l3_offset as usize),
-                            _ => None,
-                        }
-                    });
-                    if let Some(l3) = l3 {
-                        if let EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } =
-                            forwarded_egress_mtu_decision(
-                                source_frame,
-                                l3,
-                                request.meta.addr_family,
-                                mtu,
-                            )
-                        {
-                            // RFC 792 / RFC 4443 suppression: never reply to
-                            // a non-first fragment or an inbound ICMP error.
-                            // #2472: AND a per-reason token-bucket rate limit —
-                            // an oversized-DF / IPv6 flood would otherwise emit
-                            // one PTB per trigger packet, unbounded (CPU/TX
-                            // amplification + reflection). On bucket-empty the
-                            // PTB is suppressed (the `PacketTooBig` rate-limited
-                            // counter is bumped inside `allow_generated_error`);
-                            // the oversized original is still dropped below
-                            // (`mtu_signalled`), so this never falls through to
-                            // forward the MTU-violating frame.
-                            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding)
-                                && allow_generated_error(GeneratedErrorReason::PacketTooBig)
-                            {
-                                ptb_reply = match request.meta.addr_family as i32 {
-                                    libc::AF_INET => build_frag_needed_v4(
-                                        source_frame,
-                                        ptb_meta,
-                                        ingress_ident.ifindex,
-                                        forwarding,
-                                        next_hop_mtu,
-                                    ),
-                                    libc::AF_INET6 => build_packet_too_big_v6(
-                                        source_frame,
-                                        ptb_meta,
-                                        ingress_ident.ifindex,
-                                        forwarding,
-                                        next_hop_mtu as u32,
-                                    ),
-                                    _ => None,
-                                };
-                            }
-                            // Drop the oversized original regardless of
-                            // whether the PTB could be built (a suppressed
-                            // or unbuildable PTB must not fall through to
-                            // forward the MTU-violating frame). `ptb_reply`
-                            // being None here is the fail-closed silent drop.
-                            mtu_signalled = true;
-                            record_exception(
-                                recent_exceptions,
-                                ingress_ident,
-                                "egress_mtu_exceeded",
-                                source_frame.len() as u32,
-                                Some(request.meta.into()),
-                                None,
-                                forwarding,
-                            );
-                        }
-                    }
-                }
+                // #2301 + #2330 + #2845: PMTUD for forwarded frames the TCP
+                // segmentation path did not handle. Extracted to
+                // `compute_forwarded_egress_ptb` (#4408 increment 1); see its
+                // doc comment for the full rationale. Pure code-motion: same
+                // inner-MTU derivation, `forwarded_egress_mtu_decision`, PTB
+                // build, and `egress_mtu_exceeded` exception recording.
+                (ptb_reply, mtu_signalled) = compute_forwarded_egress_ptb(
+                    source_frame,
+                    request.meta,
+                    &request.decision,
+                    forwarding,
+                    is_nat64,
+                    uses_native_tunnel,
+                    ingress_ident,
+                    recent_exceptions,
+                );
                 // Skip the oversized-frame build/forward entirely when an
                 // egress-MTU PTB was signalled; the finalizer enqueues
                 // `ptb_reply` (if any) and recycles the ingress descriptor.
