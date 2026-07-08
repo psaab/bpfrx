@@ -723,6 +723,21 @@ func encodePortID(name string) []byte {
 }
 
 func encodeTTL(seconds int) []byte {
+	// The LLDP TTL TLV is a 16-bit unsigned value (IEEE 802.1AB); the wire
+	// TTL is msgTxInterval × msgTxHold, which the standard caps at
+	// txTTL = min(65535, msgTxInterval × msgTxHold). Clamp to [0, 0xffff]
+	// here so a large transmit-interval × hold-multiplier product cannot
+	// wrap uint16 back to a small or zero TTL (a TTL of 0 makes every peer
+	// IMMEDIATELY expire this neighbor — #4596). The schema validators on
+	// transmit-interval / hold-multiplier keep operator input in a sane
+	// range; this clamp is the defensive backstop for any in-range-but-large
+	// product (e.g. 16384s × 4 = 65536) and for constructed callers.
+	if seconds < 0 {
+		seconds = 0
+	}
+	if seconds > 0xffff {
+		seconds = 0xffff
+	}
 	val := make([]byte, 2)
 	binary.BigEndian.PutUint16(val, uint16(seconds))
 	return val

@@ -62,6 +62,24 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #4594 class-of-service forwarding-class queue-range gate. Strict on
+	// commit / commit-check (hard-reject a queue outside 0..255, which the
+	// userspace helper deserializes via a checked u8::try_from and
+	// fail-closes the WHOLE CoS snapshot on — CosQueueIdOutOfRange #2410 —
+	// while silently keeping stale CoS forwarding state). Lenient on load /
+	// peer-sync (warn so an already-persisted config that only warned +
+	// committed under an older binary, or a peer-synced config, still boots
+	// — #1960 no-brick; the dataplane's CosQueueIdOutOfRange fail-close is
+	// the stale-but-safe backstop on that boot).
+	if err := validateClassOfServiceForwardingClassQueueStrict(cfg.ClassOfService); err != nil {
+		if opts.lenientCoSForwardingClassQueue {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("class-of-service forwarding-class queue (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #1956 device-map cross-entry validation. Strict on commit /
 	// commit-check (hard-reject duplicate names/PCI/MAC, RETH key-mac,
 	// FPC/node misalignment); lenient on load / peer-sync (warn so an

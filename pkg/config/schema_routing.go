@@ -582,9 +582,18 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 		"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 			"disable": {desc: "Disable LLDP", children: nil},
 		}},
-		"transmit-interval": {desc: "Transmit interval", args: 1, placeholder: "<seconds>", children: nil},
-		"hold-multiplier":   {desc: "Hold multiplier", args: 1, placeholder: "<multiplier>", children: nil},
-		"disable":           {desc: "Disable LLDP", children: nil},
+		// #4596: bound to the IEEE 802.1AB LLDP-MIB ranges Junos also
+		// enforces — lldpMessageTxInterval (5..32768s) and
+		// lldpMessageTxHoldMultiplier (2..10). Their product feeds the LLDP
+		// TTL TLV; encodeTTL additionally clamps to 65535 so even the
+		// in-range extreme (32768 × 10) cannot wrap the uint16 wire value.
+		"transmit-interval": {desc: "Transmit interval", args: 1, placeholder: "<seconds>",
+			valueType: ValueInteger, valueDesc: "LLDP transmit interval in seconds (IEEE 802.1AB msgTxInterval, 5..32768)",
+			validator: ValidateInteger(5, 32768), children: nil},
+		"hold-multiplier": {desc: "Hold multiplier", args: 1, placeholder: "<multiplier>",
+			valueType: ValueInteger, valueDesc: "LLDP TTL hold multiplier (IEEE 802.1AB msgTxHold, 2..10)",
+			validator: ValidateInteger(2, 10), children: nil},
+		"disable": {desc: "Disable LLDP", children: nil},
 	}},
 }}
 

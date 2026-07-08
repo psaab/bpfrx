@@ -280,6 +280,21 @@ type compileOpts struct {
 	// Same doctrine as lenientSchedulerMapRef.
 	lenientCoSLossPriority bool
 
+	// lenientCoSForwardingClassQueue (#4594) downgrades the
+	// class-of-service forwarding-class queue-range check
+	// (validateClassOfServiceForwardingClassQueueStrict) from a hard
+	// error to a warning on the tolerant load / peer-sync paths. An
+	// out-of-range queue (queue < 0 || queue > 255) was warn-only at
+	// commit before this gate (ValidateConfig only), so it COMMITTED —
+	// while the userspace helper fail-closes the WHOLE CoS snapshot on
+	// CosQueueIdOutOfRange (#2410) and keeps its STALE CoS forwarding
+	// state, a config/dataplane divergence the operator cannot see.
+	// Commit / commit-check now reject it loudly; a config persisted by
+	// an older binary — or synced from a peer — must still boot through
+	// it (warn) rather than fail-closed-on-load (#1960 class). Same
+	// doctrine as lenientCoSLossPriority.
+	lenientCoSForwardingClassQueue bool
+
 	// lenientIPsecGatewayRefs (#2074) downgrades the IPsec VPN -> IKE
 	// gateway cross-reference check from a hard error to a warning on the
 	// tolerant load / peer-sync paths (CompileConfigLenient /
@@ -1554,6 +1569,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
 		lenientCoSLossPriority:                 true,
+		lenientCoSForwardingClassQueue:         true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
@@ -1801,6 +1817,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecPolicyProposalRef:          true,
 		lenientSchedulerMapRef:                 true,
 		lenientCoSLossPriority:                 true,
+		lenientCoSForwardingClassQueue:         true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,

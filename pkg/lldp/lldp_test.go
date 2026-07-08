@@ -125,6 +125,41 @@ func TestEncodeTTL(t *testing.T) {
 	}
 }
 
+// #4596: encodeTTL must clamp a computed TTL to the 16-bit wire maximum
+// (65535) so a large transmit-interval × hold-multiplier product cannot wrap
+// uint16 back to a small/zero TTL, which would make every peer IMMEDIATELY
+// expire this neighbor. RED on revert: without the clamp, uint16(65536) is 0
+// and uint16(160000) is 28928 (both wrong).
+func TestEncodeTTL_ClampsOverflow_4596(t *testing.T) {
+	cases := []struct {
+		name    string
+		seconds int
+		want    uint16
+	}{
+		// transmit-interval 16384 × default hold-multiplier 4 = 65536,
+		// which wraps to exactly 0 without the clamp — the issue's headline
+		// "immediately expire the neighbor" scenario.
+		{"16384x4-wraps-to-zero", 16384 * 4, 0xffff},
+		// The in-range IEEE extreme: 32768 × 10 = 327680.
+		{"ieee-extreme", 32768 * 10, 0xffff},
+		{"exact-max", 0xffff, 0xffff},
+		{"just-over-max", 0x10000, 0xffff},
+		{"negative-guard", -1, 0},
+		{"in-range-passthrough", 120, 120},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := binary.BigEndian.Uint16(encodeTTL(tc.seconds))
+			if got != tc.want {
+				t.Fatalf("encodeTTL(%d) TTL = %d, want %d", tc.seconds, got, tc.want)
+			}
+			if got == 0 && tc.want != 0 {
+				t.Fatal("TTL wrapped to 0 — neighbors would immediately expire")
+			}
+		})
+	}
+}
+
 func TestBuildFrame(t *testing.T) {
 	mac := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
 	frame, err := BuildFrame(mac, "trust0", 120, "xpf", "stateful firewall")

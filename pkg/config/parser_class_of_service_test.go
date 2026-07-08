@@ -1458,7 +1458,13 @@ system {
 	}
 }
 
-func TestValidateClassOfServiceQueueRangeWarning(t *testing.T) {
+// TestValidateClassOfServiceQueueRange pins the #4594 behavior split: an
+// out-of-range forwarding-class queue is HARD-REJECTED on the strict commit /
+// commit-check path (it used to only warn + commit, while the userspace helper
+// fail-closed the whole CoS snapshot on CosQueueIdOutOfRange and kept stale
+// state), but DOWNGRADED to a warning on the tolerant load / peer-sync path so
+// an already-persisted config still boots (#1960 no-brick).
+func TestValidateClassOfServiceQueueRange(t *testing.T) {
 	input := `class-of-service {
     forwarding-classes {
         queue 300 invalid-class;
@@ -1473,13 +1479,19 @@ system {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
+	// Strict commit path: hard-reject.
+	if _, err := CompileConfig(tree); err == nil ||
+		!strings.Contains(err.Error(), `forwarding-class "invalid-class" uses out-of-range queue 300`) {
+		t.Fatalf("strict commit must reject out-of-range queue 300, got: %v", err)
+	}
+	// Tolerant load / peer-sync path: warn, do not brick.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("compile error: %v", err)
+		t.Fatalf("lenient load must not brick on out-of-range queue: %v", err)
 	}
 	warnings := strings.Join(cfg.Warnings, "\n")
 	if !strings.Contains(warnings, `forwarding-class "invalid-class" uses out-of-range queue 300`) {
-		t.Fatalf("expected queue range warning, got: %s", warnings)
+		t.Fatalf("expected queue range warning on tolerant path, got: %s", warnings)
 	}
 }
 

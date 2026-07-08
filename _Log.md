@@ -40591,3 +40591,38 @@ top.
   single-key non-regression, non-existent multi-key path errors).
 - **File(s)**: pkg/config/ast.go, pkg/configstore/store_command.go,
   pkg/configstore/store_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-07 (#4594)
+- **Action**: class-of-service forwarding-class queue outside 0..255 was
+  warn-only (`ValidateConfig`) and COMMITTED, while the userspace helper
+  deserializes the queue id via a checked `u8::try_from` and fail-closes
+  the WHOLE CoS snapshot on `CosQueueIdOutOfRange` (#2410) — silently
+  keeping stale CoS forwarding state (config/dataplane divergence). Added
+  `validateClassOfServiceForwardingClassQueueStrict` and wired it into
+  `runUniformGates`: HARD-REJECT on strict commit / commit-check, downgrade
+  to a warning on the tolerant load / peer-sync path
+  (`lenientCoSForwardingClassQueue`, #1960 no-brick). Mirrors the fairness
+  rss-expectation queue reject and the sibling CoS strict gates.
+  RED-on-revert tests: strict rejects queue 999, lenient warns not bricks,
+  valid queues (0/7/255) commit clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict_cos.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_cos_fc_queue_4594_test.go,
+  pkg/config/parser_class_of_service_test.go, docs/config-schema.md,
+  _Log.md
+
+- **Timestamp**: 2026-07-07 (#4596)
+- **Action**: `protocols lldp transmit-interval` / `hold-multiplier` were
+  untyped (bare `Atoi`, no validator), so `transmit-interval 16384` ×
+  default hold-multiplier 4 = 65536 wrapped `uint16(seconds)` in
+  `encodeTTL` to a TTL of 0, immediately expiring the neighbor. Added
+  `ValidateInteger` validators bounding the two leaves to the IEEE 802.1AB
+  LLDP-MIB / Junos ranges (transmit-interval 5..32768, hold-multiplier
+  2..10) AND a defensive `[0, 0xffff]` clamp in `encodeTTL` (matching the
+  standard's `txTTL = min(65535, msgTxInterval × msgTxHold)`). RED-on-revert
+  tests: schema rejects out-of-range interval/multiplier, in-range commits,
+  clamp caps a computed TTL > 65535 (and the 16384×4 wrap-to-0 case).
+- **File(s)**: pkg/config/schema_routing.go,
+  pkg/config/schema_lldp_ttl_4596_test.go, pkg/lldp/lldp.go,
+  pkg/lldp/lldp_test.go, docs/config-schema.md, _Log.md
