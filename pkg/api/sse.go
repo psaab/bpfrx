@@ -45,10 +45,17 @@ func (s *Server) eventStreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setSSEHeaders(w)
-
-	sub := s.eventBuf.Subscribe(128)
+	// Bound concurrent SSE subscribers before switching to event-stream
+	// (#4484 L-2): a nil return means the cap is reached — respond 503 while
+	// we can still send a normal error (after setSSEHeaders we no longer can).
+	sub := s.eventBuf.TrySubscribe(128)
+	if sub == nil {
+		writeError(w, http.StatusServiceUnavailable, "too many concurrent event subscribers")
+		return
+	}
 	defer sub.Close()
+
+	setSSEHeaders(w)
 
 	var seq uint64
 	ctx := r.Context()
@@ -92,10 +99,16 @@ func (s *Server) logStreamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setSSEHeaders(w)
-
-	sub := s.eventBuf.Subscribe(128)
+	// Bound concurrent SSE subscribers before switching to event-stream
+	// (#4484 L-2); see eventStreamHandler for the rationale.
+	sub := s.eventBuf.TrySubscribe(128)
+	if sub == nil {
+		writeError(w, http.StatusServiceUnavailable, "too many concurrent event subscribers")
+		return
+	}
 	defer sub.Close()
+
+	setSSEHeaders(w)
 
 	var seq uint64
 	ctx := r.Context()

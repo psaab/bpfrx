@@ -19,11 +19,22 @@ reports.
   `n <= 0` as "return nothing" — a count argument never reaches
   `make([]EventRecord, n)` with a negative len (which panics).
 - `Subscription` — `eventbuf.go`. A consumer of the event ring.
-  `Close()` unsubscribes AND closes `C` (#3384): a consumer ranging over
-  `C` until it closes terminates rather than blocking forever. The
-  unsubscribe runs first under the fan-out write lock (so a concurrent
-  `Add` can never send on the closed channel) and `sync.Once` makes a
-  double `Close` safe. `ParseSeverityStrict` / `ParseCategoryStrict`
+  `Subscribe(bufSize)` never fails and is the entry point for the TRUSTED,
+  inherently bounded internal consumers (gRPC event stream, CLI monitor).
+  The UNTRUSTED REST SSE surface (`/api/v1/events/stream`,
+  `/api/v1/logs/stream`) must use `TrySubscribe(bufSize)`, which returns
+  `nil` once the live subscriber count reaches `defaultMaxSubscribers` (64)
+  — the REST handler then responds `503` (#4484 L-2). Every `Add` fans out
+  O(N) over the subscriber set and each subscription holds a buffered
+  channel, so an unbounded set is a memory + per-event-CPU DoS vector on the
+  untrusted surface; the cap mirrors `metricsMaxInFlight` (#4162). The cap
+  counts ALL subscribers uniformly (trusted `Subscribe` callers included),
+  so the trusted set (few, operator-driven) shrinks the untrusted headroom
+  but is never itself rejected. `Close()` unsubscribes AND closes `C`
+  (#3384): a consumer ranging over `C` until it closes terminates rather
+  than blocking forever. The unsubscribe runs first under the fan-out write
+  lock (so a concurrent `Add` can never send on the closed channel) and
+  `sync.Once` makes a double `Close` safe. `ParseSeverityStrict` / `ParseCategoryStrict`
   (`syslog.go`) are the fail-closed parse variants — they return an error
   on an unknown token instead of `0` ("no filter"); the SSE log/event
   stream uses them so a typo'd query rejects rather than streaming

@@ -256,6 +256,35 @@ func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 	writeOK(w, buffers)
 }
 
+// apiSchedulePowerAction runs `systemctl <arg>` after a 1s grace so the HTTP
+// response reaches the client first. It is a package var so a test can drive
+// the reboot/halt REST verbs (to assert the #4108 F8 / #4484 L-1 journal
+// wiring) WITHOUT actually taking the host down. Mirrors the grpcapi
+// schedulePowerAction seam.
+var apiSchedulePowerAction = func(systemctlArg string) {
+	go func() {
+		time.Sleep(1 * time.Second)
+		// context.Background(): a confirmed power action must not be
+		// cancelled by client disconnect. Errors ignored as before.
+		runTimeout(context.Background(), "systemctl", systemctlArg)
+	}()
+}
+
+// logSystemAction records a destructive maintenance action to the configstore
+// audit journal BEFORE it executes (#4108 F8, #4484 L-1). The gRPC
+// SystemAction handler already journals reboot/halt/power-off/zeroize; the
+// REST path did not, so a reboot/halt issued over the REST API left NO durable
+// attributable trail (the journald slog line does not survive the reboot).
+// Best-effort: a nil store (standalone build / unit test without a store) is
+// skipped, and the store layer never blocks the confirmed action on a journal
+// write failure.
+func (s *Server) logSystemAction(action string) {
+	if s.store == nil {
+		return
+	}
+	s.store.LogSystemAction(action)
+}
+
 func (s *Server) systemActionHandler(w http.ResponseWriter, r *http.Request) {
 	var req SystemActionRequest
 	if !decodeJSONBody(w, r, &req) {
@@ -264,24 +293,36 @@ func (s *Server) systemActionHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Action {
 	case "reboot":
-		go func() {
-			time.Sleep(1 * time.Second)
-			// context.Background(): a confirmed power action must not be
-			// cancelled by client disconnect. Errors ignored as before.
-			runTimeout(context.Background(), "systemctl", "reboot")
-		}()
+		// Journal BEFORE the box goes down: the fsynced record survives the
+		// reboot even though the journald line does not (#4108 F8 / #4484 L-1).
+		s.logSystemAction("reboot")
+		apiSchedulePowerAction("reboot")
 		writeOK(w, map[string]string{"message": "System going down for reboot NOW!"})
 
 	case "halt":
-		go func() {
-			time.Sleep(1 * time.Second)
-			// context.Background(): a confirmed power action must not be
-			// cancelled by client disconnect. Errors ignored as before.
-			runTimeout(context.Background(), "systemctl", "halt")
-		}()
+		s.logSystemAction("halt")
+		apiSchedulePowerAction("halt")
 		writeOK(w, map[string]string{"message": "System halting NOW!"})
 
+	case "clear-config-lock":
+		// Self-recover a wedged candidate-config lock over REST (parity with
+		// the gRPC SystemAction verb, #4484 L-1). Non-destructive: it only
+		// force-exits the configure session that holds the lock, so an
+		// operator can recover from an H-3 / #4476 lock wedge without shell
+		// access to the box.
+		if s.store == nil {
+			writeError(w, http.StatusServiceUnavailable, "config store not available")
+			return
+		}
+		holder, locked := s.store.ConfigHolder()
+		if !locked {
+			writeOK(w, map[string]string{"message": "No configuration lock held"})
+			return
+		}
+		s.store.ForceExitConfigure()
+		writeOK(w, map[string]string{"message": fmt.Sprintf("Configuration lock cleared (was held by %s)", holder)})
+
 	default:
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action: %s (use 'reboot' or 'halt')", req.Action))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action: %s (use 'reboot', 'halt', or 'clear-config-lock')", req.Action))
 	}
 }

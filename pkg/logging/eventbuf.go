@@ -70,8 +70,9 @@ type EventBuffer struct {
 	count int    // number of events stored
 	seq   uint64 // monotonically increasing sequence number
 
-	subMu sync.RWMutex
-	subs  map[*Subscription]struct{}
+	subMu   sync.RWMutex
+	subs    map[*Subscription]struct{}
+	maxSubs int // cap on concurrent subscribers (0 = unbounded)
 }
 
 // Subscription receives new events from an EventBuffer.
@@ -101,6 +102,18 @@ func (s *Subscription) Close() {
 // index-out-of-range / divide-by-zero on the first event (#3342).
 const defaultEventBufferSize = 1000
 
+// defaultMaxSubscribers bounds the number of concurrent event-stream
+// subscribers (#4484 L-2). Every Add fans out O(N) over the subscriber set
+// and each subscriber holds a buffered channel, so an unbounded set is a
+// memory + per-event-CPU DoS vector — chiefly via the untrusted REST SSE
+// surface (/events/stream, /logs/stream), which can open many connections.
+// This mirrors metricsMaxInFlight (#4162), which bounds concurrent /metrics
+// scrapes. The cap counts ALL subscribers uniformly; the trusted internal
+// consumers (gRPC event stream, CLI monitor) use Subscribe (never rejected)
+// and are few, so the untrusted REST path is what the cap actually gates via
+// TrySubscribe.
+const defaultMaxSubscribers = 64
+
 // NewEventBuffer creates a new event buffer with the given capacity. A
 // non-positive size is clamped to defaultEventBufferSize so the ring is
 // always usable; Add must never index an empty buffer or divide by zero.
@@ -109,9 +122,10 @@ func NewEventBuffer(size int) *EventBuffer {
 		size = defaultEventBufferSize
 	}
 	return &EventBuffer{
-		buf:  make([]EventRecord, size),
-		size: size,
-		subs: make(map[*Subscription]struct{}),
+		buf:     make([]EventRecord, size),
+		size:    size,
+		subs:    make(map[*Subscription]struct{}),
+		maxSubs: defaultMaxSubscribers,
 	}
 }
 
@@ -139,6 +153,10 @@ func (eb *EventBuffer) Add(rec EventRecord) {
 
 // Subscribe returns a Subscription that receives new events.
 // Call Close() on the subscription when done.
+//
+// Subscribe never fails: it is the entry point for the TRUSTED, inherently
+// bounded internal consumers (gRPC event stream, CLI monitor). The untrusted
+// REST SSE surface must use TrySubscribe, which enforces the concurrency cap.
 func (eb *EventBuffer) Subscribe(bufSize int) *Subscription {
 	if bufSize < 1 {
 		bufSize = 64
@@ -148,6 +166,30 @@ func (eb *EventBuffer) Subscribe(bufSize int) *Subscription {
 		eb: eb,
 	}
 	eb.subMu.Lock()
+	eb.subs[sub] = struct{}{}
+	eb.subMu.Unlock()
+	return sub
+}
+
+// TrySubscribe is Subscribe with a concurrency cap (#4484 L-2): it returns nil
+// when the live subscriber count has reached maxSubs, so the untrusted REST
+// SSE surface (/events/stream, /logs/stream) cannot grow the fan-out set — and
+// its per-event O(N) cost — without bound. Callers MUST handle a nil return
+// (the REST handlers respond 503). Trusted internal callers use Subscribe,
+// which never fails but still counts toward the cap here.
+func (eb *EventBuffer) TrySubscribe(bufSize int) *Subscription {
+	if bufSize < 1 {
+		bufSize = 64
+	}
+	sub := &Subscription{
+		C:  make(chan EventRecord, bufSize),
+		eb: eb,
+	}
+	eb.subMu.Lock()
+	if eb.maxSubs > 0 && len(eb.subs) >= eb.maxSubs {
+		eb.subMu.Unlock()
+		return nil
+	}
 	eb.subs[sub] = struct{}{}
 	eb.subMu.Unlock()
 	return sub

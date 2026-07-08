@@ -4084,26 +4084,37 @@ func TestRouteFilterUptoFRR(t *testing.T) {
 		}
 	})
 
-	// upto /N where N < prefix-len (e.g. upto /4 on a /8) is nonsensical
-	// in Junos; we degrade to the orlonger default rather than emit an
-	// FRR-invalid "le 4" (le < prefix-len is rejected). Locks the
-	// sub-prefix-length degrade branch (SMR #2102 coverage gap).
-	t.Run("v4_upto_below_plen_degrades", func(t *testing.T) {
+	// upto /N where N < prefix-len (e.g. upto /4 on a /8) is nonsensical in
+	// Junos (an EMPTY length range). It must fail-CLOSED — emit NO prefix-list
+	// line (match-nothing) — NOT the open-ended "le 32" the earlier #2102 code
+	// degraded to, which silently widened the match to base+all-more-specifics
+	// (fail-open on a route-filter that gates route accept/redistribute).
+	// Aligns with the #2525 fail-closed posture the sibling invalid
+	// match-types already use (#4484 L-12). Skip emits no FRR-invalid line, so
+	// the #2102 frr-reload-brick concern does not apply.
+	t.Run("v4_upto_below_plen_fail_closed", func(t *testing.T) {
 		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 4))
-		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 32\n") {
-			t.Errorf("UptoLen 4 (< plen 8) must degrade to default 'le 32', got:\n%s", got)
+		if strings.Contains(got, "permit 10.0.0.0/8") {
+			t.Errorf("UptoLen 4 (< plen 8) must emit NO permit line (fail-closed), got:\n%s", got)
+		}
+		if strings.Contains(got, "le 32") {
+			t.Errorf("must NOT fail-open to 'le 32', got:\n%s", got)
 		}
 		if strings.Contains(got, "le 4") {
 			t.Errorf("must NOT emit FRR-invalid 'le 4' (le < prefix-len), got:\n%s", got)
 		}
 	})
 
-	// upto /N where N > family max (e.g. /40 on a v4 /8) degrades to the
-	// default le 32 — never an out-of-range "le 40".
-	t.Run("v4_upto_above_maxlen_degrades", func(t *testing.T) {
+	// upto /N where N > family max (e.g. /40 on a v4 /8) is also nonsensical;
+	// it must fail-CLOSED (no line) rather than degrade to the open-ended
+	// "le 32" (#4484 L-12).
+	t.Run("v4_upto_above_maxlen_fail_closed", func(t *testing.T) {
 		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 40))
-		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 32\n") {
-			t.Errorf("UptoLen 40 (> v4 max 32) must degrade to 'le 32', got:\n%s", got)
+		if strings.Contains(got, "permit 10.0.0.0/8") {
+			t.Errorf("UptoLen 40 (> v4 max 32) must emit NO permit line (fail-closed), got:\n%s", got)
+		}
+		if strings.Contains(got, "le 32") {
+			t.Errorf("must NOT fail-open to 'le 32', got:\n%s", got)
 		}
 		if strings.Contains(got, "le 40") {
 			t.Errorf("must NOT emit out-of-range 'le 40', got:\n%s", got)
