@@ -825,6 +825,22 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             None => {
                                 build_failed = true;
                                 fallback_to_slow_path = true;
+                                // #2562: attribute a NAT64 fragment fail-closed
+                                // drop (a non-first fragment, or a real
+                                // ICMP/ICMPv6 fragment whose checksum covers the
+                                // whole datagram) to `nat64_frag_dropped`. Only
+                                // fires when the build-`None` is actually a
+                                // fragment (the SSOT predicate mirrors the
+                                // translator guards) — an unrelated build
+                                // failure is not counted here.
+                                if is_nat64
+                                    && crate::nat64::frame_is_nat64_fragment_drop(
+                                        source_frame,
+                                        request.meta.addr_family as i32,
+                                    )
+                                {
+                                    counters.record_nat64_frag_dropped();
+                                }
                             }
                         },
                     }
@@ -1130,6 +1146,18 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                             None => {
                                 build_failed = true;
                                 fallback_to_slow_path = true;
+                                // #2562: attribute a NAT64 fragment fail-closed
+                                // drop to `nat64_frag_dropped` (same SSOT
+                                // predicate + rationale as the direct/in-place
+                                // copy path above).
+                                if is_nat64
+                                    && crate::nat64::frame_is_nat64_fragment_drop(
+                                        source_frame,
+                                        request.meta.addr_family as i32,
+                                    )
+                                {
+                                    counters.record_nat64_frag_dropped();
+                                }
                             }
                         }
                     }

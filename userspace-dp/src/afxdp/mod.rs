@@ -523,6 +523,18 @@ pub(in crate::afxdp) struct BatchCounters {
     // `NAT64 pool-exhausted drops` operator counter, the transient sibling
     // of `nat64_no_source_pool` (config/empty).
     nat64_pool_exhausted: u64,
+    // #2562: fail-closed NAT64 FRAGMENT drops — a datagram was dropped because
+    // it is a fragment NAT64 cannot safely translate: a non-first fragment
+    // (offset > 0, any protocol — no L4 header to translate) or a real fragment
+    // (MF=1 or offset > 0) carrying ICMP/ICMPv6 (the ICMP checksum covers the
+    // whole datagram and cannot be recomputed from a single fragment). Bumped
+    // from the TX dispatcher when `build_nat64_forwarded_frame` returns `None`
+    // and `nat64::frame_is_nat64_fragment_drop` attributes it. Flushed to
+    // BindingLiveState.nat64_frag_dropped and surfaced as the `NAT64 fragment
+    // drops` operator counter. The stateful frag-association cache that would
+    // let real fragments traverse end-to-end (#3291 stage 4) is deferred, so
+    // this is the observable-drop half of #2562.
+    nat64_frag_dropped: u64,
     // #4477: source-NAT allocation failures — a source-NAT rule matched but no
     // translated mapping could be allocated (missing/empty/invalid pool,
     // exhausted port allocator, wrong family, or a non-first fragment on a
@@ -657,6 +669,18 @@ impl BatchCounters {
         }
     }
 
+    /// #2562: record a fail-closed NAT64 fragment drop (a non-first fragment or
+    /// a real ICMP/ICMPv6 fragment that cannot be safely translated). Bumped
+    /// from the TX dispatcher when `build_nat64_forwarded_frame` returns `None`
+    /// and `nat64::frame_is_nat64_fragment_drop` attributes the `None` to a
+    /// fragment. Batched like the sibling nat64 drop counters and flushed to
+    /// `BindingLiveState.nat64_frag_dropped`.
+    #[inline]
+    pub(in crate::afxdp) fn record_nat64_frag_dropped(&mut self) {
+        self.touched = true;
+        self.nat64_frag_dropped += 1;
+    }
+
     fn flush(&mut self, live: &BindingLiveState) {
         if !self.touched {
             return;
@@ -736,6 +760,13 @@ impl BatchCounters {
             live.nat64_pool_exhausted
                 .fetch_add(self.nat64_pool_exhausted, Ordering::Relaxed);
             self.nat64_pool_exhausted = 0;
+        }
+        // #2562: fail-closed NAT64 fragment-drop tally, batched like the sibling
+        // nat64 drop counters above.
+        if self.nat64_frag_dropped != 0 {
+            live.nat64_frag_dropped
+                .fetch_add(self.nat64_frag_dropped, Ordering::Relaxed);
+            self.nat64_frag_dropped = 0;
         }
         // #4477: source-NAT allocation-failure tally.
         if self.nat_alloc_fail != 0 {

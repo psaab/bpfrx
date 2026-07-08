@@ -2471,6 +2471,15 @@ type BindingStatus struct {
 	// the Rust serde `default` keep cross-version wire safety (an older helper
 	// omits it → 0).
 	Nat64PoolExhausted uint64 `json:"nat64_pool_exhausted,omitempty"`
+	// #2562: fail-closed NAT64 fragment drops — a datagram dropped because it is
+	// a fragment NAT64 cannot safely translate: a non-first fragment (no L4
+	// header) or a real ICMP/ICMPv6 fragment (the ICMP checksum covers the whole
+	// datagram and cannot be recomputed from a single fragment). The
+	// observable-drop half of #2562; the stateful frag-association cache (#3291
+	// stage 4) that would let real fragments traverse end-to-end is deferred.
+	// omitempty + the Rust serde `default` keep cross-version wire safety (an
+	// older helper omits it → 0).
+	Nat64FragDropped uint64 `json:"nat64_frag_dropped,omitempty"`
 	// #4477: source-NAT allocation failures (a source-NAT rule matched but no
 	// translated mapping could be allocated — missing/empty/invalid/exhausted
 	// pool, wrong family, or a non-first fragment on a port-translating rule);

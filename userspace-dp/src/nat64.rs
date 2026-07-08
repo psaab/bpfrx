@@ -1111,6 +1111,79 @@ fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
     None
 }
 
+/// #2562: does this L3-relative IPv6 packet trigger the NAT64 v6→v4
+/// fail-closed FRAGMENT drop in [`write_v6_to_v4_into`]?
+///
+/// True for a non-first fragment (offset > 0, ANY protocol) or a real fragment
+/// (Fragment Header present with MF=1 or offset > 0) carrying ICMPv6. An ATOMIC
+/// fragment (Fragment Header present, MF=0, offset 0 — RFC 6946) and a
+/// non-fragmented datagram return false. This mirrors the drop conditions of
+/// `write_v6_to_v4_into` (the `ipv6_is_non_first_fragment` drop plus the ICMPv6
+/// real-fragment guard) and is the single source of truth the
+/// `nat64_frag_dropped` counter reads to attribute a translate-returned-`None`
+/// to a fragment drop (vs an unrelated build failure).
+pub(crate) fn v6_to_v4_is_fragment_drop(packet: &[u8]) -> bool {
+    let Some(info) = ipv6_fragment_header(packet) else {
+        return false; // no Fragment Header → not a fragment
+    };
+    if info.offset_units != 0 {
+        return true; // non-first fragment, any protocol
+    }
+    if !info.more {
+        return false; // atomic fragment (MF=0, offset 0) — still translates
+    }
+    // First fragment (MF=1, offset 0): dropped only when it carries ICMPv6.
+    matches!(ipv6_l4_offset_and_protocol(packet), Some((_, PROTO_ICMPV6)))
+}
+
+/// #2562: v4→v6 twin of [`v6_to_v4_is_fragment_drop`] for the reverse NAT64
+/// direction, mirroring the drop conditions of [`write_v4_to_v6_into`].
+///
+/// True for a non-first IPv4 fragment (offset > 0, ANY protocol) or a real
+/// fragment (MF=1 or offset > 0) carrying ICMP. An atomic fragment
+/// (MF=0, offset 0) and a non-fragmented datagram return false.
+pub(crate) fn v4_to_v6_is_fragment_drop(packet: &[u8]) -> bool {
+    if packet.len() < 20 {
+        return false;
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return false;
+    }
+    let frag_word = u16::from_be_bytes([packet[6], packet[7]]);
+    let more = (frag_word & 0x2000) != 0;
+    let offset = frag_word & 0x1FFF;
+    if offset != 0 {
+        return true; // non-first fragment, any protocol
+    }
+    if !more {
+        return false; // atomic or non-fragmented
+    }
+    // First fragment (MF=1, offset 0): dropped only when it carries ICMP.
+    packet[9] == PROTO_ICMP
+}
+
+/// #2562: does this L2 frame trigger a NAT64 fail-closed fragment drop for the
+/// given ingress address family (`AF_INET6` → forward v6→v4, `AF_INET` →
+/// reverse v4→v6)?
+///
+/// Used by the TX dispatcher to attribute a NAT64 build-returned-`None` to the
+/// `nat64_frag_dropped` counter without re-deriving the drop reason inline.
+/// Returns false for a malformed/short frame or an unrecognized family.
+pub(crate) fn frame_is_nat64_fragment_drop(frame: &[u8], addr_family: i32) -> bool {
+    let Some(l3) = frame_l3_offset(frame) else {
+        return false;
+    };
+    let Some(packet) = frame.get(l3..) else {
+        return false;
+    };
+    match addr_family {
+        libc::AF_INET6 => v6_to_v4_is_fragment_drop(packet),
+        libc::AF_INET => v4_to_v6_is_fragment_drop(packet),
+        _ => false,
+    }
+}
+
 /// Allocation-free IPv6→IPv4 translation: write the translated IPv4 L3 packet
 /// directly into `dst` and return the number of bytes written (#2211).
 ///
@@ -1163,6 +1236,27 @@ pub(crate) fn write_v6_to_v4_into(
         PROTO_TCP | PROTO_UDP => l4_protocol,
         _ => return None, // Unsupported protocol
     };
+
+    // #2562 fail-closed: a REAL fragment (Fragment Header present with MF=1 OR
+    // a non-zero offset) carrying ICMPv6 CANNOT be translated. The ICMPv4
+    // checksum covers the WHOLE ICMP message, but a single fragment holds only
+    // a slice of it, so `translate_icmpv6_message_to_icmpv4` below would
+    // recompute the checksum over just this fragment's bytes and emit a FIRST
+    // fragment with a wrong checksum that the receiver discards. A non-first
+    // fragment (offset > 0, any protocol) is already dropped above; this
+    // additionally drops the FIRST fragment (MF=1, offset 0) of an ICMPv6
+    // datagram. An ATOMIC fragment (Fragment Header present, MF=0, offset 0 —
+    // RFC 6946) is NOT a real fragment: it carries the complete ICMP message
+    // and still translates normally. The stateful frag-association cache that
+    // would let real ICMP fragments traverse end-to-end via reassembly is the
+    // deferred principled fix (#2562 / #3291 stage 4).
+    if l4_protocol == PROTO_ICMPV6 {
+        if let Some(info) = ipv6_fragment_header(packet) {
+            if info.more || info.offset_units != 0 {
+                return None;
+            }
+        }
+    }
 
     // The L4 region starts at the walked offset and ends at the IPv6
     // payload boundary (`40 + payload_len`). The ext-header bytes between
@@ -1391,6 +1485,18 @@ pub(crate) fn write_v4_to_v6_into(
         return None;
     }
     let is_fragment = v4_more;
+    // #2562 fail-closed: a REAL fragment (MF=1 or offset > 0) carrying ICMP
+    // cannot be translated — the ICMPv6 checksum covers the WHOLE datagram, so
+    // `translate_icmpv4_message_to_icmpv6` over a single fragment's bytes would
+    // emit a FIRST fragment with a wrong checksum the receiver discards. A
+    // non-first fragment (offset > 0) is dropped above; this drops the FIRST
+    // fragment (MF=1, offset 0) of an ICMP datagram. An ATOMIC fragment
+    // (MF=0, offset 0) still translates. Symmetric with the v6→v4 ICMP-fragment
+    // guard; the stateful frag-association cache remains deferred (#2562 /
+    // #3291 stage 4).
+    if protocol == PROTO_ICMP && is_fragment {
+        return None;
+    }
     let v4_ident = u16::from_be_bytes([packet[4], packet[5]]);
     // RFC 7915 §4.5: a UDP fragment with a zero IPv4 checksum cannot be
     // translated — the IPv6 UDP checksum is mandatory and cannot be computed

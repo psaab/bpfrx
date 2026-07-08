@@ -457,6 +457,14 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// too small for the offered load (add capacity), distinct from the
     /// config/empty case in `nat64_no_source_pool` (fix config).
     pub(super) nat64_pool_exhausted: AtomicU64,
+    /// #2562: cumulative fail-closed NAT64 fragment drops — a datagram dropped
+    /// because it is a fragment NAT64 cannot safely translate (a non-first
+    /// fragment, or a real ICMP/ICMPv6 fragment whose checksum covers the whole
+    /// datagram). Surfaced as the `NAT64 fragment drops` operator counter. The
+    /// stateful frag-association cache (#3291 stage 4) that would let real
+    /// fragments traverse end-to-end is deferred, so this is the observable-drop
+    /// half of #2562.
+    pub(super) nat64_frag_dropped: AtomicU64,
     /// #4477: cumulative source-NAT allocation failures (rule matched, no
     /// translated mapping could be allocated — missing/empty/invalid/exhausted
     /// pool, wrong family, or a non-first fragment on a port-translating rule).
@@ -870,6 +878,7 @@ impl BindingLiveState {
             nat64_translations: AtomicU64::new(0),
             nat64_no_source_pool: AtomicU64::new(0),
             nat64_pool_exhausted: AtomicU64::new(0),
+            nat64_frag_dropped: AtomicU64::new(0),
             nat_alloc_fail: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),

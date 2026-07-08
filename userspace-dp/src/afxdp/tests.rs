@@ -9022,6 +9022,49 @@ fn record_nat64_source_failure_splits_exhaustion_from_config() {
     }
 }
 
+// #2562: the fail-closed NAT64 fragment-drop counter must flush
+// BatchCounters -> BindingLiveState -> snapshot the same way as the sibling
+// nat64 drop counters, so an operator can see fragmented-NAT64 drops and a
+// dropped flush/snapshot line is caught at build/test time.
+#[test]
+fn nat64_frag_dropped_flushes_to_live_and_snapshot() {
+    let live = BindingLiveState::new();
+    let mut batch = BatchCounters::default();
+    batch.touched = true;
+    batch.nat64_frag_dropped = 4;
+    batch.flush(&live);
+    assert_eq!(
+        batch.nat64_frag_dropped, 0,
+        "flush must zero the batched fragment-drop count"
+    );
+    let snap = live.snapshot();
+    assert_eq!(
+        snap.nat64_frag_dropped, 4,
+        "the live atomic + snapshot must carry the flushed fragment-drop count"
+    );
+    // The fragment drop is a distinct bucket from the pool counters.
+    assert_eq!(snap.nat64_no_source_pool, 0);
+    assert_eq!(snap.nat64_pool_exhausted, 0);
+}
+
+// #2562: `record_nat64_frag_dropped` bumps the fragment-drop counter and marks
+// the batch touched (so the value survives to the next flush).
+#[test]
+fn record_nat64_frag_dropped_bumps_counter() {
+    let mut batch = BatchCounters::default();
+    assert!(!batch.touched);
+    batch.record_nat64_frag_dropped();
+    batch.record_nat64_frag_dropped();
+    assert_eq!(
+        batch.nat64_frag_dropped, 2,
+        "each record must bump the fragment-drop counter"
+    );
+    assert!(batch.touched, "recording a drop must mark the batch touched");
+    // Sibling nat64 drop counters are untouched.
+    assert_eq!(batch.nat64_no_source_pool, 0);
+    assert_eq!(batch.nat64_pool_exhausted, 0);
+}
+
 // === #1873 R-C: blanket tunnel gate at the slow-path chokepoint ===
 
 fn tunnel_gate_test_fixture() -> (
