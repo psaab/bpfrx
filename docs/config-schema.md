@@ -88,6 +88,20 @@ load / peer-sync path downgrades to a warning
 committed under an older binary still boots (#1960 no-brick); the
 `CosQueueIdOutOfRange` fail-close is the stale-but-safe backstop on that boot.
 
+### `protocols lldp` TTL bounds (#4596)
+
+The `transmit-interval` and `hold-multiplier` leaves (`schema_routing.go`) now
+carry `ValidateInteger` typed-leaf validators bounding them to the IEEE 802.1AB
+LLDP-MIB ranges Junos also enforces — `lldpMessageTxInterval` **5..32768** and
+`lldpMessageTxHoldMultiplier` **2..10**. Their product feeds the 16-bit LLDP TTL
+TLV (`ttl = transmit-interval × hold-multiplier`); before this gate both leaves
+were untyped (bare `Atoi`), so e.g. `transmit-interval 16384` × default
+hold-multiplier 4 = 65536 wrapped `uint16` to a TTL of 0 and IMMEDIATELY expired
+the neighbor. `encodeTTL` (`pkg/lldp/lldp.go`) additionally clamps the computed
+TTL to `[0, 0xffff]` as a defensive backstop so even the in-range IEEE extreme
+(32768 × 10) — and any constructed caller — cannot wrap, matching the standard's
+own `txTTL = min(65535, msgTxInterval × msgTxHold)`.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,

@@ -40473,3 +40473,18 @@ top.
   pkg/config/compiler_cos_fc_queue_4594_test.go,
   pkg/config/parser_class_of_service_test.go, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-07-07 (#4596)
+- **Action**: `protocols lldp transmit-interval` / `hold-multiplier` were
+  untyped (bare `Atoi`, no validator), so `transmit-interval 16384` ×
+  default hold-multiplier 4 = 65536 wrapped `uint16(seconds)` in
+  `encodeTTL` to a TTL of 0, immediately expiring the neighbor. Added
+  `ValidateInteger` validators bounding the two leaves to the IEEE 802.1AB
+  LLDP-MIB / Junos ranges (transmit-interval 5..32768, hold-multiplier
+  2..10) AND a defensive `[0, 0xffff]` clamp in `encodeTTL` (matching the
+  standard's `txTTL = min(65535, msgTxInterval × msgTxHold)`). RED-on-revert
+  tests: schema rejects out-of-range interval/multiplier, in-range commits,
+  clamp caps a computed TTL > 65535 (and the 16384×4 wrap-to-0 case).
+- **File(s)**: pkg/config/schema_routing.go,
+  pkg/config/schema_lldp_ttl_4596_test.go, pkg/lldp/lldp.go,
+  pkg/lldp/lldp_test.go, docs/config-schema.md, _Log.md
