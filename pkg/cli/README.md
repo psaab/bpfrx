@@ -88,3 +88,13 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   scope), making it the poorest of the four match-policies surfaces. The
   rendering is shared via `printPolicyMatchIdentity`; it is a display-only change,
   no schema/wire impact.
+- #4497 (avo-001 F3): the local `test policy` (`testPolicy`) query echo now
+  surfaces the queried **ICMP/ICMPv6 type and code** in the trailing tuple
+  annotation. A `test policy … protocol icmp icmp-type 8 icmp-code 0` verdict
+  ends with `… [icmp type 8 code 0]` (previously the bare `[icmp]`), so the
+  operator reads the exact ICMP packet the simulator matched — the type/code the
+  parser already threads into `policymatch.Query.ICMPType/ICMPCode` (#3284) and
+  matches against an icmp-type-constrained application (junos-ping = type 8).
+  The annotation is rendered by the shared `formatQueryProtoTail` helper; a
+  non-ICMP query prints the bare `[proto]` exactly as before. Display-only; no
+  schema/wire impact.

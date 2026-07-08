@@ -282,11 +282,45 @@ func (c *CLI) testPolicy(args []string) error {
 	if dstPort > 0 {
 		fmt.Printf(":%d", dstPort)
 	}
-	if proto != "" {
-		fmt.Printf(" [%s]", proto)
+	// #4497 (avo-001 F3): echo the queried ICMP/ICMPv6 type and code alongside
+	// the protocol so the `test policy` verdict names the FULL tuple the
+	// simulator matched, not just the protocol. A
+	// `protocol icmp icmp-type 8 icmp-code 0` query is answered against the
+	// declared type/code (junos-ping = type 8, #3284); dropping the type/code
+	// from the echo hid WHICH ICMP packet was tested. A non-ICMP query (no
+	// type/code) prints the bare `[proto]` exactly as before.
+	if tail := formatQueryProtoTail(proto, icmpType, icmpCode); tail != "" {
+		fmt.Printf(" %s", tail)
 	}
 	fmt.Println()
 	return nil
+}
+
+// formatQueryProtoTail renders the trailing `[proto ...]` annotation for the
+// `test policy` query echo (#4497, avo-001 F3). It surfaces the queried
+// ICMP/ICMPv6 type and code so the operator reads the exact tuple the simulator
+// matched, not just the protocol name. A nil type/code is omitted; an empty
+// protocol with no type/code yields "" (nothing to annotate).
+func formatQueryProtoTail(proto string, icmpType, icmpCode *uint8) string {
+	if proto == "" && icmpType == nil && icmpCode == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	sep := ""
+	if proto != "" {
+		b.WriteString(proto)
+		sep = " "
+	}
+	if icmpType != nil {
+		fmt.Fprintf(&b, "%stype %d", sep, *icmpType)
+		sep = " "
+	}
+	if icmpCode != nil {
+		fmt.Fprintf(&b, "%scode %d", sep, *icmpCode)
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 // printPolicyMatchIdentity renders the shared PolicyID / RuleID / scope /
