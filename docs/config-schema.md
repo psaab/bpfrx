@@ -854,6 +854,33 @@ only on the strict commit path; `compileTreeLenient` downgrades it to a warning
 on `Store.Load` / `SyncApply`. Production tests:
 `schema_closedworld_ipsec_4313_test.go` (RED on revert of each flag).
 
+**More production flips — `system master-password` (#4578).** The
+`system master-password` subtree now sets `closedWorld:true`
+(`schema_system.go`) after the same leaf-completeness audit: xpf models AND
+consumes exactly one leaf, `pseudorandom-function` (the configstore
+at-rest-encryption PRF selector, read raw from the AST by
+`configstore.masterPasswordPRF`). Because `system` is open-world (#4515/X-1), a
+typo in the KEYWORD (`pseudo-random-fnuction`) previously committed clean —
+`masterPasswordPRF` then found no `pseudorandom-function` child, fell through to
+its empty default, and **at-rest config encryption was silently OFF** while the
+operator believed it was on. The flip rejects the keyword typo at strict commit.
+Paired with it, the `pseudorandom-function` value slot is now enum-validated
+(`ValidateMasterPasswordPRF`, `schema_validators.go`) against the exact selector
+set `configstore.prfHash` understands (`MasterPasswordPRFNames`, matched
+case-insensitively because prfHash lower-cases), so a typo in the VALUE
+(`bogus-prf`, or `hmac-sha256` missing the `2-`) is caught too rather than
+falling through prfHash's default and failing the persisted-tree write with an
+opaque error. This is deliberately SCOPED to the master-password subtree — the
+broader `system` open-world remediation (#4515/X-1) is untouched, because a
+blanket `system` closed-world would false-reject valid-but-unmodeled leaves (the
+#4191 class). A `pkg/configstore` drift test (`crypto_prf_sync_4578_test.go`)
+asserts `prfHash` honours every name the commit gate advertises, so the gate and
+the encrypt path cannot silently diverge. Production tests:
+`schema_master_password_prf_4578_test.go` (RED on revert of the closedWorld flag
+AND the value validator). As with the other flips, the reject fires only on the
+strict commit path; `compileTreeLenient` downgrades it to a warning on
+`Store.Load` / `SyncApply`.
+
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
 `closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
 Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;

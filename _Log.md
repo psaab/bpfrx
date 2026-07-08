@@ -40657,3 +40657,23 @@ top.
 - **File(s)**: pkg/config/schema_routing.go,
   pkg/config/schema_lldp_ttl_4596_test.go, pkg/lldp/lldp.go,
   pkg/lldp/lldp_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-07 (#4578)
+- **Action**: `system master-password pseudorandom-function <fn>` typo silently
+  disabled at-rest config encryption. `configstore.masterPasswordPRF` reads the
+  raw AST; because `system` is open-world (#4515/X-1) a KEYWORD typo
+  (`pseudo-random-fnuction`) committed clean → no `pseudorandom-function` child
+  → fell through to the empty default → encryption silently OFF. Scoped fix
+  (NOT a blanket `system` closed-world, which would false-reject unmodeled
+  leaves, #4191 class): flipped `master-password` to `closedWorld: true` (#4313
+  mechanism; leaf-complete — xpf models/consumes only `pseudorandom-function`)
+  so the keyword typo is rejected at commit, AND enum-validated the value slot
+  (`ValidateMasterPasswordPRF` against `MasterPasswordPRFNames`, case-insensitive
+  mirror of `configstore.prfHash`) so a VALUE typo (`bogus-prf`) is caught too.
+  RED-on-revert tests confirmed for BOTH guards; valid selectors + the
+  default-unset case still commit. A configstore drift test asserts prfHash
+  honours every advertised name.
+- **File(s)**: pkg/config/schema_system.go, pkg/config/schema_validators.go,
+  pkg/config/schema_master_password_prf_4578_test.go, pkg/configstore/crypto.go,
+  pkg/configstore/crypto_prf_sync_4578_test.go, docs/config-schema.md,
+  docs/next-features/master-password.md, _Log.md

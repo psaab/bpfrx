@@ -195,6 +195,13 @@ func deriveEncryptionKeyFromSalt(keyMaterial []byte, prf string, salt []byte) ([
 	return key, nil
 }
 
+// prfHash maps a master-password pseudorandom-function selector name to its
+// hash constructor. It is the SSOT for the name->hash.Hash mapping; the
+// accepted NAMES are mirrored in config.masterPasswordPRFNames, which the
+// commit-time gate (config.ValidateMasterPasswordPRF, #4578) uses to reject a
+// typo'd selector BEFORE it reaches this path. Adding a case here means adding
+// the name there too. Matching is case-insensitive (the commit gate mirrors
+// this ToLower).
 func prfHash(prf string) (func() hash.Hash, error) {
 	switch strings.ToLower(prf) {
 	case "juniper-prf1", "hmac-sha2-256", "sha256":
