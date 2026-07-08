@@ -42254,3 +42254,34 @@ top.
   pkg/daemon/daemon_ha_userspace_stream.go (new),
   pkg/daemon/daemon_ha_userspace_export.go (new),
   pkg/daemon/daemon_ha_userspace_readiness.go (new), _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: #2562 — NAT64 non-first-fragment stateful fragment-association
+  cache (the #3291 stage-4 cross-family cache). A non-first NAT64 fragment
+  carries no L4 header, so it could not find the flow/session holding the first
+  fragment's translation and was dropped fail-closed (#4617). This adds a
+  bounded, sharded, TTL+LRU fragment-association cache (`Nat64FragAssoc` on
+  `Nat64State`) keyed port-free by `(addr_family, src, dst, ip_id)` so all
+  fragments of one datagram co-locate. The FIRST fragment (offset 0, MF=1)
+  installs its `SessionDecision` on the cold path; a non-first fragment consults
+  it on the flowless arm and translates L3-only via new `write_v6_to_v4_nonfirst_into`
+  / `write_v4_to_v6_nonfirst_into` translators (payload copied verbatim, no L4
+  checksum, IPv4 ident = low-16 of the v6 ident / v6 ident = v4 ident
+  zero-extended — the SAME truncation the first fragment used, load-bearing for
+  reassembly). Cross-worker visible for free (cache rides the shared
+  `Arc<ForwardingState>`, threaded across config reloads by
+  `from_snapshots_with_previous` like the PortAllocator). Bounded (16 shards x 64
+  entries), ~2s TTL, LRU eviction, no payload bytes stored; NOT HA-synced. Miss
+  (reorder / orphan / eviction / cross-node failover) falls to the #4617
+  fail-closed drop. Forward (v6->v4) wired end-to-end; reverse (v4->v6)
+  translator + frame-builder in place with the reverse-reply poll-loop
+  install/consult deferred (recorded follow-up). Fragmented ICMP/ICMPv6 stays
+  the #4617 drop (checksum covers the whole datagram). RED-on-revert unit tests
+  (association-inherited both directions, ident-equality, no-association-dropped,
+  cache bounded, TTL evicts) + a frame-level forward dispatch test. Full cargo
+  green. Lab-bound: the loss cluster has no NAT64 path, so synthetic-packet unit
+  tests are the gate (per the converged /research).
+  **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/frame/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-coverage.md,
+  _Log.md
