@@ -1,3 +1,40 @@
+## 2026-07-07 — #4572 dataplane: clamp workers before the heartbeat zero-init loop so a large positive workers value can't wrap uint32 into a multi-billion-iteration apply hang
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4572 (ps-037-A6 F-A6-001, LOW control-plane DoS) —
+  `programBootstrapMapsLocked` (pkg/dataplane/userspace/maps_sync.go) zero-inits
+  the `userspace_heartbeat` Array (`Array<u64>`, max_entries 4096) with
+  `slot < uint32(cfg.Workers)*2*16`. VERIFY-FIRST corrected the issue's
+  headline: the NEGATIVE case (`workers -1` -> `uint32(-1)*32 = 4,294,967,264`
+  iterations) is already defended one layer up — `deriveUserspaceConfig`
+  (capabilities.go:26) coerces `workers<=0 -> 1` before the value reaches the
+  loop, and the sole caller (manager_compile.go:296) always passes that derived
+  ucfg. The LIVE, currently-reachable hang is a large POSITIVE value: the schema
+  leaf is min-only (`ValidateIntegerMin(1)`) and `deriveUserspaceConfig` does
+  NOT cap the upper side, so `workers 999999999` passes strict commit, survives
+  derivation, reaches the loop, and `uint32(999999999)*32` wraps uint32 to
+  ~1.9B iterations of `heartbeatMap.Update` — an apply/commit hang for hours (a
+  DoS, not fail-open; needs a trusted config source). Fix: hoisted
+  `workers := maxInt(cfg.Workers, 1)` before the `userspace_ctrl` struct and
+  used it for both `Workers` (was raw `uint32(cfg.Workers)`, line 154) and
+  `QueueCount` (already clamped, line 155) — restoring the line-154/179
+  consistency the issue flagged; and the loop bound is now
+  `heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())`, a new pure
+  helper that clamps the worker count into `[1, mapCap/heartbeatSlotsPerWorker]`
+  (128 workers at the current 4096-entry map) so the returned slot count can
+  never wrap uint32 or index past the fixed-size Array. PRESERVED: a normal
+  `workers 6` -> `heartbeatZeroSlots(6, 4096) = 192` (6*32), byte-identical to
+  the old `uint32(6)*32`; only <1 (clamped to 1 -> 32) and >128 (clamped to
+  4096) diverge. RED-on-revert verified
+  (maps_sync_heartbeat_slots_4572_test.go): reverting the helper body to raw
+  `uint32(workers)*heartbeatSlotsPerWorker` flips `heartbeatZeroSlots(-1,4096)`
+  to 4,294,967,264 (the exact hang count) and the over-cap / huge-positive
+  cases to out-of-bounds slot counts -> RED, while `six_unchanged` stays green.
+  go build ./... + go vet + go test ./pkg/dataplane/userspace/... green. Doc:
+  docs/config-schema.md gains a "#4572 (workers zero-init loop backstop)" bullet
+  next to the analogous #2524 ring-entries min-only backstop.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/maps_sync_heartbeat_slots_4572_test.go, docs/config-schema.md, _Log.md
+
 ## 2026-07-07 — #4570 ra: configEqual now compares ReachableTime/RetransTimer so a commit changing only those RA timers restarts the sender
 
 - **Timestamp**: 2026-07-07
