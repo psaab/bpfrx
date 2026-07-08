@@ -1251,6 +1251,15 @@ Currently implemented:
   every worker
 - ownership is now spread deterministically across eligible workers when
   multiple shaped egress interfaces share the same TX path
+- `show firewall` / `show firewall filter <name>` now surfaces the three-color
+  policer status inline under each `then policer <name>` term (#4372): the
+  policer mode (single-rate / two-rate), color mode (color-aware / color-blind),
+  and the per-color green (conform) / yellow (exceed) / red (violate) plus
+  treatment-drop packet/byte counters the userspace dataplane publishes over its
+  `three_color_policer_counters` status. Legacy single-rate `firewall policer`
+  definitions are lowered into the same three-color runtime (#4514), so both
+  policer namespaces render. The same counters are also printed as a
+  "Three-color policers:" table in the dataplane status summary.
 
 Still planned:
 
@@ -1306,6 +1315,11 @@ implemented and exercised in the userspace dataplane:
 - shared-root budget leasing across owner workers on the same shaped interface
 - base interface/runtime observability via
   `show class-of-service interface [IFACE[.UNIT]]`
+- three-color policer per-color counters exported to Prometheus
+  (`xpf_userspace_three_color_policer_packets_total` /
+  `_bytes_total` labelled by `policer`+`color`, and
+  `_drops_total` / `_drop_bytes_total` labelled by `policer`) AND surfaced in
+  `show firewall` / `show firewall filter` per referencing term (#4372)
 
 The following pieces are still not complete:
 

@@ -418,6 +418,22 @@ also carries operator content:
   cannot inject a standalone frr.conf command. Guarded by
   `TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482` (fail on
   revert of any wrapped site).
+- **Three route-map slots the #4482 sweep missed are now wrapped too
+  (#4498).** The #4494 hostile review noted that `set ip/ipv6 next-hop
+  <term.NextHop>`, `set origin <term.Origin>`, and `match source-protocol
+  <proto>` still rendered their value with a bare `%s` on the tolerant-load
+  path — a residual of the same class #4482 closed (next-hop is the most
+  notable: an IP-typed slot, but a malformed leniently-loaded value could
+  still inject). All three now pass through `sanitizeFRRValue` for parity with
+  the rest of the route-map belt, so EVERY free-text route-map interpolation is
+  sanitized regardless of load path. The #4482 guard test was extended to
+  drive an injection payload through all ten #4482 slots PLUS these three, so a
+  revert of any single wrapped site is caught (the previous guard exercised
+  only 3 of the wrapped slots — an incomplete fail-on-revert). The inline
+  route-filter prefix-list slot's sanitize sits BEHIND the #2105 `net.ParseCIDR`
+  belt (a control-char prefix is skipped fail-closed before the sanitize call),
+  so its coverage is asserted as the fail-closed property, not a payload
+  collapse.
 - **A BGP-neighbor SHOW command validates its IP before it reaches vtysh
   (#4588).** The #1798/#4097/#4482 belts above cover the config-RENDER path;
   the operational SHOW path is a separate surface. `GetBGPNeighborReceivedRoutes`
