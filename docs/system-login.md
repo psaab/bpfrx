@@ -199,6 +199,47 @@ next `commit`, and the daemon still boots cleanly (bootstrap does not touch
 those services). A failure to erase any of them surfaces as an error rather than
 a clean factory-reset report.
 
+**Provisioned login-account teardown (#4598).** The two erasures above remove
+config + rendered-config secrets, but the OS **login accounts** xpf provisioned
+also live **outside** `/etc/xpf` and **survive** the wipe — and they are the
+*biggest* re-tenant leak because they grant **interactive login + sudo**, not
+just a config-secret read:
+
+- **`/etc/shadow` password hashes** (`reconcileUserPassword`),
+- **SSH `authorized_keys`** under `/home/<user>/.ssh` (`applySystemLogin`),
+- **`/etc/sudoers.d/xpf-<user>`** NOPASSWD grants (`reconcileSudoers`).
+
+They persist for the same reason the rendered configs do: `applySystemLogin`
+runs only inside the boot-time `applyConfig`, which a post-zeroize boot **SKIPS**
+(bootstrap / `nil` active config), and even a full reconcile early-returns on an
+empty config and never `userdel`s. So `zeroize` now tears them down at wipe time
+too (`zeroizeLoginAccounts`, same error-surfacing discipline):
+
+- **Sudoers.** The entire `/etc/sudoers.d/xpf-*` namespace is removed
+  unconditionally (nothing is desired at factory reset), so no passwordless-root
+  grant survives even if a marker is missing. Operator-authored drop-ins without
+  the `xpf-` prefix are **left untouched**.
+- **Users.** A `userdel -r` (removes the `/etc/shadow` + `/etc/passwd` entry and
+  the home tree, incl. `authorized_keys`) fires **only** for an account that has
+  a **provenance marker** in `/var/lib/xpf/provisioned-users/<user>` **and** whose
+  current `/etc/passwd` UID still equals the marker's recorded UID — the same
+  UID-keyed ownership marker used for the declarative D2 lock (#1944 §5.4).
+  `authorized_keys` is removed *before* `userdel` so the SSH-key vector dies even
+  if `userdel` fails; on a `userdel` failure the marker is **retained** so a
+  retried `zeroize` re-attempts, and the failure is surfaced (the device is not
+  reported safe to re-tenant while a live account remains).
+
+**Never-touch safety invariant.** The teardown must never nuke a non-xpf account
+or strand access:
+
+- An **operator's own account** (created out of band, no xpf marker) is never
+  iterated — its keys, sudoers, and login stay intact.
+- **`root` and system accounts** have no marker and are never touched — the
+  console/root lifeline survives the wipe (critical on bare metal).
+- An **out-of-band `userdel`+recreate** with a different UID (marker UID ≠ live
+  UID) is left alone — the current owner is someone else, exactly the #1944
+  leave-then-rejoin-vs-recreate distinction.
+
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`
 spawns a **root `tcpdump` live packet capture** on a data interface, so it
