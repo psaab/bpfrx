@@ -41268,3 +41268,38 @@ top.
 - **File(s)**: pkg/config/schema_security.go,
   pkg/config/schema_closedworld_ike_proposal_4313_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #3651 — per-zone traffic + flood counter POPULATE. VERIFY-FIRST
+  on master: the userspace dataplane does NOT publish per-zone counters over
+  the wire (`ProcessStatus` carries no per-zone block;
+  `SetZoneCounterOffset`/`SetFloodCounterOffset` populate hook is wired on
+  `loader.go`/`maps_counters.go`/`maps_screen.go` but sourced only by tests).
+  So the populate needs the deferred Rust counter-publish (out of scope; cargo
+  lane busy) — the Go-only slice is DOC + surfacing-what's-available. Found the
+  real gap: four production files (pkg/api/README.md,
+  pkg/api/metrics_counters.go, pkg/api/types.go, pkg/dataplane/loader.go) cite
+  `docs/research/3643-dead-counters/plan.md §5A/§5B`, but that doc lived only on
+  the unmerged research/3643-dead-counters branch — dangling on master.
+  Restored the whole research dir (convention: plan.md + reviewer transcripts +
+  reviewer-ids.md, matching every other docs/research/<n>/), prepended a
+  "§0 Status update" to plan.md (HIDE shipped #3643; POPULATE deferred #3651;
+  substitutes; DERIVE-rejected). Added an operator-facing "Deferred
+  Observability — per-zone traffic + flood counters (#3651)" subsection to
+  docs/userspace-dataplane-gaps.md (current not-available state, the wired
+  populate hook, the §5A wire-plumbing design, live substitutes: global +
+  per-interface Bindings RX/TX + per-policy #2118 + per-screen-reason #3343).
+  Sharpened README's vague "follow-up enhancement issue" -> tracker #3651. Added
+  a RED-on-revert guard (pkg/api/zone_counter_doc_ref_test.go): the cited design
+  doc must exist on master with its §5A/§5B/#3651 anchors — deleting it (which
+  re-dangles the four in-code refs) fails the test. RED-on-revert verified (doc
+  hidden -> FAIL; restored -> PASS). No render-text churn: the HIDE surfaces
+  already render a consistent, honest "not available" across CLI/gRPC/REST, and
+  the only per-zone stat available on the Go side is the rejected DERIVE, so the
+  surfacing is the doc's substitute pointers. go test
+  ./pkg/cli/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/dataplane/ green; go build
+  clean; gofmt clean (pre-existing cli.go:503 vet note untouched).
+- **File(s)**: docs/research/3643-dead-counters/plan.md (+ agy-r1.md,
+  codex-r1.md, claude-smr-plan-r1.md, reviewer-ids.md restored),
+  docs/userspace-dataplane-gaps.md, pkg/api/README.md,
+  pkg/api/zone_counter_doc_ref_test.go, _Log.md
