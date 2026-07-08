@@ -121,13 +121,13 @@ func leaseSyncTestDaemon(t *testing.T, sock4, sock6 string, withKnob bool) *Daem
 	ss := cluster.NewSessionSync("127.0.0.1:0", "127.0.0.1:0", nil)
 
 	d := &Daemon{
-		store:              s,
-		applySem:           semaphore.NewWeighted(1),
-		rgStates:           make(map[int]*rgStateMachine),
-		cluster:            cluster.NewManager(0, 1),
-		dhcpServer:         mgr,
-		sessionSync:        ss,
-		dhcpLeaseSyncNowCh: make(chan struct{}, 1),
+		store:         s,
+		applySem:      semaphore.NewWeighted(1),
+		rgStates:      make(map[int]*rgStateMachine),
+		cluster:       cluster.NewManager(0, 1),
+		dhcpServer:    mgr,
+		sessionSync:   ss,
+		dhcpLeaseSync: dhcpLeaseSyncState{nowCh: make(chan struct{}, 1)},
 	}
 	return d
 }
