@@ -1395,6 +1395,83 @@ func TestAnnotateRejectsCommentDelimiter(t *testing.T) {
 	}
 }
 
+// TestAnnotateMultiKeyContainers is the #4587 guard: `annotate` must resolve a
+// path through NAMED / multi-key containers (security-zone <name>, from-zone
+// <z> to-zone <z> policy <p>, interfaces <name> unit <n>, family inet), not
+// only a chain of pure single-key nodes like `system`. The old hand-rolled
+// walk consumed one path token per node but matched it against ANY key in a
+// node's Keys, so it entered a multi-key node on its first key and then failed
+// to find the argument token as a child ("path not found"). This test RED-s on
+// revert for every multi-key path below while the single-key `system` case
+// stays green.
+func TestAnnotateMultiKeyContainers(t *testing.T) {
+	s := newTestStore(t)
+	s.EnterConfigure()
+
+	// Build a config exercising each multi-key container shape.
+	setup := [][]string{
+		{"security", "zones", "security-zone", "trust", "host-inbound-traffic", "system-services", "ssh"},
+		{"security", "zones", "security-zone", "trust", "description", "trusted-side"},
+		{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "allow-web", "match", "source-address", "any"},
+		{"interfaces", "ge-0/0/0", "unit", "0", "family", "inet", "address", "10.0.0.1/24"},
+	}
+	for _, p := range setup {
+		if err := s.Set(p); err != nil {
+			t.Fatalf("setup Set(%v): %v", p, err)
+		}
+	}
+
+	// Each of these paths crosses at least one multi-key node. On the old
+	// walk every one returned "path not found"; navigatePath consumes the
+	// multi-key node as a unit so they resolve. Distinct comments let the
+	// show-output assertion pin each annotation to its target.
+	cases := []struct {
+		path    []string
+		comment string
+	}{
+		// Named container: security-zone <name>.
+		{[]string{"security", "zones", "security-zone", "trust"}, "zone-trust-note"},
+		// Terminal leaf reached THROUGH the named container.
+		{[]string{"security", "zones", "security-zone", "trust", "description"}, "zone-desc-note"},
+		// from-zone <z> to-zone <z> policy <p> (four-key context + keyed policy).
+		{[]string{"security", "policies", "from-zone", "trust", "to-zone", "untrust", "policy", "allow-web"}, "policy-note"},
+		// interfaces <name> unit <n>.
+		{[]string{"interfaces", "ge-0/0/0", "unit", "0"}, "unit-note"},
+		// family inet (multi-key leaf-container).
+		{[]string{"interfaces", "ge-0/0/0", "unit", "0", "family", "inet"}, "family-note"},
+	}
+	for _, c := range cases {
+		if err := s.Annotate(c.path, c.comment); err != nil {
+			t.Errorf("Annotate(%v) must resolve a multi-key path: %v", c.path, err)
+		}
+	}
+
+	text := s.ShowCandidate()
+	for _, c := range cases {
+		want := "/* " + c.comment + " */"
+		if !strings.Contains(text, want) {
+			t.Errorf("annotation %q not in show output for path %v:\n%s", want, c.path, text)
+		}
+	}
+
+	// The single-key `system` case must still work, byte-identically.
+	if err := s.Set([]string{"system", "host-name", "fw1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Annotate([]string{"system"}, "system-note"); err != nil {
+		t.Fatalf("single-key annotate must still work: %v", err)
+	}
+	if text := s.ShowCandidate(); !strings.Contains(text, "/* system-note */") {
+		t.Errorf("single-key annotation missing:\n%s", text)
+	}
+
+	// A non-existent multi-key path still returns a clear error and mutates
+	// nothing.
+	if err := s.Annotate([]string{"security", "zones", "security-zone", "does-not-exist"}, "nope"); err == nil {
+		t.Error("expected error annotating a non-existent multi-key path")
+	}
+}
+
 func TestLoadSet(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.EnterConfigure(); err != nil {
