@@ -1,3 +1,32 @@
+## 2026-07-08 — #4409 increment 1: extract reuse_existing_lease_locked
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4409 (Rust NAT modules — `nat/allocator.rs` PortAllocator
+  god-struct/god-functions), increment 1. Pure code-motion extraction of
+  the #2397 persistent-NAT lease-reuse block (57 interior LOC) out of the
+  `allocate_translation` god-function into a new private
+  `fn reuse_existing_lease_locked(&self, live: &mut PortAllocatorLiveState,
+  key, flow, persistent_nat_timeout_ns, now_ns) -> Option<TranslatedTuple>`.
+  The block handled the "lease already exists for this persistent key" case
+  (reuse a still-valid lease and return its tuple, or tear down an expired
+  lease and fall through). Its only non-linear exit was the inner
+  `return Ok(translated)`, which maps cleanly to the helper's
+  `Some(TranslatedTuple)` return — the caller does
+  `if let Some(t) = self.reuse_existing_lease_locked(...) { return Ok(t); }`.
+  Behaviour is identical: same mutation order, same side effects
+  (`reuses_total` bump, `live_by_flow` insert, expiry-index removal,
+  `release_translated_locked`, `persistent_by_source.remove`), same lock
+  scope — the caller keeps holding its `live` MutexGuard and passes it by
+  `&mut`, so nothing runs outside the existing critical section. The only
+  textual change beyond the move is `&mut live` -> `live` at the internal
+  helper calls (inside the helper `live` is already `&mut
+  PortAllocatorLiveState`). This is NOT the #2852 Phase-1 lock-free change
+  (that is a behaviour change tracked separately, needs /triple-review).
+  Validation: full `cargo test` 3830/0 (nat:: subset 205/0), build clean,
+  rustfmt-clean on the changed lines (the only remaining local-rustfmt diff
+  is the pre-existing `use`-ordering at line 42, untouched).
+- **File(s)**: userspace-dp/src/nat/allocator.rs, _Log.md
+
 ## 2026-07-08 — #4408 increment 1: extract compute_forwarded_egress_ptb
 
 - **Timestamp**: 2026-07-08
