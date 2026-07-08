@@ -1,0 +1,135 @@
+Userspace dataplane helper:
+  PID:                       4242
+  Helper mode:               rust-native
+  io_uring active:           true
+  io_uring mode:             sqpoll
+  io_uring last error:       transient EAGAIN
+  Enabled:                   true
+  Forwarding armed:          true
+  Forwarding supported:      false
+  Forwarding blocked by:     reason-a; reason-b
+  Workers:                   3
+  Ring entries:              4096
+  Last snapshot generation:  12
+  Last FIB generation:       5
+  Interface addresses:       8
+  Neighbor entries:          14
+  Neighbor cache capacity:   128
+  Session table entries:     321/1000
+  Flow cache capacity:       16384
+  Neighbor generation:       6
+  Route entries:             9
+  Local HA forwarding role:  active
+  HA groups:                 rg0 active=true watchdog=100; rg1 active=false watchdog=0
+  Fabric links:              fab0 parent=ge-0-0-0 peer=10.99.1.2
+  Degraded path counters:    ctrl_disabled=1 transit_drop=5
+  Last resolution:           forward_candidate ingress-ifindex=70 local-ifindex=71 egress-ifindex=80 next-hop=172.16.50.1 mac=00:10:db:ff:10:01 flow=172.16.80.10:40000->172.16.80.200:5201 zones=trust->untrust
+  Bound bindings:            1/1
+  XSK-registered bindings:   1/1
+  Zerocopy bindings:         1/1
+  Shared UMEM bindings:      1/1
+  Armed queues:              1/2
+  Ready queues:              1/2
+  Armed bindings:            1/1
+  Ready bindings:            1/1
+  RX packets:                100
+  Validated packets:         90
+  Forward candidates:        80
+  Route misses:              2
+  Neighbor misses:           1
+  Exception packets:         3
+  Flow cache hits:           40
+  Flow cache misses:         10
+  Flow cache evictions:      1
+  Session hits:              50
+  Session misses:            12
+  Session creates:           8
+  Session expires:           4
+  Session delta pending:     2
+  Session delta generated:   6
+  Session delta dropped:     1
+  Session delta drained:     5
+  Event stream frames:       read=11 written=5 decode_errors=2 seq_gaps=3
+  Event stream producer:     sent=101 dropped=7 write_stalls=2 replay_evictions=1 invalid_acks=0
+  Event stream rt_flow:      session_close[sent=90 dropped=3] session_create[sent=12 dropped=1]
+  Event stream events:       policy_deny=13 screen_drop=17 screen_alarm=23 filter_log=19 session_close=29 session_create=31 unknown_drops=6
+  Event stream drops:        policy_deny=1 screen_drop=4 filter_log=9 session_close=7 session_create=8
+  Policy denied packets:     7
+  Screen drops:              9
+  SYN-cookie counters:       challenges=3 unavailable=1 syn_ack_sent=2 ack_rst_sent=1 budget_drops=1 ack_valid=5 ack_invalid=2 bypass=4
+  Generated-reply drops:     time_exceeded=1 policy_reject=2 filter_reject=3 syn_cookie=1 ptb=1 classify_parse_errors=1
+  Generated-reply sent:      policy_reject=5 filter_reject=2
+  Generated-reply budget drops: policy_reject=3 filter_reject=1
+  Generated-reply rate-limited: policy_reject=4 filter_reject=6
+  SNAT packets:              30
+  DNAT packets:              20
+  NAT64 translations:        12
+  NAT64 no-source-pool drops:3
+  NAT64 pool-exhausted drops:5
+  NAT64 fragment drops:      2
+Source NAT pools:
+  Pool                 Rule                 Persist Permit           LiveFlows   UsedPorts  Leases     Alloc      Reuse      Exhaust   
+  pool-a               rule-a               true   target-host      3           30         2          10         4          1         
+  TX packets:                70
+  TX bytes:                  9000
+  TX errors:                 100
+  TX errors non-admission:   60
+  CoS queue drops lifetime:  40
+  CoS admission drops:       5
+  CoS flow-share drops:      3
+  CoS buffer drops:          2
+  CoS ECN marked:            7
+Three-color policers:
+  ID    Name             Mode        Blind  GreenPkts YellowPkts RedPkts   DropPkts  GreenB     YellowB    RedB       DropB     
+  2     wan-egress       single-rate true   10        3         2         2         1000       300        200        200       
+  TX shared recycle unk:     1
+  TX completions:            65
+  Mirrored packets:          4
+  Mirrored bytes:            512
+  Mirror drops:              no-frame=1 tx-frame-reserve=1 no-binding=1 queue-full=2 same-worker=1 cross-worker=1
+  Kernel RX dropped:         9
+  Kernel RX invalid descs:   1
+  Direct TX packets:         40
+  Copy-path TX packets:      20
+  In-place TX packets:       10
+  In-place VLAN push desc:   5
+  In-place VLAN pop desc:    6
+  In-place VLAN no-headroom: 1
+  In-place L2 memmove fb:    2
+  Direct TX no-frame fb:     3
+  Direct TX build-none fb:   2
+  Direct TX disallowed fb:   1
+  Pending fill frames:       10
+  Spare fill frames:         11
+  Free TX frames:            12
+  Pending TX prepared:       13
+  Pending TX local:          14
+  Outstanding TX:            15
+  In-flight recycles:        16
+  Slow path local-delivery:  2
+  Slow path missing-neigh:   1
+  Slow path no-route:        1
+  Slow path next-table:      1
+  Slow path forward-build:   1
+  Slow path active:          true
+  Slow path DEGRADED:        true (live MTU 1400 < configured; jumbo frames refused)
+  Slow path live MTU:        1400
+  Slow path device:          slow0
+  Slow path mode:            tap
+  Slow path queued:          4
+  Slow path injected:        100 pkts / 20000 bytes
+  Slow path dropped:         2 pkts / 400 bytes
+  Slow path rate-limited:    1
+  Slow path queue-full:      1
+  Slow path MTU-exceeded:    1
+  Slow path write errors:    1
+  Slow path last error:      write EIO
+  Slow path per-binding:     6 pkts / 2 drops
+  Recent exceptions:         1
+  Worker 0 heartbeat age:    unknown
+  Worker 1 heartbeat age:    unknown
+Worker runtime (cumulative since worker start; last column is rolling ~60s CPU window):
+  Worker TID      Active%  SpinIdle%  BlockIdle%  CPU%     CPU%60s  WorkLoops    IdleLoops   
+  0      111      50.0     25.0     25.0       50.0     75.0     1000         2000        
+  1      222         -        -          -        -        -    3            4           
+  2      333        DEAD - panicked: boom
