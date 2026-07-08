@@ -40257,3 +40257,26 @@ top.
   userspace-dp/src/afxdp/README.md #3902 flowless-screens section gained a
   #4567 note.
 - **File(s)**: userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/syn_rate.rs, userspace-dp/src/screen/tests.rs, userspace-dp/src/afxdp/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fix #4576 (SECURITY HIGH) — `request system zeroize` did not wipe
+  the `.configdb` SSOT or `master.key`, so a factory reset left the prior
+  tenant's full config + secrets (IKE PSKs, WireGuard keys, SNMP communities)
+  and the key that decrypts them. Extracted `zeroizeConfigDir(configDir,
+  configBase)` from `performZeroizeWipe` (now testable against a temp dir).
+  It removes `master.key` FIRST (key-first: an interrupted wipe cannot leave
+  decryptable ciphertext), then `os.RemoveAll(.configdb)`, then in one ReadDir
+  pass the top-level `.conf`/`rollback*` (preserved), the `<base>.N` text
+  rollback slots (canonical rollback history w/ cleartext secrets, reloaded at
+  boot), and `.config.journal[.N]` (audit journal — wiped per #4576, superseding
+  the #4108 journal-survives-zeroize claim). Best-effort past a failure but
+  returns the first real error; the `zeroize` RPC surfaces it as codes.Internal
+  instead of reporting a clean reset. BPF pins + networkd files stay best-effort
+  (no secrets). Docs: system-login.md, configstore/README.md, LogSystemAction +
+  logSystemAction comments updated for the journal-wipe reversal.
+- **File(s)**: pkg/grpcapi/server_diag.go,
+  pkg/grpcapi/system_action_journal_4108_test.go,
+  pkg/grpcapi/zeroize_configdb_4576_test.go,
+  pkg/configstore/store_commit.go,
+  pkg/configstore/system_action_journal_4108_test.go,
+  docs/system-login.md, pkg/configstore/README.md, _Log.md

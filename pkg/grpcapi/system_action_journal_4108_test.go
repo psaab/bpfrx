@@ -30,7 +30,7 @@ func TestSystemActionJournalsDestructiveVerbs(t *testing.T) {
 	var poweredArg string
 	var wiped bool
 	schedulePowerAction = func(arg string) { poweredArg = arg }
-	performZeroizeWipe = func() { wiped = true }
+	performZeroizeWipe = func() error { wiped = true; return nil }
 
 	cases := []struct {
 		action      string

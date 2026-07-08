@@ -149,10 +149,26 @@ through `PermAll`, so `PermMaint` need not appear in its permission list.
 
 **Audit trail (#4108 F8).** When one of these destructive verbs runs, the gRPC
 `SystemAction` handler writes a fsynced `system_action` entry (verb + timestamp)
-to the configstore audit journal (`.config.journal`) **before** executing, so a
-durable, attributable record survives even a `zeroize` (the `journald` line does
-not). See the configstore README "Audit journal" section for the record format
-and zeroize-survival details.
+to the configstore audit journal (`.config.journal`) **before** executing, so an
+attributable record is durable on disk before the action runs (the `journald`
+line is not). For `reboot`/`halt`/`power-off` the record persists across the
+reboot. For `zeroize`, the wipe now **deliberately removes `.config.journal`**
+(#4576 — a completed factory reset must not hand its audit log, commit history,
+or comments to the next tenant); the durable cross-wipe trail is therefore the
+pre-execution fsync (an *interrupted* wipe still leaves the record on disk) plus
+any remote syslog collector. See the configstore README "Audit journal" section
+for the record format.
+
+**Factory-reset erasure (#4576).** `zeroize` is a security primitive: it must
+leave no prior-tenant config or secret material on disk (RMA / resale /
+re-tenant). The wipe removes the `.configdb` SSOT (`active.json`,
+`candidate.json`, `rollback.N.json`) and **`master.key` first** (so an
+interrupted wipe cannot leave AES-GCM ciphertext behind next to the key that
+decrypts it), the numbered text rollback slots `<config>.N` (full config text
+with cleartext secret leaves — reloaded at boot by `loadRollbackHistory`), the
+top-level `.conf` files (live config + `rescue.conf`), and `.config.journal`
+(+ rotated segments). A wipe that cannot fully erase this state returns an error
+rather than reporting a clean factory reset.
 
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`

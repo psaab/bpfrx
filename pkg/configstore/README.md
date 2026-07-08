@@ -451,13 +451,18 @@ owned by the `journal/` subpackage.
   (written by `grpcapi.Server.SystemAction` BEFORE the action runs). The
   append is fsynced, so the record is durable on disk before the box goes
   down or the config is wiped — the `slog.Warn` line only reaches
-  journald, which does not survive a `zeroize`. The journal file itself
-  survives a `zeroize`: `.config.journal` neither ends in `.conf` nor
-  starts with `rollback`, so it is not in the wipe's removal set.
-  `system_action` is deliberately EXCLUDED from `ListCommitHistory`
-  (`show system commit` shows config commits only). The local gRPC
-  transport is unauthenticated, so no operator identity is attributed —
-  action + timestamp is the best-effort record.
+  journald, which does not survive a reboot. For `reboot`/`halt`/`power-off`
+  the on-disk record persists across the reboot. For `zeroize`, the wipe
+  now **removes `.config.journal`** (and its rotated `.config.journal.N`
+  segments) as part of the factory reset (#4576 — a completed reset must
+  not hand its audit log / commit history / comments to the next tenant,
+  and legacy v1 fat lines could carry full config incl. secrets in a 0644
+  file). The cross-wipe trail is therefore the pre-execution fsync (an
+  *interrupted* wipe still leaves the record) plus remote syslog — not
+  on-box journal survival. `system_action` is deliberately EXCLUDED from
+  `ListCommitHistory` (`show system commit` shows config commits only). The
+  local gRPC transport is unauthenticated, so no operator identity is
+  attributed — action + timestamp is the best-effort record.
 - **`config_hash`** — sha256 hex of the post-action active tree's
   `Format()` text, the same text `saveRollbackFiles` writes: while a
   slot is retained, `sha256sum <config>.N` correlates the rollback

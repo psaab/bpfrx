@@ -5,10 +5,12 @@ import "testing"
 // TestLogSystemAction_WritesJournalEntry pins #4108 F8: a destructive
 // maintenance verb (reboot/halt/power-off/zeroize) writes a fsynced
 // `system_action` audit entry to the commit journal, so a durable,
-// attributable record survives even when the action wipes the config or takes
-// the box down. RED on revert: making Store.LogSystemAction a no-op (or
-// dropping the s.logSystemAction call in the SystemAction handler) leaves the
-// journal empty and this test fails.
+// attributable record is on disk BEFORE the action runs (the record persists
+// across reboot/halt/power-off; for zeroize the wipe then removes
+// `.config.journal` — #4576 — so the cross-wipe trail is this pre-execution
+// fsync plus remote syslog). RED on revert: making Store.LogSystemAction a
+// no-op (or dropping the s.logSystemAction call in the SystemAction handler)
+// leaves the journal empty and this test fails.
 func TestLogSystemAction_WritesJournalEntry(t *testing.T) {
 	s := newTestStore(t)
 

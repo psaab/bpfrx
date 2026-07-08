@@ -566,10 +566,12 @@ func (s *Store) ListCommitHistory(limit int) ([]*JournalEntry, error) {
 //
 // The caller MUST invoke this BEFORE running the action, because the append
 // is synchronous and fsynced (journal.Log), so the record is durable on disk
-// before the box goes down or the config is wiped. The journal file itself
-// (`.config.journal`) also survives a zeroize: it neither ends in `.conf` nor
-// starts with `rollback`, so it is not in the zeroize removal set — belt and
-// braces on top of the pre-execution fsync.
+// before the box goes down or the config is wiped. For reboot/halt/power-off
+// the on-disk record persists across the reboot. For `zeroize` the wipe now
+// deliberately REMOVES `.config.journal` (#4576 — a completed factory reset
+// must not hand its audit log to the next tenant), so the cross-wipe trail is
+// the pre-execution fsync (an interrupted wipe still leaves it) plus remote
+// syslog — this supersedes the earlier journal-survives-zeroize belt-and-braces.
 //
 // Journaling must never block a confirmed power/wipe action, so an append
 // failure is warned (journalLog), not returned. Detail carries the action
