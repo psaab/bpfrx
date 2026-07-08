@@ -41915,3 +41915,34 @@ top.
   pkg/config/schema_closedworld_nat64_4313_test.go,
   pkg/config/schema_closedworld_natv6v4_4313_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-07-08 — #4647 DHCP-server-in-cluster enablement (BUG A + BUG B)
+
+- **Timestamp**: 2026-07-08
+- **Action**: Fixed two enablement bugs the #2261 live smoke surfaced (the
+  memfile loader itself PASSED). BUG A (serious): the untagged reth1.0
+  dhcp-local-server group never matched the master-RG filter, so
+  clearFamilyLocked wiped the Kea config and DHCP-server-in-cluster was
+  non-functional with the canonical `interface reth1.0`. Root cause:
+  `filterDHCPConfigForMasterRGs` exact-string-compared the resolved group
+  interface `ge-0-0-1.0` (resolveDHCPRethInterfaces → ResolveReth keeps the
+  `.0`) against the bare master-RG member `ge-0-0-1` (rethInterfacesForRG emits
+  no suffix for a VlanID==0 unit). Fix: `stripUntaggedUnitSuffix` normalizes a
+  trailing `.0` on BOTH sides of the compare AND keeps the normalized bare
+  member in the kept set (the real device Kea binds to). Tagged units
+  (reth1.100 → ge-0-0-1.100) are untouched and match only their VLAN member.
+  BUG B: `runDHCPLeaseSyncLoop` was launched only from the connect-time comms
+  block, so a runtime `set chassis cluster dhcp-lease-synchronization; commit`
+  was a silent no-op (counters 0/0 until restart). Fix: new idempotent
+  `ensureDHCPLeaseSyncLoop(enabled)` reconciled from the apply path (section 20)
+  and shared with the connect-time launch (routed through the same
+  start/stop, guards double-launch); loop scoped to the live cluster comms
+  context (`clusterCommsCtx`), reset in stopClusterComms. Also fixed the smoke
+  script: `xpf-cli` → `/usr/local/sbin/cli`, DHCP_CLIENT_IFACE default eth1 →
+  eth0 (LAN host has eth0). RED-on-revert verified for both bugs. go test
+  ./pkg/daemon/... ./pkg/dhcpserver/... green; go build ./... ok; gofmt/vet
+  clean; bash -n on the smoke script ok.
+- **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_dhcp_lease_sync.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_apply.go, pkg/daemon/daemon_dhcp_cluster_test.go,
+  test/incus/dhcp-lease-failover.sh, pkg/dhcpserver/README.md, _Log.md

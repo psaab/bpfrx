@@ -1655,6 +1655,15 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServer
 			d.stopClusterComms()
 			d.startClusterComms(d.daemonCtx)
 		}
+
+		// #4647 BUG-B: reconcile the #2239 DHCP lease-sync push loop against
+		// the just-committed `dhcp-lease-synchronization` knob. Without this a
+		// runtime knob-ON commit on a running cluster was a silent no-op (the
+		// loop was launched only from the connect-time block) — counters stayed
+		// 0/0 until an xpfd restart. ensureDHCPLeaseSyncLoop is idempotent, so a
+		// knob-unchanged commit is a no-op, a knob-ON commit (re)launches the
+		// loop against the live comms context, and a knob-OFF commit stops it.
+		d.ensureDHCPLeaseSyncLoop(d.dhcpLeaseSyncEnabled(cfg))
 	}
 
 	// 21. Re-apply D3 RSS indirection on config change (#797 HIGH #2).

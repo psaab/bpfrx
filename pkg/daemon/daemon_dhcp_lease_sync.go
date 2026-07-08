@@ -71,6 +71,14 @@ type dhcpLeaseSyncState struct {
 	lastSentMu sync.Mutex
 	lastSent4  string // last-pushed v4 set fingerprint (change-detect)
 	lastSent6  string // last-pushed v6 set fingerprint (change-detect)
+
+	// loopMu guards the push-loop lifecycle (#4647). loopCancel is the
+	// cancel func of the currently-running push loop's context (nil when the
+	// loop is not running). ensureDHCPLeaseSyncLoop starts/stops the loop
+	// idempotently on a `dhcp-lease-synchronization` knob toggle so a runtime
+	// commit — not only a daemon restart — (re)launches it.
+	loopMu     sync.Mutex
+	loopCancel context.CancelFunc
 }
 
 // dhcpLeaseSyncEnabled reports whether #2239 lease sync is configured for this
@@ -104,9 +112,63 @@ func (d *Daemon) dhcpLeaseSyncGateOpen() bool {
 	return false
 }
 
+// ensureDHCPLeaseSyncLoop starts or stops the #2239 lease-sync push loop to
+// match the `dhcp-lease-synchronization` knob at runtime (#4647). It is
+// idempotent and safe to call from both the cluster connect-time launch
+// (daemon_ha_sync.go) and the config-apply path (daemon_apply.go): a commit
+// that toggles the knob (re)launches or stops the loop WITHOUT a daemon
+// restart. Before #4647 the loop was launched only from the connect-time block,
+// so a knob-ON commit on a running cluster was a silent no-op (counters stayed
+// 0/0 until a restart).
+//
+// The loop is scoped to the live cluster comms context (clusterCommsCtx) so it
+// shares the lifetime of the session-sync channel it pushes over; a comms
+// restart / stopClusterComms tears it down and the next connect-time launch
+// starts a fresh loop (see resetDHCPLeaseSyncLoop).
+func (d *Daemon) ensureDHCPLeaseSyncLoop(enabled bool) {
+	d.dhcpLeaseSync.loopMu.Lock()
+	defer d.dhcpLeaseSync.loopMu.Unlock()
+
+	if !enabled {
+		if d.dhcpLeaseSync.loopCancel != nil {
+			d.dhcpLeaseSync.loopCancel()
+			d.dhcpLeaseSync.loopCancel = nil
+			slog.Info("cluster: DHCP lease-sync push loop stopped (knob disabled)")
+		}
+		return
+	}
+	if d.dhcpLeaseSync.loopCancel != nil {
+		return // already running — idempotent (guards double-launch)
+	}
+	// Comms must be up: the loop reads the peer session-sync channel and
+	// early-returns if either dhcpServer or sessionSync is nil. When they are
+	// not ready yet (e.g. the apply path runs before the peer connects), skip
+	// here — the connect-time launch calls this again once sessionSync is
+	// established, so the knob-ON state is not lost.
+	if d.dhcpServer == nil || d.sessionSync == nil || d.clusterCommsCtx == nil {
+		return
+	}
+	loopCtx, cancel := context.WithCancel(d.clusterCommsCtx)
+	d.dhcpLeaseSync.loopCancel = cancel
+	go d.runDHCPLeaseSyncLoop(loopCtx)
+	slog.Info("cluster: DHCP lease-sync push loop started")
+}
+
+// resetDHCPLeaseSyncLoop clears the push-loop lifecycle handle when cluster
+// comms are torn down (#4647). The loop's context derives from the comms
+// context, so cancelling comms already stops the goroutine; this only clears
+// the cancel handle so the next comms session's connect-time launch starts a
+// fresh loop instead of no-oping on a stale handle.
+func (d *Daemon) resetDHCPLeaseSyncLoop() {
+	d.dhcpLeaseSync.loopMu.Lock()
+	d.dhcpLeaseSync.loopCancel = nil
+	d.dhcpLeaseSync.loopMu.Unlock()
+}
+
 // runDHCPLeaseSyncLoop is the supervised lease-sync push loop. It runs for the
-// daemon lifetime (joined via wg) and exits on ctx cancellation. It is started
-// only in cluster mode with the knob enabled (see daemon_ha_sync.go).
+// lifetime of the cluster comms session (joined via the comms context) and
+// exits on ctx cancellation. It is (re)launched idempotently by
+// ensureDHCPLeaseSyncLoop in cluster mode with the knob enabled.
 func (d *Daemon) runDHCPLeaseSyncLoop(ctx context.Context) {
 	if d.dhcpServer == nil || d.sessionSync == nil {
 		return

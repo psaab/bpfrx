@@ -690,6 +690,35 @@ starve session installs. All seed/read errors are fail-open (logged + counted
 by the daemon; serving is never blocked). Test seams:
 `SetLeaseSyncSeamsForTesting` injects a stub dialer + paths.
 
+**Cluster enablement fixes (#4647, found via the #2261 live smoke).** The
+memfile loader itself was correct; two bugs in the surrounding daemon-side
+enablement plumbing (`pkg/daemon`) meant the feature never engaged with the
+canonical config:
+
+- **BUG A — untagged `reth1.0` never matched the master-RG filter.**
+  `filterDHCPConfigForMasterRGs` (`daemon_ha.go`) keeps a `dhcp-local-server`
+  group only if its resolved interface belongs to a MASTER RG. For an UNTAGGED
+  reth unit, `rethInterfacesForRG` emits the bare member `ge-0-0-1`, but
+  `resolveDHCPRethInterfaces` resolves `reth1.0` → `ge-0-0-1.0` (ResolveReth
+  keeps the `.0`). The exact string compare failed, the group was dropped, and
+  `clearFamilyLocked` wiped `/etc/kea/kea-dhcp4.conf` even though the RG was
+  MASTER — so DHCP-server-in-cluster was non-functional with the canonical
+  `interface reth1.0` in `docs/ha-cluster-userspace.conf`. The fix normalizes a
+  trailing `.0` (untagged unit) on BOTH sides of the compare
+  (`stripUntaggedUnitSuffix`) AND keeps the normalized bare member in the kept
+  set — `ge-0-0-1` is the real kernel device Kea binds to; `ge-0-0-1.0` is not a
+  device. A TAGGED unit (`reth1.100` → `ge-0-0-1.100`) is left intact and still
+  matches only its VLAN member.
+- **BUG B — runtime knob-flip was a silent no-op.** The `#2239` lease-sync push
+  loop (`runDHCPLeaseSyncLoop`) was launched ONLY from the cluster
+  connect-time block, gated on the knob at connect. A runtime `set chassis
+  cluster dhcp-lease-synchronization; commit` on a RUNNING cluster left the loop
+  unstarted (counters stayed 0/0 until an xpfd restart). The apply path now
+  reconciles the loop against the just-committed knob via the idempotent
+  `ensureDHCPLeaseSyncLoop` (shared with the connect-time launch, so it cannot
+  double-launch): a knob-ON commit (re)launches it against the live comms
+  context, a knob-OFF commit stops it, without a restart.
+
 ## Callers
 
 `pkg/daemon` (constructs the always-on `DDNSManager`, runs the reconcile
