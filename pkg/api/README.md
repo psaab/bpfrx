@@ -201,7 +201,16 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
       matching the `xpf_host_inbound_kernel_denies_total` labels.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
-  consumers must drain. `?category=` (and `?severity=` on
+  consumers must drain. Concurrent SSE subscribers are BOUNDED (#4484 L-2):
+  both stream handlers subscribe via `EventBuffer.TrySubscribe`, which
+  returns nil once the live subscriber count reaches the cap
+  (`defaultMaxSubscribers`, 64) — the handler then responds `503` BEFORE
+  switching to event-stream. This mirrors `metricsMaxInFlight` (#4162): each
+  event `Add` fans out O(N) over the subscriber set and each subscription
+  holds a buffered channel, so an unbounded set is a memory + per-event-CPU
+  DoS vector on this untrusted surface. Trusted internal consumers (gRPC
+  event stream, CLI monitor) use `Subscribe`, which never fails but still
+  counts toward the cap. `?category=` (and `?severity=` on
   `/api/v1/logs/stream`) is fail-closed (#3383): an unrecognized token is
   rejected with `400` BEFORE the connection switches to event-stream, so a
   typo cannot silently widen the live feed to everything. A `SCREEN_DROP`
