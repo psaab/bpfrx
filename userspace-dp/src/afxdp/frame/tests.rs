@@ -778,6 +778,463 @@ fn pbr_routing_instance_reject_synthesizes_reply_on_session_miss() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #4499 E7 — PBR routing-instance override + NAT64 cross-family translation.
+// The PBR steer runs on the ORIGINAL IPv6 flow (poll_descriptor/mod.rs L1685),
+// yielding `vrf1.inet6.0`; the route lookup for the NAT64-TRANSLATED IPv4
+// destination is then performed IN that override table (L1733 threads
+// `route_table_override.as_deref()`), and `canonical_route_table`
+// re-canonicalizes `vrf1.inet6.0` -> `vrf1.inet.0` for the v4 destination. So
+// the PBR override SURVIVES the NAT64 translation and the translated IPv4 dst
+// lands in vrf1 — never leaking to the base `inet.0` table. Previously
+// UNCOVERED: no test combined a PBR routing-instance override with NAT64.
+// ---------------------------------------------------------------------------
+
+/// Ingress `reth1.0` (ifindex 5) carries a v6 PBR filter steering the IPv6
+/// SOURCE `2001:db8:61::/64` into routing-instance `vrf1`. A NAT64 prefix
+/// `64:ff9b::/96` (v4 pool present) translates a matching IPv6 destination to
+/// its embedded IPv4 host. The `vrf1` egress (ifindex 20) owns BOTH the
+/// translated v4 subnet `192.0.2.0/24` (connected -> `vrf1.inet.0`) and a v6
+/// subnet `2001:db8:dd::/64` (connected -> `vrf1.inet6.0`, for the no-NAT64
+/// control). No other interface owns `192.0.2.0/24`, so the base `inet.0` table
+/// has NO route for the translated dst — a leak would visibly fail to resolve.
+fn pbr_nat64_snapshot() -> crate::ConfigSnapshot {
+    crate::ConfigSnapshot {
+        zones: vec![
+            crate::ZoneSnapshot {
+                name: "lan".to_string(),
+                id: TEST_LAN_ZONE_ID,
+                ..Default::default()
+            },
+            crate::ZoneSnapshot {
+                name: "vrf1".to_string(),
+                id: TEST_SFMIX_ZONE_ID,
+                ..Default::default()
+            },
+        ],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "reth1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 5,
+                filter_input_v6: "pbr6".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet6".to_string(),
+                    address: "2001:db8:61::1/64".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/3.0".to_string(),
+                zone: "vrf1".to_string(),
+                routing_instance: "vrf1".to_string(),
+                linux_name: "ge-0-0-3".to_string(),
+                ifindex: 20,
+                hardware_addr: "02:00:00:00:00:20".to_string(),
+                addresses: vec![
+                    crate::InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "192.0.2.1/24".to_string(),
+                        scope: 0,
+                    },
+                    crate::InterfaceAddressSnapshot {
+                        family: "inet6".to_string(),
+                        address: "2001:db8:dd::1/64".to_string(),
+                        scope: 0,
+                    },
+                ],
+                ..Default::default()
+            },
+        ],
+        filters: vec![crate::FirewallFilterSnapshot {
+            name: "pbr6".to_string(),
+            family: "inet6".to_string(),
+            terms: vec![
+                crate::FirewallTermSnapshot {
+                    name: "steer".to_string(),
+                    source_addresses: vec!["2001:db8:61::/64".to_string()],
+                    routing_instance: "vrf1".to_string(),
+                    action: "accept".to_string(),
+                    ..Default::default()
+                },
+                crate::FirewallTermSnapshot {
+                    name: "default".to_string(),
+                    action: "accept".to_string(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        nat64_rules: vec![crate::NAT64RuleSnapshot {
+            name: "nat64".to_string(),
+            prefix: "64:ff9b::/96".to_string(),
+            pool_addresses: vec!["198.51.100.1".to_string()],
+            no_v6_frag_header: false,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pbr_override_survives_nat64_translation_no_vrf_leak() {
+    let state = build_forwarding_state(&pbr_nat64_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+
+    let src_v6: Ipv6Addr = "2001:db8:61::100".parse().unwrap();
+    // 192.0.2.7 embedded in 64:ff9b::/96 => 64:ff9b::c000:0207.
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0207".parse().unwrap();
+    let flow = SessionFlow {
+        src_ip: IpAddr::V6(src_v6),
+        dst_ip: IpAddr::V6(dst_v6),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: crate::ip_proto::PROTO_ICMPV6,
+            src_ip: IpAddr::V6(src_v6),
+            dst_ip: IpAddr::V6(dst_v6),
+            src_port: 0,
+            dst_port: 0,
+        },
+    };
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_ICMPV6,
+        ..Default::default()
+    };
+
+    // 1) PBR steer runs on the ORIGINAL IPv6 flow -> the v6 override table.
+    let RouteOverride::Table(override_table) =
+        ingress_route_table_override(&state, &[], meta, &flow, None, None, 0, None)
+    else {
+        panic!("a v6 PBR source term must steer the flow into the override table");
+    };
+    assert_eq!(
+        override_table, "vrf1.inet6.0",
+        "the PBR override is selected on the v6 flow, so it is the v6 table"
+    );
+
+    // 2) NAT64 classifies the synthetic v6 destination -> embedded IPv4 host.
+    let dst_v4 = match state.nat64.classify_ipv6_dest(dst_v6) {
+        crate::nat64::Nat64Match::MatchReady { dst_v4, .. } => dst_v4,
+        _ => panic!("the NAT64 prefix must match the synthetic destination"),
+    };
+    assert_eq!(dst_v4, Ipv4Addr::new(192, 0, 2, 7));
+
+    // 3) Route lookup for the TRANSLATED IPv4 destination using the v6-flow
+    //    override table — exactly what the poll loop threads. The v4 lookup
+    //    re-canonicalizes `vrf1.inet6.0` -> `vrf1.inet.0`, so the override
+    //    SURVIVES the cross-family NAT64 translation: the dst lands in vrf1.
+    let resolved = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V4(dst_v4),
+        Some(override_table.as_str()),
+    );
+    assert_eq!(
+        resolved.egress_ifindex, 20,
+        "the translated IPv4 dst must resolve in vrf1 (the PBR override survives NAT64)"
+    );
+
+    // 4) No-leak control: the base `inet.0` table has NO route for the
+    //    vrf1-only translated dst, so a lookup that IGNORED the PBR override
+    //    (used the base table) could never reach vrf1's egress 20.
+    let leaked = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V4(dst_v4),
+        Some("inet.0"),
+    );
+    assert_ne!(
+        leaked.egress_ifindex, 20,
+        "the base table must NOT resolve the vrf1-only translated dst (no VRF leak)"
+    );
+
+    // 5) Control: PBR steer to vrf1 for a v6 destination with NO NAT64 prefix
+    //    (no translation) — the override still selects `vrf1.inet6.0` and the
+    //    untranslated v6 dst resolves in vrf1.
+    let plain_dst_v6: Ipv6Addr = "2001:db8:dd::200".parse().unwrap();
+    assert!(
+        matches!(
+            state.nat64.classify_ipv6_dest(plain_dst_v6),
+            crate::nat64::Nat64Match::NoPrefixMatch
+        ),
+        "a non-prefix v6 dst is not NAT64-translated"
+    );
+    let plain_flow = SessionFlow {
+        src_ip: IpAddr::V6(src_v6),
+        dst_ip: IpAddr::V6(plain_dst_v6),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: crate::ip_proto::PROTO_ICMPV6,
+            src_ip: IpAddr::V6(src_v6),
+            dst_ip: IpAddr::V6(plain_dst_v6),
+            src_port: 0,
+            dst_port: 0,
+        },
+    };
+    let RouteOverride::Table(plain_table) =
+        ingress_route_table_override(&state, &[], meta, &plain_flow, None, None, 0, None)
+    else {
+        panic!("the v6 PBR term must steer the untranslated v6 flow too");
+    };
+    assert_eq!(plain_table, "vrf1.inet6.0");
+    let plain_resolved = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V6(plain_dst_v6),
+        Some(plain_table.as_str()),
+    );
+    assert_eq!(
+        plain_resolved.egress_ifindex, 20,
+        "the untranslated v6 dst lands in vrf1.inet6.0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #4499 H1 — output filter on the PBR egress (no output-filter bypass via PBR).
+// The per-interface OUTPUT filter is keyed by the egress ifindex alone
+// (filter/engine/eval.rs `iface_filter_out_v4_fast.get(&ifindex)`). After PBR
+// selects the override table and the route lookup returns the vrf1 egress, the
+// output filter that governs the forwarded/reflected packet is THAT egress's
+// filter — not the base egress's. Pins that a PBR-steered flow cannot bypass an
+// output filter by egressing a different interface.
+// ---------------------------------------------------------------------------
+
+/// Ingress `reth1.0` (ifindex 5) steers dst `192.0.2.0/24` into routing-instance
+/// `vrf1`. The `vrf1` egress (ifindex 20) owns that subnet and carries an output
+/// filter denying tcp/80; a base-instance egress (ifindex 30) owns the SAME
+/// subnet in `inet.0` and carries a permissive output filter — the interface the
+/// flow would egress WITHOUT the PBR steer.
+fn pbr_output_filter_snapshot() -> crate::ConfigSnapshot {
+    crate::ConfigSnapshot {
+        zones: vec![
+            crate::ZoneSnapshot {
+                name: "lan".to_string(),
+                id: TEST_LAN_ZONE_ID,
+                ..Default::default()
+            },
+            crate::ZoneSnapshot {
+                name: "vrf1".to_string(),
+                id: TEST_SFMIX_ZONE_ID,
+                ..Default::default()
+            },
+            crate::ZoneSnapshot {
+                name: "base".to_string(),
+                id: TEST_WAN_ZONE_ID,
+                ..Default::default()
+            },
+        ],
+        interfaces: vec![
+            crate::InterfaceSnapshot {
+                name: "reth1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 5,
+                filter_input_v4: "pbr4".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.0.61.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/3.0".to_string(),
+                zone: "vrf1".to_string(),
+                routing_instance: "vrf1".to_string(),
+                linux_name: "ge-0-0-3".to_string(),
+                ifindex: 20,
+                hardware_addr: "02:00:00:00:00:20".to_string(),
+                filter_output_v4: "deny-80".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.2.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+            crate::InterfaceSnapshot {
+                name: "ge-0/0/4.0".to_string(),
+                zone: "base".to_string(),
+                linux_name: "ge-0-0-4".to_string(),
+                ifindex: 30,
+                hardware_addr: "02:00:00:00:00:30".to_string(),
+                filter_output_v4: "allow-all".to_string(),
+                addresses: vec![crate::InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "192.0.2.1/24".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        filters: vec![
+            crate::FirewallFilterSnapshot {
+                name: "pbr4".to_string(),
+                family: "inet".to_string(),
+                terms: vec![
+                    crate::FirewallTermSnapshot {
+                        name: "steer".to_string(),
+                        destination_addresses: vec!["192.0.2.0/24".to_string()],
+                        routing_instance: "vrf1".to_string(),
+                        action: "accept".to_string(),
+                        ..Default::default()
+                    },
+                    crate::FirewallTermSnapshot {
+                        name: "default".to_string(),
+                        action: "accept".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            crate::FirewallFilterSnapshot {
+                name: "deny-80".to_string(),
+                family: "inet".to_string(),
+                terms: vec![
+                    crate::FirewallTermSnapshot {
+                        name: "block-http".to_string(),
+                        protocols: vec!["tcp".to_string()],
+                        destination_ports: vec!["80".to_string()],
+                        action: "discard".to_string(),
+                        ..Default::default()
+                    },
+                    crate::FirewallTermSnapshot {
+                        name: "default".to_string(),
+                        action: "accept".to_string(),
+                        ..Default::default()
+                    },
+                ],
+            },
+            crate::FirewallFilterSnapshot {
+                name: "allow-all".to_string(),
+                family: "inet".to_string(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "default".to_string(),
+                    action: "accept".to_string(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pbr_egress_output_filter_applied_not_base_egress_no_bypass() {
+    let state = build_forwarding_state(&pbr_output_filter_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    let src = Ipv4Addr::new(10, 0, 61, 100);
+    let dst = Ipv4Addr::new(192, 0, 2, 7);
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(src),
+        dst_ip: IpAddr::V4(dst),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(src),
+            dst_ip: IpAddr::V4(dst),
+            src_port: 40000,
+            dst_port: 80,
+        },
+    };
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..Default::default()
+    };
+
+    // PBR steers the flow into vrf1.
+    let RouteOverride::Table(table) =
+        ingress_route_table_override(&state, &[], meta, &flow, None, None, 0, None)
+    else {
+        panic!("the PBR term must steer the flow into vrf1");
+    };
+    assert_eq!(table, "vrf1.inet.0");
+
+    // The PBR route lookup egresses vrf1's interface (20); the base table would
+    // have egressed a DIFFERENT interface (30). The two egresses differ, so
+    // WHICH egress filter is applied is load-bearing.
+    let pbr = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V4(dst),
+        Some(table.as_str()),
+    );
+    let base = lookup_forwarding_resolution_in_table_with_dynamic(
+        &state,
+        &neighbors,
+        IpAddr::V4(dst),
+        Some("inet.0"),
+    );
+    assert_eq!(pbr.egress_ifindex, 20, "PBR selects the vrf1 egress");
+    assert_eq!(base.egress_ifindex, 30, "the base egress is a DIFFERENT interface");
+
+    // The output filter that governs the packet is the PBR-selected egress's
+    // (20) — it DENIES tcp/80. The base egress (30) filter PERMITS it, so
+    // evaluating the base filter would be an output-filter bypass.
+    let extra = crate::filter::TermMatchExtra::default();
+    let pbr_verdict = crate::filter::evaluate_interface_output_filter_counted(
+        &state.filter_state,
+        pbr.egress_ifindex,
+        false,
+        IpAddr::V4(src),
+        IpAddr::V4(dst),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        extra,
+        1500,
+    );
+    assert_eq!(
+        pbr_verdict.action,
+        crate::filter::FilterAction::Discard,
+        "the PBR-selected egress output filter must DENY tcp/80"
+    );
+
+    let base_verdict = crate::filter::evaluate_interface_output_filter_counted(
+        &state.filter_state,
+        base.egress_ifindex,
+        false,
+        IpAddr::V4(src),
+        IpAddr::V4(dst),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        extra,
+        1500,
+    );
+    assert_eq!(
+        base_verdict.action,
+        crate::filter::FilterAction::Accept,
+        "the base egress would have PERMITTED tcp/80 (the bypass this test guards against)"
+    );
+
+    // Control: a permit on the PBR egress forwards — tcp/443 is NOT denied by
+    // the PBR egress's deny-80 filter.
+    let allowed = crate::filter::evaluate_interface_output_filter_counted(
+        &state.filter_state,
+        pbr.egress_ifindex,
+        false,
+        IpAddr::V4(src),
+        IpAddr::V4(dst),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        extra,
+        1500,
+    );
+    assert_eq!(
+        allowed.action,
+        crate::filter::FilterAction::Accept,
+        "a permit on the PBR egress forwards (deny-80 only denies port 80)"
+    );
+}
+
 #[test]
 fn native_gre_logical_egress_retains_zone_without_mac() {
     let state = build_forwarding_state(&native_gre_pbr_snapshot(true));

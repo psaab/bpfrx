@@ -2193,6 +2193,186 @@ fn interface_filter_routing_instance_counted_returns_matching_override() {
     assert_eq!(filter.terms[0].counter.bytes.load(Ordering::Relaxed), 1500);
 }
 
+/// #4499 H6: an IPv6 PBR term `from destination-port 80 then routing-instance
+/// vrf1` steers a tcp/80 packet into vrf1, and a packet on ANY OTHER port does
+/// NOT match the term — it falls through to the default (routing-instance-less)
+/// term, so the evaluator returns None (no override) and the flow uses BASE
+/// routing. This is the fail-CLOSED behavior: the dest-port constraint is
+/// honored, so a PBR dest-port term can never be bypassed into matching every
+/// port (which would silently steer/leak unrelated flows). The L4-offset walk
+/// PAST IPv6 extension headers (so port 80 is extractable behind a Hop-by-Hop /
+/// Dest-Opts / Mobility header) is separately pinned by #4517's
+/// `inspect_walkers_traverse_exotic_length_prefixed_ext_headers`; this pins the
+/// PBR dest-port MATCH + fail-closed decision at the filter engine.
+#[test]
+fn pbr_destination_port_term_matches_and_fails_closed_no_bypass() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 11,
+        filter_input_v6: "pbr6".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "pbr6".into(),
+            family: "inet6".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "steer-http".into(),
+                    action: "accept".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    routing_instance: "vrf1".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    assert!(interface_filter_affects_route_lookup(&state, 11, true));
+
+    let src = IpAddr::V6("2001:db8::10".parse().unwrap());
+    let dst = IpAddr::V6("2001:db8::200".parse().unwrap());
+
+    // tcp/80 matches the PBR dest-port term -> steered into vrf1.
+    let matched = evaluate_interface_filter_routing_instance_counted(
+        &state,
+        11,
+        true,
+        src,
+        dst,
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+        1500,
+    );
+    assert_eq!(
+        matched,
+        Some("vrf1"),
+        "a tcp/80 packet must be PBR-steered into vrf1"
+    );
+
+    // tcp/8080 does NOT match the dest-port term -> the default (no-RI) term
+    // matches -> no routing-instance override -> None -> base routing. Fail
+    // CLOSED: the dest-port constraint is enforced, so there is no bypass.
+    let miss = evaluate_interface_filter_routing_instance_counted(
+        &state,
+        11,
+        true,
+        src,
+        dst,
+        PROTO_TCP,
+        40000,
+        8080,
+        0,
+        TermMatchExtra::default(),
+        1500,
+    );
+    assert_eq!(
+        miss, None,
+        "a non-80 packet must NOT match the PBR dest-port term (fail-closed to base routing, no bypass)"
+    );
+}
+
+/// #4499 H4 (Rust kernel): the per-interface OUTPUT filter is a pure function of
+/// the EGRESS interface config + packet tuple. `evaluate_interface_output_filter`
+/// takes NO session argument and reads only `state` (egress config) + the tuple,
+/// so it is NOT part of synced session state and is RE-EVALUATED per egress
+/// packet. Therefore, on a NEW PRIMARY after an HA failover, the SAME egress
+/// config yields the SAME verdict — a session synced from the old primary carries
+/// no output-filter decision and cannot suppress the new primary's egress filter.
+///
+/// This pins that kernel by building the FilterState TWICE from the SAME egress
+/// config (two independent instances standing in for the pre- and post-failover
+/// nodes) and asserting BOTH deny tcp/80 on the egress ifindex — with no session
+/// / NatDecision involved. The full cross-chassis failover-under-traffic
+/// assertion is the cluster integration test the issue calls out (out of scope
+/// for a Rust-only, test-only PR).
+#[test]
+fn output_filter_reevaluated_from_egress_config_not_session_state() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 7,
+        filter_output_v4: "deny-80".into(),
+        ..Default::default()
+    }];
+    let filters = [FirewallFilterSnapshot {
+        name: "deny-80".into(),
+        family: "inet".into(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "block-http".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["80".into()],
+                action: "discard".into(),
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "default".into(),
+                action: "accept".into(),
+                ..Default::default()
+            },
+        ],
+    }];
+    let build =
+        || parse_filter_state(&filters, &[], &ifaces, "", "").expect("filter state compiles");
+    // Two independent nodes with identical egress config: the original primary
+    // and the new primary after failover.
+    let node_a = build();
+    let new_primary = build();
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+    for (label, state) in [("original-primary", &node_a), ("new-primary", &new_primary)] {
+        let verdict = evaluate_interface_output_filter_counted(
+            state,
+            7,
+            false,
+            src,
+            dst,
+            PROTO_TCP,
+            40000,
+            80,
+            0,
+            TermMatchExtra::default(),
+            1500,
+        );
+        assert_eq!(
+            verdict.action,
+            FilterAction::Discard,
+            "{label}: the egress output filter must deny tcp/80 (re-evaluated from egress config, never synced session state)"
+        );
+    }
+
+    // The new primary forwards a non-80 port identically — the verdict is a
+    // function of the tuple + egress config, not carried session state.
+    let allowed = evaluate_interface_output_filter_counted(
+        &new_primary,
+        7,
+        false,
+        src,
+        dst,
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        TermMatchExtra::default(),
+        1500,
+    );
+    assert_eq!(allowed.action, FilterAction::Accept);
+}
+
 #[test]
 fn interface_output_filter_counted_records_term_hits() {
     let ifaces = vec![crate::InterfaceSnapshot {
