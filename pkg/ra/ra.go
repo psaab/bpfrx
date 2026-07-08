@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -808,7 +809,13 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 		a.MaxAdvInterval != b.MaxAdvInterval ||
 		a.MinAdvInterval != b.MinAdvInterval ||
 		a.LinkMTU != b.LinkMTU ||
-		a.NAT64Prefix != b.NAT64Prefix ||
+		// #4590 (A5-03): compare CIDR fields by parsed value, not raw text.
+		// buildRA re-parses NAT64Prefix via netip.ParsePrefix (sender.go), so
+		// an operator re-typing an equivalent-but-non-canonical form
+		// ("64:ff9b::/96" -> "0064:ff9b::/96") produces identical wire yet a
+		// raw-string compare here reported a diff and forced a spurious RA
+		// sender restart (sub-second RA gap). Normalizing suppresses that.
+		!prefixEqual(a.NAT64Prefix, b.NAT64Prefix) ||
 		a.NAT64PrefixLife != b.NAT64PrefixLife ||
 		a.SourceLinkLocal != b.SourceLinkLocal ||
 		// #4570: reachable-time / retransmit-timer are stamped onto the wire
@@ -829,7 +836,7 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 		return false
 	}
 	for i := range a.Prefixes {
-		if a.Prefixes[i].Prefix != b.Prefixes[i].Prefix ||
+		if !prefixEqual(a.Prefixes[i].Prefix, b.Prefixes[i].Prefix) ||
 			a.Prefixes[i].OnLink != b.Prefixes[i].OnLink ||
 			a.Prefixes[i].Autonomous != b.Prefixes[i].Autonomous ||
 			a.Prefixes[i].ValidLifetime != b.Prefixes[i].ValidLifetime ||
@@ -848,4 +855,26 @@ func configEqual(a, b *config.RAInterfaceConfig) bool {
 	}
 
 	return true
+}
+
+// prefixEqual reports whether two CIDR strings denote the same prefix,
+// tolerating equivalent-but-non-canonical textual forms. configEqual is a
+// change-detector that gates the RA sender restart; the wire is always built
+// by re-parsing the CIDR via netip.ParsePrefix (buildRA, sender.go), so two
+// strings that parse to the same netip.Prefix produce byte-identical RA
+// output. Comparing the raw strings therefore restarted the sender on a
+// purely cosmetic re-type (#4590 A5-03). If either side fails to parse (""
+// = unset, or a value that slipped past validation), fall back to an exact
+// string compare so a genuine change is never masked — an unnecessary
+// restart is harmless, a missed one is not.
+func prefixEqual(a, b string) bool {
+	if a == b {
+		return true
+	}
+	pa, errA := netip.ParsePrefix(a)
+	pb, errB := netip.ParsePrefix(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return pa == pb
 }

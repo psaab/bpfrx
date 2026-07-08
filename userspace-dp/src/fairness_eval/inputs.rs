@@ -170,116 +170,106 @@ pub(crate) fn parse_binding_flows_tsv(path: &PathBuf) -> Result<Vec<BindingFlows
     // versions), if only 3 columns are present, the iface filter is
     // treated as no-filter and worker_id defaults to binding_slot.
     let s = read_to_string(path)?;
+    let (rows, skipped) = parse_binding_flows_rows(&s);
+    warn_skipped("parse_binding_flows_tsv", path, skipped);
+    Ok(rows)
+}
+
+fn parse_binding_flows_rows(s: &str) -> (Vec<BindingFlowsRow>, usize) {
     let mut rows: Vec<BindingFlowsRow> = Vec::new();
+    let mut skipped = 0usize;
     for line in s.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() == 6 {
-            let ts: u64 = match parts[0].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let slot: u32 = match parts[1].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let qid: u32 = match parts[2].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let wid: u32 = match parts[3].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let iface = parts[4].to_string();
-            let count: u32 = match parts[5].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            rows.push(BindingFlowsRow {
-                timestamp: ts,
-                binding_slot: slot,
-                queue_id: qid,
-                worker_id: wid,
-                iface,
-                count,
-            });
-        } else if parts.len() == 3 {
-            // Legacy 3-column format: timestamp, binding_slot, count.
-            // Pretend slot==worker_id and iface=="" so it still works
-            // (caller responsible for ensuring single-iface workload).
-            let ts: u64 = match parts[0].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let slot: u32 = match parts[1].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let count: u32 = match parts[2].parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            rows.push(BindingFlowsRow {
-                timestamp: ts,
-                binding_slot: slot,
-                queue_id: 0,
-                worker_id: slot,
-                iface: String::new(),
-                count,
-            });
+        match parse_binding_flows_line(line) {
+            Some(row) => rows.push(row),
+            None => skipped += 1,
         }
-        // Other formats: silently skipped.
     }
-    Ok(rows)
+    (rows, skipped)
+}
+
+fn parse_binding_flows_line(line: &str) -> Option<BindingFlowsRow> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() == 6 {
+        Some(BindingFlowsRow {
+            timestamp: parts[0].parse().ok()?,
+            binding_slot: parts[1].parse().ok()?,
+            queue_id: parts[2].parse().ok()?,
+            worker_id: parts[3].parse().ok()?,
+            iface: parts[4].to_string(),
+            count: parts[5].parse().ok()?,
+        })
+    } else if parts.len() == 3 {
+        // Legacy 3-column format: timestamp, binding_slot, count.
+        // Pretend slot==worker_id and iface=="" so it still works
+        // (caller responsible for ensuring single-iface workload).
+        let slot: u32 = parts[1].parse().ok()?;
+        Some(BindingFlowsRow {
+            timestamp: parts[0].parse().ok()?,
+            binding_slot: slot,
+            queue_id: 0,
+            worker_id: slot,
+            iface: String::new(),
+            count: parts[2].parse().ok()?,
+        })
+    } else {
+        None
+    }
 }
 
 pub(crate) fn parse_cos_flows_tsv(path: &PathBuf) -> Result<Vec<CosFlowsRow>, String> {
     // Format: timestamp\tifindex\tqueue_id\tworker_id\tcount.
     // Source metric: xpf_userspace_cos_active_flow_count.
     let s = read_to_string(path)?;
+    let (rows, skipped) = parse_cos_flows_rows(&s);
+    warn_skipped("parse_cos_flows_tsv", path, skipped);
+    Ok(rows)
+}
+
+fn parse_cos_flows_rows(s: &str) -> (Vec<CosFlowsRow>, usize) {
     let mut rows: Vec<CosFlowsRow> = Vec::new();
+    let mut skipped = 0usize;
     for line in s.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() != 5 {
-            continue;
+        match parse_cos_flows_line(line) {
+            Some(row) => rows.push(row),
+            None => skipped += 1,
         }
-        let ts: u64 = match parts[0].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let ifindex: i32 = match parts[1].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let qid: u32 = match parts[2].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let wid: u32 = match parts[3].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let count: u32 = match parts[4].parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        rows.push(CosFlowsRow {
-            timestamp: ts,
-            ifindex,
-            queue_id: qid,
-            worker_id: wid,
-            count,
-        });
     }
-    Ok(rows)
+    (rows, skipped)
+}
+
+fn parse_cos_flows_line(line: &str) -> Option<CosFlowsRow> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    Some(CosFlowsRow {
+        timestamp: parts[0].parse().ok()?,
+        ifindex: parts[1].parse().ok()?,
+        queue_id: parts[2].parse().ok()?,
+        worker_id: parts[3].parse().ok()?,
+        count: parts[4].parse().ok()?,
+    })
+}
+
+/// Emit a stderr warning when a TSV parse skipped one or more malformed rows.
+/// A silent skip (ps-038-A1 F2) can undercount one worker's samples and flip
+/// the CoV/fairness gate silently; surfacing the count lets the harness
+/// operator notice a corrupted/truncated Prometheus scrape.
+fn warn_skipped(parser: &str, path: &PathBuf, skipped: usize) {
+    if skipped > 0 {
+        eprintln!(
+            "fairness-eval: {parser}: skipped {skipped} malformed row(s) in {}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -378,5 +368,39 @@ mod tests {
         assert_eq!(rows[0].queue_id, 4);
         assert_eq!(rows[0].worker_id, 1);
         assert_eq!(rows[0].count, 7);
+    }
+
+    #[test]
+    fn binding_flows_counts_skipped_malformed_rows() {
+        // ps-038-A1 F2: malformed rows must be COUNTED (and surfaced via a
+        // warning), not silently dropped. Comment + blank lines are NOT
+        // skips; a non-numeric field and a wrong-column-count row are.
+        let content = "\
+# header comment\n\
+\n\
+1000\t0\t0\t0\tge-0-0-2\t2\n\
+1000\tXXX\t0\t0\tge-0-0-2\t2\n\
+1000\t0\t0\n\
+1000 0 0 0 ge-0-0-2\n\
+2000\t1\t1\t1\tge-0-0-2\t3\n";
+        let (rows, skipped) = parse_binding_flows_rows(content);
+        // 2 valid 6-col rows + 1 valid 3-col row.
+        assert_eq!(rows.len(), 3, "valid rows: {rows:?}");
+        // 1 non-numeric 6-col + 1 unsupported 4-col => 2 skips.
+        assert_eq!(skipped, 2, "skipped count");
+    }
+
+    #[test]
+    fn cos_flows_counts_skipped_malformed_rows() {
+        // ps-038-A1 F2 for the CoS TSV parser.
+        let content = "\
+# timestamp\tifindex\tqueue_id\tworker_id\tcount\n\
+1000\t80\t4\t1\t7\n\
+1000\t80\tbad\t1\t7\n\
+1000\t80\t4\t1\n";
+        let (rows, skipped) = parse_cos_flows_rows(content);
+        assert_eq!(rows.len(), 1, "valid rows: {rows:?}");
+        // 1 non-numeric queue_id + 1 wrong-column-count => 2 skips.
+        assert_eq!(skipped, 2, "skipped count");
     }
 }
