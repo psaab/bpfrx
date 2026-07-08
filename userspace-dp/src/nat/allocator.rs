@@ -441,59 +441,14 @@ impl PortAllocator {
         let persistent_key =
             persistent_nat.then(|| flow.persistent_source_key(persistent_nat_permit));
         if let Some(key) = persistent_key {
-            if live.persistent_by_source.contains_key(&key) {
-                let mut reusable = None;
-                let mut expired = None;
-                let mut remove_expiry = None;
-                if let Some(lease) = live.persistent_by_source.get_mut(&key) {
-                    if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
-                        let translated = lease.translated;
-                        if lease.active_flows == 0 {
-                            remove_expiry = Some(lease.expires_at_ns);
-                            lease.activation_saw_completion = false;
-                            lease.activation_previous_expires_at_ns = lease.expires_at_ns;
-                            lease.activation_had_previous_lease = true;
-                        }
-                        lease.active_flows = lease.active_flows.saturating_add(1);
-                        let expires_at_ns =
-                            now_ns.saturating_add(persistent_nat_timeout_ns.max(NS_PER_SEC));
-                        lease.expires_at_ns = expires_at_ns;
-                        reusable = Some(translated);
-                    } else {
-                        expired = Some((lease.translated, lease.addr_index, lease.expires_at_ns));
-                    }
-                }
-                if let Some(expires_at_ns) = remove_expiry {
-                    if let Some(addr_index) = live
-                        .persistent_by_source
-                        .get(&key)
-                        .map(|lease| lease.addr_index)
-                    {
-                        Self::remove_lease_expiration_locked(
-                            &mut live,
-                            addr_index,
-                            expires_at_ns,
-                            key,
-                        );
-                    }
-                }
-                if let Some(translated) = reusable {
-                    live.live_by_flow.insert(
-                        flow,
-                        LiveAllocation {
-                            translated,
-                            persistent_key: Some(key),
-                            deterministic: false,
-                        },
-                    );
-                    self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
-                    return Ok(translated);
-                }
-                if let Some((translated, addr_index, expires_at_ns)) = expired {
-                    Self::remove_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
-                    self.release_translated_locked(&mut live, translated);
-                    live.persistent_by_source.remove(&key);
-                }
+            if let Some(translated) = self.reuse_existing_lease_locked(
+                &mut live,
+                key,
+                flow,
+                persistent_nat_timeout_ns,
+                now_ns,
+            ) {
+                return Ok(translated);
             }
         }
 
@@ -571,6 +526,89 @@ impl PortAllocator {
 
         self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
         Err(super::source::SourceNatFailureReason::AllocatorExhausted)
+    }
+
+    /// #2397 persistent-NAT lease reuse, run under the live-state lock as the
+    /// first persistent-key step of `allocate_translation`.
+    ///
+    /// When a lease already exists for `key`:
+    ///   - a still-valid lease (an active flow, or one whose inactivity timeout
+    ///     has not yet elapsed) is REUSED — on the 0 -> 1 active-flow edge its
+    ///     activation-rollback bookkeeping is re-armed and its old expiry index
+    ///     entry is dropped, its inactivity expiry is pushed out, the flow is
+    ///     recorded in `live_by_flow`, `reuses_total` is bumped, and the reused
+    ///     translated tuple is returned as `Some(_)` (the caller returns it
+    ///     directly);
+    ///   - an expired lease is torn down (expiry index entry removed, translated
+    ///     tuple released, lease dropped) and `None` is returned so the caller
+    ///     falls through to a fresh allocation.
+    ///
+    /// Returns `None` when no lease exists for `key` or the lease was expired and
+    /// reclaimed.
+    ///
+    /// #4409 increment 1: PURE lock-scoped code-motion out of the
+    /// `allocate_translation` god-function — identical mutation order and side
+    /// effects, executed under the caller's already-held `live` lock (the caller
+    /// passes its `MutexGuard` by `&mut`, so the lock scope is unchanged).
+    fn reuse_existing_lease_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        key: PersistentSourceKey,
+        flow: SourceNatFlowKey,
+        persistent_nat_timeout_ns: u64,
+        now_ns: u64,
+    ) -> Option<TranslatedTuple> {
+        if !live.persistent_by_source.contains_key(&key) {
+            return None;
+        }
+        let mut reusable = None;
+        let mut expired = None;
+        let mut remove_expiry = None;
+        if let Some(lease) = live.persistent_by_source.get_mut(&key) {
+            if lease.active_flows > 0 || lease.expires_at_ns > now_ns {
+                let translated = lease.translated;
+                if lease.active_flows == 0 {
+                    remove_expiry = Some(lease.expires_at_ns);
+                    lease.activation_saw_completion = false;
+                    lease.activation_previous_expires_at_ns = lease.expires_at_ns;
+                    lease.activation_had_previous_lease = true;
+                }
+                lease.active_flows = lease.active_flows.saturating_add(1);
+                let expires_at_ns =
+                    now_ns.saturating_add(persistent_nat_timeout_ns.max(NS_PER_SEC));
+                lease.expires_at_ns = expires_at_ns;
+                reusable = Some(translated);
+            } else {
+                expired = Some((lease.translated, lease.addr_index, lease.expires_at_ns));
+            }
+        }
+        if let Some(expires_at_ns) = remove_expiry {
+            if let Some(addr_index) = live
+                .persistent_by_source
+                .get(&key)
+                .map(|lease| lease.addr_index)
+            {
+                Self::remove_lease_expiration_locked(live, addr_index, expires_at_ns, key);
+            }
+        }
+        if let Some(translated) = reusable {
+            live.live_by_flow.insert(
+                flow,
+                LiveAllocation {
+                    translated,
+                    persistent_key: Some(key),
+                    deterministic: false,
+                },
+            );
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            return Some(translated);
+        }
+        if let Some((translated, addr_index, expires_at_ns)) = expired {
+            Self::remove_lease_expiration_locked(live, addr_index, expires_at_ns, key);
+            self.release_translated_locked(live, translated);
+            live.persistent_by_source.remove(&key);
+        }
+        None
     }
 
     fn claim_free_port_locked(
