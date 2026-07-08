@@ -1683,7 +1683,13 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 				if proto == "direct" {
 					proto = "connected"
 				}
-				fmt.Fprintf(&b, " match source-protocol %s\n", proto)
+				// #4498: sanitize the protocol token — the same #4097/#4482
+				// render-side belt the other route-map free-text slots use.
+				// A tolerant-load / peer-synced / rolled-back FromProtocols
+				// value with an embedded newline must not inject an extra
+				// frr.conf line (the strict #1798 commit gate rejects it, but
+				// the lenient load path only warns, #1960).
+				fmt.Fprintf(&b, " match source-protocol %s\n", sanitizeFRRValue(proto))
 			}
 
 			// fromCommunity / fromASPath are ONE entry of a possibly
@@ -1724,9 +1730,14 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 					// v6 address (whole route-map fails to parse); v6 uses the
 					// dedicated "set ipv6 next-hop global" form. Mirror the
 					// AF detection used by the prefix-list renderer above.
-					fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", term.NextHop)
+					fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", sanitizeFRRValue(term.NextHop))
 				} else {
-					fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
+					// #4498: sanitize the next-hop — an IP-typed slot, but on
+					// the tolerant load / peer-sync / rollback path a stored
+					// malformed value with an embedded newline reaches the
+					// renderer (the strict #1798 commit gate does not cover
+					// those paths, #1960). Parity with the #4482 set-clause belt.
+					fmt.Fprintf(&b, " set ip next-hop %s\n", sanitizeFRRValue(term.NextHop))
 				}
 			}
 
@@ -1762,7 +1773,10 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 			// the same #4097 render-side belt the community-list / as-path-list
 			// definitions use — so a tolerant-load / peer-synced / rolled-back
 			// value with an embedded newline cannot inject an extra frr.conf
-			// line regardless of load path.
+			// line regardless of load path. #4498 extended the belt to the
+			// three remaining bare-%s route-map slots the #4482 sweep missed:
+			// `set ip/ipv6 next-hop`, `set origin`, and `match
+			// source-protocol` (all rendered above).
 			//   - add    → `set community <v> additive` (append)
 			//   - delete → `set comm-list <name> delete` (strip by list)
 			//   - none   → `set community none` (strip all)
@@ -1799,7 +1813,11 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 				fmt.Fprintf(&b, " set as-path prepend %s\n", sanitizeFRRValue(strings.Join(term.ASPathPrepend, " ")))
 			}
 			if term.Origin != "" {
-				fmt.Fprintf(&b, " set origin %s\n", term.Origin)
+				// #4498: sanitize the origin token — parity with the #4482
+				// set-clause belt so a tolerant-load / peer-synced /
+				// rolled-back value with an embedded newline cannot inject an
+				// extra frr.conf line.
+				fmt.Fprintf(&b, " set origin %s\n", sanitizeFRRValue(term.Origin))
 			}
 
 			// Non-terminating term: fall through to the next sequence after
