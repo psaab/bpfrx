@@ -1,3 +1,23 @@
+## 2026-07-07 — #4589 A8-b2 F-002 grpcapi: report unknown/malformed test-routing selectors
+
+- **Timestamp**: 2026-07-07
+- **Action**: `showTestRouting` (`pkg/grpcapi/server_show_routes_text.go`)
+  used `if len(parts) != 2 { continue }` + a switch with no default arm,
+  SILENTLY dropping a malformed segment or an unknown selector key. A
+  typo'd `test-routing:dest=...,instnace=dmz` left `instance` at "" so the
+  lookup fell back to the MAIN routing table for what the operator asked
+  as a VRF query — a misleading diagnostic with no warning (parity gap vs
+  the #3696 showTestPolicy hardening). Mirrored the #3696 pattern: track a
+  `parseErr` on a malformed segment (no key=value / empty key or value)
+  and on an unknown key (default arm), and report it before the lookup.
+  Reported before the routing-nil check (a selector grammar error is a
+  client-input error independent of routing-manager availability), which
+  also keeps it testable with the default nil-manager Server. Golden
+  (`test-routing:dest=10.0.2.1`) unaffected. RED-on-revert test
+  `TestShowTestRoutingReportsUnknownSelector`/`...ValidSelectorNotFlagged`.
+- **File(s)**: pkg/grpcapi/server_show_routes_text.go,
+  pkg/grpcapi/server_show_test_routing_unknownkey_4589_test.go, _Log.md
+
 ## 2026-07-07 — #4589 A10-01 cli: bound `monitor traffic count` (negative / unbounded)
 
 - **Timestamp**: 2026-07-07

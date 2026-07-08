@@ -178,19 +178,44 @@ func (s *Server) showRoutePrefix(req *pb.ShowTextRequest, cfg *config.Config, bu
 func (s *Server) showTestRouting(req *pb.ShowTextRequest, buf *strings.Builder) (*pb.ShowTextResponse, error) {
 	params := strings.TrimPrefix(req.Topic, "test-routing:")
 	var dest, instance string
-	for _, kv := range strings.Split(params, ",") {
-		parts := strings.SplitN(kv, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		switch parts[0] {
-		case "dest":
-			dest = parts[1]
-		case "instance":
-			instance = parts[1]
+	var parseErr error
+	// #4589 A8-b2 F-002: mirror the #3696 showTestPolicy hardening. The old
+	// `if len(parts) != 2 { continue }` plus a switch with no default arm
+	// SILENTLY dropped a malformed segment or an unknown/typo'd selector key
+	// — a typo'd `instnace=dmz` left `instance` at "" so the lookup fell back
+	// to the MAIN routing table for what the operator asked as a VRF query,
+	// with no warning. Report a malformed segment (no key=value, or an empty
+	// key/value) and an unknown key instead of ignoring it. A bare
+	// `test-routing:` (empty params) still falls through to the
+	// "Missing dest parameter" diagnostic below.
+	if params != "" {
+		for _, kv := range strings.Split(params, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				if parseErr == nil {
+					parseErr = fmt.Errorf("malformed selector segment %q (expected key=value)", kv)
+				}
+				continue
+			}
+			switch parts[0] {
+			case "dest":
+				dest = parts[1]
+			case "instance":
+				instance = parts[1]
+			default:
+				if parseErr == nil {
+					parseErr = fmt.Errorf("unknown selector %q", parts[0])
+				}
+			}
 		}
 	}
-	if s.routing == nil {
+	if parseErr != nil {
+		// Report malformed grammar / an unknown key before anything else, so a
+		// typo cannot silently widen the query to the wrong routing table. A
+		// selector grammar error is a client-input error independent of
+		// routing-manager availability, so it precedes the nil-manager check.
+		fmt.Fprintf(buf, "%v\n", parseErr)
+	} else if s.routing == nil {
 		buf.WriteString("Routing manager not available\n")
 	} else if dest == "" {
 		buf.WriteString("Missing dest parameter\n")
