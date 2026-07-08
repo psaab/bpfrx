@@ -484,7 +484,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// #2691 P2: the always-on Surface A manager (router/interface-address
 		// publish). Constructed unconditionally for the same reason as the lease
 		// manager — a binding removal must have a running loop to withdraw.
-		d.surfaceA = ddns.NewSurfaceAManager()
+		d.surfaceA.mgr = ddns.NewSurfaceAManager()
 	}
 
 	// Create the RPM manager eagerly so the pointer is stable for the
@@ -1116,7 +1116,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// reconcile loop. Same lifecycle + control-socket-free + per-RG-gated
 	// discipline as the lease loop above; it reads netlink + the DHCP client
 	// lease set and publishes the firewall's own addresses.
-	if !d.opts.NoDataplane && d.surfaceA != nil {
+	if !d.opts.NoDataplane && d.surfaceA.mgr != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

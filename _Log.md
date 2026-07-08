@@ -1,3 +1,33 @@
+## 2026-07-08 — #4407 increment 5: extract surfaceAState sub-struct
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 Daemon god-struct decomposition, increment 5. Grouped the
+  six flat Surface A (router/interface-address) DDNS fields (`surfaceA`
+  `*ddns.SurfaceAManager`, `surfaceAReconcileNowCh`, `surfaceAReconcileInFlight`,
+  `surfaceACheckIPAllowlistWarned`, `surfaceACheckIPSourceBindWarned`,
+  `surfaceACheckIPNoURLWarned`) into a new `surfaceAState` sub-struct defined in
+  `daemon_ddns_surface_a.go` (the file that owns the reconcile loop). Fields
+  renamed `mgr`/`reconcileNowCh`/`reconcileInFlight`/`checkIPAllowlistWarned`/
+  `checkIPSourceBindWarned`/`checkIPNoURLWarned` (dropping the redundant
+  `surfaceA` prefix), reached as `d.surfaceA.*`. Pure code motion — identical
+  types (`atomic.Bool` / `sync.Map` in a value sub-field of the never-copied
+  `*Daemon`) + identical access contract, no behavior/locking change. Updated
+  the ~20 production access sites in `daemon_ddns_surface_a.go`, the 2 sites in
+  `daemon_run.go` (construction + loop-start gate), the init literal in
+  `daemon.go`, and the 4 struct-literal sites in
+  `daemon_ddns_surface_a_test.go`. Added `sync` + `sync/atomic` imports to the
+  owner file and removed the now-unused `pkg/ddns` import from `daemon.go`. The
+  Surface B DHCP-lease DDNS manager (`ddns` / `ddnsReconcile*`) stays flat — a
+  different mechanism (the two-mechanism split increment 1's note anticipated).
+  This exhausts the clean single-cluster code-motion increments; the remaining
+  flowexport / fabric-forwarding / SNMP+applyConfigLocked clusters are the broad
+  / `/triple-review`-gated remainder (noted in the README).
+- **File(s)**: `pkg/daemon/daemon.go`, `pkg/daemon/daemon_ddns_surface_a.go`,
+  `pkg/daemon/daemon_run.go`, `pkg/daemon/daemon_ddns_surface_a_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/...` clean;
+  `gofmt -l` clean (my files); `go test -race ./pkg/daemon/...` green.
+
 ## 2026-07-08 — #4407 increment 4: extract hostInboundFailOpenState sub-struct
 
 - **Timestamp**: 2026-07-08

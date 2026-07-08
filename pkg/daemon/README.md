@@ -108,6 +108,37 @@ tracker issue #4407 carries the remaining increments.
   tests). The similarly-named `*prometheus.Desc` fields in `pkg/api` are a
   SEPARATE collector that scrapes the live window from the active config
   independently of these logs — they are unrelated to this grouping.
+- **Increment 5 — Surface A (router/interface-address) DDNS state (#2691 P2):**
+  the six flat `surfaceA*` fields (the `*ddns.SurfaceAManager`, the depth-1
+  `surfaceAReconcileNowCh` nudge channel, the `surfaceAReconcileInFlight`
+  no-freeze guard, and the three per-warning-dedup `sync.Map`s —
+  `surfaceACheckIPAllowlistWarned` / `surfaceACheckIPSourceBindWarned` /
+  `surfaceACheckIPNoURLWarned`) moved into `surfaceAState` (defined in
+  `daemon_ddns_surface_a.go`, the file that owns the reconcile loop), reached as
+  `d.surfaceA.<field>` with the redundant `surfaceA` prefix dropped (`mgr`,
+  `reconcileNowCh`, `reconcileInFlight`, `checkIPAllowlistWarned`,
+  `checkIPSourceBindWarned`, `checkIPNoURLWarned`). The fields keep their exact
+  types (`atomic.Bool` / `sync.Map` inside a value sub-field of the never-copied
+  `*Daemon`, so the non-copyable members are safe) and their exact access
+  contract, so this is pure code motion — no behavior/locking change. A named
+  sub-field (not an embed) matches increments 1–4: every production access site
+  is bounded to `daemon_ddns_surface_a.go` plus the construct/gate sites in
+  `daemon_run.go` (and the four `daemon_ddns_surface_a_test.go` literals). The
+  **Surface B** DHCP-lease DDNS manager (`ddns` / `ddnsReconcileNowCh` /
+  `ddnsReconcileInFlight`) stays a set of flat `Daemon` fields — it is a
+  DIFFERENT DDNS mechanism, exactly the two-mechanism split increment 1's note
+  anticipated when it kept the mirrored `ddnsReconcile*` fields flat.
+
+This exhausts the CLEAN, single-cluster / single-file pure-code-motion
+increments. The remaining `Daemon` field clusters are the broad /
+review-gated remainder, deliberately NOT taken as further code-motion-only
+increments: **flowexport** (18 `flow*`/`ipfix*` fields spanning three files —
+too broad for one reviewable code-motion PR), **fabric cross-chassis
+forwarding** (the `fabric*` refresh state — broad, spread across the HA
+forwarding path), and the **SNMP + `applyConfigLocked` reconcile-ordering**
+cluster (deferred to `/triple-review` per #4407, because regrouping it
+touches apply-ordering rather than being inert field motion). These are the
+natural stopping point for the mechanical decomposition.
 
 ## Cluster mode
 

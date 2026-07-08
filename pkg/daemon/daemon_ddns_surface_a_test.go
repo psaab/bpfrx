@@ -572,7 +572,7 @@ func TestForceDDNSUpdateOwnerGate(t *testing.T) {
 	t.Run("standalone forces an update", func(t *testing.T) {
 		d := &Daemon{
 			rgStates: make(map[int]*rgStateMachine),
-			surfaceA: ddns.NewSurfaceAManager(),
+			surfaceA: surfaceAState{mgr: ddns.NewSurfaceAManager()},
 		}
 		ok, msg := d.ForceDDNSUpdate(true)
 		if !ok {
@@ -587,7 +587,7 @@ func TestForceDDNSUpdateOwnerGate(t *testing.T) {
 		d := &Daemon{
 			rgStates: make(map[int]*rgStateMachine),
 			cluster:  cluster.NewManager(0, 1),
-			surfaceA: ddns.NewSurfaceAManager(),
+			surfaceA: surfaceAState{mgr: ddns.NewSurfaceAManager()},
 		}
 		d.getOrCreateRGState(1).SetCluster(false)
 		d.getOrCreateRGState(2).SetCluster(false)
@@ -604,7 +604,7 @@ func TestForceDDNSUpdateOwnerGate(t *testing.T) {
 		d := &Daemon{
 			rgStates: make(map[int]*rgStateMachine),
 			cluster:  cluster.NewManager(0, 1),
-			surfaceA: ddns.NewSurfaceAManager(),
+			surfaceA: surfaceAState{mgr: ddns.NewSurfaceAManager()},
 		}
 		d.getOrCreateRGState(1).SetCluster(false)
 		d.getOrCreateRGState(2).SetCluster(true)
@@ -725,7 +725,7 @@ func TestSurfaceAObserverCheckIPHonorsReconcileContext(t *testing.T) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { close(done) })
 
-	d := &Daemon{surfaceA: ddns.NewSurfaceAManager()}
+	d := &Daemon{surfaceA: surfaceAState{mgr: ddns.NewSurfaceAManager()}}
 	cfg := &config.Config{}
 	scope := ddns.SurfaceAScope{
 		Key: ddns.ScopeKey{

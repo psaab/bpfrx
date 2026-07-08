@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/netip"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vishvananda/netlink"
@@ -47,10 +49,60 @@ const (
 	surfaceACheckIPTimeout = 10 * time.Second
 )
 
+// surfaceAState groups the always-on Surface A (router/interface-address) DDNS
+// state — increment 5 of the #4407 Daemon god-struct decomposition. Pure field
+// grouping, no behavior/locking change: every field keeps its exact type and
+// its access contract, reached as d.surfaceA.<field>. It is a NAMED sub-field
+// (not an embed) like increments 1–4: every access site is bounded to this file
+// (the reconcile-loop owner) plus the construct/gate sites in daemon_run.go, so
+// the explicit d.surfaceA. qualifier is clearer than field promotion. It is a
+// value field of the never-copied *Daemon, so the atomic.Bool / sync.Map
+// members are safe (never copied after first use). The DHCP-lease Surface B
+// manager (d.ddns*) stays flat — a different DDNS mechanism.
+type surfaceAState struct {
+	// mgr is the Surface A manager (#2691 P2). It publishes THIS firewall's own
+	// learned interface addresses (DHCP-lease / static / netlink) as configured
+	// FQDNs through the `system services dynamic-dns` provider catalog, reusing
+	// the pkg/ddns spine (the same Backend, record, ScopeKey, durable-state
+	// primitives). Constructed unconditionally so a binding removal always has a
+	// running loop to withdraw; the loop is netlink + DNS-network only (no
+	// control socket), gated to the RG-MASTER per scope, nudged on commit + the
+	// #1844 DHCP gateway/address-change hook + MASTER transition. nil when the
+	// dataplane is disabled (NoDataplane).
+	mgr *ddns.SurfaceAManager
+	// reconcileNowCh / reconcileInFlight mirror the ddns* pair: a depth-1 nudge
+	// channel + a no-freeze skip-if-in-flight guard.
+	reconcileNowCh    chan struct{}
+	reconcileInFlight atomic.Bool
+	// checkIPAllowlistWarned dedups the once-per-(provider,allowlist) runtime log
+	// emitted when ddns.ParseAllowlistChecked drops a malformed checkip-allowlist
+	// token (#2839). The observer runs per poll-tick, so the drop must not log
+	// every tick. Keyed by "<provider>\x00<allowlist-string>" so a corrected
+	// commit re-arms the warning.
+	checkIPAllowlistWarned sync.Map
+	// checkIPSourceBindWarned dedups the once-per-(provider,bind-error) runtime
+	// log emitted when the checkip probe fails CLOSED because the provider's
+	// configured source-address failed to parse (#3733). That parse failure is
+	// the ONLY bind-resolution error CheckIPClient returns; a dead
+	// destination-interface / VRF surfaces later as a dial error inside CheckIP
+	// (already ok=false), not here. The observer runs per poll-tick, so a
+	// persistent misconfig must not log every tick. Keyed by
+	// "<provider>\x00<bind-error>" so a corrected commit re-arms the warning.
+	checkIPSourceBindWarned sync.Map
+	// checkIPNoURLWarned dedups the once-per-provider runtime log emitted when a
+	// binding selects `address-source checkip` but the referenced provider
+	// carries no checkip-url (#4423 H08). Before the fix the runtime silently
+	// fell back to the interface address (publishing the WRONG address); now the
+	// source stays checkip and the observer skips (fail-closed) while surfacing
+	// this WARN once per provider so the operator sees why nothing publishes.
+	// Keyed by the provider name so a corrected commit (url added) re-arms it.
+	checkIPNoURLWarned sync.Map
+}
+
 // runSurfaceADDNSReconcileLoop is the supervised Surface A reconcile loop. It
 // runs for the daemon's lifetime (joined via wg) and exits on ctx cancel.
 func (d *Daemon) runSurfaceADDNSReconcileLoop(ctx context.Context) {
-	if d.surfaceA == nil {
+	if d.surfaceA.mgr == nil {
 		return
 	}
 	// Immediate first pass so a restart re-publishes / withdraws without
@@ -65,7 +117,7 @@ func (d *Daemon) runSurfaceADDNSReconcileLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			d.runGuardedSurfaceADDNSReconcile(ctx)
-		case <-d.surfaceAReconcileNowCh:
+		case <-d.surfaceA.reconcileNowCh:
 			d.runGuardedSurfaceADDNSReconcile(ctx)
 		}
 	}
@@ -75,14 +127,14 @@ func (d *Daemon) runSurfaceADDNSReconcileLoop(ctx context.Context) {
 // (skip-if-in-flight), mirroring the lease loop — a hung DNS server leaks at
 // most one goroutine and the loop keeps servicing ctx + the nudge channel.
 func (d *Daemon) runGuardedSurfaceADDNSReconcile(ctx context.Context) {
-	if d.surfaceA == nil {
+	if d.surfaceA.mgr == nil {
 		return
 	}
-	if !d.surfaceAReconcileInFlight.CompareAndSwap(false, true) {
+	if !d.surfaceA.reconcileInFlight.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
-		defer d.surfaceAReconcileInFlight.Store(false)
+		defer d.surfaceA.reconcileInFlight.Store(false)
 		d.reconcileSurfaceAOnce(ctx)
 	}()
 }
@@ -95,7 +147,7 @@ func (d *Daemon) runGuardedSurfaceADDNSReconcile(ctx context.Context) {
 // publish decision PER RG so a node MASTER for one RG and BACKUP for another
 // publishes only its own RG's records.
 func (d *Daemon) reconcileSurfaceAOnce(ctx context.Context) {
-	if d.surfaceA == nil {
+	if d.surfaceA.mgr == nil {
 		return
 	}
 	cfg := d.store.ActiveConfig()
@@ -119,7 +171,7 @@ func (d *Daemon) reconcileSurfaceAOnce(ctx context.Context) {
 	if cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
 		catalog = cfg.System.Services.DynamicDNS.Providers
 	}
-	if err := d.surfaceA.Reconcile(rctx, scopes, observe, gate, catalog); err != nil {
+	if err := d.surfaceA.mgr.Reconcile(rctx, scopes, observe, gate, catalog); err != nil {
 		slog.Warn("ddns surface-a: reconcile pass had errors (retrying next cycle)", "err", err)
 	}
 }
@@ -319,7 +371,7 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 				// commit validator also warns). Skip the log when Provider is nil (an
 				// unresolved provider is already covered by the invalid-binding row).
 				if scope.Provider != nil {
-					if _, dup := d.surfaceACheckIPNoURLWarned.LoadOrStore(scope.Provider.Name, struct{}{}); !dup {
+					if _, dup := d.surfaceA.checkIPNoURLWarned.LoadOrStore(scope.Provider.Name, struct{}{}); !dup {
 						slog.Warn("ddns surface-a: address-source checkip selected but provider has no "+
 							"checkip-url; skipping (fail-closed, NOT falling back to the interface address)",
 							"provider", scope.Provider.Name, "fqdn", scope.FQDN)
@@ -343,7 +395,7 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 				// log once per (provider, allowlist-string) so the running daemon also
 				// surfaces it without flooding the per-tick observer.
 				key := scope.Provider.Name + "\x00" + scope.Provider.CheckIPAllowlist
-				if _, dup := d.surfaceACheckIPAllowlistWarned.LoadOrStore(key, struct{}{}); !dup {
+				if _, dup := d.surfaceA.checkIPAllowlistWarned.LoadOrStore(key, struct{}{}); !dup {
 					slog.Warn("ddns surface-a: ignoring malformed checkip-allowlist token(s); "+
 						"bogus-IP allowlist is smaller than configured",
 						"provider", scope.Provider.Name, "tokens", badAllow)
@@ -355,7 +407,7 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 			// cached per-binding HTTP client (#2904) so the recurring checkip probe
 			// shares the keep-alive connection pool with the DNS-update path instead
 			// of rebuilding a transport every reconcile pass.
-			client, berr := d.surfaceA.CheckIPClient(scope.Provider)
+			client, berr := d.surfaceA.mgr.CheckIPClient(scope.Provider)
 			if berr != nil {
 				// FAIL-CLOSED (#3733): berr means the provider's configured
 				// source-address failed to parse (netip.ParseAddr) — it is the
@@ -372,7 +424,7 @@ func (d *Daemon) surfaceAObserver(cfg *config.Config) ddns.AddressObserver {
 				// so a persistent misconfig surfaces without flooding the per-tick
 				// observer.
 				key := scope.Provider.Name + "\x00" + berr.Error()
-				if _, dup := d.surfaceACheckIPSourceBindWarned.LoadOrStore(key, struct{}{}); !dup {
+				if _, dup := d.surfaceA.checkIPSourceBindWarned.LoadOrStore(key, struct{}{}); !dup {
 					slog.Warn("ddns surface-a: checkip source bind unusable; "+
 						"skipping probe (fail-closed, not falling back to default route)",
 						"provider", scope.Provider.Name, "err", berr)
@@ -702,11 +754,11 @@ func (d *Daemon) surfaceARG0Writer(master map[int]bool) bool {
 // (config commit / DHCP address change / MASTER takeover). Non-blocking depth-1
 // send: coalesces a burst into one pending wakeup.
 func (d *Daemon) nudgeSurfaceADDNSReconcile() {
-	if d.surfaceAReconcileNowCh == nil {
+	if d.surfaceA.reconcileNowCh == nil {
 		return
 	}
 	select {
-	case d.surfaceAReconcileNowCh <- struct{}{}:
+	case d.surfaceA.reconcileNowCh <- struct{}{}:
 	default:
 	}
 }
@@ -723,7 +775,7 @@ func (d *Daemon) nudgeSurfaceADDNSReconcile() {
 // A standalone node (no cluster) is always the writer. Returns (ok, message)
 // for the operator surface.
 func (d *Daemon) ForceDDNSUpdate(force bool) (bool, string) {
-	if d.surfaceA == nil && d.ddns == nil {
+	if d.surfaceA.mgr == nil && d.ddns == nil {
 		return false, "dynamic-dns: DDNS engine not running (dataplane disabled)"
 	}
 	// Per-RG owner gate (#2972): only a node that masters at least one RG may
@@ -736,8 +788,8 @@ func (d *Daemon) ForceDDNSUpdate(force bool) (bool, string) {
 			"redundancy group; the redundancy-group owner publishes (no action " +
 			"taken on the backup)"
 	}
-	if force && d.surfaceA != nil {
-		d.surfaceA.ForceRefresh()
+	if force && d.surfaceA.mgr != nil {
+		d.surfaceA.mgr.ForceRefresh()
 	}
 	// Nudge both DDNS reconcile loops immediately (Surface A router records and
 	// the DHCP-lease Surface B path) so the forced/checked pass runs now rather
@@ -755,17 +807,17 @@ func (d *Daemon) ForceDDNSUpdate(force bool) (bool, string) {
 // SurfaceAStats returns the Surface A counter snapshot for the API collector /
 // show command, or nil when the manager is not constructed (NoDataplane).
 func (d *Daemon) SurfaceAStats() *ddns.SurfaceAStats {
-	if d.surfaceA == nil {
+	if d.surfaceA.mgr == nil {
 		return nil
 	}
-	st := d.surfaceA.Stats()
+	st := d.surfaceA.mgr.Stats()
 	return &st
 }
 
 // SurfaceAStatus returns the per-scope last-published views for `show` (the
 // operator surface, plan §5.5). Empty when the manager is absent.
 func (d *Daemon) SurfaceAStatus() []ddns.SurfaceAStatusView {
-	if d.surfaceA == nil {
+	if d.surfaceA.mgr == nil {
 		return nil
 	}
 	// Materialize the CURRENTLY configured scopes so the status surfaces every
@@ -777,7 +829,7 @@ func (d *Daemon) SurfaceAStatus() []ddns.SurfaceAStatusView {
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		scopes, invalid = d.buildSurfaceAScopes(cfg)
 	}
-	views := d.surfaceA.StatusViews(scopes)
+	views := d.surfaceA.mgr.StatusViews(scopes)
 	if len(invalid) > 0 {
 		// #4423 M09: fold the structurally-invalid bindings (no hostname / no
 		// provider / undefined provider) into the operator status so a broken
