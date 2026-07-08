@@ -23,6 +23,30 @@ import (
 	"github.com/psaab/xpf/pkg/policymatch"
 )
 
+// writeThreeColorPolicerStatus renders the per-color (green/yellow/red)
+// conform/exceed and treatment-drop counters for a `then policer <name>` term,
+// mirroring the inline per-term `Hit count:` surfacing (#4372). The counters
+// come from the userspace dataplane's three_color_policer_counters wire status;
+// legacy single-rate `firewall policer` definitions are lowered into the same
+// three-color runtime (#4514), so this renders both policer namespaces. Junos
+// terms are green=conform (in committed rate), yellow=exceed (above committed,
+// within peak/excess), red=violate.
+func writeThreeColorPolicerStatus(buf *strings.Builder, ps dpuserspace.ThreeColorPolicerStatus) {
+	mode := ps.Mode
+	if mode == "" {
+		mode = "unknown"
+	}
+	colorMode := "color-aware"
+	if ps.ColorBlind {
+		colorMode = "color-blind"
+	}
+	fmt.Fprintf(buf, "    Policer %s (%s, %s):\n", ps.Name, mode, colorMode)
+	fmt.Fprintf(buf, "      green (conform):  %d packets, %d bytes\n", ps.GreenPackets, ps.GreenBytes)
+	fmt.Fprintf(buf, "      yellow (exceed):  %d packets, %d bytes\n", ps.YellowPackets, ps.YellowBytes)
+	fmt.Fprintf(buf, "      red (violate):    %d packets, %d bytes\n", ps.RedPackets, ps.RedBytes)
+	fmt.Fprintf(buf, "      dropped:          %d packets, %d bytes\n", ps.DropPackets, ps.DropBytes)
+}
+
 // showFirewall renders the `cli show firewall` output. Writes to
 // `buf`. Returns no error — the original case body had no error
 // returns; counters that fail to load are silently skipped (same
@@ -38,6 +62,7 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 		userspaceStatus = &status
 	}
 	userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
+	policerStatuses := dpuserspace.BuildThreeColorPolicerStatusIndex(userspaceStatus)
 	// Resolve filter IDs for counter display
 	var filterIDs map[string]uint32
 	if s.dp != nil && s.dp.IsLoaded() {
@@ -129,6 +154,9 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 				if term.LossPriority != "" {
 					fmt.Fprintf(buf, "    then loss-priority %s\n", term.LossPriority)
 				}
+				if term.Policer != "" {
+					fmt.Fprintf(buf, "    then policer %s\n", term.Policer)
+				}
 				action := term.Action
 				if action == "" {
 					action = "accept"
@@ -157,6 +185,11 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 				}
 				if hasCounters || userspaceOk {
 					fmt.Fprintf(buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+				}
+				if term.Policer != "" {
+					if ps, ok := policerStatuses[term.Policer]; ok {
+						writeThreeColorPolicerStatus(buf, ps)
+					}
 				}
 			}
 			buf.WriteString("\n")
@@ -425,6 +458,7 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 				userspaceStatus = &status
 			}
 			userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
+			policerStatuses := dpuserspace.BuildThreeColorPolicerStatusIndex(userspaceStatus)
 			var filterIDs map[string]uint32
 			if s.dp != nil && s.dp.IsLoaded() {
 				if cr := s.applyResult(); cr != nil {
@@ -503,6 +537,9 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 				if term.Count != "" {
 					fmt.Fprintf(buf, "    then count %s\n", term.Count)
 				}
+				if term.Policer != "" {
+					fmt.Fprintf(buf, "    then policer %s\n", term.Policer)
+				}
 				action := term.Action
 				if action == "" {
 					action = "accept"
@@ -530,6 +567,11 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 				}
 				if hasCounters || userspaceOk {
 					fmt.Fprintf(buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+				}
+				if term.Policer != "" {
+					if ps, ok := policerStatuses[term.Policer]; ok {
+						writeThreeColorPolicerStatus(buf, ps)
+					}
 				}
 			}
 			buf.WriteString("\n")
