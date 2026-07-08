@@ -451,6 +451,23 @@ validation:
   directions — tail-drop and typo-bypass — across bracket / repeated-line /
   hierarchical shapes, plus the value-slot completion pin).
 
+**The `to` range separator in `validateMultiValueLeaf` is opt-in (#4556 L-01).**
+`validateMultiValueLeaf` (`schema_walk.go`) treats the fixed mid-token `to` as
+a range separator (`<a> to <b>`) ONLY for a leaf that sets `rangeSeparator: true`
+on its `schemaNode`. The separator is meaningful solely for a leaf whose value
+domain is a numeric RANGE — port-range and NAT-pool-address. Those production
+leaves are compiler-validated (they carry no schema `validator`), so they never
+reach `validateMultiValueLeaf`; every typed multi leaf that DOES reach it today
+is an IP/CIDR leaf (`name-server`, VRRP `virtual-address`, RA `dns-server-address`)
+or a session-log-flag leaf, where `to` is never a valid member. On those leaves
+`rangeSeparator` stays false, so a literal `to` is validated as an ordinary value
+and rejected with a clear "invalid value" message (e.g. `name-server 1.1.1.1 to
+8.8.8.8` — name-server takes no range — is rejected, not silently accepted by
+skipping `to`). Before the gate, `to` was special-cased on EVERY typed multi
+leaf, leniently skipping it. Only the white-box walker test's synthetic
+port-range leaf sets `rangeSeparator` today (`schema_walk_internal_test.go`);
+`TestSchemaValidate_NameServer_ToNotRangeSeparator` pins the non-range behaviour.
+
 **IKE/IPsec proposals, RIP export/redistribute, and routing-instance interface
 are multi-value (#3904).** Four more leaves of the #2419/#3431/#3703
 bracket-list-truncation class (fable-161 F-040/F-161/F-162/F-163), all fixed by

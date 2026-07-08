@@ -119,6 +119,20 @@ This is the package that drives chassis-cluster failover.
   mismatch (a rolling `reth-advertise-interval` change, or a misconfig) no
   longer times the master out on the wrong cadence (a shorter local interval
   → premature failover/flapping; a longer one → delayed detection/loss).
+- Learned-interval floor (#4548): `recordMasterAdvert` clamps the learned
+  `Master_Adver_Interval` UP to `masterAdverFloor()` — the node's own
+  configured `cfg.AdvertiseInterval`, with a 10 ms absolute backstop
+  (`minLearnedMasterAdverInterval`, the schema minimum for
+  `reth-advertise-interval`). RFC 5798 §6.1/§6.4.2 has no packet auth, so a
+  buggy or misconfigured peer advertising `Max Adver Int=1` (10 ms) would
+  otherwise collapse `masterDownInterval` (and the preempt-gate staleness
+  horizons) to ~30 ms on a 30 ms RETH node and flap mastership on ordinary
+  scheduling/network jitter. Only the LOW side is clamped: a SLOWER master
+  (learned ≥ floor, the anti-premature-failover case above) is adopted
+  unchanged, and a matching 30 ms advert equals the 30 ms floor so the
+  fast-failover default is preserved exactly. Because the floor is the node's
+  OWN interval, a legitimately-configured low-interval cluster (e.g.
+  `reth-advertise-interval 10` on both nodes) is not over-clamped.
 - Planned shutdown: 3× priority-0 advert burst → peer takeover ~1 ms.
 - Heartbeat 200 ms, threshold 5 (1 s detection).
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a
@@ -364,6 +378,19 @@ load/peer-sync compile paths.
   inject a synthetic arrival ifindex without `CAP_NET_RAW`. Only the
   AF_PACKET-unavailable fallback is affected; the default
   `receiverAfPacket` tap already binds to a single ifindex.
+- **GTSM hop-limit gate on the raw-IPv6 fallback (#4549 F8).** RFC 5798
+  §5.1.2.3 requires VRRPv3 advertisements to carry an IPv6 hop limit of
+  255 so a routed (off-link) advert is rejected. The AF_PACKET path
+  (`parseAfPacketIPv6`, reads `ip6[7]`) and the IPv4-raw path (`hdr.TTL`)
+  already enforce this, but the raw `ip6:112` fallback socket strips the
+  IPv6 header, so the hop limit is not in the payload. `receiverIPv6` now
+  enables `ipv6.FlagHopLimit` (`IPV6_RECVHOPLIMIT`) alongside
+  `FlagInterface`, reads the hop limit from the per-packet control
+  message via the `ipv6Recv` seam, and drops any advert whose hop limit
+  is not 255. The seam therefore returns `(n, ifindex, hopLimit, src,
+  err)`. Exploitability is near-nil (VRRPv3 IPv6 uses link-local
+  multicast `ff02::12`, unroutable off-link), so this is defense-in-depth
+  parity with the other two receive paths.
 - The AF_PACKET capture fd is created `SOCK_RAW|SOCK_CLOEXEC` so it is set
   close-on-exec atomically at creation (#2476). A raw `unix.Socket` does NOT
   inherit CLOEXEC the way Go `net` sockets do, so without this the raw VRRP

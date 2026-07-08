@@ -757,6 +757,35 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #4559 (ps-034 M-01): deterministic CGNAT `port deterministic block-size
+	// <n> host address <cidr>` is typed + validated (compiler_nat.go) and was
+	// compiled into the retired eBPF plane (pkg/dataplane/compiler_nat.go, now
+	// dead after #1373/#1476), but was NEVER ported to the userspace dataplane
+	// (nat_source.go / userspace-dp have no block-allocation logic). So a
+	// deterministic pool commits clean and SILENTLY falls back to round-robin /
+	// sticky SNAT — the subscriber→fixed-port-block mapping that is the whole
+	// point (lawful-intercept / audit without per-flow logs) is not enforced.
+	// Mirror the #4291/#4292 accepted-only doctrine: warn so the operator is not
+	// silently misled. Full block-allocator enforcement is a userspace-dp
+	// follow-up tracked in #4559.
+	{
+		var detPools []string
+		for _, name := range sortedPoolNames(cfg.Security.NAT.SourcePools) {
+			if p := cfg.Security.NAT.SourcePools[name]; p != nil && p.Deterministic != nil {
+				detPools = append(detPools, name)
+			}
+		}
+		if len(detPools) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security nat source pool %s: `port deterministic block-size` is "+
+					"accepted but NOT enforced by the userspace dataplane "+
+					"(round-robin/sticky SNAT is used instead); deterministic "+
+					"CGNAT block allocation is not yet implemented (config-only "+
+					"parity, #4559)",
+				strings.Join(detPools, ", ")))
+		}
+	}
+
 	// #4232 (fable-167 P-4a): a `security alg <proto>` stanza whose proto is
 	// not one of the four the dataplane wires (dns/ftp/sip/tftp) was silently
 	// dropped. Warn so the operator knows the stanza is accepted-but-inert

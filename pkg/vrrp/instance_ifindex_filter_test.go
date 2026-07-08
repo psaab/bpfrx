@@ -109,12 +109,12 @@ func TestReceiverIPv6_DropsCrossInterfaceAdvert(t *testing.T) {
 
 		readOnce := make(chan struct{}, 1)
 		readOnce <- struct{}{}
-		vi.ipv6Recv = func(b []byte) (int, int, net.Addr, error) {
+		vi.ipv6Recv = func(b []byte) (int, int, int, net.Addr, error) {
 			select {
 			case <-readOnce:
-				return copy(b, data), arrivalIfindex, &net.IPAddr{IP: srcIP}, nil
+				return copy(b, data), arrivalIfindex, 255, &net.IPAddr{IP: srcIP}, nil
 			case <-vi.stopCh:
-				return 0, 0, nil, net.ErrClosed
+				return 0, 0, 0, nil, net.ErrClosed
 			}
 		}
 		return vi
