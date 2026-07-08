@@ -1,3 +1,19 @@
+## 2026-07-07 — #4589 A8-01 grpcapi+api: guard Rollback against a negative n
+
+- **Timestamp**: 2026-07-07
+- **Action**: The `Rollback` mutation RPC (`pkg/grpcapi/server_config.go`)
+  and its REST leg `configRollbackHandler` (`pkg/api/config.go`) had no
+  `n<0` guard, so a negative n flowed into `store.Rollback(n)` →
+  `history.Get(n-1)` → `history.Get(<0)` → the opaque "history position -1
+  out of range" store error. Fail-closed (no wrong rollback target) but a
+  poor message. Added a `req.N < 0` reject with a clear InvalidArgument /
+  400 message on both surfaces. Unlike ShowRollback (#4556, n<=0) the
+  mutation keeps n==0 valid (Junos `rollback 0` = revert to active), so
+  only n<0 is rejected. RED-on-revert test `TestRollbackRejectsNegativeN`
+  (asserts the clean message + no "out of range" leak) / `...AcceptsZeroN`.
+- **File(s)**: pkg/grpcapi/server_config.go, pkg/api/config.go,
+  pkg/grpcapi/server_rollback_negative_n_4589_test.go, _Log.md
+
 ## 2026-07-07 — #4589 A8-b2 F-002 grpcapi: report unknown/malformed test-routing selectors
 
 - **Timestamp**: 2026-07-07

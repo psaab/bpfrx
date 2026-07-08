@@ -158,6 +158,14 @@ func (s *Server) configRollbackHandler(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
+	// #4589 A8-01: mirror the gRPC Rollback guard. n==0 = revert to active
+	// (valid); a negative n reaches history.Get(<0) and surfaces the opaque
+	// "history position -1 out of range" store error. Reject up front.
+	if req.N < 0 {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("invalid n %d: rollback index must be non-negative (0 = revert to active)", req.N))
+		return
+	}
 	if err := s.store.Rollback(req.N); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
