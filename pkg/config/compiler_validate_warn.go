@@ -1466,6 +1466,84 @@ func ValidateConfig(cfg *Config) []string {
 	// #4309 (fable-review-167 I-4): DHCP relay overrides accepted-only advisory.
 	warnings = append(warnings, validateDHCPRelayParityWarnings(cfg)...)
 
+	// #4455 (HI-1): a zone that admits a multicast routing protocol relies on the
+	// kernel input-chain `policy accept` fall-through to deliver that protocol's
+	// host-bound multicast PACKET-WIDE (not scoped to the zone's ingress
+	// interface). Surface that Junos-parity/hardening gap at commit; the per-zone
+	// iifname enforcement remains deferred.
+	warnings = append(warnings, validateHostInboundMulticastWarnings(cfg)...)
+
+	return warnings
+}
+
+// validateHostInboundMulticastWarnings emits the #4455 (HI-1) commit-time
+// advisory for a zone whose `host-inbound-traffic protocols` admits a MULTICAST
+// routing protocol (OSPF/RIP/PIM/VRRP/IGMP/router-discovery/... — see the
+// protocol->group catalog in host_inbound_multicast.go and
+// docs/host-inbound-multicast.md).
+//
+// VERIFY-FIRST (current master): the kernel `xpf_hostinbound` `chain input`
+// (buildHostInboundFilterPayload) matches host-local UNICAST daddr only and runs
+// `policy accept`, so a host-bound packet to a well-known routing multicast group
+// (224.0.0.5, 224.0.0.18, ...) matches no per-zone `daddr` set and is admitted
+// PACKET-WIDE — on EVERY ingress interface — rather than scoped to the zone whose
+// `host-inbound-traffic protocols` opted in (as Junos implies). The Rust AF_XDP
+// classifier (host_inbound_admits) has no destination-address dimension, so it
+// does not gate host-bound multicast either. This is FAIL-OPEN-BUT-BOUNDED (the
+// host delivers only to groups a joined daemon subscribed; ND/PMTUD/ESP control
+// is already globally accepted), a parity/hardening gap — NOT an open door.
+//
+// WARN-only: the config is valid Junos, and the enforcement (a per-zone
+// `iifname`-scoped admission model on BOTH surfaces, the #1960 fail-closed-on-
+// revert migration gating, and the kernel/Rust lockstep) is DEFERRED (#4455), so
+// this must not reject or change forwarding. Mirrors the #3226 `system-services
+// all` packet-wide-admit advisory. Emitted for the zone-level stanza AND every
+// per-interface override (#3362); one advisory per stanza.
+func validateHostInboundMulticastWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.Security.Zones == nil {
+		return nil
+	}
+	var warnings []string
+	advise := func(where string, protocols []string) {
+		toks := hostInboundMulticastTokensPresent(protocols)
+		if len(toks) == 0 {
+			return
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"%s: host-bound routing multicast (%s) is currently admitted "+
+				"PACKET-WIDE via the kernel input-chain accept fall-through, "+
+				"not scoped to this zone's ingress interface — a known "+
+				"Junos-parity gap (#4455), pending the per-zone iifname "+
+				"multicast admission model.", where,
+			hostInboundMulticastGroupSummary(toks)))
+	}
+	names := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		zone := cfg.Security.Zones[name]
+		if zone == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
+			continue
+		}
+		if zone.HostInboundTraffic != nil {
+			advise(
+				fmt.Sprintf("zone %q host-inbound-traffic", name),
+				zone.HostInboundTraffic.Protocols)
+		}
+		// #3362: per-interface overrides carry the same `protocols` grammar and
+		// the same packet-wide multicast breadth — warn on each.
+		for _, ifRef := range zone.SortedInterfaceHostInboundRefs() {
+			hi := zone.InterfaceHostInbound[ifRef]
+			if hi == nil {
+				continue
+			}
+			advise(
+				fmt.Sprintf("zone %q interface %q host-inbound-traffic", name, ifRef),
+				hi.Protocols)
+		}
+	}
 	return warnings
 }
 

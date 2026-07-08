@@ -185,6 +185,19 @@ lives on the `research/3226-system-services` branch
 independent of that decision — it makes the current behavior visible without
 changing any forwarding.
 
+## Host-bound routing multicast is admitted packet-wide (#4455)
+
+The per-zone rules above match host-local **unicast** `daddr` only, so host-bound
+**multicast** (OSPF `224.0.0.5/6`, VRRP `224.0.0.18`, PIM `224.0.0.13`, …) falls
+through the input chain's `policy accept` **without** per-zone
+`host-inbound-traffic protocols` scoping — admitted packet-wide on every ingress
+interface, not scoped to the opting-in zone. This is fail-open-but-bounded (the
+host delivers only to groups a joined daemon subscribed), a Junos-parity gap.
+`ValidateConfig` emits a WARN-only commit-time advisory for a zone admitting a
+multicast routing protocol; the per-zone `iifname` enforcement is deferred. Full
+protocol→group catalog and the deferred four-decision plan:
+[`docs/host-inbound-multicast.md`](host-inbound-multicast.md).
+
 ## Global always-accepts (independent of the zone token set)
 
 These are accepted on EVERY host-inbound-configured zone regardless of its
