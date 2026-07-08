@@ -199,6 +199,13 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					// "$9$..."]).
 					if len(asNode.Keys) >= 2 {
 						url := asNode.Keys[1]
+						// #4589 A7 F-02: reject a leading-dash archive-site at
+						// commit. Runtime archival shells out to `scp <src> <dest>`;
+						// a `-`-prefixed URL is never a valid scp destination and,
+						// pre-`--`-separator, was parsed as an scp option (CWE-88).
+						if strings.HasPrefix(url, "-") {
+							return fmt.Errorf("system archival archive-sites %q: an archive-site URL must not begin with '-' (it is passed to scp as a destination, not an option)", url)
+						}
 						sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, url)
 						for i := 2; i+1 < len(asNode.Keys); i++ {
 							if asNode.Keys[i] == "password" {
@@ -223,6 +230,11 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					for _, site := range asNode.Children {
 						if len(site.Keys) >= 1 {
 							url := site.Keys[0]
+							// #4589 A7 F-02: reject a leading-dash archive-site at
+							// commit (hierarchical form). See the flat-set twin above.
+							if strings.HasPrefix(url, "-") {
+								return fmt.Errorf("system archival archive-sites %q: an archive-site URL must not begin with '-' (it is passed to scp as a destination, not an option)", url)
+							}
 							sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, url)
 							if site.FindChild("password") != nil {
 								sys.Archival.ArchiveSitesWithPassword = append(

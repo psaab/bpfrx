@@ -1,3 +1,23 @@
+## 2026-07-07 — #4589 A7 F-02 daemon+config: harden scp archive-site argv (leading-dash injection)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `scpArchiveTransfer` (`pkg/daemon/daemon_flow.go`) ran
+  `scp -o ... <srcPath> <dest>` with no `--` separator, and `dest` is an
+  operator-configured `archive-sites` URL taken verbatim
+  (`compiler_system.go`). A leading-dash URL (`-oProxyCommand=...`) is
+  parsed by scp's getopt as an OPTION → arbitrary command exec as the
+  xpfd root user (CWE-88). Two belts: (1) inserted `--` before src/dest so
+  getopt stops scanning; (2) added a commit-time reject of a leading-dash
+  archive-site in BOTH parse shapes (flat-set + hierarchical) in
+  `compileSystem`, since such a URL is never a valid scp destination.
+  Config-commit is already root-equivalent in xpf's coarse login-class
+  model, so this is defense-in-depth hardening, not a privilege
+  escalation. RED-on-revert tests
+  `TestArchivalLeadingDashSiteRejected{FlatSet,Hierarchical}` /
+  `TestArchivalValidSiteAccepted`.
+- **File(s)**: pkg/daemon/daemon_flow.go, pkg/config/compiler_system.go,
+  pkg/config/archival_leading_dash_4589_test.go, _Log.md
+
 ## 2026-07-07 — #4589 A8-01 grpcapi+api: guard Rollback against a negative n
 
 - **Timestamp**: 2026-07-07
