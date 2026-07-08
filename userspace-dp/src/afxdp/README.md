@@ -288,6 +288,21 @@ sync.
     on the flow-present `check_packet_with_zone_id` path — unchanged, with no
     screen double-run on the flow path. A truncated/unparseable header fails
     CLOSED (drop), matching the flow path (`#2146`).
+  - **#4567 — flowless UDP fragment folds into the per-destination-IP flood
+    bucket:** the flow-present UDP flood cap keys on `(dst_ip, dst_port)`
+    (Junos parity, `#4112` F18), but a non-first fragment carries no L4 port,
+    so the flowless caller passes `dst_port == 0`. `udp_flood_drop` now counts
+    that port-less fragment via the per-destination-IP `increment(dst_ip)`
+    bucket — the SAME abstraction the ICMP flood path uses (`icmp_flood_drop`)
+    — instead of `increment_ip_port(dst_ip, 0)`, which parked trailing
+    fragments in a stray `(dst_ip, 0)` sentinel-port cell distinct from both
+    the datagram's real `(dst_ip, port)` cell and the ICMP per-IP cell. A
+    first/atomic fragment or a normal datagram carries its real port and still
+    counts at `(dst_ip, dst_port)`, unchanged. Converging a trailing fragment
+    onto its datagram's real `(ip, port)` cell would need reassembly context
+    xpf lacks, so the per-IP fold is the bounded, honest abstraction (LOW —
+    per-port datagram DELIVERY is already capped by first-fragment counting;
+    this only keeps trailing-fragment noise in one consistent per-IP cell).
   - **#4155 — no screen rate double-count on fabric-redirected traffic:**
     a packet that ingressed the non-owner node was already screened there
     before being fabric-redirected to the RG owner (`docs/fabric-cross-chassis-fwd.md`).
