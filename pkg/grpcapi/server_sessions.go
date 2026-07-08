@@ -1188,12 +1188,9 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := egressIfaces[sessionEgressKey{ifindex: val.FibIfindex, vlanID: val.FibVlanID}]
+	outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
 	if outIf == "" {
-		outIf = zoneIfaces[val.EgressZone]
-		if outIf == "" {
-			outIf = zoneNames[val.EgressZone]
-		}
+		outIf = zoneNames[val.EgressZone]
 	}
 	se := &pb.SessionEntry{
 		SrcAddr:          net.IP(key.SrcIP[:]).String(),
@@ -1244,12 +1241,9 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 	if inIf == "" {
 		inIf = zoneNames[val.IngressZone]
 	}
-	outIf := egressIfaces[sessionEgressKey{ifindex: val.FibIfindex, vlanID: val.FibVlanID}]
+	outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
 	if outIf == "" {
-		outIf = zoneIfaces[val.EgressZone]
-		if outIf == "" {
-			outIf = zoneNames[val.EgressZone]
-		}
+		outIf = zoneNames[val.EgressZone]
 	}
 	se := &pb.SessionEntry{
 		SrcAddr:          net.IP(key.SrcIP[:]).String(),
