@@ -41127,3 +41127,42 @@ top.
 - **File(s)**: userspace-dp/benches/snat_allocator.rs (new),
   userspace-dp/Cargo.toml ([[bench]] entry),
   docs/research/2852-portalloc/microbench-results.md (new), _Log.md
+- **Timestamp**: 2026-07-07
+- **Action**: #4484 opus-172 LOW batch — drove L-1 (REST system-action audit
+  gap), L-2 (SSE subscriber cap), L-12 (FRR route-filter upto fail-open). L-1:
+  `POST /api/v1/system/action` reboot/halt bypassed the #4108 fsynced
+  system-action audit journal that gRPC already writes — added
+  `Server.logSystemAction` + an `apiSchedulePowerAction` test seam and journal
+  BEFORE scheduling the power action; also added the non-destructive
+  `clear-config-lock` verb (parity with gRPC `ForceExitConfigure`) so an
+  operator can self-recover an H-3/#4476 lock wedge over REST. L-2: unbounded
+  SSE subscriber set (`EventBuffer.Subscribe` had no cap; every `Add` fans out
+  O(N)) — added `TrySubscribe` gated by `defaultMaxSubscribers` (64), returning
+  nil at the cap; both REST SSE handlers now `TrySubscribe` and 503 BEFORE
+  switching to event-stream; trusted gRPC/CLI callers keep `Subscribe` (never
+  rejected, still counted). L-12: the `upto /N` renderer degraded a
+  below-base-length (empty range) or above-family-max length to the open-ended
+  `le family-max`, silently WIDENING the match to base+all-more-specifics
+  (fail-OPEN on a route-filter that gates route accept/redistribute) — changed
+  the invalid-length `default` arm to `skipEntry` (match-nothing, fail-CLOSED),
+  aligning with the #2525 posture the sibling invalid match-types
+  (prefix-length-range/through/unknown) already use; skip emits an FRR-legal
+  seq gap, never the invalid `le < prefix-len` the #2102 degrade was avoiding.
+  Updated the two #2102 tests (v4_upto_below_plen / above_maxlen) from
+  asserting `le 32` to asserting no line (fail-closed). Deferred: L-3/L-5/L-7/
+  L-11 (Rust cargo lane — reject/tcp.rs total_len clamp, reject reply-builder
+  message-type, forwarding.rs syn-cookie-key Debug, MissingNeighbor reinject);
+  L-4 (then syslog vs then log — cross-lane, needs a Rust dataplane sink split);
+  L-6 (frr.conf 0644→0640 risks breaking FRR cold-start read by the frr user —
+  needs 0640 + chown root:frr with graceful degradation, not a one-liner);
+  L-8 (operator-secret master-key — design-level feature); L-9 (control-link
+  auth show surface — new gRPC+CLI observability feature); L-10 (DDNS
+  surface-a write-ahead is the deliberate #2662 crash-safety design).
+  RED-on-revert verified for all three driven items. go test
+  ./pkg/api/... ./pkg/logging/... ./pkg/frr/... ./pkg/grpcapi/...
+  ./pkg/configstore/... green; go build ./... clean; gofmt + vet clean.
+- **File(s)**: pkg/api/system.go, pkg/api/types.go, pkg/api/sse.go,
+  pkg/api/system_action_audit_4484_test.go, pkg/logging/eventbuf.go,
+  pkg/logging/eventbuf_subscriber_cap_4484_test.go, pkg/frr/policy_render.go,
+  pkg/frr/frr_test.go, pkg/api/README.md, pkg/logging/README.md,
+  pkg/frr/README.md, _Log.md

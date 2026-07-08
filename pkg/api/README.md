@@ -201,7 +201,16 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
       matching the `xpf_host_inbound_kernel_denies_total` labels.
 - `GET /api/v1/events/stream` — Server-Sent Events stream of dataplane
   events. Backed by the `pkg/logging` event ring buffer; long-lived
-  consumers must drain. `?category=` (and `?severity=` on
+  consumers must drain. Concurrent SSE subscribers are BOUNDED (#4484 L-2):
+  both stream handlers subscribe via `EventBuffer.TrySubscribe`, which
+  returns nil once the live subscriber count reaches the cap
+  (`defaultMaxSubscribers`, 64) — the handler then responds `503` BEFORE
+  switching to event-stream. This mirrors `metricsMaxInFlight` (#4162): each
+  event `Add` fans out O(N) over the subscriber set and each subscription
+  holds a buffered channel, so an unbounded set is a memory + per-event-CPU
+  DoS vector on this untrusted surface. Trusted internal consumers (gRPC
+  event stream, CLI monitor) use `Subscribe`, which never fails but still
+  counts toward the cap. `?category=` (and `?severity=` on
   `/api/v1/logs/stream`) is fail-closed (#3383): an unrecognized token is
   rejected with `400` BEFORE the connection switches to event-stream, so a
   typo cannot silently widen the live feed to everything. A `SCREEN_DROP`
@@ -737,6 +746,16 @@ under the daemon's errgroup. Nothing else imports this package.
   Output/CombinedOutput variants live in the pkg/grpcapi sibling copy).
   Power actions take `context.Background()` — client disconnect must
   not cancel a confirmed reboot — and keep ignoring errors. The
+  `POST /api/v1/system/action` handler (`systemActionHandler`) journals
+  reboot/halt to the configstore audit journal (`s.logSystemAction` →
+  `Store.LogSystemAction`) BEFORE scheduling the power action, mirroring
+  the gRPC `SystemAction` handler (#4108 F8 / #4484 L-1) — the REST path
+  previously left NO durable attributable trail. The power action itself is
+  invoked through the `apiSchedulePowerAction` package-var seam so a test can
+  assert the journal wiring without taking the host down. The handler also
+  serves the non-destructive `clear-config-lock` verb (parity with gRPC):
+  it force-exits a wedged candidate-config lock (`Store.ForceExitConfigure`)
+  so an operator can self-recover from an H-3/#4476 lock wedge over REST. The
   ping/traceroute handlers keep their own request-ctx bounds but set
   `WaitDelay` so an inherited pipe cannot block past the kill; their
   budgets are request-sized (#1819) via `pingExecTimeout` (count × 1s +

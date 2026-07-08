@@ -725,7 +725,7 @@ type ClearDHCPIdentifierRequest struct {
 
 // SystemActionRequest holds a system action request.
 type SystemActionRequest struct {
-	Action string `json:"action"` // "reboot", "halt"
+	Action string `json:"action"` // "reboot", "halt", "clear-config-lock"
 }
 
 // ShowTextRequest holds a show text request.
