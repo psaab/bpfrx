@@ -314,6 +314,24 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #4573 VRRP VRID wire-width gate. Strict on commit / commit-check
+	// (hard-reject a `vrrp-group <id>` outside the RFC 5798 VRID range 1..255 —
+	// the id is truncated onto a single wire byte, so 256 wraps to the reserved
+	// VRID 0 and the VIP never masters, and 257 aliases VRID 1 onto another
+	// group). Lenient on load / peer-sync (warn so an already-persisted or
+	// peer-synced config still boots — #1960 no-brick; the pkg/vrrp runtime
+	// range check independently refuses to advertise an out-of-range VRID, so a
+	// leniently-loaded bad id is bounded, not a wrong-VRID advert). Runs on the
+	// fully-compiled *Config (VRRPGroups populated by parseVRRPGroups).
+	if err := validateVRRPGroupIDStrict(cfg); err != nil {
+		if opts.lenientVRRPGroupID {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("vrrp-group id (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
 	// (hard-reject a `security zones security-zone <name>` whose name is a
 	// reserved sentinel — "junos-global" is reclassified by the userspace

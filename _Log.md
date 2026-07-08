@@ -1,3 +1,45 @@
+## 2026-07-07 — #4573 vrrp/config: VRRP GroupID (VRID) range gate + priority Atoi-swallow fix
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4573 (ps-037-A3 B-001/B-002, low-med) — the `vrrp-group <id>`
+  instance slot had NO value validator (documented identity-token deferral,
+  schema_interfaces.go) and `parseVRRPGroups` stored any numeric id verbatim,
+  while the native VRRP engine truncates it onto the single VRID wire byte
+  (`uint8(vi.cfg.GroupID)`, pkg/vrrp/instance.go:1148/1249/1364/1425/1834/1849).
+  So `vrrp-group 256` wrapped to the RFC 5798-reserved VRID 0 (a strict RFC peer
+  such as Juniper discards the advert → the VIP never masters → HA cold-boot
+  blackhole) and 257 aliased VRID 1 onto an unrelated group. The chassis RG-id
+  analog was hardened (validateChassisClusterStrict, #4434) but VRRP was left
+  unguarded — that asymmetry is the gap. B-001 fix: new
+  `validateVRRPGroupIDStrict` (pkg/config/compiler_validate_strict_vrrp.go,
+  MinVRRPGroupID=1/MaxVRRPGroupID=255) is the exact sibling of the chassis gate
+  — hard-rejects an out-of-range id on STRICT commit, downgrades to a warning on
+  the tolerant load / HA-sync path (`lenientVRRPGroupID`, #1960 no-brick); wired
+  into the compiler tail-gate pass alongside validateChassisClusterStrict
+  (compiler_uniformgates.go). Defensive runtime range guard at instance creation
+  (pkg/vrrp/vrrp.go MinVRID/MaxVRID; manager.go UpdateInstances skips + slog.Warn
+  an out-of-range VRID) so a value that slips through the lenient path never
+  advertises VRID 0. B-002 fix: the priority / preempt hold-time /
+  advertise-interval parse in parseVRRPGroups (compiler_interfaces.go, BOTH the
+  flat-set Keys arm and the hierarchical child-node arm) no longer swallows the
+  `strconv.Atoi` error with `_ =` — a bad parse now keeps the constructor
+  default (priority 100) instead of silently resetting to 0 (the RFC 5798
+  resignation value). RED-on-revert verified: (config) 256/0/-1/300/65536 →
+  strict commit REJECTS with a named error, lenient WARNS not bricks, in-range
+  1/100/255 commit clean with no warning [revert: neuter validator → out-of-range
+  accepted]; (priority) non-numeric `priority abc` on the lenient path keeps 100
+  [revert hierarchical arm to `_ =` → got 0]; (runtime) UpdateInstances drops
+  GroupID 0/256/-1 and keeps 100, boundary 1/255 build [revert guard → all 4
+  built]. go test ./pkg/config/... ./pkg/vrrp/... green; go build ./... green;
+  gofmt/vet clean. test-failover is a nice-to-have (the change only REJECTS
+  invalid configs, so valid-config failover timing is unaffected) — deferred to
+  the parent.
+- **File(s)**: pkg/config/compiler_validate_strict_vrrp.go,
+  pkg/config/compiler_validate_strict_vrrp_4573_test.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/compiler_interfaces.go, pkg/config/schema_interfaces.go,
+  pkg/vrrp/vrrp.go, pkg/vrrp/manager.go, pkg/vrrp/vrid_guard_4573_test.go,
+  docs/config-schema.md, _Log.md
 ## 2026-07-07 — #4572 dataplane: clamp workers before the heartbeat zero-init loop so a large positive workers value can't wrap uint32 into a multi-billion-iteration apply hang
 
 - **Timestamp**: 2026-07-07
