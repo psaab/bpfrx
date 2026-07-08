@@ -1,3 +1,37 @@
+## 2026-07-08 — #4657 (codex-review-174 #14, refactor) format/cos.go: split view-model build from render
+
+- **Timestamp**: 2026-07-08
+- **Action**: Pure code-motion refactor of the 865-LOC
+  `pkg/dataplane/userspace/format/cos.go`. Mirrors the #4656 status.go
+  aggregate-then-render split. Extracted the config+runtime view-model
+  construction (`configuredCoSInterfaceViews`, `cosRuntimeIndex` +
+  `buildCoSRuntimeIndex` + `lookup` + `cosRuntimeCandidateNames`,
+  `buildCoSQueueViews`, `isOldJSONSyntheticDefaultQueue`) AND the
+  per-section render helpers into a new `cos_sections.go`. The big
+  `FormatCoSInterfaceSummary` render loop was decomposed into
+  `writeCoSInterfaceHeader` (config + runtime + waterfill header),
+  `writeCoSQueueTable` (tabwriter grid), and `writeCoSQueueDetail`
+  (interleaved Drops / Sojourn / Surplus / Equal-flow / OwnerProfile /
+  DrainShape / Waterfill rows); `renderBindingScopedTelemetry` and the
+  histogram helpers moved alongside. `cos.go` now holds the types, the
+  `FormatCoSInterfaceSummary` orchestrator, and the leaf formatters
+  (cos.go 280 LOC, cos_sections.go 632 LOC). The queue view slice is
+  still built exactly once per interface and shared between the
+  binding-scoped telemetry line and the queue table — no extra fetches,
+  no re-iteration. Output is byte-identical: added
+  `TestFormatCoSInterfaceSummaryGolden` (testdata/cos_summary.golden,
+  generated from the pre-refactor code, exercising every conditional
+  header/queue/detail block) as the byte-identity gate, reusing the
+  existing package-level `-update` flag. go build ./... clean, go vet
+  clean, `go test ./pkg/dataplane/userspace/format/` green (golden +
+  all 24 existing CoS tests). No operator-facing contract change (output
+  unchanged) so no module doc update needed.
+- **File(s)**: pkg/dataplane/userspace/format/cos.go (trimmed to types +
+  orchestrator + leaf formatters), pkg/dataplane/userspace/format/cos_sections.go
+  (new: view-model build + section render helpers),
+  pkg/dataplane/userspace/format/cos_golden_test.go (new byte-identity gate),
+  pkg/dataplane/userspace/format/testdata/cos_summary.golden (new), _Log.md
+
 ## 2026-07-08 — #4660 refactor: split cmd/cli/show.go by feature family
 
 - **Timestamp**: 2026-07-08
