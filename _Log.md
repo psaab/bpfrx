@@ -42255,6 +42255,45 @@ top.
   pkg/daemon/daemon_ha_userspace_export.go (new),
   pkg/daemon/daemon_ha_userspace_readiness.go (new), _Log.md
 
+- **Timestamp**: 2026-07-08
+  **Action**: refactor(test) #4669 — split pkg/dataplane/userspace/manager_test.go
+  (6782 LOC, the largest single file) by SUBSYSTEM into sibling
+  manager_<subsystem>_test.go files. Pure code-motion: 179 top-level
+  declarations (Test* funcs + helpers) MOVED verbatim; no test logic
+  change. Shared fixtures / helper-IPC / eBPF-gate setup moved FIRST into
+  manager_testhelpers_test.go (hostToNetwork16, injectShimMap,
+  injectSessionMaps, injectCtrlAndBindingMaps, injectUserspaceSessionMap,
+  skipIfBPFMapUnavailable — the map-injection harness used by both the
+  session-sync and HA tests). Subsystem-local helpers stayed with their
+  tests (sourceNATPoolTestConfig→nat, testStandbyNeighborPrewarmManager +
+  startFakeHAControlHelper + drainUpdateHAStateCount→ha, maxTestVLANID +
+  missing*VLANID* + liveSnapshotParentInterfaces→interfaces). The
+  original file carried NO build tags; eBPF/root gating is per-function
+  (skipIfBPFMapUnavailable + inline rlimit.RemoveMemlock t.Skip) and moves
+  with each test intact. New files: testhelpers(6), sessionsync(20),
+  ha(33), policycounters(6), policy(9), capabilities(18), snapshot(5),
+  nat(5), screens(15), cos(10), flow(5), tunnels(7), interfaces(24),
+  mirrors(5), routes(2), fabric(1), counters(6), misc(2). manager_test.go
+  deleted. Verified: go/parser+go/printer decl-diff vs origin/master =
+  179 old / 179 new, all canonical-identical, 0 missing / 0 extra / 0
+  mismatch (import blocks pruned per-file by goimports, excluded from the
+  decl diff). go build ./... clean, go vet clean, gofmt clean. Full
+  package `go test -v -count=1 ./pkg/dataplane/userspace/` PASS both
+  before (origin/master single-file) and after (split): 896 `=== RUN`
+  lines each, sorted RUN-name diff empty — the SAME tests run, none
+  dropped. No module-contract doc change needed: this is a test-file
+  reorganization with zero production change; pkg/dataplane/README.md
+  documents behavior, not a test-file index.
+  **File(s)**: pkg/dataplane/userspace/manager_test.go (deleted),
+  pkg/dataplane/userspace/manager_testhelpers_test.go (new),
+  manager_sessionsync_test.go, manager_ha_test.go,
+  manager_policycounters_test.go, manager_policy_test.go,
+  manager_capabilities_test.go, manager_snapshot_test.go,
+  manager_nat_test.go, manager_screens_test.go, manager_cos_test.go,
+  manager_flow_test.go, manager_tunnels_test.go,
+  manager_interfaces_test.go, manager_mirrors_test.go,
+  manager_routes_test.go, manager_fabric_test.go,
+  manager_counters_test.go, manager_misc_test.go (all new), _Log.md
 ## 2026-07-08 — #4661 refactor: split format/buffers.go model from render (773 LOC)
 
 - **Timestamp**: 2026-07-08
