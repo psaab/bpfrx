@@ -94,3 +94,16 @@ harness = false
 [[bench]]
 name = "session_table"
 harness = false
+
+# #2852 merge-gate: SNAT PortAllocator contention microbench. Re-
+# implements the current single-global-Mutex allocate shape vs the
+# proposed Phase-1 lock-free per-address occupancy bitmap + tiny map
+# lock (allocator.rs is pub(crate); same re-implement pattern as the
+# session_table bench). `harness = false` with its own multi-threaded
+# main (criterion times only single-threaded closures; a lock-
+# contention gate needs M-thread p99/p999). Answers the PLAN-KILL
+# question "is the global mutex a measurable bottleneck at 6-8
+# workers?" across the four AGY-5 profiles.
+[[bench]]
+name = "snat_allocator"
+harness = false

@@ -41099,6 +41099,34 @@ top.
 - **File(s)**: pkg/dhcpserver/lease_sync_test.go,
   test/incus/dhcp-lease-failover.sh, pkg/dhcpserver/README.md, _Log.md
 
+## 2026-07-07 — #2852 SNAT PortAllocator contention microbench (merge-gate)
+- **Timestamp**: 2026-07-07
+- **Action**: Added the #2852 REQUIRED merge-gate contention microbench that
+  answers the plan's PLAN-KILL question "is the global
+  `Mutex<PortAllocatorLiveState>` (allocator.rs:166) a measurable bottleneck
+  at 6-8 workers?". Re-implemented both hot-path allocate shapes side by side
+  (production allocator is `pub(crate)` in a bin crate — same re-implement
+  precedent as benches/session_table.rs): CUR = one global Mutex over the whole
+  allocate critical section; NEW = Phase-1 per-address atomic occupancy bitmap
+  (Vec<AtomicU64> + atomic cursor, fetch_or CAS-claim = the bit IS the ownership
+  token) + a tiny mutex over only the live_by_flow insert/remove + global cap as
+  AtomicUsize (F4). Drove M={1,2,4,6,8} across the four AGY-5 profiles (uniform
+  low-occ, 92% occ, 80/20 skew, narrow 64-port). VERDICT: mutex bottleneck
+  CONFIRMED (CUR negative-scales 2.87M->0.62M a/s M=1->8, p99 tail 300ns->31us,
+  no PLAN-KILL); Phase-1 WARRANTED (NEW 1.4-1.6x faster at M=6/8 across all
+  profiles, 1.3-2x lower p99); Phase-2 (shard maps) INDICATED because the
+  residual tiny mutex caps NEW at ~1.0M a/s at M=8 (short of near-linear). Two
+  iterations needed: (1) bit-by-bit probe unfairly penalized the bitmap at high
+  occupancy -> switched to word-scan trailing_zeros(!word) (O(1) per non-full
+  word); (2) a bench key-collision artifact (thread id in ignored high bits)
+  leaked bitmap bits + live-count on the proposed shape and cascaded the narrow
+  pool to spurious exhaustion -> encode tid into the 5-tuple so keys are
+  globally unique. Recorded the F4 reserve-before-release narrow-pool overshoot
+  caveat for the /engineer follow-on. cargo bench compiles + runs (0% fail all
+  profiles); rustfmt clean; full cargo test SERIAL green.
+- **File(s)**: userspace-dp/benches/snat_allocator.rs (new),
+  userspace-dp/Cargo.toml ([[bench]] entry),
+  docs/research/2852-portalloc/microbench-results.md (new), _Log.md
 - **Timestamp**: 2026-07-07
 - **Action**: #4484 opus-172 LOW batch — drove L-1 (REST system-action audit
   gap), L-2 (SSE subscriber cap), L-12 (FRR route-filter upto fail-open). L-1:
