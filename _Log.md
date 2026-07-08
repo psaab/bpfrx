@@ -42448,3 +42448,58 @@ top.
   `go build ./...`, `go test ./cmd/cli/...` green, gofmt clean. No module-doc
   change needed — internal remote-CLI fix, no behavior/contract change.
   **File(s)**: cmd/cli/monitor.go, _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: fable-173 Rust LOW batch — #4673 delete dead
+  IcmpTeRateLimiter; #4674 canonical_route_table -> Cow. #4675
+  (session/lookup.rs metadata.clone()) SKIPPED as unsafe (see below).
+
+  #4673 (LOW, dead-code): deleted the dead `IcmpTeRateLimiter`
+  (const `ICMP_TE_MAX_PER_SEC` + struct + impl, all `#[allow(dead_code)]`)
+  from forwarding/mod.rs. Tree-wide grep confirmed ZERO callers — the live
+  ICMP-TE rate-limit path is GCRA in afxdp/icmp_ratelimit.rs. The const was
+  referenced only by the dead code. Compiler + zero-caller grep is the gate
+  (no RED test for a pure dead-code delete).
+
+  #4674 (LOW perf): `canonical_route_table` now returns
+  `Cow<'static, str>` instead of `String`. The default-table remaps
+  (`inet.0`<->`inet6.0`) borrow the `'static` DEFAULT_V4_TABLE/DEFAULT_V6_TABLE
+  constants and the two lookup-path callers default to
+  `Cow::Borrowed(DEFAULT_V*_TABLE)` — this removes the per-new-flow FIB
+  resolution heap alloc that `.to_string()` forced. Only the rare per-VRF
+  suffix rewrite (`<inst>.inet.0`<->`<inst>.inet6.0`) or a non-canonical
+  passthrough owns a `String`. Callers updated: the two `.unwrap_or_else(||
+  DEFAULT_V*_TABLE.to_string())` -> `.unwrap_or(Cow::Borrowed(...))`; two
+  `tables.contains(&table)` -> `.contains(table.as_ref())`; the cold
+  build-path `.entry(table)` -> `.entry(table.into_owned())` (fib.rs, x2)
+  and the tunnel-endpoint `transport_table` field init ->
+  `transport_table.into_owned()` (tunnels.rs). The next-table recursion
+  comparisons work unchanged via std's symmetric `Cow`/`String`/`&str`
+  PartialEq impls; `&table` deref-coerces to `&str`. Behavior-identical.
+  RED-on-revert: `canonical_route_table_borrows_default_and_owns_vrf` asserts
+  `Cow::Borrowed(_)` for the defaults and `Cow::Owned(_)` for VRF/passthrough
+  — the pre-#4674 `String` return type cannot match those patterns, so the
+  test fails to compile against the reverted signature.
+
+  #4675 (LOW-MED perf): SKIPPED as unsafe, issue kept OPEN. VERIFY-FIRST:
+  `SessionMetadata` (session/entry.rs) is NOT `Copy` — it carries
+  `policy_counter: Option<Arc<PolicyRuleCounter>>`, the #3322 reorder-stable
+  bound hit-counter handle held in shared ownership with `PolicyCounterStore`
+  (the established fast path increments it every packet). The clone's only
+  cost is one `Option<Arc>` refcount bump, and only for policy-forwarded
+  sessions (None -> free). All four clone sites (lookup.rs:183/240/281/321)
+  build OWNED return values (`SessionLookup` / `ForwardSessionMatch` / a
+  tuple) that outlive the table borrow (the &mut self.entries borrow ends
+  before the caller consumes the result). A borrow cannot cross that
+  boundary, and making the type `Copy` would require removing the
+  load-bearing Arc (reintroducing the #3322 live-reorder misattribution) or a
+  return-type split rippling through every lookup caller — neither a LOW-risk
+  change. Per the task's guard, not forcing a lifetime change that breaks the
+  lookup.
+
+  Validation: FULL cargo test suite (userspace-dp) SERIAL.
+  **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/fib.rs,
+  userspace-dp/src/afxdp/forwarding_build/tunnels.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md, _Log.md

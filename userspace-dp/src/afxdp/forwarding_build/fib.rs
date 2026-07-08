@@ -80,7 +80,7 @@ pub(super) fn populate_routes(
             );
             state
                 .routes_v4
-                .entry(table)
+                .entry(table.into_owned())
                 .or_default()
                 .push(RouteEntryV4 {
                     prefix: PrefixV4::from_net(prefix),
@@ -114,7 +114,7 @@ pub(super) fn populate_routes(
             );
             state
                 .routes_v6
-                .entry(table)
+                .entry(table.into_owned())
                 .or_default()
                 .push(RouteEntryV6 {
                     prefix: PrefixV6::from_net(prefix),

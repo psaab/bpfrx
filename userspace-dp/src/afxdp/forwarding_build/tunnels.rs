@@ -90,7 +90,7 @@ pub(super) fn populate_tunnel_endpoints(
                 destination,
                 key: endpoint.key,
                 ttl,
-                transport_table,
+                transport_table: transport_table.into_owned(),
                 wg_listen_port: endpoint.wg_listen_port,
                 wg_local_privkey,
                 wg_peers,
