@@ -41888,3 +41888,30 @@ top.
   which needs /triple-review.
 - **File(s)**: userspace-dp/src/policy.rs,
   userspace-dp/src/policy_snapshot_error.rs, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4313 — three MORE per-subtree closed-world flips (extends
+  #4578 master-password + #4623 IKE proposal). (1) `security ipsec proposal`
+  (Phase-2 ESP crypto): modeled the two missing leaves — `lifetime-kilobytes`
+  (captured to `IPsecProposal.LifetimeKilobytes`, accepted-only + ValidateConfig
+  advisory since the strongSwan renderer emits only `rekey_time`, not
+  `rekey_bytes`) and cosmetic `description` (compiler-ignored) — THEN flipped
+  `closedWorld:true`. Sibling of the closed IKE proposal; silent-drop of a
+  typo'd `encryption-algorithm` FAILS OPEN on crypto (ESP SA negotiates without
+  the operator's cipher). (2) `security nat nat64` (xpf-native NAT64 stanza):
+  flipped the container `closedWorld:true` — leaf-complete by construction
+  (only `rule-set` → `prefix`/`source-pool`; `compileNAT64` + `NAT64RuleSet`
+  read/hold only those two). A typo'd `prefx` left `Prefix` empty →
+  `validateNAT64PrefixStrict` skipped the rule → NAT64 silently inert. (3)
+  `security nat natv6v4`: flipped `closedWorld:true` — only `no-v6-frag-header`.
+  Each flip: RED-on-revert rejection test (typo REJECTED at strict commit,
+  named + "closed-world"; verified RED by toggling the flags false), full
+  modeled-leaf-set commits clean (no false-reject), lenient path warns-not-
+  bricks. `go test ./pkg/config/...` green; gofmt/vet/build clean;
+  golden_4406 unaffected (new leaves unused by the corpus).
+- **File(s)**: pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/compiler_ipsec.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/schema_closedworld_ipsec_proposal_4313_test.go,
+  pkg/config/schema_closedworld_nat64_4313_test.go,
+  pkg/config/schema_closedworld_natv6v4_4313_test.go,
+  docs/config-schema.md, _Log.md

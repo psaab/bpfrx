@@ -1012,10 +1012,38 @@ Phase-1 IKE proposal above. The completeness audit that gates the flip:
   `schema_closedworld_ipsec_proposal_4313_test.go` (RED on revert of the flag;
   the lenient-no-brick case and the advisory are covered too).
 
+**More production flips — `security nat nat64` and `security nat natv6v4`
+(xpf-native NAT64 stanzas, #4313).** Both now set `closedWorld:true`
+(`schema_security.go`). These are xpf-NATIVE stanzas (Junos does NAT64 via
+source/destination NAT + `then static-nat inet`, not this spelling), so the
+grammar IS exactly what xpf models and compiles — there is no external Junos
+superset to false-reject, making them leaf-complete by construction:
+
+- `security nat nat64` — the container's only child is `rule-set`, and a
+  rule-set's only children are `prefix` and `source-pool` (both modeled value
+  leaves whose value rides on the same statement line). The compiler
+  (`compileNAT64`) reads ONLY those two and the struct (`NAT64RuleSet`) holds
+  ONLY `Prefix` + `SourcePool`. `closedWorld` is set on the `nat64` container so
+  it is inherited down (the `childClosed` fold): a typo at the nat64 level
+  (`rulset`) OR under a rule-set (`prefx` / `source-pol`) is rejected. Silent-
+  drop was a real footgun: a typo'd `prefx` left `NAT64RuleSet.Prefix` empty,
+  `validateNAT64PrefixStrict` skipped the rule (`Prefix == ""` → continue), and
+  NAT64 translation silently did nothing — IPv6-only clients lost IPv4
+  reachability with no error. Tests: `schema_closedworld_nat64_4313_test.go`.
+- `security nat natv6v4` — its entire grammar is the single flag
+  `no-v6-frag-header` (modeled); the compiler reads ONLY that keyword and the
+  struct (`NATv6v4Config`) holds ONLY `NoV6FragHeader`. A typo
+  (`no-v6-frag-heder`) previously committed clean and silently left the IPv6
+  fragment header in translated packets; it is now rejected at strict commit.
+  Tests: `schema_closedworld_natv6v4_4313_test.go`.
+
+As with every flip, the reject fires only on the strict commit path;
+`compileTreeLenient` downgrades it to a warning on `Store.Load` / `SyncApply`.
+
 **The systematic per-subtree closure continues (#4313).** Each of the flips
 above (destination-NAT then, the three IPsec option containers, master-password,
-the Phase-1 IKE proposal, now the Phase-2 IPsec proposal) closes one
-leaf-complete high-risk subtree; the
+the Phase-1 IKE proposal, now the Phase-2 IPsec proposal and the two
+xpf-native NAT64 stanzas) closes one leaf-complete high-risk subtree; the
 blanket-default flip stays deferred (it would break the deliberately-lenient
 accept-with-advisory knobs #2078/#4231 and false-reject valid-but-unmodeled
 Junos, the #4191 class). Both the remaining per-subtree flips and the

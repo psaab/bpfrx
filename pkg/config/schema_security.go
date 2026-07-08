@@ -586,13 +586,39 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				}},
 			}},
 		}},
-		"nat64": {desc: "NAT64 (IPv6-to-IPv4) translation", children: map[string]*schemaNode{
+		// #4313 — closed-world flip. `security nat nat64` is an xpf-NATIVE
+		// stanza (Junos does NAT64 via source/destination NAT + `then static-nat
+		// inet`, not this spelling), so its grammar IS exactly what xpf models
+		// and compiles — there is no external Junos superset to false-reject.
+		// The container's only child is `rule-set`, and a rule-set's only
+		// children are `prefix` and `source-pool` (both modeled, both value
+		// leaves whose value rides on the same statement line). The compiler
+		// (compiler_nat.go compileNAT64) reads ONLY prefix + source-pool and the
+		// struct (NAT64RuleSet) holds ONLY those two — so the subtree is
+		// leaf-complete by construction and closing it cannot false-reject a
+		// valid config. Silent-drop here is a real footgun: a typo'd `prefx`
+		// left NAT64RuleSet.Prefix empty, validateNAT64PrefixStrict skipped the
+		// rule (`Prefix == ""` → continue), and the NAT64 translation silently
+		// did nothing — IPv6-only clients lost IPv4 reachability with no error.
+		// closedWorld inherits down every level (childClosed fold), so a typo at
+		// the nat64 level (`rulset`) OR under a rule-set (`prefx`/`source-pol`)
+		// is REJECTED at strict commit; the tolerant Load/SyncApply path
+		// downgrades to a warning (#1960).
+		"nat64": {desc: "NAT64 (IPv6-to-IPv4) translation", closedWorld: true, children: map[string]*schemaNode{
 			"rule-set": {desc: "NAT64 rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
 				"prefix":      {desc: "NAT64 IPv6 prefix (must be /96)", args: 1, placeholder: "<ipv6-prefix>", children: nil},
 				"source-pool": {desc: "Source NAT pool for the translated IPv4 source", args: 1, placeholder: "<pool-name>", children: nil},
 			}},
 		}},
-		"natv6v4": {desc: "NAT64 IPv6-to-IPv4 options", children: map[string]*schemaNode{
+		// #4313 — closed-world flip. `security nat natv6v4` is an xpf-NATIVE
+		// options stanza whose entire grammar is the single flag
+		// `no-v6-frag-header` (modeled). The compiler (compiler_nat.go) reads
+		// ONLY that keyword and the struct (NATv6v4Config) holds ONLY
+		// NoV6FragHeader, so the subtree is leaf-complete by construction. A
+		// typo (`no-v6-frag-heder`) previously committed clean and silently left
+		// the IPv6 fragment header in translated packets; it is now rejected at
+		// strict commit (lenient path warns, #1960).
+		"natv6v4": {desc: "NAT64 IPv6-to-IPv4 options", closedWorld: true, children: map[string]*schemaNode{
 			"no-v6-frag-header": {desc: "Omit the IPv6 fragment header in translated packets", children: nil},
 		}},
 		"proxy-arp": {desc: "Proxy ARP for NAT pool addresses", children: map[string]*schemaNode{
