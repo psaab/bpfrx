@@ -1,3 +1,25 @@
+## 2026-07-08 — #4700 fix BROKEN-MASTER: legacy-dataplane import-allowlist drift after #4659 split
+
+- **Timestamp**: 2026-07-08
+- **Action**: Fixed `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports`
+  failing on clean master. #4659 ("refactor: split daemon_ha_userspace.go
+  by concern") moved the root `pkg/dataplane` imports out of
+  `daemon_ha_userspace.go` (now imports only `pkg/config`) into three new
+  files. The allowlist guard flagged the three new files as unexpected
+  imports and `daemon_ha_userspace.go` as a stale entry. Removed the stale
+  entry and added three accurate entries (case a + c): convert.go names
+  root session-domain types (SessionKey/V6, SessionValue/V6) +
+  SessFlag*/LogFlag* wire constants; readiness.go reads
+  EffectiveType/TypeUserspace; stream.go names AFInet/AFInet6. Kept the
+  #1373 docs table (`docs/pr/1373-retire-ebpf-dataplane/README.md`) in sync
+  per the test's own drift message.
+- **File(s)**: `pkg/dataplane/retirement_boundary_canary_test.go`,
+  `docs/pr/1373-retire-ebpf-dataplane/README.md`
+- **Validation**: previously-RED
+  `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports` now GREEN;
+  `go test ./pkg/dataplane/` + `./pkg/daemon/` pass; `go build ./...`,
+  `go vet` clean; `gofmt`.
+
 ## 2026-07-08 — #4559 mode 2: enforce deterministic NAPT64 (IPv6 subscriber) block allocation on userspace
 
 - **Timestamp**: 2026-07-08
