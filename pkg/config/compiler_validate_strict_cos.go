@@ -259,6 +259,51 @@ func validateClassOfServiceLossPriorityStrict(cos *ClassOfServiceConfig) error {
 	return nil
 }
 
+// validateClassOfServiceForwardingClassQueueStrict hard-rejects a
+// class-of-service forwarding-class whose queue is outside the accepted
+// 0..255 range (#4594). Before this gate the out-of-range queue was
+// warn-only (ValidateConfig) and COMMITTED, but the userspace helper
+// deserializes the queue id via a checked u8::try_from and fail-closes the
+// ENTIRE CoS snapshot on CosQueueIdOutOfRange (#2410) — silently keeping the
+// node's STALE CoS forwarding state. The operator sees a committed config that
+// is not being enforced (a config/dataplane divergence). Reject it loudly at
+// commit / commit-check instead, mirroring the fairness rss-expectation
+// queue-range reject in compiler_class_of_service.go and the sibling CoS strict
+// gates.
+//
+// xpf's valid queue range is 0..255 (the dataplane's u8 queue id), NOT the
+// Junos-classic 0..7 — see the warn text in compiler_validate_warn.go and the
+// CosQueueIdOutOfRange backstop.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientCoSForwardingClassQueue) so a config persisted by an
+// older binary — which only warned, then committed — or synced from a peer
+// still boots (#1960 no-brick); the dataplane's CosQueueIdOutOfRange fail-close
+// keeps the stale-but-safe posture on that boot. Forwarding classes are visited
+// in sorted order so commit-check surfaces a STABLE first-error message.
+func validateClassOfServiceForwardingClassQueueStrict(cos *ClassOfServiceConfig) error {
+	if cos == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cos.ForwardingClasses))
+	for name := range cos.ForwardingClasses {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		class := cos.ForwardingClasses[name]
+		if class == nil {
+			continue
+		}
+		if class.Queue < 0 || class.Queue > 255 {
+			return fmt.Errorf(
+				"class-of-service forwarding-class %q uses out-of-range queue %d (expected 0..255)",
+				class.Name, class.Queue)
+		}
+	}
+	return nil
+}
+
 func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 	if cos == nil {
 		return nil

@@ -72,6 +72,36 @@ The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 `load`/...) plus the retained `set system dataplane` description overlay.
 
+### `class-of-service forwarding-classes queue` range (#4594)
+
+`validateClassOfServiceForwardingClassQueueStrict`
+(`compiler_validate_strict_cos.go`, gated in `runUniformGates`) hard-rejects a
+forwarding-class whose `queue` is outside **0..255** on the strict commit /
+commit-check path. The value used to be warn-only (`ValidateConfig`) and
+COMMITTED, while the userspace helper deserializes the queue id via a checked
+`u8::try_from` and fail-closes the WHOLE CoS snapshot on `CosQueueIdOutOfRange`
+(#2410), silently keeping the node's STALE CoS forwarding state — a
+config/dataplane divergence the operator could not see. xpf's valid range is
+0..255 (the dataplane's `u8` queue id), NOT Junos-classic 0..7. The tolerant
+load / peer-sync path downgrades to a warning
+(`opts.lenientCoSForwardingClassQueue`) so an already-persisted queue that
+committed under an older binary still boots (#1960 no-brick); the
+`CosQueueIdOutOfRange` fail-close is the stale-but-safe backstop on that boot.
+
+### `protocols lldp` TTL bounds (#4596)
+
+The `transmit-interval` and `hold-multiplier` leaves (`schema_routing.go`) now
+carry `ValidateInteger` typed-leaf validators bounding them to the IEEE 802.1AB
+LLDP-MIB ranges Junos also enforces — `lldpMessageTxInterval` **5..32768** and
+`lldpMessageTxHoldMultiplier` **2..10**. Their product feeds the 16-bit LLDP TTL
+TLV (`ttl = transmit-interval × hold-multiplier`); before this gate both leaves
+were untyped (bare `Atoi`), so e.g. `transmit-interval 16384` × default
+hold-multiplier 4 = 65536 wrapped `uint16` to a TTL of 0 and IMMEDIATELY expired
+the neighbor. `encodeTTL` (`pkg/lldp/lldp.go`) additionally clamps the computed
+TTL to `[0, 0xffff]` as a defensive backstop so even the in-range IEEE extreme
+(32768 × 10) — and any constructed caller — cannot wrap, matching the standard's
+own `txTTL = min(65535, msgTxInterval × msgTxHold)`.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
