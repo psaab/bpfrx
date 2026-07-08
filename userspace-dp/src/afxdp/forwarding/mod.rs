@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 mod host_inbound;
 // #3070: re-export into the afxdp scope so the local-delivery admit path
@@ -45,23 +46,31 @@ pub(super) fn classify_metadata(
     }
 }
 
-pub(super) fn canonical_route_table(table: &str, is_ipv6: bool) -> String {
+/// #4674: returns `Cow<'static, str>` rather than an owned `String`. The
+/// common cases — the default-table remaps (`inet.0`↔`inet6.0`) — borrow the
+/// `'static` `DEFAULT_V4_TABLE`/`DEFAULT_V6_TABLE` constants and never
+/// allocate. Only the rare per-VRF suffix rewrite (`<inst>.inet.0`↔
+/// `<inst>.inet6.0`) or a non-canonical passthrough owns a heap string. This
+/// removes the per-new-flow FIB-resolution alloc that `.to_string()` forced at
+/// every lookup-path caller (see `lookup_forwarding_resolution_inner_ecmp`,
+/// which now defaults to `Cow::Borrowed(DEFAULT_V*_TABLE)`).
+pub(super) fn canonical_route_table(table: &str, is_ipv6: bool) -> Cow<'static, str> {
     if is_ipv6 {
-        if table == "inet.0" {
-            return "inet6.0".to_string();
+        if table == DEFAULT_V4_TABLE {
+            return Cow::Borrowed(DEFAULT_V6_TABLE);
         }
         if let Some(prefix) = table.strip_suffix(".inet.0") {
-            return format!("{prefix}.inet6.0");
+            return Cow::Owned(format!("{prefix}.inet6.0"));
         }
-        return table.to_string();
+        return Cow::Owned(table.to_string());
     }
-    if table == "inet6.0" {
-        return "inet.0".to_string();
+    if table == DEFAULT_V6_TABLE {
+        return Cow::Borrowed(DEFAULT_V4_TABLE);
     }
     if let Some(prefix) = table.strip_suffix(".inet6.0") {
-        return format!("{prefix}.inet.0");
+        return Cow::Owned(format!("{prefix}.inet.0"));
     }
-    table.to_string()
+    Cow::Owned(table.to_string())
 }
 
 /// #3771 (M12): count of neighbors skipped because their kernel state string
@@ -1237,42 +1246,6 @@ pub(super) fn select_tcp_mss(
 
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.
 
-#[allow(dead_code)]
-const ICMP_TE_MAX_PER_SEC: u32 = 100;
-
-/// Rate limiter for ICMP Time Exceeded messages.
-#[allow(dead_code)]
-struct IcmpTeRateLimiter {
-    max_per_sec: u32,
-    count: u32,
-    window_start_ns: u64,
-}
-
-#[allow(dead_code)]
-impl IcmpTeRateLimiter {
-    fn new(max_per_sec: u32) -> Self {
-        Self {
-            max_per_sec,
-            count: 0,
-            window_start_ns: 0,
-        }
-    }
-
-    fn allow(&mut self, now_ns: u64) -> bool {
-        let window = now_ns / 1_000_000_000;
-        let prev_window = self.window_start_ns / 1_000_000_000;
-        if window != prev_window {
-            self.count = 0;
-            self.window_start_ns = now_ns;
-        }
-        if self.count >= self.max_per_sec {
-            return false;
-        }
-        self.count += 1;
-        true
-    }
-}
-
 /// Returns true if the packet is IPsec traffic (ESP protocol 50, AH protocol
 /// 51, or IKE UDP ports 500/4500) that should be passed to the kernel for
 /// XFRM processing.
@@ -1457,7 +1430,7 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
         IpAddr::V4(ip) => {
             let table = table
                 .map(|table| canonical_route_table(table, false))
-                .unwrap_or_else(|| DEFAULT_V4_TABLE.to_string());
+                .unwrap_or(Cow::Borrowed(DEFAULT_V4_TABLE));
             if state.local_v4.contains(&ip) {
                 // #3151: local-delivery (to-self) attribution is table-scoped,
                 // exactly like the route-path connected scan (#2388). When the
@@ -1490,7 +1463,7 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                     || state
                         .local_tables_v4
                         .get(&ip)
-                        .is_some_and(|tables| tables.contains(&table));
+                        .is_some_and(|tables| tables.contains(table.as_ref()));
                 if !owned_here {
                     // Owned in a DIFFERENT table only (cross-VRF) — fall
                     // through to the VRF-A route lookup instead of leaking to
@@ -1541,7 +1514,7 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
         IpAddr::V6(ip) => {
             let table = table
                 .map(|table| canonical_route_table(table, true))
-                .unwrap_or_else(|| DEFAULT_V6_TABLE.to_string());
+                .unwrap_or(Cow::Borrowed(DEFAULT_V6_TABLE));
             if state.local_v6.contains(&ip) {
                 // #3151: table-scoped local-delivery attribution (see the v4
                 // branch above and the #2388 route-path connected scan).
@@ -1556,7 +1529,7 @@ pub(super) fn lookup_forwarding_resolution_inner_ecmp(
                     || state
                         .local_tables_v6
                         .get(&ip)
-                        .is_some_and(|tables| tables.contains(&table));
+                        .is_some_and(|tables| tables.contains(table.as_ref()));
                 if !owned_here {
                     // Owned in a DIFFERENT table only (cross-VRF) — fall
                     // through to the route lookup.

@@ -2626,6 +2626,42 @@ fn forwarding_state_normalizes_ipv6_routes_emitted_in_inet_table() {
 }
 
 #[test]
+fn canonical_route_table_borrows_default_and_owns_vrf() {
+    // #4674: the default-table remaps must borrow the 'static
+    // DEFAULT_V4_TABLE/DEFAULT_V6_TABLE constants so the per-new-flow FIB
+    // resolution path allocates nothing; only the rare per-VRF suffix rewrite
+    // or a non-canonical passthrough owns a heap String. RED-on-revert: the
+    // pre-#4674 `String` return type cannot match the `Cow::Borrowed` /
+    // `Cow::Owned` patterns, so this test fails to compile against the
+    // reverted signature.
+    use std::borrow::Cow;
+
+    // v4 -> v6 default remap: borrowed (zero alloc), equals inet6.0.
+    let v6_default = canonical_route_table("inet.0", true);
+    assert!(matches!(v6_default, Cow::Borrowed(_)));
+    assert_eq!(v6_default, "inet6.0");
+
+    // v6 -> v4 default remap: borrowed (zero alloc), equals inet.0.
+    let v4_default = canonical_route_table("inet6.0", false);
+    assert!(matches!(v4_default, Cow::Borrowed(_)));
+    assert_eq!(v4_default, "inet.0");
+
+    // Per-VRF suffix rewrite: owned (rare path), correct family rewrite.
+    let vrf_v6 = canonical_route_table("myvrf.inet.0", true);
+    assert!(matches!(vrf_v6, Cow::Owned(_)));
+    assert_eq!(vrf_v6, "myvrf.inet6.0");
+
+    let vrf_v4 = canonical_route_table("myvrf.inet6.0", false);
+    assert!(matches!(vrf_v4, Cow::Owned(_)));
+    assert_eq!(vrf_v4, "myvrf.inet.0");
+
+    // Non-canonical passthrough: owned, unchanged.
+    let passthrough = canonical_route_table("custom.table", true);
+    assert!(matches!(passthrough, Cow::Owned(_)));
+    assert_eq!(passthrough, "custom.table");
+}
+
+#[test]
 fn dynamic_neighbor_cache_enables_forward_candidate() {
     let state = build_forwarding_state(&forwarding_snapshot(false));
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());

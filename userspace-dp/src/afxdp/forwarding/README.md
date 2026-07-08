@@ -24,7 +24,12 @@ slow-path-injected.
 
 - `DEFAULT_V4_TABLE = "inet.0"`, `DEFAULT_V6_TABLE = "inet6.0"` —
   the default routing tables a packet starts in when no
-  routing-instance scopes it.
+  routing-instance scopes it. `canonical_route_table` (#4674) returns
+  `Cow<'static, str>`: the default-table remaps (`inet.0`↔`inet6.0`)
+  and the lookup-path default both borrow these `'static` constants and
+  allocate nothing on the per-new-flow FIB resolution path; only the
+  rare per-VRF suffix rewrite (`<inst>.inet.0`↔`<inst>.inet6.0`) or a
+  non-canonical passthrough owns a heap `String`.
 - `MAX_NEXT_TABLE_DEPTH = 8` — bounded recursion across `next-table`
   chains to keep a misconfigured loop from running forever.
 
