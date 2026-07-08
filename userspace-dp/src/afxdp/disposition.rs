@@ -129,6 +129,16 @@ pub(super) enum DispositionCounters<'a> {
 }
 
 impl DispositionCounters<'_> {
+    /// #3651: true on the worker per-packet hot path (`Hot`), false for the
+    /// cold RPC-inject path (`Cold`). Per-zone traffic accounting only runs on
+    /// `Hot` because the coalescer's thread-local is folded into the shared
+    /// store from the worker RX-batch flush — the control thread that drives
+    /// `Cold` never reaches that flush, so its accumulation would be lost.
+    #[inline]
+    fn is_hot(&self) -> bool {
+        matches!(self, Self::Hot(_))
+    }
+
     #[inline]
     fn bump_validated(&mut self, packet_length: u32) {
         match self {
@@ -333,6 +343,21 @@ pub(super) fn record_forwarding_disposition(
         }
         ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect => {
             counters.bump_forward_candidate();
+            // #3651: per-zone traffic volume for forward paths that resolve
+            // through record_forwarding_disposition (tunnel decap, next-table,
+            // fabric redirect). Hot-path only (the Cold RPC-inject path's
+            // thread-local coalescer is never flushed); needs the shim meta for
+            // the ingress zone.
+            if counters.is_hot()
+                && let Some(m) = meta
+            {
+                crate::afxdp::zone_counters::record_zone_traffic(
+                    &forwarding.zone_counter_slot_map,
+                    m.ingress_zone,
+                    forwarding.egress_zone_id(resolution.egress_ifindex),
+                    m.pkt_len as u64,
+                );
+            }
         }
         ForwardingDisposition::HAInactive => {
             update_last_resolution(last_resolution, resolution, debug, forwarding);

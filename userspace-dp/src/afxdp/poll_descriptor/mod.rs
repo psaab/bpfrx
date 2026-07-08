@@ -4008,6 +4008,17 @@ pub(super) fn poll_binding_process_descriptor(
                             .push((flow.forward_key.clone(), decision.nat));
                     }
                     telemetry.counters.forward_candidate_packets += 1;
+                    // #3651: per-zone traffic volume for this slow-path (first-
+                    // packet / non-cacheable) forwarded packet, mirroring the
+                    // flow-cache-hit fast path.
+                    crate::afxdp::zone_counters::record_zone_traffic(
+                        &worker_ctx.forwarding.zone_counter_slot_map,
+                        meta.ingress_zone,
+                        worker_ctx
+                            .forwarding
+                            .egress_zone_id(decision.resolution.egress_ifindex),
+                        meta.pkt_len as u64,
+                    );
                     if decision.nat.rewrite_src.is_some() {
                         telemetry.counters.snat_packets += 1;
                     }

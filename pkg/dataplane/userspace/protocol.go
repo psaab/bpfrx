@@ -1469,17 +1469,33 @@ type ProcessStatus struct {
 	// bpfShim nat_rule_counters offset map so Manager.ReadNATRuleCounter (and
 	// thus `show security nat source/destination/static rule`) reports the
 	// live translation count instead of a perpetual 0.
-	NATRuleCounters           []NATRuleCounterStatus            `json:"nat_rule_counters,omitempty"`
-	FilterTermCounters        []FirewallFilterTermCounterStatus `json:"filter_term_counters,omitempty"`
-	ThreeColorPolicerCounters []ThreeColorPolicerStatus         `json:"three_color_policer_counters,omitempty"`
-	SourceNATPools            []SourceNATPoolStatus             `json:"source_nat_pools,omitempty"`
-	LastResolution            *PacketResolution                 `json:"last_resolution,omitempty"`
-	SlowPath                  SlowPathStatus                    `json:"slow_path,omitempty"`
-	LastCacheFlushAt          uint64                            `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
-	DataplaneMode             string                            `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
-	ConfiguredMode            string                            `json:"configured_mode,omitempty"`        // Desired mode from config
-	EntryPrograms             map[int]string                    `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
-	DegradedPathCounters      map[string]uint64                 `json:"degraded_path_counters,omitempty"` // reason_name -> count
+	NATRuleCounters    []NATRuleCounterStatus            `json:"nat_rule_counters,omitempty"`
+	FilterTermCounters []FirewallFilterTermCounterStatus `json:"filter_term_counters,omitempty"`
+	// #3651: per-zone ingress/egress traffic (packet + byte) volume, summed
+	// across every worker/binding by the helper (ProcessStatus-level
+	// pre-summed sparse block, one row per zone with nonzero traffic keyed by
+	// the stable zone id). syncBPFCountersLocked mirrors each row into the
+	// legacy bpfShim zone-counter offset map via SetZoneCounterOffset so
+	// Manager.ReadZoneCounters (and thus `show security zones` Traffic
+	// statistics, REST /security/zones, and the Prometheus collector) reports
+	// live per-zone volume instead of ErrCounterNotPopulated ("not
+	// available"). ZoneCounterLayoutVersion selects the decode path (0/absent =
+	// pre-#3651 helper, no per-zone data); ZoneCounterOverflowActive means the
+	// configured zone count exceeded the helper's dense hot-path slot capacity
+	// so some zones went uncounted. JSON tags MUST match the Rust serde
+	// rename(...) exactly.
+	ZoneCounterLayoutVersion  uint32                     `json:"zone_counter_layout_version,omitempty"`
+	ZoneCounterOverflowActive bool                       `json:"zone_counter_overflow_active,omitempty"`
+	ZoneTrafficCounters       []ZoneTrafficCounterStatus `json:"zone_traffic_counters,omitempty"`
+	ThreeColorPolicerCounters []ThreeColorPolicerStatus  `json:"three_color_policer_counters,omitempty"`
+	SourceNATPools            []SourceNATPoolStatus      `json:"source_nat_pools,omitempty"`
+	LastResolution            *PacketResolution          `json:"last_resolution,omitempty"`
+	SlowPath                  SlowPathStatus             `json:"slow_path,omitempty"`
+	LastCacheFlushAt          uint64                     `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
+	DataplaneMode             string                     `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode            string                     `json:"configured_mode,omitempty"`        // Desired mode from config
+	EntryPrograms             map[int]string             `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
+	DegradedPathCounters      map[string]uint64          `json:"degraded_path_counters,omitempty"` // reason_name -> count
 	// #1636 option C: proactive-neighbor-warm telemetry. WarmDrops counts
 	// warm requests dropped because the bounded warmer queue was full
 	// (transient); WarmDisconnected counts requests dropped because the
@@ -2093,6 +2109,22 @@ type NATRuleCounterStatus struct {
 	CounterID uint32 `json:"counter_id,omitempty"`
 	Packets   uint64 `json:"packets,omitempty"`
 	Bytes     uint64 `json:"bytes,omitempty"`
+}
+
+// ZoneTrafficCounterStatus is one per-zone traffic-volume row reported by the
+// userspace dataplane inside ProcessStatus.ZoneTrafficCounters (#3651). ZoneID
+// is the stable name-hash zone id (StableZoneID / ZoneSnapshot.id); ingress
+// totals count packets/bytes that entered the firewall through an interface in
+// the zone, egress totals count packets/bytes that left through one. Totals are
+// cumulative since helper start (or the last clear_zone_counters IPC). The Rust
+// struct is ZoneTrafficCounterStatus (protocol/control.rs) with matching serde
+// rename tags.
+type ZoneTrafficCounterStatus struct {
+	ZoneID         uint16 `json:"zone_id,omitempty"`
+	IngressPackets uint64 `json:"ingress_packets,omitempty"`
+	IngressBytes   uint64 `json:"ingress_bytes,omitempty"`
+	EgressPackets  uint64 `json:"egress_packets,omitempty"`
+	EgressBytes    uint64 `json:"egress_bytes,omitempty"`
 }
 
 type HAStateUpdateRequest struct {

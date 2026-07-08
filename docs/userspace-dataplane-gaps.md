@@ -99,47 +99,59 @@ These are not "missing", but they are not pure userspace forwarding either:
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. #1379 is closed for the feature-gap audit; the final live cluster syslog proof was delivered in the closed #1477 validation set. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters until Rust owns a bounded neighbor-cache capacity. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
 
-## Deferred Observability — per-zone traffic + flood counters (#3651)
+## Observability — per-zone traffic (populated, #3651) + flood counters (deferred)
 
 Per-zone ingress/egress packet+byte volume (`show security zones` "Traffic
-statistics") and per-zone SYN/ICMP/UDP flood-event counts (`show security screen
-ids-option statistics` "Per-zone flood counters") are **not published by the
-userspace dataplane** and render an explicit **"not available"** on every
-surface (CLI, gRPC text, REST `per_zone_counters_available:false`). This is a
-deliberate, honest gap, not a bug: the eBPF writers that once populated the
-dense `zone_counters` / `flood_counters` BPF arrays were deleted in the #1476
-retirement, and the userspace populate campaign (#2118 per-policy, #2501
-per-session, #2161 NAT64, #3326 host-inbound, #3343 per-screen-reason) never
-covered zone or flood counters.
+statistics") is now **populated by the userspace dataplane** (#3651). Per-zone
+SYN/ICMP/UDP flood-event counts (`show security screen ids-option statistics`
+"Per-zone flood counters") remain **not published** and render an explicit
+**"not available"** — deferred, leaning on the #3343 aggregate per-reason drop
+counters (see below).
 
-- **HIDE (#3643) is what shipped.** `dataplane.ReadZoneCounters` /
+- **HIDE (#3643) is what shipped first.** `dataplane.ReadZoneCounters` /
   `ReadFloodCounters` key a Go-side sparse offset map instead of indexing the
   dense array (so a stable-hash zone id `>= MaxZones` no longer OOB-errors the
   read), returning the distinct `dataplane.ErrCounterNotPopulated` sentinel
   while unpopulated. The always-erroring `xpf_zone_packets_total` /
   `xpf_zone_bytes_total` Prometheus metrics were dropped.
 
-- **POPULATE (#3651) is the deferred prerequisite.** The Go-side populate hook
-  is already wired — `SetZoneCounterOffset` / `SetFloodCounterOffset` plus the
-  `ClearZoneCounterOffsets` / `ClearFloodCounterOffsets` resets — but is sourced
-  only by tests. Lighting the surfaces up requires Rust dataplane work: a flat
-  `[u8; 65536]` slot LUT on the hot path (two direct-index `u64` writes per
-  forwarded packet, no per-packet hash/atomic), ONE helper-pre-summed
-  `ProcessStatus`-level sparse per-zone block on the wire, and a
-  `clear_zone_counters` control-socket IPC so a `clear` resets the helper's
-  cumulative accumulators (clearing only the Go offset maps snaps back on the
-  next 1s poll). Full design of record:
+- **POPULATE traffic (#3651) is what now ships.** The Rust helper accounts
+  per-zone traffic on the forward hot path via a flat direct-index
+  `[u8; 65536]` zone-id → slot LUT (`userspace-dp/src/afxdp/zone_counters.rs`
+  `ZoneCounterSlotMap`, 63 assignable slots + `overflow_active`): two array
+  reads per forwarded packet into a per-worker thread-local coalescer (no
+  per-packet hash, no per-packet atomic — the same coalesce-then-fold pattern
+  as the policy/filter hit counters), folded per RX batch into a
+  coordinator-owned, zone-id-keyed `ZoneCounterStore` that rides `ForwardingState`
+  and survives config commits. The helper pre-sums across workers into ONE
+  `ProcessStatus`-level sparse per-zone block (`zone_traffic_counters`, layout
+  version 1, only nonzero rows). The Go status poll
+  (`syncBPFCountersLocked`) mirrors each row into the bpfShim offset map via
+  `SetZoneCounterOffset`, so `show security zones` Traffic statistics, the REST
+  `/security/zones` endpoint, and the Prometheus collector report live volume.
+  A `clear_zone_counters` control IPC resets the helper's cumulative store (the
+  Go `ClearZoneCounters` / `ClearAllCounters` overrides send it) so an operator
+  clear does not snap back on the next 1 s poll. Design of record:
   [`docs/research/3643-dead-counters/plan.md`](research/3643-dead-counters/plan.md)
   §5A.
 
-- **Live substitutes.** Until #3651 ships, per-zone-adjacent volume is available
-  from the global flow statistics, per-interface `Bindings[].RX/TX{Packets,Bytes}`,
-  per-policy hit counters (#2118, zone-pair scoped), and per-screen-reason drop
-  counters (#3343). The only unique value per-zone volume adds is
-  VLAN-unit-granular attribution — which is why simply summing per-interface
-  binding counters into zones (the §5C DERIVE shortcut) is rejected: one physical
-  binding hosting VLAN units in different zones cannot be split by logical unit,
-  so DERIVE would mis-attribute, which is worse than an honest "not available".
+- **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
+  attribution is NEW drop-path accounting (the screen module holds per-zone
+  rate-limiter state, not cumulative per-zone flood-event counters), and per the
+  §5A "recommended narrowing" it is the lower-value half. `SetFloodCounterOffset`
+  stays sourced only by tests, so `ReadFloodCounters` keeps returning
+  `ErrCounterNotPopulated` ("not available"). The live substitute is the #3343
+  aggregate per-reason drop counters (syn/icmp/udp-flood ordinals), which are
+  populated. Picking this up means adding a per-zone tally on the
+  `record_screen_drop` path (off the fast path) and a second sparse wire block.
+
+- **Live substitutes for the flood gap.** Global flow statistics, per-interface
+  `Bindings[].RX/TX{Packets,Bytes}`, per-policy hit counters (#2118, zone-pair
+  scoped), and per-screen-reason drop counters (#3343). Note that simply summing
+  per-interface binding counters into zones (the §5C DERIVE shortcut) was
+  rejected as the traffic source: one physical binding hosting VLAN units in
+  different zones cannot be split by logical unit, so DERIVE would mis-attribute
+  — worse than the honest hot-path accounting that #3651 now does.
 
 ## Retirement History (closed)
 

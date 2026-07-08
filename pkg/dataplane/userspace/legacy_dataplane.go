@@ -289,6 +289,21 @@ func (a *LegacyDataPlaneAdapter) ClearNATRuleCounters() error {
 	return m.ClearNATRuleCounters()
 }
 
+// ClearZoneCounters routes the operator per-zone traffic-counter clear through
+// the userspace Manager override (#3651) rather than the embedded bpfShim
+// method. The bpfShim method only zeroes the Go offset map; the Manager
+// override ALSO sends the clear_zone_counters IPC so the helper's cumulative
+// ZoneCounterStore resets and the cleared value does not snap back on the next
+// status poll. The embedded dataplane.DataPlane (= bpfShim) would otherwise be
+// promoted here, so this explicit method is required for the durable clear.
+func (a *LegacyDataPlaneAdapter) ClearZoneCounters() error {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return err
+	}
+	return m.ClearZoneCounters()
+}
+
 // ClearAllCounters routes the operator clear-all through the userspace Manager
 // override (#2218) so the helper NAT translation hit store is reset alongside
 // the BPF maps; otherwise the per-rule NAT totals snap back on the next poll.

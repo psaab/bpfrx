@@ -134,6 +134,8 @@ mod umem;
 #[allow(dead_code)]
 #[path = "cold_path_hist.rs"]
 mod cold_path_hist;
+// #3651: per-zone ingress/egress traffic counters (POPULATE half of #3643).
+mod zone_counters;
 // Clean-room WireGuard tunnel termination — see
 // docs/pr/wireguard-clean/plan.md. Engine + tests only in this PR;
 // hot-path activation lands in a follow-up.

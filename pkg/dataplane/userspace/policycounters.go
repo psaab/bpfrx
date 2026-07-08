@@ -329,6 +329,14 @@ func (m *Manager) ClearAllCounters() error {
 	if err := m.clearHelperNATCountersLocked(); err != nil {
 		errs = append(errs, err)
 	}
+	// #3651: a clear-all must also reset the helper per-zone traffic store,
+	// otherwise the per-zone totals snap back on the next status poll (the
+	// helper reports cumulative-since-start and syncBPFCountersLocked overwrites
+	// the offset absolutely). bpfShim.ClearAllCounters() already zeroed the Go
+	// offset map; this sends the clear_zone_counters IPC.
+	if err := m.clearHelperZoneCountersLocked(); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 

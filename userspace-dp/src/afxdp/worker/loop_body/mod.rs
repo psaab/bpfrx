@@ -824,6 +824,14 @@ pub(crate) fn worker_loop(
         // shared counters once per RX batch (alongside the filter-counter
         // flush) so `show security policies hit-count` converges within a tick.
         crate::policy::flush_recorded_policy_hit_counters();
+        // #3651: fold this worker's coalesced per-zone traffic tally into the
+        // shared zone-counter store, same cadence. `forwarding` is stable
+        // across this iteration's binding sweep, so the slot map matches the
+        // one the `record_zone_traffic` calls used.
+        crate::afxdp::zone_counters::flush_recorded_zone_counters(
+            &forwarding.zone_counter_store,
+            &forwarding.zone_counter_slot_map,
+        );
         #[cfg(feature = "debug-log")]
         {
             dbg.accumulate(&dbg_poll);

@@ -275,6 +275,11 @@ pub(crate) fn run() -> Result<(), String> {
             policy_rule_counters: Vec::new(),
             nat_rule_counters: Vec::new(),
             filter_term_counters: Vec::new(),
+            // #3651: per-zone traffic block is empty until the first status
+            // refresh reads the helper's zone-counter store.
+            zone_counter_layout_version: 0,
+            zone_counter_overflow_active: false,
+            zone_traffic_counters: Vec::new(),
             three_color_policer_counters: Vec::new(),
             source_nat_pools: Vec::new(),
             last_resolution: None,

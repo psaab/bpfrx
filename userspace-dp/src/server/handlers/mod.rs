@@ -9,7 +9,7 @@
 //   - `match request.request_type.as_str()` dispatch into per-verb
 //     handlers (substantive verbs) or inline bodies (trivial arms:
 //     `ping`/`status`, `update_fabrics`, `clear_policy_counters`,
-//     `clear_nat_counters`, `shutdown`, catch-all)
+//     `clear_nat_counters`, `clear_zone_counters`, `shutdown`, catch-all)
 //   - Post-match `refresh_status` + status attach (gated by
 //     `!suppress_status`)
 //   - Post-lock `write_state` (when `persist_state` is set)
@@ -196,6 +196,17 @@ pub(crate) fn handle_stream(
             // this store the cleared total would snap back on the next poll.
             "clear_nat_counters" => {
                 guard.afxdp.clear_nat_counters();
+                refresh_status(&mut guard);
+                persist_state = true;
+            }
+            // #3651: reset the helper-side cumulative per-zone traffic totals.
+            // Load-bearing half of the operator `clear` (the Go side also
+            // drops its zone-counter offset map): the helper reports cumulative
+            // totals every poll and the Go side mirrors them ABSOLUTELY via
+            // SetZoneCounterOffset, so without this reset the cleared value
+            // would snap back on the next poll.
+            "clear_zone_counters" => {
+                guard.afxdp.clear_zone_counters();
                 refresh_status(&mut guard);
                 persist_state = true;
             }

@@ -41976,3 +41976,57 @@ top.
   pkg/daemon/daemon_dhcp_lease_sync.go, pkg/daemon/daemon_ha_sync.go,
   pkg/daemon/daemon_apply.go, pkg/daemon/daemon_dhcp_cluster_test.go,
   test/incus/dhcp-lease-failover.sh, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-07-08 — #3651 POPULATE per-zone traffic counters (deferred half of #3643)
+
+- **Timestamp**: 2026-07-08
+- **Action**: Implemented the userspace-dp POPULATE half of #3643 (design of
+  record: docs/research/3643-dead-counters/plan.md §5A). Per-zone
+  ingress/egress packet+byte volume is now sourced from the Rust AF_XDP
+  dataplane and surfaced on `show security zones` Traffic statistics, REST
+  `/security/zones`, and the Prometheus collector — no longer
+  `ErrCounterNotPopulated` ("not available"). Per-zone FLOOD counters stay
+  deferred per the §5A recommended narrowing (lean on the #3343 aggregate).
+  RUST: new `userspace-dp/src/afxdp/zone_counters.rs` — flat direct-index
+  `[u8;65536]` zone-id→slot LUT (`ZoneCounterSlotMap`, 63 assignable slots +
+  `overflow_active`), a per-worker thread-local dense coalescer
+  (`record_zone_traffic`, two array reads/pkt, NO per-packet hash/atomic —
+  mirrors the policy/filter hit-counter coalesce-then-fold), and a
+  coordinator-owned zone-id-keyed `ZoneCounterStore` folded per RX batch
+  (`flush_recorded_zone_counters`, at loop_body next to the filter/policy
+  flush). Store rides ForwardingState (carried forward from `previous` in
+  forwarding_build) so totals survive commits; zone-id keying removes the
+  cold-path slot-reassignment zero-out entirely. Hot-path recorded at the fast
+  path (flow_cache_hit), slow path (poll_descriptor forward-candidate), and the
+  tunnel/next-table paths (record_forwarding_disposition ForwardCandidate,
+  Hot-only). Helper pre-sums across workers into the ProcessStatus-level
+  `zone_traffic_counters` sparse block (layout version 1, nonzero rows only);
+  `clear_zone_counters` control IPC resets the store. GO: ProcessStatus gains
+  ZoneCounterLayoutVersion / ZoneCounterOverflowActive / ZoneTrafficCounters
+  (tag-matched to Rust); syncBPFCountersLocked mirrors each row via
+  SetZoneCounterOffset; new zonecounters.go adds the ClearZoneCounters override
+  (+ ClearAllCounters wiring + LegacyDataPlaneAdapter route) sending the IPC.
+  Tag-matched wire; regenerated protocol_wire_v1.json + cross-language contract
+  round-trip both sides. RED-on-revert: TestSyncBPFCountersPopulatesZoneCounters
+  reverts to ErrCounterNotPopulated if the Go decode loop is removed. FULL
+  cargo test 3842/0; go test ./pkg/dataplane/... ./pkg/api/... ./pkg/grpcapi/...
+  green.
+- **File(s)**: userspace-dp/src/afxdp/zone_counters.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/disposition.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/handlers/mod.rs, userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/zonecounters.go (new),
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/zone_counters_status_test.go (new),
+  docs/userspace-dataplane-gaps.md, docs/research/3643-dead-counters/plan.md,
+  _Log.md
