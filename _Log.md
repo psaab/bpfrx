@@ -40369,3 +40369,25 @@ top.
   pkg/configstore/store_persist.go,
   pkg/configstore/commit_confirmed_persist_4577_test.go,
   pkg/configstore/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07 (#4587)
+- **Action**: Fix `annotate` failing for named / multi-key containers
+  (zones, policies, interface-units, family inet). `Store.Annotate` used a
+  hand-rolled walk that consumed ONE path token per node but matched it
+  against ANY key in the node's `Keys`, so a multi-key node
+  (`Keys=[security-zone,trust]`) was entered on its first key and then
+  failed to find the argument token (`trust`) as a child — `path not found`
+  for every named container; annotate worked only for pure single-key
+  chains like `system`. Replaced the walk with a new
+  `ConfigTree.AnnotatePath` that reuses the same multi-key-aware
+  `navigatePath` traversal `show <path>`/`FormatPath` use (the
+  #3980/#4562 read-all-siblings resolver). The comment is set on the first
+  resolved node (single-node semantics; `annotate system` byte-identical),
+  an unresolved path still returns a clear `path not found` error and
+  mutates nothing, and the #3900 comment-delimiter rejection
+  (`ValidateAnnotationText`, before resolution) is unchanged. RED-on-revert
+  test `TestAnnotateMultiKeyContainers` (zone / zone-description-leaf /
+  from-zone-to-zone-policy / interface-unit / family-inet resolve,
+  single-key non-regression, non-existent multi-key path errors).
+- **File(s)**: pkg/config/ast.go, pkg/configstore/store_command.go,
+  pkg/configstore/store_test.go, docs/config-schema.md, _Log.md

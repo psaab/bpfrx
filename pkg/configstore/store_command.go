@@ -196,29 +196,20 @@ func (s *Store) Annotate(path []string, comment string) error {
 		return err
 	}
 
-	children := s.candidate.Children
-	var target *config.Node
-	for _, key := range path {
-		found := false
-		for _, child := range children {
-			for _, k := range child.Keys {
-				if k == key {
-					target = child
-					children = child.Children
-					found = true
-					break
-				}
-			}
-			if found {
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("path not found: %s", strings.Join(path, " "))
-		}
+	// #4587: resolve the target via the shared navigatePath traversal
+	// (ConfigTree.AnnotatePath) instead of a hand-rolled walk. The old walk
+	// consumed ONE path token per node but matched it against ANY key in a
+	// node's Keys, so a named / multi-key container — Keys=[security-zone,
+	// trust], [from-zone,untrust,to-zone,trust,policy,p], [family,inet] — was
+	// entered on its first key and then failed to find the argument token
+	// (trust, inet, ...) as a child: "path not found" for every zone, policy,
+	// interface-unit, and family-inet path. Annotate worked only for a chain
+	// of pure single-key nodes such as `system`. navigatePath consumes a
+	// multi-key node as a unit, so those paths now resolve; the single-key
+	// case is unchanged.
+	if err := s.candidate.AnnotatePath(path, comment); err != nil {
+		return err
 	}
-
-	target.Annotation = comment
 	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
