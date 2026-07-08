@@ -401,13 +401,49 @@ func TestSessionWireRoundTripPolicyFields3301V6(t *testing.T) {
 		t.Fatalf("Generation round-trip = %#x, want %#x", dVal.Generation, val.Generation)
 	}
 
-	legacy := payload[:len(payload)-8]
+	// Drop the #3301 AppTimeout+PolicyCounterIdx (8 bytes) AND the #4565
+	// trailing Nat64SnatV4 (4 bytes) to simulate a pre-#3301 peer that omits all
+	// three additive trailing fields.
+	legacy := payload[:len(payload)-12]
 	_, lVal, ok := decodeSessionV6Payload(legacy)
 	if !ok {
 		t.Fatal("legacy (truncated) decode failed")
 	}
 	if lVal.AppTimeout != 0 || lVal.PolicyCounterIdx != 0 {
 		t.Fatalf("legacy frame: appto=%d counter=%d, want 0/0", lVal.AppTimeout, lVal.PolicyCounterIdx)
+	}
+}
+
+// TestSessionWireRoundTripNat64SnatV4_4565 verifies the NAT64 translated pool
+// source rides the V6 cluster sync payload as a length-gated trailing field so
+// a peer-PROMOTED NAT64 session can rebuild its reverse (v4->v6) BIB after
+// failover. RED-on-revert: dropping the encode/decode of Nat64SnatV4 loses the
+// pool source and the standby cannot reconstruct the reverse mapping.
+func TestSessionWireRoundTripNat64SnatV4_4565(t *testing.T) {
+	key := gen2170KeyV6()
+	val := dataplane.SessionValueV6{
+		State:       dataplane.SessStateEstablished,
+		IngressZone: 1,
+		EgressZone:  2,
+		Nat64SnatV4: [4]byte{203, 0, 113, 5},
+	}
+	payload := encodeSessionV6Payload(key, val)
+	_, dVal, ok := decodeSessionV6Payload(payload)
+	if !ok {
+		t.Fatal("decode failed")
+	}
+	if dVal.Nat64SnatV4 != ([4]byte{203, 0, 113, 5}) {
+		t.Fatalf("Nat64SnatV4 round-trip = %v, want [203 0 113 5]", dVal.Nat64SnatV4)
+	}
+
+	// Legacy (pre-#4565) peer omits the trailing 4 bytes -> all-zero (not NAT64).
+	legacy := payload[:len(payload)-4]
+	_, lVal, ok := decodeSessionV6Payload(legacy)
+	if !ok {
+		t.Fatal("legacy (truncated) decode failed")
+	}
+	if lVal.Nat64SnatV4 != ([4]byte{}) {
+		t.Fatalf("legacy frame Nat64SnatV4 = %v, want all-zero", lVal.Nat64SnatV4)
 	}
 }
 

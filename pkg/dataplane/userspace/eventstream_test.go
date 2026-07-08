@@ -186,6 +186,46 @@ func readFrame(r io.Reader) (typ uint8, seq uint64, payload []byte, err error) {
 	return
 }
 
+// #4565: decodeSessionEvent must read the FLAG_NAT64 marker (bit 1<<5) and the
+// trailing snat_v4 (4 bytes after the #3301 metadata) so a peer-PROMOTED NAT64
+// session can rebuild its reverse (v4->v6) BIB after failover. RED-on-revert:
+// dropping the eventstream.go decode leaves d.Nat64 false / d.Nat64SnatV4 empty.
+func TestDecodeSessionEventNat64_4565(t *testing.T) {
+	// Minimal v6 SESSION_OPEN payload. Layout: fixed 32 bytes, then 5 v6
+	// addresses (16 each) + 2 MACs (6 each) = 92, reaching off=124; then the
+	// #3301 trailing fields (policy_id/counter/apptimeout = 12) -> off=136; then
+	// the #4565 trailing snat_v4 (4) -> off=140.
+	payload := make([]byte, 140)
+	payload[0] = 6                          // AddrFamily = v6
+	payload[1] = 6                          // Protocol = TCP
+	payload[26] = SessionEventFlagNat64     // flags: NAT64 marker
+	copy(payload[136:140], []byte{203, 0, 113, 5}) // trailing snat_v4
+
+	d, ok := decodeSessionEvent(payload)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false")
+	}
+	if !d.Nat64 {
+		t.Fatal("d.Nat64 = false, want true for a FLAG_NAT64 frame")
+	}
+	if d.Nat64SnatV4 != "203.0.113.5" {
+		t.Fatalf("d.Nat64SnatV4 = %q, want 203.0.113.5", d.Nat64SnatV4)
+	}
+
+	// A legacy frame that omits the trailing snat_v4 (and the flag) decodes to
+	// not-NAT64, rolling-upgrade safe.
+	legacy := make([]byte, 136)
+	legacy[0] = 6
+	legacy[1] = 6
+	dl, ok := decodeSessionEvent(legacy)
+	if !ok {
+		t.Fatal("decodeSessionEvent returned false for legacy frame")
+	}
+	if dl.Nat64 || dl.Nat64SnatV4 != "" {
+		t.Fatalf("legacy frame: Nat64=%v snat=%q, want false/empty", dl.Nat64, dl.Nat64SnatV4)
+	}
+}
+
 func TestDecodeSessionEventV4(t *testing.T) {
 	payload := buildSessionOpenV4Payload(
 		6,          // TCP

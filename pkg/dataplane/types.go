@@ -141,6 +141,21 @@ type SessionValueV6 struct {
 	// #3073 per-rule hit-counter handle carried on the HA wire (#3301); NOT in
 	// the BPF/C conntrack ABI (bpfSessionValueV6).
 	PolicyCounterIdx uint32
+
+	// Nat64SnatV4 is the #4565 NAT64 translated pool SOURCE (4-byte IPv4). A
+	// NAT64 forward flow is keyed on the ORIGINAL IPv6 5-tuple (this V6 value),
+	// but its reverse (v4->v6) reply is keyed on the translated
+	// (server_v4 -> snat_v4) tuple, and the pool source is chosen by the
+	// helper's allocate_source — it is NOT embedded in the synced forward v6
+	// key (unlike the orig v6 src/dst, which ARE the key, and dst_v4, the /96
+	// low 32 of the key dst). A non-zero value marks the session as NAT64 and
+	// lets the peer-PROMOTED session rebuild its RFC 6146 reverse BIB after
+	// failover. Like Generation/PolicyCounterIdx this is userspace-sync-only HA
+	// metadata carried on the cluster wire (a length-gated trailing field in
+	// encodeSessionV6Payload); it is NOT part of the BPF/C conntrack ABI
+	// (bpfSessionValueV6) and MUST NOT be added to it. All-zero => not NAT64
+	// (the rolling-upgrade-safe default an old peer omits).
+	Nat64SnatV4 [4]byte
 }
 
 // ZoneConfig mirrors the C struct zone_config.

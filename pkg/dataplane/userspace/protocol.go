@@ -2814,6 +2814,16 @@ type SessionSyncRequest struct {
 	PolicyID          uint32 `json:"policy_id,omitempty"`
 	PolicyCounterIdx  uint32 `json:"policy_counter_idx,omitempty"`
 	InactivityTimeout uint32 `json:"inactivity_timeout,omitempty"`
+	// #4565: the NAT64 translated pool SOURCE (dotted-quad IPv4). A non-empty
+	// value is the peer helper's signal that this is a NAT64 cross-family
+	// session — it sets nat.nat64, rewrites the forward source to this v4 pool
+	// address, and reconstructs the reverse (v4->v6) BIB (orig v6 src/dst from
+	// the synced forward v6 key, dst_v4 from the /96-embedded low 32 of the key
+	// dst). This is the one part of the reverse mapping not carried by the
+	// synced forward key. omitempty is safe — an old helper without the key
+	// decodes it via serde(default) to "" (not NAT64), bit-identical to
+	// pre-#4565 (rolling-upgrade safe).
+	Nat64SnatV4 string `json:"nat64_snat_v4,omitempty"`
 }
 
 type SessionDeltaInfo struct {
@@ -2872,6 +2882,15 @@ type SessionDeltaInfo struct {
 	PolicyID         uint32 `json:"policy_id,omitempty"`
 	PolicyCounterIdx uint32 `json:"policy_counter_idx,omitempty"`
 	AppTimeout       uint32 `json:"app_timeout,omitempty"`
+	// #4565: NAT64 cross-family marker (open-frame flags bit 1<<5) + the
+	// translated pool SOURCE (trailing 4 bytes). Stamped onto the synced
+	// SessionValueV6 (SessFlagNAT64 + Nat64SnatV4) by daemon_ha_userspace.go so
+	// the cluster sync wire and the peer helper carry them, letting a
+	// peer-PROMOTED NAT64 session rebuild its reverse (v4->v6) BIB after
+	// failover. Nat64SnatV4 is the one datum not reconstructable from the synced
+	// forward v6 key (the orig v6 src/dst ARE the key; dst_v4 is the /96 low 32).
+	Nat64       bool   `json:"nat64,omitempty"`
+	Nat64SnatV4 string `json:"nat64_snat_v4,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -2926,4 +2945,8 @@ const (
 	// FLAG_LOG_SESSION_INIT/CLOSE in userspace-dp/src/event_stream/codec.rs.
 	SessionEventFlagLogSessionInit  uint8 = 1 << 3
 	SessionEventFlagLogSessionClose uint8 = 1 << 4
+	// #4565: NAT64 cross-family marker carried on the open frame so a peer-
+	// PROMOTED session rebuilds its reverse (v4->v6) BIB after failover. Must
+	// match FLAG_NAT64 in userspace-dp/src/event_stream/codec.rs.
+	SessionEventFlagNat64 uint8 = 1 << 5
 )

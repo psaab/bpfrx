@@ -1140,6 +1140,14 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.PolicyID = val.PolicyID
 		req.PolicyCounterIdx = val.PolicyCounterIdx
 		req.InactivityTimeout = val.AppTimeout
+		// #4565: carry the NAT64 translated pool SOURCE (non-zero marks a NAT64
+		// cross-family session) so the peer helper rebuilds the reverse (v4->v6)
+		// BIB after promotion. The generic nat_src/nat_dst fields cannot carry a
+		// v4 pool source in a v6 session's slot unambiguously — this dedicated
+		// dotted-quad is the helper's authoritative snat_v4.
+		if val.Nat64SnatV4 != ([4]byte{}) {
+			req.Nat64SnatV4 = net.IP(val.Nat64SnatV4[:]).String()
+		}
 		if val.Flags&dataplane.SessFlagSNAT == 0 {
 			req.NATSrcIP = ""
 			req.NATSrcPort = 0

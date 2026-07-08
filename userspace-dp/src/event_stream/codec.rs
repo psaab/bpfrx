@@ -138,6 +138,19 @@ pub(crate) const FLAG_IS_REVERSE: u8 = 1 << 2;
 // pre-#2785 behavior (rolling-upgrade safe).
 pub(crate) const FLAG_LOG_SESSION_INIT: u8 = 1 << 3;
 pub(crate) const FLAG_LOG_SESSION_CLOSE: u8 = 1 << 4;
+// #4565: mark a NAT64 cross-address-family session so a peer-PROMOTED session
+// can rebuild its RFC 6146 reverse BIB after failover. A NAT64 forward flow is
+// keyed on the ORIGINAL IPv6 5-tuple, but its NAT decision rewrites to an IPv4
+// pool source (`snat_v4`) + IPv4 destination, and the reverse (v4->v6) reply is
+// keyed on `(server_v4 -> snat_v4, translated port)`. The synced generic NAT
+// address fields cannot carry a v4 source in a v6 session's 16-byte slot
+// unambiguously, so this flag tells the standby: (a) set `nat.nat64`, (b) read
+// the trailing `snat_v4` (below), (c) reconstruct the original v6 src/dst from
+// the forward KEY (they ARE `key.src_ip`/`key.dst_ip` for a NAT64 forward
+// session) and `dst_v4` from the /96-embedded low 32 bits of `key.dst_ip`.
+// Additive bit: an old peer leaves it clear (0) -> decodes to "not NAT64",
+// bit-identical to pre-#4565 (rolling-upgrade safe).
+pub(crate) const FLAG_NAT64: u8 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataplaneEventKind {
@@ -332,6 +345,11 @@ impl EventFrame {
         if metadata.log_session_close {
             flags |= FLAG_LOG_SESSION_CLOSE;
         }
+        // #4565: signal a NAT64 cross-family session so the peer rebuilds the
+        // reverse BIB after failover (see FLAG_NAT64 doc + the trailing snat_v4).
+        if decision.nat.nat64 {
+            flags |= FLAG_NAT64;
+        }
         buf[pos] = flags;
         pos += 1;
 
@@ -395,6 +413,21 @@ impl EventFrame {
             None => 0,
         };
         buf[pos..pos + 4].copy_from_slice(&inactivity_secs.to_le_bytes());
+        pos += 4;
+
+        // #4565: [+12:+16] the NAT64 translated pool SOURCE (`snat_v4`, 4 raw
+        // IPv4 octets), trailing/length-gated like the #3301 fields. Written for
+        // every open frame (0.0.0.0 when not NAT64); FLAG_NAT64 above is the
+        // semantic gate. This is the ONE piece of the reverse BIB the standby
+        // cannot reconstruct from the synced forward v6 key — the pool source is
+        // chosen by `allocate_source`, not embedded in the key — so it must ride
+        // the wire (the orig v6 src/dst ARE the key; `dst_v4` is the /96 low 32
+        // of the key dst). An old Go decoder length-skips these 4 bytes.
+        let snat_v4 = match (decision.nat.nat64, decision.nat.rewrite_src) {
+            (true, Some(IpAddr::V4(v4))) => v4.octets(),
+            _ => [0u8; 4],
+        };
+        buf[pos..pos + 4].copy_from_slice(&snat_v4);
         pos += 4;
 
         // Write header

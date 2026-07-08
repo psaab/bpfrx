@@ -9,8 +9,9 @@
 // predicates.
 
 use super::helpers::{
-    bindings_settled, forwarding_unsupported_error, parse_session_sync_mac,
-    reconcile_status_bindings, set_bindings_forwarding_armed, should_run_afxdp,
+    bindings_settled, build_synced_session_entry, forwarding_unsupported_error,
+    parse_session_sync_mac, reconcile_status_bindings, set_bindings_forwarding_armed,
+    should_run_afxdp,
 };
 use super::{handle_stream, ServerState};
 use crate::state_writer::StateWriter;
@@ -1844,4 +1845,109 @@ fn update_fabrics_unchanged_set_does_not_rewrite_state_file() {
         "an unchanged update_fabrics must not rewrite the state file"
     );
     let _ = std::fs::remove_file(&state_file);
+}
+
+// #4565: a peer-PROMOTED NAT64 session must rebuild its RFC 6146 reverse BIB
+// from the wire-carried translated pool source (`nat64_snat_v4`) + the synced
+// forward v6 key. Before #4565 `build_synced_session_entry` set `nat64: false`
+// and `nat64_reverse: None`, so a promoted NAT64 session (a) never reached the
+// NAT64 frame builder (tx dispatch keys `is_nat64` off `nat.nat64`), (b) could
+// not translate the v4 reply back to IPv6 (the frame builder hard-requires
+// `nat64_reverse`), and (c) synthesized a WRONG (v6-family) reverse companion
+// key so the server's v4 reply never matched. RED-on-revert: dropping the
+// helpers.rs reconstruction makes every NAT64 assertion below fail.
+#[test]
+fn nat64_synced_entry_rebuilds_reverse_bib_4565() {
+    use crate::nat64::Nat64ReverseInfo;
+    use crate::session::reverse_session_key;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let zones = rustc_hash::FxHashMap::default();
+
+    // NAT64 forward flow: v6 client -> synthetic 64:ff9b::192.168.1.1
+    // (dst_v4 = 192.168.1.1 by RFC 6052 /96), translated to pool source
+    // 203.0.113.5:40000 on the active node.
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET6 as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "2001:db8::1".to_string(),
+        dst_ip: "64:ff9b::c0a8:101".to_string(),
+        src_port: 5001,
+        dst_port: 80,
+        ingress_zone_id: 2,
+        egress_zone_id: 3,
+        egress_ifindex: 12,
+        // The generic NAT fields carry the mangled cross-family remnants on the
+        // real wire; the NAT64 path must OVERRIDE them from nat64_snat_v4.
+        nat_src_ip: "2001:db8:dead:beef::".to_string(),
+        nat_src_port: 40000,
+        nat64_snat_v4: "203.0.113.5".to_string(),
+        ..SessionSyncRequest::default()
+    };
+    let entry = build_synced_session_entry(&req, &zones).expect("build nat64 entry");
+
+    // (a) NAT64 cross-family bit set -> tx dispatch reverse-translates + #4564
+    // reserve arms.
+    assert!(entry.decision.nat.nat64, "nat64 bit must be set");
+    // (b) forward NAT decision rebuilt to the v4 pool binding (NOT the mangled
+    // generic nat_src).
+    assert_eq!(
+        entry.decision.nat.rewrite_src,
+        Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))),
+        "rewrite_src must be the translated pool source snat_v4"
+    );
+    assert_eq!(
+        entry.decision.nat.rewrite_dst,
+        Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+        "rewrite_dst must be the /96-embedded v4 destination"
+    );
+    assert_eq!(
+        entry.decision.nat.rewrite_src_port,
+        Some(40000),
+        "translated port rides nat_src_port"
+    );
+    // (c) original v6 src/dst captured for the reverse (v4->v6) translation.
+    assert_eq!(
+        entry.metadata.nat64_reverse,
+        Some(Nat64ReverseInfo {
+            orig_src_v6: "2001:db8::1".parse::<Ipv6Addr>().unwrap(),
+            orig_dst_v6: "64:ff9b::c0a8:101".parse::<Ipv6Addr>().unwrap(),
+        }),
+        "nat64_reverse must carry the original v6 endpoints"
+    );
+
+    // (d) the synthesized reverse companion key is the v4 reply tuple
+    // (server_v4 -> snat_v4), so the server's IPv4 reply matches after failover.
+    let rk = reverse_session_key(&entry.key, entry.decision.nat);
+    assert_eq!(rk.addr_family, libc::AF_INET as u8, "reverse key must be v4");
+    assert_eq!(rk.src_ip, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    assert_eq!(rk.dst_ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)));
+    assert_eq!(rk.dst_port, 40000, "reply dst port is the translated port");
+
+    // A non-NAT64 synced session (empty nat64_snat_v4) is unaffected: no nat64
+    // bit, no reverse info, generic nat_src preserved.
+    let plain = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 1234,
+        dst_port: 80,
+        ingress_zone_id: 2,
+        egress_zone_id: 3,
+        egress_ifindex: 12,
+        nat_src_ip: "203.0.113.9".to_string(),
+        nat_src_port: 50000,
+        ..SessionSyncRequest::default()
+    };
+    let plain_entry = build_synced_session_entry(&plain, &zones).expect("build plain entry");
+    assert!(!plain_entry.decision.nat.nat64, "non-nat64 stays non-nat64");
+    assert_eq!(plain_entry.metadata.nat64_reverse, None);
+    assert_eq!(
+        plain_entry.decision.nat.rewrite_src,
+        Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))),
+        "non-nat64 keeps the generic SNAT source"
+    );
 }

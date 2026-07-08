@@ -697,7 +697,14 @@ pub(super) fn build_reverse_session_from_forward_match(
         owner_rg_id: owner_rg_for_resolution(forwarding, resolution),
         fabric_ingress: forward_match.metadata.fabric_ingress,
         is_reverse: true,
-        nat64_reverse: None,
+        // #4565: inherit the forward session's NAT64 reverse info (original v6
+        // src/dst) so a peer-PROMOTED NAT64 session's synthesized reverse
+        // companion can translate the server's v4 reply back to IPv6 after
+        // failover. `build_nat64_forwarded_frame`'s reverse (v4->v6) branch
+        // hard-requires this — without it the frame builder returns None and the
+        // reply is dropped. `None` for every non-NAT64 forward session (the
+        // forward metadata carries `None`), bit-identical to the prior behavior.
+        nat64_reverse: forward_match.metadata.nat64_reverse,
         // #2508: inherit the forward session's per-policy log selection so
         // the reverse companion's close delta carries a consistent gate.
         log_session_init: forward_match.metadata.log_session_init,

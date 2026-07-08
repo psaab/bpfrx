@@ -273,6 +273,13 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	off += 4
 	binary.LittleEndian.PutUint32(buf[off:], val.PolicyCounterIdx)
 	off += 4
+	// #4565: NAT64 translated pool SOURCE (4-byte IPv4), length-gated trailing
+	// field. Non-zero marks a NAT64 cross-family session so a peer-PROMOTED
+	// node rebuilds its reverse (v4->v6) BIB after failover. Only V6 sessions
+	// carry this (a NAT64 forward flow is keyed on the original IPv6 5-tuple).
+	// An old decoder stops after PolicyCounterIdx and ignores it (=> not NAT64).
+	copy(buf[off:off+4], val.Nat64SnatV4[:])
+	off += 4
 	return buf[:off]
 }
 
@@ -548,6 +555,12 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 	}
 	if off+4 <= len(payload) {
 		val.PolicyCounterIdx = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+	}
+	// #4565: NAT64 translated pool SOURCE (length-gated; absent => all-zero =
+	// not NAT64, the rolling-upgrade-safe default from a legacy peer).
+	if off+4 <= len(payload) {
+		copy(val.Nat64SnatV4[:], payload[off:off+4])
 		off += 4
 	}
 	return key, val, true
