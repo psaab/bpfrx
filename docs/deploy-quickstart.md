@@ -125,6 +125,14 @@ scripts/deploy/xpf-deploy.py destroy examples/deploy/standalone-passthrough.yaml
 scripts/deploy/xpf-deploy.py --hypervisor libvirt destroy examples/deploy/standalone-passthrough.yaml
 ```
 
+The `<name>-day0.iso` drive is written **owner-only (0600)** in the build
+directory and lingers there until `destroy` removes it. That ISO embeds
+`xpf.conf` verbatim — the most secret-bearing artifact on the box
+(root-authentication hash, IKE pre-shared-keys, SNMP community, DDNS
+tokens) — so the tool never leaves it world-readable even under a lax
+umask (#4586). On a shared build/CI/jump host, run `destroy` (or delete
+the ISO) once the VM is up rather than leaving day-0 secrets on disk.
+
 `deploy` runs a **preflight** before it mutates anything — the image /
 golden qcow2, every NIC source (managed network / host bridge / PF / PCI
 device), and a free instance name must all exist, or it fails with one

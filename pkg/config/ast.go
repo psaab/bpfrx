@@ -289,6 +289,32 @@ func unionChildren(nodes []*Node) []*Node {
 	return out
 }
 
+// AnnotatePath sets the annotation comment on the configuration node named by
+// path. Resolution goes through navigatePath, the same multi-key-aware
+// traversal `show <path>` uses, so a named / multi-key container is consumed
+// as one unit: security-zone <name>, from-zone <z> to-zone <z> policy <p>,
+// interfaces <name> unit <n>, family inet, and friends all resolve.
+//
+// It replaces the hand-rolled one-token-per-node walk that Store.Annotate
+// carried before #4587, which matched a multi-key node by ANY single key then
+// looked for the argument token as a child and failed ("path not found") for
+// every named container — annotate worked only for a chain of pure single-key
+// nodes such as `system`. The comment is set on the FIRST resolved node,
+// preserving the prior single-node semantics; a single-key path like `system`
+// resolves to exactly the same node and result as before. A path that does not
+// resolve returns a clear error naming the path and mutates nothing.
+func (t *ConfigTree) AnnotatePath(path []string, comment string) error {
+	if len(path) == 0 {
+		return fmt.Errorf("path not found: (empty path)")
+	}
+	matches := navigatePath(t.Children, path)
+	if len(matches) == 0 {
+		return fmt.Errorf("path not found: %s", strings.Join(path, " "))
+	}
+	matches[0].Annotation = comment
+	return nil
+}
+
 // matchNodeKeys checks if a node's Keys match path elements starting at pos.
 // Returns the number of path elements consumed (len(node.Keys)) on match, 0 otherwise.
 func matchNodeKeys(n *Node, path []string, pos int) int {

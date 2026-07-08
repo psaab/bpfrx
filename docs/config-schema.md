@@ -320,6 +320,31 @@ append-on-reinsert) was removed. Covered by `TestRenameNonFirstSibling` in
 `A->A2` still works, colliding `B->C` rejected with the tree unchanged, and a
 post-rename `CompileConfig` seeing `[A B2 C]`).
 
+**`annotate <path> "comment"` resolves through `navigatePath` (#4587).**
+`annotate` attaches a `/* comment */` to the statement at a path, and — like
+`delete`/`deactivate`/`rename` above — the path routinely crosses NAMED /
+multi-key containers: `security zones security-zone trust`, `security policies
+from-zone <z> to-zone <z> policy <p>`, `interfaces <name> unit <n>`, `family
+inet`. `Store.Annotate` (`pkg/configstore/store_command.go`) previously used a
+hand-rolled walk that consumed ONE path token per node but matched it against
+ANY key in the node's `Keys`, so it entered a multi-key node on its first key
+(`security-zone` of `Keys=[security-zone,trust]`) and then failed to find the
+argument token (`trust`) as a child — `path not found` for every zone, policy,
+interface-unit, and family-inet path. Annotate worked only for a chain of pure
+single-key nodes such as `system`. It now delegates to
+`ConfigTree.AnnotatePath` (`pkg/config/ast.go`), which reuses the SAME
+multi-key-aware `navigatePath` traversal that `show <path>` / `FormatPath`
+use (the #3980/#4562 read-all-siblings display resolver) — a multi-key node is
+consumed as a unit, so every named container resolves. The comment is set on
+the first resolved node (single-node semantics; the single-key `system` case is
+byte-identical), and an unresolved path still returns a clear `path not found:
+<path>` error and mutates nothing. The #3900 comment-delimiter rejection
+(`ValidateAnnotationText`) runs BEFORE resolution and is unchanged. Covered by
+`TestAnnotateMultiKeyContainers` in `pkg/configstore/store_test.go` (zone /
+zone-description-leaf / from-zone-to-zone-policy / interface-unit / family-inet
+resolve + RED on revert, single-key `system` non-regression, non-existent
+multi-key path still errors).
+
 **Firewall-filter `source/destination-prefix-list` refs are dual-AST too
 (#3843).** These `from` leaves are NOT `multi: true` value-tails — each
 reference carries an optional trailing `except` modifier, so they compile
