@@ -1,3 +1,38 @@
+## 2026-07-08 — #4650 (fable-173 LOW) GO residuals: gRPC egress-iface parity + tunnel lock-scope
+
+- **Timestamp**: 2026-07-08
+- **Action**: A9-F3 (LOW) — routed gRPC `sessionEntryV4`/`sessionEntryV6`
+  egress-interface resolution through the same `FibIfindex!=0`-guarded
+  `resolveSessionEgressIface` helper that REST (pkg/api/sessions.go) and the
+  gRPC filter path (server_sessions.go:480/525) already use. The two entry
+  paths inlined an UNCONDITIONAL `egressIfaces[{FibIfindex,FibVlanID}]` lookup,
+  so a FibIfindex==0 session with a stale `{0,vlan}` egressIfaces entry printed
+  a bogus egress iface over gRPC while REST printed the zone iface — a display
+  drift between the two APIs (and an internal gRPC inconsistency vs its own
+  filter path). Fix preserves the `zoneNames` fallback (helper returns
+  zoneIfaces[egressZone]; entry falls back to zoneNames[egressZone] when empty),
+  bit-identical to the REST entry path. Added
+  `pkg/grpcapi/session_egress_drift_4650_test.go` — a REST-oracle parity test
+  (independent guard reproduction) covering V4+V6, the stale-{0,vlan} case
+  (RED on revert: gRPC returned `ge-STALE-0`, want `ge-0-0-2`) and an unchanged
+  FibIfindex!=0 session.
+- **Action**: A10-F-1 (LOW hygiene) — assessed `routing/tunnel.go` `Apply`
+  holding `t.mu` across the full netlink+exec reconcile. DELIBERATE, kept: the
+  reconcile interleaves shared-map reads/writes (ownedNames, appliedAddrs,
+  appliedRI, wgConfigured, tunnels) with the netlink LinkDel/LinkAdd it drives,
+  every `apply*Locked` helper requires the lock, and two concurrent
+  Apply/Clear calls would race BOTH the maps AND kernel link state
+  (double-delete, delete-during-recreate). No isolable critical section to
+  narrow to. GetStatus is the counter-case that already narrows (snapshot
+  names under lock, probe netlink unlocked). Added an inline lock-discipline
+  comment documenting why the wide scope is load-bearing; no behavior change.
+- **Action**: Rust residuals A2-F1/A2-F2/A4-F5/A4-F8 deferred to a separate
+  cargo task (GO-only scope here). No operator-doc change: the egress-iface
+  resolution ordering has no dedicated operator doc; the fix is a
+  display-consistency correction documented in code + this log.
+- **File(s)**: pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/session_egress_drift_4650_test.go, pkg/routing/tunnel.go, _Log.md
+
 ## 2026-07-08 — #2852 Phase 1: lock-free SNAT port allocation
 
 - **Timestamp**: 2026-07-08
