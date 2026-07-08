@@ -1,3 +1,28 @@
+## 2026-07-07 — #4586 deploy: day-0 config ISO written owner-only (0600), no longer world-readable in CWD
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4586 (ps-037-A10 A10-02, MEDIUM secret-at-rest).
+  `build_config_drive()` in `scripts/deploy/xpf-deploy.py` builds the
+  `<name>-day0.iso` day-0 drive via xorriso/genisoimage under the process
+  umask (~0022 → 0644, world-readable) and never chmod'd the finished ISO.
+  That ISO embeds `xpf.conf` verbatim — the most secret-bearing artifact
+  (system root-authentication hash, security IKE pre-shared-key, SNMP
+  community, DDNS tsig/api-token/password) — and lingers in the build CWD
+  until `destroy`. On a shared build/CI/jump host a co-located UID could
+  `isoinfo -R -x /xpf.conf` the secrets out. Fix = `os.chmod(iso, 0o600)`
+  immediately after `run_capture(argv)` (once the ISO exists on disk), so
+  the drive is owner-only regardless of umask; the owner (daemon/VM) still
+  reads it fine. Also tightened the staged `xpf.conf` chmod from `0o644` to
+  `0o600` (the 0700 mkdtemp already shields it — belt-and-suspenders). Added
+  `test_xpf_deploy_iso_mode.py`: mocks the xorriso call to leave the ISO
+  0644 (the defect), then asserts `build_config_drive()` yields
+  `mode & 0o077 == 0` for both the ISO and the staged conf; RED-on-revert
+  verified (0o644 without the chmod). `python3 -m py_compile` clean; all 6
+  deploy test files + `scripts/run-selftests.sh` green (29 passed / 0 failed).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_iso_mode.py, docs/deploy-quickstart.md,
+  _Log.md
+
 ## 2026-07-07 — #4566 cos: CachedThreeColorPolicers grows to a SmallVec so the cached TX path re-meters ALL fall-through policers (not just the first two)
 
 - **Timestamp**: 2026-07-07
