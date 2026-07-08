@@ -229,6 +229,26 @@ blackholing on takeover. Compiled to `Instance.PreemptHoldTime` (seconds);
   `skipNextPreemptHold` in `handleBackupRx` so the imminent 1 ms
   `masterDownTimer` expiry promotes immediately (planned failover stays
   zero-delay).
+- **Liveness watchdog — held master dies mid-hold (#4584)** — the master
+  that was live when the hold armed can DIE *during* the hold. Arming the
+  hold used to leave `masterDownTimer` idle (it fired to arm the hold, and
+  `handleBackupRx` never resets it for a persisting lower advert), so the
+  held VIP-owning master's silence went undetected until the (possibly very
+  long) hold-time elapsed — up to ~hold-time of blackhole for a *dead*
+  master, violating the "dead master → immediate takeover" invariant.
+  `armPreemptHold` now ALSO (re)arms `masterDownTimer` for
+  `masterDownInterval` as a liveness watchdog. On its fire while
+  `preemptHoldArmed`, `stepBackup` checks `heldMasterIsStale()`: a stale
+  held master (last advert beyond the master-down horizon → it went silent)
+  disarms the hold and takes over NOW; a still-live one (adverts keep
+  refreshing `lastMasterSeen` via `recordMasterAdvert`) re-arms the watchdog
+  and lets the hold run to its natural expiry. `heldMasterIsStale` checks
+  ONLY staleness — NOT the effective>master priority comparison — so a
+  track-interface demotion below a *still-live* master does not trigger a
+  spurious watchdog takeover; the natural-expiry re-validation
+  (`shouldPreemptObservedMaster`, #2900) owns the demotion case. So a LIVE
+  held master is still deferred to hold-time (preempt-hold intent preserved)
+  while a DEAD one is taken over within ~one master-down horizon.
 - **Cancellation** — while the hold is armed, a returning >= -priority
   master advert (`handleBackupRx`) resets `masterDownTimer` and
   stop-drains the hold (no longer a lower master to preempt). A
