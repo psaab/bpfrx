@@ -3,12 +3,14 @@ package grpcapi
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -723,11 +725,15 @@ func (s *Server) proxyPeerSystemAction(ctx context.Context, req *pb.SystemAction
 
 // logSystemAction records a destructive maintenance action to the configstore
 // audit journal BEFORE it executes (#4108 F8). The store append is synchronous
-// and fsynced, so an attributable record is durable on disk even when the
-// action wipes the config (zeroize) or takes the box down (reboot/halt/
-// power-off) — the slog.Warn line only reaches journald, which does not
-// survive a zeroize. Best-effort: a journal write failure never blocks a
-// confirmed power/wipe action (the store layer warns rather than failing).
+// and fsynced, so an attributable record is durable on disk before the action
+// runs — the slog.Warn line only reaches journald, which does not survive a
+// reboot. For reboot/halt/power-off the on-disk journal record persists across
+// the reboot; for zeroize the wipe now deliberately removes .config.journal
+// (#4576 — a completed factory reset must not hand its audit log to the next
+// tenant), so the durable cross-wipe trail is the pre-execution fsync (an
+// interrupted wipe still leaves it) plus any remote syslog collector.
+// Best-effort: a journal write failure never blocks a confirmed power/wipe
+// action (the store layer warns rather than failing).
 func (s *Server) logSystemAction(action string) {
 	if s.store == nil {
 		return
@@ -748,28 +754,135 @@ var schedulePowerAction = func(systemctlArg string) {
 	}()
 }
 
+// defaultConfigDir / defaultConfigBase mirror the daemon's config-path default
+// (cmd/xpfd `-config /etc/xpf/xpf.conf`, pkg/daemon). performZeroizeWipe erases
+// the fixed appliance paths; a non-default `-config` location is out of scope
+// (the pre-#4576 wipe already assumed /etc/xpf).
+const (
+	defaultConfigDir  = "/etc/xpf"
+	defaultConfigBase = "xpf.conf"
+)
+
+// zeroizeConfigDir erases the xpf configuration STATE under configDir as part
+// of a factory reset (#4576): the .configdb SSOT + master.key, the numbered
+// text rollback slots, the top-level .conf files, and the audit journal — the
+// artifacts that persist the prior tenant's committed policy, IKE PSKs,
+// WireGuard private keys, and SNMP communities and would otherwise be reloaded
+// on the next boot.
+//
+// NOTE (scope, tracked as #4585): this erases the SSOT and rollback/journal
+// state DIRECTLY, but the RENDERED service configs xpfd writes outside
+// configDir — /etc/frr/frr.conf (0644, BGP-MD5/OSPF/ISIS auth), /etc/swanctl/
+// conf.d/* (IKE PSKs), /etc/kea/kea-dhcp{4,6}.conf — are NOT removed here. They
+// are reset on the COMPLETING reboot when the daemon reconciles to the empty
+// config; erasing them in the wipe itself (so the window between wipe and
+// reboot leaks nothing) is the #4585 follow-up.
+//
+// The artifacts removed (configBase is the config file's base name, e.g.
+// "xpf.conf", used to recognize the numbered text rollback slots):
+//   - .configdb/master.key      — the AES-GCM key that decrypts an encrypted DB
+//   - .configdb/                — the SSOT: active.json, candidate.json,
+//     rollback.N.json (Store.Load reloads active.json on next boot)
+//   - <configBase>.<N>          — the CANONICAL text rollback slots
+//     (saveRollbackFiles / loadRollbackHistory), full config TEXT with
+//     cleartext secret leaves; loadRollbackHistory reloads them at boot, so
+//     leaving them behind would let the prior tenant's config be rolled back
+//     to — the exact leak #4576 closes
+//   - *.conf                    — the live config + rescue.conf (pre-#4576 set)
+//   - rollback*                 — legacy rollback naming (pre-#4576 set)
+//   - .config.journal[.N]       — the JSONL audit journal + rotated segments
+//     (0644, prior-tenant commit history/comments; legacy v1 fat lines may
+//     carry full config incl. secrets). This SUPERSEDES the #4108 "journal
+//     survives a zeroize" belt-and-braces: the system_action record is still
+//     fsynced BEFORE the wipe (so an interrupted wipe leaves a trail, and a
+//     remote syslog collector keeps the durable cross-wipe record), but a
+//     completed factory reset must not hand its audit log to the next owner.
+//
+// Removal is KEY-FIRST: master.key is deleted before the encrypted DB body, so
+// an interrupted wipe (crash / power loss mid-RemoveAll) can never leave the
+// ciphertext behind together with the key that decrypts it — once the key is
+// gone any surviving ciphertext is unrecoverable.
+//
+// It is best-effort past a failure (a single stubborn file does not abort the
+// rest of the erasure) but returns the FIRST real error so a
+// silently-incomplete zeroize is never reported as a successful factory reset.
+// os.ErrNotExist is not an error here (an already-absent artifact is the goal).
+func zeroizeConfigDir(configDir, configBase string) error {
+	var firstErr error
+	fail := func(err error) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	dbDir := filepath.Join(configDir, ".configdb")
+	// KEY-FIRST (#4576): master.key before the encrypted DB body.
+	fail(os.Remove(filepath.Join(dbDir, "master.key")))
+	// The config SSOT (active.json, candidate.json, rollback.N.json + any
+	// residual key). RemoveAll erases the whole tree and is nil on absent.
+	fail(os.RemoveAll(dbDir))
+
+	// Top-level artifacts in a single ReadDir pass.
+	entries, err := os.ReadDir(configDir)
+	fail(err)
+	for _, f := range entries {
+		name := f.Name()
+		if strings.HasSuffix(name, ".conf") ||
+			strings.HasPrefix(name, "rollback") ||
+			name == ".config.journal" ||
+			strings.HasPrefix(name, ".config.journal.") ||
+			isTextRollbackFile(name, configBase) {
+			fail(os.Remove(filepath.Join(configDir, name)))
+		}
+	}
+	return firstErr
+}
+
+// isTextRollbackFile reports whether name is a numbered text rollback slot for
+// the config file configBase — "<configBase>.<N>" with N one-or-more decimal
+// digits (store_commit.go rollbackPath). These files carry the full prior
+// config text including cleartext secret leaves, so a factory reset removes
+// them. configBase itself ("xpf.conf") is caught by the .conf suffix rule.
+func isTextRollbackFile(name, configBase string) bool {
+	rest, ok := strings.CutPrefix(name, configBase+".")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // performZeroizeWipe erases the on-disk config, BPF pins, and managed networkd
 // files (factory reset). It is a package var so a test can drive the `zeroize`
 // SystemAction verb (to assert the #4108 F8 journal wiring) WITHOUT wiping a
-// real /etc/xpf on the developer/appliance box.
-var performZeroizeWipe = func() {
-	// Remove configs
-	configDir := "/etc/xpf"
-	files, _ := os.ReadDir(configDir)
-	for _, f := range files {
-		if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
-			os.Remove(configDir + "/" + f.Name())
+// real /etc/xpf on the developer/appliance box. It returns a non-nil error when
+// the security-critical config erasure did not fully complete (#4576).
+var performZeroizeWipe = func() error {
+	// Config state FIRST — the security-critical erasure. A failure here can
+	// leave prior-tenant config/secrets on disk, so it is surfaced to the
+	// caller (#4576).
+	err := zeroizeConfigDir(defaultConfigDir, defaultConfigBase)
+
+	// BPF pins + managed networkd files carry no secret material, so their
+	// removal stays best-effort (logged, never fatal — they do not gate the
+	// success/failure of the factory reset).
+	if e := os.RemoveAll("/sys/fs/bpf/xpf"); e != nil {
+		slog.Warn("zeroize: remove BPF pins failed", "err", e)
+	}
+	if ndFiles, e := os.ReadDir("/etc/systemd/network"); e == nil {
+		for _, f := range ndFiles {
+			if strings.HasPrefix(f.Name(), "10-xpf-") {
+				if re := os.Remove(filepath.Join("/etc/systemd/network", f.Name())); re != nil && !errors.Is(re, os.ErrNotExist) {
+					slog.Warn("zeroize: remove networkd file failed", "file", f.Name(), "err", re)
+				}
+			}
 		}
 	}
-	// Remove BPF pins
-	os.RemoveAll("/sys/fs/bpf/xpf")
-	// Remove managed networkd files
-	ndFiles, _ := os.ReadDir("/etc/systemd/network")
-	for _, f := range ndFiles {
-		if strings.HasPrefix(f.Name(), "10-xpf-") {
-			os.Remove("/etc/systemd/network/" + f.Name())
-		}
-	}
+	return err
 }
 
 func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
@@ -797,12 +910,22 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 	case "zeroize":
 		slog.Warn("system zeroize requested via gRPC")
 		// Journal BEFORE the wipe: the fsynced record is durable on disk
-		// before any config file is removed, so a factory reset still leaves
-		// an attributable audit trail (#4108 F8). The journal file itself
-		// (.config.journal) is not in the removal set below (it neither ends
-		// in .conf nor starts with rollback), so the record also survives.
+		// before any config file is removed, so an interrupted wipe still
+		// leaves an attributable trail and a remote syslog collector keeps the
+		// cross-wipe record (#4108 F8). The wipe itself now removes
+		// .config.journal (a completed factory reset must not hand its audit
+		// log to the next tenant — #4576), superseding the earlier
+		// journal-survives-zeroize belt-and-braces.
 		s.logSystemAction("zeroize")
-		performZeroizeWipe()
+		if err := performZeroizeWipe(); err != nil {
+			// A partial wipe may leave prior-tenant config/secrets on disk
+			// (#4576). Surface it instead of reporting a clean factory reset —
+			// the operator must know the erasure did not fully complete and
+			// the device is NOT safe to re-tenant.
+			slog.Error("system zeroize did not fully erase config state", "err", err)
+			return nil, status.Errorf(codes.Internal,
+				"zeroize incomplete: config state may remain on disk: %v", err)
+		}
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
 
 	case "clear-config-lock":
