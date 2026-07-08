@@ -35,12 +35,19 @@ re-created 0600 on the next commit.
 | Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
 | Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
 | Config archives | `<archive-dir>/config-*.conf` | 0600 | `store_persist.go writeArchive` |
+| Audit journal (#4579 A4-02) | `.config.journal` | 0600 | `journal/journal.go Log` |
 
 The `.configdb` and archive directories are created **0700** (they hold
 only secret-bearing files); the daemon owns them, so read-back is
-unaffected. The v2 audit journal (`.config.journal`) stays 0644 by
-design — it is compact metadata only (timestamp/action/detail), never
-config content or secret values (#1896).
+unaffected. The v2 audit journal (`.config.journal`) is compact metadata
+only (timestamp/action/config-hash) and never config content or secret
+values (#1896), so it is not a secret store the way the JSON DB is.
+It is nevertheless written **0600** (#4579 A4-02): its `Detail` field
+carries the operator's free-text commit comment verbatim, so a comment
+that names a credential ("rotated the vpn psk to …") would otherwise be
+world-readable. Tightening it to match the rest of the config surface is
+cheap defense-in-depth; the daemon owns the file, so the history tail
+read is unaffected.
 
 ### Threat model — what 0600 + 0700 defends, and what it does not (#4056)
 

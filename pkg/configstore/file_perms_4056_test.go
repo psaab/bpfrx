@@ -155,6 +155,40 @@ func TestRescueConfigOwnerOnly_4056(t *testing.T) {
 	}
 }
 
+// TestConfigJournalOwnerOnly_4579 pins that the commit audit journal
+// (.config.journal) is written owner-only 0600 (#4579 A4-02, folding it into
+// the #4056 secret-sweep). The journal records metadata (timestamps, actions,
+// config hashes), but Detail carries the operator's free-text commit comment
+// verbatim — which can inadvertently name a credential — so it matches the
+// 0600 posture of the rest of the config surface rather than sitting
+// world-readable.
+//
+// RED on revert: journal.Log opens the file 0644 (world-readable), so
+// assertOwnerOnlyFile fails.
+func TestConfigJournalOwnerOnly_4579(t *testing.T) {
+	s := newTestStore(t)
+	// A commit writes an audit record to .config.journal (journalLog on the
+	// commit path). Use a commit comment so Detail is non-empty — the field
+	// whose free-text content motivates the 0600 tightening.
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("system host-name journal-perms-4579"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitWithDescription("rotated the site psk"); err != nil {
+		t.Fatalf("CommitWithDescription: %v", err)
+	}
+
+	journalPath := filepath.Join(filepath.Dir(s.filePath), ".config.journal")
+	assertOwnerOnlyFile(t, journalPath)
+
+	// Owner can still tail the journal at 0600 (the history view reads it).
+	if _, err := os.ReadFile(journalPath); err != nil {
+		t.Fatalf("owner cannot read back 0600 journal: %v", err)
+	}
+}
+
 // TestArchiveOwnerOnly_4056 pins that a config archive file (config-*.conf,
 // full config text with cleartext secrets) is written 0600 and its directory
 // 0700.
