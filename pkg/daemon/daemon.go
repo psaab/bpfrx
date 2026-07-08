@@ -361,39 +361,18 @@ type Daemon struct {
 	// pushed (and what text it would carry via d.store.ShowActive()).
 	syncPeerForTest func()
 
-	// hostInboundAddresslessZones is the set of configured host-inbound-
-	// enforcing zones observed in the transient fail-open admit window on the
-	// PREVIOUS apply (#3698): a zone with a non-lifeline interface but no
-	// resolvable address yet, so the daemon emits no host-inbound deny for it.
-	// applyHostInboundFilter diffs the current set against this to emit
-	// state-transition logs only (a zone ENTERING or LEAVING the window),
-	// keeping the warning low-noise across repeated commits / DHCP renewals.
-	// Written and read only under applySem in applyHostInboundFilter.
-	hostInboundAddresslessZones map[string]bool
-
-	// hostInboundAddresslessIfaces is the set of {zone, interface-unit, family}
-	// host-inbound fail-open windows observed on the PREVIOUS apply (#3710), keyed
-	// as "<zone>|<iface>|<family>". This is the per-interface/per-family refinement
-	// of hostInboundAddresslessZones: a DHCP/DHCPv6 client on a non-lifeline unit
-	// with no resolved address in that family yet, which the zone-level signal
-	// hides in a MIXED zone (a DHCP-pending unit beside a statically-addressed
-	// sibling, or the v6 side of a dual-stack edge whose v6 lease lands after v4).
-	// applyHostInboundFilter diffs the current set against this to emit
-	// state-transition logs only. Written and read only under applySem.
-	hostInboundAddresslessIfaces map[string]bool
-
-	// hostInboundAmbiguousAddrs is the set of firewall-local addresses observed
-	// on the PREVIOUS apply that are host-inbound-reachable from more than one
-	// security zone with DIFFERING host-inbound service/protocol sets (#3718
-	// Option B), keyed as "<family>|<addr>". The kernel host-inbound chain
-	// matches destination address only, so such an address's admission verdict
-	// is decided order-dependently by whichever zone sorts first (and can
-	// disagree with the ingress-scoped userspace-dp path). The strict commit gate
-	// rejects this; a tolerant / peer-synced load (#1960) can slip one through,
-	// and unlike the addressless window it is NOT self-healing.
-	// applyHostInboundFilter diffs the current set against this to emit
-	// state-transition logs only. Written and read only under applySem.
-	hostInboundAmbiguousAddrs map[string]bool
+	// hostInboundFailOpen groups the three previous-apply host-inbound
+	// fail-open / ambiguity sets (#3698 addressless zones, #3710 addressless
+	// {zone,iface,family} windows, #3718 order-dependent ambiguous addresses).
+	// applyHostInboundFilter diffs the current sets against these to emit
+	// state-transition logs only, keeping the warnings low-noise across
+	// repeated commits / DHCP renewals. All three are written and read only
+	// under applySem in applyHostInboundFilter. See hostInboundFailOpenState in
+	// daemon_nft.go (the file that owns the diff/log functions). This is
+	// increment 4 of the #4407 Daemon god-struct decomposition — pure field
+	// grouping, no behavior/locking change; the fields keep their exact
+	// map[string]bool types and are reached as d.hostInboundFailOpen.<field>.
+	hostInboundFailOpen hostInboundFailOpenState
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.

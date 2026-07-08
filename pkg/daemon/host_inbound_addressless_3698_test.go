@@ -91,8 +91,8 @@ func TestLogHostInboundAddresslessTransitions(t *testing.T) {
 	if warnsFor("trust") != 0 {
 		t.Errorf("scoped trust zone must not warn, got %d", warnsFor("trust"))
 	}
-	if d.hostInboundAddresslessZones["wan"] != true {
-		t.Errorf("state not tracked: hostInboundAddresslessZones[wan] = %v", d.hostInboundAddresslessZones["wan"])
+	if d.hostInboundFailOpen.addresslessZones["wan"] != true {
+		t.Errorf("state not tracked: hostInboundFailOpen.addresslessZones[wan] = %v", d.hostInboundFailOpen.addresslessZones["wan"])
 	}
 
 	// Apply 2: still addressless → NO new WARN (state-transition dedup).
@@ -109,7 +109,7 @@ func TestLogHostInboundAddresslessTransitions(t *testing.T) {
 	if warnsFor("wan") != 1 {
 		t.Errorf("recovery must not emit another warn, wan warns = %d", warnsFor("wan"))
 	}
-	if d.hostInboundAddresslessZones["wan"] {
-		t.Errorf("state not cleared after recovery: hostInboundAddresslessZones[wan] still set")
+	if d.hostInboundFailOpen.addresslessZones["wan"] {
+		t.Errorf("state not cleared after recovery: hostInboundFailOpen.addresslessZones[wan] still set")
 	}
 }
