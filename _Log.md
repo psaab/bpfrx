@@ -26,6 +26,84 @@
   case), userspace-dp/src/filter/README.md (#4566 note beside the #2573 one).
 - **Validation**: RED-on-revert confirmed (stash the mod.rs fix → 3-policer test
   fails `left: 2, right: 3`, 2-policer test still ok). Full cargo suite below.
+## 2026-07-07 — #4573 vrrp/config: VRRP GroupID (VRID) range gate + priority Atoi-swallow fix
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4573 (ps-037-A3 B-001/B-002, low-med) — the `vrrp-group <id>`
+  instance slot had NO value validator (documented identity-token deferral,
+  schema_interfaces.go) and `parseVRRPGroups` stored any numeric id verbatim,
+  while the native VRRP engine truncates it onto the single VRID wire byte
+  (`uint8(vi.cfg.GroupID)`, pkg/vrrp/instance.go:1148/1249/1364/1425/1834/1849).
+  So `vrrp-group 256` wrapped to the RFC 5798-reserved VRID 0 (a strict RFC peer
+  such as Juniper discards the advert → the VIP never masters → HA cold-boot
+  blackhole) and 257 aliased VRID 1 onto an unrelated group. The chassis RG-id
+  analog was hardened (validateChassisClusterStrict, #4434) but VRRP was left
+  unguarded — that asymmetry is the gap. B-001 fix: new
+  `validateVRRPGroupIDStrict` (pkg/config/compiler_validate_strict_vrrp.go,
+  MinVRRPGroupID=1/MaxVRRPGroupID=255) is the exact sibling of the chassis gate
+  — hard-rejects an out-of-range id on STRICT commit, downgrades to a warning on
+  the tolerant load / HA-sync path (`lenientVRRPGroupID`, #1960 no-brick); wired
+  into the compiler tail-gate pass alongside validateChassisClusterStrict
+  (compiler_uniformgates.go). Defensive runtime range guard at instance creation
+  (pkg/vrrp/vrrp.go MinVRID/MaxVRID; manager.go UpdateInstances skips + slog.Warn
+  an out-of-range VRID) so a value that slips through the lenient path never
+  advertises VRID 0. B-002 fix: the priority / preempt hold-time /
+  advertise-interval parse in parseVRRPGroups (compiler_interfaces.go, BOTH the
+  flat-set Keys arm and the hierarchical child-node arm) no longer swallows the
+  `strconv.Atoi` error with `_ =` — a bad parse now keeps the constructor
+  default (priority 100) instead of silently resetting to 0 (the RFC 5798
+  resignation value). RED-on-revert verified: (config) 256/0/-1/300/65536 →
+  strict commit REJECTS with a named error, lenient WARNS not bricks, in-range
+  1/100/255 commit clean with no warning [revert: neuter validator → out-of-range
+  accepted]; (priority) non-numeric `priority abc` on the lenient path keeps 100
+  [revert hierarchical arm to `_ =` → got 0]; (runtime) UpdateInstances drops
+  GroupID 0/256/-1 and keeps 100, boundary 1/255 build [revert guard → all 4
+  built]. go test ./pkg/config/... ./pkg/vrrp/... green; go build ./... green;
+  gofmt/vet clean. test-failover is a nice-to-have (the change only REJECTS
+  invalid configs, so valid-config failover timing is unaffected) — deferred to
+  the parent.
+- **File(s)**: pkg/config/compiler_validate_strict_vrrp.go,
+  pkg/config/compiler_validate_strict_vrrp_4573_test.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/compiler_interfaces.go, pkg/config/schema_interfaces.go,
+  pkg/vrrp/vrrp.go, pkg/vrrp/manager.go, pkg/vrrp/vrid_guard_4573_test.go,
+  docs/config-schema.md, _Log.md
+## 2026-07-07 — #4572 dataplane: clamp workers before the heartbeat zero-init loop so a large positive workers value can't wrap uint32 into a multi-billion-iteration apply hang
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4572 (ps-037-A6 F-A6-001, LOW control-plane DoS) —
+  `programBootstrapMapsLocked` (pkg/dataplane/userspace/maps_sync.go) zero-inits
+  the `userspace_heartbeat` Array (`Array<u64>`, max_entries 4096) with
+  `slot < uint32(cfg.Workers)*2*16`. VERIFY-FIRST corrected the issue's
+  headline: the NEGATIVE case (`workers -1` -> `uint32(-1)*32 = 4,294,967,264`
+  iterations) is already defended one layer up — `deriveUserspaceConfig`
+  (capabilities.go:26) coerces `workers<=0 -> 1` before the value reaches the
+  loop, and the sole caller (manager_compile.go:296) always passes that derived
+  ucfg. The LIVE, currently-reachable hang is a large POSITIVE value: the schema
+  leaf is min-only (`ValidateIntegerMin(1)`) and `deriveUserspaceConfig` does
+  NOT cap the upper side, so `workers 999999999` passes strict commit, survives
+  derivation, reaches the loop, and `uint32(999999999)*32` wraps uint32 to
+  ~1.9B iterations of `heartbeatMap.Update` — an apply/commit hang for hours (a
+  DoS, not fail-open; needs a trusted config source). Fix: hoisted
+  `workers := maxInt(cfg.Workers, 1)` before the `userspace_ctrl` struct and
+  used it for both `Workers` (was raw `uint32(cfg.Workers)`, line 154) and
+  `QueueCount` (already clamped, line 155) — restoring the line-154/179
+  consistency the issue flagged; and the loop bound is now
+  `heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())`, a new pure
+  helper that clamps the worker count into `[1, mapCap/heartbeatSlotsPerWorker]`
+  (128 workers at the current 4096-entry map) so the returned slot count can
+  never wrap uint32 or index past the fixed-size Array. PRESERVED: a normal
+  `workers 6` -> `heartbeatZeroSlots(6, 4096) = 192` (6*32), byte-identical to
+  the old `uint32(6)*32`; only <1 (clamped to 1 -> 32) and >128 (clamped to
+  4096) diverge. RED-on-revert verified
+  (maps_sync_heartbeat_slots_4572_test.go): reverting the helper body to raw
+  `uint32(workers)*heartbeatSlotsPerWorker` flips `heartbeatZeroSlots(-1,4096)`
+  to 4,294,967,264 (the exact hang count) and the over-cap / huge-positive
+  cases to out-of-bounds slot counts -> RED, while `six_unchanged` stays green.
+  go build ./... + go vet + go test ./pkg/dataplane/userspace/... green. Doc:
+  docs/config-schema.md gains a "#4572 (workers zero-init loop backstop)" bullet
+  next to the analogous #2524 ring-entries min-only backstop.
+- **File(s)**: pkg/dataplane/userspace/maps_sync.go, pkg/dataplane/userspace/maps_sync_heartbeat_slots_4572_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-07-07 — #4570 ra: configEqual now compares ReachableTime/RetransTimer so a commit changing only those RA timers restarts the sender
 

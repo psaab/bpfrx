@@ -1710,7 +1710,32 @@ reserved for whole-dataplane selection where a rewrite shim
   groups are keyed `<address-CIDR>_grp<id>`, so a dual-stack unit may
   carry an `inet` AND an `inet6` vrrp-group with the SAME group id without
   collision (the address strings differ → two distinct
-  `unit.VRRPGroups` entries). **#2850 — `preempt hold-time`:** the
+  `unit.VRRPGroups` entries). **#4573 — VRRP VRID range gate:** the
+  `vrrp-group <id>` instance-name slot stays an unvalidated identity
+  token in the schema (same deferral class as `redundancy-group <id>`),
+  but a *semantic* commit-time cap now bounds it —
+  `validateVRRPGroupIDStrict` in `compiler_validate_strict_vrrp.go`,
+  the exact sibling of the chassis `validateChassisClusterStrict`
+  (#4434). The VRRP VRID is a single wire byte (RFC 5798 §5.2.3, valid
+  range 1..255): the native engine truncates the configured id onto it
+  (`uint8(vi.cfg.GroupID)`, `pkg/vrrp/instance.go`), so `vrrp-group 256`
+  wrapped to the RESERVED VRID 0 (a strict RFC peer such as Juniper
+  discards the advert → the VIP never masters → HA cold-boot blackhole)
+  and 257 aliased VRID 1 onto an unrelated group. Non-numeric garbage was
+  always dropped by `parseVRRPGroups`, but an out-of-range NUMERIC id
+  used to produce a live wrong-VRID instance — that asymmetry is closed.
+  Like the #4434 gate it runs on the compiled `*Config`, NOT the schema
+  walker (so it does not change the identity-token typing decision), and
+  the tolerant load / peer-sync path downgrades it to a warning
+  (`lenientVRRPGroupID`, #1960 no-brick) with a defensive runtime range
+  check at instance creation (`pkg/vrrp` `MinVRID`/`MaxVRID`,
+  `manager.go UpdateInstances`) that refuses to advertise an
+  out-of-range VRID for a value that slips through the lenient path.
+  B-002 companion: the `priority`/`preempt hold-time`/`advertise-interval`
+  parse in `parseVRRPGroups` no longer swallows an `strconv.Atoi` error
+  with `_ =` — a bad parse kept the constructor default (priority 100)
+  instead of silently resetting to 0 (the RFC 5798 resignation value).
+  **#2850 — `preempt hold-time`:** the
   `vrrp-group <id> preempt` leaf gained a nested `hold-time <seconds>`
   child (`schema_interfaces.go`, typed `ValidateInteger(1, 3600)`), Junos
   `set interfaces <if> unit <n> family inet vrrp-group <id> preempt
@@ -1826,6 +1851,30 @@ reserved for whole-dataplane selection where a rewrite shim
   non-power-of-two values at the `--ring-entries` CLI boundary
   (`server/lifecycle.rs validate_ring_entries_arg`). Go and Rust ceilings
   must stay equal.
+- **#4572 (workers zero-init loop backstop):** `system dataplane workers`
+  is the sibling min-only (`ValidateIntegerMin(1)`) leaf, and its runtime
+  ceiling is "owned by the runtime" (schema comment) rather than a strict
+  upper bound. `programBootstrapMapsLocked` zero-inits the
+  `userspace_heartbeat` Array (`Array<u64>`, `max_entries = 4096`) with
+  `slot < uint32(cfg.Workers)*2*16`. The **negative** case the issue
+  headlines (`workers -1` → `uint32(-1)*32 = 4,294,967,264` iterations) is
+  already defended one layer up: `deriveUserspaceConfig` (capabilities.go)
+  coerces `workers<=0 -> 1` before the value ever reaches the loop. The
+  **live** exposure is a large **positive** value: strict commit ACCEPTS it
+  (min-only validator) and `deriveUserspaceConfig` does not cap the upper
+  side, so `workers 999999999` reaches the loop and
+  `uint32(999999999)*32` wraps `uint32` to ~1.9B iterations of
+  `heartbeatMap.Update` — an apply/commit hang for hours (a control-plane
+  DoS, not a fail-open). The Go side now clamps once
+  (`workers := maxInt(cfg.Workers, 1)`, mirroring the adjacent `QueueCount`
+  / disabled-ctrl coercions) for the `userspace_ctrl` fields, and the
+  heartbeat zero-init loop bound is computed by
+  `heartbeatZeroSlots(cfg.Workers, heartbeatMap.MaxEntries())`
+  (`pkg/dataplane/userspace/maps_sync.go`): it clamps the worker count into
+  `[1, mapCap/heartbeatSlotsPerWorker]` so neither a negative nor an absurd
+  positive worker count can make the loop wrap `uint32` or index past the
+  fixed-size Array. This is the "lenient WARN-not-hang" contract applied at
+  the runtime consumer.
 - **#1746:** added the `class-of-service schedulers <s>
   equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
   leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler
