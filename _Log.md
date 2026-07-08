@@ -42125,3 +42125,20 @@ top.
   (new), pkg/cli/cli_request_testcmd.go (new), pkg/cli/monitor_traffic.go (new),
   pkg/cli/cli_request_chassis.go (new), pkg/cli/cli_request_system.go (new),
   pkg/cli/cli_request_security.go (new), pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4654 refactor — split pkg/cli/cli_show_interfaces.go (1396 LOC)
+  per render mode plus a shared RETH/kernel-query helper file. The RETH/member
+  display logic repeated across summary/terse/detail/extensive and drifted
+  (the #4328 family); collecting the shared helpers in one file removes the
+  drift surface. Pure code motion, behavior-identical: all 14 top-level
+  declarations moved verbatim (verified byte-for-byte against origin/master
+  via a go/parser decl-diff — identical=14, 0 bodydiff/missing/extra). The
+  netlink/sysfs query order and the exact rendered output are preserved; the
+  #4328 (RETH) + #3654 (host-inbound) output tests still pass. go build ./...
+  clean, go test ./pkg/cli/... green.
+  **File(s)**: pkg/cli/cli_show_interfaces.go (trimmed to dispatch + summary),
+  pkg/cli/cli_show_interfaces_terse.go (new), pkg/cli/cli_show_interfaces_detail.go
+  (new), pkg/cli/cli_show_interfaces_extensive.go (new),
+  pkg/cli/cli_show_interfaces_stats.go (new), pkg/cli/cli_show_interfaces_shared.go
+  (new), pkg/cli/README.md, _Log.md
