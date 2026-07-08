@@ -141,23 +141,16 @@ type Daemon struct {
 	// once per provider so the operator sees why nothing publishes. Keyed by the
 	// provider name so a corrected commit (url added) re-arms the warning.
 	surfaceACheckIPNoURLWarned sync.Map
-	// #2239 HA DHCP-server lease sync (PATH C). The push loop runs on the
-	// RG-MASTER, reads the active lease set (Kea control socket → memfile
-	// fallback), and replicates it over the cluster sync channel. The standby
-	// holds the peer set in SessionSync.peerDHCPLeases{4,6} and seeds Kea on
-	// takeover. These mirror the ddnsReconcile* fields above. The loop talks
-	// ONLY to Kea's own socket + the cluster channel — never the
-	// userspace-helper control socket (CLAUDE.md rule).
-	dhcpLeaseSyncNowCh    chan struct{} // nudge: grant/commit/MASTER takeover
-	ipsecSANudgeCh        chan struct{} // nudge: peer (re)connect -> IPsec SA re-advertise (#4385)
-	dhcpLeaseSyncInFlight atomic.Bool   // no-freeze skip-if-in-flight guard
-	dhcpLeaseLastSentMu   sync.Mutex
-	dhcpLeaseLastSent4    string // last-pushed v4 set fingerprint (change-detect)
-	dhcpLeaseLastSent6    string // last-pushed v6 set fingerprint (change-detect)
-	feeds                 *feeds.Manager
-	rpm                   *rpm.Manager
-	rpmMu                 sync.Mutex // serializes reconcileRPM callers (#1827)
-	activeRPMHash         [32]byte   // config-hash gate for RPM re-apply (#1827)
+	// #2239 HA DHCP-server lease sync (PATH C). These fields were grouped
+	// into dhcpLeaseSyncState (see daemon_dhcp_lease_sync.go) as increment 1
+	// of the #4407 Daemon god-struct decomposition — grouping only, no
+	// behavior change. The mirrored ddnsReconcile* fields above remain flat.
+	dhcpLeaseSync  dhcpLeaseSyncState
+	ipsecSANudgeCh chan struct{} // nudge: peer (re)connect -> IPsec SA re-advertise (#4385)
+	feeds          *feeds.Manager
+	rpm            *rpm.Manager
+	rpmMu          sync.Mutex // serializes reconcileRPM callers (#1827)
+	activeRPMHash  [32]byte   // config-hash gate for RPM re-apply (#1827)
 	// rpmPinsFailed records that the last probe-pin install left at
 	// least one pin unprogrammed (#1895): the install is retried
 	// (without restarting probes) on hash-gated reconcileRPM calls AND
@@ -801,7 +794,7 @@ func New(opts Options) (*Daemon, error) {
 		reconcileNowCh:             make(chan struct{}, 1),
 		ddnsReconcileNowCh:         make(chan struct{}, 1),
 		surfaceAReconcileNowCh:     make(chan struct{}, 1),
-		dhcpLeaseSyncNowCh:         make(chan struct{}, 1),
+		dhcpLeaseSync:              dhcpLeaseSyncState{nowCh: make(chan struct{}, 1)},
 		ipsecSANudgeCh:             make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,

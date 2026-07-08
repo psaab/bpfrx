@@ -41441,3 +41441,31 @@ top.
   "Strict commit-time validators" now documents the wiring canary.
 - **File(s)**: pkg/config/strict_gate_wiring_canary_test.go,
   pkg/config/policy_zone_matrix_4422_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 increment 1 — extract the #2239 DHCP-server lease-sync
+  (PATH C) fields out of the Daemon god-struct into a named sub-struct.
+  Pure code motion, no behavior/locking/lifecycle change (Go compiler
+  enforces completeness). Moved the 5 flat fields dhcpLeaseSyncNowCh,
+  dhcpLeaseSyncInFlight, dhcpLeaseLastSentMu, dhcpLeaseLastSent4,
+  dhcpLeaseLastSent6 into a new dhcpLeaseSyncState{nowCh, inFlight,
+  lastSentMu, lastSent4, lastSent6} defined in daemon_dhcp_lease_sync.go
+  (co-located with the push/seed orchestration it backs). Access is now
+  d.dhcpLeaseSync.<field>. Chose this cluster because it has the cleanest
+  boundary of all candidate groups: all production access lives in ONE
+  file (daemon_dhcp_lease_sync.go) plus the single constructor in
+  daemon.go and one test composite literal — versus the fabric cluster
+  (15 fields across 5 files, ~96 refs) or the SNMP-reconcile cluster
+  (touches the ordering-sensitive daemon_apply.go the issue warns about).
+  Used a named sub-field (not an embed) since the access sites are bounded
+  — the explicit d.dhcpLeaseSync. qualifier is clearer than promotion.
+  IMPORTANT: left ipsecSANudgeCh (which was interleaved among the lease
+  fields) as a flat Daemon field — it is IPsec-SA-sync state, not
+  lease-sync. Validation: go build ./... clean; go vet ./pkg/daemon/...
+  clean; gofmt clean; go test ./pkg/daemon/... green (4.3s); race test of
+  the lease-sync suite green. Remaining #4407 increments (fabric, SNMP,
+  flowexport, DDNS-surfaceA, neighbor, archive, host-inbound, ...) tracked
+  on the issue; applyConfigLocked reconcile-ordering split deferred to a
+  /triple-review increment per the issue's warning.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_dhcp_lease_sync.go,
+  pkg/daemon/daemon_dhcp_lease_sync_test.go, pkg/daemon/README.md, _Log.md

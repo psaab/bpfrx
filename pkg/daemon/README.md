@@ -41,6 +41,24 @@ the primary compile/apply gate.
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 
+### Struct decomposition (#4407, in progress)
+
+The `Daemon` struct historically fused 150+ flat fields spanning ~15
+subsystems. It is being decomposed incrementally into per-subsystem
+sub-structs — pure code motion, no behavior/locking/lifecycle change (the
+Go compiler enforces completeness). Each increment groups one cohesive,
+self-contained field cluster and lands as its own reviewable PR; the
+tracker issue #4407 carries the remaining increments.
+
+- **Increment 1 — DHCP-server lease sync (PATH C, #2239):** the flat
+  `dhcpLeaseSync*` / `dhcpLeaseLast*` fields moved into
+  `dhcpLeaseSyncState` (defined in `daemon_dhcp_lease_sync.go`, the file
+  that owns the push/seed orchestration), reached as `d.dhcpLeaseSync.*`.
+  A named sub-field (not an embed) was used because the access sites are
+  bounded to that one file — the explicit `d.dhcpLeaseSync.` qualifier is
+  clearer than field promotion. `ipsecSANudgeCh` stayed a flat `Daemon`
+  field (it is IPsec-SA-sync state, not lease-sync).
+
 ## Cluster mode
 
 Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).
