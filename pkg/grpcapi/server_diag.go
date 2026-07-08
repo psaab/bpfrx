@@ -801,6 +801,11 @@ const (
 //     fsynced BEFORE the wipe (so an interrupted wipe leaves a trail, and a
 //     remote syslog collector keeps the durable cross-wipe record), but a
 //     completed factory reset must not hand its audit log to the next owner.
+//   - tls/                      — the self-signed REST-API TLS pair (#4599):
+//     tls/key.pem (the device-generated localhost HTTPS private key, 0600) +
+//     tls/cert.pem. xpf-generated, not tenant config; generateSelfSignedCertAt
+//     (pkg/api) regenerates a fresh pair on absence at the next boot, so
+//     removing them is safe and hands no prior-tenant key to the next owner.
 //
 // Removal is KEY-FIRST: master.key is deleted before the encrypted DB body, so
 // an interrupted wipe (crash / power loss mid-RemoveAll) can never leave the
@@ -825,6 +830,14 @@ func zeroizeConfigDir(configDir, configBase string) error {
 	// The config SSOT (active.json, candidate.json, rollback.N.json + any
 	// residual key). RemoveAll erases the whole tree and is nil on absent.
 	fail(os.RemoveAll(dbDir))
+
+	// The self-signed REST-API TLS material (#4599): tls/key.pem (the
+	// device-generated localhost HTTPS private key) + tls/cert.pem. These are
+	// xpf-generated, not tenant config — generateSelfSignedCertAt (pkg/api)
+	// regenerates a fresh pair on absence at the next boot, so removing them is
+	// safe. A subdir, so the top-level ReadDir loop's os.Remove never catches it;
+	// erase the whole tree explicitly.
+	fail(os.RemoveAll(filepath.Join(configDir, "tls")))
 
 	// Top-level artifacts in a single ReadDir pass.
 	entries, err := os.ReadDir(configDir)

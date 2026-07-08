@@ -28,6 +28,27 @@
   `make test-failover` before merge (parent runs it).
 - **File(s)**: pkg/vrrp/instance.go,
   pkg/vrrp/instance_preempt_hold_watchdog_test.go, pkg/vrrp/README.md, _Log.md
+## 2026-07-07 — #4599 zeroize: erase self-signed REST-API TLS pair under /etc/xpf/tls
+
+- **Timestamp**: 2026-07-07
+- **Action**: `zeroizeConfigDir` (`pkg/grpcapi/server_diag.go`) removed the
+  `.configdb` SSOT + top-level `.conf`/rollback/journal artifacts but never
+  recursed into the `tls/` subdir, so `/etc/xpf/tls/key.pem` (the
+  device-generated self-signed localhost REST-API private key) and its
+  `cert.pem` SURVIVED a factory reset — a re-tenant leak (LOW: device-generated,
+  self-signed, localhost-only). The top-level ReadDir loop uses `os.Remove`,
+  which cannot delete a non-empty dir and never matched the "tls" name anyway.
+  Added an explicit `fail(os.RemoveAll(filepath.Join(configDir, "tls")))` after
+  the `.configdb` removal, folded into the same first-error surfacing (→
+  codes.Internal). Safe because `generateSelfSignedCertAt` (`pkg/api/server.go`)
+  regenerates a fresh pair on absence at the next boot (LoadX509KeyPair fails →
+  regen). RED-on-revert test `TestZeroizeConfigDirWipesTLSKey`
+  (`pkg/grpcapi/zeroize_tls_4599_test.go`): tls/key.pem + cert.pem + tls/ absent
+  after wipe, existing SSOT/rollback/journal removals still hold, non-xpf
+  bystander untouched. Doc: `docs/system-login.md` #4576 erased-paths list.
+- **File(s)**: `pkg/grpcapi/server_diag.go`,
+  `pkg/grpcapi/zeroize_tls_4599_test.go`, `docs/system-login.md`, `_Log.md`
+- Closes #4599.
 
 ## 2026-07-07 — #4589 A10-b2 F-01 ddns+config: reject empty-host DDNS generic url-template
 
@@ -40734,3 +40755,33 @@ top.
   pkg/config/schema_master_password_prf_4578_test.go, pkg/configstore/crypto.go,
   pkg/configstore/crypto_prf_sync_4578_test.go, docs/config-schema.md,
   docs/next-features/master-password.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4590 (ps-038-A1 F1/F2, RUST fairness-eval harness) — make the
+  offline `fairness-eval` CI merge gate fail-fast on bad input instead of
+  silently producing a verdict on wrong data. F1: refactored `parse_args`
+  into a testable `parse_args_from` returning `Result<Args, ParseError>`; the
+  four numeric flags (`--warmup-secs`, `--final-burst-secs`, `--n-workers`,
+  `--shaper-rate-bps`) now error (exit 2) on a mistyped/overflowing value via
+  `parse_required_numeric_value` instead of `.unwrap_or(default)`, and
+  `--n-workers 0` is rejected unconditionally (empty per-worker distribution →
+  verdict on no data). F2: `parse_binding_flows_tsv`/`parse_cos_flows_tsv`
+  count skipped malformed rows and print a stderr warning (still lenient by
+  design, but no longer silent). Added unit tests for both (RED-on-revert
+  verified by neutering). Removed now-dead exit-calling arg wrappers. Full
+  cargo suite 3718/1 (the one failure, event_stream ..._2875, is pre-existing
+  on clean origin/master — unrelated to fairness_eval).
+- **File(s)**: userspace-dp/src/fairness_eval/args.rs,
+  userspace-dp/src/fairness_eval/inputs.rs,
+  userspace-dp/src/fairness_eval/README.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4590 (ps-037-A5 A5-03, GO, pkg/ra) — `configEqual` compared
+  `NAT64Prefix` and each advertised `Prefixes[i].Prefix` as raw strings, so an
+  operator re-typing an equivalent-but-non-canonical CIDR (`64:ff9b::/96` →
+  `0064:ff9b::/96`) forced a spurious RA sender restart (sub-second RA gap)
+  even though `buildRA` re-parses via `netip.ParsePrefix` and the wire is
+  identical. Added `prefixEqual` (normalize via `netip.ParsePrefix`, exact
+  string fallback when either side is unparseable so a genuine change is never
+  masked) and routed the two CIDR compares through it. RED-on-revert verified.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/ra_test.go, pkg/ra/README.md, _Log.md

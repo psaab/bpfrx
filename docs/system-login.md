@@ -166,9 +166,13 @@ the next boot (RMA / resale / re-tenant). The wipe removes the `.configdb` SSOT
 (so an interrupted wipe cannot leave AES-GCM ciphertext behind next to the key
 that decrypts it), the numbered text rollback slots `<config>.N` (full config
 text with cleartext secret leaves — reloaded at boot by `loadRollbackHistory`),
-the top-level `.conf` files (live config + `rescue.conf`), and `.config.journal`
-(+ rotated segments). A wipe that cannot fully erase this state returns an error
-rather than reporting a clean factory reset.
+the top-level `.conf` files (live config + `rescue.conf`), `.config.journal`
+(+ rotated segments), and the self-signed REST-API TLS pair under `tls/`
+(`tls/key.pem` — the device-generated localhost HTTPS private key — and
+`tls/cert.pem`, #4599; xpf-generated, not tenant config, and regenerated on
+absence by `generateSelfSignedCertAt` on the next boot). A wipe that cannot
+fully erase this state returns an error rather than reporting a clean factory
+reset.
 
 **Rendered service-config erasure (#4585).** The wipe erases that
 SSOT/rollback/journal state directly, but the prior tenant's secrets are ALSO

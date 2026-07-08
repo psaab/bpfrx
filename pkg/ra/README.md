@@ -267,6 +267,17 @@ best-effort).
   §4.2 ND timer hints wire-stamped by #4307; here 0=unspecified maps directly
   to a zero wire field with no unset/default coercion, so a plain int compare
   is exact and no companion set-flag is needed).
+  - **The converse also holds: CIDR fields compare by parsed value, not raw
+    text (#4590 A5-03).** `buildRA` re-parses `NAT64Prefix` and each advertised
+    `Prefixes[i].Prefix` via `netip.ParsePrefix`, so two strings that parse to
+    the same `netip.Prefix` produce byte-identical wire. A raw-string compare
+    therefore over-triggered: an operator re-typing an equivalent-but-
+    non-canonical form (`64:ff9b::/96` → `0064:ff9b::/96`) forced a spurious
+    sender restart (sub-second RA gap) with no wire change. `configEqual` now
+    routes those fields through `prefixEqual`, which normalizes via
+    `netip.ParsePrefix` and falls back to an exact string compare when either
+    side fails to parse (so a genuine change is never masked — an unnecessary
+    restart is harmless, a missed one is not).
 - IPv6 NODAD is set on the per-instance NDP socket so it doesn't fight
   the kernel's own duplicate-address detection on the link-local
   address.
