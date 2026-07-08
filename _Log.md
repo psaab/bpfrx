@@ -42129,3 +42129,18 @@ top.
 - **Timestamp**: 2026-07-08
   - **Action**: #4658 refactor — split pkg/grpcapi/server_diag.go (1602 LOC) into cohesive sibling files by concern (pure code motion, behavior-identical). Ping/Traceroute/streamDiagCmd → server_diag_ping.go; monitor streams (MonitorPacketDrop, MonitorInterface, proxyMonitorInterface, dataplane glue, summary-mode) → server_diag_monitor.go; SystemAction + proxyPeerSystemAction + logSystemAction + schedulePowerAction → server_diag_system_action.go; the #4582/#4595/#4601 zeroize suite → server_diag_zeroize.go; shared dialPeer stays in the server_diag.go shell. All 30 top-level decls byte-identical (0 bodydiff/missing/extra). go build ./... clean, go vet clean, pkg/grpcapi tests green incl. all TestZeroize*/TestStreamDiag*/TestSystemActionJournals*.
   - **File(s)**: pkg/grpcapi/server_diag.go, pkg/grpcapi/server_diag_ping.go, pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/server_diag_system_action.go, pkg/grpcapi/server_diag_zeroize.go
+  **Action**: #4654 refactor — split pkg/cli/cli_show_interfaces.go (1396 LOC)
+  per render mode plus a shared RETH/kernel-query helper file. The RETH/member
+  display logic repeated across summary/terse/detail/extensive and drifted
+  (the #4328 family); collecting the shared helpers in one file removes the
+  drift surface. Pure code motion, behavior-identical: all 14 top-level
+  declarations moved verbatim (verified byte-for-byte against origin/master
+  via a go/parser decl-diff — identical=14, 0 bodydiff/missing/extra). The
+  netlink/sysfs query order and the exact rendered output are preserved; the
+  #4328 (RETH) + #3654 (host-inbound) output tests still pass. go build ./...
+  clean, go test ./pkg/cli/... green.
+  **File(s)**: pkg/cli/cli_show_interfaces.go (trimmed to dispatch + summary),
+  pkg/cli/cli_show_interfaces_terse.go (new), pkg/cli/cli_show_interfaces_detail.go
+  (new), pkg/cli/cli_show_interfaces_extensive.go (new),
+  pkg/cli/cli_show_interfaces_stats.go (new), pkg/cli/cli_show_interfaces_shared.go
+  (new), pkg/cli/README.md, _Log.md
