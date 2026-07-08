@@ -41865,3 +41865,26 @@ top.
   `MatchPoliciesResponse` (proto regen; cargo/Rust lane busy).
 - **File(s)**: pkg/cli/cli_request.go,
   pkg/cli/testpolicy_icmp_4497_test.go, pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4421 policy.rs increment-1 — extract SnapshotIntegrityError
+  (enum + Display + Error impls, ~888 LOC) out of `userspace-dp/src/policy.rs`
+  into a new `#[path]`-included sibling submodule
+  `userspace-dp/src/policy_snapshot_error.rs`. Pure code-motion: moved block
+  is byte-identical to master lines 14-901 (diff EMPTY); policy.rs retained
+  content byte-identical (diff EMPTY) with only a 3-line `#[path]/mod/use`
+  stub inserted. Re-exported `pub(crate) use snapshot_error::SnapshotIntegrityError;`
+  so all ~20 crate-wide call sites keep `crate::policy::SnapshotIntegrityError`.
+  policy.rs 4483 -> 3598 LOC. New file needs no imports (variants use only
+  primitive/prelude types; Display/Error use fully-qualified std paths).
+  cargo build green; cargo test 3738 passed (245 policy + 5 integrity-error
+  tests green); the lone `native_gre_decap_checksum_present_yields_inner_packet`
+  failure is a pre-existing parallel-test shared-counter flake (passes in
+  isolation) unrelated to this move. Mirrors the existing policy_tests.rs
+  `#[path]` idiom. README table row for policy.rs left unchanged (it lists
+  top-level feature modules, not their `#[path]` submodules — policy_tests.rs
+  is likewise omitted; the module contract is unchanged). Establishes the
+  down-payment for the deeper policy.rs decomposition (parse/evaluate/apps),
+  which needs /triple-review.
+- **File(s)**: userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_snapshot_error.rs, _Log.md
