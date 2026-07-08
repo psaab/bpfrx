@@ -1,3 +1,29 @@
+## 2026-07-07 — #4621 fsatomic canary: convert archive staging write to WriteFileAtomic
+
+- **Timestamp**: 2026-07-07
+- **Action**: Fix BROKEN-MASTER — `pkg/fsatomic/TestNoDirectOsWriteFile`
+  (the #1916 repo-wide AST canary) failed on clean master, flagging a direct
+  `os.WriteFile` at `pkg/daemon/daemon_flow.go:327` in
+  `Daemon.archiveToSites`. DIAGNOSIS: that write stages the CURRENT active
+  config (`store.ShowActive()`, may contain encrypted secrets → 0600) into a
+  fresh `os.MkdirTemp` dir, then SCPs it to the archive-sites and deletes the
+  temp dir after all uploads finish. It is NOT DurableState (deleted after
+  transfer; power-loss fsync is pointless on a transient copy) and NOT a
+  BestEffortKernelKnob (a regular tmpfs file — rename works; the allowlist is
+  strictly reserved for procfs/sysfs/bind-mount where rename is impossible by
+  construction). It is AtomicGeneratedConfig. FIX: converted the call to
+  `fsatomic.WriteFileAtomic` (temp-sibling `.<base>.tmp-*` + rename, NO fsync).
+  The rename target IS `srcPath`, so the historical remote basename (default
+  `xpf.conf`) is preserved and a reader never observes a torn file. Added a
+  rationale comment at the call site documenting the classification. Added
+  `TestArchiveConfigStagesAtomically` pinning (a) the historical basename
+  survives the rename and (b) no `.xpf.conf.tmp-*` scratch sibling leaks.
+- **File(s)**: pkg/daemon/daemon_flow.go (import + call),
+  pkg/daemon/archive_atomic_4621_test.go (new), _Log.md
+- **Validation**: `go test ./pkg/fsatomic/ -run TestNoDirectOsWriteFile` now
+  GREEN (was RED on master); `go test ./pkg/daemon/... ./pkg/fsatomic/` green;
+  `go build ./...`, gofmt, `go vet` clean.
+
 ## 2026-07-07 — #2562 NAT64 fail-closed ICMP/ICMPv6 fragment drop + `nat64_frag_dropped` counter
 
 - **Timestamp**: 2026-07-07
