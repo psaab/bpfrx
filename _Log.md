@@ -1,3 +1,35 @@
+## 2026-07-08 — #4408 increment 1: extract compute_forwarded_egress_ptb
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4408 (Rust hot-path god-function outlining), increment 1.
+  Pure code-motion extraction of the #2301/#2330/#2845 egress-MTU
+  Path-MTU-Discovery block (93 interior LOC) out of the 1,131-LOC
+  `enqueue_pending_forwards` TX-drain orchestrator into a new private
+  `#[inline] fn compute_forwarded_egress_ptb(source_frame, meta, decision,
+  forwarding, is_nat64, uses_native_tunnel, ingress_ident, recent_exceptions)
+  -> (Option<Vec<u8>>, bool)`. The block was already a self-contained
+  scoped `{ ... }` unit: it reads only immutable inputs, mutates neither
+  `target_binding` nor the tx pipeline, has no early return / continue /
+  break, and its ONLY outputs are the two locals `ptb_reply` and
+  `mtu_signalled` — so the helper returns them as a tuple and the call site
+  is `(ptb_reply, mtu_signalled) = compute_forwarded_egress_ptb(...)`.
+  Behaviour-identical: same inner-MTU derivation (GRE/WG/NAT64 SSOT
+  helpers), same `forwarded_egress_mtu_decision`, same RFC/#2472-rate-limit
+  suppression, same PTB build, and the same `egress_mtu_exceeded`
+  exception recording with identical arguments and ordering. Hot-path
+  invariants preserved (no new alloc; non-NAT64 zero-copy untouched; the
+  helper runs only on the already-cold oversized-frame path). The moved
+  body is character-identical modulo the `request.meta`->`meta` and
+  `&request.decision`->`decision` field-to-param substitution. Bounded
+  single increment; #4408 tracker continues with further outlining
+  (segmentation/mirror paths, waterfill split). NOTE: did NOT run
+  `cargo fmt` — the tree is not canonical under the locally installed
+  rustfmt (it would rewrite ~1474 files), so the added lines were
+  hand-matched to the surrounding style. Verified: full `cargo test`
+  3830/0; `cargo check` clean (no new warnings).
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/README.md, _Log.md
+
 ## 2026-07-08 — #4497 F2: mirror global-scope matrix into Rust policy.rs
 
 - **Timestamp**: 2026-07-08

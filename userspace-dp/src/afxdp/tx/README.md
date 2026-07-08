@@ -62,3 +62,22 @@ writer to synchronize against.
   writer exists.
 - TCP segmentation is `#[cold]`. The fast path is direct submit;
   segmentation only fires for over-MSS forwarded frames.
+
+## Ongoing refactor: `enqueue_pending_forwards` outlining (#4408)
+
+`dispatch/mod.rs::enqueue_pending_forwards` is a large TX-drain
+orchestrator (build + segmentation + WG/GRE + output-filter + CoS). It
+is being decomposed into named private helpers in bounded, behaviour-
+identical (pure code-motion) increments tracked by #4408. Each helper
+preserves the hot-path invariants the function guards: no-alloc /
+zero-copy for non-NAT64 forwards, the single-recycle invariant, and the
+CoS guarantee-guard.
+
+- **Increment 1** — `compute_forwarded_egress_ptb`: the #2301/#2330/#2845
+  Path-MTU-Discovery block. Given the source (inner) frame, meta, and
+  decision it derives the inner-source MTU, runs
+  `forwarded_egress_mtu_decision`, builds the ICMP Frag-Needed (v4) /
+  Packet-Too-Big (v6) reply (subject to RFC / #2472 rate-limit
+  suppression), and records the `egress_mtu_exceeded` exception. Returns
+  `(ptb_reply, mtu_signalled)`; the caller drops the oversized original
+  when `mtu_signalled` and enqueues `ptb_reply` at the finalizer.
