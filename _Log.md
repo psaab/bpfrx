@@ -1,3 +1,31 @@
+## 2026-07-07 — #4566 cos: CachedThreeColorPolicers grows to a SmallVec so the cached TX path re-meters ALL fall-through policers (not just the first two)
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4566 (ps-036 c8 F-003 = corpus F-127, LOW — rate-limit slack,
+  NOT a permit/deny bypass). `CachedThreeColorPolicers`
+  (userspace-dp/src/filter/mod.rs) held a fixed two-`Option` layout
+  (`first`/`second`); its `push` silently DROPPED the 3rd (and beyond)
+  fall-through three-color policer, so a flow with >=3 fall-through
+  `then policer` terms escaped the 3rd+ term's committed/peak rate limit on
+  EVERY cached (flow-cache-hit) packet. The live/uncached full-eval path always
+  metered each policer; only the cached replay truncated. Fix = option (a) grow
+  the container to a `smallvec::SmallVec<[Arc<ThreeColorPolicerRuntime>; 2]>`,
+  mirroring the sibling `CachedFilterCounters` (#2573) which had the identical
+  "kept only the last/first N of a fall-through set" bug. Chosen over option (b)
+  decline-the-flow-cache because the cached-path replay
+  (`apply_cached_three_color_policers` → `for_each`) already iterates a variable
+  count, the >2 heap spill happens ONCE at flow-cache install off the packet hot
+  path, and this keeps cached vs live meter-identical for ALL policer counts.
+  Dedup preserved by policer `id`. A flow with <=2 policers behaves identically
+  (still inline, no heap, all metered).
+- **File(s)**: userspace-dp/src/filter/mod.rs (struct + push/extend/from_option/
+  len/for_each rewritten over the SmallVec), userspace-dp/src/filter/tests.rs
+  (RED-on-revert: `flow_cache_hit_runs_all_three_fall_through_policers` asserts
+  len==3 + all three metered [RED: len==2, gamma un-metered on revert];
+  `flow_cache_hit_runs_both_fall_through_policers` guards the unchanged 2-policer
+  case), userspace-dp/src/filter/README.md (#4566 note beside the #2573 one).
+- **Validation**: RED-on-revert confirmed (stash the mod.rs fix → 3-policer test
+  fails `left: 2, right: 3`, 2-policer test still ok). Full cargo suite below.
 ## 2026-07-07 — #4573 vrrp/config: VRRP GroupID (VRID) range gate + priority Atoi-swallow fix
 
 - **Timestamp**: 2026-07-07
