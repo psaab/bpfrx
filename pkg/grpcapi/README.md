@@ -312,3 +312,16 @@ contract.
   fields — a bare cast wrapped negative for a large pool (~40k addresses
   over the default 64512-port window) and corrupted the
   `avail = total - used` display.
+- Request-supplied tokens that are interpolated into an operational
+  shell-out must be validated at the boundary (#4588). `GetBGPStatus`
+  (`server_routing.go`) parses a neighbor IP out of `req.Type`
+  (`received-routes:<ip>` / `advertised-routes:<ip>` / `neighbor:<ip>`) and
+  hands it to the `pkg/frr` `GetBGPNeighbor*` wrappers, which concatenate it
+  into a `vtysh -c "show bgp neighbor <ip> …"` command. Because the local
+  gRPC listener is UNAUTHENTICATED, the handler rejects a non-parseable IP
+  with `codes.InvalidArgument` (`net.ParseIP`) before it reaches vtysh — a
+  newline-bearing token would otherwise become a second raw FRR CLI command
+  (`vtysh -c` splits on newlines) with no commit-audit trail. `req.Type ==
+  "neighbor"` and `neighbor:` with an empty ip stay legal (they select every
+  neighbor). The `pkg/frr` wrappers re-validate as the load-bearing belt;
+  see `pkg/frr/README.md` "#4588".
