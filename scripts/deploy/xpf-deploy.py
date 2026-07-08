@@ -317,7 +317,11 @@ def build_config_drive(ap, runner):
     stage = tempfile.mkdtemp(prefix="xpf-day0-")
     try:
         shutil.copyfile(cfg_path, os.path.join(stage, "xpf.conf"))
-        os.chmod(os.path.join(stage, "xpf.conf"), 0o644)
+        # 0o600, not 0o644: the staged xpf.conf carries every day-0 secret
+        # (root-authentication hash, IKE PSK, SNMP community, DDNS tokens).
+        # The 0700 mkdtemp already shields it, so this is belt-and-suspenders,
+        # but it keeps the staged copy owner-only too (#4586).
+        os.chmod(os.path.join(stage, "xpf.conf"), 0o600)
         if ap["mode"] == "cluster":
             with open(os.path.join(stage, "node-id"), "w") as f:
                 f.write(f"{ap['node_id']}\n")
@@ -327,6 +331,13 @@ def build_config_drive(ap, runner):
         else:
             argv = [mkiso, "-quiet", "-V", "xpf-config", "-J", "-r", "-o", iso, stage]
         run_capture(argv)   # die with the mkiso error, not a bare traceback (H-21)
+        # The ISO embeds xpf.conf — the most secret-bearing day-0 artifact
+        # (root-authentication hash, IKE PSK, SNMP community, DDNS tokens).
+        # xorriso/genisoimage writes it under the process umask (~0022 ->
+        # 0644, world-readable) and it lingers in CWD until destroy. Restrict
+        # it to owner-only so a co-located UID cannot `isoinfo -x /xpf.conf`
+        # the secrets out (#4586). The owner (daemon/VM) still reads it fine.
+        os.chmod(iso, 0o600)
         print(f"==> built day-0 drive {iso} (label xpf-config)")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
