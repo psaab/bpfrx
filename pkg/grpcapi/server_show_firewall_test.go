@@ -89,6 +89,134 @@ func TestShowTextFirewallFilterHonorsFamilyAndUserspaceCounters(t *testing.T) {
 	}
 }
 
+func newFirewallPolicerShowStore(t *testing.T) *configstore.Store {
+	t.Helper()
+
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	for _, cmd := range []string{
+		// A valid single-rate three-color policer referenced by one term. The
+		// strict filter validator rejects a dangling `then policer` reference,
+		// so the policer must be defined for the config to commit.
+		"firewall three-color-policer tcp-limit single-rate color-blind",
+		"firewall three-color-policer tcp-limit single-rate committed-information-rate 1m",
+		"firewall three-color-policer tcp-limit single-rate committed-burst-size 15k",
+		"firewall three-color-policer tcp-limit single-rate excess-burst-size 30k",
+		"firewall family inet filter rate-in term policed from destination-port 80",
+		"firewall family inet filter rate-in term policed then policer tcp-limit",
+		"firewall family inet filter rate-in term policed then accept",
+		// A second term with NO policer — must be unaffected by the policer
+		// surfacing.
+		"firewall family inet filter rate-in term plain from destination-port 22",
+		"firewall family inet filter rate-in term plain then accept",
+	} {
+		if err := store.SetFromInput(cmd); err != nil {
+			t.Fatalf("SetFromInput(%q) error = %v", cmd, err)
+		}
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	return store
+}
+
+// TestShowFirewallSurfacesThreeColorPolicerStatus is the #4372 RED-on-revert
+// guard: `show firewall` / `show firewall filter` must surface the per-color
+// (green/yellow/red conform/exceed) and treatment-drop counters the userspace
+// dataplane publishes for a three-color policer a term references. Reverting
+// the surfacing drops the "Policer ..." block (RED). A term with no policer is
+// unaffected.
+func TestShowFirewallSurfacesThreeColorPolicerStatus(t *testing.T) {
+	store := newFirewallPolicerShowStore(t)
+	s := &Server{
+		store: store,
+		dp: &firewallFilterShowUserspaceDP{
+			Manager: dataplane.New(),
+			status: dpuserspace.ProcessStatus{
+				ThreeColorPolicerCounters: []dpuserspace.ThreeColorPolicerStatus{
+					{
+						ID:            3,
+						Name:          "tcp-limit",
+						Mode:          "single-rate",
+						ColorBlind:    true,
+						GreenPackets:  100,
+						GreenBytes:    6400,
+						YellowPackets: 20,
+						YellowBytes:   1280,
+						RedPackets:    5,
+						RedBytes:      320,
+						DropPackets:   5,
+						DropBytes:     320,
+					},
+				},
+			},
+		},
+	}
+
+	wants := []string{
+		"then policer tcp-limit",
+		"Policer tcp-limit (single-rate, color-blind):",
+		"green (conform):  100 packets, 6400 bytes",
+		"yellow (exceed):  20 packets, 1280 bytes",
+		"red (violate):    5 packets, 320 bytes",
+		"dropped:          5 packets, 320 bytes",
+	}
+
+	// show firewall filter <name>
+	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "firewall-filter:rate-in:inet"})
+	if err != nil {
+		t.Fatalf("ShowText(firewall-filter) error = %v", err)
+	}
+	filterOut := resp.GetOutput()
+	for _, want := range wants {
+		if !strings.Contains(filterOut, want) {
+			t.Fatalf("show firewall filter output missing %q:\n%s", want, filterOut)
+		}
+	}
+	// The no-policer term must not sprout a policer block.
+	if strings.Count(filterOut, "Policer tcp-limit") != 1 {
+		t.Fatalf("show firewall filter rendered the policer block %d times, want 1:\n%s",
+			strings.Count(filterOut, "Policer tcp-limit"), filterOut)
+	}
+
+	// show firewall (all filters)
+	var buf strings.Builder
+	s.showFirewall(store.ActiveConfig(), &buf)
+	allOut := buf.String()
+	for _, want := range wants {
+		if !strings.Contains(allOut, want) {
+			t.Fatalf("show firewall output missing %q:\n%s", want, allOut)
+		}
+	}
+}
+
+// TestShowFirewallOmitsPolicerBlockWithoutThreeColorPolicer is the negative half
+// of the #4372 guard: a filter with no `then policer` reference renders no
+// "Policer" block even when the dataplane publishes unrelated policer counters.
+func TestShowFirewallOmitsPolicerBlockWithoutThreeColorPolicer(t *testing.T) {
+	store := newFirewallFilterShowStore(t)
+	s := &Server{
+		store: store,
+		dp: &firewallFilterShowUserspaceDP{
+			Manager: dataplane.New(),
+			status: dpuserspace.ProcessStatus{
+				ThreeColorPolicerCounters: []dpuserspace.ThreeColorPolicerStatus{
+					{ID: 1, Name: "unreferenced", Mode: "single-rate", GreenPackets: 9},
+				},
+			},
+		},
+	}
+
+	var buf strings.Builder
+	s.showFirewall(store.ActiveConfig(), &buf)
+	out := buf.String()
+	if strings.Contains(out, "Policer ") {
+		t.Fatalf("show firewall rendered a policer block for a filter with no policer:\n%s", out)
+	}
+}
+
 func TestShowTextScreenSYNCookieCounterRowsUsesUserspaceStatus(t *testing.T) {
 	s := &Server{
 		dp: &firewallFilterShowUserspaceDP{
