@@ -77,8 +77,14 @@ func unitIsActive(unit string) bool {
 }
 
 const (
-	kea4Config = "/etc/kea/kea-dhcp4.conf"
-	kea6Config = "/etc/kea/kea-dhcp6.conf"
+	// DefaultKea4ConfPath / DefaultKea6ConfPath are the Kea server config files
+	// xpf renders. Exported so a factory-reset zeroize can erase them directly
+	// (#4585) — xpf owns these whole files, so a wipe removes them outright.
+	DefaultKea4ConfPath = "/etc/kea/kea-dhcp4.conf"
+	DefaultKea6ConfPath = "/etc/kea/kea-dhcp6.conf"
+
+	kea4Config = DefaultKea4ConfPath
+	kea6Config = DefaultKea6ConfPath
 	kea4Svc    = "kea-dhcp4-server"
 	kea6Svc    = "kea-dhcp6-server"
 	// Kea memfile lease databases (per family). Shared by the display
