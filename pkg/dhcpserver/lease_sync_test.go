@@ -912,3 +912,123 @@ func TestSplitV6Identity(t *testing.T) {
 		})
 	}
 }
+
+// TestKeaMemfileHeadersMatchKea30xSchema pins the Kea 3.0.x memfile CSV schema
+// (the appliance ships kea-common live-verified at 3.0.3, per dhcpserver.go) as
+// EXTERNAL ground truth and asserts the production keaMemfileHeader{4,6} consts
+// match it byte-for-byte (#2261).
+//
+// Why this test exists — the byte-exactness risk it closes:
+// The other memfile tests are self-referential. TestPreSeedMemfile6_EmitsHWAddress
+// derives its expected column layout from keaMemfileHeader6 itself
+// (strings.Split(keaMemfileHeader6, ",")), and the writer emits that same const,
+// so a CO-DRIFT of the const AND the writer still passes them — yet a reordered
+// or renamed column silently breaks the LIVE Kea loader when the promoted node
+// reads the standby's pre-seeded memfile on failover (the memfile CSV is
+// positional). The live "client keeps its lease across a real failover" smoke is
+// the only other witness for that drift, and it is lab-gated (plan-deferred-lab).
+//
+// This test hard-codes the exact Kea 3.0.x lease4/lease6 header column order as a
+// LITERAL string, transcribed from the Kea source of truth (CSVLeaseFile4 /
+// CSVLeaseFile6 schemas), NOT derived from the production const. Mutating the
+// production const — or the writer — by even one column therefore FAILS here
+// (RED-on-revert), catching the drift without a lab window.
+//
+// Column order source of truth (Kea 3.0.x):
+//
+//	lease4 (12 cols): address,hwaddr,client_id,valid_lifetime,expire,subnet_id,
+//	                  fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+//	lease6 (18 cols): address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,
+//	                  lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,
+//	                  state,user_context,hwtype,hwaddr_source,pool_id
+//	                  (hwaddr is field 13 / index 12 — see
+//	                  TestPreSeedMemfile6_EmitsHWAddress).
+func TestKeaMemfileHeadersMatchKea30xSchema(t *testing.T) {
+	// Literal Kea 3.0.x DHCPv4 memfile CSV header (12 columns). Hand-transcribed
+	// from the Kea schema — deliberately NOT built from keaMemfileHeader4, so this
+	// is external ground truth and not a self-referential tautology.
+	const goldenKea30xHeader4 = "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id"
+	// Literal Kea 3.0.x DHCPv6 memfile CSV header (18 columns). Hand-transcribed
+	// from the Kea schema — NOT derived from keaMemfileHeader6.
+	const goldenKea30xHeader6 = "address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,state,user_context,hwtype,hwaddr_source,pool_id"
+
+	// (1) The production consts must equal the golden literals byte-for-byte. This
+	// is the core external-ground-truth assertion: reorder/rename/add/drop a
+	// column in keaMemfileHeader{4,6} and this fails, even if the writer moved with
+	// it.
+	if keaMemfileHeader4 != goldenKea30xHeader4 {
+		t.Errorf("keaMemfileHeader4 drifted from the Kea 3.0.x lease4 schema:\n  got:  %q\n  want: %q",
+			keaMemfileHeader4, goldenKea30xHeader4)
+	}
+	if keaMemfileHeader6 != goldenKea30xHeader6 {
+		t.Errorf("keaMemfileHeader6 drifted from the Kea 3.0.x lease6 schema:\n  got:  %q\n  want: %q",
+			keaMemfileHeader6, goldenKea30xHeader6)
+	}
+
+	// (2) Independent column-count guard on the golden literals themselves (a live
+	// Kea loader keys every field positionally, so the count must be exact). This
+	// also fails loudly if a future editor mangles the golden string in this test.
+	if n := len(strings.Split(goldenKea30xHeader4, ",")); n != 12 {
+		t.Errorf("golden lease4 header has %d columns, want 12", n)
+	}
+	if n := len(strings.Split(goldenKea30xHeader6, ",")); n != 18 {
+		t.Errorf("golden lease6 header has %d columns, want 18", n)
+	}
+
+	// (3) The WRITERS must emit exactly the golden column count. Encode one lease
+	// per family and count the emitted fields against the golden headers (not the
+	// production const). This is what catches the #2261 co-drift the self-
+	// referential tests miss: if BOTH the header const and the writer format string
+	// gain/lose a column together, (1) still passes for the writer's own const but
+	// this fails against the external golden count.
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile4 := filepath.Join(dir, "kea-leases4.csv")
+	memfile6 := filepath.Join(dir, "kea-leases6.csv")
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", "", memfile4, memfile6)
+
+	if err := m.PreSeedMemfile4([]SyncLease{
+		{Family: 4, Address: "10.0.61.42", HWAddress: "aa:bb:cc:dd:ee:42",
+			ClientID: "01:aa:bb:cc:dd:ee:42", SubnetID: 3, Remaining: 900,
+			Hostname: "golden4", State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile4: %v", err)
+	}
+	if err := m.PreSeedMemfile6([]SyncLease{
+		{Family: 6, Address: "2001:db8::42", DUID: "00:01:00:0a", IAID: 7,
+			LeaseType: "IA_NA", HWAddress: "aa:bb:cc:dd:ee:f6", SubnetID: 1,
+			Remaining: 1200, State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6: %v", err)
+	}
+
+	wantCols := map[int]struct {
+		path   string
+		golden string
+		want   int
+	}{
+		4: {memfile4, goldenKea30xHeader4, 12},
+		6: {memfile6, goldenKea30xHeader6, 18},
+	}
+	for family, tc := range wantCols {
+		raw, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("read pre-seeded v%d memfile: %v", family, err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		if len(lines) < 2 {
+			t.Fatalf("pre-seeded v%d memfile has no lease row:\n%s", family, raw)
+		}
+		// Header line must itself be byte-exact against the golden.
+		if lines[0] != tc.golden {
+			t.Errorf("v%d memfile header line drifted:\n  got:  %q\n  want: %q",
+				family, lines[0], tc.golden)
+		}
+		// The lease data row must have exactly the golden column count.
+		if n := len(strings.Split(lines[1], ",")); n != tc.want {
+			t.Errorf("v%d lease row emitted %d columns, want %d (writer/header drift): %q",
+				family, n, tc.want, lines[1])
+		}
+	}
+}

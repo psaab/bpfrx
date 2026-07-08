@@ -670,6 +670,20 @@ This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
 - `WaitControlSocket{4,6}(ctx, within)` — bounded readiness wait before the
   post-start seed.
 
+**Memfile CSV schema is pinned as external ground truth (#2261).** The live
+Kea loader reads the pre-seeded memfile POSITIONALLY, so `keaMemfileHeader{4,6}`
+must be byte-exact against the Kea 3.0.x schema (the appliance ships kea-common
+live-verified at 3.0.3) or the promoted node fails to load the standby's leases
+on failover. `TestKeaMemfileHeadersMatchKea30xSchema` asserts both consts equal
+a LITERAL golden header transcribed from the Kea source of truth (lease4 = 12
+cols, lease6 = 18 cols), NOT derived from the const itself — so a co-drift of
+the header const AND the writer (which the older self-referential positional
+tests cannot catch) fails the golden. The remaining live acceptance — a real
+DHCP client keeping its binding across a hard failover with the knob ON — is
+lab-gated (plan-deferred-lab on #2261); its steps are codified as a manual
+harness in `test/incus/dhcp-lease-failover.sh` (not in `make test`/CI: it
+reboots a shared-cluster node and needs a DHCP-client fixture).
+
 All of these talk ONLY to KEA's own unix control socket (or the memfile) —
 NEVER the userspace-helper control socket (CLAUDE.md rule), so they cannot
 starve session installs. All seed/read errors are fail-open (logged + counted
