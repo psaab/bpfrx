@@ -9,6 +9,26 @@ import (
 	"strings"
 )
 
+// deterministicIPv4Enforced reports whether a deterministic-NAT pool uses the
+// IPv4-subscriber path (mode 1), which the userspace dataplane now enforces
+// (#4559). It returns true only for a valid IPv4 host CIDR with a positive
+// block size; an IPv6 host (mode 2 / NAT64) or an unparseable address is still
+// deferred (round-robin fallback) and keeps the accepted-but-inert advisory.
+// This mirrors the enforced/deferred split in
+// userspace.deterministicSourceNATFields so the advisory and the dataplane
+// agree on which pools are actually enforced.
+func deterministicIPv4Enforced(det *DeterministicNATConfig) bool {
+	if det == nil || det.BlockSize <= 0 || det.HostAddress == "" {
+		return false
+	}
+	_, hostNet, err := net.ParseCIDR(det.HostAddress)
+	if err != nil {
+		return false
+	}
+	_, bits := hostNet.Mask.Size()
+	return bits == 32
+}
+
 // sortedPoolNames returns the keys of a NAT pool map in deterministic sorted
 // order, so advisory / warning messages that enumerate pools are stable across
 // compiles (Go map iteration order is randomized). Used by the #4291/#4292
@@ -817,30 +837,39 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	// #4559 (ps-034 M-01): deterministic CGNAT `port deterministic block-size
-	// <n> host address <cidr>` is typed + validated (compiler_nat.go) and was
-	// compiled into the retired eBPF plane (pkg/dataplane/compiler_nat.go, now
-	// dead after #1373/#1476), but was NEVER ported to the userspace dataplane
-	// (nat_source.go / userspace-dp have no block-allocation logic). So a
-	// deterministic pool commits clean and SILENTLY falls back to round-robin /
-	// sticky SNAT — the subscriber→fixed-port-block mapping that is the whole
-	// point (lawful-intercept / audit without per-flow logs) is not enforced.
-	// Mirror the #4291/#4292 accepted-only doctrine: warn so the operator is not
-	// silently misled. Full block-allocator enforcement is a userspace-dp
-	// follow-up tracked in #4559.
+	// <n> host address <cidr>`. The IPv4-subscriber path (mode 1) is now
+	// ENFORCED on the userspace dataplane — the Go builder carries the block /
+	// host params (nat_source.go deterministicSourceNATFields) and the Rust
+	// allocator maps each subscriber to a fixed external IP + port block
+	// (allocate_deterministic_v4). Only the IPv6-subscriber path (mode 2 /
+	// NAT64) remains deferred: the builder leaves its snapshot fields zero so
+	// the pool silently round-robins, and the subscriber→fixed-port-block
+	// mapping (lawful-intercept / audit without per-flow logs) is not enforced
+	// for it. Warn ONLY for those deferred pools so the operator is not silently
+	// misled, mirroring the #4291/#4292 accepted-only doctrine. Full IPv6
+	// enforcement remains tracked in #4559.
 	{
 		var detPools []string
 		for _, name := range sortedPoolNames(cfg.Security.NAT.SourcePools) {
-			if p := cfg.Security.NAT.SourcePools[name]; p != nil && p.Deterministic != nil {
-				detPools = append(detPools, name)
+			p := cfg.Security.NAT.SourcePools[name]
+			if p == nil || p.Deterministic == nil {
+				continue
 			}
+			// An IPv4 host CIDR is enforced (mode 1). Anything else (IPv6 host,
+			// or a host address that no longer parses) still falls back to
+			// round-robin, so it keeps the advisory.
+			if deterministicIPv4Enforced(p.Deterministic) {
+				continue
+			}
+			detPools = append(detPools, name)
 		}
 		if len(detPools) > 0 {
 			warnings = append(warnings, fmt.Sprintf(
-				"security nat source pool %s: `port deterministic block-size` is "+
-					"accepted but NOT enforced by the userspace dataplane "+
-					"(round-robin/sticky SNAT is used instead); deterministic "+
-					"CGNAT block allocation is not yet implemented (config-only "+
-					"parity, #4559)",
+				"security nat source pool %s: `port deterministic block-size` with "+
+					"an IPv6 (NAT64) subscriber host is accepted but NOT enforced "+
+					"by the userspace dataplane (round-robin/sticky SNAT is used "+
+					"instead); IPv4-subscriber deterministic CGNAT is enforced, IPv6 "+
+					"(mode 2) block allocation is not yet implemented (#4559)",
 				strings.Join(detPools, ", ")))
 		}
 	}

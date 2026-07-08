@@ -41726,6 +41726,38 @@ top.
   docs/userspace-dataplane-architecture.md,
   docs/research/3616-ipsec-host-inbound/plan.md, _Log.md
 
+## 2026-07-08 — #4559 deterministic CGNAT IPv4 (mode 1) userspace port
+- **Timestamp**: 2026-07-08
+- **Action**: Ported the IPv4 (mode 1) deterministic CGNAT port-block
+  allocator from the retired eBPF plane to the userspace dataplane. A
+  deterministic source pool now maps each in-range subscriber IPv4 to a
+  fixed external pool address + port block (reversible from
+  `(external IP, port)` back to the subscriber with no per-flow state).
+  Go builder (`deterministicSourceNATFields`) precomputes
+  mode/block_size/blocks_per_ip/host_base(host-order u32)/host_count and
+  stamps 5 additive omitempty wire fields on `SourceNATRuleSnapshot`; the
+  Rust allocator gains `DeterministicV4`, `deterministic_indices_v4`,
+  `allocate_deterministic_v4` (first-free-port-in-block, collision-free,
+  not recycled on release), and `reverse_deterministic_v4`. Source-NAT
+  match routes a deterministic pool through the new path; an out-of-range
+  subscriber fails CLOSED. The #4560 advisory is narrowed to IPv6-host
+  (mode 2, still deferred) pools. Regenerated protocol_wire_v1.json golden
+  for the additive fields. RED-on-revert Rust test
+  (`deterministic_cgnat_v4_fixed_block_per_subscriber_reversible`) +
+  round-robin-unchanged companion + Go builder/advisory tests. FULL cargo
+  3739/0 (nat subset 205/0); Go config + userspace packages green.
+  Deferred (still #4559): IPv6/NAPT64 mode 2, block-based pool-utilization.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/protocol/nat.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/nat_source_deterministic_4559_test.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/deterministic_nat_advisory_4559_test.go,
+  docs/deterministic-nat-cgnat.md, docs/feature-gaps.md,
+  docs/vsrx-gaps.md, _Log.md
 - **Timestamp**: 2026-07-08
 - **Action**: #4497 (avo-001 F3) — surface queried ICMP type/code in the
   local CLI `test policy` query echo. The `testPolicy` verdict echoed

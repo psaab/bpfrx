@@ -102,6 +102,99 @@ enum AllocationOwner {
 struct LiveAllocation {
     translated: TranslatedTuple,
     persistent_key: Option<PersistentSourceKey>,
+    // #4559: a deterministic CGNAT block allocation. Its port is NOT pushed onto
+    // the per-address recycle queue on release (`release_translated_locked`) —
+    // the deterministic claim scans its subscriber block against
+    // `owner_by_translated` directly, so a freed port becomes claimable again the
+    // moment its owner slot clears. Recycling it too would let the queue grow
+    // without bound across per-subscriber flow churn (a deterministic-only pool
+    // never drains the recycle queue). `false` for every round-robin/persistent
+    // allocation (unchanged behaviour).
+    deterministic: bool,
+}
+
+/// #4559: IPv4 deterministic CGNAT (mode 1) block-allocation parameters,
+/// precomputed by the Go compiler and carried on the source-NAT rule. The
+/// mapping is `subscriber internal IPv4 -> fixed (external pool IP, port
+/// block)`, reversible from `(external IP, port)` back to the subscriber with
+/// NO per-flow state (the whole point of deterministic NAT: lawful-intercept /
+/// CGN audit without per-connection logging). Reproduces the retired-eBPF
+/// `nat_pool_alloc_deterministic_v4` logic (pkg/dataplane/compiler_nat.go /
+/// the deleted bpf/xdp/xdp_policy.c) in the userspace dataplane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DeterministicV4 {
+    /// Ports per subscriber block (Junos `block-size`).
+    pub(crate) block_size: u16,
+    /// Blocks each external pool address carries
+    /// (`(port_high - port_low + 1) / block_size`).
+    pub(crate) blocks_per_ip: u16,
+    /// Subscriber-CIDR network address, host-order u32.
+    pub(crate) host_base: u32,
+    /// Subscriber count in the host CIDR (`1 << (32 - prefix_len)`).
+    pub(crate) host_count: u32,
+}
+
+/// #4559: map a subscriber IPv4 to its deterministic `(ip_idx, block_idx)`.
+/// `ip_idx` selects the external pool address; `block_idx` selects the port
+/// block within that address. Returns `None` when the subscriber is outside the
+/// configured host range or the parameters are degenerate (`blocks_per_ip == 0`
+/// / `block_size == 0`) — the caller fails the allocation closed rather than
+/// silently round-robining a subscriber that has no reserved block.
+pub(crate) fn deterministic_indices_v4(
+    params: &DeterministicV4,
+    src: Ipv4Addr,
+) -> Option<(usize, u32)> {
+    let bpi = params.blocks_per_ip as u32;
+    if bpi == 0 || params.block_size == 0 {
+        return None;
+    }
+    let src_h = u32::from(src);
+    if src_h < params.host_base {
+        return None;
+    }
+    let sub_idx = src_h - params.host_base;
+    if sub_idx >= params.host_count {
+        return None;
+    }
+    let ip_idx = (sub_idx / bpi) as usize;
+    let block_idx = sub_idx % bpi;
+    Some((ip_idx, block_idx))
+}
+
+/// #4559: reverse a deterministic translated `(external pool IP, port)` back to
+/// the subscriber's internal IPv4 with NO per-flow state — the CGN-compliance
+/// property that motivates deterministic NAT. `pool_v4` is the rule's ordered
+/// external-address list (same order the forward path indexes); `port_low` is
+/// the pool's low port. Returns `None` when the tuple does not fall in the
+/// deterministic space (unknown external IP, port below `port_low`, or a
+/// block/subscriber index out of range).
+pub(crate) fn reverse_deterministic_v4(
+    params: &DeterministicV4,
+    pool_v4: &[Ipv4Addr],
+    port_low: u16,
+    translated_ip: Ipv4Addr,
+    translated_port: u16,
+) -> Option<Ipv4Addr> {
+    if params.block_size == 0 {
+        return None;
+    }
+    let ip_idx = pool_v4.iter().position(|&a| a == translated_ip)?;
+    if translated_port < port_low {
+        return None;
+    }
+    let offset = (translated_port - port_low) as u32;
+    let block_idx = offset / params.block_size as u32;
+    if block_idx >= params.blocks_per_ip as u32 {
+        return None;
+    }
+    let sub_idx = (ip_idx as u32)
+        .checked_mul(params.blocks_per_ip as u32)?
+        .checked_add(block_idx)?;
+    if sub_idx >= params.host_count {
+        return None;
+    }
+    let host = params.host_base.checked_add(sub_idx)?;
+    Some(Ipv4Addr::from(host))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -390,6 +483,7 @@ impl PortAllocator {
                         LiveAllocation {
                             translated,
                             persistent_key: Some(key),
+                            deterministic: false,
                         },
                     );
                     self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
@@ -466,6 +560,7 @@ impl PortAllocator {
                 LiveAllocation {
                     translated,
                     persistent_key,
+                    deterministic: false,
                 },
             );
             self.shared
@@ -586,6 +681,24 @@ impl PortAllocator {
         true
     }
 
+    /// #4559: release a deterministic block allocation WITHOUT recycling its
+    /// port. The deterministic claim path scans its subscriber block against
+    /// `owner_by_translated` directly, so clearing the owner slot is enough to
+    /// make the port claimable again; pushing it onto the recycle queue (which a
+    /// deterministic-only pool never drains) would grow that queue without bound
+    /// across per-subscriber flow churn.
+    fn release_translated_no_recycle_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        translated: TranslatedTuple,
+    ) -> bool {
+        if live.owner_by_translated.remove(&translated).is_none() {
+            return false;
+        }
+        live.addr_index_by_translated.remove(&translated);
+        true
+    }
+
     fn insert_lease_expiration_locked(
         live: &mut PortAllocatorLiveState,
         addr_index: usize,
@@ -641,6 +754,8 @@ impl PortAllocator {
                 Self::remove_lease_expiration_locked(&mut live, addr_index, old_expires_at_ns, key);
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
+        } else if existing.deterministic {
+            self.release_translated_no_recycle_locked(&mut live, translated);
         } else {
             self.release_translated_locked(&mut live, translated);
         }
@@ -690,10 +805,93 @@ impl PortAllocator {
             if let Some((addr_index, expires_at_ns)) = insert_expiry {
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
+        } else if existing.deterministic {
+            self.release_translated_no_recycle_locked(&mut live, translated);
         } else {
             self.release_translated_locked(&mut live, translated);
         }
         true
+    }
+
+    /// #4559: allocate a deterministic CGNAT port from the subscriber's fixed
+    /// block. The external pool IP and the port block are a pure function of the
+    /// subscriber's internal IPv4 address (`deterministic_indices_v4`), so the
+    /// `(external IP, port)` → subscriber reverse mapping needs no per-flow log.
+    /// A live flow re-allocates its existing tuple (reuse); a fresh flow claims
+    /// the first free port in `[port_start, port_end]` against
+    /// `owner_by_translated` (collision-free within the shared allocator). Unlike
+    /// round-robin PAT this does NOT touch the per-address round-robin counter,
+    /// the recycle queue, or persistent leases — a deterministic pool is
+    /// mutually exclusive with persistent-nat / address-persistent (enforced at
+    /// commit). Returns the subscriber-out-of-range / exhaustion failure to the
+    /// caller instead of silently falling back to round-robin.
+    pub(super) fn allocate_deterministic_v4(
+        &self,
+        flow: SourceNatFlowKey,
+        pool_v4: &[Ipv4Addr],
+        params: DeterministicV4,
+        src: Ipv4Addr,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        use super::source::SourceNatFailureReason;
+        if self.port_low == 0 || self.port_high == 0 || self.port_low > self.port_high {
+            return Err(SourceNatFailureReason::InvalidPortRange);
+        }
+        let (ip_idx, block_idx) = deterministic_indices_v4(&params, src)
+            .ok_or(SourceNatFailureReason::DeterministicSubscriberOutOfRange)?;
+        if ip_idx >= pool_v4.len() {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        let translated_ip = IpAddr::V4(pool_v4[ip_idx]);
+        // Block boundaries: [port_low + block_idx*block_size,
+        // that + block_size - 1], clamped to port_high. Widths align with the Go
+        // compiler because both use the SAME defaulted port range.
+        let port_start = self.port_low as u32 + block_idx * params.block_size as u32;
+        if port_start > self.port_high as u32 {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        let port_end = (port_start + params.block_size as u32 - 1).min(self.port_high as u32);
+
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing.translated);
+        }
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SourceNatFailureReason::AllocatorExhausted);
+        }
+        // Claim the first free port in the subscriber's block. The block is small
+        // (typically a few thousand ports) and this is the cold path (first
+        // packet of a flow), so a linear probe is fine.
+        for p in port_start..=port_end {
+            let translated = TranslatedTuple {
+                ip: translated_ip,
+                port: p as u16,
+            };
+            if live.owner_by_translated.contains_key(&translated) {
+                continue;
+            }
+            live.owner_by_translated
+                .insert(translated, AllocationOwner::Flow(flow));
+            live.addr_index_by_translated.insert(translated, ip_idx);
+            live.live_by_flow.insert(
+                flow,
+                LiveAllocation {
+                    translated,
+                    persistent_key: None,
+                    deterministic: true,
+                },
+            );
+            self.shared
+                .allocations_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(translated);
+        }
+        // Every port in the subscriber's block is live — the block is full.
+        self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+        Err(SourceNatFailureReason::AllocatorExhausted)
     }
 
     /// #4388: reserve a SPECIFIC translated `(ip, port)` for `flow` WITHOUT
@@ -760,6 +958,7 @@ impl PortAllocator {
             LiveAllocation {
                 translated,
                 persistent_key: None,
+                deterministic: false,
             },
         );
         true

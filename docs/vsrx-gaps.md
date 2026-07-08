@@ -22,8 +22,9 @@ Last updated: 2026-02-13
 >   takeover), IP Monitoring for Failover (#1827).
 > - **§3 Routing:** BFD (OSPF/OSPFv3/IS-IS/BGP), OSPFv3, and BGP import
 >   all shipped; the routing-policy row's claims are stale.
-> - **§2 NAT:** Twice NAT, NAT Proxy ARP, deterministic / address-shifting
->   NAT — all Done.
+> - **§2 NAT:** Twice NAT, NAT Proxy ARP Done; deterministic / address-shifting
+>   NAT is Done for IPv4 subscribers (mode 1, #4559) — IPv6/NAPT64 (mode 2)
+>   deferred (round-robin + advisory).
 > - **§4 VPN:** IPsec DPD (#3994) and traffic selectors — Done. (Policy-
 >   based IPsec VPN remains a real gap — rejected at commit, #3114; see
 >   `docs/feature-gaps.md` §15.)
@@ -118,7 +119,7 @@ Last updated: 2026-02-13
 | **NAT Rule Ordering** | Explicit rule ordering with priority numbers | Simple | No — xpf uses implicit ordering |
 | **NAT Proxy ARP** | Automatic proxy ARP for NAT pool addresses | Simple | No |
 | **Overflow Pool** | Fallback pool when primary NAT pool is exhausted | Simple | No |
-| **PAT Pool with Address Shifting** | Deterministic NAT (predictable port mapping) | Medium | Parse-only (#4559) — validated at commit + accepted-but-inert advisory, but no userspace block allocator (the eBPF impl was retired in #1373/#1476); falls back to round-robin/sticky SNAT |
+| **PAT Pool with Address Shifting** | Deterministic NAT (predictable port mapping) | Medium | IPv4 (mode 1) ENFORCED on userspace (#4559) — subscriber IPv4 → fixed external IP + port block, reversible for CGN compliance logging (`allocate_deterministic_v4`, `userspace-dp/src/nat/allocator.rs`). IPv6/NAPT64 (mode 2) still deferred (round-robin + advisory) |
 | **DS-Lite Concentrator** | IPv4-in-IPv6 softwire for carrier-grade NAT | Complex | No — xpf has NAT64 but not DS-Lite |
 
 ---
