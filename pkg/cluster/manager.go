@@ -145,6 +145,13 @@ type Manager struct {
 	peerTransferOutPrevious   map[int]peerGroupSnapshot
 	peerMonitors              []InterfaceMonitorInfo
 
+	// lastDupNodeIDWarn rate-limits the duplicate-node-id warning (#4549 F11).
+	// A peer advertising the local node's own node-id is an invalid cluster
+	// (two chassis cannot share a node-id); the warning fires at most once per
+	// 30s so a 5/s heartbeat stream cannot flood the log. Read/written under
+	// m.mu.
+	lastDupNodeIDWarn time.Time
+
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
 	hbReceiver *heartbeatReceiver

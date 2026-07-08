@@ -137,6 +137,41 @@ still promotes once the grace elapses (`neverSeenConfirmed` returns true at
 sets `peerEverSeen` and runs `electSingleNode`; `election.go` bypasses the
 readiness gate when `!peerAlive`, so the surviving node takes over.
 
+## Duplicate node-id (invalid cluster, #4549 F11)
+
+Two chassis sharing a node-id is an invalid cluster: the HA protocol
+carries no per-node identity besides the node-id, so election has **no
+asymmetric discriminator** to elect a single primary — both nodes run the
+identical `electRG` code and compute the identical result. There is no
+correct runtime resolution; the only remedy is correcting
+`/etc/xpf/node-id` on one chassis.
+
+Two defenses, both fail-safe rather than manufacturing a false winner:
+
+- **Join point (`heartbeatReceiver.recvLoop`, `heartbeat.go`).** On a
+  unicast point-to-point control link a node never receives its own
+  frame, so a same-cluster heartbeat carrying the local node-id is a
+  duplicate-node-id peer, not a loopback. The receiver still discards it
+  (it cannot be told apart from a stray loopback, and a duplicate-node-id
+  cluster is unresolvable), but calls `NoteDuplicateNodeIDHeartbeat` to
+  emit a rate-limited (`>=30s`) `slog.Error` so the operator sees the
+  misconfiguration instead of a silent split-brain. Because the frame is
+  discarded, `peerAlive`/`peerNodeID` never reflect the duplicate peer, so
+  in production both nodes run `electSingleNode` and would otherwise both
+  claim PRIMARY — the warning is the operator-facing signal that this is
+  happening.
+
+- **Election tie-break (`electRG`, `election.go`).** If a same-node-id
+  peer ever does reach election (the direct API / tests, or any future
+  path that does not go through `recvLoop`), the dual-active tie, the
+  preempt tie, and the initial-state tie all detect
+  `m.nodeID == m.peerNodeID` and **fail closed to SECONDARY** (via
+  `warnDuplicateNodeIDLocked`). Before the fix the dual-active and preempt
+  ties returned "winner stays"/"no change", leaving both symmetric nodes
+  PRIMARY (a permanent dual-primary split-brain — duplicate VIP / ARP
+  conflict). Yielding both nodes to SECONDARY produces a clean, obvious,
+  loudly-logged outage instead of subtle duplicate-address corruption.
+
 ## Control-channel authentication (#4107, PR-A)
 
 The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds

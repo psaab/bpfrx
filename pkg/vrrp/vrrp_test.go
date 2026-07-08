@@ -2168,13 +2168,13 @@ func TestReceiverIPv6_DeliversPacket(t *testing.T) {
 	// so this packet is delivered exactly as before.
 	readOnce := make(chan struct{}, 1)
 	readOnce <- struct{}{} // allow one read
-	vi.ipv6Recv = func(b []byte) (int, int, net.Addr, error) {
+	vi.ipv6Recv = func(b []byte) (int, int, int, net.Addr, error) {
 		select {
 		case <-readOnce:
 			n := copy(b, data)
-			return n, 0, &net.IPAddr{IP: srcIP}, nil
+			return n, 0, 255, &net.IPAddr{IP: srcIP}, nil
 		case <-vi.stopCh:
-			return 0, 0, nil, net.ErrClosed
+			return 0, 0, 0, nil, net.ErrClosed
 		}
 	}
 
