@@ -58,6 +58,22 @@ tracker issue #4407 carries the remaining increments.
   bounded to that one file — the explicit `d.dhcpLeaseSync.` qualifier is
   clearer than field promotion. `ipsecSANudgeCh` stayed a flat `Daemon`
   field (it is IPsec-SA-sync state, not lease-sync).
+- **Increment 2 — periodic neighbor-resolution guards (#1780 Path A):** the
+  nine flat supervision fields for `runPeriodicNeighborResolution` (the
+  per-phase in-flight overlap guards, the per-phase last-success UnixNano
+  timestamps feeding the `neighbor_periodic_last_success_age_seconds{phase}`
+  gauge, the loop-started gate, and the `warmNeighborCache` warmup guard)
+  moved into `neighborPeriodicGuards` (defined in `daemon_neighbor.go`, the
+  file that owns the supervision loop), reached as `d.neighborGuards.*`. The
+  fields keep their exact `atomic.Bool` / `atomic.Int64` types (dropping the
+  now-redundant `neighbor`/`Neighbor`/`Periodic` name prefixes), and
+  `runGuardedNeighborPhase` still takes `&`-pointers to the addressable struct
+  fields, so this is pure code motion — no behavior/locking change. A named
+  sub-field (not an embed) matches increment 1: every non-test access site is
+  bounded to `daemon_neighbor.go`. `lastStandbyNeighborRefresh` stayed a flat
+  `Daemon` field (like increment 1's `ipsecSANudgeCh`) — it is the
+  standby-side refresh rate limit read in `daemon_health.go`, a different
+  mechanism from the periodic-resolution supervision grouped here.
 
 ## Cluster mode
 

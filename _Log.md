@@ -1,3 +1,24 @@
+## 2026-07-08 — #4407 increment 2: extract neighborPeriodicGuards sub-struct
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4407 Daemon god-struct decomposition, increment 2. Grouped the
+  nine flat `runPeriodicNeighborResolution` supervision fields (#1780 Path A:
+  `neighborWarmupInFlight`, `resolveNeighborsInFlight`, `forceProbeInFlight`,
+  `cleanFailedInFlight`, the four `*LastSuccessNanos`, and
+  `neighborPeriodicLoopStarted`) into a new `neighborPeriodicGuards` sub-struct
+  defined in `daemon_neighbor.go` (the file that owns the supervision loop),
+  reached as `d.neighborGuards.*`. Dropped the now-redundant name prefixes
+  (`neighborWarmupInFlight`→`warmInFlight`, `resolveNeighborsInFlight`→
+  `resolveInFlight`, `neighborPeriodicLoopStarted`→`loopStarted`). Pure code
+  motion — no behavior/locking change; `runGuardedNeighborPhase` still takes
+  `&`-pointers to the addressable struct fields. `lastStandbyNeighborRefresh`
+  stayed flat (standby-refresh rate limit in `daemon_health.go`, a different
+  mechanism), mirroring increment 1's `ipsecSANudgeCh` decision.
+- **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_neighbor.go,
+  pkg/daemon/neighbor_periodic_guard_test.go, pkg/daemon/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/daemon/` clean;
+  `go test -race ./pkg/daemon/...` green; gofmt clean on the touched files.
+
 ## 2026-07-07 — #4228 Gap 2 follow-up: accept `buffer-size temporal <us>`
 
 - **Timestamp**: 2026-07-07

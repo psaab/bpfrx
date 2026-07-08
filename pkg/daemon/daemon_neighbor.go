@@ -376,6 +376,45 @@ func (d *Daemon) cleanFailedNeighbors() int {
 //     session-derived neighbor cache entries so standby forwarding stays ready
 //     without activation-time warmup.
 //
+// neighborPeriodicGuards groups the #1780 Path A per-phase supervision state
+// for runPeriodicNeighborResolution. Each periodic phase runs in a guarded
+// goroutine so a hung netlink/probe syscall in one phase can never freeze the
+// for-select loop (the observed 17.5h stall). The in-flight bools skip a phase
+// while a prior pass is still running (no overlap / netlink-socket leak — a
+// stuck syscall can't be cancelled, so we leak at most one goroutine per phase,
+// never a growing pile). The *LastSuccessNanos UnixNano feeds the
+// neighbor_periodic_last_success_age_seconds{phase} gauge so a stalled phase is
+// observable.
+//
+// This type was extracted from the flat Daemon fields as increment 2 of the
+// #4407 Daemon god-struct decomposition — pure field grouping, no
+// behavior/locking change. The fields keep their exact atomic types and are
+// reached as d.neighborGuards.<field>; the runGuardedNeighborPhase helper still
+// takes &-pointers to the addressable struct fields.
+type neighborPeriodicGuards struct {
+	// warmInFlight guards warmNeighborCache (the HA session-walk warmup) so a
+	// pass that exceeds one tick interval does not overlap itself;
+	// warmLastSuccessNanos records its last successful completion.
+	warmInFlight atomic.Bool
+	// resolveInFlight / forceProbeInFlight / cleanFailedInFlight are the
+	// per-phase overlap guards for the resolve, force-probe, and clean phases.
+	resolveInFlight     atomic.Bool
+	forceProbeInFlight  atomic.Bool
+	cleanFailedInFlight atomic.Bool
+	// *LastSuccessNanos hold the wall-clock UnixNano of each phase's last
+	// successful completion (0 = never), feeding the phase-age watchdog gauge.
+	resolveLastSuccessNanos     atomic.Int64
+	forceProbeLastSuccessNanos  atomic.Int64
+	cleanFailedLastSuccessNanos atomic.Int64
+	warmLastSuccessNanos        atomic.Int64
+	// loopStarted gates the phase-age gauge: it is set once
+	// runPeriodicNeighborResolution actually starts (the loop only runs when
+	// the dataplane is enabled with active config). Without it, a daemon that
+	// never starts the loop would report every phase as a forever-climbing
+	// "wedged" age — a false positive (Codex #1781 r1).
+	loopStarted atomic.Bool
+}
+
 // NeighborPeriodicPhaseAges returns, per periodic-neighbor-maintenance phase,
 // the seconds since that phase last completed successfully — the #1780 Path A
 // stall diagnostic. A phase frozen by a hung netlink/probe syscall shows a
@@ -391,7 +430,7 @@ func (d *Daemon) cleanFailedNeighbors() int {
 // (maintainClusterNeighborReadiness no-ops when d.cluster == nil and so never
 // updates warmLastSuccessNanos).
 func (d *Daemon) NeighborPeriodicPhaseAges() map[string]float64 {
-	if !d.neighborPeriodicLoopStarted.Load() {
+	if !d.neighborGuards.loopStarted.Load() {
 		return nil
 	}
 	now := time.Now()
@@ -412,14 +451,14 @@ func (d *Daemon) NeighborPeriodicPhaseAges() map[string]float64 {
 		return sec
 	}
 	ages := map[string]float64{
-		"resolve":      age(d.resolveLastSuccessNanos.Load()),
-		"force_probe":  age(d.forceProbeLastSuccessNanos.Load()),
-		"clean_failed": age(d.cleanFailedLastSuccessNanos.Load()),
+		"resolve":      age(d.neighborGuards.resolveLastSuccessNanos.Load()),
+		"force_probe":  age(d.neighborGuards.forceProbeLastSuccessNanos.Load()),
+		"clean_failed": age(d.neighborGuards.cleanFailedLastSuccessNanos.Load()),
 	}
 	// The warm phase only exists under HA; reporting it standalone would be a
 	// forever-climbing false "wedge".
 	if d.cluster != nil {
-		ages["warm"] = age(d.warmLastSuccessNanos.Load())
+		ages["warm"] = age(d.neighborGuards.warmLastSuccessNanos.Load())
 	}
 	return ages
 }
@@ -453,7 +492,7 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Mark the loop live so NeighborPeriodicPhaseAges reports phase ages only
 	// once supervision is actually running (avoids the never-started false
 	// positive — Codex #1781 r1).
-	d.neighborPeriodicLoopStarted.Store(true)
+	d.neighborGuards.loopStarted.Store(true)
 
 	// #1780 Path A: each phase runs via runGuardedNeighborPhase (a guarded
 	// goroutine) so one hung netlink/probe phase cannot freeze this loop.
@@ -489,12 +528,12 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// resolveTick is the 15s pass: resolve + force-probe (both guarded) +
 	// maintain. cleanTick is the 5s pass: clean (guarded).
 	resolveTick := func() {
-		d.runGuardedNeighborPhase(&d.resolveNeighborsInFlight, &d.resolveLastSuccessNanos, resolvePass)
-		d.runGuardedNeighborPhase(&d.forceProbeInFlight, &d.forceProbeLastSuccessNanos, forceProbePass)
+		d.runGuardedNeighborPhase(&d.neighborGuards.resolveInFlight, &d.neighborGuards.resolveLastSuccessNanos, resolvePass)
+		d.runGuardedNeighborPhase(&d.neighborGuards.forceProbeInFlight, &d.neighborGuards.forceProbeLastSuccessNanos, forceProbePass)
 		maintainPass()
 	}
 	cleanTick := func() {
-		d.runGuardedNeighborPhase(&d.cleanFailedInFlight, &d.cleanFailedLastSuccessNanos, cleanPass)
+		d.runGuardedNeighborPhase(&d.neighborGuards.cleanFailedInFlight, &d.neighborGuards.cleanFailedLastSuccessNanos, cleanPass)
 	}
 
 	// Immediate first run — don't wait for first tick. force-probe is
@@ -502,7 +541,7 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// at startup; it joins on the first 15s tick with a non-overlapping set),
 	// so the immediate pass is resolve + maintain + clean, matching the
 	// pre-#1780 startup sequence exactly.
-	d.runGuardedNeighborPhase(&d.resolveNeighborsInFlight, &d.resolveLastSuccessNanos, resolvePass)
+	d.runGuardedNeighborPhase(&d.neighborGuards.resolveInFlight, &d.neighborGuards.resolveLastSuccessNanos, resolvePass)
 	maintainPass()
 	cleanTick()
 
@@ -552,13 +591,13 @@ func (d *Daemon) maintainClusterNeighborReadiness() {
 	// keeps the snapshot in sync with kernel via netlink events,
 	// and the periodic forceProbeNeighbors tick keeps kernel entries
 	// fresh via proactive ARP/NS.
-	if !d.neighborWarmupInFlight.CompareAndSwap(false, true) {
+	if !d.neighborGuards.warmInFlight.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer func() {
-			d.warmLastSuccessNanos.Store(time.Now().UnixNano())
-			d.neighborWarmupInFlight.Store(false)
+			d.neighborGuards.warmLastSuccessNanos.Store(time.Now().UnixNano())
+			d.neighborGuards.warmInFlight.Store(false)
 		}()
 		d.warmNeighborCache()
 	}()
