@@ -22,8 +22,11 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/diagcmd"
+	"github.com/psaab/xpf/pkg/frr"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/monitoriface"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
@@ -770,13 +773,14 @@ const (
 // WireGuard private keys, and SNMP communities and would otherwise be reloaded
 // on the next boot.
 //
-// NOTE (scope, tracked as #4585): this erases the SSOT and rollback/journal
-// state DIRECTLY, but the RENDERED service configs xpfd writes outside
-// configDir — /etc/frr/frr.conf (0644, BGP-MD5/OSPF/ISIS auth), /etc/swanctl/
-// conf.d/* (IKE PSKs), /etc/kea/kea-dhcp{4,6}.conf — are NOT removed here. They
-// are reset on the COMPLETING reboot when the daemon reconciles to the empty
-// config; erasing them in the wipe itself (so the window between wipe and
-// reboot leaks nothing) is the #4585 follow-up.
+// NOTE (scope): this erases the SSOT and rollback/journal state under
+// configDir. The RENDERED service configs xpfd writes OUTSIDE configDir —
+// /etc/frr/frr.conf (0644, BGP-MD5/OSPF/ISIS auth), /etc/swanctl/conf.d/xpf.conf
+// (IKE PSKs), /etc/kea/kea-dhcp{4,6}.conf — are erased separately by
+// zeroizeRenderedConfigs (#4585). Both run under performZeroizeWipe. Erasing
+// the rendered configs in the wipe (rather than deferring to the reboot) is
+// required because a post-zeroize boot has no committed config and SKIPS the
+// reconcile that would otherwise clear them — see zeroizeRenderedConfigs.
 //
 // The artifacts removed (configBase is the config file's base name, e.g.
 // "xpf.conf", used to recognize the numbered text rollback slots):
@@ -856,16 +860,80 @@ func isTextRollbackFile(name, configBase string) bool {
 	return true
 }
 
-// performZeroizeWipe erases the on-disk config, BPF pins, and managed networkd
-// files (factory reset). It is a package var so a test can drive the `zeroize`
-// SystemAction verb (to assert the #4108 F8 journal wiring) WITHOUT wiping a
-// real /etc/xpf on the developer/appliance box. It returns a non-nil error when
-// the security-critical config erasure did not fully complete (#4576).
+// zeroizeRenderedConfigs erases the RENDERED service configs xpfd writes
+// OUTSIDE configDir — the artifacts that hold the prior tenant's secrets in
+// cleartext but are not part of the .configdb SSOT wiped by zeroizeConfigDir
+// (#4585, follow-up to #4576):
+//
+//   - frrConf (/etc/frr/frr.conf, mode 0644 WORLD-READABLE): the xpf-managed
+//     section carries BGP MD5 / OSPF / IS-IS authentication keys. Only that
+//     section is stripped (frr.StripManagedSectionFile) — operator content
+//     outside the markers is preserved and a purely operator-managed frr.conf
+//     is left untouched. No FRR reload: FRR restarts clean on the reboot.
+//   - swanctlSnippet (/etc/swanctl/conf.d/xpf.conf): the IKE PSKs live in this
+//     single xpf-owned snippet, so it is removed outright.
+//   - kea4/kea6 (/etc/kea/kea-dhcp{4,6}.conf): xpf owns these whole files, so
+//     they are removed outright.
+//
+// WHY the wipe must erase these DIRECTLY rather than lean on the completing
+// reboot: a post-zeroize boot has NO committed config, so the daemon enters
+// #1922 bootstrap mode (or, on an HA node, a normal boot with a nil active
+// config) and SKIPS the boot-time applyConfig that would otherwise reconcile
+// FRR/IPsec/Kea to empty (pkg/daemon/daemon_run.go: bootstrap suppresses the
+// apply, and the normal-boot apply is gated on ActiveConfig() != nil). The
+// rendered secrets are therefore a PERSISTENT residual across the reboot, not a
+// transient one — a device handed to the next tenant would keep the prior
+// tenant's routing-auth keys in a world-readable file. (See docs/system-login.md.)
+//
+// Discipline mirrors zeroizeConfigDir: os.ErrNotExist is not an error (an
+// already-absent artifact is the goal), removal is best-effort past a single
+// failure, but the FIRST real error is returned so a silently-incomplete wipe
+// is never reported as a clean factory reset.
+func zeroizeRenderedConfigs(frrConf, swanctlSnippet, kea4, kea6 string) error {
+	var firstErr error
+	fail := func(err error) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	// FRR: strip only the xpf-managed section (the routing-auth secrets); the
+	// file may carry operator content outside the markers. StripManagedSectionFile
+	// already treats an absent file as a no-op (nil) and leaves an unmanaged
+	// frr.conf untouched.
+	fail(frr.StripManagedSectionFile(frrConf))
+	// swanctl snippet + Kea configs: xpf owns these whole files, remove them.
+	fail(os.Remove(swanctlSnippet))
+	fail(os.Remove(kea4))
+	fail(os.Remove(kea6))
+	return firstErr
+}
+
+// performZeroizeWipe erases the on-disk config, rendered service-config
+// secrets, BPF pins, and managed networkd files (factory reset). It is a
+// package var so a test can drive the `zeroize` SystemAction verb (to assert
+// the #4108 F8 journal wiring) WITHOUT wiping a real /etc/xpf on the
+// developer/appliance box. It returns a non-nil error when a security-critical
+// erasure did not fully complete (#4576/#4585).
 var performZeroizeWipe = func() error {
 	// Config state FIRST — the security-critical erasure. A failure here can
 	// leave prior-tenant config/secrets on disk, so it is surfaced to the
 	// caller (#4576).
 	err := zeroizeConfigDir(defaultConfigDir, defaultConfigBase)
+
+	// Rendered service configs (#4585): also security-critical — routing-auth
+	// keys in a world-readable frr.conf, IKE PSKs, Kea configs. A post-zeroize
+	// boot enters bootstrap / nil-active-config normal boot and SKIPS the
+	// reconcile that would clear them, so the wipe must erase them itself. Fold
+	// its first error into the surfaced result (the .configdb error takes
+	// priority) so a partial wipe is never reported as a clean factory reset.
+	if e := zeroizeRenderedConfigs(
+		frr.DefaultFRRConf,
+		filepath.Join(ipsec.DefaultSwanctlDir, ipsec.BPFRXConfFile),
+		dhcpserver.DefaultKea4ConfPath,
+		dhcpserver.DefaultKea6ConfPath,
+	); e != nil && err == nil {
+		err = e
+	}
 
 	// BPF pins + managed networkd files carry no secret material, so their
 	// removal stays best-effort (logged, never fatal — they do not gate the
