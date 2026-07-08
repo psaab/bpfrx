@@ -1237,42 +1237,6 @@ pub(super) fn select_tcp_mss(
 
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.
 
-#[allow(dead_code)]
-const ICMP_TE_MAX_PER_SEC: u32 = 100;
-
-/// Rate limiter for ICMP Time Exceeded messages.
-#[allow(dead_code)]
-struct IcmpTeRateLimiter {
-    max_per_sec: u32,
-    count: u32,
-    window_start_ns: u64,
-}
-
-#[allow(dead_code)]
-impl IcmpTeRateLimiter {
-    fn new(max_per_sec: u32) -> Self {
-        Self {
-            max_per_sec,
-            count: 0,
-            window_start_ns: 0,
-        }
-    }
-
-    fn allow(&mut self, now_ns: u64) -> bool {
-        let window = now_ns / 1_000_000_000;
-        let prev_window = self.window_start_ns / 1_000_000_000;
-        if window != prev_window {
-            self.count = 0;
-            self.window_start_ns = now_ns;
-        }
-        if self.count >= self.max_per_sec {
-            return false;
-        }
-        self.count += 1;
-        true
-    }
-}
-
 /// Returns true if the packet is IPsec traffic (ESP protocol 50, AH protocol
 /// 51, or IKE UDP ports 500/4500) that should be passed to the kernel for
 /// XFRM processing.
