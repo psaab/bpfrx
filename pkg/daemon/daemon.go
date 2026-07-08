@@ -639,20 +639,23 @@ type Daemon struct {
 	archiveTransfer func(ctx context.Context, srcPath, dest string) error
 
 	// --- periodic configuration-archival timer (#4078) ---
-	// archiveTimerMu guards archiveTimerKey + archiveTimerStop.
-	archiveTimerMu sync.Mutex
-	// archiveTimerKey is the (interval|sites) hash the running periodic-archival
-	// timer was armed for; "" ⇒ no timer running. reconcileArchiveTimer compares
-	// against it so an unrelated commit never bounces a healthy timer.
-	archiveTimerKey string
-	// archiveTimerStop is closed to stop the running periodic-archival goroutine
-	// (reschedule on a transfer-interval/site change, or shutdown). nil ⇒ none.
-	archiveTimerStop chan struct{}
-	// archiveNewTicker builds the periodic-archival tick channel + a stop func.
-	// nil ⇒ realArchiveTicker (a wall-clock time.Ticker). Overridable so tests
-	// drive the periodic archive deterministically without a wall-clock wait
-	// and assert it reuses the archiveToSites transport (#4078).
-	archiveNewTicker func(d time.Duration) (<-chan time.Time, func())
+	// archiveTimer groups the periodic-archival timer supervision state: the
+	// (interval|sites) hash-gate key, the per-generation stop channel, their
+	// guarding mutex, and the tick-source seam. See archiveTimerState in
+	// daemon_archive_timer.go, the file that owns the reconcile/run/stop
+	// lifecycle. This is increment 3 of the #4407 Daemon god-struct
+	// decomposition — pure field grouping, no behavior/locking change; the
+	// fields keep their exact types and are reached as d.archiveTimer.<field>.
+	// A named sub-field (not an embed) matches increments 1 and 2: every access
+	// site is bounded to daemon_archive_timer.go (plus its test), and the
+	// d.archiveTimer.key qualifier also removes the prior confusing collision
+	// with the package-level archiveTimerKey(interval, sites) helper function.
+	// The transfer-on-commit archiveTransfer seam above stays a flat Daemon
+	// field — it is the one-shot upload transport (used by archiveConfig in
+	// daemon_flow.go), a different mechanism from the periodic timer grouped
+	// here (mirroring how increments 1 and 2 kept ipsecSANudgeCh /
+	// lastStandbyNeighborRefresh flat).
+	archiveTimer archiveTimerState
 
 	// --- SNMP link-state monitor seams (#3950) ---
 	// linkStateSubscribe starts a netlink link-update subscription for the

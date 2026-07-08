@@ -74,6 +74,23 @@ tracker issue #4407 carries the remaining increments.
   `Daemon` field (like increment 1's `ipsecSANudgeCh`) — it is the
   standby-side refresh rate limit read in `daemon_health.go`, a different
   mechanism from the periodic-resolution supervision grouped here.
+- **Increment 3 — periodic configuration-archival timer (#4078):** the four
+  flat supervision fields for the `system archival configuration
+  transfer-interval` timer (`archiveTimerMu`, `archiveTimerKey`,
+  `archiveTimerStop`, `archiveNewTicker`) moved into `archiveTimerState`
+  (defined in `daemon_archive_timer.go`, the file that owns the
+  reconcile/run/stop lifecycle), reached as `d.archiveTimer.*` (fields renamed
+  `mu`/`key`/`stop`/`newTicker`). The fields keep their exact types, so this is
+  pure code motion — no behavior/locking change. A named sub-field (not an
+  embed) matches increments 1 and 2: every access site is bounded to
+  `daemon_archive_timer.go` (plus its `archive_timer_4078_test.go`), and the
+  `d.archiveTimer.key` qualifier additionally removes the prior confusing
+  collision between the old `archiveTimerKey` field and the still-flat
+  package-level `archiveTimerKey(interval, sites)` hash-gate helper.
+  `archiveTransfer` stayed a flat `Daemon` field (like increment 1's
+  `ipsecSANudgeCh` and increment 2's `lastStandbyNeighborRefresh`) — it is the
+  one-shot transfer-on-commit upload seam used by `archiveConfig` in
+  `daemon_flow.go`, a different mechanism from the periodic timer grouped here.
 
 ## Cluster mode
 

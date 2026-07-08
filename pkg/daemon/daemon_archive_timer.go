@@ -4,14 +4,39 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// realArchiveTicker is the default archiveNewTicker seam: a wall-clock
-// time.Ticker firing every d. Tests override d.archiveNewTicker to drive the
-// periodic archive deterministically without a wall-clock wait (#4078).
+// archiveTimerState groups the #4078 periodic configuration-archival timer
+// supervision state, extracted from the Daemon god-struct as increment 3 of
+// the #4407 decomposition (pure field grouping — no behavior/locking change).
+// It is co-located with the reconcile/run/stop lifecycle that owns it and is
+// reached as d.archiveTimer.<field>; naming the sub-field (rather than an
+// embed) also avoids the prior collision between the old archiveTimerKey field
+// and the package-level archiveTimerKey(interval, sites) helper.
+type archiveTimerState struct {
+	// mu guards key + stop.
+	mu sync.Mutex
+	// key is the (interval|sites) hash the running periodic-archival timer was
+	// armed for; "" ⇒ no timer running. reconcileArchiveTimer compares against
+	// it so an unrelated commit never bounces a healthy timer.
+	key string
+	// stop is closed to stop the running periodic-archival goroutine
+	// (reschedule on a transfer-interval/site change, or shutdown). nil ⇒ none.
+	stop chan struct{}
+	// newTicker builds the periodic-archival tick channel + a stop func. nil ⇒
+	// realArchiveTicker (a wall-clock time.Ticker). Overridable so tests drive
+	// the periodic archive deterministically without a wall-clock wait and
+	// assert it reuses the archiveToSites transport (#4078).
+	newTicker func(d time.Duration) (<-chan time.Time, func())
+}
+
+// realArchiveTicker is the default archiveTimer.newTicker seam: a wall-clock
+// time.Ticker firing every d. Tests override d.archiveTimer.newTicker to drive
+// the periodic archive deterministically without a wall-clock wait (#4078).
 func realArchiveTicker(d time.Duration) (<-chan time.Time, func()) {
 	t := time.NewTicker(d)
 	return t.C, t.Stop
@@ -57,23 +82,23 @@ func (d *Daemon) reconcileArchiveTimer(cfg *config.Config) {
 	}
 	key := archiveTimerKey(interval, sites)
 
-	d.archiveTimerMu.Lock()
-	defer d.archiveTimerMu.Unlock()
-	if key == d.archiveTimerKey {
+	d.archiveTimer.mu.Lock()
+	defer d.archiveTimer.mu.Unlock()
+	if key == d.archiveTimer.key {
 		return // unchanged — do not bounce a healthy timer
 	}
 	// Stop the currently-running timer (if any) before (re)scheduling.
-	if d.archiveTimerStop != nil {
-		close(d.archiveTimerStop)
-		d.archiveTimerStop = nil
+	if d.archiveTimer.stop != nil {
+		close(d.archiveTimer.stop)
+		d.archiveTimer.stop = nil
 	}
-	d.archiveTimerKey = key
+	d.archiveTimer.key = key
 	if interval <= 0 {
 		slog.Info("periodic config archival disabled")
 		return
 	}
 	stop := make(chan struct{})
-	d.archiveTimerStop = stop
+	d.archiveTimer.stop = stop
 	sitesCopy := append([]string(nil), sites...)
 	go d.runArchiveTimer(interval, sitesCopy, stop)
 	slog.Info("periodic config archival scheduled",
@@ -87,7 +112,7 @@ func (d *Daemon) reconcileArchiveTimer(cfg *config.Config) {
 // per-generation stop channel is closed (reschedule/removal via
 // reconcileArchiveTimer) or the daemon-stop context is cancelled. #4078.
 func (d *Daemon) runArchiveTimer(interval int, sites []string, stop <-chan struct{}) {
-	newTicker := d.archiveNewTicker
+	newTicker := d.archiveTimer.newTicker
 	if newTicker == nil {
 		newTicker = realArchiveTicker
 	}
@@ -116,11 +141,11 @@ func (d *Daemon) runArchiveTimer(interval int, sites []string, stop <-chan struc
 // stopArchiveTimer stops the periodic archival timer at daemon shutdown. Safe
 // to call when no timer is running. #4078.
 func (d *Daemon) stopArchiveTimer() {
-	d.archiveTimerMu.Lock()
-	defer d.archiveTimerMu.Unlock()
-	if d.archiveTimerStop != nil {
-		close(d.archiveTimerStop)
-		d.archiveTimerStop = nil
+	d.archiveTimer.mu.Lock()
+	defer d.archiveTimer.mu.Unlock()
+	if d.archiveTimer.stop != nil {
+		close(d.archiveTimer.stop)
+		d.archiveTimer.stop = nil
 	}
-	d.archiveTimerKey = ""
+	d.archiveTimer.key = ""
 }
