@@ -40180,3 +40180,43 @@ top.
 - **Timestamp**: 2026-07-07
 - **Action**: #4533 (follow-up to #4517) — the embedded-ICMP IPv6 ext-header walker `parse_embedded_v6_l4` (userspace-dp/src/afxdp/icmp_embed/parse.rs) was the last of the 10 IPv6 EH walkers NOT aligned to the #2292/#4435 fail-closed doctrine: it kept a PRE-EXISTING 6-iteration bound + a post-loop `Some((offset, protocol))` fall-through, so a quoted inner packet with >6 extension headers returned a bogus ext-type proto instead of failing closed. #4517 had already added the exotic-EH set (135/139/140/253/254) to this walker, so this change is purely the fail-closed alignment + bound bump. Fix: post-loop fall-through changed from `Some((offset, protocol))` to `None` (fail CLOSED on EH-overflow, matching frame/inspect.rs #2292 and the nat64.rs #4435 walkers); loop bound bumped `0..6` -> `0..MAX_IPV6_EXT_HEADERS` (8, the shared const re-exported at crate::afxdp) so a legit quoted packet with up to 7 ext headers still parses. Not a live bug pre-fix (a >6-EH quoted packet returned a proto that failed to match any session -> fail-SAFE drop), consistency-only. PRESERVED: ESP (50) still STOPS the walk (terminal `_` arm, returns Some early — unaffected by bound/post-loop); the #1838/#1853 non-first-fragment None guard; the #4517 exotic EH types still walk; ext-free + <=7-EH normal packets parse to the true proto/ports. RED-on-revert verified (parse.rs unit tests): embedded_ext_chain_overflow_fails_closed (8-EH chain -> parse_embedded_v6_l4 None + parse_embedded_v6 None; on revert the 6-bound returns Some((88, 253)) -> RED), embedded_seven_ext_headers_still_resolve (7 EH incl Mobility/HIP/Shim6/exp -> Some((96, TCP)); on the stale-6 bound returns Some((88,253)) -> RED), embedded_esp_stops_walk (base ESP -> Some((40,50)); ESP behind one HbH -> Some((48,50)) — preservation). FULL cargo test --release SERIAL green. Docs: userspace-dp/src/afxdp/frame/README.md canonical-contract walker list annotated with the #4533 fail-closed alignment; docs/research/2150-parser-consolidation/plan.md V6-c row updated (bound 6->8, EH-overflow fail-closed None).
 - **File(s)**: userspace-dp/src/afxdp/icmp_embed/parse.rs, userspace-dp/src/afxdp/frame/README.md, docs/research/2150-parser-consolidation/plan.md, _Log.md
+
+- **Timestamp**: 2026-07-07
+- **Action**: #4567 (ps-036-c3-4 L-01) — a fragmented UDP flood split its
+  screen count across two count-min-sketch cells. The flow-present UDP flood
+  cap keys on `(dst_ip, dst_port)` (Junos parity, #4112 F18), but a non-first
+  IP fragment carries no L4 header, so the flowless caller
+  (`check_flowless_screens_opts`, poll_stages.rs flowless branch) passes
+  `dst_port == 0`. `udp_flood_drop` (userspace-dp/src/screen/mod.rs) then called
+  `increment_ip_port(dst_ip, 0)`, parking trailing fragments in a stray
+  `(dst_ip, 0)` SENTINEL-port cell — distinct from BOTH the datagram's real
+  `(dst_ip, port)` cell (first/atomic fragments, flow path) AND the
+  per-destination-IP `increment(dst_ip)` cell the ICMP flood path
+  (`icmp_flood_drop`, syn_rate.rs:197) already uses. VERIFY-FIRST confirmed the
+  threshold is read INLINE (the sketch `increment*` return value IS the
+  over-threshold signal), so the bucket incremented is the bucket read — no
+  separate read side to skew. Fix: `udp_flood_drop` branches on `dst_port == 0`
+  and folds the port-less fragment into the per-destination-IP `increment(dst_ip)`
+  bucket (the same abstraction ICMP uses); a first/atomic fragment or normal
+  datagram carries its real port (`dst_port != 0`) and still counts at
+  `(dst_ip, dst_port)`, unchanged; the ICMP path is untouched. Converging a
+  trailing fragment onto its datagram's real `(ip, port)` cell would need
+  reassembly context xpf lacks, so the per-IP fold is the bounded, honest
+  abstraction (LOW: per-port datagram DELIVERY is already capped by
+  first-fragment counting; this only keeps trailing-fragment noise in one
+  consistent per-IP cell instead of a stray `(ip,0)` one). RED-on-revert
+  verified (screen/tests.rs): udp_flood_flowless_fragment_folds_into_per_ip_bucket_4567
+  pre-saturates ONLY the per-IP(D) cells (via cell_indices + saturate_cell test
+  seams) then sends one flowless UDP fragment to D — after the fix it reads the
+  pre-saturated per-IP cells and Drops on the FIRST fragment; on revert it
+  counts the fresh `(D,0)` cells and Passes (Drop⟷Pass flips RED).
+  udp_flood_first_fragment_still_counts_per_ip_port_4567 pre-saturates per-IP(D)
+  then drives flow-path UDP datagrams to `(D,5001)`: first T still Pass, (T+1)th
+  trips its OWN `(ip,port)` bucket — proving the fold does not leak into
+  real-port counting (unchanged by the revert). ICMP unchanged
+  (icmp_flood_drop untouched; existing icmp_flood_flowless_drops guards it).
+  FULL cargo test --release SERIAL green. Docs: udp_flood_drop doc + body,
+  the flowless call-site comment, syn_rate.rs module doc, and the
+  userspace-dp/src/afxdp/README.md #3902 flowless-screens section gained a
+  #4567 note.
+- **File(s)**: userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/syn_rate.rs, userspace-dp/src/screen/tests.rs, userspace-dp/src/afxdp/README.md, _Log.md

@@ -677,7 +677,8 @@ impl ScreenState {
     /// per-destination cap keys on `(dst_ip, dst_port)` (Junos `udp flood
     /// threshold` caps the rate to a destination IP AND port). On the flowless
     /// path a non-first fragment carries no L4 port, so `dst_port` is 0 there and
-    /// the cap degrades to per-destination-IP (the best available for a fragment).
+    /// the cap folds to the per-destination-IP `increment(dst_ip)` bucket — the
+    /// same abstraction `icmp_flood_drop` uses (#4567; see the body note).
     fn udp_flood_drop(
         &mut self,
         zone: &str,
@@ -687,12 +688,32 @@ impl ScreenState {
         now_ns: u64,
         now_secs: u64,
     ) -> bool {
-        // (1) per-DESTINATION (IP + PORT) cap — PRIMARY (Junos parity). Still
-        // the #3315 `RateCounter` sketch (deferred, `now_secs`).
-        if let Some(sketch) = self.udp_dst_sketch.get_mut(zone)
-            && sketch.increment_ip_port(dst_ip, dst_port, now_secs, threshold)
-        {
-            return true;
+        // (1) per-DESTINATION cap — PRIMARY (Junos parity). Still the #3315
+        // `RateCounter` sketch (deferred, `now_secs`).
+        //
+        // #4567: a non-first IP fragment carries no L4 header, so the flowless
+        // caller passes `dst_port == 0`. Counting it via `increment_ip_port(ip,
+        // 0)` splinters a fragmented UDP flood into its own `(ip, 0)` cell — a
+        // SENTINEL port, not a real one — distinct from BOTH the datagram's real
+        // `(ip, port)` cell (first/atomic fragments, flow path) AND the
+        // per-destination-IP abstraction the ICMP flood path already uses. Fold
+        // the port-less fragment into the SAME per-destination-IP
+        // `increment(dst_ip)` bucket as `icmp_flood_drop`, so trailing fragments
+        // accumulate in one consistent per-IP cell instead of a stray `(ip, 0)`
+        // cell. A first/atomic fragment or a normal datagram always carries its
+        // real port here (`dst_port != 0`) and still counts at `(dst_ip,
+        // dst_port)`, unchanged. Converging a trailing fragment onto its
+        // datagram's real `(ip, port)` cell would need reassembly context xpf
+        // lacks, so the per-IP fold is the bounded, honest abstraction.
+        if let Some(sketch) = self.udp_dst_sketch.get_mut(zone) {
+            let over = if dst_port == 0 {
+                sketch.increment(dst_ip, now_secs, threshold)
+            } else {
+                sketch.increment_ip_port(dst_ip, dst_port, now_secs, threshold)
+            };
+            if over {
+                return true;
+            }
         }
         // (2) per-zone aggregate — SECONDARY ceiling. #3607: `TokenBucket`
         // shaper (`now_ns`).
@@ -1214,7 +1235,9 @@ impl ScreenState {
 
         // UDP flood — per-DESTINATION cap (PRIMARY) + per-zone aggregate ceiling
         // (SECONDARY). A flowless non-first fragment has no L4 port, so `dst_port`
-        // is 0 here and the cap degrades to per-destination-IP (#4112 F18).
+        // is 0 here and `udp_flood_drop` folds it into the per-destination-IP
+        // `increment(dst_ip)` bucket (the ICMP-flood abstraction) rather than a
+        // stray `(ip, 0)` cell (#4112 F18, #4567).
         if udp_flood_threshold > 0
             && pkt.protocol == PROTO_UDP
             && self.udp_flood_drop(

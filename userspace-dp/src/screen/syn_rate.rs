@@ -11,9 +11,10 @@
 //! The same substrate backs the per-destination ICMP/UDP flood caps (#4112):
 //! Junos measures `icmp flood` / `udp flood threshold` PER DESTINATION (UDP
 //! additionally per destination PORT), not per zone aggregate. `increment` keys
-//! on the destination IP (ICMP); `increment_ip_port` mixes the destination port
-//! in (UDP). The per-zone aggregate `RateCounter` is retained as a coarser
-//! SECONDARY ceiling above these per-destination caps.
+//! on the destination IP (ICMP, and a port-less UDP fragment — #4567);
+//! `increment_ip_port` mixes the destination port in (UDP with a real L4 port).
+//! The per-zone aggregate `RateCounter` is retained as a coarser SECONDARY
+//! ceiling above these per-destination caps.
 //!
 //! ## Substrate — count-min sketch of `RateCounter`s, NO eviction
 //!
