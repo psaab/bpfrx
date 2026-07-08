@@ -42142,3 +42142,26 @@ top.
   (new), pkg/cli/cli_show_interfaces_extensive.go (new),
   pkg/cli/cli_show_interfaces_stats.go (new), pkg/cli/cli_show_interfaces_shared.go
   (new), pkg/cli/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4655 refactor — split pkg/cli/cli_show_services.go (868 LOC)
+  by service presenter family. The file mixed CoS / DDNS / DHCP
+  (client/relay/server) / SNMP / LLDP / port-mirroring presenters, so
+  different owners kept editing one bucket. Split into six sibling files
+  by natural service family; cli_show_services.go stays as the
+  `handleShowServices` dispatch shell plus the presenters with no
+  dedicated family file (RPM, ip-monitoring, application-identification,
+  schedulers). Pure code motion, behavior-identical: all 20 top-level
+  declarations moved verbatim (verified byte-for-byte against
+  origin/master via a go/parser decl-diff — identical=20, 0
+  bodydiff/missing/extra; import lists differ per file as expected and
+  are excluded from the diff). Same package, so unexported helpers
+  (showConfigRedacted, userspaceDataplaneStatus) and injected *Fn hooks
+  stay reachable. go build ./... clean, go vet clean (the one
+  cli.go:503 unreachable-code note pre-dates this change), go test
+  ./pkg/cli/... green.
+  **File(s)**: pkg/cli/cli_show_services.go (trimmed to dispatch shell),
+  pkg/cli/show_services_cos.go (new), pkg/cli/show_services_ddns.go (new),
+  pkg/cli/show_services_dhcp.go (new), pkg/cli/show_services_snmp.go (new),
+  pkg/cli/show_services_lldp.go (new), pkg/cli/show_services_mirror.go (new),
+  pkg/cli/README.md, docs/system-login.md, _Log.md

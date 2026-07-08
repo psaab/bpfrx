@@ -1,0 +1,84 @@
+package cli
+
+import (
+	"fmt"
+
+	"github.com/psaab/xpf/pkg/cmdtree"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+)
+
+// handleShowClassOfService dispatches `show class-of-service ...`
+// to the appropriate presenter.
+func (c *CLI) handleShowClassOfService(args []string) error {
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show class-of-service:", operationalTree, "show", "class-of-service")
+		return nil
+	}
+	switch args[0] {
+	case "interface":
+		selector := ""
+		if len(args) > 1 {
+			selector = args[1]
+		}
+		return c.showClassOfServiceInterface(selector)
+	case "classifier":
+		nameFilter, typeFilter := parseCoSClassifierArgs(args[1:])
+		fmt.Print(dpformat.FormatCoSClassifiers(c.store.ActiveConfig(), nameFilter, typeFilter))
+		return nil
+	case "scheduler-map":
+		name := ""
+		if len(args) > 1 {
+			name = args[1]
+		}
+		fmt.Print(dpformat.FormatCoSSchedulerMaps(c.store.ActiveConfig(), name))
+		return nil
+	case "forwarding-class":
+		fmt.Print(dpformat.FormatCoSForwardingClasses(c.store.ActiveConfig()))
+		return nil
+	default:
+		cmdtree.PrintTreeHelp("show class-of-service:", operationalTree, "show", "class-of-service")
+		return nil
+	}
+}
+
+// parseCoSClassifierArgs extracts optional `name <n>` and `type <t>` filters
+// from `show class-of-service classifier` arguments.
+func parseCoSClassifierArgs(args []string) (nameFilter, typeFilter string) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "name":
+			if i+1 < len(args) {
+				nameFilter = args[i+1]
+				i++
+			}
+		case "type":
+			if i+1 < len(args) {
+				typeFilter = args[i+1]
+				i++
+			}
+		}
+	}
+	return nameFilter, typeFilter
+}
+
+func (c *CLI) showClassOfServiceInterface(selector string) error {
+	cfg := c.store.ActiveConfig()
+	var status *dpuserspace.ProcessStatus
+	if userspaceStatus, err := c.userspaceDataplaneStatus(); err == nil {
+		status = &userspaceStatus
+	}
+	fmt.Print(dpformat.FormatCoSInterfaceSummary(cfg, status, selector))
+	return nil
+}
+
+// showInterfacesQueue renders `show interfaces queue [<interface>]` (#4228
+// Gap 7) from the live userspace CoS runtime snapshot.
+func (c *CLI) showInterfacesQueue(selector string) error {
+	var status *dpuserspace.ProcessStatus
+	if userspaceStatus, err := c.userspaceDataplaneStatus(); err == nil {
+		status = &userspaceStatus
+	}
+	fmt.Print(dpformat.FormatInterfacesQueue(status, selector))
+	return nil
+}

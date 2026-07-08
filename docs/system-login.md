@@ -315,7 +315,7 @@ above covers the config-render surfaces (they route through the `RedactedClone`
 renderers). Two **operational status** commands, however, format the typed
 active config directly and so bypassed that path: `show system services`
 (`showSystemServices`, `pkg/cli/cli_show_system.go`) printed `Community: <name>
-(<auth>)`, and `show snmp` (`showSNMP`, `pkg/cli/cli_show_services.go`) printed
+(<auth>)`, and `show snmp` (`showSNMP`, `pkg/cli/show_services_snmp.go`) printed
 `  <name>: <auth>`. Both are PermView `show` commands reachable by
 `read-only` / `config-viewer` / `operator`, so the SNMP community string — a
 read/write credential — leaked in cleartext to view-only classes. They now
