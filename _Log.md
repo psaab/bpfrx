@@ -31,6 +31,36 @@
   `userspace-dp/src/event_stream/README.md`, `_Log.md`
 - Closes #4607.
 
+## 2026-07-07 — #4584 ps-037-A5 A5-02 vrrp: liveness watchdog for a held master that dies mid-preempt-hold
+
+- **Timestamp**: 2026-07-07
+- **Action**: When a higher-priority node defers preemption of a live
+  lower-priority master (`preempt hold-time <N>`, #2850), arming the hold
+  left `masterDownTimer` IDLE for the whole hold: it fired to reach the arm
+  point and `handleBackupRx` never resets it for a persisting lower advert.
+  So a held (VIP-owning, forwarding) lower-priority master that DIED mid-hold
+  went undetected until `preemptHoldTimer` expired — up to ~hold-time of VIP
+  blackhole for a DEAD master, violating the "dead master → immediate
+  takeover" invariant (#2900 enumerated preempt-off / track-demote but NOT
+  held-master-death). Fix: `armPreemptHold` now ALSO (re)arms `masterDownTimer`
+  for `masterDownInterval` as a liveness watchdog; on its fire while
+  `preemptHoldArmed`, `stepBackup` checks new `heldMasterIsStale()` — a stale
+  held master (silent beyond the master-down horizon) disarms the hold and
+  becomes MASTER now, a still-live one (adverts keep refreshing
+  `lastMasterSeen`) re-arms the watchdog and defers to the natural hold expiry.
+  `heldMasterIsStale` checks ONLY staleness (not the effective>priority
+  comparison) so a track-interface demotion below a still-live master does NOT
+  fire a spurious takeover — the #2900 natural-expiry re-validation
+  (`shouldPreemptObservedMaster`) owns that case. Preserves the normal
+  preempt-hold, priority-0 resign, sync-hold, and ~60ms failover paths.
+  RED-on-revert: `TestHoldWatchdog_DeadHeldMaster_ImmediateTakeover` +
+  `TestHoldWatchdog_LiveHeldMaster_DefersToNaturalExpiry` (both fail on the
+  masterDownTimer re-arm assertion when reverted);
+  `TestHoldWatchdog_NoHoldArmed_NormalFailoverUnchanged` +
+  `TestHeldMasterIsStale`. NOTE: VRRP failover-timing change — needs
+  `make test-failover` before merge (parent runs it).
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_preempt_hold_watchdog_test.go, pkg/vrrp/README.md, _Log.md
 ## 2026-07-07 — #4599 zeroize: erase self-signed REST-API TLS pair under /etc/xpf/tls
 
 - **Timestamp**: 2026-07-07

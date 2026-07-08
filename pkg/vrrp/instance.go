@@ -758,6 +758,56 @@ func (vi *vrrpInstance) preemptingLiveLowerMaster() bool {
 	return effective > lastMasterPriority
 }
 
+// heldMasterIsStale reports whether the lower-priority master that an armed
+// preempt hold-time (#2850) is currently deferring to has gone SILENT — its
+// last advert is older than the master-down horizon (or none was ever seen).
+// It is the #4584 liveness-watchdog predicate: while the hold is armed the
+// masterDownTimer is repurposed as a watchdog (armPreemptHold), and on its fire
+// a stale held master means the VIP-owning master DIED mid-hold and must be
+// taken over immediately (dead master → immediate takeover), whereas a
+// still-live master (recent advert, lastMasterSeen fresh) keeps deferring to
+// the natural hold expiry.
+//
+// Unlike preemptingLiveLowerMaster/shouldPreemptObservedMaster this checks ONLY
+// staleness, deliberately NOT the effective>lastMasterPriority comparison: a
+// track-interface demotion that drops us below a STILL-LIVE master must NOT
+// trigger a watchdog takeover (that live master is still forwarding). The
+// natural hold-expiry re-validation (shouldPreemptObservedMaster, #2900) owns
+// the demotion case. Uses the same master-down staleness horizon (3*advert +
+// skew on the master's learned interval) as the sibling preempt helpers so all
+// agree on what "silent" means.
+//
+// Lock discipline mirrors shouldPreemptObservedMaster: snapshot under ONE
+// RLock, then compute from the locals (never call an RLocking accessor while
+// holding the lock).
+func (vi *vrrpInstance) heldMasterIsStale() bool {
+	vi.mu.RLock()
+	priority := vi.cfg.Priority
+	trackDown := vi.trackDown
+	trackIface := vi.cfg.TrackInterface
+	trackCost := vi.cfg.TrackPriorityCost
+	advertMS := vi.cfg.AdvertiseInterval
+	masterAdver := vi.masterAdverInterval
+	lastMasterSeen := vi.lastMasterSeen
+	vi.mu.RUnlock()
+
+	effective := priority
+	if priority != 0 && priority != 255 && trackDown && trackIface != "" {
+		effective -= trackCost
+		if effective < 1 {
+			effective = 1
+		} else if effective > 254 {
+			effective = 254
+		}
+	}
+
+	advert := effectiveAdvertInterval(advertMS, masterAdver)
+	skew := time.Duration(256-effective) * advert / 256
+	masterDown := 3*advert + skew
+
+	return lastMasterSeen.IsZero() || time.Since(lastMasterSeen) > masterDown
+}
+
 // stopAndDrainTimer stops t and drains a pending fire from its channel so a
 // subsequent Reset arms a clean interval. Safe on an already-stopped or
 // already-drained timer.
@@ -773,9 +823,22 @@ func stopAndDrainTimer(t *time.Timer) {
 // armPreemptHold (re)arms the preempt hold-time countdown (#2850) for `hold`
 // and records that it is running (#2900). Called only from the run-loop
 // goroutine; the preemptHoldArmed flag is mu-guarded for external readers.
-func (vi *vrrpInstance) armPreemptHold(preemptHoldTimer *time.Timer, hold time.Duration) {
+//
+// It ALSO (re)arms masterDownTimer for masterDownInterval as a liveness
+// watchdog (#4584). Without this the masterDownTimer would sit IDLE for the
+// entire hold: it already fired to reach this arming point, and handleBackupRx
+// never resets it for a persisting lower-priority advert. A held (VIP-owning)
+// lower-priority master that DIES mid-hold would then go undetected until the
+// (possibly very long) hold-time elapsed — up to ~holdTime of VIP blackhole for
+// a dead master, violating the "dead master → immediate takeover" invariant.
+// stepBackup's masterDownTimer.C case treats a fire while preemptHoldArmed as
+// this watchdog: a stale held master triggers immediate takeover, a still-live
+// one re-arms the watchdog and defers to the natural hold expiry.
+func (vi *vrrpInstance) armPreemptHold(masterDownTimer, preemptHoldTimer *time.Timer, hold time.Duration) {
 	stopAndDrainTimer(preemptHoldTimer)
 	preemptHoldTimer.Reset(hold)
+	stopAndDrainTimer(masterDownTimer)
+	masterDownTimer.Reset(vi.masterDownInterval())
 	vi.mu.Lock()
 	vi.preemptHoldArmed = true
 	vi.mu.Unlock()
@@ -802,9 +865,15 @@ func (vi *vrrpInstance) disarmPreemptHold(preemptHoldTimer *time.Timer) {
 // the masterDownTimer fires while a live lower-priority master is still
 // present and a hold-time is configured, the promotion is deferred by arming
 // preemptHoldTimer instead of becoming MASTER immediately. handleBackupRx
-// cancels the armed hold if a >= -priority master returns; a fresh
-// lower-priority advert re-arms the masterDownTimer so the hold restarts when
-// it next expires.
+// cancels the armed hold if a >= -priority master returns.
+//
+// While the hold is armed, armPreemptHold ALSO keeps masterDownTimer running as
+// a liveness watchdog (#4584): a fire while preemptHoldArmed means the held
+// master may have gone silent. The masterDownTimer.C case checks
+// heldMasterIsStale() — a stale (dead) held master triggers immediate takeover,
+// a still-live one re-arms the watchdog and lets the hold run to natural
+// expiry — so a held VIP-owning master that dies mid-hold no longer blackholes
+// for the full hold-time.
 func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTimer *time.Timer) (stop bool) {
 	select {
 	case <-vi.stopCh:
@@ -812,6 +881,35 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 	case pkt := <-vi.rxCh:
 		vi.handleBackupRx(pkt, masterDownTimer, preemptHoldTimer)
 	case <-masterDownTimer.C:
+		// If a preempt hold-time is currently armed, this masterDownTimer fire
+		// is the #4584 liveness watchdog, NOT a fresh master-down. armPreemptHold
+		// re-armed the timer so a held VIP-owning lower-priority master that DIES
+		// mid-hold is detected within one master-down horizon instead of only
+		// when the (possibly long) hold-time elapses.
+		vi.mu.RLock()
+		holdArmed := vi.preemptHoldArmed
+		vi.mu.RUnlock()
+		if holdArmed {
+			if vi.heldMasterIsStale() {
+				// The held lower-priority master went SILENT (died) during the
+				// hold — nothing is forwarding, so restore the "dead master →
+				// immediate takeover" invariant: disarm the hold and become
+				// MASTER now instead of blackholing the VIP until the hold
+				// expires.
+				slog.Info("vrrp: held master silent during preempt hold-time, immediate takeover",
+					"key", vi.key())
+				vi.disarmPreemptHold(preemptHoldTimer)
+				vi.becomeMaster()
+				advertTimer.Reset(vi.advertInterval())
+			} else {
+				// The held master is still alive (adverts keep arriving and
+				// refreshing lastMasterSeen). Preserve the preempt-hold intent:
+				// re-arm the watchdog and let the hold run to its natural expiry.
+				stopAndDrainTimer(masterDownTimer)
+				masterDownTimer.Reset(vi.masterDownInterval())
+			}
+			return false
+		}
 		// Master timed out. If this is preemption of a still-live
 		// lower-priority master AND a preempt hold-time is configured,
 		// defer the takeover by arming the hold timer rather than
@@ -825,7 +923,7 @@ func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer, preemptHoldTime
 		if hold := vi.preemptHoldDuration(); !skipHold && hold > 0 && vi.preemptingLiveLowerMaster() {
 			slog.Info("vrrp: preempt deferred by hold-time",
 				"key", vi.key(), "hold", hold)
-			vi.armPreemptHold(preemptHoldTimer, hold)
+			vi.armPreemptHold(masterDownTimer, preemptHoldTimer, hold)
 			return false
 		}
 		vi.becomeMaster()
@@ -1579,8 +1677,12 @@ func (vi *vrrpInstance) masterAdverFloor() time.Duration {
 // resigning (priority-0) master or a returning >= -priority master cancels any
 // in-flight hold: the first because takeover becomes immediate, the second
 // because there is no longer a lower-priority master to preempt. A persisting
-// lower-priority master leaves an armed hold running (the masterDownTimer it
-// was armed from is intentionally not reset on a lower advert).
+// lower-priority master leaves an armed hold running (this path intentionally
+// does not reset masterDownTimer on a lower advert). recordMasterAdvert still
+// refreshes lastMasterSeen from every non-zero advert, which is what keeps the
+// #4584 masterDownTimer liveness watchdog (armed by armPreemptHold) reading the
+// held master as alive; if the adverts stop, the watchdog observes the staleness
+// and takes over.
 func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer, preemptHoldTimer *time.Timer) {
 	vi.recordMasterAdvert(pkt)
 	pri := vi.getPriority()
