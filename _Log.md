@@ -1,3 +1,23 @@
+## 2026-07-07 — #4589 A10-b2 F-01 ddns+config: reject empty-host DDNS generic url-template
+
+- **Timestamp**: 2026-07-07
+- **Action**: The generic-backend url-template validators
+  (`validateGenericURLTemplate` in `pkg/ddns/backend_generic.go` and its
+  commit-time mirror `ddnsGenericURLTemplateValid` in
+  `pkg/config/compiler_validate_warn.go`) only rejected an EMPTY authority,
+  so `http://:8080/upd` — non-empty authority (":8080") but EMPTY host —
+  passed both the commit warning and the runtime constructor (Go's dialer
+  then treats the empty-host URL as localhost). Require a non-empty host
+  after dropping a trailing `:port` and unwrapping a bracketed IPv6 literal,
+  in lockstep across both packages (config cannot import pkg/ddns). Residual
+  of the #2841 empty-authority-only check. RED-on-revert tests
+  `TestGenericURLTemplatePortOnlyHostRejected` (ddns) +
+  `TestP3GenericURLTemplatePortOnlyHostWarns` (config).
+- **File(s)**: pkg/ddns/backend_generic.go,
+  pkg/config/compiler_validate_warn.go,
+  pkg/ddns/backend_generic_porthost_4589_test.go,
+  pkg/config/ddns_porthost_4589_test.go, _Log.md
+
 ## 2026-07-07 — #4589 A7 F-02 daemon+config: harden scp archive-site argv (leading-dash injection)
 
 - **Timestamp**: 2026-07-07

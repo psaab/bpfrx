@@ -131,10 +131,35 @@ func validateGenericURLTemplate(tmpl string) error {
 	if at := strings.LastIndex(authority, "@"); at >= 0 {
 		authority = authority[at+1:]
 	}
-	if authority == "" {
+	// #4589 A10-b2 F-01: require a non-empty HOST after dropping a trailing
+	// :port (and unwrapping a bracketed IPv6 literal). `http://:8080/upd` has
+	// a non-empty authority (":8080") but an EMPTY host, so the old
+	// `authority == ""` check let it through — Go's dialer then treats an
+	// empty-host URL as localhost. Kept byte-for-byte in lockstep with
+	// ddnsGenericURLTemplateValid (compiler_validate_warn.go), the #2841
+	// commit-time mirror this is a residual of.
+	if ddnsTemplateHost(authority) == "" {
 		return fmt.Errorf("url-template %q has no host", config.RedactURL(tmpl))
 	}
 	return nil
+}
+
+// ddnsTemplateHost extracts the host from a URL authority whose userinfo has
+// already been stripped: it drops a trailing :port and unwraps a bracketed
+// IPv6 literal, returning "" when there is no host segment (e.g. ":8080" or an
+// unterminated "[..."). Kept in lockstep with the inline copy in
+// pkg/config.ddnsGenericURLTemplateValid (config cannot import pkg/ddns).
+func ddnsTemplateHost(authority string) string {
+	if strings.HasPrefix(authority, "[") {
+		if end := strings.Index(authority, "]"); end >= 0 {
+			return authority[1:end]
+		}
+		return ""
+	}
+	if colon := strings.IndexByte(authority, ':'); colon >= 0 {
+		return authority[:colon]
+	}
+	return authority
 }
 
 // renderGenericURL expands the inadyn-style template specifiers. %u/%p are
