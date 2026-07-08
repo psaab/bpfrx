@@ -17,6 +17,7 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/vishvananda/netlink"
 )
@@ -322,9 +323,16 @@ func (d *Daemon) archiveToSites(sites []string) {
 		return
 	}
 	srcPath := filepath.Join(tmpDir, base)
+	// AtomicGeneratedConfig (#1894/#1916): the staged snapshot is a
+	// regenerated config file, not durable state — it is deleted after the
+	// SCP uploads finish, so power-loss durability (fsync) is neither
+	// needed nor wanted on this transient copy. WriteFileAtomic writes a
+	// ".<base>.tmp-*" sibling in tmpDir and renames to srcPath, so the
+	// snapshot appears complete-or-not (a lister/reader never observes a
+	// torn file) while preserving the historical remote basename.
 	// 0600 — the active config may contain encrypted secrets; keep the
 	// transient copy owner-only (MkdirTemp already made the dir 0700).
-	if err := os.WriteFile(srcPath, []byte(active), 0600); err != nil {
+	if err := fsatomic.WriteFileAtomic(srcPath, []byte(active), 0600); err != nil {
 		slog.Warn("config archival failed: write temp config", "err", err)
 		os.RemoveAll(tmpDir)
 		return
