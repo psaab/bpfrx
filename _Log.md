@@ -40453,3 +40453,23 @@ top.
   single-key non-regression, non-existent multi-key path errors).
 - **File(s)**: pkg/config/ast.go, pkg/configstore/store_command.go,
   pkg/configstore/store_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-07-07 (#4594)
+- **Action**: class-of-service forwarding-class queue outside 0..255 was
+  warn-only (`ValidateConfig`) and COMMITTED, while the userspace helper
+  deserializes the queue id via a checked `u8::try_from` and fail-closes
+  the WHOLE CoS snapshot on `CosQueueIdOutOfRange` (#2410) — silently
+  keeping stale CoS forwarding state (config/dataplane divergence). Added
+  `validateClassOfServiceForwardingClassQueueStrict` and wired it into
+  `runUniformGates`: HARD-REJECT on strict commit / commit-check, downgrade
+  to a warning on the tolerant load / peer-sync path
+  (`lenientCoSForwardingClassQueue`, #1960 no-brick). Mirrors the fairness
+  rss-expectation queue reject and the sibling CoS strict gates.
+  RED-on-revert tests: strict rejects queue 999, lenient warns not bricks,
+  valid queues (0/7/255) commit clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict_cos.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler_cos_fc_queue_4594_test.go,
+  pkg/config/parser_class_of_service_test.go, docs/config-schema.md,
+  _Log.md

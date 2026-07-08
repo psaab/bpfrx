@@ -72,6 +72,22 @@ The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 `load`/...) plus the retained `set system dataplane` description overlay.
 
+### `class-of-service forwarding-classes queue` range (#4594)
+
+`validateClassOfServiceForwardingClassQueueStrict`
+(`compiler_validate_strict_cos.go`, gated in `runUniformGates`) hard-rejects a
+forwarding-class whose `queue` is outside **0..255** on the strict commit /
+commit-check path. The value used to be warn-only (`ValidateConfig`) and
+COMMITTED, while the userspace helper deserializes the queue id via a checked
+`u8::try_from` and fail-closes the WHOLE CoS snapshot on `CosQueueIdOutOfRange`
+(#2410), silently keeping the node's STALE CoS forwarding state — a
+config/dataplane divergence the operator could not see. xpf's valid range is
+0..255 (the dataplane's `u8` queue id), NOT Junos-classic 0..7. The tolerant
+load / peer-sync path downgrades to a warning
+(`opts.lenientCoSForwardingClassQueue`) so an already-persisted queue that
+committed under an older binary still boots (#1960 no-brick); the
+`CosQueueIdOutOfRange` fail-close is the stale-but-safe backstop on that boot.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
