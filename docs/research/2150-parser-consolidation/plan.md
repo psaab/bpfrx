@@ -98,7 +98,7 @@ path and `frame_l3_offset` (L2-b) only as a fallback. So for transit the
 |---|----------|-------|-----------|-----------|---------|
 | V6-a | `frame/inspect.rs:31 frame_l4_offset` / `:86 packet_rel_l4_offset` / `:145 packet_rel_l4_offset_and_protocol` (#2148) | 6 | offset returned, frag not flagged | `None` on truncation | forwarding, GRE inner, session-flow parse |
 | V6-b | `screen/extract.rs:66` (#2189) | 8 | yes (sets is_first_fragment) | **`Err` = fail-closed (drop)** | screen / IDS |
-| V6-c | `icmp_embed/parse.rs:108 parse_embedded_v6_l4` (#1838) | 6 | yes (None on non-first frag) | `None` | embedded ICMPv6 error quoted-packet |
+| V6-c | `icmp_embed/parse.rs:108 parse_embedded_v6_l4` (#1838, #4533) | 8 | yes (None on non-first frag) | `None` (EH-overflow fail-closed, #4533; was a stale-6 bound + post-loop `Some` fall-through) | embedded ICMPv6 error quoted-packet |
 
 All three share the same `0|43|60` / `51` / `44` / `59` arm structure but
 differ in: iteration bound (6 vs 8), fragment semantics, and fail
