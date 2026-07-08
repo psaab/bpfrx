@@ -85,7 +85,7 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 
 | Token (aliases) | nft match (`daemon_nft.go`) | Rust admit (`host_inbound.rs`) | Family | Notes |
 |---|---|---|---|---|
-| `all` / `any-service` | full admit | `all_services = true` | dual | Blanket accept for the zone. |
+| `all` / `any-service` | full admit | `all_services = true` | dual | Blanket accept for the zone — a **packet-wide** admit of EVERY IP protocol/port (GRE/ESP/AH/OSPF/PIM/VRRP/future proto numbers), a superset of the Junos meaning (`all` = union of the *named* system-services). Deliberate & documented (#3199); `ValidateConfig` emits a commit-time advisory naming the zone/interface (#3226). See [`system-services all` / `any-service` is a packet-wide admit](#system-services-all--any-service-is-a-packet-wide-admit-3226). |
 | `ssh` | tcp 22 | tcp 22 | dual | |
 | `telnet` | tcp 23 | tcp 23 | dual | |
 | `ftp` | tcp 21 | tcp 21 | dual | Control port only; FTP data is an ALG/transit concern. |
@@ -137,6 +137,53 @@ follow-up; until it lands, surface 3 stays a hand-mirror held by the set-level
 | `dvmrp` | meta l4proto 2 | ip proto 2 | **ip** | #3341. Carried inside IGMP; IPv4-only, like `igmp`. |
 | `isis` | (none) | (none) | **L2/none** | Recognized but no IP match on either surface (L2/OSI-CLNP). Kernel hands IS-IS PDUs to FRR's isisd via an LLC socket, outside the IP host-inbound filter. Excluded from `protocols all` (#3311). |
 | `router-discovery` | v4: `icmp type { 9, 10 }`; **v6: (none)** | v4 ICMP types 9, 10 | v4 per-zone; **v6 global** | **L02:** on IPv6, RS/RA (133/134) ride the always-accepted ND global set, so this token carries NOTHING on v6 — correct kernel parity, but a CLI/doc trap. |
+
+## `system-services all` / `any-service` is a packet-wide admit (#3226)
+
+`system-services all` and its `any-service` alias are the ONLY two
+`system-services` tokens that are NOT a per-tuple match. Both set one boolean
+(`all_services` in `host_inbound.rs`; `hostInboundAllowsAll` in `daemon_nft.go`)
+that short-circuits admission to accept EVERY IP protocol and port destined to
+the zone's local firewall addresses — GRE, ESP/AH, OSPF, PIM, VRRP, and any
+future protocol number — with **no** catch-all drop. `config.HostInboundFullAdmitService`
+(`pkg/config/host_inbound_tokens.go`) is the SSOT for which tokens are full-admit.
+
+This is a **superset of the Junos meaning.** In Junos, `system-services all` is
+naturally "all system-service *names*" (the union of the named tokens in the
+matrix above), and `any-service` is "the entire TCP/UDP port range" — neither
+opens arbitrary non-TCP/UDP IP protocols. xpf aliases both to the broader
+packet-wide admit. The breadth is **deliberate and documented** (#3199 kept these
+two tokens as a full-admit while scoping the sibling `protocols all` to the
+routing-protocol set — see the protocols matrix note above) and is relied on by
+the canonical HA control zone (`system-services { all }` on em0/fab* — though
+there the lifeline exclusion, not the token, is the real protection; see
+#3277 / `pkg/dataplane/userspace/zones.go`).
+
+### Commit-time advisory (#3226 — shipped)
+
+Because the breadth is easy to reach for and materially wider than Junos,
+`ValidateConfig` (`pkg/config/compiler_validate_warn.go`) emits a WARN-only
+commit-time advisory for each zone-level `host-inbound-traffic` stanza AND each
+per-interface override (#3362) whose `system-services` set contains a full-admit
+token. The advisory names the zone (and interface), states that the token
+accepts every IP protocol/port to the zone's local addresses, and suggests
+listing specific services if that is the intent. It is **never a hard reject** —
+`system-services all` is legal Junos and a reject would brick previously
+committed configs; the message only surfaces the breadth. This directly answers
+the issue's Direction: "If `any-service` must remain a non-Junos full-admit
+escape hatch, document it as such with an explicit commit warning."
+
+### The admission-narrowing posture (A vs B) remains deferred
+
+Whether to keep the documented broad alias (Option A, zero-surprise-on-upgrade)
+or scope `all` to the union of named services + a catch-all drop and split
+`any-service` off as an entire-port-range / escape-hatch (Option B, Junos-strict)
+is a **security/product posture decision**, not an engineer-fixable bug. It stays
+open on #3226 (`plan-deferred-operator`); the converged /research plan-of-action
+lives on the `research/3226-system-services` branch
+(`docs/research/3226-system-services/plan.md`). The commit-time advisory above is
+independent of that decision — it makes the current behavior visible without
+changing any forwarding.
 
 ## Global always-accepts (independent of the zone token set)
 
