@@ -981,7 +981,29 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		// that dropped `group14` to DHGroup=0 (silent PFS loss), and this
 		// gate deliberately rejected the prefixed spelling to stay
 		// compiler-faithful; the compiler fix lets both gates accept it.
-		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
+		// #4313 — closed-world flip (Phase-2 ESP crypto), the sibling of the
+		// already-closed Phase-1 `security ike proposal`. The subtree is now
+		// LEAF-COMPLETE: the full Junos `security ipsec proposal <name>` grammar
+		// is exactly protocol, encryption-algorithm, authentication-algorithm,
+		// dh-group, lifetime-seconds, lifetime-kilobytes, and description. The
+		// first five were already modeled; this change models lifetime-kilobytes
+		// (the ESP volume-rekey knob that DISTINGUISHES the Phase-2 proposal from
+		// the Phase-1 IKE proposal — Phase-1 has none) and the cosmetic
+		// description. The compiler (compiler_ipsec.go, the IPsec proposal loop)
+		// reads protocol / encryption-algorithm / authentication-algorithm /
+		// dh-group / lifetime-seconds / lifetime-kilobytes and ignores
+		// description, i.e. a subset of the modeled set — so closing carries no
+		// false-reject risk (the #4191 class). Every leaf carries its value on
+		// the same statement line (no nested value block in Junos), so
+		// closed-world never descends into an AST child of a value leaf in
+		// either parser shape. Silent-drop here FAILS OPEN on crypto exactly
+		// like the IKE proposal: a fat-fingered `encryption-algorith` used to
+		// commit clean and the ESP SA negotiated WITHOUT the operator's cipher
+		// (a silent downgrade). The flip rejects the typo at strict commit; the
+		// tolerant Load/SyncApply path downgrades it to a warning (#1960).
+		// lifetime-kilobytes is captured but accepted-only (not enforced) — see
+		// the ValidateConfig advisory in compiler_validate_warn.go.
+		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", closedWorld: true, children: map[string]*schemaNode{
 			// #4298 (V-2): type the protocol so a typo fails closed. `ah`
 			// is an accepted value here (grammar-valid) but hard-rejected at
 			// commit by validateIPsecProposalProtocolStrict — xpf does not
@@ -999,6 +1021,20 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"lifetime-seconds": {desc: "IPsec SA lifetime in seconds", args: 1, placeholder: "<seconds>",
 				valueType: ValueInteger, valueDesc: "IPsec SA lifetime in seconds",
 				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},
+			// #4313: modeled so the closed-world flip is LEAF-COMPLETE. The ESP
+			// volume-based rekey threshold; captured (IPsecProposal.LifetimeKilobytes)
+			// but accepted-only — the renderer does not yet program a byte-based
+			// rekey, so ValidateConfig emits an advisory (compiler_validate_warn.go).
+			"lifetime-kilobytes": {desc: "IPsec SA volume-based rekey threshold in kilobytes (accepted, not enforced)", args: 1, placeholder: "<kilobytes>",
+				valueType: ValueInteger, valueDesc: "IPsec SA lifetime in kilobytes",
+				valueExamples: []string{"100000", "4294967294"}, validator: ValidateIntegerMin(1), children: nil},
+			// #4313: modeled so the closed-world flip is LEAF-COMPLETE. Junos
+			// allows a cosmetic `description` on an IPsec proposal; xpf ignores it
+			// at compile (the IPsec proposal loop has no case for it), but it MUST
+			// be modeled or closed-world would false-reject a valid config that
+			// carries it. scalar:true rejects a trailing token (#3332) — a
+			// multi-word description must be quoted.
+			"description": {desc: "Proposal description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		}},
 		"policy": {desc: "IPsec policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: nil},

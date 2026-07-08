@@ -749,6 +749,32 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #4313: `security ipsec proposal <p> lifetime-kilobytes <kb>` is now typed
+	// + captured (schema leaf + compileIPsec) so the closed-world flip on the
+	// Phase-2 proposal is leaf-complete, but the ESP child SA is not yet
+	// programmed with a volume-based rekey threshold (the renderer emits only
+	// rekey_time, not rekey_bytes). Mirror the #2078/#4231 accepted-only
+	// doctrine: warn so an operator who sets a volume rekey is not silently
+	// misled into believing the SA rekeys on bytes. Full enforcement is a
+	// renderer + dataplane follow-up.
+	{
+		var lkbProps []string
+		for name := range cfg.Security.IPsec.Proposals {
+			if p := cfg.Security.IPsec.Proposals[name]; p != nil && p.LifetimeKilobytes > 0 {
+				lkbProps = append(lkbProps, name)
+			}
+		}
+		if len(lkbProps) > 0 {
+			sort.Strings(lkbProps)
+			warnings = append(warnings, fmt.Sprintf(
+				"security ipsec proposal %s lifetime-kilobytes configured but "+
+					"accepted-only — xpf does not program a volume-based (byte) "+
+					"rekey threshold; the SA rekeys on lifetime-seconds only "+
+					"(config-only parity, #4313)",
+				strings.Join(lkbProps, ", ")))
+		}
+	}
+
 	// #4291 (fable-167 N-2): the NAT `port-overloading` knobs are now typed +
 	// committed (schema leaves + compileNAT) but the userspace AF_XDP SNAT
 	// allocator enforces neither. `security nat source interface port-overloading

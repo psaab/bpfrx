@@ -305,6 +305,15 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 				if n, err := strconv.Atoi(v); err == nil {
 					prop.LifetimeSeconds = n
 				}
+			case "lifetime-kilobytes":
+				// #4313: captured for the closed-world leaf-completeness of
+				// `security ipsec proposal` and the accepted-only advisory
+				// (compiler_validate_warn.go). Volume-based rekey is not yet
+				// programmed into the ESP child SA, so the value is recorded
+				// but not enforced.
+				if n, err := strconv.Atoi(v); err == nil {
+					prop.LifetimeKilobytes = n
+				}
 			}
 		}
 		sec.IPsec.Proposals[prop.Name] = prop
