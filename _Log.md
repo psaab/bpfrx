@@ -1,3 +1,28 @@
+## 2026-07-08 — #4404 increment 1: split debug_log_throttle submodule
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4404 (poll_descriptor/mod.rs decomposition), increment 1.
+  Pure code-motion split of the cold-path `debug-log` throttle unit out
+  of `poll_descriptor/mod.rs` into a new sibling submodule
+  `poll_descriptor/debug_log_throttle.rs`. Moved verbatim: the two #4120
+  interval caps (`SESSION_MISS_DEBUG_LOG_CAP`, `POLICY_DENY_DEBUG_LOG_CAP`,
+  kept module-private), the two pure `u64 -> bool` predicates
+  (`session_miss_debug_log_allowed`, `policy_deny_debug_log_allowed`, now
+  `pub(super)` so mod.rs's call sites at the former L2024/L3410 still
+  reach them), and the `debug_log_throttle_tests` pinned-contract test
+  module. mod.rs gained `mod debug_log_throttle;` + a `use` import;
+  behavior, visibility surface, and the 3 test cases are identical. This
+  unit was chosen because it has ZERO cross-references back into mod.rs
+  (no dataplane types) — the cleanest available boundary — and directly
+  matches the issue's stated fix of outlining the cold-path debug logging.
+  The `poll_binding_process_descriptor` god-function itself (session-hit /
+  session-miss / flowless arm fusion) is NOT touched; it stays tracked on
+  #4404 and needs /triple-review (single-recycle + CoS guarantee-guard
+  invariants). Gate: FULL `cargo test` = 3739+60+8+22+1 passed / 0 failed
+  across all binaries; new file rustfmt-clean at edition 2024.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/debug_log_throttle.rs
+  (new), userspace-dp/src/afxdp/poll_descriptor/mod.rs, _Log.md
+
 ## 2026-07-08 — #4409 increment 1: extract reuse_existing_lease_locked
 
 - **Timestamp**: 2026-07-08
