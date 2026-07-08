@@ -1,3 +1,20 @@
+## 2026-07-07 — #4589 A10-01 cli: bound `monitor traffic count` (negative / unbounded)
+
+- **Timestamp**: 2026-07-07
+- **Action**: `parseMonitorTrafficArgs` (`pkg/cli/cli_request.go`) only
+  rejected a non-numeric `count`; `strconv.Atoi("-1")` and a huge value
+  both parsed clean, so `count -1` reached tcpdump's `-c` as an opaque
+  "invalid packet count" error and an unbounded value was silently
+  accepted (redundant with the already-supported `count 0` = unlimited).
+  Bounded the value to `n < 0 || n > 8192` after Atoi, matching the
+  sibling `monitor security packet-drop` cap (1..8192, monitor.go), while
+  keeping 0 as the explicit unlimited mode (buildMonitorTrafficArgv omits
+  `-c`). UX/consistency only — RBAC-gated (PermControl), no injection (the
+  `--` filter fence is intact). RED-on-revert test
+  `TestParseMonitorTrafficCountBounded`/`...InRangeAccepted`.
+- **File(s)**: pkg/cli/cli_request.go,
+  pkg/cli/monitor_traffic_count_bound_4589_test.go, _Log.md
+
 ## 2026-07-07 — #4589 A3 F-01 config: range-validate BGP peer-as / top-level local-as (uint32 wrap)
 
 - **Timestamp**: 2026-07-07

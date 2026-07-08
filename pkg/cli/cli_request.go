@@ -554,8 +554,19 @@ func parseMonitorTrafficArgs(args []string) (iface, filter, count string, err er
 			}
 			i++
 			count = args[i]
-			if _, cerr := strconv.Atoi(count); cerr != nil {
+			n, cerr := strconv.Atoi(count)
+			if cerr != nil {
 				return "", "", "", fmt.Errorf("monitor traffic: 'count' requires a numeric value, got %q", count)
+			}
+			// Bound the count like the sibling `monitor security packet-drop`
+			// (1..8192, monitor.go). 0 stays the explicit "unlimited" mode
+			// (buildMonitorTrafficArgv omits `-c` when count=="0"); a negative
+			// previously reached tcpdump's `-c` as an opaque "invalid packet
+			// count" error, and an unbounded huge value is redundant with the
+			// already-supported 0=unlimited mode. Reject both CLI-side so the
+			// numeric leaf matches the project's sibling-command bounding.
+			if n < 0 || n > 8192 {
+				return "", "", "", fmt.Errorf("monitor traffic: 'count' must be 0 (unlimited) or 1..8192, got %q", count)
 			}
 		}
 	}
