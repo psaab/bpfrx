@@ -195,7 +195,16 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 		for _, afNode := range afNodes {
 			af := afName
 			if af == "" {
-				af = afNode.Keys[0]
+				// #4827: Name() safely returns "" for an empty Keys slice —
+				// afNode.Keys[0] would panic (index out of range) on a
+				// malformed persisted Node reaching this compile path (a
+				// corrupted on-disk config-store JSON blob;
+				// pkg/configstore/db.go's plain json.Unmarshal has no Node
+				// validator). The live parser/SetPath paths structurally
+				// guarantee len(Keys) >= 1, so this only ever bites a
+				// corrupted store, but a bad persisted state must error on
+				// load, never panic (#1960 fail-closed-on-load doctrine).
+				af = afNode.Name()
 				if len(afNode.Keys) >= 2 {
 					af = afNode.Keys[1]
 				}
@@ -367,7 +376,17 @@ func validateFirewallFilterFamilyCollisionsAST(nodes []*Node, lenient bool) ([]s
 			for _, afNode := range afNodes {
 				af := afName
 				if af == "" {
-					af = afNode.Keys[0]
+					// #4827: Name() safely returns "" for an empty Keys
+					// slice — afNode.Keys[0] would panic (index out of
+					// range) on a malformed persisted Node (e.g. a
+					// corrupted on-disk config-store JSON blob;
+					// pkg/configstore/db.go's plain json.Unmarshal has no
+					// Node validator). The live parser/SetPath paths
+					// structurally guarantee len(Keys) >= 1, so this only
+					// ever bites a corrupted store, but a bad persisted
+					// state must error on load, never panic (#1960
+					// fail-closed-on-load doctrine).
+					af = afNode.Name()
 					if len(afNode.Keys) >= 2 {
 						af = afNode.Keys[1]
 					}
@@ -601,7 +620,17 @@ func validateFirewallFilterFamilyAnyMatchesAST(nodes []*Node, lenient bool) ([]s
 			for _, afNode := range afNodes {
 				af := afName
 				if af == "" {
-					af = afNode.Keys[0]
+					// #4827: Name() safely returns "" for an empty Keys
+					// slice — afNode.Keys[0] would panic (index out of
+					// range) on a malformed persisted Node (e.g. a
+					// corrupted on-disk config-store JSON blob;
+					// pkg/configstore/db.go's plain json.Unmarshal has no
+					// Node validator). The live parser/SetPath paths
+					// structurally guarantee len(Keys) >= 1, so this only
+					// ever bites a corrupted store, but a bad persisted
+					// state must error on load, never panic (#1960
+					// fail-closed-on-load doctrine).
+					af = afNode.Name()
 					if len(afNode.Keys) >= 2 {
 						af = afNode.Keys[1]
 					}
