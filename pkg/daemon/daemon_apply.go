@@ -994,6 +994,34 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 
 	d.applyRoutingRules(cfg, commitOverlay)
 
+	ipsecErr, dhcpServerErr := d.applyServicesReconcile(cfg)
+
+	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
+	// login/SSH, archival, observability, cluster runtime, host tunables).
+	// Extracted into applyTailReconciles (#4407 Phase A). The head above
+	// is decomposed into named phase methods (#4407): the decoupled
+	// setup/reconcile phases (loadable independently) — applyVRFReconcile,
+	// applyInterfaceReconcile, applyFabricIPVLAN, applyRoutingRules,
+	// applyServicesReconcile — and the ordering-entangled dataplane-apply /
+	// RETH-MAC core that stays inline (it threads applyResult / rethMACPending
+	// / the deferred errors). The tail is independent per-subsystem dispatch
+	// reading only cfg (+ nil-guarded managers), so grouping it here is a
+	// behavior-preserving mechanical move. The three head-produced deferred
+	// errors are threaded in; the helper creates lo0Err/hostInboundErr and
+	// returns the identical five-way errors.Join.
+	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyServicesReconcile runs the per-service reconcile phases of a config
+// apply that are decoupled from the dataplane-apply / RETH-MAC state: proactive
+// neighbor resolution, RA sender config, IPsec config, the Kea DHCP server, and
+// DHCP clients. Extracted verbatim from applyConfigLocked (#4407); no early
+// return and no crossing input beyond cfg. It produces the IPsec and
+// DHCP-server deferred errors (recorded, not returned early, so a later
+// per-subsystem failure does not abort the apply) and returns them (ipsecErr,
+// dhcpServerErr) for the tail reconcile's five-way errors.Join. Runs in the
+// same slot, after the routing rules and before the tail reconciles.
+func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 	// 4. Proactive neighbor resolution for all known next-hops/gateways.
 	// This ensures bpf_fib_lookup returns SUCCESS (with valid MACs)
 	// instead of NO_NEIGH for the first forwarded packet.
@@ -1133,17 +1161,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// the dataplane compile (step 2) so HOST_INBOUND_DHCP flags are
 	// active before a newly started client puts DHCP packets on the wire.
 	d.reconcileDHCPClients(cfg)
-
-	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
-	// login/SSH, archival, observability, cluster runtime, host tunables).
-	// Extracted into applyTailReconciles (#4407 Phase A). The head above
-	// (steps 0–7) is ordering-entangled and stays inline; the tail is
-	// independent per-subsystem dispatch reading only cfg (+ nil-guarded
-	// managers), so grouping it here is a behavior-preserving mechanical
-	// move. The three head-produced deferred errors are threaded in; the
-	// helper creates lo0Err/hostInboundErr and returns the identical
-	// five-way errors.Join.
-	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+	return ipsecErr, dhcpServerErr
 }
 
 // applyRoutingRules applies the routing-rules layer during a config apply:
