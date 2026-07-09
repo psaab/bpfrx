@@ -1,3 +1,33 @@
+## 2026-07-08 — #4705: resolve master-password across ALL system stanzas (no plaintext DB leak)
+
+- **Timestamp**: 2026-07-08
+- **Action**: SECURITY fix. `masterPasswordPRF` (crypto.go) resolved the
+  encryption PRF via a single first-match `tree.FindChild("system")`, so a
+  `master-password` in a SECOND top-level `system {}` stanza was missed and the
+  whole config DB was written to disk in PLAINTEXT despite encryption being
+  configured. VERIFY-FIRST confirmed reachability at every layer: the Junos
+  parser does NOT merge duplicate top-level stanzas (`parseStatements` appends
+  each), `LoadOverride`/`SyncApply` feed the raw parsed tree to the write path,
+  schema validation accepts duplicate `system` nodes, and the compiler
+  (`compileSections` loops all top-level nodes) folds every `system` node into
+  the same `cfg.System` — so the master-password is semantically active but the
+  crypto path missed it. Fix: resolve via the EXISTING `systemBlocksOf` helper
+  (the same all-matches walk the dataplane-retirement code uses) +
+  `FindChildren("master-password")` within each; encrypt if ANY carries a PRF
+  (fail closed). The #4579 A4-06 plaintext-downgrade warning (db.go
+  readTreeMeta) keys off the same `masterPasswordPRF`, so centralizing the
+  resolution repairs that path for the split-stanza case too. Added two
+  RED-on-revert tests: (1) parse two `system` stanzas (master-password only in
+  the 2nd) -> persisted DB encrypted, not plaintext; (2) plaintext-on-disk
+  split-stanza DB read back -> #4579 downgrade warning fires. Reverting to
+  first-match makes BOTH FAIL. README crypto note added.
+- **Validation**: gofmt; go build ./...; RED-on-revert confirmed (buggy
+  first-match → `masterPasswordPRF = ""` → test FAIL); fixed → PASS;
+  `pkg/configstore/...` + `pkg/config/...` green; FULL Go suite green (53 ok,
+  0 fail).
+- **File(s)**: pkg/configstore/crypto.go,
+  pkg/configstore/masterpw_split_system_4705_test.go,
+  pkg/configstore/README.md, _Log.md
 ## 2026-07-08 — #4712: deterministic sorted iteration in show-text endpoints
 
 - **Timestamp**: 2026-07-08
