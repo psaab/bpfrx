@@ -2228,6 +2228,15 @@ func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
 	if cfg == nil {
 		return nil
 	}
+	// #4146: the representable ordered DENY class is now ENFORCED on the direct
+	// host-bound path by the kernel nft `xpf_hostinbound` chain
+	// (BuildJunosHostDenyProjection). Suppress the parity warning for exactly the
+	// policies that rendered an enforced kernel rule; every un-representable /
+	// lifeline-only / unenforceable policy still warns (the documented
+	// partial-coverage remainder). Rendered means: the policy applies only to
+	// enforceable ingress zones and EVERY such zone's whole program is
+	// representable (§3.3 / §8 inv-12).
+	rendered := BuildJunosHostDenyProjection(cfg).RenderedPolicyKeys
 	var warnings []string
 	msg := func(who, reason string) string {
 		return fmt.Sprintf(
@@ -2253,6 +2262,9 @@ func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
 			if p == nil {
 				continue
 			}
+			if rendered[JunosHostZonePairPolicyKey(zpp.FromZone, p.Name)] {
+				continue // #4146: enforced on the direct path — no parity gap.
+			}
 			if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {
 				warnings = append(warnings, msg(fmt.Sprintf(
 					"%q (from-zone %q)", p.Name, zpp.FromZone), reason))
@@ -2267,6 +2279,9 @@ func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
 		// (IsHostToZoneScope); a transit or all-zones global never does.
 		if p == nil || !IsHostToZoneScope(p.Match.ToZones) {
 			continue
+		}
+		if rendered[JunosHostGlobalPolicyKey(p.Name)] {
+			continue // #4146: enforced on the direct path — no parity gap.
 		}
 		if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {
 			warnings = append(warnings, msg(fmt.Sprintf("global %q", p.Name), reason))

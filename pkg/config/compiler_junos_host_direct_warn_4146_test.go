@@ -52,11 +52,14 @@ var junosHostBaseZones = []string{
 	"set security address-book global address mgmt-net 10.10.0.0/24",
 }
 
-// TestJunosHostDirectDeliveryWarns is the #4146 (H-1 slice c) fail-on-revert
-// guard: a `to-zone junos-host` policy that is STRICTER than the coarse kernel
-// host-inbound gate — a deny/reject, or a source-restricted permit — emits the
-// commit-time parity warning. Reverting the validateJunosHostDirectDelivery
-// Warnings call (or the trigger) drops the warning and this test goes RED.
+// TestJunosHostDirectDeliveryWarns is the #4146 fail-on-revert guard for the
+// UN-REPRESENTABLE remainder: a `to-zone junos-host` policy the kernel nft chain
+// cannot faithfully enforce on the direct host-bound path — a `reject`, a
+// source-restricted PERMIT (the "deny non-permitted" half is the §6.5 follow-up),
+// a feed-tainted source, or an ingress zone with `tcp-rst` — STILL emits the
+// commit-time parity warning. Reverting the suppression logic must not silence
+// these (they are a genuine, still-open gap). REPRESENTABLE denies are covered
+// by TestJunosHostDirectDeliveryEnforcedNoWarn instead (they are now enforced).
 func TestJunosHostDirectDeliveryWarns(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -65,29 +68,7 @@ func TestJunosHostDirectDeliveryWarns(t *testing.T) {
 		cmds       []string
 	}{
 		{
-			name:       "zone-pair deny with source scope",
-			policyName: `"block-bad"`,
-			reason:     "a deny to-zone junos-host",
-			cmds: append(append([]string{}, junosHostBaseZones...),
-				"set security policies from-zone untrust to-zone junos-host policy block-bad match source-address bad-host",
-				"set security policies from-zone untrust to-zone junos-host policy block-bad match destination-address any",
-				"set security policies from-zone untrust to-zone junos-host policy block-bad match application any",
-				"set security policies from-zone untrust to-zone junos-host policy block-bad then deny",
-			),
-		},
-		{
-			name:       "zone-pair deny with source any (blanket deny is still stricter than a permit-by-service gate)",
-			policyName: `"block-all"`,
-			reason:     "a deny to-zone junos-host",
-			cmds: append(append([]string{}, junosHostBaseZones...),
-				"set security policies from-zone untrust to-zone junos-host policy block-all match source-address any",
-				"set security policies from-zone untrust to-zone junos-host policy block-all match destination-address any",
-				"set security policies from-zone untrust to-zone junos-host policy block-all match application any",
-				"set security policies from-zone untrust to-zone junos-host policy block-all then deny",
-			),
-		},
-		{
-			name:       "zone-pair reject",
+			name:       "zone-pair reject (verdict-class divergence, §6.5 follow-up)",
 			policyName: `"reject-bad"`,
 			reason:     "a reject to-zone junos-host",
 			cmds: append(append([]string{}, junosHostBaseZones...),
@@ -98,7 +79,7 @@ func TestJunosHostDirectDeliveryWarns(t *testing.T) {
 			),
 		},
 		{
-			name:       "zone-pair source-restricted permit (the standard vSRX layered-management model)",
+			name:       "zone-pair source-restricted permit (deny-non-permitted half is §6.5)",
 			policyName: `"mgmt-only"`,
 			reason:     "a source-restricted permit to-zone junos-host",
 			cmds: append(append([]string{}, junosHostBaseZones...),
@@ -109,15 +90,29 @@ func TestJunosHostDirectDeliveryWarns(t *testing.T) {
 			),
 		},
 		{
-			name:       "global policy deny to-zone junos-host",
-			policyName: `global "g-block"`,
+			name:       "deny with feed-tainted source (not commit-stable, §6.2)",
+			policyName: `"block-feed"`,
 			reason:     "a deny to-zone junos-host",
 			cmds: append(append([]string{}, junosHostBaseZones...),
-				"set security policies global policy g-block match source-address bad-host",
-				"set security policies global policy g-block match destination-address any",
-				"set security policies global policy g-block match application any",
-				"set security policies global policy g-block match to-zone junos-host",
-				"set security policies global policy g-block then deny",
+				"set security dynamic-address feed-server threat url https://feeds.example/list.txt",
+				"set security dynamic-address feed-server threat feed-name malware path /malware.txt",
+				"set security dynamic-address address-name feed-bad profile feed-name malware",
+				"set security policies from-zone untrust to-zone junos-host policy block-feed match source-address feed-bad",
+				"set security policies from-zone untrust to-zone junos-host policy block-feed match destination-address any",
+				"set security policies from-zone untrust to-zone junos-host policy block-feed match application any",
+				"set security policies from-zone untrust to-zone junos-host policy block-feed then deny",
+			),
+		},
+		{
+			name:       "deny in a tcp-rst ingress zone (silent-drop diverges, §6.2)",
+			policyName: `"block-rst"`,
+			reason:     "a deny to-zone junos-host",
+			cmds: append(append([]string{}, junosHostBaseZones...),
+				"set security zones security-zone untrust tcp-rst",
+				"set security policies from-zone untrust to-zone junos-host policy block-rst match source-address bad-host",
+				"set security policies from-zone untrust to-zone junos-host policy block-rst match destination-address any",
+				"set security policies from-zone untrust to-zone junos-host policy block-rst match application any",
+				"set security policies from-zone untrust to-zone junos-host policy block-rst then deny",
 			),
 		},
 	}
@@ -132,6 +127,56 @@ func TestJunosHostDirectDeliveryWarns(t *testing.T) {
 				if !strings.Contains(w, want) {
 					t.Errorf("warning missing substring %q:\n  %s", want, w)
 				}
+			}
+		})
+	}
+}
+
+// TestJunosHostDirectDeliveryEnforcedNoWarn is the #4146 enforcement guard: a
+// REPRESENTABLE `to-zone junos-host` DENY (static-address / any source,
+// application any, no scheduler, non-tcp-rst enforceable ingress zone) is now
+// kernel-enforced on the direct host-bound path, so its parity warning is
+// SUPPRESSED. Reverting the suppression (or the BuildJunosHostDenyProjection
+// rendered-key logic) makes a warning reappear and this test goes RED.
+func TestJunosHostDirectDeliveryEnforcedNoWarn(t *testing.T) {
+	cases := []struct {
+		name string
+		cmds []string
+	}{
+		{
+			name: "zone-pair deny with static source scope (enforced)",
+			cmds: append(append([]string{}, junosHostBaseZones...),
+				"set security policies from-zone untrust to-zone junos-host policy block-bad match source-address bad-host",
+				"set security policies from-zone untrust to-zone junos-host policy block-bad match destination-address any",
+				"set security policies from-zone untrust to-zone junos-host policy block-bad match application any",
+				"set security policies from-zone untrust to-zone junos-host policy block-bad then deny",
+			),
+		},
+		{
+			name: "zone-pair blanket deny source any (enforced)",
+			cmds: append(append([]string{}, junosHostBaseZones...),
+				"set security policies from-zone untrust to-zone junos-host policy block-all match source-address any",
+				"set security policies from-zone untrust to-zone junos-host policy block-all match destination-address any",
+				"set security policies from-zone untrust to-zone junos-host policy block-all match application any",
+				"set security policies from-zone untrust to-zone junos-host policy block-all then deny",
+			),
+		},
+		{
+			name: "global deny to-zone junos-host (enforced in every applicable zone)",
+			cmds: append(append([]string{}, junosHostBaseZones...),
+				"set security zones security-zone trust host-inbound-traffic system-services ping",
+				"set security policies global policy g-block match source-address bad-host",
+				"set security policies global policy g-block match destination-address any",
+				"set security policies global policy g-block match application any",
+				"set security policies global policy g-block match to-zone junos-host",
+				"set security policies global policy g-block then deny",
+			),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := junosHostWarnings(t, tc.cmds); len(got) != 0 {
+				t.Fatalf("expected no junos-host parity warning (enforced), got: %v", got)
 			}
 		})
 	}
