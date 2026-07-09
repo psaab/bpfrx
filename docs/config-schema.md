@@ -2001,6 +2001,29 @@ reserved for whole-dataplane selection where a rewrite shim
   parse in `parseVRRPGroups` no longer swallows an `strconv.Atoi` error
   with `_ =` — a bad parse kept the constructor default (priority 100)
   instead of silently resetting to 0 (the RFC 5798 resignation value).
+  **#4826 — reth-derived VRID range gate:** #4573 only bounded the
+  *explicit* `vrrp-group <id>` slot; a RETH interface's VRRP GroupID is
+  separately synthesized as `100 + redundancy-group-id`
+  (`CollectRethInstances`, `pkg/vrrp/vrrp.go`), and that path had no
+  commit-time bound at all. The chassis `redundancy-group <id>` gate
+  (#4434, `validateChassisClusterStrict`) caps the id at 255 — the
+  single-byte HA *heartbeat* wire limit, unrelated to VRRP — so a
+  redundancy-group in 156..255 committed cleanly while its derived VRID
+  (256..355) silently lost VRRP at runtime (`pkg/vrrp/manager.go
+  UpdateInstances` skips the out-of-range GroupID with only a WARN log —
+  no wrong-VRID advert on the wire, but a live HA blackhole for that
+  redundancy group). `validateRethVRRPGroupIDStrict`
+  (`compiler_validate_strict_reth_vrrp.go`) closes the gap the same way
+  #4573 closed it for the explicit path: hard-reject a
+  `redundant-ether-options redundancy-group <id>` above 155 at commit /
+  commit-check, downgraded to a warning on the tolerant load / peer-sync
+  path (`lenientRethVRRPGroupID`, #1960 no-brick). It mirrors
+  `CollectRethInstances`' own early return for `no-reth-vrrp` /
+  private-rg-election (the compiler default for any `chassis cluster`
+  stanza) so a redundancy-group id that produces no synthesized VRRP
+  instance is never rejected. `pkg/config` cannot import `pkg/vrrp` (the
+  dependency runs the other way), so the `100` offset is a documented
+  duplicated constant (`RethVRRPGroupIDBase`), not an import.
   **#2850 — `preempt hold-time`:** the
   `vrrp-group <id> preempt` leaf gained a nested `hold-time <seconds>`
   child (`schema_interfaces.go`, typed `ValidateInteger(1, 3600)`), Junos
