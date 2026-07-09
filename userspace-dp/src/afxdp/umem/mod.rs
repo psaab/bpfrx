@@ -1,10 +1,10 @@
 use super::*;
 // #1351: `WorkerTimers` is no longer referenced directly in this
 // file (the debug-state cadence helpers that used it moved to
-// `debug_state.rs`), but `umem/tests.rs` references it via
-// `use super::*;` at tests.rs:1384-1385 in `debug_state_test_timers`.
-// Gate the import on `cfg(test)` so production builds stay
-// warning-free (per Copilot review on PR #1581).
+// `debug_state.rs`), but `umem/tests/debug_state.rs` references it
+// via `use super::*;` in `debug_state_test_timers`. Gate the import
+// on `cfg(test)` so production builds stay warning-free (per Copilot
+// review on PR #1581).
 #[cfg(test)]
 use crate::afxdp::worker::WorkerTimers;
 
@@ -16,12 +16,11 @@ pub(in crate::afxdp) use mmap::MmapArea;
 pub(in crate::afxdp) use profile::{OwnerProfileOwnerWrites, OwnerProfilePeerWrites};
 
 // #1351: telemetry-publishing free fns and the two cadence constants
-// live in `debug_state.rs`. `umem/tests.rs` references the constants
-// (DEBUG_STATE_PUBLISH_MASK at tests.rs:1567,1575;
-// IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS at tests.rs:1541,1550,1555,
-// 1558,1610,1625) and the two gate fns via `use super::*;`, and
-// `crate::afxdp::umem::flush_v_min_scratches_into` is the absolute
-// path used by `umem/tests.rs:1316,1377`. Re-export everything at
+// live in `debug_state.rs`. `umem/tests/debug_state.rs` references
+// the constants (DEBUG_STATE_PUBLISH_MASK,
+// IDLE_DEBUG_STATE_PUBLISH_INTERVAL_NS) and the two gate fns via
+// `use super::*;`, and `crate::afxdp::umem::flush_v_min_scratches_into`
+// is the absolute path it uses. Re-export everything at
 // `pub(in crate::afxdp)` to match the existing `mmap::MmapArea` /
 // `profile::Owner|Peer` precedent and to avoid E0364 (documented in
 // `userspace-dp/src/afxdp/tx/mod.rs:38`).
@@ -1341,5 +1340,4 @@ impl BindingLiveState {
 
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;

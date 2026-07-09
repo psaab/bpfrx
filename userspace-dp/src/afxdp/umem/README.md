@@ -13,7 +13,7 @@ drop-in for xdpilone), and tracks frame budgets per binding.
 | `mmap.rs` | `MmapArea` — the raw `mmap` region. |
 | `mmap_tests.rs` | Co-located mmap unit tests. |
 | `profile.rs` | `OwnerProfileOwnerWrites` / `OwnerProfilePeerWrites` — per-frame profiling counters split by who's writing. |
-| `tests.rs` | Co-located UMEM unit tests. |
+| `tests/` | Co-located UMEM unit tests, split per-concern (#4667): `mod.rs` (shared `use` header + the cross-concern `test_tx_request_for_inbox` fixture), `mmap_area.rs`, `tx_inbox.rs`, `latency_buckets.rs`, `snapshot_propagation.rs`, `tx_submit_latency.rs`, `tx_kick_latency.rs`, `debug_state.rs`. |
 
 ## Where it sits
 

@@ -43050,3 +43050,22 @@ top.
 - **Validation**: gofmt clean; go build ./... clean; go vet ./pkg/config
   ./pkg/snmp clean (no copylocks); go test ./pkg/config/... + ./pkg/snmp/...
   pass; full `go test ./...` green (53 ok / 0 fail / 3 no-test-files, 56 pkgs).
+
+---
+- **Timestamp**: 2026-07-09 01:09 PDT
+- **Action**: #4667 — split afxdp/umem/tests.rs (1765 LOC) into per-concern
+  tests/ subdir (7 sibling submodules + tests/mod.rs). Pure byte-exact
+  test-code motion; no production logic changed. Files:
+  tests/mod.rs (shared `use` header + `test_tx_request_for_inbox` fixture),
+  mmap_area.rs (1), tx_inbox.rs (3), latency_buckets.rs (6),
+  snapshot_propagation.rs (3), tx_submit_latency.rs (9),
+  tx_kick_latency.rs (6), debug_state.rs (5). umem/mod.rs decl changed
+  `#[path="tests.rs"] mod tests;` -> `mod tests;`; two #1351 comment blocks
+  repointed from stale `tests.rs:NNNN` refs to `umem/tests/debug_state.rs`
+  (comment-only). README.md file table updated. Test count 33 preserved;
+  static crate #[test] count 3336==3336; code-line multiset missing=0,
+  extra=7x`mod X;`+7x`use super::*;`. Full serial cargo test (release):
+  3860 passed / 0 failed / 2 ignored (EXIT=0). afxdp::umem::tests:: --list==33.
+- **File(s)**: userspace-dp/src/afxdp/umem/{mod.rs,README.md},
+  userspace-dp/src/afxdp/umem/tests.rs (deleted),
+  userspace-dp/src/afxdp/umem/tests/{mod,mmap_area,tx_inbox,latency_buckets,snapshot_propagation,tx_submit_latency,tx_kick_latency,debug_state}.rs (new)
