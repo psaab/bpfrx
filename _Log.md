@@ -28,6 +28,30 @@
   `go test ./...` = 53 ok / 3 no-test / 0 fail. RED-on-revert verified
   (last-wins overwrite → `address-set S members = [A2], want [A1 A2]`).
 
+## 2026-07-09 — #4665: split cos/queue_service/tests.rs into per-concern files
+
+- **Timestamp**: 2026-07-09
+- **Action**: Pure test-code motion. Split the 4384-line
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs (85 tests) into a
+  tests/ subdir with per-concern sibling submodules loaded from
+  tests/mod.rs: selector (31), waterfill (18), drain (12), wakeup (8),
+  sojourn (6), refund (5), submit (5). Test fn/helper bodies moved
+  byte-identical (extracted by exact line ranges); no test logic changed.
+  Shared imports, the epoch constant, the relocated mid-file `use`, and
+  the cross-concern `waterfill_guarantee_rate_root` fixture live in
+  tests/mod.rs and reach each submodule via `use super::*` (verified the
+  transitive glob + explicit-use re-export resolves). Wiring: mod.rs
+  `#[cfg(test)] #[path = "tests.rs"] mod tests;` → `#[cfg(test)] mod
+  tests;` (resolves to tests/mod.rs); do NOT touch the hot selectors.
+  Verification: code-line multiset identical to the pre-split file
+  (MISSING none / UNEXPECTED_SURPLUS none); crate-wide test count 3843 ==
+  3843, queue_service 85 == 85. cargo build + FULL serial suite green
+  (main binary 3763 passed / 0 failed / 2 ignored; 60 + 8 + 22 + 1 in the
+  other binaries). No production code touched (diff = test files + the one
+  mod-wiring line).
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs (deleted),
+  userspace-dp/src/afxdp/cos/queue_service/tests/{mod,selector,drain,wakeup,waterfill,sojourn,refund,submit}.rs,
 ## 2026-07-09 — #4707: report current CPU utilization, not since-boot average
 
 - **Timestamp**: 2026-07-09
