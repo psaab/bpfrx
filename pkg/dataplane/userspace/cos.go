@@ -164,14 +164,20 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				continue
 			}
 			snap.Schedulers = append(snap.Schedulers, CoSSchedulerSnapshot{
-				Name:                  sched.Name,
-				TransmitRateBytes:     sched.TransmitRateBytes,
-				TransmitRatePercent:   sched.TransmitRatePercent,
-				TransmitRateExact:     sched.TransmitRateExact,
-				Priority:              sched.Priority,
-				BufferSizeBytes:       sched.BufferSizeBytes,
-				BufferSizePercent:     sched.BufferSizePercent,
-				SurplusSharing:        sched.SurplusSharing,
+				Name:                sched.Name,
+				TransmitRateBytes:   sched.TransmitRateBytes,
+				TransmitRatePercent: sched.TransmitRatePercent,
+				TransmitRateExact:   sched.TransmitRateExact,
+				Priority:            sched.Priority,
+				BufferSizeBytes:     sched.BufferSizeBytes,
+				BufferSizePercent:   sched.BufferSizePercent,
+				// #915/#4966: surplus-sharing is a no-op without
+				// transmit-rate exact. ValidateConfig warns but no
+				// longer strips it (that made validation mutate the
+				// config); the effective gate lives here so the
+				// runtime never receives the inert flag while the
+				// active config keeps the operator's configured intent.
+				SurplusSharing:        sched.SurplusSharing && sched.TransmitRateExact,
 				EqualFlowEnforcement:  sched.EqualFlowEnforcement,
 				EqualFlowTargetPolicy: sched.EqualFlowTargetPolicy,
 				CodelTargetNS:         sched.CodelTargetNS,

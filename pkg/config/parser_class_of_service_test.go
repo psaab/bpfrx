@@ -818,10 +818,13 @@ system {
 	}
 }
 
-// #915: ValidateConfig warn-and-strips surplus-sharing when set
-// without transmit-rate exact (#1183 lesson — runtime never sees
-// the no-op flag).
-func TestSchedulerSurplusSharingWithoutExactWarnsAndStrips(t *testing.T) {
+// #915/#4966: ValidateConfig WARNS about surplus-sharing set without
+// transmit-rate exact, but must NOT strip it — validation is a
+// read-only pass and stripping made it non-idempotent (#4966). The
+// configured intent stays on the active config; the runtime never sees
+// the inert flag because buildClassOfServiceSnapshot gates it on
+// TransmitRateExact (asserted in the userspace snapshot tests).
+func TestSchedulerSurplusSharingWithoutExactWarnsButPreservesIntent(t *testing.T) {
 	lines := []string{
 		"set class-of-service forwarding-classes queue 4 iperf-a",
 		"set class-of-service schedulers iperf-a transmit-rate 1g",
@@ -845,27 +848,89 @@ func TestSchedulerSurplusSharingWithoutExactWarnsAndStrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
-	// CompileConfig calls ValidateConfig internally and stores
-	// warnings on cfg.Warnings; calling ValidateConfig again is a
-	// no-op because the strip already cleared SurplusSharing.
-	gotWarn := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "surplus-sharing") &&
-			strings.Contains(w, "iperf-a") {
-			gotWarn = true
-			break
+	hasSurplusWarn := func(warns []string) bool {
+		for _, w := range warns {
+			if strings.Contains(w, "surplus-sharing") &&
+				strings.Contains(w, "iperf-a") {
+				return true
+			}
 		}
+		return false
 	}
-	if !gotWarn {
-		t.Fatalf("expected warn-and-strip warning on cfg.Warnings; got: %v",
+	if !hasSurplusWarn(cfg.Warnings) {
+		t.Fatalf("expected surplus-sharing warning on cfg.Warnings; got: %v",
 			cfg.Warnings)
 	}
 	sched := cfg.ClassOfService.Schedulers["iperf-a"]
 	if sched == nil {
 		t.Fatal("scheduler missing")
 	}
-	if sched.SurplusSharing {
-		t.Fatal("expected SurplusSharing=false after warn-and-strip")
+	// Intent preserved: ValidateConfig no longer strips the flag.
+	if !sched.SurplusSharing {
+		t.Fatal("expected SurplusSharing preserved (not stripped) after compile")
+	}
+	// Idempotent: a re-run of ValidateConfig on the active config must
+	// re-emit the same warning (the recompute surfaces depend on this)
+	// and must NOT mutate SurplusSharing.
+	if warns := ValidateConfig(cfg); !hasSurplusWarn(warns) {
+		t.Fatalf("second ValidateConfig dropped the surplus-sharing warning; got: %v", warns)
+	}
+	if !sched.SurplusSharing {
+		t.Fatal("ValidateConfig mutated SurplusSharing (must be read-only)")
+	}
+}
+
+// #4966: ValidateConfig is a read-only pass and MUST be idempotent —
+// calling it twice yields an identical warning slice and leaves the
+// config it was given unchanged. Before the fix, the surplus-sharing
+// warn-and-strip mutated the config, so the second call saw a
+// different state and produced a different result.
+func TestValidateConfigIdempotentAndNonMutating(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 4 iperf-a",
+		"set class-of-service schedulers iperf-a transmit-rate 1g",
+		"set class-of-service schedulers iperf-a surplus-sharing",
+		"set class-of-service scheduler-maps edge-map forwarding-class iperf-a scheduler iperf-a",
+		"set class-of-service interfaces ge-0/0/2 unit 80 shaping-rate 10g",
+		"set class-of-service interfaces ge-0/0/2 unit 80 scheduler-map edge-map",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	sched := cfg.ClassOfService.Schedulers["iperf-a"]
+	if sched == nil {
+		t.Fatal("scheduler missing")
+	}
+	before := sched.SurplusSharing
+
+	first := ValidateConfig(cfg)
+	if sched.SurplusSharing != before {
+		t.Fatalf("ValidateConfig mutated SurplusSharing: before=%v after=%v", before, sched.SurplusSharing)
+	}
+	second := ValidateConfig(cfg)
+	if sched.SurplusSharing != before {
+		t.Fatalf("second ValidateConfig mutated SurplusSharing: before=%v after=%v", before, sched.SurplusSharing)
+	}
+	if len(first) != len(second) {
+		t.Fatalf("ValidateConfig not idempotent: len(first)=%d len(second)=%d\nfirst=%v\nsecond=%v",
+			len(first), len(second), first, second)
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			t.Fatalf("ValidateConfig warning %d differs across calls:\n first=%q\nsecond=%q", i, first[i], second[i])
+		}
 	}
 }
 

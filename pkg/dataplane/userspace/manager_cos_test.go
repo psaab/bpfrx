@@ -352,6 +352,51 @@ func TestBuildClassOfServiceSnapshotIncludesSurplusSharing(t *testing.T) {
 	}
 }
 
+// #4966: surplus-sharing is a no-op without transmit-rate exact.
+// ValidateConfig warns but no longer strips it from the config, so the
+// snapshot builder is the effective gate — a scheduler with
+// SurplusSharing=true but TransmitRateExact=false must serialize
+// SurplusSharing=false so the runtime never receives the inert flag.
+func TestBuildClassOfServiceSnapshotGatesSurplusSharingOnExact(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			Schedulers: map[string]*config.CoSScheduler{
+				// Configured intent: surplus-sharing set, but the rate
+				// is NOT exact, so the effective value must be false.
+				"inert": {
+					Name:              "inert",
+					TransmitRateBytes: 125_000_000,
+					TransmitRateExact: false,
+					SurplusSharing:    true,
+					Priority:          "low",
+				},
+				// Exact + surplus-sharing: effective value stays true.
+				"live": {
+					Name:              "live",
+					TransmitRateBytes: 125_000_000,
+					TransmitRateExact: true,
+					SurplusSharing:    true,
+					Priority:          "low",
+				},
+			},
+		},
+	}
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil snapshot")
+	}
+	got := map[string]bool{}
+	for _, s := range snap.Schedulers {
+		got[s.Name] = s.SurplusSharing
+	}
+	if got["inert"] {
+		t.Errorf("expected SurplusSharing gated off on non-exact scheduler; got %v", got)
+	}
+	if !got["live"] {
+		t.Errorf("expected SurplusSharing preserved on exact scheduler; got %v", got)
+	}
+}
+
 func TestBuildClassOfServiceSnapshotIncludesEqualFlowEnforcement(t *testing.T) {
 	cfg := &config.Config{
 		ClassOfService: &config.ClassOfServiceConfig{
