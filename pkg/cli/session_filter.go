@@ -55,7 +55,15 @@ type sessionFilter struct {
 
 	// Populated by populateIfaceMaps (show + clear paths) for
 	// interface matching.
-	zoneIfaces      map[uint16]string          // zone ID → first interface name
+	//
+	// #4792: zoneIfaces holds EVERY interface bound to a zone, not just
+	// the first. A single-value map meant a session ingressing (or, via
+	// the resolveEgressIfaces zone fallback, egressing) on the 2nd+
+	// interface of a multi-interface zone was silently invisible to
+	// `show security flow session interface <name>` / the matching
+	// `clear` — the interface never matched anything, so a filtered show
+	// undercounted and a filtered clear left sessions behind.
+	zoneIfaces      map[uint16][]string        // zone ID → all bound interface names
 	egressIfacesMap map[sessionIfaceKey]string // {ifindex,vlanID} → interface name
 }
 
@@ -202,9 +210,9 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 		return false
 	}
 	if f.iface != "" {
-		inIf := f.zoneIfaces[val.IngressZone]
-		outIf := f.resolveEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone)
-		if !f.ifaceMatches(inIf) && !f.ifaceMatches(outIf) {
+		inIfs := f.zoneIfaces[val.IngressZone]
+		outIfs := f.resolveEgressIfaces(val.FibIfindex, val.FibVlanID, val.EgressZone)
+		if !f.ifaceMatchesAny(inIfs) && !f.ifaceMatchesAny(outIfs) {
 			return false
 		}
 	}
@@ -247,9 +255,9 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 		return false
 	}
 	if f.iface != "" {
-		inIf := f.zoneIfaces[val.IngressZone]
-		outIf := f.resolveEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone)
-		if !f.ifaceMatches(inIf) && !f.ifaceMatches(outIf) {
+		inIfs := f.zoneIfaces[val.IngressZone]
+		outIfs := f.resolveEgressIfaces(val.FibIfindex, val.FibVlanID, val.EgressZone)
+		if !f.ifaceMatchesAny(inIfs) && !f.ifaceMatchesAny(outIfs) {
 			return false
 		}
 	}
@@ -315,14 +323,17 @@ func (f *sessionFilter) validate() error {
 // the clear path MUST call this before matching — historically it did
 // not, so an interface-filtered clear matched nothing (#1827 PR-3).
 func (f *sessionFilter) populateIfaceMaps(c *CLI) {
-	zoneIfaces := make(map[uint16]string)
+	zoneIfaces := make(map[uint16][]string)
 	if cr := c.applyResult(); cr != nil && f.cfg != nil {
 		for zoneName, zone := range f.cfg.Security.Zones {
 			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
 				continue
 			}
 			if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
-				zoneIfaces[zid] = zone.Interfaces[0]
+				// #4792: keep EVERY interface bound to the zone, not just
+				// the first — a zone with multiple member interfaces
+				// otherwise loses visibility into sessions on the 2nd+.
+				zoneIfaces[zid] = append(zoneIfaces[zid], zone.Interfaces...)
 			}
 		}
 	}
@@ -340,12 +351,27 @@ func (f *sessionFilter) ifaceMatches(ifName string) bool {
 	return ifName == f.iface || strings.HasPrefix(ifName, f.iface+".")
 }
 
-// resolveEgressIface resolves a session's egress interface name from FIB
-// lookup result, falling back to the zone's first interface.
-func (f *sessionFilter) resolveEgressIface(fibIfindex uint32, fibVlanID uint16, egressZone uint16) string {
+// ifaceMatchesAny reports whether ANY of ifNames matches the filter's
+// interface name (see ifaceMatches). Used against a zone's full interface
+// list (#4792) instead of assuming a zone binds exactly one interface.
+func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
+	for _, ifName := range ifNames {
+		if f.ifaceMatches(ifName) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveEgressIfaces resolves a session's candidate egress interface
+// names: a precise single-element result from the FIB lookup when
+// available, otherwise EVERY interface bound to the egress zone (#4792 —
+// a zone can bind more than one interface, so a single fallback name
+// silently missed sessions egressing on any interface but the first).
+func (f *sessionFilter) resolveEgressIfaces(fibIfindex uint32, fibVlanID uint16, egressZone uint16) []string {
 	if fibIfindex != 0 {
 		if ifName, ok := f.egressIfacesMap[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
-			return ifName
+			return []string{ifName}
 		}
 	}
 	return f.zoneIfaces[egressZone]

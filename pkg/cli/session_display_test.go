@@ -105,7 +105,7 @@ func TestIfaceMatches(t *testing.T) {
 
 func TestMatchesV4_InterfaceFilter(t *testing.T) {
 	// Zone 1 = trust (ge-0/0/0), Zone 2 = untrust (ge-0/0/1)
-	zoneIfaces := map[uint16]string{1: "ge-0/0/0", 2: "ge-0/0/1"}
+	zoneIfaces := map[uint16][]string{1: {"ge-0/0/0"}, 2: {"ge-0/0/1"}}
 	egressIfaces := map[sessionIfaceKey]string{
 		{ifindex: 10, vlanID: 0}: "ge-0/0/1",
 		{ifindex: 20, vlanID: 0}: "ge-0/0/2",

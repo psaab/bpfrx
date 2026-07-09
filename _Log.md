@@ -43718,3 +43718,7 @@ top.
   **File(s)**: pkg/api/dhcp.go, pkg/api/dhcp_clear_chunked_4794_test.go
   **Action**: Fix SESSION_CLOSE slog "firewall event" line always logging policy_id=0 (use rec.PolicyID, not zeroed evt.PolicyID); add RED-on-revert test
   **File(s)**: pkg/logging/ringbuf.go, pkg/logging/session_close_slog_policyid_4796_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix session filter matching only the FIRST interface of a multi-interface zone (widen zoneIfaces to map[uint16][]string, match ANY bound interface); fix the show-path call site + existing test for the field type change; add RED-on-revert test
+  **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go, pkg/cli/session_display_test.go, pkg/cli/session_filter_multi_iface_4792_test.go
