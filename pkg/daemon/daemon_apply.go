@@ -999,12 +999,16 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
 	// login/SSH, archival, observability, cluster runtime, host tunables).
 	// Extracted into applyTailReconciles (#4407 Phase A). The head above
-	// (steps 0–7) is ordering-entangled and stays inline; the tail is
-	// independent per-subsystem dispatch reading only cfg (+ nil-guarded
-	// managers), so grouping it here is a behavior-preserving mechanical
-	// move. The three head-produced deferred errors are threaded in; the
-	// helper creates lo0Err/hostInboundErr and returns the identical
-	// five-way errors.Join.
+	// is decomposed into named phase methods (#4407): the decoupled
+	// setup/reconcile phases (loadable independently) — applyVRFReconcile,
+	// applyInterfaceReconcile, applyFabricIPVLAN, applyRoutingRules,
+	// applyServicesReconcile — and the ordering-entangled dataplane-apply /
+	// RETH-MAC core that stays inline (it threads applyResult / rethMACPending
+	// / the deferred errors). The tail is independent per-subsystem dispatch
+	// reading only cfg (+ nil-guarded managers), so grouping it here is a
+	// behavior-preserving mechanical move. The three head-produced deferred
+	// errors are threaded in; the helper creates lo0Err/hostInboundErr and
+	// returns the identical five-way errors.Join.
 	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
 }
 
