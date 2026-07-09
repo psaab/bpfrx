@@ -1,6 +1,9 @@
 package config
 
-import "net"
+import (
+	"fmt"
+	"net"
+)
 
 // SNMP community `clients` source-IP restriction (#4289).
 //
@@ -152,4 +155,52 @@ func parseSNMPClients(node *Node) []SNMPClient {
 		appendTokens(ch.Keys)
 	}
 	return out
+}
+
+// validateSNMPClients (#4834) rejects a `clients` allowlist entry whose
+// Prefix does not parse as a CIDR/IP prefix (parseClientPrefix).
+//
+// A mistyped *prefix* is already fail-closed on its own: compileClientNets
+// silently drops the unparseable entry, which only ever shrinks the
+// allowlist. But parseSNMPClients treats ANY token that is not the exact
+// literal "restrict" as a new prefix entry — so a mistyped "restrict"
+// keyword (e.g. "restric") does not attach to the prefix immediately
+// before it and instead becomes its OWN unparseable entry. That silently
+// detaches "restrict" from a broad prefix: `0.0.0.0/0 restrict` (a Junos
+// deny-all-except idiom) degrades to a plain `0.0.0.0/0` allow, and the
+// community becomes answerable from any source with no commit warning —
+// the exact fail-open class #4289/#4711 set out to prevent, just reached
+// via a different typo.
+//
+// Rejecting every unparseable Prefix at commit time closes this: the typo
+// is caught before it can produce a silent allow-all, and a genuine
+// prefix typo now also gets a clear error instead of a silently-shrunk
+// allowlist. Strict (commit / commit-check): hard-reject, naming the bad
+// token. Lenient (load / peer-sync): warn so an already-persisted config
+// an older binary accepted still boots (#1960 fail-closed-on-load class);
+// compileClientNets keeps dropping the entry on that path, matching the
+// pre-#4834 behavior exactly.
+//
+// The message never includes the community NAME (a secret, per the
+// snmpInertKnobWarnings convention) — only the offending token, which is
+// an IP/CIDR literal or a keyword typo, not a credential.
+func validateSNMPClients(clients []SNMPClient, lenient bool) (warnings []string, err error) {
+	for _, cl := range clients {
+		if _, _, perr := parseClientPrefix(cl.Prefix); perr == nil {
+			continue
+		}
+		msg := fmt.Sprintf(
+			"snmp community clients entry %q is not a valid IP/CIDR prefix "+
+				"(if this was meant to be the \"restrict\" keyword, check for a "+
+				"typo — a malformed token here can silently detach \"restrict\" "+
+				"from the preceding prefix, turning a deny-except entry into an "+
+				"unrestricted allow)",
+			cl.Prefix)
+		if lenient {
+			warnings = append(warnings, msg+" (ignored: entry dropped from the allowlist)")
+			continue
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+	return warnings, nil
 }
