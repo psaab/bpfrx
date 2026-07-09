@@ -3650,6 +3650,107 @@ fn deterministic_napt64_v6_fixed_block_per_subscriber_reversible() {
     );
 }
 
+// #4863 RED-on-revert: deterministic NAPT64 must reject an IPv6 source that is
+// OUTSIDE the configured subscriber prefix even when it shares the same 32-bit
+// subscriber word as an in-prefix subscriber. Before the fix, the subscriber
+// index was derived from the word alone (no prefix membership check), so an
+// out-of-prefix source was accepted, mapped into the in-prefix subscriber's
+// fixed block, and reverse-mapped to the WRONG (configured-base) subscriber —
+// cross-tenant block assignment + a lying stateless reverse map. Reverting the
+// `src_octets[..off] != host_base[..off]` check in `deterministic_indices_v6`
+// turns the out-of-prefix asserts below RED (the source wrongly maps to
+// Some((0, 5)) / the allocation wrongly succeeds).
+#[test]
+fn deterministic_napt64_v6_rejects_out_of_prefix_shared_word() {
+    let pool = [
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 2),
+        Ipv4Addr::new(198, 51, 100, 3),
+        Ipv4Addr::new(198, 51, 100, 4),
+    ];
+    let base: Ipv6Addr = "2001:db8::".parse().unwrap();
+    let det = DeterministicV6 {
+        block_size: 512,
+        blocks_per_ip: 126,
+        host_prefix_len: 32,
+        host_base: base.octets(),
+        host_count: 4 * 126,
+    };
+
+    // (a) /32: the in-prefix subscriber 2001:db8:0:5:: -> word 5 -> Some((0, 5)).
+    assert_eq!(
+        deterministic_indices_v6(&det, "2001:db8:0:5::".parse().unwrap()),
+        Some((0, 5)),
+        "an in-prefix source keeps mapping to its subscriber block (no regression)"
+    );
+    // The bug case: 2001:db9:0:5:: shares the subscriber word (octets[4..8] = 5)
+    // but the /32 prefix differs (0db9 != 0db8) -> MUST be rejected, not mapped.
+    assert_eq!(
+        deterministic_indices_v6(&det, "2001:db9:0:5::".parse().unwrap()),
+        None,
+        "an out-of-prefix source sharing the subscriber word must be rejected"
+    );
+
+    // (b) /64: prefix is octets[0..8]. In-prefix 2001:db8::7:0:0 -> word 7.
+    let det64 = DeterministicV6 {
+        host_prefix_len: 64,
+        ..det
+    };
+    assert_eq!(
+        deterministic_indices_v6(&det64, "2001:db8::7:0:0".parse().unwrap()),
+        Some((0, 7)),
+        "an in-prefix /64 source maps to its subscriber block"
+    );
+    // 2001:db8:0:1:0:7:: shares octets[8..12] = 7 but the /64 prefix differs
+    // (octets[6..8] = 0001 != 0000) -> rejected.
+    assert_eq!(
+        deterministic_indices_v6(&det64, "2001:db8:0:1:0:7::".parse().unwrap()),
+        None,
+        "an out-of-prefix /64 source sharing the subscriber word must be rejected"
+    );
+
+    // End to end through the allocator: an out-of-prefix source must fail the
+    // allocation CLOSED (no external tuple handed out, so no lying reverse
+    // map), while the in-prefix source still allocates and reverses correctly.
+    let alloc = PortAllocator::new(pool.len(), 1024, 65535);
+    let flow_for = |src: &str| SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6(src.parse().expect("src")),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        src_port: 40001,
+        dst_port: 443,
+    };
+    assert!(
+        alloc
+            .allocate_deterministic_v6(
+                flow_for("2001:db9:0:5::"),
+                &pool,
+                det,
+                "2001:db9:0:5::".parse().unwrap()
+            )
+            .is_err(),
+        "the out-of-prefix source must not be translated into subscriber 5's block"
+    );
+    let ok = alloc
+        .allocate_deterministic_v6(
+            flow_for("2001:db8:0:5::"),
+            &pool,
+            det,
+            "2001:db8:0:5::".parse().unwrap(),
+        )
+        .expect("the in-prefix source still allocates");
+    let ext_ip = match ok.ip {
+        IpAddr::V4(v4) => v4,
+        other => panic!("NAT64 pool is always v4, got {other}"),
+    };
+    assert_eq!(ext_ip, pool[0], "in-prefix subscriber 5 maps to pool[0]");
+    assert_eq!(
+        reverse_deterministic_v6(&det, &pool, 1024, ext_ip, ok.port),
+        Some("2001:db8:0:5::".parse().unwrap()),
+        "the reverse map recovers the true in-prefix subscriber"
+    );
+}
+
 // === #2852 Phase 1: lock-free port-claim correctness =====================
 
 // #2852 FAIL-ON-REVERT: with the port claim lock-free (per-address atomic

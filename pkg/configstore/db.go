@@ -231,9 +231,27 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 
 // DeleteConfirm removes the pending commit-confirmed state file (#4577).
 // Absent is not an error.
+//
+// The removal is a DURABLE transition (#4864): after a successful unlink the
+// parent directory is fsynced so the directory-entry removal survives a
+// crash/power-loss. WriteConfirm persists confirm.json through
+// fsatomic.WriteFileDurable (temp + fsync + rename + dir fsync); without a
+// matching dir fsync here a *successful* unlink is not durable, so a crash in
+// the window before the dirent flushes can replay the stale confirm.json on
+// reboot — and recoverPendingConfirmLocked would then revert an
+// already-confirmed config (re-diverging a confirmed HA standby). The unlink
+// and dir fsync route through the package durability seams (rbRemove/rbSyncDir,
+// #3441) so a downgrade that drops the dir sync fails a test RED.
 func (db *DB) DeleteConfirm() error {
-	if err := os.Remove(db.confirmPath()); err != nil && !os.IsNotExist(err) {
+	if err := rbRemove(db.confirmPath()); err != nil {
+		if os.IsNotExist(err) {
+			// Already absent: nothing was unlinked, so no dir sync is needed.
+			return nil
+		}
 		return fmt.Errorf("delete confirm state: %w", err)
+	}
+	if err := rbSyncDir(filepath.Dir(db.confirmPath())); err != nil {
+		return fmt.Errorf("sync dir after delete confirm state: %w", err)
 	}
 	return nil
 }

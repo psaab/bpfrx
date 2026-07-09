@@ -499,6 +499,87 @@ func TestBuild_UserspaceBuffer_ClampedTo100(t *testing.T) {
 	}
 }
 
+// #4875: Online requires positive, in-window heartbeat evidence.  An
+// empty heartbeat set (worker startup / wire-version drift omitting the
+// field) and a future-dated heartbeat (malformed clock conversion) must
+// NOT read as Online — both were previously treated as "trivially
+// fresh" and fell straight through to Online (false-green).
+
+func TestBuild_Degraded_EmptyHeartbeats(t *testing.T) {
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			// No heartbeats published yet.
+			WorkerHeartbeats: []time.Time{},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if fs.State == StateOnline {
+		t.Errorf("empty heartbeats: state %q, must not be Online", fs.State)
+	}
+	if fs.State != StateDegraded {
+		t.Errorf("empty heartbeats: state %q, want Degraded", fs.State)
+	}
+}
+
+func TestBuild_Degraded_NilHeartbeats(t *testing.T) {
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		// WorkerHeartbeats field omitted entirely (nil slice).
+		status: userspace.ProcessStatus{},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if fs.State == StateOnline {
+		t.Errorf("nil heartbeats: state %q, must not be Online", fs.State)
+	}
+	if fs.State != StateDegraded {
+		t.Errorf("nil heartbeats: state %q, want Degraded", fs.State)
+	}
+}
+
+func TestBuild_Degraded_FutureHeartbeat(t *testing.T) {
+	now := time.Now()
+	dp := &fakeUserspaceDP{
+		fakeDP: fakeDP{loaded: true},
+		status: userspace.ProcessStatus{
+			WorkerHeartbeats: []time.Time{
+				now.Add(-100 * time.Millisecond),
+				now.Add(30 * time.Second), // malformed/future conversion
+			},
+		},
+	}
+	fs, _ := Build(dp, freshProcReader(), time.Now(), SamplerSnapshot{})
+	if fs.State == StateOnline {
+		t.Errorf("future heartbeat: state %q, must not be Online", fs.State)
+	}
+	if fs.State != StateDegraded {
+		t.Errorf("future heartbeat: state %q, want Degraded", fs.State)
+	}
+}
+
+func TestHeartbeatsHealthy(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cases := []struct {
+		name string
+		hbs  []time.Time
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty", []time.Time{}, false},
+		{"one-fresh", []time.Time{now.Add(-100 * time.Millisecond)}, true},
+		{"all-fresh", []time.Time{now.Add(-100 * time.Millisecond), now.Add(-1 * time.Second)}, true},
+		{"one-stale", []time.Time{now.Add(-100 * time.Millisecond), now.Add(-5 * time.Second)}, false},
+		{"boundary-eq-maxage", []time.Time{now.Add(-2 * time.Second)}, true},
+		{"future", []time.Time{now.Add(1 * time.Second)}, false},
+		{"future-among-fresh", []time.Time{now.Add(-100 * time.Millisecond), now.Add(500 * time.Millisecond)}, false},
+	}
+	for _, tc := range cases {
+		if got := heartbeatsHealthy(tc.hbs, now, 2*time.Second); got != tc.want {
+			t.Errorf("%s: heartbeatsHealthy=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // (Cluster-mode rendering moved to the gRPC handler in #879;
 // fwdstatus.Build no longer takes a clusterMode flag. Cluster
 // composition tests live in pkg/grpcapi/.)
