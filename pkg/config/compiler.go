@@ -1330,6 +1330,22 @@ type compileOpts struct {
 	// advertise an out-of-range VRID, so a leniently-loaded bad id is bounded,
 	// not a wrong-VRID advert. Same doctrine as lenientChassisRG.
 	lenientVRRPGroupID bool
+	// lenientRethVRRPGroupID (#4826) downgrades the reth-derived VRRP VRID
+	// wire-width gate (validateRethVRRPGroupIDStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `redundant-ether-options redundancy-group <id>` whose
+	// id would push the reth-derived VRRP GroupID (100+id) past the RFC 5798
+	// VRID range 1..255 — the chassis redundancy-group id gate
+	// (validateChassisClusterStrict) alone permits id up to 255, which is
+	// the heartbeat wire bound, not the VRRP one, so an id in 156..255 used
+	// to commit cleanly and then silently lose VRRP for that redundancy
+	// group. The tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the pkg/vrrp/manager.go runtime range check independently
+	// refuses to advertise the out-of-range VRID, so a leniently-loaded bad
+	// id is bounded, not a wrong-VRID advert. Same doctrine as
+	// lenientVRRPGroupID.
+	lenientRethVRRPGroupID bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1674,6 +1690,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFlowAging:                       true,
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
+		lenientRethVRRPGroupID:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -1924,6 +1941,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFlowAging:                       true,
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
+		lenientRethVRRPGroupID:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
