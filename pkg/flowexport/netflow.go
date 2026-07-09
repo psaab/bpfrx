@@ -702,6 +702,26 @@ func (e *Exporter) BatchMaxDepth() uint64 { return e.batch.MaxDepth() }
 // without bound.
 func (e *Exporter) BatchDropped() uint64 { return e.batch.Dropped() }
 
+// Retire quiesces the exporter's batch admission lease ahead of the final
+// flush that Run performs on ctx cancel. It flips the batch to retired and
+// waits for in-flight session-close adds to finish (so those records are still
+// drained by the final flush), after which any late session-close callback
+// that loaded the pre-reconcile bundle is rejected and counted rather than
+// silently stranded (#4963). The daemon reconcile calls this on the OLD
+// exporter generation AFTER publishing the new bundle and BEFORE cancelling
+// the old Run.
+func (e *Exporter) Retire() { e.batch.retire() }
+
+// HandoffDropped returns the count of session-close records this exporter
+// rejected because they arrived after it was retired (#4963).
+func (e *Exporter) HandoffDropped() uint64 { return e.batch.HandoffDropped() }
+
+// SetHandoffCounter injects a fixed-cardinality family-level counter that the
+// batch also increments on a handoff reject, so drops on a retired-and-
+// discarded exporter stay observable after it leaves the live bundle (#4963).
+// Called once at construction before Run starts.
+func (e *Exporter) SetHandoffCounter(c *atomic.Uint64) { e.batch.setSharedHandoff(c) }
+
 // Stats returns export statistics.
 func (e *Exporter) Stats() (flows, packets uint64) {
 	return e.exportedFlows.Load(), e.exportedPkts.Load()

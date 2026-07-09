@@ -200,15 +200,24 @@ type Daemon struct {
 	// when a reconcile's NewExporter build failed and the OLD exporters were
 	// kept running so export stayed up; cleared on the next successful
 	// reconcile. Surfaced via FlowExportError().
-	flowExportErr  error
-	ipfixBundlePtr atomic.Pointer[ipfixBundle]
-	ipfixHash      [32]byte
-	ipfixHashSet   bool
-	ipfixCBOnce    sync.Once
-	ipfixReconMu   sync.Mutex
-	ipfixExportErr error
-	dhcpRelay      *dhcprelay.Manager
-	snmpAgent      *snmp.Agent
+	flowExportErr error
+	// #4963 fixed-cardinality handoff-drop totals. Each exporter of a family
+	// is injected (SetHandoffCounter) with a pointer to the matching counter
+	// here, so a session-close record rejected because it reached an exporter
+	// that was already retired during a reconcile (loaded the pre-swap bundle
+	// too late) is counted at ONE stable location per family regardless of how
+	// many exporter generations have come and gone — the record is no longer
+	// silently stranded. Surfaced via FlowExportHandoffDropped().
+	flowHandoffDropped  atomic.Uint64
+	ipfixHandoffDropped atomic.Uint64
+	ipfixBundlePtr      atomic.Pointer[ipfixBundle]
+	ipfixHash           [32]byte
+	ipfixHashSet        bool
+	ipfixCBOnce         sync.Once
+	ipfixReconMu        sync.Mutex
+	ipfixExportErr      error
+	dhcpRelay           *dhcprelay.Manager
+	snmpAgent           *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in

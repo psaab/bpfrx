@@ -43955,3 +43955,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4961 scope RA supersession per-interface — WithdrawInterfaces/WithdrawOnce bump a per-interface epoch (ifaceEpoch) instead of the whole-manager fence; releaseDrain restart + applyDeferred check the per-interface baseline (drainEntry.startIfaceEpoch) so an unrelated withdraw of interface B no longer cancels interface A's in-flight restart (IPv6 loss)
   **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4963 stop flow-export session-close records being silently stranded when a callback loaded the pre-reconcile bundle just before it was retired. Added an allocation-free admission lease to flowBatch (retired flag + inflight atomic + handoffDropped counter + injected fixed-cardinality family counter). add() rejects+counts a post-retire record instead of appending it into a batch nothing drains; Exporter/IPFIXExporter.Retire() (called before cancel in both reconcile swap + teardown paths) drains in-flight admits so records admitted before the final flush are still flushed. Surfaced HandoffDropped in ExporterBatchStats + Daemon.FlowExportHandoffDropped().
+  **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go, pkg/flowexport/handoff_lease_4963_test.go, pkg/flowexport/README.md, pkg/daemon/daemon.go, pkg/daemon/daemon_flowexport.go
