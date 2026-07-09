@@ -20,6 +20,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -242,10 +243,22 @@ func (p *probePinManager) Apply(pins []ProbePin) map[string]error {
 // clear removes all ip rules in the probe-pin priority band and flushes
 // every route in the reserved probe tables (both families). Run at
 // daemon startup as well so a crashed daemon never leaks stale pins.
+//
+// A RuleList/RouteListFiltered dump failure is aggregated and returned
+// (errors.Join, mirroring the pattern in rules.go) rather than silently
+// skipped (#4822): a swallowed dump failure meant clear()'s wired-up
+// error return could never fire, so Apply()'s caller had no way to detect
+// an incomplete band clear (stale rules/routes from a removed pin can
+// survive and mis-route a later probe cycle). Per-item RuleDel/RouteDel
+// failures on an item we DID enumerate stay Debug-only best-effort — the
+// band clear() on the NEXT apply remains the backstop for those, same as
+// before.
 func (p *probePinManager) clear() error {
+	var errs []error
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
 		rules, err := p.ops.RuleList(family)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("rule list (family %d): %w", family, err))
 			continue
 		}
 		for _, r := range rules {
@@ -261,6 +274,7 @@ func (p *probePinManager) clear() error {
 			routes, err := p.ops.RouteListFiltered(family,
 				&netlink.Route{Table: table}, netlink.RT_FILTER_TABLE)
 			if err != nil {
+				errs = append(errs, fmt.Errorf("route list (family %d, table %d): %w", family, table, err))
 				continue
 			}
 			for i := range routes {
@@ -271,5 +285,5 @@ func (p *probePinManager) clear() error {
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

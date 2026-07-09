@@ -43736,3 +43736,7 @@ top.
   **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go, pkg/ra/timer_leak_4830_test.go
   **Action**: Fix #4810 — loadRollbackHistory skipped an unreadable/corrupt intermediate rollback slot with a bare `continue`, collapsing every later slot's positional index down by one, so `rollback N` silently resolved to slot N+1's config; push a tombstone (nil-Config) HistoryEntry to preserve position==slot-number, add Store.rollbackEntry() to reject a tombstoned slot with a clear error (used by Rollback + all ShowRollback*/ShowCompareRollback* readers), and guard saveRollbackFiles against writing/dereferencing a tombstone on the next commit; add RED-on-revert tests for the index-shift, the Rollback(n) end-to-end symptom, and the save-side nil-deref panic risk
   **File(s)**: pkg/configstore/store_commit.go, pkg/configstore/store_format.go, pkg/configstore/durability_3441_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix #4822 — probePinManager.clear() swallowed RuleList/RouteListFiltered netlink dump errors with a bare `continue` and always returned nil, making Apply()'s wired-up error-log dead code; aggregate dump errors with errors.Join (mirroring pkg/routing/rules.go) so a failed dump is observable while per-item RuleDel/RouteDel failures on successfully-enumerated items stay Debug-only best-effort (unchanged); add RED-on-revert tests for both dump-failure paths plus a partial-failure test proving the other family's band still gets reclaimed
+  **File(s)**: pkg/routing/probe_pin.go, pkg/routing/probe_pin_test.go
