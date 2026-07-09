@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,9 +100,32 @@ func newHTTPClientBound(b bindConfig) *http.Client {
 		tr.DialContext = d.DialContext
 	}
 	return &http.Client{
-		Timeout:   httpClientTimeout,
-		Transport: tr,
+		Timeout:       httpClientTimeout,
+		Transport:     tr,
+		CheckRedirect: refuseSchemeDowngrade,
 	}
+}
+
+// refuseSchemeDowngrade is the shared *http.Client.CheckRedirect for every HTTP
+// DDNS backend. It refuses an HTTPS->HTTP redirect downgrade (#4861): a
+// credentialed backend (dyndns2 Basic auth, DuckDNS/Cloudflare query/bearer
+// token, Route 53 SigV4) that started over TLS must never be walked onto a
+// plaintext connection by a 30x Location, which would put the update credential
+// on the wire in cleartext for an on-path attacker. Same-scheme redirects and
+// an HTTP->HTTPS upgrade are still followed. The default 10-redirect cap is
+// re-implemented here because setting CheckRedirect replaces Go's built-in cap.
+func refuseSchemeDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("ddns http: stopped after 10 redirects")
+	}
+	if len(via) > 0 {
+		prev := via[len(via)-1].URL
+		if strings.EqualFold(prev.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+			return fmt.Errorf("ddns http: refusing HTTPS->%s redirect downgrade to %s "+
+				"(would expose update credentials in cleartext)", req.URL.Scheme, req.URL.Host)
+		}
+	}
+	return nil
 }
 
 // httpClientCache caches the hardened *http.Client (and its underlying
