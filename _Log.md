@@ -43730,3 +43730,7 @@ top.
   **File(s)**: pkg/logging/syslog.go, pkg/logging/syslog_close_resurrection_4806_test.go
   **Action**: Fix #4807 — interface-range member-range int64-overflow panic (`en-sn+1` wrapped negative for a huge trailing end integer, bypassing the 4096-member cap and reaching `make()` with a negative capacity); compare `en-sn >= interfaceRangeMaxMembers` before the `+1` so the guard cannot overflow; add RED-on-revert tests reproducing the exact `math.MaxInt64`-adjacent reproducer
   **File(s)**: pkg/config/compiler_interface_range.go, pkg/config/compiler_interface_range_4027_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix #4830 — pkg/ra time.After inside select leaked the underlying Timer in the runtime's timer heap until it fired (up to claimWaitTimeout/timeout) whenever the OTHER select case won first, in releaseDrain (ra.go) and sender.waitConnReady (sender.go); replaced both with time.NewTimer + defer Stop(); added a source-pattern RED-on-revert guard (no direct timer-count test is possible) plus fast-path/timeout behavior tests for waitConnReady
+  **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go, pkg/ra/timer_leak_4830_test.go

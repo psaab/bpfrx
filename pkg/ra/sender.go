@@ -220,10 +220,16 @@ func (s *sender) signalConnReady(opened bool) {
 // (#2834). It NEVER holds m.mu: the wait is the async socket-open latency, which
 // must not serialize other RA manager operations.
 func (s *sender) waitConnReady(timeout time.Duration) bool {
+	// #4830: time.After inside a select leaks its Timer in the runtime's
+	// timer heap until it fires (up to `timeout`) whenever the OTHER case
+	// (s.connReady) wins the select first — which is the common, fast path
+	// here. time.NewTimer + a deferred Stop reclaims it immediately instead.
+	t := time.NewTimer(timeout)
+	defer t.Stop()
 	select {
 	case <-s.connReady:
 		return s.connOpened.Load()
-	case <-time.After(timeout):
+	case <-t.C:
 		return false
 	}
 }
