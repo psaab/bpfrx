@@ -43664,3 +43664,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4407 Increment 3 — extract applyFabricIPVLAN (fabric-member IPVLAN overlays + userspace-DP deferral + stale-overlay cleanup, 99 lines) from applyConfigLocked; pure void byte-identical (no return/ctx/crossing-state per compile-check)
   **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4407 Increment 4 — extract applyRoutingRules (FRR + next-table PBR + rib-group + firewall-filter PBR, 67 lines) from applyConfigLocked; pure void byte-identical (no early return; cfg + commitOverlay inputs). Decoupled from the dataplane-apply state
+  **File(s)**: pkg/daemon/daemon_apply.go
