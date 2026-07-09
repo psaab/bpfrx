@@ -719,47 +719,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// 0.6. Program default routes in the management VRF for DHCP leases.
 	d.applyMgmtVRFRoutes()
 
-	// 1. Create tunnel interfaces (interface-level + per-unit tunnels)
-	if d.routing != nil {
-		if err := d.routing.ApplyTunnels(collectAppliedTunnels(cfg)); err != nil {
-			slog.Warn("failed to apply tunnels", "err", err)
-		}
-	}
-
-	// 1.5. Create xfrmi interfaces for IPsec VPN tunnels.
-	// Must happen before BPF compilation so compileZones() can discover
-	// the xfrmi interfaces and map them to security zones.
-	// Always call ApplyXfrmi so stale xfrmi devices are removed when VPNs
-	// are deleted from config.
-	if d.routing != nil {
-		if err := d.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
-			slog.Warn("failed to apply xfrmi interfaces", "err", err)
-		}
-	}
-
-	// 1.7. Create bond (LAG) interfaces for fabric-options member-interfaces.
-	// Always call ApplyBonds (even with empty list) so stale bonds from
-	// previous configs get cleaned up via ClearBonds().
-	if d.routing != nil {
-		var bondIfaces []*config.InterfaceConfig
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc == nil {
-				continue
-			}
-			if len(ifc.FabricMembers) > 0 {
-				bondIfaces = append(bondIfaces, ifc)
-			}
-		}
-		if err := d.routing.ApplyBonds(bondIfaces); err != nil {
-			slog.Warn("failed to apply bonds", "err", err)
-		}
-	}
-
-	// 1.8. Clean up legacy RETH bond devices from previous binary versions.
-	// VRRP now runs directly on physical member interfaces — no bonds needed.
-	if d.routing != nil {
-		d.routing.ClearRethInterfaces()
-	}
+	d.applyInterfaceReconcile(cfg)
 
 	// 1.9. Create IPVLAN interfaces for fabric members (fab0, fab1).
 	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
@@ -1443,6 +1403,58 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// helper creates lo0Err/hostInboundErr and returns the identical
 	// five-way errors.Join.
 	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyInterfaceReconcile creates/reconciles the interface-level network
+// devices during a config apply: tunnel interfaces (interface + per-unit),
+// xfrmi interfaces for IPsec VPNs (before BPF compilation so compileZones can
+// map them to zones), fabric bond/LAG member interfaces, and cleanup of legacy
+// RETH bond devices. Extracted verbatim from applyConfigLocked (#4407); all
+// steps are idempotent reconciles (unchanged config = no-op) that log-and-
+// continue on error, so there is no crossing output and no early return. Runs
+// in the same slot, after the VRF reconcile and before fabric IPVLAN creation.
+func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) {
+	// 1. Create tunnel interfaces (interface-level + per-unit tunnels)
+	if d.routing != nil {
+		if err := d.routing.ApplyTunnels(collectAppliedTunnels(cfg)); err != nil {
+			slog.Warn("failed to apply tunnels", "err", err)
+		}
+	}
+
+	// 1.5. Create xfrmi interfaces for IPsec VPN tunnels.
+	// Must happen before BPF compilation so compileZones() can discover
+	// the xfrmi interfaces and map them to security zones.
+	// Always call ApplyXfrmi so stale xfrmi devices are removed when VPNs
+	// are deleted from config.
+	if d.routing != nil {
+		if err := d.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
+			slog.Warn("failed to apply xfrmi interfaces", "err", err)
+		}
+	}
+
+	// 1.7. Create bond (LAG) interfaces for fabric-options member-interfaces.
+	// Always call ApplyBonds (even with empty list) so stale bonds from
+	// previous configs get cleaned up via ClearBonds().
+	if d.routing != nil {
+		var bondIfaces []*config.InterfaceConfig
+		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil {
+				continue
+			}
+			if len(ifc.FabricMembers) > 0 {
+				bondIfaces = append(bondIfaces, ifc)
+			}
+		}
+		if err := d.routing.ApplyBonds(bondIfaces); err != nil {
+			slog.Warn("failed to apply bonds", "err", err)
+		}
+	}
+
+	// 1.8. Clean up legacy RETH bond devices from previous binary versions.
+	// VRRP now runs directly on physical member interfaces — no bonds needed.
+	if d.routing != nil {
+		d.routing.ClearRethInterfaces()
+	}
 }
 
 // applyTailReconciles runs steps 8–21 of applyConfigLocked — the tail of the
