@@ -512,6 +512,16 @@ outside the monitor loop:
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).
+- **`Manager.Start` must NOT hold `m.mu` across the monitor's `Stop()` (#4828).**
+  The `Monitor` poll goroutine calls back into `SetMonitorWeight`, which takes
+  `m.mu`; `Stop()` joins that goroutine via `wg.Wait()`. Holding `m.mu` while
+  waiting for the goroutine to exit is an AB-BA deadlock (any config reload
+  racing a monitor state-change permanently freezes the manager). `Start`
+  therefore serializes on a dedicated `monStartMu`, takes `m.mu` ONLY to swap
+  the `m.monitor` pointer, then runs the old `Stop()` / new `Start()` outside
+  `m.mu`. This mirrors the `hbStartMu` discipline `StartHeartbeat` uses for the
+  same reason (#4033). Any future method that both takes `m.mu` and joins a
+  goroutine that re-enters the manager must follow the same split.
 - The incremental sync sweep (`sync_conn.go`) re-syncs a session ONLY on
   `val.Created >= threshold` — it deliberately does NOT re-publish an
   established flow on `LastSeen` activity (#270 narrowed this; #131's
