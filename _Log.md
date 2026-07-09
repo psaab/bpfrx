@@ -43585,3 +43585,35 @@ top.
   concurrency-consistency stress. cargo build clean; new tests pass.
 - **File(s)**: userspace-dp/src/nat/allocator.rs,
   userspace-dp/src/nat/tests_pool.rs, _Log.md
+
+- **Timestamp**: 2026-07-09 (issue #4743, fix/4743-dp-drop-counters)
+- **Action**: Add two userspace-dp observability drop counters (A/A). (1)
+  `martian_dropped` — a strict sub-breakout of `route_miss_packets`: the NoRoute
+  disposition arm (`disposition.rs record_forwarding_disposition`) now also bumps
+  `martian_dropped` when the resolution destination is a martian address
+  (`is_martian_dst`: IPv4 mcast/bcast/unspec/loopback, IPv6 mcast/unspec/loopback).
+  (2) `ipv6_ext_header_dropped` — an over-limit IPv6 extension-header chain (still
+  on an ext header after MAX_IPV6_EXT_HEADERS) is now an EXPLICIT fail-closed drop
+  at the flow-parse stage (`poll_descriptor` via `ipv6_ext_chain_over_limit` +
+  `ipv6_ext_header_over_limit_drop`) instead of being forwarded flowless
+  (l4 IDS-evasion), and counted. Full plumbing mirrors nat64_frag_dropped:
+  BindingLiveState atomic -> BatchCounters flush -> BindingLiveSnapshot -> Rust +
+  Go BindingStatus wire field (tag-matched) -> summed as "Martian drops:" /
+  "IPv6 ext-header drops:" status rows. No shim/GlobalCtr map-ABI change. Verified:
+  NoRoute already counts route_miss_packets on the hot path (poll_descriptor:5368),
+  so #1 adds the martian breakout rather than a redundant NoRoute counter.
+  RED-on-revert unit tests for both; full cargo test --release + go test green;
+  golden status fixture regenerated.
+- **File(s)**: userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/afxdp/disposition.rs,
+  userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs, userspace-dp/src/afxdp/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status_sections.go,
+  pkg/dataplane/userspace/format/status_golden_test.go,
+  pkg/dataplane/userspace/format/testdata/status_summary.golden,
+  docs/junos-cli-reference.md, _Log.md
