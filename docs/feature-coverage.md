@@ -224,7 +224,17 @@ the userspace dataplane admission boundary is in
   without those labels the rows collide on an identical `{protocol,
   collector, source}` labelset and Prometheus either rejects the duplicate
   (scrape error) or silently collapses the failing group.
-- **Prometheus metrics** (`/metrics` endpoint).
+- **Prometheus metrics** (`/metrics` endpoint). Two kernel-nftables surfaces
+  are scraped independent of dataplane load (emitted before the dataplane gate,
+  so they stay visible in a config-only / degraded boot):
+  `xpf_host_inbound_kernel_denies_total{zone,family}` (host-inbound catch-all
+  DROP counters) and `xpf_lo0_counter_hits_total{counter}` (#4422 — lo0
+  loopback input-filter `then count` hits from the `inet xpf_lo0` chain,
+  DISTINCT from the userspace fast-path `xpf_filter_hits_total`). Policy-based
+  routing (filter-based-forwarding) build health is exported as the
+  config-derived gauges `xpf_pbr_rules_installed` and `xpf_pbr_degraded_terms`
+  (#4422 — the count of routing-instance filter terms dropped from the kernel
+  FBF mirror by the fail-closed under-steer rule; see `docs/multi-wan.md`).
 - **SNMP**: system + ifTable MIB. Community `clients` source-IP restriction
   ENFORCED (#4289): `snmp community <c> clients { <prefix> [restrict]; }`
   scopes a community to the listed source prefixes — a v2c query from a source

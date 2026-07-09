@@ -97,6 +97,13 @@ func TestCollectDoesNotFalseAlertOnZoneReads(t *testing.T) {
 	orig := readHostInboundDenyCounters
 	readHostInboundDenyCounters = func() ([]xnft.HostInboundDenyCount, error) { return nil, nil }
 	defer func() { readHostInboundDenyCounters = orig }()
+	// #4422: neutralize the pre-gate kernel lo0 counter read too, for the same
+	// reason as the host-inbound read above — a sandbox without live nft/netlink
+	// would otherwise return a read error and bump counterReadErrors, masking the
+	// per-zone false-alert this test isolates.
+	origLo0 := readLo0Counters
+	readLo0Counters = func() ([]xnft.Lo0Count, error) { return nil, nil }
+	defer func() { readLo0Counters = origLo0 }()
 
 	store := newDescriptorCoverageStore(t)
 	srv := &Server{store: store, gc: conntrack.NewGC(nil, time.Minute), startTime: time.Now()}

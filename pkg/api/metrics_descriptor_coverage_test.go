@@ -531,6 +531,8 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_daemon_neighbor_periodic_last_success_age_seconds",            // #1780 neighbor watchdog
 		"xpf_ipmon_policy_failed",                                          // #1827 ip-monitoring
 		"xpf_frr_reload_degraded",                                          // #1880 FRR degraded reload
+		"xpf_pbr_rules_installed",                                          // #4422 PBR/FBF build health
+		"xpf_pbr_degraded_terms",                                           // #4422 PBR/FBF degraded terms
 		"xpf_userspace_worker_dead",                                        // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total",                  // cold-path v3
 		"xpf_cos_drain_invocations_total",                                  // CoS owner profile

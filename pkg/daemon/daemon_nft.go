@@ -144,8 +144,10 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) error {
 // `then count`), so redeclaring them on the next commit would collide
 // ("File exists"); delete+recreate guarantees each counter is declared exactly
 // once and leaves no stale counter for a removed term. A consequence is that the
-// lo0 counters reset to zero on every rebuild (every commit / DHCP re-render) —
-// nothing scrapes them so there is no metric impact. nft parses an `-f -`
+// lo0 counters reset to zero on every rebuild (every commit / DHCP re-render);
+// since #4422 they are scraped as xpf_lo0_counter_hits_total (pkg/nftables
+// ReadLo0Counters → pkg/api collectLo0Counters), and Prometheus rate() handles
+// the reset the same way it does for the host-inbound deny counters. nft parses an `-f -`
 // payload atomically, so a syntax error on any line rejects the ENTIRE payload.
 // (The pre-#2069 `flush ruleset inet xpf_lo0` was NOT valid nft and made the
 // filter fail OPEN; the delete+recreate idiom is unconditionally valid.)

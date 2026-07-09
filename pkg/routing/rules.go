@@ -724,6 +724,45 @@ func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 	return rules, errors.Join(errs...)
 }
 
+// PBRBuildStats returns observability counts derived from BuildPBRRules for the
+// active config (#4422). It is a pure function of cfg (no netlink), safe to call
+// on the Prometheus scrape path — the same posture as the config-derived
+// host-inbound addressless collectors.
+//
+//   - installed: the number of kernel `ip rule` FBF entries the
+//     routing-instance filter terms yield (post-truncation to the maxPBRRules
+//     priority window). This is the desired-install count; ApplyPBRRules
+//     installs exactly this set (a later netlink failure there is a separate,
+//     logged concern).
+//   - degraded: the number of routing-instance filter terms DROPPED from the
+//     kernel FBF mirror (fail-closed under-steer to the main table) — an
+//     unrepresentable `except` set, a DSCP-0 match, a contradictory
+//     `routing-instance` + `discard`/`reject` term (#4534), an
+//     ip-rule-unrepresentable L4/per-packet predicate (#3730), or the
+//     maxPBRRules overflow (#3430 M3, counted as one condition). A non-zero
+//     value means the kernel slow path under-steers vs the userspace fast path
+//     (which still enforces every term exactly).
+//
+// There is deliberately no "widened" count: BuildPBRRules REFUSES to widen an
+// unrepresentable match to an address-only over-steer (fail-closed drop), so an
+// over-steer is never mirrored — the "widened" audit state does not exist by
+// design.
+func PBRBuildStats(cfg *config.Config) (installed, degraded int) {
+	rules, err := BuildPBRRules(cfg)
+	installed = len(rules)
+	if err != nil {
+		// BuildPBRRules returns errors.Join(errs...); its joinError exposes the
+		// per-term error slice via Unwrap() []error, so the count of degraded
+		// terms is exact. The single-error fallback is defensive only.
+		if u, ok := err.(interface{ Unwrap() []error }); ok {
+			degraded = len(u.Unwrap())
+		} else {
+			degraded = 1
+		}
+	}
+	return installed, degraded
+}
+
 // collectAttachedInputFilters returns the set of filter names attached as an
 // interface-unit INPUT filter, split by family. These are the only filters
 // whose `then routing-instance` terms take effect as Junos FBF (#3430 H1).

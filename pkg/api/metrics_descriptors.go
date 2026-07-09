@@ -165,6 +165,53 @@ func newCollector(srv *Server) *xpfCollector {
 				"address and family.",
 			[]string{"address", "family"}, nil,
 		),
+		// #4422: per-`then count` hit counters for the kernel lo0 loopback input
+		// filter (`inet xpf_lo0` table). lo0 host-inbound traffic is enforced by
+		// the KERNEL nftables chain (not the userspace fast path), so its
+		// firewall-filter `then count <name>` counts live in nft named-counter
+		// objects, DISTINCT from xpf_filter_hits_total (which merges the
+		// userspace-dp fast-path per-term hits for data-interface filters,
+		// including FBF steering). Before #4422 nothing scraped the lo0 counters.
+		// The table is installed independent of dataplane load, so this is a
+		// control-plane signal emitted BEFORE the dataplane gate. The counter
+		// object is shared by name across terms/families (Junos named-counter
+		// semantics), so the series is labeled by the count name only. Counters
+		// reset on every table rebuild (commit / DHCP re-render); rate() handles
+		// the reset. On a read failure the series is skipped (no misleading 0) and
+		// xpf_counter_read_errors_total is bumped.
+		lo0CounterHits: prometheus.NewDesc(
+			"xpf_lo0_counter_hits_total",
+			"Total lo0 loopback input-filter hits by firewall-filter `then count` "+
+				"name, read from the kernel nftables lo0 chain (distinct from the "+
+				"userspace-dp xpf_filter_hits_total fast-path counters).",
+			[]string{"counter"}, nil,
+		),
+		// #4422: policy-based-routing (filter-based-forwarding) build health.
+		// xpf_pbr_rules_installed is the number of kernel `ip rule` FBF entries
+		// the active config's routing-instance filter terms yield (the
+		// desired-install set). Config-derived (routing.PBRBuildStats, a pure
+		// function of config), emitted BEFORE the dataplane gate.
+		pbrRulesInstalled: prometheus.NewDesc(
+			"xpf_pbr_rules_installed",
+			"Number of kernel ip-rule filter-based-forwarding entries the active "+
+				"config's routing-instance filter terms yield (#4422).",
+			nil, nil,
+		),
+		// #4422: number of routing-instance filter terms DROPPED from the kernel
+		// FBF mirror (fail-closed under-steer to the main table) — an
+		// unrepresentable except set, a DSCP-0 match, a contradictory
+		// routing-instance+discard/reject term (#4534), an ip-rule-unrepresentable
+		// L4/per-packet predicate (#3730), or the priority-window overflow (#3430
+		// M3). Non-zero means the kernel slow path under-steers vs the userspace
+		// fast path (which still enforces every term exactly). There is no
+		// "widened" state — the builder refuses to widen an unrepresentable match.
+		pbrDegradedTerms: prometheus.NewDesc(
+			"xpf_pbr_degraded_terms",
+			"Number of routing-instance filter terms dropped from the kernel "+
+				"filter-based-forwarding mirror (fail-closed under-steer), because "+
+				"the term carries a predicate an ip rule cannot express (#4422).",
+			nil, nil,
+		),
 		tcEgressPacketsTotal: prometheus.NewDesc(
 			"xpf_tc_egress_packets_total",
 			"Total TC egress packets processed.",

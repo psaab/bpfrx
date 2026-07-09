@@ -1622,6 +1622,60 @@ func TestBuildPBRRules_OtherInterfaceUnaffected(t *testing.T) {
 	}
 }
 
+// TestPBRBuildStats pins the #4422 observability contract: PBRBuildStats returns
+// the installed ip-rule count and the count of routing-instance filter terms
+// DROPPED from the kernel FBF mirror (fail-closed under-steer), matching what
+// BuildPBRRules produces. These feed the xpf_pbr_rules_installed /
+// xpf_pbr_degraded_terms gauges.
+func TestPBRBuildStats(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "ATT", TableID: 101},
+	}
+
+	t.Run("nil config is zero", func(t *testing.T) {
+		if installed, degraded := PBRBuildStats(nil); installed != 0 || degraded != 0 {
+			t.Errorf("PBRBuildStats(nil) = %d/%d, want 0/0", installed, degraded)
+		}
+	})
+
+	t.Run("installed counts built rules", func(t *testing.T) {
+		filter := &config.FirewallFilter{
+			Name: "fbf",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "a", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "ATT"},
+				{Name: "b", DestAddresses: []string{"192.168.0.0/16"}, RoutingInstance: "ATT"},
+			},
+		}
+		installed, degraded := PBRBuildStats(pbrTestConfig("inet", filter, instances, nil))
+		if installed != 2 {
+			t.Errorf("installed = %d, want 2", installed)
+		}
+		if degraded != 0 {
+			t.Errorf("degraded = %d, want 0", degraded)
+		}
+	})
+
+	t.Run("degraded counts dropped contradictory terms", func(t *testing.T) {
+		// Two contradictory routing-instance+deny terms (#4534) are each dropped
+		// from the FBF mirror with a surfaced error, plus one valid steering term.
+		filter := &config.FirewallFilter{
+			Name: "mixed",
+			Terms: []*config.FirewallFilterTerm{
+				{Name: "ok", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "ATT"},
+				{Name: "bad1", SourceAddresses: []string{"10.0.2.0/24"}, RoutingInstance: "ATT", Action: "discard"},
+				{Name: "bad2", SourceAddresses: []string{"10.0.3.0/24"}, RoutingInstance: "ATT", Action: "reject"},
+			},
+		}
+		installed, degraded := PBRBuildStats(pbrTestConfig("inet", filter, instances, nil))
+		if installed != 1 {
+			t.Errorf("installed = %d, want 1 (only the valid term steers)", installed)
+		}
+		if degraded != 2 {
+			t.Errorf("degraded = %d, want 2 (both contradictory terms dropped)", degraded)
+		}
+	})
+}
+
 // TestCollectAttachedInputFilters pins the attachment-collection contract that
 // per-interface FBF scoping rests on (#4422): only interface-unit INPUT filters
 // are collected, split by family; OUTPUT filters are excluded; and the same
