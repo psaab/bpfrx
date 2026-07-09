@@ -32,7 +32,7 @@ func TestClearDHCPIdentifiers_ChunkedBody_ClearsSingleInterface(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/dhcp/identifiers/clear",
-		strings.NewReader(`{"interface":"ge-0/0/0.0"}`))
+		strings.NewReader(`{"interface":"ge-0-0-0.50"}`))
 	req.ContentLength = -1 // simulate Transfer-Encoding: chunked
 
 	s.clearDHCPIdentifiersHandler(rr, req)
@@ -41,7 +41,7 @@ func TestClearDHCPIdentifiers_ChunkedBody_ClearsSingleInterface(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "DHCPv6 DUID cleared for ge-0/0/0.0") {
+	if !strings.Contains(body, "DHCPv6 DUID cleared for ge-0-0-0.50") {
 		t.Fatalf("chunked clear-one request did not clear the named interface "+
 			"(likely fell through to clear-all — #4794): %s", body)
 	}
@@ -58,7 +58,7 @@ func TestClearDHCPIdentifiers_KnownLengthBody_Unchanged(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/v1/dhcp/identifiers/clear",
-		strings.NewReader(`{"interface":"ge-0/0/0.0"}`))
+		strings.NewReader(`{"interface":"ge-0-0-0.50"}`))
 	// httptest.NewRequest already sets a known ContentLength for a
 	// strings.Reader body; leave it untouched.
 
@@ -68,7 +68,7 @@ func TestClearDHCPIdentifiers_KnownLengthBody_Unchanged(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, "DHCPv6 DUID cleared for ge-0/0/0.0") {
+	if !strings.Contains(body, "DHCPv6 DUID cleared for ge-0-0-0.50") {
 		t.Fatalf("known-length clear-one request did not clear the named interface: %s", body)
 	}
 }

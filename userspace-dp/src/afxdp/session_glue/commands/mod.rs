@@ -20,3 +20,12 @@ pub(in crate::afxdp::session_glue) use demote_owner_rgs::handle_demote_owner_rgs
 pub(in crate::afxdp::session_glue) use export_owner_rg_sessions::handle_export_owner_rg_sessions;
 pub(in crate::afxdp::session_glue) use refresh_owner_rgs::handle_refresh_owner_rgs;
 pub(in crate::afxdp::session_glue) use upsert_synced::handle_upsert_synced;
+
+// #4805: the activation-refresh path computes the per-session
+// `allow_replace_local` inside `collect_refresh_owner_rgs_items`. Re-export it
+// for the session-glue unit tests so the standby-vs-active publish decision
+// can be asserted without a live BPF session-map fd (unprivileged `cargo test`
+// cannot create BPF maps). Production reaches it in-file via
+// `handle_refresh_owner_rgs`, so the re-export is test-only.
+#[cfg(test)]
+pub(in crate::afxdp::session_glue) use refresh_owner_rgs::collect_refresh_owner_rgs_items;

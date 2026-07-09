@@ -78,17 +78,9 @@ func TestSecLevel_NoAuthPrivRejected(t *testing.T) {
 	}
 }
 
-// TestSecLevel_NoAuthNoPrivStillServed confirms the noAuthNoPriv level (both
-// flags clear) is unaffected by the guard and still served. The agent has a
-// user with auth/priv keys, but a request that sets neither flag carries no
-// HMAC and is processed in the clear (this matches the pre-#2681 behavior; the
-// guard only fires when priv is set and auth is clear).
-func TestSecLevel_NoAuthNoPrivStillServed(t *testing.T) {
-	const boots = 5
-	const reqTime = 1000
-	a, engineID, _, _ := newAuthPrivAgent(t, boots, reqTime)
-
-	// noAuthNoPriv GetRequest: flags = 0, empty auth/priv params, plaintext PDU.
+// buildV3NoAuthNoPrivRequest builds an SNMPv3 GetRequest at the noAuthNoPriv
+// security level (msgFlags = 0, empty auth/priv params, plaintext scopedPDU).
+func buildV3NoAuthNoPrivRequest(userName string, engineID []byte, boots, reqTime int) []byte {
 	scopedBody := berEncodeTLV(tagOctetString, engineID)
 	scopedBody = append(scopedBody, berEncodeTLV(tagOctetString, nil)...)
 	pduBody := berEncodeIntegerTLV(55)
@@ -101,7 +93,7 @@ func TestSecLevel_NoAuthNoPrivStillServed(t *testing.T) {
 	usmFields := berEncodeTLV(tagOctetString, engineID)
 	usmFields = append(usmFields, berEncodeIntegerTLV(boots)...)
 	usmFields = append(usmFields, berEncodeIntegerTLV(reqTime)...)
-	usmFields = append(usmFields, berEncodeTLV(tagOctetString, []byte("puser"))...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, []byte(userName))...)
 	usmFields = append(usmFields, berEncodeTLV(tagOctetString, nil)...) // authParams
 	usmFields = append(usmFields, berEncodeTLV(tagOctetString, nil)...) // privParams
 	usmOctet := berEncodeTLV(tagOctetString, berEncodeTLV(tagSequence, usmFields))
@@ -116,12 +108,94 @@ func TestSecLevel_NoAuthNoPrivStillServed(t *testing.T) {
 	msgBody = append(msgBody, hdrSeq...)
 	msgBody = append(msgBody, usmOctet...)
 	msgBody = append(msgBody, scopedPDU...)
-	pkt := berEncodeTLV(tagSequence, msgBody)
-	a.lastPacket = pkt
+	return berEncodeTLV(tagSequence, msgBody)
+}
 
-	resp := driveV3(t, a, pkt)
-	if got := classifyV3Response(t, resp); got != "response" {
-		t.Fatalf("noAuthNoPriv request: got %q, want a data GetResponse (valid level "+
-			"must still be served)", got)
-	}
+// TestSecLevel_AuthPrivUserMinLevel is the #4897 security regression: an
+// authPriv-configured user carries a per-user minimum security level. Requests
+// below that floor MUST be dropped, not served:
+//
+//   - noAuthNoPriv (flags = 0): the auth AND priv gates would be skipped and the
+//     plaintext scopedPDU served without any password — an auth+confidentiality
+//     bypass. MUST be dropped ("nil").
+//   - authNoPriv (auth set, priv clear): authentication is proven but privacy is
+//     stripped, so a configured-encrypted user is answered in the clear. MUST be
+//     dropped ("nil").
+//   - authPriv (both set): the configured level. MUST be served (decryptable
+//     GetResponse).
+//
+// fail-on-revert: removing the min-security-level floor in handleV3Packet makes
+// the noAuthNoPriv case decode+serve the plaintext PDU and the authNoPriv case
+// pass auth then serve the plaintext PDU — both classify as "response", failing
+// this test. That is the exact hole.
+func TestSecLevel_AuthPrivUserMinLevel(t *testing.T) {
+	const boots = 5
+	const reqTime = 1000
+
+	t.Run("noAuthNoPriv_dropped", func(t *testing.T) {
+		a, engineID, _, _ := newAuthPrivAgent(t, boots, reqTime)
+		pkt := buildV3NoAuthNoPrivRequest("puser", engineID, boots, reqTime)
+		a.lastPacket = pkt
+		resp := driveV3(t, a, pkt)
+		if got := classifyV3Response(t, resp); got != "nil" {
+			t.Fatalf("authPriv user queried at noAuthNoPriv: got %q, want %q "+
+				"(below the user's minimum level, must be dropped)", got, "nil")
+		}
+	})
+
+	t.Run("authNoPriv_dropped", func(t *testing.T) {
+		a, engineID, authKey, _ := newAuthPrivAgent(t, boots, reqTime)
+		pkt := buildV3TimedRequest(t, "sha", "puser", engineID, authKey, boots, reqTime)
+		a.lastPacket = pkt
+		resp := driveV3(t, a, pkt)
+		if got := classifyV3Response(t, resp); got != "nil" {
+			t.Fatalf("authPriv user queried at authNoPriv: got %q, want %q "+
+				"(privacy is configured, must be dropped)", got, "nil")
+		}
+	})
+
+	t.Run("authPriv_served", func(t *testing.T) {
+		a, engineID, authKey, privKey := newAuthPrivAgent(t, boots, reqTime)
+		pkt := buildV3AuthPrivAESRequest(t, "puser", engineID, authKey, privKey,
+			boots, reqTime, boots, reqTime)
+		a.lastPacket = pkt
+		resp := driveV3(t, a, pkt)
+		if !decodeV3AuthPrivResponse(t, resp, privKey) {
+			t.Fatal("authPriv user queried at authPriv was not served with a " +
+				"decryptable GetResponse (the configured level must be answered)")
+		}
+	})
+}
+
+// TestSecLevel_AuthNoPrivUserMinLevel covers the auth-only floor: an
+// authNoPriv-configured user (auth key, no priv key) must reject a
+// noAuthNoPriv request but still be served at authNoPriv.
+//
+// fail-on-revert: without the auth floor the noAuthNoPriv request is served in
+// the clear ("response"), failing the first case.
+func TestSecLevel_AuthNoPrivUserMinLevel(t *testing.T) {
+	const boots = 5
+	const reqTime = 1000
+
+	t.Run("noAuthNoPriv_dropped", func(t *testing.T) {
+		a, engineID, _ := newTimelinessAgent(t, boots, reqTime)
+		pkt := buildV3NoAuthNoPrivRequest("tuser", engineID, boots, reqTime)
+		a.lastPacket = pkt
+		resp := driveV3(t, a, pkt)
+		if got := classifyV3Response(t, resp); got != "nil" {
+			t.Fatalf("authNoPriv user queried at noAuthNoPriv: got %q, want %q "+
+				"(below the user's minimum level, must be dropped)", got, "nil")
+		}
+	})
+
+	t.Run("authNoPriv_served", func(t *testing.T) {
+		a, engineID, authKey := newTimelinessAgent(t, boots, reqTime)
+		pkt := buildV3TimedRequest(t, "sha", "tuser", engineID, authKey, boots, reqTime)
+		a.lastPacket = pkt
+		resp := driveV3(t, a, pkt)
+		if got := classifyV3Response(t, resp); got != "response" {
+			t.Fatalf("authNoPriv user queried at authNoPriv: got %q, want a data "+
+				"GetResponse (the configured level must be answered)", got)
+		}
+	})
 }
