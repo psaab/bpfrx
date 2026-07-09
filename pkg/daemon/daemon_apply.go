@@ -628,6 +628,53 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 
 	d.applyFabricIPVLAN(cfg)
 
+	// 1.9–2.7. Dataplane apply + RETH-MAC/VIP/worker-rebind critical section
+	// (#4407). Returns the ip-monitoring commit overlay and the captured
+	// networkd write error for the routing rules + tail reconcile below; an
+	// error (a #2926 context abort or an ApplyConfig compile abort) bails
+	// before the tail.
+	commitOverlay, networkdErr, err := d.applyDataplaneAndHACore(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	d.applyRoutingRules(cfg, commitOverlay)
+
+	ipsecErr, dhcpServerErr := d.applyServicesReconcile(cfg)
+
+	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
+	// login/SSH, archival, observability, cluster runtime, host tunables).
+	// Extracted into applyTailReconciles (#4407 Phase A). The head above
+	// is decomposed into named phase methods (#4407): the decoupled
+	// setup/reconcile phases (loadable independently) — applyVRFReconcile,
+	// applyInterfaceReconcile, applyFabricIPVLAN, applyRoutingRules,
+	// applyServicesReconcile — and the ordering-entangled dataplane-apply /
+	// RETH-MAC core that stays inline (it threads applyResult / rethMACPending
+	// / the deferred errors). The tail is independent per-subsystem dispatch
+	// reading only cfg (+ nil-guarded managers), so grouping it here is a
+	// behavior-preserving mechanical move. The three head-produced deferred
+	// errors are threaded in; the helper creates lo0Err/hostInboundErr and
+	// returns the identical five-way errors.Join.
+	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and
+// RETH-MAC / VRRP-VIP / AF_XDP-worker-rebind critical section of a config
+// apply (#4407). Extracted verbatim from applyConfigLocked; the head-produced
+// state that the earlier decoupled phases do not touch stays local here —
+// rethMACPending and the deferred-worker-startup flag/defer are self-contained
+// — and the two values the tail still needs are returned: the ip-monitoring
+// commit overlay (fed to applyRoutingRules and the FRR render) and the captured
+// networkd write error (threaded into applyTailReconciles' five-way Join). The
+// three early error returns — the two #2926 context-abort boundaries
+// (ctx.Err() before ApplyConfig and before the FRR reload) and the
+// compileErrorMustAbortApply dataplane abort on an ApplyConfig failure — are
+// preserved; the caller bails without running the routing / service / tail
+// reconciles, exactly as the inline `return err` did. commitOverlay and networkdErr are named
+// returns so the pre-networkd boundaries can return them (nil) before the
+// networkd phase assigns networkdErr. Runs in the same slot, after the
+// fabric-IPVLAN reconcile and before the routing rules.
+func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config) (commitOverlay []config.RouteOverlayEntry, networkdErr error, err error) {
 	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
 	// If yes, tell the userspace DP to skip initial worker startup during
 	// ApplyConfig(). Workers will be started by NotifyLinkCycle() after MAC
@@ -680,7 +727,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// against the INCOMING config (Codex PR #1843 HIGH-1) so a commit
 	// that removes or edits a policy never republishes the stale
 	// entries; the same filtered view feeds the FRR render in step 3.
-	commitOverlay := d.commitOverlayForConfig(cfg)
+	commitOverlay = d.commitOverlayForConfig(cfg)
 	if setter, ok := d.dp.(routeOverlaySetter); ok {
 		setter.SetRouteOverlay(commitOverlay)
 	}
@@ -705,7 +752,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// follows it begin, they run as one unit (no mid-sequence abort) — the
 	// next boundary is before the FRR reload.
 	if err := ctx.Err(); err != nil {
-		return err
+		return commitOverlay, networkdErr, err
 	}
 
 	// 2. Apply dataplane config through the runtime config sink.
@@ -715,7 +762,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		if applyResult, err = d.dp.ApplyConfig(context.Background(), cfg); err != nil {
 			d.recordCompileFailure(err)
 			if compileErrorMustAbortApply(err) {
-				return err
+				return commitOverlay, networkdErr, err
 			}
 		} else {
 			d.recordCompileSuccess()
@@ -783,7 +830,6 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// mirroring dhcpServerErr: every downstream reconcile step still runs so a
 	// networkd write error does not skip RETH MAC programming, VRRP VIP
 	// reconcile, FRR, RA, IPsec, etc. and leave HA state half-applied.
-	var networkdErr error
 	if d.networkd != nil && applyResult != nil {
 		if err := d.networkd.Apply(applyResult.ManagedInterfaces); err != nil {
 			slog.Warn("failed to apply networkd config", "err", err)
@@ -989,27 +1035,10 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// store.Commit the store already holds the new config, so this is a clean
 	// "apply the rest on next start" boundary, not a divergence.)
 	if err := ctx.Err(); err != nil {
-		return err
+		return commitOverlay, networkdErr, err
 	}
 
-	d.applyRoutingRules(cfg, commitOverlay)
-
-	ipsecErr, dhcpServerErr := d.applyServicesReconcile(cfg)
-
-	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
-	// login/SSH, archival, observability, cluster runtime, host tunables).
-	// Extracted into applyTailReconciles (#4407 Phase A). The head above
-	// is decomposed into named phase methods (#4407): the decoupled
-	// setup/reconcile phases (loadable independently) — applyVRFReconcile,
-	// applyInterfaceReconcile, applyFabricIPVLAN, applyRoutingRules,
-	// applyServicesReconcile — and the ordering-entangled dataplane-apply /
-	// RETH-MAC core that stays inline (it threads applyResult / rethMACPending
-	// / the deferred errors). The tail is independent per-subsystem dispatch
-	// reading only cfg (+ nil-guarded managers), so grouping it here is a
-	// behavior-preserving mechanical move. The three head-produced deferred
-	// errors are threaded in; the helper creates lo0Err/hostInboundErr and
-	// returns the identical five-way errors.Join.
-	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+	return commitOverlay, networkdErr, nil
 }
 
 // applyServicesReconcile runs the per-service reconcile phases of a config

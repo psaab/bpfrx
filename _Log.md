@@ -43688,3 +43688,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4404/#4421 batch-3 (final) test-split: relocate inline mod tests from 5 remaining userspace-dp files (xsk_ffi, shared_umem, wg/tai64n, fairness, coordinator/status) into sibling _tests.rs via #[path]. Verbatim move + rustfmt-2024 siblings; parents byte-identical; test-counts preserved. Exhausts the >150-test-line clean-split cohort
   **File(s)**: 5 parents + 5 new *_tests.rs
+
+- **Timestamp**: 2026-07-09
+  - **Action**: #4407 — extract applyConfigLocked dataplane-apply + RETH-MAC/VIP/worker-rebind core into applyDataplaneAndHACore (named-return threading of commitOverlay + networkdErr; 3 #2926 boundaries preserved)
+  - **File(s)**: pkg/daemon/daemon_apply.go
