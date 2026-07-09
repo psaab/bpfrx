@@ -867,6 +867,21 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Fix:** `cachedNlHandle` field, created on first use, closed in `Stop()`
 - **Files:** `pkg/cluster/monitor.go`, `pkg/cluster/monitor_test.go`
 
+### Monitor.getNlHandle lazy init is unsynchronized (FIXED, #4715)
+- **Severity:** LOW-MEDIUM — data race + bounded FD leak
+- **Bug:** `getNlHandle()` read/wrote `cachedNlHandle` lock-free while
+  `Stop()` nils it under `mu`. Two concurrent lock-free callers
+  (`pollInterfaceMonitors` from the poll loop, `RGInterfaceReady` from the
+  daemon HA path) each observed `nil` and created a handle — the second
+  write overwrote the first, leaking one netlink socket FD — and the write
+  raced `Stop()`.
+- **Fix:** The check-create-cache now runs under `mon.mu` (test injection
+  short-circuits before locking; neither caller holds `mu`, so no deadlock).
+  Exactly one handle is created under concurrency; lazy-recreate-after-Stop
+  is preserved. Creation is injectable via `newNlHandle` so a counting fake
+  proves creations==1 and Close-on-Stop==1 under `-race`.
+- **Files:** `pkg/cluster/monitor.go`, `pkg/cluster/monitor_test.go`
+
 ### IP monitoring probes are IPv4-only (FIXED)
 - **Severity:** LOW — IPv6 monitoring targets silently fail
 - **Fix:** Detect IPv4/IPv6, use appropriate socket/types. `icmpDialer` accepts `network string`
