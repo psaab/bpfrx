@@ -43297,3 +43297,21 @@ top.
   verified (collapse stableExporterID to constant 1 -> both new tests FAIL
   on "wire collision"; restored -> green). Full Go suite green.
 - **File(s)**: pkg/flowexport/multigroup_wire_4422_test.go, _Log.md
+
+- **Timestamp**: 2026-07-09 (session 015oARShYtiJJ2H4UB4nXGqi)
+- **Action**: #4422 slice — pin per-interface FBF/PBR scoping + multi-WAN
+  negative cells. VERIFY-FIRST: CORRECT, no leak bug. The kernel ip-rule
+  mirror (routing.BuildPBRRules) only builds rules from filters attached as
+  an interface-unit INPUT filter (collectAttachedInputFilters), each filter
+  contributes only its own terms/routing-instance table, and the per-packet
+  FBF redirect is enforced per-interface in userspace-dp off each unit's
+  FilterInputV4/V6 binding (dataplane/userspace/interfaces.go InterfaceSnapshot).
+  The ip-rule mirror's lack of an iif selector is a pre-existing DOCUMENTED
+  widening for slow-path/XDP_PASS traffic (separate deferred change), not a
+  bug in this slice. Added 3 coverage tests: MultiWANScoping (two WANs, each
+  own input filter -> own RI/table, no cross-WAN hijack, negative cell falls
+  through to main), OtherInterfaceUnaffected (OUTPUT filter on 2nd WAN is not
+  FBF -> no return-path hijack), CollectAttachedInputFilters (dedup across
+  interfaces, family split, output excluded). Mutation-verified the asserts
+  bite. Full Go suite green (53 pkg ok).
+- **File(s)**: pkg/routing/routing_test.go, _Log.md
