@@ -22,6 +22,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/user"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -553,7 +555,7 @@ func (m *Manager) writeManagedSection(section string) error {
 	// so a crash or disk-full can never leave frr.conf half-written (which is
 	// what creates the orphaned-begin-marker state handled above in the first
 	// place). rename(2) within a filesystem is atomic.
-	if err := atomicWriteFile(m.frrConf, []byte(content), 0644); err != nil {
+	if err := atomicWriteFile(m.frrConf, []byte(content), 0640); err != nil {
 		return fmt.Errorf("write frr.conf: %w", err)
 	}
 	return nil
@@ -640,7 +642,7 @@ func StripManagedSectionFile(path string) error {
 	if !changed {
 		return nil
 	}
-	if err := atomicWriteFile(path, []byte(stripped), 0644); err != nil {
+	if err := atomicWriteFile(path, []byte(stripped), 0640); err != nil {
 		return fmt.Errorf("strip frr.conf managed section: %w", err)
 	}
 	return nil
@@ -652,7 +654,7 @@ func StripManagedSectionFile(path string) error {
 // half-written file is what creates the orphaned-begin-marker state
 // handled in writeManagedSection).
 //
-// The two options reproduce this function's pre-#1894 semantics
+// The two base options reproduce this function's pre-#1894 semantics
 // verbatim (they were lifted from here, see pkg/fsatomic):
 //   - WithPreserveExisting: an existing target's mode/ownership is
 //     reapplied on the temp fd (fchmod/fchown before rename, no
@@ -664,9 +666,92 @@ func StripManagedSectionFile(path string) error {
 // On top of the previous behavior the durable writer adds the
 // parent-directory fsync that was missing here, making the rename
 // itself crash-safe.
+//
+// #4484 L-6: the managed section carries routing-authentication secrets
+// (BGP TCP-MD5, OSPF/IS-IS/RIP keys), so frr.conf must not be
+// world-readable. Callers now pass perm 0640 instead of the old 0644.
+// A 0640 file is only readable by its owner and group, so on a FRESH
+// create (no operator file to preserve) we install it owned root:<frr>
+// via WithOwner so the unprivileged frr daemons (group frr) can still
+// read it. See atomicWriteOwnerOpt for the fresh-only + best-effort
+// resolution rules that keep this from ever stranding a running FRR or
+// restamping an operator-owned file.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	return fsatomic.WriteFileDurable(path, data, perm,
-		fsatomic.WithPreserveExisting(), fsatomic.WithResolveSymlinks())
+	opts := []fsatomic.Option{
+		fsatomic.WithPreserveExisting(),
+		fsatomic.WithResolveSymlinks(),
+	}
+	if owner, ok := atomicWriteOwnerOpt(path); ok {
+		opts = append(opts, owner)
+	}
+	return fsatomic.WriteFileDurable(path, data, perm, opts...)
+}
+
+// atomicWriteOwnerOpt returns a WithOwner(0, frr-gid) option, and ok=false
+// when no ownership override should be applied. It returns an option ONLY
+// when BOTH:
+//
+//   - the target does not already exist — an existing frr.conf keeps its
+//     own mode AND ownership (WithPreserveExisting, and no WithOwner here),
+//     so a commit never restamps an operator's chosen owner (#4484 L-6
+//     "must not override an operator's existing ownership"); and
+//   - the frr group resolves — so we never chown a fresh file to a gid we
+//     could not verify. When the group is absent (FRR not installed — a dev
+//     host or a unit test) we skip the override and the file lands 0640
+//     root:root, which is harmless because nothing reads frr.conf without a
+//     running FRR. This mirrors the pkg/dhcpserver #2450 Kea-memfile owner
+//     handling: own the file by the unprivileged runtime user so a
+//     tightened mode stays readable, best-effort when that user is absent.
+//
+// os.Stat follows symlinks, matching WithResolveSymlinks: a symlink to an
+// existing file is treated as existing (preserve), a dangling symlink as a
+// fresh create (own root:frr on the resolved target).
+func atomicWriteOwnerOpt(path string) (fsatomic.Option, bool) {
+	if _, err := os.Stat(path); err == nil {
+		return nil, false // exists → preserve operator mode+ownership
+	}
+	gid, ok := resolveFRRGroup()
+	if !ok {
+		return nil, false
+	}
+	// uid 0: root owns/writes the xpf-managed frr.conf; the frr group only
+	// needs read access (the daemons load the file at startup), which the
+	// group-read bit of 0640 grants.
+	return fsatomic.WithOwner(0, gid), true
+}
+
+// frrGroupName is the unprivileged group the FRR daemons run under (Debian/
+// Ubuntu appliance base: the `frr` package creates user+group `frr`, and
+// /etc/frr/frr.conf ships mode 0640 owned frr:frr). frr.conf must be readable
+// by this group.
+const frrGroupName = "frr"
+
+// resolveFRRGroup resolves the frr group's numeric gid, and ok=false when no
+// fresh-file chown should be attempted. It is a package var so a test can
+// inject a deterministic gid (or an absent group) without depending on the
+// host's /etc/group. Production uses the real OS group database. The frr.conf
+// write path is the config-apply path (not hot), so resolving per write rather
+// than caching keeps the seam trivially test-injectable at negligible cost.
+//
+// It returns ok=false when the process is not root: only root can chown a
+// fresh frr.conf to root:frr, so a non-root xpf (unit tests, dev hosts) must
+// not attempt the chown (fsatomic would surface the EPERM and fail the write).
+// Production xpfd runs as root, so this gate is a no-op there — and it keeps
+// the frr suite deterministic and portable regardless of whether the test host
+// happens to have an `frr` group.
+var resolveFRRGroup = func() (gid int, ok bool) {
+	if os.Geteuid() != 0 {
+		return 0, false
+	}
+	g, err := user.LookupGroup(frrGroupName)
+	if err != nil {
+		return 0, false
+	}
+	gi, err := strconv.Atoi(g.Gid)
+	if err != nil {
+		return 0, false
+	}
+	return gi, true
 }
 
 // reloadLocked reloads FRR. Caller must hold reloadMu.

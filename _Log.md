@@ -17,6 +17,27 @@
   RED-on-revert verified (removing the line fails the render test).
   **File(s)**: pkg/cluster/status.go,
   pkg/cluster/controllink_auth_status_4484_test.go, pkg/cluster/README.md
+## 2026-07-09 — #4484 L-6: frr.conf 0640 + fresh-create root:frr ownership
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4484 L-6 — frr.conf carries routing-auth secrets (BGP
+  TCP-MD5, OSPF/IS-IS/RIP keys) but was written world-readable 0644. Changed
+  the two `atomicWriteFile` call sites (`writeManagedSection`,
+  `StripManagedSectionFile`) to 0640. Since 0640 is owner+group-readable
+  only, a FRESH create is now installed owned `root:frr` via
+  `fsatomic.WithOwner` (new `atomicWriteOwnerOpt` + `resolveFRRGroup`
+  helpers) so the unprivileged frr daemons can still read it. Owner override
+  applies ONLY when the target does not already exist (existing operator file
+  keeps its own mode+ownership via WithPreserveExisting — never restamped)
+  AND the process is root AND the `frr` group resolves; otherwise skipped
+  (0640 root:root, harmless — nothing reads frr.conf without a running FRR).
+  Mirrors the pkg/dhcpserver #2450 Kea-memfile ownership pattern. Updated the
+  existing `TestWriteManagedSection_PreservesExistingMode` fresh-file
+  assertion 0644→0640; added `frrconf_mode_4484_test.go` (fresh-mode 0640,
+  operator-mode-preserved, owner-decision matrix). RED-on-revert verified
+  (revert to 0644 → fresh-mode test fails).
+  **File(s)**: pkg/frr/manager.go, pkg/frr/frr_test.go,
+  pkg/frr/frrconf_mode_4484_test.go, pkg/frr/README.md
 
 ## 2026-07-09 — #4671: relocate frame/wg.rs inline tests to sibling wg_tests.rs
 

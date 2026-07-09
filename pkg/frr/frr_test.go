@@ -1157,6 +1157,13 @@ func TestWriteManagedSection_StaleEndMarkerBeforeBegin(t *testing.T) {
 // apply would be a permission regression vs the old os.WriteFile path (which
 // preserved the mode of an existing file).
 func TestWriteManagedSection_PreservesExistingMode(t *testing.T) {
+	// Force the "frr group absent" path so the fresh-file write below does not
+	// attempt a (non-root) fchown to the frr gid (#4484 L-6); the 0640 mode is
+	// enforced regardless of the owner override.
+	restore := resolveFRRGroup
+	resolveFRRGroup = func() (int, bool) { return 0, false }
+	t.Cleanup(func() { resolveFRRGroup = restore })
+
 	dir := t.TempDir()
 	confPath := filepath.Join(dir, "frr.conf")
 
@@ -1183,7 +1190,12 @@ func TestWriteManagedSection_PreservesExistingMode(t *testing.T) {
 		t.Errorf("mode not preserved across atomic write: got %o, want 0640", got)
 	}
 
-	// A brand-new file (no existing target) uses the default 0644.
+	// A brand-new file (no existing target) is created 0640, NOT the old
+	// world-readable 0644: the managed section carries routing-auth secrets
+	// (BGP TCP-MD5, OSPF/IS-IS/RIP keys), so a fresh frr.conf must not be
+	// world-readable (#4484 L-6). On a real appliance the fresh file is also
+	// owned root:frr (WithOwner) so the frr daemons can still read it; here the
+	// group is forced absent, leaving it 0640 root:root.
 	freshPath := filepath.Join(dir, "fresh.conf")
 	mf := &Manager{frrConf: freshPath}
 	if err := mf.writeManagedSection("ip route 10.0.0.0/8 Null0\n"); err != nil {
@@ -1193,8 +1205,8 @@ func TestWriteManagedSection_PreservesExistingMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := fi.Mode().Perm(); got != 0644 {
-		t.Errorf("new file mode: got %o, want 0644", got)
+	if got := fi.Mode().Perm(); got != 0640 {
+		t.Errorf("new file mode: got %o, want 0640 (0644 is world-readable, #4484 L-6)", got)
 	}
 }
 
