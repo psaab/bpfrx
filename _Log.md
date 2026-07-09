@@ -43648,3 +43648,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 6 — extract setupInterfaceNaming (PHASE 2 interface-naming + bootstrap lifeline + step-0 tunables, 93 lines) from Run(); pure void byte-identical extraction (no params/output/return/crossing-state)
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 7 (final core) — extract setupDataplaneAndInitialConfig (PHASE 3 tail: dataplane backend build + NAT seed + first applyConfig + dnsBootDone + reconcile blackholes, 124 lines) from Run(); body byte-identical, returns error for the one fatal dataplane-create early-return; Run wraps with err-check. Ordering-sensitive dataplane-arming path
+  **File(s)**: pkg/daemon/daemon_run.go
