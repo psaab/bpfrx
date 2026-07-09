@@ -36,6 +36,8 @@ Userspace dataplane helper:
   Validated packets:         90
   Forward candidates:        80
   Route misses:              2
+  Martian drops:             1
+  IPv6 ext-header drops:     4
   Neighbor misses:           1
   Exception packets:         3
   Flow cache hits:           40
