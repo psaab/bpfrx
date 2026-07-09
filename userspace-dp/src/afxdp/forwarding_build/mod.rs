@@ -338,7 +338,8 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     state.nptv6 = Nptv6State::try_from_snapshots(&snapshot.nptv6_rules)?;
     state.screen_profiles = build_screen_profiles(snapshot);
     state.screen_missing_profiles = build_screen_missing_profiles(snapshot);
-    state.syn_cookie_master_key = parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key);
+    state.syn_cookie_master_key =
+        SynCookieMasterKey(parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key));
     state.tcp_mss_all_tcp = snapshot.flow.tcp_mss_all_tcp;
     state.tcp_mss_ipsec_vpn = snapshot.flow.tcp_mss_ipsec_vpn;
     state.tcp_mss_gre_in = snapshot.flow.tcp_mss_gre_in;

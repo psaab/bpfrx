@@ -25,6 +25,56 @@
   pkg/api/metrics_lo0_test.go, pkg/api/metrics_pbr_test.go,
   pkg/api/metrics_descriptor_coverage_test.go, pkg/api/zone_counters_hide_test.go,
   pkg/daemon/daemon_nft.go, docs/multi-wan.md, docs/feature-coverage.md, _Log.md
+## 2026-07-09 — #4484 L-3 + L-7: clamp IPv4 datagram end + redact syn-cookie key in Debug
+
+- **Timestamp**: 2026-07-09 (session 015oARShYtiJJ2H4UB4nXGqi)
+  **Action**: #4484 L-3 — `tcp_segment_consumed_len`
+  (`userspace-dp/src/afxdp/frame/tcp.rs`) derived the IPv4 datagram end
+  from the header's `total_len` (`ip_datagram_end = l3 + total_len`) with
+  NO clamp to `frame.len()`. A crafted/corrupted packet advertising an
+  inflated `total_len` pushed `ip_datagram_end` past the real frame, so
+  the downstream `payload_len = ip_datagram_end.saturating_sub(
+  tcp_data_start)` over-counted the segment length, and the no-ACK RST
+  carried `ack = seq + inflated_seg_len` — an unacceptable ack the peer
+  discards, degrading the `reject`/RST path to a silent drop (a
+  fail-closed self-DoS on the reject leg). Fix: clamp the derived
+  datagram end to `frame.len()` after the family match (covers v4 —
+  the reported residual — and bounds the v6 `payload_len` path too); a
+  well-formed packet has the datagram end within the frame, so it is a
+  no-op for valid traffic. VERIFY-FIRST: read the site on origin/master;
+  confirmed the v4 branch had no `.min(frame.len())` and the ack math
+  feeds off it. RED-on-revert proof: a SYN frame with `total_len=1200`
+  but a real 54-byte frame → with the clamp `ack = seq+1`; removing the
+  clamp yields `ack = seq+1161` (1261 vs expected 101), test FAILS.
+  Guard test: a well-formed `total_len==46`, 60-byte SYN+6-payload frame
+  still acks `seq + 1 + 6` (clamp is a no-op).
+  #4484 L-7 — `ForwardingState`
+  (`userspace-dp/src/afxdp/types/forwarding.rs`) derives `Debug`, and the
+  `syn_cookie_master_key: Option<[u8; 16]>` field auto-rendered the raw
+  16-byte SYN-cookie master key into any log/trace that formats the state.
+  Fix: wrap the field in a `SynCookieMasterKey(Option<[u8; 16]>)` newtype
+  whose manual `Debug` redacts (`Some(<redacted>)` / `None`, never the
+  bytes), mirroring the WireGuard-key redaction discipline
+  (`TunnelEndpoint`/`WgRuntimePeer`) already in this file. `ForwardingState`
+  keeps `#[derive(Debug)]` so all other fields render unchanged and no
+  future field silently drops from Debug. Read/write sites updated to
+  `.0` (`forwarding_build/mod.rs`, `worker/loop_body/{mod,setup}.rs`).
+  VERIFY-FIRST: confirmed the struct derives Debug and the key field had
+  no hand-redaction; the sibling secrets use manual `debug_struct` impls.
+  RED-on-revert proof: deriving `Debug` on the newtype re-leaks
+  `SynCookieMasterKey(Some([171, 171, ...]))`, test FAILS; guard asserts
+  sibling fields (`local_v4`) still render. Gates: `cargo build` clean;
+  full serial suite `cargo test --release -- --test-threads=1` = 3775
+  passed / 0 failed / 2 ignored (+60 doctest, +8 self, +22 fairness, +1
+  snat, all 0-fail); `cargo test --release tcp` 173/0; `cargo test
+  --release syn_cookie` 55/0.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/frame/tcp_tests.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/setup.rs, _Log.md
 
 ## 2026-07-09 — #4484 L-9: control-link auth engaged/dual-accept show surface
 
