@@ -16,7 +16,7 @@ moved with its assertions intact.
 | File | Contents |
 |------|----------|
 | `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `dhcidSharedWithOther` (#2700 shared-DHCID guard), `Stats` (incl. `PTRPendingNow`, #2708), `OwnedRecordView(s)`, the `errDDNSNoBackendToWithdraw` keep-ownership sentinel (#2699), the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
-| `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. Also the fail-closed load classifiers `errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion` + `quarantineBadState` (#2650). |
+| `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. Also the fail-closed load classifiers `errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion` + `quarantineBadState` (#2650) + the durable `<path>.degraded` marker helpers `readDegradedMarker` / `writeDegradedMarker` (#4873) that keep the fail-closed posture across restart. |
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
@@ -242,6 +242,19 @@ no change in those packages:
   state is surfaced as a `show ... dynamic-dns` ALARM and the
   `xpf_dhcp_ddns_degraded` Prometheus gauge so the lost cleanup authority is
   never silent.
+  - **The fail-closed posture is DURABLE across restart (#4873).** Quarantine
+    renames the corrupt canonical file away, so a naive reload on the next boot
+    would find no file, load an EMPTY store with a nil error, and NOT degrade —
+    silently resuming publish/withdraw with all prior ownership forgotten (the
+    fail-open the in-memory `degraded` flag alone cannot prevent, since it does
+    not outlive the process). `loadStateOrDegrade` therefore writes a durable
+    `<path>.degraded` marker (via `fsatomic.WriteFileDurable`) whenever it
+    quarantines a corrupt/unsupported file, and honors that marker FIRST on every
+    load: while the marker exists the manager stays degraded regardless of the
+    canonical file's state. An operator resolves it EXPLICITLY by removing the
+    marker (after inspecting/importing the quarantined `.corrupt-*` copy) — a bare
+    restart no longer clears it. An unreadable (permission/IO, non-classified)
+    file is NOT marker-persisted, because those bytes may be fine on retry.
 - **Surface A ownership state fails CLOSED too (#2971)** — the Surface A
   (router/interface-address) `SurfaceAManager` previously BYPASSED the #2650
   wrapper: `NewSurfaceAManager` called `loadDDNSState` directly and, on any load
@@ -256,8 +269,9 @@ no change in those packages:
   WHOLE pass (no publish, no withdraw, no `save()` — the bad file is preserved)
   until the operator resolves it. A MISSING file (first boot) is NOT degraded, so
   a fresh node — including a STANDALONE (nil-gate) node — still publishes
-  normally; a restart with the bad file quarantined aside re-reads an absent
-  (clean-empty) store and resumes publishing. The degraded state is surfaced as a
+  normally; a restart after a corrupt file was quarantined stays degraded via the
+  durable `.degraded` marker (#4873) until the operator removes it — it no longer
+  re-reads an absent store and silently resumes publishing. The degraded state is surfaced as a
   `show services dynamic-dns` Surface A ALARM (CLI + gRPC) and the
   `xpf_ddns_surface_a_degraded` Prometheus gauge, and on `SurfaceAStats.Degraded`
   / `DegradedReason`.
