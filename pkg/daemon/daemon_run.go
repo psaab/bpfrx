@@ -1143,284 +1143,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start HTTP API server if configured.
 	if d.opts.APIAddr != "" {
-		// d.dp asserted against the local apiDataPlane probe
-		// (runtime_probes.go) — structurally identical to pkg/api's
-		// package-private apiRuntimeDataPlane. Go duck-types the
-		// assignment to api.Config.DP at this site; signature drift
-		// surfaces as a compile error here.
-		var apiDP apiDataPlane
-		if d.dp != nil {
-			if probe, ok := d.dp.(apiDataPlane); ok {
-				apiDP = probe
-			}
-		}
-		apiCfg := api.Config{
-			Addr:     d.opts.APIAddr,
-			Store:    d.store,
-			DP:       apiDP,
-			EventBuf: eventBuf,
-			GC:       d.gc,
-			Routing:  d.routing,
-			FRR:      d.frr,
-			IPsec:    d.ipsec,
-			DHCP:     d.dhcp,
-			VRRPMgr:  d.vrrpMgr,
-			// HTTP commits don't sync to peer (preserves prior
-			// behavior; see #846 for follow-up).
-			CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
-				return d.commitAndApply(ctx, comment, false)
-			},
-			CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
-				return d.commitConfirmedAndApply(ctx, minutes, false)
-			},
-			// #758: surface compile state so /health returns 503
-			// when the dataplane has never compiled successfully.
-			CompileHealthFn: func() api.CompileHealthSnapshot {
-				h := d.CompileHealthSnapshot()
-				return api.CompileHealthSnapshot{
-					EverSucceeded:    h.EverSucceeded,
-					FailureCount:     h.FailureCount,
-					LastError:        h.LastError,
-					LastErrorUnixSec: h.LastErrorUnixSec,
-				}
-			},
-			// #4184: surface the day-0 / bootstrap config-import outcome so a
-			// failed import is visible on /health, not just a boot-time WARN.
-			BootstrapImportFn: func() api.BootstrapImportSnapshot {
-				b := d.BootstrapImportSnapshot()
-				return api.BootstrapImportSnapshot{
-					Status:  b.Status,
-					Error:   b.Error,
-					UnixSec: b.UnixSec,
-					Failed:  b.Failed,
-				}
-			},
-			// #1780 Path A: expose the per-phase age of the Go periodic
-			// neighbor-maintenance loop so a wedged guarded goroutine
-			// (stuck netlink/probe syscall) is observable as a climbing
-			// gauge before it manifests as the cold-connect hang.
-			NeighborPhaseAgeFn: d.NeighborPeriodicPhaseAges,
-			// #1880: 1 while the last applied FRR reload fell back to
-			// the additive vtysh -f path (stale-config removal deferred
-			// to the in-manager retry loop).
-			FRRReloadDegradedFn: func() bool {
-				if d.frr == nil {
-					return false
-				}
-				return d.frr.ReloadDegraded()
-			},
-			// #3780: surface scheduler republish-failure so
-			// xpf_scheduler_republish_failed reads 1 (and
-			// xpf_scheduler_republish_stale_seconds climbs) while a
-			// scheduler window transition's republish has not converged —
-			// otherwise stale enforcement past the window is invisible to
-			// monitoring.
-			SchedulerRepublishFailedFn:       d.SchedulerRepublishFailed,
-			SchedulerRepublishStaleSecondsFn: d.SchedulerRepublishStaleSeconds,
-			// #1827: ip-monitoring policy state for the xpf_ipmon_*
-			// metric family.
-			IPMonStatusFn: func() []ipmon.PolicyStatus {
-				if d.ipmon != nil {
-					return d.ipmon.Status()
-				}
-				return nil
-			},
-			// #4423 L: ip-monitoring actuation-failure counter
-			// (xpf_ipmon_actuation_failures_total) — surfaces the silent
-			// #3757 self-heal retry loop so a degraded failover is visible.
-			IPMonActuationFailuresFn: func() uint64 {
-				if d.ipmon != nil {
-					return d.ipmon.ActuationFailures()
-				}
-				return 0
-			},
-			// #2157: event-options remediation action counters for the
-			// xpf_event_actions_* / xpf_event_action_queue_depth family.
-			EventActionStatsFn: func() eventengine.Stats {
-				if d.eventEngine != nil {
-					return d.eventEngine.Stats()
-				}
-				return eventengine.Stats{}
-			},
-			// #1895: currently-failed RPM probe-pin installs (tests
-			// holding state on ErrProbeSetup instead of probing the
-			// default path).
-			RPMPinFailedFn: func() float64 {
-				if d.rpm != nil {
-					return float64(d.rpm.PinInstallFailureCount())
-				}
-				return 0
-			},
-			// #1799: surface configstore persist-degraded state so
-			// /health returns 503 (and xpf_daemon_config_persist_degraded
-			// reads 1) while the running active config is not durable on
-			// disk (failed HA sync / auto-rollback persist, retry pending).
-			ConfigPersistDegradedFn: d.store.ConfigPersistDegraded,
-			// #3441: surface configstore rollback-history-degraded state so
-			// /health reports it (non-fatal) and
-			// xpf_config_rollback_persist_degraded reads 1 while the most
-			// recent commit failed to durably persist its text rollback
-			// files. The active config is durable; this flags a degraded
-			// recovery aid, so it does not 503.
-			RollbackHistoryDegradedFn: d.store.RollbackHistoryDegraded,
-			// #2050: surface dynamic-address feed staleness so the
-			// xpf_feed_seconds_since_last_success / xpf_feed_stale gauges
-			// read live status. A frozen enforced address set (retain-forever
-			// default) is otherwise invisible to monitoring.
-			FeedsFn: func() map[string]feeds.FeedInfo {
-				if d.feeds != nil {
-					return d.feeds.AllFeeds()
-				}
-				return nil
-			},
-			// #3042: live feed-prefix overlay so the REST match-policies
-			// simulator resolves feed-backed address-names to their live
-			// CIDRs, matching what the AF_XDP helper enforces.
-			FeedOverlayFn: func() map[string][]string {
-				return d.feedSnapshotsForConfig(d.store.ActiveConfig())
-			},
-			// #3104: live per-scheduler active-state so the REST
-			// match-policies simulator skips a scheduler-inactive policy
-			// exactly like the runtime, instead of returning a verdict the
-			// dataplane disagrees with. Sourced from the same daemon-local
-			// accessor the CLI/gRPC show surfaces use
-			// (Manager.PolicySchedulerActiveState via the dataplane adapter).
-			// ok=false when the dataplane is absent (NoDataplane); the simulator
-			// then fails closed and treats scheduled policies as inactive (#3414),
-			// matching the dataplane's nil-state behavior rather than certifying
-			// an as-if-active verdict it is skipping.
-			PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
-				if d.dp == nil {
-					return nil, false
-				}
-				p, ok := d.dp.(interface {
-					PolicySchedulerActiveState() map[string]bool
-				})
-				if !ok {
-					return nil, false
-				}
-				return p.PolicySchedulerActiveState(), true
-			},
-			// #1387 inc-2: DHCP dynamic-DNS counters for the
-			// xpf_dhcp_ddns_* metric family. Returns nil when the
-			// manager is absent (NoDataplane), omitting the family.
-			DDNSStatsFn:     d.DDNSStats,
-			SurfaceAStatsFn: d.SurfaceAStats,
-			// #2464: per-collector NetFlow v9 / IPFIX write-health for the
-			// xpf_flow_export_collector_* family + /services/flow-exporters.
-			FlowCollectorHealthFn: d.FlowCollectorHealth,
-			// #3747: per-exporter pending-batch queue depth / high-water /
-			// dropped-at-capacity count for the xpf_flow_export_batch_* family.
-			FlowExportBatchStatsFn: d.FlowExportBatchStats,
-			// #3419 M6: report whether this node is the active cluster member
-			// for RG0 so the REST session view's ha_active field matches the
-			// gRPC contract (server_sessions.go IsLocalPrimary(0)). Standalone
-			// (no cluster) reports active.
-			HAActiveFn: func() bool {
-				if d.cluster == nil {
-					return true
-				}
-				return d.cluster.IsLocalPrimary(0)
-			},
-			// #3423 M5: stamp this node's cluster id on the REST session
-			// list/summary/clear responses so a dashboard knows WHICH node it
-			// observed. Standalone (no cluster) reports node 0.
-			NodeIDFn: func() int {
-				if d.cluster == nil {
-					return 0
-				}
-				return d.cluster.NodeID()
-			},
-			// #3423 H5/M5: hand the REST session handlers the live gRPC
-			// server, which is HA-aware — its ClearSessions fans out the
-			// clear to the cluster peer (clearPeerSessions, x-peer-forwarded
-			// recursion guard) and its GetSessions/GetSessionSummary stamp the
-			// peer's table when include_peer is set. Resolved lazily so the
-			// closure can reference the gRPC server constructed below this
-			// block; guarded so a nil server resolves to a nil interface (not
-			// a non-nil typed-nil), keeping REST local-only until the gRPC
-			// server is up.
-			ClusterSessionFn: func() api.ClusterSessionService {
-				if d.grpcSrv == nil {
-					return nil
-				}
-				return d.grpcSrv
-			},
-		}
-		// Resolve interface bindings from web-management config
-		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
-			cfg.System.Services.WebManagement != nil {
-			wm := cfg.System.Services.WebManagement
-			// Bind HTTP to configured interface
-			if wm.HTTPInterface != "" {
-				bindIP := resolveInterfaceAddr(wm.HTTPInterface, "127.0.0.1")
-				// net.JoinHostPort (not string-concat) so an IPv6 interface
-				// address is bracketed ("[2001:db8::1]:8080") — a bare
-				// "2001:db8::1:8080" is unparseable by net.SplitHostPort (the
-				// clamp below) and net.Listen, blackholing an IPv6-only mgmt bind.
-				apiCfg.Addr = net.JoinHostPort(bindIP, "8080")
-				slog.Info("HTTP API bound to interface", "interface", wm.HTTPInterface, "addr", apiCfg.Addr)
-			}
-			// Enable HTTPS if configured
-			if wm.HTTPS {
-				httpsBindIP := "127.0.0.1"
-				if wm.HTTPSInterface != "" {
-					httpsBindIP = resolveInterfaceAddr(wm.HTTPSInterface, "127.0.0.1")
-					slog.Info("HTTPS API bound to interface", "interface", wm.HTTPSInterface, "addr", net.JoinHostPort(httpsBindIP, "8443"))
-				}
-				apiCfg.TLS = true
-				apiCfg.HTTPSAddr = net.JoinHostPort(httpsBindIP, "8443")
-			}
-			// API authentication
-			if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
-				authCfg := &api.AuthConfig{
-					Users:   make(map[string]string),
-					APIKeys: make(map[string]bool),
-				}
-				for _, u := range wm.APIAuth.Users {
-					authCfg.Users[u.Username] = u.Password.Reveal()
-				}
-				for _, k := range wm.APIAuth.APIKeys {
-					authCfg.APIKeys[k.Reveal()] = true
-				}
-				apiCfg.Auth = authCfg
-				slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
-			}
-			// #4047 part B: runtime fail-safe clamp. The commit gate
-			// (validateWebManagementAuthStrict, pkg/config) rejects a NEW
-			// web-management config that binds the unauthenticated REST/config API
-			// off-loopback without api-auth, but an ALREADY-PERSISTED such config
-			// is lenient-loaded (warn, no brick — #1960) and would still bind
-			// non-loopback UNAUTHENTICATED after upgrade, exposing the mutating
-			// config endpoints (set / commit / rollback / system action) to the
-			// network. clampBindToLoopback pulls a non-loopback + no-auth bind back
-			// to a loopback of the same family and WARNs: the daemon still boots,
-			// the web API stays reachable on loopback, and the console/SSH remain
-			// the lifeline (device-map §9.6 posture) until the operator adds
-			// api-auth (which restores the non-loopback bind).
-			hasAuth := apiCfg.Auth != nil
-			if clamped, ok := clampBindToLoopback(apiCfg.Addr, hasAuth); ok {
-				slog.Warn("web-management HTTP bind is non-loopback without api-auth; clamping to loopback (add `set system services web-management api-auth` to bind off-loopback) — #4047",
-					"requested", apiCfg.Addr, "clamped", clamped)
-				apiCfg.Addr = clamped
-			}
-			if apiCfg.TLS {
-				if clamped, ok := clampBindToLoopback(apiCfg.HTTPSAddr, hasAuth); ok {
-					slog.Warn("web-management HTTPS bind is non-loopback without api-auth; clamping to loopback — #4047",
-						"requested", apiCfg.HTTPSAddr, "clamped", clamped)
-					apiCfg.HTTPSAddr = clamped
-				}
-			}
-		}
-		srv := api.NewServer(apiCfg)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := srv.Run(ctx); err != nil {
-				slog.Error("API server error", "err", err)
-			}
-		}()
-		slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
+		d.startHTTPServer(ctx, &wg, eventBuf)
 	}
 
 	// #881: forwarding-daemon CPU sampler (5s/1m/5m windows for
@@ -1880,6 +1603,292 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		}
 	}()
 	slog.Info("gRPC API server started", "addr", d.opts.GRPCAddr)
+}
+
+// startHTTPServer constructs and launches the HTTP REST API server goroutine
+// (bind-interface resolution, TLS, API auth, and loopback clamping). Extracted
+// verbatim from Run()'s PHASE 5 (#4662 Increment 3); a leaf startup block with
+// no ordering dependency (same code, same call point, still guarded by the
+// d.opts.APIAddr check in Run).
+func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer) {
+	// d.dp asserted against the local apiDataPlane probe
+	// (runtime_probes.go) — structurally identical to pkg/api's
+	// package-private apiRuntimeDataPlane. Go duck-types the
+	// assignment to api.Config.DP at this site; signature drift
+	// surfaces as a compile error here.
+	var apiDP apiDataPlane
+	if d.dp != nil {
+		if probe, ok := d.dp.(apiDataPlane); ok {
+			apiDP = probe
+		}
+	}
+	apiCfg := api.Config{
+		Addr:     d.opts.APIAddr,
+		Store:    d.store,
+		DP:       apiDP,
+		EventBuf: eventBuf,
+		GC:       d.gc,
+		Routing:  d.routing,
+		FRR:      d.frr,
+		IPsec:    d.ipsec,
+		DHCP:     d.dhcp,
+		VRRPMgr:  d.vrrpMgr,
+		// HTTP commits don't sync to peer (preserves prior
+		// behavior; see #846 for follow-up).
+		CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
+			return d.commitAndApply(ctx, comment, false)
+		},
+		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
+			return d.commitConfirmedAndApply(ctx, minutes, false)
+		},
+		// #758: surface compile state so /health returns 503
+		// when the dataplane has never compiled successfully.
+		CompileHealthFn: func() api.CompileHealthSnapshot {
+			h := d.CompileHealthSnapshot()
+			return api.CompileHealthSnapshot{
+				EverSucceeded:    h.EverSucceeded,
+				FailureCount:     h.FailureCount,
+				LastError:        h.LastError,
+				LastErrorUnixSec: h.LastErrorUnixSec,
+			}
+		},
+		// #4184: surface the day-0 / bootstrap config-import outcome so a
+		// failed import is visible on /health, not just a boot-time WARN.
+		BootstrapImportFn: func() api.BootstrapImportSnapshot {
+			b := d.BootstrapImportSnapshot()
+			return api.BootstrapImportSnapshot{
+				Status:  b.Status,
+				Error:   b.Error,
+				UnixSec: b.UnixSec,
+				Failed:  b.Failed,
+			}
+		},
+		// #1780 Path A: expose the per-phase age of the Go periodic
+		// neighbor-maintenance loop so a wedged guarded goroutine
+		// (stuck netlink/probe syscall) is observable as a climbing
+		// gauge before it manifests as the cold-connect hang.
+		NeighborPhaseAgeFn: d.NeighborPeriodicPhaseAges,
+		// #1880: 1 while the last applied FRR reload fell back to
+		// the additive vtysh -f path (stale-config removal deferred
+		// to the in-manager retry loop).
+		FRRReloadDegradedFn: func() bool {
+			if d.frr == nil {
+				return false
+			}
+			return d.frr.ReloadDegraded()
+		},
+		// #3780: surface scheduler republish-failure so
+		// xpf_scheduler_republish_failed reads 1 (and
+		// xpf_scheduler_republish_stale_seconds climbs) while a
+		// scheduler window transition's republish has not converged —
+		// otherwise stale enforcement past the window is invisible to
+		// monitoring.
+		SchedulerRepublishFailedFn:       d.SchedulerRepublishFailed,
+		SchedulerRepublishStaleSecondsFn: d.SchedulerRepublishStaleSeconds,
+		// #1827: ip-monitoring policy state for the xpf_ipmon_*
+		// metric family.
+		IPMonStatusFn: func() []ipmon.PolicyStatus {
+			if d.ipmon != nil {
+				return d.ipmon.Status()
+			}
+			return nil
+		},
+		// #4423 L: ip-monitoring actuation-failure counter
+		// (xpf_ipmon_actuation_failures_total) — surfaces the silent
+		// #3757 self-heal retry loop so a degraded failover is visible.
+		IPMonActuationFailuresFn: func() uint64 {
+			if d.ipmon != nil {
+				return d.ipmon.ActuationFailures()
+			}
+			return 0
+		},
+		// #2157: event-options remediation action counters for the
+		// xpf_event_actions_* / xpf_event_action_queue_depth family.
+		EventActionStatsFn: func() eventengine.Stats {
+			if d.eventEngine != nil {
+				return d.eventEngine.Stats()
+			}
+			return eventengine.Stats{}
+		},
+		// #1895: currently-failed RPM probe-pin installs (tests
+		// holding state on ErrProbeSetup instead of probing the
+		// default path).
+		RPMPinFailedFn: func() float64 {
+			if d.rpm != nil {
+				return float64(d.rpm.PinInstallFailureCount())
+			}
+			return 0
+		},
+		// #1799: surface configstore persist-degraded state so
+		// /health returns 503 (and xpf_daemon_config_persist_degraded
+		// reads 1) while the running active config is not durable on
+		// disk (failed HA sync / auto-rollback persist, retry pending).
+		ConfigPersistDegradedFn: d.store.ConfigPersistDegraded,
+		// #3441: surface configstore rollback-history-degraded state so
+		// /health reports it (non-fatal) and
+		// xpf_config_rollback_persist_degraded reads 1 while the most
+		// recent commit failed to durably persist its text rollback
+		// files. The active config is durable; this flags a degraded
+		// recovery aid, so it does not 503.
+		RollbackHistoryDegradedFn: d.store.RollbackHistoryDegraded,
+		// #2050: surface dynamic-address feed staleness so the
+		// xpf_feed_seconds_since_last_success / xpf_feed_stale gauges
+		// read live status. A frozen enforced address set (retain-forever
+		// default) is otherwise invisible to monitoring.
+		FeedsFn: func() map[string]feeds.FeedInfo {
+			if d.feeds != nil {
+				return d.feeds.AllFeeds()
+			}
+			return nil
+		},
+		// #3042: live feed-prefix overlay so the REST match-policies
+		// simulator resolves feed-backed address-names to their live
+		// CIDRs, matching what the AF_XDP helper enforces.
+		FeedOverlayFn: func() map[string][]string {
+			return d.feedSnapshotsForConfig(d.store.ActiveConfig())
+		},
+		// #3104: live per-scheduler active-state so the REST
+		// match-policies simulator skips a scheduler-inactive policy
+		// exactly like the runtime, instead of returning a verdict the
+		// dataplane disagrees with. Sourced from the same daemon-local
+		// accessor the CLI/gRPC show surfaces use
+		// (Manager.PolicySchedulerActiveState via the dataplane adapter).
+		// ok=false when the dataplane is absent (NoDataplane); the simulator
+		// then fails closed and treats scheduled policies as inactive (#3414),
+		// matching the dataplane's nil-state behavior rather than certifying
+		// an as-if-active verdict it is skipping.
+		PolicySchedulerActiveStateFn: func() (map[string]bool, bool) {
+			if d.dp == nil {
+				return nil, false
+			}
+			p, ok := d.dp.(interface {
+				PolicySchedulerActiveState() map[string]bool
+			})
+			if !ok {
+				return nil, false
+			}
+			return p.PolicySchedulerActiveState(), true
+		},
+		// #1387 inc-2: DHCP dynamic-DNS counters for the
+		// xpf_dhcp_ddns_* metric family. Returns nil when the
+		// manager is absent (NoDataplane), omitting the family.
+		DDNSStatsFn:     d.DDNSStats,
+		SurfaceAStatsFn: d.SurfaceAStats,
+		// #2464: per-collector NetFlow v9 / IPFIX write-health for the
+		// xpf_flow_export_collector_* family + /services/flow-exporters.
+		FlowCollectorHealthFn: d.FlowCollectorHealth,
+		// #3747: per-exporter pending-batch queue depth / high-water /
+		// dropped-at-capacity count for the xpf_flow_export_batch_* family.
+		FlowExportBatchStatsFn: d.FlowExportBatchStats,
+		// #3419 M6: report whether this node is the active cluster member
+		// for RG0 so the REST session view's ha_active field matches the
+		// gRPC contract (server_sessions.go IsLocalPrimary(0)). Standalone
+		// (no cluster) reports active.
+		HAActiveFn: func() bool {
+			if d.cluster == nil {
+				return true
+			}
+			return d.cluster.IsLocalPrimary(0)
+		},
+		// #3423 M5: stamp this node's cluster id on the REST session
+		// list/summary/clear responses so a dashboard knows WHICH node it
+		// observed. Standalone (no cluster) reports node 0.
+		NodeIDFn: func() int {
+			if d.cluster == nil {
+				return 0
+			}
+			return d.cluster.NodeID()
+		},
+		// #3423 H5/M5: hand the REST session handlers the live gRPC
+		// server, which is HA-aware — its ClearSessions fans out the
+		// clear to the cluster peer (clearPeerSessions, x-peer-forwarded
+		// recursion guard) and its GetSessions/GetSessionSummary stamp the
+		// peer's table when include_peer is set. Resolved lazily so the
+		// closure can reference the gRPC server constructed below this
+		// block; guarded so a nil server resolves to a nil interface (not
+		// a non-nil typed-nil), keeping REST local-only until the gRPC
+		// server is up.
+		ClusterSessionFn: func() api.ClusterSessionService {
+			if d.grpcSrv == nil {
+				return nil
+			}
+			return d.grpcSrv
+		},
+	}
+	// Resolve interface bindings from web-management config
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
+		cfg.System.Services.WebManagement != nil {
+		wm := cfg.System.Services.WebManagement
+		// Bind HTTP to configured interface
+		if wm.HTTPInterface != "" {
+			bindIP := resolveInterfaceAddr(wm.HTTPInterface, "127.0.0.1")
+			// net.JoinHostPort (not string-concat) so an IPv6 interface
+			// address is bracketed ("[2001:db8::1]:8080") — a bare
+			// "2001:db8::1:8080" is unparseable by net.SplitHostPort (the
+			// clamp below) and net.Listen, blackholing an IPv6-only mgmt bind.
+			apiCfg.Addr = net.JoinHostPort(bindIP, "8080")
+			slog.Info("HTTP API bound to interface", "interface", wm.HTTPInterface, "addr", apiCfg.Addr)
+		}
+		// Enable HTTPS if configured
+		if wm.HTTPS {
+			httpsBindIP := "127.0.0.1"
+			if wm.HTTPSInterface != "" {
+				httpsBindIP = resolveInterfaceAddr(wm.HTTPSInterface, "127.0.0.1")
+				slog.Info("HTTPS API bound to interface", "interface", wm.HTTPSInterface, "addr", net.JoinHostPort(httpsBindIP, "8443"))
+			}
+			apiCfg.TLS = true
+			apiCfg.HTTPSAddr = net.JoinHostPort(httpsBindIP, "8443")
+		}
+		// API authentication
+		if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
+			authCfg := &api.AuthConfig{
+				Users:   make(map[string]string),
+				APIKeys: make(map[string]bool),
+			}
+			for _, u := range wm.APIAuth.Users {
+				authCfg.Users[u.Username] = u.Password.Reveal()
+			}
+			for _, k := range wm.APIAuth.APIKeys {
+				authCfg.APIKeys[k.Reveal()] = true
+			}
+			apiCfg.Auth = authCfg
+			slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
+		}
+		// #4047 part B: runtime fail-safe clamp. The commit gate
+		// (validateWebManagementAuthStrict, pkg/config) rejects a NEW
+		// web-management config that binds the unauthenticated REST/config API
+		// off-loopback without api-auth, but an ALREADY-PERSISTED such config
+		// is lenient-loaded (warn, no brick — #1960) and would still bind
+		// non-loopback UNAUTHENTICATED after upgrade, exposing the mutating
+		// config endpoints (set / commit / rollback / system action) to the
+		// network. clampBindToLoopback pulls a non-loopback + no-auth bind back
+		// to a loopback of the same family and WARNs: the daemon still boots,
+		// the web API stays reachable on loopback, and the console/SSH remain
+		// the lifeline (device-map §9.6 posture) until the operator adds
+		// api-auth (which restores the non-loopback bind).
+		hasAuth := apiCfg.Auth != nil
+		if clamped, ok := clampBindToLoopback(apiCfg.Addr, hasAuth); ok {
+			slog.Warn("web-management HTTP bind is non-loopback without api-auth; clamping to loopback (add `set system services web-management api-auth` to bind off-loopback) — #4047",
+				"requested", apiCfg.Addr, "clamped", clamped)
+			apiCfg.Addr = clamped
+		}
+		if apiCfg.TLS {
+			if clamped, ok := clampBindToLoopback(apiCfg.HTTPSAddr, hasAuth); ok {
+				slog.Warn("web-management HTTPS bind is non-loopback without api-auth; clamping to loopback — #4047",
+					"requested", apiCfg.HTTPSAddr, "clamped", clamped)
+				apiCfg.HTTPSAddr = clamped
+			}
+		}
+	}
+	srv := api.NewServer(apiCfg)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := srv.Run(ctx); err != nil {
+			slog.Error("API server error", "err", err)
+		}
+	}()
+	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
