@@ -440,178 +440,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// ===== PHASE 3: Manager init (routing/FRR/IPsec/RPM/ipmon/event-engine/DHCP/cluster/VRRP/dataplane) + first applyConfig =====
-	// Initialize routing, FRR, and IPsec managers
-	if !d.opts.NoDataplane {
-		rm, err := routing.New()
-		if err != nil {
-			slog.Warn("failed to create routing manager", "err", err)
-		} else {
-			d.routing = rm
-			// #1827: flush the reserved probe-pin band (ip rules 50-99 +
-			// tables 7000-7049) before anything else runs, so a crashed
-			// daemon never leaks stale probe pins across restarts.
-			if err := d.routing.ClearProbePins(); err != nil {
-				slog.Warn("failed to clear stale probe pins", "err", err)
-			}
-		}
-		d.frr = frr.New()
-		// #1993: on a compile-failure boot with NO preserved XDP attachments,
-		// the last-good frr.conf managed section is still on disk and FRR (an
-		// independent service) will form peerings + re-advertise prefixes for
-		// routes this unarmed node cannot forward — a transit blackhole. Clear
-		// ONLY the managed section, right after the manager exists and BEFORE
-		// the run loop settles, so peers fail over to the HA partner. The
-		// predicate PRESERVES the managed section on a hitless restart only when
-		// the helper control socket reports forwarding is genuinely live
-		// (enabled+armed); pinned XDP links are merely a cheap pre-filter, NOT
-		// proof of live forwarding (a graceful stop leaves the pins but disarms
-		// forwarding). Freeze-in-last-known-good for management (#1960) is
-		// preserved: no .network/.link removal, no link-cycle.
-		d.clearFRRForFailClosedBoot(configCompileFailed)
-		d.ipsec = ipsec.New()
-		d.ra = ra.New()
-		d.networkd = networkd.New()
-		// #1956 AGY r3 CRITICAL: exempt the #1922 management protected set
-		// from networkd.Apply's stale-file sweep so the lifeline's rename +
-		// addressing survive a commit that leaves it out of the config.
-		d.networkd.SetProtectedResolver(d.resolveProtectedInterfaces)
-		d.dhcpServer = dhcpserver.New()
-		// #1387 inc-2: construct the DHCP dynamic-DNS manager UNCONDITIONALLY
-		// (plan §4.2) — even when DDNS is disabled — so the always-on
-		// reconcile loop can withdraw records on an enabled→disabled commit.
-		// The nodeID is a node-stable watermark HINT only (never the
-		// delete-matching key, Inc-1 ddns.go), so an empty seed in standalone
-		// mode is harmless. The live rfc2136 backend is resolved per-Reconcile
-		// from the current policy.
-		d.ddns = dhcpserver.NewProductionDDNSManager(ddnsNodeIDSeed())
-		// #2691 P2: the always-on Surface A manager (router/interface-address
-		// publish). Constructed unconditionally for the same reason as the lease
-		// manager — a binding removal must have a running loop to withdraw.
-		d.surfaceA.mgr = ddns.NewSurfaceAManager()
-	}
-
-	// Create the RPM manager eagerly so the pointer is stable for the
-	// CLI/gRPC results closures and so applyConfig's hash-gated
-	// reconcileRPM (#1827) can start probes from the very first apply.
-	d.rpm = rpm.New()
-
-	// Create the ip-monitoring engine (#1827 PR-1b) before the first
-	// applyConfig so reconcileIPMon can install committed policies.
-	// The engine drives the routes-only actuator through its own
-	// debounce/throttle loop; the RPM transition hook is its sensor.
-	d.ipmon = ipmon.New(d.actuateRouteOverlay)
-	d.rpm.SetTransitionCallback(d.ipmon.HandleTransition)
-
-	// Construct the event-options engine and register its RPM event callback
-	// HERE — BEFORE the first applyConfig runs reconcileRPM and starts the
-	// probe goroutines (#3755). runProbeLoop runs its FIRST cycle immediately,
-	// so a ping_probe_failed / ping_test_failed / ping_test_completed emitted by
-	// that first cycle would be dropped (fireEvent is a no-op while onEvent is
-	// nil) if the callback were installed later — a boot-time failover edge the
-	// automation exists to handle, lost for long test-interval values. Wiring
-	// the callback before probes start closes that gap; rpm additionally buffers
-	// any event fired before a callback exists and replays it on registration,
-	// as a belt against a future reorder. Idempotent (write-once pointer).
-	d.initEventEngine()
-
-	// Create the DHCP manager eagerly, beside the ipmon engine (#1844
-	// plan §4.3, AGY r2-1/r2-2): d.dhcp is write-once at boot and
-	// read-only thereafter — the engine's run-loop goroutine (via the
-	// next-hop resolver) and the CLI/gRPC handlers read the pointer
-	// bare, so the previous lazy-create-under-applySem was a Go data
-	// race (and the first apply would have built the overlay against a
-	// nil resolver target). A dhcp.New failure is FATAL: it means
-	// netlink.NewHandle failed, and the daemon cannot manage interfaces
-	// without netlink anyway — a silent nil d.dhcp would strand the
-	// process DHCP-less for its lifetime with no retry path (SMR plan
-	// r3). The gateway-change hook nil-guards d.ipmon so construction
-	// order can never regress silently.
-	if !d.opts.NoDataplane {
-		// State dir for DUID persistence — same directory as config file.
-		dm, err := dhcp.New(filepath.Dir(d.opts.ConfigFile), d.onDHCPAddressChange, func() {
-			if e := d.ipmon; e != nil {
-				e.NotifyNextHopChange()
-			}
-		})
-		if err != nil {
-			return fmt.Errorf("create DHCP manager: %w", err)
-		}
-		d.dhcp = dm
-	}
-
-	// Resolver injection MUST precede Start(): the run-loop goroutine
-	// reads the resolver field without further synchronization, and the
-	// goroutine-creation happens-before edge also publishes d.dhcp.
-	d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop)
-	d.ipmon.Start()
-
-	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-		cc := cfg.Chassis.Cluster
-		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
-		d.cluster.SetSoftwareVersion(d.opts.Version)
-
-		// #1930 INC-2: if THIS boot is a kernel-candidate trial (the kernel
-		// journal is ARMED), set the unconditional election hold BEFORE the
-		// FIRST election so the candidate can never win it (even isolated) until
-		// the promotion gate verifies the dataplane. UpdateConfig() ITSELF runs
-		// an election (single-node path when no peer is up yet, which is exactly
-		// the candidate-boot case), so the hold MUST precede UpdateConfig — not
-		// merely Start() — or the node is already StatePrimary by the time the
-		// hold is set and Start()'s heartbeat/VRRP would advertise primary and
-		// preempt the healthy peer. ManualFailover is in-memory (lost across the
-		// reboot) and peerAlive is still false here, so the unconditional hold —
-		// not ForceSecondary — is what keeps an unverified candidate from
-		// blackholing traffic (r2 AGY Critical). No-op on an ordinary boot.
-		d.holdSecondaryIfKernelCandidateArmed()
-
-		d.cluster.UpdateConfig(cc)
-		d.cluster.Start(ctx)
-		// Wire event-drop callback: on dropped cluster events, trigger
-		// immediate reconciliation so the safety net doesn't wait 2s.
-		d.cluster.SetOnEventDrop(d.triggerReconcile)
-		slog.Info("cluster manager initialized",
-			"node", cc.NodeID, "cluster", cc.ClusterID)
-
-		// Watch cluster events for state transitions (primary/secondary).
-		go d.watchClusterEvents(ctx)
-
-		// #1930 INC-2: bounded local self-recovery for the LANE-1 HA kernel
-		// channel — auto-rejoin if an external kernel-roll orchestrator crashed
-		// while this node was drained+rebooting (no-op unless orphaned-drained).
-		d.startKernelSelfRecovery(ctx)
-	}
-
-	// Enable IP forwarding — required for the firewall to route packets.
-	// #1922: suppressed in bootstrap mode (a takeover host tunable; the
-	// bootstrap-exit reconcile enables it on the first confirmed commit).
-	if !d.opts.NoDataplane && !d.inBootstrap() {
-		enableForwarding()
-	}
-
-	// Create VRRP manager eagerly — must exist before applyConfig runs.
-	d.vrrpMgr = vrrp.NewManager()
-	// Wire event-drop callback: on dropped VRRP events, trigger
-	// immediate reconciliation.
-	d.vrrpMgr.SetOnEventDrop(d.triggerReconcile)
-	if err := d.vrrpMgr.Start(context.Background()); err != nil {
-		slog.Warn("failed to start VRRP manager", "err", err)
-	}
-	// On fresh cluster daemon start, suppress VRRP preemption until session
-	// bulk sync completes (or timeout) to avoid preempt-before-sync outages.
-	// Only applies when VRRP is enabled — otherwise no RETH VRRP instances.
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-		cc := cfg.Chassis.Cluster
-		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP && !cc.PrivateRGElection {
-			d.vrrpMgr.SetSyncHold(30 * time.Second)
-		}
-		// Private-rg-election mode: gate RG promotion on session sync
-		// readiness with a 30s timeout fallback (mirrors VRRP sync-hold).
-		// Without this, standalone nodes or nodes with permanently-down
-		// peers would never become primary.
-		if cc.PrivateRGElection && cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
-			d.armSyncReadyTimer()
-		}
+	if err := d.initManagers(ctx, configCompileFailed); err != nil {
+		return err
 	}
 
 	// Create dataplane backend (unless in config-only mode)
@@ -1889,6 +1719,194 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		}
 	}()
 	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
+}
+
+// initManagers eagerly constructs the daemon's subsystem managers (routing,
+// FRR, IPsec, RPM, ip-monitoring, event-options engine, DHCP, cluster, and
+// VRRP), storing each on d.*, BEFORE the first applyConfig and the dataplane
+// backend build that follow in Run(). Extracted verbatim from Run()'s PHASE 3
+// (#4662 Increment 4); the creation order is load-bearing (e.g. the
+// event-options engine registers an RPM callback and must exist before the
+// first applyConfig reconciles RPM). configCompileFailed is the #1960
+// fail-closed flag threaded from PHASE 1 (read-only here, at
+// clearFRRForFailClosedBoot). Returns a non-nil error only on a fatal DHCP
+// manager-create failure (the sole early return in the original block), which
+// Run propagates unchanged.
+func (d *Daemon) initManagers(ctx context.Context, configCompileFailed bool) error {
+	// Initialize routing, FRR, and IPsec managers
+	if !d.opts.NoDataplane {
+		rm, err := routing.New()
+		if err != nil {
+			slog.Warn("failed to create routing manager", "err", err)
+		} else {
+			d.routing = rm
+			// #1827: flush the reserved probe-pin band (ip rules 50-99 +
+			// tables 7000-7049) before anything else runs, so a crashed
+			// daemon never leaks stale probe pins across restarts.
+			if err := d.routing.ClearProbePins(); err != nil {
+				slog.Warn("failed to clear stale probe pins", "err", err)
+			}
+		}
+		d.frr = frr.New()
+		// #1993: on a compile-failure boot with NO preserved XDP attachments,
+		// the last-good frr.conf managed section is still on disk and FRR (an
+		// independent service) will form peerings + re-advertise prefixes for
+		// routes this unarmed node cannot forward — a transit blackhole. Clear
+		// ONLY the managed section, right after the manager exists and BEFORE
+		// the run loop settles, so peers fail over to the HA partner. The
+		// predicate PRESERVES the managed section on a hitless restart only when
+		// the helper control socket reports forwarding is genuinely live
+		// (enabled+armed); pinned XDP links are merely a cheap pre-filter, NOT
+		// proof of live forwarding (a graceful stop leaves the pins but disarms
+		// forwarding). Freeze-in-last-known-good for management (#1960) is
+		// preserved: no .network/.link removal, no link-cycle.
+		d.clearFRRForFailClosedBoot(configCompileFailed)
+		d.ipsec = ipsec.New()
+		d.ra = ra.New()
+		d.networkd = networkd.New()
+		// #1956 AGY r3 CRITICAL: exempt the #1922 management protected set
+		// from networkd.Apply's stale-file sweep so the lifeline's rename +
+		// addressing survive a commit that leaves it out of the config.
+		d.networkd.SetProtectedResolver(d.resolveProtectedInterfaces)
+		d.dhcpServer = dhcpserver.New()
+		// #1387 inc-2: construct the DHCP dynamic-DNS manager UNCONDITIONALLY
+		// (plan §4.2) — even when DDNS is disabled — so the always-on
+		// reconcile loop can withdraw records on an enabled→disabled commit.
+		// The nodeID is a node-stable watermark HINT only (never the
+		// delete-matching key, Inc-1 ddns.go), so an empty seed in standalone
+		// mode is harmless. The live rfc2136 backend is resolved per-Reconcile
+		// from the current policy.
+		d.ddns = dhcpserver.NewProductionDDNSManager(ddnsNodeIDSeed())
+		// #2691 P2: the always-on Surface A manager (router/interface-address
+		// publish). Constructed unconditionally for the same reason as the lease
+		// manager — a binding removal must have a running loop to withdraw.
+		d.surfaceA.mgr = ddns.NewSurfaceAManager()
+	}
+
+	// Create the RPM manager eagerly so the pointer is stable for the
+	// CLI/gRPC results closures and so applyConfig's hash-gated
+	// reconcileRPM (#1827) can start probes from the very first apply.
+	d.rpm = rpm.New()
+
+	// Create the ip-monitoring engine (#1827 PR-1b) before the first
+	// applyConfig so reconcileIPMon can install committed policies.
+	// The engine drives the routes-only actuator through its own
+	// debounce/throttle loop; the RPM transition hook is its sensor.
+	d.ipmon = ipmon.New(d.actuateRouteOverlay)
+	d.rpm.SetTransitionCallback(d.ipmon.HandleTransition)
+
+	// Construct the event-options engine and register its RPM event callback
+	// HERE — BEFORE the first applyConfig runs reconcileRPM and starts the
+	// probe goroutines (#3755). runProbeLoop runs its FIRST cycle immediately,
+	// so a ping_probe_failed / ping_test_failed / ping_test_completed emitted by
+	// that first cycle would be dropped (fireEvent is a no-op while onEvent is
+	// nil) if the callback were installed later — a boot-time failover edge the
+	// automation exists to handle, lost for long test-interval values. Wiring
+	// the callback before probes start closes that gap; rpm additionally buffers
+	// any event fired before a callback exists and replays it on registration,
+	// as a belt against a future reorder. Idempotent (write-once pointer).
+	d.initEventEngine()
+
+	// Create the DHCP manager eagerly, beside the ipmon engine (#1844
+	// plan §4.3, AGY r2-1/r2-2): d.dhcp is write-once at boot and
+	// read-only thereafter — the engine's run-loop goroutine (via the
+	// next-hop resolver) and the CLI/gRPC handlers read the pointer
+	// bare, so the previous lazy-create-under-applySem was a Go data
+	// race (and the first apply would have built the overlay against a
+	// nil resolver target). A dhcp.New failure is FATAL: it means
+	// netlink.NewHandle failed, and the daemon cannot manage interfaces
+	// without netlink anyway — a silent nil d.dhcp would strand the
+	// process DHCP-less for its lifetime with no retry path (SMR plan
+	// r3). The gateway-change hook nil-guards d.ipmon so construction
+	// order can never regress silently.
+	if !d.opts.NoDataplane {
+		// State dir for DUID persistence — same directory as config file.
+		dm, err := dhcp.New(filepath.Dir(d.opts.ConfigFile), d.onDHCPAddressChange, func() {
+			if e := d.ipmon; e != nil {
+				e.NotifyNextHopChange()
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("create DHCP manager: %w", err)
+		}
+		d.dhcp = dm
+	}
+
+	// Resolver injection MUST precede Start(): the run-loop goroutine
+	// reads the resolver field without further synchronization, and the
+	// goroutine-creation happens-before edge also publishes d.dhcp.
+	d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop)
+	d.ipmon.Start()
+
+	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+		cc := cfg.Chassis.Cluster
+		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
+		d.cluster.SetSoftwareVersion(d.opts.Version)
+
+		// #1930 INC-2: if THIS boot is a kernel-candidate trial (the kernel
+		// journal is ARMED), set the unconditional election hold BEFORE the
+		// FIRST election so the candidate can never win it (even isolated) until
+		// the promotion gate verifies the dataplane. UpdateConfig() ITSELF runs
+		// an election (single-node path when no peer is up yet, which is exactly
+		// the candidate-boot case), so the hold MUST precede UpdateConfig — not
+		// merely Start() — or the node is already StatePrimary by the time the
+		// hold is set and Start()'s heartbeat/VRRP would advertise primary and
+		// preempt the healthy peer. ManualFailover is in-memory (lost across the
+		// reboot) and peerAlive is still false here, so the unconditional hold —
+		// not ForceSecondary — is what keeps an unverified candidate from
+		// blackholing traffic (r2 AGY Critical). No-op on an ordinary boot.
+		d.holdSecondaryIfKernelCandidateArmed()
+
+		d.cluster.UpdateConfig(cc)
+		d.cluster.Start(ctx)
+		// Wire event-drop callback: on dropped cluster events, trigger
+		// immediate reconciliation so the safety net doesn't wait 2s.
+		d.cluster.SetOnEventDrop(d.triggerReconcile)
+		slog.Info("cluster manager initialized",
+			"node", cc.NodeID, "cluster", cc.ClusterID)
+
+		// Watch cluster events for state transitions (primary/secondary).
+		go d.watchClusterEvents(ctx)
+
+		// #1930 INC-2: bounded local self-recovery for the LANE-1 HA kernel
+		// channel — auto-rejoin if an external kernel-roll orchestrator crashed
+		// while this node was drained+rebooting (no-op unless orphaned-drained).
+		d.startKernelSelfRecovery(ctx)
+	}
+
+	// Enable IP forwarding — required for the firewall to route packets.
+	// #1922: suppressed in bootstrap mode (a takeover host tunable; the
+	// bootstrap-exit reconcile enables it on the first confirmed commit).
+	if !d.opts.NoDataplane && !d.inBootstrap() {
+		enableForwarding()
+	}
+
+	// Create VRRP manager eagerly — must exist before applyConfig runs.
+	d.vrrpMgr = vrrp.NewManager()
+	// Wire event-drop callback: on dropped VRRP events, trigger
+	// immediate reconciliation.
+	d.vrrpMgr.SetOnEventDrop(d.triggerReconcile)
+	if err := d.vrrpMgr.Start(context.Background()); err != nil {
+		slog.Warn("failed to start VRRP manager", "err", err)
+	}
+	// On fresh cluster daemon start, suppress VRRP preemption until session
+	// bulk sync completes (or timeout) to avoid preempt-before-sync outages.
+	// Only applies when VRRP is enabled — otherwise no RETH VRRP instances.
+	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+		cc := cfg.Chassis.Cluster
+		if cc.FabricInterface != "" && cc.FabricPeerAddress != "" && !cc.NoRethVRRP && !cc.PrivateRGElection {
+			d.vrrpMgr.SetSyncHold(30 * time.Second)
+		}
+		// Private-rg-election mode: gate RG promotion on session sync
+		// readiness with a 30s timeout fallback (mirrors VRRP sync-hold).
+		// Without this, standalone nodes or nodes with permanently-down
+		// peers would never become primary.
+		if cc.PrivateRGElection && cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
+			d.armSyncReadyTimer()
+		}
+	}
+	return nil
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
