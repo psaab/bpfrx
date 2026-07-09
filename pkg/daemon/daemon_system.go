@@ -212,14 +212,46 @@ func resolveSourceAddr(cfg *config.Config, srcIface string) string {
 	return ""
 }
 
-// applyAggregator starts or stops the session aggregation reporter.
+// aggregationCallback is the single, stable session-aggregation handler
+// registered on the EventReader exactly ONCE (aggCBOnce). It reads the live
+// SessionAggregator lock-free from the atomic pointer, so a config commit can
+// swap the aggregator — or clear it to nil on disable — without ever
+// registering a second callback. This is the #4964 fix mirroring the #3932
+// flow-trace / #2075 flow-export indirection: the previous applyAggregator
+// called er.AddCallback on every report-enabled reconcile, so a long-lived
+// daemon leaked one callback (and one never-flushed aggregator) per commit and
+// dispatched every event to all of them. A nil pointer (reporting disabled)
+// makes this a no-op.
+func (d *Daemon) aggregationCallback(rec logging.EventRecord, raw []byte) {
+	agg := d.aggregatorPtr.Load()
+	if agg == nil {
+		return
+	}
+	agg.HandleEvent(rec, raw)
+}
+
+// applyAggregator starts or stops the session aggregation reporter. The stable
+// indirection callback (aggregationCallback) is registered on er exactly once
+// — the first time reporting is enabled — and every later call only SWAPS the
+// active aggregator, cancelling the Run goroutine of the one it replaced. So N
+// report-enabled commits leave exactly one registered callback and one live
+// aggregator (#4964). Disabling reporting stores a nil aggregator; the stable
+// callback stays but becomes a no-op.
 func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
-	// Stop existing aggregator
+	d.aggReconMu.Lock()
+	defer d.aggReconMu.Unlock()
+
+	// Stop the currently-running aggregator generation (if any). Swap the
+	// published pointer to nil FIRST so no in-flight event can enter the
+	// retired aggregator via the stable callback, THEN cancel its flush
+	// goroutine. Retiring in the other order would let HandleEvent keep
+	// feeding a cancelled aggregator whose Run no longer flushes (the #4964
+	// leak).
 	if d.aggCancel != nil {
+		d.aggregatorPtr.Store(nil)
 		d.aggCancel()
 		d.aggCancel = nil
 	}
-	d.aggregator = nil
 
 	if !cfg.Security.Log.Report {
 		return
@@ -232,11 +264,23 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 		er.ForwardLogMsg(severity, msg)
 	})
 
-	er.AddCallback(agg.HandleEvent)
-
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Publish the new aggregator BEFORE arming the callback (and before Run
+	// starts) so the stable callback, once registered, never observes a nil
+	// during startup. Add accumulates immediately; Run only flushes.
+	d.aggregatorPtr.Store(agg)
 	d.aggCancel = cancel
-	d.aggregator = agg
+
+	// Register the single stable callback exactly once, the first time
+	// reporting is enabled. A boot with reporting disabled registers nothing;
+	// the first enable arms it. er is the same EventReader across every commit
+	// (daemon_run.go assigns the boot reader to d.eventReader, daemon_apply.go
+	// passes d.eventReader), so one registration covers all generations.
+	d.aggCBOnce.Do(func() {
+		er.AddCallback(d.aggregationCallback)
+	})
+
 	go agg.Run(ctx)
 	slog.Info("session aggregation reporting enabled (5 min interval)")
 }

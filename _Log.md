@@ -43955,3 +43955,9 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4878 type the IKE/IPsec-gateway DPD interval/threshold value leaves (ValueInteger + ValidateInteger(1,3600) / (1,100)) so garbage/zero/negative/overflow is rejected at commit-check (strict) and downgraded to a warning on tolerant load (#1960 via compileTreeLenient); both closed-world copies
   **File(s)**: pkg/config/schema_security.go, pkg/config/dpd_typed_value_4878_test.go, docs/config-schema.md
+  **Action**: #4961 scope RA supersession per-interface — WithdrawInterfaces/WithdrawOnce bump a per-interface epoch (ifaceEpoch) instead of the whole-manager fence; releaseDrain restart + applyDeferred check the per-interface baseline (drainEntry.startIfaceEpoch) so an unrelated withdraw of interface B no longer cancels interface A's in-flight restart (IPv6 loss)
+  **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4964 stop applyAggregator leaking an append-only EventReader callback + a never-flushed 20k-key SessionAggregator per report-enabled commit. Register one stable indirection callback (aggregationCallback) exactly once via aggCBOnce, publish the live aggregator through an atomic.Pointer (aggregatorPtr), swap-to-nil-before-cancel on retire — mirrors the #3932 TraceWriter / #2075 flowexport pattern. Removed the write-only aggregator field; added aggReconMu.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_system.go, pkg/daemon/aggregator_callback_4964_test.go

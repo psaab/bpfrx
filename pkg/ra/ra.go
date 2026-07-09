@@ -52,6 +52,13 @@ type drainEntry struct {
 	cfg            *config.RAInterfaceConfig // config for a standalone goodbye, if owed
 	goodbyeWanted  bool                      // a graceful Withdraw targeted this interface
 	goodbyeClaimed bool                      // the owner has taken responsibility to emit it
+	// startIfaceEpoch is the per-interface epoch (m.ifaceEpoch[name]) captured
+	// when a CHANGED-config restart installed this entry (#4961). releaseDrain
+	// starts the replacement only if this interface's epoch is UNCHANGED — i.e.
+	// no interface-scoped withdraw (WithdrawInterfaces/WithdrawOnce naming THIS
+	// interface) superseded the restart. It is 0 (and unused) for removal /
+	// Clear / WithdrawOnce entries, which pass onProvenClose=nil.
+	startIfaceEpoch uint64
 }
 
 // Manager manages per-interface RA sender goroutines.
@@ -66,24 +73,47 @@ type Manager struct {
 	// standalone goodbye it claimed has fully completed.
 	draining map[string]*drainEntry
 
-	// epoch is bumped on every state-mutating call (Apply, Withdraw,
-	// WithdrawInterfaces, WithdrawOnce, Clear). A deferred Apply captures the
-	// epoch before releasing m.mu and ABORTS its deferred start if the epoch
-	// changed — a newer call (e.g. a BACKUP transition) superseded it (#2033
-	// I16b). This prevents a stale Apply from starting RA on a demoted node.
+	// epoch is the WHOLE-MANAGER fence, bumped by the whole-manager mutators
+	// (Apply, Withdraw, Clear). A deferred Apply / changed-config restart
+	// captures it before releasing m.mu and ABORTS if it changed — a newer
+	// whole-manager call (e.g. a BACKUP transition's Withdraw/Clear, or a fresh
+	// full Apply) superseded it (#2033 I16b). This prevents a stale Apply from
+	// starting RA on a demoted node.
+	//
+	// #4961: the INTERFACE-SCOPED withdraws (WithdrawInterfaces / WithdrawOnce)
+	// no longer bump this global fence — bumping it made an unrelated
+	// WithdrawInterfaces([B]) cancel a DIFFERENT interface A's in-flight
+	// changed-config restart (epoch mismatch → A's replacement suppressed AND
+	// its tombstone deleted → A loses its RA sender → IPv6 loss on A's hosts).
+	// They now bump only the per-interface epoch below, so supersession is
+	// scoped to the interfaces they actually name.
 	epoch uint64
+
+	// ifaceEpoch is the per-interface supersession revision (#4961), bumped by
+	// the interface-scoped withdraws (WithdrawInterfaces / WithdrawOnce) for
+	// each interface they name. A changed-config restart records the target
+	// interface's epoch on its drainEntry (startIfaceEpoch) and a deferred Apply
+	// captures it per interface; releaseDrain / applyDeferred start the
+	// (re)placement only if THIS interface's epoch is still unchanged. A withdraw
+	// of interface B thus cannot cancel interface A's restart.
+	ifaceEpoch map[string]uint64
 }
 
 // New creates a new RA manager.
 func New() *Manager {
 	return &Manager{
-		senders:  make(map[string]*sender),
-		draining: make(map[string]*drainEntry),
+		senders:    make(map[string]*sender),
+		draining:   make(map[string]*drainEntry),
+		ifaceEpoch: make(map[string]uint64),
 	}
 }
 
-// bumpEpoch increments the manager epoch. Callers must hold m.mu.
+// bumpEpoch increments the whole-manager fence epoch. Callers must hold m.mu.
 func (m *Manager) bumpEpoch() { m.epoch++ }
+
+// bumpIfaceEpoch increments the per-interface supersession revision for name
+// (#4961). Callers must hold m.mu.
+func (m *Manager) bumpIfaceEpoch(name string) { m.ifaceEpoch[name]++ }
 
 // interfaceBusy reports whether the named interface currently has an active
 // sender or a draining tombstone. Callers must hold m.mu.
@@ -187,10 +217,14 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 
 		// No (further) goodbye owed. Decide the replacement under THIS lock with
 		// FRESH epoch + goodbyeWanted (round-5: no cached boolean). Start ONLY
-		// if epoch is still ours AND no goodbye was wanted (a withdraw overrides
-		// a replace). Neither can change while we hold the lock.
+		// if the whole-manager fence is still ours (no Clear/Withdraw/full-Apply
+		// superseded), THIS interface's per-interface epoch is unchanged (#4961:
+		// no interface-scoped withdraw naming this interface superseded), AND no
+		// goodbye was wanted (a withdraw overrides a replace). None can change
+		// while we hold the lock.
 		var startErr error
-		if onProvenClose != nil && m.epoch == startEpoch && !e.goodbyeWanted {
+		if onProvenClose != nil && m.epoch == startEpoch &&
+			m.ifaceEpoch[name] == e.startIfaceEpoch && !e.goodbyeWanted {
 			// Old conn PROVEN closed + tombstone still held → ≤1 live conn.
 			startErr = onProvenClose()
 		}
@@ -308,7 +342,16 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 				slog.Info("ra: restarting sender", "interface", name)
 			}
 			delete(m.senders, name)
-			m.draining[name] = &drainEntry{sender: existing, cfg: existing.cfg}
+			// #4961: record THIS interface's per-interface epoch on the restart
+			// tombstone. releaseDrain starts the replacement only if the epoch is
+			// still this value — an interface-scoped withdraw naming this
+			// interface bumps it and suppresses the (now-superseded) restart,
+			// while a withdraw of a DIFFERENT interface leaves it untouched.
+			m.draining[name] = &drainEntry{
+				sender:          existing,
+				cfg:             existing.cfg,
+				startIfaceEpoch: m.ifaceEpoch[name],
+			}
 			existing.signalStop(modeHard)
 			toStop = append(toStop, stopReq{name, existing})
 			toRestart = append(toRestart, cfg)
@@ -329,6 +372,14 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	}
 
 	epoch := m.epoch
+	// #4961: capture each deferred interface's per-interface epoch as the
+	// baseline applyDeferred re-checks, so an interface-scoped withdraw naming
+	// that interface (but NOT one naming a different interface) aborts its
+	// deferred start.
+	deferredIfaceEpoch := make(map[string]uint64, len(deferred))
+	for _, cfg := range deferred {
+		deferredIfaceEpoch[cfg.Interface] = m.ifaceEpoch[cfg.Interface]
+	}
 	m.mu.Unlock()
 
 	restartSet := make(map[string]*config.RAInterfaceConfig, len(toRestart))
@@ -379,7 +430,7 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	// Second pass for interfaces that were ALREADY draining when we held the
 	// lock (not our own restart tombstones — those are handled above).
 	if len(deferred) > 0 {
-		if err := m.applyDeferred(deferred, epoch); err != nil && firstErr == nil {
+		if err := m.applyDeferred(deferred, epoch, deferredIfaceEpoch); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -388,10 +439,13 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 }
 
 // applyDeferred waits (bounded) for each deferred interface's tombstone to
-// clear, then re-acquires m.mu and starts it — but only if the manager epoch
-// still matches startEpoch (else a newer call superseded this Apply, #2033
-// I16b). It must be called WITHOUT m.mu held.
-func (m *Manager) applyDeferred(configs []*config.RAInterfaceConfig, startEpoch uint64) error {
+// clear, then re-acquires m.mu and starts it — but only if neither the
+// whole-manager fence (startEpoch) nor THIS interface's per-interface epoch
+// (startIfaceEpoch[iface], #4961) changed. A whole-manager Withdraw/Clear/Apply
+// bumps the former; an interface-scoped withdraw naming this interface bumps the
+// latter. A withdraw of a DIFFERENT interface changes neither, so this start
+// still proceeds. It must be called WITHOUT m.mu held.
+func (m *Manager) applyDeferred(configs []*config.RAInterfaceConfig, startEpoch uint64, startIfaceEpoch map[string]uint64) error {
 	var firstErr error
 	for _, cfg := range configs {
 		if !m.waitTombstoneClear(cfg.Interface) {
@@ -401,8 +455,9 @@ func (m *Manager) applyDeferred(configs []*config.RAInterfaceConfig, startEpoch 
 		}
 
 		m.mu.Lock()
-		if m.epoch != startEpoch {
-			// A newer Withdraw/Clear/Apply superseded this start; abort.
+		if m.epoch != startEpoch || m.ifaceEpoch[cfg.Interface] != startIfaceEpoch[cfg.Interface] {
+			// A newer whole-manager call (epoch) or an interface-scoped withdraw
+			// naming this interface (ifaceEpoch) superseded this start; abort.
 			slog.Debug("ra: deferred Apply superseded by newer epoch, skipping",
 				"interface", cfg.Interface)
 			m.mu.Unlock()
@@ -504,7 +559,13 @@ func (m *Manager) Withdraw() error {
 // interfaces. Other senders are left running.
 func (m *Manager) WithdrawInterfaces(names []string) {
 	m.mu.Lock()
-	m.bumpEpoch()
+	// #4961: bump ONLY the per-interface epochs for the named interfaces, NOT
+	// the whole-manager fence. Bumping the global fence made this cancel an
+	// UNRELATED interface's in-flight changed-config restart (IPv6 loss on that
+	// interface). Interface-scoped supersession is now scoped to `names`.
+	for _, name := range names {
+		m.bumpIfaceEpoch(name)
+	}
 	owned := m.claimGracefulLocked(names)
 	epoch := m.epoch
 	m.mu.Unlock()
@@ -640,7 +701,12 @@ func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
 func (m *Manager) claimWithdrawOnceLocked(configs []*config.RAInterfaceConfig) []*config.RAInterfaceConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.bumpEpoch()
+	// #4961: interface-scoped op — bump only the named interfaces' per-interface
+	// epochs, not the whole-manager fence, so a WithdrawOnce of interface B
+	// cannot cancel interface A's in-flight restart / deferred start.
+	for _, cfg := range configs {
+		m.bumpIfaceEpoch(cfg.Interface)
+	}
 	var toGoodbye []*config.RAInterfaceConfig
 	for _, cfg := range configs {
 		if m.interfaceBusy(cfg.Interface) {
