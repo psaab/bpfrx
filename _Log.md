@@ -43935,3 +43935,7 @@ top.
   **File(s)**: pkg/config/compiler_validate_strict_chassis.go, pkg/config/schema_validate_chassis_test.go
   **Action**: #4866 cmdtree RI/RG completion DynamicFns nil-skip tolerated (#3494) entries via shared helpers
   **File(s)**: pkg/cmdtree/tree.go, pkg/cmdtree/completion_nil_ri_rg_4866_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4884(C) devicemap enumerates non-PCI physical NICs (USB/platform/SoC) so key mac entries bind; classifyNetdev seam + doc
+  **File(s)**: pkg/devicemap/devicemap.go, pkg/devicemap/devicemap_nonpci_4884_test.go, docs/bare-metal-device-map.md

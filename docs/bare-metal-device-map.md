@@ -104,6 +104,11 @@ immediately on commit.
   fallback — PCI moved, re-pin)`).
 - **No permanent MAC** (common on some VFs/virtio): the entry binds PCI-only
   and `show` marks it `(PCI-only, unverified)`; `key mac` is rejected.
+- **Non-PCI physical NICs** (USB / platform / SoC ethernet) have no PCI
+  address but do carry a factory MAC. They are enumerated (with an empty PCI
+  column) so a `key mac` entry binds them; only purely virtual netdevs
+  (loopback, bridge, veth, bond, vlan, vrf, tun/tap) are excluded from the
+  inventory. Map such a NIC with `key mac` (`pci` is unavailable).
 - **RETH members are PCI-only.** A RETH member's MAC alternates
   physical↔virtual, so its entry must be PCI-keyed (`key mac` is rejected at
   commit). It keeps `.link` `OriginalName=` matching as before.
