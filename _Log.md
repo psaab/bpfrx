@@ -1,3 +1,28 @@
+## 2026-07-09 — #4752 observability: deterministic-NAT pool block-utilization metric
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4752 (split from #4559). The #2079 pool-utilization alarm keys
+  off pool-wide `UsedPorts`, meaningless for a deterministic (CGNAT) pool whose
+  ports are pre-partitioned into fixed per-subscriber blocks — so deterministic
+  pools had no utilization/exhaustion observability. Scoped it: the deterministic
+  block mapping is a STATELESS reversible function (`allocate_deterministic_v4`),
+  so the config-derived block-PROVISIONING view is fully Go-bounded. Added two
+  Prometheus gauges to `collectNATPoolMetrics`:
+  `xpf_nat_deterministic_pool_blocks_total` (capacity = `len(addresses) *
+  floor(port-range / block-size)`, mirrors the compiler `totalBlocks`) and
+  `xpf_nat_deterministic_pool_blocks_allocated` (provisioned subscriber blocks,
+  one per subscriber; IPv6 caps at capacity). Operator charts allocated/total
+  and alarms toward 1.0. New `deterministicPoolBlockCapacity` helper; refactored
+  the existing IPv6 branch of `deterministicSubscriberCapacity` to reuse it.
+  Descriptor + Describe() wiring + descriptor-coverage canary stay green.
+  RUNTIME per-subscriber block-occupancy alarm (needs new allocator state)
+  remains a documented deferred Rust follow-up. Behavior tests (helper math for
+  IPv4/IPv6/invalid + end-to-end emission asserting det-only emission and
+  126/64 values), RED-on-mutation verified. go build + full Go suite green.
+- **File(s)**: pkg/api/metrics_nat.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_det_pool_blocks_4752_test.go,
+  docs/deterministic-nat-cgnat.md, docs/feature-gaps.md, _Log.md
+
 ## 2026-07-09 — #4759 observability: per-type ICMP/ND host-inbound accept counters
 
 - **Timestamp**: 2026-07-09
