@@ -43961,3 +43961,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4964 stop applyAggregator leaking an append-only EventReader callback + a never-flushed 20k-key SessionAggregator per report-enabled commit. Register one stable indirection callback (aggregationCallback) exactly once via aggCBOnce, publish the live aggregator through an atomic.Pointer (aggregatorPtr), swap-to-nil-before-cancel on retire — mirrors the #3932 TraceWriter / #2075 flowexport pattern. Removed the write-only aggregator field; added aggReconMu.
   **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_system.go, pkg/daemon/aggregator_callback_4964_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4970 fix remote completion cursor unit mismatch. The Tab caller (remoteCompleter.Do) sent Pos as a RUNE index while the server's Complete slices req.Line[:req.Pos] by BYTES, so a multibyte rune before the cursor truncated the prefix mid-code-point. Added completionCursor() sending int32(len(text)) (byte offset, matching the already-correct `?` listener); hardened the server to reject a mid-rune byte offset with InvalidArgument (utf8.RuneStart) instead of emitting corrupted text; documented the byte-offset contract on CompleteRequest.pos in the proto.
+  **File(s)**: cmd/cli/shared.go, cmd/cli/completion_pos_4970_test.go, pkg/grpcapi/server_cluster.go, pkg/grpcapi/complete_utf8_pos_4970_test.go, proto/xpf/v1/xpf.proto
