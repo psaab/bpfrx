@@ -40,6 +40,16 @@ type EventStream struct {
 	mu   sync.Mutex
 	conn net.Conn // current helper connection; nil when disconnected
 
+	// writeMu serializes the SetWriteDeadline+Write pair inside writeFrame so
+	// two concurrent frame writers (ackLoop's 100ms ticker vs a SendPause /
+	// SendResume / SendDrainRequest transition) cannot interleave their
+	// deadline set and write on the same conn (#4835). It is deliberately a
+	// SEPARATE lock from mu: mu guards connection lifecycle (Close, the
+	// acceptLoop conn swap, readLoop's conn read) and must NOT be held across
+	// a potentially slow/blocked socket write, so widening mu to cover the
+	// write is not an option.
+	writeMu sync.Mutex
+
 	connected atomic.Bool
 	paused    atomic.Bool
 
@@ -805,20 +815,29 @@ func (es *EventStream) writeFrame(typ uint8, seq uint64, payload []byte) error {
 	// hdr[5:8] reserved, zero
 	binary.LittleEndian.PutUint64(hdr[8:16], seq)
 
-	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-
+	// Build the complete frame before taking the write lock so no shared
+	// state (only stack-local buf) is touched under it.
+	var buf []byte
 	if len(payload) == 0 {
-		_, err := conn.Write(hdr[:])
-		if err == nil {
-			es.FramesWritten.Add(1)
-		}
-		return err
+		buf = hdr[:]
+	} else {
+		// Header + payload together to minimize syscalls.
+		buf = make([]byte, EventFrameHeaderSize+len(payload))
+		copy(buf, hdr[:])
+		copy(buf[EventFrameHeaderSize:], payload)
 	}
 
-	// Write header + payload together to minimize syscalls.
-	buf := make([]byte, EventFrameHeaderSize+len(payload))
-	copy(buf, hdr[:])
-	copy(buf[EventFrameHeaderSize:], payload)
+	// Serialize SetWriteDeadline+Write as one atomic unit per frame. Without
+	// this, two concurrent writeFrame callers (ackLoop's ticker vs a Send*
+	// state transition) could interleave their deadline set + write on the
+	// same conn — a data race on the connection's write/deadline state and,
+	// for a future per-call variable deadline, a "wrong deadline wins"
+	// hazard (#4835). writeMu is held ONLY across the deadline+write, not
+	// es.mu, so a slow write never stalls connection-lifecycle work.
+	es.writeMu.Lock()
+	defer es.writeMu.Unlock()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err := conn.Write(buf)
 	if err == nil {
 		es.FramesWritten.Add(1)
