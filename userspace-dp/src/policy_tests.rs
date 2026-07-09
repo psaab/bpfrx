@@ -5651,6 +5651,83 @@ fn global_zone_rule(name: &str, match_from: &str, match_to: &str, action: &str) 
     }
 }
 
+// #4626 M03: a global rule scoped to a MULTI-zone set. The plural
+// match_from_zones/match_to_zones carry the full set; the singular fields keep
+// the first element for rolling-upgrade compatibility.
+fn global_zone_set_rule(
+    name: &str,
+    match_from: &[&str],
+    match_to: &[&str],
+    action: &str,
+) -> PolicyRuleSnapshot {
+    let to_vec = |zs: &[&str]| zs.iter().map(|z| z.to_string()).collect::<Vec<_>>();
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "junos-global".to_string(),
+        to_zone: "junos-global".to_string(),
+        match_from_zone: match_from.first().map(|s| s.to_string()).unwrap_or_default(),
+        match_to_zone: match_to.first().map(|s| s.to_string()).unwrap_or_default(),
+        match_from_zones: to_vec(match_from),
+        match_to_zones: to_vec(match_to),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: action.to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn global_policy_multi_zone_scope_matches_set_membership() {
+    // `match from-zone [ trust lan ] to-zone untrust permit`, default deny: a
+    // packet matches iff from ∈ {trust,lan} AND to ∈ {untrust}. (Fail-on-revert:
+    // if build_global_zone_scope kept only the first element, `lan->untrust`
+    // would fall through to the default deny.)
+    let state = parse_policy_state(
+        "deny",
+        &[global_zone_set_rule("g-multi", &["trust", "lan"], &["untrust"], "permit")],
+        &test_zone_name_to_id(),
+    );
+    // from ∈ set, to ∈ set → permit (both members).
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+    // from ∉ set → default deny.
+    assert_eq!(eval(&state, TEST_WAN_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Deny);
+    // to ∉ set → default deny.
+    assert_eq!(eval(&state, TEST_TRUST_ZONE_ID, TEST_WAN_ZONE_ID), PolicyAction::Deny);
+}
+
+#[test]
+fn global_policy_multi_zone_scope_prefers_plural_over_singular() {
+    // A snapshot whose singular field names only "trust" but whose plural set is
+    // [trust, lan] must honour the FULL plural set (the plural is preferred when
+    // non-empty). `lan->untrust` therefore matches.
+    let mut rule = global_zone_set_rule("g-multi", &["trust", "lan"], &["untrust"], "permit");
+    rule.match_from_zone = "trust".to_string(); // singular = first only
+    let state = parse_policy_state("deny", &[rule], &test_zone_name_to_id());
+    assert_eq!(eval(&state, TEST_LAN_ZONE_ID, TEST_UNTRUST_ZONE_ID), PolicyAction::Permit);
+}
+
+#[test]
+fn global_zone_scope_matches_and_host_predicate() {
+    // Unit coverage for the GlobalZoneScope set primitives (#4626 M03).
+    let any = GlobalZoneScope::Any;
+    assert!(any.matches(TEST_TRUST_ZONE_ID));
+    assert!(!any.is_host_scope());
+
+    let set = GlobalZoneScope::Zones(smallvec::smallvec![TEST_TRUST_ZONE_ID, TEST_LAN_ZONE_ID]);
+    assert!(set.matches(TEST_TRUST_ZONE_ID));
+    assert!(set.matches(TEST_LAN_ZONE_ID));
+    assert!(!set.matches(TEST_WAN_ZONE_ID));
+    assert!(!set.is_host_scope());
+
+    let host = GlobalZoneScope::Zones(smallvec::smallvec![JUNOS_HOST_ZONE_ID]);
+    assert!(host.is_host_scope());
+    let host_plus = GlobalZoneScope::Zones(smallvec::smallvec![JUNOS_HOST_ZONE_ID, TEST_TRUST_ZONE_ID]);
+    assert!(!host_plus.is_host_scope());
+}
+
 #[test]
 fn global_policy_zone_context_scopes_to_pair() {
     // `global policy match from-zone trust to-zone untrust permit`, default

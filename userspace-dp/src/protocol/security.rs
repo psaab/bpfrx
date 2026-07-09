@@ -454,6 +454,19 @@ pub(crate) struct PolicyRuleSnapshot {
     pub match_from_zone: String,
     #[serde(rename = "match_to_zone", default)]
     pub match_to_zone: String,
+    /// #4626 M03: the FULL scoped-global zone SET. A Junos global policy scope
+    /// is a zone LIST (`match from-zone [ trust dmz ]`); these ADDITIVE plural
+    /// fields carry every zone while the singular fields above keep the first
+    /// element for rolling-upgrade safety. `parse_policy_state` PREFERS the
+    /// plural when non-empty and falls back to the singular otherwise
+    /// (`effective_match_zones` / `build_global_zone_scope`, policy.rs).
+    /// `serde(default)` keeps wire parity with an older Go control plane that
+    /// omits them (decode to the empty set → singular fallback). Populated only
+    /// for global policies; empty for a zone-pair rule.
+    #[serde(rename = "match_from_zones", default)]
+    pub match_from_zones: Vec<String>,
+    #[serde(rename = "match_to_zones", default)]
+    pub match_to_zones: Vec<String>,
 }
 
 /// #1606: snapshot row for a unique address-book content.
