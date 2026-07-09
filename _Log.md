@@ -43906,3 +43906,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4866 cmdtree RI/RG completion DynamicFns nil-skip tolerated (#3494) entries via shared helpers
   **File(s)**: pkg/cmdtree/tree.go, pkg/cmdtree/completion_nil_ri_rg_4866_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4953 route firewall tcp-flags (#3076) + CoS numeric DSCP/PCP code-point (#2447) rejects through the strict/tolerant policy — moved to validateFirewallTCPFlagsStrict + lenientCoSNumericCodePoint-gated call sites so CompileConfigLenient/ForNodeLenient warn (boot) instead of failing closed on an already-persisted config (#1960)
+  **File(s)**: pkg/config/compiler.go, pkg/config/compiler_dispatch.go, pkg/config/compiler_firewall.go, pkg/config/compiler_class_of_service.go, pkg/config/compiler_validate_strict_filter.go, pkg/config/compiler_uniformgates.go, pkg/config/lenient_fw_cos_4953_test.go, pkg/config/README.md

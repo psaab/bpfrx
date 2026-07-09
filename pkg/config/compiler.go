@@ -1572,6 +1572,41 @@ type compileOpts struct {
 	// lenientEventAttributesMatch (its attributes-match sibling).
 	lenientEventWithinTrigger bool
 
+	// lenientFirewallTCPFlags (#4953) downgrades the firewall-filter
+	// `from tcp-flags` enforceability reject (validateFirewallTCPFlagsStrict:
+	// disjunction, negated group, unknown flag, dangling negation, or a
+	// required/forbidden contradiction) from a hard compile error to a
+	// cfg.Warnings entry. Before #3076 such an expression committed cleanly and
+	// the constraint was silently dropped on the wire (fail-OPEN); #3076 added
+	// an inline reject in compileFirewall, but the P4 section dispatch calls
+	// compileFirewall with NO compileOpts, so the reject could not be
+	// mode-gated — an upgraded node whose already-persisted config carried the
+	// expression blacked out on load (CompileConfigLenient returned the error →
+	// ActiveConfig()==nil) and a standby's SyncApply alarm-looped. Set ONLY on
+	// the tolerant load / peer-sync paths so an already-accepted config still
+	// BOOTS; commit / commit-check stay strict. The leniently-loaded term keeps
+	// its raw TCPFlags, which the userspace snapshot builder marks
+	// TCPFlagsUnparseable to fail the term CLOSED (#3367) — a fail-closed deny
+	// sentinel, never a match-all widening. Same doctrine as lenientFilterDSCP.
+	lenientFirewallTCPFlags bool
+
+	// lenientCoSNumericCodePoint (#4953) downgrades the class-of-service
+	// numeric DSCP/PCP code-point range reject (a `code-point`/`code-points`
+	// token that is an integer outside the 6-bit DSCP domain 0..63 or the
+	// 3-bit PCP domain 0..7, on either a classifier or a rewrite-rule) from a
+	// hard compile error to a cfg.Warnings entry. Before #2447 such a token was
+	// silently dropped at the Go layer and the dataplane masked it (dscp&0x3f /
+	// pcp.min(7)) onto a DIFFERENT traffic class; #2447 made it a hard commit
+	// reject, but the reject lives inside compileClassOfService (which the P4
+	// dispatch calls with no compileOpts), so it could not be mode-gated — an
+	// upgraded node whose already-persisted config carried the value blacked
+	// out on load and a standby's SyncApply alarm-looped. Set ONLY on the
+	// tolerant load / peer-sync paths so an already-accepted config still
+	// BOOTS; on that boot the offending entry is dropped, exactly the pre-#2447
+	// fail-safe. Commit / commit-check stay strict. Same doctrine as
+	// lenientFirewallTCPFlags.
+	lenientCoSNumericCodePoint bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -1703,6 +1738,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientEventWithinTrigger:              true,
+		lenientFirewallTCPFlags:                true,
+		lenientCoSNumericCodePoint:             true,
 	})
 }
 
@@ -1954,6 +1991,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientEventWithinTrigger:              true,
+		lenientFirewallTCPFlags:                true,
+		lenientCoSNumericCodePoint:             true,
 	})
 }
 

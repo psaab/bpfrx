@@ -78,6 +78,63 @@ func validateFirewallPolicerReferencesStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFirewallTCPFlagsStrict hard-rejects a firewall-filter term whose
+// `from tcp-flags <expr>` the conjunctive dataplane matcher cannot enforce —
+// a disjunction (`ack | rst`), a negated parenthesized group (a disjunction by
+// De Morgan), an unknown flag token, a dangling negation, or a
+// self-contradictory required/forbidden pair (#3076 / #4714). Without a reject
+// such an expression committed cleanly and the constraint was silently dropped
+// on the wire — the term matched regardless of flags (fail-OPEN, a dropped
+// security constraint).
+//
+// #4953: this gate is the strict/tolerant home of the #3076 reject that used
+// to live inline in compileFirewall (where it could not be mode-gated — the
+// section compiler receives no compileOpts). The commit / commit-check path
+// hard-rejects; the tolerant load / peer-sync path downgrades to a warning
+// (opts.lenientFirewallTCPFlags) so a config an older binary persisted — or a
+// peer authored — before this reject existed still BOOTS (#1960 no-brick).
+// The leniently-loaded term keeps its raw (unparseable) TCPFlags, which the
+// userspace snapshot builder detects (ParseTCPFlagsExpression errors) and marks
+// TCPFlagsUnparseable so the Rust filter compiler fails the term CLOSED
+// (#3367) — a fail-closed deny sentinel, NEVER a fail-open widening.
+//
+// Both families (inet + inet6) are walked, sorted by filter name then by term
+// position, so the first-reported error is deterministic (Go map order is
+// randomized). Mirrors validateFirewallPolicerReferencesStrict.
+func validateFirewallTCPFlagsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || len(term.TCPFlags) == 0 {
+					continue
+				}
+				if _, _, _, err := ParseTCPFlagsExpression(term.TCPFlags); err != nil {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: %w",
+						family, name, term.Name, err)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFirewallPrefixListReferencesStrict hard-rejects a firewall-filter
 // term whose `from source-prefix-list <name>` / `destination-prefix-list
 // <name>` (with or without `except`) names a prefix-list not defined under

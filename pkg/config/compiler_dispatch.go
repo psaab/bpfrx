@@ -60,7 +60,7 @@ func compileSections(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 				return fmt.Errorf("firewall: %w", err)
 			}
 		case "class-of-service":
-			if err := compileClassOfService(node, cfg.ClassOfService); err != nil {
+			if err := compileClassOfService(node, cfg.ClassOfService, opts, &cfg.Warnings); err != nil {
 				return fmt.Errorf("class-of-service: %w", err)
 			}
 		case "services":
