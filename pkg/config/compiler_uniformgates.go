@@ -350,6 +350,28 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #4826 reth-derived VRRP VRID wire-width gate. Strict on commit /
+	// commit-check (hard-reject a `redundant-ether-options
+	// redundancy-group <id>` whose id would push the reth-derived VRRP
+	// GroupID, RethVRRPGroupIDBase+id, past the RFC 5798 VRID range 1..255 —
+	// the chassis redundancy-group id gate above caps id at 255, which is
+	// the heartbeat wire bound, not the VRRP one; an id in 156..255 commits
+	// cleanly today and then silently loses VRRP for that redundancy group
+	// at runtime). Lenient on load / peer-sync (warn so an already-persisted
+	// or peer-synced config still boots — #1960 no-brick; the pkg/vrrp
+	// runtime range check independently refuses to advertise the
+	// out-of-range VRID, so a leniently-loaded bad id is bounded, not a
+	// wrong-VRID advert). Runs on the fully-compiled *Config (RedundancyGroup
+	// populated by compileInterfaces). Same doctrine as lenientVRRPGroupID.
+	if err := validateRethVRRPGroupIDStrict(cfg); err != nil {
+		if opts.lenientRethVRRPGroupID {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reth redundancy-group id (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3055 reserved zone-name definition gate. Strict on commit / commit-check
 	// (hard-reject a `security zones security-zone <name>` whose name is a
 	// reserved sentinel — "junos-global" is reclassified by the userspace

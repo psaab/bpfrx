@@ -452,6 +452,25 @@ This is orthogonal to the "Per-interface override precedence (#3362, #3720)"
 union above, which merges host-inbound authored at DIFFERENT granularities
 (zone ∪ physical ∪ unit). #4544 merges repeated blocks at the SAME granularity.
 
+**#4818 extends this merge one level UP.** #4544 merges repeated
+`host-inbound-traffic {}` blocks *within one* `security-zone <name> {}`
+instance. It did not help if the DUPLICATE was the outer instance itself — a
+`load override` with two literal top-level `security-zone trust { ... }`
+siblings (one carrying `interfaces`, the other carrying
+`host-inbound-traffic`) still lost the first instance wholesale, because
+`compileZones` allocated a brand new `ZoneConfig` per instance and the #4544
+merge logic never got a chance to run against the discarded first instance's
+properties. #4818 makes `compileZones` find-or-create the `ZoneConfig` by
+name across instances too, so `mergeHostInbound` now unions
+host-inbound-traffic both *within* one instance (#4544) and *across* sibling
+instances of the same zone name (#4818) — and the per-interface
+`InterfaceHostInbound` map merges the same way when two instances both
+declare host-inbound-traffic on the same interface name. See
+`docs/config-schema.md`'s "#4818/#4820/#4821" duplicate-block-registry entry
+for the two sibling fixes (`services rpm probe`, `security ssh-known-hosts
+host`) that share this exact root cause at the named-instance level.
+RED-on-revert guards: `pkg/config/zone_dup_block_4818_test.go`.
+
 ## Duplicate host-local-address ambiguity (#3718, Option B)
 
 The kernel host-inbound chain matches on **destination address only** — every

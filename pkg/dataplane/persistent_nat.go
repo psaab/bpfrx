@@ -168,14 +168,23 @@ func (t *PersistentNATTable) Len() int {
 	return len(t.bindings)
 }
 
-// All returns a snapshot of all current bindings.
+// All returns a snapshot of all current bindings. Each returned pointer
+// addresses a fresh COPY of the binding, not the live table entry — so a
+// caller iterating the result never aliases table state that a concurrent
+// Save()/GC() mutates in place (e.g. Save updating LastSeen under the write
+// lock). Returning the live pointers here was a real, -race-detectable data
+// race between the SHOW path (pkg/natshow) reading LastSeen and the packet
+// path calling Save() (#4811). All PersistentNATBinding fields are value
+// types (netip.Addr, ints, string, time.Time, config.PersistentNATPermit),
+// so a struct value copy is a complete, independent snapshot.
 func (t *PersistentNATTable) All() []*PersistentNATBinding {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	result := make([]*PersistentNATBinding, 0, len(t.bindings))
 	for _, b := range t.bindings {
-		result = append(result, b)
+		cp := *b
+		result = append(result, &cp)
 	}
 	return result
 }

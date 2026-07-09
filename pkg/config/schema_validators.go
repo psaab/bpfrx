@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,3 +185,46 @@ const (
 	// Rust helper backstops the lower bound too (RoutePreferenceOutOfRange).
 	maxWireI32 = int64(math.MaxInt32)
 )
+
+// maxLoginUsernameLen caps a `system login user <name>` identity token. The
+// classic Linux useradd/UT_NAMESIZE practical limit is 32; keeping the cap
+// there also bounds the derived /etc/sudoers.d/xpf-<name> filename and the
+// grant line the daemon writes.
+const maxLoginUsernameLen = 32
+
+// loginUsernameRE is the safe POSIX/Linux account-name shape a `system login
+// user <name>` identity must match: a lowercase letter or underscore, then
+// lowercase letters, digits, underscores, or hyphens. It deliberately excludes
+// whitespace, newlines, `/`, `:`, quotes, and every sudoers metacharacter so a
+// crafted username cannot be formatted into an /etc/sudoers.d grant to inject
+// additional directives (#4895 — the lexer decodes `\n` inside a quoted string
+// into a literal newline, so a name like "x\nnobody ALL=(ALL) NOPASSWD: ALL"
+// would otherwise smuggle a second sudoers line past visudo's syntax check).
+var loginUsernameRE = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
+
+// ValidateLoginUsername is the commit-check validator for a `system login user
+// <name>` identity token (wired as the schema keyValidator on the user
+// container in schema_system.go). It rejects any name that is empty, over
+// maxLoginUsernameLen, or does not match loginUsernameRE — the defense against
+// the #4895 sudoers-injection path where the daemon formats the raw config key
+// into /etc/sudoers.d/xpf-<name>. It is strict on the operator commit path and
+// downgraded to a warning on the tolerant Load / SyncApply path
+// (compileTreeLenient), the same #1960 doctrine as the other typed-leaf gates;
+// the daemon's writeSudoersGrant/reconcileSudoers apply the SAME check
+// defensively so a leniently-loaded or peer-synced bad name still never reaches
+// the sudoers writer. The *Config arg is unused (part of the LeafValidator
+// contract); daemon callers pass nil.
+func ValidateLoginUsername(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("login user name must not be empty")
+	}
+	if len(raw) > maxLoginUsernameLen {
+		return fmt.Errorf("login user name %q too long (max %d characters)", raw, maxLoginUsernameLen)
+	}
+	if !loginUsernameRE.MatchString(raw) {
+		return fmt.Errorf("invalid login user name %q (must match %s: a lowercase letter or underscore "+
+			"followed by lowercase letters, digits, underscores, or hyphens; no whitespace, newlines, or "+
+			"sudoers metacharacters)", raw, loginUsernameRE.String())
+	}
+	return nil
+}

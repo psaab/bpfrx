@@ -1045,6 +1045,21 @@ func renderHostInboundMatches(ms []config.L4Match, family string) []string {
 				types = append(types, *ms[i].ICMPType)
 				i++
 			}
+			if len(types) == 0 {
+				// Defensive: a degenerate entry (nil ICMPType on the FIRST
+				// unconsumed ICMP/ICMPv6 match) advances zero iterations in
+				// the loop above. The documented SSOT invariant (nil
+				// ICMPType is never emitted for an ICMP proto,
+				// config.L4Match doc comment) means every reachable caller
+				// avoids this today, but nothing in the type system
+				// enforces it — without this guard i never advances and
+				// the outer loop spins on the same index forever (#4813).
+				// There is no valid ICMP type to render, so skip emitting a
+				// match fragment for this entry rather than rendering a
+				// malformed empty nft set ("icmp type {  }").
+				i++
+				continue
+			}
 			out = append(out, kw+" type "+renderHostInboundICMPSpec(types, m.Proto))
 		case config.HostInboundProtoTCP:
 			out = append(out, "tcp dport "+renderHostInboundPortSpec(m.Ports))

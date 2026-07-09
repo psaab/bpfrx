@@ -1056,9 +1056,25 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 	}
 
 	for _, probeInst := range namedInstances(node.FindChildren("probe")) {
-		probe := &RPMProbe{
-			Name:  probeInst.name,
-			Tests: make(map[string]*RPMTest),
+		// #4820: find-or-create by name rather than always allocating a
+		// fresh RPMProbe. A hand-authored `load override` config can carry
+		// two literal `probe <name> { ... }` top-level sibling blocks under
+		// `services rpm` — the hierarchical parser keeps them as separate
+		// same-key siblings (it does not merge, same root cause as #4818's
+		// security-zone finding), so namedInstances yields TWO entries for
+		// the same probe name. The pre-fix unconditional `probe := &RPMProbe{...}`
+		// + `rpmCfg.Probes[probe.Name] = probe` let the second instance
+		// silently REPLACE the first, discarding ALL of its tests. Reusing
+		// the existing probe (and its Tests map) lets both instances'
+		// `test` blocks accumulate into one probe, keyed by test name —
+		// matching Junos's merge of repeated same-name blocks.
+		probe := rpmCfg.Probes[probeInst.name]
+		if probe == nil {
+			probe = &RPMProbe{
+				Name:  probeInst.name,
+				Tests: make(map[string]*RPMTest),
+			}
+			rpmCfg.Probes[probeInst.name] = probe
 		}
 
 		for _, testInst := range namedInstances(probeInst.node.FindChildren("test")) {
@@ -1155,8 +1171,6 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 
 			probe.Tests[test.Name] = test
 		}
-
-		rpmCfg.Probes[probe.Name] = probe
 	}
 
 	svc.RPM = rpmCfg

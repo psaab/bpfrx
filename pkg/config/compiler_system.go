@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -491,7 +492,14 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 		// tunables (#2691 P2, plan §5.9). The per-interface `dynamic-dns`
 		// bindings reference these named providers.
 		if ddnsNode := svcNode.FindChild("dynamic-dns"); ddnsNode != nil {
-			if cat := compileDDNSServices(ddnsNode); cat != nil {
+			cat, ddnsWarnings, err := compileDDNSServices(ddnsNode, opts.lenientDDNSDuration)
+			if err != nil {
+				return err
+			}
+			if cfg != nil {
+				cfg.Warnings = append(cfg.Warnings, ddnsWarnings...)
+			}
+			if cat != nil {
 				if sys.Services == nil {
 					sys.Services = &SystemServicesConfig{}
 				}
@@ -547,9 +555,24 @@ var ddnsProviderStringProps = map[string]bool{
 
 // compileDDNSServices compiles the `system services dynamic-dns` block into a
 // typed *DDNSServicesConfig: the named provider catalog + the engine tunables
-// (forced-refresh / error-backoff-max). Returns nil for a truly empty block so
-// a garbage/empty stanza does not materialize a catalog (#2691 P2, plan §5.9).
-func compileDDNSServices(node *Node) *DDNSServicesConfig {
+// (forced-refresh / error-backoff-max). Returns a nil *DDNSServicesConfig for
+// a truly empty block so a garbage/empty stanza does not materialize a
+// catalog (#2691 P2, plan §5.9) — that can still happen alongside a non-nil
+// warnings slice (an all-malformed block warns but has nothing to publish).
+//
+// #4837: forced-refresh / error-backoff-max accept a Go duration string
+// ("24h") or a bare-seconds integer ("86400"), but a value that parses as
+// NEITHER form (a typo like "24hh", or a non-positive value like "-5" — the
+// downstream engine has no defined meaning for a non-positive interval) was
+// previously silently discarded: the field was left unset, falling back to
+// its downstream default, with no commit-time error or warning telling the
+// operator their value was rejected. Strict (commit / commit-check):
+// hard-reject on the first malformed leaf, naming it and its value. Lenient
+// (load / peer-sync): downgrade to a warning, accumulated across both
+// leaves, so an already-persisted config an older binary accepted still
+// boots (#1960 fail-closed-on-load class) — the field stays unset either
+// way, matching pre-#4837 runtime behavior exactly; only the warning is new.
+func compileDDNSServices(node *Node, lenient bool) (*DDNSServicesConfig, []string, error) {
 	cat := &DDNSServicesConfig{Providers: map[string]*DDNSProvider{}}
 	for _, inst := range namedInstances(node.FindChildren("provider")) {
 		p := compileDDNSProvider(inst.name, inst.node)
@@ -559,20 +582,35 @@ func compileDDNSServices(node *Node) *DDNSServicesConfig {
 	}
 	// Engine tunables: a duration ("24h") or a bare-seconds integer. They may
 	// appear as a child node OR packed into the block's Keys (flat-set).
-	if v := ddnsServicesScalar(node, "forced-refresh"); v != "" {
-		if s := parseDurationSeconds(v); s > 0 {
-			cat.ForcedRefreshSeconds = s
+	var warnings []string
+	for _, leaf := range []string{"forced-refresh", "error-backoff-max"} {
+		v := ddnsServicesScalar(node, leaf)
+		if v == "" {
+			continue
 		}
-	}
-	if v := ddnsServicesScalar(node, "error-backoff-max"); v != "" {
-		if s := parseDurationSeconds(v); s > 0 {
+		s := parseDurationSeconds(v)
+		if s <= 0 {
+			msg := fmt.Sprintf(
+				"system services dynamic-dns %s %q: not a valid duration "+
+					"(e.g. \"24h\") or a positive bare-seconds integer; "+
+					"ignored — falls back to the built-in default", leaf, v)
+			if !lenient {
+				return nil, nil, fmt.Errorf("%s", msg)
+			}
+			warnings = append(warnings, msg)
+			continue
+		}
+		switch leaf {
+		case "forced-refresh":
+			cat.ForcedRefreshSeconds = s
+		case "error-backoff-max":
 			cat.ErrorBackoffMaxSeconds = s
 		}
 	}
 	if len(cat.Providers) == 0 && cat.ForcedRefreshSeconds == 0 && cat.ErrorBackoffMaxSeconds == 0 {
-		return nil
+		return nil, warnings, nil
 	}
-	return cat
+	return cat, warnings, nil
 }
 
 // ddnsServicesScalar finds a top-level scalar leaf value under the dynamic-dns
@@ -1140,6 +1178,19 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				}
 				if comm.Authorization == "" {
 					comm.Authorization = "read-only"
+				}
+				// #4834: reject/warn on an unparseable `clients` entry before
+				// it reaches compileClientNets. See validateSNMPClients for
+				// why this matters beyond a plain prefix typo: it also
+				// catches a mistyped "restrict" keyword, which otherwise
+				// silently detaches from the preceding prefix and turns a
+				// deny-except entry into an unrestricted allow (fail-open).
+				clientWarnings, err := validateSNMPClients(comm.Clients, lenient)
+				if err != nil {
+					return err
+				}
+				if cfg != nil {
+					cfg.Warnings = append(cfg.Warnings, clientWarnings...)
 				}
 				// #4711: pre-parse the `clients` prefixes once now that
 				// comm.Clients is finalized, so AllowsSource does an
@@ -1826,54 +1877,106 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 	return nil
 }
 
-// validateBackupRouterDst (#2911) rejects a `system backup-router` whose
-// EXPLICIT `destination` prefix is a different address family than the
-// next-hop (the backup-router IP itself).
+// validateBackupRouterDst (#2911, extended by #4808) rejects a `system
+// backup-router` whose next-hop or EXPLICIT `destination` is malformed, or
+// whose destination is a different address family than the next-hop.
 //
 // Background: renderBackupRouter (pkg/frr) emits a fallback default route
 //
 //	<ip|ipv6> route <destination> <next-hop> 250
 //
 // where the route-prefix keyword is keyed on the next-hop family (#2907 /
-// #2891). An explicit destination of the WRONG family therefore renders a
-// mismatched-family static — e.g. `backup-router 2001:db8::1` +
-// `destination 0.0.0.0/0` → `ipv6 route 0.0.0.0/0 2001:db8::1 250`. FRR
-// rejects a mismatched-family static route, and frr-reload fails the ENTIRE
-// static config load on that one bad line, not just the offending route. That
-// is exactly the breakage #2907 set out to prevent for the empty-destination
-// case, so the explicit-mismatch case must be caught too.
+// #2891). Both tokens are stored as raw strings by compileSystem's
+// `"backup-router"` case with no IP-format validation at all (#4808) — a
+// syntactically malformed next-hop ("192.168.1.x") or destination
+// ("10.0.0.0/99") sails through commit uncaught and is rendered directly
+// into frr.conf. An explicit destination of the WRONG family renders a
+// mismatched-family static instead — e.g. `backup-router 2001:db8::1` +
+// `destination 0.0.0.0/0` → `ipv6 route 0.0.0.0/0 2001:db8::1 250` (#2911).
+// FRR rejects a malformed OR mismatched-family static route, and
+// frr-reload fails the ENTIRE static config load on that one bad line, not
+// just the offending route. That is exactly the breakage #2907 set out to
+// prevent for the empty-destination case, so every way to reach a bad
+// rendered line must be caught.
 //
-// Only an EXPLICIT destination is checked. An empty destination is left to
-// #2907's next-hop-family-aware default (v6 next-hop → ::/0, v4 → 0.0.0.0/0)
-// and is never a mismatch. Unparseable tokens are not this validator's
-// concern — they are left to the existing address handling.
+// Checks, in order:
+//  1. next-hop must parse as an IP address at all (#4808).
+//  2. an EXPLICIT destination must parse as a CIDR prefix at all (#4808) —
+//     natCIDRIPPart/natAddrFamily below only look at the address portion of
+//     a CIDR string, so they alone would accept a bad mask like "/99";
+//     net.ParseCIDR validates the whole token.
+//  3. an EXPLICIT destination of a different address family than the
+//     next-hop is rejected (#2911), once both sides are known to parse.
+//
+// Only an EXPLICIT destination is format/family checked. An empty
+// destination is left to #2907's next-hop-family-aware default (v6
+// next-hop → ::/0, v4 → 0.0.0.0/0) and is never malformed or a mismatch.
 //
 // Family classification reuses natAddrFamily / natCIDRIPPart so the colon
 // test (IPv4-mapped IPv6 literal → v6) matches the rest of the compiler.
 //
-// Strict (commit / commit-check): hard-reject, naming both addresses and
-// families. Lenient (load / peer-sync): warn so an already-persisted or
-// peer-synced config an older binary accepted still boots (#1960
-// fail-closed-on-load class).
+// Strict (commit / commit-check): hard-reject on the first failing check,
+// naming the offending value. Lenient (load / peer-sync): warn (accumulating
+// across all applicable checks) so an already-persisted or peer-synced
+// config an older binary accepted still boots (#1960 fail-closed-on-load
+// class).
 func validateBackupRouterDst(cfg *Config, lenient bool) ([]string, error) {
 	if cfg == nil {
 		return nil, nil
 	}
 	nh := cfg.System.BackupRouter
 	dst := cfg.System.BackupRouterDst
-	// Empty next-hop → no backup-router; empty destination → #2907's
-	// family-aware default applies, never a mismatch.
-	if nh == "" || dst == "" {
+	if nh == "" {
+		// No backup-router configured — nothing to validate.
 		return nil, nil
 	}
+
+	var warnings []string
+
+	// #4808: next-hop must be a well-formed IP address. Rendered verbatim as
+	// the FRR static route's next-hop; a malformed value fails the entire
+	// static config load (frr-reload), not just this route.
+	if net.ParseIP(nh) == nil {
+		msg := fmt.Sprintf(
+			"system backup-router %s: not a valid IP address; FRR rejects a "+
+				"malformed next-hop, which fails the entire static config "+
+				"load (frr-reload)", nh)
+		if !lenient {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg+" (ignored: backup-router default route not installed until corrected)")
+	}
+
+	if dst == "" {
+		// #2907's next-hop-family-aware default applies; never malformed or
+		// a mismatch.
+		return warnings, nil
+	}
+
+	// #4808: an explicit destination must be a well-formed CIDR prefix.
+	// net.ParseCIDR validates the mask too (natCIDRIPPart below only takes
+	// the address portion, so "10.0.0.0/99" would otherwise slip through).
+	if _, _, err := net.ParseCIDR(dst); err != nil {
+		msg := fmt.Sprintf(
+			"system backup-router destination %s: not a valid CIDR prefix; "+
+				"FRR rejects a malformed destination, which fails the entire "+
+				"static config load (frr-reload)", dst)
+		if !lenient {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg+" (ignored: backup-router default route not installed until corrected)")
+	}
+
 	nhFam := natAddrFamily(nh)
 	dstFam := natAddrFamily(natCIDRIPPart(dst))
-	// One side did not parse as an IP at all — not this validator's concern.
+	// One side did not parse as an IP at all — already reported above (or
+	// pre-existing address-book-name handling that is not this validator's
+	// concern); skip the family comparison, it would be meaningless.
 	if nhFam == "" || dstFam == "" {
-		return nil, nil
+		return warnings, nil
 	}
 	if nhFam == dstFam {
-		return nil, nil
+		return warnings, nil
 	}
 	msg := fmt.Sprintf(
 		"system backup-router %s destination %s: destination family (%s) "+
@@ -1882,7 +1985,7 @@ func validateBackupRouterDst(cfg *Config, lenient bool) ([]string, error) {
 			"config load (frr-reload)",
 		nh, dst, dstFam, nhFam)
 	if lenient {
-		return []string{msg + " (ignored: backup-router default route not installed until corrected)"}, nil
+		return append(warnings, msg+" (ignored: backup-router default route not installed until corrected)"), nil
 	}
 	return nil, fmt.Errorf("%s", msg)
 }

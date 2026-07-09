@@ -2001,6 +2001,29 @@ reserved for whole-dataplane selection where a rewrite shim
   parse in `parseVRRPGroups` no longer swallows an `strconv.Atoi` error
   with `_ =` — a bad parse kept the constructor default (priority 100)
   instead of silently resetting to 0 (the RFC 5798 resignation value).
+  **#4826 — reth-derived VRID range gate:** #4573 only bounded the
+  *explicit* `vrrp-group <id>` slot; a RETH interface's VRRP GroupID is
+  separately synthesized as `100 + redundancy-group-id`
+  (`CollectRethInstances`, `pkg/vrrp/vrrp.go`), and that path had no
+  commit-time bound at all. The chassis `redundancy-group <id>` gate
+  (#4434, `validateChassisClusterStrict`) caps the id at 255 — the
+  single-byte HA *heartbeat* wire limit, unrelated to VRRP — so a
+  redundancy-group in 156..255 committed cleanly while its derived VRID
+  (256..355) silently lost VRRP at runtime (`pkg/vrrp/manager.go
+  UpdateInstances` skips the out-of-range GroupID with only a WARN log —
+  no wrong-VRID advert on the wire, but a live HA blackhole for that
+  redundancy group). `validateRethVRRPGroupIDStrict`
+  (`compiler_validate_strict_reth_vrrp.go`) closes the gap the same way
+  #4573 closed it for the explicit path: hard-reject a
+  `redundant-ether-options redundancy-group <id>` above 155 at commit /
+  commit-check, downgraded to a warning on the tolerant load / peer-sync
+  path (`lenientRethVRRPGroupID`, #1960 no-brick). It mirrors
+  `CollectRethInstances`' own early return for `no-reth-vrrp` /
+  private-rg-election (the compiler default for any `chassis cluster`
+  stanza) so a redundancy-group id that produces no synthesized VRRP
+  instance is never rejected. `pkg/config` cannot import `pkg/vrrp` (the
+  dependency runs the other way), so the `100` offset is a documented
+  duplicated constant (`RethVRRPGroupIDBase`), not an import.
   **#2850 — `preempt hold-time`:** the
   `vrrp-group <id> preempt` leaf gained a nested `hold-time <seconds>`
   child (`schema_interfaces.go`, typed `ValidateInteger(1, 3600)`), Junos
@@ -2896,6 +2919,60 @@ reserved for whole-dataplane selection where a rewrite shim
   `NewParser` for the `LoadOverride` shape); operator doc:
   `docs/host-inbound-service-matrix.md` "Repeated host-inbound-traffic blocks
   merge (#4544)".
+- **#4818/#4820/#4821 (the TOP-LEVEL named-instance analogue of #4544/#3842/
+  #3915/#3850 — duplicate `security-zone <name>` / `probe <name>` /
+  `ssh-known-hosts host <name>` INSTANCES, not sub-blocks within one instance):**
+  every prior entry in this cluster fixed a duplicate SUB-block within one
+  named instance (`match`/`then` within one policy, `source`/`destination`
+  within one `nat {}`, `host-inbound-traffic` within one zone/interface). This
+  trio is the same defect one level UP: `namedInstances()` (`compiler_protocols.go`)
+  returns one `(name, node)` pair per hierarchical AST sibling, so a `load
+  override` config with two literal top-level blocks sharing a name — e.g. two
+  `security-zone trust { ... }` blocks — yields TWO instances for `"trust"`.
+  Three compilers read that loop with an unconditional per-iteration allocate
+  + map-assign, so the SECOND instance silently replaced the first's entire
+  compiled value:
+  - **`compileZones`** (`compiler_security_zones.go`) — `zone := &ZoneConfig{...}`
+    + `sec.Zones[inst.name] = zone` dropped the first instance's
+    interfaces/host-inbound/address-book/description/screen/tcp-rst wholesale
+    (#4818). Fix: find-or-create the `ZoneConfig` by name so every sibling
+    instance's properties accumulate onto the SAME zone — `Interfaces` appends,
+    `HostInboundTraffic`/`InterfaceHostInbound` merge via the existing
+    `mergeHostInbound` (now also applied across instances, not just across
+    blocks within one instance), `AddressBook` merges by address/address-set
+    name (find-or-create, reusing `parseAddressBookEntries`'s own #4706
+    find-or-create). `ScreenProfile`/`TCPRst`/`Description` are scalars with no
+    natural union and stay last-wins across instances (unchanged from their
+    existing last-wins behavior across repeated properties within one
+    instance).
+  - **`compileRPM`** (`compiler_services.go`) — `probe := &RPMProbe{Tests:
+    make(...)}` + `rpmCfg.Probes[probe.Name] = probe` dropped the first
+    instance's `Tests` map wholesale, disabling every RPM test it declared
+    (#4820). Fix: find-or-create the `RPMProbe` by name; `probe.Tests[test.Name]
+    = test` (unchanged) now accumulates test blocks from every sibling
+    instance into the one shared `Tests` map.
+  - **`ssh-known-hosts`** (`compiler_security.go`, inline in `compileSecurity`'s
+    switch) — `sec.SSHKnownHosts[hostInst.name] = keys` (bare overwrite, plus
+    `sec.SSHKnownHosts = make(...)` re-running on every `ssh-known-hosts`
+    block) dropped the first `host` instance's key(s) — an operator-visible SSH
+    host-key verification failure against that host (#4821). Fix:
+    `sec.SSHKnownHosts` is initialized once (find-or-create the map), and each
+    key is APPENDED (`sec.SSHKnownHosts[hostInst.name] = append(..., key)`)
+    rather than the whole per-instance slice replacing the map entry — for a
+    single instance this is byte-identical to the pre-fix build-then-assign
+    (append onto nil == a fresh slice).
+
+  As with every entry in this cluster, flat-set `SetPath` and `load merge`
+  (FormatSet round-trip) both fold two same-key top-level lines onto ONE AST
+  node, so a duplicate *instance* (as opposed to a duplicate *sub-block*) is
+  reachable ONLY via the hierarchical `NewParser` / `LoadOverride` shape — see
+  each issue's "Correction to the reviewed trace" for the refuted flat-set
+  reproduction. Regression coverage: `pkg/config/zone_dup_block_4818_test.go`,
+  `pkg/config/rpm_probe_dup_block_4820_test.go`,
+  `pkg/config/ssh_known_hosts_dup_block_4821_test.go` (each: primary
+  two/three-instance merge RED-on-revert, and a single-block/single-instance
+  byte-identical negative control — built with `NewParser` for the
+  `LoadOverride` shape, driving `CompileConfig` directly).
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same
@@ -5587,6 +5664,42 @@ or installed a blackhole, with no signal. The SSOT is `staticRouteNode()` in
 `schema_routing.go`, shared by the `routing-options`, per-`rib`, and
 `routing-instances` static blocks. Regression + fail-on-revert tests:
 `pkg/config/schema_validate_route_2448_test.go`.
+
+### #4895 — `system login user <name>` identity validated (sudoers injection)
+
+`system login user <name>` was an untyped keyed instance with NO username
+validator. The daemon writes an `/etc/sudoers.d/xpf-<name>` NOPASSWD grant for
+every `class super-user` account by formatting the raw config key directly into
+sudoers syntax (`writeSudoersGrant`, `pkg/daemon/daemon_system.go`). Because the
+lexer decodes `\n` inside a quoted string into a literal newline
+(`lexer.readString`), a crafted key such as
+
+    set system login user "x\nnobody ALL=(ALL) NOPASSWD: ALL" class super-user
+
+materialized a username containing a newline, and the grant writer emitted TWO
+valid sudoers lines. Both pass `visudo -cf` (a syntax checker, not a containment
+checker), so the drop-in installed and granted an unmodeled account passwordless
+root (CWE-74).
+
+- **schema (PRIMARY)** — the `user` login container uses `keyValidator:
+  ValidateLoginUsername` (`keyValueType: ValueIdentifier`), a safe POSIX
+  account shape `^[a-z_][a-z0-9_-]*$` capped at 32 characters. A name with a
+  newline, whitespace, `/`, `:`, `,`, `=`, a leading hyphen, uppercase, or a
+  leading digit is a commit error. Strict on the operator commit path,
+  downgraded to a warning on the tolerant Load / SyncApply path
+  (`compileTreeLenient`), the same #1960 doctrine as the other typed leaves.
+- **daemon (DEFENSE)** — `reconcileSudoers` SKIPS any super-user whose name
+  fails `ValidateLoginUsername` (neither desired nor written, so a stale grant
+  is also revoked), and `writeSudoersGrant` re-validates the name at entry and
+  refuses to format an unvalidated name into sudoers. This closes the
+  lenient-load / HA config-sync bypass where a bad name reaches the writer
+  despite the downgraded commit gate.
+
+The validator lives in `schema_validators.go` (shared symbol
+`config.ValidateLoginUsername`); the schema wiring is in `schema_system.go`.
+Regression + fail-on-revert tests: `pkg/config/login_username_4895_test.go`
+(schema gate, hierarchical + flat-set) and
+`pkg/daemon/daemon_sudoers_username_4895_test.go` (daemon defense).
 
 ### #2978 — BGP `multipath ibgp` (iBGP ECMP / `maximum-paths ibgp`)
 
