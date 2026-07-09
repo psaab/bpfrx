@@ -215,29 +215,40 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			"login-alarms":        {desc: "Display system alarms on login", children: nil},
 			"login-tip":           {desc: "Display a tip on login", children: nil},
 		}},
-		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{
-			"uid": {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
-			// #2008 H6 / #4304 S-2: the class is validated against the
-			// system-defined built-ins UNION any custom `login class <name>`
-			// defined in the SAME candidate tree. The tree-aware validator
-			// replaces the fixed enum so a valid custom-RBAC config is no
-			// longer hard-rejected at commit, while an undefined class still
-			// fails closed. RBAC enforcement is in pkg/cli/permissions.go.
-			"class": {desc: "Login class", args: 1, placeholder: "<class>",
-				valueType: ValueEnumOf, valueDesc: "System-defined class (super-user | operator | read-only | config-viewer | unauthorized) or a custom `login class <name>`",
-				valueExamples: []string{"super-user", "operator", "read-only"},
-				treeValidator: validateLoginClassRef, children: nil},
-			// #1944: close the schema asymmetry the compiler already
-			// half-implemented — give `authentication` a value-bearing
-			// children map (encrypted-password typed leaf + ssh-* keys).
-			"authentication": {desc: "Authentication methods", children: map[string]*schemaNode{
-				"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
-					valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
-				"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
-				"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
-				"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+		// #4895: the login user NAME is a keyed identity token that the daemon
+		// formats verbatim into an /etc/sudoers.d/xpf-<name> NOPASSWD grant.
+		// The lexer decodes `\n` inside a quoted string into a literal newline,
+		// so an unvalidated name can inject additional sudoers directives. The
+		// keyValidator (typed KEY slot, #1319 PR 3) validates the identity arg
+		// token against a safe POSIX account-name shape at commit-check —
+		// strict on commit, warn on the tolerant load/sync path (#1960). The
+		// daemon's writeSudoersGrant/reconcileSudoers apply the SAME check
+		// defensively so a leniently-loaded name still never reaches sudoers.
+		"user": {desc: "User name", args: 1, placeholder: "<username>",
+			keyValueType: ValueIdentifier, keyValueDesc: "POSIX login user name (lowercase letter/underscore then [a-z0-9_-])",
+			keyValidator: ValidateLoginUsername, children: map[string]*schemaNode{
+				"uid": {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
+				// #2008 H6 / #4304 S-2: the class is validated against the
+				// system-defined built-ins UNION any custom `login class <name>`
+				// defined in the SAME candidate tree. The tree-aware validator
+				// replaces the fixed enum so a valid custom-RBAC config is no
+				// longer hard-rejected at commit, while an undefined class still
+				// fails closed. RBAC enforcement is in pkg/cli/permissions.go.
+				"class": {desc: "Login class", args: 1, placeholder: "<class>",
+					valueType: ValueEnumOf, valueDesc: "System-defined class (super-user | operator | read-only | config-viewer | unauthorized) or a custom `login class <name>`",
+					valueExamples: []string{"super-user", "operator", "read-only"},
+					treeValidator: validateLoginClassRef, children: nil},
+				// #1944: close the schema asymmetry the compiler already
+				// half-implemented — give `authentication` a value-bearing
+				// children map (encrypted-password typed leaf + ssh-* keys).
+				"authentication": {desc: "Authentication methods", children: map[string]*schemaNode{
+					"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
+						valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
+					"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
+					"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
+					"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+				}},
 			}},
-		}},
 	}},
 	"dataplane-type": {desc: "Dataplane type", args: 1, placeholder: "<type>", children: nil},
 	"dataplane": {desc: "Dataplane configuration", children: map[string]*schemaNode{

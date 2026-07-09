@@ -5665,6 +5665,42 @@ or installed a blackhole, with no signal. The SSOT is `staticRouteNode()` in
 `routing-instances` static blocks. Regression + fail-on-revert tests:
 `pkg/config/schema_validate_route_2448_test.go`.
 
+### #4895 — `system login user <name>` identity validated (sudoers injection)
+
+`system login user <name>` was an untyped keyed instance with NO username
+validator. The daemon writes an `/etc/sudoers.d/xpf-<name>` NOPASSWD grant for
+every `class super-user` account by formatting the raw config key directly into
+sudoers syntax (`writeSudoersGrant`, `pkg/daemon/daemon_system.go`). Because the
+lexer decodes `\n` inside a quoted string into a literal newline
+(`lexer.readString`), a crafted key such as
+
+    set system login user "x\nnobody ALL=(ALL) NOPASSWD: ALL" class super-user
+
+materialized a username containing a newline, and the grant writer emitted TWO
+valid sudoers lines. Both pass `visudo -cf` (a syntax checker, not a containment
+checker), so the drop-in installed and granted an unmodeled account passwordless
+root (CWE-74).
+
+- **schema (PRIMARY)** — the `user` login container uses `keyValidator:
+  ValidateLoginUsername` (`keyValueType: ValueIdentifier`), a safe POSIX
+  account shape `^[a-z_][a-z0-9_-]*$` capped at 32 characters. A name with a
+  newline, whitespace, `/`, `:`, `,`, `=`, a leading hyphen, uppercase, or a
+  leading digit is a commit error. Strict on the operator commit path,
+  downgraded to a warning on the tolerant Load / SyncApply path
+  (`compileTreeLenient`), the same #1960 doctrine as the other typed leaves.
+- **daemon (DEFENSE)** — `reconcileSudoers` SKIPS any super-user whose name
+  fails `ValidateLoginUsername` (neither desired nor written, so a stale grant
+  is also revoked), and `writeSudoersGrant` re-validates the name at entry and
+  refuses to format an unvalidated name into sudoers. This closes the
+  lenient-load / HA config-sync bypass where a bad name reaches the writer
+  despite the downgraded commit gate.
+
+The validator lives in `schema_validators.go` (shared symbol
+`config.ValidateLoginUsername`); the schema wiring is in `schema_system.go`.
+Regression + fail-on-revert tests: `pkg/config/login_username_4895_test.go`
+(schema gate, hierarchical + flat-set) and
+`pkg/daemon/daemon_sudoers_username_4895_test.go` (daemon defense).
+
 ### #2978 — BGP `multipath ibgp` (iBGP ECMP / `maximum-paths ibgp`)
 
 `set protocols bgp multipath ibgp` enables iBGP equal-cost multipath. FRR's
