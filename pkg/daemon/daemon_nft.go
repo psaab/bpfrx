@@ -526,6 +526,16 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 		seenCounter[name] = true
 		counters = append(counters, name)
 	}
+	// #4759: the GLOBAL ICMP-error / ND accept rules emitted below carry named
+	// nft counters so the host-inbound admit path is observable per type-class
+	// (ICMPv6 ND, ICMPv6 error/PMTUD, ICMPv4 error/PMTUD). Those accept rules are
+	// UNCONDITIONAL (they precede every per-zone rule and are always present), so
+	// declare all three counter objects up front — declaration and reference
+	// always agree, no matter how many zones exist. The counters are AGGREGATE
+	// (the accept rules are global, not per-zone).
+	for _, typ := range xnft.HostInboundAcceptCounterTypes {
+		addCounter(xnft.HostInboundAcceptCounterName(typ))
+	}
 	for _, v := range views {
 		if hostInboundEmitsDrop(v, v.V4Addrs) {
 			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip"))
@@ -586,8 +596,19 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 	// (3, also PMTUD frag-needed code 4), time-exceeded (11, traceroute) and
 	// parameter-problem (12) are the v4 error set. Echo-request is NOT here — it
 	// stays gated on the per-zone `ping` system-service.
-	rules = append(rules, "    icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 } accept")
-	rules = append(rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept")
+	//
+	// #4759: each accept carries a named counter so the admit path is observable
+	// per type-class. This is a PURE observability add — `counter name "<n>"
+	// accept` counts then accepts, an identical terminal verdict to a bare
+	// `accept`. The single ICMPv6 rule is split into error (1-4) and ND (133-137)
+	// so the two classes count separately; the two type sets are disjoint and
+	// their union is the exact pre-#4759 set, so every packet that was accepted is
+	// still accepted (verdict-preserving — the userspace host-inbound exemption
+	// #3171 must still mirror the SAME union). The counters are AGGREGATE (global
+	// rules, not per-zone) per the #4759 caveat.
+	rules = append(rules, "    icmpv6 type { 1, 2, 3, 4 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6Error)+"\" accept")
+	rules = append(rules, "    icmpv6 type { 133, 134, 135, 136, 137 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6ND)+"\" accept")
+	rules = append(rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP4Error)+"\" accept")
 
 	for _, v := range views {
 		emitHostInboundZone(&rules, v, "ip", v.V4Addrs)

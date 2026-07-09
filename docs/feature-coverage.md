@@ -224,13 +224,17 @@ the userspace dataplane admission boundary is in
   without those labels the rows collide on an identical `{protocol,
   collector, source}` labelset and Prometheus either rejects the duplicate
   (scrape error) or silently collapses the failing group.
-- **Prometheus metrics** (`/metrics` endpoint). Two kernel-nftables surfaces
+- **Prometheus metrics** (`/metrics` endpoint). Three kernel-nftables surfaces
   are scraped independent of dataplane load (emitted before the dataplane gate,
   so they stay visible in a config-only / degraded boot):
   `xpf_host_inbound_kernel_denies_total{zone,family}` (host-inbound catch-all
-  DROP counters) and `xpf_lo0_counter_hits_total{counter}` (#4422 — lo0
+  DROP counters), `xpf_lo0_counter_hits_total{counter}` (#4422 — lo0
   loopback input-filter `then count` hits from the `inet xpf_lo0` chain,
-  DISTINCT from the userspace fast-path `xpf_filter_hits_total`). Policy-based
+  DISTINCT from the userspace fast-path `xpf_filter_hits_total`), and
+  `xpf_host_inbound_icmp_nd_accept_total{type}` (#4759 — the GLOBAL ICMP-error /
+  ND accept rules on the `inet xpf_hostinbound` chain, counted per type-class
+  `icmp6_nd` / `icmp6_error` / `icmp4_error`; AGGREGATE across all zones because
+  those accept rules are global, not per-zone). Policy-based
   routing (filter-based-forwarding) build health is exported as the
   config-derived gauges `xpf_pbr_rules_installed` and `xpf_pbr_degraded_terms`
   (#4422 — the count of routing-instance filter terms dropped from the kernel
