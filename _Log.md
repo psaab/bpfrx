@@ -42550,3 +42550,21 @@ top.
   userspace-dp/src/afxdp/forwarding_build/tunnels.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4422 slice — pin the two REJECT cells of the policy
+  zone-matrix (action × destination-class) at the SSOT flow-match engine
+  (policymatch.Match). Scoped existing coverage first: the other six cells
+  were already driven against Match() (transit permit/deny/default in
+  policymatch_test.go; junos-host permit/deny/default in junos_host_test.go),
+  and the compile-level composition is pinned in
+  pkg/config/policy_zone_matrix_4422_test.go — but NO Match() test drove a
+  `then reject` policy in either destination class (PolicyReject asserted
+  nowhere in pkg/policymatch), and DisplayAction()'s reject arm was
+  unexercised. New table-driven test asserts a matched reject resolves to
+  Action=PolicyReject / DisplayAction="reject" for both transit and
+  junos-host, is Matched (not DefaultUsed), and on the host path is not
+  swallowed as HostInboundUnmatched. Test-only; no production change.
+  Validation: gofmt; go vet; new test PASS (2 subtests); touched packages
+  (cmd/cli, pkg/config, pkg/policymatch) green; FULL Go suite green.
+  **File(s)**: pkg/policymatch/reject_matrix_4422_test.go, _Log.md
