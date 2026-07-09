@@ -43884,3 +43884,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4875 fwdstatus require positive in-window heartbeat evidence for Online; empty/nil/future heartbeats -> Degraded (was false-green Online)
   **File(s)**: pkg/fwdstatus/builder.go, pkg/fwdstatus/fwdstatus_test.go, pkg/fwdstatus/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4868 CLI commit/rollback grammar + int32 narrowing fail-closed — remote+local commit reject unknown modifier and parse commit-confirmed minutes via ParseInt(10,32) with [1,65535]; store bounds the window; remote rollback uses ParseInt(10,32) to reject int32-wrap-to-0
+  **File(s)**: cmd/cli/main.go, cmd/cli/shared.go, pkg/cli/cli_config.go, pkg/configstore/store_commit.go, +3 tests, pkg/configstore/README.md
