@@ -619,22 +619,34 @@ func detectLifelineInterface() (name string, ok bool) {
 }
 
 // pciAddrForInterface resolves the PCI bus address + MAC for a kernel
-// interface name via sysfs (the same source enumeratePCINICs uses).
+// interface name via sysfs (the same source enumeratePCINICs uses). A
+// non-PCI NIC (virtio, bond, VLAN sub-interface, or other paravirtual /
+// overlay device with no `/sys/class/net/<name>/device` PCI symlink) still
+// yields a MAC-only record — PCI resolution failing must NOT short-circuit
+// the MAC lookup, per the lifelineRecord format's own documented contract
+// ("MAC (tiebreaker for non-PCI NICs)", #4815). Reports not-found only when
+// NEITHER identity can be resolved.
 func pciAddrForInterface(name string) (lifelineRecord, bool) {
-	devicePath := filepath.Join("/sys/class/net", name, "device")
-	devReal, err := filepath.EvalSymlinks(devicePath)
-	if err != nil {
-		return lifelineRecord{}, false
+	var pciAddr string
+	if devReal, err := filepath.EvalSymlinks(filepath.Join("/sys/class/net", name, "device")); err == nil {
+		pciAddr = extractPCIAddr(devReal)
 	}
-	busAddr := extractPCIAddr(devReal)
-	if busAddr == "" {
-		return lifelineRecord{}, false
-	}
-	rec := lifelineRecord{PCIAddr: busAddr}
+	var mac string
 	if link, err := netlink.LinkByName(name); err == nil {
-		rec.MAC = link.Attrs().HardwareAddr.String()
+		mac = link.Attrs().HardwareAddr.String()
 	}
-	return rec, true
+	return lifelineRecordFromParts(pciAddr, mac)
+}
+
+// lifelineRecordFromParts is the pure core of pciAddrForInterface, factored
+// out so the non-PCI MAC-fallback logic is unit-testable without sysfs or a
+// real netlink link (#4815). Reports not-found only when neither a PCI
+// address nor a MAC was resolved.
+func lifelineRecordFromParts(pciAddr, mac string) (lifelineRecord, bool) {
+	if pciAddr == "" && mac == "" {
+		return lifelineRecord{}, false
+	}
+	return lifelineRecord{PCIAddr: pciAddr, MAC: mac}, true
 }
 
 // resolveLifelineCurrentName resolves the persisted lifeline record to the
@@ -746,8 +758,9 @@ func (d *Daemon) setupBootstrapLifeline() {
 				"interface", lifeline, "pci", rec.PCIAddr, "mac", rec.MAC)
 		}
 	} else {
-		slog.Warn("bootstrap lifeline: management NIC has no PCI address; protected set will "+
-			"fall back to fxp0 only", "interface", lifeline)
+		slog.Warn("bootstrap lifeline: management NIC has no PCI address and no resolvable "+
+			"MAC; no lifeline record written, protected set will fall back to fxp0 only",
+			"interface", lifeline)
 	}
 
 	// Determine the enumeration index of the lifeline NIC. Only index 0
