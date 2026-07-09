@@ -43712,3 +43712,7 @@ top.
   **File(s)**: pkg/config/compiler_security_addressbook.go, pkg/config/addressset_bracket_members_4791_test.go
   **Action**: Guard config-DB AES-GCM decrypt against wrong-length nonce (fail closed with error instead of panic); add RED-on-revert test
   **File(s)**: pkg/configstore/crypto.go, pkg/configstore/crypto_nonce_length_4793_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix SESSION_CLOSE slog "firewall event" line always logging policy_id=0 (use rec.PolicyID, not zeroed evt.PolicyID); add RED-on-revert test
+  **File(s)**: pkg/logging/ringbuf.go, pkg/logging/session_close_slog_policyid_4796_test.go
