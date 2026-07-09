@@ -28,22 +28,23 @@ Junos output formatting in xpf.
 16. [Security: IPsec SAs Detail](#security-ipsec-security-associations-detail)
 17. [Security: IKE SAs](#security-ike-security-associations)
 18. [Security: Log](#security-log)
-19. [Interfaces: Terse](#interfaces-terse)
-20. [Interfaces: Detail](#interfaces-detail)
-21. [Interfaces: Extensive](#interfaces-extensive)
-22. [System: Uptime](#system-uptime)
-23. [System: Memory](#system-memory)
-24. [System: Processes Summary](#system-processes-summary)
-25. [System: Version](#system-version)
-26. [Chassis Cluster: Status](#chassis-cluster-status)
-27. [Chassis Cluster: Interfaces](#chassis-cluster-interfaces)
-28. [Routing: Route Table (Brief)](#routing-route-table-brief)
-29. [Routing: Route Destination Lookup](#routing-route-destination-lookup)
-30. [Routing: Route Summary](#routing-route-summary)
-31. [Routing: BGP Summary](#routing-bgp-summary)
-32. [Routing: ARP](#routing-arp)
-33. [Pipe Filters](#pipe-filters)
-34. [Configuration Display](#configuration-display)
+19. [Firewall: Filters (raw and effective)](#firewall-filters-raw-and-effective)
+20. [Interfaces: Terse](#interfaces-terse)
+21. [Interfaces: Detail](#interfaces-detail)
+22. [Interfaces: Extensive](#interfaces-extensive)
+23. [System: Uptime](#system-uptime)
+24. [System: Memory](#system-memory)
+25. [System: Processes Summary](#system-processes-summary)
+26. [System: Version](#system-version)
+27. [Chassis Cluster: Status](#chassis-cluster-status)
+28. [Chassis Cluster: Interfaces](#chassis-cluster-interfaces)
+29. [Routing: Route Table (Brief)](#routing-route-table-brief)
+30. [Routing: Route Destination Lookup](#routing-route-destination-lookup)
+31. [Routing: Route Summary](#routing-route-summary)
+32. [Routing: BGP Summary](#routing-bgp-summary)
+33. [Routing: ARP](#routing-arp)
+34. [Pipe Filters](#pipe-filters)
+35. [Configuration Display](#configuration-display)
 
 ---
 
@@ -1508,6 +1509,79 @@ the local CLI and the remote `cli` (gRPC text path). Both share one parser,
 forwarded only a numeric count to the daemon and dropped any zone/protocol/
 action selector, so `show security log zone <name>` on the remote client
 silently dumped every event instead of isolating the requested zone.
+
+---
+
+## Firewall: Filters (raw and effective)
+
+**Commands:**
+
+- `show firewall` — all filters, RAW typed config.
+- `show firewall filter <name> [family inet|inet6]` — one filter, RAW.
+- `show firewall effective [family inet|inet6]` — all filters, EFFECTIVE
+  (compiled) view.
+- `show firewall filter <name> effective [family inet|inet6]` — one filter,
+  EFFECTIVE.
+
+The RAW view (`show firewall …`) prints the typed configuration as authored —
+literal addresses, `from source-prefix-list <name>` references by NAME,
+symbolic DSCP names, and each term's raw `then` selectors, alongside live
+per-term hit counters read from the dataplane.
+
+The EFFECTIVE view (`… effective`, #4422) rebuilds and prints the
+`FirewallFilterSnapshot` the userspace dataplane actually receives — the exact
+match/action the matcher enforces. It is read-only and derives entirely from
+the active config (it reads `dpuserspace.BuildFirewallFilterSnapshots`, the
+same builder `buildSnapshot` threads into `ConfigSnapshot.Filters`); it touches
+no dataplane state and reports no hit counters. It differs from the RAW view
+where compilation transforms the term:
+
+- **Prefix-list references are resolved** to their literal prefixes
+  (`from source-prefix-list trusted` → `from source-address 10.0.0.0/8,
+  192.168.0.0/16`), matching #2506 lowering.
+- **`except` prefix-lists** render as `from source-address except …`; an empty
+  positive set renders `(empty set — matches nothing)` and an empty `except`
+  set `(empty set — matches any)`, exposing the fail-closed / match-all
+  Junos empty-set semantics. A mixed positive+except term (rejected at strict
+  commit, #3359) is shown positive-wins.
+- **Multi-value match lists** (bracketed `[ … ]`, #2419) survive the collapse
+  and render every value (`from destination-port 22, 80`).
+- **Symbolic DSCP names resolve to numeric code points** (`ef` → `46`).
+- **`tcp-flags` expressions** render as lowered `require`/`forbid` masks
+  (#3076).
+- **Fall-through** — a `then next term` or modifier-only term (no terminating
+  action) renders `then next term (fall-through)` (#2544); a terminating term
+  renders `then <action>` (default `accept`).
+- **Unrepresentable matches** — a token the compiler cannot lower (an
+  out-of-range ICMP type, an unknown DSCP, an unparseable `tcp-flags`) that
+  reaches the snapshot on the lenient / peer-sync path renders
+  `<unrepresentable — snapshot fails closed>`, mirroring the fail-closed
+  markers the Rust filter compiler acts on (#3406/#3367).
+
+The heading carries a `[effective]` tag (`Filter: demo (family inet)
+[effective]`) so the compiled view is never confused with the raw output.
+
+```
+Filter: demo (family inet) [effective]
+  Term: t1
+    from source-address 10.0.0.0/8, 192.168.0.0/16
+    from protocol tcp
+    from destination-port 22, 80
+    from dscp 46
+    then forwarding-class best-effort
+    then count c1
+    then next term (fall-through)
+  Term: t2
+    then accept
+```
+
+### Format Details
+
+- Heading: `Filter: <name> (family inet|inet6) [effective]`.
+- Per term: `  Term: <name>`, then `from …` match lines, then `then …` action
+  and modifier lines (2-space / 4-space indent).
+- The `effective` keyword is a trailing modifier and composes with the loose
+  `family <f>` selector in either order.
 
 ---
 

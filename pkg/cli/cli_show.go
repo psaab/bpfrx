@@ -131,6 +131,19 @@ func (c *CLI) handleShow(args []string) error {
 		return nil
 
 	case "firewall":
+		// #4422: `show firewall [filter <name>] effective [family <f>]` renders
+		// the compiled FirewallFilterSnapshot the dataplane actually receives
+		// (post prefix-list resolution, DSCP code-point resolution, TCP-flags
+		// lowering, fall-through, fail-closed markers) instead of the raw config.
+		// `effective` is a trailing modifier alongside the existing loose
+		// `family <f>` modifier, so scan for both.
+		if firewallArgsHaveWord(args, "effective") {
+			family := firewallFamilyArg(args)
+			if len(args) >= 3 && args[1] == "filter" {
+				return c.showEffectiveFirewallFilter(args[2], family)
+			}
+			return c.showEffectiveFirewallFilters(family)
+		}
 		if len(args) >= 3 && args[1] == "filter" {
 			family := ""
 			if len(args) >= 5 && args[3] == "family" {
@@ -241,4 +254,28 @@ func (c *CLI) handleShow(args []string) error {
 	default:
 		return fmt.Errorf("unknown show target: %s", args[0])
 	}
+}
+
+// firewallArgsHaveWord reports whether word appears anywhere in the firewall
+// show arguments (args[0] is "firewall"). Used to detect the trailing
+// `effective` modifier (#4422) regardless of its position relative to the
+// `filter <name>` / `family <f>` tokens.
+func firewallArgsHaveWord(args []string, word string) bool {
+	for _, a := range args {
+		if a == word {
+			return true
+		}
+	}
+	return false
+}
+
+// firewallFamilyArg extracts the value of the loose trailing `family <f>`
+// modifier from the firewall show arguments, or "" if absent (#4422).
+func firewallFamilyArg(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "family" {
+			return args[i+1]
+		}
+	}
+	return ""
 }
