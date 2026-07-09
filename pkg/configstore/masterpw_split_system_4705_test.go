@@ -1,12 +1,27 @@
 package configstore
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
+
+// splitStanzaMasterPwText is a config whose master-password lives ONLY in a
+// SECOND top-level system stanza (the #4705 reachability shape). Parsed with
+// the real parser, tree.Children holds two `system` nodes.
+const splitStanzaMasterPwText = `system {
+    host-name split-secret-fw;
+}
+system {
+    master-password {
+        pseudorandom-function juniper-prf1;
+    }
+}
+`
 
 // TestMasterPasswordSplitSystemStanzaEncrypts is the #4705 regression guard.
 //
@@ -24,16 +39,7 @@ import (
 // test FAIL — the persisted DB contains the cleartext host-name and lacks the
 // encrypted envelope marker.
 func TestMasterPasswordSplitSystemStanzaEncrypts(t *testing.T) {
-	const cfgText = `system {
-    host-name split-secret-fw;
-}
-system {
-    master-password {
-        pseudorandom-function juniper-prf1;
-    }
-}
-`
-	tree, errs := config.NewParser(cfgText).Parse()
+	tree, errs := config.NewParser(splitStanzaMasterPwText).Parse()
 	if len(errs) > 0 {
 		t.Fatalf("parse error: %v", errs[0])
 	}
@@ -104,5 +110,47 @@ func TestMasterPasswordSingleStanzaStillResolves(t *testing.T) {
 	plain := testConfigTree("", "plain-fw")
 	if prf := masterPasswordPRF(plain); prf != "" {
 		t.Fatalf("masterPasswordPRF(no master-password) = %q, want empty", prf)
+	}
+}
+
+// TestMasterPasswordSplitStanzaDowngradeWarn_4705 proves the #4705 fix also
+// repairs the #4579 A4-06 plaintext-downgrade warning for the split-stanza
+// case: the warning path (db.go readTreeMeta) keys off masterPasswordPRF, so
+// with the buggy first-match resolver a config that declares master-password
+// ONLY in a second system stanza but is stored as plaintext read back WITHOUT
+// any warning — the silent at-rest exposure #4579 was built to surface. Reuses
+// the #4579 harness (captureWarnLogs / wrapEnvelope). RED on revert: first-
+// match masterPasswordPRF returns "" for this tree, the warn never fires, and
+// the substring assertion fails.
+func TestMasterPasswordSplitStanzaDowngradeWarn_4705(t *testing.T) {
+	buf := captureWarnLogs(t)
+	s := newTestStore(t)
+
+	tree, errs := config.NewParser(splitStanzaMasterPwText).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	if masterPasswordPRF(tree) != "juniper-prf1" {
+		t.Fatalf("split-stanza tree must declare a master-password (second stanza)")
+	}
+
+	// Write active.json as PLAINTEXT (no AES-GCM envelope) despite the declared
+	// master-password — the downgrade case — wrapped in the #1917 compat
+	// envelope like a real committed DB so readTreeMeta reaches decrypt/parse.
+	body, err := json.MarshalIndent(tree, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal tree: %v", err)
+	}
+	framed := wrapEnvelope(body, "", true)
+	if err := fsatomic.WriteFileDurable(s.db.activePath(), framed, 0600); err != nil {
+		t.Fatalf("write plaintext active.json: %v", err)
+	}
+
+	if _, err := s.db.ReadActive(); err != nil {
+		t.Fatalf("ReadActive: %v", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "#4579") || !strings.Contains(logged, "UNENCRYPTED plaintext") {
+		t.Fatalf("expected #4579 downgrade warning for split-stanza master-password; got log:\n%s", logged)
 	}
 }

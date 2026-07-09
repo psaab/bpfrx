@@ -36,8 +36,10 @@ func (db *DB) masterKeyPath() string {
 }
 
 // masterPasswordPRF resolves the master-password pseudorandom-function that
-// decides whether the config DB is written encrypted. It MUST consider every
-// top-level `system` stanza, not just the first (#4705).
+// decides whether the config DB is written encrypted (maybeEncryptTreeJSON)
+// and whether the #4579 A4-06 plaintext-downgrade warning fires (db.go
+// readTreeMeta). It MUST consider every top-level `system` stanza, not just
+// the first (#4705).
 //
 // The Junos parser does not merge duplicate top-level stanzas: parseStatements
 // appends each `system { ... }` block as its own child, and neither
@@ -47,16 +49,12 @@ func (db *DB) masterKeyPath() string {
 // cfg.System — so a `master-password` living in a SECOND system stanza is
 // semantically active. A single-first-match tree.FindChild("system") would
 // then miss it and write the whole DB (secrets included) in PLAINTEXT despite
-// encryption being configured. Fail CLOSED: scan every "system" child and
-// every "master-password" within it, and encrypt if ANY carries a PRF.
+// encryption being configured. Fail CLOSED: reuse systemBlocksOf (the SAME
+// all-matches helper the compiler's dataplane-retirement walk uses) to scan
+// every "system" child and every "master-password" within it, and encrypt if
+// ANY carries a PRF.
 func masterPasswordPRF(tree *config.ConfigTree) string {
-	if tree == nil {
-		return ""
-	}
-	for _, sys := range tree.Children {
-		if sys == nil || sys.Name() != "system" {
-			continue
-		}
+	for _, sys := range systemBlocksOf(tree) {
 		for _, mp := range sys.FindChildren("master-password") {
 			prf := mp.FindChild("pseudorandom-function")
 			if prf == nil {

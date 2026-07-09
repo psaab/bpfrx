@@ -128,8 +128,9 @@ inline archive-site passwords).
 
 - **Split `system` stanza resolution (#4705).** "The tree declares a
   master-password" is decided by `masterPasswordPRF`, which scans **every**
-  top-level `system` child (via a `tree.Children` walk + per-node
-  `FindChildren("master-password")`), not just the first `FindChild("system")`
+  top-level `system` child — reusing `systemBlocksOf` (the same all-matches
+  helper the dataplane-retirement walk uses) plus per-node
+  `FindChildren("master-password")` — not just the first `FindChild("system")`
   match. The Junos parser does not merge duplicate top-level stanzas
   (`parseStatements` appends each) and `LoadOverride` / `SyncApply` feed the
   raw parsed tree to the write path, so a `master-password` living in a second
@@ -137,7 +138,10 @@ inline archive-site passwords).
   nodes into one `cfg.System`). A first-match resolver missed it and wrote the
   whole DB — secrets included — in plaintext despite encryption being
   configured. Resolution now fails **closed**: if any `system` stanza carries a
-  `pseudorandom-function`, the body is encrypted.
+  `pseudorandom-function`, the body is encrypted. Because the A4-06
+  downgrade warning below also keys off `masterPasswordPRF`, centralizing the
+  resolution here fixes that path for the split-stanza case too (the warning
+  now fires when a second-stanza master-password DB is read back as plaintext).
 - **Unexpected-plaintext warning (A4-06).** Every write path encrypts the
   body when the tree declares a master-password, so `readTreeMeta` reading
   a config back as *plaintext* while its tree still declares a

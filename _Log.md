@@ -11,12 +11,16 @@
   schema validation accepts duplicate `system` nodes, and the compiler
   (`compileSections` loops all top-level nodes) folds every `system` node into
   the same `cfg.System` — so the master-password is semantically active but the
-  crypto path missed it. Fix: walk EVERY top-level `system` child +
+  crypto path missed it. Fix: resolve via the EXISTING `systemBlocksOf` helper
+  (the same all-matches walk the dataplane-retirement code uses) +
   `FindChildren("master-password")` within each; encrypt if ANY carries a PRF
-  (fail closed). Added RED-on-revert test that parses two `system` stanzas
-  (master-password only in the 2nd) and asserts the persisted DB is encrypted,
-  not plaintext; reverting to first-match makes it FAIL. README crypto note
-  added.
+  (fail closed). The #4579 A4-06 plaintext-downgrade warning (db.go
+  readTreeMeta) keys off the same `masterPasswordPRF`, so centralizing the
+  resolution repairs that path for the split-stanza case too. Added two
+  RED-on-revert tests: (1) parse two `system` stanzas (master-password only in
+  the 2nd) -> persisted DB encrypted, not plaintext; (2) plaintext-on-disk
+  split-stanza DB read back -> #4579 downgrade warning fires. Reverting to
+  first-match makes BOTH FAIL. README crypto note added.
 - **Validation**: gofmt; go build ./...; RED-on-revert confirmed (buggy
   first-match → `masterPasswordPRF = ""` → test FAIL); fixed → PASS;
   `pkg/configstore/...` + `pkg/config/...` green; FULL Go suite green (53 ok,
