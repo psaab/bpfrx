@@ -43087,3 +43087,19 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/umem/{mod.rs,README.md},
   userspace-dp/src/afxdp/umem/tests.rs (deleted),
   userspace-dp/src/afxdp/umem/tests/{mod,mmap_area,tx_inbox,latency_buckets,snapshot_propagation,tx_submit_latency,tx_kick_latency,debug_state}.rs (new)
+
+- **Timestamp**: 2026-07-09
+- **Action**: #4719 — batch/non-blocking ClearAllSessions to avoid HA-watchdog
+  starvation. Collection now uses BatchIterateSessions{,V6} (yield between
+  batch-lookups); deletion routes v4/v6 keys through new clearSessionsV4/V6
+  helpers issuing chunked BPF_MAP_DELETE_BATCH (sessionDeleteBatchSize=64 keys
+  per syscall) with runtime.Gosched() between chunks and a per-key remainder
+  fallback (concurrent GC delete / unsupported batch) so the clear stays
+  complete — never a partial clear reported as done. DNAT cleanup loops now
+  yield every batch. Added sessionClearBatchObserver test seam +
+  real-ebpf-map RED-on-revert test (300 fwd+rev flows/family): asserts all
+  cleared (fwd+rev gone), batched path taken, empty/single guards. Verified
+  RED-on-revert (per-key revert → batched-path assertion fails) and passing
+  under -race as root.
+- **File(s)**: pkg/dataplane/maps_session.go,
+  pkg/dataplane/maps_session_clear_test.go, _Log.md
