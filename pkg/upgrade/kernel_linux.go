@@ -312,11 +312,22 @@ func (s *realKernelSystem) ArmWatchdog() error {
 	defer unix.Close(fd)
 
 	timeout := watchdogTimeoutSecs()
-	// WDIOC_SETTIMEOUT failure (driver doesn't support it) is non-fatal — fall
-	// through to a keepalive write to at least pet whatever default timeout the
-	// driver has; the keepalive is the minimal arm signal.
-	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.WDIOC_SETTIMEOUT), uintptr(unsafe.Pointer(&timeout)))
-	return writeWatchdogKeepalive(fd)
+	// Attempt to set a generous timeout, then pet. We ALWAYS attempt the
+	// keepalive first so a driver that lacks WDIOC_SETTIMEOUT still gets a pet on
+	// its default timeout (the D2 weak-arm). But a SETTIMEOUT failure means we
+	// could NOT establish the generous timeout the roll relies on, so we must
+	// SURFACE it rather than swallow it (#4872 B): a StrictWatchdog (D1)
+	// deployment treats an arm failure as fatal and refuses to reboot with a
+	// watchdog whose timeout we could not control. The caller (armCandidate)
+	// decides strict-vs-best-effort; this method's job is to report the truth.
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.WDIOC_SETTIMEOUT), uintptr(unsafe.Pointer(&timeout)))
+	if err := writeWatchdogKeepalive(fd); err != nil {
+		return err
+	}
+	if errno != 0 {
+		return fmt.Errorf("watchdog WDIOC_SETTIMEOUT(%ds): %w", timeout, errno)
+	}
+	return nil
 }
 
 func (s *realKernelSystem) Reboot() error {
@@ -482,15 +493,31 @@ func (s *realKernelSystem) SetBootOrderFront(bootID string) error {
 }
 
 func (s *realKernelSystem) DisarmWatchdog() error {
+	// A genuinely-absent watchdog device is "nothing to disarm" — nil. But an
+	// I/O failure while a device IS present (open/write/close) was previously
+	// swallowed into nil, hiding a watchdog that is still armed and could bounce
+	// the box (#4872 B). Surface those errors so the caller can log them (or, in
+	// strict contexts, react) instead of assuming a clean disarm.
 	if _, err := os.Stat("/dev/watchdog"); err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat /dev/watchdog: %w", err)
 	}
 	fd, err := unix.Open("/dev/watchdog", unix.O_WRONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return nil
+		return fmt.Errorf("open /dev/watchdog for disarm: %w", err)
 	}
-	_, _ = unix.Write(fd, []byte{'V'})
-	_ = unix.Close(fd)
+	// The magic-close 'V' tells the driver to disable the watchdog on close
+	// (WDIOF_MAGICCLOSE). Both the write and the close must succeed for the
+	// disarm to actually take effect.
+	if _, werr := unix.Write(fd, []byte{'V'}); werr != nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("write watchdog magic-close: %w", werr)
+	}
+	if cerr := unix.Close(fd); cerr != nil {
+		return fmt.Errorf("close /dev/watchdog: %w", cerr)
+	}
 	return nil
 }
 

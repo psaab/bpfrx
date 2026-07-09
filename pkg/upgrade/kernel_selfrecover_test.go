@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -215,5 +216,81 @@ func TestSelfRecoveryTimerResetsOnConditionLapse(t *testing.T) {
 	now = now.Add(40 * time.Second) // 80s total but only 40s since re-observe
 	if did, _ := sr.Tick(); did {
 		t.Fatal("timer should have reset on the lapse; not yet past grace")
+	}
+}
+
+// #4872 C: a semantic-empty lease body ({}) decodes to NodeID=0 + zero
+// ExpiresAt. On node 0 that would slip past the NodeID guard and read as an
+// ALREADY-EXPIRED lease naming us, spuriously arming self-recovery during a
+// deliberate maintenance drain. A lease with no expires_at must be rejected.
+func TestSelfRecoveryEmptyLeaseDoesNotRecover(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cl := &fakeSRCluster{drained: true, peerOK: true}
+	sr := newSR(t, cl, &now, 1*time.Second)
+	if err := os.WriteFile(sr.cfg.LeasePath, []byte("{}"), 0644); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
+	_, _ = sr.Tick()
+	now = now.Add(10 * time.Second) // well past grace
+	if did, err := sr.Tick(); did || err != nil || cl.resets != 0 {
+		t.Fatalf("#4872 C: a semantic-empty {} lease must NOT trigger node-0 self-recovery "+
+			"(did=%v err=%v resets=%d)", did, err, cl.resets)
+	}
+}
+
+// #4872 C: a lease carrying node_id but no expires_at is missing a required
+// field and must not authorize self-recovery either.
+func TestSelfRecoveryLeaseMissingExpiryDoesNotRecover(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cl := &fakeSRCluster{drained: true, peerOK: true}
+	sr := newSR(t, cl, &now, 1*time.Second)
+	if err := os.WriteFile(sr.cfg.LeasePath, []byte(`{"node_id":0,"holder":"orch"}`), 0644); err != nil {
+		t.Fatalf("write lease: %v", err)
+	}
+	_, _ = sr.Tick()
+	now = now.Add(10 * time.Second)
+	if did, _ := sr.Tick(); did || cl.resets != 0 {
+		t.Fatal("#4872 C: a lease missing expires_at must NOT trigger self-recovery")
+	}
+}
+
+// #4872 D: an observation error must RESET the grace clock so grace accrues
+// only while every predicate is continuously observed positive. A run of
+// errored ticks (transient management outage) must not silently age the
+// deadline and let the next positive tick rejoin immediately.
+func TestSelfRecoveryObservationErrorResetsGrace(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cl := &fakeSRCluster{drained: true, peerOK: true}
+	sr := newSR(t, cl, &now, 60*time.Second)
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 0, ExpiresAt: now.Add(-time.Minute)})
+
+	// Tick 1: start the grace timer.
+	if did, err := sr.Tick(); did || err != nil {
+		t.Fatalf("tick 1 should only start the timer (did=%v err=%v)", did, err)
+	}
+	// Nearly a full grace window elapses, then a tick hits an observation error.
+	now = now.Add(59 * time.Second)
+	cl.peerErr = fmt.Errorf("transient management outage")
+	if did, err := sr.Tick(); did || err == nil {
+		t.Fatalf("errored tick must not recover and must surface the error (did=%v err=%v)", did, err)
+	}
+	// Clear the error and advance PAST the ORIGINAL deadline (61s since tick 1)
+	// but only just past the errored tick: with the grace clock reset this must
+	// NOT rejoin yet (pre-fix it would, because drainedSince still pointed at
+	// tick 1).
+	now = now.Add(2 * time.Second)
+	cl.peerErr = nil
+	if did, err := sr.Tick(); did || err != nil {
+		t.Fatalf("#4872 D: grace clock must restart after the errored-tick gap; must NOT "+
+			"rejoin yet (did=%v err=%v)", did, err)
+	}
+	if cl.resets != 0 {
+		t.Fatal("#4872 D: rejoined despite the reset grace window")
+	}
+	// After a fresh CONTINUOUS grace window it does recover.
+	now = now.Add(61 * time.Second)
+	if did, err := sr.Tick(); !did || err != nil || cl.resets != 1 {
+		t.Fatalf("should recover after a fresh continuous grace window (did=%v err=%v resets=%d)",
+			did, err, cl.resets)
 	}
 }
