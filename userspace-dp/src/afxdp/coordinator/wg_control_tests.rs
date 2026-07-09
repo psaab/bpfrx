@@ -1,0 +1,702 @@
+use super::*;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// #1736 S2b regression: a v4-mapped learned endpoint must unmap to
+/// canonical V4 so the encap MTU guard charges IPv4 outer overhead.
+#[test]
+fn canonicalize_endpoint_unmaps_v4_mapped() {
+    let mapped: SocketAddr = "[::ffff:10.0.61.103]:51820".parse().unwrap();
+    let got = canonicalize_endpoint(mapped);
+    assert_eq!(
+        got,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 103)), 51820)
+    );
+    assert!(!got.is_ipv6());
+}
+
+/// Native v6 and native v4 endpoints pass through untouched.
+#[test]
+fn canonicalize_endpoint_passthrough() {
+    let v6: SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+    assert_eq!(canonicalize_endpoint(v6), v6);
+    let v4: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+    assert_eq!(canonicalize_endpoint(v4), v4);
+    // A non-mapped v6 with an embedded v4-looking tail stays v6.
+    let nat64: SocketAddr = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x3d67)),
+        51820,
+    );
+    assert_eq!(canonicalize_endpoint(nat64), nat64);
+}
+
+/// #1736 S2b regression (strace-proven live): a v4 target on the
+/// dual-stack AF_INET6 socket must be sent as its V4-MAPPED form —
+/// Linux returns EINVAL for an AF_INET destination sockaddr on an
+/// AF_INET6 socket, which silently killed every initiation toward
+/// the configured v4 endpoint. Loopback round-trip proves the
+/// mapped send actually lands.
+#[test]
+fn wg_send_to_maps_v4_target_on_v6_socket() {
+    let (rx, rx_is_v6) = bind_wg_socket(0).expect("bind rx");
+    if !rx_is_v6 {
+        // Production supports the v4-fallback socket on hosts
+        // without dual-stack v6; the mapped-send regression is
+        // untestable there (covered by the v4 round-trip below).
+        return;
+    }
+    let rx_port = rx.local_addr().unwrap().port();
+    let (tx, tx_is_v6) = bind_wg_socket(0).expect("bind tx");
+    // The plain V4 loopback target — the failing live shape.
+    let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
+    wg_send_to(&tx, tx_is_v6, b"wg-test", target).expect("mapped v4 send must succeed");
+    rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 16];
+    let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
+    assert_eq!(&buf[..n], b"wg-test");
+    // Direct unmapped send documents WHY the helper exists; accept
+    // either kernel behavior (EINVAL on Linux mainline) without
+    // asserting it so the test stays portable.
+    let _ = tx.send_to(b"raw", target);
+}
+
+/// The v4-fallback socket path: native v4 sends must pass through
+/// wg_send_to UNMAPPED (socket_is_v6=false) and round-trip.
+#[test]
+fn wg_send_to_native_v4_socket_roundtrip() {
+    let rx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 rx");
+    let rx_port = rx.local_addr().unwrap().port();
+    let tx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 tx");
+    let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
+    wg_send_to(&tx, false, b"wg-v4", target).expect("native v4 send");
+    rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 16];
+    let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
+    assert_eq!(&buf[..n], b"wg-v4");
+}
+
+/// Build a `recvmsg`-shaped `sockaddr_storage` for an AF_INET6 peer
+/// with an explicit interface scope, mirroring what the kernel writes
+/// into `msg_name` for a datagram received from a link-local source.
+fn make_sin6_storage(
+    ip: Ipv6Addr,
+    port: u16,
+    flowinfo: u32,
+    scope_id: u32,
+) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let sin6 = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: flowinfo,
+        sin6_addr: libc::in6_addr {
+            s6_addr: ip.octets(),
+        },
+        sin6_scope_id: scope_id,
+    };
+    // SAFETY: sockaddr_storage is large enough for sockaddr_in6 and we
+    // only read back the populated prefix via the conversion under test.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            &sin6 as *const libc::sockaddr_in6 as *const u8,
+            &mut storage as *mut libc::sockaddr_storage as *mut u8,
+            std::mem::size_of::<libc::sockaddr_in6>(),
+        );
+    }
+    (
+        storage,
+        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+    )
+}
+
+/// #2995 fail-on-revert: a link-local (`fe80::/10`) WG peer endpoint
+/// learned from `recvmsg` MUST carry the receiving interface scope
+/// (`sin6_scope_id` = ifindex) through `sockaddr_storage_to_socketaddr`.
+/// If the conversion reverts to `SocketAddr::new(...)` the scope is
+/// dropped to 0 and `wg_send_to` toward the endpoint is rejected with
+/// EINVAL/ENODEV, so the tunnel never establishes. This asserts the
+/// scope (and `sin6_flowinfo`) survive; it goes RED if scope_id == 0.
+#[test]
+fn sockaddr_storage_to_socketaddr_preserves_link_local_scope() {
+    let ll = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x1);
+    let ifindex: u32 = 7;
+    let flowinfo: u32 = 0x0001_2345;
+    let (storage, len) = make_sin6_storage(ll, 51820, flowinfo, ifindex);
+    let got = sockaddr_storage_to_socketaddr(&storage, len).expect("AF_INET6 storage must convert");
+    match got {
+        SocketAddr::V6(v6) => {
+            assert_eq!(*v6.ip(), ll);
+            assert_eq!(v6.port(), 51820);
+            assert_eq!(
+                v6.scope_id(),
+                ifindex,
+                "link-local scope_id must equal the receiving ifindex \
+                     (reverting to SocketAddr::new drops it to 0)"
+            );
+            assert_eq!(v6.flowinfo(), flowinfo, "flowinfo must survive");
+        }
+        other => panic!("expected V6, got {other:?}"),
+    }
+}
+
+/// A global v6 endpoint carries scope_id 0 from the kernel; the
+/// conversion must preserve that 0 unchanged (the fix is a no-op for
+/// global addresses — it only matters for link-local).
+#[test]
+fn sockaddr_storage_to_socketaddr_global_v6_scope_zero() {
+    let g = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1);
+    let (storage, len) = make_sin6_storage(g, 51820, 0, 0);
+    let got = sockaddr_storage_to_socketaddr(&storage, len).expect("convert");
+    match got {
+        SocketAddr::V6(v6) => {
+            assert_eq!(*v6.ip(), g);
+            assert_eq!(v6.scope_id(), 0);
+        }
+        other => panic!("expected V6, got {other:?}"),
+    }
+}
+
+// =======================================================================
+// #1889: poll(2) loop tests on pre-opened fds (run_wg_control_loop —
+// a pipe read-end stands in for the TUN; no real device needed).
+// =======================================================================
+
+fn poll_loop_fixture() -> (
+    std::sync::Arc<crate::afxdp::wg::WgEngine>,
+    UdpSocket,
+    std::fs::File, // tun stand-in (pipe read end)
+    std::fs::File, // pipe write end (keep open!)
+    std::sync::Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    std::sync::Arc<AtomicBool>,
+) {
+    use std::os::fd::FromRawFd;
+    let engine = std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+        crate::afxdp::wg::WgEngineConfig {
+            local_private_key: [7u8; 32].into(),
+            listen_port: 0,
+            peers: vec![crate::afxdp::wg::WgPeerConfig {
+                pubkey: [9u8; 32],
+                endpoint: None, // responder-only: no bring-up sends
+                persistent_keepalive: 0,
+                allowed_ips: vec![],
+                preshared_key: [0u8; 32].into(),
+            }],
+        },
+    ));
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    socket.set_nonblocking(true).unwrap();
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "pipe");
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    set_fd_nonblocking(read_fd).unwrap();
+    let tun = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    let pipe_w = unsafe { std::fs::File::from_raw_fd(write_fd) };
+    let exceptions = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    (engine, socket, tun, pipe_w, exceptions, stop)
+}
+
+fn spawn_poll_loop(
+    engine: std::sync::Arc<crate::afxdp::wg::WgEngine>,
+    socket: UdpSocket,
+    tun: std::fs::File,
+    exceptions: std::sync::Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    stop: std::sync::Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        run_wg_control_loop(
+            "wg-test",
+            &engine,
+            &socket,
+            false,
+            tun,
+            WG_DEFAULT_OUTER_MTU,
+            &exceptions,
+            &stop,
+        );
+    })
+}
+
+/// #1889 constraint 1: an idle-blocked loop must stop+join within
+/// the poll cap budget (no eventfd — the 100ms cap bounds it).
+#[test]
+fn poll_loop_stop_joins_promptly_while_idle_blocked() {
+    let (engine, socket, tun, _pipe_w, exceptions, stop) = poll_loop_fixture();
+    let handle = spawn_poll_loop(engine, socket, tun, exceptions, stop.clone());
+    // Let the loop settle into its idle poll.
+    std::thread::sleep(Duration::from_millis(150));
+    let started = std::time::Instant::now();
+    stop.store(true, Ordering::Relaxed);
+    handle.join().expect("join");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "stop->join took {:?} (budget 500ms; cap is 100ms)",
+        started.elapsed()
+    );
+}
+
+/// #1889 constraint 2: a datagram arriving while idle-blocked wakes
+/// the loop and is processed promptly (no 1s timer wait). A non-WG
+/// type byte lands in rx_unknown_type deterministically.
+#[test]
+fn poll_loop_wakes_on_socket_readiness() {
+    let (engine, socket, tun, _pipe_w, exceptions, stop) = poll_loop_fixture();
+    let target = socket.local_addr().unwrap();
+    let counters_engine = engine.clone();
+    let handle = spawn_poll_loop(engine, socket, tun, exceptions, stop.clone());
+    std::thread::sleep(Duration::from_millis(120)); // reach idle poll
+    let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+    tx.send_to(&[0xee, 1, 2, 3], target).unwrap();
+    let mut seen = false;
+    for _ in 0..30 {
+        if counters_engine
+            .counters()
+            .rx_unknown_type
+            .load(Ordering::Relaxed)
+            == 1
+        {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Relaxed);
+    handle.join().expect("join");
+    assert!(seen, "datagram not processed within 300ms of arrival");
+}
+
+/// Fatal-fd guard: destroying the TUN under the loop (pipe write
+/// end dropped => POLLHUP on the read end) exits the thread
+/// cleanly WITHOUT the stop flag — the #1872 tombstone respawn is
+/// the recovery path. No busy-spin, no hang.
+#[test]
+fn poll_loop_exits_on_tun_teardown() {
+    let (engine, socket, tun, pipe_w, exceptions, stop) = poll_loop_fixture();
+    let handle = spawn_poll_loop(engine, socket, tun, exceptions, stop.clone());
+    std::thread::sleep(Duration::from_millis(120));
+    drop(pipe_w); // TUN "destroyed": POLLHUP forever
+    let started = std::time::Instant::now();
+    // Join must complete without stop ever being set.
+    handle.join().expect("join");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "fatal-TUN exit took {:?}",
+        started.elapsed()
+    );
+    assert!(!stop.load(Ordering::Relaxed));
+}
+
+/// Codex code-r1 BLOCKER regression: a T5 give-up must NOT
+/// evaluate the (pre-cleanup) TimerActions in the same pass — a T7
+/// DeadPeer trigger captured before the cleanup would resurrect a
+/// fresh 90s window immediately, bypassing the give-up boundary.
+#[test]
+fn attempt_give_up_ignores_same_pass_stale_actions() {
+    use crate::afxdp::wg::session::REKEY_ATTEMPT_TIME_NS;
+    use crate::afxdp::wg::timers::{InitiateReason, TimerActions, WG_NO_DEADLINE_NS};
+    let (engine, socket, _tun, _pipe_w, exceptions, _stop) = poll_loop_fixture();
+    let pk = engine.first_peer_pubkey().unwrap();
+    let ep: SocketAddr = "127.0.0.1:39999".parse().unwrap();
+    let mut encap_buf = vec![0u8; 2048];
+    let now = 200_000_000_000u64;
+    let mut attempt = Some(HandshakeAttempt {
+        started_ns: now - REKEY_ATTEMPT_TIME_NS - 1,
+        last_tx_ns: now - 1_000_000_000,
+        baseline_session: None,
+    });
+    // Stale actions captured BEFORE the give-up cleanup, carrying a
+    // due T7 trigger.
+    let stale_actions = TimerActions {
+        initiate: Some(InitiateReason::DeadPeer),
+        send_keepalive: None,
+        next_deadline_ns: WG_NO_DEADLINE_NS,
+    };
+    let deadline = drive_attempt_machine(
+        &engine,
+        &socket,
+        false,
+        &pk,
+        Some(ep),
+        &stale_actions,
+        now,
+        &mut attempt,
+        &mut encap_buf,
+        "wg-test",
+        &exceptions,
+    );
+    assert!(
+        attempt.is_none(),
+        "give-up must not resurrect an attempt from stale same-pass actions"
+    );
+    assert_eq!(deadline, WG_NO_DEADLINE_NS);
+    assert_eq!(
+        engine
+            .counters()
+            .rekeys_initiated_dead_peer
+            .load(Ordering::Relaxed),
+        0,
+        "no DeadPeer attempt may start in the give-up pass"
+    );
+}
+
+/// Build a poll-loop fixture engine whose single peer has a
+/// persistent-keepalive of `keepalive_secs`. Mirrors
+/// `poll_loop_fixture` but parameterizes the keepalive so the T8
+/// pacing path can be exercised.
+fn keepalive_engine(keepalive_secs: u16) -> std::sync::Arc<crate::afxdp::wg::WgEngine> {
+    std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+        crate::afxdp::wg::WgEngineConfig {
+            local_private_key: [7u8; 32].into(),
+            listen_port: 0,
+            peers: vec![crate::afxdp::wg::WgPeerConfig {
+                pubkey: [9u8; 32],
+                endpoint: None,
+                persistent_keepalive: keepalive_secs,
+                allowed_ips: vec![],
+                preshared_key: [0u8; 32].into(),
+            }],
+        },
+    ))
+}
+
+/// #2961: a persistent-keepalive peer whose handshake can NEVER
+/// complete must NOT enter a zero-cooldown 90s handshake storm. After
+/// the attempt machine GIVES UP at T+90, the next KeepaliveNoSession
+/// initiation must be gated until give_up_time + keepalive_interval —
+/// one keepalive interval of cooldown — not fired on the next ~1s
+/// tick.
+///
+/// Fail-on-revert: delete the `engine.note_t8_attempt(...)` call in
+/// the give-up branch and the `at give-up: gated` assertion goes RED
+/// (the un-advanced anchor makes T8 perpetually due, re-firing every
+/// tick).
+#[test]
+fn giveup_paces_keepalive_no_session_by_one_interval() {
+    use crate::afxdp::wg::session::REKEY_ATTEMPT_TIME_NS;
+    use crate::afxdp::wg::timers::{InitiateReason, TimerActions, WG_NO_DEADLINE_NS};
+    let keepalive_secs: u16 = 25;
+    let interval_ns = u64::from(keepalive_secs) * 1_000_000_000;
+    let engine = keepalive_engine(keepalive_secs);
+    let pk = engine.first_peer_pubkey().unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let ep: SocketAddr = "127.0.0.1:39998".parse().unwrap();
+    let exceptions = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+    let mut encap_buf = vec![0u8; 2048];
+
+    // An attempt that has run the full 90s window — the next
+    // drive_attempt_machine pass takes the GIVE-UP branch. No real
+    // sends occurred (last_send_any/last_recv_any stay 0), so the only
+    // thing that can pace T8 across the boundary is the give-up
+    // anchor advance under test.
+    let give_up = 200_000_000_000u64;
+    let mut attempt = Some(HandshakeAttempt {
+        started_ns: give_up - REKEY_ATTEMPT_TIME_NS,
+        last_tx_ns: give_up - 1_000_000_000,
+        baseline_session: None,
+    });
+    let idle_actions = TimerActions {
+        initiate: None,
+        send_keepalive: None,
+        next_deadline_ns: WG_NO_DEADLINE_NS,
+    };
+    let deadline = drive_attempt_machine(
+        &engine,
+        &socket,
+        false,
+        &pk,
+        Some(ep),
+        &idle_actions,
+        give_up,
+        &mut attempt,
+        &mut encap_buf,
+        "wg-test",
+        &exceptions,
+    );
+    assert!(attempt.is_none(), "give-up must clear the attempt");
+    assert_eq!(deadline, WG_NO_DEADLINE_NS);
+
+    // At give-up time the next attempt must be GATED (cooldown just
+    // started). This is the assertion that goes RED without the fix:
+    // an un-advanced anchor (0) makes due = 0 + interval, already
+    // past at give_up=200s → KeepaliveNoSession fires immediately.
+    let at_giveup = engine.timer_pass_for_peer(&pk, give_up, true);
+    assert_eq!(
+        at_giveup.initiate, None,
+        "give-up must start a keepalive cooldown, not re-fire immediately"
+    );
+    assert_eq!(
+        at_giveup.next_deadline_ns,
+        give_up + interval_ns,
+        "next KeepaliveNoSession due is one keepalive interval after give-up"
+    );
+
+    // One nanosecond before the cooldown elapses: still gated.
+    let just_before = engine.timer_pass_for_peer(&pk, give_up + interval_ns - 1, true);
+    assert_eq!(
+        just_before.initiate, None,
+        "must stay gated until the full keepalive interval elapses"
+    );
+
+    // At give_up + interval: the next attempt is finally due.
+    let at_due = engine.timer_pass_for_peer(&pk, give_up + interval_ns, true);
+    assert_eq!(
+        at_due.initiate,
+        Some(InitiateReason::KeepaliveNoSession),
+        "after the cooldown a fresh KeepaliveNoSession attempt may start"
+    );
+}
+
+/// #2961: the give-up cooldown is a FLOOR, not a ceiling — a peer
+/// that comes back to life (authenticated traffic resumes / a
+/// handshake succeeds) re-anchors T8 on the fresh traffic and is NOT
+/// held back by a prior give-up's cooldown. Proves the give-up anchor
+/// advance does not regress the live/successful peer: the T8 anchor is
+/// max(last_send_any, last_recv_any, t8_last_attempt), so newer
+/// traffic wins.
+#[test]
+fn live_peer_paces_on_fresh_traffic_not_giveup_cooldown() {
+    let keepalive_secs: u16 = 25;
+    let interval_ns = u64::from(keepalive_secs) * 1_000_000_000;
+    let engine = keepalive_engine(keepalive_secs);
+    let pk = engine.first_peer_pubkey().unwrap();
+
+    // Simulate a give-up cooldown stamped at T.
+    let give_up = 200_000_000_000u64;
+    engine.note_t8_attempt(&pk, give_up);
+
+    // Authenticated traffic resumes 5s later (e.g. a handshake
+    // finally completed and data flows) — advances last_send_any.
+    let traffic = give_up + 5_000_000_000;
+    engine.note_handshake_sent(&pk, traffic);
+
+    // T8 must now pace off the FRESH traffic anchor (traffic +
+    // interval), NOT the older give-up cooldown (give_up + interval).
+    let actions = engine.timer_pass_for_peer(&pk, traffic + interval_ns - 1, true);
+    assert_eq!(
+        actions.initiate, None,
+        "a live peer is paced off fresh traffic, not the give-up cooldown"
+    );
+    assert_eq!(
+        actions.next_deadline_ns,
+        traffic + interval_ns,
+        "the anchor follows the most recent authenticated traversal"
+    );
+}
+
+/// AGY r3 G3: the ns->ms conversion clamps to the cap and never
+/// yields a negative/zero-spin timeout for future deadlines.
+#[test]
+fn poll_timeout_ms_clamps_and_converts() {
+    let now = 1_000_000_000u64;
+    // Far-future deadline: capped.
+    assert_eq!(poll_timeout_ms(u64::MAX, now), WG_POLL_CAP_MS);
+    // 7ms out: exact conversion.
+    assert_eq!(poll_timeout_ms(now + 7_000_000, now), 7);
+    // Past deadline: 0 (the timer arm runs it on the next
+    // iteration via the now >= next_deadline condition).
+    assert_eq!(poll_timeout_ms(now - 1, now), 0);
+}
+
+/// The guard math this protects: at the v4/v6 boundary the same
+/// padded inner either fits (v4 outer) or exceeds (v6 outer) the
+/// 1500 outer MTU — the live-blackhole window.
+#[test]
+fn encapped_size_v4_vs_v6_window() {
+    // inner 1409 pads to 1424: v4 outer = 1484 (fits), v6 = 1504 (drops).
+    assert!(wg_encapped_size(1409, false) <= WG_DEFAULT_OUTER_MTU);
+    assert!(wg_encapped_size(1409, true) > WG_DEFAULT_OUTER_MTU);
+    // inner 1408 fits either way (the pre-fix observable cutoff).
+    assert!(wg_encapped_size(1408, true) <= WG_DEFAULT_OUTER_MTU);
+}
+
+/// #2300: the egress guard uses the THREADED outer MTU, not the
+/// 1500 constant. A 1409-byte inner (v4 outer, encapped 1484) fits a
+/// 1500 link but MUST be dropped on a 1450 underlay (PPPoE-class) —
+/// the topology-dependent bug the old hardcode created.
+#[test]
+fn guard_uses_threaded_outer_mtu_not_constant() {
+    // 1500 link: 1409 fits.
+    assert!(wg_inner_fits_outer_mtu(1409, false, 1500));
+    // 1450 link: 1484 > 1450, dropped. Fail-on-revert: a hardcoded
+    // 1500 guard would have let this through and forced the underlay
+    // to fragment or drop.
+    assert!(!wg_inner_fits_outer_mtu(1409, false, 1450));
+    // 1492 link (PPPoE): 1484 still fits.
+    assert!(wg_inner_fits_outer_mtu(1409, false, 1492));
+    // Jumbo 9000 link: a 5000-byte inner (encapped ~5044) fits —
+    // the old constant would have capped this at 1500.
+    assert!(wg_inner_fits_outer_mtu(5000, false, 9000));
+    assert!(!wg_inner_fits_outer_mtu(5000, false, 1500));
+}
+
+// =======================================================================
+// #2317: recvmsg / cmsg outer-ECN capture + RFC 6040 §4.2 WG decap
+// combine. The cmsg-parse tests build a synthetic control buffer with
+// the real libc CMSG_* macros and feed it to the same
+// `parse_outer_ecn_from_cmsg` the recv path uses, so the alignment +
+// walk logic is exercised exactly as in production.
+// =======================================================================
+
+/// Build a `msghdr` whose msg_control holds a single cmsg of
+/// `(level, ctype)` carrying the one-byte DS payload `ds`, and return
+/// the parsed outer ECN. The cmsg buffer is a stack `CmsgBuf`
+/// (8-byte-aligned, #2334) that the msghdr borrows for the duration
+/// of the parse.
+fn parse_ecn_with_cmsg(level: libc::c_int, ctype: libc::c_int, ds: u8) -> Option<u8> {
+    unsafe {
+        // CMSG_SPACE(1) bytes hold a header + 1 padded payload byte.
+        // Back the control buffer with the same 8-byte-aligned `CmsgBuf`
+        // the production recv path uses (#2334) so the synthetic cmsg
+        // header-field writes/reads here are aligned exactly as in
+        // `wg_recvmsg` — a bare `vec![0u8; _]` would be align-1.
+        let space = libc::CMSG_SPACE(1) as usize;
+        assert!(space <= 256, "CMSG_SPACE(1) exceeds CmsgBuf storage");
+        let mut buf = CmsgBuf([0u8; 256]);
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_control = buf.0.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        assert!(!cmsg.is_null(), "CMSG_FIRSTHDR null");
+        (*cmsg).cmsg_level = level;
+        (*cmsg).cmsg_type = ctype;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(1) as _;
+        *libc::CMSG_DATA(cmsg) = ds;
+        // msg_controllen must reflect the actual bytes written for the
+        // walk to terminate correctly.
+        msg.msg_controllen = libc::CMSG_SPACE(1) as _;
+        parse_outer_ecn_from_cmsg(&msg)
+    }
+}
+
+#[test]
+fn cmsg_parse_v4_ip_tos_extracts_ecn() {
+    // IPv4 IP_TOS cmsg: DS byte 0xB8 = EF (DSCP 46) + Not-ECT(00).
+    assert_eq!(
+        parse_ecn_with_cmsg(libc::IPPROTO_IP, libc::IP_TOS, 0xB8),
+        Some(0b00)
+    );
+    // DS byte with ECT(0) low bits: DSCP 0 + ECT(0)=0b10.
+    assert_eq!(
+        parse_ecn_with_cmsg(libc::IPPROTO_IP, libc::IP_TOS, 0b10),
+        Some(0b10)
+    );
+    // DS byte with CE low bits: AF41 (DSCP 34 << 2 = 0x88) | CE(0b11).
+    assert_eq!(
+        parse_ecn_with_cmsg(libc::IPPROTO_IP, libc::IP_TOS, 0x88 | 0b11),
+        Some(0b11)
+    );
+}
+
+#[test]
+fn cmsg_parse_v6_tclass_extracts_ecn() {
+    // IPv6 IPV6_TCLASS cmsg: Traffic Class byte with ECT(1) low bits.
+    assert_eq!(
+        parse_ecn_with_cmsg(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, 0b01),
+        Some(0b01)
+    );
+    // CE in the low 2 bits.
+    assert_eq!(
+        parse_ecn_with_cmsg(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, 0xFF),
+        Some(0b11)
+    );
+}
+
+#[test]
+fn cmsg_parse_ignores_unrelated_cmsg() {
+    // A non-TOS cmsg (e.g. SOL_SOCKET / SO_TIMESTAMP-shaped) yields no
+    // ECN — only IP_TOS / IPV6_TCLASS are honored.
+    assert_eq!(
+        parse_ecn_with_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, 0xFF),
+        None
+    );
+}
+
+#[test]
+fn cmsg_parse_empty_control_yields_none() {
+    // No control buffer at all (kernel ignored the sockopt) → None,
+    // and the decap combine is skipped.
+    unsafe {
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_control = std::ptr::null_mut();
+        msg.msg_controllen = 0;
+        assert_eq!(parse_outer_ecn_from_cmsg(&msg), None);
+    }
+}
+
+/// The WG decap site reuses the shared `apply_decap_ecn_combine`: an
+/// outer CE over an ECN-capable IPv4 inner upgrades the inner to CE
+/// and recomputes the IPv4 header checksum, and a LEGAL upgrade does
+/// NOT touch the (per-tunnel) illegal-drop counter. A test-local
+/// `AtomicU64` stands in for the counter so the strict delta is
+/// deterministic regardless of concurrent tests touching the
+/// process-global GRE/WG statics.
+#[test]
+fn wg_apply_combine_sets_ipv4_ce_and_recomputes_checksum() {
+    use crate::afxdp::gre::apply_decap_ecn_combine;
+    // Minimal 20-byte IPv4 header, DSCP 0 + ECT(0), valid checksum.
+    let mut inner = vec![0u8; 20];
+    inner[0] = 0x45; // version 4, IHL 5
+    inner[1] = 0b10; // DSCP 0, ECT(0)
+    inner[9] = PROTO_TCP;
+    let cs = crate::afxdp::frame::checksum16(&inner[..20]);
+    inner[10..12].copy_from_slice(&cs.to_be_bytes());
+    assert_eq!(crate::afxdp::frame::checksum16(&inner[..20]), 0);
+
+    let counter = AtomicU64::new(0);
+    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, 0b11, &counter);
+    assert!(forward, "ECT inner + outer CE forwards after CE upgrade");
+    assert_eq!(inner[1] & 0x03, 0b11, "inner ECN upgraded to CE");
+    assert_eq!(inner[1] >> 2, 0, "inner DSCP untouched");
+    assert_eq!(
+        crate::afxdp::frame::checksum16(&inner[..20]),
+        0,
+        "IPv4 header checksum recomputed after the TOS change"
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        0,
+        "a legal CE upgrade must not bump the illegal-drop counter"
+    );
+}
+
+/// The illegal §4.2 combo (outer CE over a Not-ECT inner) DROPS and
+/// bumps the passed counter exactly once. The WG production wiring
+/// passes `WG_DECAP_ECN_ILLEGAL_DROPS` (asserted separately below with
+/// a concurrency-tolerant `>=` check); the strict +1 is verified on a
+/// test-local atomic so it is deterministic under parallel tests.
+#[test]
+fn wg_apply_combine_drops_illegal_combo_and_counts() {
+    use crate::afxdp::gre::{WG_DECAP_ECN_ILLEGAL_DROPS, apply_decap_ecn_combine};
+    let mut inner = vec![0u8; 20];
+    inner[0] = 0x45;
+    inner[1] = 0x88; // AF41 (DSCP 34), ECN Not-ECT(00)
+
+    // Strict +1 on an isolated counter — deterministic.
+    let counter = AtomicU64::new(0);
+    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, 0b11, &counter);
+    assert!(!forward, "outer CE over a Not-ECT inner must DROP (§4.2)");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "the illegal combo must bump the passed counter exactly once"
+    );
+
+    // Production wiring: the WG global advances (>= because other
+    // parallel tests may also bump it). Proves the WG path routes to
+    // the WG counter, not just an arbitrary one.
+    let wg_before = WG_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    let mut inner2 = vec![0u8; 20];
+    inner2[0] = 0x45;
+    inner2[1] = 0x88;
+    assert!(!apply_decap_ecn_combine(
+        &mut inner2,
+        libc::AF_INET as u8,
+        0b11,
+        &WG_DECAP_ECN_ILLEGAL_DROPS,
+    ));
+    assert!(
+        WG_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed) >= wg_before + 1,
+        "the WG global illegal-drop counter must advance on the WG path"
+    );
+}

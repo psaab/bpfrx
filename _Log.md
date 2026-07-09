@@ -43676,3 +43676,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4408/#4421 — split poll_stages.rs inline #[cfg(test)] mod tests (2552 lines) into sibling poll_stages_tests.rs via #[path]; pure code-motion (test body dedent-byte-identical, production prefix identical, test count 26==26)
   **File(s)**: userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/poll_stages_tests.rs
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4404/#4421 — batch test-split: relocate inline #[cfg(test)] mod tests from 8 large userspace-dp files (cold_path_hist, wg_control, event_emit, mirror/mod, neighbor_resolver, wg/cookie, slowpath, state_writer) into sibling _tests.rs via #[path]. Verbatim move (byte-identical, verified) + rustfmt-2024 canonicalized; parents byte-identical except the #[path] swap; test counts preserved per file
+  **File(s)**: 8 parents + 8 new *_tests.rs
