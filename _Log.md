@@ -37,6 +37,91 @@
   schema leaves; this is the lenient-path inertness belt matching the
   documented #2963/#2980 render-skip pattern.
 
+## 2026-07-09 — #4706: merge duplicate address-set members instead of dropping earlier ones
+
+- **Timestamp**: 2026-07-09
+- **Action**: CORRECTNESS/SECURITY fix. `parseAddressBookEntries`
+  (`compiler_security_addressbook.go`) merged duplicate `address <name>`
+  nodes by name (#2222) but the sibling `address-set` case built a fresh
+  struct and did `ab.AddressSets[as.Name] = as` — a last-wins overwrite.
+  The hierarchical parser does NOT fold two literal `address-set S { ... }`
+  blocks into one node (verified: `NewParser` on a brace config yields TWO
+  sibling `address-set S` nodes), unlike the flat-set `SetPath` which
+  descends into one existing node and accumulates. So a hand-authored /
+  `load override` config with duplicate blocks lost the earlier stanza's
+  members silently — a policy matching the set then matched FEWER addresses
+  than the operator intended (silent narrowing; permit/deny the wrong set).
+  Fix: mirror the `address` merge-by-name — fetch-or-create the AddressSet
+  by name, then UNION members (new `appendUniqueString` helper preserves
+  first-seen order and dedups, matching Junos union-by-name semantics).
+  Nested `address-set` references took the same overwrite path and are
+  fixed too. The flat-set `set ...` path was already correct (bounding
+  factor) and is unchanged.
+- **File(s)**: pkg/config/compiler_security_addressbook.go (fix +
+  appendUniqueString helper),
+  pkg/config/addressbook_dup_addrset_merge_4706_test.go (new: union across
+  duplicate blocks, nested-ref union, dedup, single-stanza no-regression
+  guard, end-to-end policy resolution to all member prefixes; RED on revert
+  to last-wins).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/` clean;
+  `go test ./...` = 53 ok / 3 no-test / 0 fail. RED-on-revert verified
+  (last-wins overwrite → `address-set S members = [A2], want [A1 A2]`).
+
+## 2026-07-09 — #4665: split cos/queue_service/tests.rs into per-concern files
+
+- **Timestamp**: 2026-07-09
+- **Action**: Pure test-code motion. Split the 4384-line
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs (85 tests) into a
+  tests/ subdir with per-concern sibling submodules loaded from
+  tests/mod.rs: selector (31), waterfill (18), drain (12), wakeup (8),
+  sojourn (6), refund (5), submit (5). Test fn/helper bodies moved
+  byte-identical (extracted by exact line ranges); no test logic changed.
+  Shared imports, the epoch constant, the relocated mid-file `use`, and
+  the cross-concern `waterfill_guarantee_rate_root` fixture live in
+  tests/mod.rs and reach each submodule via `use super::*` (verified the
+  transitive glob + explicit-use re-export resolves). Wiring: mod.rs
+  `#[cfg(test)] #[path = "tests.rs"] mod tests;` → `#[cfg(test)] mod
+  tests;` (resolves to tests/mod.rs); do NOT touch the hot selectors.
+  Verification: code-line multiset identical to the pre-split file
+  (MISSING none / UNEXPECTED_SURPLUS none); crate-wide test count 3843 ==
+  3843, queue_service 85 == 85. cargo build + FULL serial suite green
+  (main binary 3763 passed / 0 failed / 2 ignored; 60 + 8 + 22 + 1 in the
+  other binaries). No production code touched (diff = test files + the one
+  mod-wiring line).
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests.rs (deleted),
+  userspace-dp/src/afxdp/cos/queue_service/tests/{mod,selector,drain,wakeup,waterfill,sojourn,refund,submit}.rs,
+## 2026-07-09 — #4707: report current CPU utilization, not since-boot average
+
+- **Timestamp**: 2026-07-09
+- **Action**: OBSERVABILITY fix. The Prometheus system collector read the
+  cumulative `/proc/stat` aggregate-cpu ticks once per scrape and exported
+  `(user+nice)/total*100*cpus` and `system/total*100*cpus` as `GaugeValue`
+  with no previous-tick state, so both gauges reported a since-boot lifetime
+  AVERAGE that barely moves as uptime grows — a real CPU spike at hour 100 was
+  invisible and load alarms silently never fired. The inline comment even
+  mislabeled it "instantaneous snapshot". Fix (metrics_system.go): persist the
+  prior aggregate-cpu sample on the collector (`cpuSamplePrev`/`cpuSampleValid`
+  in metrics.go, guarded by the existing `c.mu` because Collect can run
+  concurrently for parallel scrapers — same pattern as the fairness-throughput
+  window) and report the inter-scrape delta `(busyΔ/totalΔ)`. Refactored the
+  `/proc/stat` reading behind a seam: `parseProcStatCPU(line)` parses the
+  aggregate line into a `cpuSample{userNice,system,total}`; `cpuUtilization`
+  computes the delta and skips (ok=false) when totals did not advance or a
+  counter went backwards (suspend/hotplug reset); `updateCPUUtilization` folds
+  a sample into collector state and returns emit=false on the FIRST scrape (no
+  predecessor) so no bogus value is published. Updated the two metric help
+  strings (metrics_descriptors.go) to say "over the last scrape interval".
+  Tests (metrics_cpu_current_4707_test.go): parse coverage (full/short/per-core
+  reject), a RED-on-revert delta guard (busy-at-boot-then-idle fixture: delta
+  =10%/2% but cumulative =79.3% — reverting to the since-boot form makes the
+  test FAIL, verified empirically), first-sample-skip handling, and the
+  no-advance/backwards/zero-cpu guards. Validation: gofmt; `go build ./...`
+  clean; `go test ./pkg/api/...` green; FULL Go suite green (53 ok / 0 FAIL /
+  3 no-test).
+  **File(s)**: pkg/api/metrics.go, pkg/api/metrics_system.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_cpu_current_4707_test.go,
+  _Log.md
 ## 2026-07-08 — #4714: reject dangling trailing negation in tcp-flags (fail-closed)
 
 - **Timestamp**: 2026-07-08

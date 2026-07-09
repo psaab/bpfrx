@@ -2054,5 +2054,4 @@ fn assign_prepared_dscp_rewrite(
 // by other call chains).
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
