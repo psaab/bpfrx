@@ -50,16 +50,34 @@ func compileSecurity(node *Node, sec *SecurityConfig) error {
 				return fmt.Errorf("alg: %w", err)
 			}
 		case "ssh-known-hosts":
-			sec.SSHKnownHosts = make(map[string][]SSHKnownHostKey)
+			// #4821: initialize the map once (find-or-create), and APPEND
+			// each host's keys rather than replacing the map entry
+			// wholesale. A hand-authored `load override` config can carry
+			// two literal `host <name> { ... }` top-level sibling blocks
+			// under `ssh-known-hosts` (or two `ssh-known-hosts { ... }`
+			// blocks themselves) — the hierarchical parser keeps repeated
+			// same-key blocks as separate siblings (it does not merge, same
+			// root cause as #4818/#4820), so namedInstances yields TWO
+			// entries for the same host name. The pre-fix
+			// `sec.SSHKnownHosts[hostInst.name] = keys` (bare overwrite, and
+			// `sec.SSHKnownHosts = make(...)` re-executing on every
+			// ssh-known-hosts block) let a later block silently REPLACE an
+			// earlier one's key(s), discarding that key type entirely — an
+			// operator-visible SSH host-key verification failure. Junos
+			// merges repeated blocks. A SINGLE host block still produces
+			// the identical key slice as before (append onto a nil slice
+			// is byte-identical to a fresh slice), so this is a no-op for
+			// the overwhelmingly common single-block case.
+			if sec.SSHKnownHosts == nil {
+				sec.SSHKnownHosts = make(map[string][]SSHKnownHostKey)
+			}
 			for _, hostInst := range namedInstances(child.FindChildren("host")) {
-				var keys []SSHKnownHostKey
 				for _, kp := range hostInst.node.Children {
 					name := kp.Name()
 					if v := nodeVal(kp); v != "" {
-						keys = append(keys, SSHKnownHostKey{Type: name, Key: v})
+						sec.SSHKnownHosts[hostInst.name] = append(sec.SSHKnownHosts[hostInst.name], SSHKnownHostKey{Type: name, Key: v})
 					}
 				}
-				sec.SSHKnownHosts[hostInst.name] = keys
 			}
 		case "policy-stats":
 			if sw := child.FindChild("system-wide"); sw != nil {
