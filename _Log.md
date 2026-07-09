@@ -1,3 +1,30 @@
+## 2026-07-09 — #4882 userspace-dp: debug BPF session dump used `core::ptr::read` (align 2) on a `Vec<u8>` (align 1) — UB; use `read_unaligned`
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4882 (Low, debug-gated UB). `dump_bpf_session_entries`
+  (`bpf_map/metrics.rs`) decoded a `#[repr(C)]` `UserspaceSessionMapKey`
+  (alignment 2 — `u16` `pad`/`src_port`/`dst_port`) out of a `Vec<u8>` key
+  buffer (alignment 1) via `core::ptr::read`, whose alignment precondition the
+  byte buffer does not guarantee → undefined behavior (faults on arches that
+  reject misaligned loads; x86 tolerates it but it is still UB). Extracted a
+  `decode_session_map_key(&[u8]) -> UserspaceSessionMapKey` helper that uses
+  `core::ptr::read_unaligned` (matching the crate's existing
+  `frame::inspect` unaligned-metadata idiom) and routed the dump loop through
+  it. Byte/wire layout and decoded values are unchanged — only the read is now
+  alignment-safe. Verified no other unaligned `ptr::read`/`&*(ptr as *const T)`
+  struct reads exist in the bpf_map decoder (the mmap XDP-ring `*(... as
+  *const u32)` reads are page-aligned kernel ring offsets, a separate
+  well-defined path, out of scope).
+  **File(s)**: userspace-dp/src/afxdp/bpf_map/metrics.rs
+  **Validation**: added
+  `metrics::tests::decode_session_map_key_from_misaligned_buffer`, which copies
+  a reference key's bytes so the decode source starts at an ODD address
+  (guaranteed misaligned for an align-2 struct regardless of allocator base)
+  and asserts every field round-trips. Full `TMPDIR=/dev/shm
+  CARGO_TARGET_DIR=/dev/shm/cargo cargo test --release` green (dataplane merge
+  gate); `cargo build --release --features debug-log` clean (the debug dump
+  path compiles). No smoke: debug-gated metrics path, zero forwarding change.
+
 ## 2026-07-09 — #4862 config parser: assert EOF so a stray top-level `}` is an error, not a silent truncation
 
 - **Timestamp**: 2026-07-09
