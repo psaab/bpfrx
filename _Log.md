@@ -33,6 +33,74 @@
   userspace-dp/src/event_stream/tests/backpressure.rs,
   userspace-dp/src/event_stream/tests/control_frames.rs,
   userspace-dp/src/event_stream/tests/drain.rs, _Log.md
+## 2026-07-09 — #4713: reject out-of-range BGP peer-as/local-as (no uint32 wrap)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4713 — the BGP compiler parsed every `peer-as`/`local-as` leaf
+  with `strconv.Atoi(v)` then cast to `uint32(n)`, which SILENTLY WRAPPED an
+  out-of-range or negative AS onto a different-but-valid ASN: `peer-as -1` ->
+  remote-as 4294967295, and `peer-as 5000000000` -> 705032704 (a small-looking
+  ASN). The operator's intended AS then differed from what was programmed into
+  frr.conf, with no diagnostic. VERIFY-FIRST corrected the issue's framing:
+  #4589 (already in the issue base) added `ValidateInteger(1, 4294967295)` on
+  all five BGP AS leaves in `schema_routing.go`, so the STRICT operator commit /
+  commit-check path (SchemaValidate) ALREADY hard-rejects these — reproduced
+  `SchemaValidate` returning `integer out of range [1..4294967295] (got -1)`.
+  The live residual was the LENIENT load / peer-sync path
+  (`compileTreeLenient` / `CompileConfigLenient`), where SchemaValidate is
+  downgraded to a warning so a persisted or peer-synced config still boots
+  (#1960): there the compiler still wrapped the bad AS into a valid-looking ASN
+  and the FRR renderer emitted `remote-as <garbage>` — a leniently-loaded bad
+  neighbor peered under a wrong-but-valid ASN instead of being inert.
+  Fix: a shared `parseASNumber(v)` helper (`strconv.ParseUint(v, 10, 32)` +
+  reject 0) applied at all five parse sites (top-level `local-as`, group
+  `peer-as`/`local-as`, neighbor `peer-as`/`local-as`), leaving the field UNSET
+  on a bad value so the renderer's remote-as-0 skip / local-as-0 omit (#2963)
+  keeps the neighbor inert — the #2963/#2980 "leniently-loaded bad value is
+  inert" defense-in-depth doctrine, applied at the parse layer. Covers
+  routing-instance BGP too (the same `compileProtocols` is the SSOT).
+  **File(s)**: `pkg/config/compiler_protocols.go` (parseASNumber + 5 sites),
+  `pkg/config/bgp_as_wrap_4713_test.go` (new).
+  **Validation**: RED-on-revert — restoring the raw `Atoi; uint32(n)` at the
+  neighbor sites makes `TestBGPASWrapLenientInert` fail with the exact wrap
+  values (PeerAS=4294967295 / 705032704, LocalAS=4294967295 / 705032704);
+  restoring the fix -> green. Over-rejection guard `TestBGPASValidUnchanged`
+  (1, 65535, 65536, 4294967295 compile to the exact value on strict+lenient).
+  `TestBGPASWrapCommitRejected` pins the strict #4589 commit gate. `go build
+  ./...` clean; `go test ./...` all pass (53 ok / 0 FAIL). Doc note: no module
+  doc change — the operator-visible AS range is already documented by #4589's
+  schema leaves; this is the lenient-path inertness belt matching the
+  documented #2963/#2980 render-skip pattern.
+
+## 2026-07-09 — #4706: merge duplicate address-set members instead of dropping earlier ones
+
+- **Timestamp**: 2026-07-09
+- **Action**: CORRECTNESS/SECURITY fix. `parseAddressBookEntries`
+  (`compiler_security_addressbook.go`) merged duplicate `address <name>`
+  nodes by name (#2222) but the sibling `address-set` case built a fresh
+  struct and did `ab.AddressSets[as.Name] = as` — a last-wins overwrite.
+  The hierarchical parser does NOT fold two literal `address-set S { ... }`
+  blocks into one node (verified: `NewParser` on a brace config yields TWO
+  sibling `address-set S` nodes), unlike the flat-set `SetPath` which
+  descends into one existing node and accumulates. So a hand-authored /
+  `load override` config with duplicate blocks lost the earlier stanza's
+  members silently — a policy matching the set then matched FEWER addresses
+  than the operator intended (silent narrowing; permit/deny the wrong set).
+  Fix: mirror the `address` merge-by-name — fetch-or-create the AddressSet
+  by name, then UNION members (new `appendUniqueString` helper preserves
+  first-seen order and dedups, matching Junos union-by-name semantics).
+  Nested `address-set` references took the same overwrite path and are
+  fixed too. The flat-set `set ...` path was already correct (bounding
+  factor) and is unchanged.
+- **File(s)**: pkg/config/compiler_security_addressbook.go (fix +
+  appendUniqueString helper),
+  pkg/config/addressbook_dup_addrset_merge_4706_test.go (new: union across
+  duplicate blocks, nested-ref union, dedup, single-stanza no-regression
+  guard, end-to-end policy resolution to all member prefixes; RED on revert
+  to last-wins).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/` clean;
+  `go test ./...` = 53 ok / 3 no-test / 0 fail. RED-on-revert verified
+  (last-wins overwrite → `address-set S members = [A2], want [A1 A2]`).
 
 ## 2026-07-09 — #4665: split cos/queue_service/tests.rs into per-concern files
 
