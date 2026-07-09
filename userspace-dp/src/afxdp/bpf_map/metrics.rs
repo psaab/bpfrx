@@ -128,6 +128,27 @@ pub(in crate::afxdp) fn count_bpf_session_entries(map_fd: c_int) -> u32 {
     count
 }
 
+/// Decode a `UserspaceSessionMapKey` from a raw BPF key buffer produced by
+/// `bpf_map_get_next_key`.
+///
+/// #4882: the buffer is a `Vec<u8>` (alignment 1) but the struct is
+/// `#[repr(C)]` with `u16` fields (alignment 2). A plain `ptr::read` (or a
+/// `&*(ptr as *const UserspaceSessionMapKey)` cast) requires the source
+/// pointer to be aligned for the target type, which the byte buffer does not
+/// guarantee — that is UB and faults on architectures that reject misaligned
+/// loads (x86 tolerates it but it remains UB and a portability footgun). Use
+/// the crate's existing unaligned-metadata idiom (`frame::inspect`'s
+/// `read_unaligned`).
+fn decode_session_map_key(key_bytes: &[u8]) -> UserspaceSessionMapKey {
+    debug_assert!(key_bytes.len() >= core::mem::size_of::<UserspaceSessionMapKey>());
+    // SAFETY: `read_unaligned` imposes no alignment requirement on the source
+    // pointer. The caller passes a buffer sized to `key_size` (==
+    // `size_of::<UserspaceSessionMapKey>()`), and every bit pattern is a valid
+    // value for this POD `#[repr(C)]` struct (only `u8`/`u16`/`[u8; N]`
+    // fields), so the read is sound.
+    unsafe { core::ptr::read_unaligned(key_bytes.as_ptr().cast::<UserspaceSessionMapKey>()) }
+}
+
 /// Dump first N entries from the BPF USERSPACE_SESSIONS map for debugging.
 #[allow(unused_variables)]
 pub(in crate::afxdp) fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
@@ -149,9 +170,9 @@ pub(in crate::afxdp) fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32
         return;
     }
     loop {
-        // Read the key as UserspaceSessionMapKey
-        let map_key: UserspaceSessionMapKey =
-            unsafe { core::ptr::read(next_key_bytes.as_ptr().cast()) };
+        // Read the key as UserspaceSessionMapKey (alignment-safe: the key
+        // buffer is a `Vec<u8>` with no alignment guarantee — see #4882).
+        let map_key: UserspaceSessionMapKey = decode_session_map_key(&next_key_bytes);
         let _ = unsafe {
             libbpf_sys::bpf_map_lookup_elem(
                 map_fd,
@@ -265,3 +286,60 @@ pub(in crate::afxdp) static SESSION_DELETE_STALE_IGNORED: AtomicU64 = AtomicU64:
 pub(in crate::afxdp) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 pub(in crate::afxdp) static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #4882: the debug BPF session dump decodes a `#[repr(C)]` key struct
+    /// (alignment 2 — it carries `u16` fields) out of a `Vec<u8>` key buffer
+    /// (alignment 1). The old `core::ptr::read` required the source pointer to
+    /// be aligned for the struct, which the byte buffer does not guarantee →
+    /// UB. `decode_session_map_key` uses `read_unaligned`; this drives it
+    /// through a deliberately mis-aligned (odd-address) source and asserts the
+    /// fields decode correctly.
+    #[test]
+    fn decode_session_map_key_from_misaligned_buffer() {
+        let key = UserspaceSessionMapKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            pad: 0,
+            src_port: 0x1234,
+            dst_port: 0xabcd,
+            src_addr: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            dst_addr: [10, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let size = core::mem::size_of::<UserspaceSessionMapKey>();
+
+        // Native byte view of the reference key.
+        let key_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&key as *const UserspaceSessionMapKey).cast::<u8>(),
+                size,
+            )
+        };
+
+        // Copy those bytes so that the decode source starts at an ODD address,
+        // guaranteeing misalignment for an alignment-2 struct regardless of the
+        // allocator's base alignment. The old `ptr::read` on this pointer is UB;
+        // `read_unaligned` is sound.
+        let mut buf = vec![0u8; size + 1];
+        let off = if buf.as_ptr() as usize % 2 == 0 { 1 } else { 0 };
+        buf[off..off + size].copy_from_slice(key_bytes);
+        let misaligned = &buf[off..off + size];
+        assert_eq!(
+            misaligned.as_ptr() as usize % 2,
+            1,
+            "decode source must be misaligned for an alignment-2 struct",
+        );
+
+        let decoded = decode_session_map_key(misaligned);
+
+        assert_eq!(decoded.addr_family, key.addr_family);
+        assert_eq!(decoded.protocol, key.protocol);
+        assert_eq!(decoded.src_port, key.src_port);
+        assert_eq!(decoded.dst_port, key.dst_port);
+        assert_eq!(decoded.src_addr, key.src_addr);
+        assert_eq!(decoded.dst_addr, key.dst_addr);
+    }
+}
