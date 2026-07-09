@@ -262,7 +262,15 @@ func expandMemberRange(rangeName string, toks []string) ([]string, []string) {
 				"(endpoints must share a prefix and differ only in a trailing number); ignored",
 			rangeName, start, end)}
 	}
-	if en-sn+1 > interfaceRangeMaxMembers {
+	// splitTrailingInt only ever returns non-negative values (it scans a
+	// pure decimal digit run), so sn >= 0 and, given the sn > en rejection
+	// above, en >= sn >= 0 here. That makes en-sn itself overflow-safe (a
+	// non-negative difference bounded by en). Comparing en-sn against the
+	// cap BEFORE adding 1 avoids the en-sn+1 overflow that a start/end pair
+	// near math.MaxInt64 could otherwise trigger — en-sn+1 would wrap to a
+	// large negative number, silently bypassing this guard and reaching the
+	// make() below with a negative capacity (a crashing panic, #4807).
+	if en-sn >= interfaceRangeMaxMembers {
 		return nil, []string{fmt.Sprintf(
 			"interfaces interface-range %s: member-range %s to %s exceeds %d interfaces; ignored",
 			rangeName, start, end, interfaceRangeMaxMembers)}

@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestInterfaceRangeExpandsMembers is the #4027 RED-on-revert guard: an
 // `interfaces interface-range <name>` stanza must expand into its member
@@ -221,5 +224,60 @@ func TestInterfaceRangeNoStanzaUnchanged(t *testing.T) {
 	}
 	if u0 := ifc.Units[0]; u0 == nil || !containsStr(u0.Addresses, "10.0.0.1/24") {
 		t.Fatalf("plain interface unit 0 address lost")
+	}
+}
+
+// TestInterfaceRangeMemberRangeHugeEndOverflow is the #4807 RED-on-revert
+// guard: a member-range whose end value is a trailing integer near
+// math.MaxInt64 must be rejected with a clean warning, not panic the
+// compiler. Before the fix, `en-sn+1` (both plain `int`, 64-bit on amd64)
+// overflowed to a large negative number for this input, which (a) beat the
+// `en-sn+1 > interfaceRangeMaxMembers` guard (a negative number is never
+// greater than 4096) and (b) reached `make([]string, 0, en-sn+1)` with a
+// negative capacity, panicking with "runtime error: makeslice: cap out of
+// range" and crashing the whole daemon on every future compile of this
+// config (boot-time load included — no strict/lenient gate covers this
+// prewalk pass). This test goes RED on that overflow behavior.
+func TestInterfaceRangeMemberRangeHugeEndOverflow(t *testing.T) {
+	tree := setTree(t,
+		"set interfaces interface-range R member-range ge-0/0/0 to ge-0/0/9223372036854775807",
+		"set interfaces interface-range R mtu 9000",
+	)
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig returned an error instead of a clean warning: %v", err)
+	}
+
+	// Must not have expanded into millions/billions of phantom members.
+	if n := len(cfg.Interfaces.Interfaces); n > interfaceRangeMaxMembers {
+		t.Fatalf("member-range expanded to %d interfaces, want <= %d (cap)",
+			n, interfaceRangeMaxMembers)
+	}
+
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "exceeds") && strings.Contains(w, "interfaces") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a member-range-exceeds-cap warning, got: %v", cfg.Warnings)
+	}
+}
+
+// TestExpandMemberRangeHugeEndDoesNotOverflow directly exercises
+// expandMemberRange (the #4807 unit) with the exact overflow-triggering
+// inputs from the issue: start "ge-0/0/0", end "ge-0/0/9223372036854775807".
+// Before the fix this panicked inside make(); it must now return a nil
+// member list and a warning.
+func TestExpandMemberRangeHugeEndDoesNotOverflow(t *testing.T) {
+	members, warnings := expandMemberRange("R", []string{"ge-0/0/0", "to", "ge-0/0/9223372036854775807"})
+	if members != nil {
+		t.Errorf("expandMemberRange with overflow-triggering end returned %d members, want none", len(members))
+	}
+	if len(warnings) == 0 {
+		t.Errorf("expandMemberRange with overflow-triggering end returned no warning")
 	}
 }
