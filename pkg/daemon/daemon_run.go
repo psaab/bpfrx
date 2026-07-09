@@ -203,145 +203,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	dataplane.SetProtectedInterfaceResolver(d.resolveProtectedInterfaces)
 
 	// ===== PHASE 1: Config load + bootstrap =====
-	// Load persisted configuration from DB, falling back to text config file.
-	//
-	// Fatal-on-parse floor (#1917 increment B, plan §6.4 / D1): a PRESENT
-	// but unreadable active.json (JSON parse error, decrypt failure, or a
-	// config compatibility envelope this build cannot read because it was
-	// written by a NEWER xpf) must FAIL CLOSED — return the error from Run
-	// instead of warning-and-proceeding to a blind bootstrapFromFile() that
-	// would OVERWRITE the unreadable DB and silently wipe the operator's
-	// config. This is the structural guard that makes a future config-format
-	// change safe to roll out: an old reader refuses a too-new DB rather than
-	// empty-loading it. A compile error (handled leniently inside Load) or an
-	// absent DB (start-fresh) is NOT this case and still degrades gracefully.
-	//
-	// mgmt-never-stranded (#1922): on the appliance the day-0 + protected-set
-	// lifeline keeps mgmt reachable through a fail-closed boot; #1922 hardens
-	// the foreign/non-appliance host case (noted in the PR; not implemented
-	// here).
-	// configCompileFailed records the #1960 fail-closed case: a PRESENT,
-	// previously-committed active.json read+parsed fine but no longer
-	// compiles. It must NOT fall back to bootstrapFromFile() (which would
-	// blind-import the text config file over a broken-but-present committed
-	// DB — the same silently-wrong takeover this issue closes) and it forces
-	// bootstrap mode below regardless of computeBootClass's other inputs.
-	configCompileFailed := false
-	switch loadErr := d.store.Load(); classifyLoadError(loadErr) {
-	case loadFatalUnreadable:
-		// Point recovery at the actual unreadable artifact — the config
-		// DB under .configdb/, NOT the text config file (Copilot).
-		dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
-		return fmt.Errorf("config DB is present but unreadable; refusing to "+
-			"start and overwrite it (fail closed). Inspect/repair %s (the on-disk "+
-			"config DB, NOT the text config file) or roll the xpf binary forward "+
-			"to a build that can read it: %w",
-			dbPath, loadErr)
-	case loadCompileFailed:
-		// #1960 fail-closed: a previously-committed config no longer
-		// compiles. Store.Load set everCommitted=true but left compiled
-		// nil, so without this the boot predicate would resolve to NORMAL
-		// (ActiveConfig()==nil + everCommitted) and run the positional
-		// claim-all interface rename — exactly the safety hole this fixes.
-		// Surface it LOUDLY (Error, not the ignored Warn) and route into
-		// the #1922 bootstrap/lifeline safe state below.
-		configCompileFailed = true
-		dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
-		slog.Error("active config DB is present but no longer compiles; refusing interface "+
-			"takeover and entering BOOTSTRAP/lifeline safe state (management preserved, NO "+
-			"positional claim-all). Fix the config from the CLI/gRPC and 'commit confirmed', "+
-			"or repair/remove the on-disk config DB",
-			"db_path", dbPath, "err", loadErr)
-	case loadOtherError:
-		slog.Warn("failed to load config from db", "err", loadErr)
-	case loadOK:
-		// nil error: absent DB (start-fresh) or a valid loaded config.
-	}
-
-	// If DB had no active config, bootstrap from the text config file.
-	//
-	// #1960: but NOT when a present committed config failed to compile —
-	// importing the text xpf.conf there would silently swap in a different
-	// config and then take over interfaces, defeating the fail-closed intent.
-	if shouldBootstrapFromFile(d.store.ActiveConfig() != nil, configCompileFailed) {
-		if err := d.bootstrapFromFile(); err != nil {
-			// #4186 (H-17): a missing text config file is the EXPECTED
-			// factory/fresh-boot state, not a failure — log it at Info, not
-			// Warn, so operators triaging a real day-0 failure aren't taught
-			// to ignore a benign line. Keep Warn for a REAL failure (file
-			// present but unreadable/unparseable/uncommittable, incl. the
-			// #4183 device-map strand rejection).
-			// #4184 (H-11): record the outcome so a failed import is visible
-			// on /health + an event, not just here in journald.
-			if errors.Is(err, os.ErrNotExist) {
-				slog.Info("no text config present to bootstrap from (factory/fresh boot)",
-					"file", d.opts.ConfigFile)
-				d.recordBootstrapImport(bootstrapImportNoConfig, "")
-			} else {
-				slog.Warn("failed to bootstrap config from file", "err", err)
-				d.recordBootstrapImport(bootstrapImportFailed, err.Error())
-			}
-		} else {
-			d.recordBootstrapImport(bootstrapImportOK, "")
-		}
-	} else if d.store.ActiveConfig() != nil {
-		slog.Info("configuration loaded from db")
-		d.recordBootstrapImport(bootstrapImportLoadedDB, "")
-	} else {
-		// No DB config and bootstrap-from-file suppressed (e.g. a present
-		// committed config that failed to compile, #1960). Record no-config
-		// so /health reflects that no active config is installed.
-		d.recordBootstrapImport(bootstrapImportNoConfig, "")
-	}
-
-	// #1922 Item 2: the five-case boot predicate, computed ONCE here after
-	// Load + bootstrapFromFile have resolved. Case 4 (corrupt/too-new DB)
-	// already exited fatally above (#1917 D1). The remaining cases select
-	// bootstrap vs normal. Bootstrap mode suppresses interface/dataplane
-	// TAKEOVER actions (but not the management control surfaces or manager
-	// construction — C1). Every existing deployment resolves NOT-bootstrap
-	// (case 2/3, or case 5 committed-empty) → zero behavior change.
-	//
-	// #1960: configCompileFailed forces bootstrap here — a previously-committed
-	// config that no longer compiles must fail closed (no positional claim-all)
-	// regardless of the other inputs, including the HA-node guard.
-	nodeIDPresent := hasNodeIDFile()
-	bootClass := computeBootClass(d.store.ActiveConfig() != nil, d.store.EverCommitted(), nodeIDPresent, configCompileFailed)
-	if bootClass == bootClassBootstrap {
-		d.bootstrapMode.Store(true)
-		detail := "management control plane (gRPC/REST/CLI) runs normally, but interface " +
-			"rename/takeover, dataplane arm, and FRR/VRRP takeover are SUPPRESSED until the " +
-			"first 'commit confirmed' (+ confirm) or cluster config sync. This keeps a " +
-			"foreign/non-appliance host reachable on its existing management NIC."
-		if configCompileFailed {
-			// #1960: distinct cause — not "no config", but "committed config no
-			// longer compiles". The Error log above already named the DB path.
-			slog.Warn("xpf daemon entering BOOTSTRAP mode: committed configuration no longer compiles",
-				"detail", detail)
-		} else {
-			slog.Warn("xpf daemon entering BOOTSTRAP mode: no committed configuration found",
-				"detail", detail)
-		}
-	} else if nodeIDPresent && d.store.ActiveConfig() == nil {
-		// HA-node guard (C2/C8): node-id present but NEITHER a DB nor an
-		// importable xpf.conf. Resolved to NOT-bootstrap so takeover is not
-		// silently suppressed on a normal deploy, but HA availability is NOT
-		// promised — this is an operator misconfiguration. Log loudly.
-		//
-		// #4179: the nil active config carries no cluster stanza, so the boot
-		// naming below runs in STANDALONE mode (clusterMode=false → fxp0 +
-		// ge-0-0-X, no em0 / FPC). Arm the one-shot re-naming flag so the first
-		// non-empty config that arrives (a cluster SyncApply from the primary,
-		// or a local commit) re-runs startup naming with the config's real
-		// cluster identity. Naming reconciles on config arrival — no daemon
-		// restart is required.
-		d.emptyHANamingPending.Store(true)
-		slog.Error("xpf HA node has /etc/xpf/node-id but no committed config and no importable "+
-			"xpf.conf; proceeding with EMPTY config takeover (NOT bootstrap mode) using STANDALONE "+
-			"interface names. HA availability is NOT promised until the cluster config is pushed and "+
-			"committed; interface naming will reconcile to the node's cluster names (em0, ge-<fpc>-0-X) "+
-			"automatically when that config arrives (no restart required)",
-			"node_id_file", nodeIDFile)
+	configCompileFailed, err := d.loadAndBootstrapConfig()
+	if err != nil {
+		return err
 	}
 
 	// ===== PHASE 2: Interface naming + bootstrap lifeline =====
@@ -1907,6 +1771,157 @@ func (d *Daemon) initManagers(ctx context.Context, configCompileFailed bool) err
 		}
 	}
 	return nil
+}
+
+// loadAndBootstrapConfig loads the persisted configuration (DB, falling back to
+// the text config file), enforces the #1917 fatal-on-parse floor, runs
+// bootstrapFromFile when required, and derives the boot class + node-id state.
+// Extracted verbatim from Run()'s PHASE 1 (#4662 Increment 5). Returns the
+// #1960 configCompileFailed fail-closed flag (threaded onward to initManagers)
+// and a non-nil error only for the fatal 'DB present but unreadable' floor,
+// which Run propagates unchanged (fail closed, never a blind bootstrap).
+func (d *Daemon) loadAndBootstrapConfig() (bool, error) {
+	// Load persisted configuration from DB, falling back to text config file.
+	//
+	// Fatal-on-parse floor (#1917 increment B, plan §6.4 / D1): a PRESENT
+	// but unreadable active.json (JSON parse error, decrypt failure, or a
+	// config compatibility envelope this build cannot read because it was
+	// written by a NEWER xpf) must FAIL CLOSED — return the error from Run
+	// instead of warning-and-proceeding to a blind bootstrapFromFile() that
+	// would OVERWRITE the unreadable DB and silently wipe the operator's
+	// config. This is the structural guard that makes a future config-format
+	// change safe to roll out: an old reader refuses a too-new DB rather than
+	// empty-loading it. A compile error (handled leniently inside Load) or an
+	// absent DB (start-fresh) is NOT this case and still degrades gracefully.
+	//
+	// mgmt-never-stranded (#1922): on the appliance the day-0 + protected-set
+	// lifeline keeps mgmt reachable through a fail-closed boot; #1922 hardens
+	// the foreign/non-appliance host case (noted in the PR; not implemented
+	// here).
+	// configCompileFailed records the #1960 fail-closed case: a PRESENT,
+	// previously-committed active.json read+parsed fine but no longer
+	// compiles. It must NOT fall back to bootstrapFromFile() (which would
+	// blind-import the text config file over a broken-but-present committed
+	// DB — the same silently-wrong takeover this issue closes) and it forces
+	// bootstrap mode below regardless of computeBootClass's other inputs.
+	configCompileFailed := false
+	switch loadErr := d.store.Load(); classifyLoadError(loadErr) {
+	case loadFatalUnreadable:
+		// Point recovery at the actual unreadable artifact — the config
+		// DB under .configdb/, NOT the text config file (Copilot).
+		dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
+		return false, fmt.Errorf("config DB is present but unreadable; refusing to "+
+			"start and overwrite it (fail closed). Inspect/repair %s (the on-disk "+
+			"config DB, NOT the text config file) or roll the xpf binary forward "+
+			"to a build that can read it: %w",
+			dbPath, loadErr)
+	case loadCompileFailed:
+		// #1960 fail-closed: a previously-committed config no longer
+		// compiles. Store.Load set everCommitted=true but left compiled
+		// nil, so without this the boot predicate would resolve to NORMAL
+		// (ActiveConfig()==nil + everCommitted) and run the positional
+		// claim-all interface rename — exactly the safety hole this fixes.
+		// Surface it LOUDLY (Error, not the ignored Warn) and route into
+		// the #1922 bootstrap/lifeline safe state below.
+		configCompileFailed = true
+		dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
+		slog.Error("active config DB is present but no longer compiles; refusing interface "+
+			"takeover and entering BOOTSTRAP/lifeline safe state (management preserved, NO "+
+			"positional claim-all). Fix the config from the CLI/gRPC and 'commit confirmed', "+
+			"or repair/remove the on-disk config DB",
+			"db_path", dbPath, "err", loadErr)
+	case loadOtherError:
+		slog.Warn("failed to load config from db", "err", loadErr)
+	case loadOK:
+		// nil error: absent DB (start-fresh) or a valid loaded config.
+	}
+
+	// If DB had no active config, bootstrap from the text config file.
+	//
+	// #1960: but NOT when a present committed config failed to compile —
+	// importing the text xpf.conf there would silently swap in a different
+	// config and then take over interfaces, defeating the fail-closed intent.
+	if shouldBootstrapFromFile(d.store.ActiveConfig() != nil, configCompileFailed) {
+		if err := d.bootstrapFromFile(); err != nil {
+			// #4186 (H-17): a missing text config file is the EXPECTED
+			// factory/fresh-boot state, not a failure — log it at Info, not
+			// Warn, so operators triaging a real day-0 failure aren't taught
+			// to ignore a benign line. Keep Warn for a REAL failure (file
+			// present but unreadable/unparseable/uncommittable, incl. the
+			// #4183 device-map strand rejection).
+			// #4184 (H-11): record the outcome so a failed import is visible
+			// on /health + an event, not just here in journald.
+			if errors.Is(err, os.ErrNotExist) {
+				slog.Info("no text config present to bootstrap from (factory/fresh boot)",
+					"file", d.opts.ConfigFile)
+				d.recordBootstrapImport(bootstrapImportNoConfig, "")
+			} else {
+				slog.Warn("failed to bootstrap config from file", "err", err)
+				d.recordBootstrapImport(bootstrapImportFailed, err.Error())
+			}
+		} else {
+			d.recordBootstrapImport(bootstrapImportOK, "")
+		}
+	} else if d.store.ActiveConfig() != nil {
+		slog.Info("configuration loaded from db")
+		d.recordBootstrapImport(bootstrapImportLoadedDB, "")
+	} else {
+		// No DB config and bootstrap-from-file suppressed (e.g. a present
+		// committed config that failed to compile, #1960). Record no-config
+		// so /health reflects that no active config is installed.
+		d.recordBootstrapImport(bootstrapImportNoConfig, "")
+	}
+
+	// #1922 Item 2: the five-case boot predicate, computed ONCE here after
+	// Load + bootstrapFromFile have resolved. Case 4 (corrupt/too-new DB)
+	// already exited fatally above (#1917 D1). The remaining cases select
+	// bootstrap vs normal. Bootstrap mode suppresses interface/dataplane
+	// TAKEOVER actions (but not the management control surfaces or manager
+	// construction — C1). Every existing deployment resolves NOT-bootstrap
+	// (case 2/3, or case 5 committed-empty) → zero behavior change.
+	//
+	// #1960: configCompileFailed forces bootstrap here — a previously-committed
+	// config that no longer compiles must fail closed (no positional claim-all)
+	// regardless of the other inputs, including the HA-node guard.
+	nodeIDPresent := hasNodeIDFile()
+	bootClass := computeBootClass(d.store.ActiveConfig() != nil, d.store.EverCommitted(), nodeIDPresent, configCompileFailed)
+	if bootClass == bootClassBootstrap {
+		d.bootstrapMode.Store(true)
+		detail := "management control plane (gRPC/REST/CLI) runs normally, but interface " +
+			"rename/takeover, dataplane arm, and FRR/VRRP takeover are SUPPRESSED until the " +
+			"first 'commit confirmed' (+ confirm) or cluster config sync. This keeps a " +
+			"foreign/non-appliance host reachable on its existing management NIC."
+		if configCompileFailed {
+			// #1960: distinct cause — not "no config", but "committed config no
+			// longer compiles". The Error log above already named the DB path.
+			slog.Warn("xpf daemon entering BOOTSTRAP mode: committed configuration no longer compiles",
+				"detail", detail)
+		} else {
+			slog.Warn("xpf daemon entering BOOTSTRAP mode: no committed configuration found",
+				"detail", detail)
+		}
+	} else if nodeIDPresent && d.store.ActiveConfig() == nil {
+		// HA-node guard (C2/C8): node-id present but NEITHER a DB nor an
+		// importable xpf.conf. Resolved to NOT-bootstrap so takeover is not
+		// silently suppressed on a normal deploy, but HA availability is NOT
+		// promised — this is an operator misconfiguration. Log loudly.
+		//
+		// #4179: the nil active config carries no cluster stanza, so the boot
+		// naming below runs in STANDALONE mode (clusterMode=false → fxp0 +
+		// ge-0-0-X, no em0 / FPC). Arm the one-shot re-naming flag so the first
+		// non-empty config that arrives (a cluster SyncApply from the primary,
+		// or a local commit) re-runs startup naming with the config's real
+		// cluster identity. Naming reconciles on config arrival — no daemon
+		// restart is required.
+		d.emptyHANamingPending.Store(true)
+		slog.Error("xpf HA node has /etc/xpf/node-id but no committed config and no importable "+
+			"xpf.conf; proceeding with EMPTY config takeover (NOT bootstrap mode) using STANDALONE "+
+			"interface names. HA availability is NOT promised until the cluster config is pushed and "+
+			"committed; interface naming will reconcile to the node's cluster names (em0, ge-<fpc>-0-X) "+
+			"automatically when that config arrives (no restart required)",
+			"node_id_file", nodeIDFile)
+	}
+	return configCompileFailed, nil
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
