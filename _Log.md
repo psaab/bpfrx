@@ -43722,3 +43722,5 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: Fix getOriginalKernelName unconditionally appending "f<func>" to derived PCI-path interface names; extract testable pciFunctionSuffix + isPCIMultifunctionDevice mirroring systemd's names_pci_slot()/is_pci_multifunction() rule; add RED-on-revert test
   **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/pci_function_suffix_4795_test.go
+  **Action**: Fix session filter matching only the FIRST interface of a multi-interface zone (widen zoneIfaces to map[uint16][]string, match ANY bound interface); fix the show-path call site + existing test for the field type change; add RED-on-revert test
+  **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go, pkg/cli/session_display_test.go, pkg/cli/session_filter_multi_iface_4792_test.go

@@ -259,8 +259,12 @@ func (c *CLI) showFlowSession(args []string) error {
 	egressIfaces := buildSessionEgressIfaces(f.cfg)
 
 	// Populate filter maps for interface-level matching in matchesV4/V6.
-	f.zoneIfaces = zoneIfaces
-	f.egressIfacesMap = egressIfaces
+	// #4792: use the shared populateIfaceMaps builder (session_filter.go)
+	// rather than the single-first-interface zoneIfaces built above for
+	// display, so an interface-filtered show sees EVERY interface bound
+	// to a zone. zoneIfaces/egressIfaces above stay display-only (the
+	// "If:" column shows one representative interface name).
+	f.populateIfaceMaps(c)
 
 	sessionEgressIf := func(fibIfindex uint32, fibVlanID uint16, zoneID uint16, zoneName string) string {
 		if fibIfindex != 0 {
