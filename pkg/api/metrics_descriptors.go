@@ -111,6 +111,25 @@ func newCollector(srv *Server) *xpfCollector {
 				"xpf_host_inbound_denies_total path).",
 			[]string{"zone", "family"}, nil,
 		),
+		// #4146: per-scope/family drop counters for the kernel `to-zone
+		// junos-host` DENY rules on the same `inet xpf_hostinbound` chain. These
+		// are the fine per-source/per-application host-inbound denies enforced on
+		// the DIRECT host-bound path — DISTINCT from xpf_host_inbound_kernel_denies
+		// _total (coarse "no service opened this") and from the userspace-dp
+		// xpf_host_inbound_denies_total path, so the three do not double-count.
+		// This does NOT populate per-Junos-policy hit counters / `then count` /
+		// RT_FLOW deny attribution (nft cannot attribute a drop to a policy object,
+		// #4146 §6.7). The counter resets on table rebuild; rate() handles it. On a
+		// read failure the series is skipped and xpf_counter_read_errors_total is
+		// bumped.
+		hostInboundJunosHostDenies: prometheus.NewDesc(
+			"xpf_host_inbound_junos_host_denies_total",
+			"Total direct host-bound traffic denials by the kernel nftables "+
+				"`to-zone junos-host` DENY rules, per ingress-zone scope and family "+
+				"(distinct from the coarse xpf_host_inbound_kernel_denies_total and "+
+				"the userspace-dp xpf_host_inbound_denies_total paths).",
+			[]string{"scope", "family"}, nil,
+		),
 		// #4759: per-type-class hit counters for the GLOBAL ICMP-error / ND accept
 		// rules on the same kernel `inet xpf_hostinbound` chain. Those rules admit
 		// ICMPv6 Neighbor Discovery (types 133-137), ICMPv6 error/PMTUD (types

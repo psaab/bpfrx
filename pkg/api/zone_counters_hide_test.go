@@ -112,6 +112,10 @@ func TestCollectDoesNotFalseAlertOnZoneReads(t *testing.T) {
 	readHostInboundAcceptCounters = func() ([]xnft.HostInboundAcceptCount, error) { return nil, nil }
 	defer func() { readHostInboundAcceptCounters = origAccept }()
 
+	origJH := readHostInboundJunosHostDenyCounters
+	readHostInboundJunosHostDenyCounters = func() ([]xnft.HostInboundJunosHostDenyCount, error) { return nil, nil }
+	defer func() { readHostInboundJunosHostDenyCounters = origJH }()
+
 	store := newDescriptorCoverageStore(t)
 	srv := &Server{store: store, gc: conntrack.NewGC(nil, time.Minute), startTime: time.Now()}
 	srv.dp = &zoneRealReadDP{&descriptorCoverageDP{

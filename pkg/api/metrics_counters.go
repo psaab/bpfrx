@@ -18,6 +18,13 @@ import (
 // without a live kernel/netlink (#3361).
 var readHostInboundDenyCounters = xnft.ReadHostInboundDenyCounters
 
+// readHostInboundJunosHostDenyCounters is the kernel nft `to-zone junos-host`
+// DENY drop-counter source (#4146), a package var so the collector's degraded-
+// boot behavior is unit-testable without a live kernel/netlink, mirroring
+// readHostInboundDenyCounters (the junos-host counters live in the same
+// `inet xpf_hostinbound` table, separated by object-name prefix).
+var readHostInboundJunosHostDenyCounters = xnft.ReadHostInboundJunosHostDenyCounters
+
 // readLo0Counters is the kernel nft lo0 input-filter counter source, a package
 // var so the collector's behavior is unit-testable without a live kernel/netlink
 // (#4422), mirroring readHostInboundDenyCounters.
@@ -60,6 +67,31 @@ func (c *xpfCollector) collectHostInboundKernelDenies(ch chan<- prometheus.Metri
 	for _, ctr := range counts {
 		ch <- prometheus.MustNewConstMetric(c.hostInboundKernelDenies,
 			prometheus.CounterValue, float64(ctr.Packets), ctr.Zone, ctr.Family)
+	}
+}
+
+// collectHostInboundJunosHostDenies scrapes the per-scope/family named DROP
+// counters from the kernel nftables `to-zone junos-host` DENY rules (#4146) and
+// emits them as xpf_host_inbound_junos_host_denies_total. These are the fine
+// per-source/per-application host-inbound denies enforced on the DIRECT
+// host-bound path — DISTINCT from the coarse xpf_host_inbound_kernel_denies_total
+// (collectHostInboundKernelDenies) and the userspace-dp
+// xpf_host_inbound_denies_total path, so the three do not double-count.
+//
+// The nft chain is installed by the daemon INDEPENDENT of dataplane load state
+// and keeps dropping in a config-only / degraded boot, so Collect calls this
+// BEFORE the dataplane gate, matching collectHostInboundKernelDenies. On a read
+// failure the series is SKIPPED (no misleading 0) and
+// xpf_counter_read_errors_total is bumped (#3345 missing-sample contract).
+func (c *xpfCollector) collectHostInboundJunosHostDenies(ch chan<- prometheus.Metric) {
+	counts, err := readHostInboundJunosHostDenyCounters()
+	if err != nil {
+		c.counterReadErrors.Add(1)
+		return
+	}
+	for _, ctr := range counts {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundJunosHostDenies,
+			prometheus.CounterValue, float64(ctr.Packets), ctr.Scope, ctr.Family)
 	}
 }
 
