@@ -76,6 +76,8 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.local_delivery_packets = snap.local_delivery_packets;
     binding.forward_candidate_packets = snap.forward_candidate_packets;
     binding.route_miss_packets = snap.route_miss_packets;
+    binding.martian_dropped = snap.martian_dropped;
+    binding.ipv6_ext_header_dropped = snap.ipv6_ext_header_dropped;
     binding.neighbor_miss_packets = snap.neighbor_miss_packets;
     binding.discard_route_packets = snap.discard_route_packets;
     binding.next_table_packets = snap.next_table_packets;

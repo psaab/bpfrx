@@ -22,6 +22,8 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.local_delivery_packets = 0;
         binding.forward_candidate_packets = 0;
         binding.route_miss_packets = 0;
+        binding.martian_dropped = 0;
+        binding.ipv6_ext_header_dropped = 0;
         binding.neighbor_miss_packets = 0;
         binding.discard_route_packets = 0;
         binding.next_table_packets = 0;

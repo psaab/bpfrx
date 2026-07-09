@@ -370,6 +370,31 @@ enum FlowlessLocalVerdict {
     Filtered,
 }
 
+/// #4743: fail-closed drop gate for an over-limit IPv6 extension-header chain.
+/// Returns `true` (and bumps `ipv6_ext_header_dropped` on `counters`) when
+/// `frame` is an IPv6 packet whose extension-header chain is still on an
+/// extension header after `MAX_IPV6_EXT_HEADERS` iterations — an uninspectable
+/// chain the helper walkers fail closed on. The caller recycles the descriptor
+/// and continues. A truncated chain, a real-L4 chain, a non-first fragment, and
+/// a non-IPv6 packet all return `false` (unchanged flowless/normal handling), so
+/// only the genuine over-limit chain is dropped. The caller gates this on
+/// `flow.is_none()` so it fires only when the helper could not derive an L4
+/// tuple; before #4743 that packet was forwarded flowless (`l4_present =
+/// false`), an ext-header IDS-evasion. Factored out (rather than inlined) so it
+/// is unit-testable for the RED-on-revert counter assertion.
+fn ipv6_ext_header_over_limit_drop(
+    frame: &[u8],
+    addr_family: u8,
+    counters: &mut BatchCounters,
+) -> bool {
+    if crate::afxdp::frame::ipv6_ext_chain_over_limit(frame, addr_family) {
+        counters.touched = true;
+        counters.ipv6_ext_header_dropped += 1;
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flowless_local_delivery_verdict(
     forwarding: &ForwardingState,
@@ -731,6 +756,25 @@ pub(super) fn poll_binding_process_descriptor(
                     &mut binding.last_learned_neighbor,
                     worker_ctx,
                 );
+                // #4743: fail-closed drop for an OVER-LIMIT IPv6 extension-header
+                // chain. `stage_parse_flow_and_learn` returns `None` (flowless)
+                // when the #2292 helper walkers give up past
+                // MAX_IPV6_EXT_HEADERS; the flowless path would otherwise forward
+                // the packet uninspectable (`l4_present = false`) — an ext-header
+                // IDS-evasion. Gate on `flow.is_none()` (helper could not derive
+                // an L4 tuple) and drop+count ONLY the genuine over-limit chain;
+                // a non-first fragment / ICMPv6 / truncated packet is not
+                // over-limit and keeps its existing flowless handling.
+                if flow.is_none()
+                    && ipv6_ext_header_over_limit_drop(
+                        packet_frame,
+                        meta.addr_family,
+                        &mut *telemetry.counters,
+                    )
+                {
+                    binding.scratch.scratch_recycle.push(desc.addr);
+                    continue;
+                }
                 // #946 Phase 1 stage 9: fabric-ingress
                 // classification. Mutates meta.meta_flags. MUST
                 // run before screen/IPsec/flow-cache because they
@@ -5431,6 +5475,106 @@ pub(super) fn poll_binding_process_descriptor(
     }
     received.release();
     drop(received);
+}
+
+#[cfg(test)]
+mod ipv6_ext_header_drop_tests {
+    // #4743: the over-limit IPv6 ext-header fail-closed drop gate and its
+    // counter. RED-on-revert: reverting the terminal `true` in
+    // `ipv6_ext_chain_over_limit` (frame/inspect.rs) OR the increment in
+    // `ipv6_ext_header_over_limit_drop` makes these fail.
+    use super::*;
+
+    /// eth(IPv6) + IPv6 base header (version 6, `next_header`) + `tail` bytes.
+    fn v6_frame(next_header: u8, tail: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 40];
+        f[12] = 0x86; // ethertype IPv6 (0x86DD)
+        f[13] = 0xDD;
+        f[14] = 0x60; // version 6 in the high nibble
+        f[14 + 6] = next_header; // IPv6 next-header field
+        f.extend_from_slice(tail);
+        f
+    }
+
+    fn v6() -> u8 {
+        libc::AF_INET6 as u8
+    }
+
+    #[test]
+    fn over_limit_chain_is_detected() {
+        // 8 Hop-by-Hop blocks (next=0, HdrExtLen=0 => 8 bytes each). After
+        // MAX_IPV6_EXT_HEADERS iterations the walker is still on ext-header 0
+        // => over-limit / uninspectable.
+        let mut tail = Vec::new();
+        for _ in 0..8 {
+            tail.extend_from_slice(&[0u8; 8]);
+        }
+        let frame = v6_frame(0, &tail);
+        assert!(crate::afxdp::frame::ipv6_ext_chain_over_limit(&frame, v6()));
+    }
+
+    #[test]
+    fn normal_l4_chain_is_not_over_limit() {
+        // next_header = TCP (6): a real L4 within the bound.
+        let frame = v6_frame(6, &[0u8; 20]);
+        assert!(!crate::afxdp::frame::ipv6_ext_chain_over_limit(&frame, v6()));
+    }
+
+    #[test]
+    fn truncated_chain_is_not_over_limit() {
+        // next_header = Hop-by-Hop (0) but the tail is too short for a full
+        // ext-header block: an in-loop short read => truncation, NOT over-limit
+        // (so it keeps its existing flowless handling, undisturbed).
+        let frame = v6_frame(0, &[0u8; 1]);
+        assert!(!crate::afxdp::frame::ipv6_ext_chain_over_limit(&frame, v6()));
+    }
+
+    #[test]
+    fn fragment_then_l4_is_not_over_limit() {
+        // Fragment header (44) whose next-header is TCP (6): terminates on a
+        // real L4 within the bound, so a non-first fragment is NOT over-limit.
+        let mut tail = vec![6u8, 0, 0, 0, 0, 0, 0, 0]; // frag: next=TCP
+        tail.extend_from_slice(&[0u8; 20]);
+        let frame = v6_frame(44, &tail);
+        assert!(!crate::afxdp::frame::ipv6_ext_chain_over_limit(&frame, v6()));
+    }
+
+    #[test]
+    fn ipv4_is_never_over_limit() {
+        // IPv4 has no extension headers; the predicate must reject non-v6.
+        let frame = v6_frame(0, &[0u8; 64]);
+        assert!(!crate::afxdp::frame::ipv6_ext_chain_over_limit(
+            &frame,
+            libc::AF_INET as u8
+        ));
+    }
+
+    #[test]
+    fn over_limit_drop_helper_bumps_counter_and_signals_drop() {
+        let mut tail = Vec::new();
+        for _ in 0..8 {
+            tail.extend_from_slice(&[0u8; 8]);
+        }
+        let frame = v6_frame(0, &tail);
+        let mut counters = BatchCounters::default();
+        let dropped = ipv6_ext_header_over_limit_drop(&frame, v6(), &mut counters);
+        assert!(dropped, "an over-limit chain must be dropped");
+        assert_eq!(
+            counters.ipv6_ext_header_dropped, 1,
+            "the drop must bump ipv6_ext_header_dropped"
+        );
+        assert!(counters.touched, "touched must be set so the batch flushes");
+    }
+
+    #[test]
+    fn normal_frame_helper_neither_drops_nor_counts() {
+        let frame = v6_frame(6, &[0u8; 20]);
+        let mut counters = BatchCounters::default();
+        let dropped = ipv6_ext_header_over_limit_drop(&frame, v6(), &mut counters);
+        assert!(!dropped, "a normally-parseable frame must not be dropped");
+        assert_eq!(counters.ipv6_ext_header_dropped, 0);
+        assert!(!counters.touched);
+    }
 }
 
 #[cfg(test)]

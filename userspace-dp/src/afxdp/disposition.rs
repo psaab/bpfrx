@@ -20,6 +20,23 @@
 
 use super::*;
 
+/// #4743: classify a NoRoute destination as a MARTIAN address — one that a
+/// firewall must never forward and that has no legitimate route. Mirrors the
+/// neighbor-warm never-warm predicate (`coordinator::mod`): IPv4
+/// unspecified/loopback/multicast/broadcast, IPv6
+/// unspecified/loopback/multicast. IPv6 has no broadcast. Used only to
+/// sub-classify an already-decided NoRoute drop; it does not itself drop.
+pub(in crate::afxdp) fn is_martian_dst(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_unspecified() || v4.is_loopback() || v4.is_multicast() || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified() || v6.is_loopback() || v6.is_multicast()
+        }
+    }
+}
+
 pub(super) fn record_exception(
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     binding: &BindingIdentity,
@@ -215,6 +232,22 @@ impl DispositionCounters<'_> {
             }
         }
     }
+    /// #4743: a NoRoute drop whose destination is a martian address. A strict
+    /// sub-breakout of `bump_route_miss` — the caller bumps BOTH, so
+    /// `martian_dropped <= route_miss_packets` always holds (mirrors how
+    /// `screen_reason_drops` break out `screen_drops`).
+    #[inline]
+    fn bump_martian(&mut self) {
+        match self {
+            Self::Hot(c) => {
+                c.touched = true;
+                c.martian_dropped += 1;
+            }
+            Self::Cold(live) => {
+                live.martian_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     #[inline]
     fn bump_neighbor_miss(&mut self) {
         match self {
@@ -388,6 +421,19 @@ pub(super) fn record_forwarding_disposition(
         ForwardingDisposition::NoRoute => {
             update_last_resolution(last_resolution, resolution, debug, forwarding);
             counters.bump_route_miss();
+            // #4743: a NoRoute drop whose destination is a martian address is
+            // ALSO counted distinctly so an operator can tell it apart from an
+            // ordinary route miss (and correlate it with the filter-`accept`
+            // log). A martian dst simply misses the FIB and drops as NoRoute —
+            // there is no separate martian rejection site — so this classifies
+            // off the resolution's destination (from the debug tuple) and bumps
+            // martian_dropped IN ADDITION to route_miss_packets.
+            if debug
+                .and_then(|d| d.dst_ip)
+                .is_some_and(is_martian_dst)
+            {
+                counters.bump_martian();
+            }
             record_exception(
                 recent_exceptions,
                 binding,

@@ -624,6 +624,13 @@ pub(in crate::afxdp) struct BatchCounters {
     // poll_descriptor and flushed into BindingLiveState below.
     host_inbound_denied_packets: u64,
     route_miss_packets: u64,
+    // #4743: NoRoute drops whose dst is a martian address — a sub-breakout of
+    // route_miss_packets, bumped alongside it in the NoRoute disposition arm.
+    martian_dropped: u64,
+    // #4743: fail-closed drops of an over-limit IPv6 extension-header chain
+    // (still on an ext header after MAX_IPV6_EXT_HEADERS iterations). Bumped at
+    // the flow-parse stage when the helper walkers fail closed.
+    ipv6_ext_header_dropped: u64,
     neighbor_miss_packets: u64,
     discard_route_packets: u64,
     next_table_packets: u64,
@@ -903,6 +910,18 @@ impl BatchCounters {
             live.route_miss_packets
                 .fetch_add(self.route_miss_packets, Ordering::Relaxed);
             self.route_miss_packets = 0;
+        }
+        // #4743: martian-dst NoRoute sub-tally, batched like route_miss above.
+        if self.martian_dropped != 0 {
+            live.martian_dropped
+                .fetch_add(self.martian_dropped, Ordering::Relaxed);
+            self.martian_dropped = 0;
+        }
+        // #4743: over-limit IPv6 ext-header fail-closed-drop tally.
+        if self.ipv6_ext_header_dropped != 0 {
+            live.ipv6_ext_header_dropped
+                .fetch_add(self.ipv6_ext_header_dropped, Ordering::Relaxed);
+            self.ipv6_ext_header_dropped = 0;
         }
         if self.neighbor_miss_packets != 0 {
             live.neighbor_miss_packets

@@ -131,6 +131,81 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
     }
 }
 
+/// #4743: return `true` iff `frame`'s IPv6 extension-header chain is still on
+/// an extension header after `MAX_IPV6_EXT_HEADERS` iterations — the OVER-LIMIT,
+/// uninspectable chain that `frame_l4_offset` fails closed on (the post-loop
+/// `None` at the bound). Deliberately distinguishes over-limit from TRUNCATION:
+/// any in-loop short read / declared-length overrun returns `false` (a truncated
+/// chain stays on the existing flowless path, unchanged), as does a chain that
+/// terminates on a real L4 within the bound or a non-IPv6 packet. This is the
+/// gate for the explicit fail-closed drop: before #4743 an over-limit chain was
+/// forwarded flowless (`l4_present = false`), an ext-header IDS-evasion; now it
+/// is dropped and counted (`ipv6_ext_header_dropped`). Mirrors the walk in
+/// `frame_l4_offset` exactly so the two agree on what "over-limit" means.
+pub(in crate::afxdp) fn ipv6_ext_chain_over_limit(frame: &[u8], addr_family: u8) -> bool {
+    if addr_family as i32 != libc::AF_INET6 {
+        return false;
+    }
+    let Some(l3) = frame_l3_offset(frame) else {
+        return false;
+    };
+    if frame.len() < l3 + 40 {
+        return false; // truncated base header — not "over-limit"
+    }
+    let mut protocol = frame[l3 + 6];
+    let mut offset = l3 + 40;
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        match protocol {
+            // #4517 generic length-prefixed EHs (see the set at MAX_IPV6_EXT_HEADERS).
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
+                let Some(opt) = frame.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
+                    return false;
+                };
+                offset = next;
+                if frame.len() < offset {
+                    return false;
+                }
+            }
+            51 => {
+                let Some(opt) = frame.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
+                    return false;
+                };
+                offset = next;
+                if frame.len() < offset {
+                    return false;
+                }
+            }
+            44 => {
+                let Some(frag) = frame.get(offset..offset + 8) else {
+                    return false;
+                };
+                protocol = frag[0];
+                let Some(next) = offset.checked_add(8) else {
+                    return false;
+                };
+                offset = next;
+                if frame.len() < offset {
+                    return false;
+                }
+            }
+            // No-Next-Header (59) is a valid terminal; any other value is a
+            // real L4 reached within the bound. Neither is over-limit.
+            _ => return false,
+        }
+    }
+    // Completed MAX_IPV6_EXT_HEADERS iterations still on an extension header:
+    // over-limit / uninspectable.
+    true
+}
+
 pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> Option<usize> {
     match addr_family as i32 {
         libc::AF_INET => {

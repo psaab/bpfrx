@@ -29,10 +29,14 @@ type statusSummaryAggregates struct {
 	sharedUMEMBindings int
 
 	// Per-binding packet/session/flow counters (summed).
-	rxPackets             uint64
-	validatedPackets      uint64
-	forwardCandidates     uint64
-	routeMisses           uint64
+	rxPackets         uint64
+	validatedPackets  uint64
+	forwardCandidates uint64
+	routeMisses       uint64
+	// #4743: martian-dst NoRoute drops (a sub-breakout of routeMisses) and
+	// over-limit IPv6 ext-header fail-closed drops, summed across bindings.
+	martianDropped        uint64
+	ipv6ExtHeaderDropped  uint64
 	neighborMisses        uint64
 	exceptionPackets      uint64
 	flowCacheHits         uint64
@@ -172,6 +176,8 @@ func aggregateStatusSummary(status userspace.ProcessStatus) statusSummaryAggrega
 		agg.validatedPackets += binding.ValidatedPackets
 		agg.forwardCandidates += binding.ForwardCandidatePkts
 		agg.routeMisses += binding.RouteMissPackets
+		agg.martianDropped += binding.MartianDropped
+		agg.ipv6ExtHeaderDropped += binding.IPv6ExtHeaderDropped
 		agg.neighborMisses += binding.NeighborMissPackets
 		agg.exceptionPackets += binding.ExceptionPackets
 		agg.flowCacheHits += binding.FlowCacheHits
@@ -378,6 +384,8 @@ func writeOverviewSection(b *strings.Builder, status userspace.ProcessStatus, ag
 	fmt.Fprintf(b, "  Validated packets:         %d\n", agg.validatedPackets)
 	fmt.Fprintf(b, "  Forward candidates:        %d\n", agg.forwardCandidates)
 	fmt.Fprintf(b, "  Route misses:              %d\n", agg.routeMisses)
+	fmt.Fprintf(b, "  Martian drops:             %d\n", agg.martianDropped)
+	fmt.Fprintf(b, "  IPv6 ext-header drops:     %d\n", agg.ipv6ExtHeaderDropped)
 	fmt.Fprintf(b, "  Neighbor misses:           %d\n", agg.neighborMisses)
 	fmt.Fprintf(b, "  Exception packets:         %d\n", agg.exceptionPackets)
 	fmt.Fprintf(b, "  Flow cache hits:           %d\n", agg.flowCacheHits)

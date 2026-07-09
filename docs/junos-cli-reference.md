@@ -453,6 +453,22 @@ From zone: guest, To zone: lan
       and surfaced separately as the `Route misses:` line in the userspace
       helper status (`pkg/dataplane/userspace/format/status.go`) — never in
       `Packets dropped`.
+      - **Martian drops** (#4743): a no-route drop whose destination is a
+        martian address (IPv4 multicast/broadcast/unspecified/loopback, IPv6
+        multicast/unspecified/loopback) is ALSO counted distinctly as
+        `martian_dropped` and shown as the `Martian drops:` status line. It is a
+        strict sub-breakout of `route_miss_packets` (a martian dst misses the
+        FIB and drops as no-route, so it bumps both), letting an operator tell a
+        martian-dst drop apart from an ordinary route miss and correlate it with
+        the firewall-filter `accept` log.
+    - **IPv6 extension-header fail-closed drops** (#4743): an IPv6 packet whose
+      extension-header chain is still on an extension header after
+      `MAX_IPV6_EXT_HEADERS` (8) iterations (an over-limit, uninspectable chain)
+      is dropped fail-closed and counted as `ipv6_ext_header_dropped`, shown as
+      the `IPv6 ext-header drops:` status line. Before #4743 such a packet was
+      forwarded flowless (`l4_present = false`), an ext-header IDS-evasion; it is
+      distinct from a TRUNCATED chain (which stays flowless). Not in `Packets
+      dropped`.
     - **Fabric-forwarding drops** (`GlobalCtrFabricFwdDrop`, index 32) — a
       peer-owned synced session whose fabric redirect could not be completed.
     - **VLAN-push failures** (`GlobalCtrVlanPushFail`, index 40).

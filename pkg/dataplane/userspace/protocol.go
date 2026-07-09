@@ -2428,16 +2428,33 @@ type BindingStatus struct {
 	LocalDeliveryPackets     uint64 `json:"local_delivery_packets,omitempty"`
 	ForwardCandidatePkts     uint64 `json:"forward_candidate_packets,omitempty"`
 	RouteMissPackets         uint64 `json:"route_miss_packets,omitempty"`
-	NeighborMissPackets      uint64 `json:"neighbor_miss_packets,omitempty"`
-	DiscardRoutePackets      uint64 `json:"discard_route_packets,omitempty"`
-	NextTablePackets         uint64 `json:"next_table_packets,omitempty"`
-	ExceptionPackets         uint64 `json:"exception_packets,omitempty"`
-	ConfigGenMismatches      uint64 `json:"config_gen_mismatches,omitempty"`
-	FIBGenMismatches         uint64 `json:"fib_gen_mismatches,omitempty"`
-	UnsupportedPackets       uint64 `json:"unsupported_packets,omitempty"`
-	FlowCacheHits            uint64 `json:"flow_cache_hits,omitempty"`
-	FlowCacheMisses          uint64 `json:"flow_cache_misses,omitempty"`
-	FlowCacheEvictions       uint64 `json:"flow_cache_evictions,omitempty"`
+	// #4743: NoRoute drops whose destination is a MARTIAN address (IPv4
+	// multicast/broadcast/unspecified/loopback, IPv6
+	// multicast/unspecified/loopback). A strict sub-breakout of RouteMissPackets
+	// (a martian dst misses the FIB and drops as NoRoute, so it bumps both),
+	// letting an operator tell a martian-dst drop apart from an ordinary route
+	// miss and correlate it with the filter-accept log. omitempty + the Rust
+	// serde `default` keep cross-version wire safety (an older helper omits it →
+	// 0). Summed across bindings and rendered as the "Martian drops" status row.
+	MartianDropped uint64 `json:"martian_dropped,omitempty"`
+	// #4743: fail-closed drops of an IPv6 packet whose extension-header chain is
+	// still on an extension header after MAX_IPV6_EXT_HEADERS (8) iterations (an
+	// over-limit, uninspectable chain). Before #4743 such a packet was forwarded
+	// flowless; it is now dropped explicitly and counted. Distinct from a
+	// truncated chain (which stays flowless). omitempty + the Rust serde
+	// `default` keep cross-version wire safety. Rendered as the "IPv6 ext-header
+	// drops" status row.
+	IPv6ExtHeaderDropped uint64 `json:"ipv6_ext_header_dropped,omitempty"`
+	NeighborMissPackets  uint64 `json:"neighbor_miss_packets,omitempty"`
+	DiscardRoutePackets  uint64 `json:"discard_route_packets,omitempty"`
+	NextTablePackets     uint64 `json:"next_table_packets,omitempty"`
+	ExceptionPackets     uint64 `json:"exception_packets,omitempty"`
+	ConfigGenMismatches  uint64 `json:"config_gen_mismatches,omitempty"`
+	FIBGenMismatches     uint64 `json:"fib_gen_mismatches,omitempty"`
+	UnsupportedPackets   uint64 `json:"unsupported_packets,omitempty"`
+	FlowCacheHits        uint64 `json:"flow_cache_hits,omitempty"`
+	FlowCacheMisses      uint64 `json:"flow_cache_misses,omitempty"`
+	FlowCacheEvictions   uint64 `json:"flow_cache_evictions,omitempty"`
 	// #918: collision-driven subset of flow_cache_evictions (full-set
 	// LRU displacement vs stale-on-lookup eviction). Acceptance gate
 	// watches collision_evictions / hits under load.

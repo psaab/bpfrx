@@ -338,6 +338,23 @@ pub(crate) struct BindingStatus {
     pub forward_candidate_packets: u64,
     #[serde(rename = "route_miss_packets", default)]
     pub route_miss_packets: u64,
+    /// #4743: NoRoute drops whose destination is a MARTIAN address (IPv4
+    /// multicast/broadcast/unspecified/loopback, IPv6
+    /// multicast/unspecified/loopback). A strict sub-breakout of
+    /// `route_miss_packets` (a martian dst misses the FIB and drops as NoRoute,
+    /// so it bumps both), letting an operator tell a martian-dst drop apart from
+    /// an ordinary route miss. `default` keeps cross-version wire safety (an
+    /// older helper omits it and Go/Rust read 0). Surfaced as the `Martian
+    /// drops` status row.
+    #[serde(rename = "martian_dropped", default)]
+    pub martian_dropped: u64,
+    /// #4743: fail-closed drops of an IPv6 packet whose extension-header chain
+    /// is still on an extension header after `MAX_IPV6_EXT_HEADERS` (8)
+    /// iterations (an over-limit, uninspectable chain). Distinct from a
+    /// truncated chain (which stays flowless). `default` keeps cross-version
+    /// wire safety. Surfaced as the `IPv6 ext-header drops` status row.
+    #[serde(rename = "ipv6_ext_header_dropped", default)]
+    pub ipv6_ext_header_dropped: u64,
     #[serde(rename = "neighbor_miss_packets", default)]
     pub neighbor_miss_packets: u64,
     #[serde(rename = "discard_route_packets", default)]
