@@ -1,3 +1,21 @@
+## 2026-07-09 — #4668: relocate reject_reply.rs inline tests to a sibling file
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4668 — pure code-motion test refactor. `reject_reply.rs`
+  (2174 LOC) carried a 1759-line inline `#[cfg(test)] mod tests { ... }`
+  block wrapping ~380 LOC of cold reject-reply enqueue production
+  (`enqueue_policy_reject_reply` / `enqueue_reject_reply`). Extracted the
+  test module verbatim to sibling `reject_reply_tests.rs`, wired via
+  `#[cfg(test)] #[path = "reject_reply_tests.rs"] mod tests;` following the
+  worker_queue / umem / event_stream split convention. Production code
+  (lines 1-413) byte-identical; each test body byte-identical after
+  reversing the 4-space dedent out of the `mod tests {}` wrapper. Test
+  count preserved: 25 `#[test]` before == 25 after. Validation: cargo
+  build clean; `cargo test --release reject_reply` 25/25 ok; FULL serial
+  suite 3860 passed / 0 failed / 2 ignored.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs
+  (2174→417 LOC), userspace-dp/src/afxdp/poll_descriptor/reject_reply_tests.rs (new)
+
 ## 2026-07-09 — #4710: redact Secret in YAML marshal/unmarshal (close the JSON/YAML asymmetry)
 
 - **Timestamp**: 2026-07-09
@@ -43073,3 +43091,37 @@ top.
   ./pkg/cluster clean (ok 8.8s); full go test ./... green. RED-on-revert
   verified: removing the lock (keeping factory seam) → -race reports DATA
   RACE on cachedNlHandle AND creations=64 (leak) → test FAIL.
+---
+- **Timestamp**: 2026-07-09 01:09 PDT
+- **Action**: #4667 — split afxdp/umem/tests.rs (1765 LOC) into per-concern
+  tests/ subdir (7 sibling submodules + tests/mod.rs). Pure byte-exact
+  test-code motion; no production logic changed. Files:
+  tests/mod.rs (shared `use` header + `test_tx_request_for_inbox` fixture),
+  mmap_area.rs (1), tx_inbox.rs (3), latency_buckets.rs (6),
+  snapshot_propagation.rs (3), tx_submit_latency.rs (9),
+  tx_kick_latency.rs (6), debug_state.rs (5). umem/mod.rs decl changed
+  `#[path="tests.rs"] mod tests;` -> `mod tests;`; two #1351 comment blocks
+  repointed from stale `tests.rs:NNNN` refs to `umem/tests/debug_state.rs`
+  (comment-only). README.md file table updated. Test count 33 preserved;
+  static crate #[test] count 3336==3336; code-line multiset missing=0,
+  extra=7x`mod X;`+7x`use super::*;`. Full serial cargo test (release):
+  3860 passed / 0 failed / 2 ignored (EXIT=0). afxdp::umem::tests:: --list==33.
+- **File(s)**: userspace-dp/src/afxdp/umem/{mod.rs,README.md},
+  userspace-dp/src/afxdp/umem/tests.rs (deleted),
+  userspace-dp/src/afxdp/umem/tests/{mod,mmap_area,tx_inbox,latency_buckets,snapshot_propagation,tx_submit_latency,tx_kick_latency,debug_state}.rs (new)
+
+- **Timestamp**: 2026-07-09
+- **Action**: #4719 — batch/non-blocking ClearAllSessions to avoid HA-watchdog
+  starvation. Collection now uses BatchIterateSessions{,V6} (yield between
+  batch-lookups); deletion routes v4/v6 keys through new clearSessionsV4/V6
+  helpers issuing chunked BPF_MAP_DELETE_BATCH (sessionDeleteBatchSize=64 keys
+  per syscall) with runtime.Gosched() between chunks and a per-key remainder
+  fallback (concurrent GC delete / unsupported batch) so the clear stays
+  complete — never a partial clear reported as done. DNAT cleanup loops now
+  yield every batch. Added sessionClearBatchObserver test seam +
+  real-ebpf-map RED-on-revert test (300 fwd+rev flows/family): asserts all
+  cleared (fwd+rev gone), batched path taken, empty/single guards. Verified
+  RED-on-revert (per-key revert → batched-path assertion fails) and passing
+  under -race as root.
+- **File(s)**: pkg/dataplane/maps_session.go,
+  pkg/dataplane/maps_session_clear_test.go, _Log.md
