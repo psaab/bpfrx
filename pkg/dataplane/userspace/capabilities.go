@@ -488,21 +488,3 @@ func userspacePortSpecRepresentable(spec string) bool {
 	}
 	return p != 0
 }
-
-func userspaceSupportsSourceNAT(ruleSets []*config.NATRuleSet) bool {
-	for _, rs := range ruleSets {
-		if rs == nil {
-			continue
-		}
-		for _, rule := range rs.Rules {
-			if rule == nil {
-				continue
-			}
-			if rule.Then.Interface || rule.Then.Off {
-				continue
-			}
-			return false
-		}
-	}
-	return true
-}
