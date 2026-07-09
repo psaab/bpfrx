@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -764,6 +763,19 @@ func (c *CLI) showVersion() error {
 	return nil
 }
 
+// resolveShowLogPath validates a `show log <name>` filename against the
+// operator-configured `system syslog file` allowlist and returns the /var/log
+// path to tail (#4860). This restricts a view-only (PermView) account to the
+// xpf-managed syslog destinations instead of any root-readable child of
+// /var/log. A nil store fails closed (empty allowlist → refused).
+func (c *CLI) resolveShowLogPath(name string) (string, error) {
+	var cfg *config.Config
+	if c.store != nil {
+		cfg = c.store.ActiveConfig()
+	}
+	return config.SyslogLogFilePath(cfg, name)
+}
+
 // showDaemonLog displays recent daemon log entries from journald,
 // or if a filename argument is given, reads from /var/log/<filename>.
 
@@ -779,7 +791,10 @@ func (c *CLI) showDaemonLog(args []string) error {
 					n = v
 				}
 			}
-			logPath := filepath.Join("/var/log", filepath.Base(filename))
+			logPath, err := c.resolveShowLogPath(filename)
+			if err != nil {
+				return err
+			}
 			out, err := exec.Command("tail", "-n", strconv.Itoa(n), logPath).CombinedOutput()
 			if err != nil {
 				return fmt.Errorf("read %s: %w", logPath, err)

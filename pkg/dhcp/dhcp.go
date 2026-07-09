@@ -525,11 +525,17 @@ func (m *Manager) DUIDs() []DUIDInfo {
 // ClearDUID removes the persisted DUID for an interface. The next DHCPv6
 // request will generate a fresh DUID.
 func (m *Manager) ClearDUID(ifaceName string) error {
+	// Validate BEFORE mutating in-memory state or touching the filesystem so a
+	// crafted interface name is refused without side effects (#4857).
+	path, err := m.duidPath(ifaceName)
+	if err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	delete(m.duids, ifaceName)
 	m.mu.Unlock()
 
-	path := m.duidPath(ifaceName)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -610,12 +616,54 @@ func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
 	return duid, nil
 }
 
-func (m *Manager) duidPath(ifaceName string) string {
-	return filepath.Join(m.stateDir, "dhcpv6-duid-"+ifaceName)
+// validInterfaceName reports whether s is a plausible Linux network interface
+// name that is safe to embed in a DUID state-file path. A real interface name
+// is at most IFNAMSIZ-1 (15) bytes and contains NONE of: a path separator, a
+// NUL, whitespace, or a "." / ".." path component. Rejecting these neutralizes
+// a crafted `interface` value (e.g. "../../../../etc/passwd") arriving on the
+// DHCPv6-DUID-clear RPC, which would otherwise traverse out of the DUID state
+// directory when joined into the state-file path (#4857). VLAN sub-interfaces
+// such as "reth0.50" contain a '.' but are NOT a "." / ".." component, so they
+// remain valid.
+func validInterfaceName(s string) bool {
+	if s == "" || len(s) > 15 {
+		return false
+	}
+	if s == "." || s == ".." {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '/', '\\', 0, ' ', '\t', '\n', '\r':
+			return false
+		}
+	}
+	return true
+}
+
+// duidPath returns the on-disk DUID state-file path for an interface. It
+// validates the interface name and verifies the joined path stays directly
+// under stateDir so a traversal-y name can never reach a file outside the DUID
+// state directory (#4857). All DUID file operations (load/save/clear) route
+// through here, so the containment guard is applied uniformly.
+func (m *Manager) duidPath(ifaceName string) (string, error) {
+	if !validInterfaceName(ifaceName) {
+		return "", fmt.Errorf("invalid interface name %q for DUID path", ifaceName)
+	}
+	p := filepath.Join(m.stateDir, "dhcpv6-duid-"+ifaceName)
+	// Defense in depth: the resolved path must be a direct child of stateDir.
+	if filepath.Dir(p) != filepath.Clean(m.stateDir) {
+		return "", fmt.Errorf("refusing DUID path outside state dir for interface %q", ifaceName)
+	}
+	return p, nil
 }
 
 func (m *Manager) loadDUID(ifaceName string) (dhcpv6.DUID, error) {
-	data, err := os.ReadFile(m.duidPath(ifaceName))
+	path, err := m.duidPath(ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -623,6 +671,10 @@ func (m *Manager) loadDUID(ifaceName string) (dhcpv6.DUID, error) {
 }
 
 func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
+	path, err := m.duidPath(ifaceName)
+	if err != nil {
+		return err
+	}
 	// Durable creation (#1894 code-r1): the state dir's own entry must
 	// be made durable on first creation or the DUID file can be lost
 	// with the whole directory after a power cut.
@@ -632,7 +684,7 @@ func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
 	// DurableState (#1894): the DUID is the client's stable DHCPv6
 	// identity — losing it to a power cut changes the identity the
 	// server knows us by across reboot (new leases, stale bindings).
-	return fsatomic.WriteFileDurable(m.duidPath(ifaceName), duid.ToBytes(), 0644)
+	return fsatomic.WriteFileDurable(path, duid.ToBytes(), 0644)
 }
 
 // Leases returns a snapshot of all current DHCP leases.
