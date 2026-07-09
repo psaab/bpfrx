@@ -28,6 +28,32 @@
 - **File(s)**: pkg/configstore/crypto.go,
   pkg/configstore/masterpw_split_system_4705_test.go,
   pkg/configstore/README.md, _Log.md
+## 2026-07-08 — #4712: deterministic sorted iteration in show-text endpoints
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4712 — `pkg/api/show_text.go` (the `/show-text` REST handler)
+  ranged over string-keyed config maps directly for 12 topics (schedulers,
+  snmp communities/trap-groups, dhcp-relay server-groups/groups, firewall
+  filters, dynamic-address feeds, address-book addresses/address-sets,
+  applications/application-sets, netflow-v9 templates). Go randomizes map
+  iteration order, so the rendered operator/automation-facing text came back
+  in a different order across requests, breaking config diffing and making
+  downstream tests flaky. Verified all 12 cited fields are `map[string]*...`
+  (nat-static/nat-nptv6 iterate slices → already deterministic, correctly not
+  cited). Fix: added a generic `sortedKeys[V any](map[string]V) []string`
+  helper (collect keys, `sort.Strings`, iterate) and routed all 12 sites
+  through it — minimal, local, no handler restructuring. New regression test
+  stages multi-key maps (scrambled insertion order) for applications,
+  address-book, and snmp, renders each topic 40× and asserts (1) byte-identical
+  output across renders and (2) ascending-key ordering; proved RED under both a
+  reverse-sort and a raw map-range revert. Validation: gofmt -w; go build
+  ./... clean; go test ./pkg/api/... green; FULL Go suite 52 ok / 3 no-test,
+  sole FAIL is the pre-existing pkg/ddns RFC2136 port-bind flake (passes in
+  isolation, unrelated — change is pkg/api-only). No docs change: this
+  restores expected deterministic output; no operator-facing contract or
+  module doc describes the prior (buggy) ordering.
+  **File(s)**: pkg/api/show_text.go, pkg/api/show_text_sorted_4712_test.go,
+  _Log.md
 
 ## 2026-07-08 — #4422 slice: firewall-filter port-on-non-port / TCP-only / ICMP-only regression coverage
 
@@ -42612,6 +42638,30 @@ top.
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
 
+---
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4651 pure code-motion refactor — split the 1165-LOC
+  `event_stream/codec.rs` wire-codec monolith into a `codec/` module dir with
+  four wire-format submodules (`wire`, `session_sync`, `rt_flow`, `decode`) plus
+  a `mod.rs` re-export shell. `EventFrame` struct + its introspection impl kept
+  in `codec/mod.rs` so its `pub(super)` (== `pub(in event_stream)`) fields/methods
+  keep identical visibility. `codec_tests.rs` moved into `codec/` (path-loaded
+  test module unchanged; external-type imports it used to get via codec.rs's
+  top-level `use` lines added directly). Byte-identical bodies: 74 fn/struct/
+  enum/const decls, same signatures, zero body diffs (only comment/banner glue
+  added; formerly module-private helpers gained `pub(super)` == same
+  crate-internal scope). Validation: `cargo build` clean; FULL cargo test suite
+  SERIAL (`--test-threads=1`) 3854 passed / 0 failed / 2 ignored;
+  `event_stream` subset 85/0.
+- **File(s)**: userspace-dp/src/event_stream/codec/mod.rs (new),
+  userspace-dp/src/event_stream/codec/wire.rs (new),
+  userspace-dp/src/event_stream/codec/session_sync.rs (new),
+  userspace-dp/src/event_stream/codec/rt_flow.rs (new),
+  userspace-dp/src/event_stream/codec/decode.rs (new),
+  userspace-dp/src/event_stream/codec/codec_tests.rs (moved from
+  userspace-dp/src/event_stream/codec_tests.rs),
+  userspace-dp/src/event_stream/codec.rs (deleted), _Log.md
 - **Timestamp**: 2026-07-08
   **Action**: #4422 slice — pin the two REJECT cells of the policy
   zone-matrix (action × destination-class) at the SSOT flow-match engine

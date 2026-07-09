@@ -1,13 +1,19 @@
-// Tests for event_stream/codec.rs — relocated from inline
-// `#[cfg(test)] mod tests` to keep codec.rs under the modularity-discipline
-// LOC threshold. Loaded as a sibling submodule via
-// `#[path = "codec_tests.rs"]` from codec.rs.
-
+// Tests for the event_stream/codec wire codec — relocated from the former
+// inline `#[cfg(test)] mod tests` in codec.rs. Loaded as a sibling submodule
+// of `codec` via `#[path = "codec_tests.rs"]` from codec/mod.rs (#4651 split).
+//
+// `use super::*` resolves the codec items (constants, helpers, EventFrame,
+// DataplaneEventKind, ...) re-exported by codec/mod.rs. The external types the
+// test builders need used to reach the tests through codec.rs's own top-level
+// `use` lines; after the split those imports live in the codec submodules, so
+// the test module imports them directly.
 use super::*;
-use crate::afxdp::ForwardingResolution;
+use crate::afxdp::{ForwardingDisposition, ForwardingResolution};
 use crate::nat::NatDecision;
+use crate::session::{SessionDecision, SessionDelta, SessionKey, SessionMetadata};
 use crate::test_zone_ids::*;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use rustc_hash::FxHashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn test_zone_map() -> FxHashMap<String, u16> {
     let mut m = FxHashMap::default();
