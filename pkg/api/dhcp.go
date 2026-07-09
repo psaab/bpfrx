@@ -1,7 +1,10 @@
 package api
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -66,8 +69,25 @@ func (s *Server) clearDHCPIdentifiersHandler(w http.ResponseWriter, r *http.Requ
 	}
 
 	var req ClearDHCPIdentifierRequest
-	if r.ContentLength > 0 {
-		if !decodeJSONBody(w, r, &req) {
+	// #4794: gate on ContentLength != 0, not > 0. A chunked-encoded request
+	// (Transfer-Encoding: chunked) reports ContentLength == -1 (unknown
+	// length), so the old "> 0" gate skipped the body decode entirely and
+	// fell through to ClearAllDUIDs() below even when the operator's body
+	// asked to clear a single interface -- wiping every DHCPv6 DUID instead.
+	// ContentLength == 0 (a genuinely empty body, no Transfer-Encoding) still
+	// skips the decode, matching the documented "no interface = clear all"
+	// contract. A chunked request that happens to carry zero bytes hits
+	// io.EOF on Decode, which is tolerated below (not a 400) for the same
+	// reason.
+	if r.ContentLength != 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
 	}
