@@ -723,4 +723,17 @@ func TestValidatePercent(t *testing.T) {
 	if err := v("150", nil); err == nil {
 		t.Errorf("ValidatePercent 150: expected out-of-range error")
 	}
+	// NaN/Inf bypass the `<`/`>` range check (both comparisons are false
+	// for NaN) and reach the userspace snapshot where json.Marshal fails
+	// on non-finite floats (#4877). Reject them at commit-check.
+	for _, bad := range []string{"NaN", "nan", "+Inf", "-Inf", "Inf", "Infinity"} {
+		if err := v(bad, nil); err == nil {
+			t.Errorf("ValidatePercent %q: expected non-finite rejection", bad)
+		}
+	}
+	// A NaN/Inf guard must not reject an in-range finite value.
+	vf := config.ValidatePercent(0, 1)
+	if err := vf("0.5", nil); err != nil {
+		t.Errorf("ValidatePercent(0,1) 0.5: unexpected error %v", err)
+	}
 }

@@ -108,8 +108,17 @@ type Manager struct {
 	mu             sync.RWMutex
 	eventCh        chan ClusterEvent
 	monitor        *Monitor
-	garpCounts     map[int]int // rgID -> gratuitous ARP count from config
-	history        *EventHistory
+	// monStartMu serializes Start's stop-previous + swap + start-new monitor
+	// sequence. It is a SEPARATE lock from m.mu because Start must NOT hold
+	// m.mu across the old monitor's Stop(): Stop() joins the poll goroutine
+	// (mon.wg.Wait()), and that goroutine calls back into SetMonitorWeight,
+	// which takes m.mu — holding m.mu across Stop() is a classic AB-BA
+	// deadlock (#4828). monStartMu serializes concurrent Start calls without
+	// participating in that ordering (no goroutine Stop() waits on ever takes
+	// monStartMu), mirroring hbStartMu / StartHeartbeat (#4033).
+	monStartMu sync.Mutex
+	garpCounts map[int]int // rgID -> gratuitous ARP count from config
+	history    *EventHistory
 
 	// kernelUpgradeHold, when set, unconditionally holds this node SECONDARY in
 	// election (#1930 INC-2): a kernel-upgrade candidate boot must not become
@@ -379,15 +388,30 @@ func (m *Manager) sendEvent(groupID int, oldState, newState NodeState, reason st
 }
 
 // Start begins periodic interface/IP monitoring.
+//
+// The stop-previous + swap + start-new sequence is serialized by monStartMu,
+// but m.mu is released before the blocking calls: holding m.mu across the old
+// monitor's Stop() deadlocks (#4828). Stop() joins the poll goroutine via
+// wg.Wait(), and an in-flight SetMonitorWeight callback on that goroutine takes
+// m.mu — so m.mu held here (AB) vs. m.mu wanted by the poll callback while
+// Start waits on wg (BA) is a lock-order inversion. Only the m.monitor pointer
+// swap needs m.mu; Stop()/Start() on the Monitor objects are self-synchronized
+// (mon.mu + mon.wg), so they run outside m.mu. monStartMu keeps two concurrent
+// Start calls from stopping/starting each other's monitors.
 func (m *Manager) Start(ctx context.Context) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.monStartMu.Lock()
+	defer m.monStartMu.Unlock()
 
-	if m.monitor != nil {
-		m.monitor.Stop()
+	m.mu.Lock()
+	old := m.monitor
+	mon := NewMonitor(m, nil) // groups set via UpdateConfig
+	m.monitor = mon
+	m.mu.Unlock()
+
+	if old != nil {
+		old.Stop()
 	}
-	m.monitor = NewMonitor(m, nil) // groups set via UpdateConfig
-	m.monitor.Start(ctx)
+	mon.Start(ctx)
 }
 
 // Stop halts monitoring and heartbeat goroutines.

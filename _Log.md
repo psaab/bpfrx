@@ -43877,6 +43877,10 @@ top.
   **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests_pool.rs, docs/deterministic-nat-cgnat.md
   **Action**: #4870 — dhcpserver fail-closed on systemctl is-active query error. unitIsActive now returns (bool, error): a recognized state string is authoritative, an undeterminable query (timeout/exec/garbled) returns an error instead of silent "inactive". reconcileFamilyRestart restarts + surfaces the error on an uncertain query (was: skip restart, report success); clearFamilyLocked stops + surfaces the error and the config-unlink error on a removed family.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go, pkg/dhcpserver/dhcpserver_isactive_error_4870_test.go, pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4872 pkg/upgrade fail-closed hardening — (A) Promote checks RunningKernel before pruning on BootCurrent error; indeterminate state preserves journal + no reboot; (B) StrictWatchdog arm failure aborts; watchdog helpers propagate I/O errors; (C) self-recover rejects lease missing expires_at; (D) grace clock resets on any observation error
+  **File(s)**: pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_linux.go, pkg/upgrade/kernel_selfrecover.go, pkg/upgrade/kernel_test.go, pkg/upgrade/kernel_selfrecover_test.go, docs/in-place-upgrade.md
 - **Timestamp**: 2026-07-09
   **Action**: #4873 (A) — make the DDNS corrupt-state fail-closed posture durable across restart. loadStateOrDegrade now writes a durable <path>.degraded marker when it quarantines a corrupt/unsupported ownership file, and honors that marker first on every load, so a restart after quarantine stays degraded instead of coming up clean-but-empty (fail-open) and resuming publish/withdraw with ownership forgotten. Covers both the main manager and SurfaceA (same gate).
   **File(s)**: pkg/ddns/state.go, pkg/ddns/manager.go, pkg/ddns/corrupt_state_durable_4873_test.go, pkg/ddns/README.md
@@ -43888,3 +43892,9 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4868 CLI commit/rollback grammar + int32 narrowing fail-closed — remote+local commit reject unknown modifier and parse commit-confirmed minutes via ParseInt(10,32) with [1,65535]; store bounds the window; remote rollback uses ParseInt(10,32) to reject int32-wrap-to-0
   **File(s)**: cmd/cli/main.go, cmd/cli/shared.go, pkg/cli/cli_config.go, pkg/configstore/store_commit.go, +3 tests, pkg/configstore/README.md
+  **Action**: #4828 — fix AB-BA deadlock in cluster Manager.Start. Start no longer holds m.mu across the previous monitor's Stop(): the monitor poll goroutine calls SetMonitorWeight (takes m.mu) and Stop() joins it via wg.Wait(), so m.mu held across Stop() vs. m.mu wanted by the poll callback is a lock-order inversion that froze the whole HA manager on any config reload racing a monitor state change. Start now serializes on a dedicated monStartMu, takes m.mu only to swap the m.monitor pointer, and runs old.Stop()/new.Start() outside m.mu (mirrors hbStartMu/StartHeartbeat #4033). Added RED-on-revert deadlock reproduction test.
+  **File(s)**: pkg/cluster/manager.go, pkg/cluster/manager_start_deadlock_test.go, pkg/cluster/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4877 ValidatePercent rejects NaN/Inf (commit-check) before range gate
+  **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_validate_test.go
