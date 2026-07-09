@@ -122,8 +122,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -155,8 +155,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -1365,8 +1365,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -1398,8 +1398,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -2607,8 +2607,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -2640,8 +2640,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -3849,8 +3849,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -3882,8 +3882,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -5092,8 +5092,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -5125,8 +5125,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -6334,8 +6334,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -6367,8 +6367,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -7559,8 +7559,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -8522,8 +8522,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -9484,8 +9484,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -10446,8 +10446,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -11409,8 +11409,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -12371,8 +12371,8 @@
                   ],
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": {
@@ -14070,8 +14070,8 @@
                   "Applications": null,
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": null,
@@ -14400,8 +14400,8 @@
                   "Applications": null,
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": null,
@@ -14730,8 +14730,8 @@
                   "Applications": null,
                   "SourceAddressExcluded": false,
                   "DestinationAddressExcluded": false,
-                  "FromZone": "",
-                  "ToZone": ""
+                  "FromZones": null,
+                  "ToZones": null
                 },
                 "Action": 0,
                 "Log": null,

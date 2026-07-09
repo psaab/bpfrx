@@ -445,12 +445,15 @@ func policyMatchOrActionChanged(oldPol, newPol *config.Policy) bool {
 	}
 	om, nm := oldPol.Match, newPol.Match
 	if om.SourceAddressExcluded != nm.SourceAddressExcluded ||
-		om.DestinationAddressExcluded != nm.DestinationAddressExcluded ||
-		om.FromZone != nm.FromZone ||
-		om.ToZone != nm.ToZone {
+		om.DestinationAddressExcluded != nm.DestinationAddressExcluded {
 		return true
 	}
-	return !sameStringSet(om.SourceAddresses, nm.SourceAddresses) ||
+	// #4626 M03: a global policy's from/to-zone scope is a zone SET; compare as
+	// sets (like the address/application lists) so a pure reordering of the
+	// scope does not trigger a needless session clear.
+	return !sameStringSet(om.FromZones, nm.FromZones) ||
+		!sameStringSet(om.ToZones, nm.ToZones) ||
+		!sameStringSet(om.SourceAddresses, nm.SourceAddresses) ||
 		!sameStringSet(om.DestinationAddresses, nm.DestinationAddresses) ||
 		!sameStringSet(om.Applications, nm.Applications)
 }

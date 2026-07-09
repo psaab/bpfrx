@@ -121,7 +121,7 @@ func TestJunosHostGateNoTransitFallback(t *testing.T) {
 				DefaultPolicy: config.PolicyPermit,
 				Zones:         zones("trust", "dmz"),
 				GlobalPolicies: []*config.Policy{
-					{Name: "g-host-deny", Match: config.PolicyMatch{ToZone: "junos-host"}, Action: config.PolicyDeny},
+					{Name: "g-host-deny", Match: config.PolicyMatch{ToZones: []string{"junos-host"}}, Action: config.PolicyDeny},
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "dmz", ToZone: "junos-host"},
@@ -138,7 +138,7 @@ func TestJunosHostGateNoTransitFallback(t *testing.T) {
 					zonePair("trust", "junos-host", permit("trust-host-permit", config.PolicyMatch{})),
 				},
 				GlobalPolicies: []*config.Policy{
-					{Name: "g-host-deny", Match: config.PolicyMatch{ToZone: "junos-host"}, Action: config.PolicyDeny},
+					{Name: "g-host-deny", Match: config.PolicyMatch{ToZones: []string{"junos-host"}}, Action: config.PolicyDeny},
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "junos-host"},
@@ -153,7 +153,7 @@ func TestJunosHostGateNoTransitFallback(t *testing.T) {
 				DefaultPolicy: config.PolicyPermit,
 				Zones:         zones("trust", "dmz"),
 				GlobalPolicies: []*config.Policy{
-					{Name: "g-dmz-host-deny", Match: config.PolicyMatch{FromZone: "dmz", ToZone: "junos-host"}, Action: config.PolicyDeny},
+					{Name: "g-dmz-host-deny", Match: config.PolicyMatch{FromZones: []string{"dmz"}, ToZones: []string{"junos-host"}}, Action: config.PolicyDeny},
 				},
 			}, config.ApplicationsConfig{}),
 			q:             Query{FromZone: "trust", ToZone: "junos-host"},

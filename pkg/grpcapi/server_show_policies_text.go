@@ -190,7 +190,7 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 				continue
 			}
 			// #3357: drop a scoped global that targets a different zone pair.
-			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, filterFrom, filterTo) {
+			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZones, pol.Match.ToZones, filterFrom, filterTo) {
 				continue
 			}
 			action := "permit"
@@ -212,16 +212,11 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			totalPkts += pkts
 			totalBytes += bytes
-			// #3286: a scoped global (#3148) reports its zone pair in the
+			// #3286/#4626: a scoped global (#3148) reports its zone SET in the
 			// From/To columns so the hit-count row is not ambiguous; an
 			// unscoped global keeps "*"/"*".
-			hcFrom, hcTo := "*", "*"
-			if pol.Match.FromZone != "" {
-				hcFrom = pol.Match.FromZone
-			}
-			if pol.Match.ToZone != "" {
-				hcTo = pol.Match.ToZone
-			}
+			hcFrom := config.ScopeLabelOr(pol.Match.FromZones, "*")
+			hcTo := config.ScopeLabelOr(pol.Match.ToZones, "*")
 			fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12d %16d\n",
 				hcFrom, hcTo, pol.Name, action, pkts, bytes)
 		}
@@ -410,7 +405,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				continue
 			}
 			// #3357: drop a scoped global that targets a different zone pair.
-			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, filterFrom, filterTo) {
+			if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZones, pol.Match.ToZones, filterFrom, filterTo) {
 				continue
 			}
 			if !globalHeaderPrinted {
@@ -434,14 +429,14 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 				fmt.Fprintf(buf, "    Description: %s\n", pol.Description)
 			}
 			fmt.Fprintf(buf, "    Match:\n")
-			// #3286: a scoped global (#3148) narrows itself to a zone pair;
-			// surface the configured scope so the detail view does not read
-			// as all-zones. Omitted for an unscoped global (no regression).
-			if pol.Match.FromZone != "" {
-				fmt.Fprintf(buf, "      Source zone: %s\n", pol.Match.FromZone)
+			// #3286/#4626: a scoped global (#3148) narrows itself to a zone
+			// SET; surface the configured scope so the detail view does not
+			// read as all-zones. Omitted for an unscoped global (no regression).
+			if len(pol.Match.FromZones) > 0 {
+				fmt.Fprintf(buf, "      Source zone: %s\n", config.ZoneScopeSetLabel(pol.Match.FromZones))
 			}
-			if pol.Match.ToZone != "" {
-				fmt.Fprintf(buf, "      Destination zone: %s\n", pol.Match.ToZone)
+			if len(pol.Match.ToZones) > 0 {
+				fmt.Fprintf(buf, "      Destination zone: %s\n", config.ZoneScopeSetLabel(pol.Match.ToZones))
 			}
 			printAddrs("Source addresses", pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded)
 			printAddrs("Destination addresses", pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded)

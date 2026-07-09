@@ -220,7 +220,7 @@ func TestBuildSnapshotDropsDanglingGlobalMatchZone(t *testing.T) {
 	cfg.Security.GlobalPolicies = []*config.Policy{
 		{
 			Name:   "g-scoped-quarantined",
-			Match:  config.PolicyMatch{FromZone: "z214", Applications: []string{"any"}},
+			Match:  config.PolicyMatch{FromZones: []string{"z214"}, Applications: []string{"any"}},
 			Action: config.PolicyPermit,
 		},
 	}

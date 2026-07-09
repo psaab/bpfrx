@@ -244,14 +244,14 @@ func (c *ctl) showZones() error {
 					// local/gRPC-text tier renderers use).
 					for _, rule := range pi.Rules {
 						if !config.GlobalPolicyAppliesToZone(config.PolicyMatch{
-							FromZone: rule.MatchFromZone,
-							ToZone:   rule.MatchToZone,
+							FromZones: effectiveMatchFromZones(rule),
+							ToZones:   effectiveMatchToZones(rule),
 						}, z.Name) {
 							continue
 						}
 						fmt.Printf("    [global] %s -> %s: %s (%s)\n",
-							matchScopeZone(rule.MatchFromZone),
-							matchScopeZone(rule.MatchToZone),
+							config.ZoneScopeSetLabel(effectiveMatchFromZones(rule)),
+							config.ZoneScopeSetLabel(effectiveMatchToZones(rule)),
 							rule.Name, rule.Action)
 						globalPolicies++
 					}
@@ -358,16 +358,16 @@ func (c *ctl) showPoliciesFiltered(fromZone, toZone string) error {
 		// normalized to "any" via matchScopeZone — #3683 M02).
 		if pi.FromZone == "*" && pi.ToZone == "*" {
 			for _, rule := range pi.Rules {
-				if !policymatch.GlobalPolicyAppliesToZonePair(rule.MatchFromZone, rule.MatchToZone, fromZone, toZone) {
+				if !policymatch.GlobalPolicyAppliesToZonePair(effectiveMatchFromZones(rule), effectiveMatchToZones(rule), fromZone, toZone) {
 					continue
 				}
-				// #3683 (M02): render the effective scope through matchScopeZone
-				// (the shared normalizer, empty -> "any") so an unscoped global
+				// #3683 (M02) / #4626: render the effective zone SET through
+				// config.ZoneScopeSetLabel (empty -> "any") so an unscoped global
 				// prints "From zone: any, To zone: any" — the canonical Junos /
 				// local-CLI / gRPC model — instead of a hand-rolled "*" that reads
 				// like an internal wildcard rather than the explicit policy model.
 				fmt.Printf("From zone: %s, To zone: %s\n",
-					matchScopeZone(rule.MatchFromZone), matchScopeZone(rule.MatchToZone))
+					config.ZoneScopeSetLabel(effectiveMatchFromZones(rule)), config.ZoneScopeSetLabel(effectiveMatchToZones(rule)))
 				renderRule(rule)
 				fmt.Println()
 			}
@@ -509,6 +509,30 @@ func matchScopeZone(z string) string {
 	return z
 }
 
+// effectiveMatchFromZones / effectiveMatchToZones resolve a scoped-global zone
+// SET (#4626 M03) from a gRPC PolicyRule, preferring the plural
+// match_*_zones field and falling back to the singular match_*_zone for an
+// older daemon that only emits the singular value (additive-wire safety).
+func effectiveMatchFromZones(rule *pb.PolicyRule) []string {
+	if z := rule.GetMatchFromZones(); len(z) > 0 {
+		return z
+	}
+	if s := rule.GetMatchFromZone(); s != "" {
+		return []string{s}
+	}
+	return nil
+}
+
+func effectiveMatchToZones(rule *pb.PolicyRule) []string {
+	if z := rule.GetMatchToZones(); len(z) > 0 {
+		return z
+	}
+	if s := rule.GetMatchToZone(); s != "" {
+		return []string{s}
+	}
+	return nil
+}
+
 func (c *ctl) showVRRP() error {
 	resp, err := c.client.GetVRRPStatus(c.ctx(), &pb.GetVRRPStatusRequest{})
 	if err != nil {
@@ -640,11 +664,13 @@ func (c *ctl) showPoliciesBrief() error {
 			// default-policy row leave the match-scope empty and fall back to the
 			// group zones (real zones / "-"), so they are unchanged.
 			from, to := pi.FromZone, pi.ToZone
-			if rule.MatchFromZone != "" {
-				from = rule.MatchFromZone
+			// #4626: prefer the full scoped-global zone SET; empty falls back
+			// to the group zones (zone-pair / default rows leave the scope empty).
+			if zs := effectiveMatchFromZones(rule); len(zs) > 0 {
+				from = config.ZoneScopeSetLabel(zs)
 			}
-			if rule.MatchToZone != "" {
-				to = rule.MatchToZone
+			if zs := effectiveMatchToZones(rule); len(zs) > 0 {
+				to = config.ZoneScopeSetLabel(zs)
 			}
 			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 				from, to, rule.Name, rule.Action, hits)

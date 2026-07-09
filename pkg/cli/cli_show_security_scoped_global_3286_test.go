@@ -24,7 +24,7 @@ func scopedGlobalCLIConfig() *config.Config {
 	cfg.Security.GlobalPolicies = []*config.Policy{
 		{
 			Name:   "scoped-global",
-			Match:  config.PolicyMatch{FromZone: "trust", ToZone: "untrust"},
+			Match:  config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}},
 			Action: config.PolicyDeny,
 		},
 		{
@@ -215,8 +215,8 @@ func scopedGlobalCLI(t *testing.T) *CLI {
 	if cfg == nil || len(cfg.Security.GlobalPolicies) != 2 {
 		t.Fatalf("expected 2 global policies, got %v", cfg)
 	}
-	if cfg.Security.GlobalPolicies[0].Match.FromZone != "trust" {
-		t.Fatalf("scoped-global FromZone = %q, want trust", cfg.Security.GlobalPolicies[0].Match.FromZone)
+	if got := cfg.Security.GlobalPolicies[0].Match.FromZones; len(got) != 1 || got[0] != "trust" {
+		t.Fatalf("scoped-global FromZones = %q, want [trust]", got)
 	}
 	return &CLI{store: store}
 }

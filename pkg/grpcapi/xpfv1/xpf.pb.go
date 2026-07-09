@@ -2439,8 +2439,18 @@ type PolicyRule struct {
 	// state cannot be queried, so the output is unchanged for existing clients.
 	SchedulerName string `protobuf:"bytes,19,opt,name=scheduler_name,json=schedulerName,proto3" json:"scheduler_name,omitempty"`
 	Inactive      bool   `protobuf:"varint,20,opt,name=inactive,proto3" json:"inactive,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// match_from_zones / match_to_zones carry the FULL scoped-global zone SET
+	// (#4626 M03). A Junos global policy scope is a zone LIST
+	// (`match from-zone [ trust dmz ]`); the singular match_from_zone /
+	// match_to_zone (fields 11/12) keep the first element for backward
+	// compatibility, while these plural fields carry every zone so an inventory
+	// consumer sees the complete scope. Additive; empty for an unscoped global
+	// and for ordinary zone-pair rules. A reader should prefer the plural field
+	// when non-empty and fall back to the singular otherwise.
+	MatchFromZones []string `protobuf:"bytes,21,rep,name=match_from_zones,json=matchFromZones,proto3" json:"match_from_zones,omitempty"`
+	MatchToZones   []string `protobuf:"bytes,22,rep,name=match_to_zones,json=matchToZones,proto3" json:"match_to_zones,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PolicyRule) Reset() {
@@ -2611,6 +2621,20 @@ func (x *PolicyRule) GetInactive() bool {
 		return x.Inactive
 	}
 	return false
+}
+
+func (x *PolicyRule) GetMatchFromZones() []string {
+	if x != nil {
+		return x.MatchFromZones
+	}
+	return nil
+}
+
+func (x *PolicyRule) GetMatchToZones() []string {
+	if x != nil {
+		return x.MatchToZones
+	}
+	return nil
 }
 
 type GetSessionsRequest struct {
@@ -8158,7 +8182,7 @@ const file_xpf_proto_rawDesc = "" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
-	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xd6\x05\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xa6\x06\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -8182,7 +8206,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\tpolicy_id\x18\x11 \x01(\rH\x00R\bpolicyId\x88\x01\x01\x12\x17\n" +
 	"\arule_id\x18\x12 \x01(\tR\x06ruleId\x12%\n" +
 	"\x0escheduler_name\x18\x13 \x01(\tR\rschedulerName\x12\x1a\n" +
-	"\binactive\x18\x14 \x01(\bR\binactiveB\f\n" +
+	"\binactive\x18\x14 \x01(\bR\binactive\x12(\n" +
+	"\x10match_from_zones\x18\x15 \x03(\tR\x0ematchFromZones\x12$\n" +
+	"\x0ematch_to_zones\x18\x16 \x03(\tR\fmatchToZonesB\f\n" +
 	"\n" +
 	"_policy_id\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +

@@ -293,11 +293,15 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				Applications: rule.Match.Applications,
 				Log:          rule.Log != nil,
 				Count:        rule.Count,
-				// #3286: surface the scoped-global zone context (#3148) so
-				// a global narrowed to a zone pair is not reported as
-				// all-zones. Empty for an unscoped global — no regression.
-				MatchFromZone: rule.Match.FromZone,
-				MatchToZone:   rule.Match.ToZone,
+				// #3286/#4626: surface the scoped-global zone SET (#3148) so
+				// a global narrowed to a zone list is not reported as
+				// all-zones. The singular fields keep the first zone for
+				// backward compatibility; the plural fields carry the full
+				// set. Empty for an unscoped global — no regression.
+				MatchFromZone:  config.ScopeSingular(rule.Match.FromZones),
+				MatchToZone:    config.ScopeSingular(rule.Match.ToZones),
+				MatchFromZones: rule.Match.FromZones,
+				MatchToZones:   rule.Match.ToZones,
 				// #3336: match-inversion flags + independent log modes + runtime
 				// identity. The global rule_id uses the "junos-global" sentinel
 				// zones, matching the snapshot builder so it joins to the same

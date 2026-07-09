@@ -205,17 +205,47 @@ func buildOneRuleSnapshot(
 		// #2508: per-policy RT_FLOW SYSLOG log selection.
 		LogSessionInit:  logSessionInit,
 		LogSessionClose: logSessionClose,
-		// #3148: a global policy keeps fromZone/toZone == "junos-global"
+		// #3148/#4626: a global policy keeps fromZone/toZone == "junos-global"
 		// (preserving global-tier classification + ordering) and carries its
-		// optional zone context out-of-band in these fields. For a zone-pair
-		// policy pol.Match.FromZone/ToZone are empty, so this is inert.
-		MatchFromZone: pol.Match.FromZone,
-		MatchToZone:   pol.Match.ToZone,
+		// optional zone SCOPE out-of-band in these fields. The singular fields
+		// carry the first zone for backward compatibility with an old helper
+		// during a rolling upgrade; the plural fields carry the full set. For a
+		// zone-pair policy pol.Match.FromZones/ToZones are empty, so this is
+		// inert.
+		MatchFromZone:  config.ScopeSingular(pol.Match.FromZones),
+		MatchToZone:    config.ScopeSingular(pol.Match.ToZones),
+		MatchFromZones: pol.Match.FromZones,
+		MatchToZones:   pol.Match.ToZones,
 		// #3376: build-time-only offending-token detail (not serialized).
 		rejectedSourceAddresses: rejectedSrc,
 		rejectedDestAddresses:   rejectedDst,
 		rejectedApplications:    rejectedApps,
 	}
+}
+
+// effectiveMatchFromZones returns the FULL scoped-global from-zone SET carried
+// by a snapshot (#4626 M03), preferring the plural MatchFromZones field and
+// falling back to the singular MatchFromZone for an old-Go snapshot that omits
+// the plural (additive-wire safety). Empty for an unscoped / zone-pair rule.
+func (s *PolicyRuleSnapshot) effectiveMatchFromZones() []string {
+	if len(s.MatchFromZones) > 0 {
+		return s.MatchFromZones
+	}
+	if s.MatchFromZone != "" {
+		return []string{s.MatchFromZone}
+	}
+	return nil
+}
+
+// effectiveMatchToZones is the to-side of effectiveMatchFromZones (#4626 M03).
+func (s *PolicyRuleSnapshot) effectiveMatchToZones() []string {
+	if len(s.MatchToZones) > 0 {
+		return s.MatchToZones
+	}
+	if s.MatchToZone != "" {
+		return []string{s.MatchToZone}
+	}
+	return nil
 }
 
 func policyActionString(action config.PolicyAction) string {

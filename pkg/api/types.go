@@ -210,6 +210,13 @@ type PolicyRule struct {
 	// and for ordinary zone-pair rules.
 	MatchFromZone string `json:"match_from_zone,omitempty"`
 	MatchToZone   string `json:"match_to_zone,omitempty"`
+	// MatchFromZones / MatchToZones carry the FULL scoped-global zone SET
+	// (#4626 M03). A Junos global policy scope is a zone LIST; the singular
+	// fields above keep the first element for backward compatibility, while
+	// these plural fields carry every zone so an audit sees the complete
+	// scope. Empty (omitted) for an unscoped global and for zone-pair rules.
+	MatchFromZones []string `json:"match_from_zones,omitempty"`
+	MatchToZones   []string `json:"match_to_zones,omitempty"`
 	// SourceAddressExcluded / DestinationAddressExcluded carry the match
 	// inversion (#3336): the rule matches every address EXCEPT those in
 	// src_addresses / dst_addresses (Junos `source-address-excluded` /

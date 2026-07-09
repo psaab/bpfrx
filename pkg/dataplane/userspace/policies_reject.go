@@ -166,16 +166,14 @@ func PolicyContentRejectionReasons(cfg *config.Config, feedOverlay map[string][]
 // pairs / global scope are valid and common.
 func policyRejectionScope(rule *PolicyRuleSnapshot) string {
 	if rule.FromZone == "junos-global" && rule.ToZone == "junos-global" {
-		if rule.MatchFromZone != "" || rule.MatchToZone != "" {
-			from := rule.MatchFromZone
-			if from == "" {
-				from = "any"
-			}
-			to := rule.MatchToZone
-			if to == "" {
-				to = "any"
-			}
-			return fmt.Sprintf("global(%s->%s)/%s", from, to, rule.Name)
+		// #4626 M03: render the FULL scoped-global zone SET (from the plural
+		// wire fields, singular fallback). ZoneScopeSetLabel maps an empty side
+		// to "any", preserving the pre-#4626 "" -> "any" fallback.
+		from := rule.effectiveMatchFromZones()
+		to := rule.effectiveMatchToZones()
+		if len(from) > 0 || len(to) > 0 {
+			return fmt.Sprintf("global(%s->%s)/%s",
+				config.ZoneScopeSetLabel(from), config.ZoneScopeSetLabel(to), rule.Name)
 		}
 		return fmt.Sprintf("global/%s", rule.Name)
 	}

@@ -51,11 +51,11 @@ func TestGlobalPolicyZoneContextCompiles(t *testing.T) {
 		t.Fatalf("GlobalPolicies = %d, want 1", len(cfg.Security.GlobalPolicies))
 	}
 	pol := cfg.Security.GlobalPolicies[0]
-	if pol.Match.FromZone != "trust" {
-		t.Errorf("global policy Match.FromZone = %q, want %q", pol.Match.FromZone, "trust")
+	if got := pol.Match.FromZones; len(got) != 1 || got[0] != "trust" {
+		t.Errorf("global policy Match.FromZones = %q, want [trust]", got)
 	}
-	if pol.Match.ToZone != "untrust" {
-		t.Errorf("global policy Match.ToZone = %q, want %q", pol.Match.ToZone, "untrust")
+	if got := pol.Match.ToZones; len(got) != 1 || got[0] != "untrust" {
+		t.Errorf("global policy Match.ToZones = %q, want [untrust]", got)
 	}
 }
 
@@ -76,9 +76,9 @@ func TestGlobalPolicyNoZoneContextStaysAllZones(t *testing.T) {
 		t.Fatalf("GlobalPolicies = %d, want 1", len(cfg.Security.GlobalPolicies))
 	}
 	pol := cfg.Security.GlobalPolicies[0]
-	if pol.Match.FromZone != "" || pol.Match.ToZone != "" {
-		t.Errorf("global policy with no zone context: FromZone=%q ToZone=%q, want both empty",
-			pol.Match.FromZone, pol.Match.ToZone)
+	if len(pol.Match.FromZones) != 0 || len(pol.Match.ToZones) != 0 {
+		t.Errorf("global policy with no zone context: FromZones=%q ToZones=%q, want both empty",
+			pol.Match.FromZones, pol.Match.ToZones)
 	}
 }
 
@@ -129,7 +129,7 @@ func TestGlobalPolicyZoneContextStrictCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileConfig hard-failed on a global policy with explicit `match from-zone any`: %v", err)
 		}
-		if len(cfg.Security.GlobalPolicies) != 1 || cfg.Security.GlobalPolicies[0].Match.FromZone != "any" {
+		if got := cfg.Security.GlobalPolicies; len(got) != 1 || len(got[0].Match.FromZones) != 1 || got[0].Match.FromZones[0] != "any" {
 			t.Fatalf("explicit `any` not preserved verbatim: %+v", cfg.Security.GlobalPolicies)
 		}
 	})
@@ -170,7 +170,7 @@ func TestGlobalPolicyZoneContextStrictCommit(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileConfig rejected a global policy match to-zone junos-host; want a clean commit (#3639): %v", err)
 		}
-		if len(cfg.Security.GlobalPolicies) != 1 || cfg.Security.GlobalPolicies[0].Match.ToZone != "junos-host" {
+		if got := cfg.Security.GlobalPolicies; len(got) != 1 || !IsHostToZoneScope(got[0].Match.ToZones) {
 			t.Fatalf("global match to-zone junos-host not preserved: %+v", cfg.Security.GlobalPolicies)
 		}
 	})
