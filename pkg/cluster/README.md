@@ -230,6 +230,20 @@ peer liveness (`lastSeen`) or drive election.
   Enforcement therefore engages only once BOTH nodes carry the key and
   are observed signing — a mixed-version / mid-key-rollout cluster never
   splits.
+- **Operator surface (#4484 L-9).** `FormatControlPlaneStatistics`
+  (`show chassis cluster control-plane-statistics`) renders an
+  `Authentication:` line derived from `controlLinkAuthStatus()`, so an
+  operator can tell whether the control link's HMAC auth is actually
+  **engaged** (`engaged (peer authenticated; unauthenticated frames
+  rejected)` — both nodes keyed and signing) or running in
+  **dual-accept** grace (`dual-accept (no control-link key configured)`
+  or `dual-accept (key configured; peer not yet authenticated)`). It is
+  computed from the SAME two facts the auth gates use —
+  `ControlLinkAuthKey` presence + `HeartbeatPeerAuthSeen` — so the line
+  tracks the real enforcement decision, and it inspects only `len(key)`
+  so the secret is never rendered. Before this line, a control link
+  silently degraded to dual-accept (e.g. a peer that stopped signing)
+  was invisible.
 - **Secret hygiene.** The key is `config.Secret`, redacted on every
   JSON/YAML/`String()` path and masked as `##SECRET-DATA##` in raw-AST
   renders (`authentication-key` is already in `ast_redact.go`'s secret

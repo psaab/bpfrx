@@ -415,7 +415,37 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 	fmt.Fprintf(&b, "    Heartbeat packets received: %d\n", hbStats.Received)
 	fmt.Fprintf(&b, "    Heartbeat send errors:      %d\n", hbStats.SendErrors)
 	fmt.Fprintf(&b, "    Heartbeat receive errors:   %d\n", hbStats.RecvErrors)
+	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
 	return b.String()
+}
+
+// controlLinkAuthStatus summarizes the #4107 control-link authentication
+// posture for the operator (#4484 L-9). Before this surface existed, nothing
+// revealed whether the control link's HMAC authentication was actually
+// ENGAGED (frames are verified and an unauthenticated peer is rejected) or had
+// silently degraded to DUAL-ACCEPT (an unauthenticated peer is still
+// accepted) — the rolling-upgrade grace #4107 deliberately keeps open. The
+// posture is derived from the SAME two facts syncAuthDecision /
+// heartbeatAuthDecision gate on — the local key (ControlLinkAuthKey) and the
+// sticky peer-authenticated flag (HeartbeatPeerAuthSeen) — so this string
+// tracks the real enforcement decision rather than a separate estimate. It
+// only inspects len(key) and never renders the secret.
+func (m *Manager) controlLinkAuthStatus() string {
+	keyConfigured := len(m.ControlLinkAuthKey()) > 0
+	switch {
+	case !keyConfigured:
+		// No local key: this node cannot verify a peer and may be the
+		// not-yet-keyed side of a rolling upgrade — dual-accept grace.
+		return "dual-accept (no control-link key configured)"
+	case m.HeartbeatPeerAuthSeen():
+		// Both nodes are known-keyed and the peer has proven it: an
+		// unauthenticated frame is now rejected as a downgrade attack.
+		return "engaged (peer authenticated; unauthenticated frames rejected)"
+	default:
+		// Local key set but the peer has not authenticated yet (peer still
+		// upgrading / not signing): grace is still open.
+		return "dual-accept (key configured; peer not yet authenticated)"
+	}
 }
 
 // FormatDataPlaneStatistics returns data-plane (session sync) statistics.

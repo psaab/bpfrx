@@ -1,3 +1,22 @@
+## 2026-07-09 — #4484 L-9: control-link auth engaged/dual-accept show surface
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4484 L-9 — no operator surface revealed whether the #4107
+  control-link HMAC authentication was ENGAGED (enforced) or silently
+  degraded to DUAL-ACCEPT (rolling-upgrade grace). Added
+  `controlLinkAuthStatus()` and wired an `Authentication:` line into
+  `FormatControlPlaneStatistics()` (`show chassis cluster
+  control-plane-statistics`). The tri-state is derived from the SAME two
+  facts the auth gates use — `ControlLinkAuthKey` presence +
+  `HeartbeatPeerAuthSeen` — so it tracks the real enforcement decision:
+  no key → dual-accept; key + peer-auth-seen → engaged; key + peer not yet
+  authenticated → dual-accept grace. Inspects only len(key); never renders
+  the secret. No new gRPC RPC / cmdtree command — the command already
+  exists. Added `controllink_auth_status_4484_test.go` (3-state matrix +
+  key-never-leaked + FormatControlPlaneStatistics-includes-Authentication).
+  RED-on-revert verified (removing the line fails the render test).
+  **File(s)**: pkg/cluster/status.go,
+  pkg/cluster/controllink_auth_status_4484_test.go, pkg/cluster/README.md
 ## 2026-07-09 — #4484 L-6: frr.conf 0640 + fresh-create root:frr ownership
 
 - **Timestamp**: 2026-07-09
