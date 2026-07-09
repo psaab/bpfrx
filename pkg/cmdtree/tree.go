@@ -219,6 +219,7 @@ var OperationalTree = map[string]*Node{
 			"client-identifier": {Desc: "Show DHCPv6 DUID(s)"},
 		}},
 		"firewall": {Desc: "Show firewall filter configuration", Children: map[string]*Node{
+			"effective": {Desc: "Show effective (compiled) firewall filter the dataplane receives"},
 			"filter": {Desc: "Show specific filter by name", DynamicFn: func(cfg *config.Config) []string {
 				if cfg == nil {
 					return nil

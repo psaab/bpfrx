@@ -43400,3 +43400,21 @@ top.
   go build clean; go test ./pkg/ddns green; go test -race ./pkg/ddns green;
   full Go suite green.
 - **File(s)**: pkg/ddns/surface_a_provider_transition_4422_test.go, _Log.md
+
+- **Timestamp**: 2026-07-09
+- **Action**: #4422 slice — add `show firewall [filter <name>] effective
+  [family <f>]` CLI surface rendering the compiled FirewallFilterSnapshot the
+  userspace dataplane actually receives (prefix-list resolution, address/port
+  except folding, DSCP code-point resolution, tcp-flags mask lowering,
+  fall-through, fail-closed markers), distinct from the raw
+  `show firewall filter` typed-config view. VERIFY-FIRST: raw view existed
+  (cli_show_security_filters.go) but no surface exposed the effective/compiled
+  snapshot — genuine observability gap. Exported
+  dpuserspace.BuildFirewallFilterSnapshots (thin wrapper over the existing
+  builder); added cmdtree `effective` node; behavior-pinning tests
+  (prefix-list resolved vs raw reference, multi-value survival, DSCP ef->46,
+  fall-through). go build + full Go suite green (53 ok / 0 fail).
+- **File(s)**: pkg/dataplane/userspace/filters.go, pkg/cli/cli_show.go,
+  pkg/cli/cli_show_security_filters.go,
+  pkg/cli/cli_show_effective_filter_4422_test.go, pkg/cmdtree/tree.go,
+  docs/junos-cli-reference.md, _Log.md

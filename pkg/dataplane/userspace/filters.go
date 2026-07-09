@@ -11,6 +11,19 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// BuildFirewallFilterSnapshots returns the effective (compiled) firewall-filter
+// snapshots the userspace dataplane actually receives for cfg — the same value
+// buildSnapshot threads into ConfigSnapshot.Filters. It is exported so the
+// `show firewall [filter <name>] effective` CLI surface (#4422) can render
+// exactly what the matcher enforces: post prefix-list resolution, address/port
+// `except` folding (positive-wins on a mixed term), DSCP code-point resolution,
+// TCP-flags mask lowering, fall-through (NextTerm) computation, flex-match
+// lowering, and fail-closed (unrepresentable) marker assignment. It is
+// read-only and derives entirely from cfg — it touches no dataplane state.
+func BuildFirewallFilterSnapshots(cfg *config.Config) []FirewallFilterSnapshot {
+	return buildFirewallFilterSnapshots(cfg)
+}
+
 func buildFirewallFilterSnapshots(cfg *config.Config) []FirewallFilterSnapshot {
 	if cfg == nil {
 		return nil
