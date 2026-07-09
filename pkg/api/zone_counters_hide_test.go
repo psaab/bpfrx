@@ -104,6 +104,13 @@ func TestCollectDoesNotFalseAlertOnZoneReads(t *testing.T) {
 	origLo0 := readLo0Counters
 	readLo0Counters = func() ([]xnft.Lo0Count, error) { return nil, nil }
 	defer func() { readLo0Counters = origLo0 }()
+	// #4759: neutralize the pre-gate kernel host-inbound ICMP-error / ND accept
+	// counter read too, for the same reason — a sandbox without live nft/netlink
+	// would return a read error and bump counterReadErrors, masking the per-zone
+	// false-alert this test isolates.
+	origAccept := readHostInboundAcceptCounters
+	readHostInboundAcceptCounters = func() ([]xnft.HostInboundAcceptCount, error) { return nil, nil }
+	defer func() { readHostInboundAcceptCounters = origAccept }()
 
 	store := newDescriptorCoverageStore(t)
 	srv := &Server{store: store, gc: conntrack.NewGC(nil, time.Minute), startTime: time.Now()}

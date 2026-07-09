@@ -1,3 +1,35 @@
+## 2026-07-09 — #4759 observability: per-type ICMP/ND host-inbound accept counters
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4759 residual from #4422 — the GLOBAL ICMP-error / ND accept
+  rules in the kernel `inet xpf_hostinbound` chain (daemon_nft.go) were
+  UNCOUNTED, so no per-type visibility into how many ICMP-error/ND packets the
+  host-inbound path admits. BEHAVIOR-PRESERVING counter-only add: split the
+  single `icmpv6 type { 1,2,3,4,133..137 } accept` into error (1-4) + ND
+  (133-137), and attached a named nft counter to each accept rule plus the
+  ICMPv4 error rule (`counter name "<n>" accept` counts then accepts —
+  identical terminal verdict; the split type sets are disjoint and their union
+  is the exact pre-#4759 accepted set, so no packet's admission changes). Three
+  fixed counters `xpfhia_icmp6_nd` / `xpfhia_icmp6_error` / `xpfhia_icmp4_error`,
+  declared unconditionally (accept rules are always present). Added
+  pkg/nftables/host_inbound_accept_counters.go (ReadHostInboundAcceptCounters +
+  name encode/parse, distinct `xpfhia_` prefix so it never cross-parses the
+  `xpfhi_` deny counters sharing the same table) and the Prometheus metric
+  `xpf_host_inbound_icmp_nd_accept_total{type}` (descriptor + Describe() +
+  Collect() before the dataplane gate, mirroring collectHostInboundKernelDenies
+  / collectLo0Counters). AGGREGATE across zones (global rules) per the #4759
+  Low-severity caveat. Tests: updated the ruleset-string assertions (RED before
+  the test update — verified), reader round-trip/nft-safe/foreign-reject +
+  cross-prefix-reject, metric emit-before-gate + read-error-omits-series,
+  neutralized the new pre-gate reader in the zone-false-alert test. go build +
+  full Go suite green (0 fail).
+- **File(s)**: pkg/nftables/host_inbound_accept_counters.go,
+  pkg/nftables/host_inbound_accept_counters_test.go, pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_nft_test.go, pkg/api/metrics.go,
+  pkg/api/metrics_counters.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_host_inbound_accept_4759_test.go,
+  pkg/api/zone_counters_hide_test.go, docs/feature-coverage.md, _Log.md
+
 ## 2026-07-09 — #4422 observability: lo0 counter + PBR build-health metrics
 
 - **Timestamp**: 2026-07-09

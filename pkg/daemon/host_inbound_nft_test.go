@@ -193,17 +193,39 @@ func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
 	if !strings.Contains(payload, espAH) {
 		t.Errorf("payload missing raw ESP/AH exemption %q\n---\n%s", espAH, payload)
 	}
-	// icmpv6 error/PMTUD types 1-4 + ND 133-137 must be in the accepted set.
-	if !strings.Contains(payload, "icmpv6 type { 1, 2, 3, 4, 133, 134, 135, 136, 137 } accept") {
-		t.Errorf("payload missing icmpv6 error/PMTUD (1-4) + ND in the global accept:\n%s", payload)
+	// #4759: the single ICMPv6 accept was SPLIT into error (1-4) and ND (133-137)
+	// so each type-class counts separately, and each accept now carries a named
+	// nft counter. The split is verdict-preserving — the union {1,2,3,4} ∪
+	// {133,134,135,136,137} is the exact pre-#4759 accepted set, and `counter name
+	// "<n>" accept` counts then accepts (identical terminal verdict to a bare
+	// accept). Assert BOTH split rules carry their counter AND still end in
+	// `accept` (fail-on-revert: dropping a class, dropping the counter, or
+	// changing the verdict turns this RED).
+	if !strings.Contains(payload, "icmpv6 type { 1, 2, 3, 4 } counter name \"xpfhia_icmp6_error\" accept") {
+		t.Errorf("payload missing icmpv6 error/PMTUD (1-4) counted accept:\n%s", payload)
+	}
+	if !strings.Contains(payload, "icmpv6 type { 133, 134, 135, 136, 137 } counter name \"xpfhia_icmp6_nd\" accept") {
+		t.Errorf("payload missing icmpv6 ND (133-137) counted accept:\n%s", payload)
 	}
 	// #3171: the ICMPv4 error/PMTUD set must agree with the userspace
 	// host-inbound exemption (is_icmp_host_inbound_error) so the kernel chain and
 	// the XSK LocalDelivery classifier admit the same ICMP errors on a ping-less
 	// zone. Fail-on-revert: narrowing this back to bare destination-unreachable
-	// turns this RED.
-	if !strings.Contains(payload, "icmp type { destination-unreachable, time-exceeded, parameter-problem } accept") {
-		t.Errorf("payload missing icmpv4 error/PMTUD (dest-unreachable/time-exceeded/parameter-problem) accept:\n%s", payload)
+	// (or dropping the counter / changing the verdict) turns this RED.
+	if !strings.Contains(payload, "icmp type { destination-unreachable, time-exceeded, parameter-problem } counter name \"xpfhia_icmp4_error\" accept") {
+		t.Errorf("payload missing icmpv4 error/PMTUD (dest-unreachable/time-exceeded/parameter-problem) counted accept:\n%s", payload)
+	}
+	// #4759: every accept counter object referenced above must also be DECLARED in
+	// the table body (nft rejects a reference to an undeclared counter). The three
+	// declarations are UNCONDITIONAL (the accept rules are always present).
+	for _, decl := range []string{
+		"counter xpfhia_icmp6_nd {",
+		"counter xpfhia_icmp6_error {",
+		"counter xpfhia_icmp4_error {",
+	} {
+		if !strings.Contains(payload, decl) {
+			t.Errorf("payload missing accept-counter declaration %q:\n%s", decl, payload)
+		}
 	}
 
 	// The ESP/AH exemption MUST precede every per-zone scoped drop, otherwise a

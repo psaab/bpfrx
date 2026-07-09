@@ -58,6 +58,7 @@ type xpfCollector struct {
 	nat64XlateTotal             *prometheus.Desc
 	hostInboundDeny             *prometheus.Desc
 	hostInboundKernelDenies     *prometheus.Desc
+	hostInboundICMPNDAccept     *prometheus.Desc
 	hostInboundAddresslessZones *prometheus.Desc
 	hostInboundAddresslessIface *prometheus.Desc
 	hostInboundAmbiguousAddrs   *prometheus.Desc
@@ -598,6 +599,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.nat64XlateTotal
 	ch <- c.hostInboundDeny
 	ch <- c.hostInboundKernelDenies
+	ch <- c.hostInboundICMPNDAccept
 	ch <- c.hostInboundAddresslessZones
 	ch <- c.hostInboundAddresslessIface
 	ch <- c.hostInboundAmbiguousAddrs
@@ -970,6 +972,14 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// exists to close). ReadHostInboundDenyCounters reads nft via netlink and has
 	// no dataplane dependency.
 	c.collectHostInboundKernelDenies(ch)
+
+	// #4759: the GLOBAL ICMP-error / ND ACCEPT counters on the same kernel
+	// `inet xpf_hostinbound` chain. These control-message accepts are admitted
+	// regardless of any per-zone host-inbound service set and are installed
+	// INDEPENDENT of dataplane load, so — like the deny counters above — emit them
+	// BEFORE the dataplane gate so the accept series stays visible in a
+	// config-only / degraded boot. Aggregate (global rules, not per-zone).
+	c.collectHostInboundICMPNDAccepts(ch)
 
 	// #3698: configured host-inbound-enforcing zones currently in the transient
 	// fail-open admit window (a non-lifeline interface but no resolvable address

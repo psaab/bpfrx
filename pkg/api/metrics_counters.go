@@ -23,6 +23,14 @@ var readHostInboundDenyCounters = xnft.ReadHostInboundDenyCounters
 // (#4422), mirroring readHostInboundDenyCounters.
 var readLo0Counters = xnft.ReadLo0Counters
 
+// readHostInboundAcceptCounters is the kernel nft host-inbound ICMP-error / ND
+// ACCEPT-counter source (#4759), a package var so the collector's behavior is
+// unit-testable without a live kernel/netlink, mirroring
+// readHostInboundDenyCounters (the accept counters live in the same
+// `inet xpf_hostinbound` table as the deny counters, separated by object-name
+// prefix).
+var readHostInboundAcceptCounters = xnft.ReadHostInboundAcceptCounters
+
 // collectHostInboundKernelDenies scrapes the per-zone/family named DROP counters
 // from the kernel nftables host-inbound chain (#3361) and emits them as
 // xpf_host_inbound_kernel_denies_total. This is the PRIMARY host-inbound
@@ -78,6 +86,37 @@ func (c *xpfCollector) collectLo0Counters(ch chan<- prometheus.Metric) {
 	for _, ctr := range counts {
 		ch <- prometheus.MustNewConstMetric(c.lo0CounterHits,
 			prometheus.CounterValue, float64(ctr.Packets), ctr.Counter)
+	}
+}
+
+// collectHostInboundICMPNDAccepts scrapes the GLOBAL ICMP-error / ND accept
+// counters from the kernel nftables host-inbound chain (`inet xpf_hostinbound`,
+// #4759) and emits them as xpf_host_inbound_icmp_nd_accept_total, labeled by
+// type-class (icmp6_nd, icmp6_error, icmp4_error). These control-message accepts
+// are admitted regardless of any per-zone host-inbound service set (so
+// enforcement never black-holes core L3 operation); before #4759 they were
+// UNCOUNTED, giving no per-type visibility into how many ICMP-error / ND packets
+// the host-inbound path admits. The counts are AGGREGATE (the rules are global,
+// not per-zone) — a per-zone breakdown would need per-zone rule splitting.
+//
+// The nft chain is installed by the daemon INDEPENDENT of dataplane load state
+// and keeps counting in a config-only / degraded boot, so Collect calls this
+// BEFORE the dataplane gate, matching collectHostInboundKernelDenies.
+// ReadHostInboundAcceptCounters reads nft via netlink and has no dataplane
+// dependency.
+//
+// On a read failure the series is SKIPPED (no misleading 0) and
+// xpf_counter_read_errors_total is bumped, matching collectHostInboundKernelDenies
+// and the #3345 missing-sample contract.
+func (c *xpfCollector) collectHostInboundICMPNDAccepts(ch chan<- prometheus.Metric) {
+	counts, err := readHostInboundAcceptCounters()
+	if err != nil {
+		c.counterReadErrors.Add(1)
+		return
+	}
+	for _, ctr := range counts {
+		ch <- prometheus.MustNewConstMetric(c.hostInboundICMPNDAccept,
+			prometheus.CounterValue, float64(ctr.Packets), ctr.Type)
 	}
 }
 

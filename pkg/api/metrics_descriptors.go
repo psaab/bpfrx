@@ -111,6 +111,27 @@ func newCollector(srv *Server) *xpfCollector {
 				"xpf_host_inbound_denies_total path).",
 			[]string{"zone", "family"}, nil,
 		),
+		// #4759: per-type-class hit counters for the GLOBAL ICMP-error / ND accept
+		// rules on the same kernel `inet xpf_hostinbound` chain. Those rules admit
+		// ICMPv6 Neighbor Discovery (types 133-137), ICMPv6 error/PMTUD (types
+		// 1-4), and ICMPv4 error/PMTUD (destination-unreachable, time-exceeded,
+		// parameter-problem) regardless of any per-zone host-inbound service set,
+		// so core L3 operation is never black-holed; before #4759 those accepts
+		// were UNCOUNTED. The counts are AGGREGATE — the accept rules are GLOBAL,
+		// not per-zone, so there is no per-zone `type` breakdown (a per-zone split
+		// would need per-zone rule duplication, the #4759 Low-severity caveat).
+		// The counter resets when the daemon rebuilds the table (every commit /
+		// DHCP address change); Prometheus rate() handles the reset. On a read
+		// failure the series is skipped (no misleading 0) and
+		// xpf_counter_read_errors_total is bumped.
+		hostInboundICMPNDAccept: prometheus.NewDesc(
+			"xpf_host_inbound_icmp_nd_accept_total",
+			"Total ICMP-error / ND control-message accepts by the kernel nftables "+
+				"host-inbound chain, per type-class (icmp6_nd, icmp6_error, "+
+				"icmp4_error). Aggregate across all zones (the accept rules are "+
+				"global, not per-zone).",
+			[]string{"type"}, nil,
+		),
 		// #3698: 1 while a configured host-inbound-enforcing zone is in the
 		// transient fail-open admit window — it has a non-lifeline interface but
 		// no resolvable address yet (DHCP WAN before first lease, backup node
