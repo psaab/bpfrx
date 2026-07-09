@@ -43941,3 +43941,7 @@ top.
   **File(s)**: pkg/config/compiler.go, pkg/config/compiler_dispatch.go, pkg/config/compiler_firewall.go, pkg/config/compiler_class_of_service.go, pkg/config/compiler_validate_strict_filter.go, pkg/config/compiler_uniformgates.go, pkg/config/lenient_fw_cos_4953_test.go, pkg/config/README.md
   **Action**: #4884(C) devicemap enumerates non-PCI physical NICs (USB/platform/SoC) so key mac entries bind; classifyNetdev seam + doc
   **File(s)**: pkg/devicemap/devicemap.go, pkg/devicemap/devicemap_nonpci_4884_test.go, docs/bare-metal-device-map.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4956 propagate device-map rename/reload failures from enumerateAndRenameMapped (accumulate phase-2/3 rename + phase-4 reload errors, return errors.Join instead of unconditional nil) so the #4182 retry marker is preserved; added renameInterfaceFn/networkctlReloadFn seams for unit testing
+  **File(s)**: pkg/daemon/device_map.go, pkg/daemon/device_map_rename_err_4956_test.go

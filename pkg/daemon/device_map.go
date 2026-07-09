@@ -10,6 +10,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +20,15 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/devicemap"
 	"github.com/vishvananda/netlink"
+)
+
+// renameInterfaceFn / networkctlReloadFn are injectable seams for the
+// device-map rename orchestration so the rename/reload error-propagation path
+// (#4956) is unit-testable without a live netlink stack. Production leaves them
+// pointing at the real link-rename + networkctl-reload helpers.
+var (
+	renameInterfaceFn  = renameInterface
+	networkctlReloadFn = networkctlReload
 )
 
 // The pure identity resolver, present-NIC model, and host enumeration live in
@@ -129,14 +139,28 @@ func deviceMapOriginalNameFor(currentNIC, logical string) string {
 // leaf). Protected names are treated as implicitly desired: their .link is
 // NOT scrubbed (so the management NIC keeps its managed name across reboots
 // even when the operator left it out of the device-map — AGY r2 CRITICAL).
+//
+// #4956: a rename (phase 2), stranded-restore (phase 3), or `networkctl
+// reload` (phase 4) failure used to only slog.Warn and then `return nil`
+// unconditionally — laundering the failure to success. The caller chain
+// (applyStartupNamingForConfig → maybeReapplyConfigArrivalNaming) consumes the
+// one-shot #4182 retry marker (emptyHANamingPending) on a nil return, so a
+// mapped NIC that never got its logical name was reported as converged and the
+// single retry was burned, wiring the config onto nonexistent/wrong interface
+// names. Every phase now still runs best-effort (so partial progress + full
+// logging happen), but the accumulated error is RETURNED so the retry marker
+// is preserved and the boot/bootstrap sites surface it loudly.
 func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, protected map[string]bool) error {
 	if !dm.Active() {
 		return nil
 	}
-	nics, err := enumeratePresentNICs()
+	nics, err := enumeratePresentNICsFn()
 	if err != nil {
 		return fmt.Errorf("enumerate NICs: %w", err)
 	}
+	// renameErrs accumulates every phase-2/3 rename and phase-4 reload failure
+	// so the function fails (not launders) while still completing every phase.
+	var renameErrs []error
 	rethMembers := rethMembersFromConfig(cfg)
 	bindings := resolveDeviceMap(dm.Entries, nics, rethMembers)
 
@@ -184,7 +208,7 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		currentNames[i] = nics[i].Name
 	}
 	strandedTmp, changed := breakNameCollisions("device-map", currentNames, desiredNames,
-		desiredByCurrent, originalByCurrent, renameInterface)
+		desiredByCurrent, originalByCurrent, renameInterfaceFn)
 	// A temp-stranded UNMAPPED NIC (not a desired source) is carried into phase
 	// 3 keyed by its temp name; the presentNIC keeps its ORIGINAL (pre-temp)
 	// name for the predictable-name lookup, matching the pre-#4178 behavior.
@@ -214,8 +238,10 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		if writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries) {
 			changed = true
 		}
-		if err := renameInterface(current, final); err != nil {
+		if err := renameInterfaceFn(current, final); err != nil {
 			slog.Warn("device-map: rename failed", "from", current, "to", final, "err", err)
+			renameErrs = append(renameErrs,
+				fmt.Errorf("rename %s -> %s: %w", current, final, err))
 		} else {
 			slog.Info("device-map: renamed interface", "from", current, "to", final)
 			changed = true
@@ -233,9 +259,11 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 				"temp", tmp, "pci", nic.PCIAddr)
 			continue
 		}
-		if err := renameInterface(tmp, predictable); err != nil {
+		if err := renameInterfaceFn(tmp, predictable); err != nil {
 			slog.Warn("device-map: restore stranded NIC to predictable name failed",
 				"from", tmp, "to", predictable, "err", err)
+			renameErrs = append(renameErrs,
+				fmt.Errorf("restore stranded %s -> %s: %w", tmp, predictable, err))
 		} else {
 			slog.Info("device-map: restored unmapped NIC to predictable name",
 				"from", tmp, "to", predictable)
@@ -272,12 +300,20 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 	}
 
 	if changed {
-		if err := networkctlReload(); err != nil {
+		if err := networkctlReloadFn(); err != nil {
 			slog.Warn("device-map: networkctl reload failed", "err", err)
+			renameErrs = append(renameErrs, fmt.Errorf("networkctl reload: %w", err))
 		}
 		slog.Info("device-map: interface naming updated")
 	} else {
 		slog.Info("device-map: interface naming unchanged")
+	}
+	// #4956: surface any phase-2/3 rename or phase-4 reload failure so the
+	// caller's retry marker (emptyHANamingPending) is NOT consumed on an
+	// unconverged rename and the reconcile does not proceed on mis-named NICs.
+	if len(renameErrs) > 0 {
+		return fmt.Errorf("device-map: %d interface rename/reload step(s) failed: %w",
+			len(renameErrs), errors.Join(renameErrs...))
 	}
 	return nil
 }
