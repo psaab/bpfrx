@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -9,7 +10,38 @@ import (
 	fairnesscontract "github.com/psaab/xpf/pkg/fairness"
 )
 
-func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
+// numericCodePointRangeError marks a numeric DSCP/PCP code-point token that
+// fell outside its valid domain (DSCP 0..63, PCP 0..7). It is a distinct error
+// type so the tolerant load / peer-sync path (opts.lenientCoSNumericCodePoint)
+// can downgrade JUST this class of finding to a warning while every other
+// class-of-service compile error stays a hard reject.
+//
+// #2447 made an out-of-range numeric code-point a hard commit reject (before
+// that it was silently dropped at the Go layer and the dataplane masked it —
+// dscp&0x3f / pcp.min(7) — onto a DIFFERENT traffic class). #4953 keeps that
+// reject STRICT at commit / commit-check but LENIENT on load / peer-sync so a
+// config an older binary persisted (or a peer authored) still BOOTS (#1960
+// no-brick): the leniently-loaded entry is dropped, exactly the pre-#2447
+// fail-safe, and the operator's next strict commit rejects it loudly.
+type numericCodePointRangeError struct{ msg string }
+
+func (e *numericCodePointRangeError) Error() string { return e.msg }
+
+// newCodePointRangeError builds a numericCodePointRangeError with a formatted,
+// operator-facing message (the message text is unchanged from the #2447 gate;
+// only the concrete error type is now distinguishable via errors.As).
+func newCodePointRangeError(format string, args ...any) error {
+	return &numericCodePointRangeError{msg: fmt.Sprintf(format, args...)}
+}
+
+// isNumericCodePointRangeError reports whether err (or anything it wraps) is a
+// numericCodePointRangeError — the tolerant-path downgrade predicate.
+func isNumericCodePointRangeError(err error) bool {
+	var e *numericCodePointRangeError
+	return errors.As(err, &e)
+}
+
+func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOpts, warnings *[]string) error {
 	if cos == nil {
 		return nil
 	}
@@ -147,6 +179,14 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					}
 					codePoints, err := collectCoSDSCPCodePoints(lpNode)
 					if err != nil {
+						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+							if warnings != nil {
+								*warnings = append(*warnings, fmt.Sprintf(
+									"class-of-service classifiers dscp %q (downgraded to warning on tolerant path): %v",
+									classifier.Name, err))
+							}
+							continue
+						}
 						return fmt.Errorf("class-of-service classifiers dscp %q: %w", classifier.Name, err)
 					}
 					if len(codePoints) == 0 {
@@ -183,6 +223,14 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					}
 					codePoints, err := collectCoS8021CodePoints(lpNode)
 					if err != nil {
+						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+							if warnings != nil {
+								*warnings = append(*warnings, fmt.Sprintf(
+									"class-of-service classifiers ieee-802.1 %q (downgraded to warning on tolerant path): %v",
+									classifier.Name, err))
+							}
+							continue
+						}
 						return fmt.Errorf("class-of-service classifiers ieee-802.1 %q: %w", classifier.Name, err)
 					}
 					if len(codePoints) == 0 {
@@ -235,6 +283,14 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					}
 					codePoint, ok, err := collectCoSDSCPRewriteCodePoint(lpNode)
 					if err != nil {
+						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+							if warnings != nil {
+								*warnings = append(*warnings, fmt.Sprintf(
+									"class-of-service rewrite-rules dscp %q (downgraded to warning on tolerant path): %v",
+									rewriteRule.Name, err))
+							}
+							continue
+						}
 						return fmt.Errorf("class-of-service rewrite-rules dscp %q: %w", rewriteRule.Name, err)
 					}
 					if !ok {
@@ -275,6 +331,14 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					}
 					codePoint, ok, err := collectCoS8021RewriteCodePoint(lpNode)
 					if err != nil {
+						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+							if warnings != nil {
+								*warnings = append(*warnings, fmt.Sprintf(
+									"class-of-service rewrite-rules ieee-802.1 %q (downgraded to warning on tolerant path): %v",
+									rewriteRule.Name, err))
+							}
+							continue
+						}
 						return fmt.Errorf("class-of-service rewrite-rules ieee-802.1 %q: %w", rewriteRule.Name, err)
 					}
 					if !ok {
@@ -1031,7 +1095,7 @@ func collectCoS8021CodePoints(node *Node) ([]uint8, error) {
 			return nil
 		}
 		if v < 0 || v > 7 {
-			return fmt.Errorf(
+			return newCodePointRangeError(
 				"class-of-service ieee-802.1 classifier code-point %d is out of range (must be 0..7)",
 				v)
 		}
@@ -1115,7 +1179,7 @@ func collectCoS8021RewriteCodePoint(node *Node) (uint8, bool, error) {
 			return 0, false, nil
 		}
 		if v < 0 || v > 7 {
-			return 0, false, fmt.Errorf(
+			return 0, false, newCodePointRangeError(
 				"class-of-service ieee-802.1 rewrite-rule code-point %d is out of range (must be 0..7)",
 				v)
 		}
@@ -1169,7 +1233,7 @@ func expandCoSCodePointToken(raw string) ([]uint8, error) {
 	}
 	if v, err := strconv.Atoi(raw); err == nil {
 		if v < 0 || v > 63 {
-			return nil, fmt.Errorf(
+			return nil, newCodePointRangeError(
 				"class-of-service dscp code-point %d is out of range (must be 0..63)",
 				v)
 		}

@@ -265,19 +265,21 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 						compileFilterThen(thenNode, term)
 					}
 
-					// #3076: reject a tcp-flags expression the dataplane cannot
-					// enforce (disjunction, a negated group, an unknown flag, or
-					// a self-contradictory required/forbidden pair) at commit.
-					// Without this gate such an expression committed cleanly and
-					// the constraint was silently dropped on the wire — the term
-					// matched regardless of flags (fail-open). Rejecting here is
-					// fail-closed: a dropped security constraint never silently
-					// passes.
-					if len(term.TCPFlags) > 0 {
-						if _, _, _, err := ParseTCPFlagsExpression(term.TCPFlags); err != nil {
-							return fmt.Errorf("firewall filter %q term %q: %w", filter.Name, term.Name, err)
-						}
-					}
+					// #3076: a tcp-flags expression the dataplane cannot enforce
+					// (disjunction, a negated group, an unknown flag, or a
+					// self-contradictory required/forbidden pair) is rejected —
+					// without a reject such an expression committed cleanly and
+					// the constraint was silently dropped on the wire (fail-open).
+					// #4953: the reject moved OUT of the section compiler and into
+					// the strict/tolerant gate validateFirewallTCPFlagsStrict
+					// (runUniformGates) so the commit / commit-check path still
+					// hard-rejects but the load / peer-sync path downgrades to a
+					// warning — an already-persisted or peer-synced config an
+					// older binary accepted still BOOTS (#1960 no-brick). The term
+					// keeps its raw (unparseable) TCPFlags, which the userspace
+					// snapshot builder detects and marks TCPFlagsUnparseable so the
+					// Rust filter compiler fails the term CLOSED (#3367) — the raw
+					// value IS the deny sentinel, never widening to match-all.
 
 					filter.Terms = append(filter.Terms, term)
 				}

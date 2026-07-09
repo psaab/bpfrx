@@ -1317,6 +1317,29 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #3076 / #4953: firewall-filter `from tcp-flags` enforceability gate.
+	// An expression the conjunctive dataplane matcher cannot represent
+	// (disjunction, negated group, unknown flag, dangling negation, or a
+	// required/forbidden contradiction) compiled cleanly before #3076 and the
+	// constraint was silently dropped on the wire (fail-open — the term
+	// matched every TCP segment). Strict on commit / commit-check (hard reject
+	// so the operator error is visible); lenient on load / peer-sync (warn so a
+	// config an older binary persisted, or a peer authored, before the reject
+	// existed still boots — #1960 no-brick). On the leniently-loaded boot the
+	// term keeps its raw TCPFlags and the userspace snapshot builder marks it
+	// TCPFlagsUnparseable, failing the term CLOSED (#3367) rather than widening
+	// it. This reject previously lived inline in compileFirewall, which the P4
+	// dispatch calls with no compileOpts — so it could not be mode-gated and an
+	// upgraded / peer-synced node blacked out or alarm-looped HA sync.
+	if err := validateFirewallTCPFlagsStrict(cfg); err != nil {
+		if opts.lenientFirewallTCPFlags {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter tcp-flags (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2506: firewall-filter `from source-prefix-list <name>` /
 	// `destination-prefix-list <name>` cross-reference. A term naming a
 	// prefix-list not defined under `policy-options prefix-list` compiled

@@ -61,15 +61,32 @@ Regression coverage: `pkg/config/parser_recursion_dos_hb164_test.go`,
   compilation (zones, policies, NAT IDs, etc.) happens later in
   `pkg/dataplane.Manager.Compile`.
   This stage also performs a few **fail-closed semantic checks** that the
-  `setSchema` typed-leaf gate cannot express. `compileFirewall` rejects a
-  firewall-filter `from tcp-flags` expression the conjunctive dataplane
-  matcher cannot enforce — disjunction (`|`), a negated group (`!(...)`),
-  an unknown flag, or a contradictory required/forbidden pair (#3076) —
-  via `ParseTCPFlagsExpression` (`tcp_flags.go`). Before this gate such an
+  `setSchema` typed-leaf gate cannot express. The firewall-filter
+  `from tcp-flags` enforceability check rejects an expression the
+  conjunctive dataplane matcher cannot represent — disjunction (`|`), a
+  negated group (`!(...)`), an unknown flag, a dangling negation, or a
+  contradictory required/forbidden pair (#3076/#4714) — via
+  `ParseTCPFlagsExpression` (`tcp_flags.go`). Before this gate such an
   expression committed cleanly and the constraint was silently dropped on
   the wire (the term matched regardless of flags — a fail-open hole); a
   representable expression such as `syn & !ack` is parsed into
   required-bits + forbidden-bits masks and carried to the dataplane.
+  **#4953:** this reject (and the class-of-service numeric DSCP/PCP
+  code-point range reject #2447) moved OUT of the section compilers
+  (`compileFirewall` / `compileClassOfService`, which the P4 dispatch
+  calls with no `compileOpts` so they cannot be mode-gated) and became
+  strict/tolerant gates: `validateFirewallTCPFlagsStrict`
+  (`compiler_validate_strict_filter.go`, run in `runUniformGates`) and the
+  `lenientCoSNumericCodePoint`-gated call sites in `compileClassOfService`.
+  Commit / commit-check stay strict; the tolerant `Store.Load` /
+  `Store.SyncApply` path (`lenientFirewallTCPFlags` /
+  `lenientCoSNumericCodePoint`) downgrades to a warning so a config an
+  older binary persisted — or a peer authored — before the reject existed
+  cannot blackout-boot a node or alarm-loop HA config sync (#1960
+  no-brick). The leniently-loaded tcp-flags term keeps its raw value,
+  which the userspace snapshot builder marks `TCPFlagsUnparseable` to fail
+  the term CLOSED (#3367) — a deny sentinel, never a match-all widening;
+  the out-of-range code-point entry is dropped (the pre-#2447 fail-safe).
 - `ValueType` — `value_type.go`. Classifies a typed leaf's value
   (`ValueRate`, `ValueByteSizeOrPercent`, `ValueEnumOf`, ...) and supplies
   the `?`-completion placeholder via `Placeholder()`. Lives here (not
