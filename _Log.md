@@ -27,6 +27,70 @@
   FAIL / 3 no-test.
   **File(s)**: pkg/api/routing.go, pkg/api/bgp_routes_stream_4708_test.go
 
+## 2026-07-09 — #4709: stream CLI show output to the pager instead of buffering
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4709 — `dispatchWithPager` redirected a `show` command's stdout
+  to an `os.Pipe`, drained the WHOLE pipe with `io.ReadAll` into one `[]byte`,
+  then `strings.Split` into a slice before paging. `show route` (full BGP
+  table) or `show security flow session` (up to 10M sessions) buffered GBs in
+  memory before printing a byte — OOM risk on a RAM-constrained firewall.
+  Scope was BOUNDED: the pipe seam already existed, so no `io.Writer` had to be
+  threaded through the command-dispatch interface. Replaced the read-all-then-
+  page consumer with a concurrent streaming pager: the pager goroutine reads the
+  pipe incrementally via a `lineSource` (bufio.Reader with one-line lookahead)
+  and paginates a screenful at a time while the command still runs; when it
+  pauses at `--More--` the pipe fills and the command blocks on write, so output
+  is produced lazily. At most one page (+1 lookahead line +the OS pipe buffer)
+  is held at once regardless of total output. `lineSource` reproduces the old
+  `strings.Split(out,"\n")` + trailing-empty-drop semantics exactly (only "\n"
+  is the delimiter, a trailing "\r" stays on the line). Scroll behavior (space =
+  page, Enter = one line then a page, q = quit) is preserved; on quit the pager
+  drains the rest of the pipe so the writer goroutine never deadlocks on a full
+  pipe. Non-TTY behavior unchanged (keys still read from os.Stdin). The sibling
+  `dispatchWithPipe` (`show ... | match/count/last`) has the same buffering but
+  is out of #4709 scope (count/last need the full stream). Validation: gofmt;
+  go build ./...; new streaming/completeness/anti-buffering/quit-drain/line-
+  semantics tests PASS; `go test -race ./pkg/cli` green; FULL Go suite green
+  (53 ok / 0 fail / 3 no-test-pkgs).
+  **File(s)**: pkg/cli/cli_dispatch.go,
+  pkg/cli/cli_dispatch_pager_stream_4709_test.go, _Log.md
+
+## 2026-07-09 — #4664: split event_stream/tests.rs into per-concern files
+
+- **Timestamp**: 2026-07-09
+- **Action**: Pure test-code motion. Split the 2313-line
+  userspace-dp/src/event_stream/tests.rs (52 tests) into a tests/ subdir
+  with per-concern sibling submodules loaded from tests/mod.rs: rt_flow
+  (13), replay_budget (13), control_frames (10), drain (9), backpressure
+  (7). Test fn/helper bodies moved byte-identical (extracted by an exact
+  line-range partition; verified missing-code-lines=0, only new lines are
+  the five `mod X;` decls + five `use super::*;`); no test logic changed.
+  The shared imports and the three cross-concern fixtures
+  (build_raw_ack_frame, test_dataplane_event, test_close_delta) live in
+  tests/mod.rs and reach each submodule via `use super::*`. Concern-local
+  helpers (replay_seq_frame, try_read_frame_header, fill_send_buffer,
+  telemetry_seq_frame, push_budgeted_replay_frame in drain.rs;
+  build_ctrl_header in control_frames.rs) travel with their tests. The
+  parent event_stream/mod.rs declaration changed from
+  `#[path = "tests.rs"] mod tests;` to plain `mod tests;` (resolving to
+  tests/mod.rs) — the sole production-file line touched, inside the
+  existing `#[cfg(test)]` gate. The stale file-header comment that
+  described the old `#[path]` layout was dropped (comment-only).
+  Validation: cargo build OK; `cargo test --release -- --test-threads=1`
+  FULL suite 3854 passed / 0 failed / 2 ignored — identical to the
+  pre-split pristine baseline; `cargo test --release event_stream` green;
+  event_stream::tests count 52 → 52. The one pre-existing
+  `unused variable: handle` warning (keeping_up_consumer test) is carried
+  over verbatim (present in the baseline too), no new warnings.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs (deleted),
+  userspace-dp/src/event_stream/tests/mod.rs,
+  userspace-dp/src/event_stream/tests/rt_flow.rs,
+  userspace-dp/src/event_stream/tests/replay_budget.rs,
+  userspace-dp/src/event_stream/tests/backpressure.rs,
+  userspace-dp/src/event_stream/tests/control_frames.rs,
+  userspace-dp/src/event_stream/tests/drain.rs, _Log.md
 ## 2026-07-09 — #4713: reject out-of-range BGP peer-as/local-as (no uint32 wrap)
 
 - **Timestamp**: 2026-07-09

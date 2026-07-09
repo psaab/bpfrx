@@ -1689,5 +1689,4 @@ fn release_replay_dataplane_event_queue_budget(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
