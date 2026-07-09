@@ -262,10 +262,17 @@ func TestRollbackHistoryDegradedOnWriteFailure(t *testing.T) {
 // TestLoadRollbackHistoryContinuesPastReadError pins #3441 L2:
 // loadRollbackHistory must break only on a genuinely-missing slot, not on a
 // transient/permission read error — otherwise a bad intermediate slot drops
-// every later readable slot.
+// every later readable slot. It also pins #4810: the unreadable slot must
+// tombstone IN PLACE (nil Config, same position) rather than being bare-
+// skipped, which used to collapse every later slot's position down by one.
 //
-// RED on revert: breaking on any read error loads only slot 1, dropping the
-// readable slot 3 below.
+// RED on revert (#3441 L2): breaking on any read error loads only slot 1,
+// dropping the readable slot 3 below.
+// RED on revert (#4810): bare-skipping (continuing without appending a
+// tombstone) leaves slot 3's config (hostA) sitting at POSITION 1 instead of
+// position 2 — see TestRollbackAfterUnreadableSlotResolvesCorrectSlot below
+// for the end-to-end Rollback(n) assertion that actually catches the shift;
+// this test pins the tombstone's position directly.
 func TestLoadRollbackHistoryContinuesPastReadError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config")
 	s := newTestStoreAt(t, path)
@@ -290,22 +297,164 @@ func TestLoadRollbackHistoryContinuesPastReadError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Fresh store over the same files; load only the rollback history.
+	// Fresh store over the same files; New() already loads rollback history,
+	// so this second explicit load re-populates the (large-enough, no-evict)
+	// ring on top — List() below reads back the freshest load's slots at
+	// positions 0..3 regardless, so the assertions are robust to that.
 	s2 := newTestStoreAt(t, path)
 	s2.loadRollbackHistory()
 
-	if s2.history.Len() < 3 {
-		t.Fatalf("loaded %d rollback entries, want >=3 (slots after the corrupt slot 2 must still load)", s2.history.Len())
+	entries := s2.history.List() // most-recent-first: position i == slot i+1
+	if len(entries) < 4 {
+		t.Fatalf("loaded %d rollback entries, want >=4 (slots after the corrupt slot 2 must still load, in place)", len(entries))
 	}
+
+	// Slot 2 (position 1) must be a tombstone: unreadable at load, so there
+	// is no config to show — NOT silently replaced by slot 3's config.
+	if entries[1].Config != nil {
+		t.Errorf("slot 2 (position 1) = %+v, want a tombstone (nil Config) after its read error", entries[1])
+	}
+
+	// Slot 3 (position 2) must be hostA, in ITS OWN position — not shifted
+	// up into position 1 where the tombstone belongs.
+	if entries[2].Config == nil || !strings.Contains(entries[2].Config.Format(), "host-name hostA") {
+		t.Errorf("slot 3 (position 2) does not contain hostA: %+v", entries[2])
+	}
+
 	gotA := false
-	for _, e := range s2.history.List() {
-		if strings.Contains(e.Config.Format(), "host-name hostA") {
+	for i, e := range entries {
+		if i == 1 {
+			continue // tombstone: nothing to inspect
+		}
+		if e.Config != nil && strings.Contains(e.Config.Format(), "host-name hostA") {
 			gotA = true
 			break
 		}
 	}
 	if !gotA {
 		t.Error("slot 3 (hostA) was dropped — loader broke on the slot-2 read error instead of continuing")
+	}
+}
+
+// TestRollbackAfterUnreadableSlotResolvesCorrectSlot is the #4810
+// RED-on-revert guard for the end-to-end symptom: an operator running
+// `rollback N` after an intermediate slot failed to load at boot must get
+// slot N's config (or a clear "unreadable" error for the tombstoned slot
+// itself), never a DIFFERENT slot's config silently substituted in.
+//
+// RED on revert: bare-`continue`-skipping the unreadable slot 2 collapses
+// slot 3 (hostA) into history POSITION 1, so Rollback(2) (History.Get(1))
+// would silently return hostA's config instead of erroring, and Rollback(3)
+// would run off the end of the (now one-shorter) history.
+func TestRollbackAfterUnreadableSlotResolvesCorrectSlot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	s := newTestStoreAt(t, path)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"hostA", "hostB", "hostC", "hostD"} {
+		s.SetFromInput("system host-name " + name)
+		if _, err := s.Commit(); err != nil {
+			t.Fatalf("commit %s: %v", name, err)
+		}
+	}
+	// Slots (most-recent-first): .1=hostC, .2=hostB, .3=hostA, .4=<empty>.
+	// Corrupt slot 2 the same way as the sibling test above.
+	slot2 := s.rollbackPath(2)
+	if err := os.Remove(slot2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(slot2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := newTestStoreAt(t, path)
+	s2.loadRollbackHistory()
+	if err := s2.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+
+	// rollback 2 targets the tombstoned slot: must error, never silently
+	// resolve to hostA (slot 3's config) or any other slot.
+	if err := s2.Rollback(2); err == nil {
+		t.Error("Rollback(2) on the unreadable slot succeeded, want an error")
+	}
+
+	// rollback 3 must still resolve to slot 3's own config (hostA). Under
+	// the pre-#4810 bug, the bare-skip at slot 2 collapsed slot 3 into
+	// history position 1 and slot 4 (the empty initial config) into
+	// position 2, so Rollback(3) -> History.Get(2) silently returned the
+	// EMPTY initial config instead of erroring or returning hostA.
+	if err := s2.Rollback(3); err != nil {
+		t.Fatalf("Rollback(3): %v", err)
+	}
+	got := s2.candidate.Format()
+	if !strings.Contains(got, "host-name hostA") {
+		t.Errorf("Rollback(3) candidate = %q, want it to contain host-name hostA (slot 3's own config, not shifted)", got)
+	}
+}
+
+// TestSaveRollbackFilesSkipsTombstoneWithoutPanic pins the write-side half of
+// the #4810 fix: once a tombstone (nil Config) occupies a history position —
+// because its on-disk slot failed to load at boot — the NEXT commit's
+// saveRollbackFiles must not dereference that nil Config while rewriting all
+// numbered slot files. A naive "just fix the read side" patch would leave
+// this call site calling entry.Config.Format() on nil, panicking the daemon
+// on the very next commit after a degraded boot — a regression worse than
+// the original #4810 bug (which never panicked).
+func TestSaveRollbackFilesSkipsTombstoneWithoutPanic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	s := newTestStoreAt(t, path)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"hostA", "hostB", "hostC", "hostD"} {
+		s.SetFromInput("system host-name " + name)
+		if _, err := s.Commit(); err != nil {
+			t.Fatalf("commit %s: %v", name, err)
+		}
+	}
+	slot2 := s.rollbackPath(2)
+	if err := os.Remove(slot2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(slot2, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := newTestStoreAt(t, path)
+	s2.loadRollbackHistory() // slot 2 tombstones into history position 1 (0-based)
+
+	// slot 3 (hostA) is a real, readable file at this point — capture it so
+	// we can prove it is left BYTE-IDENTICAL after the commit below. The
+	// upcoming commit pushes a new entry to history position 0, shifting
+	// the tombstone from position 1 to position 2 — i.e. onto SLOT 3, not
+	// slot 2 — so slot 3 (not slot 2) is where saveRollbackFiles' tombstone
+	// skip is actually exercised on this commit.
+	slot3 := s.rollbackPath(3)
+	before, err := os.ReadFile(slot3)
+	if err != nil {
+		t.Fatalf("read slot 3 before commit: %v", err)
+	}
+
+	if err := s2.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	s2.SetFromInput("system host-name hostE")
+	if _, err := s2.Commit(); err != nil {
+		t.Fatalf("commit hostE (with a tombstoned history entry present): %v", err)
+	}
+
+	// Slot 3 must be BYTE-IDENTICAL to before the commit: saveRollbackFiles
+	// must skip writing the position the tombstone now occupies rather than
+	// dereferencing its nil Config (which would panic) or overwriting a
+	// perfectly good slot with garbage.
+	after, err := os.ReadFile(slot3)
+	if err != nil {
+		t.Fatalf("read slot 3 after commit: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("slot 3 changed after a commit with a tombstone at that history position:\nbefore=%q\nafter=%q", before, after)
 	}
 }
 
