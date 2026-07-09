@@ -61,6 +61,9 @@ type xpfCollector struct {
 	hostInboundAddresslessZones *prometheus.Desc
 	hostInboundAddresslessIface *prometheus.Desc
 	hostInboundAmbiguousAddrs   *prometheus.Desc
+	lo0CounterHits              *prometheus.Desc
+	pbrRulesInstalled           *prometheus.Desc
+	pbrDegradedTerms            *prometheus.Desc
 	tcEgressPacketsTotal        *prometheus.Desc
 	syncookieTotal              *prometheus.Desc
 	flowCacheTotal              *prometheus.Desc
@@ -598,6 +601,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostInboundAddresslessZones
 	ch <- c.hostInboundAddresslessIface
 	ch <- c.hostInboundAmbiguousAddrs
+	ch <- c.lo0CounterHits
+	ch <- c.pbrRulesInstalled
+	ch <- c.pbrDegradedTerms
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
@@ -987,6 +993,19 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// addressless window, NOT self-healing — so emit it BEFORE the dataplane gate
 	// so it stays visible in a config-only / degraded boot too.
 	c.collectHostInboundAmbiguousAddresses(ch)
+
+	// #4422: kernel nftables lo0 loopback input-filter `then count` hits. The
+	// `inet xpf_lo0` chain is installed by the daemon INDEPENDENT of dataplane
+	// load state and keeps counting host-inbound loopback traffic in a
+	// config-only / degraded boot, so emit it BEFORE the dataplane gate — the
+	// counts are DISTINCT from the userspace fast-path xpf_filter_hits_total.
+	c.collectLo0Counters(ch)
+
+	// #4422: policy-based-routing (filter-based-forwarding) build health. Derived
+	// from the active config (routing.PBRBuildStats, a pure function — no
+	// netlink), so it is a control-plane signal emitted BEFORE the dataplane gate:
+	// a degraded FBF mirror must stay visible in a config-only / degraded boot.
+	c.collectPBRStatus(ch)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {

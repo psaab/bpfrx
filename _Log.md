@@ -1,3 +1,31 @@
+## 2026-07-09 — #4422 observability: lo0 counter + PBR build-health metrics
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4422 observability subset triage + drive. Verified all 8
+  observability items vs origin/master. ALREADY-DONE: default-policy-scope
+  labels (metrics_counters.go #3363/#3286), addressless-zone (#3698/#3710),
+  NetFlow health endpoint+metrics (#2464), xpf_ipmon_unresolved_next_hops docs
+  (multi-wan.md #1844), show effective firewall-filter (#4756). REPORTED
+  (needs a kernel-nft ruleset change / dataplane, not driven here): per-type
+  ICMP/ND host-inbound counters. DROVE two genuine Go-side gaps the prior
+  #4629 pass mis-marked "covered": (1) lo0 counter integration — the kernel
+  `inet xpf_lo0` `then count` counters were never scraped (daemon_nft.go said
+  "nothing scrapes them"); added pkg/nftables ReadLo0Counters +
+  xpf_lo0_counter_hits_total{counter}, emitted before the dataplane gate,
+  DISTINCT from the userspace xpf_filter_hits_total. (2) PBR/FBF build health
+  — added routing.PBRBuildStats (pure config fn) + xpf_pbr_rules_installed /
+  xpf_pbr_degraded_terms gauges (no "widened" state — builder is fail-closed).
+  Wired descriptor-coverage test + fail-on-revert unit tests. Updated
+  daemon_nft.go comment, docs/multi-wan.md, docs/feature-coverage.md. go
+  build + full Go suite green (0 fail; pre-existing ddns RFC2136 flake
+  ignored).
+- **File(s)**: pkg/nftables/lo0_counters.go, pkg/nftables/lo0_counters_test.go,
+  pkg/routing/rules.go, pkg/routing/routing_test.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_counters.go,
+  pkg/api/metrics_lo0_test.go, pkg/api/metrics_pbr_test.go,
+  pkg/api/metrics_descriptor_coverage_test.go, pkg/api/zone_counters_hide_test.go,
+  pkg/daemon/daemon_nft.go, docs/multi-wan.md, docs/feature-coverage.md, _Log.md
+
 ## 2026-07-09 — #4484 L-9: control-link auth engaged/dual-accept show surface
 
 - **Timestamp**: 2026-07-09

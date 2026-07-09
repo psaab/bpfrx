@@ -10,12 +10,18 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	xnft "github.com/psaab/xpf/pkg/nftables"
+	"github.com/psaab/xpf/pkg/routing"
 )
 
 // readHostInboundDenyCounters is the kernel nft host-inbound deny-counter source,
 // a package var so the collector's degraded-boot behavior is unit-testable
 // without a live kernel/netlink (#3361).
 var readHostInboundDenyCounters = xnft.ReadHostInboundDenyCounters
+
+// readLo0Counters is the kernel nft lo0 input-filter counter source, a package
+// var so the collector's behavior is unit-testable without a live kernel/netlink
+// (#4422), mirroring readHostInboundDenyCounters.
+var readLo0Counters = xnft.ReadLo0Counters
 
 // collectHostInboundKernelDenies scrapes the per-zone/family named DROP counters
 // from the kernel nftables host-inbound chain (#3361) and emits them as
@@ -47,6 +53,52 @@ func (c *xpfCollector) collectHostInboundKernelDenies(ch chan<- prometheus.Metri
 		ch <- prometheus.MustNewConstMetric(c.hostInboundKernelDenies,
 			prometheus.CounterValue, float64(ctr.Packets), ctr.Zone, ctr.Family)
 	}
+}
+
+// collectLo0Counters scrapes the per-`then count` named counters from the kernel
+// nftables lo0 input-filter chain (`inet xpf_lo0`, #4422) and emits them as
+// xpf_lo0_counter_hits_total. lo0 host-inbound traffic is enforced by the KERNEL
+// nft chain, so these counts are DISTINCT from the userspace-dp fast-path
+// xpf_filter_hits_total (they are not double counts).
+//
+// The lo0 table is installed by the daemon INDEPENDENT of dataplane load state,
+// so Collect calls this BEFORE the dataplane gate — the counters keep advancing
+// in a config-only / degraded boot. ReadLo0Counters reads nft via netlink and has
+// no dataplane dependency.
+//
+// On a read failure the series is SKIPPED (no misleading 0) and
+// xpf_counter_read_errors_total is bumped, matching collectHostInboundKernelDenies
+// and the #3345 missing-sample contract.
+func (c *xpfCollector) collectLo0Counters(ch chan<- prometheus.Metric) {
+	counts, err := readLo0Counters()
+	if err != nil {
+		c.counterReadErrors.Add(1)
+		return
+	}
+	for _, ctr := range counts {
+		ch <- prometheus.MustNewConstMetric(c.lo0CounterHits,
+			prometheus.CounterValue, float64(ctr.Packets), ctr.Counter)
+	}
+}
+
+// collectPBRStatus emits the policy-based-routing (filter-based-forwarding)
+// build-health gauges xpf_pbr_rules_installed and xpf_pbr_degraded_terms (#4422).
+// routing.PBRBuildStats is a pure function of the active config (no netlink), so
+// this is a control-plane signal emitted BEFORE the dataplane gate, matching the
+// config-derived host-inbound addressless collectors. Both gauges are emitted
+// unconditionally (0 when there is no active config or no FBF term) so a
+// zero-degradation state is a present sample distinct from "collector absent" —
+// the alerting hook is xpf_pbr_degraded_terms > 0.
+func (c *xpfCollector) collectPBRStatus(ch chan<- prometheus.Metric) {
+	var cfg *config.Config
+	if c.srv != nil && c.srv.store != nil {
+		cfg = c.srv.store.ActiveConfig()
+	}
+	installed, degraded := routing.PBRBuildStats(cfg)
+	ch <- prometheus.MustNewConstMetric(c.pbrRulesInstalled,
+		prometheus.GaugeValue, float64(installed))
+	ch <- prometheus.MustNewConstMetric(c.pbrDegradedTerms,
+		prometheus.GaugeValue, float64(degraded))
 }
 
 // collectHostInboundAddresslessZones emits xpf_host_inbound_addressless_zones

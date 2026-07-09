@@ -362,6 +362,18 @@ How it lands (the `instance-type forwarding` divergence fix):
   and marks the build degraded rather than widening a constrained term
   to an address-only rule that would steer traffic the operator
   excluded. The userspace fast path still enforces the term exactly.
+- **PBR build-health metrics (#4422)**: `xpf_pbr_rules_installed`
+  gauges the number of kernel `ip rule` FBF entries the active config
+  yields (the desired-install set), and `xpf_pbr_degraded_terms` gauges
+  the number of routing-instance filter terms DROPPED from the kernel
+  mirror by the fail-closed rule above. A sustained
+  `xpf_pbr_degraded_terms > 0` means the kernel slow path under-steers
+  vs the userspace fast path — an operator alerting hook for a config
+  whose FBF cannot be fully represented as `ip rule`s. There is
+  deliberately no "widened" metric: the builder never widens an
+  unrepresentable match (fail-closed), so an over-steer is never
+  mirrored. Both gauges are config-derived and emitted even in a
+  config-only / degraded boot.
 - **Dataplane**: filter evaluation returns the term's
   routing-instance; the route lookup targets `ISP-B.inet.0` /
   `ISP-B.inet6.0`, where the snapshot builder files the instance's
@@ -376,7 +388,11 @@ How it lands (the `instance-type forwarding` divergence fix):
 Per-policy counters: `then count <name>` on the steering term is
 counted on the PBR fast path and exported as
 `xpf_filter_hits_total{filter,family,term}` — the steering-volume
-counter per FBF policy.
+counter per FBF policy. (A `then count` on a filter attached to the
+**lo0 loopback** input hook is instead enforced by the kernel nft
+`inet xpf_lo0` chain, not the fast path, and is exported separately as
+`xpf_lo0_counter_hits_total{counter}`, #4422 — see
+`docs/feature-coverage.md` Observability.)
 
 ### FBF is flow-based — the steer is decided once, on the first packet
 
