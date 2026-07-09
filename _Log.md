@@ -43941,3 +43941,7 @@ top.
   **File(s)**: pkg/config/compiler.go, pkg/config/compiler_dispatch.go, pkg/config/compiler_firewall.go, pkg/config/compiler_class_of_service.go, pkg/config/compiler_validate_strict_filter.go, pkg/config/compiler_uniformgates.go, pkg/config/lenient_fw_cos_4953_test.go, pkg/config/README.md
   **Action**: #4884(C) devicemap enumerates non-PCI physical NICs (USB/platform/SoC) so key mac entries bind; classifyNetdev seam + doc
   **File(s)**: pkg/devicemap/devicemap.go, pkg/devicemap/devicemap_nonpci_4884_test.go, docs/bare-metal-device-map.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4954 give networkd Manager reload/reconfigure activation debt — a failed networkctl reload now re-attempts on the next identical Apply (reloadPending/reconfigurePending) instead of returning a false success when files are unchanged
+  **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md

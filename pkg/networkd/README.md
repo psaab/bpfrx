@@ -44,9 +44,9 @@ Standard library only.
 
 ## Gotchas
 
-- `Apply()` only calls `networkctl reload` when files actually changed.
-  This matters: a reload bounces interfaces, and an idempotent reapply
-  must be cheap.
+- `Apply()` calls `networkctl reload` when files actually changed **or**
+  a prior activation is still owed (see reload-debt below). This matters:
+  a reload bounces interfaces, and an idempotent reapply must be cheap.
 - Interfaces not in the typed config get `ActivationPolicy=always-down`
   in their `.network` file, so they stay down across reboots.
 - **DHCP is gated per-family (#2986).** A static address is suppressed
@@ -68,6 +68,21 @@ Standard library only.
   reconcile steps (RETH MAC, VRRP VIPs, FRR, RA, IPsec). A swallowed
   write (read-only `/etc`, full disk, EACCES, blocked path) used to report
   a clean commit against stale kernel state — a fail-open hole.
+- **A failed reload/reconfigure owes activation debt (#4954).** The
+  generated files are written to disk BEFORE `networkctl reload` runs, so
+  a reload that fails leaves the kernel running the pre-failure config
+  while the files on disk already match the desired state. Without state,
+  an identical re-commit sees `writeIfChanged → (false, nil)` for every
+  file (`changed==false`), skips the reload, and returns nil — a FALSE
+  success masking a route leak / stranded NIC / management lockout. The
+  `Manager` now carries `reloadPending` / `reconfigurePending` debt: a
+  failed reload sets `reloadPending` and re-runs the idempotent reload on
+  the next `Apply` even with unchanged files, clearing the debt only on
+  success (and still returning the error until then). The per-interface
+  `networkctl reconfigure` follow-up is best-effort (warn-only, Apply
+  still returns nil) but is likewise retried from `reconfigurePending`
+  until it succeeds. Distinct from #2987 (write-error-fails-commit) and
+  the stale-file sweep.
 - **An empty desired set is NOT a no-op (#2988).** `Apply(nil)` (last
   managed interface removed) still runs the `10-xpf-*` stale-file sweep
   and requests a reload so old addresses/bonds/bridges/renames don't
