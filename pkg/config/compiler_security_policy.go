@@ -238,23 +238,22 @@ func compilePolicy(polInst struct {
 			case "destination-address-excluded":
 				pol.Match.DestinationAddressExcluded = true
 			case "from-zone":
-				// #3148: global-policy from-zone match context. The schema
-				// exposes this leaf only under `security policies global
-				// policy <p> match`; for zone-pair policies the zones come
-				// from the surrounding from-zone/to-zone stanza so this case
-				// is never reached. Empty stays "all zones".
-				if len(m.Keys) >= 2 {
-					pol.Match.FromZone = m.Keys[1]
-				} else if len(m.Children) > 0 {
-					pol.Match.FromZone = m.Children[0].Name()
-				}
+				// #3148/#4626 M03: global-policy from-zone match SCOPE. The
+				// schema exposes this leaf only under `security policies
+				// global policy <p> match`; for zone-pair policies the zones
+				// come from the surrounding from-zone/to-zone stanza so this
+				// case is never reached. Junos accepts a zone LIST here, so
+				// read BOTH Keys[1:] AND Children via the firewallMatchValues
+				// SSOT — the #2419 lexer collapses `[ trust dmz ]` onto one
+				// leaf's Keys (["from-zone","trust","dmz"]) and repeated `set`
+				// lines land as sibling children. Accumulate every value;
+				// reading only Keys[1] was the #4626 miscompile that dropped
+				// all zones past the first. Empty stays "all zones".
+				pol.Match.FromZones = append(pol.Match.FromZones, firewallMatchValues(m)...)
 			case "to-zone":
-				// #3148: global-policy to-zone match context (see from-zone).
-				if len(m.Keys) >= 2 {
-					pol.Match.ToZone = m.Keys[1]
-				} else if len(m.Children) > 0 {
-					pol.Match.ToZone = m.Children[0].Name()
-				}
+				// #3148/#4626 M03: global-policy to-zone match SCOPE — accumulate
+				// every value via firewallMatchValues (see from-zone).
+				pol.Match.ToZones = append(pol.Match.ToZones, firewallMatchValues(m)...)
 			case "application":
 				// #4121: read BOTH slots via the firewallMatchValues SSOT (see
 				// the source-address arm).
@@ -360,6 +359,15 @@ func compilePolicy(polInst struct {
 			pol.UnknownChildren = append(pol.UnknownChildren, child.Name())
 		}
 	}
+
+	// #4626 M03: canonicalize the accumulated scoped-global zone sets to a
+	// sorted, de-duplicated form so display is stable, HA expansion is
+	// order-symmetric, and `[ dmz trust ]` == `[ trust dmz ]`. A single-zone
+	// scope is a no-op (a 1-element sorted slice), keeping the pre-#4626
+	// single-string behaviour bit-identical; a zone-pair policy leaves both
+	// nil (never populated).
+	pol.Match.FromZones = sortDedupZones(pol.Match.FromZones)
+	pol.Match.ToZones = sortDedupZones(pol.Match.ToZones)
 
 	return pol
 }

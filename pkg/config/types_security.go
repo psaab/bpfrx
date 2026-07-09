@@ -1,6 +1,10 @@
 package config
 
-import "sort"
+import (
+	"slices"
+	"sort"
+	"strings"
+)
 
 // Security policy domain: zones, policies, NAT, screen/IDS, address book,
 // applications, flow/session, ALG, logging, IPsec/IKE, dynamic-address
@@ -396,19 +400,25 @@ type PolicyMatch struct {
 	// DestinationAddressExcluded inverts the destination-address match
 	// sense (Junos `match destination-address-excluded`).
 	DestinationAddressExcluded bool
-	// FromZone and ToZone carry the optional from-zone/to-zone match
-	// context of a Junos GLOBAL policy (#3148). A Junos global policy may
-	// narrow which zone pairs it applies to with
-	// `match { from-zone <z>; to-zone <z>; }`; an empty value means "all
-	// zones" (the historical global behaviour). These fields are only
-	// meaningful for global policies — zone-pair policies derive their
-	// zones from the surrounding from-zone/to-zone stanza, so the compiler
-	// never populates these for them. The global policy is still evaluated
-	// in the GLOBAL tier ordering (after exact zone-pair and the #3090
+	// FromZones and ToZones carry the optional from-zone/to-zone match
+	// context of a Junos GLOBAL policy (#3148, #4626). A Junos global policy
+	// may narrow which zone pairs it applies to with
+	// `match { from-zone [ <z> ... ]; to-zone [ <z> ... ]; }`; an empty
+	// slice means "all zones" (the historical global behaviour). Each side
+	// is a zone SET: a packet's from-zone must be in FromZones AND its
+	// to-zone must be in ToZones for the global to apply (#4626 M03). A
+	// single-zone scope is a one-element slice — bit-identical to the
+	// pre-#4626 single-string model. These fields are only meaningful for
+	// global policies — zone-pair policies derive their zones from the
+	// surrounding from-zone/to-zone stanza, so the compiler never populates
+	// these for them. The global policy is still evaluated in the GLOBAL
+	// tier ordering (after exact zone-pair and the #3090
 	// from-any/to-any/both-any wildcard tiers); the zone context is an
-	// extra match predicate, not a tier promotion.
-	FromZone string
-	ToZone   string
+	// extra match predicate, not a tier promotion. The compiler sorts and
+	// de-duplicates each slice so display is stable and HA expansion is
+	// order-symmetric.
+	FromZones []string
+	ToZones   []string
 }
 
 // IsWildcardZone reports whether a Junos GLOBAL-policy zone-scope token names
@@ -420,7 +430,7 @@ type PolicyMatch struct {
 // the runtime build_global_zone_scope (userspace-dp/src/policy.rs), which maps
 // BOTH "" and "any" to GlobalZoneScope::Any, and it is shared by
 // GlobalPolicyAppliesToZone here and by the policymatch helpers
-// (globalScopeMatches, GlobalPolicyAppliesToZonePair) so the display/audit
+// (globalScopeSetMatches, GlobalPolicyAppliesToZonePair) so the display/audit
 // surfaces cannot drift from the runtime — the exact drift that hid
 // explicit-"any" globals from zone-detail (#3680, was: only "" treated as
 // wildcard here while policymatch + the runtime also honoured "any").
@@ -431,6 +441,92 @@ type PolicyMatch struct {
 // sites do not use this helper.
 func IsWildcardZone(s string) bool {
 	return s == "" || s == "any"
+}
+
+// IsWildcardZoneSet reports whether a GLOBAL-policy zone SCOPE SET (#4626 M03)
+// names every zone. The empty slice (an omitted `match from-zone`/`to-zone`,
+// the historical unscoped global) is the all-zones wildcard, and so is any set
+// that contains the reserved token "any". The strict commit gate rejects a set
+// that mixes "any" with concrete zones (redundant + ambiguous), so a clean
+// commit only ever produces the empty set, exactly ["any"], or an all-concrete
+// list; the contains-"any" collapse here is the tolerant/corrupt-snapshot
+// backstop (a mixed set from a bad HA peer or hand-built snapshot still degrades
+// safely to all-zones on both planes). This is the set-level SSOT for the
+// wildcard test, mirroring the runtime build_global_zone_scope
+// (userspace-dp/src/policy.rs), which maps an empty list or any "any" element to
+// GlobalZoneScope::Any.
+func IsWildcardZoneSet(zs []string) bool {
+	return len(zs) == 0 || slices.Contains(zs, "any")
+}
+
+// sortDedupZones returns a sorted, de-duplicated copy of zs with blank tokens
+// dropped. It is the canonical form the compiler stamps onto a scoped-global
+// zone set (#4626 M03) so display is stable and HA expansion is order-symmetric;
+// a nil/empty input returns nil (the all-zones wildcard).
+func sortDedupZones(zs []string) []string {
+	if len(zs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(zs))
+	for _, z := range zs {
+		if z != "" {
+			out = append(out, z)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// ZoneScopeSetLabel renders a scoped-global zone SET (#4626 M03) for display: a
+// wildcard set (empty or containing "any") prints as the idiomatic Junos "any";
+// a concrete set prints its sorted-unique members space-joined ("dmz trust").
+// It is the display SSOT so no surface open-codes its own join/wildcard rule.
+func ZoneScopeSetLabel(zs []string) string {
+	if IsWildcardZoneSet(zs) {
+		return "any"
+	}
+	return strings.Join(sortDedupZones(zs), " ")
+}
+
+// ScopeLabelOr renders a scoped-global zone SET for a display surface that uses
+// a placeholder for the UNSCOPED (all-zones) case — e.g. the "*" hit-count
+// columns or the "junos-global" detail zones. An empty set (unscoped global)
+// yields the caller's placeholder; a non-empty set yields its canonical
+// ZoneScopeSetLabel (an explicit `["any"]` still renders "any", concrete zones
+// render their sorted join). This preserves the pre-#4626 per-site behaviour
+// where `FromZone != ""` swapped the placeholder for the scope value (#4626 M03).
+func ScopeLabelOr(zs []string, placeholder string) string {
+	if len(zs) == 0 {
+		return placeholder
+	}
+	return ZoneScopeSetLabel(zs)
+}
+
+// ScopeSingular returns the first element of a scoped-global zone SET, or ""
+// for an unscoped (empty) set. It is the value stamped onto the SINGULAR wire /
+// proto / REST fields (#4626 A8) for rolling-upgrade safety: an old helper /
+// client that only reads the singular field sees the first zone (a safe
+// single-zone degradation), while a new reader prefers the plural field with the
+// complete set. For a one-element set this is the zone itself, keeping the
+// pre-#4626 singular value bit-identical.
+func ScopeSingular(zs []string) string {
+	if len(zs) == 0 {
+		return ""
+	}
+	return zs[0]
+}
+
+// IsHostToZoneScope reports whether a global policy's TO-zone scope set (#4626
+// M03) is the reserved host-inbound scope — exactly the single token
+// "junos-host". The strict commit gate rejects a to-zone list that mixes
+// junos-host with any other token, so a host-inbound global has ToZones ==
+// ["junos-host"] exactly and a transit global never contains junos-host. This
+// predicate replaces the pre-#4626 `ToZone == "junos-host"` string test.
+func IsHostToZoneScope(zs []string) bool {
+	return len(zs) == 1 && zs[0] == "junos-host"
 }
 
 // GlobalPolicyAppliesToZone reports whether a global policy with the given
@@ -450,8 +546,8 @@ func IsWildcardZone(s string) bool {
 // Used by the zone-detail policy summary (#3658) to list the global tier the
 // runtime evaluates after zone-pair rules. Callers filter nil policies first.
 func GlobalPolicyAppliesToZone(m PolicyMatch, zone string) bool {
-	asSource := IsWildcardZone(m.FromZone) || m.FromZone == zone
-	asDest := IsWildcardZone(m.ToZone) || m.ToZone == zone
+	asSource := IsWildcardZoneSet(m.FromZones) || slices.Contains(m.FromZones, zone)
+	asDest := IsWildcardZoneSet(m.ToZones) || slices.Contains(m.ToZones, zone)
 	return asSource || asDest
 }
 

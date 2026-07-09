@@ -295,7 +295,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 						continue
 					}
 					// #3357: drop a scoped global for a different zone pair.
-					if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, fromZone, toZone) {
+					if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZones, pol.Match.ToZones, fromZone, toZone) {
 						continue
 					}
 					action := "permit"
@@ -316,16 +316,11 @@ func (c *CLI) handleShowSecurity(args []string) error {
 							readErr = err
 						}
 					}
-					// #3286: a scoped global (#3148) shows its zone pair in
-					// the From/To columns instead of the all-zones "*"; an
+					// #3286/#4626: a scoped global (#3148) shows its zone SET
+					// in the From/To columns instead of the all-zones "*"; an
 					// unscoped global still reads "*"/"*".
-					briefFrom, briefTo := "*", "*"
-					if pol.Match.FromZone != "" {
-						briefFrom = pol.Match.FromZone
-					}
-					if pol.Match.ToZone != "" {
-						briefTo = pol.Match.ToZone
-					}
+					briefFrom := config.ScopeLabelOr(pol.Match.FromZones, "*")
+					briefTo := config.ScopeLabelOr(pol.Match.ToZones, "*")
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						briefFrom, briefTo, pol.Name, action, hits)
 				}
@@ -413,7 +408,7 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					continue
 				}
 				// #3357: drop a scoped global for a different zone pair.
-				if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZone, pol.Match.ToZone, fromZone, toZone) {
+				if !policymatch.GlobalPolicyAppliesToZonePair(pol.Match.FromZones, pol.Match.ToZones, fromZone, toZone) {
 					continue
 				}
 				if !globalHeaderPrinted {
@@ -436,16 +431,11 @@ func (c *CLI) handleShowSecurity(args []string) error {
 				if pol.Description != "" {
 					fmt.Printf("    Description: %s\n", pol.Description)
 				}
-				// #3286: render the scoped-global zone context (#3148)
+				// #3286/#4626: render the scoped-global zone SET (#3148)
 				// instead of the all-zones "any" placeholder. An unscoped
 				// global still shows any/any — no regression.
-				globalFromZone, globalToZone := "any", "any"
-				if pol.Match.FromZone != "" {
-					globalFromZone = pol.Match.FromZone
-				}
-				if pol.Match.ToZone != "" {
-					globalToZone = pol.Match.ToZone
-				}
+				globalFromZone := config.ScopeLabelOr(pol.Match.FromZones, "any")
+				globalToZone := config.ScopeLabelOr(pol.Match.ToZones, "any")
 				fmt.Printf("    From zones: %s\n", globalFromZone)
 				fmt.Printf("    To zones: %s\n", globalToZone)
 				fmt.Printf("    Source addresses: %s\n",

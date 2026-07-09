@@ -141,7 +141,7 @@ func TestGlobalMatchRuleIDUsesJunosGlobal(t *testing.T) {
 						SourceAddressExcluded: true,
 						DestinationAddresses:  []string{"any"},
 						Applications:          []string{"any"},
-						FromZone:              "trust",
+						FromZones:             []string{"trust"},
 					},
 				},
 			},

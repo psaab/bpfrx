@@ -91,11 +91,11 @@ security {
 	}
 	// Confirm the compiler preserved the explicit "any" verbatim — the premise.
 	for _, p := range cfg.Security.GlobalPolicies {
-		if p.Name == "any-to-untrust" && p.Match.FromZone != "any" {
-			t.Fatalf("compiler dropped explicit from-zone any: %q", p.Match.FromZone)
+		if p.Name == "any-to-untrust" && (len(p.Match.FromZones) != 1 || p.Match.FromZones[0] != "any") {
+			t.Fatalf("compiler dropped explicit from-zone any: %q", p.Match.FromZones)
 		}
-		if p.Name == "trust-to-any" && p.Match.ToZone != "any" {
-			t.Fatalf("compiler dropped explicit to-zone any: %q", p.Match.ToZone)
+		if p.Name == "trust-to-any" && (len(p.Match.ToZones) != 1 || p.Match.ToZones[0] != "any") {
+			t.Fatalf("compiler dropped explicit to-zone any: %q", p.Match.ToZones)
 		}
 	}
 	return store

@@ -346,6 +346,16 @@ message PolicyRule {
   // state cannot be queried, so the output is unchanged for existing clients.
   string scheduler_name = 19;
   bool inactive = 20;
+  // match_from_zones / match_to_zones carry the FULL scoped-global zone SET
+  // (#4626 M03). A Junos global policy scope is a zone LIST
+  // (`match from-zone [ trust dmz ]`); the singular match_from_zone /
+  // match_to_zone (fields 11/12) keep the first element for backward
+  // compatibility, while these plural fields carry every zone so an inventory
+  // consumer sees the complete scope. Additive; empty for an unscoped global
+  // and for ordinary zone-pair rules. A reader should prefer the plural field
+  // when non-empty and fall back to the singular otherwise.
+  repeated string match_from_zones = 21;
+  repeated string match_to_zones = 22;
 }
 
 message GetSessionsRequest {

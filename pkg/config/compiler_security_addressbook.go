@@ -197,12 +197,24 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 	// resolved to match-none and legitimate zone-scoped global traffic fell
 	// through to default-deny. An unscoped global (empty / `any` scope) has no
 	// single zone-local book and is left to resolve against the global book.
+	//
+	// #4626 M03: the scope is now a zone SET. Zone-local book resolution stays
+	// defined only for a SINGLE concrete zone — a multi-zone scope
+	// (`[ trust dmz ]`) has no single zone-local book, so it resolves against
+	// the GLOBAL book, the same carve-out an unscoped/`any` global already gets
+	// (a documented parity limitation: multi-zone scoped globals cannot use
+	// zone-local address books). A one-element scope keeps the pre-#4626
+	// single-zone behaviour exactly; `rewrite` itself no-ops for `any`/empty.
 	for _, p := range sec.GlobalPolicies {
 		if p == nil {
 			continue
 		}
-		rewrite(p.Match.FromZone, p.Match.SourceAddresses)
-		rewrite(p.Match.ToZone, p.Match.DestinationAddresses)
+		if len(p.Match.FromZones) == 1 {
+			rewrite(p.Match.FromZones[0], p.Match.SourceAddresses)
+		}
+		if len(p.Match.ToZones) == 1 {
+			rewrite(p.Match.ToZones[0], p.Match.DestinationAddresses)
+		}
 	}
 }
 

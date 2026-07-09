@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -575,38 +576,60 @@ func validatePolicyZoneReferencesStrict(cfg *Config) error {
 		if pol == nil {
 			continue
 		}
-		// The reserved self-traffic zone `junos-host` is direction-split for a
-		// global-policy match context (#3639, #3611 Piece B):
+		// #4626 M03: a scoped-global from-zone/to-zone match context is a zone
+		// SET (`match from-zone [ a b ]`). Validate EVERY element per side —
+		// the reserved-token direction split (#3639, #3611 Piece B) and the
+		// undefined-zone fail-closed reject both apply per element:
 		//
-		//   - `match to-zone junos-host` (host-INBOUND) IS supported and now
-		//     commits. Host-bound traffic traverses the AF_XDP LocalDelivery
-		//     gate, and the userspace dataplane consults the global tier there
-		//     (evaluate_junos_host_policy_l3_aware indexes global-scoped
-		//     junos-host rules — most-specific-after-exact-and-from-any). Commit
-		//     and the dataplane agree, so it is no longer rejected.
-		//   - `match from-zone junos-host` (host-ORIGINATED) stays rejected: the
-		//     firewall's own sockets egress via the kernel TX path, never the
-		//     AF_XDP RX gate, so a from-zone junos-host global would commit but
-		//     silently never match (the #3611 Piece A architectural limitation —
-		//     documented, not built). Reject it at commit so the two layers
-		//     agree.
+		//   - `match to-zone junos-host` (host-INBOUND) IS supported and
+		//     commits — but ONLY as a lone token: a `to-zone` list that MIXES
+		//     junos-host with any other zone is ambiguous (the host predicate
+		//     is `ToZones == ["junos-host"]` exactly), so it is rejected.
+		//   - `match from-zone junos-host` (host-ORIGINATED) stays rejected on
+		//     every element: the firewall's own sockets egress via the kernel
+		//     TX path, never the AF_XDP RX gate, so a from-zone junos-host
+		//     global would commit but silently never match (#3611 Piece A).
+		//   - A scope list that MIXES `any` with concrete zones is redundant
+		//     (any ⊇ everything) and ambiguous, so it is rejected on either
+		//     side (symmetric with the junos-host no-mix rule).
 		//
-		// (`any` and the empty token stay exempt = all-zones, matching
-		// build_global_zone_scope in policy.rs.)
-		if pol.Match.FromZone == "junos-host" {
+		// (`any` alone and the empty scope stay exempt = all-zones, matching
+		// build_global_zone_scope in policy.rs. The tolerant load path still
+		// collapses a mixed set safely via IsWildcardZoneSet, but the strict
+		// commit path never emits one.)
+		if len(pol.Match.FromZones) > 1 && slices.Contains(pol.Match.FromZones, "any") {
 			return fmt.Errorf(
-				"security policies global policy %q match from-zone %q is not supported (host-originated traffic egresses via the kernel TX path, not the AF_XDP RX gate, so a from-zone junos-host global would silently never match); remove the junos-host match context (#3611 Piece A)",
-				pol.Name, pol.Match.FromZone)
+				"security policies global policy %q match from-zone list %v mixes `any` with concrete zones; use either `any` (all zones) or an explicit zone list, not both (#4626)",
+				pol.Name, pol.Match.FromZones)
 		}
-		if !defined(pol.Match.FromZone) {
+		if len(pol.Match.ToZones) > 1 && slices.Contains(pol.Match.ToZones, "any") {
 			return fmt.Errorf(
-				"security policies global policy %q match from-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",
-				pol.Name, pol.Match.FromZone, pol.Match.FromZone)
+				"security policies global policy %q match to-zone list %v mixes `any` with concrete zones; use either `any` (all zones) or an explicit zone list, not both (#4626)",
+				pol.Name, pol.Match.ToZones)
 		}
-		if !defined(pol.Match.ToZone) {
+		if len(pol.Match.ToZones) > 1 && slices.Contains(pol.Match.ToZones, "junos-host") {
 			return fmt.Errorf(
-				"security policies global policy %q match to-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",
-				pol.Name, pol.Match.ToZone, pol.Match.ToZone)
+				"security policies global policy %q match to-zone list %v mixes `junos-host` with other zones; a host-inbound global must scope `to-zone junos-host` alone (#4626/#3639)",
+				pol.Name, pol.Match.ToZones)
+		}
+		for _, z := range pol.Match.FromZones {
+			if z == "junos-host" {
+				return fmt.Errorf(
+					"security policies global policy %q match from-zone %q is not supported (host-originated traffic egresses via the kernel TX path, not the AF_XDP RX gate, so a from-zone junos-host global would silently never match); remove the junos-host match context (#3611 Piece A)",
+					pol.Name, z)
+			}
+			if !defined(z) {
+				return fmt.Errorf(
+					"security policies global policy %q match from-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",
+					pol.Name, z, z)
+			}
+		}
+		for _, z := range pol.Match.ToZones {
+			if !defined(z) {
+				return fmt.Errorf(
+					"security policies global policy %q match to-zone %q references undefined zone; define `set security zones security-zone %s` in the same commit or the global policy is silently never matched (the dataplane fails closed for an unknown match zone)",
+					pol.Name, z, z)
+			}
 		}
 	}
 	return nil

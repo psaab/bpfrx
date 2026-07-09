@@ -24,12 +24,12 @@ func scopedGlobalCLIConfig3357() *config.Config {
 	cfg.Security.GlobalPolicies = []*config.Policy{
 		{
 			Name:   "scoped-tu",
-			Match:  config.PolicyMatch{FromZone: "trust", ToZone: "untrust"},
+			Match:  config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}},
 			Action: config.PolicyDeny,
 		},
 		{
 			Name:   "scoped-td",
-			Match:  config.PolicyMatch{FromZone: "trust", ToZone: "dmz"},
+			Match:  config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"dmz"}},
 			Action: config.PolicyDeny,
 		},
 		{

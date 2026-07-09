@@ -419,13 +419,10 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		// indistinguishable from an all-zones global. An unscoped global
 		// keeps from_zone="*"/to_zone="*" (no regression). The rule label
 		// is unchanged.
-		fromZone, toZone := "*", "*"
-		if rule.Match.FromZone != "" {
-			fromZone = rule.Match.FromZone
-		}
-		if rule.Match.ToZone != "" {
-			toZone = rule.Match.ToZone
-		}
+		// #4626: a scoped global's scope is a zone SET; label it via the
+		// shared SSOT (unscoped → "*").
+		fromZone := config.ScopeLabelOr(rule.Match.FromZones, "*")
+		toZone := config.ScopeLabelOr(rule.Match.ToZones, "*")
 		ch <- prometheus.MustNewConstMetric(c.policyHitsTotal, prometheus.CounterValue,
 			float64(ctrs.Packets), fromZone, toZone, rule.Name)
 	}
