@@ -1,3 +1,39 @@
+## 2026-07-09 — #4664: split event_stream/tests.rs into per-concern files
+
+- **Timestamp**: 2026-07-09
+- **Action**: Pure test-code motion. Split the 2313-line
+  userspace-dp/src/event_stream/tests.rs (52 tests) into a tests/ subdir
+  with per-concern sibling submodules loaded from tests/mod.rs: rt_flow
+  (13), replay_budget (13), control_frames (10), drain (9), backpressure
+  (7). Test fn/helper bodies moved byte-identical (extracted by an exact
+  line-range partition; verified missing-code-lines=0, only new lines are
+  the five `mod X;` decls + five `use super::*;`); no test logic changed.
+  The shared imports and the three cross-concern fixtures
+  (build_raw_ack_frame, test_dataplane_event, test_close_delta) live in
+  tests/mod.rs and reach each submodule via `use super::*`. Concern-local
+  helpers (replay_seq_frame, try_read_frame_header, fill_send_buffer,
+  telemetry_seq_frame, push_budgeted_replay_frame in drain.rs;
+  build_ctrl_header in control_frames.rs) travel with their tests. The
+  parent event_stream/mod.rs declaration changed from
+  `#[path = "tests.rs"] mod tests;` to plain `mod tests;` (resolving to
+  tests/mod.rs) — the sole production-file line touched, inside the
+  existing `#[cfg(test)]` gate. The stale file-header comment that
+  described the old `#[path]` layout was dropped (comment-only).
+  Validation: cargo build OK; `cargo test --release -- --test-threads=1`
+  FULL suite 3854 passed / 0 failed / 2 ignored — identical to the
+  pre-split pristine baseline; `cargo test --release event_stream` green;
+  event_stream::tests count 52 → 52. The one pre-existing
+  `unused variable: handle` warning (keeping_up_consumer test) is carried
+  over verbatim (present in the baseline too), no new warnings.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs (deleted),
+  userspace-dp/src/event_stream/tests/mod.rs,
+  userspace-dp/src/event_stream/tests/rt_flow.rs,
+  userspace-dp/src/event_stream/tests/replay_budget.rs,
+  userspace-dp/src/event_stream/tests/backpressure.rs,
+  userspace-dp/src/event_stream/tests/control_frames.rs,
+  userspace-dp/src/event_stream/tests/drain.rs, _Log.md
+
 ## 2026-07-09 — #4665: split cos/queue_service/tests.rs into per-concern files
 
 - **Timestamp**: 2026-07-09
