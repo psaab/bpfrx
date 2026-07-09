@@ -326,3 +326,97 @@ func TestPersistentNATTable_IPv6(t *testing.T) {
 		t.Errorf("timeout = %s, want 600s", got.Timeout)
 	}
 }
+
+// TestPersistentNATTable_AllReturnsSnapshotCopies verifies that All()
+// returns pointers to independent COPIES, not the live table entries.
+// Mutating the table after the call (or a concurrent Save) must not be
+// observable through a previously-returned snapshot. Regression for #4811.
+func TestPersistentNATTable_AllReturnsSnapshotCopies(t *testing.T) {
+	table := NewPersistentNATTable()
+
+	srcIP := netip.MustParseAddr("192.168.1.100")
+	natIP := netip.MustParseAddr("203.0.113.1")
+	orig := &PersistentNATBinding{
+		SrcIP:    srcIP,
+		SrcPort:  12345,
+		NatIP:    natIP,
+		NatPort:  40000,
+		PoolName: "pool1",
+		LastSeen: time.Unix(1000, 0),
+		Timeout:  300 * time.Second,
+	}
+	table.Save(orig)
+
+	snap := table.All()
+	if len(snap) != 1 {
+		t.Fatalf("All() len = %d, want 1", len(snap))
+	}
+	// The returned pointer must NOT alias the live table entry.
+	if snap[0] == orig {
+		t.Fatal("All() returned the live *PersistentNATBinding pointer; want a copy")
+	}
+	before := snap[0].LastSeen
+
+	// Mutate the live table entry the way Save() does (in place, under the
+	// write lock). The already-returned snapshot must be unaffected.
+	table.Save(orig)
+	if !snap[0].LastSeen.Equal(before) {
+		t.Errorf("snapshot LastSeen changed after table mutation: got %v, want %v",
+			snap[0].LastSeen, before)
+	}
+}
+
+// TestPersistentNATTable_AllConcurrentSaveNoRace exercises the #4811 race:
+// one goroutine repeatedly Save()s an existing binding (mutating LastSeen in
+// place under the write lock) while another repeatedly calls All() and reads
+// the returned bindings' fields. With the pre-fix code (All() aliasing live
+// pointers) `go test -race` flags a data race on LastSeen; the copy-on-All
+// fix makes it race-clean.
+func TestPersistentNATTable_AllConcurrentSaveNoRace(t *testing.T) {
+	table := NewPersistentNATTable()
+
+	// Seed several bindings so All() has live entries and Save() takes the
+	// in-place "existing" update branch.
+	const n = 8
+	for i := 0; i < n; i++ {
+		table.Save(&PersistentNATBinding{
+			SrcIP:    netip.MustParseAddr("192.168.1.1"),
+			SrcPort:  uint16(1000 + i),
+			NatIP:    netip.MustParseAddr("203.0.113.1"),
+			NatPort:  uint16(40000 + i),
+			PoolName: "pool1",
+			LastSeen: time.Now(),
+			Timeout:  300 * time.Second,
+		})
+	}
+
+	const iters = 2000
+	done := make(chan struct{})
+
+	// Writer: hits the in-place existing.LastSeen = time.Now() branch.
+	go func() {
+		defer close(done)
+		for i := 0; i < iters; i++ {
+			table.Save(&PersistentNATBinding{
+				SrcIP:    netip.MustParseAddr("192.168.1.1"),
+				SrcPort:  uint16(1000 + (i % n)),
+				NatIP:    netip.MustParseAddr("203.0.113.1"),
+				NatPort:  uint16(40000 + (i % n)),
+				PoolName: "pool1",
+				LastSeen: time.Now(),
+				Timeout:  300 * time.Second,
+			})
+		}
+	}()
+
+	// Reader: iterates the snapshot and reads fields (as the SHOW path does).
+	var sink time.Time
+	for i := 0; i < iters; i++ {
+		for _, b := range table.All() {
+			// Read LastSeen the way pkg/natshow does — this is the racing read.
+			sink = b.LastSeen.Add(b.Timeout)
+		}
+	}
+	_ = sink
+	<-done
+}
