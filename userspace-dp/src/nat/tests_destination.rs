@@ -1650,5 +1650,121 @@ fn dnat_duplicate_any_zone_last_rule_wins() {
     assert_eq!(decision.rewrite_dst_port, Some(9443));
 }
 
+// #4718 FAIL-ON-REVERT: a DNAT batch carrying rules with an UNPARSEABLE
+// destination address / pool address must (1) still install the VALID rules
+// and (2) SURFACE each drop via the NatCounterStore parse-error counter,
+// instead of the pre-#4718 silent `continue`. Reverting `record_parse_error`
+// back to a bare `continue` leaves `parse_errors() == 0` → surfacing
+// assertion RED.
+#[test]
+fn dnat_unparseable_field_surfaces_and_keeps_valid_rules() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[
+            // Bad: destination address unparseable (empty-prefix host path).
+            DestinationNATRuleSnapshot {
+                name: "bad-dest".to_string(),
+                destination_address: "not-an-ip".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.99".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // Bad: pool address unparseable on a translate (non-off) rule.
+            DestinationNATRuleSnapshot {
+                name: "bad-pool".to_string(),
+                destination_address: "203.0.113.20".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "garbage".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // Valid: must still install despite the malformed siblings.
+            DestinationNATRuleSnapshot {
+                name: "good".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &counters,
+    );
+    // (1) The valid rule installed.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "valid DNAT rule must install despite sibling parse failures"
+    );
+    // The bad pool rule (valid destination) must NOT have installed.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.20".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "a DNAT rule with an unparseable pool address must be dropped"
+    );
+    // (2) Both drops surfaced — RED on the silent-skip revert.
+    assert_eq!(
+        counters.parse_errors(),
+        2,
+        "each unparseable DNAT field must bump the parse-error counter"
+    );
+}
+
+// #4718 guard: an all-valid DNAT batch installs its rule with ZERO parse
+// errors — no false positive from the surfacing path.
+#[test]
+fn dnat_all_valid_reports_no_parse_errors() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "good".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                "",
+            )
+            .is_some(),
+        "the valid rule must install"
+    );
+    assert_eq!(
+        counters.parse_errors(),
+        0,
+        "an all-valid batch must report zero parse errors"
+    );
+}
+
 // --- Pool-mode SNAT tests ---
 

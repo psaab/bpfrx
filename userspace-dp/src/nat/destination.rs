@@ -319,15 +319,29 @@ impl DnatTable {
                     // Unparseable prefix: fall back to the host
                     // `destination_address` if it parses, else drop the entry
                     // (fail-closed, like an unparseable host destination).
+                    // #4718: surface the drop loudly instead of a silent skip.
                     Err(_) => match snap.destination_address.parse::<IpAddr>() {
                         Ok(ip) => DnatDest::Host(ip),
-                        Err(_) => continue,
+                        Err(_) => {
+                            nat_counters.record_parse_error(&format!(
+                                "DNAT rule {:?}: unparseable destination prefix {:?} and address {:?}",
+                                snap.name, snap.destination_prefix, snap.destination_address
+                            ));
+                            continue;
+                        }
                     },
                 }
             } else {
                 match snap.destination_address.parse::<IpAddr>() {
                     Ok(ip) => DnatDest::Host(ip),
-                    Err(_) => continue,
+                    // #4718: surface the drop loudly instead of a silent skip.
+                    Err(_) => {
+                        nat_counters.record_parse_error(&format!(
+                            "DNAT rule {:?}: unparseable destination address {:?}",
+                            snap.name, snap.destination_address
+                        ));
+                        continue;
+                    }
                 }
             };
             // #3844: an off (exemption) entry carries no pool. Parse the pool
@@ -340,7 +354,14 @@ impl DnatTable {
             } else {
                 match snap.pool_address.parse() {
                     Ok(ip) => ip,
-                    Err(_) => continue,
+                    // #4718: surface the drop loudly instead of a silent skip.
+                    Err(_) => {
+                        nat_counters.record_parse_error(&format!(
+                            "DNAT rule {:?}: unparseable pool address {:?}",
+                            snap.name, snap.pool_address
+                        ));
+                        continue;
+                    }
                 }
             };
             // Determine the protocol key to insert this entry under.

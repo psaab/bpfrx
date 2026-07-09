@@ -352,13 +352,28 @@ impl StaticNatTable {
     ) -> Self {
         let mut table = StaticNatTable::default();
         for snap in snaps {
+            // #4718: surface an unparseable external/internal IP loudly instead
+            // of a silent skip, so a leniently-loaded / peer-synced bad rule is
+            // observable rather than a mysteriously-absent translation.
             let ext_prefix = match parse_nat_prefix(&snap.external_ip) {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    nat_counters.record_parse_error(&format!(
+                        "static-NAT rule {:?}: unparseable external-ip {:?}",
+                        snap.name, snap.external_ip
+                    ));
+                    continue;
+                }
             };
             let int_prefix = match parse_nat_prefix(&snap.internal_ip) {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    nat_counters.record_parse_error(&format!(
+                        "static-NAT rule {:?}: unparseable internal-ip {:?}",
+                        snap.name, snap.internal_ip
+                    ));
+                    continue;
+                }
             };
             // #3031: a non-host prefix on EITHER side is a block-to-block
             // (subnet) static-NAT rule. A valid block map needs equal-length

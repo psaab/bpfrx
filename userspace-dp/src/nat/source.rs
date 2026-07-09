@@ -568,10 +568,24 @@ pub(crate) fn parse_source_nat_rules_with_previous(
         // silently match ANY address — the exact fail-open this fix closes (and
         // the same bare-IP live bug fixed for DNAT in #2394).
         for prefix in &snap.source_addresses {
-            parse_match_prefix(prefix, &mut rule.source_v4, &mut rule.source_v6);
+            parse_match_prefix(
+                prefix,
+                &mut rule.source_v4,
+                &mut rule.source_v6,
+                nat_counters,
+                &snap.name,
+                "source-address",
+            );
         }
         for prefix in &snap.destination_addresses {
-            parse_match_prefix(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
+            parse_match_prefix(
+                prefix,
+                &mut rule.destination_v4,
+                &mut rule.destination_v6,
+                nat_counters,
+                &snap.name,
+                "destination-address",
+            );
         }
         // #3429: source-NAT L4 match constraints. `match destination-port`
         // ranges and the pre-expanded `match application` terms. Ranges are kept
@@ -1357,7 +1371,14 @@ pub(crate) fn match_source_nat_result_for_tuple(
 /// that parses as neither is dropped (it narrows the match rather than widening
 /// it); the `*_constrained` flag, set from the snapshot list being non-empty,
 /// makes an all-malformed set fail closed in `nets_match_*`.
-fn parse_match_prefix(prefix: &str, v4: &mut Vec<PrefixV4>, v6: &mut Vec<PrefixV6>) {
+fn parse_match_prefix(
+    prefix: &str,
+    v4: &mut Vec<PrefixV4>,
+    v6: &mut Vec<PrefixV6>,
+    nat_counters: &NatCounterStore,
+    rule_name: &str,
+    axis: &str,
+) {
     match prefix.parse::<IpNet>() {
         Ok(IpNet::V4(net)) => v4.push(PrefixV4::from_net(net)),
         Ok(IpNet::V6(net)) => v6.push(PrefixV6::from_net(net)),
@@ -1372,7 +1393,15 @@ fn parse_match_prefix(prefix: &str, v4: &mut Vec<PrefixV4>, v6: &mut Vec<PrefixV
                     v6.push(PrefixV6::from_net(net));
                 }
             }
-            Err(_) => {}
+            // #4718: a prefix that parses as neither a CIDR nor a bare host IP
+            // is dropped from the match set. The `*_constrained` flag keeps this
+            // fail-closed (an all-malformed set matches NOTHING, never the
+            // pre-#2398 fail-open collapse to match-any), but the drop was
+            // SILENT — surface it loudly + count it so an operator sees the
+            // configured match prefix that never reached the dataplane.
+            Err(_) => nat_counters.record_parse_error(&format!(
+                "source-NAT rule {rule_name:?}: unparseable {axis} match prefix {prefix:?}"
+            )),
         },
     }
 }
