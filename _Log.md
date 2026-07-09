@@ -43528,3 +43528,35 @@ top.
   pkg/cli/cli_show_security_filters.go,
   pkg/cli/cli_show_effective_filter_4422_test.go, pkg/cmdtree/tree.go,
   docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-09
+- **Action**: #4676 — chunk NAT GC to release the alloc mutex between reclaims.
+  Phase-1 (#2852) made the port CLAIM lock-free (AddressOccupancy atomic
+  bitmap); the residual was that the opportunistic expiry GC still ran under
+  the shared `live: Mutex<PortAllocatorLiveState>` for its whole sweep,
+  lengthening the "tiny" `live_by_flow` insert critical section on the hot
+  allocation path and blocking concurrent allocations for the full sweep.
+  Added `gc_expired_chunked`: each chunk collects up to GC_CHUNK(8) expired
+  leases under a SHORT `live` CS (map mutations only), drops the guard, then
+  frees the reclaimed ports on the lock-free occupancy bitmap
+  (free_recycle = fetch_and + per-address recycle push) with `live` NOT held,
+  then re-takes `live` for the next batch. Factored the per-reclaim into
+  `collect_expired_{global,for_addr}_locked` + `reclaim_expired_lease_locked`
+  (records (addr,port) into a batch instead of freeing inline) shared by the
+  chunked path and the nested pressure-path GC (`allocate_translation_locked`
+  keeps holding `live` across claim+insert, so its GC stays nested — the
+  reclaimed ports are freed inline while the guard is held, byte-identical
+  behavior). Hot path + release path now call the chunked GC OFF the insert CS:
+  GC touches only persistent_by_source + the two expiration indexes + occupancy
+  (disjoint from live_by_flow), so running it in its own lock scope is
+  behaviorally equivalent and the insert CS is genuinely tiny. Concurrency-safe:
+  each reclaim re-checks active_flows==0 && expiry matches (skips a concurrent
+  refresh/rollback); the port bit stays SET from lease-removal until the free,
+  so a concurrent claim() cannot re-hand-out the port in the gap (no
+  double-claim / no lost-reclaim). Tests (RED-on-revert): seam test asserts the
+  sweep acquires `live` >= 2 times (non-reentrant std Mutex => released between
+  batches; collapsing to a single CS fails it — verified), plus reclaim
+  correctness, active/unexpired-lease sparing, and a 4-thread alloc+release+GC
+  concurrency-consistency stress. cargo build clean; new tests pass.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/tests_pool.rs, _Log.md

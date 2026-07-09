@@ -3946,3 +3946,292 @@ fn pool_snat_fills_to_exact_capacity_then_exhausts() {
         "one flow beyond exact capacity must exhaust"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #4676: chunked opportunistic GC releases the alloc mutex between batches.
+//
+// Phase-1 (#2852) made the port CLAIM lock-free, but the expiry GC still ran
+// under the shared `live` mutex for its whole sweep, lengthening the "tiny"
+// insert critical section on the hot allocation path. The chunked sweep now
+// collects a bounded batch of expired leases under a SHORT `live` critical
+// section, drops the guard, frees the reclaimed ports on the lock-free
+// occupancy bitmap, then re-takes `live` for the next batch. These tests pin
+// (1) the seam — the sweep acquires `live` more than once, i.e. it releases it
+// between batches (RED on revert to a single critical section), (2) reclaim
+// correctness — every expired idle lease is reclaimed and its port freed, and
+// (3) that active / not-yet-expired leases are spared, plus a concurrency
+// stress that a chunked GC racing live allocations never corrupts state.
+// ---------------------------------------------------------------------------
+
+/// Install `count` idle, already-expired persistent leases on pool address
+/// `addr_index` (one per port starting at `port_low`), with their occupancy
+/// bits set and their expiry indexed — exactly the residue the live
+/// alloc+release path leaves behind for an idle-but-not-yet-GC'd lease. Lets
+/// the chunked GC be driven in isolation.
+fn install_expired_idle_leases(
+    alloc: &PortAllocator,
+    addr_index: usize,
+    ip: Ipv4Addr,
+    port_low: u16,
+    count: u16,
+    expires_at_ns: u64,
+) {
+    {
+        let mut live = alloc.debug_live();
+        for i in 0..count {
+            let port = port_low + i;
+            let key = PersistentSourceKey {
+                protocol: 6,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, (i >> 8) as u8, (i & 0xff) as u8)),
+                src_port: 40000 + i,
+                remote: None,
+            };
+            live.persistent_by_source.insert(
+                key,
+                PersistentLease {
+                    translated: TranslatedTuple {
+                        ip: IpAddr::V4(ip),
+                        port,
+                    },
+                    addr_index,
+                    expires_at_ns,
+                    timeout_ns: NS_PER_SEC,
+                    active_flows: 0,
+                    completed_flows: 1,
+                    activation_saw_completion: true,
+                    activation_previous_expires_at_ns: 0,
+                    activation_had_previous_lease: false,
+                },
+            );
+            live.lease_expirations.insert((expires_at_ns, key));
+            live.lease_expirations_by_addr[addr_index].insert((expires_at_ns, key));
+        }
+    }
+    for i in 0..count {
+        alloc.debug_seed_owner(addr_index, IpAddr::V4(ip), port_low + i);
+    }
+}
+
+/// (1) The seam: a multi-batch chunked sweep acquires `live` more than once,
+/// which (a std `Mutex` being non-reentrant) is direct proof it RELEASED the
+/// mutex between batches so a concurrent allocation's insert can slip in.
+/// Reverting the chunking to a single critical section collapses the
+/// acquisition count to 1 and fails this test.
+#[test]
+fn pool_snat_gc_chunked_releases_lock_between_batches() {
+    let ip: Ipv4Addr = "203.0.113.1".parse().unwrap();
+    let count: u16 = 20; // > GC_CHUNK (8): a budget-20 sweep needs >= 3 batches.
+    let alloc = PortAllocator::new(1, 1024, 1024 + count);
+    install_expired_idle_leases(&alloc, 0, ip, 1024, count, 500);
+
+    assert_eq!(alloc.debug_occupied_count(), count as usize);
+    {
+        let live = alloc.debug_live();
+        assert_eq!(live.persistent_by_source.len(), count as usize);
+        assert_eq!(live.lease_expirations.len(), count as usize);
+        assert_eq!(live.lease_expirations_by_addr[0].len(), count as usize);
+    }
+
+    // now_ns = 1000 is past every lease's expiry (500).
+    let reclaimed = alloc.debug_gc_expired_chunked(1_000, count as usize);
+
+    assert_eq!(
+        reclaimed, count as usize,
+        "every expired idle lease must be reclaimed"
+    );
+    assert!(
+        alloc.debug_gc_lock_acquisitions() >= 2,
+        "chunked GC must acquire `live` more than once (released between batches); got {}",
+        alloc.debug_gc_lock_acquisitions()
+    );
+    // No port left occupied after its lease was removed (no lost-reclaim leak).
+    assert_eq!(
+        alloc.debug_occupied_count(),
+        0,
+        "every reclaimed port must be freed on the occupancy bitmap"
+    );
+    let live = alloc.debug_live();
+    assert!(live.persistent_by_source.is_empty());
+    assert!(live.lease_expirations.is_empty());
+    assert!(live.lease_expirations_by_addr[0].is_empty());
+}
+
+/// (2) Correctness: the chunked sweep reclaims ONLY expired idle leases. An
+/// active lease (active_flows > 0, absent from the expiry index) and an idle
+/// but not-yet-expired lease are both spared — their ports stay occupied and
+/// their map entries survive.
+#[test]
+fn pool_snat_gc_chunked_spares_active_and_unexpired_leases() {
+    let ip: Ipv4Addr = "203.0.113.2".parse().unwrap();
+    let alloc = PortAllocator::new(1, 1024, 4096);
+    // 5 expired idle leases (ports 1024..1029, expiry 500).
+    install_expired_idle_leases(&alloc, 0, ip, 1024, 5, 500);
+
+    let active_key = PersistentSourceKey {
+        protocol: 6,
+        src_ip: "10.1.1.1".parse().unwrap(),
+        src_port: 1,
+        remote: None,
+    };
+    let future_key = PersistentSourceKey {
+        protocol: 6,
+        src_ip: "10.1.1.2".parse().unwrap(),
+        src_port: 2,
+        remote: None,
+    };
+    {
+        let mut live = alloc.debug_live();
+        // Active lease: active_flows = 1, deliberately NOT indexed (active
+        // leases never sit in the expiry index — GC must not touch it).
+        live.persistent_by_source.insert(
+            active_key,
+            PersistentLease {
+                translated: TranslatedTuple {
+                    ip: IpAddr::V4(ip),
+                    port: 2000,
+                },
+                addr_index: 0,
+                expires_at_ns: 500,
+                timeout_ns: NS_PER_SEC,
+                active_flows: 1,
+                completed_flows: 0,
+                activation_saw_completion: false,
+                activation_previous_expires_at_ns: 0,
+                activation_had_previous_lease: false,
+            },
+        );
+        // Idle but not-yet-expired lease (expiry 10_000, past now=1000).
+        live.persistent_by_source.insert(
+            future_key,
+            PersistentLease {
+                translated: TranslatedTuple {
+                    ip: IpAddr::V4(ip),
+                    port: 2001,
+                },
+                addr_index: 0,
+                expires_at_ns: 10_000,
+                timeout_ns: NS_PER_SEC,
+                active_flows: 0,
+                completed_flows: 1,
+                activation_saw_completion: true,
+                activation_previous_expires_at_ns: 0,
+                activation_had_previous_lease: false,
+            },
+        );
+        live.lease_expirations.insert((10_000, future_key));
+        live.lease_expirations_by_addr[0].insert((10_000, future_key));
+    }
+    alloc.debug_seed_owner(0, IpAddr::V4(ip), 2000);
+    alloc.debug_seed_owner(0, IpAddr::V4(ip), 2001);
+
+    // now_ns = 1000: past the 5 expired leases (500) but before the future
+    // lease (10_000). The active lease is never reached (not indexed).
+    let reclaimed = alloc.debug_gc_expired_chunked(1_000, 64);
+
+    assert_eq!(reclaimed, 5, "only the 5 expired idle leases are reclaimed");
+    for p in 1024..1029 {
+        assert!(
+            !alloc.debug_is_port_occupied(0, p),
+            "expired lease port {p} must be freed"
+        );
+    }
+    assert!(
+        alloc.debug_is_port_occupied(0, 2000),
+        "active lease port must stay occupied (never early-freed)"
+    );
+    assert!(
+        alloc.debug_is_port_occupied(0, 2001),
+        "not-yet-expired lease port must stay occupied"
+    );
+    let live = alloc.debug_live();
+    assert!(live.persistent_by_source.contains_key(&active_key));
+    assert!(live.persistent_by_source.contains_key(&future_key));
+    assert_eq!(live.persistent_by_source.len(), 2);
+    assert_eq!(live.lease_expirations.len(), 1);
+    assert!(live.lease_expirations.contains(&(10_000, future_key)));
+    assert_eq!(live.lease_expirations_by_addr[0].len(), 1);
+}
+
+/// (3) Concurrency: many threads drive real persistent + non-persistent
+/// allocate/release cycles (so both chunked-GC entry points — the hot alloc
+/// path and the periodic release path — race live allocations) on a shared
+/// allocator. now_ns advances faster than the lease timeout so GC actively
+/// reclaims expired leases DURING the run. Afterwards a single full GC must
+/// leave the allocator perfectly consistent: no lease, no occupied port, no
+/// stale index entry, no leaked flow — proving a chunked GC racing allocations
+/// neither double-frees, misses, nor strands a port.
+#[test]
+fn pool_snat_gc_chunked_concurrent_alloc_release_stays_consistent() {
+    use std::thread;
+    let ip: Ipv4Addr = "203.0.113.3".parse().unwrap();
+    let alloc = PortAllocator::new(1, 1024, 64000);
+    let threads = 4u32;
+    let per_thread = 1500u32;
+
+    thread::scope(|s| {
+        for t in 0..threads {
+            let alloc = alloc.clone();
+            s.spawn(move || {
+                let addrs = [ip];
+                for i in 0..per_thread {
+                    // Advance now_ns by 2s/iter (> the 1s min lease timeout) so
+                    // leases from earlier iterations are expired and reclaimed
+                    // by the concurrent chunked GC as the run proceeds.
+                    let now_ns = 1_000_000_000u64 + (i as u64) * 2 * NS_PER_SEC;
+                    // Unique source per (t, i) => a distinct flow AND lease key.
+                    let src_ip = IpAddr::V4(Ipv4Addr::new(
+                        10,
+                        t as u8,
+                        (i >> 8) as u8,
+                        (i & 0xff) as u8,
+                    ));
+                    let persistent = i % 2 == 0;
+                    let flow = SourceNatFlowKey {
+                        protocol: 6,
+                        src_ip,
+                        dst_ip: "8.8.8.8".parse().unwrap(),
+                        src_port: 1024 + (i % 60000) as u16,
+                        dst_port: 443,
+                    };
+                    if let Ok(translated) = alloc.allocate_translation(
+                        flow,
+                        PoolAddressFamily::V4(&addrs),
+                        0,
+                        false,
+                        persistent,
+                        PersistentNatPermit::AnyRemoteHost,
+                        NS_PER_SEC,
+                        now_ns,
+                    ) {
+                        assert!(
+                            alloc.release_flow(flow, translated, now_ns + 1),
+                            "release of a just-allocated unique flow must succeed"
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    // Single-threaded full GC well past every lease's expiry: every idle lease
+    // is now reclaimable, and every flow has been released.
+    alloc.debug_gc_expired_chunked(u64::MAX / 2, usize::MAX);
+
+    let snap = alloc.snapshot();
+    assert_eq!(
+        snap.live_flows, 0,
+        "all flows released; no live flow may remain"
+    );
+    assert_eq!(
+        snap.persistent_leases, 0,
+        "all idle expired leases must be reclaimed by the final GC"
+    );
+    assert_eq!(
+        snap.used_ports, 0,
+        "no port may stay occupied once every lease is reclaimed"
+    );
+    assert_eq!(alloc.debug_occupied_count(), 0);
+    let live = alloc.debug_live();
+    assert!(live.lease_expirations.is_empty());
+    assert!(live.lease_expirations_by_addr[0].is_empty());
+}
