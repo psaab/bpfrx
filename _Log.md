@@ -43855,3 +43855,6 @@ top.
   **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/clearduid_traversal_4857_test.go
   **Action**: #4861 — reject plaintext http:// endpoints for credentialed DDNS backends at commit (compileDDNSServices, strict/lenient) + refuse HTTPS->HTTP redirect downgrade in the shared HTTP client (newHTTPClientBound CheckRedirect)
   **File(s)**: pkg/config/compiler_ddns_tls.go, pkg/config/compiler_system.go, pkg/ddns/backend_http.go, +tests
+- **Timestamp**: 2026-07-09
+  **Action**: #4897 — SNMPv3 enforce per-user minimum security level floor in handleV3Packet: an auth-keyed user must authenticate and a privacy-keyed user must use authPriv; drop under-leveled requests (e.g. noAuthNoPriv against an authPriv user) before decoding the scoped PDU. Replaced the "authPriv user served at noAuthNoPriv" test with an authPriv/authNoPriv/noAuth matrix.
+  **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_seclevel_test.go, pkg/snmp/README.md

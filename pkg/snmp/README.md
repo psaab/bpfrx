@@ -70,6 +70,25 @@ who can supply a decryptable PDU bypass HMAC and timeliness verification
 entirely — its scopedPDU would be decrypted and executed with no auth.
 The three valid levels are unaffected.
 
+### Per-user minimum security level floor (RFC 3414 §3.1)
+
+The `msgFlags` a request carries are the *sender's chosen* level, not a
+policy the sender is free to lower. Each configured user has an implied
+minimum level: a user with an auth key **must** authenticate, and a user
+with a privacy key **must** use authPriv. After the user lookup,
+`handleV3Packet` enforces this floor **before** decoding the scoped PDU:
+a request that clears `msgFlagAuth` against a key-bearing user, or clears
+`msgFlagPriv` against a privacy-configured user, is **dropped** (returns
+nothing). Without this floor a request could set `msgFlags = 0`
+(noAuthNoPriv) while naming an authPriv user; both gates below — HMAC
+verification (gated on `msgFlagAuth`) and decryption (gated on
+`msgFlagPriv`) — would be skipped and the scopedPDU answered in plaintext
+without the configured password, an authentication + confidentiality
+bypass (#4897). Usernames are not secret, so knowing the name would
+otherwise suffice to read device identity and interface inventory and to
+re-open the unauthenticated GETBULK CPU path. Requests **at or above**
+the configured level are served exactly as before.
+
 ## SNMPv3 USM timeliness and replay protection (RFC 3414 §3.2)
 
 Authenticating a request proves the sender holds the user's key; it does
