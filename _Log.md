@@ -43680,3 +43680,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4404/#4421 — batch test-split: relocate inline #[cfg(test)] mod tests from 8 large userspace-dp files (cold_path_hist, wg_control, event_emit, mirror/mod, neighbor_resolver, wg/cookie, slowpath, state_writer) into sibling _tests.rs via #[path]. Verbatim move (byte-identical, verified) + rustfmt-2024 canonicalized; parents byte-identical except the #[path] swap; test counts preserved per file
   **File(s)**: 8 parents + 8 new *_tests.rs
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4404/#4421 batch-2 test-split: relocate inline #[cfg(test)] mod tests from 9 userspace-dp files (io_uring_write, icmp, cookie_reply, screen/rate, icmp_ratelimit, wg/handshake, host_inbound, syn_rate, per_worker) into sibling _tests.rs via #[path]. Verbatim move (byte-identical) + rustfmt-2024 siblings; parents byte-identical except #[path] swap; test counts preserved
+  **File(s)**: 9 parents + 9 new *_tests.rs

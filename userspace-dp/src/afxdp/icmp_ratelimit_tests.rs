@@ -1,0 +1,328 @@
+use super::*;
+
+/// A burst up to `burst` passes; the (burst+1)th within the same instant is
+/// rate-limited (dropped + counter bumped). FAIL-ON-REVERT: without the
+/// limiter every call returns true and `rate_limited` stays 0, so the
+/// `assert!(!allowed)` + counter assertion both fail.
+#[test]
+fn burst_beyond_capacity_is_rate_limited() {
+    let _g = global_bucket_test_lock();
+    let reason = GeneratedErrorReason::TimeExceeded;
+    let t0 = 1_000_000_000u64;
+    reset_bucket_for_test(reason, t0);
+    let before = rate_limited_count(reason);
+    // burst=5, rate=1000/s. At a frozen instant only 5 tokens are
+    // available.
+    for i in 0..5 {
+        assert!(
+            allow_generated_error_at(reason, t0, 1000, 5),
+            "token {i} within burst must pass"
+        );
+    }
+    // The 6th at the same instant: bucket empty → rate-limited.
+    assert!(
+        !allow_generated_error_at(reason, t0, 1000, 5),
+        "beyond-burst generated error must be rate-limited"
+    );
+    assert_eq!(
+        rate_limited_count(reason),
+        before + 1,
+        "the dropped generated error must bump the per-reason counter"
+    );
+}
+
+/// Tokens refill over wall-clock time: after exhausting the burst, advancing
+/// the clock by enough to accrue >= 1 token at the configured rate restores
+/// capacity.
+#[test]
+fn refill_over_time_restores_capacity() {
+    let _g = global_bucket_test_lock();
+    let reason = GeneratedErrorReason::PacketTooBig;
+    let t0 = 5_000_000_000u64;
+    reset_bucket_for_test(reason, t0);
+    // burst=2, rate=1000/s → one token accrues every 1ms.
+    assert!(allow_generated_error_at(reason, t0, 1000, 2));
+    assert!(allow_generated_error_at(reason, t0, 1000, 2));
+    assert!(
+        !allow_generated_error_at(reason, t0, 1000, 2),
+        "burst exhausted at the frozen instant"
+    );
+    // Advance 2ms → 2 tokens refill (capped at burst=2).
+    let t1 = t0 + 2_000_000;
+    assert!(
+        allow_generated_error_at(reason, t1, 1000, 2),
+        "a token must be available after the refill interval elapses"
+    );
+    assert!(
+        allow_generated_error_at(reason, t1, 1000, 2),
+        "second refilled token available"
+    );
+    assert!(
+        !allow_generated_error_at(reason, t1, 1000, 2),
+        "refill is capped at the burst depth"
+    );
+}
+
+/// Per-reason isolation: exhausting the TimeExceeded bucket must not affect
+/// the Reject bucket. FAIL-ON-REVERT for a single-shared-bucket regression.
+#[test]
+fn reasons_are_isolated() {
+    let _g = global_bucket_test_lock();
+    let te = GeneratedErrorReason::TimeExceeded;
+    let rj = GeneratedErrorReason::Reject;
+    let t0 = 9_000_000_000u64;
+    reset_bucket_for_test(te, t0);
+    reset_bucket_for_test(rj, t0);
+    // Drain TimeExceeded (burst=1).
+    assert!(allow_generated_error_at(te, t0, 1000, 1));
+    assert!(
+        !allow_generated_error_at(te, t0, 1000, 1),
+        "TimeExceeded exhausted"
+    );
+    // Reject is untouched — still has its own capacity.
+    assert!(
+        allow_generated_error_at(rj, t0, 1000, 1),
+        "Reject bucket must be independent of TimeExceeded exhaustion"
+    );
+}
+
+/// #2955 FAIL-ON-REVERT: under heavy multi-thread contention at a FROZEN
+/// first-use instant, the limiter must admit AT MOST `burst` tokens — never
+/// more — regardless of interleaving. The pre-#2955 split-atomic
+/// implementation (CAS `millitokens`, then a SEPARATE relaxed `last_ns`
+/// store) let every worker that read while `last_ns == 0` (the boot epoch)
+/// take the first-use branch and force `refreshed = cap`, each granting
+/// itself a full burst — admitting MORE than `burst` total (a torn
+/// refill/double-credit). With the GCRA single-CAS word, refill and consume
+/// commit together, so the admitted count is hard-capped at `burst`.
+///
+/// This mirrors the demonstrated race vector exactly: each trial starts from
+/// `TokenBucket::new()` (TAT == 0, the boot/first-use state) and a start
+/// barrier maximises the simultaneous-read window. Every call uses the SAME
+/// frozen `now_ns`, so no real time elapses and the only legitimately
+/// admissible tokens are the initial burst — any `total > burst` is the bug.
+/// Verified RED against the split-atomic revert (admitted 51 > burst 50).
+#[test]
+fn concurrent_hammer_never_over_admits() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let now = 100_000_000_000u64;
+    let rate = 1000u64;
+    let burst = 50u64;
+    let threads = 16;
+    let calls_per_thread = 200u64;
+
+    for trial in 0..2000 {
+        let bucket = Arc::new(TokenBucket::new()); // TAT == 0 (boot/first-use)
+        let admitted = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let bucket = Arc::clone(&bucket);
+                let admitted = Arc::clone(&admitted);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..calls_per_thread {
+                        if bucket.try_take(now, rate, burst) {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let total = admitted.load(Ordering::Relaxed);
+        assert!(
+            total <= burst,
+            "trial {trial}: at a frozen first-use instant the limiter must \
+                 admit AT MOST the burst ({burst}); admitted {total} means a \
+                 split-atomic double-credit over-admit (the #2955 race)"
+        );
+    }
+}
+
+/// #2955 deterministic atomicity guard: a single successful `try_take`
+/// advances the WHOLE state word by exactly one interval. If the refill and
+/// consume were ever split back into two atomics, a reader between them
+/// could observe an inconsistent (consumed-but-not-timestamped) state. Here
+/// we assert the GCRA invariant directly: from a full bucket at `now`, after
+/// `burst` admissions the TAT is exactly `now + burst * interval`, and the
+/// next admission is denied without further advancing the word.
+#[test]
+fn single_word_state_advances_atomically() {
+    let now = 7_000_000_000u64;
+    let rate = 1000u64; // interval = 1ms
+    let burst = 8u64;
+    let interval = NANOS_PER_SEC / rate;
+
+    let bucket = TokenBucket::new();
+    bucket.theoretical_arrival_ns.store(now, Ordering::Relaxed);
+
+    for i in 0..burst {
+        assert!(bucket.try_take(now, rate, burst), "burst token {i}");
+        assert_eq!(
+            bucket.theoretical_arrival_ns.load(Ordering::Relaxed),
+            now + (i + 1) * interval,
+            "each admit advances the single state word by exactly one \
+                 interval — refill+consume committed together"
+        );
+    }
+    // Bucket empty at the frozen instant.
+    assert!(!bucket.try_take(now, rate, burst), "burst exhausted");
+    assert_eq!(
+        bucket.theoretical_arrival_ns.load(Ordering::Relaxed),
+        now + burst * interval,
+        "a denied call must NOT advance the state word"
+    );
+}
+
+/// A zero rate disables the limiter (opt-out): always allowed, counter
+/// never moves.
+#[test]
+fn zero_rate_disables_limiter() {
+    let _g = global_bucket_test_lock();
+    let reason = GeneratedErrorReason::Reject;
+    let t0 = 12_000_000_000u64;
+    reset_bucket_for_test(reason, t0);
+    let before = rate_limited_count(reason);
+    for _ in 0..10_000 {
+        assert!(
+            allow_generated_error_at(reason, t0, 0, 1),
+            "rate 0 means unlimited"
+        );
+    }
+    assert_eq!(
+        rate_limited_count(reason),
+        before,
+        "a disabled limiter must never bump the rate-limited counter"
+    );
+}
+
+use crate::afxdp::types::FastMap;
+use std::sync::Arc;
+
+/// Build a `ForwardingState` carrying a fresh per-zone Reject bucket for
+/// each given zone id (#3618 test helper).
+fn forwarding_with_reject_zones(zone_ids: &[u16]) -> ForwardingState {
+    let mut reject_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+    for &id in zone_ids {
+        reject_buckets.insert(id, Arc::new(TokenBucket::new()));
+    }
+    ForwardingState {
+        reject_buckets,
+        ..ForwardingState::default()
+    }
+}
+
+/// #3618 HEADLINE fail-on-revert: a rejected-flow flood that drains ZONE A's
+/// per-zone Reject bucket must NOT prevent ZONE B from generating its
+/// reject. Reverting to a SINGLE global Reject bucket makes draining A empty
+/// the one shared bucket, so B is then denied and this assertion goes RED.
+/// This is the direct proof of the #3618 per-zone isolation fix — one
+/// ingress zone can no longer starve another's reject-generation.
+#[test]
+fn reject_per_zone_flood_does_not_starve_other_zone_3618() {
+    let _g = global_bucket_test_lock();
+    // Sparse, realistic stable-name-hash zone ids (NOT dense 1,2).
+    let zone_a = 41_337u16;
+    let zone_b = 9_002u16;
+    let t0 = 3_000_000_000u64;
+    let forwarding = forwarding_with_reject_zones(&[zone_a, zone_b]);
+    // Drain zone A at a frozen instant (burst = 4).
+    for i in 0..4 {
+        assert!(
+            allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 4),
+            "zone A token {i} within burst must pass"
+        );
+    }
+    assert!(
+        !allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 4),
+        "zone A bucket must be drained after its burst"
+    );
+    // Zone B, under no load, still generates its reject at the SAME instant.
+    assert!(
+        allow_generated_reject_at(&forwarding, zone_b, t0, 1000, 4),
+        "zone B must NOT be starved by zone A's flood (per-zone isolation)"
+    );
+}
+
+/// #3618: an unzoned (id 0) or otherwise-unknown from-zone id has no
+/// per-zone bucket, so the gate falls back to the shared process-global
+/// `REJECT_FALLBACK_BUCKET` — a real bucket (never fail-open) that still
+/// rate-limits and never panics on the absent key. Both an unknown id and
+/// id 0 SHARE the one fallback budget.
+#[test]
+fn reject_unknown_and_unzoned_share_fallback_bucket_3618() {
+    let _g = global_bucket_test_lock();
+    let t0 = 6_000_000_000u64;
+    // Reset the fallback bucket (+ aggregate) to full at epoch t0.
+    reset_bucket_for_test(GeneratedErrorReason::Reject, t0);
+    // Empty map: every zone id resolves to the fallback.
+    let forwarding = ForwardingState::default();
+    let unknown = 55_555u16;
+    // burst = 2 on the shared fallback: an unknown-id reject and an
+    // unzoned (id 0) reject each take one token; the third is denied.
+    assert!(allow_generated_reject_at(&forwarding, unknown, t0, 1000, 2));
+    assert!(allow_generated_reject_at(&forwarding, 0, t0, 1000, 2));
+    assert!(
+        !allow_generated_reject_at(&forwarding, unknown, t0, 1000, 2),
+        "unknown / unzoned rejects share and are bounded by the fallback bucket"
+    );
+}
+
+/// #3618 metric-preservation fail-on-revert: the aggregate
+/// `reject_rate_limited_total` (a SINGLE global atomic, NOT a per-zone sum)
+/// is bumped on EVERY per-zone deny, so the coordinator status / Prometheus
+/// contract is unchanged by the per-zone split. Drain two zones by K1 and K2
+/// and assert the aggregate advanced by exactly K1 + K2.
+#[test]
+fn reject_aggregate_counter_sums_across_zones_3618() {
+    let _g = global_bucket_test_lock();
+    let t0 = 8_000_000_000u64;
+    reset_bucket_for_test(GeneratedErrorReason::Reject, t0); // aggregate -> 0
+    let zone_a = 111u16;
+    let zone_b = 222u16;
+    let forwarding = forwarding_with_reject_zones(&[zone_a, zone_b]);
+    let before = rate_limited_count(GeneratedErrorReason::Reject);
+    let k1 = 3u64;
+    let k2 = 5u64;
+    // burst = 1 per zone: one pass, then K denies each.
+    assert!(allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+    for _ in 0..k1 {
+        assert!(!allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+    }
+    assert!(allow_generated_reject_at(&forwarding, zone_b, t0, 1000, 1));
+    for _ in 0..k2 {
+        assert!(!allow_generated_reject_at(&forwarding, zone_b, t0, 1000, 1));
+    }
+    assert_eq!(
+        rate_limited_count(GeneratedErrorReason::Reject),
+        before + k1 + k2,
+        "aggregate reject_rate_limited_total must sum every per-zone deny (metric unchanged)"
+    );
+}
+
+/// #3618: per-zone Reject buckets stay isolated from the TimeExceeded /
+/// PacketTooBig reasons (reason isolation, #2472). Draining a zone's Reject
+/// bucket must not affect the TE/PTB global buckets, and vice-versa.
+#[test]
+fn reject_per_zone_isolated_from_other_reasons_3618() {
+    let _g = global_bucket_test_lock();
+    let t0 = 10_000_000_000u64;
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, t0);
+    let zone_a = 700u16;
+    let forwarding = forwarding_with_reject_zones(&[zone_a]);
+    // Drain zone A's Reject bucket (burst = 1).
+    assert!(allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+    assert!(!allow_generated_reject_at(&forwarding, zone_a, t0, 1000, 1));
+    // TimeExceeded (a different reason, global bucket) is untouched.
+    assert!(
+        allow_generated_error_at(GeneratedErrorReason::TimeExceeded, t0, 1000, 1),
+        "TE bucket must be independent of a zone's Reject exhaustion"
+    );
+}
