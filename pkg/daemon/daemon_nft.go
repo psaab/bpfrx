@@ -277,27 +277,37 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	// peer-synced load can slip one through, and it is NOT self-healing — so log
 	// the state transition and export it as xpf_host_inbound_ambiguous_addresses.
 	d.logHostInboundAmbiguousTransitions(cfg)
-	if !hostInboundHasEnforceableView(views) && len(unzonedV4) == 0 && len(unzonedV6) == 0 {
-		// No host-inbound-configured zone with a resolvable address AND no
-		// addressed-but-unzoned interface (#4420 HI-2) — nothing to enforce.
-		// Remove any stale table. nftDeleteTable is idempotent (an add-then-delete
-		// payload, so no error when the table is absent — the common case), so a
-		// non-nil error here is a REAL teardown failure that left a stale deny in
-		// the kernel: surface it so the commit fails closed rather than reporting
-		// that host-inbound was relaxed when it was not.
+	// #4146: the effective `to-zone junos-host` DENY programs, projected per
+	// ingress zone and scoped by kernel iifname. This is the fine-grained
+	// per-source / per-application host-inbound DENY the coarse per-zone
+	// permit-by-service gate below cannot express — enforced on the DIRECT
+	// host-bound path (the kernel delivers those packets; userspace-dp never sees
+	// them). Only representable programs that resolve to >=1 non-lifeline netdev
+	// are returned; the un-representable remainder keeps the #4168 commit warning.
+	programs := dpuserspace.BuildJunosHostPrograms(cfg)
+	if !hostInboundHasEnforceableView(views) && len(unzonedV4) == 0 && len(unzonedV6) == 0 && len(programs) == 0 {
+		// No host-inbound-configured zone with a resolvable address, no
+		// addressed-but-unzoned interface (#4420 HI-2), AND no junos-host DENY
+		// program (#4146) — nothing to enforce. Remove any stale table.
+		// nftDeleteTable is idempotent (an add-then-delete payload, so no error
+		// when the table is absent — the common case), so a non-nil error here is
+		// a REAL teardown failure that left a stale deny in the kernel: surface it
+		// so the commit fails closed rather than reporting that host-inbound was
+		// relaxed when it was not.
 		if out, err := nftDeleteTable("inet", "xpf_hostinbound"); err != nil {
 			slog.Warn("failed to delete stale host-inbound filter table", "err", err, "output", string(out))
 			return fmt.Errorf("delete stale host-inbound nftables table: %w", err)
 		}
 		return nil
 	}
-	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6)
+	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs)
 	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
 	slog.Info("host-inbound filter applied", "zones", len(views),
-		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6))
+		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6),
+		"junos_host_deny_programs", len(programs))
 	return nil
 }
 
@@ -498,7 +508,7 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     the table body and scraped per zone/family into the
 //     xpf_host_inbound_kernel_denies_total metric (#3361) — distinct from the
 //     userspace-dp xpf_host_inbound_denies_total path (#3326).
-func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string) string {
+func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, programs []dpuserspace.JunosHostProgram) string {
 	// Pre-pass: collect the named DROP counters the chain will reference, so they
 	// can be declared at the top of the table body BEFORE the chain. A counter is
 	// emitted exactly when emitHostInboundZone emits a catch-all drop
@@ -553,6 +563,19 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 	if len(unzonedV6) > 0 {
 		addCounter(xnft.HostInboundDenyCounterName(dpuserspace.UnzonedHostInboundZoneLabel, "ip6"))
 	}
+	// #4146: pre-declare the junos-host DENY counters. A distinct-prefix counter
+	// (xnft.HostInboundJunosHostDenyCounterName) is referenced once per family
+	// that a program renders a drop rule for; multiple drop rules of the same
+	// (zone, family) share the ONE declaration (matching the multi-reference
+	// contract above), so declare each unique name exactly once.
+	for _, p := range programs {
+		if len(p.RulesV4) > 0 {
+			addCounter(xnft.HostInboundJunosHostDenyCounterName(p.Zone, "ip"))
+		}
+		if len(p.RulesV6) > 0 {
+			addCounter(xnft.HostInboundJunosHostDenyCounterName(p.Zone, "ip6"))
+		}
+	}
 
 	var rules []string
 	rules = append(rules, "add table inet xpf_hostinbound")
@@ -571,44 +594,50 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 	rules = append(rules, "  chain input {")
 	// #3364: explicit distinct priority so host-inbound evaluates AFTER xpf_lo0.
 	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
-	rules = append(rules, "    ct state established,related accept")
-	// Raw ESP (50) / AH (51) are exempt from host-inbound enforcement so the
-	// kernel XFRM stack can decrypt host-terminated IPsec — mirroring the
-	// userspace stage_ipsec_passthrough_check, which runs BEFORE
-	// host_inbound_admits (poll_descriptor mod.rs). Standard vSRX configures the
-	// IPsec external zone with host-inbound `system-services { ike; }` (IKE
-	// alone; ESP implicitly permitted): the `ike` token already accepts udp
-	// 500/4500 (so IKE and NAT-T survive), and this exempts the raw ESP/AH data
-	// plane (typical site-to-site). Without it a scoped `daddr <wan-ip> drop`
-	// would black-hole the tunnel AFTER IKE succeeds — a silent upgrade
-	// regression once #3070 turns a previously-no-op `ike` stanza into real
-	// enforcement.
-	rules = append(rules, "    meta l4proto { 50, 51 } accept")
-	// IPv6 ND + v4/v6 PMTUD/error control messages — accepted regardless of the
-	// host-inbound set so enforcement never breaks core L3 operation. The ICMP
-	// error subtypes accepted here MUST stay in lock-step with the userspace
-	// host-inbound exemption (`is_icmp_host_inbound_error` in
-	// userspace-dp/.../forwarding/host_inbound.rs, #3171) so the kernel chain and
-	// the XSK LocalDelivery classifier agree on a configured ping-less zone.
-	// icmpv6 type 1 (destination-unreachable), 2 (packet-too-big, PMTUD), 3
-	// (time-exceeded), 4 (parameter-problem) carry v6 error/PMTUD/traceroute
-	// signalling; 133-137 are Neighbor Discovery. ICMPv4 destination-unreachable
-	// (3, also PMTUD frag-needed code 4), time-exceeded (11, traceroute) and
-	// parameter-problem (12) are the v4 error set. Echo-request is NOT here — it
-	// stays gated on the per-zone `ping` system-service.
-	//
-	// #4759: each accept carries a named counter so the admit path is observable
-	// per type-class. This is a PURE observability add — `counter name "<n>"
-	// accept` counts then accepts, an identical terminal verdict to a bare
-	// `accept`. The single ICMPv6 rule is split into error (1-4) and ND (133-137)
-	// so the two classes count separately; the two type sets are disjoint and
-	// their union is the exact pre-#4759 set, so every packet that was accepted is
-	// still accepted (verdict-preserving — the userspace host-inbound exemption
-	// #3171 must still mirror the SAME union). The counters are AGGREGATE (global
-	// rules, not per-zone) per the #4759 caveat.
-	rules = append(rules, "    icmpv6 type { 1, 2, 3, 4 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6Error)+"\" accept")
-	rules = append(rules, "    icmpv6 type { 133, 134, 135, 136, 137 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6ND)+"\" accept")
-	rules = append(rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP4Error)+"\" accept")
+	// #4146: when a `to-zone junos-host` DENY program is enforced, the chain is
+	// restructured into Rust's coarse-then-fine order — the fine DROP must run
+	// AFTER the genuinely pre-fine-exempt accepts (ESP/AH + firewall-originated
+	// reply-direction established) but BEFORE the ND/PMTUD accepts and the
+	// residual full established accept, because Rust runs the fine junos-host
+	// policy after coarse ND/PMTUD admission (a denied source's ND/PMTUD/original-
+	// direction-established inbound MUST also be dropped, mirroring the per-hit
+	// re-eval/teardown at poll_descriptor/mod.rs:1291). With no junos-host program
+	// the chain is byte-identical to the pre-#4146 order.
+	if len(programs) > 0 {
+		// (1) Raw ESP (50) / AH (51) — GENUINELY fine-exempt: the userspace IPsec
+		// passthrough stage returns before the fine junos-host policy, and the
+		// kernel XFRM stack decrypts host-terminated IPsec before any deny.
+		rules = append(rules, "    meta l4proto { 50, 51 } accept")
+		// (2) Firewall-ORIGINATED reply traffic (host-OUTBOUND flow return).
+		// junos-host governs host-INBOUND original-direction only, so only the
+		// reply direction is admitted ahead of the fine DROP; the denied source's
+		// original-direction established inbound falls through to the DROP below.
+		rules = append(rules, "    ct state established,related ct direction reply accept")
+		// (3) Fine junos-host DROP-only subchain (per ingress zone, iifname-scoped,
+		// set-subtracted). Placed before the ND/PMTUD accepts (§6.4).
+		for _, p := range programs {
+			emitJunosHostDenyProgram(&rules, p)
+		}
+		// (4) ND/PMTUD/ICMP-error accepts for NON-denied sources.
+		emitHostInboundICMPAccepts(&rules)
+		// (5) Residual full established accept (non-denied established inbound).
+		rules = append(rules, "    ct state established,related accept")
+	} else {
+		rules = append(rules, "    ct state established,related accept")
+		// Raw ESP (50) / AH (51) are exempt from host-inbound enforcement so the
+		// kernel XFRM stack can decrypt host-terminated IPsec — mirroring the
+		// userspace stage_ipsec_passthrough_check, which runs BEFORE
+		// host_inbound_admits (poll_descriptor mod.rs). Standard vSRX configures
+		// the IPsec external zone with host-inbound `system-services { ike; }`
+		// (IKE alone; ESP implicitly permitted): the `ike` token already accepts
+		// udp 500/4500 (so IKE and NAT-T survive), and this exempts the raw ESP/AH
+		// data plane (typical site-to-site). Without it a scoped `daddr <wan-ip>
+		// drop` would black-hole the tunnel AFTER IKE succeeds — a silent upgrade
+		// regression once #3070 turns a previously-no-op `ike` stanza into real
+		// enforcement.
+		rules = append(rules, "    meta l4proto { 50, 51 } accept")
+		emitHostInboundICMPAccepts(&rules)
+	}
 
 	for _, v := range views {
 		emitHostInboundZone(&rules, v, "ip", v.V4Addrs)
@@ -626,6 +655,156 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
 	return strings.Join(rules, "\n") + "\n"
+}
+
+// emitHostInboundICMPAccepts appends the GLOBAL IPv6 ND + v4/v6 PMTUD/error
+// control-message accepts — admitted regardless of the host-inbound set so
+// enforcement never breaks core L3 operation. The ICMP error subtypes accepted
+// here MUST stay in lock-step with the userspace host-inbound exemption
+// (`is_icmp_host_inbound_global_accept` in
+// userspace-dp/.../forwarding/host_inbound.rs, #3171) so the kernel chain and
+// the XSK LocalDelivery classifier agree on a configured ping-less zone. icmpv6
+// type 1 (destination-unreachable), 2 (packet-too-big, PMTUD), 3 (time-exceeded),
+// 4 (parameter-problem); 133-137 are Neighbor Discovery. ICMPv4
+// destination-unreachable (3, PMTUD frag-needed code 4), time-exceeded (11) and
+// parameter-problem (12). Echo-request is NOT here — it stays gated on the
+// per-zone `ping` system-service. #4759: each accept carries a named AGGREGATE
+// counter (global rules, not per-zone). Factored out (#4146) so the payload
+// builder can place it either before the per-zone rules (no junos-host program)
+// or AFTER the fine junos-host DROP (coarse-then-fine order).
+func emitHostInboundICMPAccepts(rules *[]string) {
+	*rules = append(*rules, "    icmpv6 type { 1, 2, 3, 4 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6Error)+"\" accept")
+	*rules = append(*rules, "    icmpv6 type { 133, 134, 135, 136, 137 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6ND)+"\" accept")
+	*rules = append(*rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP4Error)+"\" accept")
+}
+
+// emitJunosHostDenyProgram appends one ingress zone's fine `to-zone junos-host`
+// DENY program (#4146): the fine-eligible-L4 exemption shields (ahead of an
+// `application any` drop) followed by the iifname-scoped, set-subtracted DROP
+// rules. NO fine `accept` is ever emitted (a permit only narrows later denies
+// via `saddr !=`), so the coarse host-inbound gate below stays the sole admit
+// authority (Rust poll_descriptor/mod.rs:138).
+func emitJunosHostDenyProgram(rules *[]string, p dpuserspace.JunosHostProgram) {
+	iif := nftIifnameSet(p.IngressIfnames)
+	// §6.6 fine-eligible-L4 exemption shields — only meaningful ahead of an
+	// `application any` drop (a representable narrow-app deny can never target an
+	// exempt tuple; such a deny is un-representable and never rendered). ESP/AH is
+	// already globally accepted at the chain top, so only IKE and ident need a
+	// per-zone shield.
+	if p.HasApplicationAnyDeny {
+		if p.CoarseAdmitsIKE {
+			// The coarse gate admits IKE (udp 500/4500) from any source, and the
+			// userspace IPsec passthrough reinjects it before the fine policy, so
+			// the fine drop must not swallow it.
+			*rules = append(*rules, "    iifname "+iif+" udp dport { 500, 4500 } accept")
+		}
+		if p.CoarseIdentResets {
+			// The zone's effective coarse verdict for TCP/113 is a RST (ident-reset
+			// set AND not all/any-service); preserve it ahead of the silent drop.
+			*rules = append(*rules, "    iifname "+iif+" tcp dport 113 reject with tcp reset")
+		}
+	}
+	for _, r := range p.RulesV4 {
+		emitJunosHostDropRule(rules, p.Zone, iif, r)
+	}
+	for _, r := range p.RulesV6 {
+		emitJunosHostDropRule(rules, p.Zone, iif, r)
+	}
+}
+
+// emitJunosHostDropRule renders one projected DROP rule (one nft rule per L4
+// fragment; a single rule for `application any`).
+func emitJunosHostDropRule(rules *[]string, zone, iif string, r config.JunosHostDenyRule) {
+	cn := xnft.HostInboundJunosHostDenyCounterName(zone, r.Family)
+	srcPred := junosHostSrcPredicate(r)
+	tail := srcPred + " counter name \"" + cn + "\" drop"
+	if len(r.L4) == 0 {
+		// `application any` — all protocols.
+		*rules = append(*rules, "    iifname "+iif+tail)
+		return
+	}
+	for _, f := range r.L4 {
+		l4 := renderJunosHostL4(f, r.Family)
+		line := "    iifname " + iif
+		if l4 != "" {
+			line += " " + l4
+		}
+		*rules = append(*rules, line+tail)
+	}
+}
+
+// junosHostSrcPredicate builds the leading-space source predicate for a DROP
+// rule: the positive/excluded/any source match plus every earlier-permit
+// subtraction (`<fam> saddr != <permit-set>`). Returns "" for an unconstrained
+// source with no permit subtraction (matches every source on this iifname).
+func junosHostSrcPredicate(r config.JunosHostDenyRule) string {
+	var b strings.Builder
+	switch {
+	case r.SrcExcluded && len(r.Src) > 0:
+		b.WriteString(" " + r.Family + " saddr != " + nftAddrSet(r.Src))
+	case r.SrcAny || (r.SrcExcluded && len(r.Src) == 0):
+		// match every source (no positive saddr predicate)
+	default:
+		if len(r.Src) > 0 {
+			b.WriteString(" " + r.Family + " saddr " + nftAddrSet(r.Src))
+		}
+	}
+	if len(r.PermitSubtract) > 0 {
+		b.WriteString(" " + r.Family + " saddr != " + nftAddrSet(r.PermitSubtract))
+	}
+	return b.String()
+}
+
+// renderJunosHostL4 renders one L4 match fragment for a family. Returns "" only
+// for a degenerate fragment (should not occur for a representable deny).
+func renderJunosHostL4(f config.JunosHostDenyL4, family string) string {
+	switch f.Proto {
+	case config.HostInboundProtoTCP, config.HostInboundProtoUDP:
+		kw := "tcp"
+		if f.Proto == config.HostInboundProtoUDP {
+			kw = "udp"
+		}
+		var parts []string
+		if len(f.Ports) > 0 {
+			parts = append(parts, kw+" dport "+renderHostInboundPortSpec(f.Ports))
+		}
+		if len(f.SourcePorts) > 0 {
+			parts = append(parts, kw+" sport "+renderHostInboundPortSpec(f.SourcePorts))
+		}
+		if len(parts) == 0 {
+			return "meta l4proto " + strconv.Itoa(int(f.Proto))
+		}
+		return strings.Join(parts, " ")
+	case config.HostInboundProtoICMP, config.HostInboundProtoICMPv6:
+		kw := "icmp"
+		if f.Proto == config.HostInboundProtoICMPv6 {
+			kw = "icmpv6"
+		}
+		if f.ICMPType == nil {
+			return "meta l4proto " + strconv.Itoa(int(f.Proto))
+		}
+		s := kw + " type " + strconv.Itoa(int(*f.ICMPType))
+		if f.ICMPCode != nil {
+			s += " " + kw + " code " + strconv.Itoa(int(*f.ICMPCode))
+		}
+		return s
+	default:
+		return "meta l4proto " + strconv.Itoa(int(f.Proto))
+	}
+}
+
+// nftIifnameSet renders an iifname predicate value: a single quoted name or an
+// nft anonymous set of quoted names. Interface names carry '.' (VLAN units), so
+// each name is quoted for the nft parser.
+func nftIifnameSet(names []string) string {
+	if len(names) == 1 {
+		return "\"" + names[0] + "\""
+	}
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = "\"" + n + "\""
+	}
+	return "{ " + strings.Join(quoted, ", ") + " }"
 }
 
 // emitUnzonedHostInboundDeny appends the #4420 HI-2 catch-all DROP for the given
