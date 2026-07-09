@@ -237,7 +237,7 @@ func (s *Store) ShowRollback(n int) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return "", err
 	}
@@ -249,7 +249,7 @@ func (s *Store) ShowRollbackSet(n int) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return "", err
 	}
@@ -265,7 +265,7 @@ func (s *Store) ShowCompareRollback(n int) (string, error) {
 		return "", fmt.Errorf("not in configuration mode")
 	}
 
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return "", err
 	}
@@ -422,7 +422,7 @@ func (s *Store) ShowCandidateInheritanceRedacted(path []string) string {
 func (s *Store) ShowRollbackRedacted(n int) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return "", err
 	}
@@ -434,7 +434,7 @@ func (s *Store) ShowRollbackRedacted(n int) (string, error) {
 func (s *Store) ShowRollbackSetRedacted(n int) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return "", err
 	}
@@ -466,7 +466,7 @@ func (s *Store) ShowCompareRollbackRedacted(n int) (string, error) {
 	if s.candidate == nil {
 		return "", fmt.Errorf("not in configuration mode")
 	}
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return "", err
 	}

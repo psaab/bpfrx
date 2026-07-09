@@ -43730,3 +43730,7 @@ top.
   **File(s)**: pkg/logging/syslog.go, pkg/logging/syslog_close_resurrection_4806_test.go
   **Action**: Fix #4807 — interface-range member-range int64-overflow panic (`en-sn+1` wrapped negative for a huge trailing end integer, bypassing the 4096-member cap and reaching `make()` with a negative capacity); compare `en-sn >= interfaceRangeMaxMembers` before the `+1` so the guard cannot overflow; add RED-on-revert tests reproducing the exact `math.MaxInt64`-adjacent reproducer
   **File(s)**: pkg/config/compiler_interface_range.go, pkg/config/compiler_interface_range_4027_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix #4810 — loadRollbackHistory skipped an unreadable/corrupt intermediate rollback slot with a bare `continue`, collapsing every later slot's positional index down by one, so `rollback N` silently resolved to slot N+1's config; push a tombstone (nil-Config) HistoryEntry to preserve position==slot-number, add Store.rollbackEntry() to reject a tombstoned slot with a clear error (used by Rollback + all ShowRollback*/ShowCompareRollback* readers), and guard saveRollbackFiles against writing/dereferencing a tombstone on the next commit; add RED-on-revert tests for the index-shift, the Rollback(n) end-to-end symptom, and the save-side nil-deref panic risk
+  **File(s)**: pkg/configstore/store_commit.go, pkg/configstore/store_format.go, pkg/configstore/durability_3441_test.go
