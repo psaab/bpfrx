@@ -43862,3 +43862,6 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4897 — SNMPv3 enforce per-user minimum security level floor in handleV3Packet: an auth-keyed user must authenticate and a privacy-keyed user must use authPriv; drop under-leveled requests (e.g. noAuthNoPriv against an authPriv user) before decoding the scoped PDU. Replaced the "authPriv user served at noAuthNoPriv" test with an authPriv/authNoPriv/noAuth matrix.
   **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_seclevel_test.go, pkg/snmp/README.md
+- **Timestamp**: 2026-07-09
+  **Action**: #4864 — make configstore confirm.json deletion a durable transition. DeleteConfirm now unlinks then fsyncs the parent directory (via rbRemove/rbSyncDir seams) so a successful unlink survives a crash; matches WriteConfirm's dir-fsync. Prevents a stale confirm.json replay reverting an already-confirmed config.
+  **File(s)**: pkg/configstore/db.go, pkg/configstore/confirm_delete_fsync_4864_test.go, pkg/configstore/README.md

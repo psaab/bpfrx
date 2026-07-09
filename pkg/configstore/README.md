@@ -222,7 +222,14 @@ per-path:
   (`clearPendingConfirmLocked` — plain commit / HA sync / explicit
   confirm / demotion) and the timeout rollback (`PromoteRollback`)
   remove `confirm.json`; a nested `commit confirmed` re-writes it with
-  the extended deadline. A clean restart inside the window also keeps
+  the extended deadline. The removal is a **durable transition** too
+  (#4864): `DeleteConfirm` unlinks `confirm.json` and then fsyncs the
+  parent directory (`fsatomic.SyncDir`), matching the dir-fsync `WriteConfirm`
+  performs — a bare `os.Remove` is not durable, so a crash in the window
+  before the dirent removal flushes could replay a stale `confirm.json` on
+  reboot and revert an already-confirmed config (in HA, re-diverge a confirmed
+  standby). The unlink + dir fsync route through the package durability seams
+  (`rbRemove`/`rbSyncDir`) so a dropped dir sync fails a test RED. A clean restart inside the window also keeps
   the hatch (Junos parity: the pending confirm persists across a
   reboot and rolls back if not confirmed). One residual window remains:
   a crash in the microseconds between the `writeActive` syscall and the
