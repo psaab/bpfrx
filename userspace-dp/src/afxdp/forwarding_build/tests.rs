@@ -84,12 +84,45 @@ fn syn_cookie_master_key_from_snapshot_reaches_forwarding_state() {
     };
     let state = build_forwarding_state(&snapshot);
     assert_eq!(
-        state.syn_cookie_master_key,
+        state.syn_cookie_master_key.0,
         Some([
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
         ]),
         "control-plane-delivered key must reach the dataplane for source validation"
+    );
+}
+
+// #4484 L-7: `ForwardingState` derives `Debug`; the SYN-cookie master key
+// must never render in cleartext through it. The `SynCookieMasterKey`
+// wrapper redacts in `Debug` (`Some(<redacted>)` / `None`). Fail-on-revert:
+// drop the manual `Debug` impl (deriving `Debug` on the newtype) and the raw
+// bytes reappear (`Some([171, 171, ...])`), so both asserts below FAIL.
+#[test]
+fn syn_cookie_master_key_debug_redacts_the_secret_in_forwarding_state() {
+    let mut state = ForwardingState::default();
+    state.syn_cookie_master_key = SynCookieMasterKey(Some([0xab; 16]));
+    let rendered = format!("{state:?}");
+    // The secret bytes never appear (0xab = 171 decimal in the derived form).
+    assert!(
+        !rendered.contains("171"),
+        "raw SYN-cookie key byte leaked into Debug output: {rendered}"
+    );
+    // The field renders with the redaction marker instead.
+    assert!(
+        rendered.contains("syn_cookie_master_key: Some(<redacted>)"),
+        "expected redacted marker, got: {rendered}"
+    );
+    // Guard: sibling fields still render (Debug is not wholesale suppressed).
+    assert!(
+        rendered.contains("local_v4"),
+        "other fields must still render in Debug: {rendered}"
+    );
+    // A None key renders plainly (no phantom marker).
+    let none = ForwardingState::default();
+    assert!(
+        format!("{none:?}").contains("syn_cookie_master_key: None"),
+        "unset key must render as None"
     );
 }
 

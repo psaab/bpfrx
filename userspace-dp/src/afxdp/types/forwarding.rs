@@ -10,6 +10,26 @@
 
 use super::*;
 
+/// SYN-cookie master key (16 bytes) wrapped so its `Debug` never renders
+/// the secret bytes (#4484 L-7). `ForwardingState` derives `Debug`; the
+/// auto-derived `Debug` on a bare `Option<[u8; 16]>` would print the raw
+/// key into any log/trace that formats the forwarding state. This wrapper
+/// redacts in `Debug` — `Some(<redacted>)` / `None`, never the bytes —
+/// while staying a transparent `Option<[u8; 16]>` at every read/write site
+/// (access `.0`). Mirrors the manual-redaction discipline the WireGuard
+/// key fields use (`TunnelEndpoint`/`WgRuntimePeer` in this file).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(in crate::afxdp) struct SynCookieMasterKey(pub(in crate::afxdp) Option<[u8; 16]>);
+
+impl std::fmt::Debug for SynCookieMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("Some(<redacted>)"),
+            None => f.write_str("None"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) local_v4: FastSet<Ipv4Addr>,
@@ -217,7 +237,7 @@ pub(in crate::afxdp) struct ForwardingState {
     /// emits a rate-limited runtime WARN for it (verdict still Pass). A zone
     /// in neither map simply has no screen configured (legit Pass).
     pub(in crate::afxdp) screen_missing_profiles: FastMap<String, String>,
-    pub(in crate::afxdp) syn_cookie_master_key: Option<[u8; 16]>,
+    pub(in crate::afxdp) syn_cookie_master_key: SynCookieMasterKey,
     pub(in crate::afxdp) tunnel_interfaces: FastSet<i32>,
     pub(in crate::afxdp) filter_state: crate::filter::FilterState,
     pub(in crate::afxdp) cos: CoSState,
