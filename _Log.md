@@ -43656,3 +43656,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4407 Increment 1 — extract applyInterfaceReconcile (tunnels/xfrm/bonds/legacy-RETH interface-creation steps 1-1.8, 41 lines) from applyConfigLocked; pure void byte-identical extraction (no output/early-return/crossing-state). First slice of the daemon_apply.go decomposition
   **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4407 Increment 2 — extract applyVRFReconcile (#2926-C1 ctx check + ReconcileVRFs + interface/vrf-mgmt binding + applyMgmtVRFRoutes, 98 lines) from applyConfigLocked; body byte-identical, returns error for the one ctx.Err early-return; applyConfigLocked wraps with err-check
+  **File(s)**: pkg/daemon/daemon_apply.go
