@@ -1169,6 +1169,22 @@ type compileOpts struct {
 	// zero-target group and never reads an unknown key — so a leniently-loaded
 	// bad group is harmless. Same doctrine as lenientRouterID.
 	lenientSNMPTrapGroup bool
+	// lenientDDNSDuration (#4837) downgrades the `system services
+	// dynamic-dns` `forced-refresh` / `error-backoff-max` unparseable-value
+	// gate from a hard compile error to a cfg.Warnings entry. Both leaves
+	// accept a Go duration string ("24h") or a bare-seconds integer
+	// ("86400"); before #4837 a value that parsed as NEITHER (a typo like
+	// "24hh", or a negative/garbage value) was silently discarded —
+	// compileDDNSServices left the field unset (falling back to its
+	// downstream default) with no commit-time signal, so the operator
+	// believed their tuning applied when it silently did not. The strict
+	// commit / commit-check path hard-rejects, naming the offending value;
+	// the tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted config an older binary accepted still BOOTS (#1960
+	// fail-closed-on-load class) — the field stays unset either way (the
+	// pre-#4837 runtime behavior is unchanged on the lenient path), only the
+	// warning is new. Same doctrine as lenientSNMPTrapGroup.
+	lenientDDNSDuration bool
 	// lenientPolicyTerminalAction (#3043) downgrades the security-policy
 	// terminal-action gate (validatePolicyTerminalActionStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit /
@@ -1663,6 +1679,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientBGPNeighborPeerAS:               true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
+		lenientDDNSDuration:                    true,
 		lenientPolicyTerminalAction:            true,
 		lenientPolicyLogAction:                 true,
 		lenientDuplicatePolicyNames:            true,
@@ -1913,6 +1930,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientBGPNeighborPeerAS:               true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
+		lenientDDNSDuration:                    true,
 		lenientPolicyTerminalAction:            true,
 		lenientPolicyLogAction:                 true,
 		lenientDuplicatePolicyNames:            true,
