@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -22,6 +24,19 @@ type bondManager struct {
 // member-interfaces configured. Uses the bond mode from
 // InterfaceConfig.BondMode (active-backup for fabric bonds, 802.3ad for
 // ae interfaces).
+//
+// Link-creation/enslavement/bring-up failures (LinkAdd, LinkSetMaster,
+// LinkSetUp) are accumulated with errors.Join and returned instead of
+// silently swallowed (#4823): before this fix, every one of these
+// netlink failures was logged and skipped, and Apply ALWAYS returned
+// nil — so a commit whose fabric/ae bond could not be realized in the
+// kernel still reported success, with no way for the commit pipeline
+// to detect the incomplete topology. LinkSetDown (best-effort pre-
+// enslave step) and a not-yet-present member link (LinkByName on a
+// FabricMembers entry — routine during interface enumeration ordering,
+// not itself a link-creation failure) are unchanged: still log-only,
+// since failing the WHOLE bond over one not-yet-enumerated member
+// would be worse than the partial-enslavement it already tolerates.
 func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -29,6 +44,7 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		slog.Warn("failed to clear previous bonds", "err", err)
 	}
 
+	var errs []error
 	for _, ifc := range interfaces {
 		if len(ifc.FabricMembers) == 0 {
 			continue
@@ -43,7 +59,10 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		// Check if bond already exists
 		if existing, err := b.ops.LinkByName(bondName); err == nil {
 			// Already exists — ensure it's up and skip creation
-			b.ops.LinkSetUp(existing)
+			if err := b.ops.LinkSetUp(existing); err != nil {
+				slog.Warn("failed to bring up existing bond", "name", bondName, "err", err)
+				errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", bondName, err))
+			}
 			b.bonds = append(b.bonds, bondName)
 			slog.Debug("bond already exists", "name", bondName)
 			continue
@@ -61,6 +80,7 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		}
 		if err := b.ops.LinkAdd(bond); err != nil {
 			slog.Warn("failed to create bond", "name", bondName, "err", err)
+			errs = append(errs, fmt.Errorf("bond %s: create: %w", bondName, err))
 			continue
 		}
 
@@ -68,6 +88,7 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		bondLink, err := b.ops.LinkByName(bondName)
 		if err != nil {
 			slog.Warn("failed to find created bond", "name", bondName, "err", err)
+			errs = append(errs, fmt.Errorf("bond %s: find after create: %w", bondName, err))
 			continue
 		}
 		for _, member := range ifc.FabricMembers {
@@ -83,6 +104,7 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 			if err := b.ops.LinkSetMaster(memberLink, bondLink); err != nil {
 				slog.Warn("failed to enslave member",
 					"bond", bondName, "member", member, "err", err)
+				errs = append(errs, fmt.Errorf("bond %s: enslave member %s: %w", bondName, member, err))
 				continue
 			}
 			b.ops.LinkSetUp(memberLink)
@@ -91,6 +113,7 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 
 		if err := b.ops.LinkSetUp(bondLink); err != nil {
 			slog.Warn("failed to bring up bond", "name", bondName, "err", err)
+			errs = append(errs, fmt.Errorf("bond %s: bring up: %w", bondName, err))
 		}
 		b.bonds = append(b.bonds, bondName)
 		modeStr := "802.3ad"
@@ -100,7 +123,7 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		slog.Info("bond created", "name", bondName,
 			"mode", modeStr, "members", ifc.FabricMembers)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Clear removes all previously created bond devices.
