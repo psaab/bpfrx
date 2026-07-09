@@ -1,6 +1,8 @@
 package upgrade
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,5 +97,55 @@ func TestRejoinAndConfirmTimesOutOnNoSync(t *testing.T) {
 	}
 	if !f.resetCalled {
 		t.Fatal("ResetFailover should still have been attempted")
+	}
+}
+
+// #4717: on a deadline miss driven by a failing SyncEstablished check, the
+// returned error must SURFACE the underlying transport/gRPC error (naming which
+// check failed) — not discard it and print only the synced=false boolean.
+// Reverting to the discarded-error code makes this assertion fail (RED-on-revert):
+// the error then contains neither "sync-established error" nor the wrapped cause.
+func TestRejoinAndConfirmSurfacesSyncError(t *testing.T) {
+	wantCause := errors.New("dial xpfd gRPC 127.0.0.1:50051: connection refused")
+	f := &fakeCluster{peerAlive: true, synced: true, syncErr: wantCause}
+	err := RejoinAndConfirm(f, 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error when SyncEstablished keeps failing")
+	}
+	if !strings.Contains(err.Error(), "sync-established error") {
+		t.Fatalf("timeout error must name the failed SyncEstablished check; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), wantCause.Error()) {
+		t.Fatalf("timeout error must surface the underlying SyncEstablished cause; got: %v", err)
+	}
+	if !f.resetCalled {
+		t.Fatal("ResetFailover should still have been attempted")
+	}
+}
+
+// #4717: the same surfacing must apply to a failing PeerAlive check — the error
+// names the peer-alive check and carries its underlying cause instead of only
+// reporting peer-alive=false. RED-on-revert: the discarded-error code drops it.
+func TestRejoinAndConfirmSurfacesPeerAliveError(t *testing.T) {
+	wantCause := errors.New("dial xpfd gRPC 127.0.0.1:50051: connection refused")
+	f := &fakeCluster{peerAlive: false, synced: true, peerAliveErr: wantCause}
+	err := RejoinAndConfirm(f, 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error when PeerAlive keeps failing")
+	}
+	if !strings.Contains(err.Error(), "peer-alive error") {
+		t.Fatalf("timeout error must name the failed PeerAlive check; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), wantCause.Error()) {
+		t.Fatalf("timeout error must surface the underlying PeerAlive cause; got: %v", err)
+	}
+}
+
+// #4717 guard: the SUCCESS path is unchanged — both checks pass -> nil, with no
+// spurious error text. Protects the happy path from the surfacing change.
+func TestRejoinAndConfirmSuccessUnchanged(t *testing.T) {
+	f := &fakeCluster{peerAlive: true, synced: true}
+	if err := RejoinAndConfirm(f, 5*time.Second); err != nil {
+		t.Fatalf("successful rejoin must return nil unchanged; got: %v", err)
 	}
 }
