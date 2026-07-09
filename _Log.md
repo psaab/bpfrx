@@ -43724,3 +43724,7 @@ top.
   **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/pci_function_suffix_4795_test.go
   **Action**: Fix session filter matching only the FIRST interface of a multi-interface zone (widen zoneIfaces to map[uint16][]string, match ANY bound interface); fix the show-path call site + existing test for the field type change; add RED-on-revert test
   **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go, pkg/cli/session_display_test.go, pkg/cli/session_filter_multi_iface_4792_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix #4806 — SyslogClient.Close() didn't nil s.conn or mark the client closed, so a Send() racing Close() could see the stale closed conn, hit a write error, and silently reconnect/resurrect a torn-down connection; add a `closed` flag (mu-guarded) checked at the top of Send/SendBinary, and nil s.conn in Close(); add RED-on-revert tests reproducing the resurrection
+  **File(s)**: pkg/logging/syslog.go, pkg/logging/syslog_close_resurrection_4806_test.go
