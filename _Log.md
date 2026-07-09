@@ -42896,3 +42896,21 @@ top.
   Validation: gofmt; go vet; new test PASS (2 subtests); touched packages
   (cmd/cli, pkg/config, pkg/policymatch) green; FULL Go suite green.
   **File(s)**: pkg/policymatch/reject_matrix_4422_test.go, _Log.md
+
+## 2026-07-09 — #4717 RejoinAndConfirm surface PeerAlive/SyncEstablished errors
+- **Timestamp**: 2026-07-09
+- **Action**: Fix — RejoinAndConfirm discarded the `aerr`/`serr` captured from
+  PeerAlive/SyncEstablished each poll; on deadline it formatted only the
+  alive/synced booleans, losing the transport/gRPC cause. Now retains the last
+  non-nil error from each predicate and wraps them (naming which check failed)
+  into the timeout error. Happy path unchanged (both checks pass → nil). Mirrors
+  DrainAndConfirm's existing timeout, which already wraps the last DrainComplete
+  error. Diagnostics-only; no control-flow/abort change.
+- **Edit**: pkg/upgrade/kernel_drain.go (surface last aerr/serr in timeout error)
+- **Edit**: pkg/upgrade/rolling_test.go (fakeCluster peerAliveErr/syncErr seams)
+- **Edit**: pkg/upgrade/kernel_drain_test.go (RED-on-revert: surfacing tests for
+  SyncEstablished + PeerAlive failures; success-path guard)
+- **Edit**: docs/in-place-upgrade.md (rejoin diagnostics note)
+- **Validation**: go build ./... clean; go test ./pkg/upgrade/ -count=1 ok;
+  full `go test ./...` green; RED-on-revert verified (both surfacing tests FAIL
+  when kernel_drain.go reverted, success guard still PASS).

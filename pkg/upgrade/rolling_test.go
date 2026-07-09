@@ -22,11 +22,18 @@ type fakeCluster struct {
 	syncPolls    int
 	forced       bool
 	resetCalled  bool
+	// #4717 test seams: when set, the predicate returns this error on EVERY
+	// poll (persistent transport failure), so a deadline miss must surface it.
+	peerAliveErr error
+	syncErr      error
 }
 
-func (f *fakeCluster) PeerAlive() (bool, error) { return f.peerAlive, nil }
+func (f *fakeCluster) PeerAlive() (bool, error) { return f.peerAlive, f.peerAliveErr }
 func (f *fakeCluster) SyncEstablished() (bool, error) {
 	f.syncPolls++
+	if f.syncErr != nil {
+		return false, f.syncErr
+	}
 	// Poll #1 is the PRE-cut precondition check (daemon up) — always OK.
 	// Polls #2..#(1+syncErrPolls) model the POST-cut gRPC-startup gap: the
 	// local socket refuses connections while xpfd restarts. After that the
