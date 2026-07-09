@@ -394,6 +394,20 @@ func validateNATMatchDestinationPortStrict(cfg *Config) error {
 							"(translating every port instead of failing closed)",
 						kind, rs.Name, rule.Name, rule.Match.InvalidDestinationPorts[0])
 				}
+				// #4422: a reversed range (high < low, e.g. `destination-port
+				// 4000 to 3000`) is malformed — the parser splits it into its two
+				// discrete endpoints, silently matching only those two ports
+				// instead of the contiguous range the operator wrote. Reject it so
+				// the miscompile is operator-visible at commit.
+				if len(rule.Match.ReversedDestinationPortRanges) > 0 {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: match destination-port %q is a "+
+							"reversed range (low is greater than high); the rule would commit "+
+							"but the parser splits it into the two discrete endpoints, matching "+
+							"only those ports instead of the contiguous range — swap the "+
+							"endpoints so low <= high",
+						kind, rs.Name, rule.Name, rule.Match.ReversedDestinationPortRanges[0])
+				}
 			}
 		}
 		return nil
