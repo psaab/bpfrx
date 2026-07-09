@@ -43873,3 +43873,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4870 — dhcpserver fail-closed on systemctl is-active query error. unitIsActive now returns (bool, error): a recognized state string is authoritative, an undeterminable query (timeout/exec/garbled) returns an error instead of silent "inactive". reconcileFamilyRestart restarts + surfaces the error on an uncertain query (was: skip restart, report success); clearFamilyLocked stops + surfaces the error and the config-unlink error on a removed family.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go, pkg/dhcpserver/dhcpserver_isactive_error_4870_test.go, pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4875 fwdstatus require positive in-window heartbeat evidence for Online; empty/nil/future heartbeats -> Degraded (was false-green Online)
+  **File(s)**: pkg/fwdstatus/builder.go, pkg/fwdstatus/fwdstatus_test.go, pkg/fwdstatus/README.md

@@ -218,7 +218,7 @@ func Build(
 		fs.State = StateUnknown
 	case isUserspace && usErr != nil:
 		fs.State = StateUnknown
-	case isUserspace && !allHeartbeatsFresh(usStatus.WorkerHeartbeats, time.Now(), 2*time.Second):
+	case isUserspace && !heartbeatsHealthy(usStatus.WorkerHeartbeats, time.Now(), 2*time.Second):
 		fs.State = StateDegraded
 	default:
 		fs.State = StateOnline
@@ -231,13 +231,29 @@ func ticksToNanos(ticks uint64) uint64 {
 	return ticks * 1_000_000_000 / userHZ
 }
 
-// allHeartbeatsFresh returns true iff every heartbeat is within
-// maxAge of now.  Empty slice returns true (no workers → trivially
-// fresh; caller distinguishes the empty vs populated case when
-// interpreting Degraded).
-func allHeartbeatsFresh(hbs []time.Time, now time.Time, maxAge time.Duration) bool {
+// heartbeatsHealthy returns true only on positive, in-window evidence
+// that packet-processing workers are alive: the slice must be
+// non-empty and EVERY heartbeat must fall in the closed age window
+// [0, maxAge] relative to now.  Both endpoints are load-bearing
+// (#4875):
+//
+//   - An empty slice returns false.  A userspace helper that has not
+//     yet published any heartbeat (startup) or a wire-version mismatch
+//     that omits the field must NOT read as Online — the old
+//     "empty → trivially fresh" behavior let a firewall with no live
+//     worker report a false-green forwarding state.
+//   - A future-dated heartbeat (negative age) returns false.  Both the
+//     heartbeat and `now` come from the same host clock, so a heartbeat
+//     ahead of now is a malformed/torn conversion, not real evidence of
+//     liveness; it must not satisfy the freshness check.
+//   - A stale heartbeat (age > maxAge) returns false, as before.
+func heartbeatsHealthy(hbs []time.Time, now time.Time, maxAge time.Duration) bool {
+	if len(hbs) == 0 {
+		return false
+	}
 	for _, hb := range hbs {
-		if now.Sub(hb) > maxAge {
+		age := now.Sub(hb)
+		if age < 0 || age > maxAge {
 			return false
 		}
 	}
