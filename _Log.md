@@ -1,3 +1,27 @@
+## 2026-07-09 — #4671: relocate frame/wg.rs inline tests to sibling wg_tests.rs
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4671 — pure code-motion test refactor. `frame/wg.rs` was
+  1561 LOC with production ~1-603 and a single inline
+  `#[cfg(test)] mod wg_frame_tests { ... }` block (lines 604-1561, 19
+  `#[test]`). Per codex-review-174 #8 the production WG encap was
+  DELIBERATELY not split (splitting risks hiding the single-underlay-FIB-
+  lookup invariant #3992 / inviting duplicate lookups); only the tests were
+  extracted. Moved the inline module body verbatim (4-space dedent only) to
+  sibling `frame/wg_tests.rs`, wired via
+  `#[cfg(test)] #[path = "wg_tests.rs"] mod tests;` — same convention as
+  #4668 (reject_reply) / #4670 (dispatch). The two top-level `#[cfg(test)]`
+  helpers that live OUTSIDE the mod block — `OUTER_ROUTE_RESOLVE_COUNT`
+  (the #3992 resolve-once canary counter) and `udp6_checksum_scalar_reference`
+  (the parity reference oracle) — STAY in wg.rs; the relocated tests reach
+  them via `use super::*`. Production lines 1-603 byte-identical
+  (git diff: 2 insertions + 957 deletions = mod block removed, 3-line decl
+  added). Test count 19 before == 19 after (`afxdp::frame::wg::tests::`).
+  Gate: cargo build ok; full suite `--release --test-threads=1`
+  3860 passed / 0 failed / 2 ignored (matches baseline); the #3992 canary
+  `wg_encap_frame_resolves_outer_route_once_v4` passes.
+- **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/frame/wg_tests.rs, _Log.md
 ## 2026-07-09 — #4422: pin ICMP application type/code attribution (coverage)
 
 - **Timestamp**: 2026-07-09
