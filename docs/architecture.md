@@ -193,7 +193,12 @@ editing cmdtree.
     when the resolved bind is non-loopback and `apiCfg.Auth == nil`, pulls the
     bind back to a same-family loopback (`127.0.0.1` for IPv4, `::1` for IPv6,
     port preserved) and WARNs — so a leniently-loaded vulnerable config comes up
-    on loopback (console/SSH remain the lifeline) instead of exposed. The bind
+    on loopback (console/SSH remain the lifeline) instead of exposed. The
+    non-loopback test (`hostIsLoopback`) treats the Go wildcard spelling
+    `:port`/`[::]:port` (an empty or unspecified host after `SplitHostPort`) and
+    any unparseable host as **non-loopback** so `--api-addr :8080` with no
+    api-auth is clamped, not left listening on every interface (#4903); only a
+    genuine loopback IP or the literal `localhost` is exempt. The bind
     address is built with `net.JoinHostPort` so an IPv6 mgmt address is bracketed
     and both the clamp and `net.Listen` parse it. Adding api-auth and recommitting
     restores the off-loopback bind. HTTPS is covered by the same rule
