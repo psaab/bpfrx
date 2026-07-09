@@ -492,7 +492,14 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 		// tunables (#2691 P2, plan §5.9). The per-interface `dynamic-dns`
 		// bindings reference these named providers.
 		if ddnsNode := svcNode.FindChild("dynamic-dns"); ddnsNode != nil {
-			if cat := compileDDNSServices(ddnsNode); cat != nil {
+			cat, ddnsWarnings, err := compileDDNSServices(ddnsNode, opts.lenientDDNSDuration)
+			if err != nil {
+				return err
+			}
+			if cfg != nil {
+				cfg.Warnings = append(cfg.Warnings, ddnsWarnings...)
+			}
+			if cat != nil {
 				if sys.Services == nil {
 					sys.Services = &SystemServicesConfig{}
 				}
@@ -548,9 +555,24 @@ var ddnsProviderStringProps = map[string]bool{
 
 // compileDDNSServices compiles the `system services dynamic-dns` block into a
 // typed *DDNSServicesConfig: the named provider catalog + the engine tunables
-// (forced-refresh / error-backoff-max). Returns nil for a truly empty block so
-// a garbage/empty stanza does not materialize a catalog (#2691 P2, plan §5.9).
-func compileDDNSServices(node *Node) *DDNSServicesConfig {
+// (forced-refresh / error-backoff-max). Returns a nil *DDNSServicesConfig for
+// a truly empty block so a garbage/empty stanza does not materialize a
+// catalog (#2691 P2, plan §5.9) — that can still happen alongside a non-nil
+// warnings slice (an all-malformed block warns but has nothing to publish).
+//
+// #4837: forced-refresh / error-backoff-max accept a Go duration string
+// ("24h") or a bare-seconds integer ("86400"), but a value that parses as
+// NEITHER form (a typo like "24hh", or a non-positive value like "-5" — the
+// downstream engine has no defined meaning for a non-positive interval) was
+// previously silently discarded: the field was left unset, falling back to
+// its downstream default, with no commit-time error or warning telling the
+// operator their value was rejected. Strict (commit / commit-check):
+// hard-reject on the first malformed leaf, naming it and its value. Lenient
+// (load / peer-sync): downgrade to a warning, accumulated across both
+// leaves, so an already-persisted config an older binary accepted still
+// boots (#1960 fail-closed-on-load class) — the field stays unset either
+// way, matching pre-#4837 runtime behavior exactly; only the warning is new.
+func compileDDNSServices(node *Node, lenient bool) (*DDNSServicesConfig, []string, error) {
 	cat := &DDNSServicesConfig{Providers: map[string]*DDNSProvider{}}
 	for _, inst := range namedInstances(node.FindChildren("provider")) {
 		p := compileDDNSProvider(inst.name, inst.node)
@@ -560,20 +582,35 @@ func compileDDNSServices(node *Node) *DDNSServicesConfig {
 	}
 	// Engine tunables: a duration ("24h") or a bare-seconds integer. They may
 	// appear as a child node OR packed into the block's Keys (flat-set).
-	if v := ddnsServicesScalar(node, "forced-refresh"); v != "" {
-		if s := parseDurationSeconds(v); s > 0 {
-			cat.ForcedRefreshSeconds = s
+	var warnings []string
+	for _, leaf := range []string{"forced-refresh", "error-backoff-max"} {
+		v := ddnsServicesScalar(node, leaf)
+		if v == "" {
+			continue
 		}
-	}
-	if v := ddnsServicesScalar(node, "error-backoff-max"); v != "" {
-		if s := parseDurationSeconds(v); s > 0 {
+		s := parseDurationSeconds(v)
+		if s <= 0 {
+			msg := fmt.Sprintf(
+				"system services dynamic-dns %s %q: not a valid duration "+
+					"(e.g. \"24h\") or a positive bare-seconds integer; "+
+					"ignored — falls back to the built-in default", leaf, v)
+			if !lenient {
+				return nil, nil, fmt.Errorf("%s", msg)
+			}
+			warnings = append(warnings, msg)
+			continue
+		}
+		switch leaf {
+		case "forced-refresh":
+			cat.ForcedRefreshSeconds = s
+		case "error-backoff-max":
 			cat.ErrorBackoffMaxSeconds = s
 		}
 	}
 	if len(cat.Providers) == 0 && cat.ForcedRefreshSeconds == 0 && cat.ErrorBackoffMaxSeconds == 0 {
-		return nil
+		return nil, warnings, nil
 	}
-	return cat
+	return cat, warnings, nil
 }
 
 // ddnsServicesScalar finds a top-level scalar leaf value under the dynamic-dns

@@ -1169,6 +1169,22 @@ type compileOpts struct {
 	// zero-target group and never reads an unknown key — so a leniently-loaded
 	// bad group is harmless. Same doctrine as lenientRouterID.
 	lenientSNMPTrapGroup bool
+	// lenientDDNSDuration (#4837) downgrades the `system services
+	// dynamic-dns` `forced-refresh` / `error-backoff-max` unparseable-value
+	// gate from a hard compile error to a cfg.Warnings entry. Both leaves
+	// accept a Go duration string ("24h") or a bare-seconds integer
+	// ("86400"); before #4837 a value that parsed as NEITHER (a typo like
+	// "24hh", or a negative/garbage value) was silently discarded —
+	// compileDDNSServices left the field unset (falling back to its
+	// downstream default) with no commit-time signal, so the operator
+	// believed their tuning applied when it silently did not. The strict
+	// commit / commit-check path hard-rejects, naming the offending value;
+	// the tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted config an older binary accepted still BOOTS (#1960
+	// fail-closed-on-load class) — the field stays unset either way (the
+	// pre-#4837 runtime behavior is unchanged on the lenient path), only the
+	// warning is new. Same doctrine as lenientSNMPTrapGroup.
+	lenientDDNSDuration bool
 	// lenientPolicyTerminalAction (#3043) downgrades the security-policy
 	// terminal-action gate (validatePolicyTerminalActionStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit /
@@ -1314,6 +1330,22 @@ type compileOpts struct {
 	// advertise an out-of-range VRID, so a leniently-loaded bad id is bounded,
 	// not a wrong-VRID advert. Same doctrine as lenientChassisRG.
 	lenientVRRPGroupID bool
+	// lenientRethVRRPGroupID (#4826) downgrades the reth-derived VRRP VRID
+	// wire-width gate (validateRethVRRPGroupIDStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `redundant-ether-options redundancy-group <id>` whose
+	// id would push the reth-derived VRRP GroupID (100+id) past the RFC 5798
+	// VRID range 1..255 — the chassis redundancy-group id gate
+	// (validateChassisClusterStrict) alone permits id up to 255, which is
+	// the heartbeat wire bound, not the VRRP one, so an id in 156..255 used
+	// to commit cleanly and then silently lose VRRP for that redundancy
+	// group. The tolerant load / peer-sync paths downgrade to a warning so
+	// an already-persisted or peer-synced config still BOOTS (#1960
+	// no-brick); the pkg/vrrp/manager.go runtime range check independently
+	// refuses to advertise the out-of-range VRID, so a leniently-loaded bad
+	// id is bounded, not a wrong-VRID advert. Same doctrine as
+	// lenientVRRPGroupID.
+	lenientRethVRRPGroupID bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1647,6 +1679,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientBGPNeighborPeerAS:               true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
+		lenientDDNSDuration:                    true,
 		lenientPolicyTerminalAction:            true,
 		lenientPolicyLogAction:                 true,
 		lenientDuplicatePolicyNames:            true,
@@ -1657,6 +1690,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFlowAging:                       true,
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
+		lenientRethVRRPGroupID:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -1896,6 +1930,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientBGPNeighborPeerAS:               true,
 		lenientRouterID:                        true,
 		lenientSNMPTrapGroup:                   true,
+		lenientDDNSDuration:                    true,
 		lenientPolicyTerminalAction:            true,
 		lenientPolicyLogAction:                 true,
 		lenientDuplicatePolicyNames:            true,
@@ -1906,6 +1941,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFlowAging:                       true,
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
+		lenientRethVRRPGroupID:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
