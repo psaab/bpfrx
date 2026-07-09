@@ -2132,16 +2132,22 @@ pub(crate) fn parse_policy_state_with_counters(
         // #3019: arm the LocalDelivery junos-host policy gate iff a rule
         // actually names the reserved self zone on either side.
         //
-        // #3639: a GLOBAL policy carries its junos-host context out-of-band in
-        // `match_to_zone` (its structural `to_zone` stays "junos-global"), so a
-        // `global policy ... match to-zone junos-host` must ALSO arm the gate —
-        // otherwise `evaluate_junos_host_policy_l3_aware` short-circuits on
-        // `!has_junos_host_rules` and the global-tier host consult below never
-        // runs. `match_to_zone` is populated only for globals, so this can never
-        // fire for a plain zone-pair rule.
+        // #3639/#4626: a GLOBAL policy carries its junos-host context out-of-band
+        // in the `match to-zone` SCOPE (its structural `to_zone` stays
+        // "junos-global"), so a `global policy ... match to-zone junos-host` must
+        // ALSO arm the gate — otherwise `evaluate_junos_host_policy_l3_aware`
+        // short-circuits on `!has_junos_host_rules` and the global-tier host
+        // consult below never runs. Read the gate from the RESOLVED
+        // `global_to_zone` (`is_host_scope()`), NOT the raw singular
+        // `snap.match_to_zone`: the scope build above PREFERS the plural
+        // `match_to_zones`, so a plural-only snapshot (`match_to_zones =
+        // ["junos-host"]`, empty singular) resolves to a host scope but the
+        // singular field is empty — arming off the singular there would silently
+        // fail the host-inbound global OPEN. `is_host_scope()` is Any-false, so a
+        // plain zone-pair rule (empty scope → Any) can never fire it.
         if snap.from_zone == JUNOS_HOST_ZONE_NAME
             || snap.to_zone == JUNOS_HOST_ZONE_NAME
-            || snap.match_to_zone == JUNOS_HOST_ZONE_NAME
+            || state.rules[idx].global_to_zone.is_host_scope()
         {
             state.has_junos_host_rules = true;
         }

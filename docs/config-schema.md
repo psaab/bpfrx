@@ -740,20 +740,28 @@ tag, asserted only on leaves audited to take a fixed value and NO body
 `hostname`). This is the "design pass on the value-arity contract" the #3332
 body called for; new scalar leaves opt in as they are audited.
 
-**#4415 L12 — scoped global-policy `from-zone`/`to-zone`.** A Junos global
-policy may carry an optional `match from-zone` / `match to-zone` to scope it
-to a chosen zone pair (#3148). The typed model behind it —
-`config.PolicyMatch.FromZone` / `.ToZone` — is a single string, and the
-compiler (`compiler_security_policy.go`) fills it from only the FIRST value
-token. A zone LIST (`match from-zone [ trust dmz ]`) collapses via the #2419
-lexer onto one leaf's Keys (`["from-zone","trust","dmz"]`), so the compiler
-kept `trust` and silently DROPPED `dmz` — a security-relevant scope
-narrowing with no operator-visible signal. Both leaves are now tagged
-`scalar: true`, so `SchemaValidate` rejects the list at commit instead of
-dropping a zone. Modeling a real multi-zone scope (Junos accepts a list here)
-is deferred as #4415 M03; until then the fail-closed rejection is the correct
-behavior. Pinned by
-`pkg/config/schema_global_zone_list_4415_test.go`.
+**#4415 L12 → #4626 M03 — scoped global-policy `from-zone`/`to-zone` (a zone
+SET).** A Junos global policy may carry an optional `match from-zone` /
+`match to-zone` to scope it to a set of zones (#3148). The typed model behind
+it — `config.PolicyMatch.FromZones` / `.ToZones` — is a `[]string` SET
+(sorted + de-duplicated at compile; an empty slice = all zones; a one-element
+slice = the single-zone case, bit-identical to the pre-#4626 single string). A
+zone LIST (`match from-zone [ trust dmz ]`) collapses via the #2419 lexer onto
+one leaf's Keys (`["from-zone","trust","dmz"]`); both leaves therefore carry
+`multi: true` (NOT `scalar: true`), and the compiler
+(`compiler_security_policy.go`) ACCUMULATES every value via the
+`firewallMatchValues` dual-AST SSOT rather than keeping only `Keys[1]`. The
+pre-#4626 code kept `trust` and silently DROPPED `dmz`; the #4415 L12 interim
+fail-closed `scalar: true` rejected the list outright — both are now replaced
+by real multi-zone parity (a packet matches iff its from-zone ∈ `FromZones`
+AND its to-zone ∈ `ToZones`). The strict commit gate validates per element
+(undefined-zone reject; `from-zone junos-host` reject; a scope list mixing
+`any` with concrete zones, or a `to-zone` list mixing `junos-host` with other
+zones, rejected). The scope crosses the wire as ADDITIVE plural
+`match_from_zones` / `match_to_zones` alongside the retained singular
+`match_from_zone` / `match_to_zone` (first element, rolling-upgrade safe).
+Pinned by `pkg/config/schema_global_zone_list_4415_test.go` (now a positive
+multi-zone accept) and `pkg/config/scoped_global_zoneset_4626_test.go`.
 
 `isScalarValueLeaf` also carries belt-and-braces structural guards, so a
 future mis-tag on a node that is actually multi / typed / a container
@@ -3797,8 +3805,9 @@ The two leaves are declared **only under the global policy `match` node** in
 surrounding from-zone/to-zone stanza, so the `match`-level leaves are
 global-only — `globalOnlyPolicyMatchLeaves` in `compiler_policy_match.go`
 admits them through the #3113 unsupported-leaf gate for global scope and the
-gate still rejects them under a zone-pair policy). `compilePolicy` reads them
-into `Policy.Match.FromZone`/`.ToZone` (empty = all zones).
+gate still rejects them under a zone-pair policy). `compilePolicy` accumulates
+them (via `firewallMatchValues`) into `Policy.Match.FromZones`/`.ToZones`
+(`[]string`, sorted + de-duplicated; empty = all zones — #4626 M03).
 
 **#3673 — the zone-context sibling of the #3142 tail escape.** Because
 from-zone/to-zone are NOT registered `match` siblings under a zone-pair policy,

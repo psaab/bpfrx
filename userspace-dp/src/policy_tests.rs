@@ -5520,6 +5520,48 @@ fn global_policy_to_zone_junos_host_denies_host_inbound_from_any_zone() {
     }
 }
 
+/// #4626 M03: a PLURAL-ONLY host scope must arm the gate and be enforced. A
+/// snapshot carrying `match_to_zones = ["junos-host"]` with an EMPTY singular
+/// `match_to_zone` resolves `global_to_zone` to a host scope (the decoder
+/// prefers the plural); `has_junos_host_rules` must therefore be armed from the
+/// RESOLVED scope, not the empty singular field — otherwise the host-inbound
+/// global silently fails OPEN.
+///
+/// RED-on-revert: arming `has_junos_host_rules` from `snap.match_to_zone`
+/// (the singular field, empty here) leaves the gate unarmed, so
+/// `evaluate_junos_host_policy_l3_aware` short-circuits and this global deny
+/// returns `None` (permit-through), not Deny.
+#[test]
+fn global_policy_plural_only_to_zone_junos_host_is_enforced() {
+    // Plural-only: match_to_zones = ["junos-host"], singular match_to_zone = "".
+    let mut rule = global_zone_set_rule("host-block", &[], &["junos-host"], "deny");
+    rule.match_to_zone = String::new();
+    assert_eq!(rule.match_to_zone, "", "test premise: singular must be empty");
+    assert_eq!(rule.match_to_zones, vec!["junos-host".to_string()]);
+
+    let state = parse_policy_state("permit", &[rule], &test_zone_name_to_id());
+    assert!(
+        state.has_junos_host_rules,
+        "a plural-only match to-zone junos-host must arm the host gate"
+    );
+    let res = evaluate_junos_host_policy(
+        &state,
+        TEST_UNTRUST_ZONE_ID,
+        "10.0.2.102".parse().expect("src"),
+        "10.0.2.1".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        22,
+        None,
+        64,
+    );
+    assert_eq!(
+        res.map(|r| r.action),
+        Some(PolicyAction::Deny),
+        "a plural-only global match to-zone junos-host deny must block host-inbound"
+    );
+}
+
 /// Precedence: an exact `from-zone trust to-zone junos-host permit` WINS over a
 /// global `match to-zone junos-host deny` for a trust-ingress host-bound flow
 /// (specific beats global, mirroring transit-policy precedence). For an ingress
