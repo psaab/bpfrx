@@ -11,6 +11,46 @@ import "net"
 // ignored (a security fail-open). The compiler now captures the allowlist
 // (parseSNMPClients) and the SNMP agent enforces it before serving a v2c
 // request (AllowsSource).
+//
+// #4711: the `clients` prefixes are parsed ONCE at config-compile time into
+// clientNets (a []compiledSNMPClient) rather than re-parsed on every incoming
+// v2c packet. AllowsSource then does an allocation-free longest-prefix match
+// over the precomputed *net.IPNet set. compileClientNets runs during compilation
+// (compiler_system.go), before the config is published to the SNMP agent, so the
+// cache is set with no concurrent readers; AllowsSource never mutates it.
+
+// compiledSNMPClient is a `clients` allowlist entry with its prefix already
+// parsed into a *net.IPNet (#4711). ones is the prefix length (net.IPMask
+// Size), cached so the longest-prefix comparison in AllowsSource needs no
+// per-packet Mask.Size() call. restrict mirrors SNMPClient.Restrict.
+type compiledSNMPClient struct {
+	net      *net.IPNet
+	ones     int
+	restrict bool
+}
+
+// compileClientNets pre-parses a `clients` allowlist into the allocation-free
+// match set consumed by AllowsSource (#4711). An unparseable prefix is skipped
+// (inert), exactly as the former per-call parse skipped it — never a silent
+// allow-all. Returns nil for an empty allowlist; a non-empty allowlist whose
+// entries are all unparseable yields a non-nil empty slice, so a populated but
+// fully-inert list still default-denies (and is distinguishable from "not yet
+// compiled").
+func compileClientNets(clients []SNMPClient) []compiledSNMPClient {
+	if len(clients) == 0 {
+		return nil
+	}
+	out := make([]compiledSNMPClient, 0, len(clients))
+	for _, cl := range clients {
+		_, ipnet, err := parseClientPrefix(cl.Prefix)
+		if err != nil || ipnet == nil {
+			continue // an unparseable prefix is inert, never a silent allow-all
+		}
+		ones, _ := ipnet.Mask.Size()
+		out = append(out, compiledSNMPClient{net: ipnet, ones: ones, restrict: cl.Restrict})
+	}
+	return out
+}
 
 // AllowsSource reports whether a v2c query from srcIP may be served under this
 // community. Semantics (Junos):
@@ -24,6 +64,12 @@ import "net"
 // A nil srcIP (e.g. a non-IP transport / test path with no address) is allowed
 // so enforcement never blocks a request whose source cannot be determined; the
 // real serving path always supplies the UDP source address.
+//
+// #4711: the match runs against clientNets, the prefixes parsed once at compile
+// time. A community built directly (e.g. a unit test) that never went through
+// the compiler has a nil clientNets; AllowsSource then parses on the fly for the
+// same decision — this reads only local state, so it stays race-free under
+// concurrent serving, and the real serving path always has clientNets populated.
 func (c *SNMPCommunity) AllowsSource(srcIP net.IP) bool {
 	if c == nil {
 		return false
@@ -34,20 +80,21 @@ func (c *SNMPCommunity) AllowsSource(srcIP net.IP) bool {
 	if srcIP == nil {
 		return true
 	}
+	nets := c.clientNets
+	if nets == nil {
+		// Not compiled (directly-constructed community) — parse on the fly.
+		// Same decision, just not the precomputed fast path.
+		nets = compileClientNets(c.Clients)
+	}
 	bestBits := -1
 	bestAllow := false
-	for _, cl := range c.Clients {
-		_, ipnet, err := parseClientPrefix(cl.Prefix)
-		if err != nil || ipnet == nil {
-			continue // an unparseable prefix is inert, never a silent allow-all
-		}
-		if !ipnet.Contains(srcIP) {
+	for _, cn := range nets {
+		if !cn.net.Contains(srcIP) {
 			continue
 		}
-		ones, _ := ipnet.Mask.Size()
-		if ones > bestBits {
-			bestBits = ones
-			bestAllow = !cl.Restrict
+		if cn.ones > bestBits {
+			bestBits = cn.ones
+			bestAllow = !cn.restrict
 		}
 	}
 	if bestBits < 0 {

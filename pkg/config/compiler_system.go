@@ -1141,6 +1141,13 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				if comm.Authorization == "" {
 					comm.Authorization = "read-only"
 				}
+				// #4711: pre-parse the `clients` prefixes once now that
+				// comm.Clients is finalized, so AllowsSource does an
+				// allocation-free match per incoming v2c packet instead of
+				// re-parsing every prefix on every packet. Runs here, before
+				// the config is published to the SNMP agent, so the cache is
+				// set with no concurrent readers.
+				comm.clientNets = compileClientNets(comm.Clients)
 				snmp.Communities[comm.Name] = comm
 			}
 		case "trap-group":

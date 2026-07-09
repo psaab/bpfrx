@@ -42974,3 +42974,25 @@ top.
 - **Validation**: go build ./... clean; go test ./pkg/upgrade/ -count=1 ok;
   full `go test ./...` green; RED-on-revert verified (both surfacing tests FAIL
   when kernel_drain.go reverted, success guard still PASS).
+
+## 2026-07-09 — #4711 parse SNMP client CIDRs once (perf)
+- **Timestamp**: 2026-07-09
+- **Action**: SNMPCommunity.AllowsSource re-parsed every configured `clients`
+  prefix (net.ParseCIDR/ParseIP) on EVERY incoming v2c packet. Pre-parse the
+  allowlist ONCE at config-compile time into an unexported []compiledSNMPClient
+  (clientNets) so AllowsSource does an allocation-free longest-prefix match.
+  compileClientNets runs in the compiler (compiler_system.go) after Clients is
+  finalized, before the config reaches the SNMP agent — no concurrent readers.
+  A directly-constructed community (nil clientNets, e.g. a unit test) falls back
+  to on-the-fly parsing for the SAME decision; the fallback reads only local
+  state, so it stays race-free. Semantics preserved exactly: empty list =
+  allow-all, longest-prefix match with per-entry `restrict`, no-match =
+  default-deny, malformed entry skipped-inert (never a silent allow-all).
+- **File(s)**: pkg/config/snmp_clients.go (compiledSNMPClient type,
+  compileClientNets, cache-reading AllowsSource), pkg/config/types_system.go
+  (clientNets field), pkg/config/compiler_system.go (build cache at compile),
+  pkg/config/snmp_clients_4711_test.go (new: cache populated, compiled-vs-
+  fallback parity, malformed skipped-inert, empty allow-all)
+- **Validation**: gofmt clean; go build ./... clean; go vet ./pkg/config
+  ./pkg/snmp clean (no copylocks); go test ./pkg/config/... + ./pkg/snmp/...
+  pass; full `go test ./...` green (53 ok / 0 fail / 3 no-test-files, 56 pkgs).
