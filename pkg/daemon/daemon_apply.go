@@ -992,73 +992,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		return err
 	}
 
-	// 3. Apply all routes + dynamic protocols via FRR.
-	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
-	// with the ip-monitoring routes-only actuator (#1827) — the full
-	// apply consumes the same (config-filtered) overlay computed in
-	// step 1.95, so an operator commit while a policy is FAILED
-	// preserves a still-valid injected failover route and drops
-	// removed/edited entries on the commit itself.
-	if d.frr != nil {
-		// The full apply path deliberately warns-and-continues on an FRR
-		// reload error (a transient FRR hiccup must not fail an
-		// otherwise-valid operator commit; a boot-time re-apply
-		// reconverges FRR). The returned error is only consumed by the
-		// ip-monitoring routes-only actuator, which must not publish a
-		// divergent snapshot on a hard failure (#3757).
-		_ = d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
-	}
-
-	// 3b. Apply next-table policy routing rules (ip rule)
-	if d.routing != nil {
-		// Collect all static routes from main + per-rib. Build the combined
-		// list in a fresh slice — appending Inet6StaticRoutes onto
-		// cfg.RoutingOptions.StaticRoutes directly would write into that
-		// slice's backing array when it has spare capacity (cap > len),
-		// mutating the shared active-config object other goroutines read
-		// concurrently (same hazard fixed in collectNeighborProbeTargets,
-		// fbd159e55 / #1781 r1).
-		allRoutes := make([]*config.StaticRoute, 0,
-			len(cfg.RoutingOptions.StaticRoutes)+len(cfg.RoutingOptions.Inet6StaticRoutes))
-		allRoutes = append(allRoutes, cfg.RoutingOptions.StaticRoutes...)
-		allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
-		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances); err != nil {
-			slog.Warn("failed to apply next-table rules", "err", err)
-		}
-	}
-
-	// 3c. Apply rib-group route leaking rules (ip rule). #3876: the leak is
-	// now per connected prefix (`ip rule to <prefix> lookup <sourceTable>`
-	// BEFORE main) so an imported interface route wins over a main-table
-	// default route. The connected prefixes are derived from the config
-	// addresses on each source instance's member interface units, using the
-	// same derivation the userspace FIB uses for connected routes.
-	if d.routing != nil && len(cfg.RoutingOptions.RibGroups) > 0 {
-		connectedPrefixes := config.RibGroupConnectedPrefixes(cfg)
-		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances, connectedPrefixes); err != nil {
-			slog.Warn("failed to apply rib-group rules", "err", err)
-		}
-	}
-
-	// 3d. Apply policy-based routing rules (ip rule) for firewall filter
-	// routing-instance (filter-based forwarding). Rules are derived only from
-	// filters attached as an interface input filter (#3430 H1); a degraded
-	// build — an unrepresentable except set, a DSCP-0 match, an
-	// ip-rule-unrepresentable L4/per-packet predicate (port-except / tcp-flags /
-	// icmp / is-fragment / flex, #3730), or an overflow — is surfaced but does
-	// not block the rest of the apply. The degraded term is DROPPED (fail-safe
-	// under-steer to the main table), never widened to an address-only over-steer.
-	if d.routing != nil {
-		pbrRules, buildErr := routing.BuildPBRRules(cfg)
-		if buildErr != nil {
-			slog.Warn("PBR rule build degraded; some routing-instance filter terms "+
-				"are not mirrored to the kernel FBF path and fall back to the main "+
-				"table (userspace filter path still enforces them)", "err", buildErr)
-		}
-		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
-			slog.Warn("failed to apply PBR rules", "err", err)
-		}
-	}
+	d.applyRoutingRules(cfg, commitOverlay)
 
 	// 4. Proactive neighbor resolution for all known next-hops/gateways.
 	// This ensures bpf_fib_lookup returns SUCCESS (with valid MACs)
@@ -1210,6 +1144,85 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// helper creates lo0Err/hostInboundErr and returns the identical
 	// five-way errors.Join.
 	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyRoutingRules applies the routing-rules layer during a config apply:
+// the FRR config (static + dynamic protocols, best-effort — the error is
+// consumed only by the async reconciler), next-table policy-routing rules,
+// rib-group route-leaking rules, and firewall-filter policy-based routing (PBR)
+// rules. Extracted verbatim from applyConfigLocked (#4407); all steps are
+// idempotent ip-rule/FRR reconciles that log-and-continue, so the block has no
+// early return. commitOverlay is the ip-monitoring route overlay folded into
+// the FRR assembly. Runs in the same slot, after the dataplane apply / RETH-MAC
+// sequence and before proactive neighbor resolution.
+func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.RouteOverlayEntry) {
+	// 3. Apply all routes + dynamic protocols via FRR.
+	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
+	// with the ip-monitoring routes-only actuator (#1827) — the full
+	// apply consumes the same (config-filtered) overlay computed in
+	// step 1.95, so an operator commit while a policy is FAILED
+	// preserves a still-valid injected failover route and drops
+	// removed/edited entries on the commit itself.
+	if d.frr != nil {
+		// The full apply path deliberately warns-and-continues on an FRR
+		// reload error (a transient FRR hiccup must not fail an
+		// otherwise-valid operator commit; a boot-time re-apply
+		// reconverges FRR). The returned error is only consumed by the
+		// ip-monitoring routes-only actuator, which must not publish a
+		// divergent snapshot on a hard failure (#3757).
+		_ = d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
+	}
+
+	// 3b. Apply next-table policy routing rules (ip rule)
+	if d.routing != nil {
+		// Collect all static routes from main + per-rib. Build the combined
+		// list in a fresh slice — appending Inet6StaticRoutes onto
+		// cfg.RoutingOptions.StaticRoutes directly would write into that
+		// slice's backing array when it has spare capacity (cap > len),
+		// mutating the shared active-config object other goroutines read
+		// concurrently (same hazard fixed in collectNeighborProbeTargets,
+		// fbd159e55 / #1781 r1).
+		allRoutes := make([]*config.StaticRoute, 0,
+			len(cfg.RoutingOptions.StaticRoutes)+len(cfg.RoutingOptions.Inet6StaticRoutes))
+		allRoutes = append(allRoutes, cfg.RoutingOptions.StaticRoutes...)
+		allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
+		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances); err != nil {
+			slog.Warn("failed to apply next-table rules", "err", err)
+		}
+	}
+
+	// 3c. Apply rib-group route leaking rules (ip rule). #3876: the leak is
+	// now per connected prefix (`ip rule to <prefix> lookup <sourceTable>`
+	// BEFORE main) so an imported interface route wins over a main-table
+	// default route. The connected prefixes are derived from the config
+	// addresses on each source instance's member interface units, using the
+	// same derivation the userspace FIB uses for connected routes.
+	if d.routing != nil && len(cfg.RoutingOptions.RibGroups) > 0 {
+		connectedPrefixes := config.RibGroupConnectedPrefixes(cfg)
+		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances, connectedPrefixes); err != nil {
+			slog.Warn("failed to apply rib-group rules", "err", err)
+		}
+	}
+
+	// 3d. Apply policy-based routing rules (ip rule) for firewall filter
+	// routing-instance (filter-based forwarding). Rules are derived only from
+	// filters attached as an interface input filter (#3430 H1); a degraded
+	// build — an unrepresentable except set, a DSCP-0 match, an
+	// ip-rule-unrepresentable L4/per-packet predicate (port-except / tcp-flags /
+	// icmp / is-fragment / flex, #3730), or an overflow — is surfaced but does
+	// not block the rest of the apply. The degraded term is DROPPED (fail-safe
+	// under-steer to the main table), never widened to an address-only over-steer.
+	if d.routing != nil {
+		pbrRules, buildErr := routing.BuildPBRRules(cfg)
+		if buildErr != nil {
+			slog.Warn("PBR rule build degraded; some routing-instance filter terms "+
+				"are not mirrored to the kernel FBF path and fall back to the main "+
+				"table (userspace filter path still enforces them)", "err", buildErr)
+		}
+		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
+			slog.Warn("failed to apply PBR rules", "err", err)
+		}
+	}
 }
 
 // applyFabricIPVLAN creates the fabric-member IPVLAN overlays (fab0/fab1) for
