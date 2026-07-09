@@ -43696,3 +43696,7 @@ top.
 - **Timestamp**: 2026-07-09
   - **Action**: #4652 — decompose segment_forwarded_tcp_frames_from_frame: extract emit_ipv4_segment / emit_ipv6_segment / encap_tunnel_segment inline helpers (byte-identical arm bodies + &mut-param reborrow)
   - **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs
+
+- **Timestamp**: 2026-07-09
+  - **Action**: #4455 Component B — commit-time WARN advisory for managed-FRR routing protocol (OSPF/OSPFv3/RIP) enabled on an interface whose zone omits the matching host-inbound-traffic token (the inverse of the shipped #4454 advisory)
+  - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/host_inbound_managed_routing_mismatch_4455_test.go, docs/host-inbound-multicast.md
