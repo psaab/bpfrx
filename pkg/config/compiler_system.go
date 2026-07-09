@@ -1141,6 +1141,19 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				if comm.Authorization == "" {
 					comm.Authorization = "read-only"
 				}
+				// #4834: reject/warn on an unparseable `clients` entry before
+				// it reaches compileClientNets. See validateSNMPClients for
+				// why this matters beyond a plain prefix typo: it also
+				// catches a mistyped "restrict" keyword, which otherwise
+				// silently detaches from the preceding prefix and turns a
+				// deny-except entry into an unrestricted allow (fail-open).
+				clientWarnings, err := validateSNMPClients(comm.Clients, lenient)
+				if err != nil {
+					return err
+				}
+				if cfg != nil {
+					cfg.Warnings = append(cfg.Warnings, clientWarnings...)
+				}
 				// #4711: pre-parse the `clients` prefixes once now that
 				// comm.Clients is finalized, so AllowsSource does an
 				// allocation-free match per incoming v2c packet instead of
