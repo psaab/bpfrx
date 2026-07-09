@@ -43953,9 +43953,17 @@ top.
   **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4878 type the IKE/IPsec-gateway DPD interval/threshold value leaves (ValueInteger + ValidateInteger(1,3600) / (1,100)) so garbage/zero/negative/overflow is rejected at commit-check (strict) and downgraded to a warning on tolerant load (#1960 via compileTreeLenient); both closed-world copies
+  **File(s)**: pkg/config/schema_security.go, pkg/config/dpd_typed_value_4878_test.go, docs/config-schema.md
   **Action**: #4961 scope RA supersession per-interface — WithdrawInterfaces/WithdrawOnce bump a per-interface epoch (ifaceEpoch) instead of the whole-manager fence; releaseDrain restart + applyDeferred check the per-interface baseline (drainEntry.startIfaceEpoch) so an unrelated withdraw of interface B no longer cancels interface A's in-flight restart (IPv6 loss)
   **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md
 
 - **Timestamp**: 2026-07-09
   **Action**: #4963 stop flow-export session-close records being silently stranded when a callback loaded the pre-reconcile bundle just before it was retired. Added an allocation-free admission lease to flowBatch (retired flag + inflight atomic + handoffDropped counter + injected fixed-cardinality family counter). add() rejects+counts a post-retire record instead of appending it into a batch nothing drains; Exporter/IPFIXExporter.Retire() (called before cancel in both reconcile swap + teardown paths) drains in-flight admits so records admitted before the final flush are still flushed. Surfaced HandoffDropped in ExporterBatchStats + Daemon.FlowExportHandoffDropped().
   **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go, pkg/flowexport/handoff_lease_4963_test.go, pkg/flowexport/README.md, pkg/daemon/daemon.go, pkg/daemon/daemon_flowexport.go
+  **Action**: #4964 stop applyAggregator leaking an append-only EventReader callback + a never-flushed 20k-key SessionAggregator per report-enabled commit. Register one stable indirection callback (aggregationCallback) exactly once via aggCBOnce, publish the live aggregator through an atomic.Pointer (aggregatorPtr), swap-to-nil-before-cancel on retire — mirrors the #3932 TraceWriter / #2075 flowexport pattern. Removed the write-only aggregator field; added aggReconMu.
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_system.go, pkg/daemon/aggregator_callback_4964_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4968 make the remote CLI pipe filter case-SENSITIVE to match the local CLI. Extracted the remote dispatchWithPipe switch into a testable applyPipeFilter() helper and removed the strings.ToLower on both operands for match/grep/except/find so `| match Foo` no longer matches `foo` on remote while missing it on local (Junos `| match` never case-folds). Aligns with pkg/cli.filterStream's bare strings.Contains(line, pipeArg).
+  **File(s)**: cmd/cli/shared.go, cmd/cli/pipe_filter_case_4968_test.go

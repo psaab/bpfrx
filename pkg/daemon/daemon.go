@@ -299,11 +299,28 @@ type Daemon struct {
 	eventBuf       *logging.EventBuffer
 	eventReader    *logging.EventReader
 	eventEngine    *eventengine.Engine
-	aggregator     *logging.SessionAggregator
-	aggCancel      context.CancelFunc
-	vrrpMgr        *vrrp.Manager
-	gc             *conntrack.GC
-	startTime      time.Time // daemon start time; used to suppress stale config sync
+	// #4964: the session-aggregation reporter is published through an atomic
+	// pointer read lock-free by a SINGLE stable EventReader callback that
+	// aggCBOnce registers exactly once. Each report-enabled commit SWAPS the
+	// active aggregator (nil-ing the pointer before cancelling the old Run
+	// goroutine) instead of registering a new callback, so a long-lived daemon
+	// that re-commits with reporting enabled leaves exactly one callback and
+	// one live aggregator regardless of commit count. Before #4964
+	// applyAggregator called er.AddCallback on every report-enabled reconcile:
+	// the callback list is append-only (ringbuf.go: only ClearCallbacks
+	// removes, and it is all-or-nothing), so N commits leaked N callbacks each
+	// feeding a stale never-flushed 20k-key Space-Saving aggregator, and every
+	// event was then dispatched to all N — growing per-event cost and memory
+	// even after reporting was disabled. Disabling reporting stores nil; the
+	// stable callback stays but becomes a no-op. aggReconMu serializes the
+	// swap on the commit path; the callback reads the pointer lock-free.
+	aggregatorPtr atomic.Pointer[logging.SessionAggregator]
+	aggCancel     context.CancelFunc
+	aggCBOnce     sync.Once
+	aggReconMu    sync.Mutex
+	vrrpMgr       *vrrp.Manager
+	gc            *conntrack.GC
+	startTime     time.Time // daemon start time; used to suppress stale config sync
 
 	// #846: applySem (capacity 1) serializes applyConfig + the
 	// commit→apply pair across all entry points (HTTP/gRPC commits,
