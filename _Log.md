@@ -43317,6 +43317,26 @@ top.
 - **File(s)**: pkg/routing/routing_test.go, _Log.md
 
 - **Timestamp**: 2026-07-09 (session 015oARShYtiJJ2H4UB4nXGqi)
+- **Action**: #4499 residual test-coverage (reject-path + NAT64/AppCatalog).
+  VERIFY-FIRST reconcile: the bulk of #4499 (E7 PBR+NAT64 override, H1 PBR
+  egress output-filter, H6 IPv6 PBR dest-port fail-closed, H4 Rust-kernel
+  output-filter re-eval) was ALREADY landed by the merged commit 7a320521b;
+  A2 (reject ICMP type-3/code-13, ICMPv6-1/1, and TCP RST byte-level) is
+  ALREADY comprehensively covered (reject_icmp_unreachable_v4/v6_* in
+  afxdp/tests.rs + build_reject_rst_frame tests in frame/tcp_tests.rs) — the
+  issue-comment premise was stale. Two genuine residual gaps remained and are
+  now pinned: (E2) deny-path emits POLICY_DENY, never a session-init
+  (SessionCreate) record, for both `then reject` (RST enqueued) and plain
+  `then deny` (silent drop) via deny_reply_and_emit; (A5) NAT64 translation
+  preserves the L4 service port so AppCatalog::lookup_forward resolves the same
+  application on the translated v4 flow as the original v6 flow (port read back
+  from the translated frame + a non-80 control). Mutation-verified RED: the E2
+  kind pins bite when emit_policy_deny_event's kind is flipped to
+  SessionCreate; A5 bites when the translated dst port is corrupted. Full
+  binary suite 3772 passed / 0 failed / 2 ignored. Production untouched
+  (test-only).
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/reject_reply_tests.rs,
+  userspace-dp/src/nat64_tests.rs, _Log.md
 - **Action**: #4422 slice — pin the CLEAN Surface A DDNS provider-transition.
   VERIFY-FIRST: CORRECT, no bug. When a binding's `provider` reference is
   switched A->B while BOTH providers stay in the catalog, the transition is a
