@@ -43710,3 +43710,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: Guard config-DB AES-GCM decrypt against wrong-length nonce (fail closed with error instead of panic); add RED-on-revert test
   **File(s)**: pkg/configstore/crypto.go, pkg/configstore/crypto_nonce_length_4793_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix clearDHCPIdentifiersHandler wiping ALL DHCPv6 DUIDs on a chunked-encoded clear-one request (gate body decode on ContentLength != 0, tolerate empty-body io.EOF); add RED-on-revert test
+  **File(s)**: pkg/api/dhcp.go, pkg/api/dhcp_clear_chunked_4794_test.go
