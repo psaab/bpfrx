@@ -43597,3 +43597,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 2 — extract startGRPCServer (gRPC API server startup block, PHASE 5 tail) from Run(); byte-identical body (dedent verified), 4 params (ctx, wg, eventBuf, fwdSampler). Leaf block, no ordering dependency
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 3 — extract startHTTPServer (HTTP REST API server startup block, 278 lines, PHASE 5) from Run(); byte-identical body (dedent verified), 3 params (ctx, wg, eventBuf), guard stays in Run(). Leaf block, no ordering dependency
+  **File(s)**: pkg/daemon/daemon_run.go
