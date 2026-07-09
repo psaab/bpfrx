@@ -43640,3 +43640,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 4 — extract initManagers (PHASE 3 manager-creation cluster, 173 lines) from Run(); body byte-identical, threads configCompileFailed (read-only) + returns error for the one fatal DHCP-create early-return; Run wraps with err-check. Dataplane+first-applyConfig stay in Run()
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 5 — extract loadAndBootstrapConfig (PHASE 1 config-load, 140 lines) from Run(); body byte-identical (1 return tweaked to (false,err)), returns (configCompileFailed bool, error); Run calls + err-check. #1917 fatal-floor + #1960 fail-closed flag preserved
+  **File(s)**: pkg/daemon/daemon_run.go
