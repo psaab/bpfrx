@@ -43939,3 +43939,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4884(C) devicemap enumerates non-PCI physical NICs (USB/platform/SoC) so key mac entries bind; classifyNetdev seam + doc
   **File(s)**: pkg/devicemap/devicemap.go, pkg/devicemap/devicemap_nonpci_4884_test.go, docs/bare-metal-device-map.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4954 give networkd Manager reload/reconfigure activation debt — a failed networkctl reload now re-attempts on the next identical Apply (reloadPending/reconfigurePending) instead of returning a false success when files are unchanged
+  **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md
