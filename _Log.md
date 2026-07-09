@@ -1,3 +1,34 @@
+## 2026-07-09 — #4731: stream `show ... | match/except/count/last` filters instead of buffering full output
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4731 — `dispatchWithPipe` (pkg/cli/cli_dispatch.go) did
+  `io.ReadAll` on the whole command output, then `strings.Split` on it before
+  filtering — buffering the ENTIRE output in memory (same OOM class #4709 fixed
+  for the pager) for a large `show route | match ...` etc. VERIFY-FIRST:
+  confirmed on origin/master (`0dbda9452`) that dispatchWithPipe still buffered,
+  and that #4709/PR #4730 already landed the `lineSource` (bufio.Reader + 1-line
+  lookahead) seam + the concurrent os.Pipe pager pattern — reused both, did NOT
+  reinvent. Rewrote dispatchWithPipe to mirror the #4709 concurrency: a filter
+  goroutine consumes the pipe via a new `filterStream(src, out, pipeType,
+  pipeArg)` helper while the command writes; the main goroutine runs
+  `c.dispatch(cmd)` (routing preserved exactly), closes the writer, then waits on
+  a done channel for the goroutine (which yields the command's exit code path
+  intact). Per pipe type: match/except/find/no-more emit line-by-line (≤1 line
+  held); count is a running tally (no buffering); last N is an n-wide circular
+  ring buffer (slot i%n, replay last min(count,n)) — never the whole output.
+  filterStream reuses lineSource so emitted lines are byte-identical to the old
+  strings.Split(output,"\n")-trailing-empty-dropped path. No early-return drain
+  needed — every filter reads to EOF (arrives on writer close). Tests:
+  cli_dispatch_pipe_stream_4731_test.go — a `bufferedFilter` reference reproduces
+  the pre-change io.ReadAll+strings.Split path and every pipe type × input
+  (trailing-nl/none, blank lines, arg-absent, empty, single line, \r\n, invalid
+  last args) is asserted byte-identical; plus anti-buffering proofs (match emits
+  the needle after reading <64KiB of a 2.6MB source via countingReader; count
+  tallies 500k lines; last-5 over 100k lines). Gates: go build ./... clean;
+  go test ./pkg/cli/... clean; `go test -race ./pkg/cli` ok (5.9s); full
+  `go test ./...` = 53 ok / 3 no-test / 0 FAIL.
+  **File(s)**: pkg/cli/cli_dispatch.go, pkg/cli/cli_dispatch_pipe_stream_4731_test.go, _Log.md
+
 ## 2026-07-09 — #4708: stream BGP routes REST response instead of buffering the full table
 
 - **Timestamp**: 2026-07-09

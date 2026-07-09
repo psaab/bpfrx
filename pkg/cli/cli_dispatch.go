@@ -51,6 +51,13 @@ func extractPipe(line string) (string, string, string, bool) {
 	}
 }
 
+// dispatchWithPipe runs a command and applies a Junos-style output filter
+// (| match/except/find/count/last/no-more) to its output. The command writes to
+// a pipe that a concurrent filter goroutine consumes line-by-line via the #4709
+// lineSource, so a huge "show ... | match ..." streams with bounded memory
+// instead of being buffered whole with io.ReadAll first (#4731). At most one
+// line (match/except/find/no-more), a running tally (count), or an n-line ring
+// (last) is ever held, regardless of total output.
 func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -59,49 +66,69 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	}
 	os.Stdout = w
 
-	outputCh := make(chan []byte, 1)
+	// The filter runs concurrently with the command: it reads the command's
+	// output from r as it is produced and writes the filtered result straight
+	// to the real stdout, so output is consumed lazily instead of materialized
+	// up front. Every filter reads to EOF (which arrives when w is closed), so
+	// no early-return drain is needed to unblock the writer.
+	done := make(chan struct{})
 	go func() {
-		output, _ := io.ReadAll(r)
+		filterStream(r, origStdout, pipeType, pipeArg)
 		r.Close()
-		outputCh <- output
+		close(done)
 	}()
 
 	cmdErr := c.dispatch(cmd)
 	w.Close()
 	os.Stdout = origStdout
+	<-done
 
-	output := <-outputCh
+	return cmdErr
+}
 
-	lines := strings.Split(string(output), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
+// filterStream reads newline-delimited output from src and applies a Junos-style
+// output filter, writing the result to out as each line is read. It reuses the
+// #4709 lineSource line splitting so the emitted lines are byte-identical to the
+// previous strings.Split(output, "\n")-with-trailing-empty-dropped path for any
+// input. match/except/find/no-more hold at most one line at a time; count keeps
+// only a running tally; last keeps a bounded ring buffer of the last n lines —
+// none buffers the full output (#4731).
+func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
+	ls := &lineSource{r: bufio.NewReader(src)}
 
 	switch pipeType {
 	case "match", "grep":
-		for _, line := range lines {
+		for ls.hasMore() {
+			line, _ := ls.next()
 			if strings.Contains(line, pipeArg) {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "except":
-		for _, line := range lines {
+		for ls.hasMore() {
+			line, _ := ls.next()
 			if !strings.Contains(line, pipeArg) {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "find":
 		found := false
-		for _, line := range lines {
+		for ls.hasMore() {
+			line, _ := ls.next()
 			if !found && strings.Contains(line, pipeArg) {
 				found = true
 			}
 			if found {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "count":
-		fmt.Fprintf(origStdout, "Count: %d lines\n", len(lines))
+		count := 0
+		for ls.hasMore() {
+			ls.next()
+			count++
+		}
+		fmt.Fprintf(out, "Count: %d lines\n", count)
 	case "last":
 		n := 10
 		if pipeArg != "" {
@@ -109,20 +136,29 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 				n = v
 			}
 		}
-		start := len(lines) - n
-		if start < 0 {
-			start = 0
+		// Circular buffer of the last n lines: slot i%n holds the i-th
+		// line, overwriting the oldest once more than n have arrived. Only
+		// n lines are ever retained, not the whole output.
+		ring := make([]string, n)
+		count := 0
+		for ls.hasMore() {
+			line, _ := ls.next()
+			ring[count%n] = line
+			count++
 		}
-		for _, line := range lines[start:] {
-			fmt.Fprintln(origStdout, line)
+		total := count
+		if total > n {
+			total = n
+		}
+		for i := count - total; i < count; i++ {
+			fmt.Fprintln(out, ring[i%n])
 		}
 	case "no-more":
-		for _, line := range lines {
-			fmt.Fprintln(origStdout, line)
+		for ls.hasMore() {
+			line, _ := ls.next()
+			fmt.Fprintln(out, line)
 		}
 	}
-
-	return cmdErr
 }
 
 // dispatchWithPager runs a "show" command and pages its output. The command
