@@ -559,6 +559,78 @@ fn translate_v6_to_v4_tcp() {
     assert_eq!(checksum16_ipv4_pseudo(src, dst, PROTO_TCP, tcp_payload), 0);
 }
 
+/// #4499 A5: NAT64 translation preserves the L4 ports, so the `AppCatalog`
+/// application resolution — which keys ONLY on (protocol, src_port, dst_port)
+/// and is deliberately address-agnostic — yields the SAME application for the
+/// original IPv6 flow and its NAT64-translated IPv4 flow. A v6 SYN to tcp/80
+/// (an `junos-http`-shaped catalog entry) is translated to v4; the destination
+/// service port is read back FROM the translated packet bytes and fed to
+/// `AppCatalog::lookup_forward`, which must still resolve `junos-http`.
+///
+/// This composes `nat64::translate_v6_to_v4` (the port-copy) with
+/// `policy::AppCatalog::lookup_forward` (the port-keyed resolution) as the A5
+/// finding asks. Because the service port is read out of the translated frame
+/// rather than hard-coded, a regression that corrupted the L4 port during
+/// translation would make the lookup miss (app_id 0 / UNKNOWN) and turn this
+/// RED — the exact "port not preserved across translation" failure. A no-match
+/// control (a non-80 dst) and the pre-translation v6 lookup (same app, proving
+/// address-independence) round out the pin.
+#[test]
+fn nat64_translation_preserves_port_for_appcatalog_lookup_4499() {
+    const HTTP_APP_ID: u16 = 42;
+    // A `junos-http`-shaped catalog: tcp, destination port 80 only.
+    let catalog = crate::policy::AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
+        app_id: HTTP_APP_ID,
+        protocol: PROTO_TCP,
+        dst_port_low: 80,
+        dst_port_high: 80,
+        src_port_low: 0,
+        src_port_high: 0,
+    }]);
+
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let client_port = 12345u16;
+    let http_port = 80u16;
+
+    // Pre-translation: the IPv6 flow resolves to junos-http purely by port
+    // (the catalog never sees an address), establishing the baseline.
+    assert_eq!(
+        catalog.lookup_forward(PROTO_TCP, client_port, http_port),
+        HTTP_APP_ID,
+        "the original v6 flow to tcp/80 resolves junos-http"
+    );
+
+    let ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, client_port, http_port, b"GET /");
+    let ipv4_pkt = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("translate");
+
+    // Read the L4 ports back out of the TRANSLATED v4 frame (TCP header at
+    // offset 20): src at 20..22, dst at 22..24. If translation corrupted them
+    // the lookup below misses.
+    let xlated_src_port = u16::from_be_bytes([ipv4_pkt[20], ipv4_pkt[21]]);
+    let xlated_dst_port = u16::from_be_bytes([ipv4_pkt[22], ipv4_pkt[23]]);
+    assert_eq!(xlated_src_port, client_port, "NAT64 preserves the source port");
+    assert_eq!(xlated_dst_port, http_port, "NAT64 preserves the dst service port");
+
+    // Post-translation: the SAME application resolves from the translated
+    // ports — the NAT64'd IPv4 flow is still classified junos-http.
+    assert_eq!(
+        catalog.lookup_forward(PROTO_TCP, xlated_src_port, xlated_dst_port),
+        HTTP_APP_ID,
+        "#4499 A5: the NAT64-translated v4 flow resolves the same app (port preserved)"
+    );
+
+    // Control: a translated flow to a NON-80 port must NOT resolve junos-http
+    // (proves the assertion above is port-sensitive, not a constant pass).
+    assert_eq!(
+        catalog.lookup_forward(PROTO_TCP, xlated_src_port, 8080),
+        0,
+        "a non-80 translated dst must not spuriously resolve junos-http"
+    );
+}
+
 #[test]
 fn translate_v4_to_v6_tcp() {
     let src_v4 = Ipv4Addr::new(198, 51, 100, 50);

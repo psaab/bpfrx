@@ -1670,6 +1670,138 @@ fn deny_reply_and_emit_success_logs_reject() {
     );
 }
 
+/// #4499 E2 (reject half): a policy `then reject` deny path emits a single
+/// RT_FLOW record whose KIND is `PolicyDeny` — NOT a `SessionCreate`
+/// (session-init) record — and NO second frame follows. The reject branch in
+/// the poll loop never reaches the session-install path, so a `then reject`
+/// policy configured with `then log session-init` produces the policy-deny log
+/// and the RST, but no session and hence no session-init log. This pins the
+/// EVENT KIND (the existing `deny_reply_and_emit_success_logs_reject` pins only
+/// the action byte). Fail-on-revert: if the deny path ever emitted a
+/// `SessionCreate`-kind record (a session-init leak on a denied flow), the kind
+/// assertion flips; if it emitted a trailing frame, the drain assertion flips.
+#[test]
+fn deny_reply_and_emit_reject_logs_policy_deny_kind_not_session_init_4499() {
+    use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+    use crate::event_stream::codec::DataplaneEventKind;
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let (frame, meta, flow) = tcp_v4_syn();
+    let (handle, rx) = unlimited_event_handle();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+    );
+    let forwarding = ForwardingState::default();
+    let mut counters = BatchCounters::default();
+    deny_reply_and_emit(
+        &mut pipeline,
+        &forwarding,
+        Some(&handle),
+        5,
+        &frame,
+        meta,
+        &flow,
+        &mut counters,
+        &NatDecision::default(),
+        7,
+        9,
+        0,
+        101,
+        PolicyAction::Reject,
+        0,
+        123,
+    );
+    // The RST is enqueued (active reject).
+    assert_eq!(counters.policy_reject_sent, 1, "the RST must be enqueued");
+    assert_eq!(pipeline.pending_tx_local.len(), 1);
+    // Exactly ONE record, and it is a POLICY_DENY — never a SESSION_CREATE.
+    let event = rx
+        .try_recv()
+        .expect("policy-deny event frame")
+        .decode_dataplane_event()
+        .expect("policy-deny payload");
+    assert_eq!(
+        event.kind,
+        DataplaneEventKind::PolicyDeny,
+        "#4499 E2: a `then reject` deny logs POLICY_DENY, never a session-init (SessionCreate)"
+    );
+    assert_eq!(event.action, RT_FLOW_ACTION_REJECT);
+    assert!(
+        rx.try_recv().is_err(),
+        "#4499 E2: no second (session-init) frame may follow a denied flow"
+    );
+}
+
+/// #4499 E2 (deny half): a policy `then deny` (plain deny, no ingress-zone
+/// `tcp-rst`) is a SILENT drop — `deny_reply_and_emit` enqueues NO reply, yet
+/// still emits a single RT_FLOW record whose kind is `PolicyDeny` and whose
+/// action is the truthful DENY. As with the reject half, the deny branch never
+/// installs a session, so even with `then log session-init` there is no
+/// session-init (SessionCreate) record: exactly one POLICY_DENY frame and no
+/// trailing frame. The existing `deny_reply_no_zone_tcp_rst_is_silent_drop`
+/// exercises only `enqueue_deny_reply` (the no-reply decision) and never drives
+/// the event emit; this pins the combined emit path for plain deny.
+/// Fail-on-revert: a plain deny that started synthesizing an RST flips the
+/// no-reply assertion; a plain deny that emitted a session-init flips the kind
+/// / drain assertions.
+#[test]
+fn deny_reply_and_emit_plain_deny_silent_logs_deny_no_session_init_4499() {
+    use crate::event_stream::codec::DataplaneEventKind;
+    let (frame, meta, flow) = tcp_v4_syn();
+    let (handle, rx) = unlimited_event_handle();
+    let mut pipeline = tx_pipeline(64, 64); // ample budget; plain deny still silent
+    let forwarding = ForwardingState::default(); // ingress zone 7 has no tcp-rst
+    let mut counters = BatchCounters::default();
+    deny_reply_and_emit(
+        &mut pipeline,
+        &forwarding,
+        Some(&handle),
+        5,
+        &frame,
+        meta,
+        &flow,
+        &mut counters,
+        &NatDecision::default(),
+        7, // from_zone (not tcp-rst enabled)
+        9, // to_zone
+        0, // owner_rg
+        101,
+        PolicyAction::Deny,
+        0,
+        123,
+    );
+    // Silent drop: no RST/ICMP reply enqueued, no reject counter bumped.
+    assert!(
+        pipeline.pending_tx_local.is_empty(),
+        "#4499 E2: a plain `then deny` (no zone tcp-rst) must enqueue no reply"
+    );
+    assert_eq!(counters.policy_reject_sent, 0);
+    // Exactly ONE POLICY_DENY record with the truthful DENY action, and no
+    // trailing session-init frame.
+    let event = rx
+        .try_recv()
+        .expect("policy-deny event frame")
+        .decode_dataplane_event()
+        .expect("policy-deny payload");
+    assert_eq!(
+        event.kind,
+        DataplaneEventKind::PolicyDeny,
+        "#4499 E2: a `then deny` logs POLICY_DENY, never a session-init (SessionCreate)"
+    );
+    assert_eq!(
+        event.action, RT_FLOW_ACTION_DENY,
+        "#4499 E2: a plain deny logs the truthful DENY action"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "#4499 E2: a denied flow installs no session, so no session-init frame follows"
+    );
+}
+
 /// #3618 call-site fail-on-revert (end-to-end): with per-(from-)zone Reject
 /// buckets, a rejected-flow flood that drains ZONE A's bucket must NOT stop
 /// ZONE B from emitting its reject through `enqueue_policy_reject_reply`.
