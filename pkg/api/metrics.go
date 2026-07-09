@@ -122,6 +122,8 @@ type xpfCollector struct {
 	natPoolUsedPorts                  *prometheus.Desc
 	natPoolTotalPorts                 *prometheus.Desc
 	natPoolDeterministicInfo          *prometheus.Desc
+	natPoolDetBlocksTotal             *prometheus.Desc
+	natPoolDetBlocksAllocated         *prometheus.Desc
 	userspaceSNATPoolLiveFlows        *prometheus.Desc
 	userspaceSNATPoolUsedPorts        *prometheus.Desc
 	userspaceSNATPoolPersistentLeases *prometheus.Desc
@@ -630,6 +632,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.natPoolUsedPorts
 	ch <- c.natPoolTotalPorts
 	ch <- c.natPoolDeterministicInfo
+	ch <- c.natPoolDetBlocksTotal
+	ch <- c.natPoolDetBlocksAllocated
 	ch <- c.userspaceSNATPoolLiveFlows
 	ch <- c.userspaceSNATPoolUsedPorts
 	ch <- c.userspaceSNATPoolPersistentLeases

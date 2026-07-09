@@ -175,15 +175,31 @@ and for transiently uncomputable samples (`AddressCount==0` / `PortHigh<PortLow`
 / capacity 0). Deterministic pools are SKIPPED — `UsedPorts` is not the right
 numerator for block-based allocation.
 
-**Block-based utilization for deterministic pools (#4559 assessment — DEFERRED,
-not a bounded add).** With the mode-1/mode-2 allocators now enforced (#4559), a
-deterministic pool's exhaustion mode is fundamentally PER-SUBSCRIBER, not
-pool-wide: each subscriber owns a fixed port block and cannot borrow another's,
-so a subscriber can exhaust its own block (new flows for THAT subscriber fail)
-while the pool's total `UsedPorts / capacity` stays low. A pool-wide total-port
-alarm therefore cannot capture the CGNAT failure it is meant to warn about.
+**Block-based utilization for deterministic pools.** There are two distinct
+signals here; the config-derived one landed, the runtime one is deferred.
 
-The Junos-faithful metric is block occupancy — distinct subscriber blocks with
+*Config-derived block provisioning (#4752 — DONE, Go-bounded).* The
+`xpf_nat_deterministic_pool_blocks_total` /
+`xpf_nat_deterministic_pool_blocks_allocated` gauges (see "Prometheus Metrics"
+below) expose provisioned-subscriber-blocks over block capacity, computed
+entirely from the committed config — the deterministic mapping is a stateless
+reversible function, so no dataplane readout is needed. This is the
+capacity-planning view the #2079 alarm could not provide (it keyed off pool-wide
+`UsedPorts`). It answers "am I about to run out of blocks to assign new
+subscribers?", NOT "is a subscriber's block full right now?".
+
+*Runtime block occupancy (#4559 assessment — DEFERRED, not a bounded add).*
+With the mode-1/mode-2 allocators now enforced (#4559), a deterministic pool's
+runtime exhaustion mode is fundamentally PER-SUBSCRIBER, not pool-wide: each
+subscriber owns a fixed port block and cannot borrow another's, so a subscriber
+can exhaust its own block (new flows for THAT subscriber fail) while the pool's
+total `UsedPorts / capacity` stays low. A pool-wide total-port alarm therefore
+cannot capture the CGNAT failure it is meant to warn about, and neither can the
+config-derived provisioning ratio above (which is static once the config is
+committed).
+
+The Junos-faithful runtime metric is block occupancy — distinct subscriber
+blocks with
 at least one live flow, over `AddressCount * blocks_per_ip` — but the allocator
 does not track it: it holds a global per-address occupancy bitmap and a
 `live_by_flow` map, neither of which is a distinct-occupied-blocks count.
@@ -192,7 +208,8 @@ Deriving it per poll would mean scanning every address bitmap by block range
 hot-path per-block active-flow counters — a design decision plus new allocator
 state, not a mechanical add. And even block-occupancy does not surface the true
 per-subscriber-block-full condition (that a specific subscriber's block is
-saturated). This is left as a scoped follow-up: pick the metric (occupied-block
+saturated). This RUNTIME half is left as a scoped follow-up (the config-derived
+provisioning gauges in #4752 do not cover it): pick the metric (occupied-block
 ratio vs per-subscriber-block-full events), add the bounded counter to the
 allocator, thread it through `SourceNATPoolStatus`, and teach `pkg/natpoolalarm`
 to use it for deterministic pools instead of skipping them.
@@ -268,9 +285,12 @@ assignment (the part that must be deterministic and reversible for compliance
 logging) is identical for both modes.
 
 **Deferred (still tracked in #4559):**
-- Block-based pool-utilization for deterministic pools (the #2079 alarm still
+- RUNTIME block-occupancy alarm for deterministic pools (the #2079 alarm still
   skips them — `UsedPorts` is not the right numerator for block allocation; see
-  "Pool Utilization Alarm" above for the assessment).
+  "Pool Utilization Alarm" above for the assessment). The config-derived
+  block-PROVISIONING gauges (`blocks_total` / `blocks_allocated`) landed in
+  #4752; the deferred half is the live-flow-per-block / per-subscriber-block-full
+  runtime signal, which needs new allocator state.
 
 ## BPF Implementation
 
@@ -354,9 +374,37 @@ applies.
 
 ```
 xpf_nat_pool_deterministic_info{pool="CGNAT-POOL", block_size="2016", host_count="1024"} 1
+xpf_nat_deterministic_pool_blocks_total{pool="CGNAT-POOL"} 256
+xpf_nat_deterministic_pool_blocks_allocated{pool="CGNAT-POOL"} 256
 ```
 
-A gauge metric exposing the deterministic configuration for each pool.
+`xpf_nat_pool_deterministic_info` is a gauge exposing the deterministic
+configuration for each pool.
+
+`xpf_nat_deterministic_pool_blocks_total` and
+`xpf_nat_deterministic_pool_blocks_allocated` (#4752) give the deterministic
+pool's **block-provisioning** utilization — the signal the #2079 pool-utilization
+alarm cannot provide because it keys off pool-wide `UsedPorts`, which is
+meaningless when ports are pre-partitioned into fixed per-subscriber blocks:
+
+- `blocks_total` = the pool's block capacity, `len(addresses) * floor(port-range
+  / block-size)` (the same `totalBlocks` the compiler validates against the
+  provisioned subscriber count).
+- `blocks_allocated` = the port blocks statically allocated to the provisioned
+  subscriber range (one block per subscriber). For an IPv4 subscriber CIDR this
+  is the host-address count; for an IPv6 host the dataplane caps the subscriber
+  count at capacity, so `blocks_allocated == blocks_total`.
+
+An operator charts `blocks_allocated / blocks_total` and alarms as it approaches
+1.0 — a **capacity-planning** signal ("am I about to run out of blocks to hand
+new subscribers?"). Both values are derived entirely from the committed config
+(the deterministic mapping is a stateless, reversible function — see
+`allocate_deterministic_v4`), so no dataplane readout is required.
+
+This is distinct from — and does **not** replace — the RUNTIME block-occupancy
+alarm (distinct blocks with a live flow, and per-subscriber-block-full events),
+which remains a deferred Rust follow-up because it needs new allocator state
+(see "Block-based utilization for deterministic pools" above).
 
 ## CLI
 

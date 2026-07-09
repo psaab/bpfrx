@@ -45,8 +45,61 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 				1.0, name,
 				strconv.Itoa(pool.Deterministic.BlockSize),
 				strconv.Itoa(deterministicSubscriberCapacity(pool)))
+
+			// #4752: deterministic-pool block utilization. The pool-wide
+			// used-ports counter is meaningless for a deterministic pool
+			// (ports are pre-partitioned into fixed per-subscriber blocks),
+			// so expose the block-occupancy numerator/denominator instead:
+			//   total     = pool block capacity (numAddrs * blocksPerIP)
+			//   allocated = provisioned subscriber blocks (one per subscriber)
+			// An operator divides allocated/total for utilization and alarms
+			// as it approaches 1.0. allocated is clamped to total so the ratio
+			// never exceeds 1.0 (the compiler already rejects an over-provisioned
+			// IPv4 pool; the clamp is defensive and also covers the IPv6 case
+			// where every block is provisioned).
+			totalBlocks := deterministicPoolBlockCapacity(pool)
+			if totalBlocks > 0 {
+				allocated := deterministicSubscriberCapacity(pool)
+				if allocated > totalBlocks {
+					allocated = totalBlocks
+				}
+				ch <- prometheus.MustNewConstMetric(c.natPoolDetBlocksTotal, prometheus.GaugeValue,
+					float64(totalBlocks), name)
+				ch <- prometheus.MustNewConstMetric(c.natPoolDetBlocksAllocated, prometheus.GaugeValue,
+					float64(allocated), name)
+			}
 		}
 	}
+}
+
+// deterministicPoolBlockCapacity returns the total per-subscriber port-block
+// capacity of a deterministic CGNAT pool: len(addresses) * blocksPerIP, where
+// blocksPerIP = portRange / block-size. This mirrors the totalBlocks value the
+// compiler validates against the provisioned subscriber count
+// (compiler_nat.go) and the dataplane NATPoolConfig.BlocksPerIP field. Returns
+// 0 when the pool is not a valid deterministic pool (nil, non-positive block
+// size, or block size larger than the port range).
+func deterministicPoolBlockCapacity(pool *config.NATPool) int {
+	if pool == nil || pool.Deterministic == nil {
+		return 0
+	}
+	bs := pool.Deterministic.BlockSize
+	if bs <= 0 {
+		return 0
+	}
+	portLow := pool.PortLow
+	if portLow == 0 {
+		portLow = 1024
+	}
+	portHigh := pool.PortHigh
+	if portHigh == 0 {
+		portHigh = 65535
+	}
+	portRange := portHigh - portLow + 1
+	if portRange <= 0 || bs > portRange {
+		return 0
+	}
+	return len(pool.Addresses) * (portRange / bs)
 }
 
 // deterministicSubscriberCapacity returns the value reported in the
@@ -72,19 +125,7 @@ func deterministicSubscriberCapacity(pool *config.NATPool) int {
 		// IPv4 subscriber CIDR — host-address count.
 		return 1 << uint(bits-ones)
 	}
-	// IPv6 — 1<<(128-ones) overflows Go's shift width. Report pool capacity.
-	bs := pool.Deterministic.BlockSize
-	if bs <= 0 {
-		return 0
-	}
-	portLow := pool.PortLow
-	if portLow == 0 {
-		portLow = 1024
-	}
-	portHigh := pool.PortHigh
-	if portHigh == 0 {
-		portHigh = 65535
-	}
-	blocksPerIP := (portHigh - portLow + 1) / bs
-	return len(pool.Addresses) * blocksPerIP
+	// IPv6 — 1<<(128-ones) overflows Go's shift width. Mirror the compiler,
+	// which caps the IPv6 subscriber count by pool block capacity.
+	return deterministicPoolBlockCapacity(pool)
 }

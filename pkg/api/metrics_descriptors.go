@@ -362,6 +362,24 @@ func newCollector(srv *Server) *xpfCollector {
 			"Deterministic NAT pool configuration (1 = enabled).",
 			[]string{"pool", "block_size", "host_count"}, nil,
 		),
+		natPoolDetBlocksTotal: prometheus.NewDesc(
+			"xpf_nat_deterministic_pool_blocks_total",
+			"Total per-subscriber port-block capacity of a deterministic NAT "+
+				"pool (pool addresses x floor(port-range / block-size)). The "+
+				"denominator for deterministic-pool block utilization; the "+
+				"pool-wide xpf_nat_pool_used_ports metric is meaningless for a "+
+				"deterministic pool (#4752).",
+			[]string{"pool"}, nil,
+		),
+		natPoolDetBlocksAllocated: prometheus.NewDesc(
+			"xpf_nat_deterministic_pool_blocks_allocated",
+			"Port blocks statically allocated to the provisioned subscriber "+
+				"range of a deterministic NAT pool (one block per subscriber). "+
+				"The numerator for block utilization: divide by "+
+				"xpf_nat_deterministic_pool_blocks_total and alarm as it "+
+				"approaches 1.0 (#4752).",
+			[]string{"pool"}, nil,
+		),
 		userspaceSNATPoolLiveFlows: prometheus.NewDesc(
 			"xpf_userspace_source_nat_pool_live_flows",
 			"Live source NAT pool flow allocations tracked by the userspace dataplane.",
