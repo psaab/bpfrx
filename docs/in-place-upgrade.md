@@ -287,6 +287,14 @@ Cuts the LOCAL clustered node with a controlled drain so the cluster
 keeps forwarding. Run on each node in turn (the deploy driver sequences
 both); exactly one node is primary throughout.
 
+The rolling path is selected ONLY by the `--rolling` flag. `xpfd upgrade`
+now REJECTS any stray positional argument (#4869): `flag.Parse` stops at
+the first non-flag token, so `xpfd upgrade rolling` (missing the two
+dashes) would otherwise leave `--rolling` false and silently run the
+uncoordinated STANDALONE cut on a clustered node — no drain, no
+takeover. A mistyped or misplaced argument is a hard usage error, not a
+wrong/default run.
+
 1. assert peer alive + session sync established + HA protocol compatible
    (`CurrentHAProtocolVersion`) — else ABORT to image-replace (Path C),
    never drop connections.
