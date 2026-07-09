@@ -43593,3 +43593,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 1 — extract runShutdownSequence (daemon_run.go teardown 1696-1858, byte-identical body) from Run(); Run() ends by delegating. sync already imported; build+vet+daemon-suite green
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 2 — extract startGRPCServer (gRPC API server startup block, PHASE 5 tail) from Run(); byte-identical body (dedent verified), 4 params (ctx, wg, eventBuf, fwdSampler). Leaf block, no ordering dependency
+  **File(s)**: pkg/daemon/daemon_run.go
