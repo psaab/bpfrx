@@ -653,7 +653,12 @@ sync.
   reads, gated by the flag so filter-FC-pinned / default-queue / no-CoS flows
   keep the frozen queue for free). A `then forwarding-class` filter term stays
   cached (its queue is 5-tuple-stable); only the DSCP/PCP-derived queue is
-  per-packet.
+  per-packet. The IEEE 802.1p (PCP) arm of `reclassify_cached_ba_queue` is
+  pinned by `txn_flow_cache_hit_reclassifies_ba_pcp_per_packet_4422` (#4422): a
+  priority-tagged (VID 0) PCP-0 packet seeds the default queue and a same-5-tuple
+  PCP-5 hit must re-classify to the EF queue on an interface carrying ONLY an
+  802.1p classifier — the DSCP arm was already pinned by
+  `..._ba_dscp_..._3778`.
   **TTL/hop-limit precedes egress accounting on cache hits (#3779):** the
   cache-hit path used to run the output `then count` replay, the policy hit
   counter, the three-color policers, the filter logs, and the terminal drop
@@ -667,7 +672,14 @@ sync.
   the reply) — is dropped, in BOTH cases before any egress counter/policer/log
   moves. `observed_bytes`/active-epoch stamping in `lookup_counted` still counts
   the packet as SEEN (deliberate — it is flow-activity telemetry, not
-  forwarded-byte accounting).
+  forwarded-byte accounting). #3779 pinned this ordering for the output
+  `then count` counter;
+  `txn_flow_cache_hit_ttl_expired_does_not_charge_three_color_policer_4422`
+  (#4422) pins the THREE-COLOR POLICER interaction directly: a TTL=1 cache-hit
+  packet leaves the egress output filter's policer green count unchanged, while
+  a following live hit increments it once — proving the TTL check precedes
+  `apply_cached_three_color_policers`, so an expired packet never drains a token
+  bucket meant for real traffic.
   **Cached filter-log replay is seed-captured (first-packet term, #4423 M7):**
   `emit_cached_input_filter_log` / `emit_cached_output_filter_log` replay the
   single `FilterLogMatch` (`cached_descriptor.input_filter_log` /
