@@ -310,42 +310,101 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	// CPU usage from /proc/stat (instantaneous snapshot)
+	// CPU usage from /proc/stat: report the inter-scrape delta, NOT the
+	// since-boot cumulative average (#4707). The counters in /proc/stat are
+	// monotonic-since-boot, so dividing them directly yields a lifetime
+	// average that barely moves once uptime is high. c.updateCPUUtilization
+	// folds this sample into the collector's running state and returns the
+	// (busyΔ/totalΔ) utilization to emit; it reports emit=false on the first
+	// scrape (no predecessor) so no bogus value is published.
 	if f, err := os.Open("/proc/stat"); err == nil {
 		defer f.Close()
 		scanner := bufio.NewScanner(f)
 		if scanner.Scan() {
-			line := scanner.Text()
-			if strings.HasPrefix(line, "cpu ") {
-				fields := strings.Fields(line)
-				// fields: cpu user nice system idle iowait irq softirq steal
-				if len(fields) >= 5 {
-					user, _ := strconv.ParseFloat(fields[1], 64)
-					nice, _ := strconv.ParseFloat(fields[2], 64)
-					system, _ := strconv.ParseFloat(fields[3], 64)
-					idle, _ := strconv.ParseFloat(fields[4], 64)
-					iowait := 0.0
-					if len(fields) >= 6 {
-						iowait, _ = strconv.ParseFloat(fields[5], 64)
-					}
-					total := user + nice + system + idle + iowait
-					if len(fields) >= 9 {
-						irq, _ := strconv.ParseFloat(fields[6], 64)
-						softirq, _ := strconv.ParseFloat(fields[7], 64)
-						steal, _ := strconv.ParseFloat(fields[8], 64)
-						total += irq + softirq + steal
-					}
-					cpus := float64(runtime.NumCPU())
-					if total > 0 && cpus > 0 {
-						ch <- prometheus.MustNewConstMetric(c.sysCPUUser, prometheus.GaugeValue,
-							(user+nice)/total*100*cpus)
-						ch <- prometheus.MustNewConstMetric(c.sysCPUSystem, prometheus.GaugeValue,
-							system/total*100*cpus)
-					}
+			if cur, ok := parseProcStatCPU(scanner.Text()); ok {
+				if userPct, systemPct, emit := c.updateCPUUtilization(cur, float64(runtime.NumCPU())); emit {
+					ch <- prometheus.MustNewConstMetric(c.sysCPUUser, prometheus.GaugeValue, userPct)
+					ch <- prometheus.MustNewConstMetric(c.sysCPUSystem, prometheus.GaugeValue, systemPct)
 				}
 			}
 		}
 	}
+}
+
+// cpuSample holds the cumulative /proc/stat CPU tick counters needed to
+// compute inter-scrape utilization deltas (#4707). userNice and system are the
+// busy components exported as separate gauges; total is the sum of all tick
+// fields (busy + idle + iowait + irq/softirq/steal).
+type cpuSample struct {
+	userNice float64
+	system   float64
+	total    float64
+}
+
+// parseProcStatCPU parses the aggregate "cpu " line from /proc/stat into a
+// cpuSample. It returns ok=false when the line is not a valid aggregate cpu
+// line. Field order: cpu user nice system idle iowait irq softirq steal ...
+// iowait/irq/softirq/steal may be absent on older kernels and default to 0.
+func parseProcStatCPU(line string) (cpuSample, bool) {
+	if !strings.HasPrefix(line, "cpu ") {
+		return cpuSample{}, false
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 5 {
+		return cpuSample{}, false
+	}
+	user, _ := strconv.ParseFloat(fields[1], 64)
+	nice, _ := strconv.ParseFloat(fields[2], 64)
+	system, _ := strconv.ParseFloat(fields[3], 64)
+	idle, _ := strconv.ParseFloat(fields[4], 64)
+	total := user + nice + system + idle
+	if len(fields) >= 6 {
+		iowait, _ := strconv.ParseFloat(fields[5], 64)
+		total += iowait
+	}
+	if len(fields) >= 9 {
+		irq, _ := strconv.ParseFloat(fields[6], 64)
+		softirq, _ := strconv.ParseFloat(fields[7], 64)
+		steal, _ := strconv.ParseFloat(fields[8], 64)
+		total += irq + softirq + steal
+	}
+	return cpuSample{userNice: user + nice, system: system, total: total}, true
+}
+
+// cpuUtilization computes the per-mode utilization percentages between two
+// cumulative samples, scaled by the number of CPUs (matching the historical
+// "percent of one CPU summed across cores" gauge scale). It returns ok=false
+// when the totals did not advance (no elapsed ticks) or any busy counter went
+// backwards (counter reset after suspend/hotplug), so the caller skips a bogus
+// sample. This is the #4707 delta — NOT cur.userNice/cur.total (the reverted
+// cumulative form yields a stale since-boot average).
+func cpuUtilization(prev, cur cpuSample, cpus float64) (userPct, systemPct float64, ok bool) {
+	dTotal := cur.total - prev.total
+	dUserNice := cur.userNice - prev.userNice
+	dSystem := cur.system - prev.system
+	if dTotal <= 0 || cpus <= 0 || dUserNice < 0 || dSystem < 0 {
+		return 0, 0, false
+	}
+	return dUserNice / dTotal * 100 * cpus, dSystem / dTotal * 100 * cpus, true
+}
+
+// updateCPUUtilization folds a fresh /proc/stat cpu sample into the collector's
+// running state and returns the inter-scrape utilization to emit (#4707). emit
+// is false on the first sample (no predecessor) or when the counters did not
+// advance, so the caller emits nothing rather than a bogus since-boot average.
+// Guarded by c.mu because Collect can run concurrently for parallel scrapers.
+func (c *xpfCollector) updateCPUUtilization(cur cpuSample, cpus float64) (userPct, systemPct float64, emit bool) {
+	c.mu.Lock()
+	prev := c.cpuSamplePrev
+	havePrev := c.cpuSampleValid
+	c.cpuSamplePrev = cur
+	c.cpuSampleValid = true
+	c.mu.Unlock()
+
+	if !havePrev {
+		return 0, 0, false
+	}
+	return cpuUtilization(prev, cur, cpus)
 }
 
 // parseMemInfoKB extracts the numeric kB value from a /proc/meminfo line.

@@ -1,3 +1,34 @@
+## 2026-07-09 — #4707: report current CPU utilization, not since-boot average
+
+- **Timestamp**: 2026-07-09
+- **Action**: OBSERVABILITY fix. The Prometheus system collector read the
+  cumulative `/proc/stat` aggregate-cpu ticks once per scrape and exported
+  `(user+nice)/total*100*cpus` and `system/total*100*cpus` as `GaugeValue`
+  with no previous-tick state, so both gauges reported a since-boot lifetime
+  AVERAGE that barely moves as uptime grows — a real CPU spike at hour 100 was
+  invisible and load alarms silently never fired. The inline comment even
+  mislabeled it "instantaneous snapshot". Fix (metrics_system.go): persist the
+  prior aggregate-cpu sample on the collector (`cpuSamplePrev`/`cpuSampleValid`
+  in metrics.go, guarded by the existing `c.mu` because Collect can run
+  concurrently for parallel scrapers — same pattern as the fairness-throughput
+  window) and report the inter-scrape delta `(busyΔ/totalΔ)`. Refactored the
+  `/proc/stat` reading behind a seam: `parseProcStatCPU(line)` parses the
+  aggregate line into a `cpuSample{userNice,system,total}`; `cpuUtilization`
+  computes the delta and skips (ok=false) when totals did not advance or a
+  counter went backwards (suspend/hotplug reset); `updateCPUUtilization` folds
+  a sample into collector state and returns emit=false on the FIRST scrape (no
+  predecessor) so no bogus value is published. Updated the two metric help
+  strings (metrics_descriptors.go) to say "over the last scrape interval".
+  Tests (metrics_cpu_current_4707_test.go): parse coverage (full/short/per-core
+  reject), a RED-on-revert delta guard (busy-at-boot-then-idle fixture: delta
+  =10%/2% but cumulative =79.3% — reverting to the since-boot form makes the
+  test FAIL, verified empirically), first-sample-skip handling, and the
+  no-advance/backwards/zero-cpu guards. Validation: gofmt; `go build ./...`
+  clean; `go test ./pkg/api/...` green; FULL Go suite green (53 ok / 0 FAIL /
+  3 no-test).
+  **File(s)**: pkg/api/metrics.go, pkg/api/metrics_system.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_cpu_current_4707_test.go,
+  _Log.md
 ## 2026-07-08 — #4714: reject dangling trailing negation in tcp-flags (fail-closed)
 
 - **Timestamp**: 2026-07-08
