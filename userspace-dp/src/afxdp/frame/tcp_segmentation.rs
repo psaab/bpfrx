@@ -193,135 +193,33 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
         }
 
         match meta.addr_family as i32 {
-            libc::AF_INET => {
-                {
-                    let packet = frame_out.get_mut(eth_len..)?;
-                    packet
-                        .get_mut(2..4)?
-                        .copy_from_slice(&(total_ip_len as u16).to_be_bytes());
-                    // #2077: gate the TTL==1 drop on NOT-fabric-ingress,
-                    // matching the IPv6 hop-limit gate below and the
-                    // canonical build/rewrite paths (build/ipv4.rs,
-                    // frame/mod.rs, rewrite/ipv4.rs). A fabric-ingress
-                    // segment (FABRIC_INGRESS_FLAG = 0x80) was already
-                    // decremented by the peer chassis at its real
-                    // ingress; the fabric crossing is an internal
-                    // cross-chassis redirect, not an IP hop, so the
-                    // decrement below is suppressed and the drop must be
-                    // too — otherwise a legitimately-low-TTL fabric
-                    // segment is wrongly dropped here (v4 was the lone
-                    // asymmetric site).
-                    if (meta.meta_flags & 0x80) == 0 && packet[8] <= 1 {
-                        return None;
-                    }
-                    if apply_nat {
-                        // #1852: non_first_fragment=false — the segmentation
-                        // admission gate (forwarded_tcp_may_need_segmentation)
-                        // never admits a non-first fragment.
-                        apply_nat_ipv4(packet, meta.protocol, decision.nat, false)?;
-                    }
-                    if (meta.meta_flags & 0x80) == 0 {
-                        packet[8] -= 1;
-                    }
-                }
-                let _ = enforce_expected_ports(
-                    &mut frame_out,
-                    meta.addr_family,
-                    meta.protocol,
-                    enforced_ports,
-                    false,
-                )?;
-                let packet = frame_out.get_mut(eth_len..)?;
-                // IP header checksum: full recompute (only 20 bytes, fast).
-                packet.get_mut(10..12)?.copy_from_slice(&[0, 0]);
-                let ip_sum = checksum16(packet.get(..ip_header_len)?);
-                packet
-                    .get_mut(10..12)?
-                    .copy_from_slice(&ip_sum.to_be_bytes());
-                // L4 checksum: full recompute over the pseudo-header and
-                // this segment's actual L4 bytes. A per-segment incremental
-                // adjustment from the copied original-frame checksum is
-                // never valid (#4384): each segment carries a different
-                // payload chunk, a rewritten seq (above), a cleared PSH on
-                // non-final segments, and a different pseudo-header length,
-                // none of which a NAT IP/port delta can capture — and the
-                // NAT delta itself was already folded in by apply_nat_ipv4.
-                // The removed incremental branch was gated on
-                // `enforced_ports.is_none()`, which is unreachable for any
-                // valid segmentable frame (live_frame_ports_from_meta_bytes
-                // always resolves ports), so it was dead-but-wrong: a latent
-                // corruption landmine had a refactor ever flipped the gate.
-                // Mirror the AF_INET6 arm below, which always recomputes.
-                recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
-            }
-            libc::AF_INET6 => {
-                {
-                    let packet = frame_out.get_mut(eth_len..)?;
-                    // v6 payload length = ext-header bytes + TCP header
-                    // + chunk. Each segment carries the FULL copied IP
-                    // header including the extension chain
-                    // (`ip_header_len` is the parsed ext-aware L4
-                    // offset), so omitting `ip_header_len - 40` here
-                    // under-stated the length for every ext-headered
-                    // segment (#1838). Bit-identical for the no-ext
-                    // case (ip_header_len == 40).
-                    let v6_payload_len = (ip_header_len - 40) + tcp_header_len + chunk_len;
-                    packet
-                        .get_mut(4..6)?
-                        .copy_from_slice(&(v6_payload_len as u16).to_be_bytes());
-                    if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
-                        return None;
-                    }
-                    if apply_nat {
-                        // `ip_header_len` IS the ext-aware rel_l4: it is
-                        // `frame_l4_offset - l3` and the segment copies
-                        // the full IP header incl. the ext chain.
-                        // #1852: non_first_fragment=false (admission gate).
-                        apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat, false)?;
-                    }
-                    if (meta.meta_flags & 0x80) == 0 {
-                        packet[7] -= 1;
-                    }
-                }
-                let _ = enforce_expected_ports(
-                    &mut frame_out,
-                    meta.addr_family,
-                    meta.protocol,
-                    enforced_ports,
-                    false,
-                )?;
-                let packet = frame_out.get_mut(eth_len..)?;
-                recompute_l4_checksum_ipv6(packet, ip_header_len, meta.protocol)?;
-            }
+            libc::AF_INET => emit_ipv4_segment(
+                &mut frame_out,
+                eth_len,
+                ip_header_len,
+                total_ip_len,
+                meta,
+                decision,
+                apply_nat,
+                enforced_ports,
+            )?,
+            libc::AF_INET6 => emit_ipv6_segment(
+                &mut frame_out,
+                eth_len,
+                ip_header_len,
+                tcp_header_len,
+                chunk_len,
+                meta,
+                decision,
+                apply_nat,
+                enforced_ports,
+            )?,
             _ => return None,
         }
         if decision.resolution.tunnel_endpoint_id != 0 {
-            // #2329: mode-aware encap dispatch. The pre-#2329 code
-            // unconditionally GRE-encapsulated EVERY tunnel's segmented
-            // TCP, so a WireGuard endpoint's segments went out as GRE on
-            // the wire (wrong protocol; for an inet WG endpoint it even
-            // built a degenerate 0.0.0.0→0.0.0.0 outer). Mirror the #2327
-            // build-egress dispatch in frame/mod.rs exactly: GRE→GRE,
-            // WireGuard→the WG encap path (same `wg::wg_encap_frame` the
-            // normal WG egress uses; it pulls the live noise session from
-            // `forwarding.wg_engines` itself, so the seg site needs no
-            // extra keystate), Unknown/missing→drop (fail closed, never
-            // GRE-encap an unrecognized mode).
-            let kind = forwarding
-                .tunnel_endpoints
-                .get(&decision.resolution.tunnel_endpoint_id)
-                .map(|e| tunnel_mode_kind(&e.mode));
-            let encapped = match kind {
-                Some(TunnelKind::Gre) => {
-                    encapsulate_native_gre_frame(&frame_out, meta, decision, forwarding)?
-                }
-                Some(TunnelKind::WireGuard) => {
-                    wg::wg_encap_frame(&frame_out, meta, decision, forwarding)?
-                }
-                // Unknown mode or missing endpoint row: fail closed.
-                Some(TunnelKind::Unknown) | None => return None,
-            };
-            out.push(encapped);
+            out.push(encap_tunnel_segment(
+                &frame_out, meta, decision, forwarding,
+            )?);
         } else {
             out.push(frame_out);
         }
@@ -348,6 +246,170 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames(
         false,
         expected_ports,
     )
+}
+
+/// Emit the AF_INET per-segment L3/L4 finalization for one segmented TCP
+/// frame: total-length, #2077 fabric-gated TTL drop/decrement, NAT, port
+/// enforcement, IP header checksum, and full L4 recompute (#4384 — never an
+/// incremental adjust). Operates in place on `frame_out`; a `None` return is
+/// the same fail-closed drop the inline arm produced (the caller discards the
+/// partial batch). Extracted verbatim from segment_forwarded_tcp_frames_from_frame
+/// (#4652); byte-identical body, no added allocation.
+#[inline]
+fn emit_ipv4_segment(
+    frame_out: &mut Vec<u8>,
+    eth_len: usize,
+    ip_header_len: usize,
+    total_ip_len: usize,
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    apply_nat: bool,
+    enforced_ports: Option<(u16, u16)>,
+) -> Option<()> {
+    {
+        let packet = frame_out.get_mut(eth_len..)?;
+        packet
+            .get_mut(2..4)?
+            .copy_from_slice(&(total_ip_len as u16).to_be_bytes());
+        // #2077: gate the TTL==1 drop on NOT-fabric-ingress,
+        // matching the IPv6 hop-limit gate below and the
+        // canonical build/rewrite paths (build/ipv4.rs,
+        // frame/mod.rs, rewrite/ipv4.rs). A fabric-ingress
+        // segment (FABRIC_INGRESS_FLAG = 0x80) was already
+        // decremented by the peer chassis at its real
+        // ingress; the fabric crossing is an internal
+        // cross-chassis redirect, not an IP hop, so the
+        // decrement below is suppressed and the drop must be
+        // too — otherwise a legitimately-low-TTL fabric
+        // segment is wrongly dropped here (v4 was the lone
+        // asymmetric site).
+        if (meta.meta_flags & 0x80) == 0 && packet[8] <= 1 {
+            return None;
+        }
+        if apply_nat {
+            // #1852: non_first_fragment=false — the segmentation
+            // admission gate (forwarded_tcp_may_need_segmentation)
+            // never admits a non-first fragment.
+            apply_nat_ipv4(packet, meta.protocol, decision.nat, false)?;
+        }
+        if (meta.meta_flags & 0x80) == 0 {
+            packet[8] -= 1;
+        }
+    }
+    let _ = enforce_expected_ports(
+        frame_out,
+        meta.addr_family,
+        meta.protocol,
+        enforced_ports,
+        false,
+    )?;
+    let packet = frame_out.get_mut(eth_len..)?;
+    // IP header checksum: full recompute (only 20 bytes, fast).
+    packet.get_mut(10..12)?.copy_from_slice(&[0, 0]);
+    let ip_sum = checksum16(packet.get(..ip_header_len)?);
+    packet
+        .get_mut(10..12)?
+        .copy_from_slice(&ip_sum.to_be_bytes());
+    // L4 checksum: full recompute over the pseudo-header and
+    // this segment's actual L4 bytes. A per-segment incremental
+    // adjustment from the copied original-frame checksum is
+    // never valid (#4384): each segment carries a different
+    // payload chunk, a rewritten seq (above), a cleared PSH on
+    // non-final segments, and a different pseudo-header length,
+    // none of which a NAT IP/port delta can capture — and the
+    // NAT delta itself was already folded in by apply_nat_ipv4.
+    // The removed incremental branch was gated on
+    // `enforced_ports.is_none()`, which is unreachable for any
+    // valid segmentable frame (live_frame_ports_from_meta_bytes
+    // always resolves ports), so it was dead-but-wrong: a latent
+    // corruption landmine had a refactor ever flipped the gate.
+    // Mirror the AF_INET6 arm below, which always recomputes.
+    recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
+    Some(())
+}
+
+/// Emit the AF_INET6 per-segment L3/L4 finalization: ext-aware payload length
+/// (#1838), #2077 fabric-gated hop-limit drop/decrement, NAT, port enforcement,
+/// and full L4 recompute. Operates in place on `frame_out`; a `None` return is
+/// the inline arm's fail-closed drop. Extracted verbatim (#4652); byte-identical
+/// body, no added allocation.
+#[inline]
+fn emit_ipv6_segment(
+    frame_out: &mut Vec<u8>,
+    eth_len: usize,
+    ip_header_len: usize,
+    tcp_header_len: usize,
+    chunk_len: usize,
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    apply_nat: bool,
+    enforced_ports: Option<(u16, u16)>,
+) -> Option<()> {
+    {
+        let packet = frame_out.get_mut(eth_len..)?;
+        // v6 payload length = ext-header bytes + TCP header
+        // + chunk. Each segment carries the FULL copied IP
+        // header including the extension chain
+        // (`ip_header_len` is the parsed ext-aware L4
+        // offset), so omitting `ip_header_len - 40` here
+        // under-stated the length for every ext-headered
+        // segment (#1838). Bit-identical for the no-ext
+        // case (ip_header_len == 40).
+        let v6_payload_len = (ip_header_len - 40) + tcp_header_len + chunk_len;
+        packet
+            .get_mut(4..6)?
+            .copy_from_slice(&(v6_payload_len as u16).to_be_bytes());
+        if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
+            return None;
+        }
+        if apply_nat {
+            // `ip_header_len` IS the ext-aware rel_l4: it is
+            // `frame_l4_offset - l3` and the segment copies
+            // the full IP header incl. the ext chain.
+            // #1852: non_first_fragment=false (admission gate).
+            apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat, false)?;
+        }
+        if (meta.meta_flags & 0x80) == 0 {
+            packet[7] -= 1;
+        }
+    }
+    let _ = enforce_expected_ports(
+        frame_out,
+        meta.addr_family,
+        meta.protocol,
+        enforced_ports,
+        false,
+    )?;
+    let packet = frame_out.get_mut(eth_len..)?;
+    recompute_l4_checksum_ipv6(packet, ip_header_len, meta.protocol)?;
+    Some(())
+}
+
+/// Encapsulate one finalized segment for a tunnel egress (#2329 mode-aware
+/// dispatch). GRE endpoints take the native-GRE encap, WireGuard endpoints the
+/// WG encap path (which pulls the live noise session from forwarding.wg_engines
+/// itself), and an Unknown/missing mode fails closed (never GRE-encaps an
+/// unrecognized mode). Extracted from segment_forwarded_tcp_frames_from_frame
+/// (#4652).
+#[inline]
+fn encap_tunnel_segment(
+    frame_out: &[u8],
+    meta: ForwardPacketMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+) -> Option<Vec<u8>> {
+    let kind = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+        .map(|e| tunnel_mode_kind(&e.mode));
+    match kind {
+        Some(TunnelKind::Gre) => {
+            encapsulate_native_gre_frame(frame_out, meta, decision, forwarding)
+        }
+        Some(TunnelKind::WireGuard) => wg::wg_encap_frame(frame_out, meta, decision, forwarding),
+        // Unknown mode or missing endpoint row: fail closed.
+        Some(TunnelKind::Unknown) | None => None,
+    }
 }
 
 #[cfg(test)]
