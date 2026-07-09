@@ -626,105 +626,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 
 	d.applyInterfaceReconcile(cfg)
 
-	// 1.9. Create IPVLAN interfaces for fabric members (fab0, fab1).
-	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
-	// on top for IP addressing. BPF attaches to the parent.
-	// Track which overlays are configured so stale ones can be cleaned up (#128).
-	//
-	// When the userspace dataplane is active, DEFER IPVLAN creation until
-	// after XSK binds complete. The kernel checks for upper devices (like
-	// IPVLAN) at XSK bind time — if an IPVLAN exists, zerocopy bind fails
-	// and falls back to copy mode (~3 Gbps). Deferring lets the fabric
-	// parent bind XSK in zerocopy first, then the IPVLAN is added for
-	// sync/heartbeat addressing.
-	activeFabricOverlays := make(map[string]bool)
-	type deferredIPVLAN struct {
-		parent string
-		name   string
-		addrs  []string
-	}
-	var deferredOverlays []deferredIPVLAN
-	bindingCtrl, isUserspaceDP := d.dp.(userspaceXSKBindingController)
-	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
-		if ifCfg == nil || ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
-			continue
-		}
-		parentLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
-		fabLinux := config.LinuxIfName(ifName)
-		activeFabricOverlays[fabLinux] = true
-		var addrs []string
-		if unit, ok := ifCfg.Units[0]; ok {
-			addrs = unit.Addresses
-		}
-		// When userspace DP is active, remove any existing IPVLAN and
-		// defer recreation until after XSK binds in zerocopy. The kernel
-		// checks for upper devices at bind time — IPVLAN blocks zerocopy.
-		// On subsequent applyConfig calls (config change), the IPVLAN
-		// already exists from the OnXSKBound callback and XSK is already
-		// bound, so the xskBoundNotified guard prevents re-deletion.
-		if isUserspaceDP {
-			if bindingCtrl != nil && !bindingCtrl.XSKBoundNotified() {
-				// First applyConfig — remove stale IPVLAN so XSK can zerocopy.
-				if link, err := netlink.LinkByName(fabLinux); err == nil {
-					netlink.LinkDel(link)
-					slog.Info("removed fabric IPVLAN for deferred zerocopy XSK bind",
-						"name", fabLinux)
-				}
-				deferredOverlays = append(deferredOverlays, deferredIPVLAN{
-					parent: parentLinux, name: fabLinux, addrs: addrs,
-				})
-				slog.Info("deferring fabric IPVLAN creation until XSK binds complete",
-					"parent", parentLinux, "name", fabLinux)
-				// continue // DISABLED: deferred IPVLAN broke forwarding
-			}
-			// XSK already bound — fall through to reconcile.
-		}
-		if err := ensureFabricIPVLAN(parentLinux, fabLinux, addrs); err != nil {
-			// Fabric overlay is critical for cluster heartbeat and VRRP.
-			// Retry up to 5 times with 1s delay — the parent interface
-			// might not be ready yet after a power cycle.
-			var retryErr error
-			for retry := 0; retry < 5; retry++ {
-				time.Sleep(time.Second)
-				slog.Info("retrying fabric IPVLAN creation",
-					"parent", parentLinux, "name", fabLinux, "attempt", retry+2)
-				retryErr = ensureFabricIPVLAN(parentLinux, fabLinux, addrs)
-				if retryErr == nil {
-					break
-				}
-			}
-			if retryErr != nil {
-				slog.Error("CRITICAL: fabric IPVLAN creation failed after retries — cluster heartbeat will not work",
-					"parent", parentLinux, "name", fabLinux, "err", retryErr)
-			}
-			continue
-		}
-	}
-	// Register deferred IPVLAN creation callback on the userspace manager.
-	if len(deferredOverlays) > 0 && bindingCtrl != nil {
-		bindingCtrl.SetOnXSKBound(func() {
-			for _, ov := range deferredOverlays {
-				slog.Info("XSK bound — creating deferred fabric IPVLAN",
-					"parent", ov.parent, "name", ov.name)
-				if err := ensureFabricIPVLAN(ov.parent, ov.name, ov.addrs); err != nil {
-					slog.Error("deferred fabric IPVLAN creation failed",
-						"parent", ov.parent, "name", ov.name, "err", err)
-				}
-			}
-		})
-	}
-	// Clean up stale fabric IPVLAN overlays not in current config (#128).
-	for _, name := range []string{"fab0", "fab1"} {
-		if activeFabricOverlays[name] {
-			continue
-		}
-		if link, err := netlink.LinkByName(name); err == nil {
-			if _, ok := link.(*netlink.IPVlan); ok {
-				netlink.LinkDel(link)
-				slog.Info("removed stale fabric IPVLAN", "name", name)
-			}
-		}
-	}
+	d.applyFabricIPVLAN(cfg)
 
 	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
 	// If yes, tell the userspace DP to skip initial worker startup during
@@ -1308,6 +1210,114 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// helper creates lo0Err/hostInboundErr and returns the identical
 	// five-way errors.Join.
 	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyFabricIPVLAN creates the fabric-member IPVLAN overlays (fab0/fab1) for
+// cluster heartbeat + VRRP, deferring creation past XSK bind when the userspace
+// dataplane is active (an existing IPVLAN breaks zero-copy bind, #128), and
+// cleans up stale fabric IPVLAN overlays not in the current config. Extracted
+// verbatim from applyConfigLocked (#4407); runs in the same slot, after the
+// interface-creation reconcile and before the RETH-MAC pre-check.
+func (d *Daemon) applyFabricIPVLAN(cfg *config.Config) {
+	// 1.9. Create IPVLAN interfaces for fabric members (fab0, fab1).
+	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
+	// on top for IP addressing. BPF attaches to the parent.
+	// Track which overlays are configured so stale ones can be cleaned up (#128).
+	//
+	// When the userspace dataplane is active, DEFER IPVLAN creation until
+	// after XSK binds complete. The kernel checks for upper devices (like
+	// IPVLAN) at XSK bind time — if an IPVLAN exists, zerocopy bind fails
+	// and falls back to copy mode (~3 Gbps). Deferring lets the fabric
+	// parent bind XSK in zerocopy first, then the IPVLAN is added for
+	// sync/heartbeat addressing.
+	activeFabricOverlays := make(map[string]bool)
+	type deferredIPVLAN struct {
+		parent string
+		name   string
+		addrs  []string
+	}
+	var deferredOverlays []deferredIPVLAN
+	bindingCtrl, isUserspaceDP := d.dp.(userspaceXSKBindingController)
+	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil || ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
+			continue
+		}
+		parentLinux := config.LinuxIfName(ifCfg.LocalFabricMember)
+		fabLinux := config.LinuxIfName(ifName)
+		activeFabricOverlays[fabLinux] = true
+		var addrs []string
+		if unit, ok := ifCfg.Units[0]; ok {
+			addrs = unit.Addresses
+		}
+		// When userspace DP is active, remove any existing IPVLAN and
+		// defer recreation until after XSK binds in zerocopy. The kernel
+		// checks for upper devices at bind time — IPVLAN blocks zerocopy.
+		// On subsequent applyConfig calls (config change), the IPVLAN
+		// already exists from the OnXSKBound callback and XSK is already
+		// bound, so the xskBoundNotified guard prevents re-deletion.
+		if isUserspaceDP {
+			if bindingCtrl != nil && !bindingCtrl.XSKBoundNotified() {
+				// First applyConfig — remove stale IPVLAN so XSK can zerocopy.
+				if link, err := netlink.LinkByName(fabLinux); err == nil {
+					netlink.LinkDel(link)
+					slog.Info("removed fabric IPVLAN for deferred zerocopy XSK bind",
+						"name", fabLinux)
+				}
+				deferredOverlays = append(deferredOverlays, deferredIPVLAN{
+					parent: parentLinux, name: fabLinux, addrs: addrs,
+				})
+				slog.Info("deferring fabric IPVLAN creation until XSK binds complete",
+					"parent", parentLinux, "name", fabLinux)
+				// continue // DISABLED: deferred IPVLAN broke forwarding
+			}
+			// XSK already bound — fall through to reconcile.
+		}
+		if err := ensureFabricIPVLAN(parentLinux, fabLinux, addrs); err != nil {
+			// Fabric overlay is critical for cluster heartbeat and VRRP.
+			// Retry up to 5 times with 1s delay — the parent interface
+			// might not be ready yet after a power cycle.
+			var retryErr error
+			for retry := 0; retry < 5; retry++ {
+				time.Sleep(time.Second)
+				slog.Info("retrying fabric IPVLAN creation",
+					"parent", parentLinux, "name", fabLinux, "attempt", retry+2)
+				retryErr = ensureFabricIPVLAN(parentLinux, fabLinux, addrs)
+				if retryErr == nil {
+					break
+				}
+			}
+			if retryErr != nil {
+				slog.Error("CRITICAL: fabric IPVLAN creation failed after retries — cluster heartbeat will not work",
+					"parent", parentLinux, "name", fabLinux, "err", retryErr)
+			}
+			continue
+		}
+	}
+	// Register deferred IPVLAN creation callback on the userspace manager.
+	if len(deferredOverlays) > 0 && bindingCtrl != nil {
+		bindingCtrl.SetOnXSKBound(func() {
+			for _, ov := range deferredOverlays {
+				slog.Info("XSK bound — creating deferred fabric IPVLAN",
+					"parent", ov.parent, "name", ov.name)
+				if err := ensureFabricIPVLAN(ov.parent, ov.name, ov.addrs); err != nil {
+					slog.Error("deferred fabric IPVLAN creation failed",
+						"parent", ov.parent, "name", ov.name, "err", err)
+				}
+			}
+		})
+	}
+	// Clean up stale fabric IPVLAN overlays not in current config (#128).
+	for _, name := range []string{"fab0", "fab1"} {
+		if activeFabricOverlays[name] {
+			continue
+		}
+		if link, err := netlink.LinkByName(name); err == nil {
+			if _, ok := link.(*netlink.IPVlan); ok {
+				netlink.LinkDel(link)
+				slog.Info("removed stale fabric IPVLAN", "name", name)
+			}
+		}
+	}
 }
 
 // applyVRFReconcile reconciles routing-instance VRFs during a config apply:
