@@ -43929,3 +43929,9 @@ top.
   **File(s)**: cmd/xpfd/upgrade.go, cmd/xpfd/upgrade_args_4869_test.go, docs/in-place-upgrade.md
   **Action**: #4877 ValidatePercent rejects NaN/Inf (commit-check) before range gate
   **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_validate_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4880 post-compile strict gate rejects out-of-range redundancy-group node priority (closes packed hierarchical + flat-set shapes)
+  **File(s)**: pkg/config/compiler_validate_strict_chassis.go, pkg/config/schema_validate_chassis_test.go
+  **Action**: #4866 cmdtree RI/RG completion DynamicFns nil-skip tolerated (#3494) entries via shared helpers
+  **File(s)**: pkg/cmdtree/tree.go, pkg/cmdtree/completion_nil_ri_rg_4866_test.go

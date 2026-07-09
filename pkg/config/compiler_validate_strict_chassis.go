@@ -24,6 +24,24 @@ const MaxHeartbeatRedundancyGroups = 255
 // then collide on the same GroupID byte and corrupt peer election.
 const MaxHeartbeatRedundancyGroupID = 255
 
+// MinRedundancyGroupNodePriority / MaxRedundancyGroupNodePriority bound a
+// redundancy-group node priority (Junos vSRX 1..254). 0 is treated as unset
+// (VRRP maps pri==0 to the default 100) and 255 is the RFC 5798 IP-owner
+// reserved value; both are excluded. The schema `priority` leaf
+// (schema_chassis.go ValidateInteger(1,254)) enforces this on the flat-set /
+// expanded shape, but the packed hierarchical one-liner
+// `node 0 priority <v>;` carries the value inside the node instance's own key
+// tail, which the schema walker consumes as identity and never validates —
+// compileChassis still reads it into NodePriorities under no bound (#4880). The
+// value feeds VRRP, which truncates it to uint8 on the wire
+// (pkg/vrrp/instance.go), while the private control-link election uses the raw
+// int (pkg/cluster/group_state.go), so an out-of-range priority both truncates
+// on the wire and diverges the two election views.
+const (
+	MinRedundancyGroupNodePriority = 1
+	MaxRedundancyGroupNodePriority = 254
+)
+
 // validateChassisClusterStrict hard-rejects, at commit / commit-check, a
 // chassis-cluster config whose redundancy-group cardinality or ids exceed
 // what the HA heartbeat wire format can encode (#4434, codex-172 C172-H02).
@@ -75,6 +93,43 @@ func validateChassisClusterStrict(cfg *Config) error {
 				"above %d truncates on the wire and collides with another "+
 				"redundancy-group) — renumber the redundancy-group",
 				id, MaxHeartbeatRedundancyGroupID, MaxHeartbeatRedundancyGroupID)
+		}
+	}
+
+	// #4880: node-priority range gate. The schema `priority` leaf validates the
+	// flat-set / expanded shape, but the packed hierarchical one-liner
+	// `node 0 priority <v>;` bypasses the walker (see
+	// MinRedundancyGroupNodePriority doc). compileChassis stores whatever the
+	// operator wrote into NodePriorities, and it flows to VRRP (uint8-truncated
+	// on the wire) and the private election (raw int) — so re-assert the
+	// [1,254] range on the compiled priorities here, closing BOTH shapes.
+	// Iterate rgs sorted by id, then node ids, so the first-error message is
+	// deterministic across the map-ordered AST walk.
+	rgByID := make([]*RedundancyGroup, 0, len(rgs))
+	for _, rg := range rgs {
+		if rg != nil { // #3494: tolerant/HA-sync path may carry a nil entry.
+			rgByID = append(rgByID, rg)
+		}
+	}
+	sort.Slice(rgByID, func(i, j int) bool { return rgByID[i].ID < rgByID[j].ID })
+	for _, rg := range rgByID {
+		nodeIDs := make([]int, 0, len(rg.NodePriorities))
+		for nodeID := range rg.NodePriorities {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+		sort.Ints(nodeIDs)
+		for _, nodeID := range nodeIDs {
+			pri := rg.NodePriorities[nodeID]
+			if pri < MinRedundancyGroupNodePriority || pri > MaxRedundancyGroupNodePriority {
+				return fmt.Errorf("chassis cluster: redundancy-group %d node %d priority "+
+					"%d is out of range %d..%d (0 is treated as unset and 255 is the "+
+					"RFC 5798 IP-owner reserved value; the priority feeds VRRP and "+
+					"truncates to a single wire byte, and the private control-link "+
+					"election reads the raw value) — set a priority in %d..%d",
+					rg.ID, nodeID, pri,
+					MinRedundancyGroupNodePriority, MaxRedundancyGroupNodePriority,
+					MinRedundancyGroupNodePriority, MaxRedundancyGroupNodePriority)
+			}
 		}
 	}
 	return nil
