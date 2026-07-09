@@ -43866,6 +43866,8 @@ top.
   **Action**: #4861 — reject plaintext http:// endpoints for credentialed DDNS backends at commit (compileDDNSServices, strict/lenient) + refuse HTTPS->HTTP redirect downgrade in the shared HTTP client (newHTTPClientBound CheckRedirect)
   **File(s)**: pkg/config/compiler_ddns_tls.go, pkg/config/compiler_system.go, pkg/ddns/backend_http.go, +tests
 - **Timestamp**: 2026-07-09
+  **Action**: #4865 — nil-guard tolerated nil user-application map values at the AppID ingestion boundaries. BuildCatalog skips a (nil, true) ResolveApplication result without consuming an id; resolveTupleFallback skips a nil map value before icmpTypeConstrained/matchTuple. Prevents a control-plane panic on the #3494-tolerated malformed/HA-synced nil-application shape.
+  **File(s)**: pkg/appid/catalog.go, pkg/appid/runtime.go, pkg/appid/catalog_nil_app_4865_test.go, pkg/appid/README.md
   **Action**: #4897 — SNMPv3 enforce per-user minimum security level floor in handleV3Packet: an auth-keyed user must authenticate and a privacy-keyed user must use authPriv; drop under-leveled requests (e.g. noAuthNoPriv against an authPriv user) before decoding the scoped PDU. Replaced the "authPriv user served at noAuthNoPriv" test with an authPriv/authNoPriv/noAuth matrix.
   **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_seclevel_test.go, pkg/snmp/README.md
 - **Timestamp**: 2026-07-09
