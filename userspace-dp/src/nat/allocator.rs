@@ -288,6 +288,18 @@ fn deterministic_v6_word_offset(host_prefix_len: u8) -> usize {
 /// `None` when the subscriber is below the base, beyond the pool-bounded
 /// `host_count`, or the parameters are degenerate — the caller fails the
 /// allocation closed rather than silently round-robining.
+///
+/// #4863: the source MUST lie inside the configured subscriber prefix. The
+/// subscriber index is derived only from the 32-bit word at `off`, so a source
+/// in a DIFFERENT prefix that happens to share that word would otherwise be
+/// accepted and mapped into the in-prefix subscriber's fixed block — and the
+/// stateless `reverse_deterministic_v6` (which reconstructs from `host_base`)
+/// would then attribute the external `(IPv4, port)` to the WRONG subscriber
+/// (cross-tenant block assignment + a lying reverse map). Reject any source
+/// whose prefix bytes before the subscriber word differ from `host_base`. For
+/// a /32 the checked prefix is `octets[0..4]`, for a /64 `octets[0..8]` — the
+/// bytes at `off` are exactly the configured prefix length. This is a
+/// drop-only tightening: an in-prefix source is unaffected.
 pub(crate) fn deterministic_indices_v6(
     params: &DeterministicV6,
     src: Ipv6Addr,
@@ -298,6 +310,14 @@ pub(crate) fn deterministic_indices_v6(
     }
     let off = deterministic_v6_word_offset(params.host_prefix_len);
     let src_octets = src.octets();
+    // #4863: fail closed for any source outside the configured subscriber
+    // prefix. The subscriber word alone does not identify the tenant — the
+    // prefix bytes before it must match the configured base exactly, else a
+    // colliding subscriber word in a different prefix would steal an in-prefix
+    // subscriber's block and be reverse-mapped to the wrong subscriber.
+    if src_octets[..off] != params.host_base[..off] {
+        return None;
+    }
     let src_word = u32::from_be_bytes([
         src_octets[off],
         src_octets[off + 1],
