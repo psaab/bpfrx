@@ -43593,3 +43593,11 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 1 — extract runShutdownSequence (daemon_run.go teardown 1696-1858, byte-identical body) from Run(); Run() ends by delegating. sync already imported; build+vet+daemon-suite green
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4743 dataplane drop-counter observability — add MARTIAN_DST_DROPS static (forwarding/mod.rs) bumped in lookup_forwarding_resolution_with_dynamic when disposition==NoRoute && dst_is_martian; add IPV6_EXT_HEADER_DROPS static (frame/inspect.rs) + note_ipv6_ext_header_overflow() at the 3 MAX_IPV6_EXT_HEADERS-bound None returns (frame_l4_offset / packet_rel_l4_offset / packet_rel_l4_offset_and_protocol); Coordinator::martian_dst_drops_total()/ipv6_ext_header_drops_total() readers; ProcessStatus wire fields (protocol/control.rs) populated in server/helpers.rs, init 0 in server/lifecycle.rs; regenerated protocol_wire_v1.json fixture. RED-on-revert tests: martian_dst_norroute_bumps_martian_drop_counter (forwarding/tests.rs), ipv6_over_bound_ext_header_chain_bumps_drop_counter (inspect_tests.rs). cargo test --release: 3780 pass / 0 fail / 2 ignored (main bin) + integration bins green.
+  **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/afxdp/forwarding/tests.rs, userspace-dp/src/afxdp/frame/inspect.rs, userspace-dp/src/afxdp/frame/inspect_tests.rs, userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/server/helpers.rs, userspace-dp/src/server/lifecycle.rs, userspace-dp/tests/fixtures/protocol_wire_v1.json
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4743 Go-side surfacing — add MartianDstDropsTotal + Ipv6ExtHeaderDropsTotal to ProcessStatus (protocol.go, wire tags tag-matched to Rust); Prometheus xpf_userspace_martian_dst_drops_total + xpf_userspace_ipv6_ext_header_drops_total (metrics.go Desc+Describe, metrics_descriptors.go NewDesc, metrics_userspace.go Collect); coverage-test list + metrics_test count 29->31 + assertions. go build ./... clean; go test ./pkg/dataplane/... ./pkg/api/... green.
+  **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, pkg/api/metrics_descriptor_coverage_test.go, pkg/api/metrics_test.go

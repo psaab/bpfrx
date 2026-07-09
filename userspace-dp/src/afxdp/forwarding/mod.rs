@@ -27,6 +27,44 @@ const MAX_NEXT_TABLE_DEPTH: usize = 8;
 pub(in crate::afxdp) static LOCAL_DELIVERY_IFINDEX0: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// #4743: cumulative count of packets whose destination is a MARTIAN
+/// (IPv4/IPv6 multicast, the IPv4 limited broadcast, the unspecified address
+/// `0.0.0.0`/`::`, or loopback `127/8`/`::1`) AND whose forwarding resolution
+/// on the per-packet dynamic-neighbor data path came back `NoRoute` — i.e. a
+/// definitively non-forwardable destination the FIB has no route for. Such a
+/// packet is blackholed (NoRoute is slow-path-eligible, so it is at most
+/// reinjected only for the kernel to drop it too). This is the observable
+/// half of the #4373 E4/H2/H7 "filter-accept then silent routing drop" gap:
+/// a firewall-filter `accept` log now correlates with a visible drop counter.
+///
+/// Only the MARTIAN subset of `NoRoute` is counted, NOT every `NoRoute`:
+/// a plain `NoRoute` is already tallied by `slow_path_no_route_packets` and
+/// may still be forwarded by a kernel route userspace lacks, so counting it as
+/// a "drop" would over-count. A martian, by contrast, has no legitimate
+/// forwarding path. The check is gated on the resolved disposition being
+/// `NoRoute`, so it never changes routing behaviour and never miscounts a
+/// local multicast / NDP address (those resolve `LocalDelivery` or a real
+/// route, not `NoRoute`) nor a martian that matches a default route (which is
+/// forwarded, not dropped — a separate no-martian-filter gap out of scope
+/// here). Surfaced as `xpf_userspace_martian_dst_drops_total`.
+pub(in crate::afxdp) static MARTIAN_DST_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #4743: true iff `dst` is a martian destination a firewall never forwards —
+/// IPv4/IPv6 multicast, the IPv4 limited broadcast, the unspecified address,
+/// or loopback. Used ONLY to classify an already-resolved `NoRoute` for the
+/// `MARTIAN_DST_DROPS` observability counter; it never gates forwarding.
+#[inline]
+pub(in crate::afxdp) fn dst_is_martian(dst: IpAddr) -> bool {
+    match dst {
+        IpAddr::V4(v4) => {
+            v4.is_multicast() || v4.is_broadcast() || v4.is_unspecified() || v4.is_loopback()
+        }
+        // IPv6 has no broadcast; multicast (ff00::/8) covers the group case.
+        IpAddr::V6(v6) => v6.is_multicast() || v6.is_unspecified() || v6.is_loopback(),
+    }
+}
+
 pub(super) fn classify_metadata(
     meta: UserspaceDpMeta,
     validation: ValidationState,
@@ -1374,7 +1412,17 @@ pub(super) fn lookup_forwarding_resolution_with_dynamic(
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
     dst: IpAddr,
 ) -> ForwardingResolution {
-    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, None)
+    let resolution = lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, None);
+    // #4743: classify a NoRoute to a martian destination as an observable drop
+    // (blackhole). This is the per-packet data path (`resolve_forwarding` on
+    // the session-miss/new-flow resolution); the operator-simulate entry
+    // (`lookup_forwarding_for_ip` → `lookup_forwarding_resolution`) is a
+    // DIFFERENT, non-dynamic function and is deliberately NOT counted here, so
+    // a `show ... match-policies` for a martian never inflates the counter.
+    if resolution.disposition == ForwardingDisposition::NoRoute && dst_is_martian(dst) {
+        MARTIAN_DST_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    resolution
 }
 
 /// #2734: like `lookup_forwarding_resolution_with_dynamic`, but selects an

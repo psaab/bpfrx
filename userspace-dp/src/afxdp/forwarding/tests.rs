@@ -2686,6 +2686,78 @@ fn dynamic_neighbor_cache_enables_forward_candidate() {
     );
 }
 
+/// #4743: a martian destination (multicast / IPv4 broadcast / unspecified /
+/// loopback) that resolves to NoRoute on the per-packet dynamic-neighbor data
+/// path bumps `MARTIAN_DST_DROPS`; a NON-martian NoRoute (e.g. a routable-looking
+/// unicast the FIB simply lacks) does NOT. Reverting the `MARTIAN_DST_DROPS`
+/// fetch_add turns the first assertion RED; reverting the `dst_is_martian` gate
+/// (counting every NoRoute) turns the second assertion RED.
+#[test]
+fn martian_dst_norroute_bumps_martian_drop_counter() {
+    // Route-less state: interfaces/zones present, but NO routes, so every
+    // destination — martian or not — resolves to NoRoute (no default route to
+    // shadow the martian into a ForwardCandidate).
+    let mut snap = forwarding_snapshot(false);
+    snap.routes.clear();
+    let state = build_forwarding_state(&snap);
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+
+    let load = || MARTIAN_DST_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+
+    // A multicast destination with no route: NoRoute + martian -> +1.
+    let before = load();
+    let martian = lookup_forwarding_resolution_with_dynamic(
+        &state,
+        &dynamic_neighbors,
+        IpAddr::V4(Ipv4Addr::new(224, 0, 0, 5)),
+    );
+    assert_eq!(
+        martian.disposition,
+        ForwardingDisposition::NoRoute,
+        "test premise: a martian with no route resolves NoRoute"
+    );
+    assert_eq!(
+        load(),
+        before + 1,
+        "a martian-dst NoRoute must bump MARTIAN_DST_DROPS"
+    );
+
+    // A non-martian unicast with no route: NoRoute but NOT martian -> +0.
+    let mid = load();
+    let unicast = lookup_forwarding_resolution_with_dynamic(
+        &state,
+        &dynamic_neighbors,
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    );
+    assert_eq!(
+        unicast.disposition,
+        ForwardingDisposition::NoRoute,
+        "test premise: a routeless unicast resolves NoRoute"
+    );
+    assert_eq!(
+        load(),
+        mid,
+        "a non-martian NoRoute must NOT bump MARTIAN_DST_DROPS"
+    );
+
+    // Loopback + unspecified + IPv6 multicast are martians too.
+    for dst in [
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6("ff0e::1".parse().expect("v6 multicast")),
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+        let pre = load();
+        let r = lookup_forwarding_resolution_with_dynamic(&state, &dynamic_neighbors, dst);
+        assert_eq!(
+            r.disposition,
+            ForwardingDisposition::NoRoute,
+            "test premise: {dst} resolves NoRoute in a routeless state"
+        );
+        assert_eq!(load(), pre + 1, "martian {dst} must bump MARTIAN_DST_DROPS");
+    }
+}
+
 #[test]
 fn parse_neighbor_entries_accepts_stale_ipv4_and_ipv6_rows() {
     let parsed = parse_neighbor_entries(

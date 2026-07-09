@@ -105,6 +105,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // rather than silently dropping it downstream.
     state.status.gre_encap_df_oversize_drops_total =
         state.afxdp.gre_encap_df_oversize_drops_total();
+    // #4743: martian-destination NoRoute drops (multicast / IPv4 broadcast /
+    // unspecified / loopback dst blackholed) and IPv6 extension-header
+    // fail-closed (over-bound chain) drops. Nonzero = the observable half of
+    // the #4373 filter-accept-then-silent-routing/header-drop gap.
+    state.status.martian_dst_drops_total = state.afxdp.martian_dst_drops_total();
+    state.status.ipv6_ext_header_drops_total = state.afxdp.ipv6_ext_header_drops_total();
     // #2782: native-GRE decap checksum-invalid drops (C bit set but the
     // GRE checksum failed to verify, or the header was truncated past the
     // Checksum+Reserved1 field). Nonzero = a checksummed GRE peer

@@ -30,6 +30,32 @@ use super::*;
 /// forwarding/screen paths.
 pub(crate) const MAX_IPV6_EXT_HEADERS: usize = 8;
 
+/// #4743: cumulative count of IPv6 packets fail-CLOSED dropped because their
+/// extension-header chain was still unterminated at the `MAX_IPV6_EXT_HEADERS`
+/// bound — an unparseable / over-long chain (a header-insertion IDS evasion or
+/// a malformed packet). The three forwarding L4-offset walkers below
+/// (`frame_l4_offset`, `packet_rel_l4_offset`, `packet_rel_l4_offset_and_protocol`)
+/// all return `None` at the bound, and a `None`-consuming caller fails the
+/// packet closed (no L4 offset ⇒ no forward). Before this counter the drop was
+/// silent. Bumped at each bound site via `note_ipv6_ext_header_overflow`,
+/// mirroring the sibling module-level diagnostic drop counters
+/// (`FABRIC_LINK_SKIPPED_MALFORMED`, the GRE `*_DROPS` statics). Surfaced as
+/// `xpf_userspace_ipv6_ext_header_drops_total`. NOTE: this counts fail-closed
+/// *walk events* on the forwarding walkers, which a single over-bound packet
+/// may trigger more than once (session-key + forward parse); the value is a
+/// drop-class signal, not an exact packet census. The screen path's own
+/// over-bound walk (`screen/extract.rs`) is separately counted via the
+/// aggregate `screen_drops`, so it is deliberately NOT double-counted here.
+pub(crate) static IPV6_EXT_HEADER_DROPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #4743: record one IPv6 extension-header fail-closed (over-bound) drop.
+/// A single relaxed atomic add on the (rare) malformed-packet path.
+#[inline]
+pub(crate) fn note_ipv6_ext_header_overflow() {
+    IPV6_EXT_HEADER_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 // #4517: the IPv6 extension-header types every walker in this file treats
 // as a generic length-prefixed header (byte 0 = next header, byte 1 =
 // HdrExtLen in 8-octet units excluding the first 8, advance
@@ -125,6 +151,8 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
             // ext-header offset as a fake L4 offset. Matches the screen
             // path (`screen/extract.rs`), which returns
             // `Err(TruncatedIpv6ExtChain)` on the same over-bound chain.
+            // #4743: count the otherwise-silent fail-closed over-bound drop.
+            note_ipv6_ext_header_overflow();
             None
         }
         _ => None,
@@ -183,6 +211,8 @@ pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> 
                 }
             }
             // #2292: fail-CLOSED at the bound (see frame_l4_offset).
+            // #4743: count the otherwise-silent fail-closed over-bound drop.
+            note_ipv6_ext_header_overflow();
             None
         }
         _ => None,
@@ -253,6 +283,8 @@ pub(in crate::afxdp) fn packet_rel_l4_offset_and_protocol(
             // unconsumed extension-header type (0/43/51/60), which
             // callers (GRE inner-parse, tunnel local-origin metadata,
             // NDP/TCP-flag helpers) then trusted as a real L4 protocol.
+            // #4743: count the otherwise-silent fail-closed over-bound drop.
+            note_ipv6_ext_header_overflow();
             None
         }
         _ => None,

@@ -65,6 +65,10 @@ pub(in crate::afxdp) use checksum::{
 // so `crate::nat64`'s private ext-header walkers share the single
 // canonical bound instead of hardcoding a stale 6.
 pub(crate) use inspect::MAX_IPV6_EXT_HEADERS;
+// #4743: the IPv6 extension-header fail-closed (over-bound) drop counter,
+// bumped inside the `inspect` walkers, read by `coordinator::status` to
+// surface `xpf_userspace_ipv6_ext_header_drops_total`.
+pub(crate) use inspect::IPV6_EXT_HEADER_DROPS;
 pub(super) use inspect::{
     frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
     live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,

@@ -230,6 +230,9 @@ pub(crate) fn run() -> Result<(), String> {
             gre_decap_ecn_illegal_drops_total: 0,
             wg_decap_ecn_illegal_drops_total: 0,
             gre_encap_df_oversize_drops_total: 0,
+            // #4743: martian-dst NoRoute drops + IPv6 ext-header fail-closed drops.
+            martian_dst_drops_total: 0,
+            ipv6_ext_header_drops_total: 0,
             gre_decap_checksum_invalid_drops_total: 0,
             time_exceeded_rate_limited_total: 0,
             packet_too_big_rate_limited_total: 0,

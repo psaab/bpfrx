@@ -340,6 +340,27 @@ pub(crate) struct ProcessStatus {
     /// for backward compatibility.
     #[serde(rename = "gre_encap_df_oversize_drops_total", default)]
     pub gre_encap_df_oversize_drops_total: u64,
+    /// #4743: packets DROPPED (blackholed) because their destination is a
+    /// MARTIAN (multicast / IPv4 broadcast / unspecified / loopback) that
+    /// resolved to NoRoute on the per-packet data path. The observable half of
+    /// the #4373 "filter-accept then silent routing drop" gap: a
+    /// firewall-filter `accept` log now correlates with a visible drop
+    /// counter. Only the martian subset of NoRoute is counted (a plain NoRoute
+    /// is already in `slow_path_no_route_packets` and may still be
+    /// kernel-forwarded). Surfaced as `xpf_userspace_martian_dst_drops_total`.
+    /// Omitempty for wire compat with older helpers (defaults to 0).
+    #[serde(rename = "martian_dst_drops_total", default)]
+    pub martian_dst_drops_total: u64,
+    /// #4743: IPv6 packets fail-CLOSED DROPPED because their extension-header
+    /// chain was still unterminated at the `MAX_IPV6_EXT_HEADERS` bound (an
+    /// unparseable / over-long chain — a header-insertion IDS evasion or a
+    /// malformed packet). The forwarding L4-offset walkers return no L4 offset
+    /// and the packet is dropped; before this counter that drop was silent
+    /// (the screen path's own over-bound walk is separately counted via
+    /// `screen_drops`). Surfaced as `xpf_userspace_ipv6_ext_header_drops_total`.
+    /// Omitempty for wire compat with older helpers (defaults to 0).
+    #[serde(rename = "ipv6_ext_header_drops_total", default)]
+    pub ipv6_ext_header_drops_total: u64,
     /// #2782: native-GRE decap frames DROPPED because the Checksum-Present
     /// (C) bit was set but the GRE checksum did not verify (or the header
     /// was truncated past the 4-byte Checksum+Reserved1 field). Per RFC

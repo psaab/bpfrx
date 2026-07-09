@@ -76,6 +76,54 @@ fn v6_meta(protocol: u8) -> UserspaceDpMeta {
     }
 }
 
+/// #4743: an IPv6 packet whose extension-header chain is still unterminated at
+/// the `MAX_IPV6_EXT_HEADERS` bound is fail-closed dropped by the forwarding
+/// L4-offset walker (`frame_l4_offset` returns `None`) and now bumps
+/// `IPV6_EXT_HEADER_DROPS`. A well-formed IPv6 packet (L4 directly after the
+/// base header) does NOT. Reverting the `note_ipv6_ext_header_overflow()` call
+/// at the bound turns the first counter assertion RED.
+#[test]
+fn ipv6_over_bound_ext_header_chain_bumps_drop_counter() {
+    // MAX_IPV6_EXT_HEADERS (8) Hop-by-Hop headers, each 8 bytes and each
+    // pointing to another Hop-by-Hop (next_header = 0). After 8 loop iterations
+    // the walker is STILL on an extension header -> fail-closed None at the
+    // bound (distinct from a too-short None, which is NOT counted, since the
+    // whole chain is present in the buffer).
+    let mut ext_chain = Vec::new();
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        // [next_header=0 (Hop-by-Hop), hdr_ext_len=0, 6 bytes padding] = 8 bytes.
+        ext_chain.extend_from_slice(&[0u8, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    let frame = v6_frame(0 /* Hop-by-Hop */, ext_chain.len() as u16, &ext_chain);
+
+    let before = IPV6_EXT_HEADER_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        frame_l4_offset(&frame, libc::AF_INET6 as u8),
+        None,
+        "an over-bound ext-header chain must fail closed (no L4 offset)"
+    );
+    assert_eq!(
+        IPV6_EXT_HEADER_DROPS.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1,
+        "an over-bound ext-header chain must bump IPV6_EXT_HEADER_DROPS"
+    );
+
+    // A well-formed IPv6 TCP packet (L4 immediately after the 40-byte base
+    // header) resolves an L4 offset and must NOT bump the counter.
+    let clean = v6_frame(PROTO_TCP, 4, &[0x11, 0x22, 0x33, 0x44]);
+    let mid = IPV6_EXT_HEADER_DROPS.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        frame_l4_offset(&clean, libc::AF_INET6 as u8),
+        Some(14 + 40),
+        "a well-formed IPv6 packet resolves L4 at l3+40"
+    );
+    assert_eq!(
+        IPV6_EXT_HEADER_DROPS.load(std::sync::atomic::Ordering::Relaxed),
+        mid,
+        "a well-formed IPv6 packet must NOT bump IPV6_EXT_HEADER_DROPS"
+    );
+}
+
 // ---- IPv4 frame-led parser: out-of-declared-length ports -> None ----
 
 #[test]

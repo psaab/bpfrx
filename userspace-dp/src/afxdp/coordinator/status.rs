@@ -31,6 +31,24 @@ impl super::Coordinator {
         crate::afxdp::forwarding::FABRIC_LINK_UNRESOLVED_PEER.load(Ordering::Relaxed)
     }
 
+    /// #4743: cumulative count of packets dropped (blackholed) because their
+    /// destination is a MARTIAN (multicast / IPv4 broadcast / unspecified /
+    /// loopback) that resolved to NoRoute on the per-packet data path. The
+    /// observable half of the #4373 filter-accept-then-silent-routing-drop
+    /// gap. Surfaced as `xpf_userspace_martian_dst_drops_total`.
+    pub fn martian_dst_drops_total(&self) -> u64 {
+        crate::afxdp::forwarding::MARTIAN_DST_DROPS.load(Ordering::Relaxed)
+    }
+
+    /// #4743: cumulative count of IPv6 packets fail-CLOSED dropped because
+    /// their extension-header chain was still unterminated at the
+    /// `MAX_IPV6_EXT_HEADERS` bound (an unparseable / over-long chain). Bumped
+    /// by the forwarding L4-offset walkers in `afxdp::frame::inspect`. Surfaced
+    /// as `xpf_userspace_ipv6_ext_header_drops_total`.
+    pub fn ipv6_ext_header_drops_total(&self) -> u64 {
+        crate::afxdp::frame::IPV6_EXT_HEADER_DROPS.load(Ordering::Relaxed)
+    }
+
     /// #710: sum of `no_owner_binding_drops` across every binding's
     /// `BindingLiveState`. The per-binding increment site lives in
     /// `apply_worker_shaped_tx_requests` and mechanically lands on
