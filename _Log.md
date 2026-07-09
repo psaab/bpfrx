@@ -43050,3 +43050,26 @@ top.
 - **Validation**: gofmt clean; go build ./... clean; go vet ./pkg/config
   ./pkg/snmp clean (no copylocks); go test ./pkg/config/... + ./pkg/snmp/...
   pass; full `go test ./...` green (53 ok / 0 fail / 3 no-test-files, 56 pkgs).
+
+## 2026-07-09 — #4715 Monitor.getNlHandle lazy-init race + FD leak
+
+- **Timestamp**: 2026-07-09
+- **Action**: Synchronize Monitor.getNlHandle lazy init under mon.mu (fix
+  data race on cachedNlHandle + FD leak when two concurrent lock-free
+  callers both create a netlink handle). Added nlHandleCloser interface +
+  injectable newNlHandle factory so a counting fake can prove creations==1
+  and Close-on-Stop==1 under -race. Preserved lazy-recreate-after-Stop
+  contract; test injection short-circuits before locking (no deadlock —
+  neither caller holds mon.mu).
+- **File(s)**: pkg/cluster/monitor.go (Monitor struct: cachedNlHandle now
+  nlHandleCloser + newNlHandle field; nlHandleCloser interface +
+  defaultNlHandle factory; getNlHandle check-create-cache under mon.mu),
+  pkg/cluster/monitor_test.go (countingNlHandle fake +
+  TestGetNlHandleConcurrentSingleCreation [RED-on-revert: -race DATA RACE +
+  creations=64] + TestGetNlHandleSingleThreadedCachesAndCloses),
+  docs/bugs.md (#4715 entry).
+- **Validation**: gofmt clean; go build ./... clean; go vet ./pkg/cluster
+  clean; go test ./pkg/cluster non-race pass; PRIMARY go test -race
+  ./pkg/cluster clean (ok 8.8s); full go test ./... green. RED-on-revert
+  verified: removing the lock (keeping factory seam) → -race reports DATA
+  RACE on cachedNlHandle AND creations=64 (leak) → test FAIL.

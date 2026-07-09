@@ -57,9 +57,16 @@ type Monitor struct {
 	nlHandle nlLinkGetter
 
 	// cachedNlHandle is the production netlink handle created on first use.
-	// Stored separately so Stop() can close it without adding Close() to
-	// the nlLinkGetter test interface.
-	cachedNlHandle *netlink.Handle
+	// Stored separately so Stop() can close it. Guarded by mu: getNlHandle()
+	// performs the check-create-cache under mu so exactly one handle is
+	// created under concurrent callers (the poll loop and RGInterfaceReady)
+	// and the write cannot race Stop()'s cachedNlHandle=nil (#4715).
+	cachedNlHandle nlHandleCloser
+
+	// newNlHandle creates the production netlink handle. nil means use
+	// defaultNlHandle (a real netlink.Handle). Overridable for tests so the
+	// lazy-creation path can be exercised with a counting fake.
+	newNlHandle func() (nlHandleCloser, error)
 
 	// icmpDialer can be overridden for testing.
 	// network is "udp4" or "udp6".
@@ -82,6 +89,24 @@ type Monitor struct {
 // nlLinkGetter abstracts netlink.Handle.LinkByName for testing.
 type nlLinkGetter interface {
 	LinkByName(name string) (netlink.Link, error)
+}
+
+// nlHandleCloser is a queryable netlink handle that can also be closed.
+// *netlink.Handle satisfies it; tests inject a counting fake to verify the
+// lazy-creation path creates exactly one handle and closes it on Stop.
+type nlHandleCloser interface {
+	nlLinkGetter
+	Close()
+}
+
+// defaultNlHandle is the production factory for cachedNlHandle. It creates a
+// real netlink handle; *netlink.Handle satisfies nlHandleCloser.
+func defaultNlHandle() (nlHandleCloser, error) {
+	h, err := netlink.NewHandle()
+	if err != nil {
+		return nil, err
+	}
+	return h, nil
 }
 
 // icmpConn abstracts an ICMP connection for testing.
@@ -541,14 +566,33 @@ func (mon *Monitor) RGInterfaceReady(rgID int) (bool, []string) {
 }
 
 func (mon *Monitor) getNlHandle() nlLinkGetter {
+	// Test injection short-circuits before any locking. nlHandle is set only
+	// at construction in tests and never mutated afterward, so this read is
+	// race-free.
 	if mon.nlHandle != nil {
 		return mon.nlHandle
 	}
-	// Cache the production handle to avoid leaking netlink sockets.
+
+	// The check-create-cache runs under mon.mu so concurrent callers (the
+	// poll loop via pollInterfaceMonitors and the daemon HA path via
+	// RGInterfaceReady) create exactly one production handle — no leaked
+	// netlink socket — and the cachedNlHandle write cannot race Stop()'s
+	// cachedNlHandle=nil. Neither caller holds mon.mu at this point: poll()
+	// releases it before pollInterfaceMonitors, and RGInterfaceReady()
+	// releases it before calling; so this does not deadlock. The handle can
+	// still be re-created after Stop() nils cachedNlHandle, matching the
+	// prior lazy-recreate contract. (#4715)
+	mon.mu.Lock()
+	defer mon.mu.Unlock()
+
 	if mon.cachedNlHandle != nil {
 		return mon.cachedNlHandle
 	}
-	h, err := netlink.NewHandle()
+	factory := mon.newNlHandle
+	if factory == nil {
+		factory = defaultNlHandle
+	}
+	h, err := factory()
 	if err != nil {
 		slog.Warn("cluster monitor: failed to create netlink handle", "err", err)
 		return &noopNlHandle{}
