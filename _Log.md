@@ -43945,3 +43945,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4954 give networkd Manager reload/reconfigure activation debt — a failed networkctl reload now re-attempts on the next identical Apply (reloadPending/reconfigurePending) instead of returning a false success when files are unchanged
   **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4961 scope RA supersession per-interface — WithdrawInterfaces/WithdrawOnce bump a per-interface epoch (ifaceEpoch) instead of the whole-manager fence; releaseDrain restart + applyDeferred check the per-interface baseline (drainEntry.startIfaceEpoch) so an unrelated withdraw of interface B no longer cancels interface A's in-flight restart (IPv6 loss)
+  **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md

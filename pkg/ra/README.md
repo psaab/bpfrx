@@ -155,11 +155,24 @@ after HA failover. To make that **structural**, not flag-defended:
   flight is NOT dead (`dead()` returns false until `connReady` is closed), so
   an in-progress slow bind is never spuriously torn down. Net effect: a
   transient open failure recovers on the next reconcile with NO config change.
-- **Deferred / restart Apply is epoch-guarded.** An `Apply` start that
-  waits behind a tombstone (a pre-existing drain, or its own changed-config
-  stop) captures the manager epoch; if a newer `Withdraw`/`Clear`/`Apply`
-  bumped the epoch in the interim, the deferred/restart start is aborted
-  (it must not re-arm RA on a node that has since transitioned to BACKUP).
+- **Deferred / restart Apply is epoch-guarded (two-level, #4961).** An
+  `Apply` start that waits behind a tombstone (a pre-existing drain, or its own
+  changed-config stop) captures TWO baselines: the whole-manager fence
+  (`m.epoch`) and the target interface's per-interface revision
+  (`m.ifaceEpoch[name]`, recorded on the restart's `drainEntry.startIfaceEpoch`
+  and captured per deferred interface). The (re)placement starts only if BOTH
+  are unchanged. The whole-manager fence is bumped by `Apply`, `Withdraw`, and
+  `Clear` (a node-wide transition to BACKUP must abort every in-flight start).
+  The INTERFACE-SCOPED withdraws (`WithdrawInterfaces`, `WithdrawOnce`) bump
+  ONLY the per-interface revision of the interfaces they name — NOT the fence.
+  Before #4961 they bumped the global fence, so an unrelated
+  `WithdrawInterfaces([B])` (e.g. from a concurrent HA reconcile, which is not
+  under `applySem`) cancelled interface A's in-flight changed-config restart:
+  the epoch mismatch suppressed A's replacement AND deleted its tombstone, so A
+  silently lost its RA sender and A's hosts lost their IPv6 default route /
+  RDNSS until the next RG transition. Scoping supersession per interface fixes
+  that while a withdraw NAMING A still supersedes A's restart (both the
+  per-interface epoch bump and the `goodbyeWanted` flip fire).
 - **Bounded writes.** Every owner `WriteTo` sets a 1 s write deadline so a
   stuck socket cannot wedge withdrawal; the owner always returns promptly,
   which is what makes owner-performs-the-close safe for both modes.
