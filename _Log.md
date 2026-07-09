@@ -43881,3 +43881,10 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4872 pkg/upgrade fail-closed hardening — (A) Promote checks RunningKernel before pruning on BootCurrent error; indeterminate state preserves journal + no reboot; (B) StrictWatchdog arm failure aborts; watchdog helpers propagate I/O errors; (C) self-recover rejects lease missing expires_at; (D) grace clock resets on any observation error
   **File(s)**: pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_linux.go, pkg/upgrade/kernel_selfrecover.go, pkg/upgrade/kernel_test.go, pkg/upgrade/kernel_selfrecover_test.go, docs/in-place-upgrade.md
+- **Timestamp**: 2026-07-09
+  **Action**: #4873 (A) — make the DDNS corrupt-state fail-closed posture durable across restart. loadStateOrDegrade now writes a durable <path>.degraded marker when it quarantines a corrupt/unsupported ownership file, and honors that marker first on every load, so a restart after quarantine stays degraded instead of coming up clean-but-empty (fail-open) and resuming publish/withdraw with ownership forgotten. Covers both the main manager and SurfaceA (same gate).
+  **File(s)**: pkg/ddns/state.go, pkg/ddns/manager.go, pkg/ddns/corrupt_state_durable_4873_test.go, pkg/ddns/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4875 fwdstatus require positive in-window heartbeat evidence for Online; empty/nil/future heartbeats -> Degraded (was false-green Online)
+  **File(s)**: pkg/fwdstatus/builder.go, pkg/fwdstatus/fwdstatus_test.go, pkg/fwdstatus/README.md

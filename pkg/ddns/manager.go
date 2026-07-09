@@ -318,6 +318,22 @@ type Manager struct {
 // unreadable file (permission / IO) is NOT quarantined — the bytes may be fine
 // and re-readable, so it would be wrong to move the file under a transient fault.
 func loadStateOrDegrade(path string, now func() time.Time) (st *ddnsState, degraded bool, reason string) {
+	// #4873: honor a DURABLE degraded marker FIRST. Quarantine (below) renames
+	// the corrupt canonical file away, so on the next boot a naive reload would
+	// find no file, load an empty store with a nil error, and silently resume
+	// publish/withdraw with all prior ownership forgotten (fail-open). While the
+	// marker exists we stay degraded regardless of the canonical file's state,
+	// until an operator explicitly removes the marker after repair/import. Still
+	// load the store so the manager has a path-initialized (constructible)
+	// handle; its contents are unused while every reconcile op is suspended.
+	if mreason, ok := readDegradedMarker(path); ok {
+		st, _ = loadDDNSState(path)
+		slog.Error("ddns: FAILING CLOSED on a persisted degraded marker; publishing and "+
+			"withdrawals are SUSPENDED until the operator removes it", "reason", mreason,
+			"marker", degradedMarkerPath(path))
+		return st, true, mreason
+	}
+
 	st, err := loadDDNSState(path)
 	if err == nil {
 		return st, false, ""
@@ -338,6 +354,15 @@ func loadStateOrDegrade(path string, now func() time.Time) (st *ddnsState, degra
 				"publishing and withdrawals are SUSPENDED until the operator resolves it",
 				"err", err, "quarantine", qp)
 			reason += " (quarantined to " + qp + ")"
+		}
+		// Persist the fail-closed posture durably (#4873): quarantine just
+		// removed the canonical file, so without this a restart would come up
+		// clean-but-empty and resume as if it owns nothing. The marker keeps the
+		// manager degraded across restarts until the operator resolves it.
+		if werr := writeDegradedMarker(path, reason); werr != nil {
+			slog.Error("ddns: could not persist the degraded marker; a RESTART may FAIL OPEN "+
+				"(resume with empty ownership)", "err", werr, "marker", degradedMarkerPath(path))
+			reason += " (degraded-marker write failed: " + werr.Error() + ")"
 		}
 	} else {
 		slog.Error("ddns: FAILING CLOSED on unreadable ownership state; publishing and withdrawals "+

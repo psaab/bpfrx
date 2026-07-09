@@ -373,6 +373,54 @@ func quarantineBadState(path string, now time.Time) (string, error) {
 	return dst, nil
 }
 
+// degradedMarkerSuffix names the DURABLE fail-closed marker written beside the
+// ownership store when a corrupt / unsupported-version file is quarantined
+// (#4873). Its presence keeps the manager DEGRADED across restarts. Quarantine
+// renames the only canonical file away, so without a durable marker the next
+// boot would find no file, load an EMPTY store with a NIL error, and silently
+// resume publish/withdraw with all prior ownership forgotten — the exact
+// fail-open this closes (a previously-published A/AAAA/PTR can then leak into
+// authoritative DNS forever, or a later publish can re-claim a peer-owned name
+// with no DHCID ownership record left to veto it). The in-memory `degraded`
+// flag alone does not survive the process. The manager stays degraded until an
+// operator explicitly resolves it by removing this marker (after inspecting or
+// importing the quarantined `.corrupt-*` copy).
+const degradedMarkerSuffix = ".degraded"
+
+func degradedMarkerPath(statePath string) string {
+	return statePath + degradedMarkerSuffix
+}
+
+// readDegradedMarker reports whether a durable degraded marker exists for the
+// ownership store at statePath and returns the recorded reason. A marker that
+// exists but cannot be read is still treated as PRESENT (ok=true) with a
+// generic reason — an unreadable fail-closed marker must never silently clear
+// the fail-closed posture. Only a genuine not-exist yields ok=false.
+func readDegradedMarker(statePath string) (reason string, ok bool) {
+	data, err := os.ReadFile(degradedMarkerPath(statePath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false
+		}
+		return "ddns: ownership state degraded (marker present but unreadable: " + err.Error() + ")", true
+	}
+	reason = strings.TrimSpace(string(data))
+	if reason == "" {
+		reason = "ddns: ownership state degraded (persisted #4873 marker present)"
+	}
+	return reason, true
+}
+
+// writeDegradedMarker durably persists the fail-closed posture beside the
+// ownership store (#4873) so it survives a restart after the corrupt file was
+// quarantined away.
+func writeDegradedMarker(statePath, reason string) error {
+	if err := os.MkdirAll(dirOf(statePath), 0o755); err != nil {
+		return fmt.Errorf("create ddns state dir for degraded marker: %w", err)
+	}
+	return fsatomic.WriteFileDurable(degradedMarkerPath(statePath), []byte(reason+"\n"), 0o600)
+}
+
 // save persists the store durably (fsync-on-write). Records are sorted by
 // key for a deterministic file.
 func (s *ddnsState) save() error {
