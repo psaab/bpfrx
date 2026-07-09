@@ -43692,3 +43692,7 @@ top.
 - **Timestamp**: 2026-07-09
   - **Action**: #4407 — extract applyConfigLocked dataplane-apply + RETH-MAC/VIP/worker-rebind core into applyDataplaneAndHACore (named-return threading of commitOverlay + networkdErr; 3 #2926 boundaries preserved)
   - **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-07-09
+  - **Action**: #4652 — decompose segment_forwarded_tcp_frames_from_frame: extract emit_ipv4_segment / emit_ipv6_segment / encap_tunnel_segment inline helpers (byte-identical arm bodies + &mut-param reborrow)
+  - **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs
