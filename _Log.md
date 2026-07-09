@@ -1,3 +1,25 @@
+## 2026-07-09 — #4895 security: validate `system login user <name>` (sudoers injection)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4895 (CRITICAL, CWE-74). `system login user <name>` was an
+  untyped keyed instance with no username validator; the daemon formats the raw
+  key into an /etc/sudoers.d/xpf-<name> NOPASSWD grant, and the lexer decodes
+  `\n` in a quoted string to a literal newline, so `user "x\nnobody ALL=(ALL)
+  NOPASSWD: ALL"` injected a second valid sudoers line that passed visudo and
+  installed. Fix (defense in depth): (1) PRIMARY — added
+  `config.ValidateLoginUsername` (`^[a-z_][a-z0-9_-]*$`, <=32 chars) wired as the
+  `keyValidator` on the login `user` container in schema_system.go → strict
+  commit-check, lenient-warn on load/sync per #1960; (2) DEFENSE —
+  `reconcileSudoers` skips any super-user whose name fails validation and
+  `writeSudoersGrant` re-validates at entry and refuses to format an unvalidated
+  name into sudoers (closes the lenient-load / HA config-sync bypass).
+  **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_system.go,
+  pkg/daemon/daemon_system.go, pkg/config/login_username_4895_test.go,
+  pkg/daemon/daemon_sudoers_username_4895_test.go, docs/config-schema.md
+  **Validation**: unit table + schema-gate tests (hierarchical + flat-set) +
+  daemon-defense tests. RED-on-revert confirmed: reverting the schema+daemon
+  wiring makes the injection commit clean AND writes the literal
+  `xpf-x\nnobody...` sudoers file. Full `go test ./pkg/config/ ./pkg/daemon/`
 ## 2026-07-09 — #4903 daemon: empty-host `:port` wildcard bind bypassed the #4047 loopback clamp
 
 - **Timestamp**: 2026-07-09

@@ -906,6 +906,17 @@ func (d *Daemon) reconcileSudoers(cfg *config.Config) {
 			if user.Class != "super-user" {
 				continue
 			}
+			// #4895 defense in depth: never format an unvalidated username into
+			// an /etc/sudoers.d grant. Strict commit-check rejects a crafted
+			// name (schema keyValidator), but the tolerant load / peer-sync path
+			// downgrades that to a warning (#1960), so a bad name can still reach
+			// here. Skip it entirely: neither desire nor write it, so any stale
+			// grant is also revoked by the sweep below.
+			if err := config.ValidateLoginUsername(user.Name, nil); err != nil {
+				slog.Warn("refusing sudoers grant for invalid login user name",
+					"user", user.Name, "err", err)
+				continue
+			}
 			desired[sudoersPrefix+user.Name] = struct{}{}
 			if err := writeSudoersGrant(user.Name); err != nil {
 				slog.Warn("failed to write sudoers file",
@@ -940,7 +951,18 @@ func (d *Daemon) reconcileSudoers(cfg *config.Config) {
 // generated file is validated with visudo; if validation fails the file is
 // removed rather than left as a lockout landmine (a broken drop-in breaks
 // ALL sudo invocations).
+//
+// #4895: the username is formatted verbatim into both the drop-in filename
+// and the grant line, and the config lexer decodes `\n` in a quoted string
+// into a literal newline. A name with a newline/whitespace/sudoers
+// metacharacter would inject additional directives that pass visudo's syntax
+// check. Re-validate defensively here — never format an unvalidated name into
+// sudoers, even if a caller bypassed reconcileSudoers' skip or the strict
+// commit-check gate was downgraded on a tolerant load (#1960).
 func writeSudoersGrant(user string) error {
+	if err := config.ValidateLoginUsername(user, nil); err != nil {
+		return fmt.Errorf("refusing sudoers grant for invalid login user name %q: %w", user, err)
+	}
 	path := filepath.Join(sudoersDir, sudoersPrefix+user)
 	line := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", user)
 	if current, _ := os.ReadFile(path); string(current) == line {
