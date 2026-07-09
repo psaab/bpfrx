@@ -157,34 +157,44 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 		lines = lines[:len(lines)-1]
 	}
 
+	applyPipeFilter(lines, origStdout, pipeType, pipeArg)
+	return cmdErr
+}
+
+// applyPipeFilter applies a Junos-style output filter (| match/grep/except/find/
+// count/last/no-more) to lines, writing the filtered result to out.
+//
+// match/grep/except/find are CASE-SENSITIVE, matching the local CLI's
+// pkg/cli.filterStream (which uses a bare strings.Contains(line, pipeArg)).
+// Junos `| match` never case-folds, so the remote and local surfaces must
+// agree — the earlier strings.ToLower on both operands made `| match Foo`
+// match `foo` on remote but not local, a silent semantic divergence (#4968).
+func applyPipeFilter(lines []string, out io.Writer, pipeType, pipeArg string) {
 	switch pipeType {
 	case "match", "grep":
-		lp := strings.ToLower(pipeArg)
 		for _, line := range lines {
-			if strings.Contains(strings.ToLower(line), lp) {
-				fmt.Fprintln(origStdout, line)
+			if strings.Contains(line, pipeArg) {
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "except":
-		lp := strings.ToLower(pipeArg)
 		for _, line := range lines {
-			if !strings.Contains(strings.ToLower(line), lp) {
-				fmt.Fprintln(origStdout, line)
+			if !strings.Contains(line, pipeArg) {
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "find":
-		lp := strings.ToLower(pipeArg)
 		found := false
 		for _, line := range lines {
-			if !found && strings.Contains(strings.ToLower(line), lp) {
+			if !found && strings.Contains(line, pipeArg) {
 				found = true
 			}
 			if found {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "count":
-		fmt.Fprintf(origStdout, "Count: %d lines\n", len(lines))
+		fmt.Fprintf(out, "Count: %d lines\n", len(lines))
 	case "last":
 		n := 10
 		if pipeArg != "" {
@@ -197,14 +207,13 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 			start = 0
 		}
 		for _, line := range lines[start:] {
-			fmt.Fprintln(origStdout, line)
+			fmt.Fprintln(out, line)
 		}
 	case "no-more":
 		for _, line := range lines {
-			fmt.Fprintln(origStdout, line)
+			fmt.Fprintln(out, line)
 		}
 	}
-	return cmdErr
 }
 
 func (c *ctl) dispatchOperational(line string) error {
