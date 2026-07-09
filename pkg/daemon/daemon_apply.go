@@ -631,7 +631,8 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// 1.9–2.7. Dataplane apply + RETH-MAC/VIP/worker-rebind critical section
 	// (#4407). Returns the ip-monitoring commit overlay and the captured
 	// networkd write error for the routing rules + tail reconcile below; an
-	// error is a #2926 context-abort boundary — bail before the tail.
+	// error (a #2926 context abort or an ApplyConfig compile abort) bails
+	// before the tail.
 	commitOverlay, networkdErr, err := d.applyDataplaneAndHACore(ctx, cfg)
 	if err != nil {
 		return err
@@ -665,10 +666,11 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 // — and the two values the tail still needs are returned: the ip-monitoring
 // commit overlay (fed to applyRoutingRules and the FRR render) and the captured
 // networkd write error (threaded into applyTailReconciles' five-way Join). The
-// three #2926 context-abort boundaries (before ApplyConfig, on an ApplyConfig
-// abort, and before the FRR reload) are preserved as an early error return; the
-// caller bails without running the routing / service / tail reconciles, exactly
-// as the inline `return err` did. commitOverlay and networkdErr are named
+// three early error returns — the two #2926 context-abort boundaries
+// (ctx.Err() before ApplyConfig and before the FRR reload) and the
+// compileErrorMustAbortApply dataplane abort on an ApplyConfig failure — are
+// preserved; the caller bails without running the routing / service / tail
+// reconciles, exactly as the inline `return err` did. commitOverlay and networkdErr are named
 // returns so the pre-networkd boundaries can return them (nil) before the
 // networkd phase assigns networkdErr. Runs in the same slot, after the
 // fabric-IPVLAN reconcile and before the routing rules.
