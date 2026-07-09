@@ -193,6 +193,13 @@ func (s *Store) SetRollbackExecutor(fn func(gen uint64)) {
 // code did before #1799) meant a commit-2 timeout "rolled back" to the
 // equally-unconfirmed commit 1 and stayed there forever, because
 // commit 1's own timer had been cancelled.
+// MaxCommitConfirmedMinutes is the inclusive upper bound on a
+// `commit confirmed <minutes>` auto-rollback window, matching the Junos
+// range (1..65535 minutes). It bounds the timer so
+// `time.Duration(minutes)*time.Minute` cannot overflow int64 nanoseconds
+// (#4868). CLI parse sites enforce the same bound before the RPC.
+const MaxCommitConfirmedMinutes = 65535
+
 func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -213,6 +220,17 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 
 	if minutes <= 0 {
 		minutes = 10
+	}
+	// #4868: bound the confirm window. Without an upper bound a large value
+	// overflows `time.Duration(minutes)*time.Minute` (int64 nanoseconds) below,
+	// yielding a wrapped/negative deadline that fires an immediate or wrong
+	// auto-rollback AFTER the candidate has already been promoted. Reject
+	// out-of-range values here (defense in depth — the CLIs validate first, and
+	// the gRPC handler maps this to InvalidArgument) rather than silently
+	// wrapping. `minutes` never reaches the AfterFunc unclamped.
+	if minutes > MaxCommitConfirmedMinutes {
+		return nil, fmt.Errorf("commit confirmed: timeout %d exceeds maximum %d minutes",
+			minutes, MaxCommitConfirmedMinutes)
 	}
 
 	// #1799 Option A: persist BEFORE promoting and BEFORE touching

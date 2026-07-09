@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -435,8 +436,18 @@ func (c *ctl) dispatchConfig(line string) error {
 			// Strict integer parse: a malformed token (e.g. "foo",
 			// "1x") or a negative value must NOT silently fall through
 			// to rollback 0, which discards the candidate (#3447).
-			v, err := strconv.Atoi(parts[1])
+			//
+			// #4868: parse into the int32 the RPC carries. `strconv.Atoi`
+			// returns a 64-bit int on this target, so `4294967296` parsed
+			// clean, passed the >=0 check, then `int32(v)` WRAPPED to 0 —
+			// silently resetting the candidate to the active config. Using
+			// ParseInt(_, 10, 32) rejects any value that does not fit int32
+			// (ErrRange) instead of wrapping it.
+			v, err := strconv.ParseInt(parts[1], 10, 32)
 			if err != nil {
+				if errors.Is(err, strconv.ErrRange) {
+					return fmt.Errorf("rollback: rollback number %q out of range", parts[1])
+				}
 				return fmt.Errorf("rollback: invalid rollback number %q", parts[1])
 			}
 			if v < 0 {

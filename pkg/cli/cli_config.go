@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // commitApply invokes the reconcile path for a freshly-committed config.
@@ -211,11 +212,25 @@ func (c *CLI) handleCommit(args []string) error {
 	}
 
 	if len(args) > 0 && args[0] == "confirmed" {
+		if len(args) > 2 {
+			return fmt.Errorf("usage: commit confirmed [minutes]")
+		}
+		// #4868: `commit confirmed` is the operator's rollback guard, so a
+		// malformed/out-of-range timeout must ERROR rather than silently arm the
+		// 10-minute default (banana|0|-1) or truncate a large value. Parse into
+		// the int32/Junos range and enforce [1, MaxCommitConfirmedMinutes].
 		minutes := 10
 		if len(args) >= 2 {
-			if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
-				minutes = v
+			v, err := strconv.ParseInt(args[1], 10, 32)
+			if err != nil || v <= 0 {
+				return fmt.Errorf("commit confirmed: invalid timeout %q "+
+					"(want a positive number of minutes, 1..%d)", args[1], configstore.MaxCommitConfirmedMinutes)
 			}
+			if v > configstore.MaxCommitConfirmedMinutes {
+				return fmt.Errorf("commit confirmed: timeout %d exceeds maximum %d minutes",
+					v, configstore.MaxCommitConfirmedMinutes)
+			}
+			minutes = int(v)
 		}
 
 		compiled, err := c.runCommitConfirmed(minutes)
@@ -229,6 +244,14 @@ func (c *CLI) handleCommit(args []string) error {
 		printConfigWarnings(compiled.Warnings)
 		fmt.Printf("commit confirmed will be automatically rolled back in %d minutes unless confirmed\n", minutes)
 		return nil
+	}
+
+	// #4868: an unrecognized first token (e.g. the typo `commit confimed 10`)
+	// must NOT fall through to the permanent commit below — that would be a
+	// management-stranding change with no rollback timer. Reject it before any
+	// mutation. Valid modifiers mirror cmdtree (check / comment / confirmed).
+	if len(args) > 0 {
+		return fmt.Errorf("commit: unknown option %q (valid: check, comment, confirmed)", args[0])
 	}
 
 	// Bare commit during a pending commit-confirmed window (#4000). Junos
