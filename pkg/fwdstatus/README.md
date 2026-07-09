@@ -52,3 +52,15 @@ root `pkg/dataplane` package, `pkg/cli`, or `pkg/grpcapi`.
   multi-core sum.
 - Windows shorter than the daemon uptime render as `-` to avoid lying
   about a 5 m average that hasn't elapsed yet.
+- **Online requires positive, in-window heartbeat evidence (#4875).**
+  On the userspace path `State` is `Online` only when the helper
+  reported at least one worker heartbeat AND every heartbeat lands in
+  the `[0, 2s]` age window (`heartbeatsHealthy` in `builder.go`). An
+  empty/omitted heartbeat set (worker startup, or a wire-version
+  mismatch that drops the field) and a future-dated heartbeat (a
+  malformed/torn clock conversion — heartbeats share the host clock, so
+  a heartbeat ahead of `now` is never real liveness) both read as
+  `Degraded`, never `Online`. The old `allHeartbeatsFresh` treated an
+  empty slice and a future timestamp as "trivially fresh" and fell
+  straight through to `Online`, giving operators and failover
+  automation a false-green forwarding state.
