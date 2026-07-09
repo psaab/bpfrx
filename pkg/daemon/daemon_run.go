@@ -202,6 +202,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// harmless (the compiler is not exercised there).
 	dataplane.SetProtectedInterfaceResolver(d.resolveProtectedInterfaces)
 
+	// ===== PHASE 1: Config load + bootstrap =====
 	// Load persisted configuration from DB, falling back to text config file.
 	//
 	// Fatal-on-parse floor (#1917 increment B, plan §6.4 / D1): a PRESENT
@@ -343,6 +344,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			"node_id_file", nodeIDFile)
 	}
 
+	// ===== PHASE 2: Interface naming + bootstrap lifeline =====
 	// Enumerate PCI NICs and assign vSRX-style names (fxp0, em0, ge-X-0-Y)
 	// before any manager creation or BPF load.
 	if !d.opts.NoDataplane {
@@ -437,6 +439,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// ===== PHASE 3: Manager init (routing/FRR/IPsec/RPM/ipmon/event-engine/DHCP/cluster/VRRP/dataplane) + first applyConfig =====
 	// Initialize routing, FRR, and IPsec managers
 	if !d.opts.NoDataplane {
 		rm, err := routing.New()
@@ -736,6 +739,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.reconcileBlackholeRoutes()
 	}
 
+	// ===== PHASE 4: Signal handling + apply-cancel context + event buffer + WaitGroup =====
 	// Handle signals for clean shutdown.
 	// In interactive mode, only SIGTERM triggers shutdown — SIGINT is handled
 	// by the CLI for command cancellation (Ctrl-C).
@@ -776,6 +780,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// NOTE: session sync dp wiring + sweep start moved into startClusterComms
 	// goroutine to avoid race: d.sessionSync is created asynchronously.
 
+	// ===== PHASE 5: Background-service starts + HTTP/gRPC API =====
 	// Start background services if dataplane is loaded
 	var er *logging.EventReader
 	if d.dp != nil {
@@ -1549,6 +1554,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("gRPC API server started", "addr", d.opts.GRPCAddr)
 	}
 
+	// ===== PHASE 6: Main block / wait (interactive CLI or daemon-mode signal wait) =====
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
@@ -1693,6 +1699,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("signal received, shutting down")
 	}
 
+	// ===== PHASE 7: Shutdown sequence (extracted to runShutdownSequence, #4662) =====
+	return d.runShutdownSequence(&wg, stop, runErr)
+}
+
+// runShutdownSequence performs the ordered post-run teardown: abort in-flight
+// apply, stop the signal context, wait background goroutines, then tear down
+// SNMP/flowexport/feeds/RPM/archive/event-engine/ipmon/natpool-alarm/FRR/LLDP,
+// clear HA rg_active (non-hitless), withdraw RA, stop VRRP/cluster/session-sync,
+// close/teardown the dataplane, and restore step0 tunables. The ordering is
+// load-bearing (see the per-step comments). Extracted verbatim from Run() so
+// the 1690-LOC lifecycle stays reviewable (#4662 Increment 1). Returns runErr
+// unchanged.
+func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr error) error {
 	// #2926: explicitly abort any in-flight commit/remediation apply NOW, at the
 	// very start of the shutdown sequence and BEFORE the explicit subsystem
 	// teardown below (FRR Stop, HA rg_active clear, dp.Teardown). applyCancelCtx
