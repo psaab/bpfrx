@@ -130,3 +130,80 @@ func TestZoneDetailPolicySummaryNilConfig(t *testing.T) {
 		t.Fatalf("nil cfg should return nil, got %v", lines)
 	}
 }
+
+// TestZoneDetailPolicySummaryWildcardZonePairs pins the #4885 fix: a wildcard
+// zone-pair side ("any") that governs the queried zone must be INCLUDED, and
+// zone-pair lines must render in the runtime's tier order (exact, then
+// single-wildcard, then both-any) regardless of config placement.
+//
+// The config below is deliberately authored in REVERSE tier order —
+// both-any first, single-wildcard next, exact last, plus one unrelated set —
+// so a passing test proves both the inclusion filter and the re-ordering.
+func TestZoneDetailPolicySummaryWildcardZonePairs(t *testing.T) {
+	anyMatch := config.PolicyMatch{
+		SourceAddresses:      []string{"any"},
+		DestinationAddresses: []string{"any"},
+		Applications:         []string{"any"},
+	}
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			DefaultPolicy: config.PolicyDeny,
+			Zones:         zones("trust", "untrust", "dmz"),
+			Policies: []*config.ZonePairPolicies{
+				{ // config idx 0 — both-any: governs every zone
+					FromZone: "any", ToZone: "any",
+					Policies: []*config.Policy{{Name: "anyany", Action: config.PolicyDeny, Match: anyMatch}},
+				},
+				{ // config idx 1 — single-wildcard: from any -> untrust governs a trust ingress
+					FromZone: "any", ToZone: "untrust",
+					Policies: []*config.Policy{{Name: "wild-ingress", Action: config.PolicyPermit, Match: anyMatch}},
+				},
+				{ // config idx 2 — exact: literally names trust
+					FromZone: "trust", ToZone: "untrust",
+					Policies: []*config.Policy{{Name: "exact", Action: config.PolicyPermit, Match: anyMatch}},
+				},
+				{ // config idx 3 — unrelated: neither side is trust/any
+					FromZone: "dmz", ToZone: "untrust",
+					Policies: []*config.Policy{{Name: "unrelated", Action: config.PolicyPermit, Match: anyMatch}},
+				},
+			},
+		},
+	}
+	lines := ZoneDetailPolicySummary(cfg, "trust", nil, false)
+	got := strings.Join(lines, "\n")
+
+	// Inclusion: the wildcard + both-any sets that govern trust must appear;
+	// the unrelated dmz->untrust set must not.
+	idxExact := indexOfLine(t, lines, "exact")
+	idxWild := indexOfLine(t, lines, "wild-ingress")
+	idxAny := indexOfLine(t, lines, "anyany")
+	if strings.Contains(got, "unrelated") {
+		t.Fatalf("dmz->untrust set does not govern trust and must be omitted:\n%s", got)
+	}
+	// Ordering: exact, then single-wildcard, then both-any — despite reverse
+	// config placement.
+	if !(idxExact < idxWild && idxWild < idxAny) {
+		t.Fatalf("zone-pair lines out of runtime tier order (exact=%d wild=%d any=%d):\n%s",
+			idxExact, idxWild, idxAny, got)
+	}
+	// The rendered wildcard sides keep the "any" token.
+	if !strings.Contains(got, "[zone-pair] any -> untrust: wild-ingress") {
+		t.Fatalf("single-wildcard line missing/misrendered:\n%s", got)
+	}
+	if !strings.Contains(got, "[zone-pair] any -> any: anyany") {
+		t.Fatalf("both-any line missing/misrendered:\n%s", got)
+	}
+}
+
+// indexOfLine returns the index of the first line containing sub, failing the
+// test if none matches.
+func indexOfLine(t *testing.T, lines []string, sub string) int {
+	t.Helper()
+	for i, l := range lines {
+		if strings.Contains(l, sub) {
+			return i
+		}
+	}
+	t.Fatalf("no summary line contains %q:\n%s", sub, strings.Join(lines, "\n"))
+	return -1
+}

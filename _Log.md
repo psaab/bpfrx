@@ -43896,6 +43896,8 @@ top.
   **File(s)**: pkg/cluster/manager.go, pkg/cluster/manager_start_deadlock_test.go, pkg/cluster/README.md
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4885 zone-detail includes wildcard/any->any zone-pairs, renders in runtime tier order (exact, single-wildcard, both-any)
+  **File(s)**: pkg/policymatch/zone_detail_summary.go, pkg/policymatch/zone_detail_summary_test.go
   **Action**: #4869 xpfd upgrade rejects stray positional args (fs.NArg()!=0) so `xpfd upgrade rolling` errors instead of running the uncoordinated standalone cut; extracted testable parseUpgradeArgs
   **File(s)**: cmd/xpfd/upgrade.go, cmd/xpfd/upgrade_args_4869_test.go, docs/in-place-upgrade.md
   **Action**: #4877 ValidatePercent rejects NaN/Inf (commit-check) before range gate

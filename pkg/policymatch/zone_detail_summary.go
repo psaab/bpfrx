@@ -103,6 +103,26 @@ func ZoneDetailPolicySummary(cfg *config.Config, zone string, schedActive map[st
 	// Tier 1: zone-pair policies. Track policySetID across ALL zone-pair sets
 	// (matching or not, nil or not) exactly like the runtime walker so the
 	// displayed id lands in the correct span-accumulated namespace.
+	//
+	// #4885: two divergences from the runtime evaluator are fixed here.
+	//
+	//  1. A wildcard zone-pair side ("any") governs THIS zone too, but the
+	//     pre-fix `FromZone == zone || ToZone == zone` filter dropped it: a
+	//     `from any to untrust` set governs a trust->untrust flow (any matches
+	//     trust as ingress), and a `from any to any` set governs every zone —
+	//     yet neither literally names `zone`, so both were omitted. Match a
+	//     side when it equals `zone` OR is the "any" wildcard.
+	//  2. The runtime evaluates zone-pair sets in TIER order regardless of
+	//     config placement — exact (both sides concrete), then single-wildcard
+	//     (exactly one side "any"), then both-any (see policymatch.go transit
+	//     Tiers 1-3). Emit the summary in that same order (config order kept
+	//     within each tier) so an operator reads the effective precedence, not
+	//     raw stanza placement.
+	//
+	// policySetID still advances in config order so each rule's displayed id
+	// stays in the correct span-accumulated namespace no matter which tier
+	// bucket its line lands in.
+	var exactLines, singleWildLines, bothAnyLines []string
 	zonePairPolicies := 0
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
@@ -112,7 +132,11 @@ func ZoneDetailPolicySummary(cfg *config.Config, zone string, schedActive map[st
 			policySetID++
 			continue
 		}
-		if zpp.FromZone == zone || zpp.ToZone == zone {
+		fromAny := zpp.FromZone == "any"
+		toAny := zpp.ToZone == "any"
+		fromAffects := zpp.FromZone == zone || fromAny
+		toAffects := zpp.ToZone == zone || toAny
+		if fromAffects || toAffects {
 			for i, pol := range zpp.Policies {
 				// #3476: skip a nil rule like the runtime walker does.
 				if pol == nil {
@@ -122,13 +146,24 @@ func ZoneDetailPolicySummary(cfg *config.Config, zone string, schedActive map[st
 				inactive := haveSched && dpuserspace.PolicyInactive(pol.SchedulerName, schedActive)
 				mods := zoneDetailModifiers(id, pol.SchedulerName, inactive, pol.Log,
 					pol.Count, pol.Match.SourceAddressExcluded, pol.Match.DestinationAddressExcluded)
-				lines = append(lines, fmt.Sprintf("    [zone-pair] %s -> %s: %s (%s) %s",
-					zpp.FromZone, zpp.ToZone, pol.Name, ActionString(pol.Action), mods))
+				line := fmt.Sprintf("    [zone-pair] %s -> %s: %s (%s) %s",
+					zpp.FromZone, zpp.ToZone, pol.Name, ActionString(pol.Action), mods)
+				switch {
+				case fromAny && toAny:
+					bothAnyLines = append(bothAnyLines, line)
+				case fromAny || toAny:
+					singleWildLines = append(singleWildLines, line)
+				default:
+					exactLines = append(exactLines, line)
+				}
 				zonePairPolicies++
 			}
 		}
 		policySetID++
 	}
+	lines = append(lines, exactLines...)
+	lines = append(lines, singleWildLines...)
+	lines = append(lines, bothAnyLines...)
 
 	// Tier 2: applicable GLOBAL policies. The global tier's policySetID is the
 	// count of zone-pair sets (policySetID after the loop), mirroring the
