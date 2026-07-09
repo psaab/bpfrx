@@ -252,6 +252,33 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		return nil
 	}
 
+	// Enforce the per-user minimum security level (RFC 3414 §3.1
+	// usmUserSecurityLevel). The message flags are the REQUEST's chosen level,
+	// not a policy the sender may lower: a user configured with an auth key MUST
+	// authenticate, and a user configured with a privacy key MUST use authPriv.
+	// Without this floor a request can clear msgFlags (noAuthNoPriv) while naming
+	// an authPriv user, and BOTH gates below — HMAC verification (gated on
+	// msgFlagAuth) and decryption (gated on msgFlagPriv) — are skipped, so the
+	// agent would decode and answer the scopedPDU in plaintext without the
+	// configured password. That is an authentication + confidentiality bypass:
+	// usernames are not secret, so knowing the name would suffice to read device
+	// identity and interface inventory/counters and to re-open the
+	// unauthenticated GETBULK CPU path. Drop under-leveled requests before
+	// decoding the scoped PDU. We drop rather than emit a report because we
+	// cannot produce an authenticated reply at a level the sender declined and an
+	// unauthenticated report would itself be unverifiable. (noAuthPriv — priv
+	// without auth — is already rejected above.)
+	if user.authKey != nil && msgFlags&msgFlagAuth == 0 {
+		slog.Debug("SNMPv3: request below user minimum security level (auth required), dropping",
+			"user", userName)
+		return nil
+	}
+	if user.privKey != nil && msgFlags&msgFlagPriv == 0 {
+		slog.Debug("SNMPv3: request below user minimum security level (priv required), dropping",
+			"user", userName)
+		return nil
+	}
+
 	// Verify authentication if required.
 	if msgFlags&msgFlagAuth != 0 {
 		if user.authKey == nil {
