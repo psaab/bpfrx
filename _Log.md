@@ -1,3 +1,33 @@
+## 2026-07-09 — #4422 (slice): reject reversed NAT destination-port ranges
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4422 "NAT reversed-range" slice. VERIFY-FIRST found a REAL
+  gap: a source-/destination-NAT `match destination-port <low> to <high>`
+  with high < low (e.g. `4000 to 3000`) was silently accepted at commit
+  and MISCOMPILED — parseDNATPortList required `high >= low` on the range
+  branch and otherwise fell through, splitting the range into its two
+  discrete endpoints (matched ports {4000,3000}, not the contiguous range).
+  Both endpoints are valid 1..65535 ports so the #3446 out-of-range gate
+  never fired. Sibling reversed ranges were ALREADY handled: SNAT pool
+  address range (expandAddressRange low>high) and SNAT pool port range
+  (validateSourceNATPoolStrict, #3906) both hard-reject. Fix: record a
+  reversed range on new NATMatch.ReversedDestinationPortRanges (parseDNAT-
+  PortList third return; endpoints still flow through so the lenient path
+  installs exactly what it did before — no regression) and reject it in
+  validateNATMatchDestinationPortStrict, naming rule-set/rule/token; strict
+  on commit, warn on the tolerant load/peer-sync path (#1960). Added
+  coverage test pinning DNAT+SNAT reversed reject + lenient warn, the two
+  already-handled SNAT-pool reversed cases, and over-rejection guards
+  (forward range, single-value `5000 to 5000`, descending bracket list,
+  forward pool address range). Regenerated the #4406 golden baseline
+  (purely additive: the new nil field appears as null in NATMatch JSON,
+  no value/behavior change). Validation: go build clean; pkg/config green;
+  full `go test ./...` green (53 ok, 0 FAIL).
+  **File(s)**: pkg/config/compiler_nat.go,
+  pkg/config/compiler_validate_strict_nat.go, pkg/config/types_security.go,
+  pkg/config/compiler_nat_reversed_port_range_4422_test.go,
+  pkg/config/testdata/golden_4406.json, _Log.md
+
 ## 2026-07-09 — #4668: relocate reject_reply.rs inline tests to a sibling file
 
 - **Timestamp**: 2026-07-09

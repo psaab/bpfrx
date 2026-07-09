@@ -1769,9 +1769,10 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						// silently kept only the first port. parseDNATPortList
 						// handles bracket lists and `low to high` ranges in both
 						// the hierarchical and flat-set AST shapes.
-						dports, dinvalid := parseDNATPortList(m)
+						dports, dinvalid, drev := parseDNATPortList(m)
 						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, dports...)
 						rule.Match.InvalidDestinationPorts = append(rule.Match.InvalidDestinationPorts, dinvalid...)
+						rule.Match.ReversedDestinationPortRanges = append(rule.Match.ReversedDestinationPortRanges, drev...)
 						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {
 							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
 						}
@@ -1980,9 +1981,10 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 							rule.Match.DestinationAddressName = rule.Match.DestinationAddressNames[0]
 						}
 					case "destination-port":
-						dports, dinvalid := parseDNATPortList(m)
+						dports, dinvalid, drev := parseDNATPortList(m)
 						rule.Match.DestinationPorts = append(rule.Match.DestinationPorts, dports...)
 						rule.Match.InvalidDestinationPorts = append(rule.Match.InvalidDestinationPorts, dinvalid...)
+						rule.Match.ReversedDestinationPortRanges = append(rule.Match.ReversedDestinationPortRanges, drev...)
 						if rule.Match.DestinationPort == 0 && len(rule.Match.DestinationPorts) > 0 {
 							rule.Match.DestinationPort = rule.Match.DestinationPorts[0]
 						}
@@ -2095,6 +2097,16 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 // reported as an invalid token. Out-of-range numerics (0, -1, 70000) DO parse
 // as integers, so they flow through `ports` and are range-checked downstream
 // (validateNATMatchDestinationPortStrict + the 1..65535 builder filter).
+//
+// The third return value (#4422) is the list of raw `<low> to <high>` tokens
+// where high < low — a reversed range. The parser previously fell through such
+// a range and split it into its two discrete endpoints (`4000 to 3000` → match
+// ports {4000, 3000}), silently miscompiling the operator's intended contiguous
+// range. They are surfaced to the caller (stored on
+// NATMatch.ReversedDestinationPortRanges) so validateNATMatchDestinationPortStrict
+// can reject them at commit; the two endpoints still flow through `ports` so the
+// lenient load / peer-sync path installs exactly what it did before (no
+// regression), warning instead of rejecting.
 // appendDNATPortRange expands an inclusive `low to high` destination-port range
 // into individual ports, BOUNDED to the valid 1..65535 port space (#3449). The
 // per-port `for p := low; p <= high` loops below used operator-supplied
@@ -2117,7 +2129,15 @@ func appendDNATPortRange(ports []int, low, high int) []int {
 	return ports
 }
 
-func parseDNATPortList(m *Node) (ports []int, invalid []string) {
+func parseDNATPortList(m *Node) (ports []int, invalid []string, reversed []string) {
+	// addReversed records a `<low> to <high>` range whose high < low. The two
+	// endpoints are still appended to ports (preserving the pre-#4422 split
+	// behaviour so the lenient load / peer-sync path does not change what it
+	// installs) — the reversed token drives the strict commit reject only.
+	addReversed := func(low, high int) {
+		reversed = append(reversed, fmt.Sprintf("%d to %d", low, high))
+		ports = append(ports, low, high)
+	}
 	addInvalid := func(tok string) {
 		// `to` is the range keyword; `[`/`]` are bracket-list delimiters that
 		// survive into the flat-set SetPath AST as literal tokens. None of these
@@ -2145,15 +2165,19 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 				continue
 			}
 			if i+2 < len(vals) && vals[i+1] == "to" {
-				if high, err2 := parseCanonicalPort(vals[i+2]); err2 == nil && high >= low {
-					ports = appendDNATPortRange(ports, low, high)
+				if high, err2 := parseCanonicalPort(vals[i+2]); err2 == nil {
+					if high >= low {
+						ports = appendDNATPortRange(ports, low, high)
+					} else {
+						addReversed(low, high)
+					}
 					i += 2
 					continue
 				}
 			}
 			ports = append(ports, low)
 		}
-		return ports, invalid
+		return ports, invalid, reversed
 	}
 	if len(m.Children) > 0 {
 		// Check for set-syntax port range: Keys=["destination-port","20000"] + child "to 30000"
@@ -2162,9 +2186,13 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 				// Look for "to" child indicating a range
 				toChild := m.FindChild("to")
 				if toChild != nil {
-					if high, err2 := parseCanonicalPort(nodeVal(toChild)); err2 == nil && high >= low {
-						ports = appendDNATPortRange(ports, low, high)
-						return ports, invalid
+					if high, err2 := parseCanonicalPort(nodeVal(toChild)); err2 == nil {
+						if high >= low {
+							ports = appendDNATPortRange(ports, low, high)
+						} else {
+							addReversed(low, high)
+						}
+						return ports, invalid, reversed
 					}
 				}
 				// No range — just a port with non-range children (shouldn't happen, but be safe)
@@ -2183,15 +2211,23 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 			}
 			// Hierarchical range: "20000 to 30000" → leaf Keys=["20000", "to", "30000"]
 			if len(child.Keys) >= 3 && child.Keys[1] == "to" {
-				if high, err2 := parseCanonicalPort(child.Keys[2]); err2 == nil && high >= low {
-					ports = appendDNATPortRange(ports, low, high)
+				if high, err2 := parseCanonicalPort(child.Keys[2]); err2 == nil {
+					if high >= low {
+						ports = appendDNATPortRange(ports, low, high)
+					} else {
+						addReversed(low, high)
+					}
 					continue
 				}
 			}
 			// Sibling-node range: child[i]="20000", child[i+1]="to", child[i+2]="30000"
 			if i+2 < len(m.Children) && m.Children[i+1].Name() == "to" {
-				if high, err2 := parseCanonicalPort(m.Children[i+2].Name()); err2 == nil && high >= low {
-					ports = appendDNATPortRange(ports, low, high)
+				if high, err2 := parseCanonicalPort(m.Children[i+2].Name()); err2 == nil {
+					if high >= low {
+						ports = appendDNATPortRange(ports, low, high)
+					} else {
+						addReversed(low, high)
+					}
 					i += 2
 					continue
 				}
@@ -2206,7 +2242,7 @@ func parseDNATPortList(m *Node) (ports []int, invalid []string) {
 			addInvalid(v)
 		}
 	}
-	return ports, invalid
+	return ports, invalid, reversed
 }
 
 // staticNATMappedPortFromKeys extracts the `mapped-port <port>` modifier
