@@ -16,6 +16,22 @@ lifted into that package), gaining the parent-dir fsync the local
 writer lacked. The file carries operator content outside the managed
 section, so it must survive power loss.
 
+**File mode (#4484 L-6):** the managed section carries routing-auth
+secrets (BGP TCP-MD5, OSPF/IS-IS/RIP keys), so `frr.conf` must not be
+world-readable. The write perm is **0640** (was 0644). Because 0640 is
+readable only by owner+group, a **fresh** create (no operator file to
+preserve) is installed **owned `root:frr`** via `fsatomic.WithOwner`, so
+the unprivileged frr daemons (group `frr`) can still read it —
+`atomicWriteOwnerOpt` resolves the frr gid (`resolveFRRGroup`). The
+owner override is applied **only** when (a) the target does not already
+exist — an existing operator file keeps its own mode+ownership
+(`WithPreserveExisting`, never restamped) — AND (b) the process is root
+and the `frr` group resolves. When the group is absent (FRR not
+installed — a dev host / unit test) or the process is non-root the
+override is skipped and the file lands 0640 `root:root` (harmless:
+nothing reads `frr.conf` without a running FRR). This mirrors the
+pkg/dhcpserver #2450 Kea-memfile ownership handling.
+
 ## File layout
 
 The package is split across five sibling `.go` files (no sub-packages,
