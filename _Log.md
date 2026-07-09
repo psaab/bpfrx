@@ -43684,3 +43684,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4404/#4421 batch-2 test-split: relocate inline #[cfg(test)] mod tests from 9 userspace-dp files (io_uring_write, icmp, cookie_reply, screen/rate, icmp_ratelimit, wg/handshake, host_inbound, syn_rate, per_worker) into sibling _tests.rs via #[path]. Verbatim move (byte-identical) + rustfmt-2024 siblings; parents byte-identical except #[path] swap; test counts preserved
   **File(s)**: 9 parents + 9 new *_tests.rs
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4404/#4421 batch-3 (final) test-split: relocate inline mod tests from 5 remaining userspace-dp files (xsk_ffi, shared_umem, wg/tai64n, fairness, coordinator/status) into sibling _tests.rs via #[path]. Verbatim move + rustfmt-2024 siblings; parents byte-identical; test-counts preserved. Exhausts the >150-test-line clean-split cohort
+  **File(s)**: 5 parents + 5 new *_tests.rs
