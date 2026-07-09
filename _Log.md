@@ -43855,3 +43855,6 @@ top.
   **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/clearduid_traversal_4857_test.go
   **Action**: #4861 — reject plaintext http:// endpoints for credentialed DDNS backends at commit (compileDDNSServices, strict/lenient) + refuse HTTPS->HTTP redirect downgrade in the shared HTTP client (newHTTPClientBound CheckRedirect)
   **File(s)**: pkg/config/compiler_ddns_tls.go, pkg/config/compiler_system.go, pkg/ddns/backend_http.go, +tests
+- **Timestamp**: 2026-07-09
+  **Action**: #4865 — nil-guard tolerated nil user-application map values at the AppID ingestion boundaries. BuildCatalog skips a (nil, true) ResolveApplication result without consuming an id; resolveTupleFallback skips a nil map value before icmpTypeConstrained/matchTuple. Prevents a control-plane panic on the #3494-tolerated malformed/HA-synced nil-application shape.
+  **File(s)**: pkg/appid/catalog.go, pkg/appid/runtime.go, pkg/appid/catalog_nil_app_4865_test.go, pkg/appid/README.md
