@@ -100,6 +100,17 @@ type SyslogClient struct {
 	// Seams for deterministic testing. nil → real implementations.
 	nowFn  func() time.Time         // clock source (default time.Now)
 	dialFn func() (net.Conn, error) // dial override (default s.dial)
+
+	// closed is set true by Close() (mu-guarded) and checked at the top of
+	// Send/SendBinary. Without it, a Send racing a Close (both serialize on
+	// mu, so this is a happens-after ordering, not a data race) can run
+	// AFTER Close() returns, see the pre-#4806 code's now-stale
+	// s.conn != nil, hit a "use of closed network connection" write error,
+	// and — since that is treated as a generic write failure — fall into
+	// reconnect(), silently re-establishing a brand-new socket to a target
+	// the caller believed was torn down (#4806). Checking closed instead of
+	// conn != nil makes Close() terminal: no Send after Close() may dial.
+	closed bool
 }
 
 // now returns the client's clock (overridable in tests).
@@ -338,6 +349,11 @@ func (s *SyslogClient) clearReconnectCooldown() {
 // window; the message is dropped (fail-fast) rather than blocking on a dial.
 var errReconnectCooldown = fmt.Errorf("syslog reconnect in cooldown")
 
+// errSyslogClientClosed signals that Close() already ran on this client
+// (#4806); Send/SendBinary return it immediately without touching s.conn or
+// attempting a reconnect.
+var errSyslogClientClosed = fmt.Errorf("syslog client closed")
+
 // dropReason classifies why a message was dropped, for the counter and the
 // rate-limited warning.
 type dropReason int
@@ -458,6 +474,11 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		// Close() already ran: fail fast, never reconnect (#4806).
+		return errSyslogClientClosed
+	}
 
 	if err := s.writeMsg(line); err != nil {
 		// For stream protocols, attempt one cooldown-gated reconnect. UDP
@@ -584,6 +605,11 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.closed {
+		// Close() already ran: fail fast, never reconnect (#4806).
+		return errSyslogClientClosed
+	}
 
 	if err := s.writeBinaryMsg(data); err != nil {
 		if s.protocol != "udp" {
@@ -758,12 +784,19 @@ func ParseFacility(name string) int {
 	}
 }
 
-// Close closes the underlying connection.
+// Close closes the underlying connection and marks the client closed (#4806).
+// Once Close returns, Send/SendBinary always fail fast — they never dial a
+// fresh connection, even if a caller races a Send against this Close (the
+// shared mu serializes the two: whichever acquires it first runs to
+// completion before the other observes the closed state).
 func (s *SyslogClient) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closed = true
 	if s.conn != nil {
-		return s.conn.Close()
+		err := s.conn.Close()
+		s.conn = nil
+		return err
 	}
 	return nil
 }
