@@ -5,8 +5,9 @@ use crate::test_zone_ids::*;
 use crate::xsk_ffi::IfInfo;
 use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
-    CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
-    CoSSchedulerSnapshot, DestinationNATRuleSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
+    CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
+    CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
+    DestinationNATRuleSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
     InterfaceAddressSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot,
     SourceNATRuleSnapshot, StaticNATRuleSnapshot, ThreeColorPolicerSnapshot, ZoneSnapshot,
 };
@@ -8241,6 +8242,339 @@ fn txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779() {
              ICMP Time Exceeded reply, not the transit packet"
         );
     }
+}
+
+/// #4422 RED-on-revert: the CoS behavior-aggregate re-classify on a flow-cache
+/// HIT (#3778) must also cover the IEEE 802.1p (PCP) classifier branch, not just
+/// DSCP. PCP — like DSCP — is a per-packet field excluded from the 5-tuple
+/// flow-cache key (`reclassify_cached_ba_queue` reads `meta.ingress_pcp`), so a
+/// mixed-priority flow must not be pinned to the SEED packet's queue.
+///
+/// A priority-tagged (802.1p, VID 0) packet 1 with PCP 0 seeds the cache on the
+/// default (best-effort) queue; packet 2 (same 5-tuple, PCP 5) hits the flow
+/// cache and MUST re-classify to the EF queue via the 802.1p branch of
+/// `reclassify_cached_ba_queue`. The interface carries ONLY an 802.1p classifier
+/// (no DSCP classifier), so the PCP branch is the sole path to the EF queue.
+/// Reverting the per-packet re-classify (or dropping the 802.1p arm) replays the
+/// frozen default queue (0), which this asserts against (expects queue 1).
+#[test]
+fn txn_flow_cache_hit_reclassifies_ba_pcp_per_packet_4422() {
+    // Splice an 802.1p priority tag (TPID 0x8100, VID 0, PCP in the top 3 TCI
+    // bits) after the 12-byte MAC header of an otherwise-untagged frame.
+    // Inserting 4 bytes at offset 12 leaves the IP/TCP content — and its
+    // checksum — byte-identical; only the L3 offset shifts 14 -> 18, which the
+    // paired meta below reflects (ingress_vlan_present = 1).
+    fn priority_tag(frame: &[u8], pcp: u8) -> Vec<u8> {
+        let mut tagged = Vec::with_capacity(frame.len() + 4);
+        tagged.extend_from_slice(&frame[..12]);
+        tagged.extend_from_slice(&0x8100u16.to_be_bytes());
+        tagged.extend_from_slice(&(u16::from(pcp) << 13).to_be_bytes());
+        tagged.extend_from_slice(&frame[12..]);
+        tagged
+    }
+    // Meta for a priority-tagged (VID 0) frame: L3 at 18, tag present, PCP set.
+    // Everything else mirrors the untagged `txn_meta_v4`.
+    fn pcp_meta(pcp: u8, l3_len: u16) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            l3_offset: 18,
+            l4_offset: 38,
+            payload_offset: 58,
+            ingress_vlan_present: 1,
+            ingress_vlan_id: 0,
+            ingress_pcp: pcp,
+            ..txn_meta_v4(24, 0x10_u8, l3_len)
+        }
+    }
+
+    let mut snapshot = nat_snapshot();
+    // CoS on the WAN egress (reth0.80, ifindex 12): an 802.1p (PCP) BA
+    // classifier maps PCP 5 -> expedited-forwarding (queue 1); PCP 0 is unmapped
+    // and falls to the default best-effort queue (0). Deliberately NO DSCP
+    // classifier, so the 802.1p branch of reclassify_cached_ba_queue is the only
+    // path that can select the EF queue.
+    snapshot.interfaces[1].cos_shaping_rate_bytes_per_sec = 10_000_000;
+    snapshot.interfaces[1].cos_shaping_burst_bytes = 256_000;
+    snapshot.interfaces[1].cos_scheduler_map = "wan-map".to_string();
+    snapshot.interfaces[1].cos_ieee8021_classifier = "pcp-cls".to_string();
+    snapshot.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![
+            CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            },
+            CoSForwardingClassSnapshot {
+                name: "expedited-forwarding".into(),
+                queue: 1,
+            },
+        ],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+            name: "pcp-cls".into(),
+            entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                forwarding_class: "expedited-forwarding".into(),
+                loss_priority: "low".into(),
+                code_points: vec![5],
+            }],
+        }],
+        dscp_rewrite_rules: vec![],
+        schedulers: vec![
+            CoSSchedulerSnapshot {
+                name: "be-sched".into(),
+                transmit_rate_bytes: 4_000_000,
+                transmit_rate_percent: 0.0,
+                transmit_rate_exact: false,
+                priority: "low".into(),
+                buffer_size_bytes: 128_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+            CoSSchedulerSnapshot {
+                name: "ef-sched".into(),
+                transmit_rate_bytes: 6_000_000,
+                transmit_rate_percent: 0.0,
+                transmit_rate_exact: false,
+                priority: "strict-high".into(),
+                buffer_size_bytes: 64_000,
+                buffer_size_percent: 0.0,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
+                codel_target_ns: 0,
+            },
+        ],
+        scheduler_maps: vec![CoSSchedulerMapSnapshot {
+            name: "wan-map".into(),
+            entries: vec![
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: "be-sched".into(),
+                },
+                CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "expedited-forwarding".into(),
+                    scheduler: "ef-sched".into(),
+                },
+            ],
+        }],
+    });
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // Packet 1 (pure ACK = established, cache-eligible; priority tag PCP 0):
+    // seeds the cache on the default queue.
+    let base1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let frame1 = priority_tag(&base1, 0);
+    let meta1 = pcp_meta(0, (frame1.len() - 18) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded established ACK must seed the flow cache"
+    );
+    let seed_q = binding
+        .scratch
+        .scratch_forwards
+        .last()
+        .and_then(|r| r.cos_queue_id);
+    assert_eq!(
+        seed_q,
+        Some(0),
+        "PCP-0 seed packet must land on the default (best-effort) queue"
+    );
+
+    // Packet 2 (same 5-tuple, priority tag PCP 5): flow-cache HIT. The 802.1p BA
+    // classifier MUST re-classify per packet to the EF queue instead of
+    // replaying the frozen default.
+    let base2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let frame2 = priority_tag(&base2, 5);
+    let meta2 = pcp_meta(5, (frame2.len() - 18) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    let hit_q = binding
+        .scratch
+        .scratch_forwards
+        .last()
+        .and_then(|r| r.cos_queue_id);
+    assert_eq!(
+        hit_q,
+        Some(1),
+        "the flow-cache hit MUST re-classify PCP 5 to the EF queue via the \
+         802.1p branch (#4422), not replay the seed's frozen default queue"
+    );
+}
+
+/// #4422 RED-on-revert: a TTL-expired packet on a cached flow whose egress
+/// output filter carries a THREE-COLOR POLICER must NOT consume policer credits.
+/// The #3779 hoist runs the TTL/hop-limit check BEFORE
+/// `apply_cached_three_color_policers`, so an expired cache-hit packet — which
+/// never egresses — must not meter the policer (which would drain a token bucket
+/// meant for real traffic and skew it toward red for packets that were dropped).
+///
+/// #3779 pinned the ordering for an output `then count` counter; this pins the
+/// POLICER interaction — the "TTL-expired-with-policer" item #4422 calls out.
+/// Packet 1 (TTL 64) seeds the cache; packet 2 (TTL 1) hits and must leave the
+/// policer's green count unchanged; packet 3 (TTL 64) hits and DOES meter the
+/// policer once — proving packet 2's non-metering is the TTL guard, not a dead
+/// policer. Reverting the hoist meters the expired packet 2 (green += 1) and
+/// fails the packet-2 assertion.
+#[test]
+fn txn_flow_cache_hit_ttl_expired_does_not_charge_three_color_policer_4422() {
+    let mut snapshot = nat_snapshot();
+    // Output filter on the WAN egress (reth0.80, ifindex 12): accept + a
+    // generous single-rate policer so every forwarded packet is GREEN (the
+    // assertion is about whether the packet is METERED at all, not about drops).
+    snapshot.interfaces[1].filter_output_v4 = "policed-out".to_string();
+    snapshot.filters = vec![FirewallFilterSnapshot {
+        name: "policed-out".to_string(),
+        family: "inet".to_string(),
+        terms: vec![FirewallTermSnapshot {
+            name: "accept-policed".to_string(),
+            action: "accept".to_string(),
+            policer: "p-out".to_string(),
+            ..Default::default()
+        }],
+    }];
+    snapshot.three_color_policers = vec![ThreeColorPolicerSnapshot {
+        name: "p-out".to_string(),
+        mode: "single-rate".to_string(),
+        color_blind: true,
+        committed_rate_bytes_per_sec: 1,
+        committed_burst_bytes: 10_000,
+        peak_or_excess_burst_bytes: 5_000,
+        then_action: "discard".to_string(),
+        ..Default::default()
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let green_packets = || {
+        forwarding
+            .filter_state
+            .three_color_policer_statuses()
+            .into_iter()
+            .find(|s| s.name == "p-out")
+            .expect("policer p-out present in status")
+            .green_packets
+    };
+
+    // Packet 1 (pure ACK, TTL 64): seeds the cache and forwards.
+    let frame1 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta1 = txn_meta_v4(24, 0x10_u8, (frame1.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame1,
+        meta1,
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the forwarded established ACK must seed the flow cache"
+    );
+    let green_after_seed = green_packets();
+
+    // Packet 2 (same 5-tuple, TTL 1): flow-cache HIT, TTL expired. The TTL check
+    // precedes the policer, so this packet must NOT meter it.
+    let mut frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    // IPv4 TTL byte: eth(14) + IP header offset 8 = frame index 22. Rewrite to 1
+    // and repair the IPv4 header checksum (frame[24..26]).
+    frame2[22] = 1;
+    frame2[24] = 0;
+    frame2[25] = 0;
+    let ip_sum = checksum16(&frame2[14..34]);
+    frame2[24] = (ip_sum >> 8) as u8;
+    frame2[25] = ip_sum as u8;
+    let meta2 = txn_meta_v4(24, 0x10_u8, (frame2.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    assert_eq!(
+        green_packets(),
+        green_after_seed,
+        "a TTL=1 cache-hit packet MUST NOT meter the three-color policer — the \
+         TTL check runs before apply_cached_three_color_policers (#4422 / #3779)"
+    );
+
+    // Packet 3 (same 5-tuple, TTL 64): a LIVE flow-cache hit. This DOES meter the
+    // policer once on the cached replay path — proving the policer is live and
+    // that packet 2's non-metering is specifically the TTL guard.
+    let frame3 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        0x10_u8,
+    );
+    let meta3 = txn_meta_v4(24, 0x10_u8, (frame3.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame3,
+        meta3,
+    );
+    assert_eq!(
+        green_packets(),
+        green_after_seed + 1,
+        "a live cache-hit packet meters the three-color policer exactly once — \
+         confirms the policer is live, so packet 2's unchanged count is the TTL \
+         guard, not a dead policer"
+    );
 }
 
 // I4 boundary: a forward+reverse pair is admitted while 2 slots remain

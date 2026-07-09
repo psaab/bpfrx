@@ -1,3 +1,28 @@
+## 2026-07-08 — #4422 Rust remainder: flow-cache DSCP/PCP sensitivity + TTL-with-policer coverage
+
+- **Timestamp**: 2026-07-08
+- **Action**: Added two RED-on-mutation flow-cache-hit tests pinning the
+  #4422 Rust remainder (verify-first disposition: the production logic is
+  ALREADY correct — these close the test-coverage gap, no code fix). (1)
+  `txn_flow_cache_hit_reclassifies_ba_pcp_per_packet_4422` pins the IEEE
+  802.1p (PCP) branch of the per-packet CoS behavior-aggregate re-classify on
+  a flow-cache hit (`reclassify_cached_ba_queue`,
+  `tx/cos_classify.rs`): a priority-tagged (VID 0) PCP-0 packet seeds the
+  default queue and a same-5-tuple PCP-5 hit re-classifies to the EF queue on
+  an interface carrying ONLY an 802.1p classifier. The DSCP arm was already
+  pinned by `..._ba_dscp_..._3778`; the PCP arm was untested. (2)
+  `txn_flow_cache_hit_ttl_expired_does_not_charge_three_color_policer_4422`
+  pins the TTL-expired-with-policer interaction: a TTL=1 cache-hit packet
+  leaves the egress output filter's three-color policer green count unchanged
+  (the #3779 TTL hoist runs before `apply_cached_three_color_policers`), while
+  a following live hit increments it once. #3779 covered the `then count`
+  counter only; this covers the policer token-bucket. RED verified by
+  temporarily neutering the 802.1p arm (hit queue != EF) and disabling the TTL
+  early-return (policer green 2 vs 1) — both reverted.
+- **File(s)**: `userspace-dp/src/afxdp/tests.rs`,
+  `userspace-dp/src/afxdp/README.md`, `_Log.md`
+- **Validation**: FULL cargo test suite (userspace-dp) SERIAL — see PR body.
+
 ## 2026-07-08 — #4700 fix BROKEN-MASTER: legacy-dataplane import-allowlist drift after #4659 split
 
 - **Timestamp**: 2026-07-08
