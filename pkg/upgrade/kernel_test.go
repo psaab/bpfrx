@@ -32,6 +32,10 @@ type fakeKernelSystem struct {
 	wdArmed   bool
 
 	bootCurrent       string
+	bootCurrentErr    error
+	runningErr        error
+	armWatchdogErr    error
+	disarmWatchdogErr error
 	bootOrderFrontErr bool
 	verifyPass        bool
 	verifyErr         error
@@ -84,7 +88,7 @@ func (f *fakeKernelSystem) FreeBytes(p string) (uint64, error) {
 	}
 	return 1 << 40, nil
 }
-func (f *fakeKernelSystem) RunningKernel() (string, error) { return f.running, nil }
+func (f *fakeKernelSystem) RunningKernel() (string, error) { return f.running, f.runningErr }
 func (f *fakeKernelSystem) KernelHeld() (bool, error)      { return f.held, nil }
 func (f *fakeKernelSystem) InstallCandidateKernel(v string) (string, error) {
 	f.log("install:" + v)
@@ -119,8 +123,14 @@ func (f *fakeKernelSystem) SetBootNext(id string) error {
 	f.bootNext = id
 	return nil
 }
-func (f *fakeKernelSystem) ArmWatchdog() error { f.wdArmed = true; return nil }
-func (f *fakeKernelSystem) Reboot() error      { f.log("reboot"); f.rebooted = true; return nil }
+func (f *fakeKernelSystem) ArmWatchdog() error {
+	if f.armWatchdogErr != nil {
+		return f.armWatchdogErr
+	}
+	f.wdArmed = true
+	return nil
+}
+func (f *fakeKernelSystem) Reboot() error { f.log("reboot"); f.rebooted = true; return nil }
 func (f *fakeKernelSystem) WritePromotionMarker(u string) error {
 	f.promotionMarker = u
 	return nil
@@ -129,6 +139,9 @@ func (f *fakeKernelSystem) ReadPromotionMarker() (string, error) { return f.prom
 func (f *fakeKernelSystem) ClearPromotionMarker() error          { f.promotionMarker = ""; return nil }
 func (f *fakeKernelSystem) ClearRollLease() error                { return nil }
 func (f *fakeKernelSystem) BootCurrent() (string, error) {
+	if f.bootCurrentErr != nil {
+		return "", f.bootCurrentErr
+	}
 	if f.bootCurrent != "" {
 		return f.bootCurrent, nil
 	}
@@ -153,7 +166,13 @@ func (f *fakeKernelSystem) SetBootOrderFront(id string) error {
 	f.order = out
 	return nil
 }
-func (f *fakeKernelSystem) DisarmWatchdog() error { f.wdArmed = false; return nil }
+func (f *fakeKernelSystem) DisarmWatchdog() error {
+	if f.disarmWatchdogErr != nil {
+		return f.disarmWatchdogErr
+	}
+	f.wdArmed = false
+	return nil
+}
 func (f *fakeKernelSystem) PruneInactiveSlot(slot, kg, cand string) error {
 	f.log("prune:" + slot)
 	f.selectors[slot] = kg
@@ -593,5 +612,123 @@ func TestKernelPromoteRevertsOnBootOrderFailure(t *testing.T) {
 	err := r.Promote()
 	if !errorsIsReverted(err) {
 		t.Fatalf("expected a REVERT when promote BootOrder reorder fails, got %v", err)
+	}
+}
+
+// --- #4872 A: a transient BootCurrent read error while ACTUALLY running the
+// candidate must NOT prune the running candidate; it runs the verification gate
+// (and a healthy candidate still promotes). ---
+func TestKernelPromoteBootCurrentErrRunningCandidateDoesNotPrune(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	// The candidate DID boot, but efibootmgr/NVRAM read of BootCurrent is flaky.
+	f.bootCurrentErr = fmt.Errorf("simulated efibootmgr read failure")
+	f.running = "6.18.5-12-generic" // we ARE running the candidate
+	f.verifyPass = true
+	f.beaconPass = true
+
+	if err := r.Promote(); err != nil {
+		t.Fatalf("healthy candidate must promote despite a BootCurrent read error, got %v", err)
+	}
+	if contains(f.calls, "prune:"+SlotB) {
+		t.Fatal("#4872 A: pruned the RUNNING candidate on a transient BootCurrent read error")
+	}
+	if !contains(f.calls, "bootorder-front:0004") {
+		t.Fatal("#4872 A: candidate not promoted on the fail-closed verify path")
+	}
+}
+
+// --- #4872 A: BootCurrent AND RunningKernel both unreadable -> indeterminate.
+// Fail closed: NO prune, NO reboot, surface a NON-revert error, journal
+// preserved so the next boot re-runs the gate. ---
+func TestKernelPromoteIndeterminateFailsClosed(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	f.bootCurrentErr = fmt.Errorf("efibootmgr read failure")
+	f.runningErr = fmt.Errorf("uname -r failure")
+
+	err := r.Promote()
+	if err == nil {
+		t.Fatal("#4872 A: indeterminate boot state must surface an error, not proceed as healthy")
+	}
+	if errorsIsReverted(err) {
+		t.Fatalf("#4872 A: indeterminate must NOT be a revert (exit-3 reboot-loop risk), got %v", err)
+	}
+	if contains(f.calls, "prune:"+SlotB) {
+		t.Fatal("#4872 A: pruned the candidate while unable to prove we are off it")
+	}
+	j, _ := r.loadKernelJournal()
+	if j.State != KernelStateArmed {
+		t.Fatalf("#4872 A: journal not preserved on indeterminate state (state=%s)", j.State)
+	}
+}
+
+// --- #4872 A: BootCurrent unreadable but RunningKernel positively identifies a
+// NON-candidate (known-good) kernel -> pruning the un-promoted candidate is
+// safe; no reboot, no promote. ---
+func TestKernelPromoteBootCurrentErrRunningKnownGoodCleansUp(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	f.bootCurrentErr = fmt.Errorf("efibootmgr read failure")
+	f.running = "6.18.5-10-generic" // known-good, NOT the candidate
+
+	if err := r.Promote(); err != nil {
+		t.Fatalf("on positively-known-good boot, expect nil cleanup, got %v", err)
+	}
+	if !contains(f.calls, "prune:"+SlotB) {
+		t.Fatal("expected the un-promoted candidate pruned when positively on known-good")
+	}
+	if contains(f.calls, "bootorder-front:0004") {
+		t.Fatal("must not promote when not running the candidate")
+	}
+}
+
+// --- #4872 B: under StrictWatchdog (D1) an ArmWatchdog failure ABORTS the arm
+// (no BootNext, no reboot) rather than silently rebooting into a candidate with
+// no functioning watchdog. ---
+func TestKernelArmStrictWatchdogArmFailureAborts(t *testing.T) {
+	f := newFakeKernelSystem()
+	f.armWatchdogErr = fmt.Errorf("simulated /dev/watchdog I/O error")
+	r, _ := NewKernelRunner(KernelConfig{
+		JournalPath:    filepath.Join(t.TempDir(), "k.state"),
+		Sys:            f,
+		StrictWatchdog: true,
+	})
+	err := r.Arm("6.18.5-12-generic")
+	if !errors.Is(err, ErrKernelChannelUnavailable) {
+		t.Fatalf("#4872 B: strict-watchdog arm failure must abort with ErrKernelChannelUnavailable, got %v", err)
+	}
+	if f.rebooted {
+		t.Fatal("#4872 B: must NOT reboot into a candidate with no functioning watchdog under D1")
+	}
+	if f.bootNext != "" {
+		t.Fatal("#4872 B: must NOT set BootNext when the strict arm failed")
+	}
+	j, _ := r.loadKernelJournal()
+	if j.State.atLeast(KernelStateArmed) {
+		t.Fatalf("#4872 B: journal advanced to %s despite the strict arm failure", j.State)
+	}
+}
+
+// --- #4872 B: under D2 (best-effort) an ArmWatchdog failure is logged and the
+// arm still proceeds (BootNext is the loop-safety). ---
+func TestKernelArmD2WatchdogArmFailureProceeds(t *testing.T) {
+	f := newFakeKernelSystem()
+	f.armWatchdogErr = fmt.Errorf("simulated /dev/watchdog I/O error")
+	r := newKernelRunner(t, f) // D2 (StrictWatchdog defaults false)
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("D2 should proceed despite an arm failure, got %v", err)
+	}
+	if !f.rebooted {
+		t.Fatal("D2 should still arm BootNext + reboot")
 	}
 }

@@ -610,6 +610,32 @@ candidate boot, `xpf-kernel-promote.service` runs the kernel-space
 `/var/lib/xpf/kernel-upgrade.state` makes the trial crash-safe and
 idempotent across the reboot.
 
+**Fail-closed on ambiguous boot/watchdog state (#4872).** The gate never
+treats an unreadable observation as a definite safe state:
+
+- *BootCurrent read error.* When `efibootmgr`/NVRAM can't report which
+  slot the firmware booted, `Promote` no longer blindly runs
+  `cleanupAlreadyOnKnownGood` (which PRUNES the candidate slot —
+  `/lib/modules/<candidate>` + `/boot/*-<candidate>`). It first reads
+  `RunningKernel`: if it equals the candidate we ARE on the candidate, so
+  it runs the verification gate (`verifyAndPromote`) instead of deleting
+  the kernel it is running; only a positively-identified non-candidate
+  running kernel takes the prune path. If BOTH `BootCurrent` and
+  `RunningKernel` are unreadable the state is indeterminate —
+  `recoverIndeterminate` preserves the journal + candidate, does NO prune
+  and NO reboot, and surfaces a non-revert error so the oneshot maps it to
+  an infra exit (not the exit-3 reboot). The next boot re-runs the gate.
+- *StrictWatchdog (D1) arm failure.* The preflight only checks the BAKED
+  watchdog-persistence flag; `armCandidate` now also treats a real
+  `ArmWatchdog` failure as fatal UNDER STRICT MODE — it aborts the arm
+  (no `BootNext`, no reboot, journal stays INSTALLED) rather than
+  rebooting into the candidate with no functioning watchdog. D2 keeps the
+  best-effort log-and-continue. The `realKernelSystem` watchdog helpers no
+  longer swallow I/O errors: `ArmWatchdog` surfaces a `WDIOC_SETTIMEOUT`
+  failure (after still attempting the keepalive), and `DisarmWatchdog`
+  propagates open/write/close failures (a genuinely-absent device is still
+  a clean nil).
+
 In a cluster the roll is driven ONE NODE AT A TIME by the external
 orchestrator (`scripts/deploy/xpf-deploy.py kernel-roll`): drain
 secondary-first (`xpfd upgrade kernel drain`, which confirms the peer
@@ -672,7 +698,17 @@ carrying traffic:
    (`/var/lib/xpf/kernel-roll.lease`), a drained local node, and a
    healthy primary peer, held continuously for the grace window. A
    manually drained node or a #1917 binary-rolling drain never wrote a
-   kernel-roll lease (`leaseNone`) and is left alone.
+   kernel-roll lease (`leaseNone`) and is left alone. The lease must carry
+   a real `expires_at` (#4872): a semantic-empty body (`{}`) or one that
+   omits the deadline decodes to `NodeID=0` + the zero time and, on node
+   0, would otherwise read as an already-expired lease naming us and
+   spuriously self-recover during a maintenance drain — a missing deadline
+   is now rejected as no-decision (`leaseNone`). The grace window also
+   requires CONTINUOUS positive evidence: any observation error
+   (`Armed`/`LocalDrained`/`PeerHealthyPrimary`, e.g. a transient
+   management outage) RESETS `drainedSince`, so a run of errored ticks
+   can't silently age the deadline and let the next positive tick rejoin
+   immediately.
 3. **Still-armed gate.** Self-recovery refuses to rejoin while the kernel
    journal is still ARMED even if the lease has expired — a legitimately
    long-hanging roll (one that outran its lease TTL) is still a trial in

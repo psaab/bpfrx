@@ -297,7 +297,19 @@ func (r *KernelRunner) armCandidate(j *KernelJournal) error {
 	}
 
 	if err := sys.ArmWatchdog(); err != nil {
-		// Non-fatal under D2: BootNext is the loop-safety. Log and continue.
+		if r.cfg.StrictWatchdog {
+			// D1 (strict): a strict deployment REQUIRES a functioning watchdog.
+			// The preflight only checked the BAKED persistence flag
+			// (WatchdogStatus); the actual arm failing HERE means we would reboot
+			// into the candidate with no functioning watchdog, silently defeating
+			// strict mode's guarantee (#4872 B). Abort the arm — do NOT set
+			// BootNext, do NOT reboot. The journal is still INSTALLED (we have not
+			// transitioned to ARMED yet) and BootNext was never set, so the box
+			// stays on the known-good default and a retry can re-arm cleanly.
+			return fmt.Errorf("%w: strict-watchdog (D1) arm failed: %v", ErrKernelChannelUnavailable, err)
+		}
+		// D2 (best-effort): BootNext is the loop-safety. Log and continue; an
+		// early-boot hang would need one external/console reset to recover.
 		r.logf("kernel-upgrade arm: WARNING arm watchdog: %v (continuing; BootNext closes the loop)", err)
 	}
 
@@ -358,9 +370,39 @@ func (r *KernelRunner) Promote() error {
 	}
 	cur, err := sys.BootCurrent()
 	if err != nil {
-		// Can't tell which slot we booted. Do NOT reboot (that risks a loop on
-		// a flaky efibootmgr — r1 AGY): clean up to known-good in place.
-		return r.cleanupAlreadyOnKnownGood(j, fmt.Errorf("read BootCurrent: %w", err))
+		// Can't read which slot the firmware booted. The old code treated this
+		// as "already on known-good" and ran cleanupAlreadyOnKnownGood, which
+		// PRUNES the candidate slot (deletes /lib/modules/<candidate> +
+		// /boot/*-<candidate>). But a transient efibootmgr/NVRAM read error does
+		// NOT mean we are off the candidate — if BootNext actually booted it, we
+		// would be deleting the running kernel's own modules/boot files (#4872 A).
+		// Fail CLOSED on the destructive prune: check RunningKernel first.
+		running, rkErr := sys.RunningKernel()
+		switch {
+		case rkErr != nil:
+			// Neither the booted slot NOR the running kernel is knowable. We
+			// cannot prove we are off the candidate, so we must NOT prune, and we
+			// must NOT reboot (a read-only-root reboot loop is the other hazard).
+			// Preserve the journal + candidate untouched and surface the error;
+			// the next boot re-runs this gate, and any reboot meanwhile lands on
+			// the known-good BootOrder front (BootNext already consumed).
+			return r.recoverIndeterminate(j, fmt.Errorf(
+				"read BootCurrent: %v; running kernel also unreadable: %w", err, rkErr))
+		case running == j.CandidateVersion:
+			// We ARE running the candidate despite the BootCurrent read error.
+			// Do NOT prune the kernel we are running — run the verification gate
+			// so a healthy candidate can still promote and an unhealthy one takes
+			// the controlled (bounded) revert path, never the silent-delete path.
+			r.logf("kernel-upgrade: BootCurrent unreadable (%v) but running kernel IS "+
+				"candidate %s; running verification gate (NOT pruning)", err, running)
+			return r.verifyAndPromote(j, candID, running)
+		default:
+			// Positive evidence we booted a non-candidate (known-good) kernel:
+			// pruning the un-promoted candidate slot is safe.
+			return r.cleanupAlreadyOnKnownGood(j, fmt.Errorf(
+				"read BootCurrent: %v; running kernel %s != candidate %s — on known-good",
+				err, running, j.CandidateVersion))
+		}
 	}
 	if cur != candID {
 		// Firmware ignored BootNext / fell back — this boot is ALREADY on a
@@ -381,9 +423,21 @@ func (r *KernelRunner) Promote() error {
 	if running != j.CandidateVersion {
 		return r.revert(j, fmt.Errorf("running kernel %s != candidate %s", running, j.CandidateVersion))
 	}
+	return r.verifyAndPromote(j, candID, running)
+}
+
+// verifyAndPromote runs the post-Gate-2 verification (verify-dataplane +
+// forward beacon) and, on success, promotes the candidate; on any failure it
+// reverts. It is entered only after we have CONFIRMED the running kernel is the
+// candidate (`running == j.CandidateVersion`), either via the normal
+// BootCurrent==candidate path or the #4872-A fail-closed path where BootCurrent
+// was unreadable but RunningKernel positively identified the candidate — so it
+// never prunes the kernel it is validating.
+func (r *KernelRunner) verifyAndPromote(j *KernelJournal, candID, running string) error {
+	sys := r.cfg.Sys
 
 	// Gate 3: verify-dataplane (the #1864 kernel verifier) on the candidate.
-	ok, err = sys.VerifyDataplane()
+	ok, err := sys.VerifyDataplane()
 	if err != nil {
 		return r.revert(j, fmt.Errorf("verify-dataplane error: %w", err))
 	}
@@ -427,6 +481,23 @@ func (r *KernelRunner) Promote() error {
 	}
 	r.logf("kernel-upgrade: PROMOTED candidate %s (slot %s now default)", running, j.InactiveSlot)
 	return r.clearKernelJournal()
+}
+
+// recoverIndeterminate handles the post-reboot case where NEITHER the booted
+// slot (BootCurrent) NOR the running kernel (uname -r) is readable, so we
+// cannot prove we are off the candidate. Both the destructive prune (which
+// could delete a candidate we are actually running — #4872 A) and a reboot
+// (read-only-root reboot loop) are unsafe here, so this fails CLOSED: it
+// preserves the journal + candidate untouched, performs no prune and no reboot,
+// and returns the (non-revert) error so the promotion oneshot maps it to an
+// infra exit (NOT exit 3). The next boot re-runs the gate; if NVRAM/uname is
+// readable then it resolves normally, and any reboot meanwhile falls through
+// BootOrder to the known-good slot (BootNext already consumed).
+func (r *KernelRunner) recoverIndeterminate(j *KernelJournal, why error) error {
+	r.logf("kernel-upgrade: INDETERMINATE post-reboot state (%v); cannot confirm we are off "+
+		"the candidate — preserving journal + candidate (NO prune, NO reboot) for the next "+
+		"boot / operator to resolve", why)
+	return fmt.Errorf("kernel-upgrade promote: indeterminate boot state (no prune, no reboot): %w", why)
 }
 
 // revert records the revert reason, prunes the un-promoted candidate, and

@@ -156,6 +156,20 @@ func (s *KernelSelfRecovery) readLeaseState() leaseState {
 		s.cfg.Logf("kernel self-recovery: ignoring unparsable lease %s: %v", s.cfg.LeasePath, err)
 		return leaseNone
 	}
+	// A well-formed lease MUST carry a real TTL deadline. A semantic-empty body
+	// (`{}`) or one that omits expires_at decodes to the zero time AND NodeID 0
+	// (the zero value); on node 0 that would slip past the NodeID guard and,
+	// because any real Now() is After the zero time, classify as an ALREADY-
+	// EXPIRED lease naming us — spuriously arming self-recovery and tearing a
+	// deliberately drained node back into the election during a maintenance
+	// window (#4872 C). Require expires_at: a missing/zero deadline is not a
+	// valid lease. Treat it as no-decision (leaseNone is a NO-OP in Tick), the
+	// safe direction that never triggers an unintended ResetFailover.
+	if l.ExpiresAt.IsZero() {
+		s.cfg.Logf("kernel self-recovery: ignoring lease %s missing required expires_at "+
+			"(NodeID=%d); treating as no-lease this tick", s.cfg.LeasePath, l.NodeID)
+		return leaseNone
+	}
 	if l.NodeID != s.cfg.NodeID {
 		return leaseOther
 	}
@@ -194,6 +208,12 @@ func (s *KernelSelfRecovery) Tick() (bool, error) {
 	if s.cfg.Armed != nil {
 		armed, err := s.cfg.Armed()
 		if err != nil {
+			// An observation error breaks the CONTINUOUS-evidence requirement:
+			// reset the grace clock so a run of errored ticks (e.g. a transient
+			// management outage) cannot silently age the deadline and let the next
+			// positive tick rejoin immediately (#4872 D). Grace must accrue only
+			// while every predicate is positively observed.
+			s.drainedSince = time.Time{}
 			return false, fmt.Errorf("kernel self-recovery: armed check: %w", err)
 		}
 		if armed {
@@ -206,6 +226,8 @@ func (s *KernelSelfRecovery) Tick() (bool, error) {
 
 	drained, err := s.cl.LocalDrained()
 	if err != nil {
+		// Observation error -> reset the grace clock (see #4872 D above).
+		s.drainedSince = time.Time{}
 		return false, fmt.Errorf("kernel self-recovery: local drained check: %w", err)
 	}
 	if !drained {
@@ -215,6 +237,8 @@ func (s *KernelSelfRecovery) Tick() (bool, error) {
 
 	peerOK, err := s.cl.PeerHealthyPrimary()
 	if err != nil {
+		// Observation error -> reset the grace clock (see #4872 D above).
+		s.drainedSince = time.Time{}
 		return false, fmt.Errorf("kernel self-recovery: peer health check: %w", err)
 	}
 	if !peerOK {
