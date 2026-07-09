@@ -1310,6 +1310,12 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) local_delivery_packets: u64,
     pub(crate) forward_candidate_packets: u64,
     pub(crate) route_miss_packets: u64,
+    /// #4743: martian-dst NoRoute drops snapshotted from BindingLiveState (a
+    /// sub-breakout of route_miss_packets).
+    pub(crate) martian_dropped: u64,
+    /// #4743: over-limit IPv6 ext-header fail-closed drops snapshotted from
+    /// BindingLiveState.
+    pub(crate) ipv6_ext_header_dropped: u64,
     pub(crate) neighbor_miss_packets: u64,
     pub(crate) discard_route_packets: u64,
     pub(crate) next_table_packets: u64,

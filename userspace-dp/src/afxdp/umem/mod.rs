@@ -282,6 +282,24 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) local_delivery_packets: AtomicU64,
     pub(super) forward_candidate_packets: AtomicU64,
     pub(super) route_miss_packets: AtomicU64,
+    /// #4743: cumulative NoRoute drops whose destination is a MARTIAN address
+    /// (IPv4 multicast/broadcast/unspecified/loopback, IPv6
+    /// multicast/unspecified/loopback). A strict sub-breakout of
+    /// `route_miss_packets` (a martian dst misses the FIB and drops as NoRoute,
+    /// so it bumps BOTH) — mirrors how `screen_reason_drops` break out
+    /// `screen_drops`. Lets an operator tell a martian-dst drop apart from an
+    /// ordinary route miss and correlate it with the filter-`accept` log.
+    /// Surfaced as the `Martian drops` operator counter.
+    pub(super) martian_dropped: AtomicU64,
+    /// #4743: cumulative fail-closed drops of an IPv6 packet whose
+    /// extension-header chain is still on an extension header after
+    /// `MAX_IPV6_EXT_HEADERS` (8) iterations (an over-limit, uninspectable
+    /// chain). The #2292 walkers already fail closed (`None`) on this chain;
+    /// before #4743 the flowless path forwarded it uninspectable
+    /// (`l4_present = false`), an ext-header IDS-evasion. Now dropped explicitly
+    /// and counted. Distinct from a TRUNCATED chain (which stays flowless).
+    /// Surfaced as the `IPv6 ext-header drops` operator counter.
+    pub(super) ipv6_ext_header_dropped: AtomicU64,
     pub(super) neighbor_miss_packets: AtomicU64,
     pub(super) discard_route_packets: AtomicU64,
     pub(super) next_table_packets: AtomicU64,
@@ -822,6 +840,8 @@ impl BindingLiveState {
             local_delivery_packets: AtomicU64::new(0),
             forward_candidate_packets: AtomicU64::new(0),
             route_miss_packets: AtomicU64::new(0),
+            martian_dropped: AtomicU64::new(0),
+            ipv6_ext_header_dropped: AtomicU64::new(0),
             neighbor_miss_packets: AtomicU64::new(0),
             discard_route_packets: AtomicU64::new(0),
             next_table_packets: AtomicU64::new(0),

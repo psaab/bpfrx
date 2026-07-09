@@ -7328,6 +7328,109 @@ fn disposition_counters_cold_writes_live_immediately() {
     );
 }
 
+// #4743: a NoRoute drop whose destination is a martian address bumps BOTH
+// route_miss_packets AND the martian_dropped sub-breakout. RED-on-revert:
+// removing the `counters.bump_martian()` call in the NoRoute arm makes this fail
+// (martian_dropped stays 0). A non-martian NoRoute leaves martian_dropped 0.
+fn record_noroute_with_dst(
+    counters: &mut BatchCounters,
+    dst: std::net::IpAddr,
+) {
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let binding = BindingIdentity {
+        slot: 1,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-0"),
+        ifindex: 3,
+    };
+    let dbg = crate::afxdp::ResolutionDebug {
+        ingress_ifindex: 3,
+        src_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5))),
+        dst_ip: Some(dst),
+        src_port: 1000,
+        dst_port: 2000,
+        from_zone: None,
+        to_zone: None,
+    };
+    record_forwarding_disposition(
+        &binding,
+        DispositionCounters::Hot(counters),
+        ForwardingResolution {
+            disposition: ForwardingDisposition::NoRoute,
+            local_ifindex: 0,
+            egress_ifindex: 0,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        64,
+        None,
+        Some(&dbg),
+        &recent_exceptions,
+        &Arc::new(Mutex::new(None)),
+        &ForwardingState::default(),
+    );
+}
+
+#[test]
+fn noroute_martian_dst_bumps_both_route_miss_and_martian() {
+    let mut counters = BatchCounters::default();
+    // IPv4 multicast destination that missed the FIB -> NoRoute.
+    record_noroute_with_dst(&mut counters, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)));
+    assert_eq!(counters.route_miss_packets, 1, "NoRoute must bump route_miss");
+    assert_eq!(
+        counters.martian_dropped, 1,
+        "a martian destination must ALSO bump martian_dropped"
+    );
+
+    // IPv6 multicast is martian too.
+    let mut counters6 = BatchCounters::default();
+    record_noroute_with_dst(
+        &mut counters6,
+        IpAddr::V6(std::net::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)),
+    );
+    assert_eq!(counters6.martian_dropped, 1);
+}
+
+#[test]
+fn noroute_nonmartian_dst_bumps_route_miss_only() {
+    let mut counters = BatchCounters::default();
+    // Ordinary unicast destination -> route miss, NOT martian.
+    record_noroute_with_dst(&mut counters, IpAddr::V4(Ipv4Addr::new(10, 0, 2, 5)));
+    assert_eq!(counters.route_miss_packets, 1);
+    assert_eq!(
+        counters.martian_dropped, 0,
+        "an ordinary route miss must not be classified as martian"
+    );
+}
+
+#[test]
+fn is_martian_dst_classifies_all_families() {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let m = crate::afxdp::disposition::is_martian_dst;
+    // IPv4 martians.
+    assert!(m(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))), "v4 multicast");
+    assert!(m(IpAddr::V4(Ipv4Addr::BROADCAST)), "v4 broadcast");
+    assert!(m(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), "v4 unspecified");
+    assert!(m(IpAddr::V4(Ipv4Addr::LOCALHOST)), "v4 loopback");
+    assert!(!m(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 5))), "v4 unicast");
+    // IPv6 martians (no broadcast in v6).
+    assert!(m(IpAddr::V6(Ipv6Addr::UNSPECIFIED)), "v6 unspecified");
+    assert!(m(IpAddr::V6(Ipv6Addr::LOCALHOST)), "v6 loopback");
+    assert!(
+        m(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1))),
+        "v6 multicast"
+    );
+    assert!(
+        !m(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+        "v6 unicast"
+    );
+}
+
 #[test]
 fn disposition_counters_hot_screen_drops_accumulate_in_batch() {
     let live = BindingLiveState::new();
