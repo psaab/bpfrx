@@ -2206,7 +2206,9 @@ func validateJunosHostDirectDeliveryWarnings(cfg *Config) []string {
 	// `match from-zone junos-host` global is already hard-rejected at commit
 	// (validatePolicyZoneReferencesStrict), so it never reaches here.
 	for _, p := range cfg.Security.GlobalPolicies {
-		if p == nil || p.Match.ToZone != "junos-host" {
+		// #4626 M03: a host-inbound global scopes `to-zone junos-host` alone
+		// (IsHostToZoneScope); a transit or all-zones global never does.
+		if p == nil || !IsHostToZoneScope(p.Match.ToZones) {
 			continue
 		}
 		if stricter, reason := junosHostPolicyStricterThanCoarseGate(p.Action, p.Match); stricter {

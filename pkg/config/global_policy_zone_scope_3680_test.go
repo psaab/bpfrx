@@ -70,11 +70,11 @@ func TestGlobalPolicyAppliesToZoneExplicitAny(t *testing.T) {
 	}
 	// Confirm the compiler preserved the explicit "any" verbatim (the whole
 	// premise of #3680 — the helper must cope with the stored "any").
-	if byName["any-to-untrust"].FromZone != "any" {
-		t.Fatalf("compiler did not preserve explicit from-zone any: %q", byName["any-to-untrust"].FromZone)
+	if got := byName["any-to-untrust"].FromZones; len(got) != 1 || got[0] != "any" {
+		t.Fatalf("compiler did not preserve explicit from-zone any: %q", got)
 	}
-	if byName["trust-to-any"].ToZone != "any" {
-		t.Fatalf("compiler did not preserve explicit to-zone any: %q", byName["trust-to-any"].ToZone)
+	if got := byName["trust-to-any"].ToZones; len(got) != 1 || got[0] != "any" {
+		t.Fatalf("compiler did not preserve explicit to-zone any: %q", got)
 	}
 
 	// from-zone any / to-zone untrust: `any` on the source axis places EVERY

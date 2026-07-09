@@ -107,7 +107,14 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	// never keys in the quarantine set, so they never match here.
 	if len(snap.Policies) > 0 {
 		refsQuarantinedZone := func(p PolicyRuleSnapshot) bool {
-			for _, z := range [...]string{p.FromZone, p.ToZone, p.MatchFromZone, p.MatchToZone} {
+			// #4626 M03: a scoped global's match-zone context is now a zone SET
+			// carried in the plural MatchFromZones/MatchToZones (singular kept for
+			// back-compat). Check EVERY element so a global scoped to a
+			// quarantined zone anywhere in its set is dropped, not just its first.
+			zones := []string{p.FromZone, p.ToZone, p.MatchFromZone, p.MatchToZone}
+			zones = append(zones, p.MatchFromZones...)
+			zones = append(zones, p.MatchToZones...)
+			for _, z := range zones {
 				if _, drop := quarantined[z]; drop {
 					return true
 				}

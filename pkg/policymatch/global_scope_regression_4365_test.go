@@ -53,7 +53,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyDeny,
 				GlobalPolicies: []*config.Policy{
-					permit("g-scoped", config.PolicyMatch{FromZone: "trust", ToZone: "untrust"}),
+					permit("g-scoped", config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "untrust"},
@@ -74,7 +74,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 					zonePair("dmz", "wan", permit("unrelated", config.PolicyMatch{})),
 				},
 				GlobalPolicies: []*config.Policy{
-					permit("g-scoped", config.PolicyMatch{FromZone: "trust", ToZone: "untrust"}),
+					permit("g-scoped", config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "untrust"},
@@ -89,7 +89,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyPermit,
 				GlobalPolicies: []*config.Policy{
-					deny("g-trust-only", config.PolicyMatch{FromZone: "trust"}),
+					deny("g-trust-only", config.PolicyMatch{FromZones: []string{"trust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "dmz", ToZone: "untrust"},
@@ -101,7 +101,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyPermit,
 				GlobalPolicies: []*config.Policy{
-					deny("g-to-untrust", config.PolicyMatch{ToZone: "untrust"}),
+					deny("g-to-untrust", config.PolicyMatch{ToZones: []string{"untrust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "dmz"},
@@ -114,7 +114,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyPermit,
 				GlobalPolicies: []*config.Policy{
-					deny("g-typo", config.PolicyMatch{FromZone: "trsut"}), // typo
+					deny("g-typo", config.PolicyMatch{FromZones: []string{"trsut"}}), // typo
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "untrust"},
@@ -143,7 +143,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyPermit,
 				GlobalPolicies: []*config.Policy{
-					deny("g-anyany", config.PolicyMatch{FromZone: "any", ToZone: "any"}),
+					deny("g-anyany", config.PolicyMatch{FromZones: []string{"any"}, ToZones: []string{"any"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "dmz", ToZone: "wan"},
@@ -158,7 +158,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyDeny,
 				GlobalPolicies: []*config.Policy{
-					permit("g-from-trust", config.PolicyMatch{FromZone: "trust"}),
+					permit("g-from-trust", config.PolicyMatch{FromZones: []string{"trust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "wan"},
@@ -172,7 +172,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 			cfg: cfgWith(config.SecurityConfig{
 				DefaultPolicy: config.PolicyDeny,
 				GlobalPolicies: []*config.Policy{
-					permit("g-from-trust", config.PolicyMatch{FromZone: "trust"}),
+					permit("g-from-trust", config.PolicyMatch{FromZones: []string{"trust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "dmz", ToZone: "wan"},
@@ -191,7 +191,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 					zonePair("trust", "untrust", permit("zp-allow", config.PolicyMatch{})),
 				},
 				GlobalPolicies: []*config.Policy{
-					deny("g-scoped-deny", config.PolicyMatch{FromZone: "trust", ToZone: "untrust"}),
+					deny("g-scoped-deny", config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}}),
 				},
 			}, config.ApplicationsConfig{}),
 			q:           Query{FromZone: "trust", ToZone: "untrust"},
@@ -277,7 +277,7 @@ func TestSharedMatcherGlobalScopeRegressionMatrix(t *testing.T) {
 				zonePair("dmz", "wan", permit("unrelated", config.PolicyMatch{})),
 			},
 			GlobalPolicies: []*config.Policy{
-				permit("g-scoped", config.PolicyMatch{FromZone: "trust", ToZone: "untrust"}),
+				permit("g-scoped", config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}}),
 			},
 		}, config.ApplicationsConfig{})
 		res := Match(cfg, Query{FromZone: "trust", ToZone: "untrust"})

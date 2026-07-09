@@ -137,7 +137,7 @@ func TestWildcardZoneAndScopedGlobalPrecedence(t *testing.T) {
 				Zones:         zones("trust", "untrust", "dmz"),
 				GlobalPolicies: []*config.Policy{
 					{Name: "scoped-deny", Action: config.PolicyDeny,
-						Match: config.PolicyMatch{FromZone: "trust", ToZone: "untrust"}},
+						Match: config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}}},
 				},
 			}, config.ApplicationsConfig{}),
 			q:          Query{FromZone: "dmz", ToZone: "untrust"},
@@ -150,7 +150,7 @@ func TestWildcardZoneAndScopedGlobalPrecedence(t *testing.T) {
 				Zones:         zones("trust", "untrust", "dmz"),
 				GlobalPolicies: []*config.Policy{
 					{Name: "scoped-deny", Action: config.PolicyDeny,
-						Match: config.PolicyMatch{FromZone: "trust", ToZone: "untrust"}},
+						Match: config.PolicyMatch{FromZones: []string{"trust"}, ToZones: []string{"untrust"}}},
 				},
 			}, config.ApplicationsConfig{}),
 			q:          Query{FromZone: "trust", ToZone: "untrust"},
@@ -165,7 +165,7 @@ func TestWildcardZoneAndScopedGlobalPrecedence(t *testing.T) {
 				Zones:         zones("trust", "untrust"),
 				GlobalPolicies: []*config.Policy{
 					{Name: "typo-deny", Action: config.PolicyDeny,
-						Match: config.PolicyMatch{FromZone: "trsut"}}, // typo
+						Match: config.PolicyMatch{FromZones: []string{"trsut"}}}, // typo
 				},
 			}, config.ApplicationsConfig{}),
 			q:          Query{FromZone: "trust", ToZone: "untrust"},
@@ -179,7 +179,7 @@ func TestWildcardZoneAndScopedGlobalPrecedence(t *testing.T) {
 				Zones:         zones("trust", "untrust", "dmz"),
 				GlobalPolicies: []*config.Policy{
 					{Name: "broad-deny", Action: config.PolicyDeny,
-						Match: config.PolicyMatch{FromZone: "any"}}, // explicit any
+						Match: config.PolicyMatch{FromZones: []string{"any"}}}, // explicit any
 				},
 			}, config.ApplicationsConfig{}),
 			q:          Query{FromZone: "dmz", ToZone: "untrust"},

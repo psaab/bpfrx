@@ -273,24 +273,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					// under global policy match — zone-pair policies take
 					// their zones from the from-zone/to-zone stanza.
 					//
-					// #4415 L12: tagged `scalar: true` so a list / trailing
-					// token is REJECTED at commit rather than silently
-					// dropped. The compiler
-					// (compiler_security_policy.go from-zone/to-zone cases)
-					// reads only the FIRST value token (Keys[1] or
-					// Children[0]) into the single-string Match.FromZone /
-					// Match.ToZone, so `match from-zone [ trust dmz ]`
-					// (which the #2419 lexer collapses to
-					// Keys=["from-zone","trust","dmz"]) would silently keep
-					// only "trust" and discard "dmz" — a security-relevant
-					// scope narrowing the operator never sees. Junos accepts
-					// a zone LIST here; modeling that is the deferred
-					// multi-zone-scope work (#4415 M03). Until then the
-					// fail-closed behavior is to reject the list with a clear
-					// error (validateScalarValueLeaf, #3332) so no zone is
-					// dropped without notice.
-					"from-zone": {desc: "Restrict this global policy to packets from this zone", args: 1, scalar: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
-					"to-zone":   {desc: "Restrict this global policy to packets to this zone", args: 1, scalar: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					// #4626 M03: a Junos global policy scope is a zone LIST
+					// (`match from-zone [ trust dmz ]`), so these leaves carry
+					// `multi: true` (the same marker source-address /
+					// application use above) — the #2419 lexer collapses the
+					// bracket list onto one leaf's Keys
+					// (["from-zone","trust","dmz"]) and the compiler
+					// accumulates EVERY value via firewallMatchValues into the
+					// Match.FromZones / Match.ToZones set. This replaced the
+					// #4415 L12 `scalar: true` fail-closed reject (which
+					// dropped every zone past the first) with real Junos
+					// multi-zone parity.
+					"from-zone": {desc: "Restrict this global policy to packets from these zones", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+					"to-zone":   {desc: "Restrict this global policy to packets to these zones", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 				}},
 				"then": {desc: "Action", children: policyThenSchemaChildren()},
 				// #3117: scheduler-name on global policies — same compiler +

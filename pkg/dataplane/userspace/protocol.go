@@ -1259,6 +1259,15 @@ type PolicyRuleSnapshot struct {
 	// policies — a zone-pair rule leaves them empty.
 	MatchFromZone string `json:"match_from_zone,omitempty"`
 	MatchToZone   string `json:"match_to_zone,omitempty"`
+	// #4626 M03: the FULL scoped-global zone SET. A Junos global policy scope
+	// is a zone LIST; these ADDITIVE plural fields carry every zone while the
+	// singular fields above keep the first element for rolling-upgrade safety.
+	// The Rust helper PREFERS the plural when non-empty and falls back to the
+	// singular otherwise (build_global_zone_scope, policy.rs). Additive per
+	// #1961: an old helper that ignores these still reads the singular field.
+	// Populated only for global policies; a zone-pair rule leaves them empty.
+	MatchFromZones []string `json:"match_from_zones,omitempty"`
+	MatchToZones   []string `json:"match_to_zones,omitempty"`
 	// #3376: build-time-only diagnostic detail (deliberately NOT serialized —
 	// no JSON tag, never carried on the wire). When buildOneRuleSnapshot
 	// collapses an unrepresentable side to the fail-closed sentinel (#3261), it

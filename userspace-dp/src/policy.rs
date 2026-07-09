@@ -7,6 +7,7 @@ use crate::{
 use ipnet::IpNet;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -217,14 +218,20 @@ pub(crate) struct PolicyEvaluationResult {
 /// this scope is consulted as an extra predicate inside the global-tier loop
 /// before `try_match_rule`. A non-global (zone-pair / wildcard) rule always
 /// carries `Any` on both sides, so the scope check is a no-op for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GlobalZoneScope {
     /// No constraint — the global policy applies to every defined zone on this
     /// side (the historical all-zones behaviour, and the value for every
     /// non-global rule).
     Any,
-    /// Constrained to a resolved zone id: the side matches only this zone.
-    Zone(u16),
+    /// #4626 M03: constrained to a SET of resolved zone ids — the side matches
+    /// only these zones. A Junos global policy scope is a zone LIST, so a side
+    /// carries every configured zone. The inline capacity of 2 covers the
+    /// common ≤2-zone scope with no heap allocation (a single-zone scope is a
+    /// 1-element set, bit-identical to the pre-#4626 `Zone(id)`); a larger scope
+    /// spills to the heap once at build time (a cold path). The Go compiler
+    /// sorts + de-duplicates the set, so membership is order-insensitive.
+    Zones(SmallVec<[u16; 2]>),
 }
 
 impl Default for GlobalZoneScope {
@@ -235,12 +242,28 @@ impl Default for GlobalZoneScope {
 
 impl GlobalZoneScope {
     /// Whether a flow whose zone (ingress for from, egress for to) is `id`
-    /// satisfies this scope.
+    /// satisfies this scope. `Any` matches every zone; a `Zones` set matches iff
+    /// `id` is a member (O(k), k = scope size ≈ 1-2, no allocation).
     #[inline]
-    pub(crate) fn matches(self, id: u16) -> bool {
+    pub(crate) fn matches(&self, id: u16) -> bool {
         match self {
             GlobalZoneScope::Any => true,
-            GlobalZoneScope::Zone(z) => z == id,
+            GlobalZoneScope::Zones(zs) => zs.contains(&id),
+        }
+    }
+
+    /// #4626 M03/A6: whether this TO-zone scope is the reserved host-inbound
+    /// scope — exactly the single junos-host id. `Any` is never a host scope;
+    /// a `Zones` set is a host scope iff it is exactly `[JUNOS_HOST_ZONE_ID]`.
+    /// This replaces the pre-#4626 `== Zone(JUNOS_HOST_ZONE_ID)` equality test
+    /// (the Go strict commit gate rejects a to-zone list mixing junos-host with
+    /// any other zone, so a host-inbound global always resolves to exactly this
+    /// singleton).
+    #[inline]
+    pub(crate) fn is_host_scope(&self) -> bool {
+        match self {
+            GlobalZoneScope::Any => false,
+            GlobalZoneScope::Zones(zs) => zs.as_slice() == [JUNOS_HOST_ZONE_ID],
         }
     }
 }
@@ -248,42 +271,70 @@ impl GlobalZoneScope {
 /// #3148: resolve a global policy's `match from-zone`/`to-zone` name into a
 /// [`GlobalZoneScope`].
 ///
-///   - Empty (omitted) → `Any` (all zones — the Junos implicit default).
-///   - Explicit `"any"` → `Any` as well: an explicit `match from-zone any` is
+///   - Empty (omitted list) → `Any` (all zones — the Junos implicit default).
+///   - Any `"any"` element → `Any` as well: an explicit `match from-zone any` is
 ///     the Junos all-zones default, identical to omitting the leaf. This MUST
 ///     agree with the Go commit gate, which exempts `"any"` (a valid commit) —
 ///     resolving `"any"` through `resolve_policy_zone_id` would return `None`
-///     (no zone is named `any`) → `Unresolved` (matches nothing), so a `permit`
-///     global silently over-restricts and a `deny` global silently no-ops. The
-///     explicit-`any` short-circuit eliminates that commit-vs-dataplane
-///     divergence.
-///   - Any other name resolves through [`resolve_policy_zone_id`]; an
-///     unresolvable name fails the WHOLE snapshot closed
+///     (no zone is named `any`), so a `permit` global silently over-restricts
+///     and a `deny` global silently no-ops. The contains-`any` short-circuit
+///     eliminates that commit-vs-dataplane divergence AND acts as the tolerant
+///     backstop for a corrupt/old-peer snapshot that mixes `any` with concrete
+///     zones (the Go strict commit gate rejects such a mix, so it never emits
+///     one, but a mixed set still degrades safely to all-zones here).
+///   - Any other element resolves through [`resolve_policy_zone_id`]; an
+///     unresolvable element fails the WHOLE snapshot closed
 ///     ([`SnapshotIntegrityError::UnresolvableZoneReference`], #3402) rather
 ///     than silently producing a matches-nothing scope, mirroring the
 ///     zone-pair path's reject. The Go commit gate
 ///     (`validatePolicyZoneReferencesStrict`, #2401) hard-rejects an undefined
 ///     match-zone, so a clean commit never reaches here; this is the
 ///     helper-boundary backstop for the lenient / upgrade-state / corrupt
-///     snapshot path. (`"junos-host"` is hard-rejected at commit for these
-///     leaves — see `validatePolicyZoneReferencesStrict` — so on the strict
-///     path the dataplane never sees it; on the tolerant load path it resolves
-///     to the reserved host id, which never matches a transit flow, i.e. inert
-///     fail-closed.)
+///     snapshot path. (`from-zone junos-host` is hard-rejected at commit; a
+///     tolerant-path `to-zone junos-host` resolves to the reserved host id,
+///     which never matches a transit flow — inert fail-closed for transit and
+///     the intended host-scope for the host-inbound tier.)
+///
+/// #4626 M03: `names` is the resolved scope LIST (the plural
+/// `match_from_zones`/`match_to_zones`, or `[singular]` when only the legacy
+/// field is present). Every element is resolved and collected into a sorted,
+/// de-duplicated `Zones` set.
 fn build_global_zone_scope(
     zone_name_to_id: &FxHashMap<String, u16>,
-    name: &str,
+    names: &[String],
     rule_id: &str,
 ) -> Result<GlobalZoneScope, SnapshotIntegrityError> {
-    if name.is_empty() || name == "any" {
+    if names.is_empty() || names.iter().any(|n| n.is_empty() || n == "any") {
         return Ok(GlobalZoneScope::Any);
     }
-    match resolve_policy_zone_id(zone_name_to_id, name) {
-        Some(id) => Ok(GlobalZoneScope::Zone(id)),
-        None => Err(SnapshotIntegrityError::UnresolvableZoneReference {
-            rule_id: rule_id.to_string(),
-            zone: name.to_string(),
-        }),
+    let mut ids: SmallVec<[u16; 2]> = SmallVec::with_capacity(names.len());
+    for name in names {
+        match resolve_policy_zone_id(zone_name_to_id, name) {
+            Some(id) => ids.push(id),
+            None => {
+                return Err(SnapshotIntegrityError::UnresolvableZoneReference {
+                    rule_id: rule_id.to_string(),
+                    zone: name.to_string(),
+                })
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(GlobalZoneScope::Zones(ids))
+}
+
+/// #4626 M03: resolve the EFFECTIVE scoped-global zone list from a snapshot's
+/// additive wire fields — prefer the plural `match_*_zones` (the full set) and
+/// fall back to the singular `match_*_zone` for an old-Go snapshot that omits
+/// the plural (rolling-upgrade safety). An unscoped rule yields an empty slice.
+fn effective_match_zones<'a>(plural: &'a [String], singular: &'a str) -> Cow<'a, [String]> {
+    if !plural.is_empty() {
+        Cow::Borrowed(plural)
+    } else if !singular.is_empty() {
+        Cow::Owned(vec![singular.to_string()])
+    } else {
+        Cow::Borrowed(&[])
     }
 }
 
@@ -397,8 +448,8 @@ impl Clone for PolicyRule {
             policy_id: self.policy_id,
             from_zone: self.from_zone.clone(),
             to_zone: self.to_zone.clone(),
-            global_from_zone: self.global_from_zone,
-            global_to_zone: self.global_to_zone,
+            global_from_zone: self.global_from_zone.clone(),
+            global_to_zone: self.global_to_zone.clone(),
             scheduler_name: self.scheduler_name.clone(),
             inactive: self.inactive,
             source_literal_v4: self.source_literal_v4.clone(),
@@ -1609,20 +1660,21 @@ impl PolicyState {
             }
         }
         // `junos-global` rules, each scoped by its optional `match from-zone` /
-        // `match to-zone` context (#3148). `Any` expands to the full concrete
-        // universe; a concrete `Zone(id)` pins that side; a reserved
-        // `Zone(id)` (junos-host) contributes no transit pair.
+        // `match to-zone` context (#3148/#4626). `Any` expands to the full
+        // concrete universe; a `Zones` SET expands to each of its CONCRETE
+        // members (a reserved id like junos-host contributes no transit pair).
         for &idx in &self.global_indices {
             let rule = &self.rules[idx];
-            let expand_side = |scope: GlobalZoneScope| -> Vec<u16> {
+            let expand_side = |scope: &GlobalZoneScope| -> Vec<u16> {
                 match scope {
                     GlobalZoneScope::Any => concrete.clone(),
-                    GlobalZoneScope::Zone(z) if is_concrete(z) => vec![z],
-                    GlobalZoneScope::Zone(_) => Vec::new(),
+                    GlobalZoneScope::Zones(zs) => {
+                        zs.iter().copied().filter(|&z| is_concrete(z)).collect()
+                    }
                 }
             };
-            let from_ids = expand_side(rule.global_from_zone);
-            let to_ids = expand_side(rule.global_to_zone);
+            let from_ids = expand_side(&rule.global_from_zone);
+            let to_ids = expand_side(&rule.global_to_zone);
             for &from in &from_ids {
                 for &to in &to_ids {
                     wildcard.insert((from, to));
@@ -2023,17 +2075,20 @@ pub(crate) fn parse_policy_state_with_counters(
             policy_id: snap.policy_id,
             from_zone: snap.from_zone.clone(),
             to_zone: snap.to_zone.clone(),
-            // #3148: resolve the optional global-policy zone context. Empty →
-            // Any (all zones). Inert for non-global rules (both fields empty).
-            // #3402: an unresolvable match-zone fails the whole snapshot closed.
+            // #3148/#4626 M03: resolve the optional global-policy zone SCOPE
+            // SET. The effective list prefers the plural match_*_zones wire
+            // field and falls back to the singular match_*_zone (rolling-upgrade
+            // safety). Empty → Any (all zones). Inert for non-global rules (both
+            // empty). #3402: an unresolvable element fails the whole snapshot
+            // closed.
             global_from_zone: build_global_zone_scope(
                 zone_name_to_id,
-                &snap.match_from_zone,
+                &effective_match_zones(&snap.match_from_zones, &snap.match_from_zone),
                 &rule_id,
             )?,
             global_to_zone: build_global_zone_scope(
                 zone_name_to_id,
-                &snap.match_to_zone,
+                &effective_match_zones(&snap.match_to_zones, &snap.match_to_zone),
                 &rule_id,
             )?,
             scheduler_name: snap.scheduler_name.clone(),
@@ -2077,16 +2132,22 @@ pub(crate) fn parse_policy_state_with_counters(
         // #3019: arm the LocalDelivery junos-host policy gate iff a rule
         // actually names the reserved self zone on either side.
         //
-        // #3639: a GLOBAL policy carries its junos-host context out-of-band in
-        // `match_to_zone` (its structural `to_zone` stays "junos-global"), so a
-        // `global policy ... match to-zone junos-host` must ALSO arm the gate —
-        // otherwise `evaluate_junos_host_policy_l3_aware` short-circuits on
-        // `!has_junos_host_rules` and the global-tier host consult below never
-        // runs. `match_to_zone` is populated only for globals, so this can never
-        // fire for a plain zone-pair rule.
+        // #3639/#4626: a GLOBAL policy carries its junos-host context out-of-band
+        // in the `match to-zone` SCOPE (its structural `to_zone` stays
+        // "junos-global"), so a `global policy ... match to-zone junos-host` must
+        // ALSO arm the gate — otherwise `evaluate_junos_host_policy_l3_aware`
+        // short-circuits on `!has_junos_host_rules` and the global-tier host
+        // consult below never runs. Read the gate from the RESOLVED
+        // `global_to_zone` (`is_host_scope()`), NOT the raw singular
+        // `snap.match_to_zone`: the scope build above PREFERS the plural
+        // `match_to_zones`, so a plural-only snapshot (`match_to_zones =
+        // ["junos-host"]`, empty singular) resolves to a host scope but the
+        // singular field is empty — arming off the singular there would silently
+        // fail the host-inbound global OPEN. `is_host_scope()` is Any-false, so a
+        // plain zone-pair rule (empty scope → Any) can never fire it.
         if snap.from_zone == JUNOS_HOST_ZONE_NAME
             || snap.to_zone == JUNOS_HOST_ZONE_NAME
-            || snap.match_to_zone == JUNOS_HOST_ZONE_NAME
+            || state.rules[idx].global_to_zone.is_host_scope()
         {
             state.has_junos_host_rules = true;
         }
@@ -2988,9 +3049,7 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware(
     // the RX LocalDelivery gate and is rejected at commit (#3611 Piece A).
     for &idx in &state.global_indices {
         let rule = &state.rules[idx];
-        if rule.global_to_zone != GlobalZoneScope::Zone(JUNOS_HOST_ZONE_ID)
-            || !rule.global_from_zone.matches(from_id)
-        {
+        if !rule.global_to_zone.is_host_scope() || !rule.global_from_zone.matches(from_id) {
             continue;
         }
         if let Some(mut result) = try_match_rule(

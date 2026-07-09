@@ -51,6 +51,7 @@ package policymatch
 import (
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -922,15 +923,20 @@ func Match(cfg *config.Config, q Query) (res Result) {
 		if pol == nil {
 			continue
 		}
-		if !globalScopeMatches(cfg, pol.Match.FromZone, q.FromZone) ||
-			!globalScopeMatches(cfg, pol.Match.ToZone, q.ToZone) {
+		if !globalScopeSetMatches(cfg, pol.Match.FromZones, q.FromZone) ||
+			!globalScopeSetMatches(cfg, pol.Match.ToZones, q.ToZone) {
 			continue
 		}
 		if ruleMatches(cfg, q, pol) {
 			// A global policy's scope is its `match from-zone`/`match to-zone`
-			// (empty = all zones), NOT the surrounding stanza — report that as
-			// the result's zone context (#3331/#3148).
-			return matchedResult(ids, pol, true, pol.Match.FromZone, pol.Match.ToZone, globalSetIdx, sliceIdx)
+			// SET (empty = all zones), NOT the surrounding stanza. Report the
+			// CONCRETE flow zone the packet traversed (or "" for a wildcard side,
+			// rendered "any") so a multi-zone scope keeps a single concrete zone
+			// per column — never a joined label (#3331/#3148/#4626 A10).
+			return matchedResult(ids, pol, true,
+				reportedScopeZone(pol.Match.FromZones, q.FromZone),
+				reportedScopeZone(pol.Match.ToZones, q.ToZone),
+				globalSetIdx, sliceIdx)
 		}
 	}
 
@@ -1002,21 +1008,25 @@ func matchJunosHost(cfg *config.Config, q Query, ids map[[2]uint32]uint32) Resul
 	// (evaluate_junos_host_policy_l3_aware) and transit-policy precedence (a
 	// global policy is least-specific and never jumps ahead of a zone-pair
 	// rule). The optional `match from-zone` scope still restricts by ingress
-	// zone (empty / "any" = every zone). We filter on Match.ToZone directly
-	// rather than globalScopeMatches because junos-host is not a defined zone in
-	// cfg.Security.Zones (globalScopeMatches would fail it closed). A `match
+	// zone (empty / "any" = every zone). We select on IsHostToZoneScope
+	// (ToZones == ["junos-host"]) directly rather than globalScopeSetMatches
+	// because junos-host is not a defined zone in cfg.Security.Zones
+	// (globalScopeSetMatches would fail it closed). A `match
 	// from-zone junos-host` global (host-ORIGINATED) is rejected at commit and
 	// never reaches this host-inbound path (#3611 Piece A).
 	globalSetIdx := len(cfg.Security.Policies)
 	for sliceIdx, pol := range cfg.Security.GlobalPolicies {
-		if pol == nil || pol.Match.ToZone != JunosHostZone {
+		if pol == nil || !config.IsHostToZoneScope(pol.Match.ToZones) {
 			continue
 		}
-		if !globalScopeMatches(cfg, pol.Match.FromZone, q.FromZone) {
+		if !globalScopeSetMatches(cfg, pol.Match.FromZones, q.FromZone) {
 			continue
 		}
 		if ruleMatches(cfg, q, pol) {
-			return withHI(matchedResult(ids, pol, true, pol.Match.FromZone, pol.Match.ToZone, globalSetIdx, sliceIdx))
+			return withHI(matchedResult(ids, pol, true,
+				reportedScopeZone(pol.Match.FromZones, q.FromZone),
+				reportedScopeZone(pol.Match.ToZones, q.ToZone),
+				globalSetIdx, sliceIdx))
 		}
 	}
 	// No host-bound rule matched: local delivery proceeds. Do NOT fall through
@@ -1061,31 +1071,56 @@ func ipFamily(ip net.IP) string {
 // whose match-scope zone is empty or "any" spans every zone, so it always
 // applies (it IS enforced for the filtered pair). A scoped global is selected
 // only when its scope equals the filter on each constrained axis. The semantics
-// mirror globalScopeMatches (an "any"/empty scope is all-zones) so the filtered
+// mirror globalScopeSetMatches (an "any"/empty scope is all-zones) so the filtered
 // view shows exactly the globals the runtime enforces for that zone pair.
-func GlobalPolicyAppliesToZonePair(matchFrom, matchTo, filterFrom, filterTo string) bool {
-	axisApplies := func(scope, filter string) bool {
-		if filter == "" || config.IsWildcardZone(scope) {
+func GlobalPolicyAppliesToZonePair(matchFrom, matchTo []string, filterFrom, filterTo string) bool {
+	axisApplies := func(scope []string, filter string) bool {
+		if filter == "" || config.IsWildcardZoneSet(scope) {
 			return true
 		}
-		return scope == filter
+		return slices.Contains(scope, filter)
 	}
 	return axisApplies(matchFrom, filterFrom) && axisApplies(matchTo, filterTo)
 }
 
-// globalScopeMatches replicates GlobalZoneScope::matches + build_global_zone_scope
-// (policy.rs, #3148). An empty or explicit "any" scope applies to every zone.
-// Any other name must resolve to a DEFINED zone and equal the flow's zone; an
-// undefined (typo'd, or reserved like junos-host) scope fails closed — it
-// matches nothing, never silently widening to all-zones.
-func globalScopeMatches(cfg *config.Config, scopeZone, flowZone string) bool {
-	if config.IsWildcardZone(scopeZone) {
+// globalScopeSetMatches replicates GlobalZoneScope::matches + build_global_zone_scope
+// (policy.rs, #3148/#4626) for a zone SET scope. An empty scope or one that
+// contains "any" (config.IsWildcardZoneSet) applies to every zone. Otherwise the
+// flow's zone must equal some DEFINED element of the set; an undefined element
+// (typo'd, or reserved like junos-host) contributes nothing — it never silently
+// widens the scope to all-zones, matching the runtime fail-closed backstop.
+func globalScopeSetMatches(cfg *config.Config, scope []string, flowZone string) bool {
+	if config.IsWildcardZoneSet(scope) {
 		return true
 	}
-	if _, ok := cfg.Security.Zones[scopeZone]; !ok {
-		return false // Unresolved → matches nothing
+	for _, z := range scope {
+		if _, ok := cfg.Security.Zones[z]; !ok {
+			continue // Unresolved element → contributes nothing
+		}
+		if z == flowZone {
+			return true
+		}
 	}
-	return scopeZone == flowZone
+	return false
+}
+
+// reportedScopeZone returns the single zone token for a scoped-global match's
+// Result From/To column (#4626 A10). To stay bit-identical with the pre-#4626
+// single-string model it reports the scope token VERBATIM for the 0-or-1-token
+// cases — "" for an unscoped side (rendered "any"), the literal token for a
+// single-element scope (a concrete zone, or explicit "any" preserved as "any").
+// Only a genuinely MULTI-zone scope (which the single-string model could never
+// express) reports the CONCRETE flow zone the packet traversed, so the column
+// stays a single concrete zone rather than a joined scope label.
+func reportedScopeZone(scope []string, flowZone string) string {
+	switch len(scope) {
+	case 0:
+		return ""
+	case 1:
+		return scope[0]
+	default:
+		return flowZone
+	}
 }
 
 // zoneKnown reports whether a query zone is DEFINED for the runtime's `id != 0`

@@ -859,27 +859,40 @@ capacity the surplus is dropped by `ColdPathSlotMap::build` and surfaced via its
 `overflow_active` flag; exact pairs are assigned first, so they win under
 pressure.
 
-**Global policy zone context (#3148).** A Junos global policy may carry optional
-`match { from-zone <z>; to-zone <z>; }` to scope it to one zone pair (or one
-wildcard side) instead of every zone pair. Such a rule keeps the
+**Global policy zone context (#3148, #4626 M03).** A Junos global policy may
+carry optional `match { from-zone [ <z> ... ]; to-zone [ <z> ... ]; }` to scope
+it to a set of zone pairs (or one wildcard side) instead of every zone pair. The
+scope is a zone **SET** on each side: a packet matches the global iff its
+from-zone ∈ the from-set AND its to-zone ∈ the to-set. Such a rule keeps the
 `junos-global` sentinel on its structural zones (so it stays classified in the
 `global_indices` tier and the global config order is preserved) and carries its
-context out-of-band on the additive wire fields `match_from_zone` /
-`match_to_zone` (resolved at snapshot-build time into a `GlobalZoneScope` —
-`Any` for no constraint, `Zone(id)` for a defined zone, `Unresolved` =
-fail-closed for an undefined zone). An OMITTED leaf and an explicit `any` both
-map to `Any` (all zones, the Junos implicit default) — `build_global_zone_scope`
-short-circuits `"any"` so it can never route to `Unresolved` and silently match
-nothing, keeping the dataplane in agreement with the Go commit gate (which
-exempts `any`). The reserved `junos-host` zone is direction-split as a global
-match context (#3639 / #3611 Piece B): `match to-zone junos-host` (host-INBOUND)
-commits and IS enforced — `evaluate_junos_host_policy_l3_aware` consults the
-`global_indices` tier filtered to `global_to_zone == Zone(JUNOS_HOST_ZONE_ID)`,
-after the exact `from-zone <ingress> to-zone junos-host` pair and the `from-zone
-any to-zone junos-host` wildcard (a scoped global stays least-specific). `match
-from-zone junos-host` (host-ORIGINATED) stays hard-rejected at commit — locally
-generated traffic egresses via the kernel TX path, never the AF_XDP RX gate, so
-it could only ever silently never-match (#3611 Piece A, documented not built).
+context out-of-band on ADDITIVE wire fields. The singular `match_from_zone` /
+`match_to_zone` keep the FIRST zone for rolling-upgrade compatibility with an
+old helper; the plural `match_from_zones` / `match_to_zones` carry the full set.
+`parse_policy_state` prefers the plural (falling back to `[singular]`) and
+resolves it at snapshot-build time into a `GlobalZoneScope` — `Any` for no
+constraint, `Zones(SmallVec<[u16; 2]>)` for a set of defined zone ids
+(sorted+deduped), and an unresolvable element fails the WHOLE snapshot closed
+(`UnresolvableZoneReference`, #3402). An OMITTED leaf and any `"any"` element
+both map to `Any` (all zones, the Junos implicit default) —
+`build_global_zone_scope` short-circuits `"any"` so it can never route to a
+matches-nothing scope, keeping the dataplane in agreement with the Go commit
+gate (which exempts `any` and rejects a list that MIXES `any` with concrete
+zones). A single-zone scope is a 1-element `Zones` set, bit-identical to the
+pre-#4626 `Zone(id)` model. The reserved `junos-host` zone is direction-split as
+a global match context (#3639 / #3611 Piece B): `match to-zone junos-host`
+(host-INBOUND) commits and IS enforced — `evaluate_junos_host_policy_l3_aware`
+consults the `global_indices` tier filtered by `global_to_zone.is_host_scope()`
+(the to-set is exactly `[JUNOS_HOST_ZONE_ID]`; a to-zone list that mixes
+junos-host with any other zone is rejected at commit), after the exact `from-zone
+<ingress> to-zone junos-host` pair and the `from-zone any to-zone junos-host`
+wildcard (a scoped global stays least-specific). `match from-zone junos-host`
+(host-ORIGINATED) stays hard-rejected at commit — locally generated traffic
+egresses via the kernel TX path, never the AF_XDP RX gate, so it could only ever
+silently never-match (#3611 Piece A, documented not built). A multi-zone scoped
+global that names a zone-local address book resolves against the GLOBAL book
+(zone-local resolution is defined only for a single concrete zone — a documented
+parity limitation).
 The scope is checked as an extra predicate
 inside the `junos-global` tier loop, **in the same tier position** shown above:
 a zone-scoped global policy is NOT promoted ahead of the #3090 wildcard tiers.
