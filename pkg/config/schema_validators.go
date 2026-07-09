@@ -139,6 +139,14 @@ func ValidatePercent(min, max float64) LeafValidator {
 		if err != nil {
 			return fmt.Errorf("not a number: %q", raw)
 		}
+		// NaN/Inf sail past the `<`/`>` range comparisons below (both
+		// comparisons are false for NaN), so a schema-accepted NaN/Inf
+		// reaches the snapshot and blows up at userspace publish where
+		// json.Marshal rejects non-finite floats (#4877). Reject them at
+		// commit-check so the operator gets an actionable leaf error.
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("percent must be a finite number (got %s)", raw)
+		}
 		if v < min || v > max {
 			return fmt.Errorf("percent out of range [%.2f..%.2f] (got %s)", min, max, raw)
 		}
