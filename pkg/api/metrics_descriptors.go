@@ -1342,6 +1342,31 @@ func newCollector(srv *Server) *xpfCollector {
 				"it (#3661).",
 			[]string{"source"}, nil,
 		),
+		userspaceMartianDropped: prometheus.NewDesc(
+			"xpf_userspace_martian_dropped_total",
+			"Packets dropped with a NoRoute disposition whose destination is a "+
+				"martian address (IPv4 multicast/broadcast/unspecified/loopback, "+
+				"IPv6 multicast/unspecified/loopback) — a firewall never forwards "+
+				"these and they have no legitimate route, so they miss the FIB and "+
+				"drop as NoRoute. A strict sub-breakout of the route-miss total "+
+				"(every martian drop also bumps route_miss_packets), summed across "+
+				"bindings, so an operator can tell a martian-dst drop apart from an "+
+				"ordinary route miss and correlate it with a firewall-filter accept "+
+				"log (#4743/#4768). Emitted unconditionally so 0 is a real "+
+				"\"no martian drops\" signal.",
+			nil, nil,
+		),
+		userspaceIPv6ExtHeaderDropped: prometheus.NewDesc(
+			"xpf_userspace_ipv6_ext_header_dropped_total",
+			"Packets fail-closed-dropped because their IPv6 extension-header "+
+				"chain is unparseable or exceeds the MAX_IPV6_EXT_HEADERS walk "+
+				"bound (an over-limit chain the helper cannot inspect), summed "+
+				"across bindings. Distinct from a truncated chain; makes the "+
+				"otherwise-silent fail-closed drop observable (#4743/#4768, "+
+				"relates to #4555). Emitted unconditionally so 0 is a real "+
+				"\"no ext-header drops\" signal.",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

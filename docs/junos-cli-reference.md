@@ -469,6 +469,11 @@ From zone: guest, To zone: lan
       forwarded flowless (`l4_present = false`), an ext-header IDS-evasion; it is
       distinct from a TRUNCATED chain (which stays flowless). Not in `Packets
       dropped`.
+      - **Prometheus (#4768):** both counters are also exposed as aggregate
+        scrape series — `xpf_userspace_martian_dropped_total` and
+        `xpf_userspace_ipv6_ext_header_dropped_total` — summed across bindings
+        and emitted unconditionally (0 is a real "no such drops" signal), so an
+        operator can alert on them without polling the status text.
     - **Fabric-forwarding drops** (`GlobalCtrFabricFwdDrop`, index 32) — a
       peer-owned synced session whose fabric redirect could not be completed.
     - **VLAN-push failures** (`GlobalCtrVlanPushFail`, index 40).
