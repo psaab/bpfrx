@@ -1,3 +1,26 @@
+## 2026-07-09 — #4862 config parser: assert EOF so a stray top-level `}` is an error, not a silent truncation
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4862 (HIGH security, fail-open). `Parser.Parse()` never asserted
+  the lexer reached EOF, and `parseStatements()` breaks on a top-level
+  `TokenRBrace` identically to EOF — so a stray unmatched `}` made the parser
+  STOP with zero ParseErrors and silently drop every statement after it (e.g. an
+  imported Junos config's trailing `security`/`default-policy`). LoadOverride /
+  CheckText only gate on `len(errs)==0`, so the truncated (weaker) config
+  committed with no warning. Fixed `Parse()`: after the top-level
+  `parseStatements()`, loop asserting EOF — a leftover `}` (or any stray token)
+  is a ParseError naming its position, and the parser consumes it and resumes so
+  BOTH the error AND the trailing config surface (never silently dropped; the
+  error still fails the commit). Every iteration consumes >=1 token so the loop
+  always terminates; correctly-nested `{...}` blocks are unaffected
+  (parseStatement consumes each block's own `}`). No separate parser markdown
+  doc exists — the contract is the in-code `Parse()` comment, which I updated.
+  **File(s)**: pkg/config/parser.go, pkg/config/parser_stray_brace_4862_test.go
+  **Validation**: trailing-brace / mid-stream-with-trailing-config /
+  leading-brace error cases + well-formed + deep-nesting clean cases +
+  error-position case. RED-on-revert confirmed. Full `go test ./pkg/config/
+  ./pkg/configstore/ ./pkg/cli/ ./pkg/cmdtree/` green; `go build ./...` clean.
+
 ## 2026-07-09 — #4895 security: validate `system login user <name>` (sudoers injection)
 
 - **Timestamp**: 2026-07-09
@@ -43824,3 +43847,5 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4860 — allowlist `show log <name>` to the configured `system syslog file` set (config.SyslogLogFilePath); wire CLI showDaemonLog + gRPC ShowText log: path; refuse non-allowlisted / traversal names
   **File(s)**: pkg/config/syslog_logfile.go, pkg/cli/cli_show_system.go, pkg/grpcapi/server_show.go, +tests
+  **Action**: #4857 — validate interface name in DHCP duidPath; reject path traversal in ClearDUID/load/save so a crafted `interface` cannot unlink a root file outside the DUID state dir
+  **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/clearduid_traversal_4857_test.go
