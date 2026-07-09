@@ -43632,3 +43632,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 3 — extract startHTTPServer (HTTP REST API server startup block, 278 lines, PHASE 5) from Run(); byte-identical body (dedent verified), 3 params (ctx, wg, eventBuf), guard stays in Run(). Leaf block, no ordering dependency
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4768 — Prometheus metrics xpf_userspace_martian_dropped_total + xpf_userspace_ipv6_ext_header_dropped_total (sum #4743 per-binding counters across bindings). Desc fields + newCollector + Describe wiring + emitDropClassCounters + RED-on-revert test + junos-cli-reference note
+  **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, pkg/api/metrics_drop_class_4768_test.go, docs/junos-cli-reference.md

@@ -52,6 +52,26 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitZoneIDCollision(ch, status)
 	c.emitRejectObservability(ch, status)
 	c.emitFabricSkipCounters(ch, status)
+	c.emitDropClassCounters(ch, status)
+}
+
+// emitDropClassCounters exposes the #4743 per-binding drop-class counters as
+// aggregate Prometheus series (#4768): martian-destination NoRoute drops and
+// over-limit IPv6 extension-header fail-closed drops, each summed across
+// bindings. #4766 already surfaces these as "Martian drops:" / "IPv6 ext-header
+// drops:" status rows; this adds the scrape surface. Both are emitted
+// unconditionally so a 0 is a real "no such drops" signal, not an absent
+// series (matching the reject-observability convention above). martian_dropped
+// is a sub-breakout of route_miss_packets (every martian drop also bumps the
+// route miss), so the martian series is always <= the route-miss volume.
+func (c *xpfCollector) emitDropClassCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	var martian, ipv6ExtHeader uint64
+	for _, b := range status.Bindings {
+		martian += b.MartianDropped
+		ipv6ExtHeader += b.IPv6ExtHeaderDropped
+	}
+	ch <- prometheus.MustNewConstMetric(c.userspaceMartianDropped, prometheus.CounterValue, float64(martian))
+	ch <- prometheus.MustNewConstMetric(c.userspaceIPv6ExtHeaderDropped, prometheus.CounterValue, float64(ipv6ExtHeader))
 }
 
 // emitFabricSkipCounters exposes the #3773 (M13) fabric-link skip

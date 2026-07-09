@@ -405,8 +405,11 @@ type xpfCollector struct {
 	userspaceRejectReplyBudgetDrops    *prometheus.Desc
 	userspaceRejectOutputFilterDrops   *prometheus.Desc
 	userspaceRejectRateLimitedBySource *prometheus.Desc
-	userspaceFlowCacheActiveFlows      *prometheus.Desc
-	userspaceFlowCacheCapacity         *prometheus.Desc
+	// #4768: per-binding drop-class counters (#4743) summed across bindings.
+	userspaceMartianDropped       *prometheus.Desc
+	userspaceIPv6ExtHeaderDropped *prometheus.Desc
+	userspaceFlowCacheActiveFlows *prometheus.Desc
+	userspaceFlowCacheCapacity    *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
 	userspaceEventStreamProducerFramesTotal  *prometheus.Desc
@@ -764,6 +767,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceRejectReplyBudgetDrops
 	ch <- c.userspaceRejectOutputFilterDrops
 	ch <- c.userspaceRejectRateLimitedBySource
+	ch <- c.userspaceMartianDropped
+	ch <- c.userspaceIPv6ExtHeaderDropped
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal
