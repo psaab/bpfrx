@@ -679,13 +679,20 @@ func (er *EventReader) logEvent(data []byte) {
 		outZone = fmt.Sprintf("%d", evt.EgressZone)
 	}
 	if evt.EventType == eventTypeSessionClose {
+		// #4796: on a SESSION_CLOSE, evt.PolicyID was zeroed above (#2853
+		// repurposes the [44:48] slot for the created-subsec-nanos) and only
+		// rec.PolicyID is repopulated from the trailing [136:140] admitting-
+		// policy slot (#3056). Logging evt.PolicyID here always emitted
+		// policy_id=0 for every session close. rec.PolicyID is the same field
+		// PolicyName resolution and the RT_FLOW_SESSION_CLOSE record already
+		// use, so this keeps the slog line consistent with them.
 		slog.Info("firewall event",
 			"type", eventName,
 			"src", srcStr,
 			"dst", dstStr,
 			"proto", protoStr,
 			"action", actionStr,
-			"policy_id", evt.PolicyID,
+			"policy_id", rec.PolicyID,
 			"ingress_zone", inZone,
 			"egress_zone", outZone,
 			"session_packets", rec.SessionPkts,
