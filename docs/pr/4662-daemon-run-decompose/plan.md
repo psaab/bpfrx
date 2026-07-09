@@ -1,6 +1,18 @@
 # #4662 — daemon_run.go `Run()` decomposition (Increment 1: shutdown-phase extract + phase-boundary comments)
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + Gemini)
+**Status:** CONVERGED v2 — implemented. Codex PLAN-NEEDS-MINOR + Claude SMR
+PLAN-READY-WITH-MINOR converged (Gemini infra-blocked, 2 documented ACP-init
+retries → proceed 2-of-3 per feedback_codex_infra_must_retry). Both reviewers
+independently found the SAME minor: the plan's 1709 start was inconsistent with
+keeping `d.applyCancel()` (at what was line 1705) in the helper. **Applied fix:**
+Phase 7 starts at the `#2926` apply-cancel abort comment (was line 1696), so the
+helper owns the COMPLETE teardown; the extracted body 1696-1858 is byte-identical
+to the original region (verified line-for-line). Test posture (both reviewers
+rejected the full-Run structural test): pure-code-motion → NO dedicated test; the
+gate is `go build ./...` + `go vet` + the existing 30+ daemon test suite +
+`go test ./...` + a clean-restart smoke (the graceful-shutdown path; a
+crash-based test-failover does NOT exercise runShutdownSequence). Reviewer docs:
+codex verdict inline in reviewer-ids ledger; claude-smr-plan-r1.md.
 
 ## 1. Issue framing
 `Daemon.Run` (`pkg/daemon/daemon_run.go:175`) spans ~1691 LOC to the next
