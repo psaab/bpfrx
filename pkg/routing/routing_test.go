@@ -1465,6 +1465,206 @@ func TestBuildPBRRules(t *testing.T) {
 	})
 }
 
+// TestBuildPBRRules_MultiWANScoping pins per-interface FBF scoping in the
+// multi-WAN topology (#4422). Two WAN uplinks each carry their OWN input
+// filter-based-forwarding filter steering their OWN source subnet to their OWN
+// routing-instance:
+//
+//	ge-0/0/0 input "wan1-fbf": from 10.0.1.0/24 -> routing-instance WAN1 (table 100)
+//	ge-0/0/1 input "wan2-fbf": from 10.0.2.0/24 -> routing-instance WAN2 (table 101)
+//
+// The build must emit exactly one rule per filter, each scoped to its own
+// source + table, with NO cross-contamination: WAN1's rule must never carry
+// WAN2's table (a filter on WAN1 must not hijack WAN2's routing-instance, and
+// vice-versa). Both rules stay source-constrained, so a source outside both
+// subnets (the negative cell) matches NO steering rule and falls through to the
+// main table (default route). This is the config-layer half of per-interface
+// FBF; the actual per-packet redirect is enforced in userspace-dp off each
+// interface's FilterInputV4 binding (a deferred lab-verify item).
+func TestBuildPBRRules_MultiWANScoping(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "WAN1", TableID: 100},
+		{Name: "WAN2", TableID: 101},
+	}
+	wan1 := &config.FirewallFilter{
+		Name: "wan1-fbf",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "steer-wan1", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "WAN1"},
+		},
+	}
+	wan2 := &config.FirewallFilter{
+		Name: "wan2-fbf",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "steer-wan2", SourceAddresses: []string{"10.0.2.0/24"}, RoutingInstance: "WAN2"},
+		},
+	}
+	cfg := &config.Config{RoutingInstances: instances}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		wan1.Name: wan1,
+		wan2.Name: wan2,
+	}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, FilterInputV4: "wan1-fbf"},
+		}},
+		"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, FilterInputV4: "wan2-fbf"},
+		}},
+	}
+
+	rules, err := BuildPBRRules(cfg)
+	if err != nil {
+		t.Fatalf("unexpected build error: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 PBR rules (one per WAN filter), got %d: %+v", len(rules), rules)
+	}
+
+	byInstance := make(map[string]*PBRRule)
+	for i := range rules {
+		byInstance[rules[i].Instance] = &rules[i]
+	}
+	r1, r2 := byInstance["WAN1"], byInstance["WAN2"]
+	if r1 == nil || r2 == nil {
+		t.Fatalf("expected one rule for each of WAN1/WAN2, got %+v", rules)
+	}
+
+	// WAN1's filter steers ONLY its own subnet into ONLY its own table.
+	if r1.Src != "10.0.1.0/24" || r1.TableID != 100 {
+		t.Errorf("WAN1 rule = src %q table %d, want 10.0.1.0/24 / 100", r1.Src, r1.TableID)
+	}
+	// WAN2's filter steers ONLY its own subnet into ONLY its own table.
+	if r2.Src != "10.0.2.0/24" || r2.TableID != 101 {
+		t.Errorf("WAN2 rule = src %q table %d, want 10.0.2.0/24 / 101", r2.Src, r2.TableID)
+	}
+
+	// No cross-contamination / no return-path hijack: WAN1's source must never
+	// be steered into WAN2's table and vice-versa, and neither rule may be a
+	// catch-all (empty Src) that would swallow the other WAN's traffic.
+	for i := range rules {
+		r := &rules[i]
+		if r.Src == "" {
+			t.Errorf("multi-WAN rule must stay source-constrained (no catch-all), got %+v", r)
+		}
+		if r.Src == "10.0.1.0/24" && r.TableID != 100 {
+			t.Errorf("WAN1 source 10.0.1.0/24 steered into table %d (want 100) — cross-WAN hijack", r.TableID)
+		}
+		if r.Src == "10.0.2.0/24" && r.TableID != 101 {
+			t.Errorf("WAN2 source 10.0.2.0/24 steered into table %d (want 101) — cross-WAN hijack", r.TableID)
+		}
+	}
+
+	// Negative cell: a source outside BOTH FBF subnets (e.g. 10.0.99.7) matches
+	// neither rule's Src selector, so no steering rule applies and the packet
+	// falls through to the main table (default route). Assert no rule would
+	// match it — i.e. every emitted rule carries a specific, non-matching Src.
+	const unmatched = "10.0.99.0/24"
+	for i := range rules {
+		if rules[i].Src == unmatched || rules[i].Src == "" {
+			t.Errorf("no FBF rule may match the negative-cell source %s (must fall through to main), got %+v", unmatched, &rules[i])
+		}
+	}
+}
+
+// TestBuildPBRRules_OtherInterfaceUnaffected pins that FBF stays confined to the
+// interfaces that actually attach a `then routing-instance` INPUT filter
+// (#4422). A second WAN interface that carries only an OUTPUT filter (its return
+// path) — even one whose filter names a routing-instance — must contribute NO
+// steering rule: output filters are not FBF, so WAN1's ingress steering never
+// leaks onto WAN2's return path.
+func TestBuildPBRRules_OtherInterfaceUnaffected(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "WAN1", TableID: 100},
+		{Name: "WAN2", TableID: 101},
+	}
+	ingress := &config.FirewallFilter{
+		Name: "wan1-fbf",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "steer", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "WAN1"},
+		},
+	}
+	// A routing-instance filter bound as the SECOND interface's OUTPUT filter.
+	// It is not FBF and must not program any ip rule.
+	egress := &config.FirewallFilter{
+		Name: "wan2-out",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "steer", SourceAddresses: []string{"10.0.2.0/24"}, RoutingInstance: "WAN2"},
+		},
+	}
+	cfg := &config.Config{RoutingInstances: instances}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		ingress.Name: ingress,
+		egress.Name:  egress,
+	}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, FilterInputV4: "wan1-fbf"},
+		}},
+		"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, FilterOutputV4: "wan2-out"},
+		}},
+	}
+
+	rules, err := BuildPBRRules(cfg)
+	if err != nil {
+		t.Fatalf("unexpected build error: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("expected exactly 1 PBR rule (only the ge-0/0/0 input filter), got %d: %+v", len(rules), rules)
+	}
+	if rules[0].Instance != "WAN1" || rules[0].TableID != 100 {
+		t.Errorf("only rule must be WAN1/table 100, got %+v", rules[0])
+	}
+	for i := range rules {
+		if rules[i].Instance == "WAN2" {
+			t.Errorf("ge-0/0/1 OUTPUT filter must not program an FBF rule (no return-path hijack), got %+v", &rules[i])
+		}
+	}
+}
+
+// TestCollectAttachedInputFilters pins the attachment-collection contract that
+// per-interface FBF scoping rests on (#4422): only interface-unit INPUT filters
+// are collected, split by family; OUTPUT filters are excluded; and the same
+// filter attached to several interfaces dedups to a single entry (it is
+// expanded once).
+func TestCollectAttachedInputFilters(t *testing.T) {
+	ifs := &config.InterfacesConfig{
+		Interfaces: map[string]*config.InterfaceConfig{
+			"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0, FilterInputV4: "shared-v4", FilterInputV6: "only-v6"},
+			}},
+			// Same v4 input filter as ge-0/0/0 -> must dedup, not double-count.
+			"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0, FilterInputV4: "shared-v4"},
+			}},
+			// Attachment on a THIRD interface's unit must be honored too.
+			"ge-0/0/2": {Name: "ge-0/0/2", Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0, FilterInputV4: "other-v4", FilterOutputV4: "egress-not-fbf"},
+			}},
+		},
+	}
+	inet, inet6 := collectAttachedInputFilters(ifs)
+
+	if _, ok := inet["shared-v4"]; !ok {
+		t.Error("shared-v4 input filter must be collected")
+	}
+	if _, ok := inet["other-v4"]; !ok {
+		t.Error("other-v4 input filter on ge-0/0/2 must be collected")
+	}
+	if len(inet) != 2 {
+		t.Errorf("inet set = %v, want exactly {shared-v4, other-v4} (dedup shared-v4 across two interfaces)", inet)
+	}
+	if _, ok := inet["egress-not-fbf"]; ok {
+		t.Error("OUTPUT filter egress-not-fbf must NOT be collected as FBF")
+	}
+	if _, ok := inet6["only-v6"]; !ok || len(inet6) != 1 {
+		t.Errorf("inet6 set = %v, want exactly {only-v6}", inet6)
+	}
+	if _, ok := inet6["shared-v4"]; ok {
+		t.Error("v4 filter must not leak into the inet6 set (family split)")
+	}
+}
+
 // NOTE (#1918): the former TestProbeICMP asserted probeICMP("127.0.0.1")
 // returns true (route exists) and probeICMP("not-an-ip") returns false.
 // Both encoded the bug — the old prober returned true on socket-open
