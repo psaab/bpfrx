@@ -43868,3 +43868,6 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4897 — SNMPv3 enforce per-user minimum security level floor in handleV3Packet: an auth-keyed user must authenticate and a privacy-keyed user must use authPriv; drop under-leveled requests (e.g. noAuthNoPriv against an authPriv user) before decoding the scoped PDU. Replaced the "authPriv user served at noAuthNoPriv" test with an authPriv/authNoPriv/noAuth matrix.
   **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_seclevel_test.go, pkg/snmp/README.md
+- **Timestamp**: 2026-07-09
+  **Action**: #4870 — dhcpserver fail-closed on systemctl is-active query error. unitIsActive now returns (bool, error): a recognized state string is authoritative, an undeterminable query (timeout/exec/garbled) returns an error instead of silent "inactive". reconcileFamilyRestart restarts + surfaces the error on an uncertain query (was: skip restart, report success); clearFamilyLocked stops + surfaces the error and the config-unlink error on a removed family.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go, pkg/dhcpserver/dhcpserver_isactive_error_4870_test.go, pkg/dhcpserver/README.md
