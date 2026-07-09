@@ -1,3 +1,25 @@
+## 2026-07-09 — #4422: pin ICMP application type/code attribution (coverage)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4422 slice "ICMP AppID type/code attribution". VERIFY-FIRST:
+  the attribution is CORRECT end-to-end — compiler maps `icmp-type`->ICMPType
+  and `icmp-code`->ICMPCode with no swap (compiler_applications.go), carries
+  both through the wire snapshot (capabilities.go/protocol.go), and both the Go
+  simulator (matchSingleApp) and the Rust matcher (policy.rs icmp_constraints)
+  check query type vs ICMPType and query code vs ICMPCode, code only required
+  when constrained. Builtins carry Junos-correct values (junos-ping=8,
+  junos-pingv6=128, junos-icmp-all/icmp6-all unconstrained). So: COVERAGE test,
+  not a fix. Gap closed: existing match-level tests only exercise TYPE-ONLY apps
+  (junos-ping code=nil), so the icmp-CODE dimension and a type<->code SWAP were
+  unpinned at the operator-facing Match surface. New test compiles a custom app
+  `icmp-guard` (type 3 / code 1 — asymmetric pair) and pins: exact match,
+  swap-catch (type 1 code 3 must deny), wrong-code deny, omitted-code deny,
+  omitted-type deny; a type-only app matching any code; and builtin
+  junos-ping/junos-icmp-all Match verdicts. Confirmed RED-on-regression by
+  injecting a compiler type<->code swap (assertion fired) then reverting.
+  Full Go suite: 53 ok / 0 FAIL.
+- **File(s)**: pkg/policymatch/app_icmp_code_4422_test.go, _Log.md
+
 ## 2026-07-09 — #4670: split tx/dispatch/dispatch_tests.rs into per-concern files
 
 - **Timestamp**: 2026-07-09
