@@ -248,6 +248,36 @@ func appendUniqueString(list []string, v string) []string {
 	return append(list, v)
 }
 
+// addressSetMemberValues extracts every value carried by an address-set
+// `address` / `address-set` member node, across BOTH parser AST shapes
+// (#2419, #4791 — the address-set-member instance of the same dual-shape
+// class as firewallMatchValues in compiler_firewall.go):
+//
+//   - single member          `address a;`             → Keys=["address","a"]
+//   - bracket list            `address [ a b c ];`     → Keys=["address","a","b","c"]
+//     (the lexer strips `[`/`]` and the multi:true schema leaf absorbs every
+//     trailing token onto Keys, so a bracketed list collapses onto ONE node)
+//   - flat set, one line each `set ... address a` +
+//     `set ... address b`                              → one child per value
+//
+// Reading only member.Keys[1] (the pre-#4791 bug) compiles just the first
+// bracket-list entry and silently drops the rest. Reading BOTH Keys[1:] AND
+// each child's Keys[0] covers every shape the parser can produce.
+func addressSetMemberValues(member *Node) []string {
+	var vals []string
+	for _, k := range member.Keys[1:] {
+		if k != "" {
+			vals = append(vals, k)
+		}
+	}
+	for _, vn := range member.Children {
+		if len(vn.Keys) >= 1 && vn.Keys[0] != "" {
+			vals = append(vals, vn.Keys[0])
+		}
+	}
+	return vals
+}
+
 // parseAddressBookEntries folds the `address` / `address-set` children of
 // node into ab. node is either the `global` block under `security
 // address-book` or a zone-local `address-book` block under `security zones
@@ -296,12 +326,12 @@ func parseAddressBookEntries(node *Node, ab *AddressBook) {
 				for _, member := range child.Children {
 					switch member.Name() {
 					case "address":
-						if len(member.Keys) >= 2 {
-							as.Addresses = appendUniqueString(as.Addresses, member.Keys[1])
+						for _, v := range addressSetMemberValues(member) {
+							as.Addresses = appendUniqueString(as.Addresses, v)
 						}
 					case "address-set":
-						if len(member.Keys) >= 2 {
-							as.AddressSets = appendUniqueString(as.AddressSets, member.Keys[1])
+						for _, v := range addressSetMemberValues(member) {
+							as.AddressSets = appendUniqueString(as.AddressSets, v)
 						}
 					}
 				}
