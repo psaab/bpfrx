@@ -84,6 +84,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(test)]
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 pub(super) const NS_PER_SEC: u64 = 1_000_000_000;
@@ -582,6 +584,14 @@ const GC_PERIOD: u32 = 10;
 pub(super) const ALLOCATION_GC_BUDGET: usize = 8;
 const RELEASE_GC_BUDGET: usize = 64;
 const PRESSURE_GC_BUDGET: usize = 64;
+/// #4676: leases reclaimed per short `live` critical section by the chunked
+/// opportunistic GC (`gc_expired_chunked`). The sweep drops the alloc mutex
+/// and frees the reclaimed ports on the lock-free occupancy bitmap between
+/// chunks, so a concurrent `allocate_translation` map-insert is not blocked
+/// for the full sweep. Sized to `ALLOCATION_GC_BUDGET` so the hot-path amortized
+/// GC (budget 8) is a single chunk (no extra lock churn) while the larger
+/// release/idle budgets (64) yield the mutex several times.
+const GC_CHUNK: usize = 8;
 
 #[derive(Debug)]
 struct PortAllocatorShared {
@@ -602,6 +612,13 @@ struct PortAllocatorShared {
     reuses_total: AtomicU64,
     exhaustion_total: AtomicU64,
     max_tracked_flows: usize,
+    /// #4676 test seam: counts how many times `gc_expired_chunked` acquired the
+    /// `live` mutex. A std `Mutex` is non-reentrant, so N > 1 acquisitions over
+    /// a single sweep is proof the sweep RELEASED the lock between chunks (you
+    /// cannot re-acquire a lock you still hold). Reverting the chunking to a
+    /// single critical section collapses this to 1.
+    #[cfg(test)]
+    gc_lock_acquisitions: AtomicUsize,
 }
 
 /// Bounded pool-mode SNAT allocator.
@@ -632,6 +649,8 @@ impl Default for PortAllocator {
                 reuses_total: AtomicU64::new(0),
                 exhaustion_total: AtomicU64::new(0),
                 max_tracked_flows: 0,
+                #[cfg(test)]
+                gc_lock_acquisitions: AtomicUsize::new(0),
             }),
             port_low: 1024,
             port_high: 65535,
@@ -663,6 +682,8 @@ impl PortAllocator {
                 reuses_total: AtomicU64::new(0),
                 exhaustion_total: AtomicU64::new(0),
                 max_tracked_flows,
+                #[cfg(test)]
+                gc_lock_acquisitions: AtomicUsize::new(0),
             }),
             port_low,
             port_high,
@@ -754,6 +775,23 @@ impl PortAllocator {
         if let Some(occ) = self.shared.occupancy.get(addr_index) {
             occ.cursor.store(offset, Ordering::Relaxed);
         }
+    }
+
+    /// Test-only: drive the #4676 chunked opportunistic GC directly (the same
+    /// entry point the hot allocation path and the periodic release path use),
+    /// so a white-box test can assert both the reclaim result and the seam
+    /// (`debug_gc_lock_acquisitions`).
+    #[cfg(test)]
+    pub(super) fn debug_gc_expired_chunked(&self, now_ns: u64, budget: usize) -> usize {
+        self.gc_expired_chunked(now_ns, budget)
+    }
+
+    /// Test-only: how many times `gc_expired_chunked` has acquired the `live`
+    /// mutex. Because a std `Mutex` is non-reentrant, a value > 1 over a single
+    /// sweep is direct proof the sweep RELEASED the lock between chunks.
+    #[cfg(test)]
+    pub(super) fn debug_gc_lock_acquisitions(&self) -> usize {
+        self.shared.gc_lock_acquisitions.load(Ordering::Relaxed)
     }
 
     /// Pick a pool address index for the current address family.
@@ -862,8 +900,16 @@ impl PortAllocator {
                     ip: family_addresses.ip_at(rel),
                     port,
                 };
+                // #4676: run the amortized expiry GC OFF the insert critical
+                // section — chunked, the alloc mutex released between batches,
+                // reclaimed ports freed lock-free. GC touches only the
+                // persistent-lease maps + occupancy while the insert CS below
+                // touches only `live_by_flow`, so the two are disjoint and the
+                // insert CS stays genuinely tiny (the port is already claimed on
+                // the lock-free bitmap, so GC here is opportunistic cleanup, not
+                // load-bearing for this allocation).
+                self.gc_expired_chunked(now_ns, ALLOCATION_GC_BUDGET);
                 let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
-                self.gc_expired_locked(&mut live, now_ns, ALLOCATION_GC_BUDGET);
                 if let Some(existing) = live.live_by_flow.get(&flow) {
                     // Idempotent re-entry for an already-allocated flow (a second
                     // packet racing session install). Give back the port we just
@@ -1174,8 +1220,15 @@ impl PortAllocator {
             );
         }
         live.gc_counter = live.gc_counter.wrapping_add(1);
-        if live.gc_counter % GC_PERIOD == 0 {
-            self.gc_expired_locked(&mut live, now_ns, RELEASE_GC_BUDGET);
+        let run_gc = live.gc_counter % GC_PERIOD == 0;
+        // #4676: drop the release guard BEFORE the periodic idle-lease sweep so
+        // the (up to RELEASE_GC_BUDGET) sweep runs chunked with the alloc mutex
+        // released between batches instead of blocking concurrent allocations
+        // for the whole sweep. The release mutations above are already committed
+        // under this guard, so the GC re-locking a fresh guard observes them.
+        drop(live);
+        if run_gc {
+            self.gc_expired_chunked(now_ns, RELEASE_GC_BUDGET);
         }
         true
     }
@@ -1476,11 +1529,117 @@ impl PortAllocator {
         }
     }
 
+    /// #4676: run the opportunistic global expiry GC WITHOUT holding the alloc
+    /// mutex across the whole sweep.
+    ///
+    /// The sweep is chunked: each chunk collects up to `GC_CHUNK` expired
+    /// leases from the global expiration index under a SHORT `live` critical
+    /// section (the map mutations that MUST be serialized), releases the guard,
+    /// then frees those ports on the lock-free occupancy bitmap
+    /// (`AddressOccupancy::free_recycle`, a `fetch_and` + per-address recycle
+    /// push) with `live` NOT held. Releasing `live` between chunks lets a
+    /// concurrent `allocate_translation` acquire the mutex for its tiny
+    /// `live_by_flow` insert instead of blocking for the full sweep — the
+    /// Phase-1 (#2852) residual this addresses.
+    ///
+    /// Safety: each reclaim stays idempotent. Under the short CS the lease is
+    /// re-checked (`active_flows == 0 && expires_at_ns` matches) before removal,
+    /// so a concurrent `release_flow`/`rollback_flow` that refreshed or bumped
+    /// the lease is skipped. The port bit is the ownership token and stays SET
+    /// from lease removal until we free it, so a concurrent `claim()` cannot
+    /// re-hand-out the port in the gap (no double-claim); once freed it returns
+    /// to the pool. `budget` bounds total reclaims (amortized GC). This is
+    /// disjoint from the caller's insert CS: GC touches only
+    /// `persistent_by_source` + the expiration indexes + occupancy, never
+    /// `live_by_flow`, so running it in its own lock scope is behaviorally
+    /// equivalent to the pre-#4676 nested call.
+    fn gc_expired_chunked(&self, now_ns: u64, budget: usize) -> usize {
+        if now_ns == 0 || budget == 0 {
+            return 0;
+        }
+        let mut reclaimed = 0;
+        let mut freed: Vec<(usize, u16)> = Vec::new();
+        while reclaimed < budget {
+            let chunk = (budget - reclaimed).min(GC_CHUNK);
+            freed.clear();
+            let collected = {
+                let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+                #[cfg(test)]
+                self.shared
+                    .gc_lock_acquisitions
+                    .fetch_add(1, Ordering::Relaxed);
+                self.collect_expired_global_locked(&mut live, now_ns, chunk, &mut freed)
+                // `live` guard dropped here, BEFORE the lock-free port frees
+                // below and BEFORE the loop re-acquires it for the next chunk.
+            };
+            for &(addr_index, port) in &freed {
+                self.free_translated_port(addr_index, port, true);
+            }
+            reclaimed += collected;
+            if collected < chunk {
+                // A short chunk means the expired frontier is exhausted (the
+                // earliest remaining lease is not yet expired, or the index is
+                // empty). Stop instead of re-locking for a guaranteed-empty
+                // chunk. Any lease that expires later is reclaimed by a
+                // subsequent amortized GC pass — GC is opportunistic, never the
+                // sole reclaim path.
+                break;
+            }
+        }
+        reclaimed
+    }
+
+    /// Nested (guard-held) global expiry GC for the near-capacity pressure
+    /// fallback in `allocate_translation_locked`, where `live` is held across
+    /// the whole claim+insert and cannot be released mid-flight. Shares the
+    /// `collect_expired_global_locked` primitive with the chunked path; the
+    /// only difference is that the reclaimed ports are freed inline while the
+    /// caller still holds `live` (unchanged pre-#4676 behavior).
     fn gc_expired_locked(
         &self,
         live: &mut PortAllocatorLiveState,
         now_ns: u64,
         budget: usize,
+    ) -> usize {
+        let mut freed: Vec<(usize, u16)> = Vec::new();
+        let reclaimed = self.collect_expired_global_locked(live, now_ns, budget, &mut freed);
+        for (addr_index, port) in freed {
+            self.free_translated_port(addr_index, port, true);
+        }
+        reclaimed
+    }
+
+    /// Nested (guard-held) per-address expiry GC for the pressure fallback.
+    /// Same guard-held free discipline as `gc_expired_locked`.
+    fn gc_expired_for_addr_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        addr_index: usize,
+        now_ns: u64,
+        budget: usize,
+    ) -> usize {
+        let mut freed: Vec<(usize, u16)> = Vec::new();
+        let reclaimed =
+            self.collect_expired_for_addr_locked(live, addr_index, now_ns, budget, &mut freed);
+        for (addr_index, port) in freed {
+            self.free_translated_port(addr_index, port, true);
+        }
+        reclaimed
+    }
+
+    /// Collect up to `budget` expired idle leases from the GLOBAL expiration
+    /// index under a HELD `live` guard: pop the earliest-expiring entries,
+    /// remove them from `persistent_by_source` and both expiration indexes, and
+    /// record each reclaimed lease's `(addr_index, port)` in `freed` for the
+    /// caller to release on the lock-free occupancy bitmap. Returns the count
+    /// collected. Does NOT touch the occupancy bitmap — port release is
+    /// deferred so it need not be serialized behind the alloc mutex (#4676).
+    fn collect_expired_global_locked(
+        &self,
+        live: &mut PortAllocatorLiveState,
+        now_ns: u64,
+        budget: usize,
+        freed: &mut Vec<(usize, u16)>,
     ) -> usize {
         if now_ns == 0 || budget == 0 {
             return 0;
@@ -1499,19 +1658,23 @@ impl PortAllocator {
                     by_addr.remove(&(expires_at_ns, key));
                 }
             }
-            if self.release_expired_lease_locked(live, key, expires_at_ns) {
+            if self.reclaim_expired_lease_locked(live, key, expires_at_ns, freed) {
                 reclaimed += 1;
             }
         }
         reclaimed
     }
 
-    fn gc_expired_for_addr_locked(
+    /// Per-address variant of `collect_expired_global_locked`: pops from
+    /// `lease_expirations_by_addr[addr_index]` (and mirrors the removal into the
+    /// global index). Records reclaimed ports into `freed`.
+    fn collect_expired_for_addr_locked(
         &self,
         live: &mut PortAllocatorLiveState,
         addr_index: usize,
         now_ns: u64,
         budget: usize,
+        freed: &mut Vec<(usize, u16)>,
     ) -> usize {
         if now_ns == 0 || budget == 0 || addr_index >= live.lease_expirations_by_addr.len() {
             return 0;
@@ -1530,18 +1693,26 @@ impl PortAllocator {
             }
             live.lease_expirations_by_addr[addr_index].remove(&(expires_at_ns, key));
             live.lease_expirations.remove(&(expires_at_ns, key));
-            if self.release_expired_lease_locked(live, key, expires_at_ns) {
+            if self.reclaim_expired_lease_locked(live, key, expires_at_ns, freed) {
                 reclaimed += 1;
             }
         }
         reclaimed
     }
 
-    fn release_expired_lease_locked(
+    /// Remove one expired idle lease from `persistent_by_source` under a HELD
+    /// `live` guard and RECORD its `(addr_index, port)` in `freed` — it does NOT
+    /// clear the occupancy bit (the caller frees the collected ports, possibly
+    /// after dropping `live`, keeping the lock-free bitmap op off the alloc
+    /// mutex, #4676). Re-checks the lease is still idle and its expiry still
+    /// matches so a concurrent refresh/rollback is not clobbered. Returns true
+    /// iff a lease was reclaimed.
+    fn reclaim_expired_lease_locked(
         &self,
         live: &mut PortAllocatorLiveState,
         key: PersistentSourceKey,
         expires_at_ns: u64,
+        freed: &mut Vec<(usize, u16)>,
     ) -> bool {
         let Some(lease) = live.persistent_by_source.get(&key).copied() else {
             return false;
@@ -1551,10 +1722,13 @@ impl PortAllocator {
         }
         // The lease still exists and is idle: its occupancy bit is still set
         // (no other allocation could have claimed it while the lease held it —
-        // the bit is the ownership token). Remove the lease and free its port
-        // (recycle). If the bit was somehow already clear the free is a no-op.
+        // the bit is the ownership token). Remove the lease and record its port
+        // so the caller frees it (recycle). Because the bit stays set until that
+        // free, a concurrent claim cannot re-hand-out the port even after the
+        // lease is gone from the map.
         live.persistent_by_source.remove(&key);
-        self.free_translated_port(lease.addr_index, lease.translated.port, true)
+        freed.push((lease.addr_index, lease.translated.port));
+        true
     }
 }
 
