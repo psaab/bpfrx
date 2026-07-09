@@ -50,20 +50,36 @@ func resolveInterfaceAddr(ifname, fallback string) string {
 	return fallback
 }
 
-// hostIsLoopback reports whether a bind host string is a loopback address. An
-// empty or unparseable host is treated as loopback (safe — do NOT clamp on
-// uncertainty and break a legitimate bind); resolveInterfaceAddr always returns
-// a literal IP (or the loopback fallback), so in practice host is a parseable
-// IP. Used by the #4047 part-B runtime clamp (daemon_run.go) to decide whether a
+// hostIsLoopback reports whether a bind host string is a loopback address.
+// Used by the #4047 part-B runtime clamp (daemon_run.go) to decide whether a
 // no-auth web-management bind is network-reachable and must be pulled back to
 // loopback.
+//
+// An EMPTY host is the Go wildcard bind spelling — `net.SplitHostPort(":8080")`
+// yields host "" and listens on ALL interfaces (0.0.0.0 / ::). It is emphatically
+// NOT loopback. Treating it as loopback (the pre-#4903 behaviour) let an
+// unauthenticated `--api-addr :8080` escape the clamp and expose the mutating
+// REST surface network-wide (#4903), exactly the exposure this clamp exists to
+// prevent. An unparseable, non-loopback host is likewise treated as NON-loopback
+// so the no-auth clamp errs toward pulling the bind back to loopback (fail safe)
+// rather than leaving a possibly network-reachable bind exposed. The lone
+// exception is the literal hostname "localhost": it is not a parseable IP but is
+// a legitimate loopback bind spelling that conventionally resolves to loopback,
+// so it stays classified as loopback and is not clamped.
 func hostIsLoopback(host string) bool {
 	if host == "" {
+		// Wildcard bind (all interfaces) — never loopback.
+		return false
+	}
+	if host == "localhost" {
+		// Not a parseable IP, but a legitimate loopback bind spelling.
 		return true
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		return true
+		// Unparseable and not "localhost": fail safe, treat as non-loopback so
+		// a no-auth bind gets clamped rather than left exposed.
+		return false
 	}
 	return ip.IsLoopback()
 }
@@ -75,10 +91,13 @@ func hostIsLoopback(host string) bool {
 // AND unauthenticated — that is the exact case where the unauthenticated
 // mutating config endpoints would otherwise be reachable from the network. The
 // clamp targets a loopback of the SAME address family (::1 for an IPv6 bind,
-// 127.0.0.1 for IPv4) and preserves the port. An authenticated bind, a loopback
-// bind, or an unparseable address is returned unchanged (do not clamp on
-// uncertainty and break a legitimate bind — resolveInterfaceAddr yields a
-// literal IP, so an unparseable host is not expected in practice).
+// 127.0.0.1 for IPv4) and preserves the port. An authenticated bind or a
+// genuine loopback bind (127.0.0.0/8, ::1, or the literal "localhost") is
+// returned unchanged. A bind whose host part fails to parse as an address
+// (`net.SplitHostPort` errors, e.g. a bare no-port string) is also returned
+// unchanged, since there is no port to clamp; but a parsed wildcard/empty or
+// unparseable-but-split host is now classified NON-loopback by hostIsLoopback
+// and clamped when no-auth (fail safe, #4903).
 func clampBindToLoopback(addr string, hasAuth bool) (string, bool) {
 	if hasAuth {
 		return addr, false
