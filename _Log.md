@@ -43892,3 +43892,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4828 — fix AB-BA deadlock in cluster Manager.Start. Start no longer holds m.mu across the previous monitor's Stop(): the monitor poll goroutine calls SetMonitorWeight (takes m.mu) and Stop() joins it via wg.Wait(), so m.mu held across Stop() vs. m.mu wanted by the poll callback is a lock-order inversion that froze the whole HA manager on any config reload racing a monitor state change. Start now serializes on a dedicated monStartMu, takes m.mu only to swap the m.monitor pointer, and runs old.Stop()/new.Start() outside m.mu (mirrors hbStartMu/StartHeartbeat #4033). Added RED-on-revert deadlock reproduction test.
   **File(s)**: pkg/cluster/manager.go, pkg/cluster/manager_start_deadlock_test.go, pkg/cluster/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4885 zone-detail includes wildcard/any->any zone-pairs, renders in runtime tier order (exact, single-wildcard, both-any)
+  **File(s)**: pkg/policymatch/zone_detail_summary.go, pkg/policymatch/zone_detail_summary_test.go
