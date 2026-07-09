@@ -43617,3 +43617,18 @@ top.
   pkg/dataplane/userspace/format/status_golden_test.go,
   pkg/dataplane/userspace/format/testdata/status_summary.golden,
   docs/junos-cli-reference.md, _Log.md
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 daemon_run.go Run() decompose — plan v1 (Increment 1: extract runShutdownSequence 1709-1866 + phase-boundary banners; conservative defer-clean tail extract, zero behavior change)
+  **File(s)**: docs/pr/4662-daemon-run-decompose/plan.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 1 — extract runShutdownSequence (daemon_run.go teardown 1696-1858, byte-identical body) from Run(); Run() ends by delegating. sync already imported; build+vet+daemon-suite green
+  **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 2 — extract startGRPCServer (gRPC API server startup block, PHASE 5 tail) from Run(); byte-identical body (dedent verified), 4 params (ctx, wg, eventBuf, fwdSampler). Leaf block, no ordering dependency
+  **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 3 — extract startHTTPServer (HTTP REST API server startup block, 278 lines, PHASE 5) from Run(); byte-identical body (dedent verified), 3 params (ctx, wg, eventBuf), guard stays in Run(). Leaf block, no ordering dependency
+  **File(s)**: pkg/daemon/daemon_run.go
