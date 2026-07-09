@@ -290,5 +290,5 @@ fn cos_queue_pop_known_bucket_inner(
 }
 
 #[cfg(test)]
-#[path = "pop_tests.rs"]
+#[path = "pop_tests/mod.rs"]
 mod tests;

@@ -398,7 +398,6 @@ pub(in crate::afxdp) fn cos_exact_queue_serviceable(
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
 
 // #1763 — fused select+pop fairness-neutrality differential test (the

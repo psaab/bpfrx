@@ -276,5 +276,5 @@ pub(in crate::afxdp) fn cos_queue_v_min_continue(
 }
 
 #[cfg(test)]
-#[path = "v_min_tests.rs"]
+#[path = "v_min_tests/mod.rs"]
 mod tests;

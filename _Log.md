@@ -43261,3 +43261,21 @@ top.
   under -race as root.
 - **File(s)**: pkg/dataplane/maps_session.go,
   pkg/dataplane/maps_session_clear_test.go, _Log.md
+- **Timestamp**: 2026-07-09
+- **Action**: #4666 — split cos/queue_ops oversized test files into per-concern
+  sibling files (pure test-code motion). tests.rs (1749) → tests/{admission,
+  bookkeeping,flow_fair_enable,bench,promotion,cap_aware}.rs; pop_tests.rs
+  (2060) → pop_tests/{ordering,rollback,snapshot_stack}.rs; v_min_tests.rs
+  (1992) → v_min_tests/{publish,throttle,vacate,hard_cap,prepared_drain,
+  cadence,rejoiner}.rs. Each subdir gets a mod.rs holding the verbatim shared
+  header (comment + imports) plus `mod X;` decls; each concern file reaches it
+  via `use super::*;`. Parent decls updated: mod.rs drops `#[path="tests.rs"]`
+  → plain `mod tests;`; pop.rs/v_min.rs repoint `#[path]` at the new subdir
+  mod.rs. Byte-identical: reconstruction of header+concern bodies == original
+  for all 3 files; #[test] count 76==76; code-line multiset diff = only 16
+  `mod` decls + 16 `use super::*;` added, ZERO original lines missing. No
+  production logic touched. Gates: cargo build clean; full serial suite
+  3860 passed / 0 failed / 2 ignored (baseline match); queue_ops subset 88/0.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_ops/{mod,pop,v_min}.rs,
+  queue_ops/tests/*.rs, queue_ops/pop_tests/*.rs, queue_ops/v_min_tests/*.rs,
+  _Log.md
