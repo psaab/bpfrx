@@ -43862,3 +43862,6 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4897 — SNMPv3 enforce per-user minimum security level floor in handleV3Packet: an auth-keyed user must authenticate and a privacy-keyed user must use authPriv; drop under-leveled requests (e.g. noAuthNoPriv against an authPriv user) before decoding the scoped PDU. Replaced the "authPriv user served at noAuthNoPriv" test with an authPriv/authNoPriv/noAuth matrix.
   **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_seclevel_test.go, pkg/snmp/README.md
+- **Timestamp**: 2026-07-09
+  **Action**: #4863 — deterministic NAPT64 (mode 2) validate the FULL configured subscriber prefix in deterministic_indices_v6, not just the 32-bit subscriber word: reject any IPv6 source whose prefix bytes before the subscriber word (src_octets[..off]) differ from host_base (/32 → octets[0..4], /64 → octets[0..8]). Fixes cross-tenant block assignment + lying stateless reverse map when an out-of-prefix source shares the subscriber word. Drop-only tightening; in-prefix path unchanged. Added RED-on-revert test (out-of-prefix /32 + /64 rejected, in-prefix maps + reverses correctly); updated docs/deterministic-nat-cgnat.md.
+  **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests_pool.rs, docs/deterministic-nat-cgnat.md
