@@ -22,7 +22,10 @@ import (
 //   - runSystemctl: replaces the real `systemctl <args...>` shell-out
 //     (restart/stop). Return nil for success.
 //   - unitActive: replaces the `systemctl is-active <unit>` query used
-//     for authoritative reconcile (#1778).
+//     for authoritative reconcile (#1778). This convenience seam wraps a
+//     bool-only fake as always-succeeding (nil query error); tests that
+//     need to exercise the #4870 fail-closed query-error path inject an
+//     error-returning fake via SetUnitActiveForTesting.
 func NewManagerForTesting(
 	confPath4, confPath6 string,
 	runSystemctl func(args ...string) error,
@@ -32,9 +35,17 @@ func NewManagerForTesting(
 		confPath4:    confPath4,
 		confPath6:    confPath6,
 		runSystemctl: runSystemctl,
-		unitActive:   unitActive,
+		unitActive:   func(unit string) (bool, error) { return unitActive(unit), nil },
 		warn:         slog.Warn,
 	}
+}
+
+// SetUnitActiveForTesting overrides the `systemctl is-active` seam with a
+// tri-state fake so tests can exercise the #4870 fail-closed path where
+// the query itself fails (timeout/exec error) rather than returning a
+// definitive active/inactive answer.
+func (m *Manager) SetUnitActiveForTesting(fn func(unit string) (bool, error)) {
+	m.unitActive = fn
 }
 
 // SetLeaseSyncSeamsForTesting injects the #2239 lease-sync test seams: a

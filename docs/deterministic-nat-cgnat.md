@@ -92,6 +92,15 @@ after the configured prefix:
 Only `/32` and `/64` prefix lengths are supported for IPv6 host addresses (any
 other length is hard-rejected at commit: `IPv6 host prefix must be /32 or /64`).
 
+The source must lie **inside the configured subscriber prefix**: the subscriber
+index is derived from the 32-bit word alone, so a source in a DIFFERENT prefix
+that happens to share that word would otherwise be mapped into the in-prefix
+subscriber's fixed block, and the stateless reverse map (which reconstructs from
+`host_base`) would attribute it to the WRONG subscriber. `deterministic_indices_v6`
+therefore rejects any source whose prefix bytes before the subscriber word differ
+from `host_base` (`/32` → `octets[0..4]`, `/64` → `octets[0..8]`); an
+out-of-prefix source fails CLOSED rather than being translated (#4863).
+
 **The pool must be referenced by a `security nat nat64` rule-set as its
 `source-pool`** — mode-2 enforcement lives on the NAT64 forward path (the v6→v4
 translation). A `/32` or `/64` deterministic pool NOT wired to a NAT64 rule-set
@@ -271,7 +280,7 @@ reused while a session is alive.
 | `pkg/dataplane/userspace/nat64.go` | `deterministicNAT64V6Fields()` computes `block_size`/`blocks_per_ip` (against the FIXED NAT64 range)/`host_prefix_len` (32 or 64)/`host_base_v6` from the referenced source pool, and `buildNAT64Snapshots` stamps them on `NAT64RuleSnapshot`. Only a `/32`-or-`/64` IPv6 host referenced by a NAT64 rule-set yields the params; anything else stays zero (round-robin + advisory). |
 | `pkg/dataplane/userspace/protocol.go` | `NAT64RuleSnapshot` gains the four additive `deterministic_*` wire fields (omitempty, #1961 skew-safe). |
 | `userspace-dp/src/protocol/nat.rs` | Rust mirror of the four NAT64 wire fields (`#[serde(default)]`). |
-| `userspace-dp/src/nat/allocator.rs` | `DeterministicV6` params; `deterministic_indices_v6()` (IPv6 subscriber → `(ip_idx, block_idx)` from the 32-bit word after the prefix — offset 4 for `/32`, offset 8 for `/64`); `allocate_deterministic_v6()` (mirrors the v4 claim, collision-free, not recycled); `reverse_deterministic_v6()` (`(external IPv4, port)` → subscriber IPv6 prefix, no per-flow state). |
+| `userspace-dp/src/nat/allocator.rs` | `DeterministicV6` params; `deterministic_indices_v6()` (IPv6 subscriber → `(ip_idx, block_idx)` from the 32-bit word after the prefix — offset 4 for `/32`, offset 8 for `/64`; #4863 rejects sources whose prefix bytes before the subscriber word differ from `host_base`, so an out-of-prefix source sharing the subscriber word fails CLOSED instead of stealing the in-prefix subscriber's block); `allocate_deterministic_v6()` (mirrors the v4 claim, collision-free, not recycled); `reverse_deterministic_v6()` (`(external IPv4, port)` → subscriber IPv6 prefix, no per-flow state). |
 | `userspace-dp/src/nat64.rs` | `Nat64Prefix` gains `deterministic_v6: Option<DeterministicV6>`, built from the snapshot at `from_snapshots` time (`host_count` derived from the parsed pool size, pool-bounded). `allocate_source` routes through `allocate_deterministic_v6` when set. An out-of-range subscriber fails CLOSED. |
 | `pkg/config/compiler_validate_warn.go` | The #4560 advisory is narrowed to residual UNENFORCEABLE deterministic pools only (an IPv6 host not referenced by a NAT64 rule-set, or an unsupported prefix length); an enforced mode-1 or mode-2 pool no longer warns (`deterministicIPv4Enforced` / `deterministicNAPT64Enforced`). |
 

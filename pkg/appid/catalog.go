@@ -99,6 +99,19 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 			// keep in step with).
 			continue
 		}
+		if app == nil {
+			// #4865: a tolerated nil user-application value
+			// (cfg.Applications.Applications["x"] = nil, e.g. a JSON null
+			// decoding to a nil pointer on a lenient/HA-synced load, #3494)
+			// resolves as (nil, true) — ResolveApplication reports found=true,
+			// so the !found guard above does NOT catch it, and dereferencing
+			// app.Protocol below would panic BuildCatalog during snapshot/apply,
+			// turning the tolerant "warn/skip and keep running" posture into a
+			// control-plane crash. Skip it exactly like the not-found case and do
+			// NOT consume an id slot (compileApplications rejects the nil app
+			// before producing AppNames, so there is no id to keep in step with).
+			continue
+		}
 
 		proto := catalogProtocolNumber(app.Protocol)
 
