@@ -253,9 +253,35 @@ func ExtractPCIAddr(path string) string {
 	return last
 }
 
+// classifyNetdev decides whether a /sys/class/net entry is a mappable physical
+// NIC and extracts its PCI address (empty for a non-PCI bus). devErr is the
+// error from resolving the entry's `device` symlink and devReal its resolved
+// target when devErr == nil.
+//
+// A physical NIC — PCI, USB, platform, or SoC — exposes a `device` symlink and
+// is KEPT even when it has no PCI address, so a `key mac` device-map entry can
+// still bind it (#4884). Before this, ANY NIC without a PCI address was dropped
+// from the inventory BEFORE its permanent MAC was read, so on a bare-metal /
+// SoC / USB-NIC appliance a valid MAC-only mapping never saw its target and the
+// interface was stranded (marked unbound). A purely virtual netdev — loopback,
+// bridge, veth, bond, vlan, vrf, tun/tap, and the xpf-created VRF/tunnel
+// devices — has no `device` symlink and is dropped: it is not a mappable
+// hardware NIC and would only flood the inventory / `candidates` list.
+func classifyNetdev(name, devReal string, devErr error) (pci string, keep bool) {
+	if name == "lo" {
+		return "", false
+	}
+	if devErr != nil {
+		return "", false // virtual netdev — no backing hardware device
+	}
+	return ExtractPCIAddr(devReal), true
+}
+
 // EnumeratePresentNICs builds the present-NIC inventory from sysfs + netlink:
-// current kernel name, PCI address, permanent (factory) MAC, running MAC, and
-// link state. Sorted by PCI address for stable output.
+// current kernel name, PCI address (empty for non-PCI buses), permanent
+// (factory) MAC, running MAC, and link state. Sorted by PCI address, then
+// kernel name, for stable output (non-PCI NICs share an empty PCI address, so
+// the name tiebreak keeps their order deterministic).
 func EnumeratePresentNICs() ([]PresentNIC, error) {
 	entries, err := os.ReadDir("/sys/class/net")
 	if err != nil {
@@ -264,15 +290,9 @@ func EnumeratePresentNICs() ([]PresentNIC, error) {
 	var nics []PresentNIC
 	for _, e := range entries {
 		name := e.Name()
-		if name == "lo" {
-			continue
-		}
-		devReal, err := filepath.EvalSymlinks(filepath.Join("/sys/class/net", name, "device"))
-		if err != nil {
-			continue // not a PCI device
-		}
-		pci := ExtractPCIAddr(devReal)
-		if pci == "" {
+		devReal, derr := filepath.EvalSymlinks(filepath.Join("/sys/class/net", name, "device"))
+		pci, keep := classifyNetdev(name, devReal, derr)
+		if !keep {
 			continue
 		}
 		nic := PresentNIC{Name: name, PCIAddr: pci}
@@ -286,6 +306,11 @@ func EnumeratePresentNICs() ([]PresentNIC, error) {
 		}
 		nics = append(nics, nic)
 	}
-	sort.Slice(nics, func(i, j int) bool { return nics[i].PCIAddr < nics[j].PCIAddr })
+	sort.Slice(nics, func(i, j int) bool {
+		if nics[i].PCIAddr != nics[j].PCIAddr {
+			return nics[i].PCIAddr < nics[j].PCIAddr
+		}
+		return nics[i].Name < nics[j].Name
+	})
 	return nics, nil
 }

@@ -214,25 +214,89 @@ func TestSchemaValidate_ChassisCluster_HierarchicalRejectsGarbageInterval(t *tes
 	}
 }
 
-// Documented contract pin (NOT an endorsement): the hierarchical packed
-// one-liner `node 0 priority <v>;` carries the priority INSIDE the
-// instance node's own Keys. The PR-1 walker's compiler-faithful rule
-// consumes only the identity tokens of a named-instance container and
-// ignores the rest, so this shape bypasses the typed-leaf gate even
-// though compileChassis happens to read the inline tokens. Rejecting it
-// would require a new walker feature (out of PR-2 scope; see
-// docs/config-schema.md). The flat-set form of the same statement IS
-// validated (see the matrix above) because SetPath groups `priority` into
-// its own child node.
-func TestSchemaValidate_ChassisCluster_PackedOneLinerBypassesGate(t *testing.T) {
-	if err := schemaCheck(t, `chassis {
+// #4880: the hierarchical packed one-liner `node 0 priority <v>;` carries the
+// priority INSIDE the instance node's own Keys. The walker's compiler-faithful
+// rule consumes only the identity tokens of a named-instance container and
+// ignores the rest, so this shape still slips past the typed-leaf schema gate
+// (SchemaValidate) — that walker limitation is unchanged. But compileChassis
+// reads the inline priority into NodePriorities, and it flows to VRRP
+// (uint8-truncated on the wire) and the private control-link election (raw
+// int), so an out-of-range value both truncates and diverges the two election
+// views. A post-compile range gate (validateChassisClusterStrict) now rejects
+// it at commit, matching the flat-set / expanded shape which the schema leaf
+// already gates. This was previously a contract-pin ACCEPTANCE test; it is now
+// a rejection test at the compile layer.
+func TestCompile_ChassisCluster_PackedOneLinerPriorityRejected(t *testing.T) {
+	packed := `chassis {
     cluster {
         redundancy-group 1 {
             node 0 priority 999;
         }
     }
-}`); err != nil {
-		t.Fatalf("packed one-liner is (deliberately) not validated; got: %v", err)
+}`
+	// The walker still does not catch the packed shape — SchemaValidate passes.
+	if err := schemaCheck(t, packed); err != nil {
+		t.Fatalf("SchemaValidate is expected to still pass the packed shape "+
+			"(unchanged walker limitation); got: %v", err)
+	}
+	// The post-compile gate rejects it.
+	tree, errs := config.NewParser(packed).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if _, err := config.CompileConfig(tree); err == nil {
+		t.Fatal("packed one-liner priority 999 must be rejected at compile")
+	} else if !strings.Contains(err.Error(), "priority") || !strings.Contains(err.Error(), "999") {
+		t.Fatalf("compile error should name the out-of-range priority: %v", err)
+	}
+
+	// A valid packed priority compiles clean (no over-eager rejection).
+	okTree, errs := config.NewParser(`chassis {
+    cluster {
+        redundancy-group 1 {
+            node 0 priority 200;
+        }
+    }
+}`).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if _, err := config.CompileConfig(okTree); err != nil {
+		t.Fatalf("valid packed priority 200 must compile: %v", err)
+	}
+}
+
+// TestCompile_ChassisCluster_PriorityGateClosesBothShapes asserts the #4880
+// post-compile priority gate is SHAPE-AGNOSTIC: it catches the flat-set /
+// expanded shape (priority in its own child node, built via ParseSetCommand +
+// SetPath) at the same compile layer, so the packed and expanded shapes can no
+// longer disagree. (The schema leaf also rejects the expanded shape earlier at
+// SchemaValidate; this pins the compile backstop directly.)
+func TestCompile_ChassisCluster_PriorityGateClosesBothShapes(t *testing.T) {
+	badTree := &config.ConfigTree{}
+	path, err := config.ParseSetCommand("set chassis cluster redundancy-group 1 node 0 priority 999")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := badTree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	if _, err := config.CompileConfig(badTree); err == nil {
+		t.Fatal("flat-set expanded priority 999 must be rejected at the compile gate")
+	} else if !strings.Contains(err.Error(), "priority") || !strings.Contains(err.Error(), "999") {
+		t.Fatalf("compile error should name the out-of-range priority: %v", err)
+	}
+
+	okTree := &config.ConfigTree{}
+	okPath, err := config.ParseSetCommand("set chassis cluster redundancy-group 1 node 0 priority 200")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := okTree.SetPath(okPath); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	if _, err := config.CompileConfig(okTree); err != nil {
+		t.Fatalf("valid flat-set priority 200 must compile: %v", err)
 	}
 }
 
