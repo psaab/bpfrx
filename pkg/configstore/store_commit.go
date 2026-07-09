@@ -575,13 +575,33 @@ func (s *Store) Rollback(n int) error {
 		return nil
 	}
 
-	entry, err := s.history.Get(n - 1)
+	entry, err := s.rollbackEntry(n)
 	if err != nil {
 		return err
 	}
 	s.candidate = entry.Config.Clone()
 	s.dirty = true
 	return nil
+}
+
+// rollbackEntry resolves rollback slot n (1-based) to its HistoryEntry.
+// It returns a clear error both when n is out of range and when the slot
+// was tombstoned at load time because its on-disk file could not be read
+// or parsed (#4810) — the caller must never silently fall through to a
+// DIFFERENT slot's config just because an intermediate slot was skipped.
+// See loadRollbackHistory: a tombstone (HistoryEntry with a nil Config)
+// occupies the slot's exact position so `rollback N` / `show ... rollback
+// N` always resolve slot N, never slot N+1. Callers must hold s.mu (read
+// or write — History reads are not independently synchronized).
+func (s *Store) rollbackEntry(n int) (*HistoryEntry, error) {
+	entry, err := s.history.Get(n - 1)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Config == nil {
+		return nil, fmt.Errorf("rollback slot %d is unreadable (failed to load at startup); see log for detail", n)
+	}
+	return entry, nil
 }
 
 // ListHistory returns all history entries, most recent first (goroutine-safe).
@@ -713,6 +733,17 @@ func (s *Store) saveRollbackFiles() {
 	entries := s.history.List() // most-recent-first
 	degraded := false
 	for i, entry := range entries {
+		if entry.Config == nil {
+			// #4810: a tombstoned slot (unreadable/corrupt at load, see
+			// loadRollbackHistory) has no config text to persist. Leave
+			// its on-disk file untouched — writing would dereference a
+			// nil Config, and removing it would let a NEXT boot's
+			// os.IsNotExist break() truncate every slot after it. The
+			// slot stays visibly broken (same tombstone next boot) until
+			// an operator fixes it out-of-band, instead of silently
+			// losing later, otherwise-fine slots.
+			continue
+		}
 		path := s.rollbackPath(i + 1)
 		data := entry.Config.Format()
 		var err error
@@ -796,7 +827,16 @@ func (s *Store) loadRollbackHistory() {
 			if os.IsNotExist(err) {
 				break
 			}
+			// #4810: continuing must NOT bare-skip this slot — appending
+			// nothing here collapses every LATER slot's position in
+			// `entries` down by one. Since position maps 1:1 onto the
+			// user-facing `rollback N` index (History.Get(N-1)), that
+			// silently redirected `rollback N` to slot N+1's config.
+			// Push a tombstone (nil Config) so the position is preserved;
+			// rollbackEntry() rejects a tombstone with a clear error
+			// instead of ever returning the wrong generation.
 			slog.Warn("error reading rollback file, continuing", "path", path, "err", err)
+			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
 			continue
 		}
 		parser := config.NewParser(string(data))
@@ -808,8 +848,13 @@ func (s *Store) loadRollbackHistory() {
 			// VALUE (e.g. an unterminated `pre-shared-key "SECRET…`). Forwarding
 			// errs[0] / the ParseError text would echo secret file content into
 			// the log. Line/Column are ints and cannot hold a token.
+			//
+			// #4810: same positional-integrity reasoning as the read-error
+			// branch above — a corrupt-but-readable slot also tombstones
+			// rather than shifting later slots' indices.
 			slog.Warn("skipping corrupt rollback file",
 				"path", path, "line", errs[0].Line, "column", errs[0].Column)
+			entries = append(entries, &HistoryEntry{Timestamp: time.Now()})
 			continue
 		}
 		// Use file modification time as timestamp
