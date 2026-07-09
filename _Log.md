@@ -42581,6 +42581,30 @@ top.
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md, _Log.md
 
+---
+
+- **Timestamp**: 2026-07-08
+- **Action**: #4651 pure code-motion refactor — split the 1165-LOC
+  `event_stream/codec.rs` wire-codec monolith into a `codec/` module dir with
+  four wire-format submodules (`wire`, `session_sync`, `rt_flow`, `decode`) plus
+  a `mod.rs` re-export shell. `EventFrame` struct + its introspection impl kept
+  in `codec/mod.rs` so its `pub(super)` (== `pub(in event_stream)`) fields/methods
+  keep identical visibility. `codec_tests.rs` moved into `codec/` (path-loaded
+  test module unchanged; external-type imports it used to get via codec.rs's
+  top-level `use` lines added directly). Byte-identical bodies: 74 fn/struct/
+  enum/const decls, same signatures, zero body diffs (only comment/banner glue
+  added; formerly module-private helpers gained `pub(super)` == same
+  crate-internal scope). Validation: `cargo build` clean; FULL cargo test suite
+  SERIAL (`--test-threads=1`) 3854 passed / 0 failed / 2 ignored;
+  `event_stream` subset 85/0.
+- **File(s)**: userspace-dp/src/event_stream/codec/mod.rs (new),
+  userspace-dp/src/event_stream/codec/wire.rs (new),
+  userspace-dp/src/event_stream/codec/session_sync.rs (new),
+  userspace-dp/src/event_stream/codec/rt_flow.rs (new),
+  userspace-dp/src/event_stream/codec/decode.rs (new),
+  userspace-dp/src/event_stream/codec/codec_tests.rs (moved from
+  userspace-dp/src/event_stream/codec_tests.rs),
+  userspace-dp/src/event_stream/codec.rs (deleted), _Log.md
 - **Timestamp**: 2026-07-08
   **Action**: #4422 slice — pin the two REJECT cells of the policy
   zone-matrix (action × destination-class) at the SSOT flow-match engine
