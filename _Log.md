@@ -43718,3 +43718,7 @@ top.
   **File(s)**: pkg/api/dhcp.go, pkg/api/dhcp_clear_chunked_4794_test.go
   **Action**: Fix SESSION_CLOSE slog "firewall event" line always logging policy_id=0 (use rec.PolicyID, not zeroed evt.PolicyID); add RED-on-revert test
   **File(s)**: pkg/logging/ringbuf.go, pkg/logging/session_close_slog_policyid_4796_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: Fix getOriginalKernelName unconditionally appending "f<func>" to derived PCI-path interface names; extract testable pciFunctionSuffix + isPCIMultifunctionDevice mirroring systemd's names_pci_slot()/is_pci_multifunction() rule; add RED-on-revert test
+  **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/pci_function_suffix_4795_test.go

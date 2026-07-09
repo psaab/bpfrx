@@ -1729,5 +1729,47 @@ func getOriginalKernelName(ifName string, result *CompileResult) string {
 	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("enp%ds%df%d", bus, slot, fn)
+	return fmt.Sprintf("enp%ds%d%s", bus, slot, pciFunctionSuffix(isPCIMultifunctionDevice(pciAddr), fn))
+}
+
+// pciFunctionSuffix returns the "f<function>" suffix systemd's
+// udev-builtin-net_id "path" naming scheme appends to a predictable PCI
+// interface name (enp<bus>s<slot>[f<function>]) — or "" when the suffix is
+// omitted. systemd's names_pci_slot() (src/udev/udev-builtin-net_id.c)
+// appends the suffix ONLY when the PCI function number is nonzero OR the
+// device is a genuine multi-function device (is_pci_multifunction(), which
+// tests the kernel's PCI_HEADER_TYPE multi-function bit in config space —
+// see isPCIMultifunctionDevice below). A single-function device at
+// function 0 (e.g. a standalone NIC at 0000:09:00.0) is therefore named
+// enp9s0, NOT enp9s0f0 — the #4795 bug: the pre-fix code appended "f%d"
+// unconditionally, producing a wrong .link OriginalName for every
+// single-function card. Kept pure/parameterized so the boundary logic is
+// unit-testable without sysfs.
+func pciFunctionSuffix(multifunction bool, fn uint64) string {
+	if fn == 0 && !multifunction {
+		return ""
+	}
+	return fmt.Sprintf("f%d", fn)
+}
+
+// isPCIMultifunctionDevice reports whether the PCI device at pciAddr
+// (domain:bus:slot.function, e.g. "0000:09:00.0") is a multi-function
+// device per the kernel's PCI_HEADER_TYPE config-space byte (offset 0x0E),
+// bit 0x80 ("Multi-Function Device"). This mirrors systemd's
+// is_pci_multifunction() (src/shared/pci-util.c small helper reading
+// <syspath>/config), the same signal names_pci_slot() uses to decide
+// whether to append the "f<function>" suffix. Any read failure (missing
+// sysfs, short read, permission) conservatively reports false — the same
+// fallback systemd uses on error, and the caller then falls back to the
+// "fn != 0" half of the test.
+func isPCIMultifunctionDevice(pciAddr string) bool {
+	const (
+		pciHeaderTypeOffset = 14 // PCI_HEADER_TYPE, config-space offset 0x0E
+		pciMultiFunctionBit = 0x80
+	)
+	data, err := os.ReadFile(fmt.Sprintf("/sys/bus/pci/devices/%s/config", pciAddr))
+	if err != nil || len(data) <= pciHeaderTypeOffset {
+		return false
+	}
+	return data[pciHeaderTypeOffset]&pciMultiFunctionBit != 0
 }
