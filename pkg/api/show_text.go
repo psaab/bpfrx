@@ -3,10 +3,24 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// sortedKeys returns the keys of a string-keyed map in ascending order. The
+// show-text handlers render config maps as operator/automation-facing text, so
+// iterating them in sorted order keeps the output deterministic across requests
+// (Go map iteration order is randomized). See #4712.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 	topic := r.URL.Query().Get("topic")
@@ -23,7 +37,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 		if cfg == nil || len(cfg.Schedulers) == 0 {
 			buf.WriteString("No schedulers configured\n")
 		} else {
-			for name, sched := range cfg.Schedulers {
+			for _, name := range sortedKeys(cfg.Schedulers) {
+				sched := cfg.Schedulers[name]
 				fmt.Fprintf(&buf, "Scheduler: %s\n", name)
 				if sched.StartTime != "" {
 					fmt.Fprintf(&buf, "  Start time: %s\n", sched.StartTime)
@@ -60,13 +75,15 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(snmpCfg.Communities) > 0 {
 				buf.WriteString("Communities:\n")
-				for name, comm := range snmpCfg.Communities {
+				for _, name := range sortedKeys(snmpCfg.Communities) {
+					comm := snmpCfg.Communities[name]
 					fmt.Fprintf(&buf, "  %s: %s\n", name, comm.Authorization)
 				}
 			}
 			if len(snmpCfg.TrapGroups) > 0 {
 				buf.WriteString("Trap groups:\n")
-				for name, tg := range snmpCfg.TrapGroups {
+				for _, name := range sortedKeys(snmpCfg.TrapGroups) {
+					tg := snmpCfg.TrapGroups[name]
 					fmt.Fprintf(&buf, "  %s: %s\n", name, strings.Join(tg.Targets, ", "))
 				}
 			}
@@ -79,13 +96,15 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			relay := cfg.ForwardingOptions.DHCPRelay
 			if len(relay.ServerGroups) > 0 {
 				buf.WriteString("Server groups:\n")
-				for name, sg := range relay.ServerGroups {
+				for _, name := range sortedKeys(relay.ServerGroups) {
+					sg := relay.ServerGroups[name]
 					fmt.Fprintf(&buf, "  %s: %s\n", name, strings.Join(sg.Servers, ", "))
 				}
 			}
 			if len(relay.Groups) > 0 {
 				buf.WriteString("Relay groups:\n")
-				for name, g := range relay.Groups {
+				for _, name := range sortedKeys(relay.Groups) {
+					g := relay.Groups[name]
 					fmt.Fprintf(&buf, "  %s:\n", name)
 					fmt.Fprintf(&buf, "    Interfaces: %s\n", strings.Join(g.Interfaces, ", "))
 					fmt.Fprintf(&buf, "    Active server group: %s\n", g.ActiveServerGroup)
@@ -99,7 +118,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			buf.WriteString("No firewall filters configured\n")
 		} else {
 			printFilters := func(family string, filters map[string]*config.FirewallFilter) {
-				for name, filter := range filters {
+				for _, name := range sortedKeys(filters) {
+					filter := filters[name]
 					fmt.Fprintf(&buf, "Filter: %s (family: %s)\n", name, family)
 					for _, term := range filter.Terms {
 						fmt.Fprintf(&buf, "  Term: %s\n", term.Name)
@@ -147,7 +167,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 		if cfg == nil || len(cfg.Security.DynamicAddress.FeedServers) == 0 {
 			buf.WriteString("No dynamic address feeds configured\n")
 		} else {
-			for name, feed := range cfg.Security.DynamicAddress.FeedServers {
+			for _, name := range sortedKeys(cfg.Security.DynamicAddress.FeedServers) {
+				feed := cfg.Security.DynamicAddress.FeedServers[name]
 				fmt.Fprintf(&buf, "Feed server: %s\n", name)
 				fmt.Fprintf(&buf, "  URL: %s\n", feed.URL)
 				if feed.FeedName != "" {
@@ -170,13 +191,15 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			ab := cfg.Security.AddressBook
 			if len(ab.Addresses) > 0 {
 				buf.WriteString("Addresses:\n")
-				for name, addr := range ab.Addresses {
+				for _, name := range sortedKeys(ab.Addresses) {
+					addr := ab.Addresses[name]
 					fmt.Fprintf(&buf, "  %-20s %s\n", name, addr.Value)
 				}
 			}
 			if len(ab.AddressSets) > 0 {
 				buf.WriteString("Address sets:\n")
-				for name, as := range ab.AddressSets {
+				for _, name := range sortedKeys(ab.AddressSets) {
+					as := ab.AddressSets[name]
 					fmt.Fprintf(&buf, "  %-20s members: %s\n", name, strings.Join(as.Addresses, ", "))
 				}
 			}
@@ -188,7 +211,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			if len(cfg.Applications.Applications) > 0 {
 				buf.WriteString("Applications:\n")
-				for name, app := range cfg.Applications.Applications {
+				for _, name := range sortedKeys(cfg.Applications.Applications) {
+					app := cfg.Applications.Applications[name]
 					fmt.Fprintf(&buf, "  %-20s proto=%-6s", name, app.Protocol)
 					if app.DestinationPort != "" {
 						fmt.Fprintf(&buf, " dst-port=%s", app.DestinationPort)
@@ -198,7 +222,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(cfg.Applications.ApplicationSets) > 0 {
 				buf.WriteString("Application sets:\n")
-				for name, as := range cfg.Applications.ApplicationSets {
+				for _, name := range sortedKeys(cfg.Applications.ApplicationSets) {
+					as := cfg.Applications.ApplicationSets[name]
 					fmt.Fprintf(&buf, "  %-20s members: %s\n", name, strings.Join(as.Applications, ", "))
 				}
 			}
@@ -210,7 +235,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			v9 := cfg.Services.FlowMonitoring.Version9
 			buf.WriteString("Flow monitoring (NetFlow v9):\n")
-			for name, tmpl := range v9.Templates {
+			for _, name := range sortedKeys(v9.Templates) {
+				tmpl := v9.Templates[name]
 				fmt.Fprintf(&buf, "  Template: %s\n", name)
 				if tmpl.FlowActiveTimeout > 0 {
 					fmt.Fprintf(&buf, "    Active timeout: %ds\n", tmpl.FlowActiveTimeout)

@@ -1,3 +1,30 @@
+## 2026-07-08 — #4712: deterministic sorted iteration in show-text endpoints
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4712 — `pkg/api/show_text.go` (the `/show-text` REST handler)
+  ranged over string-keyed config maps directly for 12 topics (schedulers,
+  snmp communities/trap-groups, dhcp-relay server-groups/groups, firewall
+  filters, dynamic-address feeds, address-book addresses/address-sets,
+  applications/application-sets, netflow-v9 templates). Go randomizes map
+  iteration order, so the rendered operator/automation-facing text came back
+  in a different order across requests, breaking config diffing and making
+  downstream tests flaky. Verified all 12 cited fields are `map[string]*...`
+  (nat-static/nat-nptv6 iterate slices → already deterministic, correctly not
+  cited). Fix: added a generic `sortedKeys[V any](map[string]V) []string`
+  helper (collect keys, `sort.Strings`, iterate) and routed all 12 sites
+  through it — minimal, local, no handler restructuring. New regression test
+  stages multi-key maps (scrambled insertion order) for applications,
+  address-book, and snmp, renders each topic 40× and asserts (1) byte-identical
+  output across renders and (2) ascending-key ordering; proved RED under both a
+  reverse-sort and a raw map-range revert. Validation: gofmt -w; go build
+  ./... clean; go test ./pkg/api/... green; FULL Go suite 52 ok / 3 no-test,
+  sole FAIL is the pre-existing pkg/ddns RFC2136 port-bind flake (passes in
+  isolation, unrelated — change is pkg/api-only). No docs change: this
+  restores expected deterministic output; no operator-facing contract or
+  module doc describes the prior (buggy) ordering.
+  **File(s)**: pkg/api/show_text.go, pkg/api/show_text_sorted_4712_test.go,
+  _Log.md
+
 ## 2026-07-08 — #4422 slice: firewall-filter port-on-non-port / TCP-only / ICMP-only regression coverage
 
 - **Timestamp**: 2026-07-08
