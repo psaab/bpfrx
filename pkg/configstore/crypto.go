@@ -35,23 +35,39 @@ func (db *DB) masterKeyPath() string {
 	return filepath.Join(db.dir, "master.key")
 }
 
+// masterPasswordPRF resolves the master-password pseudorandom-function that
+// decides whether the config DB is written encrypted. It MUST consider every
+// top-level `system` stanza, not just the first (#4705).
+//
+// The Junos parser does not merge duplicate top-level stanzas: parseStatements
+// appends each `system { ... }` block as its own child, and neither
+// LoadOverride nor SyncApply (both raw NewParser().Parse()) coalesce them. The
+// compiler already treats a split config as one system — compileSections loops
+// over ALL top-level nodes and folds every `system` node into the same
+// cfg.System — so a `master-password` living in a SECOND system stanza is
+// semantically active. A single-first-match tree.FindChild("system") would
+// then miss it and write the whole DB (secrets included) in PLAINTEXT despite
+// encryption being configured. Fail CLOSED: scan every "system" child and
+// every "master-password" within it, and encrypt if ANY carries a PRF.
 func masterPasswordPRF(tree *config.ConfigTree) string {
 	if tree == nil {
 		return ""
 	}
-	sys := tree.FindChild("system")
-	if sys == nil {
-		return ""
+	for _, sys := range tree.Children {
+		if sys == nil || sys.Name() != "system" {
+			continue
+		}
+		for _, mp := range sys.FindChildren("master-password") {
+			prf := mp.FindChild("pseudorandom-function")
+			if prf == nil {
+				continue
+			}
+			if v := nodeValue(prf); v != "" {
+				return v
+			}
+		}
 	}
-	mp := sys.FindChild("master-password")
-	if mp == nil {
-		return ""
-	}
-	prf := mp.FindChild("pseudorandom-function")
-	if prf == nil {
-		return ""
-	}
-	return nodeValue(prf)
+	return ""
 }
 
 func nodeValue(n *config.Node) string {
