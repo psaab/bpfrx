@@ -37,8 +37,34 @@ func NewParser(input string) *Parser {
 }
 
 // Parse parses the input and returns the configuration tree.
+//
+// After the top-level statement list, the lexer MUST be at EOF. parseStatements
+// breaks on a top-level TokenRBrace (a stray unmatched '}') identically to EOF,
+// so historically a single stray brace made Parse return the partial tree with
+// ZERO errors and silently drop every statement after the brace — a fail-open
+// config-acceptance path (#4862): LoadOverride / CheckText only gate on
+// len(errs)==0, so a truncated config (missing its security/default-policy
+// tail) committed as if it were the authored file. Assert EOF here. A leftover
+// '}' (or any other stray token) is a ParseError naming its position; rather
+// than discard the trailing config on the floor we consume the stray token and
+// resume parsing so BOTH the error and the remaining statements surface (the
+// error still fails the commit — the tree is never silently truncated). Every
+// iteration consumes at least the one stray token, so the loop always
+// terminates. Correctly nested '{ ... }' blocks are unaffected: parseStatement
+// consumes each block's own closing '}', so only an unmatched top-level '}'
+// reaches this check.
 func (p *Parser) Parse() (*ConfigTree, []ParseError) {
 	children := p.parseStatements()
+	for {
+		tok := p.lexer.Peek()
+		if tok.Type == TokenEOF {
+			break
+		}
+		p.addError(tok.Line, tok.Column,
+			fmt.Sprintf("unexpected %s at top level (unmatched '}'?)", tok))
+		p.lexer.Next() // consume the stray token to guarantee forward progress
+		children = append(children, p.parseStatements()...)
+	}
 	tree := &ConfigTree{Children: children}
 	return tree, p.errors
 }
