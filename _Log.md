@@ -43589,3 +43589,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 daemon_run.go Run() decompose — plan v1 (Increment 1: extract runShutdownSequence 1709-1866 + phase-boundary banners; conservative defer-clean tail extract, zero behavior change)
   **File(s)**: docs/pr/4662-daemon-run-decompose/plan.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 1 — extract runShutdownSequence (daemon_run.go teardown 1696-1858, byte-identical body) from Run(); Run() ends by delegating. sync already imported; build+vet+daemon-suite green
+  **File(s)**: pkg/daemon/daemon_run.go

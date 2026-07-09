@@ -1693,6 +1693,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("signal received, shutting down")
 	}
 
+	return d.runShutdownSequence(&wg, stop, runErr)
+}
+
+// runShutdownSequence performs the ordered post-run teardown: abort in-flight
+// apply, stop the signal context, wait background goroutines, then tear down
+// SNMP/flowexport/feeds/RPM/archive/event-engine/ipmon/natpool-alarm/FRR/LLDP,
+// clear HA rg_active (non-hitless), withdraw RA, stop VRRP/cluster/session-sync,
+// close/teardown the dataplane, and restore step0 tunables. The ordering is
+// load-bearing (see the per-step comments). Extracted verbatim from Run() so
+// the 1690-LOC lifecycle stays reviewable (#4662 Increment 1). Returns runErr
+// unchanged.
+func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr error) error {
 	// #2926: explicitly abort any in-flight commit/remediation apply NOW, at the
 	// very start of the shutdown sequence and BEFORE the explicit subsystem
 	// teardown below (FRR Stop, HA rg_active clear, dp.Teardown). applyCancelCtx
