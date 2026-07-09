@@ -615,10 +615,18 @@ type NATMatch struct {
 	// them at commit and the snapshot builders can fail CLOSED (match nothing)
 	// on the lenient load / peer-sync path.
 	InvalidDestinationPorts []string
-	Protocol                string   // first protocol (backward compat): "tcp", "udp", "icmp6", "gre", or "" (auto)
-	Protocols               []string // all matched protocols (#3431 bracket list / repeated, DNAT only)
-	Application             string   // first application name (backward compat), e.g. "junos-http"
-	Applications            []string // all matched application names (#3431 bracket list / repeated)
+	// ReversedDestinationPortRanges holds raw `match destination-port <low> to
+	// <high>` tokens where high < low (a reversed range, e.g. `4000 to 3000`).
+	// The parser used to silently split such a range into its two discrete
+	// endpoints ({4000, 3000}), miscompiling the operator's intended
+	// contiguous range with no feedback. They are preserved so
+	// validateNATMatchDestinationPortStrict can reject them at commit (#4422)
+	// and downgrade to a warning on the lenient load / peer-sync path.
+	ReversedDestinationPortRanges []string
+	Protocol                      string   // first protocol (backward compat): "tcp", "udp", "icmp6", "gre", or "" (auto)
+	Protocols                     []string // all matched protocols (#3431 bracket list / repeated, DNAT only)
+	Application                   string   // first application name (backward compat), e.g. "junos-http"
+	Applications                  []string // all matched application names (#3431 bracket list / repeated)
 }
 
 // natMatchValues returns the full multi-value list for a NAT match axis,
