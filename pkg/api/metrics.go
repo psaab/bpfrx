@@ -58,6 +58,7 @@ type xpfCollector struct {
 	nat64XlateTotal             *prometheus.Desc
 	hostInboundDeny             *prometheus.Desc
 	hostInboundKernelDenies     *prometheus.Desc
+	hostInboundJunosHostDenies  *prometheus.Desc
 	hostInboundICMPNDAccept     *prometheus.Desc
 	hostInboundAddresslessZones *prometheus.Desc
 	hostInboundAddresslessIface *prometheus.Desc
@@ -604,6 +605,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.nat64XlateTotal
 	ch <- c.hostInboundDeny
 	ch <- c.hostInboundKernelDenies
+	ch <- c.hostInboundJunosHostDenies
 	ch <- c.hostInboundICMPNDAccept
 	ch <- c.hostInboundAddresslessZones
 	ch <- c.hostInboundAddresslessIface
@@ -981,6 +983,13 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// exists to close). ReadHostInboundDenyCounters reads nft via netlink and has
 	// no dataplane dependency.
 	c.collectHostInboundKernelDenies(ch)
+
+	// #4146: the fine `to-zone junos-host` DENY drop counters on the same kernel
+	// `inet xpf_hostinbound` chain. Installed INDEPENDENT of dataplane load (they
+	// enforce the direct host-bound path the kernel delivers), so — like the deny
+	// counters above — emit BEFORE the dataplane gate so the series stays visible
+	// in a config-only / degraded boot.
+	c.collectHostInboundJunosHostDenies(ch)
 
 	// #4759: the GLOBAL ICMP-error / ND ACCEPT counters on the same kernel
 	// `inet xpf_hostinbound` chain. These control-message accepts are admitted
