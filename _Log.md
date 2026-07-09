@@ -1,3 +1,33 @@
+## 2026-07-09 — #4706: merge duplicate address-set members instead of dropping earlier ones
+
+- **Timestamp**: 2026-07-09
+- **Action**: CORRECTNESS/SECURITY fix. `parseAddressBookEntries`
+  (`compiler_security_addressbook.go`) merged duplicate `address <name>`
+  nodes by name (#2222) but the sibling `address-set` case built a fresh
+  struct and did `ab.AddressSets[as.Name] = as` — a last-wins overwrite.
+  The hierarchical parser does NOT fold two literal `address-set S { ... }`
+  blocks into one node (verified: `NewParser` on a brace config yields TWO
+  sibling `address-set S` nodes), unlike the flat-set `SetPath` which
+  descends into one existing node and accumulates. So a hand-authored /
+  `load override` config with duplicate blocks lost the earlier stanza's
+  members silently — a policy matching the set then matched FEWER addresses
+  than the operator intended (silent narrowing; permit/deny the wrong set).
+  Fix: mirror the `address` merge-by-name — fetch-or-create the AddressSet
+  by name, then UNION members (new `appendUniqueString` helper preserves
+  first-seen order and dedups, matching Junos union-by-name semantics).
+  Nested `address-set` references took the same overwrite path and are
+  fixed too. The flat-set `set ...` path was already correct (bounding
+  factor) and is unchanged.
+- **File(s)**: pkg/config/compiler_security_addressbook.go (fix +
+  appendUniqueString helper),
+  pkg/config/addressbook_dup_addrset_merge_4706_test.go (new: union across
+  duplicate blocks, nested-ref union, dedup, single-stanza no-regression
+  guard, end-to-end policy resolution to all member prefixes; RED on revert
+  to last-wins).
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config/` clean;
+  `go test ./...` = 53 ok / 3 no-test / 0 fail. RED-on-revert verified
+  (last-wins overwrite → `address-set S members = [A2], want [A1 A2]`).
+
 ## 2026-07-09 — #4665: split cos/queue_service/tests.rs into per-concern files
 
 - **Timestamp**: 2026-07-09
