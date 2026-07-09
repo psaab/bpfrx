@@ -477,6 +477,34 @@ blackholed for exactly the flows that survived the failover.
   sum for `xpf_userspace_dnat_publish_errors_total` — so map-pressure reverse-NAT
   loss stays operator-visible on the standby path too (#2244 parity).
 
+### Activation Refresh Recomputes `allow_replace_local` Per Session (#4805)
+
+The forward session-map publish for a peer-synced entry is gated on
+`synced_entry_allows_local_replace(ha_state, owner_rg_id, now_secs)`: for a
+`LocalDelivery` (host-inbound) session whose owning RG is **not** locally
+forwarding-active, it returns `true`, and
+`force_live_redirect_for_worker_synced_entry` publishes the userspace
+`REDIRECT` entry (policy enforced via fabric-redirect / drop) rather than a
+kernel-local `PASS_TO_KERNEL` entry. A standby node must never let a
+peer-synced, locally-undelivered session fall through to its own kernel stack.
+
+`WorkerCommand::RefreshOwnerRGS` (dispatched to every worker on any RG
+activation) runs a **wider scan** — it re-evaluates every HA-managed worker
+session, not just those indexed under the activated RG, because a split-RG
+reverse companion owned by RG2 can change local-forward vs fabric-redirect when
+RG1 moves. Each touched session is republished. That republish MUST recompute
+`allow_replace_local` from the refreshed owner RG against the current HA state,
+exactly as the initial-sync path (`handle_upsert_synced`) does —
+`collect_refresh_owner_rgs_items` in
+`afxdp/session_glue/commands/refresh_owner_rgs.rs` computes it alongside the
+refreshed metadata. Hardcoding `false` here (the pre-#4805 bug) flipped an
+unrelated, still-standby-owned `LocalDelivery` session from `REDIRECT` to
+`PASS_TO_KERNEL` on any routine RG activation elsewhere in the cluster —
+delivering host-bound traffic straight to the standby's kernel with no policy
+enforcement. Pinned by
+`refresh_owner_rgs_standby_local_delivery_forces_live_redirect_4805` and
+`refresh_owner_rgs_active_owner_local_delivery_publishes_kernel_local_4805`.
+
 ### Event Stream (Primary Path)
 
 The Rust helper pushes session events over a persistent binary-framed Unix

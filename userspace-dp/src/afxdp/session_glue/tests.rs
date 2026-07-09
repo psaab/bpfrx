@@ -5585,3 +5585,159 @@ fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
         "Close delta for a non-SNAT session must NOT attempt a dnat_table delete"
     );
 }
+
+// #4805 regression: the activation-refresh wider scan must recompute
+// `allow_replace_local` per session from the CURRENT HA state, NOT hardcode
+// `false`. A standby-owned, peer-synced `LocalDelivery` session must keep the
+// userspace REDIRECT fast path (policy enforced via fabric-redirect/drop) — it
+// must NOT be flipped to a kernel-local `PASS_TO_KERNEL` entry that delivers
+// host-bound traffic straight to the standby node's own stack unpoliced.
+//
+// The publish disposition is fully determined by
+// `force_live_redirect_for_worker_synced_entry(decision, metadata, origin,
+// allow_replace_local)` — `true` => live REDIRECT, `false` (with a kernel-local
+// entry) => PASS_TO_KERNEL. Unprivileged `cargo test` cannot create a BPF map
+// (`unprivileged_bpf_disabled=2`), so we assert the computed
+// `allow_replace_local` that `collect_refresh_owner_rgs_items` produces — the
+// single site feeding that argument on the activation path — rather than
+// reading the map byte back.
+fn synced_local_delivery_forward_metadata(owner_rg_id: i32) -> SessionMetadata {
+    SessionMetadata {
+        owner_rg_id,
+        is_reverse: false,
+        fabric_ingress: false,
+        ..test_metadata()
+    }
+}
+
+// A LocalDelivery decision whose egress_ifindex is not in the forwarding egress
+// map, so `owner_rg_for_resolution` returns 0 and the refreshed metadata keeps
+// the session's original owner RG (the standby RG under test).
+fn synced_local_delivery_decision_unowned_egress() -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::LocalDelivery,
+            local_ifindex: 0,
+            egress_ifindex: 0,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
+#[test]
+fn refresh_owner_rgs_standby_local_delivery_forces_live_redirect_4805() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    let now_ns = monotonic_nanos();
+    let now_secs = now_ns / 1_000_000_000;
+    // Peer-synced forward LocalDelivery session owned by RG2 (standby here).
+    assert!(sessions.install_with_protocol_with_origin(
+        key.clone(),
+        synced_local_delivery_decision_unowned_egress(),
+        synced_local_delivery_forward_metadata(2),
+        SessionOrigin::SyncImport,
+        now_ns,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+
+    // RG1 activates on this node (any split-RG activation triggers the wider
+    // scan); RG2 — the session's owner — remains STANDBY (inactive) here.
+    let ha_state = BTreeMap::from([
+        (1, active_ha_runtime(now_secs)),
+        (2, inactive_ha_runtime(now_secs)),
+    ]);
+    let items = super::commands::collect_refresh_owner_rgs_items(
+        &sessions,
+        &test_forwarding_state(),
+        &ha_state,
+        &Arc::new(ShardedNeighborMap::new()),
+        now_secs,
+    );
+
+    let (_, decision, metadata, origin, allow_replace_local) = items
+        .iter()
+        .find(|(item_key, ..)| *item_key == key)
+        .expect("refreshed standby LocalDelivery session");
+    // Owner RG unchanged (still RG2), disposition still LocalDelivery.
+    assert_eq!(metadata.owner_rg_id, 2);
+    assert_eq!(
+        decision.resolution.disposition,
+        ForwardingDisposition::LocalDelivery
+    );
+    // Standby-owned => allow_replace_local TRUE => force live REDIRECT.
+    assert!(
+        *allow_replace_local,
+        "standby-owned synced LocalDelivery must keep allow_replace_local=true"
+    );
+    assert!(
+        force_live_redirect_for_worker_synced_entry(
+            *decision,
+            metadata,
+            *origin,
+            *allow_replace_local,
+        ),
+        "standby-owned synced LocalDelivery must publish the LIVE REDIRECT entry, \
+         not a kernel-local PASS_TO_KERNEL entry (#4805)"
+    );
+}
+
+#[test]
+fn refresh_owner_rgs_active_owner_local_delivery_publishes_kernel_local_4805() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    let now_ns = monotonic_nanos();
+    let now_secs = now_ns / 1_000_000_000;
+    // Peer-synced forward LocalDelivery session owned by RG2, ACTIVE here.
+    assert!(sessions.install_with_protocol_with_origin(
+        key.clone(),
+        synced_local_delivery_decision_unowned_egress(),
+        synced_local_delivery_forward_metadata(2),
+        SessionOrigin::SyncImport,
+        now_ns,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+
+    let ha_state = BTreeMap::from([
+        (1, active_ha_runtime(now_secs)),
+        (2, active_ha_runtime(now_secs)),
+    ]);
+    let items = super::commands::collect_refresh_owner_rgs_items(
+        &sessions,
+        &test_forwarding_state(),
+        &ha_state,
+        &Arc::new(ShardedNeighborMap::new()),
+        now_secs,
+    );
+
+    let (_, decision, metadata, origin, allow_replace_local) = items
+        .iter()
+        .find(|(item_key, ..)| *item_key == key)
+        .expect("refreshed active-owner LocalDelivery session");
+    assert_eq!(metadata.owner_rg_id, 2);
+    assert_eq!(
+        decision.resolution.disposition,
+        ForwardingDisposition::LocalDelivery
+    );
+    // Owner-active => allow_replace_local FALSE => kernel-local PASS_TO_KERNEL.
+    assert!(
+        !*allow_replace_local,
+        "owner-active synced LocalDelivery must keep allow_replace_local=false"
+    );
+    assert!(
+        !force_live_redirect_for_worker_synced_entry(
+            *decision,
+            metadata,
+            *origin,
+            *allow_replace_local,
+        ),
+        "owner-active synced LocalDelivery keeps the kernel-local publish path"
+    );
+}
