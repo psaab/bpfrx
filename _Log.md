@@ -43961,3 +43961,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4964 stop applyAggregator leaking an append-only EventReader callback + a never-flushed 20k-key SessionAggregator per report-enabled commit. Register one stable indirection callback (aggregationCallback) exactly once via aggCBOnce, publish the live aggregator through an atomic.Pointer (aggregatorPtr), swap-to-nil-before-cancel on retire — mirrors the #3932 TraceWriter / #2075 flowexport pattern. Removed the write-only aggregator field; added aggReconMu.
   **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_system.go, pkg/daemon/aggregator_callback_4964_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4968 make the remote CLI pipe filter case-SENSITIVE to match the local CLI. Extracted the remote dispatchWithPipe switch into a testable applyPipeFilter() helper and removed the strings.ToLower on both operands for match/grep/except/find so `| match Foo` no longer matches `foo` on remote while missing it on local (Junos `| match` never case-folds). Aligns with pkg/cli.filterStream's bare strings.Contains(line, pipeArg).
+  **File(s)**: cmd/cli/shared.go, cmd/cli/pipe_filter_case_4968_test.go
