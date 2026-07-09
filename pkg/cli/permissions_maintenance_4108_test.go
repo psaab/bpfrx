@@ -80,19 +80,23 @@ func TestCheckPermission_DestructiveMaintenanceAbbreviationCannotBypass(t *testi
 }
 
 // TestCheckPermission_BenignRequestStaysControlForOperator asserts the gate is
-// surgical: operator keeps the BENIGN request verbs at PermControl — only the
-// four destructive `request system` verbs and cluster failover elevate, not
-// the whole `request` family and not the rest of the `request system` subtree
-// (software ISSU, rescue config, dynamic-dns). This guards against
-// over-gating operator out of its legitimate control commands.
+// surgical: operator keeps the BENIGN request verbs at PermControl — the
+// destructive `request system` verbs, cluster failover, ISSU drain, and the
+// destructive userspace-dataplane disarm/unregister verbs elevate (see the
+// #4859 test), but the restorative dataplane verbs and the rest of the request
+// family do NOT. This guards against over-gating operator out of its legitimate
+// control commands.
 func TestCheckPermission_BenignRequestStaysControlForOperator(t *testing.T) {
 	op := &CLI{userClass: "operator"}
 	benign := [][]string{
-		{"request", "system", "software", "in-service-upgrade"}, // request system, but not destructive
 		{"request", "system", "configuration", "rescue", "save"},
 		{"request", "system", "dynamic-dns", "update"},
 		{"request", "security", "ipsec", "sa", "clear"},
+		// Restorative dataplane verbs stay at PermControl.
 		{"request", "chassis", "cluster", "data-plane", "userspace", "forwarding", "arm"},
+		{"request", "chassis", "cluster", "data-plane", "userspace", "queue", "3", "register"},
+		{"request", "chassis", "cluster", "data-plane", "userspace", "queue", "3", "arm"},
+		{"request", "chassis", "cluster", "data-plane", "userspace", "binding", "slot", "2", "register"},
 		{"request", "protocols", "bgp", "clear"},
 	}
 	for _, parts := range benign {
