@@ -426,6 +426,17 @@ fn tcp_segment_consumed_len(frame: &[u8], parsed: TcpReplySource) -> Option<u32>
         }
         _ => return None,
     };
+    // Clamp the datagram end to the captured frame length. The IP length
+    // field (v4 total_len / v6 payload_len) is attacker-controlled: a
+    // crafted or corrupted packet can advertise a length that runs past
+    // the actual frame. Left unclamped, `ip_datagram_end` overshoots the
+    // frame, `payload_len` below over-counts by the overshoot, and the
+    // no-ACK RST then carries `ack = seq + inflated_seg_len` — an
+    // unacceptable ack the peer discards, degrading the `reject`/RST leg
+    // to a silent drop (a fail-closed self-DoS on the reject path). For a
+    // well-formed packet the datagram end is already within the frame, so
+    // this is a no-op (v4 #4484 L-3; also bounds the v6 path).
+    let ip_datagram_end = ip_datagram_end.min(frame.len());
     // TCP header start (after IPv6 ext headers, if any) and length from
     // the inbound segment's data-offset field.
     let l4 = frame_l4_offset(frame, parsed.addr_family)?;
