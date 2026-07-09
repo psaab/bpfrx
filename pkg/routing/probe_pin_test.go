@@ -21,6 +21,11 @@ type fakeProbePinOps struct {
 	failRouteAdd map[int]error  // route table → error
 	failRuleDel  map[int]error  // rule priority → error (rollback failure)
 	ruleDelCalls int
+
+	// #4822: dump-failure injection for clear()'s RuleList/RouteListFiltered
+	// error-aggregation test.
+	failRuleList          map[int]error // family → error
+	failRouteListFiltered map[int]error // table → error
 }
 
 func (f *fakeProbePinOps) RuleAdd(r *netlink.Rule) error {
@@ -46,6 +51,9 @@ func (f *fakeProbePinOps) RuleDel(r *netlink.Rule) error {
 }
 
 func (f *fakeProbePinOps) RuleList(family int) ([]netlink.Rule, error) {
+	if err, ok := f.failRuleList[family]; ok {
+		return nil, err
+	}
 	var out []netlink.Rule
 	for _, r := range f.rules {
 		if r.Family == family {
@@ -74,6 +82,9 @@ func (f *fakeProbePinOps) RouteDel(r *netlink.Route) error {
 }
 
 func (f *fakeProbePinOps) RouteListFiltered(family int, filter *netlink.Route, _ uint64) ([]netlink.Route, error) {
+	if err, ok := f.failRouteListFiltered[filter.Table]; ok {
+		return nil, err
+	}
 	var out []netlink.Route
 	for _, r := range f.routes {
 		if r.Table != filter.Table {
@@ -252,6 +263,65 @@ func TestProbePinClearRemovesOnlyBand(t *testing.T) {
 	}
 	if len(ops.routes) != 1 || ops.routes[0].Table != 254 {
 		t.Fatalf("probe-table routes not flushed (or main-table route lost): %+v", ops.routes)
+	}
+}
+
+// TestProbePinClearReportsRuleListFailure is the #4822 RED-on-revert guard:
+// a RuleList dump failure must make clear() return a non-nil error instead
+// of being silently swallowed. Before the fix, clear() unconditionally
+// returned nil even when every family's dump failed, so Apply()'s
+// slog.Warn("failed to clear probe pin band", ...) — the only observable
+// signal of an incomplete band clear — could never fire.
+func TestProbePinClearReportsRuleListFailure(t *testing.T) {
+	ops := &fakeProbePinOps{
+		links:        map[string]int{},
+		failRuleList: map[int]error{unix.AF_INET: fmt.Errorf("injected ENOBUFS")},
+	}
+	p := &probePinManager{ops: ops}
+	if err := p.clear(); err == nil {
+		t.Fatal("clear() = nil error, want non-nil after an injected RuleList failure")
+	}
+}
+
+// TestProbePinClearReportsRouteListFilteredFailure is the #4822
+// RED-on-revert guard for the RouteListFiltered dump-failure path,
+// mirroring TestProbePinClearReportsRuleListFailure above.
+func TestProbePinClearReportsRouteListFilteredFailure(t *testing.T) {
+	ops := &fakeProbePinOps{
+		links:                 map[string]int{},
+		failRouteListFiltered: map[int]error{config.ProbeTableBase: fmt.Errorf("injected ENOBUFS")},
+	}
+	p := &probePinManager{ops: ops}
+	if err := p.clear(); err == nil {
+		t.Fatal("clear() = nil error, want non-nil after an injected RouteListFiltered failure")
+	}
+}
+
+// TestProbePinClearStillReclaimsOnPartialDumpFailure asserts the fix does
+// not regress the #1827/AGY r2-3 startup-cleanup goal: when only ONE
+// family's RuleList fails, the OTHER family's band is still cleared (and
+// clear() still reports the partial failure via a non-nil error) — an
+// aggregated error must not turn back into a silent early return that skips
+// remaining, healthy families.
+func TestProbePinClearStillReclaimsOnPartialDumpFailure(t *testing.T) {
+	_, stale, _ := net.ParseCIDR("2001:db8::1/128")
+	ops := &fakeProbePinOps{
+		links:        map[string]int{},
+		failRuleList: map[int]error{unix.AF_INET: fmt.Errorf("injected ENOBUFS")},
+		rules: []netlink.Rule{
+			{Priority: config.ProbeRulePriorityBase, Family: unix.AF_INET6, Table: config.ProbeTableBase},
+		},
+		routes: []netlink.Route{
+			{Table: config.ProbeTableBase, Dst: stale},
+		},
+	}
+	p := &probePinManager{ops: ops}
+	err := p.clear()
+	if err == nil {
+		t.Fatal("clear() = nil error, want non-nil (AF_INET RuleList failed)")
+	}
+	if len(ops.rules) != 0 {
+		t.Fatalf("AF_INET6 band rule survived a partial (AF_INET-only) dump failure: %+v", ops.rules)
 	}
 }
 
