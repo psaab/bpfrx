@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -80,7 +83,6 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	typ := r.URL.Query().Get("type")
-	var b strings.Builder
 	switch typ {
 	case "routes":
 		routes, err := s.frr.GetBGPRoutes()
@@ -88,10 +90,44 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		for _, route := range routes {
-			fmt.Fprintf(&b, "%-24s %-20s %s\n", route.Network, route.NextHop, route.Path)
+		// A full internet BGP table (900k+ routes) would otherwise render
+		// into one multi-hundred-MB strings.Builder and then get copied a
+		// second time while json-encoding it — ~2x unbounded allocation on a
+		// RAM-constrained firewall (#4708). Stream the exact same wire
+		// envelope ({"success":true,"data":{"output":"<lines>"}}\n)
+		// incrementally: each route line is formatted and JSON-escaped
+		// through a fixed-size bufio buffer, so peak memory is bounded
+		// regardless of table size. JSON string escaping is per-byte
+		// independent, so escaping each line and concatenating yields exactly
+		// the same bytes as escaping the joined string.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		bw := bufio.NewWriter(w)
+		// Envelope prefix. Response{Success:true, Data: TextResponse{Output}}
+		// with Error empty (omitempty) — matches encoding/json field order.
+		io.WriteString(bw, `{"success":true,"data":{"output":"`)
+		for i := range routes {
+			route := &routes[i]
+			writeJSONStringFragment(bw, fmt.Sprintf("%-24s %-20s %s\n",
+				route.Network, route.NextHop, route.Path))
+			// Periodically push bytes onto the wire so a very large table
+			// streams out instead of parking in buffers.
+			if (i+1)%1024 == 0 {
+				bw.Flush()
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		}
+		// json.Encoder appends a trailing newline; preserve it for
+		// byte-equivalence with the previous buffered response.
+		io.WriteString(bw, "\"}}\n")
+		bw.Flush()
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
 		}
 	default:
+		var b strings.Builder
 		peers, err := s.frr.GetBGPSummary()
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -103,6 +139,24 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(&b, "%-20s %-13s %-8s %-9s %-9s %-11s %-12s %s\n",
 				p.Neighbor, p.AddressFamily, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State, p.PfxRcd)
 		}
+		writeOK(w, TextResponse{Output: b.String()})
 	}
-	writeOK(w, TextResponse{Output: b.String()})
+}
+
+// writeJSONStringFragment writes s to w with exactly the escaping
+// encoding/json applies inside a JSON string literal (HTML-safe by default:
+// the "<", ">" and "&" bytes are emitted as their \uXXXX escapes, the same as
+// the default json.Encoder used by writeJSON), but without the surrounding
+// quotes.
+// Because encoding/json escapes strings byte-by-byte with no cross-byte state,
+// concatenating the fragments is byte-for-byte identical to escaping the
+// concatenated string. Used to stream a large response without materializing
+// the whole escaped payload in memory. json.Marshal never fails for a string.
+func writeJSONStringFragment(w io.Writer, s string) {
+	esc, err := json.Marshal(s)
+	if err != nil {
+		return
+	}
+	// esc is `"...escaped..."`; drop the surrounding quotes.
+	w.Write(esc[1 : len(esc)-1])
 }
