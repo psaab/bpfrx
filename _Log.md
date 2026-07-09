@@ -43946,3 +43946,8 @@ top.
 - **Timestamp**: 2026-07-09
 - **Action**: Made ValidateConfig read-only. Removed the `sched.SurplusSharing = false` strip in the warn pass; moved the effective gate to `buildClassOfServiceSnapshot` (`SurplusSharing && TransmitRateExact`) so the runtime never sees the inert flag while configured intent is preserved. Sorted the ADDNS warning block for deterministic order.
 - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/dataplane/userspace/cos.go, pkg/config/parser_class_of_service_test.go, pkg/dataplane/userspace/manager_cos_test.go
+- **Timestamp**: 2026-07-09
+  **Action**: #4956 propagate device-map rename/reload failures from enumerateAndRenameMapped (accumulate phase-2/3 rename + phase-4 reload errors, return errors.Join instead of unconditional nil) so the #4182 retry marker is preserved; added renameInterfaceFn/networkctlReloadFn seams for unit testing
+  **File(s)**: pkg/daemon/device_map.go, pkg/daemon/device_map_rename_err_4956_test.go
+  **Action**: #4954 give networkd Manager reload/reconfigure activation debt — a failed networkctl reload now re-attempts on the next identical Apply (reloadPending/reconfigurePending) instead of returning a false success when files are unchanged
+  **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md
