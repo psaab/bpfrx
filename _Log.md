@@ -1,3 +1,32 @@
+## 2026-07-09 — #4708: stream BGP routes REST response instead of buffering the full table
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4708 — `bgpHandler` `case "routes"` (pkg/api/routing.go) rendered
+  every BGP route into one `strings.Builder`, then `writeOK` json-encoded that
+  string — a second full copy. On a full internet table (900k+ routes) that is
+  ~2x unbounded allocation (multi-hundred-MB string + its JSON-escaped copy) on
+  a RAM-constrained firewall. VERIFY-FIRST: confirmed on origin/master
+  (`deee2b0b6`) that the endpoint is a real, operator-reachable REST handler
+  returning the whole table; the response is `TextResponse` → wire envelope
+  `{"success":true,"data":{"output":"<lines>"}}\n`. SCOPE: bounded — no
+  interface change. Rewrote only `case "routes"` to stream the SAME envelope
+  incrementally: write the fixed prefix, then for each route format the line and
+  JSON-escape it through a fixed-size `bufio.Writer` (helper
+  `writeJSONStringFragment` reuses stdlib `json.Marshal` per line, stripping the
+  quotes). JSON string escaping is per-byte independent, so escaping each line
+  and concatenating is byte-for-byte identical to escaping the joined string —
+  wire format preserved exactly (same Content-Type, same trailing `\n` that
+  `json.Encoder` adds). Periodic `Flush` (every 1024 routes + at end) pushes
+  bytes onto the wire. Left `GetBGPRoutes` and the `default` (BGP summary,
+  peer-bounded) path unchanged. Added `bgp_routes_stream_4708_test.go`: (1) byte-
+  equivalence to the buffered golden for a representative table (incl. a path
+  with `<`/`>`/`&`/`"`/`\` to prove the escaper) + empty table (no nil-panic),
+  all routes present in order; (2) a `flushRecorder` ResponseWriter asserting a
+  3000-route table streams in bounded chunks (max single Write ≤ 4096) with
+  multiple Writes + ≥1 Flush. `go build ./...` clean; `go test ./...` 53 ok / 0
+  FAIL / 3 no-test.
+  **File(s)**: pkg/api/routing.go, pkg/api/bgp_routes_stream_4708_test.go
+
 ## 2026-07-09 — #4709: stream CLI show output to the pager instead of buffering
 
 - **Timestamp**: 2026-07-09
