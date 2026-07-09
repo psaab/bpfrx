@@ -223,6 +223,19 @@ func compileAddressBook(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// appendUniqueString appends v to list only if it is not already present,
+// preserving first-seen order. Used to UNION address-set members across
+// duplicate same-name stanzas (#4706) so Junos' union-by-name semantics hold
+// without accumulating duplicate member references.
+func appendUniqueString(list []string, v string) []string {
+	for _, existing := range list {
+		if existing == v {
+			return list
+		}
+	}
+	return append(list, v)
+}
+
 // parseAddressBookEntries folds the `address` / `address-set` children of
 // node into ab. node is either the `global` block under `security
 // address-book` or a zone-local `address-book` block under `security zones
@@ -249,21 +262,37 @@ func parseAddressBookEntries(node *Node, ab *AddressBook) {
 			}
 			mergeAddressNode(addr, child)
 		case "address-set":
+			// A single Junos `address-set <name>` may render as MULTIPLE
+			// sibling AST nodes: the hierarchical parser does NOT fold two
+			// literal `address-set S { ... }` blocks (unlike the flat-set
+			// `SetPath`, which descends into one existing node), so a
+			// hand-authored / `load override` config with duplicate blocks
+			// arrives here as several `address-set S` children. Merge by name
+			// so the second stanza UNIONS its members onto the first instead of
+			// overwriting and silently dropping the earlier members (#4706) —
+			// a silent policy-data-loss / narrowing bug. Mirror the merge-by-
+			// name the `address` case was hardened to above (#2222). Junos
+			// unions same-named address-sets, so dedup members (first-seen
+			// order) rather than accumulating duplicates.
 			if len(child.Keys) >= 2 {
-				as := &AddressSet{Name: child.Keys[1]}
+				name := child.Keys[1]
+				as := ab.AddressSets[name]
+				if as == nil {
+					as = &AddressSet{Name: name}
+					ab.AddressSets[name] = as
+				}
 				for _, member := range child.Children {
 					switch member.Name() {
 					case "address":
 						if len(member.Keys) >= 2 {
-							as.Addresses = append(as.Addresses, member.Keys[1])
+							as.Addresses = appendUniqueString(as.Addresses, member.Keys[1])
 						}
 					case "address-set":
 						if len(member.Keys) >= 2 {
-							as.AddressSets = append(as.AddressSets, member.Keys[1])
+							as.AddressSets = appendUniqueString(as.AddressSets, member.Keys[1])
 						}
 					}
 				}
-				ab.AddressSets[as.Name] = as
 			}
 		}
 	}
