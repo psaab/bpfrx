@@ -792,6 +792,68 @@ fn reject_rst_v4_syn_with_data_acks_seq_plus_one_plus_payload() {
     );
 }
 
+#[test]
+fn reject_rst_v4_inflated_total_len_clamped_to_frame_acks_seq_plus_one() {
+    // #4484 L-3: a crafted/corrupted IPv4 packet advertises a total_len
+    // far larger than the actual captured frame. `tcp_segment_consumed_len`
+    // must clamp the derived datagram end to `frame.len()` so the no-ACK RST
+    // acks exactly the SYN (seq + 1), NOT seq + 1 + phantom_payload. The
+    // inflated value would produce an unacceptable ack the SYN-SENT peer
+    // discards, degrading the reject to a silent drop (fail-closed self-DoS).
+    //
+    // Fail-on-revert: remove the `.min(frame.len())` clamp and the ack
+    // becomes seq + 1 + (14 + 1200 - 54) = seq + 1161, so this FAILS.
+    let mut eth = eth_header(0x0800);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]);
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]);
+    // Header claims a 1200-byte datagram, but the real frame is only
+    // 14 (eth) + 20 (IP) + 20 (TCP) = 54 bytes — no payload present.
+    let ip = ipv4_header(1200, 6);
+    let mut tcp = tcp_header_skeleton(TCP_FLAG_SYN, 5);
+    tcp[4..8].copy_from_slice(&100u32.to_be_bytes());
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&tcp);
+    assert_eq!(frame.len(), 54, "fixture frame must be 54 bytes");
+    let out = build_reject_rst_frame(&frame).expect("RST for SYN with inflated total_len");
+    let tcp_out = &out[ETH_HDR_LEN + IPV4_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN + 20];
+    // No-ACK inbound: seq=0, RST|ACK, ack = seq + 1 (SYN only, no payload).
+    assert_eq!(tcp_out[13], TCP_FLAG_RST | TCP_FLAG_ACK);
+    assert_eq!(
+        u32::from_be_bytes([tcp_out[8], tcp_out[9], tcp_out[10], tcp_out[11]]),
+        101,
+        "ack must be seq+1 (SYN); the phantom total_len payload must be clamped away"
+    );
+}
+
+#[test]
+fn reject_rst_v4_exact_total_len_unchanged_by_clamp() {
+    // Guard: a well-formed packet whose total_len == the real datagram
+    // length (no overshoot) is unaffected by the clamp — the SYN+data
+    // payload math is preserved. total_len = 20 (IP) + 20 (TCP) + 6 = 46,
+    // frame = 14 + 46 = 60 bytes; ack = seq + SYN(1) + 6 payload bytes.
+    let mut eth = eth_header(0x0800);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]);
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]);
+    let ip = ipv4_header(46, 6);
+    let mut tcp = tcp_header_skeleton(TCP_FLAG_SYN, 5);
+    tcp[4..8].copy_from_slice(&200u32.to_be_bytes());
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&tcp);
+    frame.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // 6 payload bytes
+    assert_eq!(frame.len(), 60, "fixture frame must be 60 bytes");
+    let out = build_reject_rst_frame(&frame).expect("RST for well-formed SYN+data");
+    let tcp_out = &out[ETH_HDR_LEN + IPV4_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN + 20];
+    assert_eq!(
+        u32::from_be_bytes([tcp_out[8], tcp_out[9], tcp_out[10], tcp_out[11]]),
+        200 + 1 + 6,
+        "ack = seq + SYN(1) + 6 payload bytes (clamp is a no-op for valid packets)"
+    );
+}
+
 // ---------- #2148: IPv6 extension-header L4-offset correctness ----------
 //
 // The three stale helpers (frame_has_tcp_rst,
