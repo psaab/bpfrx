@@ -208,6 +208,14 @@ func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Conf
 		best := ""
 		bestPortBased := false
 		for name, app := range cfg.Applications.Applications {
+			// #4865: skip a tolerated nil user-application value (a JSON null
+			// decoding to a nil pointer on a lenient/HA-synced load, #3494).
+			// icmpTypeConstrained is nil-safe, but matchTuple below dereferences
+			// app.Protocol/SourcePort/DestinationPort and would panic the
+			// AppID-disabled show/session-name path on a nil entry.
+			if app == nil {
+				continue
+			}
 			// #3781 interim (log-integrity): a type/code-constrained ICMP app
 			// (icmp-type/icmp-code set) match-alls every ICMP type here because
 			// matchTuple is protocol + port only (blind to the ICMP type/code).

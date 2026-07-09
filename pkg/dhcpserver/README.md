@@ -19,7 +19,19 @@ parses a torn file, no fsync on the apply path.
   **Fail-closed:** restart failures (and failures to stop an active
   unit that left the config) are returned, so a commit surfaces
   "DHCP server failed" instead of silently succeeding with no
-  service.
+  service. The `systemctl is-active` probe (`unitIsActive`) is itself
+  tri-state (#4870): a recognized state string is authoritative
+  (active / inactive / failed) regardless of exit code, but a query
+  that CANNOT determine the state — timeout, exec error, garbled/empty
+  output — returns an error rather than the previous silent "inactive".
+  On such an uncertain query the reconcile fails closed: it restarts a
+  configured family (to enforce the freshly generated config) or stops
+  a removed family (to enforce the removal) AND surfaces the query
+  error, so a transient probe blip during a cluster commit can no
+  longer skip the enforcement while the commit reports success (the old
+  fail-open left stale/removed Kea policy serving). The generated-config
+  unlink error on a removed family is surfaced too (a leftover file
+  could resurrect a removed subnet on a later manual/boot start).
 - `ApplyAsync(cfg, reason)` — `dhcpserver.go`. Enqueues an `Apply` to
   a single lazily started worker via a 1-slot latest-wins mailbox and
   returns immediately (#1835 F2). Used by the VRRP transition

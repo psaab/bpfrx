@@ -117,6 +117,16 @@ and resolves session display names from the dataplane's assigned `app_id`.
   a fail-closed result instead of panicking the app-catalog build. This
   matches the strict validation walker (`compiler_validate_strict.go`),
   which already `continue`s on the same nil entries.
+- A nil user-application VALUE
+  (`cfg.Applications.Applications["x"] = nil`, a JSON null decoding to a
+  nil `*config.Application`) is another tolerated (#3494) shape.
+  `config.ResolveApplication` returns `(nil, true)` for it, so `!found`
+  does NOT catch it. Both AppID ingestion boundaries nil-guard the value
+  (#4865): `BuildCatalog` skips it without consuming an id slot, and
+  `resolveTupleFallback` skips it before `icmpTypeConstrained`/`matchTuple`.
+  Without the guard `app.Protocol` panics `BuildCatalog` during
+  snapshot/apply (AppID on) or the show/session-name render (AppID off) —
+  turning the tolerant "warn/skip and keep running" posture into a crash.
 
 ## Tolerant-load port parsers must DEGRADE, not MISLABEL (#3725)
 

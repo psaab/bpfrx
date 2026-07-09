@@ -52,18 +52,28 @@ func runSystemctl(args ...string) error {
 }
 
 // unitIsActive reports whether a systemd unit is active (or on its way
-// up) by querying `systemctl is-active`. A non-zero exit means "not
-// active" — the state string is on stdout either way, so exit status
-// is not treated as a query failure. If systemctl cannot run at all
-// the output is empty and the unit is reported inactive (there is
-// nothing useful to stop in that case anyway).
-func unitIsActive(unit string) bool {
+// up) by querying `systemctl is-active`. It returns (active, err):
+//
+//   - A recognized state string on stdout is an authoritative answer,
+//     regardless of exit code. `systemctl is-active` exits non-zero for
+//     an inactive/failed/unknown unit but still prints the state, so
+//     that expected ExitError is NOT a query failure — active is
+//     reported (true/false) with a nil error.
+//   - No recognized state string (empty/garbled output, a missing
+//     systemctl binary, a context timeout/kill) means the query could
+//     NOT determine the unit's state. That is returned as a non-nil
+//     error so callers fail CLOSED (#4870) instead of silently mapping
+//     the uncertainty to "inactive" — which let a transient is-active
+//     failure skip a restart/stop and report the commit as successful
+//     while stale/removed Kea policy kept being served.
+func unitIsActive(unit string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "systemctl", "is-active", unit)
 	cmd.WaitDelay = 5 * time.Second
-	out, _ := cmd.Output()
-	switch strings.TrimSpace(string(out)) {
+	out, runErr := cmd.Output()
+	state := strings.TrimSpace(string(out))
+	switch state {
 	case "active", "activating", "reloading", "deactivating":
 		// "deactivating" counts as active-for-stop (Codex review on PR
 		// #1835): a previous daemon or external restart job can be
@@ -71,9 +81,19 @@ func unitIsActive(unit string) bool {
 		// here would let that queued start resurrect Kea after this
 		// commit removed its config. An extra stop on a unit that was
 		// going down anyway is harmless.
-		return true
+		return true, nil
+	case "inactive", "failed", "unknown", "maintenance":
+		// A definitive not-active answer. `systemctl is-active` prints
+		// these to stdout and exits non-zero, so runErr here is the
+		// expected ExitError, not a query failure — discard it.
+		return false, nil
 	}
-	return false
+	// No recognized state: the query itself failed. Surface the reason
+	// so the caller can fail closed rather than assume "inactive".
+	if runErr == nil {
+		runErr = fmt.Errorf("unrecognized output %q", state)
+	}
+	return false, fmt.Errorf("systemctl is-active %s: %w", unit, runErr)
 }
 
 const (
@@ -117,7 +137,7 @@ type Manager struct {
 	// Seams for tests (see test_seams.go). Production instances get
 	// the package-level implementations from New().
 	runSystemctl func(args ...string) error
-	unitActive   func(unit string) bool
+	unitActive   func(unit string) (bool, error)
 	warn         func(msg string, args ...any)
 
 	// Generation-ordered supersession (#1835 F2 redesign after the
@@ -278,10 +298,8 @@ func (m *Manager) apply(gen uint64, cfg *config.DHCPServerConfig, restartInactiv
 	if want4 {
 		if err := m.generateKea4Config(cfg); err != nil {
 			errs = append(errs, fmt.Errorf("generate kea4 config: %w", err))
-		} else if restartInactive || m.unitActive(kea4Svc) {
-			if err := m.runSystemctl("restart", kea4Svc); err != nil {
-				errs = append(errs, fmt.Errorf("restart %s: %w", kea4Svc, err))
-			}
+		} else if err := m.reconcileFamilyRestart(kea4Svc, restartInactive); err != nil {
+			errs = append(errs, err)
 		}
 	} else if err := m.clearFamilyLocked(kea4Svc, m.confPath4); err != nil {
 		errs = append(errs, err)
@@ -290,10 +308,8 @@ func (m *Manager) apply(gen uint64, cfg *config.DHCPServerConfig, restartInactiv
 	if want6 {
 		if err := m.generateKea6Config(cfg); err != nil {
 			errs = append(errs, fmt.Errorf("generate kea6 config: %w", err))
-		} else if restartInactive || m.unitActive(kea6Svc) {
-			if err := m.runSystemctl("restart", kea6Svc); err != nil {
-				errs = append(errs, fmt.Errorf("restart %s: %w", kea6Svc, err))
-			}
+		} else if err := m.reconcileFamilyRestart(kea6Svc, restartInactive); err != nil {
+			errs = append(errs, err)
 		}
 	} else if err := m.clearFamilyLocked(kea6Svc, m.confPath6); err != nil {
 		errs = append(errs, err)
@@ -378,20 +394,67 @@ func (m *Manager) applyAsyncWorker() {
 	}
 }
 
+// reconcileFamilyRestart restarts a Kea unit whose config was just
+// regenerated. It restarts when the unit is already active (to pick up
+// the fresh config) or when restartInactive is set (cluster-commit
+// semantics: bring the unit up even if it was down). Caller must hold
+// m.mu.
+//
+// Fail-closed (#4870 A): if the `systemctl is-active` query itself fails
+// (timeout/exec error, not a definitive "inactive"), the previous code
+// mapped the uncertainty to "inactive" and SKIPPED the restart, so on a
+// cluster commit a transient blip left the old Kea process serving stale
+// policy while the commit returned success. Now an uncertain query is
+// treated as needing enforcement: the unit is restarted (idempotent —
+// this authoritatively loads the freshly generated config) AND the query
+// error is surfaced so a synchronous commit does not report success on an
+// unverified enforcement.
+func (m *Manager) reconcileFamilyRestart(svc string, restartInactive bool) error {
+	var errs []error
+	active, qerr := m.unitActive(svc)
+	if qerr != nil {
+		errs = append(errs, fmt.Errorf("query %s active state: %w", svc, qerr))
+		slog.Warn("could not query Kea unit state; restarting to enforce config",
+			"service", svc, "err", qerr)
+	}
+	if restartInactive || active || qerr != nil {
+		if err := m.runSystemctl("restart", svc); err != nil {
+			errs = append(errs, fmt.Errorf("restart %s: %w", svc, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // clearFamilyLocked stops one Kea unit if systemd reports it active
 // and removes its generated config file. Caller must hold m.mu.
+//
+// Fail-closed (#4870 A): an is-active query failure no longer silently
+// skips the stop (which would leave a removed subnet still served). On an
+// uncertain query the stop is issued authoritatively (a stop on an
+// already-inactive unit is harmless) and the query error is surfaced. The
+// config-file unlink error is also surfaced now (a leftover generated
+// config lets a later manual/boot start of Kea resurrect the removed
+// subnet); an already-absent file is success.
 func (m *Manager) clearFamilyLocked(svc, confPath string) error {
-	var err error
-	if m.unitActive(svc) {
+	var errs []error
+	active, qerr := m.unitActive(svc)
+	if qerr != nil {
+		errs = append(errs, fmt.Errorf("query %s active state: %w", svc, qerr))
+		slog.Warn("could not query Kea unit state; stopping to enforce removal",
+			"service", svc, "err", qerr)
+	}
+	if active || qerr != nil {
 		if e := m.runSystemctl("stop", svc); e != nil {
-			err = fmt.Errorf("stop %s: %w", svc, e)
+			errs = append(errs, fmt.Errorf("stop %s: %w", svc, e))
 			slog.Warn("failed to stop Kea unit", "service", svc, "err", e)
 		} else {
 			slog.Info("stopped Kea unit not in current config", "service", svc)
 		}
 	}
-	os.Remove(confPath)
-	return err
+	if e := os.Remove(confPath); e != nil && !os.IsNotExist(e) {
+		errs = append(errs, fmt.Errorf("remove %s: %w", confPath, e))
+	}
+	return errors.Join(errs...)
 }
 
 // Clear stops both Kea units (if systemd reports them active) and
@@ -413,7 +476,12 @@ func (m *Manager) Clear() {
 func (m *Manager) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.unitActive(kea4Svc) || m.unitActive(kea6Svc)
+	// A query error is treated as not-running for this status reporter: a
+	// unit whose state cannot be determined must not be reported as an
+	// active DHCP server (#4870).
+	a4, _ := m.unitActive(kea4Svc)
+	a6, _ := m.unitActive(kea6Svc)
+	return a4 || a6
 }
 
 // Lease represents a DHCP lease from Kea's lease database.

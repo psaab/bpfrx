@@ -548,9 +548,12 @@ vSRX layers management-plane admission in two places: the coarse
 `host-inbound-traffic system-services <svc>` port gate above, PLUS a fine
 `security policies from-zone <z> to-zone junos-host` (or a global
 `match to-zone junos-host`) policy that can restrict the source or application
-and can `then deny`. On xpf the fine junos-host policy is **not enforced on the
-primary (direct) host-bound path**, so a stricter-than-coarse junos-host policy
-gives a false sense of security.
+and can `then deny`. On xpf the **representable ordered `then deny` class is now
+kernel-enforced on the direct host-bound path** (direction (b), #4146 below); an
+un-representable remainder (feed-tainted source, multi-term/ALG application,
+scheduler-gated policy, `tcp-rst` ingress zone, `reject`, and the "deny
+non-permitted" half of a source-restricted `permit`) is a documented
+partial-coverage limitation that keeps the commit warning.
 
 ### The gap
 
@@ -572,44 +575,100 @@ direct path; hit counters stay zero. This is distinct from #3019 (which wired th
 deny into the XSK `LocalDelivery` arm) and #3292 (the flowless arm): those are the
 XSK paths that DO enforce it.
 
-### Commit-time warning (direction c — shipped)
+### Enforcement (direction b — shipped, #4146)
+
+The representable `to-zone junos-host` DENY class is enforced on the direct
+host-bound path by a DROP-only subchain in the kernel `xpf_hostinbound` chain —
+the availability-preserving locus (the kernel delivers the packet; the userspace
+helper never sees it, so a helper crash cannot lock management out).
+
+- **Projection SSOT (`config.BuildJunosHostDenyProjection`,
+  `pkg/config/junos_host_deny.go`).** Per ingress zone, the effective ordered
+  program is assembled in Junos's exact three tiers — exact `from-zone Z to-zone
+  junos-host` → `from-zone any to-zone junos-host` (#3090) → applicable global
+  `match to-zone junos-host` — mirroring `policymatch.matchJunosHost` /
+  userspace-dp `evaluate_junos_host_policy`. The projection is decided on the
+  **whole ordered program**: if any contributing term is un-representable the
+  program emits nothing (no coarsened / partial rule) and its policies keep the
+  warning.
+- **DROP-only via set-subtraction.** A `deny` becomes a silent `drop`; a `permit`
+  NEVER emits a fine `accept` (that would let a fine permit re-admit a
+  coarse-rejected service — Rust `poll_descriptor/mod.rs:138`). Instead each later
+  deny SUBTRACTS an earlier permit's source set (`saddr != <permit-set>`), so the
+  coarse host-inbound gate stays the **sole admit authority**.
+- **Ingress `iifname` scope, never `daddr`.** The DROP is scoped by the from-zone's
+  kernel netdev names (`pkg/dataplane/userspace/BuildJunosHostPrograms`), excluding
+  lifelines (fxp0/em0/fab*) — daddr scope would both under- and over-deny across
+  zones. A global-any term renders per ingress zone with that zone's netdevs, never
+  unscoped.
+- **Coarse-then-fine order (`pkg/daemon/daemon_nft.go`).** The fine DROP runs after
+  ESP/AH accept + the firewall-originated reply-direction established accept, but
+  BEFORE the ND/PMTUD accepts and the residual full established accept, so a denied
+  source's NEW *and* original-direction-established inbound (including its
+  ND/PMTUD) are dropped — matching Rust's per-hit re-eval/teardown. ESP/AH (proto
+  50/51) are always exempt; IKE 500/4500 is shielded when the zone coarse-admits
+  `ike`; ident-reset TCP/113 keeps its RST when the zone's effective coarse verdict
+  is the RST (ident-reset set AND not `all`/`any-service`).
+  - **Operator note — exempt tuples survive an `application any` deny.** On an
+    **IKE-admitting** zone, `from-zone Z to-zone junos-host { match source-address
+    BAD; match application any; then deny; }` does **NOT** stop BAD's IKE / IPsec
+    NAT-T (UDP 500/4500): the userspace IPsec-passthrough stage returns BEFORE the
+    fine junos-host policy, and the kernel decrypts host-terminated IPsec before
+    any deny — so 500/4500 is admitted regardless of the deny. Likewise on an
+    **ident-resetting** zone (`system-services ident-reset`, not `all`) the same
+    deny still answers BAD's TCP/113 with a RST, not a silent drop. This is
+    faithful to the Rust runtime (Stage-11 passthrough / the coarse ident-reset
+    terminal both run pre-fine), not a bug. To actually deny IKE/ident from a
+    source, remove the coarse admission (drop `ike` / `ident-reset` from the
+    zone's `host-inbound-traffic`) rather than relying on a junos-host `deny`.
+- **Observability.** `xpf_host_inbound_junos_host_denies_total{scope,family}`
+  (nft named counters, distinct from the coarse
+  `xpf_host_inbound_kernel_denies_total`). This does **not** populate per-Junos-
+  policy hit counters / `then count` / RT_FLOW deny attribution — nft cannot
+  attribute a drop to a policy object; that is the one "counters stay zero" symptom
+  the direct path retains. The userspace XSK path keeps its own attribution.
+
+**Representable subset:** action `deny`; `match source-address` /
+`source-address-excluded` resolving entirely to *static* address-book CIDRs
+(recursively feed-untainted); `match application` reducing to simple
+proto + optional dst/src port + optional ICMP type/code (application-sets
+OR-expanded to multiple rules); `match destination-address any`; **no**
+`scheduler-name`; ingress zone **not** `tcp-rst`.
+
+**Un-representable remainder (keeps the commit warning below):** feed-tainted
+source, multi-term / ALG application, an application scoped to an IPsec/ident
+exempt tuple, an **explicit** `match destination-address` (needs the live
+firewall-local set to validate — deferred to a follow-up), a scheduler-gated
+policy, a `tcp-rst` ingress zone (silent drop would diverge from Junos's RST
+verdict class), `reject`, and the "deny non-permitted" half of a source-restricted
+`permit` (the reject and source-restricted-permit slices are tracked follow-ups
+using the identical machinery). No partial/coarsened kernel rule is ever emitted
+for the remainder.
+
+### Commit-time warning (direction c — shipped; now suppressed on render)
 
 `config.validateJunosHostDirectDeliveryWarnings` (`pkg/config/compiler_validate_warn.go`,
 run inside `ValidateConfig`) emits a WARN-only commit message for each `to-zone
 junos-host` policy — zone-pair or global — that is **stricter than the coarse
-gate**: a `then deny`/`then reject` (the coarse gate cannot deny a service it
-permits), or a `then permit` with a source-address restriction (the coarse gate
-admits any source). The trigger is deliberately conservative — a plain
-`permit`-from-any to junos-host only mirrors the coarse permit-by-service gate and
-does **not** warn, and an application-only scope is not a standalone trigger
-because the coarse gate already filters by service/dport. It is **never a hard
-reject**: the config is legal Junos, and a reject would brick a previously
-committed config. The warning names the policy and points here.
+gate** (a `then deny`/`then reject`, or a source-restricted `then permit`) AND is
+**not** enforced by the direction-(b) projection above. A representable DENY that
+renders an enforced kernel rule in every enforceable ingress zone it applies to
+has its warning **suppressed** (`BuildJunosHostDenyProjection().RenderedPolicyKeys`);
+an un-representable / lifeline-only / unenforceable policy still warns. The trigger
+is deliberately conservative — a plain `permit`-from-any to junos-host only mirrors
+the coarse permit-by-service gate and does **not** warn. It is **never a hard
+reject**: the config is legal Junos and a reject would brick a previously committed
+config. The warning names the policy and points here.
 
-### Enforcement (directions a/b — deferred on #4146)
+### Historical alternatives (rejected)
 
-Actually enforcing the fine junos-host restriction on the direct path is a
-security-vs-availability decision, not a mechanical fix, so it stays open on #4146:
-
-- **(a) Withhold junos-host-policy'd interface IPs from the local set**
-  (`buildLocalAddressEntries` / `buildDesiredLocalAddressSets`,
-  `pkg/dataplane/userspace/maps_sync.go`). `is_local_destination` then returns
-  false, the packet falls through to the XSK redirect, and the existing
-  `LocalDelivery` junos-host gate enforces the deny. **Cost:** the XSK
-  redirect-error arm is fail-CLOSED (`drop_degraded_transit` → `XDP_DROP`,
-  `lib.rs`), so a withheld IP is **dropped** while the dataplane helper is down —
-  turning "management always reachable" into "reachable only while the helper is
-  healthy", the exact moment an operator needs to log in. Rejected as specified.
-- **(a′) Route LOCAL destinations to the kernel on the redirect-error arm** plus
-  (a)'s withholding — steady-state enforces the deny, helper-down falls open to
-  kernel delivery. A moderate shim change with a bounded (crash-window-only)
-  fail-open on the deny.
-- **(b) Mirror source/application-scoped junos-host policy into the kernel nft
-  `xpf_hostinbound`/`xpf_lo0` chains** — preserves availability, but nft can
-  express only daddr-set + service/dport, not full application/ALG/feed semantics,
-  so it would be a partial mirror that itself introduces a new (coarser) parity
-  gap, and it doubles the enforcement SSOT. The right long-term parity answer, but
-  needs an nft-representability spec.
+- **(a) Withhold junos-host-policy'd interface IPs from the local set** so the
+  packet falls through to the XSK `LocalDelivery` junos-host gate. Rejected: the
+  XSK redirect-error arm is fail-CLOSED (`drop_degraded_transit` → `XDP_DROP`,
+  `lib.rs`), so a withheld IP is **dropped** while the helper is down — inverting
+  "management always reachable". Also blocked by the #1864 shim verifier ceiling.
+- Enforcing the fine restriction inside **userspace-dp** — wrong locus: a direct
+  host-bound packet never reaches the helper (the kernel delivers it).
 
 ## Non-handshake TCP first packet on the LocalDelivery session-miss install (#2151 / #4487 / #4539)
 
