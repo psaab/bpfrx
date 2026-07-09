@@ -574,15 +574,34 @@ var ddnsProviderStringProps = map[string]bool{
 // way, matching pre-#4837 runtime behavior exactly; only the warning is new.
 func compileDDNSServices(node *Node, lenient bool) (*DDNSServicesConfig, []string, error) {
 	cat := &DDNSServicesConfig{Providers: map[string]*DDNSProvider{}}
+	var warnings []string
 	for _, inst := range namedInstances(node.FindChildren("provider")) {
 		p := compileDDNSProvider(inst.name, inst.node)
-		if p != nil {
-			cat.Providers[p.Name] = p
+		if p == nil {
+			continue
+		}
+		cat.Providers[p.Name] = p
+		// TLS enforcement (#4861): a credentialed HTTP backend
+		// (dyndns2/duckdns/cloudflare/route53/generic) must not carry its
+		// update credential over a plaintext http:// endpoint. Strict
+		// (commit / commit-check) hard-rejects; lenient (load / peer-sync)
+		// downgrades to a warning so an already-persisted config an older
+		// binary accepted still boots (#1960 fail-closed-on-load class). The
+		// redirect-downgrade half (an https endpoint 30x'd to http) is blocked
+		// at runtime by the shared client's CheckRedirect (pkg/ddns).
+		if field, val, bad := ddnsPlaintextCredentialEndpoint(p); bad {
+			msg := fmt.Sprintf("system services dynamic-dns provider %q (backend %s) "+
+				"%s %q must be an https:// endpoint — a credentialed backend over a "+
+				"plaintext http:// endpoint transmits the update credential in cleartext",
+				p.Name, p.Backend, field, RedactURL(val))
+			if !lenient {
+				return nil, nil, fmt.Errorf("%s", msg)
+			}
+			warnings = append(warnings, msg)
 		}
 	}
 	// Engine tunables: a duration ("24h") or a bare-seconds integer. They may
 	// appear as a child node OR packed into the block's Keys (flat-set).
-	var warnings []string
 	for _, leaf := range []string{"forced-refresh", "error-backoff-max"} {
 		v := ddnsServicesScalar(node, leaf)
 		if v == "" {

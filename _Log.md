@@ -43853,3 +43853,5 @@ top.
   **File(s)**: pkg/config/syslog_logfile.go, pkg/cli/cli_show_system.go, pkg/grpcapi/server_show.go, +tests
   **Action**: #4857 — validate interface name in DHCP duidPath; reject path traversal in ClearDUID/load/save so a crafted `interface` cannot unlink a root file outside the DUID state dir
   **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/clearduid_traversal_4857_test.go
+  **Action**: #4861 — reject plaintext http:// endpoints for credentialed DDNS backends at commit (compileDDNSServices, strict/lenient) + refuse HTTPS->HTTP redirect downgrade in the shared HTTP client (newHTTPClientBound CheckRedirect)
+  **File(s)**: pkg/config/compiler_ddns_tls.go, pkg/config/compiler_system.go, pkg/ddns/backend_http.go, +tests
