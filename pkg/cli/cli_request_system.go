@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 func (c *CLI) handleRequestSystem(args []string) error {
@@ -65,16 +68,19 @@ func (c *CLI) handleRequestSystem(args []string) error {
 			return nil
 		}
 
-		// Remove active and candidate configs, rollback history
+		// Securely erase the config-DB SSOT + master.key + audit journal +
+		// rollback history (#4858). The pre-fix wipe removed only top-level
+		// .conf / rollback* files and LEFT .configdb/{active,candidate,
+		// rollback.N}.json + master.key + .config.journal behind, so the daemon
+		// reloaded the "erased" config and secrets on the next boot (a false
+		// factory reset). Route through the shared configstore primitive and
+		// refuse to report success if the erasure did not complete.
 		configDir := "/etc/xpf"
-		files, _ := os.ReadDir(configDir)
-		for _, f := range files {
-			if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
-				os.Remove(configDir + "/" + f.Name())
-			}
+		if err := configstore.FactoryResetConfigDir(configDir, "xpf.conf"); err != nil {
+			return fmt.Errorf("zeroize: configuration state not fully erased: %w", err)
 		}
 
-		// Remove BPF pins
+		// Remove BPF pins (no secret material)
 		os.RemoveAll("/sys/fs/bpf/xpf")
 
 		// Remove managed networkd files
@@ -85,7 +91,14 @@ func (c *CLI) handleRequestSystem(args []string) error {
 			}
 		}
 
-		// Remove FRR managed section
+		// Verify the config DB SSOT is gone before reporting success — a
+		// zeroize that leaves it behind must not print "erased".
+		if _, err := os.Stat(filepath.Join(configDir, ".configdb")); !os.IsNotExist(err) {
+			return fmt.Errorf("zeroize: config DB still present after wipe (stat err=%v)", err)
+		}
+
+		// Stop the daemon so it releases interface/dataplane state; the reboot
+		// completes the factory reset.
 		exec.Command("systemctl", "stop", "xpfd").Run()
 
 		fmt.Println("System zeroized. Configuration erased.")
