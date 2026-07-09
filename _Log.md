@@ -22,6 +22,121 @@
 - **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests.rs (deleted),
   userspace-dp/src/afxdp/cos/queue_service/tests/{mod,selector,drain,wakeup,waterfill,sojourn,refund,submit}.rs,
+## 2026-07-09 — #4707: report current CPU utilization, not since-boot average
+
+- **Timestamp**: 2026-07-09
+- **Action**: OBSERVABILITY fix. The Prometheus system collector read the
+  cumulative `/proc/stat` aggregate-cpu ticks once per scrape and exported
+  `(user+nice)/total*100*cpus` and `system/total*100*cpus` as `GaugeValue`
+  with no previous-tick state, so both gauges reported a since-boot lifetime
+  AVERAGE that barely moves as uptime grows — a real CPU spike at hour 100 was
+  invisible and load alarms silently never fired. The inline comment even
+  mislabeled it "instantaneous snapshot". Fix (metrics_system.go): persist the
+  prior aggregate-cpu sample on the collector (`cpuSamplePrev`/`cpuSampleValid`
+  in metrics.go, guarded by the existing `c.mu` because Collect can run
+  concurrently for parallel scrapers — same pattern as the fairness-throughput
+  window) and report the inter-scrape delta `(busyΔ/totalΔ)`. Refactored the
+  `/proc/stat` reading behind a seam: `parseProcStatCPU(line)` parses the
+  aggregate line into a `cpuSample{userNice,system,total}`; `cpuUtilization`
+  computes the delta and skips (ok=false) when totals did not advance or a
+  counter went backwards (suspend/hotplug reset); `updateCPUUtilization` folds
+  a sample into collector state and returns emit=false on the FIRST scrape (no
+  predecessor) so no bogus value is published. Updated the two metric help
+  strings (metrics_descriptors.go) to say "over the last scrape interval".
+  Tests (metrics_cpu_current_4707_test.go): parse coverage (full/short/per-core
+  reject), a RED-on-revert delta guard (busy-at-boot-then-idle fixture: delta
+  =10%/2% but cumulative =79.3% — reverting to the since-boot form makes the
+  test FAIL, verified empirically), first-sample-skip handling, and the
+  no-advance/backwards/zero-cpu guards. Validation: gofmt; `go build ./...`
+  clean; `go test ./pkg/api/...` green; FULL Go suite green (53 ok / 0 FAIL /
+  3 no-test).
+  **File(s)**: pkg/api/metrics.go, pkg/api/metrics_system.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_cpu_current_4707_test.go,
+  _Log.md
+## 2026-07-08 — #4714: reject dangling trailing negation in tcp-flags (fail-closed)
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4714 — `ParseTCPFlagsExpression` in `pkg/config/tcp_flags.go`
+  tracked `pendingNeg` but never checked for a dangling `pendingNeg==true`
+  after the token loop, so a firewall-filter `tcp-flags` value whose `!` had
+  no flag operand parsed WITHOUT error and the negation was silently dropped —
+  a fail-open on the missing forbidden-flag constraint. Verified on
+  origin/master: `tcp-flags "!"` returned `(0,0,false,nil)` (no constraint at
+  all) and `"syn & !"` returned `(SYN,0,true,nil)` (trailing `!` dropped, term
+  now matches SYN with no ACK exclusion). The only caller is the #3076
+  commit-layer guard at `compiler_firewall.go:268` (→ `CompileConfig`), so the
+  malformed expression committed cleanly. Fix (fail-closed): reject a dangling
+  negation with a clear error naming the expression — added an `if pendingNeg`
+  guard after the token loop (catches trailing `!`, e.g. `"!"`, `"syn & !"`)
+  AND a `pendingNeg` check in the `&` case (catches a `!` immediately before a
+  separator with no operand, e.g. `"! & ack"`). Valid negations (`!ack`,
+  `syn & !ack`, `!syn & !ack`, `(syn & !ack)`) are unaffected. Double-negation
+  `!!` (even count → `pendingNeg` false) is out of #4714 scope and deliberately
+  not touched (not a fail-open — it cancels to the un-negated flag).
+  Tests: extended the `TestParseTCPFlagsExpression` table with three dangling
+  cases; added `TestParseTCPFlagsDanglingNegation` (5 reject + 7 accept
+  over-rejection guards asserting exact masks) and a commit-path assert in
+  `TestFirewallFilterTCPFlagsCommitReject`. RED-on-revert confirmed: stashing
+  the parser fix makes every new reject assertion FAIL. Validation: gofmt;
+  `go build ./...` clean; `go test ./pkg/config/...` green; FULL Go suite green
+  (53 packages ok, 0 FAIL).
+  **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go, _Log.md
+
+## 2026-07-08 — #4705: resolve master-password across ALL system stanzas (no plaintext DB leak)
+
+- **Timestamp**: 2026-07-08
+- **Action**: SECURITY fix. `masterPasswordPRF` (crypto.go) resolved the
+  encryption PRF via a single first-match `tree.FindChild("system")`, so a
+  `master-password` in a SECOND top-level `system {}` stanza was missed and the
+  whole config DB was written to disk in PLAINTEXT despite encryption being
+  configured. VERIFY-FIRST confirmed reachability at every layer: the Junos
+  parser does NOT merge duplicate top-level stanzas (`parseStatements` appends
+  each), `LoadOverride`/`SyncApply` feed the raw parsed tree to the write path,
+  schema validation accepts duplicate `system` nodes, and the compiler
+  (`compileSections` loops all top-level nodes) folds every `system` node into
+  the same `cfg.System` — so the master-password is semantically active but the
+  crypto path missed it. Fix: resolve via the EXISTING `systemBlocksOf` helper
+  (the same all-matches walk the dataplane-retirement code uses) +
+  `FindChildren("master-password")` within each; encrypt if ANY carries a PRF
+  (fail closed). The #4579 A4-06 plaintext-downgrade warning (db.go
+  readTreeMeta) keys off the same `masterPasswordPRF`, so centralizing the
+  resolution repairs that path for the split-stanza case too. Added two
+  RED-on-revert tests: (1) parse two `system` stanzas (master-password only in
+  the 2nd) -> persisted DB encrypted, not plaintext; (2) plaintext-on-disk
+  split-stanza DB read back -> #4579 downgrade warning fires. Reverting to
+  first-match makes BOTH FAIL. README crypto note added.
+- **Validation**: gofmt; go build ./...; RED-on-revert confirmed (buggy
+  first-match → `masterPasswordPRF = ""` → test FAIL); fixed → PASS;
+  `pkg/configstore/...` + `pkg/config/...` green; FULL Go suite green (53 ok,
+  0 fail).
+- **File(s)**: pkg/configstore/crypto.go,
+  pkg/configstore/masterpw_split_system_4705_test.go,
+  pkg/configstore/README.md, _Log.md
+## 2026-07-08 — #4712: deterministic sorted iteration in show-text endpoints
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4712 — `pkg/api/show_text.go` (the `/show-text` REST handler)
+  ranged over string-keyed config maps directly for 12 topics (schedulers,
+  snmp communities/trap-groups, dhcp-relay server-groups/groups, firewall
+  filters, dynamic-address feeds, address-book addresses/address-sets,
+  applications/application-sets, netflow-v9 templates). Go randomizes map
+  iteration order, so the rendered operator/automation-facing text came back
+  in a different order across requests, breaking config diffing and making
+  downstream tests flaky. Verified all 12 cited fields are `map[string]*...`
+  (nat-static/nat-nptv6 iterate slices → already deterministic, correctly not
+  cited). Fix: added a generic `sortedKeys[V any](map[string]V) []string`
+  helper (collect keys, `sort.Strings`, iterate) and routed all 12 sites
+  through it — minimal, local, no handler restructuring. New regression test
+  stages multi-key maps (scrambled insertion order) for applications,
+  address-book, and snmp, renders each topic 40× and asserts (1) byte-identical
+  output across renders and (2) ascending-key ordering; proved RED under both a
+  reverse-sort and a raw map-range revert. Validation: gofmt -w; go build
+  ./... clean; go test ./pkg/api/... green; FULL Go suite 52 ok / 3 no-test,
+  sole FAIL is the pre-existing pkg/ddns RFC2136 port-bind flake (passes in
+  isolation, unrelated — change is pkg/api-only). No docs change: this
+  restores expected deterministic output; no operator-facing contract or
+  module doc describes the prior (buggy) ordering.
+  **File(s)**: pkg/api/show_text.go, pkg/api/show_text_sorted_4712_test.go,
   _Log.md
 
 ## 2026-07-08 — #4422 slice: firewall-filter port-on-non-port / TCP-only / ICMP-only regression coverage

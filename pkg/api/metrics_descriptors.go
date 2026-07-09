@@ -423,12 +423,18 @@ func newCollector(srv *Server) *xpfCollector {
 
 		sysCPUUser: prometheus.NewDesc(
 			"xpf_system_cpu_user_percent",
-			"User CPU utilization percentage.",
+			// #4707: inter-scrape delta (busyΔ/totalΔ), scaled by CPU count,
+			// NOT the since-boot cumulative average. Not emitted on the first
+			// scrape (no predecessor sample yet).
+			"User+nice CPU utilization percentage over the last scrape interval "+
+				"(summed across CPUs).",
 			nil, nil,
 		),
 		sysCPUSystem: prometheus.NewDesc(
 			"xpf_system_cpu_system_percent",
-			"System CPU utilization percentage.",
+			// #4707: inter-scrape delta (busyΔ/totalΔ), scaled by CPU count.
+			"System CPU utilization percentage over the last scrape interval "+
+				"(summed across CPUs).",
 			nil, nil,
 		),
 		sysMemTotal: prometheus.NewDesc(

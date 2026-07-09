@@ -155,6 +155,19 @@ type xpfCollector struct {
 	daemonUptime *prometheus.Desc
 	daemonMemRSS *prometheus.Desc
 
+	// #4707: previous /proc/stat aggregate-cpu tick sample, used to compute
+	// the inter-scrape CPU-utilization delta. The pre-#4707 collector divided
+	// cumulative-since-boot busy ticks by cumulative total ticks and exported
+	// the ratio as a gauge — a lifetime average that barely moves as uptime
+	// grows, so a real CPU spike at hour 100 was invisible and load alarms
+	// silently never fired. We now persist the prior sample and report
+	// (busyΔ/totalΔ) between consecutive scrapes (the idiomatic Prometheus
+	// approach). Guarded by c.mu because Collect can run concurrently for
+	// parallel scrapers. cpuSampleValid is false until the first scrape has
+	// stored a predecessor, so no CPU gauge is emitted that first round.
+	cpuSamplePrev  cpuSample
+	cpuSampleValid bool
+
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
 	frrReloadDegraded   *prometheus.Desc
