@@ -137,10 +137,17 @@ func (m *Manager) interfaceBusy(name string) bool {
 // replace, AND emits the now-owed goodbye (the withdraw wins).
 func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProvenClose func() error) error {
 	if s != nil {
+		// #4830: time.After inside a select leaks its Timer in the runtime's
+		// timer heap until it fires (up to claimWaitTimeout) whenever the
+		// OTHER case (s.stopped) wins the select first — the common path,
+		// since most releases join promptly. time.NewTimer + a deferred
+		// Stop reclaims it immediately instead.
+		t := time.NewTimer(claimWaitTimeout)
+		defer t.Stop()
 		select {
 		case <-s.stopped:
 			// proven closed — fall through to the ordered decision below.
-		case <-time.After(claimWaitTimeout):
+		case <-t.C:
 			slog.Warn("ra: timed out joining draining sender; not emitting a "+
 				"standalone goodbye and not starting a replacement (owner may "+
 				"still hold a live conn); leaving tombstone held", "interface", name)

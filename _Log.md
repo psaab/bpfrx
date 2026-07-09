@@ -43732,5 +43732,7 @@ top.
   **File(s)**: pkg/config/compiler_interface_range.go, pkg/config/compiler_interface_range_4027_test.go
 
 - **Timestamp**: 2026-07-09
+  **Action**: Fix #4830 — pkg/ra time.After inside select leaked the underlying Timer in the runtime's timer heap until it fired (up to claimWaitTimeout/timeout) whenever the OTHER select case won first, in releaseDrain (ra.go) and sender.waitConnReady (sender.go); replaced both with time.NewTimer + defer Stop(); added a source-pattern RED-on-revert guard (no direct timer-count test is possible) plus fast-path/timeout behavior tests for waitConnReady
+  **File(s)**: pkg/ra/ra.go, pkg/ra/sender.go, pkg/ra/timer_leak_4830_test.go
   **Action**: Fix #4810 — loadRollbackHistory skipped an unreadable/corrupt intermediate rollback slot with a bare `continue`, collapsing every later slot's positional index down by one, so `rollback N` silently resolved to slot N+1's config; push a tombstone (nil-Config) HistoryEntry to preserve position==slot-number, add Store.rollbackEntry() to reject a tombstoned slot with a clear error (used by Rollback + all ShowRollback*/ShowCompareRollback* readers), and guard saveRollbackFiles against writing/dereferencing a tombstone on the next commit; add RED-on-revert tests for the index-shift, the Rollback(n) end-to-end symptom, and the save-side nil-deref panic risk
   **File(s)**: pkg/configstore/store_commit.go, pkg/configstore/store_format.go, pkg/configstore/durability_3441_test.go
