@@ -1,3 +1,28 @@
+## 2026-07-09 — #4710: redact Secret in YAML marshal/unmarshal (close the JSON/YAML asymmetry)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4710 — `config.Secret` (pkg/config/secret.go) had a
+  fail-closed JSON round-trip guard (`MarshalJSON` redacts, `UnmarshalJSON`
+  REFUSES the `<redacted>` sentinel via `errRedactedSecretIngest`) and an
+  already-present defensive `MarshalYAML`, but NO `UnmarshalYAML` — an
+  asymmetry: yaml.v3 would decode the literal `<redacted>` straight into a
+  Secret, bypassing the guard the moment YAML config ingestion is wired up.
+  VERIFY-FIRST decision: NOT premature. `gopkg.in/yaml.v3` already exists in
+  the module graph (go.sum + module cache; pulled via pkg/dhcp + testify), and
+  `Secret`/`SNMPConfig`/`SNMPCommunity` already carry `MarshalYAML` methods, so
+  the project already committed to covering the YAML marshal surface — the
+  missing unmarshal half is the real gap, not a hypothetical new dependency.
+  Added `func (s *Secret) UnmarshalYAML(value *yaml.Node) error` mirroring
+  `UnmarshalJSON` byte-for-byte in behavior (decode scalar → reject
+  `SecretRedacted` with the SAME `errRedactedSecretIngest` sentinel → else
+  assign). Promoted yaml.v3 to a direct require via `go mod tidy` (go.sum
+  unchanged — already present). RED-on-revert test `TestSecretUnmarshalYAML`
+  drives the real yaml.v3 encoder/decoder: plain scalar ingests, a full
+  marshal→unmarshal round-trip of a live Secret is REFUSED; neutering the
+  sentinel guard makes the assertion fail (proven). go build ./... clean, go
+  vet clean, pkg/config green, whole-repo `go test ./...` green.
+  **File(s)**: pkg/config/secret.go, pkg/config/secret_test.go, go.mod
+
 ## 2026-07-09 — #4731: stream `show ... | match/except/count/last` filters instead of buffering full output
 
 - **Timestamp**: 2026-07-09
