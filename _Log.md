@@ -43261,3 +43261,21 @@ top.
   under -race as root.
 - **File(s)**: pkg/dataplane/maps_session.go,
   pkg/dataplane/maps_session_clear_test.go, _Log.md
+
+- **Timestamp**: 2026-07-09
+- **Action**: #4422 flowexport multi-group wire-collision — VERIFY-FIRST:
+  CORRECT (not a bug). #3740 already stamps a unique per-group SourceID
+  (NetFlow v9, RFC 3954 §5.1) / Observation Domain ID (IPFIX, RFC 7011
+  §3.1) via stableExporterID(protocol, InstanceName, TemplateName), so two
+  flow-monitoring groups to ONE collector never collide on the RFC decode
+  key; shared template IDs 256/257 are RFC-correct (scoped per observation
+  domain). Gap: existing #3740 guards hand-build ExportConfig{} with
+  explicit distinct TemplateNames — none drive the real config resolver ->
+  NewExporter -> wire path. Added end-to-end coverage: a two-template
+  `services flow-monitoring version9`/`version-ipfix` config with two
+  flow-servers at one collector -> ResolveV9/IPFIXTemplateGroups (2 groups)
+  -> one exporter per group -> assert DISTINCT nonzero SourceID/ODID on the
+  wire while both carry the shared data template ID 256. RED-on-regression
+  verified (collapse stableExporterID to constant 1 -> both new tests FAIL
+  on "wire collision"; restored -> green). Full Go suite green.
+- **File(s)**: pkg/flowexport/multigroup_wire_4422_test.go, _Log.md
