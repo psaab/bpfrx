@@ -43315,3 +43315,27 @@ top.
   interfaces, family split, output excluded). Mutation-verified the asserts
   bite. Full Go suite green (53 pkg ok).
 - **File(s)**: pkg/routing/routing_test.go, _Log.md
+
+- **Timestamp**: 2026-07-09 (session 015oARShYtiJJ2H4UB4nXGqi)
+- **Action**: #4422 slice — pin the CLEAN Surface A DDNS provider-transition.
+  VERIFY-FIRST: CORRECT, no bug. When a binding's `provider` reference is
+  switched A->B while BOTH providers stay in the catalog, the transition is a
+  clean hand-off: Pass 1 publishes B at B's endpoint; Pass 2 sees the old
+  A-scope as gone-from-config, classifyOwnedBackend finds A still present with a
+  matching fingerprint (ownedBackendOK) and issues a REAL withdraw at A's OWN
+  (original) endpoint using A's own config/creds — no orphan, no leaked
+  ownership, no leaked per-scope runtime state, no double-update (A gets a
+  withdraw, B gets a publish; neither gets both). The #3735 orphan proofs only
+  cover the UN-withdrawable variants (A removed=H01 / mutated=H02 / edited after
+  removal=H03), so this everyday two-provider switch was a coverage gap. There
+  are no per-provider goroutines to leak (reconcile is synchronous; HTTP
+  transports are cached by source-binding, not creds). Added 2 behavior-pinning
+  tests: SwitchBothConfiguredCleanHandoff (real withdraw at ns-a, publish at
+  ns-b, Orphaned==0/DeleteOK==1/UpsertOK==2/Scopes==1, old runtime entry dropped,
+  status shows one published prov-b row) + UnchangedSteadyStateNoWithdraw guard
+  (same-provider forced re-assert republishes, never withdraws/orphans).
+  Mutation-verified: forcing classifyOwnedBackend to treat the present provider
+  as gone flips the withdraw into an orphan -> ns-a deletes==0 goes RED.
+  go build clean; go test ./pkg/ddns green; go test -race ./pkg/ddns green;
+  full Go suite green.
+- **File(s)**: pkg/ddns/surface_a_provider_transition_4422_test.go, _Log.md
