@@ -42981,6 +42981,35 @@ top.
   Validation: gofmt; go vet; new test PASS (2 subtests); touched packages
   (cmd/cli, pkg/config, pkg/policymatch) green; FULL Go suite green.
   **File(s)**: pkg/policymatch/reject_matrix_4422_test.go, _Log.md
+- **Timestamp**: 2026-07-09
+  **Action**: #4718 — surface NAT reconcile parse failures instead of
+  silently dropping the rule. The three sibling NAT snapshot reconcilers
+  dropped a rule/prefix whose IP/prefix/pool field the Go control plane
+  sent but the helper could not parse, via a bare `continue`/`{}` with NO
+  diagnostic — so an operator debugging config/sync drift got zero signal a
+  NAT rule had vanished. Added `NatCounterStore::record_parse_error` (a
+  loud `eprintln!` naming the offending rule+field, journald via stderr,
+  plus a cumulative `parse_errors` atomic — the testable seam) and wired it
+  into all skip sites: destination.rs (unparseable destination prefix+addr,
+  destination addr, pool addr — issue :324/:330/:343), static_nat.rs
+  (external-ip / internal-ip — :357/:361), source.rs `parse_match_prefix`
+  (unparseable source/destination match prefix — :1375). Continue to install
+  the VALID rules (drop only the bad one — a single malformed rule from a
+  mixed-version peer-sync must NOT take down all NAT). This restores the
+  loud-skip doctrine nat64.rs (#3888) already documents its siblings follow.
+  Rust-only; the Go commit-check remains the primary gate — this is the
+  helper-boundary backstop made observable. RED-on-revert tests added per
+  reconciler (one unparseable rule + valid rules -> valid installed AND
+  parse_errors bumped) + all-valid guard (zero errors). The DNAT test
+  caught an incomplete first cut (pool site unfixed -> counter 1 not 2),
+  confirming the seam is revert-sensitive.
+  Validation: `cargo build` clean; `cargo test --release nat` 674 pass /
+  0 fail (incl. 6 new); full serial suite (see PR).
+  **File(s)**: userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/destination.rs, userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests_destination.rs,
+  userspace-dp/src/nat/tests_static.rs, userspace-dp/src/nat/tests_source.rs,
+  _Log.md
 
 ## 2026-07-09 — #4717 RejoinAndConfirm surface PeerAlive/SyncEstablished errors
 - **Timestamp**: 2026-07-09

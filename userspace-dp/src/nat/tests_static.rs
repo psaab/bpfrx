@@ -677,6 +677,95 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
     assert_eq!(ips, vec!["203.0.113.5".parse::<IpAddr>().unwrap()]);
 }
 
+// #4718 FAIL-ON-REVERT: a static-NAT batch carrying rules with an UNPARSEABLE
+// external-ip / internal-ip must (1) still install the VALID rules and (2)
+// SURFACE each drop via the NatCounterStore parse-error counter, instead of
+// the pre-#4718 silent `continue`. Reverting `record_parse_error` back to a
+// bare `continue` (the old behaviour) leaves `parse_errors() == 0`, turning
+// the surfacing assertion RED — while the valid-rule assertion still passes,
+// proving the fix keeps the good rules installing.
+#[test]
+fn static_nat_unparseable_ip_surfaces_and_keeps_valid_rules() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[
+            // Bad: external-ip is garbage — dropped, but must be surfaced.
+            StaticNATRuleSnapshot {
+                name: "bad-ext".to_string(),
+                external_ip: "not-an-ip".to_string(),
+                internal_ip: "10.0.0.5".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+            // Bad: internal-ip is garbage (external parses, internal does not)
+            // — a second surfaced drop.
+            StaticNATRuleSnapshot {
+                name: "bad-int".to_string(),
+                external_ip: "203.0.113.9".to_string(),
+                internal_ip: "garbage/33".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+            // Valid: must still install despite the malformed siblings.
+            StaticNATRuleSnapshot {
+                name: "good".to_string(),
+                from_zone: "untrust".to_string(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+                ..StaticNATRuleSnapshot::default()
+            },
+        ],
+        &counters,
+    );
+    // (1) The valid rule installed: inbound DNAT translates ext -> int.
+    assert_eq!(
+        table.match_dnat("203.0.113.10".parse().unwrap(), "untrust"),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "valid static-NAT rule must install despite sibling parse failures"
+    );
+    // The bad rule with a valid external-ip must NOT have installed.
+    assert_eq!(
+        table.match_dnat("203.0.113.9".parse().unwrap(), "untrust"),
+        None,
+        "a static-NAT rule with an unparseable internal-ip must be dropped"
+    );
+    // (2) Both drops surfaced on the counter — RED on the silent-skip revert.
+    assert_eq!(
+        counters.parse_errors(),
+        2,
+        "each unparseable static-NAT field must bump the parse-error counter"
+    );
+}
+
+// #4718 guard: an all-valid static-NAT batch installs its rule with ZERO
+// parse errors — no false positive from the surfacing path.
+#[test]
+fn static_nat_all_valid_reports_no_parse_errors() {
+    let counters = crate::nat::NatCounterStore::default();
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "good".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            ..StaticNATRuleSnapshot::default()
+        }],
+        &counters,
+    );
+    assert!(
+        table
+            .match_dnat("203.0.113.10".parse().unwrap(), "untrust")
+            .is_some(),
+        "the valid rule must install"
+    );
+    assert_eq!(
+        counters.parse_errors(),
+        0,
+        "an all-valid batch must report zero parse errors"
+    );
+}
+
 #[test]
 fn static_nat_canonical_cidr_mask_v6_installs_entry() {
     // IPv6 canonical host form carries /128; same root cause as the v4 case.

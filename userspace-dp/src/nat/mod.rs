@@ -240,6 +240,14 @@ type NatCounterRegistry = FxHashMap<u32, Arc<NatRuleCounter>>;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NatCounterStore {
     counters: Arc<Mutex<NatCounterRegistry>>,
+    /// #4718: cumulative count of NAT reconcile PARSE failures — a rule or
+    /// match prefix the Go control plane sent whose IP/prefix/pool field this
+    /// helper could not parse, so the offending rule/prefix was dropped from
+    /// the rebuilt forwarding state. Shared behind an `Arc` so a clone handed
+    /// to `from_snapshots` increments the SAME atomic the coordinator (and the
+    /// fail-on-revert test) reads. Monotonic error counter, not a gauge: it is
+    /// only bumped, never reset by a reconcile.
+    parse_errors: Arc<AtomicU64>,
 }
 
 impl NatCounterStore {
@@ -293,5 +301,47 @@ impl NatCounterStore {
             .iter()
             .map(|(&id, counter)| counter.snapshot(id))
             .collect()
+    }
+
+    /// #4718: record one NAT reconcile PARSE failure and surface it LOUDLY.
+    ///
+    /// The three sibling NAT snapshot reconcilers — `DnatTable::from_snapshots`
+    /// (destination.rs), `StaticNatTable::from_snapshots` (static_nat.rs), and
+    /// `parse_source_nat_rules_with_previous` via `parse_match_prefix`
+    /// (source.rs) — drop a rule or match prefix whose IP/prefix/pool field the
+    /// Go control plane emitted but this helper cannot parse. That data path is
+    /// an INTERNAL inconsistency: the Go commit-check already validates operator
+    /// config, so an unparseable field here means a mixed-version peer-sync, a
+    /// serialization bug, or a missed Go validation edge — never an
+    /// operator-present commit. The correct posture is defense-in-depth: DROP
+    /// ONLY the bad rule so the VALID rules in the same batch still install (a
+    /// single malformed rule must not take down all NAT — that would be a worse
+    /// availability outcome than one silently-absent translation), but make the
+    /// drop OBSERVABLE.
+    ///
+    /// Pre-#4718 each of these skips was a bare `continue`/`{}` with no
+    /// diagnostic, so an operator debugging a config/sync drift got ZERO signal
+    /// that a NAT rule had vanished. This restores the loud-skip doctrine the
+    /// NAT64 builder already documents and follows (nat64.rs #3888): the
+    /// `eprintln!` reaches journald via stderr and NAMES the offending rule +
+    /// field; the atomic counter is a cumulative metric and the testable seam
+    /// the fail-on-revert test asserts. These reconcilers run only during
+    /// control-plane config apply / peer-sync, never the packet hot path, so
+    /// the log adds no forwarding latency.
+    pub(crate) fn record_parse_error(&self, detail: &str) {
+        self.parse_errors.fetch_add(1, Ordering::Relaxed);
+        eprintln!("xpf nat reconcile: dropping rule (unparseable field): {detail}");
+    }
+
+    /// #4718: cumulative NAT reconcile parse-failure count (see
+    /// [`record_parse_error`](Self::record_parse_error)). A `> 0` value means
+    /// at least one configured NAT rule/prefix was dropped at the helper
+    /// boundary and did NOT reach the dataplane. The operator-facing surface is
+    /// the per-drop `eprintln!` (journald); this accessor is the testable seam
+    /// the fail-on-revert tests assert, so it is gated to test builds to avoid
+    /// a dead-code warning until a metrics surface consumes it.
+    #[cfg(test)]
+    pub(crate) fn parse_errors(&self) -> u64 {
+        self.parse_errors.load(Ordering::Relaxed)
     }
 }

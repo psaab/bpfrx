@@ -568,3 +568,76 @@ fn reverse_decision_turns_snat_into_reply_dnat() {
     );
 }
 
+// #4718 FAIL-ON-REVERT: a source-NAT rule whose match set contains an
+// UNPARSEABLE prefix must (1) still translate via its VALID prefixes and (2)
+// SURFACE the dropped prefix via the NatCounterStore parse-error counter,
+// instead of the pre-#4718 silent `Err(_) => {}`. Reverting
+// `record_parse_error` back to the empty arm leaves `parse_errors() == 0` →
+// surfacing assertion RED, while the translation still succeeds (the fix does
+// not change the fail-closed match-set behaviour, only makes the drop
+// observable).
+#[test]
+fn source_nat_unparseable_match_prefix_surfaces_and_keeps_valid() {
+    let counters = crate::nat::NatCounterStore::default();
+    let rules = parse_source_nat_rules_with_previous(
+        &[SourceNATRuleSnapshot {
+            name: "snat-mixed".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec![
+                "garbage".to_string(),      // unparseable — surfaced drop
+                "10.0.61.0/24".to_string(), // valid — must still translate
+            ],
+            interface_mode: true,
+            ..SourceNATRuleSnapshot::default()
+        }],
+        None,
+        &counters,
+    );
+    // (1) The valid prefix still translates its source.
+    let hit = match_source_nat(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.7".parse().expect("in valid subnet"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert!(
+        hit.is_some(),
+        "valid source-NAT prefix must translate despite a malformed sibling"
+    );
+    // (2) The malformed prefix was surfaced — RED on the silent-skip revert.
+    assert_eq!(
+        counters.parse_errors(),
+        1,
+        "an unparseable source-NAT match prefix must bump the parse-error counter"
+    );
+}
+
+// #4718 guard: an all-valid source-NAT match set reports ZERO parse errors —
+// no false positive from the surfacing path.
+#[test]
+fn source_nat_all_valid_reports_no_parse_errors() {
+    let counters = crate::nat::NatCounterStore::default();
+    let _rules = parse_source_nat_rules_with_previous(
+        &[SourceNATRuleSnapshot {
+            name: "snat-clean".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["10.0.61.0/24".to_string(), "10.0.62.5".to_string()],
+            interface_mode: true,
+            ..SourceNATRuleSnapshot::default()
+        }],
+        None,
+        &counters,
+    );
+    assert_eq!(
+        counters.parse_errors(),
+        0,
+        "an all-valid match set must report zero parse errors"
+    );
+}
+
