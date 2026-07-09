@@ -43700,3 +43700,7 @@ top.
 - **Timestamp**: 2026-07-09
   - **Action**: #4455 Component B — commit-time WARN advisory for managed-FRR routing protocol (OSPF/OSPFv3/RIP) enabled on an interface whose zone omits the matching host-inbound-traffic token (the inverse of the shipped #4454 advisory)
   - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/host_inbound_managed_routing_mismatch_4455_test.go, docs/host-inbound-multicast.md
+
+- **Timestamp**: 2026-07-09
+  - **Action**: #4788 — commit-time WARN advisory for silently-dead `tunnel mode ipip` (IPIP unimplemented in userspace-dp, #4785)
+  - **File(s)**: pkg/config/compiler_validate_warn.go, pkg/config/ipip_tunnel_dead_warn_4788_test.go

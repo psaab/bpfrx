@@ -1613,6 +1613,11 @@ func ValidateConfig(cfg *Config) []string {
 	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
 	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
 
+	// #4788: `tunnel mode ipip` is accepted but not implemented in the userspace
+	// dataplane (#4785) — warn so the operator is not silently misled by a dead
+	// tunnel.
+	warnings = append(warnings, validateIpipTunnelDeadWarning(cfg)...)
+
 	// #4309 (fable-review-167 I-4): DHCP relay overrides accepted-only advisory.
 	warnings = append(warnings, validateDHCPRelayParityWarnings(cfg)...)
 
@@ -1966,6 +1971,58 @@ func validateInterfaceParityWarnings(cfg *Config) []string {
 			warnings = append(warnings, fmt.Sprintf(
 				"interfaces %s: %s configured but accepted-only — typed and stored but not enforced by the runtime yet (parity, #4308)",
 				name, strings.Join(knobs, ", ")))
+		}
+	}
+	return warnings
+}
+
+// validateIpipTunnelDeadWarning emits the #4788 commit-time advisory for a
+// tunnel configured with `mode ipip`. IPIP (ip-in-ip, proto-4/41) is accepted
+// and creates a Tuntap routing anchor, but it is NOT implemented in the
+// userspace dataplane (#4785, PLAN-DEFERRED): there is no userspace IPIP encap
+// or decap stage (unlike GRE), so under anchor-only an inbound proto-4 packet
+// is dropped fail-closed and an egress inner packet routed to the IPIP anchor
+// classifies as an unknown tunnel mode and drops — the tunnel is silently dead
+// in BOTH directions. This advisory surfaces that so an operator is not misled;
+// WARN-only, never a reject (valid Junos), mirroring the accepted-only doctrine
+// (#2078/#4308/#4309) and honoring #1960 lenient-load.
+func validateIpipTunnelDeadWarning(cfg *Config) []string {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
+	}
+	var warnings []string
+	advise := func(where string) {
+		warnings = append(warnings, fmt.Sprintf(
+			"interfaces %s tunnel mode ipip: IPIP (ip-in-ip) is accepted but NOT yet "+
+				"implemented in the userspace dataplane (#4785) — the tunnel is created "+
+				"but passes NO traffic in either direction (inbound proto-4 is dropped "+
+				"fail-closed; an egress inner packet classifies as an unknown tunnel mode "+
+				"and drops). Use `mode gre` or `mode wireguard` for a working tunnel.",
+			where))
+	}
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		iface := cfg.Interfaces.Interfaces[name]
+		if iface == nil {
+			continue
+		}
+		if iface.Tunnel != nil && iface.Tunnel.Mode == "ipip" {
+			advise(fmt.Sprintf("%q", name))
+		}
+		unitNums := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			unitNums = append(unitNums, u)
+		}
+		sort.Ints(unitNums)
+		for _, u := range unitNums {
+			unit := iface.Units[u]
+			if unit != nil && unit.Tunnel != nil && unit.Tunnel.Mode == "ipip" {
+				advise(fmt.Sprintf("%q unit %d", name, u))
+			}
 		}
 	}
 	return warnings
