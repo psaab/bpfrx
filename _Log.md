@@ -43953,6 +43953,8 @@ top.
   **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4878 type the IKE/IPsec-gateway DPD interval/threshold value leaves (ValueInteger + ValidateInteger(1,3600) / (1,100)) so garbage/zero/negative/overflow is rejected at commit-check (strict) and downgraded to a warning on tolerant load (#1960 via compileTreeLenient); both closed-world copies
+  **File(s)**: pkg/config/schema_security.go, pkg/config/dpd_typed_value_4878_test.go, docs/config-schema.md
   **Action**: #4961 scope RA supersession per-interface — WithdrawInterfaces/WithdrawOnce bump a per-interface epoch (ifaceEpoch) instead of the whole-manager fence; releaseDrain restart + applyDeferred check the per-interface baseline (drainEntry.startIfaceEpoch) so an unrelated withdraw of interface B no longer cancels interface A's in-flight restart (IPv6 loss)
   **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md
 
