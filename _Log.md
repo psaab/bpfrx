@@ -1,3 +1,42 @@
+## 2026-07-09 — #4713: reject out-of-range BGP peer-as/local-as (no uint32 wrap)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4713 — the BGP compiler parsed every `peer-as`/`local-as` leaf
+  with `strconv.Atoi(v)` then cast to `uint32(n)`, which SILENTLY WRAPPED an
+  out-of-range or negative AS onto a different-but-valid ASN: `peer-as -1` ->
+  remote-as 4294967295, and `peer-as 5000000000` -> 705032704 (a small-looking
+  ASN). The operator's intended AS then differed from what was programmed into
+  frr.conf, with no diagnostic. VERIFY-FIRST corrected the issue's framing:
+  #4589 (already in the issue base) added `ValidateInteger(1, 4294967295)` on
+  all five BGP AS leaves in `schema_routing.go`, so the STRICT operator commit /
+  commit-check path (SchemaValidate) ALREADY hard-rejects these — reproduced
+  `SchemaValidate` returning `integer out of range [1..4294967295] (got -1)`.
+  The live residual was the LENIENT load / peer-sync path
+  (`compileTreeLenient` / `CompileConfigLenient`), where SchemaValidate is
+  downgraded to a warning so a persisted or peer-synced config still boots
+  (#1960): there the compiler still wrapped the bad AS into a valid-looking ASN
+  and the FRR renderer emitted `remote-as <garbage>` — a leniently-loaded bad
+  neighbor peered under a wrong-but-valid ASN instead of being inert.
+  Fix: a shared `parseASNumber(v)` helper (`strconv.ParseUint(v, 10, 32)` +
+  reject 0) applied at all five parse sites (top-level `local-as`, group
+  `peer-as`/`local-as`, neighbor `peer-as`/`local-as`), leaving the field UNSET
+  on a bad value so the renderer's remote-as-0 skip / local-as-0 omit (#2963)
+  keeps the neighbor inert — the #2963/#2980 "leniently-loaded bad value is
+  inert" defense-in-depth doctrine, applied at the parse layer. Covers
+  routing-instance BGP too (the same `compileProtocols` is the SSOT).
+  **File(s)**: `pkg/config/compiler_protocols.go` (parseASNumber + 5 sites),
+  `pkg/config/bgp_as_wrap_4713_test.go` (new).
+  **Validation**: RED-on-revert — restoring the raw `Atoi; uint32(n)` at the
+  neighbor sites makes `TestBGPASWrapLenientInert` fail with the exact wrap
+  values (PeerAS=4294967295 / 705032704, LocalAS=4294967295 / 705032704);
+  restoring the fix -> green. Over-rejection guard `TestBGPASValidUnchanged`
+  (1, 65535, 65536, 4294967295 compile to the exact value on strict+lenient).
+  `TestBGPASWrapCommitRejected` pins the strict #4589 commit gate. `go build
+  ./...` clean; `go test ./...` all pass (53 ok / 0 FAIL). Doc note: no module
+  doc change — the operator-visible AS range is already documented by #4589's
+  schema leaves; this is the lenient-path inertness belt matching the
+  documented #2963/#2980 render-skip pattern.
+
 ## 2026-07-08 — #4714: reject dangling trailing negation in tcp-flags (fail-closed)
 
 - **Timestamp**: 2026-07-08

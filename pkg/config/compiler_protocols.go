@@ -210,8 +210,11 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			switch child.Name() {
 			case "local-as":
 				if len(child.Keys) >= 2 {
-					if v, err := strconv.Atoi(child.Keys[1]); err == nil {
-						proto.BGP.LocalAS = uint32(v)
+					// #4713: reject out-of-range/negative AS instead of the
+					// silent uint32 wrap — leave LocalAS unset so a
+					// leniently-loaded bad value is inert.
+					if n, ok := parseASNumber(child.Keys[1]); ok {
+						proto.BGP.LocalAS = n
 					}
 				}
 			case "router-id":
@@ -304,14 +307,16 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				switch child.Name() {
 				case "peer-as":
 					if v := nodeVal(child); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							peerAS = uint32(n)
+						// #4713: no silent uint32 wrap — leave unset on a
+						// negative/oversized AS (inert on lenient load).
+						if n, ok := parseASNumber(v); ok {
+							peerAS = n
 						}
 					}
 				case "local-as":
 					if v := nodeVal(child); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							groupLocalAS = uint32(n)
+						if n, ok := parseASNumber(v); ok {
+							groupLocalAS = n
 						}
 					}
 				case "local-address":
@@ -463,14 +468,19 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								}
 							case "peer-as":
 								if v := nodeVal(prop); v != "" {
-									if n, err := strconv.Atoi(v); err == nil {
-										neighbor.PeerAS = uint32(n)
+									// #4713: no silent uint32 wrap — leave the
+									// inherited group peer-as in place on a
+									// negative/oversized override (inert on
+									// lenient load; the renderer skips a
+									// remote-as-0 neighbor).
+									if n, ok := parseASNumber(v); ok {
+										neighbor.PeerAS = n
 									}
 								}
 							case "local-as":
 								if v := nodeVal(prop); v != "" {
-									if n, err := strconv.Atoi(v); err == nil {
-										neighbor.LocalAS = uint32(n)
+									if n, ok := parseASNumber(v); ok {
+										neighbor.LocalAS = n
 									}
 								}
 							case "local-address":
@@ -937,6 +947,37 @@ func namedInstances(nodes []*Node) []struct {
 		}
 	}
 	return result
+}
+
+// parseASNumber parses a BGP AS-number string, returning the value and true
+// ONLY when it is a valid 4-byte AS in [1, 4294967295]. A negative, oversized,
+// non-numeric, or zero value returns ok=false so the caller leaves the field
+// UNSET (zero value) rather than casting a silently-wrapped uint32 into the
+// typed config (#4713).
+//
+// The pre-#4713 parse — `strconv.Atoi(v)` then `uint32(n)` — silently WRAPPED
+// out-of-range input onto a different-but-valid ASN: `peer-as -1` became
+// remote-as 4294967295, and `peer-as 5000000000` wrapped to 705032704, a
+// small-looking ASN. The strict operator commit / commit-check path already
+// hard-rejects these at the typed-leaf SchemaValidate gate (#4589,
+// ValidateInteger(1, 4294967295) on every peer-as/local-as leaf), naming the
+// field and value. This helper closes the LENIENT load / peer-sync path
+// (compileTreeLenient), where SchemaValidate is downgraded to a warning so a
+// persisted or peer-synced config still boots (#1960): leaving the AS unset
+// keeps the FRR renderer's remote-as-0 skip / local-as-0 omit (#2963) in
+// force, so a leniently-loaded bad AS is INERT rather than peering under a
+// wrong-but-valid ASN. Mirrors the #2963/#2980 "leniently-loaded bad value is
+// inert" defense-in-depth doctrine, applied at the parse layer.
+//
+// ParseUint with bitSize 32 rejects negatives and anything above uint32 max at
+// parse; the explicit n == 0 check drops AS 0 (reserved, RFC 7607) so a stray
+// `peer-as 0` / `local-as 0` never renders either.
+func parseASNumber(v string) (uint32, bool) {
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil || n == 0 {
+		return 0, false
+	}
+	return uint32(n), true
 }
 
 // nodeVal returns the value for a property node, handling both AST shapes.
