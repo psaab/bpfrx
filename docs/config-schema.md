@@ -173,8 +173,9 @@ open, the same class as a typo'd address-book NAME). See #4515.
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
-`from source-address`, `from destination-port`) accepts a Junos bracketed
-list value:
+`from source-address`, `from destination-port`, and the scoped-global
+`security policies global policy <p> match from-zone`/`to-zone`, #4626 M03)
+accepts a Junos bracketed list value:
 
 ```
 from protocol [ tcp udp icmp ];                     # hierarchical block

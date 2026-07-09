@@ -827,16 +827,24 @@ Global policies:
 
 - Same as regular policies but with `Global policies:` header.
 - Uses `From zones:` and `To zones:` (plural) instead of `From zone:` / `To zone:`.
-- **Zone context (#3148, display #3286).** A global policy may carry optional
-  `set security policies global policy <p> match from-zone <z>` /
-  `match to-zone <z>` to scope it to a chosen zone pair (or one wildcard side)
-  instead of every zone pair. With a context set, `From zones:` / `To zones:`
-  shows the configured zone instead of `any`; absent, it shows `any`
-  (all zones — the historical behaviour). A zone-scoped global policy is still
-  evaluated in the global ordering, AFTER the exact zone-pair and the `from-zone
-  any` / `to-zone any` wildcard policies — it does not jump ahead of them. An
-  omitted leaf and an explicit `match from-zone any` are identical (all zones);
-  an undefined match zone is rejected at commit. A `match to-zone junos-host`
+- **Zone context (#3148, #4626 M03, display #3286).** A global policy may carry
+  optional `set security policies global policy <p> match from-zone [ <z> ... ]`
+  / `match to-zone [ <z> ... ]` to scope it to a SET of zones (or one wildcard
+  side) instead of every zone pair. The scope is a zone set on each side: a
+  packet matches iff its from-zone is in the from-set AND its to-zone is in the
+  to-set (#4626 M03). With a context set, `From zones:` / `To zones:` shows the
+  configured zones (space-joined, sorted) instead of `any`; absent, it shows
+  `any` (all zones — the historical behaviour). A single-zone scope behaves
+  exactly as before. A zone-scoped global policy is still evaluated in the global
+  ordering, AFTER the exact zone-pair and the `from-zone any` / `to-zone any`
+  wildcard policies — it does not jump ahead of them. An omitted leaf and an
+  explicit `match from-zone any` are identical (all zones); an undefined match
+  zone is rejected at commit (per element); a scope list that MIXES `any` with
+  concrete zones — or a to-zone list that mixes `junos-host` with other zones —
+  is rejected at commit (#4626). A multi-zone scoped global that references a
+  zone-local address book resolves it against the GLOBAL book (zone-local
+  resolution is defined only for a single concrete zone — a documented parity
+  limitation). A `match to-zone junos-host`
   global (host-INBOUND) commits and IS enforced on the LocalDelivery gate
   (#3639 / #3611 Piece B) — consulted in the global tier, after the exact
   `from-zone <ingress> to-zone junos-host` pair and the `from-zone any to-zone
@@ -853,10 +861,12 @@ Global policies:
   `... detail` (`From zone:`/`To zone:`), `... brief` (the From/To columns),
   and `... hit-count` (the From zone/To zone columns) print the scoped zone for
   a scoped global; the gRPC `GetPolicies` `PolicyRule` carries
-  `match_from_zone`/`match_to_zone` (empty for an unscoped global) and the gRPC
-  text `policies-hit-count`/`policies-detail` views show the scope; the REST
+  `match_from_zone`/`match_to_zone` (the first zone, back-compat) PLUS the full
+  set in `match_from_zones`/`match_to_zones` (#4626 M03) and the gRPC text
+  `policies-hit-count`/`policies-detail` views show the scope; the REST
   `GET /api/v1/security/policies` `PolicyRule` carries
-  `match_from_zone`/`match_to_zone` (omitted when empty). The global PolicyInfo
+  `match_from_zone`/`match_to_zone` and the additive plural
+  `match_from_zones`/`match_to_zones` (omitted when empty). The global PolicyInfo
   group still reports `from_zone="*"`/`to_zone="*"` (the all-zones tier) — the
   per-rule fields carry the narrowing. An unscoped global is unchanged
   (junos-global / any / `*`).
