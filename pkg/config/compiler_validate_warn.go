@@ -1188,8 +1188,17 @@ func ValidateConfig(cfg *Config) []string {
 		// below to warn only for a percent that has no base to resolve against.
 		schedulersResolvingPercent := cosSchedulersWithShapedBinding(cos)
 		// #915: surplus-sharing is meaningful only on transmit-rate
-		// exact schedulers; warn-and-strip when set without exact so
-		// the runtime never sees the no-op flag (see #1183 lesson).
+		// exact schedulers; warn when set without exact (see #1183
+		// lesson). #4966: ValidateConfig is a READ-ONLY pass — it must
+		// NOT mutate the config. The "runtime never sees the no-op
+		// flag" guarantee is enforced at the compile-to-runtime edge
+		// instead: buildClassOfServiceSnapshot gates SurplusSharing on
+		// TransmitRateExact, so configured intent is preserved on the
+		// active config while the effective (runtime) value is false.
+		// Mutating here made validation non-idempotent — a second
+		// ValidateConfig saw SurplusSharing already cleared and emitted
+		// no warning, so recomputing surfaces (show system alarms)
+		// dropped the warning entirely.
 		for _, sched := range cos.Schedulers {
 			if sched == nil {
 				continue
@@ -1198,7 +1207,6 @@ func ValidateConfig(cfg *Config) []string {
 				warnings = append(warnings, fmt.Sprintf(
 					"class-of-service scheduler %q surplus-sharing is meaningful only with transmit-rate exact; ignored",
 					sched.Name))
-				sched.SurplusSharing = false
 			}
 			// #1746: warn-not-strip. A policy without enforcement is a
 			// harmless no-op (the dataplane gates it on
@@ -3260,6 +3268,11 @@ func validateSurfaceADDNSWarnings(cfg *Config) []string {
 			"is left stale). Use separate hostnames per family for a clean per-family "+
 			"teardown.", k.provider, k.fqdn))
 	}
+	// #4966: several loops above range over provider/family maps, so the
+	// raw append order is nondeterministic run-to-run. Sort the block
+	// before returning it so the surfaced commit warnings (and every
+	// alarm surface that re-derives them) are stable.
+	sort.Strings(warnings)
 	return warnings
 }
 

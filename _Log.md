@@ -43941,3 +43941,8 @@ top.
   **File(s)**: pkg/config/compiler.go, pkg/config/compiler_dispatch.go, pkg/config/compiler_firewall.go, pkg/config/compiler_class_of_service.go, pkg/config/compiler_validate_strict_filter.go, pkg/config/compiler_uniformgates.go, pkg/config/lenient_fw_cos_4953_test.go, pkg/config/README.md
   **Action**: #4884(C) devicemap enumerates non-PCI physical NICs (USB/platform/SoC) so key mac entries bind; classifyNetdev seam + doc
   **File(s)**: pkg/devicemap/devicemap.go, pkg/devicemap/devicemap_nonpci_4884_test.go, docs/bare-metal-device-map.md
+
+## 2026-07-09 — #4966 ValidateConfig non-idempotent SurplusSharing mutation
+- **Timestamp**: 2026-07-09
+- **Action**: Made ValidateConfig read-only. Removed the `sched.SurplusSharing = false` strip in the warn pass; moved the effective gate to `buildClassOfServiceSnapshot` (`SurplusSharing && TransmitRateExact`) so the runtime never sees the inert flag while configured intent is preserved. Sorted the ADDNS warning block for deterministic order.
+- **File(s)**: pkg/config/compiler_validate_warn.go, pkg/dataplane/userspace/cos.go, pkg/config/parser_class_of_service_test.go, pkg/dataplane/userspace/manager_cos_test.go
