@@ -38,6 +38,12 @@ func (m *Manager) SetRGReady(rgID int, ready bool, reasons []string) {
 			rg.holdTimer = time.AfterFunc(m.takeoverHoldTime, func() {
 				m.mu.Lock()
 				defer m.mu.Unlock()
+				// The manager was stopped after this timer fired but before
+				// it acquired the lock — do not run an election on a
+				// quiesced manager (#4716).
+				if m.stopped {
+					return
+				}
 				if !rg.Ready {
 					return
 				}

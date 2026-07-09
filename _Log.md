@@ -43050,3 +43050,29 @@ top.
 - **Validation**: gofmt clean; go build ./... clean; go vet ./pkg/config
   ./pkg/snmp clean (no copylocks); go test ./pkg/config/... + ./pkg/snmp/...
   pass; full `go test ./...` green (53 ok / 0 fail / 3 no-test-files, 56 pkgs).
+
+- **Timestamp**: 2026-07-09 00:58 UTC
+- **Action**: #4716 — stop rg.holdTimer on Manager.Stop to prevent post-stop
+  timer leak + spurious election. `Manager.Stop()` (pkg/cluster/manager.go)
+  stopped only monitor/heartbeat goroutines; it never ranged `m.groups` to
+  cancel armed `rg.holdTimer` timers. A takeover-hold timer armed while
+  `rg.Ready==true` (readiness.go:38 `time.AfterFunc(takeoverHoldTime, ...)`)
+  therefore kept running after Stop, fired, took `m.mu`, and ran
+  runElection/electSingleNode on a quiesced manager — pinning the Manager in
+  memory until takeoverHoldTime elapsed (goleak/test-teardown flakiness,
+  lifecycle-invariant violation). Fix: in Stop(), under m.mu, set a new
+  `m.stopped` flag and `Stop()`+nil every non-nil `rg.holdTimer`; add an
+  `if m.stopped { return }` guard at the top of the timer closure to cover the
+  race where a timer had already fired and is parked on m.mu when Stop runs.
+  Active path unchanged — the timer's normal hold-release/preempt during a
+  running manager is untouched (m.stopped is false).
+- **File(s)**: pkg/cluster/manager.go (Manager.stopped field + Stop() cancel
+  loop), pkg/cluster/readiness.go (m.stopped guard in holdTimer closure),
+  pkg/cluster/manager_stop_test.go (new: cancels-armed-timer deterministic nil
+  check, suppresses-election-after-Stop behavioral, still-promotes-when-running
+  active-path guard)
+- **Validation**: gofmt clean; go build ./... clean; go test ./pkg/cluster/...
+  pass; go test -race ./pkg/cluster pass (9.0s); full `go test ./...` green
+  (53 ok / 0 fail / 3 no-test-files). RED-on-revert verified: reverting the
+  Stop cancel-loop + closure guard fails both leak tests (timer left non-nil;
+  election event fires after Stop) while the active-path guard still passes.

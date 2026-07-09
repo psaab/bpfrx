@@ -266,6 +266,12 @@ type Manager struct {
 	// immediately. This prevents back-to-back failover/failback from
 	// racing and hitting "session sync disconnected during barrier wait".
 	failoverInProgress map[int]bool
+
+	// stopped is set by Stop() to mark the manager quiesced. It guards the
+	// per-RG hold-timer closure (readiness.go) so a takeover-hold timer that
+	// had already fired and is blocked on m.mu when Stop() runs cannot run an
+	// election on a stopped manager (#4716). Guarded by m.mu.
+	stopped bool
 }
 
 type peerGroupSnapshot struct {
@@ -392,6 +398,20 @@ func (m *Manager) Stop() {
 	receiver := m.hbReceiver
 	m.hbSender = nil
 	m.hbReceiver = nil
+	// Mark the manager stopped and cancel every armed per-RG takeover-hold
+	// timer (#4716). A timer armed while rg.Ready was true would otherwise
+	// fire after Stop(), take m.mu, and run an election on a quiesced manager
+	// — pinning the Manager in memory until takeoverHoldTime elapses. The
+	// stopped flag additionally covers the race where a timer had already
+	// fired and its closure is parked on m.mu: it acquires the lock after this
+	// section releases it, observes m.stopped, and returns without electing.
+	m.stopped = true
+	for _, rg := range m.groups {
+		if rg.holdTimer != nil {
+			rg.holdTimer.Stop()
+			rg.holdTimer = nil
+		}
+	}
 	m.mu.Unlock()
 
 	if mon != nil {
