@@ -17,12 +17,14 @@ func TestHostIsLoopback(t *testing.T) {
 		{"127.0.0.1", true},    // canonical IPv4 loopback
 		{"127.0.0.5", true},    // anywhere in 127.0.0.0/8 is loopback
 		{"::1", true},          // IPv6 loopback
+		{"localhost", true},    // hostname (not a parseable IP) but a loopback spelling
 		{"10.0.0.5", false},    // routable IPv4 (RFC1918, but network-reachable)
 		{"192.168.1.1", false}, // routable IPv4
 		{"2001:db8::1", false}, // routable IPv6
 		{"0.0.0.0", false},     // wildcard bind — reachable on every interface
-		{"", true},             // empty host: treated as safe (do not clamp)
-		{"not-an-ip", true},    // unparseable: treated as safe (do not clamp)
+		{"::", false},          // IPv6 wildcard/unspecified — reachable everywhere
+		{"", false},            // #4903: empty host is the ":port" wildcard, NOT loopback
+		{"not-an-ip", false},   // #4903: unparseable, non-loopback => fail safe (clamp)
 	}
 	for _, c := range cases {
 		if got := hostIsLoopback(c.host); got != c.want {
@@ -52,7 +54,16 @@ func TestClampBindToLoopback(t *testing.T) {
 		{"v6 loopback untouched", "[::1]:8080", false, "[::1]:8080", false},
 		// Wildcard bind is off-loopback => clamped.
 		{"v4 wildcard no-auth clamps", "0.0.0.0:8080", false, "127.0.0.1:8080", true},
-		// Unparseable / no-port => left unchanged (do not clamp on uncertainty).
+		// #4903: the Go wildcard spelling ":port" (empty host) is all-interfaces,
+		// NOT loopback — it MUST clamp when unauthenticated (this is the bug).
+		{"empty-host wildcard no-auth clamps", ":8080", false, "127.0.0.1:8080", true},
+		{"empty-host wildcard with auth not clamped", ":8080", true, ":8080", false},
+		{"v6 empty-host wildcard no-auth clamps", "[::]:8080", false, "[::1]:8080", true},
+		// #4903: a split-but-unparseable host fails safe => clamped when no-auth.
+		{"unparseable split host no-auth clamps", "bad_host:8080", false, "127.0.0.1:8080", true},
+		// "localhost" is a loopback spelling => left unchanged.
+		{"localhost loopback untouched", "localhost:8080", false, "localhost:8080", false},
+		// Unparseable / no-port (SplitHostPort errors) => left unchanged (no port to clamp).
 		{"unparseable no-port untouched", "not-an-addr", false, "not-an-addr", false},
 	}
 	for _, c := range cases {

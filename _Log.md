@@ -1,3 +1,24 @@
+## 2026-07-09 — #4903 daemon: empty-host `:port` wildcard bind bypassed the #4047 loopback clamp
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4903 (CRITICAL security). `hostIsLoopback` returned true for an
+  EMPTY host (`net.SplitHostPort(":8080")` → host "") and for an unparseable
+  host, so `clampBindToLoopback` did NOT clamp `--api-addr :8080` with no
+  api-auth — the mutating REST surface listened on ALL interfaces unauthenticated.
+  Fixed `hostIsLoopback`: empty host is the wildcard (all interfaces) → false;
+  an unparseable non-loopback host → false (fail safe, gets clamped when no-auth);
+  a genuine loopback IP (127.0.0.0/8, ::1) still true, and the literal
+  "localhost" is special-cased true (a loopback spelling that is not a parseable
+  IP). Sole caller is `clampBindToLoopback` → the REST clamp in `daemon_run.go`;
+  the cluster-bind helpers do NOT use `hostIsLoopback`, so blast radius is the
+  REST clamp only. Updated the clamp doc comment + `docs/architecture.md`.
+  **File(s)**: pkg/daemon/daemon_cluster_bind.go,
+  pkg/daemon/web_management_clamp_4047_test.go, docs/architecture.md
+  **Validation**: extended the #4047 tables with `:8080`/`[::]:8080`/`bad_host:8080`/
+  `localhost:8080`/`""`/`::`/`localhost` cases; RED-on-revert confirmed (revert →
+  `hostIsLoopback("")=true` and `:8080` not clamped fail). `go test ./pkg/daemon/`
+  green; `go build ./...` clean.
+
 ## 2026-07-09 — #4752 observability: deterministic-NAT pool block-utilization metric
 
 - **Timestamp**: 2026-07-09
