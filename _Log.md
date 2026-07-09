@@ -43672,3 +43672,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4407 Increment 5 — extract applyServicesReconcile (neighbor resolution + RA + IPsec + Kea DHCP server + DHCP clients, 139 lines) from applyConfigLocked; body byte-identical, unnamed (error,error) return threads ipsecErr/dhcpServerErr deferred errors to applyTailReconciles. Decoupled from dataplane-apply state (isCluster contained)
   **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4408/#4421 — split poll_stages.rs inline #[cfg(test)] mod tests (2552 lines) into sibling poll_stages_tests.rs via #[path]; pure code-motion (test body dedent-byte-identical, production prefix identical, test count 26==26)
+  **File(s)**: userspace-dp/src/afxdp/poll_stages.rs, userspace-dp/src/afxdp/poll_stages_tests.rs
