@@ -43951,3 +43951,7 @@ top.
   **File(s)**: pkg/daemon/device_map.go, pkg/daemon/device_map_rename_err_4956_test.go
   **Action**: #4954 give networkd Manager reload/reconfigure activation debt — a failed networkctl reload now re-attempts on the next identical Apply (reloadPending/reconfigurePending) instead of returning a false success when files are unchanged
   **File(s)**: pkg/networkd/networkd.go, pkg/networkd/reload_debt_4954_test.go, pkg/networkd/README.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4878 type the IKE/IPsec-gateway DPD interval/threshold value leaves (ValueInteger + ValidateInteger(1,3600) / (1,100)) so garbage/zero/negative/overflow is rejected at commit-check (strict) and downgraded to a warning on tolerant load (#1960 via compileTreeLenient); both closed-world copies
+  **File(s)**: pkg/config/schema_security.go, pkg/config/dpd_typed_value_4878_test.go, docs/config-schema.md

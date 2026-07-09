@@ -921,6 +921,18 @@ false-reject risk:
   `probe-idle-tunnel`, `interval <seconds>`, and `threshold <count>` (all
   modeled); `parseDeadPeerDetectionNode` reads only those five. A typo
   (`intervl`) would silently keep the Junos default; it is now rejected.
+  **#4878:** the closed-world flip caught a bad KEYWORD but not a bad VALUE —
+  `interval banana` still committed (the compiler's `strconv.Atoi` error was
+  ignored → DPD silently reverted to the strongSwan default) and
+  `interval 9223372036854775807 threshold 9223372036854775807` overflowed the
+  rendered `delay*threshold` timeout to a negative that was then dropped. Both
+  `interval` and `threshold` are now typed `ValueInteger` leaves with bounded
+  validators (`ValidateInteger(1, 3600)` / `ValidateInteger(1, 100)`), so a
+  non-numeric / non-positive / overflow-sized value is rejected at commit — and,
+  like every typed leaf, downgraded to a warning on the tolerant
+  `Store.Load` / `SyncApply` path (#1960). The chosen upper bounds keep
+  `interval*threshold` far from int overflow. Production test:
+  `dpd_typed_value_4878_test.go` (RED on revert of the two validators).
 
 Every value leaf in these subtrees (`local-ip`/`remote-ip`,
 `source-interface`/`destination-ip`, `interval`/`threshold`) carries its value
