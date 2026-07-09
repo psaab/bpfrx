@@ -43,8 +43,9 @@ use cos::{
 pub(in crate::afxdp) use shared_recycle::{
     apply_shared_recycles, apply_shared_recycles_to_bindings, resolve_tx_binding_ifindex,
 };
-// Test-only access to internal shared_recycle helpers from
-// dispatch_tests.rs (which is `mod tests` under this `mod.rs`).
+// Test-only access to internal shared_recycle helpers from the dispatch
+// tests (the `tests/` submodule under this `mod.rs`, reached via `use
+// super::*`).
 #[cfg(test)]
 use shared_recycle::{
     record_shared_recycle_unknown_slot_drops, shared_recycle_target_index,
@@ -1482,5 +1483,4 @@ fn forwarded_tcp_may_need_segmentation(
 }
 
 #[cfg(test)]
-#[path = "dispatch_tests.rs"]
 mod tests;
