@@ -1,3 +1,21 @@
+## 2026-07-09 — #4668: relocate reject_reply.rs inline tests to a sibling file
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4668 — pure code-motion test refactor. `reject_reply.rs`
+  (2174 LOC) carried a 1759-line inline `#[cfg(test)] mod tests { ... }`
+  block wrapping ~380 LOC of cold reject-reply enqueue production
+  (`enqueue_policy_reject_reply` / `enqueue_reject_reply`). Extracted the
+  test module verbatim to sibling `reject_reply_tests.rs`, wired via
+  `#[cfg(test)] #[path = "reject_reply_tests.rs"] mod tests;` following the
+  worker_queue / umem / event_stream split convention. Production code
+  (lines 1-413) byte-identical; each test body byte-identical after
+  reversing the 4-space dedent out of the `mod tests {}` wrapper. Test
+  count preserved: 25 `#[test]` before == 25 after. Validation: cargo
+  build clean; `cargo test --release reject_reply` 25/25 ok; FULL serial
+  suite 3860 passed / 0 failed / 2 ignored.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs
+  (2174→417 LOC), userspace-dp/src/afxdp/poll_descriptor/reject_reply_tests.rs (new)
+
 ## 2026-07-09 — #4710: redact Secret in YAML marshal/unmarshal (close the JSON/YAML asymmetry)
 
 - **Timestamp**: 2026-07-09
