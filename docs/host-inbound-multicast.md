@@ -61,6 +61,20 @@ reject**: the config is valid Junos, and rejecting or narrowing it would break a
 zone that relies on today's accept (see the migration decision below). This
 mirrors the #3226 `system-services all` packet-wide-admit advisory pattern.
 
+A **companion advisory** (`validateHostInboundManagedRoutingMismatch`, #4455
+Component B) closes the *inverse* blind spot: the advisory above fires only when
+a multicast token is **present** (the already-compliant case), so a zone running
+a managed FRR routing protocol with **no** matching token — the actual silent
+fail-open — was invisible. Component B cross-checks the interfaces xpf renders
+into FRR for OSPFv2/OSPFv3/RIP (`pkg/frr/policy_render.go`, global stanza and
+each routing-instance) against each interface's zone's effective
+`host-inbound-traffic protocols` set (zone-level ∪ per-interface override,
+`all`-expanded) and WARNs when the matching token (`ospf`/`ospf3`/`rip`) is
+absent, so the operator can make the admission explicit. Same WARN-only,
+zero-dataplane-surface doctrine (the Component A per-zone `iifname` DROP
+enforcement stays deferred/PLAN-KILLed). BGP/LDP (unicast) and PIM (unmanaged)
+are out of scope.
+
 ## Protocol → multicast-group catalog
 
 The single source of truth is `hostInboundMulticastCatalog` in
