@@ -80,7 +80,33 @@ func dedupHostInboundTokens(vals []string) []string {
 
 func compileZones(node *Node, sec *SecurityConfig) error {
 	for _, inst := range namedInstances(node.FindChildren("security-zone")) {
-		zone := &ZoneConfig{Name: inst.name}
+		// #4818: find-or-create by name rather than always allocating a
+		// fresh ZoneConfig. A hand-authored `load override` config can carry
+		// two literal `security-zone <name> { ... }` TOP-LEVEL sibling
+		// blocks — the hierarchical parser (parseStatements) keeps them as
+		// separate same-key siblings (it does not merge), so namedInstances
+		// yields TWO entries for the same zone name. The pre-fix unconditional
+		// `zone := &ZoneConfig{...}` + `sec.Zones[inst.name] = zone` let the
+		// second instance silently REPLACE the first, discarding its
+		// interfaces/host-inbound/address-book/description/screen/tcp-rst
+		// wholesale. This is the outer-instance analogue of the #4544 fix
+		// below, which already merges repeated host-inbound-traffic blocks
+		// WITHIN one instance — that fix is a no-op against a duplicate
+		// instance because it never runs on the first instance's properties
+		// once the whole ZoneConfig is replaced. Properties below now
+		// accumulate into the SAME zone across every sibling instance:
+		// Interfaces appends, HostInboundTraffic/InterfaceHostInbound merge
+		// via mergeHostInbound, AddressBook merges by name (find-or-create,
+		// same as parseAddressBookEntries already does for repeated
+		// address/address-set children — #4706). ScreenProfile, TCPRst, and
+		// Description are scalars with no natural union; they are last-wins
+		// across sibling instances (matches their existing last-wins
+		// behaviour across repeated properties WITHIN one instance).
+		zone := sec.Zones[inst.name]
+		if zone == nil {
+			zone = &ZoneConfig{Name: inst.name}
+			sec.Zones[inst.name] = zone
+		}
 
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
@@ -92,14 +118,19 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 					// token grammar as the zone-level stanza; parsed by the
 					// shared parseHostInboundNode so both shapes stay in lockstep.
 					//
-					// #4544: MERGE across ALL host-inbound-traffic blocks under
-					// this interface (Junos merge semantics), not FindChild
-					// (first-wins). A hand-authored `load override` config can
-					// carry two literal blocks under one interface; the
-					// hierarchical parser (parseStatements) keeps them as
-					// separate same-key siblings — it does NOT merge — so
-					// FindChild would read only the first and silently drop the
-					// rest. Iterate FindChildren and union their token sets.
+					// #4544/#4818: MERGE across ALL host-inbound-traffic blocks
+					// under this interface (Junos merge semantics), not
+					// FindChild (first-wins) and not a bare overwrite. A
+					// hand-authored `load override` config can carry two
+					// literal blocks under one interface — either as siblings
+					// within one security-zone instance (#4544) or split
+					// across two duplicate top-level security-zone instances
+					// naming the same interface (#4818); the hierarchical
+					// parser keeps all of them as separate same-key siblings —
+					// it does NOT merge — so FindChild would read only the
+					// first and a plain map assignment would drop whichever
+					// instance's interface block ran first. Merge into
+					// whatever is already recorded for this interface name.
 					var hib *HostInboundTraffic
 					for _, hn := range iface.FindChildren("host-inbound-traffic") {
 						hib = mergeHostInbound(hib, parseHostInboundNode(hn))
@@ -108,7 +139,7 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						if zone.InterfaceHostInbound == nil {
 							zone.InterfaceHostInbound = make(map[string]*HostInboundTraffic)
 						}
-						zone.InterfaceHostInbound[iface.Name()] = hib
+						zone.InterfaceHostInbound[iface.Name()] = mergeHostInbound(zone.InterfaceHostInbound[iface.Name()], hib)
 					}
 				}
 			case "screen":
@@ -120,6 +151,8 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 				// splices a raw hierarchical parse whose two literal blocks stay
 				// as separate siblings, so a bare `=` assignment silently drops
 				// every block but the last. Accumulate into the zone value.
+				// #4818 extends this across duplicate top-level security-zone
+				// instances too, since zone is now find-or-create.
 				zone.HostInboundTraffic = mergeHostInbound(zone.HostInboundTraffic, parseHostInboundNode(prop))
 			case "tcp-rst":
 				zone.TCPRst = true
@@ -129,16 +162,22 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 				// #3061: zone-local address book. Same entry grammar as the
 				// global book; resolved into the global book under
 				// zone-qualified internal names later (resolveZoneLocalAddressBooks).
-				ab := &AddressBook{
-					Addresses:   make(map[string]*Address),
-					AddressSets: make(map[string]*AddressSet),
+				// #4818: find-or-create rather than always allocating a fresh
+				// AddressBook, so a second security-zone instance's
+				// address-book block MERGES into the first's (by address/
+				// address-set name, via parseAddressBookEntries's own
+				// find-or-create — #4706) instead of replacing it outright.
+				ab := zone.AddressBook
+				if ab == nil {
+					ab = &AddressBook{
+						Addresses:   make(map[string]*Address),
+						AddressSets: make(map[string]*AddressSet),
+					}
+					zone.AddressBook = ab
 				}
 				parseAddressBookEntries(prop, ab)
-				zone.AddressBook = ab
 			}
 		}
-
-		sec.Zones[inst.name] = zone
 	}
 	return nil
 }

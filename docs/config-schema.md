@@ -2896,6 +2896,60 @@ reserved for whole-dataplane selection where a rewrite shim
   `NewParser` for the `LoadOverride` shape); operator doc:
   `docs/host-inbound-service-matrix.md` "Repeated host-inbound-traffic blocks
   merge (#4544)".
+- **#4818/#4820/#4821 (the TOP-LEVEL named-instance analogue of #4544/#3842/
+  #3915/#3850 — duplicate `security-zone <name>` / `probe <name>` /
+  `ssh-known-hosts host <name>` INSTANCES, not sub-blocks within one instance):**
+  every prior entry in this cluster fixed a duplicate SUB-block within one
+  named instance (`match`/`then` within one policy, `source`/`destination`
+  within one `nat {}`, `host-inbound-traffic` within one zone/interface). This
+  trio is the same defect one level UP: `namedInstances()` (`compiler_protocols.go`)
+  returns one `(name, node)` pair per hierarchical AST sibling, so a `load
+  override` config with two literal top-level blocks sharing a name — e.g. two
+  `security-zone trust { ... }` blocks — yields TWO instances for `"trust"`.
+  Three compilers read that loop with an unconditional per-iteration allocate
+  + map-assign, so the SECOND instance silently replaced the first's entire
+  compiled value:
+  - **`compileZones`** (`compiler_security_zones.go`) — `zone := &ZoneConfig{...}`
+    + `sec.Zones[inst.name] = zone` dropped the first instance's
+    interfaces/host-inbound/address-book/description/screen/tcp-rst wholesale
+    (#4818). Fix: find-or-create the `ZoneConfig` by name so every sibling
+    instance's properties accumulate onto the SAME zone — `Interfaces` appends,
+    `HostInboundTraffic`/`InterfaceHostInbound` merge via the existing
+    `mergeHostInbound` (now also applied across instances, not just across
+    blocks within one instance), `AddressBook` merges by address/address-set
+    name (find-or-create, reusing `parseAddressBookEntries`'s own #4706
+    find-or-create). `ScreenProfile`/`TCPRst`/`Description` are scalars with no
+    natural union and stay last-wins across instances (unchanged from their
+    existing last-wins behavior across repeated properties within one
+    instance).
+  - **`compileRPM`** (`compiler_services.go`) — `probe := &RPMProbe{Tests:
+    make(...)}` + `rpmCfg.Probes[probe.Name] = probe` dropped the first
+    instance's `Tests` map wholesale, disabling every RPM test it declared
+    (#4820). Fix: find-or-create the `RPMProbe` by name; `probe.Tests[test.Name]
+    = test` (unchanged) now accumulates test blocks from every sibling
+    instance into the one shared `Tests` map.
+  - **`ssh-known-hosts`** (`compiler_security.go`, inline in `compileSecurity`'s
+    switch) — `sec.SSHKnownHosts[hostInst.name] = keys` (bare overwrite, plus
+    `sec.SSHKnownHosts = make(...)` re-running on every `ssh-known-hosts`
+    block) dropped the first `host` instance's key(s) — an operator-visible SSH
+    host-key verification failure against that host (#4821). Fix:
+    `sec.SSHKnownHosts` is initialized once (find-or-create the map), and each
+    key is APPENDED (`sec.SSHKnownHosts[hostInst.name] = append(..., key)`)
+    rather than the whole per-instance slice replacing the map entry — for a
+    single instance this is byte-identical to the pre-fix build-then-assign
+    (append onto nil == a fresh slice).
+
+  As with every entry in this cluster, flat-set `SetPath` and `load merge`
+  (FormatSet round-trip) both fold two same-key top-level lines onto ONE AST
+  node, so a duplicate *instance* (as opposed to a duplicate *sub-block*) is
+  reachable ONLY via the hierarchical `NewParser` / `LoadOverride` shape — see
+  each issue's "Correction to the reviewed trace" for the refuted flat-set
+  reproduction. Regression coverage: `pkg/config/zone_dup_block_4818_test.go`,
+  `pkg/config/rpm_probe_dup_block_4820_test.go`,
+  `pkg/config/ssh_known_hosts_dup_block_4821_test.go` (each: primary
+  two/three-instance merge RED-on-revert, and a single-block/single-instance
+  byte-identical negative control — built with `NewParser` for the
+  `LoadOverride` shape, driving `CompileConfig` directly).
 - **#3473 (duplicate security-policy names — strict commit gate):**
   `validateDuplicatePolicyNamesStrict` (`compiler_validate_strict.go`)
   hard-rejects two security policies that share a name within the same
