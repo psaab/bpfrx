@@ -43585,3 +43585,7 @@ top.
   concurrency-consistency stress. cargo build clean; new tests pass.
 - **File(s)**: userspace-dp/src/nat/allocator.rs,
   userspace-dp/src/nat/tests_pool.rs, _Log.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 daemon_run.go Run() decompose — plan v1 (Increment 1: extract runShutdownSequence 1709-1866 + phase-boundary banners; conservative defer-clean tail extract, zero behavior change)
+  **File(s)**: docs/pr/4662-daemon-run-decompose/plan.md
