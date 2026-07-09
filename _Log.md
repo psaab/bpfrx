@@ -1,3 +1,32 @@
+## 2026-07-09 — #4709: stream CLI show output to the pager instead of buffering
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4709 — `dispatchWithPager` redirected a `show` command's stdout
+  to an `os.Pipe`, drained the WHOLE pipe with `io.ReadAll` into one `[]byte`,
+  then `strings.Split` into a slice before paging. `show route` (full BGP
+  table) or `show security flow session` (up to 10M sessions) buffered GBs in
+  memory before printing a byte — OOM risk on a RAM-constrained firewall.
+  Scope was BOUNDED: the pipe seam already existed, so no `io.Writer` had to be
+  threaded through the command-dispatch interface. Replaced the read-all-then-
+  page consumer with a concurrent streaming pager: the pager goroutine reads the
+  pipe incrementally via a `lineSource` (bufio.Reader with one-line lookahead)
+  and paginates a screenful at a time while the command still runs; when it
+  pauses at `--More--` the pipe fills and the command blocks on write, so output
+  is produced lazily. At most one page (+1 lookahead line +the OS pipe buffer)
+  is held at once regardless of total output. `lineSource` reproduces the old
+  `strings.Split(out,"\n")` + trailing-empty-drop semantics exactly (only "\n"
+  is the delimiter, a trailing "\r" stays on the line). Scroll behavior (space =
+  page, Enter = one line then a page, q = quit) is preserved; on quit the pager
+  drains the rest of the pipe so the writer goroutine never deadlocks on a full
+  pipe. Non-TTY behavior unchanged (keys still read from os.Stdin). The sibling
+  `dispatchWithPipe` (`show ... | match/count/last`) has the same buffering but
+  is out of #4709 scope (count/last need the full stream). Validation: gofmt;
+  go build ./...; new streaming/completeness/anti-buffering/quit-drain/line-
+  semantics tests PASS; `go test -race ./pkg/cli` green; FULL Go suite green
+  (53 ok / 0 fail / 3 no-test-pkgs).
+  **File(s)**: pkg/cli/cli_dispatch.go,
+  pkg/cli/cli_dispatch_pager_stream_4709_test.go, _Log.md
+
 ## 2026-07-09 — #4664: split event_stream/tests.rs into per-concern files
 
 - **Timestamp**: 2026-07-09
