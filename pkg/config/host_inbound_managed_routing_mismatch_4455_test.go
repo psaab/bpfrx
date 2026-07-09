@@ -97,4 +97,37 @@ func TestHostInboundManagedRoutingMismatch(t *testing.T) {
 	if w := validateHostInboundManagedRoutingMismatch(cfgG); !hasWarn4455B(w, `protocols ospf is enabled`) {
 		t.Fatalf("(g) expected routing-instance OSPF warning, got %v", w)
 	}
+
+	// (i) BARE zone member claims configured units: zone lists physical `reth0`,
+	// OSPF runs on unit `reth0.10` — in-zone at runtime (buildInterfaceZoneMap
+	// bare-member expansion), so a missing token must warn (would be invisible to
+	// an exact-string map).
+	cfgI := &Config{}
+	cfgI.Interfaces.Interfaces = map[string]*InterfaceConfig{"reth0": {Name: "reth0", Units: map[int]*InterfaceUnit{10: {}}}}
+	cfgI.Security.Zones = map[string]*ZoneConfig{"trust": {Interfaces: []string{"reth0"}}}
+	cfgI.Protocols.OSPF = ospfOn("reth0.10")
+	if w := validateHostInboundManagedRoutingMismatch(cfgI); !hasWarn4455B(w, `protocols ospf is enabled on interface "reth0.10" (security zone "trust")`) {
+		t.Fatalf("(i) expected warning for OSPF unit under a bare zone member, got %v", w)
+	}
+
+	// (j) PHYSICAL-PARENT override inheritance (#3720): a per-interface override
+	// on the parent `reth0` admitting ospf must cover unit `reth0.10` — no FALSE
+	// warning (an exact `InterfaceHostInbound[reth0.10]` lookup would miss it).
+	cfgJ := &Config{}
+	cfgJ.Interfaces.Interfaces = map[string]*InterfaceConfig{"reth0": {Name: "reth0", Units: map[int]*InterfaceUnit{10: {}}}}
+	zj := &ZoneConfig{Interfaces: []string{"reth0"}}
+	zj.InterfaceHostInbound = map[string]*HostInboundTraffic{"reth0": {Protocols: []string{"ospf"}}}
+	cfgJ.Security.Zones = map[string]*ZoneConfig{"trust": zj}
+	cfgJ.Protocols.OSPF = ospfOn("reth0.10")
+	if w := validateHostInboundManagedRoutingMismatch(cfgJ); len(w) != 0 {
+		t.Fatalf("(j) expected no warning: parent override admits ospf (inherited by the unit), got %v", w)
+	}
+
+	// (h) REGISTRATION PIN: the advisory must be wired into ValidateConfig, not
+	// merely callable in isolation — removing the append registration line must
+	// make a real commit-warn assertion go red (the direct-helper cases above
+	// would not catch that). Uses cfgA (OSPF without token → warns).
+	if w := ValidateConfig(cfgA); !hasWarn4455B(w, `protocols ospf is enabled on interface "ge-0/0/0.0" (security zone "trust")`) {
+		t.Fatalf("(h) ValidateConfig must surface the Component B advisory (registration), got %v", w)
+	}
 }

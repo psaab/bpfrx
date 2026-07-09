@@ -1746,16 +1746,32 @@ func validateHostInboundManagedRoutingMismatch(cfg *Config) []string {
 	if cfg == nil || cfg.Security.Zones == nil {
 		return nil
 	}
-	// Build interface-ref -> zone-name from zone membership. An interface not in
-	// any security zone has no host-inbound admission dimension, so it is not
+	// Build interface-ref -> zone-name mirroring the dataplane's
+	// buildInterfaceZoneMap (#3072): a bare zone member (`reth0`) claims the
+	// physical key AND every configured unit (`reth0.10`), a unit-qualified entry
+	// claims exactly that unit — via the zoneIfaceLogicalKeys SSOT — with
+	// first-writer-wins over sorted zone names. This matches runtime zone
+	// attribution, so an OSPF interface `reth0.10` under a zone listing bare
+	// `reth0` resolves correctly (an exact-string map would miss it). An
+	// interface not in any zone has no host-inbound dimension, so it is not
 	// warned on (the lookup below simply misses).
 	ifZone := make(map[string]string)
-	for zname, z := range cfg.Security.Zones {
+	znames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		znames = append(znames, name)
+	}
+	sort.Strings(znames)
+	for _, zname := range znames {
+		z := cfg.Security.Zones[zname]
 		if z == nil { // #3494: tolerant/HA-sync path may carry a nil zone value
 			continue
 		}
-		for _, ifn := range z.Interfaces {
-			ifZone[ifn] = zname
+		for _, ifEntry := range z.Interfaces {
+			for _, key := range zoneIfaceLogicalKeys(cfg, ifEntry) {
+				if _, seen := ifZone[key]; !seen {
+					ifZone[key] = zname
+				}
+			}
 		}
 	}
 	if len(ifZone) == 0 {
@@ -1826,15 +1842,14 @@ func validateHostInboundManagedRoutingMismatch(cfg *Config) []string {
 			if z == nil {
 				continue
 			}
-			// Effective admission set = zone-level ∪ per-interface override.
-			var eff []string
-			if z.HostInboundTraffic != nil {
-				eff = append(eff, z.HostInboundTraffic.Protocols...)
-			}
-			if hi := z.InterfaceHostInbound[ifn]; hi != nil {
-				eff = append(eff, hi.Protocols...)
-			}
-			if hostInboundAdmitsRoutingProtocol(eff, rp.token) {
+			// EFFECTIVE host-inbound protocols for this interface: zone-level ∪ the
+			// per-interface override WITH #3720 physical-parent inheritance for a
+			// logical unit — reuse the InterfaceHostInboundEffective SSOT so the
+			// advisory matches the dataplane's admission resolution exactly (a
+			// parent `reth0` override admitting ospf must cover unit `reth0.10`,
+			// else this warns falsely).
+			_, effProto, _ := z.InterfaceHostInboundEffective(ifn)
+			if hostInboundAdmitsRoutingProtocol(effProto, rp.token) {
 				continue
 			}
 			warnings = append(warnings, fmt.Sprintf(

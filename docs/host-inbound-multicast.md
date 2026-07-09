@@ -68,9 +68,15 @@ a managed FRR routing protocol with **no** matching token — the actual silent
 fail-open — was invisible. Component B cross-checks the interfaces xpf renders
 into FRR for OSPFv2/OSPFv3/RIP (`pkg/frr/policy_render.go`, global stanza and
 each routing-instance) against each interface's zone's effective
-`host-inbound-traffic protocols` set (zone-level ∪ per-interface override,
-`all`-expanded) and WARNs when the matching token (`ospf`/`ospf3`/`rip`) is
-absent, so the operator can make the admission explicit. Same WARN-only,
+`host-inbound-traffic protocols` set and WARNs when the matching token
+(`ospf`/`ospf3`/`rip`) is absent, so the operator can make the admission
+explicit. Zone attribution reuses the dataplane's `buildInterfaceZoneMap`
+semantics (`zoneIfaceLogicalKeys`: a bare zone member `reth0` claims every
+configured unit `reth0.10`), and the effective admission set reuses
+`ZoneConfig.InterfaceHostInboundEffective` (zone-level ∪ per-interface override
+with #3720 physical-parent inheritance for logical units, `all`-expanded) — so
+the advisory matches runtime enforcement exactly (no missed or false warnings
+on unit interfaces). Same WARN-only,
 zero-dataplane-surface doctrine (the Component A per-zone `iifname` DROP
 enforcement stays deferred/PLAN-KILLed). BGP/LDP (unicast) and PIM (unmanaged)
 are out of scope.
