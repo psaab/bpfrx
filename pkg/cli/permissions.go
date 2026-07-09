@@ -200,10 +200,28 @@ func requestSubcommandIsMaintenance(args []string) bool {
 		switch verb {
 		case "reboot", "halt", "power-off", "zeroize":
 			return true
+		case "software":
+			// `request system software in-service-upgrade` drives
+			// cluster.ForceSecondary() — the ISSU ownership drain forces this
+			// node secondary for ALL redundancy groups (an availability action),
+			// so it must require PermMaint like the other maintenance verbs
+			// (#4859). Any other `software` subcommand stays at PermControl.
+			if len(args) < 3 {
+				return false
+			}
+			swNode := sysNode.Children["software"]
+			if swNode == nil {
+				return false
+			}
+			issu, err := resolveCommand(args[2], keysFromTree(swNode.Children))
+			if err != nil {
+				return false
+			}
+			return issu == "in-service-upgrade"
 		}
 		return false
 	case "chassis":
-		// request chassis cluster failover ...
+		// request chassis cluster {failover ... | data-plane ...}
 		if len(args) < 3 {
 			return false
 		}
@@ -219,11 +237,80 @@ func requestSubcommandIsMaintenance(args []string) bool {
 		if clNode == nil {
 			return false
 		}
-		failoverTok, err := resolveCommand(args[2], keysFromTree(clNode.Children))
+		sub, err := resolveCommand(args[2], keysFromTree(clNode.Children))
 		if err != nil {
 			return false
 		}
-		return failoverTok == "failover"
+		switch sub {
+		case "failover":
+			return true
+		case "data-plane":
+			return dataplaneVerbIsMaintenance(clNode.Children["data-plane"], args[3:])
+		}
+		return false
+	}
+	return false
+}
+
+// dataplaneVerbIsMaintenance reports whether a `request chassis cluster
+// data-plane ...` argument tail resolves to a DESTRUCTIVE userspace-dataplane
+// control verb that must require the super-user-only PermMaint rather than the
+// plain PermControl the predefined operator class holds (#4859):
+//
+//   - forwarding disarm / queue N {unregister|disarm} / binding slot N
+//     {unregister|disarm} — take live forwarding or a redirect binding OUT of
+//     service (SetForwardingArmed(false) / SetQueueState / SetBindingState);
+//   - inject-packet — raw synthetic packet injection into the dataplane.
+//
+// The RESTORATIVE arm|register verbs and any read/status path stay at
+// PermControl so operator keeps its benign dataplane control. args is the token
+// tail AFTER "data-plane" (args[0] is the "userspace" token). The tree tokens
+// go through resolveCommand (prefix-abbreviation safe, mirroring the
+// dispatcher) and the operation token is matched case-insensitively exactly
+// like pkg/dataplane/userspace.ParseForwardingCommand /
+// ParseRegistrationOperation, so the gate and the dispatcher never disagree
+// about which inputs actually run a destructive verb.
+func dataplaneVerbIsMaintenance(dpNode *completionNode, args []string) bool {
+	if dpNode == nil || len(args) < 2 {
+		return false
+	}
+	usTok, err := resolveCommand(args[0], keysFromTree(dpNode.Children))
+	if err != nil || usTok != "userspace" {
+		return false
+	}
+	usNode := dpNode.Children["userspace"]
+	if usNode == nil {
+		return false
+	}
+	verb, err := resolveCommand(args[1], keysFromTree(usNode.Children))
+	if err != nil {
+		return false
+	}
+	switch verb {
+	case "inject-packet":
+		return true
+	case "forwarding":
+		// forwarding <arm|disarm>
+		return len(args) >= 3 && isDestructiveDataplaneOp(args[2])
+	case "queue":
+		// queue <N> <register|unregister|arm|disarm>
+		return len(args) >= 4 && isDestructiveDataplaneOp(args[3])
+	case "binding":
+		// binding slot <N> <register|unregister|arm|disarm>
+		return len(args) >= 5 && isDestructiveDataplaneOp(args[4])
+	}
+	return false
+}
+
+// isDestructiveDataplaneOp reports whether op TEARS DOWN forwarding / redirect
+// ownership — `disarm` or `unregister` — mirroring
+// pkg/dataplane/userspace.ParseRegistrationOperation / ParseForwardingCommand,
+// which lowercase and exact-match. `arm` and `register` are restorative and
+// stay at PermControl.
+func isDestructiveDataplaneOp(op string) bool {
+	switch strings.ToLower(op) {
+	case "disarm", "unregister":
+		return true
 	}
 	return false
 }

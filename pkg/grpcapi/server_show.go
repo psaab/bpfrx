@@ -2,10 +2,10 @@ package grpcapi
 
 import (
 	"context"
-	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -489,7 +489,6 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 			buf.WriteString("  Use the local CLI on the firewall for flow tracing.\n")
 		} else if strings.HasPrefix(req.Topic, "log:") {
 			parts := strings.SplitN(req.Topic, ":", 3)
-			filename := filepath.Base(parts[1]) // sanitize path
 			n := 50
 			if len(parts) >= 3 {
 				if v, err := strconv.Atoi(parts[2]); err == nil {
@@ -500,7 +499,16 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 			// the 15s exec bound does not limit how many bytes a fast
 			// tail of a huge N can return (see clampTailLines).
 			n = clampTailLines(n)
-			logPath := filepath.Join("/var/log", filename)
+			// Allowlist the log name against the configured `system syslog
+			// file` set (#4860): the remote CLI reaches `show log <name>`
+			// through this path, so tailing an arbitrary /var/log child would
+			// leak root-readable host logs (auth.log, audit.log, ...) to a
+			// view-only account. SyslogLogFilePath refuses a non-bare or
+			// non-allowlisted name.
+			logPath, err := config.SyslogLogFilePath(cfg, parts[1])
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+			}
 			out, err := combinedOutputTimeout(ctx, "tail", "-n", strconv.Itoa(n), logPath)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "read %s: %v", logPath, err)
