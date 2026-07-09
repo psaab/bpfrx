@@ -192,13 +192,44 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
 	params := strings.TrimPrefix(req.Topic, "test-zone:")
 	var ifName string
-	for _, kv := range strings.Split(params, ",") {
-		parts := strings.SplitN(kv, "=", 2)
-		if len(parts) == 2 && parts[0] == "interface" {
-			ifName = parts[1]
+	var parseErr error
+	// #4814: mirror the #4589 showTestRouting hardening (itself mirroring
+	// #3696's showTestPolicy fix). The old `if len(parts) == 2 && ...`
+	// with no else/default arm SILENTLY dropped a malformed segment (no
+	// `=`) or an unrecognized key (e.g. `interfac=ge-0/0/0`, a typo) —
+	// ifName stayed empty with no diagnostic, and the operator saw the
+	// generic "Missing interface parameter" fallback instead of a message
+	// naming their actual typo. Report a malformed segment (no key=value,
+	// or an empty key/value) and an unknown key instead of ignoring it. A
+	// bare `test-zone:` (empty params) still falls through to the
+	// "Missing interface parameter" diagnostic below.
+	if params != "" {
+		for _, kv := range strings.Split(params, ",") {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				if parseErr == nil {
+					parseErr = fmt.Errorf("malformed selector segment %q (expected key=value)", kv)
+				}
+				continue
+			}
+			switch parts[0] {
+			case "interface":
+				ifName = parts[1]
+			default:
+				if parseErr == nil {
+					parseErr = fmt.Errorf("unknown selector %q", parts[0])
+				}
+			}
 		}
 	}
-	if cfg == nil {
+	if parseErr != nil {
+		// Report malformed grammar / an unknown key before anything else, so
+		// a typo cannot silently fall through to the generic "missing
+		// parameter" message. A selector grammar error is a client-input
+		// error independent of config availability, so it precedes the
+		// nil-cfg check.
+		fmt.Fprintf(buf, "%v\n", parseErr)
+	} else if cfg == nil {
 		buf.WriteString("No active configuration\n")
 	} else if ifName == "" {
 		buf.WriteString("Missing interface parameter\n")
