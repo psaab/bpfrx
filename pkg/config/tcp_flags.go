@@ -48,6 +48,10 @@ var tcpFlagBits = map[string]uint8{
 //     disjunction by De Morgan's law
 //   - an unrecognized flag token
 //   - a flag that is both required and forbidden (a contradiction)
+//   - a dangling negation '!' with no flag operand (e.g. "!", "syn & !",
+//     "! & ack") — the '!' would otherwise be silently dropped, weakening the
+//     term (#4714, fail-open); reject it so the operator's intent is never
+//     silently lost
 //
 // An input that carries no flag at all (empty / whitespace only) returns
 // ok=false with no error: the caller leaves the wire field nil, i.e. no
@@ -88,7 +92,14 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 	for _, t := range toks {
 		switch t {
 		case "&":
-			// A conjunction separator carries no negation across itself.
+			// A conjunction separator carries no negation across itself. A '!'
+			// standing immediately before the separator has no flag operand —
+			// that is a dangling negation (e.g. "! & ack"). Reject it rather
+			// than silently discarding the '!' (#4714, fail-open).
+			if pendingNeg {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
+			}
 			pendingNeg = false
 			continue
 		case "|":
@@ -114,6 +125,15 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 			required |= bit
 		}
 		pendingNeg = false
+	}
+
+	// A negation left pending after the last token is a dangling '!' with no
+	// flag operand (e.g. "!", "syn & !"). Without this guard the trailing '!'
+	// is silently dropped and the term matches more than the operator intended
+	// (#4714, fail-open) — reject it so a malformed expression fails at commit.
+	if pendingNeg {
+		return 0, 0, false, fmt.Errorf(
+			"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
 	}
 
 	if required&forbidden != 0 {
