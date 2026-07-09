@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -81,6 +82,26 @@ type Manager struct {
 	// rename + addressing and lock the operator out (#1956 AGY r3 CRITICAL,
 	// also the #1922 lifeline invariant). nil => no exemption (legacy).
 	protectedResolver func() map[string]bool
+
+	// mu guards the activation-debt fields below. Apply runs serialized under
+	// the daemon's applySem today, but the debt is process-durable state that
+	// outlives a single call, so it is locked defensively.
+	mu sync.Mutex
+	// reloadPending records that a previous Apply wrote generated files to
+	// disk and then had `networkctl reload` FAIL (#4954). Because the files
+	// are already on disk, a later Apply with byte-identical content sees no
+	// change (writeIfChanged → changed=false) and would otherwise SKIP the
+	// reload and return nil — masking a config the kernel never activated as a
+	// green commit (route leak / stranded NIC / management lockout persists).
+	// The debt forces the next Apply to re-run the idempotent reload even with
+	// unchanged files, and is cleared only once the reload finally succeeds.
+	reloadPending bool
+	// reconfigurePending mirrors reloadPending for the per-interface
+	// `networkctl reconfigure` address-application follow-up (bonds / VLANs),
+	// which was warn-only and likewise never retried. It holds the logical
+	// interface names that still owe a reconfigure; the next activation pass
+	// retries them and clears the set on success.
+	reconfigurePending map[string]bool
 }
 
 // SetProtectedResolver registers the management protected-set provider so
@@ -227,8 +248,13 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		// kernel reflects whatever did get written, but surface the error.
 		if changed {
 			if err := runNetworkctl("reload"); err != nil {
+				// #4954: a failed reload here also owes activation debt so a
+				// later identical retry re-attempts it rather than reporting a
+				// false success.
+				m.setReloadPending(true)
 				writeErrs = append(writeErrs, fmt.Errorf("networkctl reload: %w", err))
 			} else {
+				m.setReloadPending(false)
 				restoreSlowPathRPFilter()
 			}
 		}
@@ -236,10 +262,32 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 			len(writeErrs), errors.Join(writeErrs...))
 	}
 
-	if changed {
-		slog.Info("networkd config updated, reloading", "interfaces", len(interfaces))
-		if err := runNetworkctl("reload"); err != nil {
-			return fmt.Errorf("networkctl reload: %w", err)
+	// #4954: an Apply must (re)activate whenever files changed this call OR a
+	// prior Apply left reload/reconfigure debt. Because the generated files are
+	// already on disk, an identical retry after a failed activation sees no
+	// change (changed==false) yet the kernel still runs the pre-failure config;
+	// without the debt the retry would skip the networkctl commands and return
+	// a false success. The debt is cleared only when the idempotent command
+	// finally succeeds.
+	m.mu.Lock()
+	reloadDebt := m.reloadPending
+	reconfDebt := len(m.reconfigurePending) > 0
+	m.mu.Unlock()
+
+	needReload := changed || reloadDebt
+	if needReload || reconfDebt {
+		if needReload {
+			if changed {
+				slog.Info("networkd config updated, reloading", "interfaces", len(interfaces))
+			} else {
+				slog.Info("networkd re-running deferred reload after a prior failed reload",
+					"interfaces", len(interfaces))
+			}
+			if err := runNetworkctl("reload"); err != nil {
+				m.setReloadPending(true)
+				return fmt.Errorf("networkctl reload: %w", err)
+			}
+			m.setReloadPending(false)
 		}
 		// Dynamically created interfaces (bonds, VLANs) may not get their
 		// addresses applied by reload alone. Reconfigure all managed
@@ -254,17 +302,46 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		}
 		if len(reconf) > 0 {
 			args := append([]string{"reconfigure"}, reconf...)
-			// Best-effort (reload above already applied the files), but
-			// the failure is no longer silent.
+			// Best-effort (reload above already applied the files), but the
+			// failure is no longer silent AND no longer forgotten: record the
+			// debt so the next Apply retries even with unchanged files (#4954).
 			if err := runNetworkctl(args...); err != nil {
+				m.setReconfigurePending(reconf)
 				slog.Warn("networkctl reconfigure failed",
 					"interfaces", len(reconf), "err", err)
+			} else {
+				m.setReconfigurePending(nil)
 			}
+		} else {
+			// Nothing managed to reconfigure — clear any stale debt.
+			m.setReconfigurePending(nil)
 		}
 		restoreSlowPathRPFilter()
 	}
 
 	return nil
+}
+
+// setReloadPending records or clears the #4954 reload activation debt.
+func (m *Manager) setReloadPending(pending bool) {
+	m.mu.Lock()
+	m.reloadPending = pending
+	m.mu.Unlock()
+}
+
+// setReconfigurePending records the set of interface names that still owe a
+// `networkctl reconfigure` (#4954), or clears the debt when names is empty.
+func (m *Manager) setReconfigurePending(names []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(names) == 0 {
+		m.reconfigurePending = nil
+		return
+	}
+	m.reconfigurePending = make(map[string]bool, len(names))
+	for _, n := range names {
+		m.reconfigurePending[n] = true
+	}
 }
 
 // procSysNetRoot is the root of the IPv4 sysctl tree. It is a package var
