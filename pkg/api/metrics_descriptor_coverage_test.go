@@ -554,6 +554,8 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_gre_decap_ecn_illegal_drops_total",                  // #2315 RFC 6040 4.2 decap illegal-combo drops
 		"xpf_userspace_wg_decap_ecn_illegal_drops_total",                   // #2317 WG RFC 6040 4.2 decap illegal-combo drops
 		"xpf_userspace_gre_encap_df_oversize_drops_total",                  // #2331 GRE encap DF-set oversized-outer drops
+		"xpf_userspace_martian_dst_drops_total",                            // #4743 martian-dst NoRoute blackhole drops
+		"xpf_userspace_ipv6_ext_header_drops_total",                        // #4743 IPv6 ext-header fail-closed over-bound drops
 		"xpf_userspace_gre_decap_checksum_invalid_drops_total",             // #2782 GRE decap checksum-present invalid drops
 		// #1771 §2.6 resolver backoff + §2.5 ENOBUFS/re-dump + key gauges
 		"xpf_userspace_neighbor_resolver_get_backoff_attempts_total",

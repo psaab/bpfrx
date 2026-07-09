@@ -883,6 +883,18 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceMartianDstDrops: prometheus.NewDesc(
+			"xpf_userspace_martian_dst_drops_total",
+			"martian-dst NoRoute blackhole drops",
+			nil,
+			nil,
+		),
+		userspaceIpv6ExtHeaderDrops: prometheus.NewDesc(
+			"xpf_userspace_ipv6_ext_header_drops_total",
+			"ipv6 ext-header fail-closed over-bound drops",
+			nil,
+			nil,
+		),
 		userspaceGreDecapChecksumInvalidDrops: prometheus.NewDesc(
 			"xpf_userspace_gre_decap_checksum_invalid_drops_total",
 			"gre decap checksum-present invalid drops",
@@ -971,6 +983,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2331: GRE-encap DF-set oversized-outer drop counter emitted
 		// unconditionally.
 		GreEncapDfOversizeDropsTotal: 6,
+		// #4743: martian-dst NoRoute blackhole + IPv6 ext-header fail-closed
+		// drop counters emitted unconditionally.
+		MartianDstDropsTotal:    14,
+		Ipv6ExtHeaderDropsTotal: 15,
 		// #2782: GRE-decap checksum-present invalid drop counter emitted
 		// unconditionally.
 		GreDecapChecksumInvalidDropsTotal: 8,
@@ -1041,13 +1057,14 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// gre_decap_ecn_illegal_drops_total counter (= 15) + the #2317
 	// wg_decap_ecn_illegal_drops_total counter (= 16) + the #2331
 	// gre_encap_df_oversize_drops_total counter (= 17) + the #2782
-	// gre_decap_checksum_invalid_drops_total counter (= 18) + the #2472
-	// per-reason generated-error rate-limit trio (time_exceeded /
-	// packet_too_big / reject) = 21 + the #3657 source-split reject trio
-	// (sent / reply-budget / output-filter) × 2 sources = 27 + the #3661
-	// source-split reject rate-limit drop leg × 2 sources = 29.
-	if len(got) != 29 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 29 metrics, got %d", len(got))
+	// gre_decap_checksum_invalid_drops_total counter (= 18) + the #4743
+	// martian_dst_drops_total + ipv6_ext_header_drops_total pair (= 20) + the
+	// #2472 per-reason generated-error rate-limit trio (time_exceeded /
+	// packet_too_big / reject) = 23 + the #3657 source-split reject trio
+	// (sent / reply-budget / output-filter) × 2 sources = 29 + the #3661
+	// source-split reject rate-limit drop leg × 2 sources = 31.
+	if len(got) != 31 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 31 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1073,6 +1090,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #2331: GRE-encap DF-set oversized-outer drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreEncapDfOversizeDrops, nil, 6)
+	// #4743: martian-dst NoRoute blackhole + IPv6 ext-header fail-closed drop
+	// counters emitted unconditionally.
+	assertCounterClose(t, got, c.userspaceMartianDstDrops, nil, 14)
+	assertCounterClose(t, got, c.userspaceIpv6ExtHeaderDrops, nil, 15)
 	// #2782: GRE-decap checksum-present invalid drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreDecapChecksumInvalidDrops, nil, 8)

@@ -1227,6 +1227,35 @@ func newCollector(srv *Server) *xpfCollector {
 				"(#2331).",
 			nil, nil,
 		),
+		userspaceMartianDstDrops: prometheus.NewDesc(
+			"xpf_userspace_martian_dst_drops_total",
+			"Packets dropped (blackholed) because their destination is a "+
+				"martian (IPv4/IPv6 multicast, the IPv4 limited broadcast, "+
+				"the unspecified address, or loopback) that resolved to "+
+				"NoRoute on the per-packet data path. Only the martian "+
+				"subset of NoRoute is counted, not every NoRoute (a plain "+
+				"NoRoute is already tallied by slow_path_no_route_packets "+
+				"and may still be forwarded by a kernel route the userspace "+
+				"FIB lacks). A martian, by contrast, has no legitimate "+
+				"forwarding path. This is the observable half of the #4373 "+
+				"filter-accept-then-silent-routing-drop gap: a "+
+				"firewall-filter accept log now correlates with a visible "+
+				"drop counter (#4743).",
+			nil, nil,
+		),
+		userspaceIpv6ExtHeaderDrops: prometheus.NewDesc(
+			"xpf_userspace_ipv6_ext_header_drops_total",
+			"IPv6 packets fail-closed dropped because their "+
+				"extension-header chain was still unterminated at the "+
+				"MAX_IPV6_EXT_HEADERS bound (an unparseable or over-long "+
+				"chain, for example a header-insertion IDS evasion or a "+
+				"malformed packet). The forwarding L4-offset walkers return "+
+				"no L4 offset and the packet is dropped; before this counter "+
+				"that drop was silent. The screen path's own over-bound walk "+
+				"is separately counted via the aggregate screen_drops, so it "+
+				"is not double-counted here (#4743).",
+			nil, nil,
+		),
 		userspaceGreDecapChecksumInvalidDrops: prometheus.NewDesc(
 			"xpf_userspace_gre_decap_checksum_invalid_drops_total",
 			"Native-GRE decap frames dropped because the GRE "+

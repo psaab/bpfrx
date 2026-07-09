@@ -658,6 +658,26 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.GreEncapDfOversizeDropsTotal),
 	)
 
+	// #4743: martian-destination NoRoute drops (multicast / IPv4 broadcast /
+	// unspecified / loopback dst blackholed). Emitted unconditionally so a 0 is
+	// a real "no martian-dst blackholes seen" signal rather than an absent
+	// series. Nonzero correlates a filter-accept log with a routing-drop.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceMartianDstDrops,
+		prometheus.CounterValue,
+		float64(status.MartianDstDropsTotal),
+	)
+
+	// #4743: IPv6 extension-header fail-closed (over-bound chain) drops.
+	// Emitted unconditionally so a 0 is a real "no over-bound ext-header
+	// chains seen" signal rather than an absent series. Nonzero flags a
+	// header-insertion evasion attempt or malformed IPv6 traffic.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceIpv6ExtHeaderDrops,
+		prometheus.CounterValue,
+		float64(status.Ipv6ExtHeaderDropsTotal),
+	)
+
 	// #2782: native-GRE decap checksum-invalid drops (C bit set but the
 	// GRE checksum failed to verify, or the header was truncated past the
 	// Checksum+Reserved1 field). Emitted unconditionally so a 0 is a real

@@ -380,6 +380,16 @@ type xpfCollector struct {
 	// DF-set oversized outer cannot be fragmented downstream and would
 	// silently blackhole every inner flow with no PMTUD signal.
 	userspaceGreEncapDfOversizeDrops *prometheus.Desc
+	// #4743: packets dropped (blackholed) because their destination is a
+	// martian (multicast / IPv4 broadcast / unspecified / loopback) that
+	// resolved to NoRoute on the per-packet data path — the observable half of
+	// the #4373 filter-accept-then-silent-routing-drop gap.
+	userspaceMartianDstDrops *prometheus.Desc
+	// #4743: IPv6 packets fail-closed dropped because their extension-header
+	// chain was still unterminated at the MAX_IPV6_EXT_HEADERS bound (an
+	// unparseable / over-long chain — a header-insertion IDS evasion or a
+	// malformed packet).
+	userspaceIpv6ExtHeaderDrops *prometheus.Desc
 	// #2782: native-GRE decap frames dropped because the Checksum-Present
 	// (C) bit was set but the GRE checksum failed to verify (or the header
 	// was truncated past the 4-byte Checksum+Reserved1 field). A
@@ -756,6 +766,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceWgDecapEcnIllegalDrops
 	ch <- c.userspaceGreEncapDfOversizeDrops
+	ch <- c.userspaceMartianDstDrops
+	ch <- c.userspaceIpv6ExtHeaderDrops
 	ch <- c.userspaceGreDecapChecksumInvalidDrops
 	ch <- c.userspaceTimeExceededRateLimited
 	ch <- c.userspacePacketTooBigRateLimited

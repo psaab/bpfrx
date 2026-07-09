@@ -1627,6 +1627,25 @@ type ProcessStatus struct {
 	// PTB signalling is deferred to #2330. Omitempty for wire compat with
 	// older helpers (defaults to 0).
 	GreEncapDfOversizeDropsTotal uint64 `json:"gre_encap_df_oversize_drops_total,omitempty"`
+	// #4743: packets DROPPED (blackholed) because their destination is a
+	// martian (multicast / IPv4 broadcast / unspecified / loopback) that
+	// resolved to NoRoute on the per-packet data path. The observable half of
+	// the #4373 "filter-accept then silent routing drop" gap: a firewall-filter
+	// accept log now correlates with a visible drop counter. Only the martian
+	// subset of NoRoute is counted (a plain NoRoute is already in
+	// slow_path_no_route_packets and may still be kernel-forwarded). Surfaced
+	// as xpf_userspace_martian_dst_drops_total. Omitempty for wire compat with
+	// older helpers (defaults to 0).
+	MartianDstDropsTotal uint64 `json:"martian_dst_drops_total,omitempty"`
+	// #4743: IPv6 packets fail-CLOSED DROPPED because their extension-header
+	// chain was still unterminated at the MAX_IPV6_EXT_HEADERS bound (an
+	// unparseable / over-long chain — a header-insertion IDS evasion or a
+	// malformed packet). The forwarding L4-offset walkers return no L4 offset
+	// and the packet is dropped; before this counter that drop was silent (the
+	// screen path's own over-bound walk is separately counted via
+	// screen_drops). Surfaced as xpf_userspace_ipv6_ext_header_drops_total.
+	// Omitempty for wire compat with older helpers (defaults to 0).
+	Ipv6ExtHeaderDropsTotal uint64 `json:"ipv6_ext_header_drops_total,omitempty"`
 	// #2782: native-GRE decap frames dropped because the GRE
 	// Checksum-Present (C) bit was set but the GRE checksum failed to
 	// verify (or the header was truncated past the 4-byte
