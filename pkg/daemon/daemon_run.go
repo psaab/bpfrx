@@ -1431,128 +1431,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fwdSampler.Start(ctx)
 
 	// Start gRPC API server.
-	{
-		// d.dp asserted against the local grpcDataPlane probe
-		// (runtime_probes.go) — structurally identical to
-		// pkg/grpcapi's package-private grpcRuntime
-		// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
-		// assignment to grpcapi.Config.DP at this site; signature
-		// drift surfaces as a compile error here.
-		var grpcDP grpcDataPlane
-		if d.dp != nil {
-			if probe, ok := d.dp.(grpcDataPlane); ok {
-				grpcDP = probe
-			}
-		}
-		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
-			Store:      d.store,
-			DP:         grpcDP,
-			EventBuf:   eventBuf,
-			GC:         d.gc,
-			Routing:    d.routing,
-			FRR:        d.frr,
-			IPsec:      d.ipsec,
-			Cluster:    d.cluster,
-			DHCP:       d.dhcp,
-			DHCPServer: d.dhcpServer,
-			RPMResultsFn: func() []*rpm.ProbeResult {
-				if d.rpm != nil {
-					return d.rpm.Results()
-				}
-				return nil
-			},
-			IPMonStatusFn: func() []ipmon.PolicyStatus {
-				if d.ipmon != nil {
-					return d.ipmon.Status()
-				}
-				return nil
-			},
-			// #2079: active NAT pool-utilization alarms for
-			// `show security alarms`.
-			NATPoolAlarmsFn: d.natPoolAlarms,
-			FeedsFn: func() map[string]feeds.FeedInfo {
-				if d.feeds != nil {
-					return d.feeds.AllFeeds()
-				}
-				return nil
-			},
-			// #3042: live feed-prefix overlay so the gRPC MatchPolicies
-			// simulator resolves feed-backed address-names to their live
-			// CIDRs, matching what the AF_XDP helper enforces.
-			FeedOverlayFn: func() map[string][]string {
-				return d.feedSnapshotsForConfig(d.store.ActiveConfig())
-			},
-			LLDPNeighborsFn: func() []*lldp.Neighbor {
-				if d.lldpMgr != nil {
-					return d.lldpMgr.Neighbors()
-				}
-				return nil
-			},
-			// #1387 inc-2: DHCP dynamic-DNS status sources for the
-			// `show ... dhcp-server dynamic-dns` ShowText topics.
-			DDNSStatsFn:          d.DDNSStats,
-			SurfaceADDNSStatsFn:  d.SurfaceAStats,
-			SurfaceADDNSStatusFn: d.SurfaceAStatus,
-			SurfaceADDNSForceFn:  d.ForceDDNSUpdate,
-			DDNSOwnedRecordsFn:   d.OwnedDDNSRecords,
-			// #2464: per-collector NetFlow v9 / IPFIX write-health for
-			// `show services flow-monitoring statistics`.
-			FlowCollectorHealthFn: d.FlowCollectorHealth,
-			// gRPC commits sync to cluster peer atomically inside
-			// the apply lock so the peer can never observe an apply
-			// that hasn't yet been propagated.
-			CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
-				return d.commitAndApply(ctx, comment, true)
-			},
-			CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
-				return d.commitConfirmedAndApply(ctx, minutes, true)
-			},
-			VRRPMgr: d.vrrpMgr,
-			RAMgr:   d.ra,
-			Version: d.opts.Version,
-			FabricPeerAddrFn: func() []string {
-				var addrs []string
-				if d.syncPeerAddr != "" {
-					addrs = append(addrs, d.syncPeerAddr)
-				} else {
-					d.fabricMu.RLock()
-					if d.fabricPeerIP != nil {
-						addrs = append(addrs, d.fabricPeerIP.String())
-					}
-					d.fabricMu.RUnlock()
-				}
-				if d.syncPeerAddr1 != "" {
-					addrs = append(addrs, d.syncPeerAddr1)
-				} else {
-					d.fabricMu.RLock()
-					if d.fabricPeerIP1 != nil {
-						addrs = append(addrs, d.fabricPeerIP1.String())
-					}
-					d.fabricMu.RUnlock()
-				}
-				return addrs
-			},
-			FabricVRFDevice: func() string {
-				if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
-					cc := c.Chassis.Cluster
-					if cc.ControlInterface != "" || cc.FabricInterface != "" {
-						return "vrf-mgmt"
-					}
-				}
-				return ""
-			}(),
-			FwdSampler: fwdSampler,
-		})
-		d.grpcSrv = grpcSrv
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := grpcSrv.Run(ctx); err != nil {
-				slog.Error("gRPC server error", "err", err)
-			}
-		}()
-		slog.Info("gRPC API server started", "addr", d.opts.GRPCAddr)
-	}
+	d.startGRPCServer(ctx, &wg, eventBuf, fwdSampler)
 
 	// ===== PHASE 6: Main block / wait (interactive CLI or daemon-mode signal wait) =====
 	// Start interactive CLI or block in daemon mode
@@ -1875,6 +1754,132 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 
 	slog.Info("shutdown complete")
 	return runErr
+}
+
+// startGRPCServer constructs and launches the gRPC API server goroutine.
+// Extracted verbatim from Run()'s PHASE 5 (#4662 Increment 2); the leaf
+// startup block carries no ordering dependency (same code, same call point).
+func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventBuf *logging.EventBuffer, fwdSampler *fwdstatus.Sampler) {
+	// d.dp asserted against the local grpcDataPlane probe
+	// (runtime_probes.go) — structurally identical to
+	// pkg/grpcapi's package-private grpcRuntime
+	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
+	// assignment to grpcapi.Config.DP at this site; signature
+	// drift surfaces as a compile error here.
+	var grpcDP grpcDataPlane
+	if d.dp != nil {
+		if probe, ok := d.dp.(grpcDataPlane); ok {
+			grpcDP = probe
+		}
+	}
+	grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
+		Store:      d.store,
+		DP:         grpcDP,
+		EventBuf:   eventBuf,
+		GC:         d.gc,
+		Routing:    d.routing,
+		FRR:        d.frr,
+		IPsec:      d.ipsec,
+		Cluster:    d.cluster,
+		DHCP:       d.dhcp,
+		DHCPServer: d.dhcpServer,
+		RPMResultsFn: func() []*rpm.ProbeResult {
+			if d.rpm != nil {
+				return d.rpm.Results()
+			}
+			return nil
+		},
+		IPMonStatusFn: func() []ipmon.PolicyStatus {
+			if d.ipmon != nil {
+				return d.ipmon.Status()
+			}
+			return nil
+		},
+		// #2079: active NAT pool-utilization alarms for
+		// `show security alarms`.
+		NATPoolAlarmsFn: d.natPoolAlarms,
+		FeedsFn: func() map[string]feeds.FeedInfo {
+			if d.feeds != nil {
+				return d.feeds.AllFeeds()
+			}
+			return nil
+		},
+		// #3042: live feed-prefix overlay so the gRPC MatchPolicies
+		// simulator resolves feed-backed address-names to their live
+		// CIDRs, matching what the AF_XDP helper enforces.
+		FeedOverlayFn: func() map[string][]string {
+			return d.feedSnapshotsForConfig(d.store.ActiveConfig())
+		},
+		LLDPNeighborsFn: func() []*lldp.Neighbor {
+			if d.lldpMgr != nil {
+				return d.lldpMgr.Neighbors()
+			}
+			return nil
+		},
+		// #1387 inc-2: DHCP dynamic-DNS status sources for the
+		// `show ... dhcp-server dynamic-dns` ShowText topics.
+		DDNSStatsFn:          d.DDNSStats,
+		SurfaceADDNSStatsFn:  d.SurfaceAStats,
+		SurfaceADDNSStatusFn: d.SurfaceAStatus,
+		SurfaceADDNSForceFn:  d.ForceDDNSUpdate,
+		DDNSOwnedRecordsFn:   d.OwnedDDNSRecords,
+		// #2464: per-collector NetFlow v9 / IPFIX write-health for
+		// `show services flow-monitoring statistics`.
+		FlowCollectorHealthFn: d.FlowCollectorHealth,
+		// gRPC commits sync to cluster peer atomically inside
+		// the apply lock so the peer can never observe an apply
+		// that hasn't yet been propagated.
+		CommitFn: func(ctx context.Context, comment string) (*config.Config, error) {
+			return d.commitAndApply(ctx, comment, true)
+		},
+		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
+			return d.commitConfirmedAndApply(ctx, minutes, true)
+		},
+		VRRPMgr: d.vrrpMgr,
+		RAMgr:   d.ra,
+		Version: d.opts.Version,
+		FabricPeerAddrFn: func() []string {
+			var addrs []string
+			if d.syncPeerAddr != "" {
+				addrs = append(addrs, d.syncPeerAddr)
+			} else {
+				d.fabricMu.RLock()
+				if d.fabricPeerIP != nil {
+					addrs = append(addrs, d.fabricPeerIP.String())
+				}
+				d.fabricMu.RUnlock()
+			}
+			if d.syncPeerAddr1 != "" {
+				addrs = append(addrs, d.syncPeerAddr1)
+			} else {
+				d.fabricMu.RLock()
+				if d.fabricPeerIP1 != nil {
+					addrs = append(addrs, d.fabricPeerIP1.String())
+				}
+				d.fabricMu.RUnlock()
+			}
+			return addrs
+		},
+		FabricVRFDevice: func() string {
+			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
+				cc := c.Chassis.Cluster
+				if cc.ControlInterface != "" || cc.FabricInterface != "" {
+					return "vrf-mgmt"
+				}
+			}
+			return ""
+		}(),
+		FwdSampler: fwdSampler,
+	})
+	d.grpcSrv = grpcSrv
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := grpcSrv.Run(ctx); err != nil {
+			slog.Error("gRPC server error", "err", err)
+		}
+	}()
+	slog.Info("gRPC API server started", "addr", d.opts.GRPCAddr)
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
