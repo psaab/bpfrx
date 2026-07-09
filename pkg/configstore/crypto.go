@@ -164,6 +164,15 @@ func (db *DB) maybeDecryptTreeJSON(data []byte) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("create GCM: %w", err)
 	}
+	// #4793: cipher.AEAD.Open panics if len(nonce) != gcm.NonceSize()
+	// instead of returning an error. A corrupt or tampered on-disk
+	// envelope (bad base64 length, truncated write, hand-edited JSON)
+	// would otherwise crash the daemon here on every boot — a
+	// config-DB-triggered boot loop. Fail closed with a plain error so
+	// the caller can report it instead of the process dying.
+	if len(nonce) != gcm.NonceSize() {
+		return nil, false, fmt.Errorf("invalid nonce length %d (want %d)", len(nonce), gcm.NonceSize())
+	}
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
 		return nil, false, fmt.Errorf("decrypt config tree: %w", err)

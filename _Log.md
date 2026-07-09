@@ -43710,3 +43710,5 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: Fix address-set bracket-list members silently dropped after the first entry (accumulate Keys[1:] + Children mirroring firewallMatchValues); add RED-on-revert test
   **File(s)**: pkg/config/compiler_security_addressbook.go, pkg/config/addressset_bracket_members_4791_test.go
+  **Action**: Guard config-DB AES-GCM decrypt against wrong-length nonce (fail closed with error instead of panic); add RED-on-revert test
+  **File(s)**: pkg/configstore/crypto.go, pkg/configstore/crypto_nonce_length_4793_test.go
