@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // errRedactedSecretIngest is returned by Secret.UnmarshalJSON when the
@@ -35,9 +37,10 @@ var errRedactedSecretIngest = errors.New(
 // *config.Config back from JSON/YAML (the persistence/sync SSOT is the
 // *ConfigTree AST, db.go / sync_conn.go). A redacting marshaller therefore
 // cannot starve any consumer of a secret. Render/reconcile sites read the
-// cleartext via Reveal(). UnmarshalJSON below additionally refuses the
-// redaction sentinel so that if a compiled-config JSON ingest is ever added
-// it fails loudly instead of silently loading "<redacted>" as a key.
+// cleartext via Reveal(). UnmarshalJSON and UnmarshalYAML below additionally
+// refuse the redaction sentinel so that if a compiled-config JSON or YAML
+// ingest is ever added it fails loudly instead of silently loading
+// "<redacted>" as a key.
 //
 // Secret keeps the underlying string kind (it is a named string type, not a
 // struct) so it stays comparable — usable as a map key and directly
@@ -157,4 +160,26 @@ func (s Secret) MarshalYAML() (any, error) {
 		return "", nil
 	}
 	return SecretRedacted, nil
+}
+
+// UnmarshalYAML mirrors UnmarshalJSON for the gopkg.in/yaml.v3 decoder: it
+// accepts a plain scalar so the type is a drop-in if a tree value is ever
+// decoded from YAML, but REFUSES the redaction sentinel. Without this method
+// yaml.v3 would decode the literal "<redacted>" straight into the Secret,
+// bypassing the fail-closed guard the JSON path enforces (a marshalled-then-
+// reloaded compiled config could silently reload "<redacted>" as a live
+// secret). No config YAML ingest path exists today (the compiled-config SSOT
+// is the AST tree, not YAML); this keeps the YAML surface symmetric with JSON
+// and fails closed if one is ever added. A pointer receiver is required for
+// any yaml.Unmarshaler.
+func (s *Secret) UnmarshalYAML(value *yaml.Node) error {
+	var v string
+	if err := value.Decode(&v); err != nil {
+		return err
+	}
+	if v == SecretRedacted {
+		return errRedactedSecretIngest
+	}
+	*s = Secret(v)
+	return nil
 }

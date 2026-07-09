@@ -1,3 +1,117 @@
+## 2026-07-09 — #4710: redact Secret in YAML marshal/unmarshal (close the JSON/YAML asymmetry)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4710 — `config.Secret` (pkg/config/secret.go) had a
+  fail-closed JSON round-trip guard (`MarshalJSON` redacts, `UnmarshalJSON`
+  REFUSES the `<redacted>` sentinel via `errRedactedSecretIngest`) and an
+  already-present defensive `MarshalYAML`, but NO `UnmarshalYAML` — an
+  asymmetry: yaml.v3 would decode the literal `<redacted>` straight into a
+  Secret, bypassing the guard the moment YAML config ingestion is wired up.
+  VERIFY-FIRST decision: NOT premature. `gopkg.in/yaml.v3` already exists in
+  the module graph (go.sum + module cache; pulled via pkg/dhcp + testify), and
+  `Secret`/`SNMPConfig`/`SNMPCommunity` already carry `MarshalYAML` methods, so
+  the project already committed to covering the YAML marshal surface — the
+  missing unmarshal half is the real gap, not a hypothetical new dependency.
+  Added `func (s *Secret) UnmarshalYAML(value *yaml.Node) error` mirroring
+  `UnmarshalJSON` byte-for-byte in behavior (decode scalar → reject
+  `SecretRedacted` with the SAME `errRedactedSecretIngest` sentinel → else
+  assign). Promoted yaml.v3 to a direct require via `go mod tidy` (go.sum
+  unchanged — already present). RED-on-revert test `TestSecretUnmarshalYAML`
+  drives the real yaml.v3 encoder/decoder: plain scalar ingests, a full
+  marshal→unmarshal round-trip of a live Secret is REFUSED; neutering the
+  sentinel guard makes the assertion fail (proven). go build ./... clean, go
+  vet clean, pkg/config green, whole-repo `go test ./...` green.
+  **File(s)**: pkg/config/secret.go, pkg/config/secret_test.go, go.mod
+
+## 2026-07-09 — #4731: stream `show ... | match/except/count/last` filters instead of buffering full output
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4731 — `dispatchWithPipe` (pkg/cli/cli_dispatch.go) did
+  `io.ReadAll` on the whole command output, then `strings.Split` on it before
+  filtering — buffering the ENTIRE output in memory (same OOM class #4709 fixed
+  for the pager) for a large `show route | match ...` etc. VERIFY-FIRST:
+  confirmed on origin/master (`0dbda9452`) that dispatchWithPipe still buffered,
+  and that #4709/PR #4730 already landed the `lineSource` (bufio.Reader + 1-line
+  lookahead) seam + the concurrent os.Pipe pager pattern — reused both, did NOT
+  reinvent. Rewrote dispatchWithPipe to mirror the #4709 concurrency: a filter
+  goroutine consumes the pipe via a new `filterStream(src, out, pipeType,
+  pipeArg)` helper while the command writes; the main goroutine runs
+  `c.dispatch(cmd)` (routing preserved exactly), closes the writer, then waits on
+  a done channel for the goroutine (which yields the command's exit code path
+  intact). Per pipe type: match/except/find/no-more emit line-by-line (≤1 line
+  held); count is a running tally (no buffering); last N is an n-wide circular
+  ring buffer (slot i%n, replay last min(count,n)) — never the whole output.
+  filterStream reuses lineSource so emitted lines are byte-identical to the old
+  strings.Split(output,"\n")-trailing-empty-dropped path. No early-return drain
+  needed — every filter reads to EOF (arrives on writer close). Tests:
+  cli_dispatch_pipe_stream_4731_test.go — a `bufferedFilter` reference reproduces
+  the pre-change io.ReadAll+strings.Split path and every pipe type × input
+  (trailing-nl/none, blank lines, arg-absent, empty, single line, \r\n, invalid
+  last args) is asserted byte-identical; plus anti-buffering proofs (match emits
+  the needle after reading <64KiB of a 2.6MB source via countingReader; count
+  tallies 500k lines; last-5 over 100k lines). Gates: go build ./... clean;
+  go test ./pkg/cli/... clean; `go test -race ./pkg/cli` ok (5.9s); full
+  `go test ./...` = 53 ok / 3 no-test / 0 FAIL.
+  **File(s)**: pkg/cli/cli_dispatch.go, pkg/cli/cli_dispatch_pipe_stream_4731_test.go, _Log.md
+
+## 2026-07-09 — #4708: stream BGP routes REST response instead of buffering the full table
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4708 — `bgpHandler` `case "routes"` (pkg/api/routing.go) rendered
+  every BGP route into one `strings.Builder`, then `writeOK` json-encoded that
+  string — a second full copy. On a full internet table (900k+ routes) that is
+  ~2x unbounded allocation (multi-hundred-MB string + its JSON-escaped copy) on
+  a RAM-constrained firewall. VERIFY-FIRST: confirmed on origin/master
+  (`deee2b0b6`) that the endpoint is a real, operator-reachable REST handler
+  returning the whole table; the response is `TextResponse` → wire envelope
+  `{"success":true,"data":{"output":"<lines>"}}\n`. SCOPE: bounded — no
+  interface change. Rewrote only `case "routes"` to stream the SAME envelope
+  incrementally: write the fixed prefix, then for each route format the line and
+  JSON-escape it through a fixed-size `bufio.Writer` (helper
+  `writeJSONStringFragment` reuses stdlib `json.Marshal` per line, stripping the
+  quotes). JSON string escaping is per-byte independent, so escaping each line
+  and concatenating is byte-for-byte identical to escaping the joined string —
+  wire format preserved exactly (same Content-Type, same trailing `\n` that
+  `json.Encoder` adds). Periodic `Flush` (every 1024 routes + at end) pushes
+  bytes onto the wire. Left `GetBGPRoutes` and the `default` (BGP summary,
+  peer-bounded) path unchanged. Added `bgp_routes_stream_4708_test.go`: (1) byte-
+  equivalence to the buffered golden for a representative table (incl. a path
+  with `<`/`>`/`&`/`"`/`\` to prove the escaper) + empty table (no nil-panic),
+  all routes present in order; (2) a `flushRecorder` ResponseWriter asserting a
+  3000-route table streams in bounded chunks (max single Write ≤ 4096) with
+  multiple Writes + ≥1 Flush. `go build ./...` clean; `go test ./...` 53 ok / 0
+  FAIL / 3 no-test.
+  **File(s)**: pkg/api/routing.go, pkg/api/bgp_routes_stream_4708_test.go
+
+## 2026-07-09 — #4709: stream CLI show output to the pager instead of buffering
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4709 — `dispatchWithPager` redirected a `show` command's stdout
+  to an `os.Pipe`, drained the WHOLE pipe with `io.ReadAll` into one `[]byte`,
+  then `strings.Split` into a slice before paging. `show route` (full BGP
+  table) or `show security flow session` (up to 10M sessions) buffered GBs in
+  memory before printing a byte — OOM risk on a RAM-constrained firewall.
+  Scope was BOUNDED: the pipe seam already existed, so no `io.Writer` had to be
+  threaded through the command-dispatch interface. Replaced the read-all-then-
+  page consumer with a concurrent streaming pager: the pager goroutine reads the
+  pipe incrementally via a `lineSource` (bufio.Reader with one-line lookahead)
+  and paginates a screenful at a time while the command still runs; when it
+  pauses at `--More--` the pipe fills and the command blocks on write, so output
+  is produced lazily. At most one page (+1 lookahead line +the OS pipe buffer)
+  is held at once regardless of total output. `lineSource` reproduces the old
+  `strings.Split(out,"\n")` + trailing-empty-drop semantics exactly (only "\n"
+  is the delimiter, a trailing "\r" stays on the line). Scroll behavior (space =
+  page, Enter = one line then a page, q = quit) is preserved; on quit the pager
+  drains the rest of the pipe so the writer goroutine never deadlocks on a full
+  pipe. Non-TTY behavior unchanged (keys still read from os.Stdin). The sibling
+  `dispatchWithPipe` (`show ... | match/count/last`) has the same buffering but
+  is out of #4709 scope (count/last need the full stream). Validation: gofmt;
+  go build ./...; new streaming/completeness/anti-buffering/quit-drain/line-
+  semantics tests PASS; `go test -race ./pkg/cli` green; FULL Go suite green
+  (53 ok / 0 fail / 3 no-test-pkgs).
+  **File(s)**: pkg/cli/cli_dispatch.go,
+  pkg/cli/cli_dispatch_pager_stream_4709_test.go, _Log.md
+
 ## 2026-07-09 — #4664: split event_stream/tests.rs into per-concern files
 
 - **Timestamp**: 2026-07-09
@@ -42896,3 +43010,43 @@ top.
   userspace-dp/src/nat/source.rs, userspace-dp/src/nat/tests_destination.rs,
   userspace-dp/src/nat/tests_static.rs, userspace-dp/src/nat/tests_source.rs,
   _Log.md
+
+## 2026-07-09 — #4717 RejoinAndConfirm surface PeerAlive/SyncEstablished errors
+- **Timestamp**: 2026-07-09
+- **Action**: Fix — RejoinAndConfirm discarded the `aerr`/`serr` captured from
+  PeerAlive/SyncEstablished each poll; on deadline it formatted only the
+  alive/synced booleans, losing the transport/gRPC cause. Now retains the last
+  non-nil error from each predicate and wraps them (naming which check failed)
+  into the timeout error. Happy path unchanged (both checks pass → nil). Mirrors
+  DrainAndConfirm's existing timeout, which already wraps the last DrainComplete
+  error. Diagnostics-only; no control-flow/abort change.
+- **Edit**: pkg/upgrade/kernel_drain.go (surface last aerr/serr in timeout error)
+- **Edit**: pkg/upgrade/rolling_test.go (fakeCluster peerAliveErr/syncErr seams)
+- **Edit**: pkg/upgrade/kernel_drain_test.go (RED-on-revert: surfacing tests for
+  SyncEstablished + PeerAlive failures; success-path guard)
+- **Edit**: docs/in-place-upgrade.md (rejoin diagnostics note)
+- **Validation**: go build ./... clean; go test ./pkg/upgrade/ -count=1 ok;
+  full `go test ./...` green; RED-on-revert verified (both surfacing tests FAIL
+  when kernel_drain.go reverted, success guard still PASS).
+
+## 2026-07-09 — #4711 parse SNMP client CIDRs once (perf)
+- **Timestamp**: 2026-07-09
+- **Action**: SNMPCommunity.AllowsSource re-parsed every configured `clients`
+  prefix (net.ParseCIDR/ParseIP) on EVERY incoming v2c packet. Pre-parse the
+  allowlist ONCE at config-compile time into an unexported []compiledSNMPClient
+  (clientNets) so AllowsSource does an allocation-free longest-prefix match.
+  compileClientNets runs in the compiler (compiler_system.go) after Clients is
+  finalized, before the config reaches the SNMP agent — no concurrent readers.
+  A directly-constructed community (nil clientNets, e.g. a unit test) falls back
+  to on-the-fly parsing for the SAME decision; the fallback reads only local
+  state, so it stays race-free. Semantics preserved exactly: empty list =
+  allow-all, longest-prefix match with per-entry `restrict`, no-match =
+  default-deny, malformed entry skipped-inert (never a silent allow-all).
+- **File(s)**: pkg/config/snmp_clients.go (compiledSNMPClient type,
+  compileClientNets, cache-reading AllowsSource), pkg/config/types_system.go
+  (clientNets field), pkg/config/compiler_system.go (build cache at compile),
+  pkg/config/snmp_clients_4711_test.go (new: cache populated, compiled-vs-
+  fallback parity, malformed skipped-inert, empty allow-all)
+- **Validation**: gofmt clean; go build ./... clean; go vet ./pkg/config
+  ./pkg/snmp clean (no copylocks); go test ./pkg/config/... + ./pkg/snmp/...
+  pass; full `go test ./...` green (53 ok / 0 fail / 3 no-test-files, 56 pkgs).

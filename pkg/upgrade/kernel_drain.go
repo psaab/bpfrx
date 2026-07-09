@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -119,15 +120,40 @@ func RejoinAndConfirm(cl RollingCluster, deadline time.Duration) error {
 	// Confirm the peer is still a healthy member and sync is re-established —
 	// i.e. the cluster is whole again — before declaring the rejoin done.
 	dl := time.Now().Add(deadline)
+	// Retain the last non-nil transport/gRPC error from each predicate so a
+	// deadline miss reports WHY the rejoin never confirmed, not just the
+	// alive/synced booleans (gemini-review-041 Low-2, #4717). Without this an
+	// operator sees only "peer-alive=false sync-established=false" and must dig
+	// through syslog to learn it was e.g. a refused gRPC dial while xpfd was
+	// still restarting. Mirrors DrainAndConfirm's timeout, which already wraps
+	// the last DrainComplete error.
+	var lastAErr, lastSErr error
 	for {
 		alive, aerr := cl.PeerAlive()
 		synced, serr := cl.SyncEstablished()
 		if aerr == nil && serr == nil && alive && synced {
 			return nil
 		}
+		if aerr != nil {
+			lastAErr = aerr
+		}
+		if serr != nil {
+			lastSErr = serr
+		}
 		if time.Now().After(dl) {
-			return fmt.Errorf("rejoin not confirmed within %s "+
+			base := fmt.Errorf("rejoin not confirmed within %s "+
 				"(peer-alive=%v sync-established=%v)", deadline, alive, synced)
+			var details []string
+			if lastAErr != nil {
+				details = append(details, fmt.Sprintf("last peer-alive error: %v", lastAErr))
+			}
+			if lastSErr != nil {
+				details = append(details, fmt.Sprintf("last sync-established error: %v", lastSErr))
+			}
+			if len(details) > 0 {
+				return fmt.Errorf("%w; %s", base, strings.Join(details, "; "))
+			}
+			return base
 		}
 		sleepBounded(dl)
 	}

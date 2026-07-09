@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -50,6 +51,13 @@ func extractPipe(line string) (string, string, string, bool) {
 	}
 }
 
+// dispatchWithPipe runs a command and applies a Junos-style output filter
+// (| match/except/find/count/last/no-more) to its output. The command writes to
+// a pipe that a concurrent filter goroutine consumes line-by-line via the #4709
+// lineSource, so a huge "show ... | match ..." streams with bounded memory
+// instead of being buffered whole with io.ReadAll first (#4731). At most one
+// line (match/except/find/no-more), a running tally (count), or an n-line ring
+// (last) is ever held, regardless of total output.
 func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -58,49 +66,69 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	}
 	os.Stdout = w
 
-	outputCh := make(chan []byte, 1)
+	// The filter runs concurrently with the command: it reads the command's
+	// output from r as it is produced and writes the filtered result straight
+	// to the real stdout, so output is consumed lazily instead of materialized
+	// up front. Every filter reads to EOF (which arrives when w is closed), so
+	// no early-return drain is needed to unblock the writer.
+	done := make(chan struct{})
 	go func() {
-		output, _ := io.ReadAll(r)
+		filterStream(r, origStdout, pipeType, pipeArg)
 		r.Close()
-		outputCh <- output
+		close(done)
 	}()
 
 	cmdErr := c.dispatch(cmd)
 	w.Close()
 	os.Stdout = origStdout
+	<-done
 
-	output := <-outputCh
+	return cmdErr
+}
 
-	lines := strings.Split(string(output), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
+// filterStream reads newline-delimited output from src and applies a Junos-style
+// output filter, writing the result to out as each line is read. It reuses the
+// #4709 lineSource line splitting so the emitted lines are byte-identical to the
+// previous strings.Split(output, "\n")-with-trailing-empty-dropped path for any
+// input. match/except/find/no-more hold at most one line at a time; count keeps
+// only a running tally; last keeps a bounded ring buffer of the last n lines —
+// none buffers the full output (#4731).
+func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
+	ls := &lineSource{r: bufio.NewReader(src)}
 
 	switch pipeType {
 	case "match", "grep":
-		for _, line := range lines {
+		for ls.hasMore() {
+			line, _ := ls.next()
 			if strings.Contains(line, pipeArg) {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "except":
-		for _, line := range lines {
+		for ls.hasMore() {
+			line, _ := ls.next()
 			if !strings.Contains(line, pipeArg) {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "find":
 		found := false
-		for _, line := range lines {
+		for ls.hasMore() {
+			line, _ := ls.next()
 			if !found && strings.Contains(line, pipeArg) {
 				found = true
 			}
 			if found {
-				fmt.Fprintln(origStdout, line)
+				fmt.Fprintln(out, line)
 			}
 		}
 	case "count":
-		fmt.Fprintf(origStdout, "Count: %d lines\n", len(lines))
+		count := 0
+		for ls.hasMore() {
+			ls.next()
+			count++
+		}
+		fmt.Fprintf(out, "Count: %d lines\n", count)
 	case "last":
 		n := 10
 		if pipeArg != "" {
@@ -108,22 +136,37 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 				n = v
 			}
 		}
-		start := len(lines) - n
-		if start < 0 {
-			start = 0
+		// Circular buffer of the last n lines: slot i%n holds the i-th
+		// line, overwriting the oldest once more than n have arrived. Only
+		// n lines are ever retained, not the whole output.
+		ring := make([]string, n)
+		count := 0
+		for ls.hasMore() {
+			line, _ := ls.next()
+			ring[count%n] = line
+			count++
 		}
-		for _, line := range lines[start:] {
-			fmt.Fprintln(origStdout, line)
+		total := count
+		if total > n {
+			total = n
+		}
+		for i := count - total; i < count; i++ {
+			fmt.Fprintln(out, ring[i%n])
 		}
 	case "no-more":
-		for _, line := range lines {
-			fmt.Fprintln(origStdout, line)
+		for ls.hasMore() {
+			line, _ := ls.next()
+			fmt.Fprintln(out, line)
 		}
 	}
-
-	return cmdErr
 }
 
+// dispatchWithPager runs a "show" command and pages its output. The command
+// writes to a pipe that a concurrent pager goroutine consumes incrementally, so
+// a huge table (a full BGP route table, millions of flow sessions) is streamed
+// to the terminal a screenful at a time rather than being buffered whole in
+// memory first (#4709). At most one screen of lines (plus one lookahead line
+// and the OS pipe buffer) is ever held at once, regardless of total output.
 func (c *CLI) dispatchWithPager(line string) error {
 	origStdout := os.Stdout
 	r, w, err := os.Pipe()
@@ -132,71 +175,129 @@ func (c *CLI) dispatchWithPager(line string) error {
 	}
 	os.Stdout = w
 
-	outputCh := make(chan []byte, 1)
+	termHeight := 24
+	if ws, wErr := unix.IoctlGetWinsize(int(origStdout.Fd()), unix.TIOCGWINSZ); wErr == nil && ws.Row > 0 {
+		termHeight = int(ws.Row)
+	}
+	pageSize := termHeight - 1
+
+	// The pager runs concurrently with the command: it reads the command's
+	// output from r as it is produced and pauses at each "--More--". While it
+	// waits for a keypress the pipe fills and the command blocks on write, so
+	// output is produced lazily on demand instead of materialized up front.
+	done := make(chan struct{})
 	go func() {
-		output, _ := io.ReadAll(r)
+		pageStream(r, origStdout, os.Stdin, pageSize)
 		r.Close()
-		outputCh <- output
+		close(done)
 	}()
 
 	cmdErr := c.dispatchOperational(line)
 	w.Close()
 	os.Stdout = origStdout
+	<-done
+	return cmdErr
+}
 
-	output := <-outputCh
-
-	lines := strings.Split(string(output), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
+// pageStream reads newline-delimited output from src and writes it to out one
+// screenful (pageSize lines) at a time, reading a single keypress from keys at
+// each "--More--" prompt (space = next page, Enter = one more line, q = quit).
+// It never buffers more than a single page plus one lookahead line, so the
+// caller's total output can be arbitrarily large without a proportional
+// allocation. On quit it drains the remaining input so a producer writing into
+// a pipe never blocks.
+func pageStream(src io.Reader, out io.Writer, keys io.Reader, pageSize int) {
+	if pageSize < 1 {
+		pageSize = 1
 	}
+	ls := &lineSource{r: bufio.NewReader(src)}
 
-	termHeight := 24
-	ws, err := unix.IoctlGetWinsize(int(origStdout.Fd()), unix.TIOCGWINSZ)
-	if err == nil && ws.Row > 0 {
-		termHeight = int(ws.Row)
-	}
-	pageSize := termHeight - 1
-
-	if len(lines) <= pageSize {
-		for _, line := range lines {
-			fmt.Fprintln(origStdout, line)
+	for ls.hasMore() {
+		printed := 0
+		for printed < pageSize {
+			l, ok := ls.next()
+			if !ok {
+				break
+			}
+			fmt.Fprintln(out, l)
+			printed++
 		}
-		return cmdErr
-	}
 
-	lineIdx := 0
-	for lineIdx < len(lines) {
-		end := lineIdx + pageSize
-		if end > len(lines) {
-			end = len(lines)
-		}
-		for _, line := range lines[lineIdx:end] {
-			fmt.Fprintln(origStdout, line)
-		}
-		lineIdx = end
-
-		if lineIdx >= len(lines) {
+		if !ls.hasMore() {
 			break
 		}
 
-		fmt.Fprint(origStdout, "\033[7m--More--\033[0m")
+		fmt.Fprint(out, "\033[7m--More--\033[0m")
 		buf := make([]byte, 1)
-		os.Stdin.Read(buf)
-		fmt.Fprint(origStdout, "\r        \r")
+		keys.Read(buf)
+		fmt.Fprint(out, "\r        \r")
 
 		switch buf[0] {
 		case 'q', 'Q':
-			return cmdErr
+			// Discard the rest so a blocked pipe writer can finish.
+			io.Copy(io.Discard, src)
+			return
 		case '\n', '\r':
-			if lineIdx < len(lines) {
-				fmt.Fprintln(origStdout, lines[lineIdx])
-				lineIdx++
+			if l, ok := ls.next(); ok {
+				fmt.Fprintln(out, l)
 			}
 			continue
 		default:
 		}
 	}
-	return cmdErr
+}
+
+// lineSource yields newline-delimited lines from an io.Reader with one line of
+// lookahead. It mirrors the semantics of strings.Split(output, "\n") with a
+// trailing empty element dropped: a final line terminated by "\n" does not
+// produce a phantom empty line, while an unterminated final line is returned as
+// its own line. Only "\n" is treated as the delimiter, so a trailing "\r" stays
+// on the line exactly as the previous strings.Split did.
+type lineSource struct {
+	r       *bufio.Reader
+	peeked  string
+	hasPeek bool
+	done    bool
+}
+
+// read pulls the next line directly from the underlying reader.
+func (ls *lineSource) read() (string, bool) {
+	line, err := ls.r.ReadString('\n')
+	if len(line) == 0 && err != nil {
+		ls.done = true
+		return "", false
+	}
+	if err != nil {
+		ls.done = true
+	}
+	return strings.TrimSuffix(line, "\n"), true
+}
+
+// next returns the next line, or ("", false) at end of input.
+func (ls *lineSource) next() (string, bool) {
+	if ls.hasPeek {
+		ls.hasPeek = false
+		return ls.peeked, true
+	}
+	return ls.read()
+}
+
+// hasMore reports whether another line is available, buffering it for the next
+// next() call.
+func (ls *lineSource) hasMore() bool {
+	if ls.hasPeek {
+		return true
+	}
+	if ls.done {
+		return false
+	}
+	l, ok := ls.read()
+	if !ok {
+		return false
+	}
+	ls.peeked = l
+	ls.hasPeek = true
+	return true
 }
 
 var operationalCommands = []string{

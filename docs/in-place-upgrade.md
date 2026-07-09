@@ -619,6 +619,16 @@ until `status` reports `promoted=<ver>` AND `uname -r` matches, then
 A reverted node boots the OLD kernel and reports `promoted!=<ver>` → the
 driver STOPS and never touches the peer (never-both-down).
 
+If `rejoin` cannot confirm within its deadline, `RejoinAndConfirm`
+(`pkg/upgrade/kernel_drain.go`) now surfaces the last non-nil
+`PeerAlive`/`SyncEstablished` transport error in the returned error —
+naming which check failed — instead of printing only the alive/synced
+booleans (#4717). So an operator whose rejoin stalls on a refused gRPC
+dial (xpfd still restarting) sees the actual cause in the `xpfd upgrade
+kernel rejoin` stderr rather than having to correlate syslog. This is
+diagnostics only: the happy path is unchanged and a failed rejoin
+already STOPPED the roll before touching the peer.
+
 Three independent safety nets keep an UNVERIFIED candidate from ever
 carrying traffic:
 

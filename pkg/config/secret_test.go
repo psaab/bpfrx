@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // TestSecretMarshalJSON covers the core redaction contract: a non-empty
@@ -135,6 +137,48 @@ func TestSecretUnmarshalJSON(t *testing.T) {
 	}
 	if !errors.Is(err, errRedactedSecretIngest) {
 		t.Errorf("Unmarshal(sentinel) err = %v, want errRedactedSecretIngest", err)
+	}
+}
+
+// TestSecretUnmarshalYAML is the YAML mirror of TestSecretUnmarshalJSON and
+// the RED-on-revert guard for the fail-closed round-trip: it drives the real
+// gopkg.in/yaml.v3 decoder (not the method directly) so reverting
+// UnmarshalYAML lets yaml.v3 decode the sentinel straight into the Secret and
+// the sentinel-refusal assertion fails. A plain scalar ingests as-is; a full
+// marshal->unmarshal round-trip of a live Secret must be REFUSED, never
+// reloaded as a live secret.
+func TestSecretUnmarshalYAML(t *testing.T) {
+	var s Secret
+	if err := yaml.Unmarshal([]byte("plain\n"), &s); err != nil {
+		t.Fatalf("Unmarshal(plain) error = %v", err)
+	}
+	if s.Reveal() != "plain" {
+		t.Errorf("Unmarshal(plain) = %q, want %q", s.Reveal(), "plain")
+	}
+
+	// The redaction sentinel must be REFUSED (fail-closed), never loaded as a
+	// live secret.
+	err := yaml.Unmarshal([]byte(SecretRedacted+"\n"), &s)
+	if err == nil {
+		t.Fatal("Unmarshal(sentinel) succeeded; want refusal")
+	}
+	if !errors.Is(err, errRedactedSecretIngest) {
+		t.Errorf("Unmarshal(sentinel) err = %v, want errRedactedSecretIngest", err)
+	}
+
+	// Full round-trip: marshalling a live Secret emits the sentinel (never the
+	// cleartext); feeding that YAML back in must be refused. Without
+	// UnmarshalYAML, yaml.v3 decodes the sentinel into s with no error and this
+	// assertion fails — the RED-on-revert signal.
+	yb, err := yaml.Marshal(Secret("supersecret"))
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if strings.Contains(string(yb), "supersecret") {
+		t.Errorf("Marshal() leaked cleartext: %s", yb)
+	}
+	if err := yaml.Unmarshal(yb, &s); !errors.Is(err, errRedactedSecretIngest) {
+		t.Errorf("round-trip Unmarshal(sentinel) err = %v, want errRedactedSecretIngest", err)
 	}
 }
 

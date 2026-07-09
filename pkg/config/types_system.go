@@ -521,6 +521,15 @@ type SNMPCommunity struct {
 	// is allow-all (the Junos default). Enforced by the SNMP agent via
 	// AllowsSource (snmp_clients.go).
 	Clients []SNMPClient
+
+	// clientNets is Clients pre-parsed into an allocation-free match set
+	// (#4711). The compiler populates it via compileClientNets after Clients
+	// is finalized, before the config reaches the SNMP agent, so AllowsSource
+	// matches without re-parsing every prefix on every incoming v2c packet.
+	// Unexported: derived state, not part of the config surface (not marshaled,
+	// not persisted); a config path that skips compilation leaves it nil and
+	// AllowsSource parses on the fly. See snmp_clients.go.
+	clientNets []compiledSNMPClient
 }
 
 // SNMPClient is one entry of an SNMP community `clients` source-IP allowlist:
