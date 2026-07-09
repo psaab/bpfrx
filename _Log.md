@@ -29,6 +29,34 @@
   **File(s)**: pkg/api/metrics.go, pkg/api/metrics_system.go,
   pkg/api/metrics_descriptors.go, pkg/api/metrics_cpu_current_4707_test.go,
   _Log.md
+## 2026-07-08 — #4714: reject dangling trailing negation in tcp-flags (fail-closed)
+
+- **Timestamp**: 2026-07-08
+  **Action**: #4714 — `ParseTCPFlagsExpression` in `pkg/config/tcp_flags.go`
+  tracked `pendingNeg` but never checked for a dangling `pendingNeg==true`
+  after the token loop, so a firewall-filter `tcp-flags` value whose `!` had
+  no flag operand parsed WITHOUT error and the negation was silently dropped —
+  a fail-open on the missing forbidden-flag constraint. Verified on
+  origin/master: `tcp-flags "!"` returned `(0,0,false,nil)` (no constraint at
+  all) and `"syn & !"` returned `(SYN,0,true,nil)` (trailing `!` dropped, term
+  now matches SYN with no ACK exclusion). The only caller is the #3076
+  commit-layer guard at `compiler_firewall.go:268` (→ `CompileConfig`), so the
+  malformed expression committed cleanly. Fix (fail-closed): reject a dangling
+  negation with a clear error naming the expression — added an `if pendingNeg`
+  guard after the token loop (catches trailing `!`, e.g. `"!"`, `"syn & !"`)
+  AND a `pendingNeg` check in the `&` case (catches a `!` immediately before a
+  separator with no operand, e.g. `"! & ack"`). Valid negations (`!ack`,
+  `syn & !ack`, `!syn & !ack`, `(syn & !ack)`) are unaffected. Double-negation
+  `!!` (even count → `pendingNeg` false) is out of #4714 scope and deliberately
+  not touched (not a fail-open — it cancels to the un-negated flag).
+  Tests: extended the `TestParseTCPFlagsExpression` table with three dangling
+  cases; added `TestParseTCPFlagsDanglingNegation` (5 reject + 7 accept
+  over-rejection guards asserting exact masks) and a commit-path assert in
+  `TestFirewallFilterTCPFlagsCommitReject`. RED-on-revert confirmed: stashing
+  the parser fix makes every new reject assertion FAIL. Validation: gofmt;
+  `go build ./...` clean; `go test ./pkg/config/...` green; FULL Go suite green
+  (53 packages ok, 0 FAIL).
+  **File(s)**: pkg/config/tcp_flags.go, pkg/config/tcp_flags_test.go, _Log.md
 
 ## 2026-07-08 — #4705: resolve master-password across ALL system stanzas (no plaintext DB leak)
 
