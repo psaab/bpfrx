@@ -216,129 +216,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
-	// Create dataplane backend (unless in config-only mode)
-	if !d.opts.NoDataplane {
-		dpType := ""
-		if cfg := d.store.ActiveConfig(); cfg != nil {
-			dpType = cfg.System.DataplaneType
-		}
-		dp, err := buildRuntimeDataPlane(dpType)
-		if errors.Is(err, dataplane.ErrDPDKBackendRetired) {
-			// #1527 Phase 2 of the DPDK retirement (umbrella
-			// #1525): the runtime DPDK backend is gone, but a
-			// node may still have "set system dataplane-type
-			// dpdk" persisted in the active config from before
-			// Chain A (#1526) blocked the commit. Treat this
-			// the same way as a Start() failure: log a warning
-			// and fall through to config-only mode so the
-			// daemon stays up and the operator can fix the
-			// config from the CLI / gRPC. The hard fatal-at-
-			// startup branch is reserved for genuinely unknown
-			// dataplane types (the default branch below).
-			//
-			// Note: Store.Load() now also rewrites persisted
-			// `dataplane-type dpdk` to empty before compile, so
-			// the typical path through buildRuntimeDataPlane
-			// resolves to userspace and never reaches this
-			// branch. The branch stays as defence-in-depth for
-			// callers (config sync, REST/gRPC candidate apply)
-			// that bypass Store.Load() and pass the retired
-			// type through explicitly.
-			slog.Warn("the DPDK dataplane backend has been retired; running in config-only mode until config is updated",
-				"type", dpType,
-				"err", err,
-				"remediation", "set system dataplane-type userspace",
-			)
-			d.dp = nil
-		} else if errors.Is(err, dataplane.ErrEBPFBackendRetired) {
-			// #1476: mechanical source removal of the legacy
-			// eBPF dataplane. Behaviour mirrors the DPDK arm
-			// above. Store.Load() / Store.SyncApply() both
-			// rewrite persisted `dataplane-type ebpf` to
-			// empty before compile, so the typical path
-			// never reaches this branch — but a candidate
-			// apply through REST/gRPC that explicitly passes
-			// the retired type will, and the daemon must stay
-			// up so the operator can correct the candidate.
-			slog.Warn("the legacy eBPF dataplane backend has been retired; running in config-only mode until config is updated",
-				"type", dpType,
-				"err", err,
-				"remediation", "set system dataplane-type userspace",
-			)
-			d.dp = nil
-		} else if err != nil {
-			slog.Error("failed to create dataplane", "type", dpType, "err", err)
-			return fmt.Errorf("create dataplane: %w", err)
-		} else {
-			d.dp = dp
-		}
-		// #1620: stamp the cold-path sample mask onto the userspace
-		// Manager so the next buildSnapshot includes it. Mask
-		// validation already happened in cmd/xpfd/main.go (two-flag
-		// scheme, pow-of-2-1, reject u64::MAX). nil pointer ⇒ no
-		// operator setting, userspace-dp defaults to 0xff.
-		if d.dp != nil && d.opts.ColdPathSampleMask != nil {
-			if adapter, ok := d.dp.(interface{ Manager() *dpuserspace.Manager }); ok {
-				if mgr := adapter.Manager(); mgr != nil {
-					mgr.SetColdPathSampleMask(d.opts.ColdPathSampleMask)
-				}
-			}
-		}
-		// #1922 Item 2: in bootstrap mode, do NOT arm the dataplane
-		// (AF_XDP attach) and do NOT run the boot-time applyConfig
-		// (interface/FRR/routing takeover). The backend object stays
-		// constructed (d.dp != nil) so the bootstrap-exit reconcile can
-		// arm it on the first confirmed commit (C1: construct always, arm
-		// only when not bootstrap). The control plane (gRPC/REST/CLI) is
-		// started later regardless.
-		if d.inBootstrap() {
-			slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
-		} else {
-			if d.dp != nil {
-				if err := d.dp.Start(ctx); err != nil {
-					slog.Warn("failed to start dataplane, running in config-only mode",
-						"err", err)
-					d.dp = nil
-				} else {
-					// natSeeder is satisfied by both *dataplane.Manager
-					// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
-					// SeedSessionIDCounter in maps_session.go) and the userspace
-					// *LegacyDataPlaneAdapter (via embedded bpfShim). The
-					// seed methods are no-ops on the userspace fast path
-					// but harmless to invoke. The legacyDP() round-trip is
-					// no longer required (#1519).
-					if seeder, ok := d.dp.(natSeeder); ok {
-						seeder.SeedNATPortCounters()
-						nodeID := 0
-						if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-							nodeID = cfg.Chassis.Cluster.NodeID
-						}
-						seeder.SeedSessionIDCounter(nodeID)
-					}
-				}
-			}
-			// Apply current config — needed even in config-only mode so that
-			// VRFs, interfaces, and routing are configured before cluster comms.
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				slog.Info("applying active configuration")
-				d.applyConfig(cfg)
-			}
-		}
-	}
-	// #1715: the boot-time DNS reconcile (inside the apply above) ran
-	// before DHCP clients start, so its empty-merge policy was
-	// repair-only. From here on, an empty DNS merge means "clear DNS".
-	// Set under applySem so reconcileDNSLocked (which reads it) never
-	// races: applyConfig has released the lock by now, and every later
-	// reader re-acquires it.
-	_ = d.applySem.Acquire(context.Background(), 1)
-	d.dnsBootDone = true
-	d.applySem.Release(1)
-
-	// Remove stale blackhole routes from previous daemon runs before
-	// cluster comms start (which may inject new ones).
-	if d.cluster != nil {
-		d.reconcileBlackholeRoutes()
+	if err := d.setupDataplaneAndInitialConfig(ctx); err != nil {
+		return err
 	}
 
 	// ===== PHASE 4: Signal handling + apply-cancel context + event buffer + WaitGroup =====
@@ -1931,6 +1810,145 @@ func (d *Daemon) setupInterfaceNaming() {
 				coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 		}
 	}
+}
+
+// setupDataplaneAndInitialConfig builds the runtime dataplane backend (unless
+// config-only), seeds the NAT/session-id counters, runs the FIRST applyConfig
+// (configures VRFs/interfaces/routing before cluster comms), flips the #1715
+// dnsBootDone flag under applySem, and clears stale blackhole routes. Extracted
+// verbatim from Run()'s PHASE 3 tail (#4662 Increment 7) — the ordering-
+// sensitive dataplane-arming path. The resolver injection in initManagers
+// (called before this) precedes the dataplane Start here, and the dataplane is
+// loaded before the first applyConfig; order is preserved by calling this in
+// the same Run() slot right after initManagers. Returns a non-nil error only
+// on a fatal dataplane-create failure (the block's sole early return), which
+// Run propagates unchanged.
+func (d *Daemon) setupDataplaneAndInitialConfig(ctx context.Context) error {
+	// Create dataplane backend (unless in config-only mode)
+	if !d.opts.NoDataplane {
+		dpType := ""
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			dpType = cfg.System.DataplaneType
+		}
+		dp, err := buildRuntimeDataPlane(dpType)
+		if errors.Is(err, dataplane.ErrDPDKBackendRetired) {
+			// #1527 Phase 2 of the DPDK retirement (umbrella
+			// #1525): the runtime DPDK backend is gone, but a
+			// node may still have "set system dataplane-type
+			// dpdk" persisted in the active config from before
+			// Chain A (#1526) blocked the commit. Treat this
+			// the same way as a Start() failure: log a warning
+			// and fall through to config-only mode so the
+			// daemon stays up and the operator can fix the
+			// config from the CLI / gRPC. The hard fatal-at-
+			// startup branch is reserved for genuinely unknown
+			// dataplane types (the default branch below).
+			//
+			// Note: Store.Load() now also rewrites persisted
+			// `dataplane-type dpdk` to empty before compile, so
+			// the typical path through buildRuntimeDataPlane
+			// resolves to userspace and never reaches this
+			// branch. The branch stays as defence-in-depth for
+			// callers (config sync, REST/gRPC candidate apply)
+			// that bypass Store.Load() and pass the retired
+			// type through explicitly.
+			slog.Warn("the DPDK dataplane backend has been retired; running in config-only mode until config is updated",
+				"type", dpType,
+				"err", err,
+				"remediation", "set system dataplane-type userspace",
+			)
+			d.dp = nil
+		} else if errors.Is(err, dataplane.ErrEBPFBackendRetired) {
+			// #1476: mechanical source removal of the legacy
+			// eBPF dataplane. Behaviour mirrors the DPDK arm
+			// above. Store.Load() / Store.SyncApply() both
+			// rewrite persisted `dataplane-type ebpf` to
+			// empty before compile, so the typical path
+			// never reaches this branch — but a candidate
+			// apply through REST/gRPC that explicitly passes
+			// the retired type will, and the daemon must stay
+			// up so the operator can correct the candidate.
+			slog.Warn("the legacy eBPF dataplane backend has been retired; running in config-only mode until config is updated",
+				"type", dpType,
+				"err", err,
+				"remediation", "set system dataplane-type userspace",
+			)
+			d.dp = nil
+		} else if err != nil {
+			slog.Error("failed to create dataplane", "type", dpType, "err", err)
+			return fmt.Errorf("create dataplane: %w", err)
+		} else {
+			d.dp = dp
+		}
+		// #1620: stamp the cold-path sample mask onto the userspace
+		// Manager so the next buildSnapshot includes it. Mask
+		// validation already happened in cmd/xpfd/main.go (two-flag
+		// scheme, pow-of-2-1, reject u64::MAX). nil pointer ⇒ no
+		// operator setting, userspace-dp defaults to 0xff.
+		if d.dp != nil && d.opts.ColdPathSampleMask != nil {
+			if adapter, ok := d.dp.(interface{ Manager() *dpuserspace.Manager }); ok {
+				if mgr := adapter.Manager(); mgr != nil {
+					mgr.SetColdPathSampleMask(d.opts.ColdPathSampleMask)
+				}
+			}
+		}
+		// #1922 Item 2: in bootstrap mode, do NOT arm the dataplane
+		// (AF_XDP attach) and do NOT run the boot-time applyConfig
+		// (interface/FRR/routing takeover). The backend object stays
+		// constructed (d.dp != nil) so the bootstrap-exit reconcile can
+		// arm it on the first confirmed commit (C1: construct always, arm
+		// only when not bootstrap). The control plane (gRPC/REST/CLI) is
+		// started later regardless.
+		if d.inBootstrap() {
+			slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
+		} else {
+			if d.dp != nil {
+				if err := d.dp.Start(ctx); err != nil {
+					slog.Warn("failed to start dataplane, running in config-only mode",
+						"err", err)
+					d.dp = nil
+				} else {
+					// natSeeder is satisfied by both *dataplane.Manager
+					// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
+					// SeedSessionIDCounter in maps_session.go) and the userspace
+					// *LegacyDataPlaneAdapter (via embedded bpfShim). The
+					// seed methods are no-ops on the userspace fast path
+					// but harmless to invoke. The legacyDP() round-trip is
+					// no longer required (#1519).
+					if seeder, ok := d.dp.(natSeeder); ok {
+						seeder.SeedNATPortCounters()
+						nodeID := 0
+						if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+							nodeID = cfg.Chassis.Cluster.NodeID
+						}
+						seeder.SeedSessionIDCounter(nodeID)
+					}
+				}
+			}
+			// Apply current config — needed even in config-only mode so that
+			// VRFs, interfaces, and routing are configured before cluster comms.
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				slog.Info("applying active configuration")
+				d.applyConfig(cfg)
+			}
+		}
+	}
+	// #1715: the boot-time DNS reconcile (inside the apply above) ran
+	// before DHCP clients start, so its empty-merge policy was
+	// repair-only. From here on, an empty DNS merge means "clear DNS".
+	// Set under applySem so reconcileDNSLocked (which reads it) never
+	// races: applyConfig has released the lock by now, and every later
+	// reader re-acquires it.
+	_ = d.applySem.Acquire(context.Background(), 1)
+	d.dnsBootDone = true
+	d.applySem.Release(1)
+
+	// Remove stale blackhole routes from previous daemon runs before
+	// cluster comms start (which may inject new ones).
+	if d.cluster != nil {
+		d.reconcileBlackholeRoutes()
+	}
+	return nil
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
