@@ -3,6 +3,8 @@ package cluster
 import (
 	"context"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -911,6 +913,112 @@ func TestMonitor_CarrierDownDemotesRG(t *testing.T) {
 	mon.poll()
 	if w := m.GroupStates()[0].Weight; w != 255 {
 		t.Errorf("weight after carrier recovery = %d, want 255", w)
+	}
+}
+
+// countingNlHandle is a fake nlHandleCloser that records how many times it is
+// closed. Paired with a counting factory, it lets the getNlHandle tests assert
+// that exactly one production handle is created under concurrency (no FD leak)
+// and that Stop closes it exactly once.
+type countingNlHandle struct {
+	closes *int32
+}
+
+func (h *countingNlHandle) LinkByName(name string) (netlink.Link, error) {
+	return nil, net.UnknownNetworkError("counting fake: " + name)
+}
+
+func (h *countingNlHandle) Close() { atomic.AddInt32(h.closes, 1) }
+
+// TestGetNlHandleConcurrentSingleCreation hammers getNlHandle from many
+// goroutines and asserts exactly one netlink handle is created — the #4715
+// FD-leak + data-race fix. Pre-fix, getNlHandle read/wrote mon.cachedNlHandle
+// lock-free, so concurrent callers each ran the factory (leaking every handle
+// but the last) and the write raced Stop()'s cachedNlHandle=nil. With the fix
+// the check-create-cache runs under mon.mu, so creations==1 and `go test
+// -race` is clean. Reverting the locking (keeping the factory seam) makes this
+// test RED: `-race` reports a data race on cachedNlHandle AND the 1ms factory
+// delay lets several goroutines observe cachedNlHandle==nil, so creations>1.
+func TestGetNlHandleConcurrentSingleCreation(t *testing.T) {
+	mon := NewMonitor(nil, nil)
+
+	var creations, closes int32
+	mon.newNlHandle = func() (nlHandleCloser, error) {
+		atomic.AddInt32(&creations, 1)
+		// Widen the race window: two lock-free callers would both observe
+		// cachedNlHandle==nil during this delay and each create a handle.
+		time.Sleep(time.Millisecond)
+		return &countingNlHandle{closes: &closes}, nil
+	}
+
+	const goroutines = 64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if got := mon.getNlHandle(); got == nil {
+				t.Error("getNlHandle returned nil")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&creations); got != 1 {
+		t.Fatalf("expected exactly 1 handle creation under concurrency, got %d "+
+			"(each extra creation leaks a netlink socket FD)", got)
+	}
+
+	// Stop closes the single cached handle exactly once — no leak.
+	mon.Stop()
+	if got := atomic.LoadInt32(&closes); got != 1 {
+		t.Fatalf("expected exactly 1 Close on Stop, got %d", got)
+	}
+
+	// After Stop nils cachedNlHandle, getNlHandle recreates on demand,
+	// preserving the prior lazy-recreate contract.
+	if got := mon.getNlHandle(); got == nil {
+		t.Error("getNlHandle after Stop returned nil")
+	}
+	if got := atomic.LoadInt32(&creations); got != 2 {
+		t.Fatalf("expected the handle recreated after Stop (2 total creations), got %d", got)
+	}
+	mon.Stop()
+	if got := atomic.LoadInt32(&closes); got != 2 {
+		t.Fatalf("expected the recreated handle closed on the second Stop (2 total), got %d", got)
+	}
+}
+
+// TestGetNlHandleSingleThreadedCachesAndCloses is the behavioral guard: a
+// single caller still gets a working, cached handle, repeat calls return the
+// same handle (one creation), and Stop closes it.
+func TestGetNlHandleSingleThreadedCachesAndCloses(t *testing.T) {
+	mon := NewMonitor(nil, nil)
+
+	var creations, closes int32
+	mon.newNlHandle = func() (nlHandleCloser, error) {
+		atomic.AddInt32(&creations, 1)
+		return &countingNlHandle{closes: &closes}, nil
+	}
+
+	h1 := mon.getNlHandle()
+	if h1 == nil {
+		t.Fatal("getNlHandle returned nil")
+	}
+	h2 := mon.getNlHandle()
+	if h1 != h2 {
+		t.Fatal("getNlHandle returned a different handle on repeat call — not cached")
+	}
+	if got := atomic.LoadInt32(&creations); got != 1 {
+		t.Fatalf("expected 1 creation for repeated single-threaded calls, got %d", got)
+	}
+
+	mon.Stop()
+	if got := atomic.LoadInt32(&closes); got != 1 {
+		t.Fatalf("expected 1 Close on Stop, got %d", got)
 	}
 }
 
