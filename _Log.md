@@ -43660,3 +43660,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4407 Increment 2 — extract applyVRFReconcile (#2926-C1 ctx check + ReconcileVRFs + interface/vrf-mgmt binding + applyMgmtVRFRoutes, 98 lines) from applyConfigLocked; body byte-identical, returns error for the one ctx.Err early-return; applyConfigLocked wraps with err-check
   **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4407 Increment 3 — extract applyFabricIPVLAN (fabric-member IPVLAN overlays + userspace-DP deferral + stale-overlay cleanup, 99 lines) from applyConfigLocked; pure void byte-identical (no return/ctx/crossing-state per compile-check)
+  **File(s)**: pkg/daemon/daemon_apply.go
