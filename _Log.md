@@ -1,3 +1,33 @@
+## 2026-07-08 — #4422 slice: firewall-filter port-on-non-port / TCP-only / ICMP-only regression coverage
+
+- **Timestamp**: 2026-07-08
+- **Action**: Added TEST-ONLY regression coverage for the #4422
+  firewall-FILTER (family inet|inet6 filter, not security policy) slice.
+  Gap analysis first: the three named cells' commit-check reject/accept
+  behavior is ALREADY thoroughly covered — port-on-non-port protocol
+  (icmp/gre/esp/numeric/mixed-list/inet6/except), tcp-flags-on-non-TCP,
+  icmp-type/code-on-non-ICMP, icmp-code-without-type, and the
+  port/tcp-flags-with-no-protocol positive controls in
+  `firewall_crossfield_3723_test.go`; symbolic icmp-type/named-port
+  numeric resolution on valid terms in `firewall_symbolic_match_3205_test.go`;
+  compiled `term.TCPFlags` in `parser_security_test.go`/`tcp_flags_test.go`;
+  generic unenforced `from` leaves (ttl/mac/ip-options/...) in
+  `firewall_from_unenforced_3307_test.go`. Added tests ONLY for the
+  genuinely-missing cells the slice names, each pinning the ACTUAL current
+  behavior (fail-closed reject) so a regression to a silent fail-open drop
+  flips the assert: (1) bare Junos `from port` keyword (source-OR-dest, not
+  modeled by xpf) rejected as unenforced from-match, both families,
+  UnknownFrom pinned; (2) `tcp-established` / `tcp-initial` shorthands (not
+  modeled) rejected as unenforced, both families, with `protocol tcp`
+  constraint proven to survive (only the shorthand is flagged); (3)
+  `source-port` + `protocol icmp`/`icmp6` — the source-port variant of the
+  port-on-portless-protocol cross-field reject not present in #3723 (which
+  had dest-port+icmp and source-port+esp). No production bug surfaced; all
+  three pin correct fail-closed behavior + lenient (#1960) warning downgrade.
+  Validation: gofmt; new tests PASS (8 subtests); `go build ./...` clean;
+  `go test ./pkg/config/...` green; FULL Go suite green.
+- **File(s)**: pkg/config/firewall_filter_regressions_4422_test.go, _Log.md
+
 ## 2026-07-08 — #4422 Rust remainder: flow-cache DSCP/PCP sensitivity + TTL-with-policer coverage
 
 - **Timestamp**: 2026-07-08
@@ -42575,3 +42605,20 @@ top.
   userspace-dp/src/event_stream/codec/codec_tests.rs (moved from
   userspace-dp/src/event_stream/codec_tests.rs),
   userspace-dp/src/event_stream/codec.rs (deleted), _Log.md
+- **Timestamp**: 2026-07-08
+  **Action**: #4422 slice — pin the two REJECT cells of the policy
+  zone-matrix (action × destination-class) at the SSOT flow-match engine
+  (policymatch.Match). Scoped existing coverage first: the other six cells
+  were already driven against Match() (transit permit/deny/default in
+  policymatch_test.go; junos-host permit/deny/default in junos_host_test.go),
+  and the compile-level composition is pinned in
+  pkg/config/policy_zone_matrix_4422_test.go — but NO Match() test drove a
+  `then reject` policy in either destination class (PolicyReject asserted
+  nowhere in pkg/policymatch), and DisplayAction()'s reject arm was
+  unexercised. New table-driven test asserts a matched reject resolves to
+  Action=PolicyReject / DisplayAction="reject" for both transit and
+  junos-host, is Matched (not DefaultUsed), and on the host path is not
+  swallowed as HostInboundUnmatched. Test-only; no production change.
+  Validation: gofmt; go vet; new test PASS (2 subtests); touched packages
+  (cmd/cli, pkg/config, pkg/policymatch) green; FULL Go suite green.
+  **File(s)**: pkg/policymatch/reject_matrix_4422_test.go, _Log.md
