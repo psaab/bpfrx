@@ -129,6 +129,63 @@ type Candidate struct {
 	Desc string
 }
 
+// routingInstanceNames returns the configured routing-instance names for the
+// `show route instance`, `test routing instance`, and `ping/traceroute
+// routing-instance` completers. It skips a nil slice element — the tolerant /
+// HA-sync config path (#3494) may leave nil *RoutingInstanceConfig entries the
+// daemon's own validators and route builder already tolerate. cmdtree is the
+// completion SSOT for the local CLI, remote CLI, and gRPC, so a read-only
+// completion request must never panic on that shape (#4866).
+func routingInstanceNames(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.RoutingInstances))
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		names = append(names, ri.Name)
+	}
+	return names
+}
+
+// routingInstanceTableNames returns the per-instance route-table names
+// (`<instance>.inet.0` / `<instance>.inet6.0`) appended to the main tables for
+// `show route table` completion, nil-skipping like routingInstanceNames
+// (#4866).
+func routingInstanceTableNames(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	names := make([]string, 0, 2*len(cfg.RoutingInstances))
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		names = append(names, ri.Name+".inet.0", ri.Name+".inet6.0")
+	}
+	return names
+}
+
+// redundancyGroupIDs returns the configured redundancy-group IDs for the
+// `request chassis cluster failover [reset] redundancy-group` completers,
+// skipping a nil *RedundancyGroup entry the tolerant / HA-sync path (#3494)
+// may leave in the slice (#4866).
+func redundancyGroupIDs(cfg *config.Config) []string {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Chassis.Cluster.RedundancyGroups))
+	for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+		if rg == nil {
+			continue
+		}
+		names = append(names, fmt.Sprintf("%d", rg.ID))
+	}
+	return names
+}
+
 // OperationalTree defines tab completion for operational mode.
 // This is the canonical source — all other trees derive from this.
 var OperationalTree = map[string]*Node{
@@ -248,28 +305,15 @@ var OperationalTree = map[string]*Node{
 			"detail":  {Desc: "Display detailed output"},
 			"summary": {Desc: "Show routing table statistics"},
 			"table": {Desc: "Show routes in named routing table", DynamicFn: func(cfg *config.Config) []string {
-				if cfg == nil {
-					return []string{"inet.0", "inet6.0"}
-				}
-				// Include main tables plus per-instance tables.
-				names := []string{"inet.0", "inet6.0"}
-				for _, ri := range cfg.RoutingInstances {
-					names = append(names, ri.Name+".inet.0", ri.Name+".inet6.0")
-				}
-				return names
+				// Include main tables plus per-instance tables. #4866:
+				// routingInstanceTableNames nil-skips tolerated nil RI entries.
+				return append([]string{"inet.0", "inet6.0"}, routingInstanceTableNames(cfg)...)
 			}},
 			"protocol": {Desc: "Show routes learned from named protocol", DynamicFn: func(_ *config.Config) []string {
 				return []string{"static", "direct", "local", "ospf", "bgp", "rip", "isis", "kernel", "connected"}
 			}},
 			"instance": {Desc: "Show routes for a routing instance", DynamicFn: func(cfg *config.Config) []string {
-				if cfg == nil {
-					return nil
-				}
-				names := make([]string, 0, len(cfg.RoutingInstances))
-				for _, ri := range cfg.RoutingInstances {
-					names = append(names, ri.Name)
-				}
-				return names
+				return routingInstanceNames(cfg) // #4866: nil-skip tolerated entries
 			}},
 		}},
 		"security": {Desc: "Show security information", Children: map[string]*Node{
@@ -819,14 +863,7 @@ var OperationalTree = map[string]*Node{
 						}},
 					}},
 					"redundancy-group": {Desc: "Failover a specific redundancy group", DynamicFn: func(cfg *config.Config) []string {
-						if cfg == nil || cfg.Chassis.Cluster == nil {
-							return nil
-						}
-						names := make([]string, 0, len(cfg.Chassis.Cluster.RedundancyGroups))
-						for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-							names = append(names, fmt.Sprintf("%d", rg.ID))
-						}
-						return names
+						return redundancyGroupIDs(cfg) // #4866: nil-skip tolerated RG entries
 					}, Children: map[string]*Node{
 						"node": {Desc: "Target node ID (local or peer)", DynamicFn: func(cfg *config.Config) []string {
 							if cfg == nil || cfg.Chassis.Cluster == nil {
@@ -838,14 +875,7 @@ var OperationalTree = map[string]*Node{
 					}},
 					"reset": {Desc: "Reset manual failover", Children: map[string]*Node{
 						"redundancy-group": {Desc: "Reset failover for a redundancy group", DynamicFn: func(cfg *config.Config) []string {
-							if cfg == nil || cfg.Chassis.Cluster == nil {
-								return nil
-							}
-							names := make([]string, 0, len(cfg.Chassis.Cluster.RedundancyGroups))
-							for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-								names = append(names, fmt.Sprintf("%d", rg.ID))
-							}
-							return names
+							return redundancyGroupIDs(cfg) // #4866: nil-skip tolerated RG entries
 						}},
 					}},
 				}},
@@ -1009,14 +1039,7 @@ var OperationalTree = map[string]*Node{
 		"routing": {Desc: "Test route lookup", Children: map[string]*Node{
 			"destination": {Desc: "Destination IP or prefix to look up"},
 			"instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
-				if cfg == nil {
-					return nil
-				}
-				names := make([]string, 0, len(cfg.RoutingInstances))
-				for _, ri := range cfg.RoutingInstances {
-					names = append(names, ri.Name)
-				}
-				return names
+				return routingInstanceNames(cfg) // #4866: nil-skip tolerated entries
 			}},
 		}},
 		"security-zone": {Desc: "Show zone for interface", Children: map[string]*Node{
@@ -1038,28 +1061,14 @@ var OperationalTree = map[string]*Node{
 		"source": {Desc: "Source address to use"},
 		"size":   {Desc: "Request data size in bytes"},
 		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
-			if cfg == nil {
-				return nil
-			}
-			names := make([]string, 0, len(cfg.RoutingInstances))
-			for _, ri := range cfg.RoutingInstances {
-				names = append(names, ri.Name)
-			}
-			return names
+			return routingInstanceNames(cfg) // #4866: nil-skip tolerated entries
 		}},
 	}},
 	"traceroute": {Desc: "Trace route to remote host", Children: map[string]*Node{
 		"<host>": {Desc: "Hostname or IP address of remote host"},
 		"source": {Desc: "Source address to use"},
 		"routing-instance": {Desc: "Routing instance for route lookup", DynamicFn: func(cfg *config.Config) []string {
-			if cfg == nil {
-				return nil
-			}
-			names := make([]string, 0, len(cfg.RoutingInstances))
-			for _, ri := range cfg.RoutingInstances {
-				names = append(names, ri.Name)
-			}
-			return names
+			return routingInstanceNames(cfg) // #4866: nil-skip tolerated entries
 		}},
 	}},
 	"quit": {Desc: "Exit CLI"},

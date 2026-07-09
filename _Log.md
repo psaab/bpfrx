@@ -43898,3 +43898,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4877 ValidatePercent rejects NaN/Inf (commit-check) before range gate
   **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_validate_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4866 cmdtree RI/RG completion DynamicFns nil-skip tolerated (#3494) entries via shared helpers
+  **File(s)**: pkg/cmdtree/tree.go, pkg/cmdtree/completion_nil_ri_rg_4866_test.go
