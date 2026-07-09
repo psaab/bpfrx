@@ -43708,5 +43708,7 @@ top.
   - **File(s)**: pkg/config/types_security.go, schema_security.go, compiler_security_policy.go, compiler_validate_strict_policy.go, compiler_security_addressbook.go, compiler_validate_warn.go, pkg/policymatch/policymatch.go, zone_detail_summary.go, pkg/dataplane/userspace/protocol.go, policies_lower.go, policies_reject.go, zones_quarantine.go, pkg/daemon/daemon_policy_invalidate.go, pkg/api/types.go, security.go, metrics_counters.go, pkg/grpcapi/server_show_policies_text.go, server_show_zones.go, pkg/cli/cli_show_security.go, cli_show_security_dispatch.go, cmd/cli/show_security.go, proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go, userspace-dp/src/policy.rs, protocol/security.rs, tests/fixtures/protocol_wire_v1.json, docs/config-schema.md, userspace-dataplane-architecture.md, junos-cli-reference.md
 
 - **Timestamp**: 2026-07-09
+  **Action**: Fix address-set bracket-list members silently dropped after the first entry (accumulate Keys[1:] + Children mirroring firewallMatchValues); add RED-on-revert test
+  **File(s)**: pkg/config/compiler_security_addressbook.go, pkg/config/addressset_bracket_members_4791_test.go
   **Action**: Guard config-DB AES-GCM decrypt against wrong-length nonce (fail closed with error instead of panic); add RED-on-revert test
   **File(s)**: pkg/configstore/crypto.go, pkg/configstore/crypto_nonce_length_4793_test.go
