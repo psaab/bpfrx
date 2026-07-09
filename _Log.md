@@ -1,3 +1,39 @@
+## 2026-07-09 — #4670: split tx/dispatch/dispatch_tests.rs into per-concern files
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4670 — pure code-motion test refactor. The dispatch tests
+  lived in a single ~1565-line `dispatch_tests.rs` loaded via
+  `#[cfg(test)] #[path = "dispatch_tests.rs"] mod tests;`, over the
+  modularity-discipline LOC threshold. Split it into a `tests/` subdir with
+  per-concern sibling submodules, matching the #4667/#4664/#4665 convention
+  (a `tests/mod.rs` holding the shared `use` header plus the fixtures used
+  by 2+ concerns, each submodule reached via `use super::*`). Concern files:
+  `segmentation.rs` (7), `shared_recycle.rs` (6), `enqueue_failure.rs` (6),
+  `ptb.rs` (6), `cos_shared_exact.rs` (5) = 30 tests. Shared fixtures kept
+  in `tests/mod.rs`: `test_forwarding_with_egress_mtu`,
+  `test_forwarding_decision_to_bound_ifindex`,
+  `test_live_forward_request_for_frame`, `ingress_recycled_count`
+  (the last shared by enqueue_failure + ptb). The 8 `super::`-prefixed body
+  references (`super::cos::FORCE_ENQUEUE_ERR`, `super::FORCE_OVERSIZED`,
+  `super::FORCE_TUPLE_MISMATCH`, `super::UMEM_FRAME_SHIFT` — all in
+  enqueue_failure) stay byte-identical: `tests/mod.rs`'s `use super::*`
+  re-globs those dispatch-module items into the `tests` namespace, so
+  `super::X` from a submodule resolves back to them (verified with a
+  standalone rustc repro before the split). The parent
+  `dispatch/mod.rs` declaration changed from
+  `#[path = "dispatch_tests.rs"] mod tests;` to plain `mod tests;`; the only
+  other production edit is a comment refresh. Test count identical:
+  30 `#[test]` before == 30 after. Code-line multiset (sorted,
+  non-comment/non-blank): ZERO original code lines missing, only new lines
+  are 5× `use super::*;` + 5 `mod` decls. Validation: cargo build clean;
+  FULL serial suite (`--test-threads=1`) 3860 passed / 0 failed / 2 ignored
+  (matches the pre-split baseline); `cargo test --release dispatch` 54/54 ok
+  (the 30 split tests + 24 other dispatch-path tests).
+  **File(s)**: userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs
+  (deleted), userspace-dp/src/afxdp/tx/dispatch/tests/{mod,segmentation,
+  shared_recycle,enqueue_failure,ptb,cos_shared_exact}.rs (new),
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs (declaration + comment)
+
 ## 2026-07-09 — #4668: relocate reject_reply.rs inline tests to a sibling file
 
 - **Timestamp**: 2026-07-09
