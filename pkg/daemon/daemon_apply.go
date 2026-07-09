@@ -620,104 +620,9 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		slog.Warn("config validation", "warning", w)
 	}
 
-	// #2926 boundary C1: before the netlink reconcile phase. Nothing in the
-	// kernel / dataplane / FRR has been touched yet (the SNMP swap above is an
-	// idempotent in-memory pointer flip), so a cancellation here skips the
-	// entire pipeline cleanly. This is the cheapest, safest place to honor a
-	// daemon stop.
-	if err := ctx.Err(); err != nil {
+	if err := d.applyVRFReconcile(ctx, cfg); err != nil {
 		return err
 	}
-
-	// 0. Reconcile VRF devices (routing-instance VRFs + management VRF).
-	// ReconcileVRFs is idempotent: VRFs already present with the correct
-	// table ID are preserved (ifindex unchanged). Removed-from-config
-	// VRFs are deleted. #847: xpfd claims the entire `vrf-*` kernel
-	// namespace — orphan vrf-* devices not in desired and not in
-	// m.vrfs (e.g. left over from a routing-instance rename across
-	// a daemon restart) are also reaped. Operators MUST NOT
-	// pre-create vrf-<name> outside xpfd config.
-	//
-	// (The original docs/pr/844-vrf-idempotent/plan.md described an
-	// earlier design where external VRFs were left alone; the
-	// namespace-claim policy in this code supersedes that plan. See
-	// the godoc on routing.ReconcileVRFs for the current contract.)
-	const mgmtVRFName = "mgmt"
-	const mgmtTableID = 999
-	mgmtIfaces := make(map[string]bool)
-	for name := range cfg.Interfaces.Interfaces {
-		if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") || strings.HasPrefix(name, "em") {
-			mgmtIfaces[config.LinuxIfName(name)] = true
-		}
-	}
-
-	if d.routing != nil {
-		var desired []routing.VRFSpec
-		for _, ri := range cfg.RoutingInstances {
-			if ri.InstanceType == "forwarding" {
-				slog.Info("forwarding instance, skipping VRF creation",
-					"instance", ri.Name)
-				continue
-			}
-			desired = append(desired, routing.VRFSpec{
-				Name:    ri.Name,
-				TableID: ri.TableID,
-			})
-		}
-		if len(mgmtIfaces) > 0 {
-			desired = append(desired, routing.VRFSpec{
-				Name:    mgmtVRFName,
-				TableID: mgmtTableID,
-			})
-		}
-		if err := d.routing.ReconcileVRFs(desired); err != nil {
-			slog.Warn("failed to reconcile VRFs", "err", err)
-		}
-	}
-
-	// 0a. Bind routing-instance interfaces to their VRFs.
-	// Name normalization is shared with collectAppliedTunnels'
-	// RIListMember scan via riMemberLinuxName (#1884) so the tunnel
-	// manager's unbind veto can never diverge from what this loop
-	// actually binds. Tunnel list members resolve through
-	// cfg.TunnelNameMap() (#1904) so a unit>0 entry like gr-0/0/0.1
-	// binds the real per-unit device (gr-0-0-0u1), not the literal
-	// ".1" name.
-	if d.routing != nil {
-		tunMap := cfg.TunnelNameMap()
-		for _, ri := range cfg.RoutingInstances {
-			if ri.InstanceType == "forwarding" {
-				continue
-			}
-			for _, ifaceName := range ri.Interfaces {
-				linuxName := riMemberLinuxName(tunMap, ifaceName)
-				if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
-					slog.Warn("failed to bind interface to VRF",
-						"interface", ifaceName, "linux", linuxName,
-						"instance", ri.Name, "err", err)
-				}
-			}
-		}
-	}
-
-	// 0b. Bind management interfaces (fxp*/fab*/em*) to vrf-mgmt, but
-	// only if ReconcileVRFs actually got vrf-mgmt into the managed set.
-	// If reconcile errored out before vrf-mgmt could be created,
-	// downstream code (applyMgmtVRFRoutes, HA sync) would otherwise
-	// run against a non-existent VRF.
-	d.mgmtVRFInterfaces = nil
-	if d.routing != nil && len(mgmtIfaces) > 0 && d.routing.IsManagedVRF(mgmtVRFName) {
-		d.mgmtVRFInterfaces = mgmtIfaces
-		for ifName := range mgmtIfaces {
-			if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
-				slog.Warn("failed to bind interface to management VRF",
-					"interface", ifName, "err", err)
-			}
-		}
-	}
-
-	// 0.6. Program default routes in the management VRF for DHCP leases.
-	d.applyMgmtVRFRoutes()
 
 	d.applyInterfaceReconcile(cfg)
 
@@ -1403,6 +1308,117 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// helper creates lo0Err/hostInboundErr and returns the identical
 	// five-way errors.Join.
 	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+}
+
+// applyVRFReconcile reconciles routing-instance VRFs during a config apply:
+// the #2926-C1 context-cancellation boundary check, ReconcileVRFs (create/
+// update/orphan-delete vrf-* devices), binding routing-instance member
+// interfaces to their VRFs, binding management interfaces (fxp*/fab*/em*) to
+// vrf-mgmt when it is managed, and applying the management-VRF routes.
+// Extracted verbatim from applyConfigLocked (#4407). Returns a non-nil error
+// only for the #2926-C1 ctx-cancellation check (the block's sole early return),
+// which applyConfigLocked propagates unchanged. Runs in the same slot, before
+// the interface-creation reconcile.
+func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) error {
+	// #2926 boundary C1: before the netlink reconcile phase. Nothing in the
+	// kernel / dataplane / FRR has been touched yet (the SNMP swap above is an
+	// idempotent in-memory pointer flip), so a cancellation here skips the
+	// entire pipeline cleanly. This is the cheapest, safest place to honor a
+	// daemon stop.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	// 0. Reconcile VRF devices (routing-instance VRFs + management VRF).
+	// ReconcileVRFs is idempotent: VRFs already present with the correct
+	// table ID are preserved (ifindex unchanged). Removed-from-config
+	// VRFs are deleted. #847: xpfd claims the entire `vrf-*` kernel
+	// namespace — orphan vrf-* devices not in desired and not in
+	// m.vrfs (e.g. left over from a routing-instance rename across
+	// a daemon restart) are also reaped. Operators MUST NOT
+	// pre-create vrf-<name> outside xpfd config.
+	//
+	// (The original docs/pr/844-vrf-idempotent/plan.md described an
+	// earlier design where external VRFs were left alone; the
+	// namespace-claim policy in this code supersedes that plan. See
+	// the godoc on routing.ReconcileVRFs for the current contract.)
+	const mgmtVRFName = "mgmt"
+	const mgmtTableID = 999
+	mgmtIfaces := make(map[string]bool)
+	for name := range cfg.Interfaces.Interfaces {
+		if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") || strings.HasPrefix(name, "em") {
+			mgmtIfaces[config.LinuxIfName(name)] = true
+		}
+	}
+
+	if d.routing != nil {
+		var desired []routing.VRFSpec
+		for _, ri := range cfg.RoutingInstances {
+			if ri.InstanceType == "forwarding" {
+				slog.Info("forwarding instance, skipping VRF creation",
+					"instance", ri.Name)
+				continue
+			}
+			desired = append(desired, routing.VRFSpec{
+				Name:    ri.Name,
+				TableID: ri.TableID,
+			})
+		}
+		if len(mgmtIfaces) > 0 {
+			desired = append(desired, routing.VRFSpec{
+				Name:    mgmtVRFName,
+				TableID: mgmtTableID,
+			})
+		}
+		if err := d.routing.ReconcileVRFs(desired); err != nil {
+			slog.Warn("failed to reconcile VRFs", "err", err)
+		}
+	}
+
+	// 0a. Bind routing-instance interfaces to their VRFs.
+	// Name normalization is shared with collectAppliedTunnels'
+	// RIListMember scan via riMemberLinuxName (#1884) so the tunnel
+	// manager's unbind veto can never diverge from what this loop
+	// actually binds. Tunnel list members resolve through
+	// cfg.TunnelNameMap() (#1904) so a unit>0 entry like gr-0/0/0.1
+	// binds the real per-unit device (gr-0-0-0u1), not the literal
+	// ".1" name.
+	if d.routing != nil {
+		tunMap := cfg.TunnelNameMap()
+		for _, ri := range cfg.RoutingInstances {
+			if ri.InstanceType == "forwarding" {
+				continue
+			}
+			for _, ifaceName := range ri.Interfaces {
+				linuxName := riMemberLinuxName(tunMap, ifaceName)
+				if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
+					slog.Warn("failed to bind interface to VRF",
+						"interface", ifaceName, "linux", linuxName,
+						"instance", ri.Name, "err", err)
+				}
+			}
+		}
+	}
+
+	// 0b. Bind management interfaces (fxp*/fab*/em*) to vrf-mgmt, but
+	// only if ReconcileVRFs actually got vrf-mgmt into the managed set.
+	// If reconcile errored out before vrf-mgmt could be created,
+	// downstream code (applyMgmtVRFRoutes, HA sync) would otherwise
+	// run against a non-existent VRF.
+	d.mgmtVRFInterfaces = nil
+	if d.routing != nil && len(mgmtIfaces) > 0 && d.routing.IsManagedVRF(mgmtVRFName) {
+		d.mgmtVRFInterfaces = mgmtIfaces
+		for ifName := range mgmtIfaces {
+			if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
+				slog.Warn("failed to bind interface to management VRF",
+					"interface", ifName, "err", err)
+			}
+		}
+	}
+
+	// 0.6. Program default routes in the management VRF for DHCP leases.
+	d.applyMgmtVRFRoutes()
+	return nil
 }
 
 // applyInterfaceReconcile creates/reconciles the interface-level network
