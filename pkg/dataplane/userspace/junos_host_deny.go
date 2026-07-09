@@ -1,19 +1,19 @@
 package userspace
 
 import (
-	"sort"
-
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// junos_host_deny.go layers the KERNEL-netdev iifname scope onto the config-level
-// #4146 junos-host DENY projection (config.BuildJunosHostDenyProjection). The
-// projection SSOT lives in pkg/config (it owns policies / address book /
-// applications / schedulers / feed bindings and is reused by the #4168 commit
-// warning); this wrapper resolves each ingress zone's non-lifeline interface
-// refs to the kernel netdev names a host-bound packet actually arrives on, so the
-// daemon can scope every DROP rule by `iifname` (NOT destination address —
-// daddr under-/over-denies across zones, plan §3.2).
+// junos_host_deny.go adapts the config-level #4146 junos-host DENY projection
+// (config.BuildJunosHostDenyProjection) into the JunosHostProgram shape the
+// daemon codegen consumes. The projection SSOT lives entirely in pkg/config —
+// it owns policies / address book / applications / schedulers / feed bindings,
+// resolves the kernel-netdev iifname scope (config.JunosHostZoneIngressNetdevs,
+// lifeline-excluded and free of any cross-zone-ambiguous shared parent), and is
+// reused by the #4168 commit warning so the warning can never be suppressed for
+// a deny that produced no kernel rule. This wrapper only forwards the already-
+// resolved IngressNetdevs (the `iifname` scope — NOT destination address, which
+// under-/over-denies across zones, plan §3.2) and the rendered DROP rules.
 //
 // The direct host-bound packet is delivered by the Linux kernel, so enforcement
 // is Go-only in the nft `xpf_hostinbound` chain: no Rust, no shim, no verifier
@@ -55,7 +55,6 @@ func BuildJunosHostPrograms(cfg *config.Config) []JunosHostProgram {
 	if len(proj.Programs) == 0 {
 		return nil
 	}
-	netByZone := junosHostZoneNetdevs(cfg)
 	var out []JunosHostProgram
 	for _, p := range proj.Programs {
 		if !p.Representable {
@@ -64,75 +63,23 @@ func BuildJunosHostPrograms(cfg *config.Config) []JunosHostProgram {
 		if len(p.RulesV4) == 0 && len(p.RulesV6) == 0 {
 			continue
 		}
-		ifnames := netByZone[p.Zone]
-		if len(ifnames) == 0 {
+		// IngressNetdevs is the config-computed iifname scope
+		// (config.JunosHostZoneIngressNetdevs): lifeline-excluded and free of any
+		// cross-zone-ambiguous shared parent. A representable program that
+		// resolves to no netdev emits nothing (and its config projection kept the
+		// #4168 warning — the two agree by construction on this SSOT).
+		if len(p.IngressNetdevs) == 0 {
 			continue
 		}
 		out = append(out, JunosHostProgram{
 			Zone:                  p.Zone,
-			IngressIfnames:        ifnames,
+			IngressIfnames:        p.IngressNetdevs,
 			RulesV4:               p.RulesV4,
 			RulesV6:               p.RulesV6,
 			CoarseAdmitsIKE:       p.CoarseAdmitsIKE,
 			CoarseIdentResets:     p.CoarseIdentResets,
 			HasApplicationAnyDeny: p.HasApplicationAnyDeny,
 		})
-	}
-	return out
-}
-
-// junosHostZoneNetdevs resolves each zone to the set of kernel netdev names a
-// host-bound packet on it arrives with, EXCLUDING lifelines and any netdev
-// claimed by more than one zone (an ambiguous shared physical parent — kept out
-// so a zone's deny can never over-fire on another zone's ingress).
-func junosHostZoneNetdevs(cfg *config.Config) map[string][]string {
-	snaps := buildInterfaceSnapshots(cfg)
-	lifelines := hostInboundLifelineSet(cfg)
-	// Candidate netdevs per zone, plus a global claim count per netdev.
-	cand := map[string]map[string]bool{}
-	claims := map[string]map[string]bool{} // netdev -> set of zones
-	addCand := func(zone, nd string) {
-		if nd == "" {
-			return
-		}
-		if cand[zone] == nil {
-			cand[zone] = map[string]bool{}
-		}
-		cand[zone][nd] = true
-		if claims[nd] == nil {
-			claims[nd] = map[string]bool{}
-		}
-		claims[nd][zone] = true
-	}
-	for _, s := range snaps {
-		if s.Zone == "" || hostInboundLifelineInterface(s.Name, lifelines) {
-			continue
-		}
-		// The netdev the row's own frames arrive on: the child VLAN netdev when
-		// it exists, else the row's own physical netdev.
-		addCand(s.Zone, s.LinuxName)
-		// A VLAN subunit whose frames ride the physical parent (a bondless-RETH
-		// VLAN with no Linux child netdev, LogicalOnly) arrives on the parent —
-		// include it so the iifname scope still matches. Including the parent for
-		// an ordinary VLAN child too is harmless (the parent only carries this
-		// zone's traffic when it is not ambiguous, which the claim filter below
-		// enforces).
-		if s.VLANID != 0 && s.ParentLinuxName != "" {
-			addCand(s.Zone, s.ParentLinuxName)
-		}
-	}
-	out := map[string][]string{}
-	for zone, nds := range cand {
-		var keep []string
-		for nd := range nds {
-			if len(claims[nd]) == 1 { // unambiguous: only this zone claims nd
-				keep = append(keep, nd)
-			}
-		}
-		if len(keep) > 0 {
-			sort.Strings(keep)
-			out[zone] = keep
-		}
 	}
 	return out
 }

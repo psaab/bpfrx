@@ -609,6 +609,18 @@ helper never sees it, so a helper crash cannot lock management out).
   50/51) are always exempt; IKE 500/4500 is shielded when the zone coarse-admits
   `ike`; ident-reset TCP/113 keeps its RST when the zone's effective coarse verdict
   is the RST (ident-reset set AND not `all`/`any-service`).
+  - **Operator note — exempt tuples survive an `application any` deny.** On an
+    **IKE-admitting** zone, `from-zone Z to-zone junos-host { match source-address
+    BAD; match application any; then deny; }` does **NOT** stop BAD's IKE / IPsec
+    NAT-T (UDP 500/4500): the userspace IPsec-passthrough stage returns BEFORE the
+    fine junos-host policy, and the kernel decrypts host-terminated IPsec before
+    any deny — so 500/4500 is admitted regardless of the deny. Likewise on an
+    **ident-resetting** zone (`system-services ident-reset`, not `all`) the same
+    deny still answers BAD's TCP/113 with a RST, not a silent drop. This is
+    faithful to the Rust runtime (Stage-11 passthrough / the coarse ident-reset
+    terminal both run pre-fine), not a bug. To actually deny IKE/ident from a
+    source, remove the coarse admission (drop `ike` / `ident-reset` from the
+    zone's `host-inbound-traffic`) rather than relying on a junos-host `deny`.
 - **Observability.** `xpf_host_inbound_junos_host_denies_total{scope,family}`
   (nft named counters, distinct from the coarse
   `xpf_host_inbound_kernel_denies_total`). This does **not** populate per-Junos-

@@ -124,6 +124,60 @@ func TestJunosHostExemptionFlags(t *testing.T) {
 
 type config1Program struct{ JunosHostDenyProgram }
 
+// TestJunosHostCrossZoneAmbiguousTrunkKeepsWarning is the F1 fail-on-revert
+// guard: a zone whose ONLY non-lifeline netdev is a cross-zone-ambiguous shared
+// physical parent (its untagged unit-0 rides the SAME parent that carries other
+// zones' tagged VLAN subunits) resolves to ZERO unambiguous iifname netdevs, so
+// its junos-host DENY emits NO kernel rule — and therefore MUST keep its #4168
+// warning (never suppressed). Reverting the warning-suppression gate to
+// `len(non-lifeline interface refs) > 0` (which is TRUE here) wrongly suppresses
+// the warning -> silent under-enforcement, and this test goes RED.
+func TestJunosHostCrossZoneAmbiguousTrunkKeepsWarning(t *testing.T) {
+	cfg := &Config{}
+	cfg.Interfaces.Interfaces = map[string]*InterfaceConfig{
+		"ge-0/0/2": {Name: "ge-0/0/2", Units: map[int]*InterfaceUnit{
+			0:  {Number: 0, Addresses: []string{"10.0.9.1/24"}},               // untagged, zone trunkzero
+			50: {Number: 50, VlanID: 50, Addresses: []string{"10.0.50.1/24"}}, // VLAN 50, zone vlanb
+			80: {Number: 80, VlanID: 80, Addresses: []string{"10.0.80.1/24"}}, // VLAN 80, zone vlanc
+		}},
+	}
+	cfg.Security.Zones = map[string]*ZoneConfig{
+		"trunkzero": {Name: "trunkzero", Interfaces: []string{"ge-0/0/2.0"},
+			HostInboundTraffic: &HostInboundTraffic{SystemServices: []string{"ssh"}}},
+		"vlanb": {Name: "vlanb", Interfaces: []string{"ge-0/0/2.50"},
+			HostInboundTraffic: &HostInboundTraffic{SystemServices: []string{"ssh"}}},
+		"vlanc": {Name: "vlanc", Interfaces: []string{"ge-0/0/2.80"},
+			HostInboundTraffic: &HostInboundTraffic{SystemServices: []string{"ssh"}}},
+	}
+	cfg.Security.AddressBook = &AddressBook{Addresses: map[string]*Address{
+		"bad-net": {Name: "bad-net", Value: "10.0.0.0/8"},
+	}}
+	cfg.Security.Policies = []*ZonePairPolicies{
+		{FromZone: "trunkzero", ToZone: "junos-host", Policies: []*Policy{
+			jhDeny("block-zero", []string{"bad-net"}, []string{"any"})}},
+		{FromZone: "vlanb", ToZone: "junos-host", Policies: []*Policy{
+			jhDeny("block-b", []string{"bad-net"}, []string{"any"})}},
+	}
+
+	nd := JunosHostZoneIngressNetdevs(cfg)
+	if len(nd["trunkzero"]) != 0 {
+		t.Fatalf("trunkzero must resolve to NO unambiguous netdev (shared parent ge-0-0-2), got %v", nd["trunkzero"])
+	}
+	if got := nd["vlanb"]; len(got) != 1 || got[0] != "ge-0-0-2.50" {
+		t.Fatalf("vlanb must resolve to its own child netdev ge-0-0-2.50, got %v", got)
+	}
+
+	proj := BuildJunosHostDenyProjection(cfg)
+	// The trunkzero deny produced no rule -> its warning is NOT suppressed.
+	if proj.RenderedPolicyKeys[JunosHostZonePairPolicyKey("trunkzero", "block-zero")] {
+		t.Error("trunkzero deny emits no kernel rule (ambiguous netdev) — its #4168 warning MUST NOT be suppressed (F1)")
+	}
+	// The vlanb deny DID render on its own child netdev -> suppressed.
+	if !proj.RenderedPolicyKeys[JunosHostZonePairPolicyKey("vlanb", "block-b")] {
+		t.Error("vlanb deny renders on ge-0-0-2.50 — its warning should be suppressed")
+	}
+}
+
 // TestJunosHostCrossDimensionPermitUnrepresentable proves a narrow-application
 // permit ahead of a deny is a cross-dimension carve nft cannot express — the
 // whole program is un-representable.

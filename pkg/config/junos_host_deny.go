@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net/netip"
 	"sort"
 	"strconv"
@@ -92,9 +93,17 @@ type JunosHostDenyRule struct {
 type JunosHostDenyProgram struct {
 	Zone string
 	// InterfaceRefs are the zone's NON-lifeline interface refs (config names,
-	// e.g. "reth0.50"); the dataplane wrapper resolves these to kernel netdev
-	// iifnames. Empty when the zone has no non-lifeline interface (unenforceable).
+	// e.g. "reth0.50"). Informational; the actual iifname scope is IngressNetdevs.
 	InterfaceRefs []string
+	// IngressNetdevs is the sorted set of kernel netdev names a host-bound packet
+	// on this zone arrives with — the iifname scope the daemon renders each DROP
+	// rule with (JunosHostZoneIngressNetdevs). EXCLUDES lifelines and any netdev
+	// shared with another zone (a cross-zone-ambiguous physical parent). Empty
+	// when the zone resolves to no unambiguous non-lifeline netdev: the program
+	// then emits NOTHING and its denies keep the #4168 warning — the config
+	// projection gates Representable/RenderedPolicyKeys on this so the warning can
+	// never be suppressed for a deny that produced no kernel rule (§8 inv-1/12).
+	IngressNetdevs []string
 	// Representable is false when any contributing term is un-representable; the
 	// program then carries NO rules and the daemon emits nothing for the zone.
 	Representable bool
@@ -157,6 +166,10 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 	}
 	feedBound := junosHostFeedBoundNames(cfg)
 	lifelines := HostInboundLifelineSet(cfg)
+	// Per-zone kernel netdev iifname scope. A zone whose every non-lifeline
+	// netdev is cross-zone-ambiguous resolves to an EMPTY set here — it emits no
+	// kernel rule, so its denies must NOT be suppressed from the #4168 warning.
+	netdevsByZone := JunosHostZoneIngressNetdevs(cfg)
 
 	// Per-policy-key bookkeeping to decide rendered-vs-warned (§3.3): a policy is
 	// rendered (warning suppressed) iff it is a DENY that applies to >=1
@@ -184,7 +197,12 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			continue
 		}
 		ifaceRefs := junosHostNonLifelineRefs(zone, lifelines)
-		enforceable := len(ifaceRefs) > 0
+		netdevs := netdevsByZone[zoneName]
+		// A deny suppresses its #4168 warning ONLY if it produces a rendered
+		// kernel rule, which requires >=1 unambiguous non-lifeline netdev to scope
+		// the DROP by iifname — NOT merely a non-lifeline interface REF (a ref
+		// whose only netdev is a cross-zone-ambiguous shared parent emits nothing).
+		enforceable := len(netdevs) > 0
 		representable := true
 		for _, t := range terms {
 			if !t.representable {
@@ -209,6 +227,7 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			if !ok {
 				representable = false
 			}
+			prog.IngressNetdevs = netdevs
 		}
 		// Bookkeeping for the warning.
 		for _, t := range terms {
@@ -858,6 +877,178 @@ func zoneEffectiveSystemServices(zc *ZoneConfig) []string {
 	for _, ov := range zc.InterfaceHostInbound {
 		if ov != nil {
 			add(ov.SystemServices)
+		}
+	}
+	return out
+}
+
+// JunosHostZoneIngressNetdevs returns, per security zone, the sorted set of
+// kernel netdev names a host-bound packet on that zone arrives with — the
+// iifname scope for the zone's #4146 junos-host DROP rules. It EXCLUDES
+// lifelines and any netdev claimed by MORE THAN ONE zone (an ambiguous shared
+// physical parent — e.g. a zone on a trunk's untagged unit-0 while the SAME
+// parent carries other zones' tagged VLAN subunits), so a zone's deny can never
+// over-fire on another zone's ingress.
+//
+// It is the SSOT for the iifname scope: the dataplane BuildJunosHostPrograms
+// consumes JunosHostDenyProgram.IngressNetdevs (populated from this) for kernel
+// emission, AND BuildJunosHostDenyProjection gates a deny's warning-suppression
+// on a NON-EMPTY result here — so the #4168 warning can never be suppressed for
+// a deny that produced no kernel rule (the F1 fix; §8 inv-1/12). The
+// netdev-name resolution mirrors the dataplane interface-snapshot LinuxName
+// (userspace.snapshotLinuxName) exactly, pinned byte-for-byte by
+// TestJunosHostZoneNetdevsMatchSnapshot so the two planes cannot drift.
+func JunosHostZoneIngressNetdevs(cfg *Config) map[string][]string {
+	if cfg == nil || len(cfg.Security.Zones) == 0 || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
+	}
+	lifelines := HostInboundLifelineSet(cfg)
+	zoneByIface := junosHostZoneByInterface(cfg)
+	cand := map[string]map[string]bool{}   // zone -> netdev set
+	claims := map[string]map[string]bool{} // netdev -> zone set
+	addCand := func(zone, nd string) {
+		if zone == "" || nd == "" {
+			return
+		}
+		if cand[zone] == nil {
+			cand[zone] = map[string]bool{}
+		}
+		cand[zone][nd] = true
+		if claims[nd] == nil {
+			claims[nd] = map[string]bool{}
+		}
+		claims[nd][zone] = true
+	}
+	// One "row" per physical interface + one per unit, mirroring the dataplane
+	// interface snapshot: the row's own netdev is the candidate, plus (for a VLAN
+	// subunit whose frames ride the physical parent) the parent netdev.
+	addRow := func(name, own, parent string, vlan int) {
+		if HostInboundLifelineInterface(name, lifelines) {
+			return
+		}
+		zone := zoneByIface[name]
+		if zone == "" {
+			return
+		}
+		addCand(zone, own)
+		if vlan != 0 && parent != "" {
+			addCand(zone, parent)
+		}
+	}
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for n := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, n)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		iface := cfg.Interfaces.Interfaces[ifName]
+		if iface == nil {
+			continue
+		}
+		addRow(ifName, junosHostLinuxName(cfg, ifName, nil), "", 0)
+		unitNums := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			unitNums = append(unitNums, u)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := iface.Units[un]
+			if unit == nil {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", ifName, un)
+			addRow(unitName, junosHostLinuxName(cfg, ifName, unit),
+				junosHostLinuxName(cfg, ifName, nil), unit.VlanID)
+		}
+	}
+	out := map[string][]string{}
+	for zone, nds := range cand {
+		var keep []string
+		for nd := range nds {
+			if len(claims[nd]) == 1 { // unambiguous: only this zone claims nd
+				keep = append(keep, nd)
+			}
+		}
+		if len(keep) > 0 {
+			sort.Strings(keep)
+			out[zone] = keep
+		}
+	}
+	return out
+}
+
+// junosHostLinuxName resolves an interface ref to its kernel netdev name,
+// mirroring userspace.snapshotLinuxName EXACTLY (VLAN subunit -> parent.vlanid,
+// reth unit resolution, tunnel name map, physical passthrough). Kept here so the
+// #4146 iifname scope can be resolved purely from config (the dataplane consumes
+// the result via JunosHostDenyProgram.IngressNetdevs); TestJunosHostZoneNetdevs
+// MatchSnapshot pins it against the snapshot.
+func junosHostLinuxName(cfg *Config, ifName string, unit *InterfaceUnit) string {
+	if unit != nil {
+		if tunnelNames := cfg.TunnelNameMap(); len(tunnelNames) > 0 {
+			ref := fmt.Sprintf("%s.%d", ifName, unit.Number)
+			if linuxName, ok := tunnelNames[ref]; ok && linuxName != "" {
+				return linuxName
+			}
+		}
+		if unit.VlanID > 0 {
+			return fmt.Sprintf("%s.%d", LinuxIfName(cfg.ResolveReth(ifName)), unit.VlanID)
+		}
+		if strings.HasPrefix(ifName, "reth") {
+			if unit.Number == 0 {
+				return LinuxIfName(cfg.ResolveReth(ifName))
+			}
+			return LinuxIfName(cfg.ResolveReth(fmt.Sprintf("%s.%d", ifName, unit.Number)))
+		}
+		if unit.Number == 0 {
+			return LinuxIfName(ifName)
+		}
+		return LinuxIfName(fmt.Sprintf("%s.%d", ifName, unit.Number))
+	}
+	if strings.HasPrefix(ifName, "reth") {
+		return LinuxIfName(cfg.ResolveReth(ifName))
+	}
+	return LinuxIfName(ifName)
+}
+
+// junosHostZoneByInterface maps every interface ref (physical, base, and each
+// unit) to its security zone, mirroring userspace.buildInterfaceZoneMap so the
+// netdev resolution above assigns the same zone the dataplane snapshot does.
+func junosHostZoneByInterface(cfg *Config) map[string]string {
+	out := make(map[string]string, len(cfg.Security.Zones))
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+	for _, zoneName := range zoneNames {
+		zone := cfg.Security.Zones[zoneName]
+		if zone == nil {
+			continue
+		}
+		for _, iface := range zone.Interfaces {
+			if iface == "" {
+				continue
+			}
+			if _, exists := out[iface]; !exists {
+				out[iface] = zoneName
+			}
+			if base, unit, ok := strings.Cut(iface, "."); ok && base != "" {
+				if _, exists := out[base]; !exists {
+					out[base] = zoneName
+				}
+				if unit != "" {
+					continue
+				}
+			}
+			if ifCfg := cfg.Interfaces.Interfaces[iface]; ifCfg != nil {
+				for unitNum := range ifCfg.Units {
+					unitName := fmt.Sprintf("%s.%d", iface, unitNum)
+					if _, exists := out[unitName]; !exists {
+						out[unitName] = zoneName
+					}
+				}
+			}
 		}
 	}
 	return out

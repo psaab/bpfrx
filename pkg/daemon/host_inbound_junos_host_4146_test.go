@@ -314,6 +314,96 @@ func TestJunosHostNftMatchesRustOracle(t *testing.T) {
 	}
 }
 
+// TestJunosHostExemptTupleParity documents the fine-eligible-L4 exemptions as
+// parity cells the naive `policymatch.Match` oracle CANNOT express. For an
+// IKE-admitting / ident-resetting zone, a `match source BAD application any then
+// deny` STILL admits BAD's IKE (udp 500/4500) and STILL RSTs BAD's ident (tcp
+// 113) — because the Rust IPsec-passthrough / ident-reset stages run BEFORE the
+// fine junos-host policy (Stage 11 returns pre-fine; ident-reset is a coarse
+// terminal). The pure-fine oracle returns DENY for those tuples (it models only
+// the fine layer), so the kernel nft ADMIT/RST is FAITHFUL to the Rust runtime,
+// NOT a divergence — the exemption shields the codegen emits ahead of the
+// application-any drop encode exactly that pre-fine behaviour. Only the
+// fine-eligible tuples (e.g. tcp/22) are actually dropped.
+func TestJunosHostExemptTupleParity(t *testing.T) {
+	mkPayload := func(svc string) (string, dpuserspace.JunosHostProgram) {
+		cfg := junosHostDenyTestConfig()
+		cfg.Security.Zones["untrust"].HostInboundTraffic.SystemServices = []string{svc}
+		cfg.Security.Policies = []*config.ZonePairPolicies{
+			{FromZone: "untrust", ToZone: "junos-host",
+				Policies: zonePairDeny("untrust", "block-bad", "src:bad-host", "app:any")},
+		}
+		payload, programs := junosHostPayload(t, cfg)
+		if len(programs) != 1 {
+			t.Fatalf("want 1 program for svc %q, got %d", svc, len(programs))
+		}
+		return payload, programs[0]
+	}
+	cn := xnft.HostInboundJunosHostDenyCounterName("untrust", "ip")
+
+	// oracle: the pure-fine junos-host semantics DENY BAD on every app (incl. the
+	// exempt tuples) — but that is NOT what the runtime does for IKE/ident.
+	oracleDenies := func(proto string, port int) bool {
+		res := policymatch.Match(junosHostDenyTestConfig4146Oracle(), policymatch.Query{
+			FromZone: "untrust", ToZone: policymatch.JunosHostZone,
+			SrcIP: net.ParseIP("10.0.0.5"), DstIP: net.ParseIP("10.0.2.10"),
+			Protocol: proto, DstPort: port,
+		})
+		return res.Matched && res.Action == config.PolicyDeny
+	}
+
+	t.Run("IKE 500/4500 admitted despite deny (Stage-11 pre-fine)", func(t *testing.T) {
+		payload, p := mkPayload("ike")
+		if !p.CoarseAdmitsIKE {
+			t.Fatal("zone should coarse-admit ike")
+		}
+		// The IKE shield precedes the application-any drop, so BAD's 500/4500 is
+		// admitted before the drop can silence it.
+		assertOrder(t, payload,
+			`iifname "ge-0-0-1" udp dport { 500, 4500 } accept`,
+			`iifname "ge-0-0-1" ip saddr 10.0.0.5/32`,
+		)
+		// The naive fine oracle would DENY BAD's 500 — nft's admit is the faithful
+		// runtime behaviour, not a bug.
+		if !oracleDenies("udp", 500) {
+			t.Fatal("sanity: the pure-fine oracle should DENY BAD's udp/500 (documents the intended nft divergence)")
+		}
+	})
+
+	t.Run("ident 113 RST despite deny (coarse-terminal pre-fine)", func(t *testing.T) {
+		payload, p := mkPayload("ident-reset")
+		if !p.CoarseIdentResets {
+			t.Fatal("zone should coarse-reset ident")
+		}
+		assertOrder(t, payload,
+			`iifname "ge-0-0-1" tcp dport 113 reject with tcp reset`,
+			`iifname "ge-0-0-1" ip saddr 10.0.0.5/32`,
+		)
+		if !oracleDenies("tcp", 113) {
+			t.Fatal("sanity: the pure-fine oracle should DENY BAD's tcp/113 (documents the intended nft divergence)")
+		}
+	})
+
+	t.Run("fine-eligible tcp/22 still dropped", func(t *testing.T) {
+		payload, _ := mkPayload("ike")
+		// The drop is application-any (no L4 match), so it catches BAD's tcp/22.
+		if !strings.Contains(payload, `iifname "ge-0-0-1" ip saddr 10.0.0.5/32 counter name "`+cn+`" drop`) {
+			t.Fatalf("fine-eligible traffic from BAD must still be dropped:\n%s", payload)
+		}
+	})
+}
+
+// junosHostDenyTestConfig4146Oracle rebuilds the deny config for the oracle
+// query (the zone's coarse services do not affect the fine junos-host verdict).
+func junosHostDenyTestConfig4146Oracle() *config.Config {
+	cfg := junosHostDenyTestConfig()
+	cfg.Security.Policies = []*config.ZonePairPolicies{
+		{FromZone: "untrust", ToZone: "junos-host",
+			Policies: zonePairDeny("untrust", "block-bad", "src:bad-host", "app:any")},
+	}
+	return cfg
+}
+
 // junosHostProgramDrops simulates the nft verdict of a program's v4 DROP rules
 // for a source IP: a rule drops when the source matches its positive/excluded
 // set AND is not in any permit-subtraction set. Application-any only (the fixture
