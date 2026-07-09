@@ -43644,3 +43644,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4662 Increment 5 — extract loadAndBootstrapConfig (PHASE 1 config-load, 140 lines) from Run(); body byte-identical (1 return tweaked to (false,err)), returns (configCompileFailed bool, error); Run calls + err-check. #1917 fatal-floor + #1960 fail-closed flag preserved
   **File(s)**: pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4662 Increment 6 — extract setupInterfaceNaming (PHASE 2 interface-naming + bootstrap lifeline + step-0 tunables, 93 lines) from Run(); pure void byte-identical extraction (no params/output/return/crossing-state)
+  **File(s)**: pkg/daemon/daemon_run.go

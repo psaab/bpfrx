@@ -209,99 +209,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// ===== PHASE 2: Interface naming + bootstrap lifeline =====
-	// Enumerate PCI NICs and assign vSRX-style names (fxp0, em0, ge-X-0-Y)
-	// before any manager creation or BPF load.
-	if !d.opts.NoDataplane {
-		clusterMode := false
-		nodeID := 0
-		userspaceWorkers := 0
-		// D3 (#797): default enabled. Operators opt out via
-		// `set system dataplane rss-indirection disable`.
-		rssEnabled := true
-		var rssAllowed []string
-		// #801 Phase-B Step-0 tunables: host-scope governor + netdev
-		// budget; per-iface mlx5 coalescence. Host-scope knobs are
-		// GATED by `claim-host-tunables true` (B1). Per-iface knobs
-		// (rx-usecs/tx-usecs) follow the D3 allowlist and are applied
-		// whenever coalescence is configured.
-		var (
-			governor          string
-			netdevBudget      int
-			coalesceEnable    bool
-			coalesceRX        int
-			coalesceTX        int
-			userspaceDP       bool
-			coalesceExplicit  bool
-			claimHostTunables bool
-		)
-		if cfg := d.store.ActiveConfig(); cfg != nil {
-			if cfg.Chassis.Cluster != nil {
-				clusterMode = true
-				nodeID = cfg.Chassis.Cluster.NodeID
-			}
-			// D3 (#785): pass userspace-dp worker count so linksetup can
-			// reshape mlx5 RSS indirection before any AF_XDP bind. Zero
-			// when userspace dataplane is not in use — applyRSSIndirection
-			// treats that as a no-op.
-			if dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace &&
-				cfg.System.UserspaceDataplane != nil {
-				userspaceDP = true
-				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
-				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
-					rssEnabled = false
-				}
-				// Codex H1: scope D3 to only interfaces that
-				// userspace-dp actually binds AF_XDP sockets on.
-				rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
-				// #801 knobs.
-				claimHostTunables = cfg.System.UserspaceDataplane.ClaimHostTunables
-				governor = cfg.System.UserspaceDataplane.CPUGovernor
-				netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
-				coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
-				// coalesceEnable stays false by default — the Step-0
-				// finding is "adaptive=on causes pp99 latency jitter",
-				// so default-off is what the issue asks for. An
-				// explicit `adaptive enable` inverts this.
-				if coalesceExplicit &&
-					!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
-					coalesceEnable = true
-				}
-				coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
-				coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
-			}
-		}
-		if d.inBootstrap() {
-			// #1922 Item 2/3: bootstrap mode suppresses the full rename loop
-			// and host tunables. Instead, the lifeline-gated path identifies
-			// the management NIC by its default route, records its PCI
-			// identity, and (only if it would become fxp0) renames JUST that
-			// NIC + snapshots its addressing into the bootstrap .network so
-			// the operator stays reachable. No other NIC is touched.
-			d.setupBootstrapLifeline()
-		} else {
-			// #1956: device-map mode (opt-in) renames ONLY mapped NICs by
-			// stable identity and leaves the rest alone. Positional mode
-			// (no device-map) is bit-identical to pre-#1956.
-			if err := applyStartupNamingPolicy(d.store.ActiveConfig(), nodeID, clusterMode,
-				userspaceWorkers, rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
-				// Log stays generic: helper already selected device-map vs
-				// positional; callers care only that startup naming failed.
-				slog.Warn("interface naming failed", "err", err)
-			}
-			// #801: host tunables + coalescence. Runs after the interface
-			// rename but still before the dataplane is loaded — matches
-			// the D3 "before any AF_XDP bind" invariant. Best-effort: any
-			// failure logs and continues.
-			//
-			// B1 opt-in gate: host-scope knobs (governor + netdev_budget +
-			// adaptive-rx/tx flip) only apply when `claim-host-tunables
-			// true` is set. This keeps xpfd from stepping on shared hosts
-			// silently. D3 and per-iface rx-usecs/tx-usecs continue to run
-			// as before — both are interface-scoped.
-			d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
-				coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
-		}
-	}
+	d.setupInterfaceNaming()
 
 	// ===== PHASE 3: Manager init (routing/FRR/IPsec/RPM/ipmon/event-engine/DHCP/cluster/VRRP/dataplane) + first applyConfig =====
 	if err := d.initManagers(ctx, configCompileFailed); err != nil {
@@ -1922,6 +1830,107 @@ func (d *Daemon) loadAndBootstrapConfig() (bool, error) {
 			"node_id_file", nodeIDFile)
 	}
 	return configCompileFailed, nil
+}
+
+// setupInterfaceNaming enumerates and renames the PCI NICs to vSRX-style names
+// (fxp0, em0, ge-X-0-Y), sets up the bootstrap lifeline, and applies the #801
+// step-0 host tunables — all before any manager creation or dataplane load.
+// Extracted verbatim from Run()'s PHASE 2 (#4662 Increment 6); a self-contained
+// block with no crossing output, no early return, and no ordering change.
+func (d *Daemon) setupInterfaceNaming() {
+	// Enumerate PCI NICs and assign vSRX-style names (fxp0, em0, ge-X-0-Y)
+	// before any manager creation or BPF load.
+	if !d.opts.NoDataplane {
+		clusterMode := false
+		nodeID := 0
+		userspaceWorkers := 0
+		// D3 (#797): default enabled. Operators opt out via
+		// `set system dataplane rss-indirection disable`.
+		rssEnabled := true
+		var rssAllowed []string
+		// #801 Phase-B Step-0 tunables: host-scope governor + netdev
+		// budget; per-iface mlx5 coalescence. Host-scope knobs are
+		// GATED by `claim-host-tunables true` (B1). Per-iface knobs
+		// (rx-usecs/tx-usecs) follow the D3 allowlist and are applied
+		// whenever coalescence is configured.
+		var (
+			governor          string
+			netdevBudget      int
+			coalesceEnable    bool
+			coalesceRX        int
+			coalesceTX        int
+			userspaceDP       bool
+			coalesceExplicit  bool
+			claimHostTunables bool
+		)
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			if cfg.Chassis.Cluster != nil {
+				clusterMode = true
+				nodeID = cfg.Chassis.Cluster.NodeID
+			}
+			// D3 (#785): pass userspace-dp worker count so linksetup can
+			// reshape mlx5 RSS indirection before any AF_XDP bind. Zero
+			// when userspace dataplane is not in use — applyRSSIndirection
+			// treats that as a no-op.
+			if dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace &&
+				cfg.System.UserspaceDataplane != nil {
+				userspaceDP = true
+				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
+				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
+					rssEnabled = false
+				}
+				// Codex H1: scope D3 to only interfaces that
+				// userspace-dp actually binds AF_XDP sockets on.
+				rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+				// #801 knobs.
+				claimHostTunables = cfg.System.UserspaceDataplane.ClaimHostTunables
+				governor = cfg.System.UserspaceDataplane.CPUGovernor
+				netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
+				coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
+				// coalesceEnable stays false by default — the Step-0
+				// finding is "adaptive=on causes pp99 latency jitter",
+				// so default-off is what the issue asks for. An
+				// explicit `adaptive enable` inverts this.
+				if coalesceExplicit &&
+					!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
+					coalesceEnable = true
+				}
+				coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
+				coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
+			}
+		}
+		if d.inBootstrap() {
+			// #1922 Item 2/3: bootstrap mode suppresses the full rename loop
+			// and host tunables. Instead, the lifeline-gated path identifies
+			// the management NIC by its default route, records its PCI
+			// identity, and (only if it would become fxp0) renames JUST that
+			// NIC + snapshots its addressing into the bootstrap .network so
+			// the operator stays reachable. No other NIC is touched.
+			d.setupBootstrapLifeline()
+		} else {
+			// #1956: device-map mode (opt-in) renames ONLY mapped NICs by
+			// stable identity and leaves the rest alone. Positional mode
+			// (no device-map) is bit-identical to pre-#1956.
+			if err := applyStartupNamingPolicy(d.store.ActiveConfig(), nodeID, clusterMode,
+				userspaceWorkers, rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
+				// Log stays generic: helper already selected device-map vs
+				// positional; callers care only that startup naming failed.
+				slog.Warn("interface naming failed", "err", err)
+			}
+			// #801: host tunables + coalescence. Runs after the interface
+			// rename but still before the dataplane is loaded — matches
+			// the D3 "before any AF_XDP bind" invariant. Best-effort: any
+			// failure logs and continues.
+			//
+			// B1 opt-in gate: host-scope knobs (governor + netdev_budget +
+			// adaptive-rx/tx flip) only apply when `claim-host-tunables
+			// true` is set. This keeps xpfd from stepping on shared hosts
+			// silently. D3 and per-iface rx-usecs/tx-usecs continue to run
+			// as before — both are interface-scoped.
+			d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
+				coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
+		}
+	}
 }
 
 // isInteractive returns true if stdin is a real terminal (not /dev/null or a pipe).
