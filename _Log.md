@@ -43728,3 +43728,5 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: Fix #4806 — SyslogClient.Close() didn't nil s.conn or mark the client closed, so a Send() racing Close() could see the stale closed conn, hit a write error, and silently reconnect/resurrect a torn-down connection; add a `closed` flag (mu-guarded) checked at the top of Send/SendBinary, and nil s.conn in Close(); add RED-on-revert tests reproducing the resurrection
   **File(s)**: pkg/logging/syslog.go, pkg/logging/syslog_close_resurrection_4806_test.go
+  **Action**: Fix #4807 — interface-range member-range int64-overflow panic (`en-sn+1` wrapped negative for a huge trailing end integer, bypassing the 4096-member cap and reaching `make()` with a negative capacity); compare `en-sn >= interfaceRangeMaxMembers` before the `+1` so the guard cannot overflow; add RED-on-revert tests reproducing the exact `math.MaxInt64`-adjacent reproducer
+  **File(s)**: pkg/config/compiler_interface_range.go, pkg/config/compiler_interface_range_4027_test.go
