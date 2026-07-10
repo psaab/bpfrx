@@ -343,7 +343,23 @@ under the daemon's errgroup. Nothing else imports this package.
   will read. `bgpHandler` (`/routing/bgp?type=routes`) checks once per
   1024-route chunk in its streaming loop and returns — a full internet table
   (900k+ routes) otherwise keeps formatting + JSON-escaping every remaining
-  route and writing to a dead connection (CPU/GC waste, #5232). The session
+  route and writing to a dead connection (CPU/GC waste, #5232). That check now
+  runs inside a `frr.StreamBGPRoutes` callback: the UPSTREAM RIB is streamed
+  too, not buffered (#5056). Previously the handler called `GetBGPRoutes`,
+  which ran `vtysh "show bgp ipv4 unicast"` and buffered the ENTIRE stdout
+  into one string plus a parsed `[]BGPRoute` before the first byte went out —
+  hundreds of MB for a full table, and the client-cancel check could not stop
+  the already-completed vtysh work. `StreamBGPRoutes` scans vtysh stdout one
+  line at a time (bounded `bufio.Scanner`), delivers each route to the
+  callback, and cancels the vtysh process on `r.Context()` cancellation or a
+  downstream write failure, so peak memory is O(1) in table size regardless of
+  RIB size. The rendered output is capped at `maxBGPRoutes` (100000); when the
+  cap trips a trailing `... table truncated at N routes` notice is appended to
+  the `output` string (envelope shape unchanged) and the client is pointed at
+  the CLI for the complete table. Operators needing the full RIB use
+  `show route protocol bgp`. The cap/truncation contract is pinned by
+  `bgp_routes_cap_5056_test.go`; the streaming/non-buffering + wire-format
+  invariants by `bgp_routes_stream_4708_test.go`. The session
   handlers (`/sessions`, `/sessions/summary`, `/sessions/zone-pair`) share a
   per-batch sampler (`newRequestCancelSampler`, `sessionWalkCancelInterval`
   = 1024): each `IterateSessions`/`IterateSessionsV6` callback returns

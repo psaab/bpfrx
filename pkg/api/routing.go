@@ -7,7 +7,23 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/frr"
 )
+
+// maxBGPRoutes bounds how many BGP routes the REST
+// /api/routing/bgp?type=routes endpoint renders into a single JSON response.
+// StreamBGPRoutes already bounds the per-request memory (it scans vtysh stdout
+// one route at a time — the #5056 upstream-materialization fix), but a full
+// internet table (~1M IPv4 routes) still renders to a ~100 MB JSON string on
+// the wire; capping the count bounds the response body (and the total
+// format/escape work for a slow or hostile client) while still returning a
+// large diagnostic sample. Operators who need the complete table use the CLI
+// / vtysh. When the cap trips, a trailing truncation notice line is appended
+// to the output so the client can tell the table was cut. It is a var (not a
+// const) only so tests can drive the truncation path without synthesizing a
+// million-route fixture.
+var maxBGPRoutes = 100000
 
 func (s *Server) routesHandler(w http.ResponseWriter, _ *http.Request) {
 	cfg := s.store.ActiveConfig()
@@ -85,50 +101,85 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 	typ := r.URL.Query().Get("type")
 	switch typ {
 	case "routes":
-		routes, err := s.frr.GetBGPRoutes()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// A full internet BGP table (900k+ routes) would otherwise render
-		// into one multi-hundred-MB strings.Builder and then get copied a
-		// second time while json-encoding it — ~2x unbounded allocation on a
-		// RAM-constrained firewall (#4708). Stream the exact same wire
-		// envelope ({"success":true,"data":{"output":"<lines>"}}\n)
-		// incrementally: each route line is formatted and JSON-escaped
-		// through a fixed-size bufio buffer, so peak memory is bounded
-		// regardless of table size. JSON string escaping is per-byte
-		// independent, so escaping each line and concatenating yields exactly
-		// the same bytes as escaping the joined string.
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		// The upstream RIB is streamed, not buffered: StreamBGPRoutes scans
+		// vtysh stdout one route at a time and hands each to the callback
+		// below, so a full internet table (~1M routes) is never rendered into
+		// one multi-hundred-MB string on either the FRR side or in this
+		// handler (#5056, extending the downstream-only streaming of #4708).
+		// Each route line is formatted and JSON-escaped through a fixed-size
+		// bufio buffer, so peak memory is bounded regardless of table size.
+		// JSON string escaping is per-byte independent, so escaping each line
+		// and concatenating yields exactly the same bytes as escaping the
+		// joined string. The output is capped at maxBGPRoutes with a trailing
+		// truncation notice so the response body stays bounded even for a
+		// pathologically large table.
 		bw := bufio.NewWriter(w)
-		// Envelope prefix. Response{Success:true, Data: TextResponse{Output}}
-		// with Error empty (omitempty) — matches encoding/json field order.
-		io.WriteString(bw, `{"success":true,"data":{"output":"`)
-		for i := range routes {
-			route := &routes[i]
+		emitted := 0
+		started := false
+		// emitPrefix lazily writes the 200 status + envelope prefix on the
+		// first route (or on an empty/complete table). Deferring it lets an
+		// upstream vtysh START failure — detected before any route is
+		// delivered — surface as a clean 500 instead of a truncated 200.
+		emitPrefix := func() {
+			if started {
+				return
+			}
+			started = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			// Response{Success:true, Data: TextResponse{Output}} with Error
+			// empty (omitempty) — matches encoding/json field order.
+			io.WriteString(bw, `{"success":true,"data":{"output":"`)
+		}
+		truncated, err := s.frr.StreamBGPRoutes(r.Context(), maxBGPRoutes, func(route frr.BGPRoute) error {
+			emitPrefix()
 			writeJSONStringFragment(bw, fmt.Sprintf("%-24s %-20s %s\n",
 				route.Network, route.NextHop, route.Path))
+			emitted++
 			// Periodically push bytes onto the wire so a very large table
 			// streams out instead of parking in buffers.
-			if (i+1)%1024 == 0 {
-				// Abort if the client has disconnected: a full internet
-				// table (900k+ routes) would otherwise keep formatting and
-				// JSON-escaping every remaining route and writing to a dead
-				// connection after r.Context() is cancelled — pure CPU/GC
-				// waste on a RAM-constrained firewall (#5232). Checked once
-				// per 1024-route chunk, so the abort is timely without any
-				// per-route cost. The un-flushed bufio tail and closing
-				// envelope are intentionally dropped: the connection is gone.
-				if r.Context().Err() != nil {
-					return
+			if emitted%1024 == 0 {
+				// Abort if the client has disconnected: continuing to format
+				// and JSON-escape every remaining route and write to a dead
+				// connection is pure CPU/GC waste (#5232). Returning an error
+				// stops the scan and cancels vtysh upstream. The un-flushed
+				// bufio tail and closing envelope are intentionally dropped:
+				// the connection is gone.
+				if cerr := r.Context().Err(); cerr != nil {
+					return cerr
 				}
-				bw.Flush()
+				// A downstream write failure is also terminal: propagate it so
+				// the scan stops and vtysh is cancelled instead of dumping the
+				// rest of the table into a broken pipe.
+				if ferr := bw.Flush(); ferr != nil {
+					return ferr
+				}
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			if !started {
+				// vtysh failed to start before any bytes were written — we can
+				// still send a proper error status.
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			// Client disconnect or write failure mid-stream: headers + a
+			// partial body are already on the wire, so we cannot switch to an
+			// error status. The scan is aborted and vtysh cancelled; stop.
+			return
+		}
+		// Empty or fully-drained table: emit the (possibly empty) envelope.
+		emitPrefix()
+		if truncated {
+			// Bounded-response notice, inside the JSON string so the envelope
+			// shape is unchanged; only present when the cap actually tripped.
+			writeJSONStringFragment(bw, fmt.Sprintf(
+				"... table truncated at %d routes; use the CLI 'show route protocol bgp' for the full table\n",
+				maxBGPRoutes))
 		}
 		// json.Encoder appends a trailing newline; preserve it for
 		// byte-equivalence with the previous buffered response.

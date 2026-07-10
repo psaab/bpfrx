@@ -9,13 +9,15 @@
 //   - ISISAdjacency, GetISISAdjacency
 //   - OSPFNeighbor, GetOSPFNeighbors
 //   - BGPPeerSummary, GetBGPSummary
-//   - BGPRoute, GetBGPRoutes
+//   - BGPRoute, GetBGPRoutes, StreamBGPRoutes, parseBGPRouteLine
 //   - FRRRouteDetail, FRRNextHop, GetRouteDetailJSON
 //   - FormatRouteDetail
 //   - parseRouteJSON (package-private)
 package frr
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -295,33 +297,120 @@ type BGPRoute struct {
 	Path    string
 }
 
-// GetBGPRoutes queries FRR for BGP routes.
+// bgpRoutesCommand is the vtysh query behind both GetBGPRoutes and
+// StreamBGPRoutes; keep the two paths reading the same table.
+const bgpRoutesCommand = "show bgp ipv4 unicast"
+
+// maxBGPScanLine bounds a single `show bgp ipv4 unicast` line the streaming
+// scanner will accept before erroring. FRR route lines are short (well under
+// 1 KiB even with a long AS path); 1 MiB is a generous ceiling that still
+// bounds the scanner's per-line buffer so a pathological/garbage line cannot
+// grow it without limit.
+const maxBGPScanLine = 1 << 20
+
+// parseBGPRouteLine parses one `show bgp ipv4 unicast` line into a BGPRoute.
+// It reports ok=false for header/blank/short lines that carry no route. Shared
+// by GetBGPRoutes (whole-string parse) and StreamBGPRoutes (incremental parse)
+// so both interpret the table identically.
+func parseBGPRouteLine(line string) (BGPRoute, bool) {
+	if !strings.HasPrefix(line, "*") && !strings.HasPrefix(line, " ") {
+		return BGPRoute{}, false
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return BGPRoute{}, false
+	}
+	r := BGPRoute{
+		Network: fields[1],
+		NextHop: fields[2],
+	}
+	if len(fields) >= 5 {
+		r.Path = strings.Join(fields[4:], " ")
+	}
+	return r, true
+}
+
+// GetBGPRoutes queries FRR for BGP routes and returns them as a slice.
+//
+// This buffers the entire table (vtysh stdout string + the parsed slice) and
+// is used by the CLI and gRPC show paths, where the caller already renders the
+// whole result. The REST endpoint uses StreamBGPRoutes instead so a full
+// internet table is never materialized whole in the HTTP handler (#5056).
 func (m *Manager) GetBGPRoutes() ([]BGPRoute, error) {
-	output, err := m.executor().Vtysh("show bgp ipv4 unicast")
+	output, err := m.executor().Vtysh(bgpRoutesCommand)
 	if err != nil {
 		return nil, err
 	}
 
 	var routes []BGPRoute
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
-		if !strings.HasPrefix(line, "*") && !strings.HasPrefix(line, " ") {
-			continue
+	for _, line := range strings.Split(output, "\n") {
+		if r, ok := parseBGPRouteLine(line); ok {
+			routes = append(routes, r)
 		}
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		r := BGPRoute{
-			Network: fields[1],
-			NextHop: fields[2],
-		}
-		if len(fields) >= 5 {
-			r.Path = strings.Join(fields[4:], " ")
-		}
-		routes = append(routes, r)
 	}
 	return routes, nil
+}
+
+// StreamBGPRoutes queries FRR for BGP routes and delivers them to fn one at a
+// time, scanning vtysh stdout incrementally so the full table is never
+// buffered in memory (#5056). It stops after limit routes have been delivered
+// (limit <= 0 means unbounded) and reports truncated=true when it stopped
+// because the cap was reached with more routes still pending.
+//
+// fn is invoked for each parsed route; if it returns an error (e.g. a
+// downstream client write failed) the scan stops, the vtysh process is
+// cancelled, and that error is returned. ctx cancellation (client disconnect)
+// likewise kills vtysh so it does not keep dumping a table nobody will read.
+func (m *Manager) StreamBGPRoutes(ctx context.Context, limit int, fn func(BGPRoute) error) (bool, error) {
+	// A private cancel wraps the caller's ctx so an early stop (cap reached,
+	// callback error) kills vtysh even when the caller's ctx is still live.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	rc, finish, err := m.executor().VtyshStream(ctx, bgpRoutesCommand)
+	if err != nil {
+		return false, err
+	}
+
+	truncated := false
+	var cbErr error
+	count := 0
+	scanner := bufio.NewScanner(rc)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxBGPScanLine)
+	for scanner.Scan() {
+		route, ok := parseBGPRouteLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		if limit > 0 && count >= limit {
+			truncated = true
+			break
+		}
+		if err := fn(route); err != nil {
+			cbErr = err
+			break
+		}
+		count++
+	}
+	scanErr := scanner.Err()
+
+	// Stop vtysh (it may still be producing after an early break) and reap it.
+	cancel()
+	_ = rc.Close()
+	waitErr := finish()
+
+	switch {
+	case cbErr != nil:
+		return truncated, cbErr
+	case scanErr != nil:
+		return truncated, scanErr
+	case truncated:
+		// We deliberately killed vtysh early; its resulting non-zero exit is
+		// expected, not a real failure.
+		return true, nil
+	default:
+		return false, waitErr
+	}
 }
 
 // FRRRouteDetail holds detailed route information parsed from FRR's JSON output.

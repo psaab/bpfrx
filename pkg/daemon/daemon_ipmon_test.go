@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"errors"
+	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -375,6 +377,9 @@ func (hardFailFRRExec) FrrReloadPy(context.Context, string) error {
 }
 func (hardFailFRRExec) VtyshLoad(context.Context, string) ([]byte, error) {
 	return nil, errors.New("vtysh -f boom")
+}
+func (hardFailFRRExec) VtyshStream(context.Context, string) (io.ReadCloser, func() error, error) {
+	return io.NopCloser(strings.NewReader("")), func() error { return nil }, nil
 }
 
 // TestActuatorAbortsPublishOnHardFRRError is the #3757 H1 regression: a

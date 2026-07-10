@@ -1,6 +1,10 @@
 package frr
 
-import "context"
+import (
+	"context"
+	"io"
+	"strings"
+)
 
 // This file exposes a narrow, EXPORTED test seam so packages outside pkg/frr
 // (notably pkg/daemon, which owns the boot path that calls Clear()) can drive a
@@ -35,6 +39,12 @@ func (r *RecordingExecutor) VtyshLoad(_ context.Context, conf string) ([]byte, e
 	// The degraded fallback path; the daemon-layer test does not assert on it,
 	// but it must not shell out, so return a benign success.
 	return nil, nil
+}
+
+func (r *RecordingExecutor) VtyshStream(context.Context, string) (io.ReadCloser, func() error, error) {
+	// The daemon-layer test does not exercise streaming reads; return an empty
+	// stream so nothing shells out.
+	return io.NopCloser(strings.NewReader("")), func() error { return nil }, nil
 }
 
 // ManagedSectionMarkersForTest returns the begin/end markers that bracket the
