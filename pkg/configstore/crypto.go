@@ -189,9 +189,25 @@ func unmarshalEnvelope(data []byte) (encryptedTreeEnvelope, bool, error) {
 	type alias encryptedTreeEnvelope
 	var env alias
 	if err := json.Unmarshal(data, &env); err != nil {
+		// Not JSON, or not the envelope object shape at all — a genuine
+		// plaintext (pre-encryption / legacy) config body. Pass through.
 		return encryptedTreeEnvelope{}, false, nil
 	}
 	if env.Format != encryptedTreeFormat {
+		// Fail CLOSED on an envelope-shaped body whose discriminator we do not
+		// support (#4888). An unknown/future `format`
+		// (e.g. xpf-master-password-v2), or the AES-GCM fields
+		// (salt/nonce/data) present without our current `format`, is a too-new
+		// or corrupted ENCRYPTED DB — it MUST be rejected, never treated as
+		// plaintext. Treating it as plaintext lets json.Unmarshal drop the
+		// unknown fields and decode an EMPTY ConfigTree, so Store.Load would
+		// boot a committed-empty config (loss of policy) instead of failing
+		// closed with ErrConfigDBUnreadable. Only a body with NO format AND no
+		// AES-GCM fields is a genuine plaintext body and passes through.
+		if env.Format != "" || env.Salt != "" || env.Nonce != "" || env.Data != "" {
+			return encryptedTreeEnvelope{}, false, fmt.Errorf(
+				"unsupported encrypted config envelope format %q (too-new or corrupted config DB)", env.Format)
+		}
 		return encryptedTreeEnvelope{}, false, nil
 	}
 	if env.PRF == "" || env.Salt == "" || env.Nonce == "" || env.Data == "" {

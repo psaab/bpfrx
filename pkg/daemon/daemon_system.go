@@ -335,6 +335,15 @@ const (
 func renderChronySources(servers []string) string {
 	var b strings.Builder
 	for _, server := range servers {
+		// #4902 render belt: a leniently-loaded / peer-synced value that is not
+		// a bare IP or a safe DNS hostname (e.g. an embedded space carrying a
+		// second chrony directive token, or a malformed value) is skipped so it
+		// cannot inject an extra source-line token or fail the chrony reload. The
+		// strict commit gate (config.ValidateNTPServer) rejects it at commit.
+		if err := config.ValidateNTPServer(server, nil); err != nil {
+			slog.Warn("skipping invalid NTP server", "server", server, "err", err)
+			continue
+		}
 		// Use "pool" for hostnames and "server" for literal IPs.
 		directive := "pool"
 		if net.ParseIP(server) != nil {
@@ -696,6 +705,16 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 			if f.Name == "" {
 				continue
 			}
+			// #4902 render belt: the name is formatted into /var/log/<name> and
+			// the drop-in filename 10-xpf-<name>.conf. Skip a leniently-loaded /
+			// peer-synced name with a path separator / `..` / whitespace /
+			// control char so it cannot escape /var/log or inject an rsyslog
+			// directive. The strict commit gate (config.ValidateSyslogFileName)
+			// rejects it at commit.
+			if err := config.ValidateSyslogFileName(f.Name, nil); err != nil {
+				slog.Warn("skipping invalid syslog file destination", "name", f.Name, "err", err)
+				continue
+			}
 			// Map Junos facility/severity to rsyslog selector
 			facility := f.Facility
 			if facility == "" || facility == "any" {
@@ -720,6 +739,15 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 		// Syslog user destinations: forward to logged-in users via rsyslog omusrmsg
 		for _, u := range cfg.System.Syslog.Users {
 			if u.User == "" {
+				continue
+			}
+			// #4902 render belt: the user token is formatted into the drop-in
+			// filename and the rsyslog `:omusrmsg:<user>` directive. Skip a
+			// leniently-loaded / peer-synced value that is not '*' or a safe
+			// account name. The strict commit gate (config.ValidateSyslogUser)
+			// rejects it at commit.
+			if err := config.ValidateSyslogUser(u.User, nil); err != nil {
+				slog.Warn("skipping invalid syslog user destination", "user", u.User, "err", err)
 				continue
 			}
 			facility := u.Facility
@@ -1267,6 +1295,23 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 // independent line: root-login → PermitRootLogin, key-exchange → KexAlgorithms
 // (H5, #2008). sshd validates algorithm spellings at reload, so xpf does not
 // enum-check the key-exchange list.
+// filterSSHAlgorithms drops any token that is not a safe OpenSSH algorithm
+// name (config.ValidateSSHAlgorithm), the render-side belt for #4902. Only the
+// injection/breakage shape (comma/space/control char) is filtered; sshd still
+// owns the actual algorithm-spelling check at reload. A dropped token is logged
+// so an operator can see why a leniently-loaded value did not take effect.
+func filterSSHAlgorithms(in []string) []string {
+	out := in[:0:0]
+	for _, tok := range in {
+		if err := config.ValidateSSHAlgorithm(tok, nil); err != nil {
+			slog.Warn("skipping invalid SSH algorithm token", "token", tok, "err", err)
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
 func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 	if ssh == nil {
 		return ""
@@ -1286,17 +1331,22 @@ func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 			lines = append(lines, "PermitRootLogin "+permitRoot)
 		}
 	}
-	if len(ssh.KeyExchange) > 0 {
-		lines = append(lines, "KexAlgorithms "+strings.Join(ssh.KeyExchange, ","))
+	// #4902 render belt: filter each algorithm list to safe OpenSSH tokens
+	// before comma-joining into the sshd line. A leniently-loaded / peer-synced
+	// token carrying a comma/space/control char (which would smuggle a second
+	// sshd directive token onto the line, or fail the reload) is dropped; the
+	// strict commit gate (config.ValidateSSHAlgorithm) rejects it at commit.
+	if kex := filterSSHAlgorithms(ssh.KeyExchange); len(kex) > 0 {
+		lines = append(lines, "KexAlgorithms "+strings.Join(kex, ","))
 	}
 	// #4305 S-4: sshd hardening knobs. sshd validates the algorithm
-	// spellings and numeric ranges at reload, so xpf renders them verbatim
-	// (a bad value fails the reload, which applySSHConfig reverts).
-	if len(ssh.Ciphers) > 0 {
-		lines = append(lines, "Ciphers "+strings.Join(ssh.Ciphers, ","))
+	// spellings and numeric ranges at reload; xpf gates the injection/breakage
+	// shape (#4902) and lets sshd own the spelling check.
+	if ciphers := filterSSHAlgorithms(ssh.Ciphers); len(ciphers) > 0 {
+		lines = append(lines, "Ciphers "+strings.Join(ciphers, ","))
 	}
-	if len(ssh.MACs) > 0 {
-		lines = append(lines, "MACs "+strings.Join(ssh.MACs, ","))
+	if macs := filterSSHAlgorithms(ssh.MACs); len(macs) > 0 {
+		lines = append(lines, "MACs "+strings.Join(macs, ","))
 	}
 	if ssh.ConnectionLimit > 0 {
 		// Junos `connection-limit` bounds concurrent sessions; sshd's
