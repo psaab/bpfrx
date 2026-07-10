@@ -1592,6 +1592,19 @@ where compilation transforms the term:
 The heading carries a `[effective]` tag (`Filter: demo (family inet)
 [effective]`) so the compiled view is never confused with the raw output.
 
+Both the local and the remote (`cli`) CLI render this identically (#4967). The
+snapshot renderer is the single source of truth
+`dpuserspace.RenderFirewallFilterSnapshot`; the local CLI calls it directly and
+the remote CLI routes `show firewall … effective` to the gRPC `ShowText`
+topics (`firewall-effective`, `firewall-effective:<family>`,
+`firewall-effective-filter:<name>[:<family>]`) which call the same renderer.
+Before #4967 the remote dispatcher recognized only `filter`, so
+`show firewall effective` fell through to the RAW view even though the
+completion/help tree advertised the effective leaf — a silent
+advertised-vs-executable divergence. `show bgp …` had the same class of bug on
+the remote surface (advertised as the alias for `show protocols bgp` but not
+dispatched) and is likewise fixed.
+
 ```
 Filter: demo (family inet) [effective]
   Term: t1

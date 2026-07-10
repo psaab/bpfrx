@@ -582,3 +582,85 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
+
+// showEffectiveFirewallFilters renders every compiled firewall-filter snapshot
+// (optionally filtered to one family) for `show firewall effective [family
+// <f>]` — the #4967 remote-CLI parity handler. It reuses the shared SSOT
+// renderer dpuserspace.RenderFirewallFilterSnapshot so its output matches the
+// local CLI byte-for-byte. Topic encoding:
+//
+//	firewall-effective            -> all families
+//	firewall-effective:<family>   -> one family (inet|inet6)
+func (s *Server) showEffectiveFirewallFilters(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	family := strings.TrimPrefix(req.Topic, "firewall-effective")
+	family = strings.TrimPrefix(family, ":")
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+	if family != "" && family != "inet" && family != "inet6" {
+		fmt.Fprintf(buf, "invalid family: %s\n", family)
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+	snaps := dpuserspace.BuildFirewallFilterSnapshots(cfg)
+	rendered := 0
+	for i := range snaps {
+		if family != "" && snaps[i].Family != family {
+			continue
+		}
+		buf.WriteString(dpuserspace.RenderFirewallFilterSnapshot(&snaps[i]))
+		rendered++
+	}
+	if rendered == 0 {
+		if family != "" {
+			fmt.Fprintf(buf, "No firewall filters configured (family %s)\n", family)
+		} else {
+			buf.WriteString("No firewall filters configured\n")
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// showEffectiveFirewallFilter renders one named compiled firewall-filter
+// snapshot for `show firewall filter <name> effective [family <f>]` (#4967).
+// Topic encoding (mirrors the firewall-filter: name:family scheme):
+//
+//	firewall-effective-filter:<name>            -> auto family (inet then inet6)
+//	firewall-effective-filter:<name>:<family>
+func (s *Server) showEffectiveFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	rest := strings.TrimPrefix(req.Topic, "firewall-effective-filter:")
+	name := rest
+	family := ""
+	if idx := strings.LastIndex(rest, ":"); idx > 0 {
+		name = rest[:idx]
+		family = rest[idx+1:]
+	}
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+	if family != "" && family != "inet" && family != "inet6" {
+		fmt.Fprintf(buf, "invalid family: %s\n", family)
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+	snaps := dpuserspace.BuildFirewallFilterSnapshots(cfg)
+	found := false
+	for i := range snaps {
+		if snaps[i].Name != name {
+			continue
+		}
+		if family != "" && snaps[i].Family != family {
+			continue
+		}
+		buf.WriteString(dpuserspace.RenderFirewallFilterSnapshot(&snaps[i]))
+		found = true
+	}
+	if !found {
+		if family != "" {
+			fmt.Fprintf(buf, "Filter not found: %s (family %s)\n", name, family)
+		} else {
+			fmt.Fprintf(buf, "Filter not found: %s\n", name)
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
