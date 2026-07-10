@@ -9,9 +9,9 @@ import (
 )
 
 var (
-	md5New  = md5.New
-	md5Size = md5.Size
-	sha1New = sha1.New
+	md5New   = md5.New
+	md5Size  = md5.Size
+	sha1New  = sha1.New
 	sha1Size = sha1.Size
 )
 
@@ -659,9 +659,9 @@ func TestDESEncryptDecrypt(t *testing.T) {
 	// Need a 16-byte key (8 for DES + 8 for preIV).
 	key := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	plaintext := []byte("hello world test") // 16 bytes (multiple of 8)
-	enc, pp := encryptDES(key, plaintext)
-	if enc == nil {
-		t.Fatal("encryptDES returned nil")
+	enc, pp, err := encryptDES(key, plaintext)
+	if err != nil || enc == nil {
+		t.Fatalf("encryptDES failed: %v", err)
 	}
 	dec := decryptDES(key, pp, enc)
 	if dec == nil {
@@ -678,9 +678,9 @@ func TestAES128EncryptDecrypt(t *testing.T) {
 		key[i] = byte(i + 1)
 	}
 	plaintext := []byte("test data for aes encryption roundtrip")
-	enc, pp := encryptAES128(key, plaintext, 1, 100)
-	if enc == nil {
-		t.Fatal("encryptAES128 returned nil")
+	enc, pp, err := encryptAES128(key, plaintext, 1, 100)
+	if err != nil || enc == nil {
+		t.Fatalf("encryptAES128 failed: %v", err)
 	}
 	dec := decryptAES128(key, pp, enc, 1, 100)
 	if dec == nil {
@@ -703,7 +703,7 @@ func testIfXData() []IfData {
 			IfName: "trust0", IfAlias: "Trust LAN",
 			HCInOctets: 5000000000, HCOutOctets: 3000000000,
 			HCInUcastPkts: 1000000, HCOutUcastPkts: 800000,
-			IfHighSpeed: 1000,
+			IfHighSpeed:     1000,
 			InMulticastPkts: 500, InBroadcastPkts: 100,
 			OutMulticastPkts: 200, OutBroadcastPkts: 50,
 		},

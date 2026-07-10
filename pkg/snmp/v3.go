@@ -10,6 +10,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"hash"
 	"log/slog"
 
@@ -771,10 +772,22 @@ func decryptAES128(privKey, privParams, data []byte, boots, time int) []byte {
 	return plaintext
 }
 
-// encryptPDU encrypts a scopedPDU using the user's privacy key.
-func (a *Agent) encryptPDU(user *usmUser, scopedPDU []byte) (encrypted, privParams []byte) {
+// randRead is the entropy source for the SNMPv3 per-message privacy salt. It is
+// a package variable so tests can inject an RNG failure and assert the encrypt
+// path fails closed. It defaults to crypto/rand.Read. RFC 3414 §8.2.1 requires
+// the privacy salt (msgPrivacyParameters) to be unpredictable: an all-zero or
+// otherwise deterministic salt makes the CBC/CFB IV predictable or reused, which
+// breaks the semantic security of the encrypted scopedPDU. Every salt path MUST
+// check this error and fail closed rather than proceed with a zero salt.
+var randRead = rand.Read
+
+// encryptPDU encrypts a scopedPDU using the user's privacy key. It returns an
+// error (rather than silently downgrading) when a securely-encrypted PDU cannot
+// be produced — most importantly when the RNG fails to generate the per-message
+// privacy salt — so the caller can fail closed.
+func (a *Agent) encryptPDU(user *usmUser, scopedPDU []byte) ([]byte, []byte, error) {
 	if user.privKey == nil {
-		return nil, nil
+		return nil, nil, fmt.Errorf("snmpv3: user %q has no privacy key", user.name)
 	}
 	switch user.privProto {
 	case "des":
@@ -782,19 +795,27 @@ func (a *Agent) encryptPDU(user *usmUser, scopedPDU []byte) (encrypted, privPara
 	case "aes128":
 		return encryptAES128(user.privKey, scopedPDU, a.engineBoots, a.engineTime())
 	default:
-		return nil, nil
+		return nil, nil, fmt.Errorf("snmpv3: unsupported privacy protocol %q", user.privProto)
 	}
 }
 
-// encryptDES encrypts data using DES-CBC per RFC 3414 section 8.
-func encryptDES(privKey, data []byte) ([]byte, []byte) {
+// encryptDES encrypts data using DES-CBC per RFC 3414 section 8. It fails closed
+// on an RNG error: the DES IV is the pre-IV salt XOR the per-message
+// privParams, so an all-zero privParams (the silent result of an unchecked
+// rand.Read failure) collapses the IV to a deterministic function of the
+// long-term privKey, leaking repeated-plaintext-prefix structure across
+// messages (RFC 3414 §8.2.1). On an RNG failure return the error so no PDU is
+// sent with a predictable IV.
+func encryptDES(privKey, data []byte) ([]byte, []byte, error) {
 	if len(privKey) < 16 {
-		return nil, nil
+		return nil, nil, fmt.Errorf("snmpv3: DES privacy key too short: %d bytes", len(privKey))
 	}
 	desKey := privKey[:8]
 	preIV := privKey[8:16]
 	privParams := make([]byte, 8)
-	rand.Read(privParams)
+	if _, err := randRead(privParams); err != nil {
+		return nil, nil, fmt.Errorf("snmpv3: DES privacy salt: %w", err)
+	}
 	iv := make([]byte, 8)
 	for i := range iv {
 		iv[i] = preIV[i] ^ privParams[i]
@@ -805,31 +826,38 @@ func encryptDES(privKey, data []byte) ([]byte, []byte) {
 	}
 	block, err := des.NewCipher(desKey)
 	if err != nil {
-		return nil, nil
+		return nil, nil, fmt.Errorf("snmpv3: DES cipher init: %w", err)
 	}
 	encrypted := make([]byte, len(data))
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(encrypted, data)
-	return encrypted, privParams
+	return encrypted, privParams, nil
 }
 
-// encryptAES128 encrypts data using AES-128-CFB per RFC 3826.
-func encryptAES128(privKey, data []byte, boots, time int) ([]byte, []byte) {
+// encryptAES128 encrypts data using AES-128-CFB per RFC 3826. It fails closed on
+// an RNG error: the last 8 IV bytes are the per-message privParams salt, so an
+// all-zero privParams (the silent result of an unchecked rand.Read failure)
+// makes the full IV constant for every message in the same (boots,time) second,
+// which is CFB IV reuse under a fixed key (RFC 3414 §8.2.1). On an RNG failure
+// return the error so no PDU is sent with a reused IV.
+func encryptAES128(privKey, data []byte, boots, time int) ([]byte, []byte, error) {
 	if len(privKey) < 16 {
-		return nil, nil
+		return nil, nil, fmt.Errorf("snmpv3: AES128 privacy key too short: %d bytes", len(privKey))
 	}
 	privParams := make([]byte, 8)
-	rand.Read(privParams)
+	if _, err := randRead(privParams); err != nil {
+		return nil, nil, fmt.Errorf("snmpv3: AES128 privacy salt: %w", err)
+	}
 	iv := make([]byte, 16)
 	binary.BigEndian.PutUint32(iv[0:4], uint32(boots))
 	binary.BigEndian.PutUint32(iv[4:8], uint32(time))
 	copy(iv[8:16], privParams)
 	block, err := aes.NewCipher(privKey[:16])
 	if err != nil {
-		return nil, nil
+		return nil, nil, fmt.Errorf("snmpv3: AES128 cipher init: %w", err)
 	}
 	encrypted := make([]byte, len(data))
 	cipher.NewCFBEncrypter(block, iv).XORKeyStream(encrypted, data)
-	return encrypted, privParams
+	return encrypted, privParams, nil
 }
 
 // computeAuth computes the HMAC for a v3 message (with auth params zeroed in the message).
@@ -1008,14 +1036,21 @@ func (a *Agent) buildV3Response(msgID int, reqFlags byte, user *usmUser,
 	var scopedPDUEncoded []byte
 	var privParamsVal []byte
 	if respFlags&msgFlagPriv != 0 && user.privKey != nil {
-		enc, pp := a.encryptPDU(user, scopedPDU)
-		if enc != nil {
-			scopedPDUEncoded = berEncodeTLV(tagOctetString, enc)
-			privParamsVal = pp
-		} else {
-			respFlags &^= msgFlagPriv
-			scopedPDUEncoded = scopedPDU
+		enc, pp, err := a.encryptPDU(user, scopedPDU)
+		if err != nil {
+			// Fail closed (RFC 3414 §8.2.1): the manager requested privacy but
+			// we could not produce a securely-encrypted PDU — most importantly
+			// when the RNG failed to generate the unpredictable per-message
+			// privacy salt. Never downgrade to a plaintext response and never
+			// send a PDU built from a zero/predictable salt. Returning nil here
+			// drops the response (handleV3Packet nil == no datagram), so no
+			// scopedPDU ever leaves the agent in the clear or with a weak IV.
+			slog.Warn("SNMPv3: privacy encryption failed, dropping response",
+				"user", user.name, "err", err)
+			return nil
 		}
+		scopedPDUEncoded = berEncodeTLV(tagOctetString, enc)
+		privParamsVal = pp
 	} else {
 		respFlags &^= msgFlagPriv
 		scopedPDUEncoded = scopedPDU
