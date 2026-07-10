@@ -879,6 +879,22 @@ ignored. The tolerant load/peer-sync path downgrades to a warning
 an older binary accepted still boots (#1960 no-brick doctrine) — the #2929
 routing guard stays the runtime backstop.
 
+The same gate carries a DISTINCT `bind-interface` fail-closed arm (#5297): a
+NON-EMPTY bind-interface that `XFRMIfNameAndID` resolves to **if_id 0** (any name
+that is not the canonical `st<N>` / `st<N>.<unit>`, e.g. `secure0`, a bare `st`,
+`ge-0/0/0`) creates NO XFRM device at reconciliation, so the route-based VPN
+commits cleanly but silently carries no traffic. The #2933 collision arm
+deliberately `continue`d past if_id 0 (a collision needs two VALID, non-zero
+if_ids); the #5297 arm instead hard-rejects such a name on the strict commit /
+commit-check path (naming the canonical `st<N>[.unit]` requirement) and warns on
+the tolerant load / peer-sync path. This is ALSO enforced at the typed-leaf
+schema layer — the `bind-interface` leaf is `ValueSecureTunnelIf` with the
+`ValidateSecureTunnelBindInterface` validator (`xfrmi.go`) — so commit-check and
+`?`-completion reject it early; the compiled-config gate stays as the belt for
+group-expanded / packed forms the schema layer can miss (#1960 layered defense).
+The pkg/routing "invalid bind-interface name" log is the runtime backstop for a
+tolerated invalid config.
+
 **Undefined policy community references are rejected at commit (#2881):** a
 policy-statement term's `from community <name>` (rendered FRR `match community
 <name>`) and `then community delete <name>` (the strip-by-list operation added

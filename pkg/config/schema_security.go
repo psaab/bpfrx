@@ -1113,8 +1113,19 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			}},
 		}},
 		"vpn": {desc: "IPsec VPN tunnel name", args: 1, placeholder: "<vpn-name>", children: map[string]*schemaNode{
-			"bind-interface": {desc: "XFRM tunnel interface to bind", args: 1, placeholder: "<interface-name>", children: nil},
-			"df-bit":         {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
+			// #5297: type the leaf so a non-canonical bind-interface (anything
+			// but st<N> / st<N>.<unit>) fails closed at commit-check instead of
+			// committing and then creating no XFRM device at reconciliation
+			// (silent route-based-VPN down). The compiled-config strict gate
+			// (compiler_ipsec_bindiface.go) keeps its parallel id-0 rejection
+			// for group-expanded / packed forms the schema layer can miss
+			// (#1960 layered defense). Tolerant Load/SyncApply downgrades this
+			// to a warning (schemaValidateExpandedTree in configstore).
+			"bind-interface": {desc: "Secure-tunnel interface to bind (st<N> or st<N>.<unit>)", args: 1, placeholder: "<st-interface>",
+				valueType: ValueSecureTunnelIf, valueDesc: "IPsec secure-tunnel interface (st<N> or st<N>.<unit>)",
+				valueExamples: []string{"st0", "st0.1"},
+				validator:     ValidateSecureTunnelBindInterface, children: nil},
+			"df-bit": {desc: "Outer-header DF bit handling (copy|set|clear)", args: 1, placeholder: "<mode>", children: nil},
 			// #4301 (V-5): type the enum so a typo (`on-tarffic`) fails closed
 			// at commit instead of storing verbatim and silently degrading to
 			// on-traffic. Only `immediately` is acted on (start_action =

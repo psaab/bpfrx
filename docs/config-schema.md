@@ -170,6 +170,51 @@ narrow and theoretical (a permit rule referencing an empty-prefix address is
 already fail-CLOSED — it matches nothing; only a deny blocklist entry could fail
 open, the same class as a typo'd address-book NAME). See #4515.
 
+### `security ipsec vpn … bind-interface` canonical-name fail-closed (#5297)
+
+`security ipsec vpn <name> bind-interface` is a free-form 1-arg string the
+runtime resolves to a Linux xfrmi device name and a stable XFRM if_id via
+`XFRMIfNameAndID` (`xfrmi.go`). Only the canonical secure-tunnel spelling
+`st<N>` or `st<N>.<unit>` (e.g. `st0`, `st0.1`) resolves; every OTHER name
+(`secure0`, a bare `st`, a physical `ge-0/0/0`) yields **if_id 0** — the
+authoritative "creates no XFRM device" sentinel. Before #5297 such a name
+committed successfully: the #2933 if_id-collision gate deliberately `continue`d
+past any if_id-0 name (out of scope for a *collision* between two VALID
+aliases), the schema leaf was untyped, and the compiler stored the string
+verbatim. At reconciliation the routing manager logged "invalid bind-interface
+name" and created no device, so the route-based VPN was silently DOWN with a
+clean commit — the #5297 vSRX-parity gap.
+
+The fix fails closed at **two layers** (the #1960 layered-defense doctrine),
+both strict-on-commit / lenient-on-load:
+
+- **Typed-leaf schema layer** — the `bind-interface` leaf (`schema_security.go`)
+  is now `valueType: ValueSecureTunnelIf` with the
+  `ValidateSecureTunnelBindInterface` validator (`xfrmi.go`). `SchemaValidate`
+  rejects a non-canonical name at commit-check with an actionable message
+  naming the value and the `st<N>`/`st<N>.<unit>` requirement, and `?`-completion
+  surfaces the placeholder + examples. The validator's decision is the
+  authoritative `XFRMIfNameAndID` if_id-0 check; only the message is lexical.
+- **Compiled-config strict gate** — `validateSecureTunnelBindInterfaceAST`
+  (`compiler_ipsec_bindiface.go`) gained a distinct invalid-name arm: a
+  NON-EMPTY bind-interface that resolves to if_id 0 is now hard-rejected on the
+  strict path (rather than silently `continue`-ing) and downgraded to a warning
+  on the tolerant load / peer-sync path. Because it is an AST pre-walk over the
+  group-expanded, inactive-pruned tree, it catches apply-groups-inherited /
+  duplicate-block forms the schema layer can miss — the reason both layers are
+  kept.
+
+The change is surgical: it fires ONLY for names resolving to if_id 0 (which are
+never valid), so the #2909/#2933 two-VALID-alias collision case (`st0` + `st0.0`,
+both if_id 1) is unchanged — still handled by the collision arm, still rejected
+naming the shared if_id. An empty bind-interface (none configured) is still
+skipped. The pkg/routing "invalid bind-interface name" guard remains the runtime
+backstop for a tolerated-but-invalid config. Covered by
+`pkg/config/compiler_ipsec_bindiface_validate_5297_test.go` (strict reject +
+valid-compiles-to-expected-if_id + tolerant-warn + schema-layer reject +
+#2933-non-regression, each RED on revert to the silent `continue` / untyped
+leaf).
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
