@@ -1,3 +1,18 @@
+## 2026-07-09 — #5037 cli `| last N` unbounded pre-allocation (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5037. The `| last N` filter (`filterStream`, pkg/cli) parsed N
+  with only a `v > 0` gate and eagerly did `make([]string, N)` before any
+  output — a read-only (`show`, PermView) user could `| last 2000000000` and
+  OOM-kill xpfd (~32 GiB up front). Extracted `parseLastCount` clamping N to a
+  fixed `maxTailLines` (100,000) cap and rewrote the ring to grow lazily, so
+  memory is O(min(N, lines produced)) and never O(operand). Applied the same
+  cap to the remote CLI `applyPipeFilter` (`cmd/cli/shared.go`) for local/
+  remote parity (#4968) — that branch slices rather than pre-allocating so it
+  was not the OOM vector. RED-on-revert: `TestParseLastCountCap` +
+  `TestFilterStreamLastCapTruncates`.
+  **File(s)**: pkg/cli/cli_dispatch.go, cmd/cli/shared.go,
+  pkg/cli/cli_last_cap_5037_test.go, docs/junos-cli-reference.md
 ## 2026-07-09 — #5035 grpcapi primary listener loopback clamp (security)
 
 - **Timestamp**: 2026-07-09
