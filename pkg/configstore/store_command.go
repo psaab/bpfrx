@@ -344,6 +344,17 @@ func (s *Store) LoadMergeAs(sessionID, content string) error {
 		}
 	}
 
+	// #5187: merge into a deep clone of the candidate and swap it in only on
+	// complete success. Both branches below previously applied each line
+	// directly to s.candidate and returned on the first error, leaving every
+	// EARLIER set/delete line committed to the live candidate while the
+	// RPC/CLI reported the merge FAILED — a non-atomic import (a partial
+	// delete could drop replacement deny lines that followed the failing line
+	// = fail-open). Mirror LoadOverride's parse-into-a-separate-tree-then-swap
+	// discipline so a mid-body error leaves the candidate byte-identical to
+	// before the request (dirty/lease state untouched).
+	working := s.candidate.Clone()
+
 	if isSetFormat {
 		// #3442 M3: once flat set-format is selected, every non-comment line
 		// MUST start with a recognized verb. Otherwise ParseSetVerb treats a
@@ -360,7 +371,7 @@ func (s *Store) LoadMergeAs(sessionID, content string) error {
 			if !hasFlatVerb(trimmed) {
 				return fmt.Errorf("line %d: %q is not a set/delete/deactivate/activate command", i+1, trimmed)
 			}
-			if err := applyEditLine(s.candidate, trimmed); err != nil {
+			if err := applyEditLine(working, trimmed); err != nil {
 				return fmt.Errorf("line %d: %q: %w", i+1, trimmed, err)
 			}
 		}
@@ -381,12 +392,13 @@ func (s *Store) LoadMergeAs(sessionID, content string) error {
 			if trimmed == "" {
 				continue
 			}
-			if err := applyEditLine(s.candidate, trimmed); err != nil {
+			if err := applyEditLine(working, trimmed); err != nil {
 				return fmt.Errorf("merge: %w", err)
 			}
 		}
 	}
 
+	s.candidate = working
 	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return nil
@@ -479,6 +491,17 @@ func (s *Store) LoadSetAs(sessionID, content string) (int, error) {
 	if s.candidate == nil {
 		return 0, fmt.Errorf("not in configuration mode")
 	}
+	// #5187: replay every line into a deep clone of the candidate and swap it
+	// in only after ALL lines apply. Applying directly to s.candidate advanced
+	// it line-by-line and, on the first failing line, left every EARLIER
+	// set/delete line committed to the live candidate while the RPC/CLI
+	// reported the load FAILED — a non-atomic import. A partial delete was
+	// fail-open: replacement deny lines that followed the failing line were
+	// dropped, yet the candidate had already advanced. Mirror LoadOverride's
+	// parse-into-a-separate-tree-then-swap discipline so a mid-body error
+	// leaves the candidate byte-identical to before the request (dirty/lease
+	// state untouched).
+	working := s.candidate.Clone()
 	count := 0
 	for i, line := range strings.Split(content, "\n") {
 		line = strings.TrimSpace(line)
@@ -493,11 +516,12 @@ func (s *Store) LoadSetAs(sessionID, content string) (int, error) {
 		if !hasFlatVerb(line) {
 			return count, fmt.Errorf("line %d: %q is not a set/delete/deactivate/activate command", i+1, line)
 		}
-		if err := applyEditLine(s.candidate, line); err != nil {
+		if err := applyEditLine(working, line); err != nil {
 			return count, fmt.Errorf("line %d: %q: %w", i+1, line, err)
 		}
 		count++
 	}
+	s.candidate = working
 	s.touchConfigLockLocked() // #4476: refresh the config-lock idle lease
 	s.dirty = true
 	return count, nil

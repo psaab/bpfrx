@@ -756,6 +756,21 @@ owned by the `journal/` subpackage.
     tabs as whitespace) — not only a literal space.
   - Hierarchical `LoadMerge` is unaffected — it round-trips through
     `FormatSet()`, which always emits verb-prefixed lines.
+- Flat-load request atomicity (#5187): `LoadSet` and BOTH `LoadMerge`
+  branches (flat set-format and hierarchical-via-`FormatSet`) replay every
+  edit line into a deep clone of the candidate (`ConfigTree.Clone`) and swap
+  it into `s.candidate` — setting `dirty` and refreshing the config-lock
+  lease — ONLY after ALL lines apply. On ANY line error the method returns
+  WITHOUT touching `s.candidate`, `dirty`, or the lease, so
+  `candidate_after_error == candidate_before_request` byte-for-byte. This
+  mirrors `LoadOverride`, which already parsed into a separate tree before
+  the swap. Previously all three replayed each line directly onto the live
+  candidate and returned on the first failure, leaving every EARLIER
+  set/delete line committed while the RPC/CLI reported the load FAILED — a
+  non-atomic import. The partial-delete case was fail-OPEN: replacement deny
+  lines placed AFTER the failing line were dropped, yet the candidate had
+  already advanced. (Distinct from the #3442 fix above, which addressed
+  silent-skip of a malformed line, not partial application.)
 - Commit atomicity (#846): `pkg/daemon` wraps `Commit()` together with
   `applyConfig()` under a single semaphore. Bypassing the daemon (e.g.
   using `Store` directly) loses that serialization, so concurrent CLI +
