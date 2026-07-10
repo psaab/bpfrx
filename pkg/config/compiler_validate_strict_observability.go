@@ -1,7 +1,10 @@
 package config
 
 import (
+	"context"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 )
@@ -120,8 +123,10 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 }
 
 // validateDynamicAddressFeedServerEndpointStrict hard-rejects a
-// `security dynamic-address feed-server <name>` that configures no endpoint —
-// neither `url` nor `hostname` (#3300 residual). feeds.Manager.Apply derives
+// `security dynamic-address feed-server <name>` whose resolved base url either
+// configures no endpoint — neither `url` nor `hostname` (#3300 residual) — or
+// is non-empty but MALFORMED so it cannot back an HTTP fetch (#5183).
+// feeds.Manager.Apply derives
 // each server's base URL via resolveBaseURL (feeds.go): explicit `url`, else
 // `https://<hostname>`, else the empty string — and an empty base URL makes
 // Apply SKIP the whole server (it registers NONE of its feeds, including any
@@ -178,8 +183,82 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 				"silently matches nothing; set a valid url or hostname",
 				display)
 		}
+		// #5183: a NON-empty but MALFORMED base url (e.g. `http://%`, a
+		// scheme-less `example.com/list`, or `https://` with no host) clears
+		// the emptiness gate above but is not constructible as the HTTP request
+		// the runtime issues — feeds.Manager.readFeed does
+		// http.NewRequestWithContext(ctx, "GET", fs.url, nil), which errors
+		// BEFORE any I/O, so the feed registers no content and any deny policy
+		// bound to that address-name enforces an empty (match-nothing) set — the
+		// #3300 fail-open one layer up from the emptiness case. Validate the
+		// resolved base url with the SAME request-construction semantics the
+		// runtime uses so a garbage endpoint is operator-visible at commit
+		// instead of silently non-functional. Tolerant load / peer-sync
+		// downgrades to a warning via the shared lenient wrapper at the call
+		// site (the runtime is already fail-closed match-none for the dead
+		// feed, so a leniently-loaded config still boots — #1960 / #3261).
+		if reason := feedServerBaseURLUnconstructible(feedServerResolvedBaseURL(fs)); reason != "" {
+			display := fs.Name
+			if display == "" {
+				display = name
+			}
+			return fmt.Errorf("security dynamic-address feed-server %q base url "+
+				"%q is malformed (%s) — http.NewRequestWithContext fails before "+
+				"any fetch, so it registers no feeds and any address-name bound "+
+				"to it silently matches nothing; set a valid http(s) url or hostname",
+				display, feedServerResolvedBaseURL(fs), reason)
+		}
 	}
 	return nil
+}
+
+// feedServerResolvedBaseURL returns the base url feeds.resolveBaseURL
+// (pkg/feeds/feeds.go) would produce for this server: explicit `url` (trimmed
+// of trailing slashes) wins, else `https://<hostname>`, else "". Mirrors
+// resolveBaseURL branch-for-branch; keep in sync (pkg/config cannot import
+// pkg/feeds — import cycle). Callers here reach it only after
+// feedServerBaseURLEmpty has ruled out the "" result.
+func feedServerResolvedBaseURL(fs *FeedServer) string {
+	if fs.URL != "" {
+		return strings.TrimRight(fs.URL, "/")
+	}
+	if fs.Hostname != "" {
+		return "https://" + strings.TrimRight(fs.Hostname, "/")
+	}
+	return ""
+}
+
+// feedServerBaseURLUnconstructible reports why a non-empty resolved feed base
+// url could NOT back the HTTP request the runtime issues, or "" if it is well
+// formed. The contract is the runtime's own: feeds.Manager.readFeed calls
+// http.NewRequestWithContext(ctx, "GET", url, nil), which fails (before any
+// network I/O) for an unparseable url or one url.Parse cannot fully handle.
+// url.Parse alone accepts a scheme-less or host-less string, so this ALSO
+// requires an http/https scheme and a non-empty host — the two properties a
+// feed fetch needs to reach a server at all. Returning a reason string (rather
+// than an error) keeps the caller's message assembly in one place.
+func feedServerBaseURLUnconstructible(resolved string) string {
+	if resolved == "" {
+		// Empty is the emptiness gate's job, not this one.
+		return ""
+	}
+	u, err := url.Parse(resolved)
+	if err != nil {
+		return fmt.Sprintf("not a parseable URL: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		if u.Scheme == "" {
+			return "missing http/https scheme"
+		}
+		return fmt.Sprintf("scheme %q is not http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return "missing host"
+	}
+	if _, err := http.NewRequestWithContext(context.Background(), http.MethodGet, resolved, nil); err != nil {
+		return fmt.Sprintf("http.NewRequestWithContext rejects it: %v", err)
+	}
+	return ""
 }
 
 // feedServerBaseURLEmpty reports whether feeds.resolveBaseURL would return ""
