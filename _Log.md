@@ -45100,3 +45100,23 @@ top.
   sections (removed the #1434 "VRF not unbound" residual).
 - **File(s)**: pkg/routing/tunnel.go,
   pkg/routing/tunnel_reconcile_test.go, pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5123 pkg/lldp — withdraw a neighbor immediately on a TTL=0
+  shutdown LLDPDU. The RX path stored a TTL=0 frame like any other neighbor
+  (ExpiresAt==now), so a departed peer stayed visible in `Neighbors()` until
+  the next ~10s `expiryLoop` tick, violating IEEE 802.1AB shutdown semantics
+  (the receiver must delete the neighbor at once). `rxLoop` now computes the
+  `ifname/chassis/port` key and, when the parsed TTL is 0, calls the new
+  `withdrawNeighbor` helper — a locked delete under the same `mu` the learn
+  and expiry paths use — and does NOT cache the frame. A TTL=0 frame for an
+  unknown key is a no-op (no error, no spurious insert). The non-zero TTL
+  learn/refresh path is unchanged and the 10s reap cadence is untouched.
+  Added three fail-on-revert tests driving the real `rxLoop` through the
+  `recvFn` seam with a deterministic synchronous handshake: immediate
+  withdrawal after TTL=0, unknown-key no-insert, non-zero learn+refresh.
+  Proved RED-on-revert (the two TTL=0 tests fail on reverted source; the
+  refresh test passes both ways by design). `go test -race ./pkg/lldp/...`
+  green. Updated pkg/lldp/README.md neighbor-lifecycle + ParseTLVs notes.
+- **File(s)**: pkg/lldp/lldp.go, pkg/lldp/shutdown_ttl0_5123_test.go,
+  pkg/lldp/README.md, _Log.md
