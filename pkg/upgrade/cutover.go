@@ -641,6 +641,13 @@ func firstNonNil(errs ...error) error {
 	return nil
 }
 
+// statConfigDBDir stats the pre-upgrade config-DB directory during preflight.
+// It is a package var so tests can inject a non-ENOENT stat error (EACCES/
+// EIO/stale mount) and exercise the #5074 fail-closed path deterministically
+// without root-only permission tricks. Production is os.Stat. Only preflight
+// uses this seam; the flip.go rollback-restore stats are unaffected.
+var statConfigDBDir = os.Stat
+
 // preflight checks disk space (incl. the rollback DB snapshot), GCs
 // eligible versions if short, and takes the pre-upgrade DB snapshot. Pure:
 // no live mutation.
@@ -657,7 +664,28 @@ func (r *Runner) preflight(j *Journal) error {
 	if err != nil {
 		return fmt.Errorf("size staged: %w", err)
 	}
-	dbSize, _ := dirSize(r.cfg.ConfigDBDir) // best-effort; 0 if absent
+
+	// Classify the pre-upgrade config-DB directory ONCE, FAIL-CLOSED (#5074).
+	// The DB snapshot underpins binary+DB-atomic rollback: if a transient or
+	// permission stat error (EACCES/EIO/stale mount) were misread as "DB
+	// absent", the cut would proceed with DBSnapshotPath empty and a later
+	// rollback would have no pre-upgrade DB to restore. Branch the stat
+	// EXPLICITLY: nil -> present (snapshot below); os.IsNotExist -> the only
+	// legitimate skip; ANY OTHER error -> abort the pure preflight before any
+	// live mutation.
+	var dbSize uint64
+	dbPresent := false
+	if _, serr := statConfigDBDir(r.cfg.ConfigDBDir); serr == nil {
+		dbPresent = true
+		// A present DB must be sized for the space check. A walk error here
+		// (EIO on a subfile, EACCES on a subdir) is a real storage fault and
+		// must be surfaced, never silently treated as size 0.
+		if dbSize, err = dirSize(r.cfg.ConfigDBDir); err != nil {
+			return fmt.Errorf("size config DB %s: %w", r.cfg.ConfigDBDir, err)
+		}
+	} else if !os.IsNotExist(serr) {
+		return fmt.Errorf("stat config DB %s: %w", r.cfg.ConfigDBDir, serr)
+	}
 
 	need := stagedSize + dbSize + r.cfg.DiskMarginBytes
 
@@ -688,7 +716,7 @@ func (r *Runner) preflight(j *Journal) error {
 	snapPartial := snapDir + partialSuffix
 	_ = os.RemoveAll(snapPartial)
 	_ = os.RemoveAll(snapDir)
-	if _, err := os.Stat(r.cfg.ConfigDBDir); err == nil {
+	if dbPresent {
 		if _, cerr := copyTree(r.cfg.ConfigDBDir, snapPartial); cerr != nil {
 			return fmt.Errorf("snapshot config DB: %w", cerr)
 		}

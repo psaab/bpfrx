@@ -45143,3 +45143,23 @@ top.
 - **Timestamp**: 2026-07-10 (fix/5355-tunnel-apply-failclosed)
   - **Action**: #5355 fail-closed on genuine GRE/tunnel reconcile errors — mirror #5310 xfrmManager.Apply. tunnelManager.Apply now aggregates genuine create/find/up/delete failures via errors.Join and returns them (was unconditional `return nil`); helpers applyAnchorLocked/applyKernelTunnelLocked/finishTunnelLocked return errors; applyWireguardTunLocked surfaces its LinkSetUp failure. Idempotency preserved (adopt-existing, tolerate-already-gone, defer-on-transient). New RED-on-revert tests + daemon-boundary tunnel case; README fail-closed note.
   - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_apply_failclosed_5355_test.go, pkg/routing/tunnel_reconcile_test.go, pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go, pkg/routing/README.md
+
+- **Timestamp**: 2026-07-10 (fix/5074-rollback-preflight-failclosed)
+  - **Action**: #5074 fail the rollback preflight closed on non-ENOENT
+    config-DB stat errors. `preflight` classified the DB dir with
+    `os.Stat(...) == nil {snapshot} else {skip}`, so ANY non-ENOENT stat
+    error (EACCES/EIO/stale mount) took the else branch, logged "no config
+    DB", left `DBSnapshotPath` empty (`AdvancedStateFloor` false) and let
+    the binary cut proceed with no restorable pre-upgrade DB. `dirSize`
+    errors during space sizing were also silently ignored. Fix: branch the
+    stat EXPLICITLY (nil -> present+snapshot; os.IsNotExist -> skip; ANY
+    OTHER -> return error, abort the pure preflight before any live
+    mutation) via an injectable `statConfigDBDir` seam; surface `dirSize`
+    failures on a PRESENT DB. Clean abort (preflight is pure — no binary
+    swap / marker / snapshot side-effect on the error path). New
+    RED-on-revert tests (present/absent/EACCES/EIO/dirSize-error +
+    Run-level no-mutation); RED proven (buggy code cuts to COMMITTED on
+    EACCES). Updated docs/in-place-upgrade.md PREFLIGHT bullet.
+  - **File(s)**: pkg/upgrade/cutover.go,
+    pkg/upgrade/preflight_dbsnap_failclosed_5074_test.go,
+    docs/in-place-upgrade.md, _Log.md

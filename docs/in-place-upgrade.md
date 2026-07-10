@@ -67,6 +67,16 @@ the running daemon and config untouched).
 - **PREFLIGHT** — check `/var` free ≥ staged size + config-DB snapshot
   size + margin; GC eligible versions if short; take the pre-upgrade
   config-DB snapshot (`.partial`+rename, never torn) for rollback.
+  The config-DB dir is classified **fail-closed** (#5074): the stat is
+  branched explicitly — `nil` ⇒ present (snapshot it), `os.IsNotExist`
+  ⇒ the ONLY legitimate skip (genuinely no DB), and ANY OTHER stat error
+  (EACCES/EIO/stale mount) ⇒ ABORT the (pure) preflight before any live
+  mutation. A transient/permission error must NOT be misread as "DB
+  absent": that would leave `DBSnapshotPath` empty (`AdvancedStateFloor`
+  false) and let the binary cut proceed with no restorable pre-upgrade
+  DB, so a later rollback could not restore the config. A `dirSize`
+  failure while sizing a PRESENT DB (e.g. EIO on a subfile) is likewise
+  surfaced, never silently sized as 0.
 - **COPY** — `staged/` → `.<ver>.partial/` + checksum + atomic rename to
   `versions/<ver>/`. A crash never leaves a half-populated version dir;
   stray `.partial` dirs are swept on re-run, and the sweep fsyncs the
