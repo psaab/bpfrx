@@ -900,6 +900,28 @@ SURGICAL — only NAME references are checked; `then community (set|add) <value>
 carries a community VALUE (e.g. `65000:100`), not a list reference, and a defined
 community reference commits unchanged.
 
+**The `-xpf-redist` route-map-name suffix is reserved (#5116):** the FRR renderer
+derives a per-use-site fail-closed redistribute route-map alias
+`name + "-xpf-redist"` (`redistFailClosedRouteMap`, `pkg/frr`) into FRR's GLOBAL
+name-keyed route-map namespace so a BGP-default-accept policy's trailing permit
+cannot leak into an IGP `redistribute` (#4481). FRR keys route-maps by NAME, so
+an operator policy-statement literally named `<X>-xpf-redist` alongside a dual-use
+`<X>` would collide with the generated alias in that shared object and could
+silently undo the fail-closed BGP/IGP separation — reintroducing route
+redistribution leakage under a config that otherwise passes validation.
+`validatePolicyReservedRedistNameStrict` (`compiler_validate_strict_routing.go`,
+constant `ReservedRedistSuffix`) hard-rejects a policy-statement whose name ends
+in the reserved suffix at commit / commit-check (naming the policy and the
+suffix), making the generated-alias namespace injective BY CONSTRUCTION. The
+alias derivation in `pkg/frr` references the SAME `ReservedRedistSuffix` constant
+so the two cannot drift. The tolerant load / peer-sync path downgrades to a
+warning (`lenientPolicyReservedRedistName`) so an already-persisted or
+peer-synced config an older binary accepted still boots (#1960 no-brick
+doctrine); as defense-in-depth the renderer's `redistAliasCollision` (invoked by
+`ApplyFull`) then fails the managed-section apply CLOSED if a leniently-loaded
+alias still collides, so the collision cannot leak even when the strict gate was
+bypassed.
+
 **Policy-referenced application protocols are validated against the dataplane
 resolver (#3150 — codex-review-067 finding 067-06):** a user-defined
 `set applications application <name> protocol <token>` that is REFERENCED by a

@@ -363,7 +363,40 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		return m.Clear()
 	}
 
+	// #5116 render-side belt: refuse to render a managed section in which a
+	// generated fail-closed redistribute alias (redistFailClosedRouteMap)
+	// collides with an operator-defined policy-statement of the same name. The
+	// strict commit gate (validatePolicyReservedRedistNameStrict, pkg/config)
+	// rejects such a name outright, so this only fires on the tolerant load /
+	// peer-sync / rollback path where that gate is downgraded to a warning
+	// (#1960). Fail the whole apply CLOSED — FRR keeps its last-good config,
+	// no new BGP/IGP redistribution leak — rather than emitting a colliding
+	// route-map FRR would merge.
+	if fc.PolicyOptions != nil {
+		if err := redistAliasCollision(fc.PolicyOptions, collectAllBGPAcceptDefault(fc)); err != nil {
+			return err
+		}
+	}
+
 	return m.commitManagedSection(m.buildManagedSection(fc))
+}
+
+// collectAllBGPAcceptDefault builds the GLOBAL union (default instance + every
+// VRF) of policy-statement names applied as a BGP `route-map in`/`out`. It
+// drives the #2998 trailing-permit default, the #4481 per-use-site fail-closed
+// redistribute alias, and the #5116 render-side collision guard. Both
+// buildManagedSection (render) and ApplyFull (the collision precheck) call it so
+// the two never compute the set differently.
+func collectAllBGPAcceptDefault(fc *FullConfig) map[string]bool {
+	bgpAcceptDefault := make(map[string]bool)
+	if fc == nil || fc.PolicyOptions == nil {
+		return bgpAcceptDefault
+	}
+	collectBGPRouteMapPolicies(fc.BGP, fc.PolicyOptions, bgpAcceptDefault)
+	for _, inst := range fc.Instances {
+		collectBGPRouteMapPolicies(inst.BGP, fc.PolicyOptions, bgpAcceptDefault)
+	}
+	return bgpAcceptDefault
 }
 
 // buildManagedSection renders the full xpf-managed frr.conf section for fc
@@ -434,12 +467,8 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	// #2998 trailing-permit default AND the #4481 per-use-site fail-closed
 	// redistribute alias, so it is computed once here and threaded into
 	// generatePolicyOptions AND generateProtocols (resolveRedistribute) below.
-	bgpAcceptDefault := make(map[string]bool)
+	bgpAcceptDefault := collectAllBGPAcceptDefault(fc)
 	if fc.PolicyOptions != nil {
-		collectBGPRouteMapPolicies(fc.BGP, fc.PolicyOptions, bgpAcceptDefault)
-		for _, inst := range fc.Instances {
-			collectBGPRouteMapPolicies(inst.BGP, fc.PolicyOptions, bgpAcceptDefault)
-		}
 		b.WriteString(m.generatePolicyOptions(fc.PolicyOptions, bgpAcceptDefault))
 	}
 

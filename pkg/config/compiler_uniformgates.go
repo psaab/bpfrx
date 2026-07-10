@@ -1237,6 +1237,30 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5116: reserved route-map-suffix gate. The FRR renderer derives a
+	// per-use-site fail-closed redistribute alias `name + "-xpf-redist"`
+	// (redistFailClosedRouteMap) into FRR's GLOBAL name-keyed route-map
+	// namespace to keep a BGP-default-accept policy's trailing permit from
+	// leaking into an IGP redistribute (#4481). An operator policy-statement
+	// literally named `<X>-xpf-redist` collides with that generated alias and
+	// can silently undo the fail-closed separation, reintroducing route
+	// redistribution leakage under a config that passes validation. Reserve the
+	// suffix: strict on commit / commit-check (hard reject so the reserved name
+	// is operator-visible), lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// boots — #1960; the render path carries the redistAliasCollision guard that
+	// fails the apply CLOSED on the tolerant path). Runs on the fully-compiled
+	// *Config so the policy-statement map is populated regardless of authoring
+	// order. Mirrors validateRoutingExportReferencesStrict.
+	if err := validatePolicyReservedRedistNameStrict(cfg); err != nil {
+		if opts.lenientPolicyReservedRedistName {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reserved route-map suffix (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2963: BGP neighbor peer-as gate. peer-as (remote-as) is optional in
 	// the parser/compiler, so a neighbor authored without one keeps a zero
 	// PeerAS and the FRR renderer emitted `neighbor <addr> remote-as 0`. AS 0
