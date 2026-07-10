@@ -506,22 +506,23 @@ func TestGenerateProtocols_BGPImportAndExport(t *testing.T) {
 }
 
 // TestGenerateProtocols_BGPExportNextHopSelf proves a `then next-hop self`
-// export policy attached to an iBGP neighbor renders the FRR per-neighbor
-// `next-hop-self force` knob (#2977). FRR has no `set ... next-hop self`
-// route-map clause, so the rewrite MUST be emitted at the neighbor/address-
-// family level; the pre-#2977 code emitted nothing → iBGP/route-reflector
-// peers kept the original eBGP next-hop and blackholed the prefixes.
+// export policy attached to an iBGP neighbor is lowered as a TERM-SCOPED
+// route-map `set ip/ipv6 next-hop peer-address` clause (self in the
+// outbound direction), NOT the neighbor-wide `next-hop-self` knob (#5115).
 //
-// `force` is emitted UNCONDITIONALLY: plain `next-hop-self` rewrites ONLY
-// eBGP-learned routes, whereas Junos `then next-hop self` rewrites ALL
-// matched routes (including RR-reflected iBGP-learned ones). `force` is a
-// harmless no-op for eBGP-learned routes, so unconditional `force` matches
-// Junos's unconditional semantics for both plain-iBGP and RR-client peers.
+// FRR has no literal `set ... next-hop self` clause, but in an OUTBOUND
+// route-map `set ip next-hop peer-address` resolves to the local end of
+// the BGP session (= self) and is evaluated per-route. The pre-#5115 code
+// emitted `neighbor <peer> next-hop-self force`, which ran after route
+// selection and rewrote EVERY route advertised to the peer — widening a
+// term-scoped action to the whole neighbor. The route-map lowering still
+// overrides iBGP / route-reflector-reflected next-hops (the #2977 fix),
+// now scoped to the term's routes.
 //
-// Fail-on-revert: delete the `neighbor %s next-hop-self force` emission in
-// the neighbor loops (or revert policyStatementHasNextHopSelf to always-
-// false) and the "neighbor 10.0.0.2 next-hop-self force" assertion below
-// goes RED.
+// Fail-on-revert: restore the `neighbor %s next-hop-self force` emission
+// and the neighbor block regains the widening knob (first assertion RED);
+// drop the route-map `set ip/ipv6 next-hop peer-address` emission and the
+// route-map assertions go RED.
 func TestGenerateProtocols_BGPExportNextHopSelf(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
@@ -541,26 +542,35 @@ func TestGenerateProtocols_BGPExportNextHopSelf(t *testing.T) {
 			{Address: "10.0.0.2", PeerAS: 65001, Export: []string{"NHS"}},
 		},
 	}
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
+	proto := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
 
-	// The per-neighbor next-hop-self knob MUST be emitted WITH `force`.
-	if !strings.Contains(got, "neighbor 10.0.0.2 next-hop-self force\n") {
-		t.Errorf("#2977: missing per-neighbor `next-hop-self force` for `then next-hop self` export policy, got:\n%s", got)
+	// The neighbor block MUST NOT carry the widening next-hop-self knob.
+	if strings.Contains(proto, "next-hop-self") {
+		t.Errorf("#5115: neighbor-wide `next-hop-self` knob must NOT be emitted (widens the term-scoped action), got:\n%s", proto)
 	}
-	// And NEVER as an invalid route-map set-clause (FRR rejects it, taking
-	// the whole route-map down).
-	if strings.Contains(got, "set ip next-hop self") || strings.Contains(got, "set ipv6 next-hop self") {
-		t.Errorf("#2977: must NOT emit an invalid `set ... next-hop self` route-map clause, got:\n%s", got)
+
+	// The export route-map MUST carry the term-scoped self lowering.
+	rmap := m.generatePolicyOptions(po)
+	if !strings.Contains(rmap, "set ip next-hop peer-address\n") {
+		t.Errorf("#5115: missing term-scoped `set ip next-hop peer-address` for `then next-hop self`, got:\n%s", rmap)
+	}
+	if !strings.Contains(rmap, "set ipv6 next-hop peer-address\n") {
+		t.Errorf("#5115: missing term-scoped `set ipv6 next-hop peer-address` for `then next-hop self`, got:\n%s", rmap)
+	}
+	// And NEVER an invalid `set ... next-hop self` clause (FRR rejects it,
+	// taking the whole route-map down).
+	if strings.Contains(rmap, "set ip next-hop self") || strings.Contains(rmap, "set ipv6 next-hop self") {
+		t.Errorf("must NOT emit an invalid `set ... next-hop self` route-map clause, got:\n%s", rmap)
 	}
 }
 
 // TestGenerateProtocols_BGPExportNextHopSelfRRClient proves the route-
-// reflector reflected-route sub-case the #2977 issue title names: a
-// route-reflector-CLIENT neighbor with a `then next-hop self` export must
-// render `next-hop-self force`. Plain `next-hop-self` would NOT rewrite the
-// next-hop on iBGP-learned routes the RR reflects to this client — exactly
-// the routes whose next-hop the operator means to set to self — so `force`
-// is required for Junos parity here, not optional.
+// reflector reflected-route sub-case (#2977): a route-reflector-CLIENT
+// neighbor with a `then next-hop self` export still rewrites the next-hop
+// on the iBGP-learned routes reflected to the client. An OUTBOUND route-map
+// `set ip next-hop peer-address` unconditionally overrides the next-hop for
+// every route the clause matches (the same effect the old `force` gave), so
+// the #2977 blackhole stays fixed WITHOUT the widening neighbor knob (#5115).
 func TestGenerateProtocols_BGPExportNextHopSelfRRClient(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
@@ -577,24 +587,27 @@ func TestGenerateProtocols_BGPExportNextHopSelfRRClient(t *testing.T) {
 		LocalAS:  65001, // iBGP
 		RouterID: "1.1.1.1",
 		Neighbors: []*config.BGPNeighbor{
-			// RR client: routes reflected to it are iBGP-learned, so plain
-			// next-hop-self would skip them — force is mandatory.
+			// RR client: routes reflected to it are iBGP-learned; the outbound
+			// route-map set-clause overrides their next-hop unconditionally.
 			{Address: "10.0.0.3", PeerAS: 65001, Export: []string{"NHS"}, RouteReflectorClient: true},
 		},
 	}
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
+	proto := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
 
-	if !strings.Contains(got, "neighbor 10.0.0.3 route-reflector-client\n") {
-		t.Fatalf("#2977: RR client not configured as expected, got:\n%s", got)
+	if !strings.Contains(proto, "neighbor 10.0.0.3 route-reflector-client\n") {
+		t.Fatalf("#2977: RR client not configured as expected, got:\n%s", proto)
 	}
-	if !strings.Contains(got, "neighbor 10.0.0.3 next-hop-self force\n") {
-		t.Errorf("#2977: RR-client `then next-hop self` must render `next-hop-self force` (reflected iBGP routes need force), got:\n%s", got)
+	if strings.Contains(proto, "next-hop-self") {
+		t.Errorf("#5115: RR-client export must NOT emit the widening `next-hop-self` knob, got:\n%s", proto)
+	}
+	if rmap := m.generatePolicyOptions(po); !strings.Contains(rmap, "set ip next-hop peer-address\n") {
+		t.Errorf("#2977/#5115: RR-client `then next-hop self` must render the term-scoped `set ip next-hop peer-address`, got:\n%s", rmap)
 	}
 }
 
 // TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf proves an export
-// policy WITHOUT `then next-hop self` never emits the next-hop-self knob —
-// no regression for the common case (#2977).
+// policy WITHOUT `then next-hop self` never emits the next-hop-self knob nor
+// a spurious peer-address set-clause — no regression for the common case.
 func TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
@@ -609,9 +622,87 @@ func TestGenerateProtocols_BGPExportNoSpuriousNextHopSelf(t *testing.T) {
 			{Address: "10.0.0.2", PeerAS: 65001, Export: []string{"OUT"}},
 		},
 	}
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
-	if strings.Contains(got, "next-hop-self") {
-		t.Errorf("#2977: spurious next-hop-self emitted for a policy without `then next-hop self`, got:\n%s", got)
+	if got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil); strings.Contains(got, "next-hop-self") {
+		t.Errorf("spurious next-hop-self emitted for a policy without `then next-hop self`, got:\n%s", got)
+	}
+	if got := m.generatePolicyOptions(po); strings.Contains(got, "next-hop peer-address") {
+		t.Errorf("spurious `set next-hop peer-address` emitted for a policy without `then next-hop self`, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPExportNextHopSelfTermScoped is the #5115
+// widening regression: a two-term export policy where ONE term accepts
+// prefix A without touching the next-hop and a SEPARATE term accepts prefix
+// B with `then next-hop self`. The pre-#5115 code saw "some term wants
+// self" and emitted the neighbor-wide `next-hop-self force` knob, which runs
+// after route selection and rewrites the next-hop of BOTH prefixes — even
+// prefix A, whose term never asked for self. The fix lowers the self action
+// into ONLY term B's route-map sequence, so exactly one `set ip next-hop
+// peer-address` clause is emitted and prefix A's sequence is untouched.
+//
+// Fail-on-revert: restoring the neighbor knob makes the `next-hop-self`
+// assertion RED; a knob-based lowering would also fail the "exactly one
+// set-clause / scoped to term B" assertions.
+func TestGenerateProtocols_BGPExportNextHopSelfTermScoped(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"NHS2": {
+				Name: "NHS2",
+				Terms: []*config.PolicyTerm{
+					// Term A: accept prefix A, DO NOT set next-hop self.
+					{
+						Name:         "keep-nh",
+						RouteFilters: []*config.RouteFilter{{Prefix: "10.10.0.0/24", MatchType: "exact"}},
+						Action:       "accept",
+					},
+					// Term B: accept prefix B WITH next-hop self.
+					{
+						Name:         "self-nh",
+						RouteFilters: []*config.RouteFilter{{Prefix: "10.20.0.0/24", MatchType: "exact"}},
+						NextHop:      "self",
+						Action:       "accept",
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001, // iBGP
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.2", PeerAS: 65001, Export: []string{"NHS2"}},
+		},
+	}
+
+	// No neighbor-wide knob — that is the widening the issue reports.
+	proto := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
+	if strings.Contains(proto, "next-hop-self") {
+		t.Errorf("#5115: term-scoped `then next-hop self` must NOT widen into a neighbor-wide `next-hop-self` knob, got:\n%s", proto)
+	}
+
+	rmap := m.generatePolicyOptions(po)
+	// Exactly one term requested self, so exactly one set-clause is emitted
+	// (per AF). More than one would mean it leaked onto the other term.
+	if n := strings.Count(rmap, "set ip next-hop peer-address"); n != 1 {
+		t.Errorf("#5115: expected exactly one `set ip next-hop peer-address` (term B only), got %d in:\n%s", n, rmap)
+	}
+	// The self set-clause must be scoped to term B's sequence: it appears
+	// AFTER term B's prefix (10.20.0.0/24) and there is a route-map sequence
+	// boundary between term A's prefix (10.10.0.0/24) and the set-clause, so
+	// term A's sequence does not carry it.
+	iA := strings.Index(rmap, "10.10.0.0/24")
+	iB := strings.Index(rmap, "10.20.0.0/24")
+	iSet := strings.Index(rmap, "set ip next-hop peer-address")
+	if iA < 0 || iB < 0 || iSet < 0 {
+		t.Fatalf("#5115: missing expected prefixes/set-clause in route-map, got:\n%s", rmap)
+	}
+	if !(iA < iB && iB < iSet) {
+		t.Errorf("#5115: self set-clause not scoped to term B (want prefixA<prefixB<set, got %d/%d/%d):\n%s", iA, iB, iSet, rmap)
+	}
+	if !strings.Contains(rmap[iA:iSet], "route-map NHS2") {
+		t.Errorf("#5115: no route-map sequence boundary between term A and the self set-clause — set-clause may leak into term A's sequence:\n%s", rmap)
 	}
 }
 
@@ -3887,7 +3978,12 @@ func TestNextHopPeerAddress(t *testing.T) {
 		t.Errorf("missing exact prefix-list entry for 2001:559:8585::/48 in:\n%s", got)
 	}
 
-	// Verify "next-hop self" does NOT generate "set ip next-hop peer-address"
+	// Verify "next-hop self" lowers to the OUTBOUND route-map self idiom
+	// `set ip/ipv6 next-hop peer-address` (self in the outbound direction),
+	// NOT a neighbor-wide knob and NOT an invalid `set ... next-hop self`
+	// (#5115). A bare term (no `from`) matches every advertised route, so a
+	// genuinely neighbor-wide self keeps neighbor-wide effect via the
+	// match-all route-map sequence.
 	po2 := &config.PolicyOptionsConfig{
 		PrefixLists: make(map[string]*config.PrefixList),
 		Communities: make(map[string]*config.CommunityDef),
@@ -3906,8 +4002,14 @@ func TestNextHopPeerAddress(t *testing.T) {
 		},
 	}
 	got2 := m.generatePolicyOptions(po2)
-	if strings.Contains(got2, "set ip next-hop") {
-		t.Errorf("next-hop self should NOT generate set ip next-hop, got:\n%s", got2)
+	if !strings.Contains(got2, "set ip next-hop peer-address") {
+		t.Errorf("next-hop self should lower to `set ip next-hop peer-address`, got:\n%s", got2)
+	}
+	if !strings.Contains(got2, "set ipv6 next-hop peer-address") {
+		t.Errorf("next-hop self should lower to `set ipv6 next-hop peer-address`, got:\n%s", got2)
+	}
+	if strings.Contains(got2, "next-hop self") {
+		t.Errorf("next-hop self must NOT emit a literal `set ... next-hop self`, got:\n%s", got2)
 	}
 }
 

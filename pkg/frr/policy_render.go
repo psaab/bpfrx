@@ -258,41 +258,6 @@ func isDefinedPolicyStatement(name string, po *config.PolicyOptionsConfig) bool 
 	return ok
 }
 
-// policyStatementHasNextHopSelf reports whether the named policy-statement
-// contains any term with `then next-hop self`. FRR has no route-map "set"
-// clause that rewrites the next-hop to the local router's own address (a
-// literal `set ip next-hop self` is rejected by FRR's parser, taking the
-// whole route-map down with it). The canonical FRR mechanism is the
-// per-neighbor / per-address-family `neighbor <peer> next-hop-self force`
-// knob. `next-hop self` is an OUTBOUND (advertise) concept, so this is
-// consulted only against a neighbor's EXPORT policy-statement: when true,
-// the neighbor loop emits `neighbor <peer> next-hop-self force` in that
-// address family instead of a (non-existent) route-map set-clause (#2977).
-// The `force` modifier is unconditional — plain `next-hop-self` rewrites
-// only eBGP-learned routes, but Junos `then next-hop self` rewrites ALL
-// matched routes including route-reflector-reflected (iBGP-learned) ones.
-//
-// The pre-#2977 code emitted NOTHING for `then next-hop self`, on the false
-// premise that "eBGP rewrites next-hop to self by default". That holds only
-// for eBGP; for iBGP / route-reflector advertisements the next-hop is
-// PRESERVED by default, so dropping the rewrite left iBGP peers with the
-// original (eBGP) next-hop, no IGP path to it, and a silent blackhole.
-func policyStatementHasNextHopSelf(name string, po *config.PolicyOptionsConfig) bool {
-	if po == nil || po.PolicyStatements == nil {
-		return false
-	}
-	ps := po.PolicyStatements[name]
-	if ps == nil {
-		return false
-	}
-	for _, t := range ps.Terms {
-		if t != nil && t.NextHop == "self" {
-			return true
-		}
-	}
-	return false
-}
-
 // lastNonEmpty returns the last non-empty string in the slice, or "".
 // Used to pick a neighbor's effective own export: FRR accepts only one
 // `route-map <name> out` per neighbor/address-family, and Junos set-style
@@ -966,22 +931,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
-				// Junos `then next-hop self` in the effective EXPORT policy maps
-				// to FRR's per-neighbor/AF `next-hop-self` knob, NOT a route-map
-				// set-clause (FRR has no `set ... next-hop self`). Essential for
-				// iBGP / route-reflector peers, where the next-hop is preserved
-				// by default — dropping the rewrite leaves the peer with the
-				// original eBGP next-hop and blackholes it (#2977). Emit `force`
-				// UNCONDITIONALLY: plain `next-hop-self` rewrites ONLY eBGP-
-				// learned routes, but Junos `then next-hop self` rewrites ALL
-				// matched routes including route-reflector-REFLECTED (iBGP-
-				// learned) ones — `force` is what overrides those. For an eBGP-
-				// learned route `force` is a harmless no-op (already rewritten),
-				// so unconditional `force` exactly matches Junos's unconditional
-				// rewrite for both plain-iBGP and RR-client peers.
-				if rm := bgpEffectiveExport(n, globalExport); policyStatementHasNextHopSelf(rm, policyOptions) {
-					fmt.Fprintf(&b, "  neighbor %s next-hop-self force\n", n.Address)
-				}
+				// Junos `then next-hop self` is lowered per-term INSIDE the
+				// export route-map as `set ip/ipv6 next-hop peer-address`
+				// (which resolves to self in the outbound direction), NOT the
+				// neighbor-wide `neighbor <peer> next-hop-self` knob. The knob
+				// ran after route selection and rewrote EVERY route advertised
+				// to the peer, widening a term-scoped action to all of the
+				// neighbor's routes (#5115). The route-map lowering still
+				// overrides iBGP / route-reflector-reflected next-hops (the
+				// #2977 fix), now scoped to the term. See the `term.NextHop ==
+				// "self"` branch in the route-map renderer.
+				//
 				// Inbound filter (#2490). Emit ONLY for a defined
 				// policy-statement so we never point `route-map in` at a
 				// non-existent route-map (FRR permit-all). The effective
@@ -1015,11 +975,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
-				// Next-hop-self knob, unconditional `force` (#2977) — see the
-				// ipv4 block above.
-				if rm := bgpEffectiveExport(n, globalExport); policyStatementHasNextHopSelf(rm, policyOptions) {
-					fmt.Fprintf(&b, "  neighbor %s next-hop-self force\n", n.Address)
-				}
+				// `then next-hop self` is lowered per-term in the export
+				// route-map as `set ip/ipv6 next-hop peer-address`, NOT a
+				// neighbor-wide `next-hop-self` knob (#5115) — see the ipv4
+				// block above.
 				// Inbound filter (#2490) — see the ipv4 block above.
 				if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
@@ -1818,16 +1777,34 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
 					fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
 				} else if term.NextHop == "self" {
-					// Junos "next-hop self" has NO route-map set-clause
-					// equivalent: FRR rejects a literal `set ip next-hop self`
-					// (the parser fails and takes the whole route-map down).
-					// The next-hop-self rewrite is instead emitted as the
-					// per-neighbor / per-address-family `neighbor <peer>
-					// next-hop-self` knob in the neighbor loop below, gated on
-					// policyStatementHasNextHopSelf against the neighbor's
-					// effective EXPORT policy. Emitting nothing HERE (so the
-					// route-map stays valid) but ALSO nothing at the neighbor
-					// was the #2977 silent no-op that blackholed iBGP/RR peers.
+					// Junos `then next-hop self` sets the advertised next-hop to
+					// THIS router's own session address for ONLY the routes that
+					// match this term. FRR has no literal `set ... next-hop self`
+					// (the parser rejects it and takes the whole route-map down),
+					// but in an OUTBOUND route-map `set ip next-hop peer-address`
+					// resolves to the local end of the BGP session — i.e. self —
+					// and is evaluated per-route, so it rewrites exactly this
+					// term's routes and leaves every other term's routes intact.
+					// A BGP export policy is always rendered as `route-map <name>
+					// out`, so this always evaluates in the outbound direction.
+					//
+					// This lowering REPLACES the pre-#5115 neighbor-wide
+					// `neighbor <peer> next-hop-self force` knob, which ran after
+					// route selection and rewrote EVERY route advertised to the
+					// peer — including routes accepted by OTHER terms that never
+					// requested self (the #5115 semantic widening). A term with
+					// no `from` match still renders a match-all sequence, so a
+					// genuinely neighbor-wide `then next-hop self` keeps its
+					// neighbor-wide effect. Like the old `force`, an outbound
+					// `set` overrides the next-hop on iBGP / route-reflector-
+					// reflected routes too, so the #2977 iBGP blackhole stays
+					// fixed — now correctly scoped to the term's routes.
+					//
+					// The session AF is unknown at render time; emit both forms
+					// and FRR applies each only to its matching address family
+					// (mirrors the `peer-address` branch above).
+					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
+					fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
 				} else if strings.Contains(term.NextHop, ":") {
 					// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
 					// v6 address (whole route-map fails to parse); v6 uses the

@@ -825,7 +825,8 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 - **IPv6 rib-group leaking:** `ApplyRibGroupRules()` now handles both `InterfaceRoutesRibGroup` and `InterfaceRoutesRibGroupV6`, creating both IPv4 and IPv6 ip rules per source table
 - **BGP family inet/inet6 unicast:** Per-address-family config in BGP groups → FRR `address-family ipv4/ipv6 unicast` blocks
 - **Route-filter exact:** Policy-statement route-filter matching → FRR `ip prefix-list` + `route-map match`
-- **Next-hop peer-address:** Junos `next-hop peer-address` → FRR `set ip next-hop peer-address` (was incorrectly a no-op); `next-hop self` correctly generates no FRR output
+- **Next-hop peer-address:** Junos `next-hop peer-address` → FRR `set ip next-hop peer-address` (was incorrectly a no-op)
+- **Next-hop self (term-scoped, #5115):** Junos `then next-hop self` lowers to a per-term route-map `set ip/ipv6 next-hop peer-address` clause — in an OUTBOUND route-map `peer-address` resolves to the local session address (= self) and is evaluated per-route, so it rewrites ONLY the term's routes. Earlier revisions emitted the neighbor-wide `neighbor <peer> next-hop-self force` knob, which ran after route selection and rewrote EVERY route advertised to the peer (widening a term-scoped action, #5115). The outbound set-clause still overrides iBGP / route-reflector-reflected next-hops (the #2977 fix), now correctly scoped; a bare `then next-hop self` term (no `from` match) renders a match-all sequence and keeps neighbor-wide effect.
 - **Forwarding-table export load-balancing:** ECMP load-balancing policy → FRR settings
 
 ### Application Enhancements
