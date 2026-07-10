@@ -18,19 +18,147 @@ import (
 )
 
 func TestParseSeverity(t *testing.T) {
+	// #5314: ParseSeverity must map ALL ten Junos severities the config schema
+	// accepts (junosSyslogSeverities), not just error/warning/info. Before the
+	// fix, emergency/alert/critical/notice/debug/none all fell through to 0
+	// (send-all), so a `host H <facility> critical` collapsed to no-filter and
+	// over-forwarded. This table is the fail-on-revert guard for that mapping:
+	// reverting to the 3-severity switch makes critical/emergency/etc. return 0
+	// and fails the assertions below.
 	tests := []struct {
 		name string
 		want int
 	}{
+		// Sentinels / extremes.
+		{"any", 0},
+		{"none", SeverityNone},
+		{"emergency", SeverityEmergency},
+		// Raw RFC levels.
+		{"alert", SyslogAlert},
+		{"critical", SyslogCritical},
 		{"error", SyslogError},
 		{"warning", SyslogWarning},
+		{"notice", SyslogNotice},
 		{"info", SyslogInfo},
+		{"debug", SyslogDebug},
+		// Case-insensitive.
+		{"Critical", SyslogCritical},
+		{"EMERGENCY", SeverityEmergency},
+		{"None", SeverityNone},
+		// Tolerant contract preserved: unknown / empty => 0 (no filter).
 		{"unknown", 0},
 		{"", 0},
 	}
 	for _, tt := range tests {
 		if got := ParseSeverity(tt.name); got != tt.want {
 			t.Errorf("ParseSeverity(%q) = %d, want %d", tt.name, got, tt.want)
+		}
+	}
+}
+
+// TestParseSeverityCoversSchema pins ParseSeverity to the exact severity
+// vocabulary the config schema accepts, so a schema addition without a runtime
+// mapping (the #5314 class of bug: schema accepts, runtime silently
+// no-filters) fails here. "any" and unknown legitimately map to 0 (send-all);
+// every OTHER schema token must map to a non-zero threshold.
+func TestParseSeverityCoversSchema(t *testing.T) {
+	// Mirror of config.junosSyslogSeverities (kept local to avoid an import
+	// cycle; the schema comment cross-references this test).
+	schemaSeverities := []string{
+		"any", "none", "emergency", "alert", "critical",
+		"error", "warning", "notice", "info", "debug",
+	}
+	for _, name := range schemaSeverities {
+		got := ParseSeverity(name)
+		if name == "any" {
+			if got != 0 {
+				t.Errorf("ParseSeverity(%q) = %d, want 0 (send-all)", name, got)
+			}
+			continue
+		}
+		if got == 0 {
+			t.Errorf("ParseSeverity(%q) = 0 (send-all) — schema severity has no "+
+				"runtime threshold, would over-forward (#5314)", name)
+		}
+	}
+}
+
+// TestShouldSend_AnyCritical is the core #5314 regression: `host H any critical`
+// (facility=any, severity=critical) must forward critical AND more-severe
+// records, and must NOT forward the less-severe error/warning/info records. On
+// revert (ParseSeverity("critical") -> 0), MinSeverity becomes the send-all
+// sentinel and every one of the "must NOT send" assertions goes RED.
+func TestShouldSend_AnyCritical(t *testing.T) {
+	c := &SyslogClient{MinSeverity: ParseSeverity("critical")}
+
+	// critical and MORE severe -> sent.
+	for _, sev := range []int{SyslogEmergency, SyslogAlert, SyslogCritical} {
+		if !c.ShouldSend(sev) {
+			t.Errorf("critical filter should forward severity %d (critical or more severe)", sev)
+		}
+	}
+	// LESS severe than critical -> NOT sent (the leak the bug caused).
+	for _, sev := range []int{SyslogError, SyslogWarning, SyslogNotice, SyslogInfo, SyslogDebug} {
+		if c.ShouldSend(sev) {
+			t.Errorf("critical filter MUST NOT forward severity %d (less severe than critical) — #5314 over-forward", sev)
+		}
+	}
+}
+
+// TestShouldSend_Emergency proves emergency is a real, most-restrictive
+// threshold and NOT the send-all sentinel: only emergency records pass, and
+// even alert/critical (the next-most-severe levels) are suppressed.
+func TestShouldSend_Emergency(t *testing.T) {
+	c := &SyslogClient{MinSeverity: ParseSeverity("emergency")}
+	if !c.ShouldSend(SyslogEmergency) {
+		t.Error("emergency filter should forward emergency")
+	}
+	for _, sev := range []int{SyslogAlert, SyslogCritical, SyslogError, SyslogWarning, SyslogInfo} {
+		if c.ShouldSend(sev) {
+			t.Errorf("emergency filter MUST NOT forward severity %d (emergency != send-all)", sev)
+		}
+	}
+}
+
+// TestShouldSend_AnyAndNone covers the two Junos extremes: `any` forwards
+// everything, `none` forwards nothing.
+func TestShouldSend_AnyAndNone(t *testing.T) {
+	all := []int{SyslogEmergency, SyslogAlert, SyslogCritical, SyslogError,
+		SyslogWarning, SyslogNotice, SyslogInfo, SyslogDebug}
+
+	any := &SyslogClient{MinSeverity: ParseSeverity("any")}
+	for _, sev := range all {
+		if !any.ShouldSend(sev) {
+			t.Errorf("any filter should forward severity %d", sev)
+		}
+	}
+
+	none := &SyslogClient{MinSeverity: ParseSeverity("none")}
+	for _, sev := range all {
+		if none.ShouldSend(sev) {
+			t.Errorf("none filter MUST NOT forward severity %d", sev)
+		}
+	}
+}
+
+// TestMoreRestrictiveMinSeverity checks the fold used to collapse a host's
+// several `<facility> <severity>` pairs into one client filter. Ordering,
+// most→least restrictive: none, emergency, alert..debug, any.
+func TestMoreRestrictiveMinSeverity(t *testing.T) {
+	tests := []struct {
+		a, b, want int
+	}{
+		{ParseSeverity("critical"), ParseSeverity("info"), ParseSeverity("critical")}, // critical more restrictive than info
+		{ParseSeverity("info"), ParseSeverity("critical"), ParseSeverity("critical")}, // order-independent
+		{ParseSeverity("any"), ParseSeverity("info"), ParseSeverity("info")},          // any (send-all) least restrictive
+		{ParseSeverity("emergency"), ParseSeverity("critical"), ParseSeverity("emergency")},
+		{ParseSeverity("none"), ParseSeverity("emergency"), ParseSeverity("none")}, // none most restrictive
+		{ParseSeverity("any"), ParseSeverity("none"), ParseSeverity("none")},
+		{ParseSeverity("debug"), ParseSeverity("any"), ParseSeverity("debug")}, // debug edges out any
+	}
+	for _, tt := range tests {
+		if got := MoreRestrictiveMinSeverity(tt.a, tt.b); got != tt.want {
+			t.Errorf("MoreRestrictiveMinSeverity(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
 		}
 	}
 }

@@ -687,6 +687,38 @@ func (d *Daemon) applyTimezone(cfg *config.Config) {
 // applySystemSyslog configures system-level syslog forwarding from
 // system { syslog { host ... } } config. This forwards daemon log
 // messages (Go slog) to remote syslog servers.
+// syslogHostMinSeverity folds the severity of every `<facility> <severity>`
+// pair of one syslog host into a single SyslogClient.MinSeverity threshold —
+// the most restrictive one, since the client carries a single filter. It
+// returns 0 (no filter / send-all) when no entry names a severity, matching
+// the SyslogClient zero value.
+//
+// ParseSeverity maps ALL ten Junos severities (#5314): emergency
+// (SeverityEmergency), alert/critical/error/warning/notice/info/debug (raw
+// RFC levels), plus any (0 = send-all) and none (SeverityNone = send-nothing).
+// The prior inline guard tested `if sev > 0`, which silently dropped
+// emergency/critical/alert/notice/debug/none (ParseSeverity returned 0 for
+// them), so `host H <facility> critical` left MinSeverity at the 0 send-all
+// sentinel and over-forwarded info/warning/error records the operator never
+// authorized.
+func syslogHostMinSeverity(facilities []config.SyslogFacility) int {
+	min := 0 // no filter (send-all) default; also the SyslogClient zero value
+	set := false
+	for _, f := range facilities {
+		if f.Severity == "" {
+			continue
+		}
+		sev := logging.ParseSeverity(f.Severity)
+		if !set {
+			min = sev
+			set = true
+			continue
+		}
+		min = logging.MoreRestrictiveMinSeverity(min, sev)
+	}
+	return min
+}
+
 func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 	if d.slogHandler == nil {
 		return
@@ -718,14 +750,7 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 		c.Facility = logging.FacilityDaemon
 		if len(host.Facilities) > 0 {
 			c.Facility = logging.ParseFacility(host.Facilities[0].Facility)
-			// Apply severity filter from the most restrictive facility entry
-			for _, f := range host.Facilities {
-				if sev := logging.ParseSeverity(f.Severity); sev > 0 {
-					if c.MinSeverity == 0 || sev < c.MinSeverity {
-						c.MinSeverity = sev
-					}
-				}
-			}
+			c.MinSeverity = syslogHostMinSeverity(host.Facilities)
 		}
 
 		clients = append(clients, c)

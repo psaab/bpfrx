@@ -139,6 +139,30 @@ connectionless and exempt:
   collector). The clock is cleared only on a FULLY successful reconnect
   (dial AND the retry-write both land), so the legitimate
   single-broken-pipe recovery path is unaffected.
+- **Severity filtering — complete threshold mapping (#5314).**
+  `SyslogClient.MinSeverity` encodes the Junos `host <facility> <severity>`
+  threshold: "forward this severity AND every more-severe one" (lower RFC
+  number = more severe). `ShouldSend(sev)` forwards a record iff it is at
+  least as severe as `MinSeverity`. The representation:
+  - `0` = no filter — forward everything. This is the ZERO VALUE (an
+    unconfigured client forwards all) and what Junos `any`, an unset
+    severity, and (tolerantly) an unknown token map to.
+  - `SeverityNone` (-2) = Junos `none` — forward nothing.
+  - `SeverityEmergency` (-1) = Junos `emergency` — forward ONLY emergency.
+    Emergency is RFC severity 0, which is already the send-all sentinel, so
+    the most severe level gets its own code rather than collapsing into
+    send-all.
+  - raw RFC level `alert(1)..debug(7)` — forward `severity <= MinSeverity`.
+
+  `ParseSeverity` maps all ten schema severities
+  (`junosSyslogSeverities`, pkg/config) to these codes, case-insensitively.
+  Before #5314 it mapped only error/warning/info and returned 0 for
+  everything else, so `host H <facility> critical` collapsed to the
+  send-all sentinel and a security appliance forwarded substantially more
+  syslog data than authorized — critical/notice/alert/emergency/debug/none
+  all leaked as "no filter". A syslog host that lists several
+  `<facility> <severity>` pairs is folded to one client filter via
+  `MoreRestrictiveMinSeverity` (the most restrictive pair wins).
 - **Lazy connect — receiver down at apply does not disable the stream
   (#3351).** A TCP/TLS receiver that is unreachable at config-apply or
   boot must NOT permanently silence the stream. `NewSyslogClientTransport`

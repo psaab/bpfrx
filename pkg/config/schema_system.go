@@ -10,7 +10,8 @@ package config
 // facility keyword itself is open-ended (a wildcard schema child), but the
 // severity is one of these names; anything else is a typo the runtime would
 // silently treat as "no severity filter" (logging.ParseSeverity returns 0
-// for unknown names). #2008.
+// for unknown names). All ten names below map to a real MinSeverity threshold
+// in logging.ParseSeverity (#5314). #2008.
 var junosSyslogSeverities = []string{
 	"any", "none", "emergency", "alert", "critical",
 	"error", "warning", "notice", "info", "debug",
