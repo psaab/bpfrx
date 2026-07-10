@@ -167,6 +167,41 @@ requires of an authoritative engine:
   is created with `fsatomic.MkdirAllDurable`. This is slow-path (once per start),
   so per-write durability is affordable.
 
+### Authoritative EngineID derivation (RFC 3411 §5)
+
+`initEngine` derives the authoritative SNMPv3 `snmpEngineID` from the OS
+hostname via `buildEngineID`. RFC 3411 constrains `SnmpEngineID` to **5..32
+octets**; an EngineID outside that range is rejected by compliant managers,
+which breaks every v3 discovery, USM key localization, auth check, and response
+encoding that keys off the agent's identity (v2c is unaffected). The EngineID
+must also be **deterministic and stable across restarts** — a manager caches
+`(engineBoots, engineTime)` and localizes its USM keys against it.
+
+The layout is a 5-octet enterprise prefix (`0x80 0x00 0x01 0x86 0xa3` — the
+variable-length format flag over private enterprise `0x000186a3`) + a one-octet
+format selector + a payload:
+
+- **Short hostname** (`len(hostname) <= 26`, so header + hostname `<= 32`):
+  the text form `prefix || 0x04 || hostname`, where `0x04` is RFC 3411
+  "administratively assigned text". This is **bit-identical to the pre-#4917
+  construction**, so every already-deployed appliance keeps the exact EngineID
+  its USM keys and manager caches were localized against — the migration is a
+  no-op on the short path.
+- **Long hostname** (`> 26` octets): the text form would exceed 32 octets and
+  be an **invalid EngineID** (the #4917 bug — the historical code appended the
+  full unbounded hostname). It is replaced by a deterministic hashed identity
+  `prefix || 0x05 || sha256(hostname)[:26]`, exactly 32 octets. `0x05`
+  ("administratively assigned octets") honestly labels the binary hash payload
+  (`0x04` would mislabel it as text). SHA-256 over the **full** hostname keeps
+  it deterministic (same hostname → same EngineID every boot; no randomness, no
+  timestamp) and collision-resistant (distinct long hostnames → distinct
+  EngineIDs). A one-time `slog.Info` at init records the substitution so the
+  operator sees why the EngineID is not the plain hostname.
+
+The result is 5..32 octets for every input, including the empty hostname
+(6 octets) and multi-kilobyte hostnames (32 octets). Golden-vector and
+RED-on-revert coverage lives in `engineid_4917_test.go`.
+
 ## Live reconfigure (commit-time reconcile)
 
 The full SNMP subsystem is reconciled on **every** commit, not just at boot
