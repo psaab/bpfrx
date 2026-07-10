@@ -3,8 +3,10 @@ package userspace
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -752,6 +754,86 @@ func TestSetClusterSyncedSessionV6MirrorFailureMarksHelperUnhealthy(t *testing.T
 	}
 	if m.sessionMirrorErr == "" {
 		t.Fatal("sessionMirrorErr is empty")
+	}
+}
+
+// TestSetClusterSyncedSessionV4MirrorSuccessClearsStickyFailure asserts the
+// #5247 self-heal: a transient session-mirror failure latches
+// sessionMirrorFailed (and blocks HA takeover-readiness), but a subsequent
+// SUCCESSFUL mirror through a healthy helper socket clears it without a helper
+// process restart. If the clear-on-success is reverted, the flag stays set,
+// takeoverReadyLocked never becomes ready, and this test fails.
+func TestSetClusterSyncedSessionV4MirrorSuccessClearsStickyFailure(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	sessionSock := filepath.Join(dir, "userspace-dp-sessions.sock")
+	ln, err := net.Listen("unix", sessionSock)
+	if err != nil {
+		t.Fatalf("listen session socket: %v", err)
+	}
+	defer ln.Close()
+	// A healthy session helper that acknowledges every mirror request.
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				var req ControlRequest
+				_ = json.NewDecoder(conn).Decode(&req)
+				_ = json.NewEncoder(conn).Encode(ControlResponse{OK: true})
+			}()
+		}
+	}()
+
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: 1}}
+	m.cfg.ControlSocket = filepath.Join(dir, "control.sock")
+	injectSessionMaps(t, m)
+
+	// Every takeover-readiness gate other than the session-mirror flag is
+	// satisfied, so the sticky flag is the sole thing keeping the standby
+	// not-ready.
+	m.lastStatus = ProcessStatus{
+		Enabled:         true,
+		ForwardingArmed: true,
+		Capabilities:    UserspaceCapabilities{ForwardingSupported: true},
+	}
+	m.mode = ModeUserspaceCompat
+	m.xskLivenessProven = true
+
+	// A prior transient control-socket failure latched the sticky flag.
+	m.recordSessionMirrorFailureLocked(errors.New("transient control-socket failure"))
+	if ready, reasons := m.TakeoverReady(); ready {
+		t.Fatalf("TakeoverReady() = true while mirror failed, want false; reasons=%v", reasons)
+	}
+
+	// Drive a genuinely successful forward-session mirror through the live
+	// helper socket — no helper restart.
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 61, 102},
+		DstIP:    [4]byte{172, 16, 80, 200},
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{IsReverse: 0}
+	if err := m.SetClusterSyncedSessionV4(key, val); err != nil {
+		t.Fatalf("SetClusterSyncedSessionV4: %v", err)
+	}
+
+	if m.sessionMirrorFailed {
+		t.Fatal("sessionMirrorFailed = true after successful mirror, want false (#5247)")
+	}
+	if m.sessionMirrorErr != "" {
+		t.Fatalf("sessionMirrorErr = %q after successful mirror, want empty", m.sessionMirrorErr)
+	}
+	if ready, reasons := m.TakeoverReady(); !ready {
+		t.Fatalf("TakeoverReady() = false after successful mirror, want true; reasons=%v", reasons)
 	}
 }
 
