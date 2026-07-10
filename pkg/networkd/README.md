@@ -68,6 +68,19 @@ Standard library only.
   reconcile steps (RETH MAC, VRRP VIPs, FRR, RA, IPsec). A swallowed
   write (read-only `/etc`, full disk, EACCES, blocked path) used to report
   a clean commit against stale kernel state — a fail-open hole.
+- **A failed stale-file DELETE also fails the commit (#4900).** The
+  `10-xpf-*` stale sweep used to treat `os.Remove` failures as warn-only:
+  a removed interface/address/bond/bridge/rename whose generated unit
+  could not be deleted (read-only `/etc`, immutable bit, EACCES) survived
+  a "successful" commit, and if no other generated file changed, `Apply`
+  returned nil with no reload — so the surviving `.network`/`.netdev`
+  re-applied the removed config on the next reload or boot (route leak /
+  management surprise). `Apply` and `Clear` now aggregate stale-remove
+  failures alongside the write errors (still best-effort every delete,
+  still reloading whatever DID change) and return a joined error, so a
+  stale unit that cannot be removed FAILS THE COMMIT. Distinct from #2987
+  (write failure) and #2988 (empty-set skip), neither of which surfaced a
+  delete failure.
 - **A failed reload/reconfigure owes activation debt (#4954).** The
   generated files are written to disk BEFORE `networkctl reload` runs, so
   a reload that fails leaves the kernel running the pre-failure config
