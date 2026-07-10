@@ -1033,6 +1033,14 @@ func (c *CLI) showRoutingInstances(detail bool) error {
 					fmt.Printf("    %s -> discard\n", sr.Destination)
 					continue
 				}
+				// #4908 (C175-HC-129): a next-table static route has no
+				// NextHops, so it counted toward "Static routes: N" above but
+				// emitted no row. Render it so the printed rows account for the
+				// count.
+				if sr.NextTable != "" {
+					fmt.Printf("    %s -> next-table %s\n", sr.Destination, sr.NextTable)
+					continue
+				}
 				for _, nh := range sr.NextHops {
 					nhStr := nh.Address
 					if nh.Interface != "" {

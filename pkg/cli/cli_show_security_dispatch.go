@@ -77,6 +77,24 @@ func policyDetailState(schedulerName string, activeState map[string]bool, haveSc
 	return "enabled"
 }
 
+// validatePolicyZoneFilter rejects a malformed from-zone/to-zone selector: a
+// keyword with no following zone value (e.g. "... from-zone trust to-zone").
+// The prior loose parse silently dropped the dangling predicate and returned a
+// broader/one-sided policy inventory (#4908 / C175-HC-116/126 cohort), matching
+// the tighter parse already required by the policy simulator.
+func validatePolicyZoneFilter(args []string) error {
+	for i := 0; i < len(args); i++ {
+		if args[i] != "from-zone" && args[i] != "to-zone" {
+			continue
+		}
+		if i+1 >= len(args) || args[i+1] == "from-zone" || args[i+1] == "to-zone" {
+			return fmt.Errorf("missing zone name after %q", args[i])
+		}
+		i++ // skip the consumed value
+	}
+	return nil
+}
+
 // parsePolicyZoneFilter extracts from-zone/to-zone filters from args.
 func parsePolicyZoneFilter(args []string) (fromZone, toZone string) {
 	for i := 0; i < len(args)-1; i++ {
@@ -203,6 +221,9 @@ func (c *CLI) handleShowSecurity(args []string) error {
 
 	case "policies":
 		// Parse optional zone-pair filter: from-zone X to-zone Y
+		if err := validatePolicyZoneFilter(args[1:]); err != nil {
+			return err
+		}
 		fromZone, toZone := parsePolicyZoneFilter(args[1:])
 		// "show security policies global" — only show global policies
 		globalOnly := len(args) >= 2 && args[1] == "global"

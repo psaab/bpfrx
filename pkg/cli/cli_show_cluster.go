@@ -224,15 +224,33 @@ func (c *CLI) showChassisClusterStatus() error {
 			if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
 				continue
 			}
-			for _, iface := range zone.Interfaces {
-				ifCfg, ok := cfg.Interfaces.Interfaces[iface]
+			for _, ifaceRef := range zone.Interfaces {
+				// #4908 (C175-HC-116): a zone binds a LOGICAL interface such as
+				// "ge-0/0/0.0" or "reth0.50", but cfg.Interfaces.Interfaces is
+				// keyed by the BASE interface name ("ge-0/0/0" / "reth0"). The
+				// prior direct lookup missed every unit-qualified reference and
+				// silently dropped its VRRP rows. Split off the unit suffix,
+				// look up the base, and (when a unit was named) show only that
+				// unit's groups.
+				base := ifaceRef
+				wantUnit := -1
+				if parts := strings.SplitN(ifaceRef, ".", 2); len(parts) == 2 {
+					base = parts[0]
+					if u, err := strconv.Atoi(parts[1]); err == nil {
+						wantUnit = u
+					}
+				}
+				ifCfg, ok := cfg.Interfaces.Interfaces[base]
 				if !ok {
 					continue
 				}
 				for _, unit := range ifCfg.Units {
+					if wantUnit >= 0 && unit.Number != wantUnit {
+						continue
+					}
 					for addr, vg := range unit.VRRPGroups {
 						fmt.Printf("VRRP on %s.%d: group %d, priority %d, VIP %s, address %s\n",
-							iface, unit.Number, vg.ID, vg.Priority,
+							base, unit.Number, vg.ID, vg.Priority,
 							strings.Join(vg.VirtualAddresses, ","), addr)
 					}
 				}
