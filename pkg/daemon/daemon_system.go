@@ -1090,8 +1090,15 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 		// Set SSH authorized keys. An EMPTY configured key list takes the else
 		// branch below and REVOKES any xpf-managed authorized_keys (#5106).
 		if len(user.SSHKeys) > 0 {
-			homeDir := fmt.Sprintf("/home/%s", user.Name)
-			sshDir := homeDir + "/.ssh"
+			// Derive the .ssh dir from the SAME homeBaseDir seam the emptied-key
+			// removal branch below uses (managedAuthorizedKeysPath), so the key
+			// WRITE and the key REMOVE resolve the same path by construction
+			// instead of via two independent expressions. In production
+			// homeBaseDir is "/home", so this is byte-identical to the previous
+			// fmt.Sprintf("/home/%s", user.Name); the seam only lets a test point
+			// the home base at a throwaway tree to exercise this branch — and its
+			// chown `--` guard below — hermetically (#5026).
+			sshDir := filepath.Dir(managedAuthorizedKeysPath(user.Name))
 
 			// Resolve the owner FIRST (cgo-free /etc/passwd parse). The user
 			// was created above, so it resolves. If it does not, abort the
