@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -112,13 +113,18 @@ func natCounterIDForKey(ruleKey string) uint32 {
 // surfaces through Manager.ReadNATRuleCounter (#2218). The natType prefix keeps
 // same-named rules across SNAT/DNAT/static from colliding on one counter ID.
 //
-// Collisions: two distinct keys can in principle hash to the same id. That is
-// resolved deterministically (re-hash with a "#N" suffix until free within
-// this compile) so each rule still gets a unique counter; the resolution is a
-// pure function of the colliding keys, so it is reproduced identically on every
-// compile. When the number of distinct counters reaches MaxNATRuleCounters the
-// rule falls back to counter 0 (no per-rule attribution) and a warning is
-// logged, preserving the historical exhaustion contract.
+// Collisions: two distinct keys can in principle hash to the same id. This
+// streaming pass gives each key a provisional unique id (re-hash with a "#N"
+// suffix until free) so the vestigial per-rule stamp and the exhaustion count
+// stay correct, but the winner of a contested BASE id here depends on which key
+// was compiled first — a compile-order dependence that a harmless config
+// reorder would expose (#5099). finalizeNATCounterIDs re-derives the
+// AUTHORITATIVE result.NATCounterIDs map in a stable sorted order after all NAT
+// phases run, so the id a rule ends up with is a pure function of the rule key
+// set, independent of traversal order. When the number of distinct counters
+// reaches MaxNATRuleCounters the rule falls back to counter 0 (no per-rule
+// attribution) and a warning is logged, preserving the historical exhaustion
+// contract.
 func assignNATCounterID(result *CompileResult, natType, ruleSet, rule string) uint32 {
 	ruleKey := NATCounterKey(natType, ruleSet, rule)
 	if existing, ok := result.NATCounterIDs[ruleKey]; ok {
@@ -154,6 +160,59 @@ func natCounterIDInUse(result *CompileResult, ruleKey string, counterID uint32) 
 		}
 	}
 	return false
+}
+
+// finalizeNATCounterIDs makes the per-rule NAT counter ID assignment
+// independent of compile/traversal order (#5099). It MUST run once after every
+// NAT phase that calls assignNATCounterID (SNAT, DNAT, static NAT) so it sees
+// the full key set.
+//
+// assignNATCounterID resolves a distinct-key base-hash collision by bumping
+// whichever colliding key it happens to visit SECOND to a "#N" re-hash. That
+// makes the loser a function of visit order: for two keys that share a base id,
+// the first-compiled key claims the base id and the second is bumped, so a
+// harmless config reorder swaps their ids — contradicting the stable-identity
+// contract (id = f(rule identity), never f(identity, already-visited)). Because
+// the Rust helper keeps cumulative counters keyed by numeric id across
+// reconcile, the swapped pair would read each other's history.
+//
+// This pass re-derives the id for every key that received a real counter by
+// walking the keys in a STABLE lexicographic order and applying the SAME
+// per-key "#N" re-hash probe assignNATCounterID uses. Sorting removes the
+// visit-order dependence: among keys sharing a base id the lexicographically
+// smallest keeps the base id and the rest probe deterministically, so the same
+// SET of keys always yields the same assignment regardless of the order the
+// rules compiled in. Exhausted keys (id 0, no per-rule attribution) are left
+// untouched — exhaustion selection is a separate, config-order concern.
+func finalizeNATCounterIDs(result *CompileResult) {
+	if len(result.NATCounterIDs) == 0 {
+		return
+	}
+	// Collect the keys that received a real counter; sort for a traversal-order
+	// independent assignment.
+	keys := make([]string, 0, len(result.NATCounterIDs))
+	for k, id := range result.NATCounterIDs {
+		if id != 0 {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	used := make(map[uint32]struct{}, len(keys))
+	for _, k := range keys {
+		id := natCounterIDForKey(k)
+		for attempt := 1; ; attempt++ {
+			if _, taken := used[id]; !taken {
+				break
+			}
+			id = natCounterIDForKey(fmt.Sprintf("%s#%d", k, attempt))
+			if id == 0 {
+				id = 1
+			}
+		}
+		used[id] = struct{}{}
+		result.NATCounterIDs[k] = id
+	}
 }
 
 func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
