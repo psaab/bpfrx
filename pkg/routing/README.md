@@ -60,6 +60,25 @@ A no-op commit (identical VPN set) issues zero `LinkDel` and zero
 `LinkAdd`. `Clear()` (shutdown / full teardown) still deletes every
 tracked interface.
 
+**Fail-closed on genuine create/up/delete failure (#5310).** `Apply` used
+to log every `LinkAdd` / find-after-create / `LinkSetUp` / `LinkDel`
+failure and return `nil` **unconditionally**, so a route-based IPsec VPN
+whose xfrmi could not be realized in the kernel (e.g. `LinkAdd` failed)
+reported a **successful commit** while the interface — and the routes
+bound to it — carried no traffic (fail-open false convergence). `Apply`
+now accumulates the **genuine** netlink failures with `errors.Join` and
+returns them (mirroring the #4823 bond create path and the #4901
+`clearLocked` teardown path) so `pkg/daemon` fails the commit closed. The
+tolerated idempotent conditions stay **non-errors**: an xfrmi that already
+exists is adopted via the `LinkByName` path (re-tracked + brought up =
+success, never a `LinkAdd`), and an already-gone delete returns `nil` from
+`deleteLocked`. A created-but-not-brought-up xfrmi stays **tracked** (we
+own the kernel link) so the next reconcile re-attempts the `LinkSetUp`; a
+failed `LinkAdd` leaves it **untracked** for a clean retry. A
+stale-`if_id` delete that fails skips the recreate this cycle (avoids an
+`EEXIST` `LinkAdd`) and surfaces the error, matching the #5119 bond
+changed-signature path.
+
 ### Bond (fabric/ae LAG) reconcile (#5119)
 
 `bondManager.Apply` is called by `pkg/daemon` on **every** config commit

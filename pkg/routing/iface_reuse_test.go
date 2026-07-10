@@ -38,6 +38,16 @@ type fakeLinkOps struct {
 	// removal-retention tests).
 	delFail map[string]error
 
+	// addFail[name] makes LinkAdd fail with a GENUINE (non-EEXIST) error for
+	// that link name — models a real netlink create failure (EPERM / ENOBUFS
+	// / EOPNOTSUPP) as opposed to the idempotent addExisting EEXIST. Drives the
+	// #5310 fail-closed create-failure tests.
+	addFail map[string]error
+
+	// upFail[name] makes LinkSetUp fail for that link name (#5310 bring-up
+	// fail-closed tests).
+	upFail map[string]error
+
 	// addrDelFail["name|ipnet"] makes AddrDel fail for that address on
 	// that link (#1884 link-local retention tests).
 	addrDelFail map[string]error
@@ -79,6 +89,8 @@ func newFakeLinkOps() *fakeLinkOps {
 		byNameCount:   map[string]int{},
 		hiddenUntil:   map[string]int{},
 		delFail:       map[string]error{},
+		addFail:       map[string]error{},
+		upFail:        map[string]error{},
 		addrDelFail:   map[string]error{},
 		addrListFail:  map[string]error{},
 		byNameHardErr: map[string]error{},
@@ -107,6 +119,10 @@ func (f *fakeLinkOps) LinkByName(name string) (netlink.Link, error) {
 }
 
 func (f *fakeLinkOps) LinkAdd(l netlink.Link) error {
+	if err, ok := f.addFail[l.Attrs().Name]; ok {
+		// Genuine (non-EEXIST) create failure: the link is NOT recorded.
+		return err
+	}
 	if f.addExisting {
 		return errors.New("file exists")
 	}
@@ -129,7 +145,10 @@ func (f *fakeLinkOps) LinkDel(l netlink.Link) error {
 func (f *fakeLinkOps) LinkSetUp(l netlink.Link) error {
 	// Mirror the real netlink handle: dereferencing a nil link panics.
 	// A correct caller never passes nil here.
-	_ = l.Attrs()
+	name := l.Attrs().Name
+	if err, ok := f.upFail[name]; ok {
+		return err
+	}
 	f.setUpLinks = append(f.setUpLinks, l)
 	return nil
 }

@@ -49,9 +49,29 @@ type xfrmManager struct {
 //
 // A no-op commit (identical VPN set) issues zero LinkDel and zero
 // LinkAdd calls.
+//
+// Fail-closed error contract (#5310). Apply used to log every create /
+// find-after-create / bring-up / delete failure and return nil
+// UNCONDITIONALLY, so a route-based IPsec VPN whose xfrmi could not be
+// realized in the kernel (e.g. LinkAdd failed) reported a SUCCESSFUL
+// commit while the interface — and the routes bound to it — carried no
+// traffic. Apply now accumulates the GENUINE netlink failures with
+// errors.Join and returns them (mirroring the #4823 bond create path and
+// the #4901 clearLocked teardown path) so daemon_apply.go can fail the
+// commit closed. The tolerated idempotent conditions are NOT errors: an
+// xfrmi that already exists is adopted via the LinkByName path below
+// (re-tracked + brought up = success, never a LinkAdd), and an
+// already-gone delete returns nil from deleteLocked (#4901). Only a real
+// failure (LinkAdd/LinkSetUp/find-after-create/LinkDel failed for a real
+// reason) becomes a returned error.
 func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
+
+	// errs accumulates GENUINE reconcile failures (create/find/up/delete)
+	// so the commit fails closed (#5310). Tolerated idempotent conditions
+	// (adopt an existing link, delete an already-gone link) never append.
+	var errs []error
 
 	if x.xfrmis == nil {
 		x.xfrmis = map[string]uint32{}
@@ -121,8 +141,12 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		}
 		// Differential reconcile: a failed LinkDel now retains tracking (#4901)
 		// so the next Apply retries; the recreate below still runs for a desired
-		// name whose if_id changed.
-		_ = x.deleteLocked(name)
+		// name whose if_id changed. #5310: surface a genuine LinkDel failure
+		// (deleteLocked returns nil for an already-gone link — that stays a
+		// tolerated no-op).
+		if err := x.deleteLocked(name); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	// Reconcile each desired xfrmi against the kernel. After the delete
@@ -152,12 +176,24 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			if xi, ok := link.(*netlink.Xfrmi); ok && xi.Ifid != ifID {
 				slog.Info("xfrmi has stale if_id, recreating",
 					"name", ifName, "have", xi.Ifid, "want", ifID)
-				_ = x.deleteLocked(ifName)
+				// #5310: if the stale-if_id delete fails the kernel link is
+				// still present with the wrong if_id, so a LinkAdd below would
+				// EEXIST — skip the recreate this cycle (mirroring the #5119
+				// bond changed-signature path) and surface the delete failure so
+				// the commit fails closed; the next reconcile retries the delete.
+				if err := x.deleteLocked(ifName); err != nil {
+					errs = append(errs, err)
+					continue
+				}
 				// Fall through to the LinkAdd create path below.
 			} else {
 				if upErr := x.ops.LinkSetUp(link); upErr != nil {
 					slog.Warn("failed to bring up existing xfrmi",
 						"name", ifName, "err", upErr)
+					// A genuine bring-up failure on an adopted link is surfaced
+					// (#5310), but the link exists and we own it, so it stays
+					// tracked and the next reconcile re-attempts bring-up.
+					errs = append(errs, fmt.Errorf("bring up existing xfrmi %s: %w", ifName, upErr))
 				}
 				if tracked {
 					slog.Debug("xfrmi unchanged, reused", "name", ifName, "if_id", ifID)
@@ -179,6 +215,11 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		if err := x.ops.LinkAdd(xfrmi); err != nil {
 			slog.Warn("failed to create xfrmi",
 				"name", ifName, "if_id", ifID, "err", err)
+			// #5310: a genuine create failure leaves the interface UNTRACKED
+			// (the next reconcile retries) and fails the commit closed — a
+			// route-based VPN bound to an xfrmi that never made it into the
+			// kernel must not report a successful commit.
+			errs = append(errs, fmt.Errorf("create xfrmi %s (if_id %d): %w", ifName, ifID, err))
 			continue
 		}
 
@@ -186,19 +227,24 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		if err != nil {
 			slog.Warn("failed to find xfrmi after creation",
 				"name", ifName, "err", err)
+			errs = append(errs, fmt.Errorf("find xfrmi %s after creation: %w", ifName, err))
 			continue
 		}
 
 		if err := x.ops.LinkSetUp(link); err != nil {
 			slog.Warn("failed to bring up xfrmi",
 				"name", ifName, "err", err)
+			// The link was created and is tracked below; surface the bring-up
+			// failure (#5310) so the commit fails closed and the next reconcile
+			// re-attempts the LinkSetUp.
+			errs = append(errs, fmt.Errorf("bring up xfrmi %s: %w", ifName, err))
 		}
 
 		slog.Info("xfrmi created", "name", ifName, "if_id", ifID)
 		x.xfrmis[ifName] = ifID
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // Clear removes all previously created xfrmi interfaces.
