@@ -340,6 +340,26 @@ func (m *Manager) recordSessionMirrorFailureLocked(err error) {
 	}
 }
 
+// recordSessionMirrorSuccessLocked clears the sticky session-mirror failure
+// state after a genuinely successful mirror IPC to the helper (#5247). The
+// flag means "the helper session control socket last failed"; it is set on any
+// mirror failure and gates HA takeover-readiness (takeoverReadyLocked), but was
+// previously cleared ONLY on a helper process restart (see stopLocked). A
+// single transient control-socket failure during bulk session sync therefore
+// latched the standby "not takeover-ready" until the helper respawned. Since
+// the flag tracks socket health — not "every session is mirrored" — one proven
+// mirror is sufficient to declare the socket healthy again, so a later success
+// self-heals the state without a restart. No-op when the helper is not running:
+// syncSession{V4,V6}Locked returns nil without sending in that case, so there
+// was no real mirror to prove health (and stopLocked already cleared the flag).
+func (m *Manager) recordSessionMirrorSuccessLocked() {
+	if m.proc == nil {
+		return
+	}
+	m.sessionMirrorFailed = false
+	m.sessionMirrorErr = ""
+}
+
 func (m *Manager) hasActiveDataRGLocked() bool {
 	for _, group := range m.haGroups {
 		if group.RGID > 0 && group.Active {
@@ -937,6 +957,10 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 		slog.Debug("userspace: session mirror failed", "err", err)
 		return fmt.Errorf("mirror synced v4 session to userspace helper: %w", err)
 	}
+	// A successful mirror proves the helper session socket is healthy again;
+	// clear any sticky failure so the standby regains takeover-readiness
+	// without waiting for a helper restart (#5247).
+	m.recordSessionMirrorSuccessLocked()
 	return nil
 }
 
@@ -1003,6 +1027,10 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 		slog.Debug("userspace: session mirror failed", "err", err)
 		return fmt.Errorf("mirror synced v6 session to userspace helper: %w", err)
 	}
+	// A successful mirror proves the helper session socket is healthy again;
+	// clear any sticky failure so the standby regains takeover-readiness
+	// without waiting for a helper restart (#5247).
+	m.recordSessionMirrorSuccessLocked()
 	return nil
 }
 
