@@ -113,12 +113,19 @@ FlowSet. With the #2613 drop, the #2749 re-adds of `ingressInterface`
 body + 2 src/dst mask + 4 ingressInterface + 7 CoS/egress + 16 biflow
 reverse + 12 post-NAT) and the IPv6 record is 134 bytes (69 + 2 + 4 + 7 + 16
 + 36); the NetFlow v9 record
-sizes derive from the template via `recordSize` (4-byte padded, 64 v4 / 112
-v6 — NetFlow `tcpFlags` is 1B not 2B; v9 carries no reverse element), so they
-track the template automatically. #3270: with `export-extension flow-dir` the
-templates splice in `flowDirection` (IE 61, 1B) before the post-NAT trailer —
-the IPFIX record grows to 87 (v4) / 135 (v6); the v9 record absorbs the byte
-into its existing 4-byte padding (`ipfixRecordSize(isV6, includeDir)` /
+sizes derive from the template via `recordSize` — the plain sum of the field
+lengths, 61 v4 / 109 v6 (NetFlow `tcpFlags` is 1B not 2B; v9 carries no reverse
+element), so they track the template automatically. **#4896: a v9 data record
+is NOT per-record padded.** Records are contiguous at the template-advertised
+width (RFC 3954); only the enclosing Data FlowSet is rounded up ONCE to a 32-bit
+boundary (`dataFlowSetLen`), matching how the IPFIX sibling
+(`ipfixRecordSize`/`ipfixDataSetLen`) already encodes. An earlier `recordSize`
+padded each record to 4 bytes while the template still advertised the unpadded
+width, so a standards-compliant collector — walking by the template width —
+misdecoded every record after the first in a multi-record FlowSet. #3270: with
+`export-extension flow-dir` the templates splice in `flowDirection` (IE 61, 1B)
+before the post-NAT trailer — the IPFIX record grows to 87 (v4) / 135 (v6); the
+v9 record grows to 62 (v4) / 110 (v6) (`ipfixRecordSize(isV6, includeDir)` /
 `buildTemplateFieldsV4/V6` carry the flag).
 The init-time
 assertion in `ipfix.go` pins the BASE `ipfixRecordSizeV4/V6` to the sum of their

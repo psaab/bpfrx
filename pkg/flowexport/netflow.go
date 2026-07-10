@@ -226,15 +226,25 @@ func buildTemplateFieldsV6(opts V9TemplateOptions) []templateField {
 	return netflowTemplateFieldsV6
 }
 
-// recordSize computes the data record size from template fields, padded to 4 bytes.
+// recordSize computes the data record size from template fields: the plain
+// sum of the field lengths, with NO per-record padding.
+//
+// This is deliberately the UNPADDED width — it equals what the template FlowSet
+// advertises (each field's real fieldLen) and therefore the stride a
+// standards-compliant collector uses to walk consecutive records. Per RFC 3954
+// a Data FlowSet's records are contiguous at the template-advertised width;
+// only the ENCLOSING FlowSet may carry terminal padding to a 32-bit boundary
+// (added once in dataFlowSetLen). Padding each record here (the #4896 bug) put
+// 2-3 zero bytes between records while the template still advertised the
+// unpadded width, so every record after the first was misdecoded by the
+// collector. The IPFIX sibling (ipfixRecordSize / ipfixDataSetLen) already uses
+// the exact template width with no per-record padding; this restores parity.
 func recordSize(fields []templateField) int {
 	size := 0
 	for _, f := range fields {
 		size += int(f.fieldLen)
 	}
-	// Pad to 4-byte boundary
-	pad := (4 - size%4) % 4
-	return size + pad
+	return size
 }
 
 // nfHeader is the 20-byte NetFlow v9 packet header.
@@ -323,6 +333,11 @@ func netflowTemplateConfig(isV6 bool, opts V9TemplateOptions) (uint16, []templat
 	return templateIDv4, fields, recordSize(fields)
 }
 
+// dataFlowSetLen is the on-wire length of a Data FlowSet: the 4-byte FlowSet
+// header plus recordCount CONTIGUOUS records (each recSize = the unpadded
+// template width), rounded up ONCE to a 32-bit boundary. That final rounding is
+// the RFC 3954 terminal FlowSet padding — the only padding a v9 Data FlowSet
+// may carry — and it is included in the FlowSet Length field the encoder writes.
 func dataFlowSetLen(recordCount, recSize int) int {
 	totalLen := 4 + recordCount*recSize
 	pad := (4 - totalLen%4) % 4
@@ -793,9 +808,12 @@ func (e *Exporter) sendRecords(records []FlowRecord) {
 		tmplID = templateIDv4
 	}
 
-	// Split into chunks that fit in maxPayload
-	// Reserve 20 bytes for header + 4 bytes for flowset header
-	maxRecords := (maxPayload - 20 - 4) / recSize
+	// Split into chunks that fit in maxPayload.
+	// Reserve 20 bytes for the v9 header + 4 bytes for the FlowSet header + up
+	// to 3 bytes for the RFC 3954 terminal FlowSet padding (recSize is now the
+	// unpadded record width, so dataFlowSetLen may round the set up by up to 3
+	// bytes — reserving them here keeps 20+dataLen <= maxPayload).
+	maxRecords := (maxPayload - 20 - 4 - 3) / recSize
 	if maxRecords < 1 {
 		maxRecords = 1
 	}

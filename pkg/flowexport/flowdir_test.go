@@ -90,8 +90,8 @@ func TestV9TemplateFlowDirConditionalEncode(t *testing.T) {
 		}
 		fs := encodeDataFlowSet([]FlowRecord{flowDirRecord(tc.v6, 1)}, boot, opts)
 		recSize := recordSize(fields)
-		if len(fs) != 4+recSize {
-			t.Fatalf("%s: flowset len = %d, want %d", tc.name, len(fs), 4+recSize)
+		if wantLen := dataFlowSetLen(1, recSize); len(fs) != wantLen {
+			t.Fatalf("%s: flowset len = %d, want %d", tc.name, len(fs), wantLen)
 		}
 		if got := fs[4+dirOff]; got != 1 {
 			t.Errorf("%s: encoded flowDirection = 0x%02x, want 0x01 (encoder write reverted)", tc.name, got)
