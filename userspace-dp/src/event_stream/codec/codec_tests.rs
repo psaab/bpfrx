@@ -300,6 +300,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         0xB8,            // #2749: src ToS (DSCP EF=46 << 2)
         0x13,            // #2749: TCP control bits (SYN|FIN|ACK)
         9,               // #2749: egress ifindex
+        0xA1B2_C3D4_E5F6_0708, // #4915: stable session id (rides [152:160])
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -362,12 +363,20 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
     // control bits, [148:152] egress ifindex (LE). Reverting the encoder to
     // drop these makes the NetFlow/IPFIX close record report 0 for srcTos /
     // tcpControlBits / egressInterface again (the #2613 regression #2749
-    // fixes). The payload itself must be 152 bytes.
-    assert_eq!(SECURITY_EVENT_PAYLOAD_SIZE, 152);
-    assert_eq!(p.len(), 152);
+    // fixes). The payload itself must be 160 bytes (#4915 grew it 152 -> 160).
+    assert_eq!(SECURITY_EVENT_PAYLOAD_SIZE, 160);
+    assert_eq!(p.len(), 160);
     assert_eq!(p[144], 0xB8); // src ToS
     assert_eq!(p[145], 0x13); // TCP control bits
     assert_eq!(u32::from_le_bytes(p[148..152].try_into().unwrap()), 9); // egress ifindex
+    // #4915 fail-on-revert: the stable session id rides the additive [152:160]
+    // slot (LE u64), exactly where the Go logging decoder reads it into
+    // EventRecord.SessionID. Reverting the encoder makes RT_FLOW SESSION_CREATE
+    // and SESSION_CLOSE carry no correlatable id again.
+    assert_eq!(
+        u64::from_le_bytes(p[152..160].try_into().unwrap()),
+        0xA1B2_C3D4_E5F6_0708
+    ); // stable session id
     assert_eq!(
         u64::from_le_bytes(p[0..8].try_into().unwrap()),
         1_700_000_123_000_000_000
@@ -430,6 +439,7 @@ fn test_encode_session_close_rt_flow_v6() {
         0,     // #2749: src ToS
         0,     // #2749: TCP control bits
         0,     // #2749: egress ifindex
+        0,     // #4915: stable session id
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -479,6 +489,7 @@ fn test_session_close_rt_flow_log_gate_byte() {
             0, // #2749: src ToS
             0, // #2749: TCP control bits
             0, // #2749: egress ifindex
+            0, // #4915: stable session id
         )
     };
     let gated_off = mk(false);
@@ -520,10 +531,12 @@ fn test_session_create_rt_flow_wire_layout() {
         42, // #3056: admitting policy id
         77, // #2615: ingress ifindex
         9,  // #2615: application id
+        0x1122_3344_5566_7788, // #4915: stable session id (rides [152:160])
     );
     assert_eq!(frame.data[4], MSG_SESSION_CREATE_RT_FLOW);
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p.len(), SECURITY_EVENT_PAYLOAD_SIZE);
+    assert_eq!(SECURITY_EVENT_PAYLOAD_SIZE, 160);
     // event type = SESSION_OPEN (1) so the Go formatter emits SESSION_CREATE.
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_OPEN);
     assert_eq!(p[52], 1, "must equal the Go eventTypeSessionOpen value");
@@ -554,6 +567,14 @@ fn test_session_create_rt_flow_wire_layout() {
     // from. Reverting the encoder to leave [44:48] 0 makes the create record
     // log policy 0 (the first configured policy) and this assertion fail.
     assert_eq!(u32::from_le_bytes(p[44..48].try_into().unwrap()), 42);
+    // #4915 fail-on-revert: the SESSION_CREATE frame carries the stable session
+    // id in the additive [152:160] slot (LE u64), the SAME slot and value its
+    // eventual SESSION_CLOSE will carry. Reverting the encoder leaves the create
+    // record with no correlatable session id.
+    assert_eq!(
+        u64::from_le_bytes(p[152..160].try_into().unwrap()),
+        0x1122_3344_5566_7788
+    );
 }
 
 #[test]
@@ -972,6 +993,7 @@ fn test_close_flags() {
         counters: crate::session::SessionCounters::default(),
         observed_tos: 0,
         observed_tcp_flags: 0,
+        session_id: 0,
     };
     let flags = close_flags(&delta);
     assert_eq!(flags & FLAG_FABRIC_REDIRECT, FLAG_FABRIC_REDIRECT);

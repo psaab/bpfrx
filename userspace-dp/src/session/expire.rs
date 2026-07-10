@@ -369,6 +369,11 @@ impl SessionTable {
                                 // and TCP-flags values.
                                 observed_tos: removed.observed_tos,
                                 observed_tcp_flags: removed.observed_tcp_flags,
+                                // #4915: harvest the stable session id off the
+                                // expiring entry so the SESSION_CLOSE RT_FLOW
+                                // frame carries the SAME id this session's
+                                // SESSION_CREATE did — the correlatable key.
+                                session_id: removed.session_id,
                             });
                         }
                         expired_entries.push(ExpiredSession {

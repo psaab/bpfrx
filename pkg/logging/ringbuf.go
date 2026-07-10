@@ -101,6 +101,19 @@ const (
 	rawEventTOSOffset    = 144
 	rawEventTCPBitOffset = 145
 	rawEventEgressOffset = 148
+	// #4915: the EXTENDED SESSION_CREATE/SESSION_CLOSE frame grew 152 -> 160 to
+	// carry the dataplane's STABLE session id (LE u64) at [152:160]. The
+	// userspace-dp encoders (encode_session_create_rt_flow /
+	// encode_session_close_rt_flow) stamp the same id a session's create and
+	// close records share, so a SIEM can join them and disambiguate a reused
+	// 5-tuple. The growth is ADDITIVE with the same both-sides discipline as the
+	// #2749 [144:152] block: the minimum-frame acceptance stays at
+	// rawEventWireSize (144), and the slot is read ONLY when the frame carries it
+	// (len >= rawEventSessionIDSize) AND only on a SESSION_CREATE/CLOSE, so a
+	// short legacy (<= 152-byte) frame degrades to SessionID 0 ("unknown") rather
+	// than misparsing. Both rolling-upgrade directions stay safe.
+	rawEventSessionIDSize   = 160
+	rawEventSessionIDOffset = 152
 )
 
 var _ [rawEventWireSize]struct{} = [rawEventStructSize]struct{}{}
@@ -221,7 +234,7 @@ type EventReader struct {
 	ifNames       map[uint32]string // ifindex -> interface name
 	appNamesMu    sync.RWMutex
 	appNames      map[uint16]string // app_id -> application name
-	sessionSeq    uint64            // monotonic session ID counter
+	sessionSeq    uint64            // #4915: per-EVENT monotonic ordinal (EventSeq), NOT a session id
 }
 
 // NewEventReader creates a new event reader for the given event source.
@@ -626,8 +639,25 @@ func (er *EventReader) logEvent(data []byte) {
 		rec.PolicyName = er.resolvePolicyName(rec.PolicyID)
 	}
 
-	// Assign monotonic session ID
-	rec.SessionID = atomic.AddUint64(&er.sessionSeq, 1)
+	// #4915: stamp the per-EVENT monotonic ordinal into EventSeq (it increments
+	// on every event, session or not). SessionID becomes the dataplane's STABLE
+	// per-session identity ONLY for a SESSION_CREATE / SESSION_CLOSE frame that
+	// carries the additive [152:160] slot (len >= 160), so a session's create and
+	// close records correlate and a reused 5-tuple is disambiguated. For every
+	// other event (deny/screen/filter — which have no session) AND for a short
+	// legacy session frame from a pre-#4915 helper (len < 160), SessionID falls
+	// back to the per-event ordinal, byte-identical to the pre-#4915 behavior.
+	// This keeps the change strictly additive on the wire: nothing observable
+	// changes until a new helper emits a 160-byte session frame, at which point
+	// its create and close carry the same real id.
+	rec.EventSeq = atomic.AddUint64(&er.sessionSeq, 1)
+	if (evt.EventType == eventTypeSessionOpen || evt.EventType == eventTypeSessionClose) &&
+		len(data) >= rawEventSessionIDSize {
+		rec.SessionID = binary.LittleEndian.Uint64(
+			data[rawEventSessionIDOffset : rawEventSessionIDOffset+8])
+	} else {
+		rec.SessionID = rec.EventSeq
+	}
 
 	// #2508: per-policy RT_FLOW SYSLOG gate. The userspace-dp
 	// SESSION_CREATE/SESSION_CLOSE frames carry a "should-log-to-syslog"
@@ -946,6 +976,17 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 	}
 	if evt.EventType == eventTypeScreenDrop {
 		rec.ScreenCheck = screenFlagName(evt.PolicyID)
+	}
+	// #4915: the dataplane's stable session id rides the additive [152:160] slot
+	// on a SESSION_CREATE / SESSION_CLOSE frame. Read it ONLY when the frame
+	// carries the extended length (len >= rawEventSessionIDSize) AND only on a
+	// session frame, so a short legacy (<= 152-byte) frame or a non-session event
+	// leaves SessionID at its 0 ("unknown") default. This is the SAME id the
+	// live logEvent path decodes, so the two producers stay in lockstep.
+	if (evt.EventType == eventTypeSessionOpen || evt.EventType == eventTypeSessionClose) &&
+		len(data) >= rawEventSessionIDSize {
+		rec.SessionID = binary.LittleEndian.Uint64(
+			data[rawEventSessionIDOffset : rawEventSessionIDOffset+8])
 	}
 	return rec, true
 }

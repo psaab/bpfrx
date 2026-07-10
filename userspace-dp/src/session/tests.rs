@@ -231,6 +231,71 @@ fn session_expire_removes_stale_entries() {
     assert_eq!(deltas[0].key, key);
 }
 
+// #4915 RED-on-revert: the STABLE session id must be (a) non-zero for a real
+// session (0 is the "unknown" wire sentinel), (b) DISTINCT for two concurrent
+// sessions (so a reused 5-tuple is disambiguated), and (c) IDENTICAL across a
+// session's Open and Close deltas — the correlatable key the RT_FLOW
+// SESSION_CREATE / SESSION_CLOSE frames stamp at [152:160]. Reverting the id
+// allocation or the delta threading flips these RED.
+#[test]
+fn session_id_is_stable_across_open_and_close() {
+    let mut table = SessionTable::new();
+    let a = key_v4(); // TCP
+    let b = key_v6(); // UDP
+    let t0 = 1_000_000_000u64;
+
+    // Two distinct concurrent sessions get distinct, non-zero ids.
+    assert!(table.install_with_protocol(a.clone(), decision(), metadata(), t0, PROTO_TCP, 0));
+    assert!(table.install_with_protocol(b.clone(), decision(), metadata(), t0, PROTO_UDP, 0));
+    let opens = table.drain_deltas(8);
+    assert_eq!(opens.len(), 2);
+    let a_open_id = opens.iter().find(|d| d.key == a).expect("a open").session_id;
+    let b_open_id = opens.iter().find(|d| d.key == b).expect("b open").session_id;
+    assert_ne!(a_open_id, 0, "a real session id must never be 0");
+    assert_ne!(b_open_id, 0, "a real session id must never be 0");
+    assert_ne!(
+        a_open_id, b_open_id,
+        "two concurrent sessions must get distinct ids"
+    );
+
+    // The Close delta for the UDP session `b` (reaped on the ~120 s idle window,
+    // mirroring session_expire_removes_stale_entries) carries the SAME id its
+    // Open delta did — the create/close correlation this change restores.
+    table.last_gc_ns = t0 + 118_000_000_000;
+    let expired = table.expire_stale(t0 + 120_000_000_000);
+    assert_eq!(expired, 1);
+    let closes: Vec<_> = table
+        .drain_deltas(8)
+        .into_iter()
+        .filter(|d| d.kind == SessionDeltaKind::Close)
+        .collect();
+    let b_close = closes.iter().find(|d| d.key == b).expect("b close");
+    assert_eq!(
+        b_close.session_id, b_open_id,
+        "SESSION_CLOSE must carry the same stable id as its SESSION_CREATE"
+    );
+}
+
+// #4915: the session id namespaces the worker in the high 16 bits so ids are
+// unique across the node's shared-nothing per-worker session tables; the low 48
+// bits are a per-worker counter starting at 1.
+#[test]
+fn session_id_namespaces_worker_in_high_bits() {
+    let mut table = SessionTable::new();
+    table.set_worker_id(3);
+    let t0 = 1_000_000_000u64;
+    assert!(table.install_with_protocol(key_v4(), decision(), metadata(), t0, PROTO_TCP, 0));
+    let opens = table.drain_deltas(8);
+    assert_eq!(opens.len(), 1);
+    let id = opens[0].session_id;
+    assert_eq!(id >> 48, 3, "worker id must occupy the high 16 bits");
+    assert_eq!(
+        id & 0x0000_FFFF_FFFF_FFFF,
+        1,
+        "the first session's per-worker counter starts at 1"
+    );
+}
+
 // === #4380 symmetric idle-timer (forward↔reverse companion) tests =========
 //
 // A flow is TWO independent entries that age independently. Junos measures a
@@ -3342,6 +3407,7 @@ fn reference_update_session(
             counters: SessionCounters::default(),
             observed_tos: 0,
             observed_tcp_flags: 0,
+            session_id: 0,
         });
     }
     true
@@ -3402,11 +3468,22 @@ fn assert_tables_equiv(
         sorted_keys(reference.owner_rg_session_keys(owner_rgs)),
         "owner_rg_session_keys diverged"
     );
-    assert_eq!(
-        inplace.drain_deltas(256),
-        reference.drain_deltas(256),
-        "deltas diverged"
-    );
+    // #4915: the stable session id is a per-table monotonic counter that
+    // legitimately differs between the in-place-promote path (which KEEPS the
+    // original id) and the remove+reinstall reference path (which reallocates,
+    // and whose manual delta helper hardcodes 0). It is an internal identity, not
+    // an observable behavior these differential tests pin — `entries_equiv` above
+    // already excludes it from entry comparison — so normalize it out of the
+    // delta comparison rather than asserting two independent counters agree.
+    let mut inplace_deltas = inplace.drain_deltas(256);
+    let mut reference_deltas = reference.drain_deltas(256);
+    for d in inplace_deltas.iter_mut() {
+        d.session_id = 0;
+    }
+    for d in reference_deltas.iter_mut() {
+        d.session_id = 0;
+    }
+    assert_eq!(inplace_deltas, reference_deltas, "deltas diverged");
 }
 
 fn nat_rewrite() -> SessionDecision {
@@ -6426,6 +6503,7 @@ fn open_delta(key: SessionKey) -> SessionDelta {
         counters: SessionCounters::default(),
         observed_tos: 0,
         observed_tcp_flags: 0,
+        session_id: 0,
     }
 }
 
