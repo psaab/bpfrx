@@ -61,6 +61,22 @@ installed into both places:
 install, they clear the cached FIB result so the receiving node recomputes
 node-local forwarding.
 
+Locally-created forward sessions take a parallel path: `SetSessionV4()` /
+`SetSessionV6()` install into the kernel/BPF maps, then mirror the forward
+entry **and a pre-installed reverse companion** (#310 — so the helper holds the
+reverse before RG activation, avoiding activation-time synthesis) to the local
+Rust helper over the session control socket. Both requests resolve
+egress/zone/tunnel-endpoint metadata from `m.lastSnapshot` and the compile
+result. **#5007 invariant: the forward/reverse pair MUST be resolved against
+ONE consistent snapshot.** The mirror helpers (`mirrorSessionPairV4` /
+`mirrorSessionPairV6`) build BOTH `SessionSyncRequest`s under a single
+uninterrupted `m.mu` hold — completing every snapshot read *before* any socket
+I/O drops the lock — then transmit both via `syncSessionRequestsLocked`, which
+releases `m.mu` for the send. This preserves the deliberate "session installs
+must not block snapshot publishes" property while closing the window where a
+concurrent `ApplyConfig` (which swaps `m.lastSnapshot` under `m.mu`) could make
+the reverse companion resolve against a different snapshot than the forward.
+
 That is only one direction of the userspace integration. Locally-created
 userspace sessions do **not** flow back through `SetClusterSyncedSession*`.
 They are exported through:
