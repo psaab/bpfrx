@@ -273,6 +273,15 @@ pub(crate) struct SessionDelta {
     /// NetFlow v9 `tcpFlags` (IE 6) / IPFIX `tcpControlBits` close-record
     /// field. 0 for non-TCP flows and for deltas with no live entry in hand.
     pub(crate) observed_tcp_flags: u8,
+    /// #4915: the dataplane's STABLE session id, copied from
+    /// `SessionEntry.session_id`. Carried on BOTH the Open and Close delta so the
+    /// RT_FLOW SESSION_CREATE / SESSION_CLOSE frames (#2508/#2460) can stamp the
+    /// additive [152:160] wire slot with a value that (a) is identical across a
+    /// session's create and close records and (b) disambiguates a reused 5-tuple
+    /// — the per-event ordinal the Go side stamped before could do neither. `0`
+    /// means "unknown" (a synthesized delta with no backing entry) and keeps the
+    /// legacy "session id absent" rendering on the wire.
+    pub(crate) session_id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -580,6 +580,10 @@ impl super::Coordinator {
                         // exporter).
                         observed_tos: 0,
                         observed_tcp_flags: 0,
+                        // #4915: HA purge close delta — feeds push_purge_close_
+                        // deltas (session-sync), NOT the RT_FLOW exporter, and the
+                        // SyncedSessionEntry carries no session id. 0 (unknown).
+                        session_id: 0,
                     });
                 }
             }
@@ -745,6 +749,10 @@ impl super::Coordinator {
                 // flags (and not routed through the RT_FLOW close exporter).
                 observed_tos: 0,
                 observed_tcp_flags: 0,
+                // #4915: HA bulk-export Open delta — feeds the session-sync
+                // dispatcher, NOT the RT_FLOW exporter, and the SyncedSessionEntry
+                // carries no session id. 0 (unknown).
+                session_id: 0,
             });
         }
         drop(sessions);

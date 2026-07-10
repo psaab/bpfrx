@@ -219,6 +219,13 @@ impl EventFrame {
         src_tos: u8,
         tcp_control_bits: u8,
         egress_ifindex: u32,
+        // #4915: the dataplane's STABLE session id (the `SessionEntry.session_id`
+        // assigned at install, threaded onto the close `SessionDelta`). Written
+        // LE at the additive [152:160] slot so the Go decoder populates the
+        // RT_FLOW record's SessionID with a value that (a) matches this session's
+        // SESSION_CREATE record and (b) disambiguates a reused 5-tuple. 0 stays
+        // the "unknown" sentinel (a synthesized close with no live entry).
+        session_id: u64,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -318,6 +325,11 @@ impl EventFrame {
         buf[base + 144] = src_tos;
         buf[base + 145] = tcp_control_bits;
         buf[base + 148..base + 152].copy_from_slice(&egress_ifindex.to_le_bytes());
+        // #4915: [152:160] the dataplane's stable session id (LE u64). The Go
+        // decoder reads it into EventRecord.SessionID only when the frame carries
+        // it (len >= 160), so a short legacy (152-byte) frame degrades to
+        // SessionID 0 rather than misparsing.
+        buf[base + 152..base + 160].copy_from_slice(&session_id.to_le_bytes());
 
         write_header(
             &mut buf,
@@ -379,6 +391,11 @@ impl EventFrame {
         policy_id: u32,
         ingress_ifindex: u32,
         application_id: u16,
+        // #4915: the dataplane's STABLE session id (the `SessionEntry.session_id`
+        // assigned at install, threaded onto the open `SessionDelta`). Written LE
+        // at [152:160] so the SESSION_CREATE record carries the SAME id its
+        // matching SESSION_CLOSE will, letting a SIEM join the two.
+        session_id: u64,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -434,6 +451,10 @@ impl EventFrame {
         // [134] close reason — 0 (a create has none).
         // [135] #2508 SYSLOG gate — always set (producer-gated).
         buf[base + 135] = RT_FLOW_LOG_SYSLOG;
+        // #4915: [152:160] the dataplane's stable session id (LE u64), the same
+        // value the matching SESSION_CLOSE frame carries. The Go decoder reads it
+        // only when the frame carries it (len >= 160).
+        buf[base + 152..base + 160].copy_from_slice(&session_id.to_le_bytes());
 
         write_header(
             &mut buf,

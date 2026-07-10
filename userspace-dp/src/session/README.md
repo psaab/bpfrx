@@ -799,7 +799,8 @@ The two observed bytes ride the close `SessionDelta` (`observed_tos` /
 `observed_tcp_flags`), harvested off the expiring entry in `session/expire.rs`
 exactly like the #2501 counters; the egress ifindex comes straight off the
 session's forwarding resolution. `encode_session_close_rt_flow`
-(`SECURITY_EVENT_PAYLOAD_SIZE = 152`) writes the block; the Go
+(`SECURITY_EVENT_PAYLOAD_SIZE`, 152 at #2749, later 160 at #4915) writes the
+block; the Go
 `pkg/logging/ringbuf.go` reader decodes it into
 `EventRecord.TOS`/`TCPControlBits`/`EgressIfindex`, and
 `pkg/flowexport` re-adds the template fields + encoder writes (NetFlow v9
@@ -820,6 +821,58 @@ inbound/outbound classification the close path does not carry; a constant
 ingress=0 would re-introduce the exact synthetic-zero #2613 fixed. The
 `export-extension flow-dir` knob stays accepted-but-not-applied
 (`V9TemplateOptions`) until that signal exists.
+
+### Stable session id on the create + close frames (#4915)
+
+Before #4915 the RT_FLOW event stream carried NO dataplane session identity:
+`pkg/logging` stamped `EventRecord.SessionID` with a per-EVENT monotonic ordinal
+(`atomic.AddUint64(&sessionSeq, 1)`), so a session's SESSION_CREATE and
+SESSION_CLOSE necessarily got DIFFERENT ids and could not be correlated, and a
+reused 5-tuple could not be disambiguated. The legacy eBPF `session_id_gen`
+per-CPU generator was retired with the dataplane (#1476), so no real id existed
+to put on the wire.
+
+#4915 makes `SessionTable` ASSIGN a stable id and threads it to the wire:
+
+- **Generation** — `SessionTable::alloc_session_id` (called once per fresh
+  install in `install_with_protocol_with_origin`, and once per peer-synced
+  import in `upsert_synced_with_origin`) returns `(worker_id << 48) | counter`,
+  the per-worker counter starting at 1. The worker id (set at worker setup via
+  `set_worker_id`) namespaces the id so it is unique across the node's
+  shared-nothing per-worker `SessionTable`s; the counter is monotonic, so a
+  reused 5-tuple (same worker) gets a DISTINCT id. `0` is reserved as the wire
+  "unknown" sentinel — a real id is never 0.
+- **Storage** — write-once on `SessionEntry.session_id`, never re-stamped, so a
+  session's create and close read the same value.
+- **Wire** — harvested onto the Open/Close `SessionDelta.session_id` and encoded
+  at the additive `[152:160]` u64 (LE) slot by `encode_session_create_rt_flow` /
+  `encode_session_close_rt_flow` (payload grew 152 -> 160,
+  `SECURITY_EVENT_PAYLOAD_SIZE`). Both frames of a session carry the SAME id.
+- **Decode** — `pkg/logging/ringbuf.go` reads `[152:160]` into
+  `EventRecord.SessionID` ONLY on a SESSION_CREATE/CLOSE frame with `len >= 160`;
+  otherwise SessionID falls back to the per-event ordinal (now also exposed as
+  `EventRecord.EventSeq`). This keeps the change strictly additive: nothing
+  observable moves until a new helper emits a 160-byte session frame.
+
+**Additive / rolling-safe (#1961 both-sides discipline).** Same pattern as the
+#2749 `[144:152]` block: the Go minimum-frame acceptance stays at
+`rawEventWireSize` (144); `[152:160]` is read ONLY when the frame carries it
+(`len >= rawEventSessionIDSize`, 160) AND only on a session frame. A new daemon
+still accepts an old helper's 144/152-byte frames (id absent → ordinal
+fallback), and an old daemon ignores the trailing 8 bytes.
+
+**Scope — two documented follow-ups.** (1) Cross-HA-node id IDENTITY: a
+peer-synced session is assigned a FRESH node-local id on import, so a session
+that opens on the primary and closes on the standby after a failover carries
+different ids on the two nodes. Making them identical needs the id on the
+session-sync wire (a second additive wire growth), like the #3395 P2
+policy-id-on-wire deferral above. (2) `show security flow session` still surfaces
+the `cli_show_flow.go` iteration-index fallback (`val.SessionID == 0`) because
+`publish_conntrack` was not unified onto the same `SessionEntry.session_id`;
+doing so (populating the conntrack-map `session_id` from the entry, and the
+`iter_with_idle`/refresh path) makes the live-session view show the SAME id the
+RT_FLOW frames carry. Both are additive and node-local-safe on top of this
+change.
 
 ## Per-IP session-limit lifecycle (#2134; #3122 peer-synced fix; #2128 leak-fix preserved)
 

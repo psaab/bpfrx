@@ -58,7 +58,23 @@ type EventRecord struct {
 	TCPControlBits uint8
 	EgressIfindex  uint32
 	CloseReason    string // "idle Timeout", "TCP FIN", "TCP RST", etc.
-	SessionID      uint64 // unique session identifier
+	// SessionID is the dataplane's STABLE per-session identity (#4915). On a
+	// SESSION_CREATE / SESSION_CLOSE frame it is decoded from the [152:160] wire
+	// slot — the SAME uint64 the userspace-dp session table assigns and that
+	// `show security flow session` will surface — so a session's open and close
+	// records correlate and a reused 5-tuple is disambiguated. 0 means "unknown":
+	// a non-session event (deny/screen/filter), or a short legacy frame that did
+	// not carry the slot. Before #4915 this field held a per-EVENT monotonic
+	// ordinal that could never match across a session's create and close; that
+	// ordinal now lives in EventSeq.
+	SessionID uint64
+	// EventSeq is a per-EVENT monotonic ordinal stamped by the live event reader
+	// (#4915). Unlike SessionID it increments on EVERY event (including
+	// deny/screen/filter), so it orders events within a reader session and
+	// exposes gaps; it is NOT a session identity and does not correlate a
+	// session's create with its close. It is 0 on records produced by
+	// DecodeRawEventRecord (which has no reader-scoped counter).
+	EventSeq uint64
 }
 
 // EventBuffer is a thread-safe circular buffer for recent events.

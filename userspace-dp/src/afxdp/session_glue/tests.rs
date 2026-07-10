@@ -5059,6 +5059,7 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
         counters: crate::session::SessionCounters::default(),
         observed_tos: 0,
         observed_tcp_flags: 0,
+        session_id: 0,
     };
 
     // Synthesize a binding identity with labels only — exactly what the
@@ -5175,6 +5176,7 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
         counters: crate::session::SessionCounters::default(),
         observed_tos: 0,
         observed_tcp_flags: 0,
+        session_id: 0,
     };
 
     // Drive the production drain loop and return the stamped application_id off
@@ -5319,6 +5321,7 @@ fn flush_session_deltas_session_close_reresolves_policy_id_after_reorder() {
         counters: crate::session::SessionCounters::default(),
         observed_tos: 0,
         observed_tcp_flags: 0,
+        session_id: 0,
     };
 
     let (handle, rx) = crate::event_stream::test_worker_handle(
@@ -5421,6 +5424,7 @@ fn flush_session_deltas_event_stream_drop_latches_out_of_sync() {
         counters: crate::session::SessionCounters::default(),
         observed_tos: 0,
         observed_tcp_flags: 0,
+        session_id: 0,
     };
 
     let ident = BindingIdentity {
@@ -5512,6 +5516,7 @@ fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
             counters: crate::session::SessionCounters::default(),
             observed_tos: 0,
             observed_tcp_flags: 0,
+            session_id: 0,
         }
     };
 

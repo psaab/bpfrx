@@ -863,6 +863,11 @@ impl EventStreamWorkerHandle {
                     delta.observed_tos,
                     delta.observed_tcp_flags,
                     u32::try_from(delta.decision.resolution.egress_ifindex).unwrap_or(0),
+                    // #4915: the stable session id harvested off the expiring
+                    // entry (0 for a synthesized close with no live entry). Rides
+                    // the additive [152:160] slot so the SESSION_CLOSE record
+                    // carries the same id as this session's SESSION_CREATE.
+                    delta.session_id,
                 )
             },
         );
@@ -925,6 +930,10 @@ impl EventStreamWorkerHandle {
                     // N/A / UNKNOWN.
                     ingress_ifindex,
                     app_id,
+                    // #4915: the stable session id assigned at install, carried
+                    // in the additive [152:160] slot so this SESSION_CREATE
+                    // record shares an id with its eventual SESSION_CLOSE.
+                    delta.session_id,
                 )
             },
         );
