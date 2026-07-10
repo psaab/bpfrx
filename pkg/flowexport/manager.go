@@ -826,7 +826,16 @@ func flowStartTime(rec logging.EventRecord, proto uint8) (time.Time, bool) {
 		}
 		return created, false
 	}
-	return rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, proto)), true
+	// Packet-count fallback. estimateSessionDuration saturates (#4923) so the
+	// estimate is always bounded and non-negative, which keeps `start` at or
+	// before the EndTime. Clamp explicitly anyway — mirroring the rec.Created
+	// skew clamp above — so the StartTime <= EndTime invariant holds no matter
+	// how the heuristic evolves and the flow never reports a negative duration.
+	start := rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, proto))
+	if start.After(rec.Time) {
+		return rec.Time, true
+	}
+	return start, true
 }
 
 // resolvePostNAT returns the post-NAT tuple for a flow record, falling back
@@ -871,6 +880,13 @@ func natIPAbsent(ip net.IP) bool {
 	return ip == nil || ip.IsUnspecified()
 }
 
+// maxEstimatedSessionAge bounds the packet-count StartTime heuristic
+// (estimateSessionDuration). It is a defensible ceiling on a session age no
+// real flow exceeds, and — crucially (#4923) — it is ~9e12 below the int64
+// nanosecond ceiling, so multiplying the per-packet estimate can never wrap
+// time.Duration negative.
+const maxEstimatedSessionAge = 366 * 24 * time.Hour
+
 // estimateSessionDuration provides a rough duration estimate based on packet count.
 func estimateSessionDuration(pkts uint64, proto uint8) time.Duration {
 	if pkts == 0 {
@@ -878,10 +894,20 @@ func estimateSessionDuration(pkts uint64, proto uint8) time.Duration {
 	}
 	// Use a heuristic: TCP sessions ~100ms per packet average,
 	// UDP/ICMP ~50ms per packet
+	perPkt := 50 * time.Millisecond
 	if proto == 6 { // TCP
-		return time.Duration(pkts) * 100 * time.Millisecond
+		perPkt = 100 * time.Millisecond
 	}
-	return time.Duration(pkts) * 50 * time.Millisecond
+	// #4923: saturate before the multiply overflows int64. A SessionPkts count
+	// beyond maxEstimatedSessionAge/perPkt (~92.2B TCP / ~184.5B non-TCP at the
+	// int64 ceiling, well above this cap) would wrap the signed time.Duration
+	// negative; the caller subtracts that from the record EndTime, moving
+	// StartTime *after* EndTime. Cap the coarse estimate so the result is
+	// always bounded, non-negative, and keeps StartTime <= EndTime.
+	if pkts >= uint64(maxEstimatedSessionAge/perPkt) {
+		return maxEstimatedSessionAge
+	}
+	return time.Duration(pkts) * perPkt
 }
 
 func collectorKey(c CollectorConfig) string {

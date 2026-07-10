@@ -53,6 +53,42 @@ func TestRenderStatusDisabledHasNoOperatorNote(t *testing.T) {
 	}
 }
 
+// #5196 (A3-b1-F5): the DISABLED-mode status text previously said
+// sessions "fall back to a built-in port→name heuristic", omitting the
+// user-defined-application tuple match that resolveTupleFallback
+// (runtime.go) actually performs FIRST. The built-in fallbacks are
+// consulted only when no user-defined application matches. This pins the
+// documented order so the operator-facing text matches the runtime.
+func TestRenderStatusDisabledDocumentsUserDefinedFallbackFirst(t *testing.T) {
+	cfg := &config.Config{}
+	var buf strings.Builder
+	RenderStatus(&buf, cfg)
+	out := buf.String()
+
+	// The user-defined `applications` scan must be documented...
+	userIdx := strings.Index(out, "user-defined")
+	if userIdx < 0 {
+		t.Fatalf("disabled fallback text must document the user-defined application scan:\n%s", out)
+	}
+	// ...as happening FIRST...
+	if !strings.Contains(out, "scanned FIRST") {
+		t.Fatalf("disabled fallback text must state user-defined apps are scanned first:\n%s", out)
+	}
+	// ...and the built-in heuristic only "when none match".
+	if !strings.Contains(out, "only when") {
+		t.Fatalf("disabled fallback text must state the built-in heuristic applies only when no user-defined app matches:\n%s", out)
+	}
+	// The user-defined step must precede the built-in heuristic mention,
+	// matching resolveTupleFallback's actual order.
+	builtinIdx := strings.Index(out, "built-in port→name heuristic")
+	if builtinIdx < 0 {
+		t.Fatalf("disabled fallback text must still mention the built-in heuristic:\n%s", out)
+	}
+	if userIdx > builtinIdx {
+		t.Fatalf("user-defined scan must be documented before the built-in heuristic (order matches runtime):\n%s", out)
+	}
+}
+
 func TestRenderStatusNilConfigUsesNoActiveSentinel(t *testing.T) {
 	var buf strings.Builder
 	RenderStatus(&buf, nil)
