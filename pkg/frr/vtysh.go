@@ -5,7 +5,7 @@
 // is the production default; New() pre-populates Manager.exec with it.
 //
 // Symbols:
-//   - frrExecutor interface (Vtysh / FrrReloadPy / VtyshLoad)
+//   - frrExecutor interface (Vtysh / FrrReloadPy / VtyshLoad / VtyshStream)
 //   - realExecutor (production implementation, exec.Command-backed)
 //   - Manager.ExecVtysh (public)
 //   - Thin raw-output shells: GetBFDPeers, GetRouteMapList,
@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os/exec"
 	"syscall"
@@ -71,6 +72,19 @@ type frrExecutor interface {
 	// ADDITIVE — it re-applies every desired line but cannot remove
 	// stale config; it is the degraded fallback only.
 	VtyshLoad(ctx context.Context, conf string) ([]byte, error)
+
+	// VtyshStream runs `vtysh -c <command>` under ctx and returns stdout
+	// as an io.ReadCloser plus a finish func that reaps the process. The
+	// caller scans the reader INCREMENTALLY so a huge table (a full
+	// internet BGP RIB, ~1M routes) is never buffered whole the way the
+	// string-returning Vtysh does; cancelling ctx (client disconnect /
+	// write failure) kills the vtysh process so it stops producing output
+	// for a response nobody will read (#5056). The caller MUST call
+	// finish() to release the process. finish() reports a genuine
+	// non-zero exit; a kill triggered by the caller cancelling ctx to
+	// stop early is EXPECTED and the caller's to interpret (StreamBGPRoutes
+	// suppresses it on the truncate/callback-abort paths).
+	VtyshStream(ctx context.Context, command string) (io.ReadCloser, func() error, error)
 }
 
 // realExecutor is the production frrExecutor. It is intentionally
@@ -95,6 +109,34 @@ func (realExecutor) Vtysh(command string) (string, error) {
 		return "", fmt.Errorf("vtysh %q: %w: %s", command, err, stderr.String())
 	}
 	return stdout.String(), nil
+}
+
+// VtyshStream runs `vtysh -c <command>` under ctx and streams stdout
+// through a pipe instead of buffering the whole result (the memory bound
+// for full-RIB dumps, #5056). exec.CommandContext kills the process when
+// ctx is cancelled, so a client disconnect or a downstream write failure
+// stops vtysh mid-dump rather than letting it render a multi-hundred-MB
+// table nobody will read. WaitDelay bounds the post-kill pipe-drain
+// window, matching Vtysh.
+func (realExecutor) VtyshStream(ctx context.Context, command string) (io.ReadCloser, func() error, error) {
+	cmd := exec.CommandContext(ctx, "vtysh", "-c", command)
+	cmd.WaitDelay = 5 * time.Second
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("vtysh %q: stdout pipe: %w", command, err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("vtysh %q: %w: %s", command, err, stderr.String())
+	}
+	finish := func() error {
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("vtysh %q: %w: %s", command, err, stderr.String())
+		}
+		return nil
+	}
+	return stdout, finish, nil
 }
 
 // FrrReloadPy runs `frr-reload.py --reload <conf>` under ctx.

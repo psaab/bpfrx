@@ -3,6 +3,7 @@ package frr
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -71,6 +72,20 @@ func (f *fakeExecutor) FrrReloadPy(ctx context.Context, conf string) error {
 		return hook(call)
 	}
 	return err
+}
+
+func (f *fakeExecutor) VtyshStream(_ context.Context, command string) (io.ReadCloser, func() error, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vtyshCalls++
+	f.lastVtyshCmd = command
+	if resp, ok := f.vtyshResp[command]; ok {
+		return io.NopCloser(strings.NewReader(resp)), func() error { return nil }, nil
+	}
+	if f.vtyshErr != nil {
+		return nil, nil, f.vtyshErr
+	}
+	return io.NopCloser(strings.NewReader("")), func() error { return nil }, nil
 }
 
 func (f *fakeExecutor) reloadPyCalls() int {
