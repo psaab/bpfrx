@@ -959,33 +959,7 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 	// netlink LinkList dumps (findNextOID + getOIDValue) per varbind — an
 	// O(N)/O(N²) RTM_GETLINK storm. The snapshot bounds it to one dump per PDU.
 	snap := a.newIfSnapshot()
-	var varbinds []varbind
-
-	// Process non-repeaters (like GETNEXT for first N OIDs).
-	for i := 0; i < nonRepeaters && i < len(oids); i++ {
-		nextOID := a.findNextOIDSnap(oids[i], snap)
-		if nextOID == nil {
-			varbinds = append(varbinds, varbind{oid: oids[i], tag: tagEndOfMibView, value: nil})
-		} else {
-			val, valTag := a.getOIDValueSnap(nextOID, snap)
-			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
-		}
-	}
-
-	// Process repeaters.
-	for i := nonRepeaters; i < len(oids); i++ {
-		currentOID := oids[i]
-		for j := 0; j < maxRepetitions; j++ {
-			nextOID := a.findNextOIDSnap(currentOID, snap)
-			if nextOID == nil {
-				varbinds = append(varbinds, varbind{oid: currentOID, tag: tagEndOfMibView, value: nil})
-				break
-			}
-			val, valTag := a.getOIDValueSnap(nextOID, snap)
-			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
-			currentOID = nextOID
-		}
-	}
+	varbinds := a.buildBulkVarbinds(oids, nonRepeaters, maxRepetitions, snap)
 
 	// Bound the response to maxPacketSize (RFC 3416 §4.2.3). v2c carries no
 	// per-request msgMaxSize, so the local maximum is the only ceiling. Trim
@@ -999,6 +973,75 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 		return a.buildResponse(community, requestID, errTooBig, 0, nil)
 	}
 	return resp
+}
+
+// buildBulkVarbinds produces the varbind list for a GETBULK request in RFC 3416
+// §4.2.3 order. The first nonRepeaters OIDs are treated like GETNEXT (one
+// varbind each). The remaining OIDs are "repeaters", each walked up to
+// maxRepetitions times. It is shared verbatim by the v2c handler and the v3
+// dispatcher so both encode identical wire order.
+//
+// The repeater varbinds are emitted repetition-major, NOT column-major (#5065).
+// For R repeater columns and M repetitions the order is
+//
+//	rep0-col0, rep0-col1, ..., rep0-col(R-1), rep1-col0, ...
+//
+// i.e. varbind index nonRepeaters + rep*R + col. RFC 3416 §4.2.3 mandates this
+// interleaving so a table-oriented manager reconstructs rows by the known
+// repeater width R; the pre-#5065 code nested the repetition loop inside the
+// per-column loop and emitted col0-rep0..col0-rep(M-1) then col1-... (column-
+// major), which mis-associates columns for R >= 2.
+//
+// Each repeater column advances its OWN GETNEXT cursor across repetitions. When
+// a column runs past the end of its MIB view it emits endOfMibView (named with
+// that column's terminal OID) in its own cell for that repetition and every
+// later repetition, so the row*R+col index stays aligned to the originating
+// column instead of collapsing the grid.
+func (a *Agent) buildBulkVarbinds(oids [][]int, nonRepeaters, maxRepetitions int, snap *ifSnapshot) []varbind {
+	var varbinds []varbind
+
+	// Non-repeaters: a single GETNEXT for each of the first nonRepeaters OIDs.
+	for i := 0; i < nonRepeaters && i < len(oids); i++ {
+		nextOID := a.findNextOIDSnap(oids[i], snap)
+		if nextOID == nil {
+			varbinds = append(varbinds, varbind{oid: oids[i], tag: tagEndOfMibView, value: nil})
+		} else {
+			val, valTag := a.getOIDValueSnap(nextOID, snap)
+			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
+		}
+	}
+
+	// Repeaters: one persistent GETNEXT cursor per repeater column, advanced
+	// across repetitions and emitted repetition-major.
+	repeaterCount := len(oids) - nonRepeaters
+	if repeaterCount <= 0 || maxRepetitions <= 0 {
+		return varbinds
+	}
+	cursors := make([][]int, repeaterCount)
+	exhausted := make([]bool, repeaterCount)
+	for c := 0; c < repeaterCount; c++ {
+		cursors[c] = oids[nonRepeaters+c]
+	}
+	for rep := 0; rep < maxRepetitions; rep++ {
+		for c := 0; c < repeaterCount; c++ {
+			if exhausted[c] {
+				// Column already ran off the end of the MIB view; keep its cell
+				// filled with endOfMibView so the row*R+col mapping holds.
+				varbinds = append(varbinds, varbind{oid: cursors[c], tag: tagEndOfMibView, value: nil})
+				continue
+			}
+			nextOID := a.findNextOIDSnap(cursors[c], snap)
+			if nextOID == nil {
+				varbinds = append(varbinds, varbind{oid: cursors[c], tag: tagEndOfMibView, value: nil})
+				exhausted[c] = true
+				continue
+			}
+			val, valTag := a.getOIDValueSnap(nextOID, snap)
+			varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
+			cursors[c] = nextOID
+		}
+	}
+	return varbinds
 }
 
 // getCommunity returns the configured community matching the given string, or

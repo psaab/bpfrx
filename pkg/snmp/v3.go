@@ -445,28 +445,10 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			}
 			break
 		}
-		for i := 0; i < nonRepeaters && i < len(oids); i++ {
-			nextOID := a.findNextOIDSnap(oids[i], snap)
-			if nextOID == nil {
-				respVarbinds = append(respVarbinds, varbind{oid: oids[i], tag: tagEndOfMibView})
-			} else {
-				val, valTag := a.getOIDValueSnap(nextOID, snap)
-				respVarbinds = append(respVarbinds, varbind{oid: nextOID, tag: valTag, value: val})
-			}
-		}
-		for i := nonRepeaters; i < len(oids); i++ {
-			currentOID := oids[i]
-			for j := 0; j < maxRepetitions; j++ {
-				nextOID := a.findNextOIDSnap(currentOID, snap)
-				if nextOID == nil {
-					respVarbinds = append(respVarbinds, varbind{oid: currentOID, tag: tagEndOfMibView})
-					break
-				}
-				val, valTag := a.getOIDValueSnap(nextOID, snap)
-				respVarbinds = append(respVarbinds, varbind{oid: nextOID, tag: valTag, value: val})
-				currentOID = nextOID
-			}
-		}
+		// Repetition-major, per-column-cursor GETBULK order (RFC 3416 §4.2.3),
+		// shared verbatim with the v2c handler so both paths encode identically
+		// (#5065).
+		respVarbinds = a.buildBulkVarbinds(oids, nonRepeaters, maxRepetitions, snap)
 
 		// Bound the response to the effective maximum size (RFC 3416 §4.2.3):
 		// the smaller of the manager's advertised msgMaxSize and our own
