@@ -126,6 +126,40 @@ The #1922 management lifeline / protected set is always honored regardless of
 the policy — an explicit map can NAME the management NIC but can never remove
 it from protection.
 
+### Managed→unmapped teardown (fail-closed, #5309)
+
+When a NIC is REMOVED from the device-map under `leave-alone`, the daemon must
+hand it back to the host: it renames the live interface from its xpf logical
+name back to the host-predictable name and drops the durable
+`10-xpf-<name>.link` / `.network` markers (the record that xpf renamed it), so
+by the time `networkd` reconciles the NIC is absent from both the desired set
+and the on-disk xpf set.
+
+This teardown is **fail-closed and retains the retry debt on failure**:
+
+- The rename-back is attempted **first**. Only when it **succeeds** (or when no
+  live device is still wearing the xpf name — an already-torn-down, idempotent
+  no-op) are the durable `.link`/`.network` markers reclaimed.
+- If the rename-back **fails** (e.g. `EBUSY` / a name collision), or no
+  host-predictable name can be resolved for a device still wearing the xpf
+  name, or the `networkctl reload` fails, the durable markers are **RETAINED**
+  and the error is surfaced. Deleting the markers on a failed rename-back would
+  leave the live interface under the wrong name (stale host routing ownership)
+  **and destroy the retry debt** — the markers are the only record that the
+  next commit must retry the teardown. Retaining them lets the next `commit`
+  converge instead of silently stranding the NIC.
+- A genuine teardown failure now **fails the commit closed**: the error is
+  aggregated into the commit-error join (alongside the networkd-apply and other
+  interface-management errors) rather than being logged and swallowed. The
+  operator sees the commit fail, the durable state is intact, and re-running
+  `commit` (after clearing the collision) completes the teardown.
+
+A benign no-op — every on-disk `.link` still desired, or the NIC already renamed
+back — never triggers a spurious commit failure or a `networkctl reload`. Only a
+GENUINE rename-back / reload failure retains-and-errors. This mirrors the #4956
+startup rename/reload aggregation and the #4901 retain-on-failed-delete
+discipline.
+
 ## Safety: commit pre-flight & rollback
 
 A commit that changes the device-map runs a **node-local pre-flight** against

@@ -824,8 +824,20 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// networkd.Apply so its stale-file sweep has nothing to half-clean.
 	// No-op idempotent when nothing transitioned (zero churn on an
 	// unrelated commit).
+	//
+	// A genuine teardown failure (rename-back EBUSY/collision or networkctl
+	// reload failure) is now RETURNED and RETAINS the durable .link/.network
+	// markers (#5309). It is captured into networkdErr (the interface-management
+	// error already threaded into the tail commit join) so the commit fails
+	// CLOSED instead of reporting success while the wrong live interface name
+	// persists and the retry debt is destroyed. errors.Join preserves any error
+	// the later networkd.Apply also records.
 	if cfg.Chassis.DeviceMap.Active() {
-		teardownUnmappedManaged(cfg.Chassis.DeviceMap, protectedForConfig(cfg))
+		if err := teardownUnmappedManaged(cfg.Chassis.DeviceMap, protectedForConfig(cfg)); err != nil {
+			slog.Warn("device-map teardown failed; retaining durable state, failing commit closed",
+				"err", err)
+			networkdErr = errors.Join(networkdErr, err)
+		}
 	}
 
 	// 2.5. Write systemd-networkd config for managed interfaces.
@@ -851,7 +863,9 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	if d.networkd != nil && applyResult != nil {
 		if err := d.networkd.Apply(applyResult.ManagedInterfaces); err != nil {
 			slog.Warn("failed to apply networkd config", "err", err)
-			networkdErr = fmt.Errorf("apply networkd config: %w", err)
+			// errors.Join (not assignment) so a device-map teardown failure
+			// recorded just above (#5309) is not clobbered — both fail-closed.
+			networkdErr = errors.Join(networkdErr, fmt.Errorf("apply networkd config: %w", err))
 		}
 	}
 

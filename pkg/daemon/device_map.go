@@ -29,6 +29,14 @@ import (
 var (
 	renameInterfaceFn  = renameInterface
 	networkctlReloadFn = networkctlReload
+	// teardownRestoreTargetFn resolves the rename-back target for the
+	// managed->unmapped teardown (#5309): given an xpf logical name, it reports
+	// whether a LIVE device currently wears that name and, if so, the
+	// host-predictable name to restore it to. Injectable so the fail-closed
+	// retain-on-failure path is unit-testable without a live netlink/sysfs
+	// stack (the existing teardown tests never reach the netlink block because
+	// every on-disk name is still desired or protected).
+	teardownRestoreTargetFn = teardownRestoreTarget
 )
 
 // The pure identity resolver, present-NIC model, and host enumeration live in
@@ -579,9 +587,24 @@ func protectedForConfig(cfg *config.Config) map[string]bool {
 // claim-all teardown via the compiler reconcile. It is no-op idempotent:
 // when nothing transitioned, it touches nothing (operator priority #1 —
 // zero churn on an unrelated commit).
-func teardownUnmappedManaged(dm *config.DeviceMapConfig, protected map[string]bool) {
+//
+// Fail-closed (#5309): the teardown RETURNS an error and RETAINS the durable
+// markers on a genuine failure. When the rename-back of a live device fails
+// (EBUSY / name collision) or no predictable name can be resolved for a device
+// still wearing the xpf name, the `10-xpf-<name>.link` marker and its matching
+// `.network` are KEPT — deleting them would drop xpf management AND leave the
+// live interface under the wrong name (stale host routing ownership) while
+// destroying the retry debt (the durable markers are the only record that the
+// next commit must retry the teardown). The markers are reclaimed ONLY when the
+// rename-back SUCCEEDED, or when no live device wears the name (already torn
+// down / never present — an idempotent no-op that reclaims any leftover files
+// without error). Rename-back and networkctl-reload failures are aggregated via
+// errors.Join and surfaced so the caller (daemon_apply) fails the commit closed,
+// mirroring the #4956 startup aggregation and the #4901 retain-on-failed-delete
+// discipline.
+func teardownUnmappedManaged(dm *config.DeviceMapConfig, protected map[string]bool) error {
 	if !dm.Active() || dm.EffectiveUnmappedPolicy() != config.DeviceMapPolicyLeaveAlone {
-		return
+		return nil
 	}
 	desiredNames := make(map[string]bool)
 	for _, e := range dm.Entries {
@@ -590,9 +613,13 @@ func teardownUnmappedManaged(dm *config.DeviceMapConfig, protected map[string]bo
 
 	entries, err := os.ReadDir(linkDir)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil // no link dir → nothing was ever managed → no-op
+		}
+		return fmt.Errorf("device-map teardown: read link dir: %w", err)
 	}
 	reloaded := false
+	var teardownErrs []error
 	for _, fe := range entries {
 		fname := fe.Name()
 		if !strings.HasPrefix(fname, linkPrefix) || !strings.HasSuffix(fname, ".link") {
@@ -616,32 +643,44 @@ func teardownUnmappedManaged(dm *config.DeviceMapConfig, protected map[string]bo
 				"(kept managed to preserve the management lifeline)", "name", target)
 			continue
 		}
-		// A previously-managed NIC is no longer mapped. Find the live device
-		// currently wearing this xpf name and restore it.
-		if link, err := netlink.LinkByName(target); err == nil {
-			nic := presentNIC{Name: target}
-			if devReal, err := filepath.EvalSymlinks(
-				filepath.Join("/sys/class/net", target, "device")); err == nil {
-				nic.PCIAddr = devicemap.ExtractPCIAddr(devReal)
-			}
-			predictable := predictableName(nic)
-			if predictable != "" && predictable != target {
-				if err := renameInterface(target, predictable); err == nil {
-					slog.Info("device-map teardown: restored unmapped NIC to predictable name",
-						"from", target, "to", predictable)
-					reloaded = true
-				} else {
-					slog.Warn("device-map teardown: rename-back failed; leaving device under xpf "+
-						"name but dropping management", "name", target, "err", err)
-				}
+		// A previously-managed NIC is no longer mapped. If a live device is
+		// still wearing this xpf name, restore it to its predictable host name
+		// FIRST — and only reclaim the durable markers when that succeeds.
+		predictable, live := teardownRestoreTargetFn(target)
+		renameOK := true // no live device to rename → safe to reclaim files
+		switch {
+		case !live:
+			// Already renamed back / never present. Nothing to restore; fall
+			// through to the (idempotent) marker reclaim below.
+		case predictable == "" || predictable == target:
+			// A live device still wears the xpf name but no distinct
+			// predictable name is resolvable. Dropping management now would
+			// strand the device under the wrong name AND destroy the retry
+			// debt. RETAIN the markers and fail closed (#5309).
+			renameOK = false
+			slog.Warn("device-map teardown: no predictable name to restore unmapped NIC; "+
+				"retaining durable state for retry (fail-closed)", "name", target)
+			teardownErrs = append(teardownErrs,
+				fmt.Errorf("no predictable name to restore unmapped NIC %q", target))
+		default:
+			if err := renameInterfaceFn(target, predictable); err != nil {
+				renameOK = false
+				slog.Warn("device-map teardown: rename-back failed; retaining durable state "+
+					"for retry (fail-closed)", "name", target, "to", predictable, "err", err)
+				teardownErrs = append(teardownErrs,
+					fmt.Errorf("rename-back %s -> %s: %w", target, predictable, err))
 			} else {
-				slog.Warn("device-map teardown: no predictable name for unmapped NIC; dropping "+
-					"xpf management without renaming", "name", target)
+				slog.Info("device-map teardown: restored unmapped NIC to predictable name",
+					"from", target, "to", predictable)
+				reloaded = true
 			}
-			_ = link
 		}
-		// Remove the stale .link and any matching .network regardless of the
-		// rename outcome — xpf stops managing this NIC.
+		// #5309: reclaim the durable markers ONLY when the rename-back
+		// succeeded (or there was no live device to rename). On failure, RETAIN
+		// both files so the next commit retries — never destroy the retry debt.
+		if !renameOK {
+			continue
+		}
 		if err := os.Remove(filepath.Join(linkDir, fname)); err == nil {
 			reloaded = true
 			slog.Info("device-map teardown: removed stale .link", "file", fname)
@@ -653,10 +692,37 @@ func teardownUnmappedManaged(dm *config.DeviceMapConfig, protected map[string]bo
 		}
 	}
 	if reloaded {
-		if err := networkctlReload(); err != nil {
-			slog.Warn("device-map teardown: networkctl reload failed", "err", err)
+		if err := networkctlReloadFn(); err != nil {
+			slog.Warn("device-map teardown: networkctl reload failed (fail-closed)", "err", err)
+			teardownErrs = append(teardownErrs, fmt.Errorf("networkctl reload: %w", err))
 		}
 	}
+	if len(teardownErrs) > 0 {
+		return fmt.Errorf("device-map teardown: %d step(s) failed: %w",
+			len(teardownErrs), errors.Join(teardownErrs...))
+	}
+	return nil
+}
+
+// teardownRestoreTarget resolves the rename-back target for the
+// managed->unmapped teardown. It returns (predictable, true) when a LIVE device
+// currently wears the xpf logical name `target` — `predictable` is the
+// host-predictable name to restore it to (empty when none is resolvable). It
+// returns ("", false) when no live device wears the name (already torn down or
+// never present), in which case the teardown reclaims any leftover durable
+// markers as an idempotent no-op. Split out as an injectable seam so the
+// fail-closed retain-on-failure path (#5309) is testable without live
+// netlink/sysfs.
+func teardownRestoreTarget(target string) (predictable string, live bool) {
+	if _, err := netlink.LinkByName(target); err != nil {
+		return "", false // no live device wears this xpf name
+	}
+	nic := presentNIC{Name: target}
+	if devReal, err := filepath.EvalSymlinks(
+		filepath.Join("/sys/class/net", target, "device")); err == nil {
+		nic.PCIAddr = devicemap.ExtractPCIAddr(devReal)
+	}
+	return predictableName(nic), true
 }
 
 // predictableNameLookup is the udev predictable-name resolver, injectable
