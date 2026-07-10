@@ -153,6 +153,13 @@ func (c *CLI) showApplications(args []string) error {
 		}
 		for _, name := range names {
 			as := cfg.Applications.ApplicationSets[name]
+			if as == nil {
+				// #5221: a present-but-nil application-set map value is admitted
+				// by the tolerant-load / peer-sync path (#1960) that the resolver
+				// (#5179) already tolerates. Skip it rather than dereferencing
+				// as.Name / as.Applications and panicking the CLI display.
+				continue
+			}
 			if filterName != "" && as.Name != filterName {
 				continue
 			}
