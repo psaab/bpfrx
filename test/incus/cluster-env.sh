@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared cluster test defaults.
 #
 # Makefile cluster validation is canonicalized on the isolated loss userspace
@@ -41,13 +42,28 @@ _xpf_cluster_ref() {
 	fi
 }
 
+# Instance NAMES. The LAN host name is intentionally sourced from the
+# cluster env's LAN_HOST (the loss userspace cluster sets
+# LAN_HOST=cluster-userspace-host); this is the bridge that lets the
+# HA test scripts read one variable ($CLUSTER_LAN_HOST) while every env
+# file declares its LAN host as LAN_HOST. Do NOT re-file this as a
+# variable-name mismatch — that was the (already-resolved) #5024 report.
 FW0_NAME="${FW0_NAME:-${VM0:-xpf-fw0}}"
 FW1_NAME="${FW1_NAME:-${VM1:-xpf-fw1}}"
 CLUSTER_LAN_HOST_NAME="${CLUSTER_LAN_HOST_NAME:-${LAN_HOST:-cluster-lan-host}}"
 
-FW0="${FW0:-$(_xpf_cluster_ref "$FW0_NAME")}"
-FW1="${FW1:-$(_xpf_cluster_ref "$FW1_NAME")}"
-CLUSTER_LAN_HOST="${CLUSTER_LAN_HOST:-$(_xpf_cluster_ref "$CLUSTER_LAN_HOST_NAME")}"
+# Resolve each instance ref THROUGH _xpf_cluster_ref, even when the
+# caller sets FW0/FW1/CLUSTER_LAN_HOST explicitly, so a BARE override
+# (e.g. `CLUSTER_LAN_HOST=cluster-userspace-host make test-failover`)
+# still gets the cluster's incus remote prefixed. _xpf_cluster_ref is a
+# no-op when the value already carries a `remote:` prefix or when the
+# env declares no INCUS_REMOTE (the legacy local xpf-fw0/1 cluster), so
+# the unset-default, fully-qualified-override, and legacy paths are all
+# unchanged. Before #5024 a bare override skipped the prefix entirely
+# and died `<host> is not running` on the default remote.
+FW0="$(_xpf_cluster_ref "${FW0:-$FW0_NAME}")"
+FW1="$(_xpf_cluster_ref "${FW1:-$FW1_NAME}")"
+CLUSTER_LAN_HOST="$(_xpf_cluster_ref "${CLUSTER_LAN_HOST:-$CLUSTER_LAN_HOST_NAME}")"
 
 LAN_HOST_IP="${LAN_HOST_IP:-${LAN_ADDR:-}}"
 LAN_HOST_IP="${LAN_HOST_IP%%/*}"

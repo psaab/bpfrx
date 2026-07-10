@@ -46,13 +46,12 @@ func TestStop_CancelsWatcherContext(t *testing.T) {
 // the worker drains the backlog after Stop (a second delivery is observed) and
 // never joins (Stop hangs / the goroutine leaks).
 func TestStop_StopsTrapWorkerNoPostDelivery(t *testing.T) {
-	orig := trapSender
-	defer func() { trapSender = orig }()
-
 	var calls, delivered atomic.Int64
 	entered := make(chan struct{}, 64)
 	release := make(chan struct{})
-	trapSender = func(target string, pkt []byte) error {
+	// #5023: inject the mock sender on THIS Agent, not a shared package global
+	// (which would race the running trap worker's read under -race).
+	sender := func(target string, pkt []byte) error {
 		n := calls.Add(1)
 		entered <- struct{}{} // signal every send attempt
 		if n == 1 {
@@ -62,7 +61,7 @@ func TestStop_StopsTrapWorkerNoPostDelivery(t *testing.T) {
 		return nil
 	}
 
-	a := &Agent{startTime: time.Now()}
+	a := &Agent{startTime: time.Now(), trapSender: sender}
 	// Enqueue a backlog. The worker starts, dequeues the first job, and blocks
 	// inside the sender; the rest sit in the queue behind it.
 	for i := 0; i < 8; i++ {

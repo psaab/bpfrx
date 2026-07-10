@@ -206,13 +206,10 @@ func (a *Agent) buildLinkTrapsForVersion(community, version string, linkUp bool,
 	}
 }
 
-// trapSender delivers a single pre-built trap to a target. It is a package
-// var (not a direct call) so tests can inject a deliberately slow/blocking
-// sender to prove the link-monitor caller does not block on trap delivery
-// (#2991). Production code never reassigns it.
-var trapSender = sendTrap
-
-// sendTrap sends a pre-built trap packet to a single target on port 162.
+// sendTrap sends a pre-built trap packet to a single target on port 162. It is
+// the default value of Agent.trapSender (#5023); tests inject a slow/blocking
+// or mock sender per-Agent instead of mutating a shared package global that
+// races the running trap worker's read.
 func sendTrap(target string, pkt []byte) error {
 	// Ensure the target has a port.
 	host, port, err := net.SplitHostPort(target)
@@ -381,6 +378,14 @@ func (a *Agent) enqueueTrap(job trapJob) {
 // struct) so the worker never races Stop's field access. Stop waits on trapWG.
 func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
 	defer a.trapWG.Done()
+	// Snapshot the sender once at worker start. It is set at construction
+	// (NewAgent) or by a test on its own Agent before the worker is lazily
+	// started, so this read never races a concurrent write (#5023). A
+	// bare-struct Agent that never set the field falls back to sendTrap.
+	send := a.trapSender
+	if send == nil {
+		send = sendTrap
+	}
 	for {
 		select {
 		case <-stop:
@@ -397,7 +402,7 @@ func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
 				return
 			default:
 			}
-			if err := trapSender(job.target, job.pkt); err != nil {
+			if err := send(job.target, job.pkt); err != nil {
 				slog.Warn("SNMP trap send failed",
 					"target", job.target, "group", job.group,
 					"event", job.event, "iface", job.iface, "err", err)

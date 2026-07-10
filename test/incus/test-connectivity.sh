@@ -236,7 +236,7 @@ test_cluster() {
 				fail "cluster: LAN host → WAN iperf3 IPv6 TCP (SNAT v6 may be missing)"
 			fi
 		else
-			skip "cluster: IPv6 TCP test (iperf3 not installed on cluster-lan-host)"
+			skip "cluster: IPv6 TCP test (iperf3 not installed on ${CLUSTER_LAN_HOST})"
 		fi
 
 		# IPv4 TCP: iperf3 from LAN host to WAN
@@ -247,7 +247,7 @@ test_cluster() {
 				fail "cluster: LAN host → WAN iperf3 IPv4 TCP"
 			fi
 		else
-			skip "cluster: IPv4 TCP test (iperf3 not installed on cluster-lan-host)"
+			skip "cluster: IPv4 TCP test (iperf3 not installed on ${CLUSTER_LAN_HOST})"
 		fi
 
 		# mtr path validation: verify traffic traverses RETH VIP to WAN gateway
