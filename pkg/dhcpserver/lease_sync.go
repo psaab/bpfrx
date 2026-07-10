@@ -475,6 +475,13 @@ func (m *Manager) seedSyncLeases(ctx context.Context, family int, leases []SyncL
 		if l.Family != family {
 			continue
 		}
+		if l.Remaining <= 0 {
+			// #4871: an aged-out lease must be DROPPED, never re-anchored to
+			// now_local+Remaining at seed (which would resurrect it past its
+			// true expiry). The standby-residence subtraction upstream
+			// (PeerDHCPLeases) normally removes these; this is the fail-safe.
+			continue
+		}
 		if err := m.seedOneLease(ctx, socket, family, l, now); err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -522,9 +529,14 @@ func (m *Manager) seedOneLease(ctx context.Context, socket string, family int, l
 // lease{4,6}-add argument record. valid-lft is set to Remaining so a renewing
 // client sees the correct remaining time, and the absolute expire matches.
 func syncLeaseToKea(l SyncLease, now time.Time) keaLeaseJSON {
+	// #4871: expired leases are DROPPED upstream (seedSyncLeases skips
+	// Remaining<=0), so rem is a genuinely-positive remaining lifetime here.
+	// The floor is now only a last-resort guard against a sub-second positive
+	// value producing a zero valid-lft (which Kea rejects) — it never revives
+	// an aged-out lease.
 	rem := l.Remaining
 	if rem < 1 {
-		rem = 1 // Kea rejects a zero/negative lifetime; floor to 1s
+		rem = 1
 	}
 	kl := keaLeaseJSON{
 		IPAddress: l.Address,
@@ -727,10 +739,10 @@ func (m *Manager) writeMemfile4(path string, leases []SyncLease, now time.Time) 
 		if l.Family != 4 {
 			continue
 		}
-		rem := l.Remaining
-		if rem < 1 {
-			rem = 1
+		if l.Remaining <= 0 {
+			continue // #4871: drop an aged-out lease rather than reviving it
 		}
+		rem := l.Remaining
 		expire := now.Unix() + int64(rem)
 		// address,hwaddr,client_id,valid_lifetime,expire,subnet_id,
 		// fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
@@ -751,10 +763,10 @@ func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) 
 		if l.Family != 6 {
 			continue
 		}
-		rem := l.Remaining
-		if rem < 1 {
-			rem = 1
+		if l.Remaining <= 0 {
+			continue // #4871: drop an aged-out lease rather than reviving it
 		}
+		rem := l.Remaining
 		expire := now.Unix() + int64(rem)
 		// Encode the v6 lease kind symmetrically with the read path
 		// (keaLeaseTypeToString) via the shared inverse so IA_NA / IA_TA / IA_PD

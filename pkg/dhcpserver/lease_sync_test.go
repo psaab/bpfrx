@@ -491,6 +491,75 @@ func TestPreSeedMemfile4_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestSeedAndPreSeed_DropExpiredLeases is the #4871 dhcpserver-side guard: an
+// aged-out lease (Remaining <= 0) must be DROPPED by both seed paths, never
+// floored to 1s and re-anchored to now_local (which would resurrect a lease
+// past its true expiry -> duplicate allocation). A still-valid lease in the
+// same set proves the drop is selective.
+//
+// Fail-on-revert: restoring the `if rem < 1 { rem = 1 }` floor (removing the
+// `Remaining <= 0` drops) makes the expired lease seed/write, failing the
+// count assertions.
+func TestSeedAndPreSeed_DropExpiredLeases(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+
+	t.Run("control-socket seed", func(t *testing.T) {
+		sock := tmpSocket(t, "k4exp.sock")
+		var added []keaLeaseJSON
+		stub := &stubKea{handler: func(cmd keaCommand) keaResponse {
+			if cmd.Command == "lease4-add" {
+				var kl keaLeaseJSON
+				b, _ := json.Marshal(cmd.Arguments)
+				_ = json.Unmarshal(b, &kl)
+				added = append(added, kl)
+				return keaResponse{Result: keaResultSuccess, Text: "added"}
+			}
+			return keaResponse{Result: keaResultError, Text: "unexpected"}
+		}}
+		dial, stop := startStubKea(t, sock, stub)
+		defer stop()
+		m := New()
+		m.SetLeaseSyncSeamsForTesting(dial, sock, "", "", "")
+
+		in := []SyncLease{
+			{Family: 4, Address: "10.0.0.5", HWAddress: "aa", SubnetID: 1, Remaining: 600, State: keaStateDefault},
+			{Family: 4, Address: "10.0.0.6", HWAddress: "bb", SubnetID: 1, Remaining: 0, State: keaStateDefault},
+			{Family: 4, Address: "10.0.0.7", HWAddress: "cc", SubnetID: 1, Remaining: -5, State: keaStateDefault},
+		}
+		n, err := m.SeedSyncLeases4(context.Background(), in, localNow)
+		if err != nil {
+			t.Fatalf("SeedSyncLeases4: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("seeded = %d, want 1 (only the valid lease)", n)
+		}
+		if len(added) != 1 || added[0].IPAddress != "10.0.0.5" {
+			t.Fatalf("expired lease was seeded (resurrection): %+v", added)
+		}
+	})
+
+	t.Run("memfile pre-seed", func(t *testing.T) {
+		dir := t.TempDir()
+		memfile := filepath.Join(dir, "kea-leases4.csv")
+		m := New()
+		m.SetLeaseSyncSeamsForTesting(nil, "", "", memfile, "")
+		in := []SyncLease{
+			{Family: 4, Address: "10.0.0.5", HWAddress: "aa", SubnetID: 1, Remaining: 600, State: keaStateDefault},
+			{Family: 4, Address: "10.0.0.6", HWAddress: "bb", SubnetID: 1, Remaining: 0, State: keaStateDefault},
+		}
+		if err := m.PreSeedMemfile4(in, localNow); err != nil {
+			t.Fatalf("PreSeedMemfile4: %v", err)
+		}
+		got, err := parseActiveLeases4(memfile, localNow)
+		if err != nil {
+			t.Fatalf("parseActiveLeases4: %v", err)
+		}
+		if len(got) != 1 || got[0].Address != "10.0.0.5" {
+			t.Fatalf("expired lease written to memfile (resurrection): %+v", got)
+		}
+	})
+}
+
 // TestPreSeedMemfileMerged4_PreservesLocalLeases is the #5040 regression guard.
 // On active-active takeover this node is ALREADY MASTER for one RG (its lease is
 // live in local Kea) and takes over a second RG (the peer's lease). The pre-seed

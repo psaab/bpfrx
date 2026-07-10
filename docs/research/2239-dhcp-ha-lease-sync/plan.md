@@ -442,6 +442,22 @@ they add are now part of the module contract:
   path and FAILS CLOSED — on an untrusted (corrupt) local source it returns an
   error and leaves the existing memfile intact rather than replacing it with
   peer-only rows; the async post-start `lease{4,6}-add` seed is the backstop.
+- **Synced leases age on the standby (#4871).** `SyncLease.Remaining` is
+  seconds-of-lifetime-left at the SENDER's read time and carries no sample
+  epoch, so the receiver MUST record WHEN it received each family's set and
+  subtract that standby RESIDENCE before either seed. Without it a lease held
+  for minutes (worst under a stale/partitioned sync channel — exactly when
+  failover matters) is re-anchored at seed to now_local+Remaining and
+  RESURRECTED past its true expiry, so the promoted node re-allocates an
+  address/prefix the original server already reassigned. `SessionSync` stamps
+  `peerDHCPLeases{4,6}RecvAt` on receipt (a `time.Now()` reading, monotonic in
+  production) and `PeerDHCPLeases{4,6}` subtract the monotonic residence,
+  DROPPING any lease that has aged to zero — NEVER flooring it to one second (a
+  floor revives an expired binding just as surely). The dhcpserver seed writers
+  (`seedSyncLeases`, `writeMemfile{4,6}`) also drop `Remaining<=0` as a fail-safe
+  rather than flooring. Remaining-lifetime + local re-anchor still gives peer
+  wall-clock-skew immunity (§6 clock invariant); residence subtraction closes
+  the standby-hold hole in it.
 
 ---
 

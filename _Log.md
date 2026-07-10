@@ -1,6 +1,25 @@
 ## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4871 ha/dhcpserver — synced DHCP lease lifetimes stopped aging on
+  the standby and were re-anchored/resurrected at takeover. SyncLease.Remaining
+  is seconds-left at the sender's read time with no sample epoch; the receiver
+  stored a value copy with no receipt time, so standby residence was never
+  subtracted and expired leases came back on promotion (duplicate allocation).
+  Fix: SessionSync now stamps peerDHCPLeases{4,6}RecvAt on receipt (a monotonic
+  time.Now() reading); PeerDHCPLeases{4,6} subtract the monotonic residence via
+  peerDHCPLeasesAged and DROP any lease aged to <=0 (never floor to 1). The
+  dhcpserver seed writers (seedSyncLeases, writeMemfile{4,6}) also drop
+  Remaining<=0 as a fail-safe instead of flooring; syncLeaseToKea's floor is now
+  a documented last-resort guard only. Tests: cluster TestPeerDHCPLeasesAged
+  (ages 600->500, drops the 60s lease held 100s; held set untouched — RED on
+  revert to plain copy) + dhcpserver TestSeedAndPreSeed_DropExpiredLeases
+  (socket + memfile paths drop expired — RED on restoring the floor).
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/lease_sync_wire_test.go,
+  pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  docs/research/2239-dhcp-ha-lease-sync/plan.md
+
+- **Timestamp**: 2026-07-09
   **Action**: #5040 ha/dhcpserver — the active-active takeover memfile pre-seed
   passed ONLY the peer's leases to PreSeedMemfile{4,6}, which atomically
   OVERWROTE the shared Kea memfile — wiping the leases of RGs this node still
