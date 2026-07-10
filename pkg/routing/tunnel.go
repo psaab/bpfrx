@@ -1772,13 +1772,21 @@ func (t *tunnelManager) clearLocked() error {
 	for name := range t.ownedNames {
 		names[name] = true
 	}
+	var errs []error
+	failed := map[string]bool{}
 	for name := range names {
 		link, err := t.ops.LinkByName(name)
 		if err != nil {
 			continue // already gone
 		}
 		if err := t.ops.LinkDel(link); err != nil {
+			// #4901: a failed LinkDel leaves the tunnel in the kernel. Retain
+			// ownership so a post-Clear Apply's removal diff (which keys off
+			// ownedNames) retries the delete instead of orphaning a live link
+			// with stale addresses / XFRM if_id state, and surface the error.
 			slog.Warn("failed to delete tunnel", "name", name, "err", err)
+			errs = append(errs, fmt.Errorf("delete tunnel %s: %w", name, err))
+			failed[name] = true
 		} else {
 			slog.Info("tunnel removed", "name", name)
 		}
@@ -1786,7 +1794,13 @@ func (t *tunnelManager) clearLocked() error {
 	t.tunnels = nil
 	// Reset the reconcile state with the devices: a post-Clear Apply
 	// adopts whatever survives instead of trusting stale ownership.
-	t.ownedNames = nil
+	// #4901: EXCEPT the names whose LinkDel failed — retain their ownership so
+	// the next Apply retries the delete rather than orphaning the link.
+	if len(failed) > 0 {
+		t.ownedNames = failed
+	} else {
+		t.ownedNames = nil
+	}
 	t.appliedAddrs = nil
 	t.appliedRI = nil
 	// Reset the WG-removal-prune tracking too (#1919). ClearTunnels does
@@ -1800,7 +1814,7 @@ func (t *tunnelManager) clearLocked() error {
 	// linkGen pointer; dropping the map is safe and prevents removed names
 	// from leaking generation counters (#1918).
 	t.linkGen = nil
-	return nil
+	return errors.Join(errs...)
 }
 
 // GetStatus returns the status of managed tunnel interfaces.
