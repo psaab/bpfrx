@@ -35,7 +35,7 @@ re-created 0600 on the next commit.
 | Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
 | Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
 | Config archives | `<archive-dir>/config-*.conf` | 0600 | `store_persist.go writeArchive` |
-| Audit journal (#4579 A4-02) | `.config.journal` | 0600 | `journal/journal.go Log` |
+| Audit journal (#4579 A4-02, migrate #5188) | `.config.journal`(+`.N`) | 0600 | `journal/journal.go Log` / `migratePermsLocked` |
 
 The `.configdb` and archive directories are created **0700** (they hold
 only secret-bearing files); the daemon owns them, so read-back is
@@ -48,6 +48,20 @@ that names a credential ("rotated the vpn psk to …") would otherwise be
 world-readable. Tightening it to match the rest of the config surface is
 cheap defense-in-depth; the daemon owns the file, so the history tail
 read is unaffected.
+
+Unlike the DB and text-copy files above — which `fsatomic` replaces the
+inode on every write, so a pre-#4056 0644 file is re-created 0600 on the
+next commit — the journal is **append-only**: `os.OpenFile` with
+`O_APPEND` reuses the existing inode and **ignores the 0600 perm arg**,
+so #4579 A4-02 only tightened NEW journals. An upgraded 0644 current
+file, and any rotated legacy `.N` segment (v1 fat lines carrying full
+configs incl. secrets), stayed world-readable with no migration pass.
+`journal.migratePermsLocked` (#5188) closes that gap: on first use (Log
+or Tail) it lstat's every owned segment (current + rotation siblings)
+and chmods any that is more permissive than owner-only down to 0600, and
+rotation re-asserts 0600 on the segment it renames. The pass only ever
+tightens (a stricter file is left alone), refuses to follow a symlink,
+and logs — rather than swallows — a chmod failure.
 
 ### Threat model — what 0600 + 0700 defends, and what it does not (#4056)
 

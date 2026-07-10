@@ -22,8 +22,19 @@
 // slot 1, see #1894). Legacy fat v1 lines decode tolerantly (unknown
 // JSON fields are ignored), and the first append after upgrade rotates
 // an over-threshold legacy file to segment .1 intact, so old history
-// stays visible until it ages out — no migration pass, and boot never
-// reads the journal at all.
+// stays visible until it ages out. First use — the first Log or Tail —
+// runs a one-time permission-repair pass (#5188): every OWNED segment
+// (the current file plus its rotation siblings .1../.N) is lstat'd and,
+// if a pre-0600 build left it more permissive than owner-only, chmod'd
+// to 0600, and rotation re-asserts 0600 on the renamed segment. This
+// closes the residual #4579 A4-02 left: O_APPEND ignores the perm arg on
+// an EXISTING inode, so an upgraded 0644 current file — and any rotated
+// secret-bearing legacy .N segment — otherwise stayed world-readable
+// with no migration pass at all. The repair only ever tightens (a
+// stricter-than-0600 file is left alone), refuses to follow a symlink
+// (lstat, never chmod through it to an arbitrary target), and surfaces
+// failures as warnings rather than swallowing them. Boot never reads the
+// journal at all.
 package journal
 
 import (
@@ -31,6 +42,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -102,6 +114,9 @@ type Journal struct {
 	path            string
 	maxSegmentBytes int64
 	maxSegments     int
+	// migrated guards the one-time permission-repair pass (#5188) so it
+	// runs once on first use, under j.mu, and is a no-op thereafter.
+	migrated bool
 }
 
 // Option configures a Journal.
@@ -149,6 +164,57 @@ func (j *Journal) segmentPath(n int) string {
 	return fmt.Sprintf("%s.%d", j.path, n)
 }
 
+// migratePermsLocked runs once on first use (Log or Tail) and repairs
+// the permissions of every OWNED journal segment — the current file and
+// its rotation siblings — to owner-only 0600 (#5188). #4579 A4-02 made
+// NEW journals 0600, but O_APPEND ignores the perm arg on an existing
+// inode, so an upgraded 0644 current file, and any rotated
+// secret-bearing legacy .N segment, stayed world-readable with no
+// migration pass. Only these journal-owned paths are touched, never an
+// unrelated file. Caller holds j.mu.
+func (j *Journal) migratePermsLocked() {
+	if j.migrated {
+		return
+	}
+	j.migrated = true
+	for seg := 0; seg <= j.maxSegments; seg++ {
+		chmodOwnerOnly(j.segmentPath(seg))
+	}
+}
+
+// chmodOwnerOnly tightens path to 0600 when it is a regular file whose
+// mode grants any access beyond owner read/write. It only ever tightens:
+// a file that is already 0600 or stricter is left untouched, so a
+// deliberately locked-down journal is never loosened. A symlink is
+// refused — the path is lstat'd and the link is never followed to chmod
+// an arbitrary target — and a missing path is a no-op. Failures are
+// surfaced as warnings (#5188 "surface failures"), not swallowed.
+func chmodOwnerOnly(path string) {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("journal: lstat segment for permission repair failed",
+				"path", path, "err", err)
+		}
+		return
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		slog.Warn("journal: refusing to chmod through a symlinked journal segment",
+			"path", path)
+		return
+	}
+	if !fi.Mode().IsRegular() {
+		return // not an owned journal segment (device/socket/dir/etc.)
+	}
+	if fi.Mode().Perm()&^0o600 == 0 {
+		return // already owner-only (or stricter): only tighten, never loosen
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		slog.Warn("journal: chmod journal segment to 0600 failed",
+			"path", path, "err", err)
+	}
+}
+
 // Log appends an entry, rotating first when the current segment is
 // over the size threshold. The append is fsynced (the journal is the
 // only audit record now that config payloads live in rollback storage,
@@ -157,6 +223,8 @@ func (j *Journal) segmentPath(n int) string {
 func (j *Journal) Log(entry *Entry) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+
+	j.migratePermsLocked()
 
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now()
@@ -192,7 +260,10 @@ func (j *Journal) Log(entry *Entry) error {
 	// .configdb-adjacent config surface is already 0600 (#4056); the
 	// journal is written next to it and should match rather than sit
 	// world-readable as a defense-in-depth gap. The daemon owns the file,
-	// so 0600 does not affect append or tail read-back.
+	// so 0600 does not affect append or tail read-back. NOTE: this perm
+	// arg only applies when O_CREATE actually creates the file; on an
+	// EXISTING inode O_APPEND ignores it, so migratePermsLocked() above
+	// is what tightens an upgraded 0644 journal (#5188).
 	f, err := os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("open journal: %w", err)
@@ -248,6 +319,11 @@ func (j *Journal) maybeRotateLocked() (bool, error) {
 	if err := os.Rename(j.path, j.segmentPath(1)); err != nil {
 		return false, fmt.Errorf("rotate journal: rotate current: %w", err)
 	}
+	// The renamed segment inherits the current file's mode. New v2 files
+	// are 0600, but an un-migrated legacy 0644 current would carry
+	// world-read into the rotated (secret-bearing) segment; re-assert
+	// owner-only here so rotation never widens exposure (#5188).
+	chmodOwnerOnly(j.segmentPath(1))
 	return true, nil
 }
 
@@ -262,6 +338,8 @@ func (j *Journal) maybeRotateLocked() (bool, error) {
 func (j *Journal) Tail(limit int) ([]*Entry, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+
+	j.migratePermsLocked()
 
 	if limit <= 0 {
 		return j.readAllLocked()
