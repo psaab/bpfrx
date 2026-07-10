@@ -145,8 +145,9 @@ after HA failover. To make that **structural**, not flag-defended:
   LIVE, so the live-conn count goes 1 → (briefly 0, internal) → 1 with no
   observable 0-conn window for callers, and never momentarily 2 (the old conn
   is gone first). This applies ONLY to a replace — it is NOT a withdrawal, so
-  it still emits no goodbye; a genuine `Withdraw`/`Clear`/removal keeps its
-  existing lifetime-0-goodbye + go-down behavior. The sender exposes
+  it still emits no goodbye; a genuine `Withdraw`/removal keeps its existing
+  lifetime-0-goodbye + go-down behavior (`Clear` is the explicit no-goodbye
+  primitive). The sender exposes
   `waitConnReady(timeout) bool`; the owner calls `signalConnReady(opened)`
   after `openConn` so a failed/pre-empted open releases the waiter promptly
   rather than blocking the full timeout on a sender that will never serve.
@@ -237,7 +238,14 @@ never retried and the stale IPv6 default-router identity lingered on hosts
 - `New()` — `ra.go`.
 - `Apply(configs []*config.RAInterfaceConfig) error` — `ra.go`.
   Starts/stops per-interface senders; defers + retries (epoch-guarded)
-  any interface that is currently draining.
+  any interface that is currently draining. A CHANGED config is a hard
+  replace (no goodbye — the router is not going away, the replacement
+  re-advertises at once). A REMOVED config — this interface dropped from a
+  non-empty desired set, OR an empty `configs` (all RA removed) — is a
+  GRACEFUL withdraw that emits a final lifetime-0 goodbye (#5092), so hosts
+  drop this router immediately instead of holding the stale default route
+  until Router Lifetime (default 1800s) expires. The empty-config branch
+  shares `Withdraw()`'s path via `collectGracefulWithdrawLocked`.
 - `Withdraw() error` — `ra.go`. Graceful goodbye + stop on every sender.
 - `ResendBurst()` — `ra.go`. Re-sends the startup burst (used after a
   link cycle) on every active sender, via the owner goroutine.
@@ -255,7 +263,10 @@ never retried and the stale IPv6 default-router identity lingered on hosts
   goodbye — the #2033 blackhole class). The tombstone is then HELD across
   the goodbye emit, so the busy state — and thus the mutual exclusion —
   extends over the whole operation, not just the install instant.
-- `Clear() error` — `ra.go`. Hard stop (no goodbye) of every sender.
+- `Clear() error` — `ra.go`. Hard stop (no goodbye) of every sender — the
+  explicit no-goodbye primitive for a forced/unsafe stop. NOTE: config-driven
+  removal no longer uses this; the daemon's standalone reconcile now withdraws
+  gracefully (`Withdraw()`) when all RA config is removed (#5092).
 - `Status()` — `ra.go`. Per-interface `SenderInfo`. A running sender has
   `State == "active"`; an interface whose sender is tearing down /
   emitting its goodbye is reported with `State == "draining"` (distinct
