@@ -43959,6 +43959,8 @@ top.
   **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4963 stop flow-export session-close records being silently stranded when a callback loaded the pre-reconcile bundle just before it was retired. Added an allocation-free admission lease to flowBatch (retired flag + inflight atomic + handoffDropped counter + injected fixed-cardinality family counter). add() rejects+counts a post-retire record instead of appending it into a batch nothing drains; Exporter/IPFIXExporter.Retire() (called before cancel in both reconcile swap + teardown paths) drains in-flight admits so records admitted before the final flush are still flushed. Surfaced HandoffDropped in ExporterBatchStats + Daemon.FlowExportHandoffDropped().
+  **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go, pkg/flowexport/handoff_lease_4963_test.go, pkg/flowexport/README.md, pkg/daemon/daemon.go, pkg/daemon/daemon_flowexport.go
   **Action**: #4964 stop applyAggregator leaking an append-only EventReader callback + a never-flushed 20k-key SessionAggregator per report-enabled commit. Register one stable indirection callback (aggregationCallback) exactly once via aggCBOnce, publish the live aggregator through an atomic.Pointer (aggregatorPtr), swap-to-nil-before-cancel on retire — mirrors the #3932 TraceWriter / #2075 flowexport pattern. Removed the write-only aggregator field; added aggReconMu.
   **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_system.go, pkg/daemon/aggregator_callback_4964_test.go
 

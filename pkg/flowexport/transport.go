@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -377,6 +378,40 @@ type flowBatch struct {
 	// It captures the worst-case backlog even after a later drain empties the
 	// queue, so a transient stall is still visible after the fact (#3747).
 	maxDepth atomic.Uint64
+
+	// --- #4963 admission lease ---
+	// The session-close callback loads the live exporter bundle then calls
+	// ExportSessionClose -> add() on each group's exporter. A reconcile that
+	// publishes a new bundle, cancels the old exporter's Run (which does its
+	// FINAL flushBatches on ctx cancel and returns), and closes it can race a
+	// callback that loaded the OLD bundle just before the swap: that late add()
+	// would append into a batch nothing will ever drain again, silently
+	// stranding a session-close record while every queue/collector metric looks
+	// healthy. #3742 closed only the publish-before-teardown window; this is the
+	// loaded-old-bundle residual.
+	//
+	// retired flips true when the owning exporter's generation is being torn
+	// down (bundle already swapped/emptied, final flush imminent). inflight
+	// counts add() calls that passed the retired gate. retire() sets retired
+	// then spins until inflight drains, so a record admitted BEFORE the final
+	// flush is guaranteed to still be in the batch that flush drains. A record
+	// offered AFTER retire flips is rejected and counted (handoffDropped, plus
+	// the injected fixed-cardinality sharedHandoff) instead of being silently
+	// stranded. Allocation-free: plain atomics, no per-call allocation, and the
+	// drain spin runs only on the rare day-2 reconcile teardown path.
+	retired        atomic.Bool
+	inflight       atomic.Int64
+	handoffDropped atomic.Uint64
+	// sharedHandoff, when injected by the daemon (SetHandoffCounter), is a
+	// single family-level counter every exporter of a family increments on a
+	// handoff reject, so drops on an exporter that has already left the live
+	// bundle stay observable at fixed cardinality (one counter per family, not
+	// one per retired-and-discarded exporter). Nil on a bare/zero-value batch.
+	sharedHandoff *atomic.Uint64
+	// inflightHook, when set (tests only), runs while an admitted add() holds
+	// the lease. It exists to deterministically exercise the retire() drain
+	// wait — production never sets it.
+	inflightHook func()
 }
 
 // batchCap returns the effective per-family record cap.
@@ -401,6 +436,29 @@ func (b *flowBatch) batchCap() int {
 // path. Which end is dropped barely matters for forensic value in a close
 // storm (all closes are near-contemporaneous); O(1) non-blocking does.
 func (b *flowBatch) add(fr FlowRecord) {
+	// #4963 admission lease. Increment inflight BEFORE reading retired so
+	// retire()'s drain can never slip between the gate check and the append:
+	// if this add() observes retired==false it was sequenced before
+	// retire()'s Store(true) (sync/atomic total order), therefore its inflight
+	// increment is visible to retire()'s drain loop, which then waits for the
+	// matching decrement below — so the record is guaranteed to be in the batch
+	// the final flush drains. If retired is already set, reject the record and
+	// count it (locally + on the injected family counter) rather than appending
+	// it into a batch that will never be drained again.
+	b.inflight.Add(1)
+	if b.retired.Load() {
+		b.inflight.Add(-1)
+		b.handoffDropped.Add(1)
+		if b.sharedHandoff != nil {
+			b.sharedHandoff.Add(1)
+		}
+		return
+	}
+	defer b.inflight.Add(-1)
+	if b.inflightHook != nil {
+		b.inflightHook()
+	}
+
 	capN := b.batchCap()
 	b.mu.Lock()
 	dst := &b.v4
@@ -421,6 +479,31 @@ func (b *flowBatch) add(fr FlowRecord) {
 		b.maxDepth.Store(depth)
 	}
 }
+
+// retire flips the batch to the retired state and blocks until every add()
+// that had already acquired the admission lease has finished, so a record
+// admitted before the owning exporter's final flush is guaranteed to be drained
+// by that flush (#4963). Records offered after retire returns are rejected and
+// counted (handoffDropped / the injected family counter). Allocation-free: a
+// bounded spin on the atomic inflight counter, drained in microseconds by the
+// short add() critical section, only on the rare day-2 reconcile teardown path.
+// One-way and idempotent — retired exporters are always discarded, never reused.
+func (b *flowBatch) retire() {
+	b.retired.Store(true)
+	for b.inflight.Load() != 0 {
+		runtime.Gosched()
+	}
+}
+
+// setSharedHandoff injects the fixed-cardinality family-level handoff-drop
+// counter (#4963). Called once at exporter construction, before Run starts, so
+// it never races add().
+func (b *flowBatch) setSharedHandoff(c *atomic.Uint64) { b.sharedHandoff = c }
+
+// HandoffDropped returns the cumulative count of session-close records this
+// batch rejected because they arrived after the owning exporter was retired
+// (#4963) — records that would otherwise have been silently stranded.
+func (b *flowBatch) HandoffDropped() uint64 { return b.handoffDropped.Load() }
 
 // drain atomically removes and returns the accumulated v4 and v6
 // records, resetting both batches to empty.
@@ -467,4 +550,12 @@ type ExporterBatchStats struct {
 	MaxDepth uint64 `json:"max_depth"`
 	// Dropped is the cumulative count of records dropped at capacity.
 	Dropped uint64 `json:"dropped"`
+	// HandoffDropped is the cumulative count of session-close records this
+	// exporter rejected because they arrived after it was retired during a
+	// reconcile (#4963) — records that would otherwise have been silently
+	// stranded in a batch nothing drains. Nonzero only transiently, on the
+	// exporter generation being torn down; the fixed family total surfaced by
+	// the daemon aggregates the same event across retired-and-discarded
+	// exporters.
+	HandoffDropped uint64 `json:"handoff_dropped"`
 }

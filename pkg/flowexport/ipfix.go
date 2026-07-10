@@ -923,6 +923,18 @@ func (e *IPFIXExporter) BatchMaxDepth() uint64 { return e.batch.MaxDepth() }
 // the export batch was at capacity. See Exporter.BatchDropped (#3747).
 func (e *IPFIXExporter) BatchDropped() uint64 { return e.batch.Dropped() }
 
+// Retire quiesces the exporter's batch admission lease ahead of the final
+// flush on ctx cancel — the IPFIX equivalent of Exporter.Retire (#4963).
+func (e *IPFIXExporter) Retire() { e.batch.retire() }
+
+// HandoffDropped returns the count of session-close records this exporter
+// rejected because they arrived after it was retired (#4963).
+func (e *IPFIXExporter) HandoffDropped() uint64 { return e.batch.HandoffDropped() }
+
+// SetHandoffCounter injects a fixed-cardinality family-level handoff-drop
+// counter — the IPFIX equivalent of Exporter.SetHandoffCounter (#4963).
+func (e *IPFIXExporter) SetHandoffCounter(c *atomic.Uint64) { e.batch.setSharedHandoff(c) }
+
 // CollectorHealth returns a per-collector write-health snapshot (#2464).
 func (e *IPFIXExporter) CollectorHealth() []CollectorHealth {
 	return e.conns.health()
