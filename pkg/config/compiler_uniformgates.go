@@ -350,6 +350,28 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5184 VRRP priority wire-width gate. Strict on commit / commit-check
+	// (hard-reject a `vrrp-group <id> priority <n>` outside the RFC 5798 range
+	// 1..255 — the priority is truncated onto a single wire byte, so 256 wraps
+	// to the reserved priority 0 and the group advertises resignation and never
+	// masters the VIP, 300 aliases to 44). The structured spellings are already
+	// gated by the schema `priority` leaf's ValidateInteger(1,255), but the
+	// PACKED hierarchical one-liner `vrrp-group 1 priority 256;` bypasses the
+	// schema walker (its priority is consumed as an unvalidated identity token,
+	// walkInstanceChildren) and is only caught here on the compiled *Config.
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config an older binary accepted still boots — #1960 no-brick). Runs on the
+	// fully-compiled *Config (VRRPGroups populated by parseVRRPGroups), where the
+	// wide int Priority still shows 256 as 256, before the sendAdvert uint8 cast.
+	if err := validateVRRPGroupPriorityStrict(cfg); err != nil {
+		if opts.lenientVRRPGroupPriority {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("vrrp-group priority (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #4826 reth-derived VRRP VRID wire-width gate. Strict on commit /
 	// commit-check (hard-reject a `redundant-ether-options
 	// redundancy-group <id>` whose id would push the reth-derived VRRP

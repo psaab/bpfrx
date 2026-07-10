@@ -2057,6 +2057,30 @@ reserved for whole-dataplane selection where a rewrite shim
   parse in `parseVRRPGroups` no longer swallows an `strconv.Atoi` error
   with `_ =` — a bad parse kept the constructor default (priority 100)
   instead of silently resetting to 0 (the RFC 5798 resignation value).
+  **#5184 — VRRP priority range gate:** the structured `priority`
+  spellings are gated at the schema layer by the leaf's
+  `ValidateInteger(1,255)`, but the hierarchical PACKED one-liner
+  `vrrp-group 1 priority 256;` packs the priority onto the instance
+  node's Keys, which the schema walker consumes as an unvalidated
+  identity token (`walkInstanceChildren`) — the same identity-token
+  residual as the `vrrp-group <id>` slot. `parseVRRPGroups` stored the
+  out-of-range value verbatim into the wide `int` `VRRPGroup.Priority`,
+  and the native engine later truncates it onto the single wire byte
+  (`uint8(priority)` in `sendAdvert`, `pkg/vrrp/instance.go`), so a
+  `priority 256` wrapped to the RESERVED priority 0 (RFC 5798 §5.2.4 —
+  the group advertises resignation on every beacon and never masters the
+  VIP, an HA blackhole) and 300 aliased to 44 (a silent demotion below
+  the intended weight). `validateVRRPGroupPriorityStrict`
+  (`compiler_validate_strict_vrrp_priority.go`) closes it exactly like
+  #4573 closed the VRID slot: it runs on the compiled `*Config` — where
+  the wide `int` still shows 256 as 256, before the `uint8` narrowing —
+  and hard-rejects a priority outside 1..255 at commit / commit-check,
+  catching BOTH the packed one-liner AND the structured form; the
+  tolerant load / peer-sync path downgrades it to a warning
+  (`lenientVRRPGroupPriority`, #1960 no-brick). Pinned by
+  `TestSchemaValidate_Interfaces_PackedVrrpOneLinerBypassesGate` (schema
+  passes, compile rejects) and the
+  `compiler_validate_strict_vrrp_priority_5184_test.go` matrix.
   **#4826 — reth-derived VRID range gate:** #4573 only bounded the
   *explicit* `vrrp-group <id>` slot; a RETH interface's VRRP GroupID is
   separately synthesized as `100 + redundancy-group-id`

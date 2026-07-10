@@ -1357,6 +1357,23 @@ type compileOpts struct {
 	// advertise an out-of-range VRID, so a leniently-loaded bad id is bounded,
 	// not a wrong-VRID advert. Same doctrine as lenientChassisRG.
 	lenientVRRPGroupID bool
+	// lenientVRRPGroupPriority (#5184) downgrades the VRRP priority
+	// wire-width gate (validateVRRPGroupPriorityStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `vrrp-group <id> priority <n>` outside the RFC 5798
+	// range 1..255 (the priority is truncated onto a single wire byte in
+	// sendAdvert, so 256 wraps to the reserved priority 0 — the group
+	// advertises resignation and never masters the VIP — and 300 aliases to
+	// 44). The structured spellings are gated at the schema layer
+	// (ValidateInteger(1,255)), but the PACKED hierarchical one-liner
+	// `vrrp-group 1 priority 256;` packs the priority onto the instance
+	// node's Keys, which the schema walker consumes as an unvalidated
+	// identity token (walkInstanceChildren), so an out-of-range packed
+	// priority used to commit cleanly and produce a resigning instance. The
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted or peer-synced config an older binary accepted still BOOTS
+	// (#1960 no-brick). Same doctrine as lenientVRRPGroupID.
+	lenientVRRPGroupPriority bool
 	// lenientRethVRRPGroupID (#4826) downgrades the reth-derived VRRP VRID
 	// wire-width gate (validateRethVRRPGroupIDStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1783,6 +1800,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFlowAging:                       true,
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
+		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
@@ -2052,6 +2070,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFlowAging:                       true,
 		lenientChassisRG:                       true,
 		lenientVRRPGroupID:                     true,
+		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,

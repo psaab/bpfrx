@@ -346,28 +346,47 @@ func TestSchemaValidate_Interfaces_AcceptedValuesCompileAsWritten(t *testing.T) 
 	}
 }
 
-// Known residual, pinned for honesty (same class as the chassis PR-2
-// `node 0 priority 300;` one-liner): the hierarchical PACKED one-liner
-// `vrrp-group 1 priority 300;` packs the property into the instance
-// node's Keys, which the walker's compiler-faithful contract consumes
-// as identity tokens without validation — even though the vrrp
-// compiler's legacy Keys-packed loop (compiler_interfaces.go:376) DOES
-// compile it (priority 300 then wraps at the uint8 wire encode). The
-// structured spellings (flat-set `set ... vrrp-group 1 priority 300`
-// and the braced block) ARE gated — see the matrix.
+// The hierarchical PACKED one-liner `vrrp-group 1 priority 256;` packs
+// the property into the instance node's Keys, which the schema walker's
+// compiler-faithful contract consumes as identity tokens WITHOUT running
+// the `priority` leaf's ValidateInteger(1,255) — so SchemaValidate alone
+// still passes it (an inherent limit of the schema layer, same class as
+// the chassis PR-2 `node 0 priority 300;` one-liner). #5184 backstops
+// that bypass at the COMPILED-*Config layer: validateVRRPGroupPriorityStrict
+// hard-rejects the out-of-range priority at strict commit, before the
+// sendAdvert uint8 narrowing wraps 256 to the RFC 5798 resignation value 0.
+// This test pins BOTH facts — the schema walker passes, the compile gate
+// rejects — so a revert of either the gate or the schema deferral is caught.
 func TestSchemaValidate_Interfaces_PackedVrrpOneLinerBypassesGate(t *testing.T) {
-	if err := schemaCheck(t, `interfaces {
+	const packed = `interfaces {
     ge-0-0-0 {
         unit 0 {
             family inet {
                 address 10.0.1.10/24 {
-                    vrrp-group 1 priority 300;
+                    vrrp-group 1 priority 256;
                 }
             }
         }
     }
-}`); err != nil {
-		t.Fatalf("documented bypass changed behaviour (now rejects?): %v", err)
+}`
+	// The schema walker still consumes the packed priority as an identity
+	// token and does not range-check it (documented layer limit).
+	if err := schemaCheck(t, packed); err != nil {
+		t.Fatalf("schema walker unexpectedly rejected the packed one-liner "+
+			"(the schema layer consumes it as identity tokens): %v", err)
+	}
+	// #5184: the compiled-*Config gate DOES reject it at strict commit.
+	tree, errs := config.NewParser(packed).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if _, err := config.CompileConfig(tree); err == nil {
+		t.Fatal("strict commit must reject the packed `vrrp-group 1 " +
+			"priority 256` (uint8 wire truncation wraps 256 to the RFC 5798 " +
+			"resignation priority 0), got nil error")
+	} else if !strings.Contains(err.Error(), "priority 256") ||
+		!strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("error %q does not name the out-of-range packed priority", err.Error())
 	}
 }
 

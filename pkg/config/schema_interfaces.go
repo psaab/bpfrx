@@ -282,6 +282,15 @@ func vrrpGroupSchemaNode(v6 bool) *schemaNode {
 		// uint8); 0 is the "unset → default 100" compiler sentinel and
 		// also the RFC 5798 resignation value, 255 is the valid IP-owner
 		// priority (instance.go:256). Junos: 1..255 — identical.
+		// NOTE (#5184): this leaf validator gates only the STRUCTURED
+		// spellings (flat-set / braced). The hierarchical PACKED one-liner
+		// `vrrp-group 1 priority 256;` packs the priority onto the instance
+		// node's Keys, which walkInstanceChildren consumes as an
+		// unvalidated identity token (same residual as the vrrp-group <id>
+		// slot) — it is backstopped by the semantic commit gate
+		// validateVRRPGroupPriorityStrict on the compiled *Config
+		// (compiler_validate_strict_vrrp_priority.go), the analog of
+		// validateVRRPGroupIDStrict (#4573).
 		"priority": {
 			desc:          "VRRP priority",
 			args:          1,
