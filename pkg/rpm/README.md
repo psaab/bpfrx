@@ -76,6 +76,15 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
   failures; ambiguous dial errnos default to PATH.
 - The raw-socket seam is injectable (`icmpListenFunc` in `icmp.go`) so
   prober logic is unit-testable without privileges.
+- **The http-get probe's transport is one-shot** (#4912): `probeHTTP`
+  builds a per-probe `http.Transport`, sets `DisableKeepAlives: true`, and
+  defers `CloseIdleConnections()`, then drains+closes the response body on
+  every path. A bodyless response (HTTP 204 / `Content-Length: 0`) is
+  fully consumed by `Body.Close()`, so the keep-alive default would return
+  the socket to the idle pool of that now-unowned transport (whose
+  `IdleConnTimeout == 0` never expires) — leaking one fd + read-loop
+  goroutine per probe to an empty health endpoint. Disabling keep-alives
+  closes the connection after the single request instead.
 - `destination-interface` takes precedence over the routing-instance
   VRF device for `SO_BINDTODEVICE`; otherwise VRF binding uses
   `vrf-<ri-name>` — not the destination interface itself.
