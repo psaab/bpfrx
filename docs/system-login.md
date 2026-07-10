@@ -416,6 +416,50 @@ left as a lockout landmine, because a single malformed file in
 `/etc/sudoers.d` breaks **all** sudo invocations. `root` is never
 granted an xpf-managed drop-in.
 
+## Removing a login user revokes its host credentials (#5128)
+
+Deleting a whole `system login user` from config — not just its
+`encrypted-password` directive — revokes that account's host access on
+the next commit. Before #5128 only the sudo grant was swept
+(`reconcileSudoers`); the account, its password, and its
+`authorized_keys` all survived, so a deprovisioned operator could still
+SSH in by password or key. `reconcileAbsentLoginUsers`
+(`pkg/daemon/login_password.go`) closes that gap and, like
+`reconcileSudoers`, runs **unconditionally** on every apply (including
+the "all users removed" case):
+
+1. Enumerate `/var/lib/xpf/provisioned-users/` — the accounts xpf
+   actually provisioned (the UID-keyed provenance markers, #1944 §5.4).
+2. For each marked username **no longer present** in
+   `system login { user ... }`, and **only** while the marker's recorded
+   UID still equals the account's current `/etc/passwd` UID
+   (`xpfProvisioned`): **lock** the password (`<user>:!` via
+   `chpasswd -e`, idempotent — skipped if already locked) and **remove**
+   the xpf-managed `/home/<user>/.ssh/authorized_keys`, then drop the
+   provenance marker so xpf forgets the account.
+
+The path is scoped and fail-closed:
+
+- An **out-of-band account** (no marker) is never enumerated, so it is
+  never touched.
+- A marker whose UID no longer matches the live account (deleted +
+  recreated out of band with a different UID) is treated as **not ours**:
+  the account is left intact and only the stale marker is cleaned.
+- On a `/etc/shadow` read error, a `chpasswd` failure, or an
+  `authorized_keys` removal failure, the marker is **retained** so the
+  next apply retries — a credential is never forgotten while it may still
+  be live.
+- `root` is never deprovisioned.
+
+Unlike the `zeroize` teardown (#4598), which `userdel -r`s the whole
+account, ordinary removal only **locks** the password and removes the
+managed key file. That fully revokes login (password and key) while
+being reversible: re-adding the user to config recreates the account and
+re-provisions it. Note the distinction from the section above: removing
+just the **`encrypted-password` directive** (user still present) locks
+the password but leaves `authorized_keys`; removing the **whole user**
+revokes both.
+
 ### Scope — only xpf-managed accounts
 
 The lock-on-removal applies **only to the exact account xpf
