@@ -473,7 +473,9 @@ func sessionEntryFromPB(e *pb.SessionEntry) SessionEntry {
 }
 
 // sessionSummaryFromPB maps a protobuf session summary (the peer node's view)
-// onto the REST SessionSummary shape (#3423 M5).
+// onto the REST SessionSummary shape (#3423 M5). The peer carries its OWN
+// max_sessions (#5323); its peer_status is not recursed (the peer leg is
+// local-only).
 func sessionSummaryFromPB(p *pb.GetSessionSummaryResponse) *SessionSummary {
 	return &SessionSummary{
 		TotalEntries: int(p.GetTotalEntries()),
@@ -484,6 +486,24 @@ func sessionSummaryFromPB(p *pb.GetSessionSummaryResponse) *SessionSummary {
 		SNATSessions: int(p.GetSnatSessions()),
 		DNATSessions: int(p.GetDnatSessions()),
 		NodeID:       int(p.GetNodeId()),
+		MaxSessions:  p.GetMaxSessions(),
+	}
+}
+
+// peerFetchStatusString renders the protobuf PeerFetchStatus enum as the REST
+// JSON string surfaced on SessionSummary / ZonePairSummaryResponse (#5320). The
+// UNSPECIFIED zero value renders "" (omitted) so an older/absent gRPC server
+// does not fabricate a status.
+func peerFetchStatusString(s pb.PeerFetchStatus) string {
+	switch s {
+	case pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE:
+		return "not-applicable"
+	case pb.PeerFetchStatus_PEER_FETCH_STATUS_OK:
+		return "ok"
+	case pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE:
+		return "unreachable"
+	default:
+		return ""
 	}
 }
 
@@ -559,16 +579,34 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 
 	summary.NodeID = s.nodeID()
 
+	// #5323: the dataplane's dynamic session-table capacity, fetched from the
+	// live helper status (0 = unknown when no userspace status surface exists).
+	if st := fetchUserspaceStatus(s.dp); st != nil {
+		summary.MaxSessions = st.MaxSessions
+	}
+
+	// Default peer-status: a summary without include_peer makes no claim about
+	// a peer (#5320). The include_peer path below overrides this with the gRPC
+	// server's authoritative classification.
+	summary.PeerStatus = "not-applicable"
+
 	// Augment with the cluster peer's summary when the operator opted in and
 	// an HA-aware service is wired (#3423 M5): the local summary alone
-	// understates total HA state. A standalone node / unreachable peer
-	// leaves Peer nil.
+	// understates total HA state. #5320: surface the peer-fetch completeness so
+	// an unreachable peer (LOCAL-ONLY totals) is distinguishable from a healthy
+	// standalone node rather than silently leaving Peer nil.
 	if includePeer {
 		if svc := s.clusterSession(); svc != nil {
-			if pr, err := svc.GetSessionSummary(r.Context(), &pb.GetSessionSummaryRequest{IncludePeer: true}); err == nil {
+			pr, err := svc.GetSessionSummary(r.Context(), &pb.GetSessionSummaryRequest{IncludePeer: true})
+			if err != nil {
+				summary.PeerStatus = "unreachable"
+				summary.PeerError = err.Error()
+			} else {
 				if peer := pr.GetPeer(); peer != nil {
 					summary.Peer = sessionSummaryFromPB(peer)
 				}
+				summary.PeerStatus = peerFetchStatusString(pr.GetPeerStatus())
+				summary.PeerError = pr.GetPeerError()
 			}
 		}
 	}
@@ -739,7 +777,7 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 		return result[i].ToZone < result[j].ToZone
 	})
 
-	resp := ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: result}
+	resp := ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: result, PeerStatus: "not-applicable"}
 
 	// Augment with the cluster peer's zone-pair breakdown when the operator
 	// opted in and an HA-aware service is wired (#3592): the local breakdown
@@ -750,10 +788,18 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 	// first-page gate.
 	if includePeer {
 		if svc := s.clusterSession(); svc != nil {
-			if pr, err := svc.GetZonePairSummary(r.Context(), &pb.GetZonePairSummaryRequest{IncludePeer: true}); err == nil {
+			pr, err := svc.GetZonePairSummary(r.Context(), &pb.GetZonePairSummaryRequest{IncludePeer: true})
+			if err != nil {
+				// #5320: a failed local RPC still leaves the breakdown
+				// incomplete — mark it unreachable rather than silently OK.
+				resp.PeerStatus = "unreachable"
+				resp.PeerError = err.Error()
+			} else {
 				if peer := pr.GetPeer(); peer != nil {
 					resp.Peer = zonePairSummaryFromPB(peer)
 				}
+				resp.PeerStatus = peerFetchStatusString(pr.GetPeerStatus())
+				resp.PeerError = pr.GetPeerError()
 			}
 		}
 	}

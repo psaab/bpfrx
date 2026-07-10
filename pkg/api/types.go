@@ -361,6 +361,18 @@ type SessionSummary struct {
 	// include_peer=true and a reachable peer exists.
 	NodeID int             `json:"node_id"`
 	Peer   *SessionSummary `json:"peer,omitempty"`
+	// MaxSessions is the dataplane's dynamic session-table capacity (#5323):
+	// the live AF_XDP helper publishes worker_count x per-worker capacity.
+	// Omitted (0) when no userspace status is attached — a consumer treats
+	// that as unknown rather than a fabricated authoritative bound.
+	MaxSessions uint64 `json:"max_sessions,omitempty"`
+	// PeerStatus classifies the include_peer fan-out completeness (#5320):
+	// "ok" (peer summary attached), "unreachable" (peer requested but the
+	// fetch failed — the totals here are LOCAL-ONLY), or "not-applicable"
+	// (standalone node / include_peer not set). Empty on an older/absent
+	// server. PeerError carries the failure detail when unreachable.
+	PeerStatus string `json:"peer_status,omitempty"`
+	PeerError  string `json:"peer_error,omitempty"`
 }
 
 // EventEntry holds a single event record. The forensic fields below the
@@ -770,6 +782,12 @@ type ZonePairSummaryResponse struct {
 	// (standalone build, unreachable peer, or include_peer absent). Mirrors
 	// SessionSummary.Peer (#3592).
 	Peer *ZonePairSummaryResponse `json:"peer,omitempty"`
+	// PeerStatus / PeerError mirror SessionSummary (#5320): "ok" /
+	// "unreachable" / "not-applicable". An unreachable peer means this
+	// breakdown is LOCAL-ONLY, previously indistinguishable from a healthy
+	// standalone node (peer was silently nil).
+	PeerStatus string `json:"peer_status,omitempty"`
+	PeerError  string `json:"peer_error,omitempty"`
 }
 
 // BufferInfo holds dataplane buffer utilization information.

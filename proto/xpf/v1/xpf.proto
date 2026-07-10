@@ -433,6 +433,22 @@ message GetSessionSummaryResponse {
   int32 dnat_sessions = 7;
   int32 node_id = 8;
   GetSessionSummaryResponse peer = 9;
+  // peer_status classifies the include_peer fan-out completeness (#5320): OK
+  // when the peer summary is present under `peer`, UNREACHABLE when the peer
+  // was requested but its fetch failed (the totals here are LOCAL-ONLY and
+  // understate cluster-wide state), NOT_APPLICABLE for a standalone node or an
+  // unset include_peer. Before #5320 a peer-fetch failure was logged and
+  // swallowed, leaving peer=nil — indistinguishable from a healthy standalone.
+  PeerFetchStatus peer_status = 10;
+  // peer_error carries the human-readable peer-fetch failure detail; empty
+  // unless peer_status == UNREACHABLE (#5320).
+  string peer_error = 11;
+  // max_sessions is the dataplane's dynamic session-table capacity: the live
+  // AF_XDP helper publishes worker_count x per-worker capacity. 0 = unknown
+  // (no userspace status attached), so a consumer must render "unknown" rather
+  // than a fabricated authoritative bound (#5323, replaces the hardcoded
+  // 10000000 the CLI used to print).
+  uint64 max_sessions = 12;
 }
 
 message GetNATSourceRequest {}
@@ -1034,4 +1050,24 @@ message GetZonePairSummaryResponse {
   repeated ZonePairSessionSummary zone_pairs = 1;
   int32 node_id = 2;                      // cluster node ID (0, 1, ...)
   GetZonePairSummaryResponse peer = 3;    // peer node breakdown (nil if standalone)
+  // peer_status / peer_error mirror GetSessionSummaryResponse (#5320): a peer
+  // fetch failure is now VISIBLE (UNREACHABLE) instead of leaving peer=nil and
+  // looking like a healthy standalone breakdown.
+  PeerFetchStatus peer_status = 4;
+  string peer_error = 5;
+}
+
+// PeerFetchStatus classifies whether a summary response's cluster-peer leg was
+// successfully included, so a machine consumer can distinguish a genuine
+// standalone / no-peer-requested view (NOT_APPLICABLE) from a cluster peer that
+// was requested but could NOT be reached (UNREACHABLE). Before #5320 a peer
+// fetch failure was logged and swallowed: the response returned the LOCAL-ONLY
+// totals with peer=nil, indistinguishable from a healthy standalone node — a
+// peer partition then looked like a healthy low session count. UNREACHABLE
+// surfaces the incompleteness while still returning the (useful) local totals.
+enum PeerFetchStatus {
+  PEER_FETCH_STATUS_UNSPECIFIED = 0;    // not evaluated / older server
+  PEER_FETCH_STATUS_NOT_APPLICABLE = 1; // standalone, or include_peer not set
+  PEER_FETCH_STATUS_OK = 2;             // peer requested and its data is included
+  PEER_FETCH_STATUS_UNREACHABLE = 3;    // peer requested but the fetch failed; peer data omitted
 }

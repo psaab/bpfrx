@@ -336,6 +336,17 @@ func (c *ctl) showSessionSummary() error {
 	} else {
 		printSessionSummaryBlock(resp)
 	}
+
+	// #5320: when the cluster peer was requested but could not be reached the
+	// totals above are LOCAL-ONLY. Surface that instead of letting a peer
+	// partition masquerade as a healthy low session count.
+	if resp.GetPeerStatus() == pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE {
+		fmt.Printf("\nwarning: cluster peer unreachable; counts above are LOCAL-ONLY")
+		if e := resp.GetPeerError(); e != "" {
+			fmt.Printf(" (%s)", e)
+		}
+		fmt.Println()
+	}
 	return nil
 }
 
@@ -357,7 +368,15 @@ func printSessionSummaryBlock(resp *pb.GetSessionSummaryResponse) {
 	fmt.Printf("  Pending sessions: 0\n")
 	fmt.Printf("  Invalidated sessions: 0\n")
 	fmt.Printf("  Sessions in other states: 0\n")
-	fmt.Printf("Maximum-sessions: 10000000\n")
+	// #5323: render the dataplane's dynamic max (worker_count x per-worker
+	// capacity) the live helper publishes, not the old hardcoded 10000000. A
+	// dataplane with no userspace status attached reports 0 -> "unknown"
+	// (render the truth rather than a fabricated authoritative bound).
+	if max := resp.GetMaxSessions(); max > 0 {
+		fmt.Printf("Maximum-sessions: %d\n", max)
+	} else {
+		fmt.Printf("Maximum-sessions: unknown\n")
+	}
 }
 
 func (c *ctl) showFlowStatistics() error {
