@@ -59,6 +59,14 @@ type drainEntry struct {
 	// interface) superseded the restart. It is 0 (and unused) for removal /
 	// Clear / WithdrawOnce entries, which pass onProvenClose=nil.
 	startIfaceEpoch uint64
+
+	// joinTimedOut records that releaseDrain gave up joining this entry's owner
+	// within claimWaitTimeout and handed the tombstone to the detached reclaimer
+	// (#5094). It is set true when the reclaimer is armed and surfaced in
+	// Manager.Status so an operator sees a wedged-owner interface as "join timed
+	// out; reclaiming" rather than a plain draining that silently converges. The
+	// reclaimer, not this flag, still owns the eventual goodbye/replacement.
+	joinTimedOut bool
 }
 
 // Manager manages per-interface RA sender goroutines.
@@ -178,26 +186,74 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 		case <-s.stopped:
 			// proven closed — fall through to the ordered decision below.
 		case <-t.C:
-			slog.Warn("ra: timed out joining draining sender; not emitting a "+
-				"standalone goodbye and not starting a replacement (owner may "+
-				"still hold a live conn); leaving tombstone held", "interface", name)
-			m.reclaimTombstoneWhenStopped(name, s)
+			slog.Warn("ra: timed out joining draining sender; deferring the "+
+				"goodbye/replacement to the reclaimer (owner may still hold a "+
+				"live conn); leaving tombstone held", "interface", name)
+			// #5094: the timeout defers, it must NOT erase this generation's
+			// owed action. Hand the SAME startEpoch + onProvenClose (nil for a
+			// removal/withdraw) to the detached reclaimer, which re-evaluates
+			// them against fresh state once the wedged owner finally proves
+			// closed — instead of dropping the replacement/goodbye and leaving
+			// the interface senderless until an unrelated later Apply re-drives
+			// it.
+			m.reclaimTombstoneWhenStopped(name, s, startEpoch, onProvenClose)
 			return nil
 		}
 	}
 
-	// Proven closed (or s==nil). The goodbye claim and the replacement decision
-	// are made against FRESH state at the act point. Because goodbyeWanted only
-	// goes false→true and epoch only increases, we may need at most one emit
-	// pass (claim → unlock → blocking emit → re-lock); a late Withdraw that
-	// flips goodbyeWanted during that emit gap is caught on the re-lock, which
-	// re-runs the same claim-and-decide logic before acting on the replacement.
+	// Proven closed (or s==nil): run the ordered post-close decision, then
+	// make-before-break — wait UNLOCKED for any started replacement's conn to
+	// come live so Apply returns only once the replacement RA conn is up, with
+	// no observable 0-live-conn window across a config replace (#2834). The old
+	// conn was PROVEN closed before the replacement started (≤1 live conn), and
+	// waitConnReady returns promptly if the open gives up or is pre-empted.
+	repl, err := m.finishDrainDecision(name, s, startEpoch, onProvenClose)
+	if repl != nil && !repl.waitConnReady(claimWaitTimeout) {
+		slog.Warn("ra: replacement sender conn did not come up after a "+
+			"config replace", "interface", name)
+	}
+	return err
+}
+
+// finishDrainDecision runs the ordered post-close decision for a draining
+// interface whose sender has PROVEN closed (the caller observed <-s.stopped, or
+// s==nil): emit an owed standalone goodbye (claim-once, held across the emit)
+// and/or start the still-current replacement, each re-evaluated against FRESH
+// state under m.mu, then remove the tombstone. It is the single body shared by
+// releaseDrain's proven-close arm AND the join-timeout reclaimer (#5094), so
+// both apply identical goodbye-vs-replace-vs-supersession rules.
+//
+// The goodbye claim and the replacement decision are made against FRESH state
+// at the act point. Because goodbyeWanted only goes false→true and epoch only
+// increases, at most one emit pass is needed (claim → unlock → blocking emit →
+// re-lock); a late Withdraw that flips goodbyeWanted during that emit gap is
+// caught on the re-lock, which re-runs the same claim-and-decide logic before
+// acting on the replacement.
+//
+// It returns the started replacement sender (nil if none started) so the caller
+// can wait UNLOCKED for its conn to come live (the #2834 make-before-break) —
+// finishDrainDecision itself must not block on that while holding m.mu. The
+// replacement is looked up from m.senders under the SAME lock that started it,
+// so the returned pointer is never a shared mutable local (no cross-goroutine
+// data race between a synchronous caller and the detached reclaimer).
+//
+// Identity guard (matters for the reclaimer, a no-op for releaseDrain): when
+// s != nil the whole decision is gated on the live tombstone still being OURS
+// (e.sender == s). The reclaimer runs long after the timeout, so a newer
+// Apply/Withdraw may have replaced the tombstone with its own entry; if so we
+// do nothing and leave it to its new owner. releaseDrain's synchronous caller
+// installs the entry immediately before this runs, and a racing Withdraw only
+// flips fields on that SAME entry (never replaces it), so the guard always
+// holds there — the behavior is unchanged.
+func (m *Manager) finishDrainDecision(name string, s *sender, startEpoch uint64, onProvenClose func() error) (*sender, error) {
 	for {
 		m.mu.Lock()
 		e := m.draining[name]
-		if e == nil {
+		if e == nil || (s != nil && e.sender != s) {
+			// Gone, or a newer call re-claimed the interface with its own entry;
+			// that newer owner manages its own goodbye/replacement/release.
 			m.mu.Unlock()
-			return nil // defensive; owner holds it
+			return nil, nil
 		}
 
 		// Decide goodbye claim-once with FRESH goodbyeWanted/goodbyeClaimed.
@@ -228,35 +284,65 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 		// no interface-scoped withdraw naming this interface superseded), AND no
 		// goodbye was wanted (a withdraw overrides a replace). None can change
 		// while we hold the lock.
-		var startErr error
+		var (
+			startErr error
+			repl     *sender
+		)
 		if onProvenClose != nil && m.epoch == startEpoch &&
 			m.ifaceEpoch[name] == e.startIfaceEpoch && !e.goodbyeWanted {
 			// Old conn PROVEN closed + tombstone still held → ≤1 live conn.
-			startErr = onProvenClose()
+			if startErr = onProvenClose(); startErr == nil {
+				repl = m.senders[name]
+			}
 		}
 		delete(m.draining, name)
 		m.mu.Unlock()
-		return startErr
+		return repl, startErr
 	}
 }
 
 // reclaimTombstoneWhenStopped detaches a goroutine that waits for a wedged
-// owner to finally exit, then removes its tombstone under m.mu. This self-heals
-// the degraded "tombstone held forever after a join timeout" state without ever
-// opening a second conn while the old one may be live. No goodbye and no
-// replacement are emitted/started here — the timeout already declined both.
-func (m *Manager) reclaimTombstoneWhenStopped(name string, s *sender) {
+// owner to finally exit, then completes the SAME ordered post-close decision
+// releaseDrain would have run inline had the join not timed out (#5094): emit an
+// owed standalone goodbye and/or start the still-current replacement, then
+// remove the tombstone. This self-heals the degraded "join timed out" state
+// WITHOUT ever opening a second conn while the old one may be live — the
+// replacement is opened only after <-s.stopped proves the old conn closed, and
+// only while the tombstone is still held (≤1 live conn).
+//
+// startEpoch and onProvenClose are the caller's captured generation intent
+// (onProvenClose is nil for a removal/withdraw, which want no replacement).
+// finishDrainDecision re-evaluates them against fresh state under m.mu and its
+// identity guard leaves a newer owner's re-claimed entry untouched. It is the
+// exact same decision body the synchronous proven-close arm runs, so a
+// timeout defers the action rather than erasing it.
+func (m *Manager) reclaimTombstoneWhenStopped(name string, s *sender, startEpoch uint64, onProvenClose func() error) {
+	// Mark the still-held tombstone so Status surfaces the wedged-owner interface
+	// as "join timed out; reclaiming" rather than a plain draining (#5094).
+	m.mu.Lock()
+	if e := m.draining[name]; e != nil && e.sender == s {
+		e.joinTimedOut = true
+	}
+	m.mu.Unlock()
+
 	go func() {
 		<-s.stopped
-		m.mu.Lock()
-		// Only remove if it is still the SAME entry we left (a newer call may
-		// have replaced it; that newer owner manages its own lifecycle).
-		if e := m.draining[name]; e != nil && e.sender == s {
-			delete(m.draining, name)
-			slog.Info("ra: reclaimed tombstone after wedged owner finally exited",
-				"interface", name)
+		// The wedged owner has finally exited; its conn is now PROVEN closed.
+		repl, err := m.finishDrainDecision(name, s, startEpoch, onProvenClose)
+		if err != nil {
+			slog.Warn("ra: reclaimer replacement start failed after wedged owner "+
+				"exited", "interface", name, "err", err)
+			return
 		}
-		m.mu.Unlock()
+		// Best-effort make-before-break for the healed replacement (bounded).
+		// This path is already degraded (the old owner wedged past the join
+		// timeout, so there was an unavoidable RA gap); the wait only bounds how
+		// long the detached reclaimer lingers before logging completion.
+		if repl != nil {
+			repl.waitConnReady(claimWaitTimeout)
+		}
+		slog.Info("ra: reclaimed tombstone after wedged owner finally exited",
+			"interface", name)
 	}()
 }
 
@@ -399,37 +485,24 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	// on the proven-closed arm while the tombstone is held (≤1 live conn) and
 	// only if a graceful withdraw did not supersede the replace. A removal
 	// passes onProvenClose=nil (no replacement).
+	//
+	// onProvenClose is a bare startLocked closure that touches NO Apply-local
+	// state: on the join-TIMEOUT path releaseDrain hands this same closure to the
+	// detached reclaimer, which runs it in another goroutine after the wedged
+	// owner finally exits (#5094). A closure that wrote back into an Apply local
+	// (e.g. the started replacement) would data-race that late reclaimer run.
+	// releaseDrain owns the #2834 make-before-break wait internally now, so Apply
+	// no longer needs the replacement handle here.
 	for _, req := range toStop {
 		name := req.name
 		var onProvenClose func() error
-		var replacement *sender // set by onProvenClose on a successful restart start
 		if cfg, isRestart := restartSet[name]; isRestart {
 			cfg := cfg // capture
-			onProvenClose = func() error {
-				// Runs under m.mu, tombstone held, old conn proven closed.
-				if err := m.startLocked(cfg); err != nil {
-					return err
-				}
-				replacement = m.senders[cfg.Interface]
-				return nil
-			}
+			// Runs under m.mu, tombstone held, old conn proven closed.
+			onProvenClose = func() error { return m.startLocked(cfg) }
 		}
 		if err := m.releaseDrain(name, req.s, epoch, onProvenClose); err != nil && firstErr == nil {
 			firstErr = err
-		}
-		// Make-before-break: the old conn was PROVEN closed before startLocked ran
-		// (releaseDrain only invokes onProvenClose on the <-stopped arm), so the
-		// replacement is the sole conn for this interface. start() opens the conn
-		// asynchronously in the owner goroutine; wait (UNLOCKED) for that open to
-		// resolve so Apply returns only once the replacement RA conn is live —
-		// there is no observable 0-live-conn window across a config replace
-		// (#2834). If the open gives up or is pre-empted, waitConnReady returns
-		// promptly (it does not block for the full timeout on a dead sender).
-		if replacement != nil {
-			if !replacement.waitConnReady(claimWaitTimeout) {
-				slog.Warn("ra: replacement sender conn did not come up after a "+
-					"config replace", "interface", name)
-			}
 		}
 	}
 
@@ -855,6 +928,11 @@ type SenderInfo struct {
 	// interface is deliberately reported as distinct from active so operators
 	// do not read a withdrawing router as still advertising.
 	State string
+	// JoinTimedOut is set on a draining entry whose owner wedged past
+	// claimWaitTimeout, so releaseDrain handed the owed goodbye/replacement to
+	// the detached reclaimer (#5094). It lets the display distinguish a normal
+	// brief drain from a stuck one that is being self-healed by the reclaimer.
+	JoinTimedOut bool
 }
 
 // Status returns information about all RA senders, including interfaces that
@@ -909,11 +987,12 @@ func (m *Manager) Status() []SenderInfo {
 
 	// Surface draining interfaces so a withdrawing router is not silently
 	// invisible (it is no longer "active" but not yet gone).
-	for name := range m.draining {
+	for name, e := range m.draining {
 		result = append(result, SenderInfo{
-			Interface: name,
-			State:     "draining",
-			LastRA:    "n/a",
+			Interface:    name,
+			State:        "draining",
+			LastRA:       "n/a",
+			JoinTimedOut: e.joinTimedOut,
 		})
 	}
 	return result
