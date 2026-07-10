@@ -45022,6 +45022,37 @@ top.
   pkg/flowexport/README.md, _Log.md
 
 - **Timestamp**: 2026-07-10
+- **Action**: #5298 — install FRR reject/blackhole route for static-route
+  reject/discard (fix the silently-erased `reject`). The schema
+  (`schema_routing.go`) already accepted a `route <prefix> reject` leaf and
+  `isRouteInlineKeyword` already treated `reject` as a clause boundary, but
+  `StaticRoute` carried only `Discard` and neither the inline nor the
+  hierarchical action switch in `compileStaticRoutes` handled `reject` — so a
+  committed reject compiled to a no-next-hop, non-discard route, which the FRR
+  renderer (post-#3872) deliberately renders as NOTHING, letting matching
+  traffic fall through to a less-specific route (a security/vsrx-parity
+  fail-wide). Added `StaticRoute.Reject`; handled `reject` in both action
+  switches + the same-destination merge; taught `generateStaticRouteInTable`
+  to emit `ip|ipv6 route <dst> reject [<pref>] [vrf/table]` (RTN_UNREACHABLE →
+  ICMP unreachable) while `discard` keeps `Null0` (RTN_BLACKHOLE, silent).
+  Folded `Reject` into the userspace AF_XDP FIB silent-drop snapshot
+  (`buildRouteSnapshots`) so the fast path drops the prefix instead of
+  LPM-matching a less-specific route; added `reject` display parity to CLI +
+  gRPC `show route` and mirrored the `Discard` skip in daemon neighbor
+  pre-resolution. Junos vs FRR semantics: Junos reject→FRR reject (ICMP),
+  Junos discard→FRR Null0/blackhole (silent). Tests: end-to-end compile→FRR
+  render (v4+v6, reject + discard) in pkg/frr, compiler-propagation (flat-set
+  + hierarchical) in pkg/config; proved RED-on-revert (reverting the compiler
+  reject cases and the render change fails the four reject tests while the
+  discard guards stay green). Regenerated golden_4406 baseline (additive
+  `Reject:false` field only, no behavior change). Build + touched-package
+  tests green.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/frr/config_render.go, pkg/dataplane/userspace/routes.go,
+  pkg/cli/cli_show_routing.go, pkg/grpcapi/server_show_routes_text.go,
+  pkg/daemon/daemon_neighbor.go, pkg/config/compiler_static_reject_5298_test.go,
+  pkg/frr/static_reject_5298_test.go, pkg/config/testdata/golden_4406.json,
+  pkg/frr/README.md, _Log.md
 - **Action**: #5120 routing/wireguard — unbind the WG TUN from its VRF on
   teardown/rebind. `applyWireguardTunLocked` bound the persistent `wgN` TUN
   to a VRF only in the non-empty routing-instance case with no else/unbind

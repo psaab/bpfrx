@@ -155,7 +155,7 @@ func (d *Daemon) collectNeighborProbeTargets(cfg *config.Config) []neighborProbe
 	allStaticRoutes = append(allStaticRoutes, cfg.RoutingOptions.StaticRoutes...)
 	allStaticRoutes = append(allStaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
 	for _, sr := range allStaticRoutes {
-		if sr.Discard {
+		if sr.Discard || sr.Reject {
 			continue
 		}
 		for _, nh := range sr.NextHops {
@@ -177,7 +177,7 @@ func (d *Daemon) collectNeighborProbeTargets(cfg *config.Config) []neighborProbe
 		riStaticRoutes = append(riStaticRoutes, ri.StaticRoutes...)
 		riStaticRoutes = append(riStaticRoutes, ri.Inet6StaticRoutes...)
 		for _, sr := range riStaticRoutes {
-			if sr.Discard {
+			if sr.Discard || sr.Reject {
 				continue
 			}
 			for _, nh := range sr.NextHops {
