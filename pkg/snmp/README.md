@@ -282,6 +282,29 @@ authorization surface: every request is dropped because no community matches.
   interface data. The daemon wires `buildSNMPIfData`, which does a full
   netlink `LinkList` (RTM_GETLINK dump) per call — so the request path must
   invoke it at most once per PDU (see the per-PDU snapshot gotcha below).
+
+### IF-MIB class-counter semantics (#5050)
+
+`ifInUcastPkts` / `ifHCInUcastPkts` and `ifOutUcastPkts` /
+`ifHCOutUcastPkts` count only packets NOT addressed to a multicast or
+broadcast address (RFC 2863); the unicast / multicast / broadcast columns
+must not overlap. Linux `rtnl_link_stats` (netlink) reports total
+`RxPackets` / `TxPackets` plus a single RX `Multicast` sub-count — no RX
+broadcast count and no TX multicast/broadcast breakdown. The daemon's
+`deriveIfCounters` (`pkg/daemon/daemon_snmp_reconcile.go`) therefore maps:
+
+- `ifHCInUcastPkts = RxPackets - Multicast` (clamped at 0), so IN unicast +
+  `ifInMulticastPkts` reconstructs `RxPackets` with no double-count.
+- `ifHCOutUcastPkts = TxPackets` — an **upper-bound approximation**: the
+  kernel exposes no TX class breakdown to subtract, and the TX non-unicast
+  residual (negligible on a routed firewall) is not separable.
+- `ifInMulticastPkts = Multicast`. The broadcast columns and the TX class
+  columns stay 0 — the kernel does not expose them, and an honest zero beats
+  folding those packets into the unicast counter.
+
+Before #5050 the unicast counters were `RxPackets` / `TxPackets` verbatim,
+which folded multicast/broadcast into unicast and made a manager
+double-count when summing the class columns.
 - `NotifyLinkUp` / `NotifyLinkDown` — `traps.go`.
 
 ## Callers

@@ -191,17 +191,56 @@ func buildSNMPIfData() []snmp.IfData {
 			IfHighSpeed: speed / 1_000_000, // bps -> Mbps
 		}
 		if stats != nil {
-			entry.InOctets = uint32(stats.RxBytes)
-			entry.OutOctets = uint32(stats.TxBytes)
-			entry.HCInOctets = stats.RxBytes
-			entry.HCInUcastPkts = stats.RxPackets
-			entry.HCOutOctets = stats.TxBytes
-			entry.HCOutUcastPkts = stats.TxPackets
-			entry.InMulticastPkts = uint32(stats.Multicast)
+			deriveIfCounters(&entry, stats)
 		}
 		result = append(result, entry)
 	}
 	return result
+}
+
+// deriveIfCounters fills the IF-MIB packet/octet counter fields of entry from
+// the Linux rtnl_link_stats the kernel exposes through netlink. It is factored
+// out of buildSNMPIfData as a pure seam so the class-counter semantics can be
+// unit-tested without a live netlink socket (#5050).
+//
+// IF-MIB class semantics (RFC 2863): ifInUcastPkts / ifHCInUcastPkts count
+// packets that were NOT addressed to a multicast or broadcast address, and the
+// unicast / multicast / broadcast columns must not overlap. Linux
+// rtnl_link_stats reports total RxPackets/TxPackets plus a single RX
+// `multicast` sub-count; it exposes no RX broadcast count and no TX
+// multicast/broadcast breakdown at all. Copying RxPackets/TxPackets straight
+// into the unicast counters (the old behavior) folded multicast+broadcast into
+// unicast, so a manager summing the class columns double-counted them.
+func deriveIfCounters(entry *snmp.IfData, stats *netlink.LinkStatistics) {
+	entry.InOctets = uint32(stats.RxBytes)
+	entry.OutOctets = uint32(stats.TxBytes)
+	entry.HCInOctets = stats.RxBytes
+	entry.HCOutOctets = stats.TxBytes
+
+	// IN unicast = RxPackets - Multicast: the one non-unicast RX subset the
+	// kernel gives us. Clamp at 0 in case a racy stats read observes
+	// Multicast > RxPackets (the two counters are not sampled atomically).
+	inUcast := stats.RxPackets
+	if stats.Multicast > inUcast {
+		inUcast = 0
+	} else {
+		inUcast -= stats.Multicast
+	}
+	entry.HCInUcastPkts = inUcast
+
+	// OUT unicast: rtnl_link_stats exposes no TX multicast/broadcast
+	// breakdown, so an exact TX unicast count is unavailable. TxPackets is
+	// an upper bound; the (typically negligible on a routed firewall) TX
+	// non-unicast residual cannot be separated and is not subtracted. This
+	// is a documented approximation, not a relabelled total for a counter we
+	// could otherwise split.
+	entry.HCOutUcastPkts = stats.TxPackets
+
+	// ifInMulticastPkts is the only non-unicast class Linux exposes. The
+	// broadcast columns and the TX class columns stay 0 because
+	// rtnl_link_stats does not report them — an honest zero is better than
+	// folding those packets into the unicast counter.
+	entry.InMulticastPkts = uint32(stats.Multicast)
 }
 
 // reconcileSNMP reconciles the running SNMP subsystem against the committed
