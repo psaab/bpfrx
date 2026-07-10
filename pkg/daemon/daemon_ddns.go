@@ -166,8 +166,16 @@ func (d *Daemon) reconcileDDNSOnce(ctx context.Context) {
 //     when the node is the writer at all (the node-level short-circuit already
 //     ran): such a pool is not HA-owned, so there is no peer to double-write.
 func (d *Daemon) ddnsReconcileOptions(cfg *config.Config) ddns.ReconcileOptions {
-	if d.cluster == nil || cfg == nil {
+	if cfg == nil {
 		return ddns.ReconcileOptions{}
+	}
+	// #5070: thread the SSOT Junos→kernel interface-name resolver so a
+	// destination-interface binding on the RFC 2136 backend resolves to the
+	// local node's real kernel device (reth→member, unit-0 collapse, unit≠vlan-id)
+	// before SO_BINDTODEVICE. Applied in BOTH standalone and cluster modes.
+	base := ddns.ReconcileOptions{InterfaceResolver: cfg.ResolveKernelIfName}
+	if d.cluster == nil {
+		return base
 	}
 	subnetRG := d.buildLeaseSubnetRGMap(cfg)
 	master := d.snapshotRethMasterState()
@@ -215,7 +223,9 @@ func (d *Daemon) ddnsReconcileOptions(cfg *config.Config) ddns.ReconcileOptions 
 		}
 		return master[s.RGOwner]
 	}
-	return ddns.ReconcileOptions{Gate: gate, Resolver: resolver}
+	base.Gate = gate
+	base.Resolver = resolver
+	return base
 }
 
 // leaseSubnetRG pairs a parsed pool subnet (CIDR) with the redundancy group

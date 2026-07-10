@@ -171,7 +171,10 @@ func (d *Daemon) reconcileSurfaceAOnce(ctx context.Context) {
 	if cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
 		catalog = cfg.System.Services.DynamicDNS.Providers
 	}
-	if err := d.surfaceA.mgr.Reconcile(rctx, scopes, observe, gate, catalog); err != nil {
+	// #5070: thread the SSOT Junos→kernel interface-name resolver so a
+	// per-binding destination-interface resolves to the local node's real kernel
+	// device (reth→member, unit-0 collapse, unit≠vlan-id) before SO_BINDTODEVICE.
+	if err := d.surfaceA.mgr.Reconcile(rctx, scopes, observe, gate, catalog, cfg.ResolveKernelIfName); err != nil {
 		slog.Warn("ddns surface-a: reconcile pass had errors (retrying next cycle)", "err", err)
 	}
 }

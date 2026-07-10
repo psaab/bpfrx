@@ -1,3 +1,32 @@
+## 2026-07-10 — ddns: resolve bind interface/routing-instance to kernel device (#5070)
+
+- **Timestamp**: 2026-07-10
+  - **Action**: #5070 fix — `resolveBindConfig` stored the RAW
+    `RoutingInstance` / `DestinationInterface` into `bindDevice` and passed it
+    verbatim to `SO_BINDTODEVICE`, targeting a nonexistent kernel device. Now
+    resolve a routing-instance through `diagcmd.VRFDeviceName` (→ `vrf-<name>`)
+    and a destination-interface through the committed config's SSOT resolver
+    `config.(*Config).ResolveKernelIfName` — threaded per-reconcile from the
+    daemon (DHCP path via `ReconcileOptions.InterfaceResolver`; Surface A path
+    via the trailing `SurfaceAManager.Reconcile` resolver arg, read by
+    `resolveBackend`/`CheckIPClient`; both managers hold an `ifResolver` field).
+    Review round 2 caught that the first pass used the LEAF `config.LinuxIfName`,
+    which yields FICTITIOUS devices for reth (`reth1`, no bonded device →
+    member `ge-0-0-1`), unit-0 collapse (`ge-0/0/2.0` → `ge-0-0-2`), and
+    unit≠vlan-id (`ge-0/0/2` unit 50 vlan-id 80 → `ge-0-0-2.80`) — the
+    HA-cluster WAN binding is exactly reth-with-VLAN. Added
+    `bindConfig.validateDevice()` (injectable `netlink.LinkByName` seam) called
+    by `newRFC2136Updater` for a clear construction-time error when the resolved
+    device is absent. HTTP client cache key stays raw leaves (#2956 reap
+    consistency); only the bound socket target is resolved. Rewrote the
+    bug-encoding tests; resolution table asserts REAL device names
+    (reth→member, unit-0 collapse, unit≠vlan-id, reth-VLAN→member subif) via a
+    config-backed `ResolveKernelIfName`. RED-on-revert proven. README updated.
+  - **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_rfc2136.go,
+    pkg/ddns/backend_http.go, pkg/ddns/manager.go, pkg/ddns/surface_a.go,
+    pkg/ddns/backend_bind_test.go, pkg/daemon/daemon_ddns.go,
+    pkg/daemon/daemon_ddns_surface_a.go, pkg/ddns/README.md, _Log.md
+
 ## 2026-07-10 — upgrade: wire real helper-readiness gate at cutover (#5286)
 
 - **Timestamp**: 2026-07-10
@@ -45182,3 +45211,7 @@ top.
 - **File(s)**: pkg/cli/cli_show_security_filters.go,
   pkg/cli/cli_show_effective_filter_gen_5067_test.go,
   docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-10 (fix/5355-tunnel-apply-failclosed)
+  - **Action**: #5355 fail-closed on genuine GRE/tunnel reconcile errors — mirror #5310 xfrmManager.Apply. tunnelManager.Apply now aggregates genuine create/find/up/delete failures via errors.Join and returns them (was unconditional `return nil`); helpers applyAnchorLocked/applyKernelTunnelLocked/finishTunnelLocked return errors; applyWireguardTunLocked surfaces its LinkSetUp failure. Idempotency preserved (adopt-existing, tolerate-already-gone, defer-on-transient). New RED-on-revert tests + daemon-boundary tunnel case; README fail-closed note.
+  - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_apply_failclosed_5355_test.go, pkg/routing/tunnel_reconcile_test.go, pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go, pkg/routing/README.md

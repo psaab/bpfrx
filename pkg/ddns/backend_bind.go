@@ -8,9 +8,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/diagcmd"
 )
 
 // backend_bind.go: source / interface / VRF binding for the RFC 2136 UPDATE
@@ -47,12 +49,49 @@ type bindConfig struct {
 	routingInst string     // routing-instance name (informational / VRF dev)
 }
 
+// An interface-name resolver maps a Junos interface reference (as an operator
+// types it in a destination-interface leaf, e.g. "reth0.50" or "ge-0/0/2") to
+// the ACTUAL kernel device name on the LOCAL node. Production threads the
+// committed config's SSOT resolver, config.(*Config).ResolveKernelIfName, which
+// correctly handles reth→physical-member, unit-0 collapse, unit≠vlan-id, and
+// tunnel/irb/st0 refs (config/types.go). A nil resolver falls back to the leaf
+// slash-substitution (config.LinuxIfName) — used only by callers with no
+// committed config in hand (never the daemon path). See #5070. The type is the
+// bare `func(string) string` throughout so the exported daemon-facing seams
+// (ReconcileOptions.InterfaceResolver, SurfaceAManager.Reconcile) take
+// cfg.ResolveKernelIfName without a named-type conversion.
+
+// firstResolver extracts the single OPTIONAL interface-name resolver from a
+// variadic trailing slot. The bind path threads the resolver as an optional arg
+// so the many existing no-resolver call sites (tests, direct callers) stay
+// valid while the daemon threads cfg.ResolveKernelIfName. A missing or nil
+// entry yields nil (leaf fallback).
+func firstResolver(resolveIf []func(string) string) func(string) string {
+	if len(resolveIf) > 0 {
+		return resolveIf[0]
+	}
+	return nil
+}
+
+// resolveIfKernelName maps a destination-interface Junos ref to its kernel
+// device name via the SSOT resolver, falling back to the leaf
+// slash-substitution when no resolver was threaded in.
+func resolveIfKernelName(resolve func(string) string, ref string) string {
+	if resolve != nil {
+		return resolve(ref)
+	}
+	return config.LinuxIfName(ref)
+}
+
 // resolveBindConfig builds a bindConfig from a DDNS policy's source-binding
 // leaves (#2665). An empty config yields the zero bindConfig (no binding). A
 // non-empty source-address that does not parse is a hard error so the manager
 // falls back to no-op for that family (and counts it) rather than emitting
 // UPDATEs from the wrong source.
-func resolveBindConfig(c *config.DHCPDynamicDNSConfig) (bindConfig, error) {
+//
+// resolve is the committed config's Junos→kernel interface-name resolver
+// (cfg.ResolveKernelIfName); nil ⇒ the leaf slash-substitution fallback.
+func resolveBindConfig(c *config.DHCPDynamicDNSConfig, resolve func(string) string) (bindConfig, error) {
 	if c == nil {
 		return bindConfig{}, nil
 	}
@@ -65,16 +104,61 @@ func resolveBindConfig(c *config.DHCPDynamicDNSConfig) (bindConfig, error) {
 		b.sourceAddr = a.Unmap()
 	}
 	// destination-interface is the more specific SO_BINDTODEVICE pin; a VRF
-	// (routing-instance) binds to its VRF master device, which shares the
-	// routing-instance name. Prefer the explicit destination-interface.
+	// (routing-instance) binds to its VRF master device. Prefer the explicit
+	// destination-interface.
+	//
+	// SO_BINDTODEVICE needs the REAL kernel device name — NOT the Junos config
+	// token (#5070). A destination-interface is a Junos interface reference
+	// (e.g. "reth0.50", "ge-0/0/2.50"); the daemon renames/creates the kernel
+	// device via config.(*Config).ResolveKernelIfName, which resolves
+	// reth→physical member, unit-0 collapse ("ge-0/0/2.0" → "ge-0-0-2"), and
+	// unit≠vlan-id (unit 50 / vlan-id 80 → "ge-0-0-2.80"). Resolve through that
+	// SSOT (threaded in as `resolve`), NOT the leaf slash-substitution — the
+	// latter yields fictitious devices ("reth0.100", "ge-0-0-2.50") for exactly
+	// the reth / VLAN cases the HA-cluster WAN binding targets. A
+	// routing-instance is realized as a kernel VRF master device named
+	// "vrf-<name>" (pkg/routing), so resolve it through diagcmd.VRFDeviceName —
+	// the single source of truth for that prefix (applied exactly once, #2143;
+	// a name already typed "vrf-red" is returned unchanged). Without this
+	// mapping SO_BINDTODEVICE targets a nonexistent device and every RFC 2136 /
+	// HTTP-provider / check-IP exchange hard-fails at dial.
+	//
+	// routingInst keeps the RAW routing-instance name (informational only; it
+	// is never used for the socket op — only bindDevice is).
 	b.routingInst = c.RoutingInstance
 	switch {
 	case c.DestinationInterface != "":
-		b.bindDevice = c.DestinationInterface
+		b.bindDevice = resolveIfKernelName(resolve, c.DestinationInterface)
 	case c.RoutingInstance != "":
-		b.bindDevice = c.RoutingInstance
+		b.bindDevice = diagcmd.VRFDeviceName(c.RoutingInstance)
 	}
 	return b, nil
+}
+
+// bindDeviceLinkByName is the netlink lookup used to validate that a resolved
+// SO_BINDTODEVICE target exists as a kernel device at backend construction
+// (#5070). It is a package var so tests can inject a fake without touching real
+// netlink; production uses the real netlink.LinkByName.
+var bindDeviceLinkByName = func(name string) error {
+	_, err := netlink.LinkByName(name)
+	return err
+}
+
+// validateDevice checks that the resolved bindDevice exists as a kernel device,
+// surfacing a CLEAR construction-time error instead of a cryptic
+// SO_BINDTODEVICE dial failure later (#5070). A bindConfig with no device
+// (source-address-only, or no binding at all) validates trivially. The netlink
+// lookup goes through the bindDeviceLinkByName seam so a transiently-absent
+// device (e.g. the WAN link not yet up at boot) simply fails this construction
+// pass and is retried by the reconciler's resolve-per-Reconcile loop.
+func (b bindConfig) validateDevice() error {
+	if b.bindDevice == "" {
+		return nil
+	}
+	if err := bindDeviceLinkByName(b.bindDevice); err != nil {
+		return fmt.Errorf("ddns: bind device %q does not exist: %w", b.bindDevice, err)
+	}
+	return nil
 }
 
 // isSet reports whether the bindConfig requests any binding.

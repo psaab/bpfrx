@@ -393,6 +393,37 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   `SO_BINDTODEVICE` for the interface/VRF, working for both the UDP-first and
   TCP-retry exchange). Fail-open at runtime; an invalid source-address falls the
   family back to no-op.
+- **Bind-device kernel-name resolution (#5070, `resolveBindConfig`)** —
+  `SO_BINDTODEVICE` needs the EXACT current kernel device name, not the Junos
+  config token. A `destination-interface` is a Junos interface reference (e.g.
+  `reth0.50`, `ge-0/0/2.50`); it is resolved through the daemon's single source
+  of truth for Junos→kernel naming, `config.(*Config).ResolveKernelIfName`
+  (config/types.go), which the daemon threads in from the committed config —
+  NOT the leaf `config.LinuxIfName` (bare slash-substitution). That matters
+  because the leaf primitive produces FICTITIOUS devices for exactly the cases
+  the HA-cluster WAN binding uses: a `reth` resolves to its LOCAL physical
+  member (`reth1` → `ge-0-0-1`, there is no bonded `reth1` kernel device), a
+  unit-`0` ref collapses (`ge-0/0/2.0` → `ge-0-0-2`), and a VLAN unit is named
+  by its VLAN-ID not its unit number (`ge-0/0/2` unit 50 vlan-id 80 →
+  `ge-0-0-2.80`). The resolver is threaded per-reconcile: the DHCP-lease path
+  via `ReconcileOptions.InterfaceResolver`, the Surface A path via the trailing
+  `SurfaceAManager.Reconcile` resolver arg (read by `resolveBackend` /
+  `CheckIPClient`); both are `cfg.ResolveKernelIfName`. A `routing-instance` is
+  realized as the kernel VRF master device `vrf-<name>` (pkg/routing), resolved
+  through `diagcmd.VRFDeviceName` — the single source of truth for that prefix
+  (applied exactly once, #2143; a name already typed `vrf-red` is returned
+  unchanged). `routingInst` retains the raw name for informational use only.
+  Before #5070 the raw token went straight to `SO_BINDTODEVICE`, targeting a
+  nonexistent device so every RFC 2136 / HTTP-provider / check-IP exchange over
+  the binding hard-failed at dial. The RFC 2136 constructor now also VALIDATES
+  the resolved device exists via `bindConfig.validateDevice()` (an injectable
+  `netlink.LinkByName` seam), surfacing a clear construction-time error (`bind
+  device %q does not exist`) instead of a cryptic dial failure; a
+  transiently-absent device is retried by the resolve-per-Reconcile loop. The
+  HTTP-provider and checkip paths get the same deterministic resolution (they
+  share `resolveBindConfig`). The per-binding HTTP client cache key stays the
+  RAW binding leaves (`bindCacheKey`, #2956 reap consistency); only the bound
+  socket's `SO_BINDTODEVICE` target is resolved.
 - **Dual-stack source-bind family gate (#2901, `sourceMatchesDialFamily`)** — the
   dialer's `Control` hook applies the `unix.Bind` source-bind **only when the
   source-address family matches the dial socket's address family** (keyed off the

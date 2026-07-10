@@ -291,6 +291,20 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	defer t.mu.Unlock()
 	t.ensureReconcileStateLocked()
 
+	// errs accumulates GENUINE reconcile failures (a removed tunnel's
+	// LinkDel, and each per-tunnel apply's create/find/up/delete) so the
+	// commit fails closed (#5355, sibling of the #5310 xfrmManager fix).
+	// Before this Apply logged every such failure and returned nil
+	// UNCONDITIONALLY — a GRE/tunnel LinkAdd/LinkSetUp/LinkDel failure
+	// reported a SUCCESSFUL commit while the interface was absent (fail-open
+	// false convergence). Tolerated idempotent conditions never append: a
+	// still-present compatible tunnel is adopted in place (reuse, not a
+	// LinkAdd), a delete of an already-gone tunnel is a no-op, and a
+	// TRANSIENT lookup that only defers the reconcile retains+retries
+	// without erroring. The #5354 tail-join in applyInterfaceReconcile
+	// surfaces the returned error into the commit result.
+	var errs []error
+
 	desired := make(map[string]bool, len(tunnels))
 	wgDesired := map[string]bool{}
 	for _, tc := range tunnels {
@@ -351,6 +365,10 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 				slog.Warn("failed to delete removed tunnel",
 					"name", name, "err", delErr)
 				next[name] = true // retain ownership; retry next apply
+				// #5355: a genuine LinkDel failure leaves the removed
+				// tunnel's device (and its addresses) live in the kernel —
+				// fail the commit closed rather than report a clean removal.
+				errs = append(errs, fmt.Errorf("delete removed tunnel %s: %w", name, delErr))
 				continue
 			}
 			slog.Info("tunnel removed", "name", name)
@@ -461,6 +479,10 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			if err := t.applyWireguardTunLocked(tc); err != nil {
 				slog.Warn("failed to apply wireguard tunnel",
 					"name", tc.Name, "err", err)
+				// #5355: surface the WG create/replace/bring-up failure so
+				// the commit fails closed; the sentinel-driven ownedNames
+				// re-retain below is orthogonal to the aggregation.
+				errs = append(errs, fmt.Errorf("apply wireguard tunnel %s: %w", tc.Name, err))
 				// Re-retain ownedNames ONLY when a stale NON-WG link remains
 				// under this name (incompatible same-name link whose
 				// replacement LinkDel failed — errWGIncompatibleLinkRetained).
@@ -487,13 +509,17 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 		// BOTH the plain-reuse and the LinkAdd-EEXIST paths.
 		adopting := !oldOwned[tc.Name]
 		if tc.AnchorOnly {
-			t.applyAnchorLocked(tc, adopting)
+			if err := t.applyAnchorLocked(tc, adopting); err != nil {
+				errs = append(errs, err)
+			}
 			continue
 		}
-		t.applyKernelTunnelLocked(tc)
+		if err := t.applyKernelTunnelLocked(tc); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // anchorReusable reports whether an existing link can serve as the
@@ -529,7 +555,13 @@ func anchorReusable(link netlink.Link) bool {
 // exactly like applyKernelTunnelLocked: an unchanged runner is retained
 // across applies (probe state survives commits), restarted on a config
 // change, and stopped when keepalive is removed.
-func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool) {
+//
+// #5355: returns a non-nil error on a GENUINE reconcile failure (the
+// replace LinkDel, the create LinkAdd, or the finishTunnelLocked
+// LinkSetUp) so Apply can aggregate it and fail the commit closed —
+// mirroring xfrmManager.Apply (#5310). A plain reuse/adopt of an
+// already-present compatible anchor is NOT a failure and returns nil.
+func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool) error {
 	// Drain-before-recreate + linkGen bump (#1918 §6 Axis D F7, ported to
 	// the anchor path in #4071). Decide up front whether this apply will
 	// recreate the anchor TUN. If so, CANCEL + DRAIN any existing keepalive
@@ -567,7 +599,7 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 			if delErr := t.ops.LinkDel(existing); delErr != nil {
 				slog.Warn("failed to replace tunnel anchor",
 					"name", tc.Name, "err", delErr)
-				return
+				return fmt.Errorf("replace tunnel anchor %s: %w", tc.Name, delErr)
 			}
 		}
 	}
@@ -589,7 +621,7 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 			if lkErr != nil || !anchorReusable(existingAdopt) {
 				slog.Warn("failed to create tunnel anchor",
 					"name", tc.Name, "err", addErr)
-				return
+				return fmt.Errorf("create tunnel anchor %s: %w", tc.Name, addErr)
 			}
 			slog.Info("tunnel anchor already exists as TUN, reusing",
 				"name", tc.Name)
@@ -650,7 +682,7 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 		runner.state.mu.Unlock()
 	}
 
-	t.finishTunnelLocked(tc, link, skipUp, "tunnel anchor")
+	finishErr := t.finishTunnelLocked(tc, link, skipUp, "tunnel anchor")
 
 	if tc.Keepalive > 0 {
 		if restartKA {
@@ -662,6 +694,7 @@ func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool
 	} else if hasRunner {
 		t.stopKeepaliveLocked(tc.Name)
 	}
+	return finishErr
 }
 
 // reconcileAnchorMTULocked applies the #1884 MTU ownership rule to a
@@ -780,13 +813,20 @@ func legacyTunnelMatches(existing, desired netlink.Link) bool {
 // path (the daemon always sets AnchorOnly). Compare-then-decide:
 // identical config-driven attrs reuse the device in place; any real
 // change is a legitimate delete+recreate. Caller MUST hold mu.
-func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
+//
+// #5355: returns a non-nil error on a GENUINE reconcile failure (the
+// replace LinkDel, the create LinkAdd, or the finishTunnelLocked
+// LinkSetUp) so Apply can aggregate it and fail the commit closed. An
+// invalid-endpoint config or a TRANSIENT lookup deferral is NOT a
+// fail-closed condition — the former is a config error (warn), the
+// latter self-heals on the next apply — so both return nil.
+func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) error {
 	localIP := net.ParseIP(tc.Source)
 	remoteIP := net.ParseIP(tc.Destination)
 	if localIP == nil || remoteIP == nil {
 		slog.Warn("invalid tunnel endpoints",
 			"name", tc.Name, "src", tc.Source, "dst", tc.Destination)
-		return
+		return nil
 	}
 
 	ttl := tc.TTL
@@ -824,10 +864,12 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 		willRecreate = true
 	default:
 		// Transient lookup error: leave the runner and any live link
-		// untouched; retry on the next apply.
+		// untouched; retry on the next apply. Not a fail-closed condition
+		// (#5355) — the device state is unknown, not proven-broken, and
+		// the next apply reconciles it.
 		slog.Warn("tunnel lookup failed transiently; deferring apply",
 			"name", tc.Name, "err", lookupErr)
-		return
+		return nil
 	}
 	if willRecreate {
 		// Drain the stale runner first; bump the generation so any runner
@@ -857,7 +899,7 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 				if tc.Keepalive > 0 {
 					t.startKeepalive(tc.Name, tc.Source, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
 				}
-				return
+				return fmt.Errorf("replace tunnel %s: %w", tc.Name, delErr)
 			}
 			slog.Info("replaced tunnel link with changed parameters",
 				"name", tc.Name, "existing_type", existing.Type())
@@ -867,7 +909,7 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 		if addErr := t.ops.LinkAdd(desired); addErr != nil {
 			slog.Warn("failed to create tunnel",
 				"name", tc.Name, "mode", tc.Mode, "err", addErr)
-			return
+			return fmt.Errorf("create tunnel %s: %w", tc.Name, addErr)
 		}
 		link = desired
 		created = true
@@ -928,7 +970,7 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 		runner.state.mu.Unlock()
 	}
 
-	t.finishTunnelLocked(tc, link, skipUp, "tunnel")
+	finishErr := t.finishTunnelLocked(tc, link, skipUp, "tunnel")
 
 	if tc.Keepalive > 0 {
 		if restartKA {
@@ -940,23 +982,36 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 	} else if hasRunner {
 		t.stopKeepaliveLocked(tc.Name)
 	}
+	return finishErr
 }
 
 // finishTunnelLocked is the shared apply tail: admin-up (unless a
 // retained keepalive runner holds the tunnel down), symmetric address
 // reconciliation, VRF claim reconcile, and success tracking. Caller
 // MUST hold mu; link is the kernel-fetched (or just-created) device.
-func (t *tunnelManager) finishTunnelLocked(tc *config.TunnelConfig, link netlink.Link, skipUp bool, kind string) {
+//
+// It returns a non-nil error only on a GENUINE bring-up failure (#5355):
+// a LinkSetUp that fails leaves the tunnel device present but admin-DOWN,
+// so the commit must fail closed rather than report a converged tunnel
+// that carries no traffic. Address/VRF reconcile still run best-effort
+// (they retain+retry their own state on transient failure) and are NOT
+// folded into the fail-closed signal — matching the xfrmManager.Apply
+// scope (#5310), which surfaces only create/find/up/delete link
+// failures.
+func (t *tunnelManager) finishTunnelLocked(tc *config.TunnelConfig, link netlink.Link, skipUp bool, kind string) error {
+	var upErr error
 	if skipUp {
 		slog.Debug("skipping link up: keepalive holds tunnel down",
 			"name", tc.Name)
 	} else if err := t.ops.LinkSetUp(link); err != nil {
 		slog.Warn("failed to bring up "+kind, "name", tc.Name, "err", err)
+		upErr = fmt.Errorf("bring up %s %s: %w", kind, tc.Name, err)
 	}
 	t.appliedAddrs[tc.Name] = t.reconcileLinkAddrsLocked(
 		link, tc.Name, tc.Addresses, t.appliedAddrs[tc.Name], kind)
 	t.reconcileVRFClaimLocked(tc, link)
 	t.tunnels = append(t.tunnels, tc.Name)
+	return upErr
 }
 
 // reconcileLinkAddrsLocked symmetrically reconciles a link's addresses
@@ -1444,8 +1499,16 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 		slog.Debug("wireguard tun reused", "name", tc.Name)
 	}
 
+	// #5355: a genuine bring-up failure on the persistent wgN device
+	// leaves it admin-DOWN, so surface it (fail closed) — but still run
+	// the address/VRF reconcile best-effort below and return the error at
+	// the tail. A plain LinkSetUp error is NOT the incompatible-link
+	// sentinel, so Apply's errWGIncompatibleLinkRetained branch stays a
+	// no-op and the healthy persistent link is not re-tracked.
+	var upErr error
 	if err := t.ops.LinkSetUp(link); err != nil {
 		slog.Warn("failed to bring up wireguard tun", "name", tc.Name, "err", err)
+		upErr = fmt.Errorf("bring up wireguard tun %s: %w", tc.Name, err)
 	}
 
 	// Symmetric address reconciliation (Copilot C5): because the device
@@ -1474,7 +1537,7 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	// in Apply, which shares unbindVRFClaimLocked. The wgN link is kept
 	// (S2a) but is no longer left enslaved to a stale VRF.
 	t.reconcileVRFClaimLocked(tc, link)
-	return nil
+	return upErr
 }
 
 // closeTuntapFiles closes the file descriptors returned by a Tuntap

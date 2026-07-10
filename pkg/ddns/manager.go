@@ -177,6 +177,12 @@ type ReconcileOptions struct {
 	// Resolver attributes each lease to its owning scope (RG etc., #2664). Nil
 	// ⇒ leases get the zero scope for their family (standalone Surface B).
 	Resolver ScopeResolver
+	// InterfaceResolver maps a destination-interface Junos ref to the LOCAL
+	// node's kernel device name for SO_BINDTODEVICE (#5070). The daemon passes
+	// cfg.ResolveKernelIfName (the SSOT resolver). Nil ⇒ the leaf
+	// slash-substitution fallback (a routing-instance still resolves to its
+	// vrf-<name> master via diagcmd.VRFDeviceName regardless).
+	InterfaceResolver func(ref string) string
 }
 
 // policyFromConfig resolves a typed config block into a runtime policy,
@@ -296,6 +302,15 @@ type Manager struct {
 	// (nopUpdater) and enabled (rfc2136Updater) states so enabled→disabled
 	// still runs withdrawAllLocked through a live backend (plan §4.2).
 	newUpdater func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error)
+
+	// ifResolver maps a destination-interface Junos ref to the LOCAL node's
+	// kernel device name for SO_BINDTODEVICE (#5070). It is refreshed at the
+	// START of each ReconcileScoped from ReconcileOptions.InterfaceResolver (the
+	// daemon threads cfg.ResolveKernelIfName), so a topology/commit change takes
+	// effect next cycle. Read by the production newUpdater closure under m.mu
+	// (set and read in the same locked pass). Nil ⇒ the leaf slash-substitution
+	// fallback (standalone tests with no committed config).
+	ifResolver func(string) string
 
 	// nodeID is the deterministic-owner-id seed (plan §5 invariant 2):
 	// the owner watermark is derived from the lease identity so EITHER HA
@@ -462,7 +477,8 @@ func NewProductionManager(parser LeaseParser, nodeID string) *Manager {
 		}
 		return newRFC2136Updater(pol, c, nil,
 			func() { m.skippedPTRNotAuth.Add(1) },
-			func() { m.skippedConflict.Add(1) })
+			func() { m.skippedConflict.Add(1) },
+			m.ifResolver) // #5070: resolve dest-interface to the kernel device
 	}
 	return m
 }
@@ -645,6 +661,12 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// #5070: refresh the interface-name resolver for THIS pass so a
+	// destination-interface binding resolves to the local node's real kernel
+	// device before SO_BINDTODEVICE (read by the production newUpdater closure,
+	// under this same lock). Nil (standalone tests) ⇒ the leaf fallback.
+	m.ifResolver = opts.InterfaceResolver
 
 	// FAIL CLOSED (#2650): the ownership state could not be loaded, so we cannot
 	// prove what records this firewall owns. Doing ANYTHING here is unsafe — a

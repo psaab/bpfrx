@@ -386,6 +386,14 @@ type SurfaceAManager struct {
 	// pool and dropping the entry — so the map stays bounded under binding churn.
 	httpClients *httpClientCache
 
+	// ifResolver maps a destination-interface Junos ref to the LOCAL node's
+	// kernel device name for SO_BINDTODEVICE (#5070). It is refreshed at the
+	// START of each Reconcile from the trailing resolver arg (the daemon threads
+	// cfg.ResolveKernelIfName) and read by resolveBackend + CheckIPClient during
+	// the same locked pass. Nil ⇒ the leaf slash-substitution fallback
+	// (standalone tests); a routing-instance still resolves to vrf-<name>.
+	ifResolver func(string) string
+
 	now func() time.Time
 
 	// counters (observability, plan §5.5).
@@ -484,10 +492,13 @@ func productionSurfaceABackend(p *config.DDNSProvider, fqdn string, ttl int) (DN
 // never a withdraw. When the cache is nil (a test manager) it falls back to
 // building a fresh client.
 func (m *SurfaceAManager) CheckIPClient(p *config.DDNSProvider) (*http.Client, error) {
+	// #5070: resolve a destination-interface binding to the local node's kernel
+	// device via the per-pass resolver (set at Reconcile start; the observer that
+	// calls this runs inside that same locked pass). Nil ⇒ leaf fallback.
 	if m.httpClients == nil {
-		return newProviderHTTPClient(p)
+		return newProviderHTTPClient(p, m.ifResolver)
 	}
-	return m.httpClients.clientFor(p)
+	return m.httpClients.clientFor(p, m.ifResolver)
 }
 
 // resolveBackend is the manager-bound backend resolver (#2904). It is identical
@@ -495,7 +506,9 @@ func (m *SurfaceAManager) CheckIPClient(p *config.DDNSProvider) (*http.Client, e
 // manager's cached, per-binding *http.Client so the keep-alive connection pool
 // is reused across reconcile passes instead of being rebuilt every pass.
 func (m *SurfaceAManager) resolveBackend(p *config.DDNSProvider, fqdn string, ttl int) (DNSUpdater, error) {
-	return resolveSurfaceABackend(p, fqdn, ttl, m.httpClients)
+	// #5070: thread the per-pass interface-name resolver so a destination-interface
+	// binding resolves to the local node's kernel device before SO_BINDTODEVICE.
+	return resolveSurfaceABackend(p, fqdn, ttl, m.httpClients, m.ifResolver)
 }
 
 // resolveSurfaceABackend resolves a provider-catalog entry into a live Backend.
@@ -504,7 +517,7 @@ func (m *SurfaceAManager) resolveBackend(p *config.DDNSProvider, fqdn string, tt
 // behaviour, used by productionSurfaceABackend's direct/test callers). A
 // half-configured or unknown provider degrades to the no-op (logged) exactly as
 // before.
-func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients *httpClientCache) (DNSUpdater, error) {
+func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients *httpClientCache, resolveIf ...func(string) string) (DNSUpdater, error) {
 	if p == nil {
 		return nopUpdater{}, nil
 	}
@@ -529,7 +542,7 @@ func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients 
 		if clients == nil {
 			return nil, nil
 		}
-		return clients.clientFor(p)
+		return clients.clientFor(p, resolveIf...)
 	}
 	// httpBackend resolves the source-bound client FIRST (fail-closed on a bind
 	// error) and only then builds the HTTP backend. Resolving the client before
@@ -552,7 +565,7 @@ func resolveSurfaceABackend(p *config.DDNSProvider, fqdn string, _ int, clients 
 		if p.UpdateServer == "" {
 			return nopUpdater{}, nil
 		}
-		return newSurfaceARFC2136(p, fqdn)
+		return newSurfaceARFC2136(p, fqdn, resolveIf...)
 	case "dyndns2":
 		return httpBackend(func(cl *http.Client) (DNSUpdater, error) { return newDyndns2Backend(p, cl) })
 	case "duckdns":
@@ -597,7 +610,7 @@ func newSurfaceAHTTP(p *config.DDNSProvider, build func() (DNSUpdater, error)) (
 // the record at its first address forever. The provider's transport binding
 // (source-address / dest-interface / VRF) is honored via the shared
 // resolveBindConfig→dialer path by reusing DHCPDynamicDNSConfig as the carrier.
-func newSurfaceARFC2136(p *config.DDNSProvider, _ string) (DNSUpdater, error) {
+func newSurfaceARFC2136(p *config.DDNSProvider, _ string, resolveIf ...func(string) string) (DNSUpdater, error) {
 	if p == nil {
 		return nil, errors.New("ddns surface-a: nil provider")
 	}
@@ -620,7 +633,7 @@ func newSurfaceARFC2136(p *config.DDNSProvider, _ string) (DNSUpdater, error) {
 		DestinationInterface: p.DestinationInterface,
 		RoutingInstance:      p.RoutingInstance,
 	}
-	u, err := newRFC2136Updater(pol, c, nil, nil, nil)
+	u, err := newRFC2136Updater(pol, c, nil, nil, nil, resolveIf...)
 	if err != nil {
 		return nil, err
 	}
@@ -716,9 +729,18 @@ func (m *SurfaceAManager) observeIO(fn func()) {
 // gate is the SAME per-RG ScopeGate the lease reconciler uses (#2664). A nil
 // gate (standalone) admits every scope. A gated-out scope is stop-writing,
 // never-withdraw (the peer RG master refreshes it).
-func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate, catalog map[string]*config.DDNSProvider) error {
+// resolveIf is the OPTIONAL committed-config Junos→kernel interface-name
+// resolver (the daemon threads cfg.ResolveKernelIfName) used to resolve a
+// destination-interface binding to the local node's real kernel device before
+// SO_BINDTODEVICE (#5070). Omitted (tests) ⇒ the leaf slash-substitution
+// fallback; a routing-instance still resolves to its vrf-<name> master.
+func (m *SurfaceAManager) Reconcile(ctx context.Context, scopes []SurfaceAScope, observe AddressObserver, gate ScopeGate, catalog map[string]*config.DDNSProvider, resolveIf ...func(string) string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// #5070: refresh the per-pass interface-name resolver (read by resolveBackend
+	// + CheckIPClient under this same lock).
+	m.ifResolver = firstResolver(resolveIf)
 
 	// FAIL CLOSED (#2971, mirroring the DHCP-lease #2650 gate): the ownership
 	// state could not be loaded, so we cannot prove which router records this
