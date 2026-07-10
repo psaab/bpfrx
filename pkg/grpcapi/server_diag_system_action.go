@@ -221,11 +221,15 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		if err := s.cluster.ForceSecondary(); err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "ISSU: %v", err)
 		}
+		// Fence the drain-complete message on an OBSERVED peer takeover rather
+		// than on ForceSecondary's return, which only sets desired state
+		// (#5039). Bounded by the RPC ctx so an operator Ctrl-C returns the
+		// honest (unconfirmed) report instead of hanging.
+		waitCtx, cancel := context.WithTimeout(ctx, cluster.DefaultUpgradeHandoffTimeout)
+		confirmed := s.cluster.WaitForUpgradeHandoff(waitCtx, cluster.DefaultUpgradeHandoffPoll)
+		cancel()
 		return &pb.SystemActionResponse{
-			Message: "Node is now secondary for all redundancy groups.\n" +
-				"Traffic has been drained to peer.\n" +
-				"You may now replace the binary and restart the service:\n" +
-				"  systemctl stop xpfd && <replace binary> && systemctl start xpfd",
+			Message: strings.Join(cluster.UpgradeDrainReport(confirmed), "\n"),
 		}, nil
 
 	case "dynamic-dns-update", "dynamic-dns-check":
