@@ -806,3 +806,17 @@ under the daemon's errgroup. Nothing else imports this package.
   hardening, #2084).
   Do not add raw `exec.Command` calls in handlers: a wedged binary pins
   the handler goroutine and its HTTP connection.
+  A per-job deadline is necessary but NOT sufficient: without an
+  aggregate bound a request flood holds hundreds of processes/FDs/
+  goroutines at once and starves the control plane. So each handler first
+  takes a slot from the process-wide `diagcmd.DefaultLimiter`
+  (`MaxConcurrentDiagnostics = 4`) via the `diagLimiter` package var —
+  SHARED with the gRPC Ping/Traceroute RPCs, so one aggregate cap covers
+  BOTH surfaces (a diagnostic admitted over REST and one over gRPC draw
+  from the same budget, #5057). Acquire is fail-fast: when the cap is
+  reached the handler returns **HTTP 429** immediately (no queue, no
+  wait) rather than piling up work, and the slot is released via `defer`
+  on every path (success, exec error, ctx timeout/cancel, panic). The
+  child is spawned through the `diagRun` package-var seam so a test can
+  inject a fake slow diagnostic and assert the cap without real
+  subprocesses.
