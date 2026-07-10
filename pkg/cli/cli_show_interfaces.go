@@ -136,8 +136,8 @@ func (c *CLI) showInterfaces(args []string) error {
 			unitNum, _ = strconv.Atoi(parts[1])
 		}
 		vlanID := 0
-		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
-			if unit, ok := ifCfg.Units[unitNum]; ok {
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg != nil {
+			if unit, ok := ifCfg.Units[unitNum]; ok && unit != nil {
 				vlanID = unit.VlanID
 			}
 		}
@@ -362,7 +362,7 @@ func (c *CLI) showInterfaces(args []string) error {
 
 			// DHCP annotations
 			var unit *config.InterfaceUnit
-			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg != nil {
 				if u, ok := ifCfg.Units[li.unitNum]; ok {
 					unit = u
 				}
