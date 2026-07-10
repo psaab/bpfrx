@@ -189,16 +189,23 @@ editing cmdtree.
     new config that binds off-loopback without api-auth (downgraded to a
     warning on the tolerant load / peer-sync path so an already-persisted
     config still boots — #1960); and (B) a **runtime fail-safe clamp**
-    (`clampBindToLoopback` in `pkg/daemon`, applied in `daemon_run.go`) that,
-    when the resolved bind is non-loopback and `apiCfg.Auth == nil`, pulls the
-    bind back to a same-family loopback (`127.0.0.1` for IPv4, `::1` for IPv6,
-    port preserved) and WARNs — so a leniently-loaded vulnerable config comes up
-    on loopback (console/SSH remain the lifeline) instead of exposed. The
-    non-loopback test (`hostIsLoopback`) treats the Go wildcard spelling
-    `:port`/`[::]:port` (an empty or unspecified host after `SplitHostPort`) and
-    any unparseable host as **non-loopback** so `--api-addr :8080` with no
-    api-auth is clamped, not left listening on every interface (#4903); only a
-    genuine loopback IP or the literal `localhost` is exempt. The bind
+    (`clampBindToLoopback` in `pkg/daemon`, applied in `resolveAPIBinds` /
+    `daemon_run.go`) that, when the resolved bind is non-loopback and
+    `apiCfg.Auth == nil`, pulls the bind back to a same-family loopback
+    (`127.0.0.1` for IPv4, `::1` for IPv6, port preserved) and WARNs — so a
+    leniently-loaded vulnerable config comes up on loopback (console/SSH remain
+    the lifeline) instead of exposed. This clamp runs **unconditionally on every
+    startup path** — `resolveAPIBinds` derives the bind/auth from the
+    web-management stanza (if any) and then always applies the clamp, so it also
+    covers a `--api-addr <routable>` flag with **no** `system services
+    web-management` block at all (#5127). Before #5127 the clamp lived inside the
+    web-management block and that flag path bound the mutating API off-loopback
+    unauthenticated. The non-loopback test (`hostIsLoopback`) treats the Go
+    wildcard spelling `:port`/`[::]:port` (an empty or unspecified host after
+    `SplitHostPort`) and any unparseable host as **non-loopback** so
+    `--api-addr :8080` with no api-auth is clamped, not left listening on every
+    interface (#4903); only a genuine loopback IP or the literal `localhost` is
+    exempt. The bind
     address is built with `net.JoinHostPort` so an IPv6 mgmt address is bracketed
     and both the clamp and `net.Listen` parse it. Adding api-auth and recommitting
     restores the off-loopback bind. HTTPS is covered by the same rule
