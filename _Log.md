@@ -1,3 +1,21 @@
+## 2026-07-09 — #5023 snmp: fix -race data race on the package-global trapSender
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5023 (test-infra correctness). `go test -race ./pkg/snmp/`
+  failed deterministically on `TestSendLinkTraps_DoesNotBlock`: the trap
+  worker goroutine read the package-global `trapSender` func var while the
+  #2991/#4916 tests wrote it during setup — an unsynchronized read/write.
+  Moved the sender off the package global onto a per-Agent `trapSender`
+  field, set to `sendTrap` by the constructors (bare-struct test Agents may
+  leave it nil; the worker falls back to `sendTrap`). The worker snapshots
+  the field once at start, so there is no shared mutable state between the
+  worker and any injector. Updated the #2991 and #4916 tests to inject their
+  slow/mock sender on their own Agent instead of mutating the global.
+  Verified RED on origin/master (DATA RACE + FAIL) and clean under `-race`
+  with the fix.
+  **File(s)**: pkg/snmp/agent.go, pkg/snmp/traps.go, pkg/snmp/README.md,
+  pkg/snmp/traps_async_2991_test.go, pkg/snmp/agent_stop_leak_4916_test.go
+
 ## 2026-07-09 — #4916 snmp: Agent.Stop leaked the ctx-watcher + trap worker and could deliver queued traps after Stop
 
 - **Timestamp**: 2026-07-09
