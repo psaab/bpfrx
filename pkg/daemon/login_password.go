@@ -208,6 +208,23 @@ func xpfProvisioned(name string, curUID int) bool {
 // throwaway tree; production never overrides it. #5128.
 var homeBaseDir = "/home"
 
+// rootSSHDir is the root account's .ssh directory. It is a package var only so
+// tests can point the root authorized_keys reconcile at a throwaway tree;
+// production never overrides it. It is the root-account analogue of homeBaseDir
+// for the #5276 root-credential revocation lifecycle.
+var rootSSHDir = "/root/.ssh"
+
+// rootAuthorizedKeysPath returns the xpf-managed root authorized_keys file.
+// applyRootAuth writes /root/.ssh/authorized_keys wholesale from the configured
+// root-authentication SSHKeys, so the whole file is xpf-owned. Revocation
+// removes it to disable key-based root login, gated on the UID-keyed provenance
+// marker (name "root", UID 0) so an operator-installed key file xpf never wrote
+// is left untouched — the same provenance scoping the non-root
+// managedAuthorizedKeysPath removal uses. #5276.
+func rootAuthorizedKeysPath() string {
+	return filepath.Join(rootSSHDir, "authorized_keys")
+}
+
 // managedAuthorizedKeysPath returns the xpf-managed authorized_keys file for
 // name. applySystemLogin writes /home/<name>/.ssh/authorized_keys wholesale
 // from the configured SSHKeys, so the whole file is xpf-owned. Two reconciles

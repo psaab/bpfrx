@@ -60,6 +60,23 @@ func runUpgradeSubcommand(args []string) {
 		return
 	}
 
+	// #5284 belt-and-suspenders: fail FAST on a clustered node before
+	// building a cut. A bare `xpfd upgrade` on a member (/etc/xpf/node-id
+	// present) selects the UNCOORDINATED standalone STOP->FLIP->START flow
+	// solely because `--rolling` was omitted (#4869 rejects only leftover
+	// positional args). The authoritative invariant is enforced in
+	// Runner.Run (the final privileged boundary, which also catches the
+	// postinst / recovery-doc callers), but rejecting here gives the operator
+	// the earliest, clearest message and never even builds the Runner.
+	if upgrade.ClusterNodeIDPresent(cfg.NodeIDPath) {
+		fmt.Fprintf(os.Stderr, "upgrade: refusing an UNCOORDINATED standalone cut on a "+
+			"cluster member (%s present); the standalone STOP->FLIP->START flow does "+
+			"NOT drain to the peer and would blackhole traffic if the peer is not "+
+			"ready. Run `xpfd upgrade --rolling` for a coordinated per-node drain + "+
+			"cut so the cluster keeps forwarding\n", upgrade.DefaultNodeIDFile)
+		os.Exit(1)
+	}
+
 	if err := r.Run(upgrade.Options{}); err != nil {
 		fmt.Fprintf(os.Stderr, "upgrade: %v\n", err)
 		os.Exit(1)

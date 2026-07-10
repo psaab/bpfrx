@@ -51,6 +51,19 @@ type Options struct {
 	// the deliberate first-cut path (e.g. seeding failed and the operator
 	// chose to proceed), never by the routine postinst/operator cut.
 	AllowNoRollbackFirstCut bool
+
+	// ClusterCoordinated marks this cut as driven by the COORDINATED rolling
+	// upgrade driver (RunRolling), which has already drained the local node
+	// to its peer (ForceSecondary + the strong drain predicate) before
+	// invoking this per-node cut. It is the ONLY sanctioned way to run the
+	// standalone STOP->FLIP->START flow on a CLUSTERED node (/etc/xpf/node-id
+	// present, #5284). The bare standalone entrypoints (the `xpfd upgrade`
+	// CLI verb, the postinst deferred-publish recovery hint, the recovery
+	// docs) leave it false, so the pre-STOP cluster gate in Run refuses their
+	// uncoordinated cut — a stop with no peer/RG-ownership transfer or
+	// readiness fence would blackhole a not-ready peer. Set EXCLUSIVELY by
+	// runRollingWith; never plumb it through the CLI or the postinst.
+	ClusterCoordinated bool
 }
 
 // errNoSourceGeneration is the INIT sentinel for "no published staged
@@ -133,6 +146,36 @@ func (r *Runner) resolveSource(j *Journal) (genid, dir string, err error) {
 // The standalone single-node flow. The HA rolling driver wraps this with
 // a controlled drain (rolling.go).
 func (r *Runner) Run(opts Options) (err error) {
+	// ---- CLUSTER GATE (#5284): refuse an UNCOORDINATED standalone cut on a
+	// clustered node. This is the FINAL privileged boundary — evaluated
+	// BEFORE the host-wide upgrade lock and BEFORE any journal read or live
+	// mutation — so EVERY caller of the standalone flow is caught, not just
+	// the `xpfd upgrade` CLI arg path: the postinst deferred-publish recovery
+	// hint and the recovery docs both emit the bare verb, and #4869 only
+	// rejects leftover POSITIONAL args (a valid empty arg set still selects
+	// Runner.Run purely because `--rolling` was omitted).
+	//
+	// A node with /etc/xpf/node-id is HA-managed. The standalone
+	// STOP->FLIP->START flow reaches StopUnit after only the host-local
+	// upgrade lock, with NO peer/RG-ownership transfer or peer-readiness
+	// fence — so stopping the local daemon can blackhole traffic when the
+	// peer is not ready to take over. The coordinated rolling driver
+	// (RunRolling) drains the node to its peer first, then invokes THIS Run
+	// with ClusterCoordinated=true; that is the only sanctioned path on a
+	// clustered node. Fail CLOSED with guidance (do NOT auto-reroute), and do
+	// NOT stop the unit. Standalone nodes (no node-id) are unaffected.
+	if !opts.ClusterCoordinated && r.clusterNodeIDPresent() {
+		return fmt.Errorf("refuse-standalone-cut-on-clustered-node: this node is a "+
+			"cluster member (%s present) but the upgrade was invoked as an "+
+			"UNCOORDINATED standalone cut (no --rolling). The standalone "+
+			"STOP->FLIP->START flow stops the local daemon WITHOUT draining to the "+
+			"peer or fencing on peer readiness, which blackholes traffic if the peer "+
+			"is not ready to take over. Use the coordinated rolling upgrade instead: "+
+			"`xpfd upgrade --rolling` (drains this node to its peer, cuts, then "+
+			"rejoins election so the cluster keeps forwarding). The unit was NOT "+
+			"stopped", r.cfg.NodeIDPath)
+	}
+
 	// Acquire the host-wide upgrade lock BEFORE any journal read or live
 	// mutation, unless a caller higher in the stack already holds it (the
 	// --rolling driver — #1965). Holding the lock from here through return

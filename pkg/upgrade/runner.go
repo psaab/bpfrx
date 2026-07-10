@@ -38,6 +38,17 @@ const (
 	DefaultJournalPath  = "/var/lib/xpf/upgrade.state"
 	DefaultUnit         = "xpfd"
 
+	// DefaultNodeIDFile is the install-time-stable cluster-identity marker.
+	// Its PRESENCE (independent of content) marks a node as HA-managed — the
+	// same signal the daemon keys its HA boot class on (pkg/daemon
+	// hasNodeIDFile). A clustered node MUST be upgraded via the coordinated
+	// rolling driver (RunRolling); the uncoordinated standalone
+	// STOP->FLIP->START cut is refused pre-STOP when this file is present
+	// (#5284). pkg/daemon imports pkg/upgrade, so pkg/upgrade cannot import
+	// pkg/daemon's nodeIDFile constant without a cycle — the path literal is
+	// duplicated here on purpose (both point at /etc/xpf/node-id).
+	DefaultNodeIDFile = "/etc/xpf/node-id"
+
 	// currentLink is the bookkeeping pointer inside VersionsDir.
 	currentLink = "current"
 
@@ -104,6 +115,14 @@ type Config struct {
 	JournalPath  string
 	Unit         string
 
+	// NodeIDPath is the cluster-identity marker file (#5284). Its PRESENCE
+	// gates the uncoordinated standalone cut: a clustered node must be
+	// upgraded via RunRolling, so Runner.Run refuses the standalone
+	// STOP->FLIP->START flow (pre-STOP) when this file exists and the caller
+	// is not the rolling driver. Overridable for tests; defaults to
+	// DefaultNodeIDFile.
+	NodeIDPath string
+
 	// DiskMarginBytes is the headroom required on /var beyond the staged
 	// size + DB snapshot size in PREFLIGHT.
 	DiskMarginBytes uint64
@@ -141,6 +160,9 @@ func (c *Config) withDefaults() {
 	if c.Unit == "" {
 		c.Unit = DefaultUnit
 	}
+	if c.NodeIDPath == "" {
+		c.NodeIDPath = DefaultNodeIDFile
+	}
 	if c.DiskMarginBytes == 0 {
 		c.DiskMarginBytes = 64 << 20 // 64 MiB headroom
 	}
@@ -167,6 +189,26 @@ func NewRunner(cfg Config) (*Runner, error) {
 }
 
 func (r *Runner) logf(format string, args ...any) { r.cfg.Logf(format, args...) }
+
+// ClusterNodeIDPresent reports whether the install-time-stable cluster
+// identity marker at path exists (#5284). PRESENCE — not content — is the
+// HA signal (mirrors pkg/daemon hasNodeIDFile; pkg/upgrade cannot import
+// pkg/daemon without an import cycle, so the stat is duplicated). An empty
+// path falls back to DefaultNodeIDFile so the CLI belt-and-suspenders check
+// and the Run gate agree even when the caller left Config.NodeIDPath unset.
+func ClusterNodeIDPresent(path string) bool {
+	if path == "" {
+		path = DefaultNodeIDFile
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// clusterNodeIDPresent reports whether THIS runner's configured cluster
+// identity marker is present.
+func (r *Runner) clusterNodeIDPresent() bool {
+	return ClusterNodeIDPresent(r.cfg.NodeIDPath)
+}
 
 // versionDir returns the runtime dir for ver.
 func (r *Runner) versionDir(ver string) string {
