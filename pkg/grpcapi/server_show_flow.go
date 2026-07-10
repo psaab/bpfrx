@@ -9,6 +9,7 @@
 package grpcapi
 
 import (
+	"container/heap"
 	"fmt"
 	"net"
 	"sort"
@@ -17,6 +18,8 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // showFlowMonitoring renders NetFlow v9 template configuration.
@@ -192,13 +195,68 @@ func (s *Server) showFlowStatistics(buf *strings.Builder) {
 	}
 }
 
+// resolveSessionName is a package-level indirection over
+// appid.ResolveSessionName so the bounded top-K deferral in
+// showSessionsTop (enrich only the <=K survivors, never all N sessions)
+// can be asserted by a counting fake in tests. Production always binds
+// appid.ResolveSessionName.
+var resolveSessionName = appid.ResolveSessionName
+
+// topSessionsK is the fixed row count `show ... sessions-top` renders
+// (Junos-style top-20). Selection is bounded to this many survivors via
+// a min-heap so a busy firewall (up to ~10M sessions) pays O(N log K)
+// comparisons + O(K) enrichment for a read-only status call, instead of
+// O(N log N) sort + O(N) fmt.Sprintf/appid enrichment (#5319).
+const topSessionsK = 20
+
+// topCand carries only the CHEAP raw fields needed to (a) rank a session
+// by the selected metric and (b) enrich the <=K survivors afterwards. No
+// fmt.Sprintf / appid work happens until a candidate is known to be in
+// the top K.
+type topCand struct {
+	metric                               uint64 // fwdBytes+revBytes OR fwdPkts+revPkts
+	isV6                                 bool
+	srcIP, dstIP                         net.IP
+	srcPort, dstPort                     uint16 // network order, as in the key
+	proto                                uint8
+	inZone, outZone                      uint16
+	appID                                uint16
+	fwdPkts, revPkts, fwdBytes, revBytes uint64
+	created                              uint64
+}
+
+// topCandHeap is a MIN-heap on metric: the root is the smallest of the
+// current top-K, so a new candidate displaces it only when strictly
+// larger.
+type topCandHeap []topCand
+
+func (h topCandHeap) Len() int           { return len(h) }
+func (h topCandHeap) Less(i, j int) bool { return h[i].metric < h[j].metric }
+func (h topCandHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *topCandHeap) Push(x any)        { *h = append(*h, x.(topCand)) }
+func (h *topCandHeap) Pop() any {
+	old := *h
+	n := len(old)
+	it := old[n-1]
+	*h = old[:n-1]
+	return it
+}
+
 // showSessionsTop renders the top-N (default 20) sessions sorted by
 // bytes or packets, walking both v4 and v6 session tables.
 // `topic` is "sessions-top:bytes" or "sessions-top:packets".
-func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.Builder) {
+//
+// Selection is bounded (#5319): a size-K min-heap keeps only the K
+// highest-metric forward sessions while walking the tables, ranking on
+// the raw byte/packet counter (cheap, comparable) and deferring the
+// fmt.Sprintf + appid.ResolveSessionName enrichment to the <=K
+// survivors. A backend iterator error (e.g. helper restart mid-scan) is
+// surfaced as codes.Internal instead of returning a partial ranking as
+// success (the errors were previously assigned to `_`).
+func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.Builder) error {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		buf.WriteString("Dataplane not loaded\n")
-		return
+		return nil
 	}
 	sortByBytes := topic == "sessions-top:bytes"
 	sortLabel := "bytes"
@@ -206,12 +264,6 @@ func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.
 		sortLabel = "packets"
 	}
 
-	type topEntry struct {
-		src, dst, proto, zone, app string
-		fwdPkts, revPkts           uint64
-		fwdBytes, revBytes         uint64
-		age                        int64
-	}
 	now := monotonicSeconds()
 	zoneNames := make(map[uint16]string)
 	var appNames map[uint16]string
@@ -221,93 +273,135 @@ func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.
 		}
 		appNames = cr.AppNames
 	}
-	var entries []topEntry
 
-	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	h := &topCandHeap{}
+	total := 0
+	// consider offers a candidate to the bounded top-K. It fills the heap
+	// to K, then only displaces the current minimum when the candidate is
+	// strictly larger — so at most K entries are ever retained and no
+	// enrichment happens here.
+	consider := func(c topCand) {
+		total++
+		if h.Len() < topSessionsK {
+			heap.Push(h, c)
+			return
+		}
+		if c.metric > (*h)[0].metric {
+			(*h)[0] = c
+			heap.Fix(h, 0)
+		}
+	}
+
+	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
-		inZ := zoneNames[val.IngressZone]
-		outZ := zoneNames[val.EgressZone]
-		if inZ == "" {
-			inZ = fmt.Sprintf("%d", val.IngressZone)
+		metric := val.FwdBytes + val.RevBytes
+		if !sortByBytes {
+			metric = val.FwdPackets + val.RevPackets
 		}
-		if outZ == "" {
-			outZ = fmt.Sprintf("%d", val.EgressZone)
-		}
-		var age int64
-		if now > val.Created {
-			age = int64(now - val.Created)
-		}
-		entries = append(entries, topEntry{
-			src:      fmt.Sprintf("%s:%d", net.IP(key.SrcIP[:]), ntohs(key.SrcPort)),
-			dst:      fmt.Sprintf("%s:%d", net.IP(key.DstIP[:]), ntohs(key.DstPort)),
-			proto:    protoName(key.Protocol),
-			zone:     inZ + "->" + outZ,
-			app:      appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
+		srcIP := make(net.IP, len(key.SrcIP))
+		copy(srcIP, key.SrcIP[:])
+		dstIP := make(net.IP, len(key.DstIP))
+		copy(dstIP, key.DstIP[:])
+		consider(topCand{
+			metric:   metric,
+			srcIP:    srcIP,
+			dstIP:    dstIP,
+			srcPort:  key.SrcPort,
+			dstPort:  key.DstPort,
+			proto:    key.Protocol,
+			inZone:   val.IngressZone,
+			outZone:  val.EgressZone,
+			appID:    val.AppID,
 			fwdPkts:  val.FwdPackets,
 			revPkts:  val.RevPackets,
 			fwdBytes: val.FwdBytes,
 			revBytes: val.RevBytes,
-			age:      age,
+			created:  val.Created,
 		})
 		return true
-	})
+	}); err != nil {
+		return status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+	}
 
-	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
 		}
-		inZ := zoneNames[val.IngressZone]
-		outZ := zoneNames[val.EgressZone]
-		if inZ == "" {
-			inZ = fmt.Sprintf("%d", val.IngressZone)
+		metric := val.FwdBytes + val.RevBytes
+		if !sortByBytes {
+			metric = val.FwdPackets + val.RevPackets
 		}
-		if outZ == "" {
-			outZ = fmt.Sprintf("%d", val.EgressZone)
-		}
-		var age int64
-		if now > val.Created {
-			age = int64(now - val.Created)
-		}
-		entries = append(entries, topEntry{
-			src:      fmt.Sprintf("[%s]:%d", net.IP(key.SrcIP[:]), ntohs(key.SrcPort)),
-			dst:      fmt.Sprintf("[%s]:%d", net.IP(key.DstIP[:]), ntohs(key.DstPort)),
-			proto:    protoName(key.Protocol),
-			zone:     inZ + "->" + outZ,
-			app:      appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
+		srcIP := make(net.IP, len(key.SrcIP))
+		copy(srcIP, key.SrcIP[:])
+		dstIP := make(net.IP, len(key.DstIP))
+		copy(dstIP, key.DstIP[:])
+		consider(topCand{
+			metric:   metric,
+			isV6:     true,
+			srcIP:    srcIP,
+			dstIP:    dstIP,
+			srcPort:  key.SrcPort,
+			dstPort:  key.DstPort,
+			proto:    key.Protocol,
+			inZone:   val.IngressZone,
+			outZone:  val.EgressZone,
+			appID:    val.AppID,
 			fwdPkts:  val.FwdPackets,
 			revPkts:  val.RevPackets,
 			fwdBytes: val.FwdBytes,
 			revBytes: val.RevBytes,
-			age:      age,
+			created:  val.Created,
 		})
 		return true
+	}); err != nil {
+		return status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
+
+	// Order the <=K survivors with the SAME descending comparator the
+	// original full sort used (metric already equals fwd+rev bytes or
+	// fwd+rev packets), then enrich only these rows.
+	survivors := []topCand(*h)
+	sort.Slice(survivors, func(i, j int) bool {
+		return survivors[i].metric > survivors[j].metric
 	})
 
-	if sortByBytes {
-		sort.Slice(entries, func(i, j int) bool {
-			return (entries[i].fwdBytes + entries[i].revBytes) > (entries[j].fwdBytes + entries[j].revBytes)
-		})
-	} else {
-		sort.Slice(entries, func(i, j int) bool {
-			return (entries[i].fwdPkts + entries[i].revPkts) > (entries[j].fwdPkts + entries[j].revPkts)
-		})
+	limit := topSessionsK
+	if limit > len(survivors) {
+		limit = len(survivors)
 	}
-
-	limit := 20
-	if limit > len(entries) {
-		limit = len(entries)
-	}
-	fmt.Fprintf(buf, "Top %d sessions by %s (of %d total):\n", limit, sortLabel, len(entries))
+	fmt.Fprintf(buf, "Top %d sessions by %s (of %d total):\n", limit, sortLabel, total)
 	fmt.Fprintf(buf, "%-5s %-22s %-22s %-5s %-20s %12s %12s %5s %s\n",
 		"#", "Source", "Destination", "Proto", "Zone", "Bytes(f/r)", "Pkts(f/r)", "Age", "App")
 	for i := 0; i < limit; i++ {
-		e := entries[i]
+		c := survivors[i]
+		inZ := zoneNames[c.inZone]
+		outZ := zoneNames[c.outZone]
+		if inZ == "" {
+			inZ = fmt.Sprintf("%d", c.inZone)
+		}
+		if outZ == "" {
+			outZ = fmt.Sprintf("%d", c.outZone)
+		}
+		var src, dst string
+		if c.isV6 {
+			src = fmt.Sprintf("[%s]:%d", c.srcIP, ntohs(c.srcPort))
+			dst = fmt.Sprintf("[%s]:%d", c.dstIP, ntohs(c.dstPort))
+		} else {
+			src = fmt.Sprintf("%s:%d", c.srcIP, ntohs(c.srcPort))
+			dst = fmt.Sprintf("%s:%d", c.dstIP, ntohs(c.dstPort))
+		}
+		var age int64
+		if now > c.created {
+			age = int64(now - c.created)
+		}
+		app := resolveSessionName(appNames, cfg, c.proto, ntohs(c.srcPort), ntohs(c.dstPort), c.appID)
 		fmt.Fprintf(buf, "%-5d %-22s %-22s %-5s %-20s %5d/%-6d %5d/%-6d %5d %s\n",
-			i+1, e.src, e.dst, e.proto, e.zone,
-			e.fwdBytes, e.revBytes, e.fwdPkts, e.revPkts, e.age, e.app)
+			i+1, src, dst, protoName(c.proto), inZ+"->"+outZ,
+			c.fwdBytes, c.revBytes, c.fwdPkts, c.revPkts, age, app)
 	}
+	return nil
 }
 
 // showFlowTraceoptions renders the flow traceoptions log file
