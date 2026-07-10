@@ -276,6 +276,16 @@ func newRFC2136Updater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig, client dn
 		// *dns.Client's default dialer (today's behaviour byte-for-byte).
 		if d := bind.dialer(u.timeout); d != nil {
 			cl.Dialer = d
+			// #5327: when a source-address is configured, PIN the UDP dial to its
+			// family (cl.Net drives the network miekg passes to the dialer). Without
+			// this, a dual-stack update-server hostname lets Go pick the other family
+			// and the family gate silently skips the source bind, so the UPDATE
+			// egresses from a kernel-chosen source on the wrong WAN. A device-only
+			// bind leaves cl.Net empty (byte-for-byte unchanged). The TCP truncation
+			// retry (exchange) carries the same family pin off cl.Net.
+			if suffix, ok := bind.sourceDialFamily(); ok {
+				cl.Net = "udp" + suffix
+			}
 		}
 		u.client = cl
 	}
@@ -1056,7 +1066,11 @@ func (u *rfc2136Updater) exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, er
 		// never truncates, so this path is production-only.
 		if tc, ok := u.client.(*dns.Client); ok {
 			tcpClient := *tc
-			tcpClient.Net = "tcp"
+			// #5327: keep the source-family pin on the TCP retry. If the UDP dial
+			// was pinned to a family (cl.Net "udp4"/"udp6" for a configured
+			// source-address), the retry must dial "tcp4"/"tcp6" so the source bind
+			// still applies; an unpinned client (empty/"udp") retries plain "tcp".
+			tcpClient.Net = "tcp" + networkFamilySuffix(tc.Net)
 			// Derive the TCP retry context from the CALLER's ctx (not
 			// context.Background()) so a canceled/deadline'd reconcile pass
 			// actually cancels the retry. The per-exchange timeout is still

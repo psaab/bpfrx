@@ -431,14 +431,33 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   `udp6`). The dialer is shared by the RFC 2136 backend and, via
   `newHTTPClientBound` (#2846), every HTTP backend + checkip — those endpoints
   may resolve to both A and AAAA records, and Go's Happy-Eyeballs can dial the
-  family that does NOT match the configured `source-address`. Before the gate,
-  binding a `SockaddrInet4` on an AF_INET6 socket (or the reverse) returned
-  `EAFNOSUPPORT`/`EINVAL` and aborted the whole connection. Now the
-  mismatched-family dial proceeds with the kernel-chosen source (the operator
-  configured a source only for the matching family); the matching family still
-  egresses from the configured source. `SO_BINDTODEVICE` is family-agnostic and
-  is always applied. This is the DDNS analog of the IPsec family-selection work
-  (#2757/#2832).
+  family that does NOT match the configured `source-address`. Binding a
+  `SockaddrInet4` on an AF_INET6 socket (or the reverse) returns
+  `EAFNOSUPPORT`/`EINVAL` and aborts the connection, so the gate keeps the bind to
+  the matching family. `SO_BINDTODEVICE` is family-agnostic and is always applied.
+  This is the DDNS analog of the IPsec family-selection work (#2757/#2832). The
+  gate is now a SECONDARY guard behind the #5327 family pin (below).
+- **Source-address dial-family pin (#5327, reviewed decision, `constrainDialNetwork`)**
+  — a configured `source-address` is a multi-WAN / security egress control and MUST
+  always be honored. #2901 originally made a cross-family Happy-Eyeballs dial
+  proceed with the kernel-chosen source (SILENTLY skipping the bind) — but that let
+  a DDNS update / checkip probe egress the WRONG WAN, BYPASS a source-IP ACL, and
+  PUBLISH the wrong external address with no operator-visible error. #5327 closes
+  that hole: **whenever a `source-address` is configured, the dial is PINNED to that
+  source's address family** so Happy-Eyeballs can no longer pick the other family
+  — `cl.Net` is set to `udp4`/`udp6` for the RFC 2136 `*dns.Client` (the TCP
+  truncation retry inherits the pin), and the HTTP `Transport.DialContext` is
+  wrapped (`boundDialContext` → `constrainDialNetwork`) to force `tcp4`/`tcp6`. With
+  the pin in place the source bind ALWAYS applies. **Reviewed behaviour change:** an
+  IPv4 `source-address` makes that provider effectively IPv4 for the dial (and vice
+  versa). If the endpoint has NO address in the source family (e.g. an IPv4
+  `source-address` but an IPv6-only endpoint) the pinned dial **FAILS CLOSED** — a
+  clear "no suitable address" dial error the reconciler logs + retries — rather than
+  egressing unbound on the wrong family. This deliberately overrides #2901's
+  documented "proceed unbound on a family mismatch" behaviour: a source-address
+  egress pin must never be silently abandoned. A device-only bind (no
+  `source-address`) imposes NO family pin (SO_BINDTODEVICE is family-agnostic), so
+  its dual-stack behaviour is byte-for-byte unchanged.
 - **HTTP-transport + checkip source binding (#2846)** — originally only the RFC
   2136 backend honored the source binding; the HTTP backends
   (dyndns2/Cloudflare/Route53/generic) and the external checkip probe built a

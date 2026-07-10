@@ -1,6 +1,7 @@
 package ddns
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -181,22 +182,28 @@ func (b bindConfig) isSet() bool {
 // Returns nil when no binding is requested (the *dns.Client then uses its
 // default dialer — today's behaviour byte-for-byte).
 //
-// Dual-stack family gate (#2901): the source-bind is applied only when the
-// source-address family MATCHES the dial socket's address family. The dialer is
-// shared by the RFC 2136 backend AND, via newHTTPClientBound (#2846), every HTTP
-// DDNS backend + the checkip probe — dialing endpoints that may resolve to both
-// A and AAAA records. When Go's Happy-Eyeballs dials the family that does NOT
-// match the configured source-address, calling unix.Bind with a SockaddrInet4 on
-// an AF_INET6 socket (or the reverse) fails EAFNOSUPPORT/EINVAL and aborts the
-// whole connection instead of letting it proceed. We therefore key off the
-// Dialer.Control "network" argument ("tcp4"/"tcp6"/"udp4"/"udp6") and SKIP the
-// source-bind on a family mismatch — the mismatched-family dial proceeds with
-// the kernel-chosen source rather than hard-failing. SO_BINDTODEVICE is
-// family-agnostic and is always applied. A configured source-address still
-// constrains the matching family to the operator's source; the unmatched family
-// (which the operator did not provide a source for) simply uses the default
-// source. When network is empty/unsuffixed (no family hint), the bind is applied
-// by source family as before.
+// Dual-stack family gate (#2901, refined by #5327): the source-bind is applied
+// only when the source-address family MATCHES the dial socket's address family.
+// The dialer is shared by the RFC 2136 backend AND, via newHTTPClientBound
+// (#2846), every HTTP DDNS backend + the checkip probe — dialing endpoints that
+// may resolve to both A and AAAA records. Calling unix.Bind with a SockaddrInet4
+// on an AF_INET6 socket (or the reverse) fails EAFNOSUPPORT/EINVAL and would
+// abort the whole connection, so this hook keys off the Dialer.Control "network"
+// argument ("tcp4"/"tcp6"/"udp4"/"udp6") and only binds on a family match.
+//
+// The gate is now a SECONDARY guard: whenever a source-address is configured,
+// the callers PIN the dial network to the source family upstream
+// (constrainDialNetwork — cl.Net for RFC 2136, the Transport.DialContext wrapper
+// for HTTP), so Happy-Eyeballs can no longer pick the other family. That closes
+// the #5327 hole where a cross-family dial SILENTLY SKIPPED the bind and egressed
+// from a kernel-chosen source on the WRONG WAN (bypassing a source ACL /
+// publishing the wrong address with no error). With the pin in place the network
+// here always carries the matching family suffix, so the gate always evaluates
+// true for a source-configured dial; if the endpoint has no address in the source
+// family the pinned dial FAILS CLOSED before this hook runs. The gate still
+// guards the device-only bind (no source-address → no family pin → SO_BINDTODEVICE
+// only, family-agnostic) and remains defense-in-depth against an unsuffixed
+// network. SO_BINDTODEVICE is family-agnostic and is always applied.
 func (b bindConfig) dialer(timeout time.Duration) *net.Dialer {
 	if !b.isSet() {
 		return nil
@@ -259,5 +266,71 @@ func sourceMatchesDialFamily(src netip.Addr, network string) bool {
 		return src.Is6()
 	default:
 		return true
+	}
+}
+
+// sourceDialFamily returns the address-family suffix ("4" or "6") that a
+// configured source-address pins the dial to, and whether a pin applies (#5327).
+// A pin applies ONLY when a source-address is configured: it is the operator's
+// multi-WAN / security egress control and MUST always be honored. A device-only
+// bind (SO_BINDTODEVICE) is family-agnostic and imposes no family pin, and a
+// no-binding config never reaches the constrained path.
+func (b bindConfig) sourceDialFamily() (suffix string, ok bool) {
+	if !b.sourceAddr.IsValid() {
+		return "", false
+	}
+	if b.sourceAddr.Is4() {
+		return "4", true
+	}
+	return "6", true
+}
+
+// constrainDialNetwork pins a base dial network ("tcp"/"udp") to the configured
+// source-address family (#5327). A source-address is a multi-WAN / security
+// egress pin: left dual-stack, Go's Happy-Eyeballs can pick the family the source
+// does NOT cover, the family gate in dialer() then SILENTLY SKIPS the bind, and
+// the exchange egresses from a kernel-chosen source on the wrong WAN — bypassing
+// a source ACL and/or publishing the wrong external address with no error (the
+// #2901 documented-intentional silent-skip, overridden here as a reviewed
+// decision because a configured source-address must never be silently abandoned).
+// Forcing the network to the source family guarantees the bind always applies; if
+// the endpoint has NO address in that family the pinned dial FAILS CLOSED (a clear
+// "no suitable address" dial error surfaced to the reconciler) instead of
+// egressing unbound. A network already carrying a family suffix, or a config with
+// no source-address (device-only / unbound), is returned unchanged.
+func (b bindConfig) constrainDialNetwork(base string) string {
+	suffix, ok := b.sourceDialFamily()
+	if !ok {
+		return base
+	}
+	if strings.HasSuffix(base, "4") || strings.HasSuffix(base, "6") {
+		return base
+	}
+	return base + suffix
+}
+
+// boundDialContext wraps a *net.Dialer's DialContext so the dial network is
+// pinned to the configured source-address family (#5327) before delegating. The
+// HTTP transport calls Transport.DialContext with a bare "tcp"; the rewrite forces
+// "tcp4"/"tcp6" so Happy-Eyeballs cannot pick the other family and skip the source
+// bind. With no source-address (device-only) the network is passed through
+// unchanged, so behaviour is byte-for-byte the pre-#5327 dial.
+func (b bindConfig) boundDialContext(d *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		return d.DialContext(ctx, b.constrainDialNetwork(network), address)
+	}
+}
+
+// networkFamilySuffix returns the "4"/"6" family suffix carried by a dial network
+// string, or "" for a bare "tcp"/"udp". Used to carry the #5327 source-family pin
+// from the UDP dial onto the RFC 2136 TCP truncation retry.
+func networkFamilySuffix(network string) string {
+	switch {
+	case strings.HasSuffix(network, "4"):
+		return "4"
+	case strings.HasSuffix(network, "6"):
+		return "6"
+	default:
+		return ""
 	}
 }
