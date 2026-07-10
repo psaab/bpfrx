@@ -44,6 +44,15 @@ func (m *Manager) SetRGReady(rgID int, ready bool, reasons []string) {
 				if m.stopped {
 					return
 				}
+				// The RG may have been removed (or replaced) from config
+				// while this timer was armed or already parked on m.mu
+				// (#5245). UpdateConfig stops+clears the timer on removal,
+				// but a timer that had already fired races that teardown;
+				// verify this is still the live group before electing so a
+				// stale closure cannot run an election against removed state.
+				if cur, ok := m.groups[rgID]; !ok || cur != rg {
+					return
+				}
 				if !rg.Ready {
 					return
 				}

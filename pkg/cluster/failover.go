@@ -49,6 +49,11 @@ func (m *Manager) ManualFailover(rgID int) error {
 		return fmt.Errorf("failover already in progress for redundancy group %d, please wait", rgID)
 	}
 	m.failoverInProgress[rgID] = true
+	// Snapshot the per-RG failover generation before releasing m.mu for the
+	// pre-hook. A ResetFailover landing in the unlocked window bumps it, and
+	// the post-relock re-check below then abandons the trailing SecondaryHold
+	// write instead of clobbering the operator's reset (#5246).
+	failoverGen := m.failoverGen[rgID]
 	preHook := m.preManualFailoverFn
 	retryTimeout := m.preManualFailoverRetryTimeout
 	retryInterval := m.preManualFailoverRetryInterval
@@ -102,6 +107,15 @@ func (m *Manager) ManualFailover(rgID int) error {
 	rg, ok = m.groups[rgID]
 	if !ok {
 		return fmt.Errorf("redundancy group %d not found", rgID)
+	}
+	// If a ResetFailover ran during the unlocked pre-hook window it bumped
+	// this RG's failover generation. The trailing SecondaryHold write below
+	// would otherwise silently clobber the operator's reset (#5246). Detect
+	// the supersede and abandon the write, leaving the reset's restored state
+	// intact. failoverInProgress is cleared by the deferred delete above.
+	if m.failoverGen[rgID] != failoverGen {
+		slog.Info("cluster: manual failover superseded by reset, abandoning", "rg", rgID)
+		return nil
 	}
 	oldState := rg.State
 	rg.ManualFailover = true
@@ -168,6 +182,11 @@ func (m *Manager) ResetFailover(rgID int) error {
 	}
 	rg.ManualFailover = false
 	rg.ManualFailoverAt = time.Time{}
+	// Invalidate any in-flight ManualFailover / ManualFailoverBatch whose
+	// pre-failover hook released m.mu: bump the per-RG failover generation so
+	// its post-hook re-check abandons the trailing SecondaryHold write instead
+	// of clobbering this reset (#5246).
+	m.failoverGen[rgID]++
 	m.recalcWeight(rg) // restore weight from monitor state + run election
 	slog.Info("cluster: failover reset", "rg", rgID)
 	return nil
@@ -442,8 +461,13 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 			return fmt.Errorf("failover already in progress for redundancy groups %v, please wait", ids)
 		}
 	}
+	batchGen := make(map[int]uint64, len(ids))
 	for _, rgID := range ids {
 		m.failoverInProgress[rgID] = true
+		// Snapshot each member's failover generation before releasing m.mu
+		// for the pre-hook so a ResetFailover on a member during the unlocked
+		// window is detected and its reset preserved (#5246).
+		batchGen[rgID] = m.failoverGen[rgID]
 	}
 	preHook := m.preManualFailoverFn
 	retryTimeout := m.preManualFailoverRetryTimeout
@@ -504,6 +528,18 @@ func (m *Manager) ManualFailoverBatch(rgIDs []int) error {
 	now := time.Now()
 	for _, rgID := range ids {
 		rg := m.groups[rgID]
+		if rg == nil {
+			// Group was removed from config during the unlocked pre-hook
+			// window; nothing to transfer out.
+			continue
+		}
+		// A ResetFailover on this member during the unlocked window bumped
+		// its failover generation — its reset wins; skip the SecondaryHold
+		// write so we don't clobber it (#5246).
+		if m.failoverGen[rgID] != batchGen[rgID] {
+			slog.Info("cluster: manual failover batch member superseded by reset, skipping", "rg", rgID)
+			continue
+		}
 		oldState := rg.State
 		rg.ManualFailover = true
 		rg.ManualFailoverAt = now

@@ -276,6 +276,15 @@ type Manager struct {
 	// racing and hitting "session sync disconnected during barrier wait".
 	failoverInProgress map[int]bool
 
+	// failoverGen is a per-RG monotonic generation bumped by ResetFailover
+	// (#5246). ManualFailover / ManualFailoverBatch snapshot it under m.mu
+	// before releasing the lock to run the retryable pre-failover hook, and
+	// re-check it after re-acquiring m.mu. A ResetFailover that lands in that
+	// unlocked window bumps the generation; the re-check then detects the
+	// supersede and abandons its trailing SecondaryHold write so the
+	// operator's reset is not silently clobbered. Guarded by m.mu.
+	failoverGen map[int]uint64
+
 	// stopped is set by Stop() to mark the manager quiesced. It guards the
 	// per-RG hold-timer closure (readiness.go) so a takeover-hold timer that
 	// had already fired and is blocked on m.mu when Stop() runs cannot run an
@@ -319,6 +328,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		preManualFailoverRetryTimeout:  DefaultPreManualFailoverRetryTimeout,
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 		failoverInProgress:             make(map[int]bool),
+		failoverGen:                    make(map[int]uint64),
 	}
 }
 

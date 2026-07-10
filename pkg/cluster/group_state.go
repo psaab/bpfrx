@@ -40,8 +40,20 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	}
 
 	// Remove groups no longer in config and their monitor weights.
-	for id := range m.groups {
+	for id, rg := range m.groups {
 		if !seen[id] {
+			// Stop the armed takeover-hold timer before dropping the group
+			// so its AfterFunc closure cannot fire an election against
+			// removed state (#5245). Mirrors the readiness.go not-ready
+			// clear site and Stop(): stop + nil the field under m.mu (held
+			// here). AfterFunc's Stop() does not block on an in-flight
+			// callback; if a fired callback is already parked on m.mu it
+			// runs after we unlock, but the readiness.go closure's
+			// staleness guard makes it a no-op once the group is gone.
+			if rg.holdTimer != nil {
+				rg.holdTimer.Stop()
+				rg.holdTimer = nil
+			}
 			for k := range m.monitorWeights {
 				if k.rgID == id {
 					delete(m.monitorWeights, k)

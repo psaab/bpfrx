@@ -509,6 +509,27 @@ outside the monitor loop:
   explicit operator-initiated `request chassis cluster failover`.
 - `TakeoverHoldTime` adds extra delay before election when this node would
   immediately preempt. Used to avoid election thrash on simultaneous boot.
+- **Removing an RG must stop its armed hold timer (#5245).** `SetRGReady`
+  arms a per-RG `time.AfterFunc` takeover-hold timer whose closure captures
+  the `*RedundancyGroupState` and re-runs election on expiry. `UpdateConfig`'s
+  removal loop `Stop()`s and nils `rg.holdTimer` before `delete(m.groups, id)`
+  — mirroring the `readiness.go` not-ready clear site and `Stop()`. Without
+  this the closure keeps the removed group alive and still fires, running an
+  election against removed state. Belt-and-suspenders: the closure also
+  re-checks `m.groups[rgID] == rg` after taking `m.mu` (a timer that had
+  already fired can race the teardown, since `AfterFunc.Stop()` does not
+  cancel an in-flight callback) and no-ops if the group is gone or replaced.
+- **`ManualFailover`/`ManualFailoverBatch` release `m.mu` for the pre-failover
+  hook — a racing `ResetFailover` must not be clobbered (#5246).** Both take
+  `m.mu`, mark `failoverInProgress`, then unlock to run the retryable pre-hook
+  (which may sleep up to the retry timeout), re-lock, and write
+  `State=SecondaryHold`. A `ResetFailover` in that unlocked window clears the
+  failover and re-elects, but the trailing SecondaryHold write would silently
+  overwrite it. Fix: a per-RG `failoverGen` counter — `ResetFailover` bumps it;
+  the failover path snapshots it before unlocking and abandons its trailing
+  write (single-RG returns nil; batch skips that member) if it changed. Keep
+  `failoverInProgress` cleaned up on every exit path so a superseded failover
+  cannot wedge the next one.
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).
