@@ -22,6 +22,33 @@
   to populate rec.PolicyID (the field the record now reads).
   **File(s)**: pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
   pkg/logging/session_close_binary_slog_4914_test.go
+## 2026-07-09 — #5007 userspace HA: resolve forward+reverse session-sync pair against ONE snapshot (close the m.mu-drop drift window)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5007 (bug, HA session-sync concurrency). `SetSessionV4`/
+  `SetSessionV6` installed a forward session then its reverse companion under
+  one `m.mu` hold, but `syncSessionRequestLocked` deliberately drops `m.mu`
+  around the control-socket I/O (unlock → `requestSessionSync` → lock). The
+  reverse companion was BUILT after the forward's socket round-trip, so a
+  concurrent `ApplyConfig` swapping `m.lastSnapshot` in that gap made the
+  reverse resolve egress/zone/tunnel-endpoint metadata against a DIFFERENT
+  snapshot than the forward (drifted `owner_rg_id` / egress). Fix: extracted
+  `mirrorSessionPairV4`/`mirrorSessionPairV6`, which build BOTH the forward and
+  reverse `SessionSyncRequest` under a single uninterrupted `m.mu` hold (all
+  snapshot reads complete before any unlock), then transmit both via a new
+  `syncSessionRequestsLocked` that drops `m.mu` once for the socket sends. The
+  deliberate non-blocking-publish property is preserved — socket I/O still runs
+  with `m.mu` released; only the snapshot READS were pulled ahead of the drop.
+  **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_sessionsync_snapshot_5007_test.go
+  **Validation**: added
+  `TestMirrorSessionPairV4ResolvedAgainstConsistentSnapshot_5007` — a
+  deterministic fail-on-revert test that forces an ApplyConfig-style snapshot
+  swap during the forward request's socket I/O and asserts the reverse
+  companion still carries the forward's snapshot `owner_rg_id`. It fails RED on
+  the pre-#5007 interleaved shape (reverse OwnerRGID=2, snapshot B) and passes
+  GREEN on the fix. `go test -race ./pkg/dataplane/userspace/` passes; `go vet`
+  and `gofmt` clean; `cmd/xpfd` builds. Go-only change — no Rust touched.
 ## 2026-07-09 — #5023 snmp: fix -race data race on the package-global trapSender
 
 - **Timestamp**: 2026-07-09
