@@ -1081,13 +1081,18 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// reflected in THIS scrape's xpf_interface_counter_read_errors_total. Kept
 	// separate from the security-counter total emitted just below.
 	c.emitInterfaceCounterReadErrors(ch)
-	// #3462: emit the scrape-error counter AFTER global/zone/policy/filter
+	// #5046: collect NAT pool metrics BEFORE emitCounterReadErrors — a
+	// ReadNATPortCounter failure bumps counterReadErrors, and the bump must be
+	// reflected in THIS scrape's xpf_counter_read_errors_total rather than
+	// lagging a scrape behind (the same #3462 ordering the other counter
+	// collectors follow).
+	c.collectNATPoolMetrics(ch, dp)
+	// #3462: emit the scrape-error counter AFTER global/zone/policy/filter/NAT
 	// (and the pre-gate host-inbound collector) have run, so a read failure in
 	// any of them is reflected in THIS scrape's xpf_counter_read_errors_total
 	// rather than lagging a scrape behind.
 	c.emitCounterReadErrors(ch)
 	c.collectSessionGauges(ch, dp)
-	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)
 	c.collectDDNSMetrics(ch)
 	c.collectSurfaceADDNSMetrics(ch)

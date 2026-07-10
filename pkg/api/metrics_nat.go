@@ -34,7 +34,14 @@ func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp api
 
 		if id, ok := cr.PoolIDs[name]; ok {
 			cnt, err := dp.ReadNATPortCounter(uint32(id))
-			if err == nil {
+			if err != nil {
+				// #5046: a port-counter read failure must not silently emit a
+				// healthy sample nor vanish without a trace. Omit the used-ports
+				// sample (never a fake 0) AND bump the shared scrape-error
+				// counter so monitoring can see the read failed — the same
+				// #3345/#3462 contract the zone/policy/filter collectors honor.
+				c.counterReadErrors.Add(1)
+			} else {
 				ch <- prometheus.MustNewConstMetric(c.natPoolUsedPorts, prometheus.GaugeValue,
 					float64(cnt), name)
 			}
