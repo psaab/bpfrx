@@ -1387,18 +1387,60 @@ def _node_drain_supports_mixed_ha(runner, backend, node):
     return "allow-mixed-ha" in out
 
 
-def _read_image_manifest_versions(path):
-    """Parse the bake `.manifest` (key: value) into the same key namespace as
-    `xpfd protocol-versions` (key=value, hyphenated)."""
+def _parse_image_manifest_versions(text):
+    """Parse bake `.manifest` TEXT (key: value) into the same key namespace as
+    `xpfd protocol-versions` (key=value, hyphenated). Split out from
+    `_read_image_manifest_versions` so the #5042 gate can parse the VERIFIED
+    bytes of the sidecar (returned by sign.verify_listed_artifact_bytes) rather
+    than re-opening the on-disk path after the signature check (TOCTOU)."""
     d = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or ":" not in line:
-                continue
-            k, v = line.split(":", 1)
-            d[k.strip().replace("_", "-")] = v.strip()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        d[k.strip().replace("_", "-")] = v.strip()
     return d
+
+
+def _read_image_manifest_versions(path):
+    """Parse the bake `.manifest` FILE (key: value) into the gate key namespace.
+
+    NOTE (#5042): this raw file read is authenticated ONLY when the caller has
+    already verified `path` against the signed xpf-<ver>.SHA256SUMS. The
+    mixed-base gate in cmd_image_roll now reads VERIFIED bytes via
+    `_verified_image_manifest_versions`; do not feed an unverified path
+    straight into the session-safety decision."""
+    with open(path) as f:
+        return _parse_image_manifest_versions(f.read())
+
+
+def _verified_image_manifest_versions(manifest_path, sums_path, sig_path, pubkey_path=None):
+    """#5042: verify the protocol sidecar `manifest_path` against the SIGNED
+    checksum manifest (`sums_path` + its `.minisig`) and parse the VERIFIED
+    bytes. The mixed-base HA session-safety gate decides whether synchronized
+    sessions survive an image roll; before #5042 it read the sidecar RAW, so
+    tampering only that unsigned file could spoof a compatible-window /
+    matching-session-sync decision and bypass the safety stop while every
+    signed image byte was untouched. Reading the bytes verify_listed_artifact_bytes
+    returns (hash-checked against the signed manifest, from a private copy)
+    closes that trust gap. Fails closed on any missing/mismatched/unsigned input."""
+    HERE_D = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE_D), "dist"))
+    import sign  # noqa: E402
+    data = sign.verify_listed_artifact_bytes(manifest_path, sums_path, sig_path, pubkey_path)
+    return _parse_image_manifest_versions(data.decode("utf-8", "replace"))
+
+
+def _default_sums_for_manifest(manifest_path):
+    """#5042: convention default for the SIGNED checksum manifest that covers a
+    protocol sidecar — the xpf-<ver>.SHA256SUMS sibling of the
+    xpf-<ver>.manifest (both land in the same fetch/bake directory). Returns
+    None if the manifest name does not fit the `*.manifest` shape, in which
+    case the operator must pass --sha256sums explicitly (fail closed)."""
+    if manifest_path.endswith(".manifest"):
+        return manifest_path[: -len(".manifest")] + ".SHA256SUMS"
+    return None
 
 
 def _u16(s):
@@ -1469,12 +1511,34 @@ def cmd_image_roll(args):
         die("image-roll needs --recreate-hook <script> (the backend-specific "
             "destroy+launch+day-0 recreate step); refusing to drain without it.")
 
-    # The new image's protocol versions come from its manifest (a file read).
-    # REQUIRED for the gate — fail closed if absent.
+    # The new image's protocol versions come from its manifest. #5042: the
+    # sidecar is covered by the SIGNED xpf-<ver>.SHA256SUMS, so verify it
+    # against that signed manifest (+ .minisig) and parse the VERIFIED bytes —
+    # the mixed-base session-safety gate must decide from signed bytes, never
+    # a raw sidecar an attacker could tamper. Fail closed on any
+    # missing/mismatched/unsigned input.
     if not args.manifest or not os.path.isfile(args.manifest):
         die("image-roll requires --manifest <xpf-<ver>.manifest> (the new image's "
             "version manifest) for the mixed-base gate; not found")
-    new_img = _read_image_manifest_versions(args.manifest)
+    sums_path = args.sha256sums or _default_sums_for_manifest(args.manifest)
+    if not sums_path or not os.path.isfile(sums_path):
+        die("image-roll requires the SIGNED checksum manifest "
+            "(xpf-<ver>.SHA256SUMS covering the .manifest) so the mixed-base "
+            "session-safety gate reads AUTHENTICATED bytes (#5042). Pass "
+            "--sha256sums <path> (default: the .SHA256SUMS sibling of "
+            f"--manifest); not found: {sums_path!r}")
+    sig_path = args.sig or (sums_path + ".minisig")
+    if not os.path.isfile(sig_path):
+        die(f"image-roll requires the signature {os.path.basename(sig_path)} "
+            "(minisign over the SHA256SUMS) to authenticate the mixed-base gate "
+            "input (#5042); not found. Pass --sig <path>.")
+    try:
+        new_img = _verified_image_manifest_versions(
+            args.manifest, sums_path, sig_path, args.pubkey)
+    except Exception as e:
+        die(f"image-roll: FAILED to verify {os.path.basename(args.manifest)} "
+            f"against the signed {os.path.basename(sums_path)} — the mixed-base "
+            f"gate must read signed bytes (#5042): {e}")
 
     holder = _re.sub(r"[^A-Za-z0-9._:-]", "_",
                      f"{os.uname().nodename}:pid{os.getpid()}")
@@ -1748,7 +1812,19 @@ def main():
                               "in roll order (first-to-roll then second)")
         sub.add_argument("--manifest", required=True,
                          help="the NEW image's xpf-<ver>.manifest (read for the "
-                              "mixed-base HA-protocol gate)")
+                              "mixed-base HA-protocol gate; VERIFIED against the "
+                              "signed SHA256SUMS before use, #5042)")
+        sub.add_argument("--sha256sums", default=None,
+                         help="the SIGNED xpf-<ver>.SHA256SUMS that covers the "
+                              ".manifest (default: the .SHA256SUMS sibling of "
+                              "--manifest). The mixed-base gate authenticates the "
+                              "manifest against this before reading it (#5042).")
+        sub.add_argument("--sig", default=None,
+                         help="minisign signature over --sha256sums "
+                              "(default: <sha256sums>.minisig)")
+        sub.add_argument("--pubkey", default=None,
+                         help="image signing public key (default: pinned "
+                              "scripts/dist/xpf-image.pub or $XPF_IMAGE_PUBKEY)")
         sub.add_argument("--recreate-hook", dest="recreate_hook",
                          help="script invoked as <hook> <node> to destroy+launch "
                               "the node from the new image + re-apply day-0 "
