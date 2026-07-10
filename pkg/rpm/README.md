@@ -74,6 +74,18 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
   actuates routes off an environment error. Genuine dial outcomes
   (refused/timeout/unreachable) and send/receive errors stay path
   failures; ambiguous dial errnos default to PATH.
+- **Scoped-hostname resolver setup failures also hold state** (#5061):
+  a VRF/path-scoped hostname target resolves through a DNS socket pinned
+  to the SAME `SO_BINDTODEVICE`/`SO_MARK` as the probe (#2614). A bind
+  failure on that *resolver* socket is `ErrProbeSetup` too — one shared
+  `vrfBindControl` classifies both the data socket and the resolver
+  socket. The sentinel survives `net.OpError` on the data-socket dial
+  path but is flattened to a string by `*net.DNSError` on the resolver
+  path, so the setup error is captured in an out-of-band `setupErrSink`
+  and `resolveProbeTarget` / `probeTCP` / `probeHTTP` re-tag the
+  lookup/dial failure from it. Before #5061 the resolver Control
+  returned the raw error, so an EPERM/ENODEV resolver bind was counted
+  as probe loss for icmp-ping/tcp-ping/http-get.
 - The raw-socket seam is injectable (`icmpListenFunc` in `icmp.go`) so
   prober logic is unit-testable without privileges.
 - **The http-get probe's transport is one-shot** (#4912): `probeHTTP`

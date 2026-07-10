@@ -15,7 +15,7 @@ import (
 // ip-monitoring never actuates routes off a wrong-path measurement.
 func TestProbeDialerMalformedSourceReturnsSetupError(t *testing.T) {
 	for _, src := range []string{"not-an-ip", "10.0.0.999", "2001:db8::g"} {
-		d, err := probeDialer(5*time.Second, src, probeSockOpts{})
+		d, _, err := probeDialer(5*time.Second, src, probeSockOpts{})
 		if err == nil {
 			t.Fatalf("probeDialer(%q) returned nil error; want ErrProbeSetup (would wildcard-bind)", src)
 		}
@@ -32,7 +32,7 @@ func TestProbeDialerMalformedSourceReturnsSetupError(t *testing.T) {
 // source-address stays legitimate: it means "default source", so the
 // dialer is returned with no LocalAddr and no error.
 func TestProbeDialerEmptySourceIsDefaultBind(t *testing.T) {
-	d, err := probeDialer(5*time.Second, "", probeSockOpts{})
+	d, _, err := probeDialer(5*time.Second, "", probeSockOpts{})
 	if err != nil {
 		t.Fatalf("probeDialer(\"\") err = %v, want nil (empty = default source)", err)
 	}
@@ -47,7 +47,7 @@ func TestProbeDialerEmptySourceIsDefaultBind(t *testing.T) {
 // TestProbeDialerValidSourceBinds confirms a parseable source-address is
 // carried through to the dialer's LocalAddr.
 func TestProbeDialerValidSourceBinds(t *testing.T) {
-	d, err := probeDialer(5*time.Second, "10.0.0.5", probeSockOpts{})
+	d, _, err := probeDialer(5*time.Second, "10.0.0.5", probeSockOpts{})
 	if err != nil {
 		t.Fatalf("probeDialer valid source err = %v, want nil", err)
 	}

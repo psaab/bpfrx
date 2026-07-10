@@ -213,6 +213,24 @@ editing cmdtree.
     routable-interface Prometheus scraper must then present the configured
     API key / basic-auth. `/health` stays exempt (no sensitive data, no
     table walk).
+  - **Cross-site mutation guard (CSRF, #5055).** HTTP Basic auth is an
+    *ambient* browser credential (`WWW-Authenticate: Basic`) — once a browser
+    is challenged it reattaches the cached credentials to every request to the
+    origin, including a cross-site `fetch(...,{credentials:'include'})` or a
+    cross-site `<form>` POST. The same-origin policy blocks *reading* the
+    response but not *sending* the side-effecting request, so a malicious page
+    could drive a credentialed state change. `mutationCrossSiteGuard`
+    (`pkg/api/crosssite.go`) wraps the mux BEFORE `authMiddleware` and rejects
+    any non-safe-method request (403) that shows cross-site provenance:
+    `Sec-Fetch-Site: cross-site|same-site`, an `Origin`/`Referer` whose
+    host:port differs from the target, or a CORS "simple" form content type
+    (`application/x-www-form-urlencoded` / `multipart/form-data` /
+    `text/plain`). A same-origin management-UI request (Sec-Fetch-Site
+    same-origin / none, matching Origin, `application/json`) and a programmatic
+    client (curl/CLI/scraper — none of those headers, `application/json` or an
+    empty body) both pass. Header-based API-key/Bearer clients are unaffected —
+    a cross-site page cannot set `Authorization: Bearer` / `X-API-Key`. The
+    guard applies whether or not api-auth is configured.
   - The seven `xpf_sessions_*` aggregate gauges are backed by a full walk
     of the shared v4+v6 conntrack tables (up to ~10M entries). That walk is
     served from a short-TTL (`sessionGaugeTTL`, 3s), singleflight-coalesced
