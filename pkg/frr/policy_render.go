@@ -258,57 +258,115 @@ func isDefinedPolicyStatement(name string, po *config.PolicyOptionsConfig) bool 
 	return ok
 }
 
-// lastNonEmpty returns the last non-empty string in the slice, or "".
-// Used to pick a neighbor's effective own export: FRR accepts only one
-// `route-map <name> out` per neighbor/address-family, and Junos set-style
-// accumulation means a later statement is the more-specific intent — so
-// the last entry wins.
-func lastNonEmpty(ss []string) string {
-	for i := len(ss) - 1; i >= 0; i-- {
-		if ss[i] != "" {
-			return ss[i]
+// ReservedChainSuffix is the route-map name suffix xpf RESERVES for the
+// composed BGP policy-chain route-maps the renderer derives for an ordered
+// import/export policy list of length >= 2 (composedChainName below). FRR keys
+// route-maps by NAME in a single GLOBAL namespace, so a composed name that
+// collided with an operator policy-statement would fuse the two objects and
+// could silently change the operator's filtering — the render-side guard
+// bgpComposedChainCollision fails the whole apply CLOSED on any collision
+// (#5277). Kept a package const so the derivation and the guard cannot drift.
+const ReservedChainSuffix = "-xpf-chain"
+
+// hasNonEmptyPolicy reports whether names holds at least one non-empty entry.
+// It replaces the old lastNonEmpty("") != "" idiom for "does this neighbor set
+// its own import/export?", independent of whether the entries resolve to
+// defined policy-statements (a bare/undefined own ref still suppresses the
+// global default, matching the pre-#5277 override precedence).
+func hasNonEmptyPolicy(names []string) bool {
+	for _, n := range names {
+		if n != "" {
+			return true
 		}
 	}
-	return ""
+	return false
 }
 
-// bgpEffectiveExport resolves the single peer-level export route-map name
-// for a BGP neighbor/address-family, applying Junos most-specific-wins:
-// the neighbor's own `export` (group/neighbor level) overrides the global
-// `protocols bgp export` default. FRR takes exactly one `route-map out`
-// per neighbor/AF, so we never emit two competing route-maps for one
-// peer; the neighbor's own policy, when present, is the one rendered.
-// Returns "" when neither the neighbor nor the global default sets an
-// export (no `route-map out` line is emitted).
-func bgpEffectiveExport(n *config.BGPNeighbor, globalExport string) string {
-	if rm := lastNonEmpty(n.Export); rm != "" {
-		return rm
+// filterDefinedPolicies returns, in order, the non-empty entries of names that
+// resolve to a DEFINED policy-statement. Bare protocol tokens and undefined
+// refs are dropped: a bare export token takes the redistribute path (#2473),
+// and an undefined ref must never render a dangling `route-map <name> in|out`
+// which FRR resolves to PERMIT-ALL (#2473/#2490/#2539). The surviving slice is
+// the ordered Junos policy CHAIN the renderer composes (#5277).
+func filterDefinedPolicies(names []string, po *config.PolicyOptionsConfig) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if n != "" && isDefinedPolicyStatement(n, po) {
+			out = append(out, n)
+		}
 	}
-	return globalExport
+	return out
 }
 
-// bgpEffectiveImport resolves the single peer-level import route-map name
-// for a BGP neighbor/address-family, applying Junos most-specific-wins:
-// the neighbor's own `import` (group/neighbor level) overrides the global
-// `protocols bgp import` default. FRR takes exactly one `route-map in` per
-// neighbor/AF, so we never emit two competing route-maps for one peer; the
-// neighbor's own policy, when present, is the one rendered. Returns "" when
-// neither the neighbor nor the global default sets an import (no
-// `route-map in` line is emitted). Symmetric to bgpEffectiveExport (#2490).
-//
-// Unlike export, import has NO redistribute shorthand — inbound filtering is
-// route-map-only. Both the caller and the commit-time validator therefore
-// require an import ref to name a DEFINED policy-statement (so
-// generatePolicyOptions renders a real `route-map <name>`). The caller
-// guards with isDefinedPolicyStatement before emitting `route-map <name> in`
-// to avoid the #2473 dangling-route-map PERMIT-ALL leak (here on the INBOUND
-// direction: an undefined route-map in FRR resolves to permit-all, accepting
-// every advertised prefix and defeating the operator's inbound filter).
-func bgpEffectiveImport(n *config.BGPNeighbor, globalImport string) string {
-	if rm := lastNonEmpty(n.Import); rm != "" {
-		return rm
+// bgpGlobalExportChain / bgpGlobalImportChain return the ordered chain of
+// DEFINED policy-statements set as a global `protocols bgp export`/`import`
+// default. Bare export protocol tokens are excluded here (they render as a
+// `redistribute <proto>` verb on their own path, unchanged); import has no
+// redistribute equivalent so only defined policy-statements survive (#2490).
+func bgpGlobalExportChain(bgp *config.BGPConfig, po *config.PolicyOptionsConfig) []string {
+	if bgp == nil {
+		return nil
 	}
-	return globalImport
+	return filterDefinedPolicies(bgp.Export, po)
+}
+
+func bgpGlobalImportChain(bgp *config.BGPConfig, po *config.PolicyOptionsConfig) []string {
+	if bgp == nil {
+		return nil
+	}
+	return filterDefinedPolicies(bgp.Import, po)
+}
+
+// bgpNeighborExportChain resolves a BGP neighbor's effective ORDERED export
+// policy chain, applying Junos most-specific-wins: the neighbor's OWN export
+// list (the compiler resolves group-vs-neighbor level precedence into n.Export,
+// #5277) overrides the global default. A neighbor that sets ANY own export
+// entry — even a bare/undefined one — suppresses the global default for that
+// peer (pre-#5277 override precedence); its chain is then the defined subset of
+// its own list. An empty own list falls back to the global chain.
+func bgpNeighborExportChain(n *config.BGPNeighbor, globalExportChain []string, po *config.PolicyOptionsConfig) []string {
+	if hasNonEmptyPolicy(n.Export) {
+		return filterDefinedPolicies(n.Export, po)
+	}
+	return globalExportChain
+}
+
+// bgpNeighborImportChain is the inbound symmetric of bgpNeighborExportChain
+// (#2490/#5277). Import has no redistribute shorthand, so the own-list subset is
+// simply its defined policy-statements.
+func bgpNeighborImportChain(n *config.BGPNeighbor, globalImportChain []string, po *config.PolicyOptionsConfig) []string {
+	if hasNonEmptyPolicy(n.Import) {
+		return filterDefinedPolicies(n.Import, po)
+	}
+	return globalImportChain
+}
+
+// composedChainName derives the FRR route-map name for an ordered BGP policy
+// chain of length >= 2. The member policy names (a chain never contains an
+// empty entry) are joined and suffixed with the reserved ReservedChainSuffix so
+// the composed object lives in a namespace distinct from operator route-maps;
+// bgpComposedChainCollision fails the apply closed on the rare residual
+// collision (#5277).
+func composedChainName(chain []string) string {
+	return strings.Join(chain, "-") + ReservedChainSuffix
+}
+
+// bgpRouteMapRef resolves an ordered policy chain to the FRR route-map name a
+// neighbor/address-family line references. A single-policy chain references the
+// standalone per-policy route-map generatePolicyOptions already emits
+// (byte-identical to the pre-#5277 render); a chain of >= 2 references the
+// composed route-map (composedChainName) that renderComposedRouteMap emits. An
+// empty chain yields "" (no `route-map` line). The chain is pre-filtered to
+// DEFINED policy-statements, so the returned name never dangles.
+func bgpRouteMapRef(chain []string) string {
+	switch len(chain) {
+	case 0:
+		return ""
+	case 1:
+		return chain[0]
+	default:
+		return composedChainName(chain)
+	}
 }
 
 // collectBGPRouteMapPolicies records, into dst, every DEFINED
@@ -321,37 +379,164 @@ func bgpEffectiveImport(n *config.BGPNeighbor, globalImport string) string {
 // forwarding-table export policy, whose protocol default is REJECT
 // (#2998).
 //
-// The set MIRRORS the exact emit conditions in generateProtocols
-// (effective import/export per neighbor, guarded by
-// isDefinedPolicyStatement), so a name lands here IFF a `route-map <name>
-// in|out` line is actually produced. globalExport/globalImport are
-// resolved the same way the BGP renderer resolves them (last DEFINED
-// policy-statement wins; bare protocol tokens take the redistribute path
-// and never become a route-map name).
+// The set records only a SINGLE-policy chain's standalone route-map: a chain of
+// one references the per-policy route-map generatePolicyOptions emits, whose
+// trailing default must be the BGP-accept permit. A MULTI-policy chain (#5277)
+// references a COMPOSED route-map (renderComposedRouteMap) that carries the
+// BGP-accept fall-off default INTERNALLY, so the composed members' standalone
+// route-maps are not the referenced objects and must not be forced to permit
+// here (a member also used single-policy / as a redistribute elsewhere is
+// recorded by THAT reference). globalExport/globalImport chains are resolved the
+// same way the BGP renderer resolves them.
 func collectBGPRouteMapPolicies(bgp *config.BGPConfig, po *config.PolicyOptionsConfig, dst map[string]bool) {
 	if bgp == nil || po == nil {
 		return
 	}
-	globalExport := ""
-	for _, e := range bgp.Export {
-		if e != "" && isDefinedPolicyStatement(e, po) {
-			globalExport = e
-		}
-	}
-	globalImport := ""
-	for _, e := range bgp.Import {
-		if e != "" && isDefinedPolicyStatement(e, po) {
-			globalImport = e
+	globalExportChain := bgpGlobalExportChain(bgp, po)
+	globalImportChain := bgpGlobalImportChain(bgp, po)
+	// A single-policy chain references the standalone route-map by name; only
+	// those need the #2998 trailing-permit default recorded.
+	addSingle := func(chain []string) {
+		if len(chain) == 1 {
+			dst[chain[0]] = true
 		}
 	}
 	for _, n := range bgp.Neighbors {
-		if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, po) {
-			dst[rm] = true
+		addSingle(bgpNeighborExportChain(n, globalExportChain, po))
+		addSingle(bgpNeighborImportChain(n, globalImportChain, po))
+	}
+}
+
+// bgpEffectiveChains yields every neighbor's effective export and import chain
+// for bgp (each already Junos most-specific-resolved and defined-filtered). The
+// visit callback receives each chain; callers filter by length. Shared by the
+// composed-route-map collector and the collision guard so the two never compute
+// the referenced chains differently (#5277).
+func bgpEffectiveChains(bgp *config.BGPConfig, po *config.PolicyOptionsConfig, visit func(chain []string)) {
+	if bgp == nil || po == nil {
+		return
+	}
+	globalExportChain := bgpGlobalExportChain(bgp, po)
+	globalImportChain := bgpGlobalImportChain(bgp, po)
+	for _, n := range bgp.Neighbors {
+		visit(bgpNeighborExportChain(n, globalExportChain, po))
+		visit(bgpNeighborImportChain(n, globalImportChain, po))
+	}
+}
+
+// collectBGPComposedChains records composedName -> chain for every REFERENCED
+// BGP export/import policy chain of length >= 2 in bgp. On a name conflict
+// (two DISTINCT chains deriving the same composedName) it keeps the FIRST
+// deterministically; bgpComposedChainCollision is the fail-closed guard that
+// rejects such a config before it renders (#5277).
+func collectBGPComposedChains(bgp *config.BGPConfig, po *config.PolicyOptionsConfig, dst map[string][]string) {
+	bgpEffectiveChains(bgp, po, func(chain []string) {
+		if len(chain) < 2 {
+			return
 		}
-		if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, po) {
-			dst[rm] = true
+		name := composedChainName(chain)
+		if _, ok := dst[name]; ok {
+			return
+		}
+		dst[name] = append([]string(nil), chain...)
+	})
+}
+
+// bgpComposedChainCollision is the render-side fail-closed guard for the
+// composed BGP policy-chain route-maps (#5277), mirroring redistAliasCollision
+// (#5116). FRR keys route-maps by NAME in one global namespace and MERGES two
+// same-named `route-map` definitions, so a composed name that collides with an
+// operator policy-statement — or two DISTINCT chains that derive the same
+// composed name — would fuse objects and could silently change the operator's
+// BGP filtering (a security-relevant leak). The reserved ReservedChainSuffix
+// makes both collisions astronomically unlikely, but on ANY collision this
+// returns an error so ApplyFull fails the whole managed-section apply CLOSED
+// (FRR keeps its last-good config) instead of emitting a fused route-map.
+// Returns nil for the common non-colliding case.
+func bgpComposedChainCollision(fc *FullConfig) error {
+	if fc == nil || fc.PolicyOptions == nil {
+		return nil
+	}
+	seen := map[string][]string{}
+	var firstErr error
+	check := func(bgp *config.BGPConfig) {
+		bgpEffectiveChains(bgp, fc.PolicyOptions, func(chain []string) {
+			if firstErr != nil || len(chain) < 2 {
+				return
+			}
+			name := composedChainName(chain)
+			if _, ok := fc.PolicyOptions.PolicyStatements[name]; ok {
+				firstErr = fmt.Errorf(
+					"composed BGP policy-chain route-map %q (from chain %v) "+
+						"collides with an operator policy-statement of that exact "+
+						"name; FRR merges same-named route-maps, so the collision "+
+						"could silently alter BGP filtering — refusing to render "+
+						"(rename the operator policy-statement or a chain member, "+
+						"#5277)", name, chain)
+				return
+			}
+			if prev, ok := seen[name]; ok && !equalStringSlice(prev, chain) {
+				firstErr = fmt.Errorf(
+					"BGP policy-chains %v and %v derive the same composed "+
+						"route-map name %q; FRR would merge them — rename a "+
+						"policy-statement to disambiguate (#5277)", prev, chain, name)
+				return
+			}
+			seen[name] = chain
+		})
+	}
+	check(fc.BGP)
+	for _, inst := range fc.Instances {
+		check(inst.BGP)
+	}
+	return firstErr
+}
+
+// renderComposedBGPChains emits the DEFINITIONS of every composed BGP
+// policy-chain route-map referenced anywhere in fc (default instance + every
+// VRF), deduplicated and sorted by name for deterministic output. It is emitted
+// alongside generatePolicyOptions in the managed section; FRR resolves a
+// `neighbor X route-map <name> out` reference to a route-map defined anywhere in
+// the file, so definition order does not matter. Returns "" when no chain of
+// length >= 2 is referenced (byte-identical to the pre-#5277 render). Any
+// distinct-chain name conflict is already rejected by bgpComposedChainCollision
+// in ApplyFull; here a residual conflict keeps the first chain deterministically.
+func (m *Manager) renderComposedBGPChains(fc *FullConfig) string {
+	if fc == nil || fc.PolicyOptions == nil {
+		return ""
+	}
+	chains := map[string][]string{}
+	collectBGPComposedChains(fc.BGP, fc.PolicyOptions, chains)
+	for _, inst := range fc.Instances {
+		collectBGPComposedChains(inst.BGP, fc.PolicyOptions, chains)
+	}
+	if len(chains) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(chains))
+	for name := range chains {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(m.renderComposedRouteMap(fc.PolicyOptions, name, chains[name]))
+		b.WriteString("!\n")
+	}
+	return b.String()
+}
+
+// equalStringSlice reports whether two string slices are element-wise equal.
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
+	return true
 }
 
 // bfdProfile holds a unique BFD profile (interval + multiplier).
@@ -808,16 +993,20 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// default (bgpEffectiveExport). A bare-token redistribute is a
 		// GLOBAL redistribute verb, not per-neighbor, and is emitted once
 		// under `router bgp`.
-		globalExport := ""
+		// globalExportChain is the ORDERED list of DEFINED policy-statements
+		// in `protocols bgp export` — the global export CHAIN applied as a
+		// peer-level default to neighbors with no own export. Every entry is
+		// preserved and composed in order (#5277); the pre-#5277 code kept only
+		// the LAST defined entry, silently dropping a leading reject/attribute
+		// policy so prohibited routes were advertised. Bare protocol tokens are
+		// still split out to the redistribute path below (unchanged).
+		globalExportChain := make([]string, 0, len(bgp.Export))
 		for _, e := range bgp.Export {
 			if e == "" {
 				continue
 			}
 			if isDefinedPolicyStatement(e, policyOptions) {
-				// Policy-statement name → peer-level route-map out
-				// global default. Later entry wins (lastNonEmpty
-				// semantics, applied inline here).
-				globalExport = e
+				globalExportChain = append(globalExportChain, e)
 			} else {
 				// Bare protocol token (or a name that slipped the
 				// validator on a lenient load/HA-sync path) → genuine
@@ -838,15 +1027,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// on the lenient load/HA-sync path: rendering `route-map <token> in`
 		// for a non-existent route-map would resolve to PERMIT-ALL in FRR
 		// and silently accept every inbound advertisement — the #2473
-		// dangling-route-map leak, INBOUND direction. Later defined entry
-		// wins (lastNonEmpty semantics, applied inline).
-		globalImport := ""
+		// dangling-route-map leak, INBOUND direction. Every DEFINED entry is
+		// preserved as an ordered CHAIN and composed in order (#5277); the
+		// pre-#5277 code kept only the last, silently dropping a leading inbound
+		// filter so prohibited routes were accepted.
+		globalImportChain := make([]string, 0, len(bgp.Import))
 		for _, e := range bgp.Import {
 			if e == "" {
 				continue
 			}
 			if isDefinedPolicyStatement(e, policyOptions) {
-				globalImport = e
+				globalImportChain = append(globalImportChain, e)
 			}
 		}
 
@@ -864,7 +1055,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			// activates a family-less neighbor under ipv4 unicast). Per-
 			// neighbor import/export inclusion is #2490 (symmetric to the
 			// global-default inclusion #2473 added).
-			hasOwnPolicy := bgpEffectiveExport(n, "") != "" || bgpEffectiveImport(n, "") != ""
+			hasOwnPolicy := hasNonEmptyPolicy(n.Export) || hasNonEmptyPolicy(n.Import)
 			// The "default-activate a family-less policied neighbor under
 			// ipv4 unicast" fall-through (#2473/#2490) is correct ONLY for
 			// an IPv4 peer address. An IPv6 peer (e.g. 2001:db8::1) with a
@@ -878,7 +1069,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			// IPv6-address family-less-but-policied neighbor into the ipv6
 			// set instead so it activates under ipv6 unicast (#2941).
 			isIPv6Peer := strings.Contains(n.Address, ":")
-			policyDefault := globalExport != "" || globalImport != "" || hasOwnPolicy
+			policyDefault := len(globalExportChain) > 0 || len(globalImportChain) > 0 || hasOwnPolicy
 			if (n.FamilyInet || (policyDefault && !n.FamilyInet6)) && !isIPv6Peer {
 				inet4Neighbors = append(inet4Neighbors, n)
 			}
@@ -915,20 +1106,17 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet)
 				}
-				// Outbound filter. Emit ONLY for a defined policy-statement,
-				// the same guard the inbound path uses (#2539, sibling of the
-				// #2490 inbound guard below). globalExport is already
-				// restricted to defined policy-statements (bare protocol
-				// tokens take the redistribute path via the #2473
-				// classification above), but a per-neighbor n.Export — now
-				// parseable as of #2490 — can carry a bare token or an
-				// undefined ref that slipped the strict validator on the
-				// lenient load/HA-sync path. Without the guard that renders a
-				// dangling `route-map out` = FRR permit-all OUTBOUND (the
-				// entire table advertised to the peer). Bare tokens stay on
-				// the redistribute path (never reach here as a defined name),
-				// so the #2473 bare-token→redistribute behavior is unchanged.
-				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
+				// Outbound filter. The effective export CHAIN (neighbor's own
+				// list, else the global default) is pre-filtered to DEFINED
+				// policy-statements (filterDefinedPolicies), so bare/undefined
+				// refs never render a dangling `route-map out` = FRR permit-all
+				// OUTBOUND (#2473/#2539) — bare tokens stay on the redistribute
+				// path. A single-policy chain references the standalone
+				// route-map (byte-identical to pre-#5277); a chain of >= 2
+				// references the composed route-map that preserves the ordered
+				// Junos policy chain (#5277) instead of dropping all but the
+				// last.
+				if rm := bgpRouteMapRef(bgpNeighborExportChain(n, globalExportChain, policyOptions)); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 				// Junos `then next-hop self` is lowered per-term INSIDE the
@@ -942,13 +1130,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				// #2977 fix), now scoped to the term. See the `term.NextHop ==
 				// "self"` branch in the route-map renderer.
 				//
-				// Inbound filter (#2490). Emit ONLY for a defined
-				// policy-statement so we never point `route-map in` at a
-				// non-existent route-map (FRR permit-all). The effective
-				// import may resolve to a per-neighbor ref that slipped the
-				// validator on a lenient load/HA-sync path; the guard drops
-				// it rather than leaking the inbound filter.
-				if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
+				// Inbound filter (#2490/#5277). Same chain composition as the
+				// outbound path: the effective import chain is defined-filtered
+				// (no dangling permit-all in-line), single-policy references the
+				// standalone route-map, and a chain of >= 2 references the
+				// composed route-map preserving the ordered inbound policy chain.
+				if rm := bgpRouteMapRef(bgpNeighborImportChain(n, globalImportChain, policyOptions)); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
 				}
 			}
@@ -971,16 +1158,16 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet6 > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet6)
 				}
-				// Outbound filter (#2539) — see the ipv4 block above.
-				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
+				// Outbound filter (#2539/#5277) — see the ipv4 block above.
+				if rm := bgpRouteMapRef(bgpNeighborExportChain(n, globalExportChain, policyOptions)); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 				// `then next-hop self` is lowered per-term in the export
 				// route-map as `set ip/ipv6 next-hop peer-address`, NOT a
 				// neighbor-wide `next-hop-self` knob (#5115) — see the ipv4
 				// block above.
-				// Inbound filter (#2490) — see the ipv4 block above.
-				if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
+				// Inbound filter (#2490/#5277) — see the ipv4 block above.
+				if rm := bgpRouteMapRef(bgpNeighborImportChain(n, globalImportChain, policyOptions)); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
 				}
 			}
@@ -1569,17 +1756,21 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 	return b.String()
 }
 
-// renderRouteMapForPolicy renders ONE FRR route-map for policy-statement ps
-// under emitName, appending the caller-supplied trailing default action. The
-// body — terms, match/set clauses, and inline route-filter prefix-lists whose
-// names derive from emitName — is identical across use sites; only the header
-// name and the trailing default differ. That lets a BGP-default-accept policy
-// ALSO be rendered under a fail-closed per-use-site alias for redistribute
-// without leaking its permit default across FRR's name-keyed route-map object
-// (#4481 / #2998 / #2607 / #2642).
-func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitName string, ps *config.PolicyStatement, trailingAction string) string {
+// renderPolicyTermSequences renders policy-statement ps's TERM sequences (NO
+// trailing default) into a fresh buffer under FRR route-map name routeMapName,
+// deriving inline route-filter prefix-list names from plPrefix, starting at
+// sequence startSeq. It returns the rendered text and the next unused sequence.
+//
+// Splitting the route-map NAME (route-map header) from the prefix-list PREFIX
+// lets renderComposedRouteMap emit several policies' term sequences into ONE
+// route-map (all sharing routeMapName) while keeping each policy's inline
+// prefix-lists in a distinct namespace (plPrefix carries the policy name), so a
+// term name reused across chained policies cannot fuse two prefix-lists (#5277).
+// renderRouteMapForPolicy passes routeMapName == plPrefix == emitName, keeping
+// the single-policy render byte-identical to master.
+func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, routeMapName, plPrefix string, ps *config.PolicyStatement, startSeq int) (string, int) {
 	var b strings.Builder
-	seq := 10
+	seq := startSeq
 	for _, term := range ps.Terms {
 		action := "permit"
 		if term.Action == "reject" {
@@ -1641,7 +1832,7 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 		// sequence they can satisfy (#2607; the same AND finding that
 		// drove #2071's single-matcher decision).
 		emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName, fromPrefixList, fromCommunity, fromASPath string) {
-			fmt.Fprintf(&b, "route-map %s %s %d\n", emitName, action, seqNum)
+			fmt.Fprintf(&b, "route-map %s %s %d\n", routeMapName, action, seqNum)
 
 			// Inline prefix-list for this sequence's route-filters.
 			if len(term.RouteFilters) > 0 {
@@ -1943,7 +2134,7 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 		// The common single-valued / no-match case collapses to ONE
 		// sequence with the historical plName, byte-identical to master:
 		// each OR-set defaults to a single "" sentinel.
-		plName := emitName + "-" + term.Name
+		plName := plPrefix + "-" + term.Name
 		v4rf, v6rf := partitionRouteFiltersByFamily(term.RouteFilters)
 		mixedFamily := len(term.RouteFilters) > 0 && len(v4rf) > 0 && len(v6rf) > 0
 
@@ -1995,6 +2186,22 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 		}
 	}
 
+	return b.String(), seq
+}
+
+// renderRouteMapForPolicy renders ONE FRR route-map for policy-statement ps
+// under emitName, appending the caller-supplied trailing default action. The
+// body — terms, match/set clauses, and inline route-filter prefix-lists whose
+// names derive from emitName — is identical across use sites; only the header
+// name and the trailing default differ. That lets a BGP-default-accept policy
+// ALSO be rendered under a fail-closed per-use-site alias for redistribute
+// without leaking its permit default across FRR's name-keyed route-map object
+// (#4481 / #2998 / #2607 / #2642).
+func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitName string, ps *config.PolicyStatement, trailingAction string) string {
+	body, seq := m.renderPolicyTermSequences(po, emitName, emitName, ps, 10)
+	var b strings.Builder
+	b.WriteString(body)
+
 	// Trailing default action, resolved by the caller — Junos BGP
 	// default-accept (#2998) or the fail-closed redistribute /
 	// forwarding-table default — and passed in so the SAME body can render
@@ -2003,5 +2210,66 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 	// policyTrailingAction for the case matrix.
 	fmt.Fprintf(&b, "route-map %s %s %d\n", emitName, trailingAction, seq)
 	b.WriteString("exit\n")
+	return b.String()
+}
+
+// renderComposedRouteMap composes an ordered Junos BGP policy CHAIN (>= 2
+// DEFINED policy-statements, e.g. `export [ A B C ]`) into a SINGLE FRR
+// route-map named composedName, preserving Junos policy-chain semantics that
+// the pre-#5277 lastNonEmpty collapse violated by rendering only the final
+// policy:
+//
+//   - Each policy's terms evaluate IN ORDER (A, then B, then C). A term's
+//     terminating `then accept`/`then reject` wins immediately (permit/deny,
+//     stop); a non-terminating term applies its set clauses and falls through
+//     (on-match next), exactly as the single-policy render does.
+//   - A policy with an EXPLICIT policy-level default (`then accept`/`then
+//     reject`) TERMINATES the chain with a match-all permit/deny — later
+//     policies are unreachable (Junos: the default action is terminating).
+//   - A policy with NO explicit default FALLS THROUGH to the next policy
+//     (Junos next-policy), so a route BLOCK-PRIVATE would reject is caught by
+//     BLOCK-PRIVATE before ALLOW-CUSTOMER ever runs.
+//   - If the route falls off the end of EVERY policy, the Junos BGP
+//     default-ACCEPT applies (#2998). A composed chain only ever renders in a
+//     BGP `route-map in`/`out` context, so that fall-off default is permit.
+//
+// Sequence numbers run continuously across the chain; each policy's inline
+// prefix-lists are namespaced by composedName+"-"+policyName so a term name
+// reused across policies cannot fuse two prefix-lists.
+func (m *Manager) renderComposedRouteMap(po *config.PolicyOptionsConfig, composedName string, chain []string) string {
+	var b strings.Builder
+	seq := 10
+	terminated := false
+	for _, name := range chain {
+		ps := po.PolicyStatements[name]
+		if ps == nil {
+			// Defensive: chain is pre-filtered to defined policy-statements.
+			continue
+		}
+		body, next := m.renderPolicyTermSequences(po, composedName, composedName+"-"+name, ps, seq)
+		b.WriteString(body)
+		seq = next
+		switch ps.DefaultAction {
+		case "accept":
+			fmt.Fprintf(&b, "route-map %s permit %d\n", composedName, seq)
+			b.WriteString("exit\n")
+			seq += 10
+			terminated = true
+		case "reject":
+			fmt.Fprintf(&b, "route-map %s deny %d\n", composedName, seq)
+			b.WriteString("exit\n")
+			seq += 10
+			terminated = true
+		}
+		if terminated {
+			break
+		}
+	}
+	if !terminated {
+		// Fell off the end of every policy in the chain → Junos BGP
+		// default-ACCEPT (#2998): permit the (accumulated-modified) route.
+		fmt.Fprintf(&b, "route-map %s permit %d\n", composedName, seq)
+		b.WriteString("exit\n")
+	}
 	return b.String()
 }

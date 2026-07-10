@@ -376,6 +376,14 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		if err := redistAliasCollision(fc.PolicyOptions, collectAllBGPAcceptDefault(fc)); err != nil {
 			return err
 		}
+		// #5277 render-side belt: refuse to render when a composed BGP
+		// policy-chain route-map name collides with an operator policy-statement
+		// or another chain (FRR merges same-named route-maps → silent filter
+		// change). Fail the whole apply CLOSED on the tolerant load / peer-sync
+		// / rollback path, matching the redistAliasCollision posture above.
+		if err := bgpComposedChainCollision(fc); err != nil {
+			return err
+		}
 	}
 
 	return m.commitManagedSection(m.buildManagedSection(fc))
@@ -470,6 +478,12 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	bgpAcceptDefault := collectAllBGPAcceptDefault(fc)
 	if fc.PolicyOptions != nil {
 		b.WriteString(m.generatePolicyOptions(fc.PolicyOptions, bgpAcceptDefault))
+		// Composed BGP policy-chain route-maps: an ordered `import`/`export
+		// [ A B C ]` list of >= 2 defined policy-statements is composed into a
+		// single route-map preserving Junos chain semantics (#5277). Emitted
+		// here beside the per-policy route-maps; FRR resolves the neighbor's
+		// `route-map <name>` reference regardless of definition order.
+		b.WriteString(m.renderComposedBGPChains(fc))
 	}
 
 	// Resolve forwarding-table export policy for ECMP. Sets fc.ConsistentHash

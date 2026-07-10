@@ -485,7 +485,17 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								PrefixLimitInet:  groupPrefixLimitInet,
 								PrefixLimitInet6: groupPrefixLimitInet6,
 							}
-							// Per-neighbor overrides
+							// Per-neighbor overrides. neighborOwnExport /
+							// neighborOwnImport track whether this neighbor set
+							// its OWN export/import so the first own entry
+							// REPLACES the inherited group list (Junos
+							// most-specific-LEVEL-wins: a more-specific level's
+							// export/import replaces — it does NOT merge with —
+							// the inherited one, #5277). Subsequent same-level
+							// entries (multiple set-lines or a bracket list)
+							// accumulate into the neighbor's own ordered chain.
+							neighborOwnExport := false
+							neighborOwnImport := false
 							for _, prop := range child.Children {
 								switch prop.Name() {
 								case "description":
@@ -558,10 +568,18 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								case "export":
 									// Per-neighbor export override (#2490 made
 									// the per-neighbor slot parseable; group-level
-									// export is already inherited above). Appended
-									// after the inherited group export so the
-									// bgpEffectiveExport last-wins helper picks the
-									// more-specific neighbor policy.
+									// export is already inherited above). The
+									// neighbor's OWN export REPLACES the inherited
+									// group export (Junos most-specific-LEVEL-wins,
+									// #5277): the first own entry drops the inherited
+									// group list, then this and any further
+									// neighbor-level entries accumulate as the
+									// neighbor's ordered chain. Pre-#5277 this
+									// APPENDED to the group list and the renderer
+									// kept only the last (lastNonEmpty), which both
+									// dropped a multi-policy neighbor chain AND kept
+									// the wrong policy when the neighbor overrode a
+									// group export.
 									//
 									// Multi-value leaf (#2702): a bracket-list
 									// `export [ p1 p2 ]` collapses every policy onto
@@ -570,14 +588,22 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 									// returned Keys[1] and dropped all but the first
 									// policy; firewallMatchValues accumulates both
 									// AST shapes.
+									if !neighborOwnExport {
+										neighbor.Export = nil
+										neighborOwnExport = true
+									}
 									neighbor.Export = append(neighbor.Export, firewallMatchValues(prop)...)
 								case "import":
-									// Per-neighbor import override (#2490). Appended
-									// after the inherited group import so the
-									// bgpEffectiveImport last-wins helper picks the
-									// more-specific neighbor policy. Multi-value
+									// Per-neighbor import override (#2490/#5277):
+									// the neighbor's OWN import REPLACES the
+									// inherited group import (most-specific level
+									// wins), symmetric to export above. Multi-value
 									// (#2702) — accumulate every policy across both
 									// AST shapes via firewallMatchValues.
+									if !neighborOwnImport {
+										neighbor.Import = nil
+										neighborOwnImport = true
+									}
 									neighbor.Import = append(neighbor.Import, firewallMatchValues(prop)...)
 								case "family":
 									if len(prop.Keys) >= 2 {
