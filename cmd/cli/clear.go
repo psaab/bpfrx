@@ -238,7 +238,22 @@ func (c *ctl) handleClearDHCP(args []string) error {
 	}
 
 	req := &pb.ClearDHCPClientIdentifierRequest{}
-	if len(args) >= 3 && args[1] == "interface" {
+	// A bare `clear dhcp client-identifier` (no selector) is the intentional
+	// clear-ALL. But a malformed selector must NOT silently degrade to it:
+	// the server branches on `Interface != ""`, so `... interface` (no name)
+	// or `... interfce ge-0/0/0` (unknown selector) used to fall through with
+	// an empty Interface and wipe EVERY DHCPv6 DUID (#4883-E). Require a
+	// well-formed `interface <name>` selector when one is typed.
+	if len(args) >= 2 {
+		if args[1] != "interface" {
+			return fmt.Errorf("usage: clear dhcp client-identifier [interface <name>]")
+		}
+		if len(args) < 3 || args[2] == "" {
+			return fmt.Errorf("clear dhcp client-identifier: 'interface' requires a name")
+		}
+		if len(args) > 3 {
+			return fmt.Errorf("clear dhcp client-identifier: unexpected argument %q after interface name", args[3])
+		}
 		req.Interface = args[2]
 	}
 

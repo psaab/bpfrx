@@ -471,6 +471,34 @@ func (c *ctl) handleTraceroute(args []string) error {
 	return nil
 }
 
+// readTerminalConfig collects a pasted configuration from readLine until the
+// input is COMMITTED by Ctrl-D (io.EOF). A readline.ErrInterrupt (Ctrl-C) or
+// any other read error is an ABORT: the partial input is discarded and a
+// non-nil error is returned so handleLoad does NOT apply a truncated subset of
+// the config as if it were complete.
+//
+// Before this the read loop took the same `break` for EOF, ErrInterrupt, and
+// every read error, then joined whatever lines had been collected and Loaded
+// them — printing "load ... complete". Aborting a paste with Ctrl-C could
+// therefore silently apply a valid prefix while omitting later
+// policies/services/interfaces (#4883-D). Only EOF commits.
+func readTerminalConfig(readLine func() (string, error)) (string, error) {
+	var lines []string
+	for {
+		line, err := readLine()
+		if err != nil {
+			if err == io.EOF {
+				return strings.Join(lines, "\n"), nil
+			}
+			if err == readline.ErrInterrupt {
+				return "", fmt.Errorf("load terminal: aborted (partial input discarded)")
+			}
+			return "", fmt.Errorf("load terminal: read error: %v", err)
+		}
+		lines = append(lines, line)
+	}
+}
+
 func (c *ctl) handleLoad(args []string) error {
 	if len(args) < 2 {
 		printConfigTreeHelp("load:", "load")
@@ -487,15 +515,11 @@ func (c *ctl) handleLoad(args []string) error {
 
 	if source == "terminal" {
 		fmt.Println("[Type or paste configuration, then press Ctrl-D on an empty line]")
-		var lines []string
-		for {
-			line, err := c.rl.Readline()
-			if err != nil {
-				break
-			}
-			lines = append(lines, line)
+		var err error
+		content, err = readTerminalConfig(c.rl.Readline)
+		if err != nil {
+			return err
 		}
-		content = strings.Join(lines, "\n")
 	} else {
 		data, err := os.ReadFile(source)
 		if err != nil {

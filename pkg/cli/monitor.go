@@ -231,6 +231,12 @@ type monitorFlowState struct {
 	active   bool
 	cancel   context.CancelFunc // cancel the active monitor goroutine
 	sub      *logging.Subscription
+	// lastErr records the reason the writer goroutine last stopped on its
+	// own (disk-full / permission / rotation failure). It is surfaced by
+	// showMonitorSecurityFlow so the operator sees WHY tracing stopped
+	// instead of silently reading Inactive, and it is cleared on each fresh
+	// start (#4883-B).
+	lastErr error
 }
 
 func newMonitorFlowState() *monitorFlowState {
@@ -610,6 +616,9 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 	}
 
 	c.monitorFlow.active = true
+	// Clear any error recorded by a previous writer-goroutine stop so a
+	// fresh start does not surface a stale failure reason (#4883-B).
+	c.monitorFlow.lastErr = nil
 
 	// Snapshot the current filters.
 	filters := make([]*monitorFlowFilter, 0, len(c.monitorFlow.filters))
@@ -674,7 +683,21 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 				}
 				if err := writer.writeLine(line); err != nil {
 					// Rotation or write failed; stop tracing rather than grow
-					// the active file without bound.
+					// the active file without bound. Clear the monitor state
+					// under the lock so `show ... flow` stops reporting Active
+					// and a fresh `start` is accepted — otherwise the monitor
+					// stays wedged Active (audit telemetry silently stopped
+					// while health reads green) until an operator issues
+					// `stop` (#4883-B). Guard on the subscription identity so
+					// a concurrent stop/start is not clobbered.
+					c.monitorFlow.mu.Lock()
+					if c.monitorFlow.sub == sub {
+						c.monitorFlow.active = false
+						c.monitorFlow.cancel = nil
+						c.monitorFlow.sub = nil
+						c.monitorFlow.lastErr = err
+					}
+					c.monitorFlow.mu.Unlock()
 					return
 				}
 			}
@@ -717,6 +740,12 @@ func (c *CLI) showMonitorSecurityFlow() error {
 	}
 
 	fmt.Printf("  Monitor security flow session status: %s\n", status)
+	// Surface why the writer goroutine stopped on its own (disk-full /
+	// permission / rotation) so a silently-stopped trace is visible rather
+	// than reading Inactive with no explanation (#4883-B).
+	if !c.monitorFlow.active && c.monitorFlow.lastErr != nil {
+		fmt.Printf("  Monitor security flow last error: %v\n", c.monitorFlow.lastErr)
+	}
 	if c.monitorFlow.filename != "" {
 		fmt.Printf("  Monitor security flow trace file: %s\n", filepath.Join(traceLogDir, c.monitorFlow.filename))
 	} else {
