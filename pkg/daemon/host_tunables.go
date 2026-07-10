@@ -469,10 +469,13 @@ func neighRetransPaths(fs hostTunableFS) []string {
 // "omitted-becomes-default when userspace-dp in use" logic.
 //
 //   - governorIn=""          → defaultCPUGovernor if userspaceDP else ""
+//
 //   - governorIn="default"   → "" (pass-through sentinel for skip)
+//
 //   - governorIn="performance"/"schedutil"/anything else → verbatim
 //
 //   - budgetIn=0             → defaultNetdevBudget if userspaceDP else 0
+//
 //   - budgetIn>0             → verbatim
 //
 // The rationale: the #801 Step-0 audit is scoped to userspace-dp
@@ -682,6 +685,32 @@ func restoreHostTunables(p *priorHostTunables, fs hostTunableFS, execer rssExecu
 	}
 }
 
+// hostScopeRestoreResult reports the per-field outcome of
+// restoreHostScopeTunables so the runtime-disable caller can honor the
+// ownership invariant (#5114): ownership of a host-scope knob is
+// released only after its restore write SUCCEEDS. A field counts as
+// restored when its write succeeded OR the field was empty/sentinel
+// (nothing to write). Fields whose write FAILED are reported back so
+// the caller retains their captured baseline as retry debt instead of
+// silently dropping it and leaving the host pinned at xpfd's value.
+type hostScopeRestoreResult struct {
+	// failedGovernors maps cpufreq scaling_governor path → captured
+	// value for every governor whose restore write failed and must be
+	// retained. Always non-nil; empty when every governor restored.
+	failedGovernors map[string]string
+	// budgetFailed is true when the netdev_budget restore write failed;
+	// budgetValue then holds the captured value to retain.
+	budgetFailed bool
+	budgetValue  string
+}
+
+// allRestored reports whether every captured host-scope field restored
+// successfully, i.e. no retry debt remains and ownership may be
+// released (priorTunablesActive → false).
+func (r hostScopeRestoreResult) allRestored() bool {
+	return len(r.failedGovernors) == 0 && !r.budgetFailed
+}
+
 // restoreHostScopeTunables writes only the host-scope captures
 // (cpu governor + netdev_budget) back to the kernel. Used when the
 // `claim-host-tunables` opt-in flips true → false without disabling
@@ -689,14 +718,21 @@ func restoreHostTunables(p *priorHostTunables, fs hostTunableFS, execer rssExecu
 // so its captures are retained, but the operator has retracted their
 // consent to hold host-global knobs.
 //
-// Errors are logged and swallowed. Safe to call with a nil pointer
-// (no-op).
-func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) {
+// Returns a hostScopeRestoreResult naming the fields whose kernel write
+// FAILED (#5114). The caller must retain those captures + keep
+// priorTunablesActive true so a later reconcile retries them; a
+// transient sysfs/proc write failure must not release ownership and
+// leave the host pinned at xpfd's governor / netdev_budget after the
+// operator withdrew consent. Successful (and empty-sentinel) fields are
+// reported as restored so the caller drops them. Safe to call with a
+// nil pointer (no-op → allRestored() true).
+func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) hostScopeRestoreResult {
+	res := hostScopeRestoreResult{failedGovernors: map[string]string{}}
 	if p == nil {
-		return
+		return res
 	}
 	// Governor: write each captured path only if its value is
-	// non-empty (skip sentinel).
+	// non-empty (skip sentinel). Retain any path whose write fails.
 	restored := 0
 	for path, value := range p.governors {
 		if value == "" {
@@ -705,6 +741,7 @@ func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) {
 		if err := fs.writeFile(path, []byte(value)); err != nil {
 			slog.Warn("linksetup: host tunable restore — governor write failed",
 				"path", path, "want", value, "err", err)
+			res.failedGovernors[path] = value
 			continue
 		}
 		restored++
@@ -718,22 +755,32 @@ func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) {
 		if err := fs.writeFile(sysctlPathNetdevBudget, []byte(p.budget)); err != nil {
 			slog.Warn("linksetup: host tunable restore — netdev_budget write failed",
 				"want", p.budget, "err", err)
+			res.budgetFailed = true
+			res.budgetValue = p.budget
 		} else {
 			slog.Info("linksetup: netdev_budget restored to pre-xpfd value",
 				"value", p.budget)
 		}
 	}
+	return res
 }
 
 // restoreNeighRetransTime writes every captured neighbor retrans_time_ms
 // value back to the kernel (#1636). Unlike the cpu-governor / netdev
 // knobs this is restored unconditionally on daemon stop (it applies
 // unconditionally, not behind claim-host-tunables), so a co-tenant's
-// tuned value is put back when xpfd exits. Errors are logged and
-// swallowed. Safe with a nil pointer or empty map (no-op).
-func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) {
+// tuned value is put back when xpfd exits.
+//
+// Returns the map of captures whose kernel write FAILED — path →
+// captured value — so the runtime-disable caller retains them as retry
+// debt instead of dropping the capture and stranding the host at the
+// lowered 250ms after the dataplane that wanted it is gone (#5114). The
+// returned map is always non-nil; empty means every path restored.
+// Safe with a nil pointer or empty map (no-op → empty map).
+func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) map[string]string {
+	retained := map[string]string{}
 	if p == nil || len(p.neighRetrans) == 0 {
-		return
+		return retained
 	}
 	restored := 0
 	for path, value := range p.neighRetrans {
@@ -743,6 +790,7 @@ func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) {
 		if err := fs.writeFile(path, []byte(value)); err != nil {
 			slog.Warn("linksetup: host tunable restore — neigh retrans_time_ms write failed",
 				"path", path, "want", value, "err", err)
+			retained[path] = value
 			continue
 		}
 		restored++
@@ -751,6 +799,7 @@ func restoreNeighRetransTime(p *priorHostTunables, fs hostTunableFS) {
 		slog.Info("linksetup: neigh retrans_time_ms restored to pre-xpfd value",
 			"restored", restored, "total", len(p.neighRetrans))
 	}
+	return retained
 }
 
 // restoreMlx5Coalesce emits one `ethtool -C <iface> adaptive-rx ...
@@ -788,4 +837,3 @@ func restoreMlx5Coalesce(iface string, s mlx5CoalesceState, execer rssExecutor) 
 		"adaptive_tx", s.adaptiveTX,
 		"rx_usecs", s.rxUsecs, "tx_usecs", s.txUsecs)
 }
-
