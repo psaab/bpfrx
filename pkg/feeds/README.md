@@ -12,6 +12,22 @@ feed servers and triggers config recompile when the resolved set changes
 - `GetPrefixes(name)` — `feeds.go`. Returns the current enforced (last-good) snapshot.
 - `StopAll()`, `FeedInfo`, `AllFeeds()` — surfaced to `show security dynamic-address`.
 
+## Day-2 reconcile (#5036)
+
+`Manager.Apply` is destructive (`StopAll` first) and is driven by the daemon,
+not called once at boot. The daemon constructs the manager **unconditionally**
+at startup (`ensureFeedManager`, even with no feed servers) and calls
+`reconcileFeeds` on every applied config generation (wired into
+`applyConfigLocked`, before the feed-overlay push). `reconcileFeeds` is gated
+on a hash of the feed-**server** configuration (`feedsConfigHash`, which
+excludes address bindings), so `Apply` re-runs only when the server set
+actually changes — a feed **content** refresh (which re-enters `applyConfig`
+via the `onUpdate` callback) leaves the hash unchanged and does not restart the
+fetchers. Before #5036 the manager was built only if boot-time feed servers
+existed and `Apply` was never re-invoked, so a feed server added/removed/edited
+after boot was silently ignored until restart (a deny policy bound to a
+day-2-added feed armed with zero prefixes — fail-open).
+
 ## Refresh correctness & fail-safe behavior (#2050)
 
 A fetch is treated as **successful** only when the transport read completes

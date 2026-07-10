@@ -1,6 +1,111 @@
 package daemon
 
-import "github.com/psaab/xpf/pkg/config"
+import (
+	"crypto/sha256"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/feeds"
+)
+
+// ensureFeedManager lazily constructs the dynamic-address feed manager with the
+// onUpdate callback that recompiles the dataplane when a feed refresh changes
+// the prefix set (#5036). It is idempotent and, in production, is called once
+// during single-threaded startup BEFORE the gRPC/HTTP servers accept requests,
+// so d.feeds is set exactly once and never reassigned — its pointer stays
+// race-free for the concurrent AllFeeds() readers on the show paths. The
+// manager holds no refresh goroutines until Apply is called with a non-empty
+// feed-server set (reconcileFeeds).
+func (d *Daemon) ensureFeedManager() {
+	if d.feeds != nil {
+		return
+	}
+	d.feeds = feeds.New(func() {
+		slog.Info("dynamic-address feed updated, recompiling dataplane")
+		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
+			d.applyConfig(activeCfg)
+		}
+	})
+}
+
+// feedsConfigHash returns a stable hash over the feed-SERVER configuration that
+// governs the running feed-producer set (#5036). It deliberately EXCLUDES
+// AddressBindings: bindings drive the per-apply snapshot overlay
+// (feedSnapshotsForConfig), not the producer goroutines, so a binding-only
+// change must not trigger a StopAll+restart of the fetchers. FeedServers is a
+// Go map (nondeterministic iteration), so it is serialized in sorted key order
+// with each server's URL/hostname, intervals, single feed-name, and feed
+// entries (also sorted) — matching every input feeds.Apply's plan builder reads.
+func feedsConfigHash(da *config.DynamicAddressConfig) [32]byte {
+	if da == nil {
+		return sha256.Sum256(nil)
+	}
+	names := make([]string, 0, len(da.FeedServers))
+	for name := range da.FeedServers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var b strings.Builder
+	for _, name := range names {
+		fs := da.FeedServers[name]
+		if fs == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "S|%s|%s|%s|%d|%d|%s\n",
+			name, fs.URL, fs.Hostname, fs.UpdateInterval, fs.HoldInterval, fs.FeedName)
+		entries := append([]config.FeedEntry(nil), fs.FeedEntries...)
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Name != entries[j].Name {
+				return entries[i].Name < entries[j].Name
+			}
+			return entries[i].Path < entries[j].Path
+		})
+		for _, fe := range entries {
+			fmt.Fprintf(&b, "E|%s|%s\n", fe.Name, fe.Path)
+		}
+	}
+	return sha256.Sum256([]byte(b.String()))
+}
+
+// reconcileFeeds brings the running dynamic-address feed-producer set into
+// correspondence with cfg on every applied config generation (#5036).
+//
+// Before this the feed manager was constructed ONCE at boot and only if
+// boot-time feed servers existed, and Manager.Apply was never re-invoked. So a
+// feed server ADDED on a later commit was silently ignored (a deny policy bound
+// to the new dynamic address armed with zero prefixes — fail-open for deny),
+// and a changed/removed server leaked its refresh goroutine and stale snapshot
+// namespace until restart.
+//
+// The manager is now constructed unconditionally at boot (ensureFeedManager),
+// so it is always non-nil here; Apply — which does StopAll and then starts the
+// desired producer set — is gated on feedsConfigHash so it runs ONLY when the
+// feed-server configuration actually changes. A feed CONTENT refresh re-enters
+// applyConfig via the onUpdate callback but leaves the hash unchanged, so it
+// does not thrash the fetchers. Callers MUST invoke this BEFORE reading the
+// feed overlay (feedSnapshotsForConfig) so the overlay reflects the reconciled
+// generation. Apply uses d.daemonCtx (daemon lifetime) so the refresh
+// goroutines outlive the request-scoped apply.
+func (d *Daemon) reconcileFeeds(cfg *config.Config) {
+	if d == nil || d.daemonCtx == nil || cfg == nil || d.feeds == nil {
+		return
+	}
+	da := &cfg.Security.DynamicAddress
+	h := feedsConfigHash(da)
+
+	d.feedsMu.Lock()
+	defer d.feedsMu.Unlock()
+	if h == d.activeFeedsHash {
+		return
+	}
+	d.feeds.Apply(d.daemonCtx, da)
+	d.activeFeedsHash = h
+	slog.Info("dynamic-address feed producers reconciled", "feed_servers", len(da.FeedServers))
+}
 
 // feedSnapshotSetter caches the dynamic-address feed-prefix overlay for the
 // next full snapshot build (#2049). Implemented by the userspace dataplane
