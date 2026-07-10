@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -13,10 +14,15 @@ import (
 )
 
 // backend_route53.go: the AWS Route 53 DDNS backend (#2691 P3, plan §5.2). Uses
-// a SigV4-signed ChangeResourceRecordSets request with action UPSERT — the
-// idempotent "create or replace" Route 53 verb that exactly matches the DDNS
-// publish semantic (one record, one address, replace on change). A DELETE action
-// withdraws the record on binding removal / address loss.
+// SigV4-signed ChangeResourceRecordSets requests. Route 53 UPSERT/DELETE operate
+// on a WHOLE RRset at name+type — there is no per-value add/remove — so both the
+// publish and the withdraw are OWNERSHIP-SCOPED read-modify-writes (#5389):
+// ListResourceRecordSets reads the live members, and the change touches ONLY
+// xpf's own value (drop rec.PrevAddr, add rec.Addr on publish; strip rec.Addr on
+// withdraw) while PRESERVING any co-resident FOREIGN A/AAAA a human or another
+// appliance set at the same shared name. A bare single-value UPSERT (the pre-#5389
+// path) would create-or-replace the entire RRset and silently delete those
+// foreign members. See the read-modify-write concurrency caveat on UpsertLease.
 //
 // SigV4 is implemented in sigv4.go (a minimal signer — no AWS SDK dependency;
 // plan §5.2 open question resolved toward the minimal signer since we sign ONE
@@ -129,23 +135,110 @@ type r53ErrorXML struct {
 	} `xml:"Error"`
 }
 
-// buildChangeBatch builds the UPSERT (or DELETE) change batch for a record.
-func buildChangeBatch(action string, rec LeaseDNSRecord) ([]byte, error) {
-	ttl := rec.TTL
+// listRRSetsXML is the ListResourceRecordSets response envelope. Only the
+// fields the read-modify-write publish needs are decoded (name/type/ttl/values).
+// The element namespace is deliberately NOT pinned in the tags so a plain
+// local-name match decodes the Route 53 reply regardless of the xmlns prefix it
+// carries.
+type listRRSetsXML struct {
+	ResourceRecordSets struct {
+		ResourceRecordSet []struct {
+			Name            string `xml:"Name"`
+			Type            string `xml:"Type"`
+			TTL             int    `xml:"TTL"`
+			ResourceRecords struct {
+				ResourceRecord []struct {
+					Value string `xml:"Value"`
+				} `xml:"ResourceRecord"`
+			} `xml:"ResourceRecords"`
+		} `xml:"ResourceRecordSet"`
+	} `xml:"ResourceRecordSets"`
+}
+
+// r53LiveRRSet is the current state of the RRset at a (name, type), read back
+// from Route 53 with ListResourceRecordSets. found is false when Route 53 holds
+// no RRset at that name+type. values is the FULL member list — xpf's own value
+// PLUS any FOREIGN co-resident values a human / another appliance set at the
+// same shared name (a manually-managed round-robin member, another host's A).
+type r53LiveRRSet struct {
+	found  bool
+	ttl    int
+	values []string
+}
+
+// listRRSet reads the current RRset at name+type. ListResourceRecordSets returns
+// record sets ordered from the (name, type) start point, so the exact match — if
+// it exists — is the first set returned; maxitems=1 fetches just that one. We
+// STILL filter on an exact name+type match so a non-existent RRset (for which
+// Route 53 returns the lexically-next set) reads back as found=false rather than
+// the backend adopting a neighbour's values.
+func (b *route53Backend) listRRSet(ctx context.Context, name, rtype string) (r53LiveRRSet, error) {
+	q := url.Values{}
+	q.Set("name", strings.TrimSuffix(name, ".")+".")
+	q.Set("type", rtype)
+	q.Set("maxitems", "1")
+	path := "/" + route53APIVersion + "/hostedzone/" + b.zoneID + "/rrset"
+	req, err := http.NewRequest(http.MethodGet, b.endpoint+path+"?"+q.Encode(), nil)
+	if err != nil {
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: build list request: %w", err)
+	}
+	req.Header.Set("User-Agent", "xpf-ddns/1.0")
+	signRequest(req, b.creds, nil, b.now())
+
+	code, raw, err := doRequest(ctx, b.client, req)
+	if err != nil {
+		return r53LiveRRSet{}, err
+	}
+	if cerr := classifyHTTPStatus(code); cerr != nil {
+		var e r53ErrorXML
+		if xml.Unmarshal(raw, &e) == nil && e.Error.Code != "" {
+			return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: %s: %s: %w", b.name, e.Error.Code, e.Error.Message, cerr)
+		}
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: %w", b.name, cerr)
+	}
+	var resp listRRSetsXML
+	if err := xml.Unmarshal(raw, &resp); err != nil {
+		return r53LiveRRSet{}, fmt.Errorf("ddns route53: %s: decode rrset list: %w", b.name, err)
+	}
+	want := strings.TrimSuffix(name, ".")
+	for _, s := range resp.ResourceRecordSets.ResourceRecordSet {
+		if !strings.EqualFold(strings.TrimSuffix(s.Name, "."), want) || !strings.EqualFold(s.Type, rtype) {
+			continue
+		}
+		live := r53LiveRRSet{found: true, ttl: s.TTL}
+		for _, rr := range s.ResourceRecords.ResourceRecord {
+			if v := strings.TrimSpace(rr.Value); v != "" {
+				live.values = append(live.values, v)
+			}
+		}
+		return live, nil
+	}
+	return r53LiveRRSet{found: false}, nil
+}
+
+// buildChangeBatch builds a single-change ChangeResourceRecordSets body for the
+// given action against an EXPLICIT value list. Route 53 UPSERT create-or-replaces
+// the WHOLE RRset with exactly these values, so the caller passes the MERGED set
+// (foreign members preserved) — never a bare single value, which would clobber a
+// co-resident foreign A/AAAA (#5389). A DELETE must match the live RRset exactly
+// (name, type, ttl, values).
+func buildChangeBatch(action, name, rtype string, ttl int, values []string) ([]byte, error) {
 	if ttl <= 0 {
 		ttl = defaultDDNSTTL
 	}
 	var batch changeBatchXML
 	var c r53Change
 	c.Action = action
-	c.ResourceRecordSet.Name = strings.TrimSuffix(rec.FQDN, ".") + "."
-	c.ResourceRecordSet.Type = rec.ForwardType
+	c.ResourceRecordSet.Name = strings.TrimSuffix(name, ".") + "."
+	c.ResourceRecordSet.Type = rtype
 	c.ResourceRecordSet.TTL = ttl
-	rr := struct {
-		Value string `xml:"Value"`
-	}{Value: rec.Addr.Unmap().String()}
-	c.ResourceRecordSet.ResourceRecords.ResourceRecord = append(
-		c.ResourceRecordSet.ResourceRecords.ResourceRecord, rr)
+	for _, v := range values {
+		rr := struct {
+			Value string `xml:"Value"`
+		}{Value: v}
+		c.ResourceRecordSet.ResourceRecords.ResourceRecord = append(
+			c.ResourceRecordSet.ResourceRecords.ResourceRecord, rr)
+	}
 	batch.ChangeBatch.Changes.Change = []r53Change{c}
 	out, err := xml.Marshal(&batch)
 	if err != nil {
@@ -154,12 +247,13 @@ func buildChangeBatch(action string, rec LeaseDNSRecord) ([]byte, error) {
 	return append([]byte(xml.Header), out...), nil
 }
 
-// change issues a signed ChangeResourceRecordSets with the given action. When
-// the request fails, the parsed Route 53 error code/message (never the creds)
-// is returned alongside the typed transport error so DELETE-path idempotency
-// classification (r53DeleteAlreadyGone) can inspect the on-wire code/message.
-func (b *route53Backend) change(ctx context.Context, action string, rec LeaseDNSRecord) (errCode, errMsg string, err error) {
-	body, err := buildChangeBatch(action, rec)
+// change issues a signed ChangeResourceRecordSets with the given action and the
+// EXPLICIT value list. When the request fails, the parsed Route 53 error
+// code/message (never the creds) is returned alongside the typed transport error
+// so DELETE-path idempotency classification (r53DeleteAlreadyGone) can inspect
+// the on-wire code/message.
+func (b *route53Backend) change(ctx context.Context, action, name, rtype string, ttl int, values []string) (errCode, errMsg string, err error) {
+	body, err := buildChangeBatch(action, name, rtype, ttl, values)
 	if err != nil {
 		return "", "", err
 	}
@@ -187,30 +281,156 @@ func (b *route53Backend) change(ctx context.Context, action string, rec LeaseDNS
 	return "", "", nil
 }
 
-// UpsertLease publishes the A/AAAA via a Route 53 UPSERT (create-or-replace).
+// mergeUpsertValues computes the desired RRset member list for a publish: keep
+// every CURRENT member EXCEPT xpf's own previously-published value (prevVal,
+// LeaseDNSRecord.PrevAddr), then ensure xpf's new value (newVal) is present.
+// Foreign co-resident members survive; xpf's own row is renumbered in place
+// (drop prev, add new) instead of the whole set being replaced. Duplicates are
+// collapsed (Route 53 rejects a duplicate value in one RRset). When prevVal is
+// empty (first publish / prior value lost) the merge is ADDITIVE — it coexists
+// with any foreign member; a genuinely-unknown prior xpf value leaks a stale row
+// rather than clobbering a foreign one (mirrors the Cloudflare / RFC 2136 fix).
+func mergeUpsertValues(current []string, prevVal, newVal string) []string {
+	out := make([]string, 0, len(current)+1)
+	seen := make(map[string]struct{}, len(current)+1)
+	add := func(v string) {
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range current {
+		if prevVal != "" && v == prevVal {
+			continue // drop xpf's OWN prior value (renumber in place)
+		}
+		add(v)
+	}
+	add(newVal)
+	return out
+}
+
+// removeValue returns current without the owned value (all occurrences), and
+// reports whether anything was removed.
+func removeValue(current []string, owned string) (out []string, removed bool) {
+	out = make([]string, 0, len(current))
+	for _, v := range current {
+		if v == owned {
+			removed = true
+			continue
+		}
+		out = append(out, v)
+	}
+	return out, removed
+}
+
+// sameValueSet reports whether a and b hold the same values (order-independent,
+// de-duplicated) — the idempotency gate that skips a no-op UPSERT.
+func sameValueSet(a, b []string) bool {
+	sa := make(map[string]struct{}, len(a))
+	for _, v := range a {
+		sa[v] = struct{}{}
+	}
+	sb := make(map[string]struct{}, len(b))
+	for _, v := range b {
+		sb[v] = struct{}{}
+	}
+	if len(sa) != len(sb) {
+		return false
+	}
+	for v := range sa {
+		if _, ok := sb[v]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// UpsertLease publishes xpf's A/AAAA with an OWNERSHIP-SCOPED read-modify-write
+// (#5389). Route 53 UPSERT create-or-replaces the ENTIRE RRset at name+type, so
+// a bare single-value UPSERT would delete any co-resident FOREIGN value (a
+// manually-managed round-robin member, or another host's record at a shared
+// FQDN). Instead: ListResourceRecordSets reads the live members, mergeUpsertValues
+// drops ONLY xpf's own prior value (rec.PrevAddr) and adds xpf's new value while
+// preserving every foreign member, and the MERGED set is UPSERTed. A live RRset
+// already equal to the desired set is a no-op (idempotent re-publish / ban
+// avoidance). When no RRset exists the merge is a plain create of xpf's value.
+//
+// Concurrency caveat: Route 53 has no compare-and-swap for
+// ChangeResourceRecordSets, so this read-modify-write is not atomic — a foreign
+// member added between the List and the UPSERT is not observed and would be
+// lost. The Surface A per-RG HA gate makes xpf itself a single writer for the
+// name; the residual race is a human/automation writing the SAME RRset within
+// the ~one-request window, which is the same window the Cloudflare / RFC 2136
+// value-specific fixes accept (#3739).
 func (b *route53Backend) UpsertLease(ctx context.Context, rec LeaseDNSRecord) error {
-	_, _, err := b.change(ctx, "UPSERT", rec)
+	name := strings.TrimSuffix(rec.FQDN, ".")
+	newVal := rec.Addr.Unmap().String()
+	live, err := b.listRRSet(ctx, name, rec.ForwardType)
+	if err != nil {
+		return err
+	}
+	var prevVal string
+	if rec.PrevAddr.IsValid() {
+		prevVal = rec.PrevAddr.Unmap().String()
+	}
+	desired := mergeUpsertValues(live.values, prevVal, newVal)
+	ttl := rec.TTL
+	if ttl <= 0 {
+		ttl = defaultDDNSTTL
+	}
+	if live.found && live.ttl == ttl && sameValueSet(live.values, desired) {
+		return nil // already in the desired state — no write.
+	}
+	_, _, err = b.change(ctx, "UPSERT", name, rec.ForwardType, ttl, desired)
 	return err
 }
 
-// DeleteLease withdraws the A/AAAA via a Route 53 DELETE. Route 53 requires the
-// DELETE to match the existing record's TTL + value; we re-derive both from the
-// owned record the engine passes (the sole-delete-authority boundary), so the
-// delete targets exactly what we published; over-deletion is impossible (exact
-// match required).
+// DeleteLease withdraws xpf's OWN A/AAAA while preserving co-resident foreign
+// members (#5389, the withdraw arm of the value-specific fix). It reads the live
+// RRset and removes ONLY xpf's owned value (rec.Addr):
 //
-// IDEMPOTENT delete (#2771): if the record is already gone (manually removed,
-// or a prior withdraw that did land but whose ack was lost), Route 53 rejects
-// the DELETE with HTTP 400 InvalidChangeBatch "... but it was not found".
-// Treat that as success (nil) so Surface A's withdrawOwnedLocked drops
-// ownership instead of wedging on a withdraw that can never converge. This
-// mirrors the rfc2136 backend, which treats NXRRSET/NXDOMAIN as a benign
-// idempotent delete (backend_rfc2136.go sendRemove). A genuine
-// transient/auth/throttle failure (SignatureDoesNotMatch, 5xx, 429, …) still
-// returns non-nil so the engine retries — only the already-gone case is
-// swallowed.
+//   - RRset absent → idempotent success (#2771): nothing to withdraw.
+//   - xpf's value not present (a human/automation replaced it, or it was already
+//     withdrawn) → idempotent no-op; deleting a FOREIGN value would itself be the
+//     bug (the Surface A sole-delete-authority boundary).
+//   - foreign members remain after removing xpf's value → UPSERT the reduced set
+//     (drops ONLY xpf's value, keeps every foreign member), carrying the LIVE TTL.
+//   - only xpf's value existed → DELETE the whole RRset. Route 53 requires the
+//     DELETE to match the live RRset exactly (name, type, TTL, value), so the
+//     LIVE TTL is carried, not the configured one.
+//
+// IDEMPOTENT delete (#2771) still applies to the whole-RRset DELETE: if the
+// record raced to gone between the List and the DELETE, Route 53 rejects it with
+// HTTP 400 InvalidChangeBatch "... but it was not found"; that is treated as
+// success (nil) so Surface A's withdrawOwnedLocked drops ownership instead of
+// wedging on a withdraw that can never converge. A genuine transient/auth/throttle
+// failure (SignatureDoesNotMatch, 5xx, 429, …) still returns non-nil so the
+// engine retries — only the already-gone case is swallowed.
 func (b *route53Backend) DeleteLease(ctx context.Context, rec LeaseDNSRecord) error {
-	errCode, errMsg, err := b.change(ctx, "DELETE", rec)
+	name := strings.TrimSuffix(rec.FQDN, ".")
+	owned := rec.Addr.Unmap().String()
+	live, err := b.listRRSet(ctx, name, rec.ForwardType)
+	if err != nil {
+		return err
+	}
+	if !live.found {
+		return nil // already gone — idempotent (#2771).
+	}
+	remaining, removed := removeValue(live.values, owned)
+	if !removed {
+		return nil // xpf's value not present — ownership conflict / already gone.
+	}
+	if len(remaining) > 0 {
+		// Foreign members remain — reduce the set, keep the foreign values.
+		_, _, err = b.change(ctx, "UPSERT", name, rec.ForwardType, live.ttl, remaining)
+		return err
+	}
+	// Only xpf's value existed — DELETE the whole RRset (exact live-TTL match).
+	errCode, errMsg, err := b.change(ctx, "DELETE", name, rec.ForwardType, live.ttl, []string{owned})
 	if err != nil && r53DeleteAlreadyGone(errCode, errMsg) {
 		return nil
 	}
