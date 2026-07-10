@@ -1,6 +1,7 @@
 package flowexport
 
 import (
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -272,5 +273,68 @@ func TestIPFIXExportSessionCloseFallbackBumpsCounter(t *testing.T) {
 
 	if got := e.EstimatedDurations(); got != 1 {
 		t.Fatalf("EstimatedDurations = %d, want 1", got)
+	}
+}
+
+// #4923 fail-on-revert: estimateSessionDuration must saturate rather than
+// overflow. Above ~92.2B TCP packets (~184.5B non-TCP) the pkts*perPacket
+// multiply wraps signed time.Duration negative; the caller subtracts that from
+// the record EndTime and pushes StartTime *after* EndTime. The saturating cap
+// keeps the estimate bounded and non-negative for any packet count, including
+// math.MaxUint64. Reverting the cap makes the negative-duration assertions
+// fail (the multiply wraps to a negative time.Duration).
+func TestEstimateSessionDurationSaturates(t *testing.T) {
+	// Counts spanning the pre-cap regime and well past the int64 overflow
+	// boundary, for both TCP (100ms/pkt) and non-TCP (50ms/pkt).
+	pkts := []uint64{
+		1,
+		1_000,
+		100_000_000_000, // ~100B — past the ~92.2B TCP overflow boundary
+		200_000_000_000, // ~200B — past the ~184.5B non-TCP boundary
+		math.MaxInt64,
+		math.MaxUint64,
+	}
+	for _, proto := range []uint8{6 /* TCP */, 17 /* UDP */} {
+		for _, p := range pkts {
+			d := estimateSessionDuration(p, proto)
+			if d < 0 {
+				t.Fatalf("estimateSessionDuration(%d, %d) = %v, must be non-negative (overflow)", p, proto, d)
+			}
+			if d > maxEstimatedSessionAge {
+				t.Fatalf("estimateSessionDuration(%d, %d) = %v, exceeds cap %v", p, proto, d, maxEstimatedSessionAge)
+			}
+		}
+		// A count guaranteed past the cap threshold saturates exactly to the cap.
+		if got := estimateSessionDuration(math.MaxUint64, proto); got != maxEstimatedSessionAge {
+			t.Fatalf("estimateSessionDuration(MaxUint64, %d) = %v, want cap %v", proto, got, maxEstimatedSessionAge)
+		}
+	}
+}
+
+// #4923 fail-on-revert: the packet-count StartTime fallback must never place
+// the flow start after its end, even for a pathological SessionPkts that would
+// overflow the duration heuristic. Exercises the Created==0 fallback path with
+// an extreme packet count for both exporters' underlying resolver.
+func TestFlowStartTimeFallbackNeverAfterEnd(t *testing.T) {
+	end := time.Unix(1_700_000_600, 0)
+	for _, proto := range []uint8{6 /* TCP */, 17 /* UDP */} {
+		for _, pkts := range []uint64{100_000_000_000, math.MaxUint64} {
+			rec := logging.EventRecord{
+				Time:        end,
+				Created:     0, // fallback path
+				SessionPkts: pkts,
+			}
+			start, usedEstimate := flowStartTime(rec, proto)
+			if !usedEstimate {
+				t.Fatalf("Created==0 must use the estimate (proto=%d pkts=%d)", proto, pkts)
+			}
+			if start.After(end) {
+				t.Fatalf("StartTime %v after EndTime %v (proto=%d pkts=%d) — overflow not guarded",
+					start, end, proto, pkts)
+			}
+			if d := end.Sub(start); d < 0 {
+				t.Fatalf("negative flow duration %v (proto=%d pkts=%d)", d, proto, pkts)
+			}
+		}
 	}
 }
