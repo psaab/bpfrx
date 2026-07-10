@@ -52,10 +52,16 @@ func TestDDNSProviderStringRedactsURLCredentials(t *testing.T) {
 	}
 }
 
-// TestRedactURL exercises RedactURL directly across the shapes #2781 cares
-// about: userinfo, query token, both, a plain hostname (rfc2136 update-server),
-// an inadyn template with %-specifiers (must not be mangled by url.Parse), and
-// empty input.
+// TestRedactURL exercises RedactURL directly across the shapes #2781 and #5458
+// care about: userinfo, query token, both, a plain hostname (rfc2136
+// update-server), an inadyn template with %-specifiers (must not be mangled by
+// url.Parse), empty input, and — the #5458 fix — SCHEMELESS URLs whose userinfo
+// must be redacted just like the scheme'd case while an '@' in the path/query
+// is left untouched.
+//
+// RED-on-revert: reverting secret.go's both-cases refactor makes the
+// "schemeless with creds" subtest observe the leaked "user:pass@" — the
+// mustNotContain assertions fail.
 func TestRedactURL(t *testing.T) {
 	cases := []struct {
 		name string
@@ -92,6 +98,39 @@ func TestRedactURL(t *testing.T) {
 			in:             "https://svc.example/nic/update?hostname=%h&myip=%i",
 			mustContain:    []string{"https://svc.example/nic/update?", "<redacted>"},
 			mustNotContain: []string{"hostname=", "%h", "%i"},
+		},
+		{
+			// #5458 core case: a SCHEMELESS credentialed URL (generic DDNS
+			// provider templates have no commit-time scheme validator) must have
+			// its userinfo AND query redacted. Pre-fix the userinfo leaked.
+			name:           "schemeless with creds",
+			in:             "user:pass@example.com/update?token=SECRET",
+			mustContain:    []string{"<redacted>@example.com/update?", "<redacted>"},
+			mustNotContain: []string{"user:", "pass", "SECRET", "token="},
+		},
+		{
+			// #5458: schemeless WITHOUT creds — host/path intact, query redacted,
+			// and NO spurious userinfo redaction (no "<redacted>@").
+			name:           "schemeless without creds",
+			in:             "example.com/x?t=S",
+			mustContain:    []string{"example.com/x?", "<redacted>"},
+			mustNotContain: []string{"<redacted>@", "t=S"},
+		},
+		{
+			// #5458 boundary: an '@' in the PATH is past the authority and must
+			// NOT trigger userinfo redaction. No query -> no redaction at all.
+			name:           "at-sign in path",
+			in:             "host/p@th",
+			mustContain:    []string{"host/p@th"},
+			mustNotContain: []string{"<redacted>"},
+		},
+		{
+			// #5458 boundary: an '@' in the QUERY is past the authority. The query
+			// is dropped wholesale; the host is untouched and not userinfo-redacted.
+			name:           "at-sign in query",
+			in:             "host?x=a@b",
+			mustContain:    []string{"host?", "<redacted>"},
+			mustNotContain: []string{"<redacted>@", "a@b"},
 		},
 		{
 			name: "empty",
