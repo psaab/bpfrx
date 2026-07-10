@@ -232,6 +232,37 @@ type ownedRecord struct {
 	// degrades to "unknown" and is compared as "cannot determine a mismatch" —
 	// never a false alarm.
 	BackendFingerprint string `json:"backend_fingerprint,omitempty"`
+	// PublishPending marks a Surface A ownership record whose DESIRED address was
+	// durably written-ahead but whose wire publish has NOT yet been CONFIRMED
+	// (#5285). The pre-#5285 Surface A publish persisted the desired address into
+	// the SOLE ownership row BEFORE the provider I/O with no pending bit and no
+	// retained prior value, so an abrupt CRASH between state.save and the wire add
+	// left the store falsely reporting the new address as published (the in-process
+	// rollback in publishLocked never ran): on restart the unchanged-owned skip
+	// suppressed recovery, public DNS stayed at the OLD value while the appliance
+	// reported the NEW one, and the old value's cleanup key was destroyed. With
+	// PublishPending=true the record is NOT settled — its AddrText holds the DESIRED
+	// value not yet on the wire and PriorAddrText retains the last CONFIRMED value —
+	// so the next reconcile MUST re-run the provider I/O (it does not take the
+	// unchanged-owned skip, see reconcileScopeLocked's pendingRecovery) and keeps the
+	// prior value's cleanup key. Cleared by the confirm-save AFTER a successful wire
+	// add. Mirrors the DHCP-lease path's PTRPending durable-pending idiom. DISTINCT
+	// from #2662 (which persists the intent BEFORE the add to close the end-of-pass
+	// orphan window, but writes the desired address as though confirmed): #5285 adds
+	// the desired-vs-confirmed distinction so a crash in that same window cannot be
+	// mistaken for a confirmed publish. Omitted from the JSON when false; an absent
+	// value (a pre-#5285 store, a settled record) degrades to "settled", the safe
+	// default.
+	PublishPending bool `json:"publish_pending,omitempty"`
+	// PriorAddrText is the last CONFIRMED published rdata, retained while
+	// PublishPending is true (#5285). During crash recovery it is threaded to the
+	// backend as the value-specific replace target (LeaseDNSRecord.PrevAddr) so the
+	// self-owned in-place replace touches xpf's REAL live value — never the phantom
+	// desired value that AddrText holds until the wire confirms — and so the stale
+	// prior record is still cleanable/reclaimable (no misdirection, no lost cleanup
+	// key). Released (set "") by the confirm-save once the wire add succeeds. Omitted
+	// from the JSON when empty.
+	PriorAddrText string `json:"prior_addr_text,omitempty"`
 	// Scope is the ScopeKey this record belongs to (#2691 P1b, plan §5.4). It
 	// is the per-family / per-interface / per-RG / per-routing-instance scope
 	// the record was published under, so two scopes for the same name+address
