@@ -45235,3 +45235,29 @@ top.
   - **File(s)**: pkg/upgrade/cutover.go,
     pkg/upgrade/preflight_dbsnap_failclosed_5074_test.go,
     docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-10 (fix/5428-kernel-pkginstalled-tristate)
+  - **Action**: #5428 fail safe on a dpkg-query error in the kernel
+    pre-purge installed-set loop. #5427 made the post-purge sweep safe on
+    a purge FAILURE / partial purge, but both the PRE-purge installed-set
+    loop and the POST-purge confirmed-absent re-query used a helper that
+    returned `false` on ANY dpkg-query error, so a dpkg-DB corruption/parse
+    error (while the package IS installed) read as "not installed" ->
+    package dropped from the set -> purge SKIPPED -> the sweep deleted
+    package-owned /boot + /lib/modules files while dpkg still owned them
+    (same DB/FS divergence, reached via a query error instead of a
+    lock/maintainer-script failure). Made the pkgInstalled check TRI-STATE
+    `(bool, error)`; a query error now FAILS SAFE (possibly-installed) on
+    both sides so a real purge is attempted and the sweep stays gated
+    behind a POSITIVE confirmed-absent re-query. isPkgInstalled
+    distinguishes a genuinely-unknown package ("no packages found matching"
+    -> confirmed absent, no apt "Unable to locate package" regression) from
+    a real query failure (fail safe). New RED-on-revert tests via the
+    pkgInstalledFn seam (pre-purge + post-purge query error keeps files) +
+    dpkgQueryAbsent classification + real dpkg-query tri-state. RED proven
+    (buggy code sweeps files on a query error). Updated
+    docs/pr/1930-inc1-kernel-channel/codex-kernel-linux-impl.md.
+  - **File(s)**: pkg/upgrade/kernel_linux.go,
+    pkg/upgrade/kernel_pkgquery_5428_test.go,
+    pkg/upgrade/kernel_purge_5076_test.go,
+    docs/pr/1930-inc1-kernel-channel/codex-kernel-linux-impl.md, _Log.md

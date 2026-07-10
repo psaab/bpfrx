@@ -44,11 +44,14 @@ type realKernelSystem struct {
 	//
 	//   aptGetFn       overrides the apt-get invocation (purge, install).
 	//   pkgInstalledFn overrides the dpkg "is this package installed?" query.
+	//                  It is TRI-STATE (installed, queryErr): a non-nil queryErr
+	//                  means dpkg's status could not be determined and callers on
+	//                  a destructive path must fail SAFE (#5428).
 	//   fsRoot         prefixes the /boot + /lib/modules paths the prune sweep
 	//                  and the slot selector touch, so a test can assert
 	//                  against a temp-rooted filesystem.
 	aptGetFn       func(args ...string) error
-	pkgInstalledFn func(pkg string) bool
+	pkgInstalledFn func(pkg string) (bool, error)
 	fsRoot         string
 }
 
@@ -61,9 +64,14 @@ func (s *realKernelSystem) aptGetCmd(args ...string) error {
 	return aptGet(args...)
 }
 
-// pkgInstalled reports whether a package is installed, through the injected
-// seam when present, else a real dpkg-query.
-func (s *realKernelSystem) pkgInstalled(pkg string) bool {
+// pkgInstalled reports whether a package is installed AND whether the dpkg
+// query itself succeeded, through the injected seam when present, else a real
+// dpkg-query. It is TRI-STATE (installed / not-installed / query-error): a
+// non-nil error means the status could NOT be determined (dpkg-DB corruption,
+// lock, missing binary). Callers on a path that then deletes package-owned
+// files MUST treat a query error as POSSIBLY-INSTALLED and fail safe — never as
+// "removed" (#5428).
+func (s *realKernelSystem) pkgInstalled(pkg string) (bool, error) {
 	if s.pkgInstalledFn != nil {
 		return s.pkgInstalledFn(pkg)
 	}
@@ -263,7 +271,13 @@ func (s *realKernelSystem) InstallCandidateKernel(version string) (string, error
 	// (#5076).
 	anyInstalled := false
 	for _, p := range pkgs {
-		if s.pkgInstalled(p) {
+		ok, qerr := s.pkgInstalled(p)
+		// On a query error the on-disk payload is UNCERTAIN just as when the
+		// package is recorded installed, so fail safe and force --reinstall:
+		// apt then re-fetches and re-lays /boot + /lib/modules regardless
+		// (harmless when the package turns out not to be installed — apt just
+		// installs it fresh) (#5076/#5428).
+		if qerr != nil || ok {
 			anyInstalled = true
 			break
 		}
@@ -609,10 +623,20 @@ func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVer
 		"linux-headers-" + candidateVersion,
 	}
 	// Only purge packages that are actually installed (avoid apt errors on a
-	// never-installed optional pkg like headers/modules-extra).
+	// never-installed optional pkg like headers/modules-extra). A dpkg-query
+	// ERROR here (DB corruption, lock, missing binary) must NOT be misread as
+	// "not installed": that false-negative would drop a still-owned package
+	// from the set, skip the purge, and let the sweep below delete
+	// package-owned /boot + /lib/modules files while dpkg still owns them (the
+	// #5427 divergence class, reached via DB corruption instead of a
+	// lock/maintainer-script failure). Fail SAFE: treat a query error as
+	// POSSIBLY-INSTALLED and include the package, so a real purge is attempted
+	// and the sweep stays gated behind the confirmed-absent re-query below
+	// (#5428).
 	var installed []string
 	for _, p := range candPkgs {
-		if s.pkgInstalled(p) {
+		ok, qerr := s.pkgInstalled(p)
+		if qerr != nil || ok {
 			installed = append(installed, p)
 		}
 	}
@@ -635,15 +659,18 @@ func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVer
 		// Re-query dpkg: manual deletion of package-owned files must ONLY
 		// follow a CONFIRMED removal. If any package is still installed (a
 		// partial purge), keep its files and surface the anomaly rather than
-		// delete a still-owned payload (#5076).
+		// delete a still-owned payload (#5076). A query ERROR on the re-query
+		// is NOT a confirmed removal either — fail SAFE and treat it as
+		// still-installed so the sweep is skipped (#5428).
 		var stillInstalled []string
 		for _, p := range installed {
-			if s.pkgInstalled(p) {
+			ok, qerr := s.pkgInstalled(p)
+			if qerr != nil || ok {
 				stillInstalled = append(stillInstalled, p)
 			}
 		}
 		if len(stillInstalled) > 0 {
-			return fmt.Errorf("purge un-promoted candidate %s: still installed after purge: %s",
+			return fmt.Errorf("purge un-promoted candidate %s: still installed or unconfirmed-removed after purge: %s",
 				candidateVersion, strings.Join(stillInstalled, ", "))
 		}
 	}
@@ -666,13 +693,39 @@ func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVer
 	return nil
 }
 
-// isPkgInstalled reports whether a dpkg package is in the "installed" state.
-func isPkgInstalled(pkg string) bool {
+// isPkgInstalled reports whether a dpkg package is in the "installed" state and
+// whether the query itself succeeded. It is TRI-STATE: (true, nil) installed,
+// (false, nil) confirmed NOT installed, (false, err) status UNKNOWN.
+//
+// dpkg-query exits non-zero in TWO very different situations, and they must not
+// be conflated (#5428):
+//   - the package is genuinely unknown to dpkg ("no packages found matching") —
+//     a never-installed optional pkg (e.g. linux-headers/-modules-extra), OR a
+//     package dpkg fully purged (purge drops it from the DB entirely). This is a
+//     legitimate confirmed-absent, returned as (false, nil). Treating it as an
+//     error would push a never-installed pkg into the purge set and make
+//     `apt-get purge` fail with "Unable to locate package" — a prune regression.
+//   - a real query failure (DB corruption/parse error, permission, lock,
+//     missing binary). The status is UNKNOWN; return the error so a destructive
+//     caller fails SAFE (possibly-installed) rather than deleting owned files.
+func isPkgInstalled(pkg string) (bool, error) {
 	out, err := captureCmd("dpkg-query", "-W", "-f=${Status}", pkg)
 	if err != nil {
-		return false
+		if dpkgQueryAbsent(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	return strings.Contains(out, "install ok installed")
+	return strings.Contains(out, "install ok installed"), nil
+}
+
+// dpkgQueryAbsent reports whether a dpkg-query error means the package is
+// genuinely unknown to dpkg (a legitimate "not installed") rather than a real
+// query failure that must fail SAFE (#5428). captureCmd folds dpkg-query's
+// stderr into the returned error, so the "no packages found matching" marker is
+// visible in err.Error().
+func dpkgQueryAbsent(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no packages found matching")
 }
 
 func (s *realKernelSystem) Now() time.Time {
