@@ -45139,3 +45139,25 @@ top.
   chaining" section + first-hop-only Option 82 gotcha.
 - **File(s)**: pkg/dhcprelay/relay.go,
   pkg/dhcprelay/relay_chain_5071_test.go, pkg/dhcprelay/README.md, _Log.md
+- **Action**: #5067 — bind `show firewall [filter <name>] effective` to the
+  helper-acknowledged generation. The effective view compiled its snapshots
+  from ActiveConfig() and labeled them as what "the dataplane actually
+  receives" without ever consulting the apply/generation state. commitAndApply
+  promotes the active config via store.Commit() BEFORE applyAndSyncCommitted
+  runs; a required-protocol-gate apply error (applyErrSkipsPeerSync /
+  compileErrorMustAbortApply) leaves the dataplane DISARMED while ActiveConfig
+  is already the new generation, so the view falsely certified an unapplied
+  config as live. Added firewallEffectiveLiveness (dataplane loaded + helper
+  status → armed && acked-gen == last-applied-gen) and
+  printFirewallEffectiveBanner: certifies "dataplane-acknowledged (generation
+  N)" only when armed+coherent, else prints a prominent COMPILED-DESIRED /
+  disarmed-or-drift banner surfacing acked vs desired generations; a soft note
+  when no runtime is wired. Display-only — no change to apply/commit/sync.
+  Applied to both the all-filters and single-filter forms. Four tests
+  (armed-acked, disarmed-drift, generation-drift, no-runtime); RED-on-revert
+  proven (the disarmed + drift tests fail on reverted source — the compiled
+  snapshot is presented as effective with no banner). Updated
+  docs/junos-cli-reference.md with the generation-liveness banner section.
+- **File(s)**: pkg/cli/cli_show_security_filters.go,
+  pkg/cli/cli_show_effective_filter_gen_5067_test.go,
+  docs/junos-cli-reference.md, _Log.md
