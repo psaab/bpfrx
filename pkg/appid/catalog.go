@@ -113,7 +113,17 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 			continue
 		}
 
-		proto := catalogProtocolNumber(app.Protocol)
+		// #4887: honor ProtocolNumber's ok bit. catalogProtocolNumber (still used
+		// by the drift-guard test) drops ok, collapsing an EXPLICIT but
+		// unrepresentable protocol token (e.g. `protocol junos-foobar` surviving a
+		// tolerant/HA-sync load that strict commit would reject) to byte 0. That
+		// byte-0 fan-out shipped a live Protocol:0 (HOPOPT) catalog row whose
+		// app_id the Rust helper stamps on genuine protocol-0 sessions — a false
+		// AppID label for an application whose protocol was known-malformed. An
+		// unresolvable token is unemittable (folded into `emittable` below): no
+		// catalog row, no stampable AppNames name. An EXPLICIT `protocol 0`
+		// resolves to (0, true) and is preserved.
+		proto, protoOK := ProtocolNumber(app.Protocol)
 
 		dstLow, dstHigh, derr := parsePortRange(app.DestinationPort)
 		if derr != nil {
@@ -153,7 +163,15 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 		// emit no catalog row (fail CLOSED, no mislabel), but still consume the
 		// id below so the app_id sequence stays in lock-step with
 		// compileApplications (which bumps its id in exactly these cases).
-		emittable := srcOK && dstLow <= dstHigh && srcLow <= srcHigh
+		// protoEmittable (#4887) joins the port gates. An OMITTED protocol (empty
+		// spec) is the intended "any L4" case and fans out to TCP+UDP below, so it
+		// stays emittable even though ProtocolNumber("") reports ok=false. An
+		// EXPLICIT but unrepresentable protocol emits no row and no AppNames name,
+		// but still consumes the id below so the app_id sequence stays lock-step
+		// with compileApplications (which applies the identical gate for AppNames
+		// parity — appid_catalog_parity_test.go).
+		protoEmittable := protoOK || strings.TrimSpace(app.Protocol) == ""
+		emittable := protoEmittable && srcOK && dstLow <= dstHigh && srcLow <= srcHigh
 
 		if emittable {
 			// #3725 M04: record the id->name mapping ONLY for an app that emits

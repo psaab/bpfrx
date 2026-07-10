@@ -60,6 +60,19 @@ A no-op commit (identical VPN set) issues zero `LinkDel` and zero
 `LinkAdd`. `Clear()` (shutdown / full teardown) still deletes every
 tracked interface.
 
+**Teardown retains on delete failure (#4901).** The xfrm / bond / tunnel
+teardown paths (`clearLocked`, reached via `Clear`) used to log a failed
+netlink `LinkDel`, drop the object from tracking, and return `nil` — so a
+transient / `EBUSY` / `EPERM` delete failure left the link in the kernel
+while the manager forgot it owned it, orphaning the xfrmi / bond / tunnel
+(stale addresses, enslaved members, XFRM `if_id` state) with no state left
+to retry it. This mirrored neither the VRF nor the tunnel **Apply** removal
+diff, both of which already retain ownership on a failed delete (`next[name]
+= true`). `clearLocked` now returns the `errors.Join`'d delete errors and
+**retains tracking** for objects whose `LinkDel` failed (`xfrmis` entry /
+`bonds` name / `ownedNames` entry) so the next reconcile retries; only
+successfully-removed (or already-gone) objects are dropped.
+
 #### `if_id` collision guard (#2909)
 
 The kernel keys the SA↔xfrmi binding on the XFRM `if_id`, so the `if_id`

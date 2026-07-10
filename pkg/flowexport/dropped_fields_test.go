@@ -174,8 +174,8 @@ func TestNetflowRecordOmitsDroppedFields(t *testing.T) {
 	} {
 		fs := encodeDataFlowSet([]FlowRecord{nonZeroRecord(tc.v6)}, boot, opts)
 		recSize := recordSize(tc.fields)
-		if len(fs) != 4+recSize {
-			t.Fatalf("%s: flowset len = %d, want %d", tc.name, len(fs), 4+recSize)
+		if wantLen := dataFlowSetLen(1, recSize); len(fs) != wantLen {
+			t.Fatalf("%s: flowset len = %d, want %d", tc.name, len(fs), wantLen)
 		}
 		proto := fs[4+tc.protoOff]
 		if proto != 6 {

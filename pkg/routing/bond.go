@@ -136,17 +136,25 @@ func (b *bondManager) Clear() error {
 // clearLocked is the lock-free body of Clear. Caller must hold mu.
 // Used internally by Apply.
 func (b *bondManager) clearLocked() error {
+	var errs []error
+	var retained []string
 	for _, name := range b.bonds {
 		link, err := b.ops.LinkByName(name)
 		if err != nil {
 			continue // already gone
 		}
 		if err := b.ops.LinkDel(link); err != nil {
+			// #4901: a failed LinkDel leaves the bond (and its enslaved members)
+			// in the kernel. Retain the name so the next reconcile retries the
+			// delete, and surface the error instead of returning a clean-teardown
+			// nil that loses ownership of the orphaned bond.
 			slog.Warn("failed to delete bond", "name", name, "err", err)
+			errs = append(errs, fmt.Errorf("delete bond %s: %w", name, err))
+			retained = append(retained, name)
 		} else {
 			slog.Info("bond removed", "name", name)
 		}
 	}
-	b.bonds = nil
-	return nil
+	b.bonds = retained
+	return errors.Join(errs...)
 }

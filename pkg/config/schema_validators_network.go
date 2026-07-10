@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -29,6 +30,49 @@ func ValidateIPAddress(raw string, _ *Config) error {
 		return fmt.Errorf("not a valid IP address (got %q)", raw)
 	}
 	return nil
+}
+
+// ValidateBGPClusterID accepts a BGP route-reflector cluster-id in exactly the
+// two forms FRR/vtysh's `bgp cluster-id <A.B.C.D | (1-4294967295)>` grammar
+// accepts: an IPv4 dotted-quad, or a 32-bit unsigned integer in 1..4294967295.
+//
+// `protocols bgp cluster-id` is parsed as a raw string and rendered verbatim
+// (compiler_protocols.go copies child.Keys[1]; pkg/frr/policy_render.go emits
+// `bgp cluster-id <v>`). Unlike the adjacent router-id (guarded by
+// validateRouterIDStrict + the validRouterID render belt), cluster-id had NO
+// value validator and NO render-side sanitize belt. A bad token (`not.an.ip`,
+// an IPv6 literal, `0`, or an out-of-range integer) is rejected by FRR at
+// frr-reload, which exits non-zero on any CMD_WARNING_CONFIG_FAILED and stalls
+// the WHOLE xpf-managed section — so a mistyped cluster-id poisons the reload
+// for any co-committed routing change (#4919). Accepting exactly what FRR
+// accepts keeps the commit gate from over-rejecting a valid config while
+// closing the reload-poison surface.
+//
+// Strict at commit-check (SchemaValidate); the tolerant load / peer-sync path
+// keeps booting (#1960) and the render belt (validClusterID + sanitizeFRRValue,
+// pkg/frr) keeps a leniently-loaded bad value out of frr.conf.
+func ValidateBGPClusterID(raw string, _ *Config) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("missing value (expected a BGP cluster-id: an IPv4 dotted-quad like 10.0.0.1, or an integer 1..4294967295)")
+	}
+	// IPv4 dotted-quad form. net.ParseIP rejects a bare integer, so the
+	// integer spelling falls through to the ParseUint arm below.
+	if ip := net.ParseIP(trimmed); ip != nil {
+		if ip.To4() == nil {
+			return fmt.Errorf("invalid cluster-id %q (an IPv6 address is not a valid BGP cluster-id; use an IPv4 dotted-quad or a 32-bit integer)", raw)
+		}
+		return nil
+	}
+	// 32-bit unsigned integer form. ParseUint with bitSize 32 rejects a value
+	// above 4294967295 (out-of-FRR-range) as a parse error.
+	if v, err := strconv.ParseUint(trimmed, 10, 32); err == nil {
+		if v < 1 {
+			return fmt.Errorf("invalid cluster-id %q (the integer form must be in 1..4294967295)", raw)
+		}
+		return nil
+	}
+	return fmt.Errorf("invalid cluster-id %q (expected an IPv4 dotted-quad like 10.0.0.1, or a 32-bit integer 1..4294967295)", raw)
 }
 
 // ValidateIPv6Address accepts an IPv6 literal WITHOUT a prefix length and
