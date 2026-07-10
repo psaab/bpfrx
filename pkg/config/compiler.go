@@ -393,6 +393,19 @@ type compileOpts struct {
 	// nothing) is rejected. Same doctrine as lenientLogProfileStreamRef.
 	lenientDynamicAddressFeedRef bool
 
+	// lenientDuplicateNamedBlock (#5180) downgrades the duplicate
+	// hierarchical named-block gate (validateDuplicateNamedBlockAST) from a
+	// hard error to a warning on the tolerant load / peer-sync paths. An
+	// already-persisted config (older binaries silently reduced a repeated
+	// `groups`/`interfaces`/`screen ids-option` block to last-writer-wins),
+	// or one synced from a peer, may carry such a duplicate; an upgrading /
+	// receiving node must still boot through it (warn — the runtime keeps the
+	// historical last-writer-wins result) rather than fail-closed-on-load
+	// (#1960 class). Commit / commit-check stay strict — a new operator edit
+	// that authors a block twice (silently dropping the earlier one) is
+	// rejected so the author is told to write it once.
+	lenientDuplicateNamedBlock bool
+
 	// lenientNATHostMask (#2173) downgrades the static-NAT / NAT64
 	// host-mask gate (validateNATHostMaskStrict) from a hard compile error
 	// to a cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync
@@ -1676,6 +1689,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
+		lenientDuplicateNamedBlock:             true,
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
@@ -1860,6 +1874,17 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, riTableIDErr
 	}
 
+	// #5180: duplicate hierarchical named-block gate. Runs PRE-expansion on the
+	// top-level stanzas (never a group body — apply-groups deep-merges rather
+	// than duplicating) so an authored `groups`/`interfaces`/`screen ids-option`
+	// block written twice is rejected (strict) instead of silently reduced to
+	// last-writer-wins; lenient warns and keeps the historical result.
+	dupBlockWarnings, dupBlockErr := validateDuplicateNamedBlockAST(
+		tree, opts.lenientDuplicateNamedBlock)
+	if dupBlockErr != nil {
+		return nil, dupBlockErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -1885,6 +1910,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	return cfg, nil
 }
 
@@ -1930,6 +1956,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
 		lenientDynamicAddressFeedRef:           true,
+		lenientDuplicateNamedBlock:             true,
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
@@ -2048,6 +2075,14 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, riTableIDErr
 	}
 
+	// #5180: duplicate hierarchical named-block gate — see compileConfigWithOpts.
+	// Pre-expansion, top-level stanzas only; strict rejects, lenient warns.
+	dupBlockWarnings, dupBlockErr := validateDuplicateNamedBlockAST(
+		tree, opts.lenientDuplicateNamedBlock)
+	if dupBlockErr != nil {
+		return nil, dupBlockErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -2069,6 +2104,7 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, zoneIDWarnings...)
 	cfg.Warnings = append(cfg.Warnings, riTableIDWarnings...)
+	cfg.Warnings = append(cfg.Warnings, dupBlockWarnings...)
 	return cfg, nil
 }
 
