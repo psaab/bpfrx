@@ -175,6 +175,13 @@ type Config struct {
 	// xpf_frr_reload_degraded gauge (0/1, no labels). Optional; if nil,
 	// the gauge is not emitted.
 	FRRReloadDegradedFn func() bool
+	// IPsecRebindPendingFn reports whether the last DHCP-lease-change IPsec
+	// rebind failed and has not yet reconverged — swanctl local_addrs are
+	// bound to a stale lease address while set, so the tunnel cannot
+	// re-establish and the daemon's retry loop is still running (#4899).
+	// Backs the xpf_ipsec_rebind_pending gauge (0/1, no labels). Optional;
+	// if nil, the gauge is not emitted.
+	IPsecRebindPendingFn func() bool
 	// SchedulerRepublishFailedFn reports whether the most recent
 	// scheduler-driven policy republish failed and has not yet converged
 	// (#3780). A scheduler window transition republishes enforcement; a
@@ -279,6 +286,7 @@ type Server struct {
 	rollbackHistoryDegradedFn        func() bool
 	neighborPhaseAgeFn               func() map[string]float64
 	frrReloadDegradedFn              func() bool
+	ipsecRebindPendingFn             func() bool
 	schedulerRepublishFailedFn       func() bool
 	schedulerRepublishStaleSecondsFn func() float64
 	ipmonStatusFn                    func() []ipmon.PolicyStatus
@@ -363,6 +371,7 @@ func NewServer(cfg Config) *Server {
 		rollbackHistoryDegradedFn:        cfg.RollbackHistoryDegradedFn,
 		neighborPhaseAgeFn:               cfg.NeighborPhaseAgeFn,
 		frrReloadDegradedFn:              cfg.FRRReloadDegradedFn,
+		ipsecRebindPendingFn:             cfg.IPsecRebindPendingFn,
 		schedulerRepublishFailedFn:       cfg.SchedulerRepublishFailedFn,
 		schedulerRepublishStaleSecondsFn: cfg.SchedulerRepublishStaleSecondsFn,
 		ipmonStatusFn:                    cfg.IPMonStatusFn,

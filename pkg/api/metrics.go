@@ -178,6 +178,10 @@ type xpfCollector struct {
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
 	frrReloadDegraded   *prometheus.Desc
+	// #4899: 0/1 gauge — 1 while the last DHCP-lease-change IPsec rebind
+	// failed and swanctl local_addrs are still bound to a stale lease
+	// address (the retry loop has not yet reconverged).
+	ipsecRebindPending *prometheus.Desc
 
 	// #3780: 0/1 gauge — 1 while the most recent scheduler-driven policy
 	// republish failed and has not yet converged (stale enforcement past
@@ -669,6 +673,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
 	ch <- c.frrReloadDegraded
+	ch <- c.ipsecRebindPending
 	ch <- c.schedulerRepublishFailed
 	ch <- c.schedulerRepublishStale
 	ch <- c.configPersistDegraded
@@ -925,6 +930,20 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			v = 1
 		}
 		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
+			prometheus.GaugeValue, v)
+	}
+
+	// #4899: IPsec DHCP-lease-change rebind-pending is a control-plane
+	// signal (the daemon re-renders swanctl even in config-only mode) —
+	// emit it BEFORE the dataplane gate so a stale-local_addrs tunnel that
+	// cannot re-establish stays visible even when the dataplane is not
+	// loaded.
+	if c.srv.ipsecRebindPendingFn != nil {
+		v := 0.0
+		if c.srv.ipsecRebindPendingFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.ipsecRebindPending,
 			prometheus.GaugeValue, v)
 	}
 

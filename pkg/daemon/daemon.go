@@ -119,7 +119,33 @@ type Daemon struct {
 	// behavior change. The mirrored ddnsReconcile* fields above remain flat.
 	dhcpLeaseSync  dhcpLeaseSyncState
 	ipsecSANudgeCh chan struct{} // nudge: peer (re)connect -> IPsec SA re-advertise (#4385)
-	feeds          *feeds.Manager
+	// #4899 DHCP-lease-change IPsec rebind recovery state. When a DHCP
+	// renewal moves the kernel address an IPsec gateway is dynamically bound
+	// to (external-interface, no explicit local-address), the management-only
+	// lease callback re-renders swanctl local_addrs best-effort
+	// (reapplyIPsecForLeaseChange). Before #4899 a swanctl reload failure on
+	// that path was dropped as a slog.Warn: strongSwan kept binding the STALE
+	// lease address, the tunnel could not re-establish, and the operator had
+	// no signal and no recovery. These fields make the failure RECOVERABLE
+	// (a single-flight retry loop mirroring probePinRetryLoop, #1895) and
+	// VISIBLE (the ipsecRebindPending gauge). All mutations of the two flags
+	// happen under ipsecRebindMu; ipsecRebindPending is atomic so the metrics
+	// collector reads it lock-free.
+	ipsecRebindMu          sync.Mutex
+	ipsecRebindPending     atomic.Bool // health signal: local_addrs stale, rebind not yet reconverged
+	ipsecRebindRetryActive bool        // single-flight guard for the retry loop (guarded by ipsecRebindMu)
+	// ipsecRebindRetryEvery overrides the retry cadence (tests); 0 =
+	// ipsecRebindRetryInterval.
+	ipsecRebindRetryEvery time.Duration
+	// ipsecApply is the test seam for the swanctl re-render+reload on the
+	// lease-change path; nil = d.ipsec.Apply(ipsec.PrepareConfig(cfg)).
+	ipsecApply func(*config.Config) error
+	// ipsecRebindActiveCfg is the test seam for the config the retry loop
+	// re-renders against; nil = d.store.ActiveConfig (so a commit that
+	// removes the VPN naturally converges the loop instead of resurrecting
+	// deleted config).
+	ipsecRebindActiveCfg func() *config.Config
+	feeds                *feeds.Manager
 	// feedsMu serializes reconcileFeeds callers and guards activeFeedsHash
 	// (#5036). d.feeds itself is constructed once at boot (unconditionally,
 	// even with no feed servers) and never reassigned, so its pointer is

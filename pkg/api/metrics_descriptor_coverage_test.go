@@ -422,6 +422,10 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		// xpf_frr_reload_degraded gauge emits and the canary covers its
 		// descriptor declaration.
 		frrReloadDegradedFn: func() bool { return true },
+		// #4899: wire a non-nil IPsec rebind-pending source so the
+		// xpf_ipsec_rebind_pending gauge emits and the canary covers its
+		// descriptor declaration.
+		ipsecRebindPendingFn: func() bool { return true },
 		// #1827: wire a non-nil ip-monitoring status source so the
 		// xpf_ipmon_* family emits and the canary covers its
 		// descriptor declarations.
@@ -531,6 +535,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_daemon_neighbor_periodic_last_success_age_seconds",            // #1780 neighbor watchdog
 		"xpf_ipmon_policy_failed",                                          // #1827 ip-monitoring
 		"xpf_frr_reload_degraded",                                          // #1880 FRR degraded reload
+		"xpf_ipsec_rebind_pending",                                         // #4899 IPsec lease-change rebind health
 		"xpf_pbr_rules_installed",                                          // #4422 PBR/FBF build health
 		"xpf_pbr_degraded_terms",                                           // #4422 PBR/FBF degraded terms
 		"xpf_userspace_worker_dead",                                        // emitWorkerRuntime

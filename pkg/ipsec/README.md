@@ -346,6 +346,34 @@ all files stay in `package ipsec`, so the public API is unchanged.
   - Non-DHCP runtime address changes (e.g. a manual VIP move on a static
     interface) still rely on a commit/boot re-render; only DHCP lease
     changes have a runtime hook today.
+  - **Recoverable + visible rebind failure (#4899).** The management-only
+    `reapplyIPsecForLeaseChange` re-render is best-effort with respect to
+    lease processing (a swanctl failure must never block or fail DHCP
+    handling), but its reload error is NO LONGER dropped as a bare
+    `slog.Warn`. Before #4899 a failed `swanctl --load-all` on this path
+    left strongSwan binding the STALE lease address — the tunnel could not
+    re-establish and the operator had no signal and no recovery.
+    - **Recoverable:** on failure the daemon raises an
+      `ipsecRebindPending` flag and arms a single-flight retry loop
+      (`ipsecRebindRetryLoop`, `pkg/daemon/daemon_ipsec_rebind.go`) that
+      re-runs the re-render+reload on a slow cadence
+      (`ipsecRebindRetryInterval`, 30s) until it converges, then clears the
+      flag and disarms. It mirrors the probe-pin retry idiom (#1895,
+      `probePinRetryLoop`). The loop re-renders against the LIVE active
+      config (`d.store.ActiveConfig`), so a commit that removes the VPN or
+      the DHCP binding converges the loop instead of resurrecting deleted
+      config. Both the apply and the pending-flag update run under the apply
+      semaphore, so the pending state always reflects the last completed
+      apply (no lost-failure race against a concurrent commit's IPsec
+      apply).
+    - **Visible:** while pending, the `xpf_ipsec_rebind_pending` Prometheus
+      gauge reads 1 (surfaced via `Daemon.IPsecRebindPending` →
+      `api.Config.IPsecRebindPendingFn`), mirroring the
+      `xpf_frr_reload_degraded` degraded-state gauge (#1880). It clears to 0
+      once swanctl `local_addrs` reconverge on the current lease.
+    - This is the DHCP-lease-change best-effort caller ONLY. The
+      commit-path IPsec apply already fail-closes the commit on an
+      `ipsec.Apply` error (#4433) and is unchanged.
 - **IKE policy chain → proposal cross-reference (#2270).** A gateway's
   `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
   (`resolveIKESettings`, `ike.go`). When that chain breaks — the
