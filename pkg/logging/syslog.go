@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,12 +32,37 @@ const (
 	defaultReconnectCooldown = 1 * time.Second
 )
 
-// Syslog severity levels (RFC 3164).
+// Syslog wire severity levels (RFC 5424 / RFC 3164 numeric PRI severity).
+// LOWER number = MORE severe. These are the on-the-wire severity codes AND
+// the values a record's severity is compared against in ShouldSend.
 const (
-	SyslogError   = 3
-	SyslogWarning = 4
-	SyslogNotice  = 5
-	SyslogInfo    = 6
+	SyslogEmergency = 0
+	SyslogAlert     = 1
+	SyslogCritical  = 2
+	SyslogError     = 3
+	SyslogWarning   = 4
+	SyslogNotice    = 5
+	SyslogInfo      = 6
+	SyslogDebug     = 7
+)
+
+// SyslogClient.MinSeverity filter sentinels (#5314). MinSeverity encodes the
+// Junos `host <facility> <severity>` threshold ("send this severity AND every
+// more-severe one"). It is NOT a wire severity code — it reuses the raw RFC
+// values above for alert(1)..debug(7), but the two extremes need dedicated
+// sentinels:
+//
+//   - 0 = "no severity filter" — forward every record. This is the ZERO VALUE,
+//     so an unconfigured client forwards everything, and it is also what Junos
+//     `any` (and an unknown/typo'd severity, tolerantly) maps to.
+//   - SeverityEmergency = -1 — forward ONLY emergency records. The most severe
+//     level cannot reuse SyslogEmergency(0) because 0 already means send-all;
+//     collapsing emergency into the send-all sentinel is exactly the #5314
+//     over-forward bug, so emergency gets its own code.
+//   - SeverityNone = -2 — forward NOTHING (Junos `none`).
+const (
+	SeverityNone      = -2
+	SeverityEmergency = -1
 )
 
 // Syslog facility codes (RFC 3164).
@@ -68,7 +94,7 @@ type SyslogClient struct {
 	protocol    string // "udp", "tcp", "tls"
 	tlsConfig   *tls.Config
 	Facility    int    // syslog facility code (default: FacilityLocal0)
-	MinSeverity int    // 0 = no filter, else SyslogError(3)/SyslogWarning(4)/SyslogInfo(6)
+	MinSeverity int    // severity threshold; 0 = no filter, SeverityEmergency(-1)/SeverityNone(-2) sentinels, else raw RFC level (see ShouldSend)
 	Format      string // "sd-syslog" for RFC 5424, "structured" for Junos RT_FLOW, "" for RFC 3164
 	Categories  uint8  // bitmask of allowed event categories (0 = all)
 
@@ -656,9 +682,59 @@ func (s *SyslogClient) writeBinaryMsg(data []byte) error {
 }
 
 // ShouldSend returns true if the event severity passes this client's filter.
-// Lower severity number = higher priority (error=3 < warning=4 < info=6).
+// Lower severity number = higher priority (emergency=0 < error=3 < info=6). A
+// record is sent iff it is at least as severe as MinSeverity — the Junos
+// "<severity> AND more severe" threshold. The two sentinels are handled
+// explicitly so the most-severe level (emergency) does not collide with the
+// send-all zero value (#5314):
+//
+//   - MinSeverity == 0 (no filter / Junos any / unset) → send everything.
+//   - MinSeverity == SeverityNone (Junos none) → send nothing.
+//   - MinSeverity == SeverityEmergency (Junos emergency) → send only emergency
+//     (SyslogEmergency==0), i.e. severity <= 0.
+//   - otherwise MinSeverity is a raw RFC level alert(1)..debug(7); send iff the
+//     record's severity is <= MinSeverity (equal or more severe).
 func (s *SyslogClient) ShouldSend(severity int) bool {
-	return s.MinSeverity == 0 || severity <= s.MinSeverity
+	switch s.MinSeverity {
+	case 0:
+		return true
+	case SeverityNone:
+		return false
+	case SeverityEmergency:
+		return severity <= SyslogEmergency
+	default:
+		return severity <= s.MinSeverity
+	}
+}
+
+// minSeverityRestrictRank ranks a MinSeverity threshold code by how much it
+// restricts forwarding: HIGHER rank = MORE restrictive (forwards fewer
+// records). Ordering, most→least restrictive: none, emergency, alert,
+// critical, error, warning, notice, info, debug, any(0). Used to merge the
+// per-facility severities of one syslog host into a single most-restrictive
+// client filter (the client holds one MinSeverity, not a per-facility map).
+func minSeverityRestrictRank(min int) int {
+	switch min {
+	case SeverityNone: // send nothing — most restrictive
+		return 100
+	case SeverityEmergency: // send only emergency
+		return 99
+	case 0: // no filter / any — least restrictive
+		return -1
+	default: // raw RFC level: alert(1)..debug(7); lower value = more restrictive
+		return 8 - min
+	}
+}
+
+// MoreRestrictiveMinSeverity returns whichever of two MinSeverity threshold
+// codes forwards the FEWER records. When a syslog host lists several
+// `<facility> <severity>` pairs the client — which carries a single
+// MinSeverity — adopts the most restrictive of them (#5314).
+func MoreRestrictiveMinSeverity(a, b int) int {
+	if minSeverityRestrictRank(b) > minSeverityRestrictRank(a) {
+		return b
+	}
+	return a
 }
 
 // ShouldSendEvent returns true if both severity and category filters pass.
@@ -732,16 +808,49 @@ func ParseSeverityStrict(name string) (int, error) {
 	}
 }
 
-// ParseSeverity converts a severity name to its numeric value.
-// Returns 0 (no filter) for unrecognized names.
+// ParseSeverity converts a Junos syslog severity name to the MinSeverity
+// threshold code used by ShouldSend. It maps ALL ten severities the config
+// schema accepts (junosSyslogSeverities in pkg/config/schema_system.go), plus
+// the two extremes as sentinels (#5314):
+//
+//	any                        -> 0                 (no filter, send all)
+//	none                       -> SeverityNone (-2) (send nothing)
+//	emergency                  -> SeverityEmergency (-1) (send only emergency)
+//	alert/critical/error/
+//	warning/notice/info/debug  -> raw RFC level 1..7
+//
+// The mapping is case-insensitive. Before #5314 only error/warning/info were
+// mapped and everything else fell through to 0 = send-all, so a legitimate
+// `host H <facility> critical` collapsed to no-filter and over-forwarded
+// info/warning/error records the operator never authorized.
+//
+// Tolerant contract (preserved): an unrecognized name returns 0 (no filter),
+// matching the historical behavior. The strict commit-time schema
+// (ValidateEnum(junosSyslogSeverities)) rejects unknown severities before they
+// reach here; ParseSeverityStrict is the fail-closed variant used by the SSE
+// surface.
 func ParseSeverity(name string) int {
-	switch name {
+	switch strings.ToLower(name) {
+	case "any":
+		return 0
+	case "none":
+		return SeverityNone
+	case "emergency":
+		return SeverityEmergency
+	case "alert":
+		return SyslogAlert
+	case "critical":
+		return SyslogCritical
 	case "error":
 		return SyslogError
 	case "warning":
 		return SyslogWarning
+	case "notice":
+		return SyslogNotice
 	case "info":
 		return SyslogInfo
+	case "debug":
+		return SyslogDebug
 	default:
 		return 0
 	}

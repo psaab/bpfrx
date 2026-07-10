@@ -18,8 +18,10 @@ package config
 //     event mode; anything else is stream mode).
 //   - syslogLogFormats: pkg/logging (syslog.go "sd-syslog" timestamp branch,
 //     ringbuf.go "binary"/"structured" branches; "syslog"/"" => RFC 3164).
-//   - syslogSeverities: pkg/logging ParseSeverity (error/warning/info map to
-//     a floor; everything else => 0 = no floor).
+//   - syslogSeverities: pkg/logging ParseSeverity (all ten Junos severities
+//     map to a MinSeverity threshold — emergency/alert/critical/error/warning/
+//     notice/info/debug plus any=>send-all and none=>send-nothing, #5314; an
+//     unknown token stays 0 = no floor).
 //   - syslogFacilities: pkg/logging ParseFacility (recognized names; every
 //     other name silently remaps to local0).
 //   - syslogCategories: pkg/logging ParseCategory (all/session/policy/screen/
