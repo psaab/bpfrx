@@ -153,6 +153,17 @@ inline archive-site passwords).
   loading the cleartext secrets without a trace. Reaching that state needs
   write access to the 0600/0700 `.configdb` (root/owner), so this is a
   visibility improvement, not a privilege-escalation fix.
+- **Unknown inner-envelope format fails closed (#4888).** `unmarshalEnvelope`
+  distinguishes a genuine plaintext body (no `format`, no `salt`/`nonce`/`data`
+  — passed through) from an envelope-shaped body it cannot decrypt: an
+  unknown/future `format` (e.g. a `xpf-master-password-v2` bump), or the
+  AES-GCM fields present without the current `format`, returns an ERROR so
+  `Store.Load` reports `ErrConfigDBUnreadable`. Without this, an inner encrypted
+  envelope past the outer `#xpf-config-envelope` gate whose format was corrupted
+  or is too-new would be `json.Unmarshal`'d into a `ConfigTree` with all unknown
+  fields dropped — an EMPTY tree — booting a committed-empty config (loss of
+  policy) instead of failing closed. This restores at the inner layer the same
+  no-empty-load-on-unknown property the outer envelope provides.
 - **GCM AAD binding (A4-05) — deliberately NOT changed.** `Seal`/`Open` pass
   a nil additional-authenticated-data argument. Binding the envelope header
   (PRF/salt) as AAD is textbook defense-in-depth, but the scheme already
