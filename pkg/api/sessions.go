@@ -21,9 +21,11 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
-// maxConcurrentSessionLists bounds how many GET /security/sessions list
-// walks may run at once (#5318). A session list walks the whole v4+v6
-// conntrack table holding per-bucket BPF-map locks, so N concurrent
+// maxConcurrentSessionWalks bounds how many full session-table walks may
+// run at once across the session-scan REST endpoints (#5318, #5433): the
+// GET /security/sessions list, GET /security/sessions/summary, and GET
+// /security/sessions/summary/zone-pairs. Each of these walks the whole
+// v4+v6 conntrack table holding per-bucket BPF-map locks, so N concurrent
 // scrapers each drive their own full walk simultaneously — on a
 // multi-million-session firewall that multiplies contention with the live
 // dataplane session-sync path. The cap is deliberately small: legitimate
@@ -31,16 +33,19 @@ import (
 // never starve session installs. #5237 already aborts a walk when its own
 // client disconnects; this bounds how many connected clients can walk at
 // once, which the disconnect-abort does not.
-const maxConcurrentSessionLists = 4
+const maxConcurrentSessionWalks = 4
 
-// sessionsListLimiter is the admission gate for the session list handler.
-// It reuses the diagcmd fixed-capacity counting semaphore (the same
-// fail-fast idiom the diagnostic ping/traceroute handlers use, #5057):
-// Acquire is non-blocking, so an over-cap request is rejected immediately
-// with HTTP 429 rather than queued into an unbounded backlog. It is a
-// package var so a test can swap in a fresh small-capacity limiter without
-// mutating process-wide state.
-var sessionsListLimiter = diagcmd.NewLimiter(maxConcurrentSessionLists)
+// sessionWalkLimiter is the shared admission gate for the full-table
+// session-scan handlers (list, summary, zone-pairs). It reuses the diagcmd
+// fixed-capacity counting semaphore (the same fail-fast idiom the
+// diagnostic ping/traceroute handlers use, #5057): Acquire is non-blocking,
+// so an over-cap request is rejected immediately with HTTP 429 rather than
+// queued into an unbounded backlog. One shared limiter (not one per
+// endpoint) bounds the AGGREGATE walk concurrency, since all three handlers
+// contend for the same per-bucket BPF-map locks against session-sync
+// (#5433). It is a package var so a test can swap in a fresh small-capacity
+// limiter without mutating process-wide state.
+var sessionWalkLimiter = diagcmd.NewLimiter(maxConcurrentSessionWalks)
 
 // defaultSessionCountCap bounds how many matching sessions the offset list
 // walk counts before it stops and reports Total as an approximate lower
@@ -112,8 +117,9 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 	// BPF-map locks. Acquire a slot fail-fast BEFORE the walk (and before the
 	// peer fan-out) so a concurrent-scrape flood is rejected with HTTP 429
 	// rather than each driving its own simultaneous walk. Release on every
-	// exit path via defer. This covers both the offset and cursor paths.
-	release, err := sessionsListLimiter.Acquire()
+	// exit path via defer. This covers both the offset and cursor paths. The
+	// limiter is shared with the summary/zone-pair scans (#5433).
+	release, err := sessionWalkLimiter.Acquire()
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests,
 			"session list concurrency limit reached; retry shortly")
@@ -610,6 +616,23 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admission bound (#5433): the summary is an EXACT aggregate over the whole
+	// v4+v6 conntrack table, so — like the list handler (#5318) — it holds
+	// per-bucket BPF-map locks that contend with the live session-sync path.
+	// An exact aggregate genuinely needs the full walk (no sessionCountCap: a
+	// capped summary would change the response contract), so the gate alone is
+	// the fix. Acquire fail-fast BEFORE the walk (and the peer fan-out); an
+	// over-cap request is rejected with HTTP 429 instead of driving its own
+	// simultaneous walk. Release on every exit path via the deferred idempotent
+	// release; nothing is released on the ErrBusy path (release is nil there).
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		writeError(w, http.StatusTooManyRequests,
+			"session scan concurrency limit reached; retry shortly")
+		return
+	}
+	defer release()
+
 	var summary SessionSummary
 
 	// Stop the full-table walk if the client disconnects mid-scan so we do
@@ -782,6 +805,24 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 		writeOK(w, ZonePairSummaryResponse{NodeID: s.nodeID(), ZonePairs: []ZonePairSessionSummary{}})
 		return
 	}
+
+	// Admission bound (#5433): the zone-pair breakdown is an EXACT aggregate
+	// over the whole v4+v6 conntrack table, holding per-bucket BPF-map locks
+	// that contend with the live session-sync path (same as the list handler,
+	// #5318). An exact breakdown needs the full walk (no sessionCountCap: a
+	// capped breakdown would change the response contract), so the gate alone
+	// is the fix. Acquire fail-fast BEFORE the walk (and the peer fan-out);
+	// over-cap requests get HTTP 429 instead of driving their own simultaneous
+	// walk. Gate after the not-loaded early return, which serves an empty
+	// breakdown without walking. Release on every exit path via the deferred
+	// idempotent release; nothing is released on the ErrBusy path.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		writeError(w, http.StatusTooManyRequests,
+			"session scan concurrency limit reached; retry shortly")
+		return
+	}
+	defer release()
 
 	// Build zone ID -> name reverse map
 	zoneNames := make(map[uint16]string)
