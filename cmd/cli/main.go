@@ -19,18 +19,42 @@ import (
 
 	"github.com/chzyer/readline"
 	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/policymatch"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// maxConfigRecvBytes bounds a single gRPC response the CLI will accept. The
+// configstore accepts a configuration up to configstore.MaxConfigSize (16 MiB),
+// and a ShowConfig response can carry a payload of that size, so the CLI must
+// be able to receive it. grpc-Go defaults MaxCallRecvMsgSize to 4 MiB, which
+// truncates a large `show configuration` with ResourceExhausted (#5321). Track
+// the store ceiling plus 1 MiB of gRPC/proto framing headroom so the two
+// bounds cannot drift.
+const maxConfigRecvBytes = configstore.MaxConfigSize + (1 << 20)
+
+// dialOpts returns the gRPC dial options the CLI client uses to reach xpfd.
+// Kept as a helper (rather than inline) so tests exercise the exact production
+// construction: insecure loopback transport plus the raised receive cap that
+// lets a large `show configuration` (up to configstore.MaxConfigSize) round
+// trip past grpc-Go's 4 MiB default (#5321). extra options (e.g. a bufconn
+// dialer) are appended for tests.
+func dialOpts(extra ...grpc.DialOption) []grpc.DialOption {
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxConfigRecvBytes)),
+	}
+	return append(opts, extra...)
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "xpfd gRPC address")
 	cmdFlag := flag.String("c", "", "run a single command non-interactively and exit")
 	flag.Parse()
 
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(*addr, dialOpts()...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cli: connect: %v\n", err)
 		os.Exit(1)
