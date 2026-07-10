@@ -35,7 +35,7 @@ func (c *ctl) confirmYes(prompt string) (bool, error) {
 	// Restore the correct prompt for the current mode so this
 	// helper composes with both `request system ...` (operational)
 	// and `run request system ...` (from configuration mode).
-	if c.configMode {
+	if c.configMode.Load() {
 		c.rl.SetPrompt(c.configPrompt())
 	} else {
 		c.rl.SetPrompt(c.operationalPrompt())

@@ -57,7 +57,7 @@ func TestRemoteCommitUnknownModifierNoRPC_4868(t *testing.T) {
 	for _, line := range []string{"commit confimed 10", "commit bogus", "commit synchronize"} {
 		t.Run(line, func(t *testing.T) {
 			fake := &commitRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchConfig(line); err == nil {
 				t.Fatalf("%q: expected an error for an unknown commit modifier", line)
 			}
@@ -83,7 +83,7 @@ func TestRemoteCommitConfirmedInvalidNoRPC_4868(t *testing.T) {
 	} {
 		t.Run(line, func(t *testing.T) {
 			fake := &commitRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchConfig(line); err == nil {
 				t.Fatalf("%q: expected an error", line)
 			}
@@ -109,7 +109,7 @@ func TestRemoteCommitConfirmedValidMinutes_4868(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.line, func(t *testing.T) {
 			fake := &commitRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchConfig(tc.line); err != nil {
 				t.Fatalf("%q: %v", tc.line, err)
 			}
@@ -128,7 +128,7 @@ func TestRemoteRollbackInt32WrapNoRPC_4868(t *testing.T) {
 	for _, arg := range []string{"4294967296", "4294967297", "2147483648"} {
 		t.Run(arg, func(t *testing.T) {
 			fake := &rollbackRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchConfig("rollback " + arg); err == nil {
 				t.Fatalf("rollback %q returned nil; expected out-of-range rejection", arg)
 			}

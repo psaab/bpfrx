@@ -428,11 +428,18 @@ under the daemon's errgroup. Nothing else imports this package.
     netlink read fails, so the descriptor Help text names every read surface
     that increments it — global, zone, policy, and filter dataplane reads
     PLUS the kernel-nftables host-inbound read (#3463), not global-only, so
-    it matches this contract. The error-counter SAMPLE is emitted LAST in
-    `Collect` (`emitCounterReadErrors`), AFTER the global/zone/policy/filter
-    sub-collectors (and the pre-gate host-inbound collector) have run, so a
-    read failure in any of them is reflected in THIS scrape's value rather
-    than lagging one scrape behind (#3462). The per-filter collector also
+    it matches this contract. The error-counter SAMPLE is emitted via a
+    `defer c.emitCounterReadErrors(ch)` established at the TOP of `Collect`
+    (#5045), so it runs at function exit — AFTER the global/zone/policy/filter
+    sub-collectors (and the pre-gate host-inbound collector) have run — on
+    EVERY return path. A read failure in any collector is reflected in THIS
+    scrape's value rather than lagging one scrape behind (#3462). Crucially the
+    deferred emit also covers the `dp == nil || !dp.IsLoaded()` early return: a
+    config-only / degraded boot with a failing pre-gate nft read previously
+    skipped the only (post-gate) emit site and carried NEITHER the data series
+    NOR the error sample — a clean absence that broke the omit-plus-error
+    contract in exactly the degraded state the pre-gate collectors observe
+    (#5045). The per-filter collector also
     merges the userspace-dp helper-published `filter_term_counters` into
     `xpf_filter_hits_total` (the same `BuildFirewallFilterTermCounterIndex`
     the CLI/gRPC text paths use), so the canonical metrics path does not

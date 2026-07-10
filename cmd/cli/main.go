@@ -84,10 +84,10 @@ func main() {
 		client:        client,
 		hostname:      hostname,
 		username:      username,
-		configMode:    false,
 		clusterRole:   resp.ClusterRole,
 		clusterNodeID: resp.ClusterNodeId,
 	}
+	// configMode starts false (atomic.Bool zero value).
 
 	if *cmdFlag != "" {
 		c.startCmd()
@@ -124,7 +124,7 @@ func main() {
 			resp, err := c.client.Complete(ctx, &pb.CompleteRequest{
 				Line:       text,
 				Pos:        int32(len(text)),
-				ConfigMode: c.configMode,
+				ConfigMode: c.configMode.Load(),
 			})
 			if err != nil || len(resp.Candidates) == 0 {
 				fmt.Fprintln(c.rl.Stdout(), "  (no help available)")
@@ -139,7 +139,7 @@ func main() {
 				} else if strings.Contains(text, "|") {
 					desc = pipeFilterDescs[name]
 				} else {
-					desc = remoteLookupDesc(strings.Fields(text), name, c.configMode)
+					desc = remoteLookupDesc(strings.Fields(text), name, c.configMode.Load())
 				}
 				candidates[i] = cmdtree.Candidate{Name: name, Desc: desc}
 			}
@@ -162,29 +162,11 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
-	var lastInterrupt time.Time
-	go func() {
-		for range sigCh {
-			if c.cancelCmd() {
-				fmt.Fprintln(os.Stderr, "\n^C (command cancelled)")
-				continue
-			}
-			now := time.Now()
-			if now.Sub(lastInterrupt) < 2*time.Second {
-				if c.configMode {
-					_, _ = client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
-				}
-				os.Exit(0)
-			}
-			lastInterrupt = now
-			fmt.Fprintln(os.Stderr, "\n^C (press again within 2s to exit)")
-			rl.Refresh()
-		}
-	}()
+	go c.runSignalLoop(sigCh, client, rl.Refresh, func() { os.Exit(0) })
 	defer signal.Stop(sigCh)
 
 	for {
-		if c.configMode {
+		if c.configMode.Load() {
 			st, err := client.GetConfigModeStatus(context.Background(), &pb.GetConfigModeStatusRequest{})
 			if err == nil && st.ConfirmPending {
 				fmt.Println("[commit confirmed pending - issue 'commit' to confirm]")
@@ -197,10 +179,10 @@ func main() {
 				continue
 			}
 			if err == io.EOF {
-				if c.configMode {
-					c.configMode = false
+				if c.configMode.Load() {
+					c.configMode.Store(false)
 					c.editPath = nil
-					_, _ = client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
+					exitConfigureBounded(client)
 					rl.SetPrompt(c.operationalPrompt())
 					fmt.Println("\nExiting configuration mode")
 					continue
@@ -230,9 +212,71 @@ func main() {
 		}
 	}
 
-	if c.configMode {
-		_, _ = client.ExitConfigure(context.Background(), &pb.ExitConfigureRequest{})
+	if c.configMode.Load() {
+		exitConfigureBounded(client)
 	}
+}
+
+// exitConfigureTimeout bounds the ExitConfigure control RPC the CLI issues
+// when leaving configuration mode from a path that has no cancellable command
+// context: the SIGINT double-Ctrl-C handler, an EOF (Ctrl-D) at the prompt,
+// and the normal post-loop teardown. These previously used
+// context.Background(), so a wedged daemon could hang Ctrl-C cleanup or block
+// process exit indefinitely (#5053). A bounded context guarantees the CLI
+// still tears down and exits. Sized like the other CLI control RPCs.
+const exitConfigureTimeout = 5 * time.Second
+
+// exitConfigureBounded issues a best-effort ExitConfigure with a bounded
+// context so a hung daemon cannot wedge CLI teardown. The error is discarded:
+// this is cleanup on the way out and there is nothing left to recover.
+func exitConfigureBounded(client pb.BpfrxServiceClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), exitConfigureTimeout)
+	defer cancel()
+	_, _ = client.ExitConfigure(ctx, &pb.ExitConfigureRequest{})
+}
+
+// interruptWindow is the double-Ctrl-C window: a second interrupt within this
+// span of the first exits the CLI.
+const interruptWindow = 2 * time.Second
+
+// runSignalLoop is the body of the SIGINT goroutine, extracted from main so
+// tests can drive it with an injected channel (#5053). It processes interrupts
+// until sigCh is closed: a running command is cancelled; otherwise a first
+// Ctrl-C arms a 2s window and a second within it tears down. refresh redraws
+// the prompt (rl.Refresh in production; nil in tests). onExit terminates the
+// process (os.Exit(0) in production; a recorder in tests) — it is expected not
+// to return, so the loop stops after invoking it.
+func (c *ctl) runSignalLoop(sigCh <-chan os.Signal, client pb.BpfrxServiceClient, refresh func(), onExit func()) {
+	var lastInterrupt time.Time
+	for range sigCh {
+		if c.cancelCmd() {
+			fmt.Fprintln(os.Stderr, "\n^C (command cancelled)")
+			continue
+		}
+		now := time.Now()
+		if now.Sub(lastInterrupt) < interruptWindow {
+			c.exitOnInterrupt(client, onExit)
+			return
+		}
+		lastInterrupt = now
+		fmt.Fprintln(os.Stderr, "\n^C (press again within 2s to exit)")
+		if refresh != nil {
+			refresh()
+		}
+	}
+}
+
+// exitOnInterrupt performs the double-Ctrl-C teardown: if still in
+// configuration mode, release the daemon-side config lock with a bounded
+// ExitConfigure, then invoke onExit. configMode is read atomically because the
+// main loop mutates it concurrently; a racy read here let a Ctrl-C landing
+// during a configure/exit/EOF transition observe stale state and skip the
+// ExitConfigure cleanup (#5053).
+func (c *ctl) exitOnInterrupt(client pb.BpfrxServiceClient, onExit func()) {
+	if c.configMode.Load() {
+		exitConfigureBounded(client)
+	}
+	onExit()
 }
 
 // maxConfirmedMinutes bounds `commit confirmed <minutes>` (Junos range
