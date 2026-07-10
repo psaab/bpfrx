@@ -1,3 +1,28 @@
+## 2026-07-09 — #5006 ddns: Manager held m.mu across blocking RFC 2136 DNS UPDATE I/O — stalled Stats()/OwnedRecordViews()
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5006 (Medium, telemetry stall). The DHCP dynamic-DNS
+  `Manager.ReconcileScoped` held `m.mu` for the whole pass — including the
+  blocking RFC 2136 DNS UPDATE wire I/O in `upsertLocked`
+  (`updater.UpsertLease`) and `deleteOwnedLocked` (`updater.DeleteLease`),
+  bounded only by the ~5s DDNS reconcile timeout. The telemetry/CLI readers
+  `Stats()` and `OwnedRecordViews()` take `m.mu.Lock()`, so
+  `show system services dynamic-dns` and Prometheus scrapes blocked for the
+  full DNS exchange when the authoritative server was slow/offline. Mirrored
+  the sibling `SurfaceAManager.providerIO`: added a `Manager.providerIO`
+  helper that releases `m.mu` around the ONE wire call and re-acquires it
+  (panic-safe), and routed both `UpsertLease` and `DeleteLease` through it.
+  Safe because the daemon serializes reconcile passes (`ddnsReconcileInFlight`)
+  so no concurrent pass mutates `m.state` during the drop — only the read-only
+  telemetry callers, which is exactly what must be unblocked. The write-ahead
+  ownership intent is still persisted under the lock BEFORE the wire add and
+  the result recorded under the re-acquired lock AFTER it.
+  **File(s)**: pkg/ddns/manager.go, pkg/ddns/manager_lockio_5006_test.go
+  **Validation**: new `TestManagerLockNotHeldDuringUpsert` /
+  `TestManagerLockNotHeldDuringDelete` (fail-on-revert: reverting the
+  providerIO wrapping makes both HANG on the blocked reader and fire the 2s
+  t.Fatal — verified RED). `go build ./...`, `go vet ./pkg/ddns/`, and the full
+  `go test ./pkg/ddns/` suite are green.
 ## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
 
 - **Timestamp**: 2026-07-09
