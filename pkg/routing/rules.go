@@ -478,6 +478,18 @@ type PBRRule struct {
 	Dport    *PBRPortRange // destination-port range, nil = no dest-port selector
 	TableID  int           // target routing table
 	Instance string        // routing instance name (for logging)
+	// IifName scopes the kernel FBF ip rule to the Linux ingress interface the
+	// firewall filter is attached to (#5117). Junos filter-based-forwarding is
+	// bound to a specific interface-unit input filter, so a `then
+	// routing-instance` term only steers traffic INGRESSING that interface. The
+	// pre-#5117 mirror set no iif selector, so a slow-path (XDP_PASS) packet
+	// arriving on a DIFFERENT interface could match the rule and be steered into
+	// the wrong VRF (cross-WAN / tenant route-leak). This carries the resolved
+	// kernel ifname (e.g. "ge-0-0-0", "ge-0-0-0.50", a RETH member) so Apply
+	// emits FRA_IIFNAME and the rule matches ONLY that interface. It is never
+	// empty for a built rule: BuildPBRRules fails closed (drops the term +
+	// degrades) rather than installing a global iif-less rule.
+	IifName string
 }
 
 // PBRPortRange is a numeric [Lo,Hi] port range for the kernel FBF ip-rule
@@ -559,6 +571,19 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 		rule.Priority = prio
 		rule.Family = pbr.Family
 
+		// Scope the rule to the ingress interface the filter is attached to
+		// (#5117) so a slow-path packet on a different interface cannot match a
+		// global rule and be steered into the wrong VRF. BuildPBRRules guarantees
+		// IifName is non-empty (it fails closed otherwise), but guard anyway so a
+		// malformed rule never installs an unscoped (global) FRA-less rule.
+		if pbr.IifName == "" {
+			errs = append(errs, fmt.Errorf(
+				"PBR rule instance %s table %d has no ingress interface; refusing to "+
+					"install a global iif-less FBF rule (#5117)", pbr.Instance, pbr.TableID))
+			continue
+		}
+		rule.IifName = pbr.IifName
+
 		// Emit a tos selector iff the term actually matched a DSCP (#3430 H2).
 		if pbr.TOSSet {
 			rule.Tos = uint(pbr.TOS)
@@ -598,7 +623,8 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 			continue
 		}
 		slog.Info("PBR rule added",
-			"instance", pbr.Instance, "tos", pbr.TOS, "tos_set", pbr.TOSSet,
+			"instance", pbr.Instance, "iif", pbr.IifName,
+			"tos", pbr.TOS, "tos_set", pbr.TOSSet,
 			"src", pbr.Src, "dst", pbr.Dst, "ipproto", pbr.IPProto,
 			"sport", pbr.Sport.String(), "dport", pbr.Dport.String(),
 			"table", pbr.TableID)
@@ -647,11 +673,17 @@ func (p *pbrManager) clear() error {
 // program a global ip rule. Output-attached filters are not FBF and are
 // ignored.
 //
-// Each attached filter is expanded once regardless of how many interfaces
-// reference it: the resulting ip rules carry no incoming-interface selector
-// (a documented widening relative to per-interface Junos FBF — adding an iif
-// selector requires the kernel ifname mapping and is a separate change), so a
-// duplicate per attachment would be redundant.
+// Each rule is scoped to the Linux ingress interface the filter is attached to
+// (#5117): a filter bound to several interfaces is expanded once PER
+// (filter, interface) attachment, and every emitted rule carries an IifName
+// (FRA_IIFNAME) resolved via cfg.ResolveKernelIfName so it matches ONLY packets
+// ingressing that interface. This mirrors per-interface Junos FBF, where a
+// `then routing-instance` term only steers traffic ingressing the interface the
+// filter is attached to. The pre-#5117 mirror emitted one iif-less rule per
+// filter, so a slow-path (XDP_PASS) packet arriving on a DIFFERENT interface
+// could match the global rule and be steered into the wrong VRF. An attachment
+// whose ingress interface cannot be resolved fails CLOSED (the term is dropped
+// and the build degraded) rather than installing a global iif-less rule.
 //
 // Kernel-mirror support matrix (#3730). An `ip rule` can only express a subset
 // of a firewall-filter term's `from` predicates, so the mirror is exact for the
@@ -689,27 +721,43 @@ func BuildPBRRules(cfg *config.Config) ([]PBRRule, error) {
 		tableIDs[inst.Name] = inst.TableID
 	}
 
-	inetAttached, inet6Attached := collectAttachedInputFilters(&cfg.Interfaces)
+	inetAttached, inet6Attached := collectAttachedInputFilters(cfg)
 	pls := cfg.PolicyOptions.PrefixLists
 
 	var rules []PBRRule
 	var errs []error
-	build := func(names []string, filters map[string]*config.FirewallFilter, family int) {
-		for _, name := range names {
-			filter := filters[name]
+	build := func(atts []pbrAttachment, filters map[string]*config.FirewallFilter, family int) {
+		for _, att := range atts {
+			filter := filters[att.Filter]
 			if filter == nil {
 				// Dangling attachment (filter named on an interface but not
 				// defined). The strict commit gate rejects this
 				// (validateFilterAttachmentReferences / warn path); skip here.
 				continue
 			}
+			if att.Iif == "" {
+				// #5117: the ingress interface could not be resolved to a kernel
+				// ifname. Fail closed — installing a global iif-less rule would
+				// over-steer traffic on every interface into the target VRF. The
+				// userspace filter path still enforces the term exactly.
+				errs = append(errs, fmt.Errorf(
+					"PBR filter %s: cannot resolve the ingress interface for FBF "+
+						"scoping; steering for this attachment is dropped (fail-safe "+
+						"under-steer) rather than installing a global iif-less rule",
+					att.Filter))
+				continue
+			}
 			r, e := buildPBRFromFilter(filter, family, tableIDs, pls)
+			// Scope every rule this attachment produced to its ingress interface.
+			for i := range r {
+				r[i].IifName = att.Iif
+			}
 			rules = append(rules, r...)
 			errs = append(errs, e...)
 		}
 	}
-	build(sortedKeys(inetAttached), fw.FiltersInet, unix.AF_INET)
-	build(sortedKeys(inet6Attached), fw.FiltersInet6, unix.AF_INET6)
+	build(inetAttached, fw.FiltersInet, unix.AF_INET)
+	build(inet6Attached, fw.FiltersInet6, unix.AF_INET6)
 
 	// M3: truncate to the priority window and report the overflow rather than
 	// silently dropping later terms' steering.
@@ -763,16 +811,45 @@ func PBRBuildStats(cfg *config.Config) (installed, degraded int) {
 	return installed, degraded
 }
 
-// collectAttachedInputFilters returns the set of filter names attached as an
-// interface-unit INPUT filter, split by family. These are the only filters
-// whose `then routing-instance` terms take effect as Junos FBF (#3430 H1).
-func collectAttachedInputFilters(ifs *config.InterfacesConfig) (inet, inet6 map[string]struct{}) {
-	inet = make(map[string]struct{})
-	inet6 = make(map[string]struct{})
-	if ifs == nil {
-		return inet, inet6
+// pbrAttachment binds a firewall filter to the Linux ingress interface it is
+// attached to as an interface-unit input filter. Carrying the interface
+// identity (not just the filter name, #5117) lets BuildPBRRules scope each
+// kernel FBF ip rule to the interface the filter is bound to — matching
+// per-interface Junos FBF instead of steering matching traffic globally.
+type pbrAttachment struct {
+	Filter string // firewall filter name
+	Iif    string // Linux ingress ifname (e.g. "ge-0-0-0", "ge-0-0-0.50")
+}
+
+// collectAttachedInputFilters returns the ordered, de-duplicated set of
+// (filter, ingress-interface) attachments for interface-unit INPUT filters,
+// split by family. These are the only filters whose `then routing-instance`
+// terms take effect as Junos FBF (#3430 H1).
+//
+// Unlike the pre-#5117 collector (which returned filter NAMES only and so
+// deduplicated a filter attached to several interfaces into a single global
+// rule), this preserves the ingress interface each attachment binds to. The
+// kernel ifname is resolved canonically via cfg.ResolveKernelIfName — the same
+// Junos-ref → Linux-name mapping the rest of routing uses, so a unit-0 collapse
+// (ge-0/0/0 → ge-0-0-0), an 802.1Q VLAN unit (ge-0/0/0.50), and a RETH member
+// (reth0 → local physical member) all resolve consistently. Entries are
+// de-duplicated by (filter, iif) so the same filter on the same interface is
+// not double-counted, and the result is sorted (filter, then iif) so emitted
+// ip-rule priorities are stable across applies despite Go map-iteration order.
+func collectAttachedInputFilters(cfg *config.Config) (inet, inet6 []pbrAttachment) {
+	if cfg == nil {
+		return nil, nil
 	}
-	for _, ifc := range ifs.Interfaces {
+	seenV4 := make(map[pbrAttachment]struct{})
+	seenV6 := make(map[pbrAttachment]struct{})
+	add := func(seen map[pbrAttachment]struct{}, list *[]pbrAttachment, a pbrAttachment) {
+		if _, dup := seen[a]; dup {
+			return
+		}
+		seen[a] = struct{}{}
+		*list = append(*list, a)
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
 		}
@@ -780,26 +857,35 @@ func collectAttachedInputFilters(ifs *config.InterfacesConfig) (inet, inet6 map[
 			if unit == nil {
 				continue
 			}
+			if unit.FilterInputV4 == "" && unit.FilterInputV6 == "" {
+				continue
+			}
+			// Resolve the kernel ingress ifname for this interface-unit, matching
+			// how the filter binds (base / VLAN sub-interface / RETH member).
+			iif := cfg.ResolveKernelIfName(fmt.Sprintf("%s.%d", ifc.Name, unit.Number))
 			if unit.FilterInputV4 != "" {
-				inet[unit.FilterInputV4] = struct{}{}
+				add(seenV4, &inet, pbrAttachment{Filter: unit.FilterInputV4, Iif: iif})
 			}
 			if unit.FilterInputV6 != "" {
-				inet6[unit.FilterInputV6] = struct{}{}
+				add(seenV6, &inet6, pbrAttachment{Filter: unit.FilterInputV6, Iif: iif})
 			}
 		}
 	}
+	sortAttachments(inet)
+	sortAttachments(inet6)
 	return inet, inet6
 }
 
-// sortedKeys returns the map keys in deterministic (sorted) order so the
-// emitted ip-rule priorities are stable across applies.
-func sortedKeys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
+// sortAttachments orders attachments deterministically (filter name, then
+// ingress ifname) so the emitted ip-rule priorities are stable across applies
+// regardless of Go map-iteration order.
+func sortAttachments(atts []pbrAttachment) {
+	sort.Slice(atts, func(i, j int) bool {
+		if atts[i].Filter != atts[j].Filter {
+			return atts[i].Filter < atts[j].Filter
+		}
+		return atts[i].Iif < atts[j].Iif
+	})
 }
 
 // buildPBRFromFilter extracts PBR rules from a single firewall filter.
@@ -821,11 +907,11 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		// userspace-dp/src/afxdp/forwarding/mod.rs) returns RouteOverride::Drop for
 		// such a term (#4392). The kernel `ip rule` mirror must match that
 		// disposition — building a steering rule here would fail OPEN, steering
-		// slow-path / XDP_PASS / unfiltered-interface traffic (the ip rule is
-		// global, no iif selector) into the target VRF that userspace drops. The
-		// strict commit gate (validateFilterRoutingInstanceConflictStrict) rejects
-		// this term, but is LENIENT on load / peer-sync (#1960 no-brick), so a
-		// contradictory term can still reach here — skip it (do NOT steer).
+		// slow-path / XDP_PASS traffic ingressing the attached interface (even
+		// with the #5117 iif selector) into the target VRF that userspace drops.
+		// The strict commit gate (validateFilterRoutingInstanceConflictStrict)
+		// rejects this term, but is LENIENT on load / peer-sync (#1960 no-brick),
+		// so a contradictory term can still reach here — skip it (do NOT steer).
 		if term.Action == "discard" || term.Action == "reject" {
 			errs = append(errs, fmt.Errorf(
 				"PBR filter %s term %s co-locates routing-instance %q with a terminating "+
@@ -948,9 +1034,11 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		hasL4 := len(protos) > 0 || len(sports) > 0 || len(dports) > 0
 		if !hasDSCP && !srcConstrained && !dstConstrained && !hasL4 {
 			// A truly unconstrained `then routing-instance` term (no dscp, no
-			// address, no L4) would program `from all to all lookup <vr>`, which —
-			// the mirror has no iif selector (H03) — steers ALL traffic globally.
-			// Skip it (fail-safe under-steer), matching the pre-#3730 behavior.
+			// address, no L4) would program `from all to all iif <if> lookup <vr>`.
+			// Even with the #5117 iif selector scoping it to the attached
+			// interface, xpf conservatively declines to emit an interface-wide
+			// catch-all steer here (fail-safe under-steer), matching the pre-#3730
+			// behavior; the userspace filter path still enforces the term exactly.
 			slog.Warn("PBR: filter term has routing-instance but no ip-rule-compatible criteria (dscp, address, protocol, port)",
 				"filter", filter.Name, "term", term.Name)
 			continue

@@ -362,6 +362,13 @@ How it lands (the `instance-type forwarding` divergence fix):
   and marks the build degraded rather than widening a constrained term
   to an address-only rule that would steer traffic the operator
   excluded. The userspace fast path still enforces the term exactly.
+  Each `ip rule` is also scoped to the ingress interface the steering
+  filter is attached to via `IifName`/`FRA_IIFNAME` (#5117) — a filter
+  bound to `reth1 unit 0` only steers traffic ingressing `reth1`, so a
+  slow-path (`XDP_PASS`) packet arriving on a different interface cannot
+  match the rule and be mis-steered into the wrong uplink's VRF. A filter
+  attached to several interfaces expands to one iif-scoped rule per
+  interface rather than a single global rule.
 - **PBR build-health metrics (#4422)**: `xpf_pbr_rules_installed`
   gauges the number of kernel `ip rule` FBF entries the active config
   yields (the desired-install set), and `xpf_pbr_degraded_terms` gauges

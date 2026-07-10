@@ -695,9 +695,9 @@ func TestPBRRulesApply_Fake(t *testing.T) {
 	p := &pbrManager{ops: ops}
 
 	rules := []PBRRule{
-		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a"},
-		{Family: unix.AF_INET6, Src: "2001:db8::/32", TableID: 100, Instance: "vr-a"},
-		{Family: unix.AF_INET, Dst: "10.5.0.0/16", TableID: 101, Instance: "vr-b"},
+		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
+		{Family: unix.AF_INET6, Src: "2001:db8::/32", TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
+		{Family: unix.AF_INET, Dst: "10.5.0.0/16", TableID: 101, Instance: "vr-b", IifName: "ge-0-0-1"},
 	}
 
 	if err := p.Apply(rules); err != nil {
@@ -723,6 +723,44 @@ func TestPBRRulesApply_Fake(t *testing.T) {
 	}
 }
 
+// TestPBRApplyScopesRuleToIif verifies pbrManager.Apply stamps the ingress
+// interface onto the installed netlink rule (FRA_IIFNAME, #5117): a PBRRule
+// carrying an IifName becomes an ip rule scoped to that interface, and a rule
+// with no IifName is REFUSED (never installed as a global iif-less rule).
+func TestPBRApplyScopesRuleToIif(t *testing.T) {
+	t.Run("iif is programmed onto the rule", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		p := &pbrManager{ops: ops}
+		rules := []PBRRule{
+			{Family: unix.AF_INET, Src: "10.0.1.0/24", TableID: 101, Instance: "ATT", IifName: "ge-0-0-0"},
+		}
+		if err := p.Apply(rules); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		if ops.count(unix.AF_INET) != 1 {
+			t.Fatalf("expected 1 installed rule, got %d", ops.count(unix.AF_INET))
+		}
+		if got := ops.rules[unix.AF_INET][0].IifName; got != "ge-0-0-0" {
+			t.Errorf("installed rule IifName = %q, want %q (must scope to the ingress interface)", got, "ge-0-0-0")
+		}
+	})
+
+	t.Run("empty iif is refused, not installed globally", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		p := &pbrManager{ops: ops}
+		rules := []PBRRule{
+			{Family: unix.AF_INET, Src: "10.0.1.0/24", TableID: 101, Instance: "ATT"}, // no IifName
+		}
+		err := p.Apply(rules)
+		if err == nil {
+			t.Fatal("Apply must return non-nil for a rule with no ingress interface (#5117 fail-closed)")
+		}
+		if ops.count(unix.AF_INET) != 0 {
+			t.Errorf("no global iif-less rule may be installed, got %d", ops.count(unix.AF_INET))
+		}
+	})
+}
+
 // TestPBRApplyAggregatesAddErrors verifies that pbrManager.Apply surfaces a
 // RuleAdd failure (#3430 H3) instead of swallowing it and reporting success
 // after the up-front clear already removed the previously-working steering.
@@ -732,7 +770,7 @@ func TestPBRApplyAggregatesAddErrors(t *testing.T) {
 	p := &pbrManager{ops: ops}
 
 	rules := []PBRRule{
-		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a"},
+		{Family: unix.AF_INET, TOS: 46 << 2, TOSSet: true, TableID: 100, Instance: "vr-a", IifName: "ge-0-0-0"},
 	}
 	err := p.Apply(rules)
 	if err == nil {
@@ -750,7 +788,7 @@ func TestPBRApplyCapBoundary(t *testing.T) {
 	mk := func(n int) []PBRRule {
 		out := make([]PBRRule, n)
 		for i := range out {
-			out[i] = PBRRule{Family: unix.AF_INET, Src: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256), TableID: 100, Instance: "vr"}
+			out[i] = PBRRule{Family: unix.AF_INET, Src: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256), TableID: 100, Instance: "vr", IifName: "ge-0-0-0"}
 		}
 		return out
 	}
@@ -794,7 +832,7 @@ func TestPBRApplyClearDelFailureSurfaced(t *testing.T) {
 	// cleared. Pre-fix the clear() RuleDel failure was debug-logged only and
 	// Apply returned nil.
 	rules := []PBRRule{
-		{Family: unix.AF_INET, Src: "10.7.0.0/16", TableID: 101, Instance: "vr-b"},
+		{Family: unix.AF_INET, Src: "10.7.0.0/16", TableID: 101, Instance: "vr-b", IifName: "ge-0-0-0"},
 	}
 	if err := p.Apply(rules); err == nil {
 		t.Fatal("Apply must return non-nil when a stale rule cannot be cleared (#3430 H3)")
