@@ -492,9 +492,28 @@ func ResolveFilterPrefixListAddrs(
 			// the tolerant path it is a warning and we contribute no prefixes
 			// for it — but the direction stays `constrained` (set above), so the
 			// matcher fails closed rather than matching any.
+			//
+			// #5097: still record the reference's POLARITY before skipping it.
+			// An unresolved `except` ref contributes no prefixes but MUST set
+			// hasExcept so a SOLE unresolved except lowers to the empty-set
+			// complement (nil, true, true) = "match every address NOT in {}" =
+			// match ALL, exactly like the resolved-but-empty except case below.
+			// The pre-#5097 `continue` skipped this before the ref.Except check,
+			// so hasExcept stayed false and a sole unresolved except collapsed to
+			// (nil, false, true) = match NOTHING — which turned a `discard`/
+			// `reject` term into a no-op on the tolerant/peer-sync path (the deny
+			// matched no packet and traffic fell through to a later permit), a
+			// fail-OPEN for the deny it was written to enforce. Recording
+			// hasExcept keeps the empty except set matching broadly (fail
+			// CLOSED). A positive ref stays unrecorded: an unresolved positive
+			// scope correctly lowers to (nil, false, true) = match NOTHING, which
+			// is already fail-closed for positive membership.
 			slog.Warn("firewall filter prefix-list reference unresolved",
 				"filter", filterName, "term", termName, "direction", direction,
 				"prefix-list", ref.Name)
+			if ref.Except {
+				hasExcept = true
+			}
 			continue
 		}
 		if ref.Except {
