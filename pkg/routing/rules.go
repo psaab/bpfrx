@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -192,13 +193,43 @@ func (n *nextTableManager) clear() error {
 		for _, r := range rules {
 			if r.Priority >= nextTableRulePriority && r.Priority < nextTableRulePriority+100 {
 				if err := n.ops.RuleDel(&r); err != nil {
-					slog.Debug("failed to delete stale next-table rule",
+					if isRuleAlreadyGone(err) {
+						// The rule is already absent (ENOENT / no such
+						// rule) — a delete of a rule that is not there IS
+						// the desired end-state, not a failure. Log for
+						// diagnostics but do NOT aggregate so an idempotent
+						// re-clear does not spuriously fail the apply.
+						slog.Debug("stale next-table rule already absent",
+							"priority", r.Priority, "err", err)
+						continue
+					}
+					// #5118: a real RuleDel failure leaves a STALE next-table
+					// route-leak rule in the kernel. That rule is an active
+					// cross-VRF forwarding instruction sitting BEFORE the main
+					// table, so a silent success here would preserve an
+					// inter-VRF leak after a "successful" commit. Aggregate the
+					// error (mirroring pbrManager.clear) so Apply — and the
+					// daemon apply loop — observe the divergence instead of nil.
+					slog.Warn("failed to delete stale next-table rule",
 						"priority", r.Priority, "err", err)
+					errs = append(errs, fmt.Errorf(
+						"delete stale next-table rule prio %d: %w", r.Priority, err))
 				}
 			}
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// isRuleAlreadyGone reports whether a RuleDel error means the rule was
+// already absent (ENOENT / "no such rule"). The next-table and rib-group
+// clear() passes list-then-delete, so the kernel returning ENOENT means the
+// rule vanished between the dump and the delete (e.g. a concurrent flush or
+// an idempotent re-clear). Deleting an already-gone rule reaches the desired
+// end-state, so this MUST NOT be aggregated as an apply failure; only a rule
+// that exists but cannot be removed is a genuine stale-rule failure (#5118).
+func isRuleAlreadyGone(err error) bool {
+	return errors.Is(err, unix.ENOENT) || os.IsNotExist(err)
 }
 
 // ribGroupManager reconciles rib-group route-leak ip rules. Stateless
@@ -440,8 +471,23 @@ func (rg *ribGroupManager) clear() error {
 			inLegacy := r.Priority >= 200 && r.Priority < 300
 			if inCurrent || inOldBlanket || inLegacy {
 				if err := rg.ops.RuleDel(&r); err != nil {
-					slog.Debug("failed to delete stale rib-group rule",
+					if isRuleAlreadyGone(err) {
+						// Already absent — the desired end-state, not a
+						// failure. Log only; do not fail an idempotent
+						// re-clear (see isRuleAlreadyGone / #5118).
+						slog.Debug("stale rib-group rule already absent",
+							"priority", r.Priority, "err", err)
+						continue
+					}
+					// #5118: a real RuleDel failure leaves a STALE rib-group
+					// route-leak rule (a per-prefix connected-route leak that
+					// precedes the main table) in the kernel. Aggregate it so
+					// Apply surfaces the inter-VRF leak instead of reporting a
+					// silent success, mirroring pbrManager.clear.
+					slog.Warn("failed to delete stale rib-group rule",
 						"priority", r.Priority, "err", err)
+					errs = append(errs, fmt.Errorf(
+						"delete stale rib-group rule prio %d: %w", r.Priority, err))
 				}
 			}
 		}
