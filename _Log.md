@@ -45302,3 +45302,8 @@ top.
   it). #5237 disconnect-abort preserved. RED-on-revert proven for both.
 - **File(s)**: pkg/api/sessions.go, pkg/api/types.go,
   pkg/api/sessions_pagination_bound_5318_test.go, pkg/api/README.md, _Log.md
+
+## #4825 cmd/xpfd dispatch test coverage
+- **Timestamp**: 2026-07-10
+- **Action**: Extract testable top-level dispatch seam (classifyCommand) + upgrade->kernel route seam (upgradeArgsSelectKernel), add dispatch tests. Behavior-preserving; main() output byte-identical (verified vs origin/master binary across 11 dispatch paths).
+- **File(s)**: cmd/xpfd/main.go, cmd/xpfd/upgrade.go, cmd/xpfd/dispatch_test.go, cmd/xpfd/README.md

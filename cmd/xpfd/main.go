@@ -26,22 +26,85 @@ var (
 	commit    = "unknown"
 )
 
+// xpfdCommand identifies which top-level `xpfd` subcommand an argv selects.
+// cmdDaemon is the fall-through (no recognized subcommand: parse the daemon
+// flags and run); cmdUnknown is a non-flag first token that matches no known
+// subcommand (a hard usage error).
+type xpfdCommand int
+
+const (
+	cmdDaemon xpfdCommand = iota
+	cmdVersion
+	cmdProtocolVersions
+	cmdCleanup
+	cmdUpgrade
+	cmdSeedRuntime
+	cmdPublishGeneration
+	cmdVerifyDataplane
+	cmdCheckConfig
+	cmdUnknown
+)
+
+// classifyCommand maps a full argv (os.Args) to the top-level subcommand it
+// selects, WITHOUT executing any side effects. It is the single source of
+// truth for main()'s routing decision, extracted so that "which subcommand
+// runs for which argv" is unit-testable without os.Exit or the real
+// upgrade/cleanup/daemon side effects. It mirrors, in order, the first-token
+// checks main() historically performed:
+//
+//   - a recognized verb ("version", "cleanup", "upgrade", ...) selects that
+//     subcommand;
+//   - a non-empty, non-flag first token that matches no verb is cmdUnknown
+//     (rejected so a typo'd `xpfd show ...` never boots a second daemon);
+//   - anything else (no args, an empty first token, or a leading '-' flag)
+//     falls through to cmdDaemon.
+func classifyCommand(argv []string) xpfdCommand {
+	if len(argv) <= 1 {
+		return cmdDaemon
+	}
+	switch argv[1] {
+	case "version":
+		return cmdVersion
+	case "protocol-versions":
+		return cmdProtocolVersions
+	case "cleanup":
+		return cmdCleanup
+	case "upgrade":
+		return cmdUpgrade
+	case "seed-runtime":
+		return cmdSeedRuntime
+	case "publish-generation":
+		return cmdPublishGeneration
+	case "verify-dataplane":
+		return cmdVerifyDataplane
+	case "check-config":
+		return cmdCheckConfig
+	}
+	// Reject unknown positional arguments — prevents accidentally starting
+	// a second daemon when running "xpfd show ..." outside the CLI. Use the
+	// "cli" binary or run xpfd interactively for show/request/configure.
+	if argv[1] != "" && argv[1][0] != '-' {
+		return cmdUnknown
+	}
+	return cmdDaemon
+}
+
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "version" {
+	switch classifyCommand(os.Args) {
+	case cmdVersion:
 		fmt.Printf("xpfd %s (commit %s, built %s)\n", version, commit, buildTime)
 		return
-	}
 
-	// `xpfd protocol-versions` emits the compile-time HA / session-sync /
-	// config-DB version constants this binary embeds, machine-parseably
-	// (key=value lines). #1930 INC-3 LANE-2: the mixed-base image-replace gate
-	// reads these from the STAGED binary (unpacked from the new image, run on
-	// the deploy host) to decide — WITHOUT booting the image — whether the new
-	// image's HA/session-sync protocol is back-compatible with the still-running
-	// peer. Pairs with the bake version manifest (a file read where the binary
-	// can't be run, e.g. cross-arch). Keep keys stable: external tooling parses
-	// them.
-	if len(os.Args) > 1 && os.Args[1] == "protocol-versions" {
+	case cmdProtocolVersions:
+		// `xpfd protocol-versions` emits the compile-time HA / session-sync /
+		// config-DB version constants this binary embeds, machine-parseably
+		// (key=value lines). #1930 INC-3 LANE-2: the mixed-base image-replace gate
+		// reads these from the STAGED binary (unpacked from the new image, run on
+		// the deploy host) to decide — WITHOUT booting the image — whether the new
+		// image's HA/session-sync protocol is back-compatible with the still-running
+		// peer. Pairs with the bake version manifest (a file read where the binary
+		// can't be run, e.g. cross-arch). Keep keys stable: external tooling parses
+		// them.
 		fmt.Printf("xpf-version=%s\n", version)
 		fmt.Printf("ha-protocol-version=%d\n", cluster.CurrentHAProtocolVersion)
 		fmt.Printf("ha-protocol-min-compat=%d\n", cluster.MinCompatHAProtocolVersion)
@@ -52,9 +115,8 @@ func main() {
 		fmt.Printf("configdb-envelope-version=%d\n", configstore.EnvelopeFormatVersion)
 		fmt.Printf("configdb-min-reader-version=%d\n", configstore.EnvelopeMinReaderVersion)
 		return
-	}
 
-	if len(os.Args) > 1 && os.Args[1] == "cleanup" {
+	case cmdCleanup:
 		// #5322: cleanup takes NO flags or positional arguments; like #4869's
 		// `xpfd upgrade`, a stray operand (e.g. a typo'd path) is a hard usage
 		// error, not silently ignored while cleanup still GCs all pinned
@@ -90,52 +152,48 @@ func main() {
 		fm.Stop()
 		fmt.Println("all pinned BPF state and managed routes removed")
 		return
-	}
 
-	// #1917 increment B in-place upgrade cut-over. `xpfd upgrade` performs
-	// the verified, atomic, rollback-capable STOP->FLIP->START cut to the
-	// dpkg-staged version; `xpfd upgrade --rolling` drives a controlled
-	// per-node HA drain so a cluster stays forwarding. Invoked from the
-	// .deb postinst (standalone) and by the operator / dogfood driver.
-	if len(os.Args) > 1 && os.Args[1] == "upgrade" {
+	case cmdUpgrade:
+		// #1917 increment B in-place upgrade cut-over. `xpfd upgrade` performs
+		// the verified, atomic, rollback-capable STOP->FLIP->START cut to the
+		// dpkg-staged version; `xpfd upgrade --rolling` drives a controlled
+		// per-node HA drain so a cluster stays forwarding. Invoked from the
+		// .deb postinst (standalone) and by the operator / dogfood driver.
 		runUpgradeSubcommand(os.Args[2:])
 		return
-	}
 
-	// #1964 mechanism A: `xpfd seed-runtime` seeds the versioned runtime
-	// layout on FIRST `.deb` install. The postinst runs this on first
-	// install ($2 empty) AFTER unpack but BEFORE #DEBHELPER# starts the
-	// unit: it copies staged/* into versions/<v>/, sets versions/current ->
-	// <v>, and repoints /usr/local/sbin/* through versions/current — giving
-	// every appliance a real, immutable rollback target before the first
-	// in-place upgrade can ever STOP the daemon. No cut/verify/stop here.
-	// Idempotent: a re-run (apt re-running the postinst) converges to the
-	// same fully-seeded state.
-	if len(os.Args) > 1 && os.Args[1] == "seed-runtime" {
+	case cmdSeedRuntime:
+		// #1964 mechanism A: `xpfd seed-runtime` seeds the versioned runtime
+		// layout on FIRST `.deb` install. The postinst runs this on first
+		// install ($2 empty) AFTER unpack but BEFORE #DEBHELPER# starts the
+		// unit: it copies staged/* into versions/<v>/, sets versions/current ->
+		// <v>, and repoints /usr/local/sbin/* through versions/current — giving
+		// every appliance a real, immutable rollback target before the first
+		// in-place upgrade can ever STOP the daemon. No cut/verify/stop here.
+		// Idempotent: a re-run (apt re-running the postinst) converges to the
+		// same fully-seeded state.
 		runSeedRuntimeSubcommand(os.Args[2:])
 		return
-	}
 
-	// #1981 Option B: `xpfd publish-generation` copies the dpkg-staged binary
-	// set into an immutable staged-gen/<genid>/ and repoints current-gen, so a
-	// later cut reads a whole, single-generation source dpkg is not rewriting
-	// (closing the dpkg-unpack vs operator-cut torn-read race). The postinst
-	// runs it after a complete unpack before the cut; an operator runs it as
-	// the deferred-publish recovery verb (when the postinst deferred the
-	// publish because the upgrade lock was busy) before `xpfd upgrade`.
-	if len(os.Args) > 1 && os.Args[1] == "publish-generation" {
+	case cmdPublishGeneration:
+		// #1981 Option B: `xpfd publish-generation` copies the dpkg-staged binary
+		// set into an immutable staged-gen/<genid>/ and repoints current-gen, so a
+		// later cut reads a whole, single-generation source dpkg is not rewriting
+		// (closing the dpkg-unpack vs operator-cut torn-read race). The postinst
+		// runs it after a complete unpack before the cut; an operator runs it as
+		// the deferred-publish recovery verb (when the postinst deferred the
+		// publish because the upgrade lock was busy) before `xpfd upgrade`.
 		runPublishGenerationSubcommand(os.Args[2:])
 		return
-	}
 
-	// #1864 deploy-time pre-flight: run the kernel BPF verifier against
-	// the shim object EMBEDDED IN THIS BINARY without touching any
-	// production state (anonymous maps, no pins, no attach, nothing
-	// detached — a running daemon's loaded program keeps forwarding).
-	// Deploy tooling pushes the NEW binary to a temp path and runs
-	// this BEFORE stopping the old daemon; a REJECT refuses the deploy
-	// instead of killing the dataplane (the 2026-06-10 incident shape).
-	if len(os.Args) > 1 && os.Args[1] == "verify-dataplane" {
+	case cmdVerifyDataplane:
+		// #1864 deploy-time pre-flight: run the kernel BPF verifier against
+		// the shim object EMBEDDED IN THIS BINARY without touching any
+		// production state (anonymous maps, no pins, no attach, nothing
+		// detached — a running daemon's loaded program keeps forwarding).
+		// Deploy tooling pushes the NEW binary to a temp path and runs
+		// this BEFORE stopping the old daemon; a REJECT refuses the deploy
+		// instead of killing the dataplane (the 2026-06-10 incident shape).
 		if err := dataplane.VerifyEmbeddedUserspaceShim(); err != nil {
 			if errors.Is(err, dataplane.ErrUserspaceShimVerifierReject) {
 				fmt.Printf("REJECT embedded userspace shim\n%v\n", err)
@@ -146,18 +204,18 @@ func main() {
 		}
 		fmt.Println("PASS embedded userspace shim (verifier accepted; no production state touched)")
 		return
-	}
 
-	// #1879 day-0 validation gate: run the REAL strict commit-check
-	// pipeline (parse → typed-leaf SchemaValidate on the expanded tree →
-	// strict compile; configstore.CheckText) against a config file
-	// without touching any daemon, store, or dataplane state. The
-	// first-boot config-drive loader (scripts/image/xpf-day0-config)
-	// validates the untrusted day-0 config with this BEFORE installing
-	// it as /etc/xpf/xpf.conf. Exit codes mirror verify-dataplane's
-	// shape: 0 PASS, 2 config rejected, 1 other error (unreadable file,
-	// oversize, bad flags).
-	if len(os.Args) > 1 && os.Args[1] == "check-config" {
+	case cmdCheckConfig:
+		// #1879 day-0 validation gate: run the REAL strict commit-check
+		// pipeline (parse → typed-leaf SchemaValidate on the expanded tree →
+		// strict compile; configstore.CheckText) against a config file
+		// without touching any daemon, store, or dataplane state. The
+		// first-boot config-drive loader (scripts/image/xpf-day0-config)
+		// validates the untrusted day-0 config with this BEFORE installing
+		// it as /etc/xpf/xpf.conf. Exit codes mirror verify-dataplane's
+		// shape: 0 PASS, 2 config rejected, 1 other error (unreadable file,
+		// oversize, bad flags).
+		//
 		// ContinueOnError, not ExitOnError: the flag package exits
 		// with status 2 on a bad flag, which would collide with this
 		// subcommand's "2 = config rejected" contract that the day-0
@@ -236,17 +294,14 @@ func main() {
 		}
 		fmt.Printf("PASS %s (strict commit-check: parse + schema + compile + device-map preflight)\n", path)
 		return
-	}
 
-	// Reject unknown positional arguments — prevents accidentally starting
-	// a second daemon when running "xpfd show ..." outside the CLI.
-	// Use the "cli" binary or run xpfd interactively for show/request/configure.
-	if len(os.Args) > 1 && os.Args[1] != "" && os.Args[1][0] != '-' {
+	case cmdUnknown:
 		fmt.Fprintf(os.Stderr, "xpfd: unknown command %q\n", os.Args[1])
 		fmt.Fprintf(os.Stderr, "  use the 'cli' binary for remote commands, or run xpfd on a TTY\n")
 		os.Exit(1)
 	}
 
+	// cmdDaemon: no recognized subcommand — parse the daemon flags and run.
 	configFile := flag.String("config", "/etc/xpf/xpf.conf", "configuration file path")
 	noDataplane := flag.Bool("no-dataplane", false, "run without a dataplane (config-only mode)")
 	apiAddr := flag.String("api-addr", "127.0.0.1:8080", "HTTP API listen address (empty to disable)")

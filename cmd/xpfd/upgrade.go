@@ -28,7 +28,7 @@ import (
 func runUpgradeSubcommand(args []string) {
 	// #1930: `xpfd upgrade kernel ...` is the LANE-1 verify-gated in-place
 	// kernel channel (a distinct sub-verb from the #1917 binary cut-over).
-	if len(args) > 0 && args[0] == "kernel" {
+	if upgradeArgsSelectKernel(args) {
 		runUpgradeKernelSubcommand(args[1:])
 		return
 	}
@@ -78,6 +78,16 @@ func runUpgradeSubcommand(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println("upgrade complete")
+}
+
+// upgradeArgsSelectKernel reports whether `xpfd upgrade <args...>` routes to the
+// #1930 `upgrade kernel` sub-verb (verify-gated in-place kernel channel) rather
+// than the #1917 binary cut-over. The kernel route is selected iff the first
+// operand is exactly "kernel". Extracted so the second-level dispatch decision
+// is unit-testable without the os.Exit / real-runner side effects of
+// runUpgradeSubcommand.
+func upgradeArgsSelectKernel(args []string) bool {
+	return len(args) > 0 && args[0] == "kernel"
 }
 
 // newUpgradeConfig assembles the upgrade Runner Config, WIRING the post-cut

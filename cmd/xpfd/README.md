@@ -10,6 +10,18 @@ and exposes gRPC + HTTP REST + an interactive CLI.
 `daemon.New(opts)`. The daemon instance assembles every subsystem
 manager from `pkg/*` and runs them under an errgroup.
 
+`main()` first routes on `classifyCommand(os.Args)` — the pure,
+side-effect-free SSOT for the top-level subcommand decision (which
+subcommand runs for a given argv; `cmdDaemon` is the fall-through that
+parses the daemon flags). `xpfd upgrade` then routes on
+`upgradeArgsSelectKernel` (binary cut-over vs `upgrade kernel`). Both
+routing decisions and every subcommand arg parser
+(`parseUpgradeArgs`, `parseSeedRuntimeArgs`,
+`parsePublishGenerationArgs`, `parseCleanupArgs`,
+`validateKernelVerbArgs`) are unit-testable without `os.Exit` or the
+real upgrade/cleanup side effects (`dispatch_test.go`,
+`upgrade_args_4869_test.go`, `leftover_args_5322_test.go`).
+
 ## Flags
 
 - `-config` — config file path. Default `/etc/xpf/xpf.conf`.
