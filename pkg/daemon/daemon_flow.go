@@ -22,6 +22,26 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// mgmtVRFIfaceSet returns the currently-published management-VRF interface
+// set (nil before the first apply). The returned map is immutable — the apply
+// path publishes a fresh map wholesale via publishMgmtVRFIfaces and never
+// mutates it in place — so callers read it lock-free. See the
+// mgmtVRFInterfaces field doc (daemon.go) for the #5113 concurrency contract.
+func (d *Daemon) mgmtVRFIfaceSet() map[string]bool {
+	if p := d.mgmtVRFInterfaces.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// publishMgmtVRFIfaces atomically publishes m as the management-VRF interface
+// set. Called only from the apply path under applySem; the atomic Store makes
+// the field publication safe for the lock-free DHCP-callback readers (#5113).
+// m must be treated as immutable after this call.
+func (d *Daemon) publishMgmtVRFIfaces(m map[string]bool) {
+	d.mgmtVRFInterfaces.Store(&m)
+}
+
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
 // Interfaces bound to the management VRF are excluded — their routes are
 // programmed directly via netlink into the VRF table by applyMgmtVRFRoutes.
@@ -29,9 +49,10 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 	if d.dhcp == nil {
 		return nil
 	}
+	mgmtSet := d.mgmtVRFIfaceSet()
 	var routes []frr.DHCPRoute
 	for _, lease := range d.dhcp.Leases() {
-		if d.mgmtVRFInterfaces[lease.Interface] {
+		if mgmtSet[lease.Interface] {
 			continue
 		}
 		isIPv6 := lease.Family == dhcp.AFInet6
@@ -61,7 +82,8 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 // for DHCP leases on management interfaces (fxp*, fab*). These routes are
 // managed via netlink (not FRR) because FRR doesn't own the management VRF.
 func (d *Daemon) applyMgmtVRFRoutes() {
-	if d.dhcp == nil || len(d.mgmtVRFInterfaces) == 0 {
+	mgmtSet := d.mgmtVRFIfaceSet()
+	if d.dhcp == nil || len(mgmtSet) == 0 {
 		return
 	}
 	const mgmtTableID = 999
@@ -73,7 +95,7 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 	defer nlh.Close()
 
 	for _, lease := range d.dhcp.Leases() {
-		if !d.mgmtVRFInterfaces[lease.Interface] {
+		if !mgmtSet[lease.Interface] {
 			continue
 		}
 		// A lease may carry a default gateway (option 3 or the option-121

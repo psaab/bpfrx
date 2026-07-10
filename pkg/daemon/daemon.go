@@ -384,7 +384,17 @@ type Daemon struct {
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
-	mgmtVRFInterfaces map[string]bool
+	//
+	// Concurrency (#5113): the apply path publishes a fresh map on each commit
+	// under applySem, but the DHCP-manager lease-change callback
+	// (onDHCPAddressChange) reads it WITHOUT applySem — an unsynchronized
+	// concurrent map-pointer read/write (a real Go data race). The published
+	// maps are immutable (replaced wholesale, never mutated in place), so the
+	// field is an atomic.Pointer: apply publishes with a single Store (see
+	// publishMgmtVRFIfaces) and every reader Loads a consistent snapshot
+	// lock-free (see mgmtVRFIfaceSet). Load may return nil before the first
+	// publish — readers treat that as "no mgmt VRF interfaces yet".
+	mgmtVRFInterfaces atomic.Pointer[map[string]bool]
 
 	// rgStates tracks the unified cluster + VRRP state for each
 	// redundancy group. Both watchClusterEvents and watchVRRPEvents

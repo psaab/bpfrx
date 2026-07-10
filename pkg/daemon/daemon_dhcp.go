@@ -192,8 +192,11 @@ func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
 	if d.dhcp != nil && len(d.dhcp.DelegatedPrefixesForRA()) > 0 {
 		return true
 	}
-	// If management VRF bindings are unavailable, stay conservative.
-	if len(d.mgmtVRFInterfaces) == 0 {
+	// If management VRF bindings are unavailable, stay conservative. Read a
+	// single lock-free snapshot (#5113) so the whole classification runs
+	// against one consistent map, never a torn/nil-transient publication.
+	mgmtSet := d.mgmtVRFIfaceSet()
+	if len(mgmtSet) == 0 {
 		return true
 	}
 	for ifName, ifc := range cfg.Interfaces.Interfaces {
@@ -204,7 +207,7 @@ func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
 			if unit == nil || (!unit.DHCP && !unit.DHCPv6) {
 				continue
 			}
-			if !d.mgmtVRFInterfaces[config.DHCPLeaseIfName(ifName, unit)] {
+			if !mgmtSet[config.DHCPLeaseIfName(ifName, unit)] {
 				return true
 			}
 		}

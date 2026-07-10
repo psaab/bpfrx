@@ -7,11 +7,8 @@ import (
 )
 
 func TestDHCPLeaseChangeRequiresRecompile_ManagementOnlyDHCP(t *testing.T) {
-	d := &Daemon{
-		mgmtVRFInterfaces: map[string]bool{
-			"fxp0": true,
-		},
-	}
+	d := &Daemon{}
+	d.publishMgmtVRFIfaces(map[string]bool{"fxp0": true})
 	cfg := &config.Config{
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{
@@ -31,11 +28,8 @@ func TestDHCPLeaseChangeRequiresRecompile_ManagementOnlyDHCP(t *testing.T) {
 }
 
 func TestDHCPLeaseChangeRequiresRecompile_NonManagementDHCP(t *testing.T) {
-	d := &Daemon{
-		mgmtVRFInterfaces: map[string]bool{
-			"fxp0": true,
-		},
-	}
+	d := &Daemon{}
+	d.publishMgmtVRFIfaces(map[string]bool{"fxp0": true})
 	cfg := &config.Config{
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{
