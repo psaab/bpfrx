@@ -441,6 +441,17 @@ func (a *LegacyDataPlaneAdapter) SetDeferWorkers(v bool) {
 	m.SetDeferWorkers(v)
 }
 
+// RecordDeferredWorkerArmDebt forwards the #5134 deferred-MAC worker-arm debt to
+// the underlying manager so the daemon can record it without swallowing the
+// failed re-apply error.
+func (a *LegacyDataPlaneAdapter) RecordDeferredWorkerArmDebt() {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return
+	}
+	m.RecordDeferredWorkerArmDebt()
+}
+
 func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() {
 	m, err := a.managerOrErr()
 	if err != nil {

@@ -18,6 +18,15 @@ func (c userspaceLinkController) SetDeferWorkers(v bool) {
 	}
 }
 
+// RecordDeferredWorkerArmDebt records the #5134 deferred-MAC worker-arm debt.
+// It is not part of the LinkController interface; the daemon reaches it via an
+// optional type assertion on d.dp.Link() (mirroring SetDeferWorkers).
+func (c userspaceLinkController) RecordDeferredWorkerArmDebt() {
+	if c.manager != nil {
+		c.manager.RecordDeferredWorkerArmDebt()
+	}
+}
+
 func (c userspaceLinkController) PrepareLinkCycle() {
 	if c.manager != nil {
 		c.manager.PrepareLinkCycle()

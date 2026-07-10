@@ -193,6 +193,19 @@ type Manager struct {
 	sessionMirrorErr    string
 	deferWorkers        bool // skip worker spawn until NotifyLinkCycle
 	xskBoundNotified    bool // OnXSKBound fired at most once
+	// pendingWorkerArm records "generation debt" from a deferred-MAC
+	// re-apply that failed to publish (#5134). After a live RETH
+	// virtual-MAC change with no link cycle, the first apply publishes a
+	// workerless DeferWorkers=true snapshot and the daemon issues a
+	// MANDATORY re-apply to arm the workers with the now-correct MAC. If
+	// that re-apply's apply_snapshot fails, the manager keeps the
+	// workerless snapshot as lastSnapshot/publishedSnapshot and the commit
+	// still reports success — a silent forwarding outage. The daemon records
+	// the debt here instead of swallowing the error; the status reconcile
+	// loop (retryDeferredWorkerArmLocked) then retries the DeferWorkers=false
+	// publish every tick until the workers bind, self-healing a transient
+	// helper / control-socket error.
+	pendingWorkerArm bool
 
 	lookupUserspaceCtrlForFailClosedHook userspaceCtrlLookupHook
 
