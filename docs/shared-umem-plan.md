@@ -146,6 +146,27 @@ visible but non-blocking. Operators should not need to keep
 Live runtime capability and post-bind zero-copy validation decide whether a
 group is used.
 
+Because the artifact is audit-only, the config compiler treats
+`system dataplane shared-umem phase0-artifact-file` as follows (#5300):
+
+- The typed config carries only the operator-DECLARED artifact PATH, never the
+  node-local file's parsed contents. The identical committed tree therefore
+  compiles to the identical typed config on any node — a peer or a restarted
+  host that lacks or differs on the file still produces the same
+  same-tree->same-config result, preserving determinism and HA config replay.
+- The audit read is NON-GATING. A missing, unreadable, non-regular, oversized,
+  or malformed artifact becomes a commit WARNING, never a compile error, so a
+  committed config that references a node-local audit JSON always commits.
+- The audit read is NON-BLOCKING and bounded: it stats first and refuses any
+  non-regular file (directory, FIFO, socket, device), refuses an over-cap file
+  by its stat size, opens `O_NONBLOCK` as a TOCTOU backstop, and bounds the read
+  with a limited reader — a FIFO/device/huge/stalled file can never hang or OOM
+  the commit; it is treated as an audit miss (warn, continue).
+
+The audit read runs as a compile tail gate (`sharedUMEMAuditWarnings`), so the
+operator still gets the audit signal at commit/load, while the typed
+`SharedUMEMConfig` stays file-independent.
+
 The Phase 0 artifact must be machine-readable and include:
 
 - kernel release

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -815,11 +816,7 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 				cfg.PollMode = v
 			}
 		case "shared-umem":
-			shared, err := compileSharedUMEMConfig(child)
-			if err != nil {
-				return err
-			}
-			cfg.SharedUMEM = shared
+			cfg.SharedUMEM = compileSharedUMEMConfig(child)
 		case "rss-indirection":
 			// Defaults to enabled; only the string "disable" flips it off.
 			// Anything else (including "enable" and empty) leaves the
@@ -1039,7 +1036,14 @@ func userspaceRetiredKnobWarnings(cfg *Config) []string {
 	return warnings
 }
 
-func compileSharedUMEMConfig(node *Node) (*SharedUMEMConfig, error) {
+// compileSharedUMEMConfig compiles the `system dataplane shared-umem` stanza
+// into typed config. It is intentionally PURE (no file I/O): it records the
+// mode, the participating-interface filter, and the operator-DECLARED
+// phase0-artifact-file PATH only. The artifact's node-local contents are NEVER
+// embedded here — that node-local read happens non-fatally in
+// sharedUMEMAuditWarnings so the same committed tree compiles to the same typed
+// config on any node (#5300 determinism).
+func compileSharedUMEMConfig(node *Node) *SharedUMEMConfig {
 	cfg := &SharedUMEMConfig{}
 	for _, child := range node.Children {
 		switch child.Name() {
@@ -1050,22 +1054,44 @@ func compileSharedUMEMConfig(node *Node) (*SharedUMEMConfig, error) {
 				cfg.Interfaces = append(cfg.Interfaces, LinuxIfName(v))
 			}
 		case "phase0-artifact-file", "artifact-file":
-			path := nodeVal(child)
-			if path == "" {
-				continue
+			if path := nodeVal(child); path != "" {
+				cfg.Phase0ArtifactFile = path
 			}
-			artifact, err := readSharedUMEMPhase0Artifact(path)
-			if err != nil {
-				return nil, err
-			}
-			cfg.Phase0Artifact = artifact
 		}
 	}
-	return cfg, nil
+	return cfg
 }
 
-func readSharedUMEMPhase0Artifact(path string) (map[string]interface{}, error) {
-	file, err := os.Open(path)
+// readSharedUMEMPhase0ArtifactForAudit reads and validates the operator-declared
+// Phase 0 audit artifact for the AUDIT WARNING path only (#5300). It is
+// non-blocking and bounded so it can never hang or OOM a commit:
+//   - it stats first and refuses any non-regular file (directory, FIFO, socket,
+//     device) — an os.Open on a FIFO/device can block indefinitely;
+//   - it refuses an over-cap file by its stat size before opening;
+//   - it opens O_RDONLY|O_NONBLOCK (a no-op on a regular file) so a stat->open
+//     TOCTOU swap to a FIFO/device still cannot block; and
+//   - it bounds the read with a LimitReader.
+//
+// The returned artifact is used ONLY to derive an operator-visible audit
+// warning; it is never stored in the typed config, so it cannot affect
+// same-tree->same-config determinism. Every error return here is non-fatal at
+// the call site (sharedUMEMAuditWarnings turns it into a warning, not a compile
+// error).
+func readSharedUMEMPhase0ArtifactForAudit(path string) (map[string]interface{}, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read shared-umem artifact %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("read shared-umem artifact %s: not a regular file (mode %s)", path, info.Mode().Type())
+	}
+	if info.Size() > sharedUMEMPhase0ArtifactMaxBytes {
+		return nil, fmt.Errorf("read shared-umem artifact %s: exceeds %d bytes", path, sharedUMEMPhase0ArtifactMaxBytes)
+	}
+
+	// O_NONBLOCK guards a stat->open TOCTOU swap to a FIFO/device; on a regular
+	// file it has no effect.
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("read shared-umem artifact %s: %w", path, err)
 	}
@@ -1090,6 +1116,43 @@ func readSharedUMEMPhase0Artifact(path string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("decode shared-umem artifact %s: %w", path, err)
 	}
 	return artifact, nil
+}
+
+// sharedUMEMAuditWarnings performs the NON-BLOCKING, NON-GATING Phase 0 audit
+// read for the operator-declared shared-umem artifact (#5300). Per
+// docs/shared-umem-plan.md ("Phase 0: Repro and Audit Evidence") the artifact
+// is audit evidence only: it does not gate runtime shared-UMEM selection, so a
+// read failure must never fail the compile and must never change the typed
+// config. Running it as a tail gate keeps the operator audit signal at commit /
+// load while keeping the read off the typed-config path:
+//
+//   - unavailable / unreadable / non-regular / oversized / malformed -> one
+//     commit WARNING (visible but non-blocking); the commit still succeeds.
+//   - a machine-readable artifact whose "passed" field is explicitly false ->
+//     a WARNING surfacing that recorded result.
+//
+// Because it only appends to cfg.Warnings (a host-local diagnostic) and never
+// touches cfg.System.UserspaceDataplane.SharedUMEM, the same committed tree
+// still compiles to the identical typed config on a peer / after restart.
+func sharedUMEMAuditWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.System.UserspaceDataplane == nil ||
+		cfg.System.UserspaceDataplane.SharedUMEM == nil {
+		return nil
+	}
+	path := cfg.System.UserspaceDataplane.SharedUMEM.Phase0ArtifactFile
+	if path == "" {
+		return nil
+	}
+	artifact, err := readSharedUMEMPhase0ArtifactForAudit(path)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"system dataplane shared-umem phase0-artifact-file %s: audit artifact unavailable (%v); non-blocking, does not gate the commit or change the compiled config", path, err)}
+	}
+	if passed, ok := artifact["passed"].(bool); ok && !passed {
+		return []string{fmt.Sprintf(
+			"system dataplane shared-umem phase0-artifact-file %s: audit artifact records passed=false; shared-UMEM selection is decided at runtime by live bind validation, not this artifact", path)}
+	}
+	return nil
 }
 
 func normalizeSharedUMEMArtifactInterfaces(artifact map[string]interface{}) error {

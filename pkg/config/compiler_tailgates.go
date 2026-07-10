@@ -187,5 +187,15 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// advisory instead of silently doing nothing.
 	cfg.Warnings = append(cfg.Warnings, sshHardeningAdvisoryWarnings(cfg)...)
 
+	// #5300: the shared-umem Phase 0 audit artifact is audit evidence only
+	// (docs/shared-umem-plan.md) — it does NOT gate runtime shared-UMEM
+	// selection. The read is non-blocking (stat-first, refuses non-regular
+	// files, bounded) and NON-GATING: a missing / unreadable / malformed
+	// artifact on a peer or after a restart becomes a commit WARNING, never a
+	// compile error, and its content never enters the typed config, so the same
+	// committed tree compiles to the identical typed config on every node. It
+	// runs last because it is a pure advisory read that depends on no other gate.
+	cfg.Warnings = append(cfg.Warnings, sharedUMEMAuditWarnings(cfg)...)
+
 	return nil
 }
