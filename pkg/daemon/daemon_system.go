@@ -818,17 +818,35 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			continue // never create/modify root via config
 		}
 
+		// #5005 defense in depth: never format an unvalidated username into a
+		// root-privileged id/useradd/chown invocation. The strict commit-check
+		// rejects a crafted name (schema keyValidator, ValidateLoginUsername),
+		// but the tolerant load / peer-sync path downgrades that to a warning
+		// (#1960), so a leading-dash or otherwise unsafe name can still reach
+		// here. Skip it entirely — the same doctrine the sudoers writer already
+		// applies (reconcileSudoers/writeSudoersGrant, #4895). Combined with the
+		// `--` end-of-options separators below, this fails closed against option
+		// injection into the account/SSH-key writer.
+		if err := config.ValidateLoginUsername(user.Name, nil); err != nil {
+			slog.Warn("refusing to provision invalid login user name",
+				"user", user.Name, "err", err)
+			continue
+		}
+
 		// Check if user already exists. A non-zero exit means "user
 		// doesn't exist"; a timeout also lands here, in which case the
-		// useradd below fails with "already exists" and is logged.
-		_, err := runCommandTimeout("id", user.Name)
+		// useradd below fails with "already exists" and is logged. The `--`
+		// stops id treating a name as an option (#5005).
+		_, err := runCommandTimeout("id", "--", user.Name)
 		if err != nil {
 			// User doesn't exist — create it
 			args := []string{"-m", "-s", "/bin/bash"}
 			if user.UID > 0 {
 				args = append(args, "-u", fmt.Sprintf("%d", user.UID))
 			}
-			args = append(args, user.Name)
+			// `--` before the operand so a name is never parsed as a useradd
+			// option (#5005 option-injection defense).
+			args = append(args, "--", user.Name)
 			if out, err := runCommandTimeout("useradd", args...); err != nil {
 				slog.Warn("failed to create user",
 					"user", user.Name, "err", err, "output", string(out))
@@ -892,7 +910,8 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			// content then matches on reboot, the whole block (and the chown)
 			// would skip forever — never repairing the dir owner (Codex r2
 			// HIGH). Running it every apply closes that window.
-			if out, err := runCommandTimeout("chown", "-R", user.Name+":"+user.Name, sshDir); err != nil {
+			// `--` stops chown parsing "-name:-name" as options (#5005).
+			if out, err := runCommandTimeout("chown", "-R", "--", user.Name+":"+user.Name, sshDir); err != nil {
 				slog.Warn("failed to chown ssh dir",
 					"user", user.Name, "dir", sshDir,
 					"err", err, "output", strings.TrimSpace(string(out)))
