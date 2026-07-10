@@ -2948,7 +2948,18 @@ reserved for whole-dataplane selection where a rewrite shim
   conflict (e.g. a member-local `mtu` overrides the range `mtu`) while
   additive statements (addresses) accumulate. `member-range <a> to <b>`
   expands over the trailing decimal (endpoints must share a prefix; capped
-  at `interfaceRangeMaxMembers` to bound a typo). The pass handles BOTH AST
+  at `interfaceRangeMaxMembers` to bound a typo). The expansion loop
+  iterates on the bounded COUNT `k` in `0..(en-sn)` (< the cap) and forms
+  each name as `sn+k`, NOT on the raw endpoint `i` up to `en`: the endpoint
+  values come from `strconv.Atoi` (no typed-schema ceiling) and can sit at
+  `math.MaxInt64`, where a `for i := sn; i <= en; i++` loop overflowed —
+  `i++` at `MaxInt64` wrapped to `MinInt64`, `i <= en` stayed true, and the
+  loop appended forever (#5373 infinite loop / OOM, reachable at commit AND
+  on the tolerant / HA config-sync load path). Counting on `k` keeps the
+  loop variable small regardless of `en`'s magnitude while `sn+k` still
+  yields exactly `sn..en` (this is separate from the #4807 `en-sn+1`
+  capacity-overflow guard, which the `en-sn >= cap` check handles). The
+  pass handles BOTH AST
   shapes (flat-set replay packs the range name into each leaf's `Keys[0]`;
   the hierarchical parser packs it into the `interface-range` node's
   `Keys[1]`) and is a strict no-op — the tree is left byte-identical —
