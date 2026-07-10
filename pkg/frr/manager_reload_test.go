@@ -253,6 +253,84 @@ func TestApplyFullPropagatesDegraded(t *testing.T) {
 	}
 }
 
+// TestHardFailureFromHealthyStateArmsRetry pins #5109: a commit whose
+// FIRST reload HARD-fails (both frr-reload.py AND the additive vtysh -f
+// fallback fail) from a healthy, non-degraded state must mark the
+// generation degraded AND arm the retry loop — so live FRR, which kept
+// its previous config while frr.conf on disk holds the new section,
+// self-heals on the next reload instead of staying stale forever.
+//
+// This is the gap the sibling TestHardFailureReArmsRetry does NOT cover:
+// there the manager was ALREADY degraded (commit 1) before the hard
+// failure, so commitManagedSection's re-arm guard fired off the existing
+// degraded=true. Here there is no prior degraded state, so the fix must
+// live in noteReloadOutcomeLocked's default (hard-error) arm. Reverting
+// that arm leaves degraded=false with no episode → the test fails.
+func TestHardFailureFromHealthyStateArmsRetry(t *testing.T) {
+	// BOTH legs fail on EVERY call: frr-reload.py errors, and the vtysh
+	// -f fallback also errors, so reloadLocked returns a hard (non-
+	// degraded) error from the very first commit.
+	fake := &fakeExecutor{
+		frrReloadPyErr: errors.New("primary down"),
+		vtyshLoadErr:   errors.New("vtysh also down"),
+	}
+	// Hour-long delays: the episode must exist but need not fire for this
+	// assertion; t.Cleanup(m.Stop) reaps it.
+	m := newRetryTestManager(t, fake, []time.Duration{time.Hour}, time.Hour)
+
+	err := m.Clear()
+	if err == nil || errors.Is(err, ErrFRRReloadDegraded) {
+		t.Fatalf("Clear = %v, want a hard (non-degraded) reload failure", err)
+	}
+	if !m.ReloadDegraded() {
+		t.Fatalf("ReloadDegraded() = false after a hard failure from a healthy state — no retry debt armed")
+	}
+	m.retryMu.Lock()
+	live := m.retryDone != nil && m.retryCtx != nil && m.retryCtx.Err() == nil
+	m.retryMu.Unlock()
+	if !live {
+		t.Fatalf("no live retry episode after a hard-failing commit from a healthy state — hard-error arm missing")
+	}
+}
+
+// TestHardFailureFromHealthyStateSelfHeals proves the armed retry debt
+// actually converges: after a hard failure from a healthy state (both
+// legs fail), once the primary reload starts succeeding, the retry loop
+// re-runs it against the on-disk frr.conf and clears the degraded state
+// — the end-to-end self-heal the #5109 fix restores.
+func TestHardFailureFromHealthyStateSelfHeals(t *testing.T) {
+	fake := &fakeExecutor{
+		// vtysh -f keeps failing so the FIRST commit is a hard failure
+		// (never the additive-degraded path); the primary hard-fails on
+		// call 1 then recovers, so the degraded-retry loop (primary-only)
+		// can converge.
+		vtyshLoadErr: errors.New("vtysh down"),
+	}
+	fake.frrReloadPyHook = func(call int) error {
+		if call == 1 {
+			return errors.New("primary down") // commit 1: hard failure
+		}
+		return nil // retry: primary recovers
+	}
+	m := newRetryTestManager(t, fake,
+		[]time.Duration{time.Millisecond, time.Millisecond, time.Millisecond},
+		2*time.Millisecond)
+
+	err := m.Clear()
+	if err == nil || errors.Is(err, ErrFRRReloadDegraded) {
+		t.Fatalf("Clear = %v, want a hard (non-degraded) reload failure", err)
+	}
+	if !m.ReloadDegraded() {
+		t.Fatalf("ReloadDegraded() = false right after a hard failure — no retry debt armed")
+	}
+	waitFor(t, "hard-failure retry convergence", 2*time.Second, func() bool {
+		return !m.ReloadDegraded()
+	})
+	if calls := fake.reloadPyCalls(); calls < 2 {
+		t.Errorf("FrrReloadPy calls = %d, want >= 2 (commit + at least one retry)", calls)
+	}
+}
+
 // TestHardFailureReArmsRetry pins Codex code-r1 H1: a superseding
 // commit pre-cancels the degraded-retry episode, but if that commit
 // then HARD-fails (both reload legs), it has not superseded anything —
