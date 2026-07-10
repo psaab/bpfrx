@@ -6,6 +6,9 @@ import (
 	"math"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -131,9 +134,14 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {
 				cnt, err := telemetry.NATPortCounter(uint32(id))
-				if err == nil {
-					used64 = int64(cnt)
+				if err != nil {
+					// A counter read FAILURE must fail the RPC as unavailable,
+					// not return a healthy zero-usage pool (#5046, #3345
+					// counter-error contract, matching GetZones/GetPolicies).
+					return nil, status.Errorf(codes.Internal,
+						"NAT pool port counter read failed for pool %q: %v", name, err)
 				}
+				used64 = int64(cnt)
 			}
 		}
 
@@ -217,17 +225,22 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 	// Helper to read NAT rule counters. natType MUST match the type the
 	// compiler stamped (#2218): same-named source/destination/static rules use
 	// distinct counter IDs keyed by dataplane.NATCounterKey.
-	readCounter := func(natType, rsName, ruleName string) (uint64, uint64) {
+	//
+	// A counter READ FAILURE is returned as an error, not swallowed to (0,0):
+	// the RPC must fail as unavailable rather than render a telemetry-bridge
+	// failure as a healthy zero hit count (#5046, #3345 counter-error contract).
+	readCounter := func(natType, rsName, ruleName string) (uint64, uint64, error) {
 		if cr != nil {
 			ruleKey := dataplane.NATCounterKey(natType, rsName, ruleName)
 			if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 				cnt, err := telemetry.NATRuleCounter(uint32(cid))
-				if err == nil {
-					return cnt.Packets, cnt.Bytes
+				if err != nil {
+					return 0, 0, err
 				}
+				return cnt.Packets, cnt.Bytes, nil
 			}
 		}
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	// Source NAT rules (default when nat_type is empty or "source")
@@ -249,7 +262,11 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 				if rule.Match.DestinationAddress != "" {
 					dstMatch = rule.Match.DestinationAddress
 				}
-				hitPkts, hitBytes := readCounter(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
+				hitPkts, hitBytes, err := readCounter(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
+				if err != nil {
+					return nil, status.Errorf(codes.Internal,
+						"NAT rule counter read failed for %s/%s: %v", rs.Name, rule.Name, err)
+				}
 				resp.Rules = append(resp.Rules, &pb.NATRuleStats{
 					RuleSet:          rs.Name,
 					RuleName:         rule.Name,
@@ -284,7 +301,11 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 					if rule.Match.DestinationPort != 0 {
 						dstMatch += fmt.Sprintf(":%d", rule.Match.DestinationPort)
 					}
-					hitPkts, hitBytes := readCounter(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
+					hitPkts, hitBytes, err := readCounter(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
+					if err != nil {
+						return nil, status.Errorf(codes.Internal,
+							"NAT rule counter read failed for %s/%s: %v", rs.Name, rule.Name, err)
+					}
 					resp.Rules = append(resp.Rules, &pb.NATRuleStats{
 						RuleSet:          rs.Name,
 						RuleName:         rule.Name,
