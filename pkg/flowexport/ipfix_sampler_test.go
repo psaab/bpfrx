@@ -7,14 +7,22 @@ import (
 	"time"
 )
 
-// #3748 fail-on-revert pins for the IPFIX sampler Options Template (Set ID 3,
-// template ID 258) + Options Data Record that advertises the group's 1-in-N
-// sampling configuration (PSAMP systematic count-based sampling, RFC 5477).
+// #3748/#5312 fail-on-revert pins for the IPFIX sampler Options Template (Set ID
+// 3, template ID 258) + Options Data Record that advertises the group's 1-in-N
+// sampling configuration.
 //
 // Before #3748 ipfixSetIDOptionsTemplate (Set ID 3) was a bare constant: no
 // options template and no sampler record were ever built or sent, so a
 // collector could not learn the sampling rate and could not scale the sampled
 // record count by N.
+//
+// #5312: xpf samples at SESSION-RECORD (Flow) granularity, so the record MUST
+// carry the RFC 7014 FLOW-selection IEs (flowSelectorAlgorithm 390 /
+// samplingFlowInterval 396 / samplingFlowSpacing 397), NOT the PSAMP
+// PACKET-selection IEs (selectorAlgorithm 304 / samplingPacketInterval 305 /
+// samplingPacketSpace 306). The packet-selection IEs would tell a standards
+// collector to renormalize each record's octet/packet counters by N, inflating
+// the already-complete per-session volume.
 //
 // The IE numbers/set IDs are asserted as literals independent of the package
 // constants so a typo'd constant cannot make a test agree with itself.
@@ -22,10 +30,16 @@ const (
 	wantOptionsSetID          uint16 = 3
 	wantOptionsTemplateID     uint16 = 258
 	wantObservationDomainIDIE uint16 = 149
-	wantSelectorAlgorithmIE   uint16 = 304
-	wantSamplingIntervalIE    uint16 = 305
-	wantSamplingSpaceIE       uint16 = 306
-	wantSystematicCountAlgo   uint16 = 1
+	// #5312: RFC 7014 flow-selection IEs (record granularity).
+	wantFlowSelectorAlgorithmIE uint16 = 390
+	wantSamplingFlowIntervalIE  uint16 = 396
+	wantSamplingFlowSpacingIE   uint16 = 397
+	wantSystematicCountAlgo     uint16 = 1
+	// #5312: the PSAMP packet-selection IEs that MUST NOT appear — advertising
+	// them mis-describes record sampling as packet sampling.
+	psampSelectorAlgorithmIE    uint16 = 304
+	psampSamplingPacketInterval uint16 = 305
+	psampSamplingPacketSpace    uint16 = 306
 )
 
 // decodeOptionsTemplateRecord walks an Options Template Set (Set ID 3, RFC 7011
@@ -76,8 +90,9 @@ func decodeOptionsTemplateRecord(t *testing.T, ts []byte) (tmplID, scopeCount ui
 // TestIPFIXOptionsTemplateSetDecode decodes the encoder output directly (no
 // wire) and pins the sampler Options Template shape: Set ID 3, template ID 258,
 // exactly one scope field (observationDomainId, IE 149) followed by the three
-// PSAMP option fields (selectorAlgorithm 304, samplingPacketInterval 305,
-// samplingPacketSpace 306) with the correct lengths.
+// RFC 7014 FLOW-selection option fields (flowSelectorAlgorithm 390,
+// samplingFlowInterval 396, samplingFlowSpacing 397) with the correct lengths,
+// and asserts the PSAMP PACKET-selection IEs are ABSENT (#5312).
 func TestIPFIXOptionsTemplateSetDecode(t *testing.T) {
 	ts := encodeIPFIXOptionsTemplateSet()
 	tmplID, scopeCount, specs := decodeOptionsTemplateRecord(t, ts)
@@ -93,9 +108,9 @@ func TestIPFIXOptionsTemplateSetDecode(t *testing.T) {
 	}
 	want := []ipfixSpec{
 		{elementID: wantObservationDomainIDIE, length: 4},
-		{elementID: wantSelectorAlgorithmIE, length: 2},
-		{elementID: wantSamplingIntervalIE, length: 4},
-		{elementID: wantSamplingSpaceIE, length: 4},
+		{elementID: wantFlowSelectorAlgorithmIE, length: 2},
+		{elementID: wantSamplingFlowIntervalIE, length: 8},
+		{elementID: wantSamplingFlowSpacingIE, length: 8},
 	}
 	if len(specs) != len(want) {
 		t.Fatalf("field count = %d, want %d (%v)", len(specs), len(want), specs)
@@ -103,6 +118,14 @@ func TestIPFIXOptionsTemplateSetDecode(t *testing.T) {
 	for i, w := range want {
 		if specs[i].elementID != w.elementID || specs[i].length != w.length || specs[i].enterprise != 0 {
 			t.Errorf("field[%d] = %+v, want elementID=%d length=%d enterprise=0", i, specs[i], w.elementID, w.length)
+		}
+	}
+	// #5312: the misleading PSAMP packet-selection IEs must NOT be advertised —
+	// they would tell a collector to renormalize per-record octet/packet counts
+	// by N, mis-describing record-granularity sampling as packet sampling.
+	for _, bad := range []uint16{psampSelectorAlgorithmIE, psampSamplingPacketInterval, psampSamplingPacketSpace} {
+		if _, ok := findSpec(specs, bad, 0); ok {
+			t.Errorf("options template advertises packet-selection IE %d — record-granularity sampling must use RFC 7014 flow-selection IEs (390/396/397)", bad)
 		}
 	}
 }
@@ -114,7 +137,7 @@ func TestIPFIXOptionsSamplerDataSetDecode(t *testing.T) {
 	const odid uint32 = 0xDEADBEEF
 	cases := []struct {
 		rate      int
-		wantSpace uint32
+		wantSpace uint64
 	}{
 		{rate: 100, wantSpace: 99},
 		{rate: 2, wantSpace: 1},
@@ -137,13 +160,13 @@ func TestIPFIXOptionsSamplerDataSetDecode(t *testing.T) {
 			t.Errorf("rate %d: observationDomainId scope = %#x, want %#x", c.rate, got, odid)
 		}
 		if got := binary.BigEndian.Uint16(rec[4:6]); got != wantSystematicCountAlgo {
-			t.Errorf("rate %d: selectorAlgorithm = %d, want %d (systematic count-based)", c.rate, got, wantSystematicCountAlgo)
+			t.Errorf("rate %d: flowSelectorAlgorithm = %d, want %d (systematic count-based)", c.rate, got, wantSystematicCountAlgo)
 		}
-		if got := binary.BigEndian.Uint32(rec[6:10]); got != 1 {
-			t.Errorf("rate %d: samplingPacketInterval = %d, want 1", c.rate, got)
+		if got := binary.BigEndian.Uint64(rec[6:14]); got != 1 {
+			t.Errorf("rate %d: samplingFlowInterval = %d, want 1", c.rate, got)
 		}
-		if got := binary.BigEndian.Uint32(rec[10:14]); got != c.wantSpace {
-			t.Errorf("rate %d: samplingPacketSpace = %d, want %d (N-1)", c.rate, got, c.wantSpace)
+		if got := binary.BigEndian.Uint64(rec[14:22]); got != c.wantSpace {
+			t.Errorf("rate %d: samplingFlowSpacing = %d, want %d (N-1)", c.rate, got, c.wantSpace)
 		}
 	}
 }
@@ -156,7 +179,8 @@ func TestIPFIXOptionsSamplerDataSetDecode(t *testing.T) {
 //     Record (Set ID 258);
 //   - the options record scope (observationDomainId) equals the group's ODID
 //     (== the message header ObservationID);
-//   - the advertised rate is systematic count-based, interval=1, space=N-1;
+//   - the advertised rate is systematic count-based FLOW selection (RFC 7014),
+//     samplingFlowInterval=1, samplingFlowSpacing=N-1;
 //   - the Options Data Record advances the header Sequence Number by exactly one
 //     (it is a Data Record; #2609 convention).
 //
@@ -245,9 +269,15 @@ func TestIPFIXSamplerOptionsWireLoopback(t *testing.T) {
 	if len(specs) < 1 || specs[0].elementID != wantObservationDomainIDIE {
 		t.Errorf("wire scope field = %+v, want observationDomainId (IE %d)", specs, wantObservationDomainIDIE)
 	}
-	for _, ie := range []uint16{wantSelectorAlgorithmIE, wantSamplingIntervalIE, wantSamplingSpaceIE} {
+	for _, ie := range []uint16{wantFlowSelectorAlgorithmIE, wantSamplingFlowIntervalIE, wantSamplingFlowSpacingIE} {
 		if _, ok := findSpec(specs, ie, 0); !ok {
-			t.Errorf("wire options template missing sampler IE %d", ie)
+			t.Errorf("wire options template missing flow-selection sampler IE %d", ie)
+		}
+	}
+	// #5312: the packet-selection IEs must not ride the wire template.
+	for _, bad := range []uint16{psampSelectorAlgorithmIE, psampSamplingPacketInterval, psampSamplingPacketSpace} {
+		if _, ok := findSpec(specs, bad, 0); ok {
+			t.Errorf("wire options template advertises packet-selection IE %d — must be RFC 7014 flow-selection", bad)
 		}
 	}
 
@@ -263,13 +293,13 @@ func TestIPFIXSamplerOptionsWireLoopback(t *testing.T) {
 		t.Errorf("wire options record scope ODID = %#x, want %#x", got, e.sourceID)
 	}
 	if got := binary.BigEndian.Uint16(rec[4:6]); got != wantSystematicCountAlgo {
-		t.Errorf("wire selectorAlgorithm = %d, want %d", got, wantSystematicCountAlgo)
+		t.Errorf("wire flowSelectorAlgorithm = %d, want %d", got, wantSystematicCountAlgo)
 	}
-	if got := binary.BigEndian.Uint32(rec[6:10]); got != 1 {
-		t.Errorf("wire samplingPacketInterval = %d, want 1", got)
+	if got := binary.BigEndian.Uint64(rec[6:14]); got != 1 {
+		t.Errorf("wire samplingFlowInterval = %d, want 1", got)
 	}
-	if got := binary.BigEndian.Uint32(rec[10:14]); got != rate-1 {
-		t.Errorf("wire samplingPacketSpace = %d, want %d (N-1)", got, rate-1)
+	if got := binary.BigEndian.Uint64(rec[14:22]); got != uint64(rate-1) {
+		t.Errorf("wire samplingFlowSpacing = %d, want %d (N-1)", got, rate-1)
 	}
 
 	// The Options Data Record is a Data Record: it advanced the counter by one.

@@ -263,7 +263,15 @@ per-path:
   (`fsatomic` cannot guarantee an atomic restore), whereas C is already
   the durable content, so converging needs no further write to hold the
   invariant. A PRE-rename failure (any non-typed write error) is still a
-  clean rejection with A intact.
+  clean rejection with A intact. The classification travels through the DB
+  layer's `fmt.Errorf("persist %s: %w", …)` wrap in `db.go writeTreeMarked`;
+  `isPostRenameDurabilityFailure` (`errors.As`) sees the typed error through
+  that `%w`. A downgrade to `%v` would silently break classification, so
+  `postrename_dbboundary_5234_test.go` drives a REAL post-rename dir-fsync
+  failure through `db.WriteActive` (via fsatomic's exported
+  `SetAfterRenameSyncDirForTesting` seam) and asserts both the direct
+  classification and the end-to-end converge — FAILing RED if the wrap is
+  ever downgraded (#5234).
 - **Crash window (persist-then-promote ambiguity).** Because the disk
   write happens first, a crash after `WriteActive` succeeds but before
   the in-memory promotion completes means a restart loads the NEW tree

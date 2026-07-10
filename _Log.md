@@ -44842,6 +44842,43 @@ top.
 - **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
   pkg/daemon/daemon_snmp_reconcile_test.go, pkg/snmp/README.md
 
+## 2026-07-10 — #5115 term-scoped next-hop-self
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5115 [BUG frr/bgp MEDIUM] `then next-hop self` widened into a
+  neighbor-wide next-hop rewrite. `policy_render.go` scanned the effective
+  export policy with `policyStatementHasNextHopSelf` and, if ANY term
+  requested self, emitted `neighbor <peer> next-hop-self force` — an FRR knob
+  that runs AFTER route selection and rewrites the next-hop of EVERY route
+  advertised to the peer, including routes accepted by OTHER terms that never
+  asked for self (semantic widening; can redirect traffic through the
+  firewall or break third-party next-hop reachability). Fix: lower
+  `then next-hop self` per-term INSIDE the export route-map as
+  `set ip next-hop peer-address` + `set ipv6 next-hop peer-address`. In an
+  OUTBOUND route-map `peer-address` resolves to the local session address
+  (= self) and is evaluated per-route, so it rewrites ONLY the term's routes.
+  Removed both neighbor-loop knob emissions (IPv4 + IPv6) and the now-unused
+  `policyStatementHasNextHopSelf` helper. The outbound set-clause still
+  overrides iBGP / route-reflector-reflected next-hops (keeps the #2977 fix),
+  now correctly scoped; a bare `then next-hop self` term (no `from`) renders a
+  match-all sequence and keeps neighbor-wide effect. Fail-on-revert tests
+  (pkg/frr/frr_test.go): rewrote TestGenerateProtocols_BGPExportNextHopSelf
+  and ...RRClient to assert the term-scoped set-clause + NO neighbor knob;
+  added TestGenerateProtocols_BGPExportNextHopSelfTermScoped (the #5115
+  two-accepted-term widening regression: prefix A accepted without self,
+  prefix B accepted with self → exactly one set-clause, scoped to B's
+  sequence, no knob); updated TestNextHopPeerAddress and
+  ...BGPExportNoSpuriousNextHopSelf. RED-on-revert VERIFIED: restoring
+  origin/master's policy_render.go (keeping the tests) made 4 tests FAIL
+  (BGPExportNextHopSelf, ...RRClient, ...TermScoped, TestNextHopPeerAddress),
+  no-spurious correctly stayed PASS; restored → all PASS. Validation:
+  `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0;
+  `go test ./pkg/frr/... ./pkg/config/...` ok; gofmt clean. Docs:
+  pkg/frr/README.md `next-hop self` section + docs/phases.md rewritten to the
+  term-scoped route-map contract. No cluster smoke (control-plane FRR config
+  generation; verified by RED-on-revert unit tests).
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, docs/phases.md, _Log.md
 - **Timestamp**: 2026-07-10
 - **Action**: Fix flowexport batch max-depth high-water update race (#5048).
   The `maxDepth` high-water update in `flowBatch.add()` ran OUTSIDE `b.mu`
@@ -44904,3 +44941,58 @@ top.
   pkg/cluster/upgrade_drain_test.go,
   pkg/cli/cli_request_system_issu_5039_test.go,
   pkg/grpcapi/server_diag_issu_5039_test.go
+## 2026-07-10 — #5234 fsatomic/configstore post-rename durability classification coverage
+- **Timestamp**: 2026-07-10
+- **Action**: Close the #5234 test-coverage gap (follow-up to #5185/#5230).
+  The converge-to-C tests inject via the Store `writeActiveFn` seam, which
+  bypasses `db.go writeTreeMarked`'s `fmt.Errorf("persist %s: %w", …)` wrap,
+  so nothing proved `isPostRenameDurabilityFailure` (errors.As) still
+  classifies the `*PostRenameSyncError` through that `%w`. Exported the
+  unexported fsatomic post-rename seam as `SetAfterRenameSyncDirForTesting`
+  (reuses the existing `afterRenameSyncDir`/`SyncDir` primitives — no new
+  fsync path) so a configstore test can drive a REAL post-rename dir-fsync
+  failure through `db.WriteActive`. Added a focused boundary test and an
+  end-to-end converge test. Proved RED-on-revert: downgrading db.go's `%w`
+  to `%v` makes both fail (classification flattens → reject instead of
+  converge). No production behavior change.
+- **File(s)**: pkg/fsatomic/test_seams.go (new),
+  pkg/configstore/postrename_dbboundary_5234_test.go (new),
+  pkg/fsatomic/README.md, pkg/configstore/README.md, _Log.md
+## 2026-07-10 — #5031 redact raw error from unauthenticated /health
+
+- **Timestamp**: 2026-07-10
+- **Action**: Redact raw compile/bootstrap error strings from the
+  unauthenticated `/health` payload. `/health` is unconditionally exempt
+  from authMiddleware; `healthHandler` copied `h.LastError` into
+  `compile_last_error` and `b.Error` into `bootstrap_import_error`, both
+  verbatim parser/compiler strings that can carry file paths, config
+  internals, or a secret echoed by a schema validator. Removed both
+  fields; kept status/counters/timestamps/reason codes as the health
+  signal. Full detail remains in the journal (compile WARN/ERROR) and the
+  authenticated BOOTSTRAP_IMPORT_FAILED event. Added
+  TestHealthHandler_RedactsRawErrorDetail (secret-sentinel body scan,
+  RED-on-revert) and inverted the two prior assertions that required the
+  raw error to be present. Updated pkg/api/README.md /health contract.
+- **File(s)**: pkg/api/health.go, pkg/api/health_test.go,
+  pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5312 flowexport/ipfix — emit RECORD-granularity sampling IEs.
+  ShouldExport does 1-in-N selection of whole SESSION records, but
+  encodeIPFIXOptionsSamplerDataSet advertised PSAMP PACKET-selection IEs
+  (selectorAlgorithm 304 / samplingPacketInterval 305 / samplingPacketSpace
+  306, interval=1/space=N-1). A standards collector reads that as packet
+  sampling and renormalizes each record's octet/packetDeltaCount by N —
+  inflating the already-complete per-session volume. The only guard was a
+  code comment ("must NOT multiply by N") that no wire field carried.
+  Replaced with the RFC 7014 (Flow Selection Techniques) flow-selection IEs:
+  flowSelectorAlgorithm (390, u16) = 1 (systematic count-based, IANA "Flow
+  Selector Algorithm" registry), samplingFlowInterval (396, u64) = 1,
+  samplingFlowSpacing (397, u64) = N-1. Record size 14 -> 22. A collector now
+  scales the POPULATION (flow count/aggregate) by N and leaves per-record
+  counters intact. Updated the sampler test to pin 390/396/397 + u64 widths +
+  record size 22 AND assert 304/305/306 are ABSENT; proved RED-on-revert
+  (reverting ipfix.go fails the template/data-set decode tests). Updated
+  pkg/flowexport/README.md #3748/#5312 sampler section.
+- **File(s)**: pkg/flowexport/ipfix.go, pkg/flowexport/ipfix_sampler_test.go,
+  pkg/flowexport/README.md, _Log.md

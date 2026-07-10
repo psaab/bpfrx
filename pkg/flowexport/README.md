@@ -448,29 +448,48 @@ bidirectional accounting.** `FlowRecord.RevPackets`/`RevBytes` are populated
 for both exporters but consumed only by IPFIX. See the converged research plan
 on #3746.
 
-**#3748 (sub-part b) — IPFIX sampler Options Template + record.** Before
+**#3748 (sub-part b) / #5312 — IPFIX sampler Options Template + record.** Before
 #3748 `ipfixSetIDOptionsTemplate` (Set ID 3) was a bare constant: the IPFIX
 exporter emitted DATA templates (256/257) only and never advertised the
 sampling rate, so a collector receiving 1-in-N-sampled records could not
 learn N and could not scale the sampled record count. The exporter now emits,
 on the SAME template-refresh cadence, an **Options Template** (Set ID 3,
 template ID **258** — distinct from the 256/257 data IDs) and an **Options
-Data Record** (Set ID 258) carrying the sampling configuration as PSAMP
-systematic count-based sampling (RFC 5477 / IANA "IPFIX Entities"):
+Data Record** (Set ID 258) carrying the sampling configuration.
+
+**#5312 — describe FLOW selection, not packet sampling.** xpf samples 1-in-N at
+**SESSION-RECORD (Flow) granularity**: `ShouldExport` applies the modulo per
+SESSION_CLOSE event, selecting whole Flows, *not* 1-in-N packets in the datapath
+the way Junos jflow does. #3748 originally advertised this with the PSAMP
+**packet-selection** IEs (`selectorAlgorithm` 304 / `samplingPacketInterval` 305
+/ `samplingPacketSpace` 306), which tell a standards-based collector this is
+*packet* sampling and to renormalize each record's `octetDeltaCount` /
+`packetDeltaCount` by N — inflating the already-complete per-session volume by
+N× (bogus traffic/capacity/billing estimates). The record now carries the
+**RFC 7014 (Flow Selection Techniques) flow-selection IEs**, the flow-granularity
+analog of the PSAMP IEs, so a collector interprets the sampling correctly:
 
 | Field | IE | Len | Role | Value |
 |-------|----|----|------|-------|
 | `observationDomainId` | 149 | 4 | **scope** | the group's stable ODID (#3740) |
-| `selectorAlgorithm` | 304 | 2 | option | `1` (systematic count-based) |
-| `samplingPacketInterval` | 305 | 4 | option | `1` |
-| `samplingPacketSpace` | 306 | 4 | option | `N-1` |
+| `flowSelectorAlgorithm` | 390 | 2 | option | `1` (systematic count-based, IANA "Flow Selector Algorithm") |
+| `samplingFlowInterval` | 396 | 8 | option | `1` (Flows consecutively selected) |
+| `samplingFlowSpacing` | 397 | 8 | option | `N-1` (Flows skipped between intervals) |
+
+A collector reads flow selection as "you received 1/N of all Flows" and scales
+the **population** (flow count / aggregate volume) by N, while each exported
+record's per-session `octetDeltaCount` / `packetDeltaCount` stays complete and
+is **NOT** renormalized by N. (The `selectorIDTotalFlowsObserved` 394 /
+`selectorIDTotalFlowsSelected` 395 pair could express the same ratio with live
+counters; we use the static systematic count-based interval/spacing form because
+it is the direct analog of the fixed per-group config and needs no live state.)
 
 The record is scoped by `observationDomainId` (IE 149) — the group's #3740
 ODID, which also stamps the message header — so the sampling config binds to
 this observation domain. `encodeIPFIXOptionsTemplateSet` /
 `encodeIPFIXOptionsSamplerDataSet` build the two sets; `sendSamplerOptions`
 packages them into one IPFIX Message (template first, then its data record).
-The `ipfixOptionsSamplerRecordSize` (14) is pinned against the field slices at
+The `ipfixOptionsSamplerRecordSize` (22) is pinned against the field slices at
 build time (same discipline as the #2526 data-record pins), so a
 template/encoder drift panics at init.
 
@@ -490,22 +509,25 @@ the current cumulative count for the message header, then increments, exactly
 as `sendRecords` does. The template-only data-template refresh still carries
 the cumulative count without advancing it (#2609 unchanged).
 
-**SEMANTIC NUANCE — record-granularity sampling, not packet sampling.** xpf
-samples **1-in-N at SESSION-RECORD granularity**: `ShouldExport` applies the
-modulo per SESSION_CLOSE event, NOT 1-in-N packets in the datapath the way
-Junos jflow does. Advertising interval=1 / space=N-1 lets a collector scale
-the sampled **record COUNT** by N (correct), but each exported record already
-carries the **full per-session** `octetDeltaCount` / `packetDeltaCount`, so a
-collector must **NOT** additionally multiply the per-record volume by N —
-doing so double-counts. This is documented on `sendSamplerOptions` too.
+**SEMANTIC NUANCE — record-granularity sampling, expressed as flow selection
+(#5312).** Because the record uses the RFC 7014 flow-selection IEs, the
+semantics are unambiguous on the wire: a collector scales the **population**
+(flow count / aggregate volume across the network) by N, while each exported
+record's **full per-session** `octetDeltaCount` / `packetDeltaCount` stays
+complete and is **NOT** renormalized by N. This is the whole point of #5312 —
+the previous packet-selection IEs carried no wire signal that the per-record
+volume was already complete, so a standards collector would have double-counted
+by N. This is documented on `sendSamplerOptions` too.
 
 Fail-on-revert pins in `ipfix_sampler_test.go`:
 `TestIPFIXOptionsTemplateSetDecode` (Set ID 3, template 258, one scope field =
-IE 149, option IEs 304/305/306 with correct lengths + set-length integrity),
-`TestIPFIXOptionsSamplerDataSetDecode` (interval=1 / space=N-1 across sampled
-and degenerate rates), `TestIPFIXSamplerOptionsWireLoopback` (the real
-exporter UDP path emits the options message after the data template, scope ==
-header ODID, rate = N-1, and the record advances the sequence by one), and
+IE 149, flow-selection option IEs 390/396/397 with correct lengths + set-length
+integrity, and the packet-selection IEs 304/305/306 asserted ABSENT — #5312),
+`TestIPFIXOptionsSamplerDataSetDecode` (flowSelectorAlgorithm=1, interval=1 /
+space=N-1 across sampled and degenerate rates), `TestIPFIXSamplerOptionsWireLoopback`
+(the real exporter UDP path emits the options message after the data template,
+scope == header ODID, flow-selection rate = N-1 with no packet-selection IEs, and
+the record advances the sequence by one), and
 `TestIPFIXSamplerOptionsAbsentWhenUnsampled` (rate 0/1 emit no options
 message). Removing the sampler emission flips these RED.
 

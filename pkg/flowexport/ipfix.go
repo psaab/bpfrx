@@ -73,30 +73,42 @@ const ipfixReversePEN uint32 = 29305
 // of the 4-byte IANA form.
 const ipfixEnterpriseBit uint16 = 0x8000
 
-// #3748: PSAMP sampling Information Elements (RFC 5477 / the IANA "IPFIX
-// Entities" registry) carried by the Options Data Record that advertises the
-// group's 1-in-N sampling configuration to a collector.
+// #3748/#5312: RFC 7014 (Flow Selection Techniques) FLOW-selection Information
+// Elements carried by the Options Data Record that advertises the group's
+// 1-in-N sampling configuration to a collector. xpf samples at SESSION-RECORD
+// (Flow) granularity — ShouldExport applies the 1-in-N modulo per SESSION_CLOSE
+// event, selecting whole Flows, not packets. The PSAMP packet-selection IEs
+// (selectorAlgorithm 304 / samplingPacketInterval 305 / samplingPacketSpace 306)
+// would tell a standards collector this is PACKET sampling and to renormalize
+// each record's octet/packet counters by N — inflating the already-complete
+// per-session volume (#5312). The RFC 7014 flow-selection IEs describe the
+// population the sampler actually ran on: whole Flow records.
 const (
 	// observationDomainId (IE 149, unsigned32) — the SCOPE field of the
 	// sampler Options Template. Its value is the group's stable Observation
 	// Domain ID (#3740), which also stamps the message header, so the record
 	// scopes the sampling config to this observation domain.
 	ipfixObservationDomainID = 149
-	// selectorAlgorithm (IE 304, unsigned16) — the PSAMP selection method.
-	ipfixSelectorAlgorithm = 304
-	// samplingPacketInterval (IE 305, unsigned32) — number of consecutive
-	// units selected (1 for 1-in-N systematic count-based sampling).
-	ipfixSamplingPacketInterval = 305
-	// samplingPacketSpace (IE 306, unsigned32) — number of units skipped
-	// between selections (N-1 for 1-in-N).
-	ipfixSamplingPacketSpace = 306
+	// flowSelectorAlgorithm (IE 390, unsigned16, RFC 7014 §5) — the Flow
+	// selection algorithm, taken from the IANA "Flow Selector Algorithm"
+	// registry. Flow-granularity analog of PSAMP selectorAlgorithm (IE 304).
+	ipfixFlowSelectorAlgorithm = 390
+	// samplingFlowInterval (IE 396, unsigned64, RFC 7014 §5) — number of Flows
+	// consecutively selected (1 for 1-in-N systematic count-based flow sampling).
+	ipfixSamplingFlowInterval = 396
+	// samplingFlowSpacing (IE 397, unsigned64, RFC 7014 §5) — number of Flows
+	// skipped between two sampling intervals (N-1 for 1-in-N).
+	ipfixSamplingFlowSpacing = 397
 )
 
-// ipfixSelectorAlgorithmSystematicCount is the IANA "PSAMP Selection Method"
-// registry value for Systematic count-based Sampling (RFC 5476): select
-// samplingPacketInterval units, then skip samplingPacketSpace units. xpf's
-// 1-in-N is expressed as interval=1, space=N-1 (#3748).
-const ipfixSelectorAlgorithmSystematicCount uint16 = 1
+// ipfixFlowSelectorAlgorithmSystematicCount is the IANA "Flow Selector
+// Algorithm" (RFC 7014) registry value for Systematic count-based Sampling:
+// select samplingFlowInterval Flows, then skip samplingFlowSpacing Flows. It
+// shares value 1 with the PSAMP "Selection Method" registry, but the
+// surrounding RFC 7014 flow-selection IEs make a collector treat it as FLOW
+// selection, not packet selection. xpf's 1-in-N is expressed as interval=1,
+// space=N-1 (#5312).
+const ipfixFlowSelectorAlgorithmSystematicCount uint16 = 1
 
 // IPFIX Set IDs (RFC 7011 Section 3.3.2).
 const (
@@ -419,27 +431,28 @@ func encodeIPFIXTemplateSetDir(includeDir bool) []byte {
 	return b
 }
 
-// #3748: the sampler Options Template scope + option fields (RFC 7011 §4 /
-// RFC 5477). The single scope field (observationDomainId, IE 149) binds the
-// record to an Observation Domain; the option fields carry the sampling
-// configuration. All are standard IANA IEs (4-byte Template Set specifiers).
+// #3748/#5312: the sampler Options Template scope + option fields (RFC 7011 §4 /
+// RFC 7014 §5). The single scope field (observationDomainId, IE 149) binds the
+// record to an Observation Domain; the option fields carry the FLOW-selection
+// sampling configuration. All are standard IANA IEs (4-byte Template Set
+// specifiers).
 var (
 	ipfixOptionsSamplerScope = []ipfixField{
 		{ipfixObservationDomainID, 4, 0},
 	}
 	ipfixOptionsSamplerFields = []ipfixField{
-		{ipfixSelectorAlgorithm, 2, 0},
-		{ipfixSamplingPacketInterval, 4, 0},
-		{ipfixSamplingPacketSpace, 4, 0},
+		{ipfixFlowSelectorAlgorithm, 2, 0},
+		{ipfixSamplingFlowInterval, 8, 0},
+		{ipfixSamplingFlowSpacing, 8, 0},
 	}
 )
 
 // ipfixOptionsSamplerRecordSize is the byte size of the sampler Options Data
-// Record: observationDomainId(4) + selectorAlgorithm(2) + samplingPacketInterval(4)
-// + samplingPacketSpace(4) = 14. Pinned against the field slices at build time so
+// Record: observationDomainId(4) + flowSelectorAlgorithm(2) + samplingFlowInterval(8)
+// + samplingFlowSpacing(8) = 22. Pinned against the field slices at build time so
 // a template/encoder drift panics at init (#3748), mirroring the #2526 data-record
 // pins.
-const ipfixOptionsSamplerRecordSize = 14
+const ipfixOptionsSamplerRecordSize = 22
 
 var _ = func() struct{} {
 	if ipfixSumLen(ipfixOptionsSamplerScope)+ipfixSumLen(ipfixOptionsSamplerFields) != ipfixOptionsSamplerRecordSize {
@@ -484,14 +497,15 @@ func encodeIPFIXOptionsTemplateSet() []byte {
 
 // encodeIPFIXOptionsSamplerDataSet builds the sampler Options Data Set (a Data
 // Set whose Set ID equals the Options Template ID, 258). It carries one record
-// scoped to odid, advertising 1-in-N systematic count-based sampling as
-// interval=1 / space=samplingRate-1. samplingRate <= 1 (unsampled) yields
-// space=0 (1-in-1), but callers only emit this set when sampling is active (see
-// IPFIXExporter.emitSampler) (#3748).
+// scoped to odid, advertising 1-in-N FLOW (session-record) sampling as RFC 7014
+// systematic count-based flow selection: flowSelectorAlgorithm=1,
+// samplingFlowInterval=1, samplingFlowSpacing=samplingRate-1. samplingRate <= 1
+// (unsampled) yields space=0 (1-in-1), but callers only emit this set when
+// sampling is active (see IPFIXExporter.emitSampler) (#3748/#5312).
 func encodeIPFIXOptionsSamplerDataSet(odid uint32, samplingRate int) []byte {
-	var space uint32
+	var space uint64
 	if samplingRate > 1 {
-		space = uint32(samplingRate - 1)
+		space = uint64(samplingRate - 1)
 	}
 	totalLen := 4 + ipfixOptionsSamplerRecordSize
 	b := make([]byte, totalLen)
@@ -502,15 +516,16 @@ func encodeIPFIXOptionsSamplerDataSet(odid uint32, samplingRate int) []byte {
 	binary.BigEndian.PutUint16(b[off+2:off+4], uint16(totalLen))
 	off += 4
 
-	// Record: observationDomainId (scope), then the option fields.
+	// Record: observationDomainId (scope), then the RFC 7014 flow-selection
+	// option fields.
 	binary.BigEndian.PutUint32(b[off:off+4], odid)
 	off += 4
-	binary.BigEndian.PutUint16(b[off:off+2], ipfixSelectorAlgorithmSystematicCount)
+	binary.BigEndian.PutUint16(b[off:off+2], ipfixFlowSelectorAlgorithmSystematicCount)
 	off += 2
-	binary.BigEndian.PutUint32(b[off:off+4], 1) // samplingPacketInterval = 1
-	off += 4
-	binary.BigEndian.PutUint32(b[off:off+4], space) // samplingPacketSpace = N-1
-	off += 4
+	binary.BigEndian.PutUint64(b[off:off+8], 1) // samplingFlowInterval = 1
+	off += 8
+	binary.BigEndian.PutUint64(b[off:off+8], space) // samplingFlowSpacing = N-1
+	off += 8
 	return b
 }
 
@@ -982,15 +997,22 @@ func (e *IPFIXExporter) sendTemplates() {
 
 // sendSamplerOptions emits the sampler Options Template Set (Set ID 3, template
 // ID 258) followed by its Options Data Record (Set ID 258) in one IPFIX Message,
-// advertising the group's 1-in-N sampling rate as PSAMP systematic count-based
-// sampling (#3748). Called on the template-refresh cadence for sampled groups.
+// advertising the group's 1-in-N sampling rate as RFC 7014 systematic
+// count-based FLOW selection (#3748/#5312). Called on the template-refresh
+// cadence for sampled groups.
 //
-// SEMANTIC NUANCE (documented in README): xpf samples 1-in-N at SESSION-RECORD
-// granularity — ShouldExport applies the modulo per SESSION_CLOSE event, not
-// 1-in-N packets in the datapath as Junos jflow does. Advertising interval=1 /
-// space=N-1 lets a collector scale the sampled RECORD COUNT by N (correct), but
-// each exported record already carries the full per-session octet/packet volume,
-// so a collector must NOT additionally multiply octetDeltaCount by N.
+// FLOW-granularity representation (#5312): xpf samples 1-in-N at SESSION-RECORD
+// granularity — ShouldExport applies the modulo per SESSION_CLOSE event,
+// selecting whole Flows, not 1-in-N packets in the datapath as Junos jflow
+// does. The record therefore carries the RFC 7014 flow-selection IEs
+// (flowSelectorAlgorithm=1 / samplingFlowInterval=1 / samplingFlowSpacing=N-1),
+// NOT the PSAMP packet-selection IEs (selectorAlgorithm / samplingPacketInterval
+// / samplingPacketSpace). A standards collector reads flow selection as "you
+// received 1/N of all Flows" and scales the POPULATION (flow count, aggregate
+// volume) by N, while each exported record's octetDeltaCount / packetDeltaCount
+// stays the complete per-session volume and is NOT renormalized by N. The
+// packet-selection IEs would have wrongly implied the opposite — per-record
+// counter renormalization — which is the #5312 defect this replaces.
 //
 // The Options Data Record is a Data Record (it rides a Set with ID >= 256), so
 // it advances the header Sequence Number by one, consistent with the #2609
