@@ -381,11 +381,17 @@ type Daemon struct {
 	// swap on the commit path; the callback reads the pointer lock-free.
 	aggregatorPtr atomic.Pointer[logging.SessionAggregator]
 	aggCancel     context.CancelFunc
-	aggCBOnce     sync.Once
-	aggReconMu    sync.Mutex
-	vrrpMgr       *vrrp.Manager
-	gc            *conntrack.GC
-	startTime     time.Time // daemon start time; used to suppress stale config sync
+	// aggSig is the derived-config signature of the live aggregator generation
+	// (#5313). applyAggregator retires+rebuilds the running aggregator ONLY when
+	// the newly-derived signature differs; an unchanged signature keeps the live
+	// aggregator — and its pending flush window — running instead of discarding
+	// ~5 min of SESSION_CLOSE counters on every report-enabled commit.
+	aggSig     aggregatorSig
+	aggCBOnce  sync.Once
+	aggReconMu sync.Mutex
+	vrrpMgr    *vrrp.Manager
+	gc         *conntrack.GC
+	startTime  time.Time // daemon start time; used to suppress stale config sync
 
 	// #846: applySem (capacity 1) serializes applyConfig + the
 	// commit→apply pair across all entry points (HTTP/gRPC commits,

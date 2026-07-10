@@ -237,6 +237,16 @@ func (sa *SessionAggregator) flushWithDropped() (topSrc, topDst []AggregateEntry
 }
 
 // Run starts the periodic flush loop. Blocks until ctx is cancelled.
+//
+// On ctx cancellation Run performs a FINAL flush before returning (#5313).
+// Without it, cancelling the context — which happens on daemon shutdown AND on
+// every config-churn teardown/replace in applyAggregator — silently discarded
+// up to a full flush interval (~5 min) of accumulated SESSION_CLOSE counters:
+// the pending window was only ever emitted on ticker.C. The final flush emits
+// that window as its own (partial) report so no counters are lost. flushAndLog
+// is a no-op when there are no pending counters (empty window), so a cancel
+// that races just after a ticker flush neither double-counts nor emits an empty
+// report.
 func (sa *SessionAggregator) Run(ctx context.Context) {
 	ticker := time.NewTicker(sa.flushInterval)
 	defer ticker.Stop()
@@ -244,6 +254,8 @@ func (sa *SessionAggregator) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Graceful final flush of the pending window before teardown.
+			sa.flushAndLog()
 			return
 		case <-ticker.C:
 			sa.flushAndLog()

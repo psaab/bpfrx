@@ -230,34 +230,85 @@ func (d *Daemon) aggregationCallback(rec logging.EventRecord, raw []byte) {
 	agg.HandleEvent(rec, raw)
 }
 
-// applyAggregator starts or stops the session aggregation reporter. The stable
-// indirection callback (aggregationCallback) is registered on er exactly once
-// — the first time reporting is enabled — and every later call only SWAPS the
-// active aggregator, cancelling the Run goroutine of the one it replaced. So N
-// report-enabled commits leave exactly one registered callback and one live
-// aggregator (#4964). Disabling reporting stores a nil aggregator; the stable
-// callback stays but becomes a no-op.
+// aggregatorSig is the comparable, derived-config signature of one aggregator
+// generation. applyAggregator retires+rebuilds the running aggregator only when
+// the signature genuinely changes (#5313). Only `enabled` is config-driven
+// today — window/topN are fixed defaults — but folding them into the signature
+// keeps the equality gate correct if either becomes configurable later.
+type aggregatorSig struct {
+	enabled       bool
+	flushInterval time.Duration
+	topN          int
+}
+
+// Fixed defaults for the session aggregation reporter. NewSessionAggregator(0,
+// 0) resolves to these same values internally; naming them here lets the
+// equality-gate signature carry the parameters the aggregator is built from.
+const (
+	aggregatorFlushInterval = 5 * time.Minute
+	aggregatorTopN          = 10
+)
+
+// applyAggregator starts, stops, or LEAVES-RUNNING the session aggregation
+// reporter. The stable indirection callback (aggregationCallback) is registered
+// on er exactly once — the first time reporting is enabled — so N report-enabled
+// commits leave exactly one registered callback and one live aggregator (#4964).
+//
+// #5313 (equality gate + final flush): the pre-#5313 body cancelled+replaced the
+// aggregator on EVERY call with no equality check. Because aggregator.Run only
+// flushed on ticker.C and returned on ctx.Done WITHOUT flushing, any unrelated
+// report-enabled commit (a syslog-stream edit, a hostname change — anything that
+// re-runs applySyslogConfig) tore down the running aggregator and silently
+// discarded up to a full flush window (~5 min) of pending SESSION_CLOSE counters.
+// Two composed fixes close that:
+//
+//  1. Equality gate: if a live aggregator's derived signature is unchanged, keep
+//     it — and its pending window — running instead of cancel+replace.
+//  2. Final flush: aggregator.Run now flushes the pending window on ctx.Done, so
+//     a genuine replace/disable emits the retiring window as a partial report
+//     (the new generation starts from an empty window — no double count) rather
+//     than dropping it.
+//
+// Disabling reporting stores a nil aggregator; the stable callback stays but
+// becomes a no-op.
 func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 	d.aggReconMu.Lock()
 	defer d.aggReconMu.Unlock()
 
-	// Stop the currently-running aggregator generation (if any). Swap the
-	// published pointer to nil FIRST so no in-flight event can enter the
-	// retired aggregator via the stable callback, THEN cancel its flush
-	// goroutine. Retiring in the other order would let HandleEvent keep
-	// feeding a cancelled aggregator whose Run no longer flushes (the #4964
-	// leak).
+	desired := aggregatorSig{
+		enabled:       cfg.Security.Log.Report,
+		flushInterval: aggregatorFlushInterval,
+		topN:          aggregatorTopN,
+	}
+
+	// Equality gate (#5313): a live aggregator whose derived config is unchanged
+	// keeps running — do NOT cancel+replace it, which would discard its pending
+	// flush window. Only a genuine change (enable/disable or a parameter change)
+	// falls through to teardown.
+	if d.aggCancel != nil && d.aggSig == desired {
+		return
+	}
+
+	// Retire the running aggregator generation (config genuinely changed, or we
+	// are disabling). Swap the published pointer to nil FIRST so no in-flight
+	// event can enter the retired aggregator via the stable callback, THEN cancel
+	// its flush goroutine. Retiring in the other order would let HandleEvent keep
+	// feeding a cancelled aggregator (the #4964 leak). Cancelling now triggers
+	// Run's final flush (#5313): the retiring generation emits its pending window
+	// as a partial report before returning, so those ~5 min of counters are not
+	// silently dropped.
 	if d.aggCancel != nil {
 		d.aggregatorPtr.Store(nil)
 		d.aggCancel()
 		d.aggCancel = nil
+		d.aggSig = aggregatorSig{}
 	}
 
-	if !cfg.Security.Log.Report {
+	if !desired.enabled {
 		return
 	}
 
-	agg := logging.NewSessionAggregator(0, 0) // defaults: 5min, top-10
+	agg := logging.NewSessionAggregator(desired.flushInterval, desired.topN)
 
 	// Wire aggregator log output to the first available syslog client or local writer
 	agg.SetLogFunc(func(severity int, msg string) {
@@ -271,6 +322,7 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 	// during startup. Add accumulates immediately; Run only flushes.
 	d.aggregatorPtr.Store(agg)
 	d.aggCancel = cancel
+	d.aggSig = desired
 
 	// Register the single stable callback exactly once, the first time
 	// reporting is enabled. A boot with reporting disabled registers nothing;
