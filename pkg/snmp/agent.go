@@ -774,7 +774,7 @@ func (a *Agent) handleGet(community []byte, pduBody []byte) []byte {
 		}
 	}
 
-	return a.buildResponse(community, requestID, errNoError, 0, varbinds)
+	return a.boundGetResponse(community, requestID, varbinds)
 }
 
 // handleGetNext processes a GETNEXT request.
@@ -799,7 +799,22 @@ func (a *Agent) handleGetNext(community []byte, pduBody []byte) []byte {
 		}
 	}
 
-	return a.buildResponse(community, requestID, errNoError, 0, varbinds)
+	return a.boundGetResponse(community, requestID, varbinds)
+}
+
+// boundGetResponse builds a v2c GET/GETNEXT GetResponse and enforces the local
+// message-size ceiling (#4918, residual of #2612 which bounded only GETBULK).
+// A GET/GETNEXT carries a fixed 1:1 varbind-per-request-OID contract, so —
+// unlike GETBULK, whose oversized walk the manager continues with a follow-up
+// request — an oversized GET/GETNEXT response cannot be trimmed. Per RFC 3416
+// §4.2.1/§4.2.2 it is replaced with tooBig + an empty varbind list rather than
+// emitting a datagram larger than maxPacketSize.
+func (a *Agent) boundGetResponse(community []byte, requestID int, varbinds []varbind) []byte {
+	resp := a.buildResponse(community, requestID, errNoError, 0, varbinds)
+	if len(resp) > effectiveMaxSize(maxPacketSize) {
+		return a.buildResponse(community, requestID, errTooBig, 0, nil)
+	}
+	return resp
 }
 
 // handleGetBulk processes a GETBULK request (RFC 3416).
@@ -1169,12 +1184,13 @@ func effectiveMaxSize(advertised int) int {
 }
 
 // trimToFit bounds a GETBULK response to maxSize bytes (RFC 3416 §4.2.3). It
-// builds the response from vbs via build; if the encoded message exceeds
-// maxSize it drops trailing varbinds one at a time and rebuilds until the
-// message fits, returning the truncated-but-well-formed response. A manager
-// that receives a trimmed response continues the walk with a follow-up GETBULK
-// from the last returned OID, so trimming (not tooBig) is the normal, preferred
-// outcome.
+// builds the response from vbs via build; if the full encoded message exceeds
+// maxSize it binary-searches the largest leading prefix of varbinds whose
+// encoded message still fits and returns that truncated-but-well-formed
+// response (#4918: O(log n) rebuilds, not the old O(n) decrement-and-rebuild).
+// A manager that receives a trimmed response continues the walk with a
+// follow-up GETBULK from the last returned OID, so trimming (not tooBig) is the
+// normal, preferred outcome.
 //
 // build must construct a complete SNMP response message from the supplied
 // varbind list (it captures the version-specific envelope: v2c community frame
@@ -1187,13 +1203,39 @@ func effectiveMaxSize(advertised int) int {
 // pathological maxSize, but it is handled rather than emitting an oversized
 // datagram.
 func trimToFit(vbs []varbind, maxSize int, build func([]varbind) []byte) (resp []byte, ok bool) {
-	for n := len(vbs); n >= 0; n-- {
-		resp = build(vbs[:n])
-		if len(resp) <= maxSize {
-			return resp, true
+	// Fast path: the full varbind set almost always fits, so try it first —
+	// one build, no trimming (the common case, unchanged cost).
+	full := build(vbs)
+	if len(full) <= maxSize {
+		return full, true
+	}
+
+	// Oversized. The encoded message length is monotonic non-decreasing in the
+	// number of leading varbinds (each varbind adds bytes), so binary-search
+	// the largest prefix that still fits instead of dropping one varbind at a
+	// time and rebuilding. This turns the trim from O(n) rebuilds (each O(n),
+	// and for v3 each re-running USM framing/HMAC/encryption on the single
+	// serial SNMP goroutine) into O(log n) rebuilds — #4918, the O(n^2)
+	// residual of #2612. The result is identical to the decrement-and-rebuild:
+	// the longest leading prefix of vbs whose encoded response is <= maxSize.
+	empty := build(vbs[:0])
+	if len(empty) > maxSize {
+		return nil, false // even a zero-varbind response cannot fit
+	}
+	// Invariant: build(vbs[:lo]) fits, build(vbs[:hi]) does not (len(vbs) was
+	// just shown oversized). Narrow until lo+1 == hi; lo is then the answer.
+	lo, hi := 0, len(vbs)
+	best := empty
+	for lo+1 < hi {
+		mid := (lo + hi) / 2
+		r := build(vbs[:mid])
+		if len(r) <= maxSize {
+			lo, best = mid, r
+		} else {
+			hi = mid
 		}
 	}
-	return nil, false
+	return best, true
 }
 
 // buildResponse constructs a complete SNMP v2c response packet.
