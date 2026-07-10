@@ -188,6 +188,15 @@ func (s *Server) showTestRouting(req *pb.ShowTextRequest, buf *strings.Builder) 
 	// key/value) and an unknown key instead of ignoring it. A bare
 	// `test-routing:` (empty params) still falls through to the
 	// "Missing dest parameter" diagnostic below.
+	//
+	// #4921: reject a DUPLICATE selector key (e.g. `dest=a,dest=b` or
+	// `instance=blue,instance=prod`), the sibling of the #3709 showTestPolicy
+	// fix. The switch below re-assigns dest/instance on a repeated key, silently
+	// LAST-WINning, so the diagnostic route lookup answered for a DIFFERENT
+	// destination/VRF than the operator typed, with no warning. There is no
+	// correct silent pick, so a repeat is a reported error with the same shape
+	// as showTestPolicy.
+	seen := make(map[string]bool)
 	if params != "" {
 		for _, kv := range strings.Split(params, ",") {
 			parts := strings.SplitN(kv, "=", 2)
@@ -197,6 +206,17 @@ func (s *Server) showTestRouting(req *pb.ShowTextRequest, buf *strings.Builder) 
 				}
 				continue
 			}
+			if seen[parts[0]] {
+				// A duplicate KNOWN key last-wins below; a duplicate UNKNOWN key
+				// already recorded an "unknown selector" error on its first
+				// occurrence (parseErr is set-once), so this only overrides when
+				// no earlier grammar error was captured.
+				if parseErr == nil {
+					parseErr = fmt.Errorf("selector %q specified more than once", parts[0])
+				}
+				continue
+			}
+			seen[parts[0]] = true
 			switch parts[0] {
 			case "dest":
 				dest = parts[1]
