@@ -328,6 +328,10 @@ func (s *Server) showRoutingOptions(cfg *config.Config, buf *strings.Builder) {
 					fmt.Fprintf(buf, "  %-24s %-20s %s\n", sr.Destination, "discard", fmtPref(sr.Preference))
 					continue
 				}
+				if sr.Reject {
+					fmt.Fprintf(buf, "  %-24s %-20s %s\n", sr.Destination, "reject", fmtPref(sr.Preference))
+					continue
+				}
 				if sr.NextTable != "" {
 					fmt.Fprintf(buf, "  %-24s %-20s %s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference))
 					continue
@@ -353,6 +357,10 @@ func (s *Server) showRoutingOptions(cfg *config.Config, buf *strings.Builder) {
 			for _, sr := range ro.Inet6StaticRoutes {
 				if sr.Discard {
 					fmt.Fprintf(buf, "  %-40s %-30s %s\n", sr.Destination, "discard", fmtPref(sr.Preference))
+					continue
+				}
+				if sr.Reject {
+					fmt.Fprintf(buf, "  %-40s %-30s %s\n", sr.Destination, "reject", fmtPref(sr.Preference))
 					continue
 				}
 				if sr.NextTable != "" {
@@ -454,6 +462,10 @@ func (s *Server) showRoutingInstancesDetail(cfg *config.Config, buf *strings.Bui
 				for _, sr := range ri.StaticRoutes {
 					if sr.Discard {
 						fmt.Fprintf(buf, "    %s -> discard\n", sr.Destination)
+						continue
+					}
+					if sr.Reject {
+						fmt.Fprintf(buf, "    %s -> reject\n", sr.Destination)
 						continue
 					}
 					for _, nh := range sr.NextHops {

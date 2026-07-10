@@ -333,10 +333,16 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			// deletable by the WG reconcile (it is absent from the new WG
 			// desired set), not re-classified as foreign and leaked. This
 			// mirrors the forward WG→non-WG handoff, which also keeps
-			// appliedAddrs. Drop only appliedRI: the GRE/anchor VRF claim is
-			// no longer valid (WG binds VRF directly, never via appliedRI).
+			// appliedAddrs. PRESERVE appliedRI too (#5120): WG now reconciles
+			// its VRF through the shared claim machinery, so a prior anchor
+			// VRF claim must carry into applyWireguardTunLocked's reconcile —
+			// a reused anchor TUN keeps its kernel master across the handoff,
+			// and dropping the claim would leave an empty appliedRI that
+			// skips the identity-gated unbind, stranding an anchor→WG-no-RI
+			// device enslaved to the old VRF. (A GRE→WG handoff deletes and
+			// recreates the link, so the fresh TUN has master==0 and the
+			// carried claim self-clears in the reconcile.)
 			t.stopKeepaliveLocked(name)
-			delete(t.appliedRI, name)
 			continue
 		}
 		t.stopKeepaliveLocked(name)
@@ -405,14 +411,18 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 		if err != nil {
 			if isLinkNotFound(err) {
 				// Device genuinely gone (manual `ip link del`, or never
-				// existed). Nothing to prune; drop tracking.
+				// existed). Nothing to prune; drop tracking. The VRF binding
+				// died with the device, so clear any claim too (#5120) —
+				// there is nothing left to unbind.
 				delete(t.appliedAddrs, name)
+				delete(t.appliedRI, name)
 			} else {
 				// Transient lookup error (EBUSY/netlink/timeout): we cannot
 				// conclude the device is clean. Retain the name AND its
 				// tracked address set so the next Apply retries the prune —
 				// dropping here would forget a still-leaked address forever
-				// (#1919 r1 Codex/AGY MAJOR).
+				// (#1919 r1 Codex/AGY MAJOR). The appliedRI claim is left
+				// intact so the next Apply also retries the VRF unbind (#5120).
 				slog.Warn("failed to look up wireguard tun for address prune",
 					"name", name, "err", err)
 				nextWG[name] = true
@@ -420,10 +430,18 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			continue
 		}
 		failed, retry := t.pruneAppliedAddrsLocked(link, name, t.appliedAddrs[name])
-		if retry {
-			// Could not prove the device clean (an AddrDel failed, or
-			// AddrList itself failed). Carry the residual set forward (it
-			// gates link-local deletion next pass) and retry next Apply.
+		// Identity-gated VRF unbind (#5120): the persistent wgN link is KEPT
+		// (S2a), but a WG tunnel removed from config must not linger enslaved
+		// to the VRF it last claimed. Mirror the RI-removal unbind in
+		// reconcileVRFClaimLocked — retain the claim and retry on transient
+		// failure.
+		unbindRetry := t.unbindVRFClaimLocked(name, link)
+		if retry || unbindRetry {
+			// Could not prove the device clean (an AddrDel failed, AddrList
+			// itself failed, or the VRF unbind hit a transient error). Carry
+			// the residual address set forward (it gates link-local deletion
+			// next pass) and retry next Apply. A retained appliedRI claim
+			// (unbindRetry) is revisited on that retry.
 			t.appliedAddrs[name] = failed
 			nextWG[name] = true
 			continue
@@ -1151,15 +1169,38 @@ func (t *tunnelManager) reconcileVRFClaimLocked(tc *config.TunnelConfig, link ne
 		return
 	}
 
+	// config wants no RI (step 3): identity-gated unbind of the prior
+	// claim, shared with the WireGuard config-removal path (#5120).
+	t.unbindVRFClaimLocked(name, link)
+}
+
+// unbindVRFClaimLocked runs the identity-gated unbind half of the #1884
+// A.5 claim procedure for a tunnel whose desired routing-instance is now
+// empty — either because the `routing-instance` stanza was removed from a
+// still-configured tunnel (reconcileVRFClaimLocked step 3) or because the
+// whole tunnel was removed and its persistent link is being reconciled
+// (#5120, the WireGuard removal path — the wgN link is KEPT but must not
+// linger enslaved to a VRF it should no longer be in). It clears the
+// link's master to vrf-<claim> ONLY when the link's CURRENT master is
+// OBSERVED to be that VRF device, so it can neither strand a master we own
+// nor touch a foreign bind.
+//
+// The appliedRI claim clears on a successful unbind, on master==0 (already
+// unbound), on an identity mismatch (master not ours), or when the VRF
+// device is not-found (deleting a VRF frees its slaves). It is RETAINED —
+// and the function returns retry=true — only on a TRANSIENT failure (a VRF
+// lookup error other than not-found, or a LinkSetNoMaster error) so the
+// caller re-runs the reconcile on the next Apply. Caller MUST hold mu.
+func (t *tunnelManager) unbindVRFClaimLocked(name string, link netlink.Link) (retry bool) {
 	claim := t.appliedRI[name]
 	if claim == "" {
-		return
+		return false
 	}
 	master := link.Attrs().MasterIndex
 	if master == 0 {
 		// Nothing is bound — whatever we once bound is already gone.
 		delete(t.appliedRI, name)
-		return
+		return false
 	}
 	vrf, err := t.ops.LinkByName("vrf-" + claim)
 	if err != nil {
@@ -1167,24 +1208,25 @@ func (t *tunnelManager) reconcileVRFClaimLocked(tc *config.TunnelConfig, link ne
 			// The VRF device is gone; deleting a master frees its
 			// slaves, so the current master cannot be ours.
 			delete(t.appliedRI, name)
-			return
+			return false
 		}
 		// Transient lookup error: retain the claim, retry next apply.
-		return
+		return true
 	}
 	if vrf.Attrs().Index != master {
 		// Master is not the VRF we bound (someone else's bind).
 		delete(t.appliedRI, name)
-		return
+		return false
 	}
 	if err := t.ops.LinkSetNoMaster(link); err != nil {
 		slog.Warn("failed to unbind tunnel from VRF",
 			"name", name, "vrf", claim, "err", err)
-		return // retain claim; retry next apply
+		return true // retain claim; retry next apply
 	}
 	slog.Info("tunnel unbound from routing-instance",
 		"name", name, "vrf", claim)
 	delete(t.appliedRI, name)
+	return false
 }
 
 // observeListClaimLocked transfers the appliedRI claim to the
@@ -1320,11 +1362,15 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 // daemon was DOWN is not in wgConfigured on the next start, so it is not
 // pruned (restart-adoption limitation shared by the whole manager — it
 // only prunes what it tracked applying); (2) the wgN link and its live
-// Rust-attached peer/session are kept (not torn) by design; (3) VRF
-// membership is NOT unbound on removal (WG binds VRF directly, bypassing
-// the appliedRI claim machinery, so there is no identity-gated unbind —
-// the same root cause as the no-unbind-on-routing-instance-removal gap
-// for a still-configured WG tunnel).
+// Rust-attached peer/session are kept (not torn) by design.
+//
+// VRF membership IS reconciled through the shared appliedRI claim
+// machinery (#5120): the reconcile below records an identity-gated claim
+// on a successful bind, so removing the `routing-instance` stanza from a
+// still-configured tunnel unbinds here, and removing the whole tunnel
+// unbinds via the persistent-link prune in Apply (both use
+// unbindVRFClaimLocked — the wgN link is kept but never left enslaved to a
+// stale VRF).
 //
 // The Rust control thread (coordinator/wg_control.rs) attaches to this
 // persistent device by name.
@@ -1418,12 +1464,16 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	t.appliedAddrs[tc.Name] = t.reconcileLinkAddrsLocked(
 		link, tc.Name, tc.Addresses, t.appliedAddrs[tc.Name], "wireguard tun")
 
-	if tc.RoutingInstance != "" {
-		if bindErr := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); bindErr != nil {
-			slog.Warn("failed to bind wireguard tun to VRF",
-				"name", tc.Name, "vrf", tc.RoutingInstance, "err", bindErr)
-		}
-	}
+	// VRF binding via the shared identity-gated claim machinery (#5120).
+	// Previously WG bound directly with no else/unbind branch, so removing
+	// the `routing-instance` stanza from a still-configured tunnel left wgN
+	// mastered to the old VRF indefinitely. reconcileVRFClaimLocked records
+	// appliedRI on a successful bind and, when the desired RI is now empty,
+	// identity-checks the current master and unbinds (unbindVRFClaimLocked).
+	// The whole-tunnel-removal case is handled by the persistent-link prune
+	// in Apply, which shares unbindVRFClaimLocked. The wgN link is kept
+	// (S2a) but is no longer left enslaved to a stale VRF.
+	t.reconcileVRFClaimLocked(tc, link)
 	return nil
 }
 

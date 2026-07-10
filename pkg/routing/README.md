@@ -443,19 +443,29 @@ when the existing kernel link is genuinely incompatible:
   transient list failure still retries (it does NOT reuse
   `reconcileLinkAddrsLocked`, whose return only records failed LL
   deletes). A transient `LinkByName` error (vs `isLinkNotFound`) also
-  retains for retry; a genuine not-found drops tracking. Residuals
-  deferred to #1434: removal while the daemon was DOWN is not pruned
-  (only tracked-applied addresses prune), and VRF membership is not
-  unbound (WG binds VRF directly, no `appliedRI` claim).
+  retains for retry; a genuine not-found drops tracking. The same removal
+  pass also identity-gated-unbinds the WG TUN from its VRF (#5120,
+  `unbindVRFClaimLocked`): the persistent `wgN` link is KEPT but is never
+  left enslaved to the VRF it last claimed — a transient `LinkSetNoMaster`
+  failure retains the `appliedRI` claim (and the `wgConfigured` entry) for
+  retry, and a not-found device clears the claim (the binding died with the
+  device). Residual deferred to #1434: removal while the daemon was DOWN is
+  not pruned (only tracked-applied addresses/claims reconcile).
 - **VRF claims** (`appliedRI`): written ONLY from a successful
   `BindInterfaceToVRF` or a direct observation that the link's master
   is `vrf-<RIListMember>` (a step-0a routing-instance interface-list
   bind) — never from intent. `TunnelConfig.RIListMember` (populated by
   `collectAppliedTunnels` with the exact step-0a name normalization)
   vetoes unbinding when the config list-binds the tunnel. Unbind on
-  config-wants-none is identity-gated: only when the current master IS
-  the claimed RI's `vrf-` device; transient errors retain the claim
-  for retry.
+  config-wants-none is identity-gated (`unbindVRFClaimLocked`): only when
+  the current master IS the claimed RI's `vrf-` device; transient errors
+  retain the claim for retry. WireGuard `wgN` TUNs now use this SAME claim
+  machinery (#5120): `applyWireguardTunLocked` routes through
+  `reconcileVRFClaimLocked` so removing the `routing-instance` stanza from
+  a still-configured tunnel unbinds it, and the persistent-link removal
+  prune (above) shares `unbindVRFClaimLocked` — closing the pre-#5120 gap
+  where WG bound its VRF directly with no unbind branch and left `wgN`
+  mastered to a stale VRF after an RI change or tunnel removal.
 - **Keepalives** (BOTH the anchor and the legacy branch, #4071): runners
   are reconciled by normalized identity `(remote, source, interval,
   retry<=0→3)` and survive unrelated applies; `LinkSetUp` is SKIPPED

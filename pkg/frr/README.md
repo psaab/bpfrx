@@ -168,6 +168,26 @@ also carries operator content:
   (no `preference`) therefore does NOT float: with `HasPreference == false` it
   renders at the route-level distance, equal-cost with the primary — a
   `preference` is REQUIRED to make a qualified-next-hop a floating backup.
+- **Negative routes: `discard` vs `reject` (#5298).** A static route's
+  terminal `discard` or `reject` action installs an ACTIVE no-next-hop route
+  so matching traffic is dropped instead of following a less-specific route.
+  The two differ in what the source sees: `discard` → FRR `Null0`
+  (`RTN_BLACKHOLE`, a SILENT drop), `reject` → FRR `reject`
+  (`RTN_UNREACHABLE`, drop + ICMP unreachable to the source). The compiler
+  (`compileStaticRoutes`) sets `StaticRoute.Discard` / `StaticRoute.Reject`
+  (mutually exclusive) from both the inline route-keys and hierarchical/
+  flat-set action switches, and `generateStaticRouteInTable` emits the single
+  line `ip|ipv6 route <dst> (Null0|reject) [<pref>] [vrf/table]` for either
+  BEFORE the empty-next-hops guard. Before #5298 the compiler handled only
+  `discard`; a committed `reject` (accepted by the schema leaf) was silently
+  dropped end-to-end — no disposition, no next-hop — and the renderer then
+  emitted NOTHING for the resulting no-next-hop route, so the reject prefix
+  fell through to the default (a fail-wide). The userspace AF_XDP FIB folds
+  `Reject` into its silent-drop disposition (`buildRouteSnapshots`, #5298) so
+  the fast path drops the prefix too rather than LPM-matching a less-specific
+  route; a userspace-generated ICMP unreachable (vs the kernel/FRR reject
+  route's ICMP) is a follow-up. A no-next-hop route WITHOUT `discard`/`reject`
+  still renders nothing (#3872), not a blackhole.
 - **VRRP-VIP-only subnets (#2452 secondary).** A bondless-RETH member that
   carries only a VRRP virtual address (no matching `unit.Addresses` entry)
   also contributes its VIP subnet as a connected prefix, so a static

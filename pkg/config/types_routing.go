@@ -225,9 +225,15 @@ type NextHopEntry struct {
 type StaticRoute struct {
 	Destination string         // CIDR: "10.0.0.0/8" or "::/0"
 	NextHops    []NextHopEntry // multiple next-hops = ECMP
-	Discard     bool           // null route (blackhole)
-	Preference  int            // route preference (admin distance), default 5
-	NextTable   string         // routing instance name for inter-VRF route leaking (e.g. "Comcast.inet.0" → "Comcast")
+	Discard     bool           // null route (blackhole): silently drop matching traffic
+	// Reject installs an unreachable route: matching traffic is dropped AND an
+	// ICMP unreachable is returned to the source (Junos `route <p> reject` →
+	// FRR `ip route <p> reject`). Distinct from Discard (Junos `discard` → FRR
+	// Null0/blackhole, a silent drop). Both suppress a next-hop; Reject and
+	// Discard are mutually exclusive per route (Junos allows only one action).
+	Reject     bool
+	Preference int    // route preference (admin distance), default 5
+	NextTable  string // routing instance name for inter-VRF route leaking (e.g. "Comcast.inet.0" → "Comcast")
 }
 
 // ProtocolsConfig holds dynamic routing protocol configuration.
