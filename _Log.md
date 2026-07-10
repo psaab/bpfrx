@@ -45100,3 +45100,24 @@ top.
   sections (removed the #1434 "VRF not unbound" residual).
 - **File(s)**: pkg/routing/tunnel.go,
   pkg/routing/tunnel_reconcile_test.go, pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5071 — preserve downstream giaddr + Option 82 on DHCP relay
+  chaining (RFC 1542 §4.1.1 / RFC 3046). The forward loop stamped its own
+  giaddr and Del/overwrote Option 82 unconditionally, even when the inbound
+  BOOTREQUEST already carried a nonzero giaddr from a downstream relay —
+  making the server pick the wrong pool, reply to the wrong relay, and
+  destroying the original circuit-id. Added `giaddrIsSet()` and captured the
+  chained condition BEFORE any mutation; on a chained request (giaddr!=0) the
+  relay now preserves BOTH giaddr and the downstream relay-agent Option 82
+  untouched and only increments the BOOTP hops field. First-hop path
+  (giaddr==0) is unchanged: stamp giaddr + insert circuit-id Option 82. The
+  RFC 1542 hop-limit check (#4309, default 16) runs for both paths. No new
+  config knob (untrusted-client Option 82 trust policy noted out of scope).
+  Three fail-on-revert tests (first-hop stamp preserved, chained
+  giaddr+Option-82 preserved with exact-byte assertions, chained hop-limit
+  drop); RED-on-revert proven (chained-preserve fails on reverted source,
+  first-hop passes both ways). Updated pkg/dhcprelay/README.md with a "Relay
+  chaining" section + first-hop-only Option 82 gotcha.
+- **File(s)**: pkg/dhcprelay/relay.go,
+  pkg/dhcprelay/relay_chain_5071_test.go, pkg/dhcprelay/README.md, _Log.md
