@@ -23,6 +23,24 @@ var (
 	rbRemove           = os.Remove
 )
 
+// maxCommitDescriptionBytes bounds the operator-supplied commit description
+// (the `commit comment` text) that is recorded verbatim in the in-memory
+// history entry and the durable JSONL audit journal.
+//
+// #4891: an unbounded description marshals into a single oversized JSONL line.
+// The journal's bounded reverse-tail scanner (journal.maxTailLineBytes, 16 MiB)
+// treats any line past its cap as a poisoned newline-free fragment and discards
+// it — so an oversized-but-valid commit record would VANISH from bounded
+// history / `show system commit` views after allocating memory and disk
+// proportional to its size. 4 KiB is far above any human-authored commit
+// comment while keeping every journal line orders of magnitude below the
+// tail-scanner cap. Enforced strictly on the operator commit path (fail the
+// commit with a clear error before anything is persisted — the #1960 strict-at-
+// commit doctrine) and, as a structural belt at the journal boundary,
+// defensively truncated in journalLog so no Detail from any caller can poison
+// the tail scanner.
+const maxCommitDescriptionBytes = 4 << 10
+
 // CommitCheck validates the candidate configuration without applying it.
 func (s *Store) CommitCheck() (*config.Config, error) {
 	s.mu.RLock()
@@ -73,6 +91,15 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	}
 	if s.candidate == nil {
 		return nil, fmt.Errorf("not in configuration mode")
+	}
+
+	// #4891: reject an over-cap commit description BEFORE anything is
+	// persisted or promoted. Fail-fast with a clear error (the #1960
+	// strict-at-commit doctrine) so an oversized comment never bloats the
+	// journal nor hides itself behind the tail scanner's corrupt-line defense.
+	if len(description) > maxCommitDescriptionBytes {
+		return nil, fmt.Errorf("commit description too long: %d bytes (max %d)",
+			len(description), maxCommitDescriptionBytes)
 	}
 
 	compiled, err := s.compileTree(s.candidate)

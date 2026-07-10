@@ -206,6 +206,99 @@ func feedServerBaseURLEmpty(fs *FeedServer) bool {
 	return true
 }
 
+// validateDynamicAddressFeedNameUniquenessStrict hard-rejects two
+// dynamic-address feeds that resolve to the SAME effective feed name (#4913).
+//
+// feeds.Manager keys its worker map AND its enforcement snapshot by the
+// effective feed name (pkg/feeds/feeds.go Apply): a feed-server with per-feed
+// entries contributes each FeedEntry.Name; a single-feed server contributes its
+// FeedName, falling back to the server name. Two feeds sharing a name are a
+// config authoring error (a typo): the pre-#4913 Apply ranged the UNORDERED
+// FeedServers map and assigned m.feeds[name] = fs per entry, so the duplicate
+// OVERWROTE the earlier worker — orphaning its cancel func (a goroutine leak:
+// StopAll cancels only the survivor, so the overwritten refresh loop kept
+// fetching / firing onUpdate until the daemon's parent context ended) — and
+// enforcement read whichever provider won the last map iteration
+// (nondeterministic across commits / restarts). Reject the collision at commit
+// so the operator fixes the typo instead of shipping a denylist backed by a
+// nondeterministic provider.
+//
+// The effective-name derivation mirrors feeds.Manager EXACTLY (and the
+// declared-name set built by validateDynamicAddressFeedReferencesStrict). An
+// endpoint-less feed-server (rejected just before by
+// validateDynamicAddressFeedServerEndpointStrict) is SKIPPED by Apply and
+// registers no worker, so it is excluded here too (feedServerBaseURLEmpty) —
+// otherwise a benign endpoint-less shadow name would be miscounted as a live
+// collision. This gate runs AFTER the endpoint gate so, on the strict path, the
+// surviving servers are exactly the ones Apply would register.
+//
+// Strict path (commit / commit-check): the first collision is a hard error
+// naming the feed and both declaring servers. Lenient path (load / peer-sync,
+// opts.lenientDynamicAddressFeedRef): warn so an already-persisted or
+// peer-synced config an older binary accepted still boots — the runtime is now
+// deterministic-with-a-warning via the feeds.Apply de-dup (#4913), starting one
+// worker for the lexicographically-first server instead of leaking, now
+// flagged. Mirrors validateDynamicAddressFeedReferencesStrict.
+func validateDynamicAddressFeedNameUniquenessStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	servers := cfg.Security.DynamicAddress.FeedServers
+	if len(servers) == 0 {
+		return nil
+	}
+	// FeedServers is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs, and so the "first"
+	// declaring server recorded per name matches feeds.Apply's sorted winner.
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	owner := make(map[string]string) // effective feed name -> first declaring server display name
+	for _, name := range names {
+		fs := servers[name]
+		if fs == nil || feedServerBaseURLEmpty(fs) {
+			continue
+		}
+		display := fs.Name
+		if display == "" {
+			display = name
+		}
+		add := func(feedName string) error {
+			if feedName == "" {
+				return nil
+			}
+			if prev, ok := owner[feedName]; ok {
+				return fmt.Errorf("security dynamic-address feed name %q is "+
+					"declared by more than one feed-server (%q and %q) — a feed "+
+					"name is a unique identity: the duplicate would start an "+
+					"orphaned refresh loop and back enforcement with a "+
+					"nondeterministic provider; rename one feed", feedName, prev, display)
+			}
+			owner[feedName] = display
+			return nil
+		}
+		if len(fs.FeedEntries) > 0 {
+			for _, fe := range fs.FeedEntries {
+				if err := add(fe.Name); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		key := fs.FeedName
+		if key == "" {
+			key = fs.Name
+		}
+		if err := add(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateDynamicAddressFeedReferencesStrict hard-rejects a
 // `security dynamic-address address-name <addr> profile feed-name <feed>`
 // binding whose `<feed>` resolves to no declared feed (#3300). The
