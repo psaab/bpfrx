@@ -1265,3 +1265,114 @@ func mapsEqualSI(a, b map[string]int) bool {
 	}
 	return true
 }
+
+// cloneIDSet copies an id-occupancy set so a probe run does not mutate the
+// caller's map.
+func cloneIDSet(m map[int]bool) map[int]bool {
+	out := make(map[int]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// oldLinearProbe reproduces the pre-#5203 collision probe: a +1 linear walk
+// through whatever ids the node's rendered set already occupies. Its result is
+// therefore a function of the SURROUNDING subnets, which is exactly the
+// node-dependence #5203 removes. Kept in the test only, to prove the scenario
+// below actually discriminates the old behavior from the new.
+func oldLinearProbe(base int, used map[int]bool) int {
+	id := base
+	for used[id] {
+		if id >= keaSubnetIDMax {
+			id = 1
+		} else {
+			id++
+		}
+	}
+	return id
+}
+
+// TestKeaSubnetIDCollisionProbeIsNodeIndependent is the #5203 completeness
+// guard for #5041. stableSubnetID makes the common (non-colliding) subnet_id a
+// pure function of the CIDR, so both HA nodes agree. On a genuine FNV-1a
+// COLLISION the loser must PROBE for a free id. The old probe stepped +1
+// through the node's render order, so the free id it landed on depended on
+// which OTHER subnets were in THAT node's MASTER-filtered subset — under
+// asymmetric mastering the two nodes could disagree, reintroducing the #5041
+// cross-node lease misbind for the colliding pair. resolveSubnetID now walks a
+// CIDR-DERIVED sequence, so a colliding subnet resolves to the SAME id on both
+// nodes regardless of the surrounding subnets.
+//
+// The two `used` maps model the exact asymmetry: both nodes see `cidr`
+// colliding at `base` (its stableSubnetID, already claimed by the collision's
+// winning partner), but node A additionally masters subnets that happen to sit
+// on the LINEAR probe path base+1, base+2 while node B does not. The old +1
+// probe walks past those on node A only, so it diverges; the CIDR-derived
+// probe ignores set position and converges.
+func TestKeaSubnetIDCollisionProbeIsNodeIndependent(t *testing.T) {
+	const cidr = "10.55.0.0/24"
+	base := stableSubnetID(cidr)
+
+	// The CIDR-derived step must not itself land on base+1/base+2 for this
+	// fixture, or node A's extra occupancy would perturb the new probe too and
+	// mask the property under test. It never does (the step is a large hash),
+	// but assert it so the fixture stays honest if the hash salt changes.
+	step := int(subnetProbeStep(cidr))
+	if step == 1 || step == 2 {
+		t.Fatalf("fixture invalid: CIDR-derived step %d collides with the linear-path occupancy", step)
+	}
+
+	nodeA := map[int]bool{base: true, base + 1: true, base + 2: true}
+	nodeB := map[int]bool{base: true}
+
+	idA := resolveSubnetID(cidr, cloneIDSet(nodeA))
+	idB := resolveSubnetID(cidr, cloneIDSet(nodeB))
+
+	if idA != idB {
+		t.Fatalf("resolveSubnetID gave id %d on node A but %d on node B for the same colliding CIDR %s — a synced lease would misbind on the peer (#5203)", idA, idB, cidr)
+	}
+	if idA == base {
+		t.Fatalf("collision left unresolved: id stayed at the occupied base %d", base)
+	}
+	if idA < 1 || idA > keaSubnetIDMax {
+		t.Fatalf("resolved id %d outside the valid Kea range [1,%d]", idA, keaSubnetIDMax)
+	}
+
+	// Fail-on-revert: prove the scenario actually distinguishes the fix. The
+	// old linear +1 probe DID depend on the node's subset, so it MUST disagree
+	// across nodeA/nodeB here. If it agreed, the fixture would not be
+	// exercising the divergence resolveSubnetID removes.
+	oldA := oldLinearProbe(base, cloneIDSet(nodeA))
+	oldB := oldLinearProbe(base, cloneIDSet(nodeB))
+	if oldA == oldB {
+		t.Fatalf("fixture does not discriminate the fix: the old linear probe agreed (%d) across both node subsets", oldA)
+	}
+}
+
+// TestResolveSubnetIDNonColliding asserts the common path is unchanged: with no
+// occupied ids every subnet resolves to its stableSubnetID direct hit, no id is
+// 0 (Kea's SUBNET_ID_UNUSED sentinel) or out of range, and a rendered set never
+// contains a duplicate id.
+func TestResolveSubnetIDNonColliding(t *testing.T) {
+	cidrs := []string{
+		"10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24",
+		"192.168.0.0/23", "172.16.5.0/24",
+		"2001:db8:1::/64", "2001:db8:2::/64",
+	}
+	used := make(map[int]bool)
+	for _, c := range cidrs {
+		want := stableSubnetID(c)
+		got := resolveSubnetID(c, used)
+		if got != want {
+			t.Errorf("resolveSubnetID(%s) = %d, want stableSubnetID direct hit %d", c, got, want)
+		}
+		if got < 1 || got > keaSubnetIDMax {
+			t.Errorf("resolveSubnetID(%s) = %d outside valid Kea range [1,%d]", c, got, keaSubnetIDMax)
+		}
+		if used[got] {
+			t.Errorf("resolveSubnetID(%s) = %d duplicates an already-assigned id", c, got)
+		}
+		used[got] = true
+	}
+}
