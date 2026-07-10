@@ -38,6 +38,15 @@
 //     a same-name redefine's OLD command set, and a queued duplicate that raced
 //     the arm-on-commit cooldown all stop firing instead of mutating config no
 //     active policy authorizes.
+//   - #5311 revision-aware cooldown arm: the arm-on-commit stamp is CONDITIONAL
+//     on the live runtime still being the same generation (semantic revision)
+//     that authorized the action. A remediation whose own commit redefines the
+//     triggering policy (R1 -> R2) reconciles a FRESH re-armed runtime through
+//     the commit callback's Apply; armCooldown must not stamp that successor R2
+//     with R1's completion time (a name-based ABA that would suppress the
+//     re-armed R2 for the whole cooldown, contradicting the "a redefined policy
+//     re-arms" contract). The identity check and stamp run together under e.mu
+//     so a concurrent Apply cannot swap the runtime between them.
 package eventengine
 
 import (
@@ -664,7 +673,13 @@ func (e *Engine) runAction(a plannedAction) {
 		err := e.applyOnce(e.commitContext(), a)
 		if err == nil {
 			e.counters.committed.Add(1)
-			e.armCooldown(a.policyName)
+			// Arm the cooldown against the SAME generation that authorized this
+			// action (#5311). a.semRev is the policy's semantic revision as of
+			// the evaluate that enqueued the action; staleReason already proved
+			// it still matched live state at commit time. Passing it lets
+			// armCooldown skip the stamp if this action's OWN commit redefined
+			// the policy (R1 -> R2), which reconciled a fresh re-armed runtime.
+			e.armCooldown(a.policyName, a.semRev)
 			slog.Info("event-options: configuration committed",
 				"policy", a.policyName, "commands", len(a.ops))
 			return
@@ -923,9 +938,29 @@ func (e *Engine) classifyPlan(pol *config.EventPolicy) ([]plannedOp, bool) {
 // armCooldown records a successful-commit timestamp for the policy under lock
 // (#2140 / #2157). Done on the worker after commit so a dropped/rejected
 // action does not consume the cooldown.
-func (e *Engine) armCooldown(name string) {
+//
+// Revision-aware ABA guard (#5311): the stamp is CONDITIONAL on the live
+// runtime still being the SAME generation that authorized this action. authRev
+// is the action's semantic revision (plannedAction.semRev). A remediation whose
+// own commit redefined the triggering policy (R1 -> R2) reconciles through the
+// commitFn callback -> Apply, which installs a FRESH re-armed runtime for the
+// successor because the semantic revision changed. That successor R2 must NOT be
+// stamped with R1's completion time: doing so is a name-based ABA that would
+// suppress the re-armed R2 for the whole ~30s cooldown, contradicting the
+// documented "a redefined policy re-arms" contract (README, reconcile section).
+// When authRev no longer matches e.semRev[name] (successor installed, or policy
+// removed — no entry), skip the stamp; the successor keeps its zero lastTrigger.
+// The identity check and the stamp are performed under e.mu in one critical
+// section so a concurrent Apply cannot swap the runtime between them (no TOCTOU).
+func (e *Engine) armCooldown(name, authRev string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.semRev[name] != authRev {
+		// A successor generation was installed (or the policy was removed) while
+		// this action committed. Do not throttle the successor with the
+		// predecessor's completion time.
+		return
+	}
 	if rt := e.runtime[name]; rt != nil {
 		rt.lastTrigger = e.now()
 	}

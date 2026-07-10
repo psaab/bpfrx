@@ -105,6 +105,34 @@ the queue, but the timestamp is written by the worker after a successful
 commit, so a dropped/rejected action does NOT consume the cooldown — the next
 legitimate trigger can retry.
 
+### Revision-aware cooldown arm (#5311)
+
+The arm-on-commit stamp is **conditional on the live runtime still being the
+same generation that authorized the action**. `armCooldown(name, authRev)`
+stamps `lastTrigger` only when `e.semRev[name] == authRev`, where `authRev` is
+the action's `plannedAction.semRev`. The identity check and the stamp run
+together under `e.mu`, so a concurrent `Apply` cannot swap the runtime between
+them (no TOCTOU).
+
+This closes a **name-based ABA** that violated the "a redefined policy re-arms"
+contract above. A remediation whose own `change-configuration` redefines its
+triggering policy (R1 → R2) commits synchronously; the daemon's commit callback
+then reconciles the new config and calls `Apply`, which — because the semantic
+revision changed — installs a **fresh re-armed runtime** (zero `lastTrigger`)
+for the successor R2. The old revision-blind `armCooldown(name)` stamped
+whatever runtime was under `name` at that instant, so it wrote **R1's completion
+time onto the freshly re-armed R2**, suppressing R2 for the whole 30 s cooldown —
+exactly the re-arm the reconcile just performed. Passing the authorizing
+revision lets `armCooldown` detect the successor (`e.semRev[name]` now carries
+R2's revision, `authRev` still carries R1's) and skip the stamp; R2 keeps its
+zero `lastTrigger` and an immediately following event fires it. When the policy
+was instead removed during the action, `e.semRev` has no entry and the mismatch
+skips the (now absent) stamp too. The common case — a policy that does not
+redefine itself — is unchanged: `authRev` still matches the carried-forward
+runtime and the cooldown stamps as before. Regression-locked (fail-on-revert) by
+`Test*_5311` in `engine_cooldown_rev_5311_test.go` — reverting to the name-only
+stamp re-throttles the successor and the ABA tests go RED.
+
 ## Revalidate a queued action before commit (#3750)
 
 A pre-classified `plannedAction` sits in the worker queue (and may retry for up
