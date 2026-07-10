@@ -766,11 +766,7 @@ func (d *Daemon) reconcileRGState() {
 		// MAC producing a distinct link-local, so hosts see each node
 		// as a separate IPv6 router. Without this, hosts ECMP-split
 		// traffic to BOTH nodes even though only one is active.
-		if !tr.Active && d.ra != nil && !d.startupGoodbyeRA[rgID] {
-			if d.startupGoodbyeRA == nil {
-				d.startupGoodbyeRA = make(map[int]bool)
-			}
-			d.startupGoodbyeRA[rgID] = true
+		if !tr.Active && d.ra != nil && d.startupGoodbyeNeeded(rgID) {
 			cfg := d.store.ActiveConfig()
 			if cfg != nil {
 				rgIfaces := rethInterfacesForRG(cfg, rgID)
@@ -785,8 +781,11 @@ func (d *Daemon) reconcileRGState() {
 						rgRA = append(rgRA, ra)
 					}
 				}
-				if len(rgRA) > 0 {
-					go d.ra.WithdrawOnce(rgRA)
+				if len(rgRA) > 0 && d.startupGoodbyeBegin(rgID) {
+					// Emit off the reconcile goroutine (bind retry can take ~2s);
+					// the sticky bit is set only after the goodbye lands so a
+					// failure is retried on the next reconcile tick (#5093).
+					go d.runStartupGoodbye(rgID, rgRA)
 				}
 			}
 		}
@@ -797,6 +796,72 @@ func (d *Daemon) reconcileRGState() {
 	// the data-RG primary; the standby reverts to the config baseline.
 	if anyRGChanged {
 		d.reconcileIPMonGating()
+	}
+}
+
+// startupGoodbyeNeeded reports whether the cold-boot one-shot goodbye still
+// needs to run for rgID: not already confirmed sent AND not currently in
+// flight. Guarded by startupGoodbyeMu because the in-flight/done state is now
+// written from the async goodbye goroutine (#5093).
+func (d *Daemon) startupGoodbyeNeeded(rgID int) bool {
+	d.startupGoodbyeMu.Lock()
+	defer d.startupGoodbyeMu.Unlock()
+	return !d.startupGoodbyeRA[rgID] && !d.startupGoodbyeInflight[rgID]
+}
+
+// startupGoodbyeBegin atomically claims the in-flight slot for rgID. It returns
+// false if the goodbye was completed or claimed by another goroutine between the
+// startupGoodbyeNeeded check and here, so at most one goodbye goroutine runs per
+// RG at a time (a duplicate would self-skip on the held WithdrawOnce tombstone
+// and falsely record success — #5093).
+func (d *Daemon) startupGoodbyeBegin(rgID int) bool {
+	d.startupGoodbyeMu.Lock()
+	defer d.startupGoodbyeMu.Unlock()
+	if d.startupGoodbyeRA[rgID] || d.startupGoodbyeInflight[rgID] {
+		return false
+	}
+	if d.startupGoodbyeInflight == nil {
+		d.startupGoodbyeInflight = make(map[int]bool)
+	}
+	d.startupGoodbyeInflight[rgID] = true
+	return true
+}
+
+// runStartupGoodbye emits the cold-boot one-shot goodbye for an inactive RG and
+// marks the RG done ONLY when every interface's lifetime-0 RA was written (or
+// intentionally skipped because another owner already holds it). On any
+// per-interface write/bind failure it leaves the sticky bit unset so the next
+// reconcile pass (2s ticker) retries — the old code set the bit before launching
+// the async withdraw, so a bind/write failure was never retried and the stale
+// IPv6 default-router identity lingered on hosts until Router Lifetime expiry
+// (#5093). Runs in its own goroutine; the in-flight slot serializes retries.
+func (d *Daemon) runStartupGoodbye(rgID int, rgRA []*config.RAInterfaceConfig) {
+	withdraw := d.startupGoodbyeWithdrawFn
+	if withdraw == nil {
+		withdraw = d.ra.WithdrawOnce
+	}
+	results := withdraw(rgRA)
+	done := true
+	for _, r := range results {
+		if r.Err != nil {
+			done = false
+			slog.Warn("ra: startup goodbye failed; will retry on next reconcile",
+				"rg", rgID, "interface", r.Interface, "err", r.Err)
+		}
+	}
+
+	d.startupGoodbyeMu.Lock()
+	delete(d.startupGoodbyeInflight, rgID)
+	if done {
+		if d.startupGoodbyeRA == nil {
+			d.startupGoodbyeRA = make(map[int]bool)
+		}
+		d.startupGoodbyeRA[rgID] = true
+	}
+	d.startupGoodbyeMu.Unlock()
+
+	if done {
+		slog.Info("ra: startup goodbye complete", "rg", rgID)
 	}
 }
 

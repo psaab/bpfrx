@@ -561,7 +561,20 @@ type Daemon struct {
 	// startupGoodbyeRA tracks whether the one-shot goodbye RA has been
 	// sent for each inactive RG on startup. Prevents stale RA routes
 	// from a previous primary run keeping hosts dual-pathing traffic.
-	startupGoodbyeRA map[int]bool
+	// It is set only AFTER the goodbye provably went out (#5093): a
+	// bind/write failure leaves it unset so the reconcile ticker retries.
+	// startupGoodbyeMu guards it plus startupGoodbyeInflight, which are now
+	// written from the async WithdrawOnce goroutine as well as the reconcile
+	// loop. startupGoodbyeInflight marks RGs whose goodbye goroutine is still
+	// running so a later reconcile tick does not launch a duplicate (which
+	// would self-skip on the held tombstone and falsely record success).
+	startupGoodbyeMu       sync.Mutex
+	startupGoodbyeRA       map[int]bool
+	startupGoodbyeInflight map[int]bool
+	// startupGoodbyeWithdrawFn is the WithdrawOnce entry the cold-boot goodbye
+	// goroutine calls; overridable in tests to force per-interface outcomes
+	// (#5093). Nil means use d.ra.WithdrawOnce.
+	startupGoodbyeWithdrawFn func([]*config.RAInterfaceConfig) []ra.GoodbyeResult
 
 	// startupActiveAnnounce tracks whether the one-shot active-side
 	// neighbor refresh has been sent for each RG on this daemon run.
