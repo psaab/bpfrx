@@ -164,6 +164,18 @@ func (m *Manager) statusLoop(ctx context.Context) {
 						slog.Warn("userspace dataplane snapshot sync failed", "err", err)
 					}
 				}
+				// #5134: settle a deferred-MAC worker-arm debt. A live RETH
+				// virtual-MAC change with no link cycle publishes a workerless
+				// DeferWorkers=true snapshot; the daemon's mandatory re-apply
+				// arms the workers. If that re-apply failed, the daemon recorded
+				// generation debt here — retry the DeferWorkers=false publish
+				// until the workers bind, instead of leaving a non-forwarding
+				// snapshot with the commit reported successful.
+				if m.pendingWorkerArm {
+					if err := m.retryDeferredWorkerArmLocked(); err != nil {
+						slog.Warn("userspace: deferred-worker arm retry failed; will retry", "err", err)
+					}
+				}
 				helperActiveSig := activeHAGroupSignatureSlice(status.HAGroups)
 				if m.clusterHA {
 					_ = m.refreshHAStateFromMapsLocked()

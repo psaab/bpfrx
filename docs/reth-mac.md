@@ -67,6 +67,48 @@ also restores that function's live-address-change detection, which
 requires an UP link to distinguish `IFF_LIVE_ADDR_CHANGE` drivers from
 those that need a cycle.
 
+## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
+
+Programming the virtual MAC can happen two ways:
+
+- **Link cycle** (`programRethMAC` had to bring the member DOWN/UP): the old
+  AF_XDP sockets die with the cycle. The daemon calls `NotifyLinkCycle()`,
+  which sends `rebind` to the helper and recreates the workers with fresh
+  sockets. This path arms the workers via the rebind, independent of the
+  published snapshot's `DeferWorkers` flag.
+- **Live MAC set** (`IFF_LIVE_ADDR_CHANGE` driver, or the fast path that sets
+  the MAC while the link is still DOWN — no cycle): the initial dataplane
+  apply of the commit ran with `SetDeferWorkers(true)` so worker startup was
+  skipped (avoids the mlx5 zero-copy double-bind EBUSY). The published
+  snapshot therefore carries `DeferWorkers=true` and is **workerless /
+  non-forwarding**. The daemon then issues a MANDATORY second `ApplyConfig`
+  (`reapplyAfterDeferredMAC`) with the correct MAC and `DeferWorkers` cleared —
+  that re-apply is what actually starts the workers.
+
+The re-apply is failure-critical. The userspace manager only advances its
+snapshot bookkeeping (`lastSnapshot` / `publishedSnapshot` / `lastSnapshotHash`)
+on a **successful** `apply_snapshot` publish. If the re-apply's publish fails
+(helper rejects it, control-socket error, resource pressure) and the daemon
+swallows the error, the manager keeps the workerless `DeferWorkers=true`
+snapshot as the published/last state, status reconciliation replays it, the
+workers never bind, and the commit still reports success — a silent forwarding
+outage on that node.
+
+**Contract:** `reapplyAfterDeferredMAC` never swallows the re-apply error. On
+failure it records **generation debt** via `RecordDeferredWorkerArmDebt()`
+(`Manager.pendingWorkerArm`). The 1 Hz status reconcile loop calls
+`retryDeferredWorkerArmLocked()`, which republishes the retained snapshot with
+`DeferWorkers=false` and a bumped generation until the workers bind, then clears
+the debt. A transient helper error self-heals without failing the commit; the
+node never terminally publishes a workerless snapshot while reporting success.
+
+| File | Function |
+|------|----------|
+| `pkg/daemon/daemon_apply.go` | `reapplyAfterDeferredMAC()` — mandatory re-apply; records debt on failure |
+| `pkg/daemon/daemon_apply.go` | `recordDataplaneWorkerArmDebt()` — routes the debt to the dataplane |
+| `pkg/dataplane/userspace/manager_worker_arm_5134.go` | `RecordDeferredWorkerArmDebt()` / `retryDeferredWorkerArmLocked()` |
+| `pkg/dataplane/userspace/process_status.go` | status loop drives the retry each tick |
+
 ## Reboot Safety
 
 - Bootstrap `.link` files (from `setup.sh`) use the physical MAC for udev rename

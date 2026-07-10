@@ -1003,9 +1003,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		// MAC set live (no link cycle) but workers were deferred.
 		// Trigger a re-apply to start workers with the now-correct MAC.
 		// This is cheaper than NotifyLinkCycle (no stop_workers/rebind).
-		if _, err := d.dp.ApplyConfig(context.Background(), cfg); err != nil {
-			slog.Warn("failed to re-apply after deferred MAC", "err", err)
-		}
+		d.reapplyAfterDeferredMAC(cfg)
 	}
 
 	// NOTE: stable link-local cleanup for secondary RGs is handled by
@@ -1875,6 +1873,50 @@ func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {
 		return
 	}
 	d.dp.Link().SetDeferWorkers(deferWorkers)
+}
+
+// reapplyAfterDeferredMAC runs the MANDATORY dataplane re-apply that arms the
+// deferred AF_XDP workers after a live RETH virtual-MAC change with no link
+// cycle (#5134). The first apply of this commit published a workerless
+// DeferWorkers=true snapshot (worker startup was deferred so the double-bind
+// does not EBUSY on mlx5 zero-copy queues); this re-apply — now with the
+// correct MAC and DeferWorkers cleared — is what actually starts the workers.
+//
+// If the re-apply fails, the error MUST NOT be swallowed into a successful
+// commit: the userspace manager only advances its snapshot bookkeeping on a
+// successful publish, so a failed re-apply leaves the workerless snapshot as
+// the published/last state and status reconciliation replays it forever —
+// workers never bind and forwarding is silently down on this node. Record
+// generation debt so the status reconcile loop retries the DeferWorkers=false
+// publish until the workers bind, self-healing a transient helper /
+// control-socket error.
+func (d *Daemon) reapplyAfterDeferredMAC(cfg *config.Config) {
+	if d.dp == nil {
+		return
+	}
+	if _, err := d.dp.ApplyConfig(context.Background(), cfg); err != nil {
+		slog.Warn("failed to re-apply after deferred MAC; recording worker-arm debt for retry",
+			"err", err)
+		d.recordDataplaneWorkerArmDebt()
+	}
+}
+
+// recordDataplaneWorkerArmDebt records the #5134 deferred-MAC worker-arm debt on
+// the dataplane so status reconciliation retries the DeferWorkers=false publish.
+// Mirrors setDataplaneDeferWorkers: assert the recorder directly on d.dp, else
+// reach it through the link controller.
+func (d *Daemon) recordDataplaneWorkerArmDebt() {
+	if d.dp == nil {
+		return
+	}
+	type debtRecorder interface{ RecordDeferredWorkerArmDebt() }
+	if r, ok := d.dp.(debtRecorder); ok {
+		r.RecordDeferredWorkerArmDebt()
+		return
+	}
+	if r, ok := d.dp.Link().(debtRecorder); ok {
+		r.RecordDeferredWorkerArmDebt()
+	}
 }
 
 // reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).
