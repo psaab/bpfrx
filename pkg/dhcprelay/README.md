@@ -48,6 +48,46 @@ The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
 real `ciaddr`" UDP-unicast row — the client already owns and ARP-answers for
 its address.
 
+## Relay chaining — giaddr / Option 82 ownership (#5071)
+
+The forward loop distinguishes a **first-hop** relay from an **intermediate**
+relay in a chain by inspecting the inbound BOOTREQUEST's `giaddr`
+(`GatewayIPAddr`), per RFC 1542 §4.1.1 / RFC 3046:
+
+| Inbound `giaddr` | `giaddr` action | Option 82 action | `hops` |
+|------------------|-----------------|------------------|--------|
+| `0.0.0.0` (first hop) | **stamp** this relay's interface IP | **insert** `circuit-id` = interface name | increment (after limit check) |
+| non-zero (chained) | **preserve** untouched | **preserve** the downstream option untouched (no `Del`/overwrite) | increment (after limit check) |
+
+The **first relay on the client segment owns both fields**: the server selects
+the client's address pool from the `giaddr` it sees and unicasts its
+`OFFER`/`ACK` back to `giaddr:67`, and the original `circuit-id` must survive so
+the operator's per-port Option 82 policy still applies at the server. An
+intermediate relay that overwrote `giaddr` would make the server lease from the
+wrong pool and reply to the wrong relay; overwriting Option 82 would destroy the
+downstream `circuit-id`. So on a chained request this relay changes **only** the
+BOOTP `hops` field.
+
+- The chained condition is captured **before** any mutation
+  (`giaddrIsSet(pkt.GatewayIPAddr)`), so a zero `giaddr` in either the 4-byte or
+  4-in-16 form reads as first-hop.
+- The RFC 1542 §4.1.1 hop-limit check (`overrides maximum-hop-count`, default
+  16, #4309) runs for **both** paths — it is most load-bearing on a chained
+  ring, where a misconfigured downstream relay loop would otherwise circulate a
+  request forever (`RequestsDroppedMaxHops`).
+- **Reply path.** A chained request's reply is unicast by the server directly to
+  the preserved (downstream) `giaddr:67`, so it does not return through this
+  relay's `giaddr:67`-bound server conn — the intermediate relay handles only the
+  request direction, which is RFC-correct. The reply-path Option 82 strip +
+  `giaddr` clear (below) therefore only fires for first-hop leases this relay
+  actually owns.
+- **Untrusted-client Option 82 policy is out of scope.** Junos models a
+  `trusted`/`untrusted` edge with per-port Option 82 insert/replace/keep/drop
+  actions. xpf has no such config knob today (only `relay-agent-option`,
+  accepted-only), so this fix implements the minimal RFC-correct preservation:
+  first-hop inserts, chained preserves. A future `option-82` trust-policy knob
+  can layer an explicit untrusted-client replace/drop action on top.
+
 ## Reply delivery model (#2076)
 
 Server replies (OFFER/ACK/NAK/FORCERENEW) are delivered to clients honoring the
@@ -413,8 +453,11 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   upstream server lease from the wrong subnet pool. If netlink enumeration
   fails the resolver falls back to the portable lister rather than failing
   closed (a transient netlink hiccup must not strand a relay).
-- Option 82 sub-option 1 (`circuit-id`) is set to the interface name; on
-  the reply path it's stripped before forwarding to the client.
+- Option 82 sub-option 1 (`circuit-id`) is set to the interface name **on
+  first-hop requests only** (inbound `giaddr==0`); a chained request's
+  downstream Option 82 is preserved untouched (#5071, see "Relay chaining"
+  above). On the reply path Option 82 is stripped before forwarding to the
+  client.
 - Server addresses must be **literal IPs**. `Apply()` calls
   `net.ParseIP` and rejects hostnames; there is no DNS resolution
   path. To target a hostname, the operator must resolve it externally
