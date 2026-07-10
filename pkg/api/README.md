@@ -719,6 +719,37 @@ under the daemon's errgroup. Nothing else imports this package.
   node-local session-map keys (opaque to clients); when the runtime
   dataplane lacks cursor iteration the handler falls back to the offset path.
   Pinned by `sessions_pagination_test.go`.
+- Bounded pagination walk + admission gate (#5318, connected-client residual
+  after the #5237 disconnect-abort). Two hardenings on `GET /security/sessions`
+  so a small paginated read cannot force unbounded full-table work per page:
+  - **Admission bound.** A session list is a full conntrack-table walk that
+    contends with the live session-sync path for per-bucket BPF-map locks. The
+    handler now acquires a slot from `sessionsListLimiter`
+    (`diagcmd.NewLimiter(maxConcurrentSessionLists)` = 4, the SAME fail-fast
+    counting-semaphore idiom the diagnostic ping/traceroute handlers use, #5057)
+    BEFORE the walk and the peer fan-out, releasing on every exit path. Over-cap
+    requests are rejected immediately with **HTTP 429** (`session list
+    concurrency limit reached; retry shortly`) rather than each driving its own
+    simultaneous walk — a scrape flood can no longer multiply lock contention.
+    The #5237 disconnect-abort bounds a SINGLE client's walk once ITS connection
+    drops; this bounds how many CONNECTED clients walk at once, which the
+    disconnect-abort does not.
+  - **Bounded Total.** The offset mode's exact `total` previously forced a FULL
+    v4+v6 table scan on EVERY 100-row page (O(table) per page, repeated per
+    poll) just to count. The walk now caps the count at `sessionCountCap`
+    (`defaultSessionCountCap` = 1,000,000) matching rows: `countCap` is
+    `max(sessionCountCap, offset+limit)` so an explicitly requested deep window
+    still fills to `limit`. UNDER the cap `total` is EXACT and the response is
+    **byte-identical** to before (`total_approximate` is `omitempty`, so it is
+    absent for normal-sized tables). PAST the cap the walk stops and `total`
+    becomes a bounded LOWER BOUND with `total_approximate: true` — only the
+    multi-million-session case degrades, and it degrades gracefully rather than
+    re-walking the whole table per page. Cursor mode (`page_size>0`) is already
+    bounded (it stops at `page_size` and reports no `total`) and is unchanged.
+    A fuller keyset/cursor-default redesign of the offset contract is a possible
+    follow-up; this fix is the minimal bounded one. Pinned by
+    `sessions_pagination_bound_5318_test.go` (RED-on-revert: the bounded-walk and
+    admission assertions both fail if either hardening is removed).
 - Session clear (`POST /api/v1/security/sessions/clear`) clears ALL local
   sessions and accepts NO parameters: a non-empty query string
   (`r.URL.RawQuery`) or request body returns HTTP 400 rather than silently

@@ -45291,3 +45291,14 @@ top.
     pkg/upgrade/kernel_pkgquery_5428_test.go,
     pkg/upgrade/kernel_purge_5076_test.go,
     docs/pr/1930-inc1-kernel-channel/codex-kernel-linux-impl.md, _Log.md
+
+## 2026-07-10 — #5318 bound sessions pagination walk + admission gate
+- **Timestamp**: 2026-07-10
+- **Action**: Fixed #5318 (api, connected-client residual after #5237). Added a
+  per-endpoint admission semaphore (`sessionsListLimiter`, reusing
+  `diagcmd.NewLimiter`, cap 4 → HTTP 429 on saturation) to `sessionsHandler`,
+  and bounded the offset-mode Total-counting walk (`sessionCountCap` = 1,000,000;
+  exact byte-compatible Total under the cap, `total_approximate` lower bound past
+  it). #5237 disconnect-abort preserved. RED-on-revert proven for both.
+- **File(s)**: pkg/api/sessions.go, pkg/api/types.go,
+  pkg/api/sessions_pagination_bound_5318_test.go, pkg/api/README.md, _Log.md

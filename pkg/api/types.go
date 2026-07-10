@@ -328,12 +328,20 @@ type SessionEntry struct {
 //     stable cursor page; an empty NextPageToken marks the last page.
 //     Total is omitted in cursor mode (it would require a full scan).
 type SessionListResponse struct {
-	Total         int            `json:"total"`
-	Limit         int            `json:"limit"`
-	Offset        int            `json:"offset"`
-	PageSize      int            `json:"page_size,omitempty"`
-	NextPageToken string         `json:"next_page_token,omitempty"`
-	Sessions      []SessionEntry `json:"sessions"`
+	Total int `json:"total"`
+	// TotalApproximate marks Total as a bounded LOWER BOUND rather than an
+	// exact table count (#5318). On a table larger than sessionCountCap the
+	// offset list walk stops after the cap instead of forcing a full v4+v6
+	// scan per page (which contended with session-sync on a multi-million-
+	// session firewall). Omitted (false) for normal-sized tables, where Total
+	// stays exact and the response is byte-identical to the pre-#5318 shape.
+	// Absent in cursor mode (page_size>0), which does not compute a Total.
+	TotalApproximate bool           `json:"total_approximate,omitempty"`
+	Limit            int            `json:"limit"`
+	Offset           int            `json:"offset"`
+	PageSize         int            `json:"page_size,omitempty"`
+	NextPageToken    string         `json:"next_page_token,omitempty"`
+	Sessions         []SessionEntry `json:"sessions"`
 	// NodeID is the cluster node this list was observed on (0 standalone),
 	// mirroring the gRPC GetSessionsResponse.node_id. It is always present
 	// so a dashboard polling one node knows WHICH node's table it sees —
