@@ -62,7 +62,10 @@ type CompileResult struct {
 	// ID. The ID is DERIVED from the key by a stable hash (assignNATCounterID),
 	// not a sequential position counter, so a rule keeps the same ID across a
 	// config reorder/removal — the cumulative helper counter store stays
-	// correctly attributed by construction (#2255). 0 = no counter.
+	// correctly attributed by construction (#2255). A rare distinct-key hash
+	// collision is resolved by finalizeNATCounterIDs in a stable sorted order
+	// after all NAT phases, so the assignment is independent of compile order
+	// even on a collision (#5099). 0 = no counter.
 	NATCounterIDs map[string]uint32
 
 	// pendingXDP/TC collect interface indexes for deferred program attachment.
@@ -242,6 +245,13 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	if err := compileStaticNAT(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile static nat: %w", err)
 	}
+
+	// SNAT, DNAT, and static NAT have now recorded every per-rule counter key.
+	// Re-derive the authoritative counter IDs in a stable order so a distinct-
+	// key hash collision resolves the same way regardless of the order the rules
+	// compiled in — the streaming assignment alone is compile-order dependent
+	// on a collision (#5099).
+	finalizeNATCounterIDs(result)
 
 	// Phase 6.6: Compile NAT64 prefixes
 	if err := compileNAT64(dp, cfg, result); err != nil {
