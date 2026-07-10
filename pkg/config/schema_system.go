@@ -64,8 +64,13 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	// resolver directive token.
 	"domain-name":   {desc: "Domain name", args: 1, valueType: ValueHostname, valueDesc: "DNS domain name", valueExamples: []string{"example.net"}, validator: ValidateDNSDomain, placeholder: "<domain>", children: nil},
 	"domain-search": {desc: "Domain search list", args: 1, multi: true, valueType: ValueHostname, valueDesc: "DNS domain name", valueExamples: []string{"example.net", "corp.example.net"}, validator: ValidateDNSDomain, placeholder: "<domain>", children: nil},
-	"time-zone":     {desc: "System time zone", args: 1, placeholder: "<timezone>", children: nil},
-	"no-redirects":  {desc: "Disable ICMP redirects", children: nil},
+	// #5011: time-zone is rendered into the /etc/localtime symlink target
+	// (/usr/share/zoneinfo/<value>). Type it as a zoneinfo name so a `..`
+	// component / absolute path / space cannot turn the symlink target into a
+	// path-traversal. The daemon render belt (zoneinfoTarget) is the second
+	// boundary for a leniently-loaded value (#1960).
+	"time-zone":    {desc: "System time zone", args: 1, valueType: ValueTimeZone, valueDesc: "IANA time zone name", valueExamples: []string{"UTC", "America/Los_Angeles", "Etc/GMT+5"}, validator: ValidateTimeZone, placeholder: "<timezone>", children: nil},
+	"no-redirects": {desc: "Disable ICMP redirects", children: nil},
 	// #1319 PR 3: compiled verbatim and written into the resolver
 	// drop-in (pkg/daemon/daemon_dns.go:114) — a garbage server
 	// string silently produced broken DNS configuration.

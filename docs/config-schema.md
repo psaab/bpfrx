@@ -2176,6 +2176,21 @@ reserved for whole-dataplane selection where a rewrite shim
   positive worker count can make the loop wrap `uint32` or index past the
   fixed-size Array. This is the "lenient WARN-not-hang" contract applied at
   the runtime consumer.
+- **#5011 (time-zone path-traversal reject):** `system time-zone` was an
+  untyped string leaf rendered directly into the `/etc/localtime` symlink
+  target (`/usr/share/zoneinfo/<value>`, `applyTimezone` in
+  `pkg/daemon/daemon_system.go`). A `..` component / absolute path / space
+  was accepted, a theoretical traversal on the symlink target. It is now a
+  typed leaf: a new `ValueTimeZone` slot + `ValidateTimeZone` (a zoneinfo-name
+  grammar — one or more `/`-separated segments matching `[A-Za-z0-9][A-Za-z0-9_+-]*`,
+  so `.`/`..`/absolute/space/control are rejected; `UTC`,
+  `America/Los_Angeles`, `Etc/GMT+5` still pass) strict at commit-check. Per
+  the #1960 doctrine the tolerant load / peer-sync path only warns, so the
+  daemon carries a **render belt** (`zoneinfoTarget`): it resolves the joined
+  target with `filepath.Join` + `filepath.Rel` and refuses (fail-closed, no
+  symlink written) any value that is empty, absolute, or escapes the zoneinfo
+  root — the same validator+belt double boundary #4902 established for the
+  system service/resolver string leaves.
 - **#1746:** added the `class-of-service schedulers <s>
   equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
   leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler

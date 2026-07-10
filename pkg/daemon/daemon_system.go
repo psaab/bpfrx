@@ -581,6 +581,41 @@ func (d *Daemon) applySSHKnownHosts(cfg *config.Config) {
 	slog.Info("SSH known hosts written", "hosts", len(cfg.Security.SSHKnownHosts))
 }
 
+// zoneinfoRoot is the directory tree a `system time-zone` value may reference.
+// The /etc/localtime symlink target MUST resolve to a path within this root.
+const zoneinfoRoot = "/usr/share/zoneinfo"
+
+// zoneinfoTarget builds the /etc/localtime symlink target for the given
+// time-zone value and reports whether it stays within zoneinfoRoot. It is the
+// #5011 render belt: even if a traversal value ("../../etc/shadow") slips past
+// the commit-time config.ValidateTimeZone gate on the tolerant load /
+// peer-sync path (#1960), the daemon refuses to point /etc/localtime outside
+// the zoneinfo tree. filepath.Join cleans the joined path (collapsing any ".."
+// segments), so the containment test runs on the resolved target rather than
+// the raw string; for a legitimate zone (America/Los_Angeles, UTC, Etc/GMT+5)
+// the result is byte-identical to the old "/usr/share/zoneinfo/" + tz concat,
+// so the symlink idempotence compare is unaffected.
+func zoneinfoTarget(tz string) (string, bool) {
+	// An empty or absolute value is never a legitimate zone. filepath.Join
+	// would otherwise re-root an absolute value into the tree ("/etc/passwd"
+	// -> "/usr/share/zoneinfo/etc/passwd"), silently reinterpreting it; refuse
+	// it outright so the belt's rejection set matches ValidateTimeZone.
+	if tz == "" || filepath.IsAbs(tz) {
+		return "", false
+	}
+	target := filepath.Join(zoneinfoRoot, tz)
+	rel, err := filepath.Rel(zoneinfoRoot, target)
+	if err != nil {
+		return "", false
+	}
+	// rel == "." means tz resolved to the root itself ("."), which is a
+	// directory, not a zone file; a ".." or "../" prefix means it escaped.
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return target, true
+}
+
 // applyTimezone sets the system timezone from system { time-zone } config.
 func (d *Daemon) applyTimezone(cfg *config.Config) {
 	if cfg.System.TimeZone == "" {
@@ -599,7 +634,17 @@ func (d *Daemon) applyTimezone(cfg *config.Config) {
 	// the symlink when it is wrong; always (re)write /etc/timezone when its
 	// content differs, including when the symlink was already correct.
 	current, _ := os.Readlink("/etc/localtime")
-	target := "/usr/share/zoneinfo/" + cfg.System.TimeZone
+	// #5011 render belt: resolve the symlink target and refuse to create
+	// /etc/localtime if it escapes the zoneinfo root. The commit-time
+	// ValidateTimeZone gate rejects a `..`/absolute value, but #1960
+	// downgrades that to a warning on the tolerant load / peer-sync path, so
+	// this fail-closed check is the real boundary against a traversal target.
+	target, ok := zoneinfoTarget(cfg.System.TimeZone)
+	if !ok {
+		slog.Warn("refusing time-zone: symlink target escapes zoneinfo root",
+			"timezone", cfg.System.TimeZone)
+		return
+	}
 
 	tzContent := cfg.System.TimeZone + "\n"
 	tzCurrent, _ := os.ReadFile("/etc/timezone")
