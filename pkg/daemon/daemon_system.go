@@ -814,20 +814,64 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 		}
 	}
 
-	// Read existing xpf-managed files
+	// Reconcile the on-disk managed drop-ins against `desired`. A removal OR a
+	// (re)write flips `changed`, which gates the single restart below.
+	changed := reconcileSyslogDropins(confDir, prefix, desired)
+
+	if changed {
+		if out, err := runCommandTimeout("systemctl", "restart", "rsyslog"); err != nil {
+			slog.Error("failed to restart rsyslog",
+				"err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			slog.Info("rsyslog file configs applied", "files", len(desired))
+		}
+	}
+}
+
+// reconcileSyslogDropins removes stale xpf-managed rsyslog drop-ins (any file
+// under confDir whose name starts with prefix that is not present in desired)
+// and writes the desired drop-ins. It returns true when the on-disk managed
+// set actually changed — a file was removed OR a file was (re)written — which
+// the caller uses to gate the single `systemctl restart rsyslog`.
+//
+// #5111: a successful removal MUST count as a change, even when `desired` is
+// empty. Removing the final managed destination leaves nothing to write, so
+// the write loop cannot set `changed`; before this fix `changed` stayed false
+// and the restart was skipped, leaving rsyslog with the deleted rule still
+// loaded (logs kept flowing to a removed destination — an audit/confidentiality
+// leak). A no-op remove of an already-absent file (os.IsNotExist) does NOT count
+// so a steady-state reconcile does not spuriously restart rsyslog every apply.
+// os.Remove errors are surfaced (slog.Warn) rather than discarded, and still
+// mark a change so the restart re-reads config instead of silently stranding a
+// stale rule with no restart.
+func reconcileSyslogDropins(confDir, prefix string, desired map[string]string) bool {
+	changed := false
+
+	// Remove stale xpf-managed files.
 	entries, _ := os.ReadDir(confDir)
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), prefix) {
 			continue
 		}
-		if _, keep := desired[e.Name()]; !keep {
-			// Remove stale config
-			os.Remove(filepath.Join(confDir, e.Name()))
+		if _, keep := desired[e.Name()]; keep {
+			continue
 		}
+		path := filepath.Join(confDir, e.Name())
+		if err := os.Remove(path); err != nil {
+			if os.IsNotExist(err) {
+				// Already gone — nothing was actually removed, so no restart
+				// is owed for this entry.
+				continue
+			}
+			// A partial/failed removal is still a config change we want
+			// rsyslog to re-read; surface the error instead of discarding it.
+			slog.Warn("failed to remove stale rsyslog config",
+				"file", e.Name(), "err", err)
+		}
+		changed = true
 	}
 
-	// Write desired configs
-	changed := false
+	// Write desired configs.
 	for name, content := range desired {
 		path := filepath.Join(confDir, name)
 		current, _ := os.ReadFile(path)
@@ -841,14 +885,7 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 		}
 	}
 
-	if changed {
-		if out, err := runCommandTimeout("systemctl", "restart", "rsyslog"); err != nil {
-			slog.Error("failed to restart rsyslog",
-				"err", err, "output", strings.TrimSpace(string(out)))
-		} else {
-			slog.Info("rsyslog file configs applied", "files", len(desired))
-		}
-	}
+	return changed
 }
 
 // applySystemLogin creates OS user accounts and SSH authorized_keys from
