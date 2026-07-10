@@ -33,10 +33,11 @@ type fakeConn struct {
 	seq    int
 	closed bool
 
-	// rsQueue holds injected RS source addresses. ReadFrom pops one per call;
-	// when empty it blocks until rsSignal fires or the conn is closed, then
-	// returns a timeout error so the receiver polls stopCh.
-	rsQueue  []netip.Addr
+	// rsQueue holds injected Router Solicitations (control message + source).
+	// ReadFrom pops one per call; when empty it blocks until rsSignal fires or
+	// the conn is closed, then returns a timeout error so the receiver polls
+	// stopCh.
+	rsQueue  []rsInject
 	rsSignal chan struct{}
 
 	// liveCounter, if non-nil, is incremented on construction (by the
@@ -61,6 +62,14 @@ type fakeConn struct {
 	// can prove finishShutdown leaves goodbyeEmitted=false on a failed graceful
 	// goodbye, arming the manager's release-time backstop. Guarded by f.mu.
 	writeErr error
+}
+
+// rsInject is one queued Router Solicitation: the received control message
+// (carrying the IP Hop Limit once ipv6.FlagHopLimit is enabled) and the source
+// address, so a test can drive the RFC 4861 §6.1.1 receive validation.
+type rsInject struct {
+	cm  *ipv6.ControlMessage
+	src netip.Addr
 }
 
 func newFakeConn() *fakeConn {
@@ -121,10 +130,10 @@ func (f *fakeConn) ReadFrom() (ndp.Message, *ipv6.ControlMessage, netip.Addr, er
 			return nil, nil, netip.Addr{}, errClosed{}
 		}
 		if len(f.rsQueue) > 0 {
-			src := f.rsQueue[0]
+			rs := f.rsQueue[0]
 			f.rsQueue = f.rsQueue[1:]
 			f.mu.Unlock()
-			return &ndp.RouterSolicitation{}, nil, src, nil
+			return &ndp.RouterSolicitation{}, rs.cm, rs.src, nil
 		}
 		f.mu.Unlock()
 		// No RS queued: wait for a signal or a short tick, then return a
@@ -138,9 +147,19 @@ func (f *fakeConn) ReadFrom() (ndp.Message, *ipv6.ControlMessage, netip.Addr, er
 	}
 }
 
+// injectRS queues a VALID Router Solicitation from src: Hop Limit 255 (the
+// on-link value RFC 4861 §6.1.1 requires). Callers pass a link-local or
+// unspecified src so the RS passes receive validation and triggers an RA.
 func (f *fakeConn) injectRS(src netip.Addr) {
+	f.injectRSRaw(&ipv6.ControlMessage{HopLimit: 255}, src)
+}
+
+// injectRSRaw queues a Router Solicitation with a caller-chosen control message
+// (nil = hop limit unavailable) and source, so a test can drive the RFC 4861
+// §6.1.1 receive validation with a wrong hop limit or an off-link source.
+func (f *fakeConn) injectRSRaw(cm *ipv6.ControlMessage, src netip.Addr) {
 	f.mu.Lock()
-	f.rsQueue = append(f.rsQueue, src)
+	f.rsQueue = append(f.rsQueue, rsInject{cm: cm, src: src})
 	f.mu.Unlock()
 	select {
 	case f.rsSignal <- struct{}{}:
@@ -175,6 +194,7 @@ func (f *fakeConn) JoinGroup(netip.Addr) error       { return nil }
 func (f *fakeConn) SetICMPFilter(*ipv6.ICMPFilter) error {
 	return nil
 }
+func (f *fakeConn) SetControlMessage(ipv6.ControlFlags, bool) error { return nil }
 
 func (f *fakeConn) snapshot() []writeRec {
 	f.mu.Lock()
