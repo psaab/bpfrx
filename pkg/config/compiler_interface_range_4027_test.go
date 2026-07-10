@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestInterfaceRangeExpandsMembers is the #4027 RED-on-revert guard: an
@@ -279,5 +280,59 @@ func TestExpandMemberRangeHugeEndDoesNotOverflow(t *testing.T) {
 	}
 	if len(warnings) == 0 {
 		t.Errorf("expandMemberRange with overflow-triggering end returned no warning")
+	}
+}
+
+// TestExpandMemberRangeNearMaxInt64Terminates is the #5373 RED-on-revert
+// guard for a DIFFERENT overflow than #4807. Here BOTH endpoints sit just
+// below math.MaxInt64 and their DIFFERENCE (en-sn == 5) is well under the
+// interfaceRangeMaxMembers cap, so the range PASSES the `en-sn >= cap`
+// guard — yet the old counting loop `for i := sn; i <= en; i++` still
+// overflowed: at i == MaxInt64 the body ran, then i++ wrapped to
+// math.MinInt64, MinInt64 <= MaxInt64 stayed true, and the loop appended
+// member names forever (infinite loop + unbounded slice growth → OOM).
+// expandMemberRange runs at strict commit AND on the tolerant / HA
+// config-sync load path, so a persisted or peer-synced config carrying
+// this pattern hangs the daemon on load, not merely on an interactive
+// commit.
+//
+// The fix iterates on the bounded count k in 0..(en-sn) (< 4096) and
+// forms names as sn+k, so the loop variable never approaches MaxInt64 and
+// termination is independent of en's absolute magnitude. This test drives
+// expandMemberRange in a goroutine guarded by a 2s watchdog: with the fix
+// it returns instantly with the 6-name sn..en list; WITHOUT the fix the
+// goroutine spins forever and the watchdog fires t.Fatal — the test goes
+// RED on revert without wedging the rest of the `go test` run.
+func TestExpandMemberRangeNearMaxInt64Terminates(t *testing.T) {
+	// sn = MaxInt64-5, en = MaxInt64. en-sn == 5 (< cap) so the range is
+	// NOT rejected, but en == MaxInt64 is exactly the i++ overflow point.
+	const start = "ge-0/0/9223372036854775802"
+	const end = "ge-0/0/9223372036854775807"
+
+	type result struct {
+		members  []string
+		warnings []string
+	}
+	done := make(chan result, 1)
+	go func() {
+		m, w := expandMemberRange("R", []string{start, "to", end})
+		done <- result{m, w}
+	}()
+
+	select {
+	case r := <-done:
+		if len(r.warnings) != 0 {
+			t.Fatalf("unexpected warning for a within-cap range: %v", r.warnings)
+		}
+		// sn..en inclusive == 6 member names, bounded and correct.
+		if len(r.members) != 6 {
+			t.Fatalf("expandMemberRange returned %d members, want 6: %v", len(r.members), r.members)
+		}
+		if r.members[0] != "ge-0/0/9223372036854775802" ||
+			r.members[5] != "ge-0/0/9223372036854775807" {
+			t.Fatalf("member endpoints wrong: first=%q last=%q", r.members[0], r.members[5])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expandMemberRange did not terminate within 2s — int64 loop-variable overflow (#5373)")
 	}
 }
