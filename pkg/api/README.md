@@ -544,7 +544,16 @@ under the daemon's errgroup. Nothing else imports this package.
   cross-zone observability leak). `queryUint16Strict`/`queryIntStrict`
   (`api.go`) return `(0, false)` on a malformed non-empty value; the
   sessions/events `zone` filter and the policy-match `dst_port`/`src_port`
-  return HTTP 400 instead of zeroing the predicate. #3679: `queryIntStrict`
+  return HTTP 400 instead of zeroing the predicate. #4926: the
+  security-events `limit` parameter is likewise parsed strict — a
+  present-but-malformed/negative value (`limit=abc`, `limit=-1`), a
+  non-canonical spelling (`limit=+5`), or a value past the 10000 upper cap
+  (`limit=10001`) returns HTTP 400 instead of silently defaulting to 50 or
+  clamping (a fail-open that mirrored the lenient `queryInt` and could
+  under-report the requested event window). An absent/empty `limit` still
+  defaults to 50, matching the zone filter's "absent = no constraint"
+  semantics; a valid `limit` in `[0..10000]` is used as-is. #3679:
+  `queryIntStrict`
   parses via `config.ParseCanonicalUint` rather than `strconv.Atoi`, so a
   signed/non-canonical spelling (`dst_port=+80`, which `Atoi` accepted as `80`)
   is rejected here exactly as the #3606 commit-time and dataplane port parsers
@@ -555,7 +564,8 @@ under the daemon's errgroup. Nothing else imports this package.
   filter (`pkg/logging` `EventFilter.matches`) matches protocol/action
   EXACTLY (case-insensitive), not by substring — `protocol=C` no longer
   over-matches TCP/ICMP/ICMPv6. These contracts are pinned by
-  `rest_filter_failclosed_test.go` in this package.
+  `rest_filter_failclosed_test.go` (and, for the events `limit`,
+  `rest_events_limit_failclosed_4926_test.go`) in this package.
 - The `GET /api/v1/security/sessions` view mirrors the gRPC `GetSessions`
   session contract (#3419). The REST `SessionEntry` previously diverged from
   gRPC — `age_seconds` carried IDLE time (now-LastSeen) instead of wall age,

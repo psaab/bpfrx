@@ -426,9 +426,26 @@ func (s *Server) eventsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := queryInt(r, "limit", 50)
+	// #4926: parse `limit` STRICTLY so a present-but-malformed, negative, or
+	// over-cap value fails closed with HTTP 400 — mirroring the sibling `zone`
+	// filter below — instead of silently defaulting the caller's requested
+	// scope. The lenient queryInt returned the 50 default on `limit=abc` /
+	// `limit=-1`, a fail-open that hid a client bug and could silently
+	// under-report the event window. An ABSENT/empty `limit` still defaults to
+	// 50 (queryIntStrict returns (def, true) for an empty value), matching the
+	// zone filter's "absent = no constraint" semantics. queryIntStrict rejects
+	// malformed/negative/non-canonical values; the explicit upper-bound check
+	// then rejects a value past the 10000 cap rather than the old silent clamp,
+	// so a caller asking for more than the buffer can return is told, not
+	// quietly truncated. Valid `limit=10000` still works.
+	limit, ok := queryIntStrict(r, "limit", 50)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid limit: "+r.URL.Query().Get("limit"))
+		return
+	}
 	if limit > 10000 {
-		limit = 10000
+		writeError(w, http.StatusBadRequest, "invalid limit: "+r.URL.Query().Get("limit")+" exceeds maximum 10000")
+		return
 	}
 
 	filter := logging.EventFilter{
