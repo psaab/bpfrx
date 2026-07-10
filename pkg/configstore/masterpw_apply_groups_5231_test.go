@@ -176,3 +176,117 @@ system {
 		t.Fatalf("groups-without-master-password masterPasswordPRF = %q, want empty", prf)
 	}
 }
+
+// wildcardGroupMasterPwText declares master-password inside a `groups { g {
+// <*> { master-password ... } } }` body — under a `<*>` wildcard node, NOT a
+// literal `system` node — and activates it with `apply-groups g`. Junos merges
+// a group's `<*>` children into the top-level `system` stanza at apply-groups
+// expansion (walkGroupToContext / mergeNodes), so the master-password is active
+// at runtime, but a group scan keyed on a literal `system` child name misses
+// it. Reachable only via the hierarchical parser (load override / load set /
+// boot config load / HA SyncApply), not flat-set (`set` treats a top-of-group
+// `<*>` as a leaf).
+const wildcardGroupMasterPwText = `groups {
+    g {
+        <*> {
+            master-password {
+                pseudorandom-function juniper-prf1;
+            }
+        }
+    }
+}
+apply-groups g;
+system {
+    host-name wildcard-secret-fw;
+}
+`
+
+// TestMasterPasswordViaWildcardApplyGroupsEncrypts is the #5231 wildcard-group
+// residual guard (gemini-review-046 MERGE-NEEDS-MAJOR).
+//
+// A master-password authored under a `<*>` wildcard node inside a group and
+// pulled in via apply-groups is ACTIVE at runtime — apply-groups expansion
+// matches `<*>` against the top-level context and merges its children into the
+// `system` stanza, so compileSystem sets cfg.System.MasterPassword. A group
+// scan that requires an intervening node literally named `system`
+// (systemBlocksOfNode) does NOT see a master-password under `<*>`, resolves the
+// PRF as empty, and writes active.json in PLAINTEXT despite encryption being
+// active. The recursive group walk (masterPasswordPRFInSubtree) finds the
+// master-password regardless of the intervening node name.
+//
+// Built with the real hierarchical parser so it exercises the true reachability
+// path. Reverting the group scan to the literal-`system` version makes this
+// test FAIL (empty PRF -> plaintext host-name, no envelope marker).
+func TestMasterPasswordViaWildcardApplyGroupsEncrypts(t *testing.T) {
+	tree, errs := config.NewParser(wildcardGroupMasterPwText).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+
+	// Premise: no top-level system carries master-password, and no group has a
+	// literal `system` child holding the master-password — it lives under `<*>`.
+	for _, sys := range systemBlocksOf(tree) {
+		if sys.FindChild("master-password") != nil {
+			t.Fatalf("test premise broken: a top-level system stanza carries master-password")
+		}
+	}
+	for _, groupsRoot := range groupsBlocksOf(tree) {
+		for _, group := range groupsRoot.Children {
+			for _, groupSys := range systemBlocksOfNode(group) {
+				if groupSys.FindChild("master-password") != nil {
+					t.Fatalf("test premise broken: master-password sits under a literal `system` node, not `<*>`")
+				}
+			}
+		}
+	}
+
+	// Runtime ACTIVATES it: apply-groups expansion merges the `<*>` body into
+	// the top-level system, so the compiled config carries the PRF.
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig() error = %v", err)
+	}
+	if cfg.System.MasterPassword != "juniper-prf1" {
+		t.Fatalf("compiled System.MasterPassword = %q, want %q (wildcard apply-groups must activate it)",
+			cfg.System.MasterPassword, "juniper-prf1")
+	}
+
+	// The at-rest encrypt gate must resolve the same PRF from the UNEXPANDED
+	// tree via the recursive group walk (fail-closed).
+	if prf := masterPasswordPRF(tree); prf != "juniper-prf1" {
+		t.Fatalf("masterPasswordPRF = %q, want %q (recursive group walk must find master-password under <*>)",
+			prf, "juniper-prf1")
+	}
+
+	dir := t.TempDir()
+	db, err := NewDB(dir)
+	if err != nil {
+		t.Fatalf("NewDB() error = %v", err)
+	}
+	if err := db.WriteActive(tree); err != nil {
+		t.Fatalf("WriteActive() error = %v", err)
+	}
+
+	raw, err := os.ReadFile(db.activePath())
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if strings.Contains(string(raw), "wildcard-secret-fw") {
+		t.Fatalf("wildcard-group master-password config leaked plaintext to disk: %s", string(raw))
+	}
+	if !strings.Contains(string(raw), encryptedTreeFormat) {
+		t.Fatalf("wildcard-group master-password config was not encrypted (missing envelope marker): %s", string(raw))
+	}
+	if _, err := os.Stat(db.masterKeyPath()); err != nil {
+		t.Fatalf("master key was not created: %v", err)
+	}
+
+	// Round-trips back to the original tree.
+	got, err := db.ReadActive()
+	if err != nil {
+		t.Fatalf("ReadActive() error = %v", err)
+	}
+	if got.FormatJSON() != tree.FormatJSON() {
+		t.Fatalf("ReadActive() mismatch\ngot:\n%s\nwant:\n%s", got.FormatJSON(), tree.FormatJSON())
+	}
+}
