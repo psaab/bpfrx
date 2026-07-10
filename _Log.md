@@ -44757,5 +44757,42 @@ top.
   **File(s)**: pkg/cli/cli_show_system.go, pkg/cli/cli_show_log_cap_5069_test.go, docs/junos-cli-reference.md, _Log.md
 
 - **Timestamp**: 2026-07-10
+  **Action**: #5068 [BUG cli DoS] the local CLI `show interfaces` presenter
+  family (terse / detail / extensive / `show vlans` / the summary walk) and
+  the interface-name + unit-number value-hint completers dereferenced
+  present-but-nil `InterfaceConfig` (`map[string]*InterfaceConfig`) and
+  `InterfaceUnit` (`map[int]*InterfaceUnit`) map values without a guard. Those
+  nil slots are admitted on the tolerant / HA-sync config path that the
+  compiler warn-pass already tolerates (compiler_validate_warn_nil_3494_test.go
+  codifies `"zz-nil-ifc": nil` and a nil `Units[N]`), so such a
+  persisted/synced config becomes ACTIVE. Rendering `show interfaces terse`
+  (or triggering interface-name value-hint completion) over it nil-derefed;
+  CLI.Run has no panic recovery, so the in-process xpfd exits — same family as
+  the fixed #3476/#3493/#3494 but a distinct unguarded map-value set. Fix:
+  mirrored the #5221/#3476 inline `if X == nil { continue }` pattern —
+  skip a nil interface value at every range-all loop and a nil unit value at
+  every unit loop; harden the keyed lookups (`ifCfg != nil` / `unit != nil`)
+  in terse's disable-flag + reth-address blocks and the summary walk's
+  vlan/DHCP lookups; guard both completion value-hints
+  (ValueHintInterfaceName / ValueHintUnitNumber). Scope held to the
+  `show interfaces` command family + interface completion (the named panic
+  surface); the sibling cluster/zones/session views that share the class are
+  out of scope for this issue. Fail-on-revert tests
+  (pkg/cli/cli_show_interfaces_nil_5068_test.go): inject a nil interface value,
+  a zone-referenced nil interface, and a nil unit into the live ActiveConfig
+  and drive terse/detail/extensive/vlans/summary + both completers, asserting
+  no panic. RED-on-revert VERIFIED: `git stash` of the six source guards (test
+  retained) → `nil pointer dereference` panic at cli_show_interfaces_terse.go
+  (FAIL); stash pop restored → PASS. Test note: detail/extensive use a
+  no-match filter (the nil-deref map-build loop runs before the name filter)
+  and each presenter gets its own captureStdout call so the os.Pipe
+  (drained only after the callback returns) can't overrun on a many-netdev
+  host. Docs: no operator-doc change — behavior for valid configs is
+  unchanged; this is internal tolerant-config robustness, matching the
+  #3476/#3494 precedent that added no doc. Validation:
+  `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0;
+  `go test ./pkg/cli/...` ok; gofmt clean. No cluster smoke (control-plane CLI
+  display path, no forwarding effect).
+  **File(s)**: pkg/cli/completion.go, pkg/cli/cli_show_interfaces_terse.go, pkg/cli/cli_show_interfaces_detail.go, pkg/cli/cli_show_interfaces_extensive.go, pkg/cli/cli_show_interfaces_stats.go, pkg/cli/cli_show_interfaces.go, pkg/cli/cli_show_interfaces_nil_5068_test.go, _Log.md
   **Action**: #5056 [BUG api MEDIUM] The REST BGP routes endpoint (`/api/routing/bgp?type=routes`, `bgpHandler` in pkg/api/routing.go) materialized the ENTIRE upstream RIB before responding. It called `frr.GetBGPRoutes`, which ran `vtysh "show bgp ipv4 unicast"` and buffered ALL of vtysh stdout into one growable string (`realExecutor.Vtysh`, pkg/frr/vtysh.go) plus a parsed `[]BGPRoute` — hundreds of MB for a full internet table (~1M routes) on a RAM-constrained firewall, BEFORE the first byte went out. The #4708/#5232 work streamed only the DOWNSTREAM writer + added a per-1024-chunk client-cancel check, but the already-completed vtysh work upstream was unbounded and uncancellable. Fix (bound the materialization end-to-end): added `VtyshStream(ctx, command) (io.ReadCloser, func() error, error)` to the `frrExecutor` interface — `realExecutor` runs `exec.CommandContext` with a `StdoutPipe` so stdout is streamed, not buffered, and ctx-cancel kills vtysh. New `Manager.StreamBGPRoutes(ctx, limit, fn)` (pkg/frr/status_parse.go) scans that pipe with a bounded `bufio.Scanner`, parses each line via the shared `parseBGPRouteLine` helper (extracted from GetBGPRoutes so both interpret the table identically), delivers each route to `fn`, stops after `limit` routes (reporting `truncated`), and cancels vtysh on ctx-cancellation or an `fn` error. `bgpHandler` now streams via StreamBGPRoutes with a `maxBGPRoutes`=100000 cap: peak memory is O(1) in table size, a client disconnect / downstream write failure (now checked — the `bw.Flush()` return is no longer discarded) aborts the scan AND cancels vtysh, and when the cap trips a trailing `... table truncated at N routes; use the CLI 'show route protocol bgp' for the full table` notice is appended inside the JSON `output` string (envelope shape unchanged; only present when truncated, so the non-truncated wire format is byte-identical to #4708). The handler emits the 200 + envelope prefix LAZILY on the first route so an upstream vtysh START failure still surfaces as a clean 500. GetBGPRoutes is unchanged (still used by the CLI/gRPC show paths that render the whole result). Fail-on-revert test `TestBGPRoutesEndpointCapTruncates` (pkg/api/bgp_routes_cap_5056_test.go) drives the endpoint via the fake-executor seam with a 50-route table and a lowered cap (10), asserting exactly 10 route lines + the truncation notice + the over-cap route ABSENT + a well-formed envelope. RED-on-revert VERIFIED: disabling the `count >= limit` cap in StreamBGPRoutes made the endpoint stream all 50 routes → "rendered 50 route lines, want exactly the cap 10" + "truncation notice missing" + "over-cap route present" all FAIL; restored to green. The existing `bgp_routes_stream_4708_test.go` (wire-format + non-buffering) and `api_ctx_cancel_5232_5233_test.go` (client-cancel abort) now exercise the streaming path too (the api/frr/daemon test fakes gained a `VtyshStream` method) and stay green. Validation: `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0; `go test ./pkg/api/... ./pkg/frr/... ./pkg/daemon/...` all ok; gofmt clean. Docs: pkg/api/README.md bgpHandler bullet + pkg/frr/README.md (vtysh.go/status_parse.go file-table entries and the "no streaming" note) updated to describe the upstream-streaming + cap/truncation contract. No cluster smoke (control-plane REST read path, no forwarding effect).
   **File(s)**: pkg/frr/vtysh.go, pkg/frr/status_parse.go, pkg/frr/testseam.go, pkg/frr/executor_test.go, pkg/daemon/daemon_ipmon_test.go, pkg/api/routing.go, pkg/api/bgp_routes_stream_4708_test.go, pkg/api/bgp_routes_cap_5056_test.go, pkg/api/README.md, pkg/frr/README.md, _Log.md

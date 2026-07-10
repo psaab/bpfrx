@@ -471,6 +471,12 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 	case config.ValueHintInterfaceName:
 		var out []config.SchemaCompletion
 		for name, iface := range cfg.Interfaces.Interfaces {
+			// #5068: skip a present-but-nil interface value (tolerant /
+			// HA-sync path admits it, #3494) rather than dereferencing
+			// iface.Description and panicking the completion.
+			if iface == nil {
+				continue
+			}
 			desc := iface.Description
 			if desc == "" {
 				desc = "(configured)"
@@ -565,6 +571,12 @@ func (c *CLI) valueProvider(hint config.ValueHint, path []string) []config.Schem
 		}
 		var out []config.SchemaCompletion
 		for num, unit := range iface.Units {
+			// #5068: skip a present-but-nil unit value (tolerant / HA-sync
+			// path admits it, #3494) rather than dereferencing
+			// unit.Description and panicking the completion.
+			if unit == nil {
+				continue
+			}
 			desc := unit.Description
 			if desc == "" {
 				desc = "(configured)"
