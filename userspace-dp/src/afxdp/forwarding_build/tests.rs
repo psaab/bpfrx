@@ -4511,6 +4511,39 @@ fn wg_reload_seeds_high_water_on_identity_change() {
 }
 
 #[test]
+fn wg_endpoint_v6_bracketed_hydrates_initiator_capable() {
+    // A standard IPv6 endpoint `[addr]:port` must hydrate to
+    // Some(SocketAddr) with the authored port so the peer can INITIATE
+    // handshakes/keepalives — not None (responder-only) (#5182).
+    let snap = wg_snapshot(51820, &["10.0.0.0/24"], "[2001:db8::1]:51820");
+    let state = build_forwarding_state(&snap);
+    let ep = state.tunnel_endpoints.get(&7).expect("WG endpoint present");
+    assert_eq!(ep.wg_peers.len(), 1);
+    let want: std::net::SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+    assert_eq!(
+        ep.wg_peers[0].endpoint,
+        Some(want),
+        "bracketed IPv6 endpoint must hydrate initiator-capable with its port"
+    );
+}
+
+#[test]
+fn wg_endpoint_nonempty_unparseable_drops_row() {
+    // A non-empty endpoint that does not parse to a concrete SocketAddr
+    // (here a port-stripped bare host — exactly the #5182 tokenizer bug's
+    // output) must fail the ROW closed, NOT silently degrade the peer to
+    // responder-only. FAIL-ON-REVERT: the pre-fix `.parse().ok()` coerced
+    // this to None and KEPT the row, so it would still contain key 7.
+    let snap = wg_snapshot(51820, &["10.0.0.0/24"], "2001:db8::1");
+    let state = build_forwarding_state(&snap);
+    assert!(
+        !state.tunnel_endpoints.contains_key(&7),
+        "non-empty unparseable WG endpoint must drop the row, not hydrate responder-only"
+    );
+    assert!(!state.has_wg_tunnels);
+}
+
+#[test]
 fn wg_endpoint_with_zero_listen_port_is_dropped() {
     // A WG tunnel with no listen port cannot bind a socket and is
     // invisible to the shim gate; it must be dropped, not installed as a

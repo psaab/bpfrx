@@ -2113,6 +2113,17 @@ reserved for whole-dataplane selection where a rewrite shim
   every compile/load/HA-sync path funnels through. The gate also
   hard-rejects a WG tunnel with zero peers, a duplicate or malformed
   (non-64-hex) peer pubkey, a malformed preshared-key,
+  a peer `endpoint` that is not a concrete `host:port` (IPv6 authored as
+  `[addr]:port`) with a numeric UDP port in `1..65535` and an IP-literal
+  host — the Rust `hydrate_wg_identity` turns it into a `SocketAddr`
+  (`wg_endpoint.parse::<SocketAddr>()`, no DNS), so a port-less/zero-port
+  or hostname endpoint that COMMITTED CLEAN would hydrate the peer
+  RESPONDER-ONLY (unable to initiate handshakes/keepalives). The lexer
+  preserves the bracketed `[v6]:port` literal as one scalar (#5182) — it
+  previously split it on the address's inner colons and dropped the port,
+  so every IPv6 peer silently degraded; the dataplane now DROPS the row
+  on a non-empty unparseable endpoint instead of coercing it to
+  responder-only. The gate also rejects
   endpoint-bearing peers that disagree on outer transport family (one
   UDP socket = one outer family), or an EXACT-duplicate `allowed-ips`
   prefix across two peers (#2445 — the cryptokey routing table maps a

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 )
 
 // validateWireguardPeersStrict enforces the multi-peer WireGuard
@@ -237,22 +238,31 @@ func isWireguardKeyHex(s string) bool {
 	return true
 }
 
-// endpointIsV6 parses a WireGuard endpoint and reports whether its
-// address is IPv6. It accepts the canonical `IP:port` form AND a bare
-// IP literal: the flat-set/hierarchical tokenizer splits a `[v6]:port`
-// literal on its inner colons and stores only the host, so a v6 endpoint
-// authored as config TEXT arrives here as a bare `2001:db8::1` (a
-// pre-existing parser limitation, orthogonal to #1434). Either form must
-// classify by family for the one-UDP-socket outer-family gate. Returns
-// an error only when the value is neither a host:port nor a bare IP.
+// endpointIsV6 validates a WireGuard peer endpoint and reports whether its
+// address is IPv6. The endpoint MUST be a concrete `host:port` (IPv6 as
+// `[addr]:port`) with a numeric UDP port in 1..65535 and an IP-literal
+// host — exactly what the Rust hydrate can turn into a `SocketAddr`
+// (`wg_endpoint.parse::<SocketAddr>()`; it does NOT resolve DNS and rejects
+// a missing/zero port). Rejecting a port-less, zero-port, or hostname
+// endpoint here upholds the invariant that every non-empty endpoint the
+// strict commit ACCEPTS hydrates to `Some(SocketAddr)` with the authored
+// port and can therefore INITIATE (#5182). Before the lexer preserved the
+// bracketed `[v6]:port` token, a v6 endpoint arrived port-stripped and had
+// to be accepted as a bare IP — that leniency is what silently degraded
+// every IPv6 peer to responder-only. The bool return classifies the outer
+// family for the one-UDP-socket mixed-family gate.
 func endpointIsV6(endpoint string) (bool, error) {
-	if host, _, err := net.SplitHostPort(endpoint); err == nil {
-		if ip := net.ParseIP(host); ip != nil {
-			return ip.To4() == nil, nil
-		}
+	host, portStr, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return false, fmt.Errorf("must be host:port (IPv6 as [addr]:port): %w", err)
 	}
-	if ip := net.ParseIP(endpoint); ip != nil {
-		return ip.To4() == nil, nil
+	port, perr := strconv.Atoi(portStr)
+	if perr != nil || port < 1 || port > 65535 {
+		return false, fmt.Errorf("UDP port %q is not a number in 1..65535", portStr)
 	}
-	return false, fmt.Errorf("endpoint %q is not an IP[:port] literal", endpoint)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false, fmt.Errorf("host %q is not an IP literal (a WireGuard endpoint must be a numeric address, not a hostname; the dataplane does not resolve DNS)", host)
+	}
+	return ip.To4() == nil, nil
 }
