@@ -38,23 +38,77 @@ func (db *DB) masterKeyPath() string {
 // masterPasswordPRF resolves the master-password pseudorandom-function that
 // decides whether the config DB is written encrypted (maybeEncryptTreeJSON)
 // and whether the #4579 A4-06 plaintext-downgrade warning fires (db.go
-// readTreeMeta). It MUST consider every top-level `system` stanza, not just
-// the first (#4705).
+// readTreeMeta). It MUST consider every surface that activates encryption at
+// runtime: every top-level `system` stanza (#4705) AND every `system` stanza
+// declared inside a `groups { <name> { ... } }` body reachable via
+// apply-groups (#5231).
 //
-// The Junos parser does not merge duplicate top-level stanzas: parseStatements
-// appends each `system { ... }` block as its own child, and neither
-// LoadOverride nor SyncApply (both raw NewParser().Parse()) coalesce them. The
-// compiler already treats a split config as one system — compileSections loops
-// over ALL top-level nodes and folds every `system` node into the same
-// cfg.System — so a `master-password` living in a SECOND system stanza is
-// semantically active. A single-first-match tree.FindChild("system") would
-// then miss it and write the whole DB (secrets included) in PLAINTEXT despite
-// encryption being configured. Fail CLOSED: reuse systemBlocksOf (the SAME
-// all-matches helper the compiler's dataplane-retirement walk uses) to scan
-// every "system" child and every "master-password" within it, and encrypt if
-// ANY carries a PRF.
+// Top-level split stanzas (#4705): the Junos parser does not merge duplicate
+// top-level stanzas — parseStatements appends each `system { ... }` block as
+// its own child, and neither LoadOverride nor SyncApply (both raw
+// NewParser().Parse()) coalesce them. The compiler already treats a split
+// config as one system — compileSections loops over ALL top-level nodes and
+// folds every `system` node into the same cfg.System — so a `master-password`
+// living in a SECOND system stanza is semantically active. A single-first-match
+// tree.FindChild("system") would then miss it and write the whole DB (secrets
+// included) in PLAINTEXT despite encryption being configured.
+//
+// Groups / apply-groups (#5231): a `master-password` declared inside a
+// `groups { g { system { master-password ... } } }` body and pulled in with
+// `apply-groups g` is ACTIVE at runtime — compileConfigWithOpts expands
+// apply-groups (tree.ExpandGroups) BEFORE compileSystem reads master-password
+// (compiler_system.go), so the effective config carries the PRF. But this
+// at-rest write path runs on the UNEXPANDED persisted candidate tree
+// (apply-groups expansion happens only on a compile clone), so the
+// group-declared master-password is INVISIBLE to systemBlocksOf, the encrypt
+// gate returns "", and active.json (IKE PSKs, WireGuard keys, SNMP
+// communities, user secrets) is written PLAINTEXT despite encryption being
+// configured via a group.
+//
+// Fail CLOSED — err toward encrypting. We scan every group's `system` body
+// directly rather than first resolving which groups apply-groups actually
+// references. This mirrors the sibling rewriteRetiredDataplaneType Pass 2 in
+// this file (which likewise walks every group's system blocks without
+// consulting apply-groups) and is a strict superset of the runtime-active
+// surface: apply-groups only COPIES existing leaves, so any PRF that is active
+// after expansion physically exists in some group's system body here — the
+// direct scan can never FALSE-NEGATIVE relative to runtime. A defined-but-
+// unreferenced group is a harmless FALSE-POSITIVE (encrypting when
+// unnecessary is always safe; writing plaintext when encryption was configured
+// is the security defect this guards). Reusing the compiler's ExpandGroups
+// would instead mutate the very tree we are about to persist and drag
+// ${node}/undefined-group error handling into a write path that must not fail,
+// for no security gain.
 func masterPasswordPRF(tree *config.ConfigTree) string {
-	for _, sys := range systemBlocksOf(tree) {
+	// Surface 1: every top-level `system { ... }` stanza (#4705).
+	if prf := masterPasswordPRFInSystems(systemBlocksOf(tree)); prf != "" {
+		return prf
+	}
+
+	// Surface 2: every `system { ... }` stanza nested in a `groups { <name>
+	// { ... } }` definition (#5231). Multiple top-level `groups { ... }`
+	// blocks and multiple `system` stanzas per group are both admitted, so
+	// walk every match — the same all-matches shape rewriteRetiredDataplaneType
+	// uses.
+	for _, groupsRoot := range groupsBlocksOf(tree) {
+		for _, group := range groupsRoot.Children {
+			if group == nil {
+				continue
+			}
+			if prf := masterPasswordPRFInSystems(systemBlocksOfNode(group)); prf != "" {
+				return prf
+			}
+		}
+	}
+	return ""
+}
+
+// masterPasswordPRFInSystems returns the first non-empty master-password
+// pseudorandom-function value across the given system-shaped nodes. Shared by
+// the top-level (#4705) and groups/apply-groups (#5231) scans in
+// masterPasswordPRF.
+func masterPasswordPRFInSystems(systems []*config.Node) string {
+	for _, sys := range systems {
 		for _, mp := range sys.FindChildren("master-password") {
 			prf := mp.FindChild("pseudorandom-function")
 			if prf == nil {

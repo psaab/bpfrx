@@ -124,7 +124,7 @@ inline archive-site passwords).
   configstore directory. The "master-password" naming is an HKDF
   info string only — it isn't a user-supplied password.
 
-### At-rest crypto hardening notes (#4579 A4-05/A4-06, #4705)
+### At-rest crypto hardening notes (#4579 A4-05/A4-06, #4705, #5231)
 
 - **Split `system` stanza resolution (#4705).** "The tree declares a
   master-password" is decided by `masterPasswordPRF`, which scans **every**
@@ -142,6 +142,28 @@ inline archive-site passwords).
   downgrade warning below also keys off `masterPasswordPRF`, centralizing the
   resolution here fixes that path for the split-stanza case too (the warning
   now fires when a second-stanza master-password DB is read back as plaintext).
+- **Groups / apply-groups resolution (#5231).** The encrypt gate also covers a
+  `master-password` declared inside a `groups { <name> { system {
+  master-password ... } } }` body and pulled in with `apply-groups <name>`.
+  Such a master-password is **active at runtime** — `compileConfigWithOpts`
+  expands `apply-groups` (via `tree.ExpandGroups`) *before* `compileSystem`
+  reads `master-password`, so the effective `cfg.System.MasterPassword` is set
+  — but the at-rest write path runs on the **unexpanded** persisted candidate
+  tree (expansion happens only on a compile clone). A resolver that scanned
+  only top-level `system` stanzas therefore missed the group-declared PRF and
+  wrote `active.json` (IKE PSKs, WireGuard keys, SNMP communities, user
+  secrets) in plaintext despite encryption being configured via a group.
+  `masterPasswordPRF` now also walks every `groups` block →
+  `systemBlocksOfNode(group)` → `master-password`/`pseudorandom-function`
+  (the same helpers `rewriteRetiredDataplaneType` Pass 2 uses to find
+  `dataplane-type` nested in groups). This is a deliberate **fail-closed
+  superset** of the runtime-active surface: `apply-groups` only copies existing
+  leaves, so a PRF active after expansion physically exists in some group body
+  here (never a false-negative), while a defined-but-unapplied group is a
+  harmless false-positive (encrypting when unnecessary is always safe). Reusing
+  the compiler's `ExpandGroups` was rejected: it would mutate the tree being
+  persisted and pull `${node}`/undefined-group error handling into a write
+  path that must not fail, for no security gain.
 - **Unexpected-plaintext warning (A4-06).** Every write path encrypts the
   body when the tree declares a master-password, so `readTreeMeta` reading
   a config back as *plaintext* while its tree still declares a
