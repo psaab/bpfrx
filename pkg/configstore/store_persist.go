@@ -560,13 +560,29 @@ func (s *Store) SaveRescueConfig() error {
 }
 
 // DeleteRescueConfig removes the rescue configuration.
+//
+// The removal is a DURABLE transition (#5197 A4-b1-F10). SaveRescueConfig
+// persists rescue.conf through fsatomic.WriteFileDurable (temp + fsync +
+// rename + parent-dir fsync), so the delete must match that dir-sync
+// discipline — mirroring DB.DeleteConfirm (#4864). A bare os.Remove is not
+// durable: after a successful unlink the directory-entry removal lives only in
+// the page cache, so a power loss in that window can replay the deleted
+// rescue.conf on reboot. rescue.conf is the full active config TEXT with
+// cleartext secret leaves (IKE PSK, SNMP community, auth-keys, #4056), so a
+// resurrected copy re-exposes secrets the operator explicitly deleted. fsync
+// the parent directory after the unlink so the removal survives power loss.
+// The unlink and dir fsync route through the package durability seams
+// (rbRemove/rbSyncDir) so a dropped dir sync fails a test RED.
 func (s *Store) DeleteRescueConfig() error {
 	path := s.rescuePath()
-	if err := os.Remove(path); err != nil {
+	if err := rbRemove(path); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("no rescue configuration exists")
 		}
 		return fmt.Errorf("delete rescue config: %w", err)
+	}
+	if err := rbSyncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync dir after delete rescue config: %w", err)
 	}
 	slog.Info("rescue configuration deleted", "path", path)
 	return nil
