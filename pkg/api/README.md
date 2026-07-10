@@ -285,6 +285,16 @@ under the daemon's errgroup. Nothing else imports this package.
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
   bulk sync (per CLAUDE.md control-socket rules).
+- A `/metrics` scrape performs at most ONE control-socket `Status()` round
+  trip. `Collect` fetches the `ProcessStatus` once (`fetchUserspaceStatus`,
+  after the dataplane gate) and shares the snapshot with BOTH the filter-term
+  hit merge (`collectFilterCounters`) and the userspace-status families
+  (`collectUserspaceStatus`). Before #5317 those two collectors each issued
+  their own `Status()`, so one scrape did two serialized `status` RPCs on the
+  contention-critical control socket (and read two A/B-skewed snapshots). On a
+  Status() failure the shared fetch returns nil once and is NOT retried — the
+  filter merge falls back to the map path and the userspace families emit
+  nothing, exactly as each collector degraded before.
 - Userspace CoS metrics are emitted from a single `Status()` snapshot per
   scrape. Queue-scoped drain-phase counters
   (`xpf_userspace_cos_drain_{guarantee,surplus}_sent_bytes_total` and

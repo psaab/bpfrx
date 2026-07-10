@@ -124,7 +124,7 @@ func filterApplyResult() *dataplane.ApplyResult {
 func countFilterSamples(t *testing.T, c *xpfCollector, dp apiRuntimeDataPlane) int {
 	t.Helper()
 	ch := make(chan prometheus.Metric, 64)
-	c.collectFilterCounters(ch, dp)
+	c.collectFilterCounters(ch, dp, fetchUserspaceStatus(dp))
 	close(ch)
 	var n int
 	for m := range ch {

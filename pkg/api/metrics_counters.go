@@ -475,7 +475,7 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 	}
 }
 
-func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
+func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane, userspaceStatus *dpuserspace.ProcessStatus) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -489,14 +489,14 @@ func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp api
 	// canonical metrics path reports 0/stale while the text commands show real
 	// hits. The userspace merge is independent of the eBPF apply result, so it
 	// must NOT be gated on cr/FilterIDs below.
-	var userspaceStatus *dpuserspace.ProcessStatus
-	if provider, ok := dp.(interface {
-		Status() (dpuserspace.ProcessStatus, error)
-	}); ok {
-		if status, err := provider.Status(); err == nil {
-			userspaceStatus = &status
-		}
-	}
+	//
+	// #5317: the ProcessStatus is fetched ONCE per scrape by Collect (via
+	// fetchUserspaceStatus) and shared with collectUserspaceStatus, so this no
+	// longer issues its own control-socket Status() round trip. A nil pointer —
+	// the helper exposes no Status() surface or the single round trip failed —
+	// yields an empty term index from BuildFirewallFilterTermCounterIndex, so the
+	// userspace merge is a no-op and the map path is unaffected, exactly as the
+	// prior per-collector fetch behaved on a missing/failed status.
 	userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
 
 	// The retired-eBPF/map counter path is gated on a compile result carrying

@@ -1059,10 +1059,21 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	// #5317: fetch the userspace-dp helper status ONCE per scrape and share the
+	// snapshot across collectFilterCounters (filter-term hit merge) and
+	// collectUserspaceStatus (CoS / worker-runtime / fairness / neighbor / ...
+	// families). Before this each of those collectors issued its own
+	// control-socket Status() round trip, so a single scrape did two serialized
+	// `status` RPCs — doubling contention with session installs during bulk sync
+	// (CLAUDE.md "Control socket contention"). nil = no Status() surface or a
+	// failed round trip; both collectors degrade exactly as they did on their
+	// own failed/absent fetch.
+	userspaceStatus := fetchUserspaceStatus(dp)
+
 	c.collectGlobalCounters(ch, dp)
 	c.collectInterfaceCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
-	c.collectFilterCounters(ch, dp)
+	c.collectFilterCounters(ch, dp, userspaceStatus)
 	// #3464: emit the per-interface scrape-error counter AFTER
 	// collectInterfaceCounters has run, so a read failure this scrape is
 	// reflected in THIS scrape's xpf_interface_counter_read_errors_total. Kept
@@ -1079,7 +1090,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectDDNSMetrics(ch)
 	c.collectSurfaceADDNSMetrics(ch)
 	c.collectSystemMetrics(ch)
-	c.collectUserspaceStatus(ch, dp)
+	c.collectUserspaceStatus(ch, userspaceStatus)
 }
 
 // #709: emit per-bucket counter samples. Bucket index maps to a
