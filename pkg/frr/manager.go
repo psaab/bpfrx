@@ -515,7 +515,9 @@ func (m *Manager) buildManagedSection(fc *FullConfig) string {
 //
 // Return contract: nil = full diff convergence; ErrFRRReloadDegraded
 // (errors.Is) = additive fallback applied, retry scheduled when
-// enabled; other errors = nothing converged.
+// enabled; other errors = HARD failure, nothing applied — the generation
+// is marked degraded and the retry is likewise scheduled when enabled
+// (#5109) so live FRR self-heals, and the error is returned.
 func (m *Manager) commitManagedSection(section string) error {
 	m.signalRetryCancel()
 	m.reloadMu.Lock()
@@ -851,18 +853,34 @@ func (m *Manager) warnPytoolsOnce(err error) {
 //     pending retry episode (AGY r3 f2: a woken redundant retry must
 //     exit without exec'ing, so its own transient failure can never
 //     spuriously re-set the gauge).
-//   - ErrFRRReloadDegraded: set the gauge and ensure a retry episode
-//     (when enabled). A pythontools-missing cause starts the retry at
-//     the slow cadence directly.
-//   - other errors: nothing was applied at all; the gauge keeps
-//     reflecting the last APPLIED reload and the error propagates to
-//     the caller (warn-and-continue at commit, loud log at cleanup).
+//   - ErrFRRReloadDegraded: the additive vtysh -f fallback applied every
+//     desired line but deferred stale-config removal — set the gauge and
+//     ensure a retry episode (when enabled). A pythontools-missing cause
+//     starts the retry at the slow cadence directly.
+//   - other errors (HARD failure, #5109): both frr-reload.py AND the
+//     additive vtysh -f fallback failed, so NOTHING was applied — live
+//     FRR keeps its previous config while frr.conf on disk already holds
+//     the new desired managed section. Treat it exactly like a degraded
+//     reload for recovery: set the gauge and arm the retry so the next
+//     reconcile re-runs the primary reload against the on-disk config and
+//     self-heals. The error still propagates to the caller (warn-and-
+//     continue at commit, loud log at cleanup). Before #5109 a hard
+//     failure from a non-degraded state hit no case here: the gauge
+//     stayed 0, no retry debt was armed, and live FRR kept the stale
+//     forwarding state until the next commit or a daemon restart while
+//     the operator's commit reported success.
 func (m *Manager) noteReloadOutcomeLocked(err error) {
 	switch {
 	case err == nil:
 		m.degraded.Store(false)
 		m.signalRetryCancel()
 	case errors.Is(err, ErrFRRReloadDegraded):
+		m.degraded.Store(true)
+		m.ensureRetryLocked(isFrrReloadPyMissing(err))
+	default:
+		// Hard reload failure: nothing converged, but frr.conf on disk is
+		// the SSOT the retry loop reloads, so arming retry debt (mirroring
+		// the degraded case) lets a later primary reload self-heal.
 		m.degraded.Store(true)
 		m.ensureRetryLocked(isFrrReloadPyMissing(err))
 	}

@@ -1223,11 +1223,19 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 	if d.frr != nil {
 		// The full apply path deliberately warns-and-continues on an FRR
 		// reload error (a transient FRR hiccup must not fail an
-		// otherwise-valid operator commit; a boot-time re-apply
-		// reconverges FRR). The returned error is only consumed by the
-		// ip-monitoring routes-only actuator, which must not publish a
-		// divergent snapshot on a hard failure (#3757).
-		_ = d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
+		// otherwise-valid operator commit; the in-manager degraded-retry
+		// loop reconverges FRR without waiting for a restart).
+		// applyFRRConfig returns nil on a DEGRADED reload (#1880, the new
+		// routes are already live); a non-nil return is a HARD reload
+		// failure where NOTHING was applied. We do not fail the commit on
+		// it, but we no longer discard it silently (#5109): the frr
+		// manager has marked the generation degraded and armed its retry
+		// debt (surfaced via the ReloadDegraded() health gauge), so log it
+		// and continue rather than reporting an unqualified success.
+		if err := d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay)); err != nil {
+			slog.Warn("FRR full apply hit a hard reload failure; commit continues, frr manager armed degraded retry debt",
+				"err", err)
+		}
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)

@@ -653,3 +653,18 @@ also carries operator content:
   shutdown) cancels in-flight process groups and reaps the retry
   goroutine; `DisableDegradedRetry()` is the one-shot (`xpfd cleanup`)
   configuration.
+- Hard failure (#5109): when BOTH frr-reload.py AND the additive
+  `vtysh -f` fallback fail, `reloadLocked` returns the underlying error
+  (NOT the degraded sentinel) — nothing was applied, so live FRR keeps
+  its previous config while `frr.conf` on disk already carries the new
+  desired managed section. `noteReloadOutcomeLocked` treats this exactly
+  like a degraded reload for RECOVERY: it sets the gauge and arms the
+  same single-flight retry loop, which re-runs the primary reload against
+  the on-disk SSOT until a full diff converges — so a hard failure
+  self-heals without a restart. The error still propagates to the caller
+  (the daemon's full-apply path logs it and continues, #5109; the
+  ip-monitoring actuator uses it to avoid publishing a divergent snapshot,
+  #3757). Before #5109 a hard failure from a non-degraded state hit no
+  case in the outcome switch: the gauge stayed 0, no retry debt was armed,
+  and live FRR kept the stale forwarding state until the next commit or a
+  daemon restart while the operator's commit reported success.
