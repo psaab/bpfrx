@@ -44,6 +44,32 @@ func ValidateByteSize(raw string, _ *Config) error {
 	return nil
 }
 
+// ValidatePolicerBurstSize validates a legacy firewall policer
+// `if-exceeding burst-size-limit` value (#5299). Junos accepts a byte
+// count either bare (100000) or with a k/m/g suffix (15k), so — unlike
+// the CoS ValidateByteSize gate — a bare integer is NOT rejected here
+// (it is unambiguous bytes for a policer bucket and was a valid,
+// compiling input before this gate). What IS rejected is the fail-closed
+// input the pre-#5299 parseBurstSizeLimit silently coerced to 0 (or, on
+// overflow, wrapped to a small nonzero): empty, zero, negative,
+// malformed (15kk), and any value whose scaled product overflows uint64.
+// A 0-byte bucket fail-closes the policer to a drop-all meter for the
+// default `then discard`, so a typo must not commit clean.
+func ValidatePolicerBurstSize(raw string, _ *Config) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("missing value (expected a burst size in bytes, e.g. 15k, 100000, 1m)")
+	}
+	n, err := parseBurstSizeLimitStrict(trimmed)
+	if err != nil {
+		return fmt.Errorf("not a valid burst-size-limit (expected bytes, optionally with a k/m/g suffix, e.g. 15k): %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("burst-size-limit must be greater than zero (0 compiles the same as unset and fail-closes the policer to a drop-all meter)")
+	}
+	return nil
+}
+
 // ValidateCoSTransmitRateTail validates the whole tail of a CoS scheduler
 // `transmit-rate` leaf (#4228 Gap 2). Junos accepts three mutually-exclusive
 // heads — a bandwidth (10m), `percent <n>`, or `remainder` — each optionally

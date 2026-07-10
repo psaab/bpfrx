@@ -3647,6 +3647,73 @@ warnings, and completion presence of the new leaves at unit + interface
 level). FAIL-ON-REVERT: dropping the validators / warnings makes the
 garbage values commit clean again and the inert knobs go silent.
 
+### #5299 — legacy firewall policer `bandwidth-limit` / `burst-size-limit` fail-closed rate validation
+
+The legacy single-rate two-color policer leaves
+`firewall policer <name> if-exceeding bandwidth-limit` /
+`burst-size-limit` were untyped (`ValueAny`), so the compiler's
+silent-zero parsers coerced garbage / zero / overflow to 0. A typo like
+`if-exceeding bandwidth-limit 10mm` COMMITTED CLEAN → `parseBandwidthLimit`
+returned 0 bps → the userspace runtime `fail_closed(true)` (#4522/#4514)
+drop-alls matching traffic for the default `then discard` (or skips /
+inerts the meter for a non-discard action). `parseBurstSizeLimit` was
+additionally an unchecked `v * multiplier` uint64 multiply that WRAPPED an
+overflowing burst to a small nonzero value — a silently-wrong meter rather
+than an outright reject. The #4522/#4514 runtime backstop fail-closes on
+the 0 the typo produces but never validated the control-plane quantity, so
+the outage was invisible at commit.
+
+Fix (fail-closed, #1960 doctrine):
+
+- **`bandwidth-limit`** is now `valueType: ValueRate` + `validator:
+  ValidateRate` (`schema_cos.go`). `ValidateRate` rejects empty, malformed
+  (`10mm`), negative, `NaN`/`Inf`, overflow, and anything below 8 bps
+  (which folds in `0`, since a sub-8-bps rate round-trips to 0 bytes/sec).
+- **`burst-size-limit`** is `valueType: ValueByteSize` + a dedicated
+  `validator: ValidatePolicerBurstSize` (`schema_validators_cos.go`).
+  Unlike the CoS `ValidateByteSize` gate it does NOT reject a bare integer
+  — a bare byte count is unambiguous for a policer bucket and was a valid
+  compiling input, so keeping it preserves valid configs. It DOES reject
+  empty, zero, negative, malformed (`15kk`), and any k/m/g-scaled product
+  that overflows uint64 (via `parseBurstSizeLimitStrict`).
+- **`parseBurstSizeLimit`** (the lenient parser) now delegates to
+  `parseBurstSizeLimitStrict` and returns 0 on error, so an OVERFLOWING
+  value is no longer wrapped to a small nonzero meter — it becomes the
+  unambiguous "unset" 0 the strict schema gate already rejects at commit.
+  `parseBandwidthLimit` / `parseScaledDecimalUnit` already clamp overflow
+  to 0, so no change was needed there.
+
+Tolerant path: the configstore `Store.Load` / `Store.SyncApply` ingress
+(`compileTreeLenient`) runs the SAME `SchemaValidate` gate but DOWNGRADES a
+violation to a warning and compiles leniently (coercing to 0), so a
+peer-synced or older-binary policer cannot blackout-boot the node — the
+operator's next strict commit rejects it loudly.
+
+No compiled-`FirewallConfig` strict gate (parallel to
+`validateThreeColorPolicersStrict`) was added: `SchemaValidate` runs on the
+fully apply-groups-expanded candidate tree, so every strict operator-commit
+form — including group-expanded and flat-set-packed values — is already
+covered at the schema leaf; there is no compiled-config-only form that
+bypasses it on the strict path. The only paths that skip the schema leaf
+are the tolerant Load / SyncApply ingress, which #1960 requires to stay
+lenient. A hard compiled-config gate there would BRICK a leniently-loaded
+policer that coerced to 0 (the existing `validateThreeColorPolicersStrict`
+hard-fails even under `CompileConfigLenient` — a contrasting, arguably
+latent-brick precedent deliberately not replicated for the legacy policer),
+and a compiled `BandwidthLimit == 0` cannot be distinguished from a
+legitimately-unset limit without a `Configured` bool the type does not
+carry.
+
+Regression coverage: `pkg/config/policer_rate_validate_5299_test.go`
+(flat-set `ParseSetCommand` + `SetPath`): valid `10m` / `15k` /
+bare-integer accept + compile-to-expected-units, malformed / zero /
+negative / `NaN` / `Inf` / overflow strict-REJECT, tolerant-load
+WARN-not-hard-fail, and a direct `parseBurstSizeLimit` overflow-returns-0
+unit test. FAIL-ON-REVERT: dropping the validators makes the reject cases
+commit clean again; reverting the `parseBurstSizeLimit` delegation makes
+the overflow test go RED (the old inline multiply returned a wrapped
+nonzero, e.g. `20000000000000g` → `3729424098846048256`).
+
 ### #3043 — Security-policy missing/conflicting terminal action (commit fail-closed)
 
 `PolicyAction`'s zero value is `PolicyPermit` (`types_security.go`:

@@ -370,8 +370,34 @@ func cosPriorityLowMinShareSchema() *schemaNode {
 var schemaFirewall = &schemaNode{desc: "Firewall filters and policers", children: map[string]*schemaNode{
 	"policer": {desc: "Traffic policer", args: 1, multi: true, placeholder: "<name>", children: map[string]*schemaNode{
 		"if-exceeding": {desc: "Rate limits for the policer", children: map[string]*schemaNode{
-			"bandwidth-limit":  {desc: "Bandwidth limit in bits per second (k|m|g suffix)", args: 1, placeholder: "<bps>", children: nil},
-			"burst-size-limit": {desc: "Burst size limit in bytes (k|m|g suffix)", args: 1, placeholder: "<bytes>", children: nil},
+			// #5299: both leaves were untyped (ValueAny), so the legacy
+			// parsers (parseBandwidthLimit / parseBurstSizeLimit) silently
+			// coerced garbage / zero / overflow to 0 bps/bytes. A typo like
+			// `bandwidth-limit 10mm` then committed clean and fail-closed the
+			// meter to a drop-all (default `then discard`) or an inert meter.
+			// Typing them rejects malformed/zero/overflowing input loud at
+			// commit; the tolerant Store.Load / SyncApply ingress downgrades
+			// the same violation to a warning (#1319 doctrine).
+			"bandwidth-limit": {
+				desc:          "Bandwidth limit in bits per second (k|m|g suffix)",
+				args:          1,
+				placeholder:   "<bps>",
+				valueType:     ValueRate,
+				valueDesc:     "Bandwidth in bits/sec (e.g. 100k, 10m, 1g) or bps integer; must compile to a non-zero byte/sec rate",
+				valueExamples: []string{"10m", "1g"},
+				validator:     ValidateRate,
+				children:      nil,
+			},
+			"burst-size-limit": {
+				desc:          "Burst size limit in bytes (k|m|g suffix)",
+				args:          1,
+				placeholder:   "<bytes>",
+				valueType:     ValueByteSize,
+				valueDesc:     "Burst size in bytes (e.g. 15k, 100000, 1m); must be greater than zero and must not overflow",
+				valueExamples: []string{"15k", "100000"},
+				validator:     ValidatePolicerBurstSize,
+				children:      nil,
+			},
 		}},
 		"logical-interface-policer": {desc: "Logical interface policer (shared across protocol families)", children: nil},
 		"then": {desc: "Action for traffic exceeding the limits", children: map[string]*schemaNode{
