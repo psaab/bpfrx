@@ -111,7 +111,22 @@ func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDrop
 	}
 
 	if cfg != nil {
+		// #5010 render belt: name-server is rendered verbatim into the
+		// resolv.conf `nameserver` line and the resolved.conf `DNS=` line.
+		// The strict commit gate (config.ValidateIPAddress on the leaf)
+		// rejects a malformed value, but #1960 downgrades that to a warning
+		// on the tolerant load / peer-sync path — so re-validate each static
+		// name-server here and fail-closed skip a value that is not a bare IP
+		// address (an embedded space would inject a second resolver token).
+		// This mirrors the domain-name / domain-search belt below (#4902).
+		// The DHCP-learned servers appended after this loop are already
+		// net.IP.String() output, so only the operator-supplied static list
+		// needs re-validation.
 		for _, ns := range cfg.System.NameServers {
+			if err := config.ValidateIPAddress(ns, nil); err != nil {
+				slog.Warn("skipping invalid name-server", "server", ns, "err", err)
+				continue
+			}
 			add(ns)
 		}
 	}

@@ -37,6 +37,25 @@ startup, and on every DHCP address change it:
 The reconciler runs under the daemon's `applySem` (apply serialization
 lock), so it never races a concurrent commit or a DHCP-driven reconcile.
 
+### Input-validation render belt (#4902, #5010)
+
+`system name-server`, `system domain-name`, and `system domain-search`
+are rendered **verbatim** into `/etc/resolv.conf` (`nameserver <v>` /
+`search <v>...`) and the resolved drop-in (`DNS=` / `Domains=`). Each of
+these leaves carries a strict commit-check validator (`name-server` →
+`ValidateIPAddress`; `domain-*` → `ValidateDNSDomain`), but #1960
+downgrades commit rejection to a **warning** on the tolerant load /
+peer-sync path — so the commit gate is not the last line of defence.
+
+`mergeDNSInput` therefore **re-validates every value at render** and
+**fail-closed skips** any that no longer parses (an IP with an embedded
+space would inject a second resolver token; a domain with a space would
+inject an extra search token). A skipped value is logged (`skipping
+invalid name-server` / `... domain-*`) and simply omitted from the merged
+input; valid siblings still render. This is the render-side half of the
+#4902 double boundary — #5010 closed the `name-server` gap so all three
+DNS leaves now have both a commit validator and a render belt.
+
 ## Boot-time behavior
 
 The boot config apply runs **before** DHCP clients start, so there are no

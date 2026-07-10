@@ -233,7 +233,7 @@ done
 if $target_ok; then
 	pass "iperf3 target reachable ($IPERF_TARGET)"
 else
-	die "Cannot reach iperf3 target $IPERF_TARGET from cluster-lan-host"
+	die "Cannot reach iperf3 target $IPERF_TARGET from ${CLUSTER_LAN_HOST}"
 fi
 
 # ── Start iperf3 ─────────────────────────────────────────────────────
@@ -281,7 +281,7 @@ if ! $iperf_started; then
 fi
 
 if incus exec "$CLUSTER_LAN_HOST" -- pgrep iperf3 &>/dev/null; then
-	pass "iperf3 running on cluster-lan-host"
+	pass "iperf3 running on ${CLUSTER_LAN_HOST}"
 else
 	incus exec "$CLUSTER_LAN_HOST" -- cat "${LOG}" 2>/dev/null || true
 	die "iperf3 failed to start"

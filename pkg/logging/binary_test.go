@@ -32,9 +32,14 @@ func TestFormatBinaryRecord_Basic(t *testing.T) {
 		Time:        time.Date(2026, 1, 15, 10, 30, 0, 0, time.UTC),
 		InZoneName:  "trust",
 		OutZoneName: "untrust",
-		PolicyName:  "allow-web",
-		AppName:     "junos-https",
-		SessionID:   100,
+		// #4914: the binary record now encodes rec.PolicyID (the authoritative
+		// post-processing policy id) rather than evt.PolicyID. In the live
+		// pipeline logEvent mirrors evt.PolicyID into rec.PolicyID for every
+		// non-close event, so set it here to match evt.PolicyID above.
+		PolicyID:   42,
+		PolicyName: "allow-web",
+		AppName:    "junos-https",
+		SessionID:  100,
 	}
 
 	buf := formatBinaryRecord(evt, rec, SyslogInfo, 0)

@@ -1,3 +1,54 @@
+## 2026-07-09 — #4914 logging: SESSION_CLOSE binary record + generic slog no longer report policy_id=0 / action=deny
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4914 (telemetry correctness; residual of #4796). On a
+  SESSION_CLOSE, logEvent zeroes evt.PolicyID (#2853 repurposes [44:48] for
+  the created-subsec-nanos) and only rec.PolicyID carries the admitting
+  policy from [136:140] (#3056); the wire action byte is intentionally 0.
+  Two sinks still misrepresented the close: (1) formatBinaryRecord encoded
+  evt.PolicyID (0) and evt.Action (0 -> actionDeny), so every binary
+  session-close record read policy_id=0 + action=deny; (2) the generic slog
+  "firewall event" close branch still emitted action=actionName(0)="deny".
+  Fixed formatBinaryRecord to encode rec.PolicyID and to flag the close
+  action byte actionNotApplicable (0xFF, documented sentinel — the fixed-
+  shape record cannot omit a field like the text formatters do). Fixed the
+  slog close line to omit action and carry the close reason instead, matching
+  the standard/structured lines (#2513). Scoped to SESSION_CLOSE (the
+  SESSION_OPEN binary action byte is locked by an existing unit test and is
+  out of this issue's scope). Added a live parity fixture through
+  ProcessRawEvent asserting the admitting policy id + no-deny across buffer,
+  callback, slog, standard, structured, and binary sinks (RED on revert of
+  any of the three production changes). Updated TestFormatBinaryRecord_Basic
+  to populate rec.PolicyID (the field the record now reads).
+  **File(s)**: pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/logging/session_close_binary_slog_4914_test.go
+## 2026-07-09 — #5007 userspace HA: resolve forward+reverse session-sync pair against ONE snapshot (close the m.mu-drop drift window)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5007 (bug, HA session-sync concurrency). `SetSessionV4`/
+  `SetSessionV6` installed a forward session then its reverse companion under
+  one `m.mu` hold, but `syncSessionRequestLocked` deliberately drops `m.mu`
+  around the control-socket I/O (unlock → `requestSessionSync` → lock). The
+  reverse companion was BUILT after the forward's socket round-trip, so a
+  concurrent `ApplyConfig` swapping `m.lastSnapshot` in that gap made the
+  reverse resolve egress/zone/tunnel-endpoint metadata against a DIFFERENT
+  snapshot than the forward (drifted `owner_rg_id` / egress). Fix: extracted
+  `mirrorSessionPairV4`/`mirrorSessionPairV6`, which build BOTH the forward and
+  reverse `SessionSyncRequest` under a single uninterrupted `m.mu` hold (all
+  snapshot reads complete before any unlock), then transmit both via a new
+  `syncSessionRequestsLocked` that drops `m.mu` once for the socket sends. The
+  deliberate non-blocking-publish property is preserved — socket I/O still runs
+  with `m.mu` released; only the snapshot READS were pulled ahead of the drop.
+  **File(s)**: pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_sessionsync_snapshot_5007_test.go
+  **Validation**: added
+  `TestMirrorSessionPairV4ResolvedAgainstConsistentSnapshot_5007` — a
+  deterministic fail-on-revert test that forces an ApplyConfig-style snapshot
+  swap during the forward request's socket I/O and asserts the reverse
+  companion still carries the forward's snapshot `owner_rg_id`. It fails RED on
+  the pre-#5007 interleaved shape (reverse OwnerRGID=2, snapshot B) and passes
+  GREEN on the fix. `go test -race ./pkg/dataplane/userspace/` passes; `go vet`
+  and `gofmt` clean; `cmd/xpfd` builds. Go-only change — no Rust touched.
 ## 2026-07-09 — #5023 snmp: fix -race data race on the package-global trapSender
 
 - **Timestamp**: 2026-07-09
@@ -44242,3 +44293,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #5011 path-validate `system time-zone` before the /etc/localtime symlink target (theoretical ../ traversal). The value was an untyped string rendered into the symlink target /usr/share/zoneinfo/<value> (applyTimezone, pkg/daemon/daemon_system.go); a `..` component / absolute path / space could steer the target out of the zoneinfo root. Added ValueTimeZone ValueType + ValidateTimeZone (zoneinfo grammar: `/`-separated segments matching [A-Za-z0-9][A-Za-z0-9_+-]*, rejecting '.'/'..'/absolute/space/control; UTC, America/Los_Angeles, Etc/GMT+5 pass) wired onto the time-zone leaf → strict reject at commit-check (SchemaValidate). Per #1960 doctrine the lenient load/peer-sync path only warns, so added a render belt zoneinfoTarget(): resolves the joined target with filepath.Join+filepath.Rel and refuses (fail-closed, no symlink) an empty/absolute/root-escaping value; applyTimezone gates the symlink creation on it. filepath.Join yields a byte-identical target for legit zones so the symlink idempotence compare is unaffected. Tests: config/time_zone_path_validate_5011_test.go (validator table + flat-set commit gate) RED on revert of the leaf wiring; daemon/time_zone_symlink_belt_5011_test.go (containment/escape) RED on revert of the belt. Documented as a #5011 bullet in docs/config-schema.md.
   **File(s)**: pkg/config/value_type.go, pkg/config/schema_validators_system.go, pkg/config/schema_system.go, pkg/config/time_zone_path_validate_5011_test.go, pkg/daemon/daemon_system.go, pkg/daemon/time_zone_symlink_belt_5011_test.go, docs/config-schema.md
+  **Action**: #5024 unblock the HA/failover test gate — cluster-env resolver + regression test + de-hardcode misleading LAN-host strings. Investigation: the reported "reads $CLUSTER_LAN_HOST but env defines LAN_HOST" and "bare instance names hit the default remote" bugs are ALREADY fixed at origin/master — the shared `cluster-env.sh` (added #1401) derives $CLUSTER_LAN_HOST from the env's LAN_HOST and remote-qualifies $FW0/$FW1/$CLUSTER_LAN_HOST via `_xpf_cluster_ref`/INCUS_REMOTE; the default `make test-failover` already resolves loss:cluster-userspace-host. The issue was filed against the ~3300-commit-stale main checkout, and the operator's documented workaround (`CLUSTER_LAN_HOST=cluster-userspace-host`) was itself the second failure: a BARE override skipped the remote prefix (`${VAR:-ref}` short-circuited `_xpf_cluster_ref`), so incus looked for `cluster-userspace-host` on the DEFAULT remote → "not running". Fix: (1) cluster-env.sh now routes explicit FW0/FW1/CLUSTER_LAN_HOST overrides THROUGH `_xpf_cluster_ref` too (`$(_xpf_cluster_ref "${VAR:-name}")`), a strict superset — unset-default, fully-qualified-override, and legacy-no-INCUS_REMOTE paths are byte-identical, only a bare override on a remote cluster changes (now correctly `loss:<name>`). (2) New hermetic `test/incus/cluster-env-selftest.sh` + `make test-cluster-env-lib`: sources cluster-env.sh in an `env -i` subshell and pins 15 cases (loss default, legacy local, bare/qualified/legacy overrides, IPERF target, LAN_HOST_IP). Proven RED-on-regression against the old resolver. (3) De-hardcoded the literal "cluster-lan-host" in die/pass/skip OUTPUT strings across test-failover / test-double-failover / test-ha-crash / test-stress-failover / test-chained-crash / test-active-active / test-restart-connectivity / test-connectivity to interpolate $CLUSTER_LAN_HOST — those stale literals are what produced the #5024 misdiagnosis (operator saw "from cluster-lan-host" while the resolved host was loss:cluster-userspace-host). shellcheck clean; cluster-cell-selftest 12/12 still green (preamble lock wiring untouched). No full failover run (parent validates the gate).
+  **File(s)**: test/incus/cluster-env.sh, test/incus/cluster-env-selftest.sh, Makefile, CLAUDE.md, test/incus/test-failover.sh, test/incus/test-double-failover.sh, test/incus/test-ha-crash.sh, test/incus/test-stress-failover.sh, test/incus/test-chained-crash.sh, test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh, test/incus/test-connectivity.sh
+  **Action**: #5010 add a render-side belt for `system name-server` (validator/belt asymmetry vs #4902). The resolver `name-server` leaf carried a strict commit-time validator (config.ValidateIPAddress) but had NO render belt in mergeDNSInput, unlike the sibling domain-name/domain-search which #5009 gave both. Under #1960 commit rejection is downgraded to a warning on the tolerant load/peer-sync path, so the render belt is the real security boundary. mergeDNSInput (pkg/daemon/daemon_dns.go) now re-validates each static name-server with config.ValidateIPAddress and fail-closed skips (slog.Warn) any value that is not a bare IP (an embedded space would inject a second resolver token), mirroring the domain belt upstream of both RenderResolvConf and RenderResolvedDropin. DHCP-learned servers are already net.IP.String() so only the operator-supplied static list needs re-validation. Regression test system_dns_nameserver_belt_5010_test.go (drops space/newline/malformed/CIDR, keeps valid v4+v6), RED on revert of the belt. Documented the render belt in docs/dns-ownership.md.
+  **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/system_dns_nameserver_belt_5010_test.go, docs/dns-ownership.md

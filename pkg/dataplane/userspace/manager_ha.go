@@ -868,10 +868,31 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
 		return nil
 	}
+	m.mirrorSessionPairV4(key, val)
+	return nil
+}
+
+// mirrorSessionPairV4 mirrors a forward session and its pre-installed reverse
+// companion (#310) to the Rust helper.
+//
+// #5007: it resolves BOTH requests against ONE consistent config snapshot by
+// building them under a single uninterrupted m.mu hold — BEFORE any control
+// socket I/O drops the lock — then transmits both. buildSessionSyncRequestV4
+// resolves egress/zone/tunnel-endpoint metadata from m.lastSnapshot (and the
+// compile result); a concurrent ApplyConfig publishes a new m.lastSnapshot
+// while holding m.mu, so resolving both requests during one continuous hold
+// guarantees the forward/reverse pair derives from the SAME snapshot.
+// Transmitting only after both builds preserves the deliberate "socket I/O
+// must not block snapshot publishes" property (syncSessionRequestsLocked
+// drops m.mu for the send).
+func (m *Manager) mirrorSessionPairV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Send the forward session to the Rust worker.
-	_ = m.syncSessionV4Locked("upsert", key, &val)
+	if m.proc == nil {
+		return
+	}
+	reqs := make([]SessionSyncRequest, 0, 2)
+	reqs = append(reqs, m.buildSessionSyncRequestV4("upsert", key, &val))
 	// Pre-install the reverse companion so the Rust worker has it before
 	// RG activation, avoiding activation-time synthesis (#310).
 	if val.ReverseKey.Protocol != 0 {
@@ -886,9 +907,10 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 		revVal.FibDmac = [6]byte{}
 		revVal.FibSmac = [6]byte{}
 		revVal.FibGen = 0
-		_ = m.syncSessionV4Locked("upsert", val.ReverseKey, &revVal)
+		reqs = append(reqs, m.buildSessionSyncRequestV4("upsert", val.ReverseKey, &revVal))
 	}
-	return nil
+	// Snapshot reads are complete; transmit both requests in sequence.
+	m.syncSessionRequestsLocked(reqs...)
 }
 
 func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
@@ -925,10 +947,22 @@ func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.Session
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
 		return nil
 	}
+	m.mirrorSessionPairV6(key, val)
+	return nil
+}
+
+// mirrorSessionPairV6 is the IPv6 analogue of mirrorSessionPairV4 — see that
+// method for the #5007 single-snapshot rationale. It builds the forward
+// request and its reverse companion under one uninterrupted m.mu hold, then
+// transmits both.
+func (m *Manager) mirrorSessionPairV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Send the forward session to the Rust worker.
-	_ = m.syncSessionV6Locked("upsert", key, &val)
+	if m.proc == nil {
+		return
+	}
+	reqs := make([]SessionSyncRequest, 0, 2)
+	reqs = append(reqs, m.buildSessionSyncRequestV6("upsert", key, &val))
 	// Pre-install the reverse companion so the Rust worker has it before
 	// RG activation, avoiding activation-time synthesis (#310).
 	if val.ReverseKey.Protocol != 0 {
@@ -943,9 +977,10 @@ func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.Session
 		revVal.FibDmac = [6]byte{}
 		revVal.FibSmac = [6]byte{}
 		revVal.FibGen = 0
-		_ = m.syncSessionV6Locked("upsert", val.ReverseKey, &revVal)
+		reqs = append(reqs, m.buildSessionSyncRequestV6("upsert", val.ReverseKey, &revVal))
 	}
-	return nil
+	// Snapshot reads are complete; transmit both requests in sequence.
+	m.syncSessionRequestsLocked(reqs...)
 }
 
 func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
@@ -1216,6 +1251,33 @@ func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
 		slog.Debug("userspace session sync mirror failed", "operation", req.Operation, "err", err)
 	}
 	return err
+}
+
+// syncSessionRequestsLocked transmits one or more PRE-BUILT session-sync
+// requests to the Rust helper over the control socket. Like
+// syncSessionRequestLocked it drops m.mu once for the socket I/O (so snapshot
+// publishes are not blocked by a session install) and reacquires it before
+// returning; the caller keeps the lock across the call. It performs NO
+// snapshot reads — callers MUST have built every request under a single,
+// uninterrupted prior m.mu hold so a forward/reverse companion pair is
+// resolved against one consistent snapshot (#5007). Sending both requests
+// under a single unlock also keeps the pair's transmit contiguous.
+func (m *Manager) syncSessionRequestsLocked(reqs ...SessionSyncRequest) {
+	if len(reqs) == 0 {
+		return
+	}
+	m.mu.Unlock()
+	for i := range reqs {
+		ctrlReq := ControlRequest{
+			Type:           "sync_session",
+			SuppressStatus: true,
+			SessionSync:    &reqs[i],
+		}
+		if err := m.requestSessionSync(ctrlReq); err != nil {
+			slog.Debug("userspace session sync mirror failed", "operation", reqs[i].Operation, "err", err)
+		}
+	}
+	m.mu.Lock()
 }
 
 func (m *Manager) zoneNameByID(zoneID uint16) string {
