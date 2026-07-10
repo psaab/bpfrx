@@ -196,9 +196,9 @@ func TestDecodeSessionEventNat64_4565(t *testing.T) {
 	// #3301 trailing fields (policy_id/counter/apptimeout = 12) -> off=136; then
 	// the #4565 trailing snat_v4 (4) -> off=140.
 	payload := make([]byte, 140)
-	payload[0] = 6                          // AddrFamily = v6
-	payload[1] = 6                          // Protocol = TCP
-	payload[26] = SessionEventFlagNat64     // flags: NAT64 marker
+	payload[0] = 6                                 // AddrFamily = v6
+	payload[1] = 6                                 // Protocol = TCP
+	payload[26] = SessionEventFlagNat64            // flags: NAT64 marker
 	copy(payload[136:140], []byte{203, 0, 113, 5}) // trailing snat_v4
 
 	d, ok := decodeSessionEvent(payload)
@@ -702,6 +702,46 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 	if len(got) != len(payload) {
 		t.Fatalf("payload len = %d, want %d", len(got), len(payload))
+	}
+}
+
+// TestEventStreamStartReturnsErrorOnListenFailure verifies that a failed
+// net.Listen surfaces an error from Start() rather than being logged and
+// swallowed, and that ListenerBound() stays false so callers can refuse to
+// treat the stream as healthy (#5273). Binding a socket inside a non-existent
+// directory reliably fails with ENOENT.
+func TestEventStreamStartReturnsErrorOnListenFailure(t *testing.T) {
+	unbindable := filepath.Join(t.TempDir(), "missing-dir", "events.sock")
+	es := NewEventStream(unbindable)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := es.Start(ctx); err == nil {
+		t.Fatal("Start() = nil error for an unbindable socket path, want error")
+	}
+	if es.ListenerBound() {
+		t.Fatal("ListenerBound() = true after a failed Start, want false")
+	}
+}
+
+// TestEventStreamListenerBoundReflectsLifecycle verifies ListenerBound tracks
+// the bind: false before Start, true after a successful bind, false after Close.
+func TestEventStreamListenerBoundReflectsLifecycle(t *testing.T) {
+	es := NewEventStream(filepath.Join(t.TempDir(), "events.sock"))
+	if es.ListenerBound() {
+		t.Fatal("ListenerBound() = true before Start, want false")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := es.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !es.ListenerBound() {
+		t.Fatal("ListenerBound() = false after a successful Start, want true")
+	}
+	es.Close()
+	if es.ListenerBound() {
+		t.Fatal("ListenerBound() = true after Close, want false")
 	}
 }
 

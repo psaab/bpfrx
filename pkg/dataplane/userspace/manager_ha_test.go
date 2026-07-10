@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -16,6 +17,23 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// boundEventStream returns an EventStream whose listener successfully bound on a
+// throwaway temp socket, so its ListenerBound() reports true. Takeover-readiness
+// gates on a bound event-stream listener (#5273); fixtures that expect a healthy
+// node ready to serve session deltas must attach one. The listener + accept loop
+// are torn down via t.Cleanup.
+func boundEventStream(t *testing.T) *EventStream {
+	t.Helper()
+	es := NewEventStream(filepath.Join(t.TempDir(), "events.sock"))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := es.Start(ctx); err != nil {
+		t.Fatalf("event stream Start: %v", err)
+	}
+	t.Cleanup(es.Close)
+	return es
+}
 
 func TestTakeoverReadyReportsSessionMirrorFailure(t *testing.T) {
 	m := &Manager{
@@ -160,12 +178,98 @@ func TestTakeoverReadyAllowsStandbyWithReadyBindingsWithoutLivenessProof(t *test
 			1: {RGID: 1, Active: false},
 			2: {RGID: 2, Active: false},
 		},
+		eventStream: boundEventStream(t),
 	}
 
 	ready, reasons := m.TakeoverReady()
 	if !ready {
 		t.Fatalf("TakeoverReady() = false, want true, reasons=%v", reasons)
 	}
+}
+
+// TestTakeoverReadyRequiresEventStreamListenerBound is the #5273 regression:
+// takeover-readiness must gate on the LOCAL event-stream listener being bound
+// (the node can serve session deltas), NOT on a peer having connected. A node
+// whose listener failed to bind is session-starved for a standby and must not be
+// advertised takeover-ready; a healthy node with no peer yet must NOT be blocked.
+//
+// RED-on-revert: removing the ListenerBound() gate in takeoverReadyLocked makes
+// the ListenerBindFailed sub-case report ready=true (every other gate passes),
+// while the two ListenerBound sub-cases stay green either way — proving the gate
+// keys on listener-up, not peer-connected.
+func TestTakeoverReadyRequiresEventStreamListenerBound(t *testing.T) {
+	newHealthyManager := func() *Manager {
+		return &Manager{
+			proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+			lastStatus: ProcessStatus{
+				Enabled:         true,
+				ForwardingArmed: true,
+				Capabilities:    UserspaceCapabilities{ForwardingSupported: true},
+			},
+			mode:              ModeUserspaceCompat,
+			xskLivenessProven: true,
+		}
+	}
+
+	t.Run("ListenerBindFailed", func(t *testing.T) {
+		es := NewEventStream(filepath.Join(t.TempDir(), "missing-dir", "events.sock"))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		if err := es.Start(ctx); err == nil {
+			t.Fatal("precondition: Start unexpectedly succeeded on an unbindable path")
+		}
+		m := newHealthyManager()
+		m.eventStream = es // stored, but the listener never bound
+		ready, reasons := m.TakeoverReady()
+		if ready {
+			t.Fatalf("TakeoverReady() = true with an unbound event-stream listener, want false; reasons=%v", reasons)
+		}
+		if !hasReasonSubstr(reasons, "event stream listener not bound") {
+			t.Fatalf("missing event-stream listener gate reason, got %v", reasons)
+		}
+	})
+
+	t.Run("ListenerBoundNoPeer", func(t *testing.T) {
+		es := boundEventStream(t)
+		if es.IsConnected() {
+			t.Fatal("precondition: no peer should be connected yet")
+		}
+		m := newHealthyManager()
+		m.eventStream = es
+		if ready, reasons := m.TakeoverReady(); !ready {
+			t.Fatalf("TakeoverReady() = false for a healthy peerless node, want true; reasons=%v", reasons)
+		}
+	})
+
+	t.Run("ListenerBoundPeerConnected", func(t *testing.T) {
+		es := boundEventStream(t)
+		conn, err := net.Dial("unix", es.socketPath)
+		if err != nil {
+			t.Fatalf("dial event socket: %v", err)
+		}
+		defer conn.Close()
+		deadline := time.Now().Add(2 * time.Second)
+		for !es.IsConnected() {
+			if time.Now().After(deadline) {
+				t.Fatal("peer did not connect to event stream")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		m := newHealthyManager()
+		m.eventStream = es
+		if ready, reasons := m.TakeoverReady(); !ready {
+			t.Fatalf("TakeoverReady() = false with peer connected, want true; reasons=%v", reasons)
+		}
+	})
+}
+
+func hasReasonSubstr(reasons []string, substr string) bool {
+	for _, r := range reasons {
+		if strings.Contains(r, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTakeoverReadyRequiresLivenessProofOnActiveNode(t *testing.T) {

@@ -52,7 +52,16 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	_ = os.Remove(evtPath)
 	es := NewEventStream(evtPath)
 	esCtx, esCancel := context.WithCancel(context.Background())
-	es.Start(esCtx)
+	// The event socket carries every post-bootstrap session delta the helper
+	// streams to the peer. If its listener fails to bind we cannot serve a
+	// standby, so fail the whole bring-up here — BEFORE spawning the helper —
+	// rather than storing a non-nil-but-dead stream that takeoverReadyLocked
+	// would then wave through as healthy (#5273).
+	if err := es.Start(esCtx); err != nil {
+		esCancel()
+		es.Close()
+		return fmt.Errorf("start userspace dataplane event stream listener: %w", err)
+	}
 	m.eventStream = es
 	m.eventStreamCancel = esCancel
 	// Clear stale XSKMAP entries from previous helper instance.

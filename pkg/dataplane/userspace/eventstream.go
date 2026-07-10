@@ -50,6 +50,14 @@ type EventStream struct {
 	// write is not an option.
 	writeMu sync.Mutex
 
+	// listening is TRUE once net.Listen on the event socket succeeded in
+	// Start(), and FALSE again after Close(). It records whether the daemon
+	// can SERVE session deltas to a helper — the local listener is bound —
+	// which is distinct from `connected` below (a helper has dialed in). HA
+	// takeover-readiness gates on this: a node whose delta channel never bound
+	// must not advertise itself able to feed a standby after failover (#5273).
+	listening atomic.Bool
+
 	connected atomic.Bool
 	paused    atomic.Bool
 
@@ -156,20 +164,41 @@ func (es *EventStream) dataplaneCallbacks() (func(uint64, []byte), func(uint64, 
 }
 
 // Start creates the Unix socket listener and launches the accept loop.
-func (es *EventStream) Start(ctx context.Context) {
+//
+// It returns an error when net.Listen fails (path-too-long, EADDRINUSE,
+// permission, missing directory). The failure is NOT swallowed: the event
+// socket is the ONLY channel over which the helper streams post-bootstrap
+// session open/close/update deltas to the peer, so a bind failure means the
+// node can never serve a standby. The caller must treat a Start error as a
+// failed bring-up rather than storing a non-nil-but-dead stream (#5273).
+func (es *EventStream) Start(ctx context.Context) error {
 	_ = os.Remove(es.socketPath)
 	ln, err := net.Listen("unix", es.socketPath)
 	if err != nil {
 		slog.Error("event stream: failed to listen", "path", es.socketPath, "err", err)
-		return
+		return fmt.Errorf("event stream listen on %s: %w", es.socketPath, err)
 	}
 	es.listener = ln
+	es.listening.Store(true)
 	slog.Info("event stream: listening", "path", es.socketPath)
 	go es.acceptLoop(ctx)
+	return nil
+}
+
+// ListenerBound reports whether the event-stream listener socket successfully
+// bound (net.Listen in Start() succeeded and Close() has not run). It is TRUE
+// as soon as the daemon can SERVE session deltas — independent of whether a
+// helper/peer has yet dialed in (that is IsConnected). HA takeover-readiness
+// gates on ListenerBound, not IsConnected, so a healthy node with no peer
+// connected yet is still takeover-ready while a node whose delta channel never
+// bound is not (#5273).
+func (es *EventStream) ListenerBound() bool {
+	return es.listening.Load()
 }
 
 // Close shuts down the listener and any active connection.
 func (es *EventStream) Close() {
+	es.listening.Store(false)
 	if es.listener != nil {
 		es.listener.Close()
 	}
