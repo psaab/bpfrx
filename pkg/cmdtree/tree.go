@@ -1259,7 +1259,15 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 				dynamicConsumed = true
 				continue
 			}
-			if node.HasDynamic() && cfg != nil {
+			if node.HasDynamic() {
+				// #5196 (A3-b1-F3): invoke the provider even when cfg==nil.
+				// nil-safety is the provider contract (all DynamicFn /
+				// ContextDynamicFn either guard `cfg == nil` or ignore cfg),
+				// and config-independent providers (e.g. `show route table`
+				// → inet.0/inet6.0, `show route protocol`) intentionally
+				// supply defaults for a nil config (fresh boot /
+				// compile-failure recovery). The old `&& cfg != nil` caller
+				// gate suppressed those defaults.
 				return FilterPrefix(node.DynamicValues(cfg, words), partial)
 			}
 			return nil
@@ -1275,7 +1283,8 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 			candidates = append(candidates, ph)
 		}
 	}
-	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() && cfg != nil {
+	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() {
+		// #5196 (A3-b1-F3): nil-config-aware providers must still run.
 		candidates = append(candidates, currentNode.DynamicValues(cfg, words)...)
 	}
 	return FilterPrefix(candidates, partial)
@@ -1325,7 +1334,8 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 				dynamicConsumed = true
 				continue
 			}
-			if node.HasDynamic() && cfg != nil {
+			if node.HasDynamic() {
+				// #5196 (A3-b1-F3): run the provider on nil cfg too.
 				var candidates []Candidate
 				for _, name := range node.DynamicValues(cfg, words) {
 					if strings.HasPrefix(name, partial) {
@@ -1352,7 +1362,8 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 	if parentTyped && currentNode != nil {
 		candidates = append(candidates, typedLeafCandidates(currentNode, partial)...)
 	}
-	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() && cfg != nil {
+	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() {
+		// #5196 (A3-b1-F3): nil-config-aware providers must still run.
 		for _, name := range currentNode.DynamicValues(cfg, words) {
 			if strings.HasPrefix(name, partial) {
 				candidates = append(candidates, Candidate{Name: name, Desc: "(configured)"})
