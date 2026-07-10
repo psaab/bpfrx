@@ -265,6 +265,46 @@ def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
     return True
 
 
+def verify_listed_artifact_bytes(path, manifest_path, sig_path, pubkey_path=None):
+    """Verify ONE manifest-listed artifact `path` against a signed manifest and
+    return its VERIFIED bytes (TOCTOU-safe).
+
+    Like verify_image_artifact, but for a file the caller must READ and act on
+    (not merely trust in place): the returned bytes come from a private 0700
+    copy whose sha256 was compared to the signed manifest entry, so a
+    concurrent swap of the on-disk `path` AFTER the check cannot feed
+    unverified bytes to the caller (the Codex-M5/AGY-A4 TOCTOU class the
+    verify_and_read primitive already guards for directly-signed files).
+
+    Use this for an artifact that is COVERED by the signed checksum manifest
+    but is not itself minisigned — e.g. the mixed-base protocol sidecar
+    xpf-<ver>.manifest (#5042), whose ha-protocol / session-sync fields drive
+    the deployer's HA session-safety gate and therefore must be read from
+    signed bytes."""
+    manifest = verify_manifest_map(manifest_path, sig_path, pubkey_path)
+    base = os.path.basename(path)
+    if base not in manifest:
+        raise SignError(
+            f"{base} is not listed in the signed manifest "
+            f"{os.path.basename(manifest_path)} — refusing to trust it.")
+    import shutil as _sh
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix="xpf-listed-")
+    try:
+        os.chmod(tmp, 0o700)
+        copy = os.path.join(tmp, base)
+        _sh.copyfile(path, copy)
+        actual = sha256_file(copy)
+        if actual != manifest[base]:
+            raise SignError(
+                f"{base}: SHA256 MISMATCH — manifest {manifest[base]}, actual "
+                f"{actual}. The file does not match the signed checksum.")
+        with open(copy, "rb") as fh:
+            return fh.read()
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 # ── CLI shim for the test gate + manual use ──────────────────────────────
 def _main(argv):
     import argparse
