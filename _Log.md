@@ -1,3 +1,18 @@
+## 2026-07-09 — #5035 grpcapi primary listener loopback clamp (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5035. The primary gRPC listener (`Run`) is unauthenticated
+  (only `configLockInterceptor`), so a non-loopback `--grpc-addr` would
+  expose destructive RPCs (SystemAction zeroize/reboot, Commit/Delete/
+  Rollback) to the network. Added `clampGRPCBindToLoopback` mirroring the
+  #4903/#4928 web-management/cluster doctrine and wired it into `Run` so a
+  wildcard/routable bind is pulled back to a same-family loopback + warned.
+  The default 127.0.0.1 path is unchanged. RED-on-revert:
+  `TestRunClampsNonLoopbackBind` + pure `TestClampGRPCBindToLoopback`.
+  **File(s)**: pkg/grpcapi/server.go,
+  pkg/grpcapi/server_grpc_loopback_clamp_5035_test.go,
+  pkg/grpcapi/README.md
+
 ## 2026-07-09 — #4908 cli/show display-fidelity cohort (partial: 6 fixed, 6 deferred)
 
 - **Timestamp**: 2026-07-09
