@@ -30,6 +30,25 @@ Codex implemented pkg/upgrade/kernel_linux.go against the KernelSystem interface
   /lib/modules (#5076). Test seams (injectable aptGet / dpkg-query + fsRoot)
   cover the purge-failure, partial-purge, confirmed-removal, and reinstall
   paths.
+- The dpkg "is this package installed?" query is TRI-STATE — installed /
+  not-installed / query-error (#5428). #5076/#5427 made the sweep safe on a
+  purge FAILURE and a PARTIAL purge, but both the PRE-purge installed-set loop
+  and the POST-purge confirmed-absent re-query used a helper that returned
+  `false` on ANY dpkg-query error, so a dpkg-DB corruption/parse error (while
+  the package IS installed) read as "not installed" -> the package was dropped
+  from the set, the purge was skipped, and the sweep deleted package-owned
+  /boot + /lib/modules files while dpkg still owned them (the same DB/FS
+  divergence, reached via a query error instead of a lock/maintainer-script
+  failure). A query error now FAILS SAFE: the package is treated as
+  POSSIBLY-INSTALLED so a real purge is attempted and the sweep stays gated
+  behind a POSITIVE confirmed-absent re-query. isPkgInstalled distinguishes a
+  genuinely-unknown package ("no packages found matching" -> confirmed absent,
+  so a never-installed optional pkg is not pushed into the purge set and
+  apt-get does not fail with "Unable to locate package") from a real query
+  failure (DB corruption, permission, lock, missing binary -> fail safe). New
+  seam signature `pkgInstalledFn func(pkg string) (bool, error)` lets a test
+  inject a query error; the #5428 tests prove RED-on-revert (files swept
+  without the fix).
 
 Build/test: go build ./... OK; go vet ./pkg/upgrade OK; 17 kernel tests + the
 existing #1917 tests green.

@@ -50,7 +50,7 @@ func TestPruneInactiveSlot_PurgeFailureLeavesFiles(t *testing.T) {
 	var purgeArgs []string
 	sys := &realKernelSystem{
 		fsRoot:         root,
-		pkgInstalledFn: func(string) bool { return true }, // candidate installed
+		pkgInstalledFn: func(string) (bool, error) { return true, nil }, // candidate installed
 		aptGetFn: func(args ...string) error {
 			purgeArgs = args
 			return fmt.Errorf("dpkg: error: dpkg frontend lock held by another process")
@@ -100,7 +100,7 @@ func TestPruneInactiveSlot_PurgeSuccessSweepsFiles(t *testing.T) {
 	sys := &realKernelSystem{
 		fsRoot: root,
 		// Installed before the purge, absent after — dpkg confirms removal.
-		pkgInstalledFn: func(string) bool { return !purged },
+		pkgInstalledFn: func(string) (bool, error) { return !purged, nil },
 		aptGetFn: func(args ...string) error {
 			if len(args) > 0 && args[0] == "purge" {
 				purged = true
@@ -132,7 +132,7 @@ func TestPruneInactiveSlot_PartialPurgeKeepsFiles(t *testing.T) {
 
 	sys := &realKernelSystem{
 		fsRoot:         root,
-		pkgInstalledFn: func(string) bool { return true }, // never confirmed absent
+		pkgInstalledFn: func(string) (bool, error) { return true, nil }, // never confirmed absent
 		aptGetFn:       func(args ...string) error { return nil },
 	}
 
@@ -162,7 +162,7 @@ func TestPruneInactiveSlot_NothingInstalledSweeps(t *testing.T) {
 	purgeCalled := false
 	sys := &realKernelSystem{
 		fsRoot:         root,
-		pkgInstalledFn: func(string) bool { return false },
+		pkgInstalledFn: func(string) (bool, error) { return false, nil },
 		aptGetFn: func(args ...string) error {
 			purgeCalled = true
 			return nil
