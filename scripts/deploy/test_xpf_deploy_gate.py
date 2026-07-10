@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -298,6 +301,124 @@ class NicSpecParserTests(unittest.TestCase):
         ifs = self._launch_interfaces(["bridge:br0,mac=02:00:00:00:00:01"])
         self.assertEqual(ifs[0]["mac"], "02:00:00:00:00:01")
         self.assertEqual(ifs[0]["source"], "br0")
+
+
+# ── #5042: the mixed-base gate input must be SIGNED ───────────────────────
+class MixedBaseSignedManifestTests(unittest.TestCase):
+    """The protocol sidecar xpf-<ver>.manifest carries the ha-protocol /
+    session-sync fields the mixed-base HA session-safety gate reads. Before
+    #5042 the deployer parsed it RAW, so tampering ONLY that sidecar — while
+    every signed image byte (the qcow2 + the signed SHA256SUMS + its .minisig)
+    stayed untouched — could spoof a compatible-window / matching-session-sync
+    decision and bypass the session-safety stop.
+
+    _verified_image_manifest_versions now binds the sidecar to the signed
+    SHA256SUMS via sign.verify_listed_artifact_bytes. These vectors pin that a
+    protocol-field tamper is caught (fail closed). RED on a fix-forward that
+    reverts to reading the sidecar raw / drops the checksum binding."""
+
+    def setUp(self):
+        here = Path(__file__).resolve().parent
+        sys.path.insert(0, str(here.parent / "dist"))
+        import sign
+        self.sign = sign
+        self.tmp = tempfile.mkdtemp(prefix="xpf-5042-test-")
+        # A non-placeholder pubkey path so _resolve_pubkey accepts it.
+        self.pub = os.path.join(self.tmp, "test.pub")
+        with open(self.pub, "w") as f:
+            f.write("untrusted-test-key\n")
+        # The signed SHA256SUMS + its .minisig are the SIGNED bytes an attacker
+        # does NOT touch, so model them as validly signed: neutralize the
+        # minisign check and exercise the CHECKSUM binding (pure Python), which
+        # is what actually catches a tampered sidecar. A real end-to-end
+        # minisign chain is covered separately when the binary is present.
+        self._orig_verify_sig = sign.verify_signature
+        sign.verify_signature = lambda m, s, p: None
+
+    def tearDown(self):
+        self.sign.verify_signature = self._orig_verify_sig
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stage(self, manifest_text, list_manifest=True):
+        """Write a sidecar + a signed-manifest covering it (+ a stub .minisig)."""
+        manifest = os.path.join(self.tmp, "xpf-1.2.3.manifest")
+        with open(manifest, "w") as f:
+            f.write(manifest_text)
+        sums = os.path.join(self.tmp, "xpf-1.2.3.SHA256SUMS")
+        listed = [manifest] if list_manifest else []
+        if not listed:
+            # a decoy so the manifest is non-empty but does NOT cover the sidecar
+            decoy = os.path.join(self.tmp, "decoy.bin")
+            with open(decoy, "w") as f:
+                f.write("x")
+            listed = [decoy]
+        self.sign.write_manifest(sums, listed)
+        sig = sums + ".minisig"
+        with open(sig, "w") as f:
+            f.write("stub-signature (verify_signature patched)\n")
+        return manifest, sums, sig
+
+    def test_untampered_sidecar_verifies_parses_and_gates(self):
+        manifest, sums, sig = self._stage(_SAMPLE_MANIFEST)
+        img = xpf_deploy._verified_image_manifest_versions(
+            manifest, sums, sig, self.pub)
+        self.assertEqual(img["session-sync-protocol-version"], "3")
+        survive, reason = xpf_deploy._gate_mixed_base(img, _peer(1, 3))
+        self.assertTrue(survive, reason)
+
+    def test_tampered_protocol_field_fails_closed(self):
+        manifest, sums, sig = self._stage(_SAMPLE_MANIFEST)
+        # Attacker rewrites ONLY the sidecar's session-sync field to spoof a
+        # matching-sync decision; the signed SHA256SUMS + .minisig still list
+        # the ORIGINAL sidecar hash.
+        with open(manifest, "w") as f:
+            f.write(_SAMPLE_MANIFEST.replace(
+                "session_sync_protocol_version: 3",
+                "session_sync_protocol_version: 4"))
+        with self.assertRaises(self.sign.SignError):
+            xpf_deploy._verified_image_manifest_versions(
+                manifest, sums, sig, self.pub)
+
+    def test_sidecar_not_in_signed_manifest_fails_closed(self):
+        manifest, sums, sig = self._stage(_SAMPLE_MANIFEST, list_manifest=False)
+        with self.assertRaises(self.sign.SignError):
+            xpf_deploy._verified_image_manifest_versions(
+                manifest, sums, sig, self.pub)
+
+    def test_default_sums_sibling_of_manifest(self):
+        self.assertEqual(
+            xpf_deploy._default_sums_for_manifest("/d/xpf-1.2.3.manifest"),
+            "/d/xpf-1.2.3.SHA256SUMS")
+        self.assertIsNone(xpf_deploy._default_sums_for_manifest("/d/weird.txt"))
+
+    def test_real_minisign_end_to_end_tamper(self):
+        """Full chain when minisign is installed: real keygen -> sign the
+        SHA256SUMS -> verify (pass) -> tamper the sidecar -> verify (fail)."""
+        if not shutil.which("minisign"):
+            self.skipTest("minisign not installed")
+        # Use the REAL signature verification for this leg.
+        self.sign.verify_signature = self._orig_verify_sig
+        sec = os.path.join(self.tmp, "e2e.key")
+        pub = os.path.join(self.tmp, "e2e.pub")
+        r = subprocess.run(["minisign", "-G", "-W", "-p", pub, "-s", sec],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest(f"minisign keygen unavailable (-W): {r.stderr.strip()}")
+        manifest = os.path.join(self.tmp, "xpf-9.9.9.manifest")
+        with open(manifest, "w") as f:
+            f.write(_SAMPLE_MANIFEST)
+        sums = os.path.join(self.tmp, "xpf-9.9.9.SHA256SUMS")
+        self.sign.write_manifest(sums, [manifest])
+        self.sign.sign_manifest(sums, sec)
+        sig = sums + ".minisig"
+        img = xpf_deploy._verified_image_manifest_versions(manifest, sums, sig, pub)
+        self.assertTrue(xpf_deploy._gate_mixed_base(img, _peer(1, 3))[0])
+        with open(manifest, "w") as f:
+            f.write(_SAMPLE_MANIFEST.replace(
+                "session_sync_protocol_version: 3",
+                "session_sync_protocol_version: 4"))
+        with self.assertRaises(self.sign.SignError):
+            xpf_deploy._verified_image_manifest_versions(manifest, sums, sig, pub)
 
 
 if __name__ == "__main__":

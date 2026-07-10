@@ -772,6 +772,19 @@ node from a new baked image ONE AT A TIME (built on the existing per-node
    `ha-protocol-min-compat` / `session-sync-protocol-version` fields the
    bake records from `xpfd protocol-versions`) and the running peer's live
    `xpfd protocol-versions`, and applies `upgrade.GateMixedBaseSwap`
+
+   **Signed gate input (#5042).** The `xpf-<ver>.manifest` sidecar is
+   included in the signed `xpf-<ver>.SHA256SUMS` set at bake time, and
+   `image-roll` VERIFIES it against that signed manifest (`--sha256sums` /
+   `--sig` / `--pubkey`, defaulting to the `.SHA256SUMS` sibling + its
+   `.minisig` + the pinned image pubkey) and parses the checksum-bound bytes
+   before the gate reads them. Before #5042 the sidecar was parsed raw, so
+   tampering ONLY those protocol fields — while every signed image byte
+   stayed untouched — could spoof a compatible-window / matching-session-sync
+   decision and bypass the session-safety stop. Verification is fail-closed:
+   a missing/unsigned/mismatched manifest STOPS the roll (there is no
+   `--allow-session-drop`-style bypass of the signature — that flag relaxes
+   only the compatibility verdict, never the authentication of the input).
    (mirrored in the driver, unit-tested in Go): sessions survive **iff**
    the peer's HA protocol is within the new image's
    `[min-compat, version]` window AND the session-sync protocol matches
