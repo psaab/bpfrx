@@ -84,6 +84,9 @@ make test-deploy     # Build -> push xpfd+cli+helper (each sha256-verified ==
 make test-deploy-lib # Self-test the deploy reconcile/sha-verify helpers (no VM)
 make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
                      #   lock preamble (no cluster — private lock path, mocked incus)
+make test-cluster-env-lib # Self-test the cluster-env resolver (#5024): $FW0/
+                     #   $FW1/$CLUSTER_LAN_HOST derive from each env's VM0/VM1/
+                     #   LAN_HOST and get INCUS_REMOTE-qualified (no cluster)
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
 make test-logs       # journalctl -u xpfd -n 50
@@ -150,6 +153,15 @@ Or use `test/incus/cluster-setup.sh` directly with `BPFRX_CLUSTER_ENV` set:
 `{init|create|deploy all|destroy|ssh 0|1|status|logs 0|1}`.
 
 **IMPORTANT:** Any change touching cluster, VRRP, session sync, or failover code MUST pass `make test-failover` before commit.
+
+`make test-failover` (and the sibling HA smoke targets) run on the loss
+userspace cluster by default and need **no** `CLUSTER_LAN_HOST` override —
+`cluster-env.sh` derives the LAN host from the env's `LAN_HOST`
+(`cluster-userspace-host`) and remote-qualifies every instance ref with
+`INCUS_REMOTE` (`loss:`), so `$CLUSTER_LAN_HOST` resolves to
+`loss:cluster-userspace-host` on its own (#5024). A **bare** override is
+still remote-qualified (`CLUSTER_LAN_HOST=cluster-userspace-host` →
+`loss:cluster-userspace-host`); `make test-cluster-env-lib` guards this.
 
 ## Architecture
 

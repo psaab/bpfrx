@@ -261,7 +261,7 @@ done
 if $target_ok; then
 	pass "iperf3 target reachable ($IPERF_TARGET)"
 else
-	die "Cannot reach iperf3 target $IPERF_TARGET from cluster-lan-host"
+	die "Cannot reach iperf3 target $IPERF_TARGET from ${CLUSTER_LAN_HOST}"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
