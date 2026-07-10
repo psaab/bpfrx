@@ -1214,13 +1214,19 @@ func expandAddressRange(low, high string) ([]string, error) {
 	if lowN > highN {
 		return nil, fmt.Errorf("low address %s > high address %s", low, high)
 	}
-	count := highN - lowN + 1
+	// #5194 A3-b2-F9: compute the inclusive count in uint64. In uint32 the
+	// full-domain range 0.0.0.0-255.255.255.255 has highN-lowN == 0xFFFFFFFF and
+	// +1 WRAPS to 0, so the `> 256` guard passed, the generation loop ran zero
+	// times, and the oversized range committed as an EMPTY pool with nil error
+	// instead of the promised size error.
+	count := uint64(highN) - uint64(lowN) + 1
 	if count > 256 {
 		return nil, fmt.Errorf("address range too large: %d IPs (max 256)", count)
 	}
 	var result []string
 	buf := make(net.IP, 4)
-	for i := uint32(0); i < count; i++ {
+	// count is bounded by 256 here, so the uint32 loop bound cannot wrap.
+	for i := uint32(0); i < uint32(count); i++ {
 		binary.BigEndian.PutUint32(buf, lowN+i)
 		result = append(result, buf.String()+"/32")
 	}
