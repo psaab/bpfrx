@@ -905,6 +905,21 @@ evidence, not as active eBPF source-removal blockers.
   a commit that *removes* a responder and re-install the removed responder from a
   stale pre-commit config snapshot -- it always reconciles the post-commit
   `ActiveConfig` (#4001).
+- Removal teardown (#2475 sysctl + #4955 neighbor entry): a commit that drops an
+  interface (or its last address) from `proxy-arp` tears down BOTH the leaked
+  `proxy_arp`/`proxy_ndp` sysctl AND the installed `NTF_PROXY` neighbor entries.
+  The daemon remembers the last-installed `(iface -> families)` set; on each
+  reconcile it feeds those prior interfaces back into `ReconcileProxyARP` as the
+  `priorIfaceMap`, so the stateless dataplane reconcile lists the removed
+  interfaces, finds their `NTF_PROXY` entries absent from the desired set, and
+  `NeighDel`s them (#4955) before disabling the sysctl (#2475). Full removal
+  (config now has zero entries) still runs the reconcile for exactly this sweep.
+  Without it the neighbor entry was orphaned in the kernel and kept answering ARP
+  for the retired IPv4 via the route-topology-dependent pneigh branch until a
+  link reset/reboot -- attracting traffic to an obsolete translation or a
+  reassigned VIP. The add path is also best-effort: a mid-add `NeighSet` failure
+  no longer nils out the remembered set, so a later removal can still tear down
+  what was installed.
 - Breadth tradeoff (IPv4): with the default `medium_id=0`, `proxy_arp=1` makes the
   kernel answer ARP on that interface for ANY target routed out a different
   interface -- broader than Junos `proxy-arp`, which proxies only the listed
