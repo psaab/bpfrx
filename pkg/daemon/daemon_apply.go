@@ -624,7 +624,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		return err
 	}
 
-	d.applyInterfaceReconcile(cfg)
+	// #5310: capture the interface-reconcile failure (xfrmi/bond/tunnel/legacy-
+	// reth) and thread it into the tail commit-error join so a genuine reconcile
+	// failure (e.g. a route-based VPN's xfrmi that could not be created) fails
+	// the commit closed instead of reporting false success. All later reconcile
+	// steps still run — the error is deferred to the tail exactly like
+	// networkdErr/hostInboundErr/lo0Err (fail-closed but complete).
+	ifaceErr := d.applyInterfaceReconcile(cfg)
 
 	d.applyFabricIPVLAN(cfg)
 
@@ -652,10 +658,10 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// RETH-MAC core that stays inline (it threads applyResult / rethMACPending
 	// / the deferred errors). The tail is independent per-subsystem dispatch
 	// reading only cfg (+ nil-guarded managers), so grouping it here is a
-	// behavior-preserving mechanical move. The three head-produced deferred
-	// errors are threaded in; the helper creates lo0Err/hostInboundErr and
-	// returns the identical five-way errors.Join.
-	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr)
+	// behavior-preserving mechanical move. The four head-produced deferred
+	// errors (networkdErr/dhcpServerErr/ipsecErr/ifaceErr) are threaded in; the
+	// helper creates lo0Err/hostInboundErr and returns the six-way errors.Join.
+	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr, ifaceErr)
 }
 
 // applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and
@@ -1058,7 +1064,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 // return and no crossing input beyond cfg. It produces the IPsec and
 // DHCP-server deferred errors (recorded, not returned early, so a later
 // per-subsystem failure does not abort the apply) and returns them (ipsecErr,
-// dhcpServerErr) for the tail reconcile's five-way errors.Join. Runs in the
+// dhcpServerErr) for the tail reconcile's six-way errors.Join. Runs in the
 // same slot, after the routing rules and before the tail reconciles.
 func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 	// 4. Proactive neighbor resolution for all known next-hops/gateways.
@@ -1520,15 +1526,31 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 // xfrmi interfaces for IPsec VPNs (before BPF compilation so compileZones can
 // map them to zones), fabric bond/LAG member interfaces, and cleanup of legacy
 // RETH bond devices. Extracted verbatim from applyConfigLocked (#4407); all
-// steps are idempotent reconciles (unchanged config = no-op) that log-and-
-// continue on error, so there is no crossing output and no early return. Runs
-// in the same slot, after the VRF reconcile and before fabric IPVLAN creation.
-func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) {
+// steps are idempotent reconciles (unchanged config = no-op). Runs in the same
+// slot, after the VRF reconcile and before fabric IPVLAN creation.
+//
+// Fail-closed (#5310): each sub-stage's GENUINE reconcile failure is
+// accumulated with errors.Join and returned so the caller can join it into the
+// commit result. Before this the function was void and every sub-stage error
+// was swallowed at WARN — a route-based IPsec VPN whose xfrmi failed to be
+// created (xfrmManager.Apply used to return nil unconditionally) or a fabric
+// bond that could not be realized (#4823) reported a SUCCESSFUL commit while the
+// interface carried no traffic. The tolerated idempotent conditions stay
+// non-errors inside each manager (an already-exists link is adopted, an
+// already-gone delete is a no-op — #4901/#5119/#5261), so a benign re-apply
+// still returns nil and keeps succeeding. All steps still run (no early return)
+// so a failure in one does not skip the others.
+func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
+	if d.routing == nil {
+		return nil
+	}
+
+	var errs []error
+
 	// 1. Create tunnel interfaces (interface-level + per-unit tunnels)
-	if d.routing != nil {
-		if err := d.routing.ApplyTunnels(collectAppliedTunnels(cfg)); err != nil {
-			slog.Warn("failed to apply tunnels", "err", err)
-		}
+	if err := d.routing.ApplyTunnels(collectAppliedTunnels(cfg)); err != nil {
+		slog.Warn("failed to apply tunnels", "err", err)
+		errs = append(errs, fmt.Errorf("apply tunnels: %w", err))
 	}
 
 	// 1.5. Create xfrmi interfaces for IPsec VPN tunnels.
@@ -1536,35 +1558,39 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) {
 	// the xfrmi interfaces and map them to security zones.
 	// Always call ApplyXfrmi so stale xfrmi devices are removed when VPNs
 	// are deleted from config.
-	if d.routing != nil {
-		if err := d.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
-			slog.Warn("failed to apply xfrmi interfaces", "err", err)
-		}
+	if err := d.routing.ApplyXfrmi(cfg.Security.IPsec.VPNs); err != nil {
+		slog.Warn("failed to apply xfrmi interfaces", "err", err)
+		errs = append(errs, fmt.Errorf("apply xfrmi interfaces: %w", err))
 	}
 
 	// 1.7. Create bond (LAG) interfaces for fabric-options member-interfaces.
 	// Always call ApplyBonds (even with empty list) so stale bonds from
 	// previous configs get cleaned up via ClearBonds().
-	if d.routing != nil {
-		var bondIfaces []*config.InterfaceConfig
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc == nil {
-				continue
-			}
-			if len(ifc.FabricMembers) > 0 {
-				bondIfaces = append(bondIfaces, ifc)
-			}
+	var bondIfaces []*config.InterfaceConfig
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
 		}
-		if err := d.routing.ApplyBonds(bondIfaces); err != nil {
-			slog.Warn("failed to apply bonds", "err", err)
+		if len(ifc.FabricMembers) > 0 {
+			bondIfaces = append(bondIfaces, ifc)
 		}
+	}
+	if err := d.routing.ApplyBonds(bondIfaces); err != nil {
+		slog.Warn("failed to apply bonds", "err", err)
+		errs = append(errs, fmt.Errorf("apply bonds: %w", err))
 	}
 
 	// 1.8. Clean up legacy RETH bond devices from previous binary versions.
 	// VRRP now runs directly on physical member interfaces — no bonds needed.
-	if d.routing != nil {
-		d.routing.ClearRethInterfaces()
+	// ClearRethInterfaces returns an error only on a netlink LinkList failure
+	// (the per-bond LinkDel failures are logged internally); surface it so a
+	// stale legacy reth bond left in the kernel fails the commit closed.
+	if err := d.routing.ClearRethInterfaces(); err != nil {
+		slog.Warn("failed to clean up legacy RETH bonds", "err", err)
+		errs = append(errs, fmt.Errorf("clean up legacy RETH bonds: %w", err))
 	}
+
+	return errors.Join(errs...)
 }
 
 // applyTailReconciles runs steps 8–21 of applyConfigLocked — the tail of the
@@ -1578,13 +1604,13 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) {
 // intentionally-async callbacks the apply body spawns all live in the head,
 // not here.
 //
-// Error-join contract: the five deferred reconcile errors accumulate across
-// the whole apply body but are joined only at this tail (fail-closed — every
-// step still runs). networkdErr/dhcpServerErr/ipsecErr originate in the head
+// Error-join contract: the deferred reconcile errors accumulate across the
+// whole apply body but are joined only at this tail (fail-closed — every step
+// still runs). networkdErr/dhcpServerErr/ipsecErr/ifaceErr originate in the head
 // and are threaded in as parameters; lo0Err/hostInboundErr originate in step
 // 9.5 below. The returned errors.Join preserves the exact operand order the
-// inline tail used (#1778/#2987/#4433).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServerErr, ipsecErr error) error {
+// inline tail used (#1778/#2987/#4433/#5310).
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServerErr, ipsecErr, ifaceErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
@@ -1844,13 +1870,14 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServer
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	// #1778 + #2987 + #4433: deferred reconcile failures — every reconcile
-	// step above has run; surface the networkd write failure, the Kea
-	// restart/stop failure, and the IPsec render/reload failure through the
-	// commit so a step that left stale kernel/swanctl state fails the commit
-	// (fail-closed) instead of reporting success. All are joined so none
-	// masks the other.
-	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr)
+	// #1778 + #2987 + #4433 + #5310: deferred reconcile failures — every
+	// reconcile step above has run; surface the networkd write failure, the Kea
+	// restart/stop failure, the IPsec render/reload failure, and the
+	// interface-reconcile failure (xfrmi/bond/tunnel/legacy-reth create/up/delete
+	// — #5310) through the commit so a step that left stale or missing
+	// kernel/swanctl state fails the commit (fail-closed) instead of reporting
+	// success. All are joined so none masks the other.
+	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

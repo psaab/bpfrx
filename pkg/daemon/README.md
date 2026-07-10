@@ -455,6 +455,27 @@ never lock an operator out of a remote box it manages.
   success-no-error, idempotent add+delete teardown) and
   `daemon_apply_runtime_test.go:TestApplyConfigLockedSurfacesLo0Failure` (the
   commit-level `errors.Join` wiring proof).
+  **Interface-reconcile fail-closed (#5310, mirroring #3333/#3392):**
+  `applyInterfaceReconcile` (tunnels / xfrmi / fabric bonds / legacy-reth
+  cleanup) was VOID and swallowed every sub-stage failure at WARN, and the tail
+  commit-error join EXCLUDED the whole stage — so a commit that added a
+  route-based IPsec VPN whose xfrmi `LinkAdd` failed (`xfrmManager.Apply`
+  returned `nil` unconditionally) reported SUCCESS while the interface, and the
+  route-based IPs bound to it, carried no traffic (cross-module false
+  convergence). It now RETURNS an `errors.Join` of its sub-stage failures;
+  `applyConfigLocked` captures it (`ifaceErr`) and threads it into the tail
+  `errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr,
+  ifaceErr)`, so a genuine reconcile failure fails the commit closed. The
+  underlying managers keep their idempotency (`xfrmManager.Apply` adopts an
+  already-exists link and treats an already-gone delete as success #4901/#5261;
+  `bondManager` #4823/#5119), so a benign re-apply still returns `nil` — this is
+  purely surfacing GENUINE failures. All later reconcile steps still run (the
+  error is deferred to the tail, fail-closed but complete). Tests:
+  `apply_interface_reconcile_failclosed_5310_test.go` (direct
+  applyInterfaceReconcile xfrmi/bond failure-surfaced + idempotent-no-error, and
+  the `applyTailReconciles` commit-join wiring proof) plus
+  `pkg/routing/xfrm_apply_failclosed_5310_test.go` (the routing-side
+  `xfrmManager.Apply` returns-error / tolerates-already-exists half).
   **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
