@@ -7397,6 +7397,203 @@ fn term_extra_truncated_icmpv6_fails_closed() {
     );
 }
 
+// #5150 (security — match-on-padding / filter-evasion): the flexible-match-range
+// byte slices (flex_l3 / flex_l4) MUST be bounded by the IP-DECLARED datagram
+// end (IP total-length), NOT the physical Ethernet frame end. Otherwise a
+// byte-offset filter term can match ATTACKER-CONTROLLED bytes in Ethernet slack
+// (padding beyond the declared IP length — e.g. the 60-octet minimum-frame pad
+// appended by NICs after a short datagram). These tests build a frame with slack
+// past the IP total-length and assert the slack is EXCLUDED from both flex
+// slices. They FAIL if the clamp is reverted to `..frame.len()` (the slice then
+// runs to the frame end and includes the slack marker).
+const FLEX_SLACK_MARKER: [u8; 4] = [0xDE, 0xAD, 0xBE, 0xEF];
+
+#[test]
+fn term_extra_flex_l3_l4_clamped_to_ipv4_declared_end_excludes_ethernet_slack() {
+    // Real 8-byte L4 payload; frag_v4_packet sets IPv4 total-length correctly to
+    // 20 (IP header) + payload.len().
+    let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let datagram = frag_v4_packet(PROTO_UDP, 0x0000, &payload);
+    let total_length = datagram.len(); // == the IPv4 total-length field
+    let mut frame = vec![0u8; 14]; // ethernet header
+    frame.extend_from_slice(&datagram);
+    frame.extend_from_slice(&FLEX_SLACK_MARKER); // attacker bytes in Ethernet slack
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20, // ethernet + IPv4 header
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+
+    let flex_l3 = extra.flex_l3.expect("l3 slice present");
+    assert_eq!(
+        flex_l3.len(),
+        total_length,
+        "flex_l3 must end at the IP-declared datagram end (l3_offset + total-length), \
+         excluding the 4 Ethernet-slack bytes — reverting the clamp to ..frame.len() \
+         makes this total_length + 4 and fails here"
+    );
+    assert!(
+        !flex_l3.ends_with(&FLEX_SLACK_MARKER),
+        "the attacker slack marker must NOT be visible to a layer-3 flex byte-match"
+    );
+
+    let flex_l4 = extra.flex_l4.expect("l4 slice present");
+    assert_eq!(
+        flex_l4.len(),
+        payload.len(),
+        "flex_l4 (from l4_offset) must end at the declared datagram end — the real \
+         L4 payload only, no Ethernet slack"
+    );
+    assert!(
+        !flex_l4.ends_with(&FLEX_SLACK_MARKER),
+        "the attacker slack marker must NOT be visible to a layer-4 flex byte-match"
+    );
+}
+
+#[test]
+fn term_extra_flex_no_slack_exposes_full_ipv4_datagram() {
+    // No Ethernet slack: frame.len() == 14 + total-length, so declared_end ==
+    // frame.len() and both slices are byte-identical to pre-#5150 behavior.
+    let payload = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02];
+    let datagram = frag_v4_packet(PROTO_UDP, 0x0000, &payload);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.flex_l3,
+        Some(&frame[14..]),
+        "a well-formed packet with no slack must expose the full L3 datagram (no regression)"
+    );
+    assert_eq!(
+        extra.flex_l4,
+        Some(&frame[14 + 20..]),
+        "flex_l4 must expose the full L4 payload when there is no slack"
+    );
+}
+
+#[test]
+fn term_extra_flex_lying_oversized_ipv4_length_clamped_to_frame() {
+    // A LYING (too-large) IPv4 total-length must clamp to frame.len(): the slice
+    // is bounded by the physical frame, never over-reading (no panic).
+    let payload = [0x11u8, 0x22, 0x33, 0x44];
+    let mut datagram = frag_v4_packet(PROTO_UDP, 0x0000, &payload);
+    datagram[2..4].copy_from_slice(&0xFFFFu16.to_be_bytes()); // total-length = 65535
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.flex_l3,
+        Some(&frame[14..]),
+        "a lying oversized IP total-length must clamp to frame.len(), not over-read"
+    );
+    assert_eq!(extra.flex_l4, Some(&frame[14 + 20..]));
+}
+
+#[test]
+fn term_extra_flex_tiny_ipv4_length_l4_offset_past_declared_end_fails_closed() {
+    // A TINY declared total-length (10) puts the declared datagram end (l3+10=24)
+    // BEFORE l4_offset (34). The L4 slice range is invalid → None (fail closed,
+    // no panic, no negative range). flex_l3 is a bounded 10-byte window.
+    let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let mut datagram = frag_v4_packet(PROTO_UDP, 0x0000, &payload);
+    datagram[2..4].copy_from_slice(&10u16.to_be_bytes());
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20, // 34, past the declared end (24)
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert!(
+        extra.flex_l4.is_none(),
+        "l4_offset at/past the declared datagram end must yield no L4 slice (fail closed)"
+    );
+    assert_eq!(
+        extra.flex_l3.map(<[u8]>::len),
+        Some(10),
+        "flex_l3 is clamped to the tiny declared length (l3_offset..l3_offset+10)"
+    );
+}
+
+#[test]
+fn term_extra_flex_clamped_to_ipv6_declared_end_excludes_ethernet_slack() {
+    // IPv6 sibling: payload-length == payload.len() (no ext headers), so the
+    // declared datagram end is l3 + 40 + payload-length == datagram.len().
+    let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let datagram = frag_v6_packet(PROTO_UDP, None, &payload);
+    let declared_len = datagram.len();
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    frame.extend_from_slice(&FLEX_SLACK_MARKER);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 40,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    let flex_l3 = extra.flex_l3.expect("l3 slice present");
+    assert_eq!(
+        flex_l3.len(),
+        declared_len,
+        "IPv6 flex_l3 must end at l3 + 40 + payload-length, excluding Ethernet slack"
+    );
+    assert!(!flex_l3.ends_with(&FLEX_SLACK_MARKER));
+    let flex_l4 = extra.flex_l4.expect("l4 slice present");
+    assert_eq!(flex_l4.len(), payload.len());
+    assert!(!flex_l4.ends_with(&FLEX_SLACK_MARKER));
+}
+
+#[test]
+fn term_extra_fwd_flex_clamped_to_ipv4_declared_end_excludes_slack() {
+    // The ForwardPacketMeta (CoS / TX-selection) builder is the twin fold and
+    // MUST apply the identical clamp — otherwise a CoS-action byte-match on that
+    // path reads Ethernet slack.
+    let payload = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let datagram = frag_v4_packet(PROTO_UDP, 0x0000, &payload);
+    let total_length = datagram.len();
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&datagram);
+    frame.extend_from_slice(&FLEX_SLACK_MARKER);
+    let meta = ForwardPacketMeta {
+        l3_offset: 14,
+        l4_offset: 14 + 20,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..ForwardPacketMeta::default()
+    };
+    let extra = term_match_extra_from_frame_fwd(&frame, meta);
+    let flex_l3 = extra.flex_l3.expect("l3 slice present");
+    assert_eq!(
+        flex_l3.len(),
+        total_length,
+        "the fwd builder must clamp flex_l3 to the IP-declared end too"
+    );
+    assert!(!flex_l3.ends_with(&FLEX_SLACK_MARKER));
+    assert!(!extra.flex_l4.expect("l4 slice present").ends_with(&FLEX_SLACK_MARKER));
+}
+
 // #3008 (meta sibling of #2449): `term_match_extra_from_meta` builds match
 // inputs from metadata ALONE — there is no frame to read the real ICMP type/code
 // from. The pre-fix code stamped `icmp_type = icmp_code = 0` while keeping

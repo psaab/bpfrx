@@ -531,6 +531,57 @@ pub(in crate::afxdp) fn is_any_fragment(packet: &[u8], addr_family: u8) -> bool 
 /// are not present in the frame, force `(0, 0, 0)` AND drop `l4_present`, so the
 /// L4 matcher fails closed (treats it as no-match). The #2344/#2362 gate only
 /// covered the non-first-fragment case, not pure truncation.
+/// #5150: end offset (into `frame`) of the IP-DECLARED datagram, i.e.
+/// `l3_offset + IP total length`, CLAMPED to `frame.len()`. Backs the
+/// flexible-match-range byte slices (`flex_l3`/`flex_l4`) so a firewall filter
+/// byte-match is bounded by the LOGICAL IP datagram (IP total-length) and never
+/// by the physical Ethernet backing frame.
+///
+/// Two clamps, both security-relevant:
+///   - Upper clamp to `frame.len()`: a LYING (too-large) IP length field can
+///     never widen the slice past the physical frame (no over-read).
+///   - The slice end is this value, NOT `frame.len()`: attacker-controlled bytes
+///     in Ethernet SLACK (padding beyond the declared IP length — e.g. the 60-
+///     octet minimum-frame pad after a short datagram) are EXCLUDED, closing the
+///     match-on-padding / filter-evasion hole.
+///
+/// Returns `None` when the frame is too short to even hold the IP length field
+/// (IPv4 total-length at l3+2..4, IPv6 payload-length at l3+4..6) — the caller
+/// then has no declared bound and fails the flex slice closed (the same
+/// fail-closed posture as a frame shorter than `l3_offset`). A non-IP
+/// `addr_family` also yields `None` (no IP datagram to bound).
+///
+/// For a well-formed packet with no Ethernet slack, `declared_end == frame.len()`
+/// so `flex_l3`/`flex_l4` see the exact same bytes as before this change.
+#[inline]
+fn ip_declared_end(frame: &[u8], l3_offset: usize, addr_family: u8) -> Option<usize> {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            // IPv4 total length (header + payload), bytes 2..4 of the IP header.
+            let total = u16::from_be_bytes([
+                *frame.get(l3_offset + 2)?,
+                *frame.get(l3_offset + 3)?,
+            ]) as usize;
+            Some(l3_offset.checked_add(total)?.min(frame.len()))
+        }
+        libc::AF_INET6 => {
+            // IPv6 payload length (ext headers + L4 + payload), bytes 4..6 of the
+            // fixed 40-byte IPv6 header. Declared datagram end = l3 + 40 + payload.
+            let payload = u16::from_be_bytes([
+                *frame.get(l3_offset + 4)?,
+                *frame.get(l3_offset + 5)?,
+            ]) as usize;
+            Some(
+                l3_offset
+                    .checked_add(40)?
+                    .checked_add(payload)?
+                    .min(frame.len()),
+            )
+        }
+        _ => None,
+    }
+}
+
 #[inline]
 pub(in crate::afxdp) fn term_match_extra_from_frame(
     frame: &[u8],
@@ -573,6 +624,15 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
     } else {
         (meta.tcp_flags, 0, 0)
     };
+    // #5150: clamp the flexible-match-range byte slices to the IP-DECLARED
+    // datagram end (`l3_offset + IP total length`, clamped to `frame.len()`),
+    // NOT the physical frame end. Slicing to `frame.len()` exposed
+    // attacker-controlled bytes in Ethernet slack (padding beyond the declared
+    // IP length) to a byte-offset filter match — a match-on-padding /
+    // filter-evasion bug. `None` (frame too short to hold the IP length field)
+    // fails both slices closed, like a frame shorter than l3_offset.
+    let l3 = meta.l3_offset as usize;
+    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
     crate::filter::TermMatchExtra {
         tcp_flags,
         is_fragment,
@@ -585,21 +645,27 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         l4_present: !non_first_fragment && !l4_truncated,
         // #3077: the L3 header slice (match-start layer-3) backs the
         // flexible-match-range byte-offset match. The byte offset is relative to
-        // the start of the IP header. `l3_packet` is None if the frame is
-        // shorter than l3_offset, in which case the matcher's bounds check fails
-        // the flex term closed.
-        flex_l3: l3_packet,
+        // the start of the IP header. #5150: the slice ends at the IP-declared
+        // datagram end, not frame.len(), so Ethernet slack cannot be matched.
+        // `frame.get(l3..declared_end)` is None if the frame is shorter than
+        // l3_offset (declared_end < l3 → invalid range) OR `declared_end` is
+        // None, in which case the matcher's bounds check fails the flex term
+        // closed.
+        flex_l3: declared_end.and_then(|end| frame.get(l3..end)),
         // #3232: the L4 header slice (match-start layer-4) backs a layer-4
         // flexible-match-range. The byte offset is relative to the start of the
         // transport header (`meta.l4_offset`). A NON-FIRST fragment carries no
         // L4 header there (its post-IP bytes are payload), so it gets None and a
-        // layer-4 flex term fails closed. `frame.get` is None if the frame is
+        // layer-4 flex term fails closed. #5150: the slice ends at the
+        // IP-declared datagram end (Ethernet slack excluded); if l4_offset is at
+        // or past that end (e.g. a lying tiny IP length) the range is invalid and
+        // yields None → fail closed. `frame.get` is also None if the frame is
         // shorter than l4_offset, in which case the matcher's bounds check fails
         // closed too.
         flex_l4: if non_first_fragment {
             None
         } else {
-            frame.get(meta.l4_offset as usize..)
+            declared_end.and_then(|end| frame.get(meta.l4_offset as usize..end))
         },
     }
 }
@@ -644,22 +710,28 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
     } else {
         (meta.tcp_flags, 0, 0)
     };
+    // #5150: same IP-declared-end clamp as the input-filter builder above — the
+    // two builders MUST stay identical. Without it a CoS-action byte-match on
+    // this TX-selection path would read Ethernet slack (match-on-padding).
+    let l3 = meta.l3_offset as usize;
+    let declared_end = ip_declared_end(frame, l3, meta.addr_family);
     crate::filter::TermMatchExtra {
         tcp_flags,
         is_fragment,
         icmp_type,
         icmp_code,
         l4_present: !non_first_fragment && !l4_truncated,
-        // #3077: L3 header slice for flexible-match-range (see the input-filter
-        // builder above). Same fail-closed-on-too-short bounds check applies.
-        flex_l3: l3_packet,
-        // #3232: L4 header slice for a layer-4 flexible-match-range (see the
-        // input-filter builder above). None on a non-first fragment so a
-        // layer-4 flex term fails closed.
+        // #3077 / #5150: L3 header slice for flexible-match-range (see the
+        // input-filter builder above), clamped to the IP-declared datagram end.
+        // Same fail-closed-on-too-short/None bounds check applies.
+        flex_l3: declared_end.and_then(|end| frame.get(l3..end)),
+        // #3232 / #5150: L4 header slice for a layer-4 flexible-match-range (see
+        // the input-filter builder above), clamped to the IP-declared datagram
+        // end. None on a non-first fragment so a layer-4 flex term fails closed.
         flex_l4: if non_first_fragment {
             None
         } else {
-            frame.get(meta.l4_offset as usize..)
+            declared_end.and_then(|end| frame.get(meta.l4_offset as usize..end))
         },
     }
 }
