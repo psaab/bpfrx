@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 )
@@ -187,6 +188,17 @@ func validateOneWireguardTunnel(tc *TunnelConfig) error {
 		}
 
 		for _, cidr := range p.AllowedIPs {
+			// #5194 A3-b3-F6: reject a MALFORMED allowed-ips prefix at commit.
+			// The Rust hydrate (forwarding_build/tunnels.rs) parses each entry
+			// with ipnet::IpNet and `Err(_) => continue`, silently dropping a
+			// malformed prefix while KEEPING the peer — an all-malformed list
+			// yields an empty AllowedIPs set (a peer that routes nothing) with no
+			// diagnostic. Parse every entry here so the commit-accept set never
+			// exceeds the runtime-hydrate set; the lenient path downgrades this to
+			// a warning via emit() (the caller wraps validateOneWireguardTunnel).
+			if _, perr := netip.ParsePrefix(cidr); perr != nil {
+				return fmt.Errorf("peer %q has a malformed allowed-ips prefix %q: %v (expected CIDR like 10.0.0.0/24 or 2001:db8::/48)", p.PublicKeyHex, cidr, perr)
+			}
 			canon := canonicalAllowedIPPrefix(cidr)
 			if owner, dup := prefixOwner[canon]; dup && owner != p.PublicKeyHex {
 				return fmt.Errorf("allowed-ips prefix %s is claimed by two peers (%q and %q); the cryptokey routing table maps a prefix to exactly one peer, so an exact-duplicate prefix has no longest-prefix winner and silently strips one peer's route — give each peer distinct allowed-ips", canon, owner, p.PublicKeyHex)
@@ -208,9 +220,14 @@ func validateOneWireguardTunnel(tc *TunnelConfig) error {
 // same cryptokey-routing entry compare equal regardless of host-bit
 // spelling or IPv6 zero-compression (10.0.0.5/24 == 10.0.0.0/24,
 // 2001:db8::1/32 == 2001:db8::/32). An unparseable string is keyed
-// verbatim: malformed-prefix validation is the Rust IpNet boundary's
-// concern (orthogonal to #2445), and an exact verbatim repeat still
-// surfaces as a duplicate here.
+// verbatim; an exact verbatim repeat still surfaces as a duplicate here.
+//
+// #5194 A3-b3-F6: malformed prefixes are now REJECTED at strict commit (and
+// warned on tolerant load) by the netip.ParsePrefix gate in
+// validateOneWireguardTunnel, so on the strict path an unparseable string never
+// reaches this key builder. The verbatim fallback therefore only matters on the
+// tolerant load path, where a malformed entry survives as a warning; keying it
+// verbatim keeps the same-prefix dedup working there too.
 func canonicalAllowedIPPrefix(cidr string) string {
 	if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
 		return ipNet.String()

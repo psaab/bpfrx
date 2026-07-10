@@ -240,7 +240,20 @@ pub(in crate::afxdp) fn hydrate_wg_identity(
         for cidr in &wire.wg_allowed_ips {
             match cidr.parse::<ipnet::IpNet>() {
                 Ok(net) => allowed_ips.push(net),
-                Err(_) => continue,
+                Err(_) => {
+                    // #5194 A3-b3-F6: drop only the malformed prefix (keeping the
+                    // peer's other routes), but make the drop OBSERVABLE. The Go
+                    // commit gate now rejects a malformed allowed-ips at strict
+                    // commit and warns on tolerant load, so this only fires for a
+                    // leniently-loaded / peer-synced config that slipped a bad
+                    // prefix past the warn path — log which route vanished instead
+                    // of leaving the operator to debug a silent blackhole.
+                    eprintln!(
+                        "xpf-userspace-dp: wireguard allowed-ips {:?} is not a valid CIDR; dropping this prefix (the peer keeps its other routes)",
+                        cidr
+                    );
+                    continue;
+                }
             }
         }
         let mut endpoint: Option<SocketAddr> = None;
