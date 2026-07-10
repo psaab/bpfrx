@@ -862,18 +862,67 @@ func stableSubnetID(subnet string) int {
 	return int(h.Sum32()%keaSubnetIDMax) + 1
 }
 
-// nextSubnetID advances a subnet-id by one within the valid range, wrapping
-// keaSubnetIDMax back to 1. It is the deterministic linear probe used to
-// resolve the (astronomically unlikely) case of two DISTINCT subnets in the
-// SAME rendered config hashing to the same id: probing in the canonical
-// (sorted-group, sorted-pool) render order keeps the resolution a function of
-// the rendered SET, so it never reintroduces map-iteration nondeterminism. Two
-// subnets on a single Kea instance must never share an id or Kea would misbind.
-func nextSubnetID(id int) int {
-	if id >= keaSubnetIDMax {
-		return 1
+// subnetProbeStep derives a DETERMINISTIC probe step from the subnet CIDR
+// ALONE, using a DIFFERENT FNV-1a seed than stableSubnetID (a fixed salt
+// prefix). It is only consulted to resolve the astronomically unlikely case of
+// two DISTINCT CIDRs in the SAME rendered config hashing to the same id
+// (#5203). Because the step is a pure function of the CIDR — never of the
+// node's MASTER-filtered subset — a colliding subnet walks the SAME probe
+// sequence on both HA nodes, so it resolves to the SAME id regardless of which
+// OTHER subnets each node masters. This is the completeness residual of #5041:
+// the earlier +1 linear probe stepped through the node's render order, so the
+// free id it found depended on the surrounding subnets and could differ across
+// nodes under asymmetric mastering, reintroducing the #5041 cross-node misbind
+// for the colliding pair.
+//
+// The step is forced coprime with keaSubnetIDMax so the linear probe over
+// (base + k*step) visits every id in [1, keaSubnetIDMax] exactly once and thus
+// always finds a free slot (there are always far fewer than keaSubnetIDMax
+// subnets). keaSubnetIDMax == 0xFFFFFFFE == 2 * (2^31-1) with 2^31-1 prime, so
+// an odd step is coprime unless it equals that prime factor; we bump that one
+// residue.
+func subnetProbeStep(subnet string) uint32 {
+	h := fnv.New32a()
+	// Distinct seed from stableSubnetID (which hashes the raw CIDR bytes): the
+	// salt makes this an INDEPENDENT hash so base and step do not correlate.
+	_, _ = h.Write([]byte("xpf-subnet-probe\x00"))
+	_, _ = h.Write([]byte(subnet))
+	step := h.Sum32() % uint32(keaSubnetIDMax) // [0, keaSubnetIDMax-1]
+	step |= 1                                  // odd -> coprime with the 2 factor
+	if step == 0x7FFFFFFF {                    // == 2^31-1, the only odd non-coprime residue
+		step += 2
 	}
-	return id + 1
+	return step
+}
+
+// resolveSubnetID returns the Kea subnet-id to assign to subnet given the ids
+// already claimed by earlier subnets in the SAME rendered config (used). The
+// common path is the direct stableSubnetID hit — no collision — returned
+// unchanged so realistic deployments are bit-identical to #5041. On a genuine
+// hash collision the loser walks a CIDR-DERIVED sequence base + k*step (folded
+// into [1, keaSubnetIDMax]) until it finds a free id, skipping occupied ids in
+// a CIDR-DETERMINED order rather than the set-position order the old +1 probe
+// used. Two subnets on a single Kea instance must never share an id (Kea would
+// misbind), and 0 / 0xFFFFFFFF (Kea's reserved sentinels) are never produced.
+func resolveSubnetID(subnet string, used map[int]bool) int {
+	id := stableSubnetID(subnet)
+	if !used[id] {
+		return id
+	}
+	m := uint64(keaSubnetIDMax)
+	step := uint64(subnetProbeStep(subnet))
+	cur := uint64(id - 1) // 0-based, in [0, keaSubnetIDMax-1]
+	for k := uint64(1); k < m; k++ {
+		cur += step
+		if cur >= m {
+			cur -= m // step < m, so cur < 2m: one subtraction re-folds
+		}
+		cand := int(cur) + 1
+		if !used[cand] {
+			return cand
+		}
+	}
+	return id // unreachable: subnet count is always << keaSubnetIDMax
 }
 
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
@@ -903,21 +952,20 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 
 	var subnets []keaSubnet4
 	usedIDs := make(map[int]bool)
-	// #5041/#2668: assign Kea subnet_id from a STABLE hash of the subnet CIDR,
-	// walking a DETERMINISTIC (sorted-group, sorted-pool) order. Kea binds
+	// #5041/#2668/#5203: assign Kea subnet_id from a STABLE hash of the subnet
+	// CIDR, walking a DETERMINISTIC (sorted-group, sorted-pool) order. Kea binds
 	// memfile leases (kea-leases4.csv) to subnets by the subnet_id column. The
 	// prior positional counter gave the SAME subnet a DIFFERENT id on the two
 	// HA nodes because each renders only its MASTER-filtered subset, so a
 	// synced lease misbound on the receiver (#5041). Hashing the CIDR makes the
 	// id a function of the subnet identity alone — identical on both nodes,
-	// across filtered subsets and reloads (#2668). The sorted walk keeps the
-	// rare collision probe deterministic.
+	// across filtered subsets and reloads (#2668). On the astronomically rare
+	// hash collision, resolveSubnetID probes a CIDR-DERIVED sequence (not the
+	// node's set position), so even the colliding pair resolves to the same id
+	// on both nodes (#5203).
 	for _, group := range stableGroups(cfg.DHCPLocalServer.Groups) {
 		for _, pool := range stablePools(group.Pools) {
-			id := stableSubnetID(pool.Subnet)
-			for usedIDs[id] {
-				id = nextSubnetID(id)
-			}
+			id := resolveSubnetID(pool.Subnet, usedIDs)
 			usedIDs[id] = true
 			sub := keaSubnet4{
 				ID:     id,
@@ -1031,17 +1079,16 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 
 	var subnets []keaSubnet6
 	usedIDs := make(map[int]bool)
-	// #5041/#2668: same stable-hash subnet_id assignment as the v4 path. Kea
-	// binds kea-leases6.csv leases by subnet_id, so a positional counter over
-	// each node's MASTER-filtered subset gave one subnet different ids on the
-	// two nodes and misbound synced leases. Hash the CIDR so the id is stable
-	// per subnet across nodes, filtered subsets, and reloads.
+	// #5041/#2668/#5203: same stable-hash subnet_id assignment as the v4 path.
+	// Kea binds kea-leases6.csv leases by subnet_id, so a positional counter
+	// over each node's MASTER-filtered subset gave one subnet different ids on
+	// the two nodes and misbound synced leases. Hash the CIDR so the id is
+	// stable per subnet across nodes, filtered subsets, and reloads; on a hash
+	// collision resolveSubnetID probes a CIDR-DERIVED sequence so the colliding
+	// pair still resolves identically on both nodes (#5203).
 	for _, group := range stableGroups(cfg.DHCPv6LocalServer.Groups) {
 		for _, pool := range stablePools(group.Pools) {
-			id := stableSubnetID(pool.Subnet)
-			for usedIDs[id] {
-				id = nextSubnetID(id)
-			}
+			id := resolveSubnetID(pool.Subnet, usedIDs)
 			usedIDs[id] = true
 			sub := keaSubnet6{
 				ID:     id,
