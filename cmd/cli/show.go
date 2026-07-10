@@ -12,6 +12,7 @@ package main
 //	show_nat.go        security nat source/destination renderers
 //	show_interfaces.go show interfaces
 //	show_protocols.go  show protocols ospf/bgp/bfd/rip/isis
+//	show_firewall_effective.go  arg helpers for show firewall … effective (#4967)
 //	show_system.go     show system (commit/rollback/uptime/...)
 //	show_services.go   show services (rpm/ip-monitoring/app-id/ddns)
 //	show_dhcp.go       show dhcp leases / client-identifier
@@ -236,6 +237,14 @@ func (c *ctl) handleShow(args []string) error {
 	case "protocols":
 		return c.handleShowProtocols(args[1:])
 
+	case "bgp":
+		// #4967: `show bgp ...` is the advertised alias for `show protocols
+		// bgp ...` (cmdtree). The local CLI implements it; the remote
+		// dispatcher previously had no bgp case, so tab-completing and running
+		// `show bgp summary` errored. handleShowProtocols switches on args[0],
+		// which is already "bgp" here, so pass args verbatim.
+		return c.handleShowProtocols(args)
+
 	case "system":
 		return c.handleShowSystem(args[1:])
 
@@ -270,6 +279,28 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("dhcp-server")
 
 	case "firewall":
+		// #4967: `show firewall [filter <name>] effective [family <f>]` renders
+		// the compiled FirewallFilterSnapshot the dataplane receives. cmdtree
+		// advertises `effective` and the local CLI implements it, but the remote
+		// dispatcher previously fell through to showText("firewall") — the RAW
+		// config, not the compiled snapshot. Route it to the dedicated server
+		// topics (which share the SSOT renderer) so the two surfaces agree.
+		// `effective` is a trailing modifier, matching the local grammar.
+		if firewallArgsContain(args, "effective") {
+			family := firewallFamilyValue(args)
+			if name := firewallFilterName(args); name != "" {
+				topic := "firewall-effective-filter:" + name
+				if family != "" {
+					topic += ":" + family
+				}
+				return c.showText(topic)
+			}
+			topic := "firewall-effective"
+			if family != "" {
+				topic += ":" + family
+			}
+			return c.showText(topic)
+		}
 		if len(args) >= 3 && args[1] == "filter" {
 			topic := "firewall-filter:" + args[2]
 			if len(args) >= 5 && args[3] == "family" {
