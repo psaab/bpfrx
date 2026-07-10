@@ -41,6 +41,36 @@ func isNumericCodePointRangeError(err error) bool {
 	return errors.As(err, &e)
 }
 
+// unknownCodePointTokenError marks a class-of-service code-point token that is
+// neither numeric nor a known symbolic DSCP alias — a typo such as `af99` or
+// `foo`, or any non-numeric spelling on the PCP side (802.1p has no aliases)
+// (#5194 A3-b2-F12). Before #5194 such a token was silently dropped in BOTH the
+// strict and tolerant paths, inconsistent with the numeric out-of-range path
+// (#2447) which rejects at commit and warns on tolerant load. This type gives
+// the typo the SAME treatment: STRICT-reject at commit / commit-check, LENIENT
+// warn-and-drop on load / peer-sync (opts.lenientCoSNumericCodePoint) so a
+// config an older/looser binary persisted still boots and the operator's next
+// strict commit rejects the typo loudly.
+type unknownCodePointTokenError struct{ msg string }
+
+func (e *unknownCodePointTokenError) Error() string { return e.msg }
+
+func newUnknownCodePointTokenError(format string, args ...any) error {
+	return &unknownCodePointTokenError{msg: fmt.Sprintf(format, args...)}
+}
+
+// isDowngradableCoSCodePointError reports whether err is one of the
+// class-of-service code-point findings the tolerant path downgrades to a
+// warning: a numeric out-of-range value (#2447) OR an unknown/typo symbolic
+// token (#5194 A3-b2-F12). Every other compile error stays a hard reject.
+func isDowngradableCoSCodePointError(err error) bool {
+	if isNumericCodePointRangeError(err) {
+		return true
+	}
+	var e *unknownCodePointTokenError
+	return errors.As(err, &e)
+}
+
 func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOpts, warnings *[]string) error {
 	if cos == nil {
 		return nil
@@ -179,7 +209,7 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 					}
 					codePoints, err := collectCoSDSCPCodePoints(lpNode)
 					if err != nil {
-						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+						if opts.lenientCoSNumericCodePoint && isDowngradableCoSCodePointError(err) {
 							if warnings != nil {
 								*warnings = append(*warnings, fmt.Sprintf(
 									"class-of-service classifiers dscp %q (downgraded to warning on tolerant path): %v",
@@ -223,7 +253,7 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 					}
 					codePoints, err := collectCoS8021CodePoints(lpNode)
 					if err != nil {
-						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+						if opts.lenientCoSNumericCodePoint && isDowngradableCoSCodePointError(err) {
 							if warnings != nil {
 								*warnings = append(*warnings, fmt.Sprintf(
 									"class-of-service classifiers ieee-802.1 %q (downgraded to warning on tolerant path): %v",
@@ -283,7 +313,7 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 					}
 					codePoint, ok, err := collectCoSDSCPRewriteCodePoint(lpNode)
 					if err != nil {
-						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+						if opts.lenientCoSNumericCodePoint && isDowngradableCoSCodePointError(err) {
 							if warnings != nil {
 								*warnings = append(*warnings, fmt.Sprintf(
 									"class-of-service rewrite-rules dscp %q (downgraded to warning on tolerant path): %v",
@@ -331,7 +361,7 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig, opts compileOp
 					}
 					codePoint, ok, err := collectCoS8021RewriteCodePoint(lpNode)
 					if err != nil {
-						if opts.lenientCoSNumericCodePoint && isNumericCodePointRangeError(err) {
+						if opts.lenientCoSNumericCodePoint && isDowngradableCoSCodePointError(err) {
 							if warnings != nil {
 								*warnings = append(*warnings, fmt.Sprintf(
 									"class-of-service rewrite-rules ieee-802.1 %q (downgraded to warning on tolerant path): %v",
@@ -1089,10 +1119,12 @@ func collectCoS8021CodePoints(node *Node) ([]uint8, error) {
 		}
 		v, err := strconv.Atoi(raw)
 		if err != nil {
-			// Non-numeric token: 802.1p has no symbolic aliases (unlike
-			// DSCP). Preserve the pre-fix skip for anything that is not a
-			// number so we do not reject Junos-compatibility spellings.
-			return nil
+			// #5194 A3-b2-F12: 802.1p has no symbolic aliases, so a non-numeric
+			// token is always a typo. The pre-fix code silently skipped it in
+			// both strict and tolerant paths; reject it at commit (warn-and-drop
+			// on tolerant load) like the numeric out-of-range path below.
+			return newUnknownCodePointTokenError(
+				"class-of-service ieee-802.1 classifier code-point %q is not a valid 0..7 value", raw)
 		}
 		if v < 0 || v > 7 {
 			return newCodePointRangeError(
@@ -1173,10 +1205,12 @@ func collectCoS8021RewriteCodePoint(node *Node) (uint8, bool, error) {
 		}
 		v, err := strconv.Atoi(raw)
 		if err != nil {
-			// Non-numeric token: 802.1p has no symbolic aliases; skip it
-			// (preserving the Junos-compatibility tolerance the classifier
-			// path uses for unknown spellings).
-			return 0, false, nil
+			// #5194 A3-b2-F12: 802.1p has no symbolic aliases, so a non-numeric
+			// rewrite-rule token is always a typo. Reject it at commit
+			// (warn-and-drop on tolerant load) rather than silently dropping the
+			// rewrite entry, matching the classifier side.
+			return 0, false, newUnknownCodePointTokenError(
+				"class-of-service ieee-802.1 rewrite-rule code-point %q is not a valid 0..7 value", raw)
 		}
 		if v < 0 || v > 7 {
 			return 0, false, newCodePointRangeError(
@@ -1239,7 +1273,13 @@ func expandCoSCodePointToken(raw string) ([]uint8, error) {
 		}
 		return []uint8{uint8(v)}, nil
 	}
-	return nil, nil
+	// #5194 A3-b2-F12: a non-numeric, non-alias token is a typo (e.g. `af99`).
+	// The pre-fix code returned no values and no error, silently dropping the
+	// classifier/rewrite entry in BOTH strict and tolerant paths. Reject it at
+	// commit (warn-and-drop on tolerant load) like the numeric out-of-range
+	// path so the operator sees the typo instead of a silently missing class.
+	return nil, newUnknownCodePointTokenError(
+		"class-of-service dscp code-point %q is not a valid DSCP alias or 0..63 value", raw)
 }
 
 var coSDSCPValues = map[string]uint8{

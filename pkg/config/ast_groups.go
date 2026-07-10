@@ -5,6 +5,31 @@ import (
 	"strings"
 )
 
+const (
+	// maxGroupExpandDepth bounds the TRANSITIVE nested-group recursion —
+	// apply-groups inside a group body inside a group body, a chain
+	// g1->g2->...->gN (#5194 A3-b2-F1). The `seen` cycle guard only rejects a
+	// group that references ITSELF (directly or via a cycle); the #4474 memo
+	// only collapses a converging DAG. Neither bounds a shallow-syntax ACYCLIC
+	// chain of distinct groups, which recurses one stack frame per link and can
+	// exhaust the goroutine stack on commit / HA config-sync. A legitimate Junos
+	// config nests apply-groups templates only a handful deep, so this cap sits
+	// far above real use yet rejects a generated/pathological chain cleanly with
+	// an error instead of crashing.
+	maxGroupExpandDepth = 64
+	// maxGroupExpandWork bounds the TOTAL number of group expansions performed
+	// across one ExpandGroups call (every context, every nesting level). It
+	// catches a wide shallow fan-out that stays under the depth cap but still
+	// performs unbounded work, and is a backstop for the depth cap itself.
+	maxGroupExpandWork = 100000
+)
+
+// groupExpandBudget carries the total-work counter shared across the whole
+// expansion recursion (depth is passed by value per nested-group level).
+type groupExpandBudget struct {
+	work int // group expansions performed so far
+}
+
 // ExpandGroups resolves all "apply-groups" references in the tree.
 // It collects group definitions from the "groups" stanza, then for each
 // "apply-groups <name>" node, clones the referenced group's children and
@@ -65,7 +90,7 @@ func (t *ConfigTree) expandGroups(tagInherited bool, vars map[string]string) err
 	// The nil ancestorPath means we're at the top level. The memo map is
 	// created once here and threaded through the whole recursion so a group
 	// reachable via many paths (a converging DAG) is expanded ONCE (#4474).
-	if err := expandGroupsRecursive(&t.Children, groups, nil, nil, make(map[string][]*Node), tagInherited, vars); err != nil {
+	if err := expandGroupsRecursive(&t.Children, groups, nil, nil, make(map[string][]*Node), tagInherited, vars, 0, &groupExpandBudget{}); err != nil {
 		return err
 	}
 
@@ -173,7 +198,12 @@ func walkGroupToContext(groupChildren []*Node, ancestorPath [][]string) []*Node 
 // context) so a converging DAG expands each group once (#4474 fan-out fix).
 // If tagInherited is true, merged nodes get InheritedFrom set to the group name.
 // vars provides ${var} replacements for group names (may be nil).
-func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath [][]string, seen map[string]bool, memo map[string][]*Node, tagInherited bool, vars map[string]string) error {
+func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath [][]string, seen map[string]bool, memo map[string][]*Node, tagInherited bool, vars map[string]string, depth int, budget *groupExpandBudget) error {
+	// #5194 A3-b2-F1: bound the nested-group recursion depth before it can
+	// exhaust the goroutine stack on a deep acyclic chain g1->g2->...->gN.
+	if depth > maxGroupExpandDepth {
+		return fmt.Errorf("apply-groups nesting exceeds maximum depth of %d (possible generated or pathological config)", maxGroupExpandDepth)
+	}
 	// First, collect apply-groups references at this level.
 	// Support bracket-list syntax: apply-groups [ name1 name2 ] produces
 	// Keys = ["apply-groups", "name1", "name2"].
@@ -191,6 +221,14 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 		g, ok := groups[name]
 		if !ok {
 			return fmt.Errorf("apply-groups references undefined group %q", name)
+		}
+
+		// #5194 A3-b2-F1: bound the TOTAL expansion work so a wide shallow
+		// fan-out (many groups, each referenced from many contexts) that stays
+		// under the depth cap still cannot spin unbounded on commit / HA sync.
+		budget.work++
+		if budget.work > maxGroupExpandWork {
+			return fmt.Errorf("apply-groups expansion exceeds maximum work budget of %d (possible generated or pathological config)", maxGroupExpandWork)
 		}
 
 		// Memoization (#4474 fan-out fix): the fully-expanded body of a group
@@ -247,7 +285,7 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			// inherited FROM the nested group are tagged with THAT group's name:
 			// tagNodesInherited above ran before this call, so it tags only the
 			// outer group's own body and does not clobber the nested tags.
-			if err := expandGroupsRecursive(&cloned, groups, ancestorPath, seen, memo, tagInherited, vars); err != nil {
+			if err := expandGroupsRecursive(&cloned, groups, ancestorPath, seen, memo, tagInherited, vars, depth+1, budget); err != nil {
 				return err
 			}
 			expanded = cloned
@@ -279,7 +317,10 @@ func expandGroupsRecursive(nodes *[]*Node, groups map[string]*Node, ancestorPath
 			childPath := make([][]string, len(ancestorPath)+1)
 			copy(childPath, ancestorPath)
 			childPath[len(ancestorPath)] = n.Keys
-			if err := expandGroupsRecursive(&n.Children, groups, childPath, seen, memo, tagInherited, vars); err != nil {
+			// Descending the config TREE (not the nested-group chain), so depth
+			// is unchanged — tree depth is already bounded by the parser
+			// brace-depth cap (#4148). The shared work budget still applies.
+			if err := expandGroupsRecursive(&n.Children, groups, childPath, seen, memo, tagInherited, vars, depth, budget); err != nil {
 				return err
 			}
 		}

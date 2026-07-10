@@ -580,6 +580,15 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 				"name", appName, "port", app.DestinationPort, "err", err)
 			continue
 		}
+		// #5194 A3-b1-F2: sanitize an EXPLICIT destination port so a literal
+		// 0/0-0 (the (0,0) "no constraint" sentinel) does not record a
+		// stampable AppNames row for an over-matching app. Mirrors
+		// appid.BuildCatalog exactly to keep the two AppNames maps
+		// byte-identical (appid_catalog_parity_test.go).
+		dstOK := true
+		if app.DestinationPort != "" {
+			dstLow, dstHigh, dstOK = appid.NormalizeExplicitPortRange(dstLow, dstHigh)
+		}
 
 		// Parse source port range (stored in BPF app_value, not expanded)
 		srcOK := true
@@ -591,6 +600,9 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 				slog.Warn("bad source-port for application",
 					"name", appName, "port", app.SourcePort, "err", srcErr)
 				srcOK = false
+			} else {
+				// #5194 A3-b1-F2: same sanitization for an explicit source port.
+				srcLow, srcHigh, srcOK = appid.NormalizeExplicitPortRange(srcLow, srcHigh)
 			}
 		}
 
@@ -611,7 +623,7 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		// EXPLICIT but unrepresentable protocol records no AppNames name (gated
 		// identically to appid.BuildCatalog for parity).
 		protoEmittable := protoOK || strings.TrimSpace(app.Protocol) == ""
-		if protoEmittable && srcOK && dstLow <= dstHigh && srcLow <= srcHigh {
+		if protoEmittable && srcOK && dstOK && dstLow <= dstHigh && srcLow <= srcHigh {
 			result.AppNames[uint16(appID)] = appName
 		}
 

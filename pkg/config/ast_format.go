@@ -558,13 +558,34 @@ func nodesToJSON(nodes []*Node) map[string]interface{} {
 			result[n.KeyPath()+" @inactive"] = "inactive"
 		}
 		if n.IsLeaf {
-			// Leaf node: key is first key, value is remaining keys joined
+			// Leaf node: key is first key, value is remaining keys joined.
+			var val interface{}
 			if len(n.Keys) == 1 {
-				result[n.Keys[0]] = true
+				val = true
 			} else if len(n.Keys) == 2 {
-				result[n.Keys[0]] = n.Keys[1]
+				val = n.Keys[1]
 			} else {
-				result[n.Keys[0]] = strings.Join(n.Keys[1:], " ")
+				val = strings.Join(n.Keys[1:], " ")
+			}
+			key := n.Keys[0]
+			// #5194 A3-b2-F11: a REPEATED leaf statement (e.g. two `name-server`
+			// lines) must not overwrite last-wins — Junos `display json` renders
+			// repeats as an ordered array. Promote the second and later
+			// occurrences of a key to a []interface{}, appending in document
+			// order, so no configured value is silently dropped. A single
+			// occurrence stays scalar (unchanged). A prior container map under
+			// the same key (a malformed mixed leaf/container shape) is left
+			// alone — the container branch owns that key.
+			if existing, ok := result[key]; ok {
+				if _, isMap := existing.(map[string]interface{}); !isMap {
+					if arr, isArr := existing.([]interface{}); isArr {
+						result[key] = append(arr, val)
+					} else {
+						result[key] = []interface{}{existing, val}
+					}
+				}
+			} else {
+				result[key] = val
 			}
 		} else {
 			name := n.Keys[0]

@@ -124,7 +124,23 @@ func ParseSetVerb(input string) (verb string, path []string, err error) {
 
 	for {
 		tok = lexer.Next()
-		if tok.Type == TokenEOF || tok.Type == TokenSemicolon {
+		if tok.Type == TokenEOF {
+			break
+		}
+		if tok.Type == TokenSemicolon {
+			// #5194 A3-b3-F7: a single trailing semicolon terminates the flat
+			// command, but any token AFTER it is a second statement crammed onto
+			// one line (e.g. `set system host-name fw; delete security policies`).
+			// The pre-fix loop broke on the semicolon and SILENTLY discarded the
+			// remainder while the caller (LoadSet applyEditLine) reported the line
+			// applied — so the trailing `delete` never ran yet commit reported
+			// success. Permit at most one terminating semicolon, then require EOF;
+			// reject any subsequent token with its line/column.
+			if next := lexer.Next(); next.Type != TokenEOF {
+				return "", nil, fmt.Errorf(
+					"unexpected token %s after ';' at line %d, column %d (only one statement per line)",
+					next.Type, next.Line, next.Column)
+			}
 			break
 		}
 		if tok.Type == TokenIdentifier || tok.Type == TokenString {
