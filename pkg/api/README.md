@@ -16,6 +16,17 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
 - `GET /health` — liveness/readiness. `CompileHealthFn` (#758) lets the
   daemon downgrade `/health` to 503 when a recent compile failed
   silently; without the callback it defaults to 200.
+  **Redaction (#5031):** `/health` is unconditionally unauthenticated
+  (`authMiddleware` exempts it), so it exposes only status, counters,
+  timestamps, and stable reason codes — never the raw compile/bootstrap
+  error strings. `compile_last_error` and `bootstrap_import_error` are NOT
+  emitted (those strings are copied verbatim from the parser/compiler and
+  can carry file paths, config internals, or a secret echoed by a schema
+  validator). The failure is still signalled by `compile_failure_count` /
+  `compile_last_error_unix` and `bootstrap_import_status` /
+  `bootstrap_import_failed` / `bootstrap_import_unix`; the full detail
+  stays in the journal (compile WARN/ERROR) and the authenticated in-band
+  `BOOTSTRAP_IMPORT_FAILED` event (event stream / ring buffer).
   `ConfigPersistDegradedFn` (#1799, same injection pattern) downgrades
   `/health` to 503 while the running active config failed to persist to
   disk (HA config-sync or commit-confirmed auto-rollback hit a write
