@@ -776,6 +776,27 @@ func (c *CLI) resolveShowLogPath(name string) (string, error) {
 	return config.SyslogLogFilePath(cfg, name)
 }
 
+// parseShowLogCount reads the operator-supplied line count at args[idx] for a
+// `show log` request. It defaults to 50 when the operand is absent,
+// non-positive, or unparseable (Junos-compatible leniency), and clamps any N
+// above maxTailLines so a view-only (PermView) account cannot make `tail` /
+// `journalctl` emit — and CombinedOutput buffer in-process — an unbounded
+// number of lines (#5069). It shares the maxTailLines cap with the `| last N`
+// ring (#5037): both bound the count of operator-requested log lines the
+// control plane holds at once.
+func parseShowLogCount(args []string, idx int) int {
+	n := 50
+	if idx < len(args) {
+		if v, err := strconv.Atoi(args[idx]); err == nil && v > 0 {
+			n = v
+		}
+	}
+	if n > maxTailLines {
+		n = maxTailLines
+	}
+	return n
+}
+
 // showDaemonLog displays recent daemon log entries from journald,
 // or if a filename argument is given, reads from /var/log/<filename>.
 
@@ -785,12 +806,7 @@ func (c *CLI) showDaemonLog(args []string) error {
 		if _, err := strconv.Atoi(args[0]); err != nil {
 			// Argument is a filename like "messages"
 			filename := args[0]
-			n := 50
-			if len(args) > 1 {
-				if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
-					n = v
-				}
-			}
+			n := parseShowLogCount(args, 1)
 			logPath, err := c.resolveShowLogPath(filename)
 			if err != nil {
 				return err
@@ -804,12 +820,7 @@ func (c *CLI) showDaemonLog(args []string) error {
 		}
 	}
 
-	n := 50
-	if len(args) > 0 {
-		if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
-			n = v
-		}
-	}
+	n := parseShowLogCount(args, 0)
 
 	out, err := exec.Command("journalctl", "-u", "xpfd", "-n", strconv.Itoa(n), "--no-pager").CombinedOutput()
 	if err != nil {
