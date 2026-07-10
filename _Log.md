@@ -1,3 +1,21 @@
+## 2026-07-09 — #4912 rpm: HTTP probe leaked a keep-alive transport + fd per bodyless (204) response
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4912 (resource leak). `probeHTTP` built a fresh
+  `http.Transport` per probe with keep-alives implicitly ENABLED and
+  `IdleConnTimeout == 0`, ran one GET, and dropped the transport. For a
+  bodyless response (204 / Content-Length: 0), `resp.Body.Close()`
+  returned the connection to that unowned transport's idle pool with no
+  idle timeout, so the socket + persistent-connection read-loop goroutine
+  retained each other forever — one fd + goroutine leaked per probe to an
+  empty health endpoint. Fix: set `DisableKeepAlives: true`, defer
+  `transport.CloseIdleConnections()`, and drain (`io.Copy(io.Discard,
+  ...)`) + close the body on every path. Added
+  `TestProbeHTTPBodylessResponseNoConnLeak_4912` — a repeated-204 probe
+  with a connection-counting listener that asserts the server's open-conn
+  count drains to zero; RED on revert (4 conns stay open).
+  **File(s)**: pkg/rpm/rpm.go,
+  pkg/rpm/http_transport_leak_4912_test.go, pkg/rpm/README.md
 ## 2026-07-09 — #4876 cmd/xpfd: publish-generation ran destructive staged-generation GC even when the journal protection set was unreadable
 
 - **Timestamp**: 2026-07-09
