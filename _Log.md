@@ -1,3 +1,19 @@
+## 2026-07-09 — #5005 daemon: applySystemLogin option-injection (missing `--` + no defensive username re-validation)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5005 (security). `applySystemLogin` ran root `id`/`useradd`/
+  `chown` with the config username as a leading positional arg and no `--`
+  end-of-options separator, and never re-validated the name. On the tolerant
+  load / peer-sync path the strict commit-check is downgraded to a warning
+  (#1960), so a leading-dash name could reach these root tools as an option.
+  Fixed by mirroring the #4895 sudoers writer: defensively call
+  `config.ValidateLoginUsername` at the top of the per-user loop (skip+warn on
+  failure) AND add `--` before the operand in every exec (`id -- <name>`,
+  `useradd ... -- <name>`, `chown -R -- <owner> <dir>`). Made `runCommandTimeout`
+  a stubbable package var so the option-injection test can capture argv.
+  **File(s)**: pkg/daemon/daemon_system.go, pkg/daemon/exec_timeout.go,
+  pkg/daemon/daemon_login_optinjection_5005_test.go
+
 ## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
 
 - **Timestamp**: 2026-07-09
