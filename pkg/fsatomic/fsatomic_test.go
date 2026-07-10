@@ -23,6 +23,7 @@ func resetSeams(t *testing.T) {
 		chownTemp = func(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
 		syncFile = func(f *os.File) error { return f.Sync() }
 		closeTemp = func(f *os.File) error { return f.Close() }
+		afterRenameSyncDir = SyncDir
 	})
 }
 
@@ -479,6 +480,99 @@ func TestConcurrentWritersLastOneWins(t *testing.T) {
 	got := mustRead(t, path)
 	if !strings.HasPrefix(got, "writer-") {
 		t.Fatalf("content = %q, want a complete writer-N payload (no tearing)", got)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestWriteFileDurable_PostRenameSyncErrorClassified pins the #5185
+// pre/post-rename distinction. A directory-fsync failure that happens
+// AFTER a successful rename must be returned as *PostRenameSyncError, and
+// the NEW content must be visible on disk — a restart would load it. The
+// test fails RED if the wrapping is dropped (a caller could then report a
+// clean rejection while the new content is durable, the reported-rejected-
+// but-durable divergence).
+func TestWriteFileDurable_PostRenameSyncErrorClassified(t *testing.T) {
+	resetSeams(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.conf")
+	if err := os.WriteFile(path, []byte("OLD"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected dir fsync failure")
+	afterRenameSyncDir = func(string) error { return injected }
+
+	err := WriteFileDurable(path, []byte("NEW"), 0600)
+	if err == nil {
+		t.Fatal("expected an error from the post-rename dir fsync")
+	}
+	var pre *PostRenameSyncError
+	if !errors.As(err, &pre) {
+		t.Fatalf("post-rename failure must be *PostRenameSyncError, got %T: %v", err, err)
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("PostRenameSyncError must wrap the underlying fsync error: %v", err)
+	}
+	if pre.Path != path {
+		t.Errorf("PostRenameSyncError.Path = %q, want %q", pre.Path, path)
+	}
+	// The rename already happened: the new content is visible on disk.
+	if got := mustRead(t, path); got != "NEW" {
+		t.Errorf("post-rename content = %q, want NEW (rename succeeded before the fsync)", got)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestWriteFileDurable_PreRenameNotClassifiedPostRename proves the
+// converse: any PRE-rename failure (here the rename syscall itself) must
+// NOT be classified as *PostRenameSyncError, and the OLD content must
+// remain intact — a clean rejection is correct there.
+func TestWriteFileDurable_PreRenameNotClassifiedPostRename(t *testing.T) {
+	resetSeams(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.conf")
+	if err := os.WriteFile(path, []byte("OLD"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected rename failure")
+	renameFile = func(o, n string) error { return injected }
+
+	err := WriteFileDurable(path, []byte("NEW"), 0600)
+	if err == nil {
+		t.Fatal("expected an error from the rename")
+	}
+	var pre *PostRenameSyncError
+	if errors.As(err, &pre) {
+		t.Fatalf("a pre-rename (rename) failure must NOT be *PostRenameSyncError: %v", err)
+	}
+	if got := mustRead(t, path); got != "OLD" {
+		t.Errorf("pre-rename failure content = %q, want OLD intact", got)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestWriteFileDurable_TempFsyncIsPreRename guards the seam split: the
+// pre-rename temp-file fsync (syncFile) failing must stay a pre-rename
+// error, NOT a post-rename one, even though both stages fsync.
+func TestWriteFileDurable_TempFsyncIsPreRename(t *testing.T) {
+	resetSeams(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.conf")
+	if err := os.WriteFile(path, []byte("OLD"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected temp fsync failure")
+	syncFile = func(*os.File) error { return injected }
+
+	err := WriteFileDurable(path, []byte("NEW"), 0600)
+	var pre *PostRenameSyncError
+	if errors.As(err, &pre) {
+		t.Fatalf("a temp-file fsync failure is pre-rename, must NOT be *PostRenameSyncError: %v", err)
+	}
+	if got := mustRead(t, path); got != "OLD" {
+		t.Errorf("temp-fsync failure content = %q, want OLD intact", got)
 	}
 	assertNoTemps(t, dir)
 }
