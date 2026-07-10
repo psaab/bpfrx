@@ -70,11 +70,21 @@ func (s Secret) String() string {
 // Two credential-carrying components are redacted while the scheme/host/path
 // prefix is preserved so the log line stays diagnostically useful:
 //
-//   - userinfo: a "user:pass@" (or "user@") segment between "scheme://" and the
-//     first '/', '?' or '#' becomes "<redacted>@" — operators embed creds there
-//     (e.g. https://user:token@api.example/update).
+//   - userinfo: a "user:pass@" (or "user@") segment inside the authority
+//     becomes "<redacted>@" — operators embed creds there (e.g.
+//     https://user:token@api.example/update). The authority is the network
+//     location up to the first '/', '?' or '#'; for a scheme'd URL it begins
+//     after "://", and for a SCHEMELESS URL (e.g. a generic DDNS provider
+//     template like "user:pass@host/upd?token=SECRET", which has NO commit-time
+//     scheme validator) it begins at index 0. Userinfo is redacted in BOTH
+//     cases (#5458) — before that fix a schemeless credentialed URL leaked its
+//     "user:pass@" into journald/exported logs.
 //   - query string: everything after the first '?' becomes "<redacted>" — the
 //     #2781 case is a token in the query (e.g. ...?token=SECRET&host=%h).
+//
+// The redaction is bounded to the authority: an '@' in the PATH ("host/p@th")
+// or QUERY ("host?x=a@b") is past the authority boundary and does NOT trigger
+// userinfo redaction (the query is dropped wholesale regardless).
 //
 // An empty input returns "" so absence stays distinguishable. A value with no
 // credential-bearing component is returned with the query (if any) still
@@ -86,23 +96,26 @@ func RedactURL(s string) string {
 	}
 	const redacted = "<redacted>"
 
-	// Redact userinfo: locate the authority (between "://" and the next
-	// delimiter) and replace any "...@" prefix within it.
+	// Redact userinfo: locate the authority and replace any "...@" prefix
+	// within it. The authority starts after "://" for a scheme'd URL, or at
+	// index 0 for a schemeless URL (#5458), and ends at the first '/', '?' or
+	// '#'. Bounding to the authority keeps an '@' in the path or query
+	// untouched.
+	authStart := 0
 	if i := strings.Index(s, "://"); i >= 0 {
-		authStart := i + len("://")
-		// The authority ends at the first '/', '?' or '#'.
-		authEnd := len(s)
-		for j := authStart; j < len(s); j++ {
-			if c := s[j]; c == '/' || c == '?' || c == '#' {
-				authEnd = j
-				break
-			}
+		authStart = i + len("://")
+	}
+	authEnd := len(s)
+	for j := authStart; j < len(s); j++ {
+		if c := s[j]; c == '/' || c == '?' || c == '#' {
+			authEnd = j
+			break
 		}
-		authority := s[authStart:authEnd]
-		if at := strings.LastIndex(authority, "@"); at >= 0 {
-			// Replace the whole userinfo (everything up to and including '@').
-			s = s[:authStart] + redacted + "@" + authority[at+1:] + s[authEnd:]
-		}
+	}
+	authority := s[authStart:authEnd]
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		// Replace the whole userinfo (everything up to and including '@').
+		s = s[:authStart] + redacted + "@" + authority[at+1:] + s[authEnd:]
 	}
 
 	// Redact the query string: everything after the first '?' (preserve any
