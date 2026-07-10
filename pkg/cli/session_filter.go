@@ -67,7 +67,31 @@ type sessionFilter struct {
 	egressIfacesMap map[sessionIfaceKey]string // {ifindex,vlanID} → interface name
 }
 
+// parseSessionFilter parses session-selector and presentation tokens for
+// the SHOW path, where display modifiers (summary/brief/sort-by) are
+// legal.
 func (c *CLI) parseSessionFilter(args []string) sessionFilter {
+	return c.parseSessionFilterMode(args, false)
+}
+
+// parseClearSessionFilter parses session-selector tokens for the CLEAR
+// path. Presentation-only modifiers (summary/brief/sort-by) are NOT clear
+// predicates and MUST be rejected: the shared show/clear parser accepted
+// them but hasFilter() excluded all three, so a pasted show-syntax token
+// like `clear security flow session summary` fell through to
+// ClearAllSessions plus an unfiltered peer clear — the most destructive
+// path on both HA nodes (#5066). Rejecting them makes an EXACTLY-empty
+// token list the only selector that means clear-all. (The remote CLI's
+// clear parser in cmd/cli already rejects these; this brings the local
+// interactive CLI to the same fail-closed posture.)
+func (c *CLI) parseClearSessionFilter(args []string) sessionFilter {
+	return c.parseSessionFilterMode(args, true)
+}
+
+// parseSessionFilterMode is the shared implementation. clearMode rejects
+// presentation-only tokens (see parseClearSessionFilter); the show path
+// passes clearMode=false and additionally validates the sort-by value.
+func (c *CLI) parseSessionFilterMode(args []string, clearMode bool) sessionFilter {
 	var f sessionFilter
 	f.cfg = c.store.ActiveConfig()
 	cr := c.applyResult()
@@ -183,18 +207,45 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 				f.appName = v
 			}
 		case "summary":
-			f.summary = true
+			if clearMode {
+				f.setParseErr(errDisplayModifierOnClear("summary"))
+			} else {
+				f.summary = true
+			}
 		case "brief":
-			f.brief = true
+			if clearMode {
+				f.setParseErr(errDisplayModifierOnClear("brief"))
+			} else {
+				f.brief = true
+			}
 		case "sort-by":
 			if v, ok := takeValue(&i, "sort-by"); ok {
-				f.sortBy = v // "bytes" or "packets"
+				switch {
+				case clearMode:
+					f.setParseErr(errDisplayModifierOnClear("sort-by"))
+				case v != "bytes" && v != "packets":
+					// Validate the sort key on the show path: an unknown
+					// value silently degraded to a plain session list
+					// instead of the requested top-talkers view.
+					f.setParseErr(fmt.Errorf("invalid sort-by %q (expected \"bytes\" or \"packets\")", v))
+				default:
+					f.sortBy = v
+				}
 			}
 		default:
 			f.setParseErr(fmt.Errorf("unknown session filter %q", args[i]))
 		}
 	}
 	return f
+}
+
+// errDisplayModifierOnClear builds the parse error for a presentation-only
+// token supplied on the clear path. These tokens are display modifiers
+// (they change how sessions are rendered, not which sessions are
+// selected), so accepting one on `clear security flow session` would
+// leave the selector empty and clear the entire table (#5066).
+func errDisplayModifierOnClear(tok string) error {
+	return fmt.Errorf("%q is a display modifier, not valid for clear", tok)
 }
 
 // setParseErr records the first parse error (the first is the most

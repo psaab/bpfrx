@@ -87,7 +87,10 @@ func (c *CLI) showRoutes() error {
 
 	allTables, err := c.routing.GetAllTableRoutes(instances)
 	if err != nil {
-		return fmt.Errorf("get routes: %w", err)
+		// A per-family/per-table dump failure is non-fatal: render whatever
+		// was read and surface the failure so the operator can tell a partial
+		// from a genuinely empty table (#5125).
+		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
 
 	fmt.Print(routing.FormatAllRoutes(allTables))
@@ -101,7 +104,7 @@ func (c *CLI) showRouteTerse() error {
 	}
 	entries, err := c.routing.GetRoutes()
 	if err != nil {
-		return fmt.Errorf("get routes: %w", err)
+		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
 	fmt.Print(routing.FormatRouteTerse(entries))
 	return nil
@@ -134,7 +137,7 @@ func (c *CLI) showRoutesForInstance(instanceName string) error {
 
 	entries, err := c.routing.GetRoutesForTable(tableID)
 	if err != nil {
-		return fmt.Errorf("get routes for instance %s: %w", instanceName, err)
+		fmt.Printf("warning: partial route display for instance %s (some address families unavailable): %v\n", instanceName, err)
 	}
 
 	fmt.Printf("Routing table for instance %s (table %d):\n", instanceName, tableID)
@@ -175,7 +178,7 @@ func (c *CLI) showRoutesForProtocol(proto string) error {
 
 	entries, err := c.routing.GetRoutes()
 	if err != nil {
-		return fmt.Errorf("get routes: %w", err)
+		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
 
 	proto = strings.ToLower(proto)
@@ -210,7 +213,7 @@ func (c *CLI) showRoutesForPrefix(prefix, modifier string) error {
 
 	allTables, err := c.routing.GetAllTableRoutes(instances)
 	if err != nil {
-		return fmt.Errorf("get routes: %w", err)
+		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
 
 	fmt.Print(routing.FormatRouteDestination(allTables, prefix, modifier))
@@ -230,7 +233,7 @@ func (c *CLI) showRouteSummary() error {
 	}
 	allTables, err := c.routing.GetAllTableRoutes(instances)
 	if err != nil {
-		return fmt.Errorf("get routes: %w", err)
+		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
 
 	routerID := ""
@@ -254,7 +257,7 @@ func (c *CLI) showRouteDetail() error {
 
 	routes, err := c.frr.GetRouteDetailJSON()
 	if err != nil {
-		return fmt.Errorf("get route detail: %w", err)
+		fmt.Printf("warning: partial route display (some address families unavailable): %v\n", err)
 	}
 
 	if len(routes) == 0 {
@@ -1006,8 +1009,10 @@ func (c *CLI) showRoutingInstances(detail bool) error {
 			fmt.Printf("  Interfaces: %s\n", strings.Join(ri.Interfaces, ", "))
 		}
 		if ri.TableID > 0 && c.routing != nil {
-			if routes, err := c.routing.GetRoutesForTable(ri.TableID); err == nil {
-				fmt.Printf("  Route count: %d\n", len(routes))
+			routes, err := c.routing.GetRoutesForTable(ri.TableID)
+			fmt.Printf("  Route count: %d\n", len(routes))
+			if err != nil {
+				fmt.Printf("  warning: partial route count (some address families unavailable): %v\n", err)
 			}
 		}
 		var protos []string

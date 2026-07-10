@@ -127,7 +127,11 @@ func (c *CLI) handleClearSecurity(args []string) error {
 			fmt.Println("dataplane not loaded")
 			return nil
 		}
-		f := c.parseSessionFilter(args[2:])
+		// Clear uses the selector-only parser: presentation-only tokens
+		// (summary/brief/sort-by) are rejected here, so a pasted
+		// show-syntax modifier errors instead of falling through to the
+		// destructive clear-all path (#5066).
+		f := c.parseClearSessionFilter(args[2:])
 		if f.hasFilter() {
 			return c.clearFilteredSessions(f)
 		}

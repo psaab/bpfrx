@@ -33,3 +33,23 @@ func NewManagerWithLinkOpsForTest(ops linkOps) *Manager {
 	m.monitor = &monitorManager{ops: ops, monitorStatus: make(map[int][]InterfaceMonitorStatus)}
 	return m
 }
+
+// NewManagerWithRouteListerForTest builds a *Manager whose route-read domain
+// (routeReader) is backed by the supplied routeLister instead of a live
+// *netlink.Handle. It exists so tests in dependent packages (e.g. pkg/grpcapi)
+// can drive the GetRoutes/GetRoutesForTable/GetAllTableRoutes read path — and
+// the callers that render it — against an in-memory fake that fails a single
+// address family, proving the partial-render-with-warning contract (#5125)
+// without root, a real netlink handle, or host side effects.
+//
+// Only the routes domain is wired; every other domain is left nil (these
+// tests exercise reads only). nlHandle stays nil (Close nil-guards it).
+//
+// Callers pass any value whose method set matches routeLister (the interface's
+// methods are all exported, so a fake defined in another package satisfies it
+// structurally).
+func NewManagerWithRouteListerForTest(ops routeLister) *Manager {
+	m := &Manager{}
+	m.routes = &routeReader{ops: ops}
+	return m
+}

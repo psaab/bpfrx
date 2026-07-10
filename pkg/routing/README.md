@@ -355,6 +355,44 @@ desired set. `clear()` walks `[AF_INET, AF_INET6]`, calling `RuleList`
   debug-logged only, keeping an idempotent re-clear from spuriously failing
   the apply.
 
+### Route-display read error contract (#5125)
+
+The read side (`routeReader` in `routes.go`) mirrors the write-side
+`errors.Join`-per-family discipline above. `GetRoutes`, `GetRoutesForTable`,
+and `GetAllTableRoutes` each dump `[FAMILY_V4, FAMILY_V6]` independently, and
+`frr.GetRouteDetailJSON` runs `show ip route json` / `show ipv6 route json`
+independently. Before #5125 a per-family netlink (or per-command vtysh/JSON)
+failure was swallowed with `continue` and the function returned `nil` error,
+so a failed inet6 dump alongside a successful inet4 dump rendered as an
+authoritative "no inet6 routes" — indistinguishable from a genuinely empty
+table during a transient backend hiccup.
+
+- **Backend (this package + `pkg/frr`): join, don't swallow.** A per-family
+  failure is `errors.Join`ed into the returned error, tagged with the family
+  (`inet`/`inet6`) plus the table id / routing-instance name / failing vtysh
+  command. The family that DID dump is still returned. So a **non-nil error
+  alongside a non-empty slice means "partial result"** — the caller must
+  render the partial and surface the error, not treat the error as fatal.
+  `GetAllTableRoutes` likewise joins the main-table error and each
+  per-instance error (previously it `continue`d and dropped the whole
+  instance table) while still appending every table it could read.
+- **Callers: render the partial, warn non-fatally — never bail.** Every
+  `show route` render caller (`pkg/cli/cli_show_routing.go`,
+  `pkg/grpcapi/server_show_routes_text.go`) now renders whatever entries were
+  returned and emits an in-band `warning: partial route display (some address
+  families unavailable): <err>` line instead of `return`ing the error and
+  dropping the entire display. This is the load-bearing half of the fix: with
+  the backend now returning a non-nil error on a partial, a caller that still
+  did `if err != nil { return err }` would break the ENTIRE `show route` on a
+  transient single-family hiccup — strictly worse than the old silent-swallow
+  (which at least showed the inet4 partial). The structured
+  `grpcapi.GetRoutes` RPC has no warning field, so it logs the error
+  (`slog.Warn`) and returns the partial; a **total** failure (no entries at
+  all) still returns a hard error. Fail-on-revert coverage:
+  `routes_perfamily_5125_test.go` (backend), `pkg/frr/route_detail_perfamily_5125_test.go`
+  (FRR backend), `pkg/grpcapi/server_show_routes_perfamily_5125_test.go`
+  (caller renders partial + warns, RPC returns partial).
+
 ## Tunnel reconcile-in-place (#1884)
 
 `tunnelManager.Apply` reconciles instead of clear-all +

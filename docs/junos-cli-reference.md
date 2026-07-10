@@ -96,6 +96,18 @@ dropping the predicate (which would widen the inspected set):
   narrowed view, or the interactive local CLI (which applies filters to
   its summary/top-talkers). `brief` is a display modifier, not a filter,
   so it may accompany `summary`.
+- **Clear takes selectors only, never display modifiers (#5066).** The
+  presentation tokens `summary`, `brief`, and `sort-by` are meaningful
+  only for `show security flow session` — they change how sessions are
+  rendered, not which sessions are selected. On `clear security flow
+  session` they are **rejected** with an error. This is a fail-closed
+  invariant: `clear` interprets an EXACTLY-empty selector as clear-all, so
+  a token that parses but selects nothing (as these did before #5066 — the
+  shared parser accepted them but `hasFilter()` excluded all three) must
+  never be silently swallowed, or a pasted show-syntax modifier would wipe
+  the entire session table on both HA nodes. The remote `cli` clear parser
+  (`cmd/cli/clear.go`) already rejected them; the local interactive CLI
+  now matches (`parseClearSessionFilter`, `pkg/cli/session_filter.go`).
 - Direct gRPC `GetSessions` (`pkg/grpcapi/server_sessions.go`) validates
   the `protocol` token and rejects a negative `offset` (centrally in
   `GetSessions`, covering both the cursor and legacy paths); both return
