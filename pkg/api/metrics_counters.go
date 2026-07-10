@@ -302,11 +302,16 @@ func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp api
 // alerting whether or not any read failed. #3462: this MUST run AFTER every
 // sub-collector that can bump counterReadErrors (collectHostInboundKernelDenies,
 // collectGlobalCounters, collectPolicyCounters,
-// collectFilterCounters; #3643 dropped the per-zone bumper) — Collect calls it
-// last — so a policy/filter read
-// that fails in THIS scrape is reflected in THIS scrape's value, not lagged by
-// one scrape (which it was when the sample was emitted from collectGlobalCounters
-// before those collectors ran).
+// collectFilterCounters; #3643 dropped the per-zone bumper) so a policy/filter
+// read that fails in THIS scrape is reflected in THIS scrape's value, not lagged
+// by one scrape (which it was when the sample was emitted from
+// collectGlobalCounters before those collectors ran). #5045: Collect establishes
+// this as a `defer` at the TOP of the method, so it runs at function exit — on
+// EVERY return path (including the unloaded-dataplane early return, where the
+// pre-gate host-inbound/lo0 collectors can have bumped counterReadErrors) —
+// keeping the omit-plus-error contract intact even in a config-only / degraded
+// boot. It reads only the atomic counter, so it is safe to call exactly once at
+// the end regardless of dataplane-loaded state.
 func (c *xpfCollector) emitCounterReadErrors(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.counterReadErrorsTotal, prometheus.CounterValue,
 		float64(c.counterReadErrors.Load()))
