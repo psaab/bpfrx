@@ -339,6 +339,71 @@ func TestRESTSessionListPeerOnlyOnFirstPage(t *testing.T) {
 	}
 }
 
+// TestRESTSessionListPeerHonorsPageSize asserts the #4920 contract: a
+// cursor-mode session list (page_size set, no limit) with include_peer=true
+// forwards page_size to the peer fetch as PageSize, so the peer fan-out honors
+// the SAME page bound the local list did. Before the fix peerSessionsRequest
+// forwarded only offset-mode limit, so the peer gRPC request carried
+// Limit==0 AND PageSize==0; getSessionsLegacy then defaulted the peer list to
+// 100 sessions and the first REST page silently undercounted a peer holding
+// >100 sessions.
+//
+// The dp is the cursor-capable multiSessionDP so the LOCAL request genuinely
+// takes the page_size>0 cursor path (matching the real trigger). The peer fetch
+// is exercised through the fakeClusterSessionService seam, which records the
+// forwarded request — no real peer required.
+//
+// FAIL-ON-REVERT: dropping the page_size→PageSize forward in
+// peerSessionsRequest makes the recorded peer request carry PageSize==0,
+// flipping the want-1000 assertion red.
+func TestRESTSessionListPeerHonorsPageSize(t *testing.T) {
+	fake := &fakeClusterSessionService{
+		getResp: &pb.GetSessionsResponse{
+			NodeId: 5,
+			Peer: &pb.GetSessionsResponse{
+				NodeId: 6,
+				Total:  1,
+				Sessions: []*pb.SessionEntry{{
+					SrcAddr: "10.0.9.9", Protocol: "TCP",
+				}},
+			},
+		},
+	}
+	s := &Server{
+		dp:               newMultiSessionDP(),
+		eventBuf:         logging.NewEventBuffer(8),
+		nodeIDFn:         func() int { return 5 },
+		clusterSessionFn: func() ClusterSessionService { return fake },
+	}
+
+	// Cursor mode: page_size set, NO limit. This is the real #4920 trigger.
+	rr := httptest.NewRecorder()
+	s.sessionsHandler(rr, httptest.NewRequest("GET",
+		"/api/v1/security/sessions?page_size=1000&include_peer=true", nil))
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if !fake.getCalled || fake.getReq == nil {
+		t.Fatal("include_peer=true did not fetch peer sessions via the HA-aware service")
+	}
+	if got := fake.getReq.GetPageSize(); got != 1000 {
+		t.Fatalf("peer request PageSize = %d, want 1000 (cursor-mode page_size not forwarded — peer undercounts to the 100 default)", got)
+	}
+	// The peer request must carry include_peer (fetches the peer's Peer leg)
+	// and must NOT drop page_size to the offset-mode limit default.
+	if !fake.getReq.GetIncludePeer() {
+		t.Fatal("peer request lost IncludePeer")
+	}
+	if fake.getReq.GetLimit() != 0 {
+		t.Fatalf("peer request Limit = %d, want 0 (cursor mode sends page_size, not limit)", fake.getReq.GetLimit())
+	}
+	// And the peer leg must still attach to the REST response.
+	resp := decodeSessions(t, rr.Body.Bytes())
+	if resp.Peer == nil || resp.Peer.NodeID != 6 {
+		t.Fatalf("peer leg not attached: %+v", resp.Peer)
+	}
+}
+
 // TestRESTZonePairsNodeID asserts the zone-pair summary stamps node_id so it is
 // consistent with its /sessions/summary sibling (#3423 M5). Before the fix it
 // returned a bare array with no node identity.

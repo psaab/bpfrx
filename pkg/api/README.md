@@ -609,14 +609,21 @@ under the daemon's errgroup. Nothing else imports this package.
   the handler delegates the PEER fetch to the live gRPC server through the
   `ClusterSessionFn`/`ClusterSessionService` seam and attaches the peer node's
   list/summary under a nested `peer` field (mirroring gRPC `GetSessions`/
-  `GetSessionSummary` `include_peer`). The peer's FULL table is attached only on
+  `GetSessionSummary` `include_peer`). The peer's table is attached only on
   the FIRST page — in BOTH pagination modes (cursor mode's first page has no
   `page_token`; offset mode's first window has `offset==0`). A non-first page
-  must not re-attach the whole peer table or a client summing `peer.sessions`
+  must not re-attach the peer table or a client summing `peer.sessions`
   across pages would OVER-COUNT the peer; the offset path never sets a
-  `page_token`, so the `sessionFirstPage` guard checks `offset==0` too. A
-  standalone node or unreachable peer leaves `peer` absent. Pinned by
-  `sessions_ha_scope_3423_test.go`.
+  `page_token`, so the `sessionFirstPage` guard checks `offset==0` too. The peer
+  fetch honors the SAME page bound the local list did: `peerSessionsRequest`
+  forwards offset-mode `limit` AND cursor-mode `page_size` to the peer gRPC
+  request (#4920). Before that fix a cursor-mode caller (`page_size` without
+  `limit`) sent the peer `Limit==0` AND `PageSize==0`, so `getSessionsLegacy`
+  defaulted the peer list to 100 sessions and the first REST page silently
+  undercounted a peer holding >100 sessions. `page_token` is intentionally NOT
+  forwarded — tokens encode node-local map keys and the peer fetch only runs on
+  the first page. A standalone node or unreachable peer leaves `peer` absent.
+  Pinned by `sessions_ha_scope_3423_test.go`.
 - The zone-pair summary (`GET /api/v1/security/sessions/summary/zone-pairs`,
   `sessionZonePairHandler`) is the same SUMMARY class and carries `node_id` —
   the response shape changed from a bare array to

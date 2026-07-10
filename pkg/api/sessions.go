@@ -417,6 +417,19 @@ func peerSessionsRequest(r *http.Request) *pb.GetSessionsRequest {
 	if l, err := strconv.Atoi(q.Get("limit")); err == nil && l > 0 {
 		req.Limit = int32(l)
 	}
+	// Forward cursor-mode page_size so the peer fan-out honors the SAME page
+	// bound the local list did (#4920). A cursor-mode REST caller sends
+	// page_size WITHOUT limit; without this the peer gRPC request carried
+	// Limit==0 AND PageSize==0, so getSessionsLegacy defaulted the peer list to
+	// 100 sessions and the first REST page attached at most 100 peer sessions —
+	// silently undercounting the peer whenever it held >100 sessions. The value
+	// is read leniently (the caller validated page_size via queryIntStrict
+	// before a peer fetch is attempted); the peer's gRPC surface re-clamps it to
+	// the 10000 ceiling. page_token is intentionally NOT forwarded — tokens
+	// encode node-local map keys and the peer fetch only runs on the first page.
+	if p, err := strconv.Atoi(q.Get("page_size")); err == nil && p > 0 {
+		req.PageSize = int32(p)
+	}
 	return req
 }
 
