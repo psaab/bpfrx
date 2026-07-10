@@ -16,6 +16,23 @@ type vrfOverlapPrefix struct {
 	origin string       // e.g. `interface "ge-0/0/1.0"` or `filter "fbf" term "t1"`
 }
 
+const (
+	// vrfOverlapMaxWarnings caps how many cross-routing-instance overlap
+	// advisories one compile emits (#5194 A3-b3-F5). A config with a large
+	// number of overlapping prefixes must not flood commit output; the (N+1)th
+	// overlap collapses into a single truncation notice.
+	vrfOverlapMaxWarnings = 64
+	// vrfOverlapMaxComparisons bounds the total prefix-pair comparisons this
+	// advisory-only scan performs (#5194 A3-b3-F5). The pairwise scan is O(P^2)
+	// across every routing-instance prefix; on a pathological config (thousands
+	// of prefixes per RI across many RIs) that is millions of Overlaps() calls
+	// on EVERY strict AND tolerant compile, including HA peer-sync. This is a
+	// cold advisory path (a warning, never a reject), so once the budget is
+	// spent the scan stops and emits a truncation notice rather than letting the
+	// cross-VRF advisory dominate commit latency.
+	vrfOverlapMaxComparisons = 1 << 20 // ~1M
+)
+
 // validateVRFOverlap emits a commit WARNING (never a hard reject) when two
 // DISTINCT routing-instances carry overlapping L3 address space. This is the
 // #2387 interim mitigation (Track A.1): the userspace-dp session/flow identity
@@ -161,13 +178,34 @@ func validateVRFOverlap(cfg *Config) []string {
 	}
 
 	var warnings []string
+	// #5194 A3-b3-F5: bound this O(P^2) advisory scan. `comparisons` spends the
+	// operation budget; the warning cap stops once enough advisories are
+	// collected. Either limit trips `truncated`, which appends one notice so the
+	// operator knows the scan was incomplete rather than silently under-reporting.
+	comparisons := 0
+	truncated := false
+Scan:
 	for i := 0; i < len(riNames); i++ {
 		for j := i + 1; j < len(riNames); j++ {
 			riA, riB := riNames[i], riNames[j]
 			for _, a := range riPrefixes[riA] {
 				for _, b := range riPrefixes[riB] {
+					if comparisons >= vrfOverlapMaxComparisons {
+						truncated = true
+						break Scan
+					}
+					comparisons++
+					// Family-separated: an IPv4 and an IPv6 prefix never overlap,
+					// so skip the pair cheaply before the Overlaps() call.
+					if a.prefix.Addr().Is4() != b.prefix.Addr().Is4() {
+						continue
+					}
 					if !a.prefix.Overlaps(b.prefix) {
 						continue
+					}
+					if len(warnings) >= vrfOverlapMaxWarnings {
+						truncated = true
+						break Scan
 					}
 					if a.prefix == b.prefix {
 						warnings = append(warnings, fmt.Sprintf(
@@ -189,6 +227,13 @@ func validateVRFOverlap(cfg *Config) []string {
 				}
 			}
 		}
+	}
+	if truncated {
+		warnings = append(warnings, fmt.Sprintf(
+			"cross-routing-instance overlap validation was truncated after %d prefix "+
+				"comparisons / %d advisories (config exceeds the advisory scan budget); "+
+				"some overlaps may be unreported",
+			comparisons, len(warnings)))
 	}
 	return warnings
 }
