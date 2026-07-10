@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // #4712: the /show-text handlers render config maps (schedulers, snmp,
@@ -149,8 +151,20 @@ func TestShowTextDeterministicSortedOrder(t *testing.T) {
 	})
 
 	t.Run("snmp", func(t *testing.T) {
+		// #5315: the community string is the shared secret AND the map key, so
+		// it is now masked with config.SecretDataPlaceholder in the render — the
+		// cleartext comm_* names no longer appear. Determinism (the #4712
+		// contract) is still exercised: iteration runs over the real sorted keys
+		// before masking, so the byte-identical-across-renders assertion below
+		// still fails RED if the sorted-iteration is reverted to a raw map range.
 		out := assertDeterministic(t, s, "snmp", renders)
-		comms := []string{"comm_alpha", "comm_bravo", "comm_charlie", "comm_delta"}
-		assertSortedEntries(t, "snmp", "Communities", out, comms)
+		for _, name := range []string{"comm_alpha", "comm_bravo", "comm_charlie", "comm_delta"} {
+			if strings.Contains(out, name) {
+				t.Errorf("snmp: community secret %q leaked in cleartext:\n%s", name, out)
+			}
+		}
+		if !strings.Contains(out, config.SecretDataPlaceholder) {
+			t.Errorf("snmp: expected redaction placeholder %q in output:\n%s", config.SecretDataPlaceholder, out)
+		}
 	})
 }

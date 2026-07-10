@@ -75,9 +75,20 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(snmpCfg.Communities) > 0 {
 				buf.WriteString("Communities:\n")
+				// #5315: the SNMPv1/v2c community string IS the shared secret
+				// (it authorizes the request on the wire) and it is also the
+				// Communities map key. Emitting the raw key here leaked the
+				// cleartext credential over the REST show-text surface, which
+				// has no login-class authz and is loopback-open by default.
+				// Mask it with the shared raw-AST placeholder — the same token
+				// pkg/cli `show snmp` uses for a redacted community (#4111) — so
+				// this manual renderer matches the established redaction
+				// boundary. The authorization mode stays visible; only the
+				// secret is masked. Iteration still runs over the real (sorted)
+				// keys so ordering stays deterministic (#4712).
 				for _, name := range sortedKeys(snmpCfg.Communities) {
 					comm := snmpCfg.Communities[name]
-					fmt.Fprintf(&buf, "  %s: %s\n", name, comm.Authorization)
+					fmt.Fprintf(&buf, "  %s: %s\n", config.SecretDataPlaceholder, comm.Authorization)
 				}
 			}
 			if len(snmpCfg.TrapGroups) > 0 {
