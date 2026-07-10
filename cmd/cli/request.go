@@ -210,7 +210,16 @@ func (c *ctl) handleRequestChassisClusterFailover(args []string) error {
 
 	if len(args) >= 2 && args[0] == "redundancy-group" {
 		actionSuffix := args[1]
-		if len(args) >= 4 && args[2] == "node" {
+		if len(args) >= 3 && args[2] == "node" {
+			// `node` was typed but its value is missing. The old
+			// `len(args) >= 4` gate silently dropped the bare `node` and
+			// sent an untargeted `cluster-failover:<rg>`, which the server
+			// treats as ManualFailover(<rg>) — a truncated automation token
+			// or an interactive omission triggers a REAL RG failover
+			// instead of a usage error (#4883-C). Require the node value.
+			if len(args) < 4 {
+				return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> node <node-id>")
+			}
 			actionSuffix += ":node" + args[3]
 		}
 		action := "cluster-failover:" + actionSuffix
