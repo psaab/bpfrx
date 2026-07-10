@@ -245,6 +245,34 @@ or strand access:
   UID) is left alone — the current owner is someone else, exactly the #1944
   leave-then-rejoin-vs-recreate distinction.
 
+**Local config-archive erasure (#5186).** The three erasures above cover the
+config SSOT/rollback/journal state, the rendered service configs, and the login
+accounts — but they missed the last on-box generation of config secrets: the
+**local configuration archive** at **`/var/lib/xpf/archive`**. `writeArchive`
+drops timestamped `config-<ts>.<seq>.conf` snapshots there (Junos `system
+archival`), each a **0600 copy of the full committed config TEXT** with the same
+cleartext secret leaves as a rollback slot (IKE PSK, WireGuard private keys, SNMP
+communities, BGP-MD5). A pre-#5186 `zeroize` left the archive untouched, so a
+re-tenanted / RMA'd / resold device still handed the next owner the prior
+tenant's archived secrets — a false factory reset. `zeroize` now erases it at
+wipe time too (`configstore.FactoryResetArchiveDir`, same error-surfacing +
+final-fsync durability discipline as the config-state wipe), and **both** the
+gRPC `performZeroizeWipe` and the on-box CLI `request system zeroize` route
+through that single shared primitive so they wipe the same archive.
+
+- **Ownership guard.** Only the **xpf-owned default** path
+  (`configstore.DefaultArchiveDir` = `/var/lib/xpf/archive`) is erased. An
+  operator-configured **custom** archive directory — a remote mount, an NFS
+  export, or a compliance/audit retention store — is **NOT** xpf's to destroy;
+  blindly deleting it could wipe records the operator is required to keep. Such a
+  path cannot be proven xpf-owned, so it is **skipped with a warning** rather
+  than deleted (never a fail-closed delete). This mirrors how the config-state
+  wipe proves ownership by its fixed default appliance path and how the
+  login-account teardown refuses to touch a non-xpf-owned account.
+- **Error surfacing.** A deletion or final directory-fsync failure is surfaced
+  (folded into the wipe result / returned by the CLI), so a `zeroize` that could
+  not fully erase the archive is never reported as a clean factory reset.
+
 **Privileged-subcommand exception — `monitor traffic` (#4067).** Almost
 every command is gated on the top-level word alone, but `monitor traffic`
 spawns a **root `tcpdump` live packet capture** on a data interface, so it

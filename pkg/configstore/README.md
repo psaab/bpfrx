@@ -350,6 +350,20 @@ per-path:
   `rbRemove`/`rbSyncDir` seams so a dropped sync fails a test RED. The
   gRPC `zeroizeConfigDir` mirror in `pkg/grpcapi` carries the same
   barriers (its own `zeroizeSyncDir` seam).
+- **`FactoryResetArchiveDir` — local config-archive erasure (#5186).**
+  `zeroize` must remove EVERY on-box generation of config secrets. The
+  config archive (`<archive-dir>/config-*.conf`, 0600 full-config-text
+  with cleartext secret leaves — see the persistence-layout table above)
+  was the omitted generation: a pre-#5186 wipe left `/var/lib/xpf/archive`
+  behind, so a re-tenanted device kept the prior tenant's archived
+  secrets. `FactoryResetArchiveDir` `RemoveAll`s the archive tree and
+  fsyncs the parent (same error-surfacing + durability discipline), and
+  BOTH the on-box CLI `request system zeroize` and the gRPC
+  `performZeroizeWipe` route archive erasure through this one shared
+  primitive. **Ownership guard:** it erases ONLY the xpf-owned default
+  (`DefaultArchiveDir` = `/var/lib/xpf/archive`); a custom / remote /
+  compliance archive destination is not provably xpf-owned, so it is
+  SKIPPED with a warning rather than blindly deleted.
 - **`CommitConfirmed` ordering.** Confirm state is only touched after
   the persist succeeds: on failure the rollback timer is NOT armed and
   an existing pending confirm (timer + rollback target) is left fully
