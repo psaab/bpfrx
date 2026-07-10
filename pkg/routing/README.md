@@ -355,6 +355,35 @@ desired set. `clear()` walks `[AF_INET, AF_INET6]`, calling `RuleList`
   debug-logged only, keeping an idempotent re-clear from spuriously failing
   the apply.
 
+### Route-display read error contract (#5125)
+
+The `show route` read backends dump each address family independently
+and must keep a partial dump distinguishable from a genuinely empty
+table — the read-side mirror of the clear/Apply contract above.
+
+- **`routeReader.GetRoutes` / `GetRoutesForTable`** (`routes.go`) walk
+  `[FAMILY_V4, FAMILY_V6]`, calling `RouteList` / `RouteListFiltered` per
+  family. A per-family netlink failure is **joined into the returned
+  error** (`errors.Join`, wrapped with the `inet`/`inet6` family via
+  `familyName`, and the table id for the per-table read) rather than
+  swallowed; the successfully-dumped family's entries are still returned
+  so the caller can render what is available. `GetAllTableRoutes`
+  likewise joins the main-table error and each per-instance error (tagged
+  with the instance name) and no longer drops a VRF table on a transient
+  failure. Before #5125 both readers `continue`d on the per-family error
+  and returned `entries, nil`, so a failed IPv6 dump alongside a
+  successful IPv4 dump rendered as an authoritative partial/"no routes",
+  masking real state during a transient netlink failure.
+- **`frr.GetRouteDetailJSON`** (`pkg/frr/status_parse.go`) is the FRR
+  analogue: the `show ip route json` / `show ipv6 route json` vtysh calls
+  and their JSON parse are per-family, and a failure of either is now
+  joined into the returned error (tagged with the failing command)
+  instead of being swallowed into an IPv4-only success.
+
+All existing `show route` CLI/gRPC callers already surface a non-nil
+error (`if err != nil { return … }`), so a partial-dump failure now
+reaches the operator as a clear diagnostic instead of empty output.
+
 ## Tunnel reconcile-in-place (#1884)
 
 `tunnelManager.Apply` reconciles instead of clear-all +

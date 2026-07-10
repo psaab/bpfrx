@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -57,14 +58,32 @@ type routeReader struct {
 	ops routeLister
 }
 
+// familyName renders a netlink address family as its Junos-style inet/
+// inet6 tag so a per-family fetch failure names the family that failed.
+func familyName(family int) string {
+	if family == netlink.FAMILY_V6 {
+		return "inet6"
+	}
+	return "inet"
+}
+
 // GetRoutesForTable reads routes from a specific kernel routing table.
+//
+// Each address family is dumped independently. A per-family netlink
+// failure is joined into the returned error (with family/table context)
+// rather than silently swallowed, so a partial dump — e.g. IPv6 fails
+// while IPv4 succeeds — is distinguishable from a genuinely empty table.
+// The successfully-dumped family's entries are still returned so callers
+// can render what is available alongside surfacing the failure.
 func (rr *routeReader) GetRoutesForTable(tableID int) ([]RouteEntry, error) {
 	var entries []RouteEntry
+	var errs error
 
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		filter := &netlink.Route{Table: tableID}
 		routes, err := rr.ops.RouteListFiltered(family, filter, netlink.RT_FILTER_TABLE)
 		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("list %s routes for table %d: %w", familyName(family), tableID, err))
 			continue
 		}
 		for _, r := range routes {
@@ -72,16 +91,22 @@ func (rr *routeReader) GetRoutesForTable(tableID int) ([]RouteEntry, error) {
 		}
 	}
 
-	return entries, nil
+	return entries, errs
 }
 
 // GetRoutes reads the main kernel routing table.
+//
+// Like GetRoutesForTable, a per-family netlink failure is joined into
+// the returned error with family context instead of being swallowed, so
+// partial output is never mistaken for an authoritative empty table.
 func (rr *routeReader) GetRoutes() ([]RouteEntry, error) {
 	var entries []RouteEntry
+	var errs error
 
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		routes, err := rr.ops.RouteList(nil, family)
 		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("list %s routes: %w", familyName(family), err))
 			continue
 		}
 		for _, r := range routes {
@@ -89,7 +114,7 @@ func (rr *routeReader) GetRoutes() ([]RouteEntry, error) {
 		}
 	}
 
-	return entries, nil
+	return entries, errs
 }
 
 // GetVRFRoutes reads routes from a VRF's routing table by VRF device name.
@@ -158,26 +183,31 @@ func (rr *routeReader) GetTableRoutes(tableName string) ([]RouteEntry, error) {
 // IPv4 and IPv6 routes are split into separate inet.0/inet6.0 tables.
 func (rr *routeReader) GetAllTableRoutes(instances []*config.RoutingInstanceConfig) ([]TableRoutes, error) {
 	var tables []TableRoutes
+	var errs error
 
-	// Main table
+	// Main table. A partial per-family failure is joined into errs, but
+	// whatever entries were dumped are still surfaced.
 	mainEntries, err := rr.GetRoutes()
 	if err != nil {
-		return nil, err
+		errs = errors.Join(errs, err)
 	}
 	tables = appendSplitAF(tables, "", mainEntries)
 
-	// Per-VRF tables
+	// Per-VRF tables. A per-instance fetch failure is joined into errs
+	// (tagged with the instance name) instead of silently dropping the
+	// table, so the operator sees a diagnostic rather than a table that
+	// vanishes on a transient netlink error.
 	for _, ri := range instances {
 		if ri.TableID == 0 {
 			continue
 		}
 		entries, err := rr.GetRoutesForTable(ri.TableID)
 		if err != nil {
-			continue
+			errs = errors.Join(errs, fmt.Errorf("routing instance %q: %w", ri.Name, err))
 		}
 		tables = appendSplitAF(tables, ri.Name, entries)
 	}
-	return tables, nil
+	return tables, errs
 }
 
 // routeToEntry converts a netlink route to a RouteEntry.

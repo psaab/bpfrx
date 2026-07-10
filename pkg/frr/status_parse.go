@@ -17,6 +17,7 @@ package frr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -370,20 +371,31 @@ type frrNextHopJSON struct {
 }
 
 // GetRouteDetailJSON queries FRR for detailed IPv4 and IPv6 routes via vtysh JSON output.
+//
+// The IPv4 and IPv6 dumps are independent vtysh calls. A per-family vtysh
+// or JSON-parse failure is joined into the returned error (tagged with
+// the failing command) instead of being swallowed, so a partial result —
+// e.g. the IPv6 dump fails while the IPv4 dump succeeds — surfaces as an
+// error rather than rendering as an authoritative "No routes". The
+// successfully-parsed family's routes are still returned so the caller
+// can show what is available.
 func (m *Manager) GetRouteDetailJSON() ([]FRRRouteDetail, error) {
 	var all []FRRRouteDetail
+	var errs error
 	for _, cmd := range []string{"show ip route json", "show ipv6 route json"} {
 		output, err := m.executor().Vtysh(cmd)
 		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("vtysh %q: %w", cmd, err))
 			continue
 		}
 		routes, err := parseRouteJSON(output)
 		if err != nil {
+			errs = errors.Join(errs, fmt.Errorf("parse %q: %w", cmd, err))
 			continue
 		}
 		all = append(all, routes...)
 	}
-	return all, nil
+	return all, errs
 }
 
 // parseRouteJSON parses FRR's JSON route output into FRRRouteDetail entries.
