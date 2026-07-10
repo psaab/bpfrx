@@ -477,6 +477,25 @@ just the **`encrypted-password` directive** (user still present) locks
 the password but leaves `authorized_keys`; removing the **whole user**
 revokes both.
 
+### Emptying a retained user's SSH keys revokes the key file (#5106)
+
+`reconcileAbsentLoginUsers` only fires for a user that has been **removed**
+from config. A user that is **retained** but has had its **last**
+`authentication ssh-rsa`/key removed (key list now empty) was NOT covered:
+`applySystemLogin` wrote `authorized_keys` only inside `if len(user.SSHKeys)
+> 0`, so an emptied key list left the stale key file installed and the
+revoked key still permitted login. `applySystemLogin` now reconciles the
+empty-key-list case in the matching `else` branch: when a configured user
+has no keys, it removes the xpf-managed
+`/home/<user>/.ssh/authorized_keys` so key-based login is revoked. The
+removal is gated on the same UID-keyed provenance marker
+(`xpfProvisioned`) as the removal path above — xpf only deletes a key file
+it wrote wholesale, never a pre-existing / out-of-band user's
+operator-installed keys — and is idempotent (an already-absent file is a
+no-op). The password directive and the SSH keys remain independent: this
+branch touches only `authorized_keys`, and removing the
+`encrypted-password` directive still only locks the password.
+
 ### Scope — only xpf-managed accounts
 
 The lock-on-removal applies **only to the exact account xpf

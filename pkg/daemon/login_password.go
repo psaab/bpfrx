@@ -210,11 +210,13 @@ var homeBaseDir = "/home"
 
 // managedAuthorizedKeysPath returns the xpf-managed authorized_keys file for
 // name. applySystemLogin writes /home/<name>/.ssh/authorized_keys wholesale
-// from the configured SSHKeys, so the whole file is xpf-owned; the absent-user
-// reconcile removes it to revoke key-based login. filepath.Base(Clean(...))
-// keeps the join inside homeBaseDir defensively (names reaching here are
-// validated OS usernames, but never trust a name for a root-privileged
-// removal). #5128.
+// from the configured SSHKeys, so the whole file is xpf-owned. Two reconciles
+// remove it to revoke key-based login: the absent-user reconcile when the user
+// is deleted from config (#5128), and applySystemLogin's own empty-key-list
+// branch when a RETAINED user's last key is removed from config (#5106).
+// filepath.Base(Clean(...)) keeps the join inside homeBaseDir defensively
+// (names reaching here are validated OS usernames, but never trust a name for
+// a root-privileged removal). #5128.
 func managedAuthorizedKeysPath(name string) string {
 	return filepath.Join(homeBaseDir, filepath.Base(filepath.Clean(name)), ".ssh", "authorized_keys")
 }
