@@ -166,7 +166,7 @@ func TestCommitLeaseInitialAcquisition(t *testing.T) {
 	key := clientKey{iface: "ge-0-0-3", family: AFInet}
 	lease := v4Lease("10.0.0.5/24")
 
-	if err := m.commitLease(key, lease, nil, nil, nil); err != nil {
+	if err := m.commitLease(key, lease, nil, nil, nil, false); err != nil {
 		t.Fatalf("commitLease: %v", err)
 	}
 	if got := m.LeaseFor("ge-0-0-3", AFInet); got == nil || got.Address != lease.Address {
@@ -188,7 +188,7 @@ func TestCommitLeaseUnchangedRenewalNoCallback(t *testing.T) {
 	m := NewManagerForTesting(nil)
 	key := clientKey{iface: "ge-0-0-3", family: AFInet}
 	prev := v4Lease("10.0.0.5/24")
-	if err := m.commitLease(key, prev, nil, nil, nil); err != nil {
+	if err := m.commitLease(key, prev, nil, nil, nil, false); err != nil {
 		t.Fatalf("initial commitLease: %v", err)
 	}
 	disarmRecompile(m)
@@ -196,7 +196,7 @@ func TestCommitLeaseUnchangedRenewalNoCallback(t *testing.T) {
 	renewed := v4Lease("10.0.0.5/24", func(l *Lease) {
 		l.Obtained = prev.Obtained.Add(30 * time.Minute)
 	})
-	if err := m.commitLease(key, renewed, prev, nil, nil); err != nil {
+	if err := m.commitLease(key, renewed, prev, nil, nil, false); err != nil {
 		t.Fatalf("renewal commitLease: %v", err)
 	}
 	got := m.LeaseFor("ge-0-0-3", AFInet)
@@ -229,12 +229,12 @@ func TestCommitLeaseChangedContentFiresCallback(t *testing.T) {
 			m := NewManagerForTesting(nil)
 			key := clientKey{iface: "ge-0-0-3", family: AFInet}
 			prev := v4Lease("10.0.0.5/24")
-			if err := m.commitLease(key, prev, nil, nil, nil); err != nil {
+			if err := m.commitLease(key, prev, nil, nil, nil, false); err != nil {
 				t.Fatalf("initial commitLease: %v", err)
 			}
 			disarmRecompile(m)
 
-			if err := m.commitLease(key, tt.next, prev, nil, nil); err != nil {
+			if err := m.commitLease(key, tt.next, prev, nil, nil, false); err != nil {
 				t.Fatalf("renewal commitLease: %v", err)
 			}
 			got := m.LeaseFor("ge-0-0-3", AFInet)
@@ -271,7 +271,7 @@ func TestCommitLeaseDelegatedPrefixes(t *testing.T) {
 		Obtained:  time.Now(),
 	}
 
-	if err := m.commitLease(key, lease, nil, pds, nil); err != nil {
+	if err := m.commitLease(key, lease, nil, pds, nil, true); err != nil {
 		t.Fatalf("initial commitLease: %v", err)
 	}
 	if got := m.DelegatedPrefixes(); len(got) != 1 || got[0].Prefix != pds[0].Prefix {
@@ -285,16 +285,17 @@ func TestCommitLeaseDelegatedPrefixes(t *testing.T) {
 	samePDs[0].Obtained = time.Now().Add(time.Minute)
 	renewed := *lease
 	renewed.Obtained = time.Now().Add(time.Minute)
-	if err := m.commitLease(key, &renewed, lease, samePDs, pds); err != nil {
+	if err := m.commitLease(key, &renewed, lease, samePDs, pds, true); err != nil {
 		t.Fatalf("renewal commitLease: %v", err)
 	}
 	if recompileArmed(m) {
 		t.Fatal("unchanged lease+PD renewal must not fire onAddressChange")
 	}
 
-	// Renewal reply with no IA_PD options: previously delegated
-	// prefixes stay stored, no callback.
-	if err := m.commitLease(key, &renewed, &renewed, nil, samePDs); err != nil {
+	// Renewal reply with no IA_PD options (applyPDs=false, the
+	// retain-on-silence path): previously delegated prefixes stay stored,
+	// no callback.
+	if err := m.commitLease(key, &renewed, &renewed, nil, samePDs, false); err != nil {
 		t.Fatalf("empty-PD commitLease: %v", err)
 	}
 	if got := m.DelegatedPrefixes(); len(got) != 1 {
@@ -312,7 +313,7 @@ func TestCommitLeaseDelegatedPrefixes(t *testing.T) {
 		ValidLifetime:     2 * time.Hour,
 		Obtained:          time.Now(),
 	}}
-	if err := m.commitLease(key, &renewed, &renewed, newPDs, samePDs); err != nil {
+	if err := m.commitLease(key, &renewed, &renewed, newPDs, samePDs, true); err != nil {
 		t.Fatalf("changed-PD commitLease: %v", err)
 	}
 	if got := m.DelegatedPrefixes(); len(got) != 1 || got[0].Prefix != newPDs[0].Prefix {
@@ -338,7 +339,7 @@ func TestCommitLeaseStatelessNoAddress(t *testing.T) {
 		Obtained:  time.Now(),
 	}
 
-	if err := m.commitLease(key, lease, nil, nil, nil); err != nil {
+	if err := m.commitLease(key, lease, nil, nil, nil, false); err != nil {
 		t.Fatalf("initial commitLease: %v", err)
 	}
 	if got := m.LeaseFor("ge-0-0-3", AFInet6); got == nil || len(got.DNS) != 1 {
@@ -351,7 +352,7 @@ func TestCommitLeaseStatelessNoAddress(t *testing.T) {
 
 	refresh := *lease
 	refresh.Obtained = time.Now().Add(time.Hour)
-	if err := m.commitLease(key, &refresh, lease, nil, nil); err != nil {
+	if err := m.commitLease(key, &refresh, lease, nil, nil, false); err != nil {
 		t.Fatalf("refresh commitLease: %v", err)
 	}
 	if recompileArmed(m) {

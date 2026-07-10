@@ -39,7 +39,7 @@ func TestCommitLeaseGatewayHookMatrix(t *testing.T) {
 	key := clientKey{iface: "ge-0-0-3", family: AFInet}
 
 	prev := v4Lease("10.0.0.5/24")
-	if err := m.commitLease(key, prev, nil, nil, nil); err != nil {
+	if err := m.commitLease(key, prev, nil, nil, nil, false); err != nil {
 		t.Fatalf("initial commitLease: %v", err)
 	}
 	if got := fires.Load(); got != 1 {
@@ -65,7 +65,7 @@ func TestCommitLeaseGatewayHookMatrix(t *testing.T) {
 	cur := prev
 	for _, st := range steps {
 		before := fires.Load()
-		if err := m.commitLease(key, st.next, cur, nil, nil); err != nil {
+		if err := m.commitLease(key, st.next, cur, nil, nil, false); err != nil {
 			t.Fatalf("%s: commitLease: %v", st.name, err)
 		}
 		fired := fires.Load() > before
@@ -92,7 +92,7 @@ func TestFinishClientFiresGatewayHook(t *testing.T) {
 		committed := make(chan struct{})
 		m = NewManagerForTestingWithHooks(func(ctx context.Context, iface string, af AddressFamily) {
 			key := clientKey{iface: iface, family: af}
-			if err := m.commitLease(key, v4Lease("10.0.0.5/24"), nil, nil, nil); err != nil {
+			if err := m.commitLease(key, v4Lease("10.0.0.5/24"), nil, nil, nil, false); err != nil {
 				t.Errorf("commitLease: %v", err)
 			}
 			close(committed)
@@ -117,7 +117,7 @@ func TestFinishClientFiresGatewayHook(t *testing.T) {
 		committed := make(chan struct{})
 		m = NewManagerForTestingWithHooks(func(ctx context.Context, iface string, af AddressFamily) {
 			key := clientKey{iface: iface, family: af}
-			if err := m.commitLease(key, v4Lease("10.0.0.5/24"), nil, nil, nil); err != nil {
+			if err := m.commitLease(key, v4Lease("10.0.0.5/24"), nil, nil, nil, false); err != nil {
 				t.Errorf("commitLease: %v", err)
 			}
 			close(committed)
@@ -176,7 +176,7 @@ func TestGatewayHookConcurrency(t *testing.T) {
 					l.Gateway = gw
 				}
 			})
-			if err := m.commitLease(key, next, prev, nil, nil); err != nil {
+			if err := m.commitLease(key, next, prev, nil, nil, false); err != nil {
 				t.Errorf("commitLease: %v", err)
 				return
 			}

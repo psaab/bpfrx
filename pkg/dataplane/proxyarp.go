@@ -182,7 +182,23 @@ func toggleProxyResponders(ifaceFamilies map[string]map[int]struct{}, enable boo
 //     cleanup. ReconcileProxyARP itself is stateless across calls (it only
 //     sees the current config), so the enabled set is the seam the stateful
 //     disable-on-removal is built on.
-func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPAdded, map[string]map[int]struct{}, error) {
+//
+// priorIfaceMap is the (interface name → ifindex) set that proxy-arp was
+// installed on by a PRIOR commit (the daemon's remembered state). Its
+// ifindexes are folded into the managed listing set so NTF_PROXY neighbor
+// entries are also swept off interfaces that have since dropped out of the
+// config: without this the entries are orphaned in the kernel and keep
+// answering ARP/NDP for the removed target (#4955, distinct from the #2475
+// sysctl-only teardown). Because such interfaces are absent from the desired
+// set, every NTF_PROXY entry found on them is stale and NeighDel'd. Pass nil
+// when there is no prior state to sweep.
+//
+// On a partial NeighSet failure the add loop is best-effort (logs and
+// continues) and still returns the computed enabled set plus the first error,
+// rather than aborting with a nil enabled set — otherwise the daemon would
+// forget the interfaces it just tried to manage and never tear them down
+// (#4955 secondary).
+func ReconcileProxyARP(cfg *config.Config, ifaceMap, priorIfaceMap map[string]int) ([]ProxyARPAdded, map[string]map[int]struct{}, error) {
 	type proxyKey struct {
 		ifindex int
 		ip      netip.Addr
@@ -213,7 +229,11 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 		fams[family] = struct{}{}
 	}
 
-	for _, entry := range cfg.Security.NAT.ProxyARP {
+	var cfgEntries []*config.ProxyARPEntry
+	if cfg != nil {
+		cfgEntries = cfg.Security.NAT.ProxyARP
+	}
+	for _, entry := range cfgEntries {
 		ifindex, ok := ifaceMap[entry.Interface]
 		if !ok {
 			slog.Warn("proxy-arp: interface not found", "iface", entry.Interface)
@@ -251,6 +271,13 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 	existing := make(map[proxyKey]struct{})
 	managedSet := make(map[int]bool)
 	for _, idx := range managedIfindexes {
+		managedSet[idx] = true
+	}
+	// #4955: also list interfaces that a PRIOR commit installed proxy-arp on
+	// but that have since dropped out of the config. They contribute no desired
+	// entries, so any NTF_PROXY entry still on them is stale and swept below —
+	// closing the orphan where a removed interface kept answering ARP/NDP.
+	for _, idx := range priorIfaceMap {
 		managedSet[idx] = true
 	}
 
@@ -306,7 +333,16 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 
 	// Add missing entries (family derived from the key — v4 and v6 share the
 	// same NTF_PROXY install path; #2197 item 1).
+	//
+	// #4955: the add loop is best-effort. A NeighSet failure is logged and the
+	// remaining installs still proceed, and the function returns the computed
+	// enabled set (below) plus the first error instead of bailing out with a
+	// nil enabled set. Aborting here previously made the daemon overwrite its
+	// remembered state with nil, so it forgot every interface it had managed
+	// and never disabled the sysctl or swept the neighbor entries on a later
+	// removal.
 	var added []ProxyARPAdded
+	var addErr error
 	for key := range desired {
 		if _, ok := existing[key]; ok {
 			continue
@@ -319,7 +355,12 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 			Family:    family,
 		}
 		if err := neighSetSeam(neigh); err != nil {
-			return nil, nil, fmt.Errorf("proxy-arp: add %s on ifindex %d: %w", key.ip, key.ifindex, err)
+			slog.Warn("proxy-arp: failed to add entry",
+				"ip", key.ip, "ifindex", key.ifindex, "err", err)
+			if addErr == nil {
+				addErr = fmt.Errorf("proxy-arp: add %s on ifindex %d: %w", key.ip, key.ifindex, err)
+			}
+			continue
 		}
 		ifaceName := ""
 		if link, err := netlink.LinkByIndex(key.ifindex); err == nil {
@@ -376,7 +417,7 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 		slog.Info("proxy-arp reconciled", "added", len(added), "removed", removed)
 	}
 
-	return added, ifaceFamilies, nil
+	return added, ifaceFamilies, addErr
 }
 
 // DisableProxyResponders writes "0" to the per-interface proxy responder
