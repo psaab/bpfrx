@@ -76,9 +76,12 @@ type xpfCollector struct {
 	// failed read SKIPS emitting that counter's sample (so a degraded counter
 	// bridge does NOT report a misleading 0); this metric is the scrape-error
 	// signal an operator alerts on. Persisted on the collector so it accumulates
-	// across scrapes like a real counter. #3462: the SAMPLE is emitted last in
-	// Collect (emitCounterReadErrors), after all collectors that can bump it, so
-	// a failure this scrape is reflected this scrape.
+	// across scrapes like a real counter. #3462/#5045: the SAMPLE is emitted via
+	// a `defer c.emitCounterReadErrors(ch)` established at the TOP of Collect, so
+	// it runs at function exit — after all collectors that can bump it — on
+	// EVERY return path (the unloaded-dataplane early return AND normal
+	// completion). A failure this scrape is reflected this scrape, and the
+	// omit-plus-error contract is never violated by an early return.
 	counterReadErrorsTotal *prometheus.Desc
 	counterReadErrors      atomic.Uint64
 
@@ -898,6 +901,27 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
+	// #5045: emit the xpf_counter_read_errors_total scrape-error sample on
+	// EVERY return path of Collect, so the #3345/#3462 omit-plus-error contract
+	// (a series OMITTED because its read failed => the SAME scrape MUST carry
+	// the error signal) holds even in a config-only / degraded boot. The
+	// pre-gate host-inbound / lo0 collectors below
+	// (collectHostInboundKernelDenies, collectHostInboundJunosHostDenies,
+	// collectHostInboundICMPNDAccepts, collectLo0Counters) bump
+	// counterReadErrors and SKIP their series on an nft read failure, then
+	// Collect hits the `dp == nil || !dp.IsLoaded()` early return. Before this,
+	// the only emit site sat AFTER that gate, so an unloaded-dataplane scrape
+	// with a failing pre-gate read carried NEITHER the data series NOR the
+	// error sample — a clean absence in exactly the degraded state those
+	// pre-gate collectors exist to observe. A defer emits the total exactly
+	// ONCE at function exit, after every collector that can bump it, on BOTH
+	// the unloaded early return and normal completion. counterReadErrors is a
+	// cumulative atomic.Uint64 (never reset per-scrape), so the deferred value
+	// reflects THIS scrape's + prior errors — identical to the loaded-path
+	// value before this change, since nothing after the former emit site
+	// (collectSessionGauges..collectUserspaceStatus) bumps it.
+	defer c.emitCounterReadErrors(ch)
+
 	// #1799: config-persist health is a control-plane signal — emit it
 	// BEFORE the dataplane gate below so the degraded state stays
 	// visible even when the dataplane is not loaded.
@@ -1081,17 +1105,15 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// reflected in THIS scrape's xpf_interface_counter_read_errors_total. Kept
 	// separate from the security-counter total emitted just below.
 	c.emitInterfaceCounterReadErrors(ch)
-	// #5046: collect NAT pool metrics BEFORE emitCounterReadErrors — a
-	// ReadNATPortCounter failure bumps counterReadErrors, and the bump must be
-	// reflected in THIS scrape's xpf_counter_read_errors_total rather than
-	// lagging a scrape behind (the same #3462 ordering the other counter
-	// collectors follow).
+	// #5046: collect NAT pool metrics on the loaded path — a ReadNATPortCounter
+	// failure bumps counterReadErrors. The deferred emitCounterReadErrors at the
+	// top of Collect runs at function exit, AFTER this, so the bump is reflected
+	// in THIS scrape's xpf_counter_read_errors_total rather than lagging a scrape
+	// behind (the #3462 ordering the other counter collectors follow). #5045: the
+	// scrape-error sample is no longer emitted from an explicit call here — the
+	// deferred emit covers this normal-completion path AND the unloaded early
+	// return above with exactly one emission per scrape.
 	c.collectNATPoolMetrics(ch, dp)
-	// #3462: emit the scrape-error counter AFTER global/zone/policy/filter/NAT
-	// (and the pre-gate host-inbound collector) have run, so a read failure in
-	// any of them is reflected in THIS scrape's xpf_counter_read_errors_total
-	// rather than lagging a scrape behind.
-	c.emitCounterReadErrors(ch)
 	c.collectSessionGauges(ch, dp)
 	c.collectDHCPMetrics(ch)
 	c.collectDDNSMetrics(ch)
