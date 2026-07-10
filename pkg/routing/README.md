@@ -29,7 +29,7 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` + tracked `name→if_id` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on `if_id` change) — it does NOT clear-all-then-rebuild, so an unrelated config commit leaves active xfrmi interfaces untouched (#2546). Refuses to create either of two distinct devices that derive the same `if_id` — fail-closed collision guard (#2909) |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
 | `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails (best-effort — a failed rollback is swept by the next band clear; the pin reports failed either way); callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
-| `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
+| `bond.go` | `bondManager` | bond (fabric/ae LAG) device lifecycle; own `mu` + tracked `name→bondSig` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on signature change) — it does NOT clear-all-then-rebuild, so an unrelated config commit no longer flaps the LAG (#5119, mirroring #2546) |
 | `reth.go` | `rethManager` | stale `reth*` bond cleanup |
 | `monitor.go` | `monitorManager` | interface-monitor HA signal; own `mu`. Link health via `linkAttrsUp` reads kernel **operstate** (`OperUp` → up; `OperUnknown` → admin-flag fallback; `OperDown`/lower-layer-down → down), **not** `IFF_UP` — admin-up-but-carrier-down (cable pulled) must report DOWN so HA fails over (#2070). Mirrors `pkg/vrrp.linkAttrsUp` and `pkg/cluster/monitor.go` |
 
@@ -59,6 +59,30 @@ all and rebuilding:
 A no-op commit (identical VPN set) issues zero `LinkDel` and zero
 `LinkAdd`. `Clear()` (shutdown / full teardown) still deletes every
 tracked interface.
+
+### Bond (fabric/ae LAG) reconcile (#5119)
+
+`bondManager.Apply` is called by `pkg/daemon` on **every** config commit
+(not only when the bond/fabric config changes) so bonds for deleted
+fabric interfaces are torn down. It therefore reconciles the desired bond
+set (`name→bondSig` — mode, MTU, and the sorted resolved Linux member
+set) against the tracked set instead of clearing all and rebuilding:
+
+- **keep** a bond untouched when it is still desired with an identical
+  `bondSig` — no `LinkDel`/`LinkAdd`/`LinkSetMaster`, so an unrelated
+  policy-only commit no longer flaps the LAG (`LinkDel`→`LinkAdd`→
+  re-enslave→LACP re-converge, traffic loss on the bond);
+- **create** a newly-desired bond (also adopts a kernel bond that
+  outlived in-memory tracking, e.g. across a daemon restart);
+- **recreate** (delete+create) a bond whose signature changed — a genuine
+  member/mode/MTU change; the mode and enslavement cannot be changed in
+  place while members are attached;
+- **delete** a bond whose fabric interface was removed.
+
+A no-op commit (identical desired bond set) issues zero `LinkDel`, zero
+`LinkAdd`, and zero `LinkSetMaster`. This was the non-idempotent
+anti-pattern #2546 fixed for XFRM but not bonds. `Clear()` (shutdown /
+full teardown) still deletes every tracked bond.
 
 **Teardown retains on delete failure (#4901).** The xfrm / bond / tunnel
 teardown paths (`clearLocked`, reached via `Clear`) used to log a failed
