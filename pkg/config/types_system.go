@@ -153,10 +153,22 @@ type UserspaceConfig struct {
 // opportunistic cross-NIC shared UMEM and fall back per binding when the live
 // device/kernel path cannot support it. Phase 0 artifacts are audit evidence:
 // the helper logs mismatches but does not gate runtime selection on them.
+//
+// Phase0ArtifactFile is the operator-DECLARED path to the machine-readable
+// Phase 0 audit artifact (#5300). It intentionally carries only the declared
+// path, NEVER the node-local file's parsed contents: the artifact is audit
+// evidence only (docs/shared-umem-plan.md "Phase 0"), does not gate runtime
+// shared-UMEM selection, and MUST NOT make the compiled typed config depend on
+// a node-local file — otherwise the identical committed tree would compile to a
+// DIFFERENT typed config on a peer / after restart when the file is absent or
+// differs, breaking same-tree->same-config determinism and HA replay. The audit
+// read itself is performed non-fatally by sharedUMEMAuditWarnings: a missing /
+// unreadable / non-regular / oversized / malformed artifact becomes a commit
+// WARNING, never a compile error, and never changes this typed config.
 type SharedUMEMConfig struct {
-	Mode           string                 `json:"mode,omitempty"`
-	Interfaces     []string               `json:"interfaces,omitempty"`
-	Phase0Artifact map[string]interface{} `json:"phase0_artifact,omitempty"`
+	Mode               string   `json:"mode,omitempty"`
+	Interfaces         []string `json:"interfaces,omitempty"`
+	Phase0ArtifactFile string   `json:"phase0_artifact_file,omitempty"`
 }
 
 // RootAuthConfig holds root-authentication settings.

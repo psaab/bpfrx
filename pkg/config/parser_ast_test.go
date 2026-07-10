@@ -3461,33 +3461,58 @@ func TestUserspaceDataplaneSharedUMEMConfig(t *testing.T) {
 	if got := strings.Join(dp.SharedUMEM.Interfaces, ","); got != "ge-0-0-1,ge-0-0-2" {
 		t.Fatalf("SharedUMEM.Interfaces = %q", got)
 	}
-	if passed, ok := dp.SharedUMEM.Phase0Artifact["passed"].(bool); !ok || !passed {
-		t.Fatalf("SharedUMEM.Phase0Artifact[passed] = %#v", dp.SharedUMEM.Phase0Artifact["passed"])
+	// #5300: the typed config carries only the operator-DECLARED path, never the
+	// node-local file's parsed content (the determinism decouple). The compile
+	// must also produce no audit warning for a well-formed, passed=true artifact.
+	if dp.SharedUMEM.Phase0ArtifactFile != artifact {
+		t.Fatalf("SharedUMEM.Phase0ArtifactFile = %q, want %q", dp.SharedUMEM.Phase0ArtifactFile, artifact)
 	}
-	if got := strings.Join(sharedUMEMArtifactStringArray(t, dp.SharedUMEM.Phase0Artifact, "selected_interfaces"), ","); got != "ge-0-0-1,ge-0-0-2" {
-		t.Fatalf("SharedUMEM.Phase0Artifact[selected_interfaces] = %q", got)
+	if hasWarningContaining(cfg.Warnings, "shared-umem phase0-artifact-file") {
+		t.Fatalf("well-formed passed=true artifact must not warn, got %#v", cfg.Warnings)
 	}
-	mtu, ok := dp.SharedUMEM.Phase0Artifact["mtu"].(map[string]interface{})
+	// The audit read (warning path) still parses + Linux-normalizes the file so
+	// the operator audit signal keeps its value; assert that content here.
+	parsed, err := readSharedUMEMPhase0ArtifactForAudit(artifact)
+	if err != nil {
+		t.Fatalf("readSharedUMEMPhase0ArtifactForAudit: %v", err)
+	}
+	if passed, ok := parsed["passed"].(bool); !ok || !passed {
+		t.Fatalf("audit artifact[passed] = %#v", parsed["passed"])
+	}
+	if got := strings.Join(sharedUMEMArtifactStringArray(t, parsed, "selected_interfaces"), ","); got != "ge-0-0-1,ge-0-0-2" {
+		t.Fatalf("audit artifact[selected_interfaces] = %q", got)
+	}
+	mtu, ok := parsed["mtu"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("SharedUMEM.Phase0Artifact[mtu] = %#v", dp.SharedUMEM.Phase0Artifact["mtu"])
+		t.Fatalf("audit artifact[mtu] = %#v", parsed["mtu"])
 	}
 	if _, ok := mtu["ge-0-0-1"]; !ok {
-		t.Fatalf("SharedUMEM.Phase0Artifact[mtu] was not Linux-name normalized: %#v", mtu)
+		t.Fatalf("audit artifact[mtu] was not Linux-name normalized: %#v", mtu)
 	}
-	driverName, ok := dp.SharedUMEM.Phase0Artifact["driver_name"].(map[string]interface{})
+	driverName, ok := parsed["driver_name"].(map[string]interface{})
 	if !ok {
-		t.Fatalf("SharedUMEM.Phase0Artifact[driver_name] = %#v", dp.SharedUMEM.Phase0Artifact["driver_name"])
+		t.Fatalf("audit artifact[driver_name] = %#v", parsed["driver_name"])
 	}
 	if _, ok := driverName["ge-0-0-1"]; !ok {
-		t.Fatalf("SharedUMEM.Phase0Artifact[driver_name] was not Linux-name normalized: %#v", driverName)
+		t.Fatalf("audit artifact[driver_name] was not Linux-name normalized: %#v", driverName)
 	}
 }
 
-func TestUserspaceDataplaneSharedUMEMRejectsNullArtifact(t *testing.T) {
+// TestUserspaceDataplaneSharedUMEMNullArtifactIsNonGating proves a malformed
+// (here: JSON-null) audit artifact is NON-GATING (#5300): the audit-read helper
+// still rejects it, but the commit must SUCCEED with the failure surfaced as a
+// warning rather than propagated as a compile error.
+func TestUserspaceDataplaneSharedUMEMNullArtifactIsNonGating(t *testing.T) {
 	artifact := t.TempDir() + "/phase0.json"
 	if err := os.WriteFile(artifact, []byte(`null`), 0644); err != nil {
 		t.Fatal(err)
 	}
+	// The audit-read helper still rejects a JSON-null top-level value...
+	if _, err := readSharedUMEMPhase0ArtifactForAudit(artifact); err == nil ||
+		!strings.Contains(err.Error(), "top-level value must be a JSON object") {
+		t.Fatalf("readSharedUMEMPhase0ArtifactForAudit error = %v, want null rejection", err)
+	}
+	// ...but a malformed artifact must NOT gate the commit.
 	lines := []string{
 		"set system dataplane-type userspace",
 		"set system dataplane shared-umem mode cross-nic",
@@ -3504,9 +3529,18 @@ func TestUserspaceDataplaneSharedUMEMRejectsNullArtifact(t *testing.T) {
 			t.Fatalf("SetPath(%v): %v", path, err)
 		}
 	}
-	_, err := CompileConfig(tree)
-	if err == nil || !strings.Contains(err.Error(), "top-level value must be a JSON object") {
-		t.Fatalf("CompileConfig error = %v, want null artifact rejection", err)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig with malformed audit artifact must succeed (non-gating), got %v", err)
+	}
+	if cfg.System.UserspaceDataplane == nil || cfg.System.UserspaceDataplane.SharedUMEM == nil {
+		t.Fatal("SharedUMEM config not compiled")
+	}
+	if cfg.System.UserspaceDataplane.SharedUMEM.Phase0ArtifactFile != artifact {
+		t.Fatalf("Phase0ArtifactFile = %q, want %q", cfg.System.UserspaceDataplane.SharedUMEM.Phase0ArtifactFile, artifact)
+	}
+	if !hasWarningContaining(cfg.Warnings, "audit artifact unavailable") {
+		t.Fatalf("expected audit-unavailable warning, got %#v", cfg.Warnings)
 	}
 }
 
@@ -3522,9 +3556,9 @@ func TestUserspaceDataplaneSharedUMEMRejectsOversizedArtifact(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = readSharedUMEMPhase0Artifact(artifact)
+	_, err = readSharedUMEMPhase0ArtifactForAudit(artifact)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("readSharedUMEMPhase0Artifact error = %v, want size rejection", err)
+		t.Fatalf("readSharedUMEMPhase0ArtifactForAudit error = %v, want size rejection", err)
 	}
 }
 
@@ -3533,9 +3567,9 @@ func TestUserspaceDataplaneSharedUMEMRejectsArtifactKeyCollision(t *testing.T) {
 	if err := os.WriteFile(artifact, []byte(`{"passed":true,"driver_name":{"ge-0/0/1":"mlx5_core","ge-0-0-1":"mlx5_core"}}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := readSharedUMEMPhase0Artifact(artifact)
+	_, err := readSharedUMEMPhase0ArtifactForAudit(artifact)
 	if err == nil || !strings.Contains(err.Error(), "duplicate driver_name key after Linux interface-name normalization: ge-0-0-1") {
-		t.Fatalf("readSharedUMEMPhase0Artifact error = %v, want normalized-key collision", err)
+		t.Fatalf("readSharedUMEMPhase0ArtifactForAudit error = %v, want normalized-key collision", err)
 	}
 }
 
@@ -3544,9 +3578,9 @@ func TestUserspaceDataplaneSharedUMEMRejectsArtifactArrayCollision(t *testing.T)
 	if err := os.WriteFile(artifact, []byte(`{"passed":true,"selected_interfaces":["ge-0/0/1","ge-0-0-1"]}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := readSharedUMEMPhase0Artifact(artifact)
+	_, err := readSharedUMEMPhase0ArtifactForAudit(artifact)
 	if err == nil || !strings.Contains(err.Error(), "duplicate selected_interfaces entry after Linux interface-name normalization: ge-0-0-1") {
-		t.Fatalf("readSharedUMEMPhase0Artifact error = %v, want normalized-array collision", err)
+		t.Fatalf("readSharedUMEMPhase0ArtifactForAudit error = %v, want normalized-array collision", err)
 	}
 }
 
