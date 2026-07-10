@@ -585,8 +585,11 @@ Ownership is now enforced atomically under `s.mu` via
 section through session-scoped `*As` variants: `SetAs`,
 `SetFromInputAs`, `DeleteAs`, `DeleteFromInputAs`,
 `DeactivateFromInputAs`/`ActivateFromInputAs`, `CopyAs`, `RenameAs`,
-`InsertAs`, `LoadOverrideAs`/`LoadMergeAs`/`LoadSetAs`, `RollbackAs`, and
-`ConfirmCommitAs`. The commit-family RPCs whose mutation runs through a daemon
+`InsertAs`, `AnnotateAs`, `LoadOverrideAs`/`LoadMergeAs`/`LoadSetAs`,
+`RollbackAs`, and `ConfirmCommitAs`. (`AnnotateAs` closed a #5379 gap — before
+it, `Annotate` was the one candidate mutator with no ownership check at all, so
+a non-holder could annotate another session's candidate and refresh the true
+holder's idle lease.) The commit-family RPCs whose mutation runs through a daemon
 callback (`Commit`, `CommitConfirmed`) call the exported `EnsureConfigHolder`
 first. The gRPC handlers thread `peerSessionID(ctx)` — the same identifier
 `EnterConfigureSession` records — into every one of these, so a second remote
