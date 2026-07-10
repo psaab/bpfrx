@@ -30,14 +30,21 @@ import (
 // error (candidate rejected, live config untouched). The #2929 routing guard
 // stays as the runtime backstop.
 //
-// Scope — surgical: the gate fires ONLY when two DISTINCT bind-interface
-// strings derive the SAME non-zero if_id. It does NOT fire when:
-//   - the same bind-interface string is shared by multiple VPNs (that is one
-//     device, one if_id — not the ambiguous-alias case #2929 named), nor
-//   - a bind-interface XFRMIfNameAndID cannot parse as `st<N>[.unit]`
-//     (if_id 0) — out of scope here; some other path handles a bad string.
+// Scope — surgical: the if_id-collision arm fires ONLY when two DISTINCT
+// bind-interface strings derive the SAME non-zero if_id. It does NOT fire when
+// the same bind-interface string is shared by multiple VPNs (that is one
+// device, one if_id — not the ambiguous-alias case #2929 named).
 //
 // An unambiguous map (st0.0 + st0.1, or st0 + st1) commits cleanly.
+//
+// #5297 invalid-name arm: a NON-EMPTY bind-interface that XFRMIfNameAndID
+// cannot parse as `st<N>[.unit]` resolves to if_id 0 — it creates NO XFRM
+// device at reconciliation, so the route-based VPN commits but silently
+// carries no traffic. This is a DISTINCT failure from the #2933 collision
+// (which needs two VALID, non-zero if_ids): the gate now rejects such a name on
+// the strict path (naming the canonical st<N>[.unit] requirement) and warns on
+// the tolerant path, mirroring the same strict/lenient split. An empty
+// bind-interface (none configured) is still skipped.
 //
 // This is an AST pre-walk (like validateUnsupportedInterfaceStanzasAST / the other
 // reject-at-commit gates) rather than a typed-Config validator so it runs on
@@ -65,6 +72,16 @@ func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string
 	byID := map[uint32]map[string]*bindRef{}
 	order := []uint32{} // first-seen if_id order for deterministic errors
 
+	// #5297: a NON-EMPTY bind-interface that XFRMIfNameAndID resolves to
+	// if_id 0 is not a canonical st<N>[.unit] secure-tunnel name. It commits
+	// but creates no XFRM device at reconciliation (pkg/routing logs "invalid
+	// bind-interface name"), so the route-based VPN is silently DOWN. Collect
+	// these here and reject (strict) / warn (lenient) after the walk, in
+	// deterministic order. Distinct from the #2933 if_id-collision gate below
+	// (two VALID aliases sharing one non-zero if_id).
+	type invalidBind struct{ vpn, iface string }
+	var invalid []invalidBind
+
 	// #3562: iterate EVERY top-level `security` node and EVERY `ipsec` sibling,
 	// not the first match at any level. parseStatements APPENDS a repeated
 	// top-level block instead of merging it (parser.go) and compileExpanded /
@@ -90,8 +107,13 @@ func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string
 				}
 				_, ifID := XFRMIfNameAndID(bindIface)
 				if ifID == 0 {
-					// Not a recognizable st<N>[.unit] secure-tunnel binding;
-					// out of scope for the if_id-collision gate.
+					// #5297: not a recognizable st<N>[.unit] secure-tunnel
+					// binding — it creates no XFRM device (empty name / zero
+					// id), so the VPN silently carries no traffic. Record for a
+					// fail-closed reject (strict) / warn (lenient) after the
+					// walk. NOT the #2933 collision case (that needs a valid,
+					// non-zero if_id).
+					invalid = append(invalid, invalidBind{vpn: inst.name, iface: bindIface})
 					continue
 				}
 				group, ok := byID[ifID]
@@ -123,6 +145,31 @@ func validateSecureTunnelBindInterfaceAST(nodes []*Node, lenient bool) ([]string
 		}
 		warnings = append(warnings, msg)
 		return nil
+	}
+
+	// #5297: fail closed on any bind-interface that resolves to no XFRM
+	// device. Strict (commit / commit-check) hard-rejects with an actionable
+	// message naming the canonical st<N>[.unit] requirement; lenient (load /
+	// peer-sync) warns and skips so an already-persisted or peer-synced config
+	// an older binary silently accepted still BOOTS (#1960) — the pkg/routing
+	// reconciler stays the runtime backstop (logs the invalid name, no device).
+	// Sorted for deterministic output.
+	sort.Slice(invalid, func(i, j int) bool {
+		if invalid[i].iface != invalid[j].iface {
+			return invalid[i].iface < invalid[j].iface
+		}
+		return invalid[i].vpn < invalid[j].vpn
+	})
+	for _, bad := range invalid {
+		if err := emit(
+			"secure-tunnel bind-interface %q (security ipsec vpn %s) is not a "+
+				"valid secure-tunnel interface: it must be st<N> or st<N>.<unit> "+
+				"(e.g. st0 or st0.1). Any other name resolves to no XFRM "+
+				"interface, so the route-based VPN commits successfully but "+
+				"carries no traffic (silent tunnel down) (#5297)",
+			bad.iface, bad.vpn); err != nil {
+			return nil, err
+		}
 	}
 
 	for _, ifID := range order {

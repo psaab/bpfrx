@@ -559,6 +559,31 @@ its OWN learned address — on top of the SAME spine, without forking the engine
     the `owned && !changed && !refreshDue` skip does not fire, the new name is
     published, and the old name's record (under the previous FQDN's scope key) is
     withdrawn by Pass 2 (publish-new + withdraw-old, never an orphaned old RR).
+  - **durable desired-vs-confirmed crash recovery (#5285)** — the write-ahead
+    ownership row now carries a durable `PublishPending` bit and a retained
+    `PriorAddrText` (the last-CONFIRMED value), not just the desired address.
+    `publishLocked` persists `{desired, PublishPending=true, prior=<last
+    confirmed>}` BEFORE the provider I/O and CONFIRMS it (clears the pending bit,
+    releases the prior value) with a second save AFTER a successful wire add. This
+    closes the save→wire crash window that pre-#5285 mishandled: previously the
+    DESIRED address was written into the SOLE ownership row with NO pending bit and
+    NO retained prior, so a CRASH between `state.save(B)` and
+    `providerIO(UpsertLease)` (the in-process rollback never runs on a crash) seeded
+    B as BOTH `lastAddr` and successfully-published — on restart the `owned &&
+    !changed && !refreshDue` skip suppressed recovery, public DNS stayed at the OLD
+    value A while the appliance reported B, and A's value-specific cleanup key was
+    destroyed. Now a PENDING record forces `refreshDue` in `reconcileScopeLocked`
+    (`pendingRecovery`), so restart RE-RUNS the wire op for the desired value and
+    threads the retained prior A as `PrevAddr` (the value-specific in-place replace
+    of xpf's REAL live value — never the phantom desired). Mirrors the DHCP-lease
+    `PTRPending` durable-pending idiom. **DISTINCT from #2662:** #2662 write-aheads
+    the intent to close the *end-of-pass* orphan window (a live RR with no durable
+    owner) but records the desired address as though confirmed; #5285 adds the
+    desired-vs-confirmed distinction so a crash in that same window cannot be
+    mistaken for a confirmed publish. The in-process rollback (a NON-crash wire
+    failure restores the confirmed prior) is preserved — the durable pending bit is
+    the crash-safe SUPERSET. Fail-on-revert:
+    `surface_a_durable_pending_5285_test.go`.
   - **forced-refresh** — a per-scope wire-update FLOOR (default 24h) decoupled
     from the 30s reconcile cadence, to prove liveness / resist record reaping
     without per-poll traffic.
