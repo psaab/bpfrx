@@ -1169,6 +1169,49 @@ Phase-1 IKE proposal above. The completeness audit that gates the flip:
   `schema_closedworld_ipsec_proposal_4313_test.go` (RED on revert of the flag;
   the lenient-no-brick case and the advisory are covered too).
 
+### #5195 — pkg/config secret-handling cohort (codex-177 A3-b2)
+
+Two low-severity but security-relevant residuals in the config compiler: a
+crypto-namespace collision that silently downgrades an IPsec proposal, and a
+VRRP validator that echoes an auth secret into diagnostics. Both are AST
+pre-walk gates with the standard strict-reject / lenient-warn (#1960) split.
+
+- **F7 — reserved synthetic proposal-set name (`validateReservedIPsecProposalNamesAST`,
+  `compiler_ipsec_proposalset.go`).** When a policy carries a predefined
+  `proposal-set`, `expandIKEProposalSets` / `expandIPsecProposalSets` mint
+  concrete proposals under synthetic `__proposal-set/<policy>/<set>/<index>`
+  names and write them into the SAME name-keyed `IKEProposals` / `Proposals`
+  maps that hold operator-authored proposals, AFTER those maps are built. The
+  lexer permits `/ _ .` in bare identifiers, so an operator can author a
+  proposal with that exact name — the unconditional map write then silently
+  overwrites one with the other, installing a different (typically weaker)
+  crypto proposal than configured (a silent downgrade). The `__proposal-set/`
+  prefix (`reservedProposalSetNamePrefix`, the single source of truth shared
+  with `syntheticProposalSetName`) is now RESERVED: an authored `security
+  {ike|ipsec} proposal` whose name uses it hard-rejects at strict commit and
+  warns on the tolerant load / peer-sync path. The two expand loops additionally
+  keep an occupancy guard — they never overwrite a slot already taken — so a
+  leniently-loaded squatter that an older binary accepted is preserved, not
+  clobbered. The gate enumerates names with the SAME `namedInstances` helper
+  `compileIKE` / `compileIPsec` use to key the maps, so it checks exactly the
+  names that could collide. Tests:
+  `compiler_ipsec_reserved_proposal_name_5195_test.go` (strict reject IKE + ESP,
+  lenient no-downgrade with the authored crypto preserved, and a no-false-
+  positive clean-expansion case; RED on revert of both the gate and the guard).
+
+- **F10 — VRRP track validator secret echo (`validateVRRPTrackInterfaceAST`,
+  `compiler_interfaces.go`).** The duplicate-`track-interface` shape check built
+  its diagnostic node path from the FULL vrrp-group node `Keys`. In the
+  Keys-packed spelling `vrrp-group 1 authentication-key <secret> track-interface
+  X track-interface Y` the authentication-key VALUE rides on that same Keys run,
+  so the strict error / lenient warning echoed the secret into logs + CLI. The
+  path is now built from `vrrpGroupIDKeys(n)` (the value-free `vrrp-group <id>`
+  identity) BEFORE any message — mirroring the identical guard the #4288 auth
+  validator (`validateVRRPAuthenticationAST`) already applies. Same
+  message-from-identity-only doctrine as the #4306 S-5 inert-knob advisories.
+  Tests: `vrrp_track_secret_5195_test.go` (strict + lenient, RED on revert:
+  the sentinel secret appears in the message).
+
 **More production flips — `security nat nat64` and `security nat natv6v4`
 (xpf-native NAT64 stanzas, #4313).** Both now set `closedWorld:true`
 (`schema_security.go`). These are xpf-NATIVE stanzas (Junos does NAT64 via

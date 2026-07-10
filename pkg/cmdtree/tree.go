@@ -1219,9 +1219,18 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 	// derived from ValueType instead of an explicit "<name>" node).
 	parentTyped := false
 	dynamicConsumed := false
+	// #5196 (A3-b1-F4): resolveTreeWord accepts unique keyword prefixes
+	// for traversal, but ContextDynamicFn providers scan the consumed
+	// words for exact keywords (e.g. the policy provider looks for
+	// "from-zone"/"to-zone"). Track the CANONICAL keyword for each
+	// resolved word so an accepted abbreviation ("from-z"/"to-z") still
+	// carries the state those providers key off. Value slots (dynamic /
+	// typed / placeholder — the !ok branches) keep the raw word, since
+	// that is the operator-supplied value, not a keyword.
+	canonWords := append([]string(nil), words...)
 	for wi, w := range words {
 		dynamicConsumed = false
-		_, node, matches, ok := resolveTreeWord(current, w)
+		name, node, matches, ok := resolveTreeWord(current, w)
 		if !ok {
 			if parentTyped {
 				// Typed-leaf value slot consumed this word; stay at same level.
@@ -1252,6 +1261,9 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 			}
 			return nil
 		}
+		// Resolved (possibly via unique prefix): record the canonical
+		// keyword so downstream ContextDynamicFn providers see it (#5196).
+		canonWords[wi] = name
 		currentNode = node
 		parentTyped = node.IsTypedLeaf()
 		if node.Children == nil {
@@ -1259,8 +1271,16 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 				dynamicConsumed = true
 				continue
 			}
-			if node.HasDynamic() && cfg != nil {
-				return FilterPrefix(node.DynamicValues(cfg, words), partial)
+			if node.HasDynamic() {
+				// #5196 (A3-b1-F3): invoke the provider even when cfg==nil.
+				// nil-safety is the provider contract (all DynamicFn /
+				// ContextDynamicFn either guard `cfg == nil` or ignore cfg),
+				// and config-independent providers (e.g. `show route table`
+				// → inet.0/inet6.0, `show route protocol`) intentionally
+				// supply defaults for a nil config (fresh boot /
+				// compile-failure recovery). The old `&& cfg != nil` caller
+				// gate suppressed those defaults.
+				return FilterPrefix(node.DynamicValues(cfg, canonWords), partial)
 			}
 			return nil
 		}
@@ -1275,8 +1295,10 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 			candidates = append(candidates, ph)
 		}
 	}
-	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() && cfg != nil {
-		candidates = append(candidates, currentNode.DynamicValues(cfg, words)...)
+	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() {
+		// #5196 (A3-b1-F3): nil-config-aware providers must still run.
+		// #5196 (A3-b1-F4): pass canonical keywords, not raw abbreviations.
+		candidates = append(candidates, currentNode.DynamicValues(cfg, canonWords)...)
 	}
 	return FilterPrefix(candidates, partial)
 }
@@ -1287,9 +1309,12 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 	var currentNode *Node
 	parentTyped := false
 	dynamicConsumed := false
+	// #5196 (A3-b1-F4): canonicalize accepted keyword prefixes so
+	// ContextDynamicFn providers see exact keywords. Mirrors CompleteFromTree.
+	canonWords := append([]string(nil), words...)
 	for wi, w := range words {
 		dynamicConsumed = false
-		_, node, matches, ok := resolveTreeWord(current, w)
+		canonName, node, matches, ok := resolveTreeWord(current, w)
 		if !ok {
 			if parentTyped {
 				parentTyped = false
@@ -1318,6 +1343,8 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 			}
 			return nil
 		}
+		// Record the canonical keyword for the resolved word (#5196).
+		canonWords[wi] = canonName
 		currentNode = node
 		parentTyped = node.IsTypedLeaf()
 		if node.Children == nil {
@@ -1325,9 +1352,11 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 				dynamicConsumed = true
 				continue
 			}
-			if node.HasDynamic() && cfg != nil {
+			if node.HasDynamic() {
+				// #5196 (A3-b1-F3): run the provider on nil cfg too.
+				// #5196 (A3-b1-F4): pass canonical keywords.
 				var candidates []Candidate
-				for _, name := range node.DynamicValues(cfg, words) {
+				for _, name := range node.DynamicValues(cfg, canonWords) {
 					if strings.HasPrefix(name, partial) {
 						candidates = append(candidates, Candidate{Name: name, Desc: "(configured)"})
 					}
@@ -1352,8 +1381,10 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 	if parentTyped && currentNode != nil {
 		candidates = append(candidates, typedLeafCandidates(currentNode, partial)...)
 	}
-	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() && cfg != nil {
-		for _, name := range currentNode.DynamicValues(cfg, words) {
+	if !dynamicConsumed && currentNode != nil && currentNode.HasDynamic() {
+		// #5196 (A3-b1-F3): nil-config-aware providers must still run.
+		// #5196 (A3-b1-F4): pass canonical keywords, not raw abbreviations.
+		for _, name := range currentNode.DynamicValues(cfg, canonWords) {
 			if strings.HasPrefix(name, partial) {
 				candidates = append(candidates, Candidate{Name: name, Desc: "(configured)"})
 			}

@@ -933,7 +933,18 @@ func validateVRRPTrackInterfaceAST(nodes []*Node, prefix string, lenient bool) (
 	for _, n := range nodes {
 		nodePath := joinNodePath(prefix, n.Keys)
 		if n.Name() == "vrrp-group" {
-			w, err := checkVRRPGroupTrackShape(n, nodePath, lenient)
+			// SECURITY (#5195, codex-177 A3-b2-F10): build the diagnostic path
+			// from the group IDENTITY ONLY (`vrrp-group <id>`), never n.Keys — in
+			// the Keys-packed spelling (`vrrp-group 1 authentication-key <secret>
+			// track-interface X track-interface Y`) the node's Keys run carries
+			// the authentication-key VALUE, so joinNodePath(prefix, n.Keys) would
+			// ECHO the secret into the commit error / lenient warning (logs +
+			// CLI). vrrpGroupIDKeys truncates to the value-free identity; `prefix`
+			// is composed of ancestor container keys (interface/unit/family/
+			// address) which carry no secret leaf value. Mirrors the identical
+			// guard in validateVRRPAuthenticationAST.
+			idPath := joinNodePath(prefix, vrrpGroupIDKeys(n))
+			w, err := checkVRRPGroupTrackShape(n, idPath, lenient)
 			warnings = append(warnings, w...)
 			if err != nil {
 				return nil, err
