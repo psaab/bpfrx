@@ -143,13 +143,17 @@ the bad entry — never MISLABEL a session as a wrong-but-plausible application:
   session to port 4464 was labeled as the malformed app) and accepted a signed
   spelling (`"+80"` → 80). A malformed spec now never matches.
 - **AppID catalog (`BuildCatalog`, `catalog.go`):** a catalog row is emitted
-  only for an **emittable** application — non-inverted destination range, a
-  source-port that parses, and a non-inverted source range. A bad `source-port`
-  no longer ships an unconstrained `SrcPortLow=0/High=0` row (H03/M06, which
-  would stamp ANY matching dst-port flow), and a reversed range no longer ships
-  inverted bounds (M07). An unemittable app still **consumes** its `app_id` so
-  the id sequence stays in lock-step with `compileApplications` (which bumps the
-  id in those cases); only a dest-port parse error skips the id.
+  only for an **emittable** application — a representable protocol (or an omitted
+  spec, which fans out to any-L4), non-inverted destination range, a source-port
+  that parses, and a non-inverted source range. A bad `source-port` no longer
+  ships an unconstrained `SrcPortLow=0/High=0` row (H03/M06, which would stamp
+  ANY matching dst-port flow), a reversed range no longer ships inverted bounds
+  (M07), and an EXPLICIT but unrepresentable protocol (`ProtocolNumber` ok=false,
+  e.g. `protocol junos-foobar` surviving a tolerant/HA-sync load) no longer ships
+  a Protocol:0 (HOPOPT) row that would falsely label protocol-0 sessions (#4887).
+  An unemittable app still **consumes** its `app_id` so the id sequence stays in
+  lock-step with `compileApplications` (which bumps the id in those cases); only
+  a dest-port parse error skips the id.
 - **AppNames (`BuildCatalog` and `compileApplications`, M04):** the `app_id →
   name` mapping is recorded ONLY for an emittable app. Recording it before the
   port parse left `AppNames` holding a name at an id no `CatalogEntry` can stamp
@@ -181,6 +185,21 @@ an omitted spec fans out; every explicit protocol stays single. Regression pins:
 `TestCatalogExplicitProtocol0DoesNotFanOut`,
 `TestCatalogProtocol0FromParsedConfig`, and `TestCatalogOmittedProtocolFansOut`
 in `catalog_proto0_4008_test.go`.
+
+The third case — an **explicit but unrepresentable** token (`ok == false`) — is
+handled separately (#4887): keying the fan-out on the protocol being absent
+stopped it from fanning to TCP+UDP, but the resolved byte still fell through to
+0, so it shipped a single live `Protocol:0` (HOPOPT) row whose `app_id` the Rust
+helper stamps on genuine protocol-0 sessions — a false AppID label for an
+application whose protocol was known-malformed. `BuildCatalog` and
+`compileApplications` now read `ProtocolNumber`'s `ok` bit and treat an
+unrepresentable explicit protocol as **unemittable**: no `CatalogEntry`, no
+`AppNames` name (the id is still consumed, keeping both `AppNames` maps
+byte-identical). An explicit `protocol 0` stays representable (`(0, true)`) and
+still ships its single row. Regression pins:
+`TestBuildCatalogUnrepresentableProtocolNoRow` and
+`TestBuildCatalogExplicitProtocolZeroStillShips` in
+`catalog_bad_protocol_4887_test.go`.
 
 ## ICMP type/code labeling (#3781 interim)
 

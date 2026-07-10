@@ -1191,8 +1191,8 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"feed-server": {desc: "Feed server name", args: 1, placeholder: "<server-name>", children: map[string]*schemaNode{
 			"url":             {desc: "Feed URL (takes precedence over hostname)", args: 1, placeholder: "<url>", children: nil},
 			"hostname":        {desc: "Server hostname for building per-feed URLs", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
-			"update-interval": {desc: "Feed refresh interval in seconds (default 3600)", args: 1, placeholder: "<seconds>", children: nil},
-			"hold-interval":   {desc: "Drop a feed's last-good snapshot to empty after N seconds of fetch failure; omit to retain last-good forever (default)", args: 1, placeholder: "<seconds>", children: nil},
+			"update-interval": {desc: "Feed refresh interval in seconds (default 3600)", args: 1, valueType: ValueInteger, valueDesc: "Seconds (> 0)", valueExamples: []string{"3600", "300"}, validator: ValidateInteger(1, MaxDurationSeconds), placeholder: "<seconds>", children: nil},
+			"hold-interval":   {desc: "Drop a feed's last-good snapshot to empty after N seconds of fetch failure; omit to retain last-good forever (default)", args: 1, valueType: ValueInteger, valueDesc: "Seconds (> 0)", valueExamples: []string{"86400"}, validator: ValidateInteger(1, MaxDurationSeconds), placeholder: "<seconds>", children: nil},
 			"feed-name": {desc: "Named feed on this server", args: 1, placeholder: "<feed-name>", children: map[string]*schemaNode{
 				"path": {desc: "Path on the feed server for this feed", args: 1, placeholder: "<path>", children: nil},
 			}},
