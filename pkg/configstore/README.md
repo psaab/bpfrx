@@ -584,6 +584,15 @@ owned by the `journal/` subpackage.
   actions. `limit <= 0` still reads everything. Line assembly is
   capped at 16 MiB (corrupt newline-free content is skipped, not
   buffered whole).
+- **Detail cap (#4891)** — an operator-supplied commit description is
+  bounded at `maxCommitDescriptionBytes` (4 KiB). `CommitWithDescription`
+  rejects an over-cap comment with a clear error BEFORE persist/promote
+  (the #1960 strict-at-commit doctrine), so an oversized comment never
+  bloats the journal. As a structural belt, `journalLog` also truncates
+  any `Detail` past the cap (UTF-8-safe, with an explicit
+  `…[truncated N bytes]` marker) — without the bound an oversized line
+  would exceed the 16 MiB tail-assembly cap above and the reverse-tail
+  scanner would silently discard the record it was meant to preserve.
 - **Rotation** — at append time, when the current segment reaches
   1 MiB it rotates to `.config.journal.1` (keep 2 rotated segments,
   oldest deleted). A pre-#1896 fat journal rotates to `.1` intact on

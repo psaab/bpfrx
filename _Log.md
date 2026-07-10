@@ -1,3 +1,19 @@
+## 2026-07-09 — #4891 configstore: bound the commit description so an oversized journal record cannot self-poison the tail scanner
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4891 (audit integrity). An unbounded commit description
+  marshaled into one oversized JSONL journal line; the bounded reverse-tail
+  scanner (`maxTailLineBytes` = 16 MiB) then treats a line past its cap as a
+  poisoned fragment and discards it — so an oversized-but-valid commit record
+  vanished from bounded history views after allocating memory/disk
+  proportional to its size. Added `maxCommitDescriptionBytes` (4 KiB);
+  `CommitWithDescription` now rejects an over-cap comment with a clear error
+  before any persist/promote (strict-at-commit, #1960), and `journalLog`
+  defensively truncates any over-cap `Detail` (UTF-8-safe + explicit marker)
+  as a structural boundary belt for all callers.
+  **File(s)**: pkg/configstore/store_commit.go, pkg/configstore/store_persist.go,
+  pkg/configstore/README.md, pkg/configstore/commit_description_cap_4891_test.go
+
 ## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
 
 - **Timestamp**: 2026-07-09

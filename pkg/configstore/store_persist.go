@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -261,9 +262,33 @@ func (s *Store) writeActiveMarker(tree *config.ConfigTree, committed bool) error
 // and the persist_error path must not recurse into journaling its own
 // failure (#1896).
 func (s *Store) journalLog(e *JournalEntry) {
+	// #4891 boundary belt: never hand the journal a Detail larger than the
+	// commit-description cap. An oversized JSONL line would be discarded by
+	// the journal's bounded reverse-tail scanner (maxTailLineBytes), silently
+	// dropping a real audit record. The operator commit path already rejects
+	// an over-cap description with a clear error; this bounds every OTHER
+	// Detail source (sync notes, error text) so the "no journal line poisons
+	// the tail scanner" invariant holds structurally regardless of caller.
+	if len(e.Detail) > maxCommitDescriptionBytes {
+		e.Detail = truncateDetail(e.Detail, maxCommitDescriptionBytes)
+	}
 	if err := s.journal.Log(e); err != nil {
 		slog.Warn("config journal append failed", "action", e.Action, "err", err)
 	}
+}
+
+// truncateDetail bounds an audit Detail to at most max content bytes, backing
+// off to a valid UTF-8 boundary, and appends an explicit marker so a reader
+// sees the record was clipped rather than silently losing tail bytes (#4891).
+func truncateDetail(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := s[:max]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + fmt.Sprintf("…[truncated %d bytes]", len(s)-len(cut))
 }
 
 // journalConfigHash returns the sha256 hex of the tree's Format() text
