@@ -1404,6 +1404,15 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 // from the EXACT owned tuple (the sole-delete-authority boundary, shared with
 // the lease path): Surface A never deletes a name it did not record.
 //
+// Delete-target selection (#5334): the wire delete targets the value ACTUALLY
+// LIVE at the provider. For a settled record that is AddrText; for a crash-left
+// PENDING record (#5285) it is the retained CONFIRMED prior (PriorAddrText),
+// because AddrText then holds a DESIRED value that never reached the wire.
+// Deleting AddrText for a pending record would remove nothing published and leave
+// the live prior value orphaned — so pending withdraw prefers PriorAddrText,
+// mirroring publishLocked. A pending FIRST publish (empty prior) has nothing live,
+// so the wire delete is skipped and only the on-disk state is cleaned up.
+//
 // Observability honesty (#2691 P2 MINOR M1): the ownership entry is dropped only
 // AFTER a successful wire delete; a failed delete increments deleteFail (not
 // deleteOK) and leaves the entry so the next reconcile retries. A no-op backend
@@ -1419,12 +1428,42 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 // the scope with a different address while we were unlocked, we must NOT drop the
 // newer ownership — that would orphan the freshly-published RR.
 func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRecord, backend DNSUpdater) error {
-	a, err := netip.ParseAddr(owned.AddrText)
+	// #5334: delete the value ACTUALLY LIVE on the wire, not a desired-but-
+	// unpublished one. A crash-left PENDING record (PublishPending=true, from a
+	// renumber killed between the durable write-ahead save and the wire add, #5285)
+	// carries an AddrText that holds the DESIRED address which NEVER reached the
+	// provider; the value truly live at the provider is the retained CONFIRMED prior
+	// (PriorAddrText). Withdrawing AddrText would delete a record that was never
+	// published and leave the live prior value ORPHANED in public DNS while xpf
+	// reports the scope withdrawn. Prefer PriorAddrText while pending — mirroring
+	// publishLocked, which threads PriorAddrText (never the phantom AddrText) as the
+	// value-specific replace/cleanup target for a pending record.
+	liveText := owned.AddrText
+	if owned.PublishPending {
+		liveText = owned.PriorAddrText
+	}
+	if liveText == "" {
+		// Nothing is live on the wire to delete. The reachable case is a PENDING
+		// FIRST publish (PublishPending=true, PriorAddrText=="") that crashed before
+		// its wire add ever ran: the desired value was write-ahead-saved but no RR was
+		// ever published, so there is nothing to remove. Issue NO wire delete
+		// (deleting the phantom desired value would target a record that never
+		// existed) and just clean up the on-disk ownership + runtime state so the
+		// scope stops being reported. A settled Surface A record always carries a
+		// non-empty AddrText, so a non-pending record never lands here.
+		slog.Debug("ddns surface-a: withdraw of a pending record with no confirmed prior; nothing live to delete, clearing ownership",
+			"fqdn", owned.FQDN, "pending-addr", owned.AddrText)
+		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
+		delete(m.runtime, owned.scopeOf().scopePrefix())
+		m.clearOrphan(owned)
+		return nil
+	}
+	a, err := netip.ParseAddr(liveText)
 	if err != nil {
 		// Stored rdata no longer parses (should not happen): drop the entry to
 		// avoid wedging, but issue no delete with a guessed address.
 		slog.Warn("ddns surface-a: owned record has unparseable address; dropping entry",
-			"fqdn", owned.FQDN, "addr", owned.AddrText, "err", err)
+			"fqdn", owned.FQDN, "addr", liveText, "err", err)
 		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 		delete(m.runtime, owned.scopeOf().scopePrefix())
 		m.clearOrphan(owned)
@@ -1476,7 +1515,7 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 	delete(m.runtime, owned.scopeOf().scopePrefix())
 	m.clearOrphan(owned)
-	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", owned.AddrText)
+	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", liveText)
 	return nil
 }
 

@@ -104,6 +104,23 @@ verb on any cadence is pointless. The terminal mark clears on a successful
 publish or a daemon restart (the runtime cache is rebuilt from the durable
 store), so a later provider change that adds a delete verb is re-probed.
 
+**Withdraw deletes the LIVE value, not a pending desired one (#5334).** A
+crash-left PENDING record (`PublishPending=true`, from a renumber A→B killed
+between the durable write-ahead save and the wire add, #5285) has an `AddrText`
+that holds the DESIRED value B which NEVER reached the provider, while the value
+truly live at the provider is the retained CONFIRMED prior A (`PriorAddrText`).
+If such a record is withdrawn — the binding is removed while the appliance is
+down, then a restart's Pass-2 sweep tears the scope down — `withdrawOwnedLocked`
+now targets `PriorAddrText` (A) while pending, MIRRORING `publishLocked`, which
+already threads `PriorAddrText` (never the phantom `AddrText`) as the
+value-specific replace/cleanup target. The pre-#5334 code deleted `AddrText` (B)
+unconditionally, which removed a record that was never published and left the
+live prior A ORPHANED in public DNS while xpf reported the scope withdrawn. A
+PENDING FIRST publish (empty `PriorAddrText`) has nothing live at all — the wire
+delete is SKIPPED (deleting the never-published B would target a record that
+never existed) and only the on-disk ownership + runtime state are cleaned up, no
+error. Fail-on-revert: `surface_a_withdraw_pending_5334_test.go`.
+
 | backend | withdraw mechanism | per-family withdraw? |
 |---|---|---|
 | `dyndns2` | the same update GET with `offline=YES` (the de-facto dyndns2 withdraw — dyn/no-ip/dns-o-matic take the hostname offline). Body verdict parsed like an upsert; a provider failure → non-nil error → ownership kept for retry. | **No — HOST-level** (offline=YES takes down BOTH A and AAAA). |
