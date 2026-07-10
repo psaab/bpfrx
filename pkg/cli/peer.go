@@ -12,12 +12,35 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/psaab/xpf/pkg/grpcapi"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
+
+// fabricAuthKey resolves the #4107 control-link PSK the CLI attaches to peer
+// fabric dials. It mirrors grpcapi Server.fabricAuthKey: a test seam wins, then
+// the live cluster-manager key, else nil (unkeyed / standalone -> the dial is
+// tokenless and the peer's dual-accept grace still admits it).
+func (c *CLI) fabricAuthKey() []byte {
+	if c.fabricAuthKeyFn != nil {
+		return c.fabricAuthKeyFn()
+	}
+	if c.cluster != nil {
+		return c.cluster.ControlLinkAuthKey()
+	}
+	return nil
+}
+
+// peerPort returns the peer fabric gRPC port, defaulting to 50051.
+func (c *CLI) peerPort() int {
+	if c.fabricPeerPort != 0 {
+		return c.fabricPeerPort
+	}
+	return 50051
+}
 
 // dialPeer establishes a gRPC connection to the cluster peer, trying fab0
 // then fab1 if dual-fabric is configured. Returns nil if not in cluster mode.
@@ -30,7 +53,18 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 		return nil
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// #5324: authenticate every RPC we dial on the peer's fabric listener
+		// with the #4107 control-link PSK, mirroring the daemon-side dialer
+		// (grpcapi Server.dialPeer). GetRequestMetadata is read per RPC so the
+		// token rotates with the auth window; an unkeyed cluster resolves an
+		// empty key -> no token -> the peer's dual-accept grace still admits the
+		// call (no unkeyed-cluster regression). Without this credential the peer
+		// rejects the tokenless CLI dial Unauthenticated once the fabric guard
+		// arms, silently breaking CLI peer observability/role control.
+		grpc.WithPerRPCCredentials(grpcapi.NewFabricAuthCreds(c.fabricAuthKey)),
+	}
 	if c.fabricVRFDevice != "" {
 		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{
@@ -46,8 +80,9 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 		}))
 	}
 
+	port := c.peerPort()
 	for _, ip := range peerIPs {
-		peerAddr := fmt.Sprintf("%s:50051", ip)
+		peerAddr := fmt.Sprintf("%s:%d", ip, port)
 		conn, err := grpc.NewClient(peerAddr, dialOpts...)
 		if err != nil {
 			continue

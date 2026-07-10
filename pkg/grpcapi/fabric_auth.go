@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
@@ -284,3 +285,20 @@ func (c fabricAuthCreds) GetRequestMetadata(ctx context.Context, uri ...string) 
 }
 
 func (c fabricAuthCreds) RequireTransportSecurity() bool { return false }
+
+// NewFabricAuthCreds returns the client-side per-RPC credential that attaches the
+// #4107 control-link PSK fabric token to every RPC dialed on a peer's fabric
+// listener. It is the shared-creds helper the CLI's peer dialer (pkg/cli
+// dialPeer) uses so its cross-node fabric RPCs carry the SAME time-windowed HMAC
+// token the daemon-side dialer (Server.dialPeer) already sends. Without it, once
+// the fabric auth guard arms (both nodes keyed), the peer's fabricAuthInterceptor
+// rejects the tokenless CLI dial as Unauthenticated (#5324).
+//
+// keyFn is read fresh per RPC so the token rotates with the auth window and picks
+// up a live key change; an empty key yields no token, so a not-yet-keyed / unkeyed
+// node dials tokenless and the peer's dual-accept grace still admits the call (no
+// unkeyed-cluster regression). The credential does not require transport security
+// — it rides the fabric's insecure transport, exactly like the daemon-side dialer.
+func NewFabricAuthCreds(keyFn func() []byte) credentials.PerRPCCredentials {
+	return fabricAuthCreds{keyFn: keyFn}
+}

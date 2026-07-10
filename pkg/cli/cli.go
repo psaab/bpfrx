@@ -37,21 +37,21 @@ import (
 
 // CLI is the interactive command-line interface.
 type CLI struct {
-	rl                 *readline.Instance
-	store              *configstore.Store
-	dp                 cliRuntime
-	eventBuf           *logging.EventBuffer
-	eventReader        *logging.EventReader
-	routing            *routing.Manager
-	frr                *frr.Manager
-	ipsec              *ipsec.Manager
-	dhcp               *dhcp.Manager
-	dhcpRelay          *dhcprelay.Manager
-	cluster            *cluster.Manager
-	rpmResultsFn       func() []*rpm.ProbeResult
-	ipmonStatusFn      func() []ipmon.PolicyStatus
-	natPoolAlarmsFn    func() []natpoolalarm.ActiveAlarm
-	feedsFn            func() map[string]feeds.FeedInfo
+	rl              *readline.Instance
+	store           *configstore.Store
+	dp              cliRuntime
+	eventBuf        *logging.EventBuffer
+	eventReader     *logging.EventReader
+	routing         *routing.Manager
+	frr             *frr.Manager
+	ipsec           *ipsec.Manager
+	dhcp            *dhcp.Manager
+	dhcpRelay       *dhcprelay.Manager
+	cluster         *cluster.Manager
+	rpmResultsFn    func() []*rpm.ProbeResult
+	ipmonStatusFn   func() []ipmon.PolicyStatus
+	natPoolAlarmsFn func() []natpoolalarm.ActiveAlarm
+	feedsFn         func() map[string]feeds.FeedInfo
 	// feedOverlayFn returns the live dynamic-address feed-prefix overlay
 	// (#3105): an address-name -> union-of-live-feed-CIDR-strings map, the same
 	// source the REST/gRPC simulators consume (daemon SnapshotForBindings). The
@@ -107,8 +107,16 @@ type CLI struct {
 	commitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
 
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
-	fabricPeerAddrFn   func() []string
-	fabricVRFDevice    string
+	fabricPeerAddrFn func() []string
+	fabricVRFDevice  string
+	// fabricAuthKeyFn resolves the #4107 control-link PSK the CLI attaches to
+	// peer fabric dials (dialPeer). Nil in production, where fabricAuthKey()
+	// falls back to the cluster manager's live key; a test seam sets it
+	// directly so tests need not construct a keyed cluster.Manager (#5324).
+	fabricAuthKeyFn func() []byte
+	// fabricPeerPort overrides the peer gRPC port (default 50051 when 0). A
+	// test seam so dialPeer can target an ephemeral loopback fabric server.
+	fabricPeerPort     int
 	peerSystemActionFn func(ctx context.Context, action string) (string, error)
 
 	// Monitor security flow state (per-CLI-session).
