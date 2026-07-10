@@ -179,6 +179,19 @@ sender learned about us via discovery, not our local clock at receive time.
 - DES (`decryptDES`/`encryptDES`, RFC 3414 §8) derives its IV from `privParams`
   XOR the pre-IV salt alone, so boots/time do not enter the DES IV.
 
+**Privacy salt fails closed on RNG error (RFC 3414 §8.2.1, #5453).** The
+per-message privacy salt (`msgPrivacyParameters`) MUST be unpredictable: an
+all-zero salt makes the DES IV a deterministic function of the long-term
+`privKey` (repeated-plaintext-prefix leakage) and makes the AES-128-CFB IV
+constant within a `(boots,time)` second (CFB IV reuse). The salt is generated
+through the injectable `randRead` seam (defaults to `crypto/rand.Read`).
+`encryptDES`/`encryptAES128` **check the `randRead` error** and return it rather
+than proceeding with a zero salt; `encryptPDU` propagates it, and
+`buildV3Response` **fails closed** — it drops the response (returns `nil`, so no
+datagram is written) instead of downgrading to a plaintext or zero-salt PDU.
+An RNG failure (getrandom `EAGAIN` at early boot, a FIPS module error) therefore
+yields *no reply* to an `authPriv` request, never an insecurely encrypted one.
+
 ### engineBoots persistence
 
 `engineBoots` is loaded, incremented, and persisted once at agent construction
