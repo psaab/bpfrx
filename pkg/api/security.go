@@ -523,6 +523,29 @@ func hostInboundToREST(a *dpuserspace.HostInboundAdmission) *MatchPoliciesHostIn
 	}
 }
 
+// matchPoliciesSelectorKeys is the exact, ordered set of query-string
+// selectors the match-policies handler consults. It is the SINGLE source of
+// truth for BOTH the #3709 duplicate-scalar check AND the #5316 unknown-key
+// allowlist: a selector is added here (and only here), and both the reads and
+// the two validation passes derive from it, so a new dimension cannot be
+// duplicate-checked-but-not-allowlisted (or vice versa) and a caller typo can
+// never silently re-open the fail-open gap.
+var matchPoliciesSelectorKeys = []string{
+	"from_zone", "to_zone", "src_ip", "dst_ip",
+	"src_port", "dst_port", "protocol", "icmp_type", "icmp_code",
+}
+
+// isMatchPoliciesSelector reports whether key is a recognized match-policies
+// selector (a member of matchPoliciesSelectorKeys).
+func isMatchPoliciesSelector(key string) bool {
+	for _, k := range matchPoliciesSelectorKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	// #3709: validate request grammar BEFORE the cfg == nil verdict so a
 	// malformed / duplicate / missing-zone query fails the SAME way during the
@@ -540,14 +563,40 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	// tested, each certifying a verdict for a packet the operator may not have
 	// typed. There is no correct silent pick, so a repeat is a 400, matching the
 	// strict CLI/gRPC parsers (policymatch.ParseSelectorArgs / showTestPolicy).
-	for _, key := range []string{
-		"from_zone", "to_zone", "src_ip", "dst_ip",
-		"src_port", "dst_port", "protocol", "icmp_type", "icmp_code",
-	} {
+	for _, key := range matchPoliciesSelectorKeys {
 		if len(q[key]) > 1 {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("selector %q specified more than once", key))
 			return
 		}
+	}
+
+	// #5316: reject an UNKNOWN / misspelled selector key (fail closed). The
+	// handler reads ONLY matchPoliciesSelectorKeys; any other key is never
+	// examined, so a typo such as `protcol` for `protocol` silently degrades
+	// that dimension to the wildcard-any default — q.Get("protocol") returns
+	// "" — and the shared simulator can certify a broad PERMIT for a packet
+	// class the caller never intended to test. That is a FAIL-OPEN on a
+	// security-verification endpoint. Enumerate every key the caller supplied
+	// and 400 any that is not in the selector allowlist, naming the offender.
+	// The allowlist is the SAME slice the reads use, so adding a selector later
+	// cannot re-open the gap. Absent keys are unchanged: an unspecified
+	// dimension is still the intentional match-any wildcard — only UNKNOWN keys
+	// are rejected, not missing ones. Reached AFTER the duplicate check so a
+	// repeated known selector still surfaces its #3709 duplicate error, and
+	// (like the checks above) BEFORE the cfg == nil verdict so the boot window
+	// rejects an unknown key identically to the config-present path.
+	var unknown []string
+	for key := range q {
+		if !isMatchPoliciesSelector(key) {
+			unknown = append(unknown, key)
+		}
+	}
+	if len(unknown) > 0 {
+		// Sort so the reported key is deterministic when a caller supplies
+		// several unknown keys (map iteration order is randomized).
+		sort.Strings(unknown)
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown selector parameter: %s", unknown[0]))
+		return
 	}
 
 	fromZone := q.Get("from_zone")
