@@ -1,0 +1,78 @@
+package diagcmd
+
+import (
+	"errors"
+	"sync"
+)
+
+// MaxConcurrentDiagnostics bounds how many host-level ping/traceroute
+// diagnostics may run at once across EVERY control surface that exposes
+// them (the REST API and the gRPC API share the single DefaultLimiter
+// below). Each in-flight diagnostic holds a child process, its output
+// pipes, a handler goroutine and — on gRPC — a stream, for up to the
+// 150s diagExecCeiling. Without an aggregate bound a burst of concurrent
+// diagnostic requests can pin hundreds/thousands of PIDs/FDs/goroutines
+// and starve the control plane that drives the dataplane (#5057).
+//
+// The value is deliberately small: legitimate operator/automation use
+// runs a handful of diagnostics at once, while a firewall must never let
+// a diagnostic flood exhaust host resources. A per-job deadline (present
+// via pingExecTimeout/diagTracerouteTimeout in the API packages) plus
+// this aggregate concurrency bound together cap the worst-case resource
+// footprint.
+const MaxConcurrentDiagnostics = 4
+
+// ErrBusy is returned by Limiter.Acquire when the concurrency cap is
+// already reached. Callers map it to their surface's overload signal:
+// HTTP 429 (REST) / codes.ResourceExhausted (gRPC).
+var ErrBusy = errors.New("diagnostic concurrency limit reached")
+
+// Limiter is a fixed-capacity counting semaphore bounding concurrent
+// diagnostic executions. Acquire is fail-fast (non-blocking): excess
+// callers are rejected immediately rather than queued, so a request
+// flood cannot build an unbounded backlog of waiters. The zero value is
+// unusable; construct with NewLimiter.
+type Limiter struct {
+	sem chan struct{}
+}
+
+// NewLimiter returns a Limiter admitting at most n concurrent holders.
+// n < 1 is clamped to 1 so a misconfiguration cannot disable the bound.
+func NewLimiter(n int) *Limiter {
+	if n < 1 {
+		n = 1
+	}
+	return &Limiter{sem: make(chan struct{}, n)}
+}
+
+// Acquire takes one slot without blocking. On success it returns a
+// release function and a nil error; the caller MUST defer release so the
+// slot is returned on every exit path (success, error, timeout, context
+// cancel, panic). When the cap is already reached it returns ErrBusy and
+// a nil release — do NOT call release in that case.
+//
+// The returned release is idempotent via sync.Once: an accidental double
+// defer cannot over-release and free another caller's slot (which would
+// re-open the very DoS window this limiter closes).
+func (l *Limiter) Acquire() (release func(), err error) {
+	select {
+	case l.sem <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-l.sem }) }, nil
+	default:
+		return nil, ErrBusy
+	}
+}
+
+// InFlight reports the number of slots currently held. Intended for
+// tests and future metrics; it is a point-in-time read.
+func (l *Limiter) InFlight() int { return len(l.sem) }
+
+// Cap reports the maximum number of concurrent holders.
+func (l *Limiter) Cap() int { return cap(l.sem) }
+
+// DefaultLimiter is the process-wide diagnostic limiter shared by the
+// REST and gRPC ping/traceroute handlers, so one aggregate cap covers
+// both surfaces (a diagnostic admitted over REST and one admitted over
+// gRPC draw from the same MaxConcurrentDiagnostics budget).
+var DefaultLimiter = NewLimiter(MaxConcurrentDiagnostics)

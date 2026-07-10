@@ -53,6 +53,21 @@ func checkDiagArgs(target, source, routingInstance string) error {
 	return nil
 }
 
+// diagLimiter is the aggregate concurrency bound for the gRPC
+// ping/traceroute RPCs. It points at the process-wide
+// diagcmd.DefaultLimiter so a diagnostic admitted over gRPC and one
+// admitted over REST draw from the SAME MaxConcurrentDiagnostics budget
+// — a request flood on either surface cannot exhaust host PIDs/FDs/
+// goroutines (#5057). It is a package var so a test can swap in a fresh
+// limiter without mutating global state.
+var diagLimiter = diagcmd.DefaultLimiter
+
+// streamDiag is the diagnostic command runner used by Ping/Traceroute.
+// It is a package var so a test can inject a fake slow diagnostic and
+// exercise the concurrency limiter without spawning real ping/traceroute
+// subprocesses. It defaults to streamDiagCmd.
+var streamDiag = streamDiagCmd
+
 func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.PingResponse]) error {
 	if req.Target == "" {
 		return status.Error(codes.InvalidArgument, "target required")
@@ -67,9 +82,22 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 	if count > 100 {
 		count = 100
 	}
+
+	// Aggregate concurrency bound (#5057): acquire a diagnostic slot
+	// before spawning any child. Fail-fast with RESOURCE_EXHAUSTED when
+	// the cap is reached so a request flood is rejected immediately
+	// instead of piling up processes/FDs/goroutines/streams. Release on
+	// EVERY path via defer (success, exec error, ctx timeout/cancel).
+	release, err := diagLimiter.Acquire()
+	if err != nil {
+		return status.Error(codes.ResourceExhausted,
+			"diagnostic concurrency limit reached; retry shortly")
+	}
+	defer release()
+
 	cmd := buildPingArgv(req, count)
 
-	return streamDiagCmd(stream.Context(), pingExecTimeout(count), cmd, func(line string) error {
+	return streamDiag(stream.Context(), pingExecTimeout(count), cmd, func(line string) error {
 		return stream.Send(&pb.PingResponse{Output: line})
 	})
 }
@@ -100,9 +128,19 @@ func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreami
 	if err := checkDiagArgs(req.Target, req.Source, req.RoutingInstance); err != nil {
 		return err
 	}
+
+	// Aggregate concurrency bound (#5057): see Ping. One shared limiter
+	// covers ping AND traceroute across gRPC and REST.
+	release, err := diagLimiter.Acquire()
+	if err != nil {
+		return status.Error(codes.ResourceExhausted,
+			"diagnostic concurrency limit reached; retry shortly")
+	}
+	defer release()
+
 	cmd := buildTracerouteArgv(req)
 
-	return streamDiagCmd(stream.Context(), diagTracerouteTimeout, cmd, func(line string) error {
+	return streamDiag(stream.Context(), diagTracerouteTimeout, cmd, func(line string) error {
 		return stream.Send(&pb.TracerouteResponse{Output: line})
 	})
 }

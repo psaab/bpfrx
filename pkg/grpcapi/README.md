@@ -259,6 +259,19 @@ contract.
   user-supplied target after a `--` end-of-options separator so a
   `-`-prefixed target is an operand, not a flag (option-confusion
   hardening, #2084).
+  Per-job deadlines are necessary but NOT sufficient: without an
+  aggregate bound a request flood holds hundreds of processes/FDs/
+  goroutines/streams at once and starves the control plane. So Ping and
+  Traceroute first take a slot from the process-wide
+  `diagcmd.DefaultLimiter` (`MaxConcurrentDiagnostics = 4`) via the
+  `diagLimiter` package var — SHARED with the REST ping/traceroute
+  handlers, so one aggregate cap covers BOTH surfaces (#5057). Acquire is
+  fail-fast: when the cap is reached the RPC returns
+  `codes.ResourceExhausted` immediately (no queue, no wait) and the slot
+  is released via `defer` on every path (success, exec error, ctx
+  timeout/cancel). `streamDiagCmd` is called through the `streamDiag`
+  package-var seam so a test can inject a fake slow diagnostic and assert
+  the cap without real subprocesses.
 - Policy text views (`server_show_policies_text.go`) must render BOTH
   zone-pair AND global policies (#3059). `showPoliciesHitCount` and
   `showPoliciesDetail` loop `cfg.Security.Policies` and then append a

@@ -90,6 +90,28 @@ func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, TextResponse{Output: b.String()})
 }
 
+// diagLimiter is the aggregate concurrency bound for the REST
+// ping/traceroute handlers. It points at the process-wide
+// diagcmd.DefaultLimiter so a diagnostic admitted over REST and one
+// admitted over gRPC draw from the SAME MaxConcurrentDiagnostics budget
+// — a request flood on either surface cannot exhaust host PIDs/FDs/
+// goroutines (#5057). It is a package var so a test can swap in a fresh
+// limiter without mutating global state.
+var diagLimiter = diagcmd.DefaultLimiter
+
+// diagRun executes a diagnostic argv and returns combined stdout+stderr.
+// It is a package var so a test can inject a fake slow diagnostic and
+// exercise the concurrency limiter without spawning real ping/traceroute
+// subprocesses. The default mirrors the handlers' prior inline behavior:
+// CommandContext under the caller's request-sized deadline, with
+// WaitDelay capping the post-kill pipe-drain window (#1805).
+var diagRun = func(ctx context.Context, argv []string) (string, error) {
+	c := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	c.WaitDelay = requestExecWaitDelay
+	out, err := c.CombinedOutput()
+	return string(out), err
+}
+
 func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 	var req PingRequest
 	if !decodeJSONBody(w, r, &req) {
@@ -108,18 +130,26 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 		count = 100
 	}
 
+	// Aggregate concurrency bound (#5057): acquire a diagnostic slot
+	// before spawning any child. Fail-fast with 429 when the cap is
+	// reached so a request flood is rejected immediately instead of
+	// piling up processes/FDs/goroutines. Release on EVERY path via
+	// defer (success, exec error, ctx timeout/cancel, panic).
+	release, err := diagLimiter.Acquire()
+	if err != nil {
+		writeError(w, http.StatusTooManyRequests,
+			"diagnostic concurrency limit reached; retry shortly")
+		return
+	}
+	defer release()
+
 	cmd := buildPingArgv(req, count)
 
 	// Request-sized budget (#1819): count × 1s + slack, 30s floor,
 	// 150s ceiling — see pingExecTimeout in exec_timeout.go.
 	ctx, cancel := context.WithTimeout(r.Context(), pingExecTimeout(count))
 	defer cancel()
-	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
-	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
-	// that inherited the output pipe cannot block Wait past the ctx kill.
-	c.WaitDelay = requestExecWaitDelay
-	out, err := c.CombinedOutput()
-	output := string(out)
+	output, err := diagRun(ctx, cmd)
 	if err != nil {
 		output += "\n" + err.Error()
 	}
@@ -136,18 +166,23 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Aggregate concurrency bound (#5057): see pingHandler. One shared
+	// limiter covers ping AND traceroute across REST and gRPC.
+	release, err := diagLimiter.Acquire()
+	if err != nil {
+		writeError(w, http.StatusTooManyRequests,
+			"diagnostic concurrency limit reached; retry shortly")
+		return
+	}
+	defer release()
+
 	cmd := buildTracerouteArgv(req)
 
 	// Shared diag budget (#1819): same 60s as the gRPC Traceroute path
 	// — see diagTracerouteTimeout in exec_timeout.go.
 	ctx, cancel := context.WithTimeout(r.Context(), diagTracerouteTimeout)
 	defer cancel()
-	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
-	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
-	// that inherited the output pipe cannot block Wait past the ctx kill.
-	c.WaitDelay = requestExecWaitDelay
-	out, err := c.CombinedOutput()
-	output := string(out)
+	output, err := diagRun(ctx, cmd)
 	if err != nil {
 		output += "\n" + err.Error()
 	}
