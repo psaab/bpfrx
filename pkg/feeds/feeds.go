@@ -170,26 +170,73 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 	}
 
 	m.mu.Lock()
-	for _, fsCfg := range daCfg.FeedServers {
+	defer m.mu.Unlock()
+
+	// Build a COMPLETE, deterministic, de-duplicated plan BEFORE starting any
+	// refresh goroutine (#4913). daCfg.FeedServers is a Go map, so ranging it
+	// visits servers in nondeterministic order, and two feed-servers can
+	// declare the SAME effective feed name. The pre-#4913 loop assigned
+	// m.feeds[name] = fs and started a refresh loop per entry as it went, so a
+	// duplicate name OVERWROTE the earlier map entry — orphaning that worker's
+	// cancel func (StopAll then cancels only the survivor, so the overwritten
+	// loop kept fetching / logging / firing onUpdate until the daemon's parent
+	// context ended) — and enforcement read whichever provider won the last map
+	// iteration (nondeterministic across commits / restarts). Sorting the
+	// server keys and keeping only the FIRST occurrence of each effective feed
+	// name makes the winner deterministic and guarantees exactly one refresh
+	// loop — hence exactly one cancel — per name, so no goroutine is orphaned.
+	type feedPlan struct {
+		name     string
+		url      string
+		hold     time.Duration
+		interval time.Duration
+		server   string
+	}
+	serverNames := make([]string, 0, len(daCfg.FeedServers))
+	for sn := range daCfg.FeedServers {
+		serverNames = append(serverNames, sn)
+	}
+	sort.Strings(serverNames)
+
+	var plans []feedPlan
+	seen := make(map[string]bool)
+	for _, sn := range serverNames {
+		fsCfg := daCfg.FeedServers[sn]
+		if fsCfg == nil {
+			continue
+		}
 		baseURL := resolveBaseURL(fsCfg)
 		if baseURL == "" {
 			continue
 		}
-
 		interval := time.Duration(fsCfg.UpdateInterval) * time.Second
 		if interval <= 0 {
 			interval = time.Hour
 		}
 		hold := resolveHoldInterval(fsCfg.HoldInterval)
-		// Human-readable hold for the start log: retainForever (the default)
-		// would otherwise log as "0s".
-		holdStr := "forever"
-		if hold > 0 {
-			holdStr = hold.String()
+
+		plan := func(name, url string) {
+			if name == "" {
+				return
+			}
+			if seen[name] {
+				// A feed name is an identity: two feeds sharing one would race
+				// on m.feeds[name] and orphan a refresh loop. Keep the first
+				// (deterministic winner: lexicographically-first server, then
+				// declaration order) and drop the duplicate with a warning. The
+				// strict compile gate (validateDynamicAddressFeedNameUniqueness
+				// Strict) rejects this at commit; this de-dup is the runtime
+				// safety net for a leniently-loaded / peer-synced config.
+				slog.Warn("dynamic-address: duplicate feed name ignored — only the first declaration starts a refresh loop (declare each feed name once)",
+					"name", name, "server", fsCfg.Name, "url", url)
+				return
+			}
+			seen[name] = true
+			plans = append(plans, feedPlan{name: name, url: url, hold: hold, interval: interval, server: fsCfg.Name})
 		}
 
 		if len(fsCfg.FeedEntries) > 0 {
-			// Multiple named feeds with per-feed paths
+			// Multiple named feeds with per-feed paths.
 			for _, fe := range fsCfg.FeedEntries {
 				feedURL := baseURL
 				if fe.Path != "" {
@@ -199,41 +246,40 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 					}
 					feedURL = baseURL + p
 				}
-				feedCtx, cancel := context.WithCancel(ctx)
-				fs := &feedState{
-					name:         fe.Name,
-					url:          feedURL,
-					holdInterval: hold,
-					cancel:       cancel,
-				}
-				m.feeds[fe.Name] = fs
-				warnPlaintextFeed(fe.Name, feedURL)
-				go m.refreshLoop(feedCtx, fs, interval)
-				slog.Info("dynamic address feed started",
-					"name", fe.Name, "server", fsCfg.Name, "url", feedURL,
-					"interval", interval, "hold", holdStr)
+				plan(fe.Name, feedURL)
 			}
 		} else {
-			// Single feed (backward compat): keyed by FeedName or server name
+			// Single feed (backward compat): keyed by FeedName or server name.
 			key := fsCfg.FeedName
 			if key == "" {
 				key = fsCfg.Name
 			}
-			feedCtx, cancel := context.WithCancel(ctx)
-			fs := &feedState{
-				name:         key,
-				url:          baseURL,
-				holdInterval: hold,
-				cancel:       cancel,
-			}
-			m.feeds[key] = fs
-			warnPlaintextFeed(key, baseURL)
-			go m.refreshLoop(feedCtx, fs, interval)
-			slog.Info("dynamic address feed started",
-				"name", key, "url", baseURL, "interval", interval, "hold", holdStr)
+			plan(key, baseURL)
 		}
 	}
-	m.mu.Unlock()
+
+	// Start exactly one refresh loop per unique planned feed.
+	for _, p := range plans {
+		// Human-readable hold for the start log: retainForever (the default)
+		// would otherwise log as "0s".
+		holdStr := "forever"
+		if p.hold > 0 {
+			holdStr = p.hold.String()
+		}
+		feedCtx, cancel := context.WithCancel(ctx)
+		fs := &feedState{
+			name:         p.name,
+			url:          p.url,
+			holdInterval: p.hold,
+			cancel:       cancel,
+		}
+		m.feeds[p.name] = fs
+		warnPlaintextFeed(p.name, p.url)
+		go m.refreshLoop(feedCtx, fs, p.interval)
+		slog.Info("dynamic address feed started",
+			"name", p.name, "server", p.server, "url", p.url,
+			"interval", p.interval, "hold", holdStr)
+	}
 }
 
 // StopAll cancels all running feed refresh goroutines.
