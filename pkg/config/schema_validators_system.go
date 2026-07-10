@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -182,6 +184,168 @@ func ValidateRingEntries(raw string, _ *Config) error {
 	}
 	if v&(v-1) != 0 {
 		return fmt.Errorf("ring-entries must be a power of two in [1..%d] (got %d)", MaxRingEntries, v)
+	}
+	return nil
+}
+
+// #4902: several untyped `system` string leaves are rendered VERBATIM into
+// root-owned host service / resolver config files that are then reloaded:
+//
+//   - `system ntp server <s>`                  -> chrony sources
+//   - `system domain-name`/`domain-search`     -> Domains=/search (resolved/resolv.conf)
+//   - `system services ssh key-exchange|ciphers|macs` -> sshd drop-in
+//   - `system syslog file <name>`/`user <user>`-> /etc/rsyslog.d drop-in + filename
+//
+// The lexer decodes `\n` inside a quoted string into a literal newline, so a
+// crafted value could inject an additional directive line or make a reload
+// fail. The global control-char gate (freetext.go: validateNodesControlChars
+// strict-rejects, SanitizeTreeControlChars scrubs on lenient load) closes the
+// NEWLINE vector, but a value that is control-char-clean yet still outside the
+// token's grammar — an embedded SPACE (a second directive token), a path
+// separator in a syslog filename, or a malformed value — is not caught by that
+// generic gate. It commits, reaches the root-owned config, and either injects
+// an extra token or persistently fails the service reload (read as ordinary
+// apply degradation). These typed validators constrain each rendered token to
+// its real grammar, strict at commit-check (SchemaValidate). The tolerant load
+// / peer-sync path keeps booting (#1960); the render-side belts (pkg/daemon
+// renderChronySources / buildSSHDConfig / applySyslogFiles / mergeDNSInput)
+// re-apply the same checks so a leniently-loaded bad value never reaches the
+// generated file.
+
+// sshAlgorithmRE is the safe OpenSSH algorithm-token shape for a single
+// KexAlgorithms / Ciphers / MACs entry. OpenSSH algorithm names are letters,
+// digits, and the punctuation `- _ . @ +` (e.g. curve25519-sha256@libssh.org,
+// diffie-hellman-group-exchange-sha256, hmac-sha2-256-etm@openssh.com,
+// aes256-gcm@openssh.com). It deliberately excludes whitespace, control
+// characters, and the comma that joins the list — a token carrying a comma or
+// space would smuggle a second sshd directive token onto the rendered line (or
+// fail the sshd reload).
+var sshAlgorithmRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@+-]*$`)
+
+// syslogNameRE is the safe shape for a `system syslog file <name>` filename or
+// a `system syslog user <user>` account token. The name is formatted into a
+// file path (/var/log/<name>, /etc/rsyslog.d/10-xpf-<name>.conf) and into the
+// rsyslog drop-in body, so it must not contain a path separator, whitespace,
+// control characters, or rsyslog metacharacters. A leading alnum plus
+// [A-Za-z0-9._-] covers real log/account names while excluding `/`, spaces, and
+// directive punctuation.
+var syslogNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// validateDNSNameShape checks that name is a syntactically valid DNS name: LDH
+// labels (letters, digits, hyphens; no leading/trailing hyphen) joined by dots,
+// an optional single trailing dot, within the RFC length caps. `what` names the
+// leaf for the error. A control-char or space value fails here (space is
+// non-LDH), so a domain/hostname value cannot inject a second config token.
+func validateDNSNameShape(name, what string) error {
+	stripped := strings.TrimSuffix(name, ".")
+	if stripped == "" {
+		return fmt.Errorf("%s %q has no labels", what, name)
+	}
+	if len(stripped) > maxDNSNameLen {
+		return fmt.Errorf("%s %q exceeds %d octets", what, name, maxDNSNameLen)
+	}
+	for _, lbl := range strings.Split(stripped, ".") {
+		if lbl == "" {
+			return fmt.Errorf("%s %q has an empty label (leading/trailing/doubled dot)", what, name)
+		}
+		if len(lbl) > maxDNSLabelLen {
+			return fmt.Errorf("%s label %q exceeds %d octets", what, lbl, maxDNSLabelLen)
+		}
+		if lbl[0] == '-' || lbl[len(lbl)-1] == '-' {
+			return fmt.Errorf("%s label %q begins or ends with '-'", what, lbl)
+		}
+		for _, r := range lbl {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+				r >= '0' && r <= '9', r == '-':
+				// LDH.
+			default:
+				return fmt.Errorf("%s %q contains the non-LDH character %q "+
+					"(only letters, digits, hyphens, and dots are allowed)", what, name, r)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateNTPServer accepts a `system ntp server` value that is either a bare
+// IP address (chrony `server`/`pool` target) or a DNS hostname. It rejects an
+// embedded space (a second chrony directive token such as `trust`/`prefer`), a
+// control character, or a malformed value — any of which would inject an extra
+// token into the rendered chrony source line or fail the chrony reload (#4902).
+func ValidateNTPServer(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing NTP server (expected an IP address or hostname)")
+	}
+	if net.ParseIP(raw) != nil {
+		return nil
+	}
+	return validateDNSNameShape(raw, "ntp server")
+}
+
+// ValidateDNSDomain accepts a `system domain-name` / `system domain-search`
+// value: a DNS domain name (LDH labels, optional trailing dot). An empty value
+// is accepted (the compiler/renderer skips it); a space/control/malformed value
+// is rejected so it cannot inject an extra token into the resolved.conf
+// `Domains=` line or the resolv.conf `search` line (#4902).
+func ValidateDNSDomain(raw string, _ *Config) error {
+	if raw == "" {
+		return nil
+	}
+	return validateDNSNameShape(raw, "domain")
+}
+
+// ValidateSSHAlgorithm accepts one `system services ssh key-exchange | ciphers
+// | macs` token: a safe OpenSSH algorithm name (sshAlgorithmRE). It rejects a
+// comma (the list separator), whitespace, control characters, or any other
+// metacharacter so a crafted token cannot smuggle a second sshd directive token
+// onto the rendered KexAlgorithms/Ciphers/MACs line or fail the sshd reload
+// (#4902).
+func ValidateSSHAlgorithm(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing SSH algorithm name")
+	}
+	if !sshAlgorithmRE.MatchString(raw) {
+		return fmt.Errorf("invalid SSH algorithm %q (must match %s: a letter or digit "+
+			"followed by letters, digits, or the punctuation . _ @ + - ; no whitespace, "+
+			"commas, or control characters)", raw, sshAlgorithmRE.String())
+	}
+	return nil
+}
+
+// ValidateSyslogFileName accepts a `system syslog file <name>` destination
+// name. The name is formatted into a file path (/var/log/<name>) and a drop-in
+// filename (/etc/rsyslog.d/10-xpf-<name>.conf), so it must be a safe base name
+// with no path separator, no `..`, no whitespace, and no rsyslog
+// metacharacters (#4902).
+func ValidateSyslogFileName(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing syslog file name")
+	}
+	if strings.Contains(raw, "..") || !syslogNameRE.MatchString(raw) {
+		return fmt.Errorf("invalid syslog file name %q (must match %s: a letter or digit "+
+			"followed by letters, digits, or . _ - ; no '/', '..', whitespace, or control "+
+			"characters — it is written to /var/log/<name>)", raw, syslogNameRE.String())
+	}
+	return nil
+}
+
+// ValidateSyslogUser accepts a `system syslog user <user>` destination: either
+// the wildcard `*` (all logged-in users) or a safe account name (syslogNameRE).
+// The value is formatted into a drop-in filename and the rsyslog
+// `:omusrmsg:<user>` directive, so a path separator, whitespace, or control
+// character is rejected (#4902).
+func ValidateSyslogUser(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing syslog user")
+	}
+	if raw == "*" {
+		return nil
+	}
+	if strings.Contains(raw, "..") || !syslogNameRE.MatchString(raw) {
+		return fmt.Errorf("invalid syslog user %q (must be '*' or match %s: a letter or "+
+			"digit followed by letters, digits, or . _ - ; no '/', whitespace, or control "+
+			"characters)", raw, syslogNameRE.String())
 	}
 	return nil
 }
