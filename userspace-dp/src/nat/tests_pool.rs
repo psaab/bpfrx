@@ -11,7 +11,9 @@ use super::allocator::{
     PersistentSourceKey, PoolAddressFamily, TranslatedTuple, deterministic_indices_v6,
     reverse_deterministic_v4, reverse_deterministic_v6, sticky_pool_index,
 };
-use super::source::{PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFlowKey};
+use super::source::{
+    PersistentNatPermit, SOURCE_NAT_PROTO_ANY, SourceNatFailureReason, SourceNatFlowKey,
+};
 use super::destination::{PROTO_ANY, PROTO_TCP, PROTO_UDP};
 use super::*;
 use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6};
@@ -511,6 +513,339 @@ fn pool_snat_no_translation_preserves_source_port() {
     assert_eq!(
         status[0].used_ports, 0,
         "no-translation must NOT allocate a pool port (source port preserved)",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #5269: address-only occupancy tokens (port no-translation / port-less).
+//
+// The address-only branch selects a pool address but must ALSO mint an
+// occupancy token keyed on the translated REVERSE identity (protocol, pool
+// address, PRESERVED source port, remote endpoint), so two internal flows behind
+// a one-address pool cannot both receive the SAME public tuple. Before the fix
+// the branch minted nothing: a second colliding flow got an identical translated
+// tuple the reverse (1:N) index could not disambiguate, stranding / mis-
+// delivering the later flow's replies under the first session. A genuinely-
+// colliding second flow is now DENIED as exhaustion (mirroring how a full port-
+// translating pool behaves and the vSRX address-only capacity limit); a non-
+// colliding flow mints its own token and succeeds.
+// ---------------------------------------------------------------------------
+
+fn addr_only_lookup(
+    rules: &[SourceNatRule],
+    src_ip: &str,
+    src_port: u16,
+    dst_ip: &str,
+    dst_port: u16,
+    protocol: u8,
+) -> SourceNatLookup {
+    let mut counter = None;
+    match_source_nat_result_for_tuple(
+        rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        src_ip.parse().expect("src"),
+        dst_ip.parse().expect("dst"),
+        protocol,
+        src_port,
+        dst_port,
+        None,
+        None,
+        0,
+        false,
+        false,
+        &mut counter,
+    )
+}
+
+fn one_address_notrans_rule() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-notrans".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        pool_no_translation: true,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+// #5269 FAIL-ON-REVERT: `port no-translation`, ONE rule / ONE pool / ONE
+// address. Flow A gets the public tuple AND an occupancy token; the reverse
+// index resolves the public tuple to exactly A. Flow B (a different internal
+// host, SAME preserved port + SAME remote) would collide on the identical public
+// tuple and MUST be denied as exhaustion — not handed the duplicate. Reverting
+// the fix (drop the `reserve_address_only` mint) makes B return `Matched` with
+// A's rewrite_src and `rewrite_src_port: None` — an unowned duplicate — turning
+// the `Unavailable` assertion RED.
+#[test]
+fn pool_snat_no_translation_collision_denies_second_flow_5269() {
+    let rules = one_address_notrans_rule();
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    // Wire contract (unchanged): the source port is PRESERVED, never rewritten.
+    assert_eq!(a.rewrite_src_port, None);
+
+    // The reverse index resolves the public tuple to EXACTLY flow A.
+    let flow_a = SourceNatFlowKey {
+        protocol: PROTO_TCP,
+        src_ip: "10.0.1.100".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners.len(), 1, "flow A must mint exactly one occupancy token");
+    assert_eq!(owners[0].1, flow_a, "reverse index must resolve to flow A");
+    assert_eq!(
+        owners[0].0.translated_ip,
+        "203.0.113.1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(owners[0].0.translated_port, 12345);
+
+    // Flow B: DIFFERENT internal host, SAME preserved port + SAME remote -> SAME
+    // public tuple (203.0.113.1:12345 -> 8.8.8.8:443). It must fail closed.
+    match addr_only_lookup(&rules, "10.0.1.101", 12345, "8.8.8.8", 443, PROTO_TCP) {
+        SourceNatLookup::Unavailable(f) => assert_eq!(
+            f.reason,
+            SourceNatFailureReason::AllocatorExhausted,
+            "colliding address-only flow must fail closed as exhaustion",
+        ),
+        other => panic!("flow B must be denied (exhaustion), got {other:?}"),
+    }
+
+    // The reverse index STILL resolves uniquely to flow A — B minted nothing.
+    let owners_after = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners_after.len(), 1, "denied flow B must not add a token");
+    assert_eq!(owners_after[0].1, flow_a);
+
+    // No pool PORT is consumed (address-only tokens are off the port bitmap).
+    let status = source_nat_pool_statuses(&rules);
+    assert_eq!(status[0].used_ports, 0);
+    assert_eq!(status[0].live_flows, 1, "only flow A is tracked");
+}
+
+// #5269: the address-only token is freed by the SAME teardown path used for PAT
+// ports (`release_source_nat_allocation`), so a colliding identity becomes
+// reusable after the first flow tears down — no leak.
+#[test]
+fn pool_snat_no_translation_token_released_on_teardown_5269() {
+    let rules = one_address_notrans_rule();
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Tear down flow A. `release_source_nat_allocation` now derives the preserved
+    // port from the flow key (the decision left `rewrite_src_port` unset) and
+    // clears the reverse-identity token.
+    let key_a = session_key_from_src("10.0.1.100", 12345, "8.8.8.8", 443);
+    release_source_nat_allocation(&rules, &key_a, a, false, 1);
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        0,
+        "token must be freed on teardown (no leak)",
+    );
+    assert_eq!(source_nat_pool_statuses(&rules)[0].live_flows, 0);
+
+    // The previously-colliding flow B now succeeds (identity is free again).
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.101",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(b.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+}
+
+// #5269 FAIL-ON-REVERT: two port-less (GRE) flows to a one-address pool. Same
+// remote -> indistinguishable reverse identity -> the second is denied as
+// exhaustion. Different remote -> distinct reverse identity -> disambiguated and
+// admitted. Either way the reverse index is unambiguous. Reverting the mint lets
+// the same-remote second flow return `Matched` with the duplicate `(pool_addr)`
+// tuple (`rewrite_src_port: None`), turning the `Unavailable` assertion RED.
+#[test]
+fn pool_snat_portless_gre_collision_and_disambiguation_5269() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-gre".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    // Flow A: GRE 10.0.1.100 -> 8.8.8.8 (port-less; src/dst port 0).
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        0,
+        "8.8.8.8",
+        0,
+        PROTO_GRE,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(a.rewrite_src_port, None, "port-less flow must not carry a port");
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Flow B: GRE from a DIFFERENT host to the SAME remote — indistinguishable on
+    // the reverse path -> denied as exhaustion (address-only capacity limit).
+    match addr_only_lookup(&rules, "10.0.1.101", 0, "8.8.8.8", 0, PROTO_GRE) {
+        SourceNatLookup::Unavailable(f) => {
+            assert_eq!(f.reason, SourceNatFailureReason::AllocatorExhausted)
+        }
+        other => panic!("colliding GRE flow must be denied, got {other:?}"),
+    }
+    assert_eq!(rules[0].pool_allocator.debug_address_only_owners().len(), 1);
+
+    // Flow C: GRE from a third host to a DIFFERENT remote — reverse identity
+    // differs by remote IP -> disambiguated and admitted.
+    let c = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.102",
+        0,
+        "9.9.9.9",
+        0,
+        PROTO_GRE,
+    ));
+    assert_eq!(c.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(c.rewrite_src_port, None);
+
+    // Two owners, each keyed by a DISTINCT remote — no two flows share a public
+    // reverse tuple, and each identity resolves to exactly one owning flow.
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners.len(), 2, "A (8.8.8.8) and C (9.9.9.9) own distinct identities");
+    let mut remotes: Vec<IpAddr> = owners.iter().map(|(k, _)| k.dst_ip).collect();
+    remotes.sort();
+    assert_eq!(
+        remotes,
+        vec![
+            "8.8.8.8".parse::<IpAddr>().unwrap(),
+            "9.9.9.9".parse::<IpAddr>().unwrap()
+        ],
+    );
+    let mut owning_srcs: Vec<IpAddr> = owners.iter().map(|(_, f)| f.src_ip).collect();
+    owning_srcs.sort();
+    assert_eq!(
+        owning_srcs,
+        vec![
+            "10.0.1.100".parse::<IpAddr>().unwrap(),
+            "10.0.1.102".parse::<IpAddr>().unwrap()
+        ],
+    );
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+}
+
+// #5269 (no false exhaustion): distinct preserved ports on a ONE-address pool
+// mint distinct reverse identities, so both address-only flows succeed.
+#[test]
+fn pool_snat_no_translation_distinct_ports_both_succeed_5269() {
+    let rules = one_address_notrans_rule();
+
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        12346,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_eq!(a.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(b.rewrite_src, Some("203.0.113.1".parse().unwrap()));
+    assert_eq!(a.rewrite_src_port, None);
+    assert_eq!(b.rewrite_src_port, None);
+
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners.len(), 2, "distinct preserved ports mint distinct tokens");
+    let mut ports: Vec<u16> = owners.iter().map(|(k, _)| k.translated_port).collect();
+    ports.sort();
+    assert_eq!(ports, vec![12345, 12346]);
+    assert_eq!(source_nat_pool_statuses(&rules)[0].used_ports, 0);
+}
+
+// #5269 (no false exhaustion): a TWO-address pool round-robins two colliding-port
+// flows onto DIFFERENT pool addresses, so both address-only flows succeed with
+// distinct reverse identities.
+#[test]
+fn pool_snat_no_translation_two_address_pool_both_succeed_5269() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-notrans2".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string(), "203.0.113.2/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        pool_no_translation: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    // Same preserved port + remote, but round-robin places the two flows on
+    // different pool addresses -> distinct identities -> both admitted.
+    let a = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.100",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    let b = expect_snat_decision(addr_only_lookup(
+        &rules,
+        "10.0.1.101",
+        12345,
+        "8.8.8.8",
+        443,
+        PROTO_TCP,
+    ));
+    assert_ne!(
+        a.rewrite_src, b.rewrite_src,
+        "round-robin must place the two flows on different pool addresses",
+    );
+
+    let owners = rules[0].pool_allocator.debug_address_only_owners();
+    assert_eq!(owners.len(), 2, "two-address pool mints two distinct tokens");
+    let mut ips: Vec<IpAddr> = owners.iter().map(|(k, _)| k.translated_ip).collect();
+    ips.sort();
+    assert_eq!(
+        ips,
+        vec![
+            "203.0.113.1".parse::<IpAddr>().unwrap(),
+            "203.0.113.2".parse::<IpAddr>().unwrap()
+        ],
     );
 }
 
