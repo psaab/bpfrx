@@ -91,6 +91,12 @@ const (
 	// ValueDate is a Junos scheduler calendar date in YYYY-MM-DD form
 	// (e.g. 2026-03-01). Validated by ValidateDate.
 	ValueDate
+	// ValueTimeZone is an IANA tz-database / zoneinfo name (e.g. UTC,
+	// America/Los_Angeles, Etc/GMT+5). It is rendered into the
+	// /etc/localtime symlink target, so ValidateTimeZone rejects a `..`
+	// component / absolute path / space at commit check to keep the target
+	// inside the zoneinfo root (#5011).
+	ValueTimeZone
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -133,6 +139,8 @@ func (v ValueType) Placeholder() string {
 		return "<HH:MM:SS>"
 	case ValueDate:
 		return "<YYYY-MM-DD>"
+	case ValueTimeZone:
+		return "<timezone>"
 	}
 	return ""
 }

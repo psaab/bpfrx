@@ -349,3 +349,49 @@ func ValidateSyslogUser(raw string, _ *Config) error {
 	}
 	return nil
 }
+
+// zoneNameSegmentRE is the safe shape for one `/`-separated segment of a
+// `system time-zone` value (an IANA tz-database / zoneinfo name). Real zone
+// segments are letters, digits, and the punctuation `_ + -`
+// (America/Los_Angeles, Etc/GMT+5, Etc/GMT-14, America/Port-au-Prince), each
+// beginning with a letter or digit. The alphabet deliberately EXCLUDES '.' (so
+// a '.' or '..' path component can never appear), '/' (the segment separator),
+// whitespace, and control characters — any of which could turn the rendered
+// /etc/localtime symlink target into a path-traversal.
+var zoneNameSegmentRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_+-]*$`)
+
+// maxTimeZoneLen bounds a `system time-zone` value. IANA zone names are short
+// (the longest shipped name is well under 40 octets); 64 is a comfortable cap
+// that still rejects an absurdly long traversal string.
+const maxTimeZoneLen = 64
+
+// ValidateTimeZone accepts a `system time-zone` value: an IANA tz-database /
+// zoneinfo name such as `UTC`, `America/Los_Angeles`, or `Etc/GMT+5`. The value
+// is rendered into the /etc/localtime symlink target
+// (/usr/share/zoneinfo/<value>), so it must be a relative, traversal-free
+// path: one or more `/`-separated segments, each matching zoneNameSegmentRE. An
+// empty value, an absolute path (leading `/`), a `..` component, a trailing /
+// doubled slash, or any segment with a space / control character / other
+// metacharacter is rejected so the value cannot escape the zoneinfo root
+// (#5011).
+//
+// Strict at commit-check (SchemaValidate); the tolerant load / peer-sync path
+// keeps booting (#1960) and the render belt (zoneinfoTarget in
+// pkg/daemon/daemon_system.go) refuses an out-of-root symlink target for a
+// value that slips through.
+func ValidateTimeZone(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing value (expected a time zone, e.g. UTC or America/Los_Angeles)")
+	}
+	if len(raw) > maxTimeZoneLen {
+		return fmt.Errorf("time-zone %q exceeds %d octets", raw, maxTimeZoneLen)
+	}
+	for _, seg := range strings.Split(raw, "/") {
+		if !zoneNameSegmentRE.MatchString(seg) {
+			return fmt.Errorf("invalid time-zone %q: segment %q must be a zoneinfo name "+
+				"component (a letter or digit followed by letters, digits, or _ + - ; no "+
+				"'.', '..', '/', whitespace, or control characters)", raw, seg)
+		}
+	}
+	return nil
+}
