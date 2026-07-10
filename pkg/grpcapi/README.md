@@ -15,6 +15,21 @@ tab completion. The wire schema is `proto/xpf/v1`.
   and blocks until the context is cancelled.
 - Tab completion: `Complete` RPC, backed by `pkg/cmdtree`.
 
+## Trust boundary (loopback-only, #5035)
+
+The primary listener started by `Run` installs **no** authentication or
+TLS — only `configLockInterceptor` — so every RPC (including destructive
+`SystemAction` zeroize/reboot/halt/power-off and Commit/Delete/Rollback)
+is inherently trusted. That trust holds only if the listener is
+loopback-bound. `Run` therefore clamps a non-loopback `--grpc-addr`
+(`0.0.0.0`, a routable address, or the `:port` wildcard) back to a
+same-family loopback (`clampGRPCBindToLoopback`) and warns, mirroring the
+web-management (#4903) and cluster-bind (#4928) doctrine. There is no
+auth mode that unlocks a non-loopback bind here: the intentionally
+network-exposed gRPC surface is the **separate** fabric listener
+(`RunFabricListener`), which authenticates (#4107) and allowlists (#4122)
+every call.
+
 ## Callers
 
 `cmd/xpfd` (instantiates and runs); `cmd/cli` (consumes); HTTP REST

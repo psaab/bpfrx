@@ -13,6 +13,20 @@
   `TestFilterStreamLastCapTruncates`.
   **File(s)**: pkg/cli/cli_dispatch.go, cmd/cli/shared.go,
   pkg/cli/cli_last_cap_5037_test.go, docs/junos-cli-reference.md
+## 2026-07-09 — #5035 grpcapi primary listener loopback clamp (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5035. The primary gRPC listener (`Run`) is unauthenticated
+  (only `configLockInterceptor`), so a non-loopback `--grpc-addr` would
+  expose destructive RPCs (SystemAction zeroize/reboot, Commit/Delete/
+  Rollback) to the network. Added `clampGRPCBindToLoopback` mirroring the
+  #4903/#4928 web-management/cluster doctrine and wired it into `Run` so a
+  wildcard/routable bind is pulled back to a same-family loopback + warned.
+  The default 127.0.0.1 path is unchanged. RED-on-revert:
+  `TestRunClampsNonLoopbackBind` + pure `TestClampGRPCBindToLoopback`.
+  **File(s)**: pkg/grpcapi/server.go,
+  pkg/grpcapi/server_grpc_loopback_clamp_5035_test.go,
+  pkg/grpcapi/README.md
 
 ## 2026-07-09 — #4908 cli/show display-fidelity cohort (partial: 6 fixed, 6 deferred)
 
@@ -44369,3 +44383,6 @@ top.
   **File(s)**: test/incus/cluster-env.sh, test/incus/cluster-env-selftest.sh, Makefile, CLAUDE.md, test/incus/test-failover.sh, test/incus/test-double-failover.sh, test/incus/test-ha-crash.sh, test/incus/test-stress-failover.sh, test/incus/test-chained-crash.sh, test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh, test/incus/test-connectivity.sh
   **Action**: #5010 add a render-side belt for `system name-server` (validator/belt asymmetry vs #4902). The resolver `name-server` leaf carried a strict commit-time validator (config.ValidateIPAddress) but had NO render belt in mergeDNSInput, unlike the sibling domain-name/domain-search which #5009 gave both. Under #1960 commit rejection is downgraded to a warning on the tolerant load/peer-sync path, so the render belt is the real security boundary. mergeDNSInput (pkg/daemon/daemon_dns.go) now re-validates each static name-server with config.ValidateIPAddress and fail-closed skips (slog.Warn) any value that is not a bare IP (an embedded space would inject a second resolver token), mirroring the domain belt upstream of both RenderResolvConf and RenderResolvedDropin. DHCP-learned servers are already net.IP.String() so only the operator-supplied static list needs re-validation. Regression test system_dns_nameserver_belt_5010_test.go (drops space/newline/malformed/CIDR, keeps valid v4+v6), RED on revert of the belt. Documented the render belt in docs/dns-ownership.md.
   **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/system_dns_nameserver_belt_5010_test.go, docs/dns-ownership.md
+- **Timestamp**: 2026-07-09
+  **Action**: #5044 fail closed when redundancy-group enumeration fails during an ISSU/image-roll drain instead of guessing {0,1,2}. ForceSecondary demotes EVERY configured RG server-side, but ResetFailover reset only the client-enumerated set, and configuredRGs() silently fell back to a hardcoded {0,1,2} on a transient `show chassis cluster status` failure or an unparseable render. A cluster with >3 redundancy groups (RG IDs are not bounded to 0-2; >15 is possible) therefore left RG>=3 held ForceSecondary while ResetFailover returned nil; RejoinAndConfirm checks only PeerAlive/SyncEstablished (no per-RG local eligibility), so the orchestrator advanced to drain/recreate the peer that still owned those groups — a no-primary window. Split the fallback logic into a pure configuredRGsFromStatus(s, statusErr) that returns an error on a status-fetch failure or a zero-RG parse; configuredRGs() now returns ([]int, error) and ResetFailover propagates it, stopping the roll rather than silently under-resetting. Regression test TestConfiguredRGsFromStatus_FailsClosed (pkg/upgrade/cluster_cli_test.go) pins: transient error -> error, no-RG status -> error, valid status keeps RG>=3 (want [0 1 2 5]); RED on revert to any hardcoded fallback set. No operator/module doc change: the {0,1,2} guess was an internal implementation detail (only in code comments, now updated); the RejoinAndConfirm/ResetFailover "never both down / no-primary" contract is documented in the surrounding code comments.
+  **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
