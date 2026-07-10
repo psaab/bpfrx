@@ -117,6 +117,8 @@ func (s *Server) ClearDHCPClientIdentifier(_ context.Context, req *pb.ClearDHCPC
 		}, nil
 	}
 
-	s.dhcp.ClearAllDUIDs()
+	if err := s.dhcp.ClearAllDUIDs(); err != nil {
+		return nil, fmt.Errorf("clear all DUIDs: %w", err)
+	}
 	return &pb.ClearDHCPClientIdentifierResponse{Message: "All DHCPv6 DUIDs cleared"}, nil
 }

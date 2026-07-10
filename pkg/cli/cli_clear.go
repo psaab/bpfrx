@@ -445,7 +445,9 @@ func (c *CLI) handleClearDHCP(args []string) error {
 		return nil
 	}
 
-	c.dhcp.ClearAllDUIDs()
+	if err := c.dhcp.ClearAllDUIDs(); err != nil {
+		return fmt.Errorf("clear all DUIDs: %w", err)
+	}
 	fmt.Println("All DHCPv6 DUIDs cleared")
 	return nil
 }

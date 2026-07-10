@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
@@ -382,10 +383,45 @@ func loadDDNSState(path string) (*ddnsState, error) {
 		return s, fmt.Errorf("ddns state %s has version %d (want %d): %w",
 			path, f.Version, ddnsStateVersion, errDDNSStateUnsupportedVersion)
 	}
+	// Semantic validation (#4909): valid-JSON, valid-version is NOT enough. A
+	// record whose textual address does not parse is corrupt in a way the
+	// reconciler cannot recover — deleteOwnedLocked cannot reconstruct the exact
+	// wire RR, so it silently dropped the in-memory entry WITHOUT a wire delete
+	// AND without persisting; the malformed record then reloaded on restart and
+	// the stale DNS RR oscillated, uncleanable. Fail closed here (quarantine the
+	// store, like a JSON-corrupt or bad-version file) so a malformed address is
+	// never trusted or acted on.
+	for _, r := range f.Records {
+		if err := validOwnedRecordAddrs(r); err != nil {
+			s.records = map[string]ownedRecord{}
+			return s, fmt.Errorf("ddns state %s: %w: %v", path, errDDNSStateCorrupt, err)
+		}
+	}
 	for _, r := range f.Records {
 		s.records[ownedRecordKey(r.scopeOf(), r.Identity, r.Address)] = r
 	}
 	return s, nil
+}
+
+// validOwnedRecordAddrs reports whether an owned record's textual addresses are
+// semantically well-formed. A record may legitimately carry an empty Address (a
+// Surface A router record keys on {scope, identity, ""} and carries its rdata in
+// AddrText) or an empty AddrText (a DHCP-lease record's rdata IS its Address),
+// but any NON-EMPTY address field MUST parse as an IP: the published rdata is
+// always an A/AAAA address, so an unparseable value is a corrupt record the
+// reconciler cannot turn into a correct wire delete (#4909).
+func validOwnedRecordAddrs(r ownedRecord) error {
+	if r.Address != "" {
+		if _, err := netip.ParseAddr(r.Address); err != nil {
+			return fmt.Errorf("record %q address %q: %w", r.FQDN, r.Address, err)
+		}
+	}
+	if r.AddrText != "" {
+		if _, err := netip.ParseAddr(r.AddrText); err != nil {
+			return fmt.Errorf("record %q addr_text %q: %w", r.FQDN, r.AddrText, err)
+		}
+	}
+	return nil
 }
 
 // quarantineBadState moves a corrupt / unknown-version ownership file aside to a

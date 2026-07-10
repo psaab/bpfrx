@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
@@ -87,6 +88,55 @@ func classifyCommand(argv []string) xpfdCommand {
 		return cmdUnknown
 	}
 	return cmdDaemon
+}
+
+// readBoundedFile reads path, refusing anything larger than max bytes while
+// allocating at most max+1 bytes REGARDLESS of the file's reported size.
+//
+// The pre-#4909 check-config path did os.Stat (size gate) then os.ReadFile
+// (whole-file alloc) then a post-read len(data) cap — a TOCTOU: an adversarial
+// or FUSE-backed file can under-report its size to Stat and then stream an
+// unbounded body to ReadFile, ballooning memory before the post-read cap fires.
+// Reading through an io.LimitReader(max+1) on a single opened descriptor closes
+// the window: the allocation is bounded by the limit, not by what Stat claimed,
+// and reaching the (max+1)-th byte proves the file is over-cap. A non-regular
+// file (dir/device/FIFO) is refused up front.
+func readBoundedFile(path string, max int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	data, err := readBounded(f, max)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return data, nil
+}
+
+// readBounded reads at most max+1 bytes from r and rejects a source that
+// exceeds max, allocating no more than max+1 bytes REGARDLESS of how much data
+// r would supply. This is the load-bearing half of the #4909 fix: the pre-fix
+// os.ReadFile materialized the WHOLE file before any cap, so a FUSE/racing file
+// that under-reported its Stat size could still stream an unbounded body and
+// balloon memory. io.LimitReader(max+1) caps the read; reaching the (max+1)-th
+// byte proves the source is over-cap.
+func readBounded(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("exceeds %d byte limit", max)
+	}
+	return data, nil
 }
 
 func main() {
@@ -235,34 +285,11 @@ func main() {
 			os.Exit(1)
 		}
 		path := fs.Arg(0)
-		// The day-0 config drive is untrusted input: hard-cap the size
-		// before reading so a garbage volume cannot balloon memory.
+		// The day-0 config drive is untrusted input: hard-cap the size.
 		const maxCheckConfigBytes = 4 << 20 // 4 MiB
-		fi, err := os.Stat(path)
+		data, err := readBoundedFile(path, maxCheckConfigBytes)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "check-config: %v\n", err)
-			os.Exit(1)
-		}
-		if !fi.Mode().IsRegular() {
-			fmt.Fprintf(os.Stderr, "check-config: %s: not a regular file\n", path)
-			os.Exit(1)
-		}
-		if fi.Size() > maxCheckConfigBytes {
-			fmt.Fprintf(os.Stderr, "check-config: %s: %d bytes exceeds %d byte limit\n",
-				path, fi.Size(), int64(maxCheckConfigBytes))
-			os.Exit(1)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "check-config: %v\n", err)
-			os.Exit(1)
-		}
-		// Re-check after the read: the Stat above is advisory (the
-		// file could grow between stat and read when the caller is
-		// not the ro-mounted day-0 loader).
-		if len(data) > maxCheckConfigBytes {
-			fmt.Fprintf(os.Stderr, "check-config: %s: %d bytes exceeds %d byte limit\n",
-				path, len(data), int64(maxCheckConfigBytes))
 			os.Exit(1)
 		}
 		compiled, err := configstore.CheckText(string(data), *nodeID)

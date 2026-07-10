@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -32,6 +33,16 @@ func (c *CLI) fabricAuthKey() []byte {
 		return c.cluster.ControlLinkAuthKey()
 	}
 	return nil
+}
+
+// peerEndpoint builds the host:port gRPC/dial target for a peer fabric address.
+// It uses net.JoinHostPort so an IPv6 fabric literal (e.g. 2001:db8::2) is
+// bracketed to [2001:db8::2]:50051; the pre-#4909 fmt.Sprintf("%s:%d") produced
+// the unbracketed 2001:db8::2:50051, which grpc.NewClient and the TCP
+// reachability probe both parse as a bogus host:port so the IPv6 fabric dial
+// silently fails.
+func peerEndpoint(ip string, port int) string {
+	return net.JoinHostPort(ip, strconv.Itoa(port))
 }
 
 // peerPort returns the peer fabric gRPC port, defaulting to 50051.
@@ -82,7 +93,7 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 
 	port := c.peerPort()
 	for _, ip := range peerIPs {
-		peerAddr := fmt.Sprintf("%s:%d", ip, port)
+		peerAddr := peerEndpoint(ip, port)
 		conn, err := grpc.NewClient(peerAddr, dialOpts...)
 		if err != nil {
 			continue

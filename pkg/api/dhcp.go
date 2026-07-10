@@ -101,6 +101,9 @@ func (s *Server) clearDHCPIdentifiersHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	s.dhcp.ClearAllDUIDs()
+	if err := s.dhcp.ClearAllDUIDs(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeOK(w, map[string]string{"message": "All DHCPv6 DUIDs cleared"})
 }

@@ -22,6 +22,17 @@ cap would otherwise truncate a large config with `ResourceExhausted`
 - `-c "<command>"` — single-command, non-interactive mode. Exits with
   the command's status. Useful for scripted operations.
 
+## Local-only verbs run without a live daemon (#4909)
+
+`main.go` normally probes the daemon with `GetStatus` at startup and
+exits if xpfd is unreachable. But some `-c` verbs execute entirely in
+the client with no gRPC round-trip and must work exactly when the daemon
+is DOWN (recovery/bootstrap). `isLocalOnlyCommand` classifies these and
+dispatches them BEFORE the reachability probe. Today the only member is
+the offline WireGuard key generator (`request security wireguard
+generate-private-key`, #1434) — a pure-Go X25519 keygen. The pre-fix
+startup probe made it unreachable precisely when it was needed.
+
 ## Tab completion
 
 Driven by the gRPC `Complete` RPC, which lowers the same `pkg/cmdtree`
