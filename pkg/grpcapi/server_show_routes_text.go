@@ -36,7 +36,11 @@ func (s *Server) showRouteAll(cfg *config.Config, buf *strings.Builder) error {
 	}
 	allTables, err := s.routing.GetAllTableRoutes(instances)
 	if err != nil {
-		return status.Errorf(codes.Internal, "get routes: %v", err)
+		// A per-family/per-table dump failure is non-fatal: render whatever
+		// was read and surface the failure in-band so the operator can tell a
+		// partial from a genuinely empty table, instead of dropping the whole
+		// `show route` display on a transient single-family hiccup (#5125).
+		fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 	}
 	buf.WriteString(routing.FormatAllRoutes(allTables))
 	return nil
@@ -55,7 +59,7 @@ func (s *Server) showRouteSummary(cfg *config.Config, buf *strings.Builder) erro
 	}
 	allTables, err := s.routing.GetAllTableRoutes(instances)
 	if err != nil {
-		return status.Errorf(codes.Internal, "get routes: %v", err)
+		fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 	}
 	routerID := ""
 	if cfg != nil {
@@ -77,7 +81,7 @@ func (s *Server) showRouteTerse(buf *strings.Builder) error {
 	}
 	entries, err := s.routing.GetRoutes()
 	if err != nil {
-		return status.Errorf(codes.Internal, "get routes: %v", err)
+		fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 	}
 	buf.WriteString(routing.FormatRouteTerse(entries))
 	return nil
@@ -91,7 +95,7 @@ func (s *Server) showRouteDetail(buf *strings.Builder) error {
 	}
 	routes, err := s.frr.GetRouteDetailJSON()
 	if err != nil {
-		return status.Errorf(codes.Internal, "get route detail: %v", err)
+		fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 	}
 	if len(routes) == 0 {
 		buf.WriteString("No routes\n")
@@ -128,7 +132,7 @@ func (s *Server) showRouteProtocol(req *pb.ShowTextRequest, buf *strings.Builder
 	} else {
 		entries, err := s.routing.GetRoutes()
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 		}
 		fmt.Fprintf(buf, "Routes matching protocol: %s\n", proto)
 		fmt.Fprintf(buf, "  %-24s %-20s %-14s %-12s %s\n", "Destination", "Next-hop", "Interface", "Proto", "Pref")
@@ -168,7 +172,7 @@ func (s *Server) showRoutePrefix(req *pb.ShowTextRequest, cfg *config.Config, bu
 		}
 		allTables, err := s.routing.GetAllTableRoutes(instances)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			fmt.Fprintf(buf, "warning: partial route display (some address families unavailable): %v\n", err)
 		}
 		buf.WriteString(routing.FormatRouteDestination(allTables, prefix, modifier))
 	}
@@ -248,7 +252,14 @@ func (s *Server) showTestRouting(req *pb.ShowTextRequest, buf *strings.Builder) 
 			entries, err = s.routing.GetRoutes()
 		}
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			// A total failure (no entries: VRF not found, or every family's
+			// dump failed) stays a hard gRPC error. A partial per-family
+			// failure still has a usable table — warn in-band and continue the
+			// lookup rather than dropping it (#5125).
+			if len(entries) == 0 {
+				return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+			}
+			fmt.Fprintf(buf, "warning: partial route data (some address families unavailable): %v\n", err)
 		}
 		filterCIDR := dest
 		if !strings.Contains(filterCIDR, "/") {
@@ -416,8 +427,10 @@ func (s *Server) showRoutingInstancesDetail(cfg *config.Config, buf *strings.Bui
 				fmt.Fprintf(buf, "  Interfaces: %s\n", strings.Join(ri.Interfaces, ", "))
 			}
 			if ri.TableID > 0 && s.routing != nil {
-				if routes, err := s.routing.GetRoutesForTable(ri.TableID); err == nil {
-					fmt.Fprintf(buf, "  Route count: %d\n", len(routes))
+				routes, err := s.routing.GetRoutesForTable(ri.TableID)
+				fmt.Fprintf(buf, "  Route count: %d\n", len(routes))
+				if err != nil {
+					fmt.Fprintf(buf, "  warning: partial route count (some address families unavailable): %v\n", err)
 				}
 			}
 			var protos []string
@@ -486,8 +499,9 @@ func (s *Server) showRouteInstance(filter string, cfg *config.Config, buf *strin
 	if s.routing != nil {
 		entries, err := s.routing.GetRoutesForTable(tableID)
 		if err != nil {
-			fmt.Fprintf(buf, "Error: %v\n", err)
-			return
+			// Non-fatal: render whatever family was read and surface the
+			// per-family failure rather than dropping the table (#5125).
+			fmt.Fprintf(buf, "warning: partial route display for instance %s (some address families unavailable): %v\n", instanceName, err)
 		}
 		fmt.Fprintf(buf, "Routing table for instance %s (table %d):\n", instanceName, tableID)
 		fmt.Fprintf(buf, "  %-24s %-20s %-14s %-12s %s\n",

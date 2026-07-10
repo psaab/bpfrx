@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
@@ -20,7 +21,15 @@ func (s *Server) GetRoutes(_ context.Context, _ *pb.GetRoutesRequest) (*pb.GetRo
 
 	entries, err := s.routing.GetRoutes()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+		// A total failure (no entries: every family's dump failed) stays a
+		// hard gRPC error. A partial per-family failure still has usable
+		// routes; the GetRoutesResponse proto carries no warning field, so
+		// surface the failure via logging and still return the family that
+		// succeeded rather than dropping the partial (#5125).
+		if len(entries) == 0 {
+			return nil, status.Errorf(codes.Internal, "get routes: %v", err)
+		}
+		slog.Warn("GetRoutes returning partial route dump", "error", err)
 	}
 
 	resp := &pb.GetRoutesResponse{}
