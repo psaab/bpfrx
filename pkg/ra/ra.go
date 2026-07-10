@@ -208,7 +208,13 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 			slog.Info("ra: emitting standalone goodbye (owner exited without "+
 				"one; claim held across emit)", "interface", name)
 			if cfg != nil {
-				m.sendOneGoodbye(cfg) // entry still held → Apply defers, no clobber
+				// Surface a failed backstop goodbye (#5093): this is the last
+				// retry the graceful-withdraw path has, so a swallowed write
+				// error here would silently leave the stale router live on hosts.
+				if err := m.sendOneGoodbye(cfg); err != nil {
+					slog.Warn("ra: standalone goodbye failed",
+						"interface", name, "err", err)
+				}
 			}
 			// Re-loop: re-acquire the lock and re-evaluate against fresh state
 			// before deciding the replacement (the emit ran outside the lock).
@@ -660,7 +666,7 @@ func (m *Manager) ResendBurst() {
 // Apply would leave the interface with no sender). Interfaces with a live
 // sender (VRRP MASTER already won) or an existing tombstone are skipped — a
 // goodbye must not clobber a live primary.
-func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
+func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) []GoodbyeResult {
 	// The busy-check and the tombstone install MUST be atomic under m.mu —
 	// claimWithdrawOnceLocked does both while holding the lock. Splitting them
 	// (check, drop the lock, then install) reopens the #2272 check-and-act race:
@@ -677,12 +683,39 @@ func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
 	// run() loop, so it emits only the lifetime-0 goodbye and never a normal RA
 	// after it — preserving the single-owner-emit invariant. The tombstone is
 	// removed only AFTER the goodbye fully completes.
+	//
+	// Per-interface outcomes are returned so the cold-boot caller can retain
+	// retry debt: a claimed interface reports Sent only when a lifetime-0 RA
+	// actually went out, Err when the bind/write failed. An interface that was
+	// busy (a live sender won, or another withdraw owns it) is reported Skipped —
+	// its goodbye is another owner's responsibility, not retry debt here (#5093).
+	claimed := make(map[string]error, len(toGoodbye))
 	for _, cfg := range toGoodbye {
-		m.sendOneGoodbye(cfg)
+		err := m.sendOneGoodbye(cfg)
+		claimed[cfg.Interface] = err
 		m.mu.Lock()
 		delete(m.draining, cfg.Interface)
 		m.mu.Unlock()
 	}
+
+	results := make([]GoodbyeResult, 0, len(configs))
+	seen := make(map[string]struct{}, len(configs))
+	for _, cfg := range configs {
+		if _, dup := seen[cfg.Interface]; dup {
+			continue
+		}
+		seen[cfg.Interface] = struct{}{}
+		if err, ok := claimed[cfg.Interface]; ok {
+			results = append(results, GoodbyeResult{
+				Interface: cfg.Interface,
+				Sent:      err == nil,
+				Err:       err,
+			})
+			continue
+		}
+		results = append(results, GoodbyeResult{Interface: cfg.Interface, Skipped: true})
+	}
+	return results
 }
 
 // claimWithdrawOnceLocked performs the WithdrawOnce check-and-claim for each
@@ -720,20 +753,39 @@ func (m *Manager) claimWithdrawOnceLocked(configs []*config.RAInterfaceConfig) [
 	return toGoodbye
 }
 
+// GoodbyeResult reports the per-interface outcome of a one-shot goodbye
+// (WithdrawOnce). Exactly one of Sent / Skipped is true, or Err is non-nil:
+//   - Sent:    at least one lifetime-0 RA was written without error.
+//   - Skipped: the interface was busy (a live sender won, or another withdraw
+//     already owns the goodbye) so this call did not attempt it.
+//   - Err:     the bind or the lifetime-0 write failed; the caller should retain
+//     retry debt (mark the one-shot done only after Sent — #5093).
+type GoodbyeResult struct {
+	Interface string
+	Sent      bool
+	Skipped   bool
+	Err       error
+}
+
 // sendOneGoodbye opens a temporary sender for cfg, emits the standalone goodbye
-// (no burst, no link toggle — #2033 I12), and closes. m.mu must NOT be held.
-func (m *Manager) sendOneGoodbye(cfg *config.RAInterfaceConfig) {
+// (no burst, no link toggle — #2033 I12), and closes. m.mu must NOT be held. It
+// returns nil only when the goodbye actually went out; a missing interface, a
+// bind failure, or a lifetime-0 write failure returns a non-nil error so the
+// caller can surface it and retain retry debt (#5093).
+func (m *Manager) sendOneGoodbye(cfg *config.RAInterfaceConfig) error {
 	iface, err := net.InterfaceByName(cfg.Interface)
 	if err != nil {
 		slog.Debug("ra: WithdrawOnce: interface not found",
 			"interface", cfg.Interface, "err", err)
-		return
+		return fmt.Errorf("ra: goodbye interface %s: %w", cfg.Interface, err)
 	}
 	s := newSender(cfg, iface)
 	if err := s.sendGoodbyeStandalone(); err != nil {
 		slog.Debug("ra: WithdrawOnce: failed to send goodbye",
 			"interface", cfg.Interface, "err", err)
+		return err
 	}
+	return nil
 }
 
 // Clear stops all senders without sending goodbye RAs.

@@ -44976,6 +44976,30 @@ top.
 - **File(s)**: pkg/api/health.go, pkg/api/health_test.go,
   pkg/api/README.md, _Log.md
 
+## 2026-07-10 — #5093 surface RA goodbye write failures + fix cold-boot one-shot
+
+- **Timestamp**: 2026-07-10
+- **Action**: Stop swallowing goodbye-RA (lifetime-0) write failures and
+  fix the cold-boot one-shot being marked done before it runs. In
+  `pkg/ra`, `sendGoodbyeStandalone` and `sendOneGoodbye` now return a
+  non-nil error (wrapping the new `errGoodbyeWrite`) when the bind
+  succeeds but the lifetime-0 write fails, and `WithdrawOnce` returns
+  `[]GoodbyeResult` (per-interface `Sent`/`Skipped`/`Err`). The
+  releaseDrain standalone backstop now logs a WARN on a failed goodbye
+  instead of discarding it. In `pkg/daemon`, the cold-boot goodbye no
+  longer sets `startupGoodbyeRA[rg]` before launching the async
+  `WithdrawOnce`; `runStartupGoodbye` sets the sticky bit ONLY after every
+  interface reports Sent/Skipped, and an in-flight guard
+  (`startupGoodbyeInflight`, `startupGoodbyeMu`) serializes retries so the
+  2s reconcile ticker retries a failed goodbye without a duplicate
+  goroutine self-skipping on the held tombstone. Added fail-on-revert
+  tests (forced write error via the listenFn/fakeConn seam) proving the
+  failure is surfaced and retry debt is retained; both proven RED on
+  revert. Updated pkg/ra/README.md goodbye contract.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go,
+  pkg/ra/goodbye_failure_5093_test.go, pkg/daemon/daemon.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/startup_goodbye_5093_test.go,
+  pkg/ra/README.md, _Log.md
 - **Timestamp**: 2026-07-10
 - **Action**: #5312 flowexport/ipfix — emit RECORD-granularity sampling IEs.
   ShouldExport does 1-in-N selection of whole SESSION records, but

@@ -198,8 +198,23 @@ after HA failover. To make that **structural**, not flag-defended:
 goodbye-ONLY path (`sendGoodbyeStandalone`) that never launches an owner
 or a startup burst (so it cannot re-advertise the router it withdraws)
 and never toggles the link (no `ensureLinkLocal` link-cycle on a demoting
-interface — if no usable link-local exists the goodbye is skipped
-best-effort).
+interface — if no usable link-local exists the bind fails and no goodbye
+goes out this pass).
+
+**Goodbye write failures are surfaced, not swallowed (#5093).**
+`sendGoodbyeRA` returns whether the full lifetime-0 sequence was written;
+`sendGoodbyeStandalone` and `sendOneGoodbye` propagate a non-nil error
+(wrapping `errGoodbyeWrite`) when the bind succeeds but the write fails;
+and `WithdrawOnce` returns a `[]GoodbyeResult` — one per interface, each
+`Sent` (a lifetime-0 RA went out), `Skipped` (the interface was busy so
+another owner holds the goodbye), or carrying `Err` (bind/write failed).
+The cold-boot one-shot caller (`pkg/daemon`
+`reconcileRGState`/`runStartupGoodbye`) marks the RG done ONLY after every
+interface reports `Sent`/`Skipped`; a failure leaves the sticky bit unset
+so the reconcile ticker retries. Previously the daemon marked the one-shot
+done *before* launching the async withdraw, so a bind/write failure was
+never retried and the stale IPv6 default-router identity lingered on hosts
+(ECMP to an inactive node) until Router Lifetime expiry.
 
 ## Entry points
 
@@ -213,8 +228,10 @@ best-effort).
   link cycle) on every active sender, via the owner goroutine.
 - `WithdrawInterfaces(names []string)` — `ra.go`. Graceful goodbye + stop
   by interface name.
-- `WithdrawOnce(configs []*config.RAInterfaceConfig)` — `ra.go`.
-  Goodbye-only (no burst, no link toggle); skips busy interfaces. The
+- `WithdrawOnce(configs []*config.RAInterfaceConfig) []GoodbyeResult` —
+  `ra.go`. Goodbye-only (no burst, no link toggle); skips busy interfaces.
+  Returns a per-interface outcome (`Sent`/`Skipped`/`Err`) so a caller can
+  retain retry debt on a failed goodbye (#5093). The
   busy-check and the claim-and-hold tombstone install are performed
   ATOMICALLY under `m.mu` by `claimWithdrawOnceLocked` (#2272): holding the
   lock across BOTH closes the check-and-act window in which a concurrent

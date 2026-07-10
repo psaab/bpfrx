@@ -299,14 +299,23 @@ func (s *sender) openConn() bool {
 	return true
 }
 
+// errGoodbyeWrite is returned by the standalone goodbye path when the bind
+// succeeded but the lifetime-0 RA write itself failed. Callers (WithdrawOnce /
+// the daemon cold-boot one-shot) MUST surface this and retain retry debt rather
+// than record a false success — a swallowed write failure lets the old IPv6
+// default-router identity live on hosts (ECMP to an inactive node) until Router
+// Lifetime expiry while operators see success (#5093).
+var errGoodbyeWrite = errors.New("ra: goodbye RA write failed")
+
 // sendGoodbyeStandalone is the WithdrawOnce goodbye-only entry point. It opens
 // a connection, emits the lifetime-0 goodbye, and closes — WITHOUT launching
 // run() and WITHOUT the startup burst (so it never re-advertises the router it
 // is withdrawing — fixes S1). Per #2033 I12 it MUST NOT toggle the link: if no
 // usable link-local exists, ndp.Listen fails and the goodbye is skipped
 // best-effort rather than cycling a demoting interface (which may be mid-RETH-
-// MAC-cycle). Returns an error only when the conn could not be opened so the
-// caller can log; a goodbye is otherwise emitted and the conn closed here.
+// MAC-cycle). It returns nil only when the goodbye actually went out; a bind
+// failure OR a lifetime-0 write failure returns a non-nil error so the caller
+// can surface it and retry (#5093). The conn is opened and closed here.
 func (s *sender) sendGoodbyeStandalone() error {
 	conn, srcAddr, err := s.listen()
 	if err != nil {
@@ -315,7 +324,9 @@ func (s *sender) sendGoodbyeStandalone() error {
 	s.conn = conn
 	s.setSrcAddr(srcAddr)
 	defer s.conn.Close()
-	s.sendGoodbyeRA()
+	if !s.sendGoodbyeRA() {
+		return fmt.Errorf("%w on %s", errGoodbyeWrite, s.cfg.Interface)
+	}
 	return nil
 }
 
@@ -707,9 +718,10 @@ func (s *sender) sendRA() {
 // Owner-only — emitted as the final write in finishShutdown. It returns true
 // only when the full sequence was written without error; a write failure
 // returns false so finishShutdown leaves goodbyeEmitted=false and the manager's
-// release-time backstop retries the goodbye on a fresh conn. (The standalone
-// backstop path, sendGoodbyeStandalone, ignores the bool — it is itself the
-// retry, so there is no further fallback to arm.)
+// release-time backstop retries the goodbye on a fresh conn. The standalone
+// backstop path, sendGoodbyeStandalone, now surfaces this bool as an error
+// (errGoodbyeWrite, #5093) so its caller (WithdrawOnce) reports the failure and
+// the cold-boot one-shot retains retry debt for the reconcile ticker to retry.
 func (s *sender) sendGoodbyeRA() bool {
 	ra := s.buildRA()
 	ra.RouterLifetime = 0
