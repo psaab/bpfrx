@@ -154,6 +154,33 @@ struct LiveAllocation {
     // recycle queue). `false` for every round-robin/persistent allocation
     // (unchanged behaviour).
     deterministic: bool,
+    // #5269: an address-only occupancy token (port no-translation / port-less
+    // source NAT). No pool PORT is consumed on the occupancy bitmap — the packet
+    // keeps its own source port on the wire — so release must NOT free a port
+    // bit; instead it clears the reverse-identity entry in `address_only_owners`.
+    // `false` for every PAT / deterministic / persistent allocation.
+    address_only: bool,
+}
+
+/// #5269: reverse-identity ownership key for an address-only (port
+/// no-translation / port-less) source-NAT translation. The reverse conntrack
+/// demux keys a reply on (protocol, translated source IP, translated source
+/// port, remote IP, remote port); two forward flows that would produce the SAME
+/// reverse identity cannot coexist because their replies are indistinguishable,
+/// so the allocator grants each identity to exactly ONE flow and denies a
+/// genuinely-colliding second flow as exhaustion. `translated_port` is the
+/// PRESERVED source port for a port-bearing protocol, or 0 for a port-less
+/// protocol (GRE/ESP/AH/...). This is the address-only analogue of the PAT
+/// occupancy bit: PAT keeps `(pool_addr, port)` unique by handing out a fresh
+/// port; address-only cannot move the port, so it enforces uniqueness on the
+/// full reverse identity instead.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(super) struct AddressOnlyReverseKey {
+    pub(super) protocol: u8,
+    pub(super) translated_ip: IpAddr,
+    pub(super) translated_port: u16,
+    pub(super) dst_ip: IpAddr,
+    pub(super) dst_port: u16,
 }
 
 /// #4559: IPv4 deterministic CGNAT (mode 1) block-allocation parameters,
@@ -411,6 +438,13 @@ pub(super) struct PortAllocatorLiveState {
     pub(super) persistent_by_source: FxHashMap<PersistentSourceKey, PersistentLease>,
     pub(super) lease_expirations: BTreeSet<(u64, PersistentSourceKey)>,
     pub(super) lease_expirations_by_addr: Vec<BTreeSet<(u64, PersistentSourceKey)>>,
+    // #5269: address-only occupancy tokens — the translated reverse identity of a
+    // `port no-translation` / port-less flow mapped to its owning FORWARD flow.
+    // Populated by `reserve_address_only` (which denies a second flow that would
+    // claim an already-owned identity) and cleared by `release_flow` /
+    // `rollback_flow` for an `address_only` `LiveAllocation`. Distinct from the
+    // per-address occupancy bitmap, which tracks PAT port ownership.
+    address_only_owners: FxHashMap<AddressOnlyReverseKey, SourceNatFlowKey>,
     gc_counter: u32,
 }
 
@@ -955,6 +989,7 @@ impl PortAllocator {
                         persistent_key: None,
                         addr_index: abs,
                         deterministic: false,
+                        address_only: false,
                     },
                 );
                 self.shared
@@ -1087,6 +1122,7 @@ impl PortAllocator {
                     persistent_key,
                     addr_index: abs,
                     deterministic: false,
+                    address_only: false,
                 },
             );
             self.shared
@@ -1160,6 +1196,7 @@ impl PortAllocator {
                     persistent_key: Some(key),
                     addr_index,
                     deterministic: false,
+                    address_only: false,
                 },
             );
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
@@ -1228,6 +1265,18 @@ impl PortAllocator {
                 Self::remove_lease_expiration_locked(&mut live, addr_index, old_expires_at_ns, key);
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
+        } else if existing.address_only {
+            // #5269: address-only token — no pool port bit was claimed, so free
+            // the reverse-identity owner instead. Recompute the key from the
+            // stored translated tuple + the flow's remote endpoint (the SAME key
+            // `reserve_address_only` inserted).
+            live.address_only_owners.remove(&AddressOnlyReverseKey {
+                protocol: flow.protocol,
+                translated_ip: existing.translated.ip,
+                translated_port: existing.translated.port,
+                dst_ip: flow.dst_ip,
+                dst_port: flow.dst_port,
+            });
         } else {
             // Non-persistent (or deterministic) flow owns its port outright:
             // free the bit, recycling it unless it is a deterministic block
@@ -1292,6 +1341,16 @@ impl PortAllocator {
             if let Some((addr_index, expires_at_ns)) = insert_expiry {
                 Self::insert_lease_expiration_locked(&mut live, addr_index, expires_at_ns, key);
             }
+        } else if existing.address_only {
+            // #5269: address-only token rollback — clear the reverse-identity
+            // owner (no pool port bit to free), mirroring `release_flow`.
+            live.address_only_owners.remove(&AddressOnlyReverseKey {
+                protocol: flow.protocol,
+                translated_ip: existing.translated.ip,
+                translated_port: existing.translated.port,
+                dst_ip: flow.dst_ip,
+                dst_port: flow.dst_port,
+            });
         } else {
             self.free_translated_port(
                 existing.addr_index,
@@ -1368,6 +1427,7 @@ impl PortAllocator {
                         persistent_key: None,
                         addr_index: ip_idx,
                         deterministic: true,
+                        address_only: false,
                     },
                 );
                 self.shared
@@ -1445,6 +1505,7 @@ impl PortAllocator {
                         persistent_key: None,
                         addr_index: ip_idx,
                         deterministic: true,
+                        address_only: false,
                     },
                 );
                 self.shared
@@ -1519,9 +1580,106 @@ impl PortAllocator {
                 persistent_key: None,
                 addr_index,
                 deterministic: false,
+                address_only: false,
             },
         );
         true
+    }
+
+    /// #5269: mint an ADDRESS-ONLY occupancy token for a `port no-translation`
+    /// or port-less source-NAT flow. Unlike PAT ([`allocate_translation`]) no
+    /// pool PORT is consumed — the packet keeps its own source port on the wire
+    /// — but the translated REVERSE identity (protocol, chosen pool address,
+    /// PRESERVED source port, remote endpoint) is claimed so a SECOND flow that
+    /// would map to the SAME public reverse tuple is DENIED as exhaustion
+    /// instead of silently receiving an unowned duplicate whose replies the
+    /// reverse (1:N) index cannot disambiguate.
+    ///
+    /// The FIRST flow owns the identity and succeeds; a genuinely-colliding
+    /// second flow (same pool address, same preserved port, same remote — for a
+    /// port-less protocol, same pool address + remote) fails closed, mirroring
+    /// how a full port-translating pool reports exhaustion and the vSRX
+    /// address-only / persistent capacity limit. A NON-colliding address-only
+    /// flow (different preserved port, pool address, or remote) mints its own
+    /// token and succeeds.
+    ///
+    /// The token is recorded in `live_by_flow` (flagged `address_only`) AND in
+    /// `address_only_owners`, so the EXISTING teardown path
+    /// (`release_flow`/`rollback_flow` via `release_source_nat_allocation`,
+    /// already called for every reaped or delete-synced session) frees it — no
+    /// new delete site. Idempotent: a second packet of the SAME flow returns its
+    /// existing translated tuple.
+    pub(super) fn reserve_address_only(
+        &self,
+        flow: SourceNatFlowKey,
+        translated_ip: IpAddr,
+    ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
+        let translated = TranslatedTuple {
+            ip: translated_ip,
+            // Port-bearing protocols preserve their source port; a port-less
+            // protocol carries 0 here. This value is NOT written to the wire
+            // (the caller leaves `rewrite_src_port` unset); it keys the reverse
+            // identity and lets the SAME `release_flow` free the token.
+            port: flow.src_port,
+        };
+        let rkey = AddressOnlyReverseKey {
+            protocol: flow.protocol,
+            translated_ip,
+            translated_port: flow.src_port,
+            dst_ip: flow.dst_ip,
+            dst_port: flow.dst_port,
+        };
+        let mut live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        // Idempotent re-entry: a second packet of the same flow (racing session
+        // install) reuses its first decision rather than re-keying.
+        if let Some(existing) = live.live_by_flow.get(&flow) {
+            self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
+            return Ok(existing.translated);
+        }
+        // Collision: the reverse identity is already owned by a DIFFERENT flow.
+        // Two flows sharing one public reverse tuple cannot coexist (their
+        // replies are indistinguishable), so deny the second — the address-only
+        // capacity limit. `flow` is not in `live_by_flow` here (checked above),
+        // so any existing owner is necessarily a different flow.
+        if live.address_only_owners.contains_key(&rkey) {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+        }
+        if live.live_by_flow.len() >= self.shared.max_tracked_flows {
+            self.shared.exhaustion_total.fetch_add(1, Ordering::Relaxed);
+            return Err(super::source::SourceNatFailureReason::AllocatorExhausted);
+        }
+        live.address_only_owners.insert(rkey, flow);
+        live.live_by_flow.insert(
+            flow,
+            LiveAllocation {
+                translated,
+                persistent_key: None,
+                // No pool-port bit is claimed for an address-only token, so the
+                // occupancy address index is irrelevant to its release.
+                addr_index: 0,
+                deterministic: false,
+                address_only: true,
+            },
+        );
+        self.shared
+            .allocations_total
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(translated)
+    }
+
+    /// Test-only: snapshot the address-only reverse-identity ownership map so a
+    /// white-box test can assert the reverse index resolves each public tuple to
+    /// exactly one owning forward flow (#5269).
+    #[cfg(test)]
+    pub(super) fn debug_address_only_owners(
+        &self,
+    ) -> Vec<(AddressOnlyReverseKey, SourceNatFlowKey)> {
+        let live = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
+        live.address_only_owners
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect()
     }
 
     pub(super) fn snapshot(&self) -> PortAllocatorSnapshot {
