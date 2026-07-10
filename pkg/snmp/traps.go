@@ -206,13 +206,10 @@ func (a *Agent) buildLinkTrapsForVersion(community, version string, linkUp bool,
 	}
 }
 
-// trapSender delivers a single pre-built trap to a target. It is a package
-// var (not a direct call) so tests can inject a deliberately slow/blocking
-// sender to prove the link-monitor caller does not block on trap delivery
-// (#2991). Production code never reassigns it.
-var trapSender = sendTrap
-
-// sendTrap sends a pre-built trap packet to a single target on port 162.
+// sendTrap sends a pre-built trap packet to a single target on port 162. It is
+// the default value of Agent.trapSender (#5023); tests inject a slow/blocking
+// or mock sender per-Agent instead of mutating a shared package global that
+// races the running trap worker's read.
 func sendTrap(target string, pkt []byte) error {
 	// Ensure the target has a port.
 	host, port, err := net.SplitHostPort(target)
@@ -333,12 +330,33 @@ func sortedTrapGroups(cfg *config.SNMPConfig) []*config.SNMPTrapGroup {
 // here — the queue only fills when targets are not draining, and blocking the
 // link monitor on SNMP observability is exactly the failure #2991 fixes.
 func (a *Agent) enqueueTrap(job trapJob) {
+	a.mu.Lock()
+	if a.stopped {
+		// #4916: the agent has been stopped (day-2 disable / rotation). Never
+		// start a worker or enqueue a post-Stop trap — dropping here is what
+		// guarantees no trap reaches a removed/rotated receiver after Stop.
+		a.mu.Unlock()
+		dropped := a.trapsDropped.Add(1)
+		slog.Warn("SNMP trap dropped: agent stopped",
+			"target", job.target, "group", job.group,
+			"event", job.event, "iface", job.iface, "dropped_total", dropped)
+		return
+	}
 	a.trapWorkerOnce.Do(func() {
-		a.trapQueue = make(chan trapJob, trapQueueDepth)
-		go a.trapWorker()
+		if a.trapQueue == nil {
+			a.trapQueue = make(chan trapJob, trapQueueDepth)
+		}
+		if a.trapStop == nil {
+			a.trapStop = make(chan struct{})
+		}
+		a.trapWG.Add(1)
+		go a.trapWorker(a.trapQueue, a.trapStop)
 	})
+	q := a.trapQueue
+	a.mu.Unlock()
+
 	select {
-	case a.trapQueue <- job:
+	case q <- job:
 	default:
 		dropped := a.trapsDropped.Add(1)
 		slog.Warn("SNMP trap queue full, dropping trap",
@@ -351,16 +369,48 @@ func (a *Agent) enqueueTrap(job trapJob) {
 // queued trap off the link-monitor goroutine (#2991). A single worker bounds
 // goroutine growth and serializes the slow dials; the queue capacity bounds
 // memory.
-func (a *Agent) trapWorker() {
-	for job := range a.trapQueue {
-		if err := trapSender(job.target, job.pkt); err != nil {
-			slog.Warn("SNMP trap send failed",
-				"target", job.target, "group", job.group,
-				"event", job.event, "iface", job.iface, "err", err)
-		} else {
-			slog.Info("SNMP trap sent",
-				"target", job.target, "group", job.group,
-				"event", job.event, "iface", job.iface, "ifindex", job.ifindex)
+//
+// #4916: the worker selects on stop as well as the queue and re-checks stop
+// before every send, so a Stop() ABANDONS the queued backlog (no trap is
+// delivered to a removed/rotated receiver after the authorizing config was
+// revoked) and the goroutine always exits — no leak per disable/re-enable
+// cycle. The queue and stop channel are passed in (rather than read from the
+// struct) so the worker never races Stop's field access. Stop waits on trapWG.
+func (a *Agent) trapWorker(queue chan trapJob, stop chan struct{}) {
+	defer a.trapWG.Done()
+	// Snapshot the sender once at worker start. It is set at construction
+	// (NewAgent) or by a test on its own Agent before the worker is lazily
+	// started, so this read never races a concurrent write (#5023). A
+	// bare-struct Agent that never set the field falls back to sendTrap.
+	send := a.trapSender
+	if send == nil {
+		send = sendTrap
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		case job, ok := <-queue:
+			if !ok {
+				return
+			}
+			// Re-check stop before delivering: the outer select picks
+			// randomly when both cases are ready, so a job dequeued
+			// concurrently with Stop must not be sent after Stop.
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := send(job.target, job.pkt); err != nil {
+				slog.Warn("SNMP trap send failed",
+					"target", job.target, "group", job.group,
+					"event", job.event, "iface", job.iface, "err", err)
+			} else {
+				slog.Info("SNMP trap sent",
+					"target", job.target, "group", job.group,
+					"event", job.event, "iface", job.iface, "ifindex", job.ifindex)
+			}
 		}
 	}
 }

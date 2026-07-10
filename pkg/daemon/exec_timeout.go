@@ -21,7 +21,13 @@ const externalCommandTimeout = 15 * time.Second
 // the error reflects the context deadline; callers log the failure and
 // continue — apply success/failure semantics are unchanged, failures
 // just become visible and bounded.
-func runCommandTimeout(name string, args ...string) ([]byte, error) {
+//
+// It is a package var (not a bare func) so tests can capture the argv a
+// caller passes to root-privileged tools without spawning real processes —
+// the seam the #5005 applySystemLogin option-injection test uses to assert
+// the `--` end-of-options separator reaches id/useradd/chown. Production
+// code never reassigns it.
+var runCommandTimeout = func(name string, args ...string) ([]byte, error) {
 	return runCommandStdinTimeout(nil, name, args...)
 }
 

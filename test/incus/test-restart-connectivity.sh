@@ -136,7 +136,7 @@ sleep 1
 if incus exec "$CLUSTER_LAN_HOST" -- ping -c 3 -W 2 "$IPERF_TARGET" &>/dev/null; then
 	pass "baseline connectivity OK ($IPERF_TARGET)"
 else
-	die "no baseline connectivity to $IPERF_TARGET from cluster-lan-host"
+	die "no baseline connectivity to $IPERF_TARGET from ${CLUSTER_LAN_HOST}"
 fi
 
 # ── Restart cycles ───────────────────────────────────────────────────

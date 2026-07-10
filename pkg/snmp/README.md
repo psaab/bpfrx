@@ -202,6 +202,17 @@ the boot apply and the boot block from double-starting the agent. The agent +
 monitor goroutines bind to a lifetime context derived from `d.daemonCtx` and are
 torn down explicitly at shutdown (`teardownSNMP`).
 
+`Agent.Stop()` is self-contained and idempotent (#4916): the daemon-wide
+context stays live across a day-2 SNMP disable, so Stop cannot rely on it. Stop
+cancels a per-agent lifecycle context (unblocking the `<-ctx.Done()` watcher
+goroutine `Start` spawns), signals the async trap worker to ABANDON its queued
+backlog (so no trap is delivered to a removed/rotated receiver after the
+authorizing config was revoked), closes the UDP socket, and waits for the
+worker to exit. After Stop, `enqueueTrap` drops rather than starting a new
+worker. Without this, each disable/re-enable cycle leaked a goroutine pair and
+the trap worker could keep sending a stale backlog with the old community to
+the old target.
+
 The reconcile runs **early** in `applyConfigLocked` — before the dataplane
 apply, which can abort the reconcile pipeline early (it returns on
 `ErrPolicySchedulerProtocolIncompatible`). `Store.Commit()` has already
@@ -302,8 +313,10 @@ authorization surface: every request is dropped because no community matches.
   for both `NewAgent` and bare-struct test agents). When the queue is full
   the trap is DROPPED and `trapsDropped` is incremented rather than
   blocking the caller — dropping is the correct backpressure when targets
-  are not draining. The delivery is replaceable through the `trapSender`
-  package var (the seam tests use to inject a slow sender). Before #2991
+  are not draining. The delivery is replaceable through the per-Agent
+  `trapSender` field (the seam tests use to inject a slow/mock sender on
+  their own Agent; #5023 moved it off a shared package var so the injection
+  no longer races the running trap worker's read under `-race`). Before #2991
   delivery was synchronous and inline, so an unreachable trap target (or a
   hung DNS lookup for an FQDN target) blocked link-state processing for up
   to the 2s dial timeout × target count.
