@@ -948,6 +948,12 @@ message NATRuleStats {
 
 message CompleteRequest {
   string line = 1;
+  // pos is a BYTE offset into line (not a rune/codepoint index): the server's
+  // Complete slices line[:pos]. Callers with a rune-indexed cursor (readline)
+  // MUST convert to the byte length of the prefix before sending, or a
+  // multibyte rune before the cursor makes pos < len(bytes) and the slice cuts
+  // a code point in half. The server rejects a pos that lands mid-rune with
+  // InvalidArgument (#4970).
   int32 pos = 2;
   bool config_mode = 3;
 }

@@ -232,6 +232,10 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 			d.flowExportErr = err
 			return true
 		}
+		// #4963: fold this exporter's handoff rejects into the fixed
+		// family-level counter so drops on it stay observable after it is
+		// later retired and dropped from the live bundle.
+		exp.SetHandoffCounter(&d.flowHandoffDropped)
 		exps = append(exps, exp)
 		groups = append(groups, v9Group{exp: exp, ec: ec})
 	}
@@ -268,6 +272,15 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 	d.flowBundle.Store(&exporterBundle{groups: groups})
 
 	if oldCancel != nil {
+		// #4963: retire the old exporters (bundle already swapped above) BEFORE
+		// cancelling their Run. Retire drains any session-close callback that
+		// already acquired the old bundle so its record lands in the batch the
+		// final flush (on cancel) drains; a callback that arrives after this is
+		// rejected + counted rather than silently stranded in a batch nothing
+		// will drain again.
+		for _, e := range oldExps {
+			e.Retire()
+		}
 		oldCancel()
 		if oldWg != nil {
 			oldWg.Wait()
@@ -292,6 +305,11 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 // removal path swaps it to empty) so a session-close callback can no longer
 // queue into an exporter this tears down (#3742). Nil-safe / idempotent.
 func (d *Daemon) teardownV9Locked() {
+	// #4963: retire (drain in-flight admits, then reject-and-count late ones)
+	// before cancelling Run's final flush, matching the swap path.
+	for _, exp := range d.flowExporters {
+		exp.Retire()
+	}
 	if d.flowCancel != nil {
 		d.flowCancel()
 	}
@@ -368,6 +386,8 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 			d.ipfixExportErr = err
 			return true
 		}
+		// #4963: fold handoff rejects into the fixed family-level counter.
+		exp.SetHandoffCounter(&d.ipfixHandoffDropped)
 		exps = append(exps, exp)
 		groups = append(groups, ipfixGroup{exp: exp, ec: ec})
 	}
@@ -396,6 +416,10 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 	d.ipfixBundlePtr.Store(&ipfixBundle{groups: groups})
 
 	if oldCancel != nil {
+		// #4963: retire before cancel (see the v9 swap path).
+		for _, e := range oldExps {
+			e.Retire()
+		}
 		oldCancel()
 		if oldWg != nil {
 			oldWg.Wait()
@@ -417,6 +441,10 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 // teardownIPFIXLocked is the IPFIX equivalent of teardownV9Locked. The
 // caller MUST hold ipfixReconMu and MUST unpublish d.ipfixBundlePtr first.
 func (d *Daemon) teardownIPFIXLocked() {
+	// #4963: retire before cancel (see teardownV9Locked).
+	for _, exp := range d.ipfixExporters {
+		exp.Retire()
+	}
 	if d.ipfixCancel != nil {
 		d.ipfixCancel()
 	}
@@ -618,26 +646,40 @@ func (d *Daemon) FlowExportBatchStats() []flowexport.ExporterBatchStats {
 	if b := d.flowBundle.Load(); b != nil {
 		for _, g := range b.groups {
 			out = append(out, flowexport.ExporterBatchStats{
-				Protocol: "netflow-v9",
-				Instance: g.ec.InstanceName,
-				Template: g.ec.TemplateName,
-				Depth:    g.exp.BatchDepth(),
-				MaxDepth: g.exp.BatchMaxDepth(),
-				Dropped:  g.exp.BatchDropped(),
+				Protocol:       "netflow-v9",
+				Instance:       g.ec.InstanceName,
+				Template:       g.ec.TemplateName,
+				Depth:          g.exp.BatchDepth(),
+				MaxDepth:       g.exp.BatchMaxDepth(),
+				Dropped:        g.exp.BatchDropped(),
+				HandoffDropped: g.exp.HandoffDropped(),
 			})
 		}
 	}
 	if b := d.ipfixBundlePtr.Load(); b != nil {
 		for _, g := range b.groups {
 			out = append(out, flowexport.ExporterBatchStats{
-				Protocol: "ipfix",
-				Instance: g.ec.InstanceName,
-				Template: g.ec.TemplateName,
-				Depth:    g.exp.BatchDepth(),
-				MaxDepth: g.exp.BatchMaxDepth(),
-				Dropped:  g.exp.BatchDropped(),
+				Protocol:       "ipfix",
+				Instance:       g.ec.InstanceName,
+				Template:       g.ec.TemplateName,
+				Depth:          g.exp.BatchDepth(),
+				MaxDepth:       g.exp.BatchMaxDepth(),
+				Dropped:        g.exp.BatchDropped(),
+				HandoffDropped: g.exp.HandoffDropped(),
 			})
 		}
 	}
 	return out
+}
+
+// FlowExportHandoffDropped returns the fixed-cardinality per-family totals of
+// session-close records rejected because they reached an exporter that had
+// already been retired during a reconcile (#4963). Before the admission lease
+// such a record was silently appended into a batch nothing would drain again —
+// permanently stranded with every queue/collector metric looking healthy.
+// These two counters survive exporter churn (each exporter increments the
+// shared family counter), so a nonzero value is the operator-visible signal
+// that day-2 flow-export reconciles are losing close records at handoff.
+func (d *Daemon) FlowExportHandoffDropped() (netflowV9, ipfix uint64) {
+	return d.flowHandoffDropped.Load(), d.ipfixHandoffDropped.Load()
 }
