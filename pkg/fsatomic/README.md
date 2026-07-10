@@ -107,6 +107,16 @@ pre/post classification: a post-rename failure is `*PostRenameSyncError`
 with the NEW content visible on disk; the pre-rename rename/temp-fsync
 failures are NOT `*PostRenameSyncError` and leave the OLD content intact.
 
+`SetAfterRenameSyncDirForTesting(fn) (restore func())` (#5234) exports that
+same post-rename seam so a DEPENDENT package's test can force the failure
+through a `WriteFileDurable` call it does not control directly. `pkg/configstore`
+uses it to drive a REAL post-rename failure through `db.WriteActive` and prove
+the `*PostRenameSyncError` classification survives the DB layer's
+`fmt.Errorf("persist %s: %w", …)` wrap (the converge-to-C tests otherwise
+inject via the Store's `writeActiveFn` seam, which bypasses that wrap). It is
+test-only — production code must never call it; it mutates a process-global
+seam and is not safe under `t.Parallel`.
+
 ## Canary (`canary_test.go`)
 
 `TestNoDirectOsWriteFile` is the writer-class enforcement test. It walks

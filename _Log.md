@@ -44895,6 +44895,23 @@ top.
 - **File(s)**: pkg/flowexport/transport.go,
   pkg/flowexport/maxdepth_race_5048_test.go
 
+## 2026-07-10 — #5234 fsatomic/configstore post-rename durability classification coverage
+- **Timestamp**: 2026-07-10
+- **Action**: Close the #5234 test-coverage gap (follow-up to #5185/#5230).
+  The converge-to-C tests inject via the Store `writeActiveFn` seam, which
+  bypasses `db.go writeTreeMarked`'s `fmt.Errorf("persist %s: %w", …)` wrap,
+  so nothing proved `isPostRenameDurabilityFailure` (errors.As) still
+  classifies the `*PostRenameSyncError` through that `%w`. Exported the
+  unexported fsatomic post-rename seam as `SetAfterRenameSyncDirForTesting`
+  (reuses the existing `afterRenameSyncDir`/`SyncDir` primitives — no new
+  fsync path) so a configstore test can drive a REAL post-rename dir-fsync
+  failure through `db.WriteActive`. Added a focused boundary test and an
+  end-to-end converge test. Proved RED-on-revert: downgrading db.go's `%w`
+  to `%v` makes both fail (classification flattens → reject instead of
+  converge). No production behavior change.
+- **File(s)**: pkg/fsatomic/test_seams.go (new),
+  pkg/configstore/postrename_dbboundary_5234_test.go (new),
+  pkg/fsatomic/README.md, pkg/configstore/README.md, _Log.md
 ## 2026-07-10 — #5031 redact raw error from unauthenticated /health
 
 - **Timestamp**: 2026-07-10
