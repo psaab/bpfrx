@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -559,18 +560,44 @@ func (m *Manager) ClearDUID(ifaceName string) error {
 	return nil
 }
 
-// ClearAllDUIDs removes all persisted DUIDs.
-func (m *Manager) ClearAllDUIDs() {
+// ClearAllDUIDs removes every DHCPv6 DUID this manager knows about — both the
+// in-memory cache AND every DUID persisted on disk, including a DUID whose
+// client has not called getDUID since the last restart (present on disk but
+// absent from m.duids). Iterating only m.duids left such persisted DUIDs behind
+// while the API reported "all cleared" (#4909). Delete errors are aggregated
+// and returned so the caller never reports success while an I/O or permission
+// error stranded a DUID file.
+func (m *Manager) ClearAllDUIDs() error {
+	// Union of in-memory cached interfaces and interfaces with a persisted DUID
+	// file, so a DUID untouched since restart is still enumerated.
+	names := make(map[string]struct{})
 	m.mu.Lock()
-	ifaces := make([]string, 0, len(m.duids))
 	for k := range m.duids {
-		ifaces = append(ifaces, k)
+		names[k] = struct{}{}
 	}
 	m.mu.Unlock()
 
-	for _, ifName := range ifaces {
-		m.ClearDUID(ifName)
+	const prefix = "dhcpv6-duid-"
+	entries, err := os.ReadDir(m.stateDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("enumerate DUID state dir: %w", err)
 	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if name, ok := strings.CutPrefix(e.Name(), prefix); ok {
+			names[name] = struct{}{}
+		}
+	}
+
+	var errs []error
+	for ifName := range names {
+		if err := m.ClearDUID(ifName); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // getDUID returns the DUID for an interface, loading from disk or generating
@@ -617,8 +644,18 @@ func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
 		}
 	}
 
-	// Persist
+	// Persist. A DUID-LLT embeds a generation timestamp, so a DUID-LLT that
+	// never reaches disk is EPHEMERAL: the next restart regenerates a different
+	// Time, the DHCPv6 server sees a brand-new client, and the old lease lingers
+	// (#4909). Surface the persist failure for the time-based DUID instead of
+	// silently handing out an unstable identity. A DUID-LL is a pure function of
+	// the hardware address — byte-identical across restart even if never
+	// persisted — so a persist failure there is benign and only logged.
 	if err := m.saveDUID(ifaceName, duid); err != nil {
+		if duidType == "duid-llt" {
+			return nil, fmt.Errorf("persist DUID-LLT for %s (unstable across restart if not persisted): %w",
+				ifaceName, err)
+		}
 		slog.Warn("DHCPv6: failed to persist DUID",
 			"interface", ifaceName, "err", err)
 	}

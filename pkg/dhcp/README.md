@@ -169,6 +169,19 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   config apply.
 - DUID is cached per-interface in the state directory with type hints
   (`duid-ll`, `duid-llt`).
+  - **A DUID-LLT that cannot be persisted is a hard error (#4909).** A
+    DUID-LLT embeds a generation timestamp, so an unpersisted one is ephemeral
+    — the next restart mints a different Time, the server sees a new client, and
+    the old lease lingers. `getDUID` now surfaces the persist failure for
+    `duid-llt` instead of silently handing out an unstable identity. A `duid-ll`
+    is a pure function of the hardware address (byte-identical across restart),
+    so its persist failure stays benign (logged, non-fatal).
+  - **`ClearAllDUIDs` clears persisted DUIDs and surfaces errors (#4909).** It
+    unions the in-memory cache with the `dhcpv6-duid-*` files on disk, so a DUID
+    a client has not re-fetched since restart (on disk, absent from the cache)
+    is still removed, and it returns an aggregated error rather than reporting
+    "all cleared" while an I/O/permission failure stranded a file. The gRPC /
+    REST / CLI clear-identifier handlers propagate that error.
 - The DHCP client owns the address. `pkg/networkd` deliberately skips
   address reconciliation on DHCP-marked interfaces.
 - DHCP-learned default routes go into FRR with admin distance 200 — lower
