@@ -581,16 +581,33 @@ func (d *Daemon) applyKernelTuning(cfg *config.Config) {
 	}
 }
 
+// sshKnownHostsPath is the OpenSSH global known-hosts file xpfd owns and fully
+// rewrites from security { ssh-known-hosts }. Overridable in tests so the
+// write/remove side effects can be exercised against a temp dir.
+var sshKnownHostsPath = "/etc/ssh/ssh_known_hosts"
+
+// sshKnownHostsHeader marks the file as xpf-owned. Both the write path and the
+// empty-desired-state removal path key off this exact string: the daemon
+// rewrites the file only when it renders content, and removes it only when the
+// on-disk file begins with this header — never a hand-maintained/foreign
+// ssh_known_hosts.
+const sshKnownHostsHeader = "# Managed by xpfd — do not edit\n"
+
 // applySSHKnownHosts writes /etc/ssh/ssh_known_hosts from
-// security { ssh-known-hosts { host ... } } config.
+// security { ssh-known-hosts { host ... } } config. When the desired trust is
+// cleared (no configured hosts) the xpf-owned file is REMOVED, so a revoked or
+// compromised host key can never outlive the config that trusted it (#5112):
+// applied durable trust must not outlive desired trust. The removal is
+// ownership-guarded — a file lacking the managed header is left untouched.
 func (d *Daemon) applySSHKnownHosts(cfg *config.Config) {
-	const path = "/etc/ssh/ssh_known_hosts"
+	path := sshKnownHostsPath
 	if len(cfg.Security.SSHKnownHosts) == 0 {
+		removeManagedSSHKnownHosts(path)
 		return
 	}
 
 	var buf strings.Builder
-	buf.WriteString("# Managed by xpfd — do not edit\n")
+	buf.WriteString(sshKnownHostsHeader)
 	// Sort hosts for deterministic output
 	var hosts []string
 	for h := range cfg.Security.SSHKnownHosts {
@@ -631,6 +648,40 @@ func (d *Daemon) applySSHKnownHosts(cfg *config.Config) {
 		return
 	}
 	slog.Info("SSH known hosts written", "hosts", len(cfg.Security.SSHKnownHosts))
+}
+
+// removeManagedSSHKnownHosts removes the xpf-owned ssh_known_hosts file when
+// the desired trust is empty. It deletes the file ONLY when the on-disk
+// content begins with the managed header, so a hand-maintained or otherwise
+// foreign ssh_known_hosts is never touched. An absent file is a no-op.
+//
+// Unlike the write path (fsatomic.WriteFileAtomic — no fsync, because a
+// lost-on-power-cut rewrite simply re-renders the SAME trust next apply), the
+// removal is the DANGEROUS direction: a lost unlink would resurrect a revoked,
+// now-untrusted host key on reboot. So the parent directory is fsynced after
+// the unlink to make the removal durable across power loss.
+func removeManagedSSHKnownHosts(path string) {
+	current, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("failed to read ssh known hosts for removal", "path", path, "err", err)
+		}
+		return
+	}
+	if !strings.HasPrefix(string(current), sshKnownHostsHeader) {
+		// Foreign / hand-maintained file — not ours to delete.
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("failed to remove ssh known hosts", "path", path, "err", err)
+		}
+		return
+	}
+	if err := fsatomic.SyncDir(filepath.Dir(path)); err != nil {
+		slog.Warn("failed to fsync dir after ssh known hosts removal", "path", path, "err", err)
+	}
+	slog.Info("SSH known hosts cleared; managed file removed", "path", path)
 }
 
 // zoneinfoRoot is the directory tree a `system time-zone` value may reference.

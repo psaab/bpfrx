@@ -290,6 +290,16 @@ Special cases:
   resolved cgo-free from `/etc/passwd` (`lookupUIDGID` — never `os/user`).
 - **`WithOwner` vs `WithPreserveExisting` precedence**: if both are set,
   owner = `WithOwner`'s, mode = preserved-existing's (explicit owner wins).
+- **`ssh_known_hosts` WRITE is AtomicGeneratedConfig, but its REMOVAL
+  fsyncs the parent dir** (#5112): the write is a no-fsync
+  `WriteFileAtomic` because a lost-on-power-cut rewrite just re-renders the
+  SAME trust next apply. Clearing `security ssh-known-hosts` REMOVES the
+  xpf-owned file (`applySSHKnownHosts` → `removeManagedSSHKnownHosts`,
+  ownership-guarded on the managed header so a foreign/hand-maintained file
+  is never deleted), and that removal fsyncs the parent dir
+  (`fsatomic.SyncDir`): a lost unlink is the DANGEROUS direction — it would
+  resurrect a revoked, now-untrusted host key on reboot. Applied durable
+  trust must not outlive desired trust.
 
 Rules of thumb:
 
