@@ -243,6 +243,18 @@ contract.
   the HTTP path), both capped at the 150s `diagExecCeiling`; the same
   formulas live in `pkg/api/exec_timeout.go` for the REST siblings, and
   `streamDiagCmd` kills the child promptly when a stream send fails.
+  `streamDiagCmd` must also reap the child on the scanner-error path
+  (#5060): a combined-output line larger than the scanner token cap
+  yields `bufio.ErrTooLong`, and — exactly as on the send-failure path —
+  the scan goroutine must `cancel()` + `pr.Close()` before the waiter
+  returns, or exec.Cmd's internal copy goroutine stays wedged in
+  `pw.Write` (WaitDelay closes only the exec-owned OS pipes, not this
+  `io.Pipe`) and the RPC leaks past the deadline. The cleanup is a
+  `defer` so it fires on every scanner exit; the per-line token is a
+  deliberate `Scanner.Buffer` cap (`diagScanMaxToken`), and each
+  operator-supplied field (target/source/routing-instance) is bounded at
+  `maxDiagArgLen` at the RPC boundary so a multi-kilobyte argument is
+  rejected with `InvalidArgument` before it can reach exec.
   The argv builders (`buildPingArgv`/`buildTracerouteArgv`) place the
   user-supplied target after a `--` end-of-options separator so a
   `-`-prefixed target is an operand, not a flag (option-confusion
