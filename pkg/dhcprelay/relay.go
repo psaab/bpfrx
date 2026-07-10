@@ -1138,15 +1138,29 @@ func (m *Manager) runRelaySession(ctx context.Context,
 				continue
 			}
 
-			// Set giaddr to our interface IP so the server knows where to reply.
-			pkt.GatewayIPAddr = giaddr
+			// RFC 1542 §4.1.1 / RFC 3046 relay chaining: a nonzero inbound
+			// giaddr means a DOWNSTREAM relay is the FIRST relay on the
+			// client's segment and already stamped both the giaddr and the
+			// relay-agent Option 82. That first relay OWNS them: the server
+			// selects the client's address pool from the giaddr it sees and
+			// unicasts its OFFER/ACK back to giaddr:67, and the original
+			// circuit-id must survive so the operator's per-port policy still
+			// applies. An intermediate relay MUST preserve both and only
+			// touch the BOOTP hops field (#5071). Overwriting the giaddr makes
+			// the server lease from the wrong pool and reply to the wrong
+			// relay; overwriting Option 82 destroys the downstream circuit-id.
+			// Capture the chained condition BEFORE any mutation below.
+			chained := giaddrIsSet(pkt.GatewayIPAddr)
 
 			// Enforce the RFC 1542 §4.1.1 hop limit BEFORE incrementing.
 			// HopCount is uint8: checking after a ++ lets an incoming value
 			// of 255 wrap to 0 and slip past a post-increment ">= limit"
 			// test, defeating loop protection. A request that already carries
 			// the limit has reached it and must be dropped. The limit is the
-			// group's `overrides maximum-hop-count` (default 16) — #4309.
+			// group's `overrides maximum-hop-count` (default 16) — #4309. This
+			// loop guard applies to first-hop AND chained requests; it is most
+			// load-bearing on a chained ring, where a misconfigured downstream
+			// relay loop would otherwise circulate the request forever.
 			if pkt.HopCount >= ir.maxHopCount {
 				ir.requestsDroppedMaxHops.Add(1)
 				slog.Warn("dhcp-relay: hop count exceeded, dropping",
@@ -1155,8 +1169,21 @@ func (m *Manager) runRelaySession(ctx context.Context,
 			}
 			pkt.HopCount++
 
-			// Add Option 82 (Relay Agent Information) with circuit-id sub-option.
-			addOption82(pkt, ifaceName)
+			if chained {
+				// Chained downstream relay: preserve giaddr AND the existing
+				// relay-agent Option 82 untouched (do NOT stamp our giaddr and
+				// do NOT Del/overwrite Option 82). Only the hops field above
+				// was modified.
+				slog.Debug("dhcp-relay: preserving downstream giaddr and Option 82 (relay chain)",
+					"interface", ifaceName,
+					"giaddr", pkt.GatewayIPAddr, "hops", pkt.HopCount)
+			} else {
+				// First hop (inbound giaddr == 0): stamp our interface IP so
+				// the server knows where to reply, and insert Option 82 (Relay
+				// Agent Information) with the circuit-id sub-option.
+				pkt.GatewayIPAddr = giaddr
+				addOption82(pkt, ifaceName)
+			}
 
 			// Unicast the modified packet to each server in the active group.
 			relayData := pkt.ToBytes()
@@ -1507,6 +1534,17 @@ func clientRequestRelayable(msgType dhcpv4.MessageType) bool {
 // non-6-byte chaddr falls back to broadcast (the L2 frame would be malformed).
 func l2Eligible(pkt *dhcpv4.DHCPv4) bool {
 	return pkt.HWType == iana.HWTypeEthernet && len(pkt.ClientHWAddr) == 6
+}
+
+// giaddrIsSet reports whether a BOOTP giaddr (GatewayIPAddr) field carries a
+// real relay address — i.e. a DOWNSTREAM relay already stamped it and this node
+// is an intermediate hop in a relay chain (RFC 1542 §4.1.1 / RFC 3046). A zero
+// or unset giaddr (0.0.0.0 or nil) means this relay is the first hop on the
+// client segment. Comparison is form-agnostic (net.IP.Equal handles the 4-byte
+// vs 4-in-16 form), so a zero in either representation reads as unset.
+func giaddrIsSet(ip net.IP) bool {
+	v4 := ip.To4()
+	return v4 != nil && !v4.Equal(net.IPv4zero)
 }
 
 // addOption82 inserts or replaces the Relay Agent Information option (82)
