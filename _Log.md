@@ -43959,10 +43959,14 @@ top.
   **File(s)**: pkg/ra/ra.go, pkg/ra/per_iface_epoch_4961_test.go, pkg/ra/README.md
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4963 stop flow-export session-close records being silently stranded when a callback loaded the pre-reconcile bundle just before it was retired. Added an allocation-free admission lease to flowBatch (retired flag + inflight atomic + handoffDropped counter + injected fixed-cardinality family counter). add() rejects+counts a post-retire record instead of appending it into a batch nothing drains; Exporter/IPFIXExporter.Retire() (called before cancel in both reconcile swap + teardown paths) drains in-flight admits so records admitted before the final flush are still flushed. Surfaced HandoffDropped in ExporterBatchStats + Daemon.FlowExportHandoffDropped().
+  **File(s)**: pkg/flowexport/transport.go, pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go, pkg/flowexport/handoff_lease_4963_test.go, pkg/flowexport/README.md, pkg/daemon/daemon.go, pkg/daemon/daemon_flowexport.go
   **Action**: #4964 stop applyAggregator leaking an append-only EventReader callback + a never-flushed 20k-key SessionAggregator per report-enabled commit. Register one stable indirection callback (aggregationCallback) exactly once via aggCBOnce, publish the live aggregator through an atomic.Pointer (aggregatorPtr), swap-to-nil-before-cancel on retire — mirrors the #3932 TraceWriter / #2075 flowexport pattern. Removed the write-only aggregator field; added aggReconMu.
   **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_system.go, pkg/daemon/aggregator_callback_4964_test.go
 
 - **Timestamp**: 2026-07-09
+  **Action**: #4970 fix remote completion cursor unit mismatch. The Tab caller (remoteCompleter.Do) sent Pos as a RUNE index while the server's Complete slices req.Line[:req.Pos] by BYTES, so a multibyte rune before the cursor truncated the prefix mid-code-point. Added completionCursor() sending int32(len(text)) (byte offset, matching the already-correct `?` listener); hardened the server to reject a mid-rune byte offset with InvalidArgument (utf8.RuneStart) instead of emitting corrupted text; documented the byte-offset contract on CompleteRequest.pos in the proto.
+  **File(s)**: cmd/cli/shared.go, cmd/cli/completion_pos_4970_test.go, pkg/grpcapi/server_cluster.go, pkg/grpcapi/complete_utf8_pos_4970_test.go, proto/xpf/v1/xpf.proto
   **Action**: #4968 make the remote CLI pipe filter case-SENSITIVE to match the local CLI. Extracted the remote dispatchWithPipe switch into a testable applyPipeFilter() helper and removed the strings.ToLower on both operands for match/grep/except/find so `| match Foo` no longer matches `foo` on remote while missing it on local (Junos `| match` never case-folds). Aligns with pkg/cli.filterStream's bare strings.Contains(line, pipeArg).
   **File(s)**: cmd/cli/shared.go, cmd/cli/pipe_filter_case_4968_test.go
 

@@ -6,6 +6,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/cmdtree"
@@ -428,6 +429,15 @@ func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Compl
 	}
 	text := req.Line
 	if int(req.Pos) < len(text) {
+		// req.Pos is a BYTE offset into req.Line. Refuse a cut that would
+		// land inside a multibyte UTF-8 rune rather than slice a code point
+		// in half and emit corrupted completion text. A byte offset is a
+		// valid boundary when the byte at that index is a rune start (an
+		// ASCII byte or a leading multibyte byte), not a 10xxxxxx
+		// continuation byte (#4970).
+		if !utf8.RuneStart(text[req.Pos]) {
+			return nil, status.Error(codes.InvalidArgument, "position splits a UTF-8 rune")
+		}
 		text = text[:req.Pos]
 	}
 
