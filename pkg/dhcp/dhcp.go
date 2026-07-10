@@ -407,6 +407,22 @@ func (m *Manager) finishClient(key clientKey, dc *dhcpClient) {
 		m.removeAddress(key.iface, lease)
 	}
 	m.fireGatewayChange()
+	// #4874 A2: a terminal exit that removed a committed lease/PD must
+	// also re-render compiled state. The FRR DHCP default/classless
+	// routes and the v6 RA prefix are regenerated ONLY by applyConfig
+	// (from Leases() / DelegatedPrefixesForRA()), which onGatewayChange
+	// does NOT drive — it only marks the ip-monitoring overlay dirty. So
+	// without a recompile the withdrawn gateway/prefix keep being
+	// advertised until some unrelated commit (indefinitely on a DHCPv4
+	// max-retransmission exit that returns while a #1844-retained lease is
+	// still recorded). Fire only when a lease record actually existed: the
+	// pure-failure exits (no lease ever acquired) have nothing to withdraw,
+	// and the ctx.Done cancellation paths already deleted the record and
+	// are re-rendered by their surrounding applyConfig (Reconcile) or the
+	// re-acquire that follows (Renew), so they need no recompile here.
+	if lease != nil {
+		m.scheduleRecompile()
+	}
 }
 
 // Renew restarts the DHCP client for the specified interface and address
@@ -789,7 +805,7 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 		backoff = baseBackoff // reset on success
 		attempt = 0
 
-		if err := m.commitLease(key, lease, committed, nil, nil); err != nil {
+		if err := m.commitLease(key, lease, committed, nil, nil, false); err != nil {
 			slog.Warn("DHCPv4: failed to apply address",
 				"interface", ifaceName, "err", err)
 			continue
@@ -823,7 +839,7 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 			// NOT a fresh DISCOVER (#2994).
 			renewed, rerr := m.v4Exchange(ctx, ifaceName, exchangeRenew, committed)
 			if rerr == nil {
-				if cerr := m.commitLease(key, renewed, committed, nil, nil); cerr != nil {
+				if cerr := m.commitLease(key, renewed, committed, nil, nil, false); cerr != nil {
 					slog.Warn("DHCPv4: failed to apply renewed lease, re-acquiring",
 						"interface", ifaceName, "err", cerr)
 					break
@@ -863,7 +879,7 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 			// T2 rebind attempt — broadcast REBIND (#2994).
 			renewed, rerr = m.v4Exchange(ctx, ifaceName, exchangeRebind, committed)
 			if rerr == nil {
-				if cerr := m.commitLease(key, renewed, committed, nil, nil); cerr != nil {
+				if cerr := m.commitLease(key, renewed, committed, nil, nil, false); cerr != nil {
 					slog.Warn("DHCPv4: failed to apply rebound lease, re-acquiring",
 						"interface", ifaceName, "err", cerr)
 					break
@@ -919,6 +935,13 @@ func (m *Manager) abandonLeaseAfterNAK(key clientKey, committed *Lease) {
 	delete(m.leases, key)
 	m.mu.Unlock()
 	m.fireGatewayChange()
+	// #4874 A2: withdraw the FRR default/classless routes in lock-step
+	// with the address. onGatewayChange only nudges the ip-monitoring
+	// overlay; the base DHCP default route is re-rendered by applyConfig
+	// (recompile) from Leases(), so scheduling the recompile is what makes
+	// the README's "a NAK deconfigures the interface immediately" promise
+	// (#3956) cover the route, not just the kernel address.
+	m.scheduleRecompile()
 }
 
 // doDHCPv4 performs a single DHCPv4 exchange for the given mode:
@@ -1204,15 +1227,17 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 		// commitLease and the daemon's reconcileDNS reads it from
 		// Leases(); the debounced onAddressChange callback (fired by
 		// commitLease when lease content changed) drives the reconcile.
-		if err := m.commitLease(key, result.lease, committed, result.prefixes, committedPDs); err != nil {
+		// Reconcile the delegated-prefix set: store live prefixes, remove
+		// explicitly-withdrawn (valid-lifetime 0) ones, retain the held set
+		// on an absent/empty IA_PD (#4874 B, #1844 anti-outage).
+		reconciledPDs, applyPDs := reconcileDelegatedPDs(committedPDs, result.prefixes, result.withdrawnPDs)
+		if err := m.commitLease(key, result.lease, committed, reconciledPDs, committedPDs, applyPDs); err != nil {
 			slog.Warn("DHCPv6: failed to apply address",
 				"interface", ifaceName, "err", err)
 			continue
 		}
 		committed = result.lease
-		if len(result.prefixes) > 0 {
-			committedPDs = result.prefixes
-		}
+		committedPDs = reconciledPDs
 
 		if stateless {
 			slog.Info("DHCPv6: stateless options obtained",
@@ -1250,15 +1275,14 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			// fresh Solicit (#2994).
 			renewed, rerr := m.v6Exchange(ctx, ifaceName, exchangeRenew, committed, committedPDs)
 			if rerr == nil {
-				if cerr := m.commitLease(key, renewed.lease, committed, renewed.prefixes, committedPDs); cerr != nil {
+				reconciledPDs, applyPDs := reconcileDelegatedPDs(committedPDs, renewed.prefixes, renewed.withdrawnPDs)
+				if cerr := m.commitLease(key, renewed.lease, committed, reconciledPDs, committedPDs, applyPDs); cerr != nil {
 					slog.Warn("DHCPv6: failed to apply renewed lease, re-acquiring",
 						"interface", ifaceName, "err", cerr)
 					break
 				}
 				committed = renewed.lease
-				if len(renewed.prefixes) > 0 {
-					committedPDs = renewed.prefixes
-				}
+				committedPDs = reconciledPDs
 				slog.Info("DHCPv6: lease renewed",
 					"interface", ifaceName,
 					"address", committed.Address,
@@ -1286,15 +1310,14 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			// T2 rebind attempt — REBIND (multicast, no server DUID) (#2994).
 			renewed, rerr = m.v6Exchange(ctx, ifaceName, exchangeRebind, committed, committedPDs)
 			if rerr == nil {
-				if cerr := m.commitLease(key, renewed.lease, committed, renewed.prefixes, committedPDs); cerr != nil {
+				reconciledPDs, applyPDs := reconcileDelegatedPDs(committedPDs, renewed.prefixes, renewed.withdrawnPDs)
+				if cerr := m.commitLease(key, renewed.lease, committed, reconciledPDs, committedPDs, applyPDs); cerr != nil {
 					slog.Warn("DHCPv6: failed to apply rebound lease, re-acquiring",
 						"interface", ifaceName, "err", cerr)
 					break
 				}
 				committed = renewed.lease
-				if len(renewed.prefixes) > 0 {
-					committedPDs = renewed.prefixes
-				}
+				committedPDs = reconciledPDs
 				slog.Info("DHCPv6: lease rebound",
 					"interface", ifaceName,
 					"address", committed.Address,
@@ -1311,8 +1334,16 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 // dhcpv6Result holds results from a DHCPv6 exchange including both IA_NA and IA_PD.
 type dhcpv6Result struct {
-	lease    *Lease
+	lease *Lease
+	// prefixes holds the LIVE delegated prefixes (valid-lifetime > 0).
 	prefixes []DelegatedPrefix
+	// withdrawnPDs holds prefixes the reply carried with valid-lifetime 0
+	// — an RFC 8415 §12.1 explicit withdrawal (#4874 B). They are never
+	// stored or re-advertised; the commit-path reconcile removes them from
+	// the held set rather than re-granting them at the RA sender's 30-day
+	// defaults. Distinguishing an explicit withdrawal from an absent/empty
+	// IA_PD (silence) keeps the #1844 anti-outage retain-on-silence rule.
+	withdrawnPDs []DelegatedPrefix
 }
 
 // doDHCPv6 performs a single DHCPv6 exchange for the given mode.
@@ -1507,9 +1538,10 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 		addr, validLT = selectIANAAddress(adv)
 	}
 
-	// Extract IA_PD delegated prefixes
+	// Extract IA_PD delegated prefixes, split into live and (RFC 8415
+	// §12.1) explicitly-withdrawn valid-lifetime-0 prefixes (#4874 B).
 	if wantPD {
-		result.prefixes = extractDelegatedPrefixes(adv, ifaceName, now)
+		result.prefixes, result.withdrawnPDs = extractDelegatedPrefixes(adv, ifaceName, now)
 		for _, dp := range result.prefixes {
 			slog.Info("DHCPv6: received delegated prefix",
 				"interface", ifaceName,
@@ -1517,14 +1549,21 @@ func (m *Manager) parseV6Reply(ctx context.Context, ifaceName string, adv *dhcpv
 				"preferred", dp.PreferredLifetime,
 				"valid", dp.ValidLifetime)
 		}
+		for _, dp := range result.withdrawnPDs {
+			slog.Info("DHCPv6: server withdrew delegated prefix (valid-lifetime 0)",
+				"interface", ifaceName, "prefix", dp.Prefix)
+		}
 	}
 
-	// If we wanted IA_NA but didn't get an address, check if PD-only is OK
-	if wantNA && !addr.IsValid() && !wantPD {
-		return nil, fmt.Errorf("no IA_NA address in DHCPv6 reply")
-	}
-	if wantNA && !addr.IsValid() && wantPD && len(result.prefixes) == 0 {
-		return nil, fmt.Errorf("no IA_NA address or IA_PD prefix in DHCPv6 reply")
+	// A usable reply must yield either an IA_NA address or at least one
+	// LIVE delegated prefix. Count live PDs regardless of wantNA so a
+	// PD-only client (wantNA=false) whose reply carried only withdrawn
+	// (valid-lifetime 0) prefixes is treated as an acquisition/renew
+	// FAILURE and retried, not settled into an empty 1h lease (#4874 B,
+	// Codex F6). The trailing wantNA||wantPD guard keeps a degenerate
+	// no-IA config on its prior no-reject path.
+	if !addr.IsValid() && len(result.prefixes) == 0 && (wantNA || wantPD) {
+		return nil, fmt.Errorf("no usable IA_NA address or live IA_PD prefix in DHCPv6 reply on %s", ifaceName)
 	}
 
 	lease := &Lease{
@@ -1647,9 +1686,16 @@ func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []
 	return mods
 }
 
-// extractDelegatedPrefixes parses IA_PD options from a DHCPv6 reply.
-func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Time) []DelegatedPrefix {
-	var result []DelegatedPrefix
+// extractDelegatedPrefixes parses IA_PD options from a DHCPv6 reply,
+// partitioning the prefixes into live (valid-lifetime > 0) and explicitly
+// withdrawn (valid-lifetime 0) sets. A zero valid-lifetime IA_PD is an RFC
+// 8415 §12.1 withdrawal: it must never be stored or re-advertised — this
+// mirrors selectIANAAddress's skip of a valid-lifetime-0 IAADDR (#4383).
+// The caller uses the withdrawn set to remove the prefix from the held set
+// (per-prefix, so a co-held prefix the reply merely omitted is retained)
+// rather than keeping it and re-granting it at the RA sender's 30-day
+// defaults (#4874 B).
+func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Time) (live, withdrawn []DelegatedPrefix) {
 	for _, opt := range msg.Options.Options {
 		iapdOpt, ok := opt.(*dhcpv6.OptIAPD)
 		if !ok {
@@ -1664,16 +1710,21 @@ func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Ti
 			if !ok {
 				continue
 			}
-			result = append(result, DelegatedPrefix{
+			dp := DelegatedPrefix{
 				Interface:         ifaceName,
 				Prefix:            netip.PrefixFrom(ip, ones),
 				PreferredLifetime: prefix.PreferredLifetime,
 				ValidLifetime:     prefix.ValidLifetime,
 				Obtained:          now,
-			})
+			}
+			if prefix.ValidLifetime == 0 {
+				withdrawn = append(withdrawn, dp)
+			} else {
+				live = append(live, dp)
+			}
 		}
 	}
-	return result
+	return live, withdrawn
 }
 
 // discoverIPv6Router finds the link-local address of an IPv6 router on the

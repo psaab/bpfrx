@@ -1,6 +1,7 @@
 package dhcp
 
 import (
+	"net/netip"
 	"slices"
 	"time"
 )
@@ -99,6 +100,51 @@ func delegatedPrefixesChanged(prev, next []DelegatedPrefix) bool {
 	return false
 }
 
+// reconcileDelegatedPDs applies RFC 8415 per-prefix IA_PD withdrawal
+// semantics (#4874 B). Given the currently-held prefixes (prior), the
+// live prefixes in a reply (valid-lifetime > 0) and the explicitly
+// withdrawn ones (valid-lifetime 0):
+//
+//   - no live AND no withdrawn → an absent/empty IA_PD is SILENCE, not a
+//     withdrawal: retain prior unchanged (apply=false), the #1844
+//     anti-outage rule (a server that omits the IA_PD on a renew must not
+//     drop the delegation).
+//   - otherwise → (prior \ withdrawn) ∪ live, apply=true. The reconcile is
+//     per-prefix, never a blunt clear-all (Codex F5): a prefix the reply
+//     neither renewed nor withdrew (co-held, merely omitted) is retained.
+//     Live prefixes are authoritative — on a RENEW servers echo every held
+//     PD, so live is normally the whole set and carries fresh lifetimes.
+//
+// apply reports whether the caller should write result to the stored PD
+// set (and delete the map entry when result is empty). When apply is false
+// the result equals prior and the stored set must be left untouched.
+func reconcileDelegatedPDs(prior, live, withdrawn []DelegatedPrefix) (result []DelegatedPrefix, apply bool) {
+	if len(live) == 0 && len(withdrawn) == 0 {
+		return prior, false
+	}
+	withdrawnSet := make(map[netip.Prefix]struct{}, len(withdrawn))
+	for _, w := range withdrawn {
+		withdrawnSet[w.Prefix] = struct{}{}
+	}
+	liveSet := make(map[netip.Prefix]struct{}, len(live))
+	for _, l := range live {
+		liveSet[l.Prefix] = struct{}{}
+	}
+	// Retain co-held prefixes the reply neither withdrew nor renewed; a
+	// renewed prefix is re-added below with the reply's fresh lifetimes.
+	for _, p := range prior {
+		if _, w := withdrawnSet[p.Prefix]; w {
+			continue
+		}
+		if _, l := liveSet[p.Prefix]; l {
+			continue
+		}
+		result = append(result, p)
+	}
+	result = append(result, live...)
+	return result, true
+}
+
 // commitLease installs a freshly acquired or renewed lease as the
 // active one for key. It is the single commit path shared by initial
 // acquisition, T1 renew, and T2 rebind (#1777), so a renewal result
@@ -110,10 +156,15 @@ func delegatedPrefixesChanged(prev, next []DelegatedPrefix) bool {
 //     applied — re-acquisition-equivalent handling; applyAddress's
 //     AddrReplace only installs the new address and would leave the old
 //     one lingering on the interface.
-//   - The lease record (and, for DHCPv6, any delegated prefixes) is
-//     stored for Leases()/DelegatedPrefixes() consumers. A reply with
-//     no IA_PD options leaves previously delegated prefixes in place
-//     (pre-#1777 semantics).
+//   - The lease record is stored for Leases() consumers. For DHCPv6, the
+//     delegated-prefix set is updated only when applyPDs is true: prefixes
+//     holds the already-reconciled set (see reconcileDelegatedPDs) and is
+//     written verbatim, deleting the map entry when it is empty (an
+//     explicit all-withdrawn reply, #4874 B). applyPDs is false for v4 and
+//     for a v6 reply that carried no IA_PD information, which leaves the
+//     previously delegated prefixes in place (the #1844 retain-on-silence
+//     rule); v4 must never touch the iface-keyed PD map that a co-resident
+//     v6 client owns.
 //   - The debounced onAddressChange callback fires only when lease
 //     content actually changed. The callback re-enters the daemon's
 //     applyConfig (full recompile) and thus Reconcile; an
@@ -122,10 +173,11 @@ func delegatedPrefixesChanged(prev, next []DelegatedPrefix) bool {
 //     firing is never a restart-loop hazard — only recompile churn.
 //
 // prev is the lease currently applied to the interface (nil on first
-// acquisition); prevPDs the delegated prefixes currently stored. On
-// error (address apply failed) nothing is stored and the caller falls
-// back to re-acquisition.
-func (m *Manager) commitLease(key clientKey, lease, prev *Lease, prefixes, prevPDs []DelegatedPrefix) error {
+// acquisition); prevPDs the delegated prefixes currently stored (for the
+// change-detection compare). prefixes is the already-reconciled PD set to
+// store when applyPDs is true. On error (address apply failed) nothing is
+// stored and the caller falls back to re-acquisition.
+func (m *Manager) commitLease(key clientKey, lease, prev *Lease, prefixes, prevPDs []DelegatedPrefix, applyPDs bool) error {
 	if lease.Address.IsValid() {
 		if prev != nil && prev.Address.IsValid() && prev.Address != lease.Address {
 			m.removeAddress(key.iface, prev)
@@ -137,8 +189,14 @@ func (m *Manager) commitLease(key clientKey, lease, prev *Lease, prefixes, prevP
 
 	m.mu.Lock()
 	m.leases[key] = lease
-	if len(prefixes) > 0 {
-		m.delegatedPDs[key.iface] = prefixes
+	if applyPDs {
+		if len(prefixes) > 0 {
+			m.delegatedPDs[key.iface] = prefixes
+		} else {
+			// An explicit all-withdrawn reply: drop the delegation so
+			// DelegatedPrefixesForRA() stops advertising it (#4874 B).
+			delete(m.delegatedPDs, key.iface)
+		}
 	}
 	m.mu.Unlock()
 
@@ -151,8 +209,11 @@ func (m *Manager) commitLease(key clientKey, lease, prev *Lease, prefixes, prevP
 		m.fireGatewayChange()
 	}
 
-	if prev == nil || leaseContentChanged(prev, lease) ||
-		(len(prefixes) > 0 && delegatedPrefixesChanged(prevPDs, prefixes)) {
+	// A PD change (including a withdrawal that empties the set) must
+	// re-render RA. Gate on applyPDs so a retain-on-silence commit does not
+	// diff against an empty prefixes arg and spuriously fire (#4874 B).
+	pdChanged := applyPDs && delegatedPrefixesChanged(prevPDs, prefixes)
+	if prev == nil || leaseContentChanged(prev, lease) || pdChanged {
 		m.scheduleRecompile()
 	}
 	return nil

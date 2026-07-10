@@ -111,9 +111,12 @@ the debounced `onAddressChange` callback when content changed.
   changed subnets). Per RFC 2131 §4.4.5 a NAK in the RENEWING *or*
   REBINDING state deconfigures the interface immediately
   (`abandonLeaseAfterNAK`: remove the kernel address, drop the lease
-  record, fire `onGatewayChange`) and returns to INIT — a fresh DISCOVER
-  with no prior lease — rather than keeping the revoked address until
-  T2. `doDHCPv4` wraps the sentinel `errDHCPNAK` on a NAK reply so the
+  record, fire `onGatewayChange`, then `scheduleRecompile`) and returns
+  to INIT — a fresh DISCOVER with no prior lease — rather than keeping
+  the revoked address until T2. The `scheduleRecompile` is what makes
+  "immediately" cover the FRR default/classless routes too, not just the
+  kernel address: those routes are re-rendered only by `applyConfig`
+  (#4874 A2). `doDHCPv4` wraps the sentinel `errDHCPNAK` on a NAK reply so the
   run loop distinguishes the two via `errors.Is`. A malformed/unmatched
   timeout renew is therefore still fail-safe (degrades to the previous
   full-acquisition path), and an explicit revocation is honored at once.
@@ -125,8 +128,14 @@ the debounced `onAddressChange` callback when content changed.
   it on every T1 interval would recompile the dataplane periodically
   for nothing. `Reconcile` keys on config identity (never lease state),
   so a fire is never a restart-loop hazard — only recompile churn.
-  An IA_PD reply with no prefixes retains previously delegated prefixes
-  (and does not count as a change).
+  An IA_PD reply with **no prefixes** (silence) retains previously
+  delegated prefixes and does not count as a change (the #1844
+  anti-outage rule). A prefix returned with **valid-lifetime 0** is an
+  RFC 8415 §12.1 *withdrawal*, not silence: `reconcileDelegatedPDs`
+  removes it from the held set per-prefix (`(prior \ withdrawn) ∪ live`,
+  never a blunt clear-all) so it is neither stored nor re-advertised, and
+  fires the recompile so the RA sender drops it (#4874 B). See the
+  zero-lifetime IA_PD note under Gotchas.
 - The decision logic is concentrated in `commitLease` / `renewalTimers`
   / `leaseContentChanged` / `delegatedPrefixesChanged` and pinned by
   `commit_test.go`. The run-loop state machine itself (the
@@ -174,6 +183,24 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   with the CHOSEN address's own valid-lifetime, never a stale value from
   a different IAADDR. This replaced a last-wins overwrite that installed
   whichever address enumerated last. Pinned by `dhcpv6_iana_test.go`.
+- **DHCPv6 zero-valid-lifetime IA_PD is a withdrawal, not a lease** (#4874
+  B, RFC 8415 §12.1). Symmetric to the IA_NA skip above:
+  `extractDelegatedPrefixes` partitions a reply's prefixes into *live*
+  (valid-lifetime > 0) and *withdrawn* (valid-lifetime 0); the withdrawn
+  ones are never stored or re-advertised. Before the fix a server that
+  revoked an IA_PD by returning it with valid-lifetime 0 (while renewing
+  the IA_NA) had the zeroed prefix stored, kept by
+  `DelegatedPrefixesForRA`, and re-advertised at the RA sender's 30-day
+  valid / 7-day preferred defaults. `reconcileDelegatedPDs` applies
+  per-prefix withdrawal semantics — `(prior \ withdrawn) ∪ live`, an
+  absent/empty IA_PD stays on the retain path (silence ≠ withdrawal), a
+  co-held prefix the reply merely omitted is retained — and the run loop
+  updates `committedPDs` to the reconciled set so the next RENEW does not
+  echo the withdrawn prefix and invite a re-grant. On acquire, a reply
+  that yields no IA_NA address and no *live* prefix (only withdrawn PDs)
+  is an acquisition failure and is retried, never settled into an empty
+  1h lease — counted regardless of `wantNA` so a PD-only client cannot
+  fall through. Pinned by `dhcp_lease_expiry_4874_test.go`.
 - **RFC 3442 classless static routes (option 121 / legacy 249, #4118).**
   `leaseFromACKv4` parses option 121 (the standard `ClasslessStaticRoute`
   accessor) and falls back to the legacy Microsoft option 249 (raw
@@ -204,11 +231,22 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   expired lease should stop being used). An explicit **DHCPNAK is
   honored** (#3956): it deconfigures immediately via
   `abandonLeaseAfterNAK` — see "Timeout falls through, NAK abandons"
-  above. **Coupling rule (#1844):** any lease-record removal (the NAK
-  path and, if clock expiry is ever implemented, that path too) MUST
-  route through a path that fires `onGatewayChange` (`finishClient` and
-  `abandonLeaseAfterNAK` both do), so the ip-monitoring overlay
-  withdraws its resolved next-hop in lock-step with the address.
+  above. **Coupling rule (#1844, extended #4874 A2):** any lease-record
+  removal (the NAK path, the `finishClient` max-retransmission/terminal
+  exit, and, if clock expiry is ever implemented, that path too) MUST
+  route through a path that fires **both** `onGatewayChange` AND
+  `scheduleRecompile` (`finishClient` and `abandonLeaseAfterNAK` both do).
+  `onGatewayChange` alone only marks the ip-monitoring overlay dirty; the
+  base DHCP default/classless routes (from `Leases()`) and the v6 RA
+  prefix (from `DelegatedPrefixesForRA()`) are re-rendered ONLY by
+  `applyConfig`, which the debounced `scheduleRecompile` drives — so
+  without it a terminal exit removes the address but leaves the FRR route
+  + RA prefix stale until an unrelated commit (indefinitely on the
+  `finishClient` max-retransmission exit, which does not run from an
+  `applyConfig`). The ctx.Done cancellation exits already delete the
+  record inline and are re-rendered by their surrounding `applyConfig`
+  (Reconcile) or the following re-acquire (Renew), so `finishClient`
+  fires the recompile only when a lease record actually remained.
 - **Degenerate subnet mask is refused (#4101, untrusted input).**
   `leaseFromACKv4` validates option 1 after `net.IPMask.Size()`: a zero
   mask (`0.0.0.0` → `Size()` returns `ones=0`) or a non-contiguous mask
