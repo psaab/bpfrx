@@ -148,7 +148,13 @@ func TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482(t *testing.T
 		{"match community", " match community cm1  neighbor 7.7.7.7 remote-as 65000\n"},
 		{"match as-path", " match as-path ap1  router bgp 65000\n"},
 		{"set ip next-hop", " set ip next-hop 1.2.3.4  router bgp 65000\n"},
-		{"set origin", " set origin igp  router bgp 65000\n"},
+		// NOTE: `set origin` moved OUT of this sanitize-onto-one-line list by
+		// #4919. The origin slot is now fail-closed by the validBGPOrigin
+		// render belt (only igp | egp | incomplete render), so the injection
+		// payload "igp\n router bgp 65000" is skipped entirely rather than
+		// sanitized onto one line — a strictly stronger guarantee, asserted
+		// separately below. (Parity with the route-filter CIDR fail-closed belt
+		// already documented in this test.)
 		{"set community additive", " set community 65000:2  neighbor 8.8.8.8 remote-as 65000 additive\n"},
 		{"set comm-list delete", " set comm-list clist1  neighbor 9.9.9.9 remote-as 65000 delete\n"},
 		{"set ipv6 next-hop", " set ipv6 next-hop global 2001:db8::1  router bgp 65000\n"},
@@ -164,5 +170,15 @@ func TestGeneratePolicyOptions_SetClauseAndPrefixListSanitized_4482(t *testing.T
 	// all (neither the CIDR nor its injected tail appears).
 	if strings.Contains(got, "10.9.0.0/16") {
 		t.Errorf("inline route-filter: malformed prefix should be fail-closed (skipped), got:\n%s", got)
+	}
+
+	// set origin (#4919): the invalid origin payload ("igp\n router bgp 65000")
+	// is fail-closed by the validBGPOrigin render belt — only igp | egp |
+	// incomplete render. No `set origin` line derived from the payload may
+	// appear at all (the earlier no-standalone-`router bgp`-line guard already
+	// covers the injected tail; this pins the fail-closed skip of the origin
+	// slot specifically).
+	if strings.Contains(got, "set origin igp  router bgp 65000") {
+		t.Errorf("set origin: invalid origin should be fail-closed (skipped) by #4919, got:\n%s", got)
 	}
 }
