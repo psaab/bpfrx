@@ -44842,6 +44842,43 @@ top.
 - **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
   pkg/daemon/daemon_snmp_reconcile_test.go, pkg/snmp/README.md
 
+## 2026-07-10 — #5115 term-scoped next-hop-self
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5115 [BUG frr/bgp MEDIUM] `then next-hop self` widened into a
+  neighbor-wide next-hop rewrite. `policy_render.go` scanned the effective
+  export policy with `policyStatementHasNextHopSelf` and, if ANY term
+  requested self, emitted `neighbor <peer> next-hop-self force` — an FRR knob
+  that runs AFTER route selection and rewrites the next-hop of EVERY route
+  advertised to the peer, including routes accepted by OTHER terms that never
+  asked for self (semantic widening; can redirect traffic through the
+  firewall or break third-party next-hop reachability). Fix: lower
+  `then next-hop self` per-term INSIDE the export route-map as
+  `set ip next-hop peer-address` + `set ipv6 next-hop peer-address`. In an
+  OUTBOUND route-map `peer-address` resolves to the local session address
+  (= self) and is evaluated per-route, so it rewrites ONLY the term's routes.
+  Removed both neighbor-loop knob emissions (IPv4 + IPv6) and the now-unused
+  `policyStatementHasNextHopSelf` helper. The outbound set-clause still
+  overrides iBGP / route-reflector-reflected next-hops (keeps the #2977 fix),
+  now correctly scoped; a bare `then next-hop self` term (no `from`) renders a
+  match-all sequence and keeps neighbor-wide effect. Fail-on-revert tests
+  (pkg/frr/frr_test.go): rewrote TestGenerateProtocols_BGPExportNextHopSelf
+  and ...RRClient to assert the term-scoped set-clause + NO neighbor knob;
+  added TestGenerateProtocols_BGPExportNextHopSelfTermScoped (the #5115
+  two-accepted-term widening regression: prefix A accepted without self,
+  prefix B accepted with self → exactly one set-clause, scoped to B's
+  sequence, no knob); updated TestNextHopPeerAddress and
+  ...BGPExportNoSpuriousNextHopSelf. RED-on-revert VERIFIED: restoring
+  origin/master's policy_render.go (keeping the tests) made 4 tests FAIL
+  (BGPExportNextHopSelf, ...RRClient, ...TermScoped, TestNextHopPeerAddress),
+  no-spurious correctly stayed PASS; restored → all PASS. Validation:
+  `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0;
+  `go test ./pkg/frr/... ./pkg/config/...` ok; gofmt clean. Docs:
+  pkg/frr/README.md `next-hop self` section + docs/phases.md rewritten to the
+  term-scoped route-map contract. No cluster smoke (control-plane FRR config
+  generation; verified by RED-on-revert unit tests).
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, docs/phases.md, _Log.md
 - **Timestamp**: 2026-07-10
 - **Action**: Fix flowexport batch max-depth high-water update race (#5048).
   The `maxDepth` high-water update in `flowBatch.add()` ran OUTSIDE `b.mu`
