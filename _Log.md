@@ -1,3 +1,16 @@
+## 2026-07-09 — api: CSRF/cross-site guard on REST mutations (#5055)
+
+- **Timestamp**: 2026-07-09
+  **Action**: Added `mutationCrossSiteGuard` (`pkg/api/crosssite.go`) — a
+  Fetch-Metadata resource-isolation guard wrapping the mux before
+  `authMiddleware`. Rejects (403) any non-safe-method request with cross-site
+  provenance: `Sec-Fetch-Site: cross-site|same-site`, cross-host
+  `Origin`/`Referer`, or a CORS simple form content type. Closes the
+  browser-ambient-Basic CSRF vector while leaving same-origin UI + programmatic
+  (curl/CLI/Bearer/API-key) clients untouched.
+  **File(s)**: pkg/api/crosssite.go, pkg/api/server.go,
+  pkg/api/crosssite_5055_test.go, docs/architecture.md, _Log.md
+
 ## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
 
 - **Timestamp**: 2026-07-09
