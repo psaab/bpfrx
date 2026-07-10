@@ -21,9 +21,12 @@ import (
 // policy, IKE PSKs, WireGuard private keys, and SNMP communities:
 //
 //   - .configdb/master.key  — the AES-GCM key that decrypts an encrypted DB.
-//     Removed FIRST (key-first): an interrupted wipe (crash / power loss
-//     mid-RemoveAll) can then never leave the ciphertext together with the key
-//     that decrypts it.
+//     Removed FIRST (key-first) and that removal is fsynced (.configdb) BEFORE
+//     the ciphertext body is touched (#5197): an interrupted wipe (crash /
+//     power loss mid-RemoveAll) can then never leave the ciphertext together
+//     with the key that decrypts it. Without the barrier both unlinks sit in
+//     the page cache and the filesystem is free to persist the ciphertext
+//     removal while losing the key removal, breaking the guarantee.
 //   - .configdb/            — the SSOT: active.json, candidate.json,
 //     rollback.N.json. Store.Load reloads active.json on the next boot, so the
 //     whole tree must go or the "erased" config is restored.
@@ -39,7 +42,12 @@ import (
 // the goal); removal is best-effort past a single stubborn file, but the FIRST
 // real error is returned so a silently-incomplete wipe is never reported as a
 // clean factory reset. The parent dir is fsynced at the end so the unlinks are
-// durable across a power cut before the completing reboot.
+// durable across a power cut before the completing reboot, and that final
+// directory-fsync error is now PROPAGATED (#5197) — a fsync failure means the
+// erasure may not be on stable storage, so it must not be reported as a clean
+// zeroize the way the discarded end-of-function d.Sync() previously was. The
+// durability barriers route through the package fsync seam (rbSyncDir) so a
+// dropped sync fails a test RED.
 //
 // Scope: this erases the config-DB SSOT + journal + rollback state under
 // configDir. The RENDERED service configs xpfd writes OUTSIDE configDir
@@ -54,8 +62,19 @@ func FactoryResetConfigDir(configDir, configBase string) error {
 	}
 
 	dbDir := filepath.Join(configDir, ".configdb")
-	// KEY-FIRST: master.key before the encrypted DB body.
-	fail(os.Remove(filepath.Join(dbDir, "master.key")))
+	// KEY-FIRST: master.key before the encrypted DB body. Make the key unlink
+	// DURABLE before the ciphertext is removed (#5197) — fsync .configdb so the
+	// key removal is on stable storage before RemoveAll begins. Otherwise a
+	// power cut could persist the ciphertext removal while losing the key
+	// removal, defeating the key-first cryptographic-erasure guarantee.
+	keyErr := rbRemove(filepath.Join(dbDir, "master.key"))
+	fail(keyErr)
+	if keyErr == nil {
+		// The key existed and was unlinked: make that unlink durable before the
+		// ciphertext body removal. An absent .configdb yields ErrNotExist, which
+		// fail() excludes (nothing was removed, so nothing to make durable).
+		fail(rbSyncDir(dbDir))
+	}
 	// The config SSOT (active.json, candidate.json, rollback.N.json + any
 	// residual key). RemoveAll erases the whole tree and is nil on absent.
 	fail(os.RemoveAll(dbDir))
@@ -76,13 +95,13 @@ func FactoryResetConfigDir(configDir, configBase string) error {
 		}
 	}
 
-	// fsync the parent directory so the unlinks are durable before the reboot
-	// that completes the factory reset (best-effort — a fsync failure here does
-	// not un-erase anything and must not gate the wipe result).
-	if d, derr := os.Open(configDir); derr == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
+	// fsync the parent directory so ALL the unlinks above are durable before
+	// the reboot that completes the factory reset. Unlike the discarded
+	// end-of-function d.Sync() this replaced, a sync failure here is PROPAGATED
+	// (#5197): a failed fsync means the erasure may not be on stable storage,
+	// so it must not be reported as a clean zeroize. ErrNotExist (configDir
+	// itself absent → nothing to wipe) is excluded by fail().
+	fail(rbSyncDir(configDir))
 	return firstErr
 }
 

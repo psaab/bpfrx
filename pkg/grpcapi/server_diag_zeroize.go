@@ -11,8 +11,16 @@ import (
 
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/ipsec"
 )
+
+// zeroizeSyncDir is the directory-fsync seam for the factory-reset wipe
+// (#5197). Production uses fsatomic.SyncDir; a test overrides it to record the
+// durability barrier (so a dropped fsync fails RED) and to inject a sync
+// failure. Mirrors the configstore rbSyncDir seam. Production code must never
+// mutate it.
+var zeroizeSyncDir = fsatomic.SyncDir
 
 // defaultConfigDir / defaultConfigBase mirror the daemon's config-path default
 // (cmd/xpfd `-config /etc/xpf/xpf.conf`, pkg/daemon). performZeroizeWipe erases
@@ -64,10 +72,18 @@ const (
 //     (pkg/api) regenerates a fresh pair on absence at the next boot, so
 //     removing them is safe and hands no prior-tenant key to the next owner.
 //
-// Removal is KEY-FIRST: master.key is deleted before the encrypted DB body, so
-// an interrupted wipe (crash / power loss mid-RemoveAll) can never leave the
-// ciphertext behind together with the key that decrypts it — once the key is
-// gone any surviving ciphertext is unrecoverable.
+// Removal is KEY-FIRST and DURABLY ordered (#4576/#5197): master.key is deleted
+// before the encrypted DB body AND the key unlink is fsynced (.configdb) before
+// RemoveAll begins, so an interrupted wipe (crash / power loss mid-RemoveAll)
+// can never leave the ciphertext behind together with the key that decrypts it
+// — once the key is gone any surviving ciphertext is unrecoverable. Without the
+// fsync barrier both unlinks sit in the page cache and the filesystem is free
+// to persist the ciphertext removal while losing the key removal.
+//
+// The parent directory is fsynced at the end so every unlink is durable before
+// the completing reboot, and that final dir-fsync error is PROPAGATED (#5197):
+// a failed fsync means the erasure may not be on stable storage, so it must not
+// be reported as a clean zeroize.
 //
 // It is best-effort past a failure (a single stubborn file does not abort the
 // rest of the erasure) but returns the FIRST real error so a
@@ -82,8 +98,18 @@ func zeroizeConfigDir(configDir, configBase string) error {
 	}
 
 	dbDir := filepath.Join(configDir, ".configdb")
-	// KEY-FIRST (#4576): master.key before the encrypted DB body.
-	fail(os.Remove(filepath.Join(dbDir, "master.key")))
+	// KEY-FIRST (#4576): master.key before the encrypted DB body. Make the key
+	// unlink DURABLE before the ciphertext is removed (#5197) — fsync .configdb
+	// so the key removal is on stable storage before RemoveAll begins.
+	// Otherwise a power cut could persist the ciphertext removal while losing
+	// the key removal, defeating the key-first cryptographic-erasure guarantee.
+	keyErr := os.Remove(filepath.Join(dbDir, "master.key"))
+	fail(keyErr)
+	if keyErr == nil {
+		// The key existed and was unlinked: make that unlink durable before the
+		// ciphertext body removal. Absent .configdb → ErrNotExist, excluded by fail().
+		fail(zeroizeSyncDir(dbDir))
+	}
 	// The config SSOT (active.json, candidate.json, rollback.N.json + any
 	// residual key). RemoveAll erases the whole tree and is nil on absent.
 	fail(os.RemoveAll(dbDir))
@@ -109,6 +135,14 @@ func zeroizeConfigDir(configDir, configBase string) error {
 			fail(os.Remove(filepath.Join(configDir, name)))
 		}
 	}
+
+	// fsync the parent directory so ALL the unlinks above (the .configdb tree,
+	// tls/, and the enumerated top-level files) are durable before the reboot
+	// that completes the factory reset (#5197). A sync failure means the
+	// erasure may not be on stable storage, so it is PROPAGATED — never
+	// reported as a clean zeroize. ErrNotExist (configDir absent) is excluded
+	// by fail().
+	fail(zeroizeSyncDir(configDir))
 	return firstErr
 }
 

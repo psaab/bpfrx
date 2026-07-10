@@ -324,6 +324,24 @@ per-path:
   a crash in the microseconds between the `writeActive` syscall and the
   `confirm.json` write leaves no `confirm.json` — vastly smaller than
   the whole multi-minute window this closes.
+- **Durable deletes match durable writes (#5197).** A delete of a
+  secret-bearing artifact fsyncs its parent directory so the removal is
+  durable, mirroring the `fsatomic.WriteFileDurable` its writer used — a
+  bare `os.Remove` is not durable, so a power cut in the window before
+  the directory-entry removal flushes can replay the deleted file on
+  reboot. `DeleteRescueConfig` fsyncs `rescue.conf`'s directory after the
+  unlink (its creator `SaveRescueConfig` is dir-synced); the resurrected
+  copy would otherwise re-expose the cleartext secret leaves rescue.conf
+  carries (IKE PSK / SNMP community / auth-keys, #4056). `FactoryResetConfigDir`
+  (the on-box `request system zeroize`) additionally fsyncs `.configdb`
+  BETWEEN the key-first `master.key` unlink and the ciphertext `RemoveAll`
+  — so an interrupted wipe can never leave ciphertext together with a
+  still-durable key — and PROPAGATES the final `configDir` fsync error
+  (the pre-#5197 code discarded it), so a non-durable wipe is never
+  reported as a clean factory reset. All routes go through the
+  `rbRemove`/`rbSyncDir` seams so a dropped sync fails a test RED. The
+  gRPC `zeroizeConfigDir` mirror in `pkg/grpcapi` carries the same
+  barriers (its own `zeroizeSyncDir` seam).
 - **`CommitConfirmed` ordering.** Confirm state is only touched after
   the persist succeeds: on failure the rollback timer is NOT armed and
   an existing pending confirm (timer + rollback target) is left fully
