@@ -220,7 +220,13 @@ func normalizeUpdateServer(s string) (string, error) {
 // seam means a real *dns.Client is used. Returns an error when the policy
 // is structurally unusable (no update-server / bad TSIG) so the caller can
 // fall back to a no-op and count it rather than emit broken UPDATEs.
-func newRFC2136Updater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig, client dnsExchanger, onPTRNotAuth, onConflict func()) (*rfc2136Updater, error) {
+//
+// resolveIf is the OPTIONAL committed-config Junos→kernel interface-name
+// resolver (cfg.ResolveKernelIfName) threaded from the daemon so a
+// destination-interface binding resolves to the real kernel device before
+// SO_BINDTODEVICE (#5070). Omitted / nil ⇒ the leaf slash-substitution fallback
+// (direct + test callers with no committed config).
+func newRFC2136Updater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig, client dnsExchanger, onPTRNotAuth, onConflict func(), resolveIf ...func(string) string) (*rfc2136Updater, error) {
 	if c == nil {
 		return nil, errors.New("ddns: nil config for rfc2136 backend")
 	}
@@ -250,7 +256,7 @@ func newRFC2136Updater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig, client dn
 	// invalid source-address is a hard error (the caller falls back to no-op +
 	// counts it) so a misconfigured bind never emits UPDATEs from the wrong
 	// source.
-	bind, err := resolveBindConfig(c)
+	bind, err := resolveBindConfig(c, firstResolver(resolveIf))
 	if err != nil {
 		return nil, err
 	}

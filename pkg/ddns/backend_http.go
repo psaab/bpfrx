@@ -195,8 +195,13 @@ func bindCacheKey(p *config.DDNSProvider) string {
 // every caller MUST fail CLOSED on it (skip the publish / probe) rather than
 // egress from that unbound client: the publish resolver (resolveSurfaceABackend,
 // #4437) and the checkip observer (CheckIPBound, #3733) both do.
-func (c *httpClientCache) clientFor(p *config.DDNSProvider) (*http.Client, error) {
-	b, err := resolveProviderBindConfig(p)
+// resolveIf is the OPTIONAL committed-config interface-name resolver
+// (cfg.ResolveKernelIfName) threaded from the daemon so a destination-interface
+// binding resolves to the real kernel device (#5070). The cache KEY stays the
+// raw binding leaves (bindCacheKey) so the #2956 reap stays consistent; only the
+// bound client's SO_BINDTODEVICE target is resolved.
+func (c *httpClientCache) clientFor(p *config.DDNSProvider, resolveIf ...func(string) string) (*http.Client, error) {
+	b, err := resolveProviderBindConfig(p, firstResolver(resolveIf))
 	if err != nil {
 		return newHTTPClient(), err
 	}
@@ -255,7 +260,7 @@ func (c *httpClientCache) size() int {
 // resolveBindConfig discipline so an invalid source-address is a hard error
 // (fail-open: the constructor degrades to the unbound default rather than
 // emitting from the wrong source — see the callers).
-func resolveProviderBindConfig(p *config.DDNSProvider) (bindConfig, error) {
+func resolveProviderBindConfig(p *config.DDNSProvider, resolve func(string) string) (bindConfig, error) {
 	if p == nil {
 		return bindConfig{}, nil
 	}
@@ -263,7 +268,7 @@ func resolveProviderBindConfig(p *config.DDNSProvider) (bindConfig, error) {
 		SourceAddress:        p.SourceAddress,
 		DestinationInterface: p.DestinationInterface,
 		RoutingInstance:      p.RoutingInstance,
-	})
+	}, resolve)
 }
 
 // newProviderHTTPClient builds a bound HTTP client for an HTTP backend from its
@@ -272,8 +277,8 @@ func resolveProviderBindConfig(p *config.DDNSProvider) (bindConfig, error) {
 // warning) rather than wedging the backend — matching the rfc2136 fail-open
 // posture. Returns the client and any bind-resolution error for the caller to
 // surface; on error the returned client is the unbound default.
-func newProviderHTTPClient(p *config.DDNSProvider) (*http.Client, error) {
-	b, err := resolveProviderBindConfig(p)
+func newProviderHTTPClient(p *config.DDNSProvider, resolveIf ...func(string) string) (*http.Client, error) {
+	b, err := resolveProviderBindConfig(p, firstResolver(resolveIf))
 	if err != nil {
 		return newHTTPClient(), err
 	}

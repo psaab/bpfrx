@@ -49,12 +49,49 @@ type bindConfig struct {
 	routingInst string     // routing-instance name (informational / VRF dev)
 }
 
+// An interface-name resolver maps a Junos interface reference (as an operator
+// types it in a destination-interface leaf, e.g. "reth0.50" or "ge-0/0/2") to
+// the ACTUAL kernel device name on the LOCAL node. Production threads the
+// committed config's SSOT resolver, config.(*Config).ResolveKernelIfName, which
+// correctly handles reth→physical-member, unit-0 collapse, unit≠vlan-id, and
+// tunnel/irb/st0 refs (config/types.go). A nil resolver falls back to the leaf
+// slash-substitution (config.LinuxIfName) — used only by callers with no
+// committed config in hand (never the daemon path). See #5070. The type is the
+// bare `func(string) string` throughout so the exported daemon-facing seams
+// (ReconcileOptions.InterfaceResolver, SurfaceAManager.Reconcile) take
+// cfg.ResolveKernelIfName without a named-type conversion.
+
+// firstResolver extracts the single OPTIONAL interface-name resolver from a
+// variadic trailing slot. The bind path threads the resolver as an optional arg
+// so the many existing no-resolver call sites (tests, direct callers) stay
+// valid while the daemon threads cfg.ResolveKernelIfName. A missing or nil
+// entry yields nil (leaf fallback).
+func firstResolver(resolveIf []func(string) string) func(string) string {
+	if len(resolveIf) > 0 {
+		return resolveIf[0]
+	}
+	return nil
+}
+
+// resolveIfKernelName maps a destination-interface Junos ref to its kernel
+// device name via the SSOT resolver, falling back to the leaf
+// slash-substitution when no resolver was threaded in.
+func resolveIfKernelName(resolve func(string) string, ref string) string {
+	if resolve != nil {
+		return resolve(ref)
+	}
+	return config.LinuxIfName(ref)
+}
+
 // resolveBindConfig builds a bindConfig from a DDNS policy's source-binding
 // leaves (#2665). An empty config yields the zero bindConfig (no binding). A
 // non-empty source-address that does not parse is a hard error so the manager
 // falls back to no-op for that family (and counts it) rather than emitting
 // UPDATEs from the wrong source.
-func resolveBindConfig(c *config.DHCPDynamicDNSConfig) (bindConfig, error) {
+//
+// resolve is the committed config's Junos→kernel interface-name resolver
+// (cfg.ResolveKernelIfName); nil ⇒ the leaf slash-substitution fallback.
+func resolveBindConfig(c *config.DHCPDynamicDNSConfig, resolve func(string) string) (bindConfig, error) {
 	if c == nil {
 		return bindConfig{}, nil
 	}
@@ -71,10 +108,14 @@ func resolveBindConfig(c *config.DHCPDynamicDNSConfig) (bindConfig, error) {
 	// destination-interface.
 	//
 	// SO_BINDTODEVICE needs the REAL kernel device name — NOT the Junos config
-	// token (#5070). A destination-interface is a Junos interface name (e.g.
-	// "ge-0/0/2.50", slashes + unit); the daemon renames the kernel device to
-	// the slash-substituted form ("ge-0-0-2.50"), so resolve it through the
-	// SAME canonical translator the daemon uses (config.LinuxIfName). A
+	// token (#5070). A destination-interface is a Junos interface reference
+	// (e.g. "reth0.50", "ge-0/0/2.50"); the daemon renames/creates the kernel
+	// device via config.(*Config).ResolveKernelIfName, which resolves
+	// reth→physical member, unit-0 collapse ("ge-0/0/2.0" → "ge-0-0-2"), and
+	// unit≠vlan-id (unit 50 / vlan-id 80 → "ge-0-0-2.80"). Resolve through that
+	// SSOT (threaded in as `resolve`), NOT the leaf slash-substitution — the
+	// latter yields fictitious devices ("reth0.100", "ge-0-0-2.50") for exactly
+	// the reth / VLAN cases the HA-cluster WAN binding targets. A
 	// routing-instance is realized as a kernel VRF master device named
 	// "vrf-<name>" (pkg/routing), so resolve it through diagcmd.VRFDeviceName —
 	// the single source of truth for that prefix (applied exactly once, #2143;
@@ -87,7 +128,7 @@ func resolveBindConfig(c *config.DHCPDynamicDNSConfig) (bindConfig, error) {
 	b.routingInst = c.RoutingInstance
 	switch {
 	case c.DestinationInterface != "":
-		b.bindDevice = config.LinuxIfName(c.DestinationInterface)
+		b.bindDevice = resolveIfKernelName(resolve, c.DestinationInterface)
 	case c.RoutingInstance != "":
 		b.bindDevice = diagcmd.VRFDeviceName(c.RoutingInstance)
 	}
