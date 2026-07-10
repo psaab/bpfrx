@@ -83,6 +83,13 @@ func newHTTPClient() *http.Client {
 // expose it via Transport.DialContext (the dialer is connection-typed "tcp" for
 // HTTP, so the Control-based bind — not a network-typed LocalAddr — is what keeps
 // it working across both families uniformly). httpDialTimeout bounds the connect.
+//
+// #5327: when a source-address is configured the DialContext is wrapped
+// (boundDialContext) to PIN the dial to the source family, so Happy-Eyeballs
+// cannot pick the other family and silently skip the source bind (an update that
+// then egresses the wrong WAN / bypasses a source ACL / publishes the wrong
+// address). An endpoint with no address in the source family FAILS CLOSED at the
+// dial instead of egressing unbound.
 func newHTTPClientBound(b bindConfig) *http.Client {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -97,7 +104,12 @@ func newHTTPClientBound(b bindConfig) *http.Client {
 		ExpectContinueTimeout: time.Second,
 	}
 	if d := b.dialer(httpDialTimeout); d != nil {
-		tr.DialContext = d.DialContext
+		// #5327: pin the dial to the configured source-address family via a
+		// DialContext wrapper (constrainDialNetwork) so Happy-Eyeballs cannot pick
+		// the other family and skip the source bind — which would egress the update
+		// from a kernel-chosen source on the wrong WAN. A device-only bind (no
+		// source-address) passes the network through unchanged.
+		tr.DialContext = b.boundDialContext(d)
 	}
 	return &http.Client{
 		Timeout:       httpClientTimeout,
