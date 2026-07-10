@@ -922,7 +922,8 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 		// when this per-user loop is skipped (Login nil / no users), which
 		// is exactly the "user removed from config" case (#3889).
 
-		// Set SSH authorized keys
+		// Set SSH authorized keys. An EMPTY configured key list takes the else
+		// branch below and REVOKES any xpf-managed authorized_keys (#5106).
 		if len(user.SSHKeys) > 0 {
 			homeDir := fmt.Sprintf("/home/%s", user.Name)
 			sshDir := homeDir + "/.ssh"
@@ -978,6 +979,29 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 					continue
 				}
 				slog.Info("SSH keys updated", "user", user.Name, "keys", len(user.SSHKeys))
+			}
+		} else {
+			// Empty key list on a RETAINED user: reconcile the xpf-managed
+			// authorized_keys to ABSENT so removing the last key from config
+			// actually revokes key-based login. Without this the stale key file
+			// a prior apply wrote keeps granting access — reconcileAbsentLogin-
+			// Users only covers a fully REMOVED user, not a retained user whose
+			// key list was emptied (#5106). Gate on the UID-keyed provenance
+			// marker (as deprovisionLoginUser does) so we only ever remove an
+			// authorized_keys file xpf itself wrote — never a pre-existing /
+			// out-of-band user's operator-installed keys. The whole file is
+			// xpf-owned when the marker matches (applySystemLogin writes it
+			// wholesale), so removing it is safe.
+			if uid, ok := lookupUID(user.Name); ok && xpfProvisioned(user.Name, uid) {
+				keysFile := managedAuthorizedKeysPath(user.Name)
+				switch err := os.Remove(keysFile); {
+				case err == nil:
+					slog.Info("revoked SSH keys (last key removed from config)",
+						"user", user.Name)
+				case !os.IsNotExist(err):
+					slog.Warn("failed to remove authorized_keys after key list emptied",
+						"user", user.Name, "file", keysFile, "err", err)
+				}
 			}
 		}
 	}
