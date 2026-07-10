@@ -139,6 +139,20 @@ plus a cluster smoke before merge.
   policy-scheduler rule slots, and the per-interface networkd configs.
 - Session iteration: `IterateSessions`, `BatchIterateSessions`,
   `IterateSessionsV6`, `BatchIterateSessionsV6`.
+- Full-table clear (`clear security flow session all`): `ClearAllSessions`
+  and `ClearAllSessionsChunked`. The table holds up to ~10M sessions per
+  family, so the clear is both cooperative (yields between batches — #4719)
+  and **bounded** (#5304): it collects at most `sessionClearSnapshotChunk`
+  keys, deletes that chunk (+ its dynamic DNAT entries) via chunked
+  `BPF_MAP_DELETE_BATCH`, then re-scans for the next chunk — peak key-slice
+  memory is O(chunk), not O(table). Deleting every collected key before the
+  next scan makes the loop converge (every key present at start is removed).
+  `ClearAllSessionsChunked` invokes an optional per-chunk callback so the
+  userspace wrapper (`userspace.Manager.ClearAllSessions`) can issue its
+  authoritative Rust-helper delete on each bounded chunk instead of building
+  a second full-table key snapshot of its own — the two coexisting full-table
+  snapshots (wrapper v4+v6 + shim v4+v6 + DNAT lists) were the ~1 GB RSS spike
+  that #5304 removed.
 - Session domain adapters: `SessionStoreOf`, `TelemetryOf`, and
   `NewDataPlaneSessionStore`. The generic `DataPlane` adapter preserves the
   batch-iteration fast path and centralizes cluster/GC companion ownership:

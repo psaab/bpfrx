@@ -193,6 +193,101 @@ func TestClearAllSessionsBatchedRemovesEverything(t *testing.T) {
 	}
 }
 
+// TestClearAllSessionsBoundedSnapshot is the fail-on-revert guard for #5304:
+// the full-table clear must collect keys in bounded chunks, never one N-sized
+// snapshot of the whole table (which — combined with the userspace wrapper's
+// duplicate snapshot and the dynamic-DNAT key lists — spiked ~1 GB of RSS on a
+// max-loaded 10M/family table and could stall/OOM-kill the daemon). It shrinks
+// sessionClearSnapshotChunk, installs several chunks' worth of sessions per
+// family, and asserts (a) every session is still cleared and (b) the snapshot
+// observer fired once per bounded chunk with len(keys) <= chunk across multiple
+// chunks per family.
+//
+// fail-on-revert: reverting ClearAllSessions to the collect-all body snapshots
+// the entire table into one slice and never invokes sessionClearSnapshotObserver,
+// so chunkCalls/maxChunk stay 0 and the "bounded chunk path" assertion fails
+// RED; a variant that snapshots-all yet still reported the slice would report
+// len == N > chunk and trip the "<= chunk" assertion. The all-cleared checks
+// guard the preserved semantics (no dropped session, no orphaned reverse).
+func TestClearAllSessionsBoundedSnapshot(t *testing.T) {
+	m := newClearTestManager(t)
+
+	const chunk = 64
+	restore := sessionClearSnapshotChunk
+	sessionClearSnapshotChunk = chunk
+	t.Cleanup(func() { sessionClearSnapshotChunk = restore })
+
+	// flows forward + flows reverse per family = 2*flows entries. 2*flows is a
+	// multiple of chunk chosen to span several chunks (500/64 ~= 8 chunks).
+	const flows = 250
+	for i := uint32(0); i < flows; i++ {
+		if err := m.SetSessionV4(clearTestV4Key(i, false), SessionValue{State: 1, IsReverse: 0}); err != nil {
+			t.Fatalf("set v4 fwd %d: %v", i, err)
+		}
+		if err := m.SetSessionV4(clearTestV4Key(i, true), SessionValue{State: 1, IsReverse: 1}); err != nil {
+			t.Fatalf("set v4 rev %d: %v", i, err)
+		}
+		if err := m.SetSessionV6(clearTestV6Key(i, false), SessionValueV6{State: 1, IsReverse: 0}); err != nil {
+			t.Fatalf("set v6 fwd %d: %v", i, err)
+		}
+		if err := m.SetSessionV6(clearTestV6Key(i, true), SessionValueV6{State: 1, IsReverse: 1}); err != nil {
+			t.Fatalf("set v6 rev %d: %v", i, err)
+		}
+	}
+	const wantEntries = 2 * flows
+
+	// Snapshot seam: record the size of every collected key chunk. A revert to a
+	// single full-table snapshot never touches this observer.
+	var maxChunk, chunkCalls, observedKeys int
+	sessionClearSnapshotObserver = func(n int) {
+		chunkCalls++
+		observedKeys += n
+		if n > maxChunk {
+			maxChunk = n
+		}
+		if n > sessionClearSnapshotChunk {
+			t.Errorf("snapshot chunk %d exceeds bound %d — collect-all regression?", n, sessionClearSnapshotChunk)
+		}
+	}
+	t.Cleanup(func() { sessionClearSnapshotObserver = nil })
+
+	v4Deleted, v6Deleted, err := m.ClearAllSessions()
+	if err != nil {
+		t.Fatalf("ClearAllSessions: %v", err)
+	}
+
+	// (a) correctness: every session cleared, both families, fwd + reverse.
+	if v4Deleted != wantEntries || v6Deleted != wantEntries {
+		t.Errorf("deleted = (%d, %d), want (%d, %d)", v4Deleted, v6Deleted, wantEntries, wantEntries)
+	}
+	if got := countAllV4(t, m); got != 0 {
+		t.Errorf("post-clear v4 entries = %d, want 0 (dropped session / orphaned reverse)", got)
+	}
+	if got := countAllV6(t, m); got != 0 {
+		t.Errorf("post-clear v6 entries = %d, want 0 (dropped session / orphaned reverse)", got)
+	}
+
+	// (b) bounded working set: the chunk path fired, every chunk <= bound, and
+	// it took multiple bounded chunks per family — proving it did NOT snapshot
+	// the whole table into one slice. RED on revert (observer never fires).
+	if chunkCalls == 0 || maxChunk == 0 {
+		t.Fatalf("snapshot chunk observer never fired (chunkCalls=%d) — collect-all regression (unbounded snapshot)?", chunkCalls)
+	}
+	if maxChunk > chunk {
+		t.Errorf("max snapshot chunk = %d, want <= %d (bounded working set)", maxChunk, chunk)
+	}
+	// Each family needs at least ceil(wantEntries/chunk) chunks; both families
+	// together at least 2x that. A single N-sized snapshot would be 1/family.
+	minPerFamily := (wantEntries + chunk - 1) / chunk
+	if chunkCalls < 2*minPerFamily {
+		t.Errorf("snapshot chunkCalls = %d, want >= %d (bounded chunks, not one giant snapshot)", chunkCalls, 2*minPerFamily)
+	}
+	// Every key passes through exactly one bounded chunk (v4 + v6 = 2*wantEntries).
+	if observedKeys != 2*wantEntries {
+		t.Errorf("observed snapshot keys = %d, want %d (all keys routed through bounded chunks)", observedKeys, 2*wantEntries)
+	}
+}
+
 // TestClearAllSessionsEmptyAndSmall guards the empty-table (no panic, no batch
 // syscall) and single-session boundary cases.
 func TestClearAllSessionsEmptyAndSmall(t *testing.T) {

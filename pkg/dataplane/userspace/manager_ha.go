@@ -1113,31 +1113,24 @@ func (m *Manager) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, err
 // the Rust helper for every session so an operator `clear security flow session
 // all` actually stops forwarding under revoked decisions (#5096). The helper
 // exposes no bulk-clear verb (only the per-session "delete" the singular path
-// uses), so every mirror key — forward AND reverse conntrack entries — is
-// snapshotted BEFORE the mirror is emptied and then deleted on the helper.
-// Returns the bpf mirror's (v4, v6, err) counts unchanged.
+// uses), so every mirror key — forward AND reverse conntrack entries — must be
+// deleted on the helper too.
+//
+// The keys are NOT snapshotted here. Enumerating the full v4+v6 mirror into
+// wrapper-owned slices while the shim's own clear snapshots them AGAIN (plus the
+// dynamic-DNAT key lists) stacked ~1 GB of duplicate key slices in RSS on a
+// max-loaded 10M/family table — enough for the recovery command to stall or
+// OOM-kill the daemon (#5304). Instead the shim's ClearAllSessionsChunked drives
+// a per-chunk callback: it collects a bounded chunk, deletes it from the mirror,
+// and hands that same bounded chunk here for deletion on the helper, so neither
+// side ever holds more than one chunk of keys. deleteHelperSessions{V4,V6} keeps
+// the #5096 chunked-transmission behaviour (sessionHelperDeleteChunk). Returns
+// the bpf mirror's (v4, v6, err) counts unchanged.
 func (m *Manager) ClearAllSessions() (int, int, error) {
-	var v4Keys []dataplane.SessionKey
-	if err := m.bpfShim.BatchIterateSessions(func(key dataplane.SessionKey, _ dataplane.SessionValue) bool {
-		v4Keys = append(v4Keys, key)
-		return true
-	}); err != nil {
-		slog.Debug("userspace: enumerate v4 sessions for helper clear failed", "err", err)
-	}
-	var v6Keys []dataplane.SessionKeyV6
-	if err := m.bpfShim.BatchIterateSessionsV6(func(key dataplane.SessionKeyV6, _ dataplane.SessionValueV6) bool {
-		v6Keys = append(v6Keys, key)
-		return true
-	}); err != nil {
-		slog.Debug("userspace: enumerate v6 sessions for helper clear failed", "err", err)
-	}
-
-	v4Deleted, v6Deleted, err := m.bpfShim.ClearAllSessions()
-
-	m.deleteHelperSessionsV4(v4Keys)
-	m.deleteHelperSessionsV6(v6Keys)
-
-	return v4Deleted, v6Deleted, err
+	return m.bpfShim.ClearAllSessionsChunked(
+		func(keys []dataplane.SessionKey) { m.deleteHelperSessionsV4(keys) },
+		func(keys []dataplane.SessionKeyV6) { m.deleteHelperSessionsV6(keys) },
+	)
 }
 
 // deleteHelperSessionsV4 tells the Rust helper to delete every key so the batch

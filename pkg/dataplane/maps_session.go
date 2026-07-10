@@ -355,67 +355,177 @@ func (m *Manager) SessionCount() (v4, v6 int) {
 // non-hot-path nil check per chunk).
 var sessionClearBatchObserver func(batchKeys int)
 
+// sessionClearSnapshotObserver, when non-nil, is invoked once per collected key
+// CHUNK with the number of keys in that chunk (bounded by
+// sessionClearSnapshotChunk). It is a test-only seam that lets a unit test
+// assert the clear collects keys in bounded chunks instead of snapshotting the
+// entire table into one N-sized slice (#5304). A revert to the collect-all
+// clear stops invoking it, so a bounded-working-set test goes RED. Production
+// leaves it nil.
+var sessionClearSnapshotObserver func(chunkKeys int)
+
+// sessionClearSnapshotChunk bounds the working set of the full-table clear. The
+// session table can hold up to ~10M entries per family; snapshotting every key
+// (v4 + v6) plus the dynamic DNAT key lists into slices before any delete
+// stacks them all in RSS at once — ~1 GB on a max-loaded table, enough for the
+// supported-max recovery command (`clear security flow session all`) to stall
+// or OOM-kill the daemon (#5304). The clear instead collects at most this many
+// keys, deletes that chunk (and its DNAT entries), then re-scans for the next
+// chunk, so peak key-slice memory is O(chunk), not O(table). It is a var (not
+// const) so a test can shrink it to exercise the multi-chunk path with a small
+// table.
+var sessionClearSnapshotChunk = 4096
+
 // ClearAllSessions deletes all IPv4 and IPv6 sessions, plus associated
 // dynamic DNAT table entries for SNAT sessions. Returns (v4_deleted, v6_deleted, err).
-//
-// The full table can hold up to ~10M sessions, so the clear must not
-// monopolize the controller goroutine — a multi-second synchronous stall can
-// starve the HA peer watchdog/heartbeat and trip a spurious failover (#4719).
-// Both phases are therefore cooperative: collection uses the batch-lookup
-// iterators (BatchIterateSessions{,V6}, which yield via runtime.Gosched between
-// batches), and deletion uses chunked BPF_MAP_DELETE_BATCH syscalls that yield
-// between chunks (clearSessionsV4/clearSessionsV6). Semantics are unchanged:
-// every session — both the forward and the reverse conntrack entry — is still
-// removed, plus the dynamic dnat_table entries for SNAT sessions.
 func (m *Manager) ClearAllSessions() (int, int, error) {
-	// IPv4: collect all keys and SNAT entries for DNAT cleanup
-	var v4Keys []SessionKey
-	var snatDNATKeys []DNATKey
-	if err := m.BatchIterateSessions(func(key SessionKey, val SessionValue) bool {
-		v4Keys = append(v4Keys, key)
-		// Track dynamic SNAT sessions for dnat_table cleanup
-		if val.IsReverse == 0 &&
-			val.Flags&SessFlagSNAT != 0 &&
-			val.Flags&SessFlagStaticNAT == 0 {
-			// Must match the write-side key encoding (#2406: host-order port).
-			snatDNATKeys = append(snatDNATKeys, dnatKeyForSessionV4(key, val))
-		}
-		return true
-	}); err != nil {
-		return 0, 0, fmt.Errorf("iterate sessions: %w", err)
-	}
-	v4Deleted := m.clearSessionsV4(v4Keys)
-	for i, dk := range snatDNATKeys {
-		m.DeleteDNATEntry(dk)
-		if (i+1)%sessionDeleteBatchSize == 0 {
-			runtime.Gosched()
-		}
-	}
+	return m.ClearAllSessionsChunked(nil, nil)
+}
 
-	// IPv6: collect all keys and SNAT entries for DNAT cleanup
-	var v6Keys []SessionKeyV6
-	var snatDNATKeysV6 []DNATKeyV6
-	if err := m.BatchIterateSessionsV6(func(key SessionKeyV6, val SessionValueV6) bool {
-		v6Keys = append(v6Keys, key)
-		if val.IsReverse == 0 &&
-			val.Flags&SessFlagSNAT != 0 &&
-			val.Flags&SessFlagStaticNAT == 0 {
-			// Must match the write-side key encoding (#2406: host-order port).
-			snatDNATKeysV6 = append(snatDNATKeysV6, dnatKeyForSessionV6(key, val))
-		}
-		return true
-	}); err != nil {
-		return v4Deleted, 0, fmt.Errorf("iterate sessions_v6: %w", err)
+// ClearAllSessionsChunked is the bounded-memory implementation of
+// ClearAllSessions. onV4Chunk / onV6Chunk, when non-nil, are invoked with each
+// deleted key chunk (bounded by sessionClearSnapshotChunk) so a caller — the
+// userspace wrapper — can issue its authoritative Rust-helper delete per chunk
+// WITHOUT building a second full-table key snapshot of its own (the #5304
+// double snapshot). The slices handed to the callbacks are valid only for the
+// duration of the call; the backing array is reused across chunks.
+//
+// The full table can hold up to ~10M sessions, so the clear must neither
+// monopolize the controller goroutine — a multi-second synchronous stall can
+// starve the HA peer watchdog/heartbeat and trip a spurious failover (#4719) —
+// nor spike RSS by snapshotting the whole table at once (#5304). Collection and
+// deletion are therefore both cooperative AND bounded: collection uses the
+// batch-lookup iterators (BatchIterateSessions{,V6}, which yield via
+// runtime.Gosched between batches) but stops at sessionClearSnapshotChunk keys
+// and re-scans for the remainder, and deletion uses chunked
+// BPF_MAP_DELETE_BATCH syscalls that yield between chunks
+// (clearSessionsV4/clearSessionsV6). Semantics are unchanged: every session —
+// both the forward and the reverse conntrack entry — present at the start is
+// still removed, plus the dynamic dnat_table entries for SNAT sessions.
+func (m *Manager) ClearAllSessionsChunked(onV4Chunk func([]SessionKey), onV6Chunk func([]SessionKeyV6)) (int, int, error) {
+	v4Deleted, err := m.clearSessionsChunkedV4(onV4Chunk)
+	if err != nil {
+		return v4Deleted, 0, err
 	}
-	v6Deleted := m.clearSessionsV6(v6Keys)
-	for i, dk := range snatDNATKeysV6 {
-		m.DeleteDNATEntryV6(dk)
-		if (i+1)%sessionDeleteBatchSize == 0 {
-			runtime.Gosched()
-		}
+	v6Deleted, err := m.clearSessionsChunkedV6(onV6Chunk)
+	if err != nil {
+		return v4Deleted, v6Deleted, err
 	}
-
 	return v4Deleted, v6Deleted, nil
+}
+
+// clearSessionsChunkedV4 drains the IPv4 session map in bounded chunks: it
+// collects up to sessionClearSnapshotChunk keys (plus the SNAT sessions' DNAT
+// keys) from a fresh batch scan, deletes that chunk and its DNAT entries, hands
+// the chunk to onChunk, then re-scans for the remainder until the map is empty.
+// Because every collected key is deleted before the next scan, a fresh scan
+// never re-returns it, so the loop converges — every key present at the start
+// is removed — while holding only O(chunk) keys in memory (#5304).
+func (m *Manager) clearSessionsChunkedV4(onChunk func([]SessionKey)) (int, error) {
+	deleted := 0
+	keys := make([]SessionKey, 0, sessionClearSnapshotChunk)
+	var snatDNATKeys []DNATKey
+	for {
+		keys = keys[:0]
+		snatDNATKeys = snatDNATKeys[:0]
+		full := false
+		if err := m.BatchIterateSessions(func(key SessionKey, val SessionValue) bool {
+			keys = append(keys, key)
+			// Track dynamic SNAT sessions for dnat_table cleanup.
+			if val.IsReverse == 0 &&
+				val.Flags&SessFlagSNAT != 0 &&
+				val.Flags&SessFlagStaticNAT == 0 {
+				// Must match the write-side key encoding (#2406: host-order port).
+				snatDNATKeys = append(snatDNATKeys, dnatKeyForSessionV4(key, val))
+			}
+			if len(keys) >= sessionClearSnapshotChunk {
+				full = true
+				return false // chunk full — stop and re-scan for the remainder
+			}
+			return true
+		}); err != nil {
+			return deleted, fmt.Errorf("iterate sessions: %w", err)
+		}
+		if len(keys) == 0 {
+			break // table drained
+		}
+		if sessionClearSnapshotObserver != nil {
+			sessionClearSnapshotObserver(len(keys))
+		}
+		before := deleted
+		deleted += m.clearSessionsV4(keys)
+		for i, dk := range snatDNATKeys {
+			m.DeleteDNATEntry(dk)
+			if (i+1)%sessionDeleteBatchSize == 0 {
+				runtime.Gosched()
+			}
+		}
+		if onChunk != nil {
+			onChunk(keys)
+		}
+		if !full {
+			break // this scan drained the remaining keys
+		}
+		if deleted == before {
+			// A full chunk that deleted nothing means these keys are
+			// un-deletable; a fresh scan would return them forever. Break
+			// rather than spin (defensive — a live map always makes progress).
+			break
+		}
+	}
+	return deleted, nil
+}
+
+// clearSessionsChunkedV6 is the IPv6 variant of clearSessionsChunkedV4.
+func (m *Manager) clearSessionsChunkedV6(onChunk func([]SessionKeyV6)) (int, error) {
+	deleted := 0
+	keys := make([]SessionKeyV6, 0, sessionClearSnapshotChunk)
+	var snatDNATKeys []DNATKeyV6
+	for {
+		keys = keys[:0]
+		snatDNATKeys = snatDNATKeys[:0]
+		full := false
+		if err := m.BatchIterateSessionsV6(func(key SessionKeyV6, val SessionValueV6) bool {
+			keys = append(keys, key)
+			if val.IsReverse == 0 &&
+				val.Flags&SessFlagSNAT != 0 &&
+				val.Flags&SessFlagStaticNAT == 0 {
+				// Must match the write-side key encoding (#2406: host-order port).
+				snatDNATKeys = append(snatDNATKeys, dnatKeyForSessionV6(key, val))
+			}
+			if len(keys) >= sessionClearSnapshotChunk {
+				full = true
+				return false
+			}
+			return true
+		}); err != nil {
+			return deleted, fmt.Errorf("iterate sessions_v6: %w", err)
+		}
+		if len(keys) == 0 {
+			break
+		}
+		if sessionClearSnapshotObserver != nil {
+			sessionClearSnapshotObserver(len(keys))
+		}
+		before := deleted
+		deleted += m.clearSessionsV6(keys)
+		for i, dk := range snatDNATKeys {
+			m.DeleteDNATEntryV6(dk)
+			if (i+1)%sessionDeleteBatchSize == 0 {
+				runtime.Gosched()
+			}
+		}
+		if onChunk != nil {
+			onChunk(keys)
+		}
+		if !full {
+			break
+		}
+		if deleted == before {
+			break
+		}
+	}
+	return deleted, nil
 }
 
 // clearSessionsV4 deletes every key in keys from the v4 session map using
