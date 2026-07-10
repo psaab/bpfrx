@@ -724,8 +724,8 @@ under the daemon's errgroup. Nothing else imports this package.
   so a small paginated read cannot force unbounded full-table work per page:
   - **Admission bound.** A session list is a full conntrack-table walk that
     contends with the live session-sync path for per-bucket BPF-map locks. The
-    handler now acquires a slot from `sessionsListLimiter`
-    (`diagcmd.NewLimiter(maxConcurrentSessionLists)` = 4, the SAME fail-fast
+    handler now acquires a slot from `sessionWalkLimiter`
+    (`diagcmd.NewLimiter(maxConcurrentSessionWalks)` = 4, the SAME fail-fast
     counting-semaphore idiom the diagnostic ping/traceroute handlers use, #5057)
     BEFORE the walk and the peer fan-out, releasing on every exit path. Over-cap
     requests are rejected immediately with **HTTP 429** (`session list
@@ -733,7 +733,19 @@ under the daemon's errgroup. Nothing else imports this package.
     simultaneous walk — a scrape flood can no longer multiply lock contention.
     The #5237 disconnect-abort bounds a SINGLE client's walk once ITS connection
     drops; this bounds how many CONNECTED clients walk at once, which the
-    disconnect-abort does not.
+    disconnect-abort does not. **#5433 extends the SAME gate to the aggregation
+    siblings** `GET /security/sessions/summary` and
+    `GET /security/sessions/summary/zone-pairs`, which drive the identical full
+    v4+v6 walk. All three share ONE `sessionWalkLimiter` so the bound is on the
+    AGGREGATE walk concurrency across the scan endpoints, not one budget per
+    endpoint (they contend for the same locks). The aggregation handlers compute
+    an EXACT summary / zone-pair breakdown, so `sessionCountCap` is NOT applied —
+    an exact aggregate genuinely needs the full walk and a cap would change the
+    response contract; the admission gate alone is the fix (no response-shape
+    change). Over-cap aggregation requests return **HTTP 429** (`session scan
+    concurrency limit reached; retry shortly`). Pinned by
+    `sessions_aggregation_bound_5433_test.go` (per-handler concurrency bound +
+    shared-limiter cross-endpoint 429 + permit-release, RED-on-revert).
   - **Bounded Total.** The offset mode's exact `total` previously forced a FULL
     v4+v6 table scan on EVERY 100-row page (O(table) per page, repeated per
     poll) just to count. The walk now caps the count at `sessionCountCap`

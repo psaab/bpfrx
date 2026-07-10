@@ -125,14 +125,14 @@ func (d *blockingSessionDP) IterateSessionsV6(func(dataplane.SessionKeyV6, datap
 
 // TestRESTSessionListConcurrencyBound pins the #5318 admission contract for the
 // session list handler, mirroring the #5057 diagnostic-limiter test. It swaps
-// sessionsListLimiter for a fresh small-capacity limiter and drives cap+excess
+// sessionWalkLimiter for a fresh small-capacity limiter and drives cap+excess
 // concurrent list requests through a walk that blocks on a gate. It asserts:
 //   - at most `cap` handlers run the walk concurrently,
 //   - the `excess` requests are rejected immediately with HTTP 429 (not queued),
 //   - after the admitted walks finish the limiter is fully released, so a
 //     subsequent request succeeds.
 //
-// RED-on-revert: remove the sessionsListLimiter.Acquire()/429 branch from
+// RED-on-revert: remove the sessionWalkLimiter.Acquire()/429 branch from
 // sessionsHandler and every request is admitted — the 429 count drops to 0 and
 // the max-concurrency assertion fires.
 func TestRESTSessionListConcurrencyBound(t *testing.T) {
@@ -142,9 +142,9 @@ func TestRESTSessionListConcurrencyBound(t *testing.T) {
 		total  = capN + excess
 	)
 
-	orig := sessionsListLimiter
-	t.Cleanup(func() { sessionsListLimiter = orig })
-	sessionsListLimiter = diagcmd.NewLimiter(capN)
+	orig := sessionWalkLimiter
+	t.Cleanup(func() { sessionWalkLimiter = orig })
+	sessionWalkLimiter = diagcmd.NewLimiter(capN)
 
 	var (
 		inFlight    int32
