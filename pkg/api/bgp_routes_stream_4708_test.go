@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -37,6 +38,12 @@ type fakeBGPExecutor struct {
 func (f fakeBGPExecutor) Vtysh(string) (string, error)                      { return f.vtyshOut, nil }
 func (f fakeBGPExecutor) FrrReloadPy(context.Context, string) error         { return nil }
 func (f fakeBGPExecutor) VtyshLoad(context.Context, string) ([]byte, error) { return nil, nil }
+
+// VtyshStream serves the canned table as an incremental reader so the streaming
+// StreamBGPRoutes path (and therefore bgpHandler) is exercised end-to-end.
+func (f fakeBGPExecutor) VtyshStream(context.Context, string) (io.ReadCloser, func() error, error) {
+	return io.NopCloser(strings.NewReader(f.vtyshOut)), func() error { return nil }, nil
+}
 
 // makeFRRBGPOutput renders route tuples into an FRR `show bgp ipv4 unicast`-
 // style block. GetBGPRoutes keeps lines starting with "*"/" " that have >=3
