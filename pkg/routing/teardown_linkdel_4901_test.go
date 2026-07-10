@@ -66,7 +66,7 @@ func TestBondClearRetainsAndReturnsOnLinkDelFailure(t *testing.T) {
 	seedDummy(ops, "bond-ok")
 	ops.delFail["bond-bad"] = errors.New("injected EPERM")
 
-	b := &bondManager{ops: ops, bonds: []string{"bond-bad", "bond-ok"}}
+	b := &bondManager{ops: ops, bonds: map[string]bondSig{"bond-bad": {}, "bond-ok": {}}}
 
 	err := b.Clear()
 	if err == nil {
@@ -75,10 +75,10 @@ func TestBondClearRetainsAndReturnsOnLinkDelFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "bond-bad") {
 		t.Errorf("Clear error should name the failed bond: %v", err)
 	}
-	if !sliceHas(b.bonds, "bond-bad") {
+	if _, ok := b.bonds["bond-bad"]; !ok {
 		t.Fatal("failed-delete bond must be RETAINED in tracking so the next reconcile retries")
 	}
-	if sliceHas(b.bonds, "bond-ok") {
+	if _, ok := b.bonds["bond-ok"]; ok {
 		t.Fatal("successfully-deleted bond must be dropped from tracking")
 	}
 }
