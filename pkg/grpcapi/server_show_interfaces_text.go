@@ -336,10 +336,14 @@ func (s *Server) showInterfacesQueue(req *pb.ShowTextRequest, buf *strings.Build
 		selector = req.Filter
 	}
 	var status *dpuserspace.ProcessStatus
-	if userspaceStatus, err := s.userspaceDataplaneStatus(); err == nil {
+	userspaceStatus, statusErr := s.userspaceDataplaneStatus()
+	if statusErr == nil {
 		status = &userspaceStatus
 	}
-	buf.WriteString(dpformat.FormatInterfacesQueue(status, selector))
+	// Surface a status-retrieval error instead of conflating it with an empty
+	// CoS snapshot (#5326) — the remote CLI must see "unreachable", not "no
+	// queues active", during the uncertain window.
+	buf.WriteString(dpformat.FormatInterfacesQueue(status, statusErr, selector))
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
 

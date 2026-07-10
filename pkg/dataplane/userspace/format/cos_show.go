@@ -31,8 +31,29 @@ import (
 // CoSQueueStatus (QueuedPackets/Bytes, DrainSentBytes, the admission-drop
 // counters aggregated across worker instances by the Rust coordinator). An
 // empty selector renders every CoS interface reported by the dataplane.
-func FormatInterfacesQueue(status *userspace.ProcessStatus, selector string) string {
+//
+// The renderer distinguishes three states so operator uncertainty is never
+// laundered into "no CoS" (#5326):
+//
+//   - statusErr != nil — the status fetch FAILED (helper down, control socket
+//     unavailable, decode error). The CoS runtime state is UNKNOWN, not empty,
+//     so surface the error instead of the empty-snapshot message. This upholds
+//     the appliance invariant that uncertainty must not render as zero/empty
+//     health.
+//   - statusErr == nil, empty snapshot — a legitimately empty CoS runtime;
+//     render the "No class-of-service queues active" message unchanged.
+//   - statusErr == nil, non-empty snapshot — render the per-queue counters.
+//
+// Callers MUST pass the error returned alongside the status snapshot; a nil
+// status with a nil error is still treated as the legitimate empty case.
+func FormatInterfacesQueue(status *userspace.ProcessStatus, statusErr error, selector string) string {
 	selector = strings.TrimSpace(selector)
+	if statusErr != nil {
+		if selector == "" {
+			return fmt.Sprintf("error retrieving class-of-service queue status: %v\n", statusErr)
+		}
+		return fmt.Sprintf("error retrieving class-of-service queue status on %s: %v\n", selector, statusErr)
+	}
 	if status == nil || len(status.CoSInterfaces) == 0 {
 		if selector == "" {
 			return "No class-of-service queues active\n"

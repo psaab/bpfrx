@@ -1,6 +1,7 @@
 package format
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -59,7 +60,7 @@ func TestFormatInterfacesQueue(t *testing.T) {
 		},
 	}
 
-	out := FormatInterfacesQueue(status, "")
+	out := FormatInterfacesQueue(status, nil, "")
 	for _, want := range []string{
 		"Physical interface: reth0.80",
 		"Egress queues: 8 supported, 2 in use",
@@ -86,20 +87,73 @@ func TestFormatInterfacesQueueSelectorFilter(t *testing.T) {
 		},
 	}
 	// Physical-name selector matches the unit-qualified runtime interface.
-	out := FormatInterfacesQueue(status, "reth0")
+	out := FormatInterfacesQueue(status, nil, "reth0")
 	if !strings.Contains(out, "reth0.80") || strings.Contains(out, "reth1.0") {
 		t.Fatalf("selector reth0 did not filter correctly:\n%s", out)
 	}
 	// No matching interface reports a scoped no-data message.
-	out = FormatInterfacesQueue(status, "ge-9-9-9")
+	out = FormatInterfacesQueue(status, nil, "ge-9-9-9")
 	if !strings.Contains(out, "No class-of-service queues active on ge-9-9-9") {
 		t.Fatalf("unexpected no-match output:\n%s", out)
 	}
 }
 
+// TestFormatInterfacesQueueNoStatus is state (2): a successful but empty CoS
+// snapshot (nil status, nil error) must still render the legitimate
+// "No class-of-service queues active" message. Guards against a regression
+// where the #5326 error-vs-empty split accidentally treats an empty snapshot
+// as an error.
 func TestFormatInterfacesQueueNoStatus(t *testing.T) {
-	if got := FormatInterfacesQueue(nil, ""); !strings.Contains(got, "No class-of-service queues active") {
+	if got := FormatInterfacesQueue(nil, nil, ""); !strings.Contains(got, "No class-of-service queues active") {
 		t.Fatalf("nil status: %q", got)
+	}
+	if got := FormatInterfacesQueue(nil, nil, ""); strings.Contains(got, "error retrieving") {
+		t.Fatalf("empty snapshot must not render an error: %q", got)
+	}
+}
+
+// TestFormatInterfacesQueueStatusError is state (1): a status-retrieval error
+// must render as an explicit error, NOT "No class-of-service queues active"
+// (#5326). Conflating the fetch failure with an empty snapshot would tell the
+// operator there is no CoS during exactly the window when the truth is UNKNOWN.
+// Reverting FormatInterfacesQueue to discard the error (nil status → empty
+// branch) makes this assertion RED.
+func TestFormatInterfacesQueueStatusError(t *testing.T) {
+	fetchErr := errors.New("control socket unavailable")
+
+	// Unscoped: error is surfaced, empty-snapshot message is NOT emitted.
+	out := FormatInterfacesQueue(nil, fetchErr, "")
+	if !strings.Contains(out, "error retrieving class-of-service queue status") {
+		t.Fatalf("status error not surfaced:\n%s", out)
+	}
+	if !strings.Contains(out, "control socket unavailable") {
+		t.Fatalf("underlying error text missing:\n%s", out)
+	}
+	if strings.Contains(out, "No class-of-service queues active") {
+		t.Fatalf("fetch error must not render the empty-snapshot message:\n%s", out)
+	}
+
+	// Scoped: the selector is echoed in the error message.
+	out = FormatInterfacesQueue(nil, fetchErr, "reth0")
+	if !strings.Contains(out, "error retrieving class-of-service queue status on reth0") {
+		t.Fatalf("scoped status error not surfaced:\n%s", out)
+	}
+	if strings.Contains(out, "No class-of-service queues active") {
+		t.Fatalf("scoped fetch error must not render the empty-snapshot message:\n%s", out)
+	}
+
+	// A non-nil status is irrelevant when the fetch errored: still an error.
+	partial := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
+			{InterfaceName: "reth0.80", Queues: []userspace.CoSQueueStatus{{QueueID: 0}}},
+		},
+	}
+	out = FormatInterfacesQueue(partial, fetchErr, "")
+	if !strings.Contains(out, "error retrieving class-of-service queue status") {
+		t.Fatalf("error must win over a stale/partial snapshot:\n%s", out)
+	}
+	if strings.Contains(out, "Physical interface: reth0.80") {
+		t.Fatalf("must not render queues from a snapshot fetched with an error:\n%s", out)
 	}
 }
 
