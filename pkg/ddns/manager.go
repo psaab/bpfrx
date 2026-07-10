@@ -81,6 +81,37 @@ type Lease struct {
 	SubnetID   string // pool/subnet metadata
 	HostName   string // host-name option
 	ClientFQDN string // client-supplied FQDN option (fqdn_fwd implied)
+	// LeaseType is the v6 lease_type discriminator carried through the
+	// LeaseParser boundary (#5072): it distinguishes an address binding (IA_NA
+	// / IA_TA) from a delegated-prefix binding (IA_PD) so the reconciler never
+	// coerces an IA_PD prefix base (e.g. 2001:db8:abcd::) into a host
+	// A/AAAA/PTR. The ZERO value is LeaseTypeIANA (an address lease), so a v4
+	// lease, a v6 lease with no lease_type column, and any Lease constructed
+	// without setting this field are correctly treated as address-bearing.
+	// The Kea-memfile adapter maps a PRESENT-but-unparseable / unknown column
+	// to LeaseTypeUnknown so it is rejected fail-closed rather than guessed.
+	LeaseType int
+}
+
+// v6 lease_type values carried on Lease.LeaseType. The address types mirror
+// Kea's memfile column (0=IA_NA, 1=IA_TA, 2=IA_PD); LeaseTypeUnknown is a
+// local sentinel the Kea-memfile adapter assigns when the column is present but
+// unparseable. Only IA_NA / IA_TA are address-bearing and eligible for host DNS
+// (#5072). IA_NA is 0 so it is the safe zero-value default.
+const (
+	LeaseTypeIANA    = 0  // identity association, non-temporary address
+	LeaseTypeIATA    = 1  // identity association, temporary address
+	LeaseTypeIAPD    = 2  // identity association, prefix delegation (NOT a host address)
+	LeaseTypeUnknown = -1 // lease_type column present but unparseable / unrecognized
+)
+
+// isAddressLease reports whether the lease binds a host ADDRESS eligible for
+// A/AAAA/PTR publication. This is an explicit ALLOWLIST: only IA_NA / IA_TA
+// qualify. An IA_PD delegated-prefix base must never be published (authoritative
+// DNS for a delegated network base is an info-disclosure / policy violation),
+// and any unknown / unparseable type is rejected fail-closed (#5072).
+func (l Lease) isAddressLease() bool {
+	return l.LeaseType == LeaseTypeIANA || l.LeaseType == LeaseTypeIATA
 }
 
 // LeaseParser reads a family's (4 or 6) active leases from a Kea memfile path
@@ -177,14 +208,19 @@ func policyFromConfig(c *config.DHCPDynamicDNSConfig) ddnsPolicy {
 // Stats is the observable counter snapshot surfaced by `show` (and,
 // since increment 2, the Prometheus collector). All counters are monotonic.
 type Stats struct {
-	Enabled          bool
-	Backend          string
-	UpsertOK         uint64
-	UpsertFail       uint64
-	DeleteOK         uint64
-	DeleteFail       uint64
-	SkippedNoName    uint64
-	SkippedNoBackend uint64 // records skipped because no live backend is wired
+	Enabled       bool
+	Backend       string
+	UpsertOK      uint64
+	UpsertFail    uint64
+	DeleteOK      uint64
+	DeleteFail    uint64
+	SkippedNoName uint64
+	// SkippedNonAddress counts leases skipped because they are not an
+	// address-bearing lease type eligible for host DNS — an IA_PD
+	// delegated-prefix binding or an unknown/unparseable v6 lease_type (#5072).
+	// A prefix base must never be coerced into an A/AAAA/PTR record.
+	SkippedNonAddress uint64
+	SkippedNoBackend  uint64 // records skipped because no live backend is wired
 	// SkippedPTRNotAuth counts reverse-zone PTR updates skipped because the
 	// authoritative server returned NOTAUTH/REFUSED for the reverse zone —
 	// a reverse zone we do not own (e.g. delegated to an ISP). The forward
@@ -293,6 +329,7 @@ type Manager struct {
 	deleteOK          atomic.Uint64
 	deleteFail        atomic.Uint64
 	skippedNoName     atomic.Uint64
+	skippedNonAddress atomic.Uint64 // leases skipped: IA_PD / non-address lease type (#5072)
 	skippedNoBackend  atomic.Uint64 // upsert/delete skipped: no live backend wired
 	skippedPTRNotAuth atomic.Uint64 // reverse-zone PTR skipped (NOTAUTH/REFUSED)
 	skippedConflict   atomic.Uint64 // add skipped: exact RR already exists
@@ -832,6 +869,19 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 	for _, l := range leases {
 		pol := env.polFor(l.Family)
 		source := hostnameSourceFor(&pol)
+		// Only an address-bearing lease (IA_NA / IA_TA) may become an
+		// A/AAAA/PTR record. Reject an IA_PD delegated-prefix base (and any
+		// unknown/unparseable v6 lease type) BEFORE name/record derivation so
+		// its prefix base is never coerced into a host address and published
+		// (#5072). It is dropped from `want`, so any record mis-published for
+		// it before this gate existed is withdrawn by the Pass-1 delete below.
+		if !l.isAddressLease() {
+			m.skippedNonAddress.Add(1)
+			slog.Debug("ddns: skipping non-address lease (IA_PD / unknown lease type); "+
+				"not publishing host DNS for a delegated-prefix base",
+				"address", l.Address, "family", l.Family, "leaseType", l.LeaseType)
+			continue
+		}
 		// Resolve the lease's scope + the per-RG HA gate decision (#2664). A
 		// gated-out scope is recorded so Pass 1 protects its owned records from
 		// deletion, and the desired record is NOT added (stop-writing).
@@ -1347,6 +1397,7 @@ func (m *Manager) Stats() Stats {
 		DeleteOK:          m.deleteOK.Load(),
 		DeleteFail:        m.deleteFail.Load(),
 		SkippedNoName:     m.skippedNoName.Load(),
+		SkippedNonAddress: m.skippedNonAddress.Load(),
 		SkippedNoBackend:  m.skippedNoBackend.Load(),
 		SkippedPTRNotAuth: m.skippedPTRNotAuth.Load(),
 		SkippedConflict:   m.skippedConflict.Load(),
