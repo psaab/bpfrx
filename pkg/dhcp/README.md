@@ -221,7 +221,17 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   more-specific classless routes — and `applyMgmtVRFRoutes` installs them
   into the management VRF table (999) via netlink. `leaseContentChanged`
   diffs `ClasslessRoutes`, so the routes are withdrawn/re-installed in
-  lock-step with the lease on renew/expiry, like the default route.
+  lock-step with the lease on renew/expiry, like the default route. For
+  the management VRF the withdrawal is enforced by a full RECONCILE, not
+  an append-only apply (#5108): every route xpf installs in table 999 is
+  stamped `RTPROT_DHCP`, and each `applyMgmtVRFRoutes` run lists the
+  xpf-owned routes already in the table and `RouteDel`s any whose
+  destination is no longer in the current desired set — including the
+  empty-desired case (management lease disabled, or option-121 route
+  withdrawn), which the pre-#5108 early-return skipped, leaving a stale
+  route that could blackhole management traffic to a prior DHCP router.
+  The delete is scoped to `RTPROT_DHCP` so operator routes in the VRF are
+  never touched.
 - **Lease records are NOT expired by the wall clock.** During a
   *timeout-driven* failed re-acquisition (T2 rebind timed out, fresh
   DORA in progress) the lease record and the kernel address
