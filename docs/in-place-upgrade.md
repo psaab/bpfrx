@@ -111,6 +111,48 @@ the running daemon and config untouched).
    a transient respawn resolves the matching-version `xpf-userspace-dp`,
    never the shared `/usr/local/sbin` link.
 
+### Post-start helper-readiness gate (#5286)
+
+After START, the cut consults `System.HelperHealthy(expectVersion,
+StartHealthDeadline)` before it COMMITS (GC + clear the rollback journal on
+the standalone path) or returns the node to HA election. This gate decides
+whether the new version actually forwards.
+
+The production `realSystem` accepts a helper-health probe injected via
+`upgrade.NewSystemWithHelperHealth`; `cmd/xpfd` (`buildUpgradeSystem`) now
+wires it. Before #5286 the construction site used the probe-less
+`NewSystem`, so `HelperHealthy` degraded to a bare `systemctl is-active`
+poll and IGNORED `expectVersion` — service PROCESS ACTIVITY was the only
+witness. Because xpfd is `Type=simple`, systemd reports the unit active the
+instant the process is up, so the cut could COMMIT while the userspace
+helper was down / stale / crash-looping and NOT forwarding.
+
+The wired probe (`upgrade.HelperHealthProbe`) fails CLOSED unless, within
+`StartHealthDeadline`, it observes ALL of:
+
+1. **process up** — `systemctl is-active <unit>` == active. Necessary but
+   NOT sufficient (this alone was the pre-#5286 signal).
+2. **armed + forwarding** — the userspace helper answers a one-shot
+   control-socket `status` query (the existing
+   `userspace.ProbeStatus`/`ProbeForwardingArmed` request — no new IPC)
+   reporting `Enabled && ForwardingArmed`, the authoritative "forwarding is
+   live" pair. A down/stale/crash-looping helper fails here.
+3. **on the target version** — the armed helper's executable
+   (`/proc/<pid>/exe`) resolves under `versions/<expectVersion>/`, so a
+   stale previous-version helper still armed on the shared control socket is
+   not mistaken for the freshly-cut dataplane. This leans on the
+   concrete-version `ExecStart` invariant above: `dir(os.Args[0])` — and
+   therefore the co-located `xpf-userspace-dp` — is the matching-version
+   dir.
+
+The control-socket path is resolved from the ACTIVE config (honoring an
+operator `system dataplane control-socket` override) with a default
+fallback, so the gate probes the socket the running helper actually listens
+on. Per the #1373 eBPF retirement the userspace helper is the ONLY
+forwarding path, so a healthy post-upgrade node MUST have an armed
+forwarding helper — there is no legitimate no-helper case to exempt. A
+not-healthy result flows into the existing rollback path below.
+
 ### Rollback (binary + DB atomic)
 
 Standalone auto-rollback (on an unhealthy post-start helper) and operator

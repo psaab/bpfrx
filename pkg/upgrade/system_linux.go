@@ -138,18 +138,35 @@ func (s *realSystem) BinaryVersion(bin string) (string, error) {
 		"(want \"xpfd <version> ...\"): %q", bin, trimmed)
 }
 
+// unitActiveProbe reports whether <unit>.service is currently active per
+// `systemctl is-active`. It is a package var so BOTH the is-active-only
+// fallback below AND the wired HelperHealthProbe precondition share ONE seam a
+// test can force. Forcing it is the hinge of the #5286 RED-on-revert: with the
+// process reported ACTIVE but the helper NOT armed+forwarding, HelperHealthy is
+// (wrongly) healthy under the OLD is-active-only path but fails closed under
+// the new gate.
+var unitActiveProbe = func(unit string) bool {
+	out, _ := exec.Command("systemctl", "is-active", unit+".service").Output()
+	return strings.TrimSpace(string(out)) == "active"
+}
+
 func (s *realSystem) HelperHealthy(expectVersion string, deadline time.Duration) error {
 	if s.helperHealth != nil {
 		return s.helperHealth(expectVersion, deadline)
 	}
-	// Fallback: poll `systemctl is-active` until active or deadline. The
-	// unit's own ExecStartPre verify gate + Restart=on-failure means an
-	// active unit is a reasonable health proxy when no helper probe is
-	// wired.
+	// Fallback (NO probe wired — e.g. a non-xpfd caller or a test): poll
+	// `systemctl is-active` until active or deadline.
+	//
+	// #5286: this is the WEAK is-active-only signal production no longer relies
+	// on. A Type=simple xpfd reports active immediately, so this proxy admits a
+	// daemon whose helper is down / stale / crash-looping and NOT forwarding.
+	// The production upgrade path wires a real probe via
+	// NewSystemWithHelperHealth (cmd/xpfd) that ADDITIONALLY requires the
+	// dataplane to be armed+forwarding on the target version. This branch
+	// remains only for callers that inject no probe.
 	end := time.Now().Add(deadline)
 	for {
-		out, _ := exec.Command("systemctl", "is-active", s.unit+".service").Output()
-		if strings.TrimSpace(string(out)) == "active" {
+		if unitActiveProbe(s.unit) {
 			return nil
 		}
 		if time.Now().After(end) {

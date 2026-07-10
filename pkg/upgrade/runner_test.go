@@ -38,6 +38,11 @@ type fakeSystem struct {
 	// healthHook, if set, runs at the start of HelperHealthy (used to
 	// simulate the new daemon mutating the live config DB post-start).
 	healthHook func()
+	// healthProbe, if set, REPLACES the healthErr/healthFailVersions result of
+	// HelperHealthy. #5286 wires the REAL HelperHealthProbe here so a cutover
+	// integration test drives the production armed+forwarding+target-version
+	// gate through a live Run().
+	healthProbe func(ver string, deadline time.Duration) error
 	// startFailOnce makes the NEXT StartUnit call fail once (to simulate a
 	// post-flip start-exec failure that must trigger auto-rollback).
 	startFailOnce bool
@@ -102,10 +107,13 @@ func (f *fakeSystem) VerifyDataplane(string, []string) (bool, error) {
 	return f.verifyPass, f.verifyErr
 }
 func (f *fakeSystem) BinaryVersion(string) (string, error) { return f.stagedVersion, nil }
-func (f *fakeSystem) HelperHealthy(ver string, _ time.Duration) error {
+func (f *fakeSystem) HelperHealthy(ver string, deadline time.Duration) error {
 	f.log("health:" + ver)
 	if f.healthHook != nil {
 		f.healthHook()
+	}
+	if f.healthProbe != nil {
+		return f.healthProbe(ver, deadline)
 	}
 	if f.healthFailVersions[ver] {
 		return fmt.Errorf("health fail for %s", ver)

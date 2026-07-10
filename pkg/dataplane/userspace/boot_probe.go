@@ -40,30 +40,62 @@ func DefaultControlSocketPath(cfg *config.Config) string {
 // unarmed": both mean no live forwarding, and the #1993 caller fails toward
 // clearing FRR in either case.
 func ProbeForwardingArmed(controlSocket string, timeout time.Duration) (bool, error) {
+	st, err := ProbeStatus(controlSocket, timeout)
+	if err != nil {
+		// No surviving helper (ENOENT / ECONNREFUSED), a bad path, or a
+		// framing failure: not armed. The error is informational only.
+		return false, err
+	}
+	if st == nil {
+		// A !ok / nil-status response is a clean "not armed", not an error.
+		return false, nil
+	}
+	return st.Enabled && st.ForwardingArmed, nil
+}
+
+// ProbeStatus performs the same one-shot control-socket "status" query as
+// ProbeForwardingArmed but returns the FULL ProcessStatus, for callers that
+// need more than the armed+forwarding bool. It stands up NO Manager and starts
+// NO helper — it is the exact same request the runtime status loop and the
+// boot armed-probe issue, so it does NOT invent a new IPC.
+//
+// #5286 uses it in the upgrade cutover readiness gate: beyond
+// Enabled && ForwardingArmed it needs ProcessStatus.PID to tie the ARMED helper
+// to the freshly-cut target-version binary (a stale previous-version helper
+// still armed on the socket must not be mistaken for the new dataplane).
+//
+// Return contract:
+//   - dial / encode / decode failure  -> (nil, err)   (helper unreachable or
+//     framing broke)
+//   - helper answered !ok (no live status) -> (nil, nil)
+//   - helper answered ok               -> (status, nil)  (status may itself be
+//     nil if the helper omitted it, which the caller treats as not-ready)
+//
+// It deliberately does NOT interpret Enabled/ForwardingArmed — the caller
+// decides what "ready" means.
+func ProbeStatus(controlSocket string, timeout time.Duration) (*ProcessStatus, error) {
 	if controlSocket == "" {
-		return false, errors.New("userspace dataplane control socket not configured")
+		return nil, errors.New("userspace dataplane control socket not configured")
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
 	conn, err := net.DialTimeout("unix", controlSocket, timeout)
 	if err != nil {
-		// No surviving helper (ENOENT / ECONNREFUSED) or it is not accepting:
-		// not armed.
-		return false, err
+		return nil, err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 
 	if err := json.NewEncoder(conn).Encode(&ControlRequest{Type: "status"}); err != nil {
-		return false, err
+		return nil, err
 	}
 	var resp ControlResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
-		return false, err
+		return nil, err
 	}
-	if !resp.OK || resp.Status == nil {
-		return false, nil
+	if !resp.OK {
+		return nil, nil
 	}
-	return resp.Status.Enabled && resp.Status.ForwardingArmed, nil
+	return resp.Status, nil
 }
