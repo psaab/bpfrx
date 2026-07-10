@@ -142,8 +142,23 @@ func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDrop
 
 	in := system.ResolvedDropinInput{NameServers: servers}
 	if cfg != nil {
-		in.DomainName = cfg.System.DomainName
-		in.DomainSearch = cfg.System.DomainSearch
+		// #4902 render belt: domain-name / domain-search are rendered verbatim
+		// into the resolved.conf `Domains=` line and the resolv.conf `search`
+		// line. Drop a leniently-loaded / peer-synced value that is not a valid
+		// DNS name (an embedded space would inject an extra resolver token). The
+		// strict commit gate (config.ValidateDNSDomain) rejects it at commit.
+		if config.ValidateDNSDomain(cfg.System.DomainName, nil) == nil {
+			in.DomainName = cfg.System.DomainName
+		} else if cfg.System.DomainName != "" {
+			slog.Warn("skipping invalid domain-name", "domain", cfg.System.DomainName)
+		}
+		for _, d := range cfg.System.DomainSearch {
+			if config.ValidateDNSDomain(d, nil) == nil {
+				in.DomainSearch = append(in.DomainSearch, d)
+			} else {
+				slog.Warn("skipping invalid domain-search entry", "domain", d)
+			}
+		}
 	}
 	return in
 }

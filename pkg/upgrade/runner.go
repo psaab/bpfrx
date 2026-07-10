@@ -263,18 +263,20 @@ func (r *Runner) saveJournal(j *Journal) error {
 }
 
 // ReadJournalSourceGeneration returns the SourceGeneration recorded in the
-// upgrade journal at path, or "" if the journal is absent, unparsable, or has
-// no pinned generation. It is used by `xpfd publish-generation` to PROTECT a
+// upgrade journal at path, or "" if the journal is absent or has no pinned
+// generation. It is used by `xpfd publish-generation` to PROTECT a
 // crashed/resumable cut's pinned generation from the publish GC (the journal
 // is durable; the host-wide lock that would otherwise serialize the cut is NOT
 // held across a crash).
 //
-// Both a missing journal AND a malformed (unparsable) one return ("", nil): a
-// journal that does not parse cannot name a genid to protect, and this is a
-// best-effort GC-protection seam (the cut's own gc(j) protects its source from
-// the authoritative in-memory journal). Only a genuine READ error (I/O,
-// permission) surfaces — that is worth logging, and the caller treats it as
-// "no protection" without failing the publish. The returned genid is only ever
+// An ABSENT journal returns ("", nil): there is no crashed cut to protect, so
+// the caller may GC freely. A journal that is PRESENT but cannot be read (I/O,
+// permission) OR cannot be parsed (malformed/truncated) returns a non-nil
+// error: the protection set is UNKNOWN, and the destructive publish GC MUST
+// fail closed (skip GC) rather than proceed with an empty protection set and
+// reap the pinned source generation of a crash-after-STOP cut, which would
+// leave the upgrade unrecoverable / daemon-down (#4876). A well-formed journal
+// returns its SourceGeneration (possibly ""). The returned genid is only ever
 // used as a GC-protection key, never as a path, so the caller need not
 // validate it.
 func ReadJournalSourceGeneration(path string) (string, error) {
@@ -287,10 +289,13 @@ func ReadJournalSourceGeneration(path string) (string, error) {
 	}
 	j := &Journal{}
 	if uerr := json.Unmarshal(data, j); uerr != nil {
-		// A malformed journal names no genid to protect; degrade to "no
-		// protection" rather than surfacing an error a best-effort caller would
-		// only log-and-ignore.
-		return "", nil
+		// A present-but-malformed journal must NOT be silently treated as "no
+		// protection" (#4876): a crashed/resumable cut may have pinned a source
+		// generation this corrupted/truncated journal can no longer name.
+		// Surface it as an error so the destructive publish-generation GC fails
+		// closed (skips GC) instead of reaping a pinned generation and bricking
+		// the resume.
+		return "", fmt.Errorf("parse upgrade journal %s: %w", path, uerr)
 	}
 	return j.SourceGeneration, nil
 }

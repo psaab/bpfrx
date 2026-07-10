@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -748,9 +749,22 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 	if err != nil {
 		return 0, err
 	}
+	// This transport is created per-probe and dropped when probeHTTP returns.
+	// DisableKeepAlives means the underlying TCP connection is closed after the
+	// single request instead of being parked in the transport's idle pool. A
+	// pooled connection would leak here (#4912): a bodyless response (HTTP 204
+	// or Content-Length: 0) is fully consumed by resp.Body.Close(), so the
+	// keep-alive path returns the socket to the pool — but the transport has no
+	// owner and IdleConnTimeout == 0 (no limit), so the socket and its
+	// persistent-connection read-loop goroutine retain each other forever.
+	// Frequent probes to an empty health endpoint would then leak one fd +
+	// goroutine per attempt. CloseIdleConnections() on return is a belt-and-
+	// suspenders drop of anything that did get pooled.
 	transport := &http.Transport{
-		DialContext: dialer.DialContext,
+		DialContext:       dialer.DialContext,
+		DisableKeepAlives: true,
 	}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: 10 * time.Second, Transport: transport}
 
 	start := time.Now()
@@ -762,6 +776,10 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 	if err != nil {
 		return 0, fmt.Errorf("HTTP GET failed: %w", err)
 	}
+	// Drain then close the body on every path — including a bodyless 204 — so
+	// the connection is fully consumed before close and never lingers
+	// half-read (#4912).
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	rtt := time.Since(start)
 

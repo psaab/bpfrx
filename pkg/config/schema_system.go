@@ -57,9 +57,13 @@ func syslogDestinationModifiers(extra map[string]*schemaNode) map[string]*schema
 }
 
 var schemaSystem = &schemaNode{desc: "System configuration", children: map[string]*schemaNode{
-	"host-name":     {desc: "System hostname", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
-	"domain-name":   {desc: "Domain name", args: 1, placeholder: "<domain>", children: nil},
-	"domain-search": {desc: "Domain search list", args: 1, multi: true, placeholder: "<domain>", children: nil},
+	"host-name": {desc: "System hostname", args: 1, scalar: true, placeholder: "<hostname>", children: nil},
+	// #4902: domain-name / domain-search are rendered verbatim into the
+	// resolved.conf `Domains=` line and the resolv.conf `search` line. Type them
+	// as DNS names so a space/control/malformed value cannot inject an extra
+	// resolver directive token.
+	"domain-name":   {desc: "Domain name", args: 1, valueType: ValueHostname, valueDesc: "DNS domain name", valueExamples: []string{"example.net"}, validator: ValidateDNSDomain, placeholder: "<domain>", children: nil},
+	"domain-search": {desc: "Domain search list", args: 1, multi: true, valueType: ValueHostname, valueDesc: "DNS domain name", valueExamples: []string{"example.net", "corp.example.net"}, validator: ValidateDNSDomain, placeholder: "<domain>", children: nil},
 	"time-zone":     {desc: "System time zone", args: 1, placeholder: "<timezone>", children: nil},
 	"no-redirects":  {desc: "Disable ICMP redirects", children: nil},
 	// #1319 PR 3: compiled verbatim and written into the resolver
@@ -144,7 +148,11 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// SetPath's single-value-REPLACE branch collapsed a multi-server
 		// config to the LAST server on a flat-set / load-set / display-set
 		// round-trip.
-		"server": {desc: "NTP server", args: 1, multi: true, placeholder: "<address>", children: nil},
+		// #4902: the NTP server value is rendered verbatim into a chrony
+		// `server`/`pool` directive. Type it as an IP-or-hostname so a
+		// space/control/malformed value cannot inject a second chrony directive
+		// token or fail the chrony reload.
+		"server": {desc: "NTP server", args: 1, multi: true, valueType: ValueHostname, valueDesc: "NTP server IP address or hostname", valueExamples: []string{"192.0.2.1", "pool.ntp.org"}, validator: ValidateNTPServer, placeholder: "<address>", children: nil},
 		"threshold": {desc: "Threshold", args: 1, placeholder: "<seconds>", children: map[string]*schemaNode{
 			"action": {desc: "Action on threshold", args: 1, placeholder: "<action>", children: nil},
 		}},
@@ -162,9 +170,16 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		// filter" (ParseSeverity returns 0 for anything it does not know).
 		// `allow-duplicates` is an explicit presence-only flag so it is
 		// not mistaken for a facility with a missing severity.
+		// #4902: the user token is formatted into a drop-in filename
+		// (10-xpf-user-<user>.conf) and the rsyslog `:omusrmsg:<user>` directive.
+		// A keyValidator (typed KEY slot) rejects a path separator / whitespace /
+		// control-char value at commit; the daemon's applySyslogFiles applies the
+		// same check defensively.
 		"user": {desc: "Syslog user destination", args: 1, placeholder: "<user>",
-			wildcard: syslogFacilitySeverityLeaf(),
-			children: syslogDestinationModifiers(nil)},
+			keyValueType: ValueIdentifier, keyValueDesc: "Login user name, or '*' for all logged-in users",
+			keyValidator: ValidateSyslogUser,
+			wildcard:     syslogFacilitySeverityLeaf(),
+			children:     syslogDestinationModifiers(nil)},
 		"host": {desc: "Syslog host destination", args: 1, placeholder: "<host>",
 			wildcard: syslogFacilitySeverityLeaf(),
 			// #4303 S-1: host-only modifiers wired into the runtime syslog
@@ -185,8 +200,14 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				"routing-instance":  {desc: "Routing instance used to reach the host", args: 1, placeholder: "<instance>", children: nil},
 				"exclude-hostname":  {desc: "Omit the local hostname field", children: nil},
 			})},
+		// #4902: the file name is formatted into /var/log/<name> and the drop-in
+		// filename 10-xpf-<name>.conf. A keyValidator rejects a path separator /
+		// `..` / whitespace / control-char value at commit; applySyslogFiles
+		// applies the same check defensively.
 		"file": {desc: "Syslog file destination", args: 1, placeholder: "<filename>",
-			wildcard: syslogFacilitySeverityLeaf(),
+			keyValueType: ValueIdentifier, keyValueDesc: "Log file base name (written to /var/log/<name>)",
+			keyValidator: ValidateSyslogFileName,
+			wildcard:     syslogFacilitySeverityLeaf(),
 			children: syslogDestinationModifiers(map[string]*schemaNode{
 				"archive": {desc: "Archive-file rotation settings", children: map[string]*schemaNode{
 					"size":              {desc: "Maximum file size before rotation", args: 1, placeholder: "<size>", children: nil},
@@ -419,19 +440,35 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			// KexAlgorithms (pkg/daemon/daemon_system.go applySSHConfig).
 			// Junos takes a free-form algorithm-name list; sshd validates
 			// the spellings at reload, so no enum here.
+			// #4902: the key-exchange list is joined with commas into a sshd
+			// `KexAlgorithms` line. Type each token as a safe OpenSSH algorithm
+			// name so a value with a comma/space/control char cannot smuggle a
+			// second sshd directive token onto the line (or fail the reload). sshd
+			// still validates the algorithm SPELLING at reload; this only rejects
+			// the injection/breakage shape.
 			"key-exchange": {
-				desc:        "SSH key-exchange method (KexAlgorithms)",
-				args:        1,
-				multi:       true,
-				placeholder: "<key-exchange-method>",
-				children:    nil,
+				desc:          "SSH key-exchange method (KexAlgorithms)",
+				args:          1,
+				multi:         true,
+				placeholder:   "<key-exchange-method>",
+				valueType:     ValueIdentifier,
+				valueDesc:     "OpenSSH key-exchange algorithm name",
+				valueExamples: []string{"curve25519-sha256", "diffie-hellman-group-exchange-sha256"},
+				validator:     ValidateSSHAlgorithm,
+				children:      nil,
 			},
 			// #4305 S-4: sshd hardening knobs rendered into the xpf drop-in.
-			// ciphers/macs are free-form algorithm lists (sshd validates the
-			// spellings at reload, so no enum). The numeric knobs are bounded
-			// to the Junos ranges.
-			"ciphers": {desc: "SSH ciphers (sshd Ciphers)", args: 1, multi: true, placeholder: "<cipher>", children: nil},
-			"macs":    {desc: "SSH message-authentication codes (sshd MACs)", args: 1, multi: true, placeholder: "<mac>", children: nil},
+			// #4902: ciphers/macs are comma-joined into sshd Ciphers/MACs lines,
+			// so each token is a typed safe algorithm name (same rationale as
+			// key-exchange above). sshd validates the spellings at reload.
+			"ciphers": {desc: "SSH ciphers (sshd Ciphers)", args: 1, multi: true,
+				valueType: ValueIdentifier, valueDesc: "OpenSSH cipher name",
+				valueExamples: []string{"aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com"},
+				validator:     ValidateSSHAlgorithm, placeholder: "<cipher>", children: nil},
+			"macs": {desc: "SSH message-authentication codes (sshd MACs)", args: 1, multi: true,
+				valueType: ValueIdentifier, valueDesc: "OpenSSH MAC name",
+				valueExamples: []string{"hmac-sha2-256-etm@openssh.com", "hmac-sha2-512"},
+				validator:     ValidateSSHAlgorithm, placeholder: "<mac>", children: nil},
 			"connection-limit": {desc: "Maximum concurrent SSH connections (sshd MaxStartups)", args: 1, placeholder: "<limit>",
 				valueType: ValueInteger, valueDesc: "1-250", validator: ValidateInteger(1, 250), children: nil},
 			"rate-limit": {desc: "SSH connection attempts per minute", args: 1, placeholder: "<limit>",

@@ -1038,6 +1038,28 @@ func (m *Manager) withdrawAllLocked(ctx context.Context) error {
 	return firstErr
 }
 
+// providerIO performs ONE provider network call (UpsertLease/DeleteLease) with
+// m.mu RELEASED, then re-acquires the lock before returning (#5006, mirroring
+// SurfaceAManager.providerIO / #2778). The caller MUST hold m.mu on entry and
+// will hold it again on return. Releasing the lock around the wire op — bounded
+// by the ~5s DDNS reconcile timeout — is the whole point: a slow or hung
+// authoritative RFC 2136 server must NOT block the telemetry/CLI readers
+// Stats() / OwnedRecordViews() (`show system services dynamic-dns` + the
+// Prometheus scrape both take m.mu). The daemon serializes reconcile passes
+// (ddnsReconcileInFlight, pkg/daemon/daemon.go), so no concurrent pass mutates
+// m.state while the lock is dropped here — only the read-only Stats() /
+// OwnedRecordViews() callers may run, which is exactly what must be unblocked.
+// The write-ahead ownership intent (upsertLocked) is persisted under the lock
+// BEFORE this call and the wire result is recorded under the re-acquired lock
+// AFTER it, so the durable store is never mutated concurrently. Panic-safe: the
+// lock is re-acquired even if fn panics, keeping ReconcileScoped's deferred
+// Unlock balanced (a panicking backend would otherwise double-unlock).
+func (m *Manager) providerIO(fn func() error) error {
+	m.mu.Unlock()
+	defer m.mu.Lock()
+	return fn()
+}
+
 // upsertLocked publishes a record and records ownership on success. With no
 // live backend (nopUpdater), the upsert is a logged no-op AND ownership is
 // deliberately NOT recorded: recording ownership for a record that never
@@ -1105,7 +1127,7 @@ func (m *Manager) upsertLocked(ctx context.Context, updater DNSUpdater, rec Leas
 		return err
 	}
 
-	if err := updater.UpsertLease(ctx, rec); err != nil {
+	if err := m.providerIO(func() error { return updater.UpsertLease(ctx, rec) }); err != nil {
 		// ORDER MATTERS (#2676): check errDDNSPTRPending BEFORE
 		// errDDNSConflictRefused. errDDNSPTRPending is returned ONLY after the
 		// forward A/AAAA add SUCCEEDED, so its presence proves the forward is
@@ -1215,7 +1237,7 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, updater DNSUpdater, own
 	// delete still satisfies the DHCID-match prerequisite. Only when THIS is the
 	// last owned record under the name is the DHCID removed with it.
 	rec.KeepForwardDHCID = m.dhcidSharedWithOther(owned)
-	if err := updater.DeleteLease(ctx, rec); err != nil {
+	if err := m.providerIO(func() error { return updater.DeleteLease(ctx, rec) }); err != nil {
 		m.deleteFail.Add(1)
 		return err
 	}

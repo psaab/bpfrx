@@ -25,6 +25,108 @@
   the pre-#5007 interleaved shape (reverse OwnerRGID=2, snapshot B) and passes
   GREEN on the fix. `go test -race ./pkg/dataplane/userspace/` passes; `go vet`
   and `gofmt` clean; `cmd/xpfd` builds. Go-only change — no Rust touched.
+## 2026-07-09 — #5006 ddns: Manager held m.mu across blocking RFC 2136 DNS UPDATE I/O — stalled Stats()/OwnedRecordViews()
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5006 (Medium, telemetry stall). The DHCP dynamic-DNS
+  `Manager.ReconcileScoped` held `m.mu` for the whole pass — including the
+  blocking RFC 2136 DNS UPDATE wire I/O in `upsertLocked`
+  (`updater.UpsertLease`) and `deleteOwnedLocked` (`updater.DeleteLease`),
+  bounded only by the ~5s DDNS reconcile timeout. The telemetry/CLI readers
+  `Stats()` and `OwnedRecordViews()` take `m.mu.Lock()`, so
+  `show system services dynamic-dns` and Prometheus scrapes blocked for the
+  full DNS exchange when the authoritative server was slow/offline. Mirrored
+  the sibling `SurfaceAManager.providerIO`: added a `Manager.providerIO`
+  helper that releases `m.mu` around the ONE wire call and re-acquires it
+  (panic-safe), and routed both `UpsertLease` and `DeleteLease` through it.
+  Safe because the daemon serializes reconcile passes (`ddnsReconcileInFlight`)
+  so no concurrent pass mutates `m.state` during the drop — only the read-only
+  telemetry callers, which is exactly what must be unblocked. The write-ahead
+  ownership intent is still persisted under the lock BEFORE the wire add and
+  the result recorded under the re-acquired lock AFTER it.
+  **File(s)**: pkg/ddns/manager.go, pkg/ddns/manager_lockio_5006_test.go
+  **Validation**: new `TestManagerLockNotHeldDuringUpsert` /
+  `TestManagerLockNotHeldDuringDelete` (fail-on-revert: reverting the
+  providerIO wrapping makes both HANG on the blocked reader and fire the 2s
+  t.Fatal — verified RED). `go build ./...`, `go vet ./pkg/ddns/`, and the full
+  `go test ./pkg/ddns/` suite are green.
+## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4910 (availability). Both gRPC listeners (`Run` loopback,
+  `RunFabricListener` fabric) called `srv.GracefulStop()` with no timeout,
+  and the unbounded server-streaming `MonitorInterface` RPC only watched
+  its client `stream.Context()`. A client (loopback, or an authenticated
+  fabric peer) holding that stream open during shutdown blocked
+  GracefulStop — and thus `Run`/`RunFabricListener` — forever, wedging
+  daemon stop/failover/restart. Fix: added `stopGRPCServer(srv, timeout)`
+  — GracefulStop in a goroutine + `Stop()` after `grpcStopTimeout` (2s) —
+  used by both listeners; `Run`'s serve/shutdown loop factored into
+  `serveUntilDone` for testability. Force-Stop cancels the stuck stream's
+  context so the handler returns; a clean/idle shutdown still returns as
+  soon as GracefulStop completes (no dropped events on normal disconnect).
+  Added `TestServeUntilDoneBoundedByStuckMonitorStream_4910` (RED on
+  revert: hangs 7s) + `TestStopGRPCServerIdleReturnsPromptly_4910`.
+  **File(s)**: pkg/grpcapi/server.go,
+  pkg/grpcapi/server_shutdown_monitor_4910_test.go, pkg/grpcapi/README.md
+## 2026-07-09 — #4912 rpm: HTTP probe leaked a keep-alive transport + fd per bodyless (204) response
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4912 (resource leak). `probeHTTP` built a fresh
+  `http.Transport` per probe with keep-alives implicitly ENABLED and
+  `IdleConnTimeout == 0`, ran one GET, and dropped the transport. For a
+  bodyless response (204 / Content-Length: 0), `resp.Body.Close()`
+  returned the connection to that unowned transport's idle pool with no
+  idle timeout, so the socket + persistent-connection read-loop goroutine
+  retained each other forever — one fd + goroutine leaked per probe to an
+  empty health endpoint. Fix: set `DisableKeepAlives: true`, defer
+  `transport.CloseIdleConnections()`, and drain (`io.Copy(io.Discard,
+  ...)`) + close the body on every path. Added
+  `TestProbeHTTPBodylessResponseNoConnLeak_4912` — a repeated-204 probe
+  with a connection-counting listener that asserts the server's open-conn
+  count drains to zero; RED on revert (4 conns stay open).
+  **File(s)**: pkg/rpm/rpm.go,
+  pkg/rpm/http_transport_leak_4912_test.go, pkg/rpm/README.md
+## 2026-07-09 — #4876 cmd/xpfd: publish-generation ran destructive staged-generation GC even when the journal protection set was unreadable
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4876 (upgrade / fail-open). `xpfd publish-generation` read
+  the upgrade journal to protect a crashed/resumable cut's pinned source
+  generation from its GC, but on a journal read error only WARNed and ran
+  GC anyway with an empty protection set; a present-but-malformed journal
+  degraded to ("",nil), same result. A crash-after-STOP cut whose journal
+  became unreadable could have its pinned source reaped, bricking the
+  resume. Fix: `ReadJournalSourceGeneration` now errors on a
+  present-but-malformed journal (absent still returns ("",nil)); the verb
+  routes through a new `gcProtectionForPublish` helper that SKIPS GC when
+  the protection set is unknown (read error / malformed). Added
+  fail-on-revert tests at both the reader and caller level.
+  **File(s)**: pkg/upgrade/runner.go,
+  pkg/upgrade/read_journal_malformed_4876_test.go,
+  cmd/xpfd/publish_generation.go,
+  cmd/xpfd/publish_generation_gc_4876_test.go, docs/in-place-upgrade.md
+## 2026-07-09 — #4888 configstore: encrypted-envelope with unknown/future `format` fell through as plaintext and empty-loaded instead of failing closed
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4888 (fail-open, security-adjacent). `unmarshalEnvelope`
+  returned (ok=false, err=nil) for ANY body whose `format` was not the
+  current `xpf-master-password-v1`, so `maybeDecryptTreeJSON` handed the
+  raw bytes back as plaintext; `readTreeMeta` then `json.Unmarshal`'d an
+  envelope-shaped body (future format / corruption) into a `ConfigTree`,
+  dropping the unknown `format`/`prf`/`salt`/`nonce`/`data` fields and
+  yielding an EMPTY tree — so `Store.Load` booted a committed-empty config
+  instead of `ErrConfigDBUnreadable`. Fix: fail CLOSED on an
+  envelope-shaped body with an unknown/future `format` OR AES-GCM fields
+  present without the current format; only a body with no format AND no
+  AES-GCM fields passes through as genuine plaintext (verified the legacy
+  no-envelope + current-format paths still pass). ConfigTree JSON is
+  `{"Children":[...]}` — no top-level format/salt/nonce/data — so the
+  plaintext discriminator cannot false-positive. Added a unit test on the
+  `unmarshalEnvelope` contract + an end-to-end `Store.Load` ->
+  `ErrConfigDBUnreadable` test; both RED on revert.
+  **File(s)**: pkg/configstore/crypto.go,
+  pkg/configstore/crypto_envelope_unknown_format_4888_test.go,
+  pkg/configstore/README.md
 
 ## 2026-07-09 — #4882 userspace-dp: debug BPF session dump used `core::ptr::read` (align 2) on a `Vec<u8>` (align 1) — UB; use `read_unaligned`
 
@@ -44008,6 +44110,9 @@ top.
   **Action**: #4955 fix orphaned NTF_PROXY proxy-arp neighbor entry on interface/config removal. ReconcileProxyARP now folds a priorIfaceMap (interfaces a prior commit installed proxy-arp on, remembered by the daemon) into its managed listing set, so NTF_PROXY entries on interfaces dropped from the config are listed as stale and NeighDel'd (previously managedSet came only from the current config, orphaning them). The add loop is now best-effort and returns a non-nil enabled set on partial failure instead of nil-ing the daemon's remembered state. Daemon reconcileProxyARP now always drives the dataplane reconcile (even on full removal) with the prior-interface set. Added proxyARPApplyFn seam + priorProxyARPIfaceMap helper.
   **File(s)**: pkg/dataplane/proxyarp.go, pkg/dataplane/proxyarp_test.go, pkg/dataplane/proxyarp_orphan_4955_test.go, pkg/daemon/daemon_proxyarp.go, pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md
 
+- **Timestamp**: 2026-07-09 17:57 PDT
+  **Action**: #4902 add typed grammar validators for the untyped `system` string leaves rendered verbatim into root-owned host service/resolver configs (chrony/sshd/rsyslog/resolved). New validators in schema_validators_system.go: ValidateNTPServer (IP or DNS hostname), ValidateDNSDomain (domain-name/domain-search), ValidateSSHAlgorithm (key-exchange/ciphers/macs OpenSSH token), ValidateSyslogFileName + ValidateSyslogUser (safe base name / '*'). Wired into schema_system.go as typed value validators (ntp server, domain-name/search, ssh kex/ciphers/macs) and keyValidators (syslog file/user identity). The global control-char gate (freetext.go) already closes the newline vector strict+lenient; these gates additionally reject the space-token-injection / path-separator / malformed shapes that a control-char scrub leaves intact. Render-side belts (defense for lenient load/HA-sync): renderChronySources skips invalid servers, buildSSHDConfig filters algorithm lists via new filterSSHAlgorithms, applySyslogFiles skips invalid file/user names, mergeDNSInput drops invalid domains. Tests: pkg/config (validator unit tables + flat-set/hierarchical SchemaValidate gate) and pkg/daemon (render-belt skip/filter). Verified RED on revert of both the schema wiring (config) and the render belts (daemon). No separate doc change: config-schema.md documents the typed-leaf mechanism; the belts follow the documented #1798 three-layer model.
+  **File(s)**: pkg/config/schema_validators_system.go, pkg/config/schema_system.go, pkg/config/system_string_injection_4902_test.go, pkg/daemon/daemon_system.go, pkg/daemon/daemon_dns.go, pkg/daemon/system_string_injection_belt_4902_test.go
 - **Timestamp**: 2026-07-09 17:42 PDT
   **Action**: #4896 fix NetFlow v9 record/template width mismatch (records 2+ misdecode). recordSize() padded EACH data record to a 4-byte boundary while the template advertised the unpadded field-length sum, so a standards-compliant collector (walking by the template width) misdecoded every record after the first in a multi-record Data FlowSet. Removed the per-record padding: records are now contiguous at the template width (RFC 3954); only the enclosing FlowSet is rounded up once (dataFlowSetLen terminal padding), matching the already-correct IPFIX sibling. Reserved worst-case 3B terminal padding in the exporter maxRecords so 20+dataLen stays <= maxPayload. Added netflow_multirecord_4896_test.go: a 2- and 7-record v4/v6 golden decoder (both flow-dir modes) that walks records at the INDEPENDENT template-advertised width and asserts each record's src IP/port + the FlowSet Length field. Updated single-record assertions (postnat/flowdir/dropped_fields) from `4+recSize` to dataFlowSetLen(1,recSize) and the recordSize constants 64/112 -> 61/109. Updated pkg/flowexport/README.md. RED on revert (reintroducing the pad makes FlowSet Length 132 vs collector-expected 128).
   **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/netflow_multirecord_4896_test.go, pkg/flowexport/postnat_test.go, pkg/flowexport/flowdir_test.go, pkg/flowexport/dropped_fields_test.go, pkg/flowexport/README.md
