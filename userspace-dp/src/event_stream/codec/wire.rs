@@ -77,8 +77,21 @@ pub(crate) const MSG_SESSION_CREATE_RT_FLOW: u8 = 15;
 // SESSION_CREATE / deny / screen / filter frames do. [140:144] stays reserved
 // padding. All frame encoders emit this length; non-close frames leave
 // [136:152] zero.
+//
+// #4915: 160 bytes (was 152). The trailing [152:160] u64 carries the
+// dataplane's STABLE session id (LE) on the SESSION_CREATE and SESSION_CLOSE
+// frames so a SIEM/operator can join a session's open and close records — the
+// per-event ordinal the Go side stamped before could never match across the
+// two events, nor disambiguate a reused 5-tuple. Only the two RT_FLOW session
+// frames populate this slot (`encode_session_create_rt_flow` /
+// `encode_session_close_rt_flow`); deny/screen/filter frames have no session
+// and leave it zero. The growth is ADDITIVE with the same discipline as the
+// #2749 [144:152] block: the Go side keeps its minimum-frame acceptance at the
+// legacy 144 bytes (`rawEventWireSize`) and reads [152:160] only when the frame
+// carries it (`len(data) >= 160`) AND only on a session frame, so both
+// rolling-upgrade directions stay safe (#1961 both-sides wire discipline).
 #[allow(dead_code)]
-pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 152;
+pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 160;
 
 pub(super) const RT_FLOW_AF_INET: u8 = 2;
 pub(super) const RT_FLOW_AF_INET6: u8 = 10;
@@ -185,7 +198,12 @@ pub(super) fn write_ip(buf: &mut [u8; 256], pos: usize, ip: IpAddr, is_v6: bool)
     }
 }
 
-pub(super) fn write_ip_opt(buf: &mut [u8; 256], pos: usize, ip: Option<IpAddr>, is_v6: bool) -> usize {
+pub(super) fn write_ip_opt(
+    buf: &mut [u8; 256],
+    pos: usize,
+    ip: Option<IpAddr>,
+    is_v6: bool,
+) -> usize {
     match ip {
         Some(addr) => write_ip(buf, pos, addr, is_v6),
         None => {

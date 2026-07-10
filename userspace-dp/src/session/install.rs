@@ -138,6 +138,11 @@ impl SessionTable {
         // self.key_to_handle.insert(...) overwrites it cleanly.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
+        // #4915: allocate the STABLE, node-unique session id for this fresh
+        // install. Threaded onto the entry (write-once) and the Open delta so a
+        // session's SESSION_CREATE and SESSION_CLOSE RT_FLOW records share one
+        // correlatable id, and a reused 5-tuple gets a distinct id.
+        let session_id = self.alloc_session_id();
         let record = SessionRecord {
             key: key.clone(),
             entry: SessionEntry {
@@ -193,6 +198,9 @@ impl SessionTable {
                 // first packet is accounted on its forwarding pass.
                 observed_tos: 0,
                 observed_tcp_flags: tcp_flags,
+                // #4915: the stable id allocated above, write-once for the life
+                // of the entry.
+                session_id,
             },
         };
         let raw = self.entries.insert(record);
@@ -242,6 +250,10 @@ impl SessionTable {
                 // (informational — Open deltas have no flowexport consumer).
                 observed_tos: 0,
                 observed_tcp_flags: tcp_flags,
+                // #4915: the stable session id assigned above, so the
+                // SESSION_CREATE RT_FLOW frame carries the id its eventual
+                // SESSION_CLOSE will.
+                session_id,
             });
         }
         true
@@ -301,6 +313,14 @@ impl SessionTable {
         // key_to_handle mapping internally before returning None.
         let _previous = self.remove_entry(&key);
         let epoch = self.next_epoch();
+        // #4915: a peer-synced import gets a FRESH node-local session id. The
+        // peer's original id is not carried on the HA session-sync wire, so a
+        // session that opens on the primary and closes on the standby after a
+        // failover carries different ids on the two nodes — a documented
+        // follow-up (cross-node id identity needs a session-sync wire change).
+        // A node-local id still fixes same-node create/close correlation and
+        // matches this node's own live-session view.
+        let session_id = self.alloc_session_id();
         let record = SessionRecord {
             key: key.clone(),
             entry: SessionEntry {
@@ -376,6 +396,8 @@ impl SessionTable {
                 // Seed with the trigger flags, ToS unknown until first forward.
                 observed_tos: 0,
                 observed_tcp_flags: tcp_flags,
+                // #4915: fresh node-local id allocated above.
+                session_id,
             },
         };
         let raw = self.entries.insert(record);
@@ -429,6 +451,9 @@ impl SessionTable {
             // #2749: explicit Open-delta emit, no entry in hand.
             observed_tos: 0,
             observed_tcp_flags: 0,
+            // #4915: no backing entry in hand on this explicit-emit path, so no
+            // stable id is available — 0 keeps the "unknown" wire sentinel.
+            session_id: 0,
         });
     }
 
@@ -467,6 +492,11 @@ impl SessionTable {
             // values off the expiring entry).
             observed_tos: 0,
             observed_tcp_flags: 0,
+            // #4915: the entry was already removed by the explicit-close caller,
+            // so its stable id is no longer in hand — 0 keeps the "unknown"
+            // sentinel. The dominant idle/age close path (session/expire.rs)
+            // carries the real id off the expiring entry.
+            session_id: 0,
         });
     }
 

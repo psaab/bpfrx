@@ -122,6 +122,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
         // the close-emit / round-trip tests can assert real wire values.
         observed_tos: 0xB8,
         observed_tcp_flags: 0x13,
+        session_id: 0,
     }
 }
 

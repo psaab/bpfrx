@@ -456,6 +456,18 @@ struct SessionEntry {
     /// forwarded packet). Yields the cumulative `tcpControlBits` a collector
     /// expects (SYN|ACK|FIN|RST|… over the flow). 0 for non-TCP flows.
     observed_tcp_flags: u8,
+    /// #4915: the STABLE, node-unique session id assigned at install
+    /// (`SessionTable::alloc_session_id`). Write-once — never re-stamped over the
+    /// entry's life — so a session's SESSION_CREATE and SESSION_CLOSE RT_FLOW
+    /// records carry the SAME id, and a reused 5-tuple (same worker, later
+    /// install) gets a DISTINCT id. Harvested onto the Open/Close `SessionDelta`
+    /// and encoded at RT_FLOW [152:160]. The high 16 bits namespace the id by
+    /// worker so it is unique across the node's shared-nothing worker tables; the
+    /// low 48 bits are a per-worker monotonic counter starting at 1, so a real id
+    /// is never 0 (0 is the "unknown/legacy" wire sentinel). A peer-synced import
+    /// (`upsert_synced`) is assigned a FRESH node-local id — cross-node id
+    /// identity is a documented follow-up (see docs).
+    session_id: u64,
 }
 
 /// #2501: per-session traffic accounting, split by direction. A `Copy`
@@ -647,6 +659,18 @@ pub(crate) struct SessionTable {
     session_limit_src_counts: SeededIpMap<u32>,
     /// #2134: per-destination-IP mirror of `session_limit_src_counts`.
     session_limit_dst_counts: SeededIpMap<u32>,
+    /// #4915: per-worker monotonic session-id counter. Starts at 1 (so a real
+    /// id is never 0 — 0 is the "unknown" wire sentinel) and is bumped once per
+    /// `alloc_session_id`. Worker-owned and single-threaded like every other
+    /// counter here, so a plain `u64` (no atomic). Combined with
+    /// `session_id_worker_hi` to form the STABLE `SessionEntry.session_id`.
+    next_session_id: u64,
+    /// #4915: this worker's id shifted into the high 16 bits, so a session id is
+    /// unique across the node's shared-nothing per-worker `SessionTable`s
+    /// (`(worker_id as u64) << 48`). 0 for a table with no worker id set (the
+    /// test default and any single-table context) — harmless there because a
+    /// lone table's monotonic counter is already unique.
+    session_id_worker_hi: u64,
 }
 
 impl SessionTable {
@@ -702,12 +726,43 @@ impl SessionTable {
             // attacker-chosen source/destination IP — seed them too.
             session_limit_src_counts: HashMap::with_hasher(state.clone()),
             session_limit_dst_counts: HashMap::with_hasher(state),
+            // #4915: monotonic session-id counter starts at 1 (0 = "unknown"
+            // sentinel on the wire); worker namespace defaults to 0 until
+            // `set_worker_id` is called at worker setup.
+            next_session_id: 1,
+            session_id_worker_hi: 0,
         }
     }
 
     fn next_epoch(&mut self) -> u64 {
         self.epoch_counter += 1;
         self.epoch_counter
+    }
+
+    /// #4915: namespace this table's session ids by worker so the STABLE session
+    /// id (`SessionEntry.session_id`) is unique across the node's shared-nothing
+    /// per-worker `SessionTable`s. Called once at worker setup with the worker's
+    /// id; the id occupies the high 16 bits, leaving the low 48 for the
+    /// per-worker monotonic counter. A worker id >= 2^16 is clamped into range
+    /// (never happens — a queue index is tiny) so the shift cannot alias the
+    /// counter bits.
+    pub fn set_worker_id(&mut self, worker_id: u32) {
+        self.session_id_worker_hi = ((worker_id as u64) & 0xFFFF) << 48;
+    }
+
+    /// #4915: allocate the next STABLE session id for a freshly-installed entry.
+    /// Worker id in the high 16 bits, per-worker monotonic counter (masked to 48
+    /// bits) in the low bits; the counter starts at 1 so the returned id is never
+    /// 0 (0 is the "unknown/legacy" wire sentinel). The 48-bit counter space is
+    /// ~281 trillion ids per worker — unreachable in a process lifetime — but the
+    /// mask + the `== 0` guard keep the id well-formed even in the impossible
+    /// wrap case rather than aliasing the worker bits or emitting the 0 sentinel.
+    fn alloc_session_id(&mut self) -> u64 {
+        let counter = self.next_session_id;
+        self.next_session_id = self.next_session_id.wrapping_add(1);
+        let low = counter & 0x0000_FFFF_FFFF_FFFF;
+        let low = if low == 0 { 1 } else { low };
+        self.session_id_worker_hi | low
     }
 
     /// Update the configurable session timeouts.
@@ -1381,6 +1436,10 @@ impl SessionTable {
                 .entry_by_key(key)
                 .map(|e| (e.observed_tos, e.observed_tcp_flags))
                 .unwrap_or((0, 0));
+            // #4915: a promote keeps the entry's stable session id (read off the
+            // same entry as created_ns/counters), so the Open delta announcing
+            // the new local ownership carries the id already assigned at import.
+            let session_id = self.entry_by_key(key).map(|e| e.session_id).unwrap_or(0);
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key: key.clone(),
@@ -1393,6 +1452,7 @@ impl SessionTable {
                 counters,
                 observed_tos,
                 observed_tcp_flags,
+                session_id,
             });
         }
         true

@@ -1300,8 +1300,35 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			return d.grpcSrv
 		},
 	}
-	// Resolve interface bindings from web-management config
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
+	// Resolve interface bindings + api-auth from web-management config, then
+	// apply the #4047/#5127 loopback fail-safe on EVERY path (resolveAPIBinds).
+	d.resolveAPIBinds(&apiCfg, d.store.ActiveConfig())
+	srv := api.NewServer(apiCfg)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := srv.Run(ctx); err != nil {
+			slog.Error("API server error", "err", err)
+		}
+	}()
+	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
+}
+
+// resolveAPIBinds finalizes the HTTP/HTTPS listen addresses, TLS flag, and
+// api-auth on apiCfg from the active web-management config, then applies the
+// #4047/#5127 loopback fail-safe clamp. It is split out of startHTTPServer so
+// the bind/auth/clamp decision is unit-testable without opening a socket.
+//
+// cfg is the active config; it may be nil or lack a `system services
+// web-management` stanza. The KEY invariant (#5127): the loopback clamp runs
+// UNCONDITIONALLY — even when no web-management block exists — because
+// apiCfg.Addr defaults to the `--api-addr` flag, which an operator can point
+// off-loopback with no web-management stanza at all. Before #5127 the clamp
+// lived INSIDE the web-management block, so that flag path bound the mutating
+// REST/config API (set / commit / rollback / DHCP / system-action) to the
+// network UNAUTHENTICATED, defeating the #4047 fail-safe.
+func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
+	if cfg != nil && cfg.System.Services != nil &&
 		cfg.System.Services.WebManagement != nil {
 		wm := cfg.System.Services.WebManagement
 		// Bind HTTP to configured interface
@@ -1339,41 +1366,36 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			apiCfg.Auth = authCfg
 			slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
 		}
-		// #4047 part B: runtime fail-safe clamp. The commit gate
-		// (validateWebManagementAuthStrict, pkg/config) rejects a NEW
-		// web-management config that binds the unauthenticated REST/config API
-		// off-loopback without api-auth, but an ALREADY-PERSISTED such config
-		// is lenient-loaded (warn, no brick — #1960) and would still bind
-		// non-loopback UNAUTHENTICATED after upgrade, exposing the mutating
-		// config endpoints (set / commit / rollback / system action) to the
-		// network. clampBindToLoopback pulls a non-loopback + no-auth bind back
-		// to a loopback of the same family and WARNs: the daemon still boots,
-		// the web API stays reachable on loopback, and the console/SSH remain
-		// the lifeline (device-map §9.6 posture) until the operator adds
-		// api-auth (which restores the non-loopback bind).
-		hasAuth := apiCfg.Auth != nil
-		if clamped, ok := clampBindToLoopback(apiCfg.Addr, hasAuth); ok {
-			slog.Warn("web-management HTTP bind is non-loopback without api-auth; clamping to loopback (add `set system services web-management api-auth` to bind off-loopback) — #4047",
-				"requested", apiCfg.Addr, "clamped", clamped)
-			apiCfg.Addr = clamped
-		}
-		if apiCfg.TLS {
-			if clamped, ok := clampBindToLoopback(apiCfg.HTTPSAddr, hasAuth); ok {
-				slog.Warn("web-management HTTPS bind is non-loopback without api-auth; clamping to loopback — #4047",
-					"requested", apiCfg.HTTPSAddr, "clamped", clamped)
-				apiCfg.HTTPSAddr = clamped
-			}
+	}
+
+	// #4047 part B / #5127: runtime fail-safe clamp, applied on EVERY path
+	// (whether or not a web-management stanza exists). The commit gate
+	// (validateWebManagementAuthStrict, pkg/config) rejects a NEW web-management
+	// config that binds the unauthenticated REST/config API off-loopback without
+	// api-auth, but an ALREADY-PERSISTED such config is lenient-loaded (warn, no
+	// brick — #1960), AND the `--api-addr` flag has no commit gate at all
+	// (#5127). Either can bind non-loopback UNAUTHENTICATED, exposing the
+	// mutating config endpoints (set / commit / rollback / DHCP / system-action)
+	// to the network. clampBindToLoopback is a no-op when the bind is already
+	// loopback OR api-auth is configured, so the default 127.0.0.1:8080 path and
+	// an authenticated off-loopback web-management bind are unaffected; it only
+	// pulls a non-loopback + no-auth bind back to a same-family loopback and
+	// WARNs. The daemon still boots and the web API stays reachable on loopback,
+	// with the console/SSH the lifeline (device-map §9.6 posture) until the
+	// operator adds api-auth (which restores the non-loopback bind).
+	hasAuth := apiCfg.Auth != nil
+	if clamped, ok := clampBindToLoopback(apiCfg.Addr, hasAuth); ok {
+		slog.Warn("HTTP API bind is non-loopback without api-auth; clamping to loopback (add `set system services web-management api-auth` to bind off-loopback) — #4047/#5127",
+			"requested", apiCfg.Addr, "clamped", clamped)
+		apiCfg.Addr = clamped
+	}
+	if apiCfg.TLS {
+		if clamped, ok := clampBindToLoopback(apiCfg.HTTPSAddr, hasAuth); ok {
+			slog.Warn("HTTPS API bind is non-loopback without api-auth; clamping to loopback — #4047/#5127",
+				"requested", apiCfg.HTTPSAddr, "clamped", clamped)
+			apiCfg.HTTPSAddr = clamped
 		}
 	}
-	srv := api.NewServer(apiCfg)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := srv.Run(ctx); err != nil {
-			slog.Error("API server error", "err", err)
-		}
-	}()
-	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
 }
 
 // initManagers eagerly constructs the daemon's subsystem managers (routing,
