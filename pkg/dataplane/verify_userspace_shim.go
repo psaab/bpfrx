@@ -15,6 +15,13 @@
 // and programs, never attaches anything, and frees everything when the
 // collection is closed (or the process exits). A good program loaded
 // by a running daemon keeps forwarding throughout.
+//
+// The one interaction with production state is READ-ONLY: the shared
+// validateUserspaceShimSpec gate now inspects the running daemon's live
+// pinned maps to catch an ABI incompatibility at the pre-flight rather
+// than after the old daemon is stopped (#5307). That inspection opens a
+// handle, reads the map shape, and closes it — it never unpins,
+// attaches, or mutates the pin, so the running daemon keeps forwarding.
 package dataplane
 
 import (

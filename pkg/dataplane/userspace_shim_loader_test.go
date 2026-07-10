@@ -127,6 +127,265 @@ func TestValidateUserspaceShimSpecDriftMentionsUserspaceXDPGenerate(t *testing.T
 	}
 }
 
+// validABIBaseSpec builds a shim spec that passes every pre-#5307 check
+// (presence + MaxEntries + NO_PREALLOC) AND the new dnat_table expected-shape
+// check, so the ONLY thing that can reject it is the #5307 live-pin ABI
+// comparison. Shapes mirror the real embedded shim (Type/KeySize/ValueSize).
+func validABIBaseSpec() *ebpf.CollectionSpec {
+	return &ebpf.CollectionSpec{
+		Maps: map[string]*ebpf.MapSpec{
+			"userspace_bindings":       {Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: BindingArrayMaxEntries},
+			"userspace_ingress_ifaces": {Type: ebpf.Hash, KeySize: 4, ValueSize: 1, MaxEntries: MaxInterfaces},
+			"dnat_table":               {Type: ebpf.Hash, KeySize: 12, ValueSize: 8, MaxEntries: userspaceShimMaxSessions, Flags: unix.BPF_F_NO_PREALLOC},
+			"userspace_ctrl":           {Type: ebpf.Array, KeySize: 4, ValueSize: 40, MaxEntries: 1},
+		},
+	}
+}
+
+// pinReaderWithOverride returns a fake live-pin reader that reports each map's
+// pinned shape as the spec's shape, unless overridden. An override models a
+// running daemon whose pin has a different ABI than the new shim.
+func pinReaderWithOverride(spec *ebpf.CollectionSpec, overrides map[string]userspaceMapABI) userspacePinnedMapABIReader {
+	return func(path string) (userspaceMapABI, bool, error) {
+		name := filepath.Base(path)
+		if s, ok := overrides[name]; ok {
+			return s, true, nil
+		}
+		if ms, ok := spec.Maps[name]; ok {
+			return mapABIFromSpec(ms), true, nil
+		}
+		return userspaceMapABI{}, false, nil
+	}
+}
+
+func noPinReader() userspacePinnedMapABIReader {
+	return func(string) (userspaceMapABI, bool, error) { return userspaceMapABI{}, false, nil }
+}
+
+// legacyPresenceMaxEntriesValidate replicates the pre-#5307 validator (presence
+// + MaxEntries + NO_PREALLOC only, no ABI / live-pin comparison). It exists so
+// the tests can prove RED-on-revert: a spec the new validator rejects for an
+// ABI/live-pin mismatch is ACCEPTED here, i.e. before #5307 the incompatibility
+// was invisible until the post-stop load.
+func legacyPresenceMaxEntriesValidate(spec *ebpf.CollectionSpec) error {
+	if ms, ok := spec.Maps["userspace_bindings"]; !ok {
+		return fmt.Errorf("missing userspace_bindings")
+	} else if ms.MaxEntries != BindingArrayMaxEntries {
+		return fmt.Errorf("userspace_bindings max_entries drift")
+	}
+	if ms, ok := spec.Maps["userspace_ingress_ifaces"]; !ok {
+		return fmt.Errorf("missing userspace_ingress_ifaces")
+	} else if ms.MaxEntries != MaxInterfaces {
+		return fmt.Errorf("userspace_ingress_ifaces max_entries drift")
+	}
+	if ms, ok := spec.Maps["dnat_table"]; !ok {
+		return fmt.Errorf("missing dnat_table")
+	} else if ms.MaxEntries != userspaceShimMaxSessions {
+		return fmt.Errorf("dnat_table max_entries drift")
+	} else if ms.Flags&unix.BPF_F_NO_PREALLOC == 0 {
+		return fmt.Errorf("dnat_table flags drift")
+	}
+	return nil
+}
+
+// TestValidateUserspaceShimSpecLivePinABI is the #5307 core: a shim whose map
+// ABI (Type/KeySize/ValueSize/MaxEntries/Flags) differs from the RUNNING
+// daemon's live pin is rejected at the pre-flight — before the old daemon is
+// stopped — instead of failing ErrMapIncompatible at the post-stop load. Each
+// mismatch spec passes the legacy presence+MaxEntries validator, so reverting
+// the ABI/live-pin comparison turns every reject case RED (nil error, the
+// incompatibility only surfaces at load).
+func TestValidateUserspaceShimSpecLivePinABI(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		overrides map[string]userspaceMapABI
+		wantMap   string // "" => expect the spec to PASS
+		wantField string
+	}{
+		{name: "matching-live-pin", overrides: nil, wantMap: ""},
+		{
+			name:      "value-size-reorder-on-userspace_ctrl",
+			overrides: map[string]userspaceMapABI{"userspace_ctrl": {Type: ebpf.Array, KeySize: 4, ValueSize: 48, MaxEntries: 1}},
+			wantMap:   "userspace_ctrl", wantField: "ValueSize",
+		},
+		{
+			name:      "key-size-on-dnat_table",
+			overrides: map[string]userspaceMapABI{"dnat_table": {Type: ebpf.Hash, KeySize: 16, ValueSize: 8, MaxEntries: userspaceShimMaxSessions, Flags: unix.BPF_F_NO_PREALLOC}},
+			wantMap:   "dnat_table", wantField: "KeySize",
+		},
+		{
+			name:      "type-on-userspace_ingress_ifaces",
+			overrides: map[string]userspaceMapABI{"userspace_ingress_ifaces": {Type: ebpf.Array, KeySize: 4, ValueSize: 1, MaxEntries: MaxInterfaces}},
+			wantMap:   "userspace_ingress_ifaces", wantField: "Type",
+		},
+		{
+			name:      "flags-on-dnat_table",
+			overrides: map[string]userspaceMapABI{"dnat_table": {Type: ebpf.Hash, KeySize: 12, ValueSize: 8, MaxEntries: userspaceShimMaxSessions, Flags: 0}},
+			wantMap:   "dnat_table", wantField: "Flags",
+		},
+		{
+			name:      "max-entries-on-userspace_bindings",
+			overrides: map[string]userspaceMapABI{"userspace_bindings": {Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: BindingArrayMaxEntries + 1}},
+			wantMap:   "userspace_bindings", wantField: "MaxEntries",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			base := validABIBaseSpec()
+
+			// RED-on-revert guard: the pre-#5307 validator accepts the base spec,
+			// so the ONLY reject signal here is the new ABI/live-pin comparison.
+			if err := legacyPresenceMaxEntriesValidate(base); err != nil {
+				t.Fatalf("legacy validator rejected the base spec (%v); cannot prove RED-on-revert", err)
+			}
+
+			err := validateUserspaceShimSpecWith(base, pinReaderWithOverride(base, tt.overrides))
+			if tt.wantMap == "" {
+				if err != nil {
+					t.Fatalf("unexpected error on matching pins: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("want ABI mismatch on %s, got nil (would brick post-stop after ErrMapIncompatible)", tt.wantMap)
+			}
+			for _, want := range []string{tt.wantMap, tt.wantField, "ABI-incompatible", userspaceShimGenerateRemediation} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err = %v, want substring %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateUserspaceShimSpecSkipsDisposableFallbackStatsPin guards the
+// #4113 interaction: the disposable counter map (userspace_fallback_stats) is
+// reset on an intended shape change by reconcileDisposableCollectionPin, so the
+// #5307 ABI pre-flight must NOT reject a shape-changed pin for it — doing so
+// would re-brick the very upgrade the reconcile unblocks.
+func TestValidateUserspaceShimSpecSkipsDisposableFallbackStatsPin(t *testing.T) {
+	t.Parallel()
+
+	base := validABIBaseSpec()
+	base.Maps[userspaceFallbackStatsMapName] = &ebpf.MapSpec{Type: ebpf.PerCPUArray, KeySize: 4, ValueSize: 8, MaxEntries: 16}
+	// Live pin is the stale #4113 Array shape — an ABI mismatch for any other map.
+	reader := pinReaderWithOverride(base, map[string]userspaceMapABI{
+		userspaceFallbackStatsMapName: {Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: 16},
+	})
+	if err := validateUserspaceShimSpecWith(base, reader); err != nil {
+		t.Fatalf("live-pin ABI check must skip disposable %s (reconciled separately), got: %v",
+			userspaceFallbackStatsMapName, err)
+	}
+}
+
+// TestValidateUserspaceShimSpecNoLivePinSkips proves a fresh node (no pins)
+// passes the live-pin comparison without a false failure — only the
+// expected-value checks apply.
+func TestValidateUserspaceShimSpecNoLivePinSkips(t *testing.T) {
+	t.Parallel()
+
+	base := validABIBaseSpec()
+	if err := validateUserspaceShimSpecWith(base, noPinReader()); err != nil {
+		t.Fatalf("fresh node (no pins) must pass, got: %v", err)
+	}
+}
+
+// TestValidateUserspaceShimSpecDNATExpectedABIDrift covers the expected-value
+// arm: an embedded dnat_table whose Type/KeySize/ValueSize drifts from the Go
+// single source of truth is rejected even on a fresh node with no live pin. The
+// legacy validator accepts these (RED-on-revert).
+func TestValidateUserspaceShimSpecDNATExpectedABIDrift(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*ebpf.MapSpec)
+		field  string
+	}{
+		{"value-size", func(m *ebpf.MapSpec) { m.ValueSize = 16 }, "value_size"},
+		{"key-size", func(m *ebpf.MapSpec) { m.KeySize = 16 }, "key_size"},
+		{"type", func(m *ebpf.MapSpec) { m.Type = ebpf.LRUHash }, "type"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			base := validABIBaseSpec()
+			tt.mutate(base.Maps["dnat_table"])
+
+			if err := legacyPresenceMaxEntriesValidate(base); err != nil {
+				t.Fatalf("legacy validator rejected base (%v); cannot prove RED-on-revert", err)
+			}
+
+			err := validateUserspaceShimSpecWith(base, noPinReader())
+			if err == nil {
+				t.Fatalf("want dnat_table %s drift error on fresh node, got nil", tt.field)
+			}
+			if !strings.Contains(err.Error(), "dnat_table") || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("err = %v, want dnat_table %s drift", err, tt.field)
+			}
+		})
+	}
+}
+
+// TestValidateUserspaceShimSpecLivePinReadErrorSurfaces proves an unexpected
+// live-pin read error is not swallowed (it aborts the pre-flight rather than
+// silently proceeding to a possibly-incompatible load).
+func TestValidateUserspaceShimSpecLivePinReadErrorSurfaces(t *testing.T) {
+	t.Parallel()
+
+	base := validABIBaseSpec()
+	sentinel := errors.New("bpffs read boom")
+	reader := func(string) (userspaceMapABI, bool, error) { return userspaceMapABI{}, false, sentinel }
+	if err := validateUserspaceShimSpecWith(base, reader); !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want wrapped reader error", err)
+	}
+}
+
+// TestReadPinnedShimMapABISkipsMissingPin proves the production reader treats a
+// missing pin as "skip" (fresh node), not an error.
+func TestReadPinnedShimMapABISkipsMissingPin(t *testing.T) {
+	t.Parallel()
+
+	_, exists, err := readPinnedShimMapABI(filepath.Join(t.TempDir(), "not-pinned"))
+	if err != nil {
+		t.Fatalf("missing pin: unexpected err %v", err)
+	}
+	if exists {
+		t.Fatal("missing pin reported as existing")
+	}
+}
+
+// TestReadPinnedShimMapABISkipsUnsearchablePinDir mirrors the real deployment:
+// /sys/fs/bpf is mode 700, so an unprivileged inspector cannot search it. The
+// reader must skip (nil error) rather than fail the pre-flight; the real deploy
+// pre-flight runs as root and can read the pins.
+func TestReadPinnedShimMapABISkipsUnsearchablePinDir(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory search permission")
+	}
+	sub := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(sub, 0o000); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(sub, 0o700) })
+
+	_, exists, err := readPinnedShimMapABI(filepath.Join(sub, "dnat_table"))
+	if err != nil {
+		t.Fatalf("unsearchable pin dir: want skip (nil err), got %v", err)
+	}
+	if exists {
+		t.Fatal("unsearchable pin reported as existing")
+	}
+}
+
 func TestLoadOrCreatePinnedShimMapRefusesIncompatiblePinnedMap(t *testing.T) {
 	t.Parallel()
 

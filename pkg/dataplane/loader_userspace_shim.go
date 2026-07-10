@@ -163,7 +163,22 @@ func (m *Manager) loadUserspaceShimObjectsOnce() (err error) {
 	return nil
 }
 
+// validateUserspaceShimSpec is the deploy pre-flight ABI gate. It runs from
+// three call sites: the build-time verifier (cmd/shimverify), the deploy
+// pre-flight (xpfd verify-dataplane, which runs BEFORE the old daemon is
+// stopped — README #1864 §3), and the daemon's own shim load. It rejects a
+// shim whose maps drift from the Go-side contract OR from the RUNNING daemon's
+// live pinned maps, so an ABI incompatibility is caught HERE — while the old
+// dataplane still forwards — instead of surfacing as ErrMapIncompatible at
+// NewCollectionWithOptions AFTER the old daemon has been stopped (which strands
+// the node fail-closed; #5307).
 func validateUserspaceShimSpec(userspaceSpec *ebpf.CollectionSpec) error {
+	return validateUserspaceShimSpecWith(userspaceSpec, readPinnedShimMapABI)
+}
+
+// validateUserspaceShimSpecWith is validateUserspaceShimSpec with an injectable
+// live-pin reader, so the ABI comparison can be exercised without root/bpffs.
+func validateUserspaceShimSpecWith(userspaceSpec *ebpf.CollectionSpec, readPin userspacePinnedMapABIReader) error {
 	if ms, ok := userspaceSpec.Maps[userspaceBindingsMapName]; !ok {
 		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_bindings")
 	} else if ms.MaxEntries != BindingArrayMaxEntries {
@@ -186,8 +201,190 @@ func validateUserspaceShimSpec(userspaceSpec *ebpf.CollectionSpec) error {
 			"dnat_table flags drift: embedded=%d, expected BPF_F_NO_PREALLOC (userspace shim compatibility map). %s",
 			ms.Flags, userspaceShimGenerateRemediation,
 		)
+	} else if err := validateDNATExpectedABI(ms); err != nil {
+		return err
+	}
+	// #5307: compare the embedded shim's map ABI against the RUNNING daemon's
+	// live pins so ErrMapIncompatible is caught pre-stop, not post-stop.
+	return validateUserspaceShimLivePins(userspaceSpec, readPin)
+}
+
+// userspaceMapABI carries exactly the fields cilium/ebpf's MapSpec.Compatible
+// compares at a PinByName load (Type, KeySize, ValueSize, MaxEntries, Flags) —
+// i.e. the set an ErrMapIncompatible flags. See cilium/ebpf map.go
+// MapSpec.Compatible.
+type userspaceMapABI struct {
+	Type       ebpf.MapType
+	KeySize    uint32
+	ValueSize  uint32
+	MaxEntries uint32
+	Flags      uint32
+}
+
+func mapABIFromSpec(ms *ebpf.MapSpec) userspaceMapABI {
+	return userspaceMapABI{
+		Type:       ms.Type,
+		KeySize:    ms.KeySize,
+		ValueSize:  ms.ValueSize,
+		MaxEntries: ms.MaxEntries,
+		Flags:      ms.Flags,
+	}
+}
+
+// userspaceMapABIDiff reports the first ABI field in which the embedded shim map
+// spec differs from a reference shape (the Go expected shape or the live pinned
+// map), or "" when compatible. It mirrors cilium/ebpf MapSpec.Compatible: Type,
+// KeySize, ValueSize, MaxEntries, Flags — the exact set an ErrMapIncompatible
+// flags at PinByName load. None of the shim's ABI-checked pinned maps is a
+// DevMap/DevMapHash, so Compatible's BPF_F_RDONLY_PROG flag exception does not
+// apply here.
+func userspaceMapABIDiff(embedded, ref userspaceMapABI) string {
+	switch {
+	case embedded.Type != ref.Type:
+		return fmt.Sprintf("Type embedded=%s pinned=%s", embedded.Type, ref.Type)
+	case embedded.KeySize != ref.KeySize:
+		return fmt.Sprintf("KeySize embedded=%d pinned=%d", embedded.KeySize, ref.KeySize)
+	case embedded.ValueSize != ref.ValueSize:
+		return fmt.Sprintf("ValueSize embedded=%d pinned=%d", embedded.ValueSize, ref.ValueSize)
+	case embedded.MaxEntries != ref.MaxEntries:
+		return fmt.Sprintf("MaxEntries embedded=%d pinned=%d", embedded.MaxEntries, ref.MaxEntries)
+	case embedded.Flags != ref.Flags:
+		return fmt.Sprintf("Flags embedded=%#x pinned=%#x", embedded.Flags, ref.Flags)
+	}
+	return ""
+}
+
+// validateDNATExpectedABI checks the embedded dnat_table against the Go-side
+// single source of truth (userspaceShimSharedMapSpecs) for the ABI fields
+// cilium/ebpf compares beyond MaxEntries/Flags already asserted by the caller:
+// Type, KeySize, ValueSize. This catches an embedded-vs-Go ABI drift even on a
+// fresh node that has no live pin to compare against (#5307 expected-value arm).
+// Only dnat_table has a Go-side expected shape here; the other pinned shim maps
+// are Rust-defined and are guarded by the live-pin comparison.
+func validateDNATExpectedABI(embedded *ebpf.MapSpec) error {
+	want := sharedShimMapSpecByName(userspaceShimCompatibilityDNATName)
+	if want == nil {
+		return nil
+	}
+	if embedded.Type != want.Type {
+		return fmt.Errorf(
+			"dnat_table type drift: embedded=%s, expected=%s (userspace shim compatibility map). %s",
+			embedded.Type, want.Type, userspaceShimGenerateRemediation,
+		)
+	}
+	if embedded.KeySize != want.KeySize {
+		return fmt.Errorf(
+			"dnat_table key_size drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
+			embedded.KeySize, want.KeySize, userspaceShimGenerateRemediation,
+		)
+	}
+	if embedded.ValueSize != want.ValueSize {
+		return fmt.Errorf(
+			"dnat_table value_size drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
+			embedded.ValueSize, want.ValueSize, userspaceShimGenerateRemediation,
+		)
 	}
 	return nil
+}
+
+func sharedShimMapSpecByName(name string) *ebpf.MapSpec {
+	for _, s := range userspaceShimSharedMapSpecs() {
+		if s.Name == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// userspaceABICheckedPinnedMaps is the set of PinByName shim maps whose live
+// pin must be ABI-compatible with the new shim before the collection load. It
+// is userspacePinnedShimMaps() minus the DISPOSABLE counter map
+// (userspace_fallback_stats): that map is deliberately reset on an intended
+// shape change by reconcileDisposableCollectionPin (#4113), so ABI-checking it
+// here would re-brick the very upgrade that reconcile was written to unblock.
+func userspaceABICheckedPinnedMaps() []string {
+	names := userspacePinnedShimMaps()
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if n == userspaceFallbackStatsMapName {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// validateUserspaceShimLivePins compares the embedded shim's ABI-relevant map
+// shape against the RUNNING daemon's live pinned maps. A mismatch means the
+// PinByName collection load would fail ErrMapIncompatible — but at the deploy
+// pre-flight the old daemon is still up and its pins still exist, so catching
+// it here refuses the deploy with the current dataplane still forwarding,
+// instead of bricking the node after the old daemon has been stopped (#5307).
+//
+// A map with no pin yet (fresh node / first load) is skipped, so this never
+// produces a false failure on a clean node. A map absent from the new shim is
+// skipped, since PinByName never loads it.
+func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin userspacePinnedMapABIReader) error {
+	if readPin == nil {
+		return nil
+	}
+	for _, name := range userspaceABICheckedPinnedMaps() {
+		ms, ok := userspaceSpec.Maps[name]
+		if !ok {
+			continue // absent from the new shim: PinByName never loads it
+		}
+		pinPath := filepath.Join(bpfPinPath, name)
+		live, exists, err := readPin(pinPath)
+		if err != nil {
+			return fmt.Errorf("userspace shim ABI pre-flight: inspect live pin %s: %w", name, err)
+		}
+		if !exists {
+			continue // fresh node / first load: nothing pinned yet
+		}
+		if diff := userspaceMapABIDiff(mapABIFromSpec(ms), live); diff != "" {
+			return fmt.Errorf(
+				"userspace shim map %s is ABI-incompatible with the live pinned map at %s: %s. "+
+					"Loading the new dataplane would fail with ErrMapIncompatible AFTER the running "+
+					"daemon is stopped, stranding the node fail-closed; refusing so the current "+
+					"dataplane keeps forwarding. %s",
+				name, pinPath, diff, userspaceShimGenerateRemediation,
+			)
+		}
+	}
+	return nil
+}
+
+// userspacePinnedMapABIReader reads the ABI-relevant shape of a live pinned map
+// at path. It returns exists=false with a nil error when there is no pin to
+// compare against (a fresh node, or a pin directory this process cannot search
+// — unprivileged unit tests: /sys/fs/bpf is mode 700), so the live-pin
+// comparison is skipped without a false failure. The real deploy pre-flight and
+// daemon load run as root and can read the pins.
+type userspacePinnedMapABIReader func(path string) (shape userspaceMapABI, exists bool, err error)
+
+// readPinnedShimMapABI is the production reader. It inspects the pinned map
+// READ-ONLY: open a handle, read its shape, close it. It never unpins,
+// attaches, or otherwise mutates the map, so the running daemon keeps
+// forwarding throughout the pre-flight (#1864 verify-path spirit).
+func readPinnedShimMapABI(path string) (userspaceMapABI, bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) || errors.Is(err, os.ErrPermission) {
+			return userspaceMapABI{}, false, nil
+		}
+		return userspaceMapABI{}, false, fmt.Errorf("stat pinned shim map %s: %w", path, err)
+	}
+	m, err := ebpf.LoadPinnedMap(path, nil)
+	if err != nil {
+		return userspaceMapABI{}, false, fmt.Errorf("inspect pinned shim map %s: %w", path, err)
+	}
+	defer m.Close()
+	return userspaceMapABI{
+		Type:       m.Type(),
+		KeySize:    m.KeySize(),
+		ValueSize:  m.ValueSize(),
+		MaxEntries: m.MaxEntries(),
+		Flags:      m.Flags(),
+	}, true, nil
 }
 
 func userspaceBindingsMaxEntriesDriftError(got uint32) error {
