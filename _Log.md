@@ -1,3 +1,23 @@
+## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4910 (availability). Both gRPC listeners (`Run` loopback,
+  `RunFabricListener` fabric) called `srv.GracefulStop()` with no timeout,
+  and the unbounded server-streaming `MonitorInterface` RPC only watched
+  its client `stream.Context()`. A client (loopback, or an authenticated
+  fabric peer) holding that stream open during shutdown blocked
+  GracefulStop — and thus `Run`/`RunFabricListener` — forever, wedging
+  daemon stop/failover/restart. Fix: added `stopGRPCServer(srv, timeout)`
+  — GracefulStop in a goroutine + `Stop()` after `grpcStopTimeout` (2s) —
+  used by both listeners; `Run`'s serve/shutdown loop factored into
+  `serveUntilDone` for testability. Force-Stop cancels the stuck stream's
+  context so the handler returns; a clean/idle shutdown still returns as
+  soon as GracefulStop completes (no dropped events on normal disconnect).
+  Added `TestServeUntilDoneBoundedByStuckMonitorStream_4910` (RED on
+  revert: hangs 7s) + `TestStopGRPCServerIdleReturnsPromptly_4910`.
+  **File(s)**: pkg/grpcapi/server.go,
+  pkg/grpcapi/server_shutdown_monitor_4910_test.go, pkg/grpcapi/README.md
+
 ## 2026-07-09 — #4882 userspace-dp: debug BPF session dump used `core::ptr::read` (align 2) on a `Vec<u8>` (align 1) — UB; use `read_unaligned`
 
 - **Timestamp**: 2026-07-09
