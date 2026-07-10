@@ -19,10 +19,10 @@ import (
 // sender").
 func TestSendLinkTraps_DoesNotBlock(t *testing.T) {
 	const slow = 2 * time.Second
-	orig := trapSender
-	defer func() { trapSender = orig }()
 	released := make(chan struct{})
-	trapSender = func(target string, pkt []byte) error {
+	// #5023: inject the slow sender on THIS Agent (no shared package global,
+	// so no race with the running trap worker's read).
+	slowSender := func(target string, pkt []byte) error {
 		// Block until the test releases us (models a hung dial/DNS).
 		<-released
 		return nil
@@ -41,7 +41,8 @@ func TestSendLinkTraps_DoesNotBlock(t *testing.T) {
 				}},
 			},
 		},
-		startTime: time.Now(),
+		startTime:  time.Now(),
+		trapSender: slowSender,
 	}
 
 	done := make(chan struct{})
