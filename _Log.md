@@ -1,6 +1,23 @@
 ## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
 
 - **Timestamp**: 2026-07-09
+  **Action**: #5040 ha/dhcpserver — the active-active takeover memfile pre-seed
+  passed ONLY the peer's leases to PreSeedMemfile{4,6}, which atomically
+  OVERWROTE the shared Kea memfile — wiping the leases of RGs this node still
+  masters, so the restarted Kea could re-allocate their in-use addresses
+  (duplicate allocation). New `PreSeedMemfileMerged{4,6}(ctx, peer, now)` reads
+  this node's CURRENT local active leases (socket-preferred, memfile fallback —
+  the GetSyncLeases path) and writes the UNION with the peer set, keyed by lease
+  identity (`mergeLeasesByIdentity`, local live binding wins a conflict).
+  FAIL-CLOSED: an untrusted/corrupt local read returns an error and leaves the
+  memfile intact (post-start lease-add is the backstop) rather than replacing it
+  with peer-only rows. `preSeedDHCPLeaseMemfile` now calls the merged variant
+  under a bounded ctx. Tests: TestPreSeedMemfileMerged4_PreservesLocalLeases
+  (RED on revert to peer-only overwrite) + _FailsClosedOnUntrustedLocal.
+  **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/daemon/daemon_dhcp_lease_sync.go,
+  pkg/dhcpserver/lease_sync_test.go, docs/research/2239-dhcp-ha-lease-sync/plan.md
+
+- **Timestamp**: 2026-07-09
   **Action**: #5041 ha/dhcpserver — Kea `subnet-id` was a positional counter
   over each node's MASTER-filtered subnet list, so the SAME subnet got a
   DIFFERENT id on the two HA nodes and synced leases (which carry `subnet-id`

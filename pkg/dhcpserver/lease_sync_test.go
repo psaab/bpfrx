@@ -491,6 +491,97 @@ func TestPreSeedMemfile4_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestPreSeedMemfileMerged4_PreservesLocalLeases is the #5040 regression guard.
+// On active-active takeover this node is ALREADY MASTER for one RG (its lease is
+// live in local Kea) and takes over a second RG (the peer's lease). The pre-seed
+// must write the UNION so the restarting Kea keeps the still-mastered RG's
+// in-use bindings. The pre-#5040 peer-only overwrite wiped them.
+//
+// Fail-on-revert: reverting PreSeedMemfileMerged4 to a peer-only write (or the
+// merge to peer-wins/local-drop) drops 10.0.1.50 from the memfile, failing the
+// still-mastered assertion.
+func TestPreSeedMemfileMerged4_PreservesLocalLeases(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+	sock := tmpSocket(t, "k4merge.sock")
+	// Local Kea (already mastering RG-A) reports one live lease via lease4-get-all.
+	stub := &stubKea{handler: func(cmd keaCommand) keaResponse {
+		if cmd.Command == "lease4-get-all" {
+			return leaseGetAllResponse([]keaLeaseJSON{{
+				IPAddress: "10.0.1.50", HWAddress: "aa:aa:aa:aa:aa:aa",
+				SubnetID: 1, ValidLft: 3600, CLTT: localNow.Unix() - 100,
+				State: keaStateDefault,
+			}})
+		}
+		return keaResponse{Result: keaResultError, Text: "unexpected"}
+	}}
+	dial, stop := startStubKea(t, sock, stub)
+	defer stop()
+
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases4.csv")
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(dial, sock, "", memfile, "")
+
+	// Peer set (the newly-taken RG-B): a different address/subnet.
+	peer := []SyncLease{{
+		Family: 4, Address: "10.0.2.80", HWAddress: "bb:bb:bb:bb:bb:bb",
+		SubnetID: 2, ValidLife: 3600, Remaining: 1800, State: keaStateDefault,
+	}}
+	if err := m.PreSeedMemfileMerged4(context.Background(), peer, localNow); err != nil {
+		t.Fatalf("PreSeedMemfileMerged4: %v", err)
+	}
+	got, err := parseActiveLeases4(memfile, localNow)
+	if err != nil {
+		t.Fatalf("parseActiveLeases4 on pre-seeded file: %v", err)
+	}
+	addrs := make(map[string]bool, len(got))
+	for _, l := range got {
+		addrs[l.Address] = true
+	}
+	if !addrs["10.0.1.50"] {
+		t.Errorf("still-mastered local lease 10.0.1.50 was wiped by the pre-seed (duplicate-allocation bug #5040); memfile has %v", addrs)
+	}
+	if !addrs["10.0.2.80"] {
+		t.Errorf("newly-taken peer lease 10.0.2.80 missing from pre-seed; memfile has %v", addrs)
+	}
+}
+
+// TestPreSeedMemfileMerged4_FailsClosedOnUntrustedLocal proves the #5040
+// fail-closed posture: when the local lease source cannot be read (socket down
+// AND an existing memfile is corrupt/untrusted), the pre-seed must NOT replace
+// the memfile with peer-only rows — it returns an error and leaves the file
+// intact so the restarting Kea reloads its own persisted leases (the post-start
+// lease-add seed still adds the peer set).
+func TestPreSeedMemfileMerged4_FailsClosedOnUntrustedLocal(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases4.csv")
+	// A present-but-headerless/mangled memfile is an untrusted local source.
+	corrupt := "garbage,not,a,valid,header,at,all\n"
+	if err := os.WriteFile(memfile, []byte(corrupt), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := New()
+	// nil dialer + a bogus socket path → socket read fails → memfile fallback →
+	// corrupt memfile → local read errors.
+	m.SetLeaseSyncSeamsForTesting(nil, filepath.Join(dir, "nope.sock"), "", memfile, "")
+
+	peer := []SyncLease{{
+		Family: 4, Address: "10.0.2.80", HWAddress: "bb", SubnetID: 2,
+		Remaining: 1800, State: keaStateDefault,
+	}}
+	if err := m.PreSeedMemfileMerged4(context.Background(), peer, localNow); err == nil {
+		t.Fatalf("expected fail-closed error on untrusted local source, got nil")
+	}
+	after, rerr := os.ReadFile(memfile)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(after) != corrupt {
+		t.Errorf("fail-closed must leave the memfile intact, got:\n%s", after)
+	}
+}
+
 // Test (#2268): the v6 memfile pre-seed must round-trip the lease KIND
 // symmetrically with the read path — an IA_TA (temporary-address) lease read
 // and held as IA_TA must be written back as lease_type=1 (IA_TA), never silently

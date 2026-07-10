@@ -428,6 +428,20 @@ they add are now part of the module contract:
   same-config hash collision between two DISTINCT subnets is resolved by a
   deterministic linear probe walked in the canonical (sorted-group, sorted-pool)
   render order so it stays a function of the rendered set.
+- **Takeover pre-seed is a UNION, never a replace (#5040).** On a per-RG
+  active-active takeover this node is ALREADY MASTER for one or more RGs whose
+  leases are live in the local Kea; the takeover then restarts Kea under the
+  union config (already-mastered RG + newly-taken RG). The pre-seed
+  (`preSeedDHCPLeaseMemfile` → `PreSeedMemfileMerged{4,6}`) MUST write the union
+  of this node's current local active leases and the held peer leases, NOT the
+  peer-only set. A peer-only atomic overwrite of the shared memfile wiped this
+  node's still-mastered rows, so the restarted Kea had no record of those in-use
+  bindings and could re-allocate their addresses (duplicate allocation). The
+  merge is keyed by lease identity with the LOCAL live binding winning a
+  conflict. It reads the local set via the socket-preferred / memfile-fallback
+  path and FAILS CLOSED — on an untrusted (corrupt) local source it returns an
+  error and leaves the existing memfile intact rather than replacing it with
+  peer-only rows; the async post-start `lease{4,6}-add` seed is the backstop.
 
 ---
 
