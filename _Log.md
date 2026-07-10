@@ -1,3 +1,21 @@
+## 2026-07-09 — #4876 cmd/xpfd: publish-generation ran destructive staged-generation GC even when the journal protection set was unreadable
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4876 (upgrade / fail-open). `xpfd publish-generation` read
+  the upgrade journal to protect a crashed/resumable cut's pinned source
+  generation from its GC, but on a journal read error only WARNed and ran
+  GC anyway with an empty protection set; a present-but-malformed journal
+  degraded to ("",nil), same result. A crash-after-STOP cut whose journal
+  became unreadable could have its pinned source reaped, bricking the
+  resume. Fix: `ReadJournalSourceGeneration` now errors on a
+  present-but-malformed journal (absent still returns ("",nil)); the verb
+  routes through a new `gcProtectionForPublish` helper that SKIPS GC when
+  the protection set is unknown (read error / malformed). Added
+  fail-on-revert tests at both the reader and caller level.
+  **File(s)**: pkg/upgrade/runner.go,
+  pkg/upgrade/read_journal_malformed_4876_test.go,
+  cmd/xpfd/publish_generation.go,
+  cmd/xpfd/publish_generation_gc_4876_test.go, docs/in-place-upgrade.md
 ## 2026-07-09 — #4888 configstore: encrypted-envelope with unknown/future `format` fell through as plaintext and empty-loaded instead of failing closed
 
 - **Timestamp**: 2026-07-09
