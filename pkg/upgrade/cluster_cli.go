@@ -503,11 +503,18 @@ func parseNodeToken(tok string) (int, bool) {
 
 func (g *grpcCluster) ResetFailover() error {
 	// ForceSecondary demotes EVERY configured RG, so ResetFailover must
-	// reset every configured RG — not a hardcoded {0,1} (Codex: shipped
-	// configs include RG 2, which would otherwise stay held demoted after
-	// cutover). Enumerate the live RG IDs from the status output; fall back
-	// to {0,1,2} if enumeration fails.
-	rgs := g.configuredRGs()
+	// reset every configured RG — not a hardcoded set. Enumerate the live RG
+	// IDs from the status output and FAIL CLOSED if enumeration fails (#5044):
+	// the old {0,1,2} fallback silently left RG>=3 held ForceSecondary on a
+	// transient status error, and RG IDs are not bounded to {0,1,2} (>15 is
+	// possible). RejoinAndConfirm only checks PeerAlive/SyncEstablished — with
+	// a guessed set it would return nil and advance to drain/recreate the peer
+	// that still owns the un-reset groups, opening a no-primary window for
+	// them. Returning the error stops the roll instead.
+	rgs, err := g.configuredRGs()
+	if err != nil {
+		return err
+	}
 	var firstErr error
 	for _, rg := range rgs {
 		if err := g.systemAction(fmt.Sprintf("cluster-failover-reset:%d", rg)); err != nil {
@@ -519,16 +526,33 @@ func (g *grpcCluster) ResetFailover() error {
 	return firstErr
 }
 
-// configuredRGs returns the redundancy-group IDs from the status output,
-// or a conservative {0,1,2} fallback if it cannot enumerate them.
-func (g *grpcCluster) configuredRGs() []int {
+// configuredRGs returns the redundancy-group IDs enumerated from the live
+// status output. It FAILS CLOSED (#5044) rather than guessing a hardcoded set:
+// see configuredRGsFromStatus.
+func (g *grpcCluster) configuredRGs() ([]int, error) {
 	s, err := g.statusText()
-	if err == nil {
-		if rgs := parseRGIDs(s); len(rgs) > 0 {
-			return rgs
-		}
+	return configuredRGsFromStatus(s, err)
+}
+
+// configuredRGsFromStatus derives the configured redundancy-group ID set from
+// the rendered `show chassis cluster status` text (s) and the error from
+// fetching it (statusErr). It FAILS CLOSED: a status-fetch error, or a parse
+// that yields no RG IDs, returns an error rather than the pre-#5044 {0,1,2}
+// guess. That guess stranded RG>=3 held ForceSecondary on a transient status
+// failure — the caller (ResetFailover) reset only 0-2, returned nil, and the
+// orchestrator advanced to touch the peer while the extra groups had no
+// primary. Kept as a pure function so the fail-closed contract is unit-tested
+// without a gRPC dial.
+func configuredRGsFromStatus(s string, statusErr error) ([]int, error) {
+	if statusErr != nil {
+		return nil, fmt.Errorf("enumerate configured redundancy groups: %w", statusErr)
 	}
-	return []int{0, 1, 2}
+	rgs := parseRGIDs(s)
+	if len(rgs) == 0 {
+		return nil, fmt.Errorf("enumerate configured redundancy groups: " +
+			"no redundancy groups found in cluster status output")
+	}
+	return rgs, nil
 }
 
 // parseRGIDs extracts the redundancy-group IDs from "Redundancy group: N"

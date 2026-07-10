@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -329,6 +330,46 @@ func TestParseRGIDs(t *testing.T) {
 	got := parseRGIDs(s)
 	if len(got) != 3 || got[0] != 0 || got[1] != 1 || got[2] != 2 {
 		t.Fatalf("parseRGIDs = %v, want [0 1 2]", got)
+	}
+}
+
+// TestConfiguredRGsFromStatus_FailsClosed proves the #5044 fix: RG enumeration
+// FAILS CLOSED on a transient status error or an unparseable status, instead of
+// the old {0,1,2} guess. The guess stranded RG>=3 held ForceSecondary (a
+// cluster can run >3 redundancy groups), letting ResetFailover return nil and
+// the orchestrator advance to drain/recreate the peer that still owned those
+// groups — a no-primary window. RED if a fix-forward reintroduces any hardcoded
+// fallback RG set.
+func TestConfiguredRGsFromStatus_FailsClosed(t *testing.T) {
+	// A transient `show chassis cluster status` failure must NOT resolve to a
+	// guessed set — it must return an error so ResetFailover propagates it.
+	if rgs, err := configuredRGsFromStatus("", errors.New("gRPC unavailable")); err == nil {
+		t.Fatalf("transient status error: got rgs=%v err=nil, want an error "+
+			"(no {0,1,2} fallback)", rgs)
+	}
+
+	// A status that parses to no RG headers (empty/garbled render) must also
+	// fail closed rather than guess.
+	if rgs, err := configuredRGsFromStatus("Node name: node0\n(no groups)\n", nil); err == nil {
+		t.Fatalf("no-RG status: got rgs=%v err=nil, want an error "+
+			"(no {0,1,2} fallback)", rgs)
+	}
+
+	// The happy path still enumerates every configured RG, including RG>=3,
+	// which the old hardcoded {0,1,2} would have dropped.
+	s := strings.Join([]string{
+		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
+		"Redundancy group: 1 , Failover count: 0",
+		"Redundancy group: 2 , Failover count: 0",
+		"Redundancy group: 5 , Failover count: 0",
+	}, "\n")
+	rgs, err := configuredRGsFromStatus(s, nil)
+	if err != nil {
+		t.Fatalf("valid status: unexpected error: %v", err)
+	}
+	if len(rgs) != 4 || rgs[3] != 5 {
+		t.Fatalf("valid status: rgs = %v, want [0 1 2 5] (RG>=3 must be kept)", rgs)
 	}
 }
 

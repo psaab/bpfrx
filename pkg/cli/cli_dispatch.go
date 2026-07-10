@@ -93,6 +93,32 @@ func (c *CLI) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 // input. match/except/find/no-more hold at most one line at a time; count keeps
 // only a running tally; last keeps a bounded ring buffer of the last n lines —
 // none buffers the full output (#4731).
+// maxTailLines bounds the ring the `| last N` filter retains and grows,
+// independent of the operator-supplied N (#5037). `show` is a read-only
+// (PermView) command, so without a bound a viewer could run
+// `show ... | last 2000000000` and force a ~32 GiB up-front []string
+// allocation, OOM-killing the in-process xpfd before any output is produced.
+// 100,000 lines is far more tail than any operator needs, yet caps the ring's
+// worst-case slice header at ~1.6 MiB (64-bit) plus the retained line strings.
+const maxTailLines = 100_000
+
+// parseLastCount parses the `| last N` operand. It defaults to 10, ignores a
+// non-positive or unparseable N (Junos-compatible leniency), and clamps N to
+// maxTailLines so the retained/grown ring is bounded by a fixed operator cap
+// rather than an untrusted operand (#5037).
+func parseLastCount(arg string) int {
+	n := 10
+	if arg != "" {
+		if v, err := strconv.Atoi(arg); err == nil && v > 0 {
+			n = v
+		}
+	}
+	if n > maxTailLines {
+		n = maxTailLines
+	}
+	return n
+}
+
 func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
 	ls := &lineSource{r: bufio.NewReader(src)}
 
@@ -130,20 +156,22 @@ func filterStream(src io.Reader, out io.Writer, pipeType, pipeArg string) {
 		}
 		fmt.Fprintf(out, "Count: %d lines\n", count)
 	case "last":
-		n := 10
-		if pipeArg != "" {
-			if v, err := strconv.Atoi(pipeArg); err == nil && v > 0 {
-				n = v
-			}
-		}
+		n := parseLastCount(pipeArg)
 		// Circular buffer of the last n lines: slot i%n holds the i-th
-		// line, overwriting the oldest once more than n have arrived. Only
-		// n lines are ever retained, not the whole output.
-		ring := make([]string, n)
+		// line, overwriting the oldest once more than n have arrived. The
+		// ring GROWS LAZILY (append until it holds n lines, then overwrite)
+		// so its memory is O(min(n, lines produced)) — never O(operand),
+		// never pre-allocated from an untrusted N (#5037). Only n lines are
+		// ever retained, not the whole output.
+		ring := make([]string, 0)
 		count := 0
 		for ls.hasMore() {
 			line, _ := ls.next()
-			ring[count%n] = line
+			if len(ring) < n {
+				ring = append(ring, line)
+			} else {
+				ring[count%n] = line
+			}
 			count++
 		}
 		total := count

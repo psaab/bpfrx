@@ -2233,6 +2233,11 @@ Shows last N lines:
 > show log messages | last 20
 ```
 
+`N` is clamped to a fixed maximum (100,000 lines) so an oversized operand
+cannot force an unbounded allocation in the control plane (#5037); the
+buffer also grows lazily, so it only ever holds `min(N, lines produced)`
+lines regardless of how large `N` is.
+
 ### Combined Filters
 
 Pipe filters can be chained:

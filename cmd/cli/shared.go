@@ -196,11 +196,20 @@ func applyPipeFilter(lines []string, out io.Writer, pipeType, pipeArg string) {
 	case "count":
 		fmt.Fprintf(out, "Count: %d lines\n", len(lines))
 	case "last":
+		// Clamp N to the same cap the local CLI enforces
+		// (pkg/cli.maxTailLines, #5037) so `| last N` behaves identically on
+		// both surfaces (#4968 local/remote harmony). This branch slices
+		// lines[start:] rather than pre-allocating from N, so it is not the
+		// OOM vector the local filterStream was — the clamp is for parity.
+		const maxTailLines = 100_000
 		n := 10
 		if pipeArg != "" {
 			if v, err := strconv.Atoi(pipeArg); err == nil && v > 0 {
 				n = v
 			}
+		}
+		if n > maxTailLines {
+			n = maxTailLines
 		}
 		start := len(lines) - n
 		if start < 0 {

@@ -1,3 +1,33 @@
+## 2026-07-09 — #5037 cli `| last N` unbounded pre-allocation (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5037. The `| last N` filter (`filterStream`, pkg/cli) parsed N
+  with only a `v > 0` gate and eagerly did `make([]string, N)` before any
+  output — a read-only (`show`, PermView) user could `| last 2000000000` and
+  OOM-kill xpfd (~32 GiB up front). Extracted `parseLastCount` clamping N to a
+  fixed `maxTailLines` (100,000) cap and rewrote the ring to grow lazily, so
+  memory is O(min(N, lines produced)) and never O(operand). Applied the same
+  cap to the remote CLI `applyPipeFilter` (`cmd/cli/shared.go`) for local/
+  remote parity (#4968) — that branch slices rather than pre-allocating so it
+  was not the OOM vector. RED-on-revert: `TestParseLastCountCap` +
+  `TestFilterStreamLastCapTruncates`.
+  **File(s)**: pkg/cli/cli_dispatch.go, cmd/cli/shared.go,
+  pkg/cli/cli_last_cap_5037_test.go, docs/junos-cli-reference.md
+## 2026-07-09 — #5035 grpcapi primary listener loopback clamp (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5035. The primary gRPC listener (`Run`) is unauthenticated
+  (only `configLockInterceptor`), so a non-loopback `--grpc-addr` would
+  expose destructive RPCs (SystemAction zeroize/reboot, Commit/Delete/
+  Rollback) to the network. Added `clampGRPCBindToLoopback` mirroring the
+  #4903/#4928 web-management/cluster doctrine and wired it into `Run` so a
+  wildcard/routable bind is pulled back to a same-family loopback + warned.
+  The default 127.0.0.1 path is unchanged. RED-on-revert:
+  `TestRunClampsNonLoopbackBind` + pure `TestClampGRPCBindToLoopback`.
+  **File(s)**: pkg/grpcapi/server.go,
+  pkg/grpcapi/server_grpc_loopback_clamp_5035_test.go,
+  pkg/grpcapi/README.md
+
 ## 2026-07-09 — #4908 cli/show display-fidelity cohort (partial: 6 fixed, 6 deferred)
 
 - **Timestamp**: 2026-07-09
@@ -44356,3 +44386,5 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #5042 [SECURITY] sign the mixed-base image-roll gate input. The deployer's HA session-safety gate (_gate_mixed_base, scripts/deploy/xpf-deploy.py) decides whether synchronized sessions survive a LANE-2 image roll from the ha-protocol-version / ha-protocol-min-compat / session-sync-protocol-version fields in xpf-<ver>.manifest. That sidecar was written OUTSIDE the signed SHA256SUMS set (bake.py signed only [qcow_out, meta_out]) and parsed RAW by _read_image_manifest_versions, so tampering ONLY those protocol fields — while every signed image byte (qcow2 + signed SHA256SUMS + its .minisig) stayed untouched — could spoof a compatible-window / matching-session-sync verdict and bypass the safety stop. Trust boundary: the decision that protects synced sessions must come from signed bytes. Fix: (1) bake.py now writes xpf-<ver>.manifest BEFORE the checksum manifest and includes it in the signed set (write_manifest(sums,[qcow_out,meta_out,manifest])); the .minisig over SHA256SUMS still follows the #4017 validate-before-sign order. (2) sign.py gains verify_listed_artifact_bytes() — TOCTOU-safe verify of a manifest-listed (not directly-signed) file against the signed checksum manifest, returning the hash-bound bytes from a private 0700 copy. (3) xpf-deploy.py image-roll now VERIFIES the sidecar via _verified_image_manifest_versions (new --sha256sums/--sig/--pubkey args default to the .SHA256SUMS sibling + .minisig + pinned image pubkey) and parses the verified bytes; _read_image_manifest_versions split into _parse_image_manifest_versions(text) so the gate never re-opens the raw path post-verify. Fail-closed on any missing/unsigned/mismatched input; --allow-session-drop relaxes only the compatibility verdict, never the signature. Test (test_xpf_deploy_gate.py MixedBaseSignedManifestTests): tamper-only-protocol-field fails closed (checksum-binding leg, hermetic via patched verify_signature) PLUS a real minisign keygen->sign->verify->tamper->verify end-to-end leg (skips if minisign absent; PASSED here — minisign present); RED on revert to the raw read. publish.py already allow-lists the .manifest and verifies per-file, so adding it to the signed set is additive. All 29 scripts/run-selftests.sh legs green. Docs: bake.py output list + docs/in-place-upgrade.md LANE-2 gate note updated for the signed-input boundary.
   **File(s)**: scripts/image/bake.py, scripts/dist/sign.py, scripts/deploy/xpf-deploy.py, scripts/deploy/test_xpf_deploy_gate.py, docs/in-place-upgrade.md
+  **Action**: #5044 fail closed when redundancy-group enumeration fails during an ISSU/image-roll drain instead of guessing {0,1,2}. ForceSecondary demotes EVERY configured RG server-side, but ResetFailover reset only the client-enumerated set, and configuredRGs() silently fell back to a hardcoded {0,1,2} on a transient `show chassis cluster status` failure or an unparseable render. A cluster with >3 redundancy groups (RG IDs are not bounded to 0-2; >15 is possible) therefore left RG>=3 held ForceSecondary while ResetFailover returned nil; RejoinAndConfirm checks only PeerAlive/SyncEstablished (no per-RG local eligibility), so the orchestrator advanced to drain/recreate the peer that still owned those groups — a no-primary window. Split the fallback logic into a pure configuredRGsFromStatus(s, statusErr) that returns an error on a status-fetch failure or a zero-RG parse; configuredRGs() now returns ([]int, error) and ResetFailover propagates it, stopping the roll rather than silently under-resetting. Regression test TestConfiguredRGsFromStatus_FailsClosed (pkg/upgrade/cluster_cli_test.go) pins: transient error -> error, no-RG status -> error, valid status keeps RG>=3 (want [0 1 2 5]); RED on revert to any hardcoded fallback set. No operator/module doc change: the {0,1,2} guess was an internal implementation detail (only in code comments, now updated); the RejoinAndConfirm/ResetFailover "never both down / no-primary" contract is documented in the surrounding code comments.
+  **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
