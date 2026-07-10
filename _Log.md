@@ -1,3 +1,30 @@
+## 2026-07-09 — pkg/api: abort long read handlers on client disconnect (#5232/#5233)
+
+- **Timestamp**: 2026-07-09
+  - **Action**: #5232/#5233 pkg/api long full-table read handlers now abort
+    when the REST client disconnects (r.Context() cancelled), the HTTP analog
+    of the merged gRPC #5060. (#5232) bgpHandler's route-streaming loop
+    (`/routing/bgp?type=routes`) checks `r.Context().Err()` once per 1024-route
+    chunk and returns — a 900k-route internet table otherwise keeps formatting +
+    JSON-escaping every remaining route and writing to a dead connection
+    (CPU/GC waste). (#5233) the session handlers (`/sessions` offset walk,
+    `/sessions/summary`, `/sessions/zone-pair`) share a per-batch sampler
+    (`newRequestCancelSampler`, `sessionWalkCancelInterval`=1024): each
+    IterateSessions/IterateSessionsV6 callback returns false once the context
+    is cancelled, breaking the conntrack BPF-map walk and releasing the
+    per-bucket lock back to the live dataplane session-sync path instead of
+    holding it for a discarded scan. Sampled per batch (not per session) so the
+    check adds no per-entry cost and never fires on the normal path — output +
+    ordering unchanged. Tests (api_ctx_cancel_5232_5233_test.go): each handler
+    driven with an already-cancelled request context over a large synthetic
+    table asserts an early abort (bgp: <=1024 route lines emitted, no closing
+    envelope; sessions: exactly one sampling window walked) plus a non-cancelled
+    positive control (bgp byte-equal to golden; sessions walk the whole table).
+    All RED on revert of the checks (empirically verified). Validation:
+    `go build ./...` clean; `go test ./pkg/api/...` green.
+  - **File(s)**: pkg/api/routing.go, pkg/api/sessions.go,
+    pkg/api/api_ctx_cancel_5232_5233_test.go, pkg/api/README.md
+
 ## 2026-07-09 — grpcapi: enforce config-lock holder on mutators/commit (#5059)
 
 - **Timestamp**: 2026-07-09

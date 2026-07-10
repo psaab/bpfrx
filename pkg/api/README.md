@@ -326,6 +326,24 @@ under the daemon's errgroup. Nothing else imports this package.
   contract is pinned by `sessions_iterator_error_test.go` in this package
   and in `pkg/grpcapi` / `pkg/cli` (CLI top-talkers fails the command; NAT
   summaries print a stderr warning).
+- Long full-table read handlers must ABORT when the client disconnects
+  (#5232/#5233). The REST server cancels `r.Context()` on disconnect, so a
+  handler that walks a large structure has to sample `r.Context().Err()`
+  periodically and stop rather than run to completion for a response nobody
+  will read. `bgpHandler` (`/routing/bgp?type=routes`) checks once per
+  1024-route chunk in its streaming loop and returns — a full internet table
+  (900k+ routes) otherwise keeps formatting + JSON-escaping every remaining
+  route and writing to a dead connection (CPU/GC waste, #5232). The session
+  handlers (`/sessions`, `/sessions/summary`, `/sessions/zone-pair`) share a
+  per-batch sampler (`newRequestCancelSampler`, `sessionWalkCancelInterval`
+  = 1024): each `IterateSessions`/`IterateSessionsV6` callback returns
+  `false` once the context is cancelled, breaking the conntrack map walk and
+  releasing the per-bucket BPF-map lock back to the live dataplane
+  session-sync path (#5233) instead of holding it for a discarded scan. The
+  sampler probes `ctx.Err()` once per batch (not per session) so the check
+  adds no per-entry cost, and it never fires on the normal path — output and
+  ordering are unchanged. Pinned by `api_ctx_cancel_5232_5233_test.go`. This
+  is the REST analog of the gRPC `streamDiagCmd` cancellation cleanup (#5060).
 - Session-count metrics come from the LIVE dataplane session table, not
   the BPF GC sweep stats (#3929). `collectSessionGauges`
   (`metrics_sessions.go`) derives `xpf_sessions_active` (forward entries)
