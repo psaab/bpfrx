@@ -25,6 +25,88 @@
   the pre-#5007 interleaved shape (reverse OwnerRGID=2, snapshot B) and passes
   GREEN on the fix. `go test -race ./pkg/dataplane/userspace/` passes; `go vet`
   and `gofmt` clean; `cmd/xpfd` builds. Go-only change — no Rust touched.
+## 2026-07-09 — #4891 configstore: bound the commit description so an oversized journal record cannot self-poison the tail scanner
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4891 (audit integrity). An unbounded commit description
+  marshaled into one oversized JSONL journal line; the bounded reverse-tail
+  scanner (`maxTailLineBytes` = 16 MiB) then treats a line past its cap as a
+  poisoned fragment and discards it — so an oversized-but-valid commit record
+  vanished from bounded history views after allocating memory/disk
+  proportional to its size. Added `maxCommitDescriptionBytes` (4 KiB);
+  `CommitWithDescription` now rejects an over-cap comment with a clear error
+  before any persist/promote (strict-at-commit, #1960), and `journalLog`
+  defensively truncates any over-cap `Detail` (UTF-8-safe + explicit marker)
+  as a structural boundary belt for all callers.
+  **File(s)**: pkg/configstore/store_commit.go, pkg/configstore/store_persist.go,
+  pkg/configstore/README.md, pkg/configstore/commit_description_cap_4891_test.go
+
+## 2026-07-09 — #4881 config/nat: mixed scope kinds in one NAT from/to clause were OR-expanded (wider), not AND-ed fail-closed as the comment claimed
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4881 (Low, NAT scope widening / fail-open). A single NAT
+  rule-set `from` (or source-`to`, or static-`from`) clause that mixes scope
+  KINDS (e.g. `from zone trust` + `from interface ge-0/0/1.0`) was accepted by
+  the schema (zone/interface/routing-instance are independent `multi:true`
+  leaves with no mutual-exclusion validator) and OR-expanded by the #3096
+  Cartesian product (`collectNATScopes` → `applyNATFromScope` loop,
+  `compiler_nat.go`) into multiple typed rule-sets matching EITHER scope —
+  WIDER than the operator's likely AND intent and contrary to Junos'
+  one-kind-per-clause rule. The in-tree `parseNATMatchScopes` comment falsely
+  claimed the mix was "AND-ed fail-closed at match time" (no such AND exists).
+  Added an AST pre-walk `validateNATRuleSetMixedScopeAST`
+  (`compiler_nat_mixed_scope.go`) that rejects any `from` (all three NAT
+  kinds) or source-NAT `to` clause carrying >1 distinct scope kind at strict
+  commit / commit-check (lenient-warn on load/peer-sync via
+  `lenientNATMixedScope`), mirroring `validateDNATRuleSetToScopeAST` (#3444).
+  Detection reuses `parseNATMatchScopes` and aggregates distinct kinds exactly
+  as the compiler's Cartesian input, uses `forEachChild` for the #3562
+  duplicate-block class, and checks destination NAT on `from` only (its `to`
+  is separately rejected by #3444). Corrected the false comment and documented
+  the gate in `docs/config-schema.md`.
+  **File(s)**: pkg/config/compiler_nat_mixed_scope.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler.go,
+  pkg/config/compiler_nat.go (comment),
+  pkg/config/compiler_nat_mixed_scope_4881_test.go, docs/config-schema.md
+  **Validation**: `TestValidateNATRuleSetMixedScope` covers zone+interface,
+  zone+routing-instance, interface+routing-instance across source `from`,
+  source `to`, destination `from`, static `from`, plus no-false-positive
+  (single-kind from + single-kind to; same-kind zone list) and the
+  lenient-load warning. Fail-on-revert: neutralizing the validator makes every
+  reject subtest RED while the accept subtests stay green. `go build ./...`,
+  `go vet ./pkg/config/`, and the full `go test ./pkg/config/` suite are green
+  (no existing test mixes kinds within one clause — no regression).
+## 2026-07-09 — #4913 feeds: globally-duplicate feed names orphaned refresh loops + nondeterministic provider
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4913 (Medium, correctness + goroutine leak). feeds.Manager
+  keys its worker map (`m.feeds`) and enforcement snapshot by the effective
+  feed name. `Apply` ranged the UNORDERED `daCfg.FeedServers` map and did
+  `m.feeds[name] = fs` + `go refreshLoop` per entry as it went, so two
+  feed-servers declaring the same effective feed name each started a refresh
+  loop and the later map iteration OVERWROTE the first worker — orphaning its
+  cancel func (StopAll cancels only the survivor, so the overwritten loop kept
+  fetching / firing onUpdate until the parent ctx ended) — while enforcement
+  read whichever provider won the last map iteration (nondeterministic across
+  commits/restarts). Two fixes: (1) `Apply` now builds a COMPLETE,
+  deterministic (sorted server keys), de-duplicated plan BEFORE starting any
+  goroutine and starts exactly one refresh loop per name (first wins; duplicate
+  dropped with a warning), so no cancel is orphaned and the winner is
+  deterministic; (2) a new strict compile gate
+  `validateDynamicAddressFeedNameUniquenessStrict` rejects a globally-duplicate
+  effective feed name at commit / commit-check (lenient-warn on load/peer-sync),
+  mirroring the effective-name derivation of the #3300 reference gate and
+  excluding endpoint-less servers (which Apply skips).
+  **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_dup_name_4913_test.go,
+  pkg/config/compiler_validate_strict_observability.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/dynamic_address_feed_dup_name_4913_test.go
+  **Validation**: `TestApplyDeDupsDuplicateFeedNames` (fail-on-revert:
+  reverting the Apply de-dup starts two loops → nondeterministic winner + a
+  second orphaned fetch → RED) and `TestValidateDynamicAddressFeedNameUniqueness`
+  (fail-on-revert: neutralizing the gate call makes the commit-reject + lenient
+  subtests RED). `go build ./...`, `go vet ./pkg/feeds/ ./pkg/config/`, and the
+  full feeds + config suites are green.
 ## 2026-07-09 — #5006 ddns: Manager held m.mu across blocking RFC 2136 DNS UPDATE I/O — stalled Stats()/OwnedRecordViews()
 
 - **Timestamp**: 2026-07-09
