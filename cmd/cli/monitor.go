@@ -352,60 +352,93 @@ func (c *ctl) handleMonitorSecurity(args []string) error {
 }
 
 func (c *ctl) handleMonitorSecurityPacketDrop(args []string) error {
+	// Parse selectors fail-closed (#5051). This is an incident-response
+	// filter: a malformed or unknown selector must ABORT with a usage error
+	// before any RPC, never be silently dropped. The old loop used
+	// `if i+1 < len(args)` (missing value silently ignored) and
+	// `strconv.Atoi(...); err == nil` (parse error silently erased the port
+	// to 0 = wildcard), and had no default arm for unknown tokens — so
+	// `monitor security packet-drop source-port abc` opened an UNFILTERED
+	// stream showing ALL drops with a success exit. Mirror the strict local
+	// CLI parser in pkg/cli/monitor.go (require a value per selector, reject
+	// non-numeric/out-of-range ports and count, reject unknown tokens).
 	req := &pb.MonitorPacketDropRequest{}
+	needValue := func(i int) error {
+		if i+1 >= len(args) {
+			return fmt.Errorf("%s requires a value", args[i])
+		}
+		return nil
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				req.SourcePrefix = args[i]
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			req.SourcePrefix = args[i]
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				req.DestinationPrefix = args[i]
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			req.DestinationPrefix = args[i]
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.SourcePort = uint32(v)
-				}
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			v, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				return fmt.Errorf("invalid source-port %q: must be 0..65535", args[i])
+			}
+			req.SourcePort = uint32(v)
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.DestinationPort = uint32(v)
-				}
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			v, err := strconv.ParseUint(args[i], 10, 16)
+			if err != nil {
+				return fmt.Errorf("invalid destination-port %q: must be 0..65535", args[i])
+			}
+			req.DestinationPort = uint32(v)
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				req.Protocol = args[i]
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			req.Protocol = args[i]
 		case "from-zone":
-			if i+1 < len(args) {
-				i++
-				req.FromZone = args[i]
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			req.FromZone = args[i]
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				req.Interface = args[i]
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			req.Interface = args[i]
 		case "count":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.Count = int32(v)
-				}
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			v, err := strconv.Atoi(args[i])
+			if err != nil || v < 1 || v > 8192 {
+				return fmt.Errorf("invalid count %q: must be 1..8192", args[i])
+			}
+			req.Count = int32(v)
 		case "node":
-			if i+1 < len(args) {
-				i++
-				req.Node = args[i]
+			if err := needValue(i); err != nil {
+				return err
 			}
+			i++
+			req.Node = args[i]
+		default:
+			return fmt.Errorf("unknown packet-drop option: %s", args[i])
 		}
 	}
 
