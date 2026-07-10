@@ -7,10 +7,23 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// configMutationStatus maps a store mutation/commit error to the right gRPC
+// status code. A config-lock ownership violation (#5059,
+// configstore.ErrConfigLockedByOther) is PermissionDenied; every other error
+// (bad path, parse failure, read-only secondary, etc.) keeps the historical
+// InvalidArgument mapping so existing clients see no behavior change.
+func configMutationStatus(err error) error {
+	if errors.Is(err, configstore.ErrConfigLockedByOther) {
+		return status.Errorf(codes.PermissionDenied, "%v", err)
+	}
+	return status.Errorf(codes.InvalidArgument, "%v", err)
+}
 
 // --- Config lifecycle RPCs ---
 
@@ -47,13 +60,17 @@ func (s *Server) GetConfigModeStatus(_ context.Context, _ *pb.GetConfigModeStatu
 	}, nil
 }
 
-func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
+func (s *Server) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
+	// #5059: enforce config-lock ownership. peerSessionID identifies this
+	// connection; the store rejects a mutation whose caller is not the lock
+	// holder. An empty session (unit tests / internal) bypasses.
+	sessionID := peerSessionID(ctx)
 	input := req.Input
 	if strings.HasPrefix(input, "copy ") || strings.HasPrefix(input, "rename ") {
-		return s.handleCopyRename(input)
+		return s.handleCopyRename(sessionID, input)
 	}
 	if strings.HasPrefix(input, "insert ") {
-		return s.handleInsert(input)
+		return s.handleInsert(sessionID, input)
 	}
 	// #2051: the remote CLI rides the Set RPC for activate/deactivate (no
 	// dedicated RPC). Prefix-route the verb to the store wrapper BEFORE the
@@ -76,22 +93,22 @@ func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, er
 		}
 		var err error
 		if verb == "deactivate" {
-			err = s.store.DeactivateFromInput(rest)
+			err = s.store.DeactivateFromInputAs(sessionID, rest)
 		} else {
-			err = s.store.ActivateFromInput(rest)
+			err = s.store.ActivateFromInputAs(sessionID, rest)
 		}
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+			return nil, configMutationStatus(err)
 		}
 		return &pb.SetResponse{}, nil
 	}
-	if err := s.store.SetFromInput(input); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	if err := s.store.SetFromInputAs(sessionID, input); err != nil {
+		return nil, configMutationStatus(err)
 	}
 	return &pb.SetResponse{}, nil
 }
 
-func (s *Server) handleCopyRename(input string) (*pb.SetResponse, error) {
+func (s *Server) handleCopyRename(sessionID, input string) (*pb.SetResponse, error) {
 	parts := strings.Fields(input)
 	isRename := parts[0] == "rename"
 	toIdx := -1
@@ -108,17 +125,17 @@ func (s *Server) handleCopyRename(input string) (*pb.SetResponse, error) {
 	dstPath := parts[toIdx+1:]
 	var err error
 	if isRename {
-		err = s.store.Rename(srcPath, dstPath)
+		err = s.store.RenameAs(sessionID, srcPath, dstPath)
 	} else {
-		err = s.store.Copy(srcPath, dstPath)
+		err = s.store.CopyAs(sessionID, srcPath, dstPath)
 	}
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		return nil, configMutationStatus(err)
 	}
 	return &pb.SetResponse{}, nil
 }
 
-func (s *Server) handleInsert(input string) (*pb.SetResponse, error) {
+func (s *Server) handleInsert(sessionID, input string) (*pb.SetResponse, error) {
 	parts := strings.Fields(input)
 	kwIdx := -1
 	isBefore := false
@@ -143,28 +160,29 @@ func (s *Server) handleInsert(input string) (*pb.SetResponse, error) {
 	}
 	parentPath := elemPath[:len(elemPath)-len(refTokens)]
 	refPath := append(append([]string{}, parentPath...), refTokens...)
-	if err := s.store.Insert(elemPath, refPath, isBefore); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	if err := s.store.InsertAs(sessionID, elemPath, refPath, isBefore); err != nil {
+		return nil, configMutationStatus(err)
 	}
 	return &pb.SetResponse{}, nil
 }
 
-func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	if err := s.store.DeleteFromInput(req.Input); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+func (s *Server) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	if err := s.store.DeleteFromInputAs(peerSessionID(ctx), req.Input); err != nil {
+		return nil, configMutationStatus(err)
 	}
 	return &pb.DeleteResponse{}, nil
 }
 
-func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse, error) {
+func (s *Server) Load(ctx context.Context, req *pb.LoadRequest) (*pb.LoadResponse, error) {
+	sessionID := peerSessionID(ctx)
 	switch req.Mode {
 	case "override":
-		if err := s.store.LoadOverride(req.Content); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		if err := s.store.LoadOverrideAs(sessionID, req.Content); err != nil {
+			return nil, configMutationStatus(err)
 		}
 	case "merge", "":
-		if err := s.store.LoadMerge(req.Content); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		if err := s.store.LoadMergeAs(sessionID, req.Content); err != nil {
+			return nil, configMutationStatus(err)
 		}
 	case "set":
 		// #2052: make `load set` a real service-mode op. LoadSet replays the
@@ -172,9 +190,9 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 		// `deactivate <path>` lines (emitted by `show | display set` for
 		// inactive nodes, #2008 H1) round-trips back to an inactive node.
 		// The applied-count is log-only (LoadResponse has no count field).
-		count, err := s.store.LoadSet(req.Content)
+		count, err := s.store.LoadSetAs(sessionID, req.Content)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+			return nil, configMutationStatus(err)
 		}
 		slog.Info("load set applied", "commands", count)
 	default:
@@ -184,13 +202,21 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 }
 
 func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
+	// #5059: only the config-lock holder may commit the shared candidate. Reject
+	// a commit from a non-holder session before it can confirm/apply another
+	// session's pending work. Empty session (unit tests / internal) bypasses.
+	sessionID := peerSessionID(ctx)
+	if err := s.store.EnsureConfigHolder(sessionID); err != nil {
+		return nil, configMutationStatus(err)
+	}
+
 	// Bare commit during a pending commit-confirmed window (#4000). Confirm
 	// the pending config only when the candidate is UNCHANGED; new staged
 	// edits fall through to the normal commit below, where the daemon commitFn
 	// (CommitWithDescription, #3861) applies them AND clears the timer, so the
 	// edits are committed rather than silently dropped.
 	if s.store.IsConfirmPending() && !s.store.IsDirty() {
-		if err := s.store.ConfirmCommit(); err != nil {
+		if err := s.store.ConfirmCommitAs(sessionID); err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
 		}
 		return &pb.CommitResponse{}, nil
@@ -225,6 +251,10 @@ func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.C
 }
 
 func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
+	// #5059: only the config-lock holder may commit the shared candidate.
+	if err := s.store.EnsureConfigHolder(peerSessionID(ctx)); err != nil {
+		return nil, configMutationStatus(err)
+	}
 	if s.commitConfirmedFn == nil {
 		return nil, status.Errorf(codes.Internal, "commit-confirmed handler not wired")
 	}
@@ -242,14 +272,19 @@ func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedReq
 	return &pb.CommitConfirmedResponse{Warnings: configWarnings(compiled)}, nil
 }
 
-func (s *Server) ConfirmCommit(_ context.Context, _ *pb.ConfirmCommitRequest) (*pb.ConfirmCommitResponse, error) {
-	if err := s.store.ConfirmCommit(); err != nil {
+func (s *Server) ConfirmCommit(ctx context.Context, _ *pb.ConfirmCommitRequest) (*pb.ConfirmCommitResponse, error) {
+	// #5059: only the config-lock holder may confirm (and cancel the auto-
+	// rollback of) the pending commit-confirmed.
+	if err := s.store.ConfirmCommitAs(peerSessionID(ctx)); err != nil {
+		if errors.Is(err, configstore.ErrConfigLockedByOther) {
+			return nil, status.Errorf(codes.PermissionDenied, "%v", err)
+		}
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 	return &pb.ConfirmCommitResponse{}, nil
 }
 
-func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
+func (s *Server) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb.RollbackResponse, error) {
 	// #4589 A8-01: n==0 is the valid Junos `rollback 0` (revert to active);
 	// n>=1 selects history slot n. A negative n maps to history.Get(n-1) =
 	// history.Get(<-1>) → the opaque store error "history position -1 out of
@@ -260,8 +295,8 @@ func (s *Server) Rollback(_ context.Context, req *pb.RollbackRequest) (*pb.Rollb
 		return nil, status.Errorf(codes.InvalidArgument,
 			"invalid n %d: rollback index must be non-negative (0 = revert to active)", req.N)
 	}
-	if err := s.store.Rollback(int(req.N)); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	if err := s.store.RollbackAs(peerSessionID(ctx), int(req.N)); err != nil {
+		return nil, configMutationStatus(err)
 	}
 	return &pb.RollbackResponse{}, nil
 }

@@ -401,10 +401,19 @@ func (s *Store) clearPendingConfirmLocked() bool {
 }
 
 // ConfirmCommit cancels the auto-rollback timer, confirming the config.
-func (s *Store) ConfirmCommit() error {
+func (s *Store) ConfirmCommit() error { return s.ConfirmCommitAs("") }
+
+// ConfirmCommitAs is ConfirmCommit scoped to a config-lock holder session
+// (#5059): a non-holder session must not confirm (and thereby cancel the
+// auto-rollback of) another session's pending commit-confirmed. sessionID == ""
+// bypasses ownership (internal/system caller, e.g. the confirm-on-sync path).
+func (s *Store) ConfirmCommitAs(sessionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if err := s.ensureHolderLocked(sessionID); err != nil {
+		return err
+	}
 	if !s.clearPendingConfirmLocked() {
 		return fmt.Errorf("no pending confirmed commit")
 	}
@@ -598,7 +607,11 @@ func (s *Store) performAutoRollback(gen uint64) {
 
 // Rollback reverts the candidate to a previous configuration.
 // n=0 reverts to active; n>0 reverts to the nth previous commit.
-func (s *Store) Rollback(n int) error {
+func (s *Store) Rollback(n int) error { return s.RollbackAs("", n) }
+
+// RollbackAs is Rollback scoped to a config-lock holder session (#5059).
+// sessionID == "" bypasses ownership (internal/system caller).
+func (s *Store) RollbackAs(sessionID string, n int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -607,6 +620,11 @@ func (s *Store) Rollback(n int) error {
 	// commit-confirmed timeout revert PromoteRollback (which promotes the
 	// active config directly and is intentionally NOT gated).
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	// #5059: reject a rollback issued by a session that is not the config-lock
+	// holder — it mutates the shared candidate.
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {

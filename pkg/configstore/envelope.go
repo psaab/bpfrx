@@ -59,6 +59,20 @@ var ErrConfigLocked = errors.New("configuration is locked by another user")
 // through the gated methods, so they deliberately bypass this gate.
 var ErrClusterReadOnly = errors.New("configuration is read-only on the cluster secondary")
 
+// ErrConfigLockedByOther tags a rejected candidate mutation/commit made by a
+// session that is NOT the current config-lock holder (#5059). The candidate is
+// intentionally singular and shared, so serialization under Store.mu alone is
+// not authorization: without this gate a session that never entered config mode
+// could Set/Delete/Load/Rollback/Commit another session's pending candidate. It
+// is returned by the session-scoped *As mutators and EnsureConfigHolder when a
+// non-empty caller session differs from the recorded holder. A caller session
+// of "" is the explicit internal/system capability (daemon apply, REST-stateless
+// enter, HA sync, tests) and bypasses the gate; a lock acquired with no recorded
+// holder (the internal/local EnterConfigure path) is likewise not owned by any
+// session and is not blocked. It is a TRANSIENT condition (the holder commits or
+// exits), so deferrable callers may errors.Is + retry.
+var ErrConfigLockedByOther = errors.New("configuration candidate is held by another session")
+
 // Config-DB compatibility envelope (#1917 increment B, plan §6.4 / D1).
 //
 // The envelope is EMBEDDED in active.json as a single magic header LINE

@@ -1,3 +1,22 @@
+## 2026-07-09 — grpcapi: enforce config-lock holder on mutators/commit (#5059)
+
+- **Timestamp**: 2026-07-09
+  **Action**: Config mutators/commit RPCs ignored the config-lock holder — any
+  gRPC session could Set/Delete/Load/Rollback/Commit another session's shared
+  candidate. Added `ensureHolderLocked` + session-scoped `*As` store variants
+  (SetAs/DeleteAs/Load*As/RollbackAs/ConfirmCommitAs/Copy/Rename/Insert/
+  Deactivate/Activate) and exported `EnsureConfigHolder`; threaded
+  `peerSessionID(ctx)` through every gRPC config mutation/commit handler.
+  Non-holder -> `ErrConfigLockedByOther` -> `codes.PermissionDenied`. Empty
+  session ("") = internal/system bypass (local CLI, REST-stateless, HA sync,
+  tests) so existing behavior is unchanged.
+  **File(s)**: pkg/configstore/store_lock.go, pkg/configstore/store_command.go,
+  pkg/configstore/store_commit.go, pkg/configstore/envelope.go,
+  pkg/grpcapi/server_config.go,
+  pkg/configstore/config_lock_holder_5059_test.go,
+  pkg/grpcapi/config_lock_holder_5059_test.go, pkg/configstore/README.md,
+  _Log.md
+
 ## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
 
 - **Timestamp**: 2026-07-09
