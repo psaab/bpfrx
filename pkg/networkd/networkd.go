@@ -189,13 +189,22 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 
 	changed := false
 
-	// Remove stale xpf-managed files
+	// Remove stale xpf-managed files. #4900: a remove FAILURE is aggregated
+	// (mirroring the #2987 write-failure handling) and fails the commit —
+	// best-effort still attempts every delete, but a stale 10-xpf-* unit that
+	// cannot be removed (read-only /etc, immutable bit, EACCES) must NOT survive
+	// a "successful" commit and silently re-apply the removed address / VRF /
+	// bond / bridge / rename on the next reload or reboot. The prior warn-only
+	// path let such a file survive with no error and, if no other file changed,
+	// no reload either.
+	var removeErrs []error
 	matches, _ := filepath.Glob(filepath.Join(m.networkDir, filePrefix+"*"))
 	for _, path := range matches {
 		base := filepath.Base(path)
 		if !expected[base] {
 			if err := os.Remove(path); err != nil {
 				slog.Warn("failed to remove stale networkd file", "path", path, "err", err)
+				removeErrs = append(removeErrs, fmt.Errorf("remove stale %s: %w", base, err))
 			} else {
 				slog.Info("removed stale networkd file", "path", path)
 				changed = true
@@ -243,9 +252,12 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		write(networkPath, m.generateNetwork(ifc))
 	}
 
-	if len(writeErrs) > 0 {
-		// Fail the commit (#2987). Still reload if some files changed so the
-		// kernel reflects whatever did get written, but surface the error.
+	if len(writeErrs) > 0 || len(removeErrs) > 0 {
+		// Fail the commit (#2987 write failures, #4900 stale-remove failures).
+		// Still reload if some files changed so the kernel reflects whatever did
+		// get written/removed, but surface the error so the operator is not told
+		// a config was committed while a stale unit survives on disk.
+		nWrite, nRemove := len(writeErrs), len(removeErrs)
 		if changed {
 			if err := runNetworkctl("reload"); err != nil {
 				// #4954: a failed reload here also owes activation debt so a
@@ -258,8 +270,9 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 				restoreSlowPathRPFilter()
 			}
 		}
-		return fmt.Errorf("networkd: %d generated file(s) failed to write: %w",
-			len(writeErrs), errors.Join(writeErrs...))
+		allErrs := append(append([]error{}, removeErrs...), writeErrs...)
+		return fmt.Errorf("networkd: %d generated file(s) failed to write, %d stale file(s) failed to remove: %w",
+			nWrite, nRemove, errors.Join(allErrs...))
 	}
 
 	// #4954: an Apply must (re)activate whenever files changed this call OR a
@@ -411,9 +424,11 @@ func (m *Manager) Clear() error {
 		return nil
 	}
 
+	var removeErrs []error
 	for _, path := range matches {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			slog.Warn("failed to remove networkd file", "path", path, "err", err)
+			removeErrs = append(removeErrs, fmt.Errorf("remove %s: %w", filepath.Base(path), err))
 		}
 	}
 
@@ -421,6 +436,15 @@ func (m *Manager) Clear() error {
 		return fmt.Errorf("networkctl reload: %w", err)
 	}
 	restoreSlowPathRPFilter()
+	// #4900: a managed file that could not be removed must fail the Clear — a
+	// surviving 10-xpf-* unit re-applies removed host config (address / VRF /
+	// bond / bridge / rename) on the next reload or boot. The reload above still
+	// ran best-effort so whatever WAS removed takes effect, but the operator is
+	// not told the clear succeeded when it did not.
+	if len(removeErrs) > 0 {
+		return fmt.Errorf("networkd: %d managed file(s) failed to remove: %w",
+			len(removeErrs), errors.Join(removeErrs...))
+	}
 	slog.Info("cleared xpf networkd files", "removed", len(matches))
 	return nil
 }

@@ -103,7 +103,6 @@ func NewWithConfigDir(dir string) *Manager {
 // connections, actively terminates their live SAs (terminateRemovedConns).
 func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 	newNames := vpnConnNameSet(ipsecCfg)
-	removed := m.swapConnNames(newNames)
 
 	var applyErr error
 	if ipsecCfg == nil || len(ipsecCfg.VPNs) == 0 {
@@ -112,23 +111,41 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 		applyErr = m.applyConfig(ipsecCfg)
 	}
 
-	// Terminate the live SAs of deleted connections AFTER the reload has
-	// unloaded their config, so a straggler SA cannot be re-initiated from a
+	// #4898: state promotion and SA teardown are gated on reload SUCCESS. On a
+	// failed reload strongSwan keeps the PREVIOUS config loaded and effective, so
+	// prevConnNames must NOT advance and the removed connections' live SAs must
+	// NOT be terminated — they may still be the effective policy. Leaving
+	// prevConnNames unchanged lets the next successful Apply/Clear recompute the
+	// diff and retry the teardown; advancing it here (the old ordering) would
+	// forget which connections are still loaded and disrupt a still-effective
+	// tunnel while reporting success.
+	if applyErr != nil {
+		return applyErr
+	}
+
+	// Reload succeeded: atomically advance prevConnNames to the applied set and
+	// tear down the live SAs of the connections the operator DELETED. Their
+	// config is now unloaded, so a straggler SA cannot be re-initiated from a
 	// still-loaded connection while we tear it down. Terminate is idempotent:
 	// a removed VPN with no active SA is a clean no-op (no --terminate is
 	// issued because it never shows up in --list-sas).
+	removed := m.promoteConnNames(newNames)
 	m.terminateRemovedConns(removed)
-
-	return applyErr
+	return nil
 }
 
 // Clear removes the xpf config and reloads strongSwan, terminating the live
 // SAs of every previously-applied connection.
 func (m *Manager) Clear() error {
-	removed := m.swapConnNames(nil)
-	err := m.clearConfig()
+	if err := m.clearConfig(); err != nil {
+		// #4898: the reload failed — the old config is still the effective
+		// loaded config. Preserve prevConnNames and skip termination so a later
+		// Clear retries the teardown rather than reporting a false success.
+		return err
+	}
+	removed := m.promoteConnNames(nil)
 	m.terminateRemovedConns(removed)
-	return err
+	return nil
 }
 
 // applyConfig renders + atomically writes the swanctl snippet and reloads.
@@ -160,12 +177,18 @@ func (m *Manager) applyConfig(ipsecCfg *config.IPsecConfig) error {
 }
 
 // clearConfig removes the xpf snippet and reloads strongSwan.
+//
+// #4898: the reload error is PROPAGATED, not swallowed. The empty-clear branch
+// (Apply(nil)/Clear deleting the last VPN) previously did `_ = m.reload()` and
+// returned nil, reporting success even when `swanctl --load-all` failed and
+// charon kept the old connection loaded — a decommissioned/compromised peer
+// would stay authorized and could re-initiate. This now mirrors applyConfig,
+// which already propagates reload errors (the #4433 contract).
 func (m *Manager) clearConfig() error {
 	if err := os.Remove(m.configPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove config: %w", err)
 	}
-	_ = m.reload()
-	return nil
+	return m.reload()
 }
 
 func (m *Manager) reload() error {
@@ -192,12 +215,17 @@ func vpnConnNameSet(ipsecCfg *config.IPsecConfig) map[string]bool {
 	return names
 }
 
-// swapConnNames records newNames as the current applied connection set and
+// promoteConnNames records newNames as the current applied connection set and
 // returns the connections that were present before but are gone now — the
 // ones an operator DELETED. The diff keys off the VPN name (map key), not
 // renderability, so a VPN that merely became unrenderable (a broken gateway
 // reference) is NOT treated as removed and keeps its SAs.
-func (m *Manager) swapConnNames(newNames map[string]bool) []string {
+//
+// #4898: this is called ONLY after a successful reload, so prevConnNames always
+// reflects the last config strongSwan actually loaded — never a config whose
+// reload failed. The name/removed diff and the prevConnNames advance stay
+// atomic under mu.
+func (m *Manager) promoteConnNames(newNames map[string]bool) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var removed []string

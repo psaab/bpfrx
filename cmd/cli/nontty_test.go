@@ -58,6 +58,19 @@ type fakeBpfrxClient struct {
 	getZonesCalls int
 	getZonesResp  *pb.GetZonesResponse
 	getZonesErr   error
+
+	// GetBGPStatus recorder (#4967 remote `show bgp` alias coverage).
+	getBGPStatusCalls  int
+	getBGPStatusReq    *pb.GetBGPStatusRequest
+	getBGPStatusOutput string
+}
+
+func (f *fakeBpfrxClient) GetBGPStatus(
+	_ context.Context, in *pb.GetBGPStatusRequest, _ ...grpc.CallOption,
+) (*pb.GetBGPStatusResponse, error) {
+	f.getBGPStatusCalls++
+	f.getBGPStatusReq = in
+	return &pb.GetBGPStatusResponse{Output: f.getBGPStatusOutput}, nil
 }
 
 func (f *fakeBpfrxClient) GetZones(

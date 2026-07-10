@@ -87,6 +87,19 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		return s.showFirewallFilter(req, cfg, &buf)
 	}
 
+	// #4967: `show firewall [filter <name>] effective [family <f>]` renders the
+	// compiled FirewallFilterSnapshot the dataplane actually receives. The
+	// remote CLI advertises these leaves (cmdtree) and the local CLI implements
+	// them, so the remote dispatcher routes them here to the shared SSOT
+	// renderer (dpuserspace.RenderFirewallFilterSnapshot) — the advertised and
+	// executable grammars can no longer diverge into the raw-config view.
+	if strings.HasPrefix(req.Topic, "firewall-effective-filter:") {
+		return s.showEffectiveFirewallFilter(req, cfg, &buf)
+	}
+	if req.Topic == "firewall-effective" || strings.HasPrefix(req.Topic, "firewall-effective:") {
+		return s.showEffectiveFirewallFilters(req, cfg, &buf)
+	}
+
 	switch req.Topic {
 	case "zones-detail":
 		// #1043 Phase 8: case body extracted to server_show_zones_text.go
