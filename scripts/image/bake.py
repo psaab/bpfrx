@@ -6,7 +6,12 @@ image to provision it) and exports it for both hypervisors:
 
   dist/xpf-<ver>.qcow2                  - libvirt/KVM (virt-install)
   dist/xpf-<ver>.incus-metadata.tar.gz  - incus VM image metadata
-  dist/xpf-<ver>.SHA256SUMS             - per-version checksum manifest (#1924)
+  dist/xpf-<ver>.manifest               - build + HA/session-sync protocol
+                                          metadata (mixed-base image-roll gate);
+                                          COVERED by the signed SHA256SUMS (#5042)
+  dist/xpf-<ver>.SHA256SUMS             - per-version checksum manifest (#1924),
+                                          covering the qcow2, incus metadata, AND
+                                          the .manifest sidecar (#5042)
   dist/xpf-<ver>.SHA256SUMS.minisig     - minisign signature over the manifest
                                           (only when XPF_SIGN_SECKEY is set)
 
@@ -659,20 +664,17 @@ def main():
                     "  variant: xpf-appliance\n")
         run(["tar", "-C", work, "-czf", meta_out, "metadata.yaml"])
 
-        # Per-version, version-named checksum manifest (#1924 §5.1): each
-        # bake owns its manifest so retaining v1 next to v2 never orphans
-        # v1's checksums. Verification (validate.py / xpf-deploy.py fetch)
-        # is PER-FILE against the basenames listed here.
-        sums = os.path.join(a.out, f"xpf-{ver}.SHA256SUMS")
-        sign.write_manifest(sums, [qcow_out, meta_out])
-        info("checksums:")
-        print(open(sums).read(), end="")
-
-        # NOTE(#4017): the manifest is SIGNED below, AFTER the validation
-        # gate — not here. The checksum manifest itself is not a trust
-        # artifact (publish refuses unsigned trees), but the .minisig
-        # signature is, so it must never exist for an image that failed the
-        # gate. See finalize_artifacts() at the end of the pipeline.
+        # NOTE(#5042): the per-version checksum manifest (xpf-<ver>.SHA256SUMS)
+        # is written BELOW — after the xpf-<ver>.manifest protocol sidecar
+        # exists — so the sidecar is COVERED by the signed checksum set. The
+        # deployer's mixed-base HA session-safety gate decides session survival
+        # from that sidecar's ha-protocol / session-sync fields; before #5042
+        # those bytes lived outside every signed artifact, so tampering the
+        # sidecar alone could spoof a compatible-window / matching-sync decision
+        # and bypass the session-safety stop while every signed image byte was
+        # untouched. The .minisig over SHA256SUMS is produced only AFTER the
+        # validation gate (#4017); see write_manifest below and
+        # finalize_artifacts() at the end of the pipeline.
 
         try:
             commit = out_text(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
@@ -712,6 +714,20 @@ def main():
                     f"bake_host_kernel: {os.uname().release}\n"
                     + proto_lines)
         info(f"manifest: {manifest}")
+
+        # Per-version, version-named checksum manifest (#1924 §5.1): each bake
+        # owns its manifest so retaining v1 next to v2 never orphans v1's
+        # checksums. Verification (validate.py / xpf-deploy.py fetch) is
+        # PER-FILE against the basenames listed here. #5042: the protocol
+        # sidecar xpf-<ver>.manifest is now in the signed set so the deployer's
+        # mixed-base HA session-safety gate reads AUTHENTICATED bytes —
+        # `xpf-deploy image-roll` verifies it against this SHA256SUMS before
+        # parsing the ha-protocol / session-sync fields. The .minisig over this
+        # manifest is produced only AFTER the validation gate (finalize_artifacts).
+        sums = os.path.join(a.out, f"xpf-{ver}.SHA256SUMS")
+        sign.write_manifest(sums, [qcow_out, meta_out, manifest])
+        info("checksums:")
+        print(open(sums).read(), end="")
 
         # 7. validation gate, THEN sign (#4017). The manifest signature is a
         # TRUST artifact — downstream publish (scripts/dist/publish.py) and

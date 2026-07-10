@@ -187,8 +187,12 @@ func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
 
 // NewServer creates a new gRPC server.
 // NOTE: gRPC is local-only (127.0.0.1) so all RPCs are inherently trusted.
-// Login class RBAC enforcement could be added here via per-RPC interceptors if
-// gRPC is ever exposed on non-loopback addresses.
+// Run enforces that trust boundary: a non-loopback bind address is clamped
+// back to loopback (clampGRPCBindToLoopback, #5035) because this listener has
+// no authentication. Login class RBAC enforcement could be added here via
+// per-RPC interceptors if gRPC is ever intentionally exposed on non-loopback
+// addresses; until then, cross-node access uses the authenticated fabric
+// listener (RunFabricListener), not this one.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
 		store:                 cfg.Store,
@@ -257,7 +261,66 @@ func stopGRPCServer(srv *grpc.Server, timeout time.Duration) {
 	}
 }
 
+// grpcHostIsLoopback reports whether a gRPC bind host is a loopback address.
+// It mirrors the web-management / cluster bind doctrine (#4903/#4928): an EMPTY
+// host is the Go wildcard spelling (`net.SplitHostPort(":50051")` yields host ""
+// and listens on ALL interfaces) and is NOT loopback; the literal "localhost"
+// is a legitimate loopback bind spelling; an unparseable, non-loopback host
+// fails safe as NON-loopback so the bind is clamped rather than left exposed.
+func grpcHostIsLoopback(host string) bool {
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// clampGRPCBindToLoopback pulls a non-loopback PRIMARY gRPC bind back to a
+// loopback of the same address family (#5035). The primary gRPC listener
+// (Run) installs only configLockInterceptor — no TLS, no authentication — so
+// NewServer's documented contract is that gRPC is loopback-only and every RPC
+// is inherently trusted (SystemAction zeroize/reboot/halt/power-off,
+// Commit/Delete/Rollback, the whole config surface). A non-loopback
+// `--grpc-addr` (`0.0.0.0`, a routable address) would therefore expose the
+// full unauthenticated control plane to the network. Unlike the
+// web-management clamp there is NO auth mode that unlocks a non-loopback bind
+// here: the intentionally network-exposed gRPC surface is the SEPARATE fabric
+// listener (RunFabricListener), which authenticates (#4107) and allowlists
+// (#4122) every call. A genuine loopback bind (127.0.0.0/8, ::1, "localhost")
+// is returned unchanged; a bind whose host part fails to split (no port to
+// clamp) is also returned unchanged.
+func clampGRPCBindToLoopback(addr string) (string, bool) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || grpcHostIsLoopback(host) {
+		return addr, false
+	}
+	loopback := "127.0.0.1"
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		// An IPv6 (non-v4-mapped) bind clamps to the IPv6 loopback so the
+		// listener stays same-family.
+		loopback = "::1"
+	}
+	return net.JoinHostPort(loopback, port), true
+}
+
 func (s *Server) Run(ctx context.Context) error {
+	// Fail-safe loopback clamp (#5035): the primary gRPC listener is
+	// unauthenticated, so a non-loopback bind would expose destructive RPCs to
+	// the network. Pull it back to a loopback of the same family and WARN; the
+	// daemon still boots and gRPC stays reachable on loopback (the console/SSH
+	// remain the lifeline). Cross-node access uses the authenticated fabric
+	// listener, not this one.
+	if clamped, ok := clampGRPCBindToLoopback(s.addr); ok {
+		slog.Warn("gRPC bind is non-loopback but the primary gRPC listener is unauthenticated (loopback-only trust boundary); clamping to loopback — use the authenticated cluster fabric listener for cross-node access — #5035",
+			"requested", s.addr, "clamped", clamped)
+		s.addr = clamped
+	}
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("gRPC listen: %w", err)
