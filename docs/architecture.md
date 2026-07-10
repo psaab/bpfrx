@@ -183,6 +183,15 @@ editing cmdtree.
   (see `pkg/cluster/README.md`).
 - **HTTP REST** on `127.0.0.1:8080` — health, Prometheus `/metrics`,
   config endpoints, full gRPC parity.
+  - **Listener lifecycle is all-or-nothing (#5058).** `Server.Run` may
+    serve both an HTTP and (with `web-management https` + a self-signed
+    cert) an HTTPS listener; the two form ONE lifecycle. Run binds both
+    listeners synchronously up front, so a bind failure on either closes
+    whichever already bound and returns before anything serves. Once both
+    are serving, any terminal serve error OR context cancellation shuts
+    down BOTH servers and joins BOTH serve goroutines before Run returns.
+    A single-listener failure therefore never leaves the sibling serving
+    an orphaned management socket the daemon can no longer reach to close.
   - **Off-loopback bind requires api-auth (#4047).** The REST/config API
     serves the mutating endpoints (`config set/delete/commit/commit-confirmed/
     rollback/load/activate`, `system/action`) with **no** auth middleware

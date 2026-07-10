@@ -9,10 +9,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -558,38 +561,93 @@ func NewServer(cfg Config) *Server {
 	return s
 }
 
-// Run starts the HTTP (and optionally HTTPS) server and blocks until ctx is cancelled.
+// Run starts the HTTP (and optionally HTTPS) server and blocks until ctx is
+// cancelled or a listener terminates with an error.
+//
+// #5058: the HTTP and HTTPS listeners form ONE server lifecycle — startup is
+// all-or-nothing and any terminal child error tears down every sibling. Both
+// listeners are bound synchronously up front (a bind failure on either closes
+// whichever already bound and returns before anything serves), then served
+// under shared cancellation. On any serve error OR ctx cancellation both
+// servers are shut down and both serve goroutines are joined before Run
+// returns, so no surviving listener, socket, or goroutine is ever leaked.
+// Before this change a bind/serve failure of one listener returned immediately
+// and left the other serving forever — an orphaned management socket that the
+// daemon wrapper could never reach to shut down.
 func (s *Server) Run(ctx context.Context) error {
-	errCh := make(chan error, 1)
+	// Bind synchronously and in a fixed order (HTTP first) so startup fails
+	// atomically before either server accepts a connection.
+	httpLn, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("api: bind HTTP listener %q: %w", s.httpServer.Addr, err)
+	}
+
+	var httpsLn net.Listener
+	if s.httpsServer != nil {
+		httpsLn, err = net.Listen("tcp", s.httpsServer.Addr)
+		if err != nil {
+			// The HTTP listener already bound — close it so a failed
+			// startup leaves no orphaned socket behind (#5058).
+			httpLn.Close()
+			return fmt.Errorf("api: bind HTTPS listener %q: %w", s.httpsServer.Addr, err)
+		}
+	}
+
+	// Both listeners are bound. Serve each in its own goroutine; a fatal
+	// Serve error is reported once on the buffered channel.
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		slog.Info("HTTP API server listening", "addr", s.httpServer.Addr)
-		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := s.httpServer.Serve(httpLn); err != http.ErrServerClosed {
 			errCh <- err
 		}
 	}()
 
-	// Start HTTPS server if configured
 	if s.httpsServer != nil {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			slog.Info("HTTPS API server listening", "addr", s.httpsServer.Addr)
-			if err := s.httpsServer.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
+			// TLSConfig.Certificates is already populated in NewServer, so
+			// ServeTLS with empty cert/key file paths uses those certs
+			// (identical to the previous ListenAndServeTLS("", "")).
+			if err := s.httpsServer.ServeTLS(httpsLn, "", ""); err != http.ErrServerClosed {
 				errCh <- err
 			}
 		}()
 	}
 
+	var serveErr error
 	select {
-	case err := <-errCh:
-		return err
+	case serveErr = <-errCh:
 	case <-ctx.Done():
 	}
 
+	// Shut down BOTH servers regardless of which path woke us. Shutdown closes
+	// the listener and unblocks the matching Serve goroutine with
+	// http.ErrServerClosed; join both so no goroutine outlives Run.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	var shutErr error
 	if s.httpsServer != nil {
-		s.httpsServer.Shutdown(shutdownCtx)
+		shutErr = s.httpsServer.Shutdown(shutdownCtx)
 	}
-	return s.httpServer.Shutdown(shutdownCtx)
+	if err := s.httpServer.Shutdown(shutdownCtx); err != nil && shutErr == nil {
+		shutErr = err
+	}
+	wg.Wait()
+
+	// A serve error is the real cause of the exit; surface it ahead of any
+	// shutdown error (which, on the serve-error path, is usually just the
+	// already-stopped sibling).
+	if serveErr != nil {
+		return serveErr
+	}
+	return shutErr
 }
 
 const (
