@@ -34,6 +34,12 @@ var proxyARPReconcileFn = (*Daemon).reconcileProxyARP
 // procfs; production wiring is dataplane.DisableProxyResponders.
 var proxyARPDisableFn = dataplane.DisableProxyResponders
 
+// proxyARPApplyFn is the dataplane reconcile the daemon drives each commit. It
+// is a package var so the #4955 test can assert the daemon feeds the
+// prior-interface set through to the NTF_PROXY sweep without touching netlink;
+// production wiring is dataplane.ReconcileProxyARP.
+var proxyARPApplyFn = dataplane.ReconcileProxyARP
+
 // ifaceIndexByName resolves a Linux interface name to its kernel ifindex. It
 // is a package var so the RETH-resolution unit test can drive
 // proxyARPIfaceMap without real interfaces; production wiring is
@@ -79,6 +85,26 @@ func proxyARPIfaceMap(cfg *config.Config) map[string]int {
 	return ifaceMap
 }
 
+// priorProxyARPIfaceMap resolves the interfaces proxy-arp was installed on by a
+// PRIOR commit — the Linux netdev names remembered in d.proxyARPEnabled (which
+// ReconcileProxyARP keys by link.Attrs().Name) — to their current kernel
+// ifindexes. The dataplane reconcile folds these into its managed listing set
+// so it sweeps orphaned NTF_PROXY neighbor entries off interfaces that have
+// since dropped out of the config (#4955). A name that no longer resolves (its
+// netdev was deleted) is skipped: its neighbor entries went away with the
+// netdev, so there is nothing left to sweep.
+func priorProxyARPIfaceMap(priorNames []string) map[string]int {
+	m := make(map[string]int, len(priorNames))
+	for _, name := range priorNames {
+		idx, err := ifaceIndexByName(name)
+		if err != nil {
+			continue
+		}
+		m[name] = idx
+	}
+	return m
+}
+
 // reconcileProxyARP reconciles the kernel proxy-ARP/NDP responder state
 // (NTF_PROXY neighbor entries + the per-interface proxy_arp/proxy_ndp sysctls)
 // for the configured `security nat proxy-arp` addresses. It is a no-op when no
@@ -98,33 +124,44 @@ func proxyARPIfaceMap(cfg *config.Config) map[string]int {
 // via cfg.ResolveKernelIfName; losing it would re-break proxy-arp on RETH or
 // VLAN-tagged interfaces.
 func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
-	// #2475: a commit that REMOVES proxy-arp (cfg now has zero entries) must
-	// still run so the disable-on-removal pass below can drive the leaked
-	// sysctl back to 0 on the interfaces a prior commit enabled. Only skip the
+	// #2475/#4955: a commit that REMOVES proxy-arp (cfg now has zero entries)
+	// must still run so the reconcile can (a) drive the leaked proxy_arp /
+	// proxy_ndp sysctl back to 0 and (b) NeighDel the orphaned NTF_PROXY
+	// entries on the interfaces a prior commit installed them on. Only skip the
 	// expensive netlink reconcile + iface resolution when there is also nothing
 	// to tear down, preserving the "no-op on configs that never use proxy-arp"
 	// property the always-on loop relies on.
 	hasEntries := cfg != nil && len(cfg.Security.NAT.ProxyARP) > 0
-	if !hasEntries {
-		d.proxyARPEnabledMu.Lock()
-		hadPrior := len(d.proxyARPEnabled) > 0
-		d.proxyARPEnabledMu.Unlock()
-		if !hadPrior {
-			return
-		}
+
+	// Snapshot the interfaces a prior commit installed proxy-arp on so the
+	// stateless dataplane reconcile can sweep entries that dropped out of the
+	// config (#4955). Keys are Linux netdev names (ReconcileProxyARP keys its
+	// enabled set by link.Attrs().Name), so they resolve directly via
+	// ifaceIndexByName without cfg.ResolveKernelIfName.
+	d.proxyARPEnabledMu.Lock()
+	priorNames := make([]string, 0, len(d.proxyARPEnabled))
+	for iface := range d.proxyARPEnabled {
+		priorNames = append(priorNames, iface)
+	}
+	d.proxyARPEnabledMu.Unlock()
+
+	if !hasEntries && len(priorNames) == 0 {
+		return
 	}
 
-	var (
-		added   []dataplane.ProxyARPAdded
-		enabled map[string]map[int]struct{}
-		err     error
-	)
+	priorIfaceMap := priorProxyARPIfaceMap(priorNames)
+	ifaceMap := map[string]int{}
 	if hasEntries {
-		ifaceMap := proxyARPIfaceMap(cfg)
-		added, enabled, err = dataplane.ReconcileProxyARP(cfg, ifaceMap)
-		if err != nil {
-			slog.Warn("failed to reconcile proxy ARP", "err", err)
-		}
+		ifaceMap = proxyARPIfaceMap(cfg)
+	}
+
+	// Always run the reconcile: even with zero configured entries it sweeps the
+	// orphaned NTF_PROXY entries on the prior interfaces (desired is empty
+	// there, so every entry found is stale and deleted) and returns a non-nil
+	// enabled set so the diff below tears down the sysctl.
+	added, enabled, err := proxyARPApplyFn(cfg, ifaceMap, priorIfaceMap)
+	if err != nil {
+		slog.Warn("failed to reconcile proxy ARP", "err", err)
 	}
 
 	// #2475 teardown: disable the per-interface proxy responder sysctl on every

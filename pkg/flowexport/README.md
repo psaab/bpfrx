@@ -691,6 +691,44 @@ group; emitted before the dataplane gate — exporters are control-plane). A
 climbing `dropped_total`, or a sustained nonzero `depth`, is the operator
 signal that the export drain cannot keep up.
 
+## Retirement handoff admission lease (#4963)
+
+`#3742` publishes the new exporter bundle BEFORE tearing the old generation
+down, so the swap window itself never drops a record. But the session-close
+callback loads the live bundle (`d.flowBundle.Load()`) and only *then* iterates
+its groups calling `ExportSessionClose` → `flowBatch.add`. A callback that
+loaded the OLD bundle *just before* the reconcile's `Store` could still call
+`add` **after** the old exporter's `Run` did its FINAL `flushBatches` on ctx
+cancel and returned. That late record was appended into a batch nothing would
+ever drain again — permanently stranded, while every queue/collector metric
+looked healthy. `#3742` fixed the swap window; this is the loaded-old-bundle
+residual.
+
+Each `flowBatch` now carries an **allocation-free admission lease**: `add`
+increments an atomic `inflight` counter, then checks a `retired` flag. On
+teardown the daemon calls `Exporter.Retire()` / `IPFIXExporter.Retire()`
+(`flowBatch.retire`) on the OLD generation **after** publishing the new bundle
+and **before** cancelling `Run`. `retire` sets `retired` then spins until
+`inflight` drains — so any `add` that had already passed the gate finishes
+appending and is still drained by the final flush (the record is NOT lost). An
+`add` that arrives after `retired` is set is **rejected and counted** in a
+distinct `handoffDropped` counter (separate from the `#3747` capacity
+`Dropped`) instead of being silently stranded. `sync/atomic` sequential
+consistency guarantees the ordering: an `add` that observes `retired==false`
+was sequenced before `retire`'s `Store(true)`, so its `inflight++` is visible to
+the drain loop, which then waits for it.
+
+Because a retired exporter leaves the live bundle immediately, its per-exporter
+`handoffDropped` would become unreadable through `FlowExportBatchStats`. Each
+exporter is therefore also injected (`SetHandoffCounter`) with a pointer to one
+**fixed-cardinality per-family** counter on the daemon
+(`flowHandoffDropped` / `ipfixHandoffDropped`); `add` increments both on a
+reject. The per-exporter value is surfaced on live exporters via
+`ExporterBatchStats.HandoffDropped`, and the family totals via
+`Daemon.FlowExportHandoffDropped()`. A nonzero family total is the
+operator-visible signal that day-2 flow-export reconciles are losing close
+records at handoff — the failure that used to be completely silent.
+
 ## Export-pipeline resiliency (#4423)
 
 Three hardening fixes to the exporter goroutine and its sysUptime clock.

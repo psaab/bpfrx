@@ -545,20 +545,37 @@ func (c *ctl) showConfigHelp() {
 	cmdtree.WriteHelp(os.Stdout, cmdtree.HelpCandidates(cmdtree.ConfigTopLevel))
 }
 
+// completionCursor derives the CompleteRequest cursor fields from a readline
+// (line, pos) pair. readline reports pos as a RUNE index into the rune slice,
+// but the server's Complete interprets CompleteRequest.Pos as a BYTE offset
+// into CompleteRequest.Line (it does text[:req.Pos]). Send the byte length of
+// the prefix so the two units agree even when the prefix holds multibyte runes.
+//
+// Sending the rune index made pos < len(prefixBytes) whenever a multibyte rune
+// preceded the cursor, so the server re-sliced req.Line mid-rune and corrupted
+// the token being completed (#4970). Because text is already the prefix up to
+// the cursor, its byte length equals len(text) and the server's guard
+// (int(req.Pos) < len(text)) is then false — it never re-slices. This matches
+// the `?` help listener in main.go, which already sends int32(len(text)).
+func completionCursor(line []rune, pos int) (string, int32) {
+	text := string(line[:pos])
+	return text, int32(len(text))
+}
+
 func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	if rc.helpWritten {
 		rc.helpWritten = false
 		return nil, 0
 	}
 
-	text := string(line[:pos])
+	text, cursor := completionCursor(line, pos)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	resp, err := rc.ctl.client.Complete(ctx, &pb.CompleteRequest{
 		Line:       text,
-		Pos:        int32(pos),
+		Pos:        cursor,
 		ConfigMode: rc.ctl.configMode,
 	})
 	if err != nil || len(resp.Candidates) == 0 {
