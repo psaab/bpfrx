@@ -120,9 +120,19 @@ type Daemon struct {
 	dhcpLeaseSync  dhcpLeaseSyncState
 	ipsecSANudgeCh chan struct{} // nudge: peer (re)connect -> IPsec SA re-advertise (#4385)
 	feeds          *feeds.Manager
-	rpm            *rpm.Manager
-	rpmMu          sync.Mutex // serializes reconcileRPM callers (#1827)
-	activeRPMHash  [32]byte   // config-hash gate for RPM re-apply (#1827)
+	// feedsMu serializes reconcileFeeds callers and guards activeFeedsHash
+	// (#5036). d.feeds itself is constructed once at boot (unconditionally,
+	// even with no feed servers) and never reassigned, so its pointer is
+	// race-free; only the day-2 reconcile bookkeeping needs the lock.
+	feedsMu sync.Mutex
+	// activeFeedsHash is the config-hash gate for the day-2 feed reconcile
+	// (#5036): d.feeds.Apply (StopAll + restart) runs only when the feed-server
+	// configuration actually changes, so a feed CONTENT update (which re-enters
+	// applyConfig via onUpdate) does not thrash the refresh goroutines.
+	activeFeedsHash [32]byte
+	rpm             *rpm.Manager
+	rpmMu           sync.Mutex // serializes reconcileRPM callers (#1827)
+	activeRPMHash   [32]byte   // config-hash gate for RPM re-apply (#1827)
 	// rpmPinsFailed records that the last probe-pin install left at
 	// least one pin unprogrammed (#1895): the install is retried
 	// (without restarting probes) on hash-gated reconcileRPM calls AND

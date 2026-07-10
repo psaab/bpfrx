@@ -732,6 +732,18 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		setter.SetRouteOverlay(commitOverlay)
 	}
 
+	// 1.95. Reconcile the running dynamic-address feed-producer set against
+	// this config generation BEFORE reading its overlay (#5036). This is what
+	// makes a day-2 feed-server add/remove/edit take effect: the feed manager
+	// is constructed unconditionally at boot, and this hash-gated Apply starts
+	// the replacement producers (and joins removed ones) whenever the
+	// feed-server config changes. A feed CONTENT refresh leaves the hash
+	// unchanged, so it does not restart the fetchers. Must run before the
+	// SetFeedSnapshots overlay push below so the overlay reflects the
+	// reconciled generation (the fresh snapshot lands asynchronously and its
+	// onUpdate re-applies, exactly as at boot).
+	d.reconcileFeeds(cfg)
+
 	// 1.96. Refresh the dataplane's dynamic-address feed overlay from the
 	// feed manager BEFORE the full snapshot build (#2049). The feed manager
 	// fetches threat-feed/allowlist prefixes and its onUpdate callback
