@@ -258,7 +258,14 @@ func (c *CLI) testRouting(args []string) error {
 		entries, err = c.routing.GetRoutes()
 	}
 	if err != nil {
-		return fmt.Errorf("get routes: %w", err)
+		// A total failure (no entries: e.g. VRF not found, or every family's
+		// dump failed) stays fatal. A partial per-family failure still has a
+		// usable table — warn and continue the lookup rather than dropping it
+		// (#5125).
+		if len(entries) == 0 {
+			return fmt.Errorf("get routes: %w", err)
+		}
+		fmt.Printf("warning: partial route data (some address families unavailable): %v\n", err)
 	}
 
 	// Normalize dest to CIDR for matching
