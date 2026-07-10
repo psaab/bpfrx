@@ -152,6 +152,12 @@ type Server struct {
 	// dials the real peer; a unit test wires it to observe the forwarded
 	// request (x-peer-forwarded metadata) without a live peer.
 	peerZonePairSummaryFn func(ctx context.Context, req *pb.GetZonePairSummaryRequest) (*pb.GetZonePairSummaryResponse, error)
+	// peerSessionSummaryFn is the GetSessionSummary analog of
+	// peerZonePairSummaryFn (#5320). Production leaves it nil and
+	// proxyPeerSessionSummary dials the real peer; a unit test wires it to
+	// drive the peer_status classification (OK / UNREACHABLE / NOT_APPLICABLE)
+	// without a live peer.
+	peerSessionSummaryFn func(ctx context.Context) (*pb.GetSessionSummaryResponse, error)
 	// fabricAuthKeyFn is a test seam for the #4107 fabric-listener PSK auth.
 	// Production leaves it nil and fabricAuthKey() reads the live control-link
 	// key from the cluster manager; a unit test wires it to inject a key

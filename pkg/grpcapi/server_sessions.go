@@ -733,27 +733,75 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
 	}
 
-	// Fetch peer summary if requested and in cluster mode.
-	if req.GetIncludePeer() && s.cluster != nil && s.cluster.PeerAlive() {
-		conn, err := s.dialPeer()
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewBpfrxServiceClient(conn)
-			peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			// Do NOT set include_peer on the peer request — prevents recursion.
-			peerResp, err := client.GetSessionSummary(peerCtx, &pb.GetSessionSummaryRequest{})
-			if err != nil {
-				slog.Warn("failed to fetch peer session summary", "err", err)
-			} else {
-				resp.Peer = peerResp
-			}
-		} else {
-			slog.Warn("failed to dial peer for session summary", "err", err)
+	// max_sessions is the dataplane's dynamic session-table capacity (#5323):
+	// the live AF_XDP helper publishes worker_count x per-worker capacity. A
+	// dataplane with no userspace status surface leaves it 0 = unknown, so a
+	// consumer renders "unknown" rather than the old hardcoded 10000000.
+	if st, err := s.userspaceDataplaneStatus(); err == nil {
+		resp.MaxSessions = st.MaxSessions
+	}
+
+	// Fetch peer summary if requested (#5320). A peer-fetch failure is now
+	// classified as UNREACHABLE (visible incompleteness) instead of being
+	// logged and swallowed with peer=nil, which was indistinguishable from a
+	// healthy standalone node. The local totals are still returned — the local
+	// view is useful — but the response says whether it is complete.
+	if req.GetIncludePeer() {
+		peerResp, perr := s.proxyPeerSessionSummary(ctx)
+		switch {
+		case perr != nil:
+			slog.Warn("failed to fetch peer session summary", "err", perr)
+			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
+			resp.PeerError = perr.Error()
+		case peerResp != nil:
+			resp.Peer = peerResp
+			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_OK
+		default:
+			// (nil, nil): standalone node (NOT_APPLICABLE) or a clustered node
+			// whose peer heartbeat is currently lost (UNREACHABLE — a partition,
+			// not standalone).
+			resp.PeerStatus = s.peerAbsentStatus()
 		}
+	} else {
+		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
 	}
 
 	return resp, nil
+}
+
+// peerAbsentStatus classifies a (nil, nil) peer fetch (#5320): a genuinely
+// standalone node (no cluster manager) is NOT_APPLICABLE, while a cluster node
+// whose peer is currently not alive is UNREACHABLE — its summary is LOCAL-ONLY
+// and understates cluster-wide state, so the incompleteness must be visible.
+func (s *Server) peerAbsentStatus() pb.PeerFetchStatus {
+	if s.cluster != nil && !s.cluster.PeerAlive() {
+		return pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
+	}
+	return pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
+}
+
+// proxyPeerSessionSummary forwards a session-summary request to the cluster
+// peer for the include_peer fan-out (#5320), mirroring proxyPeerZonePairSummary.
+// A wired peerSessionSummaryFn (test seam) takes precedence; otherwise it dials
+// the peer only when one is alive, returning (nil, nil) for a standalone node /
+// dead peer so the caller can classify the absence. The forwarded request
+// carries include_peer=false so the peer answers from its local table without
+// recursing back.
+func (s *Server) proxyPeerSessionSummary(ctx context.Context) (*pb.GetSessionSummaryResponse, error) {
+	if s.peerSessionSummaryFn != nil {
+		return s.peerSessionSummaryFn(ctx)
+	}
+	if s.cluster == nil || !s.cluster.PeerAlive() {
+		return nil, nil
+	}
+	conn, err := s.dialPeer()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return pb.NewBpfrxServiceClient(conn).GetSessionSummary(peerCtx, &pb.GetSessionSummaryRequest{})
 }
 
 // GetZonePairSummary aggregates the local session table by (ingress-zone,
@@ -791,11 +839,21 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 	// peer only when one is alive; a unit test wires peerZonePairSummaryFn.
 	if req.GetIncludePeer() && !peerForwardedFromContext(ctx) {
 		peerResp, perr := s.proxyPeerZonePairSummary(ctx, &pb.GetZonePairSummaryRequest{})
-		if perr != nil {
+		switch {
+		case perr != nil:
+			// #5320: surface the failure (UNREACHABLE) instead of swallowing it
+			// with peer=nil, which looked like a healthy standalone breakdown.
 			slog.Warn("failed to fetch peer zone-pair summary", "err", perr)
-		} else if peerResp != nil {
+			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_UNREACHABLE
+			resp.PeerError = perr.Error()
+		case peerResp != nil:
 			resp.Peer = peerResp
+			resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_OK
+		default:
+			resp.PeerStatus = s.peerAbsentStatus()
 		}
+	} else {
+		resp.PeerStatus = pb.PeerFetchStatus_PEER_FETCH_STATUS_NOT_APPLICABLE
 	}
 
 	return resp, nil

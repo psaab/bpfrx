@@ -179,6 +179,28 @@ Maximum-sessions: 4194304
 - Sub-items indented 2 spaces (Valid/Pending/Invalidated/Other).
 - `Maximum-sessions: 4194304` (4M max on vSRX).
 
+### xpf implementation notes (#5323 / #5320)
+
+- **`Maximum-sessions` is DYNAMIC, not a fixed literal.** xpf renders the
+  live AF_XDP helper's `max_sessions` (worker_count x per-worker capacity,
+  131072/worker) taken from the userspace `ProcessStatus`. It replaces the
+  historical hardcoded `10000000` on both the remote CLI
+  (`cmd/cli/show_flow.go`, from `GetSessionSummaryResponse.max_sessions`) and
+  the local CLI (`pkg/cli/cli_show_flow.go`, from `userspaceDataplaneStatus()`).
+  When no dataplane status is available the value renders `unknown` rather than
+  a fabricated authoritative bound.
+- **Multicast/Failed/Services-offload counters stay `0`.** The AF_XDP helper
+  publishes no multicast/failed-session counters, so those Junos rows are
+  reported as `0` for format parity (documented follow-up, not authoritative).
+- **HA completeness (`include_peer`).** `GetSessionSummary` /
+  `GetZonePairSummary` and the REST `/api/v1/security/sessions/summary`
+  [`/zone-pairs`] endpoints now carry a machine-readable peer-fetch status
+  (`peer_status` = `ok` | `unreachable` | `not-applicable`, plus `peer_error`).
+  A cluster peer that is requested but unreachable is reported as `unreachable`
+  (the totals are LOCAL-ONLY) instead of being swallowed and returned as a
+  healthy-looking standalone view; the remote CLI prints a
+  `warning: cluster peer unreachable; counts above are LOCAL-ONLY` line.
+
 ---
 
 ## Security: Flow Statistics

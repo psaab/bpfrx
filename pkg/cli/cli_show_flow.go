@@ -561,7 +561,15 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Pending sessions: 0\n")
 		fmt.Printf("  Invalidated sessions: 0\n")
 		fmt.Printf("  Sessions in other states: 0\n")
-		fmt.Printf("Maximum-sessions: 10000000\n")
+		// #5323: render the dataplane's dynamic max (worker_count x per-worker
+		// capacity) from the live helper status, not the old hardcoded
+		// 10000000. If no userspace status is available (max 0), render
+		// "unknown" instead of a fabricated authoritative bound.
+		if st, err := c.userspaceDataplaneStatus(); err == nil && st.MaxSessions > 0 {
+			fmt.Printf("Maximum-sessions: %d\n", st.MaxSessions)
+		} else {
+			fmt.Printf("Maximum-sessions: unknown\n")
+		}
 
 		if count > 0 {
 			fmt.Printf("\nSession distribution:\n")
