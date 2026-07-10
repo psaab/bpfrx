@@ -509,7 +509,17 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		return nil
 	}
 
-	return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errNoError, 0, respVarbinds)
+	// Bound the GET/GETNEXT response to the effective maximum size, matching
+	// the GETBULK cap above (#4918). GET/GETNEXT carry a fixed 1:1
+	// varbind-per-request-OID contract that cannot be trimmed, so an oversized
+	// response is replaced with tooBig + an empty varbind list (RFC 3416
+	// §4.2.1/§4.2.2) rather than emitting an over-size datagram — the v3
+	// residual of #2612, which bounded only GETBULK.
+	resp := a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errNoError, 0, respVarbinds)
+	if len(resp) > effectiveMaxSize(msgMaxSize) {
+		return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errTooBig, 0, nil)
+	}
+	return resp
 }
 
 // verifyAuth checks the HMAC authentication of a v3 message.
