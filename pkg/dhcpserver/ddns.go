@@ -45,10 +45,13 @@ type DDNSOwnedRecordView = ddns.OwnedRecordView
 // keaLeaseParser adapts the package-local Kea-memfile parser
 // (parseActiveLeases, in ddns_leases.go) to the ddns.LeaseParser seam,
 // converting each full memfile ddnsLease into the reconcile-relevant
-// ddns.Lease view. The v6 lease-type / prefix-len fields the lease-sync
-// fallback needs are NOT part of the DDNS reconcile contract, so they are
-// dropped at this boundary (exactly as the engine read the ddnsLease before
-// the move — it only ever used these fields).
+// ddns.Lease view. The prefix-len field the lease-sync fallback needs is not
+// part of the DDNS reconcile contract, so it is dropped at this boundary. The
+// v6 lease_type discriminator IS carried through (#5072): the reconciler must
+// distinguish an IA_PD delegated-prefix base from an address lease so it never
+// publishes an AAAA/PTR for a delegated network base. A present-but-unparseable
+// lease_type (LeaseTypeOK == false) is mapped to ddns.LeaseTypeUnknown so it is
+// rejected fail-closed instead of defaulting to an address type.
 func keaLeaseParser(path string, family int, now time.Time) ([]ddns.Lease, error) {
 	leases, err := parseActiveLeases(path, family, now)
 	if err != nil {
@@ -56,6 +59,17 @@ func keaLeaseParser(path string, family int, now time.Time) ([]ddns.Lease, error
 	}
 	out := make([]ddns.Lease, 0, len(leases))
 	for _, l := range leases {
+		leaseType := ddns.LeaseTypeIANA // v4 and v6-without-column: address lease
+		if l.Family == 6 {
+			if l.LeaseTypeOK {
+				// keaLeaseType{IANA,IATA,IAPD} share Kea's numeric values with
+				// ddns.LeaseType{IANA,IATA,IAPD}; carry the raw type. An
+				// unrecognized numeric value fails the reconciler's allowlist.
+				leaseType = l.LeaseType
+			} else {
+				leaseType = ddns.LeaseTypeUnknown
+			}
+		}
 		out = append(out, ddns.Lease{
 			Family:     l.Family,
 			Address:    l.Address,
@@ -63,6 +77,7 @@ func keaLeaseParser(path string, family int, now time.Time) ([]ddns.Lease, error
 			SubnetID:   l.SubnetID,
 			HostName:   l.HostName,
 			ClientFQDN: l.ClientFQDN,
+			LeaseType:  leaseType,
 		})
 	}
 	return out, nil
