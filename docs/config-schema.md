@@ -66,6 +66,18 @@ code-motion split — every `(compiler_validate_strict.go)` locator
 elsewhere in this document still names the correct, unchanged function, now
 in whichever sibling file holds it (grep the function name to find it).
 
+The lenient WARN side (`ValidateConfig(cfg *Config) []string`, aggregated on
+the same commit path but appending advisories instead of failing) got the
+same treatment in #4845: the former ~3.6k-LOC `compiler_validate_warn.go`
+monolith was split by domain into sibling files
+(`compiler_validate_warn_{host_inbound,routing,firewall,ddns,cos}.go`),
+mirroring the strict layout. The residual `compiler_validate_warn.go` keeps
+`ValidateConfig` itself (the dispatcher) plus the generic helpers it calls
+inline (NAT `sortedPoolNames` / `deterministic*Enforced`,
+`schedulerHasEffectiveWindow`, `anySamplingDirectionConfigured`). It was a
+pure code-motion split with byte-identical bodies — grep the function name to
+find its current file.
+
 Each gate is a hand-wired `if err := validate<X>Strict(cfg); err != nil {
 ... }` line in `runUniformGates` (`compiler_uniformgates.go`) / `compiler.go`.
 Adding a gate function without adding that invocation line leaves it DEAD —
