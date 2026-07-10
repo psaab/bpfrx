@@ -11,21 +11,47 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
-// #709 + #869: single Status() call per scrape, then dispatch to
-// CoS owner profile + worker runtime collectors.  Both features need
-// the same ProcessStatus; calling Status() twice per scrape is
-// wasteful on the userspace-dp control socket.
-func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
+// fetchUserspaceStatus performs the SINGLE per-scrape userspace-dp control-
+// socket Status() round trip whose result is shared by every collector that
+// consumes it (collectFilterCounters + collectUserspaceStatus). #5317: before
+// this each of those collectors issued its own Status() request, so one
+// /metrics scrape did two serialized `status` RPCs on the control socket —
+// doubling contention with session installs during bulk sync (CLAUDE.md
+// "Control socket contention"). Fetching once also gives both metric families a
+// COHERENT snapshot instead of two A/B-skewed reads.
+//
+// Returns nil when the dataplane does not expose a Status() surface OR the
+// round trip failed. Both collectors degrade to their prior no-status behavior
+// on nil — collectFilterCounters skips the userspace merge (empty term index,
+// map path unaffected), collectUserspaceStatus emits nothing — identical to when
+// each fetched Status() itself.
+func fetchUserspaceStatus(dp apiRuntimeDataPlane) *dpuserspace.ProcessStatus {
 	provider, ok := dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
-		return
+		return nil
 	}
 	status, err := provider.Status()
 	if err != nil {
+		return nil
+	}
+	return &status
+}
+
+// #709 + #869: single Status() call per scrape, then dispatch to
+// CoS owner profile + worker runtime collectors.  Both features need
+// the same ProcessStatus; calling Status() twice per scrape is
+// wasteful on the userspace-dp control socket. #5317: the round trip is
+// now performed ONCE by Collect (via fetchUserspaceStatus) and the snapshot
+// passed in here, shared with collectFilterCounters — a nil pointer means the
+// helper exposes no Status() surface or the single round trip failed, so this
+// collector emits nothing (the prior status-error behavior).
+func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, statusPtr *dpuserspace.ProcessStatus) {
+	if statusPtr == nil {
 		return
 	}
+	status := *statusPtr
 	c.emitCoSOwnerProfile(ch, status)
 	c.emitCoSDrainPhaseTelemetry(ch, status)
 	c.emitCoSParkReasonTelemetry(ch, status)

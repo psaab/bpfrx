@@ -40,7 +40,7 @@ func newFilterStore(t *testing.T, setLines []string) *configstore.Store {
 func filterHitsByTerm(t *testing.T, c *xpfCollector, dp apiRuntimeDataPlane) map[string]float64 {
 	t.Helper()
 	ch := make(chan prometheus.Metric, 64)
-	c.collectFilterCounters(ch, dp)
+	c.collectFilterCounters(ch, dp, fetchUserspaceStatus(dp))
 	close(ch)
 	out := map[string]float64{}
 	for m := range ch {
