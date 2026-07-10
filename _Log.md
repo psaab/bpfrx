@@ -1,3 +1,26 @@
+## 2026-07-09 — #4888 configstore: encrypted-envelope with unknown/future `format` fell through as plaintext and empty-loaded instead of failing closed
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4888 (fail-open, security-adjacent). `unmarshalEnvelope`
+  returned (ok=false, err=nil) for ANY body whose `format` was not the
+  current `xpf-master-password-v1`, so `maybeDecryptTreeJSON` handed the
+  raw bytes back as plaintext; `readTreeMeta` then `json.Unmarshal`'d an
+  envelope-shaped body (future format / corruption) into a `ConfigTree`,
+  dropping the unknown `format`/`prf`/`salt`/`nonce`/`data` fields and
+  yielding an EMPTY tree — so `Store.Load` booted a committed-empty config
+  instead of `ErrConfigDBUnreadable`. Fix: fail CLOSED on an
+  envelope-shaped body with an unknown/future `format` OR AES-GCM fields
+  present without the current format; only a body with no format AND no
+  AES-GCM fields passes through as genuine plaintext (verified the legacy
+  no-envelope + current-format paths still pass). ConfigTree JSON is
+  `{"Children":[...]}` — no top-level format/salt/nonce/data — so the
+  plaintext discriminator cannot false-positive. Added a unit test on the
+  `unmarshalEnvelope` contract + an end-to-end `Store.Load` ->
+  `ErrConfigDBUnreadable` test; both RED on revert.
+  **File(s)**: pkg/configstore/crypto.go,
+  pkg/configstore/crypto_envelope_unknown_format_4888_test.go,
+  pkg/configstore/README.md
+
 ## 2026-07-09 — #4882 userspace-dp: debug BPF session dump used `core::ptr::read` (align 2) on a `Vec<u8>` (align 1) — UB; use `read_unaligned`
 
 - **Timestamp**: 2026-07-09
