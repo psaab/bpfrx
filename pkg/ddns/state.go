@@ -391,14 +391,6 @@ func loadDDNSState(path string) (*ddnsState, error) {
 	// the stale DNS RR oscillated, uncleanable. Fail closed here (quarantine the
 	// store, like a JSON-corrupt or bad-version file) so a malformed address is
 	// never trusted or acted on.
-	// Semantic validation (#4909): valid-JSON, valid-version is NOT enough. A
-	// record whose textual address does not parse is corrupt in a way the
-	// reconciler cannot recover — deleteOwnedLocked cannot reconstruct the exact
-	// wire RR, so it silently dropped the in-memory entry WITHOUT a wire delete
-	// AND without persisting; the malformed record then reloaded on restart and
-	// the stale DNS RR oscillated, uncleanable. Fail closed here (quarantine the
-	// store, like a JSON-corrupt or bad-version file) so a malformed address is
-	// never trusted or acted on.
 	for _, r := range f.Records {
 		if err := validOwnedRecordAddrs(r); err != nil {
 			s.records = map[string]ownedRecord{}
