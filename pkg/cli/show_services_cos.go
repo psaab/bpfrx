@@ -76,9 +76,13 @@ func (c *CLI) showClassOfServiceInterface(selector string) error {
 // Gap 7) from the live userspace CoS runtime snapshot.
 func (c *CLI) showInterfacesQueue(selector string) error {
 	var status *dpuserspace.ProcessStatus
-	if userspaceStatus, err := c.userspaceDataplaneStatus(); err == nil {
+	userspaceStatus, statusErr := c.userspaceDataplaneStatus()
+	if statusErr == nil {
 		status = &userspaceStatus
 	}
-	fmt.Print(dpformat.FormatInterfacesQueue(status, selector))
+	// Pass the fetch error through so a failed status retrieval renders as an
+	// explicit error, not "No class-of-service queues active" (#5326): a nil
+	// status must not conflate "unreachable" with "empty".
+	fmt.Print(dpformat.FormatInterfacesQueue(status, statusErr, selector))
 	return nil
 }

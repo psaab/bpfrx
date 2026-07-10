@@ -30,6 +30,16 @@ userspace status) — with no dataplane change:
   (`QueuedPackets/Bytes`, `DrainSentBytes`, the admission-drop counters).
   Optional interface filter; a physical-name selector (`ge-0-0-2`)
   matches the unit-qualified runtime label (`ge-0-0-2.80`).
+  `FormatInterfacesQueue` distinguishes three states so operator
+  uncertainty is never laundered into "no CoS" (#5326): (1) a status
+  *fetch error* (helper down, control socket unavailable, decode error)
+  renders `error retrieving class-of-service queue status: <err>` — the
+  CoS runtime state is UNKNOWN, not empty; (2) a successful but empty
+  snapshot renders the legitimate `No class-of-service queues active`;
+  (3) a successful non-empty snapshot renders the per-queue counters.
+  Callers (`pkg/cli` and the gRPC `ShowText` path) pass the status
+  *error* through to the formatter — a nil status must not conflate
+  "unreachable" with "empty".
 - `show class-of-service classifier [name <n>] [type <dscp|ieee-802.1>]`
   — the configured classifiers, rendering the code point as 6-bit binary
   (DSCP) or 3-bit binary (802.1p PCP), with forwarding-class and loss
