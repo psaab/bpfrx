@@ -1,3 +1,21 @@
+## 2026-07-10 — ddns: resolve bind interface/routing-instance to kernel device (#5070)
+
+- **Timestamp**: 2026-07-10
+  - **Action**: #5070 fix — `resolveBindConfig` stored the RAW
+    `RoutingInstance` / `DestinationInterface` into `bindDevice` and passed it
+    verbatim to `SO_BINDTODEVICE`, targeting a nonexistent kernel device (VRF
+    master is `vrf-<name>`; Junos `ge-0/0/2.50` is kernel `ge-0-0-2.50`). Now
+    resolve a destination-interface through `config.LinuxIfName` and a
+    routing-instance through `diagcmd.VRFDeviceName` (canonical resolvers, no
+    hand-rolled strings). Added `bindConfig.validateDevice()` (injectable
+    `netlink.LinkByName` seam) called by `newRFC2136Updater` to surface a clear
+    construction-time error when the resolved device is absent. Rewrote the two
+    bug-encoding tests (`VRF-WAN`/`ge-0-0-2` raw pass-through) and added a
+    resolution table (physical/vlan/reth/ri) + the existence-check test.
+    RED-on-revert proven. `_Log`, README updated.
+  - **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_rfc2136.go,
+    pkg/ddns/backend_bind_test.go, pkg/ddns/README.md, _Log.md
+
 ## 2026-07-10 — upgrade: wire real helper-readiness gate at cutover (#5286)
 
 - **Timestamp**: 2026-07-10

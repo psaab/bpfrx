@@ -393,6 +393,26 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   `SO_BINDTODEVICE` for the interface/VRF, working for both the UDP-first and
   TCP-retry exchange). Fail-open at runtime; an invalid source-address falls the
   family back to no-op.
+- **Bind-device kernel-name resolution (#5070, `resolveBindConfig`)** —
+  `SO_BINDTODEVICE` needs the REAL kernel device name, not the Junos config
+  token. A `destination-interface` is a Junos interface name (e.g.
+  `ge-0/0/2.50`, slashes + unit); the daemon renames the kernel device to the
+  slash-substituted form (`ge-0-0-2.50`), so it is resolved through the SAME
+  canonical translator the daemon uses, `config.LinuxIfName`. A
+  `routing-instance` is realized as the kernel VRF master device `vrf-<name>`
+  (pkg/routing), so it is resolved through `diagcmd.VRFDeviceName` — the single
+  source of truth for that prefix (applied exactly once, #2143; a name already
+  typed `vrf-red` is returned unchanged). `routingInst` retains the raw name for
+  informational use only. Before #5070 the raw token went straight to
+  `SO_BINDTODEVICE`, targeting a nonexistent device so every RFC 2136 /
+  HTTP-provider / check-IP exchange over the binding hard-failed at dial. The
+  RFC 2136 constructor now also VALIDATES the resolved device exists via
+  `bindConfig.validateDevice()` (an injectable `netlink.LinkByName` seam),
+  surfacing a clear construction-time error (`bind device %q does not exist`)
+  instead of a cryptic dial failure; a transiently-absent device is retried by
+  the resolve-per-Reconcile loop. The HTTP-provider and checkip paths get the
+  same deterministic resolution (they share `resolveBindConfig`) so their dial
+  error, if any, now names a real-form device.
 - **Dual-stack source-bind family gate (#2901, `sourceMatchesDialFamily`)** — the
   dialer's `Control` hook applies the `unix.Bind` source-bind **only when the
   source-address family matches the dial socket's address family** (keyed off the

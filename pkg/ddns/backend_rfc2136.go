@@ -254,6 +254,12 @@ func newRFC2136Updater(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig, client dn
 	if err != nil {
 		return nil, err
 	}
+	// #5070: fail construction with a clear error when the resolved bind device
+	// (kernel interface or vrf-<name> master) does not exist, rather than
+	// leaking a cryptic SO_BINDTODEVICE failure into every UPDATE dial later.
+	if err := bind.validateDevice(); err != nil {
+		return nil, err
+	}
 	if u.client == nil {
 		cl := &dns.Client{
 			Timeout:    u.timeout,
