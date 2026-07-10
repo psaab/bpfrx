@@ -86,7 +86,13 @@ func (c *CLI) showVlans() error {
 	}
 	var entries []vlanEntry
 	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #5068: tolerant/HA-sync path may carry a nil interface value
+			continue
+		}
 		for unitNum, unit := range ifc.Units {
+			if unit == nil { // #5068: nil unit value
+				continue
+			}
 			if unit.VlanID > 0 || ifc.VlanTagging {
 				// #5325: query with the SAME canonical "base.unit" key used
 				// when building ifZone; fall back to a base-only binding

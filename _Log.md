@@ -44755,3 +44755,42 @@ top.
 - **Timestamp**: 2026-07-10
   **Action**: #5069 [BUG cli DoS] `show log [<name>] N` (`showDaemonLog`, pkg/cli/cli_show_system.go) accepted any positive `int` operand with no upper cap and fed it straight into `tail -n N` (file path) / `journalctl -n N` (journald path), buffering the whole result via `CombinedOutput` before `fmt.Print`. A view-only (PermView) account could run `show log 1000000000` and force an O(retained-log-size) heap allocation + management stall — a resource-abuse/DoS vector. Fix: extracted a `parseShowLogCount(args, idx)` helper that defaults to 50, ignores non-positive/unparseable operands (Junos-compatible leniency), and clamps any N above `maxTailLines` (100,000 — the same operator line cap the `| last N` ring uses, #5037). Both `show log` paths now route their count through the helper, so the value handed to tail/journalctl is bounded regardless of the operand. Minimal + consistent with the existing #5037 clamp pattern in the same package. Fail-on-revert test `TestParseShowLogCountCap` (pkg/cli/cli_show_log_cap_5069_test.go) drives the pure helper across both arg indices (journald idx 0, file idx 1) asserting default/leniency plus over-cap clamp; a seam over the parse function means no real large log file is needed. RED-on-revert VERIFIED: temporarily removed the `if n > maxTailLines` clamp → the "1000000000"/"2000000000"/"100001" cases returned the raw operand (FAIL, "exceeds cap 100000"); restored → PASS. Docs: added a `## System: Log` section to docs/junos-cli-reference.md documenting the `show log [<name>] [N]` command, the allowlist restriction (#4860), the default-50 leniency, and the 100,000-line cap (#5069). Validation: `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0; `go test ./pkg/cli/... ./pkg/logging/...` ok; gofmt clean. No cluster smoke (control-plane CLI operand-bounding path, no forwarding effect).
   **File(s)**: pkg/cli/cli_show_system.go, pkg/cli/cli_show_log_cap_5069_test.go, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+  **Action**: #5068 [BUG cli DoS] the local CLI `show interfaces` presenter
+  family (terse / detail / extensive / `show vlans` / the summary walk) and
+  the interface-name + unit-number value-hint completers dereferenced
+  present-but-nil `InterfaceConfig` (`map[string]*InterfaceConfig`) and
+  `InterfaceUnit` (`map[int]*InterfaceUnit`) map values without a guard. Those
+  nil slots are admitted on the tolerant / HA-sync config path that the
+  compiler warn-pass already tolerates (compiler_validate_warn_nil_3494_test.go
+  codifies `"zz-nil-ifc": nil` and a nil `Units[N]`), so such a
+  persisted/synced config becomes ACTIVE. Rendering `show interfaces terse`
+  (or triggering interface-name value-hint completion) over it nil-derefed;
+  CLI.Run has no panic recovery, so the in-process xpfd exits — same family as
+  the fixed #3476/#3493/#3494 but a distinct unguarded map-value set. Fix:
+  mirrored the #5221/#3476 inline `if X == nil { continue }` pattern —
+  skip a nil interface value at every range-all loop and a nil unit value at
+  every unit loop; harden the keyed lookups (`ifCfg != nil` / `unit != nil`)
+  in terse's disable-flag + reth-address blocks and the summary walk's
+  vlan/DHCP lookups; guard both completion value-hints
+  (ValueHintInterfaceName / ValueHintUnitNumber). Scope held to the
+  `show interfaces` command family + interface completion (the named panic
+  surface); the sibling cluster/zones/session views that share the class are
+  out of scope for this issue. Fail-on-revert tests
+  (pkg/cli/cli_show_interfaces_nil_5068_test.go): inject a nil interface value,
+  a zone-referenced nil interface, and a nil unit into the live ActiveConfig
+  and drive terse/detail/extensive/vlans/summary + both completers, asserting
+  no panic. RED-on-revert VERIFIED: `git stash` of the six source guards (test
+  retained) → `nil pointer dereference` panic at cli_show_interfaces_terse.go
+  (FAIL); stash pop restored → PASS. Test note: detail/extensive use a
+  no-match filter (the nil-deref map-build loop runs before the name filter)
+  and each presenter gets its own captureStdout call so the os.Pipe
+  (drained only after the callback returns) can't overrun on a many-netdev
+  host. Docs: no operator-doc change — behavior for valid configs is
+  unchanged; this is internal tolerant-config robustness, matching the
+  #3476/#3494 precedent that added no doc. Validation:
+  `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0;
+  `go test ./pkg/cli/...` ok; gofmt clean. No cluster smoke (control-plane CLI
+  display path, no forwarding effect).
+  **File(s)**: pkg/cli/completion.go, pkg/cli/cli_show_interfaces_terse.go, pkg/cli/cli_show_interfaces_detail.go, pkg/cli/cli_show_interfaces_extensive.go, pkg/cli/cli_show_interfaces_stats.go, pkg/cli/cli_show_interfaces.go, pkg/cli/cli_show_interfaces_nil_5068_test.go, _Log.md

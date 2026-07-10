@@ -40,6 +40,9 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 			}
 		}
 		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil { // #5068: tolerant/HA-sync path may carry a nil interface value
+				continue
+			}
 			if ifc.Description != "" {
 				ifDescMap[ifc.Name] = ifc.Description
 			}
