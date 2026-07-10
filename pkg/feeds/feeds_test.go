@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -163,8 +164,11 @@ func TestMixedFeedDegradedStatus(t *testing.T) {
 	if !info.Degraded {
 		t.Error("Degraded = false despite a skipped invalid line; want true")
 	}
-	if len(info.InvalidSample) != 1 || info.InvalidSample[0] != "not-an-ip" {
-		t.Errorf("InvalidSample = %v, want [not-an-ip]", info.InvalidSample)
+	// #4922: the retained sample entry is an escaped (quoted) prefix, not the
+	// verbatim line. A short line is quoted-but-otherwise-intact.
+	wantSample := strconv.Quote("not-an-ip")
+	if len(info.InvalidSample) != 1 || info.InvalidSample[0] != wantSample {
+		t.Errorf("InvalidSample = %v, want [%s]", info.InvalidSample, wantSample)
 	}
 }
 

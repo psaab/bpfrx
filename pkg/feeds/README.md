@@ -80,7 +80,7 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   mixes valid prefixes with malformed lines still installs the valid prefixes
   (a clean body is bit-identical to before), but the skipped invalid lines are
   no longer *silent*: `parseFeed` counts every malformed (non-comment, non-CIDR,
-  non-IP) line and keeps a bounded verbatim sample (`maxInvalidSample`, 5).
+  non-IP) line and keeps a bounded sample (`maxInvalidSample`, 5).
   `FeedInfo` surfaces `InvalidLines`, `InvalidSample`, and `Degraded`
   (`InvalidLines > 0`); `show security dynamic-address` prints a `DEGRADED`
   line. A degraded install logs one `slog.Warn` on the content change (not every
@@ -90,6 +90,24 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   published feed instead of it reporting a clean success. The markers are
   cleared when a later clean body installs, and on a `hold-interval`
   drop-to-empty.
+- **the invalid-line sample is byte-bounded, not just count-bounded (#4922).**
+  The scanner admits a malformed line up to `maxLineBytes` (1 MiB), so the
+  pre-#4922 code — which retained the first 5 offenders *verbatim* — let one
+  feed pin ~5 MiB of garbage in memory (kept in `feedState`, deep-copied by
+  `AllFeeds`) and emit multi-MB `slog.Warn` records on the degraded warning, all
+  within the advertised feed limits. Each retained sample entry is now bounded
+  at the retention point (in `parseFeed`, so `installSnapshot`/`AllFeeds`/the
+  `slog.Warn` all inherit the bounded form): the offending line is truncated to
+  its first `maxInvalidSampleBytes` (256) raw bytes, `strconv.Quote`-escaped so
+  NULs / control bytes / newlines / invalid UTF-8 render as printable `\x..`
+  escapes (never raw control bytes into a log or CLI show), and a truncated line
+  is annotated with its **original byte length** (`… (<n> bytes total)`) so an
+  operator can still triage "line was 1 MiB, starts with `<prefix>`" without
+  retaining the whole thing. A short line (< the cap) is retained
+  quoted-but-otherwise-intact. A per-entry ceiling (`maxInvalidSampleEntryBytes`)
+  and an aggregate budget (`maxInvalidSampleTotalBytes`, the count cap × the
+  per-entry cap) are the hard ceilings; the existing count bound (5) and
+  changed-degraded-only logging are unchanged.
 
 `FeedInfo` carries additive status fields (`LastSuccess`, `LastError`,
 `StaleSince`, `Hash`) alongside the legacy `URL`/`Prefixes`/`LastFetch`.
@@ -114,9 +132,13 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 - Feed bodies are parsed line-by-line, one CIDR per line. Comment lines
   (`#`, `//`) and blanks are skipped silently. A malformed non-comment line
   is skipped but **counted** (`InvalidLines`/`InvalidSample`, marks the feed
-  `Degraded`, #2993) — it is no longer a silent drop. A *scanner-level* error
-  (overlong line / read error) is NOT skipped: it fails the whole fetch
-  (retain last-good).
+  `Degraded`, #2993) — it is no longer a silent drop. Each `InvalidSample`
+  entry is a byte-bounded, `strconv.Quote`-escaped prefix (≤
+  `maxInvalidSampleBytes` raw bytes) plus the original byte length, NOT the
+  verbatim line (#4922) — so a hostile provider serving near-1-MiB malformed
+  lines cannot pin megabytes in memory or emit multi-MB log records. A
+  *scanner-level* error (overlong line / read error) is NOT skipped: it fails
+  the whole fetch (retain last-good).
 - A successful fetch always replaces the snapshot and stamps success, but
   the `onUpdate` recompile fires only when the canonical content hash
   changes — not on every fetch and not merely on a count change.

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,9 +35,42 @@ const maxLineBytes = 1 << 20 // 1 MiB
 
 // maxInvalidSample bounds how many distinct malformed lines are retained for
 // operator display (#2993). A degraded feed records the total invalid-line
-// count plus a small verbatim sample so an operator can identify the bad lines
-// without the sample growing unbounded for a wholesale-garbage body.
+// count plus a small sample so an operator can identify the bad lines without
+// the sample growing unbounded for a wholesale-garbage body. This is a COUNT
+// bound; each retained entry is additionally BYTE-bounded (see
+// maxInvalidSampleBytes, #4922).
 const maxInvalidSample = 5
+
+// maxInvalidSampleBytes caps the RAW byte prefix of a single malformed line
+// retained in the sample (#4922). A malformed line may be up to maxLineBytes
+// (1 MiB) long; the pre-#4922 code appended the whole line VERBATIM, so a
+// hostile/broken provider serving near-1-MiB malformed lines could pin ~5 MiB
+// of garbage in memory (retained in feedState, deep-copied by AllFeeds) and emit
+// multi-MB slog records on the degraded-feed warning — all within the advertised
+// feed limits. We now keep only the first maxInvalidSampleBytes bytes of each
+// offending line, escaped to a printable form, plus its true byte length, so an
+// operator can still triage "line was 1 MiB, starts with <prefix>" without
+// retaining the whole thing.
+const maxInvalidSampleBytes = 256
+
+// maxInvalidSampleEntryBytes is the HARD per-entry ceiling on a retained sample
+// string AFTER escaping + length annotation (#4922). strconv.Quote can expand
+// each raw byte to a 4-char \xNN escape, so a maxInvalidSampleBytes-byte prefix
+// quotes to at most 4*maxInvalidSampleBytes+2 chars; the truncation annotation
+// (" … (<n> bytes total)") adds a small bounded suffix. This constant is the
+// assertion anchor for the #4922 fail-on-revert test and the defensive final
+// clamp in boundInvalidSample.
+const maxInvalidSampleEntryBytes = 4*maxInvalidSampleBytes + 64
+
+// maxInvalidSampleTotalBytes is a belt-and-suspenders ceiling on the SUM of the
+// retained sample entry lengths across all maxInvalidSample entries (#4922).
+// The per-entry cap already bounds each string; this aggregate budget is a live
+// second guard so even a future change that loosens the per-entry cap cannot
+// grow the retained sample without bound. In the current tuning it equals the
+// count cap times the per-entry cap, so the worst legitimate case (5 fully
+// escaped 256-byte prefixes) fits exactly and the gate degrades gracefully only
+// if the per-entry cap is later raised.
+const maxInvalidSampleTotalBytes = maxInvalidSample * maxInvalidSampleEntryBytes
 
 // maxFeedBodyBytes caps the total HTTP response body a single feed fetch will
 // buffer (#3934). Without a cap, a feed server that returns a huge (or
@@ -93,8 +127,10 @@ type feedState struct {
 	// valid + invalid lines: the valid prefixes are installed but the skipped
 	// invalid lines are no longer silent. invalidLines counts every malformed
 	// line in the last successfully-installed body; invalidSample keeps up to
-	// maxInvalidSample verbatim offenders for display. Both are zero/nil for a
-	// clean body (no behaviour change) and are cleared on a drop-to-empty.
+	// maxInvalidSample offenders for display, each a byte-bounded, escaped
+	// prefix + length annotation (#4922), NOT the verbatim line. Both are
+	// zero/nil for a clean body (no behaviour change) and are cleared on a
+	// drop-to-empty.
 	invalidLines  int
 	invalidSample []string
 
@@ -421,8 +457,10 @@ type FeedInfo struct {
 
 	// Parse-quality of the installed snapshot (#2993). InvalidLines is the
 	// number of malformed lines skipped while parsing the last
-	// successfully-installed body; InvalidSample is a bounded verbatim sample
-	// of those lines. Degraded is true when InvalidLines > 0 — the feed
+	// successfully-installed body; InvalidSample is a bounded sample of those
+	// lines — each entry is a byte-bounded, escaped prefix plus the original
+	// line's byte length (#4922), safe to print (no raw control bytes) and never
+	// the full verbatim line. Degraded is true when InvalidLines > 0 — the feed
 	// installed a PARTIAL set (some published lines were dropped), which an
 	// operator should investigate even though valid prefixes are enforced.
 	InvalidLines  int
@@ -454,8 +492,8 @@ type fetchResult struct {
 	hash     [32]byte
 
 	// invalidLines counts malformed lines skipped during parse; invalidSample
-	// holds up to maxInvalidSample verbatim offenders (#2993). A clean body
-	// leaves both zero/nil.
+	// holds up to maxInvalidSample byte-bounded, escaped offenders (#2993,
+	// byte-bounded in #4922). A clean body leaves both zero/nil.
 	invalidLines  int
 	invalidSample []string
 }
@@ -533,6 +571,7 @@ func parseFeed(r io.Reader) (fetchResult, error) {
 	var prefixes []string
 	var invalidLines int
 	var invalidSample []string
+	var invalidSampleBytes int // running total of retained sample-entry lengths (#4922)
 	// Cap the total bytes buffered. Read one byte past the cap so a body that
 	// exactly fills the cap is accepted while anything larger is detected.
 	cr := &countingReader{r: io.LimitReader(r, maxFeedBodyBytes+1)}
@@ -560,9 +599,21 @@ func parseFeed(r io.Reader) (fetchResult, error) {
 			// skip it (the published valid prefixes are installed), but it is no
 			// longer silent: count it and keep a bounded sample so the fetch is
 			// observably degraded rather than reporting a clean success.
+			//
+			// #4922: retain only a BYTE-bounded, escaped prefix of each offender
+			// (not the verbatim line, which the scanner admits up to
+			// maxLineBytes = 1 MiB). Bounding here, at the retention point, means
+			// installSnapshot, AllFeeds' deep copy, and the degraded-feed
+			// slog.Warn all inherit the small, safe form — a hostile provider
+			// serving near-1-MiB garbage lines can no longer pin megabytes in
+			// memory or emit multi-MB log records. Both a COUNT cap
+			// (maxInvalidSample) and an aggregate BYTE budget
+			// (maxInvalidSampleTotalBytes) gate the append.
 			invalidLines++
-			if len(invalidSample) < maxInvalidSample {
-				invalidSample = append(invalidSample, line)
+			if len(invalidSample) < maxInvalidSample && invalidSampleBytes < maxInvalidSampleTotalBytes {
+				entry := boundInvalidSample(line)
+				invalidSample = append(invalidSample, entry)
+				invalidSampleBytes += len(entry)
 			}
 		}
 		// Entry cap: bail as soon as the parsed set exceeds the per-feed limit
@@ -597,6 +648,39 @@ func parseFeed(r io.Reader) (fetchResult, error) {
 		invalidLines:  invalidLines,
 		invalidSample: invalidSample,
 	}, nil
+}
+
+// boundInvalidSample renders a malformed feed line into the small, safe form
+// retained for the degraded-feed sample (#4922). It:
+//
+//   - truncates the line to at most maxInvalidSampleBytes RAW bytes,
+//   - escapes the (possibly truncated) prefix with strconv.Quote so NUL,
+//     newline, control bytes, and invalid UTF-8 become printable \x.. / \n
+//     escapes — never raw control bytes into a slog record or a CLI show,
+//   - annotates a truncated line with its ORIGINAL byte length so an operator
+//     can still see "this line was 1 MiB, starts with <prefix>".
+//
+// A short line (< the byte cap) is returned quoted-but-otherwise-intact, so the
+// diagnostic value for the common stray-text case is preserved. A final
+// defensive clamp guarantees the result never exceeds maxInvalidSampleEntryBytes
+// even if strconv.Quote's expansion is looser than assumed; the clamp keeps the
+// string printable (it only trims already-escaped ASCII).
+func boundInvalidSample(line string) string {
+	orig := len(line)
+	prefix := line
+	truncated := false
+	if orig > maxInvalidSampleBytes {
+		prefix = line[:maxInvalidSampleBytes]
+		truncated = true
+	}
+	out := strconv.Quote(prefix)
+	if truncated {
+		out = fmt.Sprintf("%s … (%d bytes total)", out, orig)
+	}
+	if len(out) > maxInvalidSampleEntryBytes {
+		out = out[:maxInvalidSampleEntryBytes]
+	}
+	return out
 }
 
 // canonicalize dedups and sorts the prefix list. Input prefixes are already in
