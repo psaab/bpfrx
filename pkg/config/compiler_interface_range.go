@@ -275,9 +275,19 @@ func expandMemberRange(rangeName string, toks []string) ([]string, []string) {
 			"interfaces interface-range %s: member-range %s to %s exceeds %d interfaces; ignored",
 			rangeName, start, end, interfaceRangeMaxMembers)}
 	}
-	out := make([]string, 0, en-sn+1)
-	for i := sn; i <= en; i++ {
-		out = append(out, fmt.Sprintf("%s%d", sp, i))
+	// Iterate on the bounded COUNT, not the raw endpoint. The cap above
+	// guarantees n = en-sn is in [0, interfaceRangeMaxMembers), so the loop
+	// variable k stays small and can never approach the point where k++
+	// overflows int64. Forming names as sn+k still yields exactly sn..en
+	// (sn+n == en, and every sn+k <= en <= MaxInt64 is overflow-free).
+	// Looping on `i` up to `en` instead overflowed when en == MaxInt64: the
+	// body ran at i == MaxInt64, then i++ wrapped to MinInt64, i <= en
+	// stayed true, and the loop appended forever (#5373 infinite loop / OOM,
+	// reachable at commit AND on the tolerant / HA config-sync load path).
+	n := en - sn
+	out := make([]string, 0, n+1)
+	for k := 0; k <= n; k++ {
+		out = append(out, fmt.Sprintf("%s%d", sp, sn+k))
 	}
 	return out, nil
 }
