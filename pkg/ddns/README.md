@@ -104,22 +104,36 @@ verb on any cadence is pointless. The terminal mark clears on a successful
 publish or a daemon restart (the runtime cache is rebuilt from the durable
 store), so a later provider change that adds a delete verb is re-probed.
 
-**Withdraw deletes the LIVE value, not a pending desired one (#5334).** A
-crash-left PENDING record (`PublishPending=true`, from a renumber A→B killed
-between the durable write-ahead save and the wire add, #5285) has an `AddrText`
-that holds the DESIRED value B which NEVER reached the provider, while the value
-truly live at the provider is the retained CONFIRMED prior A (`PriorAddrText`).
+**A pending withdraw deletes BOTH crash-window candidates (#5334).** A crash-left
+PENDING record (`PublishPending=true`, from a renumber A→B killed in the #5285
+window) persists the byte-identical shape `{AddrText=B, PriorAddrText=A}` for TWO
+different crash windows, and the pending bit cannot tell them apart:
+
+- **Window 1** — crash BETWEEN the durable write-ahead save (`publishLocked`) and
+  the wire add: B never reached the provider, so the CONFIRMED prior **A is still
+  live**.
+- **Window 2** — crash AFTER a SUCCESSFUL wire add but BEFORE the confirm-save
+  clears the pending bit: `sendAddSelfOwned` (backend_rfc2136.go) atomically
+  `Remove(A)`+`Insert(B)`, so **B is live** and A is gone.
+
 If such a record is withdrawn — the binding is removed while the appliance is
-down, then a restart's Pass-2 sweep tears the scope down — `withdrawOwnedLocked`
-now targets `PriorAddrText` (A) while pending, MIRRORING `publishLocked`, which
-already threads `PriorAddrText` (never the phantom `AddrText`) as the
-value-specific replace/cleanup target. The pre-#5334 code deleted `AddrText` (B)
-unconditionally, which removed a record that was never published and left the
-live prior A ORPHANED in public DNS while xpf reported the scope withdrawn. A
-PENDING FIRST publish (empty `PriorAddrText`) has nothing live at all — the wire
-delete is SKIPPED (deleting the never-published B would target a record that
-never existed) and only the on-disk ownership + runtime state are cleaned up, no
-error. Fail-on-revert: `surface_a_withdraw_pending_5334_test.go`.
+down, then a restart's Pass-2 sweep tears the scope down — deleting EITHER single
+value orphans the other window's live RR. So `withdrawOwnedLocked` (via
+`withdrawTargets`) issues a value-specific exact-RR delete of **both** `AddrText`
+AND `PriorAddrText` (deduplicated). This is safe because an exact-RR delete of a
+value that is NOT live is BENIGN — rfc2136 `sendRemove` maps `NXRrset`/`NameError`
+to success, and the host-granular backends (DuckDNS `clear=true`, dyndns2
+`offline=YES`) ignore the rdata entirely while the existing `SiblingFamilyOwned`
+suppression still guards a live sibling family (#3738). The both-delete therefore
+removes whichever value the crash left live and no-ops the other, so the "delete
+the actually-live value" invariant holds REGARDLESS of the window. The
+**non-pending** path is unchanged (delete `AddrText` only), and a PENDING FIRST
+publish (empty `PriorAddrText`) deletes its single candidate `AddrText` — the live
+B in window 2, a benign no-op in window 1 — never a skip (skipping it would orphan
+the window-2 live B, a strict regression). A per-candidate provider failure keeps
+ownership so the next reconcile retries every candidate (an already-deleted one is
+benign). Fail-on-revert: `surface_a_withdraw_pending_5334_test.go` (both a
+single-`AddrText` revert and a prefer-`PriorAddrText`/skip revert go RED).
 
 | backend | withdraw mechanism | per-family withdraw? |
 |---|---|---|
