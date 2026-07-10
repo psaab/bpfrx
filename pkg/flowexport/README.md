@@ -65,6 +65,23 @@ how often the heuristic is still in play. (Since #2501 the byte/packet
 **volume** counters are real too — the forward direction on the standard
 IANA counters and the reverse direction on the #3746 biflow reverse IEs.)
 
+**#4923 — the packet-count fallback can no longer overflow StartTime
+past EndTime.** `estimateSessionDuration` multiplies the uint64 packet
+count by a per-packet time (100ms TCP / 50ms otherwise); above ~92.2
+billion TCP packets (~184.5 billion non-TCP) that product overflowed
+signed `time.Duration` to a NEGATIVE value, and subtracting a negative
+duration from the record EndTime moved `StartTime` *after* EndTime —
+emitting first-switched after last-switched (NetFlow) / contradictory
+absolute milliseconds (IPFIX) that a collector may reject, exactly on
+the legacy / HA-recovery fallback paths. `estimateSessionDuration` now
+SATURATES at `maxEstimatedSessionAge` (366 days — a defensible session
+ceiling ~9e12 ns below the int64 nanosecond limit) so the estimate is
+always bounded and non-negative, and `flowStartTime` additionally clamps
+the fallback `StartTime` to the EndTime (mirroring the `Created` skew
+clamp) so `StartTime <= EndTime` holds no matter how the heuristic
+evolves. Only the pathological overflow regime changes; realistic packet
+counts keep the exact prior estimate.
+
 **#2853 — the flow StartTime keeps MILLISECOND resolution.** #2465's
 `created` field is integer Unix **seconds** (offset 108, u32), so every
 flow opened in the same wall-clock second exported the same StartTime —
