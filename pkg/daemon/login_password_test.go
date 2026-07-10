@@ -244,6 +244,26 @@ func TestRootAuthApplyBoundaryRevalidatesHash(t *testing.T) {
 	}
 	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
 
+	// applyRootAuth now drives reconcileUserPassword (name "root", UID 0) and
+	// records/reads a provenance marker + reconciles /root/.ssh — stage all of
+	// them at a throwaway tree so this apply-boundary test stays hermetic and
+	// never touches the real /etc/shadow, /var/lib/xpf, or /root/.ssh (#5276).
+	shadow := filepath.Join(dir, "shadow")
+	if err := os.WriteFile(shadow, []byte("root:$6$existing$hash:19000:0:99999:7:::\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	passwd := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(passwd, []byte("root:x:0:0:root:/root:/bin/bash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origShadow, origPasswd, origDir, origRoot := shadowPath, passwdPath, provisionedUsersDir, rootSSHDir
+	shadowPath, passwdPath = shadow, passwd
+	provisionedUsersDir = filepath.Join(dir, "provisioned-users")
+	rootSSHDir = filepath.Join(dir, "root-ssh")
+	t.Cleanup(func() {
+		shadowPath, passwdPath, provisionedUsersDir, rootSSHDir = origShadow, origPasswd, origDir, origRoot
+	})
+
 	d := &Daemon{}
 
 	// Invalid plaintext → no chpasswd.

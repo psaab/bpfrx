@@ -1180,9 +1180,12 @@ func writeSudoersGrant(user string) error {
 }
 
 // reconcileUserPassword applies, leaves, or locks a login user's OS
-// password per the declarative #1944 lifecycle. It runs inside
-// applySystemLogin (under the apply lock, so there is no marker/shadow
-// race) and never touches root (excluded by the applySystemLogin loop).
+// password per the declarative #1944 lifecycle. It runs under the apply lock
+// (so there is no marker/shadow race). It is keyed entirely on user.Name /
+// the account's current UID, so it is name-agnostic: applySystemLogin drives
+// it for each non-root login user, and applyRootAuth drives it for the root
+// account (name "root", UID 0) so root gets the SAME apply-boundary
+// revalidation, UID-keyed provenance, and lock-on-removal semantics (#5276).
 //
 //   - encrypted-password set → write it via `chpasswd -e` unless the
 //     on-disk shadow hash already equals it (idempotent); a successful
@@ -1491,51 +1494,71 @@ func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 	return "# Managed by xpf — do not edit\n" + strings.Join(lines, "\n") + "\n"
 }
 
-// applyRootAuth applies root-authentication config: encrypted-password and SSH keys.
+// applyRootAuth applies AND declaratively reconciles `system
+// root-authentication` (encrypted-password + SSH keys) against root's OS
+// credentials, mirroring the non-root #1944/#5106/#5128 lifecycle.
+//
+// Before #5276 this was WRITE-ONLY: it returned immediately when the stanza was
+// absent and had only positive branches for a nonempty password or key list, so
+// removing the stanza (or emptying a leaf) left the prior /etc/shadow root hash
+// and /root/.ssh/authorized_keys LIVE — offboarding/rotation/compromise never
+// revoked root access despite a green commit. Non-root reconciliation already
+// LOCKS a removed password and REMOVES the last xpf-managed key via a UID-keyed
+// provenance marker; root now gets the SAME semantics:
+//
+//   - Password: delegated to reconcileUserPassword keyed on name "root" / UID 0.
+//     A configured encrypted-password is applied via `chpasswd -e` (with the
+//     apply-boundary hash revalidation) and records the provenance marker; an
+//     ABSENT password (stanza removed OR the encrypted-password leaf emptied)
+//     LOCKS the root shadow field — but ONLY when xpf itself provisioned root's
+//     credentials (marker present) and the field is not already locked, and
+//     NEVER on a shadow read error (fail-closed). A fresh boot that never
+//     configured root-authentication has no marker, so root is never locked out
+//     and console/recovery access is preserved.
+//   - Keys: a configured key list is written wholesale to
+//     /root/.ssh/authorized_keys and records the provenance marker; an EMPTY
+//     key list (stanza removed OR the ssh-* leaf emptied) REMOVES the
+//     xpf-managed authorized_keys — but ONLY when the provenance marker is
+//     present, so an operator-installed key file xpf never wrote is left
+//     untouched (provenance-scoped removal, never a hand-placed key).
+//
+// The single UID-keyed marker (name "root", UID 0) gates both revocations — the
+// same one-marker-per-principal scheme the non-root path uses — and is recorded
+// on EITHER a password apply or a key apply so a keys-only root-authentication
+// (no encrypted-password) is still revocable. Idempotent: re-applying with the
+// stanza still absent re-locks nothing (the shadow field is already "!") and
+// removes nothing (the key file is already gone).
 func (d *Daemon) applyRootAuth(cfg *config.Config) {
 	ra := cfg.System.RootAuthentication
-	if ra == nil {
-		return
+
+	// A nil stanza means "root-authentication not configured": the desired
+	// password AND key list are empty, so the reconcile REVOKES whatever xpf
+	// previously provisioned (gated by the marker) instead of early-returning
+	// and orphaning a live root credential (#5276).
+	var password config.Secret
+	var keys []string
+	if ra != nil {
+		password = ra.EncryptedPassword
+		keys = ra.SSHKeys
 	}
 
-	// Set root password from encrypted-password (crypt(3) hash)
-	if ra.EncryptedPassword != "" {
-		// Defense-in-depth at the apply boundary, mirroring
-		// reconcileUserPassword (#1944 E1 shares ValidateCryptHash between
-		// root-auth and per-user auth). The strict operator-commit gate
-		// rejects plaintext/DES/empty-checksum/':' values, but the lenient
-		// Load/SyncApply ingress (pkg/configstore/store.go) only downgrades
-		// that to a warning, so a persisted/synced bad value would otherwise
-		// reach `chpasswd -e` verbatim — writing plaintext as root's password
-		// or corrupting the chpasswd stdin line via ':'. Re-check here and
-		// skip+warn so "plaintext never reaches /etc/shadow" holds for root
-		// on every path too, without bricking boot. SSH keys below are
-		// still applied regardless.
-		if err := config.ValidateCryptHash(ra.EncryptedPassword.Reveal(), nil); err != nil {
-			slog.Warn("refusing to apply invalid root encrypted-password to /etc/shadow", "err", err)
-		} else {
-			// Use chpasswd -e to set pre-hashed password
-			stdin := strings.NewReader("root:" + ra.EncryptedPassword.Reveal() + "\n")
-			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
-				slog.Warn("failed to set root password", "err", err, "output", string(out))
-			} else {
-				slog.Info("root encrypted-password applied")
-			}
-		}
-	}
+	// Password: reuse the non-root #1944 reconciler keyed on name "root" / UID 0.
+	// It applies a configured hash (with apply-boundary revalidation + marker)
+	// and, when the password is absent, D2-locks root ONLY if the marker shows
+	// xpf provisioned it — never on a read error, never an already-locked field.
+	d.reconcileUserPassword(&config.LoginUser{Name: "root", EncryptedPassword: password})
 
-	// Write SSH authorized_keys for root
-	if len(ra.SSHKeys) > 0 {
-		sshDir := "/root/.ssh"
+	// Keys: write the configured set wholesale, else revoke the xpf-managed file.
+	if len(keys) > 0 {
 		// MkdirAllDurable: root authorized_keys is DurableState written into
 		// this dir, so the dir's own entry must survive a power cut too
 		// (Codex r1).
-		if err := fsatomic.MkdirAllDurable(sshDir, 0700); err != nil {
+		if err := fsatomic.MkdirAllDurable(rootSSHDir, 0700); err != nil {
 			slog.Warn("failed to create /root/.ssh dir", "err", err)
 			return
 		}
-		keysContent := strings.Join(ra.SSHKeys, "\n") + "\n"
-		keysFile := sshDir + "/authorized_keys"
+		keysContent := strings.Join(keys, "\n") + "\n"
+		keysFile := rootAuthorizedKeysPath()
 		current, _ := os.ReadFile(keysFile)
 		if string(current) != keysContent {
 			// DurableState: root SSH access must survive a power cut.
@@ -1543,9 +1566,31 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 			// uid 0) and keeps the install correctly-owned at rename.
 			if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(0, 0)); err != nil {
 				slog.Warn("failed to write root authorized_keys", "err", err)
-			} else {
-				slog.Info("root SSH keys applied", "keys", len(ra.SSHKeys))
+				return
 			}
+			slog.Info("root SSH keys applied", "keys", len(keys))
+		}
+		// Record provenance keyed by name "root" / UID 0 (the same marker
+		// reconcileUserPassword writes on a root password apply) so a later
+		// stanza/leaf removal can revoke THIS xpf-written key file. Written on
+		// the key apply too so a keys-only root-authentication is revocable.
+		if err := markProvisioned("root", 0); err != nil {
+			slog.Warn("failed to write root provisioned marker", "err", err)
+		}
+	} else if xpfProvisioned("root", 0) {
+		// Empty/absent key list AND xpf provisioned root: revoke the xpf-managed
+		// root authorized_keys so removing the keys from config actually disables
+		// key-based root login. The marker gate leaves an operator-installed key
+		// file xpf never wrote untouched — provenance-scoped removal, mirroring
+		// applySystemLogin's emptied-key-list branch + deprovisionLoginUser
+		// (the whole file is xpf-owned when the marker matches). #5276.
+		keysFile := rootAuthorizedKeysPath()
+		switch err := os.Remove(keysFile); {
+		case err == nil:
+			slog.Info("revoked root SSH keys (root-authentication keys removed from config)")
+		case !os.IsNotExist(err):
+			slog.Warn("failed to remove root authorized_keys after key list emptied",
+				"file", keysFile, "err", err)
 		}
 	}
 }

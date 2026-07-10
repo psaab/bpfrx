@@ -4,7 +4,8 @@ This is the operator contract for `system login user` and
 `system root-authentication` password handling. It documents how a
 configured login password reaches the OS account database, the
 commit-time validation of the hash, and the declarative reconciliation
-behaviour when a password directive is removed. (#1944)
+behaviour when a password directive is removed — for both per-user
+accounts (#1944) and `root` (#5276).
 
 ## Per-user console login password
 
@@ -466,7 +467,9 @@ The path is scoped and fail-closed:
   `authorized_keys` removal failure, the marker is **retained** so the
   next apply retries — a credential is never forgotten while it may still
   be live.
-- `root` is never deprovisioned.
+- `root` is never deprovisioned **by this login-user path** — it is
+  reconciled separately by `applyRootAuth` (see "Root credentials are
+  revoked on removal (#5276)" below).
 
 Unlike the `zeroize` teardown (#4598), which `userdel -r`s the whole
 account, ordinary removal only **locks** the password and removes the
@@ -498,9 +501,11 @@ branch touches only `authorized_keys`, and removing the
 
 ### Scope — only xpf-managed accounts
 
-The lock-on-removal applies **only to the exact account xpf
-provisioned**, never root, and never to accounts absent from config
-(xpf does not deprovision/`userdel` accounts). Provenance is tracked by
+The per-user lock-on-removal applies **only to the exact account xpf
+provisioned**, and never to accounts absent from config (xpf does not
+deprovision/`userdel` accounts). `root` is handled by its own
+`applyRootAuth` reconcile (see "Root credentials are revoked on removal
+(#5276)"), not this per-user path. Provenance is tracked by
 a per-user marker file under `/var/lib/xpf/provisioned-users/<name>`
 whose content is the account's numeric **UID** at the time xpf wrote
 its password (written on both `useradd` and a successful
@@ -518,6 +523,65 @@ its password (written on both `useradd` and a successful
 A transient `/etc/shadow` read error never causes a lock (the lock
 decision fails closed on a read error), so a read hiccup can never lock
 out an operator.
+
+## Root credentials are revoked on removal (#5276)
+
+`system root-authentication` (`encrypted-password` + `ssh-*` keys) gets
+the **same** declarative revocation the per-user path has. Before #5276
+`applyRootAuth` was **write-only**: it returned immediately when the
+stanza was nil and had only positive branches for a nonempty password or
+key list. Removing the stanza (or emptying a leaf) left the prior
+`/etc/shadow` root hash and `/root/.ssh/authorized_keys` **live**, so
+offboarding/rotation/compromise never revoked root access despite a
+green commit — while non-root users already locked a removed password
+and removed the last managed key.
+
+`applyRootAuth` (`pkg/daemon/daemon_system.go`) now reconciles root
+against the current config on every apply, reusing the per-user
+machinery keyed on the account name `root` / **UID 0**:
+
+- **Password** — delegated to `reconcileUserPassword` with a synthetic
+  `root` login user. A configured `encrypted-password` is applied via
+  `chpasswd -e` (with the same apply-boundary `ValidateCryptHash`
+  re-check) and records the provenance marker; an **absent** password
+  (stanza removed OR the `encrypted-password` leaf emptied) **LOCKS** the
+  root shadow field (`root:!`) — but **only** when xpf itself provisioned
+  root's credentials (marker present) and the field is not already
+  locked, and **never** on a shadow read error.
+- **Keys** — a configured key list is written wholesale to
+  `/root/.ssh/authorized_keys` and records the provenance marker; an
+  **empty** key list (stanza removed OR the `ssh-*` leaf emptied)
+  **REMOVES** the xpf-managed `authorized_keys` — but **only** when the
+  provenance marker is present, so an **operator-installed** key file xpf
+  never wrote is left untouched (provenance-scoped removal, never a
+  hand-placed key).
+
+Provenance uses the **same** UID-keyed marker as the per-user path — a
+single `/var/lib/xpf/provisioned-users/root` file (`markProvisioned` /
+`xpfProvisioned` with UID 0) — recorded on **either** a root password
+apply **or** a root key apply, so a **keys-only** `root-authentication`
+(no `encrypted-password`) is still revocable. The one marker gates both
+revocations, mirroring the one-marker-per-principal scheme the login-user
+reconcilers use. The non-root `reconcileAbsentLoginUsers` /
+`applySystemLogin` loops still **skip** `root` entirely — root is
+governed solely by this dedicated `applyRootAuth` path.
+
+**Safety.** The marker gate is the fresh-boot lifeline: an appliance that
+**never** configured `root-authentication` has no marker, so root is
+**never** locked and console/recovery access is preserved — the same
+`_never revoke what xpf did not provision_` invariant the per-user path
+enforces. On typical images root's shadow field is already `!`
+(distro-locked), so `isLockedShadow` makes the lock a no-op there.
+Re-adding `root-authentication` restores the password/keys. The one
+residual edge — a keys-only root-authentication whose root password was
+set **out-of-band** (outside xpf, not a Junos concept), then the stanza
+removed — will lock that out-of-band password; this fails **safe** (more
+restrictive, recovery mode still works) and matches the declarative
+intent of removing root-authentication.
+
+**Idempotent.** Re-applying with the stanza still absent re-locks nothing
+(the shadow field is already `!` → `pwNoop`) and removes nothing (the key
+file is already gone → `os.Remove` `NotExist` no-op).
 
 ## Idempotency
 
