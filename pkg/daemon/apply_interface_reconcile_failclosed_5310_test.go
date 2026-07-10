@@ -141,6 +141,45 @@ func TestApplyInterfaceReconcileSurfacesBondFailure(t *testing.T) {
 	}
 }
 
+// TestApplyInterfaceReconcileSurfacesTunnelFailure proves the tunnel sub-stage
+// is aggregated too (#5355): a genuine GRE/anchor tunnel LinkAdd failure makes
+// applyInterfaceReconcile return non-nil. Before #5355 tunnelManager.Apply
+// logged every per-tunnel create/up/delete failure and returned nil
+// UNCONDITIONALLY, so even though the #5354 tail-join already threaded
+// ApplyTunnels, there was never an error to surface — the commit reported
+// success while the tunnel interface was absent (fail-open false convergence).
+//
+// FAIL-ON-REVERT: restore tunnelManager.Apply's unconditional `return nil` and
+// this goes RED (applyInterfaceReconcile returns nil despite the tunnel create
+// having failed).
+func TestApplyInterfaceReconcileSurfacesTunnelFailure(t *testing.T) {
+	ops := newReconcileFakeLinkOps()
+	injected := errors.New("injected: tunnel LinkAdd EPERM")
+	ops.addFail["gr-0-0-0"] = injected
+
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"gr-0/0/0": {
+			Name: "gr-0/0/0",
+			Tunnel: &config.TunnelConfig{
+				Name:        "gr-0-0-0",
+				Source:      "10.0.0.1",
+				Destination: "10.0.0.2",
+			},
+		},
+	}
+
+	d := &Daemon{routing: routing.NewManagerWithLinkOpsForTest(ops)}
+	err := d.applyInterfaceReconcile(cfg)
+	if err == nil {
+		t.Fatal("applyInterfaceReconcile must surface the tunnel create failure " +
+			"(fail-closed #5355); got nil")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("returned error must wrap the injected tunnel failure, got %v", err)
+	}
+}
+
 // TestApplyInterfaceReconcileToleratesIdempotent proves a benign reconcile does
 // NOT fail the commit: the xfrmi already exists with the matching if_id (adopt
 // path) and every other sub-stage is a no-op, so applyInterfaceReconcile returns
