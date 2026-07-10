@@ -45020,3 +45020,29 @@ top.
   pkg/flowexport/README.md #3748/#5312 sampler section.
 - **File(s)**: pkg/flowexport/ipfix.go, pkg/flowexport/ipfix_sampler_test.go,
   pkg/flowexport/README.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5120 routing/wireguard — unbind the WG TUN from its VRF on
+  teardown/rebind. `applyWireguardTunLocked` bound the persistent `wgN` TUN
+  to a VRF only in the non-empty routing-instance case with no else/unbind
+  branch, and the WG config-removal prune in `Apply` only reconciled
+  addresses. So removing the `routing-instance` stanza from a still-
+  configured tunnel — or removing the whole tunnel — left `wgN` mastered to
+  the old `vrf-<name>` indefinitely (traffic isolated in / leaked through
+  the wrong routing table). Routed WG through the SAME identity-gated claim
+  machinery as GRE/IPIP: the apply path now calls `reconcileVRFClaimLocked`
+  (records `appliedRI` on a successful bind, unbinds when the desired RI is
+  empty), and the persistent-link removal prune calls the new extracted
+  `unbindVRFClaimLocked` helper (identity-checks the current master vs the
+  claimed `vrf-` device, LinkSetNoMaster only when it is ours, retains the
+  claim + `wgConfigured` entry on transient failure for retry, clears on a
+  not-found device). Preserved `appliedRI` across the non-WG→WG same-name
+  handoff so a reused anchor TUN's prior VRF claim carries into the WG
+  reconcile (else an anchor→WG-no-RI device would strand its old master).
+  Added four fail-on-revert tests (bind+removal-unbind, RI-removal-unbind,
+  foreign-master-veto, transient-unbind retry); proved RED-on-revert (3/4
+  fail on reverted source; the foreign-master safety guard passes both
+  ways by design). Updated pkg/routing/README.md WG-removal + VRF-claims
+  sections (removed the #1434 "VRF not unbound" residual).
+- **File(s)**: pkg/routing/tunnel.go,
+  pkg/routing/tunnel_reconcile_test.go, pkg/routing/README.md, _Log.md
