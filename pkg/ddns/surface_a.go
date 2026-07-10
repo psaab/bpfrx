@@ -1404,6 +1404,26 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 // from the EXACT owned tuple (the sole-delete-authority boundary, shared with
 // the lease path): Surface A never deletes a name it did not record.
 //
+// Delete-target selection (#5334): the wire delete must target the value ACTUALLY
+// LIVE at the provider. For a SETTLED record that is unambiguously AddrText. For a
+// crash-left PENDING record (#5285) which value is live is AMBIGUOUS — publishLocked
+// has TWO crash windows and the persisted {AddrText=B, PriorAddrText=A} shape is
+// byte-identical in both:
+//   - Window 1: crash BETWEEN the durable write-ahead save and the wire add — B
+//     never reached the provider, so the CONFIRMED prior A is still live.
+//   - Window 2: crash AFTER a SUCCESSFUL wire add but BEFORE the confirm-save
+//     clears the pending bit — sendAddSelfOwned atomically removed A and inserted
+//     B, so B is live and A is gone.
+//
+// The pending bit cannot distinguish the windows, so withdrawing EITHER single
+// value orphans the other window's live RR. Rather than guess one horn, a pending
+// withdraw issues an exact-RR delete of BOTH candidate rdata (AddrText AND
+// PriorAddrText, deduplicated). A value-specific exact-RR delete of a value that
+// is NOT live is BENIGN (rfc2136 sendRemove maps NXRrset/NameError to success;
+// host-granular DuckDNS/dyndns2 ignore the rdata and SiblingFamilyOwned already
+// guards the live sibling), so the both-delete removes whichever value the crash
+// left live and no-ops the other — the invariant holds regardless of the window.
+//
 // Observability honesty (#2691 P2 MINOR M1): the ownership entry is dropped only
 // AFTER a successful wire delete; a failed delete increments deleteFail (not
 // deleteOK) and leaves the entry so the next reconcile retries. A no-op backend
@@ -1419,12 +1439,18 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 // the scope with a different address while we were unlocked, we must NOT drop the
 // newer ownership — that would orphan the freshly-published RR.
 func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRecord, backend DNSUpdater) error {
-	a, err := netip.ParseAddr(owned.AddrText)
-	if err != nil {
-		// Stored rdata no longer parses (should not happen): drop the entry to
-		// avoid wedging, but issue no delete with a guessed address.
-		slog.Warn("ddns surface-a: owned record has unparseable address; dropping entry",
-			"fqdn", owned.FQDN, "addr", owned.AddrText, "err", err)
+	// #5334: the set of rdata to exact-RR delete. A SETTLED record yields just its
+	// live AddrText; a crash-left PENDING record yields BOTH crash-window candidates
+	// (AddrText and PriorAddrText) so the actually-live value is removed regardless
+	// of which window the crash fell in (see the doc comment). Empties/unparseables
+	// are dropped and duplicates coalesced.
+	targets := m.withdrawTargets(owned)
+	if len(targets) == 0 {
+		// No parseable rdata to delete (should not happen for a Surface A record —
+		// a settled record always carries a parseable AddrText). Drop the entry to
+		// avoid wedging rather than issue a delete with a guessed address.
+		slog.Warn("ddns surface-a: owned record has no parseable address; dropping entry",
+			"fqdn", owned.FQDN, "addr", owned.AddrText, "prior", owned.PriorAddrText)
 		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 		delete(m.runtime, owned.scopeOf().scopePrefix())
 		m.clearOrphan(owned)
@@ -1440,24 +1466,41 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 			"fqdn", owned.FQDN, "addr", owned.AddrText, "provider", owned.scopeOf().PolicyID)
 		return fmt.Errorf("ddns surface-a: no live backend to withdraw %s", owned.FQDN)
 	}
-	rec, err := buildHostRecord(owned.FQDN, a, owned.TTL)
-	if err != nil {
-		m.deleteFail++
-		return err
+	// #3738: whether a SIBLING family is still owned at this {provider, FQDN}. A
+	// host-granular-withdraw backend (DuckDNS clear=true, dyndns2 offline=YES — both
+	// take the WHOLE hostname down) uses this to SKIP its destructive verb so a
+	// single-family withdraw does not blackhole the live sibling; per-family
+	// backends (rfc2136/cloudflare/route53/bind) ignore it. Identical for every
+	// candidate delete of this record (same family/FQDN/provider), so compute once.
+	sibling := m.siblingFamilyOwnedLocked(owned)
+	var firstErr error
+	for _, a := range targets {
+		rec, err := buildHostRecord(owned.FQDN, a, owned.TTL)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		rec.SiblingFamilyOwned = sibling
+		// Wire DeleteLease with m.mu RELEASED (#2778): the 15s-timeout provider call
+		// must not block StatusViews/Stats/other scopes. A delete of a non-live
+		// candidate is a benign no-op (the backend maps not-found to success), so an
+		// error here is a REAL provider failure.
+		if err := m.providerIO(func() error { return backend.DeleteLease(ctx, rec) }); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
-	// #3738: flag whether a SIBLING family is still owned at this {provider,
-	// FQDN}. A host-granular-withdraw backend (DuckDNS clear=true, dyndns2
-	// offline=YES — both take the WHOLE hostname down) uses this to SKIP its
-	// destructive verb so it does not blackhole the still-live sibling family;
-	// per-family backends (rfc2136/cloudflare/route53/bind) ignore it. Computed
-	// under the lock from the current ownership store.
-	rec.SiblingFamilyOwned = m.siblingFamilyOwnedLocked(owned)
-	// Perform the wire DeleteLease with m.mu RELEASED (#2778): the 15s-timeout
-	// provider call must not block StatusViews/Stats/other scopes.
-	wireErr := m.providerIO(func() error { return backend.DeleteLease(ctx, rec) })
-	if wireErr != nil {
+	if firstErr != nil {
+		// A candidate delete failed with a real provider error. Keep ownership so the
+		// next reconcile retries EVERY candidate (an already-deleted one is a benign
+		// no-op) — a genuinely-live value is never orphaned. The
+		// errGenericDeleteUnsupported sentinel is preserved (%w) so withdrawScopeLocked
+		// marks the scope terminal instead of retrying a structurally-unsupported verb.
 		m.deleteFail++
-		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, wireErr)
+		return fmt.Errorf("ddns surface-a: withdraw %s %s: %w", owned.ForwardType, owned.FQDN, firstErr)
 	}
 	m.deleteOK++
 
@@ -1476,8 +1519,45 @@ func (m *SurfaceAManager) withdrawOwnedLocked(ctx context.Context, owned ownedRe
 	m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
 	delete(m.runtime, owned.scopeOf().scopePrefix())
 	m.clearOrphan(owned)
-	slog.Info("ddns surface-a: withdrew record", "fqdn", owned.FQDN, "addr", owned.AddrText)
+	slog.Info("ddns surface-a: withdrew record",
+		"fqdn", owned.FQDN, "addr", owned.AddrText, "candidates", len(targets))
 	return nil
+}
+
+// withdrawTargets returns the deduplicated, parseable rdata an exact-RR withdraw
+// must delete for an owned record (#5334). A SETTLED record yields exactly its
+// live AddrText. A crash-left PENDING record (PublishPending=true) yields BOTH
+// AddrText and PriorAddrText — the two crash-window candidates for "which value is
+// live" (see withdrawOwnedLocked's doc comment) — so the both-delete removes
+// whichever the crash left live and benign-no-ops the other. Empty and
+// unparseable values are dropped (an unparseable stored rdata is logged and
+// skipped, never guessed) and duplicates coalesced (a same-value pending record
+// collapses to one delete). Caller holds m.mu.
+func (m *SurfaceAManager) withdrawTargets(owned ownedRecord) []netip.Addr {
+	texts := []string{owned.AddrText}
+	if owned.PublishPending && owned.PriorAddrText != "" {
+		texts = append(texts, owned.PriorAddrText)
+	}
+	out := make([]netip.Addr, 0, len(texts))
+	seen := make(map[netip.Addr]struct{}, len(texts))
+	for _, t := range texts {
+		if t == "" {
+			continue
+		}
+		a, err := netip.ParseAddr(t)
+		if err != nil {
+			slog.Warn("ddns surface-a: owned record has unparseable withdraw rdata; skipping that candidate",
+				"fqdn", owned.FQDN, "addr", t, "err", err)
+			continue
+		}
+		a = a.Unmap()
+		if _, dup := seen[a]; dup {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out
 }
 
 // siblingFamilyOwnedLocked reports whether ANOTHER owned record shares this
