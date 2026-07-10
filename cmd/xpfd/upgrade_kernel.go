@@ -50,6 +50,19 @@ func runUpgradeKernelSubcommand(args []string) {
 		os.Exit(1)
 	}
 
+	// #5322: reject leftover positional operands per verb BEFORE taking the
+	// upgrade lock or building the runner. Like #4869's `xpfd upgrade`,
+	// flag.FlagSet.Parse stops at the first non-flag token, so before this
+	// guard a stray operand on a no-arg verb (e.g. `xpfd upgrade kernel promote
+	// g0-typo`, or `drain`/`rejoin` with a fat-fingered extra) was silently
+	// dropped and the privileged BootOrder-reorder / drain still ran. `arm`
+	// legitimately takes exactly one operand (the target kernel version);
+	// promote/status/drain/rejoin take none.
+	if err := validateKernelVerbArgs(verb, fs.Args()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	// Serialize the MUTATING kernel sub-verbs (arm/promote/drain/rejoin)
 	// against every other host-local upgrade mutator via the host-wide
 	// upgrade lock (#1965). `status` is read-only and stays lock-free.
@@ -85,12 +98,9 @@ func runUpgradeKernelSubcommand(args []string) {
 
 	switch verb {
 	case "arm":
-		rest := fs.Args()
-		if len(rest) != 1 {
-			fmt.Fprintln(os.Stderr, "usage: xpfd upgrade kernel arm <version>")
-			os.Exit(1)
-		}
-		if err := r.Arm(rest[0]); err != nil {
+		// Arity validated up-front by validateKernelVerbArgs (exactly one
+		// operand: the target kernel version).
+		if err := r.Arm(fs.Args()[0]); err != nil {
 			if errors.Is(err, upgrade.ErrKernelChannelUnavailable) {
 				fmt.Fprintf(os.Stderr, "upgrade kernel arm: %v\n", err)
 				os.Exit(2)
@@ -183,4 +193,25 @@ func runUpgradeKernelSubcommand(args []string) {
 		fmt.Fprintf(os.Stderr, "upgrade kernel: unknown verb %q (want arm|promote|status|drain|rejoin)\n", verb)
 		os.Exit(1)
 	}
+}
+
+// validateKernelVerbArgs enforces the per-verb positional arity for `xpfd
+// upgrade kernel <verb>` (#5322). `arm` takes exactly one operand (the target
+// kernel version); promote/status/drain/rejoin take none. An unknown verb is
+// left to the dispatch's own default case (returns nil here), so its existing
+// "unknown verb" error is preserved. Extracted so the leftover-arg rejection is
+// unit-testable without the os.Exit / lock / real-runner side effects.
+func validateKernelVerbArgs(verb string, positionals []string) error {
+	switch verb {
+	case "arm":
+		if len(positionals) != 1 {
+			return fmt.Errorf("usage: xpfd upgrade kernel arm <version>")
+		}
+	case "promote", "status", "drain", "rejoin":
+		if len(positionals) != 0 {
+			return fmt.Errorf("upgrade kernel %s: unexpected argument(s) %v; "+
+				"this verb takes no positional arguments", verb, positionals)
+		}
+	}
+	return nil
 }

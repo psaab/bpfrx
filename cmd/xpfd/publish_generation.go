@@ -33,11 +33,9 @@ import (
 //
 // Exit codes: 0 success, 1 error, 2 lock busy (publish deferred).
 func runPublishGenerationSubcommand(args []string) {
-	fs := flag.NewFlagSet("publish-generation", flag.ContinueOnError)
-	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
-	stagedGenDir := fs.String("staged-gen-dir", upgrade.DefaultStagedGenDir, "staged-generation root")
-	journalPath := fs.String("journal", upgrade.DefaultJournalPath, "upgrade journal path (its pinned generation is protected from GC)")
-	if err := fs.Parse(args); err != nil {
+	flags, err := parsePublishGenerationArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "publish-generation: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -59,8 +57,8 @@ func runPublishGenerationSubcommand(args []string) {
 	defer func() { _ = h.Release() }()
 
 	cfg := stagedgen.Config{
-		StagedDir: *stagedDir,
-		Dir:       *stagedGenDir,
+		StagedDir: flags.stagedDir,
+		Dir:       flags.stagedGenDir,
 		Logf:      func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
 	}
 	genid, err := cfg.Publish()
@@ -82,7 +80,7 @@ func runPublishGenerationSubcommand(args []string) {
 	// than run with an empty protection set that could reap the pinned source.
 	// Skipping is safe — the extra staged generations are harmless and the
 	// next publish with a readable journal reclaims them.
-	protected, runGC, warn := gcProtectionForPublish(*journalPath)
+	protected, runGC, warn := gcProtectionForPublish(flags.journalPath)
 	if warn != "" {
 		fmt.Fprintf(os.Stderr, "publish-generation: WARN %s\n", warn)
 	}
@@ -92,6 +90,43 @@ func runPublishGenerationSubcommand(args []string) {
 		}
 	}
 	fmt.Printf("publish-generation complete (generation %s)\n", genid)
+}
+
+// publishGenerationFlags holds the parsed `xpfd publish-generation` flags. Kept
+// in a struct so the flag parsing + positional-arg validation is unit-testable
+// without the os.Exit / lock / real-Publish side effects of the dispatch.
+type publishGenerationFlags struct {
+	stagedDir, stagedGenDir, journalPath string
+}
+
+// parsePublishGenerationArgs parses the `xpfd publish-generation [flags]`
+// argument set.
+//
+// #5322: publish-generation takes NO positional arguments; like #4869's `xpfd
+// upgrade`, it REJECTS any leftover operand rather than silently dropping it.
+// `flag.FlagSet.Parse` stops at the first non-flag token, so before this guard
+// `xpfd publish-generation typo --staged-gen-dir /lab` left the PRODUCTION
+// default staged-gen dir in place (the flag intent silently discarded) and
+// still repointed/GC'd the live generation while reporting success. The
+// validation runs BEFORE the host-wide lock is taken, so a mistyped operand is
+// rejected with no side effects.
+func parsePublishGenerationArgs(args []string) (publishGenerationFlags, error) {
+	fs := flag.NewFlagSet("publish-generation", flag.ContinueOnError)
+	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
+	stagedGenDir := fs.String("staged-gen-dir", upgrade.DefaultStagedGenDir, "staged-generation root")
+	journalPath := fs.String("journal", upgrade.DefaultJournalPath, "upgrade journal path (its pinned generation is protected from GC)")
+	if err := fs.Parse(args); err != nil {
+		return publishGenerationFlags{}, err
+	}
+	if fs.NArg() != 0 {
+		return publishGenerationFlags{}, fmt.Errorf("unexpected argument(s) %v; "+
+			"usage: xpfd publish-generation [flags] (this verb takes no positional arguments)", fs.Args())
+	}
+	return publishGenerationFlags{
+		stagedDir:    *stagedDir,
+		stagedGenDir: *stagedGenDir,
+		journalPath:  *journalPath,
+	}, nil
 }
 
 // gcProtectionForPublish computes the staged-generation GC protection set for
