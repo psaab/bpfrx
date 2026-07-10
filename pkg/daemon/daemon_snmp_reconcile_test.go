@@ -412,3 +412,74 @@ func TestReconcileSNMPBindFailureLeavesHashUnrecordedAndRetries(t *testing.T) {
 		t.Fatal("successful retry did not record the desired SNMP hash")
 	}
 }
+
+// TestDeriveIfCountersUnicastExcludesMulticast is the fail-on-revert guard for
+// #5050. The SNMP IF-MIB unicast packet counters must carry only the unicast
+// subset, never the Linux TOTAL RxPackets/TxPackets (which fold in
+// multicast/broadcast). With RxPackets = unicast + multicast, ifHCInUcastPkts
+// must equal the unicast value and ifInMulticastPkts the multicast value; if
+// the counters overlapped (the pre-fix bug) HCInUcastPkts would equal the
+// total and this test fails RED.
+func TestDeriveIfCountersUnicastExcludesMulticast(t *testing.T) {
+	const (
+		inUnicast   = uint64(1_000_000)
+		inMulticast = uint64(250_000)
+		inTotal     = inUnicast + inMulticast // Linux RxPackets = all classes
+		txTotal     = uint64(4_000_000)
+		rxBytes     = uint64(9_000_000_000) // > 2^32 to exercise HC counters
+		txBytes     = uint64(8_000_000_000)
+	)
+	stats := &netlink.LinkStatistics{
+		RxPackets: inTotal,
+		TxPackets: txTotal,
+		RxBytes:   rxBytes,
+		TxBytes:   txBytes,
+		Multicast: inMulticast,
+	}
+
+	var entry snmp.IfData
+	deriveIfCounters(&entry, stats)
+
+	// The core invariant: IN unicast is the unicast subset, NOT the total.
+	if entry.HCInUcastPkts != inUnicast {
+		t.Errorf("ifHCInUcastPkts = %d, want %d (unicast subset, not total %d) — "+
+			"multicast is being double-counted into unicast (#5050)",
+			entry.HCInUcastPkts, inUnicast, inTotal)
+	}
+	if entry.HCInUcastPkts == inTotal {
+		t.Errorf("ifHCInUcastPkts = %d equals Linux TOTAL RxPackets — the pre-fix "+
+			"bug reappeared (#5050)", entry.HCInUcastPkts)
+	}
+	// Multicast must be reported under its own class column, so unicast +
+	// multicast reconstructs the total with no overlap.
+	if entry.InMulticastPkts != uint32(inMulticast) {
+		t.Errorf("ifInMulticastPkts = %d, want %d", entry.InMulticastPkts, inMulticast)
+	}
+	if got := uint64(entry.HCInUcastPkts) + uint64(entry.InMulticastPkts); got != inTotal {
+		t.Errorf("unicast(%d) + multicast(%d) = %d, want RxPackets total %d — "+
+			"class columns overlap", entry.HCInUcastPkts, entry.InMulticastPkts, got, inTotal)
+	}
+	// OUT unicast tracks TxPackets (Linux exposes no TX class breakdown to
+	// subtract) and the HC octet counters carry the full 64-bit byte totals.
+	if entry.HCOutUcastPkts != txTotal {
+		t.Errorf("ifHCOutUcastPkts = %d, want %d", entry.HCOutUcastPkts, txTotal)
+	}
+	if entry.HCInOctets != rxBytes {
+		t.Errorf("ifHCInOctets = %d, want %d", entry.HCInOctets, rxBytes)
+	}
+	if entry.HCOutOctets != txBytes {
+		t.Errorf("ifHCOutOctets = %d, want %d", entry.HCOutOctets, txBytes)
+	}
+}
+
+// TestDeriveIfCountersClampsMulticastOverflow proves the racy-read guard: if a
+// non-atomic stats sample observes Multicast > RxPackets, IN unicast clamps to
+// 0 rather than underflowing to a huge uint64 (#5050).
+func TestDeriveIfCountersClampsMulticastOverflow(t *testing.T) {
+	stats := &netlink.LinkStatistics{RxPackets: 100, Multicast: 250}
+	var entry snmp.IfData
+	deriveIfCounters(&entry, stats)
+	if entry.HCInUcastPkts != 0 {
+		t.Errorf("ifHCInUcastPkts = %d, want 0 (clamped, no underflow)", entry.HCInUcastPkts)
+	}
+}
