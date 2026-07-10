@@ -43965,3 +43965,7 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4968 make the remote CLI pipe filter case-SENSITIVE to match the local CLI. Extracted the remote dispatchWithPipe switch into a testable applyPipeFilter() helper and removed the strings.ToLower on both operands for match/grep/except/find so `| match Foo` no longer matches `foo` on remote while missing it on local (Junos `| match` never case-folds). Aligns with pkg/cli.filterStream's bare strings.Contains(line, pipeArg).
   **File(s)**: cmd/cli/shared.go, cmd/cli/pipe_filter_case_4968_test.go
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4955 fix orphaned NTF_PROXY proxy-arp neighbor entry on interface/config removal. ReconcileProxyARP now folds a priorIfaceMap (interfaces a prior commit installed proxy-arp on, remembered by the daemon) into its managed listing set, so NTF_PROXY entries on interfaces dropped from the config are listed as stale and NeighDel'd (previously managedSet came only from the current config, orphaning them). The add loop is now best-effort and returns a non-nil enabled set on partial failure instead of nil-ing the daemon's remembered state. Daemon reconcileProxyARP now always drives the dataplane reconcile (even on full removal) with the prior-interface set. Added proxyARPApplyFn seam + priorProxyARPIfaceMap helper.
+  **File(s)**: pkg/dataplane/proxyarp.go, pkg/dataplane/proxyarp_test.go, pkg/dataplane/proxyarp_orphan_4955_test.go, pkg/daemon/daemon_proxyarp.go, pkg/daemon/daemon_proxyarp_orphan_4955_test.go, docs/feature-gaps.md
