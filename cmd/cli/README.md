@@ -6,8 +6,15 @@ daemon-local CLI.
 
 ## Entry
 
-`main.go` parses flags, dials the gRPC API, and hands control to the
-shared `pkg/cli` engine.
+`main.go` parses flags, dials the gRPC API (see `dialOpts`), and hands
+control to the shared `pkg/cli` engine.
+
+The dial raises the client `MaxCallRecvMsgSize` to
+`configstore.MaxConfigSize` + 1 MiB of framing headroom
+(`maxConfigRecvBytes`), so a `show configuration` for a config up to the
+store's 16 MiB ceiling can be displayed. grpc-Go's 4 MiB default receive
+cap would otherwise truncate a large config with `ResourceExhausted`
+(#5321). Tracking the store const keeps the two bounds from drifting.
 
 ## Flags
 
