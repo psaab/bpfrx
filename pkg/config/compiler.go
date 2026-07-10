@@ -806,6 +806,20 @@ type compileOpts struct {
 	// ExportConfigs, so eligible flows duplicate to both instances rather than
 	// bricking the load. Same doctrine as lenientFlowServerTemplateRef.
 	lenientSamplingInstanceConflicts bool
+	// lenientSamplingInputRate (#5244) downgrades the sampling instance
+	// input-rate lower-bound gate (validateSamplingInputRateStrict) from a
+	// hard compile error to a cfg.Warnings entry. A negative
+	// `forwarding-options sampling instance <name> input rate` was previously
+	// stored unchecked: the flow exporter's 1-in-N gate (`SamplingRate > 1`)
+	// then silently ignored the configured ratio and exported every eligible
+	// flow, and the retired eBPF cast would wrap it into a huge divisor. The
+	// strict commit / commit-check path hard-rejects so the typo is operator-
+	// visible; the tolerant load / peer-sync paths warn so an already-persisted
+	// or peer-synced config authored by a pre-guard version still BOOTS (#1960)
+	// — the userspace snapshot builder clamps `rate <= 0 -> 1`, so a leniently-
+	// loaded negative rate runs safely as sample-all. Same doctrine as
+	// lenientSamplingInstanceConflicts.
+	lenientSamplingInputRate bool
 	// lenientApplicationSetMembers (#2217 Finding B) downgrades the
 	// application-set member cross-reference gate
 	// (validateApplicationSetMembersStrict) from a hard compile error to a
@@ -1732,6 +1746,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFirewallRefs:                    true,
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
+		lenientSamplingInputRate:               true,
 		lenientApplicationSetMembers:           true,
 		lenientPolicyMatchApplications:         true,
 		lenientNATMatchApplications:            true,
@@ -2000,6 +2015,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFirewallRefs:                    true,
 		lenientFlowServerTemplateRef:           true,
 		lenientSamplingInstanceConflicts:       true,
+		lenientSamplingInputRate:               true,
 		lenientApplicationSetMembers:           true,
 		lenientPolicyMatchApplications:         true,
 		lenientNATMatchApplications:            true,

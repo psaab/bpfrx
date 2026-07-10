@@ -4742,7 +4742,16 @@ the value sits in a single typed slot:
     `ValidateInteger(0, maxWireU32)`. **0 is accepted** (the documented
     `0 = sample all` sentinel, `types_system.go`; Layer A normalizes
     `rate<=0 -> 1`) — EXACT Layer-A agreement, rejecting only the
-    decode-aborting `>u32max`.
+    decode-aborting `>u32max`. This typed-leaf gate hard-rejects a negative
+    rate at strict operator commit (#1979). Defense-in-depth (#5244): the
+    compiler carries a second lower-bound guard
+    (`validateSamplingInputRateStrict`, a uniform gate) so `compileSampling`
+    matches the sibling `compilePortMirroring` inline guard and the tolerant
+    load / peer-sync path (where the typed-leaf gate is downgraded to a
+    warning) still names the fail-open consequence. Strict on commit / commit-
+    check; lenient-warn on tolerant load / peer-sync (#1960) — a negative rate
+    is otherwise a silent fail-open (the exporter's `SamplingRate > 1` 1-in-N
+    gate ignores the ratio and exports every eligible flow).
   - `forwarding-options sampling … output flow-server <addr> port` —
     `ValidateInteger(1, maxWireU16)` (Rust u16 CollectorPort; Layer A skips a
     server whose port is `<1` or `>65535`). `flow-server` keeps `args:1` for
