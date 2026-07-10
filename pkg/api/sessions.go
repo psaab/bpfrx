@@ -17,8 +17,42 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
+
+// maxConcurrentSessionLists bounds how many GET /security/sessions list
+// walks may run at once (#5318). A session list walks the whole v4+v6
+// conntrack table holding per-bucket BPF-map locks, so N concurrent
+// scrapers each drive their own full walk simultaneously — on a
+// multi-million-session firewall that multiplies contention with the live
+// dataplane session-sync path. The cap is deliberately small: legitimate
+// dashboards/automation poll a handful at a time, while a scrape flood must
+// never starve session installs. #5237 already aborts a walk when its own
+// client disconnects; this bounds how many connected clients can walk at
+// once, which the disconnect-abort does not.
+const maxConcurrentSessionLists = 4
+
+// sessionsListLimiter is the admission gate for the session list handler.
+// It reuses the diagcmd fixed-capacity counting semaphore (the same
+// fail-fast idiom the diagnostic ping/traceroute handlers use, #5057):
+// Acquire is non-blocking, so an over-cap request is rejected immediately
+// with HTTP 429 rather than queued into an unbounded backlog. It is a
+// package var so a test can swap in a fresh small-capacity limiter without
+// mutating process-wide state.
+var sessionsListLimiter = diagcmd.NewLimiter(maxConcurrentSessionLists)
+
+// defaultSessionCountCap bounds how many matching sessions the offset list
+// walk counts before it stops and reports Total as an approximate lower
+// bound instead of forcing a full v4+v6 table scan for an EXACT Total on
+// every page (#5318). It is set well above any realistic non-attack session
+// table so the common case keeps its exact, byte-identical Total; only a
+// multi-million-session table degrades to an approximate count.
+const defaultSessionCountCap = 1_000_000
+
+// sessionCountCap is the live cap value. A package var so a test can shrink
+// it and exercise the approximate-Total path without a million-row fixture.
+var sessionCountCap = defaultSessionCountCap
 
 // sessionCursorIterator is the optional cursor-based session iteration
 // surface. The production runtime dataplane (the userspace
@@ -72,6 +106,20 @@ func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "dataplane not loaded")
 		return
 	}
+
+	// Admission bound (#5318): a session list is a full conntrack-table walk
+	// that contends with the live dataplane session-sync path for per-bucket
+	// BPF-map locks. Acquire a slot fail-fast BEFORE the walk (and before the
+	// peer fan-out) so a concurrent-scrape flood is rejected with HTTP 429
+	// rather than each driving its own simultaneous walk. Release on every
+	// exit path via defer. This covers both the offset and cursor paths.
+	release, err := sessionsListLimiter.Acquire()
+	if err != nil {
+		writeError(w, http.StatusTooManyRequests,
+			"session list concurrency limit reached; retry shortly")
+		return
+	}
+	defer release()
 
 	view := s.buildSessionView()
 	q, errMsg := buildSessionQuery(r, view)
@@ -139,13 +187,29 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessi
 
 	now := monotonicSeconds()
 	all := make([]SessionEntry, 0)
-	idx := 0
+	matched := 0
+	capped := false
 
-	// Abort the full-table walk if the client disconnects: on a
-	// multi-million-session firewall the offset scan otherwise runs to
-	// completion holding per-bucket BPF-map locks even though the response
-	// is discarded, contending with the live dataplane session-sync path
-	// (#5233). Sampled per batch so the check costs nothing per session.
+	// Bound the Total-counting walk (#5318). The exact-Total contract used to
+	// force a FULL v4+v6 table walk on EVERY page just to report Total —
+	// O(table) work per 100-row page, repeated per poll, contending with the
+	// live session-sync path on a multi-million-session firewall. Cap the
+	// count: walk at most countCap matching rows. UNDER the cap Total is EXACT
+	// and the response is byte-identical to before (total_approximate omitted);
+	// past the cap the walk stops and Total is reported as an approximate lower
+	// bound (total_approximate=true). countCap is raised to cover an explicitly
+	// requested deep window (offset+limit) so a page is never truncated below
+	// the requested limit; only the count degrades on a huge table.
+	countCap := sessionCountCap
+	if need := offset + limit; need > countCap {
+		countCap = need
+	}
+
+	// Abort the walk if the client disconnects: on a multi-million-session
+	// firewall the offset scan otherwise runs holding per-bucket BPF-map
+	// locks even though the response is discarded, contending with the live
+	// dataplane session-sync path (#5237/#5233). Sampled per batch so the
+	// check costs nothing per session.
 	cancelled := newRequestCancelSampler(r.Context(), sessionWalkCancelInterval)
 
 	// IPv4 sessions. A backend iterator failure (e.g. helper restart
@@ -158,39 +222,52 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessi
 		if !q.matchV4(key, val) {
 			return true
 		}
-		if idx >= offset && len(all) < limit {
+		if matched >= offset && len(all) < limit {
 			all = append(all, s.enrichSessionV4(key, val, now, view))
 		}
-		idx++
+		matched++
+		// Strictly-greater so a table of EXACTLY countCap matches still
+		// completes and reports an exact Total; only countCap+1 trips the cap.
+		if matched > countCap {
+			capped = true
+			return false
+		}
 		return true
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "iterate sessions: "+err.Error())
 		return
 	}
 
-	// IPv6 sessions
-	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if cancelled() {
-			return false
-		}
-		if !q.matchV6(key, val) {
+	// IPv6 sessions — skipped entirely once the v4 walk already hit the cap.
+	if !capped {
+		if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if cancelled() {
+				return false
+			}
+			if !q.matchV6(key, val) {
+				return true
+			}
+			if matched >= offset && len(all) < limit {
+				all = append(all, s.enrichSessionV6(key, val, now, view))
+			}
+			matched++
+			if matched > countCap {
+				capped = true
+				return false
+			}
 			return true
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "iterate sessions_v6: "+err.Error())
+			return
 		}
-		if idx >= offset && len(all) < limit {
-			all = append(all, s.enrichSessionV6(key, val, now, view))
-		}
-		idx++
-		return true
-	}); err != nil {
-		writeError(w, http.StatusInternalServerError, "iterate sessions_v6: "+err.Error())
-		return
 	}
 
 	s.writeSessionList(w, r, SessionListResponse{
-		Total:    idx,
-		Limit:    limit,
-		Offset:   offset,
-		Sessions: all,
+		Total:            matched,
+		TotalApproximate: capped,
+		Limit:            limit,
+		Offset:           offset,
+		Sessions:         all,
 	})
 }
 
