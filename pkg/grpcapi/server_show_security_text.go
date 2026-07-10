@@ -330,6 +330,13 @@ func (s *Server) showApplications(cfg *config.Config, buf *strings.Builder) {
 		sort.Strings(names)
 		for _, name := range names {
 			as := cfg.Applications.ApplicationSets[name]
+			if as == nil {
+				// #5221: a present-but-nil application-set map value is admitted
+				// by the tolerant-load / peer-sync path (#1960) that the resolver
+				// (#5179) already tolerates. Skip it rather than dereferencing
+				// as.Applications and panicking the display handler.
+				continue
+			}
 			fmt.Fprintf(buf, "  %-24s members: %s\n", name, strings.Join(as.Applications, ", "))
 		}
 	}
