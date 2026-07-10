@@ -1046,6 +1046,126 @@ func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 	return nil
 }
 
+// sessionHelperDeleteChunk bounds how many per-session helper "delete" IPCs the
+// batch/clear session paths transmit under a single control-socket unlock so a
+// large clear stays cooperative and cannot monopolize the shared control socket
+// (#5096). syncSessionRequestsLocked drops and reacquires m.mu once per chunk,
+// giving a concurrent snapshot publish a window between chunks.
+const sessionHelperDeleteChunk = 256
+
+// BatchDeleteSessions deletes a batch of IPv4 sessions from the BPF mirror AND
+// issues an authoritative "delete" to the Rust helper for every key (#5096).
+//
+// The LegacyDataPlaneAdapter embeds the bpfShim as its dataplane.DataPlane, so
+// without this method Go promotion would dispatch a batch delete to the mirror
+// map ONLY — leaving the helper, which owns packet lookup/lifetime, forwarding
+// under the just-revoked decision until it re-publishes the mirror ~10s later.
+// The singular DeleteSession already routes per-session deletes to the helper;
+// this does the same for the batch path used by policy invalidation and the
+// cluster-stale sweep. The bpf mirror's delete count is returned unchanged so
+// caller count semantics are preserved.
+func (m *Manager) BatchDeleteSessions(keys []dataplane.SessionKey) (int, error) {
+	deleted, err := m.bpfShim.BatchDeleteSessions(keys)
+	// Attempt the helper delete for every key regardless of the mirror result:
+	// a batch where a key vanished concurrently returns ErrKeyNotExist with a
+	// partial count, and the helper delete of an already-absent key is a no-op,
+	// so skipping on error would strand the still-present helper sessions.
+	m.deleteHelperSessionsV4(keys)
+	return deleted, err
+}
+
+// BatchDeleteSessionsV6 is the IPv6 analogue of BatchDeleteSessions (#5096).
+func (m *Manager) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, error) {
+	deleted, err := m.bpfShim.BatchDeleteSessionsV6(keys)
+	m.deleteHelperSessionsV6(keys)
+	return deleted, err
+}
+
+// ClearAllSessions clears the BPF mirror AND issues an authoritative "delete" to
+// the Rust helper for every session so an operator `clear security flow session
+// all` actually stops forwarding under revoked decisions (#5096). The helper
+// exposes no bulk-clear verb (only the per-session "delete" the singular path
+// uses), so every mirror key — forward AND reverse conntrack entries — is
+// snapshotted BEFORE the mirror is emptied and then deleted on the helper.
+// Returns the bpf mirror's (v4, v6, err) counts unchanged.
+func (m *Manager) ClearAllSessions() (int, int, error) {
+	var v4Keys []dataplane.SessionKey
+	if err := m.bpfShim.BatchIterateSessions(func(key dataplane.SessionKey, _ dataplane.SessionValue) bool {
+		v4Keys = append(v4Keys, key)
+		return true
+	}); err != nil {
+		slog.Debug("userspace: enumerate v4 sessions for helper clear failed", "err", err)
+	}
+	var v6Keys []dataplane.SessionKeyV6
+	if err := m.bpfShim.BatchIterateSessionsV6(func(key dataplane.SessionKeyV6, _ dataplane.SessionValueV6) bool {
+		v6Keys = append(v6Keys, key)
+		return true
+	}); err != nil {
+		slog.Debug("userspace: enumerate v6 sessions for helper clear failed", "err", err)
+	}
+
+	v4Deleted, v6Deleted, err := m.bpfShim.ClearAllSessions()
+
+	m.deleteHelperSessionsV4(v4Keys)
+	m.deleteHelperSessionsV6(v6Keys)
+
+	return v4Deleted, v6Deleted, err
+}
+
+// deleteHelperSessionsV4 tells the Rust helper to delete every key so the batch
+// and clear session paths converge the helper's authoritative session table
+// with the BPF mirror (#5096). Requests are transmitted in bounded chunks (see
+// sessionHelperDeleteChunk) so a large clear does not monopolize the shared
+// control socket. A helper IPC error is logged inside syncSessionRequestsLocked
+// but is not fatal — mirroring the singular DeleteSession path, which likewise
+// treats the helper delete as best-effort (the periodic session sync and GC
+// delta reconcile any transient miss). A "delete" request built with a nil
+// value carries only the 5-tuple, so no snapshot read happens under m.mu.
+func (m *Manager) deleteHelperSessionsV4(keys []dataplane.SessionKey) {
+	if len(keys) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil {
+		return
+	}
+	for start := 0; start < len(keys); start += sessionHelperDeleteChunk {
+		end := start + sessionHelperDeleteChunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		reqs := make([]SessionSyncRequest, 0, end-start)
+		for i := start; i < end; i++ {
+			reqs = append(reqs, m.buildSessionSyncRequestV4("delete", keys[i], nil))
+		}
+		m.syncSessionRequestsLocked(reqs...)
+	}
+}
+
+// deleteHelperSessionsV6 is the IPv6 analogue of deleteHelperSessionsV4 (#5096).
+func (m *Manager) deleteHelperSessionsV6(keys []dataplane.SessionKeyV6) {
+	if len(keys) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil {
+		return
+	}
+	for start := 0; start < len(keys); start += sessionHelperDeleteChunk {
+		end := start + sessionHelperDeleteChunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		reqs := make([]SessionSyncRequest, 0, end-start)
+		for i := start; i < end; i++ {
+			reqs = append(reqs, m.buildSessionSyncRequestV6("delete", keys[i], nil))
+		}
+		m.syncSessionRequestsLocked(reqs...)
+	}
+}
+
 func (m *Manager) syncSessionV4Locked(op string, key dataplane.SessionKey, val *dataplane.SessionValue) error {
 	if m.proc == nil {
 		return nil

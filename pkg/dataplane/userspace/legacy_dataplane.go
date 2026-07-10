@@ -395,6 +395,44 @@ func (a *LegacyDataPlaneAdapter) DeleteSessionV6(key dataplane.SessionKeyV6) err
 	return m.DeleteSessionV6(key)
 }
 
+// BatchDeleteSessions overrides the promoted bpfShim batch delete so the
+// authoritative Rust helper is told to delete every key too (#5096). Without
+// this override Go method promotion routes policy-invalidation and cluster-
+// stale batch deletes (dataPlaneSessionStore.batchDeleteV4 -> s.dp.Batch...)
+// to the BPF mirror ONLY, leaving the helper forwarding under the revoked
+// decision until it re-publishes the mirror. The singular DeleteSession
+// override already routes per-session deletes to the helper; see
+// Manager.BatchDeleteSessions.
+func (a *LegacyDataPlaneAdapter) BatchDeleteSessions(keys []dataplane.SessionKey) (int, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return 0, err
+	}
+	return m.BatchDeleteSessions(keys)
+}
+
+// BatchDeleteSessionsV6 is the IPv6 analogue of BatchDeleteSessions (#5096).
+func (a *LegacyDataPlaneAdapter) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return 0, err
+	}
+	return m.BatchDeleteSessionsV6(keys)
+}
+
+// ClearAllSessions overrides the promoted bpfShim clear-all so an operator
+// `clear security flow session all` reaches the authoritative Rust helper and
+// not merely the BPF mirror (#5096). Without it the promoted bpfShim clear
+// empties the mirror only; the helper keeps forwarding under revoked decisions
+// until it re-publishes the mirror ~10s later. See Manager.ClearAllSessions.
+func (a *LegacyDataPlaneAdapter) ClearAllSessions() (int, int, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return 0, 0, err
+	}
+	return m.ClearAllSessions()
+}
+
 func (a *LegacyDataPlaneAdapter) SetDeferWorkers(v bool) {
 	m, err := a.managerOrErr()
 	if err != nil {
