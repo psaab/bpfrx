@@ -35,7 +35,7 @@ func (d *Daemon) ensureFeedManager() {
 // governs the running feed-producer set (#5036). It deliberately EXCLUDES
 // AddressBindings: bindings drive the per-apply snapshot overlay
 // (feedSnapshotsForConfig), not the producer goroutines, so a binding-only
-// change must not trigger a StopAll+restart of the fetchers. FeedServers is a
+// change must not trigger a producer swap/restart of the fetchers. FeedServers is a
 // Go map (nondeterministic iteration), so it is serialized in sorted key order
 // with each server's URL/hostname, intervals, single feed-name, and feed
 // entries (also sorted) — matching every input feeds.Apply's plan builder reads.
@@ -82,9 +82,11 @@ func feedsConfigHash(da *config.DynamicAddressConfig) [32]byte {
 // namespace until restart.
 //
 // The manager is now constructed unconditionally at boot (ensureFeedManager),
-// so it is always non-nil here; Apply — which does StopAll and then starts the
-// desired producer set — is gated on feedsConfigHash so it runs ONLY when the
-// feed-server configuration actually changes. A feed CONTENT refresh re-enters
+// so it is always non-nil here; Apply — which swaps to the desired producer set,
+// carrying each persisted feed's last-good snapshot forward so a reconfigure
+// never opens a fail-open denylist window (#5282) — is gated on feedsConfigHash
+// so it runs ONLY when the feed-server configuration actually changes. A feed
+// CONTENT refresh re-enters
 // applyConfig via the onUpdate callback but leaves the hash unchanged, so it
 // does not thrash the fetchers. Callers MUST invoke this BEFORE reading the
 // feed overlay (feedSnapshotsForConfig) so the overlay reflects the reconciled

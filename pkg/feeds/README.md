@@ -8,25 +8,61 @@ feed servers and triggers config recompile when the resolved set changes
 
 - `Manager` — `feeds.go`.
 - `New(updateFn)` — `feeds.go`.
-- `Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)` — `feeds.go`. Starts/stops per-feed refresh goroutines.
+- `Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)` — `feeds.go`. Reconciles the per-feed refresh goroutines; carries a persisted feed's last-good snapshot forward across the reconfigure (#5282, see below).
 - `GetPrefixes(name)` — `feeds.go`. Returns the current enforced (last-good) snapshot.
-- `StopAll()`, `FeedInfo`, `AllFeeds()` — surfaced to `show security dynamic-address`.
+- `StopAll()`, `FeedInfo`, `AllFeeds()` — surfaced to `show security dynamic-address`. `StopAll` is the shutdown path (cancels every producer, empties the map); `Apply` no longer routes through it (#5282).
 
 ## Day-2 reconcile (#5036)
 
-`Manager.Apply` is destructive (`StopAll` first) and is driven by the daemon,
-not called once at boot. The daemon constructs the manager **unconditionally**
-at startup (`ensureFeedManager`, even with no feed servers) and calls
-`reconcileFeeds` on every applied config generation (wired into
-`applyConfigLocked`, before the feed-overlay push). `reconcileFeeds` is gated
-on a hash of the feed-**server** configuration (`feedsConfigHash`, which
-excludes address bindings), so `Apply` re-runs only when the server set
-actually changes — a feed **content** refresh (which re-enters `applyConfig`
-via the `onUpdate` callback) leaves the hash unchanged and does not restart the
-fetchers. Before #5036 the manager was built only if boot-time feed servers
-existed and `Apply` was never re-invoked, so a feed server added/removed/edited
-after boot was silently ignored until restart (a deny policy bound to a
-day-2-added feed armed with zero prefixes — fail-open).
+`Manager.Apply` is driven by the daemon, not called once at boot. The daemon
+constructs the manager **unconditionally** at startup (`ensureFeedManager`, even
+with no feed servers) and calls `reconcileFeeds` on every applied config
+generation (wired into `applyConfigLocked`, before the feed-overlay push).
+`reconcileFeeds` is gated on a hash of the feed-**server** configuration
+(`feedsConfigHash`, which excludes address bindings), so `Apply` re-runs only
+when the server set actually changes — a feed **content** refresh (which
+re-enters `applyConfig` via the `onUpdate` callback) leaves the hash unchanged
+and does not restart the fetchers. Before #5036 the manager was built only if
+boot-time feed servers existed and `Apply` was never re-invoked, so a feed
+server added/removed/edited after boot was silently ignored until restart (a
+deny policy bound to a day-2-added feed armed with zero prefixes — fail-open).
+
+## Apply-time snapshot handoff — no fail-open window on reconfigure (#5282)
+
+`Apply` reconciles the running producer set **without** dropping a persisted
+feed's enforced prefixes. Before #5282 it called `StopAll` as its FIRST step,
+which cancelled every producer and replaced `m.feeds` with an **empty** map;
+the replacement `feedState`s started empty and fetched **asynchronously**. So
+editing a deny feed's URL/interval instantly dropped its installed snapshot —
+the overlay (`SnapshotForBindings`, joined into the dataplane address book)
+compiled **match-none** from that instant until the new fetch landed. Worse, if
+the new endpoint was down, `retainForever` (the #2050 default) pinned the
+**empty** set indefinitely: a **fail-open denylist window** where traffic that
+should be DENIED was ALLOWED — directly contradicting #2050's "never fail-open a
+stale denylist" promise.
+
+`Apply` now builds the desired plan first, then swaps the producer set under one
+lock: it cancels every old producer (each captured its old URL/interval, so even
+a persisted feed with an edited URL/interval needs a fresh refresh loop) but, for
+each feed that **persists** (same name), carries its last-good enforced snapshot
+forward into the replacement `feedState` (`carryForwardSnapshot`). The persisted
+feed keeps enforcing its last-good prefixes until its NEW fetch **atomically**
+replaces them (`installSnapshot`). Distinctions:
+
+- **persisted feed** (same name, possibly new URL/interval) → last-good retained
+  until the new fetch lands; if the new fetch FAILS, `retainForever` keeps the
+  carried set installed indefinitely (never reverts to empty — #2050 preserved),
+- **removed feed** (deleted from config) → no plan entry, no replacement, its
+  snapshot is dropped (correct — the operator removed it),
+- **brand-new feed** → no prior snapshot, starts empty until its first fetch
+  (the documented fail-closed cold-start, not a regression of an existing feed).
+
+The atomic swap on a successful new fetch is unchanged, so the overlay compiler
+never sees a torn prefix set. Retained FAILURE markers (`LastError`/`StaleSince`)
+are intentionally NOT carried: the new endpoint gets a clean slate and the first
+post-Apply fetch re-derives stale state, which also gives an opt-in
+`hold-interval` a fresh window on the new endpoint rather than a partially-elapsed
+one (strictly more conservative for the fail-open guard).
 
 ## Refresh correctness & fail-safe behavior (#2050)
 
