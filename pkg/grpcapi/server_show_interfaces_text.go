@@ -460,8 +460,15 @@ func (s *Server) showIPv6RouterAdvertisement(cfg *config.Config, buf *strings.Bu
 				fmt.Fprintf(buf, "Interface: %s\n", info.Interface)
 				if info.State == "draining" {
 					// A withdrawing router (emitting its lifetime-0 goodbye);
-					// no longer advertising. Report state and move on.
-					fmt.Fprintln(buf, "  State:              draining (withdrawing)")
+					// no longer advertising. Report state and move on. #5094: a
+					// join-timed-out entry is being self-healed by the reclaimer
+					// (its wedged owner has not yet released) — surface that so
+					// an operator sees a stuck drain, not a silent hang.
+					if info.JoinTimedOut {
+						fmt.Fprintln(buf, "  State:              draining (join timed out; reclaiming)")
+					} else {
+						fmt.Fprintln(buf, "  State:              draining (withdrawing)")
+					}
 					fmt.Fprintln(buf)
 					continue
 				}

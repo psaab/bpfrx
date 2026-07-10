@@ -59,18 +59,26 @@ after HA failover. To make that **structural**, not flag-defended:
       the standalone never clobbers a re-claimed master and ≤1 live conn holds.
       The tombstone IS the mutual exclusion; there is no separate check-then-act
       on `m.senders`.
-    - **Timeout never emits AND never starts a replacement (closes the
-      happens-before break AND the ≤1-conn break on the restart path):**
-      `releaseDrain` reads `goodbyeEmitted` ONLY after a successful `<-stopped`.
-      If the join times out (`claimWaitTimeout` — pathological, since owner
-      writes are bounded by `SetWriteDeadline`), it does NOT emit a standalone
-      (the read would be unordered; the owner may be live) AND does NOT start
-      the changed-config replacement (the old conn may still be live → would
-      break ≤1-conn). It LEAVES the tombstone held — so any future
+    - **Timeout DEFERS the emit/replacement to the reclaimer — it must not
+      ERASE the owed action (#5094):** `releaseDrain` reads `goodbyeEmitted` /
+      opens a replacement ONLY after a successful `<-stopped`. If the join times
+      out (`claimWaitTimeout` — pathological, since owner writes are bounded by
+      `SetWriteDeadline`), it does NOT act inline (the `goodbyeEmitted` read
+      would be unordered and the old conn may still be live → a replacement
+      would break ≤1-conn). It LEAVES the tombstone held — so any future
       `Apply`/reconcile defers, never opening a second conn — and detaches a
-      reclaimer that removes the tombstone once the wedged owner finally exits.
-      The safe degraded state is "old sender lingers, no replacement, tombstone
-      held," never two conns and never an unordered emit.
+      reclaimer, handing it the SAME `startEpoch` + `onProvenClose`. The
+      reclaimer waits for `<-stopped` (the wedged owner finally proving its conn
+      closed — restoring the happens-before AND the old-conn-closed precondition)
+      and then runs the EXACT SAME ordered decision body (`finishDrainDecision`)
+      the proven-close arm runs: emit the owed goodbye and/or start the
+      still-current replacement, re-evaluated against fresh state under `m.mu`,
+      before removing the tombstone. A timeout thus DEFERS the action, never
+      drops it — the pre-#5094 reclaimer merely `delete`d the tombstone, leaving
+      the interface senderless (or its goodbye lost) until an unrelated later
+      `Apply` re-drove it. The transient degraded state is "old sender lingers,
+      no replacement yet, tombstone held (Status shows `join timed out`)" — never
+      two conns, never an unordered emit — self-healed once the owner exits.
   Net: EXACTLY ONE goodbye per withdrawn interface — the owner's if the
   upgrade landed, otherwise one standalone — and ZERO for a pure changed-config
   replace. Because the owner closes the conn AFTER its goodbye, a racing hard
@@ -82,7 +90,14 @@ after HA failover. To make that **structural**, not flag-defended:
   removal and the changed-config **restart**) all route through it. The restart
   passes an `onProvenClose` callback that opens the replacement conn — it runs
   ONLY on the proven-closed (`<-stopped`) arm, under `m.mu`, with the tombstone
-  still held, and only if no graceful withdraw superseded the replace. There is
+  still held, and only if no graceful withdraw superseded the replace. The
+  proven-close arm's "emit goodbye and/or start replacement, then release" logic
+  lives in ONE helper, `finishDrainDecision`, which the join-timeout reclaimer
+  ALSO runs after the wedged owner finally exits (#5094) — so a timeout defers
+  that same decision instead of a divergent path dropping it. `onProvenClose` is
+  a bare `startLocked` closure that touches no `Apply`-local state, precisely so
+  the reclaimer can run it in another goroutine without a data race; the
+  make-before-break `waitConnReady` now lives inside `releaseDrain`. There is
   no divergent inline copy of these rules, so the timeout / happens-before /
   ≤1-conn class cannot reappear in a third path.
 - **Replacement decision is atomic under the act-lock (round-5).** The
@@ -245,7 +260,10 @@ never retried and the stale IPv6 default-router identity lingered on hosts
   `State == "active"`; an interface whose sender is tearing down /
   emitting its goodbye is reported with `State == "draining"` (distinct
   from active, so a withdrawing router is neither read as still
-  advertising nor silently invisible).
+  advertising nor silently invisible). A draining entry whose owner wedged
+  past the join timeout also sets `JoinTimedOut` (#5094) so the display can
+  show `draining (join timed out; reclaiming)` — a stuck drain being
+  self-healed by the reclaimer, not a silent hang.
 
 ## Callers
 
