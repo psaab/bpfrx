@@ -1,3 +1,20 @@
+## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5041 ha/dhcpserver — Kea `subnet-id` was a positional counter
+  over each node's MASTER-filtered subnet list, so the SAME subnet got a
+  DIFFERENT id on the two HA nodes and synced leases (which carry `subnet-id`
+  verbatim) misbound on the receiver. Replaced the counter with
+  `stableSubnetID(subnet)` — an FNV-1a hash of the canonical CIDR folded into
+  Kea's valid `[1, 0xFFFFFFFE]` range — plus a deterministic sorted-order
+  linear probe (`nextSubnetID`) for the astronomically-rare same-config
+  collision. The id is now identical per subnet across nodes, filtered subsets,
+  reordering, and reloads (subsumes #2668). Updated the #2668 regen test to
+  self-capture (no longer pins positional golden ids) and added
+  `TestKeaSubnetIDStableAcrossFilteredSubsets` (RED on revert to positional).
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  docs/research/2239-dhcp-ha-lease-sync/plan.md
+
 ## 2026-07-09 — #4908 cli/show display-fidelity cohort (partial: 6 fixed, 6 deferred)
 
 - **Timestamp**: 2026-07-09

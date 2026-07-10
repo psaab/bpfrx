@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net"
@@ -831,6 +832,50 @@ func stablePools(pools []*config.DHCPPool) []*config.DHCPPool {
 	return out
 }
 
+// keaSubnetIDMax is the largest Kea subnet-id we assign. Kea subnet-ids are
+// uint32 with two reserved sentinels: 0 (SUBNET_ID_UNUSED) and 0xFFFFFFFF
+// (SUBNET_ID_GLOBAL). We therefore map into the closed range
+// [1, 0xFFFFFFFE].
+const keaSubnetIDMax = 0xFFFFFFFE
+
+// stableSubnetID derives a DETERMINISTIC Kea subnet-id from the subnet's
+// canonical CIDR identity (#5041). The prior scheme was a positional counter
+// (subnetID := 1; subnetID++) over each node's list of subnets. In an HA
+// cluster each node renders only its MASTER-filtered subset
+// (filterDHCPConfigForMasterRGs), so the SAME logical subnet landed at a
+// DIFFERENT position — and thus a DIFFERENT subnet_id — on the two nodes. A
+// synced lease carries its subnet_id verbatim, so it misbound on the receiver
+// (Kea rejected it or bound it to the wrong subnet), defeating the
+// duplicate-allocation protection lease sync exists to provide.
+//
+// Hashing the CIDR string makes the id a pure function of the subnet identity:
+// the same subnet gets the same id on both nodes regardless of the
+// MASTER-filtered subset, group ordering, or failover generation — the #5041
+// invariant. The #2668 property (stable across reloads of an unchanged config)
+// is subsumed. Distinct id spaces per family are irrelevant here: v4 and v6 are
+// separate Kea daemons with independent subnet_id spaces, and a synced lease is
+// seeded into the daemon matching its family, so we hash the CIDR alone.
+func stableSubnetID(subnet string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(subnet))
+	// Fold uint32 into [1, keaSubnetIDMax].
+	return int(h.Sum32()%keaSubnetIDMax) + 1
+}
+
+// nextSubnetID advances a subnet-id by one within the valid range, wrapping
+// keaSubnetIDMax back to 1. It is the deterministic linear probe used to
+// resolve the (astronomically unlikely) case of two DISTINCT subnets in the
+// SAME rendered config hashing to the same id: probing in the canonical
+// (sorted-group, sorted-pool) render order keeps the resolution a function of
+// the rendered SET, so it never reintroduces map-iteration nondeterminism. Two
+// subnets on a single Kea instance must never share an id or Kea would misbind.
+func nextSubnetID(id int) int {
+	if id >= keaSubnetIDMax {
+		return 1
+	}
+	return id + 1
+}
+
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	type keaPool struct {
 		Pool string `json:"pool"`
@@ -857,22 +902,27 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	m.warnAmbiguousV4SubnetSelection(cfg.DHCPLocalServer)
 
 	var subnets []keaSubnet4
-	subnetID := 1
-	// #2668: assign Kea subnet_id over a DETERMINISTIC, reload-stable order.
-	// Ranging the Groups map directly used Go's randomized map-iteration
-	// order, so every config regeneration (commit / reload) could hand the
-	// same subnet a DIFFERENT subnet_id. Kea binds memfile leases
-	// (kea-leases4.csv) to subnets by the subnet_id column, so a shifted ID
-	// remaps live leases onto the wrong subnet. Iterate group names sorted
-	// lexically and pools sorted by their subnet so the SAME logical subnet
-	// always gets the SAME subnet_id across reloads of an unchanged config.
+	usedIDs := make(map[int]bool)
+	// #5041/#2668: assign Kea subnet_id from a STABLE hash of the subnet CIDR,
+	// walking a DETERMINISTIC (sorted-group, sorted-pool) order. Kea binds
+	// memfile leases (kea-leases4.csv) to subnets by the subnet_id column. The
+	// prior positional counter gave the SAME subnet a DIFFERENT id on the two
+	// HA nodes because each renders only its MASTER-filtered subset, so a
+	// synced lease misbound on the receiver (#5041). Hashing the CIDR makes the
+	// id a function of the subnet identity alone — identical on both nodes,
+	// across filtered subsets and reloads (#2668). The sorted walk keeps the
+	// rare collision probe deterministic.
 	for _, group := range stableGroups(cfg.DHCPLocalServer.Groups) {
 		for _, pool := range stablePools(group.Pools) {
+			id := stableSubnetID(pool.Subnet)
+			for usedIDs[id] {
+				id = nextSubnetID(id)
+			}
+			usedIDs[id] = true
 			sub := keaSubnet4{
-				ID:     subnetID,
+				ID:     id,
 				Subnet: pool.Subnet,
 			}
-			subnetID++
 			if pool.RangeLow != "" && pool.RangeHigh != "" {
 				sub.Pools = append(sub.Pools, keaPool{
 					Pool: fmt.Sprintf("%s - %s", pool.RangeLow, pool.RangeHigh),
@@ -980,18 +1030,23 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 	}
 
 	var subnets []keaSubnet6
-	subnetID := 1
-	// #2668: same reload-stable subnet_id ordering as the v4 path. Kea binds
-	// kea-leases6.csv leases by subnet_id, so the randomized map-iteration
-	// order had to be replaced by a deterministic sort to keep active leases
-	// pinned to their subnet across reloads.
+	usedIDs := make(map[int]bool)
+	// #5041/#2668: same stable-hash subnet_id assignment as the v4 path. Kea
+	// binds kea-leases6.csv leases by subnet_id, so a positional counter over
+	// each node's MASTER-filtered subset gave one subnet different ids on the
+	// two nodes and misbound synced leases. Hash the CIDR so the id is stable
+	// per subnet across nodes, filtered subsets, and reloads.
 	for _, group := range stableGroups(cfg.DHCPv6LocalServer.Groups) {
 		for _, pool := range stablePools(group.Pools) {
+			id := stableSubnetID(pool.Subnet)
+			for usedIDs[id] {
+				id = nextSubnetID(id)
+			}
+			usedIDs[id] = true
 			sub := keaSubnet6{
-				ID:     subnetID,
+				ID:     id,
 				Subnet: pool.Subnet,
 			}
-			subnetID++
 			if pool.RangeLow != "" && pool.RangeHigh != "" {
 				sub.Pools = append(sub.Pools, keaPool{
 					Pool: fmt.Sprintf("%s - %s", pool.RangeLow, pool.RangeHigh),

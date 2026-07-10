@@ -409,6 +409,26 @@ to clock skew.
   apply semantics.
 - **Standalone unchanged.** Loop gated on `cluster != nil` && `DHCPLeaseSync`.
 
+### 6.1 Post-implementation corrections (codex-review-177 / codex-175)
+
+Three defects in the shipped PATH C were found after merge; the invariants
+they add are now part of the module contract:
+
+- **Stable subnet identity across nodes (#5041).** The Kea `subnet-id` MUST be
+  a deterministic function of the subnet's canonical CIDR identity, NOT a
+  positional counter over the node's rendered subnet list. Each HA node renders
+  only its MASTER-filtered subset (`filterDHCPConfigForMasterRGs`), so a
+  positional id gave the SAME logical subnet a DIFFERENT id on the two nodes; a
+  synced lease carries `subnet-id` verbatim, so it misbound on the receiver
+  (Kea rejected it or bound it to the wrong subnet), defeating the
+  duplicate-allocation protection. `stableSubnetID` (pkg/dhcpserver) hashes the
+  CIDR (FNV-1a, folded into Kea's valid `[1, 0xFFFFFFFE]` range) so the id is
+  identical on both nodes across filtered subsets, group reordering, and
+  failover generations. The `#2668` reload-stability property is subsumed. A
+  same-config hash collision between two DISTINCT subnets is resolved by a
+  deterministic linear probe walked in the canonical (sorted-group, sorted-pool)
+  render order so it stays a function of the rendered set.
+
 ---
 
 ## 7. Risk table

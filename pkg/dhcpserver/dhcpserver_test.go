@@ -1139,30 +1139,12 @@ func subnetIDMap(t *testing.T, path, family string) map[string]int {
 // subnet MUST receive the SAME subnet_id on every config regeneration. The
 // assignment used to range the randomized Groups map, so reverting to that
 // makes this test flaky (a wrong mapping eventually appears across the N
-// regenerations); the sorted assignment never does. The expected mapping is
-// the golden sorted order: groups by name (alpha, mid, zeta), pools by
-// subnet within each group.
+// regenerations). Since #5041 the id is a stable hash of the subnet CIDR
+// rather than a positional counter, so we no longer pin golden positional
+// values — we capture the first regeneration's mapping and assert every
+// subsequent regeneration reproduces it exactly.
 func TestKeaSubnetIDStableAcrossRegenerations(t *testing.T) {
-	// Golden expected subnet_id, derived from the deterministic order:
-	//   alpha/10.0.1.0/25=1, alpha/10.0.1.128/25=2, mid/10.0.2.0/24=3,
-	//   zeta/10.0.3.0/24=4.
-	wantV4 := map[string]int{
-		"10.0.1.0/25":   1,
-		"10.0.1.128/25": 2,
-		"10.0.2.0/24":   3,
-		"10.0.3.0/24":   4,
-	}
-	// NOTE: stablePools sorts by the literal subnet STRING, and
-	// "2001:db8:1:8000::/65" < "2001:db8:1::/65" lexically ('8' (0x38) <
-	// ':' (0x3a) at the 4th hextet), so the 8000 half-subnet gets id 1.
-	// The exact ordering does not matter for correctness — only that it is
-	// STABLE — but the golden pins it so an accidental reorder is caught.
-	wantV6 := map[string]int{
-		"2001:db8:1:8000::/65": 1,
-		"2001:db8:1::/65":      2,
-		"2001:db8:2::/64":      3,
-		"2001:db8:3::/64":      4,
-	}
+	var wantV4, wantV6 map[string]int
 
 	const regens = 50 // enough to surface map-order randomization on revert
 	for i := 0; i < regens; i++ {
@@ -1171,8 +1153,10 @@ func TestKeaSubnetIDStableAcrossRegenerations(t *testing.T) {
 			t.Fatalf("generateKea4Config[%d]: %v", i, err)
 		}
 		got := subnetIDMap(t, mv4.confPath4, "4")
-		if !mapsEqualSI(got, wantV4) {
-			t.Fatalf("v4 regen %d: subnet_id mapping %v != golden %v", i, got, wantV4)
+		if i == 0 {
+			wantV4 = got
+		} else if !mapsEqualSI(got, wantV4) {
+			t.Fatalf("v4 regen %d: subnet_id mapping %v != first-regen %v", i, got, wantV4)
 		}
 
 		mv6, _ := testManager(t, map[string]bool{}, "")
@@ -1180,10 +1164,94 @@ func TestKeaSubnetIDStableAcrossRegenerations(t *testing.T) {
 			t.Fatalf("generateKea6Config[%d]: %v", i, err)
 		}
 		got6 := subnetIDMap(t, mv6.confPath6, "6")
-		if !mapsEqualSI(got6, wantV6) {
-			t.Fatalf("v6 regen %d: subnet_id mapping %v != golden %v", i, got6, wantV6)
+		if i == 0 {
+			wantV6 = got6
+		} else if !mapsEqualSI(got6, wantV6) {
+			t.Fatalf("v6 regen %d: subnet_id mapping %v != first-regen %v", i, got6, wantV6)
 		}
 	}
+}
+
+// TestKeaSubnetIDStableAcrossFilteredSubsets is the #5041 regression guard.
+// In an HA cluster each node renders only its MASTER-filtered subset of
+// subnets, so the SAME logical subnet lands at a DIFFERENT position on the two
+// nodes. The old positional counter therefore gave that subnet a DIFFERENT
+// subnet_id per node, and a synced lease (which carries subnet_id verbatim)
+// misbound on the receiver. The stable-hash id must be IDENTICAL for a subnet
+// whether it is rendered in the full config or in a filtered subset where its
+// position shifts.
+//
+// Fail-on-revert: reverting stableSubnetID to the positional counter makes the
+// filtered subset renumber the shared subnets (position 3/4 in full become
+// 1/2 in the {mid,zeta} subset), so this test fails.
+func TestKeaSubnetIDStableAcrossFilteredSubsets(t *testing.T) {
+	check := func(t *testing.T, family string,
+		gen func(m *Manager, cfg *config.DHCPServerConfig) error,
+		full *config.DHCPServerConfig,
+		subsetGroups map[string]*config.DHCPServerGroup,
+		sharedSubnets []string,
+	) {
+		t.Helper()
+		mFull, _ := testManager(t, map[string]bool{}, "")
+		if err := gen(mFull, full); err != nil {
+			t.Fatalf("generate full: %v", err)
+		}
+		confPath := mFull.confPath4
+		if family == "6" {
+			confPath = mFull.confPath6
+		}
+		idsFull := subnetIDMap(t, confPath, family)
+
+		// Render only a subset of the groups (as a node mastering a subset of
+		// RGs would), which shifts the surviving subnets' positions.
+		subset := &config.DHCPServerConfig{}
+		if family == "6" {
+			subset.DHCPv6LocalServer = &config.DHCPLocalServerConfig{Groups: subsetGroups}
+		} else {
+			subset.DHCPLocalServer = &config.DHCPLocalServerConfig{Groups: subsetGroups}
+		}
+		mSub, _ := testManager(t, map[string]bool{}, "")
+		if err := gen(mSub, subset); err != nil {
+			t.Fatalf("generate subset: %v", err)
+		}
+		confPathSub := mSub.confPath4
+		if family == "6" {
+			confPathSub = mSub.confPath6
+		}
+		idsSub := subnetIDMap(t, confPathSub, family)
+
+		for _, sn := range sharedSubnets {
+			if idsFull[sn] == 0 || idsSub[sn] == 0 {
+				t.Fatalf("subnet %s missing (full=%d subset=%d)", sn, idsFull[sn], idsSub[sn])
+			}
+			if idsFull[sn] != idsSub[sn] {
+				t.Errorf("subnet %s subnet_id shifted between full (%d) and filtered subset (%d) — synced leases would misbind on the peer",
+					sn, idsFull[sn], idsSub[sn])
+			}
+		}
+	}
+
+	v4Full := multiGroupV4Config()
+	check(t, "4",
+		func(m *Manager, cfg *config.DHCPServerConfig) error { return m.generateKea4Config(cfg) },
+		v4Full,
+		map[string]*config.DHCPServerGroup{
+			"mid":  v4Full.DHCPLocalServer.Groups["mid"],
+			"zeta": v4Full.DHCPLocalServer.Groups["zeta"],
+		},
+		[]string{"10.0.2.0/24", "10.0.3.0/24"},
+	)
+
+	v6Full := multiGroupV6Config()
+	check(t, "6",
+		func(m *Manager, cfg *config.DHCPServerConfig) error { return m.generateKea6Config(cfg) },
+		v6Full,
+		map[string]*config.DHCPServerGroup{
+			"mid":  v6Full.DHCPv6LocalServer.Groups["mid"],
+			"zeta": v6Full.DHCPv6LocalServer.Groups["zeta"],
+		},
+		[]string{"2001:db8:2::/64", "2001:db8:3::/64"},
+	)
 }
 
 func mapsEqualSI(a, b map[string]int) bool {
