@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -443,6 +444,19 @@ var performZeroizeWipe = func() error {
 	// marker, #1944) so a non-xpf admin/system/operator account is NEVER touched.
 	// Also security-critical, so fold its first error into the surfaced result.
 	if e := zeroizeLoginAccounts(); e != nil && err == nil {
+		err = e
+	}
+
+	// Local config archive (#5186): /var/lib/xpf/archive holds
+	// config-<ts>.<seq>.conf snapshots — 0600 copies of the full committed
+	// config TEXT WITH cleartext secret leaves (IKE PSK, WireGuard keys, SNMP
+	// communities). It is the last on-box generation of config secrets and a
+	// pre-#5186 zeroize LEFT it behind, so a re-tenanted device kept the prior
+	// tenant's archived secrets. Ownership-guarded (FactoryResetArchiveDir):
+	// erases ONLY the xpf-owned default path, never a custom/remote/compliance
+	// archive destination. Also security-critical, so fold its first error into
+	// the surfaced result.
+	if e := configstore.FactoryResetArchiveDir(configstore.DefaultArchiveDir); e != nil && err == nil {
 		err = e
 	}
 
