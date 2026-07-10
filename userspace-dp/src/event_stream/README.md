@@ -26,7 +26,7 @@ periodic ACK from the daemon.
   `MSG_SESSION_CREATE_RT_FLOW` (15).
   The telemetry frame payload is not a userspace-specific schema: it is
   the same `dataplane.Event` layout consumed by the Go ringbuf logger,
-  including AF values 2/10 and big-endian L4 ports. The payload is 152
+  including AF values 2/10 and big-endian L4 ports. The payload is 160
   bytes (`SECURITY_EVENT_PAYLOAD_SIZE`): #3056 grew it 136 -> 144 (the
   trailing [136:140] u32 carries the admitting policy ID on the
   SESSION_CLOSE frame, whose [44:48] policy_id slot is occupied by the
@@ -36,12 +36,29 @@ periodic ACK from the daemon.
   at [144:152] on the SESSION_CLOSE RT_FLOW frame: [144] src ToS byte
   (DSCP<<2), [145] cumulative TCP control bits, [146:148] reserved
   (flowDirection, deferred), [148:152] egress ifindex (LITTLE-endian u32).
+  #4915 grew it once more 152 -> 160 with an ADDITIVE [152:160] u64
+  (LITTLE-endian) carrying the dataplane's STABLE session id on BOTH the
+  SESSION_CREATE and SESSION_CLOSE frames (`encode_session_create_rt_flow`
+  / `encode_session_close_rt_flow`, threaded from the session's
+  `SessionEntry.session_id` via the Open/Close `SessionDelta`), so a SIEM
+  can join a session's open and close records — the per-event ordinal the
+  Go side stamped before could never match across the two events, nor
+  disambiguate a reused 5-tuple. deny/screen/filter frames have no session
+  and leave [152:160] zero.
   The growth is additive and rolling-upgrade-safe: the Go reader keeps its
   minimum-frame acceptance at the legacy 144 bytes and decodes the
   [144:152] block ONLY when the frame carries it (`len >= 152`) AND on a
-  SESSION_CLOSE, so a new daemon still accepts an old helper's 144-byte
-  frames and an old daemon ignores the trailing 8 bytes (#1961). Every
-  frame encoder emits 152 bytes; non-close frames leave [144:152] zero.
+  SESSION_CLOSE, and the [152:160] session id ONLY when `len >= 160` AND on
+  a SESSION_CREATE/CLOSE, so a new daemon still accepts an old helper's
+  144/152-byte frames and an old daemon ignores the trailing bytes (#1961).
+  Every frame encoder emits 160 bytes; non-close frames leave [144:152]
+  zero and non-session frames leave [152:160] zero. NOTE (#4915 scope): a
+  peer-synced session gets a FRESH node-local id on import — cross-HA-node
+  id identity (the same id on both cluster nodes) is a documented follow-up
+  needing a session-sync wire change; and `show security flow session`
+  still surfaces the iteration-index fallback until the conntrack-map
+  publish is unified to the same `SessionEntry.session_id` (also a
+  follow-up).
   Userspace telemetry may also populate the non-session metadata slots
   used by the Go adapter for action, rule ID, term ID, reason, owner RG,
   ingress ifindex, and application ID.

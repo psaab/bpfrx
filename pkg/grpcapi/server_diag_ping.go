@@ -17,9 +17,48 @@ import (
 
 // --- Diagnostic RPCs ---
 
+// maxDiagArgLen bounds each operator-supplied diagnostic argument
+// (target, source, routing-instance) at the RPC boundary. A DNS name is
+// capped at 253 octets (RFC 1035), an IPv6 literal at ~45, and a VRF
+// name is short, so 512 accepts every legitimate value while rejecting a
+// pathological field far below the streamDiagCmd line-scanner token cap.
+// The gRPC receive limit is 16 MiB, so without this bound a multi-kilobyte
+// target reaches exec and surfaces as a single combined-output line larger
+// than the scanner token size — the ErrTooLong leak vector fixed in
+// streamDiagCmd (#5060).
+const maxDiagArgLen = 512
+
+// checkDiagArg rejects an over-length diagnostic argument with
+// InvalidArgument so an oversized field never reaches exec or the
+// combined-output line scanner.
+func checkDiagArg(name, v string) error {
+	if len(v) > maxDiagArgLen {
+		return status.Errorf(codes.InvalidArgument,
+			"%s exceeds %d bytes (%d)", name, maxDiagArgLen, len(v))
+	}
+	return nil
+}
+
+// checkDiagArgs bounds the shared ping/traceroute fields in one pass.
+func checkDiagArgs(target, source, routingInstance string) error {
+	for _, f := range []struct{ name, val string }{
+		{"target", target},
+		{"source", source},
+		{"routing-instance", routingInstance},
+	} {
+		if err := checkDiagArg(f.name, f.val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.PingResponse]) error {
 	if req.Target == "" {
 		return status.Error(codes.InvalidArgument, "target required")
+	}
+	if err := checkDiagArgs(req.Target, req.Source, req.RoutingInstance); err != nil {
+		return err
 	}
 	count := int(req.Count)
 	if count <= 0 {
@@ -58,6 +97,9 @@ func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreami
 	if req.Target == "" {
 		return status.Error(codes.InvalidArgument, "target required")
 	}
+	if err := checkDiagArgs(req.Target, req.Source, req.RoutingInstance); err != nil {
+		return err
+	}
 	cmd := buildTracerouteArgv(req)
 
 	return streamDiagCmd(stream.Context(), diagTracerouteTimeout, cmd, func(line string) error {
@@ -76,6 +118,18 @@ func buildTracerouteArgv(req *pb.TracerouteRequest) []string {
 		RoutingInstance: req.RoutingInstance,
 	})
 }
+
+// diagScanInitToken / diagScanMaxToken size the combined-output line
+// scanner in streamDiagCmd. The max is set explicitly (rather than
+// relying on the bufio default) to make the per-line ceiling a
+// deliberate, documented bound: a line beyond it is a controlled
+// bufio.ErrTooLong that the streamDiagCmd cleanup path reaps without
+// leaking the child or scan goroutine (#5060). Diag output lines are
+// short, so 64 KiB is generous.
+const (
+	diagScanInitToken = 4 << 10  // 4 KiB initial scanner buffer
+	diagScanMaxToken  = 64 << 10 // 64 KiB hard per-line cap
+)
 
 // streamDiagCmd runs a command and streams each line of combined output
 // via sendFn. timeout is request-sized by the caller (#1819, see the
@@ -106,21 +160,32 @@ func streamDiagCmd(ctx context.Context, timeout time.Duration, cmd []string, sen
 
 	// Scan lines and stream each one.
 	scanner := bufio.NewScanner(pr)
+	// Bound the per-line token deliberately (#5060): a combined-output
+	// line longer than diagScanMaxToken is a controlled bufio.ErrTooLong,
+	// not an unbounded allocation.
+	scanner.Buffer(make([]byte, 0, diagScanInitToken), diagScanMaxToken)
 	scanDone := make(chan error, 1)
 	go func() {
+		// Own and close BOTH pipe ends on EVERY exit path — the
+		// send-failure path AND the scanner-error/EOF path (#5060).
+		// Whenever the scanner stops reading pr (a sendFn failure, or a
+		// scanner error such as bufio.ErrTooLong from a line beyond
+		// diagScanMaxToken), exec.Cmd's internal copy goroutine can be
+		// blocked in pw.Write; WaitDelay closes only the exec-owned OS
+		// pipes, not this io.Pipe, so without pr.Close() that write
+		// never returns, c.Wait() below never returns, and the RPC plus
+		// this goroutine leak past the deadline. pr.Close() makes the
+		// blocked write return ErrClosedPipe; cancel() kills the child
+		// promptly. Both are idempotent and harmless on the normal EOF
+		// path — pr is already drained and the child already exited.
+		// (Codex review on PR #1823 established the send-failure half;
+		// #5060 extends it to the scanner-error path.)
+		defer func() {
+			cancel()
+			_ = pr.Close()
+		}()
 		for scanner.Scan() {
 			if err := sendFn(scanner.Text()); err != nil {
-				// Nobody reads the pipe after this point — kill the
-				// child now instead of letting it block on writes for
-				// the rest of the budget, AND close the read end:
-				// exec.Cmd's internal copy goroutine may already be
-				// blocked in pw.Write on a burst the scanner never
-				// consumed, and WaitDelay only closes the exec-owned
-				// OS pipes, not this io.Pipe — pr.Close makes that
-				// blocked write return ErrClosedPipe so c.Wait can
-				// finish (Codex review on PR #1823).
-				cancel()
-				pr.Close()
 				scanDone <- err
 				return
 			}
