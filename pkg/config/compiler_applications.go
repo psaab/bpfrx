@@ -182,8 +182,18 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 			// which handles both `address` and `address-set` members.
 			switch member.Name() {
 			case "application", "application-set":
-				v := nodeVal(member)
-				if v != "" {
+				// A bracketed member list (`application [ a b c ]` or
+				// `application-set [ S1 S2 ]`) collapses onto ONE leaf whose
+				// Keys hold every value (Keys=["application","a","b","c"]) per
+				// the #2419 dual-shape pattern — the lexer strips the brackets
+				// and the multi:true-style leaf absorbs the trailing tokens.
+				// Reading only nodeVal(member) (== Keys[1]) compiled just the
+				// first entry and silently dropped the rest, so a policy
+				// referencing the set under-matched — a DENY covered only the
+				// first application (#5181, the applications-side analogue of
+				// the #4791 address-set fix). Accumulate every value across
+				// BOTH AST shapes.
+				for _, v := range applicationSetMemberValues(member) {
 					as.Applications = append(as.Applications, v)
 				}
 			case "description":
@@ -729,4 +739,36 @@ func nodeVal(n *Node) string {
 		return n.Children[0].Name()
 	}
 	return ""
+}
+
+// applicationSetMemberValues extracts every value carried by an
+// application-set `application` / `application-set` member node, across BOTH
+// parser AST shapes (#2419, #5181 — the applications-side instance of the same
+// dual-shape class as addressSetMemberValues in compiler_security_addressbook.go
+// and firewallMatchValues in compiler_firewall.go):
+//
+//   - single member          `application a;`         → Keys=["application","a"]
+//   - bracket list            `application [ a b c ];` → Keys=["application","a","b","c"]
+//     (the lexer strips `[`/`]` and the leaf absorbs every trailing token onto
+//     Keys, so a bracketed list collapses onto ONE node)
+//   - flat set, one line each `set ... application a` +
+//     `set ... application b`                          → one child per value
+//
+// Reading only member.Keys[1] (nodeVal, the pre-#5181 bug) compiles just the
+// first bracket-list entry and silently drops the rest — a security-relevant
+// under-match when a DENY policy references the truncated set. Reading BOTH
+// Keys[1:] AND each child's Keys[0] covers every shape the parser can produce.
+func applicationSetMemberValues(member *Node) []string {
+	var vals []string
+	for _, k := range member.Keys[1:] {
+		if k != "" {
+			vals = append(vals, k)
+		}
+	}
+	for _, vn := range member.Children {
+		if len(vn.Keys) >= 1 && vn.Keys[0] != "" {
+			vals = append(vals, vn.Keys[0])
+		}
+	}
+	return vals
 }
