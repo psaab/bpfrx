@@ -44,9 +44,16 @@
 //
 // Durability note: a WriteFileDurable error AFTER the rename (directory
 // fsync failure) means the new content is visible in the namespace but
-// its durability is unknown. Callers treating the write as failed must
-// tolerate the new content surviving — the same crash-window trade the
-// #1799 persist-before-promote contract already documents.
+// its durability is unknown. Such a failure is returned as a typed
+// *PostRenameSyncError (#5185) so a caller that keeps durable-on-disk
+// state in lockstep with applied in-memory state (configstore commit)
+// can DISTINGUISH it from a pre-rename failure: a pre-rename error leaves
+// the OLD content intact (a clean rejection is correct), whereas the
+// post-rename error leaves the NEW content visible — a restart would load
+// it — so the caller must converge to the new content rather than report
+// a plain rejection. Callers that only treat the write as failed still
+// work unchanged: *PostRenameSyncError is a plain error whose Error()
+// names the stage and whose Unwrap() exposes the underlying fsync error.
 package fsatomic
 
 import (
@@ -55,6 +62,37 @@ import (
 	"path/filepath"
 	"syscall"
 )
+
+// PostRenameSyncError reports a WriteFileDurable failure that happened
+// AFTER the rename succeeded — the parent-directory fsync failed (#5185).
+// At this point the NEW content is already visible in the namespace (a
+// reader, or a daemon restart, sees `data`); only its durability across
+// power loss is unknown. This is categorically different from any
+// pre-rename failure (create/write/chmod/chown/temp-fsync/close/rename),
+// where the rename never happened and the OLD content is intact.
+//
+// A caller that must keep durable-on-disk state consistent with applied
+// in-memory state — configstore Commit/CommitConfirmed — type-asserts on
+// this via errors.As to CONVERGE to the new content (make memory/applied
+// match what a restart would load) instead of returning a clean rejection
+// while the new content is durable on disk. A caller that does not care
+// treats it as an opaque error unchanged.
+type PostRenameSyncError struct {
+	// Path is the target the rename landed on (the new content is visible
+	// here).
+	Path string
+	// Err is the underlying directory-fsync error.
+	Err error
+}
+
+func (e *PostRenameSyncError) Error() string {
+	return fmt.Sprintf("fsatomic: directory fsync after rename to %s failed: %v "+
+		"(new content is visible; durability across power loss is unknown)", e.Path, e.Err)
+}
+
+// Unwrap exposes the underlying fsync error so errors.Is/As on the wrapped
+// cause still works.
+func (e *PostRenameSyncError) Unwrap() error { return e.Err }
 
 type options struct {
 	preserveExisting bool
@@ -111,6 +149,14 @@ var (
 	chownTemp  = func(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
 	syncFile   = func(f *os.File) error { return f.Sync() }
 	closeTemp  = func(f *os.File) error { return f.Close() }
+
+	// afterRenameSyncDir is the POST-rename directory-fsync seam (#5185).
+	// It is separate from syncFile (which serves the pre-rename temp-file
+	// fsync AND SyncDir) so a test can force the durability-sync failure
+	// that occurs strictly AFTER a successful rename — the
+	// PostRenameSyncError path — without also failing the pre-rename temp
+	// fsync. Defaults to SyncDir; production code must never mutate it.
+	afterRenameSyncDir = SyncDir
 )
 
 // WriteFileAtomic replaces path with data via create-temp-in-same-dir,
@@ -312,9 +358,12 @@ func writeFile(path string, data []byte, perm os.FileMode, durable bool, opts ..
 	if durable {
 		// Make the rename itself durable. Uses the RESOLVED target's
 		// parent — with WithResolveSymlinks the symlink's own directory
-		// is irrelevant to where the namespace change happened.
-		if err := SyncDir(dir); err != nil {
-			return err
+		// is irrelevant to where the namespace change happened. A failure
+		// HERE is post-rename: the new content is already visible in the
+		// namespace, so wrap it in *PostRenameSyncError (#5185) — the old
+		// content is gone and a caller must not report a clean rejection.
+		if err := afterRenameSyncDir(dir); err != nil {
+			return &PostRenameSyncError{Path: target, Err: err}
 		}
 	}
 	return nil

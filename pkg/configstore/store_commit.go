@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,19 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
+
+// isPostRenameDurabilityFailure reports whether err is fsatomic's
+// post-rename directory-fsync failure (#5185). At that point the NEW
+// content is already VISIBLE on disk (a daemon restart would load it),
+// only its durability across power loss is unknown — categorically
+// different from a pre-rename failure, which leaves the OLD content intact.
+// The commit paths use it to converge to the new content on a post-rename
+// failure instead of reporting a clean rejection while the new content is
+// durable on disk (durable(C) != in-memory/applied(A)).
+func isPostRenameDurabilityFailure(err error) bool {
+	var e *fsatomic.PostRenameSyncError
+	return errors.As(err, &e)
+}
 
 // Rollback/archive persistence seams (#3441, following the #1916
 // pkg/api/tls_test.go pattern). Production code must never mutate these;
@@ -107,15 +121,42 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		return nil, fmt.Errorf("commit check failed: %w", err)
 	}
 
-	// #1799 Option A: persist BEFORE promote. On failure the old
-	// active stays on disk and in memory; the operator sees the
-	// error and the candidate is still there to retry.
+	// #1799 Option A: persist BEFORE promote. On a PRE-rename failure the
+	// old active stays on disk and in memory; the operator sees the error
+	// and the candidate is still there to retry.
+	//
+	// #5185: a POST-rename directory-fsync failure is categorically
+	// different — the candidate (C) is already VISIBLE on disk (a restart
+	// would load C), only its durability across power loss is unknown.
+	// Returning a plain "commit failed" there would leave
+	// durable(C) != in-memory/applied(A): the operator is told REJECTED
+	// while a restart activates C — the reported-rejected-but-durable
+	// divergence. So on a post-rename failure CONVERGE instead of rejecting:
+	// promote C in memory and return the compiled config so the daemon
+	// APPLIES it, restoring durable==memory==applied, and flag the
+	// durability uncertainty through the Option-B degraded machinery
+	// (health 503, gauge, journal ERROR, background re-fsync retry via
+	// noteActivePersistFailureLocked). Converge-to-C is chosen over
+	// durably-restoring-A because restoring A needs ANOTHER rename that can
+	// itself fail post-rename — fsatomic cannot guarantee an atomic restore
+	// — whereas C is already the durable content, so converging to it needs
+	// no further write to hold the invariant.
 	if err := s.writeActive(s.candidate); err != nil {
-		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
+		if !isPostRenameDurabilityFailure(err) {
+			return nil, fmt.Errorf("commit failed: persist active config: %w", err)
+		}
+		// Post-rename: converge memory+applied to C (fall through to the
+		// promotion below), but keep the degraded signal. everCommitted /
+		// persistMarkerCommitted are set BEFORE noteActivePersistFailureLocked
+		// so the background retry re-writes committed=1 for C.
+		s.everCommitted = true
+		s.persistMarkerCommitted = true
+		s.noteActivePersistFailureLocked("commit_postrename", err)
+	} else {
+		s.persistDegraded = false       // disk now holds the current config
+		s.everCommitted = true          // #1922 step-0: a real commit has succeeded
+		s.persistMarkerCommitted = true // #1922: degraded-retry writes committed=1
 	}
-	s.persistDegraded = false       // disk now holds the current config
-	s.everCommitted = true          // #1922 step-0: a real commit has succeeded
-	s.persistMarkerCommitted = true // #1922: degraded-retry writes committed=1
 
 	// Push current active to history with description
 	s.history.Push(&HistoryEntry{
@@ -262,17 +303,31 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 
 	// #1799 Option A: persist BEFORE promoting and BEFORE touching
 	// any confirm state (see contract above).
+	//
+	// #5185: classify the failure exactly as CommitWithDescription does. A
+	// PRE-rename failure is a clean rejection — old active intact, and (per
+	// the #1799 ordering) no confirm state touched. A POST-rename dir-fsync
+	// failure leaves the candidate (C) visible on disk, so converge to it
+	// (promote, arm the timer, return compiled) and flag degraded
+	// durability, rather than report REJECTED while a restart would activate
+	// C. Rationale (converge-to-C over restore-A) is in CommitWithDescription.
 	if err := s.writeActive(s.candidate); err != nil {
-		return nil, fmt.Errorf("commit confirmed failed: persist active config: %w", err)
+		if !isPostRenameDurabilityFailure(err) {
+			return nil, fmt.Errorf("commit confirmed failed: persist active config: %w", err)
+		}
+		s.everCommitted = true
+		s.persistMarkerCommitted = true
+		s.noteActivePersistFailureLocked("commit_confirmed_postrename", err)
+	} else {
+		s.persistDegraded = false // disk now holds the current config
+		// #1922 step-0: a commit confirmed persists the candidate as the
+		// active config (committed=1 on disk via writeActive). The marker is
+		// set here, NOT gated on confirmation — the on-disk DB is now a real
+		// committed config; if the timer fires, the Item 1b first-commit
+		// rollback path (prevCfg==nil) re-writes the never-committed marker.
+		s.everCommitted = true
+		s.persistMarkerCommitted = true
 	}
-	s.persistDegraded = false // disk now holds the current config
-	// #1922 step-0: a commit confirmed persists the candidate as the
-	// active config (committed=1 on disk via writeActive). The marker is
-	// set here, NOT gated on confirmation — the on-disk DB is now a real
-	// committed config; if the timer fires, the Item 1b first-commit
-	// rollback path (prevCfg==nil) re-writes the never-committed marker.
-	s.everCommitted = true
-	s.persistMarkerCommitted = true
 
 	if s.confirmTimer != nil {
 		// Nested confirmed commit: cancel the pending timer but keep

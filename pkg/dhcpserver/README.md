@@ -125,40 +125,61 @@ subtree with an IPv6 `fixed-address`.)
   separate companion gap, #2239.) ISC Kea handles static reservations
   entirely in the config file, independent of its HA hook.
 
-## Stable subnet IDs — #2668
+## Stable subnet IDs — #2668 / #5041 / #5203
 
 `generateKea4Config`/`generateKea6Config` assign each rendered subnet a Kea
 `subnet_id` (the `id` field of `subnet4`/`subnet6`). Kea binds memfile leases
 (`kea-leases4.csv`/`kea-leases6.csv`) to a subnet by the `subnet_id` COLUMN,
-so the ID a subnet receives MUST be stable across config regenerations
-(commit / reload) — a shifted ID remaps live leases onto the wrong
-subnet/pool and corrupts diagnostics, lease-sync, and DDNS (which keys
-desired records by SubnetID, #2663).
+so the ID a subnet receives MUST be stable — both across config regenerations
+on ONE node (commit / reload, #2668) and across the two HA nodes (#5041). A
+shifted ID remaps live leases onto the wrong subnet/pool and corrupts
+diagnostics, lease-sync, and DDNS (which keys desired records by SubnetID,
+#2663). A synced lease carries its `subnet_id` verbatim, so if the peer
+renders the same subnet under a different id, the lease misbinds on the
+receiver (#5041).
 
-The IDs are assigned over a DETERMINISTIC order:
+The id is a pure function of the subnet's canonical CIDR identity
+(`stableSubnetID`): an FNV-1a hash of the CIDR string folded into the valid
+Kea range `[1, 0xFFFFFFFE]` (avoiding the reserved sentinels `0` =
+SUBNET_ID_UNUSED and `0xFFFFFFFF` = SUBNET_ID_GLOBAL). Hashing the CIDR — not
+the subnet's POSITION — is what makes the id identical on both HA nodes: each
+node renders only its MASTER-filtered subset (`filterDHCPConfigForMasterRGs`),
+so the same subnet lands at a different position on the two nodes, and the
+pre-#5041 positional counter therefore gave it a different id per node. The
+#2668 reload-stability property (an unchanged config always renders identical
+ids) is subsumed, since the hash never depends on map-iteration order.
 
-- **Groups** are sorted by name (`stableGroups`). The config holds groups in
-  a Go map, whose iteration order is RANDOMIZED — ranging it directly was the
-  #2668 bug: the same subnet could get a different `subnet_id` on every
-  regeneration of an UNCHANGED config.
-- **Pools** within a group are sorted by subnet, then name (`stablePools`),
-  so a pool keeps its `subnet_id` even if it is reordered within the group's
-  config list. The subnet string is the natural key Kea binds a lease to.
-- The `interfaces-config.interfaces` list is collected over the same sorted
-  group order, so it is deterministic too.
+Rendering still walks a DETERMINISTIC order — **groups** sorted by name
+(`stableGroups`), **pools** sorted by subnet then name (`stablePools`), and
+the `interfaces-config.interfaces` list collected over the same order — but
+that order now only governs the COLLISION probe, not the id value itself.
 
-Stability level: SORTED-BY-NAME (not a persisted name→id map). This removes
-the randomization — the actual reported defect — so an unchanged config
-always renders identical `subnet_id`s. The weaker guarantee is that
-INSERTING a group/pool whose sort key lands in the middle shifts the IDs of
-all later subnets (a persistent name→id store would avoid that). Add/remove
-is a deliberate operator config change, not the per-reload churn #2668 is
-about, and a persisted ID map adds a new on-disk state file plus its own
-HA-sync and stale-entry-GC concerns; the regression guard
-(`TestKeaSubnetIDStableAcrossRegenerations`) pins the sorted ordering and is
-the failure mode that bit production. If add/remove lease-remapping becomes a
-concern, layering a persistent map on top of this stable order is the next
-increment.
+**Collision probe (#5203).** Two DISTINCT CIDRs in one rendered config can
+hash to the same id (astronomically rare, ~k²/2³³ for k subnets). Two subnets
+on one Kea instance must never share an id, so the loser probes for a free id
+(`resolveSubnetID`). The probe sequence is `base + k*step` folded into
+`[1, 0xFFFFFFFE]`, where `step` is derived from a SECOND, independently-salted
+FNV-1a hash of the CIDR (`subnetProbeStep`). Because both the base and the
+step are pure functions of the CIDR — never of the surrounding subnets — a
+colliding subnet walks the SAME sequence on both nodes and resolves to the
+SAME id even under asymmetric RG mastering. The earlier +1 linear probe
+stepped through the node's render order, so the free id it found depended on
+which OTHER subnets that node mastered and could differ across nodes,
+reintroducing the #5041 misbind for the colliding pair. The step is forced
+coprime with `0xFFFFFFFE` (= 2·(2³¹−1)) so the walk visits every id exactly
+once and always finds a free slot.
+
+Residual: the probe converges cross-node unless a THIRD subnet, present in one
+node's subset but not the other, hashes onto the loser's CIDR-derived probe
+path — a second-order coincidence far rarer than the first-order collision,
+and the practical limit of a stateless (no persisted name→id map) scheme. A
+persisted map would also close the add/remove-shifts-later-ids gap but adds a
+new on-disk state file with its own HA-sync and stale-entry-GC concerns;
+add/remove is a deliberate operator change, not the per-reload churn #2668
+addressed. Regression guards: `TestKeaSubnetIDStableAcrossRegenerations`
+(#2668, reload), `TestKeaSubnetIDStableAcrossFilteredSubsets` (#5041,
+cross-node), and `TestKeaSubnetIDCollisionProbeIsNodeIndependent` (#5203,
+colliding pair).
 
 ## Expired-lease reclamation — #1387 (stale-lease-cleanup slice / Path S)
 
