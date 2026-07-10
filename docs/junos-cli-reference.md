@@ -1904,6 +1904,30 @@ JUNOS modules [20250306.002422_builder_junos_244_r1_s2]
 
 ---
 
+## System: Log
+
+**Commands:**
+
+```
+> show log [N]              # last N daemon (journald) lines, default 50
+> show log <name> [N]       # last N lines of the /var/log/<name> syslog file
+```
+
+### Format Details
+
+- With no filename, tails the `xpfd` journald unit. With a filename argument,
+  reads `/var/log/<name>`; `<name>` is restricted to the operator-configured
+  `system syslog file` allowlist (#4860) — a view-only (PermView) account cannot
+  read arbitrary root-readable files under `/var/log`.
+- The optional line count `N` defaults to 50. A non-positive or unparseable `N`
+  is ignored and falls back to the default (Junos-compatible leniency).
+- `N` is clamped to a fixed maximum (100,000 lines, the same `maxTailLines` cap
+  as `| last N`) so a view-only account cannot request `show log 1000000000` and
+  force `tail`/`journalctl` to emit — and the control plane to buffer in-process
+  — an unbounded number of lines (#5069).
+
+---
+
 ## Chassis Cluster: Status
 
 **Command:** `show chassis cluster status`
