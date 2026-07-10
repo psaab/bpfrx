@@ -294,6 +294,26 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #5195 (codex-177 A3-b2-F7) reserved IPsec proposal-name gate. The
+	// compiler mints synthetic proposals under the `__proposal-set/` name
+	// prefix when expanding a predefined `proposal-set` (expandIKEProposalSets /
+	// expandIPsecProposalSets) and writes them into the SAME name-keyed maps as
+	// operator-authored proposals. The lexer permits `/ _ .` in bare
+	// identifiers, so an authored proposal can take that exact name and one
+	// silently overwrites the other — a different / weaker crypto proposal is
+	// installed than configured (a silent downgrade). Runs on the group-
+	// expanded, inactive-pruned tree so an apply-groups-inherited proposal is
+	// covered. Strict (commit / commit-check): a reserved-prefix authored name
+	// hard-rejects. Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config an older binary accepted still boots (#1960) — the
+	// expand-time occupancy guard then keeps the authored proposal from being
+	// clobbered.
+	reservedProposalNameWarnings, err := validateReservedIPsecProposalNamesAST(
+		tree.Children, opts.lenientReservedProposalSetNames)
+	if err != nil {
+		return nil, err
+	}
+
 	// #3113 security-policy unsupported-match-leaf gate. A policy whose
 	// `match` clause carries a leaf the compiler does not enforce (e.g.
 	// `dynamic-application`, `url-category`, `source-identity`) committed
@@ -439,6 +459,7 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, fwFilterFamilyAnyWarnings...)
 	warnings = append(warnings, bindIfaceWarnings...)
 	warnings = append(warnings, ipsecTSWarnings...)
+	warnings = append(warnings, reservedProposalNameWarnings...)
 	warnings = append(warnings, policyMatchWarnings...)
 	warnings = append(warnings, policyThenPermitWarnings...)
 	warnings = append(warnings, policyThenRejectWarnings...)

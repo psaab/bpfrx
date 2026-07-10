@@ -342,6 +342,20 @@ type compileOpts struct {
 	// line stays inert. Same doctrine as lenientIKEPolicyChainRef.
 	lenientIPsecTrafficSelectors bool
 
+	// lenientReservedProposalSetNames (#5195, codex-177 A3-b2-F7) downgrades
+	// the reserved-proposal-name gate (validateReservedIPsecProposalNamesAST)
+	// from a hard compile error to a cfg.Warnings entry on the tolerant load /
+	// peer-sync paths. An operator-authored `security {ike|ipsec} proposal`
+	// whose name uses the compiler-owned `__proposal-set/` prefix would alias a
+	// synthetic proposal-set member and silently overwrite it (or be overwritten
+	// by it), installing a different / weaker crypto proposal than configured (a
+	// silent downgrade). Commit / commit-check stay strict so a new operator edit
+	// is rejected; an already-persisted or peer-synced config an older binary
+	// accepted must still BOOT (warn) per the #1960 fail-closed-on-load doctrine —
+	// the expand-time occupancy guard then keeps the authored proposal from being
+	// clobbered. Same doctrine as lenientIPsecTrafficSelectors.
+	lenientReservedProposalSetNames bool
+
 	// lenientIPsecProposalProtocol (#4298, V-2) downgrades the IPsec
 	// proposal `protocol ah` reject (validateIPsecProposalProtocolStrict)
 	// from a hard error to a warning on the tolerant load / peer-sync paths.
@@ -1731,6 +1745,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
+		lenientReservedProposalSetNames:        true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
@@ -2001,6 +2016,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
 		lenientIPsecTrafficSelectors:           true,
+		lenientReservedProposalSetNames:        true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
