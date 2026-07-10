@@ -14,6 +14,62 @@
   **File(s)**: pkg/daemon/daemon_system.go, pkg/daemon/exec_timeout.go,
   pkg/daemon/daemon_login_optinjection_5005_test.go
 
+## 2026-07-09 — #4913 feeds: globally-duplicate feed names orphaned refresh loops + nondeterministic provider
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4913 (Medium, correctness + goroutine leak). feeds.Manager
+  keys its worker map (`m.feeds`) and enforcement snapshot by the effective
+  feed name. `Apply` ranged the UNORDERED `daCfg.FeedServers` map and did
+  `m.feeds[name] = fs` + `go refreshLoop` per entry as it went, so two
+  feed-servers declaring the same effective feed name each started a refresh
+  loop and the later map iteration OVERWROTE the first worker — orphaning its
+  cancel func (StopAll cancels only the survivor, so the overwritten loop kept
+  fetching / firing onUpdate until the parent ctx ended) — while enforcement
+  read whichever provider won the last map iteration (nondeterministic across
+  commits/restarts). Two fixes: (1) `Apply` now builds a COMPLETE,
+  deterministic (sorted server keys), de-duplicated plan BEFORE starting any
+  goroutine and starts exactly one refresh loop per name (first wins; duplicate
+  dropped with a warning), so no cancel is orphaned and the winner is
+  deterministic; (2) a new strict compile gate
+  `validateDynamicAddressFeedNameUniquenessStrict` rejects a globally-duplicate
+  effective feed name at commit / commit-check (lenient-warn on load/peer-sync),
+  mirroring the effective-name derivation of the #3300 reference gate and
+  excluding endpoint-less servers (which Apply skips).
+  **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_dup_name_4913_test.go,
+  pkg/config/compiler_validate_strict_observability.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/dynamic_address_feed_dup_name_4913_test.go
+  **Validation**: `TestApplyDeDupsDuplicateFeedNames` (fail-on-revert:
+  reverting the Apply de-dup starts two loops → nondeterministic winner + a
+  second orphaned fetch → RED) and `TestValidateDynamicAddressFeedNameUniqueness`
+  (fail-on-revert: neutralizing the gate call makes the commit-reject + lenient
+  subtests RED). `go build ./...`, `go vet ./pkg/feeds/ ./pkg/config/`, and the
+  full feeds + config suites are green.
+## 2026-07-09 — #5006 ddns: Manager held m.mu across blocking RFC 2136 DNS UPDATE I/O — stalled Stats()/OwnedRecordViews()
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5006 (Medium, telemetry stall). The DHCP dynamic-DNS
+  `Manager.ReconcileScoped` held `m.mu` for the whole pass — including the
+  blocking RFC 2136 DNS UPDATE wire I/O in `upsertLocked`
+  (`updater.UpsertLease`) and `deleteOwnedLocked` (`updater.DeleteLease`),
+  bounded only by the ~5s DDNS reconcile timeout. The telemetry/CLI readers
+  `Stats()` and `OwnedRecordViews()` take `m.mu.Lock()`, so
+  `show system services dynamic-dns` and Prometheus scrapes blocked for the
+  full DNS exchange when the authoritative server was slow/offline. Mirrored
+  the sibling `SurfaceAManager.providerIO`: added a `Manager.providerIO`
+  helper that releases `m.mu` around the ONE wire call and re-acquires it
+  (panic-safe), and routed both `UpsertLease` and `DeleteLease` through it.
+  Safe because the daemon serializes reconcile passes (`ddnsReconcileInFlight`)
+  so no concurrent pass mutates `m.state` during the drop — only the read-only
+  telemetry callers, which is exactly what must be unblocked. The write-ahead
+  ownership intent is still persisted under the lock BEFORE the wire add and
+  the result recorded under the re-acquired lock AFTER it.
+  **File(s)**: pkg/ddns/manager.go, pkg/ddns/manager_lockio_5006_test.go
+  **Validation**: new `TestManagerLockNotHeldDuringUpsert` /
+  `TestManagerLockNotHeldDuringDelete` (fail-on-revert: reverting the
+  providerIO wrapping makes both HANG on the blocked reader and fire the 2s
+  t.Fatal — verified RED). `go build ./...`, `go vet ./pkg/ddns/`, and the full
+  `go test ./pkg/ddns/` suite are green.
 ## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
 
 - **Timestamp**: 2026-07-09

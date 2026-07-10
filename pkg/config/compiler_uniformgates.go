@@ -1154,6 +1154,24 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #4913 dynamic-address feed-name uniqueness gate. feeds.Manager keys its
+	// worker map + enforcement snapshot by the effective feed name, so two
+	// feed-servers declaring the same name raced on m.feeds[name] — orphaning a
+	// refresh loop (goroutine leak) and backing enforcement with a
+	// nondeterministic provider. Reject the collision so the operator fixes the
+	// typo. Runs AFTER the endpoint gate so the surviving servers are exactly
+	// the ones Apply would register (endpoint-less servers are skipped by both).
+	// Strict on commit / commit-check; lenient on load / peer-sync (warn — the
+	// runtime now de-dups deterministically per #4913 rather than leaking).
+	if err := validateDynamicAddressFeedNameUniquenessStrict(cfg); err != nil {
+		if opts.lenientDynamicAddressFeedRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("dynamic-address feed name uniqueness (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #3300 dynamic-address feed cross-reference gate. A
 	// `security dynamic-address address-name <addr> profile feed-name <feed>`
 	// whose feed-name resolves to no declared feed-server feed records an
