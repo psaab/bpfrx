@@ -113,6 +113,15 @@ func (l *Lexer) Next() Token {
 			return Token{Type: TokenEOF, Line: l.line, Column: l.column}
 		}
 		if c := l.input[l.pos]; c == '[' || c == ']' {
+			// A bracketed IPv6 socket literal `[<addr>]:port` is NOT
+			// bracket-list sugar — emit it whole so the address's inner
+			// colons and its port survive (#5182). Only the '[' form can
+			// open such a literal.
+			if c == '[' {
+				if tok, ok := l.tryBracketedEndpointLiteral(); ok {
+					return tok
+				}
+			}
 			l.advance()
 			continue
 		}
@@ -149,6 +158,50 @@ func (l *Lexer) Next() Token {
 			Column: col,
 		}
 	}
+}
+
+// tryBracketedEndpointLiteral recognizes a bracketed IPv6 socket literal
+// `[<addr>]:port` at the current '[' and, on a match, returns it as ONE
+// identifier token WITH the brackets and port intact. The lexer otherwise
+// strips '[' / ']' as bracket-list sugar (#2419), which split a WireGuard
+// `endpoint [2001:db8::1]:51820` into a bare host `2001:db8::1` plus an
+// orphan `:51820` — dropping the port so the peer hydrated responder-only
+// (#5182). Keeping the brackets means both net.SplitHostPort (Go commit
+// gate) and SocketAddr::parse (Rust hydrate) recover host and port.
+//
+// The match is deliberately narrow so it can NEVER collide with a genuine
+// bracket list: it requires '[' immediately followed (no interior
+// whitespace) by a run of identifier chars, a closing ']', and then a ':'
+// port separator. A list `[ a b c ]` has whitespace after '['; a
+// single-element `[tcp]` has no trailing ':'; a spaceless `[a b]` has no
+// ']' terminating the first run — all three fail the match and fall
+// through to the existing strip path. Returns ok=false leaving l
+// unmodified when the pattern does not match.
+func (l *Lexer) tryBracketedEndpointLiteral() (Token, bool) {
+	// Caller guarantees l.input[l.pos] == '['.
+	j := l.pos + 1
+	if j >= len(l.input) || !isIdentChar(l.input[j]) {
+		return Token{}, false // '[' opens a list / empty list, not a literal
+	}
+	for j < len(l.input) && isIdentChar(l.input[j]) {
+		j++
+	}
+	if j >= len(l.input) || l.input[j] != ']' {
+		return Token{}, false // first run not closed by ']' — list sugar
+	}
+	j++ // consume ']'
+	if j >= len(l.input) || l.input[j] != ':' {
+		return Token{}, false // no ':port' — a bare `[x]`, keep stripping
+	}
+	for j < len(l.input) && isIdentChar(l.input[j]) {
+		j++ // ':port' (and any trailing identifier chars, e.g. a scope)
+	}
+	line, col := l.line, l.column
+	value := l.input[l.pos:j]
+	for l.pos < j {
+		l.advance()
+	}
+	return Token{Type: TokenIdentifier, Value: value, Line: line, Column: col}, true
 }
 
 // Peek returns the next token without advancing.

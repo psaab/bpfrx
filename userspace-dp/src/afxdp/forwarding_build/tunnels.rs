@@ -196,9 +196,11 @@ pub(in crate::afxdp) fn wg_peers_eq(a: &[WgRuntimePeer], b: &[WgRuntimePeer]) ->
 /// the SAME gates as `populate_tunnel_endpoints`' WireGuard arm: mode
 /// must be "wireguard", listen_port must be nonzero, the local privkey
 /// AND every peer pubkey must decode. Individually-invalid allowed-ips
-/// CIDRs are skipped (the peer is kept), and an unparsable/empty
-/// `wg_endpoint` hydrates to `None` (responder-only) — neither
-/// disqualifies the row. A row with ZERO peers is dropped (a peerless
+/// CIDRs are skipped (the peer is kept). An EMPTY `wg_endpoint` hydrates
+/// to `None` (responder-only), but a NON-EMPTY endpoint that does not
+/// parse to a `SocketAddr` DROPS the row (#5182) — coercing it to `None`
+/// silently degraded every such peer to responder-only. A row with ZERO
+/// peers is dropped (a peerless
 /// WG tunnel can never handshake; the Go commit gate rejects it, and
 /// hydrate fails closed for a leniently-loaded one).
 ///
@@ -243,14 +245,21 @@ pub(in crate::afxdp) fn hydrate_wg_identity(
         }
         let mut endpoint: Option<SocketAddr> = None;
         if !wire.wg_endpoint.is_empty() {
+            // A non-empty endpoint that does not parse to a concrete
+            // SocketAddr must fail the ROW closed rather than silently
+            // coerce to None (responder-only) (#5182). The pre-fix
+            // `.parse().ok()` turned a malformed/port-stripped endpoint
+            // into a peer that could never initiate — the exact silent
+            // degradation the Go commit gate now rejects; the dataplane
+            // keeps defense-in-depth in agreement so a leniently-loaded
+            // config fails loudly (drop) instead of quietly.
+            let Ok(parsed) = wire.wg_endpoint.parse::<SocketAddr>() else {
+                return None;
+            };
             // Canonicalize (unmap ::ffff:a.b.c.d) so a configured
             // v4-mapped literal gets the same logical-v4 treatment as a
             // learned endpoint (#1736).
-            endpoint = wire
-                .wg_endpoint
-                .parse::<SocketAddr>()
-                .ok()
-                .map(crate::afxdp::wg::canonicalize_endpoint);
+            endpoint = Some(crate::afxdp::wg::canonicalize_endpoint(parsed));
         }
         // PSK is OPTIONAL: an empty hex hydrates to the all-zero key
         // (no PSK). A malformed non-empty PSK drops the row (fail

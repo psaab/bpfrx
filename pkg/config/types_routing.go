@@ -590,9 +590,12 @@ func (tc *TunnelConfig) WgOuterFamilyV6() bool {
 		if p.Endpoint == "" {
 			continue
 		}
-		// Accept `IP:port` AND a bare IP literal — the config tokenizer
-		// stores a v6 `[addr]:port` endpoint as a bare `addr` (see
-		// endpointIsV6 / compiler_validate_wireguard.go).
+		// The strict commit gate (endpointIsV6) now requires a concrete
+		// `host:port` (IPv6 as `[addr]:port`), and the lexer preserves the
+		// bracketed literal whole (#5182), so SplitHostPort recovers the
+		// host for classification. The bare-IP fallback is retained as
+		// defense-in-depth for a leniently-loaded config that never went
+		// through the strict gate.
 		if host, _, err := net.SplitHostPort(p.Endpoint); err == nil {
 			if ip := net.ParseIP(host); ip != nil {
 				return ip.To4() == nil

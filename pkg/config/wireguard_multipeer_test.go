@@ -470,13 +470,114 @@ func TestWireguardBadPubkeyRejected(t *testing.T) {
 	}
 }
 
+// A WireGuard IPv6 peer endpoint authored as the standard `[addr]:port`
+// literal must preserve its full bracketed host AND port all the way to
+// the compiled peer — the lexer no longer splits it on the address's
+// inner colons and drops the port (#5182). Both the flat-set and the
+// hierarchical AST shapes go through the same lexer, so both are pinned.
+//
+// FAIL-ON-REVERT: without the lexer's bracketed-literal recognizer the
+// endpoint arrives as a bare `2001:db8::1` (port stripped), so the
+// equality assertion fails; and the strict gate — which now REQUIRES a
+// numeric port — would reject the port-less remnant.
+func TestWireguardV6EndpointPortPreservedFlatSet(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.1.0.0/16",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " endpoint [2001:db8::1]:51820",
+	})
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	tc := wgTunnel(t, cfg, "wg0")
+	if len(tc.WgPeers) != 1 {
+		t.Fatalf("WgPeers = %d, want 1", len(tc.WgPeers))
+	}
+	if got, want := tc.WgPeers[0].Endpoint, "[2001:db8::1]:51820"; got != want {
+		t.Errorf("Endpoint = %q, want %q (bracketed v6 endpoint port stripped by tokenizer, #5182)", got, want)
+	}
+}
+
+// Same preservation via the hierarchical parser.
+func TestWireguardV6EndpointPortPreservedHierarchical(t *testing.T) {
+	src := `interfaces {
+    wg0 {
+        tunnel {
+            mode wireguard;
+            wireguard {
+                listen-port 51820;
+                private-key ` + wgKeyA + `;
+                peer ` + wgKeyB + ` {
+                    allowed-ips 10.1.0.0/16;
+                    endpoint [2001:db8::1]:51820;
+                }
+            }
+        }
+    }
+}`
+	tree, perrs := NewParser(src).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse errors: %v", perrs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	tc := wgTunnel(t, cfg, "wg0")
+	if len(tc.WgPeers) != 1 {
+		t.Fatalf("WgPeers = %d, want 1", len(tc.WgPeers))
+	}
+	if got, want := tc.WgPeers[0].Endpoint, "[2001:db8::1]:51820"; got != want {
+		t.Errorf("Endpoint = %q, want %q (#5182)", got, want)
+	}
+}
+
+// The strict commit gate REJECTS a WireGuard endpoint that carries no
+// port (a bare IP): the Rust hydrate cannot turn it into a SocketAddr and
+// would silently make the peer responder-only. Rejecting it at commit
+// upholds the "every accepted endpoint hydrates to Some(SocketAddr) with
+// the authored port" invariant (#5182).
+func TestWireguardEndpointMissingPortRejected(t *testing.T) {
+	for _, ep := range []string{"2001:db8::1", "203.0.113.1", "203.0.113.1:0"} {
+		_, err := compileSet(t, []string{
+			"set interfaces wg0 tunnel mode wireguard",
+			"set interfaces wg0 tunnel wireguard listen-port 51820",
+			"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+			"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.1.0.0/16",
+			"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " endpoint " + ep,
+		})
+		if err == nil {
+			t.Fatalf("endpoint %q without a valid port must be a commit error", ep)
+		}
+		if !strings.Contains(err.Error(), "invalid endpoint") {
+			t.Errorf("endpoint %q: error = %q, want invalid-endpoint message", ep, err)
+		}
+	}
+}
+
+// A well-formed IPv6 `[addr]:port` endpoint is ACCEPTED at strict commit
+// (the companion to the missing-port rejection above).
+func TestWireguardV6EndpointAccepted(t *testing.T) {
+	_, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " allowed-ips 10.1.0.0/16",
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB + " endpoint [2001:db8::1]:51820",
+	})
+	if err != nil {
+		t.Fatalf("well-formed [v6]:port endpoint must commit clean: %v", err)
+	}
+}
+
 // Endpoint-bearing peers that disagree on outer transport family are a
 // hard commit reject (one UDP socket = one outer family).
 func TestWireguardMixedEndpointFamilyRejected(t *testing.T) {
-	// Use the hierarchical AST so the bracketed IPv6 literal survives
-	// intact (the flat-set tokenizer splits a `[v6]:port` token on the
-	// inner colons — a pre-existing parser limitation orthogonal to the
-	// multi-peer model).
+	// The bracketed IPv6 literal survives the lexer intact in BOTH AST
+	// shapes now (#5182); the hierarchical form here exercises the same
+	// mixed-family gate it always has.
 	src := `
 interfaces {
     wg0 {
