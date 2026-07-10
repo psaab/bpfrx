@@ -1,3 +1,34 @@
+## 2026-07-09 — #4913 feeds: globally-duplicate feed names orphaned refresh loops + nondeterministic provider
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4913 (Medium, correctness + goroutine leak). feeds.Manager
+  keys its worker map (`m.feeds`) and enforcement snapshot by the effective
+  feed name. `Apply` ranged the UNORDERED `daCfg.FeedServers` map and did
+  `m.feeds[name] = fs` + `go refreshLoop` per entry as it went, so two
+  feed-servers declaring the same effective feed name each started a refresh
+  loop and the later map iteration OVERWROTE the first worker — orphaning its
+  cancel func (StopAll cancels only the survivor, so the overwritten loop kept
+  fetching / firing onUpdate until the parent ctx ended) — while enforcement
+  read whichever provider won the last map iteration (nondeterministic across
+  commits/restarts). Two fixes: (1) `Apply` now builds a COMPLETE,
+  deterministic (sorted server keys), de-duplicated plan BEFORE starting any
+  goroutine and starts exactly one refresh loop per name (first wins; duplicate
+  dropped with a warning), so no cancel is orphaned and the winner is
+  deterministic; (2) a new strict compile gate
+  `validateDynamicAddressFeedNameUniquenessStrict` rejects a globally-duplicate
+  effective feed name at commit / commit-check (lenient-warn on load/peer-sync),
+  mirroring the effective-name derivation of the #3300 reference gate and
+  excluding endpoint-less servers (which Apply skips).
+  **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_dup_name_4913_test.go,
+  pkg/config/compiler_validate_strict_observability.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/dynamic_address_feed_dup_name_4913_test.go
+  **Validation**: `TestApplyDeDupsDuplicateFeedNames` (fail-on-revert:
+  reverting the Apply de-dup starts two loops → nondeterministic winner + a
+  second orphaned fetch → RED) and `TestValidateDynamicAddressFeedNameUniqueness`
+  (fail-on-revert: neutralizing the gate call makes the commit-reject + lenient
+  subtests RED). `go build ./...`, `go vet ./pkg/feeds/ ./pkg/config/`, and the
+  full feeds + config suites are green.
 ## 2026-07-09 — #5006 ddns: Manager held m.mu across blocking RFC 2136 DNS UPDATE I/O — stalled Stats()/OwnedRecordViews()
 
 - **Timestamp**: 2026-07-09
