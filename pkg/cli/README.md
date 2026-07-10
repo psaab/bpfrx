@@ -40,6 +40,13 @@ sibling files (same package, so unexported helpers stay reachable):
 The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
 argv builders (#2084 / #4524 / #4527) moved verbatim.
 
+Fail-open hardening (#4883): `parseMonitorTrafficArgs` (`monitor_traffic.go`)
+rejects an empty/unrecognized `matching` predicate instead of launching an
+UNFILTERED capture, and the `monitor security flow` writer goroutine
+(`monitor.go`) clears `active/cancel/sub` and records `lastErr` when the trace
+writer fails — so a disk-full/rotation error no longer wedges the monitor
+Active (surfaced by `show monitor security flow`).
+
 ## `show interfaces` render files (#4654)
 
 The `show interfaces` presenters were historically one 1396-line

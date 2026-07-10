@@ -1,3 +1,33 @@
+## 2026-07-10 — cli: reject fail-open CLI tokens (5-defect cohort, #4883)
+
+- **Timestamp**: 2026-07-10 (fix/4883-cli-failopen-cohort)
+  - **Action**: #4883 — five CLI fail-open/footgun fixes where a missing or
+    malformed token silently BROADENED a privileged/destructive action.
+    (A) `parseMonitorTrafficArgs` rejects an empty/unrecognized `matching`
+    predicate (a stray/typo token) instead of launching an UNFILTERED
+    tcpdump capture. (B) the `monitor security flow` writer goroutine now
+    takes `monitorFlow.mu` on a writer error, clears `active/cancel/sub`
+    (guarded by subscription identity) and records `lastErr` — surfaced by
+    `show monitor security flow` — so a disk-full/rotation failure no longer
+    wedges the monitor Active. (C) `request chassis cluster failover
+    redundancy-group <N> node` with no node value now errors instead of
+    sending an untargeted `cluster-failover:<N>` (CLI-side validation only;
+    server failover untouched). (D) the `load ... terminal` read loop
+    (extracted to `readTerminalConfig`) commits ONLY on EOF (Ctrl-D);
+    ErrInterrupt (Ctrl-C) or any read error ABORTS and discards the partial
+    input. (E) `clear dhcp client-identifier` rejects a malformed selector
+    (`interface` with no name / unknown selector / stray extra) instead of
+    falling through to the empty (clear-ALL) request; a bare
+    `client-identifier` remains the intentional clear-all. One RED-on-revert
+    test per sub-fix (A-E); all proven RED on targeted revert.
+  - **File(s)**: pkg/cli/monitor_traffic.go, pkg/cli/monitor.go,
+    cmd/cli/request.go, cmd/cli/main.go, cmd/cli/clear.go,
+    pkg/cli/monitor_traffic_matching_4883_test.go,
+    pkg/cli/monitor_flow_writer_stop_4883_test.go,
+    cmd/cli/request_failover_node_4883_test.go,
+    cmd/cli/load_terminal_abort_4883_test.go,
+    cmd/cli/clear_dhcp_duid_4883_test.go, pkg/cli/README.md, _Log.md
+
 ## 2026-07-10 — ddns: resolve bind interface/routing-instance to kernel device (#5070)
 
 - **Timestamp**: 2026-07-10
