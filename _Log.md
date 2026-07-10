@@ -1,3 +1,19 @@
+## 2026-07-09 — #4916 snmp: Agent.Stop leaked the ctx-watcher + trap worker and could deliver queued traps after Stop
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4916 (goroutine leak + stale telemetry). `Agent.Stop` only set
+  `stopped` and closed the socket; the daemon-wide context stays live across a
+  day-2 SNMP disable, so the `<-ctx.Done()` watcher blocked forever and the trap
+  worker ranged an unclosed channel forever, still delivering any queued backlog
+  to the old target/community. Gave the agent a per-agent lifecycle context
+  (`lifeCancel`), a `trapStop` channel, and a `trapWG`. Stop now cancels the
+  watcher context, signals the worker to ABANDON its queue (worker selects on
+  `trapStop` and re-checks it before each send — no post-Stop delivery), closes
+  the socket, and waits for the worker to exit. Stop is idempotent (guarded on
+  `stopped`); `enqueueTrap` drops (never starts a worker) once stopped.
+  **File(s)**: pkg/snmp/agent.go, pkg/snmp/traps.go, pkg/snmp/README.md,
+  pkg/snmp/agent_stop_leak_4916_test.go
+
 ## 2026-07-09 — #4891 configstore: bound the commit description so an oversized journal record cannot self-poison the tail scanner
 
 - **Timestamp**: 2026-07-09
