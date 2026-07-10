@@ -2,10 +2,94 @@ package configstore
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// DefaultArchiveDir is the xpf-owned DEFAULT local config-archive directory —
+// the pkg/config archival compiler default (compiler_system.go) and the
+// pkg/daemon runtime fallback (daemon_apply.go). writeArchive drops timestamped
+// config-<ts>.<seq>.conf snapshots here, each a 0600 copy of the full committed
+// config TEXT with cleartext secret leaves (IKE PSK, WireGuard private keys,
+// SNMP communities, BGP MD5). It is the ONLY archive path a factory reset
+// provably owns and is therefore allowed to erase (see FactoryResetArchiveDir's
+// ownership guard).
+//
+// KEEP IN SYNC with the pkg/config archival compiler default: pkg/config cannot
+// import pkg/configstore (configstore already imports config), so the literal
+// is duplicated rather than shared. If the compiler default ever moves, this
+// must move with it or a zeroize would skip the real archive.
+//
+// It is a var, not a const, so the zeroize tests can repoint the ownership
+// guard at a throwaway tree (mirroring the grpcapi zeroize* path seams).
+// Production code must never mutate it.
+var DefaultArchiveDir = "/var/lib/xpf/archive"
+
+// FactoryResetArchiveDir erases the LOCAL configuration archive as part of a
+// factory reset (#5186) — but ONLY when archiveDir is the xpf-owned default.
+//
+// WHY the wipe must erase it: zeroize must remove EVERY on-box generation of
+// config secrets (the .configdb SSOT + master.key, the numbered text rollback
+// slots, the audit journal, the rendered service configs, and the login
+// accounts are all wiped by the sibling FactoryResetConfigDir /
+// zeroizeRenderedConfigs / zeroizeLoginAccounts). The local config archive was
+// the OMITTED generation: a pre-#5186 zeroize left /var/lib/xpf/archive
+// untouched, so a device handed to the next tenant after a factory reset still
+// carried 0600 full-config-text copies with the prior tenant's cleartext PSKs,
+// keys, and communities.
+//
+// OWNERSHIP GUARD (#5186): erase the archive ONLY when archiveDir is the
+// xpf-owned default (DefaultArchiveDir). An operator-configured CUSTOM archive
+// directory may be a remote mount, an NFS export, or a compliance/audit
+// retention store that is NOT xpf's to destroy — blindly deleting it could wipe
+// records the operator is legally required to keep. Ownership cannot be proven
+// for such a path, so it is SKIPPED with a warning rather than deleted (never
+// fail-closed-delete). This mirrors how the config-state wipe proves ownership
+// by its fixed default appliance path, and how zeroizeLoginAccounts refuses to
+// touch a non-xpf-owned account.
+//
+// Discipline mirrors FactoryResetConfigDir: os.ErrNotExist is never an error
+// (an already-absent archive is the goal); the whole archive tree is
+// RemoveAll'd; the PARENT directory is then fsynced so the removal of the
+// archive directory entry itself is durable before the completing reboot, and
+// that fsync error is PROPAGATED — a fsync failure means the erasure may not be
+// on stable storage, so it must not be reported as a clean zeroize. The
+// durability barrier routes through the rbSyncDir seam so a dropped sync fails
+// a test RED.
+func FactoryResetArchiveDir(archiveDir string) error {
+	// Ownership guard: only the xpf-owned default is provably safe to erase. A
+	// custom/remote/compliance archive destination is skipped with a warning,
+	// never blindly deleted.
+	if filepath.Clean(archiveDir) != DefaultArchiveDir {
+		slog.Warn("zeroize: skipping config archive directory with unproven "+
+			"ownership (not the xpf-owned default); a custom, remote, or "+
+			"compliance archive destination is the operator's to erase, not "+
+			"the factory reset's",
+			"dir", archiveDir, "default", DefaultArchiveDir)
+		return nil
+	}
+
+	var firstErr error
+	fail := func(err error) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// Erase the whole archive tree — every config-<ts>.<seq>.conf snapshot of
+	// the prior tenant's config text. RemoveAll is nil on an absent dir.
+	fail(os.RemoveAll(archiveDir))
+
+	// fsync the PARENT so the unlink of the archive directory entry itself is
+	// durable before the reboot that completes the factory reset. A sync
+	// failure is propagated — a silently non-durable erasure must never be
+	// reported as a clean zeroize. ErrNotExist (parent absent → nothing was
+	// removed) is excluded by fail().
+	fail(rbSyncDir(filepath.Dir(archiveDir)))
+	return firstErr
+}
 
 // FactoryResetConfigDir securely erases the on-disk configuration STATE under
 // configDir as part of a factory reset (#4858). It is the single shared
@@ -52,7 +136,10 @@ import (
 // Scope: this erases the config-DB SSOT + journal + rollback state under
 // configDir. The RENDERED service configs xpfd writes OUTSIDE configDir
 // (/etc/frr/frr.conf, /etc/swanctl/conf.d, /etc/kea) and provisioned OS login
-// accounts are handled separately by the daemon's RPC factory-reset path.
+// accounts are handled separately by the daemon's RPC factory-reset path; the
+// local config archive (/var/lib/xpf/archive) — another OUTSIDE-configDir
+// generation of config secrets — is erased by the sibling FactoryResetArchiveDir
+// (#5186), which both the CLI and the gRPC wipe also call.
 func FactoryResetConfigDir(configDir, configBase string) error {
 	var firstErr error
 	fail := func(err error) {

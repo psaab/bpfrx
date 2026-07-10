@@ -82,6 +82,18 @@ func (c *CLI) handleRequestSystem(args []string) error {
 			return fmt.Errorf("zeroize: configuration state not fully erased: %w", err)
 		}
 
+		// Erase the local config archive (#5186): /var/lib/xpf/archive holds
+		// 0600 config-<ts>.conf snapshots — full config TEXT with cleartext
+		// secret leaves (PSK/keys/community). The pre-#5186 zeroize left it
+		// behind, so a prior tenant's secrets survived a factory reset.
+		// Ownership-guarded to the xpf-owned default path (a custom, remote, or
+		// compliance archive destination is skipped with a warning, never
+		// blindly deleted). Routes through the same shared configstore primitive
+		// as the gRPC factory-reset path so both wipe exactly the same archive.
+		if err := configstore.FactoryResetArchiveDir(configstore.DefaultArchiveDir); err != nil {
+			return fmt.Errorf("zeroize: config archive not fully erased: %w", err)
+		}
+
 		// Remove BPF pins (no secret material)
 		os.RemoveAll("/sys/fs/bpf/xpf")
 
