@@ -32,7 +32,9 @@
 //	false      false      no-op (never claimed)
 //	false      true       capture + write
 //	true       true       capture-if-not-already + write (reconcile)
-//	true       false      restore (B2), discard snapshot
+//	true       false      restore (B2); drop restored captures, RETAIN
+//	                      any whose write failed + stay active to retry
+//	                      the debt next reconcile (#5114)
 //	(shutdown) *          restore (if active) on daemon Stop
 //
 // Coalescence (interface-scoped) runs on every apply with the same
@@ -55,7 +57,10 @@ import (
 //     pre-xpfd value is captured before the first write so restore can
 //     revert to the exact pre-xpfd string.
 //  3. Restore-on-disable (B2): when claim flips true → false, every
-//     captured value is written back and the snapshot is cleared.
+//     captured value is written back. A field is dropped from the
+//     snapshot only after its restore write SUCCEEDS; a failed write
+//     retains the capture + keeps priorTunablesActive true so the next
+//     reconcile retries it (#5114 retry-debt invariant).
 //
 // Never returns an error — any failure logs and continues. Tunable
 // regressions must not block commit or daemon start.
@@ -127,8 +132,14 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 		// captures so a later re-enable re-captures cleanly. Without this
 		// the lowered values would persist for the daemon lifetime even
 		// though the dataplane that wanted them is gone.
-		restoreNeighRetransTime(prior, fs)
-		prior.neighRetrans = map[string]string{}
+		//
+		// #5114: drop only the paths whose restore write SUCCEEDED;
+		// restoreNeighRetransTime returns the failed captures, which we
+		// keep as retry debt so the next reconcile (this same branch
+		// re-fires while userspace-dp stays disabled and captures remain)
+		// retries them. A transient /proc write failure must not strand
+		// the host at the lowered 250ms.
+		prior.neighRetrans = restoreNeighRetransTime(prior, fs)
 	}
 
 	// Host-scope restore path: previously claimed, now gated off.
@@ -137,17 +148,34 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 	// active and those are the snapshots shutdown-restore relies on.
 	if active && (!userspaceDP || !claimHostTunables) {
 		slog.Info("linksetup: claim-host-tunables disabled, restoring pre-xpfd host-scope values")
-		restoreHostScopeTunables(prior, fs)
+		res := restoreHostScopeTunables(prior, fs)
 		d.priorTunablesMu.Lock()
 		// Keep the snapshot object alive if coalescence just
-		// captured new mlx5 state; only clear host-scope fields.
-		prior.governors = map[string]string{}
-		prior.budget = ""
+		// captured new mlx5 state; only touch host-scope fields.
+		//
+		// #5114: ownership is released only after a SUCCESSFUL restore.
+		// Retain the captures whose kernel write FAILED (drop the ones
+		// that restored) and, if any remain, keep priorTunablesActive
+		// true so this same restore path re-fires on the next reconcile
+		// and retries the debt — a transient sysfs/proc write failure
+		// must not leave the host pinned at xpfd's governor /
+		// netdev_budget after the operator withdrew consent.
+		prior.governors = res.failedGovernors
+		if res.budgetFailed {
+			prior.budget = res.budgetValue
+		} else {
+			prior.budget = ""
+		}
 		d.priorTunables = prior
-		// Claim is now off but coalescence may still have captures;
-		// keep priorTunablesActive aligned with claim state so the
-		// same restore path doesn't re-fire next reconcile.
-		d.priorTunablesActive = false
+		if res.allRestored() {
+			// Claim is now off and every host-scope knob reverted;
+			// release ownership so the restore path stops firing.
+			d.priorTunablesActive = false
+		} else {
+			slog.Warn("linksetup: host-scope tunable restore incomplete, retaining capture for retry",
+				"failed_governors", len(res.failedGovernors),
+				"budget_failed", res.budgetFailed)
+		}
 		d.priorTunablesMu.Unlock()
 		return
 	}
