@@ -113,20 +113,30 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 		vrfPart = fmt.Sprintf(" table %d", tableID)
 	}
 
-	// Explicit discard (blackhole) route: single Null0 line.
-	if sr.Discard {
+	// Negative routes (no next-hop, single line). Junos `discard` and `reject`
+	// both install an active route so matching traffic is dropped instead of
+	// following a less-specific route, but differ in what the source sees:
+	//   - discard → FRR Null0 (RTN_BLACKHOLE): silent drop, no ICMP.
+	//   - reject  → FRR reject (RTN_UNREACHABLE): drop + ICMP unreachable.
+	// Without this, a committed reject compiled to a no-next-hop route rendered
+	// nothing (#5298) and the traffic fell through to the default — a fail-wide.
+	if sr.Discard || sr.Reject {
 		nexthop := "Null0"
+		if sr.Reject {
+			nexthop = "reject"
+		}
 		if sr.Preference > 0 {
 			return fmt.Sprintf("%s route %s %s %d%s\n", prefix, sr.Destination, nexthop, sr.Preference, vrfPart)
 		}
 		return fmt.Sprintf("%s route %s %s%s\n", prefix, sr.Destination, nexthop, vrfPart)
 	}
 
-	// A non-discard route with NO next-hops is incomplete — e.g. every gateway
-	// of an ECMP `next-hop [ a b ]` list was deleted (#3872 delete-side). Render
-	// NOTHING rather than a Null0 blackhole: silently blackholing traffic that
-	// would otherwise fall through to a default / more-specific route is a
-	// fail-wide. (An explicit `discard` above still renders Null0.)
+	// A route with NO next-hops and no discard/reject action is incomplete —
+	// e.g. every gateway of an ECMP `next-hop [ a b ]` list was deleted (#3872
+	// delete-side). Render NOTHING rather than a Null0 blackhole: silently
+	// blackholing traffic that would otherwise fall through to a default /
+	// more-specific route is a fail-wide. (An explicit `discard`/`reject`
+	// above still renders its negative-route line.)
 	if len(sr.NextHops) == 0 {
 		return ""
 	}

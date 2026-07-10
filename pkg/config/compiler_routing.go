@@ -240,6 +240,8 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 					}
 				case "discard":
 					route.Discard = true
+				case "reject":
+					route.Reject = true
 				case "preference":
 					if i+1 < len(routeInst.node.Keys) {
 						i++
@@ -294,6 +296,8 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 				}
 			case "discard":
 				route.Discard = true
+			case "reject":
+				route.Reject = true
 			case "preference":
 				if v := nodeVal(prop); v != "" {
 					if n, err := strconv.Atoi(v); err == nil {
@@ -357,6 +361,9 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 			existingRoute.NextHops = append(existingRoute.NextHops, route.NextHops...)
 			if route.Discard {
 				existingRoute.Discard = true
+			}
+			if route.Reject {
+				existingRoute.Reject = true
 			}
 			if route.Preference != 5 {
 				existingRoute.Preference = route.Preference
