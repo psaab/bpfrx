@@ -1590,6 +1590,22 @@ type compileOpts struct {
 	// on the tolerant path, so a leniently-loaded collision cannot leak. Same
 	// doctrine as lenientRoutingExportRef.
 	lenientPolicyReservedRedistName bool
+	// lenientPolicyReservedChainName (#5442) downgrades the reserved
+	// composed-chain route-map-suffix gate (validatePolicyReservedChainNameStrict)
+	// from a hard compile error to a cfg.Warnings entry. An operator
+	// policy-statement whose name ends in the reserved ReservedChainSuffix
+	// ("-xpf-chain") collides in FRR's global name-keyed route-map namespace with
+	// the composed BGP policy-chain route-map the renderer derives for an ordered
+	// import/export chain of length >= 2 (#5277); FRR merges same-named
+	// route-maps, which can silently alter the operator's BGP filtering. The
+	// strict commit / commit-check path hard-rejects such a name so it is
+	// operator-visible; an already-persisted or peer-synced config an older
+	// binary accepted must still BOOT (warn) per the #1960 fail-closed-on-load
+	// doctrine — the render path carries a defense-in-depth collision guard
+	// (bgpComposedChainCollision, pkg/frr) that fails the managed-section apply
+	// CLOSED on the tolerant path, so a leniently-loaded collision cannot leak.
+	// Same doctrine as lenientPolicyReservedRedistName.
+	lenientPolicyReservedChainName bool
 	// lenientVRRPVirtualAddress (#3013) downgrades the VRRP virtual-address
 	// subnet-containment gate (validateVRRPVirtualAddressSubnet) from a hard
 	// compile error to a cfg.Warnings entry. A VRRP virtual-address that does
@@ -1827,6 +1843,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyCommunityRef:              true,
 		lenientPolicyReservedRedistName:        true,
+		lenientPolicyReservedChainName:         true,
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
@@ -2098,6 +2115,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyCommunityRef:              true,
 		lenientPolicyReservedRedistName:        true,
+		lenientPolicyReservedChainName:         true,
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
