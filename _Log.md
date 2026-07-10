@@ -44542,6 +44542,8 @@ top.
   **File(s)**: pkg/rpm/icmp.go, pkg/rpm/rpm.go, pkg/rpm/resolver_setup_5061_test.go, pkg/rpm/probe_dialer_2492_test.go, pkg/rpm/scoped_hostname_2493_test.go, pkg/rpm/README.md
 
 - **Timestamp**: 2026-07-09
+  - **Action**: #5180 reject duplicate hierarchical named blocks (groups/interfaces/screen ids-option + screen family) at strict commit via validateDuplicateNamedBlockAST — prevents silent last-writer-wins drop; flat-set merges (dual-AST equivalence); lenient-warn on tolerant load.
+  - **File(s)**: pkg/config/dup_named_blocks.go, pkg/config/compiler.go, pkg/config/dup_named_blocks_5180_test.go
   - **Action**: #5183 reject malformed feed-server base URL at strict commit — validateDynamicAddressFeedServerEndpointStrict now checks the resolved base url is constructible (http/https scheme, host, http.NewRequestWithContext) so a garbage url no longer commits clean then fails at runtime. Lenient-warn on tolerant load.
   - **File(s)**: pkg/config/compiler_validate_strict_observability.go, pkg/config/compiler_feed_url_malformed_5183_test.go
   - **Action**: #5179 nil application-set value no longer panics CatalogNames — lookupApplicationSet skips a present-but-nil map value (fail-closed not-found) so expandAppSet never derefs a nil *ApplicationSet.
