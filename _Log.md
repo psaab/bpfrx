@@ -29,6 +29,108 @@
   (fail-on-revert: neutralizing the gate call makes the commit-reject + lenient
   subtests RED). `go build ./...`, `go vet ./pkg/feeds/ ./pkg/config/`, and the
   full feeds + config suites are green.
+## 2026-07-09 — #5006 ddns: Manager held m.mu across blocking RFC 2136 DNS UPDATE I/O — stalled Stats()/OwnedRecordViews()
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5006 (Medium, telemetry stall). The DHCP dynamic-DNS
+  `Manager.ReconcileScoped` held `m.mu` for the whole pass — including the
+  blocking RFC 2136 DNS UPDATE wire I/O in `upsertLocked`
+  (`updater.UpsertLease`) and `deleteOwnedLocked` (`updater.DeleteLease`),
+  bounded only by the ~5s DDNS reconcile timeout. The telemetry/CLI readers
+  `Stats()` and `OwnedRecordViews()` take `m.mu.Lock()`, so
+  `show system services dynamic-dns` and Prometheus scrapes blocked for the
+  full DNS exchange when the authoritative server was slow/offline. Mirrored
+  the sibling `SurfaceAManager.providerIO`: added a `Manager.providerIO`
+  helper that releases `m.mu` around the ONE wire call and re-acquires it
+  (panic-safe), and routed both `UpsertLease` and `DeleteLease` through it.
+  Safe because the daemon serializes reconcile passes (`ddnsReconcileInFlight`)
+  so no concurrent pass mutates `m.state` during the drop — only the read-only
+  telemetry callers, which is exactly what must be unblocked. The write-ahead
+  ownership intent is still persisted under the lock BEFORE the wire add and
+  the result recorded under the re-acquired lock AFTER it.
+  **File(s)**: pkg/ddns/manager.go, pkg/ddns/manager_lockio_5006_test.go
+  **Validation**: new `TestManagerLockNotHeldDuringUpsert` /
+  `TestManagerLockNotHeldDuringDelete` (fail-on-revert: reverting the
+  providerIO wrapping makes both HANG on the blocked reader and fire the 2s
+  t.Fatal — verified RED). `go build ./...`, `go vet ./pkg/ddns/`, and the full
+  `go test ./pkg/ddns/` suite are green.
+## 2026-07-09 — #4910 grpcapi: active MonitorInterface stream could block daemon shutdown forever (GracefulStop with no timeout)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4910 (availability). Both gRPC listeners (`Run` loopback,
+  `RunFabricListener` fabric) called `srv.GracefulStop()` with no timeout,
+  and the unbounded server-streaming `MonitorInterface` RPC only watched
+  its client `stream.Context()`. A client (loopback, or an authenticated
+  fabric peer) holding that stream open during shutdown blocked
+  GracefulStop — and thus `Run`/`RunFabricListener` — forever, wedging
+  daemon stop/failover/restart. Fix: added `stopGRPCServer(srv, timeout)`
+  — GracefulStop in a goroutine + `Stop()` after `grpcStopTimeout` (2s) —
+  used by both listeners; `Run`'s serve/shutdown loop factored into
+  `serveUntilDone` for testability. Force-Stop cancels the stuck stream's
+  context so the handler returns; a clean/idle shutdown still returns as
+  soon as GracefulStop completes (no dropped events on normal disconnect).
+  Added `TestServeUntilDoneBoundedByStuckMonitorStream_4910` (RED on
+  revert: hangs 7s) + `TestStopGRPCServerIdleReturnsPromptly_4910`.
+  **File(s)**: pkg/grpcapi/server.go,
+  pkg/grpcapi/server_shutdown_monitor_4910_test.go, pkg/grpcapi/README.md
+## 2026-07-09 — #4912 rpm: HTTP probe leaked a keep-alive transport + fd per bodyless (204) response
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4912 (resource leak). `probeHTTP` built a fresh
+  `http.Transport` per probe with keep-alives implicitly ENABLED and
+  `IdleConnTimeout == 0`, ran one GET, and dropped the transport. For a
+  bodyless response (204 / Content-Length: 0), `resp.Body.Close()`
+  returned the connection to that unowned transport's idle pool with no
+  idle timeout, so the socket + persistent-connection read-loop goroutine
+  retained each other forever — one fd + goroutine leaked per probe to an
+  empty health endpoint. Fix: set `DisableKeepAlives: true`, defer
+  `transport.CloseIdleConnections()`, and drain (`io.Copy(io.Discard,
+  ...)`) + close the body on every path. Added
+  `TestProbeHTTPBodylessResponseNoConnLeak_4912` — a repeated-204 probe
+  with a connection-counting listener that asserts the server's open-conn
+  count drains to zero; RED on revert (4 conns stay open).
+  **File(s)**: pkg/rpm/rpm.go,
+  pkg/rpm/http_transport_leak_4912_test.go, pkg/rpm/README.md
+## 2026-07-09 — #4876 cmd/xpfd: publish-generation ran destructive staged-generation GC even when the journal protection set was unreadable
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4876 (upgrade / fail-open). `xpfd publish-generation` read
+  the upgrade journal to protect a crashed/resumable cut's pinned source
+  generation from its GC, but on a journal read error only WARNed and ran
+  GC anyway with an empty protection set; a present-but-malformed journal
+  degraded to ("",nil), same result. A crash-after-STOP cut whose journal
+  became unreadable could have its pinned source reaped, bricking the
+  resume. Fix: `ReadJournalSourceGeneration` now errors on a
+  present-but-malformed journal (absent still returns ("",nil)); the verb
+  routes through a new `gcProtectionForPublish` helper that SKIPS GC when
+  the protection set is unknown (read error / malformed). Added
+  fail-on-revert tests at both the reader and caller level.
+  **File(s)**: pkg/upgrade/runner.go,
+  pkg/upgrade/read_journal_malformed_4876_test.go,
+  cmd/xpfd/publish_generation.go,
+  cmd/xpfd/publish_generation_gc_4876_test.go, docs/in-place-upgrade.md
+## 2026-07-09 — #4888 configstore: encrypted-envelope with unknown/future `format` fell through as plaintext and empty-loaded instead of failing closed
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4888 (fail-open, security-adjacent). `unmarshalEnvelope`
+  returned (ok=false, err=nil) for ANY body whose `format` was not the
+  current `xpf-master-password-v1`, so `maybeDecryptTreeJSON` handed the
+  raw bytes back as plaintext; `readTreeMeta` then `json.Unmarshal`'d an
+  envelope-shaped body (future format / corruption) into a `ConfigTree`,
+  dropping the unknown `format`/`prf`/`salt`/`nonce`/`data` fields and
+  yielding an EMPTY tree — so `Store.Load` booted a committed-empty config
+  instead of `ErrConfigDBUnreadable`. Fix: fail CLOSED on an
+  envelope-shaped body with an unknown/future `format` OR AES-GCM fields
+  present without the current format; only a body with no format AND no
+  AES-GCM fields passes through as genuine plaintext (verified the legacy
+  no-envelope + current-format paths still pass). ConfigTree JSON is
+  `{"Children":[...]}` — no top-level format/salt/nonce/data — so the
+  plaintext discriminator cannot false-positive. Added a unit test on the
+  `unmarshalEnvelope` contract + an end-to-end `Store.Load` ->
+  `ErrConfigDBUnreadable` test; both RED on revert.
+  **File(s)**: pkg/configstore/crypto.go,
+  pkg/configstore/crypto_envelope_unknown_format_4888_test.go,
+  pkg/configstore/README.md
 
 ## 2026-07-09 — #4882 userspace-dp: debug BPF session dump used `core::ptr::read` (align 2) on a `Vec<u8>` (align 1) — UB; use `read_unaligned`
 

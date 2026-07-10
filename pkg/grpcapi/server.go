@@ -227,6 +227,36 @@ func NewServer(addr string, cfg Config) *Server {
 }
 
 // Run starts the gRPC server and blocks until ctx is cancelled.
+// grpcStopTimeout bounds the graceful shutdown of a gRPC listener (#4910). On
+// ctx cancellation a listener first tries GracefulStop so in-flight RPCs can
+// finish, but the unbounded server-streaming MonitorInterface RPC only watches
+// its client stream context — a client holding that stream open would
+// otherwise block GracefulStop, and therefore Run / RunFabricListener, forever
+// (a stuck daemon stop / failover / restart). After this grace period the
+// server is force-Stop()'d so shutdown always completes.
+const grpcStopTimeout = 2 * time.Second
+
+// stopGRPCServer stops srv with a BOUNDED graceful shutdown (#4910):
+// GracefulStop runs in a goroutine so active RPCs get a chance to finish, but
+// if they have not within timeout, Stop() force-closes the connections —
+// which cancels a stuck streaming handler's stream context so it returns and
+// GracefulStop unblocks. A normal, RPC-idle shutdown (or one where every
+// client has disconnected) returns as soon as GracefulStop completes, well
+// before the timeout, so a clean disconnect drops nothing.
+func stopGRPCServer(srv *grpc.Server, timeout time.Duration) {
+	stopped := make(chan struct{})
+	go func() {
+		srv.GracefulStop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(timeout):
+		srv.Stop()
+		<-stopped
+	}
+}
+
 func (s *Server) Run(ctx context.Context) error {
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -237,6 +267,14 @@ func (s *Server) Run(ctx context.Context) error {
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.UnaryInterceptor(s.configLockInterceptor),
 	)
+	return s.serveUntilDone(ctx, srv, lis)
+}
+
+// serveUntilDone registers the service on srv, serves lis, and on ctx
+// cancellation stops srv with a bounded graceful shutdown (stopGRPCServer). It
+// is split out of Run so the shutdown path can be exercised over an in-memory
+// listener in tests.
+func (s *Server) serveUntilDone(ctx context.Context, srv *grpc.Server, lis net.Listener) error {
 	pb.RegisterBpfrxServiceServer(srv, s)
 
 	errCh := make(chan error, 1)
@@ -254,7 +292,7 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	srv.GracefulStop()
+	stopGRPCServer(srv, grpcStopTimeout)
 	return nil
 }
 
@@ -307,7 +345,7 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 	}()
 
 	<-ctx.Done()
-	srv.GracefulStop()
+	stopGRPCServer(srv, grpcStopTimeout)
 }
 
 // fabricAllowedUnaryMethods is the fail-closed allowlist (#4122) of unary RPCs
