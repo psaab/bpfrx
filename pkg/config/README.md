@@ -938,6 +938,29 @@ doctrine); as defense-in-depth the renderer's `redistAliasCollision` (invoked by
 alias still collides, so the collision cannot leak even when the strict gate was
 bypassed.
 
+**The `-xpf-chain` route-map-name suffix is reserved (#5442):** the direct
+parity sibling of the `-xpf-redist` reservation above. #5277 composes an ordered
+BGP import/export policy chain of length >= 2 into a SINGLE FRR route-map named
+`join(chain, "-") + "-xpf-chain"` (`composedChainName`, `pkg/frr`) in FRR's
+GLOBAL name-keyed route-map namespace. An operator policy-statement literally
+named `<X>-xpf-chain` lands in that reserved suffix namespace and can collide
+with a generated composed route-map — FRR MERGES two same-named route-map
+definitions, silently altering the operator's BGP filtering.
+`validatePolicyReservedChainNameStrict` (`compiler_validate_strict_routing.go`,
+constant `ReservedChainSuffix`) hard-rejects a policy-statement whose name ends
+in the reserved suffix at commit / commit-check (naming the policy and the
+suffix), making the composed-name namespace injective against operator
+policy-statements BY CONSTRUCTION. The composed-name derivation in `pkg/frr`
+re-exports the SAME `ReservedChainSuffix` constant
+(`frr.ReservedChainSuffix = config.ReservedChainSuffix`) so the two cannot drift.
+The tolerant load / peer-sync path downgrades to a warning
+(`lenientPolicyReservedChainName`) so an already-persisted or peer-synced config
+an older binary accepted still boots (#1960 no-brick doctrine); as
+defense-in-depth the renderer's `bgpComposedChainCollision` (invoked by
+`ApplyFull`) then fails the managed-section apply CLOSED if a leniently-loaded
+composed name still collides, so the collision cannot leak even when the strict
+gate was bypassed.
+
 **Policy-referenced application protocols are validated against the dataplane
 resolver (#3150 — codex-review-067 finding 067-06):** a user-defined
 `set applications application <name> protocol <token>` that is REFERENCED by a

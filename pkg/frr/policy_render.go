@@ -265,8 +265,12 @@ func isDefinedPolicyStatement(name string, po *config.PolicyOptionsConfig) bool 
 // collided with an operator policy-statement would fuse the two objects and
 // could silently change the operator's filtering — the render-side guard
 // bgpComposedChainCollision fails the whole apply CLOSED on any collision
-// (#5277). Kept a package const so the derivation and the guard cannot drift.
-const ReservedChainSuffix = "-xpf-chain"
+// (#5277). The canonical constant lives in pkg/config (config.ReservedChainSuffix),
+// which the commit-time strict validator validatePolicyReservedChainNameStrict
+// reserves (#5442); this re-export sources the same literal so the composed-name
+// derivation here and the config gate cannot drift (mirrors the redist pattern,
+// where frr references config.ReservedRedistSuffix directly).
+const ReservedChainSuffix = config.ReservedChainSuffix
 
 // hasNonEmptyPolicy reports whether names holds at least one non-empty entry.
 // It replaces the old lastNonEmpty("") != "" idiom for "does this neighbor set
@@ -989,10 +993,12 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// policy-statement-name route-map-out exports: a per-neighbor
 		// export overrides the global default for that neighbor. FRR
 		// accepts a single `route-map out` per neighbor/AF, so exactly one
-		// is emitted — the neighbor's own when present, else the global
-		// default (bgpEffectiveExport). A bare-token redistribute is a
-		// GLOBAL redistribute verb, not per-neighbor, and is emitted once
-		// under `router bgp`.
+		// is emitted — the neighbor's own export chain when present, else
+		// the global export chain (bgpNeighborExportChain resolves the
+		// override; a resolved chain of >= 2 is composed into one
+		// `-xpf-chain` route-map via composedChainName/bgpRouteMapRef,
+		// #5277). A bare-token redistribute is a GLOBAL redistribute verb,
+		// not per-neighbor, and is emitted once under `router bgp`.
 		// globalExportChain is the ORDERED list of DEFINED policy-statements
 		// in `protocols bgp export` — the global export CHAIN applied as a
 		// peer-level default to neighbors with no own export. Every entry is

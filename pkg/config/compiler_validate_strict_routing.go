@@ -882,3 +882,62 @@ func validatePolicyReservedRedistNameStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// ReservedChainSuffix is the route-map name suffix xpf RESERVES for the composed
+// BGP policy-chain route-maps the FRR renderer derives for an ordered
+// import/export policy list of length >= 2 (composedChainName in pkg/frr joins
+// the member policy names and appends this suffix). FRR keys route-maps by NAME
+// in a single GLOBAL namespace, so an operator policy-statement whose name ends
+// in this suffix would collide with a generated composed route-map in that
+// shared object and FRR would MERGE the two same-named definitions, silently
+// altering the operator's BGP filtering (#5277/#5442). The composed-name
+// derivation (pkg/frr) and the strict validator below MUST agree on this exact
+// string; pkg/frr re-exports this constant (frr.ReservedChainSuffix =
+// config.ReservedChainSuffix) so the two never drift.
+const ReservedChainSuffix = "-xpf-chain"
+
+// validatePolicyReservedChainNameStrict hard-rejects an operator
+// policy-statement whose name ends in the reserved ReservedChainSuffix. That
+// suffix is owned by the FRR renderer's generated composed BGP policy-chain
+// route-maps (#5277): an ordered import/export chain of length >= 2 is joined
+// and suffixed with ReservedChainSuffix (composedChainName in pkg/frr). An
+// operator name in that suffix namespace can collide with a generated composed
+// route-map in FRR's global name-keyed route-map object; FRR MERGES two
+// same-named route-map definitions, silently altering the operator's BGP
+// filtering (#5442). Reserving the suffix at commit makes the composed-name
+// namespace injective against operator policy-statements BY CONSTRUCTION — no
+// legal config can name a policy-statement into the generated slot.
+//
+// Strict on commit / commit-check (hard reject so the reserved name is
+// operator-visible); lenient on load / peer-sync (warn so an already-persisted
+// or peer-synced config an older binary accepted still boots — #1960
+// fail-closed-on-load class). The render-side defense-in-depth
+// (bgpComposedChainCollision in pkg/frr) fails the whole managed-section apply
+// CLOSED on the tolerant path, so a leniently-loaded collision cannot leak. Runs
+// on the fully-compiled *Config so the policy-statement map is populated
+// regardless of authoring order. Mirrors validatePolicyReservedRedistNameStrict.
+func validatePolicyReservedChainNameStrict(cfg *Config) error {
+	if cfg == nil || cfg.PolicyOptions.PolicyStatements == nil {
+		return nil
+	}
+	// Deterministic first-error: iterate policy-statement names in sorted order.
+	names := make([]string, 0, len(cfg.PolicyOptions.PolicyStatements))
+	for name := range cfg.PolicyOptions.PolicyStatements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if strings.HasSuffix(name, ReservedChainSuffix) {
+			return fmt.Errorf(
+				"policy-statement %q ends in the reserved %q suffix; xpf owns "+
+					"that suffix for generated composed BGP policy-chain "+
+					"route-maps (#5277/#5442) and an operator name in that "+
+					"namespace can collide with a generated composed route-map "+
+					"in FRR's global route-map object, which FRR would merge — "+
+					"silently altering BGP route filtering — rename the "+
+					"policy-statement off the reserved suffix",
+				name, ReservedChainSuffix)
+		}
+	}
+	return nil
+}

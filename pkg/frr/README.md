@@ -443,7 +443,17 @@ also carries operator content:
      so `bgpComposedChainCollision` (called by `ApplyFull`, mirroring
      `redistAliasCollision`) fails the whole apply CLOSED if a composed name
      collides with an operator policy-statement or two distinct chains derive
-     the same name. `collectBGPRouteMapPolicies` records only SINGLE-policy
+     the same name. **Commit-time reservation (#5442):** the `-xpf-chain`
+     suffix (`config.ReservedChainSuffix`, which `frr.ReservedChainSuffix`
+     re-exports so the two cannot drift) is ALSO reserved at commit /
+     commit-check — `validatePolicyReservedChainNameStrict` (`pkg/config`,
+     mirroring `validatePolicyReservedRedistNameStrict`) hard-rejects an
+     operator policy-statement whose name ends in it (lenient-warn on
+     load/HA-sync per #1960), so an operator name collision is rejected
+     cleanly at commit instead of surfacing as a late whole-section apply
+     failure; `bgpComposedChainCollision` remains the render-side
+     defense-in-depth for the tolerant path. `collectBGPRouteMapPolicies`
+     records only SINGLE-policy
      chains into `bgpAcceptDefault` (a composed chain carries its BGP-accept
      default INTERNALLY, so its members' standalone route-maps are not the
      referenced objects). RED-on-revert covered by `bgp_policy_chain_5277_test.go`

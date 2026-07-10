@@ -1283,6 +1283,29 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5442: reserved composed-chain route-map-suffix gate. #5277 composes an
+	// ordered BGP import/export policy chain (length >= 2) into a single FRR
+	// route-map named `join(chain, "-") + "-xpf-chain"` (composedChainName,
+	// pkg/frr) in FRR's GLOBAL name-keyed route-map namespace. An operator
+	// policy-statement literally named `<X>-xpf-chain` collides with that
+	// generated composed route-map and FRR MERGES same-named route-maps,
+	// silently altering the operator's BGP filtering. Reserve the suffix: strict
+	// on commit / commit-check (hard reject so the reserved name is
+	// operator-visible), lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config an older binary accepted still
+	// boots — #1960; the render path carries the bgpComposedChainCollision guard
+	// that fails the apply CLOSED on the tolerant path). Runs on the
+	// fully-compiled *Config so the policy-statement map is populated regardless
+	// of authoring order. Mirrors validatePolicyReservedRedistNameStrict.
+	if err := validatePolicyReservedChainNameStrict(cfg); err != nil {
+		if opts.lenientPolicyReservedChainName {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("reserved route-map suffix (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2963: BGP neighbor peer-as gate. peer-as (remote-as) is optional in
 	// the parser/compiler, so a neighbor authored without one keeps a zero
 	// PeerAS and the FRR renderer emitted `neighbor <addr> remote-as 0`. AS 0
