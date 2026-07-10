@@ -175,18 +175,20 @@ func TestNetflowTemplateV4_PostNATFields(t *testing.T) {
 			t.Fatalf("v9 v4 template post-NAT field %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	// Record size derives from the template. The pre-NAT v4 body is 39 bytes;
-	// #2749 re-added ingressInterface (IE 10, 4B) + SrcTos (1) + TCPFlags (1) +
-	// OutputSNMP (4); +12 post-NAT = 39+4+6+12 = 61, padded to 64.
-	if rs := recordSize(netflowTemplateFieldsV4); rs != 64 {
-		t.Fatalf("v9 v4 recordSize = %d, want 64 (39 pre-NAT body + 4 ingressInterface + 6 CoS/egress (#2749) + 12 post-NAT, padded)", rs)
+	// Record size derives from the template: the plain (unpadded) sum of the
+	// field lengths, which is exactly the template-advertised width (#4896 — a
+	// v9 record is NOT per-record padded; only the enclosing FlowSet is). The
+	// pre-NAT v4 body is 39 bytes; #2749 re-added ingressInterface (IE 10, 4B) +
+	// SrcTos (1) + TCPFlags (1) + OutputSNMP (4); +12 post-NAT = 39+4+6+12 = 61.
+	if rs := recordSize(netflowTemplateFieldsV4); rs != 61 {
+		t.Fatalf("v9 v4 recordSize = %d, want 61 (39 pre-NAT body + 4 ingressInterface + 6 CoS/egress (#2749) + 12 post-NAT, unpadded template width)", rs)
 	}
 }
 
-// netflowUnpaddedLen returns the summed (unpadded) field length; the v9
-// encoder writes fields sequentially then pads the record at the END, so the
-// post-NAT tuple sits at the last 12/36 unpadded bytes, NOT at
-// recordSize-12.
+// netflowUnpaddedLen returns the summed field length. Since #4896 removed the
+// per-record padding this equals recordSize (records are contiguous at the
+// template width), so the post-NAT tuple sits at the last 12/36 bytes of the
+// record body.
 func netflowUnpaddedLen(fields []templateField) int {
 	n := 0
 	for _, f := range fields {
@@ -211,9 +213,9 @@ func TestNetflowTemplateV6_PostNATFields(t *testing.T) {
 	}
 	// The pre-NAT v6 body is 63 bytes; #2749 re-added ingressInterface (IE 10,
 	// 4B) + SrcTos (1) + TCPFlags (1) + OutputSNMP (4); +36 post-NAT =
-	// 63+4+6+36 = 109, padded to 112.
-	if rs := recordSize(netflowTemplateFieldsV6); rs != 112 {
-		t.Fatalf("v9 v6 recordSize = %d, want 112 (63 pre-NAT body + 4 ingressInterface + 6 CoS/egress (#2749) + 36 post-NAT, padded)", rs)
+	// 63+4+6+36 = 109 (unpadded template width, #4896).
+	if rs := recordSize(netflowTemplateFieldsV6); rs != 109 {
+		t.Fatalf("v9 v6 recordSize = %d, want 109 (63 pre-NAT body + 4 ingressInterface + 6 CoS/egress (#2749) + 36 post-NAT, unpadded template width)", rs)
 	}
 }
 
@@ -236,11 +238,12 @@ func TestNetflowEncodeV4_PostNATGolden(t *testing.T) {
 	}
 	fs := encodeDataFlowSet([]FlowRecord{rec}, boot, opts)
 	recSize := recordSize(netflowTemplateFieldsV4)
-	// FlowSet = 4 (header) + recSize.
-	if len(fs) != 4+recSize {
-		t.Fatalf("v9 v4 flowset len = %d, want %d", len(fs), 4+recSize)
+	// FlowSet = 4 (header) + contiguous records, rounded up once to a 32-bit
+	// boundary (RFC 3954 terminal padding, #4896).
+	if wantLen := dataFlowSetLen(1, recSize); len(fs) != wantLen {
+		t.Fatalf("v9 v4 flowset len = %d, want %d", len(fs), wantLen)
 	}
-	// Post-NAT tuple is the last 12 UNPADDED bytes (v9 pads at the end).
+	// Post-NAT tuple is the last 12 bytes of the contiguous record body.
 	postOff := 4 + netflowUnpaddedLen(netflowTemplateFieldsV4) - 12
 	if ip := net.IP(fs[postOff : postOff+4]); !ip.Equal(net.IPv4(203, 0, 113, 5).To4()) {
 		t.Errorf("v9 postNatSrcIPv4 = %s, want 203.0.113.5", ip)
@@ -277,8 +280,8 @@ func TestNetflowEncodeV6_PostNATGolden(t *testing.T) {
 	}
 	fs := encodeDataFlowSet([]FlowRecord{rec}, boot, opts)
 	recSize := recordSize(netflowTemplateFieldsV6)
-	if len(fs) != 4+recSize {
-		t.Fatalf("v9 v6 flowset len = %d, want %d", len(fs), 4+recSize)
+	if wantLen := dataFlowSetLen(1, recSize); len(fs) != wantLen {
+		t.Fatalf("v9 v6 flowset len = %d, want %d", len(fs), wantLen)
 	}
 	postOff := 4 + netflowUnpaddedLen(netflowTemplateFieldsV6) - 36
 	if ip := net.IP(fs[postOff : postOff+16]); !ip.Equal(natSrc) {

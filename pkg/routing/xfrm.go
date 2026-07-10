@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -117,7 +119,10 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		if want && wantID == trackedID {
 			continue // still desired, unchanged — leave it untouched
 		}
-		x.deleteLocked(name)
+		// Differential reconcile: a failed LinkDel now retains tracking (#4901)
+		// so the next Apply retries; the recreate below still runs for a desired
+		// name whose if_id changed.
+		_ = x.deleteLocked(name)
 	}
 
 	// Reconcile each desired xfrmi against the kernel. After the delete
@@ -147,7 +152,7 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			if xi, ok := link.(*netlink.Xfrmi); ok && xi.Ifid != ifID {
 				slog.Info("xfrmi has stale if_id, recreating",
 					"name", ifName, "have", xi.Ifid, "want", ifID)
-				x.deleteLocked(ifName)
+				_ = x.deleteLocked(ifName)
 				// Fall through to the LinkAdd create path below.
 			} else {
 				if upErr := x.ops.LinkSetUp(link); upErr != nil {
@@ -207,26 +212,42 @@ func (x *xfrmManager) Clear() error {
 // Clear (shutdown / full teardown). Apply no longer calls this — it
 // reconciles differentially instead (#2546).
 func (x *xfrmManager) clearLocked() error {
+	var errs []error
 	for name := range x.xfrmis {
-		x.deleteLocked(name)
+		if err := x.deleteLocked(name); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	x.xfrmis = nil
-	return nil
+	// #4901: deleteLocked drops each successfully-removed name and RETAINS the
+	// ones whose LinkDel failed so the next reconcile retries — do NOT
+	// blanket-nil the map here (the old behavior), which would forget an
+	// orphaned xfrmi and lose ownership while reporting a clean teardown. Only
+	// clear the map once every device is actually gone.
+	if len(x.xfrmis) == 0 {
+		x.xfrmis = nil
+	}
+	return errors.Join(errs...)
 }
 
 // deleteLocked removes a single tracked xfrmi by name and drops it from
 // tracking. Caller must hold mu. A link already gone from the kernel is
-// treated as success (the entry is still untracked).
-func (x *xfrmManager) deleteLocked(name string) {
+// treated as success (the entry is still untracked). It returns a non-nil
+// error when the netlink LinkDel fails, in which case the name is RETAINED in
+// tracking (#4901) so the next reconcile retries instead of orphaning the link.
+func (x *xfrmManager) deleteLocked(name string) error {
 	link, err := x.ops.LinkByName(name)
 	if err != nil {
 		delete(x.xfrmis, name)
-		return // already gone
+		return nil // already gone
 	}
 	if err := x.ops.LinkDel(link); err != nil {
+		// #4901: a failed LinkDel leaves the xfrmi in the kernel. Retain
+		// tracking (do NOT delete from x.xfrmis) and surface the error so the
+		// caller can aggregate it and the next reconcile retries.
 		slog.Warn("failed to delete xfrmi", "name", name, "err", err)
-	} else {
-		slog.Info("xfrmi removed", "name", name)
+		return fmt.Errorf("delete xfrmi %s: %w", name, err)
 	}
+	slog.Info("xfrmi removed", "name", name)
 	delete(x.xfrmis, name)
+	return nil
 }

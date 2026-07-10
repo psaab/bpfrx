@@ -236,7 +236,12 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				// matter — repeating the ASN is the whole mechanism); a
 				// single-value leaf would drop all but the first (#2892).
 				"as-path-prepend": {desc: "AS path prepend", args: 1, multi: true, groupReplace: true, placeholder: "<asn>", children: nil},
-				"origin":          {desc: "Origin", args: 1, placeholder: "<origin>", children: nil},
+				// #4919: type `then origin` as an enum. Without a validator a
+				// non-control invalid token (e.g. `igpp`) passed the #4498
+				// sanitize belt and reached FRR verbatim, failing the route-map
+				// grammar at frr-reload and stalling the WHOLE managed section.
+				// FRR `set origin` accepts only igp | egp | incomplete.
+				"origin": {desc: "Origin", args: 1, valueType: ValueEnumOf, valueDesc: "BGP origin (igp | egp | incomplete)", valueExamples: []string{"igp", "egp", "incomplete"}, validator: ValidateEnum([]string{"igp", "egp", "incomplete"}), placeholder: "<origin>", children: nil},
 			}},
 		}},
 		"then": {desc: "Default action", children: nil},
@@ -335,7 +340,7 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 	"bgp": {desc: "BGP configuration", children: map[string]*schemaNode{
 		"local-as":         {desc: "Local AS number", args: 1, valueType: ValueInteger, placeholder: "<as-number>", validator: ValidateInteger(1, 4294967295), children: nil},
 		"router-id":        {desc: "Router ID", args: 1, placeholder: "<address>", children: nil},
-		"cluster-id":       {desc: "Cluster ID", args: 1, placeholder: "<id>", children: nil},
+		"cluster-id":       {desc: "Cluster ID", args: 1, valueType: ValueIPAddress, valueDesc: "Route-reflector cluster-id (IPv4 dotted-quad, or 32-bit integer 1..4294967295)", valueExamples: []string{"10.0.0.1", "1"}, validator: ValidateBGPClusterID, placeholder: "<id>", children: nil},
 		"graceful-restart": {desc: "Graceful restart", children: nil},
 		"log-updown":       {desc: "Log up/down events", children: nil},
 		"multipath": {desc: "Multipath", children: map[string]*schemaNode{

@@ -24,9 +24,16 @@ the apply path pays no fsync (the file is regenerated on every apply).
   `applyConfigLocked` tail result alongside networkd / Kea / host-inbound /
   lo0 (fail-closed on commit); the config stays promoted + peer-synced and the
   remaining reconcile steps still run, so the operator sees a degraded-state
-  error instead of a false success.
+  error instead of a false success. **The empty-clear branch is symmetric
+  (#4898):** deleting the last VPN routes `Apply(nil)` → `clearConfig`, which now
+  RETURNS the `swanctl --load-all` error (it previously did `_ = m.reload()` and
+  reported success). Promotion of `prevConnNames` and removed-SA termination are
+  gated on reload SUCCESS — a failed reload leaves the OLD config effective, so
+  the applied-name set is preserved and no SA is torn down, letting the next
+  successful Apply/Clear retry the diff + teardown.
 - `Clear() error` — `manager.go`. Remove the xpf snippet, reload, and
-  terminate every previously-applied connection's live SAs (#3941).
+  terminate every previously-applied connection's live SAs (#3941). Like Apply,
+  a reload failure is returned and skips promotion/termination (#4898).
 - `SAStatus`, `TerminateAllSAs`, `InitiateConnection`, `GetSAStatus`,
   `ActiveConnectionNames` — `ike.go`.
 - `PrepareConfig(cfg *config.Config) *config.IPsecConfig` — `policy.go`.
@@ -38,9 +45,9 @@ all files stay in `package ipsec`, so the public API is unchanged.
 
 - `manager.go` — transactional SA-config reconciler: `Manager`
   lifecycle (`New`/`Apply`/`Clear`/`reload`), the removed-connection
-  diff + live-SA teardown (`swapConnNames`/`terminateRemovedConns`,
-  #3941), and the `swanctl` shell-out helper (`runSwanctl`, the `sc`
-  seam, `swanctlTimeout`).
+  diff + live-SA teardown (`promoteConnNames`/`terminateRemovedConns`,
+  #3941; promotion gated on reload success, #4898), and the `swanctl`
+  shell-out helper (`runSwanctl`, the `sc` seam, `swanctlTimeout`).
 - `ike.go` — IKE/ESP settings resolution + proposal builders
   (`resolveIKESettings`/`resolveESPSettings`/`deriveDPD`/`buildESPProposal`/
   `dhGroupBits`) and the SA-status query + `swanctl --list-sas` output
@@ -80,18 +87,22 @@ all files stay in `package ipsec`, so the public API is unchanged.
   gap: a VPN removed for a compromised peer / decommissioned site stays
   up). `Apply` therefore remembers the previous applied connection-name
   set (`prevConnNames`, sanitized VPN map keys) and on each apply diffs it
-  against the new set (`swapConnNames`). For every connection that
-  disappeared, `terminateRemovedConns` reloads first (so the removed conn
-  is unloaded and cannot re-initiate), then queries live SAs and issues
-  `swanctl --terminate --ike <conn>` only for a removed conn that actually
-  has a live SA — so deleting a VPN that was never up is a clean no-op. If
-  the live-SA query fails, it falls back to an unconditional (idempotent)
-  terminate. The diff keys off the VPN NAME, not renderability, so a VPN
-  that merely became unrenderable (a broken gateway reference) is not
+  against the new set. `Apply`/`Clear` reload FIRST and only on reload
+  success advance `prevConnNames` and tear down removed SAs
+  (`promoteConnNames`, #4898) — so the removed conn is unloaded and cannot
+  re-initiate before teardown, and a failed reload leaves the old set intact
+  rather than forgetting a still-loaded connection or disrupting a
+  still-effective tunnel. `terminateRemovedConns` then queries live SAs and
+  issues `swanctl --terminate --ike <conn>` only for a removed conn that
+  actually has a live SA — so deleting a VPN that was never up is a clean
+  no-op. If the live-SA query fails, it falls back to an unconditional
+  (idempotent) terminate. The diff keys off the VPN NAME, not renderability,
+  so a VPN that merely became unrenderable (a broken gateway reference) is not
   treated as deleted and keeps its SAs. Modified/added connections are
   untouched — only removals are torn down. All swanctl shell-outs route
   through the `sc` seam so the diff→terminate path is unit-tested against
-  a recording double (`delete_terminate_3941_test.go`).
+  recording doubles (`delete_terminate_3941_test.go`,
+  `manager_reload_ordering_4898_test.go`).
 - **SA-status parsing must match the real `swanctl --list-sas` layout
   (#3937).** `GetSAStatus` shells out to `swanctl --list-sas` and feeds the
   stdout to `parseSAOutput`. The real strongSwan output is
