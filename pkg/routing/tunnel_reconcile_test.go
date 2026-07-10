@@ -1647,3 +1647,169 @@ func TestClearTunnelsDeletesOwnershipUnion(t *testing.T) {
 		t.Fatal("Clear left the failed-apply owned link behind (union rule)")
 	}
 }
+
+// --- #5120: WireGuard TUN VRF bind/unbind lifecycle ------------------
+//
+// The WG apply path used to bind the persistent wgN TUN to a VRF only in
+// the non-empty routing-instance case, with no else/unbind branch. Removing
+// the whole tunnel — or clearing its `routing-instance` while it stayed
+// configured — left wgN mastered to the old VRF indefinitely. These tests
+// pin the bind, the RI-removal unbind, the config-removal unbind, the
+// foreign-master veto, and the transient-failure retry. They go RED if the
+// unbind wiring is reverted.
+
+func wgTCVRF(ri string, addrs ...string) *config.TunnelConfig {
+	return &config.TunnelConfig{
+		Name: "wg0", Mode: "wireguard", RoutingInstance: ri, Addresses: addrs,
+	}
+}
+
+func wgClaim(t *testing.T, tm *tunnelManager) string {
+	t.Helper()
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	return tm.appliedRI["wg0"]
+}
+
+// The core fail-on-revert guard: a WG tunnel removed from config keeps its
+// persistent link (S2a) but must be UNBOUND from the VRF it last claimed.
+func TestWireguardVRFUnboundOnConfigRemoval(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	seedVRF(ops, "red", 100)
+
+	if err := tm.Apply([]*config.TunnelConfig{wgTCVRF("red", "172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1 (bind): %v", err)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 100 {
+		t.Fatalf("wg0 not bound to vrf-red: MasterIndex=%d want 100", got)
+	}
+	if got := wgClaim(t, tm); got != "red" {
+		t.Fatalf("appliedRI claim not recorded on WG bind: %q want red", got)
+	}
+
+	// Remove the WG tunnel entirely from config.
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal): %v", err)
+	}
+	if _, err := ops.LinkByName("wg0"); err != nil {
+		t.Fatalf("persistent wg0 link gone after removal (must be kept): %v", err)
+	}
+	if len(ops.noMaster) != 1 || ops.noMaster[0] != "wg0" {
+		t.Fatalf("wg0 not unbound from VRF on removal (#5120): noMaster=%v", ops.noMaster)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 0 {
+		t.Fatalf("wg0 still enslaved after removal: MasterIndex=%d want 0", got)
+	}
+	if got := wgClaim(t, tm); got != "" {
+		t.Fatalf("appliedRI claim not cleared after unbind: %q", got)
+	}
+
+	// Idempotent: a later Apply with the tunnel still absent must not
+	// re-issue the unbind (the claim is gone and there is nothing to visit).
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (still removed): %v", err)
+	}
+	if len(ops.noMaster) != 1 {
+		t.Fatalf("VRF unbind not idempotent on removal: %v", ops.noMaster)
+	}
+}
+
+// Clearing the `routing-instance` stanza from a STILL-configured WG tunnel
+// must unbind it (parity with GRE/IPIP reconcileVRFClaimLocked step 3).
+func TestWireguardVRFUnboundOnRoutingInstanceRemoval(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	seedVRF(ops, "red", 100)
+
+	if err := tm.Apply([]*config.TunnelConfig{wgTCVRF("red", "172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1 (bind): %v", err)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 100 {
+		t.Fatalf("wg0 not bound: MasterIndex=%d want 100", got)
+	}
+
+	// Same tunnel, routing-instance removed (still WireGuard, still present).
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 2 (RI removed): %v", err)
+	}
+	if _, err := ops.LinkByName("wg0"); err != nil {
+		t.Fatalf("wg0 link gone after RI removal (must be kept): %v", err)
+	}
+	if len(ops.noMaster) != 1 || ops.noMaster[0] != "wg0" {
+		t.Fatalf("wg0 not unbound on routing-instance removal (#5120): noMaster=%v", ops.noMaster)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 0 {
+		t.Fatalf("wg0 still enslaved after RI removal: MasterIndex=%d want 0", got)
+	}
+	if got := wgClaim(t, tm); got != "" {
+		t.Fatalf("appliedRI claim not cleared after RI removal: %q", got)
+	}
+}
+
+// A WG tunnel this manager never bound (no appliedRI claim) but which
+// carries a FOREIGN master must never be unbound on config removal — the
+// identity gate must reject a master we do not own.
+func TestWireguardVRFForeignMasterNeverUnbound(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+
+	// Apply with NO routing-instance ⇒ no claim recorded.
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	if got := wgClaim(t, tm); got != "" {
+		t.Fatalf("unexpected claim for RI-less WG tunnel: %q", got)
+	}
+	// Someone else binds wg0 to a VRF out-of-band.
+	ops.links["wg0"].Attrs().MasterIndex = 200
+
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal): %v", err)
+	}
+	if len(ops.noMaster) != 0 {
+		t.Fatalf("foreign master unbound on removal (identity gate breached): %v", ops.noMaster)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 200 {
+		t.Fatalf("foreign master mutated: MasterIndex=%d want 200", got)
+	}
+}
+
+// A TRANSIENT LinkSetNoMaster failure on removal must RETAIN the claim (and
+// the wgConfigured tracking) and retry on the next Apply until it succeeds.
+func TestWireguardVRFUnbindTransientRetried(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	seedVRF(ops, "red", 100)
+
+	if err := tm.Apply([]*config.TunnelConfig{wgTCVRF("red", "172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1 (bind): %v", err)
+	}
+
+	// Removal, but the unbind netlink call fails transiently.
+	ops.noMasterErr = errors.New("EBUSY")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal, unbind fails): %v", err)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 100 {
+		t.Fatalf("wg0 unbound despite injected LinkSetNoMaster failure: MasterIndex=%d", got)
+	}
+	if got := wgClaim(t, tm); got != "red" {
+		t.Fatalf("claim not retained after transient unbind failure: %q want red", got)
+	}
+
+	// Retry: unbind now succeeds → wg0 freed, claim cleared.
+	ops.noMasterErr = nil
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (retry): %v", err)
+	}
+	if len(ops.noMaster) != 1 || ops.noMaster[0] != "wg0" {
+		t.Fatalf("VRF unbind not retried after transient failure (#5120): %v", ops.noMaster)
+	}
+	if got := ops.links["wg0"].Attrs().MasterIndex; got != 0 {
+		t.Fatalf("wg0 still enslaved after retry: MasterIndex=%d want 0", got)
+	}
+	if got := wgClaim(t, tm); got != "" {
+		t.Fatalf("claim not cleared after successful retry: %q", got)
+	}
+}
