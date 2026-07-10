@@ -1,3 +1,16 @@
+## 2026-07-09 — daemon: revoke credentials on login-user removal (#5128)
+
+- **Timestamp**: 2026-07-09
+  **Action**: Added `reconcileAbsentLoginUsers`/`deprovisionLoginUser` — a
+  declarative absent-user reconcile that consumes the UID-keyed provenance
+  marker to LOCK the password and REMOVE the managed `authorized_keys` of a
+  login user deleted from config (host access was retained before; only the
+  sudo grant was swept). Scoped strictly to the exact xpf-provisioned UID
+  (never an out-of-band account), fail-closed toward retry. Wired
+  unconditionally after `reconcileSudoers` in `daemon_apply.go`.
+  **File(s)**: pkg/daemon/login_password.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/login_deprovision_5128_test.go, docs/system-login.md, _Log.md
+
 ## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
 
 - **Timestamp**: 2026-07-09

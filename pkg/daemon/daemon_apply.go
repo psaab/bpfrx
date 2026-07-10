@@ -1632,6 +1632,13 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServer
 	// that must still sweep stale grants.
 	d.reconcileSudoers(cfg)
 
+	// 11c. Revoke host credentials for any xpf-provisioned login account that
+	// was removed from config (#5128). reconcileSudoers above only revokes the
+	// sudo grant; without this a deprovisioned operator keeps their password
+	// and authorized_keys and can still SSH in. Like reconcileSudoers it MUST
+	// run unconditionally — the "all users removed" case must still revoke.
+	d.reconcileAbsentLoginUsers(cfg)
+
 	// 12. Apply SSH service configuration (root-login)
 	d.applySSHConfig(cfg)
 
