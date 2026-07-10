@@ -227,6 +227,29 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**Bracketed lists on a WILDCARD container collapse differently — a NESTED
+chain, not `Keys[1:]` (#5248).** The contract above assumes a `multi: true`
+value leaf, whose surplus bracket tokens land on ONE leaf's `Keys`. A
+bracket list whose element is instead a **wildcard container** —
+`security zones security-zone <z> interfaces [ ge-0/0/0 ge-0/0/1 ]`, where
+the interface name is `schemaNode.wildcard` with its own `host-inbound-traffic`
+child, NOT a `multi` leaf — does NOT collapse onto `Keys[1:]`. `SetPath`
+descends the wildcard for the FIRST token, then (the interface-name node has
+no wildcard of its own) nests every remaining token as a child UNDER that
+first member: `interfaces -> ge-0/0/0(container) -> ge-0/0/1(leaf)`; a 3+
+element list collapses the whole tail onto the deepest leaf's Keys
+(`interfaces -> a(container) -> leaf Keys=[b c]`). `firewallMatchValues` is
+therefore the WRONG helper here — it reads one node's `Keys[1:]` + immediate
+children and would still see only the first member. `compileZones`
+(`compiler_security_zones.go`) flattens the nested chain with the recursive
+`zoneInterfaceMembers`, which reads every key at each level and skips a
+`host-inbound-traffic` body (a bracketed member is bare membership — it cannot
+carry a per-interface host-inbound stanza). Before #5248 the reader took only
+`iface.Name()` and silently dropped every member after the first — a zone-
+membership (security boundary) loss that also hid the dropped interface from
+the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
+`pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
+
 **`multi: true` ALSO prevents single-value REPLACE for repeated keyed-list
 leaves (#3984).** The `#2419` discussion above is about ONE statement with a
 bracket list. The SAME `multi: true` marker fixes a second, distinct shape:

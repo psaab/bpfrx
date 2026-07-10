@@ -112,7 +112,26 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 			switch prop.Name() {
 			case "interfaces":
 				for _, iface := range prop.Children {
-					zone.Interfaces = append(zone.Interfaces, iface.Name())
+					// #5248: accumulate EVERY interface name this member node
+					// carries, across all parser AST shapes, not just the first.
+					// A bracketed flat-set / load-override membership list
+					// `interfaces [ ge-0/0/0 ge-0/0/1 ]` arrives bracket-stripped
+					// (the lexer drops `[`/`]`, #2419). Unlike a multi:true value
+					// leaf — where the surplus tokens collapse onto ONE leaf's
+					// Keys and firewallMatchValues recovers them — the schema
+					// models the interface name as a WILDCARD container, so
+					// SetPath NESTS each surplus token under the first member
+					// (`interfaces -> ge-0/0/0(container) -> ge-0/0/1(leaf)`; a
+					// 3+ list collapses the whole tail onto the deepest leaf's
+					// Keys, e.g. `[b c]`). Reading only iface.Name() compiled just
+					// the FIRST member and SILENTLY DROPPED the rest — a zone-
+					// membership (security boundary) loss: the dropped interfaces
+					// are left unmanaged / brought DOWN or evaluated against the
+					// wrong zone, and their absence hid them from the strict
+					// zone-interface-defined gate. zoneInterfaceMembers flattens
+					// the nested chain so the hierarchical `{ a; b; }`, a single
+					// `a`, and the bracketed `[ a b c ]` all yield every member.
+					zone.Interfaces = append(zone.Interfaces, zoneInterfaceMembers(iface)...)
 					// #3362: per-interface host-inbound-traffic override
 					// (`interfaces <if> host-inbound-traffic { ... }`). Same
 					// token grammar as the zone-level stanza; parsed by the
@@ -180,4 +199,41 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 		}
 	}
 	return nil
+}
+
+// zoneInterfaceMembers flattens every interface name a `security-zone`
+// `interfaces` member node carries, across BOTH parser AST shapes (#5248 — the
+// zone-membership instance of the #2419 dual-shape class):
+//
+//   - hierarchical block  `interfaces { a; b; }`  → one child leaf per name,
+//     each read at the top of the recursion (iface.Keys = ["a"], ["b"])
+//   - single membership    `interfaces a`          → iface.Keys = ["a"]
+//   - bracket list          `interfaces [ a b c ]`  → a NESTED chain, because the
+//     schema models the interface name as a WILDCARD container (not a multi:true
+//     leaf): `interfaces -> a(container) -> leaf Keys=["b","c"]`. The lexer strips
+//     the brackets (#2419) so the flat-set path is [..., interfaces, a, b, c];
+//     SetPath descends the wildcard for `a`, then — the interface-name node has
+//     no wildcard of its own — collapses every remaining token onto ONE leaf
+//     under `a` (ast_edit.go SetPath, the childSchema==nil tail).
+//
+// Reading only the member's Name() (Keys[0]) compiled just the first member and
+// silently dropped the rest (#5248). Recursing the nested chain and reading every
+// key at each level recovers all members. A `host-inbound-traffic` body under a
+// member is NOT an interface name — it is compiled separately (#3362) and skipped
+// here; a bracketed member cannot carry one (Junos: brackets are bare
+// membership), so per-interface host-inbound stays keyed on the direct child.
+func zoneInterfaceMembers(iface *Node) []string {
+	var names []string
+	for _, k := range iface.Keys {
+		if k != "" {
+			names = append(names, k)
+		}
+	}
+	for _, child := range iface.Children {
+		if child.Name() == "host-inbound-traffic" {
+			continue
+		}
+		names = append(names, zoneInterfaceMembers(child)...)
+	}
+	return names
 }
