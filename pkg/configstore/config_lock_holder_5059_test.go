@@ -40,6 +40,9 @@ func TestStoreMutatorHolderEnforcement(t *testing.T) {
 		{"InsertAs", func() error {
 			return store.InsertAs("intruder", []string{"a"}, []string{"b"}, true)
 		}},
+		{"AnnotateAs", func() error {
+			return store.AnnotateAs("intruder", []string{"system", "host-name"}, "hi")
+		}},
 		{"LoadOverrideAs", func() error { return store.LoadOverrideAs("intruder", "system { host-name x; }") }},
 		{"LoadMergeAs", func() error { return store.LoadMergeAs("intruder", "set system host-name x") }},
 		{"LoadSetAs", func() error { _, e := store.LoadSetAs("intruder", "set system host-name x"); return e }},

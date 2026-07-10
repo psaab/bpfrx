@@ -237,12 +237,28 @@ func (s *Store) InsertAs(sessionID string, elementPath, refPath []string, before
 	return nil
 }
 
-// Annotate sets a comment on a configuration node in the candidate config.
+// Annotate sets a comment on a configuration node in the candidate config. It
+// is the internal/system entry point (no session ownership check); a
+// session-scoped caller uses AnnotateAs to carry the caller's session for
+// config-lock holder enforcement (#5379).
 func (s *Store) Annotate(path []string, comment string) error {
+	return s.AnnotateAs("", path, comment)
+}
+
+// AnnotateAs is Annotate scoped to a config-lock holder session (#5379,
+// mirroring the #5059 *As mutators). sessionID == "" bypasses ownership
+// (internal/system caller). Annotate was the one candidate mutator missing the
+// ensureHolderLocked ownership check that every sibling enforces, so a caller
+// that did not hold the config lock could annotate another session's candidate
+// and refresh (extend) the true holder's idle lease with no ownership check.
+func (s *Store) AnnotateAs(sessionID string, path []string, comment string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
