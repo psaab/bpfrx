@@ -152,7 +152,8 @@ type Daemon struct {
 	// race-free; only the day-2 reconcile bookkeeping needs the lock.
 	feedsMu sync.Mutex
 	// activeFeedsHash is the config-hash gate for the day-2 feed reconcile
-	// (#5036): d.feeds.Apply (StopAll + restart) runs only when the feed-server
+	// (#5036): d.feeds.Apply (producer swap; persisted feeds carry their
+	// last-good snapshot forward, #5282) runs only when the feed-server
 	// configuration actually changes, so a feed CONTENT update (which re-enters
 	// applyConfig via onUpdate) does not thrash the refresh goroutines.
 	activeFeedsHash [32]byte

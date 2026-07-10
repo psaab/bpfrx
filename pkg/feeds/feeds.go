@@ -199,28 +199,23 @@ func resolveHoldInterval(seconds int) time.Duration {
 // When a feed-server has FeedEntries, each entry becomes a separate feed
 // keyed by the feed-name with its per-feed path appended to the base URL.
 func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig) {
-	m.StopAll()
-
-	if daCfg == nil || len(daCfg.FeedServers) == 0 {
-		return
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Build a COMPLETE, deterministic, de-duplicated plan BEFORE starting any
-	// refresh goroutine (#4913). daCfg.FeedServers is a Go map, so ranging it
+	// Build a COMPLETE, deterministic, de-duplicated plan BEFORE mutating
+	// m.feeds (#4913, #5282). daCfg.FeedServers is a Go map, so ranging it
 	// visits servers in nondeterministic order, and two feed-servers can
 	// declare the SAME effective feed name. The pre-#4913 loop assigned
 	// m.feeds[name] = fs and started a refresh loop per entry as it went, so a
 	// duplicate name OVERWROTE the earlier map entry — orphaning that worker's
-	// cancel func (StopAll then cancels only the survivor, so the overwritten
+	// cancel func (a cancel then reached only the survivor, so the overwritten
 	// loop kept fetching / logging / firing onUpdate until the daemon's parent
 	// context ended) — and enforcement read whichever provider won the last map
 	// iteration (nondeterministic across commits / restarts). Sorting the
 	// server keys and keeping only the FIRST occurrence of each effective feed
 	// name makes the winner deterministic and guarantees exactly one refresh
 	// loop — hence exactly one cancel — per name, so no goroutine is orphaned.
+	//
+	// Building the plan up front (rather than the pre-#5282 StopAll-then-empty
+	// first step) is also what lets a PERSISTED feed carry its last-good
+	// snapshot forward across the reconfigure — see the swap below.
 	type feedPlan struct {
 		name     string
 		url      string
@@ -228,73 +223,104 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 		interval time.Duration
 		server   string
 	}
-	serverNames := make([]string, 0, len(daCfg.FeedServers))
-	for sn := range daCfg.FeedServers {
-		serverNames = append(serverNames, sn)
-	}
-	sort.Strings(serverNames)
-
 	var plans []feedPlan
-	seen := make(map[string]bool)
-	for _, sn := range serverNames {
-		fsCfg := daCfg.FeedServers[sn]
-		if fsCfg == nil {
-			continue
+	if daCfg != nil && len(daCfg.FeedServers) > 0 {
+		serverNames := make([]string, 0, len(daCfg.FeedServers))
+		for sn := range daCfg.FeedServers {
+			serverNames = append(serverNames, sn)
 		}
-		baseURL := resolveBaseURL(fsCfg)
-		if baseURL == "" {
-			continue
-		}
-		interval := time.Duration(fsCfg.UpdateInterval) * time.Second
-		if interval <= 0 {
-			interval = time.Hour
-		}
-		hold := resolveHoldInterval(fsCfg.HoldInterval)
+		sort.Strings(serverNames)
 
-		plan := func(name, url string) {
-			if name == "" {
-				return
+		seen := make(map[string]bool)
+		for _, sn := range serverNames {
+			fsCfg := daCfg.FeedServers[sn]
+			if fsCfg == nil {
+				continue
 			}
-			if seen[name] {
-				// A feed name is an identity: two feeds sharing one would race
-				// on m.feeds[name] and orphan a refresh loop. Keep the first
-				// (deterministic winner: lexicographically-first server, then
-				// declaration order) and drop the duplicate with a warning. The
-				// strict compile gate (validateDynamicAddressFeedNameUniqueness
-				// Strict) rejects this at commit; this de-dup is the runtime
-				// safety net for a leniently-loaded / peer-synced config.
-				slog.Warn("dynamic-address: duplicate feed name ignored — only the first declaration starts a refresh loop (declare each feed name once)",
-					"name", name, "server", fsCfg.Name, "url", url)
-				return
+			baseURL := resolveBaseURL(fsCfg)
+			if baseURL == "" {
+				continue
 			}
-			seen[name] = true
-			plans = append(plans, feedPlan{name: name, url: url, hold: hold, interval: interval, server: fsCfg.Name})
-		}
+			interval := time.Duration(fsCfg.UpdateInterval) * time.Second
+			if interval <= 0 {
+				interval = time.Hour
+			}
+			hold := resolveHoldInterval(fsCfg.HoldInterval)
 
-		if len(fsCfg.FeedEntries) > 0 {
-			// Multiple named feeds with per-feed paths.
-			for _, fe := range fsCfg.FeedEntries {
-				feedURL := baseURL
-				if fe.Path != "" {
-					p := fe.Path
-					if !strings.HasPrefix(p, "/") {
-						p = "/" + p
-					}
-					feedURL = baseURL + p
+			plan := func(name, url string) {
+				if name == "" {
+					return
 				}
-				plan(fe.Name, feedURL)
+				if seen[name] {
+					// A feed name is an identity: two feeds sharing one would race
+					// on m.feeds[name] and orphan a refresh loop. Keep the first
+					// (deterministic winner: lexicographically-first server, then
+					// declaration order) and drop the duplicate with a warning. The
+					// strict compile gate (validateDynamicAddressFeedNameUniqueness
+					// Strict) rejects this at commit; this de-dup is the runtime
+					// safety net for a leniently-loaded / peer-synced config.
+					slog.Warn("dynamic-address: duplicate feed name ignored — only the first declaration starts a refresh loop (declare each feed name once)",
+						"name", name, "server", fsCfg.Name, "url", url)
+					return
+				}
+				seen[name] = true
+				plans = append(plans, feedPlan{name: name, url: url, hold: hold, interval: interval, server: fsCfg.Name})
 			}
-		} else {
-			// Single feed (backward compat): keyed by FeedName or server name.
-			key := fsCfg.FeedName
-			if key == "" {
-				key = fsCfg.Name
+
+			if len(fsCfg.FeedEntries) > 0 {
+				// Multiple named feeds with per-feed paths.
+				for _, fe := range fsCfg.FeedEntries {
+					feedURL := baseURL
+					if fe.Path != "" {
+						p := fe.Path
+						if !strings.HasPrefix(p, "/") {
+							p = "/" + p
+						}
+						feedURL = baseURL + p
+					}
+					plan(fe.Name, feedURL)
+				}
+			} else {
+				// Single feed (backward compat): keyed by FeedName or server name.
+				key := fsCfg.FeedName
+				if key == "" {
+					key = fsCfg.Name
+				}
+				plan(key, baseURL)
 			}
-			plan(key, baseURL)
 		}
 	}
 
-	// Start exactly one refresh loop per unique planned feed.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Swap the producer set under one lock (#5282). Cancel EVERY existing
+	// producer — each captured its old URL/interval via its feedState, so even a
+	// feed that persists (same name) with an edited URL/interval needs a fresh
+	// refresh loop — but before discarding the old map, carry each PERSISTED
+	// feed's last-good ENFORCED snapshot forward into its replacement feedState.
+	//
+	// This closes the fail-open denylist window that the pre-#5282
+	// StopAll-then-empty-then-async-fetch sequence opened: Apply used to replace
+	// m.feeds with an EMPTY map as its first step, so a still-present deny feed's
+	// overlay compiled to match-NONE from that instant until its NEW fetch
+	// landed asynchronously — and if the new endpoint was down, retainForever
+	// pinned the EMPTY set indefinitely (traffic that should be DENIED was
+	// ALLOWED). Carrying the snapshot forward keeps the last-good prefixes
+	// enforced until the new fetch atomically replaces them (installSnapshot).
+	//
+	// A feed GENUINELY REMOVED from config has no entry in the new plan, so it
+	// gets no replacement and its snapshot is dropped (correct — the operator
+	// removed it). A brand-NEW feed has no prior snapshot and starts empty until
+	// its first fetch (the documented fail-closed cold-start, not a regression).
+	old := m.feeds
+	for _, fs := range old {
+		if fs.cancel != nil {
+			fs.cancel()
+		}
+	}
+
+	newFeeds := make(map[string]*feedState, len(plans))
 	for _, p := range plans {
 		// Human-readable hold for the start log: retainForever (the default)
 		// would otherwise log as "0s".
@@ -309,13 +335,52 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 			holdInterval: p.hold,
 			cancel:       cancel,
 		}
-		m.feeds[p.name] = fs
+		// Persisted feed (same name survives the reconfigure): inherit the
+		// last-good snapshot so there is no fail-open window (#5282).
+		if prev, ok := old[p.name]; ok {
+			carryForwardSnapshot(fs, prev)
+		}
+		newFeeds[p.name] = fs
 		warnPlaintextFeed(p.name, p.url)
 		go m.refreshLoop(feedCtx, fs, p.interval)
 		slog.Info("dynamic address feed started",
 			"name", p.name, "server", p.server, "url", p.url,
-			"interval", p.interval, "hold", holdStr)
+			"interval", p.interval, "hold", holdStr,
+			"carried_prefixes", len(fs.prefixes))
 	}
+	m.feeds = newFeeds
+}
+
+// carryForwardSnapshot copies a prior feedState's last-good ENFORCED snapshot
+// (and its success / parse-quality metadata) into a freshly-built replacement
+// during Apply, so a feed that PERSISTS across a reconfigure (same name,
+// possibly new URL/interval) keeps enforcing its last-good prefixes until its
+// NEW fetch lands and atomically replaces them (#5282). Without this a persisted
+// deny feed would compile to match-none for the whole async re-fetch window —
+// and indefinitely under retainForever if the new endpoint is down (fail-open).
+//
+// Both src and dst are accessed with m.mu held by the caller (Apply). The prior
+// producer has already been cancelled; its snapshot fields are stable while the
+// lock is held, and the slices are deep-copied so the orphaned old feedState
+// cannot alias the live one after the lock is released.
+//
+// The retained FAILURE markers (lastError / staleSince) are intentionally NOT
+// carried: the new endpoint gets a clean slate, and the first post-Apply fetch
+// re-derives stale state via recordFailure (which re-arms staleSince because the
+// carried snapshot is present). This also gives an opt-in hold-interval a FRESH
+// window on the new endpoint rather than inheriting a partially-elapsed one — a
+// strictly more conservative (later-dropping) choice for the fail-open guard.
+func carryForwardSnapshot(dst, src *feedState) {
+	if src == nil || !src.hasSnapshot || len(src.prefixes) == 0 {
+		return
+	}
+	dst.prefixes = append([]string(nil), src.prefixes...)
+	dst.hash = src.hash
+	dst.hasSnapshot = true
+	dst.lastFetch = src.lastFetch
+	dst.lastSuccess = src.lastSuccess
+	dst.invalidLines = src.invalidLines
+	dst.invalidSample = append([]string(nil), src.invalidSample...)
 }
 
 // StopAll cancels all running feed refresh goroutines.
