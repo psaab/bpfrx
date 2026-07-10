@@ -793,11 +793,14 @@ func TestGeneratePolicyOptions_TerminatingTermNoOnMatchNext(t *testing.T) {
 	}
 }
 
-// TestGenerateProtocols_BGPImportMostSpecificWins proves Junos most-specific-
-// wins: a per-neighbor import overrides the inherited group import, and FRR
-// gets exactly ONE `route-map in`. The compiler appends the per-neighbor
-// import after the inherited group import; bgpEffectiveImport (lastNonEmpty)
-// picks the neighbor's.
+// TestGenerateProtocols_BGPImportMostSpecificWins proves the RENDER side of
+// Junos most-specific-wins after #5277: the group-vs-neighbor LEVEL override is
+// now resolved by the COMPILER (a neighbor's own import REPLACES the inherited
+// group import — see TestBGPNeighborImportReplacesGroup in pkg/config), so the
+// renderer receives the neighbor's already-resolved OWN import list. A
+// single-policy list still references the standalone route-map (byte-identical),
+// and FRR gets exactly ONE `route-map in`. The overridden group policy is not in
+// the neighbor's list at all, so it never renders.
 func TestGenerateProtocols_BGPImportMostSpecificWins(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
@@ -810,13 +813,13 @@ func TestGenerateProtocols_BGPImportMostSpecificWins(t *testing.T) {
 		LocalAS:  65001,
 		RouterID: "1.1.1.1",
 		Neighbors: []*config.BGPNeighbor{
-			// Inherited group import first, neighbor override appended last.
-			{Address: "10.0.2.1", PeerAS: 65002, Import: []string{"GROUP-IMPORT", "NEIGH-IMPORT"}},
+			// Compiler-resolved: the neighbor's own import replaced the group's.
+			{Address: "10.0.2.1", PeerAS: 65002, Import: []string{"NEIGH-IMPORT"}},
 		},
 	}
 	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po, nil)
 	if !strings.Contains(got, "neighbor 10.0.2.1 route-map NEIGH-IMPORT in\n") {
-		t.Errorf("most-specific import (NEIGH-IMPORT) not selected, got:\n%s", got)
+		t.Errorf("resolved neighbor import (NEIGH-IMPORT) not applied, got:\n%s", got)
 	}
 	if strings.Contains(got, "route-map GROUP-IMPORT in") {
 		t.Errorf("overridden group import must not render, got:\n%s", got)
