@@ -412,6 +412,12 @@ type flowBatch struct {
 	// the lease. It exists to deterministically exercise the retire() drain
 	// wait — production never sets it.
 	inflightHook func()
+	// maxDepthHook, when set (tests only), runs inside the high-water CAS loop
+	// after each maxDepth.Load() and before the CompareAndSwap, receiving the
+	// depth this add() observed. It exists to deterministically interleave two
+	// concurrent updaters at the load-then-store window and prove the CAS-max
+	// keeps the mark monotonic (#5048) — production never sets it.
+	maxDepthHook func(depth uint64)
 }
 
 // batchCap returns the effective per-family record cap.
@@ -473,10 +479,23 @@ func (b *flowBatch) add(fr FlowRecord) {
 	*dst = append(*dst, fr)
 	depth := uint64(len(b.v4) + len(b.v6))
 	b.mu.Unlock()
-	// maxDepth is written only here; adds are serialized by mu, so the
-	// load-then-store cannot race another writer (readers only Load()).
-	if depth > b.maxDepth.Load() {
-		b.maxDepth.Store(depth)
+	// Publish the high-water mark with a lock-free CAS-max loop. The mu
+	// section above serializes the append, but this update runs OUTSIDE mu
+	// (like the dropped/handoffDropped atomics), so a plain load-then-store
+	// would race a concurrent adder: if A computes depth 1 and B computes
+	// depth 2, both load an older value and B's store of 2 can be clobbered
+	// by A's later store of 1, regressing the published maximum. CompareAndSwap
+	// makes each update an atomic max(old, observed): retry until either our
+	// value is no longer the larger one or the swap from the value we read
+	// succeeds, so the mark is monotonic and never regresses (#5048).
+	for {
+		cur := b.maxDepth.Load()
+		if b.maxDepthHook != nil {
+			b.maxDepthHook(depth)
+		}
+		if depth <= cur || b.maxDepth.CompareAndSwap(cur, depth) {
+			break
+		}
 	}
 }
 

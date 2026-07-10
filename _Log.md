@@ -44829,3 +44829,19 @@ top.
   Added RED-on-revert tests. Updated pkg/snmp/README.md class-counter note.
 - **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
   pkg/daemon/daemon_snmp_reconcile_test.go, pkg/snmp/README.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: Fix flowexport batch max-depth high-water update race (#5048).
+  The `maxDepth` high-water update in `flowBatch.add()` ran OUTSIDE `b.mu`
+  as a plain load-then-store (`if depth > maxDepth.Load() { Store(depth) }`),
+  so two concurrent adders could interleave — B stores 2, A's later store
+  of 1 clobbers it — regressing the published high-water mark. Replaced with
+  a lock-free CAS-max loop (atomic `max(old, observed)`), consistent with the
+  sibling `dropped`/`handoffDropped` atomics that also update outside mu.
+  Added a test-only `maxDepthHook` seam and a deterministic barrier test that
+  forces the reverse-order store (RED-on-revert: MaxDepth regresses 2->1) plus
+  a 256-goroutine `-race` stress test. Docs: no contract change — maxDepth was
+  already documented as a monotonic high-water mark; this only makes it correct
+  under concurrency.
+- **File(s)**: pkg/flowexport/transport.go,
+  pkg/flowexport/maxdepth_race_5048_test.go
