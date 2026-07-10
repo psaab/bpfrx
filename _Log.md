@@ -1,3 +1,21 @@
+## 2026-07-10 — pkg/api,pkg/routing: render reject route disposition (#5410)
+
+- **Timestamp**: 2026-07-10 (fix/5410-reject-route-display)
+  - **Action**: #5410 — two READ paths did not distinguish an installed
+    static `reject` route (first-class since #5298, installs as
+    `RTN_UNREACHABLE` via FRR) from `discard`/directly-connected. (a) REST
+    `/routes` (`routesHandler`) lumped a reject route into the unlabeled
+    no-next-hop branch with discard; added an additive `disposition` field
+    (`reject`/`discard`/`connected`) on `RouteInfo`, backward-compatible
+    (`omitempty`). (b) the kernel-FIB reader (`routeToEntry`) mapped only
+    `RTN_BLACKHOLE`→`discard`, so a reject route rendered `direct`; added
+    `RTN_UNREACHABLE`→`reject`. Labels mirror the CLI/gRPC `show route`
+    reject/discard conventions. RED-on-revert proven for both readers.
+  - **File(s)**: pkg/api/routing.go, pkg/api/types.go,
+    pkg/api/routes_disposition_5410_test.go, pkg/routing/routes.go,
+    pkg/routing/routes_disposition_5410_test.go, pkg/api/README.md,
+    pkg/routing/README.md, _Log.md
+
 ## 2026-07-10 — cli: reject fail-open CLI tokens (5-defect cohort, #4883)
 
 - **Timestamp**: 2026-07-10 (fix/4883-cli-failopen-cohort)

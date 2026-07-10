@@ -347,6 +347,18 @@ under the daemon's errgroup. Nothing else imports this package.
   contract is pinned by `sessions_iterator_error_test.go` in this package
   and in `pkg/grpcapi` / `pkg/cli` (CLI top-talkers fails the command; NAT
   summaries print a stderr warning).
+- The static-route `/routing/routes` handler (`routesHandler`, `routing.go`)
+  renders one `RouteInfo` per next-hop for a normal route. A route with no
+  forwarding next-hop instead carries a `disposition` label distinguishing
+  `reject` (FRR `RTN_UNREACHABLE`, drop + ICMP unreachable), `discard` (FRR
+  `Null0`/`RTN_BLACKHOLE`, silent drop), and `connected` (no gateway). This
+  mirrors the `reject`/`discard` labels the CLI/gRPC `show route` text already
+  renders, closing the #5410 gap where a first-class `reject` route (#5298)
+  was lumped into the same unlabeled no-next-hop branch as `discard`. The
+  `disposition` field is additive and `omitempty`, so a route with a real
+  next-hop or a `next_table` leaks nothing new and existing consumers reading
+  `destination`/`next_hop`/`interface`/`preference`/`next_table` are
+  unaffected. Pinned by `routes_disposition_5410_test.go`.
 - Long full-table read handlers must ABORT when the client disconnects
   (#5232/#5233). The REST server cancels `r.Context()` on disconnect, so a
   handler that walks a large structure has to sample `r.Context().Err()`

@@ -42,9 +42,32 @@ func (s *Server) routesHandler(w http.ResponseWriter, _ *http.Request) {
 			})
 			continue
 		}
-		if r.Discard || len(r.NextHops) == 0 {
+		// Routes with no forwarding next-hop carry a disposition label so
+		// this view distinguishes reject (RTN_UNREACHABLE) from discard
+		// (RTN_BLACKHOLE) from directly-connected, matching how the CLI/gRPC
+		// `show route` text renders reject/discard (#5298/#5410). Reject and
+		// Discard are mutually exclusive; check them before the no-next-hop
+		// fallthrough since a reject/discard route also carries no NextHops.
+		if r.Reject {
 			result = append(result, RouteInfo{
 				Destination: r.Destination,
+				Disposition: "reject",
+				Preference:  r.Preference,
+			})
+			continue
+		}
+		if r.Discard {
+			result = append(result, RouteInfo{
+				Destination: r.Destination,
+				Disposition: "discard",
+				Preference:  r.Preference,
+			})
+			continue
+		}
+		if len(r.NextHops) == 0 {
+			result = append(result, RouteInfo{
+				Destination: r.Destination,
+				Disposition: "connected",
 				Preference:  r.Preference,
 			})
 			continue

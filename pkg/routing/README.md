@@ -587,6 +587,16 @@ field consumers show a real next-hop instead of a bare "direct". A
 single-gateway, connected/direct, or discard route leaves `NextHops`
 nil and is bit-identical to before.
 
+For a no-gateway route `routeToEntry` labels the disposition from
+`route.Type`: `RTN_BLACKHOLE` → `"discard"` (silent drop), `RTN_UNREACHABLE`
+→ `"reject"` (drop + ICMP unreachable), else `"direct"` (directly-connected).
+The `reject` mapping was added in #5410 to match the kernel FIB now that
+#5298 installs a static `reject` route as `RTN_UNREACHABLE` via FRR; before
+it, an installed reject route fell through to the `"direct"` else branch and
+mis-rendered as directly-connected. The label set mirrors the `reject`/
+`discard` conventions `formatTableJunos` and the gRPC/REST readers already
+use for the config static-route view.
+
 Rendering: `formatTableJunos` (`routeformat.go`, the canonical Junos
 `show route` view used by both the local CLI and the gRPC text path)
 emits one `>  to <gw> via <if>` line per leg when `NextHops` is

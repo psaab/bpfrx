@@ -237,6 +237,13 @@ func (rr *routeReader) routeToEntry(r netlink.Route, family int) RouteEntry {
 		entry.NextHop = r.Gw.String()
 	} else if r.Type == unix.RTN_BLACKHOLE {
 		entry.NextHop = "discard"
+	} else if r.Type == unix.RTN_UNREACHABLE {
+		// A `route <p> reject` installs as RTN_UNREACHABLE in the kernel
+		// FIB (Junos reject → FRR `ip route <p> reject`, #5298). Label it
+		// "reject" so the kernel-table view distinguishes it from a
+		// silent discard (RTN_BLACKHOLE) and a directly-connected route,
+		// matching the `show route` (CLI/gRPC) reject/discard conventions.
+		entry.NextHop = "reject"
 	} else {
 		entry.NextHop = "direct"
 	}
