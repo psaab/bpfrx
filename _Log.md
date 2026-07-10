@@ -44599,3 +44599,7 @@ top.
 - **Timestamp**: 2026-07-10
   **Action**: #4926 — security-events `limit` REST param fail-open→fail-closed. Replaced lenient `queryInt(r,"limit",50)`+silent 10000-clamp in `eventsHandler` with strict `queryIntStrict` (400 on malformed/negative/non-canonical) + explicit >10000 → HTTP 400, mirroring the sibling `zone` filter. Added fail-on-revert handler test + README fail-closed doc.
   **File(s)**: pkg/api/security.go, pkg/api/rest_events_limit_failclosed_4926_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-07-10
+  **Action**: #4922 — dynamic-address feed invalid-line sample was COUNT-bounded (maxInvalidSample=5) but not BYTE-bounded; scanner admits ~1 MiB malformed lines, so one feed could retain ~5 MiB verbatim garbage + emit multi-MB slog records. Fix: bound each retained sample entry at the retention point (parseFeed) to a strconv.Quote-escaped first-256-byte prefix + original byte-length annotation (maxInvalidSampleBytes/EntryBytes/TotalBytes); installSnapshot/AllFeeds/slog.Warn all inherit the bounded, escape-safe form. Added 6 fail-on-revert tests (all RED when reverted to verbatim append) + README byte-cap/metadata docs.
+  **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_samplecap_4922_test.go, pkg/feeds/feeds_test.go, pkg/feeds/README.md
