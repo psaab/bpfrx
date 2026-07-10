@@ -44929,3 +44929,24 @@ top.
   raw error to be present. Updated pkg/api/README.md /health contract.
 - **File(s)**: pkg/api/health.go, pkg/api/health_test.go,
   pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5312 flowexport/ipfix — emit RECORD-granularity sampling IEs.
+  ShouldExport does 1-in-N selection of whole SESSION records, but
+  encodeIPFIXOptionsSamplerDataSet advertised PSAMP PACKET-selection IEs
+  (selectorAlgorithm 304 / samplingPacketInterval 305 / samplingPacketSpace
+  306, interval=1/space=N-1). A standards collector reads that as packet
+  sampling and renormalizes each record's octet/packetDeltaCount by N —
+  inflating the already-complete per-session volume. The only guard was a
+  code comment ("must NOT multiply by N") that no wire field carried.
+  Replaced with the RFC 7014 (Flow Selection Techniques) flow-selection IEs:
+  flowSelectorAlgorithm (390, u16) = 1 (systematic count-based, IANA "Flow
+  Selector Algorithm" registry), samplingFlowInterval (396, u64) = 1,
+  samplingFlowSpacing (397, u64) = N-1. Record size 14 -> 22. A collector now
+  scales the POPULATION (flow count/aggregate) by N and leaves per-record
+  counters intact. Updated the sampler test to pin 390/396/397 + u64 widths +
+  record size 22 AND assert 304/305/306 are ABSENT; proved RED-on-revert
+  (reverting ipfix.go fails the template/data-set decode tests). Updated
+  pkg/flowexport/README.md #3748/#5312 sampler section.
+- **File(s)**: pkg/flowexport/ipfix.go, pkg/flowexport/ipfix_sampler_test.go,
+  pkg/flowexport/README.md, _Log.md
