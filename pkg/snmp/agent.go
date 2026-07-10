@@ -722,6 +722,8 @@ func (a *Agent) handlePacketFrom(data []byte, srcIP net.IP) []byte {
 	}
 
 	switch version {
+	case snmpVersion1:
+		return a.handleV1Packet(rest, srcIP)
 	case snmpVersion2c:
 		return a.handleV2cPacket(rest, srcIP)
 	case snmpVersion3:
@@ -795,6 +797,190 @@ func (a *Agent) handleV2cPacket(rest []byte, srcIP net.IP) []byte {
 		slog.Debug("SNMP: unsupported PDU type", "type", pduTag)
 		return nil
 	}
+}
+
+// handleV1Packet processes an SNMPv1 message (RFC 1157; version already decoded
+// as 0). It shares the community frame, the source allowlist (#4289), and the
+// bounded MIB lookup with the v2c path — the ONLY differences are the response
+// rules a v1 manager expects (#5049): a missing/unresolvable OID yields a whole-
+// PDU error-status=noSuchName(2) with a 1-based error-index and the request
+// varbinds echoed back UNCHANGED (v1 has no per-varbind exception values), and
+// no v2-only type (Counter64) ever reaches the wire.
+//
+// Before #5049 the version-0 case fell through to the default "unsupported
+// version" drop, so the agent emitted v1 traps but silently dropped every v1
+// GET/GETNEXT poll — a legacy v1 manager saw the device as down.
+func (a *Agent) handleV1Packet(rest []byte, srcIP net.IP) []byte {
+	// Decode community string (same frame as v2c).
+	community, rest, err := berDecodeOctetString(rest)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode community")
+		return nil
+	}
+
+	// Verify community string and resolve its authorization level.
+	comm := a.getCommunity(string(community))
+	if comm == nil {
+		// SECURITY (#4302): never log the community string (the v1 shared
+		// secret); log only the source, symmetric with the v2c path (#4289).
+		slog.Debug("SNMP: invalid community", "src", srcIP, "known_community", false)
+		return nil
+	}
+
+	// #4289: enforce the community `clients` source-IP restriction, identical to
+	// the v2c path — a scoped community answers ONLY permitted sources.
+	if !comm.AllowsSource(srcIP) {
+		slog.Debug("SNMP: source not permitted for community",
+			"src", srcIP, "known_community", true)
+		return nil
+	}
+
+	// Decode PDU.
+	pduTag, pduBody, err := berDecodeHeader(rest)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode PDU header")
+		return nil
+	}
+
+	switch pduTag {
+	case pduGetRequest:
+		return a.handleV1Get(community, pduBody)
+	case pduGetNextRequest:
+		return a.handleV1GetNext(community, pduBody)
+	case pduSetRequest:
+		return a.handleV1Set(community, comm, srcIP, pduBody)
+	default:
+		// v1 has no GETBULK (a v2c/v3 addition); any other PDU type is dropped,
+		// matching the v2c default.
+		slog.Debug("SNMP: unsupported v1 PDU type", "type", pduTag)
+		return nil
+	}
+}
+
+// echoVarbinds builds the request-echo varbind list an SNMPv1 error response
+// carries: each requested OID with a NULL value. RFC 1157 §4.1.x specifies that
+// on an error the GetResponse-PDU's variable-bindings field is that of the
+// received request — v1 never rewrites individual varbind values with exception
+// markers the way v2c does.
+func echoVarbinds(oids [][]int) []varbind {
+	vbs := make([]varbind, 0, len(oids))
+	for _, oid := range oids {
+		vbs = append(vbs, varbind{oid: oid, tag: tagNull, value: nil})
+	}
+	return vbs
+}
+
+// handleV1Get processes an SNMPv1 GET (RFC 1157 §4.1.2). All requested OIDs must
+// resolve; the first that does not fails the WHOLE PDU with noSuchName and the
+// 1-based index of the offending varbind, echoing the request varbinds. A
+// Counter64-typed object is not representable in v1 (RFC 2089), so a direct GET
+// of one is treated as a missing name → noSuchName, and no Counter64 is emitted.
+func (a *Agent) handleV1Get(community []byte, pduBody []byte) []byte {
+	requestID, _, _, oids, err := decodePDUFields(pduBody)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode v1 GET PDU", "err", err)
+		return nil
+	}
+
+	// One interface snapshot for the whole PDU (#4013).
+	snap := a.newIfSnapshot()
+	varbinds := make([]varbind, 0, len(oids))
+	for i, oid := range oids {
+		val, valTag := a.getOIDValueSnap(oid, snap)
+		if val == nil || valTag == tagCounter64 {
+			// Missing name, or a v2-only Counter64 that v1 cannot carry: fail
+			// the whole PDU with noSuchName + the 1-based offending index, and
+			// echo the request varbinds unchanged.
+			return a.buildResponseVersion(snmpVersion1, community, requestID,
+				errNoSuchName, i+1, echoVarbinds(oids))
+		}
+		varbinds = append(varbinds, varbind{oid: oid, tag: valTag, value: val})
+	}
+
+	return a.boundGetResponseVersion(snmpVersion1, community, requestID, varbinds)
+}
+
+// handleV1GetNext processes an SNMPv1 GETNEXT (RFC 1157 §4.1.3). Each requested
+// OID advances lexicographically to the next served object, STEPPING OVER any
+// Counter64-typed node (RFC 2089 — a v1 walk must not surface a type it cannot
+// encode). Running off the end of the MIB view fails the PDU with noSuchName and
+// the 1-based index, echoing the request varbinds (v1 has no endOfMibView).
+func (a *Agent) handleV1GetNext(community []byte, pduBody []byte) []byte {
+	requestID, _, _, oids, err := decodePDUFields(pduBody)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode v1 GETNEXT PDU", "err", err)
+		return nil
+	}
+
+	// One interface snapshot for the whole PDU (#4013).
+	snap := a.newIfSnapshot()
+	varbinds := make([]varbind, 0, len(oids))
+	for i, oid := range oids {
+		nextOID, val, valTag := a.findNextV1OIDSnap(oid, snap)
+		if nextOID == nil {
+			// End of MIB view: v1 signals this as noSuchName on the whole PDU
+			// (there is no per-varbind endOfMibView exception).
+			return a.buildResponseVersion(snmpVersion1, community, requestID,
+				errNoSuchName, i+1, echoVarbinds(oids))
+		}
+		varbinds = append(varbinds, varbind{oid: nextOID, tag: valTag, value: val})
+	}
+
+	return a.boundGetResponseVersion(snmpVersion1, community, requestID, varbinds)
+}
+
+// findNextV1OIDSnap is findNextOIDSnap for the SNMPv1 MIB view: it returns the
+// next served OID after `oid` that is representable in v1 (RFC 2089), skipping
+// any Counter64-typed node so a v1 GETNEXT/GET-walk steps over the 64-bit
+// high-capacity counters instead of stalling or emitting a type v1 cannot carry.
+// Returns (nil, nil, 0) at the end of the MIB view.
+func (a *Agent) findNextV1OIDSnap(oid []int, snap *ifSnapshot) ([]int, []byte, byte) {
+	cur := oid
+	for {
+		next := a.findNextOIDSnap(cur, snap)
+		if next == nil {
+			return nil, nil, 0
+		}
+		val, valTag := a.getOIDValueSnap(next, snap)
+		if val == nil || valTag == tagCounter64 {
+			// Not representable in v1 (Counter64) or unexpectedly empty: advance
+			// past it and keep walking.
+			cur = next
+			continue
+		}
+		return next, val, valTag
+	}
+}
+
+// handleV1Set processes an SNMPv1 SET (RFC 1157 §4.1.5). The agent serves only
+// read-only objects, and v1 has neither the noAccess nor notWritable
+// error-status the v2c handler uses; per the RFC 2089 §2.1 SNMPv2→SNMPv1 error
+// mapping BOTH map to noSuchName(2). So a SET — whether denied for a read-only
+// community or refused because no served object is writable — returns
+// noSuchName with error-index 1 and the request varbinds echoed.
+func (a *Agent) handleV1Set(community []byte, comm *config.SNMPCommunity, srcIP net.IP, pduBody []byte) []byte {
+	requestID, _, _, oids, err := decodePDUFields(pduBody)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode v1 SET PDU", "err", err)
+		return nil
+	}
+
+	if !communityCanWrite(comm) {
+		// SECURITY (#4302): log the source and (non-secret) authorization level,
+		// never the community string, matching the v2c #4289 pattern.
+		slog.Debug("SNMP: v1 SET denied, community not authorized read-write",
+			"src", srcIP, "authorization", comm.Authorization)
+	}
+
+	// Read-only community OR read-write community with no writable object: both
+	// collapse to noSuchName in v1. error-index is the 1-based position of the
+	// offending varbind (the first one when any OID is present).
+	errIdx := 0
+	if len(oids) > 0 {
+		errIdx = 1
+	}
+	return a.buildResponseVersion(snmpVersion1, community, requestID,
+		errNoSuchName, errIdx, echoVarbinds(oids))
 }
 
 // communityCanWrite reports whether the community is authorized for SET
@@ -929,9 +1115,16 @@ func (a *Agent) handleGetNext(community []byte, pduBody []byte) []byte {
 // §4.2.1/§4.2.2 it is replaced with tooBig + an empty varbind list rather than
 // emitting a datagram larger than maxPacketSize.
 func (a *Agent) boundGetResponse(community []byte, requestID int, varbinds []varbind) []byte {
-	resp := a.buildResponse(community, requestID, errNoError, 0, varbinds)
+	return a.boundGetResponseVersion(snmpVersion2c, community, requestID, varbinds)
+}
+
+// boundGetResponseVersion is boundGetResponse parameterized on the message
+// version field, so the SNMPv1 GET/GETNEXT handlers (#5049) share the identical
+// size ceiling and tooBig fallback as v2c while emitting a version-0 envelope.
+func (a *Agent) boundGetResponseVersion(version int, community []byte, requestID int, varbinds []varbind) []byte {
+	resp := a.buildResponseVersion(version, community, requestID, errNoError, 0, varbinds)
 	if len(resp) > effectiveMaxSize(maxPacketSize) {
-		return a.buildResponse(community, requestID, errTooBig, 0, nil)
+		return a.buildResponseVersion(version, community, requestID, errTooBig, 0, nil)
 	}
 	return resp
 }
@@ -1402,6 +1595,19 @@ func trimToFit(vbs []varbind, maxSize int, build func([]varbind) []byte) (resp [
 
 // buildResponse constructs a complete SNMP v2c response packet.
 func (a *Agent) buildResponse(community []byte, requestID int, errorStatus int, errorIndex int, varbinds []varbind) []byte {
+	return a.buildResponseVersion(snmpVersion2c, community, requestID, errorStatus, errorIndex, varbinds)
+}
+
+// buildResponseVersion constructs a complete SNMP GetResponse packet with an
+// explicit message version field. v2c callers pass snmpVersion2c (via
+// buildResponse); the SNMPv1 handlers (#5049) pass snmpVersion1 so the response
+// carries a version-0 envelope. The PDU shape (GetResponse tag, request-id /
+// error-status / error-index / varbind-list body) is identical for v1 and v2c —
+// only the version field and the caller-chosen error-status/varbind semantics
+// differ. v1 callers never pass an exception-tag varbind (noSuchObject /
+// noSuchInstance / endOfMibView), so those v2-only markers never reach the wire
+// on a v1 response.
+func (a *Agent) buildResponseVersion(version int, community []byte, requestID int, errorStatus int, errorIndex int, varbinds []varbind) []byte {
 	// Encode varbind list.
 	var vbListBytes []byte
 	for _, vb := range varbinds {
@@ -1426,7 +1632,7 @@ func (a *Agent) buildResponse(community []byte, requestID int, errorStatus int, 
 	pduEncoded := berEncodeTLV(pduGetResponse, pduBody)
 
 	// Encode message: version, community, PDU.
-	msgBody := berEncodeIntegerTLV(snmpVersion2c)
+	msgBody := berEncodeIntegerTLV(version)
 	msgBody = append(msgBody, berEncodeTLV(tagOctetString, community)...)
 	msgBody = append(msgBody, pduEncoded...)
 
