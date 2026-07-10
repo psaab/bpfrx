@@ -276,14 +276,25 @@ authorization surface: every request is dropped because no community matches.
   484-byte floor (a bogus/tiny advertised value cannot starve the response);
   v2c carries no per-request `msgMaxSize` on the wire, so the effective size is
   the local 4096-byte maximum. During expansion the response is built and then
-  trimmed: trailing varbinds are dropped until the encoded message (including
-  the v3 USM/scopedPDU and any auth/priv overhead) fits. Trimming — not
+  trimmed: the largest leading prefix of varbinds whose encoded message
+  (including the v3 USM/scopedPDU and any auth/priv overhead) fits is kept.
+  `trimToFit` finds that prefix by **binary search** — the encoded length is
+  monotonic in the number of leading varbinds — so it costs O(log n) rebuilds,
+  not the O(n) decrement-and-rebuild it replaced (#4918, which for v3 re-ran
+  USM framing/HMAC/encryption on every dropped varbind). Trimming — not
   `tooBig` — is the normal outcome; the manager continues the walk with a
   follow-up GETBULK from the last returned OID. `tooBig` (with an empty varbind
   list) is returned only in the pathological case where not even a single
-  varbind fits. This prevents emitting an oversized UDP datagram that the peer
-  or the network would fragment or drop. See `effectiveMaxSize` / `trimToFit`
-  in `agent.go`.
+  varbind fits. See `effectiveMaxSize` / `trimToFit` in `agent.go`.
+- **Plain GET/GETNEXT responses are size-bounded too (#4918).** A GET/GETNEXT
+  carries a fixed 1:1 varbind-per-request-OID contract, so an oversized
+  response cannot be trimmed like GETBULK (the manager cannot "continue" a
+  GET). Per RFC 3416 §4.2.1/§4.2.2 an over-size GET/GETNEXT response is
+  replaced with `tooBig` + an empty varbind list rather than emitting a
+  datagram larger than the effective maximum. `boundGetResponse` (v2c, in
+  `agent.go`) and the v3 GET/GETNEXT tail (`v3.go`) enforce this; before #4918
+  only GETBULK was bounded (#2612), so a GET naming many OIDs — or one OID with
+  a long configured string value — could reflect an oversized datagram.
 - **The interface table is snapshotted ONCE per PDU (#4013).** `SetIfDataFn`
   (the daemon's `buildSNMPIfData`) performs a full netlink `LinkList`
   (RTM_GETLINK dump) on every call, so a request handler must NOT read it

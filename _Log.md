@@ -1,3 +1,20 @@
+## 2026-07-09 — #4918 snmp GET/GETNEXT size bound + trimToFit O(n^2) (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4918 (residual of #2612). (1) v2c `handleGet`/`handleGetNext`
+  and the v3 GET/GETNEXT tail returned `buildResponse(...)` directly with no
+  size cap — an oversized response was emitted. Added `boundGetResponse` (v2c)
+  + a matching v3 tail check that replaces an over-`effectiveMaxSize` GET/
+  GETNEXT with `tooBig` + empty varbinds (RFC 3416 §4.2.1/§4.2.2; GET/GETNEXT
+  cannot be trimmed like GETBULK). (2) `trimToFit` did an O(n) decrement-and-
+  rebuild (O(n^2) total, v3 re-running USM/HMAC/enc per drop) — replaced with a
+  fast-path full build + binary search (O(log n) rebuilds) returning the same
+  largest-fitting prefix. GETBULK trimming behaviour is unchanged. RED-on-
+  revert: `TestV2cGet_OversizedReturnsTooBig` /
+  `TestV2cGetNext_OversizedReturnsTooBig` (6.7 KB / 6.6 KB over-size without
+  the bound) + `TestTrimToFit_BinarySearch` (991 build calls when linear).
+  **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3.go,
+  pkg/snmp/getresp_size_4918_test.go, pkg/snmp/README.md
 ## 2026-07-09 — #5037 cli `| last N` unbounded pre-allocation (security)
 
 - **Timestamp**: 2026-07-09
