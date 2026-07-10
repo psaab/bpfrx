@@ -491,6 +491,13 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("POST /api/v1/system/action", s.systemActionHandler)
 
 	var handler http.Handler = mux
+	// #5055: guard the mutation surface against cross-site credentialed requests
+	// (CSRF via browser-ambient Basic auth). This wraps the mux BEFORE auth so it
+	// applies to every mutation route whether or not auth is configured; a
+	// request that clears auth then hits this guard, so an attacker holding
+	// ambient Basic credentials is still blocked from driving a state change from
+	// a cross-site page. Safe methods and header-key/Bearer clients are unaffected.
+	handler = mutationCrossSiteGuard(handler)
 	if cfg.Auth != nil {
 		// #4162 (auth posture): /metrics is unauthenticated by default, which
 		// is the standard Prometheus posture and safe on the loopback default
@@ -503,7 +510,7 @@ func NewServer(cfg Config) *Server {
 		// endpoint (documented in docs/architecture.md). /health stays exempt
 		// (it exposes no table walk and no sensitive data).
 		metricsRequireAuth := !isLoopbackBindAddr(cfg.Addr)
-		handler = authMiddleware(*cfg.Auth, metricsRequireAuth, mux)
+		handler = authMiddleware(*cfg.Auth, metricsRequireAuth, handler)
 	}
 
 	s.httpServer = &http.Server{

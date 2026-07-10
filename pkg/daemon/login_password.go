@@ -2,11 +2,13 @@
 package daemon
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
@@ -199,4 +201,132 @@ func xpfProvisioned(name string, curUID int) bool {
 		return false
 	}
 	return true
+}
+
+// homeBaseDir is the parent directory of per-user home directories. It is a
+// package var only so tests can point the authorized_keys reconcile at a
+// throwaway tree; production never overrides it. #5128.
+var homeBaseDir = "/home"
+
+// managedAuthorizedKeysPath returns the xpf-managed authorized_keys file for
+// name. applySystemLogin writes /home/<name>/.ssh/authorized_keys wholesale
+// from the configured SSHKeys, so the whole file is xpf-owned; the absent-user
+// reconcile removes it to revoke key-based login. filepath.Base(Clean(...))
+// keeps the join inside homeBaseDir defensively (names reaching here are
+// validated OS usernames, but never trust a name for a root-privileged
+// removal). #5128.
+func managedAuthorizedKeysPath(name string) string {
+	return filepath.Join(homeBaseDir, filepath.Base(filepath.Clean(name)), ".ssh", "authorized_keys")
+}
+
+// reconcileAbsentLoginUsers revokes the host credentials of every
+// xpf-provisioned login account that is NO LONGER present in
+// cfg.System.Login.Users (#5128). Declarative removal of a `system login user`
+// must revoke that user's host access — Junos semantics — not merely drop the
+// sudo grant (reconcileSudoers) while leaving the account, password, and
+// authorized_keys live.
+//
+// It is the removal half of the #1944 UID-keyed provenance lifecycle and the
+// mirror of reconcileSudoers: it MUST run unconditionally on every apply
+// (independent of applySystemLogin's early return) so the "all users removed"
+// case still revokes. It enumerates provisionedUsersDir — the set of accounts
+// xpf actually provisioned — and deprovisions each marker whose username no
+// longer appears in the config. An out-of-band account (no marker) is never
+// enumerated and never touched.
+func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
+	entries, err := os.ReadDir(provisionedUsersDir)
+	if err != nil {
+		// No markers yet (fresh install) or unreadable — nothing xpf
+		// provisioned, so nothing to revoke.
+		return
+	}
+
+	// The set of usernames still declared in config; these are kept.
+	desired := make(map[string]struct{})
+	if cfg.System.Login != nil {
+		for _, u := range cfg.System.Login.Users {
+			if u.Name == "" {
+				continue
+			}
+			desired[u.Name] = struct{}{}
+		}
+	}
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == "root" {
+			continue // root is never provisioned/deprovisioned via config
+		}
+		if _, keep := desired[name]; keep {
+			continue // still configured — leave it alone
+		}
+		d.deprovisionLoginUser(name)
+	}
+}
+
+// deprovisionLoginUser revokes one removed account's password and managed
+// authorized_keys, but ONLY when the UID-keyed provenance marker still matches
+// the account's current UID (never an out-of-band account), then drops the
+// marker so xpf forgets the account. It is fail-closed toward retry: any step
+// that cannot be completed safely leaves the marker in place so the next apply
+// retries, and it never removes a credential it did not first verify as
+// xpf-owned. #5128.
+func (d *Daemon) deprovisionLoginUser(name string) {
+	curUID, uidOK := lookupUID(name)
+	if !uidOK {
+		// The account is already gone from the host (out-of-band userdel).
+		// There is nothing to revoke; drop the stale marker so we stop
+		// revisiting it every apply.
+		_ = os.Remove(markerPath(name))
+		return
+	}
+	if !xpfProvisioned(name, curUID) {
+		// Marker missing or its UID no longer matches (the account was
+		// deleted+recreated out of band with a different UID). xpfProvisioned
+		// already cleaned a stale marker inline. NEVER touch a non-xpf account.
+		return
+	}
+
+	// Lock the password (idempotent). Fail-CLOSED on a shadow read error: we
+	// must not forget the account (drop the marker) while a live credential may
+	// still be active — retry next apply instead. Mirrors the #1944 pwLock
+	// discipline (never lock on a read error, but here that also means never
+	// prematurely stop managing the account).
+	cur, ok := currentShadowHash(name)
+	if !ok {
+		slog.Warn("skipping removed-user deprovision: cannot read shadow",
+			"user", name)
+		return // keep marker; retry next apply
+	}
+	if !isLockedShadow(cur) {
+		stdin := strings.NewReader(name + ":!\n")
+		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+			slog.Warn("failed to lock password for removed login user",
+				"user", name, "err", err, "output", strings.TrimSpace(string(out)))
+			return // keep marker; retry
+		}
+		slog.Info("locked password for removed login user", "user", name)
+	}
+
+	// Remove the xpf-managed authorized_keys so key-based login is revoked too
+	// (the whole file is xpf-owned — applySystemLogin writes it wholesale).
+	keysFile := managedAuthorizedKeysPath(name)
+	if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove authorized_keys for removed login user",
+			"user", name, "file", keysFile, "err", err)
+		return // keep marker; retry
+	}
+
+	// Fully revoked — drop the provenance marker so xpf no longer manages this
+	// account. If the same user is later re-added to config, applySystemLogin
+	// recreates it and re-records the marker.
+	if err := os.Remove(markerPath(name)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove provenance marker after deprovision",
+			"user", name, "err", err)
+	}
+	slog.Info("deprovisioned removed login user (password locked, keys removed)",
+		"user", name)
 }

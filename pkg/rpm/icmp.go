@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -300,8 +301,17 @@ func resolveProbeTarget(ctx context.Context, target string, opts probeSockOpts) 
 	if ip := net.ParseIP(target); ip != nil {
 		return &net.IPAddr{IP: ip}, nil
 	}
-	ips, err := lookupIPAddr(ctx, resolverForOpts(opts), target)
+	resolver, sink := resolverForOpts(opts)
+	ips, err := lookupIPAddr(ctx, resolver, target)
 	if err != nil {
+		// A VRF-bound resolver socket-setup failure (SO_BINDTODEVICE /
+		// SO_MARK EPERM/ENODEV, failed RawConn.Control) is an environment
+		// error, not path health: it never left the box. The sentinel is
+		// lost through *net.DNSError, so re-tag from the out-of-band sink so
+		// the probe loop HOLDS state instead of counting loss (#5061).
+		if se := sink.load(); se != nil {
+			return nil, se
+		}
 		return nil, fmt.Errorf("resolve target %q: %w", target, err)
 	}
 	if len(ips) == 0 {
@@ -312,42 +322,104 @@ func resolveProbeTarget(ctx context.Context, target string, opts probeSockOpts) 
 	return &net.IPAddr{IP: ips[0].IP, Zone: ips[0].Zone}, nil
 }
 
+// setupErrSink captures the ErrProbeSetup-wrapped socket-setup error that a
+// bound resolver (or the data-socket Control) hits during a single probe, so a
+// hostname probe can re-tag its lookup/dial failure as SETUP instead of LOSS
+// (#5061). It exists because the ErrProbeSetup sentinel rides out through
+// net.OpError on the DATA-socket dial path (errors.Is finds it) but is
+// FLATTENED TO A STRING by *net.DNSError on the RESOLVER path — a resolver bind
+// failure would otherwise reach the probe loop as an ordinary resolve error and
+// be counted as probe loss, advancing failure thresholds and actuating
+// ip-monitoring routes off a control-plane error (the #1843 fail-safe was only
+// wired for the data socket). Records the FIRST error; the resolver may Dial
+// concurrently for the A and AAAA queries, so record is mutex-guarded. All
+// methods are nil-safe (an unscoped probe has no sink).
+type setupErrSink struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (s *setupErrSink) record(err error) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.mu.Unlock()
+}
+
+func (s *setupErrSink) load() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// vrfBindControl returns a net.Dialer Control hook that pins a socket to the
+// probe's VRF/path scope (SO_BINDTODEVICE / SO_MARK) and classifies BOTH a
+// RawConn.Control failure and an applyVRFBind failure as ErrProbeSetup — a
+// control-plane bind error is an environment/capability failure, never path
+// health (#5061 / the #1843 fail-safe). It is the SINGLE Control helper shared
+// by the probe DATA socket (probeDialer) and the VRF-bound DNS RESOLVER socket
+// (vrfBoundResolver), so a resolver-socket bind failure now holds test state
+// exactly like a data-socket bind failure. The wrapped error is also recorded
+// in sink (when non-nil): the sentinel survives net.OpError on the data path
+// but not *net.DNSError on the resolver path, so a hostname probe reads sink
+// out-of-band to re-tag the failure. Genuine dial outcomes (refused, timeout,
+// unreachable) never pass through this callback and stay path signals.
+func vrfBindControl(opts probeSockOpts, sink *setupErrSink) func(network, address string, c syscall.RawConn) error {
+	return func(_, _ string, c syscall.RawConn) error {
+		var cerr error
+		err := c.Control(func(fd uintptr) {
+			cerr = applyVRFBind(int(fd), opts.BindDevice, opts.Mark)
+		})
+		var out error
+		switch {
+		case err != nil:
+			out = fmt.Errorf("%w: socket control: %v", ErrProbeSetup, err)
+		case cerr != nil:
+			out = fmt.Errorf("%w: socket option: %v", ErrProbeSetup, cerr)
+		default:
+			return nil
+		}
+		sink.record(out)
+		return out
+	}
+}
+
 // resolverForOpts selects the DNS resolver for a probe (#2614): the
 // default resolver for an unscoped probe (no device, no mark —
 // bit-identical to the pre-#2614 process-default lookup), or a
-// VRF/path-bound resolver when the probe carries a scope. Split out so a
-// unit test can assert the scoped probe gets a bound resolver and the
-// unscoped probe gets the default — the live VRF DNS query is lab-bound,
-// so this selection is the gate.
-func resolverForOpts(opts probeSockOpts) *net.Resolver {
+// VRF/path-bound resolver when the probe carries a scope. It returns the
+// setupErrSink the bound resolver records socket-setup failures into (nil for
+// the unscoped/default resolver) so the caller can re-tag a lookup failure as
+// ErrProbeSetup (#5061). Split out so a unit test can assert the scoped probe
+// gets a bound resolver and the unscoped probe gets the default — the live VRF
+// DNS query is lab-bound, so this selection is the gate.
+func resolverForOpts(opts probeSockOpts) (*net.Resolver, *setupErrSink) {
 	if opts.BindDevice != "" || opts.Mark != 0 {
-		return vrfBoundResolver(opts)
+		sink := &setupErrSink{}
+		return vrfBoundResolver(opts, sink), sink
 	}
-	return net.DefaultResolver
+	return net.DefaultResolver, nil
 }
 
 // vrfBoundResolver builds a net.Resolver that issues DNS queries from a
 // socket pinned to the probe's VRF/path scope (#2614). PreferGo selects
 // the pure-Go DNS client so the Dial hook is honored (the cgo resolver
-// path ignores it); the Dialer's Control applies the same applyVRFBind
-// (SO_BINDTODEVICE / SO_MARK) as the probe DATA socket, so the query
-// leaves the VRF and resolves against the VRF's DNS.
-func vrfBoundResolver(opts probeSockOpts) *net.Resolver {
+// path ignores it); the Dialer's Control (the shared vrfBindControl) applies
+// the same applyVRFBind (SO_BINDTODEVICE / SO_MARK) as the probe DATA socket,
+// so the query leaves the VRF and resolves against the VRF's DNS — and a bind
+// failure is classified ErrProbeSetup and recorded in sink (#5061).
+func vrfBoundResolver(opts probeSockOpts, sink *setupErrSink) *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Control: func(_, _ string, c syscall.RawConn) error {
-					var cerr error
-					err := c.Control(func(fd uintptr) {
-						cerr = applyVRFBind(int(fd), opts.BindDevice, opts.Mark)
-					})
-					if err != nil {
-						return err
-					}
-					return cerr
-				},
-			}
+			d := net.Dialer{Control: vrfBindControl(opts, sink)}
 			return d.DialContext(ctx, network, address)
 		},
 	}
