@@ -294,7 +294,16 @@ authorization surface: every request is dropped because no community matches.
 
 ## ASN.1 specifics
 
-- Tag constants used: Counter32 (0x41), Gauge32 (0x42), Counter64 (0x46).
+- Tag constants used: Counter32 (0x41), Gauge32 (0x42), TimeTicks (0x43),
+  Counter64 (0x46).
+- **Unsigned application integers prepend a leading `0x00` when the top content
+  octet has its high bit set.** Counter32/Gauge32/Counter64 **and TimeTicks**
+  are unsigned, but BER integer content is two's-complement; without the leading
+  zero a value `>= 0x80…` decodes as negative. `berEncodeCounter32`,
+  `berEncodeGauge32`, `berEncodeCounter64`, and `berEncodeTimeTicks` all strip
+  leading zeros then prepend one `0x00` if `buf[0]&0x80 != 0`. TimeTicks lacked
+  this (#4924): `sysUpTime` and v1/v2 link-trap timestamps at `>= 0x80000000`
+  hundredths (~248.5 days uptime) encoded as non-canonical/negative BER.
 - Exception values: `noSuchObject` (0x80), `noSuchInstance` (0x81),
   `endOfMibView` (0x82) — emitted for missing OIDs in walks.
 - GETNEXT walking order is driven by a static OID list; it must stay in
@@ -321,6 +330,19 @@ authorization surface: every request is dropped because no community matches.
   follow-up GETBULK from the last returned OID. `tooBig` (with an empty varbind
   list) is returned only in the pathological case where not even a single
   varbind fits. See `effectiveMaxSize` / `trimToFit` in `agent.go`.
+- **GETBULK varbind order is repetition-major (RFC 3416 §4.2.3, #5065).** For
+  `R` repeater columns and `M` repetitions the response interleaves by
+  repetition — `rep0-col0, rep0-col1, …, rep1-col0, …` (varbind index
+  `nonRepeaters + rep*R + col`), NOT column-major (`col0-rep0..col0-repM-1`).
+  A table-oriented manager reconstructs rows by the known width `R`, so
+  column-major mis-associates columns for `R >= 2`. Both the v2c handler
+  (`handleGetBulk`) and the v3 dispatcher call the single shared
+  `buildBulkVarbinds`, which keeps one GETNEXT cursor per repeater column and
+  advances each across repetitions. A column that runs past the end of its MIB
+  view emits `endOfMibView` (named with that column's terminal OID) in its own
+  grid cell for that and every later repetition, so the `row*R+col` index stays
+  aligned. Wire-order + early-exhaustion coverage:
+  `ber_getbulk_conformance_test.go` (v2c + v3).
 - **Plain GET/GETNEXT responses are size-bounded too (#4918).** A GET/GETNEXT
   carries a fixed 1:1 varbind-per-request-OID contract, so an oversized
   response cannot be trimmed like GETBULK (the manager cannot "continue" a
