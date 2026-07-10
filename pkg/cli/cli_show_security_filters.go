@@ -456,9 +456,10 @@ type firewallEffectiveLiveness struct {
 	// confirm is live.
 	determined bool
 	// live is true only when the dataplane is armed AND the helper-acknowledged
-	// snapshot generation matches the daemon's last successfully-applied
-	// generation — the only state in which the compiled snapshots equal what
-	// the dataplane is enforcing.
+	// snapshot generation is at or ahead of the daemon's last successfully-
+	// applied generation — the state in which the compiled snapshots equal what
+	// the dataplane is enforcing. (Helper-ahead is benign; see
+	// firewallEffectiveLiveness.)
 	live bool
 	// appliedGen is the daemon's last successfully-recorded apply generation
 	// (0 when no apply has ever been recorded).
@@ -495,15 +496,24 @@ func (c *CLI) firewallEffectiveLiveness() firewallEffectiveLiveness {
 	armed := status.Enabled && status.ForwardingArmed &&
 		status.Capabilities.ForwardingSupported &&
 		cr != nil && cr.Capabilities.ForwardingSupported
-	// Coherent requires the helper's acknowledged generation to equal the
-	// daemon's last successfully-applied generation. Divergence means the helper
-	// has not caught up to (or rejected) the active configuration.
-	coherent := cr != nil && status.LastSnapshotGeneration == cr.Generation
+	// Coherent requires the helper's acknowledged generation to be AT OR AHEAD
+	// of the daemon's last successfully-applied generation. Helper-BEHIND
+	// (acked < applied) is real drift — the helper has not caught up to (or
+	// rejected) the applied configuration. Helper-AHEAD (acked > applied) is
+	// BENIGN: a scheduler-only republish (Manager.UpdatePolicyScheduleState)
+	// advances the helper's snapshot generation WITHOUT calling
+	// recordApplyResultLocked, so LastApplyResult().Generation lags the helper
+	// on a perfectly healthy box. That republish only re-times policy
+	// enable/disable — it carries the SAME filter content — so the effective
+	// view is still live. The genuine #5067 disarm is caught by the `armed`
+	// predicate (ForwardingArmed=false) independent of this compare, so
+	// accepting helper-ahead does not weaken the original fix.
+	coherent := cr != nil && status.LastSnapshotGeneration >= cr.Generation
 	switch {
 	case !armed:
 		v.reason = "dataplane disarmed (forwarding not armed)"
 	case !coherent:
-		v.reason = "dataplane generation drift (helper has not acknowledged the active configuration)"
+		v.reason = "dataplane generation drift (helper is behind the applied configuration)"
 	default:
 		v.live = true
 	}

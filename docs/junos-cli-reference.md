@@ -1635,17 +1635,21 @@ config is already the new generation — so the compiled-desired snapshot is NOT
 what the dataplane is enforcing. The local CLI therefore binds the view to the
 HELPER-ACKNOWLEDGED generation before rendering:
 
-- **Armed + acknowledged** (dataplane armed and the acknowledged generation
-  equals the daemon's last applied generation): the snapshots are prefixed with
-  `Effective firewall filters — dataplane-acknowledged (generation N).` and are
-  safe to read as live.
+- **Armed + acknowledged** (dataplane armed and the acknowledged generation is
+  at or ahead of the daemon's last applied generation): the snapshots are
+  prefixed with `Effective firewall filters — dataplane-acknowledged
+  (generation N).` and are safe to read as live. Helper-ahead is benign — a
+  scheduler-only republish (`Manager.UpdatePolicyScheduleState`) advances the
+  helper's snapshot generation without bumping the last recorded apply
+  generation, and it carries the same filter content, so the view is still live.
 - **Disarmed or generation drift**: the snapshots are prefixed with a prominent
   `WARNING: dataplane is NOT enforcing the active configuration.` banner that
-  labels the output `COMPILED-DESIRED`, states the reason (dataplane disarmed /
-  generation drift), and surfaces the last dataplane-acknowledged generation
-  versus the desired (active, not-yet-acknowledged) configuration. The compiled
-  snapshots are still printed under the banner so the operator can inspect the
-  desired compile, but they are never certified as live.
+  labels the output `COMPILED-DESIRED`, states the reason (dataplane disarmed, or
+  the helper is BEHIND the applied generation), and surfaces the last
+  dataplane-acknowledged generation versus the desired (active, not-yet-
+  acknowledged) configuration. The compiled snapshots are still printed under the
+  banner so the operator can inspect the desired compile, but they are never
+  certified as live.
 - **Dataplane status unavailable** (no runtime wired): a soft note records that
   the snapshots are compiled-desired and the acknowledged generation could not be
   confirmed.

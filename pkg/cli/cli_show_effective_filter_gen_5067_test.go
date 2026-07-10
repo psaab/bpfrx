@@ -184,6 +184,53 @@ func TestShowEffectiveFirewallFiltersGenerationDrift(t *testing.T) {
 	}
 }
 
+// TestShowEffectiveFirewallFiltersHelperAheadIsLive covers the benign helper-
+// AHEAD edge (#5420 review): a scheduler-only republish
+// (Manager.UpdatePolicyScheduleState) advances the helper's snapshot generation
+// and the helper ACKs it, but that path never calls recordApplyResultLocked — so
+// LastApplyResult().Generation lags the helper's LastSnapshotGeneration on a
+// perfectly HEALTHY, armed box. The republish carries the same filter content
+// (it only re-times policy enable/disable), so the effective view must still
+// render LIVE with NO drift banner. An `==` coherence check would spuriously
+// warn "NOT enforcing" here; `>=` accepts helper-at-or-ahead.
+func TestShowEffectiveFirewallFiltersHelperAheadIsLive(t *testing.T) {
+	c := &CLI{
+		store: newEffectiveFilterTestStore(t),
+		dp: &effectiveGenCLIDP{
+			Manager: dataplane.New(),
+			// Daemon's last recorded apply is generation 5.
+			apply: &dataplane.ApplyResult{
+				Generation:   5,
+				Capabilities: dataplane.Capabilities{ForwardingSupported: true},
+			},
+			// Armed, and the helper has moved AHEAD to generation 6 via a
+			// scheduler republish (recordApplyResultLocked was not called).
+			status: dpuserspace.ProcessStatus{
+				Enabled:                true,
+				ForwardingArmed:        true,
+				Capabilities:           dpuserspace.UserspaceCapabilities{ForwardingSupported: true},
+				LastSnapshotGeneration: 6,
+			},
+		},
+	}
+
+	out := captureStdout(t, func() {
+		if err := c.showEffectiveFirewallFilters(""); err != nil {
+			t.Fatalf("showEffectiveFirewallFilters() error = %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "Effective firewall filters — dataplane-acknowledged (generation 6).") {
+		t.Fatalf("output = %q, want live certification at the helper-ahead generation", out)
+	}
+	if strings.Contains(out, "WARNING") || strings.Contains(out, "COMPILED-DESIRED") {
+		t.Fatalf("output = %q, must NOT flag drift when the helper is at or ahead of the applied generation", out)
+	}
+	if !strings.Contains(out, "Filter: demo (family inet) [effective]") {
+		t.Fatalf("output = %q, want compiled snapshot body", out)
+	}
+}
+
 // TestShowEffectiveFirewallFiltersNoRuntime: with no dataplane runtime wired the
 // view cannot confirm the acknowledged generation, so it renders compiled-desired
 // under a soft note rather than falsely certifying it as live.
