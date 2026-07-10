@@ -839,6 +839,98 @@ func TestPBRApplyClearDelFailureSurfaced(t *testing.T) {
 	}
 }
 
+// TestNextTableRibGroupClearDelFailureSurfaced is the #5118 fail-on-revert
+// guard. Both nextTableManager.clear and ribGroupManager.clear used to only
+// debug-log a RuleDel failure, so errors.Join returned nil and Apply reported
+// SUCCESS while a stale route-leak rule remained in the kernel. That rule is
+// an active cross-VRF forwarding instruction that PRECEDES the main table, so
+// the swallowed delete leaves a silent inter-VRF route leak that survives a
+// "successful" commit. When RuleDel returns a REAL failure (the rule EXISTS
+// but cannot be removed, e.g. EBUSY), Apply MUST return non-nil.
+//
+// Reverting either clear() to the pre-#5118 debug-log-only form makes Apply
+// return nil despite the un-deletable rule, so this test fails.
+func TestNextTableRibGroupClearDelFailureSurfaced(t *testing.T) {
+	cases := []struct {
+		name string
+		prio int
+		run  func(ops *fakeRuleOps) error
+	}{
+		{
+			name: "next-table",
+			prio: nextTableRulePriority + 3,
+			run: func(ops *fakeRuleOps) error {
+				// nil routes → no re-adds; the only activity is clear().
+				return (&nextTableManager{ops: ops}).Apply(nil, nil)
+			},
+		},
+		{
+			name: "rib-group",
+			prio: ribGroupLeakRulePriority + 3,
+			run: func(ops *fakeRuleOps) error {
+				// Empty rib-groups → early return after clear(); no re-adds.
+				return (&ribGroupManager{ops: ops}).Apply(nil, nil, nil)
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ops := newFakeRuleOps()
+			// A stale rule inside the managed window clear() scans.
+			seedRule(ops, unix.AF_INET, c.prio, 100)
+			// RuleDel returns a REAL failure: the rule exists but cannot be
+			// removed, so it lingers as an active route-leak instruction.
+			ops.delErr = errors.New("netlink EBUSY")
+			if err := c.run(ops); err == nil {
+				t.Fatalf("%s: Apply must return non-nil when a stale route-leak "+
+					"rule cannot be cleared (#5118) — got nil", c.name)
+			}
+		})
+	}
+}
+
+// TestNextTableRibGroupClearDelNotFoundIdempotent verifies the #5118 ENOENT
+// carve-out: a RuleDel that fails because the rule is ALREADY GONE (ENOENT /
+// no such rule — it vanished between the RuleList dump and the delete, or an
+// idempotent re-clear removed it) is NOT a failure. Deleting an already-absent
+// rule reaches the desired end-state, so Apply MUST return nil rather than
+// spuriously failing the apply on a benign no-op delete.
+func TestNextTableRibGroupClearDelNotFoundIdempotent(t *testing.T) {
+	cases := []struct {
+		name string
+		prio int
+		run  func(ops *fakeRuleOps) error
+	}{
+		{
+			name: "next-table",
+			prio: nextTableRulePriority + 4,
+			run: func(ops *fakeRuleOps) error {
+				return (&nextTableManager{ops: ops}).Apply(nil, nil)
+			},
+		},
+		{
+			name: "rib-group",
+			prio: ribGroupLeakRulePriority + 4,
+			run: func(ops *fakeRuleOps) error {
+				return (&ribGroupManager{ops: ops}).Apply(nil, nil, nil)
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ops := newFakeRuleOps()
+			seedRule(ops, unix.AF_INET, c.prio, 100)
+			// RuleDel reports the rule is already absent — the delete's goal
+			// (rule gone) is met, so this must NOT surface as an apply error.
+			ops.delErr = unix.ENOENT
+			if err := c.run(ops); err != nil {
+				t.Fatalf("%s: Apply must return nil when a stale rule is already "+
+					"absent (ENOENT) — got %v", c.name, err)
+			}
+		})
+	}
+}
+
 // seedRule inserts a rule at the given family/priority/table directly into
 // the fake's backing store (bypassing RuleAdd accounting) so a clear() can
 // be exercised against pre-existing kernel rules.

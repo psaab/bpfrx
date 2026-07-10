@@ -256,7 +256,7 @@ colliding pair; the lenient load / peer-sync path warns and
 its routes/leaks are not programmed — preserving the #1960 no-brick
 intent while guaranteeing no two VRFs ever share a table.
 
-### clear()/Apply error contract (#2273, #3430, #3731)
+### clear()/Apply error contract (#2273, #3430, #3731, #5118)
 
 Each reconciler's `Apply` is clear-then-re-add: `clear()` removes every
 rule in the manager's own priority window, then `Apply` re-installs the
@@ -293,11 +293,24 @@ desired set. `clear()` walks `[AF_INET, AF_INET6]`, calling `RuleList`
   reported success. A clean re-apply is unaffected: `clear()` removes the
   in-window rules before they are re-added, so an idempotent re-apply does
   not hit EEXIST — an already-cleared rule is re-added fresh and `Apply`
-  returns `nil`. `RuleDel` failures on individual next-table / rib-group
-  rules remain debug-logged and do not fail `Apply` — a stale rule that
-  survives one delete is swept by the next pass and re-add uses
-  `NLM_F_CREATE|NLM_F_EXCL`, so a still-desired rule stays correct (the
-  PBR `clear()` additionally aggregates its `RuleDel` failures, #3430 H3).
+  returns `nil`.
+- **Per-rule `RuleDel` failures in `clear()` are aggregated and returned,
+  never swallowed — for ALL THREE reconcilers (#3430 H3 for PBR, #5118 for
+  next-table + rib-group).** A stale route-leak rule that cannot be deleted
+  is an active cross-VRF forwarding instruction that sits BEFORE the main
+  table, so leaving it in place preserves inter-VRF reachability and can
+  override a main-table route. Before #5118 the next-table and rib-group
+  `clear()` only debug-logged a `RuleDel` failure, so `errors.Join(errs...)`
+  returned `nil` and `Apply` reported SUCCESS while the stale leak rule
+  survived until an unrelated future apply — a silent inter-VRF leak past a
+  "successful" commit. All three `clear()` paths now `errors.Join` the
+  `RuleDel` failure so it propagates through `Apply`. The ONE carve-out:
+  an ENOENT / "no such rule" delete (the rule vanished between the
+  `RuleList` dump and the delete, or an idempotent re-clear already removed
+  it) is NOT a failure — deleting an already-absent rule reaches the
+  desired end-state, so `isRuleAlreadyGone` filters it out and it is
+  debug-logged only, keeping an idempotent re-clear from spuriously failing
+  the apply.
 
 ## Tunnel reconcile-in-place (#1884)
 
