@@ -308,6 +308,34 @@ func (c *ctl) dispatchOperational(line string) error {
 	}
 }
 
+// parseRollbackSelector converts a rollback slot/index token into the int32
+// the rollback RPCs carry. strconv.Atoi returns a 64-bit int on this target,
+// so a value like 4294967297 parsed clean, passed a naive lower-bound check,
+// then int32() WRAPPED to a different in-range slot (4294967297 -> 1): the
+// mutating path silently discarded the candidate (#4868) and the read-only
+// display/compare selectors silently rendered the WRONG rollback with a
+// success exit (#5052). ParseInt with a 32-bit width returns strconv.ErrRange
+// for any value outside int32 range instead of wrapping, so the truncation can
+// never reach the wire.
+//
+// min is the smallest accepted value: 0 for the mutating `rollback` (0 =
+// revert to active / discard candidate), 1 for the read-only display/compare
+// selectors that require a positive history slot. usage is the caller's syntax
+// hint, echoed on every failure so the operator sees the offending command.
+func parseRollbackSelector(token, usage string, min int32) (int32, error) {
+	v, err := strconv.ParseInt(token, 10, 32)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("rollback number %q out of range; %s", token, usage)
+		}
+		return 0, fmt.Errorf("%s", usage)
+	}
+	if v < int64(min) {
+		return 0, fmt.Errorf("%s", usage)
+	}
+	return int32(v), nil
+}
+
 func (c *ctl) dispatchConfig(line string) error {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
@@ -451,27 +479,18 @@ func (c *ctl) dispatchConfig(line string) error {
 	case "rollback":
 		n := int32(0)
 		if len(parts) >= 2 {
-			// Strict integer parse: a malformed token (e.g. "foo",
-			// "1x") or a negative value must NOT silently fall through
-			// to rollback 0, which discards the candidate (#3447).
-			//
-			// #4868: parse into the int32 the RPC carries. `strconv.Atoi`
-			// returns a 64-bit int on this target, so `4294967296` parsed
-			// clean, passed the >=0 check, then `int32(v)` WRAPPED to 0 —
-			// silently resetting the candidate to the active config. Using
-			// ParseInt(_, 10, 32) rejects any value that does not fit int32
-			// (ErrRange) instead of wrapping it.
-			v, err := strconv.ParseInt(parts[1], 10, 32)
+			// Strict integer parse via the shared selector parser
+			// (#3447/#4868/#5052): a malformed token ("foo", "1x"), a
+			// negative value, or an int32-overflowing value must NOT
+			// silently fall through to rollback 0 (which discards the
+			// candidate). min=0 keeps `rollback 0` valid (revert to
+			// active). See parseRollbackSelector for the int32-wrap
+			// rationale.
+			v, err := parseRollbackSelector(parts[1], "rollback: rollback number must be a non-negative integer within int32 range", 0)
 			if err != nil {
-				if errors.Is(err, strconv.ErrRange) {
-					return fmt.Errorf("rollback: rollback number %q out of range", parts[1])
-				}
-				return fmt.Errorf("rollback: invalid rollback number %q", parts[1])
+				return err
 			}
-			if v < 0 {
-				return fmt.Errorf("rollback: rollback number must be >= 0, got %d", v)
-			}
-			n = int32(v)
+			n = v
 		}
 		_, err := c.client.Rollback(c.ctx(), &pb.RollbackRequest{N: n})
 		if err != nil {
