@@ -44895,6 +44895,69 @@ top.
 - **File(s)**: pkg/flowexport/transport.go,
   pkg/flowexport/maxdepth_race_5048_test.go
 
+- **Timestamp**: 2026-07-10
+- **Action**: Fix ISSU `request system software in-service-upgrade` printing
+  drain-complete + stop instructions from desired state alone (#5039).
+  `ForceSecondary()` only sets desired manager state and enqueues a droppable
+  election event; the real VRRP resignation / VIP handoff happens
+  asynchronously and can lag or be dropped. Both the interactive CLI handler
+  (`pkg/cli/cli_request_system.go`) and the remote-CLI gRPC path
+  (`pkg/grpcapi/server_diag_system_action.go`, reached via
+  `cmd/cli/request.go` SystemAction) unconditionally printed "Traffic has been
+  drained to peer" + `systemctl stop xpfd` straight off ForceSecondary's
+  return — certifying a drain that may not have happened and telling the
+  operator to stop the only forwarding owner. Added a read-only observer
+  `Manager.WaitForUpgradeHandoff` (bounded wait until peer alive + primary for
+  >=1 RG AND this node no longer primary for any RG) plus a shared honest
+  `UpgradeDrainReport(confirmed)` builder in `pkg/cluster/upgrade_drain.go`.
+  Both surfaces now fence the stop instruction on the OBSERVED handoff; on
+  timeout they warn and direct `show chassis cluster status` verification. No
+  change to the drain mutation / ISSU behavior — output-only fence. RED-on-
+  revert tests in pkg/cluster (message both modes + fence), pkg/cli (CLI
+  render), pkg/grpcapi (wire format + drain-start gate). Doc: feature-gaps.md
+  ISSU row updated.
+- **File(s)**: pkg/cluster/upgrade_drain.go,
+  pkg/cluster/upgrade_drain_test.go, pkg/cli/cli_request_system.go,
+  pkg/cli/cli_request_system_issu_5039_test.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_diag_issu_5039_test.go, docs/feature-gaps.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: Address HA reviewer on #5405 (#5039). (1) BLOCKER: partial-drain
+  blackhole — `upgradeHandoffComplete()` confirmed on the FIRST peer-primary RG
+  (any-one OR over peerGroups), so in the default multi-RG config a peer taking
+  over only RG0 (control-plane, no data VIP) while data RGs lagged/events were
+  dropped would print "drained — safe to stop" and blackhole the still-node0
+  data RG. Tightened to require EVERY non-disabled RG this node relinquished to
+  be peer-primary (skip disabled RGs; a zero-enabled-RG config never confirms).
+  (2) NIT: removed the copy-pasteable `systemctl stop ...` line from the
+  UNCONFIRMED report so a hurried operator can't paste it past the warning; the
+  stop/swap command is printed only on the confirmed path. Extended tests:
+  multi-RG partial (1/3 peer-primary → NOT confirmed, RED on any-one revert),
+  full (3/3 → confirmed), missing-peer-entry, disabled-RG skip, zero-enabled;
+  unconfirmed reports (cluster/cli/grpcapi) assert NO "systemctl stop".
+  `go test -race` green on the three packages.
+- **File(s)**: pkg/cluster/upgrade_drain.go,
+  pkg/cluster/upgrade_drain_test.go,
+  pkg/cli/cli_request_system_issu_5039_test.go,
+  pkg/grpcapi/server_diag_issu_5039_test.go
+## 2026-07-10 — #5234 fsatomic/configstore post-rename durability classification coverage
+- **Timestamp**: 2026-07-10
+- **Action**: Close the #5234 test-coverage gap (follow-up to #5185/#5230).
+  The converge-to-C tests inject via the Store `writeActiveFn` seam, which
+  bypasses `db.go writeTreeMarked`'s `fmt.Errorf("persist %s: %w", …)` wrap,
+  so nothing proved `isPostRenameDurabilityFailure` (errors.As) still
+  classifies the `*PostRenameSyncError` through that `%w`. Exported the
+  unexported fsatomic post-rename seam as `SetAfterRenameSyncDirForTesting`
+  (reuses the existing `afterRenameSyncDir`/`SyncDir` primitives — no new
+  fsync path) so a configstore test can drive a REAL post-rename dir-fsync
+  failure through `db.WriteActive`. Added a focused boundary test and an
+  end-to-end converge test. Proved RED-on-revert: downgrading db.go's `%w`
+  to `%v` makes both fail (classification flattens → reject instead of
+  converge). No production behavior change.
+- **File(s)**: pkg/fsatomic/test_seams.go (new),
+  pkg/configstore/postrename_dbboundary_5234_test.go (new),
+  pkg/fsatomic/README.md, pkg/configstore/README.md, _Log.md
 ## 2026-07-10 — #5031 redact raw error from unauthenticated /health
 
 - **Timestamp**: 2026-07-10
@@ -44937,3 +45000,23 @@ top.
   pkg/ra/goodbye_failure_5093_test.go, pkg/daemon/daemon.go,
   pkg/daemon/daemon_ha.go, pkg/daemon/startup_goodbye_5093_test.go,
   pkg/ra/README.md, _Log.md
+- **Timestamp**: 2026-07-10
+- **Action**: #5312 flowexport/ipfix — emit RECORD-granularity sampling IEs.
+  ShouldExport does 1-in-N selection of whole SESSION records, but
+  encodeIPFIXOptionsSamplerDataSet advertised PSAMP PACKET-selection IEs
+  (selectorAlgorithm 304 / samplingPacketInterval 305 / samplingPacketSpace
+  306, interval=1/space=N-1). A standards collector reads that as packet
+  sampling and renormalizes each record's octet/packetDeltaCount by N —
+  inflating the already-complete per-session volume. The only guard was a
+  code comment ("must NOT multiply by N") that no wire field carried.
+  Replaced with the RFC 7014 (Flow Selection Techniques) flow-selection IEs:
+  flowSelectorAlgorithm (390, u16) = 1 (systematic count-based, IANA "Flow
+  Selector Algorithm" registry), samplingFlowInterval (396, u64) = 1,
+  samplingFlowSpacing (397, u64) = N-1. Record size 14 -> 22. A collector now
+  scales the POPULATION (flow count/aggregate) by N and leaves per-record
+  counters intact. Updated the sampler test to pin 390/396/397 + u64 widths +
+  record size 22 AND assert 304/305/306 are ABSENT; proved RED-on-revert
+  (reverting ipfix.go fails the template/data-set decode tests). Updated
+  pkg/flowexport/README.md #3748/#5312 sampler section.
+- **File(s)**: pkg/flowexport/ipfix.go, pkg/flowexport/ipfix_sampler_test.go,
+  pkg/flowexport/README.md, _Log.md

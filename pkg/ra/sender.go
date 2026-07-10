@@ -718,9 +718,10 @@ func (s *sender) sendRA() {
 // Owner-only — emitted as the final write in finishShutdown. It returns true
 // only when the full sequence was written without error; a write failure
 // returns false so finishShutdown leaves goodbyeEmitted=false and the manager's
-// release-time backstop retries the goodbye on a fresh conn. (The standalone
-// backstop path, sendGoodbyeStandalone, ignores the bool — it is itself the
-// retry, so there is no further fallback to arm.)
+// release-time backstop retries the goodbye on a fresh conn. The standalone
+// backstop path, sendGoodbyeStandalone, now surfaces this bool as an error
+// (errGoodbyeWrite, #5093) so its caller (WithdrawOnce) reports the failure and
+// the cold-boot one-shot retains retry debt for the reconcile ticker to retry.
 func (s *sender) sendGoodbyeRA() bool {
 	ra := s.buildRA()
 	ra.RouterLifetime = 0
