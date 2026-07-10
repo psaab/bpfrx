@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Predefined IKE/IPsec proposal-set expansion (fable-167 V-1, #4297).
 //
@@ -109,13 +112,90 @@ func ProposalSetNames() []string {
 	return []string{"basic", "compatible", "standard", "suiteb-gcm-128", "suiteb-gcm-256"}
 }
 
+// reservedProposalSetNamePrefix is the name namespace the compiler OWNS for the
+// synthetic proposals it mints when expanding a predefined `proposal-set`
+// (syntheticProposalSetName). expandIKEProposalSets / expandIPsecProposalSets
+// write concrete proposals under `<prefix><policy>/<set>/<index>` names into the
+// SAME IKEProposals / Proposals maps that hold operator-authored proposals,
+// AFTER those maps are built. Because the lexer permits `/ _ .` in bare
+// identifiers an operator can author a proposal with that exact name, so the two
+// namespaces could alias and one would silently overwrite the other — installing
+// a different (typically weaker) crypto proposal than configured, a silent
+// downgrade (#5195, codex-177 A3-b2-F7). validateReservedIPsecProposalNamesAST
+// reserves this prefix at strict commit so an authored proposal can never take
+// a synthetic name, and the expand loops keep an occupancy guard as belt-and-
+// suspenders on the lenient load path.
+const reservedProposalSetNamePrefix = "__proposal-set/"
+
 // syntheticProposalSetName builds a deterministic, collision-resistant name
 // for a proposal synthesized from a policy's proposal-set. The rendered
 // swanctl proposal is the crypto token string (buildIKEProposalFromIKE /
-// buildESPProposal), not this name, so the name is internal only; the "__"
-// prefix and slashes keep it clear of operator-authored proposal names.
+// buildESPProposal), not this name, so the name is internal only; the reserved
+// "__proposal-set/" prefix (rejected for authored names at commit) keeps it
+// clear of operator-authored proposal names.
 func syntheticProposalSetName(policy, set string, n int) string {
-	return fmt.Sprintf("__proposal-set/%s/%s/%d", policy, set, n)
+	return fmt.Sprintf("%s%s/%s/%d", reservedProposalSetNamePrefix, policy, set, n)
+}
+
+// validateReservedIPsecProposalNamesAST rejects (strict) or warns (lenient) any
+// operator-authored IKE or IPsec `proposal <name>` whose name uses the
+// reservedProposalSetNamePrefix namespace the compiler owns for synthetic
+// proposal-set expansion (#5195, codex-177 A3-b2-F7).
+//
+// Without this gate, an authored proposal named exactly
+// `__proposal-set/<policy>/<set>/<index>` aliases the synthetic proposal that
+// expandIKEProposalSets / expandIPsecProposalSets mint into the same name-keyed
+// map, and the unconditional map write silently overwrites one with the other —
+// a different, typically weaker crypto proposal is installed than the operator
+// configured (a silent downgrade). Reserving the prefix at commit guarantees the
+// authored and synthetic namespaces never alias, so the expansion is
+// collision-free by construction.
+//
+// Runs on the group-expanded, inactive-pruned AST (apply-groups-inherited
+// proposals covered; inactive ones ignored) and enumerates proposal names with
+// the SAME namedInstances helper compileIKE / compileIPsec use to key the maps,
+// so it checks exactly the names that could collide. Strict (commit /
+// commit-check): the first reserved-prefix authored name hard-rejects. Lenient
+// (load / peer-sync): warn so an already-persisted or peer-synced config an
+// older binary silently accepted still boots (#1960) — the expand-time occupancy
+// guard then keeps the authored proposal from being clobbered.
+func validateReservedIPsecProposalNamesAST(nodes []*Node, lenient bool) ([]string, error) {
+	var warnings []string
+	emit := func(section, name string) error {
+		msg := fmt.Sprintf(
+			"security %s proposal %q uses the reserved %q name prefix, which the "+
+				"compiler owns for predefined proposal-set expansion; an authored "+
+				"proposal with this name would silently overwrite (or be overwritten "+
+				"by) a synthetic set member, installing a different crypto proposal "+
+				"than configured — rename the proposal (#5195)",
+			section, name, reservedProposalSetNamePrefix)
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
+	walkErr := forEachChild(nodes, "security", func(security *Node) error {
+		for _, section := range []string{"ike", "ipsec"} {
+			if err := forEachChild(security.Children, section, func(s *Node) error {
+				for _, inst := range namedInstances(s.FindChildren("proposal")) {
+					if strings.HasPrefix(inst.name, reservedProposalSetNamePrefix) {
+						if err := emit(section, inst.name); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	return warnings, nil
 }
 
 // expandIKEProposalSets synthesizes concrete IKE (Phase 1) proposals for every
@@ -143,12 +223,21 @@ func expandIKEProposalSets(sec *SecurityConfig) {
 		}
 		for i, s := range specs {
 			name := syntheticProposalSetName(pol.Name, pol.ProposalSet, i+1)
-			sec.IPsec.IKEProposals[name] = &IKEProposal{
-				Name:          name,
-				AuthMethod:    s.authMethod,
-				EncryptionAlg: s.enc,
-				AuthAlg:       s.auth,
-				DHGroup:       s.dhGroup,
+			// #5195 defense in depth: never silently clobber a slot already
+			// occupied by an operator-authored proposal. The strict commit gate
+			// (validateReservedIPsecProposalNamesAST) reserves this prefix, so on
+			// the commit path the slot is always free; the guard matters only on
+			// the lenient load / peer-sync path, where a config an older binary
+			// accepted may still squat the name — keep the authored proposal
+			// rather than overwriting it with the (possibly weaker) set member.
+			if _, taken := sec.IPsec.IKEProposals[name]; !taken {
+				sec.IPsec.IKEProposals[name] = &IKEProposal{
+					Name:          name,
+					AuthMethod:    s.authMethod,
+					EncryptionAlg: s.enc,
+					AuthAlg:       s.auth,
+					DHGroup:       s.dhGroup,
+				}
 			}
 			pol.Proposals = append(pol.Proposals, name)
 		}
@@ -174,12 +263,18 @@ func expandIPsecProposalSets(sec *SecurityConfig) {
 		}
 		for i, s := range specs {
 			name := syntheticProposalSetName(pol.Name, pol.ProposalSet, i+1)
-			sec.IPsec.Proposals[name] = &IPsecProposal{
-				Name:          name,
-				Protocol:      "esp",
-				EncryptionAlg: s.enc,
-				AuthAlg:       s.auth,
-				DHGroup:       s.dhGroup,
+			// #5195 defense in depth: see expandIKEProposalSets — do not
+			// overwrite an operator-authored proposal that squats a synthetic
+			// name on the lenient load path (the strict gate reserves the prefix
+			// so this cannot happen on commit).
+			if _, taken := sec.IPsec.Proposals[name]; !taken {
+				sec.IPsec.Proposals[name] = &IPsecProposal{
+					Name:          name,
+					Protocol:      "esp",
+					EncryptionAlg: s.enc,
+					AuthAlg:       s.auth,
+					DHGroup:       s.dhGroup,
+				}
 			}
 			pol.Proposals = append(pol.Proposals, name)
 		}
