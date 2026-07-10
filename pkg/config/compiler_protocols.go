@@ -1126,28 +1126,22 @@ func parseBandwidthLimitStrict(s string) (uint64, error) {
 
 // parseBurstSizeLimit parses a Junos burst-size-limit value (in bytes).
 // "15k" = 15,000 bytes; "1m" = 1,000,000 bytes; plain number = bytes.
+//
+// It delegates to parseBurstSizeLimitStrict and keeps the legacy
+// zero-return-on-garbage contract (empty / malformed input compiles as
+// "unset"). Crucially, on an OVERFLOWING scaled product it now returns 0
+// rather than the wrapped small nonzero value the old inline `v *
+// multiplier` produced (#5299): a wrapped burst is a silently-wrong meter,
+// whereas 0 is the unambiguous "unset" sentinel and is already rejected
+// loud at commit by the ValidatePolicerBurstSize schema gate — only the
+// tolerant Store.Load / SyncApply path ever reaches here with a value the
+// strict gate downgraded to a warning.
 func parseBurstSizeLimit(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	multiplier := uint64(1)
-	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
-		multiplier = 1000000000
-		s = s[:len(s)-1]
-	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
-		multiplier = 1000000
-		s = s[:len(s)-1]
-	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
-		multiplier = 1000
-		s = s[:len(s)-1]
-	}
-	v, err := strconv.ParseUint(s, 10, 64)
+	v, err := parseBurstSizeLimitStrict(s)
 	if err != nil {
 		return 0
 	}
-	// burst-size-limit is already in bytes
-	return v * multiplier
+	return v
 }
 
 func parseScaledDecimalUnit(s string) uint64 {
