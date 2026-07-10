@@ -73,6 +73,19 @@ import (
 // it to the dataplane. The daemon's commitAndApply implementation
 // holds the apply semaphore across both steps so the engine's
 // commit can't interleave with another caller's commit/apply pair.
+//
+// Its return is TRI-STATE (#5063), and the returned *config.Config — not
+// the error — is the authority on whether the generation was promoted:
+//
+//   - (compiled != nil, nil): committed, active, dataplane armed. Success.
+//   - (compiled != nil, err): committed, active, dataplane armed, but a
+//     BEST-EFFORT subsystem (networkd write / Kea restart / host-inbound nft;
+//     daemon_apply.go applyAndSyncCommitted) is in DEBT. The generation is
+//     live — this is NOT a rejection. The engine records it as committed
+//     (arms cooldown) and additionally counts the debt (#5063).
+//   - (nil, err): the commit did NOT promote (bootstrap gate, compile/commit
+//     failure, or a required-protocol-gate that DISARMED the dataplane). This
+//     is the only genuine rejection.
 type CommitFn func(ctx context.Context, comment string) (*config.Config, error)
 
 // Minimum time between successive triggers of the same policy.
@@ -97,8 +110,9 @@ const (
 // fields are cumulative since daemon start except QueueDepth, which is the
 // instantaneous number of queued-but-not-yet-applied actions.
 type Stats struct {
-	Committed         uint64 // actions whose batch committed successfully
-	Rejected          uint64 // actions rejected (bad plan / CommitCheck / apply error)
+	Committed         uint64 // actions whose batch committed successfully (INCLUDES committed-with-apply-debt, #5063)
+	CommittedWithDebt uint64 // subset of Committed that promoted+armed but left a best-effort subsystem in debt (#5063)
+	Rejected          uint64 // actions rejected (bad plan / CommitCheck / commit not promoted)
 	Retried           uint64 // retry attempts after a held config lock
 	DroppedQueueFull  uint64 // actions superseded/evicted because the queue was full
 	DroppedLockHeld   uint64 // actions dropped after the lock-retry deadline elapsed
@@ -110,6 +124,7 @@ type Stats struct {
 // engineCounters holds the atomic counters behind Stats.
 type engineCounters struct {
 	committed         atomic.Uint64
+	committedWithDebt atomic.Uint64
 	rejected          atomic.Uint64
 	retried           atomic.Uint64
 	droppedQueueFull  atomic.Uint64
@@ -555,6 +570,7 @@ func (e *Engine) PolicyCount() int {
 func (e *Engine) Stats() Stats {
 	return Stats{
 		Committed:         e.counters.committed.Load(),
+		CommittedWithDebt: e.counters.committedWithDebt.Load(),
 		Rejected:          e.counters.rejected.Load(),
 		Retried:           e.counters.retried.Load(),
 		DroppedQueueFull:  e.counters.droppedQueueFull.Load(),
@@ -682,6 +698,23 @@ func (e *Engine) runAction(a plannedAction) {
 			e.armCooldown(a.policyName, a.semRev)
 			slog.Info("event-options: configuration committed",
 				"policy", a.policyName, "commands", len(a.ops))
+			return
+		}
+		// #5063: committed-with-apply-debt. The generation was promoted, is active,
+		// and the dataplane is armed — a best-effort subsystem (networkd / Kea /
+		// host-inbound nft) is in debt. This is NOT a rejection: record it as
+		// committed and arm the SAME-generation cooldown exactly as the clean-commit
+		// path, so the live autonomous change is not miscounted rejected and the
+		// same event cannot immediately re-commit during an incident. Also bump the
+		// distinct debt counter and log a WARN so the operator sees the subsystem
+		// debt. Terminal like the clean commit — no retry.
+		var debt *commitDebtError
+		if errors.As(err, &debt) {
+			e.counters.committed.Add(1)
+			e.counters.committedWithDebt.Add(1)
+			e.armCooldown(a.policyName, a.semRev)
+			slog.Warn("event-options: configuration committed with apply debt",
+				"policy", a.policyName, "commands", len(a.ops), "err", debt.err)
 			return
 		}
 		if errors.Is(err, errStaleAction) {
@@ -825,11 +858,25 @@ func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 		e.store.ExitConfigure()
 		return nil
 	}
-	if _, err := e.commitFn(ctx, desc); err != nil {
-		e.store.ExitConfigure()
+	compiled, err := e.commitFn(ctx, desc)
+	// ExitConfigure unconditionally: commitFn has already promoted (or refused
+	// to promote) the candidate, so the engine's configure session is done
+	// either way — the same teardown the success path always ran.
+	e.store.ExitConfigure()
+	if err != nil {
+		// #5063: the returned *config.Config, not the error, decides whether the
+		// generation was promoted. A non-nil compiled means the config committed,
+		// is active, and the dataplane is armed — a best-effort subsystem is just
+		// in debt (see CommitFn). That is committed-with-debt, NOT a rejection:
+		// signal it so runAction arms the cooldown and counts it committed instead
+		// of re-committing the same event and inflating the rejected counter. Only
+		// a nil compiled (commit never promoted / dataplane disarmed) is a genuine
+		// permanent rejection.
+		if compiled != nil {
+			return &commitDebtError{err: err}
+		}
 		return errBatch("commit: %v", err)
 	}
-	e.store.ExitConfigure()
 	return nil
 }
 
@@ -847,6 +894,17 @@ func remediationDescription(a plannedAction) string {
 func errBatch(format string, args ...any) error {
 	return fmt.Errorf(format, args...)
 }
+
+// commitDebtError is returned by applyOnce when commitFn promoted the generation
+// (non-nil *config.Config) but a best-effort subsystem apply failed (#5063): the
+// config is committed, active, and the dataplane armed, so it is committed — NOT
+// rejected — with the wrapped subsystem error as apply debt. runAction detects it
+// via errors.As, counts committed + committedWithDebt, and arms the cooldown.
+// Unwrap exposes the underlying subsystem error for logging / errors.Is.
+type commitDebtError struct{ err error }
+
+func (e *commitDebtError) Error() string { return "committed with apply debt: " + e.err.Error() }
+func (e *commitDebtError) Unwrap() error { return e.err }
 
 // errStaleAction is the sentinel returned by applyOnce when the pre-classified
 // action is no longer valid to commit (#3750): its policy was removed or

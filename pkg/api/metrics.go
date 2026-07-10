@@ -237,12 +237,13 @@ type xpfCollector struct {
 
 	// #2157: event-options remediation action observability. Makes the
 	// previously-silent loss (drop on held config lock) visible.
-	eventActionsCommitted  *prometheus.Desc
-	eventActionsRejected   *prometheus.Desc
-	eventActionsRetried    *prometheus.Desc
-	eventActionsDropped    *prometheus.Desc
-	eventAttributesInvalid *prometheus.Desc
-	eventActionQueueDepth  *prometheus.Desc
+	eventActionsCommitted         *prometheus.Desc
+	eventActionsCommittedWithDebt *prometheus.Desc
+	eventActionsRejected          *prometheus.Desc
+	eventActionsRetried           *prometheus.Desc
+	eventActionsDropped           *prometheus.Desc
+	eventAttributesInvalid        *prometheus.Desc
+	eventActionQueueDepth         *prometheus.Desc
 
 	// #2050: dynamic-address feed staleness. seconds-since-last-success
 	// climbs while a feed cannot be refreshed (retain-forever default
@@ -688,6 +689,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ipmonActuationFailures
 	ch <- c.rpmPinInstallFailures
 	ch <- c.eventActionsCommitted
+	ch <- c.eventActionsCommittedWithDebt
 	ch <- c.eventActionsRejected
 	ch <- c.eventActionsRetried
 	ch <- c.eventActionsDropped

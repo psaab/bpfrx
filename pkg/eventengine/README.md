@@ -290,7 +290,9 @@ blocks a `commitFn` on `ctx.Done()` and asserts `Close()` aborts it with
 
 `Engine.Stats()` backs:
 
-- `xpf_event_actions_committed_total`
+- `xpf_event_actions_committed_total` (INCLUDES the committed-with-apply-debt
+  subset, #5063)
+- `xpf_event_actions_committed_with_debt_total` (#5063 — see below)
 - `xpf_event_actions_rejected_total`
 - `xpf_event_actions_retried_total`
 - `xpf_event_actions_dropped_total{reason="lock_held"|"queue_full"|"stale"}`
@@ -298,6 +300,33 @@ blocks a `commitFn` on `ctx.Done()` and asserts `Close()` aborts it with
   within-cooldown action, #3750)
 - `xpf_event_attributes_match_invalid_total`
 - `xpf_event_action_queue_depth` (gauge)
+
+## Commit-status classification (`CommitFn` is tri-state, #5063)
+
+The daemon's `CommitFn` (`commitAndApply` → `applyAndSyncCommitted`,
+`pkg/daemon/daemon_apply.go`) returns `(*config.Config, error)` and **the
+returned config, not the error, is the authority on whether the generation was
+promoted**:
+
+- `(compiled != nil, nil)` — committed, active, dataplane armed. **Committed.**
+- `(compiled != nil, err)` — committed, active, dataplane armed, but a
+  **best-effort** subsystem (networkd write / Kea restart / host-inbound nft)
+  is in **debt**. The generation is LIVE — **NOT a rejection.** `applyOnce`
+  signals this as a `commitDebtError`; `runAction` counts it
+  `committed` + `committedWithDebt`, arms the SAME-generation cooldown, logs a
+  WARN, and does **not** retry.
+- `(nil, err)` — the commit did NOT promote (bootstrap gate, compile/commit
+  failure, or a required-protocol gate that DISARMED the dataplane). This is the
+  **only genuine rejection** (`xpf_event_actions_rejected_total`).
+
+Invariant: once a generation is promoted and armed, the engine's commit
+counters, cooldown, and audit MUST record it as committed even if a best-effort
+subsystem remains in debt. Before #5063, `applyOnce` discarded `compiled` and
+returned `errBatch` on ANY error, so a live autonomous change was miscounted
+rejected, no cooldown armed, and the same event could immediately re-commit —
+false telemetry plus control-plane churn during an incident. Regression-locked
+by `engine_armed_debt_5063_test.go` (fail-on-revert: the debt case goes RED if
+`applyOnce` re-discards `compiled`).
 
 ## Temporal `within` trigger semantics (#3756)
 
