@@ -1448,7 +1448,7 @@ func TestBuildPBRRules(t *testing.T) {
 		ops := newFakeRuleOps()
 		p := &pbrManager{ops: ops}
 		if err := p.Apply([]PBRRule{
-			{Family: unix.AF_INET, IPProto: 6, Dport: &PBRPortRange{Lo: 443, Hi: 443}, TableID: 100, Instance: "vr"},
+			{Family: unix.AF_INET, IPProto: 6, Dport: &PBRPortRange{Lo: 443, Hi: 443}, TableID: 100, Instance: "vr", IifName: "ge-0-0-0"},
 		}); err != nil {
 			t.Fatalf("Apply: %v", err)
 		}
@@ -1622,6 +1622,114 @@ func TestBuildPBRRules_OtherInterfaceUnaffected(t *testing.T) {
 	}
 }
 
+// TestBuildPBRRules_IifNameScoped is the #5117 fail-on-revert guard: every FBF
+// ip rule a filter produces must be scoped to the Linux ingress interface the
+// filter is attached to (IifName != ""), so a kernel slow-path (XDP_PASS)
+// packet arriving on a DIFFERENT interface cannot match a global rule and be
+// steered into the wrong VRF. RED on revert: dropping the IifName scoping makes
+// every rule carry an empty ingress interface (a global rule), failing here.
+func TestBuildPBRRules_IifNameScoped(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{{Name: "ATT", TableID: 101}}
+	filter := &config.FirewallFilter{
+		Name: "fbf",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "a", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "ATT"},
+			{Name: "b", DestAddresses: []string{"192.168.0.0/16"}, RoutingInstance: "ATT"},
+		},
+	}
+	// pbrTestConfig attaches the filter to ge-0/0/0 unit 0 -> kernel ge-0-0-0.
+	rules, err := BuildPBRRules(pbrTestConfig("inet", filter, instances, nil))
+	if err != nil {
+		t.Fatalf("unexpected build error: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 rules, got %d: %+v", len(rules), rules)
+	}
+	for i := range rules {
+		if rules[i].IifName != "ge-0-0-0" {
+			t.Errorf("rule %d IifName = %q, want %q (must be scoped to the attached interface, not a global rule)",
+				i, rules[i].IifName, "ge-0-0-0")
+		}
+	}
+}
+
+// TestBuildPBRRules_IifNameVLANUnit pins that the ingress interface is resolved
+// to the VLAN sub-interface when the filter is attached to an 802.1Q-tagged
+// unit (#5117): the mirror must scope to ge-0-0-0.50, not the base ge-0-0-0.
+func TestBuildPBRRules_IifNameVLANUnit(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{{Name: "ATT", TableID: 101}}
+	filter := &config.FirewallFilter{
+		Name: "fbf",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "a", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "ATT"},
+		},
+	}
+	cfg := &config.Config{RoutingInstances: instances}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{filter.Name: filter}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
+			50: {Number: 50, VlanID: 50, FilterInputV4: "fbf"},
+		}},
+	}
+	rules, err := BuildPBRRules(cfg)
+	if err != nil {
+		t.Fatalf("unexpected build error: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d: %+v", len(rules), rules)
+	}
+	if rules[0].IifName != "ge-0-0-0.50" {
+		t.Errorf("VLAN-unit FBF rule IifName = %q, want %q (must scope to the VLAN sub-interface)",
+			rules[0].IifName, "ge-0-0-0.50")
+	}
+}
+
+// TestBuildPBRRules_IifNamePerInterface pins that a filter attached to TWO
+// interfaces yields DISTINCT per-interface rules — one per (filter, interface)
+// attachment, each carrying its own IifName — rather than one global rule
+// (#5117). RED on revert: the pre-#5117 collector deduped by filter name and
+// emitted a single iif-less rule, so this two-interface config would produce
+// one rule with an empty ingress interface.
+func TestBuildPBRRules_IifNamePerInterface(t *testing.T) {
+	instances := []*config.RoutingInstanceConfig{{Name: "ATT", TableID: 101}}
+	shared := &config.FirewallFilter{
+		Name: "shared-fbf",
+		Terms: []*config.FirewallFilterTerm{
+			{Name: "steer", SourceAddresses: []string{"10.0.1.0/24"}, RoutingInstance: "ATT"},
+		},
+	}
+	cfg := &config.Config{RoutingInstances: instances}
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{shared.Name: shared}
+	// The SAME filter is bound as the input filter on two interfaces.
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, FilterInputV4: "shared-fbf"},
+		}},
+		"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, FilterInputV4: "shared-fbf"},
+		}},
+	}
+	rules, err := BuildPBRRules(cfg)
+	if err != nil {
+		t.Fatalf("unexpected build error: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("expected 2 rules (one per attached interface), got %d: %+v", len(rules), rules)
+	}
+	gotIifs := map[string]bool{}
+	for i := range rules {
+		if rules[i].IifName == "" {
+			t.Errorf("rule %d has an empty ingress interface (global rule) — must be per-interface scoped: %+v", i, rules[i])
+		}
+		gotIifs[rules[i].IifName] = true
+	}
+	for _, want := range []string{"ge-0-0-0", "ge-0-0-1"} {
+		if !gotIifs[want] {
+			t.Errorf("expected a distinct rule scoped to %q, got iifs %v", want, gotIifs)
+		}
+	}
+}
+
 // TestPBRBuildStats pins the #4422 observability contract: PBRBuildStats returns
 // the installed ip-rule count and the count of routing-instance filter terms
 // DROPPED from the kernel FBF mirror (fail-closed under-steer), matching what
@@ -1676,18 +1784,31 @@ func TestPBRBuildStats(t *testing.T) {
 	})
 }
 
+// hasAttachment reports whether atts carries an attachment for the given filter
+// AND ingress ifname — the per-interface FBF-scoping unit (#5117).
+func hasAttachment(atts []pbrAttachment, filter, iif string) bool {
+	for _, a := range atts {
+		if a.Filter == filter && a.Iif == iif {
+			return true
+		}
+	}
+	return false
+}
+
 // TestCollectAttachedInputFilters pins the attachment-collection contract that
-// per-interface FBF scoping rests on (#4422): only interface-unit INPUT filters
-// are collected, split by family; OUTPUT filters are excluded; and the same
-// filter attached to several interfaces dedups to a single entry (it is
-// expanded once).
+// per-interface FBF scoping rests on (#4422, #5117): only interface-unit INPUT
+// filters are collected, split by family; OUTPUT filters are excluded; the
+// ingress interface identity is PRESERVED (resolved to the kernel ifname); and
+// a filter attached to several interfaces yields ONE attachment per interface
+// (NOT deduplicated to a single global entry — that was the #5117 over-steer).
 func TestCollectAttachedInputFilters(t *testing.T) {
-	ifs := &config.InterfacesConfig{
+	cfg := &config.Config{Interfaces: config.InterfacesConfig{
 		Interfaces: map[string]*config.InterfaceConfig{
 			"ge-0/0/0": {Name: "ge-0/0/0", Units: map[int]*config.InterfaceUnit{
 				0: {Number: 0, FilterInputV4: "shared-v4", FilterInputV6: "only-v6"},
 			}},
-			// Same v4 input filter as ge-0/0/0 -> must dedup, not double-count.
+			// Same v4 input filter as ge-0/0/0 -> must be a SEPARATE attachment
+			// (its own iif), NOT deduped away — the pre-#5117 collapse is the bug.
 			"ge-0/0/1": {Name: "ge-0/0/1", Units: map[int]*config.InterfaceUnit{
 				0: {Number: 0, FilterInputV4: "shared-v4"},
 			}},
@@ -1696,25 +1817,38 @@ func TestCollectAttachedInputFilters(t *testing.T) {
 				0: {Number: 0, FilterInputV4: "other-v4", FilterOutputV4: "egress-not-fbf"},
 			}},
 		},
-	}
-	inet, inet6 := collectAttachedInputFilters(ifs)
+	}}
+	inet, inet6 := collectAttachedInputFilters(cfg)
 
-	if _, ok := inet["shared-v4"]; !ok {
-		t.Error("shared-v4 input filter must be collected")
+	// shared-v4 must appear once per interface it is attached to, each carrying
+	// that interface's resolved kernel ifname (#5117 — RED on revert: the old
+	// collector collapsed both into one iif-less entry).
+	if !hasAttachment(inet, "shared-v4", "ge-0-0-0") {
+		t.Errorf("shared-v4 must be attached to ge-0-0-0, got %+v", inet)
 	}
-	if _, ok := inet["other-v4"]; !ok {
-		t.Error("other-v4 input filter on ge-0/0/2 must be collected")
+	if !hasAttachment(inet, "shared-v4", "ge-0-0-1") {
+		t.Errorf("shared-v4 must ALSO be attached to ge-0-0-1 (per-interface, not deduped), got %+v", inet)
 	}
-	if len(inet) != 2 {
-		t.Errorf("inet set = %v, want exactly {shared-v4, other-v4} (dedup shared-v4 across two interfaces)", inet)
+	if !hasAttachment(inet, "other-v4", "ge-0-0-2") {
+		t.Errorf("other-v4 input filter on ge-0/0/2 must be collected as ge-0-0-2, got %+v", inet)
 	}
-	if _, ok := inet["egress-not-fbf"]; ok {
+	// Two shared-v4 attachments + one other-v4 = 3 inet attachments.
+	if len(inet) != 3 {
+		t.Errorf("inet attachments = %+v, want 3 (shared-v4@ge-0-0-0, shared-v4@ge-0-0-1, other-v4@ge-0-0-2)", inet)
+	}
+	// Every attachment must carry a resolved, non-empty ingress interface.
+	for _, a := range inet {
+		if a.Iif == "" {
+			t.Errorf("attachment %+v has an empty ingress interface (must fail closed, never global)", a)
+		}
+	}
+	if hasAttachment(inet, "egress-not-fbf", "ge-0-0-2") {
 		t.Error("OUTPUT filter egress-not-fbf must NOT be collected as FBF")
 	}
-	if _, ok := inet6["only-v6"]; !ok || len(inet6) != 1 {
-		t.Errorf("inet6 set = %v, want exactly {only-v6}", inet6)
+	if !hasAttachment(inet6, "only-v6", "ge-0-0-0") || len(inet6) != 1 {
+		t.Errorf("inet6 attachments = %+v, want exactly {only-v6@ge-0-0-0}", inet6)
 	}
-	if _, ok := inet6["shared-v4"]; ok {
+	if hasAttachment(inet6, "shared-v4", "ge-0-0-0") {
 		t.Error("v4 filter must not leak into the inet6 set (family split)")
 	}
 }

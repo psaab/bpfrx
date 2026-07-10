@@ -148,15 +148,32 @@ delegate to the owning domain. Exported types:
   and the userspace filter path still enforces the term exactly. The
   degraded error is returned to the daemon (`daemon_apply.go` step 3d) and
   logged; the buildable rules are still installed.
+  **Per-interface iif scoping (#5117).** Junos FBF is bound to a specific
+  interface-unit input filter, so a `then routing-instance` term only steers
+  traffic INGRESSING the interface the filter is attached to. Each kernel `ip
+  rule` therefore carries an `IifName` (`FRA_IIFNAME`) resolved via
+  `cfg.ResolveKernelIfName` — the canonical Junos-ref → Linux-name mapping, so a
+  unit-0 collapse (`ge-0/0/0` → `ge-0-0-0`), an 802.1Q VLAN unit
+  (`ge-0/0/0.50`) and a RETH member (`reth0` → local physical member) all
+  resolve consistently. `collectAttachedInputFilters` preserves the ingress
+  interface per attachment (it no longer dedups a filter down to a single global
+  entry), and a filter attached to N interfaces expands to N rules — one per
+  `(filter, interface)`, each with its own `IifName`. `pbrManager.Apply` refuses
+  to install a rule with no ingress interface (fail closed, never a global rule).
+  Before #5117 the mirror set no iif selector, so a slow-path (`XDP_PASS`) packet
+  arriving on a DIFFERENT interface could match the global rule and be steered
+  into the wrong VRF (cross-WAN / tenant route-leak) — the userspace fast path
+  was always per-interface, so only the kernel fallback over-steered.
   **Contradictory deny terms are not steered (#4534).** A term that
   co-locates `then routing-instance <x>` with a terminating `then discard` /
   `then reject` is contradictory — it asks the dataplane to BOTH steer the
   packet into `<x>` AND drop it. The deny wins on BOTH forwarding paths: the
   userspace runtime returns `RouteOverride::Drop` (#4392,
   `ingress_route_table_override`) and `buildPBRFromFilter` SKIPS the steering
-  `ip rule` (records a degraded error). Without the kernel skip the global
-  `ip rule` (no `iif` selector) would fail OPEN — steering slow-path /
-  `XDP_PASS` / unfiltered-interface traffic into the VRF that userspace drops.
+  `ip rule` (records a degraded error). Without the kernel skip the mirror
+  `ip rule` would fail OPEN — steering slow-path / `XDP_PASS` traffic
+  ingressing the attached interface (even with the #5117 iif selector) into
+  the VRF that userspace drops.
   The strict commit gate (`validateFilterRoutingInstanceConflictStrict`,
   #3308) rejects such a term at commit, but is lenient on load / peer-sync
   (#1960 no-brick), so a persisted / peer-synced contradiction can still reach
