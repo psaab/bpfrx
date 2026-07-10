@@ -213,7 +213,17 @@ func ResolveApplicationSet(name string, appSets map[string]*ApplicationSet) (*Ap
 // predefined bundle name) then the built-in predefined Junos set table.
 func lookupApplicationSet(name string, appSets map[string]*ApplicationSet) (*ApplicationSet, bool) {
 	if appSets != nil {
-		if as, ok := appSets[name]; ok {
+		// #5179: a present-but-nil map value (ApplicationSets[name] == nil)
+		// must NOT be reported as a found set. The tolerant-load / peer-sync
+		// path (#1960) can admit a null slot; returning (nil, true) here made
+		// expandAppSet range over as.Applications on a nil *ApplicationSet — a
+		// nil-deref panic that took down the whole control-plane catalog build
+		// (appid.CatalogNames) on commit/load. Skip the nil slot so the lookup
+		// falls through to the predefined table (an operator nulling out a
+		// predefined bundle name keeps the built-in definition) or, failing
+		// that, returns (nil, false) → a deterministic "not found" expansion
+		// error instead of a panic. Fail-closed, not fatal.
+		if as, ok := appSets[name]; ok && as != nil {
 			return as, true
 		}
 	}
