@@ -9,6 +9,24 @@ import (
 	"github.com/psaab/xpf/pkg/policymatch"
 )
 
+// validatePolicyZoneSelectors rejects a malformed from-zone/to-zone selector: a
+// keyword with no following zone value (e.g. "... from-zone trust to-zone").
+// The remote `show security policies` parsers silently dropped the dangling
+// predicate and returned a broader/one-sided policy inventory (#4908 /
+// C175-HC-126), matching the tighter parse already required by the simulator.
+func validatePolicyZoneSelectors(args []string) error {
+	for i := 0; i < len(args); i++ {
+		if args[i] != "from-zone" && args[i] != "to-zone" {
+			continue
+		}
+		if i+1 >= len(args) || args[i+1] == "from-zone" || args[i+1] == "to-zone" {
+			return fmt.Errorf("missing zone name after %q", args[i])
+		}
+		i++ // skip the consumed value
+	}
+	return nil
+}
+
 func (c *ctl) handleShowSecurity(args []string) error {
 	if len(args) == 0 {
 		printRemoteTreeHelp("show security:", "show", "security")
@@ -22,6 +40,13 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		}
 		return c.showZones()
 	case "policies":
+		// #4908 (C175-HC-126): reject a from-zone/to-zone selector missing its
+		// zone value (e.g. "... from-zone trust to-zone"). The loose parse below
+		// silently dropped the dangling predicate and returned a broader/
+		// one-sided inventory.
+		if err := validatePolicyZoneSelectors(args[1:]); err != nil {
+			return err
+		}
 		if len(args) >= 2 && args[1] == "brief" {
 			return c.showPoliciesBrief()
 		}

@@ -1,3 +1,59 @@
+## 2026-07-09 — #4908 cli/show display-fidelity cohort (partial: 6 fixed, 6 deferred)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4908 (display-fidelity cohort). Fixed the clearly-material,
+  display-layer-only defects and deferred the rest with reasons (per the
+  triage guidance to keep changes in pkg/cli show formatting and not touch
+  dataplane/counter semantics).
+  FIXED:
+    - C175-HC-116: cluster-status VRRP rows were dropped for logical zone
+      interface refs. A zone binds "ge-0-0-0.0" but cfg.Interfaces.Interfaces
+      is keyed by base "ge-0-0-0"; split the unit suffix, look up the base,
+      filter to the named unit. (pkg/cli/cli_show_cluster.go)
+    - C175-HC-129: routing-instance detail counted next-table static routes
+      but emitted no row (they have no NextHops). Added a next-table row.
+      (pkg/cli/cli_show_routing.go)
+    - C175-HC-080: DHCPv6 lease table labeled the HWAddress column "DUID"
+      though GetLeases6 never reads Kea's duid/iaid; relabeled to HWAddress.
+      (pkg/cli/show_services_dhcp.go)
+    - C175-HC-121: DHCP lease read/parse failures were rendered as a clean
+      "No active leases"; now surface the GetLeases4/6 errors and only claim
+      "no leases" when both reads succeeded. (pkg/cli/show_services_dhcp.go)
+    - C175-HC-073 (partial): the peer session detail printed
+      "Total sessions: -1" (the server's filtered-total sentinel); fall back
+      to the number of sessions returned. (pkg/cli/cli_show_flow.go)
+    - C175-HC-126: `show security policies` (local + remote) silently dropped
+      a from-zone/to-zone selector missing its value (e.g.
+      "... from-zone trust to-zone") and returned a broader/one-sided
+      inventory; reject the malformed selector.
+      (pkg/cli/cli_show_security_dispatch.go, cmd/cli/show_security.go)
+  DEFERRED (need non-display plumbing or fall outside pkg/cli display scope):
+    - C175-HC-063 alarms: a true "currently active" vs cumulative distinction
+      needs stateful prior-sample/window tracking (daemon-side), not a
+      display-only change.
+    - C175-HC-073 peer-summary filter + pagination: the peer summary sends an
+      empty GetSessionSummaryRequest; honoring the filter needs proto filter
+      fields + server support (beyond pkg/cli).
+    - C175-HC-077 DNAT pool-name join: NATDestInfo carries the rule name and
+      translate_ip but not the pool name (the stats join key "pool <name>");
+      a correct join needs a read-only pool_name field on NATDestInfo
+      (proto + grpcapi), beyond pkg/cli formatting.
+    - C175-HC-082 owning-RG label: the dataplane session value carries no
+      per-session RGID (RGID lives on IfaceZoneValue); a per-session owning-RG
+      label needs a zone/iface->RG map plumbed to the session display.
+    - C175-HC-122 dhcprelay counter: in pkg/dhcprelay and changes counter
+      semantics (out of the display-only guardrail).
+    - C175-HC-125 lldp TTL=0 neighbors: in pkg/lldp and changes
+      neighbor-learning semantics (out of the display-only guardrail).
+  Added RED-on-revert tests: a live showChassisClusterStatus test for
+  C175-HC-116 (VRRP row present for a logical zone iface) and pure-function
+  tests for both C175-HC-126 selector validators.
+  **File(s)**: pkg/cli/cli_show_cluster.go, pkg/cli/cli_show_routing.go,
+  pkg/cli/show_services_dhcp.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/cli_show_security_dispatch.go, cmd/cli/show_security.go,
+  pkg/cli/cli_display_fidelity_4908_test.go,
+  cmd/cli/show_security_selector_4908_test.go
+
 ## 2026-07-09 — #4914 logging: SESSION_CLOSE binary record + generic slog no longer report policy_id=0 / action=deny
 
 - **Timestamp**: 2026-07-09

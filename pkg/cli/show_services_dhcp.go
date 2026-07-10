@@ -234,14 +234,29 @@ func (c *CLI) showDHCPServer(detail bool) error {
 
 	// Read Kea lease files directly.
 	server := dhcpserver.New()
-	leases4, _ := server.GetLeases4()
-	leases6, _ := server.GetLeases6()
+	leases4, err4 := server.GetLeases4()
+	leases6, err6 := server.GetLeases6()
+
+	// #4908 (C175-HC-121): surface a lease-file read/parse failure instead of
+	// rendering it as a clean empty table. An unreadable or parse-failing Kea
+	// lease file previously fell through to "No active leases", making a
+	// degraded server indistinguishable from a healthy one with no leases.
+	if err4 != nil {
+		fmt.Printf("warning: could not read DHCPv4 leases: %v\n", err4)
+	}
+	if err6 != nil {
+		fmt.Printf("warning: could not read DHCPv6 leases: %v\n", err6)
+	}
 
 	if len(leases4) == 0 && len(leases6) == 0 {
-		if !detail {
-			fmt.Println("No active leases")
-		} else {
-			fmt.Println("Active leases: none")
+		// Only claim "no leases" when both reads actually succeeded; a warning
+		// was already emitted above for any failed read.
+		if err4 == nil && err6 == nil {
+			if !detail {
+				fmt.Println("No active leases")
+			} else {
+				fmt.Println("Active leases: none")
+			}
 		}
 		return nil
 	}
@@ -264,14 +279,17 @@ func (c *CLI) showDHCPServer(detail bool) error {
 	}
 	if len(leases6) > 0 {
 		fmt.Printf("DHCPv6 Leases (%d active):\n", len(leases6))
+		// #4908 (C175-HC-080): label the column "HWAddress", not "DUID". Kea's
+		// GetLeases6 populates Lease.HWAddress (the link-layer address), not the
+		// client DUID/IAID, so a "DUID" header mislabeled the printed value.
 		if detail {
-			fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "DUID", "Hostname", "Subnet", "Lifetime", "Expires")
+			fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "HWAddress", "Hostname", "Subnet", "Lifetime", "Expires")
 			for _, l := range leases6 {
 				fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n",
 					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
 			}
 		} else {
-			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
+			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "HWAddress", "Hostname", "Lifetime", "Expires")
 			for _, l := range leases6 {
 				fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
 					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)

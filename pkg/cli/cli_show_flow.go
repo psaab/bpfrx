@@ -723,7 +723,16 @@ func (c *CLI) showFlowSession(args []string) error {
 					fmt.Println()
 				}
 			}
-			fmt.Printf("Total sessions: %d\n", peerResp.Total)
+			// #4908 (C175-HC-073): the peer returns Total=-1 as a sentinel when
+			// a filter is active (it skips the full scan). Printing the raw
+			// sentinel showed "Total sessions: -1"; fall back to the number of
+			// sessions actually returned so a filtered command reports a
+			// meaningful count instead of a negative sentinel.
+			peerTotal := peerResp.Total
+			if peerTotal < 0 {
+				peerTotal = int32(len(peerResp.Sessions))
+			}
+			fmt.Printf("Total sessions: %d\n", peerTotal)
 		}
 	}
 	return nil
