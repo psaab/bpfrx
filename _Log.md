@@ -44827,3 +44827,33 @@ top.
     3928167816↔487396352).
   - **File(s)**: pkg/dataplane/compiler_nat.go, pkg/dataplane/compiler.go,
     pkg/dataplane/compiler_nat_counter_determinism_test.go, _Log.md
+- - **Timestamp**: 2026-07-10
+  **Action**: #5051 [BUG cli LOW] The REMOTE CLI `monitor security packet-drop` selector parser (`handleMonitorSecurityPacketDrop`, cmd/cli/monitor.go) was fail-open: value-taking selectors used `if i+1 < len(args)` (a missing value was silently ignored), source-port/destination-port/count used `if v, err := strconv.Atoi(...); err == nil` (a parse error silently ERASED the field to 0 = wildcard), and there was NO `default` arm for unknown tokens. So `monitor security packet-drop source-port abc` left `SourcePort=0`, opened the stream, and showed ALL drops with a SUCCESS exit — the server's `>65535` range guard never saw the erased-to-zero value. An incident-response filter must fail closed. Fix (mirror the strict LOCAL CLI parser in pkg/cli/monitor.go): a `needValue(i)` helper returns "<sel> requires a value" when a selector has no following token; source-port/destination-port now `strconv.ParseUint(_,10,16)` and reject non-numeric/>65535 ("invalid source-port %q: must be 0..65535"); count `strconv.Atoi` + range-checks 1..8192 ("invalid count %q: must be 1..8192"); a `default` arm rejects unknown tokens ("unknown packet-drop option: %s"). Every rejection RETURNS an error BEFORE `c.client.MonitorPacketDrop` is dialed, and the remote CLI dispatch (`cmd/cli/main.go` `dispatch`->`os.Exit(1)`) turns that into a non-zero exit — the typo now fails visibly instead of silently broadening telemetry. Valid selectors (source-prefix/destination-prefix/protocol/from-zone/interface/node still pass through as strings; the server validates prefixes/protocol/zone/iface and rejects bad ones — those were never part of the erase-to-zero fail-open, so no local re-validation was added). Fail-on-revert test (cmd/cli/monitor_packetdrop_5051_test.go): added a `MonitorPacketDrop` stub + `fakePacketDropStream` (Recv->io.EOF) to the shared `fakeBpfrxClient` (nontty_test.go gained `packetDropCalls`/`packetDropReq`) so a request that reaches the RPC completes with nil error; `TestRemotePacketDropStrictParse` drives 10 malformed inputs (non-numeric/out-of-range ports, missing values, non-numeric/zero/out-of-range count, unknown selector typo, unknown trailing token) asserting each returns an error with `packetDropCalls==0`, plus a positive case proving a full valid selector set reaches the RPC once with the parsed request intact (sport=1024 dport=443 tcp trust ge-0/0/0 count=10). RED-on-revert VERIFIED: `git stash` of cmd/cli/monitor.go (keeping the test) made all 10 reject subtests FAIL — each returned `err = <nil>` (the fail-open success path); restored -> all PASS. Validation: `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` exit 0; `go test ./cmd/cli/...` ok; gofmt clean. Docs: no change — the valid selector set is unchanged (docs/monitor-interface-research.md lists the same filter options); the fix only converts a silent unfiltered-stream into a clean rejection of a malformed/unknown selector. No cluster smoke (control-plane CLI parse path; no forwarding change).
+  **File(s)**: cmd/cli/monitor.go, cmd/cli/nontty_test.go, cmd/cli/monitor_packetdrop_5051_test.go, _Log.md
+
+## 2026-07-10 — #5050 SNMP IF-MIB unicast counters
+
+- **Timestamp**: 2026-07-10
+- **Action**: Fix IF-MIB ifHC{In,Out}UcastPkts populated with Linux TOTAL
+  packet counts. Extracted `deriveIfCounters` seam from `buildSNMPIfData`;
+  IN unicast now = RxPackets - Multicast (clamped), OUT unicast = TxPackets
+  (documented approximation — no TX class breakdown in rtnl_link_stats).
+  Added RED-on-revert tests. Updated pkg/snmp/README.md class-counter note.
+- **File(s)**: pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_reconcile_test.go, pkg/snmp/README.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: Fix flowexport batch max-depth high-water update race (#5048).
+  The `maxDepth` high-water update in `flowBatch.add()` ran OUTSIDE `b.mu`
+  as a plain load-then-store (`if depth > maxDepth.Load() { Store(depth) }`),
+  so two concurrent adders could interleave — B stores 2, A's later store
+  of 1 clobbers it — regressing the published high-water mark. Replaced with
+  a lock-free CAS-max loop (atomic `max(old, observed)`), consistent with the
+  sibling `dropped`/`handoffDropped` atomics that also update outside mu.
+  Added a test-only `maxDepthHook` seam and a deterministic barrier test that
+  forces the reverse-order store (RED-on-revert: MaxDepth regresses 2->1) plus
+  a 256-goroutine `-race` stress test. Docs: no contract change — maxDepth was
+  already documented as a monotonic high-water mark; this only makes it correct
+  under concurrency.
+- **File(s)**: pkg/flowexport/transport.go,
+  pkg/flowexport/maxdepth_race_5048_test.go
