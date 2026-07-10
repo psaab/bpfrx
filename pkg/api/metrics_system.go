@@ -257,6 +257,8 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 		st := c.srv.eventActionStatsFn()
 		ch <- prometheus.MustNewConstMetric(c.eventActionsCommitted,
 			prometheus.CounterValue, float64(st.Committed))
+		ch <- prometheus.MustNewConstMetric(c.eventActionsCommittedWithDebt,
+			prometheus.CounterValue, float64(st.CommittedWithDebt))
 		ch <- prometheus.MustNewConstMetric(c.eventActionsRejected,
 			prometheus.CounterValue, float64(st.Rejected))
 		ch <- prometheus.MustNewConstMetric(c.eventActionsRetried,

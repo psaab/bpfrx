@@ -666,7 +666,20 @@ func newCollector(srv *Server) *xpfCollector {
 		eventActionsCommitted: prometheus.NewDesc(
 			"xpf_event_actions_committed_total",
 			"Total event-options change-configuration remediation actions "+
-				"that committed successfully (#2157).",
+				"that committed successfully (#2157). INCLUDES the "+
+				"committed-with-apply-debt subset (#5063): the generation was "+
+				"promoted, is active, and the dataplane armed even when a "+
+				"best-effort subsystem stayed in debt.",
+			nil, nil,
+		),
+		eventActionsCommittedWithDebt: prometheus.NewDesc(
+			"xpf_event_actions_committed_with_debt_total",
+			"Subset of xpf_event_actions_committed_total whose commit "+
+				"promoted+armed the generation but left a BEST-EFFORT subsystem "+
+				"(networkd write / Kea restart / host-inbound nft) in debt "+
+				"(#5063). The change is LIVE — this is not a rejection — but a "+
+				"nonzero value means a committed remediation applied with a "+
+				"recoverable subsystem hiccup worth investigating.",
 			nil, nil,
 		),
 		eventActionsRejected: prometheus.NewDesc(
