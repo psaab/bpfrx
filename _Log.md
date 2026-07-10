@@ -1,3 +1,16 @@
+## 2026-07-09 — cli/monitor: gate + confine file-backed flow trace (#5038)
+
+- **Timestamp**: 2026-07-09
+  **Action**: `monitor security flow file <name>` let a view-only user make the
+  root daemon open/append/rotate an arbitrary existing /var/log inode. Gated the
+  file-backed verbs (`file`/`start`) at PermControl in `requiredPermission`
+  (new `monitorSubcommandIsSecurityFlowFileWrite`, prefix-resolved) so a
+  read-only class cannot trigger the root write; and confined traces to a
+  dedicated root-owned (0700) dir `/var/log/xpf-flow-trace` (openTraceFile now
+  MkdirAll's it) instead of the shared /var/log, so a filename can never land
+  on a system-log inode.
+  **File(s)**: pkg/cli/monitor.go, pkg/cli/permissions.go,
+  pkg/cli/monitor_flow_perm_5038_test.go, docs/system-login.md, _Log.md
 ## 2026-07-09 — api: CSRF/cross-site guard on REST mutations (#5055)
 
 - **Timestamp**: 2026-07-09

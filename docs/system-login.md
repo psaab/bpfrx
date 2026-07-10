@@ -249,15 +249,32 @@ every command is gated on the top-level word alone, but `monitor traffic`
 spawns a **root `tcpdump` live packet capture** on a data interface, so it
 is gated at the **control** level (the same bucket as the `request` /
 shell-out family) instead of the plain `view` level the rest of `monitor`
-(interface stats, security-flow trace) uses. A `read-only` / `config-viewer`
-class — intended only to VIEW config and status — is therefore **denied**
-`monitor traffic`; `operator` and `super-user` are allowed. This mirrors
-Junos, which gates `monitor traffic` behind the maintenance permission, not
-plain read-only. The exception lives in `requiredPermission`
-(`pkg/cli/permissions.go`) and resolves the subcommand with the same prefix
-matcher the dispatcher uses, so an abbreviated `monitor tr` is gated
-identically to the fully-spelled form and cannot bypass the gate. Other
-`monitor` subcommands and read-only `show` commands are unaffected.
+(interface stats, terminal-only `packet-drop`) uses. A `read-only` /
+`config-viewer` class — intended only to VIEW config and status — is
+therefore **denied** `monitor traffic`; `operator` and `super-user` are
+allowed. This mirrors Junos, which gates `monitor traffic` behind the
+maintenance permission, not plain read-only. The exception lives in
+`requiredPermission` (`pkg/cli/permissions.go`) and resolves the subcommand
+with the same prefix matcher the dispatcher uses, so an abbreviated `monitor
+tr` is gated identically to the fully-spelled form and cannot bypass the
+gate. Other `monitor` subcommands and read-only `show` commands are
+unaffected.
+
+**Privileged-subcommand exception — `monitor security flow {file,start}`
+(#5038).** The file-backed flow trace makes the **root daemon create, append
+to, and rotate a file on disk** (`openTraceFile` / `rotateTraceFile`,
+`pkg/cli/monitor.go`). At `view` level a `read-only` class could point that
+write at, and rotate-rename, an arbitrary existing regular inode — corrupting
+or displacing a privileged log. `monitor security flow file <name>` and
+`monitor security flow start` are therefore gated at the **control** level
+too (same `requiredPermission` prefix-resolved gate as `monitor traffic`), so
+a view-only class cannot trigger the root write at all. The status form (bare
+`monitor security flow`), `filter` (in-memory), `stop`, and the terminal-only
+`monitor security packet-drop` stay `view`. Defense in depth: traces are also
+confined to a dedicated root-owned (0700) directory `/var/log/xpf-flow-trace`
+rather than the shared `/var/log`, so even a control-level operator's trace
+filename can never resolve onto — or rotate/rename — a system-log inode such
+as `/var/log/auth.log`.
 
 **Filter option-injection hardening — `monitor traffic ... matching` (#4524).**
 The `matching <filter>` clause greedily consumes every token up to the next
