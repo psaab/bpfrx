@@ -35,7 +35,7 @@ re-created 0600 on the next commit.
 | Text rollback slots | `<config>.N` (e.g. `xpf.conf.1`) | 0600 | `store_commit.go saveRollbackFiles` |
 | Rescue config | `rescue.conf` | 0600 | `store_persist.go SaveRescueConfig` |
 | Config archives | `<archive-dir>/config-*.conf` | 0600 | `store_persist.go writeArchive` |
-| Audit journal (#4579 A4-02) | `.config.journal` | 0600 | `journal/journal.go Log` |
+| Audit journal (#4579 A4-02, migrate #5188) | `.config.journal`(+`.N`) | 0600 | `journal/journal.go Log` / `migratePermsLocked` |
 
 The `.configdb` and archive directories are created **0700** (they hold
 only secret-bearing files); the daemon owns them, so read-back is
@@ -48,6 +48,20 @@ that names a credential ("rotated the vpn psk to …") would otherwise be
 world-readable. Tightening it to match the rest of the config surface is
 cheap defense-in-depth; the daemon owns the file, so the history tail
 read is unaffected.
+
+Unlike the DB and text-copy files above — which `fsatomic` replaces the
+inode on every write, so a pre-#4056 0644 file is re-created 0600 on the
+next commit — the journal is **append-only**: `os.OpenFile` with
+`O_APPEND` reuses the existing inode and **ignores the 0600 perm arg**,
+so #4579 A4-02 only tightened NEW journals. An upgraded 0644 current
+file, and any rotated legacy `.N` segment (v1 fat lines carrying full
+configs incl. secrets), stayed world-readable with no migration pass.
+`journal.migratePermsLocked` (#5188) closes that gap: on first use (Log
+or Tail) it lstat's every owned segment (current + rotation siblings)
+and chmods any that is more permissive than owner-only down to 0600, and
+rotation re-asserts 0600 on the segment it renames. The pass only ever
+tightens (a stricter file is left alone), refuses to follow a symlink,
+and logs — rather than swallows — a chmod failure.
 
 ### Threat model — what 0600 + 0700 defends, and what it does not (#4056)
 
@@ -124,7 +138,7 @@ inline archive-site passwords).
   configstore directory. The "master-password" naming is an HKDF
   info string only — it isn't a user-supplied password.
 
-### At-rest crypto hardening notes (#4579 A4-05/A4-06, #4705)
+### At-rest crypto hardening notes (#4579 A4-05/A4-06, #4705, #5231)
 
 - **Split `system` stanza resolution (#4705).** "The tree declares a
   master-password" is decided by `masterPasswordPRF`, which scans **every**
@@ -142,6 +156,35 @@ inline archive-site passwords).
   downgrade warning below also keys off `masterPasswordPRF`, centralizing the
   resolution here fixes that path for the split-stanza case too (the warning
   now fires when a second-stanza master-password DB is read back as plaintext).
+- **Groups / apply-groups resolution (#5231).** The encrypt gate also covers a
+  `master-password` declared inside a `groups { ... }` body and pulled in with
+  `apply-groups <name>`. Such a master-password is **active at runtime** —
+  `compileConfigWithOpts` expands `apply-groups` (via `tree.ExpandGroups`)
+  *before* `compileSystem` reads `master-password`, so the effective
+  `cfg.System.MasterPassword` is set — but the at-rest write path runs on the
+  **unexpanded** persisted candidate tree (expansion happens only on a compile
+  clone). A resolver that scanned only top-level `system` stanzas therefore
+  missed the group-declared PRF and wrote `active.json` (IKE PSKs, WireGuard
+  keys, SNMP communities, user secrets) in plaintext despite encryption being
+  configured via a group. `masterPasswordPRF` now **recursively** walks every
+  `groups` block (`masterPasswordPRFInSubtree`) and treats **any**
+  `master-password { pseudorandom-function <X> }` descendant as
+  encryption-configured, regardless of the intervening node name. The recursion
+  is required — not cosmetic: a group's children can be authored under a `<*>`
+  wildcard node whose body Junos merges into the top-level `system` stanza at
+  apply-groups expansion (`walkGroupToContext` / `mergeNodes`,
+  `pkg/config/ast_groups.go`), so a scan keyed on a literal `system` child
+  (`systemBlocksOfNode`) MISSES the wildcard shape and still leaks plaintext
+  end-to-end. The invariant is now **any master-password anywhere under any
+  `groups` block triggers encryption**. This over-encrypts on a
+  defined-but-unapplied group (a harmless false-positive — encrypting when
+  unnecessary is always safe) and can never false-negative relative to runtime:
+  `apply-groups` only *copies* existing leaves, so a PRF active after expansion
+  physically exists somewhere under a group body here. The walk is read-only and
+  total (nil-safe, never errors on a malformed group) because the write path must
+  not fail. Reusing the compiler's `ExpandGroups` was rejected: it would mutate
+  the tree being persisted and pull `${node}`/undefined-group error handling into
+  that write path, for no security gain.
 - **Unexpected-plaintext warning (A4-06).** Every write path encrypts the
   body when the tree declares a master-password, so `readTreeMeta` reading
   a config back as *plaintext* while its tree still declares a

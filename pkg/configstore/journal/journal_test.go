@@ -557,6 +557,209 @@ func TestFileOfOnlyNewlines(t *testing.T) {
 	}
 }
 
+// TestMigratePreexistingCurrent0644 (#5188): a journal upgraded from a
+// pre-0600 build has a 0644 CURRENT inode. O_APPEND ignores the perm arg
+// on an existing inode, so only the first-use permission-repair pass can
+// tighten it. First Log must leave the current segment at 0600. Fails
+// (mode stays 0644) if the migration is reverted.
+func TestMigratePreexistingCurrent0644(t *testing.T) {
+	j := testJournal(t)
+	if err := os.WriteFile(j.path, []byte(`{"v":2,"action":"commit","detail":"old"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Defeat umask so the precondition is deterministic.
+	if err := os.Chmod(j.path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(j.path); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0644 {
+		t.Fatalf("precondition: want 0644, got %04o", fi.Mode().Perm())
+	}
+
+	mustLog(t, j, &Entry{Action: "commit", Detail: "new"})
+
+	fi, err := os.Stat(j.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("current journal not migrated to 0600: got %04o", fi.Mode().Perm())
+	}
+	// The migration must not corrupt content: both entries survive.
+	got, err := j.Tail(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Detail != "old" || got[1].Detail != "new" {
+		t.Fatalf("migration altered content: %+v", got)
+	}
+}
+
+// TestMigrateRotatedSegment0644 (#5188): a rotated legacy segment left
+// world-readable by an old build carries full v1 fat lines (secrets).
+// First use — here a Tail, proving the pass runs on the read path too —
+// must migrate every owned segment, current and rotated. Fails (mode
+// stays 0644) if the migration is reverted.
+func TestMigrateRotatedSegment0644(t *testing.T) {
+	j := testJournal(t)
+	if err := os.WriteFile(j.segmentPath(1),
+		[]byte(legacyV1Line(time.Now(), "commit", "legacy secret", 16)+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(j.segmentPath(1), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := j.Tail(50); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(j.segmentPath(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("rotated segment .1 not migrated to 0600: got %04o", fi.Mode().Perm())
+	}
+}
+
+// TestRotationRepairsSegmentMode (#5188): the rotation path itself must
+// re-assert 0600 on the segment it creates. maybeRotateLocked is called
+// directly to bypass Log's first-use migration, isolating the
+// rotation-repair. Fails (.1 stays 0644) if the rotation chmod is
+// reverted.
+func TestRotationRepairsSegmentMode(t *testing.T) {
+	j := testJournal(t, WithMaxSegmentBytes(1))
+	if err := os.WriteFile(j.path,
+		[]byte(`{"v":2,"action":"commit","detail":"x"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(j.path, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := j.maybeRotateLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rotated {
+		t.Fatal("expected rotation of an over-threshold current segment")
+	}
+
+	fi, err := os.Stat(j.segmentPath(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("rotation did not repair .1 to 0600: got %04o", fi.Mode().Perm())
+	}
+}
+
+// TestRotationProduces0600Segment (#5188): end-to-end through Log — a
+// single Log over a 0644 upgraded current triggers exactly one rotation,
+// and both the rotated .1 (the migrated legacy segment) and the freshly
+// created current must be 0600. A small threshold forces one rotation
+// only: with more rotations the current is re-created 0600 and the
+// fresh-inode masks a reverted repair, so this test deliberately keeps
+// .1 == the migrated seed. Fails if migration or rotation-repair
+// regresses.
+func TestRotationProduces0600Segment(t *testing.T) {
+	j := testJournal(t, WithMaxSegmentBytes(10), WithMaxSegments(2))
+	// Seed an upgraded 0644 current file already over the 10-byte
+	// threshold, then a single append rotates it exactly once.
+	if err := os.WriteFile(j.path,
+		[]byte(`{"v":2,"action":"commit","detail":"seed"}`+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(j.path, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	mustLog(t, j, &Entry{Action: "commit", Detail: "post-upgrade"})
+
+	fi, err := os.Stat(j.segmentPath(1))
+	if err != nil {
+		t.Fatalf("segment .1 missing: %v", err)
+	}
+	if fi.Mode().Perm() != 0600 {
+		t.Fatalf("rotated .1 (migrated seed) not 0600: got %04o", fi.Mode().Perm())
+	}
+	if fi, err := os.Stat(j.path); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode().Perm() != 0600 {
+		t.Fatalf("current not 0600: got %04o", fi.Mode().Perm())
+	}
+	// Both entries remain visible across the rotation.
+	got, err := j.Tail(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Detail != "seed" || got[1].Detail != "post-upgrade" {
+		t.Fatalf("rotation altered content: %+v", got)
+	}
+}
+
+// TestMigrateSkipsSymlink (#5188): the repair pass must lstat and refuse
+// to follow a symlink — it must never chmod an arbitrary target through
+// a symlinked journal path. The link target's mode must be untouched.
+func TestMigrateSkipsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "outside")
+	if err := os.WriteFile(target, []byte("unrelated 0644 file\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0644); err != nil {
+		t.Fatal(err)
+	}
+	jpath := filepath.Join(dir, ".config.journal")
+	if err := os.Symlink(target, jpath); err != nil {
+		t.Fatal(err)
+	}
+
+	j := New(jpath)
+	// Trigger first-use migration via a read; a read outcome is
+	// irrelevant, the security assertion is that the target is untouched.
+	_, _ = j.Tail(50)
+
+	if fi, err := os.Lstat(jpath); err != nil {
+		t.Fatal(err)
+	} else if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("test setup: journal path is not a symlink")
+	}
+	tfi, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tfi.Mode().Perm() != 0644 {
+		t.Fatalf("symlink target chmod'd through the link: got %04o", tfi.Mode().Perm())
+	}
+}
+
+// TestMigrateLeavesStricterModeAlone (#5188): the repair only ever
+// tightens. A 0400 (owner read-only) segment must NOT be loosened to
+// 0600.
+func TestMigrateLeavesStricterModeAlone(t *testing.T) {
+	j := testJournal(t)
+	if err := os.WriteFile(j.path,
+		[]byte(`{"v":2,"action":"commit","detail":"ro"}`+"\n"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(j.path, 0400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Tail(50); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(j.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0400 {
+		t.Fatalf("stricter mode was loosened: got %04o", fi.Mode().Perm())
+	}
+}
+
 // TestConcurrentLogTail: rotation under concurrent readers must never
 // duplicate or error (internal mutex). Run with -race.
 func TestConcurrentLogTail(t *testing.T) {

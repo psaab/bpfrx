@@ -113,6 +113,17 @@ func (s *Server) bgpHandler(w http.ResponseWriter, r *http.Request) {
 			// Periodically push bytes onto the wire so a very large table
 			// streams out instead of parking in buffers.
 			if (i+1)%1024 == 0 {
+				// Abort if the client has disconnected: a full internet
+				// table (900k+ routes) would otherwise keep formatting and
+				// JSON-escaping every remaining route and writing to a dead
+				// connection after r.Context() is cancelled — pure CPU/GC
+				// waste on a RAM-constrained firewall (#5232). Checked once
+				// per 1024-route chunk, so the abort is timely without any
+				// per-route cost. The un-flushed bufio tail and closing
+				// envelope are intentionally dropped: the connection is gone.
+				if r.Context().Err() != nil {
+					return
+				}
 				bw.Flush()
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
