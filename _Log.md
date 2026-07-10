@@ -44884,3 +44884,23 @@ top.
   pkg/cli/cli_request_system_issu_5039_test.go,
   pkg/grpcapi/server_diag_system_action.go,
   pkg/grpcapi/server_diag_issu_5039_test.go, docs/feature-gaps.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: Address HA reviewer on #5405 (#5039). (1) BLOCKER: partial-drain
+  blackhole — `upgradeHandoffComplete()` confirmed on the FIRST peer-primary RG
+  (any-one OR over peerGroups), so in the default multi-RG config a peer taking
+  over only RG0 (control-plane, no data VIP) while data RGs lagged/events were
+  dropped would print "drained — safe to stop" and blackhole the still-node0
+  data RG. Tightened to require EVERY non-disabled RG this node relinquished to
+  be peer-primary (skip disabled RGs; a zero-enabled-RG config never confirms).
+  (2) NIT: removed the copy-pasteable `systemctl stop ...` line from the
+  UNCONFIRMED report so a hurried operator can't paste it past the warning; the
+  stop/swap command is printed only on the confirmed path. Extended tests:
+  multi-RG partial (1/3 peer-primary → NOT confirmed, RED on any-one revert),
+  full (3/3 → confirmed), missing-peer-entry, disabled-RG skip, zero-enabled;
+  unconfirmed reports (cluster/cli/grpcapi) assert NO "systemctl stop".
+  `go test -race` green on the three packages.
+- **File(s)**: pkg/cluster/upgrade_drain.go,
+  pkg/cluster/upgrade_drain_test.go,
+  pkg/cli/cli_request_system_issu_5039_test.go,
+  pkg/grpcapi/server_diag_issu_5039_test.go

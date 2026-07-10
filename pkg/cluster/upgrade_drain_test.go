@@ -42,6 +42,11 @@ func TestUpgradeDrainReportUnconfirmed(t *testing.T) {
 		strings.Contains(joined, "traffic drained to peer") {
 		t.Errorf("unconfirmed report must NOT certify the drain completed:\n%s", joined)
 	}
+	// No copy-pasteable stop command on the unconfirmed path — a hurried
+	// operator must not be handed a stop command that blackholes traffic.
+	if strings.Contains(joined, "systemctl stop") {
+		t.Errorf("unconfirmed report must NOT include a systemctl stop command:\n%s", joined)
+	}
 }
 
 func newHandoffTestManager(t *testing.T) *Manager {
@@ -118,5 +123,109 @@ func TestWaitForUpgradeHandoffNotConfirmedWhenPeerDead(t *testing.T) {
 	defer cancel()
 	if m.WaitForUpgradeHandoff(ctx, 5*time.Millisecond) {
 		t.Fatal("handoff must NOT confirm when the peer is not alive")
+	}
+}
+
+// newMultiRGManager builds the default-shaped 3-RG cluster (RG0/RG1/RG2), all
+// relinquished to Secondary locally (post-ForceSecondary applied state).
+func newMultiRGManager(t *testing.T) *Manager {
+	t.Helper()
+	m := NewManager(0, 1)
+	for _, gid := range []int{0, 1, 2} {
+		m.groups[gid] = &RedundancyGroupState{GroupID: gid, State: StateSecondary}
+	}
+	m.peerAlive = true
+	return m
+}
+
+// TestWaitForUpgradeHandoffMultiRGPartialDrainNotConfirmed is the #5039
+// partial-drain guard: in a 3-RG config the peer has taken over only RG0 (e.g.
+// control-plane, no data VIP) while RG1/RG2 lag or their election events on
+// this node were dropped. The command MUST report NOT confirmed — an any-one
+// predicate would falsely certify the drain and blackhole the still-node0 data
+// RGs. RED if the predicate reverts to any-one.
+func TestWaitForUpgradeHandoffMultiRGPartialDrainNotConfirmed(t *testing.T) {
+	m := newMultiRGManager(t)
+	m.mu.Lock()
+	m.peerGroups[0] = PeerGroupState{GroupID: 0, State: StatePrimary}
+	m.peerGroups[1] = PeerGroupState{GroupID: 1, State: StateSecondary}
+	m.peerGroups[2] = PeerGroupState{GroupID: 2, State: StateSecondaryHold}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if m.WaitForUpgradeHandoff(ctx, 5*time.Millisecond) {
+		t.Fatal("handoff must NOT confirm when only some relinquished RGs are peer-primary")
+	}
+}
+
+// TestWaitForUpgradeHandoffMultiRGFullDrainConfirmed: only once the peer owns
+// primary for EVERY relinquished RG is the drain confirmed.
+func TestWaitForUpgradeHandoffMultiRGFullDrainConfirmed(t *testing.T) {
+	m := newMultiRGManager(t)
+	m.mu.Lock()
+	for _, gid := range []int{0, 1, 2} {
+		m.peerGroups[gid] = PeerGroupState{GroupID: gid, State: StatePrimary}
+	}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !m.WaitForUpgradeHandoff(ctx, 5*time.Millisecond) {
+		t.Fatal("handoff must confirm when ALL relinquished RGs are peer-primary")
+	}
+}
+
+// TestWaitForUpgradeHandoffMultiRGMissingPeerEntryNotConfirmed: a relinquished
+// RG with no peer-group entry at all (peer has not reported taking it) must
+// block confirmation just like a non-primary entry.
+func TestWaitForUpgradeHandoffMultiRGMissingPeerEntryNotConfirmed(t *testing.T) {
+	m := newMultiRGManager(t)
+	m.mu.Lock()
+	m.peerGroups[0] = PeerGroupState{GroupID: 0, State: StatePrimary}
+	m.peerGroups[1] = PeerGroupState{GroupID: 1, State: StatePrimary}
+	// RG2 intentionally has no peer entry.
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if m.WaitForUpgradeHandoff(ctx, 5*time.Millisecond) {
+		t.Fatal("handoff must NOT confirm while a relinquished RG has no peer-primary entry")
+	}
+}
+
+// TestWaitForUpgradeHandoffSkipsDisabledRG: a disabled RG is not part of the
+// drain and must not require a peer-primary entry.
+func TestWaitForUpgradeHandoffSkipsDisabledRG(t *testing.T) {
+	m := NewManager(0, 1)
+	m.groups[0] = &RedundancyGroupState{GroupID: 0, State: StateSecondary}
+	m.groups[1] = &RedundancyGroupState{GroupID: 1, State: StateDisabled}
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerGroups[0] = PeerGroupState{GroupID: 0, State: StatePrimary}
+	// RG1 is disabled — no peer entry required.
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if !m.WaitForUpgradeHandoff(ctx, 5*time.Millisecond) {
+		t.Fatal("disabled RG must be skipped; handoff should confirm on the enabled RG")
+	}
+}
+
+// TestWaitForUpgradeHandoffNoEnabledRGsNotConfirmed: a config with zero enabled
+// RGs has nothing to drain and must not falsely confirm.
+func TestWaitForUpgradeHandoffNoEnabledRGsNotConfirmed(t *testing.T) {
+	m := NewManager(0, 1)
+	m.groups[0] = &RedundancyGroupState{GroupID: 0, State: StateDisabled}
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerGroups[0] = PeerGroupState{GroupID: 0, State: StatePrimary}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if m.WaitForUpgradeHandoff(ctx, 5*time.Millisecond) {
+		t.Fatal("a config with no enabled RGs must not confirm a drain")
 	}
 }

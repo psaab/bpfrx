@@ -57,4 +57,7 @@ func TestSystemActionISSUWireFormat(t *testing.T) {
 	if !strings.Contains(unconfirmed, "Do NOT stop xpfd yet") {
 		t.Errorf("unconfirmed ISSU wire message must warn against stopping:\n%s", unconfirmed)
 	}
+	if strings.Contains(unconfirmed, "systemctl stop") {
+		t.Errorf("unconfirmed ISSU wire message must NOT include a systemctl stop command:\n%s", unconfirmed)
+	}
 }

@@ -31,27 +31,41 @@ const DefaultUpgradeHandoffTimeout = 10 * time.Second
 const DefaultUpgradeHandoffPoll = 200 * time.Millisecond
 
 // upgradeHandoffComplete reports whether the ISSU drain has actually taken
-// effect: the peer is alive and owns at least one RG as primary while THIS node
-// no longer owns any RG as primary. It is a read-only snapshot taken under a
-// single RLock so there is no torn view between "am I still primary" and "is
-// the peer primary".
+// effect: the peer is alive, this node no longer owns ANY non-disabled RG as
+// primary, and EVERY non-disabled RG this node relinquished is now owned by the
+// peer as primary. It is a read-only snapshot taken under a single RLock so
+// there is no torn view across the RG/peer maps.
+//
+// The all-RGs requirement is load-bearing (#5039): ForceSecondary drains every
+// RG, but the peer's takeover of each is asynchronous and its election events
+// on this node can be dropped. In the default multi-RG config, confirming on
+// the FIRST peer-primary RG (e.g. control-plane RG0, which carries no data VIP)
+// would report "drained — safe to stop" while a still-locally-relevant data RG
+// remains un-transferred — blackholing it. The drain is complete only when the
+// peer owns primary for every RG this node gave up.
 func (m *Manager) upgradeHandoffComplete() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if !m.peerAlive {
 		return false
 	}
-	for _, rg := range m.groups {
+	relinquished := 0
+	for gid, rg := range m.groups {
+		if rg.State == StateDisabled {
+			continue // administratively disabled — nothing to hand off
+		}
 		if rg.State == StatePrimary {
 			return false // still own an RG locally — not drained
 		}
-	}
-	for _, pg := range m.peerGroups {
-		if pg.State == StatePrimary {
-			return true // peer has taken over — handoff observed
+		relinquished++
+		pg, ok := m.peerGroups[gid]
+		if !ok || pg.State != StatePrimary {
+			return false // peer has not (yet) taken this RG as primary
 		}
 	}
-	return false
+	// Confirm only once every non-disabled RG we relinquished is peer-primary.
+	// A node with no enabled RGs has nothing to drain and must not confirm.
+	return relinquished > 0
 }
 
 // WaitForUpgradeHandoff blocks until the peer has acknowledged primary
@@ -107,12 +121,15 @@ func UpgradeDrainReport(handoffConfirmed bool) []string {
 			"  systemctl stop xpfd && <replace binary> && systemctl start xpfd",
 		}
 	}
+	// Deliberately NO copy-pasteable `systemctl stop` command here: a hurried
+	// operator could paste it despite the warning and blackhole traffic. The
+	// stop/swap instruction is printed ONLY on the confirmed path above.
 	return []string{
 		"Node has been requested secondary for all redundancy groups.",
 		"WARNING: peer takeover was NOT confirmed — traffic may NOT be drained.",
 		"Do NOT stop xpfd yet: this node may still be the only forwarding owner.",
 		"Verify with 'show chassis cluster status' that the peer is primary and",
-		"this node is secondary, then replace the binary and restart:",
-		"  systemctl stop xpfd && <replace binary> && systemctl start xpfd",
+		"this node is secondary for ALL redundancy groups before replacing the",
+		"binary and restarting the service.",
 	}
 }

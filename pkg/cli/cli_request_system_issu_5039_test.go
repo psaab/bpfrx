@@ -37,4 +37,8 @@ func TestPrintISSUDrainReportUnconfirmedWithholdsStopCertification(t *testing.T)
 	if !strings.Contains(out, "show chassis cluster status") {
 		t.Errorf("unconfirmed ISSU output must direct the operator to verify handoff:\n%s", out)
 	}
+	// No copy-pasteable stop command on the unconfirmed path (#5039 review).
+	if strings.Contains(out, "systemctl stop") {
+		t.Errorf("unconfirmed ISSU output must NOT include a systemctl stop command:\n%s", out)
+	}
 }
