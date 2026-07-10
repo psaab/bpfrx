@@ -701,3 +701,58 @@ func validateSamplingInstanceConflictsStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// validateSamplingInputRateStrict hard-rejects a `forwarding-options sampling
+// instance <name> input rate` below zero (#5244).
+//
+// The defect: compileSampling stored the parsed rate with no lower-bound check,
+// so a typo like `input rate -1` committed cleanly. A negative rate is a
+// fail-open: the 1-in-N export gate in the flow exporter
+// (ExportConfig.ShouldExport, pkg/flowexport) treats `SamplingRate > 1` as
+// false for a negative value, so the operator's intended 1-in-N ratio is
+// silently ignored (every eligible flow exports) — while the userspace
+// snapshot path defensively clamps `rate <= 0 -> 1` and the retired eBPF
+// compiler cast `uint32(InputRate)` would wrap it into a ~4.29e9 divisor. Any
+// way it lands, the configured rate is not what runs and the operator gets no
+// signal. The sibling port-mirroring path already rejects the same class
+// inline in compilePortMirroring ("input rate must not be negative"); sampling
+// was missed.
+//
+// `0` is VALID and preserved: it means "sample every packet" per Junos, matches
+// the port-mirroring sibling ("0 mirrors every packet"), and is the codebase
+// contract (SamplingInstance.InputRate doc, the `rate <= 0 -> 1` snapshot
+// clamp, and the `SamplingRate > 1` exporter gate all treat 0 as sample-all).
+// Only a strictly negative rate is rejected; there is no upper bound here
+// (the sibling has none either, and the snapshot builder already caps at the
+// Rust u32 max, #1977).
+//
+// Strict on commit / commit-check (hard reject so the typo is operator-
+// visible); lenient on load / peer-sync (the call site downgrades to a warning
+// via opts.lenientSamplingInputRate so an already-persisted or peer-synced
+// config authored by a pre-guard version still BOOTS — #1960; the snapshot
+// clamp keeps the running dataplane safe). Mirrors
+// validateSamplingInstanceConflictsStrict.
+func validateSamplingInputRateStrict(cfg *Config) error {
+	if cfg == nil || cfg.ForwardingOptions.Sampling == nil {
+		return nil
+	}
+	insts := cfg.ForwardingOptions.Sampling.Instances
+	// Deterministic instance order so the first-offender message is stable.
+	names := make([]string, 0, len(insts))
+	for name := range insts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		inst := insts[name]
+		if inst == nil {
+			continue
+		}
+		if inst.InputRate < 0 {
+			return fmt.Errorf("forwarding-options sampling instance %q: input "+
+				"rate must not be negative, got %d (a 1-in-N sampling rate must "+
+				"be >= 0; 0 samples every packet)", name, inst.InputRate)
+		}
+	}
+	return nil
+}

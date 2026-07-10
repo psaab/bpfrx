@@ -1537,6 +1537,32 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5244: sampling instance input-rate lower bound (compiler-side defense-
+	// in-depth). A negative `forwarding-options sampling instance <name> input
+	// rate` is a fail-open — the exporter's `SamplingRate > 1` gate is false
+	// for a negative value (every eligible flow exports, the ratio is ignored)
+	// and the retired eBPF cast wrapped it into a huge divisor. At strict
+	// operator commit this is already hard-rejected by the #1979 SchemaValidate
+	// typed-leaf gate (ValidateInteger(0, maxWireU32)), which runs before the
+	// compiler; `compileSampling` itself, however, stored the value unchecked,
+	// unlike the sibling `compilePortMirroring`, which carries its own inline
+	// guard. This gate closes that asymmetry so a negative rate reaching the
+	// compiler without the typed-leaf gate (tolerant load / peer-sync, direct
+	// CompileConfig callers, future refactors) is still caught. Strict on
+	// commit / commit-check; lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config still boots — #1960; the userspace
+	// snapshot builder clamps rate <= 0 -> 1, so the running dataplane is
+	// safe). `0` stays valid (sample every packet). Mirrors
+	// validateSamplingInstanceConflictsStrict.
+	if err := validateSamplingInputRateStrict(cfg); err != nil {
+		if opts.lenientSamplingInputRate {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("sampling instance input rate (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2217 Finding B: application-set member cross-reference. An
 	// `applications application-set <set>` member referencing neither a defined
 	// application (user / junos-* predefined) nor a defined nested
