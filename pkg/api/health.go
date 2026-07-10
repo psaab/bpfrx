@@ -20,9 +20,15 @@ func (s *Server) healthHandler(w http.ResponseWriter, _ *http.Request) {
 		h := s.compileHealthFn()
 		payload["compile_ever_succeeded"] = h.EverSucceeded
 		payload["compile_failure_count"] = h.FailureCount
-		if h.LastError != "" {
-			payload["compile_last_error"] = h.LastError
-		}
+		// #5031: /health is intentionally unauthenticated (authMiddleware
+		// exempts it unconditionally). The raw compile error string
+		// (h.LastError) is copied verbatim from the compiler and can carry
+		// file paths, config internals, or a secret echoed by a schema
+		// validator that quotes the submitted value — so it MUST NOT cross
+		// into this always-public payload. Surface only the presence +
+		// timestamp of a failure (a stable, non-secret signal); the full
+		// detail stays in the journal ("failed to compile dataplane" WARN/
+		// ERROR in daemon_health.go) for authenticated operators.
 		if h.LastErrorUnixSec != 0 {
 			payload["compile_last_error_unix"] = h.LastErrorUnixSec
 		}
@@ -43,9 +49,14 @@ func (s *Server) healthHandler(w http.ResponseWriter, _ *http.Request) {
 		if b.Status != "" {
 			payload["bootstrap_import_status"] = b.Status
 			payload["bootstrap_import_failed"] = b.Failed
-			if b.Error != "" {
-				payload["bootstrap_import_error"] = b.Error
-			}
+			// #5031: b.Error is the raw import failure string — a parse/commit
+			// error that quotes the offending day-0 config, which can include a
+			// submitted secret (e.g. a `system login` password echoed by a
+			// schema validator). Do NOT emit it on the unauthenticated /health
+			// surface. The status enum, failed flag, and timestamp are the
+			// stable signal; the full detail stays in the journal and in the
+			// in-band BOOTSTRAP_IMPORT_FAILED event (authenticated event stream
+			// / ring buffer, daemon_health.go recordBootstrapImport).
 			if b.UnixSec != 0 {
 				payload["bootstrap_import_unix"] = b.UnixSec
 			}

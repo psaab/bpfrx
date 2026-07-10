@@ -3,8 +3,107 @@ package api
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// TestHealthHandler_RedactsRawErrorDetail is the #5031 fail-on-revert guard.
+// /health is unconditionally unauthenticated (authMiddleware exempts it), so a
+// raw compile/bootstrap error string — which can quote a submitted secret
+// (e.g. a `system login` password echoed by a schema validator), a file path,
+// or topology — must never appear verbatim in the response body. Each subtest
+// seeds a distinctive secret sentinel into a leak site, hits the handler, and
+// asserts the raw response bytes never contain the sentinel while the health
+// SIGNAL is preserved. RED-on-revert: restoring payload["compile_last_error"]
+// or payload["bootstrap_import_error"] puts the sentinel back in the body and
+// fails the strings.Contains check.
+func TestHealthHandler_RedactsRawErrorDetail(t *testing.T) {
+	const secret = "S3CR3T-plaintext-password-5031-do-not-leak"
+
+	// Compile leak site: a degraded compile returns 503 early, so drive it in
+	// isolation (bootstrapImportFn nil).
+	t.Run("compile", func(t *testing.T) {
+		s := &Server{
+			compileHealthFn: func() CompileHealthSnapshot {
+				return CompileHealthSnapshot{
+					EverSucceeded:    false,
+					FailureCount:     4,
+					LastError:        "compile system login: bad password " + secret,
+					LastErrorUnixSec: 1_700_000_000,
+				}
+			},
+		}
+		rr := httptest.NewRecorder()
+		s.healthHandler(rr, httptest.NewRequest("GET", "/health", nil))
+
+		if rr.Code != 503 {
+			t.Errorf("status = %d, want 503 (compile degradation must still gate the probe)", rr.Code)
+		}
+		body := rr.Body.String()
+		if strings.Contains(body, secret) {
+			t.Fatalf("unauthenticated /health body leaked the raw compile error sentinel (#5031):\n%s", body)
+		}
+		data := unmarshalHealthData(t, body)
+		if _, present := data["compile_last_error"]; present {
+			t.Error("compile_last_error must be absent from the unauthenticated /health body")
+		}
+		if st, _ := data["status"].(string); st != "degraded" {
+			t.Errorf("status = %q, want \"degraded\" (signal preserved)", st)
+		}
+		if ts, _ := data["compile_last_error_unix"].(float64); ts == 0 {
+			t.Error("compile_last_error_unix should remain so a probe still sees a failure occurred")
+		}
+	})
+
+	// Bootstrap leak site: reached only when compile is not degraded, so leave
+	// compileHealthFn nil and drive the bootstrap-failed path (non-fatal, 200).
+	t.Run("bootstrap", func(t *testing.T) {
+		s := &Server{
+			bootstrapImportFn: func() BootstrapImportSnapshot {
+				return BootstrapImportSnapshot{
+					Status:  "import-failed",
+					Error:   "commit: parse error near " + secret,
+					UnixSec: 1_700_000_000,
+					Failed:  true,
+				}
+			},
+		}
+		rr := httptest.NewRecorder()
+		s.healthHandler(rr, httptest.NewRequest("GET", "/health", nil))
+
+		body := rr.Body.String()
+		if strings.Contains(body, secret) {
+			t.Fatalf("unauthenticated /health body leaked the raw bootstrap error sentinel (#5031):\n%s", body)
+		}
+		data := unmarshalHealthData(t, body)
+		if _, present := data["bootstrap_import_error"]; present {
+			t.Error("bootstrap_import_error must be absent from the unauthenticated /health body")
+		}
+		if st, _ := data["bootstrap_import_status"].(string); st != "import-failed" {
+			t.Errorf("bootstrap_import_status = %q, want \"import-failed\" (signal preserved)", st)
+		}
+		if failed, _ := data["bootstrap_import_failed"].(bool); !failed {
+			t.Error("bootstrap_import_failed should remain true (signal preserved)")
+		}
+		if ts, _ := data["bootstrap_import_unix"].(float64); ts == 0 {
+			t.Error("bootstrap_import_unix should remain so a probe still sees when the import failed")
+		}
+	})
+}
+
+// unmarshalHealthData decodes a /health response body and returns its Data map.
+func unmarshalHealthData(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var resp Response
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("data = %T, want map", resp.Data)
+	}
+	return data
+}
 
 // TestHealthHandler_DegradedWhenCompileNeverSucceeded pins #758: when
 // the daemon's dataplane compile has failed and never succeeded, /health
@@ -48,8 +147,15 @@ func TestHealthHandler_DegradedWhenCompileNeverSucceeded(t *testing.T) {
 	if ever, _ := data["compile_ever_succeeded"].(bool); ever {
 		t.Error("compile_ever_succeeded should be false")
 	}
-	if msg, _ := data["compile_last_error"].(string); msg == "" {
-		t.Error("compile_last_error should be populated")
+	// #5031: the raw compile error must NOT be echoed on the unauthenticated
+	// /health surface. The presence + timestamp of the failure is the stable
+	// signal instead. RED-on-revert: re-adding payload["compile_last_error"]
+	// fails this assertion.
+	if _, present := data["compile_last_error"]; present {
+		t.Error("compile_last_error must be absent from the unauthenticated /health body (#5031)")
+	}
+	if ts, _ := data["compile_last_error_unix"].(float64); ts == 0 {
+		t.Error("compile_last_error_unix should be populated so a probe still sees a failure occurred")
 	}
 }
 
@@ -241,8 +347,15 @@ func TestHealthHandler_ReportsBootstrapImportFailed(t *testing.T) {
 	if failed, _ := data["bootstrap_import_failed"].(bool); !failed {
 		t.Error("bootstrap_import_failed should be true")
 	}
-	if msg, _ := data["bootstrap_import_error"].(string); msg == "" {
-		t.Error("bootstrap_import_error should be populated")
+	// #5031: the raw bootstrap import error must NOT be echoed on the
+	// unauthenticated /health surface. The status enum + failed flag +
+	// timestamp are the stable signal instead. RED-on-revert: re-adding
+	// payload["bootstrap_import_error"] fails this assertion.
+	if _, present := data["bootstrap_import_error"]; present {
+		t.Error("bootstrap_import_error must be absent from the unauthenticated /health body (#5031)")
+	}
+	if ts, _ := data["bootstrap_import_unix"].(float64); ts == 0 {
+		t.Error("bootstrap_import_unix should be populated so a probe still sees when the import failed")
 	}
 }
 

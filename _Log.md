@@ -44894,3 +44894,21 @@ top.
   under concurrency.
 - **File(s)**: pkg/flowexport/transport.go,
   pkg/flowexport/maxdepth_race_5048_test.go
+
+## 2026-07-10 — #5031 redact raw error from unauthenticated /health
+
+- **Timestamp**: 2026-07-10
+- **Action**: Redact raw compile/bootstrap error strings from the
+  unauthenticated `/health` payload. `/health` is unconditionally exempt
+  from authMiddleware; `healthHandler` copied `h.LastError` into
+  `compile_last_error` and `b.Error` into `bootstrap_import_error`, both
+  verbatim parser/compiler strings that can carry file paths, config
+  internals, or a secret echoed by a schema validator. Removed both
+  fields; kept status/counters/timestamps/reason codes as the health
+  signal. Full detail remains in the journal (compile WARN/ERROR) and the
+  authenticated BOOTSTRAP_IMPORT_FAILED event. Added
+  TestHealthHandler_RedactsRawErrorDetail (secret-sentinel body scan,
+  RED-on-revert) and inverted the two prior assertions that required the
+  raw error to be present. Updated pkg/api/README.md /health contract.
+- **File(s)**: pkg/api/health.go, pkg/api/health_test.go,
+  pkg/api/README.md, _Log.md
