@@ -1056,11 +1056,21 @@ func (m *SurfaceAManager) reconcileScopeLocked(ctx context.Context, sc SurfaceAS
 	// record is owned yet → owned==false → the skip below does not fire and the
 	// new name is published. The old name's record (under the previous FQDN's
 	// scope key) is no longer in `desired`, so Reconcile Pass 2 withdraws it.
-	_, owned := m.state.get(sc.effectiveKey(), surfaceAIdentity, "")
+	ownedRec, owned := m.state.get(sc.effectiveKey(), surfaceAIdentity, "")
+	// Durable crash recovery (#5285): a PENDING owned record — its desired AddrText
+	// was write-ahead-saved but the wire add never CONFIRMED, because a crash struck
+	// between state.save and the provider I/O — is NOT settled. The unchanged-owned
+	// skip below MUST NOT suppress its recovery, or public DNS would stay at the OLD
+	// value forever while the appliance falsely reported the new one (and the old
+	// value's cleanup key would be lost). Force the scope refresh-due while pending
+	// so publishLocked re-runs the wire op and converges the provider to the desired
+	// value, threading the retained prior value as the replace/cleanup target. The
+	// pending bit is cleared by publishLocked's confirm-save once the add succeeds.
+	pendingRecovery := owned && ownedRec.PublishPending
 	// force (#3276): the operator `request system dynamic-dns update` latch makes
 	// the scope refresh-due regardless of the change-detection / forced-refresh
 	// floor, so the owner re-asserts the wire record now.
-	refreshDue := force || rt.lastPublished.IsZero() || now.Sub(rt.lastPublished) >= forced
+	refreshDue := force || pendingRecovery || rt.lastPublished.IsZero() || now.Sub(rt.lastPublished) >= forced
 	if owned && !changed && !refreshDue {
 		m.skipped++
 		slog.Debug("ddns surface-a: address unchanged and forced-refresh not due; skipping",
@@ -1189,14 +1199,26 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 	prevOwned, hadPrev := m.state.get(key, surfaceAIdentity, "")
 	prevAddr := ""
 	if hadPrev {
-		// The previously-published rdata lives in AddrText for a Surface A record
-		// (Address is the "" scope key, #2691 P2). Reading Address here always
-		// yielded "" so the "replaced record address" renumber log below never
-		// fired — a WAN renumber left no operational trace (#3734/M02). Prefer
-		// AddrText; fall back to Address only for a legacy lease-shape entry.
-		prevAddr = prevOwned.AddrText
-		if prevAddr == "" {
-			prevAddr = prevOwned.Address
+		if prevOwned.PublishPending {
+			// The current durable row is a not-yet-confirmed PENDING write-ahead
+			// (#5285): a prior crash struck between the write-ahead state.save and
+			// the wire add, so its AddrText holds the DESIRED value that never
+			// reached the wire. The value actually LIVE at the provider is the
+			// retained CONFIRMED prior (PriorAddrText). Thread the prior so the
+			// self-owned in-place replace targets xpf's real live value and cleans
+			// the stale record — never the phantom desired value AddrText carries.
+			prevAddr = prevOwned.PriorAddrText
+		} else {
+			// The previously-published rdata lives in AddrText for a Surface A
+			// record (Address is the "" scope key, #2691 P2). Reading Address here
+			// always yielded "" so the "replaced record address" renumber log below
+			// never fired — a WAN renumber left no operational trace (#3734/M02).
+			// Prefer AddrText; fall back to Address only for a legacy lease-shape
+			// entry.
+			prevAddr = prevOwned.AddrText
+			if prevAddr == "" {
+				prevAddr = prevOwned.Address
+			}
 		}
 	}
 
@@ -1229,8 +1251,15 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		m.noteOrphan(prevOwned, fp, orphanReasonEndpointChangedInPlace, now)
 	}
 
-	// Write-ahead the ownership intent BEFORE the wire add (#2662): a crash
-	// after the add finds the record owned and the next reconcile converges it.
+	// Write-ahead the ownership intent BEFORE the wire add (#2662 + #5285): the
+	// durable row records the DESIRED address as PENDING (PublishPending=true) and
+	// RETAINS the last-confirmed value (PriorAddrText) until the wire add confirms.
+	// This closes the save->wire crash window (#5285): a crash after this save but
+	// before/inside the wire add leaves a PENDING record (never a false-confirmed
+	// one), so restart recovery re-runs the provider I/O and still knows the prior
+	// value's cleanup key. The confirm-save AFTER a successful wire add clears the
+	// pending bit and releases the prior value (mirrors the DHCP-lease PTRPending
+	// idiom). The in-process rollback below still handles a NON-crash wire failure.
 	ow := ownedRecord{
 		Family:             familyInt(addr),
 		Identity:           surfaceAIdentity,
@@ -1241,6 +1270,8 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		TTL:                ttl,
 		AddrText:           addr.String(),
 		BackendFingerprint: fp,
+		PublishPending:     true,     // #5285: desired, not yet confirmed on the wire
+		PriorAddrText:      prevAddr, // #5285: last-confirmed value retained for replace + cleanup
 	}.withScope(key)
 	m.state.put(ow)
 	if err := m.state.save(); err != nil {
@@ -1320,6 +1351,25 @@ func (m *SurfaceAManager) publishLocked(ctx context.Context, sc SurfaceAScope, a
 		slog.Info("ddns surface-a: published record", "fqdn", rec.FQDN, "addr", addr.String())
 	}
 	m.upsertOK++
+
+	// CONFIRM the publish (#5285): the wire add SUCCEEDED, so mark the durable row
+	// CONFIRMED — clear the pending bit, make the desired address the confirmed one,
+	// and RELEASE the retained prior value (its cleanup key: the self-owned in-place
+	// replace already took the old rdata down at the server). This confirm-save runs
+	// AFTER the wire op, so a crash before it leaves the PENDING write-ahead intact
+	// and recovery re-runs the idempotent wire add rather than false-confirming a
+	// value that never reached the wire. A confirm-save failure is non-fatal: the
+	// record is still durably owned via the pending write-ahead, so the next
+	// reconcile re-runs the idempotent add to clear the flag (mirrors upsertLocked's
+	// confirm posture).
+	confirmed := ow
+	confirmed.PublishPending = false
+	confirmed.PriorAddrText = ""
+	m.state.put(confirmed)
+	if err := m.state.save(); err != nil {
+		slog.Warn("ddns surface-a: cannot persist confirmed ownership after publish (record still owned via pending write-ahead)",
+			"fqdn", rec.FQDN, "err", err)
+	}
 	return nil
 }
 
