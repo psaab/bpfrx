@@ -359,6 +359,21 @@ under the daemon's errgroup. Nothing else imports this package.
   next-hop or a `next_table` leaks nothing new and existing consumers reading
   `destination`/`next_hop`/`interface`/`preference`/`next_table` are
   unaffected. Pinned by `routes_disposition_5410_test.go`.
+- The same handler covers the FULL static-route set the CLI/gRPC `show route`
+  iterate, not just the global inet.0 table (#5439). It walks
+  `RoutingOptions.StaticRoutes` (inet.0), `RoutingOptions.Inet6StaticRoutes`
+  (inet6.0), AND every routing-instance's per-VRF `StaticRoutes` /
+  `Inet6StaticRoutes`, tagging each `RouteInfo` with its `family` (`inet` /
+  `inet6`) and Junos RIB `table` name (`inet.0` / `inet6.0`, or
+  `<instance>.inet.0` / `<instance>.inet6.0` for a VRF). Before #5439 it
+  iterated ONLY inet.0, so the REST view silently omitted every IPv6 static
+  route and every per-VRF static route — not even their destination — while
+  the CLI/gRPC rendered both families and every VRF. The disposition labeling
+  above applies uniformly across all four sources (an `appendStaticRoutes`
+  helper renders each table). The `family` / `table` fields are additive and
+  `omitempty`, the inet.0 rows still lead in their original order, so a legacy
+  consumer reading the pre-#5439 inet.0 subset positionally is unaffected.
+  Pinned by `routes_ipv6_vrf_5439_test.go`.
 - Long full-table read handlers must ABORT when the client disconnects
   (#5232/#5233). The REST server cancels `r.Context()` on disconnect, so a
   handler that walks a large structure has to sample `r.Context().Err()`

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/frr"
 )
 
@@ -32,59 +33,86 @@ func (s *Server) routesHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
+	// Iterate the SAME static-route sources the CLI/gRPC `show route` text
+	// walks (#5439): the global inet.0 + inet6.0 tables AND every
+	// routing-instance's per-VRF inet.0 + inet6.0 tables. Before #5439 this
+	// handler rendered only cfg.RoutingOptions.StaticRoutes (inet.0), so it
+	// silently omitted every IPv6 static route and every per-VRF static
+	// route — not even their destination — making the REST view inconsistent
+	// with the CLI/gRPC. Each route is tagged with its family and Junos RIB
+	// name so a consumer can tell inet from inet6 and the default table from
+	// a VRF. The inet.0 rows still come first, in their original order, so a
+	// legacy consumer's positional reads are unchanged.
 	var result []RouteInfo
-	for _, r := range cfg.RoutingOptions.StaticRoutes {
-		if r.NextTable != "" {
-			result = append(result, RouteInfo{
-				Destination: r.Destination,
-				NextTable:   r.NextTable,
-				Preference:  r.Preference,
-			})
+	result = appendStaticRoutes(result, cfg.RoutingOptions.StaticRoutes, "inet", "inet.0")
+	result = appendStaticRoutes(result, cfg.RoutingOptions.Inet6StaticRoutes, "inet6", "inet6.0")
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
 			continue
 		}
-		// Routes with no forwarding next-hop carry a disposition label so
-		// this view distinguishes reject (RTN_UNREACHABLE) from discard
-		// (RTN_BLACKHOLE) from directly-connected, matching how the CLI/gRPC
-		// `show route` text renders reject/discard (#5298/#5410). Reject and
-		// Discard are mutually exclusive; check them before the no-next-hop
-		// fallthrough since a reject/discard route also carries no NextHops.
-		if r.Reject {
-			result = append(result, RouteInfo{
-				Destination: r.Destination,
-				Disposition: "reject",
-				Preference:  r.Preference,
-			})
-			continue
-		}
-		if r.Discard {
-			result = append(result, RouteInfo{
-				Destination: r.Destination,
-				Disposition: "discard",
-				Preference:  r.Preference,
-			})
-			continue
-		}
-		if len(r.NextHops) == 0 {
-			result = append(result, RouteInfo{
-				Destination: r.Destination,
-				Disposition: "connected",
-				Preference:  r.Preference,
-			})
-			continue
-		}
-		for _, nh := range r.NextHops {
-			result = append(result, RouteInfo{
-				Destination: r.Destination,
-				NextHop:     nh.Address,
-				Interface:   nh.Interface,
-				Preference:  r.Preference,
-			})
-		}
+		result = appendStaticRoutes(result, ri.StaticRoutes, "inet", ri.Name+".inet.0")
+		result = appendStaticRoutes(result, ri.Inet6StaticRoutes, "inet6", ri.Name+".inet6.0")
 	}
 	if result == nil {
 		result = []RouteInfo{}
 	}
 	writeOK(w, result)
+}
+
+// appendStaticRoutes renders each static route in routes into one or more
+// RouteInfo rows tagged with the given family ("inet"/"inet6") and Junos RIB
+// table name, appending them to result. It applies the same disposition
+// labeling the CLI/gRPC `show route` text uses (#5298/#5410): a route with no
+// forwarding next-hop carries a "reject" (RTN_UNREACHABLE), "discard"
+// (RTN_BLACKHOLE), or "connected" (directly-connected) label, while a
+// next-table route carries next_table and a normal route emits one row per
+// next-hop. Reject and Discard are mutually exclusive and are checked before
+// the no-next-hop fallthrough since a reject/discard route also carries no
+// NextHops. Shared by the global inet.0/inet6.0 tables and every per-VRF
+// table so all four sources render identically.
+func appendStaticRoutes(result []RouteInfo, routes []*config.StaticRoute, family, table string) []RouteInfo {
+	for _, r := range routes {
+		if r == nil {
+			continue
+		}
+		base := RouteInfo{
+			Destination: r.Destination,
+			Preference:  r.Preference,
+			Family:      family,
+			Table:       table,
+		}
+		if r.NextTable != "" {
+			ri := base
+			ri.NextTable = r.NextTable
+			result = append(result, ri)
+			continue
+		}
+		if r.Reject {
+			ri := base
+			ri.Disposition = "reject"
+			result = append(result, ri)
+			continue
+		}
+		if r.Discard {
+			ri := base
+			ri.Disposition = "discard"
+			result = append(result, ri)
+			continue
+		}
+		if len(r.NextHops) == 0 {
+			ri := base
+			ri.Disposition = "connected"
+			result = append(result, ri)
+			continue
+		}
+		for _, nh := range r.NextHops {
+			ri := base
+			ri.NextHop = nh.Address
+			ri.Interface = nh.Interface
+			result = append(result, ri)
+		}
+	}
+	return result
 }
 
 func (s *Server) ospfHandler(w http.ResponseWriter, r *http.Request) {
