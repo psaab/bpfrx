@@ -81,6 +81,15 @@ func parseMonitorTrafficArgs(args []string) (iface, filter, count string, err er
 				}
 				rest = append(rest, args[j])
 			}
+			// `matching` with no filter expression — a trailing bare
+			// `matching`, or `matching` immediately followed by another
+			// grammar keyword (`matching count 20`) — previously left
+			// filter="" and launched an UNFILTERED privileged capture that
+			// exposes ALL interface traffic instead of the intended flow
+			// (#4883-A). Require an actual filter expression.
+			if len(rest) == 0 {
+				return "", "", "", fmt.Errorf("monitor traffic: 'matching' requires a filter expression")
+			}
 			i += len(rest)
 			filter = stripSurroundingQuotes(strings.Join(rest, " "))
 		case "count":
@@ -108,6 +117,14 @@ func parseMonitorTrafficArgs(args []string) (iface, filter, count string, err er
 			if n < 0 || n > 8192 {
 				return "", "", "", fmt.Errorf("monitor traffic: 'count' must be 0 (unlimited) or 1..8192, got %q", count)
 			}
+		default:
+			// Any token that is neither a grammar keyword nor a value
+			// consumed by one is a typo/stray token. A mistyped predicate
+			// like `matchng tcp port 443` used to hit no switch arm and be
+			// silently discarded, dropping the filter and starting an
+			// UNFILTERED capture (#4883-A). Reject it with a clear error
+			// instead of broadening the capture.
+			return "", "", "", fmt.Errorf("monitor traffic: unrecognized token %q", args[i])
 		}
 	}
 	return iface, filter, count, nil
