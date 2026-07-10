@@ -126,6 +126,15 @@ const (
 	actionDeny   = 0
 	actionPermit = 1
 	actionReject = 2
+	// actionNotApplicable flags the binary-log action byte on a SESSION_CLOSE,
+	// which carries no forwarding decision. Its wire action byte is
+	// intentionally 0, which the raw encoding would stamp as "deny" (actionDeny)
+	// and mislead binary forensic consumers into reading a normal close as a
+	// drop (#4914). The standard and structured text formatters OMIT the action
+	// field on a close (#2513); the fixed-shape binary record cannot omit a
+	// field, so it carries this explicit "not applicable" sentinel instead of a
+	// bogus 0.
+	actionNotApplicable = 0xFF
 )
 
 const (
@@ -686,13 +695,22 @@ func (er *EventReader) logEvent(data []byte) {
 		// policy_id=0 for every session close. rec.PolicyID is the same field
 		// PolicyName resolution and the RT_FLOW_SESSION_CLOSE record already
 		// use, so this keeps the slog line consistent with them.
+		//
+		// #4914: OMIT action on a close. The wire action byte is intentionally
+		// 0 for a session close, so actionName(evt.Action) renders "deny" —
+		// logging it here classified every normal termination as a drop and
+		// drove false drop alerts / broken correlation. The standard and
+		// structured RT_FLOW_SESSION_CLOSE lines already omit action (#2513);
+		// this generic slog branch was the residual sink still emitting it.
+		// Carry the close reason instead, which is what the structured line
+		// surfaces.
 		slog.Info("firewall event",
 			"type", eventName,
 			"src", srcStr,
 			"dst", dstStr,
 			"proto", protoStr,
-			"action", actionStr,
 			"policy_id", rec.PolicyID,
+			"reason", rec.CloseReason,
 			"ingress_zone", inZone,
 			"egress_zone", outZone,
 			"session_packets", rec.SessionPkts,
@@ -1250,7 +1268,8 @@ const (
 //	  [3:5]     Total record length (uint16 big-endian, includes header)
 //	  [5]       EventType
 //	  [6]       Protocol number
-//	  [7]       Action (0=deny, 1=permit, 2=reject)
+//	  [7]       Action (0=deny, 1=permit, 2=reject, 255=n/a for a
+//	            SESSION_CLOSE, which carries no forwarding decision)
 //	  [8]       AddrFamily (2=IPv4, 10=IPv6)
 //	  [9]       Severity (syslog level)
 //	  [10:18]   Timestamp (uint64 LE, Unix nanoseconds)
@@ -1296,7 +1315,16 @@ func formatBinaryRecord(evt *rawEvent, rec *EventRecord, severity int, closeReas
 	// Event fields
 	buf[5] = evt.EventType
 	buf[6] = evt.Protocol
-	buf[7] = evt.Action
+	// #4914: a SESSION_CLOSE carries no forwarding decision — its wire action
+	// byte is intentionally 0, which as a raw actionDeny would tell a binary
+	// forensic consumer that a normal termination was a drop. Flag it "not
+	// applicable" so tooling does not attribute closes to a deny. Every other
+	// event type keeps its real action byte.
+	if evt.EventType == eventTypeSessionClose {
+		buf[7] = actionNotApplicable
+	} else {
+		buf[7] = evt.Action
+	}
 	buf[8] = evt.AddrFamily
 	buf[9] = uint8(severity)
 	// Timestamp
@@ -1307,8 +1335,14 @@ func formatBinaryRecord(evt *rawEvent, rec *EventRecord, severity int, closeReas
 	// Ports (big-endian, as parsed from BPF)
 	binary.BigEndian.PutUint16(buf[50:52], evt.SrcPort)
 	binary.BigEndian.PutUint16(buf[52:54], evt.DstPort)
-	// PolicyID
-	binary.LittleEndian.PutUint32(buf[54:58], evt.PolicyID)
+	// PolicyID. #4914: encode rec.PolicyID, not evt.PolicyID. They match for
+	// every non-close frame, but on a SESSION_CLOSE evt.PolicyID was zeroed by
+	// logEvent (#2853 repurposes the [44:48] slot for the created-subsec-nanos)
+	// and only rec.PolicyID carries the admitting policy from the trailing
+	// [136:140] slot (#3056). Encoding evt.PolicyID stamped policy_id=0 on every
+	// binary session-close record; rec.PolicyID matches the resolved PolicyName
+	// and the standard/structured RT_FLOW_SESSION_CLOSE lines.
+	binary.LittleEndian.PutUint32(buf[54:58], rec.PolicyID)
 	// Zone IDs
 	binary.LittleEndian.PutUint16(buf[58:60], evt.IngressZone)
 	binary.LittleEndian.PutUint16(buf[60:62], evt.EgressZone)

@@ -1,3 +1,27 @@
+## 2026-07-09 — #4914 logging: SESSION_CLOSE binary record + generic slog no longer report policy_id=0 / action=deny
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4914 (telemetry correctness; residual of #4796). On a
+  SESSION_CLOSE, logEvent zeroes evt.PolicyID (#2853 repurposes [44:48] for
+  the created-subsec-nanos) and only rec.PolicyID carries the admitting
+  policy from [136:140] (#3056); the wire action byte is intentionally 0.
+  Two sinks still misrepresented the close: (1) formatBinaryRecord encoded
+  evt.PolicyID (0) and evt.Action (0 -> actionDeny), so every binary
+  session-close record read policy_id=0 + action=deny; (2) the generic slog
+  "firewall event" close branch still emitted action=actionName(0)="deny".
+  Fixed formatBinaryRecord to encode rec.PolicyID and to flag the close
+  action byte actionNotApplicable (0xFF, documented sentinel — the fixed-
+  shape record cannot omit a field like the text formatters do). Fixed the
+  slog close line to omit action and carry the close reason instead, matching
+  the standard/structured lines (#2513). Scoped to SESSION_CLOSE (the
+  SESSION_OPEN binary action byte is locked by an existing unit test and is
+  out of this issue's scope). Added a live parity fixture through
+  ProcessRawEvent asserting the admitting policy id + no-deny across buffer,
+  callback, slog, standard, structured, and binary sinks (RED on revert of
+  any of the three production changes). Updated TestFormatBinaryRecord_Basic
+  to populate rec.PolicyID (the field the record now reads).
+  **File(s)**: pkg/logging/ringbuf.go, pkg/logging/binary_test.go,
+  pkg/logging/session_close_binary_slog_4914_test.go
 ## 2026-07-09 — #5007 userspace HA: resolve forward+reverse session-sync pair against ONE snapshot (close the m.mu-drop drift window)
 
 - **Timestamp**: 2026-07-09
