@@ -174,6 +174,17 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 // Run starts the daemon and blocks until shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.daemonCtx = ctx
+	// #5308: guarantee the two daemonCtx-bound background loops (policy
+	// scheduler + RPM probe-pin retry) are cancelled + joined even when Run
+	// returns WITHOUT reaching runShutdownSequence — an early-error return
+	// (config load / manager init / dataplane setup) or an embedded library
+	// caller whose ctx cancels. On the normal path runShutdownSequence has
+	// already stopped both (idempotent / nil-safe), so these defers are no-ops
+	// there; they only do real work on the return paths that skip it. Both loops
+	// may be started during initManagers' boot apply below, so registering the
+	// defers here covers every subsequent return.
+	defer d.stopPinRetryLoop()
+	defer d.stopPolicySchedulerLoop()
 	d.startPolicySchedulerLoopLocked()
 
 	// Wrap the default slog handler to support system syslog forwarding.
@@ -822,6 +833,21 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	// Cancel context to stop background goroutines, then wait for them.
 	stop()
 	wg.Wait()
+
+	// #5308: cancel + join the two long-lived loops that bind to d.daemonCtx
+	// (never cancelled in production) rather than the run WaitGroup above, so
+	// wg.Wait does NOT cover them. Both call into subsystems torn down further
+	// below and therefore MUST be stopped first: the policy scheduler
+	// republishes schedule state through the dataplane runtime
+	// (UpdatePolicyScheduleState — closed by dp.Close/dp.Teardown), and the RPM
+	// probe-pin retry loop runs routing-pin syscalls through the routing/FRR
+	// manager (stopped by frr.Stop / routing teardown). Cancelling + joining
+	// here guarantees no late scheduler tick runs against a closed runtime and
+	// no late pin-retry tick runs a syscall after routing is gone. Both helpers
+	// are idempotent / nil-safe (a never-started loop joins cleanly), so this is
+	// also the safety-net for the Run()-returns path via the defers in Run.
+	d.stopPolicySchedulerLoop()
+	d.stopPinRetryLoop()
 
 	// Stop the SNMP agent + link-state trap monitor (#3967). Their goroutines
 	// bind to d.daemonCtx (never cancelled in production) rather than the run

@@ -138,12 +138,49 @@ func writePolicySchedulerHashString(h interface{ Write([]byte) (int, error) }, s
 }
 
 func (d *Daemon) startPolicySchedulerLoopLocked() {
-	if d.daemonCtx == nil || d.scheduler == nil || d.schedulerCancel != nil {
+	// schedulerStopped latches at shutdown (stopPolicySchedulerLoop): once the
+	// loop has been cancelled + joined, a late reconcile must NOT start a new
+	// generation — that Add would race the shutdown's schedulerWg.Wait (#5308).
+	if d.schedulerStopped || d.daemonCtx == nil || d.scheduler == nil || d.schedulerCancel != nil {
 		return
 	}
 	ctx, cancel := context.WithCancel(d.daemonCtx)
 	d.schedulerCancel = cancel
-	go d.scheduler.Run(ctx)
+	// Capture the scheduler pointer at start time (a config-replace reconcile
+	// may reassign d.scheduler) and track the goroutine on schedulerWg so
+	// shutdown can join every generation after cancelling.
+	sched := d.scheduler
+	d.schedulerWg.Add(1)
+	go func() {
+		defer d.schedulerWg.Done()
+		sched.Run(ctx)
+	}()
+}
+
+// stopPolicySchedulerLoop cancels the policy-scheduler Run() goroutine and
+// joins it. It is called from the shutdown sequence BEFORE the dataplane
+// runtime the scheduler republishes into (UpdatePolicyScheduleState) is torn
+// down, so a late scheduler tick can never run against a closed runtime
+// (#5308). The applySem is acquired only to read+cancel schedulerCancel under
+// the same lock that guards it, then RELEASED before the join: an in-flight
+// tick blocked in publishPolicyScheduleState on applySem.Acquire must be able
+// to complete so the goroutine can observe ctx.Done() — holding applySem
+// across the join would deadlock. Idempotent / nil-safe: a never-started loop
+// (feature disabled, or already cancelled by a config-replace) joins cleanly.
+func (d *Daemon) stopPolicySchedulerLoop() {
+	if d.applySem != nil {
+		_ = d.applySem.Acquire(context.Background(), 1)
+	}
+	d.schedulerStopped = true
+	cancel := d.schedulerCancel
+	d.schedulerCancel = nil
+	if d.applySem != nil {
+		d.applySem.Release(1)
+	}
+	if cancel != nil {
+		cancel()
+	}
+	d.schedulerWg.Wait()
 }
 
 // publishPolicyScheduleState is the scheduler's updateFn. It returns a
