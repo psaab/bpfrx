@@ -2,6 +2,7 @@ package snmp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -322,15 +323,98 @@ func (a *Agent) hasV3Users() bool {
 	return len(a.v3Users) > 0
 }
 
-// initEngine generates a deterministic engine ID from the hostname.
+// SNMPv3 authoritative EngineID construction (RFC 3411 §5).
+//
+// RFC 3411 constrains SnmpEngineID to 5..32 octets. An EngineID outside that
+// range is rejected by standards-compliant managers, which breaks every
+// SNMPv3 discovery, USM key localization, auth check, and response encoding
+// that depends on the agent's identity (v2c is unaffected). The historical
+// construction (a 6-octet header followed by the FULL, unbounded OS hostname)
+// silently produced an INVALID >32-octet EngineID for any hostname longer than
+// 26 bytes (#4917).
+const (
+	// snmpEngineIDMaxLen is the RFC 3411 SnmpEngineID upper bound (octets).
+	snmpEngineIDMaxLen = 32
+
+	// engineIDFormatText (RFC 3411 §5, format 3 "administratively assigned
+	// text") labels the payload as TEXT. Kept for the short-hostname form so
+	// the EngineID stays bit-identical to the pre-#4917 construction and
+	// already-localized USM keys / manager caches on deployed appliances
+	// remain valid.
+	engineIDFormatText = 0x04
+
+	// engineIDFormatOctets (RFC 3411 §5, format 4 "administratively assigned
+	// octets") labels the payload as OCTETS. Used for the hashed long-hostname
+	// form so the format octet honestly describes a binary (non-text) SHA-256
+	// payload — 0x04 would mislabel the hash as text.
+	engineIDFormatOctets = 0x05
+)
+
+// engineIDPrefix is the 5-octet enterprise header: the RFC 3411 variable-length
+// format flag (high bit 0x80 set on the first octet) over private enterprise
+// number 0x000186a3. The sixth octet — the format selector — is appended per
+// form (text vs octets) by buildEngineID. Read-only after init; buildEngineID
+// copies it (append from a fresh backing array) and never mutates it.
+var engineIDPrefix = []byte{0x80, 0x00, 0x01, 0x86, 0xa3}
+
+// buildEngineID derives a deterministic, RFC 3411-valid (5..32 octet)
+// authoritative SNMPv3 EngineID from the OS hostname. The EngineID must be
+// stable across restarts because a manager caches our (engineBoots, engineTime)
+// and localizes its USM keys against it.
+//
+//   - Short hostname (header + hostname <= 32 octets, i.e. len(hostname) <= 26):
+//     the historical TEXT form engineIDPrefix || 0x04 || hostname, returned
+//     BIT-IDENTICAL to the pre-#4917 construction. This is the migration guard:
+//     every currently-working appliance keeps the exact EngineID it localized
+//     its keys against, so no manager cache or USM key is invalidated.
+//   - Long hostname (> 26 octets): the text form would exceed 32 octets and be
+//     an INVALID EngineID (rejected by compliant managers — the #4917 bug). It
+//     is replaced by a deterministic hashed identity engineIDPrefix || 0x05 ||
+//     sha256(hostname)[:26], exactly 32 octets. SHA-256 over the FULL hostname
+//     is deterministic (same hostname -> same EngineID every boot, no
+//     randomness/timestamp) and collision-resistant (distinct long hostnames ->
+//     distinct EngineIDs). The 0x05 (octets) format honestly labels the binary
+//     payload.
+//
+// The result is 5..32 octets for ALL inputs, including empty (6 octets) and
+// multi-kilobyte (32 octets) hostnames.
+func buildEngineID(hostname string) []byte {
+	headerLen := len(engineIDPrefix) + 1 // enterprise prefix + one format octet
+	if len(hostname) <= snmpEngineIDMaxLen-headerLen {
+		id := make([]byte, 0, headerLen+len(hostname))
+		id = append(id, engineIDPrefix...)
+		id = append(id, engineIDFormatText)
+		id = append(id, hostname...)
+		return id
+	}
+	sum := sha256.Sum256([]byte(hostname))
+	hashLen := snmpEngineIDMaxLen - headerLen // 26 -> total exactly 32 octets
+	id := make([]byte, 0, snmpEngineIDMaxLen)
+	id = append(id, engineIDPrefix...)
+	id = append(id, engineIDFormatOctets)
+	id = append(id, sum[:hashLen]...)
+	return id
+}
+
+// initEngine generates a deterministic, RFC 3411-bounded engine ID from the
+// hostname (see buildEngineID). A hostname longer than 26 octets no longer
+// yields an invalid >32-octet EngineID (#4917); the hashed identity is used
+// instead, and the substitution is logged once so the operator sees why the
+// EngineID is not the plain hostname.
 func (a *Agent) initEngine() {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "xpf"
 	}
-	// RFC 3411 format: enterprise(4) + text(3) = 0x80 | len, enterprise OID, format byte, text.
-	// Simplified: use 0x80 0x00 0x00 0x00 0x01 (enterprise=1) + 0x04 (text) + hostname bytes.
-	a.engineID = append([]byte{0x80, 0x00, 0x01, 0x86, 0xa3, 0x04}, []byte(hostname)...)
+	a.engineID = buildEngineID(hostname)
+	if len(hostname) > snmpEngineIDMaxLen-(len(engineIDPrefix)+1) {
+		// One-time state event (allowed by the logging rules — not in a loop):
+		// the text EngineID would exceed the RFC 3411 32-octet cap, so a stable
+		// hashed identity is used. This is the startup signal the #4917 issue
+		// noted was missing.
+		slog.Info("SNMP: hostname exceeds the RFC 3411 32-octet text EngineID cap; using a stable hashed SNMPv3 EngineID",
+			"hostname_len", len(hostname), "engineid_len", len(a.engineID))
+	}
 	a.engineBoots = a.loadAndIncrementEngineBoots()
 }
 
