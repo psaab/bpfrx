@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/psaab/xpf/pkg/dhcp"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -12,11 +13,21 @@ func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*
 	if s.dhcp == nil {
 		return &pb.GetDHCPLeasesResponse{}, nil
 	}
+	return buildDHCPLeasesResponse(s.dhcp.Leases(), s.dhcp.DelegatedPrefixes()), nil
+}
 
+// buildDHCPLeasesResponse aggregates DHCP address leases (IA_NA) and IPv6
+// delegated prefixes (IA_PD) into the GetDHCPLeases response. A delegated
+// prefix is attached to the matching inet6 address lease when one exists;
+// otherwise it is surfaced as a standalone PD-only lease entry so a
+// prefix-delegation-only interface (IA_PD present, no IA_NA address) still
+// reports its delegated prefix (#5382). Extracted as a pure function so the
+// aggregation is unit-testable without a live dhcp.Manager.
+func buildDHCPLeasesResponse(leases []*dhcp.Lease, pds []dhcp.DelegatedPrefix) *pb.GetDHCPLeasesResponse {
 	resp := &pb.GetDHCPLeasesResponse{}
-	for _, l := range s.dhcp.Leases() {
+	for _, l := range leases {
 		family := "inet"
-		if l.Family == 6 {
+		if l.Family == dhcp.AFInet6 {
 			family = "inet6"
 		}
 		info := &pb.DHCPLeaseInfo{
@@ -39,7 +50,7 @@ func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*
 	}
 
 	// Add delegated prefixes
-	for _, dp := range s.dhcp.DelegatedPrefixes() {
+	for _, dp := range pds {
 		pdInfo := &pb.DHCPDelegatedPrefix{
 			Interface:         dp.Interface,
 			Prefix:            dp.Prefix.String(),
@@ -47,7 +58,7 @@ func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*
 			ValidLifetime:     dp.ValidLifetime.String(),
 			Obtained:          dp.Obtained.Format(time.RFC3339),
 		}
-		// Attach PD to the matching lease, or add to first inet6 lease
+		// Attach PD to the matching inet6 lease if one exists.
 		attached := false
 		for _, lease := range resp.Leases {
 			if lease.Interface == dp.Interface && lease.Family == "inet6" {
@@ -56,8 +67,13 @@ func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*
 				break
 			}
 		}
-		if !attached && len(resp.Leases) > 0 {
-			// Create a standalone lease entry for PD-only
+		if !attached {
+			// No inet6 address lease to attach to — surface the prefix as a
+			// standalone PD-only lease entry. This must fire even when there
+			// are no IA_NA leases at all (resp.Leases empty), otherwise a
+			// prefix-delegation-only interface reports an empty lease table
+			// (#5382). A subsequent PD for the same interface attaches to the
+			// standalone entry created here (it now matches the inner loop).
 			resp.Leases = append(resp.Leases, &pb.DHCPLeaseInfo{
 				Interface:         dp.Interface,
 				Family:            "inet6",
@@ -67,7 +83,7 @@ func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*
 		}
 	}
 
-	return resp, nil
+	return resp
 }
 
 func (s *Server) GetDHCPClientIdentifiers(_ context.Context, _ *pb.GetDHCPClientIdentifiersRequest) (*pb.GetDHCPClientIdentifiersResponse, error) {
