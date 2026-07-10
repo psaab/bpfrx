@@ -114,8 +114,9 @@ type Monitor struct {
 	active  map[string]*alarmState
 	started bool // run() launched (guards Stop against an unstarted monitor)
 
-	stop chan struct{}
-	done chan struct{}
+	stopOnce sync.Once // guards close(stop) against concurrent Stop callers
+	stop     chan struct{}
+	done     chan struct{}
 }
 
 // New constructs a Monitor. sample and emit are dependency-injected so the
@@ -175,12 +176,11 @@ func (m *Monitor) Stop() {
 	m.mu.Lock()
 	started := m.started
 	m.mu.Unlock()
-	select {
-	case <-m.stop:
-		// already stopped
-	default:
-		close(m.stop)
-	}
+	// sync.Once, not a select/default check: the select-default close is racy —
+	// two concurrent Stop callers can both observe the channel open, both fall
+	// to default, and both call close(m.stop), panicking on the second close
+	// (#4909). Once serializes the close so exactly one caller performs it.
+	m.stopOnce.Do(func() { close(m.stop) })
 	if started {
 		<-m.done // join the run() goroutine
 	}
