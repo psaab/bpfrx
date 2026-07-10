@@ -55,6 +55,14 @@ func main() {
 	}
 
 	if len(os.Args) > 1 && os.Args[1] == "cleanup" {
+		// #5322: cleanup takes NO flags or positional arguments; like #4869's
+		// `xpfd upgrade`, a stray operand (e.g. a typo'd path) is a hard usage
+		// error, not silently ignored while cleanup still GCs all pinned
+		// dataplane state and clears the FRR managed routes.
+		if err := parseCleanupArgs(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup: %v\n", err)
+			os.Exit(1)
+		}
 		if err := dataplane.Cleanup(); err != nil {
 			fmt.Fprintf(os.Stderr, "cleanup BPF: %v\n", err)
 			os.Exit(1)
@@ -332,4 +340,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "xpfd: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// parseCleanupArgs validates the operands of `xpfd cleanup`. The verb takes no
+// flags and no positional arguments; #5322 rejects any leftover token (mirroring
+// #4869's `xpfd upgrade` guard) so a mistyped invocation is a hard usage error
+// rather than a silent full teardown of pinned dataplane state + FRR managed
+// routes. Extracted so the leftover-arg rejection is unit-testable without the
+// os.Exit / real-Cleanup side effects of the dispatch.
+func parseCleanupArgs(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("unexpected argument(s) %v; "+
+			"usage: xpfd cleanup (this verb takes no arguments)", args)
+	}
+	return nil
 }

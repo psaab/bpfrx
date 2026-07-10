@@ -19,6 +19,47 @@ import (
 //
 // Exit codes: 0 success, 1 error.
 func runSeedRuntimeSubcommand(args []string) {
+	flags, err := parseSeedRuntimeArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "seed-runtime: %v\n", err)
+		os.Exit(1)
+	}
+	if flags.capCheck {
+		fmt.Println("seed-runtime supported")
+		return
+	}
+
+	if err := upruntime.Seed(upruntime.Config{
+		StagedDir:    flags.stagedDir,
+		VersionsDir:  flags.versionsDir,
+		StagedGenDir: flags.stagedGenDir,
+		SbinDir:      flags.sbinDir,
+		Logf:         func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "seed-runtime: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("seed-runtime complete")
+}
+
+// seedRuntimeFlags holds the parsed `xpfd seed-runtime` flags. Kept in a
+// struct so the flag parsing + positional-arg validation is unit-testable
+// without the os.Exit / real-Seed side effects of the dispatch.
+type seedRuntimeFlags struct {
+	stagedDir, versionsDir, stagedGenDir, sbinDir string
+	capCheck                                      bool
+}
+
+// parseSeedRuntimeArgs parses the `xpfd seed-runtime [flags]` argument set.
+//
+// #5322: seed-runtime takes NO positional arguments; like #4869's `xpfd
+// upgrade`, it REJECTS any leftover operand instead of silently dropping it.
+// `flag.FlagSet.Parse` stops at the first non-flag token, so before this guard
+// `xpfd seed-runtime typo --sbin-dir /x` left the trailing flags in fs.Args()
+// with the DEFAULT sbin dir and still seeded/repointed the versioned runtime —
+// a mistyped operand silently ran a different privileged operation than
+// intended.
+func parseSeedRuntimeArgs(args []string) (seedRuntimeFlags, error) {
 	fs := flag.NewFlagSet("seed-runtime", flag.ContinueOnError)
 	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
 	versionsDir := fs.String("versions-dir", upgrade.DefaultVersionsDir, "runtime versioned dir")
@@ -44,22 +85,17 @@ func runSeedRuntimeSubcommand(args []string) {
 		"probe-only: exit 0 if this binary supports the #1964 versioned-runtime "+
 			"layout, without touching the filesystem")
 	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
+		return seedRuntimeFlags{}, err
 	}
-	if *capCheck {
-		fmt.Println("seed-runtime supported")
-		return
+	if fs.NArg() != 0 {
+		return seedRuntimeFlags{}, fmt.Errorf("unexpected argument(s) %v; "+
+			"usage: xpfd seed-runtime [flags] (this verb takes no positional arguments)", fs.Args())
 	}
-
-	if err := upruntime.Seed(upruntime.Config{
-		StagedDir:    *stagedDir,
-		VersionsDir:  *versionsDir,
-		StagedGenDir: *stagedGenDir,
-		SbinDir:      *sbinDir,
-		Logf:         func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "seed-runtime: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("seed-runtime complete")
+	return seedRuntimeFlags{
+		stagedDir:    *stagedDir,
+		versionsDir:  *versionsDir,
+		stagedGenDir: *stagedGenDir,
+		sbinDir:      *sbinDir,
+		capCheck:     *capCheck,
+	}, nil
 }

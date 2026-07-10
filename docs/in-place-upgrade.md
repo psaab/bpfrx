@@ -337,6 +337,20 @@ uncoordinated STANDALONE cut on a clustered node — no drain, no
 takeover. A mistyped or misplaced argument is a hard usage error, not a
 wrong/default run.
 
+**Sibling lifecycle verbs reject leftover operands too (#5322).** The same
+`flag.Parse`-stops-at-the-first-operand hazard applied to every sibling
+root-only lifecycle verb, which had no `NArg()` guard: `xpfd seed-runtime`,
+`xpfd publish-generation`, `xpfd cleanup`, and the `xpfd upgrade kernel`
+`promote`/`drain`/`rejoin` sub-verbs (`status` is guarded for consistency).
+A typo like `xpfd publish-generation typo --staged-gen-dir /lab` used to keep
+the PRODUCTION default staged-gen dir (the `--staged-gen-dir` intent silently
+discarded) and still repoint/GC the live generation while reporting success;
+`xpfd upgrade kernel promote g0-typo` still reordered `BootOrder`. Each verb
+now REJECTS any unexpected operand before any privileged mutation (the
+publish-generation guard runs BEFORE the host-wide lock is taken). Legitimate
+arity is preserved: `arm` still takes exactly one operand (the target kernel
+version); the no-operand verbs take none.
+
 **Clustered-node standalone-cut invariant (#5284).** Arg parsing alone is
 NOT enough: a VALID empty arg set (a plain `xpfd upgrade`) still selects
 `Runner.Run` purely because `--rolling` was omitted, and the postinst
