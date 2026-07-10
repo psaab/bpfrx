@@ -3,6 +3,7 @@ package userspace
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -50,9 +51,19 @@ func injectShimCompileResult(t *testing.T, bpfShim *dataplane.Manager, cr *datap
 // It drives mirrorSessionPairV4 directly (not the SetSessionV4 wrapper) so it
 // never touches m.bpfShim's kernel session map and needs no BPF privileges.
 func TestMirrorSessionPairV4ResolvedAgainstConsistentSnapshot_5007(t *testing.T) {
-	dir := t.TempDir()
-	controlSock := filepath.Join(dir, "control.sock")
-	sessionSock := filepath.Join(dir, "userspace-dp-sessions.sock")
+	// Use a SHORT temp dir (not t.TempDir(), whose path embeds the 60-char
+	// test name) so the derived unix socket path stays well under the 108-byte
+	// sun_path limit even under a long TMPDIR (CI runners, GOTMPDIR=/dev/shm).
+	// sessionSocketPath() derives the session socket from the control socket's
+	// directory + the fixed "userspace-dp-sessions.sock" basename, so only the
+	// directory is shortened — the load-bearing basename is preserved.
+	sockDir, err := os.MkdirTemp("", "xs")
+	if err != nil {
+		t.Fatalf("mkdir temp: %v", err)
+	}
+	defer os.RemoveAll(sockDir)
+	controlSock := filepath.Join(sockDir, "control.sock")
+	sessionSock := filepath.Join(sockDir, "userspace-dp-sessions.sock")
 
 	ln, err := net.Listen("unix", sessionSock)
 	if err != nil {
