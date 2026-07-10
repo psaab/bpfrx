@@ -1285,12 +1285,19 @@ func (m *Manager) upsertLocked(ctx context.Context, updater DNSUpdater, rec Leas
 func (m *Manager) deleteOwnedLocked(ctx context.Context, updater DNSUpdater, owned ownedRecord) error {
 	rec, err := buildLeaseRecord(owned.FQDN, owned.Address, owned.TTL)
 	if err != nil {
-		// The stored address no longer parses (should not happen): drop
-		// the entry to avoid wedging, but do NOT issue a delete with a
-		// guessed name.
-		slog.Warn("ddns: owned record has unparseable address; dropping entry",
+		// The stored address no longer parses (a corrupt store now fails closed
+		// at load, but keep this defensive). We cannot reconstruct the exact
+		// wire RR, so a safe wire delete is impossible — do NOT issue a delete
+		// with a guessed name. Drop the entry to avoid wedging, but PERSIST the
+		// drop (#4909): without the save the malformed record reloaded on the
+		// next restart and this same silent drop oscillated forever.
+		slog.Warn("ddns: owned record has unparseable address; dropping entry (persisted)",
 			"address", owned.Address, "err", err)
 		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
+		if serr := m.state.save(); serr != nil {
+			slog.Warn("ddns: cannot persist drop of unparseable-address record",
+				"fqdn", owned.FQDN, "err", serr)
+		}
 		return nil
 	}
 	// Force the stored forward type / PTR name (re-derived above should

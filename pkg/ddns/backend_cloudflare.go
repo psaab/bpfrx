@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -81,9 +83,21 @@ func newCloudflareBackend(p *config.DDNSProvider, client *http.Client) (*cloudfl
 
 // cfEnvelope is the common Cloudflare response envelope.
 type cfEnvelope struct {
-	Success bool            `json:"success"`
-	Errors  []cfMessage     `json:"errors"`
-	Result  json.RawMessage `json:"result"`
+	Success    bool            `json:"success"`
+	Errors     []cfMessage     `json:"errors"`
+	Result     json.RawMessage `json:"result"`
+	ResultInfo cfResultInfo    `json:"result_info"`
+}
+
+// cfResultInfo carries Cloudflare's list pagination metadata. Absent on
+// non-list endpoints (all fields zero), which listRecords treats as "single
+// page" via its result-count fallback.
+type cfResultInfo struct {
+	Page       int `json:"page"`
+	PerPage    int `json:"per_page"`
+	Count      int `json:"count"`
+	TotalCount int `json:"total_count"`
+	TotalPages int `json:"total_pages"`
 }
 
 type cfMessage struct {
@@ -180,18 +194,47 @@ func (b *cloudflareBackend) resolveZoneID(ctx context.Context) (string, error) {
 // can carry several records of one type, and recs[0] is an API-ordering
 // artifact, not a statement of which row xpf owns (#2770).
 func (b *cloudflareBackend) listRecords(ctx context.Context, zoneID, rtype, fqdn string) ([]cfRecord, error) {
-	q := url.Values{}
-	q.Set("type", rtype)
-	q.Set("name", strings.TrimSuffix(fqdn, "."))
-	env, err := b.do(ctx, http.MethodGet, "/zones/"+zoneID+"/dns_records?"+q.Encode(), nil)
-	if err != nil {
-		return nil, err
+	// Paginate (#4909). The dns_records list is paginated (default 100/page);
+	// the pre-fix single GET returned only page 1, so a name+type carrying more
+	// rows than one page hid xpf-owned rows past that page — driving a duplicate
+	// create (owned row unseen) or a false "already absent" delete. Walk every
+	// page until the API's result_info says we have them all, with a hard page
+	// cap as a runaway guard.
+	const (
+		perPage  = 100
+		maxPages = 1000 // 100k rows for one name+type — far beyond any real zone
+	)
+	var all []cfRecord
+	name := strings.TrimSuffix(fqdn, ".")
+	for page := 1; page <= maxPages; page++ {
+		q := url.Values{}
+		q.Set("type", rtype)
+		q.Set("name", name)
+		q.Set("per_page", strconv.Itoa(perPage))
+		q.Set("page", strconv.Itoa(page))
+		env, err := b.do(ctx, http.MethodGet, "/zones/"+zoneID+"/dns_records?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		var recs []cfRecord
+		if err := json.Unmarshal(env.Result, &recs); err != nil {
+			return nil, fmt.Errorf("ddns cloudflare: %s: decode records: %w", b.name, err)
+		}
+		all = append(all, recs...)
+		// Stop when the API reports the last page. Fall back to a short-page
+		// heuristic when result_info is absent (a mock/older API omits it): a
+		// page returning fewer than perPage rows is the last one.
+		if ri := env.ResultInfo; ri.TotalPages > 0 {
+			if page >= ri.TotalPages {
+				return all, nil
+			}
+		} else if len(recs) < perPage {
+			return all, nil
+		}
 	}
-	var recs []cfRecord
-	if err := json.Unmarshal(env.Result, &recs); err != nil {
-		return nil, fmt.Errorf("ddns cloudflare: %s: decode records: %w", b.name, err)
-	}
-	return recs, nil
+	slog.Warn("ddns cloudflare: record list hit page cap; results may be truncated",
+		"backend", b.name, "name", name, "type", rtype, "max_pages", maxPages)
+	return all, nil
 }
 
 // UpsertLease publishes the A/AAAA with a VALUE-SPECIFIC in-place replace
