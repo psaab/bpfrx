@@ -1626,6 +1626,38 @@ where compilation transforms the term:
 The heading carries a `[effective]` tag (`Filter: demo (family inet)
 [effective]`) so the compiled view is never confused with the raw output.
 
+**Generation-liveness banner (#5067).** The effective view compiles its
+snapshots from the ACTIVE config, which `commitAndApply` promotes via
+`store.Commit()` BEFORE the dataplane apply runs. A required-protocol-gate apply
+error (`applyErrSkipsPeerSync` / `compileErrorMustAbortApply`, see
+`pkg/daemon/daemon_apply.go`) leaves the dataplane DISARMED while the active
+config is already the new generation — so the compiled-desired snapshot is NOT
+what the dataplane is enforcing. The local CLI therefore binds the view to the
+HELPER-ACKNOWLEDGED generation before rendering:
+
+- **Armed + acknowledged** (dataplane armed and the acknowledged generation is
+  at or ahead of the daemon's last applied generation): the snapshots are
+  prefixed with `Effective firewall filters — dataplane-acknowledged
+  (generation N).` and are safe to read as live. Helper-ahead is benign — a
+  scheduler-only republish (`Manager.UpdatePolicyScheduleState`) advances the
+  helper's snapshot generation without bumping the last recorded apply
+  generation, and it carries the same filter content, so the view is still live.
+- **Disarmed or generation drift**: the snapshots are prefixed with a prominent
+  `WARNING: dataplane is NOT enforcing the active configuration.` banner that
+  labels the output `COMPILED-DESIRED`, states the reason (dataplane disarmed, or
+  the helper is BEHIND the applied generation), and surfaces the last
+  dataplane-acknowledged generation versus the desired (active, not-yet-
+  acknowledged) configuration. The compiled snapshots are still printed under the
+  banner so the operator can inspect the desired compile, but they are never
+  certified as live.
+- **Dataplane status unavailable** (no runtime wired): a soft note records that
+  the snapshots are compiled-desired and the acknowledged generation could not be
+  confirmed.
+
+This applies to the local CLI (`pkg/cli`). The remote CLI's gRPC `ShowText`
+path renders the same compiled snapshots without the liveness banner; adding the
+generation-liveness context to the gRPC surface is a follow-up.
+
 Both the local and the remote (`cli`) CLI render this identically (#4967). The
 snapshot renderer is the single source of truth
 `dpuserspace.RenderFirewallFilterSnapshot`; the local CLI calls it directly and

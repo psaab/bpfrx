@@ -336,15 +336,26 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 }
 
 // showEffectiveFirewallFilters renders the EFFECTIVE (compiled) firewall-filter
-// snapshots the userspace dataplane actually receives (#4422). Unlike
-// showFirewallFilters (which prints the raw typed config), this rebuilds the
-// FirewallFilterSnapshot the config compiler emits and prints the terms exactly
-// as the matcher enforces them: prefix-list references resolved to literal
-// prefixes, address/port `except` folded (positive-wins on a mixed term), DSCP
-// tokens resolved to numeric code points, TCP-flags lowered to required/
-// forbidden masks, `then next term` / modifier-only fall-through computed, and
-// any unrepresentable match marked fail-closed. It is read-only — it derives the
-// snapshot from the active config and never touches the dataplane.
+// snapshots for `show firewall effective` (#4422). Unlike showFirewallFilters
+// (which prints the raw typed config), this rebuilds the FirewallFilterSnapshot
+// the config compiler emits and prints the terms exactly as the matcher would
+// enforce them: prefix-list references resolved to literal prefixes, address/
+// port `except` folded (positive-wins on a mixed term), DSCP tokens resolved to
+// numeric code points, TCP-flags lowered to required/forbidden masks, `then next
+// term` / modifier-only fall-through computed, and any unrepresentable match
+// marked fail-closed. It is read-only — it derives the snapshot from the active
+// config and never touches the dataplane.
+//
+// #5067: the snapshots are compiled from ActiveConfig(), which commitAndApply
+// promotes via store.Commit() BEFORE applyAndSyncCommitted runs. A required-
+// protocol-gate apply error (applyErrSkipsPeerSync / compileErrorMustAbortApply,
+// pkg/daemon/daemon_apply.go) leaves the dataplane DISARMED while ActiveConfig is
+// already the new generation, so the compiled-desired snapshot is NOT what the
+// dataplane is enforcing. printFirewallEffectiveBanner binds the view to the
+// helper-acknowledged generation: it certifies the output as live only when the
+// dataplane is armed and the acknowledged generation matches the last applied
+// generation, and otherwise prints a prominent compiled-desired / drift banner
+// so the operator is not misled.
 func (c *CLI) showEffectiveFirewallFilters(family string) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
@@ -357,20 +368,24 @@ func (c *CLI) showEffectiveFirewallFilters(family string) error {
 		return nil
 	}
 	snaps := dpuserspace.BuildFirewallFilterSnapshots(cfg)
-	rendered := 0
+	matched := make([]int, 0, len(snaps))
 	for i := range snaps {
 		if family != "" && snaps[i].Family != family {
 			continue
 		}
-		renderEffectiveFilterSnapshot(&snaps[i])
-		rendered++
+		matched = append(matched, i)
 	}
-	if rendered == 0 {
+	if len(matched) == 0 {
 		if family != "" {
 			fmt.Printf("No firewall filters configured (family %s)\n", family)
 		} else {
 			fmt.Println("No firewall filters configured")
 		}
+		return nil
+	}
+	c.printFirewallEffectiveBanner()
+	for _, i := range matched {
+		renderEffectiveFilterSnapshot(&snaps[i])
 	}
 	return nil
 }
@@ -390,7 +405,7 @@ func (c *CLI) showEffectiveFirewallFilter(name, family string) error {
 		return nil
 	}
 	snaps := dpuserspace.BuildFirewallFilterSnapshots(cfg)
-	found := false
+	matched := make([]int, 0, len(snaps))
 	for i := range snaps {
 		if snaps[i].Name != name {
 			continue
@@ -398,15 +413,20 @@ func (c *CLI) showEffectiveFirewallFilter(name, family string) error {
 		if family != "" && snaps[i].Family != family {
 			continue
 		}
-		renderEffectiveFilterSnapshot(&snaps[i])
-		found = true
+		matched = append(matched, i)
 	}
-	if !found {
+	if len(matched) == 0 {
 		if family != "" {
 			fmt.Printf("Filter not found: %s (family %s)\n", name, family)
 		} else {
 			fmt.Printf("Filter not found: %s\n", name)
 		}
+		return nil
+	}
+	// #5067: same generation-liveness caveat as the all-filters view.
+	c.printFirewallEffectiveBanner()
+	for _, i := range matched {
+		renderEffectiveFilterSnapshot(&snaps[i])
 	}
 	return nil
 }
@@ -417,4 +437,113 @@ func (c *CLI) showEffectiveFirewallFilter(name, family string) error {
 // emit byte-identical output.
 func renderEffectiveFilterSnapshot(snap *dpuserspace.FirewallFilterSnapshot) {
 	fmt.Print(dpuserspace.RenderFirewallFilterSnapshot(snap))
+}
+
+// firewallEffectiveLiveness records whether the compiled firewall-filter
+// snapshots rendered by the `effective` view are actually what the dataplane is
+// enforcing (#5067). The view derives its content from ActiveConfig(), but
+// commitAndApply promotes the active config via store.Commit() BEFORE
+// applyAndSyncCommitted runs the dataplane apply; a required-protocol-gate apply
+// error (applyErrSkipsPeerSync / compileErrorMustAbortApply) leaves the
+// dataplane DISARMED while ActiveConfig is already the new generation. This
+// binds the rendered content to the HELPER-ACKNOWLEDGED generation instead of
+// blindly certifying the promoted config as live.
+type firewallEffectiveLiveness struct {
+	// determined is true when a dataplane runtime is loaded AND its helper
+	// status was obtained — i.e. we can actually compare the acknowledged
+	// generation against the last applied generation. When false (no runtime,
+	// or status unavailable) the view is compiled-desired that we cannot
+	// confirm is live.
+	determined bool
+	// live is true only when the dataplane is armed AND the helper-acknowledged
+	// snapshot generation is at or ahead of the daemon's last successfully-
+	// applied generation — the state in which the compiled snapshots equal what
+	// the dataplane is enforcing. (Helper-ahead is benign; see
+	// firewallEffectiveLiveness.)
+	live bool
+	// appliedGen is the daemon's last successfully-recorded apply generation
+	// (0 when no apply has ever been recorded).
+	appliedGen uint64
+	// ackedGen is the generation the userspace helper reports it has applied
+	// (status.LastSnapshotGeneration).
+	ackedGen uint64
+	// reason explains why the view is not live (disarmed / generation drift).
+	reason string
+}
+
+// firewallEffectiveLiveness inspects the dataplane apply-result and userspace
+// helper status to decide whether the `effective` firewall view can be
+// certified as dataplane-acknowledged (#5067).
+func (c *CLI) firewallEffectiveLiveness() firewallEffectiveLiveness {
+	var v firewallEffectiveLiveness
+	if !c.dataplaneLoaded() {
+		return v // undetermined: no runtime to confirm against
+	}
+	status, err := c.userspaceDataplaneStatus()
+	if err != nil {
+		return v // undetermined: helper status unavailable
+	}
+	v.determined = true
+	v.ackedGen = status.LastSnapshotGeneration
+	cr := c.applyResult()
+	if cr != nil {
+		v.appliedGen = cr.Generation
+	}
+	// Armed requires the helper to be enabled + forwarding-armed with forwarding
+	// supported, AND a recorded apply that itself reported forwarding supported.
+	// A required-protocol-gate disarm sets ForwardingArmed=false without
+	// advancing the recorded apply result, so this is false in the #5067 window.
+	armed := status.Enabled && status.ForwardingArmed &&
+		status.Capabilities.ForwardingSupported &&
+		cr != nil && cr.Capabilities.ForwardingSupported
+	// Coherent requires the helper's acknowledged generation to be AT OR AHEAD
+	// of the daemon's last successfully-applied generation. Helper-BEHIND
+	// (acked < applied) is real drift — the helper has not caught up to (or
+	// rejected) the applied configuration. Helper-AHEAD (acked > applied) is
+	// BENIGN: a scheduler-only republish (Manager.UpdatePolicyScheduleState)
+	// advances the helper's snapshot generation WITHOUT calling
+	// recordApplyResultLocked, so LastApplyResult().Generation lags the helper
+	// on a perfectly healthy box. That republish only re-times policy
+	// enable/disable — it carries the SAME filter content — so the effective
+	// view is still live. The genuine #5067 disarm is caught by the `armed`
+	// predicate (ForwardingArmed=false) independent of this compare, so
+	// accepting helper-ahead does not weaken the original fix.
+	coherent := cr != nil && status.LastSnapshotGeneration >= cr.Generation
+	switch {
+	case !armed:
+		v.reason = "dataplane disarmed (forwarding not armed)"
+	case !coherent:
+		v.reason = "dataplane generation drift (helper is behind the applied configuration)"
+	default:
+		v.live = true
+	}
+	return v
+}
+
+// printFirewallEffectiveBanner prints the generation-liveness context for the
+// `effective` firewall-filter view (#5067) BEFORE the compiled snapshots, so an
+// operator is never misled into reading a compiled-desired-but-unapplied config
+// as what the dataplane is enforcing.
+func (c *CLI) printFirewallEffectiveBanner() {
+	v := c.firewallEffectiveLiveness()
+	switch {
+	case !v.determined:
+		fmt.Println("Note: dataplane status unavailable — the firewall filters below are")
+		fmt.Println("  compiled-desired; the dataplane's acknowledged generation could not be")
+		fmt.Println("  confirmed.")
+		fmt.Println()
+	case v.live:
+		fmt.Printf("Effective firewall filters — dataplane-acknowledged (generation %d).\n\n", v.ackedGen)
+	default:
+		fmt.Println("WARNING: dataplane is NOT enforcing the active configuration.")
+		fmt.Println("  The firewall filters below are COMPILED-DESIRED (what the active")
+		fmt.Println("  configuration compiles to), NOT what the dataplane is enforcing.")
+		fmt.Printf("  Reason: %s.\n", v.reason)
+		fmt.Printf("  Last dataplane-acknowledged generation: %d.\n", v.ackedGen)
+		if v.appliedGen != v.ackedGen {
+			fmt.Printf("  Last daemon-applied generation: %d.\n", v.appliedGen)
+		}
+		fmt.Println("  Desired: active configuration (not acknowledged).")
+		fmt.Println()
+	}
 }

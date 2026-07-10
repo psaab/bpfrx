@@ -45168,6 +45168,49 @@ top.
   chaining" section + first-hop-only Option 82 gotcha.
 - **File(s)**: pkg/dhcprelay/relay.go,
   pkg/dhcprelay/relay_chain_5071_test.go, pkg/dhcprelay/README.md, _Log.md
+- **Action**: #5067 — bind `show firewall [filter <name>] effective` to the
+  helper-acknowledged generation. The effective view compiled its snapshots
+  from ActiveConfig() and labeled them as what "the dataplane actually
+  receives" without ever consulting the apply/generation state. commitAndApply
+  promotes the active config via store.Commit() BEFORE applyAndSyncCommitted
+  runs; a required-protocol-gate apply error (applyErrSkipsPeerSync /
+  compileErrorMustAbortApply) leaves the dataplane DISARMED while ActiveConfig
+  is already the new generation, so the view falsely certified an unapplied
+  config as live. Added firewallEffectiveLiveness (dataplane loaded + helper
+  status → armed && acked-gen == last-applied-gen) and
+  printFirewallEffectiveBanner: certifies "dataplane-acknowledged (generation
+  N)" only when armed+coherent, else prints a prominent COMPILED-DESIRED /
+  disarmed-or-drift banner surfacing acked vs desired generations; a soft note
+  when no runtime is wired. Display-only — no change to apply/commit/sync.
+  Applied to both the all-filters and single-filter forms. Four tests
+  (armed-acked, disarmed-drift, generation-drift, no-runtime); RED-on-revert
+  proven (the disarmed + drift tests fail on reverted source — the compiled
+  snapshot is presented as effective with no banner). Updated
+  docs/junos-cli-reference.md with the generation-liveness banner section.
+- **File(s)**: pkg/cli/cli_show_security_filters.go,
+  pkg/cli/cli_show_effective_filter_gen_5067_test.go,
+  docs/junos-cli-reference.md, _Log.md
+- **Action**: #5067 / PR #5420 review fix — relax the effective-view coherence
+  check from `==` to `>=`. The `==` check spuriously flagged "dataplane
+  generation drift / NOT enforcing" on a HEALTHY armed box after a scheduler-
+  only republish: Manager.UpdatePolicyScheduleState advances the helper's
+  snapshot generation (helper ACKs N+1) but never calls recordApplyResultLocked,
+  so LastApplyResult().Generation stays at N -> N+1 == N is false -> false-
+  positive banner until the next commit. Helper-AHEAD is benign (the republish
+  re-times policy enable/disable, same filter content). Changed
+  `coherent := ... LastSnapshotGeneration >= cr.Generation` so helper-behind
+  (acked < applied) still shows real drift while helper-at-or-ahead renders
+  live. The original #5067 disarm is caught by the `armed` predicate
+  (ForwardingArmed=false) independent of the gen compare, so `>=` does not
+  weaken it (verified in-source: UpdatePolicyScheduleState bumps m.generation +
+  m.lastSnapshot without recordApplyResultLocked). Added
+  TestShowEffectiveFirewallFiltersHelperAheadIsLive (acked=applied+1, armed ->
+  live, no banner); it is RED against the committed `==` version. Disarm/behind
+  RED-on-revert re-proven against origin/master. Updated
+  docs/junos-cli-reference.md wording to "at or ahead of".
+- **File(s)**: pkg/cli/cli_show_security_filters.go,
+  pkg/cli/cli_show_effective_filter_gen_5067_test.go,
+  docs/junos-cli-reference.md, _Log.md
 
 - **Timestamp**: 2026-07-10 (fix/5355-tunnel-apply-failclosed)
   - **Action**: #5355 fail-closed on genuine GRE/tunnel reconcile errors — mirror #5310 xfrmManager.Apply. tunnelManager.Apply now aggregates genuine create/find/up/delete failures via errors.Join and returns them (was unconditional `return nil`); helpers applyAnchorLocked/applyKernelTunnelLocked/finishTunnelLocked return errors; applyWireguardTunLocked surfaces its LinkSetUp failure. Idempotency preserved (adopt-existing, tolerate-already-gone, defer-on-transient). New RED-on-revert tests + daemon-boundary tunnel case; README fail-closed note.
