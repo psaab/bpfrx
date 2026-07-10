@@ -548,6 +548,28 @@ under the daemon's errgroup. Nothing else imports this package.
   the legacy counter and are the follow-up SSOT surfaces (the Prometheus
   `xpf_userspace_snat_pool_*` family in `metrics_userspace.go` already
   exposes the runtime per-pool view).
+- NAT-stats telemetry read failures fail CLOSED as *unavailable*, never as a
+  healthy zero (#5046, the #3345 counter-error contract). A read is a
+  *failure* only when the id resolves and the telemetry call errors (a
+  missing apply-id / absent runtime entry is a legitimate "no counter" and
+  is NOT flagged). On such a failure:
+  - **REST** (`nat.go`) returns HTTP 500: `runtimeSourceNATPools()` now
+    returns `(map, error)` and propagates a `Status()` read failure (instead
+    of the old bare `nil`, indistinguishable from provider-absent);
+    `natPoolStatsHandler` also 500s on a fallback `ReadNATPortCounter`
+    failure, and `natRuleStatsHandler` 500s on a `ReadNATRuleCounter`
+    failure — rather than emitting `used_ports`/`hit_packets` = 0 with 200.
+  - **gRPC** (`server_nat.go`) returns `codes.Internal`: `GetNATPoolStats`
+    on a `NATPortCounter` failure and `GetNATRuleStats` on a `NATRuleCounter`
+    failure (the `readCounter` helper now returns an error), matching the
+    `GetZones`/`GetPolicies` #3408 contract.
+  - **Prometheus** (`metrics_nat.go`) OMITS the affected
+    `xpf_nat_pool_used_ports` sample (never a fake `0`) and bumps the shared
+    `xpf_counter_read_errors_total`; `collectNATPoolMetrics` now runs BEFORE
+    `emitCounterReadErrors` so the bump is reflected in the same scrape
+    (#3462 ordering). Pinned by `nat_counter_error_test.go` (REST +
+    Prometheus) and `pkg/grpcapi/nat_counter_error_test.go` (gRPC),
+    fail-on-revert.
 - Interface-mode source-NAT rows (`source-nat interface`, no named pool)
   report `UsedPorts` as the count of forward SNAT sessions that traversed
   THAT rule set's own from/to zone pair — not the firewall-wide SNAT total

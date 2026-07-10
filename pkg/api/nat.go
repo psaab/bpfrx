@@ -22,22 +22,29 @@ import (
 // retired-eBPF port counter cannot. Returns nil when the helper is not running
 // or does not expose a runtime status — callers then fall back to the
 // config-derived view.
-func (s *Server) runtimeSourceNATPools() map[string]dpuserspace.SourceNATPoolStatus {
+//
+// Returns (nil, nil) when the helper is not running or does not expose a
+// runtime status — callers then fall back to the config-derived view. But a
+// Status() READ FAILURE returns a non-nil error: a telemetry-bridge failure is
+// NOT "no pools in use", and the caller must surface it as unavailable rather
+// than silently defaulting to a healthy zero-usage view (#5046, #3345
+// counter-error contract).
+func (s *Server) runtimeSourceNATPools() (map[string]dpuserspace.SourceNATPoolStatus, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
-		return nil
+		return nil, nil
 	}
 	provider, ok := s.dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	status, err := provider.Status()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	if len(status.SourceNATPools) == 0 {
-		return nil
+		return nil, nil
 	}
 	pools := make(map[string]dpuserspace.SourceNATPoolStatus, len(status.SourceNATPools))
 	for _, p := range status.SourceNATPools {
@@ -49,7 +56,7 @@ func (s *Server) runtimeSourceNATPools() map[string]dpuserspace.SourceNATPoolSta
 		}
 		pools[p.PoolName] = p
 	}
-	return pools
+	return pools, nil
 }
 
 func (s *Server) natSourceHandler(w http.ResponseWriter, _ *http.Request) {
@@ -126,7 +133,16 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 	// actual used ports, and shares allocator state across rules — config text
 	// can over-report capacity and the legacy ReadNATPortCounter is dead under
 	// the AF_XDP dataplane. runtime[name] is the SSOT when present.
-	runtime := s.runtimeSourceNATPools()
+	//
+	// A runtime status READ FAILURE must fail closed as unavailable (HTTP 500),
+	// not fall through to a config-derived zero-usage view that reads as
+	// "healthy idle" (#5046, #3345 counter-error contract).
+	runtime, err := s.runtimeSourceNATPools()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError,
+			"NAT pool runtime status read failed: "+err.Error())
+		return
+	}
 
 	// Named pools
 	for name, pool := range cfg.Security.NAT.SourcePools {
@@ -160,9 +176,14 @@ func (s *Server) natPoolStatsHandler(w http.ResponseWriter, _ *http.Request) {
 			// back to the legacy port counter so the surface is not blank.
 			if id, ok := cr.PoolIDs[name]; ok {
 				cnt, err := s.dp.ReadNATPortCounter(uint32(id))
-				if err == nil {
-					used = int(cnt)
+				if err != nil {
+					// A counter read FAILURE is not idle usage: surface it as
+					// unavailable rather than reporting a healthy 0 (#5046).
+					writeError(w, http.StatusInternalServerError,
+						"NAT pool port counter read failed: "+err.Error())
+					return
 				}
+				used = int(cnt)
 			}
 		}
 
@@ -283,10 +304,15 @@ func (s *Server) natRuleStatsHandler(w http.ResponseWriter, r *http.Request) {
 				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := s.dp.ReadNATRuleCounter(uint32(cid))
-					if err == nil {
-						hitPkts = cnt.Packets
-						hitBytes = cnt.Bytes
+					if err != nil {
+						// A counter read FAILURE must surface as unavailable, not
+						// render as a healthy zero hit count (#5046).
+						writeError(w, http.StatusInternalServerError,
+							"NAT rule counter read failed: "+err.Error())
+						return
 					}
+					hitPkts = cnt.Packets
+					hitBytes = cnt.Bytes
 				}
 			}
 

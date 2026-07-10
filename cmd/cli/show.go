@@ -23,7 +23,6 @@ package main
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -395,11 +394,15 @@ func (c *ctl) handleConfigShow(args []string) error {
 	if strings.Contains(line, "| compare") {
 		if idx := strings.Index(line, "| compare rollback"); idx >= 0 {
 			rest := strings.TrimSpace(line[idx+len("| compare rollback"):])
-			n, err := strconv.Atoi(rest)
-			if err != nil || n < 1 {
-				return fmt.Errorf("usage: show | compare rollback <N>")
+			// #5052: parse into the RPC's int32 via the shared selector
+			// parser. strconv.Atoi + int32() wrapped an out-of-range
+			// value (e.g. 4294967297 -> 1) and silently compared the
+			// wrong slot with a success exit.
+			n, err := parseRollbackSelector(rest, "usage: show | compare rollback <N>", 1)
+			if err != nil {
+				return err
 			}
-			resp, err := c.client.ShowCompare(c.ctx(), &pb.ShowCompareRequest{RollbackN: int32(n)})
+			resp, err := c.client.ShowCompare(c.ctx(), &pb.ShowCompareRequest{RollbackN: n})
 			if err != nil {
 				return fmt.Errorf("%v", err)
 			}
