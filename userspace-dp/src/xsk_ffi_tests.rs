@@ -172,3 +172,49 @@ fn write_fill_insert_bounded_by_remaining_reservation() {
         w.commit();
     }
 }
+
+// ── RX consumer-ring release safety (#4997) ──────────────────────
+//
+// `ReadRx` now holds `ring: &'a mut XskRingCons` (it was a shared
+// `&'a XskRingCons` plus a `*const -> *mut` cast in `release()`/drop —
+// writing the consumer ring through a pointer derived from `&T` with no
+// `UnsafeCell` is UB under Stacked/Tree Borrows, which Miri flags). The
+// `release()`/drop calls must still advance the real kernel-facing
+// `consumer` pointer through that `&mut`.
+//
+// This drives the exact production `receive` -> `read` -> `release`
+// path on a hermetic test ring and asserts (a) the descriptors read
+// back in order and (b) the `consumer` pointer advanced by the released
+// count — i.e. `release()` genuinely wrote through the reference.
+//
+// Fail-on-revert: reverting the field to `&XskRingCons` no longer
+// compiles — `bridge_xsk_ring_cons_release` takes `*mut XskRingCons`
+// and a `&T` does not coerce to `*mut T` without the removed const
+// cast — so the type change is itself compile-pinned; this test
+// additionally pins the release/cancel behavior. Miri cannot drive it
+// (the libxdp C bridge is `extern "C"` FFI, unsupported under Miri), so
+// there is no Miri-gated variant — the `&mut` type + this behavioral
+// test are the pins.
+#[test]
+fn read_rx_release_advances_consumer_through_mut_ref() {
+    let mut rx = RingRx::new_for_test(-1, 8);
+    rx.push_for_test(desc(0xAA));
+    rx.push_for_test(desc(0xBB));
+
+    // consumer pointer starts at 0 (nothing released yet).
+    assert_eq!(unsafe { *rx.ring.consumer }, 0);
+
+    {
+        let mut r = rx.receive(4);
+        let d0 = r.read().expect("first descriptor available");
+        let d1 = r.read().expect("second descriptor available");
+        assert_eq!(d0.addr, 0xAA);
+        assert_eq!(d1.addr, 0xBB);
+        assert!(r.read().is_none(), "only two descriptors were pushed");
+        r.release();
+    }
+
+    // release() must have written through the &mut: the kernel-facing
+    // consumer pointer advanced by the two released descriptors.
+    assert_eq!(unsafe { *rx.ring.consumer }, 2);
+}

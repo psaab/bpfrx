@@ -499,7 +499,14 @@ window for ALL FOUR managed binaries:
   and `current-gen` is never reaped even if it is not the newest by name
   or mtimes are perturbed). It ignores (never counts, never deletes) any
   directory whose name is not a valid `genid`, and sweeps `.partial`
-  orphans.
+  orphans. **Fail-closed protection (#4876):** the publish's GC runs ONLY
+  when the journal protection set is known. A crashed cut leaves a durable
+  journal pinning its source generation with the host lock released; if
+  that journal is present but cannot be read (I/O error) or is malformed,
+  the pinned generation is UNKNOWN, so publish-generation SKIPS the GC
+  rather than run it with an empty protection set and reap the crashed
+  cut's source (which would leave the resume unrecoverable). An absent
+  journal means no crashed cut, so GC proceeds normally.
 - **Same-version replacement (B-P3b OPT1).** `versions/<ver>` carries a
   `.srcgen` stamp; the copy-skip is generation-aware. A same-version
   re-stage with NEW bytes (a new generation) RE-COPIES a stale, non-live

@@ -760,7 +760,7 @@ impl RingRx {
         let mut idx: u32 = 0;
         let peeked = unsafe { bridge_xsk_ring_cons_peek(&mut *self.ring, n, &mut idx) };
         ReadRx {
-            ring: &*self.ring,
+            ring: &mut *self.ring,
             base_idx: idx,
             peeked,
             read_count: 0,
@@ -863,7 +863,7 @@ impl std::os::fd::AsRawFd for RingTx {
 
 /// Iterator over received descriptors. Must call `release()` when done.
 pub struct ReadRx<'a> {
-    ring: &'a XskRingCons,
+    ring: &'a mut XskRingCons,
     base_idx: u32,
     peeked: u32,
     read_count: u32,
@@ -888,11 +888,11 @@ impl ReadRx<'_> {
 
     pub fn release(&mut self) {
         if !self.released && self.read_count > 0 {
-            // Safety: we cast away the shared ref to call the release bridge.
-            // This is sound because ReadRx has exclusive logical access to
-            // the consumer side of this ring during its lifetime.
-            let ring_ptr = self.ring as *const XskRingCons as *mut XskRingCons;
-            unsafe { bridge_xsk_ring_cons_release(ring_ptr, self.read_count) };
+            // `self.ring` is `&mut XskRingCons`, so the release bridge (which
+            // mutates `cached_cons` and the shared `*consumer`) is called
+            // through an exclusive reference — no `*const -> *mut` cast, no
+            // write-through-`&T` UB. Mirrors `ReadComplete::release`.
+            unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };
             self.released = true;
         }
     }
@@ -900,15 +900,14 @@ impl ReadRx<'_> {
 
 impl Drop for ReadRx<'_> {
     fn drop(&mut self) {
-        let ring_ptr = self.ring as *const XskRingCons as *mut XskRingCons;
         if !self.released && self.read_count > 0 {
-            unsafe { bridge_xsk_ring_cons_release(ring_ptr, self.read_count) };
+            unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };
         }
         // Cancel any peeked-but-unread entries so cached_cons doesn't
         // drift ahead of the real consumer pointer.
         let unreleased = self.peeked - self.read_count;
         if unreleased > 0 {
-            unsafe { bridge_xsk_ring_cons_cancel(ring_ptr, unreleased) };
+            unsafe { bridge_xsk_ring_cons_cancel(self.ring, unreleased) };
         }
     }
 }
