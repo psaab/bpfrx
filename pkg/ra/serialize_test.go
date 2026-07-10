@@ -1817,7 +1817,27 @@ func TestRestartTimeoutNoGoodbyeNoReplacement(t *testing.T) {
 	if !stillDraining {
 		t.Fatal("restart timeout removed the tombstone; it must be LEFT HELD")
 	}
-	close(wedge) // let the owner exit so the reclaimer + test can finish
+
+	// #5094: the assertions above pin the DEGRADED window (owner still wedged).
+	// Once the owner exits, the reclaimer must NOT drop the owed action: with a
+	// racing graceful Withdraw the goodbye wins over the suppressed replacement,
+	// so exactly one goodbye is emitted and no replacement is started. Let the
+	// owner exit and wait for the reclaimer to settle (its final act is removing
+	// the tombstone, after any synchronous goodbye) so the reclaimer's work
+	// completes within this test rather than racing the harness teardown.
+	close(wedge)
+	waitDrainCleared(t, m, "lo")
+	if _, conns := fl.goodbyeStats("lo"); conns != 1 {
+		t.Fatalf("after reclaim: %d conns carried a goodbye, want exactly one "+
+			"(the reclaimer must emit the owed goodbye exactly once — #5094)", conns)
+	}
+	m.mu.Lock()
+	_, healedLive := m.senders["lo"]
+	m.mu.Unlock()
+	if healedLive {
+		t.Fatal("reclaimer started a replacement despite a graceful withdraw; " +
+			"the withdraw must win (#5094)")
+	}
 }
 
 // TestRestartTimeoutNoReplacementWhenNoGoodbye (round-4 MAJOR 2): the same
@@ -1888,7 +1908,23 @@ func TestRestartTimeoutNoReplacementWhenNoGoodbye(t *testing.T) {
 	if conns != 0 || total != 0 {
 		t.Fatalf("pure restart emitted a goodbye (%d conns / %d writes); expected 0", conns, total)
 	}
+
+	// #5094: the assertions above pin the DEGRADED window (≤1 conn while the old
+	// owner is wedged). Once the owner exits, the reclaimer must START the
+	// deferred replacement rather than dropping it — the interface must not be
+	// left senderless. Wait for the replacement conn so the reclaimer's work
+	// (and its openConn) completes within this test, then quiesce.
 	close(wedge)
+	newC := waitReplacementConn(t, fl, "lo", old)
+	waitWrites(t, newC, 1)
+	m.mu.Lock()
+	_, healed := m.senders["lo"]
+	m.mu.Unlock()
+	if !healed {
+		t.Fatal("reclaimer left the interface senderless after the wedged owner " +
+			"exited — the deferred restart was dropped (#5094)")
+	}
+	_ = m.Clear()
 }
 
 // --- #2033 round-5: replacement decision is atomic under the act-lock ---

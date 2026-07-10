@@ -1,8 +1,50 @@
 # pkg/snmp
 
-SNMPv2c and SNMPv3 agent. Responds to GET / GETNEXT / GETBULK on
+SNMPv1, SNMPv2c, and SNMPv3 agent. Responds to GET / GETNEXT (all three
+versions) and GETBULK (v2c/v3 only — GETBULK is not an SNMPv1 PDU) on
 ifTable, ifXTable, and a small set of system OIDs. Also sends link-up /
 link-down traps. ASN.1 BER encoding is hand-coded, no external library.
+
+## SNMPv1 polling (RFC 1157 / RFC 2089, #5049)
+
+The request dispatch (`handlePacketFrom`) routes the message version field:
+0 → `handleV1Packet`, 1 → `handleV2cPacket`, 3 → `handleV3Packet`. Before
+#5049 only versions 1 and 3 had a case and version 0 fell through to the
+"unsupported version" default — so the agent emitted v1 traps
+(`buildLinkTrapV1`, `set snmp trap-group … version v1`) yet silently dropped
+every v1 GET/GETNEXT/SET, and a legacy v1-only manager timed out and marked
+the device down.
+
+The v1 handlers share the v2c community frame, the `clients` source-IP
+allowlist (#4289), the per-PDU interface snapshot (#4013), the bounded MIB
+lookup (`getOIDValueSnap` / `findNextOIDSnap`), and the message-size ceiling
+(`boundGetResponseVersion` → `tooBig` on overflow). Only the response rules
+differ, per the SNMPv1 error model:
+
+- **GET of a missing/unresolvable OID** → the whole PDU fails with
+  `noSuchName` (error-status 2) and a **1-based error-index** naming the
+  offending varbind; the request varbinds are **echoed unchanged** (NULL
+  values). v1 has **no per-varbind exception values** — `noSuchObject`,
+  `noSuchInstance`, and `endOfMibView` are v2-only and never appear in a v1
+  response.
+- **GETNEXT past the end of the MIB view** → `noSuchName` with the offending
+  index (there is no `endOfMibView` in v1).
+- **Counter64 (RFC 2089)** — Counter64 is not a v1 type. A **direct GET** of a
+  Counter64-typed node (ifHCInOctets/…, ifXTable cols 6/7/10/11) returns
+  `noSuchName`; a **GETNEXT walk steps OVER** every Counter64 node
+  (`findNextV1OIDSnap`) so the walk advances to the next representable object.
+  No Counter64 octet ever reaches the wire on a v1 response.
+- **SET** — the agent exposes no writable object, and v1 lacks the `noAccess`
+  / `notWritable` statuses the v2c handler returns; per the RFC 2089 §2.1
+  SNMPv2→SNMPv1 error mapping BOTH map to `noSuchName`. So a v1 SET (whether
+  the community is read-only or read-write) returns `noSuchName` with
+  error-index 1 and the request varbinds echoed.
+
+`buildResponseVersion` (shared by v1 and v2c via `buildResponse`) writes the
+message version field explicitly; the GetResponse PDU shape is otherwise
+identical across the two versions. Coverage:
+`agent_v1_polling_5049_test.go` (RED-on-revert: stashing the dispatch case +
+handlers makes every "expect a response" assertion get nil).
 
 ## Community authorization (SET access control)
 

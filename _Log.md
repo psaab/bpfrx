@@ -45022,6 +45022,29 @@ top.
   pkg/flowexport/README.md, _Log.md
 
 - **Timestamp**: 2026-07-10
+- **Action**: #5094 — ra join-timeout reclaimer no longer drops the owed
+  replacement / terminal goodbye. Before the fix, when a draining sender's owner
+  wedged past `claimWaitTimeout`, `releaseDrain` handed the tombstone to a
+  detached reclaimer that merely `delete`d it once the wedged owner exited —
+  losing the changed-config replacement (`onProvenClose`) and any owed
+  standalone goodbye, so the interface could stay senderless (or lose its
+  goodbye) until an unrelated later Apply re-drove it. Extracted the
+  proven-close ordered decision (goodbye claim-once + replacement +
+  supersession re-check) into `finishDrainDecision`; both `releaseDrain`'s
+  `<-stopped` arm AND the reclaimer now run it — the reclaimer waits for
+  `<-stopped` first (restoring the happens-before + old-conn-closed
+  precondition) so all #2033 invariants hold (≤1 live conn, ordered emit,
+  claim-once, epoch/ifaceEpoch supersession, entry-identity guard). Made
+  `onProvenClose` a bare `startLocked` closure and moved the #2834
+  make-before-break `waitConnReady` into `releaseDrain` to avoid a data race
+  on Apply-local state now that the closure runs in the reclaimer goroutine.
+  Added a `joinTimedOut` flag surfaced via `Manager.Status` / `show interfaces`
+  ("draining (join timed out; reclaiming)"). RED-on-revert proven: reverting the
+  reclaimer to delete-only fails all four timeout tests (replacement conn never
+  opens; owed goodbye never emitted). `go test -race ./pkg/ra/...` green.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/reclaimer_sender_5094_test.go,
+  pkg/ra/serialize_test.go, pkg/ra/README.md,
+  pkg/grpcapi/server_show_interfaces_text.go, _Log.md
 - **Action**: #5298 — install FRR reject/blackhole route for static-route
   reject/discard (fix the silently-erased `reject`). The schema
   (`schema_routing.go`) already accepted a `route <prefix> reject` leaf and
