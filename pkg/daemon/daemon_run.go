@@ -459,15 +459,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start dynamic address feeds if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && len(cfg.Security.DynamicAddress.FeedServers) > 0 {
-		d.feeds = feeds.New(func() {
-			slog.Info("dynamic-address feed updated, recompiling dataplane")
-			if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
-				d.applyConfig(activeCfg)
-			}
-		})
-		d.feeds.Apply(ctx, &cfg.Security.DynamicAddress)
+	// Construct the dynamic-address feed manager UNCONDITIONALLY (#5036) — even
+	// when no feed servers are configured at boot — and reconcile it against
+	// the active config. Before this the manager was built only if boot-time
+	// feed servers existed and Apply was never re-invoked, so a feed server
+	// added (or removed/edited) on a later commit was silently ignored until
+	// restart: a deny policy bound to the new feed armed with zero prefixes
+	// (fail-open). ensureFeedManager makes d.feeds non-nil so the day-2
+	// reconcile path (reconcileFeeds, wired into applyConfigLocked) can start
+	// the producers; reconcileFeeds here does the initial hash-gated Apply for
+	// a config that already declares feed servers.
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.ensureFeedManager()
+		d.reconcileFeeds(cfg)
 	}
 
 	// RPM probes are started by the hash-gated reconcileRPM step inside

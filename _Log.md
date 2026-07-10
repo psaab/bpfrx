@@ -1,3 +1,21 @@
+## 2026-07-09 — #5036 dynamic-address feed day-2 reconcile (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5036. The feed manager was constructed ONLY at boot and only if
+  boot-time feed servers existed (`daemon_run.go`), and `Manager.Apply` was
+  never re-invoked — so a feed server added/removed/edited on a day-2 commit was
+  silently ignored until restart (a deny policy bound to a day-2-added feed
+  armed with zero prefixes = fail-open). Now: `ensureFeedManager` constructs the
+  manager UNCONDITIONALLY at boot; `reconcileFeeds` (hash-gated on the
+  feed-SERVER set via `feedsConfigHash`, which excludes bindings) is wired into
+  `applyConfigLocked` before the feed-overlay push, so a day-2 server change
+  re-`Apply`s (starts/joins producers) while a feed CONTENT refresh (onUpdate →
+  applyConfig) leaves the hash unchanged and does not thrash the fetchers.
+  Added `feedsMu`/`activeFeedsHash` to the Daemon struct. RED-on-revert:
+  `TestReconcileFeedsDay2` (+ `TestFeedsConfigHash`, `TestReconcileFeedsNilManagerSafe`).
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_feeds.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_feeds_reconcile_5036_test.go, pkg/feeds/README.md
 ## 2026-07-09 — #4918 snmp GET/GETNEXT size bound + trimToFit O(n^2) (security)
 
 - **Timestamp**: 2026-07-09
