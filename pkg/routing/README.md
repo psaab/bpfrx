@@ -483,6 +483,28 @@ when the existing kernel link is genuinely incompatible:
   the anchor path unconditionally stopped the runner, so a configured
   keepalive was accepted-but-inert on the only production dataplane.
 
+**Fail-closed on genuine create/up/delete failure (#5355).** Like
+`xfrmManager.Apply` before #5310, `tunnelManager.Apply` used to log every
+per-tunnel `LinkAdd` / `LinkSetUp` / `LinkDel` failure and return `nil`
+**unconditionally**, so a GRE/anchor/WireGuard tunnel that could not be
+realized in the kernel reported a **successful commit** while the interface
+was absent (or admin-DOWN, or a removed tunnel's device lingered) —
+fail-open false convergence. `Apply` now accumulates the **genuine**
+failures with `errors.Join` and returns them so the #5354
+`applyInterfaceReconcile` tail-join fails the commit closed. The apply
+helpers (`applyAnchorLocked` / `applyKernelTunnelLocked` /
+`applyWireguardTunLocked`) and the shared `finishTunnelLocked` tail return
+the create / replace-delete / bring-up error; the removal diff aggregates a
+removed tunnel's `LinkDel` failure. The tolerated idempotent conditions
+stay **non-errors**: a still-present compatible anchor is adopted in place
+(reuse, not a `LinkAdd`), a delete of an already-gone tunnel is a no-op
+(`isLinkNotFound`), and a **transient** `LinkByName` lookup only defers the
+reconcile (retain + retry, no error — the device state is unknown, not
+proven-broken). Config-parse issues (invalid endpoints) stay warn-only.
+Address / MTU / VRF-claim reconcile failures are NOT folded into the
+fail-closed signal — they retain+retry their own state (above) and are out
+of scope, matching #5310's create/find/up/delete boundary.
+
 ## Keepalive liveness probing (`tunnel_keepalive.go`, #1918)
 
 The keepalive performs a **real ICMP echo round-trip** — it is a

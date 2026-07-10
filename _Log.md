@@ -45139,3 +45139,7 @@ top.
   chaining" section + first-hop-only Option 82 gotcha.
 - **File(s)**: pkg/dhcprelay/relay.go,
   pkg/dhcprelay/relay_chain_5071_test.go, pkg/dhcprelay/README.md, _Log.md
+
+- **Timestamp**: 2026-07-10 (fix/5355-tunnel-apply-failclosed)
+  - **Action**: #5355 fail-closed on genuine GRE/tunnel reconcile errors — mirror #5310 xfrmManager.Apply. tunnelManager.Apply now aggregates genuine create/find/up/delete failures via errors.Join and returns them (was unconditional `return nil`); helpers applyAnchorLocked/applyKernelTunnelLocked/finishTunnelLocked return errors; applyWireguardTunLocked surfaces its LinkSetUp failure. Idempotency preserved (adopt-existing, tolerate-already-gone, defer-on-transient). New RED-on-revert tests + daemon-boundary tunnel case; README fail-closed note.
+  - **File(s)**: pkg/routing/tunnel.go, pkg/routing/tunnel_apply_failclosed_5355_test.go, pkg/routing/tunnel_reconcile_test.go, pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go, pkg/routing/README.md

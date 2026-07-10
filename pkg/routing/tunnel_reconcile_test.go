@@ -253,9 +253,12 @@ func TestTunnelRemovalRetriedAfterFailedDelete(t *testing.T) {
 		t.Fatalf("Apply 1: %v", err)
 	}
 
+	// #5355: the removed tunnel's LinkDel failure is now SURFACED
+	// (fail-closed) instead of swallowed, but ownership is still retained
+	// so the next apply retries — the subject of this test.
 	ops.delFail["gr-0-0-1"] = errors.New("EBUSY")
-	if err := tm.Apply(both[:1]); err != nil {
-		t.Fatalf("Apply 2: %v", err)
+	if err := tm.Apply(both[:1]); err == nil {
+		t.Fatal("Apply 2 must surface the removed-tunnel LinkDel failure (fail-closed #5355)")
 	}
 	if _, ok := ops.links["gr-0-0-1"]; !ok {
 		t.Fatal("link unexpectedly gone despite failed delete")
@@ -966,10 +969,11 @@ func TestLegacyToWireguardSameNameIncompatibleLinkDelFailureRetained(t *testing.
 		t.Fatal("gre wg0 not tracked in ownedNames")
 	}
 	// Transition to WG; WG must replace the non-TUN GRE link, but its
-	// LinkDel fails.
+	// LinkDel fails. #5355: that failure is now surfaced (fail-closed) and
+	// wraps the retain sentinel that drives the ownedNames re-retain below.
 	ops.delFail["wg0"] = errors.New("EBUSY")
-	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
-		t.Fatalf("Apply 2 (transition, LinkDel fails): %v", err)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err == nil || !errors.Is(err, errWGIncompatibleLinkRetained) {
+		t.Fatalf("Apply 2 must surface the WG incompatible-link replace failure wrapping the retain sentinel (fail-closed #5355), got %v", err)
 	}
 	// The stale GRE link could not be replaced — it must be RETAINED in
 	// ownedNames so cleanup is retried (not orphaned).
@@ -1009,11 +1013,14 @@ func TestWireguardCreateFailureDoesNotRetainOwnership(t *testing.T) {
 		t.Fatalf("Apply 1: %v", err)
 	}
 	// Next Apply (still WG): LinkByName transiently fails → mustCreate, and
-	// LinkAdd then fails. The live WG TUN still exists in the fake.
+	// LinkAdd then fails. The live WG TUN still exists in the fake. #5355:
+	// the create failure is now surfaced (fail-closed), and it must NOT be
+	// the retain sentinel — a plain create failure must not re-retain
+	// ownership (the subject of this test).
 	ops.byNameHardErr["wg0"] = errors.New("EBUSY: transient netlink error")
 	ops.addExisting = true // LinkAdd returns "file exists"
-	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
-		t.Fatalf("Apply 2 (create fails): %v", err)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err == nil || errors.Is(err, errWGIncompatibleLinkRetained) {
+		t.Fatalf("Apply 2 must surface a NON-sentinel WG create failure (fail-closed #5355), got %v", err)
 	}
 	tm.mu.Lock()
 	owned := tm.ownedNames["wg0"]
@@ -1625,12 +1632,15 @@ func TestClearTunnelsDeletesOwnershipUnion(t *testing.T) {
 
 	// Apply where the second tunnel FAILS mid-apply (non-TUN collision
 	// whose LinkDel fails): it stays in ownedNames but never reaches
-	// t.tunnels.
+	// t.tunnels. #5355: that genuine replace-LinkDel failure is now
+	// SURFACED (fail-closed) rather than swallowed — Apply returns it — but
+	// the ownership bookkeeping this test exercises is unchanged.
 	ops.links["gr-0-0-1"] = &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "gr-0-0-1", Index: 9}}
-	ops.delFail["gr-0-0-1"] = errors.New("EBUSY")
+	injected := errors.New("EBUSY")
+	ops.delFail["gr-0-0-1"] = injected
 	tcs := []*config.TunnelConfig{anchorTC("gr-0-0-0"), anchorTC("gr-0-0-1")}
-	if err := tm.Apply(tcs); err != nil {
-		t.Fatalf("Apply: %v", err)
+	if err := tm.Apply(tcs); err == nil || !errors.Is(err, injected) {
+		t.Fatalf("Apply must surface the failed anchor-replace LinkDel (fail-closed #5355), got %v", err)
 	}
 
 	// ClearTunnels must delete EVERYTHING it owns — including the
