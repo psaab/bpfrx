@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/vishvananda/netlink"
@@ -47,14 +48,31 @@ func (c *CLI) showVlans() error {
 		return nil
 	}
 
-	// Build zone lookup: interface name → zone name
-	ifZone := make(map[string]string)
+	// Build zone lookup: interface name → zone name.
+	//
+	// #5325: a zone binds a LOGICAL interface such as "ge-0/0/9.0", but the
+	// VLAN-entry loop below keys by the BASE interface name plus the unit
+	// number. Keying ifZone by the raw zone-member string and then querying
+	// it with the bare base name (ifc.Name) missed every unit-qualified
+	// binding, blanking the Zone column for a correctly zoned VLAN unit.
+	// Build ifZone with the SAME canonical "base.unit" key the query uses,
+	// and keep a base-only map for un-unit-qualified bindings (which govern
+	// every unit of the interface). Mirrors the #4908/C175-HC-116 base/unit
+	// resolution in showChassisClusterStatus.
+	ifZone := make(map[string]string)     // "base.unit" -> zone
+	ifZoneBase := make(map[string]string) // "base"      -> zone (all units)
 	for zoneName, zone := range cfg.Security.Zones {
 		if zone == nil { // #3493: tolerant/HA-sync path may carry a nil zone value
 			continue
 		}
 		for _, iface := range zone.Interfaces {
-			ifZone[iface] = zoneName
+			if parts := strings.SplitN(iface, ".", 2); len(parts) == 2 {
+				if u, err := strconv.Atoi(parts[1]); err == nil {
+					ifZone[fmt.Sprintf("%s.%d", parts[0], u)] = zoneName
+					continue
+				}
+			}
+			ifZoneBase[iface] = zoneName
 		}
 	}
 
@@ -70,7 +88,14 @@ func (c *CLI) showVlans() error {
 	for _, ifc := range cfg.Interfaces.Interfaces {
 		for unitNum, unit := range ifc.Units {
 			if unit.VlanID > 0 || ifc.VlanTagging {
-				zone := ifZone[ifc.Name]
+				// #5325: query with the SAME canonical "base.unit" key used
+				// when building ifZone; fall back to a base-only binding
+				// (which governs every unit) so a non-unit-qualified zone
+				// member still resolves.
+				zone := ifZone[fmt.Sprintf("%s.%d", ifc.Name, unitNum)]
+				if zone == "" {
+					zone = ifZoneBase[ifc.Name]
+				}
 				entries = append(entries, vlanEntry{
 					iface:  ifc.Name,
 					unit:   unitNum,
