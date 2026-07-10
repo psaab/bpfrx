@@ -63,6 +63,13 @@ type fakeBpfrxClient struct {
 	getBGPStatusCalls  int
 	getBGPStatusReq    *pb.GetBGPStatusRequest
 	getBGPStatusOutput string
+
+	// MonitorPacketDrop recorder (#5051 remote-surface fail-closed parse
+	// coverage). Stubbing this RPC lets the strict-parse test assert that a
+	// malformed selector aborts BEFORE the stream is opened (packetDropCalls
+	// stays 0) rather than nil-panicking on the un-stubbed method.
+	packetDropCalls int
+	packetDropReq   *pb.MonitorPacketDropRequest
 }
 
 func (f *fakeBpfrxClient) GetBGPStatus(
