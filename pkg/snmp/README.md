@@ -294,7 +294,16 @@ authorization surface: every request is dropped because no community matches.
 
 ## ASN.1 specifics
 
-- Tag constants used: Counter32 (0x41), Gauge32 (0x42), Counter64 (0x46).
+- Tag constants used: Counter32 (0x41), Gauge32 (0x42), TimeTicks (0x43),
+  Counter64 (0x46).
+- **Unsigned application integers prepend a leading `0x00` when the top content
+  octet has its high bit set.** Counter32/Gauge32/Counter64 **and TimeTicks**
+  are unsigned, but BER integer content is two's-complement; without the leading
+  zero a value `>= 0x80…` decodes as negative. `berEncodeCounter32`,
+  `berEncodeGauge32`, `berEncodeCounter64`, and `berEncodeTimeTicks` all strip
+  leading zeros then prepend one `0x00` if `buf[0]&0x80 != 0`. TimeTicks lacked
+  this (#4924): `sysUpTime` and v1/v2 link-trap timestamps at `>= 0x80000000`
+  hundredths (~248.5 days uptime) encoded as non-canonical/negative BER.
 - Exception values: `noSuchObject` (0x80), `noSuchInstance` (0x81),
   `endOfMibView` (0x82) — emitted for missing OIDs in walks.
 - GETNEXT walking order is driven by a static OID list; it must stay in

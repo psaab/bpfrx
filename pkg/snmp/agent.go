@@ -1461,6 +1461,15 @@ func berEncodeTimeTicks(hundredths int) []byte {
 	for len(buf) > 1 && buf[0] == 0 {
 		buf = buf[1:]
 	}
+	// TimeTicks is an unsigned APPLICATION integer: if the most-significant
+	// content octet has its high bit set, prepend a 0x00 so the value is not
+	// misdecoded as a negative signed INTEGER. This mirrors berEncodeCounter32 /
+	// berEncodeGauge32 / berEncodeCounter64; without it a sysUpTime or v1/v2
+	// link-trap timestamp at >= 0x80000000 hundredths (~248.5 days of uptime)
+	// encodes as non-canonical/negative BER that strict managers reject (#4924).
+	if buf[0]&0x80 != 0 {
+		buf = append([]byte{0x00}, buf...)
+	}
 	return buf
 }
 
