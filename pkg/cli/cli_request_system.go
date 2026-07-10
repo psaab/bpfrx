@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/configstore"
 )
 
@@ -178,11 +180,30 @@ func (c *CLI) handleRequestSystemSoftware(args []string) error {
 		return fmt.Errorf("ISSU: %v", err)
 	}
 
-	fmt.Println("Node is now secondary for all redundancy groups.")
-	fmt.Println("Traffic has been drained to peer.")
-	fmt.Println("You may now replace the binary and restart the service:")
-	fmt.Println("  systemctl stop xpfd && <replace binary> && systemctl start xpfd")
+	c.reportInServiceUpgradeDrain()
 	return nil
+}
+
+// reportInServiceUpgradeDrain fences the drain-complete message on an OBSERVED
+// peer takeover before telling the operator it is safe to stop this node
+// (#5039). ForceSecondary only sets desired state and enqueues a droppable
+// election event; the actual handoff happens asynchronously and can lag, so
+// the command waits (bounded) to see the peer own primary before printing stop
+// instructions, and otherwise warns and withholds them. Split out so the
+// rendering is unit-testable without driving the interactive confirmation
+// prompt.
+func (c *CLI) reportInServiceUpgradeDrain() {
+	ctx, cancel := context.WithTimeout(context.Background(), cluster.DefaultUpgradeHandoffTimeout)
+	defer cancel()
+	confirmed := c.cluster.WaitForUpgradeHandoff(ctx, cluster.DefaultUpgradeHandoffPoll)
+	printISSUDrainReport(confirmed)
+}
+
+// printISSUDrainReport writes the honest ISSU drain report to stdout.
+func printISSUDrainReport(handoffConfirmed bool) {
+	for _, line := range cluster.UpgradeDrainReport(handoffConfirmed) {
+		fmt.Println(line)
+	}
 }
 
 func (c *CLI) handleRequestSystemConfiguration(args []string) error {

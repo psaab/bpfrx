@@ -44895,6 +44895,52 @@ top.
 - **File(s)**: pkg/flowexport/transport.go,
   pkg/flowexport/maxdepth_race_5048_test.go
 
+- **Timestamp**: 2026-07-10
+- **Action**: Fix ISSU `request system software in-service-upgrade` printing
+  drain-complete + stop instructions from desired state alone (#5039).
+  `ForceSecondary()` only sets desired manager state and enqueues a droppable
+  election event; the real VRRP resignation / VIP handoff happens
+  asynchronously and can lag or be dropped. Both the interactive CLI handler
+  (`pkg/cli/cli_request_system.go`) and the remote-CLI gRPC path
+  (`pkg/grpcapi/server_diag_system_action.go`, reached via
+  `cmd/cli/request.go` SystemAction) unconditionally printed "Traffic has been
+  drained to peer" + `systemctl stop xpfd` straight off ForceSecondary's
+  return — certifying a drain that may not have happened and telling the
+  operator to stop the only forwarding owner. Added a read-only observer
+  `Manager.WaitForUpgradeHandoff` (bounded wait until peer alive + primary for
+  >=1 RG AND this node no longer primary for any RG) plus a shared honest
+  `UpgradeDrainReport(confirmed)` builder in `pkg/cluster/upgrade_drain.go`.
+  Both surfaces now fence the stop instruction on the OBSERVED handoff; on
+  timeout they warn and direct `show chassis cluster status` verification. No
+  change to the drain mutation / ISSU behavior — output-only fence. RED-on-
+  revert tests in pkg/cluster (message both modes + fence), pkg/cli (CLI
+  render), pkg/grpcapi (wire format + drain-start gate). Doc: feature-gaps.md
+  ISSU row updated.
+- **File(s)**: pkg/cluster/upgrade_drain.go,
+  pkg/cluster/upgrade_drain_test.go, pkg/cli/cli_request_system.go,
+  pkg/cli/cli_request_system_issu_5039_test.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_diag_issu_5039_test.go, docs/feature-gaps.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: Address HA reviewer on #5405 (#5039). (1) BLOCKER: partial-drain
+  blackhole — `upgradeHandoffComplete()` confirmed on the FIRST peer-primary RG
+  (any-one OR over peerGroups), so in the default multi-RG config a peer taking
+  over only RG0 (control-plane, no data VIP) while data RGs lagged/events were
+  dropped would print "drained — safe to stop" and blackhole the still-node0
+  data RG. Tightened to require EVERY non-disabled RG this node relinquished to
+  be peer-primary (skip disabled RGs; a zero-enabled-RG config never confirms).
+  (2) NIT: removed the copy-pasteable `systemctl stop ...` line from the
+  UNCONFIRMED report so a hurried operator can't paste it past the warning; the
+  stop/swap command is printed only on the confirmed path. Extended tests:
+  multi-RG partial (1/3 peer-primary → NOT confirmed, RED on any-one revert),
+  full (3/3 → confirmed), missing-peer-entry, disabled-RG skip, zero-enabled;
+  unconfirmed reports (cluster/cli/grpcapi) assert NO "systemctl stop".
+  `go test -race` green on the three packages.
+- **File(s)**: pkg/cluster/upgrade_drain.go,
+  pkg/cluster/upgrade_drain_test.go,
+  pkg/cli/cli_request_system_issu_5039_test.go,
+  pkg/grpcapi/server_diag_issu_5039_test.go
 ## 2026-07-10 — #5234 fsatomic/configstore post-rename durability classification coverage
 - **Timestamp**: 2026-07-10
 - **Action**: Close the #5234 test-coverage gap (follow-up to #5185/#5230).
