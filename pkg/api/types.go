@@ -466,6 +466,22 @@ type RouteInfo struct {
 	// a next-table leaks nothing here, so existing consumers reading
 	// destination/next_hop/interface/preference/next_table are unaffected.
 	Disposition string `json:"disposition,omitempty"`
+	// Family is the address family this static route lives in: "inet"
+	// (IPv4, rib inet.0) or "inet6" (IPv6, rib inet6.0). Before #5439 the
+	// REST /routes view rendered only inet.0 routes, so it silently omitted
+	// every IPv6 and per-routing-instance static route — inconsistent with
+	// the CLI/gRPC `show route`, which iterates both families and every VRF.
+	// The handler now covers v4 + v6 + per-routing-instance routes, tagging
+	// each with its Family and Table so the REST view matches show-route
+	// coverage. Additive and omitempty: a legacy consumer reading only the
+	// pre-#5439 inet.0 subset ignores these.
+	Family string `json:"family,omitempty"`
+	// Table is the Junos RIB this route belongs to: "inet.0" / "inet6.0" for
+	// the global (default) routing table, or "<instance>.inet.0" /
+	// "<instance>.inet6.0" for a per-routing-instance (VRF) static route
+	// (#5439). It encodes both the routing instance and the family, matching
+	// how the CLI/gRPC label each table. Additive and omitempty.
+	Table string `json:"table,omitempty"`
 }
 
 // ScreenInfo holds screen profile information.
