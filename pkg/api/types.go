@@ -457,6 +457,15 @@ type RouteInfo struct {
 	Interface   string `json:"interface,omitempty"`
 	Preference  int    `json:"preference,omitempty"`
 	NextTable   string `json:"next_table,omitempty"`
+	// Disposition labels a route that has no forwarding next-hop with the
+	// action it takes: "reject" (return ICMP unreachable, FRR
+	// RTN_UNREACHABLE), "discard" (silent blackhole, FRR Null0), or
+	// "connected" (directly-connected, no gateway). It mirrors the
+	// reject/discard labels the CLI/gRPC `show route` text already renders
+	// (#5298/#5410). Additive and omitempty: a route with a real next-hop or
+	// a next-table leaks nothing here, so existing consumers reading
+	// destination/next_hop/interface/preference/next_table are unaffected.
+	Disposition string `json:"disposition,omitempty"`
 }
 
 // ScreenInfo holds screen profile information.
