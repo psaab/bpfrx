@@ -4,8 +4,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/upgrade"
 )
 
@@ -33,18 +40,7 @@ func runUpgradeSubcommand(args []string) {
 	}
 	rolling := &flags.rolling
 
-	cfg := upgrade.Config{
-		StagedDir:           flags.stagedDir,
-		VersionsDir:         flags.versionsDir,
-		StagedGenDir:        flags.stagedGenDir,
-		SbinDir:             flags.sbinDir,
-		ConfigDBDir:         flags.configDBDir,
-		JournalPath:         flags.journalPath,
-		Unit:                flags.unit,
-		StartHealthDeadline: flags.healthDeadline,
-		Sys:                 upgrade.NewSystem(flags.unit),
-		Logf:                func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
-	}
+	cfg := newUpgradeConfig(flags)
 	r, err := upgrade.NewRunner(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "upgrade: %v\n", err)
@@ -82,6 +78,119 @@ func runUpgradeSubcommand(args []string) {
 		os.Exit(1)
 	}
 	fmt.Println("upgrade complete")
+}
+
+// newUpgradeConfig assembles the upgrade Runner Config, WIRING the post-cut
+// helper-readiness probe into Sys via buildUpgradeSystem (#5286). Extracted from
+// runUpgradeSubcommand (which calls os.Exit and cannot be unit-tested) so a test
+// can assert the constructed Sys actually consults the helper probe rather than
+// the pre-fix is-active-only NewSystem.
+func newUpgradeConfig(flags upgradeFlags) upgrade.Config {
+	return upgrade.Config{
+		StagedDir:           flags.stagedDir,
+		VersionsDir:         flags.versionsDir,
+		StagedGenDir:        flags.stagedGenDir,
+		SbinDir:             flags.sbinDir,
+		ConfigDBDir:         flags.configDBDir,
+		JournalPath:         flags.journalPath,
+		Unit:                flags.unit,
+		StartHealthDeadline: flags.healthDeadline,
+		Sys:                 buildUpgradeSystem(flags),
+		Logf:                func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
+	}
+}
+
+// buildUpgradeSystem constructs the production upgrade System, WIRING the
+// post-cut helper-readiness probe (#5286). Before this fix the site built
+// upgrade.NewSystem(flags.unit) — no probe — so realSystem.HelperHealthy
+// degraded to a bare `systemctl is-active` poll and IGNORED expectVersion. A
+// tree-wide grep found ZERO callers of NewSystemWithHelperHealth, so service
+// PROCESS ACTIVITY was the only witness on the failure-critical cutover path: a
+// Type=simple xpfd reports active immediately, so the cut could COMMIT (and
+// clear the rollback journal / return the node to HA election) while the
+// userspace helper was down / stale / crash-looping and NOT forwarding.
+//
+// The wired probe (upgrade.HelperHealthProbe) fails CLOSED unless, within the
+// health deadline, the unit is active AND the helper reports armed+forwarding
+// on the control socket AND that armed helper is executing the freshly-cut
+// TARGET version's binary. Not-healthy flows into cutover.go's existing
+// rollback path (standalone auto-rollback; HA surfaces the failure).
+func buildUpgradeSystem(flags upgradeFlags) upgrade.System {
+	unit := flags.unit
+	if unit == "" {
+		unit = upgrade.DefaultUnit
+	}
+	deps := upgrade.HelperHealthDeps{
+		UnitActive:    func() bool { return upgradeUnitActive(unit) },
+		Status:        upgradeHelperStatus,
+		HelperExe:     upgradeHelperExe,
+		ControlSocket: upgradeControlSock(flags.configDBDir),
+		VersionsDir:   flags.versionsDir,
+	}
+	return upgrade.NewSystemWithHelperHealth(unit, upgrade.HelperHealthProbe(deps))
+}
+
+// Seams for the #5286 helper-readiness probe. Package vars so a test can point
+// the control-socket status query, the exe resolution, the is-active check, and
+// the socket-path resolution at fakes — and prove the production System
+// actually CONSULTS the helper probe (NewSystemWithHelperHealth), not the
+// pre-fix is-active-only NewSystem.
+var (
+	upgradeHelperStatus upgrade.HelperStatusFunc = defaultUpgradeHelperStatus
+	upgradeHelperExe    upgrade.HelperExeFunc    = defaultUpgradeHelperExe
+	upgradeUnitActive                            = defaultUpgradeUnitActive
+	upgradeControlSock                           = defaultUpgradeControlSocket
+)
+
+// defaultUpgradeHelperStatus adapts the existing control-socket status query
+// (userspace.ProbeStatus — the same one-shot "status" request the runtime and
+// the #1993 boot probe use) to the primitive tuple pkg/upgrade consumes. It
+// invents no new IPC.
+func defaultUpgradeHelperStatus(controlSocket string, timeout time.Duration) (enabled, armed bool, pid int, err error) {
+	st, perr := dpuserspace.ProbeStatus(controlSocket, timeout)
+	if perr != nil {
+		return false, false, 0, perr
+	}
+	if st == nil {
+		// Helper answered !ok / no live status: not ready.
+		return false, false, 0, nil
+	}
+	return st.Enabled, st.ForwardingArmed, st.PID, nil
+}
+
+// defaultUpgradeHelperExe resolves the executable a running PID is executing via
+// /proc/<pid>/exe. The upgrade subprocess runs as root, so the readlink is
+// permitted. Readlink returns the RESOLVED real path even when the helper was
+// launched through the /usr/local/sbin symlink, so it lands under
+// versions/<target>/ regardless of launch form.
+func defaultUpgradeHelperExe(pid int) (string, error) {
+	return os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
+}
+
+// defaultUpgradeUnitActive reports whether <unit>.service is active.
+func defaultUpgradeUnitActive(unit string) bool {
+	out, _ := exec.Command("systemctl", "is-active", unit+".service").Output()
+	return strings.TrimSpace(string(out)) == "active"
+}
+
+// defaultUpgradeControlSocket resolves the helper control-socket path from the
+// ACTIVE config so an operator `system dataplane control-socket <path>`
+// override is honored (a cutover gate that probed the wrong socket would
+// false-negative and roll back a healthy upgrade). Best-effort and read-only:
+// on any failure it falls back to the default path — which is what a
+// default-config deployment's helper listens on (mirrors the #1993 boot probe's
+// DefaultControlSocketPath(nil) precedent). It never MUTATES config state.
+func defaultUpgradeControlSocket(configDBDir string) string {
+	if fi, err := os.Stat(configDBDir); err == nil && fi.IsDir() {
+		if db, derr := configstore.NewDB(configDBDir); derr == nil {
+			if tree, rerr := db.ReadActive(); rerr == nil && tree != nil {
+				if cfg, cerr := config.CompileConfigLenient(tree); cerr == nil && cfg != nil {
+					return dpuserspace.DefaultControlSocketPath(cfg)
+				}
+			}
+		}
+	}
+	return dpuserspace.DefaultControlSocketPath(nil)
 }
 
 // upgradeFlags holds the parsed `xpfd upgrade` flags. Kept in a struct so the

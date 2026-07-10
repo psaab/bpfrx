@@ -1,3 +1,33 @@
+## 2026-07-10 — upgrade: wire real helper-readiness gate at cutover (#5286)
+
+- **Timestamp**: 2026-07-10
+  - **Action**: #5286 production wired `NewSystemWithHelperHealth` (previously
+    ZERO callers) at the `cmd/xpfd` cutover construction site, so
+    `realSystem.HelperHealthy` no longer degrades to a bare `systemctl
+    is-active` poll that ignored `expectVersion`. New `HelperHealthProbe`
+    (`pkg/upgrade/helper_health.go`) FAILS CLOSED unless, within the health
+    deadline, it observes ALL of: unit active (precondition), helper
+    `Enabled && ForwardingArmed` via the existing control-socket status query
+    (`userspace.ProbeStatus`, new sibling of `ProbeForwardingArmed` — no new
+    IPC), AND the armed helper's `/proc/<pid>/exe` under
+    `versions/<expectVersion>/` (target-version tie). Not-healthy flows into
+    cutover.go's existing rollback path (standalone auto-rollback; HA surfaces).
+    Control socket resolved from the active config (honors operator override)
+    with default fallback.
+  - **File(s)**: pkg/dataplane/userspace/boot_probe.go (add ProbeStatus,
+    refactor ProbeForwardingArmed), pkg/upgrade/helper_health.go (new),
+    pkg/upgrade/system_linux.go (unitActiveProbe seam), cmd/xpfd/upgrade.go
+    (buildUpgradeSystem/newUpgradeConfig + probe adapters/seams),
+    pkg/upgrade/helper_health_5286_test.go (new),
+    cmd/xpfd/upgrade_helper_health_5286_test.go (new),
+    pkg/upgrade/runner_test.go (fakeSystem.healthProbe hook),
+    docs/in-place-upgrade.md (post-start readiness gate section).
+  - **Validation**: `go build ./...` exit 0; `go test ./cmd/xpfd/...
+    ./pkg/upgrade/...` ok; userspace boot_probe tests ok; gofmt clean.
+    RED-on-revert verified: simulating an is-active-only revert fails
+    ActiveButNotForwarding / StaleVersionHelper / StatusQueryError /
+    RevertToIsActiveOnly / Run_NotForwardingHelper_DoesNotCommit; reverting the
+    Sys wiring to NewSystem fails the cmd/xpfd wiring guard.
 ## 2026-07-10 — config: fail closed on an invalid IPsec bind-interface (#5297)
 
 - **Timestamp**: 2026-07-10
