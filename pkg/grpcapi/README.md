@@ -198,6 +198,18 @@ contract.
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
+- **Bounded shutdown (#4910).** Both listeners stop through
+  `stopGRPCServer` (`server.go`): `GracefulStop` runs in a goroutine and,
+  if active RPCs have not finished within `grpcStopTimeout`, `Stop()`
+  force-closes the connections. This is required because `MonitorInterface`
+  streams forever off only its client `stream.Context()` — a client
+  holding that stream open during shutdown would otherwise block
+  `GracefulStop`, and therefore `Run` / `RunFabricListener`, indefinitely
+  (a stuck daemon stop / failover / restart). `Run`'s serve+shutdown loop
+  is factored into `serveUntilDone(ctx, srv, lis)` so the bounded-stop path
+  is exercisable over an in-memory listener. A normal, RPC-idle shutdown
+  (or one where every client has disconnected) returns as soon as
+  `GracefulStop` completes — the timeout is only a backstop.
 - Request-path external commands (ps, df, ss, journalctl, chronyc,
   ntpq, timedatectl, tail, ip neigh flush, systemctl power actions)
   must go through the bounded helpers in `exec_timeout.go` (#1805):
