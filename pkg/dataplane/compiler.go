@@ -563,7 +563,13 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 			return fmt.Errorf("application %q not found", appName)
 		}
 
-		proto := protocolNumber(app.Protocol)
+		// #4887: honor ProtocolNumber's ok bit so an EXPLICIT but unrepresentable
+		// protocol token (surviving a tolerant/HA-sync load) does not record a
+		// stampable AppNames name. protocolNumber (still used for the retired eBPF
+		// port writes and by compiler_nat.go) drops ok; read it here to gate the
+		// AppNames row identically to appid.BuildCatalog and keep the two AppNames
+		// maps byte-identical (appid_catalog_parity_test.go).
+		proto, protoOK := appid.ProtocolNumber(app.Protocol)
 
 		result.AppIDs[appName] = appID
 
@@ -600,7 +606,12 @@ func compileApplications(dp DataPlane, cfg *config.Config, result *CompileResult
 		// AppNames maps stay byte-identical (appid_catalog_parity_test.go). The
 		// id is still consumed (loop-tail appID++) because BuildCatalog also
 		// consumes it here; only the dest-port `continue` above skips the id.
-		if srcOK && dstLow <= dstHigh && srcLow <= srcHigh {
+		// #4887: an OMITTED protocol (empty spec) fans out to TCP+UDP below and
+		// stays emittable even though ProtocolNumber("") reports ok=false; an
+		// EXPLICIT but unrepresentable protocol records no AppNames name (gated
+		// identically to appid.BuildCatalog for parity).
+		protoEmittable := protoOK || strings.TrimSpace(app.Protocol) == ""
+		if protoEmittable && srcOK && dstLow <= dstHigh && srcLow <= srcHigh {
 			result.AppNames[uint16(appID)] = appName
 		}
 
