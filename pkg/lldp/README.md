@@ -14,7 +14,10 @@ frame flood cannot exhaust memory (#4044).
 - `Apply(ctx context.Context, cfg *LLDPConfig)` — `lldp.go`. Reconcile-shaped:
   `Stop()`s the current generation before starting the new one, so calling it
   repeatedly is idempotent. A nil/disabled/empty config stops the service.
-- `Stop()` — `lldp.go`.
+  Holds `lifecycleMu` across the whole transition so a concurrent `Stop()`
+  cannot interleave (see **Apply/Stop concurrency** below).
+- `Stop()` — `lldp.go`. Holds `lifecycleMu`, then tears the generation down via
+  the internal `stopLocked`.
 - `Running()` — `lldp.go`. Reports whether a live generation has at least one
   active interface session. Used by the daemon's day-2 reconcile (#2372) and
   its tests to observe the start/stop transition.
@@ -79,6 +82,25 @@ interface-name gotcha below).
 - Construction goes through the `newIfSessionFn` seam so `socket_test.go`
   can inject a `socketpair(2)`-backed session and assert `Stop()` returns
   promptly with a parked RX goroutine, without `CAP_NET_RAW`.
+- **Apply/Stop concurrency (`#5121`):** `Apply` (a config commit) and `Stop`
+  (daemon shutdown) are lifecycle transitions that can run concurrently — the
+  shutdown path (`pkg/daemon` `runShutdownSequence`) calls `lldpMgr.Stop()`
+  **without** the `applySem` that `Apply` runs under, so a `SIGTERM` mid-commit
+  races them. A dedicated `lifecycleMu` (distinct from the `mu` that guards the
+  neighbor table / sessions) serializes the two: `Apply` holds it across the
+  whole teardown-then-rebuild and `Stop` holds it across the teardown, so the
+  `m.cancel` write/read, every `wg.Add(1)` vs `wg.Wait()`, and the session
+  publish vs snapshot are atomic with respect to each other. Without it the
+  race detector flags `m.cancel` and the `WaitGroup`, the `Add`/`Wait`
+  interleave is a `WaitGroup` misuse (panic or a dropped join), and a `Stop`
+  that snapshots the session set before `Apply` publishes a later interface's
+  session leaves that RX goroutine parked in `recv` forever (hanging shutdown,
+  leaking the socket). `Apply` calls the internal `stopLocked` (not `Stop`) to
+  avoid re-acquiring the non-reentrant lock; `lifecycleMu` is never held by the
+  TX/RX/expiry goroutines (they take only `mu`), so holding it across
+  `wg.Wait()` cannot deadlock. Regression: `TestApplyStopLifecycleRace`
+  (`lifecycle_mutex_5121_test.go`), RED under `go test -race` if the mutex is
+  reverted.
 - A socket setup / `CAP_NET_RAW` failure now surfaces at `Apply()` time
   (logged once, interface skipped) instead of silently per-frame.
 

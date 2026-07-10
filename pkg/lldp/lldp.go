@@ -87,6 +87,26 @@ type LLDPConfig struct {
 
 // Manager runs LLDP transmit/receive goroutines and maintains the neighbor table.
 type Manager struct {
+	// lifecycleMu serializes the Apply/Stop generation transition. Apply (a
+	// config commit) and Stop (daemon shutdown) can run concurrently — the
+	// shutdown path calls Stop() without the applySem that Apply runs under, so
+	// a SIGTERM mid-commit races them. Without this lock that race is real
+	// (#5121): Apply's wg.Add(1) races Stop's wg.Wait() (a WaitGroup misuse that
+	// can panic or lose a goroutine from the join), the m.cancel write/read is a
+	// data race, and Stop can snapshot the session set before Apply finishes
+	// publishing later sessions — leaving those interfaces' RX goroutines parked
+	// in recv forever (their fds never get closed), which hangs shutdown and
+	// leaks sockets/goroutines. Holding lifecycleMu across the whole transition
+	// makes each of build (Apply) and teardown (Stop) atomic with respect to the
+	// other.
+	//
+	// It is deliberately NOT m.mu: the TX/RX/expiry goroutines take only m.mu
+	// (never lifecycleMu), so holding lifecycleMu across stopLocked's wg.Wait()
+	// cannot deadlock against the goroutines being joined. Apply calls the
+	// internal stopLocked() (not Stop()) to avoid a self-deadlock on the
+	// non-reentrant lock.
+	lifecycleMu sync.Mutex
+
 	mu        sync.RWMutex
 	neighbors map[string]*Neighbor // key: "ifname/chassisID/portID"
 	cancel    context.CancelFunc
@@ -232,9 +252,19 @@ func New() *Manager {
 }
 
 // Apply starts LLDP on the configured interfaces.
+//
+// It holds lifecycleMu for the entire generation transition so a concurrent
+// Stop() (daemon shutdown) cannot interleave with the teardown-then-rebuild:
+// the tear-down of the previous generation, the cancel/session publication of
+// the new one, and every wg.Add(1) all happen atomically with respect to a
+// racing Stop (#5121). The internal teardown uses stopLocked() (not Stop) to
+// avoid re-acquiring the non-reentrant lifecycleMu.
 func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	m.applyCount.Add(1)
-	m.Stop()
+	m.stopLocked()
 
 	if cfg == nil || cfg.Disable || len(cfg.Interfaces) == 0 {
 		return
@@ -313,7 +343,18 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 	}()
 }
 
-// Stop halts all LLDP goroutines and clears the neighbor table.
+// Stop halts all LLDP goroutines and clears the neighbor table. It holds
+// lifecycleMu so a concurrent Apply() (config commit) cannot interleave its
+// build with this teardown (#5121); the actual work is in stopLocked.
+func (m *Manager) Stop() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.stopLocked()
+}
+
+// stopLocked performs the generation teardown. The caller MUST hold
+// lifecycleMu (Stop acquires it; Apply already holds it), which is what
+// serializes the cancel/wg access against a racing Apply/Stop.
 //
 // Ordering is load-bearing: cancel the context (stops the timer-driven TX and
 // expiry loops), then close every session's sockets (unblocks any RX goroutine
@@ -321,7 +362,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 // is what makes Stop bounded — waiting first would re-introduce the read-timeout
 // stall. The close-under-read race is benign: a recv on a just-closed fd returns
 // an error and the RX loop treats any post-cancel error as "shutdown, return".
-func (m *Manager) Stop() {
+func (m *Manager) stopLocked() {
 	m.mu.Lock()
 	sessions := m.sessions
 	m.sessions = nil
