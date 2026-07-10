@@ -152,7 +152,7 @@ it is entangled with the lease-sync memfile fallback (`lease_sync.go`,
 engine reads leases through an injected seam:
 
 ```go
-type Lease struct { Family int; Address, Identity, SubnetID, HostName, ClientFQDN string }
+type Lease struct { Family int; Address, Identity, SubnetID, HostName, ClientFQDN string; LeaseType int }
 type LeaseParser func(path string, family int, now time.Time) ([]Lease, error)
 ```
 
@@ -161,6 +161,20 @@ type LeaseParser func(path string, family int, now time.Time) ([]Lease, error)
 constructs the manager. The dependency is one-way: **`pkg/ddns` never imports
 `pkg/dhcpserver`.** `pkg/ddns` imports only `pkg/config` (for the typed
 `DHCPDynamicDNSConfig` the policy/backend factory consume) and `pkg/fsatomic`.
+
+**Only address-bearing leases publish (`Lease.LeaseType`, #5072).** The v6
+lease_type discriminator is carried through the seam so the reconciler can gate
+by lease kind: `reconcileOnceLocked` runs an explicit address-lease ALLOWLIST
+(`isAddressLease` — IA_NA / IA_TA only) BEFORE name/record derivation, so an
+IA_PD delegated-prefix binding never has its prefix base (e.g.
+`2001:db8:abcd::`) coerced into a host AAAA/PTR — publishing authoritative DNS
+for a delegated network base is an info-disclosure / policy violation. The
+`LeaseType` zero value is `LeaseTypeIANA` (an address lease), so a v4 lease and
+a v6 lease with no lease_type column are treated as address-bearing; the
+Kea-memfile adapter maps a present-but-unparseable / unknown column to
+`LeaseTypeUnknown` so it is rejected fail-closed. Skipped leases increment
+`Stats.SkippedNonAddress`. Before #5072 the adapter dropped lease_type and every
+named lease (IA_PD included) was published.
 
 ## Cross-package surface (used via `pkg/dhcpserver` aliases)
 
