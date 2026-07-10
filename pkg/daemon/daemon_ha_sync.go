@@ -414,7 +414,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// interface directly (handles config-only mode where applyConfig may
 	// have run but mgmtVRFInterfaces is empty due to VRF creation failure).
 	vrfDevice := ""
-	if len(d.mgmtVRFInterfaces) > 0 {
+	if len(d.mgmtVRFIfaceSet()) > 0 {
 		vrfDevice = "vrf-mgmt"
 	} else if cc.ControlInterface != "" {
 		// Control/fabric interfaces (em*, fab*) are always placed in

@@ -1019,8 +1019,8 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// networkctl reconfigure strips VRF master bindings because networkd
 	// considers the daemon-created vrf-mgmt device "unmanaged" and ignores
 	// the VRF= directive. Re-bind here to restore VRF membership.
-	if d.routing != nil && d.mgmtVRFInterfaces != nil {
-		for ifName := range d.mgmtVRFInterfaces {
+	if mgmtSet := d.mgmtVRFIfaceSet(); d.routing != nil && len(mgmtSet) > 0 {
+		for ifName := range mgmtSet {
 			if err := d.routing.BindInterfaceToVRF(ifName, "mgmt"); err != nil {
 				slog.Warn("failed to re-bind interface to management VRF",
 					"interface", ifName, "err", err)
@@ -1485,9 +1485,14 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 	// If reconcile errored out before vrf-mgmt could be created,
 	// downstream code (applyMgmtVRFRoutes, HA sync) would otherwise
 	// run against a non-existent VRF.
-	d.mgmtVRFInterfaces = nil
+	// Compute the final management-VRF interface set, then publish it with a
+	// single atomic Store (#5113) so a lock-free DHCP-callback reader never
+	// observes the transient nil the old two-step (= nil then = mgmtIfaces)
+	// published. mgmtSet stays nil (readers see the safe empty state) unless
+	// reconcile actually got vrf-mgmt into the managed set.
+	var mgmtSet map[string]bool
 	if d.routing != nil && len(mgmtIfaces) > 0 && d.routing.IsManagedVRF(mgmtVRFName) {
-		d.mgmtVRFInterfaces = mgmtIfaces
+		mgmtSet = mgmtIfaces
 		for ifName := range mgmtIfaces {
 			if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
 				slog.Warn("failed to bind interface to management VRF",
@@ -1495,6 +1500,7 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 			}
 		}
 	}
+	d.publishMgmtVRFIfaces(mgmtSet)
 
 	// 0.6. Program default routes in the management VRF for DHCP leases.
 	d.applyMgmtVRFRoutes()
