@@ -6398,6 +6398,98 @@ fn empty_except_prefix_list_scope_matches_all() {
     );
 }
 
+// #5097: the source_except POLARITY the Go control plane lowers for an
+// UNRESOLVED sole `except` prefix-list is load-bearing at the matcher. This
+// pairs the two snapshots to prove it:
+//   - FIXED lowering (source_except=true, empty, constrained) -> the matcher's
+//     empty-except guard returns `except` = match ALL, so a discard term drops
+//     the packet (fail CLOSED).
+//   - BUGGY lowering (source_except=false, empty, constrained) -> the empty
+//     positive guard returns false = match NOTHING, so the discard term matches
+//     no packet and traffic falls through to the terminal accept (fail OPEN).
+// The Go fix flips the emitted flag from the second shape to the first; this
+// test locks the matcher contract the fix depends on.
+//
+// FAIL-ON-REVERT: revert the `nets_match_v4`/`nets_match_v6` empty guard from
+// `return except` to a hardcoded `return false` (the pre-#2506 collapse) and the
+// FIXED-lowering assertion below flips Discard -> Accept and goes RED.
+#[test]
+fn unresolved_sole_except_polarity_is_load_bearing_5097() {
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    let dst = IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1));
+
+    // FIXED (#5097) lowering: unresolved sole except -> except=true, empty,
+    // constrained. Discard term must match ALL -> packet discarded (fail closed).
+    let fixed = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "unresolved-except-discard".into(),
+                    source_addresses: vec![], // unresolved -> no prefixes
+                    source_except: true,      // ...but polarity preserved
+                    source_constrained: true,
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default-accept".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &fixed, "inet:f", src, dst, PROTO_TCP, 1000, 80, 0, TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "the FIXED #5097 lowering (unresolved sole except -> except=true) must \
+         match ALL and DISCARD (fail closed); a matcher whose empty-except guard \
+         returns match-none reintroduces the fail-OPEN"
+    );
+
+    // BUGGY (pre-#5097) lowering: the `continue` dropped the polarity, emitting
+    // except=false. Empty positive scope matches NOTHING, so the discard term
+    // never fires and the packet falls through to the terminal accept (fail
+    // OPEN). This asserts the flag — not the empty list — decides the outcome.
+    let buggy = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "lost-polarity-discard".into(),
+                    source_addresses: vec![],
+                    source_except: false, // #5097 bug: polarity lost
+                    source_constrained: true,
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default-accept".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &buggy, "inet:f", src, dst, PROTO_TCP, 1000, 80, 0, TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "the BUGGY pre-#5097 lowering (except=false) matches NOTHING -> the \
+         discard never fires -> fail OPEN. Proves source_except is load-bearing."
+    );
+}
+
 #[test]
 fn except_v4_list_does_not_constrain_v6_packet() {
     // Cross-family: `from source-prefix-list X except` where X is v4-only. For a
