@@ -381,6 +381,28 @@ client never reconnects once the receiver returns.
   current writer running (the flowexport #3742 keep-old-on-failure posture).
   `EventReader.CallbackCount()` is the leak witness. Pin:
   `TestFlowTraceSingleCallbackAcrossReconciles` (`pkg/daemon`).
+- **Session aggregator: equality gate keeps the live window, teardown flushes
+  it (#5313).** `applyAggregator` (`pkg/daemon/daemon_system.go`) derives a
+  comparable `aggregatorSig` (report enabled + flush interval + top-N) from the
+  active config and retires+rebuilds the running `SessionAggregator` ONLY when
+  the signature genuinely changes. An unchanged report-enabled re-apply — any
+  unrelated commit that re-runs `applySyslogConfig` (a syslog-stream edit, a
+  hostname change) — now keeps the SAME live aggregator, so its pending flush
+  window survives. Before #5313 `applyAggregator` cancelled+replaced on EVERY
+  call, and `SessionAggregator.Run` returned on `ctx.Done()` WITHOUT flushing
+  (`flushAndLog` fired only on `ticker.C`), so up to a full ~5 min window of
+  accumulated `SESSION_CLOSE` counters was silently discarded on any such
+  commit. The composed fix: (1) the equality gate above, and (2) `Run` now
+  performs a FINAL `flushAndLog` on `ctx.Done()` before returning, so a genuine
+  replace/disable/shutdown emits the retiring window as its own (partial)
+  report and the new generation starts from an empty window. `flushAndLog`
+  suppresses an all-empty report and `topAndReset` drains the window, so a
+  ticker flush immediately followed by teardown neither double-counts nor emits
+  an empty line. Pins (fail-on-revert): `TestApplyAggregatorEqualityGateKeeps-
+  LiveAggregator` + `TestApplyAggregatorConfigChangeFlushesPendingWindow`
+  (`pkg/daemon`), `TestAggregatorRunFinalFlushOnCancel` +
+  `TestAggregatorRunNoEmptyFlushOnCancel` + `TestAggregatorFlushAndLogNoDouble-
+  Emit` (`pkg/logging`).
 - **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
   The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
   in its first 8 bytes (LE u64), stamped by the userspace-dp producer at
