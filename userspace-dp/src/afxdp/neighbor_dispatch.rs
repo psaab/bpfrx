@@ -480,6 +480,28 @@ pub(super) fn learn_dynamic_neighbor(
     src_ip: IpAddr,
     src_mac: [u8; 6],
 ) {
+    // #4889: illegitimate source-IP CLASS gate on the #1787 RX source-MAC
+    // learn path, mirroring the #2790 unicast-only gate the ARP-reply and
+    // NDP-NA learn arms already apply in poll_stages.rs. Unlike those L2
+    // advert paths, this 5th learn path derives the neighbor identity from
+    // a LIVE transit frame's L3 source (`flow.src_ip`) — an attacker can
+    // therefore send a normal TCP/UDP packet with a unicast source MAC but
+    // a spoofed source IP whose CLASS can never name a real next-hop host
+    // (unspecified `0.0.0.0`/`::`, loopback `127/8`/`::1`, multicast
+    // `224/4`/`ff00::/8`, or the IPv4 limited broadcast
+    // `255.255.255.255`). Caching such a `(ingress_ifindex, spoofed_ip) ->
+    // src_mac` entry poisons the userspace `dynamic_neighbors` map (and,
+    // via `add_kernel_neighbor` on the ARP/NDP siblings, could feed the
+    // kernel table) with an impossible next-hop identity. Reuse the single
+    // source of truth `neighbor_ip_is_learnable` (handles v4+v6) rather
+    // than re-deriving the class checks. Runs BEFORE the own-IP gate and
+    // the `learn_pair_if_changed` insert so a rejected learn neither caches
+    // nor bumps `mac_change_epoch` (#3048/#3169). Rejection means
+    // do-not-learn only — the packet still forwards; this is a learn-path
+    // guard, not a packet filter.
+    if !neighbor_ip_is_learnable(src_ip) {
+        return;
+    }
     // #3182: anti-poisoning own-IP gate on the #1787 RX source-MAC learn
     // path, mirroring the #2851 ARP/NDP gate in poll_stages.rs. An attacker
     // can spoof a transit packet whose SOURCE IP is one of the router's own

@@ -1381,6 +1381,90 @@ fn rx_learn_own_wan_ip_rejected_3182() {
     );
 }
 
+/// #4889 fail-on-revert (RX source-MAC learn path illegitimate source-IP
+/// CLASS anti-poison). The #1787 RX learn path (`learn_dynamic_neighbor`,
+/// reached via `stage_parse_flow_and_learn`) derives the neighbor identity
+/// from a LIVE transit frame's L3 source. Before #4889 it validated only
+/// the Ethernet source-MAC class and the own-IP overlap (#3182) — NOT the
+/// source-IP class. A packet with a unicast source MAC but a spoofed source
+/// IP whose class can never name a real next-hop (loopback / multicast /
+/// limited-broadcast / unspecified, v4 and v6) therefore seeded an
+/// impossible `(ingress_ifindex, spoofed_ip) -> src_mac` entry into the
+/// userspace `dynamic_neighbors` cache — the same poisoning the ARP-reply
+/// and NDP-NA learn arms already reject via `neighbor_ip_is_learnable`
+/// (#2790).
+///
+/// This drives each spoofed class (both address families) with a valid
+/// unicast source MAC and asserts NO entry is cached under either the
+/// physical (11) or resolved logical (12) ifindex, plus a legitimate
+/// unicast source that IS still learned (no over-rejection regression).
+///
+/// Removing the `if !neighbor_ip_is_learnable(src_ip) { return; }` guard at
+/// the top of `learn_dynamic_neighbor` makes every spoofed-class assert
+/// fail RED (the illegitimate entry would be inserted); the legitimate-learn
+/// assert keeps the guard honest against over-rejection.
+#[test]
+fn rx_learn_non_unicast_src_ip_rejected_4889() {
+    let forwarding = build_forwarding_state(&super::super::test_fixtures::nat_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::default());
+
+    // A syntactically valid, locally-administered UNICAST source MAC —
+    // the source-MAC class gate (frame[6] & 1 == 0) accepts it, so only
+    // the source-IP class gate can stop the spoofed learn.
+    let unicast_mac = [0x02, 0x00, 0x00, 0x00, 0xba, 0xad];
+
+    // Every illegitimate source-IP class the ARP/NDP paths reject, v4 + v6:
+    //   loopback (127/8, ::1), multicast (224/4, ff00::/8),
+    //   limited broadcast (255.255.255.255), unspecified (0.0.0.0, ::).
+    let spoofed: [IpAddr; 6] = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),          // 127.0.0.1
+        IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),  // multicast
+        IpAddr::V4(Ipv4Addr::BROADCAST),          // 255.255.255.255
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),        // 0.0.0.0
+        IpAddr::V6(Ipv6Addr::LOCALHOST),          // ::1
+        IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), // ff02::1
+    ];
+
+    for src in spoofed {
+        // Physical ingress 11 + VLAN 80 resolves the logical (route-egress)
+        // ifindex 12 in this fixture — the #3182 test exercises the same
+        // key pair. A rejected learn must touch NEITHER key.
+        crate::afxdp::neighbor_dispatch::learn_dynamic_neighbor(
+            &forwarding,
+            &neighbors,
+            11,
+            80,
+            src,
+            unicast_mac,
+        );
+        assert!(
+            neighbors.get(&(11, src)).is_none() && neighbors.get(&(12, src)).is_none(),
+            "the RX learn path must reject an illegitimate source-IP class \
+             ({src}) even with a unicast source MAC (#4889)"
+        );
+    }
+
+    // A legitimate unicast source is still learned (caches under the
+    // resolved logical ifindex 12), proving the class gate does not
+    // over-reject.
+    let good = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 42));
+    let good_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x2a];
+    crate::afxdp::neighbor_dispatch::learn_dynamic_neighbor(
+        &forwarding,
+        &neighbors,
+        11,
+        80,
+        good,
+        good_mac,
+    );
+    assert_eq!(
+        neighbors.get(&(12, good)).map(|e| e.mac),
+        Some(good_mac),
+        "a legitimate unicast RX-learned source must still cache (#4889 \
+         guard must not over-reject)"
+    );
+}
+
 // ===================================================================
 // #3021 / #3022 — the ingress ZONE lookup (zone-pair policy for
 // forwarding, and screen/SYN-cookie zone resolution) must key on the

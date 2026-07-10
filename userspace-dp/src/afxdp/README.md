@@ -189,6 +189,25 @@ sync.
     the router actually owns. `local_v*` continues to drive the
     `LocalDelivery` to-self disposition unchanged — only the anti-poison
     predicate switched sets.
+  - **Illegitimate source-IP CLASS anti-poison (`#4889`, RFC 826 /
+    RFC 4861):** ALL learn paths — including the RX source-MAC path
+    (`learn_dynamic_neighbor`) — reject a learn whose learned IP falls in a
+    class that can never name a real unicast next-hop: unspecified
+    (`0.0.0.0` / `::`), loopback (`127/8` / `::1`), multicast
+    (`224/4` / `ff00::/8`), or the IPv4 limited broadcast
+    (`255.255.255.255`). The gate is the shared `neighbor_ip_is_learnable`
+    predicate (single source of truth for v4+v6, `frame/inspect.rs`),
+    applied BEFORE the cache write on the ARP-reply arm (`#2790`), the
+    NDP-NA arm (`#2790`), and — as of `#4889` — the RX source-MAC learn
+    path. That 5th path derives the neighbor identity from a LIVE transit
+    frame's L3 source (`flow.src_ip`), so a normal TCP/UDP packet with a
+    unicast source MAC but a spoofed source IP (`127.0.0.1` / `224.0.0.1` /
+    `255.255.255.255` / `::1` / `ff02::1` / `0.0.0.0`) would otherwise seed
+    an impossible `(ingress_ifindex, spoofed_ip) -> src_mac` entry. Before
+    #4889 this path validated only the source-MAC class and the own-IP
+    overlap (`#3182`), NOT the source-IP class — closing that gap brings it
+    to parity with the L2 advert paths. Rejection is do-not-learn only (the
+    packet still forwards); this is a learn-path guard, not a packet filter.
   - **STALE install + NDP Override honor (`#4475`, opus-172 H-2, RFC 4861
     §7.2.5):** the own-IP gate above only protects addresses the router
     OWNS. Every OTHER same-segment next-hop — including the WAN gateway —
