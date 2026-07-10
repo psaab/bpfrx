@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -28,6 +29,42 @@ import (
 type sessionCursorIterator interface {
 	IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error
 	IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+}
+
+// sessionWalkCancelInterval is how many conntrack entries a session map walk
+// visits between request-context cancellation samples. Each iter.Next holds a
+// per-bucket BPF-map lock, so a REST client that has disconnected
+// (r.Context() cancelled) should stop the full-table walk promptly to release
+// that lock back to the live dataplane session-sync path (#5233). Sampling
+// once per batch keeps the mutex-guarded ctx.Err() read off the per-session
+// hot path — probing every single entry would itself add lock traffic across a
+// multi-million-entry table.
+const sessionWalkCancelInterval = 1024
+
+// newRequestCancelSampler returns a predicate reporting whether ctx has been
+// cancelled, inspecting ctx.Err() only once per `every` calls and latching
+// true once observed. Session iterator callbacks call it at the top of each
+// invocation so a long conntrack map walk aborts (the callback returns false,
+// breaking IterateSessions) within one sampling window of a client disconnect,
+// without paying ctx.Err() per session (#5233). On the normal, non-cancelled
+// path it never returns true, so output and ordering are unchanged.
+func newRequestCancelSampler(ctx context.Context, every int) func() bool {
+	if every < 1 {
+		every = 1
+	}
+	n := 0
+	cancelled := false
+	return func() bool {
+		if cancelled {
+			return true
+		}
+		n++
+		if n >= every {
+			n = 0
+			cancelled = ctx.Err() != nil
+		}
+		return cancelled
+	}
 }
 
 func (s *Server) sessionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -104,10 +141,20 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessi
 	all := make([]SessionEntry, 0)
 	idx := 0
 
+	// Abort the full-table walk if the client disconnects: on a
+	// multi-million-session firewall the offset scan otherwise runs to
+	// completion holding per-bucket BPF-map locks even though the response
+	// is discarded, contending with the live dataplane session-sync path
+	// (#5233). Sampled per batch so the check costs nothing per session.
+	cancelled := newRequestCancelSampler(r.Context(), sessionWalkCancelInterval)
+
 	// IPv4 sessions. A backend iterator failure (e.g. helper restart
 	// mid-scan) must fail the request rather than returning HTTP 200 with
 	// a partial/zero session list as a healthy result (#2469).
 	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		if !q.matchV4(key, val) {
 			return true
 		}
@@ -123,6 +170,9 @@ func (s *Server) sessionsOffset(w http.ResponseWriter, r *http.Request, q *sessi
 
 	// IPv6 sessions
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		if !q.matchV6(key, val) {
 			return true
 		}
@@ -452,9 +502,17 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 
 	var summary SessionSummary
 
+	// Stop the full-table walk if the client disconnects mid-scan so we do
+	// not keep holding per-bucket BPF-map locks for a summary nobody will
+	// read (#5233); sampled per batch (see newRequestCancelSampler).
+	cancelled := newRequestCancelSampler(r.Context(), sessionWalkCancelInterval)
+
 	// A partial scan yields an under-count that looks like a healthy
 	// summary — fail the request instead of publishing it (#2469).
 	if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		summary.TotalEntries++
 		if val.IsReverse == 0 {
 			summary.ForwardOnly++
@@ -476,6 +534,9 @@ func (s *Server) sessionSummaryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		summary.TotalEntries++
 		if val.IsReverse == 0 {
 			summary.ForwardOnly++
@@ -634,9 +695,18 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 		zp.Total++
 	}
 
+	// Stop the full-table walk if the client disconnects mid-scan so the
+	// per-bucket BPF-map locks are released back to the live dataplane
+	// instead of finishing a breakdown nobody will read (#5233); sampled
+	// per batch (see newRequestCancelSampler).
+	cancelled := newRequestCancelSampler(r.Context(), sessionWalkCancelInterval)
+
 	// A partial scan produces a misleading zone-pair breakdown — fail
 	// the request rather than serving an incomplete table as OK (#2469).
 	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		if val.IsReverse == 0 {
 			countSession(val.IngressZone, val.EgressZone, key.Protocol)
 		}
@@ -646,6 +716,9 @@ func (s *Server) sessionZonePairHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		if val.IsReverse == 0 {
 			countSession(val.IngressZone, val.EgressZone, key.Protocol)
 		}
