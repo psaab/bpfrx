@@ -303,285 +303,316 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			var groupDefaultOriginate bool
 			var groupAllowASIn int
 			var groupRemovePrivateAS bool
-			for _, child := range groupInst.node.Children {
-				switch child.Name() {
-				case "peer-as":
-					if v := nodeVal(child); v != "" {
-						// #4713: no silent uint32 wrap — leave unset on a
-						// negative/oversized AS (inert on lenient load).
-						if n, ok := parseASNumber(v); ok {
-							peerAS = n
-						}
+			// #5270: two-pass, order-INDEPENDENT group inheritance. A BGP
+			// group's `neighbor` children and its group-level default
+			// attributes (peer-as/local-as/local-address/hold-time/passive/
+			// description/multihop/export/import/family+prefix-limit/
+			// authentication-key/bfd/default-originate/loops/remove-private)
+			// are semantically-unordered Junos siblings. The old single
+			// stamp-as-you-go pass copied whatever group defaults had been
+			// *seen so far* onto each neighbor as it was encountered, so a
+			// `neighbor` authored BEFORE the group's `export` (or peer-as,
+			// etc.) captured the empty/zero default — e.g. FRR then emitted
+			// no outbound route-map and leaked routes (fail-open). Pass 0
+			// processes every NON-neighbor child, fully collecting all group
+			// defaults regardless of sibling order; pass 1 processes only the
+			// `neighbor` children, stamping each from the completed defaults.
+			// Per-neighbor explicit values still override the group default in
+			// the neighbor block below (unchanged precedence). Works for both
+			// the hierarchical and flat-set AST shapes; multi-value list leaves
+			// (export/import, #2419/#2702) accumulate fully in pass 0.
+			for pass := 0; pass < 2; pass++ {
+				for _, child := range groupInst.node.Children {
+					isNeighbor := child.Name() == "neighbor"
+					if pass == 0 && isNeighbor {
+						// Pass 0: collect group-level defaults only; defer
+						// neighbor stamping until every default is known.
+						continue
 					}
-				case "local-as":
-					if v := nodeVal(child); v != "" {
-						if n, ok := parseASNumber(v); ok {
-							groupLocalAS = n
-						}
+					if pass == 1 && !isNeighbor {
+						// Pass 1: stamp neighbors only; group defaults are
+						// already fully collected.
+						continue
 					}
-				case "local-address":
-					groupLocalAddress = nodeVal(child)
-				case "hold-time":
-					if v := nodeVal(child); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							groupHoldTime = n
+					switch child.Name() {
+					case "peer-as":
+						if v := nodeVal(child); v != "" {
+							// #4713: no silent uint32 wrap — leave unset on a
+							// negative/oversized AS (inert on lenient load).
+							if n, ok := parseASNumber(v); ok {
+								peerAS = n
+							}
 						}
-					}
-				case "passive":
-					groupPassive = true
-				case "description":
-					groupDesc = nodeVal(child)
-				case "multihop":
-					if v := nodeVal(child); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							groupMultihop = n
+					case "local-as":
+						if v := nodeVal(child); v != "" {
+							if n, ok := parseASNumber(v); ok {
+								groupLocalAS = n
+							}
 						}
-					}
-				case "export":
-					// Multi-value leaf (#2702): a bracket-list
-					// `export [ p1 p2 ]` collapses every policy onto
-					// child.Keys[1:] (flat-set, #2585) or onto child
-					// nodes (hierarchical). The old nodeVal-first read
-					// returned Keys[1] (non-empty) and appended ONLY the
-					// first policy, masking the Keys[1:] fallback. Route
-					// through the firewallMatchValues SSOT so all
-					// policies survive in both AST shapes.
-					groupExport = append(groupExport, firewallMatchValues(child)...)
-				case "import":
-					groupImport = append(groupImport, firewallMatchValues(child)...)
-				case "family":
-					// Hierarchical: family { inet { unicast; } inet6 { unicast; } }
-					// Flat (via schema): family node with children inet/inet6
-					if len(child.Keys) >= 2 {
-						switch child.Keys[1] {
-						case "inet":
-							familyInet = true
-							groupPrefixLimitInet = parsePrefixLimit(child)
-						case "inet6":
-							familyInet6 = true
-							groupPrefixLimitInet6 = parsePrefixLimit(child)
+					case "local-address":
+						groupLocalAddress = nodeVal(child)
+					case "hold-time":
+						if v := nodeVal(child); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								groupHoldTime = n
+							}
 						}
-					} else {
-						for _, fc := range child.Children {
-							switch fc.Name() {
+					case "passive":
+						groupPassive = true
+					case "description":
+						groupDesc = nodeVal(child)
+					case "multihop":
+						if v := nodeVal(child); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								groupMultihop = n
+							}
+						}
+					case "export":
+						// Multi-value leaf (#2702): a bracket-list
+						// `export [ p1 p2 ]` collapses every policy onto
+						// child.Keys[1:] (flat-set, #2585) or onto child
+						// nodes (hierarchical). The old nodeVal-first read
+						// returned Keys[1] (non-empty) and appended ONLY the
+						// first policy, masking the Keys[1:] fallback. Route
+						// through the firewallMatchValues SSOT so all
+						// policies survive in both AST shapes.
+						groupExport = append(groupExport, firewallMatchValues(child)...)
+					case "import":
+						groupImport = append(groupImport, firewallMatchValues(child)...)
+					case "family":
+						// Hierarchical: family { inet { unicast; } inet6 { unicast; } }
+						// Flat (via schema): family node with children inet/inet6
+						if len(child.Keys) >= 2 {
+							switch child.Keys[1] {
 							case "inet":
 								familyInet = true
-								groupPrefixLimitInet = parsePrefixLimit(fc)
+								groupPrefixLimitInet = parsePrefixLimit(child)
 							case "inet6":
 								familyInet6 = true
-								groupPrefixLimitInet6 = parsePrefixLimit(fc)
+								groupPrefixLimitInet6 = parsePrefixLimit(child)
 							}
-						}
-					}
-				case "default-originate":
-					groupDefaultOriginate = true
-				case "loops":
-					if v := nodeVal(child); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							groupAllowASIn = n
-						}
-					}
-				case "remove-private":
-					groupRemovePrivateAS = true
-				case "authentication-key":
-					groupAuthKey = nodeVal(child)
-				case "bfd-liveness-detection":
-					groupBFD = true
-					for _, bc := range child.Children {
-						switch bc.Name() {
-						case "minimum-interval":
-							if v := nodeVal(bc); v != "" {
-								if n, err := strconv.Atoi(v); err == nil {
-									groupBFDInterval = n
-								}
-							}
-						case "multiplier":
-							if v := nodeVal(bc); v != "" {
-								if n, err := strconv.Atoi(v); err == nil {
-									groupBFDMultiplier = n
+						} else {
+							for _, fc := range child.Children {
+								switch fc.Name() {
+								case "inet":
+									familyInet = true
+									groupPrefixLimitInet = parsePrefixLimit(fc)
+								case "inet6":
+									familyInet6 = true
+									groupPrefixLimitInet6 = parsePrefixLimit(fc)
 								}
 							}
 						}
-					}
-				case "neighbor":
-					nAddr := nodeVal(child)
-					if nAddr != "" {
-						// Gate group-level address-family flags by the
-						// neighbor's own address version (#2454). A
-						// dual-stack group (family inet AND inet6) must NOT
-						// activate a bare IPv4 neighbor under
-						// `address-family ipv6 unicast` (and vice versa):
-						// without RFC 5549 extended-nexthop (which this
-						// config model has no knob for) activating an IPv4
-						// address for IPv6 unicast is invalid and breaks the
-						// peer's AF activation. So an IPv4-addressed neighbor
-						// inherits only the group's inet flag, an
-						// IPv6-addressed neighbor only inet6.
-						//
-						// An address that does not parse (a hostname/peer-
-						// group template or a malformed value) is left to
-						// inherit BOTH group flags unchanged — preserving
-						// pre-#2454 behavior for the non-literal-IP case
-						// rather than silently dropping a family.
-						inheritInet, inheritInet6 := familyInet, familyInet6
-						if ip := net.ParseIP(nAddr); ip != nil {
-							if ip.To4() != nil {
-								inheritInet6 = false
-							} else {
-								inheritInet = false
+					case "default-originate":
+						groupDefaultOriginate = true
+					case "loops":
+						if v := nodeVal(child); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								groupAllowASIn = n
 							}
 						}
-						neighbor := &BGPNeighbor{
-							Address:          nAddr,
-							PeerAS:           peerAS,
-							LocalAS:          groupLocalAS,
-							LocalAddress:     groupLocalAddress,
-							HoldTime:         groupHoldTime,
-							Passive:          groupPassive,
-							Description:      groupDesc,
-							MultihopTTL:      groupMultihop,
-							Export:           groupExport,
-							Import:           groupImport,
-							FamilyInet:       inheritInet,
-							FamilyInet6:      inheritInet6,
-							GroupName:        groupInst.name,
-							AuthPassword:     Secret(groupAuthKey),
-							BFD:              groupBFD,
-							BFDInterval:      groupBFDInterval,
-							BFDMultiplier:    groupBFDMultiplier,
-							DefaultOriginate: groupDefaultOriginate,
-							AllowASIn:        groupAllowASIn,
-							RemovePrivateAS:  groupRemovePrivateAS,
-							PrefixLimitInet:  groupPrefixLimitInet,
-							PrefixLimitInet6: groupPrefixLimitInet6,
-						}
-						// Per-neighbor overrides
-						for _, prop := range child.Children {
-							switch prop.Name() {
-							case "description":
-								neighbor.Description = nodeVal(prop)
-							case "multihop":
-								if v := nodeVal(prop); v != "" {
+					case "remove-private":
+						groupRemovePrivateAS = true
+					case "authentication-key":
+						groupAuthKey = nodeVal(child)
+					case "bfd-liveness-detection":
+						groupBFD = true
+						for _, bc := range child.Children {
+							switch bc.Name() {
+							case "minimum-interval":
+								if v := nodeVal(bc); v != "" {
 									if n, err := strconv.Atoi(v); err == nil {
-										neighbor.MultihopTTL = n
+										groupBFDInterval = n
 									}
 								}
-							case "peer-as":
-								if v := nodeVal(prop); v != "" {
-									// #4713: no silent uint32 wrap — leave the
-									// inherited group peer-as in place on a
-									// negative/oversized override (inert on
-									// lenient load; the renderer skips a
-									// remote-as-0 neighbor).
-									if n, ok := parseASNumber(v); ok {
-										neighbor.PeerAS = n
-									}
-								}
-							case "local-as":
-								if v := nodeVal(prop); v != "" {
-									if n, ok := parseASNumber(v); ok {
-										neighbor.LocalAS = n
-									}
-								}
-							case "local-address":
-								neighbor.LocalAddress = nodeVal(prop)
-							case "hold-time":
-								if v := nodeVal(prop); v != "" {
+							case "multiplier":
+								if v := nodeVal(bc); v != "" {
 									if n, err := strconv.Atoi(v); err == nil {
-										neighbor.HoldTime = n
+										groupBFDMultiplier = n
 									}
 								}
-							case "passive":
-								neighbor.Passive = true
-							case "authentication-key":
-								neighbor.AuthPassword = Secret(nodeVal(prop))
-							case "route-reflector-client":
-								neighbor.RouteReflectorClient = true
-							case "default-originate":
-								neighbor.DefaultOriginate = true
-							case "bfd-liveness-detection":
-								neighbor.BFD = true
-								for _, bc := range prop.Children {
-									switch bc.Name() {
-									case "minimum-interval":
-										if v := nodeVal(bc); v != "" {
-											if n, err := strconv.Atoi(v); err == nil {
-												neighbor.BFDInterval = n
-											}
-										}
-									case "multiplier":
-										if v := nodeVal(bc); v != "" {
-											if n, err := strconv.Atoi(v); err == nil {
-												neighbor.BFDMultiplier = n
-											}
-										}
-									}
-								}
-							case "loops":
-								if v := nodeVal(prop); v != "" {
-									if n, err := strconv.Atoi(v); err == nil {
-										neighbor.AllowASIn = n
-									}
-								}
-							case "remove-private":
-								neighbor.RemovePrivateAS = true
-							case "export":
-								// Per-neighbor export override (#2490 made
-								// the per-neighbor slot parseable; group-level
-								// export is already inherited above). Appended
-								// after the inherited group export so the
-								// bgpEffectiveExport last-wins helper picks the
-								// more-specific neighbor policy.
-								//
-								// Multi-value leaf (#2702): a bracket-list
-								// `export [ p1 p2 ]` collapses every policy onto
-								// prop.Keys[1:] (flat-set) or onto child nodes
-								// (hierarchical). The old nodeVal-first read
-								// returned Keys[1] and dropped all but the first
-								// policy; firewallMatchValues accumulates both
-								// AST shapes.
-								neighbor.Export = append(neighbor.Export, firewallMatchValues(prop)...)
-							case "import":
-								// Per-neighbor import override (#2490). Appended
-								// after the inherited group import so the
-								// bgpEffectiveImport last-wins helper picks the
-								// more-specific neighbor policy. Multi-value
-								// (#2702) — accumulate every policy across both
-								// AST shapes via firewallMatchValues.
-								neighbor.Import = append(neighbor.Import, firewallMatchValues(prop)...)
-							case "family":
-								if len(prop.Keys) >= 2 {
-									switch prop.Keys[1] {
-									case "inet":
-										neighbor.FamilyInet = true
-										if pl := parsePrefixLimit(prop); pl > 0 {
-											neighbor.PrefixLimitInet = pl
-										}
-									case "inet6":
-										neighbor.FamilyInet6 = true
-										if pl := parsePrefixLimit(prop); pl > 0 {
-											neighbor.PrefixLimitInet6 = pl
-										}
-									}
+							}
+						}
+					case "neighbor":
+						nAddr := nodeVal(child)
+						if nAddr != "" {
+							// Gate group-level address-family flags by the
+							// neighbor's own address version (#2454). A
+							// dual-stack group (family inet AND inet6) must NOT
+							// activate a bare IPv4 neighbor under
+							// `address-family ipv6 unicast` (and vice versa):
+							// without RFC 5549 extended-nexthop (which this
+							// config model has no knob for) activating an IPv4
+							// address for IPv6 unicast is invalid and breaks the
+							// peer's AF activation. So an IPv4-addressed neighbor
+							// inherits only the group's inet flag, an
+							// IPv6-addressed neighbor only inet6.
+							//
+							// An address that does not parse (a hostname/peer-
+							// group template or a malformed value) is left to
+							// inherit BOTH group flags unchanged — preserving
+							// pre-#2454 behavior for the non-literal-IP case
+							// rather than silently dropping a family.
+							inheritInet, inheritInet6 := familyInet, familyInet6
+							if ip := net.ParseIP(nAddr); ip != nil {
+								if ip.To4() != nil {
+									inheritInet6 = false
 								} else {
-									for _, fc := range prop.Children {
-										switch fc.Name() {
+									inheritInet = false
+								}
+							}
+							neighbor := &BGPNeighbor{
+								Address:          nAddr,
+								PeerAS:           peerAS,
+								LocalAS:          groupLocalAS,
+								LocalAddress:     groupLocalAddress,
+								HoldTime:         groupHoldTime,
+								Passive:          groupPassive,
+								Description:      groupDesc,
+								MultihopTTL:      groupMultihop,
+								Export:           groupExport,
+								Import:           groupImport,
+								FamilyInet:       inheritInet,
+								FamilyInet6:      inheritInet6,
+								GroupName:        groupInst.name,
+								AuthPassword:     Secret(groupAuthKey),
+								BFD:              groupBFD,
+								BFDInterval:      groupBFDInterval,
+								BFDMultiplier:    groupBFDMultiplier,
+								DefaultOriginate: groupDefaultOriginate,
+								AllowASIn:        groupAllowASIn,
+								RemovePrivateAS:  groupRemovePrivateAS,
+								PrefixLimitInet:  groupPrefixLimitInet,
+								PrefixLimitInet6: groupPrefixLimitInet6,
+							}
+							// Per-neighbor overrides
+							for _, prop := range child.Children {
+								switch prop.Name() {
+								case "description":
+									neighbor.Description = nodeVal(prop)
+								case "multihop":
+									if v := nodeVal(prop); v != "" {
+										if n, err := strconv.Atoi(v); err == nil {
+											neighbor.MultihopTTL = n
+										}
+									}
+								case "peer-as":
+									if v := nodeVal(prop); v != "" {
+										// #4713: no silent uint32 wrap — leave the
+										// inherited group peer-as in place on a
+										// negative/oversized override (inert on
+										// lenient load; the renderer skips a
+										// remote-as-0 neighbor).
+										if n, ok := parseASNumber(v); ok {
+											neighbor.PeerAS = n
+										}
+									}
+								case "local-as":
+									if v := nodeVal(prop); v != "" {
+										if n, ok := parseASNumber(v); ok {
+											neighbor.LocalAS = n
+										}
+									}
+								case "local-address":
+									neighbor.LocalAddress = nodeVal(prop)
+								case "hold-time":
+									if v := nodeVal(prop); v != "" {
+										if n, err := strconv.Atoi(v); err == nil {
+											neighbor.HoldTime = n
+										}
+									}
+								case "passive":
+									neighbor.Passive = true
+								case "authentication-key":
+									neighbor.AuthPassword = Secret(nodeVal(prop))
+								case "route-reflector-client":
+									neighbor.RouteReflectorClient = true
+								case "default-originate":
+									neighbor.DefaultOriginate = true
+								case "bfd-liveness-detection":
+									neighbor.BFD = true
+									for _, bc := range prop.Children {
+										switch bc.Name() {
+										case "minimum-interval":
+											if v := nodeVal(bc); v != "" {
+												if n, err := strconv.Atoi(v); err == nil {
+													neighbor.BFDInterval = n
+												}
+											}
+										case "multiplier":
+											if v := nodeVal(bc); v != "" {
+												if n, err := strconv.Atoi(v); err == nil {
+													neighbor.BFDMultiplier = n
+												}
+											}
+										}
+									}
+								case "loops":
+									if v := nodeVal(prop); v != "" {
+										if n, err := strconv.Atoi(v); err == nil {
+											neighbor.AllowASIn = n
+										}
+									}
+								case "remove-private":
+									neighbor.RemovePrivateAS = true
+								case "export":
+									// Per-neighbor export override (#2490 made
+									// the per-neighbor slot parseable; group-level
+									// export is already inherited above). Appended
+									// after the inherited group export so the
+									// bgpEffectiveExport last-wins helper picks the
+									// more-specific neighbor policy.
+									//
+									// Multi-value leaf (#2702): a bracket-list
+									// `export [ p1 p2 ]` collapses every policy onto
+									// prop.Keys[1:] (flat-set) or onto child nodes
+									// (hierarchical). The old nodeVal-first read
+									// returned Keys[1] and dropped all but the first
+									// policy; firewallMatchValues accumulates both
+									// AST shapes.
+									neighbor.Export = append(neighbor.Export, firewallMatchValues(prop)...)
+								case "import":
+									// Per-neighbor import override (#2490). Appended
+									// after the inherited group import so the
+									// bgpEffectiveImport last-wins helper picks the
+									// more-specific neighbor policy. Multi-value
+									// (#2702) — accumulate every policy across both
+									// AST shapes via firewallMatchValues.
+									neighbor.Import = append(neighbor.Import, firewallMatchValues(prop)...)
+								case "family":
+									if len(prop.Keys) >= 2 {
+										switch prop.Keys[1] {
 										case "inet":
 											neighbor.FamilyInet = true
-											if pl := parsePrefixLimit(fc); pl > 0 {
+											if pl := parsePrefixLimit(prop); pl > 0 {
 												neighbor.PrefixLimitInet = pl
 											}
 										case "inet6":
 											neighbor.FamilyInet6 = true
-											if pl := parsePrefixLimit(fc); pl > 0 {
+											if pl := parsePrefixLimit(prop); pl > 0 {
 												neighbor.PrefixLimitInet6 = pl
+											}
+										}
+									} else {
+										for _, fc := range prop.Children {
+											switch fc.Name() {
+											case "inet":
+												neighbor.FamilyInet = true
+												if pl := parsePrefixLimit(fc); pl > 0 {
+													neighbor.PrefixLimitInet = pl
+												}
+											case "inet6":
+												neighbor.FamilyInet6 = true
+												if pl := parsePrefixLimit(fc); pl > 0 {
+													neighbor.PrefixLimitInet6 = pl
+												}
 											}
 										}
 									}
 								}
 							}
+							proto.BGP.Neighbors = append(proto.BGP.Neighbors, neighbor)
 						}
-						proto.BGP.Neighbors = append(proto.BGP.Neighbors, neighbor)
 					}
 				}
 			}
