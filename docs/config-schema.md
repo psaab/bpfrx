@@ -1858,6 +1858,22 @@ outer-own-content-kept, three-deep chain, cycle-terminates, tagged inheritance
 attribution, and a depth-22 converging diamond lattice that expands in
 sub-millisecond memoized but times out / runs for tens of seconds un-memoized).
 
+**Bounding a deep acyclic chain (depth + work budget, #5194 A3-b2-F1).** The
+`seen` guard bounds only CYCLES and the memo only collapses a converging DAG;
+neither bounds a shallow-syntax ACYCLIC chain of DISTINCT groups
+(`g1 -> g2 -> ... -> gN`). That chain recurses one `expandGroupsRecursive` frame
+per link via the pre-merge nested expansion, so a generated/pathological deep
+chain could exhaust the goroutine stack on commit or HA config-sync. Two limits
+now thread through the recursion: a `depth` counter (incremented ONLY on the
+nested-group recursion, NOT the config-tree descent — tree depth is already
+bounded by the parser brace-depth cap #4148) rejected past `maxGroupExpandDepth`
+(64), and a shared `groupExpandBudget.work` counter rejected past
+`maxGroupExpandWork` (100000) to catch a wide shallow fan-out that stays under
+the depth cap. Both fail cleanly with an error rather than crashing; the caps sit
+far above any legitimate Junos nesting. Covered by
+`pkg/config/apply_groups_depth_5194_test.go` (deep chain rejected, shallow chain
+still expands and inherits the deepest leaf).
+
 ## `then community` operations: add / delete / set / none (#2848)
 
 The policy-term action `then community` supports the Junos/vSRX community
