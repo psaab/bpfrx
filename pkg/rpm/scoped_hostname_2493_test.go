@@ -104,7 +104,7 @@ func TestVRFBoundResolverIsBuiltForScope(t *testing.T) {
 		{Mark: 0x1234},                    // next-hop pin scope
 		{BindDevice: "ge-0-0-1", Mark: 7}, // both
 	} {
-		r := resolverForOpts(opts)
+		r, _ := resolverForOpts(opts)
 		if r == net.DefaultResolver {
 			t.Fatalf("resolverForOpts(%+v) returned the DEFAULT resolver — DNS would "+
 				"escape the probe's VRF/path scope (#2614)", opts)
@@ -119,7 +119,7 @@ func TestVRFBoundResolverIsBuiltForScope(t *testing.T) {
 	}
 
 	// An UNSCOPED probe uses the process-default resolver unchanged.
-	if r := resolverForOpts(probeSockOpts{}); r != net.DefaultResolver {
+	if r, _ := resolverForOpts(probeSockOpts{}); r != net.DefaultResolver {
 		t.Fatal("resolverForOpts(unscoped) must be the default resolver (no behavior change)")
 	}
 }

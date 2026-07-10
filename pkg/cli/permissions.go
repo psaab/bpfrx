@@ -136,6 +136,18 @@ func requiredPermission(parts []string) config.LoginClassPermission {
 		return config.PermControl
 	}
 
+	// `monitor security flow {file|start}` drives a ROOT-privileged write to a
+	// trace file on disk (openTraceFile create/append + rotation rename). A
+	// view-only / read-only class must not be able to make the root daemon
+	// create/append/rotate on-disk files — even confined to the dedicated trace
+	// dir that is a privilege escalation and a disk-fill/telemetry-exposure vector
+	// — so gate the file-backed flow-trace verbs at the control level even though
+	// `monitor` is otherwise view-level (#5038). The terminal-only `monitor
+	// security packet-drop` and the flow status/filter/stop verbs stay view-level.
+	if action == "monitor" && monitorSubcommandIsSecurityFlowFileWrite(parts[1:]) {
+		return config.PermControl
+	}
+
 	// `request system {reboot,halt,power-off,zeroize}` and `request chassis
 	// cluster failover` are DESTRUCTIVE maintenance verbs. On Junos the
 	// predefined `operator` class lacks the `maintenance` permission and so
@@ -333,4 +345,45 @@ func monitorSubcommandIsTraffic(args []string) bool {
 		return false
 	}
 	return resolved == "traffic"
+}
+
+// monitorSubcommandIsSecurityFlowFileWrite reports whether the monitor
+// arguments resolve to `monitor security flow file ...` or `monitor security
+// flow start` — the two verbs that cause the root daemon to create/append/
+// rotate a trace file on disk (#5038). It uses the same prefix resolution the
+// monitor dispatcher applies (resolveCommand over the cmdtree children) so an
+// abbreviated `monitor sec fl fi trace` or `monitor sec fl sta` is gated
+// identically to the fully-spelled form and cannot bypass the gate. Bare
+// `monitor security flow` (status), `filter`, `stop`, and `monitor security
+// packet-drop` (terminal-only) resolve to false and stay view-level.
+func monitorSubcommandIsSecurityFlowFileWrite(args []string) bool {
+	// Need at least `security flow <verb>`.
+	if len(args) < 3 {
+		return false
+	}
+	monNode, ok := operationalTree["monitor"]
+	if !ok || monNode == nil {
+		return false
+	}
+	sec, err := resolveCommand(args[0], keysFromTree(monNode.Children))
+	if err != nil || sec != "security" {
+		return false
+	}
+	secNode := monNode.Children["security"]
+	if secNode == nil {
+		return false
+	}
+	flow, err := resolveCommand(args[1], keysFromTree(secNode.Children))
+	if err != nil || flow != "flow" {
+		return false
+	}
+	flowNode := secNode.Children["flow"]
+	if flowNode == nil {
+		return false
+	}
+	verb, err := resolveCommand(args[2], keysFromTree(flowNode.Children))
+	if err != nil {
+		return false
+	}
+	return verb == "file" || verb == "start"
 }

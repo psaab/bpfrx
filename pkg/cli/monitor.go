@@ -18,16 +18,23 @@ import (
 )
 
 // traceLogDir is the directory flow-trace files are written to. It is a
-// package var (not a const) only so tests can redirect it to a temp dir;
-// production always writes under /var/log.
-var traceLogDir = "/var/log"
+// dedicated, root-owned (0700) namespace UNDER /var/log rather than /var/log
+// itself (#5038): confining traces to a private directory means an
+// operator-supplied trace filename can never resolve onto — or rotate/rename —
+// an unrelated privileged system-log inode such as /var/log/auth.log, and the
+// 0700 ownership stops a non-root user from pre-planting a symlink/inode the
+// root daemon would then open. It is a package var (not a const) only so tests
+// can redirect it to a temp dir.
+var traceLogDir = "/var/log/xpf-flow-trace"
 
 // sanitizeTraceFilename validates an operator-supplied flow-trace filename.
 // The trace file always lives directly under traceLogDir, so only a bare
 // basename is accepted: path separators, "." / "..", and absolute paths are
 // rejected. Without this a "monitor security flow file ../../etc/x" command
-// resolves to /var/log/../../etc/x and the daemon appends root-written flow
-// telemetry outside the log directory (#3378 HC-01).
+// resolves to traceLogDir/../../etc/x and the daemon appends root-written flow
+// telemetry outside the trace directory (#3378 HC-01). Combined with the
+// dedicated-directory confinement (#5038) a name can neither traverse out nor
+// collide with a system-log inode.
 func sanitizeTraceFilename(name string) error {
 	if name == "" {
 		return fmt.Errorf("trace filename must not be empty")
@@ -45,14 +52,25 @@ func sanitizeTraceFilename(name string) error {
 }
 
 // openTraceFile opens the flow-trace file inside traceLogDir with restrictive
-// permissions. The name is sanitized first (basename only), the file is opened
-// O_NOFOLLOW so a pre-planted symlink under /var/log cannot redirect the
-// root-written telemetry (#3378 MC-02), the opened descriptor is verified to be
-// a regular file, and it is created mode 0600 rather than world-readable 0644
-// — flow tuples/zones/policy names are audit-grade telemetry (#3378 MC-01).
+// permissions. The dedicated 0700 trace directory is created first, the name is
+// sanitized (basename only), the file is opened O_NOFOLLOW so a pre-planted
+// symlink under the trace dir cannot redirect the root-written telemetry (#3378
+// MC-02), the opened descriptor is verified to be a regular file, and it is
+// created mode 0600 rather than world-readable 0644 — flow tuples/zones/policy
+// names are audit-grade telemetry (#3378 MC-01). The file-backed monitor verbs
+// are additionally gated at PermControl (pkg/cli/permissions.go, #5038) so a
+// view-only class cannot trigger this root-privileged write at all.
 func openTraceFile(name string) (*os.File, string, error) {
 	if err := sanitizeTraceFilename(name); err != nil {
 		return nil, "", err
+	}
+	// Ensure the dedicated, root-owned (0700) trace directory exists before
+	// opening into it (#5038). Confining traces to this private namespace — not
+	// the shared /var/log — is what prevents a trace filename from ever landing
+	// on an unrelated system-log inode, and 0700 keeps non-root users from
+	// planting anything the root daemon would open here.
+	if err := os.MkdirAll(traceLogDir, 0o700); err != nil {
+		return nil, "", fmt.Errorf("create trace dir %s: %w", traceLogDir, err)
 	}
 	path := filepath.Join(traceLogDir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|unix.O_NOFOLLOW, 0o600)

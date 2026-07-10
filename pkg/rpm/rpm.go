@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -37,16 +36,17 @@ import (
 // listen error; tcp-ping/http-get had no such backstop. An EMPTY
 // source-address stays legitimate (means "default source"): only a
 // non-empty value that will not parse is the error.
-func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) (*net.Dialer, error) {
+func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) (*net.Dialer, *setupErrSink, error) {
 	d := &net.Dialer{Timeout: timeout}
 	if sourceAddr != "" {
 		ip := net.ParseIP(sourceAddr)
 		if ip == nil {
-			return nil, fmt.Errorf("%w: invalid source-address %q (would bind wildcard source)",
+			return nil, nil, fmt.Errorf("%w: invalid source-address %q (would bind wildcard source)",
 				ErrProbeSetup, sourceAddr)
 		}
 		d.LocalAddr = &net.TCPAddr{IP: ip}
 	}
+	var sink *setupErrSink
 	if opts.BindDevice != "" || opts.Mark != 0 {
 		// Resolve the hostname IN THE PROBE'S VRF/path scope (#2614): the
 		// dialer's own name resolution otherwise runs through the
@@ -56,32 +56,21 @@ func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) (
 		// resolveProbeTarget). Setting Resolver pins the DNS socket to the
 		// same SO_BINDTODEVICE / SO_MARK as the connect socket. A literal
 		// IP target skips DNS entirely, so this is a no-op for IP targets.
-		d.Resolver = vrfBoundResolver(opts)
-		d.Control = func(network, address string, c syscall.RawConn) error {
-			var cerr error
-			err := c.Control(func(fd uintptr) {
-				cerr = applyVRFBind(int(fd), opts.BindDevice, opts.Mark)
-			})
-			if err != nil {
-				err = fmt.Errorf("%w: socket control: %v", ErrProbeSetup, err)
-			} else if cerr != nil {
-				// Socket-option failures (SO_BINDTODEVICE EPERM/ENODEV,
-				// SO_MARK EPERM) are environment/capability errors, not
-				// path health: mark them ErrProbeSetup so tcp-ping and
-				// http-get hold state exactly like icmp-ping (Codex PR
-				// #1843 HIGH-2). The sentinel survives the net.OpError /
-				// url.Error wrapping on the dial path, so the probe
-				// loop's errors.Is check catches it for all three probe
-				// types. Genuine dial outcomes (refused, timeout,
-				// unreachable) never pass through this callback and stay
-				// path signals — ambiguous dial errnos deliberately
-				// default to PATH (conservative for detection).
-				err = fmt.Errorf("%w: socket option: %v", ErrProbeSetup, cerr)
-			}
-			return err
-		}
+		//
+		// Both the connect socket and the DNS resolver socket use the SAME
+		// shared vrfBindControl (#5061): a SO_BINDTODEVICE / SO_MARK bind
+		// failure on EITHER is classified ErrProbeSetup so the probe holds
+		// state instead of counting loss. The connect-socket failure rides
+		// out through net.OpError (errors.Is finds the sentinel); the
+		// resolver-socket failure is flattened to a string by *net.DNSError,
+		// so it is captured in sink and the probe re-tags its dial failure
+		// from sink (see probeTCP / probeHTTP). Genuine dial outcomes
+		// (refused, timeout, unreachable) never pass through this callback.
+		sink = &setupErrSink{}
+		d.Resolver = vrfBoundResolver(opts, sink)
+		d.Control = vrfBindControl(opts, sink)
 	}
-	return d, nil
+	return d, sink, nil
 }
 
 // vrfDeviceName returns the VRF device name for a routing instance.
@@ -687,7 +676,7 @@ func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key st
 func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
 	port := test.EffectiveDestinationPort()
 	addr := net.JoinHostPort(test.Target, fmt.Sprintf("%d", port))
-	dialer, err := probeDialer(5*time.Second, test.SourceAddress, opts)
+	dialer, sink, err := probeDialer(5*time.Second, test.SourceAddress, opts)
 	if err != nil {
 		return 0, err
 	}
@@ -695,6 +684,14 @@ func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest, opts probe
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
+		// A VRF-bound resolver socket-setup failure is lost through
+		// *net.DNSError, so re-tag it as ErrProbeSetup from the out-of-band
+		// sink — the probe never left the box and must hold state, not count
+		// loss (#5061). A connect-socket setup failure already carries the
+		// sentinel via net.OpError; either way this yields ErrProbeSetup.
+		if se := sink.load(); se != nil {
+			return 0, se
+		}
 		return 0, fmt.Errorf("TCP connect failed: %w", err)
 	}
 	rtt := time.Since(start)
@@ -745,7 +742,7 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 		return 0, err
 	}
 
-	dialer, err := probeDialer(10*time.Second, test.SourceAddress, opts)
+	dialer, sink, err := probeDialer(10*time.Second, test.SourceAddress, opts)
 	if err != nil {
 		return 0, err
 	}
@@ -774,6 +771,13 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// Re-tag a VRF-bound resolver socket-setup failure as ErrProbeSetup
+		// from the out-of-band sink (the sentinel is lost through the
+		// *net.DNSError / *url.Error wrapping on this path) so the probe
+		// holds state instead of counting loss (#5061).
+		if se := sink.load(); se != nil {
+			return 0, se
+		}
 		return 0, fmt.Errorf("HTTP GET failed: %w", err)
 	}
 	// Drain then close the body on every path — including a bodyless 204 — so
