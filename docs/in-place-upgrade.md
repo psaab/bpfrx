@@ -295,6 +295,28 @@ uncoordinated STANDALONE cut on a clustered node — no drain, no
 takeover. A mistyped or misplaced argument is a hard usage error, not a
 wrong/default run.
 
+**Clustered-node standalone-cut invariant (#5284).** Arg parsing alone is
+NOT enough: a VALID empty arg set (a plain `xpfd upgrade`) still selects
+`Runner.Run` purely because `--rolling` was omitted, and the postinst
+deferred-publish recovery hint and this doc's recovery snippets emit that
+bare verb. `Runner.Run` therefore enforces the invariant at the FINAL
+privileged boundary — BEFORE the host-wide upgrade lock and BEFORE any
+journal read or `StopUnit`: if the cluster-identity marker
+`/etc/xpf/node-id` is PRESENT and the cut was NOT invoked by the rolling
+driver, the run is refused (`refuse-standalone-cut-on-clustered-node`)
+with guidance to use `xpfd upgrade --rolling`. It fails CLOSED (never
+auto-reroutes) and the unit is NOT stopped, so the daemon keeps
+forwarding. Presence — not content — is the signal, matching the daemon's
+own HA boot-class gate (`pkg/daemon` `hasNodeIDFile`). This catches ALL
+callers of the standalone flow, not just the CLI arg path; the CLI also
+rejects early (belt-and-suspenders) for the clearest message. The rolling
+driver (`RunRolling`) legitimately performs the per-node cut AFTER its
+drain, so it invokes the inner `Runner.Run` with an internal
+`ClusterCoordinated` flag that bypasses this gate — the gate distinguishes
+a BARE standalone cut from a rolling-driver-invoked local cut, so
+coordinated rolling upgrades are never blocked. A standalone node (no
+`/etc/xpf/node-id`) is entirely unaffected.
+
 1. assert peer alive + session sync established + HA protocol compatible
    (`CurrentHAProtocolVersion`) — else ABORT to image-replace (Path C),
    never drop connections.
@@ -528,7 +550,11 @@ window for ALL FOUR managed binaries:
   operator recovers with `xpfd publish-generation && xpfd upgrade`
   (`dpkg-reconfigure xpf` is equivalent). A bare `xpfd upgrade` alone
   would re-read the OLD `current-gen` and no-op, so the recovery MUST
-  publish first.
+  publish first. **On a CLUSTERED node** (`/etc/xpf/node-id` present) the
+  cut verb is `xpfd upgrade --rolling`, NOT the bare `xpfd upgrade` — the
+  standalone cut is refused there (#5284). The postinst deferred-publish
+  hint is node-id-aware and prints the correct verb; the runtime gate in
+  `Runner.Run` refuses the bare cut regardless of what the operator types.
 - **Disk budget.** Each binary set is ~50-70 MB (dominated by `xpfd`
   embedding the kernel-verified shim + `xpf-userspace-dp`). Steady-state
   copies: `staged/` (1) + `staged-gen/` current+1 (2) + `versions/`
