@@ -41,7 +41,7 @@ func TestRemoteRollbackMalformedNoRPC(t *testing.T) {
 	for _, arg := range []string{"foo", "1x", "-1", "abc", "99999999999999999999"} {
 		t.Run(arg, func(t *testing.T) {
 			fake := &rollbackRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			err := c.dispatchConfig("rollback " + arg)
 			if err == nil {
 				t.Fatalf("rollback %q returned nil error; expected rejection", arg)
@@ -70,7 +70,7 @@ func TestRemoteRollbackValidIssuesRPC(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.line, func(t *testing.T) {
 			fake := &rollbackRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchConfig(tc.line); err != nil {
 				t.Fatalf("%q: %v", tc.line, err)
 			}

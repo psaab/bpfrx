@@ -53,6 +53,28 @@ The split is pure code motion. All handlers moved verbatim; the gRPC
 call sequences and the text-proxy fallthrough are preserved so the
 remote CLI output stays bit-identical to before.
 
+## Interactive loop & signals
+
+The interactive session runs two goroutines against one `ctl`:
+
+- the **main loop** (`main.go`) reads a line, dispatches it, and owns all
+  configuration-mode transitions — `configure` enters, `exit`/`quit` and
+  EOF (Ctrl-D) leave;
+- the **SIGINT goroutine** (`runSignalLoop`) handles Ctrl-C: it cancels a
+  running command, and on a second Ctrl-C within 2 s tears the session
+  down, issuing `ExitConfigure` first if still in configuration mode so
+  the daemon-side config lock is released.
+
+Both goroutines touch `ctl.configMode`, so it is an `atomic.Bool`
+accessed only via `Load`/`Store` (#5053). A plain `bool` let the SIGINT
+read race the main loop's write; a Ctrl-C landing during a mode
+transition could observe stale state and skip the `ExitConfigure`
+cleanup. The teardown paths that run without a cancellable command
+context (SIGINT, EOF, and the post-loop exit) call `ExitConfigure`
+through `exitConfigureBounded`, whose context is time-bounded
+(`exitConfigureTimeout`) so a wedged daemon cannot hang Ctrl-C cleanup
+or block process exit.
+
 ## Operational notes
 
 - Output streams over gRPC. There's no separate SSH / Telnet layer —

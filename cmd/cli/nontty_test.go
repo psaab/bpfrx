@@ -25,6 +25,15 @@ import (
 	"google.golang.org/grpc"
 )
 
+// configModeCtl builds a *ctl already in configuration mode. configMode is an
+// atomic.Bool (#5053), so it cannot be set in a composite literal; this keeps
+// the call sites a single expression.
+func configModeCtl(client pb.BpfrxServiceClient) *ctl {
+	c := &ctl{client: client}
+	c.configMode.Store(true)
+	return c
+}
+
 // fakeBpfrxClient embeds the generated client interface so we can
 // override only the RPC methods we care about. Any method the test
 // does not override will nil-panic when called — which is exactly
@@ -164,7 +173,7 @@ func TestDispatchOperational_ConfigureNonTTYHardErrors(t *testing.T) {
 		t.Errorf("EnterConfigure RPC was issued %d times; expected 0 (no lock leak)",
 			fake.enterConfigureCalls)
 	}
-	if c.configMode {
+	if c.configMode.Load() {
 		t.Error("c.configMode = true after hard-errored configure; expected false")
 	}
 }

@@ -73,7 +73,7 @@ func TestShowRollbackDisplaySelectorOverflowNoRPC_5052(t *testing.T) {
 		arg := arg
 		t.Run("show system rollback/"+arg, func(t *testing.T) {
 			fake := &showRollbackRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchOperational("show system rollback " + arg); err == nil {
 				t.Fatalf("show system rollback %q returned nil; expected rejection", arg)
 			}
@@ -84,7 +84,7 @@ func TestShowRollbackDisplaySelectorOverflowNoRPC_5052(t *testing.T) {
 		})
 		t.Run("show system rollback compare/"+arg, func(t *testing.T) {
 			fake := &showRollbackRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchOperational("show system rollback compare " + arg); err == nil {
 				t.Fatalf("show system rollback compare %q returned nil; expected rejection", arg)
 			}
@@ -95,7 +95,7 @@ func TestShowRollbackDisplaySelectorOverflowNoRPC_5052(t *testing.T) {
 		})
 		t.Run("show | compare rollback/"+arg, func(t *testing.T) {
 			fake := &showRollbackRecorderClient{}
-			c := &ctl{client: fake, configMode: true}
+			c := configModeCtl(fake)
 			if err := c.dispatchConfig("show | compare rollback " + arg); err == nil {
 				t.Fatalf("show | compare rollback %q returned nil; expected rejection", arg)
 			}
@@ -115,7 +115,7 @@ func TestShowRollbackDisplaySelectorValidPassthrough_5052(t *testing.T) {
 
 	t.Run("show system rollback 2", func(t *testing.T) {
 		fake := &showRollbackRecorderClient{}
-		c := &ctl{client: fake, configMode: true}
+		c := configModeCtl(fake)
 		if err := c.dispatchOperational("show system rollback 2"); err != nil {
 			t.Fatal(err)
 		}
@@ -126,7 +126,7 @@ func TestShowRollbackDisplaySelectorValidPassthrough_5052(t *testing.T) {
 
 	t.Run("show system rollback MaxInt32", func(t *testing.T) {
 		fake := &showRollbackRecorderClient{}
-		c := &ctl{client: fake, configMode: true}
+		c := configModeCtl(fake)
 		if err := c.dispatchOperational("show system rollback 2147483647"); err != nil {
 			t.Fatal(err)
 		}
@@ -137,7 +137,7 @@ func TestShowRollbackDisplaySelectorValidPassthrough_5052(t *testing.T) {
 
 	t.Run("show system rollback compare 3", func(t *testing.T) {
 		fake := &showRollbackRecorderClient{}
-		c := &ctl{client: fake, configMode: true}
+		c := configModeCtl(fake)
 		if err := c.dispatchOperational("show system rollback compare 3"); err != nil {
 			t.Fatal(err)
 		}
@@ -148,7 +148,7 @@ func TestShowRollbackDisplaySelectorValidPassthrough_5052(t *testing.T) {
 
 	t.Run("show | compare rollback MaxInt32", func(t *testing.T) {
 		fake := &showRollbackRecorderClient{}
-		c := &ctl{client: fake, configMode: true}
+		c := configModeCtl(fake)
 		if err := c.dispatchConfig("show | compare rollback 2147483647"); err != nil {
 			t.Fatal(err)
 		}

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -35,11 +36,16 @@ var pipeFilterDescs = map[string]string{
 }
 
 type ctl struct {
-	client        pb.BpfrxServiceClient
-	rl            *readline.Instance
-	hostname      string
-	username      string
-	configMode    bool
+	client   pb.BpfrxServiceClient
+	rl       *readline.Instance
+	hostname string
+	username string
+	// configMode is read by the SIGINT goroutine (main.go) concurrently
+	// with the main loop's mode transitions, so it MUST be accessed
+	// atomically. A racy read let a Ctrl-C that landed during a
+	// configure/exit/EOF transition observe stale state and skip the
+	// explicit ExitConfigure cleanup on the way out (#5053).
+	configMode    atomic.Bool
 	editPath      []string
 	clusterRole   string // "primary", "secondary", or "" (not clustered)
 	clusterNodeID int32
@@ -102,7 +108,7 @@ func (c *ctl) dispatch(line string) error {
 		return c.dispatchWithPipe(cmd, pipeType, pipeArg)
 	}
 
-	if c.configMode {
+	if c.configMode.Load() {
 		return c.dispatchConfig(line)
 	}
 	return c.dispatchOperational(line)
@@ -262,7 +268,7 @@ func (c *ctl) dispatchOperational(line string) error {
 		if err != nil {
 			return fmt.Errorf("%v", err)
 		}
-		c.configMode = true
+		c.configMode.Store(true)
 		c.rl.SetPrompt(c.configPrompt())
 		if exclusive {
 			fmt.Println("Entering configuration mode (exclusive)")
@@ -510,7 +516,7 @@ func (c *ctl) dispatchConfig(line string) error {
 
 	case "exit", "quit":
 		_, _ = c.client.ExitConfigure(c.ctx(), &pb.ExitConfigureRequest{})
-		c.configMode = false
+		c.configMode.Store(false)
 		c.editPath = nil
 		if c.rl != nil {
 			c.rl.SetPrompt(c.operationalPrompt())
@@ -538,7 +544,7 @@ func (c *ctl) refreshPrompt() {
 	}
 	cancel()
 	if c.rl != nil {
-		if c.configMode {
+		if c.configMode.Load() {
 			c.rl.SetPrompt(c.configPrompt())
 		} else {
 			c.rl.SetPrompt(c.operationalPrompt())
@@ -604,7 +610,7 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	resp, err := rc.ctl.client.Complete(ctx, &pb.CompleteRequest{
 		Line:       text,
 		Pos:        cursor,
-		ConfigMode: rc.ctl.configMode,
+		ConfigMode: rc.ctl.configMode.Load(),
 	})
 	if err != nil || len(resp.Candidates) == 0 {
 		return nil, 0
@@ -643,7 +649,7 @@ func (rc *remoteCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		} else if isPipe {
 			desc = pipeFilterDescs[name]
 		} else {
-			desc = remoteLookupDesc(words, name, rc.ctl.configMode)
+			desc = remoteLookupDesc(words, name, rc.ctl.configMode.Load())
 		}
 		candidates[i] = cmdtree.Candidate{Name: name, Desc: desc}
 	}
