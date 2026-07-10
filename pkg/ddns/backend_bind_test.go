@@ -2,8 +2,10 @@ package ddns
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -22,7 +24,7 @@ import (
 // rfc2136 backend installs the custom dialer.
 
 func TestResolveBindConfigEmptyIsNoBinding(t *testing.T) {
-	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{})
+	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{}, nil)
 	if err != nil {
 		t.Fatalf("empty config: %v", err)
 	}
@@ -35,7 +37,7 @@ func TestResolveBindConfigEmptyIsNoBinding(t *testing.T) {
 }
 
 func TestResolveBindConfigSourceAddress(t *testing.T) {
-	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "10.0.0.9"})
+	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "10.0.0.9"}, nil)
 	if err != nil {
 		t.Fatalf("source-address: %v", err)
 	}
@@ -51,38 +53,161 @@ func TestResolveBindConfigSourceAddress(t *testing.T) {
 }
 
 func TestResolveBindConfigInvalidSourceAddressRejected(t *testing.T) {
-	if _, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "not-an-ip"}); err == nil {
+	if _, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "not-an-ip"}, nil); err == nil {
 		t.Fatal("an invalid source-address must be rejected (the manager then falls back to no-op + counts it)")
 	}
 }
 
+// bindTestConfig builds a committed *config.Config that exercises the SSOT
+// interface-name resolver (config.ResolveKernelIfName) for the #5070 cases the
+// leaf slash-substitution gets WRONG:
+//
+//   - ge-0/0/2 has unit 0 (unit-0 collapse) and unit 50 with vlan-id 80
+//     (unit#≠vlan-id: the kernel subif is named by the VLAN ID, not the unit).
+//   - reth1's local physical member is ge-0/0/1 (there is no bonded "reth1"
+//     kernel device — SO_BINDTODEVICE must target the member).
+//   - reth0's local physical member is ge-0/0/3, and reth0 unit 100 carries
+//     vlan-id 100, so reth0.100 → the member's VLAN subif ge-0-0-3.100.
+//
+// NodeID 0 makes the slot-0 members the LOCAL-node members (RethToPhysical).
+func bindTestConfig() *config.Config {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0/0/2": {Name: "ge-0/0/2", Units: map[int]*config.InterfaceUnit{
+			0:  {Number: 0},
+			50: {Number: 50, VlanID: 80},
+		}},
+		"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth1"},
+		"ge-0/0/3": {Name: "ge-0/0/3", RedundantParent: "reth0"},
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{
+			100: {Number: 100, VlanID: 100},
+		}},
+	}
+	cfg.Chassis.Cluster = &config.ClusterConfig{NodeID: 0}
+	return cfg
+}
+
 func TestResolveBindConfigDestInterfaceWinsOverVRF(t *testing.T) {
 	// destination-interface is the more specific SO_BINDTODEVICE pin; when both
-	// it and a routing-instance are set, the destination-interface wins.
+	// it and a routing-instance are set, the destination-interface wins — and it
+	// resolves from Junos form ("ge-0/0/2") to the real kernel device ("ge-0-0-2")
+	// via the committed config's SSOT resolver so SO_BINDTODEVICE targets a real
+	// device (#5070).
+	resolve := bindTestConfig().ResolveKernelIfName
 	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{
-		DestinationInterface: "ge-0-0-2",
-		RoutingInstance:      "VRF-WAN",
-	})
+		DestinationInterface: "ge-0/0/2",
+		RoutingInstance:      "WAN",
+	}, resolve)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if b.bindDevice != "ge-0-0-2" {
-		t.Fatalf("destination-interface must win for SO_BINDTODEVICE, got %q", b.bindDevice)
+		t.Fatalf("destination-interface must resolve to the kernel device for SO_BINDTODEVICE, got %q", b.bindDevice)
 	}
-	if b.routingInst != "VRF-WAN" {
-		t.Fatalf("routing-instance must be recorded, got %q", b.routingInst)
+	// routingInst keeps the RAW routing-instance name (informational only).
+	if b.routingInst != "WAN" {
+		t.Fatalf("routing-instance must be recorded (raw, informational), got %q", b.routingInst)
 	}
 }
 
 func TestResolveBindConfigVRFOnlyBindsVRFDevice(t *testing.T) {
-	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{RoutingInstance: "VRF-WAN"})
+	b, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{RoutingInstance: "WAN"}, bindTestConfig().ResolveKernelIfName)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	// A VRF binds to its VRF master device, which shares the routing-instance
-	// name (Linux's VRF socket-binding model).
-	if b.bindDevice != "VRF-WAN" {
-		t.Fatalf("a VRF-only config must bind to the VRF device, got %q", b.bindDevice)
+	// A routing-instance binds to its kernel VRF master device "vrf-<name>"
+	// (pkg/routing), NOT the raw routing-instance name (#5070).
+	if b.bindDevice != "vrf-WAN" {
+		t.Fatalf("a VRF-only config must bind to the vrf-<name> device, got %q", b.bindDevice)
+	}
+}
+
+// TestResolveBindConfigResolvesKernelDevices is the #5070 fix-direction table:
+// a committed Junos interface / routing-instance reference MUST resolve to the
+// EXACT current kernel device name SO_BINDTODEVICE needs, via the committed
+// config's SSOT resolver — NOT the leaf slash-substitution, which produces
+// nonexistent devices for reth / VLAN-unit / unit-0 cases (the HA-cluster WAN
+// binding is exactly reth-with-VLAN). Before the fix bindDevice held the raw
+// Junos token and the dial hard-failed on a nonexistent device.
+func TestResolveBindConfigResolvesKernelDevices(t *testing.T) {
+	resolve := bindTestConfig().ResolveKernelIfName
+	cases := []struct {
+		name string
+		cfg  config.DHCPDynamicDNSConfig
+		want string
+	}{
+		// bare physical → slash-substituted.
+		{"physical", config.DHCPDynamicDNSConfig{DestinationInterface: "ge-0/0/2"}, "ge-0-0-2"},
+		// unit-0 collapse: ".0" is stripped (kernel has no ".0" subif).
+		{"unit-0-collapse", config.DHCPDynamicDNSConfig{DestinationInterface: "ge-0/0/2.0"}, "ge-0-0-2"},
+		// unit# ≠ vlan-id: unit 50 carries vlan-id 80, kernel subif is ".80".
+		{"unit-neq-vlanid", config.DHCPDynamicDNSConfig{DestinationInterface: "ge-0/0/2.50"}, "ge-0-0-2.80"},
+		// reth → its LOCAL physical member (no bonded "reth1" kernel device).
+		{"reth", config.DHCPDynamicDNSConfig{DestinationInterface: "reth1"}, "ge-0-0-1"},
+		// reth VLAN unit → member's VLAN subif (reth0 member ge-0/0/3, vlan-id 100).
+		{"reth-vlan-unit", config.DHCPDynamicDNSConfig{DestinationInterface: "reth0.100"}, "ge-0-0-3.100"},
+		// RI-only → vrf-<name> master (no resolver needed for this half).
+		{"ri-only", config.DHCPDynamicDNSConfig{RoutingInstance: "WAN"}, "vrf-WAN"},
+		// already vrf-prefixed → unchanged (prefix applied once, #2143).
+		{"ri-already-prefixed", config.DHCPDynamicDNSConfig{RoutingInstance: "vrf-red"}, "vrf-red"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			b, err := resolveBindConfig(&cfg, resolve)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if b.bindDevice != tc.want {
+				t.Fatalf("bindDevice = %q, want %q", b.bindDevice, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewRFC2136UpdaterValidatesBindDeviceExists proves the #5070
+// construction-time existence check: a resolved bind device that netlink cannot
+// find fails backend construction with a CLEAR error (naming the resolved
+// kernel device) instead of a cryptic SO_BINDTODEVICE dial failure later. It
+// threads the SSOT resolver so a reth binding resolves to its physical member,
+// and uses the injectable netlink seam so the test needs no real interface.
+func TestNewRFC2136UpdaterValidatesBindDeviceExists(t *testing.T) {
+	pol := policyFromConfig(&config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", UpdateServer: "192.0.2.53:53",
+	})
+	resolve := bindTestConfig().ResolveKernelIfName
+
+	// Seam: pretend only the reth1 physical member "ge-0-0-1" exists.
+	orig := bindDeviceLinkByName
+	t.Cleanup(func() { bindDeviceLinkByName = orig })
+	bindDeviceLinkByName = func(name string) error {
+		if name == "ge-0-0-1" {
+			return nil
+		}
+		return fmt.Errorf("Link not found")
+	}
+
+	// Present device: reth1 → member "ge-0-0-1" (resolved) → constructs.
+	ok := &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", UpdateServer: "192.0.2.53:53",
+		DestinationInterface: "reth1",
+	}
+	if _, err := newRFC2136Updater(pol, ok, nil, nil, nil, resolve); err != nil {
+		t.Fatalf("a present bind device must construct, got %v", err)
+	}
+
+	// Absent device: ge-0/0/2 → "ge-0-0-2" (not in the seam) → clear error
+	// naming the resolved kernel device.
+	bad := &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", UpdateServer: "192.0.2.53:53",
+		DestinationInterface: "ge-0/0/2",
+	}
+	_, err := newRFC2136Updater(pol, bad, nil, nil, nil, resolve)
+	if err == nil {
+		t.Fatal("an absent bind device must fail newRFC2136Updater")
+	}
+	if !strings.Contains(err.Error(), "ge-0-0-2") {
+		t.Fatalf("construction error must name the resolved kernel device, got %v", err)
 	}
 }
 
@@ -205,7 +330,7 @@ var _ syscall.RawConn = rawConnFD(0)
 // test RED.
 func TestDialerSourceBindFamilyGate(t *testing.T) {
 	// A loopback source binds without needing the address assigned to an iface.
-	b4, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "127.0.0.1"})
+	b4, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "127.0.0.1"}, nil)
 	if err != nil {
 		t.Fatalf("resolve v4: %v", err)
 	}
@@ -228,7 +353,7 @@ func TestDialerSourceBindFamilyGate(t *testing.T) {
 		t.Fatalf("v4 source on tcp6 must not error, got %v", err)
 	}
 
-	b6, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "::1"})
+	b6, err := resolveBindConfig(&config.DHCPDynamicDNSConfig{SourceAddress: "::1"}, nil)
 	if err != nil {
 		t.Fatalf("resolve v6: %v", err)
 	}
