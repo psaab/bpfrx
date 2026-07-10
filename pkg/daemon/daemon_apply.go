@@ -1103,9 +1103,13 @@ func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 				slog.Warn("failed to apply RA config", "err", err)
 			}
 		} else if d.ra != nil {
-			// No RA configs — clear any previous RA senders.
-			if err := d.ra.Clear(); err != nil {
-				slog.Warn("failed to clear RA config", "err", err)
+			// No RA configs remain — the operator removed all RA. Gracefully
+			// WITHDRAW any previous senders (final lifetime-0 goodbye, #5092)
+			// instead of a hard Clear, so hosts drop this router immediately
+			// rather than holding the stale default route until Router Lifetime
+			// (default 1800s) expires. Withdraw is a no-op when no senders exist.
+			if err := d.ra.Withdraw(); err != nil {
+				slog.Warn("failed to withdraw RA config", "err", err)
 			}
 		}
 	}

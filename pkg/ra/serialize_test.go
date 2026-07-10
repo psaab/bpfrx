@@ -818,7 +818,9 @@ func TestT5_ApplyConfigEqualKeepsSender(t *testing.T) {
 	_ = m.Clear()
 }
 
-// T6 — Clear / Apply-remove emit NO goodbye (modeHard).
+// T6 — Clear emits NO goodbye (modeHard). Clear() is the explicit no-goodbye
+// primitive for a forced/unsafe stop; config-driven removal now withdraws
+// gracefully instead (#5092, see config_removal_goodbye_5092_test.go).
 func TestT6_ClearEmitsNoGoodbye(t *testing.T) {
 	if _, err := net.InterfaceByName("lo"); err != nil {
 		t.Skip("lo interface unavailable")

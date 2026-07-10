@@ -356,7 +356,10 @@ func (m *Manager) reclaimTombstoneWhenStopped(name string, s *sender, startEpoch
 // tombstone covers the whole stop→start window, so a concurrent
 // Apply/Withdraw/WithdrawOnce that sees it defers instead of opening a second
 // conn. A CHANGED config is a hard replace (no goodbye — the router is not
-// going away); a REMOVED config is a hard stop (no goodbye).
+// going away); a REMOVED config (this interface, or all of them when configs is
+// empty) is a GRACEFUL withdraw that emits a final lifetime-0 goodbye (#5092),
+// so hosts drop the router immediately rather than holding a stale default
+// route until Router Lifetime expires.
 //
 // Interfaces that are ALREADY draining when this Apply runs (a prior
 // withdraw/stop or a WithdrawOnce claim still tearing down) are NOT started in
@@ -371,9 +374,19 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	m.bumpEpoch()
 
 	if len(configs) == 0 {
-		err := m.clearLocked()
+		// Config-driven removal of ALL RA (#5092): retire every sender with a
+		// final lifetime-0 goodbye (RFC 4861 §6.2.5) rather than a silent hard
+		// stop, so hosts drop this router immediately instead of holding the
+		// stale default route until Router Lifetime (default 1800s) expires.
+		// Same graceful path as Withdraw(); Clear() remains the explicit
+		// no-goodbye primitive for a forced/unsafe stop.
+		owned, epoch := m.collectGracefulWithdrawLocked()
 		m.mu.Unlock()
-		return err
+		for _, o := range owned {
+			// nil onProvenClose: a removal never starts a replacement.
+			m.releaseDrain(o.name, o.s, epoch, nil)
+		}
+		return nil
 	}
 
 	// Build desired map.
@@ -391,16 +404,24 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	}
 	var toStop []stopReq
 
-	// Remove senders not in the desired set (hard stop, no goodbye — a config
-	// change must not blackhole hosts). Install a drainEntry so a concurrent
-	// WithdrawOnce/Apply defers, and a racing graceful Withdraw can flip
-	// goodbyeWanted on it (the release path then emits the standalone).
+	// Remove senders not in the desired set. A TRUE removal (the operator
+	// deleted this interface's RA config and nothing re-advertises the router)
+	// is a GRACEFUL withdraw (#5092): install a goodbyeWanted drainEntry and
+	// signalStop(modeGraceful) so the owner emits the RFC 4861 §6.2.5
+	// lifetime-0 goodbye as its final RA — hosts drop this router at once
+	// instead of holding the stale default route until Router Lifetime
+	// (default 1800s) expires. This mirrors claimGracefulLocked's active-sender
+	// branch; releaseDrain's standalone backstop covers a lost upgrade race.
+	// The changed-config RESTART path below stays a hard replace (no goodbye —
+	// the router is not going away; the replacement re-advertises immediately).
+	// The tombstone also lets a concurrent WithdrawOnce/Apply defer and a racing
+	// graceful Withdraw flip goodbyeWanted (idempotent — already true here).
 	for name, s := range m.senders {
 		if _, ok := desired[name]; !ok {
-			slog.Info("ra: removing sender", "interface", name)
+			slog.Info("ra: withdrawing removed sender (graceful goodbye)", "interface", name)
 			delete(m.senders, name)
-			m.draining[name] = &drainEntry{sender: s, cfg: s.cfg}
-			s.signalStop(modeHard)
+			m.draining[name] = &drainEntry{sender: s, cfg: s.cfg, goodbyeWanted: true}
+			s.signalStop(modeGraceful)
 			toStop = append(toStop, stopReq{name, s})
 		}
 	}
@@ -613,25 +634,38 @@ type ownedDrain struct {
 func (m *Manager) Withdraw() error {
 	m.mu.Lock()
 	m.bumpEpoch()
-	var names []string
-	for name := range m.senders {
-		names = append(names, name)
-	}
-	// Also include interfaces already DRAINING (e.g. a Clear acquired m.mu
-	// first and hard-stopped them, or a changed-config restart is mid stop->
-	// start). claimGracefulLocked flips goodbyeWanted on those entries; their
-	// existing owner's release path emits the standalone if owed.
-	for name := range m.draining {
-		names = append(names, name)
-	}
-	owned := m.claimGracefulLocked(names)
-	epoch := m.epoch
+	owned, epoch := m.collectGracefulWithdrawLocked()
 	m.mu.Unlock()
 	for _, o := range owned {
 		// nil onProvenClose: a withdraw never starts a replacement.
 		m.releaseDrain(o.name, o.s, epoch, nil)
 	}
 	return nil
+}
+
+// collectGracefulWithdrawLocked flips graceful-withdrawal intent on every active
+// sender AND every already-draining interface, returning the drains THIS caller
+// owns the join+release for plus the current fenced epoch. Callers hold m.mu
+// (and have already bumped the whole-manager epoch); they must Unlock and drive
+// releaseDrain(o.name, o.s, epoch, nil) for each returned drain. Shared by
+// Withdraw() and Apply()'s empty-config branch (config-driven removal of ALL RA,
+// #5092) so both retire senders with a final lifetime-0 goodbye — the graceful
+// terminal withdrawal RFC 4861 §6.2.5 recommends — rather than a silent hard
+// stop that strands a stale default route on hosts.
+//
+// Already-draining interfaces are included (e.g. a Clear acquired m.mu first and
+// hard-stopped them, or a changed-config restart is mid stop->start):
+// claimGracefulLocked flips goodbyeWanted on those entries so their existing
+// owner's release path emits the standalone if one is owed.
+func (m *Manager) collectGracefulWithdrawLocked() ([]ownedDrain, uint64) {
+	var names []string
+	for name := range m.senders {
+		names = append(names, name)
+	}
+	for name := range m.draining {
+		names = append(names, name)
+	}
+	return m.claimGracefulLocked(names), m.epoch
 }
 
 // WithdrawInterfaces sends goodbye RAs and stops senders only for the named
