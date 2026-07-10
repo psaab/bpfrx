@@ -120,6 +120,16 @@ func (d *Daemon) onDHCPAddressChange() {
 // no IPsec gateway uses is a no-op, so an unrelated renew never churns
 // swanctl or resets live SAs. It runs under applySem to serialize with a
 // concurrent commit's IPsec apply (both write the same swanctl conf).
+//
+// #4899: the swanctl reload is NO LONGER best-effort-and-forgotten. On
+// failure strongSwan keeps binding the stale lease address and the tunnel
+// cannot re-establish, so the failure is made both RECOVERABLE — a
+// single-flight retry loop (ipsecRebindRetryLoop, see
+// daemon_ipsec_rebind.go) re-attempts the reapply until it converges —
+// and VISIBLE — the ipsecRebindPending health signal backs the
+// xpf_ipsec_rebind_pending gauge while local_addrs are stale. The lease
+// callback itself stays NON-FATAL: the retry + gauge ARE the recovery, so
+// a failed rebind never blocks or fails DHCP lease processing.
 func (d *Daemon) reapplyIPsecForLeaseChange(cfg *config.Config) {
 	if d.ipsec == nil || cfg == nil {
 		return
@@ -133,9 +143,20 @@ func (d *Daemon) reapplyIPsecForLeaseChange(cfg *config.Config) {
 	}
 	defer d.applySem.Release(1)
 	slog.Info("DHCP address changed on IPsec-bound interface, re-rendering swanctl local_addrs")
-	if err := d.ipsec.Apply(ipsec.PrepareConfig(cfg)); err != nil {
-		slog.Warn("failed to re-apply IPsec config after DHCP address change", "err", err)
+	if err := d.ipsecApplyForLeaseChange(cfg); err != nil {
+		slog.Warn("failed to re-apply IPsec config after DHCP address change; "+
+			"local_addrs may be stale until the rebind retry converges", "err", err)
+		// Set the health signal and arm the single-flight retry loop. The
+		// arm/apply state transition runs while applySem is still held (via
+		// the deferred Release), so it is atomic with this Apply attempt and
+		// cannot race a concurrent retry-loop attempt (which also holds
+		// applySem across its own apply+record).
+		d.armIPsecRebind()
+		return
 	}
+	// Success: clear any prior pending state (a no-op on the common healthy
+	// path, where nothing was pending and nothing is logged).
+	d.clearIPsecRebindPending()
 }
 
 // reconcileDHCPClients converges running DHCP/DHCPv6 clients with the

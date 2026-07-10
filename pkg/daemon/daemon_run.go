@@ -1169,6 +1169,12 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			}
 			return d.frr.ReloadDegraded()
 		},
+		// #4899: 1 while the last DHCP-lease-change IPsec rebind
+		// failed and swanctl local_addrs are still bound to a stale
+		// lease address (the retry loop has not reconverged), so the
+		// operator sees a tunnel that cannot re-establish instead of a
+		// silently-dropped reload error.
+		IPsecRebindPendingFn: d.IPsecRebindPending,
 		// #3780: surface scheduler republish-failure so
 		// xpf_scheduler_republish_failed reads 1 (and
 		// xpf_scheduler_republish_stale_seconds climbs) while a

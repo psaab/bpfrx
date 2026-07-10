@@ -578,6 +578,18 @@ func newCollector(srv *Server) *xpfCollector {
 				"removal is deferred while set (#1880).",
 			nil, nil,
 		),
+		ipsecRebindPending: prometheus.NewDesc(
+			"xpf_ipsec_rebind_pending",
+			"1 while the last DHCP-lease-change IPsec rebind failed and has "+
+				"not yet reconverged (#4899): a DHCP renewal moved the kernel "+
+				"address an IPsec gateway is dynamically bound to "+
+				"(external-interface, no explicit local-address), but the "+
+				"swanctl re-render/reload failed, so strongSwan keeps binding "+
+				"the STALE lease address and the tunnel cannot re-establish. "+
+				"The daemon retries the rebind autonomously; 0 once swanctl "+
+				"local_addrs reconverge on the current lease.",
+			nil, nil,
+		),
 		schedulerRepublishFailed: prometheus.NewDesc(
 			"xpf_scheduler_republish_failed",
 			"1 while the most recent scheduler-driven policy republish "+
