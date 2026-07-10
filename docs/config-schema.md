@@ -695,6 +695,53 @@ above), `compiler_security_screen.go` (screen/IDS), `compiler_security_addressbo
 (`compiler_ipsec_trafficselector.go`) onto the shared reader remains deferred
 (the #4104 DRY note, low-value/high-churn).
 
+## BGP group inheritance is sibling-order-independent (#5270)
+
+A BGP `group`'s `neighbor` children and its group-level default attributes are
+**semantically-unordered** Junos siblings. A neighbor inherits every group-level
+default it does not override: `peer-as`, `local-as`, `local-address`,
+`hold-time`, `passive`, `description`, `multihop`, `export`, `import`,
+`family` (inet/inet6 + per-family `prefix-limit maximum`), `authentication-key`,
+`bfd-liveness-detection` (interval/multiplier), `default-originate`, `loops`
+(allow-as-in), and `remove-private`.
+
+`compileProtocols` (`compiler_protocols.go`) used to walk a group's children
+ONCE and stamp each neighbor with whatever group defaults had been *seen so
+far* at the moment the `neighbor` child was encountered. That made inheritance
+**encounter-order-dependent**: a `neighbor` authored before the group's
+`export` (or `peer-as`, `local-address`, …) captured the empty/zero default,
+so a config like
+
+```
+set protocols bgp group G neighbor 192.0.2.1     # neighbor FIRST
+set protocols bgp group G export OUT             # export AFTER
+```
+
+compiled the neighbor with an empty `Export` → the FRR renderer emitted no
+outbound route-map → routes leaked outbound (fail-open, not vSRX-equivalent).
+Junos treats the two `set` lines as order-independent; xpf did not.
+
+The compiler now does a **two-pass** group walk that is order-independent in
+BOTH AST shapes (hierarchical block and flat-set):
+
+- **Pass 0** processes every NON-`neighbor` child, fully collecting all
+  group-level defaults regardless of sibling order (multi-value list leaves
+  such as `export`/`import` accumulate via `firewallMatchValues` per the
+  dual-AST contract above).
+- **Pass 1** processes only the `neighbor` children, stamping each from the
+  now-completed group defaults. Per-neighbor explicit values are applied on top
+  and still OVERRIDE the inherited group default — the override precedence is
+  unchanged; only the DEFAULT source moved from "seen-so-far" to
+  "fully-collected".
+
+The result: semantically-unordered sibling statements compile to IDENTICAL
+neighbor state regardless of encounter order. The same `compileProtocols` runs
+for top-level `protocols bgp` and per-`routing-instances` BGP, so both inherit
+the fix. Covered by `pkg/config/bgp_group_inherit_order_5270_test.go` (neighbor
+-before-export inherits, both orders identical across export/peer-as/
+local-address/hold-time, per-neighbor override still wins in both orders, and a
+hierarchical-shape variant).
+
 ## Duplicate host-local-address fail-closed gate (#3718, Option B)
 
 Beyond the per-leaf token allowlist above, host-inbound admission has a
