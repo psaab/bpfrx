@@ -148,10 +148,18 @@ editing cmdtree.
   is configured, every peer-proxied RPC must carry a time-windowed HMAC
   bearer token (`HMAC-SHA256(PSK, domain‖window)`, 30 s window ±1 for skew)
   in the `xpf-fabric-auth` metadata header, verified constant-time; the
-  local node attaches it on `dialPeer` via `fabricAuthCreds`. This closes
-  the gap where any host on the shared control segment could invoke the
-  allowlisted read/monitor/`ClearSessions`/cross-node-failover RPCs with no
-  credential. Dual-accept (mirroring the heartbeat, `fabricAuthDecision`):
+  local node attaches it on `dialPeer` via `fabricAuthCreds`. **Both**
+  fabric dialers attach the token: the daemon's own `Server.dialPeer`
+  (`server_diag.go`) and the in-process operator CLI's peer dialer
+  (`pkg/cli` `dialPeer`, which reaches the peer directly for cluster-wide
+  `show`/`clear`/`request chassis cluster` proxying) — the latter builds
+  the credential from the same live control-link PSK via the shared
+  `grpcapi.NewFabricAuthCreds` helper (#5324). Before #5324 the CLI dialer
+  used insecure creds only, so enabling the fabric PSK silently broke CLI
+  peer observability/role control with `Unauthenticated` once the guard
+  armed. This closes the gap where any host on the shared control segment
+  could invoke the allowlisted
+  read/monitor/`ClearSessions`/cross-node-failover RPCs with no credential. Dual-accept (mirroring the heartbeat, `fabricAuthDecision`):
   a node with no key configured accepts everything; once enforcement is
   armed the peer must keep signing (a tokenless call is then a downgrade
   attack and is rejected `Unauthenticated`); a tokenless call before
