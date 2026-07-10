@@ -305,13 +305,21 @@ func (d *Daemon) nudgeDHCPLeaseSync() {
 	}
 }
 
-// preSeedDHCPLeaseMemfile writes the held peer leases into the Kea memfile
-// CSV(s) BEFORE Kea is (re)started on takeover (#2239 Q3, the dup-alloc-window
-// closer per SMR NIT-1). Pre-seeding the memfile means the just-started Kea
-// loads the in-use bindings into its lease manager at boot, so it can NEVER
-// answer a DISCOVER with an in-use address even in the brief window before the
-// post-start lease-add seed runs. Best-effort + fail-open: a write failure is
-// logged; the post-start lease-add (seedDHCPLeasesFromPeer) is the backstop.
+// preSeedDHCPLeaseMemfile writes leases into the Kea memfile CSV(s) BEFORE Kea
+// is (re)started on takeover (#2239 Q3, the dup-alloc-window closer per SMR
+// NIT-1). Pre-seeding the memfile means the just-started Kea loads the in-use
+// bindings into its lease manager at boot, so it can NEVER answer a DISCOVER
+// with an in-use address even in the brief window before the post-start
+// lease-add seed runs. Best-effort + fail-open: a write failure is logged; the
+// post-start lease-add (seedDHCPLeasesFromPeer) is the backstop.
+//
+// #5040: the pre-seed writes the UNION of this node's current local active
+// leases and the held peer leases, NOT the peer-only set. On a per-RG
+// active-active takeover this node is already MASTER for some RGs whose leases
+// are live locally; overwriting the shared memfile with peer-only rows wiped
+// those still-mastered leases and let Kea re-allocate their in-use addresses.
+// The merge (PreSeedMemfileMerged{4,6}) reads the local set and fails closed on
+// an untrusted local source rather than replacing it.
 //
 // Called from the MASTER-takeover path BEFORE dhcpServer.ApplyAsync(start).
 func (d *Daemon) preSeedDHCPLeaseMemfile() {
@@ -322,16 +330,18 @@ func (d *Daemon) preSeedDHCPLeaseMemfile() {
 	if cc == nil || !cc.DHCPLeaseSync {
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), dhcpLeaseReadTimeout)
+	defer cancel()
 	now := time.Now()
 	if leases := d.sessionSync.PeerDHCPLeases4(); len(leases) > 0 {
-		if err := d.dhcpServer.PreSeedMemfile4(leases, now); err != nil {
+		if err := d.dhcpServer.PreSeedMemfileMerged4(ctx, leases, now); err != nil {
 			slog.Warn("cluster: DHCP v4 lease memfile pre-seed failed (post-start lease-add is backstop)", "err", err)
 		} else {
 			slog.Info("cluster: DHCP v4 leases pre-seeded into memfile before Kea start", "count", len(leases))
 		}
 	}
 	if leases := d.sessionSync.PeerDHCPLeases6(); len(leases) > 0 {
-		if err := d.dhcpServer.PreSeedMemfile6(leases, now); err != nil {
+		if err := d.dhcpServer.PreSeedMemfileMerged6(ctx, leases, now); err != nil {
 			slog.Warn("cluster: DHCP v6 lease memfile pre-seed failed (post-start lease-add is backstop)", "err", err)
 		} else {
 			slog.Info("cluster: DHCP v6 leases pre-seeded into memfile before Kea start", "count", len(leases))

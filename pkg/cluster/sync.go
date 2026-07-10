@@ -304,9 +304,20 @@ type SessionSync struct {
 	// #2239: the standby holds the peer's most-recent full lease set per
 	// family (the peerIPsecSAs precedent). On takeover the daemon reads these
 	// and seeds the just-started Kea. Replaced wholesale on each full-set push.
-	peerDHCPLeases4  []dhcpserver.SyncLease
-	peerDHCPLeases6  []dhcpserver.SyncLease
-	peerDHCPLeasesMu sync.Mutex
+	//
+	// #4871: peerDHCPLeases{4,6}RecvAt records WHEN this node received each
+	// family's held set. SyncLease.Remaining is seconds-of-lifetime-left at the
+	// SENDER's read time and carries no sample epoch, so a set held on the
+	// standby ages only if the receiver subtracts its own residence before
+	// seeding — otherwise a lease held for minutes is re-anchored to
+	// now_local+Remaining on takeover and RESURRECTED past its true expiry
+	// (duplicate allocation). RecvAt is a time.Now() reading (monotonic in
+	// production), so PeerDHCPLeases{4,6} subtract a monotonic residence.
+	peerDHCPLeases4       []dhcpserver.SyncLease
+	peerDHCPLeases6       []dhcpserver.SyncLease
+	peerDHCPLeases4RecvAt time.Time
+	peerDHCPLeases6RecvAt time.Time
+	peerDHCPLeasesMu      sync.Mutex
 	// IsPrimaryFn reports whether the local node is primary for the default sync scope.
 	IsPrimaryFn func() bool
 	// IsPrimaryForRGFn reports whether the local node is primary for a given RG.
@@ -932,23 +943,56 @@ func (s *SessionSync) RecordDHCPLeasesSeeded(n int) {
 	}
 }
 
-// PeerDHCPLeases4 returns a copy of the v4 lease set held from the peer (#2239).
-// The standby seeds these into Kea on takeover.
+// PeerDHCPLeases4 returns the v4 lease set held from the peer, AGED by this
+// node's standby residence (#2239/#4871). The standby seeds these into Kea on
+// takeover.
 func (s *SessionSync) PeerDHCPLeases4() []dhcpserver.SyncLease {
-	s.peerDHCPLeasesMu.Lock()
-	defer s.peerDHCPLeasesMu.Unlock()
-	cp := make([]dhcpserver.SyncLease, len(s.peerDHCPLeases4))
-	copy(cp, s.peerDHCPLeases4)
-	return cp
+	return s.peerDHCPLeasesAged(4, time.Now())
 }
 
-// PeerDHCPLeases6 returns a copy of the v6 lease set held from the peer (#2239).
+// PeerDHCPLeases6 returns the aged v6 lease set held from the peer (#2239/#4871).
 func (s *SessionSync) PeerDHCPLeases6() []dhcpserver.SyncLease {
+	return s.peerDHCPLeasesAged(6, time.Now())
+}
+
+// peerDHCPLeasesAged returns a copy of the held peer lease set for a family with
+// each lease's Remaining lifetime reduced by this node's standby RESIDENCE —
+// the monotonic time elapsed since the set was received — and leases that have
+// aged to zero DROPPED (#4871).
+//
+// Remaining is seconds-of-lifetime-left at the SENDER's read time and carries
+// no sample epoch. Without this subtraction a lease held on the standby for
+// minutes is re-anchored at seed to now_local+Remaining and resurrected past
+// its true expiry, so the promoted node could re-allocate an address/prefix the
+// original server already reassigned (duplicate allocation). A lease at or below
+// zero is dropped, NOT floored to one second — a floor would revive an expired
+// binding just as surely. now is injected for tests; production passes
+// time.Now() (which, like the stored RecvAt, carries a monotonic reading, so
+// the residence is a monotonic delta immune to wall-clock steps).
+func (s *SessionSync) peerDHCPLeasesAged(family int, now time.Time) []dhcpserver.SyncLease {
 	s.peerDHCPLeasesMu.Lock()
 	defer s.peerDHCPLeasesMu.Unlock()
-	cp := make([]dhcpserver.SyncLease, len(s.peerDHCPLeases6))
-	copy(cp, s.peerDHCPLeases6)
-	return cp
+	src := s.peerDHCPLeases4
+	recvAt := s.peerDHCPLeases4RecvAt
+	if family == 6 {
+		src = s.peerDHCPLeases6
+		recvAt = s.peerDHCPLeases6RecvAt
+	}
+	var residence int
+	if !recvAt.IsZero() {
+		if d := int(now.Sub(recvAt).Seconds()); d > 0 {
+			residence = d
+		}
+	}
+	out := make([]dhcpserver.SyncLease, 0, len(src))
+	for _, l := range src {
+		l.Remaining -= residence // l is a value copy; the held set is untouched
+		if l.Remaining <= 0 {
+			continue // aged out on the standby — drop, never resurrect at seed
+		}
+		out = append(out, l)
+	}
+	return out
 }
 
 // SetPeerDHCPLeasesForTesting injects a held peer lease set for a family so
@@ -961,11 +1005,17 @@ func (s *SessionSync) SetPeerDHCPLeasesForTesting(family int, leases []dhcpserve
 // storePeerDHCPLeases replaces the held lease set for a family (full-set push
 // semantics). Called from the receive path.
 func (s *SessionSync) storePeerDHCPLeases(family int, leases []dhcpserver.SyncLease) {
+	// #4871: stamp the receipt time so PeerDHCPLeases{4,6} can subtract standby
+	// residence before seeding. time.Now() carries a monotonic reading, so the
+	// later now.Sub(recvAt) is a monotonic residence.
+	recvAt := time.Now()
 	s.peerDHCPLeasesMu.Lock()
 	if family == 6 {
 		s.peerDHCPLeases6 = leases
+		s.peerDHCPLeases6RecvAt = recvAt
 	} else {
 		s.peerDHCPLeases4 = leases
+		s.peerDHCPLeases4RecvAt = recvAt
 	}
 	s.peerDHCPLeasesMu.Unlock()
 }

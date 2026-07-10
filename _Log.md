@@ -1,3 +1,55 @@
+## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4871 ha/dhcpserver — synced DHCP lease lifetimes stopped aging on
+  the standby and were re-anchored/resurrected at takeover. SyncLease.Remaining
+  is seconds-left at the sender's read time with no sample epoch; the receiver
+  stored a value copy with no receipt time, so standby residence was never
+  subtracted and expired leases came back on promotion (duplicate allocation).
+  Fix: SessionSync now stamps peerDHCPLeases{4,6}RecvAt on receipt (a monotonic
+  time.Now() reading); PeerDHCPLeases{4,6} subtract the monotonic residence via
+  peerDHCPLeasesAged and DROP any lease aged to <=0 (never floor to 1). The
+  dhcpserver seed writers (seedSyncLeases, writeMemfile{4,6}) also drop
+  Remaining<=0 as a fail-safe instead of flooring; syncLeaseToKea's floor is now
+  a documented last-resort guard only. Tests: cluster TestPeerDHCPLeasesAged
+  (ages 600->500, drops the 60s lease held 100s; held set untouched — RED on
+  revert to plain copy) + dhcpserver TestSeedAndPreSeed_DropExpiredLeases
+  (socket + memfile paths drop expired — RED on restoring the floor).
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/lease_sync_wire_test.go,
+  pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  docs/research/2239-dhcp-ha-lease-sync/plan.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5040 ha/dhcpserver — the active-active takeover memfile pre-seed
+  passed ONLY the peer's leases to PreSeedMemfile{4,6}, which atomically
+  OVERWROTE the shared Kea memfile — wiping the leases of RGs this node still
+  masters, so the restarted Kea could re-allocate their in-use addresses
+  (duplicate allocation). New `PreSeedMemfileMerged{4,6}(ctx, peer, now)` reads
+  this node's CURRENT local active leases (socket-preferred, memfile fallback —
+  the GetSyncLeases path) and writes the UNION with the peer set, keyed by lease
+  identity (`mergeLeasesByIdentity`, local live binding wins a conflict).
+  FAIL-CLOSED: an untrusted/corrupt local read returns an error and leaves the
+  memfile intact (post-start lease-add is the backstop) rather than replacing it
+  with peer-only rows. `preSeedDHCPLeaseMemfile` now calls the merged variant
+  under a bounded ctx. Tests: TestPreSeedMemfileMerged4_PreservesLocalLeases
+  (RED on revert to peer-only overwrite) + _FailsClosedOnUntrustedLocal.
+  **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/daemon/daemon_dhcp_lease_sync.go,
+  pkg/dhcpserver/lease_sync_test.go, docs/research/2239-dhcp-ha-lease-sync/plan.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5041 ha/dhcpserver — Kea `subnet-id` was a positional counter
+  over each node's MASTER-filtered subnet list, so the SAME subnet got a
+  DIFFERENT id on the two HA nodes and synced leases (which carry `subnet-id`
+  verbatim) misbound on the receiver. Replaced the counter with
+  `stableSubnetID(subnet)` — an FNV-1a hash of the canonical CIDR folded into
+  Kea's valid `[1, 0xFFFFFFFE]` range — plus a deterministic sorted-order
+  linear probe (`nextSubnetID`) for the astronomically-rare same-config
+  collision. The id is now identical per subnet across nodes, filtered subsets,
+  reordering, and reloads (subsumes #2668). Updated the #2668 regen test to
+  self-capture (no longer pins positional golden ids) and added
+  `TestKeaSubnetIDStableAcrossFilteredSubsets` (RED on revert to positional).
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  docs/research/2239-dhcp-ha-lease-sync/plan.md
 ## 2026-07-09 — #5036 dynamic-address feed day-2 reconcile (security)
 
 - **Timestamp**: 2026-07-09
