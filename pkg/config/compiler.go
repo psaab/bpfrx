@@ -1530,6 +1530,21 @@ type compileOpts struct {
 	// community VALUE (e.g. 65000:100), not a list reference, and is not
 	// checked. Same doctrine as lenientRoutingExportRef.
 	lenientPolicyCommunityRef bool
+	// lenientPolicyReservedRedistName (#5116) downgrades the reserved
+	// route-map-suffix gate (validatePolicyReservedRedistNameStrict) from a
+	// hard compile error to a cfg.Warnings entry. An operator policy-statement
+	// whose name ends in the reserved ReservedRedistSuffix ("-xpf-redist")
+	// collides in FRR's global name-keyed route-map namespace with the
+	// per-use-site fail-closed redistribute alias the renderer derives (#4481),
+	// which can silently reintroduce BGP/IGP redistribution leakage. The strict
+	// commit / commit-check path hard-rejects such a name so it is
+	// operator-visible; an already-persisted or peer-synced config an older
+	// binary accepted must still BOOT (warn) per the #1960 fail-closed-on-load
+	// doctrine — the render path carries a defense-in-depth collision guard
+	// (redistAliasCollision, pkg/frr) that fails the managed-section apply CLOSED
+	// on the tolerant path, so a leniently-loaded collision cannot leak. Same
+	// doctrine as lenientRoutingExportRef.
+	lenientPolicyReservedRedistName bool
 	// lenientVRRPVirtualAddress (#3013) downgrades the VRRP virtual-address
 	// subnet-containment gate (validateVRRPVirtualAddressSubnet) from a hard
 	// compile error to a cfg.Warnings entry. A VRRP virtual-address that does
@@ -1763,6 +1778,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyThenDeny:                  true,
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyCommunityRef:              true,
+		lenientPolicyReservedRedistName:        true,
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
@@ -2030,6 +2046,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyThenDeny:                  true,
 		lenientPolicyMissingMatch:              true,
 		lenientPolicyCommunityRef:              true,
+		lenientPolicyReservedRedistName:        true,
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,

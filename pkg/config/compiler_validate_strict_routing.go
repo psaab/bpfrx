@@ -828,3 +828,57 @@ func validatePrefixLengthRange(rf *RouteFilter) error {
 	}
 	return nil
 }
+
+// ReservedRedistSuffix is the route-map name suffix xpf RESERVES for the
+// per-use-site fail-closed redistribute aliases the FRR renderer derives
+// (redistFailClosedRouteMap in pkg/frr/policy_render.go emits `name + suffix`).
+// FRR keys route-maps by NAME in a single GLOBAL namespace, so an operator
+// policy-statement whose name ends in this suffix would collide with a
+// generated alias in that shared object and could silently undo the #4481
+// fail-closed BGP/IGP separation — reintroducing route redistribution leakage
+// under a config that otherwise passes validation (#5116). The alias derivation
+// (pkg/frr) and the strict validator below MUST agree on this exact string;
+// pkg/frr references this constant so the two never drift.
+const ReservedRedistSuffix = "-xpf-redist"
+
+// validatePolicyReservedRedistNameStrict hard-rejects an operator
+// policy-statement whose name ends in the reserved ReservedRedistSuffix. That
+// suffix is owned by the FRR renderer's generated fail-closed redistribute
+// aliases (#4481); an operator name in that namespace can collide with a
+// generated alias in FRR's global name-keyed route-map object and silently
+// reintroduce BGP/IGP redistribution leakage (#5116). Reserving the suffix at
+// commit makes the generated-alias namespace injective BY CONSTRUCTION — no
+// legal config can name a policy-statement into the generated slot.
+//
+// Strict on commit / commit-check (hard reject so the reserved name is
+// operator-visible); lenient on load / peer-sync (warn so an already-persisted
+// or peer-synced config an older binary accepted still boots — #1960
+// fail-closed-on-load class). The render-side defense-in-depth (redistAliasCollision
+// in pkg/frr) fails the whole managed-section apply CLOSED on the tolerant path,
+// so a leniently-loaded collision cannot leak. Runs on the fully-compiled
+// *Config so the policy-statement map is populated regardless of authoring
+// order. Mirrors validateRoutingExportReferencesStrict.
+func validatePolicyReservedRedistNameStrict(cfg *Config) error {
+	if cfg == nil || cfg.PolicyOptions.PolicyStatements == nil {
+		return nil
+	}
+	// Deterministic first-error: iterate policy-statement names in sorted order.
+	names := make([]string, 0, len(cfg.PolicyOptions.PolicyStatements))
+	for name := range cfg.PolicyOptions.PolicyStatements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if strings.HasSuffix(name, ReservedRedistSuffix) {
+			return fmt.Errorf(
+				"policy-statement %q ends in the reserved %q suffix; xpf owns "+
+					"that suffix for generated fail-closed redistribute route-map "+
+					"aliases (#4481/#5116) and an operator name in that namespace "+
+					"can collide with a generated alias in FRR's global route-map "+
+					"object, silently reintroducing BGP/IGP redistribution leakage "+
+					"— rename the policy-statement off the reserved suffix",
+				name, ReservedRedistSuffix)
+		}
+	}
+	return nil
+}

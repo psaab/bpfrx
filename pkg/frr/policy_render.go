@@ -1378,12 +1378,65 @@ func communityMemberIsRegex(member string) bool {
 // BGP default-accept trailing permit (#2998); this alias carries the fail-closed
 // trailing deny the redistribute / forwarding-table context requires, so the
 // BGP permit default never leaks into the IGP through FRR's single name-keyed
-// route-map object (#4481). The "-xpf-redist" suffix is reserved: an operator
-// policy-statement of that exact derived name would collide — the same
-// non-injective-name caveat as F-220 (prefix-list names), which stays
-// vanishingly unlikely and is documented in the module README.
+// route-map object (#4481). The config.ReservedRedistSuffix ("-xpf-redist") is
+// RESERVED: the strict commit gate (validatePolicyReservedRedistNameStrict,
+// pkg/config) rejects an operator policy-statement whose name ends in it, so the
+// generated-alias namespace is injective by construction (#5116). The alias
+// derivation here and that validator share the one constant so they cannot
+// drift. redistAliasCollision below is the render-side belt: on the tolerant
+// load / peer-sync path (where the strict gate only warns) it fails the apply
+// CLOSED if an alias still collides with an operator policy-statement, so a
+// leniently-loaded collision cannot silently leak.
 func redistFailClosedRouteMap(name string) string {
-	return name + "-xpf-redist"
+	return name + config.ReservedRedistSuffix
+}
+
+// redistAliasCollision is the render-side defense-in-depth for #5116. For every
+// policy-statement that generates a fail-closed redistribute alias
+// (policyNeedsRedistAlias), it checks whether that derived alias name
+// (redistFailClosedRouteMap) also exists as an operator-defined
+// policy-statement. FRR keys route-maps by NAME in one global namespace and
+// MERGES two same-named `route-map` definitions into a single object, so a
+// colliding operator policy's (possibly permit-default) sequences would fuse
+// with the generated fail-closed deny alias and could reintroduce the #4481
+// BGP/IGP redistribution leak the alias exists to prevent.
+//
+// The strict commit gate (validatePolicyReservedRedistNameStrict, pkg/config)
+// rejects a reserved-suffix operator name outright, so a committed config never
+// reaches here with a collision. This belt covers the tolerant load / peer-sync
+// / rollback path where that gate only warns (#1960): ApplyFull calls it before
+// building the managed section and returns the error, failing the whole apply
+// CLOSED (FRR keeps its last-good config, no new leak) instead of emitting a
+// colliding route-map. Returns nil for the common non-colliding case, leaving
+// render output byte-identical.
+func redistAliasCollision(po *config.PolicyOptionsConfig, bgpAcceptDefault map[string]bool) error {
+	if po == nil || po.PolicyStatements == nil {
+		return nil
+	}
+	// Deterministic first-error: iterate policy-statement names in sorted order.
+	names := make([]string, 0, len(po.PolicyStatements))
+	for name := range po.PolicyStatements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ps := po.PolicyStatements[name]
+		if !policyNeedsRedistAlias(name, ps, bgpAcceptDefault) {
+			continue
+		}
+		alias := redistFailClosedRouteMap(name)
+		if _, ok := po.PolicyStatements[alias]; ok {
+			return fmt.Errorf(
+				"policy-statement %q generates the fail-closed redistribute "+
+					"route-map alias %q (reserved %q suffix), which collides with "+
+					"an operator-defined policy-statement of that exact name; FRR "+
+					"merges same-named route-maps, so the collision could "+
+					"reintroduce the #4481 BGP/IGP redistribution leak — refusing "+
+					"to render (rename the operator policy off the reserved suffix)",
+				name, alias, config.ReservedRedistSuffix)
+		}
+	}
+	return nil
 }
 
 // policyNeedsRedistAlias reports whether policy-statement name renders a
