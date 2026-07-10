@@ -546,3 +546,24 @@ all files stay in `package ipsec`, so the public API is unchanged.
   rejected an embedded newline in ANY value at commit — the #4098 gate
   adds the traffic-selector-specific shape check (malformed / mis-scoped
   selector) and the render-side belt.
+- **Injective child-section naming (#5122).** Each traffic selector
+  renders one swanctl child section named `<conn>-<sanitizeChildName(ts)>`
+  (`effectiveTrafficSelectors` in `policy.go`). `sanitizeChildName` maps
+  every disallowed rune to a single `-`, so two DISTINCT selector names
+  that differ only in sanitized characters (e.g. `site/a` and `site:a`,
+  both legal Junos identifier chars) both collapse to `site-a` and used
+  to emit DUPLICATE child sections — strongSwan then rejects the config
+  or silently merges/loses one selector, a selector-specific
+  site-to-site outage. `effectiveTrafficSelectors` now detects any
+  sanitized base shared by two or more selectors and appends a stable
+  hash of the ORIGINAL selector name (`childNameDisambiguator`, fnv-1a
+  low 32 bits, 8 hex chars) to EACH colliding entry so every configured
+  selector renders a UNIQUE section. Non-colliding names (the common
+  case) are left byte-for-byte unchanged — no churn. The disambiguator
+  is a pure function of the original name, so the same config renders
+  identical section names across renders and across HA nodes, preserving
+  config-sync and idempotent commits. A residual guard extends the name
+  deterministically in the astronomically unlikely event a disambiguated
+  name still collides. Unlike the #4098 gate this does NOT reject the
+  config: two selectors with distinct legal Junos names are valid, so the
+  fix makes both render (vSRX parity) rather than failing the commit.

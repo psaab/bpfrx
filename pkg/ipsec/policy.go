@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net"
 	"sort"
@@ -391,8 +392,35 @@ func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSel
 	}
 	sort.Strings(names)
 
+	// sanitizeChildName is not injective: it maps every disallowed rune to a
+	// single '-', so two distinct selector names differing only in sanitized
+	// characters (e.g. `site/a` and `site:a`, both legal Junos identifier
+	// chars) both collapse to `site-a` and render DUPLICATE swanctl child
+	// sections. strongSwan then rejects the config or silently merges/loses
+	// one child — a selector-specific site-to-site outage (#5122). Detect any
+	// base name shared by two or more selectors and append a stable hash of
+	// the ORIGINAL selector name to EACH colliding entry so every configured
+	// selector renders a UNIQUE child section. Non-colliding names are left
+	// byte-for-byte unchanged (no churn), and the disambiguator is a pure
+	// function of the original name, so the same config renders identically
+	// across renders and across HA nodes (config-sync + idempotent commit).
+	bases := make([]string, len(names))
+	counts := make(map[string]int, len(names))
+	for i, name := range names {
+		bases[i] = sanitizeChildName(name)
+		counts[bases[i]]++
+	}
+	// Reserve every non-colliding base first so a disambiguated collided name
+	// can never land on a name a distinct selector already owns.
+	used := make(map[string]bool, len(names))
+	for i := range names {
+		if counts[bases[i]] == 1 {
+			used[bases[i]] = true
+		}
+	}
+
 	children := make([]childSelector, 0, len(names))
-	for _, name := range names {
+	for i, name := range names {
 		ts := vpn.TrafficSelectors[name]
 		localTS := vpn.LocalID
 		remoteTS := vpn.RemoteID
@@ -402,13 +430,37 @@ func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSel
 		if ts.RemoteIP != "" {
 			remoteTS = ts.RemoteIP
 		}
+		childName := bases[i]
+		if counts[bases[i]] > 1 {
+			childName = bases[i] + "-" + childNameDisambiguator(name)
+			// Astronomically unlikely: the disambiguated name still collides
+			// (a hash collision, or a distinct selector literally named
+			// `<base>-<hash>`). Extend deterministically until unique so the
+			// injectivity guarantee is absolute.
+			for used[childName] {
+				childName += "x"
+			}
+			used[childName] = true
+		}
 		children = append(children, childSelector{
-			Name:     connName + "-" + sanitizeChildName(name),
+			Name:     connName + "-" + childName,
 			LocalTS:  localTS,
 			RemoteTS: remoteTS,
 		})
 	}
 	return children
+}
+
+// childNameDisambiguator returns a short, stable hash of the ORIGINAL selector
+// name, used to make colliding sanitized child-section names injective (#5122).
+// It is a deterministic pure function of the input (fnv-1a 64-bit, low 32 bits
+// as 8 hex chars), so distinct original names that sanitize to the same base
+// receive distinct suffixes, and the same config renders the same name on every
+// node — a prerequisite for HA config-sync and idempotent commits.
+func childNameDisambiguator(original string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(original))
+	return fmt.Sprintf("%08x", uint32(h.Sum64()))
 }
 
 // sanitizeSwanctlValue strips ASCII control characters — the C0 set
