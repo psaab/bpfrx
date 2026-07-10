@@ -819,6 +819,27 @@ not read it, so the value is currently unsupported and discarded — an arity
 gate there would assert validation on a no-op feature (tag it only if/when
 `AddressSet.Description` is wired).
 
+**Bracket-list members inside opaque set containers — the reader must
+accumulate, not index (#4791 address-set, #5181 application-set).** The
+`applications application-set <name>` body is an opaque `args:1` leaf
+(`children:nil`), so `SchemaValidate` never walks into it and its member leaves
+carry NO `multi:true` tag. But a member list is still authored as a Junos
+bracketed list — `application [ app1 app2 app3 ]` — which the lexer collapses
+onto ONE leaf's Keys (`["application","app1","app2","app3"]`) per the #2419
+dual-shape rule. A compiler reading only `Keys[1]` (via `nodeVal`) kept just
+`app1` and silently dropped the rest, so a policy referencing the set
+under-matched — a DENY covered only the first application (fail-open). Both the
+`application` and nested `application-set` member arms in
+`compileApplications` now read every value through `applicationSetMemberValues`
+(`Keys[1:]` AND each child's `Keys[0]`), the applications-side sibling of
+`addressSetMemberValues` (`compiler_security_addressbook.go`, #4791) and the
+`firewallMatchValues` SSOT. This is a compiler-reader fix, NOT a schema tag:
+the opaque container stays `args:1` (the #3890 default arm still records typo'd
+member keywords for the strict syntax gate). Pinned by
+`pkg/config/applicationset_bracket_members_5181_test.go` (flat-set +
+hierarchical bracket lists, nested-set bracket list, deny-policy expansion, and
+a single-member negative control), RED on revert to `Keys[1]`.
+
 ## Per-subtree closed-world keyword validation (#4313)
 
 The scalar-arity gate (#3332, above) is a token-level fix: it catches an
