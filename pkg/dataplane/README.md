@@ -81,6 +81,36 @@ Guard layers (`build-userspace-xdp.sh`):
    `test/incus/cluster-setup.sh deploy_vm()` pushes the new binary to
    a temp path and runs this BEFORE stopping the old daemon — a
    REJECT refuses the deploy with the old dataplane still forwarding.
+
+   The shared `validateUserspaceShimSpec` gate this runs also performs
+   an **ABI compatibility check** (#5307): for every PinByName shim map
+   it compares the embedded shim's `Type`, `KeySize`, `ValueSize`,
+   `MaxEntries`, and `Flags` — the exact fields cilium/ebpf's
+   `MapSpec.Compatible` flags with `ErrMapIncompatible` at load —
+   against BOTH the Go-side expected shape (dnat_table only, from
+   `userspaceShimSharedMapSpecs`) AND the RUNNING daemon's **live
+   pinned maps** (read-only via `ebpf.LoadPinnedMap` + shape
+   accessors). Because this runs while the old daemon is still up (its
+   pins live), an ABI-incompatible map is caught HERE and the deploy is
+   refused — instead of the pre-#5307 behavior where a green pre-flight
+   let the deploy proceed, the old daemon was stopped, and the new
+   daemon's `NewCollectionWithOptions` then failed `ErrMapIncompatible`,
+   stranding the node fail-closed (config-only). A map with no pin yet
+   (fresh node / first load) skips the live-pin arm — only the
+   expected-value checks apply, so a clean node never false-fails. The
+   disposable counter map `userspace_fallback_stats` is intentionally
+   excluded: `reconcileDisposableCollectionPin` resets it on an
+   intended shape change (#4113), so ABI-checking it here would re-brick
+   that upgrade.
+
+   **Residual (documented, not caught here):** a *same-size* Go/Rust
+   value **field reorder** — identical `KeySize`/`ValueSize`/`Type`/
+   `Flags` but a different field layout — is invisible to this
+   spec-level ABI comparison (and to `ErrMapIncompatible` itself). That
+   class stays covered by the build-time kernel-verifier gate above +
+   the cross-language struct-parity tests (`bpf/headers/*.h` vs the Go
+   mirrors and the userspace-dp parity tests), NOT the deploy
+   pre-flight.
 4. **Tests** — root-gated `TestVerifyEmbeddedUserspaceShim` catches a
    bad tracked artifact in privileged `make test`;
    `TestVerifyUserspaceShimShrinkEquivalence` proves the verify-only
