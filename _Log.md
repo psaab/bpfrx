@@ -14,6 +14,73 @@
   **File(s)**: pkg/daemon/daemon_system.go, pkg/daemon/exec_timeout.go,
   pkg/daemon/daemon_login_optinjection_5005_test.go
 
+## 2026-07-09 — #4916 snmp: Agent.Stop leaked the ctx-watcher + trap worker and could deliver queued traps after Stop
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4916 (goroutine leak + stale telemetry). `Agent.Stop` only set
+  `stopped` and closed the socket; the daemon-wide context stays live across a
+  day-2 SNMP disable, so the `<-ctx.Done()` watcher blocked forever and the trap
+  worker ranged an unclosed channel forever, still delivering any queued backlog
+  to the old target/community. Gave the agent a per-agent lifecycle context
+  (`lifeCancel`), a `trapStop` channel, and a `trapWG`. Stop now cancels the
+  watcher context, signals the worker to ABANDON its queue (worker selects on
+  `trapStop` and re-checks it before each send — no post-Stop delivery), closes
+  the socket, and waits for the worker to exit. Stop is idempotent (guarded on
+  `stopped`); `enqueueTrap` drops (never starts a worker) once stopped.
+  **File(s)**: pkg/snmp/agent.go, pkg/snmp/traps.go, pkg/snmp/README.md,
+  pkg/snmp/agent_stop_leak_4916_test.go
+
+## 2026-07-09 — #4891 configstore: bound the commit description so an oversized journal record cannot self-poison the tail scanner
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4891 (audit integrity). An unbounded commit description
+  marshaled into one oversized JSONL journal line; the bounded reverse-tail
+  scanner (`maxTailLineBytes` = 16 MiB) then treats a line past its cap as a
+  poisoned fragment and discards it — so an oversized-but-valid commit record
+  vanished from bounded history views after allocating memory/disk
+  proportional to its size. Added `maxCommitDescriptionBytes` (4 KiB);
+  `CommitWithDescription` now rejects an over-cap comment with a clear error
+  before any persist/promote (strict-at-commit, #1960), and `journalLog`
+  defensively truncates any over-cap `Detail` (UTF-8-safe + explicit marker)
+  as a structural boundary belt for all callers.
+  **File(s)**: pkg/configstore/store_commit.go, pkg/configstore/store_persist.go,
+  pkg/configstore/README.md, pkg/configstore/commit_description_cap_4891_test.go
+
+## 2026-07-09 — #4881 config/nat: mixed scope kinds in one NAT from/to clause were OR-expanded (wider), not AND-ed fail-closed as the comment claimed
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4881 (Low, NAT scope widening / fail-open). A single NAT
+  rule-set `from` (or source-`to`, or static-`from`) clause that mixes scope
+  KINDS (e.g. `from zone trust` + `from interface ge-0/0/1.0`) was accepted by
+  the schema (zone/interface/routing-instance are independent `multi:true`
+  leaves with no mutual-exclusion validator) and OR-expanded by the #3096
+  Cartesian product (`collectNATScopes` → `applyNATFromScope` loop,
+  `compiler_nat.go`) into multiple typed rule-sets matching EITHER scope —
+  WIDER than the operator's likely AND intent and contrary to Junos'
+  one-kind-per-clause rule. The in-tree `parseNATMatchScopes` comment falsely
+  claimed the mix was "AND-ed fail-closed at match time" (no such AND exists).
+  Added an AST pre-walk `validateNATRuleSetMixedScopeAST`
+  (`compiler_nat_mixed_scope.go`) that rejects any `from` (all three NAT
+  kinds) or source-NAT `to` clause carrying >1 distinct scope kind at strict
+  commit / commit-check (lenient-warn on load/peer-sync via
+  `lenientNATMixedScope`), mirroring `validateDNATRuleSetToScopeAST` (#3444).
+  Detection reuses `parseNATMatchScopes` and aggregates distinct kinds exactly
+  as the compiler's Cartesian input, uses `forEachChild` for the #3562
+  duplicate-block class, and checks destination NAT on `from` only (its `to`
+  is separately rejected by #3444). Corrected the false comment and documented
+  the gate in `docs/config-schema.md`.
+  **File(s)**: pkg/config/compiler_nat_mixed_scope.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler.go,
+  pkg/config/compiler_nat.go (comment),
+  pkg/config/compiler_nat_mixed_scope_4881_test.go, docs/config-schema.md
+  **Validation**: `TestValidateNATRuleSetMixedScope` covers zone+interface,
+  zone+routing-instance, interface+routing-instance across source `from`,
+  source `to`, destination `from`, static `from`, plus no-false-positive
+  (single-kind from + single-kind to; same-kind zone list) and the
+  lenient-load warning. Fail-on-revert: neutralizing the validator makes every
+  reject subtest RED while the accept subtests stay green. `go build ./...`,
+  `go vet ./pkg/config/`, and the full `go test ./pkg/config/` suite are green
+  (no existing test mixes kinds within one clause — no regression).
 ## 2026-07-09 — #4913 feeds: globally-duplicate feed names orphaned refresh loops + nondeterministic provider
 
 - **Timestamp**: 2026-07-09
