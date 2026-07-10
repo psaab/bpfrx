@@ -228,7 +228,14 @@ func Build(
 }
 
 func ticksToNanos(ticks uint64) uint64 {
-	return ticks * 1_000_000_000 / userHZ
+	// Divide before multiply. The naive `ticks * 1e9 / userHZ` overflows
+	// uint64 once `ticks * 1e9` exceeds 2^64 — at ~1.845e10 ticks (~33 days of
+	// busy time summed across 64 cores at 100 Hz) the product wraps and the CPU
+	// windows that diagnose saturation go invalid (#4909). Splitting into a
+	// whole-second term plus a sub-second remainder keeps full precision (the
+	// remainder is < userHZ so `rem * 1e9` cannot overflow) while pushing the
+	// overflow point out by a factor of userHZ, far beyond any real uptime.
+	return (ticks/userHZ)*1_000_000_000 + (ticks%userHZ)*1_000_000_000/userHZ
 }
 
 // heartbeatsHealthy returns true only on positive, in-window evidence
