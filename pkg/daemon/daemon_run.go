@@ -547,8 +547,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// boot apply and this block never double-start.
 	d.snmpReconMu.Lock()
 	if cfg := d.store.ActiveConfig(); snmpEnabled(cfg) {
-		d.startSNMPLocked(cfg)
-		d.snmpHash, d.snmpHashSet = snmpConfigHash(cfg), true
+		// Record the running-config hash only if the listener actually bound.
+		// A discarded bind failure would otherwise leave SNMP down while state
+		// says "applied", so a later identical commit no-ops forever (#5110);
+		// leaving the hash unrecorded lets the next commit retry the bind.
+		if err := d.startSNMPLocked(cfg); err != nil {
+			slog.Error("SNMP agent failed to start at boot; a later commit will retry", "err", err)
+		} else {
+			d.snmpHash, d.snmpHashSet = snmpConfigHash(cfg), true
+		}
 	}
 	d.snmpBootReady = true
 	d.snmpReconMu.Unlock()
