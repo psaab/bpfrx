@@ -200,6 +200,24 @@ type Agent struct {
 	trapQueue      chan trapJob
 	trapWorkerOnce sync.Once
 	trapsDropped   atomic.Uint64
+
+	// Lifecycle shutdown (#4916). Stop must cancel the context-watcher
+	// goroutine AND stop the trap worker so a day-2 SNMP disable (Stop called
+	// while the daemon context is still live) does not leak a goroutine pair
+	// nor deliver a queued trap to a removed/rotated receiver after the config
+	// that authorized it was revoked. All three are guarded by mu:
+	//   - lifeCancel cancels the derived lifecycle context the ctx-watcher
+	//     waits on, so Stop unblocks the watcher even when the parent context
+	//     stays live.
+	//   - trapStop is closed by Stop to tell the worker to ABANDON its queue
+	//     (no post-Stop delivery); the worker also re-checks it before each
+	//     send so a Stop that races a dequeued job never delivers it.
+	//   - trapWG lets Stop wait for the worker to exit. It counts only a
+	//     worker that actually started (lazy, via trapWorkerOnce), so Stop
+	//     returns immediately when none ran.
+	lifeCancel context.CancelFunc
+	trapStop   chan struct{}
+	trapWG     sync.WaitGroup
 }
 
 // trapJob is one queued trap-delivery unit: a pre-built SNMP packet and its
@@ -462,14 +480,20 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("snmp: listen: %w", err)
 	}
 
+	// Derive a lifecycle context so BOTH parent-context cancellation and an
+	// explicit day-2 Stop() unblock the watcher below (#4916). Stop calls
+	// lifeCancel; the parent ctx cancelling also propagates here.
+	lifeCtx, cancel := context.WithCancel(ctx)
+
 	a.mu.Lock()
 	a.conn = conn
+	a.lifeCancel = cancel
 	a.mu.Unlock()
 
 	slog.Info("SNMP agent listening", "addr", ":161")
 
 	go func() {
-		<-ctx.Done()
+		<-lifeCtx.Done()
 		a.Stop()
 	}()
 
@@ -500,15 +524,38 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 }
 
-// Stop shuts down the SNMP agent.
+// Stop shuts down the SNMP agent. It is idempotent and safe to call
+// concurrently: the ctx-watcher goroutine and a day-2 reconcile both call it.
+//
+// #4916: besides closing the UDP socket, Stop must (a) cancel the lifecycle
+// context so the ctx-watcher goroutine unblocks even when the parent daemon
+// context is still live, and (b) signal the trap worker to abandon its queue
+// and wait for it to exit — so no goroutine pair leaks per disable/re-enable
+// cycle and no queued trap is delivered to a removed/rotated receiver after the
+// authorizing config was revoked.
 func (a *Agent) Stop() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	if a.stopped {
+		a.mu.Unlock()
+		return // already stopped: idempotent, no double-close / double-wait
+	}
 	a.stopped = true
+	if a.lifeCancel != nil {
+		a.lifeCancel() // unblock the ctx-watcher goroutine
+	}
+	if a.trapStop != nil {
+		close(a.trapStop) // tell the trap worker to abandon its queue
+	}
 	if a.conn != nil {
 		a.conn.Close()
 		a.conn = nil
 	}
+	a.mu.Unlock()
+
+	// Wait for the trap worker to exit OUTSIDE the lock: it may be mid-send,
+	// and enqueueTrap briefly takes a.mu. trapWG counts only a worker that
+	// actually started, so this returns immediately when none ran.
+	a.trapWG.Wait()
 	slog.Info("SNMP agent stopped")
 }
 
