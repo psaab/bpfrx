@@ -1,3 +1,26 @@
+## 2026-07-10 — config: fail closed on an invalid IPsec bind-interface (#5297)
+
+- **Timestamp**: 2026-07-10
+  - **Action**: #5297 — a non-canonical `security ipsec vpn <name>
+    bind-interface` (anything but `st<N>`/`st<N>.<unit>`, e.g. `secure0`)
+    committed successfully but resolved to `XFRMIfNameAndID` if_id 0, so the
+    reconciler created NO XFRM device and the route-based VPN was silently
+    DOWN. Now fail-closed at two layers (#1960 doctrine): (1) the
+    `bind-interface` schema leaf is `ValueSecureTunnelIf` +
+    `ValidateSecureTunnelBindInterface` so `SchemaValidate`/`?`-completion
+    reject it at commit-check; (2) `validateSecureTunnelBindInterfaceAST`
+    gained an invalid-name arm that hard-rejects an if_id-0 name on the strict
+    path and warns on the tolerant load/peer-sync path (catches
+    group-expanded/packed forms). The id-0 sentinel is the authoritative
+    "creates no device" signal; the message states the canonical
+    `st<N>[.unit]` requirement. Surgical — the #2909/#2933 two-VALID-alias
+    collision arm (needs a non-zero if_id) is untouched. pkg/routing "invalid
+    bind-interface name" log stays the runtime backstop.
+  - **File(s)**: pkg/config/xfrmi.go, pkg/config/value_type.go,
+    pkg/config/schema_security.go, pkg/config/compiler_ipsec_bindiface.go,
+    pkg/config/compiler_ipsec_bindiface_validate_5297_test.go,
+    docs/config-schema.md, pkg/config/README.md
+
 ## 2026-07-09 — pkg/api: abort long read handlers on client disconnect (#5232/#5233)
 
 - **Timestamp**: 2026-07-09

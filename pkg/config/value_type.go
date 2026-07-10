@@ -97,6 +97,13 @@ const (
 	// component / absolute path / space at commit check to keep the target
 	// inside the zoneinfo root (#5011).
 	ValueTimeZone
+	// ValueSecureTunnelIf is an IPsec route-based VPN bind-interface: a
+	// canonical secure-tunnel interface st<N> or st<N>.<unit> (e.g. st0,
+	// st0.1). Validated by ValidateSecureTunnelBindInterface — any other
+	// name resolves to no XFRM device (XFRMIfNameAndID if_id 0), so the VPN
+	// commits but silently carries no traffic; the name is rejected at
+	// commit check (#5297).
+	ValueSecureTunnelIf
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -141,6 +148,8 @@ func (v ValueType) Placeholder() string {
 		return "<YYYY-MM-DD>"
 	case ValueTimeZone:
 		return "<timezone>"
+	case ValueSecureTunnelIf:
+		return "<st-interface>"
 	}
 	return ""
 }
