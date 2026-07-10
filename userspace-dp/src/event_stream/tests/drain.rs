@@ -212,7 +212,7 @@ fn test_replay_does_not_wedge_on_stuck_reader_2877() {
     let (done_tx, done_rx) = mpsc::channel::<bool>();
     let h_shared = shared.clone();
     let handle = thread::spawn(move || {
-        let r = replay_buffered(&helper_side, &mut replay_buf, 0, &h_shared);
+        let r = replay_buffered(&helper_side, &mut replay_buf, 0, &h_shared, &mut None);
         done_tx.send(r.is_err()).ok();
     });
 
@@ -310,6 +310,7 @@ fn test_idle_keepalive_wouldblock_is_backpressure_not_reconnect_2883() {
             &loop_shared,
             &mut replay_buf,
             &mut ctrl_read_buf,
+            &mut None,
             Duration::from_millis(0),
         )
     });

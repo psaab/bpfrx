@@ -275,10 +275,44 @@ cluster-scoped.
   only the atomic allocate + non-blocking `try_send`; the lossless retry loop
   drops it before every sleep so a backpressured export never stalls the other
   producers, and re-allocates (rolling back the failed attempt) on each retry so
-  the eventual wire seq matches the successful enqueue position. The I/O
-  thread's own FullResync/resync allocations do NOT take this lock: they precede
-  a reader reset, so their seq holes are benign, and the rollback CAS tolerates
-  the rare interleave with them.
+  the eventual wire seq matches the successful enqueue position.
+- **The replay-gap FullResync is ordered under the same lock (#5267).** The I/O
+  thread's replay-gap barrier (`replay_buffered`) used to allocate its seq with
+  a bare `fetch_add` and write it DIRECTLY to the socket, bypassing the channel.
+  On a reconnect the channel still holds the deltas committed during the
+  disconnect (LOWER seqs) which the connected loop drains AFTER the direct write,
+  so a HIGHER-seq FullResync landed on the wire before those lower-seq deltas —
+  wire order != seq order. The Go reader (zero reorder tolerance) then diagnosed
+  a session-sync gap on the first post-barrier delta, dropped the connection, and
+  churned resyncs on the very HA-recovery barrier (a self-amplifying failover
+  data-loss risk). The fix allocates the FullResync's seq **under
+  `producer_seq_lock`** (just the `fetch_add`, no socket write, so producers are
+  never stalled and there is no deadlock) and **parks** the frame in a
+  per-connection `pending_resync` slot instead of writing it. The connected
+  loop's channel drain (`drain_channel_into_write_buf`) then **merges** the
+  barrier into the write stream in seq order: it flushes the barrier just before
+  the first channel frame whose seq exceeds it (a delta committed AFTER the
+  barrier), or when the channel drains empty (the barrier is the current max) —
+  so every lower-seq delta is written first and the wire stays monotonic. Because
+  the seq is allocated under the lock, every delta already committed to the
+  channel has a strictly lower seq (channel commit is atomic under the same lock)
+  and every delta committed afterward a strictly higher one, so the merge is
+  total. `connected` stays published BEFORE `replay_buffered`: it gates only the
+  lossless producer path, and deferring it would make `push_delta_lossless`
+  fail-closed ("not connected") during the non-gap replay window —
+  `flush_session_deltas` latches that as loss-of-sync and forces a spurious full
+  resync on every clean reconnect. Ordering is guaranteed by the lock, not by the
+  `connected` timing, so the two are kept orthogonal. If the connection is
+  already paused, the barrier follows the existing paused-frame behavior: it is
+  retained in replay rather than written. The latent `MSG_RESUME` replay-suffix
+  scheduling gap is tracked separately in #5328; #5267 does not redefine the
+  dormant Pause/Resume protocol.
+- **Only the DORMANT drain-poison resync still allocates outside the lock.**
+  `handle_drain_request`'s poison-FullResync (the `MSG_DRAIN_REQUEST` path has no
+  live caller — graceful demotion uses the session-sync barrier, not the fenced
+  drain) still allocates with a bare `fetch_add` and writes directly; it precedes
+  a reader reset and the rollback CAS tolerates the rare interleave. If that path
+  is ever made live it must adopt the same #5267 ordered-barrier treatment.
 - **HA session open/close deltas are correctness-critical and use the
   LOSSLESS path (#2874).** `flush_session_deltas` (`afxdp/session_delta.rs`)
   routes the type-2 session-sync open/close delta through

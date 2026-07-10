@@ -47986,3 +47986,19 @@ top.
   time.Minute` product turns the pathological cases RED — the products overflow
   non-positive (e.g. MaxInt64 → -1m0s, 200000000 → -1790762h...) and
   time.NewTicker panics "non-positive interval for NewTicker"; restored GREEN.
+
+## #5267 event-stream FullResync seq-ordering (2026-07-10)
+- **Timestamp**: 2026-07-10
+- **Action**: Fix replay-gap FullResync written outside
+  `producer_seq_lock` (out-of-order wire frames and HA resync churn). Allocate
+  the barrier sequence under the lock, park it in the per-connection
+  `pending_resync`, and merge it into the connected-loop drain in sequence
+  order. Added a deterministic RED-on-revert wire-order test and an independent
+  lock-held guard proving the replay-gap allocator cannot bypass the producer
+  critical section. Clarified that paused barriers follow the existing replay
+  behavior; #5328 owns the separate latent Resume replay-suffix gap.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests/replay_budget.rs,
+  userspace-dp/src/event_stream/tests/backpressure.rs,
+  userspace-dp/src/event_stream/tests/drain.rs,
+  userspace-dp/src/event_stream/README.md, _Log.md
