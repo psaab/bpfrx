@@ -1,3 +1,36 @@
+## 2026-07-09 — #5023 snmp: fix -race data race on the package-global trapSender
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5023 (test-infra correctness). `go test -race ./pkg/snmp/`
+  failed deterministically on `TestSendLinkTraps_DoesNotBlock`: the trap
+  worker goroutine read the package-global `trapSender` func var while the
+  #2991/#4916 tests wrote it during setup — an unsynchronized read/write.
+  Moved the sender off the package global onto a per-Agent `trapSender`
+  field, set to `sendTrap` by the constructors (bare-struct test Agents may
+  leave it nil; the worker falls back to `sendTrap`). The worker snapshots
+  the field once at start, so there is no shared mutable state between the
+  worker and any injector. Updated the #2991 and #4916 tests to inject their
+  slow/mock sender on their own Agent instead of mutating the global.
+  Verified RED on origin/master (DATA RACE + FAIL) and clean under `-race`
+  with the fix.
+  **File(s)**: pkg/snmp/agent.go, pkg/snmp/traps.go, pkg/snmp/README.md,
+  pkg/snmp/traps_async_2991_test.go, pkg/snmp/agent_stop_leak_4916_test.go
+## 2026-07-09 — #5005 daemon: applySystemLogin option-injection (missing `--` + no defensive username re-validation)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5005 (security). `applySystemLogin` ran root `id`/`useradd`/
+  `chown` with the config username as a leading positional arg and no `--`
+  end-of-options separator, and never re-validated the name. On the tolerant
+  load / peer-sync path the strict commit-check is downgraded to a warning
+  (#1960), so a leading-dash name could reach these root tools as an option.
+  Fixed by mirroring the #4895 sudoers writer: defensively call
+  `config.ValidateLoginUsername` at the top of the per-user loop (skip+warn on
+  failure) AND add `--` before the operand in every exec (`id -- <name>`,
+  `useradd ... -- <name>`, `chown -R -- <owner> <dir>`). Made `runCommandTimeout`
+  a stubbable package var so the option-injection test can capture argv.
+  **File(s)**: pkg/daemon/daemon_system.go, pkg/daemon/exec_timeout.go,
+  pkg/daemon/daemon_login_optinjection_5005_test.go
+
 ## 2026-07-09 — #4916 snmp: Agent.Stop leaked the ctx-watcher + trap worker and could deliver queued traps after Stop
 
 - **Timestamp**: 2026-07-09
@@ -44209,3 +44242,5 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #5024 unblock the HA/failover test gate — cluster-env resolver + regression test + de-hardcode misleading LAN-host strings. Investigation: the reported "reads $CLUSTER_LAN_HOST but env defines LAN_HOST" and "bare instance names hit the default remote" bugs are ALREADY fixed at origin/master — the shared `cluster-env.sh` (added #1401) derives $CLUSTER_LAN_HOST from the env's LAN_HOST and remote-qualifies $FW0/$FW1/$CLUSTER_LAN_HOST via `_xpf_cluster_ref`/INCUS_REMOTE; the default `make test-failover` already resolves loss:cluster-userspace-host. The issue was filed against the ~3300-commit-stale main checkout, and the operator's documented workaround (`CLUSTER_LAN_HOST=cluster-userspace-host`) was itself the second failure: a BARE override skipped the remote prefix (`${VAR:-ref}` short-circuited `_xpf_cluster_ref`), so incus looked for `cluster-userspace-host` on the DEFAULT remote → "not running". Fix: (1) cluster-env.sh now routes explicit FW0/FW1/CLUSTER_LAN_HOST overrides THROUGH `_xpf_cluster_ref` too (`$(_xpf_cluster_ref "${VAR:-name}")`), a strict superset — unset-default, fully-qualified-override, and legacy-no-INCUS_REMOTE paths are byte-identical, only a bare override on a remote cluster changes (now correctly `loss:<name>`). (2) New hermetic `test/incus/cluster-env-selftest.sh` + `make test-cluster-env-lib`: sources cluster-env.sh in an `env -i` subshell and pins 15 cases (loss default, legacy local, bare/qualified/legacy overrides, IPERF target, LAN_HOST_IP). Proven RED-on-regression against the old resolver. (3) De-hardcoded the literal "cluster-lan-host" in die/pass/skip OUTPUT strings across test-failover / test-double-failover / test-ha-crash / test-stress-failover / test-chained-crash / test-active-active / test-restart-connectivity / test-connectivity to interpolate $CLUSTER_LAN_HOST — those stale literals are what produced the #5024 misdiagnosis (operator saw "from cluster-lan-host" while the resolved host was loss:cluster-userspace-host). shellcheck clean; cluster-cell-selftest 12/12 still green (preamble lock wiring untouched). No full failover run (parent validates the gate).
   **File(s)**: test/incus/cluster-env.sh, test/incus/cluster-env-selftest.sh, Makefile, CLAUDE.md, test/incus/test-failover.sh, test/incus/test-double-failover.sh, test/incus/test-ha-crash.sh, test/incus/test-stress-failover.sh, test/incus/test-chained-crash.sh, test/incus/test-active-active.sh, test/incus/test-restart-connectivity.sh, test/incus/test-connectivity.sh
+  **Action**: #5010 add a render-side belt for `system name-server` (validator/belt asymmetry vs #4902). The resolver `name-server` leaf carried a strict commit-time validator (config.ValidateIPAddress) but had NO render belt in mergeDNSInput, unlike the sibling domain-name/domain-search which #5009 gave both. Under #1960 commit rejection is downgraded to a warning on the tolerant load/peer-sync path, so the render belt is the real security boundary. mergeDNSInput (pkg/daemon/daemon_dns.go) now re-validates each static name-server with config.ValidateIPAddress and fail-closed skips (slog.Warn) any value that is not a bare IP (an embedded space would inject a second resolver token), mirroring the domain belt upstream of both RenderResolvConf and RenderResolvedDropin. DHCP-learned servers are already net.IP.String() so only the operator-supplied static list needs re-validation. Regression test system_dns_nameserver_belt_5010_test.go (drops space/newline/malformed/CIDR, keeps valid v4+v6), RED on revert of the belt. Documented the render belt in docs/dns-ownership.md.
+  **File(s)**: pkg/daemon/daemon_dns.go, pkg/daemon/system_dns_nameserver_belt_5010_test.go, docs/dns-ownership.md

@@ -201,6 +201,17 @@ type Agent struct {
 	trapWorkerOnce sync.Once
 	trapsDropped   atomic.Uint64
 
+	// trapSender delivers a single pre-built trap to a target. It is a
+	// per-Agent field (not a package global) so tests can inject a
+	// deliberately slow/blocking or mock sender on their OWN Agent without a
+	// cross-goroutine write to a shared global that races the running trap
+	// worker's read (#5023). Defaults to sendTrap (set by the constructors); a
+	// bare-struct test Agent may leave it nil, in which case the worker falls
+	// back to sendTrap. Production never reassigns it after construction, and
+	// the worker snapshots it once at start, so there is no shared mutable
+	// state between the worker and any injector.
+	trapSender func(target string, pkt []byte) error
+
 	// Lifecycle shutdown (#4916). Stop must cancel the context-watcher
 	// goroutine AND stop the trap worker so a day-2 SNMP disable (Stop called
 	// while the daemon context is still live) does not leak a goroutine pair
@@ -259,6 +270,7 @@ func NewAgentWithBootsPath(cfg *config.SNMPConfig, bootsPath string) *Agent {
 		cfg:             cfg,
 		startTime:       time.Now(),
 		engineBootsPath: bootsPath,
+		trapSender:      sendTrap,
 	}
 	a.initEngine()
 	a.initV3Users()

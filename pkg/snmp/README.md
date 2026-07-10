@@ -313,8 +313,10 @@ authorization surface: every request is dropped because no community matches.
   for both `NewAgent` and bare-struct test agents). When the queue is full
   the trap is DROPPED and `trapsDropped` is incremented rather than
   blocking the caller — dropping is the correct backpressure when targets
-  are not draining. The delivery is replaceable through the `trapSender`
-  package var (the seam tests use to inject a slow sender). Before #2991
+  are not draining. The delivery is replaceable through the per-Agent
+  `trapSender` field (the seam tests use to inject a slow/mock sender on
+  their own Agent; #5023 moved it off a shared package var so the injection
+  no longer races the running trap worker's read under `-race`). Before #2991
   delivery was synchronous and inline, so an unreachable trap target (or a
   hung DNS lookup for an FQDN target) blocked link-state processing for up
   to the 2s dial timeout × target count.
