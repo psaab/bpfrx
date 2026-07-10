@@ -554,11 +554,25 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 		if neighbor == nil {
 			continue
 		}
+
+		key := fmt.Sprintf("%s/%s/%s", iface.Name, neighbor.ChassisID, neighbor.PortID)
+
+		// IEEE 802.1AB shutdown semantics: a TTL=0 LLDPDU is an explicit
+		// withdrawal, not a neighbor advertisement. Remove any existing entry
+		// for this key immediately under the neighbor lock and do NOT cache the
+		// frame. Storing it as an ordinary neighbor (as a non-zero TTL frame is)
+		// would set ExpiresAt==now and leave the departed peer visible in
+		// Neighbors() until the next ~10s expiryLoop tick — a peer that has
+		// announced its departure must disappear now, not up to 10s later
+		// (#5123).
+		if neighbor.TTL == 0 {
+			m.withdrawNeighbor(key)
+			continue
+		}
+
 		neighbor.Interface = iface.Name
 		neighbor.LastSeen = time.Now()
 		neighbor.ExpiresAt = time.Now().Add(time.Duration(neighbor.TTL) * time.Second)
-
-		key := fmt.Sprintf("%s/%s/%s", iface.Name, neighbor.ChassisID, neighbor.PortID)
 		m.learnNeighbor(key, neighbor)
 	}
 }
@@ -616,6 +630,29 @@ func (m *Manager) learnNeighbor(key string, n *Neighbor) bool {
 	}
 	m.neighbors[key] = n
 	return true
+}
+
+// withdrawNeighbor removes the neighbor identified by key, if present. It is the
+// immediate-withdrawal path for a TTL=0 shutdown LLDPDU (IEEE 802.1AB §"the
+// receiving LLDP agent shall delete the associated information"): the neighbor
+// is dropped as soon as the shutdown frame is received rather than lingering
+// until the periodic expiryLoop tick. A TTL=0 frame for a key that is not in the
+// table is a no-op — no error, no spurious insert. It takes the same m.mu the
+// learn and expiry paths use, so the delete is serialized against concurrent
+// refreshes and reaps. A shutdown is a rare per-neighbor event (not per-packet),
+// so the state-transition log mirrors expiryLoop's "expired" line.
+func (m *Manager) withdrawNeighbor(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.neighbors[key]
+	if !ok {
+		return
+	}
+	slog.Info("LLDP neighbor withdrawn (TTL=0 shutdown)",
+		"interface", n.Interface,
+		"chassis", n.ChassisID,
+		"port", n.PortID)
+	delete(m.neighbors, key)
 }
 
 // warnNeighborCapDroppedLocked logs (at most once per capDropWarnInterval per

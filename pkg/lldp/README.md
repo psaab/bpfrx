@@ -151,7 +151,18 @@ Two properties keep this safe (#2372 review findings 3 + 6):
   is unit-tested (`TestApplyResolvesKernelIfName`, `socket_test.go`)
   without a host device present.
 - TTL countdown is per-neighbor; expired entries auto-purge from the
-  `Neighbors()` snapshot.
+  `Neighbors()` snapshot on the `expiryLoop` 10s tick.
+- **Immediate withdrawal on TTL=0 shutdown (#5123):** IEEE 802.1AB defines
+  a TTL=0 LLDPDU as an explicit shutdown — the receiver must delete the
+  neighbor at once, not age it out. `rxLoop` treats a parsed TTL of 0 as a
+  withdrawal, not an advertisement: it computes the
+  `ifname/chassis/port` key and calls `withdrawNeighbor` (`lldp.go`), which
+  deletes that entry under `mu` and does **not** cache the frame. Without
+  this, a shutdown frame was stored like any other neighbor with
+  `ExpiresAt==now`, so the departed peer stayed in `Neighbors()` until the
+  next ~10s `expiryLoop` tick. A TTL=0 frame for an unknown key is a no-op
+  (no error, no spurious insert). The fix is the immediate delete, not a
+  change to the reap cadence.
 - The neighbor map is RWMutex-guarded. `Neighbors()` returns a copy, not
   a reference, so callers can iterate without holding the lock.
 - `ParseTLVs` counts a mandatory TLV (Chassis ID, Port ID, TTL) as
@@ -161,7 +172,9 @@ Two properties keep this safe (#2372 review findings 3 + 6):
   TTL under 2 bytes) leaves the corresponding flag unset, so the frame is
   rejected rather than cached under an empty `ifname//` key with TTL 0
   (#2551). A valid 2-byte TTL of 0 is a legitimate shutdown advert and is
-  still accepted (the gate is "the TLV parsed", not "TTL != 0").
+  still accepted here (the gate is "the TLV parsed", not "TTL != 0"); the
+  RX path then acts on that parsed TTL=0 by withdrawing the neighbor
+  immediately (see the immediate-withdrawal note above, #5123).
 - **Bounded neighbor table (#4044):** LLDP is unauthenticated L2 — any
   station on the segment can flood frames carrying arbitrary (spoofed)
   chassis-id / port-id pairs, one distinct neighbor entry per distinct
