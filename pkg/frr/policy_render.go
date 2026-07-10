@@ -81,6 +81,39 @@ func validRouterID(s string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
+// validClusterID reports whether a BGP route-reflector cluster-id is one of
+// the two forms FRR/vtysh's `bgp cluster-id <A.B.C.D | (1-4294967295)>` grammar
+// accepts: an IPv4 dotted-quad or a 32-bit unsigned integer in 1..4294967295.
+// Render-side defense-in-depth for #4919: `protocols bgp cluster-id` is stored
+// verbatim, so a tolerant-load / peer-synced / rolled-back config may carry a
+// malformed value (e.g. `not.an.ip`, an IPv6 literal, or an embedded-newline
+// injection). FRR rejects anything else and fails the whole frr-reload, so the
+// renderer must keep a leniently-loaded bad cluster-id out of frr.conf
+// entirely. Commit / commit-check stay strict (config.ValidateBGPClusterID).
+// Mirrors validRouterID; the accept set matches ValidateBGPClusterID exactly.
+func validClusterID(s string) bool {
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.To4() != nil
+	}
+	v, err := strconv.ParseUint(s, 10, 32)
+	return err == nil && v >= 1
+}
+
+// validBGPOrigin reports whether a route-map `then origin` value is one of the
+// three tokens FRR's `set origin <egp|igp|incomplete>` grammar accepts.
+// Render-side belt for #4919: `then origin` is stored verbatim and was only
+// control-char sanitized (#4498), so a non-control typo (`igpp`) or a
+// leniently-loaded / peer-synced bad value reached FRR and failed the route-map
+// grammar, stalling the reload. Skipping an invalid origin (fail-closed) keeps
+// it out of frr.conf; commit-check stays strict (schema ValidateEnum).
+func validBGPOrigin(s string) bool {
+	switch s {
+	case "igp", "egp", "incomplete":
+		return true
+	}
+	return false
+}
+
 // knownRedistProtocols are the FRR redistribute protocol keywords.
 // ospf6 / ripng are the FRR keywords for OSPFv3 / RIPng redistribution;
 // without them a bare `export ospf6` / `export ripng` falls through to the
@@ -678,8 +711,11 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		if validRouterID(bgp.RouterID) {
 			fmt.Fprintf(&b, " bgp router-id %s\n", bgp.RouterID)
 		}
-		if bgp.ClusterID != "" {
-			fmt.Fprintf(&b, " bgp cluster-id %s\n", bgp.ClusterID)
+		if bgp.ClusterID != "" && validClusterID(bgp.ClusterID) {
+			// #4919: skip a malformed cluster-id (leniently-loaded / peer-synced
+			// bad value) and sanitize the accepted value, so no invalid token or
+			// injected newline reaches the frr-reload.
+			fmt.Fprintf(&b, " bgp cluster-id %s\n", sanitizeFRRValue(bgp.ClusterID))
 		}
 		if bgp.GracefulRestart {
 			b.WriteString(" bgp graceful-restart\n")
@@ -1826,11 +1862,14 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 			if len(term.ASPathPrepend) > 0 {
 				fmt.Fprintf(&b, " set as-path prepend %s\n", sanitizeFRRValue(strings.Join(term.ASPathPrepend, " ")))
 			}
-			if term.Origin != "" {
-				// #4498: sanitize the origin token — parity with the #4482
-				// set-clause belt so a tolerant-load / peer-synced /
-				// rolled-back value with an embedded newline cannot inject an
-				// extra frr.conf line.
+			if term.Origin != "" && validBGPOrigin(term.Origin) {
+				// #4919: skip an invalid origin (fail-closed) — a non-control
+				// typo like `igpp` or a leniently-loaded / peer-synced bad
+				// value would fail the FRR route-map grammar and poison the
+				// reload. Only igp | egp | incomplete are valid. #4498:
+				// sanitize the accepted token too (defense-in-depth; a valid
+				// origin has no control chars, so it is a no-op on the happy
+				// path).
 				fmt.Fprintf(&b, " set origin %s\n", sanitizeFRRValue(term.Origin))
 			}
 
