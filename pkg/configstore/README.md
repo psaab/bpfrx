@@ -200,6 +200,27 @@ per-path:
   rename atomic, the old active survives on disk — a restart after a
   failed commit serves the previous config and the operator saw an
   error, never a silent revert.
+- **Post-rename durability failure — converge, don't reject (#5185).**
+  The "old active survives on disk" guarantee above holds only for a
+  PRE-rename failure. `fsatomic.WriteFileDurable` fsyncs the parent
+  directory AFTER the rename; if that dir-fsync fails, the rename already
+  happened — the NEW candidate (C) is VISIBLE on disk (a restart loads C),
+  only its durability across power loss is unknown. Reporting a plain
+  "commit failed" there would leave durable(C) != in-memory/applied(A):
+  the operator is told REJECTED while a restart activates C. `fsatomic`
+  now returns that case as a typed `*fsatomic.PostRenameSyncError`;
+  `Commit`/`CommitWithDescription`/`CommitConfirmed` classify it
+  (`isPostRenameDurabilityFailure`) and, instead of rejecting, CONVERGE:
+  promote C in memory, return the compiled config so the daemon applies C
+  (restoring durable == in-memory == applied), and raise the Option-B
+  degraded machinery (health 503, gauge, journal ERROR, background
+  re-fsync retry — the `commit_postrename` / `commit_confirmed_postrename`
+  actions). Converge-to-C is chosen over durably-restoring-A because
+  restoring A needs ANOTHER rename that can itself fail post-rename
+  (`fsatomic` cannot guarantee an atomic restore), whereas C is already
+  the durable content, so converging needs no further write to hold the
+  invariant. A PRE-rename failure (any non-typed write error) is still a
+  clean rejection with A intact.
 - **Crash window (persist-then-promote ambiguity).** Because the disk
   write happens first, a crash after `WriteActive` succeeds but before
   the in-memory promotion completes means a restart loads the NEW tree

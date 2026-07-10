@@ -81,9 +81,18 @@ FRR now delegates here.
 The temp file is cleaned up and the target left untouched on every
 failure **before** the rename. A `WriteFileDurable` error **after** the
 rename (dir-fsync failure) means the new content is visible but its
-durability is unknown; callers treating the write as failed must
-tolerate the new content surviving — the same crash-window trade the
-configstore #1799 persist-before-promote contract documents.
+durability is unknown; such a failure is returned as a typed
+`*PostRenameSyncError` (#5185) so a caller can DISTINGUISH it from a
+pre-rename failure. A pre-rename error leaves the OLD content intact (a
+clean rejection is correct); the post-rename error leaves the NEW content
+visible — a restart would load it — so a caller that keeps durable-on-disk
+state in lockstep with applied in-memory state (configstore
+Commit/CommitConfirmed) must **converge to the new content** instead of
+reporting a plain rejection while the new content is durable on disk.
+`*PostRenameSyncError` is still a plain `error` (its `Error()` names the
+stage, `Unwrap()` exposes the fsync cause), so callers that do not care
+treat it unchanged — the same crash-window trade the configstore #1799
+persist-before-promote contract documents.
 
 ## Testing
 
@@ -92,7 +101,11 @@ package-private seams (create/write/chmod/chown/sync/close/rename/
 dir-open) and asserts the three invariants: error names the stage,
 target untouched (pre-rename stages), temp cleaned up. `WithOwner` is
 tested for owned-before-rename ordering and for precedence over
-`WithPreserveExisting`.
+`WithPreserveExisting`. The dedicated `afterRenameSyncDir` seam (#5185)
+forces the POST-rename directory-fsync failure so the tests can assert the
+pre/post classification: a post-rename failure is `*PostRenameSyncError`
+with the NEW content visible on disk; the pre-rename rename/temp-fsync
+failures are NOT `*PostRenameSyncError` and leave the OLD content intact.
 
 ## Canary (`canary_test.go`)
 
