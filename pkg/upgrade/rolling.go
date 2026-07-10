@@ -171,7 +171,11 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 	//    LockAlreadyHeld: RunRolling holds the host-wide upgrade lock for
 	//    the whole rolling window, so the inner cut must NOT re-flock the
 	//    same file (it would EWOULDBLOCK and abort) — #1965.
-	if err := r.Run(Options{SkipStartHealthRollback: true, LockAlreadyHeld: true}); err != nil {
+	//    ClusterCoordinated: this node was just drained to its peer (steps
+	//    3-4 above), so the per-node cut is sanctioned even on a clustered
+	//    node — it bypasses the #5284 pre-STOP cluster gate that refuses a
+	//    BARE standalone cut on a member with /etc/xpf/node-id present.
+	if err := r.Run(Options{SkipStartHealthRollback: true, LockAlreadyHeld: true, ClusterCoordinated: true}); err != nil {
 		return fmt.Errorf("rolling: single-node cut failed (HA rollback is "+
 			"operator-driven — inspect the node): %w", err)
 	}

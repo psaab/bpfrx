@@ -135,6 +135,21 @@ case "$1" in
             # prior generation stays the source; the operator re-publishes and
             # cuts). A publish failure does NOT fail configure (a non-zero
             # postinst half-configures dpkg, worse than a deferred cut).
+            #
+            # #5284: the DEFERRED/FAILED-publish recovery hints below must name
+            # the CORRECT cut verb for THIS node. On a clustered node
+            # (/etc/xpf/node-id present) the uncoordinated `xpfd upgrade` is
+            # REFUSED (the standalone STOP->FLIP->START cut stops the local
+            # daemon without draining to the peer — it would blackhole traffic
+            # if the peer is not ready); the operator MUST use the coordinated
+            # rolling driver. Emit `--rolling` in the hint on a clustered node
+            # so the recovery guidance never points at the bare verb the
+            # runtime gate rejects.
+            if [ -f /etc/xpf/node-id ]; then
+                CUT_HINT="xpfd upgrade --rolling"
+            else
+                CUT_HINT="xpfd upgrade"
+            fi
             PUBLISH_OK=0
             if "$STAGED/xpfd" publish-generation; then
                 PUBLISH_OK=1
@@ -147,7 +162,7 @@ case "$1" in
                     : > /run/xpf/upgrade-deferred 2>/dev/null || true
                     echo "xpf: staged-generation publish deferred (another upgrade" \
                          "holds the lock) — staged only; after it completes run:" \
-                         "xpfd publish-generation && xpfd upgrade" >&2
+                         "xpfd publish-generation && $CUT_HINT" >&2
                 else
                     echo "xpf: WARNING staged-generation publish failed (rc=$rc) —" \
                          "no new generation published; the cut will read the prior" \
@@ -186,7 +201,7 @@ case "$1" in
                 # generation (not this upgrade) or refuse. The operator
                 # re-publishes + cuts once the blocker clears.
                 echo "xpf: staged generation not published — skipping the cut;" \
-                     "recover with: xpfd publish-generation && xpfd upgrade" >&2
+                     "recover with: xpfd publish-generation && $CUT_HINT" >&2
             elif [ -f /etc/xpf/node-id ]; then
                 echo "xpf: clustered node (node-id present) — staged only;" \
                      "cut over with: xpfd upgrade --rolling" >&2
