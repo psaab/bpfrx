@@ -49,6 +49,21 @@ func dialOpts(extra ...grpc.DialOption) []grpc.DialOption {
 	return append(opts, extra...)
 }
 
+// isLocalOnlyCommand reports whether cmd (the `-c` single-command string) is a
+// CLI verb that executes entirely in the client with NO gRPC round-trip, so it
+// must run even when xpfd is unreachable. Today the only such verb is the
+// offline WireGuard key generator (`request security wireguard
+// generate-private-key`, #1434) — a pure-Go X25519 keygen whose whole purpose
+// is to be available exactly when the daemon is down (recovery/bootstrap),
+// which the pre-dispatch GetStatus probe otherwise defeats (#4909). Matches the
+// canonical token form; abbreviated prefixes still take the daemon path.
+func isLocalOnlyCommand(cmd string) bool {
+	f := strings.Fields(cmd)
+	return len(f) == 4 &&
+		f[0] == "request" && f[1] == "security" &&
+		f[2] == "wireguard" && f[3] == "generate-private-key"
+}
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "xpfd gRPC address")
 	cmdFlag := flag.String("c", "", "run a single command non-interactively and exit")
@@ -63,14 +78,6 @@ func main() {
 
 	client := pb.NewBpfrxServiceClient(conn)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	resp, err := client.GetStatus(ctx, &pb.GetStatusRequest{})
-	cancel()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cli: cannot reach xpfd at %s: %v\n", *addr, err)
-		os.Exit(1)
-	}
-
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "xpf"
@@ -78,6 +85,31 @@ func main() {
 	username := os.Getenv("USER")
 	if username == "" {
 		username = "remote"
+	}
+
+	// A local-only verb (the offline WireGuard key generator) runs entirely in
+	// the client with no gRPC round-trip, so it must work when xpfd is DOWN —
+	// exactly during recovery/bootstrap. Dispatch it BEFORE the GetStatus
+	// reachability probe, which would otherwise exit(1) and make the offline
+	// generator unreachable precisely when it is needed (#4909).
+	if *cmdFlag != "" && isLocalOnlyCommand(*cmdFlag) {
+		c := &ctl{client: client, hostname: hostname, username: username}
+		c.startCmd()
+		err := c.dispatch(*cmdFlag)
+		c.endCmd()
+		if err != nil && err != errExit {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	resp, err := client.GetStatus(ctx, &pb.GetStatusRequest{})
+	cancel()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cli: cannot reach xpfd at %s: %v\n", *addr, err)
+		os.Exit(1)
 	}
 
 	c := &ctl{
