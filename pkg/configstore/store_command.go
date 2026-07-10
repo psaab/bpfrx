@@ -7,12 +7,22 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// Set applies a "set" command to the candidate configuration.
-func (s *Store) Set(path []string) error {
+// Set applies a "set" command to the candidate configuration. It is the
+// internal/system entry point (no session ownership check); the gRPC user path
+// uses SetAs to carry the caller's session for config-lock holder enforcement
+// (#5059).
+func (s *Store) Set(path []string) error { return s.SetAs("", path) }
+
+// SetAs is Set scoped to a config-lock holder session (#5059). sessionID == ""
+// bypasses ownership (internal/system caller).
+func (s *Store) SetAs(sessionID string, path []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -28,20 +38,30 @@ func (s *Store) Set(path []string) error {
 }
 
 // SetFromInput parses a "set ..." command string and applies it.
-func (s *Store) SetFromInput(input string) error {
+func (s *Store) SetFromInput(input string) error { return s.SetFromInputAs("", input) }
+
+// SetFromInputAs is SetFromInput scoped to a config-lock holder session (#5059).
+func (s *Store) SetFromInputAs(sessionID, input string) error {
 	path, err := config.ParseSetCommand("set " + input)
 	if err != nil {
 		return err
 	}
-	return s.Set(path)
+	return s.SetAs(sessionID, path)
 }
 
-// Delete removes a node at the given path from the candidate configuration.
-func (s *Store) Delete(path []string) error {
+// Delete removes a node at the given path from the candidate configuration. The
+// internal/system entry point; the gRPC user path uses DeleteAs (#5059).
+func (s *Store) Delete(path []string) error { return s.DeleteAs("", path) }
+
+// DeleteAs is Delete scoped to a config-lock holder session (#5059).
+func (s *Store) DeleteAs(sessionID string, path []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -57,12 +77,16 @@ func (s *Store) Delete(path []string) error {
 }
 
 // DeleteFromInput parses a "delete ..." command string and applies it.
-func (s *Store) DeleteFromInput(input string) error {
+func (s *Store) DeleteFromInput(input string) error { return s.DeleteFromInputAs("", input) }
+
+// DeleteFromInputAs is DeleteFromInput scoped to a config-lock holder session
+// (#5059).
+func (s *Store) DeleteFromInputAs(sessionID, input string) error {
 	path, err := config.ParseSetCommand("delete " + input)
 	if err != nil {
 		return err
 	}
-	return s.Delete(path)
+	return s.DeleteAs(sessionID, path)
 }
 
 // DeactivateFromInput marks the candidate node at the given path inactive
@@ -77,9 +101,18 @@ func (s *Store) DeleteFromInput(input string) error {
 // reaching DeactivatePath. The node must already exist; DeactivatePath on an
 // already-inactive node is idempotent (it re-sets a bool).
 func (s *Store) DeactivateFromInput(input string) error {
+	return s.DeactivateFromInputAs("", input)
+}
+
+// DeactivateFromInputAs is DeactivateFromInput scoped to a config-lock holder
+// session (#5059).
+func (s *Store) DeactivateFromInputAs(sessionID, input string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -98,9 +131,18 @@ func (s *Store) DeactivateFromInput(input string) error {
 // verb. Symmetric with DeactivateFromInput; ActivatePath on an already-active
 // node is idempotent.
 func (s *Store) ActivateFromInput(input string) error {
+	return s.ActivateFromInputAs("", input)
+}
+
+// ActivateFromInputAs is ActivateFromInput scoped to a config-lock holder
+// session (#5059).
+func (s *Store) ActivateFromInputAs(sessionID, input string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -115,10 +157,16 @@ func (s *Store) ActivateFromInput(input string) error {
 }
 
 // Copy duplicates a config subtree from srcPath to dstPath.
-func (s *Store) Copy(srcPath, dstPath []string) error {
+func (s *Store) Copy(srcPath, dstPath []string) error { return s.CopyAs("", srcPath, dstPath) }
+
+// CopyAs is Copy scoped to a config-lock holder session (#5059).
+func (s *Store) CopyAs(sessionID string, srcPath, dstPath []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -133,10 +181,16 @@ func (s *Store) Copy(srcPath, dstPath []string) error {
 }
 
 // Rename moves a config subtree from srcPath to dstPath.
-func (s *Store) Rename(srcPath, dstPath []string) error {
+func (s *Store) Rename(srcPath, dstPath []string) error { return s.RenameAs("", srcPath, dstPath) }
+
+// RenameAs is Rename scoped to a config-lock holder session (#5059).
+func (s *Store) RenameAs(sessionID string, srcPath, dstPath []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -153,9 +207,17 @@ func (s *Store) Rename(srcPath, dstPath []string) error {
 // Insert moves an element before or after a reference element within the
 // same parent's ordered children list.
 func (s *Store) Insert(elementPath, refPath []string, before bool) error {
+	return s.InsertAs("", elementPath, refPath, before)
+}
+
+// InsertAs is Insert scoped to a config-lock holder session (#5059).
+func (s *Store) InsertAs(sessionID string, elementPath, refPath []string, before bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -217,7 +279,10 @@ func (s *Store) Annotate(path []string, comment string) error {
 
 // LoadOverride replaces the entire candidate config with the parsed input.
 // The input can be hierarchical Junos config or flat "set" commands.
-func (s *Store) LoadOverride(content string) error {
+func (s *Store) LoadOverride(content string) error { return s.LoadOverrideAs("", content) }
+
+// LoadOverrideAs is LoadOverride scoped to a config-lock holder session (#5059).
+func (s *Store) LoadOverrideAs(sessionID, content string) error {
 	if err := checkConfigSize(content); err != nil {
 		return err
 	}
@@ -225,6 +290,9 @@ func (s *Store) LoadOverride(content string) error {
 	defer s.mu.Unlock()
 
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -245,7 +313,10 @@ func (s *Store) LoadOverride(content string) error {
 // LoadMerge merges the parsed input into the existing candidate config.
 // For flat "set" commands, each line is applied individually.
 // For hierarchical input, it's converted to set commands and merged.
-func (s *Store) LoadMerge(content string) error {
+func (s *Store) LoadMerge(content string) error { return s.LoadMergeAs("", content) }
+
+// LoadMergeAs is LoadMerge scoped to a config-lock holder session (#5059).
+func (s *Store) LoadMergeAs(sessionID, content string) error {
 	if err := checkConfigSize(content); err != nil {
 		return err
 	}
@@ -253,6 +324,9 @@ func (s *Store) LoadMerge(content string) error {
 	defer s.mu.Unlock()
 
 	if err := s.ensureWritableLocked(); err != nil {
+		return err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
 	if s.candidate == nil {
@@ -387,13 +461,19 @@ func applyEditLine(tree *config.ConfigTree, line string) error {
 // command). The deactivate/activate verbs make `show | display set` output
 // round-trippable: previously a `deactivate <path>` line was skipped here,
 // so an inactive node reloaded ACTIVE.
-func (s *Store) LoadSet(content string) (int, error) {
+func (s *Store) LoadSet(content string) (int, error) { return s.LoadSetAs("", content) }
+
+// LoadSetAs is LoadSet scoped to a config-lock holder session (#5059).
+func (s *Store) LoadSetAs(sessionID, content string) (int, error) {
 	if err := checkConfigSize(content); err != nil {
 		return 0, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensureWritableLocked(); err != nil {
+		return 0, err
+	}
+	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return 0, err
 	}
 	if s.candidate == nil {

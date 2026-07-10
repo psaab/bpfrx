@@ -475,6 +475,13 @@ func (m *Manager) seedSyncLeases(ctx context.Context, family int, leases []SyncL
 		if l.Family != family {
 			continue
 		}
+		if l.Remaining <= 0 {
+			// #4871: an aged-out lease must be DROPPED, never re-anchored to
+			// now_local+Remaining at seed (which would resurrect it past its
+			// true expiry). The standby-residence subtraction upstream
+			// (PeerDHCPLeases) normally removes these; this is the fail-safe.
+			continue
+		}
 		if err := m.seedOneLease(ctx, socket, family, l, now); err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -522,9 +529,14 @@ func (m *Manager) seedOneLease(ctx context.Context, socket string, family int, l
 // lease{4,6}-add argument record. valid-lft is set to Remaining so a renewing
 // client sees the correct remaining time, and the absolute expire matches.
 func syncLeaseToKea(l SyncLease, now time.Time) keaLeaseJSON {
+	// #4871: expired leases are DROPPED upstream (seedSyncLeases skips
+	// Remaining<=0), so rem is a genuinely-positive remaining lifetime here.
+	// The floor is now only a last-resort guard against a sub-second positive
+	// value producing a zero valid-lft (which Kea rejects) — it never revives
+	// an aged-out lease.
 	rem := l.Remaining
 	if rem < 1 {
-		rem = 1 // Kea rejects a zero/negative lifetime; floor to 1s
+		rem = 1
 	}
 	kl := keaLeaseJSON{
 		IPAddress: l.Address,
@@ -638,6 +650,74 @@ func (m *Manager) PreSeedMemfile6(leases []SyncLease, now time.Time) error {
 	return m.writeMemfile6(m.leaseFile(6), leases, now)
 }
 
+// PreSeedMemfileMerged4 pre-seeds the Kea v4 memfile with the UNION of this
+// node's CURRENT local active leases and the held peer leases (#5040), instead
+// of overwriting it with the peer-only set.
+//
+// On a per-RG active-active takeover this node is ALREADY MASTER for one or
+// more RGs whose leases are live in the local Kea (and its persisted memfile).
+// The takeover then restarts Kea under the union config (already-mastered RG +
+// newly-taken RG). A peer-ONLY pre-seed (the pre-#5040 behavior) atomically
+// OVERWROTE the shared memfile, wiping this node's own still-mastered RG rows;
+// the restarted Kea then had no record of those in-use bindings and could
+// re-allocate their addresses to new clients (duplicate allocation). The
+// invariant: restarting Kea during one RG transition must preserve the lease
+// union for every RG that remains locally MASTER.
+//
+// The local set is read via the same socket-preferred, memfile-fallback path
+// GetSyncLeases4 uses. FAIL-CLOSED: if that read errors (an untrusted/corrupt
+// local source), we do NOT overwrite the memfile with peer-only leases — we
+// return the error and leave the existing memfile intact so the restarting Kea
+// reloads its own persisted rows, and the async post-start lease-add seed still
+// adds the peer set. A genuinely MISSING memfile with Kea down is a trusted
+// empty (a cold node with nothing to preserve), so the union degenerates to the
+// peer set and the pre-seed proceeds.
+func (m *Manager) PreSeedMemfileMerged4(ctx context.Context, peer []SyncLease, now time.Time) error {
+	local, err := m.getSyncLeases(ctx, 4, now)
+	if err != nil {
+		return fmt.Errorf("pre-seed v4: local lease read failed, not overwriting memfile: %w", err)
+	}
+	return m.writeMemfile4(m.leaseFile(4), mergeLeasesByIdentity(local, peer, 4), now)
+}
+
+// PreSeedMemfileMerged6 is the v6 counterpart of PreSeedMemfileMerged4 (#5040).
+func (m *Manager) PreSeedMemfileMerged6(ctx context.Context, peer []SyncLease, now time.Time) error {
+	local, err := m.getSyncLeases(ctx, 6, now)
+	if err != nil {
+		return fmt.Errorf("pre-seed v6: local lease read failed, not overwriting memfile: %w", err)
+	}
+	return m.writeMemfile6(m.leaseFile(6), mergeLeasesByIdentity(local, peer, 6), now)
+}
+
+// mergeLeasesByIdentity returns the union of the local and peer lease sets for
+// one family, keyed by SyncLease.IdentityKey (address + client identity). The
+// LOCAL lease WINS a conflict: for an RG this node still masters, its live
+// binding is the authoritative in-use lease, so it must never be displaced by a
+// peer copy. Peer-only identities (the RG being taken over) are appended. The
+// result is a fresh slice; inputs are not mutated.
+func mergeLeasesByIdentity(local, peer []SyncLease, family int) []SyncLease {
+	seen := make(map[string]struct{}, len(local)+len(peer))
+	out := make([]SyncLease, 0, len(local)+len(peer))
+	for _, l := range local {
+		if l.Family != family {
+			continue
+		}
+		out = append(out, l)
+		seen[l.IdentityKey()] = struct{}{}
+	}
+	for _, l := range peer {
+		if l.Family != family {
+			continue
+		}
+		if _, dup := seen[l.IdentityKey()]; dup {
+			continue // local live binding wins
+		}
+		out = append(out, l)
+		seen[l.IdentityKey()] = struct{}{}
+	}
+	return out
+}
+
 // keaMemfileHeader4 is Kea's canonical DHCPv4 memfile CSV header (Kea 2.x/3.x).
 const keaMemfileHeader4 = "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id"
 
@@ -659,10 +739,10 @@ func (m *Manager) writeMemfile4(path string, leases []SyncLease, now time.Time) 
 		if l.Family != 4 {
 			continue
 		}
-		rem := l.Remaining
-		if rem < 1 {
-			rem = 1
+		if l.Remaining <= 0 {
+			continue // #4871: drop an aged-out lease rather than reviving it
 		}
+		rem := l.Remaining
 		expire := now.Unix() + int64(rem)
 		// address,hwaddr,client_id,valid_lifetime,expire,subnet_id,
 		// fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
@@ -683,10 +763,10 @@ func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) 
 		if l.Family != 6 {
 			continue
 		}
-		rem := l.Remaining
-		if rem < 1 {
-			rem = 1
+		if l.Remaining <= 0 {
+			continue // #4871: drop an aged-out lease rather than reviving it
 		}
+		rem := l.Remaining
 		expire := now.Unix() + int64(rem)
 		// Encode the v6 lease kind symmetrically with the read path
 		// (keaLeaseTypeToString) via the shared inverse so IA_NA / IA_TA / IA_PD

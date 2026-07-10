@@ -485,6 +485,50 @@ Boot-time `bootstrapFromFile` enters config mode first, so it too is
 governed by the same gate (a no-op there because `clusterReadOnly` is
 `false` at boot, before any RG0 transition).
 
+### Config-lock ownership gate (#5059)
+
+The candidate is intentionally **singular and shared** — `EnterConfigure*`
+records the holder session and blocks a second *enter*, but the mutating
+methods themselves used to verify only `ensureWritableLocked()` +
+`candidate != nil`. That meant a session that **never entered config mode**
+(only the *enter* was gated) could still call `Set`/`Delete`/`Load`/
+`Rollback` directly, mutate another session's pending candidate, refresh the
+true holder's idle lease (`touchConfigLockLocked`), and `Commit` it — all
+with no ownership check. Serialization under `s.mu` orders those calls; it is
+not authorization. This surface is reachable on the loopback gRPC listener
+and, more importantly, on the HA fabric listener.
+
+Ownership is now enforced atomically under `s.mu` via
+`ensureHolderLocked(sessionID)`, called inside every user mutator's critical
+section through session-scoped `*As` variants: `SetAs`,
+`SetFromInputAs`, `DeleteAs`, `DeleteFromInputAs`,
+`DeactivateFromInputAs`/`ActivateFromInputAs`, `CopyAs`, `RenameAs`,
+`InsertAs`, `LoadOverrideAs`/`LoadMergeAs`/`LoadSetAs`, `RollbackAs`, and
+`ConfirmCommitAs`. The commit-family RPCs whose mutation runs through a daemon
+callback (`Commit`, `CommitConfirmed`) call the exported `EnsureConfigHolder`
+first. The gRPC handlers thread `peerSessionID(ctx)` — the same identifier
+`EnterConfigureSession` records — into every one of these, so a second remote
+session is rejected with `ErrConfigLockedByOther` (mapped to
+`codes.PermissionDenied`).
+
+Two deliberate bypasses keep the internal paths working:
+
+- **`sessionID == ""` is the internal/system capability** — the in-process
+  CLI, the stateless REST config-enter path (no per-session holder, #4476),
+  HA sync, and tests all call the plain (non-`As`) methods, which delegate
+  with an empty session and skip the ownership check. This is why the local
+  CLI and REST behavior is bit-identical to before #5059.
+- **A lock with no recorded holder** (`effectiveHolderLocked() == ""`, i.e.
+  the internal/local `EnterConfigure()` path) is not owned by any session, so
+  a user session is not blocked from it. A remote gRPC caller always carries a
+  non-empty `peerSessionID` and records it on `EnterConfigureSession`, so it
+  cannot manufacture an empty-holder state to slip through.
+
+Like `ErrClusterReadOnly`, `ErrConfigLockedByOther` is `errors.Is`-matchable;
+it is transient (the holder commits or exits). The internal `SyncApply` /
+`PromoteRollback` convergence applies never route through the gated methods,
+so they are unaffected — same distinction as the read-only gate above.
+
 ### Step-0 committed marker (#1922 Item 2)
 
 The config-DB compatibility envelope (#1917) carries a `committed=` header

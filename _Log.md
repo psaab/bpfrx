@@ -1,3 +1,146 @@
+## 2026-07-09 — grpcapi: enforce config-lock holder on mutators/commit (#5059)
+
+- **Timestamp**: 2026-07-09
+  **Action**: Config mutators/commit RPCs ignored the config-lock holder — any
+  gRPC session could Set/Delete/Load/Rollback/Commit another session's shared
+  candidate. Added `ensureHolderLocked` + session-scoped `*As` store variants
+  (SetAs/DeleteAs/Load*As/RollbackAs/ConfirmCommitAs/Copy/Rename/Insert/
+  Deactivate/Activate) and exported `EnsureConfigHolder`; threaded
+  `peerSessionID(ctx)` through every gRPC config mutation/commit handler.
+  Non-holder -> `ErrConfigLockedByOther` -> `codes.PermissionDenied`. Empty
+  session ("") = internal/system bypass (local CLI, REST-stateless, HA sync,
+  tests) so existing behavior is unchanged.
+  **File(s)**: pkg/configstore/store_lock.go, pkg/configstore/store_command.go,
+  pkg/configstore/store_commit.go, pkg/configstore/envelope.go,
+  pkg/grpcapi/server_config.go,
+  pkg/configstore/config_lock_holder_5059_test.go,
+  pkg/grpcapi/config_lock_holder_5059_test.go, pkg/configstore/README.md,
+  _Log.md
+## 2026-07-09 — cli/monitor: gate + confine file-backed flow trace (#5038)
+
+- **Timestamp**: 2026-07-09
+  **Action**: `monitor security flow file <name>` let a view-only user make the
+  root daemon open/append/rotate an arbitrary existing /var/log inode. Gated the
+  file-backed verbs (`file`/`start`) at PermControl in `requiredPermission`
+  (new `monitorSubcommandIsSecurityFlowFileWrite`, prefix-resolved) so a
+  read-only class cannot trigger the root write; and confined traces to a
+  dedicated root-owned (0700) dir `/var/log/xpf-flow-trace` (openTraceFile now
+  MkdirAll's it) instead of the shared /var/log, so a filename can never land
+  on a system-log inode.
+  **File(s)**: pkg/cli/monitor.go, pkg/cli/permissions.go,
+  pkg/cli/monitor_flow_perm_5038_test.go, docs/system-login.md, _Log.md
+## 2026-07-09 — api: CSRF/cross-site guard on REST mutations (#5055)
+
+- **Timestamp**: 2026-07-09
+  **Action**: Added `mutationCrossSiteGuard` (`pkg/api/crosssite.go`) — a
+  Fetch-Metadata resource-isolation guard wrapping the mux before
+  `authMiddleware`. Rejects (403) any non-safe-method request with cross-site
+  provenance: `Sec-Fetch-Site: cross-site|same-site`, cross-host
+  `Origin`/`Referer`, or a CORS simple form content type. Closes the
+  browser-ambient-Basic CSRF vector while leaving same-origin UI + programmatic
+  (curl/CLI/Bearer/API-key) clients untouched.
+  **File(s)**: pkg/api/crosssite.go, pkg/api/server.go,
+  pkg/api/crosssite_5055_test.go, docs/architecture.md, _Log.md
+## 2026-07-09 — daemon: revoke credentials on login-user removal (#5128)
+
+- **Timestamp**: 2026-07-09
+  **Action**: Added `reconcileAbsentLoginUsers`/`deprovisionLoginUser` — a
+  declarative absent-user reconcile that consumes the UID-keyed provenance
+  marker to LOCK the password and REMOVE the managed `authorized_keys` of a
+  login user deleted from config (host access was retained before; only the
+  sudo grant was swept). Scoped strictly to the exact xpf-provisioned UID
+  (never an out-of-band account), fail-closed toward retry. Wired
+  unconditionally after `reconcileSudoers` in `daemon_apply.go`.
+  **File(s)**: pkg/daemon/login_password.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/login_deprovision_5128_test.go, docs/system-login.md, _Log.md
+
+## 2026-07-09 — HA dhcpserver lease-sync trio (#5040 / #5041 / #4871)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4871 ha/dhcpserver — synced DHCP lease lifetimes stopped aging on
+  the standby and were re-anchored/resurrected at takeover. SyncLease.Remaining
+  is seconds-left at the sender's read time with no sample epoch; the receiver
+  stored a value copy with no receipt time, so standby residence was never
+  subtracted and expired leases came back on promotion (duplicate allocation).
+  Fix: SessionSync now stamps peerDHCPLeases{4,6}RecvAt on receipt (a monotonic
+  time.Now() reading); PeerDHCPLeases{4,6} subtract the monotonic residence via
+  peerDHCPLeasesAged and DROP any lease aged to <=0 (never floor to 1). The
+  dhcpserver seed writers (seedSyncLeases, writeMemfile{4,6}) also drop
+  Remaining<=0 as a fail-safe instead of flooring; syncLeaseToKea's floor is now
+  a documented last-resort guard only. Tests: cluster TestPeerDHCPLeasesAged
+  (ages 600->500, drops the 60s lease held 100s; held set untouched — RED on
+  revert to plain copy) + dhcpserver TestSeedAndPreSeed_DropExpiredLeases
+  (socket + memfile paths drop expired — RED on restoring the floor).
+  **File(s)**: pkg/cluster/sync.go, pkg/cluster/lease_sync_wire_test.go,
+  pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  docs/research/2239-dhcp-ha-lease-sync/plan.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5040 ha/dhcpserver — the active-active takeover memfile pre-seed
+  passed ONLY the peer's leases to PreSeedMemfile{4,6}, which atomically
+  OVERWROTE the shared Kea memfile — wiping the leases of RGs this node still
+  masters, so the restarted Kea could re-allocate their in-use addresses
+  (duplicate allocation). New `PreSeedMemfileMerged{4,6}(ctx, peer, now)` reads
+  this node's CURRENT local active leases (socket-preferred, memfile fallback —
+  the GetSyncLeases path) and writes the UNION with the peer set, keyed by lease
+  identity (`mergeLeasesByIdentity`, local live binding wins a conflict).
+  FAIL-CLOSED: an untrusted/corrupt local read returns an error and leaves the
+  memfile intact (post-start lease-add is the backstop) rather than replacing it
+  with peer-only rows. `preSeedDHCPLeaseMemfile` now calls the merged variant
+  under a bounded ctx. Tests: TestPreSeedMemfileMerged4_PreservesLocalLeases
+  (RED on revert to peer-only overwrite) + _FailsClosedOnUntrustedLocal.
+  **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/daemon/daemon_dhcp_lease_sync.go,
+  pkg/dhcpserver/lease_sync_test.go, docs/research/2239-dhcp-ha-lease-sync/plan.md
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5041 ha/dhcpserver — Kea `subnet-id` was a positional counter
+  over each node's MASTER-filtered subnet list, so the SAME subnet got a
+  DIFFERENT id on the two HA nodes and synced leases (which carry `subnet-id`
+  verbatim) misbound on the receiver. Replaced the counter with
+  `stableSubnetID(subnet)` — an FNV-1a hash of the canonical CIDR folded into
+  Kea's valid `[1, 0xFFFFFFFE]` range — plus a deterministic sorted-order
+  linear probe (`nextSubnetID`) for the astronomically-rare same-config
+  collision. The id is now identical per subnet across nodes, filtered subsets,
+  reordering, and reloads (subsumes #2668). Updated the #2668 regen test to
+  self-capture (no longer pins positional golden ids) and added
+  `TestKeaSubnetIDStableAcrossFilteredSubsets` (RED on revert to positional).
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  docs/research/2239-dhcp-ha-lease-sync/plan.md
+## 2026-07-09 — #5036 dynamic-address feed day-2 reconcile (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #5036. The feed manager was constructed ONLY at boot and only if
+  boot-time feed servers existed (`daemon_run.go`), and `Manager.Apply` was
+  never re-invoked — so a feed server added/removed/edited on a day-2 commit was
+  silently ignored until restart (a deny policy bound to a day-2-added feed
+  armed with zero prefixes = fail-open). Now: `ensureFeedManager` constructs the
+  manager UNCONDITIONALLY at boot; `reconcileFeeds` (hash-gated on the
+  feed-SERVER set via `feedsConfigHash`, which excludes bindings) is wired into
+  `applyConfigLocked` before the feed-overlay push, so a day-2 server change
+  re-`Apply`s (starts/joins producers) while a feed CONTENT refresh (onUpdate →
+  applyConfig) leaves the hash unchanged and does not thrash the fetchers.
+  Added `feedsMu`/`activeFeedsHash` to the Daemon struct. RED-on-revert:
+  `TestReconcileFeedsDay2` (+ `TestFeedsConfigHash`, `TestReconcileFeedsNilManagerSafe`).
+  **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon_feeds.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_feeds_reconcile_5036_test.go, pkg/feeds/README.md
+## 2026-07-09 — #4918 snmp GET/GETNEXT size bound + trimToFit O(n^2) (security)
+
+- **Timestamp**: 2026-07-09
+  **Action**: #4918 (residual of #2612). (1) v2c `handleGet`/`handleGetNext`
+  and the v3 GET/GETNEXT tail returned `buildResponse(...)` directly with no
+  size cap — an oversized response was emitted. Added `boundGetResponse` (v2c)
+  + a matching v3 tail check that replaces an over-`effectiveMaxSize` GET/
+  GETNEXT with `tooBig` + empty varbinds (RFC 3416 §4.2.1/§4.2.2; GET/GETNEXT
+  cannot be trimmed like GETBULK). (2) `trimToFit` did an O(n) decrement-and-
+  rebuild (O(n^2) total, v3 re-running USM/HMAC/enc per drop) — replaced with a
+  fast-path full build + binary search (O(log n) rebuilds) returning the same
+  largest-fitting prefix. GETBULK trimming behaviour is unchanged. RED-on-
+  revert: `TestV2cGet_OversizedReturnsTooBig` /
+  `TestV2cGetNext_OversizedReturnsTooBig` (6.7 KB / 6.6 KB over-size without
+  the bound) + `TestTrimToFit_BinarySearch` (991 build calls when linear).
+  **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3.go,
+  pkg/snmp/getresp_size_4918_test.go, pkg/snmp/README.md
 ## 2026-07-09 — #5037 cli `| last N` unbounded pre-allocation (security)
 
 - **Timestamp**: 2026-07-09
@@ -44391,3 +44534,9 @@ top.
 - **Timestamp**: 2026-07-09
   **Action**: #4915 RT_FLOW SESSION_CREATE/CLOSE now carry the dataplane's STABLE session id (additive wire growth 152 -> 160). Ground-truth correction: the issue's premise that a real u64 session id already existed was FALSE on origin/master — publish_conntrack hardcoded session_id:0, SessionEntry/SessionDelta had no id field, and cli_show_flow.go fell back to the iteration index; the legacy eBPF session_id_gen generator was retired with the dataplane (#1476). So the fix ASSIGNS one. Rust: SessionTable::alloc_session_id() = (worker_id<<48)|counter (counter starts at 1, 0 = wire "unknown" sentinel; worker id set via set_worker_id at worker setup so ids are node-unique across the shared-nothing per-worker tables and a reused 5-tuple is disambiguated), stored write-once on SessionEntry.session_id, threaded onto the Open/Close SessionDelta, and encoded LE at the new [152:160] slot in encode_session_create_rt_flow + encode_session_close_rt_flow (SECURITY_EVENT_PAYLOAD_SIZE 152->160). Go (pkg/logging/ringbuf.go): decode [152:160] into EventRecord.SessionID ONLY on a SESSION_CREATE/CLOSE frame with len>=160; the per-event ordinal moves to the new EventRecord.EventSeq, and SessionID falls back to that ordinal for non-session events / short legacy frames, so the change is strictly additive (#2749-style both-sides length discipline; minimum acceptance stays 144). Tests: Rust codec [152:160] round-trip assertions on the v4-close + create wire-layout tests + session_id_is_stable_across_open_and_close (distinct+nonzero+create==close id) + session_id_namespaces_worker_in_high_bits; the two inplace-vs-reference differential tests normalize session_id out of the delta comparison (a per-table counter that legitimately differs between in-place-promote and remove+reinstall). Go: TestDecodeRawEventCarriesSessionID (160B create+close), TestDecodeRawEventLegacyFrameSessionIDAbsent (152/144B -> 0, no crash), TestLiveEventSessionIDAndEventSeq (real id vs ordinal + legacy fallback). Validation: full `cargo test --release` = 3890 passed / 0 failed / 2 ignored; `go test ./pkg/logging/... ./pkg/daemon/... ./pkg/api/... ./pkg/grpcapi/...` green; go build ./... clean. Deferred (documented): cross-HA-node id identity (synced session gets a fresh node-local id — needs a session-sync wire change) and unifying show-security-flow-session's publish_conntrack id onto the same SessionEntry.session_id.
   **File(s)**: userspace-dp/src/event_stream/codec/wire.rs, userspace-dp/src/event_stream/codec/rt_flow.rs, userspace-dp/src/event_stream/codec/codec_tests.rs, userspace-dp/src/event_stream/mod.rs, userspace-dp/src/session/mod.rs, userspace-dp/src/session/entry.rs, userspace-dp/src/session/install.rs, userspace-dp/src/session/expire.rs, userspace-dp/src/session/tests.rs, userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/worker/loop_body/setup.rs, userspace-dp/src/event_stream/README.md, userspace-dp/src/session/README.md, pkg/logging/ringbuf.go, pkg/logging/eventbuf.go, pkg/logging/rtflow_sessionid_4915_test.go
+  **Action**: #5095 [SECURITY] ra: Router Solicitation handling skipped the RFC 4861 §6.1.1 receive checks. rsReceiver (pkg/ra/sender.go) read `msg, _, src, err := s.conn.ReadFrom()` — discarding the *ipv6.ControlMessage — and validated only the decoded message TYPE (`if _, ok := msg.(*ndp.RouterSolicitation); !ok`). The ndpConn seam exposed no SetControlMessage, so the received Hop Limit was never requested and never checked, and the source scope was never validated. An off-link or spoofed RS (wrong hop limit / global source) was therefore accepted and scheduled a multicast RA (RA-injection / DoS; bounded only by the 3s multicast rate limit). Fix: (1) ndpConn gains SetControlMessage(cf ipv6.ControlFlags, on bool) error (matches mdlayher/ndp v1.1.0). (2) openConn enables ipv6.FlagHopLimit via SetControlMessage so ReadFrom populates cm.HopLimit; a failure is warned and rsReceiver then fails closed. (3) rsReceiver captures the control message and gates each RS through new validRSReceive(cm, src): Hop Limit MUST be 255 (on-link proof) AND source MUST be unspecified (::) or link-local unicast (fe80::/10) — global/ULA/multicast/wrong-hop/nil-cm are silently discarded (fail closed). Only the two checks the issue requested (hop-limit + source-scope); the SLLAO-with-unspecified-source check was out of scope. Tests (pkg/ra/rs_receive_validation_5095_test.go): table-driven validRSReceive (link-local/unspecified/global/ULA/multicast x hop 255/254/64/nil); end-to-end through the real sender pipeline — an off-link RS (hop 254) triggers NO RA reply within maxRSDelay while a valid RS (hop 255, fe80::) does (RED on revert of the rsReceiver gate: the off-link RS then triggers a reply). fakeConn gained SetControlMessage + carries a per-RS control message; injectRS now defaults to a valid hop-255 RS, injectRSRaw injects arbitrary cm/src. Docs: pkg/ra/README.md gotchas document the receive validation.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/serialize_test.go, pkg/ra/rs_receive_validation_5095_test.go, pkg/ra/README.md
+  **Action**: #5072 [SECURITY/vsrx-parity] ddns: Kea adapter dropped the IA_PD discriminator so delegated-prefix bases were published as host AAAA/PTR. keaLeaseParser (pkg/dhcpserver/ddns.go) projected each ddnsLease onto ddns.Lease copying only Family/Address/Identity/SubnetID/HostName/ClientFQDN and dropping LeaseType/PrefixLen; ddns.Lease had no lease-type field, so reconcileOnceLocked built buildLeaseRecord(fqdn, l.Address, ...) for EVERY named lease with no type gate — an IA_PD prefix base (e.g. 2001:db8:abcd::) was parsed as a host address and published as an AAAA/PTR for a delegated network base (info-disclosure / policy violation). Fix: (1) ddns.Lease gains LeaseType int (zero value = LeaseTypeIANA so v4 + v6-sans-column + every existing Lease literal remain address-bearing — no test churn); constants LeaseTypeIANA/IATA/IAPD mirror Kea's memfile numerics (0/1/2) plus a local LeaseTypeUnknown=-1 sentinel; isAddressLease() is an explicit ALLOWLIST (IA_NA/IA_TA only). (2) reconcileOnceLocked rejects !isAddressLease() BEFORE name/record derivation, increments a new skippedNonAddress counter (surfaced as Stats.SkippedNonAddress), and drops the lease from `want` so any record mis-published before the fix is withdrawn by the Pass-1 delete. (3) keaLeaseParser carries lease_type through for family 6 (raw numeric when LeaseTypeOK, else LeaseTypeUnknown fail-closed); v4 stays IA_NA. Test (pkg/dhcpserver/ddns_iapd_5072_test.go): a mixed IA_NA/IA_PD v6 memfile through the real keaLeaseParser -> engine — asserts only the IA_NA host publishes (no AAAA/ownership for the IA_PD base) and Stats().SkippedNonAddress==1; RED on revert of the gate (publishes net-pd.example.com -> 2001:db8:bbbb::). Docs: pkg/ddns/README.md LeaseParser-seam section documents the allowlist + carried discriminator.
+  **File(s)**: pkg/ddns/manager.go, pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_iapd_5072_test.go, pkg/ddns/README.md
+  **Action**: #5061 [SECURITY] rpm: VRF-scoped resolver socket setup failures were counted as probe LOSS. A scoped (routing-instance / destination-interface / next-hop) RPM test with a HOSTNAME target resolves through a DNS socket pinned to the same SO_BINDTODEVICE/SO_MARK as the probe (#2614). The DATA-socket Control wrapped SO_BINDTODEVICE/SO_MARK failures with ErrProbeSetup (the #1843 hold-state fail-safe), but the resolver-socket Control (vrfBoundResolver's dialer Control in icmp.go) returned the raw err/cerr. Worse, the ErrProbeSetup sentinel does NOT survive the resolver's *net.DNSError (it flattens its cause to a string, unlike net.OpError), so even a wrapped resolver error would not be caught by errors.Is. A resolver bind failure (EPERM/ENODEV/failed RawConn.Control) therefore reached the probe loop as an ordinary resolve error, advanced failure thresholds, fired a transition, and could make ip-monitoring withdraw a healthy route or install a failover route off a control-plane error. Fix: one shared vrfBindControl(opts, sink) classifies BOTH the data socket (probeDialer) and the resolver socket (vrfBoundResolver) — RawConn.Control and applyVRFBind failures are ErrProbeSetup; a new mutex-guarded setupErrSink captures the setup error out-of-band (the resolver may Dial A+AAAA concurrently). resolveProbeTarget / probeTCP / probeHTTP re-tag their lookup/dial failure from sink.load() so all three probe types hold state on a resolver bind failure. resolverForOpts / probeDialer now return the sink (nil for unscoped/default resolver). Tests (resolver_setup_5061_test.go): shared-helper classification with a fake RawConn; ICMP hold-state end-to-end via the lookupIPAddr seam (drives the real vrfBindControl → applyVRFBind ENODEV, then a *net.DNSError as the resolver would); TCP + HTTP hold-state end-to-end through the real dialer (scoped hostname → SO_BINDTODEVICE ENODEV before any egress). All RED on revert of sink.record. README "Setup errors hold state" extended with the resolver-socket path.
+  **File(s)**: pkg/rpm/icmp.go, pkg/rpm/rpm.go, pkg/rpm/resolver_setup_5061_test.go, pkg/rpm/probe_dialer_2492_test.go, pkg/rpm/scoped_hostname_2493_test.go, pkg/rpm/README.md

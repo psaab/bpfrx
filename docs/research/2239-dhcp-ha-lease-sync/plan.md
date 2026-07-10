@@ -409,6 +409,56 @@ to clock skew.
   apply semantics.
 - **Standalone unchanged.** Loop gated on `cluster != nil` && `DHCPLeaseSync`.
 
+### 6.1 Post-implementation corrections (codex-review-177 / codex-175)
+
+Three defects in the shipped PATH C were found after merge; the invariants
+they add are now part of the module contract:
+
+- **Stable subnet identity across nodes (#5041).** The Kea `subnet-id` MUST be
+  a deterministic function of the subnet's canonical CIDR identity, NOT a
+  positional counter over the node's rendered subnet list. Each HA node renders
+  only its MASTER-filtered subset (`filterDHCPConfigForMasterRGs`), so a
+  positional id gave the SAME logical subnet a DIFFERENT id on the two nodes; a
+  synced lease carries `subnet-id` verbatim, so it misbound on the receiver
+  (Kea rejected it or bound it to the wrong subnet), defeating the
+  duplicate-allocation protection. `stableSubnetID` (pkg/dhcpserver) hashes the
+  CIDR (FNV-1a, folded into Kea's valid `[1, 0xFFFFFFFE]` range) so the id is
+  identical on both nodes across filtered subsets, group reordering, and
+  failover generations. The `#2668` reload-stability property is subsumed. A
+  same-config hash collision between two DISTINCT subnets is resolved by a
+  deterministic linear probe walked in the canonical (sorted-group, sorted-pool)
+  render order so it stays a function of the rendered set.
+- **Takeover pre-seed is a UNION, never a replace (#5040).** On a per-RG
+  active-active takeover this node is ALREADY MASTER for one or more RGs whose
+  leases are live in the local Kea; the takeover then restarts Kea under the
+  union config (already-mastered RG + newly-taken RG). The pre-seed
+  (`preSeedDHCPLeaseMemfile` → `PreSeedMemfileMerged{4,6}`) MUST write the union
+  of this node's current local active leases and the held peer leases, NOT the
+  peer-only set. A peer-only atomic overwrite of the shared memfile wiped this
+  node's still-mastered rows, so the restarted Kea had no record of those in-use
+  bindings and could re-allocate their addresses (duplicate allocation). The
+  merge is keyed by lease identity with the LOCAL live binding winning a
+  conflict. It reads the local set via the socket-preferred / memfile-fallback
+  path and FAILS CLOSED — on an untrusted (corrupt) local source it returns an
+  error and leaves the existing memfile intact rather than replacing it with
+  peer-only rows; the async post-start `lease{4,6}-add` seed is the backstop.
+- **Synced leases age on the standby (#4871).** `SyncLease.Remaining` is
+  seconds-of-lifetime-left at the SENDER's read time and carries no sample
+  epoch, so the receiver MUST record WHEN it received each family's set and
+  subtract that standby RESIDENCE before either seed. Without it a lease held
+  for minutes (worst under a stale/partitioned sync channel — exactly when
+  failover matters) is re-anchored at seed to now_local+Remaining and
+  RESURRECTED past its true expiry, so the promoted node re-allocates an
+  address/prefix the original server already reassigned. `SessionSync` stamps
+  `peerDHCPLeases{4,6}RecvAt` on receipt (a `time.Now()` reading, monotonic in
+  production) and `PeerDHCPLeases{4,6}` subtract the monotonic residence,
+  DROPPING any lease that has aged to zero — NEVER flooring it to one second (a
+  floor revives an expired binding just as surely). The dhcpserver seed writers
+  (`seedSyncLeases`, `writeMemfile{4,6}`) also drop `Remaining<=0` as a fail-safe
+  rather than flooring. Remaining-lifetime + local re-anchor still gives peer
+  wall-clock-skew immunity (§6 clock invariant); residence subtraction closes
+  the standby-hold hole in it.
+
 ---
 
 ## 7. Risk table

@@ -180,6 +180,19 @@ after HA failover. To make that **structural**, not flag-defended:
   backs off on a persistent non-deadline read error (so it cannot
   hot-loop at 100% CPU if the interface dies while `stopCh` is still
   open). It is a detached goroutine unblocked by the owner's `conn.Close`.
+- **RS receive validation (RFC 4861 §6.1.1, #5095).** Before forwarding a
+  Router Solicitation to the owner (which replies with a multicast RA),
+  `rsReceiver` runs `validRSReceive`: the IP **Hop Limit MUST be 255** (a
+  value forwarding would have decremented, so 255 proves the RS
+  originated on-link) and the **source MUST be the unspecified address or
+  a link-local unicast** (the only sources a conformant solicitor uses).
+  Anything else — wrong hop limit, or a global/ULA/multicast source — is
+  silently discarded so an off-link or spoofed RS cannot trigger an RA
+  (RA-injection / DoS surface). `openConn` enables
+  `ipv6.FlagHopLimit` via `SetControlMessage` so the received hop limit is
+  available; a **nil** control message (hop limit unknown) fails closed.
+  If the socket cannot report the hop limit, solicited RAs pause until the
+  next periodic RA rather than answering a possibly off-link solicitation.
 
 `WithdrawOnce` (boot-as-secondary stale-route withdraw) uses a
 goodbye-ONLY path (`sendGoodbyeStandalone`) that never launches an owner

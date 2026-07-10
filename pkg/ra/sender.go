@@ -85,8 +85,9 @@ const (
 // compile-time seam so tests can substitute a recorder/injector (fakeConn)
 // without a live NDP socket. The signatures MUST match mdlayher/ndp v1.1.0
 // exactly: ndp.Message + *ipv6.ControlMessage + netip.Addr on WriteTo/ReadFrom,
-// *ipv6.ICMPFilter on SetICMPFilter, netip.Addr group on JoinGroup. Do not
-// widen this interface beyond what sender needs.
+// *ipv6.ICMPFilter on SetICMPFilter, netip.Addr group on JoinGroup,
+// ipv6.ControlFlags + on/off on SetControlMessage. Do not widen this interface
+// beyond what sender needs.
 type ndpConn interface {
 	WriteTo(m ndp.Message, cm *ipv6.ControlMessage, dst netip.Addr) error
 	ReadFrom() (ndp.Message, *ipv6.ControlMessage, netip.Addr, error)
@@ -95,6 +96,10 @@ type ndpConn interface {
 	SetWriteDeadline(t time.Time) error
 	JoinGroup(group netip.Addr) error
 	SetICMPFilter(f *ipv6.ICMPFilter) error
+	// SetControlMessage enables/disables per-packet control-message fields on
+	// receive. sender enables ipv6.FlagHopLimit so rsReceiver can enforce the
+	// RFC 4861 §6.1.1 Hop-Limit==255 check on Router Solicitations (#5095).
+	SetControlMessage(cf ipv6.ControlFlags, on bool) error
 }
 
 // listenFn opens an ndpConn for the interface. Overridable in tests; defaults
@@ -264,6 +269,18 @@ func (s *sender) openConn() bool {
 	}
 	s.conn = conn
 	s.setSrcAddr(srcAddr)
+
+	// Request the received IP Hop Limit on each packet so rsReceiver can enforce
+	// the RFC 4861 §6.1.1 Router Solicitation check (Hop Limit MUST be 255 — a
+	// value forwarding would have decremented, so 255 proves the RS originated
+	// on-link). If the socket cannot report the hop limit, rsReceiver fails
+	// closed (rejects all RS): solicited RAs pause until the next periodic RA
+	// rather than answering a possibly off-link/spoofed solicitation (#5095).
+	if err := s.conn.SetControlMessage(ipv6.FlagHopLimit, true); err != nil {
+		slog.Warn("ra: failed to request RS hop-limit control message; "+
+			"solicited RAs will be held (periodic RAs continue)",
+			"interface", s.cfg.Interface, "err", err)
+	}
 
 	// Join all-routers multicast to receive Router Solicitations.
 	allRouters := netip.MustParseAddr("ff02::2")
@@ -587,7 +604,7 @@ func (s *sender) rsReceiver(ch chan<- netip.Addr) {
 	defer close(ch)
 	for {
 		s.conn.SetReadDeadline(time.Now().Add(rsReadDeadline))
-		msg, _, src, err := s.conn.ReadFrom()
+		msg, cm, src, err := s.conn.ReadFrom()
 		if err != nil {
 			select {
 			case <-s.stopCh:
@@ -612,11 +629,41 @@ func (s *sender) rsReceiver(ch chan<- netip.Addr) {
 			continue
 		}
 
+		// RFC 4861 §6.1.1 Router Solicitation receive validation: silently
+		// discard an RS that fails the on-link / source-scope checks so an
+		// off-link or spoofed solicitation cannot trigger a multicast RA
+		// (RA-injection / DoS surface, #5095). Fail closed.
+		if !validRSReceive(cm, src) {
+			slog.Debug("ra: discarding Router Solicitation failing RFC 4861 §6.1.1 "+
+				"receive validation (hop-limit != 255 or off-link source)",
+				"interface", s.iface.Name, "src", src)
+			continue
+		}
+
 		select {
 		case ch <- src:
 		default:
 		}
 	}
+}
+
+// validRSReceive applies the RFC 4861 §6.1.1 Router Solicitation receive checks
+// that guard the RA-trigger path (#5095):
+//
+//   - the IP Hop Limit MUST be 255 — a value that IP forwarding would have
+//     decremented, so 255 proves the RS provably originated on-link; and
+//   - the IP source address MUST be the unspecified address (::) or a
+//     link-local unicast (fe80::/10) — the only sources a conformant solicitor
+//     uses. Any global/ULA/multicast source is rejected.
+//
+// A nil control message means the received hop limit is unavailable, so it
+// fails closed. This blocks an off-link or spoofed RS from triggering an RA.
+func validRSReceive(cm *ipv6.ControlMessage, src netip.Addr) bool {
+	if cm == nil || cm.HopLimit != 255 {
+		return false
+	}
+	src = src.Unmap()
+	return src.IsUnspecified() || src.IsLinkLocalUnicast()
 }
 
 // isTimeout reports whether err is an i/o deadline timeout (the expected

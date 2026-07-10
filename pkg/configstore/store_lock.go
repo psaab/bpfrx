@@ -28,6 +28,51 @@ func (s *Store) ensureWritableLocked() error {
 	return nil
 }
 
+// ensureHolderLocked enforces config-lock ownership on a user-session mutation
+// or commit (#5059). The candidate is singular and shared, so serialization
+// under s.mu is not authorization: a session that never entered config mode
+// could otherwise mutate/commit another session's candidate. It rejects a
+// non-empty caller sessionID that differs from the recorded holder. Callers
+// MUST hold s.mu.
+//
+// Two deliberate bypasses:
+//   - sessionID == "" is the internal/system capability (daemon apply, the
+//     stateless REST config-enter path, HA sync, in-process CLI, tests). These
+//     do not carry a peer session and must not be blocked.
+//   - a lock with no recorded holder (effectiveHolderLocked() == "", i.e. the
+//     internal/local EnterConfigure() path) is not owned by any session, so a
+//     user session is not blocked from it — matching pre-#5059 behavior for the
+//     local-CLI / internal acquire.
+//
+// A remote gRPC caller always carries a non-empty peerSessionID and records it
+// as the holder on EnterConfigureSession, so a second remote session is gated
+// against it — closing the exact cross-session mutation the issue describes.
+func (s *Store) ensureHolderLocked(sessionID string) error {
+	if sessionID == "" {
+		return nil // internal/system caller: explicit bypass
+	}
+	if !s.configDir {
+		return nil // not in config mode; candidate==nil is reported by the caller
+	}
+	holder := s.effectiveHolderLocked()
+	if holder == "" || holder == sessionID {
+		return nil
+	}
+	return fmt.Errorf("%w", ErrConfigLockedByOther)
+}
+
+// EnsureConfigHolder atomically verifies that sessionID owns the config lock,
+// returning ErrConfigLockedByOther otherwise (#5059). It is the exported gate
+// used by the commit-family gRPC RPCs (Commit/CommitConfirmed) whose mutation
+// runs through a daemon callback rather than a single store method, so they
+// cannot thread the holder through an *As variant. sessionID == "" bypasses
+// (internal/system caller), matching ensureHolderLocked.
+func (s *Store) EnsureConfigHolder(sessionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ensureHolderLocked(sessionID)
+}
+
 // configLockLeaseTTL bounds how long a config lock may sit idle — with no edit
 // activity — before a new entrant may reclaim it. #4476: the REST config-enter
 // path (POST /api/v1/config/enter) is stateless and has NO disconnect hook,

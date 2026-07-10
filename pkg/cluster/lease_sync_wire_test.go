@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/dhcpserver"
 )
@@ -139,6 +140,46 @@ func TestPeerDHCPLeasesHold(t *testing.T) {
 	s.storePeerDHCPLeases(4, nil)
 	if len(s.PeerDHCPLeases4()) != 0 {
 		t.Errorf("full-set replace did not clear v4")
+	}
+}
+
+// TestPeerDHCPLeasesAged is the #4871 regression guard. SyncLease.Remaining is
+// seconds-of-lifetime-left at the SENDER's read time with no sample epoch, so a
+// set held on the standby must be AGED by the receiver's residence before it is
+// seeded on takeover — otherwise a held lease is re-anchored to
+// now_local+Remaining and resurrected past its true expiry (duplicate
+// allocation). A lease that has aged to zero must be DROPPED, not floored to 1.
+//
+// Fail-on-revert: reverting peerDHCPLeasesAged to a plain copy makes both
+// assertions fail — the still-valid lease keeps its full 600 (not 500) and the
+// expired lease is returned instead of dropped.
+func TestPeerDHCPLeasesAged(t *testing.T) {
+	s := &SessionSync{}
+	now := time.Unix(1_700_000_000, 0)
+	// Received 100s ago.
+	recvAt := now.Add(-100 * time.Second)
+	s.peerDHCPLeases4 = []dhcpserver.SyncLease{
+		{Family: 4, Address: "10.0.0.5", Remaining: 600}, // -> 500 after aging
+		{Family: 4, Address: "10.0.0.6", Remaining: 60},  // -> dropped (60-100<=0)
+	}
+	s.peerDHCPLeases4RecvAt = recvAt
+
+	got := s.peerDHCPLeasesAged(4, now)
+	if len(got) != 1 {
+		t.Fatalf("aged set: got %d leases, want 1 (the expired one must be dropped): %+v", len(got), got)
+	}
+	if got[0].Address != "10.0.0.5" {
+		t.Fatalf("wrong lease survived: %+v", got[0])
+	}
+	if got[0].Remaining != 500 {
+		t.Errorf("aged Remaining = %d, want 500 (600 - 100s residence)", got[0].Remaining)
+	}
+	// The held set itself must be untouched (aging works on copies).
+	s.peerDHCPLeasesMu.Lock()
+	held := s.peerDHCPLeases4[0].Remaining
+	s.peerDHCPLeasesMu.Unlock()
+	if held != 600 {
+		t.Errorf("aging mutated the held set: Remaining = %d, want 600", held)
 	}
 }
 
