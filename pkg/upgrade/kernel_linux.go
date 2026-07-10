@@ -37,6 +37,47 @@ type realKernelSystem struct {
 	// BeaconTarget is the ForwardBeacon ping target; empty -> the IPv4 default
 	// gateway. Set via XPF_KERNEL_BEACON_TARGET for a topology-specific peer.
 	BeaconTarget string
+
+	// Test seams (#5076). All nil/"" in production; a test injects them to
+	// drive the purge-failure path deterministically without shelling out to
+	// apt/dpkg or touching the real /boot + /lib/modules.
+	//
+	//   aptGetFn       overrides the apt-get invocation (purge, install).
+	//   pkgInstalledFn overrides the dpkg "is this package installed?" query.
+	//   fsRoot         prefixes the /boot + /lib/modules paths the prune sweep
+	//                  and the slot selector touch, so a test can assert
+	//                  against a temp-rooted filesystem.
+	aptGetFn       func(args ...string) error
+	pkgInstalledFn func(pkg string) bool
+	fsRoot         string
+}
+
+// aptGetCmd runs apt-get through the injected seam when present, else the real
+// apt-get helper.
+func (s *realKernelSystem) aptGetCmd(args ...string) error {
+	if s.aptGetFn != nil {
+		return s.aptGetFn(args...)
+	}
+	return aptGet(args...)
+}
+
+// pkgInstalled reports whether a package is installed, through the injected
+// seam when present, else a real dpkg-query.
+func (s *realKernelSystem) pkgInstalled(pkg string) bool {
+	if s.pkgInstalledFn != nil {
+		return s.pkgInstalledFn(pkg)
+	}
+	return isPkgInstalled(pkg)
+}
+
+// rooted prefixes an absolute path with fsRoot (empty in production -> the path
+// is returned unchanged). Lets tests confine package-owned file operations to a
+// temp directory.
+func (s *realKernelSystem) rooted(p string) string {
+	if s.fsRoot == "" {
+		return p
+	}
+	return filepath.Join(s.fsRoot, p)
 }
 
 var _ KernelSystem = (*realKernelSystem)(nil)
@@ -213,8 +254,22 @@ func (s *realKernelSystem) InstallCandidateKernel(version string) (string, error
 	if aptPackageAvailable(headersPkg) {
 		pkgs = append(pkgs, headersPkg)
 	}
-	installArgs := append([]string{"install", "-y"}, pkgs...)
-	if err := aptGet(installArgs...); err != nil {
+	// If any candidate package is already recorded installed by dpkg, its
+	// on-disk payload is UNCERTAIN: a prior prune (or an interrupted roll)
+	// could have removed /boot + /lib/modules while dpkg still thinks the
+	// version is current. A plain `apt-get install <same-version>` would then
+	// treat the package as satisfied and never restore the files. Force
+	// --reinstall in that case so apt re-fetches and lays the payload back down
+	// (#5076).
+	anyInstalled := false
+	for _, p := range pkgs {
+		if s.pkgInstalled(p) {
+			anyInstalled = true
+			break
+		}
+	}
+	installArgs := buildInstallArgs(pkgs, anyInstalled)
+	if err := s.aptGetCmd(installArgs...); err != nil {
 		return "", err
 	}
 	if err := runCmd("update-initramfs", "-u", "-k", version); err != nil {
@@ -250,8 +305,20 @@ func (s *realKernelSystem) DefaultBootEntry() (string, error) {
 	return order[0], nil
 }
 
+// buildInstallArgs returns the apt-get argv for installing the candidate
+// packages. When any target package is already installed the payload may be
+// stale/missing, so --reinstall is required to make apt restore /boot +
+// /lib/modules even though dpkg thinks the version is current (#5076).
+func buildInstallArgs(pkgs []string, anyInstalled bool) []string {
+	args := []string{"install", "-y"}
+	if anyInstalled {
+		args = append(args, "--reinstall")
+	}
+	return append(args, pkgs...)
+}
+
 func (s *realKernelSystem) WriteSlotSelector(slot, unameR string) error {
-	dir := filepath.Join("/boot/efi/EFI", slot)
+	dir := s.rooted(filepath.Join("/boot/efi/EFI", slot))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create slot selector dir %s: %w", dir, err)
 	}
@@ -263,7 +330,7 @@ func (s *realKernelSystem) WriteSlotSelector(slot, unameR string) error {
 }
 
 func (s *realKernelSystem) ReadSlotSelector(slot string) (string, error) {
-	path := filepath.Join("/boot/efi/EFI", slot, "xpf.selector")
+	path := s.rooted(filepath.Join("/boot/efi/EFI", slot, "xpf.selector"))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -522,16 +589,19 @@ func (s *realKernelSystem) DisarmWatchdog() error {
 }
 
 func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVersion string) error {
+	// Restore the inactive slot's boot selector to the KNOWN-GOOD kernel FIRST.
+	// This is the load-bearing safety step and it is independent of the package
+	// cleanup below: whatever happens to the candidate's packages, the slot
+	// selector never points at the (possibly half-removed) candidate. Doing it
+	// before any package/file mutation guarantees a later failure cannot strand
+	// the selector on the candidate (#5076).
 	if err := s.WriteSlotSelector(slot, knownGoodUnameR); err != nil {
 		return err
 	}
 	// The candidate kernel packages are HELD (InstallCandidateKernel re-holds
 	// the full set), so `apt-get purge` must be allowed to change held packages
 	// or it leaves the candidate installed-in-dpkg while we delete its files
-	// (r2 Codex High). Include linux-modules-extra (the install adds it). All
-	// best-effort: a prune failure must not block the revert (the firmware
-	// fallback is the safety), but we no longer purge a held pkg without the
-	// override and we cover the same package set the install added.
+	// (r2 Codex High). Include linux-modules-extra (the install adds it).
 	candPkgs := []string{
 		"linux-image-" + candidateVersion,
 		"linux-modules-" + candidateVersion,
@@ -542,20 +612,55 @@ func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVer
 	// never-installed optional pkg like headers/modules-extra).
 	var installed []string
 	for _, p := range candPkgs {
-		if isPkgInstalled(p) {
+		if s.pkgInstalled(p) {
 			installed = append(installed, p)
 		}
 	}
 	if len(installed) > 0 {
 		args := append([]string{"purge", "-y", "--allow-change-held-packages"}, installed...)
-		if err := aptGet(args...); err != nil {
-			fmt.Fprintf(os.Stderr, "kernel-upgrade: WARNING purge un-promoted candidate %s: %v\n", candidateVersion, err)
+		if err := s.aptGetCmd(args...); err != nil {
+			// The purge FAILED (dpkg lock, held-package refusal, a
+			// maintainer-script error, ...). dpkg still records these packages
+			// as installed. Deleting their /boot + /lib/modules payload now
+			// would leave the package database and the filesystem
+			// inconsistent: a later `apt-get install <same-version>` WITHOUT
+			// --reinstall sees the package current and never restores the
+			// files, so the slot would hold a kernel with no modules/boot
+			// files. LEAVE the package-owned files intact and surface the
+			// failure so the caller logs it and the prune stays retryable. The
+			// selector is already pointed at known-good (above), so the box is
+			// safe regardless (#5076).
+			return fmt.Errorf("purge un-promoted candidate %s: %w", candidateVersion, err)
+		}
+		// Re-query dpkg: manual deletion of package-owned files must ONLY
+		// follow a CONFIRMED removal. If any package is still installed (a
+		// partial purge), keep its files and surface the anomaly rather than
+		// delete a still-owned payload (#5076).
+		var stillInstalled []string
+		for _, p := range installed {
+			if s.pkgInstalled(p) {
+				stillInstalled = append(stillInstalled, p)
+			}
+		}
+		if len(stillInstalled) > 0 {
+			return fmt.Errorf("purge un-promoted candidate %s: still installed after purge: %s",
+				candidateVersion, strings.Join(stillInstalled, ", "))
 		}
 	}
-	_ = os.RemoveAll(filepath.Join("/lib/modules", candidateVersion))
-	if matches, err := filepath.Glob(filepath.Join("/boot", "*-"+candidateVersion)); err == nil {
+	// The candidate packages are confirmed ABSENT (none were installed, or the
+	// purge removed them and the dpkg re-query confirms it). Any leftover
+	// /lib/modules or /boot files are now truly orphaned, so sweeping them
+	// cannot desync dpkg. This sweep is best-effort: an orphan-file removal
+	// error must not block the revert (the firmware-cleared BootNext is the
+	// safety floor), so it is logged, not returned.
+	if err := os.RemoveAll(s.rooted(filepath.Join("/lib/modules", candidateVersion))); err != nil {
+		fmt.Fprintf(os.Stderr, "kernel-upgrade: WARNING remove /lib/modules/%s: %v\n", candidateVersion, err)
+	}
+	if matches, err := filepath.Glob(s.rooted(filepath.Join("/boot", "*-"+candidateVersion))); err == nil {
 		for _, match := range matches {
-			_ = os.RemoveAll(match)
+			if err := os.RemoveAll(match); err != nil {
+				fmt.Fprintf(os.Stderr, "kernel-upgrade: WARNING remove %s: %v\n", match, err)
+			}
 		}
 	}
 	return nil
