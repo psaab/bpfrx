@@ -3,17 +3,27 @@ package daemon
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/vishvananda/netlink"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/snmp"
 )
+
+// snmpBindTimeout bounds how long startSNMPLocked waits for the listener
+// goroutine to confirm it bound UDP/161 before treating the start as failed.
+// The real bind (ResolveUDPAddr + ListenUDP) is a synchronous syscall that
+// reports in microseconds, so this ceiling only fires if a serve seam wedges;
+// it exists solely to keep the apply path — which holds snmpReconMu — from
+// blocking forever on a misbehaving listener.
+const snmpBindTimeout = 5 * time.Second
 
 // snmpEnabled reports whether the committed config asks for a running SNMP
 // agent. It is the SINGLE source of truth shared by the boot start block
@@ -246,7 +256,17 @@ func (d *Daemon) reconcileSNMP(cfg *config.Config) bool {
 		if !d.snmpBootReady || d.daemonCtx == nil {
 			return false
 		}
-		d.startSNMPLocked(cfg)
+		// Record the desired hash ONLY on a confirmed-listening agent. If the
+		// bind failed (e.g. transient UDP/161 conflict), startSNMPLocked has
+		// already torn the half-started agent down and returned the error;
+		// leaving snmpHash/snmpHashSet unchanged keeps d.snmpAgent nil, so the
+		// NEXT identical apply re-enters this branch and RETRIES the bind
+		// (self-heals a transient failure) instead of silently no-oping (#5110).
+		if err := d.startSNMPLocked(cfg); err != nil {
+			slog.Warn("SNMP agent start failed; leaving desired hash unrecorded so the next apply retries the bind",
+				"err", err)
+			return false
+		}
 		d.snmpHash, d.snmpHashSet = h, true
 		return true
 	}
@@ -278,14 +298,38 @@ func (d *Daemon) reconcileSNMP(cfg *config.Config) bool {
 // on a fresh lifetime context derived from d.daemonCtx. The caller MUST hold
 // snmpReconMu and MUST have verified snmpEnabled(cfg). Shared by the boot start
 // block and reconcileSNMP so both go through one implementation (#3967).
-func (d *Daemon) startSNMPLocked(cfg *config.Config) {
+//
+// It waits (bounded by snmpBindTimeout) for the listener goroutine to confirm
+// it actually bound the socket before returning, and returns a non-nil error if
+// the bind FAILED (or timed out). On that error path it has already rolled the
+// half-started agent back via teardownSNMPLocked — no goroutine or socket is
+// left behind and d.snmpAgent is nil again — so the caller must NOT publish the
+// running-config hash and a later identical apply can retry a clean start. This
+// closes #5110: the pre-fix serve closure discarded Agent.Start's bind error,
+// so a transient UDP/161 failure left SNMP absent while the desired hash still
+// recorded "applied", no-oping every subsequent identical commit.
+func (d *Daemon) startSNMPLocked(cfg *config.Config) error {
 	ctx, cancel := context.WithCancel(d.daemonCtx)
 	agent := snmp.NewAgentWithBootsPath(cfg.System.SNMP, d.snmpBootsPath)
 	agent.SetIfDataFn(buildSNMPIfData)
 
+	// The serve seam binds UDP/161 and then serves for the lifetime of ctx. It
+	// reports the bind outcome on `ready` EXACTLY ONCE — nil once the listener
+	// is bound (before entering the blocking serve loop), or the bind error if
+	// it failed — so startSNMPLocked can gate hash publication on a real bind.
+	// The default splits Agent.Bind (synchronous bind) from Agent.Serve (the
+	// blocking loop); tests inject a seam that scripts the bind outcome without
+	// touching a privileged socket.
 	serve := d.snmpServe
 	if serve == nil {
-		serve = func(ctx context.Context, a *snmp.Agent) { _ = a.Start(ctx) }
+		serve = func(ctx context.Context, a *snmp.Agent, ready chan<- error) {
+			if err := a.Bind(ctx); err != nil {
+				ready <- err
+				return
+			}
+			ready <- nil
+			a.Serve()
+		}
 	}
 
 	wg := &sync.WaitGroup{}
@@ -295,11 +339,27 @@ func (d *Daemon) startSNMPLocked(cfg *config.Config) {
 	d.snmpWg = wg
 	d.snmpMonitorRunning = false
 
+	// Buffered so the listener goroutine never blocks on the send even if we
+	// stopped waiting (timeout path) before it reported.
+	ready := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		serve(ctx, agent)
+		serve(ctx, agent, ready)
 	}()
+
+	var bindErr error
+	select {
+	case bindErr = <-ready:
+	case <-time.After(snmpBindTimeout):
+		bindErr = fmt.Errorf("snmp: listener did not confirm bind within %s", snmpBindTimeout)
+	}
+	if bindErr != nil {
+		// Roll the partially-started agent back so the failure path leaks no
+		// goroutine/socket and the next identical apply retries a clean start.
+		d.teardownSNMPLocked()
+		return bindErr
+	}
 
 	if len(cfg.System.SNMP.TrapGroups) > 0 {
 		d.startSNMPMonitorLocked()
@@ -308,6 +368,7 @@ func (d *Daemon) startSNMPLocked(cfg *config.Config) {
 		"communities", len(cfg.System.SNMP.Communities),
 		"v3_users", len(cfg.System.SNMP.V3Users),
 		"trap_groups", len(cfg.System.SNMP.TrapGroups))
+	return nil
 }
 
 // startSNMPMonitorLocked launches the netlink link-state trap monitor on the

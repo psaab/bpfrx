@@ -244,11 +244,15 @@ type Daemon struct {
 	snmpHashSet        bool               // true once snmpHash reflects a running agent
 	snmpMonitorRunning bool               // true while the link-state trap monitor goroutine is live
 	snmpBootReady      bool               // set true after the boot block; gates the reconcile START path
-	// snmpServe runs the agent's UDP/161 listener for the lifetime of ctx.
-	// nil ⇒ agent.Start (binds UDP/161, needs CAP_NET_BIND_SERVICE). The
-	// reconcile unit test injects a seam so it can drive enable/disable
-	// without binding a privileged socket (#3967).
-	snmpServe func(ctx context.Context, agent *snmp.Agent)
+	// snmpServe binds the agent's UDP/161 listener and then serves for the
+	// lifetime of ctx. It reports the bind outcome on `ready` exactly once —
+	// nil once bound (before serving), or the bind error — so startSNMPLocked
+	// can publish the running-config hash ONLY on a confirmed bind (#5110). nil
+	// ⇒ the default Agent.Bind + Agent.Serve split (binds UDP/161, needs
+	// CAP_NET_BIND_SERVICE). The reconcile unit test injects a seam so it can
+	// drive enable/disable — and simulate a bind failure — without binding a
+	// privileged socket (#3967, #5110).
+	snmpServe func(ctx context.Context, agent *snmp.Agent, ready chan<- error)
 	// snmpBootsPath overrides the SNMPv3 engineBoots persistence path passed
 	// to snmp.NewAgentWithBootsPath. Empty ⇒ the package default. Tests inject
 	// a temp path so a reconcile-triggered start does not touch /var/lib/xpf

@@ -479,9 +479,30 @@ func (s *ifSnapshot) get() []IfData {
 	return s.data
 }
 
-// Start begins listening for SNMP requests on UDP port 161.
-// It blocks until the context is cancelled.
+// Start binds the UDP/161 listener and then serves requests until the context
+// is cancelled. It is a convenience wrapper over Bind + Serve for callers that
+// do not need to observe the bind result separately from the serve loop; it
+// returns the bind error synchronously and blocks in Serve only on a
+// successful bind.
 func (a *Agent) Start(ctx context.Context) error {
+	if err := a.Bind(ctx); err != nil {
+		return err
+	}
+	a.Serve()
+	return nil
+}
+
+// Bind resolves and opens the UDP/161 listener and arms the lifecycle watcher
+// that turns ctx cancellation (or a day-2 Stop) into a socket close. It returns
+// the bind error SYNCHRONOUSLY so a caller can learn whether the listener
+// actually came up before publishing "SNMP is running" state (#5110): a
+// discarded bind failure (e.g. a transient UDP/161 conflict) otherwise leaves
+// SNMP silently down while the apply records success, and every identical later
+// apply no-ops. On success the caller MUST call Serve (directly or in a
+// goroutine) to process requests and Stop to release the socket. On failure no
+// socket or goroutine is left behind (the watcher is armed only after a
+// successful ListenUDP), so the caller can retry a clean Bind.
+func (a *Agent) Bind(ctx context.Context) error {
 	addr, err := net.ResolveUDPAddr("udp", ":161")
 	if err != nil {
 		return fmt.Errorf("snmp: resolve address: %w", err)
@@ -508,6 +529,20 @@ func (a *Agent) Start(ctx context.Context) error {
 		<-lifeCtx.Done()
 		a.Stop()
 	}()
+	return nil
+}
+
+// Serve runs the request loop on the listener opened by a prior successful
+// Bind, blocking until the socket is closed (by Stop / ctx cancellation). It is
+// a no-op if no socket is open (Bind failed or was never called, or Stop
+// already ran), so it is safe to call unconditionally after Bind.
+func (a *Agent) Serve() {
+	a.mu.Lock()
+	conn := a.conn
+	a.mu.Unlock()
+	if conn == nil {
+		return
+	}
 
 	buf := make([]byte, maxPacketSize)
 	for {
@@ -517,7 +552,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			stopped := a.stopped
 			a.mu.Unlock()
 			if stopped {
-				return nil
+				return
 			}
 			slog.Error("SNMP read error", "err", err)
 			continue

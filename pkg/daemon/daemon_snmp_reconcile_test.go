@@ -140,10 +140,11 @@ type snmpServeRecorder struct {
 	calls int
 }
 
-func (r *snmpServeRecorder) serve(ctx context.Context, _ *snmp.Agent) {
+func (r *snmpServeRecorder) serve(ctx context.Context, _ *snmp.Agent, ready chan<- error) {
 	r.mu.Lock()
 	r.calls++
 	r.mu.Unlock()
+	ready <- nil // simulate a successful bind
 	<-ctx.Done()
 }
 
@@ -159,7 +160,7 @@ func (r *snmpServeRecorder) count() int {
 // seam, the link-state monitor on hermetic subscribe/list seams, and the
 // SNMPv3 engineBoots file on a temp path. snmpBootReady=true simulates the
 // post-boot state in which day-2 commits own the SNMP lifecycle.
-func newSNMPReconcileDaemon(t *testing.T, serve func(context.Context, *snmp.Agent)) *Daemon {
+func newSNMPReconcileDaemon(t *testing.T, serve func(context.Context, *snmp.Agent, chan<- error)) *Daemon {
 	t.Helper()
 	installFakeNetworkctl(t)
 	d := &Daemon{
@@ -321,5 +322,93 @@ func TestReconcileSNMPStartsMonitorOnTrapGroupAddedDay2(t *testing.T) {
 	}
 	if got := rec.count(); got != 1 {
 		t.Fatalf("adding a trap group bounced the UDP listener: serve invocations = %d, want 1", got)
+	}
+}
+
+// snmpServeBindOutcome is a snmpServe seam whose bind result is scripted per
+// attempt: the first failN attempts report a bind failure on the readiness
+// channel and return WITHOUT serving (mirroring Agent.Bind failing before
+// Agent.Serve); every later attempt reports a successful bind and blocks until
+// ctx cancel (mirroring a clean Bind+Serve). It counts attempts so a test can
+// prove a failed start is retried on the next apply.
+type snmpServeBindOutcome struct {
+	mu       sync.Mutex
+	attempts int
+	failN    int
+}
+
+func (s *snmpServeBindOutcome) serve(ctx context.Context, _ *snmp.Agent, ready chan<- error) {
+	s.mu.Lock()
+	s.attempts++
+	n := s.attempts
+	s.mu.Unlock()
+	if n <= s.failN {
+		ready <- errors.New("snmp: listen: listen udp :161: bind: address already in use")
+		return
+	}
+	ready <- nil
+	<-ctx.Done()
+}
+
+func (s *snmpServeBindOutcome) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+// TestReconcileSNMPBindFailureLeavesHashUnrecordedAndRetries is the #5110
+// RED-on-revert test: a listener bind failure must NOT publish the running
+// SNMP hash, and the half-started agent must be torn down, so the NEXT
+// identical apply retries the bind (self-healing a transient UDP/161 failure)
+// instead of no-oping forever with SNMP silently down.
+//
+// Mutation check: record d.snmpHash on the failed start (or leave the zombie
+// agent non-nil / drop the teardown), and the retry apply sees a running agent
+// with a matching hash, takes the idempotent no-op path, and never re-attempts
+// the bind — seam attempts stay at 1 and d.snmpAgent stays nil, failing the
+// retry assertions below.
+func TestReconcileSNMPBindFailureLeavesHashUnrecordedAndRetries(t *testing.T) {
+	seam := &snmpServeBindOutcome{failN: 1} // fail the first bind, then succeed
+	d := newSNMPReconcileDaemon(t, seam.serve)
+
+	// First enable: the listener bind FAILS.
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable, bind fails): %v", err)
+	}
+	if got := seam.count(); got != 1 {
+		t.Fatalf("bind was not attempted exactly once: attempts = %d, want 1", got)
+	}
+	if d.snmpAgent != nil {
+		t.Fatal("bind failure left a zombie SNMP agent: d.snmpAgent must be nil " +
+			"after a failed start so the next apply retries (#5110)")
+	}
+	d.snmpReconMu.Lock()
+	hashSet := d.snmpHashSet
+	d.snmpReconMu.Unlock()
+	if hashSet {
+		t.Fatal("bind failure recorded the desired SNMP hash: a subsequent " +
+			"identical apply will no-op and SNMP stays silently down (#5110)")
+	}
+
+	// Second identical enable: because the hash was NOT recorded and the zombie
+	// was torn down, the apply RETRIES the bind, which now succeeds.
+	if err := d.applyConfigLocked(context.Background(), snmpEnabledConfig()); err != nil {
+		t.Fatalf("applyConfigLocked(enable retry): %v", err)
+	}
+	if got := seam.count(); got != 2 {
+		t.Fatalf("failed SNMP start was NOT retried on the next identical apply: "+
+			"bind attempts = %d, want 2 (#5110)", got)
+	}
+	if d.snmpAgent == nil {
+		t.Fatal("SNMP did not self-heal: the retry apply did not bring the agent up")
+	}
+	if !waitUntil(t, time.Second, func() bool { return d.snmpAgent != nil }) {
+		t.Fatal("SNMP agent not running after successful retry")
+	}
+	d.snmpReconMu.Lock()
+	hashSet = d.snmpHashSet
+	d.snmpReconMu.Unlock()
+	if !hashSet {
+		t.Fatal("successful retry did not record the desired SNMP hash")
 	}
 }
