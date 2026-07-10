@@ -380,6 +380,29 @@ never lock an operator out of a remote box it manages.
     the teardown itself performs no `applyConfigLocked`, so the cancel aborts
     only a genuinely in-flight commit/remediation apply, never the shutdown's own
     cleanup.
+  - **Cancel + join the two daemonCtx-bound loops BEFORE dependent teardown
+    (#5308).** Because `d.daemonCtx` is never cancelled and neither the policy
+    scheduler nor the RPM probe-pin retry loop binds to the run `WaitGroup`,
+    `stop()` + `wg.Wait()` does not stop them. The shutdown sequence therefore
+    calls `stopPolicySchedulerLoop()` + `stopPinRetryLoop()` immediately after
+    `wg.Wait()` and BEFORE the subsystems they call into are torn down: the
+    scheduler republishes schedule state through the dataplane runtime
+    (`UpdatePolicyScheduleState`, closed by `dp.Close`/`dp.Teardown`), and the
+    pin-retry loop runs routing-pin syscalls through the routing/FRR manager
+    (stopped by `frr.Stop`/routing teardown). Each helper cancels its loop's
+    context (the scheduler's `schedulerCancel`; a cancellable child of
+    `d.daemonCtx` for pin-retry — it no longer binds `context.Background()`) and
+    joins the goroutine on a `WaitGroup` (`schedulerWg`/`pinRetryWg`). The
+    cancel is taken under the loop's own lock (`applySem` / `rpmMu`) but that
+    lock is RELEASED before the join — an in-flight tick blocked on that same
+    lock (`publishPolicyScheduleState` on `applySem`; `probePinRetryLoop` on
+    `rpmMu`) must be able to finish so the goroutine can observe `ctx.Done()`.
+    A `schedulerStopped`/`pinRetryStopped` latch prevents a late reconcile from
+    starting a new generation after the join (which would race the `Wait`).
+    Both helpers are idempotent / nil-safe and are ALSO registered as `defer`s
+    in `Run`, so an early-error return (or an embedded library caller whose ctx
+    cancels) that never reaches the shutdown sequence still cancels + joins both
+    loops instead of leaking them.
 - FRR reload runs with a 15 s context timeout to keep `systemctl reload
   frr` from hanging. The systemd unit has `TimeoutStopSec=20` as a safety
   net.

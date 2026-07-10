@@ -286,11 +286,44 @@ func (d *Daemon) retryFailedProbePinsLocked() {
 // stays off after a reboot (AGY review on PR #1899). The loop stops
 // itself once every pin is installed. Caller holds rpmMu.
 func (d *Daemon) maybeStartPinRetryLoopLocked() {
-	if !d.rpmPinsFailed || d.rpmPinRetryActive || d.daemonCtx == nil {
+	// pinRetryStopped latches at shutdown (stopPinRetryLoop): once the loop is
+	// cancelled + joined, a late reconcileRPM must NOT start a new one — that
+	// Add would race the shutdown's pinRetryWg.Wait (#5308).
+	if d.pinRetryStopped || !d.rpmPinsFailed || d.rpmPinRetryActive || d.daemonCtx == nil {
 		return
 	}
 	d.rpmPinRetryActive = true
-	go d.probePinRetryLoop(d.daemonCtx)
+	// Bind the loop to a CANCELLABLE child of d.daemonCtx (not d.daemonCtx
+	// itself, which is never cancelled in production) so shutdown can stop it
+	// before FRR/routing teardown, and track it on pinRetryWg so shutdown can
+	// join it (#5308). Callers hold rpmMu.
+	ctx, cancel := context.WithCancel(d.daemonCtx)
+	d.pinRetryCancel = cancel
+	d.pinRetryWg.Add(1)
+	go func() {
+		defer d.pinRetryWg.Done()
+		d.probePinRetryLoop(ctx)
+	}()
+}
+
+// stopPinRetryLoop cancels the probePinRetryLoop goroutine and joins it. It is
+// called from the shutdown sequence BEFORE FRR/routing teardown so a late
+// retry tick can never run a routing-pin syscall against a torn-down routing
+// manager (#5308). rpmMu is held only to read+cancel pinRetryCancel and latch
+// pinRetryStopped, then RELEASED before the join: probePinRetryLoop takes rpmMu
+// on both its ctx.Done() and ticker branches, so holding it across the join
+// would deadlock. Idempotent / nil-safe: a loop that was never started (no pin
+// failures) joins cleanly.
+func (d *Daemon) stopPinRetryLoop() {
+	d.rpmMu.Lock()
+	d.pinRetryStopped = true
+	cancel := d.pinRetryCancel
+	d.pinRetryCancel = nil
+	d.rpmMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	d.pinRetryWg.Wait()
 }
 
 // probePinRetryLoop is the slow autonomous retry of failed probe-pin

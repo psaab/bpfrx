@@ -181,7 +181,20 @@ type Daemon struct {
 	// probePinApply is the test seam for probe-pin programming; nil =
 	// d.routing.ApplyProbePins (#1895).
 	probePinApply func([]routing.ProbePin) map[string]error
-	ipmon         *ipmon.Engine
+	// pinRetryCancel/pinRetryWg/pinRetryStopped scope the probePinRetryLoop
+	// lifecycle so daemon shutdown can cancel + join it BEFORE FRR/routing
+	// teardown (#5308). The loop used to bind to d.daemonCtx (never cancelled
+	// in production), so a late retry tick could run routing-pin syscalls
+	// after the routing manager was gone — and it leaked outright for library
+	// callers where Run() returns. maybeStartPinRetryLoopLocked now derives a
+	// cancellable child of d.daemonCtx and tracks the goroutine on pinRetryWg;
+	// stopPinRetryLoop cancels + joins. All three are guarded by rpmMu;
+	// pinRetryStopped latches on shutdown so no new loop can be started after
+	// the join (which would race pinRetryWg.Wait).
+	pinRetryCancel  context.CancelFunc
+	pinRetryWg      sync.WaitGroup
+	pinRetryStopped bool
+	ipmon           *ipmon.Engine
 	// natPoolAlarm is the #2079 NAT source pool-utilization-alarm monitor:
 	// a slow (10s) loop over the helper's last-applied NAT pool snapshot
 	// that raises/clears `show security alarms` entries with hysteresis and
@@ -284,12 +297,23 @@ type Daemon struct {
 	// to snmp.NewAgentWithBootsPath. Empty ⇒ the package default. Tests inject
 	// a temp path so a reconcile-triggered start does not touch /var/lib/xpf
 	// (#3967).
-	snmpBootsPath             string
-	lldpMgr                   *lldp.Manager
-	lldpApplied               *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
-	lldpApplyInit             bool             // true once reconcileLLDP has run at least once
-	scheduler                 *scheduler.Scheduler
-	schedulerCancel           context.CancelFunc
+	snmpBootsPath   string
+	lldpMgr         *lldp.Manager
+	lldpApplied     *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
+	lldpApplyInit   bool             // true once reconcileLLDP has run at least once
+	scheduler       *scheduler.Scheduler
+	schedulerCancel context.CancelFunc
+	// schedulerWg tracks every policy-scheduler Run() goroutine generation so
+	// daemon shutdown can join it after cancelling, and schedulerStopped
+	// latches on shutdown so no new generation is started after the join
+	// (#5308). Before this the scheduler goroutine was cancelled only on a
+	// config-replace, so at shutdown a late tick could republish policy
+	// schedule state through an already-torn-down runtime, and it leaked for
+	// library callers where Run() returns. schedulerCancel/schedulerWg/
+	// schedulerStopped are all mutated under applySem (the "Locked" convention
+	// for the scheduler start/reconcile path).
+	schedulerWg               sync.WaitGroup
+	schedulerStopped          bool
 	policySchedulerConfigHash [32]byte
 	policySchedulerEpoch      atomic.Uint64
 	// #3780: scheduler republish-failure observability.
