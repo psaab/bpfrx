@@ -71,6 +71,71 @@ func TestDeferredWorkerArmDebtRetainedWhileHelperDown(t *testing.T) {
 	if m.publishedSnapshot != 7 {
 		t.Fatalf("publishedSnapshot = %d, want 7 retained after a failed re-arm publish", m.publishedSnapshot)
 	}
+	// A failed apply_snapshot must NOT burn a generation: m.generation is
+	// committed only after a successful publish. Otherwise every failed retry
+	// tick would advance the generation while the debt persists.
+	if m.generation != 7 {
+		t.Fatalf("generation = %d, want 7 unchanged after a failed re-arm publish", m.generation)
+	}
+}
+
+// TestDeferredWorkerArmDebtSettledWhenAlreadyArmed pins the settle-early(b)
+// monotonicity guard (#5169/#5171): when the debt is still set but a LATER full
+// apply has already published a DeferWorkers=false snapshot (workers armed),
+// the retry MUST clear the debt and return nil WITHOUT republishing — it must
+// not clobber the newer retained snapshot with stale content or burn a
+// generation.
+//
+// RED-on-revert: if the `!m.lastSnapshot.DeferWorkers` settle-early check is
+// removed, the retry republishes the (already-armed) snapshot — the control
+// server then receives an apply_snapshot and the generation advances, failing
+// this test.
+func TestDeferredWorkerArmDebtSettledWhenAlreadyArmed(t *testing.T) {
+	controlSock := filepath.Join(t.TempDir(), "control.sock")
+
+	cfg := &config.Config{}
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	m.cfg.ControlSocket = controlSock
+	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+
+	// A later full apply already armed the workers: the retained snapshot has
+	// DeferWorkers=false.
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{ControlSocket: controlSock}, 9, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	snap.DeferWorkers = false
+	m.lastSnapshot = snap
+	m.generation = 9
+	m.publishedSnapshot = 9
+	// Stale debt from an earlier failed re-arm that the newer apply superseded.
+	m.RecordDeferredWorkerArmDebt()
+
+	reqs := startArmControlServer(t, controlSock, 1)
+
+	m.mu.Lock()
+	retryErr := m.retryDeferredWorkerArmLocked()
+	m.mu.Unlock()
+	if retryErr != nil {
+		t.Fatalf("retry must return nil when the workers are already armed, got %v", retryErr)
+	}
+	if m.pendingWorkerArm {
+		t.Fatal("debt must be cleared once a later apply already armed the workers")
+	}
+	if m.generation != 9 {
+		t.Fatalf("generation = %d, want 9 unchanged (settle-early must not republish/bump)", m.generation)
+	}
+	if m.publishedSnapshot != 9 {
+		t.Fatalf("publishedSnapshot = %d, want 9 unchanged", m.publishedSnapshot)
+	}
+	// The retained (newer) snapshot must NOT be clobbered by a stale republish:
+	// no apply_snapshot may reach the control server.
+	select {
+	case req := <-reqs:
+		t.Fatalf("settle-early must not republish; got a %q request", req.Type)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 // TestDeferredWorkerArmDebtArmsWorkersOnRecovery verifies the self-heal: once

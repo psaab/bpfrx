@@ -54,10 +54,14 @@ func (m *Manager) retryDeferredWorkerArmLocked() error {
 		return nil
 	}
 
+	// Compute the next generation locally and commit m.generation ONLY after
+	// the publish succeeds (mirrors UpdatePolicyScheduleState). A failed
+	// apply_snapshot must not permanently advance m.generation — otherwise
+	// each failed retry tick would burn a generation while the debt persists.
+	nextGeneration := m.generation + 1
 	next := *m.lastSnapshot
 	next.DeferWorkers = false
-	m.generation++
-	next.Generation = m.generation
+	next.Generation = nextGeneration
 	next.FIBGeneration = m.readFIBGeneration()
 	next.GeneratedAt = time.Now().UTC()
 
@@ -78,6 +82,8 @@ func (m *Manager) retryDeferredWorkerArmLocked() error {
 		return fmt.Errorf("re-arm deferred workers: %w", err)
 	}
 	m.logWgEndpointSetTransitionLocked(&publishSnap, "deferred-worker-arm")
+	// Publish succeeded — commit the generation bump now.
+	m.generation = nextGeneration
 	m.lastSnapshot = &next
 	m.rebuildNeighborIndex()
 	m.rebuildMonitoredIfindexes()
