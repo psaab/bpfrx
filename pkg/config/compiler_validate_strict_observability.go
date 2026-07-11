@@ -202,11 +202,16 @@ func validateDynamicAddressFeedServerEndpointStrict(cfg *Config) error {
 			if display == "" {
 				display = name
 			}
+			// Redact the echoed URL: a malformed-but-credentialed base url
+			// (e.g. "https://user:token@" with no host) would otherwise leak
+			// the embedded userinfo / query token into this operator-visible
+			// commit error and any log capturing it (#5521; matches the DDNS
+			// validation warnings that already RedactURL their server/template).
 			return fmt.Errorf("security dynamic-address feed-server %q base url "+
 				"%q is malformed (%s) — http.NewRequestWithContext fails before "+
 				"any fetch, so it registers no feeds and any address-name bound "+
 				"to it silently matches nothing; set a valid http(s) url or hostname",
-				display, feedServerResolvedBaseURL(fs), reason)
+				display, RedactURL(feedServerResolvedBaseURL(fs)), reason)
 		}
 	}
 	return nil

@@ -866,7 +866,11 @@ func (s *Server) showDynamicAddress(cfg *config.Config, buf *strings.Builder) {
 		}
 		for name, feed := range cfg.Security.DynamicAddress.FeedServers {
 			fmt.Fprintf(buf, "Feed server: %s\n", name)
-			fmt.Fprintf(buf, "  URL: %s\n", feed.URL)
+			// Redact any embedded basic-auth userinfo / query-string token —
+			// dynamic-address feeds routinely carry per-tenant bearer tokens in
+			// the URL, and this render reaches read-only management clients and
+			// command-output logs / support bundles (#5521).
+			fmt.Fprintf(buf, "  URL: %s\n", config.RedactURL(feed.URL))
 			if feed.FeedName != "" {
 				fmt.Fprintf(buf, "  Feed name: %s\n", feed.FeedName)
 			}

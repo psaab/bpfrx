@@ -181,7 +181,9 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			for _, name := range sortedKeys(cfg.Security.DynamicAddress.FeedServers) {
 				feed := cfg.Security.DynamicAddress.FeedServers[name]
 				fmt.Fprintf(&buf, "Feed server: %s\n", name)
-				fmt.Fprintf(&buf, "  URL: %s\n", feed.URL)
+				// Redact embedded userinfo / query-string credentials before
+				// rendering to the REST client (#5521).
+				fmt.Fprintf(&buf, "  URL: %s\n", config.RedactURL(feed.URL))
 				if feed.FeedName != "" {
 					fmt.Fprintf(&buf, "  Feed name: %s\n", feed.FeedName)
 				}

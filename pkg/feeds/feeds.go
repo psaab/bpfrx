@@ -177,7 +177,7 @@ func resolveBaseURL(fsCfg *config.FeedServer) string {
 func warnPlaintextFeed(name, url string) {
 	if strings.HasPrefix(strings.ToLower(url), "http://") {
 		slog.Warn("dynamic-address: feed URL is plaintext http (no integrity — a MITM can substitute the feed body); prefer https",
-			"name", name, "url", url)
+			"name", name, "url", config.RedactURL(url))
 	}
 }
 
@@ -344,7 +344,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 		warnPlaintextFeed(p.name, p.url)
 		go m.refreshLoop(feedCtx, fs, p.interval)
 		slog.Info("dynamic address feed started",
-			"name", p.name, "server", p.server, "url", p.url,
+			"name", p.name, "server", p.server, "url", config.RedactURL(p.url),
 			"interval", p.interval, "hold", holdStr,
 			"carried_prefixes", len(fs.prefixes))
 	}
