@@ -1562,6 +1562,67 @@ def _node_protocol_versions(runner, backend, node):
     return d
 
 
+def _node_cluster_node_id(runner, backend, node):
+    """Read the recreated node's cluster-identity marker /etc/xpf/node-id — the
+    SAME file xpfd keys HA identity on (pkg/daemon/daemon.go `nodeIDFile`),
+    written by the day-0 config drive during the recreate. Returns the int
+    node-id, or None if absent/unreadable/unparsable so the #5075 identity gate
+    fails CLOSED. Used to confirm an image-recreated node came back as the
+    EXPECTED node, not a wrong-id relaunch (e.g. a --recreate-hook that swapped
+    node-id 0 and 1)."""
+    out = _node_exec(runner, backend, node,
+                     ["cat", "/etc/xpf/node-id"], check=False)
+    s = (out or "").strip()
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _recreated_node_matches(live_versions, want_version, live_node_id, want_node_id):
+    """#5075 identity+version gate for a node recreated from the new image.
+    Returns (ok: bool, reason: str).
+
+    The post-recreate readiness poll must accept a responding xpfd ONLY when it
+    is BOTH the EXPECTED build (its live `xpf-version` equals the AUTHENTICATED
+    image manifest's xpf-version) AND the EXPECTED cluster node (its
+    /etc/xpf/node-id equals the node-id the deploy assigned). Before #5075 the
+    poll accepted ANY xpfd that merely answered with a non-empty xpf-version, so
+    a --recreate-hook that relaunched the OLD image, a stale alias, or the WRONG
+    node-id satisfied the poll and the roll proceeded to the peer with the pair
+    on unintended/mixed software — a silent deploy-integrity failure. This gate
+    fails CLOSED on every mismatch.
+
+    - live_versions: dict from `xpfd protocol-versions` on the recreated node.
+    - want_version:  xpf-version from the AUTHENTICATED image manifest.
+    - live_node_id:  int|None parsed from /etc/xpf/node-id on the node.
+    - want_node_id:  the cluster node-id the deploy assigned this node.
+
+    A still-booting node (empty xpf-version) returns (False, ...) too, so the
+    caller can simply keep polling until the gate passes or the boot deadline
+    elapses, then fail closed with the last reason."""
+    live_ver = (live_versions or {}).get("xpf-version", "")
+    if not live_ver:
+        return False, "xpfd is not answering protocol-versions yet (no xpf-version)"
+    if not want_version:
+        return (False, "the authenticated image manifest carries no xpf-version — "
+                "cannot confirm the node rolled to the expected build (#5075)")
+    if live_ver != want_version:
+        return (False, f"node is running xpf-version {live_ver!r}, but the "
+                f"authenticated manifest expects {want_version!r} — the recreate "
+                f"did NOT roll to the requested image (old image / stale alias / "
+                f"wrong build)")
+    if live_node_id is None:
+        return (False, "cannot read /etc/xpf/node-id on the recreated node — "
+                f"cannot confirm it is cluster node-id {want_node_id} (#5075)")
+    if live_node_id != want_node_id:
+        return (False, f"node reports cluster node-id {live_node_id}, not the "
+                f"expected {want_node_id} — the recreate launched the WRONG node "
+                f"identity (#5075)")
+    return (True, f"xpf-version {live_ver} and cluster node-id {live_node_id} "
+            f"match the expected new image")
+
+
 def _node_drain_supports_mixed_ha(runner, backend, node):
     """Feature-detect whether a node's RUNNING xpfd accepts the INC-3
     `--allow-mixed-ha` drain flag. An image rolled FROM a pre-INC-3 release has
@@ -1847,19 +1908,43 @@ def cmd_image_roll(args):
                 return
             _recreate_node_from_image(runner, backend, node, args)
 
-            # 3. poll until the node is back (xpfd answers protocol-versions).
+            # 3. poll until the node is back AS THE EXPECTED NODE ON THE NEW
+            #    IMAGE. #5075: accepting ANY responding xpfd (the pre-fix
+            #    `if pv.get("xpf-version")` non-empty check) let a --recreate-hook
+            #    that relaunched the OLD image / a stale alias / the WRONG node-id
+            #    satisfy the poll — the driver rejoined and proceeded to the peer
+            #    with the pair on unintended/mixed software (silent deploy-
+            #    integrity failure). Require the live xpf-version to EXACTLY match
+            #    the AUTHENTICATED manifest's xpf-version AND /etc/xpf/node-id to
+            #    match the assigned cluster node-id before treating the node as
+            #    "back". Keep polling until the gate passes or the boot deadline
+            #    elapses (existing retry/timeout preserved), then FAIL CLOSED with
+            #    the never-both-down leases HELD — a mismatch is not a successful
+            #    roll.
+            want_ver = new_img.get("xpf-version", "")
+            want_nid = node_ids[node]
             deadline = _time.time() + boot_deadline
             back = False
+            last_reason = ("did not come back within the boot deadline "
+                           "(xpfd never answered protocol-versions)")
             while _time.time() < deadline:
                 _time.sleep(10)
                 pv = _node_protocol_versions(runner, backend, node)
+                # Only read the node-id marker once xpfd is actually answering,
+                # to avoid an extra `cat` on every poll while the node is down.
+                live_nid = None
                 if pv.get("xpf-version"):
-                    back = True
+                    live_nid = _node_cluster_node_id(runner, backend, node)
+                back, last_reason = _recreated_node_matches(
+                    pv, want_ver, live_nid, want_nid)
+                if back:
                     break
             if not back:
-                die(f"{node} did not come back within {boot_deadline}s after image "
-                    f"recreate; STOPPING — {peer} stays primary. Investigate.")
-            print(f"   {node} back on the new image")
+                die(f"{node} did NOT come back as the expected node on the new "
+                    f"image within {boot_deadline}s after image recreate: "
+                    f"{last_reason}. STOPPING with the never-both-down leases HELD "
+                    f"— {peer} stays primary. Investigate the recreate (#5075).")
+            print(f"   {node} back on the new image: {last_reason}")
 
             # 4. rejoin + confirm sync BEFORE touching the peer (never-both-down).
             print(f"   rejoining {node} (confirming sync)...")

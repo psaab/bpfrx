@@ -45455,3 +45455,23 @@ top.
   Validation: `python3 -m py_compile` clean; `bash scripts/run-selftests.sh`
   green (37 passed, 0 failed, includes the new test).
 - **File(s)**: scripts/deploy/xpf-deploy.py, scripts/deploy/test_xpf_deploy_lease_ttl.py, docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+  **Action**: #5075 — image-roll post-recreate readiness now verifies node
+  IDENTITY + BUILD, not just "any responding xpfd". Added
+  `_recreated_node_matches()` (pure identity+version predicate) and
+  `_node_cluster_node_id()` (reads /etc/xpf/node-id) in
+  `scripts/deploy/xpf-deploy.py`; rewired `cmd_image_roll`'s post-recreate
+  poll to require live `xpf-version` == the AUTHENTICATED manifest's
+  xpf-version AND /etc/xpf/node-id == the assigned cluster node-id before
+  treating the node as "back". Fails CLOSED with the never-both-down leases
+  HELD on a stale-alias / old-image / wrong-node-id recreate; existing
+  retry/timeout preserved. Added
+  `scripts/deploy/test_xpf_deploy_image_roll_identity.py` (12 tests, RED on
+  revert: wrong-build + wrong-node-id recreations accepted by the old code).
+  Updated the LANE-2 image-roll section of docs/in-place-upgrade.md.
+  Validation: `python3 -m py_compile scripts/deploy/xpf-deploy.py` clean;
+  `bash scripts/run-selftests.sh` green (38 passed, 0 failed).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_image_roll_identity.py,
+  docs/in-place-upgrade.md, _Log.md
