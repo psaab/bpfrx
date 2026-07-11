@@ -45992,3 +45992,17 @@ top.
   pkg/dataplane/userspace/policies.go,
   pkg/dataplane/userspace/policies_lower.go,
   pkg/dataplane/userspace/lenient_permit_widening_5575_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5571 — bound the DDNS ownership-state read before loading it all
+  into memory (CWE-770). Added `readBoundedStateFile` (os.Stat pre-check +
+  io.LimitReader(maxDDNSStateBytes+1) sentinel) and the derived cap constants
+  `maxDDNSStateRecords`/`maxDDNSStateRecordBytes`/`maxDDNSStateBytes` (~128 MiB)
+  plus the `errDDNSStateTooLarge` sentinel (wraps errDDNSStateCorrupt) so an
+  over-bound file engages the existing fail-closed quarantine + durable
+  `.degraded` marker posture. `loadDDNSState` now reads via the bounded helper.
+  Added fail-on-revert tests (sparse oversized file rejected by the size bound;
+  end-to-end degrade/quarantine; normal file still loads; missing = not-exist).
+  Updated pkg/ddns/README.md size-bound contract. RED-on-revert verified.
+  **File(s)**: pkg/ddns/state.go, pkg/ddns/state_readbound_5571_test.go,
+  pkg/ddns/README.md, _Log.md
