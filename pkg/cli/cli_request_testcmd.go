@@ -58,6 +58,7 @@ func (c *CLI) testPolicy(args []string) error {
 	fromZone, toZone, srcIP, dstIP, proto := sel.FromZone, sel.ToZone, sel.SrcIP, sel.DstIP, sel.Protocol
 	srcPort, dstPort := sel.SrcPort, sel.DstPort
 	icmpType, icmpCode := sel.ICMPType, sel.ICMPCode
+	nonFirstFrag := sel.NonFirstFragment
 
 	if fromZone == "" || toZone == "" {
 		// #3628: shared SSOT selector list (policymatch) so the advertised
@@ -81,16 +82,19 @@ func (c *CLI) testPolicy(args []string) error {
 	// simulators and the AF_XDP helper. Nil (CLI outside the daemon) keeps the
 	// pre-#3105 static-only behavior.
 	res := policymatch.Match(cfg, policymatch.Query{
-		FromZone:    fromZone,
-		ToZone:      toZone,
-		SrcIP:       parsedSrc,
-		DstIP:       parsedDst,
-		Protocol:    proto,
-		SrcPort:     srcPort,
-		DstPort:     dstPort,
-		ICMPType:    icmpType,
-		ICMPCode:    icmpCode,
-		FeedOverlay: c.feedOverlay(),
+		FromZone: fromZone,
+		ToZone:   toZone,
+		SrcIP:    parsedSrc,
+		DstIP:    parsedDst,
+		Protocol: proto,
+		SrcPort:  srcPort,
+		DstPort:  dstPort,
+		ICMPType: icmpType,
+		ICMPCode: icmpCode,
+		// #5572: a non-first IP fragment (no L4 header) reproduces the #4569
+		// fragment-associated deny; false is a normal L4-present packet.
+		NonFirstFragment: nonFirstFrag,
+		FeedOverlay:      c.feedOverlay(),
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
 		PolicyInactiveFn: c.policyInactiveFn(),
@@ -116,6 +120,12 @@ func (c *CLI) testPolicy(args []string) error {
 	// dropped at route lookup before policy runs — surface the advisory so the
 	// `test policy` verdict below is not read as real forwarding.
 	if note := res.RouteDropNote(); note != "" {
+		fmt.Printf("  %s\n", note)
+	}
+	// #5572: a non-first fragment whose permit was overridden to an overlapping
+	// port-bearing deny — surface the advisory so the verdict below is not read
+	// as a first-fragment / exact-port match.
+	if note := res.FragmentDenyNote(); note != "" {
 		fmt.Printf("  %s\n", note)
 	}
 	if !res.Matched {

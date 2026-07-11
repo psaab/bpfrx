@@ -447,6 +447,10 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		Protocol:        sel.Protocol,
 		SourcePort:      int32(sel.SrcPort),
 		DestinationPort: int32(sel.DstPort),
+		// #5572: forward the non-first-fragment (l4_present == false)
+		// discriminator so the typed MatchPolicies RPC reproduces the #4569
+		// fragment-associated deny; false is a normal L4 packet.
+		NonFirstFragment: sel.NonFirstFragment,
 	}
 	if sel.ICMPType != nil {
 		u := uint32(*sel.ICMPType)
@@ -493,6 +497,12 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		fmt.Printf("    Destination addresses%s: %v\n", policymatch.ExceptSuffix(resp.GetDestinationAddressExcluded()), resp.DstAddresses)
 		fmt.Printf("    Applications: %v\n", resp.Applications)
 		fmt.Printf("    Action: %s\n", resp.Action)
+		// #5572: a non-first fragment whose permit was overridden to this
+		// overlapping port-bearing deny — explain the over-drop, mirroring the
+		// local CLI + REST surfaces.
+		if note := resp.GetFragmentDenyNote(); note != "" {
+			fmt.Printf("    %s\n", note)
+		}
 	} else if resp.HostInboundUnmatched {
 		// #3285: host-bound traffic — no transit global/default fallback.
 		// #3655: render the SSOT policymatch.HostInboundShowLine (as the local

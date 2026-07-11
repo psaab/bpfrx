@@ -208,14 +208,19 @@ const matchPoliciesUsageTail = ` from-zone <zone> to-zone <zone>
        [source-port <0-65535>] [destination-port <0-65535>]
        [protocol <name|number>]   tcp, udp, icmp, icmp6, gre, esp, ospf, ... or 0-255
        [icmp-type <0-255>] [icmp-code <0-255>]
+       [non-first-fragment]       simulate a non-first IP fragment (no L4 header)
        from-zone and to-zone are required; an omitted selector matches any.
        an unknown selector, or a selector given without a value, is an error
        (the query is not silently widened to match traffic you did not type).
+       non-first-fragment is the only valueless selector; it makes the simulator
+       reproduce the dataplane's fragment-associated deny (a port-bearing deny the
+       first fragment would hit denies the fragment too).
        examples:
          ... protocol tcp destination-port 443
          ... protocol udp source-port 53 destination-port 53
          ... protocol icmp icmp-type 8 icmp-code 0    (IPv4 echo request)
-         ... protocol icmp6 icmp-type 128             (IPv6 echo request)`
+         ... protocol icmp6 icmp-type 128             (IPv6 echo request)
+         ... protocol tcp non-first-fragment          (non-first TCP fragment)`
 
 // MatchPoliciesUsage is the full usage/help block printed by `show security
 // match-policies` when the required from-zone/to-zone selectors are missing
@@ -254,6 +259,38 @@ type Query struct {
 	// echo-reply, code 0 is common), which a plain int could not.
 	ICMPType *uint8
 	ICMPCode *uint8
+
+	// NonFirstFragment marks the query as a NON-FIRST IP fragment (#5572), the
+	// flowless / no-L4 packet shape the dataplane calls `l4_present == false`
+	// (policy.rs evaluate_policy_result_l3_aware, #3291/#4569). A non-first
+	// TCP/UDP fragment carries the datagram's post-IP bytes as PAYLOAD, not an L4
+	// header, so it has no readable ports (SrcPort/DstPort are meaningless — they
+	// are ignored) and no readable ICMP type/code. The default false is a normal
+	// L4-present packet, so every existing caller is byte-identical.
+	//
+	// When true the simulator reproduces the dataplane's #4569
+	// fragment-associated deny EXACTLY:
+	//
+	//   - a PORT-BEARING or ICMP-type-constrained application term fails closed
+	//     (matchApp with l4Present == false), regardless of any port value the
+	//     caller left in SrcPort/DstPort — a fragment cannot be classified into an
+	//     exact port, a port range (including a `0-1023` range that a naive port-0
+	//     query would spuriously match), or an ICMP type;
+	//   - a PROTOCOL-ONLY / `application any` term STILL matches on the L3 identity
+	//     + known IP protocol the fragment does carry;
+	//   - while walking rules in first-match precedence order, the FIRST
+	//     port-bearing DENY/REJECT whose L3 (zone fixed by the tier + src/dst
+	//     address) OVERLAPS the fragment but was SKIPPED only because its
+	//     L4-constrained term is inapplicable is remembered; if the walk then lands
+	//     on a PERMIT (a matched permit OR a default-permit) it is OVERRIDDEN to
+	//     that DENY (Result.FragmentAssociatedDeny), so the simulator reports the
+	//     same DROP + enforcing policy the dataplane applies rather than a
+	//     fabricated port-0 permit.
+	//
+	// This is the transit-path gate only; a `to-zone junos-host` fragment takes
+	// the host gate, which has no #4569 override (it still fails port-bearing
+	// terms closed). See the #4569 override in Match.
+	NonFirstFragment bool
 
 	// FeedOverlay is the dynamic-address feed-prefix overlay (#2049): an
 	// address-name -> union-of-live-feed-CIDR-strings map, the same shape the
@@ -313,6 +350,15 @@ type SelectorArgs struct {
 	DstPort  int    // 0 = unspecified
 	ICMPType *uint8 // nil = unspecified
 	ICMPCode *uint8 // nil = unspecified
+
+	// NonFirstFragment is the #5572 non-first-fragment / no-L4 discriminator.
+	// false (default) = a normal L4-present packet, unchanged for every existing
+	// query. true = the operator supplied the valueless `non-first-fragment`
+	// selector, so the simulator evaluates the flowless fragment path
+	// (l4_present == false) and reproduces the dataplane's #4569
+	// fragment-associated deny. It is the ONLY non-value-taking selector; it is
+	// still duplicate-checked like every other selector.
+	NonFirstFragment bool
 }
 
 // ParseSelectorArgs is the SINGLE strict grammar for the policy-simulator
@@ -466,6 +512,18 @@ func ParseSelectorArgs(args []string) (SelectorArgs, error) {
 				return SelectorArgs{}, fmt.Errorf("invalid icmp-code: %w", err)
 			}
 			s.ICMPCode = cc
+		case "non-first-fragment":
+			// #5572: the ONLY valueless selector — a non-first IP fragment
+			// (l4_present == false) is a packet SHAPE, not a value dimension, so
+			// it takes no following token. It is still duplicate-checked (a
+			// repeated `non-first-fragment non-first-fragment` is an error, the
+			// same fail-closed posture as every value-taking selector, #3709). It
+			// does NOT consume a value, so it must NOT route through takeValue.
+			if seen["non-first-fragment"] {
+				return SelectorArgs{}, fmt.Errorf("selector %q specified more than once", "non-first-fragment")
+			}
+			seen["non-first-fragment"] = true
+			s.NonFirstFragment = true
 		default:
 			return SelectorArgs{}, fmt.Errorf("unknown selector %q", args[i])
 		}
@@ -479,15 +537,16 @@ func ParseSelectorArgs(args []string) (SelectorArgs, error) {
 // non-empty value is already net.ParseIP-validated by ParseSelectorArgs.
 func (s SelectorArgs) Query() Query {
 	return Query{
-		FromZone: s.FromZone,
-		ToZone:   s.ToZone,
-		SrcIP:    net.ParseIP(s.SrcIP),
-		DstIP:    net.ParseIP(s.DstIP),
-		Protocol: s.Protocol,
-		SrcPort:  s.SrcPort,
-		DstPort:  s.DstPort,
-		ICMPType: s.ICMPType,
-		ICMPCode: s.ICMPCode,
+		FromZone:         s.FromZone,
+		ToZone:           s.ToZone,
+		SrcIP:            net.ParseIP(s.SrcIP),
+		DstIP:            net.ParseIP(s.DstIP),
+		Protocol:         s.Protocol,
+		SrcPort:          s.SrcPort,
+		DstPort:          s.DstPort,
+		ICMPType:         s.ICMPType,
+		ICMPCode:         s.ICMPCode,
+		NonFirstFragment: s.NonFirstFragment,
 	}
 }
 
@@ -653,6 +712,46 @@ type Result struct {
 	// set; empty otherwise. It feeds RouteDropNote so the operator sees WHICH
 	// class triggered the route-drop advisory.
 	RouteDropClass string
+
+	// FragmentAssociatedDeny is true when this verdict is a #5572 non-first
+	// fragment whose PERMIT (matched or default) was OVERRIDDEN to the DENY it
+	// skipped, reproducing the dataplane's #4569 fragment-associated deny. When
+	// set, the Result is attributed to the DENY policy (PolicyName / PolicyID /
+	// RuleID / Action name the enforcing deny), Matched is true, and Action is
+	// deny/reject. It is set ONLY for a Query with NonFirstFragment == true whose
+	// transit walk would otherwise have permitted; a fragment that a real
+	// (protocol-only / `any`) deny matched directly, or that permits with no
+	// overlapping skipped deny, does not carry it. Callers surface FragmentDenyNote
+	// so an operator reads WHY the fragment is denied (the security-over-
+	// availability over-drop) rather than mistaking it for a first-fragment deny.
+	FragmentAssociatedDeny bool
+}
+
+// FragmentDenyNotePrefix is the stable leading token of the fragment-associated
+// deny advisory (#5572), an SSOT so every match-policies surface shares one
+// wording and cannot drift. A caller renders FragmentDenyNote(), never a
+// hand-built string. Mirrors the RouteDropNotePrefix pattern.
+const FragmentDenyNotePrefix = "fragment-associated deny advisory:"
+
+// FragmentDenyNote returns the operator-facing advisory for a Result whose
+// PERMIT was overridden to a #4569 fragment-associated deny (#5572), or "" when
+// the Result carries no such override. It states plainly that the verdict is a
+// non-first fragment inheriting an overlapping port-bearing deny — the Junos
+// security-over-availability default — so an operator does not read the deny as a
+// first-fragment / exact-port match, and understands a plain L4 packet on the
+// same tuple may instead permit. Like RouteDropNote it is ADVISORY (it does not
+// alter the verdict) and mirrors that SSOT pattern so the surfaces stay in
+// lock-step.
+func (r Result) FragmentDenyNote() string {
+	if !r.FragmentAssociatedDeny {
+		return ""
+	}
+	return fmt.Sprintf("%s this is a NON-FIRST IP fragment (no L4 header, no ports); "+
+		"it is denied because it overlaps port-bearing deny policy %q, which the first "+
+		"fragment's real ports WOULD hit — Junos associates a non-first fragment with the "+
+		"first fragment's deny (a security-over-availability over-drop). A plain L4 packet "+
+		"on the same addresses/protocol may instead be permitted by a later rule.",
+		FragmentDenyNotePrefix, r.PolicyName)
 }
 
 // RouteDropNotePrefix is the stable leading token of the route-drop advisory
@@ -861,6 +960,33 @@ func Match(cfg *config.Config, q Query) (res Result) {
 		return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
 	}
 
+	// #5572: while walking the transit tiers in first-match precedence order,
+	// remember the FIRST port-bearing DENY/REJECT a non-first fragment SKIPPED
+	// (overlapping L3, L4-constrained term inapplicable), mirroring the
+	// dataplane's #4569 note_skipped_frag_deny. `matchOr` then reproduces
+	// apply_frag_deny_override: a matched PERMIT with an earlier skipped
+	// overlapping deny is OVERRIDDEN to that deny. For a normal (L4-present)
+	// query q.NonFirstFragment is false, so both are inert and the walk is
+	// byte-identical to before.
+	var fragDeny *fragDenyCandidate
+	noteFrag := func(pol *config.Policy, global bool, fromZone, toZone string, setIdx, sliceIdx int) {
+		if !q.NonFirstFragment || fragDeny != nil {
+			return
+		}
+		if isSkippedFragDeny(cfg, q, pol) {
+			fragDeny = &fragDenyCandidate{
+				pol: pol, global: global, fromZone: fromZone, toZone: toZone,
+				setIdx: setIdx, sliceIdx: sliceIdx,
+			}
+		}
+	}
+	matchOr := func(res Result) Result {
+		if q.NonFirstFragment && fragDeny != nil && res.Action == config.PolicyPermit {
+			return fragDenyResult(ids, *fragDeny)
+		}
+		return res
+	}
+
 	// Tier 1: exact zone-pair policies, in config order (first match wins).
 	// q.FromZone/q.ToZone are concrete zone names; a wildcard set
 	// (FromZone/ToZone == "any") never compares equal, so it is excluded here.
@@ -869,9 +995,13 @@ func Match(cfg *config.Config, q Query) (res Result) {
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return matchOr(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			}
+			noteFrag(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 
@@ -895,9 +1025,13 @@ func Match(cfg *config.Config, q Query) (res Result) {
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return matchOr(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			}
+			noteFrag(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 
@@ -907,9 +1041,13 @@ func Match(cfg *config.Config, q Query) (res Result) {
 			continue
 		}
 		for sliceIdx, pol := range zpp.Policies {
-			if pol != nil && ruleMatches(cfg, q, pol) {
-				return matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
+			if pol == nil {
+				continue
 			}
+			if ruleMatches(cfg, q, pol) {
+				return matchOr(matchedResult(ids, pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx))
+			}
+			noteFrag(pol, false, zpp.FromZone, zpp.ToZone, setIdx, sliceIdx)
 		}
 	}
 
@@ -927,20 +1065,29 @@ func Match(cfg *config.Config, q Query) (res Result) {
 			!globalScopeSetMatches(cfg, pol.Match.ToZones, q.ToZone) {
 			continue
 		}
+		// A global policy's scope is its `match from-zone`/`match to-zone` SET
+		// (empty = all zones), NOT the surrounding stanza. Report the CONCRETE
+		// flow zone the packet traversed (or "" for a wildcard side, rendered
+		// "any") so a multi-zone scope keeps a single concrete zone per column —
+		// never a joined label (#3331/#3148/#4626 A10).
+		gFrom := reportedScopeZone(pol.Match.FromZones, q.FromZone)
+		gTo := reportedScopeZone(pol.Match.ToZones, q.ToZone)
 		if ruleMatches(cfg, q, pol) {
-			// A global policy's scope is its `match from-zone`/`match to-zone`
-			// SET (empty = all zones), NOT the surrounding stanza. Report the
-			// CONCRETE flow zone the packet traversed (or "" for a wildcard side,
-			// rendered "any") so a multi-zone scope keeps a single concrete zone
-			// per column — never a joined label (#3331/#3148/#4626 A10).
-			return matchedResult(ids, pol, true,
-				reportedScopeZone(pol.Match.FromZones, q.FromZone),
-				reportedScopeZone(pol.Match.ToZones, q.ToZone),
-				globalSetIdx, sliceIdx)
+			return matchOr(matchedResult(ids, pol, true, gFrom, gTo, globalSetIdx, sliceIdx))
 		}
+		noteFrag(pol, true, gFrom, gTo, globalSetIdx, sliceIdx)
 	}
 
 	// Tier 5: configured default-policy (NOT a hard-coded deny).
+	//
+	// #5572: a flowless fragment that reaches the implicit default still fails
+	// closed against an overlapping port-bearing DENY it skipped when the default
+	// is PERMIT — mirroring the dataplane's post-walk #4569 override. A
+	// default-DENY/REJECT already drops, so the override only matters for
+	// default-permit; when no deny was skipped this is inert.
+	if q.NonFirstFragment && fragDeny != nil && cfg.Security.DefaultPolicy == config.PolicyPermit {
+		return fragDenyResult(ids, *fragDeny)
+	}
 	return Result{DefaultUsed: true, Action: cfg.Security.DefaultPolicy}
 }
 
@@ -1213,7 +1360,12 @@ func ruleMatches(cfg *config.Config, q Query, pol *config.Policy) bool {
 	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP) {
 		return false
 	}
-	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort, q.ICMPType, q.ICMPCode)
+	// #5572: a non-first fragment is flowless (l4_present == false) — port-bearing
+	// and ICMP-type-constrained application terms then fail closed, while
+	// protocol-only / `any` terms still match on the L3 identity + known protocol
+	// the fragment carries. The default (NonFirstFragment == false) passes
+	// l4Present == true, so the existing L4 path is byte-identical.
+	return matchApp(cfg, pol.Match.Applications, q.Protocol, q.SrcPort, q.DstPort, q.ICMPType, q.ICMPCode, !q.NonFirstFragment)
 }
 
 // matchAddr replicates policy.rs try_match_rule's per-side address logic
@@ -1492,7 +1644,13 @@ func policyContentRejectionReasons(cfg *config.Config, feedOverlay map[string][]
 	return dpuserspace.PolicyContentRejectionReasons(cfg, feedOverlay)
 }
 
-func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
+// #5572: l4Present is false for a NON-FIRST fragment (the dataplane's
+// evaluate_policy_result_l3_aware l4_present == false, #3291). It fails closed a
+// PORT-BEARING or ICMP-type-constrained term (which a fragment cannot be
+// classified into) while a protocol-only / `any` term still matches on the known
+// IP protocol — a direct mirror of CompiledApplications::matches. Every ordinary
+// (L4-present) caller passes true, so the L4 path is byte-identical.
+func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort int, icmpType, icmpCode *uint8, l4Present bool) bool {
 	if len(apps) == 0 {
 		return true
 	}
@@ -1518,20 +1676,20 @@ func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort 
 				continue
 			}
 			for _, m := range members {
-				if matchSingleApp(cfg, m, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode) {
+				if matchSingleApp(cfg, m, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode, l4Present) {
 					return true
 				}
 			}
 			continue
 		}
-		if matchSingleApp(cfg, a, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode) {
+		if matchSingleApp(cfg, a, queryProto, queryProtoOK, srcPort, dstPort, icmpType, icmpCode, l4Present) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryProtoOK bool, srcPort, dstPort int, icmpType, icmpCode *uint8) bool {
+func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryProtoOK bool, srcPort, dstPort int, icmpType, icmpCode *uint8, l4Present bool) bool {
 	app, ok := config.ResolveApplication(appName, cfg.Applications.Applications)
 	if !ok {
 		return false
@@ -1571,6 +1729,14 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	// ICMP type constraint (junos-icmp-all, or any non-ICMP app) is unaffected:
 	// it matches on protocol/ports alone, exactly as before.
 	if app.ICMPType != nil {
+		// #5572: a non-first fragment (l4Present == false) carries no readable
+		// ICMP type/code — the dataplane's packet_icmp is None there — so an
+		// ICMP-type-constrained term fails closed regardless of any type the
+		// caller left in the query. Mirrors CompiledApplications::matches, which
+		// only consults icmp_constraints when packet_icmp is Some.
+		if !l4Present {
+			return false
+		}
 		// The dataplane keys icmp_constraints under the app's ICMP protocol, so
 		// the type constraint is only ever consulted for an ICMP-family packet.
 		// A predefined ICMP app pins app.Protocol (handled by the check above),
@@ -1598,6 +1764,14 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	// would hit (sibling of #3323's protocol omission). An UNCONSTRAINED dst
 	// port term (app.DestinationPort == "") still matches any port, unchanged.
 	if app.DestinationPort != "" {
+		// #5572: a non-first fragment (l4Present == false) has no L4 header, so a
+		// destination-port term fails closed unconditionally — even a term like
+		// `destination-port 0-1023` that a naive port-0 query would spuriously
+		// match. This is the exact port-gate the dataplane's matches() applies
+		// (exact_dst_ports / range_terms are consulted only when l4_present).
+		if !l4Present {
+			return false
+		}
 		if dstPort <= 0 || !portMatches(app.DestinationPort, dstPort) {
 			return false
 		}
@@ -1622,9 +1796,141 @@ func matchSingleApp(cfg *config.Config, appName string, queryProto uint8, queryP
 	// (no source-port constraint) is unaffected, so a query omitting source port
 	// against an ordinary destination-port app behaves exactly as before.
 	if app.SourcePort != "" {
+		// #5572: a non-first fragment has no L4 header — a source-port term fails
+		// closed unconditionally, the source-side sibling of the destination-port
+		// gate above.
+		if !l4Present {
+			return false
+		}
 		if srcPort <= 0 || !portMatches(app.SourcePort, srcPort) {
 			return false
 		}
+	}
+	return true
+}
+
+// hasL4ConstrainedTerm reports whether the policy's application list carries at
+// least one term FOR the query protocol whose match is GATED by L4 presence —
+// an exact destination-port, a port RANGE, a source-port constraint, or an
+// ICMP/ICMPv6 type constraint (#5572). It is the exact mirror of the dataplane's
+// CompiledApplications::has_l4_constrained_term (policy.rs #4569): the
+// discriminator that tells a DENY skipped for a flowless fragment ONLY because
+// its L4-constrained term is inapplicable (→ fail the fragment closed) from a
+// DENY that genuinely does not apply to this protocol at all (→ let the fragment
+// proceed). An `application any` (match-any) or a protocol-only term is NOT
+// gated, so those return false.
+func hasL4ConstrainedTerm(cfg *config.Config, apps []string, proto string) bool {
+	queryProto, ok := appid.ProtocolNumber(proto)
+	if !ok {
+		return false
+	}
+	for _, a := range apps {
+		if a == "any" {
+			// match-any covers this protocol with an ungated term.
+			return false
+		}
+		if _, isSet := cfg.Applications.ApplicationSets[a]; isSet {
+			members, err := config.ExpandApplicationSet(a, &cfg.Applications)
+			if err != nil {
+				continue
+			}
+			for _, m := range members {
+				if appTermL4Constrained(cfg, m, queryProto) {
+					return true
+				}
+			}
+			continue
+		}
+		if appTermL4Constrained(cfg, a, queryProto) {
+			return true
+		}
+	}
+	return false
+}
+
+// appTermL4Constrained reports whether a single application resolves to a term
+// FOR queryProto that is port- or ICMP-type-constrained (#5572). A term for a
+// different protocol does not count (the dataplane keys terms by protocol, so a
+// tcp-only deny is not "L4-constrained" for a udp fragment).
+func appTermL4Constrained(cfg *config.Config, appName string, queryProto uint8) bool {
+	app, ok := config.ResolveApplication(appName, cfg.Applications.Applications)
+	if !ok {
+		return false
+	}
+	appProto, appOK := appid.ProtocolNumber(app.Protocol)
+	if !appOK || appProto != queryProto {
+		return false
+	}
+	return app.DestinationPort != "" || app.SourcePort != "" || app.ICMPType != nil
+}
+
+// fragDenyCandidate remembers the FIRST port-bearing DENY/REJECT a non-first
+// fragment skipped while walking the transit tiers (#5572), enough to rebuild the
+// full matchedResult so the fragment-associated deny verdict names the ENFORCING
+// policy (PolicyName / PolicyID / RuleID / scope), not just a bare drop. The
+// dataplane's SkippedFragDeny carries only policy_id + counter (it attributes a
+// wire PolicyDeny event); the simulator's operator-facing verdict must carry the
+// full identity, so it stores the tier coordinates matchedResult keys on.
+type fragDenyCandidate struct {
+	pol      *config.Policy
+	global   bool
+	fromZone string
+	toZone   string
+	setIdx   int
+	sliceIdx int
+}
+
+// fragDenyResult builds the #5572 fragment-associated deny verdict from a skipped
+// candidate: the DENY policy's full matchedResult, flagged FragmentAssociatedDeny
+// so callers render FragmentDenyNote. Action is the deny/reject the policy
+// carries, mirroring the dataplane's frag_associated_deny_result attribution.
+func fragDenyResult(ids map[[2]uint32]uint32, c fragDenyCandidate) Result {
+	r := matchedResult(ids, c.pol, c.global, c.fromZone, c.toZone, c.setIdx, c.sliceIdx)
+	r.FragmentAssociatedDeny = true
+	return r
+}
+
+// isSkippedFragDeny mirrors the dataplane's rule_is_skipped_frag_ambiguous_deny
+// (policy.rs #4569): is pol a port-bearing (L4-constrained) DENY/REJECT that a
+// flowless non-first fragment SKIPPED only because l4_present == false, and whose
+// L3 (source + destination address — the zone side is already fixed by the tier
+// the caller is walking) OVERLAPS the fragment? Only such a deny is remembered so
+// a later PERMIT can be failed closed. Returns true iff ALL hold:
+//   - the policy is scheduler-active (mirrors rule.inactive);
+//   - its action is deny or reject (a permit is not a fail-open risk);
+//   - it carries an L4-constrained term for the fragment's protocol
+//     (hasL4ConstrainedTerm) — a term the fragment cannot be classified into,
+//     not a rule for a different protocol;
+//   - it does NOT already match this flowless fragment (a protocol-only / `any`
+//     deny term matches directly and is a real deny, never "skipped");
+//   - its source+destination address set overlaps the fragment.
+//
+// A non-overlapping deny, a different-protocol deny, or a permit therefore leaves
+// the fragment on its normal (forward) path.
+func isSkippedFragDeny(cfg *config.Config, q Query, pol *config.Policy) bool {
+	if q.PolicyInactiveFn != nil && q.PolicyInactiveFn(pol.SchedulerName) {
+		return false
+	}
+	if pol.Action != config.PolicyDeny && pol.Action != config.PolicyReject {
+		return false
+	}
+	if !hasL4ConstrainedTerm(cfg, pol.Match.Applications, q.Protocol) {
+		return false
+	}
+	// A protocol-only / `any` term would match flowlessly → the rule is a real
+	// deny handled directly by the tier walk, not a skip. Fail-closed ports pass
+	// 0 and l4Present == false so port/icmp terms cannot match.
+	if matchApp(cfg, pol.Match.Applications, q.Protocol, 0, 0, nil, nil, false) {
+		return false
+	}
+	// L3 overlap: the zone is fixed by the tier bucket, so only source +
+	// destination address overlap is checked (the same matchAddr the runtime uses
+	// via rule_l3_matches).
+	if !matchAddr(cfg, q.FeedOverlay, pol.Match.SourceAddresses, pol.Match.SourceAddressExcluded, q.SrcIP) {
+		return false
+	}
+	if !matchAddr(cfg, q.FeedOverlay, pol.Match.DestinationAddresses, pol.Match.DestinationAddressExcluded, q.DstIP) {
+		return false
 	}
 	return true
 }

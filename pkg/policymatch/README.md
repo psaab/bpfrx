@@ -428,6 +428,70 @@ no-over-report control).
 
 Where the runtime and the old simulators disagreed, the runtime wins.
 
+## Non-first fragment / fragment-associated deny (#5572)
+
+`Query.NonFirstFragment` marks the query as a NON-FIRST IP fragment — the
+dataplane's flowless / no-L4 packet shape (`evaluate_policy_result_l3_aware`
+`l4_present == false`, #3291/#4569). A non-first TCP/UDP fragment carries the
+datagram's post-IP bytes as PAYLOAD, not an L4 header, so `SrcPort`/`DstPort`
+are meaningless (ignored) and there is no readable ICMP type/code. The default
+`false` is a normal L4-present packet, so every existing caller is unchanged.
+
+Before #5572 the simulator had no fragment discriminator: a non-first fragment
+could only be expressed as ports `0`, which `Match` evaluated as a real port-0
+packet. In an ordered `deny junos-https` (TCP/443) then `permit any` vector it
+skipped the port-bearing deny at the port gate, fell through to the later
+permit, and reported PERMIT — while the DATAPLANE applied the #4569
+fragment-associated deny and dropped the fragment. The oracle contradicted the
+live firewall on exactly the traffic an operator debugs during an incident,
+hiding the enforcing policy id.
+
+With `NonFirstFragment == true`, `Match` reproduces the dataplane's #4569
+override EXACTLY:
+
+- `matchApp` (via the threaded `l4Present == false`) fails a PORT-BEARING or
+  ICMP-type-constrained application term closed regardless of any port value —
+  even a `destination-port 0-1023` range a naive port-0 query would spuriously
+  match — while a PROTOCOL-ONLY / `application any` term still matches on the L3
+  identity + known IP protocol the fragment carries (mirror of
+  `CompiledApplications::matches`);
+- while walking the transit tiers in first-match precedence order,
+  `isSkippedFragDeny` (the mirror of `rule_is_skipped_frag_ambiguous_deny`)
+  remembers the FIRST port-bearing DENY/REJECT whose L4-constrained term is
+  inapplicable to the fragment (`hasL4ConstrainedTerm`), that does NOT match
+  flowlessly, and whose source+destination ADDRESS overlaps the fragment (the
+  zone is fixed by the tier);
+- if the walk then lands on a PERMIT — a matched permit OR a default-permit —
+  `matchOr` / the default arm OVERRIDE it to that deny
+  (`Result.FragmentAssociatedDeny`, attributed to the enforcing policy so
+  `PolicyName`/`PolicyID`/`RuleID`/`Action` name the real deny), and
+  `Result.FragmentDenyNote()` renders the SSOT over-drop advisory.
+
+Scoped narrowly, mirroring the dataplane: a fragment a real (protocol-only /
+`any`) deny matches directly is a normal deny (not flagged as an override); a
+deny for a DIFFERENT protocol (`hasL4ConstrainedTerm` false) or a
+NON-overlapping source/destination leaves the fragment on its forward path. The
+transit path only carries the override — a `to-zone junos-host` fragment takes
+the host gate, which has no #4569 override (it still fails port-bearing terms
+closed).
+
+Every operator surface threads the discriminator: the valueless
+`non-first-fragment` CLI selector (local + remote `show security match-policies`
+/ `test policy`, via `ParseSelectorArgs`), the gRPC `MatchPolicies` RPC
+`non_first_fragment` field, the gRPC `test-policy:` bridge `frag=1` token, and
+the REST `non_first_fragment` query parameter. The verdict + advisory ride the
+gRPC `MatchPoliciesResponse` (`fragment_associated_deny`/`fragment_deny_note`)
+and REST `MatchPoliciesResult` so remote clients explain the over-drop
+identically to the local CLI.
+
+The fail-on-revert artifacts are in `fragment_5572_test.go` (the fixture is the
+issue's `deny junos-https` then `permit any`, IPv4 + IPv6): reverting the
+discriminator makes the fragment query report `permit-all` and fails the
+want-deny assertion, catching the exact simulator-vs-dataplane divergence. The
+dataplane reference is `userspace-dp/src/policy.rs` (`note_skipped_frag_deny` /
+`apply_frag_deny_override` / `rule_is_skipped_frag_ambiguous_deny` /
+`has_l4_constrained_term`) pinned in `userspace-dp/src/policy_tests.rs` (#4569).
+
 ## Not modeled
 
 Scheduler-driven policy `inactive` state is not applied — a scheduled policy is
