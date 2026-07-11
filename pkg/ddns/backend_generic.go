@@ -72,7 +72,22 @@ func newGenericBackend(p *config.DDNSProvider, client *http.Client) (*genericBac
 	}
 	ok := defaultGenericOKTokens
 	if s := strings.TrimSpace(p.OKResponse); s != "" {
-		ok = []string{strings.ToLower(s)}
+		// Split a configured ok-response into WHOLE TOKENS, not one
+		// space-joined element (#5557 / claude-review-003 A10). matchesGenericOK
+		// does whole-token matching (#2838): a success token must equal a
+		// trimmed response line or be the leading whitespace-delimited field of
+		// a line — it never sees a token as a raw substring. A single element
+		// carrying an embedded space (e.g. "good nochg") therefore can only
+		// match a response line that is EXACTLY "good nochg"; its first-field
+		// path is dead (a first field never contains a space), so a dyndns2-shape
+		// body like "good nochg 1.2.3.4" is never recognized and every update is
+		// treated as failed → error spam + backoff → DNS goes stale. Tokenizing
+		// on whitespace makes each configured word a matchable whole token,
+		// exactly like the single-token defaultGenericOKTokens set. Semantics are
+		// unchanged: the matcher is ANY-token (OR), so any configured word being
+		// present as a whole token/leading field signals success. strings.Fields
+		// yields at least one element here (s is non-empty after TrimSpace).
+		ok = strings.Fields(strings.ToLower(s))
 	}
 	// Bind the dial to the configured source-address/interface/VRF (#2846).
 	client, err := ensureProviderHTTPClient(p, client)
