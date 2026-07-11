@@ -235,24 +235,34 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				pr.Applications = []string{}
 			}
 
-			if (statsEnabled || rule.Count) && readPolicy != nil {
-				// #3474: the counter read handle MUST use the RAW slice index i,
-				// not len(pi.Rules) (the compacted, nil-skipped count). The
-				// resolver (policyRuleIDForCounter) and every other caller —
-				// metrics_counters.go's policyCounterID(policySetID, i),
-				// cli_show_security*.go, server_show_policies_text.go, and this
-				// function's OWN global-policy loop below (+ uint32(i)) — key off
-				// the raw slice index. With a nil rule before a real rule
-				// len(pi.Rules) would lag i and mis-resolve this rule's counter;
-				// using i keeps every counter handle on the one raw-slice-index
-				// SSOT. (Nil rules are not reachable via any production config
-				// path today; this is defensive SSOT-alignment, like #3476/#3494.)
-				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				if ctrs, err := readPolicy(policyID); err == nil {
-					pr.HitPackets = ctrs.Packets
-					pr.HitBytes = ctrs.Bytes
-				} else if readErr == nil {
-					readErr = err
+			if statsEnabled || rule.Count {
+				if readPolicy != nil {
+					// #3474: the counter read handle MUST use the RAW slice
+					// index i, not len(pi.Rules) (the compacted, nil-skipped
+					// count). The resolver (policyRuleIDForCounter) and every
+					// other caller — metrics_counters.go's
+					// policyCounterID(policySetID, i), cli_show_security*.go,
+					// server_show_policies_text.go, and this function's OWN
+					// global-policy loop below (+ uint32(i)) — key off the raw
+					// slice index. With a nil rule before a real rule
+					// len(pi.Rules) would lag i and mis-resolve this rule's
+					// counter; using i keeps every counter handle on the one
+					// raw-slice-index SSOT. (Nil rules are not reachable via any
+					// production config path today; this is defensive
+					// SSOT-alignment, like #3476/#3494.)
+					policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+					if ctrs, err := readPolicy(policyID); err == nil {
+						pr.HitPackets = ctrs.Packets
+						pr.HitBytes = ctrs.Bytes
+					} else if readErr == nil {
+						readErr = err
+					}
+				} else {
+					// #5580: the rule is counter-eligible but no runtime counter
+					// source exists (dataplane unloaded — readPolicy was not
+					// built). Mark the 0/0 counts non-authoritative so a monitor
+					// does not read them as "rule matched no traffic".
+					pr.HitCountersUnavailable = true
 				}
 			}
 			pi.Rules = append(pi.Rules, pr)
@@ -326,13 +336,19 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 				pr.Applications = []string{}
 			}
 
-			if (statsEnabled || rule.Count) && readPolicy != nil {
-				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-				if ctrs, err := readPolicy(policyID); err == nil {
-					pr.HitPackets = ctrs.Packets
-					pr.HitBytes = ctrs.Bytes
-				} else if readErr == nil {
-					readErr = err
+			if statsEnabled || rule.Count {
+				if readPolicy != nil {
+					policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+					if ctrs, err := readPolicy(policyID); err == nil {
+						pr.HitPackets = ctrs.Packets
+						pr.HitBytes = ctrs.Bytes
+					} else if readErr == nil {
+						readErr = err
+					}
+				} else {
+					// #5580: counter-eligible global rule, dataplane unloaded —
+					// mark the zero counts non-authoritative (see zone-pair loop).
+					pr.HitCountersUnavailable = true
 				}
 			}
 			pi.Rules = append(pi.Rules, pr)
@@ -376,12 +392,21 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 		// implies the dataplane is loaded (built above under that guard); the
 		// bulk snapshot already includes the DefaultPolicySentinelID handle
 		// (ReadAllPolicyCounters puts it), so the value is identical.
-		if statsEnabled && readPolicy != nil {
-			if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
-				defRule.HitPackets = ctrs.Packets
-				defRule.HitBytes = ctrs.Bytes
-			} else if readErr == nil {
-				readErr = err
+		if statsEnabled {
+			if readPolicy != nil {
+				if ctrs, err := readPolicy(dataplane.DefaultPolicySentinelID); err == nil {
+					defRule.HitPackets = ctrs.Packets
+					defRule.HitBytes = ctrs.Bytes
+				} else if readErr == nil {
+					readErr = err
+				}
+			} else {
+				// #5580: the implicit default-policy row is counter-eligible
+				// whenever system-wide policy-stats is on; with the dataplane
+				// unloaded there is no counter source, so its 0/0 is not
+				// authoritative. (The default row has no `then count`, so
+				// eligibility gates on statsEnabled alone.)
+				defRule.HitCountersUnavailable = true
 			}
 		}
 		result = append(result, PolicyInfo{

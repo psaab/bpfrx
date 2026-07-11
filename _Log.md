@@ -46089,3 +46089,26 @@ top.
   policymatch/cmd-cli/grpcapi/api green; gofmt -w.
   **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/README.md,
   pkg/policymatch/fragment_5572_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11 (fix/5580-rest-counter-availability)
+- **Action**: #5580 — add a hit-counter availability discriminator to the REST
+  security-policies inventory so a monitor can tell a real idle 0 from "no
+  counter source". Added `PolicyRule.HitCountersUnavailable bool`
+  (`json:"hit_counters_unavailable,omitempty"`) in pkg/api/types.go, following
+  the InterfaceStats.Unavailable (#3464) / HostInboundKernelDeniesUnavailable
+  (#3681) idiom + #3345 "counter-unavailable != zero" contract. In
+  policiesHandler the three counter-read sites (zone-pair rules, global rules,
+  implicit default-policy row) now set the flag when a rule is counter-ELIGIBLE
+  (`policy-stats` on OR `then count`; default row gates on `policy-stats`) but
+  `readPolicy == nil` (dataplane UNLOADED). A NOT-counter-enabled rule
+  (Count=false, stats off) stays flag-omitted — a legitimate honest zero,
+  distinct from counter-enabled-but-source-unavailable. Loaded read FAILURE is
+  still HTTP 500 (#3408), never this in-body flag. HTTP stays 200. Response
+  schema is documented in-code (Go struct doc comment) matching the #3464/#3681
+  precedent — no separate markdown API schema doc exists to update. Added 3
+  fail-on-revert tests (unloaded/system-wide, unloaded/then-count-only,
+  loaded). RED-on-revert PROVEN: stashing only security.go (keeping the struct
+  field) makes the two unloaded tests fail — eligible rules return 0/0 with the
+  flag false. Gates: go build ./... + go test ./pkg/api/... green; gofmt -w.
+- **File(s)**: pkg/api/types.go, pkg/api/security.go,
+  pkg/api/security_policy_counter_availability_5580_test.go, _Log.md
