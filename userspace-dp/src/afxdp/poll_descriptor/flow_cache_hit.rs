@@ -151,11 +151,16 @@ pub(super) fn stage_flow_cache_hit(
         if matches!(
             cached_decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
-        ) && matches!(packet_ttl_would_expire(raw_frame, meta), Some(true))
+        ) && matches!(packet_ttl_would_expire(packet_frame, meta), Some(true))
         {
-            // #1145: reuse the line-50 raw_frame bind instead of re-slicing.
+            // #5140: the TTL/hop-limit test + the embedded original in the
+            // generated Time Exceeded read the INNER packet via `packet_frame`
+            // (decapped frame post native-GRE, else `raw_frame`); `meta.l3_offset`
+            // is inner-relative after `stage_native_gre_decap`, so the outer
+            // `raw_frame` would test the wrong TTL byte. `desc` is still passed to
+            // recycle the outer UMEM slot (the reply is a freshly built frame).
             if let Some(request) = build_local_time_exceeded_request(
-                raw_frame,
+                packet_frame,
                 desc,
                 meta,
                 &worker_ctx.ident,

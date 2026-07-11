@@ -383,6 +383,60 @@ The **Routing-Present (`R`) bit stays a drop** — the Source Route Entry
 list is variable-length with no fixed offset and is effectively dead on
 the modern Internet; parsing it is out of scope.
 
+### 6d. Post-Decap Single-Authoritative-Buffer Invariant (#5140)
+
+`stage_native_gre_decap` returns a **synthetic inner frame** (a fresh
+`owned_packet_frame: Vec<u8>` = 14-byte synthetic Ethernet + inner
+packet) together with an inner meta whose `l3_offset`/`l4_offset` are
+**inner-relative** (`l3_offset = 14`, `l4_offset = 14 + inner IHL`). The
+original `raw_frame` (the UMEM slice for `desc`) stays the **outer**
+encapsulated frame. The worker binds
+
+```
+let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+```
+
+so `packet_frame` is the inner frame after a GRE decap and the live
+`raw_frame` otherwise. **After decap, `meta` offsets are authoritative
+ONLY against `packet_frame`.** Indexing the outer `raw_frame` with an
+inner-relative offset reads the wrong bytes.
+
+This bites hardest on an UNTAGGED underlay: the inner `l4_offset`
+(`14 + 20 = 34` for a 20-byte inner IPv4 header) lands EXACTLY on the
+outer GRE flags byte (`eth 14 + outer IP 20 = 34`). The GRE flags low
+bits (Recur / reserved) are attacker-controllable and ignored by the
+decap parser (only C/R/K/S/version are checked), so `raw_frame[34]` is an
+attacker-seeded byte. Reading it as an "ICMP type" can misclassify an
+ordinary inner ICMP echo (type 8) as an exempt error/PMTUD control
+message — bypassing the host-inbound admission gate on a ping-less zone
+(`is_icmp_host_inbound_global_accept`, #3171) or the `allow-embedded-icmp`
+policy-check exemption.
+
+The rule, enforced in `poll_descriptor/mod.rs` +
+`poll_descriptor/flow_cache_hit.rs`: every post-decap INNER read uses
+`packet_frame` —
+
+- the host-inbound / lo0 ICMP-type byte (session-hit + session-miss),
+- the `is_embedded_icmp_error` ICMP-type classification,
+- the TTL/hop-limit test + generated Time Exceeded
+  (`packet_ttl_would_expire` / `build_local_time_exceeded_request`, in
+  the session-hit, session-miss, AND flow-cache-hit paths).
+
+`raw_frame` is retained ONLY for genuinely outer/live reads: source-MAC
+neighbour learning (`learn_from_live_frame` is gated on
+`owned_packet_frame.is_none()`), the `pending_neigh_flow_key` buffer
+(also `owned_packet_frame.is_none()`-guarded), the debug-log wire-vs-meta
+diagnostic, and the embedded-ICMP-NAT match/build pair
+(`try_embedded_icmp_nat_match` reads the outer UMEM via `desc`, so its
+sibling `build_nat_reversed_icmp_error_*` MUST stay on the same outer
+buffer — for a GRE inner the outer bytes at the inner offset do not parse
+as a matching ICMP error, so that path is inert on decap rather than
+mis-firing). Fail-on-revert coverage:
+`gre_decap_inner_icmp_echo_denied_by_host_inbound_reads_inner_type` drives
+a real GRE-tunnelled inner echo through `poll_binding_process_descriptor`
+and asserts the host-inbound DENY that only the `packet_frame` read
+produces.
+
 ## Policy-Based Routing Without A Tunnel Netdevice
 
 This is the most important control-plane question.
