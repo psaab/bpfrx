@@ -61,6 +61,15 @@ const (
 //     to — the exact leak #4576 closes
 //   - *.conf                    — the live config + rescue.conf (pre-#4576 set)
 //   - rollback*                 — legacy rollback naming (pre-#4576 set)
+//   - .<base>.tmp-*             — fsatomic crash-leaked write temps (#5475): a
+//     daemon killed between fsatomic's CreateTemp and its rename leaves a
+//     ".<base>.tmp-<rand>" file (pkg/fsatomic createTemp) still holding the FULL
+//     cleartext config text it was mid-writing (xpf.conf / rescue.conf / a
+//     rollback slot). fsatomic self-heals a leaked temp on the NEXT write to
+//     that base, but a factory reset + reboot means there is no next write, so
+//     the temp — and its secrets — would otherwise survive. Temps inside
+//     .configdb / tls are already erased by the RemoveAll calls above; only
+//     TOP-LEVEL configDir temps needed this sweep.
 //   - .config.journal[.N]       — the JSONL audit journal + rotated segments
 //     (0644, prior-tenant commit history/comments; legacy v1 fat lines may
 //     carry full config incl. secrets). This SUPERSEDES the #4108 "journal
@@ -133,7 +142,8 @@ func zeroizeConfigDir(configDir, configBase string) error {
 			strings.HasPrefix(name, "rollback") ||
 			name == ".config.journal" ||
 			strings.HasPrefix(name, ".config.journal.") ||
-			isTextRollbackFile(name, configBase) {
+			isTextRollbackFile(name, configBase) ||
+			isFsatomicTemp(name) {
 			fail(os.Remove(filepath.Join(configDir, name)))
 		}
 	}
@@ -164,6 +174,24 @@ func isTextRollbackFile(name, configBase string) bool {
 		}
 	}
 	return true
+}
+
+// isFsatomicTemp reports whether name is a crash-leaked fsatomic write temp —
+// the ".<base>.tmp-<random>" shape pkg/fsatomic gives every temp it creates
+// before the atomic rename (fsatomic.go createTemp: `"."+base+".tmp-"`). A
+// daemon killed between CreateTemp and the rename leaves one behind still
+// holding the FULL cleartext config text it was mid-writing (xpf.conf /
+// rescue.conf / a numbered rollback slot with IKE PSKs, WireGuard keys, SNMP
+// communities), and after a factory reset + reboot there is no next write to
+// that base to self-heal it (#5475). The glob is the exact one the configstore
+// NewDB sweep uses inside .configdb (configstore/db.go) — KEEP IN SYNC with
+// fsatomic's temp naming and the sibling configstore.FactoryResetConfigDir
+// sweep. It is intentionally narrow: only a dotfile that contains ".tmp-"
+// matches, so legitimate dotfiles (.config.journal, .config.journal.N) are left
+// for their own rules. The pattern is a constant, so Match never errors.
+func isFsatomicTemp(name string) bool {
+	ok, _ := filepath.Match(".*.tmp-*", name)
+	return ok
 }
 
 // zeroizeRenderedConfigs erases the RENDERED service configs xpfd writes
