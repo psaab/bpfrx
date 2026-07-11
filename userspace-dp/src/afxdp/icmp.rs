@@ -181,18 +181,11 @@ pub(super) fn build_local_time_exceeded_request(
     if !can_generate_icmp_error_reply(frame, meta, forwarding) {
         return None;
     }
-    // #2472: per-reason token-bucket rate limit on the LOCALLY-GENERATED Time
-    // Exceeded. A TTL=1 / hop-limit=1 flood (a routing loop or a crafted
-    // low-TTL stream) would otherwise emit one generated ICMP error per
-    // trigger packet, unbounded — a CPU/TX amplification + reflection sink.
-    // The bucket is global-per-reason (Linux `icmp_msgs_per_sec` model); on
-    // empty we drop the generated error and bump the observable
-    // `TimeExceeded` rate-limited counter (inside `allow_generated_error`).
-    if !allow_generated_error(GeneratedErrorReason::TimeExceeded) {
-        counters.touched = true;
-        return None;
-    }
-
+    // #5567: prove the reply FEASIBLE before touching the rate-limit token.
+    // The egress lookup below and the v4/v6 builder each return None (a drop)
+    // when the reply CANNOT be produced — no egress object for the ingress
+    // ifindex, no primary address of the inbound family, or an unparseable
+    // trigger. Building first makes the build itself the feasibility proof.
     let egress = forwarding.egress.get(&ingress_ident.ifindex)?;
     let target_ifindex = if egress.bind_ifindex > 0 {
         egress.bind_ifindex
@@ -208,6 +201,29 @@ pub(super) fn build_local_time_exceeded_request(
         }
         _ => return None,
     }?;
+
+    // #2472/#5567: per-reason token-bucket rate limit on the LOCALLY-GENERATED
+    // Time Exceeded, consumed ONLY now that the reply is proven feasible + built
+    // (above). A TTL=1 / hop-limit=1 flood (a routing loop or a crafted low-TTL
+    // stream) would otherwise emit one generated ICMP error per trigger packet,
+    // unbounded — a CPU/TX amplification + reflection sink. The bucket is
+    // global-per-reason (Linux `icmp_msgs_per_sec` model); on empty we drop the
+    // generated error and bump the observable `TimeExceeded` rate-limited
+    // counter (inside `allow_generated_error`).
+    //
+    // #5567: the token was previously consumed BEFORE the egress lookup + build.
+    // A flood of reply-eligible-but-UNBUILDABLE triggers on one interface
+    // (missing egress object / missing family address / builder returns None)
+    // then drained this shared per-reason bucket and starved buildable
+    // PMTUD/traceroute diagnostics on ANOTHER interface — a cross-interface
+    // false-deny DoS. Consuming after feasibility mirrors the reject path's
+    // #3656 H11 build-before-consume ordering. The trigger-packet disposition is
+    // unchanged: an unbuildable attempt still returns None (drop) here, exactly
+    // as before, only without spending a token.
+    if !allow_generated_error(GeneratedErrorReason::TimeExceeded) {
+        counters.touched = true;
+        return None;
+    }
 
     let now_ns = monotonic_nanos();
     // #2238: classify the GENERATED ICMP/ICMPv6 error by its OWN egress

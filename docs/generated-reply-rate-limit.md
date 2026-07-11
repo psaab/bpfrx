@@ -123,3 +123,19 @@ source-neutral aggregate.
 - #3656: a frame that can never produce a reply (inbound RST, inbound ICMP error,
   non-first fragment, ...) is proven unreplyable BEFORE the token is consumed, so
   a flood of unreplyable frames cannot drain a zone's bucket (H11).
+- #5567: the SAME build-before-consume ordering now holds for the **TimeExceeded**
+  and **PacketTooBig** reasons, closing the residual the #3656 fix left on those
+  two generators. Both consume their token ONLY after the reply is proven
+  FEASIBLE + built — the egress-object lookup and the v4/v6 builder each return
+  `None` (a drop) when the reply cannot be produced (no egress object for the
+  ingress ifindex, no primary address of the inbound family, or an unparseable
+  trigger). Previously the token was consumed BEFORE the build, so a flood of
+  reply-eligible-but-UNBUILDABLE triggers on ONE interface (e.g. a wrong-family or
+  no-egress ingress) drained the shared global TE/PTB bucket and starved buildable
+  PMTUD / traceroute diagnostics on ANOTHER interface — a cross-interface
+  false-deny DoS. The gate order is: RFC/suppression gate → build (feasibility
+  proof) → token. A buildable reply that the token denies is still dropped
+  (rate-limited, counter bumped); an unbuildable reply never touches the token.
+  The trigger-packet disposition is unchanged in every case: TE returns `None`
+  (drop) exactly as before, and the oversized-original PTB drop stays gated on
+  `mtu_signalled`, independent of whether the PTB was built.

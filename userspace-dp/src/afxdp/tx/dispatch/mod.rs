@@ -227,10 +227,20 @@ fn compute_forwarded_egress_ptb(
             // the oversized original is still dropped below
             // (`mtu_signalled`), so this never falls through to
             // forward the MTU-violating frame.
-            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding)
-                && allow_generated_error(GeneratedErrorReason::PacketTooBig)
-            {
-                ptb_reply = match meta.addr_family as i32 {
+            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding) {
+                // #5567: build the PTB FIRST — the build IS the feasibility
+                // proof (each builder returns None on a missing egress object
+                // for the ingress ifindex, a missing primary address of the
+                // inbound family, or an unparseable trigger) — then consume the
+                // per-reason token ONLY when a reply was actually produced.
+                // Previously the token was spent before the build, so a flood
+                // of reply-eligible-but-UNBUILDABLE oversized-DF / IPv6 triggers
+                // on one interface drained the shared PacketTooBig bucket and
+                // starved buildable PMTUD on ANOTHER interface (a cross-interface
+                // false-deny DoS). Mirrors the reject path's #3656 H11
+                // build-before-consume ordering; the suppression gate above
+                // still runs first, so no token is spent on a suppressed PTB.
+                let built = match meta.addr_family as i32 {
                     libc::AF_INET => build_frag_needed_v4(
                         source_frame,
                         ptb_meta,
@@ -247,6 +257,15 @@ fn compute_forwarded_egress_ptb(
                     ),
                     _ => None,
                 };
+                // A buildable reply the token DENIES is rate-limited (dropped,
+                // token consumed + `PacketTooBig` counter bumped inside
+                // `allow_generated_error`). An UNBUILDABLE reply short-circuits
+                // the `&&`, so the token is NOT consumed. Either way the
+                // oversized original is still dropped below (`mtu_signalled`),
+                // so the trigger disposition is unchanged.
+                if built.is_some() && allow_generated_error(GeneratedErrorReason::PacketTooBig) {
+                    ptb_reply = built;
+                }
             }
             // Drop the oversized original regardless of
             // whether the PTB could be built (a suppressed
