@@ -383,6 +383,24 @@ a BARE standalone cut from a rolling-driver-invoked local cut, so
 coordinated rolling upgrades are never blocked. A standalone node (no
 `/etc/xpf/node-id`) is entirely unaffected.
 
+**Indeterminate-membership fail-closed contract (#5573).** The
+presence test is a tri-state, not a boolean. `ClusterNodeIDPresent`
+returns `(true,nil)` when the marker exists (clustered), `(false,nil)`
+ONLY for `os.IsNotExist` / ENOENT (genuinely standalone → proceed), and
+`(false,err)` for EVERY other `os.Stat` failure — EACCES, EIO, ESTALE,
+LSM denial, mount fault. A non-ENOENT lookup error means HA membership
+is UNKNOWN, and BOTH the CLI belt-and-suspenders check and the
+`Runner.Run` privileged gate FAIL CLOSED on it
+(`refuse-standalone-cut-indeterminate-cluster-membership`): they refuse
+the uncoordinated cut and do NOT stop the unit, because assuming
+standalone when the marker is unreadable would let the
+STOP→FLIP→START flow blackhole a real HA node whose peer is not ready.
+Before #5573 the predicate returned `err == nil` for every error, so an
+unreadable marker on a clustered node collapsed to "standalone" and both
+gates were bypassed — a fail-OPEN HA-safety hole. The fix is
+error-classification only; failover timing and the VRRP/session-sync
+state machines are untouched.
+
 1. assert peer alive + session sync established + HA protocol compatible
    (`CurrentHAProtocolVersion`) — else ABORT to image-replace (Path C),
    never drop connections.

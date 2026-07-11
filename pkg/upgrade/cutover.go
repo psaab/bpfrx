@@ -164,16 +164,37 @@ func (r *Runner) Run(opts Options) (err error) {
 	// with ClusterCoordinated=true; that is the only sanctioned path on a
 	// clustered node. Fail CLOSED with guidance (do NOT auto-reroute), and do
 	// NOT stop the unit. Standalone nodes (no node-id) are unaffected.
-	if !opts.ClusterCoordinated && r.clusterNodeIDPresent() {
-		return fmt.Errorf("refuse-standalone-cut-on-clustered-node: this node is a "+
-			"cluster member (%s present) but the upgrade was invoked as an "+
-			"UNCOORDINATED standalone cut (no --rolling). The standalone "+
-			"STOP->FLIP->START flow stops the local daemon WITHOUT draining to the "+
-			"peer or fencing on peer readiness, which blackholes traffic if the peer "+
-			"is not ready to take over. Use the coordinated rolling upgrade instead: "+
-			"`xpfd upgrade --rolling` (drains this node to its peer, cuts, then "+
-			"rejoins election so the cluster keeps forwarding). The unit was NOT "+
-			"stopped", r.cfg.NodeIDPath)
+	if !opts.ClusterCoordinated {
+		present, cerr := r.clusterNodeIDPresent()
+		if cerr != nil {
+			// #5573: the marker exists-check itself FAILED with a non-ENOENT
+			// error (EACCES/EIO/ESTALE/LSM denial/mount fault). We cannot prove
+			// this is a standalone node, so we CANNOT safely take the
+			// uncoordinated STOP->FLIP->START path — assuming standalone when
+			// the cluster-identity marker is unreadable would blackhole a real
+			// HA node whose peer is not ready to take over. Fail CLOSED here at
+			// the same pre-lock/pre-journal/pre-mutation boundary as the
+			// clustered refusal below; do NOT stop the unit.
+			return fmt.Errorf("refuse-standalone-cut-indeterminate-cluster-membership: "+
+				"cannot determine whether this node is a cluster member (%w). The "+
+				"UNCOORDINATED standalone STOP->FLIP->START cut is refused because "+
+				"assuming standalone when the cluster-identity marker is unreadable "+
+				"would blackhole traffic if this is in fact an HA node whose peer is "+
+				"not ready. Resolve the marker lookup failure, or run "+
+				"`xpfd upgrade --rolling` for a coordinated per-node drain, then "+
+				"retry. The unit was NOT stopped", cerr)
+		}
+		if present {
+			return fmt.Errorf("refuse-standalone-cut-on-clustered-node: this node is a "+
+				"cluster member (%s present) but the upgrade was invoked as an "+
+				"UNCOORDINATED standalone cut (no --rolling). The standalone "+
+				"STOP->FLIP->START flow stops the local daemon WITHOUT draining to the "+
+				"peer or fencing on peer readiness, which blackholes traffic if the peer "+
+				"is not ready to take over. Use the coordinated rolling upgrade instead: "+
+				"`xpfd upgrade --rolling` (drains this node to its peer, cuts, then "+
+				"rejoins election so the cluster keeps forwarding). The unit was NOT "+
+				"stopped", r.cfg.NodeIDPath)
+		}
 	}
 
 	// Acquire the host-wide upgrade lock BEFORE any journal read or live
