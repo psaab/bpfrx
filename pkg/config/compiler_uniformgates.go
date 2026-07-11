@@ -1446,6 +1446,27 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5456: firewall-filter term rule-expansion bound. A term whose
+	// source×destination×dest-port×src-port cross-product (prefix-list prefixes
+	// folded into src/dst) exceeds MaxFilterTermExpansion silently wrapped the
+	// uint32 counter-slot stride (mis-attributing hits onto a neighbouring
+	// term's slots) and drove an unbounded commit-time term expansion (a
+	// config-driven memory/CPU DoS). Strict on commit / commit-check (hard
+	// reject so the over-bound term is operator-visible); lenient on load /
+	// peer-sync (warn so an already-persisted or peer-synced config still boots
+	// — #1960; FilterTermExpansionCount / expandFilterTerm then CLAMP to the cap
+	// rather than wrapping). Runs on the fully-compiled *Config so the
+	// prefix-list maps are populated regardless of authoring order. Mirrors the
+	// prefix-list reference gate above.
+	if err := validateFilterTermExpansionBoundStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter term expansion (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2416: NAT `match source-address-name <book-entry>` cross-reference. A
 	// source / destination NAT rule naming an address-book entry not defined
 	// under `security address-book` compiled cleanly; the snapshot builder

@@ -760,6 +760,81 @@ func validateFilterActionsStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterTermExpansionBoundStrict hard-rejects any firewall-filter term
+// whose rule cross-product — (literal source addresses + every
+// source-prefix-list prefix) × (literal destination addresses + every
+// destination-prefix-list prefix) × destination-ports × source-ports — exceeds
+// MaxFilterTermExpansion (#5456).
+//
+// The cross-product is the per-term counter-slot STRIDE (config.
+// FilterTermExpansionCount) AND the size of the materialized rule set
+// (pkg/dataplane.expandFilterTerm emits one rule per entry). Before this gate
+// the count was cast straight to uint32 with no overflow check, so a term whose
+// product exceeds 2^32 (e.g. a 5000-prefix source list × a 5000-prefix
+// destination list × 100 dest-ports × 100 src-ports = 2.5e11) WRAPPED to a
+// small wrong stride: `show firewall filter` and the Prometheus collector then
+// read into a neighbouring term's counter slots and mis-attribute the hits (a
+// silent-truncation cousin of the #3459 drift). The same unbounded product is a
+// commit-time memory/CPU-exhaustion surface — a config-driven DoS. This gate
+// makes the over-bound term an operator-visible commit error naming the term
+// and its expansion, rather than truncating the stride or letting the expander
+// try to materialize the cross-product.
+//
+// The product is computed in overflow-checked uint64 (FilterTermExpansionCount64)
+// so the compare itself never wraps. Both families are walked, sorted by filter
+// name then by the term's position, so the first-reported error is
+// deterministic across runs (Go map order is randomized).
+//
+// On the tolerant load / peer-sync path the call site downgrades this to a
+// warning (opts.lenientFirewallRefs) so an already-persisted or peer-synced
+// config carrying such a term still BOOTS (#1960 fail-closed-on-load class);
+// FilterTermExpansionCount and expandFilterTerm then CLAMP the stride and the
+// materialized rule set to MaxFilterTermExpansion rather than wrapping, so a
+// leniently-loaded term is bounded, not truncated. Commit / commit-check stay
+// strict. Mirrors validateFirewallPolicerReferencesStrict.
+func validateFilterTermExpansionBoundStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	prefixLists := cfg.PolicyOptions.PrefixLists
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				count := FilterTermExpansionCount64(term, prefixLists)
+				if count > MaxFilterTermExpansion {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q expands to %d dataplane "+
+							"rules (source-addresses+prefixes × destination-addresses+"+
+							"prefixes × destination-ports × source-ports), exceeding the "+
+							"%d-rule per-term cap — this would overflow the uint32 "+
+							"counter-slot stride (mis-attributing `show firewall filter` "+
+							"hits onto neighbouring terms) and is a commit-time "+
+							"resource-exhaustion surface; reduce the prefix-list / port "+
+							"cross-product or split the term",
+						family, name, term.Name, count, MaxFilterTermExpansion)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFilterMatchValuesStrict hard-rejects any firewall-filter term that
 // carries a SYMBOLIC match value (icmp-type / icmp-code name or a named port)
 // the compiler could not resolve to a number — #3205 (agy-070 #07/#08).

@@ -97,6 +97,35 @@ The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 `load`/...) plus the retained `set system dataplane` description overlay.
 
+### firewall-filter term rule-expansion bound (#5456)
+
+`validateFilterTermExpansionBoundStrict` (`compiler_validate_strict_filter.go`,
+gated in `runUniformGates`) hard-rejects a firewall-filter term whose rule
+cross-product — (literal source-addresses + every source-prefix-list prefix) ×
+(literal destination-addresses + every destination-prefix-list prefix) ×
+destination-ports × source-ports — exceeds `MaxFilterTermExpansion` (1<<20 =
+1,048,576, in `firewall_filter_expand.go`).
+
+That cross-product is the per-term counter-slot **stride**
+(`config.FilterTermExpansionCount`, the #3459 SSOT every counter reader walks)
+AND the size of the materialized rule set (`pkg/dataplane.expandFilterTerm`).
+Before this gate the count was computed as `int` products and cast straight to
+`uint32` with no overflow check, so a term whose product exceeds 2^32 (e.g. a
+5000-prefix source list × a 5000-prefix destination list × 100 dest-ports × 100
+src-ports = 2.5e11) **wrapped** to a small wrong stride — `show firewall filter`
+/ the Prometheus collector then read into a neighbouring term's counter slots and
+mis-attributed the hits (a silent-truncation cousin of #3459). The same unbounded
+product is a commit-time memory/CPU-exhaustion surface (a config-driven DoS). The
+count is now computed in overflow-checked `uint64` (`FilterTermExpansionCount64`,
+`math/bits.Mul64`) and the `uint32` stride **clamps** to `MaxFilterTermExpansion`
+rather than wrapping; `expandFilterTerm` caps its materialized slice at the same
+bound, so the drift-guard invariant (count == `len(expandFilterTerm)`) holds for
+an over-bound term too. Strict on commit / commit-check (hard reject naming the
+term and its expansion); lenient on load / peer-sync
+(`opts.lenientFirewallRefs`, warn — an already-persisted or peer-synced config
+still boots per #1960, with the clamp keeping the stride bounded). Distinct from
+#3459, which fixed the stride's *layout* SSOT, not its overflow.
+
 ### `class-of-service forwarding-classes queue` range (#4594)
 
 `validateClassOfServiceForwardingClassQueueStrict`

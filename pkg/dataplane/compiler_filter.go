@@ -607,11 +607,24 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		srcPorts = []string{""} // "any"
 	}
 
+	// #5456: bound the materialized cross-product to config.MaxFilterTermExpansion
+	// — the same cap the strict commit gate (validateFilterTermExpansionBoundStrict)
+	// enforces and the same cap config.FilterTermExpansionCount clamps its stride
+	// to. A committed config can never reach this bound (commit rejects an
+	// over-cap term); it fires only on the tolerant load / peer-sync path (#1960),
+	// where it keeps the allocation bounded instead of attempting the unbounded
+	// (e.g. 2.5e11-entry) cross-product a wrapped uint32 count used to hide.
+	// Keeping the len here == the clamped FilterTermExpansionCount preserves the
+	// #3459 drift-guard invariant for an over-bound term too.
 	var rules []FilterRule
+expand:
 	for _, src := range srcAddrs {
 		for _, dst := range dstAddrs {
 			for _, dp := range dstPorts {
 				for _, sp := range srcPorts {
+					if len(rules) >= config.MaxFilterTermExpansion {
+						break expand
+					}
 					rule := base
 					if src.cidr != "" {
 						rule.MatchFlags |= FilterMatchSrcAddr
