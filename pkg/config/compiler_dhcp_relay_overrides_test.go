@@ -385,3 +385,117 @@ func TestDHCPRelayOverrides_4309_Advisory(t *testing.T) {
 		t.Errorf("maximum-hop-count is enforced and must not be in the accepted-only advisory: %s", warn)
 	}
 }
+
+// #5414 (RFC 3046 §2.1 anti-spoofing): `overrides trust-option-82` marks the
+// group's interfaces as trusted relay uplinks and must compile to
+// DHCPRelayGroup.TrustOption82 from the flat-set path. RED-on-revert: without
+// the compiler case the field reads back false (silent drop) and the relay
+// keeps trusting a client-forged giaddr.
+func TestDHCPRelayOverrides_5414_TrustOption82_FlatSet(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set forwarding-options dhcp-relay server-group sg 10.1.1.1",
+		"set forwarding-options dhcp-relay group lan active-server-group sg",
+		"set forwarding-options dhcp-relay group lan interface ge-0/0/0.0",
+		"set forwarding-options dhcp-relay group lan overrides trust-option-82",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	g := relayGroup(t, cfg, "lan")
+	if !g.TrustOption82 {
+		t.Error("TrustOption82 = false, want true (flat-set overrides trust-option-82)")
+	}
+	// The interface list must stay clean — the new keyword must not be swallowed.
+	if len(g.Interfaces) != 1 || g.Interfaces[0] != "ge-0/0/0.0" {
+		t.Errorf("Interfaces = %v, want [ge-0/0/0.0]", g.Interfaces)
+	}
+}
+
+// Default: absent trust-option-82 leaves the group UNTRUSTED (the safe default
+// that overwrites a client-forged giaddr).
+func TestDHCPRelayOverrides_5414_TrustOption82_DefaultUntrusted(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set forwarding-options dhcp-relay server-group sg 10.1.1.1",
+		"set forwarding-options dhcp-relay group lan active-server-group sg",
+		"set forwarding-options dhcp-relay group lan interface ge-0/0/0.0",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if g := relayGroup(t, cfg, "lan"); g.TrustOption82 {
+		t.Error("TrustOption82 = true, want false (absent override → untrusted default)")
+	}
+}
+
+// Merged-Keys and block forms of trust-option-82 must also compile — the same
+// three parse shapes #4309 covers for its knobs.
+func TestDHCPRelayOverrides_5414_TrustOption82_MergedAndBlock(t *testing.T) {
+	// Merged-Keys: trust-option-82 packed inline with interface in one node.
+	merged := &Node{
+		Keys: []string{"dhcp-relay"},
+		Children: []*Node{
+			{Keys: []string{"server-group", "sg", "10.1.1.1"}, IsLeaf: true},
+			{
+				Keys: []string{
+					"group", "lan",
+					"overrides", "trust-option-82",
+					"interface", "ge-0/0/0.0",
+				},
+				IsLeaf: true,
+			},
+		},
+	}
+	fo := &ForwardingOptionsConfig{}
+	if err := compileDHCPRelay(merged, fo); err != nil {
+		t.Fatalf("compileDHCPRelay (merged): %v", err)
+	}
+	if g := fo.DHCPRelay.Groups["lan"]; g == nil || !g.TrustOption82 {
+		t.Errorf("merged-Keys TrustOption82 not set: %+v", g)
+	} else if len(g.Interfaces) != 1 || g.Interfaces[0] != "ge-0/0/0.0" {
+		t.Errorf("merged-Keys Interfaces = %v, want [ge-0/0/0.0] (trust-option-82 swallowed?)", g.Interfaces)
+	}
+
+	// Block form: overrides { trust-option-82; } as a child node.
+	block := &Node{
+		Keys: []string{"dhcp-relay"},
+		Children: []*Node{
+			{Keys: []string{"server-group", "sg", "10.1.1.1"}, IsLeaf: true},
+			{
+				Keys: []string{"group", "lan"},
+				Children: []*Node{
+					{Keys: []string{"interface", "ge-0/0/0.0"}, IsLeaf: true},
+					{Keys: []string{"overrides"}, Children: []*Node{
+						{Keys: []string{"trust-option-82"}, IsLeaf: true},
+					}},
+				},
+			},
+		},
+	}
+	fo2 := &ForwardingOptionsConfig{}
+	if err := compileDHCPRelay(block, fo2); err != nil {
+		t.Fatalf("compileDHCPRelay (block): %v", err)
+	}
+	if g := fo2.DHCPRelay.Groups["lan"]; g == nil || !g.TrustOption82 {
+		t.Errorf("block-form TrustOption82 not set: %+v", g)
+	}
+}
+
+// Structural completion must offer trust-option-82 under overrides so an
+// operator can discover the knob via `?`.
+func TestDHCPRelayOverrides_5414_SchemaCompletion(t *testing.T) {
+	comps := CompleteSetPath([]string{
+		"forwarding-options", "dhcp-relay", "group", "lan", "overrides", "",
+	})
+	found := false
+	for _, c := range comps {
+		if c == "trust-option-82" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("overrides completion missing trust-option-82; got %v", comps)
+	}
+}

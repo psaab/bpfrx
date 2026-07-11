@@ -1623,6 +1623,8 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 						g.ForwardOnly = true
 					case "relay-agent-option":
 						g.RelayAgentOption = true
+					case "trust-option-82":
+						g.TrustOption82 = true
 					case "maximum-hop-count":
 						if i+1 < len(keys) {
 							i++
@@ -1667,6 +1669,8 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 						g.ForwardOnly = true
 					case "relay-agent-option":
 						g.RelayAgentOption = true
+					case "trust-option-82":
+						g.TrustOption82 = true
 					case "maximum-hop-count":
 						if v := nodeVal(oc); v != "" {
 							if n, err := strconv.Atoi(v); err == nil {
@@ -1683,6 +1687,8 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 						g.ForwardOnly = true
 					case "relay-agent-option":
 						g.RelayAgentOption = true
+					case "trust-option-82":
+						g.TrustOption82 = true
 					case "maximum-hop-count":
 						if i+1 < len(prop.Keys) {
 							i++
