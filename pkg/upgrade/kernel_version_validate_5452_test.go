@@ -37,6 +37,7 @@ func TestValidateKernelSegment(t *testing.T) {
 		"*",           // glob star -> /boot/*-* wildcard
 		"?",           // glob single
 		"6.18.0-[ab]", // glob class
+		".",           // lone "." -> /lib/modules/. == /lib/modules (whole-tree delete)
 		"..",          // traversal (/lib/modules/.. == /lib)
 		"../etc",      // traversal
 		"6.18/0",      // path separator
@@ -161,6 +162,34 @@ func TestPruneInactiveSlot_RejectsTraversalCandidate(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(root, "lib", "modules")); statErr != nil {
 		t.Errorf("/lib/modules removed by a \"..\" traversal prune (%v)", statErr)
+	}
+}
+
+// A lone "." candidate must be rejected before os.RemoveAll("/lib/modules/.")
+// (which resolves to "/lib/modules" itself -> deletes the WHOLE modules tree).
+// A "." is in the charset and is neither empty nor "..", so the charset scan
+// alone would let it through — hence the explicit "." guard. RED-on-revert:
+// without the guard the prune deletes every installed kernel's modules.
+func TestPruneInactiveSlot_RejectsLoneDotCandidate(t *testing.T) {
+	root := t.TempDir()
+	otherKernel := filepath.Join(root, "lib", "modules", "6.18.5-10-generic")
+	if err := os.MkdirAll(otherKernel, 0755); err != nil {
+		t.Fatalf("seed lib/modules: %v", err)
+	}
+	sys := &realKernelSystem{
+		fsRoot:         root,
+		pkgInstalledFn: func(string) (bool, error) { return false, nil },
+		aptGetFn:       func(...string) error { return nil },
+	}
+	err := sys.PruneInactiveSlot("xpf-B", "6.18.5-10-generic", ".")
+	if err == nil {
+		t.Fatal("PruneInactiveSlot(candidate=\".\") = nil, want a rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, "lib", "modules")); statErr != nil {
+		t.Errorf("/lib/modules removed by a \".\" prune (%v) — whole modules tree wiped", statErr)
+	}
+	if _, statErr := os.Stat(otherKernel); statErr != nil {
+		t.Errorf("/lib/modules/6.18.5-10-generic removed by a \".\" prune (%v)", statErr)
 	}
 }
 

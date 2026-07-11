@@ -83,7 +83,9 @@ func ValidateVersionSegment(ver string) error {
 // it is NOT sufficient here. A real `uname -r` is alphanumerics plus `.`, `-`,
 // `+`, `~`, `_` (e.g. "6.18.0-xpf1-amd64"), so this validator allows ONLY that
 // charset, is non-empty, rejects a leading `-` (would parse as an apt/efi
-// option) and any ".." (traversal), and fails CLOSED on anything else.
+// option) and any "." / ".." relative element (traversal — a lone "." is in
+// the charset but resolves to the parent dir under filepath.Join), and fails
+// CLOSED on anything else.
 func ValidateKernelSegment(what, seg string) error {
 	if seg == "" {
 		return fmt.Errorf("%s is empty", what)
@@ -91,8 +93,12 @@ func ValidateKernelSegment(what, seg string) error {
 	if strings.HasPrefix(seg, "-") {
 		return fmt.Errorf("%s %q has a leading '-' (parses as a command option)", what, seg)
 	}
-	if strings.Contains(seg, "..") {
-		return fmt.Errorf("%s %q contains \"..\" (path traversal)", what, seg)
+	if seg == "." || strings.Contains(seg, "..") {
+		// A lone "." is in the charset but resolves to the parent dir under
+		// filepath.Join (filepath.Join("/lib/modules", ".") == "/lib/modules"),
+		// so a candidateVersion="." would RemoveAll the entire modules tree —
+		// same class as "..". Reject both, matching ValidateVersionSegment.
+		return fmt.Errorf("%s %q is a relative path element (\".\" / \"..\")", what, seg)
 	}
 	for _, r := range seg {
 		switch {
