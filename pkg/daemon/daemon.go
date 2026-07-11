@@ -409,6 +409,21 @@ type Daemon struct {
 	// to the client when the lock holder is slow, instead of
 	// hanging the request indefinitely.
 	applySem *semaphore.Weighted
+	// resetting enters the TERMINAL factory-reset (zeroize) generation
+	// (#5281). A gRPC-initiated zeroize (factoryReset) sets it true while it
+	// holds applySem and erases on-disk state, and — on a successful wipe —
+	// leaves it set for the daemon's remaining lifetime (the daemon is stopped
+	// moments later). Once set, every config writer that acquires applySem
+	// (commitAndApply / commitConfirmedAndApply / syncAndApply /
+	// executeConfirmedRollback, the applyConfigLocked reconcile, and the
+	// periodic DHCP-lease IPsec rebind) short-circuits, so nothing re-persists
+	// the just-erased .configdb SSOT or re-renders the wiped secrets
+	// (frr.conf/swanctl PSKs/Kea/login accounts) in the window between the wipe
+	// and the daemon stop. Read/written only via isResetting / enterReset...
+	// exitResetGeneration (sync/atomic), so the zeroize goroutine and any
+	// concurrent apply goroutine race safely. A failed wipe clears it again so
+	// the box stays recoverable (fail-closed, see factoryReset).
+	resetting atomic.Bool
 	// applyBodyForTest, when non-nil, replaces applyConfigLocked's
 	// body. Test-only seam used by apply_serialize_test.go to
 	// exercise the semaphore contract through the real applyConfig

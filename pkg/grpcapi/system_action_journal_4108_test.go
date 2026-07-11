@@ -20,17 +20,22 @@ import (
 // RED on revert: dropping the s.logSystemAction(...) call from a case leaves no
 // journal entry for that verb and the corresponding subtest fails.
 func TestSystemActionJournalsDestructiveVerbs(t *testing.T) {
-	// Neutralize the real destructive side effects for the whole test.
+	// Neutralize the real destructive side effects for the whole test —
+	// including the #5281 post-zeroize daemon stop, which the zeroize verb now
+	// schedules on a successful wipe.
 	origPower := schedulePowerAction
 	origWipe := performZeroizeWipe
+	origStop := scheduleStopDaemon
 	t.Cleanup(func() {
 		schedulePowerAction = origPower
 		performZeroizeWipe = origWipe
+		scheduleStopDaemon = origStop
 	})
 	var poweredArg string
 	var wiped bool
 	schedulePowerAction = func(arg string) { poweredArg = arg }
 	performZeroizeWipe = func() error { wiped = true; return nil }
+	scheduleStopDaemon = func() {}
 
 	cases := []struct {
 		action      string

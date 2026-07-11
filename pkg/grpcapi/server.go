@@ -105,12 +105,23 @@ type Config struct {
 	// (handlers translate to DeadlineExceeded/Canceled).
 	CommitFn          func(ctx context.Context, comment string) (*config.Config, error)
 	CommitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
-	VRRPMgr           *vrrp.Manager      // native VRRP manager
-	RAMgr             *ra.Manager        // embedded RA sender manager
-	Version           string             // software version string
-	FabricPeerAddrFn  func() []string    // returns peer fabric IPs (fab0, fab1; empty if standalone)
-	FabricVRFDevice   string             // VRF for fabric interface (e.g. "vrf-mgmt")
-	FwdSampler        *fwdstatus.Sampler // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
+	// ZeroizeFn runs a factory-reset (zeroize) wipe under the daemon's apply
+	// gate (#5281). It acquires the same apply semaphore commit/sync serialize
+	// on, enters a TERMINAL reset generation so no concurrent or subsequent
+	// config writer can re-create the erased .configdb SSOT or re-render the
+	// wiped secrets, runs the passed wipe closure (the package performZeroizeWipe
+	// primitive) while quiesced, and returns nil ONLY when the wipe fully
+	// completed. On failure it fail-closes (the box stays recoverable) and
+	// returns the error, and the SystemAction handler does NOT stop the daemon.
+	// nil in NoDataplane / unit-test builds with no daemon, in which case the
+	// handler falls back to an ungated direct wipe (the pre-#5281 behavior).
+	ZeroizeFn        func(ctx context.Context, wipe func() error) error
+	VRRPMgr          *vrrp.Manager      // native VRRP manager
+	RAMgr            *ra.Manager        // embedded RA sender manager
+	Version          string             // software version string
+	FabricPeerAddrFn func() []string    // returns peer fabric IPs (fab0, fab1; empty if standalone)
+	FabricVRFDevice  string             // VRF for fabric interface (e.g. "vrf-mgmt")
+	FwdSampler       *fwdstatus.Sampler // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
 }
 
 // Server implements the BpfrxService gRPC service.
@@ -140,6 +151,7 @@ type Server struct {
 	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
 	commitFn              func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn     func(ctx context.Context, minutes int) (*config.Config, error)
+	zeroizeFn             func(ctx context.Context, wipe func() error) error
 	vrrpMgr               *vrrp.Manager
 	raMgr                 *ra.Manager
 	fwdSampler            *fwdstatus.Sampler
@@ -234,6 +246,7 @@ func NewServer(addr string, cfg Config) *Server {
 		flowCollectorHealthFn: cfg.FlowCollectorHealthFn,
 		commitFn:              cfg.CommitFn,
 		commitConfirmedFn:     cfg.CommitConfirmedFn,
+		zeroizeFn:             cfg.ZeroizeFn,
 		vrrpMgr:               cfg.VRRPMgr,
 		raMgr:                 cfg.RAMgr,
 		fwdSampler:            cfg.FwdSampler,

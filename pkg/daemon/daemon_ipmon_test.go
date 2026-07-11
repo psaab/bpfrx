@@ -434,6 +434,42 @@ func TestActuatorPublishesOnDegradedFRR(t *testing.T) {
 	}
 }
 
+// TestActuateRouteOverlaySkipsWhenResetting pins the #5281 review fold: once a
+// factory reset (zeroize) has entered the terminal reset generation, the
+// ip-monitoring route-overlay actuator must be a NO-OP. It re-renders
+// /etc/frr/frr.conf (the world-readable file carrying the xpf-managed BGP-MD5 /
+// OSPF / IS-IS routing-auth keys) from the still-resident in-memory
+// ActiveConfig; in the wipe→stop window a probe-flap sweep would otherwise
+// re-materialize the just-erased routing-auth keys into a file that survives the
+// post-zeroize reboot — defeating the wipe. The actuator must NOT reload FRR and
+// NOT publish/bump, and must return false (stay dirty; the daemon is being
+// wiped/stopped, so the retry never fires).
+//
+// RED on revert: removing the isResetting gate lets the actuator render frr.conf
+// (RecordingExecutor.ReloadCalls == 1) and publish (dp.calls != nil) — this test
+// then fails.
+func TestActuateRouteOverlaySkipsWhenResetting(t *testing.T) {
+	exec := &frr.RecordingExecutor{} // clean reload — the ungated path WOULD render+publish
+	dp := &fakeOverlayDP{}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		frr:      frr.NewForTest(filepath.Join(t.TempDir(), "frr.conf"), exec),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+	d.enterResetGeneration()
+
+	if ok := d.actuateRouteOverlayLocked(&config.Config{}); ok {
+		t.Fatal("actuator reported success during a factory reset; must be a no-op (false)")
+	}
+	if exec.ReloadCalls != 0 {
+		t.Fatalf("frr.conf was re-rendered during a factory reset (ReloadCalls=%d): erased routing-auth keys re-materialized", exec.ReloadCalls)
+	}
+	if len(dp.calls) != 0 {
+		t.Fatalf("dataplane actuated during a factory reset: calls = %v (must be none)", dp.calls)
+	}
+}
+
 // TestActuateRouteOverlayAbortsOnContextCancel is the #3758 regression
 // at the exact bug line: actuateRouteOverlay acquires the apply
 // semaphore with the ENGINE's actuation context (cancelled on ipmon
