@@ -54,9 +54,17 @@ sg incus-admin -c "XPFD=$PWD/xpfd python3 scripts/image/validate.py \
     --qcow2 $QCOW --metadata $META all"
 ```
 
-It imports the image into local incus and boots three throwaway VMs on a
+It imports the image into local incus and boots throwaway VMs on a
 dedicated NAT network (`xpf-image-net`); none touch the shared cluster,
-and all are deleted on exit. Scenarios:
+and all are deleted on exit. The incus alias and every scenario instance
+are **namespaced with a per-run ID** (`xpf-image-validate-<run>` /
+`xpf-image-<run>-a…e`), and every teardown is **ownership-gated**: the
+harness tags each instance it creates with `user.xpf-owner=<run>` and
+force-deletes ONLY objects carrying that tag (and only the alias it
+imported). So a concurrent bake, or an unrelated same-named VM/image, is
+never destroyed — before this the constant `xpf-image-validate` alias and
+`xpf-image-a…e` instances were force-deleted at import/launch/cleanup with
+no run-ID or ownership check (#4905-D). Scenarios:
 
 | Scenario | Proves |
 |---|---|

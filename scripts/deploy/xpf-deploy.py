@@ -90,6 +90,69 @@ def die(msg):
     sys.exit(f"ERROR: {msg}")
 
 
+# ── identifier / path-containment safety (#4905-B) ────────────────────
+# The appliance `name` and `image` are interpolated straight into filesystem
+# paths that this tool WRITES and REMOVES (often via sudo): the day-0 ISO in
+# CWD (`<name>-day0.iso`), and the per-VM overlay + shared golden qcow2 under
+# /var/lib/libvirt/images (`<name>.qcow2` / `<image>.qcow2`). A value bearing a
+# path separator, a `..` component, an absolute path, or a leading dash would
+# redirect those write/delete sinks outside the managed storage dir — e.g.
+# `../../../../tmp/owned` resolves to `/tmp/owned.qcow2`, and destroy/cleanup
+# would `rm -f` (or `sudo rm -f`) it. Validate every identifier to a single
+# safe path component, and enforce commonpath containment at each sink as
+# defense-in-depth.
+_SAFE_IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def validate_identifier(value, field):
+    """Reject a name/image identifier that could escape the managed dir.
+
+    Allows only a single safe path component: it must start with an
+    alphanumeric and contain only [A-Za-z0-9._-] (so no `/`, `\\`, spaces,
+    shell metacharacters, or a leading `.`/`-`). This rules out `..`, absolute
+    paths, and any embedded separator. Returns the value on success; die()s
+    with a clear message otherwise (#4905-B)."""
+    if not isinstance(value, str) or not value:
+        die(f"{field} is required and must be a non-empty string")
+    if os.path.isabs(value):
+        die(f"{field} '{value}' must not be an absolute path")
+    if "/" in value or "\\" in value or os.sep in value \
+            or (os.altsep and os.altsep in value):
+        die(f"{field} '{value}' must not contain a path separator")
+    if value.startswith("-"):
+        die(f"{field} '{value}' must not start with '-' (would be read as a "
+            "CLI flag by the hypervisor tools)")
+    if not _SAFE_IDENT.match(value):
+        die(f"{field} '{value}' is not a safe identifier — allow only "
+            "[A-Za-z0-9][A-Za-z0-9._-]* (no separators, '..', spaces, or "
+            "shell metacharacters), so it cannot escape the managed storage "
+            "directory (#4905-B)")
+    return value
+
+
+def contained_join(dirpath, basename, field):
+    """Join basename onto dirpath and assert the result stays inside dirpath.
+
+    Defense-in-depth beyond validate_identifier: even if a future caller
+    forgot to validate, a path that resolves outside `dirpath` is refused
+    rather than written/deleted (#4905-B). Returns the safe absolute-joined
+    path (not realpath-resolved, so the caller sees the intended location)."""
+    full = os.path.join(dirpath, basename)
+    real_dir = os.path.realpath(dirpath)
+    real_full = os.path.realpath(full)
+    if real_full != real_dir and \
+            os.path.commonpath([real_dir, real_full]) != real_dir:
+        die(f"refusing {field} path {full!r}: it escapes the managed "
+            f"directory {dirpath!r} (#4905-B)")
+    return full
+
+
+def day0_iso_path(name):
+    """Path of the day-0 ISO for `name`, validated + contained to CWD."""
+    validate_identifier(name, "name")
+    return contained_join(os.getcwd(), f"{name}-day0.iso", "day-0 ISO")
+
+
 def run_capture(argv, dry=False):
     """Run argv, capturing stdout+stderr. On a nonzero exit, die() with the
     command, the return code, and the captured stderr — the hypervisor tool's
@@ -213,6 +276,12 @@ def cmd_inventory(_args):
 def validate_appliance(ap, where):
     if not ap.get("name"):
         die(f"{where}: name is required")
+    # Reject a name/image that could escape the managed storage dir before we
+    # ever construct a path from it (#4905-B). The path-building helpers
+    # re-validate at each sink, but failing here gives a clear load-time error.
+    validate_identifier(ap["name"], f"{where}: name")
+    if ap.get("image"):
+        validate_identifier(ap["image"], f"{where}: image")
     if ap["mode"] not in ("standalone", "cluster"):
         die(f"{where}: mode must be standalone|cluster")
     if ap["mode"] == "cluster" and ap.get("node_id") not in (0, 1):
@@ -293,7 +362,7 @@ def build_config_drive(ap, runner):
     if not cfg:
         return None
     cfg_path = cfg if os.path.isabs(cfg) else os.path.join(ap["base_dir"], cfg)
-    iso = os.path.join(os.getcwd(), f"{ap['name']}-day0.iso")
+    iso = day0_iso_path(ap["name"])
     if runner.dry:
         print(f"==> (dry-run) would build day-0 drive {iso} from {cfg_path} "
               f"(label xpf-config, check-config validated)")
@@ -560,8 +629,19 @@ def libvirt_golden_path(image):
     """The libvirt golden qcow2 path — the SINGLE source of truth shared by
     `deploy --hypervisor libvirt` (reads it as the read-only overlay backing)
     AND `fetch --install-libvirt` (writes the verified image here). One helper
-    so the two halves can't drift (fable-165 H-30)."""
-    return os.path.join(LIBVIRT_IMAGES, f"{image}.qcow2")
+    so the two halves can't drift (fable-165 H-30). The image identifier is
+    validated + contained so a crafted `image:`/`--alias` cannot redirect the
+    install/read outside LIBVIRT_IMAGES (#4905-B)."""
+    validate_identifier(image, "image")
+    return contained_join(LIBVIRT_IMAGES, f"{image}.qcow2", "golden image")
+
+
+def libvirt_overlay_path(name):
+    """The per-VM writable overlay qcow2 path under LIBVIRT_IMAGES, validated +
+    contained so a crafted `name:` cannot redirect the overlay create/remove
+    (which destroy runs via `sudo rm -f`) outside LIBVIRT_IMAGES (#4905-B)."""
+    validate_identifier(name, "name")
+    return contained_join(LIBVIRT_IMAGES, f"{name}.qcow2", "per-VM overlay")
 
 
 def _install_libvirt_golden(srcq, image):
@@ -600,7 +680,7 @@ def libvirt_disk(ap, runner):
     out from under it.
     """
     golden = libvirt_golden_path(ap['image'])
-    overlay = os.path.join(LIBVIRT_IMAGES, f"{ap['name']}.qcow2")
+    overlay = libvirt_overlay_path(ap['name'])
     if os.path.abspath(overlay) == os.path.abspath(golden):
         die(f"VM name '{ap['name']}' collides with the golden image basename "
             f"'{ap['image']}' — the per-VM overlay would overwrite the golden "
@@ -648,7 +728,7 @@ def deploy_libvirt(ap, runner, start):
         # re-run. Undefine the domain + remove the overlay we created, then
         # re-raise the original error (SystemExit keeps its message).
         if not runner.dry:
-            overlay = os.path.join(LIBVIRT_IMAGES, f"{name}.qcow2")
+            overlay = libvirt_overlay_path(name)
             _cleanup_libvirt(name, overlay)
         raise
 
@@ -749,7 +829,7 @@ def _deploy_libvirt_inner(ap, runner, start, iso):
 def deploy(ap, args):
     runner = Runner(args.dry_run)
     if args.image:
-        ap["image"] = args.image
+        ap["image"] = validate_identifier(args.image, "--image")
     (deploy_incus if args.hypervisor == "incus" else deploy_libvirt)(
         ap, runner, not args.no_start)
 
@@ -757,7 +837,7 @@ def deploy(ap, args):
 # ── destroy (teardown for a clean re-deploy, fable-165 H-27) ───────────
 def destroy_incus(ap, runner):
     name = ap["name"]
-    iso = os.path.join(os.getcwd(), f"{name}-day0.iso")
+    iso = day0_iso_path(name)
     if runner.dry:
         runner.run(["incus", "delete", "--force", name])
     elif _incus_exists("instance", name):
@@ -772,8 +852,8 @@ def destroy_incus(ap, runner):
 
 def destroy_libvirt(ap, runner):
     name = ap["name"]
-    overlay = os.path.join(LIBVIRT_IMAGES, f"{name}.qcow2")
-    iso = os.path.join(os.getcwd(), f"{name}-day0.iso")
+    overlay = libvirt_overlay_path(name)
+    iso = day0_iso_path(name)
     if runner.dry:
         runner.run(["virsh", "destroy", name])
         runner.run(["virsh", "undefine", "--nvram", name])
@@ -802,7 +882,7 @@ def destroy_libvirt(ap, runner):
 def destroy(ap, args):
     runner = Runner(args.dry_run)
     if args.image:
-        ap["image"] = args.image
+        ap["image"] = validate_identifier(args.image, "--image")
     (destroy_incus if args.hypervisor == "incus" else destroy_libvirt)(ap, runner)
 
 
@@ -1057,8 +1137,29 @@ def cmd_fetch(args):
 # is unreachable), the driver aborts BEFORE draining the second node, so the
 # cluster never ends up with both nodes down.
 
-def _node_exec(runner, backend, node, argv, check=True):
-    """Run argv inside `node` via the chosen backend (incus|ssh)."""
+class NodeExecResult:
+    """Structured result of a node command: exit code, stdout, stderr, and an
+    `ok` flag (transport + command both succeeded).
+
+    The kernel roll needs to tell an empty-BECAUSE-the-command-succeeded read
+    apart from an empty-BECAUSE-the-transport-failed read (SSH/incus drop,
+    control-socket contention, a `uname` that never ran). The old wrapper
+    returned only stdout, collapsing both to "" — so a single transient status
+    failure was misread as a completed reboot and the drained node was left
+    ForceSecondary with its leases released (#4905-A). `ok` is the affirmative
+    signal that distinguishes the two."""
+
+    __slots__ = ("rc", "out", "err", "ok")
+
+    def __init__(self, rc, out, err, ok):
+        self.rc = rc
+        self.out = out
+        self.err = err
+        self.ok = ok
+
+
+def _node_exec_argv(backend, node, argv):
+    """Build the full host argv that runs `argv` inside `node` (incus|ssh)."""
     if backend == "ssh":
         # Non-interactive automation: never hang on a host-key / password prompt
         # or a dead host (Copilot). BatchMode disables all prompts (fail fast
@@ -1077,20 +1178,39 @@ def _node_exec(runner, backend, node, argv, check=True):
         # after it is the remote command. A literal "--" would be sent as the
         # first token of the remote command string, and the remote login shell
         # would try to run `-- <cmd>` → "--: command not found" (Copilot).
-        full = ["ssh",
+        return ["ssh",
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=15",
                 node, remote]
-    else:
-        full = ["incus", "exec", node, "--"] + argv
+    return ["incus", "exec", node, "--"] + argv
+
+
+def _node_exec_result(runner, backend, node, argv):
+    """Run argv inside `node`; return a NodeExecResult (never die()s).
+
+    Unlike _node_exec, this preserves the exit code + stderr so callers can
+    distinguish a transport/command FAILURE from legitimately-empty output
+    (#4905-A reboot detection). In dry-run it prints the command and returns an
+    ok result with empty output (nothing executed)."""
+    full = _node_exec_argv(backend, node, argv)
     if runner.dry:
         print("   " + " ".join(shlex.quote(a) for a in full))
-        return ""
+        return NodeExecResult(0, "", "", True)
     r = subprocess.run(full, capture_output=True, text=True)
-    if check and r.returncode != 0:
+    return NodeExecResult(r.returncode, r.stdout, r.stderr, r.returncode == 0)
+
+
+def _node_exec(runner, backend, node, argv, check=True):
+    """Run argv inside `node` via the chosen backend (incus|ssh).
+
+    Returns stdout (string) for the many callers that only need it. Callers
+    that must distinguish a transport failure from empty output (kernel-roll
+    reboot detection) use _node_exec_result instead (#4905-A)."""
+    res = _node_exec_result(runner, backend, node, argv)
+    if check and not res.ok and not runner.dry:
         die(f"{node}: command failed ({' '.join(argv)}): "
-            f"{r.stdout.strip()} {r.stderr.strip()}")
-    return r.stdout
+            f"{res.out.strip()} {res.err.strip()}")
+    return res.out
 
 
 def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
@@ -1166,8 +1286,39 @@ def _kernel_status(runner, backend, node):
     return st
 
 
-def _running_kernel(runner, backend, node):
-    return _node_exec(runner, backend, node, ["uname", "-r"], check=False).strip()
+def _running_kernel_result(runner, backend, node):
+    """(ok, release): `ok` is False on a transport/command failure (SSH/incus
+    drop, control-socket contention), True with the stripped `uname -r` output
+    otherwise. The roll loop must NOT treat an un-ok read as a reboot (#4905-A)."""
+    res = _node_exec_result(runner, backend, node, ["uname", "-r"])
+    return res.ok, (res.out.strip() if res.ok else "")
+
+
+def _boot_id(runner, backend, node):
+    """The node's boot_id (/proc/sys/kernel/random/boot_id) — a fresh UUID on
+    every boot — or "" if it could not be read. A CHANGED boot_id across the
+    arm is the affirmative reboot signal the roll uses; a transport failure
+    returns "" (unknown), which is NEVER treated as a reboot (#4905-A)."""
+    res = _node_exec_result(runner, backend, node,
+                            ["cat", "/proc/sys/kernel/random/boot_id"])
+    return res.out.strip() if res.ok else ""
+
+
+def _reboot_confirmed(pre_boot_id, cur_boot_id, running, version):
+    """Affirmative reboot test (#4905-A). A reboot is confirmed ONLY by a
+    positive signal — a CHANGED boot_id, or the candidate kernel actually
+    running — NEVER by an empty/failed status read. Returns True iff an
+    affirmative signal is present.
+
+    This is the crux of the #4905-A fix: the old loop set rebooted=True on ANY
+    empty `uname -r` read, so one transient SSH/incus blip made a
+    still-drained-and-running node look like a completed revert, and the finally
+    skipped its rejoin — leaving the node ForceSecondary with its leases gone."""
+    if cur_boot_id and pre_boot_id and cur_boot_id != pre_boot_id:
+        return True
+    if running and version and running == version:
+        return True
+    return False
 
 
 def cmd_kernel_roll(args):
@@ -1242,6 +1393,13 @@ def cmd_kernel_roll(args):
             #    distinguish the two by exit code, so the poll below detects a
             #    no-reboot (uname never changes off known-good while armed=none),
             #    and the finally REJOINS a drained node that never rebooted.
+            # Record the pre-arm boot_id (#4905-A): a CHANGED boot_id after the
+            # arm is the AFFIRMATIVE proof the node actually rebooted. Reading
+            # it here — after a confirmed drain, before arm — is on a healthy,
+            # reachable node, so it normally succeeds; if it can't be read we
+            # fall back to the running==candidate signal (a promote still sets
+            # rebooted, and an unconfirmed reboot conservatively rejoins).
+            pre_boot_id = _boot_id(runner, backend, node)
             print(f"   arming candidate {version} on {node} (will reboot)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "arm", version], check=False)
@@ -1253,15 +1411,24 @@ def cmd_kernel_roll(args):
             # 5. poll until back + promoted==version (or STOP on revert/timeout)
             deadline = _time.time() + poll_deadline
             promoted = False
+            running = ""   # last observed kernel ("" = never reachable)
             while _time.time() < deadline:
                 _time.sleep(10)
                 st = _kernel_status(runner, backend, node)
-                running = _running_kernel(runner, backend, node)
-                if not running:
-                    rebooted = True   # transport dropped -> the box is rebooting
-                    continue          # node still rebooting / unreachable
-                if running == version:
-                    rebooted = True   # booted the candidate kernel
+                ok, running = _running_kernel_result(runner, backend, node)
+                if not ok:
+                    # TRANSPORT failure (SSH/incus drop, control-socket
+                    # contention) — NOT a reboot. The old code set rebooted=True
+                    # on ANY empty read, so one status blip masqueraded as a
+                    # completed revert and the finally skipped rejoin, stranding
+                    # the node drained + ForceSecondary (#4905-A). Do NOT touch
+                    # `rebooted`; just retry.
+                    continue
+                # Node is reachable. Confirm a reboot ONLY from an affirmative
+                # signal: a changed boot_id, or the candidate kernel running.
+                cur_boot_id = _boot_id(runner, backend, node)
+                if _reboot_confirmed(pre_boot_id, cur_boot_id, running, version):
+                    rebooted = True
                 if st.get("promoted") == version and running == version:
                     promoted = True
                     break
@@ -1279,6 +1446,8 @@ def cmd_kernel_roll(args):
                 # signature (running==known-good, armed=none) while still drained
                 # — it must NOT be classified as a revert, or `completed=True`
                 # would suppress the finally-rejoin and strand the node drained.
+                # With the #4905-A fix, `rebooted` is now set ONLY by a confirmed
+                # boot_id change, so a transient blip can no longer forge it.
                 if (rebooted and running != version and "armed" in st
                         and st.get("armed") == "none"):
                     # node REBOOTED to a NON-candidate kernel and nothing is armed

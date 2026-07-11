@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -140,6 +141,35 @@ class Harness:
         self.created_net = False
         self.instances = []
         self.work = tempfile.mkdtemp(prefix="xpf-validate-")
+        # Per-run ownership token (#4905-D). The alias + every instance name is
+        # namespaced with it, and every destructive op refuses to touch an
+        # object that lacks THIS run's ownership tag — so a concurrent bake or
+        # an unrelated same-named VM/image is never force-deleted. process-
+        # unique (uuid4) so two `validate.py` runs on one host never collide.
+        self.run_id = uuid.uuid4().hex[:8]
+        self.alias = f"{ALIAS}-{self.run_id}"
+        self.imported_alias = False   # True once WE imported self.alias
+
+    def iname(self, suffix):
+        """Run-namespaced instance name for a scenario slot (#4905-D)."""
+        return f"xpf-image-{self.run_id}-{suffix}"
+
+    def _owned_delete(self, name):
+        """Force-delete instance `name` ONLY if it carries THIS run's ownership
+        tag (user.xpf-owner == run_id). Refuses to delete an instance this run
+        did not create — a concurrent bake or an unrelated same-named VM
+        (#4905-D). A missing instance is a safe no-op."""
+        got = incus("config", "get", name, "user.xpf-owner",
+                    check=False, capture=True)
+        if got.returncode != 0:
+            return  # instance does not exist / not queryable — nothing to delete
+        owner = (got.stdout or "").strip()
+        if owner != self.run_id:
+            info(f"refusing to delete instance {name}: ownership tag {owner!r} "
+                 f"!= this run {self.run_id!r} (concurrent bake / unrelated VM) "
+                 "— #4905-D")
+            return
+        incus("delete", "-f", name, check=False, capture=True)
 
     # ── lifecycle ──
     def ensure_network(self):
@@ -192,14 +222,24 @@ class Harness:
 
     def import_image(self):
         self.verify_signatures()
-        incus("image", "delete", ALIAS, check=False, capture=True)
-        info(f"importing image into local incus as {ALIAS}")
-        incus("image", "import", self.metadata, self.qcow2, "--alias", ALIAS)
+        # self.alias is run-namespaced, so a concurrent bake using the default
+        # `xpf-image-validate` alias is NOT clobbered (#4905-D). The pre-delete
+        # only targets our own unique alias (idempotent within a run).
+        incus("image", "delete", self.alias, check=False, capture=True)
+        info(f"importing image into local incus as {self.alias}")
+        incus("image", "import", self.metadata, self.qcow2, "--alias", self.alias)
+        self.imported_alias = True   # cleanup may now delete THIS alias (#4905-D)
 
     def launch(self, name, iso=None, root_size=None, extra_nics=0):
-        incus("delete", "-f", name, check=False, capture=True)
-        incus("init", ALIAS, name, "--vm", "--network", self.net,
-              "-c", "limits.cpu=2", "-c", "limits.memory=2GiB", capture=True)
+        # Ownership-gated pre-delete (#4905-D): only reclaim a same-named
+        # instance if it is one WE created (it won't normally exist — the name
+        # is run-namespaced).
+        self._owned_delete(name)
+        # Tag the instance with this run's ownership token so drop()/cleanup()
+        # can prove it is ours before force-deleting (#4905-D).
+        incus("init", self.alias, name, "--vm", "--network", self.net,
+              "-c", "limits.cpu=2", "-c", "limits.memory=2GiB",
+              "-c", f"user.xpf-owner={self.run_id}", capture=True)
         if root_size:
             # Override the instance's root disk to a size LARGER than the
             # image (#1925 Scenario D). `device override root` materializes an
@@ -222,17 +262,23 @@ class Harness:
 
     def drop(self, name):
         if not self.keep:
-            incus("delete", "-f", name, check=False, capture=True)
+            self._owned_delete(name)   # ownership-gated (#4905-D)
             if name in self.instances:
                 self.instances.remove(name)
 
     def cleanup(self):
         if self.keep:
-            print(f"keeping instances {self.instances}, alias {ALIAS}, network {self.net}")
+            print(f"keeping instances {self.instances}, alias {self.alias}, "
+                  f"network {self.net}")
         else:
             for i in self.instances:
-                incus("delete", "-f", i, check=False, capture=True)
-            incus("image", "delete", ALIAS, check=False, capture=True)
+                self._owned_delete(i)   # ownership-gated (#4905-D)
+            # Only delete the alias if WE imported it this run, and only the
+            # run-namespaced name — never a bystander's `xpf-image-validate`
+            # (#4905-D).
+            if self.imported_alias:
+                incus("image", "delete", self.alias, check=False, capture=True)
+            # created_net already gates the network delete to one WE created.
             if self.created_net:
                 incus("network", "delete", self.net, check=False, capture=True)
         subprocess.run(["rm", "-rf", self.work], check=False)
@@ -261,55 +307,57 @@ class Harness:
     # ── scenarios ──
     def scenario_a(self):
         info("── Scenario A: first boot, NO config drive ──")
-        self.launch("xpf-image-a")
-        self.wait_xpfd("xpf-image-a")
-        kver = guest("xpf-image-a", "uname", "-r", capture=True).stdout.strip()
+        a = self.iname("a")   # run-namespaced instance name (#4905-D)
+        self.launch(a)
+        self.wait_xpfd(a)
+        kver = guest(a, "uname", "-r", capture=True).stdout.strip()
         info(f"guest kernel: {kver}")
         rel = kver.split("-")[0]
         if not _kver_ge(rel, (6, 18)):
             fail(f"guest kernel {kver} < 6.18")
-        if not guest_sh("xpf-image-a", 'uname -r | grep -q -- -generic'):
+        if not guest_sh(a, 'uname -r | grep -q -- -generic'):
             fail("running kernel is not the -generic flavor")
-        if not guest_sh("xpf-image-a", 'test -d "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/mellanox"'):
+        if not guest_sh(a, 'test -d "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/mellanox"'):
             fail("linux-modules-extra (mlx5/i40e driver set) missing")
-        if not guest_sh("xpf-image-a", '[ "$(ls /lib/modules | wc -l)" -eq 1 ]'):
+        if not guest_sh(a, '[ "$(ls /lib/modules | wc -l)" -eq 1 ]'):
             fail("more than one kernel in /lib/modules — stale cloudimg kernel not purged")
-        if not guest_sh("xpf-image-a", 'grep -qw init_on_alloc=0 /proc/cmdline'):
+        if not guest_sh(a, 'grep -qw init_on_alloc=0 /proc/cmdline'):
             fail("init_on_alloc=0 missing from the booted kernel cmdline")
         info("in-guest verify-dataplane (the bake gate, image kernel)...")
-        if guest("xpf-image-a", "nice", "-n", "19", "/usr/local/sbin/xpfd", "verify-dataplane",
+        if guest(a, "nice", "-n", "19", "/usr/local/sbin/xpfd", "verify-dataplane",
                  check=False).returncode != 0:
             fail("in-guest verify-dataplane REJECTED — image must not ship")
-        self.wait_fxp0_dhcp("xpf-image-a")
+        self.wait_fxp0_dhcp(a)
         # #4172: frr-pythontools (/usr/lib/frr/frr-reload.py) MUST be present
         # or every FRR reload silently degrades to the additive `vtysh -f`
         # fallback and stale-config removal never converges (a deleted route
         # keeps forwarding). It is NOT pulled in transitively by `frr`, so
         # assert presence here — package-name drift fails with a clear cause
         # rather than as the downstream "deleted route still active" symptom.
-        if not guest_sh("xpf-image-a", 'test -x /usr/lib/frr/frr-reload.py'):
+        if not guest_sh(a, 'test -x /usr/lib/frr/frr-reload.py'):
             fail("frr-reload.py missing (/usr/lib/frr/frr-reload.py) — "
                  "frr-pythontools not installed (#4172 FRR reload permanently "
                  "degraded; stale-config removal never converges)")
-        if not guest_sh("xpf-image-a", 'ss -tln | grep -q ":22 "'):
+        if not guest_sh(a, 'ss -tln | grep -q ":22 "'):
             fail("sshd not listening")
-        if not guest_sh("xpf-image-a",
+        if not guest_sh(a,
                         '/usr/sbin/sshd -T | grep -qxE "permitrootlogin (prohibit-password|without-password|no)"'):
             fail("sshd effective config does not refuse root password auth")
-        if not guest_sh("xpf-image-a", '/usr/sbin/sshd -T | grep -qx "permitemptypasswords no"'):
+        if not guest_sh(a, '/usr/sbin/sshd -T | grep -qx "permitemptypasswords no"'):
             fail("sshd effective config does not pin PermitEmptyPasswords no")
-        if guest("xpf-image-a", "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
+        if guest(a, "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
             fail("unexpected /etc/xpf/xpf.conf")
-        if guest("xpf-image-a", "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
+        if guest(a, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
             fail("unexpected day-0 stamp")
-        if not guest_sh("xpf-image-a",
+        if not guest_sh(a,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "no config medium found"'):
             fail("day-0 loader did not log the no-medium fallback")
         info("Scenario A PASS")
-        self.drop("xpf-image-a")
+        self.drop(a)
 
     def scenario_b(self):
         info("── Scenario B: first boot WITH valid day-0 config drive ──")
+        b = self.iname("b")   # run-namespaced instance name (#4905-D)
         conf = os.path.join(self.work, "day0-valid.conf")
         with open(conf, "w") as f:
             f.write("system {\n    host-name xpf-day0-b;\n}\n"
@@ -318,54 +366,55 @@ class Harness:
                     "            }\n        }\n    }\n}\n")
         iso = make_config_drive.build_config_drive(conf, os.path.join(self.work, "day0-valid.iso"),
                                                    validate=False)
-        self.launch("xpf-image-b", iso)
-        self.wait_xpfd("xpf-image-b")
-        if guest("xpf-image-b", "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode != 0:
+        self.launch(b, iso)
+        self.wait_xpfd(b)
+        if guest(b, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode != 0:
             fail("day-0 stamp missing")
-        if guest("xpf-image-b", "test", "-s", "/etc/xpf/xpf.conf", check=False).returncode != 0:
+        if guest(b, "test", "-s", "/etc/xpf/xpf.conf", check=False).returncode != 0:
             fail("/etc/xpf/xpf.conf missing")
-        if not guest_sh("xpf-image-b",
+        if not guest_sh(b,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "day-0 config installed"'):
             fail("day-0 loader did not log the install")
-        self._wait("xpf-image-b",
-                   lambda: guest_sh("xpf-image-b",
+        self._wait(b,
+                   lambda: guest_sh(b,
                                     'echo "show configuration" | /usr/local/sbin/cli 2>/dev/null '
                                     '| grep -q "host-name xpf-day0-b"'),
                    20, 3, "committed config does not show host-name xpf-day0-b")
-        if not guest_sh("xpf-image-b", '[ "$(hostname)" = xpf-day0-b ]'):
+        if not guest_sh(b, '[ "$(hostname)" = xpf-day0-b ]'):
             fail("hostname not applied")
-        info("rebooting xpf-image-b — second boot must NOT re-apply...")
-        incus("restart", "xpf-image-b")
-        self.wait_agent("xpf-image-b")
-        self.wait_xpfd("xpf-image-b")
-        if not guest_sh("xpf-image-b",
+        info(f"rebooting {b} — second boot must NOT re-apply...")
+        incus("restart", b)
+        self.wait_agent(b)
+        self.wait_xpfd(b)
+        if not guest_sh(b,
                         '! journalctl -u xpf-day0-config -b --no-pager | grep -q "day-0 config installed"'):
             fail("second boot re-applied the day-0 config")
-        if not guest_sh("xpf-image-b",
+        if not guest_sh(b,
                         'systemctl show -p ConditionResult xpf-day0-config | grep -q "ConditionResult=no" '
                         '|| journalctl -u xpf-day0-config -b --no-pager | grep -q "already applied"'):
             fail("second boot: day-0 loader neither condition-skipped nor stamp-skipped")
         info("Scenario B PASS")
-        self.drop("xpf-image-b")
+        self.drop(b)
 
     def scenario_c(self):
         info("── Scenario C: first boot WITH INVALID day-0 config drive ──")
+        c = self.iname("c")   # run-namespaced instance name (#4905-D)
         conf = os.path.join(self.work, "day0-invalid.conf")
         with open(conf, "w") as f:
             f.write("system {\n    host-name xpf-day0-c;\n    dataplane-type ebpf;\n}\n")
         iso = make_config_drive.build_config_drive(conf, os.path.join(self.work, "day0-invalid.iso"),
                                                    validate=False)
-        self.launch("xpf-image-c", iso)
-        self.wait_xpfd("xpf-image-c")
-        if not guest_sh("xpf-image-c",
+        self.launch(c, iso)
+        self.wait_xpfd(c)
+        if not guest_sh(c,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q "REJECTED by commit-check"'):
             fail("day-0 loader did not log the commit-check REJECT")
-        if guest("xpf-image-c", "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
+        if guest(c, "test", "-e", "/etc/xpf/xpf.conf", check=False).returncode == 0:
             fail("invalid config was installed")
-        if guest("xpf-image-c", "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
+        if guest(c, "test", "-e", "/etc/xpf/.day0-config-applied", check=False).returncode == 0:
             fail("stamp written on REJECT")
-        self.wait_fxp0_dhcp("xpf-image-c")
-        if not guest_sh("xpf-image-c", '[ "$(hostname)" != xpf-day0-c ]'):
+        self.wait_fxp0_dhcp(c)
+        if not guest_sh(c, '[ "$(hostname)" != xpf-day0-c ]'):
             fail("invalid config changed the hostname")
         info("Scenario C reject leg PASS (fallback reachable, boot survived)")
 
@@ -385,25 +434,25 @@ class Harness:
         good_iso = make_config_drive.build_config_drive(
             good, os.path.join(self.work, "day0-c-fixed.iso"), validate=False)
         # Replace the day0 medium in place, then reboot.
-        incus("config", "device", "remove", "xpf-image-c", "day0", capture=True)
-        incus("config", "device", "add", "xpf-image-c", "day0", "disk",
+        incus("config", "device", "remove", c, "day0", capture=True)
+        incus("config", "device", "add", c, "day0", "disk",
               f"source={os.path.realpath(good_iso)}", capture=True)
-        incus("restart", "xpf-image-c")
-        self.wait_agent("xpf-image-c")
-        self.wait_xpfd("xpf-image-c")
-        if guest("xpf-image-c", "test", "-e", "/etc/xpf/.day0-config-applied",
+        incus("restart", c)
+        self.wait_agent(c)
+        self.wait_xpfd(c)
+        if guest(c, "test", "-e", "/etc/xpf/.day0-config-applied",
                  check=False).returncode != 0:
             fail("retry: day-0 stamp missing after fix+reboot — the retry "
                  "contract is broken (a rejected first boot could never be fixed)")
-        if not guest_sh("xpf-image-c",
+        if not guest_sh(c,
                         'journalctl -u xpf-day0-config -b --no-pager | grep -q '
                         '"day-0 config installed"'):
             fail("retry: day-0 loader did not install the fixed config on reboot")
-        self._wait("xpf-image-c",
-                   lambda: guest_sh("xpf-image-c", '[ "$(hostname)" = xpf-day0-c-fixed ]'),
+        self._wait(c,
+                   lambda: guest_sh(c, '[ "$(hostname)" = xpf-day0-c-fixed ]'),
                    20, 3, "retry: fixed hostname xpf-day0-c-fixed not applied")
         info("Scenario C PASS (reject survived, fix+reboot applied — retry contract)")
-        self.drop("xpf-image-c")
+        self.drop(c)
 
     def _root_fs_gib(self, name):
         """Total size of the root filesystem in GiB (float), via df."""
@@ -423,27 +472,29 @@ class Harness:
 
     def scenario_d(self):
         info("── Scenario D: first-boot root auto-grow on a resized disk (#1925) ──")
+        d = self.iname("d")     # run-namespaced instance names (#4905-D)
+        d2 = self.iname("d2")
 
         # ── Grow case: provision a root disk LARGER than the 8 GiB bake. ──
         info("D1 grow: launching with a 20GiB root disk (bake is 8GiB)...")
-        self.launch("xpf-image-d", root_size="20GiB")
-        self.wait_xpfd("xpf-image-d")
+        self.launch(d, root_size="20GiB")
+        self.wait_xpfd(d)
         # growpart + resize2fs MUST survive the cloud-init purge + autoremove
         # (#1925); a missing tool makes the grow a permanent no-op. Assert
         # presence first so package-name drift fails here with a clear cause
         # rather than as the downstream "partition still 8GiB" symptom.
-        if not guest_sh("xpf-image-d", 'command -v growpart >/dev/null'):
+        if not guest_sh(d, 'command -v growpart >/dev/null'):
             fail("growpart missing in the image — cloud-guest-utils not installed "
                  "(#1925 grow would no-op; the cloud-init purge orphaned it)")
-        if not guest_sh("xpf-image-d", 'command -v resize2fs >/dev/null'):
+        if not guest_sh(d, 'command -v resize2fs >/dev/null'):
             fail("resize2fs missing in the image — e2fsprogs not installed (#1925)")
-        if not guest_sh("xpf-image-d", 'systemctl is-active --quiet xpf-grow-root'):
+        if not guest_sh(d, 'systemctl is-active --quiet xpf-grow-root'):
             fail("xpf-grow-root.service is not active after first boot")
-        if guest("xpf-image-d", "test", "-e", "/etc/xpf/.root-grown",
+        if guest(d, "test", "-e", "/etc/xpf/.root-grown",
                  check=False).returncode != 0:
             fail("root-grow stamp /etc/xpf/.root-grown missing after grow")
-        part = self._root_part_gib("xpf-image-d")
-        fs = self._root_fs_gib("xpf-image-d")
+        part = self._root_part_gib(d)
+        fs = self._root_fs_gib(d)
         info(f"D1 grow: root partition {part:.1f}GiB, filesystem {fs:.1f}GiB")
         # The 20GiB disk minus the small ESP/BIOS/BOOT partitions leaves the
         # root partition well above the 8GiB bake floor; assert it grew past a
@@ -453,52 +504,53 @@ class Harness:
         if fs < 15.0:
             fail(f"root filesystem only {fs:.1f}GiB on a 20GiB disk — resize2fs did not run")
         # The grow must not have disturbed the dataplane gate.
-        if guest("xpf-image-d", "nice", "-n", "19", "/usr/local/sbin/xpfd",
+        if guest(d, "nice", "-n", "19", "/usr/local/sbin/xpfd",
                  "verify-dataplane", check=False).returncode != 0:
             fail("verify-dataplane REJECTED after root grow")
         # Boot/ESP partitions intact: exactly the root partition grew, the
         # partition count is unchanged, and the ESP is still mounted.
-        if not guest_sh("xpf-image-d", 'mountpoint -q /boot/efi'):
+        if not guest_sh(d, 'mountpoint -q /boot/efi'):
             fail("ESP (/boot/efi) not mounted after grow — boot substrate disturbed")
 
         # ── Idempotency: reboot must NOT re-grow / re-stamp. ──
         info("D1 idempotency: rebooting — second boot must skip the grow...")
-        incus("restart", "xpf-image-d")
-        self.wait_agent("xpf-image-d")
-        self.wait_xpfd("xpf-image-d")
-        if not guest_sh("xpf-image-d",
+        incus("restart", d)
+        self.wait_agent(d)
+        self.wait_xpfd(d)
+        if not guest_sh(d,
                         'systemctl show -p ConditionResult xpf-grow-root | grep -q '
                         '"ConditionResult=no"'):
             fail("second boot did not condition-skip xpf-grow-root (stamp ineffective)")
-        part2 = self._root_part_gib("xpf-image-d")
+        part2 = self._root_part_gib(d)
         if abs(part2 - part) > 0.1:
             fail(f"root partition changed across reboot ({part:.1f} -> {part2:.1f}GiB)")
         info("D1 PASS (grew once, idempotent on reboot, boot substrate intact)")
-        self.drop("xpf-image-d")
+        self.drop(d)
 
         # ── Control (no-op) case: bake-size disk must boot clean, no grow. ──
         info("D2 control: launching at the exact bake size (no resize)...")
-        self.launch("xpf-image-d2")
-        self.wait_xpfd("xpf-image-d2")
+        self.launch(d2)
+        self.wait_xpfd(d2)
         # The grow ran (one-shot fired) but was a no-op: growpart NOCHANGE +
         # resize2fs no-op. The stamp is written either way (clean exit), and
         # the box boots clean with the dataplane gate green.
-        if guest("xpf-image-d2", "test", "-e", "/etc/xpf/.root-grown",
+        if guest(d2, "test", "-e", "/etc/xpf/.root-grown",
                  check=False).returncode != 0:
             fail("root-grow stamp missing on the control (no-op) boot")
-        if not guest_sh("xpf-image-d2",
+        if not guest_sh(d2,
                         'journalctl -u xpf-grow-root -b --no-pager | '
                         'grep -qiE "NOCHANGE|done"'):
             fail("control boot: xpf-grow-root did not log a no-op grow")
-        if guest("xpf-image-d2", "nice", "-n", "19", "/usr/local/sbin/xpfd",
+        if guest(d2, "nice", "-n", "19", "/usr/local/sbin/xpfd",
                  "verify-dataplane", check=False).returncode != 0:
             fail("verify-dataplane REJECTED on the control boot")
         info("D2 PASS (clean boot, grow was a no-op at bake size)")
-        self.drop("xpf-image-d2")
+        self.drop(d2)
         info("Scenario D PASS")
 
     def scenario_e(self):
         info("── Scenario E: cluster node-id day-0 drive (#4209 H-9) ──")
+        e = self.iname("e")   # run-namespaced instance name (#4905-D)
         conf = os.path.join(self.work, "day0-node1.conf")
         with open(conf, "w") as f:
             f.write("system {\n    host-name xpf-node1;\n}\n"
@@ -512,13 +564,13 @@ class Harness:
             conf, os.path.join(self.work, "day0-node1.iso"), node_id=1,
             validate=False)
         # Two extra NICs so the namer has em0 (idx 1) and ge-7/0/0 (idx 2).
-        self.launch("xpf-image-e", iso, extra_nics=2)
-        self.wait_xpfd("xpf-image-e")
-        if guest("xpf-image-e", "test", "-e", "/etc/xpf/.day0-config-applied",
+        self.launch(e, iso, extra_nics=2)
+        self.wait_xpfd(e)
+        if guest(e, "test", "-e", "/etc/xpf/.day0-config-applied",
                  check=False).returncode != 0:
             fail("node-id drive: day-0 stamp missing")
         # node-id persisted verbatim.
-        nid = guest("xpf-image-e", "sh", "-c",
+        nid = guest(e, "sh", "-c",
                     "cat /etc/xpf/node-id 2>/dev/null",
                     capture=True).stdout.strip()
         if nid != "1":
@@ -526,14 +578,14 @@ class Harness:
                  "persisted from the day-0 drive")
         # Cluster-mode naming: node 1 uses FPC 7. em0 is assigned only in
         # cluster mode (position 2); ge-7/0/0 proves the node-1 FPC branch.
-        if not guest_sh("xpf-image-e", 'ip link show em0 >/dev/null 2>&1'):
+        if not guest_sh(e, 'ip link show em0 >/dev/null 2>&1'):
             fail("em0 not present — daemon did not enter cluster naming mode "
                  "for a node-id-present image")
-        if not guest_sh("xpf-image-e", 'ip link show ge-7/0/0 >/dev/null 2>&1'):
+        if not guest_sh(e, 'ip link show ge-7/0/0 >/dev/null 2>&1'):
             fail("ge-7/0/0 not present — node-1 FPC-7 positional naming did not "
                  "run (a node-0 image would name it ge-0/0/0)")
         info("Scenario E PASS (node-id=1 persisted, cluster em0 + ge-7/0/N naming)")
-        self.drop("xpf-image-e")
+        self.drop(e)
 
     def scenario_qemu(self):
         info("── Scenario Q: libvirt/plain-QEMU bootability (#4209 H-9) ──")
