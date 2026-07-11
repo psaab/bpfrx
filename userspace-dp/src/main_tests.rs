@@ -1754,13 +1754,21 @@ fn run_control_request(
 
 /// #3789: clearing `defer_workers` on a same-plan apply TRIGGERS the
 /// deferred-binding reconcile (`debug_reconcile_calls` 0 -> 1). When that
-/// reconcile aborts in the pre-teardown preflight — here the test snapshot
-/// carries no map pins, so it stops at `missing_xsk_pin` — the
+/// reconcile aborts in the pre-teardown preflight — here the gen-2 snapshot
+/// clears its mandatory map pins, so it stops at `missing_xsk_pin` — the
 /// full-reconcile handler leg now FAILS CLOSED: it reports `ok=false` and
 /// keeps the prior deferred (gen-1) snapshot as the boot baseline. Before
 /// #3789 `afxdp.reconcile` returned `()`, the handler swallowed the abort,
 /// stored the rejected gen-2 (defer_workers=false) snapshot, and acked
 /// ok=true — the M1 class #3766 fixed only for the same-plan *refresh* leg.
+///
+/// #5171: the gen-1 DEFERRED apply now carries valid (test-sentinel) map
+/// pins so it passes the new `validate_snapshot_buildable` gate and is
+/// still defer-accepted (ok=true). Before #5171 the deferred apply skipped
+/// that integrity build entirely, so gen-1 was acked ok=true even with NO
+/// map pins — the fail-open this test used to lean on to keep gen-1 valid.
+/// The missing-pin abort is now injected at gen-2 (map pins cleared) where
+/// the reconcile actually runs.
 #[test]
 fn apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_3789() {
     let state = Arc::new(Mutex::new(ServerState {
@@ -1798,6 +1806,17 @@ fn apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_
             "workers": 1,
             "ring_entries": 64,
         }),
+        // #5171: define the "lan" zone the interface references so the
+        // forwarding build in validate_snapshot_buildable resolves it. Before
+        // #5171 the deferred apply skipped the build entirely, so this gen-1
+        // snapshot was accepted even though its zoned interface referenced an
+        // UNDEFINED zone (a non-buildable config) — the fail-open this fix
+        // closes.
+        zones: vec![ZoneSnapshot {
+            name: "lan".to_string(),
+            id: 1,
+            ..ZoneSnapshot::default()
+        }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/1.0".to_string(),
             zone: "lan".to_string(),
@@ -1806,6 +1825,15 @@ fn apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_
             rx_queues: 1,
             ..InterfaceSnapshot::default()
         }],
+        // #5171: valid (test-sentinel) map pins so the deferred apply passes
+        // validate_snapshot_buildable and is still accepted (ok=true). The
+        // missing-pin abort is injected at gen-2 below, not here.
+        map_pins: MapPins {
+            xsk: "test-map-pin-ok://xsk".to_string(),
+            heartbeat: "test-map-pin-ok://heartbeat".to_string(),
+            sessions: "test-map-pin-ok://sessions".to_string(),
+            ..MapPins::default()
+        },
         defer_workers: true,
         ..ConfigSnapshot::default()
     };
@@ -1831,6 +1859,12 @@ fn apply_snapshot_same_plan_clearing_defer_workers_reconcile_abort_fails_closed_
     resumed_snapshot.fib_generation = 2;
     resumed_snapshot.generated_at = Utc::now();
     resumed_snapshot.defer_workers = false;
+    // #5171: clear the mandatory map pins on gen-2 so the deferred-binding
+    // reconcile aborts at `missing_xsk_pin` (map pins are NOT part of the
+    // binding-plan key, so gen-1 and gen-2 stay same-plan). Pre-#5171 the
+    // missing pin lived on gen-1, but a deferred apply with no pins is now
+    // rejected by validate_snapshot_buildable before it can be stored.
+    resumed_snapshot.map_pins = MapPins::default();
     assert!(same_binding_plan(&deferred_snapshot, &resumed_snapshot));
 
     let response = run_control_request(

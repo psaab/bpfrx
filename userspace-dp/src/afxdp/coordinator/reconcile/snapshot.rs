@@ -234,6 +234,120 @@ pub(super) fn build_reconcile_forwarding(
     }
 }
 
+/// #5171: the #1606/#3402 policy-state preflight, factored out so BOTH
+/// `Coordinator::reconcile`'s pre-teardown leg AND the
+/// `Coordinator::validate_snapshot_buildable` deferred-apply gate parse the
+/// policy state through the identical path — the two can never drift on
+/// which snapshots pass the policy check.
+///
+/// Resolves policy zones against the INCOMING snapshot's own zones
+/// (`zone_name_to_id_from_snapshot`), NOT `self.forwarding.zone_name_to_id`
+/// (the live table is empty on a fresh boot / HA standby first sync and
+/// stale on a new-zone apply; `populate_zones(snapshot)` runs only later in
+/// `build_forwarding_state`). Validating against the live table would flag
+/// every concrete-zone policy as `UnresolvableZoneReference` and reject the
+/// whole snapshot. Parses into a SCRATCH counter store (#1606 Codex r1 F2)
+/// so a rejected snapshot leaks no `Arc<PolicyRuleCounter>` handles into any
+/// live store. The parsed state is discarded — this is a preflight, the real
+/// parse happens later inside `build_forwarding_state`.
+pub(super) fn preflight_policy_state(
+    snapshot: &ConfigSnapshot,
+) -> Result<(), crate::policy::SnapshotIntegrityError> {
+    let preflight_counters = crate::policy::PolicyCounterStore::default();
+    let preflight_zones = crate::policy::zone_name_to_id_from_snapshot(&snapshot.zones);
+    crate::policy::parse_policy_state_with_counters(
+        &snapshot.default_policy,
+        &snapshot.policies,
+        &preflight_zones,
+        &snapshot.address_books,
+        &preflight_counters,
+    )
+    .map(|_| ())
+}
+
+/// #5171: side-effect-free validation that every MANDATORY BPF map pin
+/// (xsk/heartbeat/sessions) is present and openable, and every PRESENT
+/// optional pin (conntrack v4/v6, dnat tables) is openable — exactly the
+/// emptiness + open checks `preflight_map_fds` runs (via the same
+/// `OwnedFd::open_bpf_map`), but WITHOUT keeping the FDs, mutating
+/// `bindings`, or writing `last_reconcile_stage`. Each opened FD is dropped
+/// immediately; openability is the only signal a validate-only path needs.
+/// Returns the same stage descriptor `preflight_map_fds` would set, wrapped
+/// in `ReconcileError::MapSetup`, so the deferred-apply integrity gate
+/// reports an identical error to the reconcile path (a MISSING/UNOPENABLE
+/// mandatory pin is the #5171 headline fail-open a deferred apply must
+/// reject before ack/persist).
+pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::ReconcileError> {
+    for (pin, empty_stage, open_stage) in [
+        (
+            &snapshot.map_pins.xsk,
+            "missing_xsk_pin",
+            "open_xsk_map_failed",
+        ),
+        (
+            &snapshot.map_pins.heartbeat,
+            "missing_heartbeat_pin",
+            "open_heartbeat_map_failed",
+        ),
+        (
+            &snapshot.map_pins.sessions,
+            "missing_session_pin",
+            "open_session_map_failed",
+        ),
+    ] {
+        if pin.is_empty() {
+            return Err(super::ReconcileError::MapSetup(empty_stage.to_string()));
+        }
+        // Open then drop: proves the mandatory pin resolves to a real map
+        // without retaining the FD or mutating any published state.
+        OwnedFd::open_bpf_map(pin)
+            .map_err(|err| super::ReconcileError::MapSetup(format!("{open_stage}:{err}")))?;
+    }
+    // #2444 empty-vs-present discipline: an empty optional pin means the
+    // feature is absent (no gating); a PRESENT pin that fails to open is
+    // fatal (the feature WAS configured but its map is unopenable), exactly
+    // as `open_optional_map` treats it.
+    for (pin, name) in [
+        (&snapshot.map_pins.conntrack_v4, "conntrack_v4"),
+        (&snapshot.map_pins.conntrack_v6, "conntrack_v6"),
+        (&snapshot.map_pins.dnat_table, "dnat_table"),
+        (&snapshot.map_pins.dnat_table_v6, "dnat_table_v6"),
+    ] {
+        if !pin.is_empty() {
+            OwnedFd::open_bpf_map(pin).map_err(|err| {
+                super::ReconcileError::MapSetup(format!("open_{name}_map_failed:{err}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// #5171: side-effect-free forwarding-build integrity validation. Runs the
+/// SAME `build_forwarding_state_with_policy_counters_and_previous` build
+/// that `build_reconcile_forwarding` runs — so the two paths reject the
+/// identical non-buildable snapshots (invalid interface address, CoS queue,
+/// NPTv6 rule, ...) with no drift — but with SCRATCH policy + NAT counter
+/// stores so a rejected snapshot leaks no per-rule counter handles into the
+/// LIVE stores, and reading the prior `coord.forwarding` as the build's
+/// "previous" arg exactly as the real build does. The built state is
+/// discarded; only its Ok/Err verdict is returned. `WgEngine::new` (invoked
+/// inside the build for a WG endpoint) is a pure constructor — no socket
+/// bind, no thread spawn — so the discarded build has no observable side
+/// effect.
+pub(super) fn validate_forwarding_buildable(
+    coord: &Coordinator,
+    snapshot: &ConfigSnapshot,
+) -> Result<(), super::ReconcileError> {
+    build_forwarding_state_with_policy_counters_and_previous(
+        snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&coord.forwarding),
+    )
+    .map(|_| ())
+    .map_err(super::ReconcileError::Integrity)
+}
+
 /// #2444: open an OPTIONAL BPF map pin with empty-vs-present discipline.
 ///
 /// - empty pin -> `Ok(None)` (feature genuinely absent; no gating). This

@@ -3398,6 +3398,98 @@ fn reconcile_missing_pin_returns_map_setup_err_3789() {
     }
 }
 
+/// #5171: the side-effect-free `validate_snapshot_buildable` gate (used by
+/// the deferred-activation apply path, which never reaches `reconcile`) and
+/// the worker-spawning `reconcile` MUST reject the IDENTICAL non-buildable
+/// snapshots — same `ReconcileError` variant, same stage descriptor — so the
+/// defer path can never drift from the path that actually builds forwarding.
+/// This locks the no-drift guarantee that lets the defer branch reuse the
+/// integrity legs without duplicating their logic.
+///
+/// Two failure classes are checked: a MISSING mandatory map pin
+/// (`ReconcileError::MapSetup`) and a forwarding-build integrity fault —
+/// unparseable interface address (`ReconcileError::Integrity`). A fully
+/// buildable snapshot passes both; a `None` snapshot (teardown) is trivially
+/// buildable.
+///
+/// Fail-on-revert: `validate_snapshot_buildable` calls the SAME
+/// `preflight_policy_state` / `validate_map_pins` (open the same pins) /
+/// `build_forwarding_state_..` primitives `reconcile` runs; a drift in
+/// either path (e.g. skipping the map-pin or forwarding leg) makes one of
+/// the paired assertions below diverge.
+#[test]
+fn validate_snapshot_buildable_matches_reconcile_5171() {
+    // --- Class 1: a MISSING mandatory map pin -----------------------------
+    let mut missing_pin = fail_open_snapshot(8);
+    missing_pin.map_pins.sessions = String::new(); // -> missing_session_pin
+
+    let mut recon_coord = Coordinator::new();
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+    let recon = recon_coord.reconcile(Some(&missing_pin), &mut bindings, 64);
+    assert!(
+        matches!(&recon, Err(ReconcileError::MapSetup(stage)) if stage == "missing_session_pin"),
+        "reconcile must reject the missing-session-pin snapshot at missing_session_pin, got {recon:?}"
+    );
+
+    // validate rejects the SAME snapshot with the SAME MapSetup stage, on a
+    // FRESH coordinator with NO bindings — proving it needs neither.
+    let validate_coord = Coordinator::new();
+    let validated = validate_coord.validate_snapshot_buildable(Some(&missing_pin));
+    assert!(
+        matches!(&validated, Err(ReconcileError::MapSetup(stage)) if stage == "missing_session_pin"),
+        "validate_snapshot_buildable must reject the same snapshot with the same MapSetup stage, got {validated:?}"
+    );
+    // Side-effect-free: no workers spawned, no per-binding error stamped.
+    assert!(
+        validate_coord.workers.live.is_empty(),
+        "validate_snapshot_buildable must not bring up workers"
+    );
+
+    // --- Class 2: a forwarding-build integrity fault ----------------------
+    let mut bad_build = fail_open_snapshot(9);
+    bad_build.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions"); // all pins open
+    bad_build.interfaces = vec![crate::protocol::snapshot::InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        ifindex: 10,
+        addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.0.0.0/33".to_string(), // unparseable -> Integrity
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+
+    let mut recon_coord2 = Coordinator::new();
+    let mut bindings2: Vec<BindingStatus> = Vec::new();
+    let recon2 = recon_coord2.reconcile(Some(&bad_build), &mut bindings2, 64);
+    assert!(
+        matches!(recon2, Err(ReconcileError::Integrity(_))),
+        "reconcile must reject the unparseable-address snapshot as Integrity, got {recon2:?}"
+    );
+    let validate_coord2 = Coordinator::new();
+    assert!(
+        matches!(
+            validate_coord2.validate_snapshot_buildable(Some(&bad_build)),
+            Err(ReconcileError::Integrity(_))
+        ),
+        "validate_snapshot_buildable must reject the same snapshot as Integrity"
+    );
+
+    // --- Buildable + None both pass validate ------------------------------
+    let mut ok_snap = fail_open_snapshot(10);
+    ok_snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    let ok_coord = Coordinator::new();
+    assert!(
+        ok_coord.validate_snapshot_buildable(Some(&ok_snap)).is_ok(),
+        "a fully-buildable snapshot must pass validate_snapshot_buildable"
+    );
+    assert!(
+        ok_coord.validate_snapshot_buildable(None).is_ok(),
+        "a None snapshot (teardown) is trivially buildable"
+    );
+}
+
 /// #3402: a FRESH-BOOT snapshot ships its zones AND a concrete-zone policy in
 /// the SAME atomic ConfigSnapshot, with the coordinator's live forwarding zone
 /// table still EMPTY (populate_zones(snapshot) runs only later inside
