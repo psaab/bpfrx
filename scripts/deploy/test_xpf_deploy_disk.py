@@ -27,6 +27,9 @@ path and it IS the golden.
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -163,6 +166,110 @@ class LibvirtPerVmDiskTests(unittest.TestCase):
         r = RecordingRunner()
         with self.assertRaises(SystemExit):
             xpf_deploy.deploy_libvirt(ap, r, start=False)
+
+
+class LibvirtGoldenOverwriteGuardTests(unittest.TestCase):
+    """#5043: `fetch --install-libvirt` must NOT overwrite a golden qcow2 in
+    place while per-VM overlays back onto it — that shifts the immutable
+    backing bytes under every overlay and corrupts them (both HA nodes commonly
+    share one golden). First install (no golden yet) and a re-fetch with no
+    dependent overlays stay allowed; the dangerous in-place overwrite of an
+    in-use golden fails closed.
+
+    On revert (drop the guard so `_install_libvirt_golden` copies over any
+    existing golden unconditionally) the refuse/no-clobber assertions in
+    test_overwrite_with_dependent_overlay_is_refused go RED.
+    """
+
+    def setUp(self):
+        # A private temp dir stands in for /var/lib/libvirt/images so the copy
+        # path is writable (no sudo) and the scan sees only our fixtures.
+        self._imgdir = tempfile.mkdtemp(prefix="xpf-golden-images-")
+        self._srcdir = tempfile.mkdtemp(prefix="xpf-golden-src-")
+        self._orig_images = xpf_deploy.LIBVIRT_IMAGES
+        self._orig_backing = xpf_deploy._qcow2_backing_file
+        xpf_deploy.LIBVIRT_IMAGES = self._imgdir
+        # Fake the qemu-img backing probe so the test is hermetic (no qemu-img
+        # required): a {realpath: backing-or-None} map drives the classifier.
+        self._backing = {}
+
+        def fake_backing(path):
+            return self._backing.get(os.path.realpath(path))
+
+        xpf_deploy._qcow2_backing_file = fake_backing
+
+    def tearDown(self):
+        xpf_deploy.LIBVIRT_IMAGES = self._orig_images
+        xpf_deploy._qcow2_backing_file = self._orig_backing
+        shutil.rmtree(self._imgdir, ignore_errors=True)
+        shutil.rmtree(self._srcdir, ignore_errors=True)
+
+    def _write(self, path, content):
+        with open(path, "wb") as f:
+            f.write(content)
+        return path
+
+    def _src(self, content=b"VERIFIED-NEW-GOLDEN"):
+        # Source lives OUTSIDE the images dir so it is never scanned as an
+        # overlay (mirrors the real fetch out-dir).
+        return self._write(os.path.join(self._srcdir, "verified.qcow2"), content)
+
+    def _golden_path(self, image="xpf-appliance"):
+        return os.path.join(self._imgdir, f"{image}.qcow2")
+
+    def test_first_install_copies_the_golden(self):
+        # No golden present yet -> the copy proceeds (first-install path).
+        src = self._src(b"GOLDEN-V1")
+        dst = xpf_deploy._install_libvirt_golden(src, "xpf-appliance")
+        self.assertEqual(os.path.realpath(dst),
+                         os.path.realpath(self._golden_path()))
+        with open(dst, "rb") as f:
+            self.assertEqual(f.read(), b"GOLDEN-V1")
+
+    def test_refetch_without_dependent_overlays_replaces(self):
+        # Golden exists, but nothing backs onto it -> legitimate re-fetch is
+        # allowed and the golden is replaced with the new verified bytes.
+        golden = self._write(self._golden_path(), b"GOLDEN-V1")
+        # An unrelated image in the same dir (its own full image, no backing).
+        other = self._write(os.path.join(self._imgdir, "some-other.qcow2"), b"x")
+        self._backing[os.path.realpath(other)] = None
+        xpf_deploy._install_libvirt_golden(self._src(b"GOLDEN-V2"), "xpf-appliance")
+        with open(golden, "rb") as f:
+            self.assertEqual(f.read(), b"GOLDEN-V2")
+
+    def test_overwrite_with_dependent_overlay_is_refused(self):
+        # Golden exists AND a per-VM overlay backs onto it -> refuse, and the
+        # golden bytes must be UNCHANGED (no partial clobber before the die).
+        golden = self._write(self._golden_path(), b"GOLDEN-V1")
+        overlay = self._write(os.path.join(self._imgdir, "ha-fw0.qcow2"), b"ovl")
+        self._backing[os.path.realpath(overlay)] = os.path.realpath(golden)
+        with self.assertRaises(SystemExit):
+            xpf_deploy._install_libvirt_golden(self._src(b"GOLDEN-V2"),
+                                               "xpf-appliance")
+        with open(golden, "rb") as f:
+            self.assertEqual(f.read(), b"GOLDEN-V1",
+                             "golden must not be touched when overwrite refused")
+
+    def test_dependent_overlays_lists_only_true_backers(self):
+        golden = self._write(self._golden_path(), b"G")
+        dep0 = self._write(os.path.join(self._imgdir, "ha-fw0.qcow2"), b"a")
+        dep1 = self._write(os.path.join(self._imgdir, "ha-fw1.qcow2"), b"b")
+        indep = self._write(os.path.join(self._imgdir, "unrelated.qcow2"), b"c")
+        self._backing[os.path.realpath(dep0)] = os.path.realpath(golden)
+        self._backing[os.path.realpath(dep1)] = os.path.realpath(golden)
+        # Backs onto a DIFFERENT golden -> not a dependent of this one.
+        self._backing[os.path.realpath(indep)] = "/var/lib/libvirt/images/other.qcow2"
+        deps = {os.path.realpath(d)
+                for d in xpf_deploy._dependent_overlays(golden)}
+        self.assertEqual(deps,
+                         {os.path.realpath(dep0), os.path.realpath(dep1)})
+
+    def test_golden_is_not_its_own_overlay(self):
+        # A golden whose own backing (spuriously) resolves to itself must never
+        # be reported as a dependent overlay of itself.
+        golden = self._write(self._golden_path(), b"G")
+        self._backing[os.path.realpath(golden)] = os.path.realpath(golden)
+        self.assertEqual(xpf_deploy._dependent_overlays(golden), [])
 
 
 if __name__ == "__main__":

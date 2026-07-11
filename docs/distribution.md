@@ -206,6 +206,27 @@ per-VM copy-on-write overlay backed read-only by the golden. `--install-libvirt`
 is the one step that moves the *verified* qcow2 to the shared golden path; both
 sides derive that path from the same helper so they cannot drift.
 
+**Golden immutability — re-fetch over an in-use golden is REFUSED (#5043).**
+The golden is a *shared, read-only backing store*: each per-VM overlay is
+`qemu-img create -b <golden>` and depends on the golden's bytes never changing.
+Overwriting it in place while overlays back onto it shifts the backing bytes
+under every live overlay and corrupts them — and because an HA pair usually
+shares one golden, a single re-fetch would poison *both* nodes' disks. So
+`fetch --install-libvirt` refuses to overwrite a golden that still has
+dependent overlays (it scans `/var/lib/libvirt/images/*.qcow2` and checks each
+one's `qemu-img info` backing file). First install (no golden yet) and a
+re-fetch after the dependents are gone both proceed normally. To roll a new
+image onto hosts with live VMs, EITHER:
+
+- destroy the dependent VM(s) first so no overlay references the old golden —
+  `xpf-deploy.py --hypervisor libvirt destroy <appliance.yaml>` per VM — then
+  re-run `fetch --install-libvirt`; OR
+- install the new image under a *fresh tag* so existing overlays keep their
+  immutable backing —
+  `fetch --install-libvirt --alias xpf-<newver>` — and point the deploy YAML at
+  `image: xpf-<newver>`. New VMs boot from the new golden; already-deployed VMs
+  keep running on the old one until you redeploy them.
+
 ### CAUTION — interface takeover (#1879)
 
 `xpfd` owns and renames every interface on the host. A bare-metal `apt install
