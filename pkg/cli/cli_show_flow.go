@@ -731,12 +731,13 @@ func (c *CLI) showFlowSession(args []string) error {
 					fmt.Println()
 				}
 			}
-			// #5034 (C175-HC-073): the peer's GetSessions now returns a REAL
+			// #5034 (C175-HC-073): a current peer's GetSessions returns a REAL
 			// filtered total in Total — an exact count-only scan of
-			// filter-matching sessions, no longer the -1 sentinel. Render it
-			// directly. The #5033 len(Sessions) fallback for the sentinel is
-			// gone: len(Sessions) undercounts once the peer's result is
-			// capped (limit 10000), whereas Total is the true count.
+			// filter-matching sessions, no longer the -1 sentinel — so it is
+			// rendered directly (Total is the true count; len(Sessions)
+			// undercounts once the peer's result is capped at limit 10000).
+			// peerSessionsTotal retains the -1-sentinel->len fallback for a
+			// pre-#5034 peer during a mixed-version ISSU window.
 			fmt.Printf("Total sessions: %d\n", peerSessionsTotal(peerResp))
 		}
 	}

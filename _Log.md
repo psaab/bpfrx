@@ -45831,3 +45831,19 @@ top.
   pkg/ddns/README.md ok-response wording.
 - **File(s)**: pkg/ddns/backend_generic.go, pkg/ddns/backend_http_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5034 review fold (rev-5559 MERGE-NEEDS-MINOR) — restore the
+  -1-sentinel fallback in `peerSessionsTotal` for mixed-version clusters.
+  Removing the #5033 `Total<0 -> len(Sessions)` guard assumed the server
+  never emits -1, but a PEER is a separate binary: during ISSU / rolling
+  upgrade a new cli querying an OLD (pre-#5034) peer gets Total=-1 for a
+  filtered query and would render "Total sessions: -1", re-exposing the
+  #4908/#5033 display bug in the upgrade window. `peerSessionsTotal` now
+  returns Total only when `>= 0`, else falls back to `len(Sessions)` as
+  #5033 did (dead branch once both nodes run #5034+). Added
+  `TestPeerSessionsTotalMixedVersionFallback` (RED-on-revert: drop the guard
+  -> renders raw -1). Updated the render-site comment. go build ./... + go
+  test ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
+  **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/peer_sessions_total_5034_test.go, _Log.md
