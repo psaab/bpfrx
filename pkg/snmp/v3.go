@@ -832,11 +832,31 @@ func (a *Agent) encryptPDU(user *usmUser, scopedPDU []byte) ([]byte, []byte, err
 	}
 	switch user.privProto {
 	case "des":
-		enc, err := encryptDES(user.privKey, scopedPDU, salt)
+		// RFC 3414 §8.1.1.1 RECOMMENDS the DES privacy salt be
+		// snmpEngineBoots(4) || local-integer(4) (big-endian) so the DES-CBC IV
+		// (key-derived preIV XOR salt) is DETERMINISTICALLY unique across a
+		// REBOOT: a fresh boot advances the high 32 salt bytes regardless of
+		// where the monotonic counter re-randomizes its start. Overlay
+		// engineBoots onto the counter's high 32 bits; keep the counter's low 32
+		// bits (salt[4:8]) as the per-message local-integer. That low half still
+		// increments monotonically per PDU and repeats only every 2^32 messages,
+		// so within-boot IV uniqueness is preserved for 2^32 PDUs — this does NOT
+		// reopen #5032 (that defect was birthday-bound random salts; the counter
+		// model is unchanged). The overlaid salt is what we build the IV from AND
+		// what we return as privParams: the wire salt MUST equal the IV salt or
+		// the manager's decryptDES rebuilds a different IV and decodes garbage.
+		//
+		// The AES path is intentionally left with the raw counter — encryptAES128
+		// embeds engineBoots in its own IV (boots||time||salt), so its cross-boot
+		// uniqueness is already deterministic without touching the salt.
+		desSalt := make([]byte, 8)
+		copy(desSalt, salt)
+		binary.BigEndian.PutUint32(desSalt[0:4], uint32(a.engineBoots))
+		enc, err := encryptDES(user.privKey, scopedPDU, desSalt)
 		if err != nil {
 			return nil, nil, err
 		}
-		return enc, salt, nil
+		return enc, desSalt, nil
 	case "aes128":
 		enc, err := encryptAES128(user.privKey, scopedPDU, salt, a.engineBoots, a.engineTime())
 		if err != nil {
@@ -850,11 +870,14 @@ func (a *Agent) encryptPDU(user *usmUser, scopedPDU []byte) ([]byte, []byte, err
 
 // encryptDES encrypts data using DES-CBC per RFC 3414 §8.1.1.1. The caller
 // supplies the 8-octet privacy salt (msgPrivacyParameters); the CBC IV is the
-// key-derived pre-IV XORed with that salt. RFC 3414 §8.1.1.1 requires the salt
-// to differ for each message within an engineBoots domain — the agent allocates
-// it from a monotonic counter (Agent.nextPrivSalt), guaranteeing a distinct IV
-// per message so DES-CBC never repeats first-block structure (RFC 3414 §8.2.1).
-// The salt is returned to the wire unchanged as privParams by the caller.
+// key-derived pre-IV XORed with that salt. RFC 3414 §8.1.1.1 RECOMMENDS the salt
+// be snmpEngineBoots(4) || local-integer(4) (big-endian): encryptPDU builds it
+// as engineBoots(4) || counter32(4), where counter32 is the low half of the
+// monotonic Agent.nextPrivSalt counter. The engineBoots prefix makes the IV
+// deterministically unique across a reboot; the counter32 makes it distinct for
+// each of up to 2^32 messages within a boot, so DES-CBC never repeats
+// first-block structure (RFC 3414 §8.2.1). The salt is returned to the wire
+// unchanged as privParams by the caller so the receiver rebuilds the same IV.
 func encryptDES(privKey, data, salt []byte) ([]byte, error) {
 	if len(privKey) < 16 {
 		return nil, fmt.Errorf("snmpv3: DES privacy key too short: %d bytes", len(privKey))

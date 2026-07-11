@@ -1,3 +1,19 @@
+## 2026-07-11 — #5544 snmp/v3: prefix DES privacy salt with engineBoots (RFC 3414 §8.1.1.1)
+- **Timestamp**: 2026-07-11 (fix/5544-snmp-des-salt-boots)
+- **Action**: `encryptPDU` (pkg/snmp/v3.go) allocated an 8-byte monotonic-counter
+  privacy salt via `nextPrivSalt` and passed it verbatim to BOTH the DES and AES
+  paths. RFC 3414 §8.1.1.1 RECOMMENDS the DES salt be
+  `snmpEngineBoots(4) || local-integer(4)` (big-endian) so cross-REBOOT DES-CBC
+  IV uniqueness is DETERMINISTIC, not merely probabilistic. Overlaid engineBoots
+  onto the counter's high 32 bits in the `case "des"` branch
+  (`desSalt = engineBoots(4) || salt[4:8]`), passed desSalt to encryptDES AND
+  returned it as privParams (wire salt must equal IV salt or decryptDES rebuilds
+  a wrong IV). Low 32 bits stay the monotonic counter → within-boot uniqueness
+  preserved for 2^32 PDUs (does NOT reopen #5032). AES path UNCHANGED
+  (encryptAES128 already embeds boots in its own IV). Updated encryptPDU DES-branch
+  + encryptDES doc comments. Added test/verified RED-on-revert.
+- **File(s)**: pkg/snmp/v3.go, pkg/snmp/des_salt_boots_5544_test.go, _Log.md
+
 ## 2026-07-11 — #5577 dataplane/userspace: prune quarantined member from scoped-global deny (fail-open fix)
 - **Timestamp**: 2026-07-11 (fix/5577-quarantine-scoped-global-member)
 - **Action**: `quarantineCollidingZones` (pkg/dataplane/userspace/zones_quarantine.go)
