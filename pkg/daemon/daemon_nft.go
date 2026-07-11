@@ -300,7 +300,14 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 		}
 		return nil
 	}
-	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs)
+	// #5582: the configured WireGuard listen port(s). The XDP shim steers
+	// local-destination UDP on the WG listen port to the kernel WG socket, so the
+	// host-inbound filter must admit that port or a fresh passive handshake to a
+	// restricted zoned address is dropped by the per-zone catch-all. Empty (nil)
+	// when no WG tunnel is configured — buildHostInboundFilterPayload then emits
+	// no WG accept, so the restricted-default posture is unchanged.
+	wgListenPorts := cfg.WireGuardListenPorts()
+	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs, wgListenPorts)
 	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
@@ -497,6 +504,14 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     set omitting `ping` does not black-hole PMTUD/ND/error delivery. This set
 //     is mirrored by the userspace host-inbound exemption (#3171) so kernel and
 //     XSK LocalDelivery agree. Echo-request stays gated on the `ping` service.
+//     3b. #5582: when WireGuard is configured, a coarse
+//     `udp dport <configured-wg-listen-port(s)> accept` (emitHostInbound
+//     WireGuardAccept). The shim steers local-destination UDP on the WG listen
+//     port to the kernel WG socket, so the host-inbound filter must admit it or a
+//     fresh passive handshake to a restricted zoned address is dropped by the
+//     per-zone catch-all. A single global input-hook rule (input = host-destined
+//     only), so it mirrors the shim's local-destination scope without touching
+//     transit UDP; only the WG port is opened, so the restricted default holds.
 //  4. Per host-inbound-configured zone, per family with addresses:
 //     - if `system-services all` / `any-service`: <fam> daddr <addrs> accept
 //     (and no deny — the operator opened the zone to all services).
@@ -508,7 +523,7 @@ func hostInboundHasEnforceableView(views []dpuserspace.ZoneHostInboundView) bool
 //     the table body and scraped per zone/family into the
 //     xpf_host_inbound_kernel_denies_total metric (#3361) — distinct from the
 //     userspace-dp xpf_host_inbound_denies_total path (#3326).
-func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, programs []dpuserspace.JunosHostProgram) string {
+func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, programs []dpuserspace.JunosHostProgram, wgListenPorts []uint16) string {
 	// Pre-pass: collect the named DROP counters the chain will reference, so they
 	// can be declared at the top of the table body BEFORE the chain. A counter is
 	// emitted exactly when emitHostInboundZone emits a catch-all drop
@@ -620,6 +635,11 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 		}
 		// (4) ND/PMTUD/ICMP-error accepts for NON-denied sources.
 		emitHostInboundICMPAccepts(&rules)
+		// (4b) #5582: coarse WireGuard listen-port admission. Placed AFTER the
+		// fine junos-host DROP subchain so an explicit operator `to-zone
+		// junos-host` deny of a WG source still wins; it is a coarse admit like
+		// the ND/PMTUD accepts.
+		emitHostInboundWireGuardAccept(&rules, wgListenPorts)
 		// (5) Residual full established accept (non-denied established inbound).
 		rules = append(rules, "    ct state established,related accept")
 	} else {
@@ -637,6 +657,11 @@ func buildHostInboundFilterPayload(views []dpuserspace.ZoneHostInboundView, unzo
 		// enforcement.
 		rules = append(rules, "    meta l4proto { 50, 51 } accept")
 		emitHostInboundICMPAccepts(&rules)
+		// #5582: coarse WireGuard listen-port admission (see
+		// emitHostInboundWireGuardAccept). A single global accept on the input
+		// hook, so the shim-steered outer transport reaches the userspace WG
+		// socket regardless of which zone's address it is destined to.
+		emitHostInboundWireGuardAccept(&rules, wgListenPorts)
 	}
 
 	for _, v := range views {
@@ -676,6 +701,57 @@ func emitHostInboundICMPAccepts(rules *[]string) {
 	*rules = append(*rules, "    icmpv6 type { 1, 2, 3, 4 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6Error)+"\" accept")
 	*rules = append(*rules, "    icmpv6 type { 133, 134, 135, 136, 137 } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP6ND)+"\" accept")
 	*rules = append(*rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } counter name \""+xnft.HostInboundAcceptCounterName(xnft.HostInboundAcceptICMP4Error)+"\" accept")
+}
+
+// emitHostInboundWireGuardAccept appends the #5582 dynamic WireGuard listen-port
+// admission: a single coarse `udp dport <configured-wg-port(s)> accept` on the
+// host-inbound input hook.
+//
+// The XDP shim deliberately steers local-destination UDP on the configured WG
+// listen port to the kernel (userspace-xdp wg_steer_to_kernel) so the userspace
+// WireGuard control socket receives the outer transport. Without this accept a
+// FRESH passive (responder-only) handshake — conntrack NEW, so the leading
+// `ct state established,related accept` does not cover it — misses the per-zone
+// service accepts and is dropped by the host-inbound catch-all (or the #4420
+// addressed-but-unzoned catch-all), so a supported responder-only WireGuard
+// listener can never come up on a restricted zoned address.
+//
+// The rule is emitted ONCE, not per zone. The nft input hook only ever sees
+// host-destined packets, so a bare `udp dport <port>` admits the WG port to
+// EVERY firewall-local address — exactly the shim's `is_local_destination`
+// steering scope — while transit/forward UDP (which traverses the forward hook,
+// never this input chain) is untouched, so transit/DNAT UDP on the WG port is
+// never shunted around policy. Only the configured WG port(s) are opened; every
+// other host-bound service stays governed by the per-zone default-deny, so the
+// restricted-default posture is preserved.
+//
+// The port set is the compile-time SSOT config.WireGuardListenPorts() (all
+// configured WG tunnels). The shim's single-port WG-RX steering (S2a) only
+// steers the FIRST configured listen port today, so for a config with a second
+// WG tunnel on a different port that second rule is currently a no-op at the
+// kernel (nothing steers that port up), but admitting all configured ports keeps
+// the kernel filter correct-in-intent and ready for the deferred multi-tunnel
+// steering (#1434 Increment 2). No-op when WG is not configured.
+func emitHostInboundWireGuardAccept(rules *[]string, wgListenPorts []uint16) {
+	if len(wgListenPorts) == 0 {
+		return
+	}
+	*rules = append(*rules, "    udp dport "+renderWireGuardPortSpec(wgListenPorts)+" accept")
+}
+
+// renderWireGuardPortSpec renders the WireGuard listen-port set as an nft
+// destination-port value: a single port ("51820") or an anonymous set
+// ("{ 51820, 51821 }"). Ports arrive sorted+deduped from
+// config.WireGuardListenPorts().
+func renderWireGuardPortSpec(ports []uint16) string {
+	if len(ports) == 1 {
+		return strconv.Itoa(int(ports[0]))
+	}
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(int(p))
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
 }
 
 // emitJunosHostDenyProgram appends one ingress zone's fine `to-zone junos-host`

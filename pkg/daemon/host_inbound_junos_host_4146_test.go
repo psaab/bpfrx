@@ -86,7 +86,7 @@ func junosHostPayload(t *testing.T, cfg *config.Config) (string, []dpuserspace.J
 	t.Helper()
 	views := dpuserspace.BuildZoneHostInboundViews(cfg)
 	programs := dpuserspace.BuildJunosHostPrograms(cfg)
-	return buildHostInboundFilterPayload(views, nil, nil, programs), programs
+	return buildHostInboundFilterPayload(views, nil, nil, programs, nil), programs
 }
 
 // junosHostSection returns the payload lines from the junos-host DROP subchain
