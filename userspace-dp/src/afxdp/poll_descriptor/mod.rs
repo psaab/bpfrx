@@ -1182,7 +1182,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 // error/PMTUD control message stays admitted on a
                                 // ping-less zone (mirrors the kernel chain). 0
                                 // for non-ICMP (ignored by host_inbound_admits).
-                                raw_frame
+                                // #5140: read the INNER type via `packet_frame`
+                                // (= decapped frame post native-GRE, else
+                                // `raw_frame`); `meta.l4_offset` is inner-relative
+                                // after `stage_native_gre_decap`, so indexing the
+                                // outer `raw_frame` would read the wrong byte and
+                                // could admit an ordinary echo as an exempt error.
+                                packet_frame
                                     .get(meta.l4_offset as usize)
                                     .copied()
                                     .unwrap_or(0),
@@ -1349,9 +1355,15 @@ pub(super) fn poll_binding_process_descriptor(
                             resolved.decision.resolution.disposition,
                             ForwardingDisposition::ForwardCandidate
                         ) {
-                            // #1145: reuse line-50 raw_frame bind.
+                            // #5140: read the INNER packet via `packet_frame`
+                            // (decapped frame post native-GRE, else `raw_frame`).
+                            // The TTL/hop-limit test + the embedded original in
+                            // the generated Time Exceeded are keyed on the
+                            // inner-relative `meta` offsets; `desc` is carried
+                            // only to recycle the outer UMEM slot (the reply is a
+                            // freshly built prebuilt frame).
                             let local_icmp_te = build_local_time_exceeded_request(
-                                raw_frame,
+                                packet_frame,
                                 desc,
                                 meta,
                                 &worker_ctx.ident,
@@ -2178,8 +2190,14 @@ pub(super) fn poll_binding_process_descriptor(
                         let is_embedded_icmp_error = if worker_ctx.forwarding.allow_embedded_icmp
                             && matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6)
                         {
-                            // #1145: reuse line-50 raw_frame bind.
-                            raw_frame
+                            // #5140: classify on the INNER ICMP type via
+                            // `packet_frame` (decapped frame post native-GRE, else
+                            // `raw_frame`). `meta.l4_offset` is inner-relative
+                            // after `stage_native_gre_decap`; indexing the outer
+                            // `raw_frame` could read an arbitrary outer byte and
+                            // misclassify an ordinary echo as an exempt embedded
+                            // error (permitted without policy check).
+                            packet_frame
                                 .get(meta.l4_offset as usize)
                                 .copied()
                                 .map(|icmp_type| is_icmp_error(meta.protocol, icmp_type))
@@ -2221,7 +2239,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 // error/PMTUD control messages are admitted on a
                                 // ping-less zone (mirrors the kernel chain). 0
                                 // for non-ICMP (ignored by host_inbound_admits).
-                                raw_frame
+                                // #5140: read the INNER type via `packet_frame`
+                                // (decapped frame post native-GRE, else
+                                // `raw_frame`) — `meta.l4_offset` is inner-relative
+                                // after `stage_native_gre_decap`, so the outer
+                                // `raw_frame` would read the wrong byte and could
+                                // host-admit an ordinary echo as an exempt error.
+                                packet_frame
                                     .get(meta.l4_offset as usize)
                                     .copied()
                                     .unwrap_or(0),
@@ -2902,9 +2926,16 @@ pub(super) fn poll_binding_process_descriptor(
                                     }
                                     None
                                 };
-                                // #1145: reuse line-50 raw_frame bind.
+                                // #5140: read the INNER packet via `packet_frame`
+                                // (decapped frame post native-GRE, else
+                                // `raw_frame`). The TTL/hop-limit test + the
+                                // embedded original in the generated Time Exceeded
+                                // are keyed on the inner-relative `meta` offsets;
+                                // `desc` is carried only to recycle the outer UMEM
+                                // slot (the reply is a freshly built prebuilt
+                                // frame).
                                 let local_icmp_te = build_local_time_exceeded_request(
-                                    raw_frame,
+                                    packet_frame,
                                     desc,
                                     meta,
                                     &worker_ctx.ident,

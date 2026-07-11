@@ -1,3 +1,45 @@
+## 2026-07-11 — #5140 (security): post-GRE-decap ICMP/host-inbound/TTL reads use packet_frame, not outer raw_frame
+- **Timestamp**: 2026-07-11 (fix/5140-gre-decap-packet-frame)
+- **Action**: `stage_native_gre_decap` returns a synthetic inner frame
+  (`owned_packet_frame`) whose meta offsets are inner-relative, while
+  `raw_frame` stays the OUTER frame. Several post-decap INNER reads indexed
+  the outer `raw_frame` with the inner `meta.l4_offset`/`l3_offset` — reading
+  wrong (and, on an untagged underlay, attacker-controllable GRE-flags) bytes.
+  On untagged, inner `l4_offset` (14+20=34) lands EXACTLY on the outer GRE
+  flags byte, whose low bits (Recur/reserved) the decap ignores — so a crafted
+  GRE frame wrapping an ICMP echo could seed `raw_frame[34]` with an ICMP-error
+  type and (mis)classify the echo as an exempt error → host-inbound admission
+  bypass on a ping-less zone / `allow-embedded-icmp` policy-check exemption.
+  Swapped `raw_frame`→`packet_frame` at every post-decap inner read; kept
+  `raw_frame` only for genuinely outer reads. Enumeration — CHANGED (7 inner
+  reads): host-inbound ICMP-type byte session-hit (mod.rs ~1185) + session-miss
+  (~2224); `is_embedded_icmp_error` ICMP-type (~2182); TTL/hop-limit
+  `build_local_time_exceeded_request` session-hit (~1352) + session-miss (~2905);
+  flow-cache-hit `packet_ttl_would_expire` (flow_cache_hit.rs ~154) +
+  `build_local_time_exceeded_request` (~158). LEFT as outer (verified): the
+  embedded-ICMP-NAT `build_nat_reversed_icmp_error_v4/v6` (~2504/2509) is paired
+  with `try_embedded_icmp_nat_match` which reads the outer UMEM via `desc` — both
+  must share the outer buffer; inert on GRE (match fails on outer bytes). The
+  `cfg!(debug-log)` wire-vs-meta diagnostic (~4001-4091) reads `raw_frame` by
+  design. `pending_neigh_flow_key` (~5372) and source-MAC learning are already
+  `owned_packet_frame.is_none()`-guarded. `desc` on the two TTL builders is only
+  the UMEM-recycle handle (the reply is a freshly built prebuilt frame), so the
+  buffer swap does not disturb recycling.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs (5 inner reads),
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs (2 inner reads),
+  userspace-dp/src/afxdp/tests_gre_local_delivery.rs (fail-on-revert test),
+  docs/userspace-native-gre-plan.md (new §6d buffer-authority invariant), _Log.md
+- **Validation**: `cargo build` green; FULL `cargo test --release` green
+  (3935 passed / 0 failed). RED-on-revert PROVEN: new test
+  `gre_decap_inner_icmp_echo_denied_by_host_inbound_reads_inner_type` drives a
+  real GRE-tunnelled inner ICMP echo (outer GRE flags byte planted 0x0B = ICMPv4
+  time-exceeded) through `poll_binding_process_descriptor` and asserts the
+  host-inbound DENY (`host_inbound_denied_packets == 1`); swapping the session-miss
+  host-inbound read back to `raw_frame` makes it read the outer 0x0B error byte,
+  admit the echo as an exempt error, and the counter reads 0 (test FAILS). Drives
+  the REAL decap+classify path, not a synthetic leaf call. iperf loss-cluster
+  smoke deferred (classification/correctness fix, behind the #1864 shim-ABI wall).
+
 ## 2026-07-11 — #5141 (security): clamp TCP segmentation to the IP-declared datagram length
 - **Timestamp**: 2026-07-11 (fix/5141-tcpseg-iplen-clamp)
 - **Action**: TCP segmentation sliced the segmentable payload from the full

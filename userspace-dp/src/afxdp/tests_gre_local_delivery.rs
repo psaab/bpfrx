@@ -1262,3 +1262,97 @@ fn unknown_tunnel_mode_classifies_as_unknown_not_gre() {
     }
 }
 
+
+/// #5140 LITERAL fail-on-revert (security): the post-GRE-decap host-inbound
+/// admission gate MUST read the ICMP/ICMPv6 type from the decapped inner
+/// `packet_frame`, NOT the outer `raw_frame`. After `stage_native_gre_decap`
+/// the inner meta's `l4_offset` is inner-relative (14 + inner IHL = 34 for a
+/// 20-byte inner IPv4 header). For an UNTAGGED GRE underlay that offset lands
+/// EXACTLY on the outer GRE flags byte (eth 14 + outer IP 20 = 34 = the GRE
+/// header). The GRE flags low bits (Recur / reserved) are attacker-controllable
+/// and ignored by the decap (only C/R/K/S/version are checked), so an attacker
+/// can seed `raw_frame[34]` with an ICMP-error type value (11 = time-exceeded).
+///
+/// The trigger here is a GRE-tunnelled inner ICMP ECHO (type 8) to the firewall-
+/// local gr- address on a PING-LESS zone (empty host-inbound set → Junos deny-all
+/// posture for ping). The correct disposition is DENY: an echo is not an
+/// error/PMTUD control message, so the #3171 global-accept exemption does not
+/// apply and the empty zone set drops it.
+///
+/// - FIXED (`packet_frame[34]` = inner type 8 = echo): NOT globally accepted →
+///   empty zone set → DENIED → `host_inbound_denied_packets == 1`.
+/// - BUGGY (`raw_frame[34]` = outer GRE flags 0x0B = 11 = time-exceeded): the
+///   #3171 `is_icmp_host_inbound_global_accept` exemption ADMITS it before the
+///   zone lookup → `host_inbound_denied_packets == 0` — an ordinary echo bypasses
+///   host-inbound admission (the security misclassification #5140 fixes).
+///
+/// Swap `packet_frame` back to `raw_frame` at the session-MISS host-inbound
+/// ICMP-type read (`poll_descriptor/mod.rs`, the `host_inbound_gated_lo0_action`
+/// icmp_type argument) and this test goes RED. Drives the REAL decap+classify
+/// path via `poll_binding_process_descriptor` (not a synthetic leaf call).
+#[test]
+fn gre_decap_inner_icmp_echo_denied_by_host_inbound_reads_inner_type() {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    // Ping-less posture: a present-but-EMPTY host-inbound set on every zone so
+    // an inner ICMP echo to the firewall-local gr- address is denied (Junos
+    // deny-all), while ICMP ERROR types stay globally admitted (#3171). This is
+    // what makes the outer-vs-inner read observable: outer flags 0x0B decodes to
+    // error type 11 (admit-exempt); inner type 8 is echo (deny).
+    let zone_ids: Vec<u16> = forwarding.zone_id_to_name.keys().copied().collect();
+    assert!(!zone_ids.is_empty(), "fixture must define at least one zone");
+    for id in zone_ids {
+        forwarding
+            .zone_host_inbound
+            .insert(id, crate::afxdp::types::ZoneHostInbound::default());
+    }
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-0");
+    let mut sessions = SessionTable::new();
+
+    // Inner: ICMP echo request (type 8) 10.255.0.2 -> 10.255.0.1 (gr-local).
+    let inner = build_gre_inner_icmp_packet_v4();
+    assert_eq!(inner[20], 8, "inner must be an ICMP echo request (type 8)");
+    // Untagged GRE-to-self outer frame; then plant an ICMP-error type value in
+    // the outer GRE flags byte (frame[34], the byte the buggy read indexes).
+    // 0x0B sets only Recur/reserved low bits (no C/R/K/S) so decap is unaffected.
+    let mut frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    assert_eq!(
+        frame[34], 0x00,
+        "untagged frame[34] is the GRE flags byte (eth14 + outerIP20)"
+    );
+    frame[34] = 0x0B; // ICMPv4 time-exceeded (11) — an error type in the #3171 set
+    let meta = gre_to_self_outer_meta(0, frame.len());
+
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(
+        dbg.local, 1,
+        "the decapped inner echo to the gr-local address must take the \
+         LocalDelivery arm"
+    );
+    assert_eq!(
+        batch.host_inbound_denied_packets, 1,
+        "#5140: the host-inbound gate must read the INNER ICMP type (8 = echo) \
+         from packet_frame and DENY on the ping-less zone; the buggy raw_frame \
+         read sees the outer GRE flags byte (0x0B = 11 = time-exceeded) and \
+         admits the echo as an exempt error (host-inbound bypass)"
+    );
+    assert_eq!(
+        dbg.host_inbound_deny, 1,
+        "#3610/M07: the deny is accounted on dbg.host_inbound_deny"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "a host-inbound-denied inner echo must not cache a host-local session"
+    );
+}
+
