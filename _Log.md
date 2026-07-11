@@ -45434,3 +45434,46 @@ top.
 - **Timestamp**: 2026-07-10
 - **Action**: Test-coverage-only (no production change). Added pkg/cli/chrony_test.go — a table-driven test for printChronyTracking (pkg/cli/chrony.go), the `chronyc tracking` output parser behind `show system ntp status`, which had zero unit coverage. Captures stdout via the existing captureStdout helper and asserts the rendered Junos-style block. Cases: fully-synchronised block (exact 12-line match over all 11 rendered fields in fixed order, plus omission checks that chronyc's Residual freq / Skew and the Skew value do NOT leak); unsynchronised block (Leap status "Not synchronised" verbatim); unusual leap status ("Insert second"); malformed lines with no " : " separator ignored + leading-separator empty-key line skipped by the idx>0 guard; duplicated key keeps last value (map overwrite); empty input renders only the header. Verified non-tautological: mutating the Leap-status lookup key in chrony.go turns the test RED; revert → GREEN. No production bug found — parser behaves correctly for all fed inputs (the line[idx+3:] slice is not out-of-bounds, as the issue notes). Validation: `go test ./pkg/cli/...` green; gofmt clean.
 - **File(s)**: pkg/cli/chrony_test.go, _Log.md
+
+## 2026-07-10 — #5281 grpcapi zeroize goes through the apply gate and stops xpfd
+- **Timestamp**: 2026-07-10
+- **Action**: SECURITY. Fixed the gRPC `SystemAction{zeroize}` factory reset,
+  which called package-level `performZeroizeWipe` directly with no lifecycle
+  coordination and never stopped xpfd — so after a "successful" zeroize the
+  still-running daemon held the pre-wipe in-memory ActiveConfig and the next
+  reconcile / commit / HA-sync re-rendered the erased secrets (frr.conf /
+  swanctl PSKs / Kea / login accounts) and re-created the `.configdb` SSOT.
+  New daemon-owned `factoryReset` (pkg/daemon/daemon_apply.go), wired as
+  `grpcapi.Config.ZeroizeFn` (pkg/daemon/daemon_run.go), acquires the SAME
+  `applySem` commit/apply/HA-sync serialize on (draining any in-flight apply),
+  enters a TERMINAL reset generation (`d.resetting`) BEFORE the wipe, runs the
+  wipe under the gate, and on success leaves the generation set (the handler
+  stops xpfd moments later). Config writers now short-circuit on
+  `errDaemonResetting`: commitAndApply / commitConfirmedAndApply / syncAndApply
+  reject before persisting; executeConfirmedRollback skips; applyConfigLocked
+  refuses (defense-in-depth); ipsecApplyForLeaseChange refuses (periodic swanctl
+  PSK re-render). The grpcapi handler routes the wipe through `s.zeroizeFn`
+  (falling back to a direct wipe only when nil), and on a fully-successful wipe
+  schedules `scheduleStopDaemon` (`systemctl stop xpfd` after a 1s grace,
+  mirroring the local `request system zeroize` CLI). Sequence is strictly
+  gate → wipe → stop, fail-CLOSED: a wipe that does not complete returns
+  Internal and does NOT stop the daemon. #4108 action-journal write preserved
+  (before the wipe); existing RPC path unchanged otherwise. Sibling issues
+  #5280 (wrong-root) / #5278 (per-principal auth) intentionally out of scope —
+  no overlapping edits (this touches the gate/stop lifecycle, not the wipe roots
+  or auth).
+- **Tests**: pkg/grpcapi/zeroize_gate_stop_5281_test.go (gate→wipe→stop order,
+  fail-closed no-stop, no-gate fallback — RED on revert to the direct-wipe
+  handler: gate bypassed + no stop → FAIL, verified); updated
+  system_action_journal_4108_test.go to neutralize the new scheduleStopDaemon
+  seam; pkg/daemon/factory_reset_5281_test.go (gate-first acquire, terminal
+  reset generation on success, gate released, commit/HA-sync/reconcile/ipsec
+  rejected during reset, fail-closed clears the generation).
+- **Validation**: `GOCACHE=/tmp/gocache-5281 GOTMPDIR=/tmp go build ./...` green;
+  `go test -race ./pkg/grpcapi/... ./pkg/daemon/...` green; gofmt clean.
+- **File(s)**: pkg/grpcapi/server.go, pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/system_action_journal_4108_test.go,
+  pkg/grpcapi/zeroize_gate_stop_5281_test.go, pkg/grpcapi/README.md,
+  pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_ipsec_rebind.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/factory_reset_5281_test.go, pkg/daemon/README.md, _Log.md

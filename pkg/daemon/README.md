@@ -337,6 +337,22 @@ never lock an operator out of a remote box it manages.
 - `commitFn` and `commitConfirmedFn` are passed to `pkg/cli` and
   `pkg/grpcapi`; they hold the apply semaphore across the commit + apply
   pair so concurrent committers serialize.
+- **Factory-reset gate (`factoryReset`, wired as `grpcapi.Config.ZeroizeFn`,
+  #5281).** A gRPC `zeroize` no longer erases state out-of-band. `factoryReset`
+  acquires the SAME `applySem` commit/apply/HA-sync serialize on (draining any
+  in-flight apply), enters a **terminal reset generation** (`d.resetting`,
+  `isResetting`/`enterResetGeneration`/`exitResetGeneration`) BEFORE running the
+  wipe closure, and — on a successful wipe — leaves that generation set for the
+  daemon's remaining lifetime (the gRPC handler stops xpfd moments later). Once
+  set, every config writer that acquires `applySem` short-circuits on
+  `errDaemonResetting`: `commitAndApply` / `commitConfirmedAndApply` /
+  `syncAndApply` reject **before** persisting (so a racing commit/HA-sync cannot
+  re-create the just-erased `.configdb` SSOT), `executeConfirmedRollback`
+  skips, `applyConfigLocked` refuses (defense-in-depth), and
+  `ipsecApplyForLeaseChange` refuses (so a DHCP-lease rebind cannot re-render
+  the erased swanctl PSK snippet). It fail-CLOSES: a wipe error exits the reset
+  generation and releases the gate so the box stays recoverable, and the handler
+  reports the reset incomplete and does NOT stop the daemon.
 - **Cancellable apply at coarse boundaries (#2926, follow-up to #2914/#2868).**
   `applyConfigLocked(ctx, cfg)` checks `ctx.Err()` at three phase boundaries and
   returns the ctx error at the next one rather than completing the netlink + FRR

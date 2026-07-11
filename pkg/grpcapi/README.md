@@ -92,6 +92,24 @@ contract.
 - `CommitFn` (passed in by the daemon) holds the apply semaphore across
   `Commit()` and the dataplane apply. This is the same primitive `pkg/cli`
   uses; concurrent operator commits serialize via that semaphore (#846).
+- **Zeroize goes through the apply gate AND stops xpfd (#5281).** The
+  `SystemAction{zeroize}` handler does NOT call `performZeroizeWipe`
+  directly. It routes through `ZeroizeFn` (wired by the daemon to
+  `factoryReset`), which takes the SAME apply semaphore `CommitFn` uses
+  and enters a **terminal reset generation** before erasing, so a
+  concurrent in-flight apply is drained and no later commit / HA-sync /
+  reconcile re-creates the erased `.configdb` SSOT or re-renders the wiped
+  secrets (frr.conf / swanctl PSKs / Kea / login accounts). On a
+  fully-successful wipe the handler then schedules `scheduleStopDaemon`
+  (`systemctl stop xpfd` after a 1 s grace, mirroring the local
+  `request system zeroize` CLI path in `pkg/cli`) so the daemon does not
+  keep running with the pre-wipe in-memory `ActiveConfig`. The sequence is
+  strictly **gate → wipe → stop**, fail-CLOSED: a wipe that does not
+  complete returns `Internal` and does **not** stop the daemon (stopping a
+  half-wiped box would strand prior-tenant secrets on disk). The `#4108`
+  action-journal write still happens BEFORE the wipe. `ZeroizeFn` is nil
+  only in a NoDataplane / no-daemon build, where the handler falls back to
+  an ungated direct wipe (there is no running reconcile loop to race).
 - Tab completion (`Complete` RPC) and `?` help come from `pkg/cmdtree` —
   add commands there once and they show up in every CLI surface.
 - Session show and clear share ONE matcher: `ClearSessions` builds the

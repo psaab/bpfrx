@@ -22,6 +22,15 @@ const ipsecRebindRetryInterval = 30 * time.Second
 // time), so re-applying the same config picks up the new lease. Tests inject a
 // seam so the retry lifecycle can be driven without shelling out to swanctl.
 func (d *Daemon) ipsecApplyForLeaseChange(cfg *config.Config) error {
+	// #5281: the DHCP-lease-change rebind re-renders /etc/swanctl/conf.d/xpf.conf
+	// (IKE PSKs) from the still-resident in-memory ActiveConfig. Both callers
+	// (reapplyIPsecForLeaseChange, tryIPsecRebindRetry) run under applySem, but a
+	// factory reset that already erased that snippet must not have it recreated
+	// in the wipe→stop window — short-circuit once the terminal reset generation
+	// is entered.
+	if d.isResetting() {
+		return errDaemonResetting
+	}
 	if d.ipsecApply != nil {
 		return d.ipsecApply(cfg)
 	}

@@ -63,6 +63,41 @@ var schedulePowerAction = func(systemctlArg string) {
 	}()
 }
 
+// scheduleStopDaemon stops xpfd after a 1s grace so the zeroize RPC response
+// reaches the client before the daemon exits (#5281). A completed factory reset
+// MUST stop the daemon: otherwise xpfd keeps running with the pre-wipe
+// in-memory ActiveConfig and re-renders the erased secrets on the next reconcile
+// / commit / HA-sync — the incomplete-wipe window this closes. It mirrors the
+// local `request system zeroize` CLI path (pkg/cli), which likewise runs
+// `systemctl stop xpfd` after the wipe. It is a package var so a test can assert
+// the stop is scheduled WITHOUT actually stopping a running daemon, and is
+// scheduled ONLY on a fully-successful wipe (never on a fail-closed partial
+// wipe). The daemon has already entered the terminal reset generation (see
+// ZeroizeFn), so the ~1s grace cannot re-render anything.
+var scheduleStopDaemon = func() {
+	go func() {
+		time.Sleep(1 * time.Second)
+		// context.Background(): a confirmed factory reset must not be cancelled
+		// by client disconnect. Error ignored (mirrors schedulePowerAction).
+		runTimeout(context.Background(), "systemctl", "stop", "xpfd")
+	}()
+}
+
+// runZeroize erases on-disk state for a factory reset. It routes through the
+// daemon-owned apply gate (ZeroizeFn) when wired (#5281): the daemon acquires
+// its apply semaphore, enters the terminal reset generation, and runs the
+// performZeroizeWipe primitive while quiesced, so no concurrent or subsequent
+// commit / HA-sync / reconcile re-creates the erased state. When ZeroizeFn is
+// nil (NoDataplane / a bare unit-test Server with no daemon), it falls back to
+// an ungated direct wipe — the pre-#5281 behavior — which is acceptable because
+// there is no running reconcile loop to race in that build.
+func (s *Server) runZeroize(ctx context.Context) error {
+	if s.zeroizeFn != nil {
+		return s.zeroizeFn(ctx, performZeroizeWipe)
+	}
+	return performZeroizeWipe()
+}
+
 func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
 	switch req.Action {
 	case "reboot":
@@ -95,15 +130,31 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		// log to the next tenant — #4576), superseding the earlier
 		// journal-survives-zeroize belt-and-braces.
 		s.logSystemAction("zeroize")
-		if err := performZeroizeWipe(); err != nil {
-			// A partial wipe may leave prior-tenant config/secrets on disk
-			// (#4576). Surface it instead of reporting a clean factory reset —
-			// the operator must know the erasure did not fully complete and
-			// the device is NOT safe to re-tenant.
+		// Run the wipe through the daemon apply gate (#5281): ZeroizeFn takes the
+		// same apply semaphore commit/sync serialize on and enters a terminal
+		// reset generation BEFORE erasing, so a concurrent in-flight apply is
+		// drained and no later commit / HA-sync / reconcile re-creates the erased
+		// .configdb SSOT or re-renders the wiped secrets. The pre-#5281 handler
+		// called performZeroizeWipe directly with no lifecycle coordination.
+		if err := s.runZeroize(ctx); err != nil {
+			// FAIL-CLOSED: a partial wipe may leave prior-tenant config/secrets
+			// on disk (#4576). Surface it instead of reporting a clean factory
+			// reset — the operator must know the erasure did not fully complete
+			// and the device is NOT safe to re-tenant. Do NOT stop xpfd here: the
+			// wipe did not finish, so stopping would strand a half-reset box (the
+			// daemon has already left the reset generation, so it keeps running
+			// normally until a retried zeroize succeeds).
 			slog.Error("system zeroize did not fully erase config state", "err", err)
 			return nil, status.Errorf(codes.Internal,
 				"zeroize incomplete: config state may remain on disk: %v", err)
 		}
+		// The wipe fully completed. Stop xpfd so the daemon does not keep running
+		// with the pre-wipe in-memory ActiveConfig and re-render the erased
+		// secrets on the next reconcile (#5281). Scheduled after a 1s grace so
+		// this response reaches the client; the daemon is already in the terminal
+		// reset generation, so nothing re-renders in the interim. The reboot
+		// completes the factory reset.
+		scheduleStopDaemon()
 		return &pb.SystemActionResponse{Message: "System zeroized. Configuration erased. Reboot to complete factory reset."}, nil
 
 	case "clear-config-lock":

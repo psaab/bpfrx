@@ -155,6 +155,65 @@ func (d *Daemon) applyCancelCtx() context.Context {
 	return context.Background()
 }
 
+// errDaemonResetting is returned by every config-write entry point once a
+// factory reset (zeroize) has entered its terminal reset generation (#5281). It
+// is not surfaced to an operator on the normal path — resetting is only ever
+// set true by factoryReset while the daemon is being wiped and stopped — so its
+// job is purely to make a racing commit / HA-sync / rollback / reconcile abort
+// instead of re-creating the just-erased state.
+var errDaemonResetting = errors.New("factory reset in progress: configuration writes are rejected")
+
+// isResetting reports whether a factory reset has entered the terminal reset
+// generation (#5281). Config writers check it under applySem to short-circuit.
+func (d *Daemon) isResetting() bool { return d.resetting.Load() }
+
+// enterResetGeneration marks the daemon as being factory-reset. Called by
+// factoryReset while it holds applySem, BEFORE the wipe, so any writer that
+// later acquires applySem re-renders nothing (#5281). It is left set for the
+// daemon's remaining lifetime on a successful wipe (the daemon is stopped
+// moments later) and cleared again only if the wipe FAILED (exitResetGeneration).
+func (d *Daemon) enterResetGeneration() { d.resetting.Store(true) }
+
+// exitResetGeneration leaves the reset generation. Called only on a FAILED wipe
+// so the box stays recoverable and normal config work resumes (#5281).
+func (d *Daemon) exitResetGeneration() { d.resetting.Store(false) }
+
+// factoryReset runs a gRPC-initiated zeroize under the SAME global writer gate
+// (d.applySem) that commit / apply / HA-sync serialize on, then enters the
+// terminal reset generation so no concurrent or subsequent config writer can
+// re-persist the erased .configdb SSOT or re-render the wiped secrets before the
+// daemon is stopped (#5281). It is wired into the gRPC server as Config.ZeroizeFn
+// and receives the pkg/grpcapi factory-reset primitive as wipe (kept there so
+// the wipe stays testable via the performZeroizeWipe seam).
+//
+// Sequence (fail-CLOSED, wipe-then-stop):
+//  1. Acquire applySem — this DRAINS any in-flight apply and BLOCKS a concurrent
+//     one for the duration of the wipe. If ctx is cancelled before acquisition
+//     (client disconnect), nothing has been erased yet, so aborting is safe.
+//  2. Enter the terminal reset generation BEFORE the wipe, so a writer that
+//     acquires applySem AFTER this returns (a periodic reconciler, a late
+//     commit, a shutdown-time apply) short-circuits on errDaemonResetting.
+//  3. Run the wipe while holding applySem.
+//     - On FAILURE: exit the reset generation and release applySem (deferred)
+//     so the half-reset box is recoverable and a retry can run, and return
+//     the error. The caller must NOT stop the daemon — a stop here would
+//     strand a box whose secrets are still on disk.
+//     - On SUCCESS: stay in the reset generation (never cleared) and return nil;
+//     the caller stops xpfd. applySem is released on return, but the resetting
+//     flag keeps every later writer from re-rendering during the stop window.
+func (d *Daemon) factoryReset(ctx context.Context, wipe func() error) error {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer d.applySem.Release(1)
+	d.enterResetGeneration()
+	if err := wipe(); err != nil {
+		d.exitResetGeneration()
+		return err
+	}
+	return nil
+}
+
 // commitAndApply atomically promotes the candidate config and
 // applies it. Holds applySem across configstore.Commit and
 // applyConfigLocked so two concurrent committers can't interleave
@@ -202,6 +261,14 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 		return nil, err
 	}
 	defer d.applySem.Release(1)
+
+	// #5281: reject the commit if a factory reset is in progress. Checked under
+	// applySem and BEFORE store.Commit persists the candidate — a commit that
+	// promoted after the zeroize wipe would re-create the just-erased .configdb
+	// SSOT on disk and re-render secrets on apply.
+	if d.isResetting() {
+		return nil, errDaemonResetting
+	}
 
 	// #1956 R-8 device-map pre-flight: reject a candidate whose device-map
 	// would strand management on next boot, while the operator is still
@@ -334,6 +401,15 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 	}
 	defer d.applySem.Release(1)
 
+	// #5281: reject a peer-driven sync-apply while a factory reset is in
+	// progress. SyncApply persists the peer config as active before the
+	// reconcile, so an HA sync landing after the zeroize wipe would re-create
+	// the erased SSOT and re-render secrets. Checked under applySem, before
+	// SyncApply.
+	if d.isResetting() {
+		return nil, errDaemonResetting
+	}
+
 	// Pre-sync active config for the #4234 deletion-clear (see commitAndApply).
 	// A peer-pushed config that deletes a policy must drop that policy's synced
 	// sessions on THIS node too; the standby is not primary, so its own clear
@@ -404,6 +480,13 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 	}
 	defer d.applySem.Release(1)
 
+	// #5281: reject a commit-confirmed while a factory reset is in progress
+	// (same rationale as commitAndApply — CommitConfirmed persists the candidate
+	// and arms a rollback timer that would re-apply after the wipe).
+	if d.isResetting() {
+		return nil, errDaemonResetting
+	}
+
 	// #1956 R-8/V-3 device-map pre-flight: validate BOTH the candidate AND
 	// the rollback target (the currently-active config, restored on a
 	// confirmed-commit timeout) against present hardware. If EITHER would
@@ -448,6 +531,13 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
+
+	// #5281: a confirm-timeout rollback that fires after a factory reset wipe
+	// would PromoteRollback (re-persisting the SSOT) and re-apply the rolled-back
+	// config, re-rendering secrets. Skip it — the daemon is being wiped/stopped.
+	if d.isResetting() {
+		return
+	}
 
 	// Pre-rollback active config (the abandoned unconfirmed config, C2) for the
 	// #4234 deletion-clear: a rollback that removes a policy the abandoned commit
@@ -556,6 +646,17 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// explicit so a future caller cannot panic the reconcile.
 	if cfg == nil {
 		return nil
+	}
+
+	// #5281 defense-in-depth: refuse to reconcile once a factory reset has
+	// entered the terminal reset generation. The commit / sync / rollback entry
+	// points already reject before persisting, so in practice nothing reaches
+	// here during the wipe→stop window; this guards any other applyConfigLocked
+	// caller (a boot-time apply, a future path) from re-rendering the erased
+	// secrets (frr.conf/swanctl/Kea/login) from the still-resident in-memory
+	// ActiveConfig.
+	if d.isResetting() {
+		return errDaemonResetting
 	}
 
 	// Reconcile the whole SNMP subsystem FIRST (#2008 H17, Codex r2; extended
