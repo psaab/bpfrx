@@ -211,11 +211,49 @@ fn forwarded_tcp_may_need_segmentation_flags_oversized_frame() {
         l3_offset: 14,
         ..UserspaceDpMeta::default()
     };
-    let frame = vec![0u8; 14 + 1600];
+    // #5141: the gate now admits on the IP-DECLARED datagram length, not the
+    // raw backing length, so the frame needs a valid IPv4 header whose
+    // `total_len` declares an oversized (>MTU) datagram. total_len = 1600 with
+    // ihl=20; backing = 14 + 1600 matches the declaration (no slack).
+    let mut frame = vec![0u8; 14 + 1600];
+    frame[14] = 0x45; // IPv4, ihl=5 (20 bytes)
+    let total_len: u16 = 1600;
+    frame[16] = (total_len >> 8) as u8;
+    frame[17] = total_len as u8;
+    frame[23] = PROTO_TCP; // protocol (cosmetic; gate uses meta.protocol)
     assert!(forwarded_tcp_may_need_segmentation(
         &frame,
         meta,
         &test_decision(),
         &forwarding,
     ));
+}
+
+#[test]
+fn forwarded_tcp_may_need_segmentation_uses_declared_len_not_backing() {
+    // #5141 admission-clamp sentinel: a frame whose BACKING (14 + 1600) exceeds
+    // the 1500 MTU but whose IPv4 `total_len` declares only a 1400-byte
+    // datagram (200 trailing slack bytes) must NOT be admitted for
+    // segmentation — the declared datagram fits within the MTU. The pre-#5141
+    // gate compared `frame.len() - l3 > mtu` on the backing length and would
+    // (wrongly) flag it, then the builder would clamp and refuse: a spurious
+    // `tcp_segmentation_miss`. RED-on-revert: restoring the backing-length
+    // compare makes this assertion fail (returns true).
+    let forwarding = test_forwarding_with_egress_mtu(1500);
+    let meta = UserspaceDpMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        ..UserspaceDpMeta::default()
+    };
+    let mut frame = vec![0u8; 14 + 1600];
+    frame[14] = 0x45; // IPv4, ihl=5 (20 bytes)
+    let declared_total_len: u16 = 1400; // < MTU: the true datagram fits
+    frame[16] = (declared_total_len >> 8) as u8;
+    frame[17] = declared_total_len as u8;
+    frame[23] = PROTO_TCP;
+    assert!(
+        !forwarded_tcp_may_need_segmentation(&frame, meta, &test_decision(), &forwarding),
+        "admission must read the IP-declared length, not the backing slack"
+    );
 }
