@@ -69,7 +69,11 @@ def build_config_drive(config, out=None, node_id=None, validate=True):
     stage = tempfile.mkdtemp(prefix="xpf-day0-")
     try:
         shutil.copyfile(config, os.path.join(stage, "xpf.conf"))
-        os.chmod(os.path.join(stage, "xpf.conf"), 0o644)
+        # 0o600, not 0o644: the staged xpf.conf carries every day-0 secret
+        # (root-authentication hash, IKE PSK, SNMP community, DDNS tokens).
+        # The 0700 mkdtemp already shields it, but keep the staged copy
+        # owner-only too, matching the deploy path (#4905-C / xpf-deploy.py).
+        os.chmod(os.path.join(stage, "xpf.conf"), 0o600)
         if node_id is not None:
             with open(os.path.join(stage, "node-id"), "w") as f:
                 f.write(f"{node_id}\n")
@@ -80,6 +84,14 @@ def build_config_drive(config, out=None, node_id=None, validate=True):
         else:
             argv = [tool, "-quiet", "-V", "xpf-config", "-J", "-r", "-o", out, stage]
         subprocess.run(argv, check=True)
+        # The finished ISO embeds xpf.conf — the most secret-bearing day-0
+        # artifact. xorriso/genisoimage/mkisofs writes it under the process
+        # umask (~0022 -> 0644, world-readable) and it lingers in CWD until an
+        # explicit destroy, so any co-located UID could `isoinfo -x /xpf.conf`
+        # the secrets out. Restrict it to owner-only immediately after build,
+        # matching the deploy implementation (#4905-C). The owner still reads
+        # it fine when attaching it to the VM.
+        os.chmod(out, 0o600)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     return out

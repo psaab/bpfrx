@@ -130,8 +130,21 @@ directory and lingers there until `destroy` removes it. That ISO embeds
 `xpf.conf` verbatim — the most secret-bearing artifact on the box
 (root-authentication hash, IKE pre-shared-keys, SNMP community, DDNS
 tokens) — so the tool never leaves it world-readable even under a lax
-umask (#4586). On a shared build/CI/jump host, run `destroy` (or delete
-the ISO) once the VM is up rather than leaving day-0 secrets on disk.
+umask (#4586). The standalone builder `scripts/image/make_config_drive.py`
+applies the same 0600 (staged copy and finished ISO), so neither day-0
+path leaves the secrets world-readable (#4905-C). On a shared
+build/CI/jump host, run `destroy` (or delete the ISO) once the VM is up
+rather than leaving day-0 secrets on disk.
+
+`name`/`image` are **validated to a single safe path component** before
+any path is built from them (#4905-B). They are interpolated into files
+the tool writes and removes — the day-0 ISO in the build dir, and the
+per-VM overlay + shared golden qcow2 under `/var/lib/libvirt/images`
+(sometimes via `sudo rm -f`) — so a value with a path separator, a `..`
+component, an absolute path, or a leading dash is rejected, and each path
+sink additionally enforces `commonpath` containment. A crafted or
+mistyped `name: ../../../../tmp/owned` can no longer redirect a write or
+delete outside the managed storage dir.
 
 `deploy` runs a **preflight** before it mutates anything — the image /
 golden qcow2, every NIC source (managed network / host bridge / PF / PCI

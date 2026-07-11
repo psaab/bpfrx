@@ -752,6 +752,20 @@ until `status` reports `promoted=<ver>` AND `uname -r` matches, then
 A reverted node boots the OLD kernel and reports `promoted!=<ver>` → the
 driver STOPS and never touches the peer (never-both-down).
 
+The poll decides "the node rebooted" from an AFFIRMATIVE signal only — a
+CHANGED `boot_id` (`/proc/sys/kernel/random/boot_id`, recorded pre-arm) or the
+candidate kernel actually running — never from an empty status read (#4905-A).
+The node-exec wrapper returns a STRUCTURED result (exit code + stderr), so a
+transient SSH/incus drop or control-socket contention is distinguished from a
+real reboot: an un-ok read is retried, not misread as a completed revert.
+Before this, ANY empty `uname -r` set `rebooted=True`, so one status blip made
+a still-drained-and-running node (e.g. an `arm` that failed its UEFI/NVRAM
+preflight WITHOUT rebooting) look like a finished revert; the `finally` then
+skipped its rejoin and left the node DRAINED + ForceSecondary with both leases
+released — a silent loss of redundancy. Rejoin is now decided from the
+confirmed drain state: a drained node that never affirmatively rebooted is
+always rejoined.
+
 If `rejoin` cannot confirm within its deadline, `RejoinAndConfirm`
 (`pkg/upgrade/kernel_drain.go`) now surfaces the last non-nil
 `PeerAlive`/`SyncEstablished` transport error in the returned error —
