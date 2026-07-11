@@ -81,11 +81,23 @@ func bondSigOf(ifc *config.InterfaceConfig) bondSig {
 //     LinkAdd→re-enslave→LACP re-converge). This was the non-idempotent
 //     anti-pattern #2546 fixed for XFRM but not bonds.
 //   - CREATE a bond that is newly desired (also adopts a kernel bond that
-//     outlived in-memory tracking, e.g. across a daemon restart).
-//   - RECREATE (delete+create) a bond whose signature changed — a genuine
-//     config change (member added/removed, mode or MTU changed). The bond
-//     mode and enslavement cannot be changed in place while members are
-//     attached, so a signature change is a delete+rebuild.
+//     outlived in-memory tracking, e.g. across a daemon restart). Both the
+//     create and adopt paths verify the bond's ACTUAL enslaved member set and
+//     track the REALIZED signature, not the full desired one: a member absent
+//     at realization time (a #4823 soft error) yields a PARTIAL sig, never a
+//     full one recorded as satisfied (#5261). A fully-realized adopt tracks
+//     the full desired sig and never flaps (#5259).
+//   - COMPLETE a still-desired bond whose realized member set is a strict
+//     SUBSET of the desired set (same mode/MTU, just missing members) IN
+//     PLACE — the missing members are enslaved via the adopt branch with no
+//     LinkDel/LinkAdd, so a live (degraded) fabric/RETH bond is never flapped
+//     on an unrelated commit. This is the self-heal path for a partial
+//     realization once the absent member appears (#5261).
+//   - RECREATE (delete+create) a bond whose identity changed — a genuine
+//     config change that is NOT a pure member addition (member removed, mode
+//     or MTU changed). The bond mode and existing enslavement cannot be
+//     changed in place while members are attached, so such a change is a
+//     delete+rebuild.
 //   - DELETE a bond that is no longer desired (its fabric interface was
 //     removed).
 //
@@ -128,43 +140,66 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 
 	var errs []error
 
-	// Delete pass: remove bonds that are no longer desired OR whose
-	// signature changed. A KEPT bond (still desired, identical signature)
-	// is left untouched — no destructive link op — so an unrelated commit
-	// does not flap the LAG (#5119). #4901: a failed LinkDel retains
+	// Delete pass: remove bonds that are no longer desired OR whose identity
+	// changed. A KEPT bond is left untouched — no destructive link op — so an
+	// unrelated commit does not flap the LAG (#5119). A bond is KEPT when it
+	// is still desired AND either:
+	//   - its signature is identical (unchanged), or
+	//   - it needs only a PARTIAL COMPLETION: same mode/MTU, and the tracked
+	//     (realized) member set is a strict subset of the desired set. Such a
+	//     bond is completed in place in the create pass (enslave the missing
+	//     members, no LinkDel/LinkAdd) instead of being delete+recreated —
+	//     never flap a live (degraded) fabric/RETH bond to add a member
+	//     (#5261).
+	// Everything else (no longer desired, or a genuine identity change: member
+	// removed, mode/MTU changed) is deleted. #4901: a failed LinkDel retains
 	// tracking so the next reconcile retries; a changed bond whose delete
-	// failed keeps its OLD signature, so it is NOT recreated this cycle
-	// (its stale kernel device is still present) and the next reconcile
-	// retries the delete first.
+	// failed keeps its OLD signature, so it is NOT recreated this cycle (its
+	// stale kernel device is still present) and the next reconcile retries the
+	// delete first.
 	for name, trackedSig := range b.bonds {
-		if wantSig, want := desired[name]; want && wantSig == trackedSig {
-			continue // unchanged — keep
+		if wantSig, want := desired[name]; want &&
+			(wantSig == trackedSig || isPartialCompletion(trackedSig, wantSig)) {
+			continue // keep — unchanged or an in-place partial completion
 		}
 		if err := b.deleteLocked(name); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	// Create/reconcile pass: build bonds that are newly desired or were
-	// just deleted because their signature changed.
+	// Create/reconcile pass: build bonds that are newly desired or were just
+	// deleted because their identity changed, and complete partial bonds in
+	// place.
 	for _, name := range order {
 		sig := desired[name]
 		if trackedSig, kept := b.bonds[name]; kept {
-			// Survived the delete pass. Either:
-			//   - unchanged (signature matched) — bring it up idempotently
-			//     (a no-op on an already-up bond, matching the XFRM keep
-			//     path); zero LinkDel/LinkAdd/LinkSetMaster, so no flap.
-			//   - OR a changed bond whose LinkDel failed above (OLD sig
-			//     retained). Skip recreation this cycle to avoid an EEXIST
-			//     LinkAdd; the next reconcile retries the delete first.
+			// Survived the delete pass.
 			if trackedSig == sig {
+				// Unchanged — bring it up idempotently (a no-op on an
+				// already-up bond, matching the XFRM keep path); zero
+				// LinkDel/LinkAdd/LinkSetMaster, so no flap.
 				if link, err := b.ops.LinkByName(name); err == nil {
 					if err := b.ops.LinkSetUp(link); err != nil {
 						slog.Warn("failed to bring up existing bond", "name", name, "err", err)
 						errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
 					}
 				}
+				continue
 			}
+			if isPartialCompletion(trackedSig, sig) {
+				// Same bond, missing members. Complete the enslavement IN
+				// PLACE via the adopt branch of createLocked (the kernel bond
+				// still exists — it was NOT deleted above), which enslaves the
+				// still-missing members and re-tracks the realized member set.
+				// No LinkDel/LinkAdd — the degraded bond is not flapped (#5261).
+				if err := b.createLocked(name, ifcByName[name], sig); err != nil {
+					errs = append(errs, err)
+				}
+				continue
+			}
+			// A genuine identity change whose LinkDel failed above (OLD sig
+			// retained). Skip recreation this cycle to avoid an EEXIST LinkAdd;
+			// the next reconcile retries the delete first.
 			continue
 		}
 		if err := b.createLocked(name, ifcByName[name], sig); err != nil {
@@ -178,23 +213,60 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 // already-present kernel device of that name without tearing it down (one
 // that outlived in-memory tracking across a daemon restart, or whose prior
 // LinkDel failed), or else creates the bond, enslaves its members, and
-// brings everything up. On success the bond is tracked under sig. Netlink
-// failures are aggregated and returned (#4823) rather than swallowed; a
-// LinkAdd / find-after-create failure leaves the bond UNTRACKED so the
-// next reconcile retries. Caller must hold mu.
+// brings everything up. On success the bond is tracked under the signature
+// of its ACTUAL realized member set (which equals sig once fully enslaved).
+// Netlink failures are aggregated and returned (#4823) rather than
+// swallowed; a LinkAdd / find-after-create failure leaves the bond
+// UNTRACKED so the next reconcile retries. Caller must hold mu.
 func (b *bondManager) createLocked(name string, ifc *config.InterfaceConfig, sig bondSig) error {
-	// Adopt an existing kernel device without a destructive rebuild. Kernel
-	// bond internals (mode/members) are not re-read here — this matches the
-	// pre-#5119 adopt behavior; the common no-op commit path never reaches
-	// createLocked because an unchanged bond is kept in the delete pass.
+	// Adopt an existing kernel device without a destructive rebuild — but
+	// verify the actual enslaved member set before accepting the KEEP.
+	//
+	// The adopt path is the common daemon-restart case: the bond outlived
+	// in-memory tracking and must NOT be flapped (LinkDel→LinkAdd→re-enslave
+	// →LACP re-converge). Tracking the FULL desired sig unconditionally,
+	// however, is wrong when the bond was realized with a PARTIAL member set
+	// (a member absent at realization time is a #4823 soft error — routine
+	// during interface enumeration ordering). If a restart then adopts that
+	// partial bond and records the full desired sig, every future reconcile
+	// sees tracked == desired and KEEPs the partial bond forever, never
+	// completing the missing enslavement (#5261).
+	//
+	// So compare the observed kernel member set to the desired set:
+	//   - COMPLETE (observed covers desired) → track the full desired sig and
+	//     only bring the bond up. Zero enslave/LinkDel/LinkAdd — no flap of a
+	//     good bond (#5259 preserved exactly).
+	//   - PARTIAL → attempt to enslave the still-missing members now (the
+	//     member may have appeared since the bond was first realized — e.g. a
+	//     restart that resolved the enumeration race); members still absent
+	//     stay a #4823 soft error. Then track a sig derived from the ACTUAL
+	//     realized member set. If completion filled the set the tracked sig
+	//     equals the desired sig; otherwise it is a PARTIAL sig != desired, so
+	//     the NEXT reconcile re-enters this branch (Apply routes a pure
+	//     partial through the KEEP path, never the delete pass) and completes
+	//     the missing enslavement IN PLACE once the member appears, instead of
+	//     KEEP-ing a partial bond forever.
+	// No LinkDel/LinkAdd is issued on the adopt path — the same code path
+	// serves both a restart adoption and an in-place partial completion.
 	if existing, err := b.ops.LinkByName(name); err == nil {
-		b.bonds[name] = sig
-		slog.Debug("bond already exists", "name", name)
+		var errs []error
+		trackSig := sig
+		observed, ok := b.observedMembers(existing)
+		if ok && !membersCoverDesired(ifc, observed) {
+			enslaved, memberErrs := b.enslaveMembers(name, existing, ifc.FabricMembers, observed)
+			errs = append(errs, memberErrs...)
+			for _, m := range enslaved {
+				observed[m] = true
+			}
+			trackSig = sigWithMembers(sig, observed)
+		}
+		b.bonds[name] = trackSig
+		slog.Debug("bond already exists", "name", name, "complete", trackSig == sig)
 		if err := b.ops.LinkSetUp(existing); err != nil {
 			slog.Warn("failed to bring up existing bond", "name", name, "err", err)
-			return fmt.Errorf("bond %s: bring up existing: %w", name, err)
+			errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
 		}
-		return nil
+		return errors.Join(errs...)
 	}
 
 	bond := netlink.NewLinkBond(netlink.LinkAttrs{Name: name})
@@ -218,9 +290,45 @@ func (b *bondManager) createLocked(name string, ifc *config.InterfaceConfig, sig
 		return fmt.Errorf("bond %s: find after create: %w", name, err)
 	}
 
-	var errs []error
-	for _, member := range ifc.FabricMembers {
+	enslaved, errs := b.enslaveMembers(name, bondLink, ifc.FabricMembers, nil)
+	if err := b.ops.LinkSetUp(bondLink); err != nil {
+		slog.Warn("failed to bring up bond", "name", name, "err", err)
+		errs = append(errs, fmt.Errorf("bond %s: bring up: %w", name, err))
+	}
+	// Track the ACTUAL realized member set, not the full desired set. A member
+	// absent at creation (a #4823 soft error) yields a PARTIAL sig, so a later
+	// reconcile completes the enslavement IN PLACE when the member appears
+	// (the Apply partial-completion path) instead of KEEP-ing the bond partial
+	// forever (#5261). Fully enslaved → realized == desired → this equals sig.
+	realized := make(map[string]bool, len(enslaved))
+	for _, m := range enslaved {
+		realized[m] = true
+	}
+	b.bonds[name] = sigWithMembers(sig, realized)
+	slog.Info("bond created", "name", name, "mode", sig.mode, "members", ifc.FabricMembers)
+	return errors.Join(errs...)
+}
+
+// enslaveMembers enslaves the given fabric members (Junos names) into
+// bondLink, skipping any whose resolved Linux name is already present in
+// `already` (an already-enslaved member must NOT be flapped). It returns the
+// Linux names it SUCCESSFULLY enslaved and the accumulated hard errors.
+//
+// A member not yet visible in the kernel (LinkByName miss) is a #4823 soft
+// error: logged and skipped, the bond is still realized with the members
+// that ARE present, and the caller tracks a partial sig so a later reconcile
+// completes it. A LinkSetMaster failure on a member that IS present is a hard
+// error, accumulated and returned. Caller must hold mu.
+func (b *bondManager) enslaveMembers(name string, bondLink netlink.Link, members []string, already map[string]bool) ([]string, []error) {
+	var (
+		enslaved []string
+		errs     []error
+	)
+	for _, member := range members {
 		linuxName := config.LinuxIfName(member)
+		if already[linuxName] {
+			continue // already enslaved — leave it in place, do not flap
+		}
 		memberLink, err := b.ops.LinkByName(linuxName)
 		if err != nil {
 			slog.Warn("bond member not found",
@@ -236,16 +344,100 @@ func (b *bondManager) createLocked(name string, ifc *config.InterfaceConfig, sig
 			continue
 		}
 		b.ops.LinkSetUp(memberLink)
+		enslaved = append(enslaved, linuxName)
 		slog.Info("bond member added", "bond", name, "member", member)
 	}
+	return enslaved, errs
+}
 
-	if err := b.ops.LinkSetUp(bondLink); err != nil {
-		slog.Warn("failed to bring up bond", "name", name, "err", err)
-		errs = append(errs, fmt.Errorf("bond %s: bring up: %w", name, err))
+// observedMembers returns the set of Linux interface names currently
+// enslaved to bondLink (their MasterIndex equals the bond's index). The
+// second return is false when the member set cannot be determined — a
+// LinkList failure, or a bond whose index is 0 (a real kernel bond never has
+// index 0; the fallback keeps the adopt path bit-identical to the prior
+// track-full-desired behavior rather than misclassifying the bond as
+// partial). Caller must hold mu.
+func (b *bondManager) observedMembers(bondLink netlink.Link) (map[string]bool, bool) {
+	idx := bondLink.Attrs().Index
+	if idx == 0 {
+		return nil, false
 	}
-	b.bonds[name] = sig
-	slog.Info("bond created", "name", name, "mode", sig.mode, "members", ifc.FabricMembers)
-	return errors.Join(errs...)
+	links, err := b.ops.LinkList()
+	if err != nil {
+		slog.Warn("bond adopt: LinkList failed; cannot verify member set", "err", err)
+		return nil, false
+	}
+	members := map[string]bool{}
+	for _, l := range links {
+		if l.Attrs().MasterIndex == idx {
+			members[l.Attrs().Name] = true
+		}
+	}
+	return members, true
+}
+
+// membersCoverDesired reports whether every desired fabric member (resolved
+// to its Linux name) is present in the observed enslaved-member set.
+func membersCoverDesired(ifc *config.InterfaceConfig, observed map[string]bool) bool {
+	for _, m := range ifc.FabricMembers {
+		if !observed[config.LinuxIfName(m)] {
+			return false
+		}
+	}
+	return true
+}
+
+// isPartialCompletion reports whether a tracked bond differs from its desired
+// signature ONLY by missing members — same mode and MTU, and the tracked
+// (realized) member set is a strict subset of the desired set. Such a bond is
+// completed IN PLACE (the missing members are enslaved via createLocked's
+// adopt branch) rather than delete+recreated, so a live (degraded) fabric/RETH
+// bond is never flapped on an unrelated commit (#5261). A member removal, a
+// mode change, or an MTU change is NOT a partial completion — it changes the
+// bond identity and takes the delete+recreate path.
+func isPartialCompletion(tracked, want bondSig) bool {
+	if tracked.mode != want.mode || tracked.mtu != want.mtu {
+		return false
+	}
+	if tracked.members == want.members {
+		return false
+	}
+	return membersSubset(tracked.members, want.members)
+}
+
+// membersSubset reports whether every member in sub is present in super (both
+// are sorted, comma-joined member strings). An empty sub is a subset of
+// anything (a bond realized with zero members yet is a partial of any desired
+// member set).
+func membersSubset(sub, super string) bool {
+	if sub == "" {
+		return true
+	}
+	set := make(map[string]bool)
+	for _, m := range strings.Split(super, ",") {
+		set[m] = true
+	}
+	for _, m := range strings.Split(sub, ",") {
+		if !set[m] {
+			return false
+		}
+	}
+	return true
+}
+
+// sigWithMembers returns a copy of base whose member set is the sorted,
+// comma-joined names in realized. When realized equals the desired member
+// set the result equals base, so a completed adopt tracks the full desired
+// sig; a still-partial adopt tracks a sig that differs from desired and thus
+// triggers a follow-up reconcile (#5261).
+func sigWithMembers(base bondSig, realized map[string]bool) bondSig {
+	names := make([]string, 0, len(realized))
+	for n := range realized {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	base.members = strings.Join(names, ",")
+	return base
 }
 
 // Clear removes all previously created bond devices.

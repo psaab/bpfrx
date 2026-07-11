@@ -120,14 +120,36 @@ set) against the tracked set instead of clearing all and rebuilding:
   policy-only commit no longer flaps the LAG (`LinkDel`→`LinkAdd`→
   re-enslave→LACP re-converge, traffic loss on the bond);
 - **create** a newly-desired bond (also adopts a kernel bond that
-  outlived in-memory tracking, e.g. across a daemon restart);
-- **recreate** (delete+create) a bond whose signature changed — a genuine
-  member/mode/MTU change; the mode and enslavement cannot be changed in
-  place while members are attached;
+  outlived in-memory tracking, e.g. across a daemon restart). Both the
+  create and adopt paths enumerate the bond's **actual** enslaved member
+  set (`LinkList` by `MasterIndex`) and track the **realized** signature,
+  never the full desired one: a fully-realized bond is tracked under the
+  full desired sig and only brought up (no flap, #5259); a bond realized
+  with a **partial** member set (a member absent at realization time — the
+  #4823 soft error) is tracked under its realized (partial) sig — so a
+  partial realization is never recorded as satisfied and does not become
+  KEEP-forever (#5261). This is symmetric: a fresh-create with an absent
+  member tracks the partial sig too, so it converges when the member
+  appears rather than staying stuck (the fresh-create analogue of #5261);
+- **complete in place** a still-desired bond whose realized member set is
+  a strict **subset** of the desired set (same mode/MTU — just missing
+  members, incl. a config member-**add**): the missing members are
+  enslaved via the adopt branch with **no `LinkDel`/`LinkAdd`**, so a live
+  (degraded) fabric/RETH bond is never flapped to grow it. Enslaving a
+  slave into an existing bond is non-disruptive to the members already
+  forwarding. This is the self-heal path for a partial realization once
+  the absent member appears (#5261) — it replaces the earlier
+  delete+recreate route, which flapped the bond on every commit;
+- **recreate** (delete+create) a bond whose **identity** changed — a
+  genuine change that is *not* a pure member addition (member removed, or
+  mode/MTU changed); the mode and existing enslavement cannot be changed
+  in place while members are attached;
 - **delete** a bond whose fabric interface was removed.
 
 A no-op commit (identical desired bond set) issues zero `LinkDel`, zero
-`LinkAdd`, and zero `LinkSetMaster`. This was the non-idempotent
+`LinkAdd`, and zero `LinkSetMaster`, and a **partial** bond issues zero
+`LinkDel`/`LinkAdd` on every reconcile (only an in-place `LinkSetMaster`
+attempt of the still-missing members). This was the non-idempotent
 anti-pattern #2546 fixed for XFRM but not bonds. `Clear()` (shutdown /
 full teardown) still deletes every tracked bond.
 
