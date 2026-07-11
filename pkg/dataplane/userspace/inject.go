@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 const InjectPacketUsage = "request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error> [packet-length <bytes>] [destination-ip <ip>] [emit-on-wire true source-ip <ip> [source-port <port>] [destination-port <port>] [protocol <icmp|icmpv6>]]"
@@ -16,11 +18,10 @@ func ParseInjectPacketCommand(args []string) (slot uint32, mode string, extra ma
 	if len(args) < 4 || args[0] != "inject-packet" || args[1] != "slot" {
 		return 0, "", nil, fmt.Errorf("usage: %s", InjectPacketUsage)
 	}
-	slotNum, err := strconv.Atoi(args[2])
+	slot, err = parseBindingSlot(args[2])
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("invalid slot: %s", args[2])
+		return 0, "", nil, err
 	}
-	slot = uint32(slotNum)
 	mode = args[3]
 	extra = make(map[string]string)
 	for i := 4; i < len(args); i += 2 {
@@ -113,6 +114,13 @@ func BuildInjectPacketRequest(slot uint32, mode string, extra map[string]string,
 }
 
 func validateInjectPacketRequestForHelper(req InjectPacketRequest, status ProcessStatus) error {
+	// Defense-in-depth (#5449): a request built directly via
+	// BuildInjectPacketRequest can carry an out-of-range slot that never
+	// passed parseBindingSlot. Reject it at the helper seam before it
+	// selects an out-of-bounds binding-array slot.
+	if req.Slot >= dataplane.BindingArrayMaxEntries {
+		return fmt.Errorf("inject slot %d out of range [0, %d)", req.Slot, dataplane.BindingArrayMaxEntries)
+	}
 	if !req.EmitOnWire {
 		return nil
 	}
