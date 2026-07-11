@@ -1893,3 +1893,372 @@ fn per_zone_reject_isolation_at_call_site_3618() {
 
     reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
 }
+
+/// #5569 RED-on-revert (the whole fix): a flood of egress-FILTERED rejects —
+/// rejects whose generated ICMP unreachable is DISCARDED by the reply's own
+/// egress output filter — must NOT drain the per-zone reject token bucket, so
+/// a later filter-PERMITTED reject (a TCP RST the SAME zone's output filter
+/// accepts) still finds a token. The output filter accepts TCP (the RST is
+/// permitted) and discards ICMP (the flood is filtered); both ingress on
+/// ifindex 5 → zone A → the SAME per-zone bucket, so this is same-zone
+/// cross-protocol starvation, not the #3618 cross-ZONE case.
+///
+/// FIXED ordering (classify BEFORE token): each filtered ICMP reject
+/// short-circuits at the output-filter drop and spends no token, so the bucket
+/// stays full and the trailing PERMITTED RST is admitted. Pre-fix ordering
+/// (token BEFORE classify): each filtered ICMP reject consumes a token before
+/// being discarded; a flood larger than the burst drains the bucket (and
+/// out-consumes any wall-clock refill, since a pre-fix filtered reject that
+/// finds a refilled token still consumes it before the classify drop), so the
+/// trailing PERMITTED RST is denied (rate-limited) — RED there on the
+/// output-filter-drop count, the rate-limit-drop count, AND the permitted-RST
+/// send.
+#[test]
+fn egress_filtered_reject_does_not_drain_zone_token_5569() {
+    use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+    use crate::afxdp::icmp_ratelimit::TokenBucket;
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, global_bucket_test_lock, reset_bucket_for_test,
+    };
+    use crate::afxdp::types::FastMap;
+    use std::sync::Arc;
+
+    // This test's per-zone bucket is local, but hold the shared lock + reset
+    // the fallback (mirrors per_zone_reject_isolation_at_call_site_3618) so a
+    // sibling cannot perturb the fallback if any resolution falls through.
+    let _g = global_bucket_test_lock();
+    reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+
+    let zone_a = 4_321u16;
+    let ifidx = 5i32;
+    let mut ifindex_to_zone_id: FastMap<i32, u16> = FastMap::default();
+    ifindex_to_zone_id.insert(ifidx, zone_a);
+    let mut reject_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+    reject_buckets.insert(zone_a, Arc::new(TokenBucket::new()));
+
+    // Output filter on ifindex 5: accept TCP (RST permitted), discard ICMP
+    // (the generated ICMP unreachable is filtered). First-match terms.
+    let filter_state = crate::filter::parse_filter_state(
+        &[crate::FirewallFilterSnapshot {
+            name: "fc".into(),
+            family: "inet".into(),
+            terms: vec![
+                crate::FirewallTermSnapshot {
+                    name: "allow-tcp".into(),
+                    action: "accept".into(),
+                    protocols: vec!["tcp".into()],
+                    ..Default::default()
+                },
+                crate::FirewallTermSnapshot {
+                    name: "drop-icmp".into(),
+                    action: "discard".into(),
+                    protocols: vec!["icmp".into()],
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+        &[crate::InterfaceSnapshot {
+            name: "ge-0/0/1.0".into(),
+            ifindex: 5,
+            filter_output_v4: "fc".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    let mut forwarding = ForwardingState {
+        filter_state,
+        tx_selection_enabled_v4: true,
+        ifindex_to_zone_id,
+        reject_buckets,
+        ..ForwardingState::default()
+    };
+    // egress[5] with a v4 primary so the ICMP unreachable BUILDS (feasible) —
+    // the flood must reach the classify (fixed) / token (pre-fix) gate, not
+    // short-circuit at the #3656 feasibility check.
+    forwarding.egress.insert(
+        5,
+        EgressInterface {
+            bind_ifindex: 5,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+            zone_id: 0,
+            redundancy_group: 0,
+            primary_v4: Some(std::net::Ipv4Addr::new(10, 0, 61, 1)),
+            primary_v6: None,
+        },
+    );
+
+    // Flood N filtered ICMP rejects. N > DEFAULT_BURST (1000) so the pre-fix
+    // ordering fully drains the bucket.
+    let (icmp_frame, icmp_meta, icmp_flow) = icmp_v4_echo();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+    );
+    let mut counters = BatchCounters::default();
+    const FLOOD: u64 = 1_500;
+    for _ in 0..FLOOD {
+        let sent = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &icmp_frame,
+            icmp_meta,
+            &icmp_flow,
+            &mut counters,
+        );
+        assert!(!sent, "an egress-filtered ICMP reject must not enqueue");
+    }
+    // Every filtered reject took the output-filter drop leg and spent NO
+    // token: all counted as output-filter drops, none as rate-limit drops.
+    assert_eq!(
+        counters.policy_reject_output_filter_drops, FLOOD,
+        "all filtered rejects must count as output-filter drops"
+    );
+    assert_eq!(
+        counters.policy_reject_rate_limit_drops, 0,
+        "a filtered reject must not drain the token → no rate-limit drops"
+    );
+    assert!(
+        pipeline.pending_tx_local.is_empty(),
+        "no filtered reject may enqueue a reply"
+    );
+
+    // The trailing filter-PERMITTED reject (a TCP RST the filter accepts) in
+    // the SAME zone still finds a token on the fixed ordering.
+    let (tcp_frame, tcp_meta, tcp_flow) = tcp_v4_syn();
+    let sent = enqueue_policy_reject_reply(
+        &mut pipeline,
+        &forwarding,
+        5,
+        &tcp_frame,
+        tcp_meta,
+        &tcp_flow,
+        &mut counters,
+    );
+    assert!(
+        sent,
+        "a filter-PERMITTED reject must still get a token after a filtered flood (#5569)"
+    );
+    assert_eq!(counters.policy_reject_sent, 1);
+    assert_eq!(
+        pipeline.pending_tx_local.len(),
+        1,
+        "the permitted RST must be enqueued"
+    );
+    reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+}
+
+/// #5569 invariant 2 (rate-limiting preserved): a reject that SURVIVES the
+/// output-filter classification but whose per-zone token bucket is EXHAUSTED
+/// is still dropped (rate-limited) and bumps the reject rate-limited counter
+/// EXACTLY once — the reorder neither double-consumes the token nor drops the
+/// rate limit for filter-admitted replies. No output filter is configured, so
+/// the RST trivially survives classify; the zone bucket is drained empty, so
+/// the token denies. The drop is attributed to the rate-limit counter, NOT the
+/// output-filter counter.
+#[test]
+fn token_exhausted_reject_after_classify_survives_still_rate_limited_5569() {
+    use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+    use crate::afxdp::icmp_ratelimit::TokenBucket;
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, allow_generated_reject_at, global_bucket_test_lock,
+        rate_limited_count, reset_bucket_for_test,
+    };
+    use crate::afxdp::types::FastMap;
+    use std::sync::Arc;
+
+    let _g = global_bucket_test_lock();
+    reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+
+    let zone_a = 4_321u16;
+    let ifidx = 5i32;
+    let mut ifindex_to_zone_id: FastMap<i32, u16> = FastMap::default();
+    ifindex_to_zone_id.insert(ifidx, zone_a);
+    let mut reject_buckets: FastMap<u16, Arc<TokenBucket>> = FastMap::default();
+    reject_buckets.insert(zone_a, Arc::new(TokenBucket::new()));
+    let forwarding = ForwardingState {
+        ifindex_to_zone_id,
+        reject_buckets,
+        ..ForwardingState::default()
+    };
+
+    // Drain zone A's bucket at a far-future epoch so the call site's smaller
+    // monotonic `now` yields zero refill and the bucket stays empty across the
+    // call (mirrors per_zone_reject_isolation_at_call_site_3618).
+    let far_future = u64::MAX / 2;
+    while allow_generated_reject_at(&forwarding, zone_a, far_future, 1000, 1000) {}
+    let before = rate_limited_count(GeneratedErrorReason::Reject);
+
+    let (frame, meta, flow) = tcp_v4_syn(); // RST survives classify (no filter)
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+    );
+    let mut counters = BatchCounters::default();
+    let sent = enqueue_policy_reject_reply(
+        &mut pipeline,
+        &forwarding,
+        5,
+        &frame,
+        meta,
+        &flow,
+        &mut counters,
+    );
+    assert!(
+        !sent,
+        "a token-exhausted reject must be dropped (rate-limiting preserved)"
+    );
+    assert_eq!(counters.policy_reject_sent, 0);
+    assert!(pipeline.pending_tx_local.is_empty());
+    // The reply SURVIVED classify (no output filter), so it is a rate-limit
+    // drop, NOT an output-filter drop.
+    assert_eq!(
+        counters.policy_reject_output_filter_drops, 0,
+        "a filter-admitted reply must not count an output-filter drop"
+    );
+    assert_eq!(
+        counters.policy_reject_rate_limit_drops, 1,
+        "the token denial must bump the rate-limit drop exactly once (no double-consume)"
+    );
+    assert_eq!(
+        rate_limited_count(GeneratedErrorReason::Reject),
+        before + 1,
+        "the aggregate reject rate-limited counter must advance by exactly one"
+    );
+    reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
+}
+
+/// #5569 invariant 3 (verdict threaded through): a reject that survives
+/// classify AND whose token is allowed is enqueued carrying the SAME verdict
+/// (cos_queue_id / dscp_rewrite) the output-filter classification produced —
+/// the reorder threads the classify verdict through to the enqueue unchanged.
+/// An output filter `then accept forwarding-class iperf-a` on the reply's
+/// egress routes the generated RST to that class's queue (4).
+#[test]
+fn token_allowed_reject_enqueues_with_classify_verdict_5569() {
+    use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let snapshot = crate::ConfigSnapshot {
+        interfaces: vec![crate::InterfaceSnapshot {
+            name: "ge-0/0/1.0".into(),
+            ifindex: 5,
+            hardware_addr: "02:bf:72:00:00:05".into(),
+            filter_output_v4: "fc-tcp".into(),
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        filters: vec![crate::FirewallFilterSnapshot {
+            name: "fc-tcp".into(),
+            family: "inet".into(),
+            terms: vec![crate::FirewallTermSnapshot {
+                name: "fc-rst".into(),
+                action: "accept".into(),
+                protocols: vec!["tcp".into()],
+                forwarding_class: "iperf-a".into(),
+                ..Default::default()
+            }],
+        }],
+        class_of_service: Some(crate::ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                crate::CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                crate::CoSForwardingClassSnapshot {
+                    name: "iperf-a".into(),
+                    queue: 4,
+                },
+            ],
+            schedulers: vec![
+                crate::CoSSchedulerSnapshot {
+                    name: "be".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_percent: 0.0,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                crate::CoSSchedulerSnapshot {
+                    name: "a".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_percent: 0.0,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![crate::CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    crate::CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be".into(),
+                    },
+                    crate::CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "iperf-a".into(),
+                        scheduler: "a".into(),
+                    },
+                ],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+    let (frame, meta, flow) = tcp_v4_syn();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+    );
+    let mut counters = BatchCounters::default();
+    let sent = enqueue_policy_reject_reply(
+        &mut pipeline,
+        &forwarding,
+        5,
+        &frame,
+        meta,
+        &flow,
+        &mut counters,
+    );
+    assert!(
+        sent,
+        "a classify-surviving, token-allowed reject must enqueue"
+    );
+    assert_eq!(counters.policy_reject_sent, 1);
+    let req = pipeline
+        .pending_tx_local
+        .pop_front()
+        .expect("reject RST request");
+    assert_eq!(
+        req.cos_queue_id,
+        Some(4),
+        "the enqueued RST must carry the classify verdict's cos_queue_id (iperf-a → q4)"
+    );
+    assert_eq!(
+        req.dscp_rewrite, None,
+        "no dscp rewrite configured → verdict.dscp_rewrite passed through as None"
+    );
+}

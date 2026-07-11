@@ -240,7 +240,12 @@ fn enqueue_reject_reply(
     // below, at the gate), so H11 now protects each zone's bucket independently;
     // the CONSUMPTION ORDERING (feasibility before consume) is unchanged. The
     // extra build under budget/rate pressure is on the already-cold reject
-    // exception path.
+    // exception path. #5569 extends the ordering further: the per-zone token is
+    // consumed only AFTER the #2238/#3035 output-filter classification below
+    // ADMITS the reply, so a flood of egress-FILTERED rejects (built, feasible,
+    // but discarded by the reply's own output filter/policer) no longer drains
+    // the zone's bucket and starves a later filter-PERMITTED reject in the SAME
+    // zone — see the token gate below and `docs/generated-reply-rate-limit.md`.
     // #3976: resolve the LOGICAL ingress unit ifindex ONCE, up here, so both
     // the non-TCP ICMP/ICMPv6 reject BUILD below and the #3035 output-filter
     // classify further down key off the same value. `forwarding.egress` (and
@@ -295,59 +300,6 @@ fn enqueue_reject_reply(
         return false;
     }
 
-    // #2472/#3618: per-ZONE token-bucket rate limit on the LOCALLY-GENERATED
-    // reject reply (TCP RST or ICMP/ICMPv6 unreachable). The SYN-cookie
-    // TX-frame budget gate above is a queue-protection gate (it keeps the
-    // reply ring from starving transit TX), NOT a per-reason rate cap — under
-    // a sustained rejected-flow flood it refills as fast as TX drains. The
-    // token bucket bounds the generated-error RATE so a flood of rejected
-    // flows cannot be amplified into unbounded RST/ICMP backscatter.
-    //
-    // #3618: the bucket is now PER INGRESS (from) ZONE, not a single global
-    // one. `from_zone_id` is resolved from the LOGICAL ingress unit ifindex
-    // (the same SSOT the #3976 reply build + #3035 output-classify key off —
-    // so a VLAN sub-interface keys its OWN zone's bucket, and `ifindex_to_zone_id`
-    // also maps the physical parent so a non-VLAN port resolves identically).
-    // Before #3618 a rejected-flow flood ingressing one zone drained the single
-    // shared bucket and starved legitimate reject-generation in a DIFFERENT
-    // zone; per-zone buckets remove that cross-zone starvation. An unzoned /
-    // unknown ingress interface (id 0) falls back to the shared
-    // REJECT_FALLBACK_BUCKET (never fail-open). Both policy and filter reject
-    // still share the SAME per-zone bucket for a given ingress zone (a single
-    // emit path, per the RejectReplySource doc comment). #3656: the token is
-    // consumed ONLY for a buildable reply (feasibility is proven above), so a
-    // flood of unreplyable frames can no longer drain the zone's bucket and
-    // starve legitimate rejects (H11). On bucket-empty we fail-closed to the
-    // silent drop the caller already performs and bump the observable aggregate
-    // `Reject` rate-limited counter (inside `allow_generated_reject`), which
-    // stays a SINGLE atomic so the coordinator status / Prometheus metric is
-    // unchanged.
-    let from_zone_id = forwarding
-        .ifindex_to_zone_id
-        .get(&logical_ingress_ifindex)
-        .copied()
-        .unwrap_or(0);
-    if !allow_generated_reject(forwarding, from_zone_id) {
-        counters.touched = true;
-        // #3661: attribute the rate-limit drop to the reply's SOURCE so a
-        // firewall-filter `then reject` starvation is not conflated with a
-        // policy `then reject` starvation under a rejected-flow flood. Both
-        // sources still share the SAME per-zone reject bucket for a given
-        // ingress zone (#3618); the aggregate `reject_rate_limited_total`
-        // (bumped inside `allow_generated_reject`) stays source-NEUTRAL for
-        // back-compat and is a single atomic summed across all zones, and these
-        // two per-source per-binding counters sum to it exactly (the reject
-        // bucket has this ONE consume site — #3656 proved the token is consumed
-        // only for a buildable reply, so an unreplyable frame reaches neither
-        // counter). Mirrors the #3615 budget-drop / output-filter source split
-        // a few lines below.
-        match source {
-            RejectReplySource::Policy => counters.policy_reject_rate_limit_drops += 1,
-            RejectReplySource::Filter => counters.filter_reject_rate_limit_drops += 1,
-        }
-        return false;
-    }
-
     // #2238: classify the GENERATED reply (TCP RST or ICMP/ICMPv6
     // unreachable) by its OWN egress 5-tuple + egress interface — the
     // reflected reply egresses on the interface it arrived on, so
@@ -370,6 +322,23 @@ fn enqueue_reject_reply(
     // build); the physical `ingress_ifindex` is still used for the XSK
     // transmit (`egress_ifindex`) below. For a non-VLAN port the logical and
     // physical indexes coincide, so this is a no-op there.
+    //
+    // #5569: this output-filter classification now runs BEFORE the per-zone
+    // reject rate-limit token is consumed (the token block moved BELOW this
+    // one). A reply the output filter DROPS — an egress `discard`/`reject`
+    // terminal action or a three-color policer on the reply's OWN egress
+    // unit, or a fail-closed re-parse error of our own built bytes —
+    // therefore spends NO zone token. Before this reorder a flood of
+    // egress-FILTERED rejects (whose generated ICMP/RST is discarded by the
+    // output filter) drained the ingress zone's shared reject bucket and
+    // suppressed a later TCP RST the SAME zone's output filter would have
+    // PERMITTED (same-zone cross-protocol starvation). This mirrors the #3656
+    // H11 build-before-consume ordering (an unreplyable frame spends no token)
+    // and the #5567 feasibility-before-consume reorder on the TE/PTB
+    // generators: a resource meant to bound amplification must not be spent on
+    // a reply that never leaves the box. The trigger packet is still dropped
+    // regardless (fail-closed — the caller drops on a `false` return); only
+    // WHEN the token advances changed.
     let now_ns = monotonic_nanos();
     let verdict = classify_generated_reply(forwarding, logical_ingress_ifindex, &bytes, now_ns);
     if verdict.drop {
@@ -388,7 +357,67 @@ fn enqueue_reject_reply(
                 RejectReplySource::Filter => counters.filter_reject_output_filter_drops += 1,
             }
         }
-        // Fail-closed to the silent drop the caller already performs.
+        // Fail-closed to the silent drop the caller already performs. #5569:
+        // reached BEFORE the token gate below, so a filter-dropped (or
+        // parse-error) reply consumes no per-zone reject token.
+        return false;
+    }
+
+    // #2472/#3618: per-ZONE token-bucket rate limit on the LOCALLY-GENERATED
+    // reject reply (TCP RST or ICMP/ICMPv6 unreachable). The SYN-cookie
+    // TX-frame budget gate above is a queue-protection gate (it keeps the
+    // reply ring from starving transit TX), NOT a per-reason rate cap — under
+    // a sustained rejected-flow flood it refills as fast as TX drains. The
+    // token bucket bounds the generated-error RATE so a flood of rejected
+    // flows cannot be amplified into unbounded RST/ICMP backscatter.
+    //
+    // #3618: the bucket is now PER INGRESS (from) ZONE, not a single global
+    // one. `from_zone_id` is resolved from the LOGICAL ingress unit ifindex
+    // (the same SSOT the #3976 reply build + #3035 output-classify key off —
+    // so a VLAN sub-interface keys its OWN zone's bucket, and `ifindex_to_zone_id`
+    // also maps the physical parent so a non-VLAN port resolves identically).
+    // Before #3618 a rejected-flow flood ingressing one zone drained the single
+    // shared bucket and starved legitimate reject-generation in a DIFFERENT
+    // zone; per-zone buckets remove that cross-zone starvation. An unzoned /
+    // unknown ingress interface (id 0) falls back to the shared
+    // REJECT_FALLBACK_BUCKET (never fail-open). Both policy and filter reject
+    // still share the SAME per-zone bucket for a given ingress zone (a single
+    // emit path, per the RejectReplySource doc comment). #3656: the token is
+    // consumed ONLY for a buildable reply (feasibility is proven above the
+    // budget gate), so a flood of unreplyable frames can no longer drain the
+    // zone's bucket and starve legitimate rejects (H11). #5569: the token is
+    // ALSO consumed only AFTER the output-filter classification above admits
+    // the reply, so a flood of egress-FILTERED rejects (built + feasible, but
+    // discarded by the reply's own egress output filter / policer) can no
+    // longer drain the zone's bucket and suppress a later filter-PERMITTED
+    // reject in the SAME zone (same-zone cross-protocol starvation). On
+    // bucket-empty we fail-closed to the silent drop the caller already
+    // performs and bump the observable aggregate `Reject` rate-limited counter
+    // (inside `allow_generated_reject`), which stays a SINGLE atomic so the
+    // coordinator status / Prometheus metric is unchanged.
+    let from_zone_id = forwarding
+        .ifindex_to_zone_id
+        .get(&logical_ingress_ifindex)
+        .copied()
+        .unwrap_or(0);
+    if !allow_generated_reject(forwarding, from_zone_id) {
+        counters.touched = true;
+        // #3661: attribute the rate-limit drop to the reply's SOURCE so a
+        // firewall-filter `then reject` starvation is not conflated with a
+        // policy `then reject` starvation under a rejected-flow flood. Both
+        // sources still share the SAME per-zone reject bucket for a given
+        // ingress zone (#3618); the aggregate `reject_rate_limited_total`
+        // (bumped inside `allow_generated_reject`) stays source-NEUTRAL for
+        // back-compat and is a single atomic summed across all zones, and these
+        // two per-source per-binding counters sum to it exactly (the reject
+        // bucket has this ONE consume site — #3656 proved the token is consumed
+        // only for a buildable reply, and #5569 proved it is consumed only for
+        // a filter-ADMITTED reply, so a filtered / unreplyable frame reaches
+        // neither counter). Mirrors the #3615 output-filter source split above.
+        match source {
+            RejectReplySource::Policy => counters.policy_reject_rate_limit_drops += 1,
+            RejectReplySource::Filter => counters.filter_reject_rate_limit_drops += 1,
+        }
         return false;
     }
 

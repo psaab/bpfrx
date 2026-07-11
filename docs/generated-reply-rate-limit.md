@@ -139,3 +139,27 @@ source-neutral aggregate.
   The trigger-packet disposition is unchanged in every case: TE returns `None`
   (drop) exactly as before, and the oversized-original PTB drop stays gated on
   `mtu_signalled`, independent of whether the PTB was built.
+- #5569: for the **Reject** reason the per-zone token is now consumed only AFTER
+  the #2238/#3035 output-filter classification ADMITS the reply, not before it.
+  The reject-path gate order in `enqueue_reject_reply` is now: build (feasibility,
+  #3656) → TX-frame budget → **output-filter classify (`classify_generated_reply`)**
+  → **per-zone token (`allow_generated_reject`)** → enqueue. Previously the token
+  was consumed BEFORE the classify-drop, so a flood of egress-FILTERED rejects —
+  rejects whose generated ICMP/RST is discarded by the reply's OWN egress output
+  filter or three-color policer — drained the ingress zone's shared reject bucket
+  and suppressed a later TCP RST the SAME zone's output filter would have
+  PERMITTED (same-zone cross-protocol starvation: a filtered-ICMP flood starving a
+  permitted-RST). This is the reject-path analogue of the #3656 H11 (unreplyable)
+  and #5567 (unbuildable TE/PTB) build-before-consume ordering: a resource meant
+  to bound amplification must not be spent on a reply the box discards. A reply the
+  output filter DROPS (terminal `discard`/`reject`, a policer discard, or a
+  fail-closed re-parse error of our own bytes) now spends NO zone token and is
+  attributed to `*_reject_output_filter_drops` / `generated_reply_classify_parse_errors`;
+  a reply that SURVIVES classify but the token DENIES is still dropped
+  (rate-limited, `*_reject_rate_limit_drops` + the aggregate
+  `reject_rate_limited_total` bumped exactly once — `allow_generated_reject` is
+  still called exactly once, no double-consume); a reply that survives classify AND
+  the token allows is enqueued carrying the SAME `verdict.cos_queue_id` /
+  `verdict.dscp_rewrite`. The trigger-packet disposition is unchanged (the caller
+  drops the trigger on a `false` return regardless); only WHEN the token advances
+  changed.
