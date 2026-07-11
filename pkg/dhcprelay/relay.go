@@ -137,6 +137,14 @@ type RelayStats struct {
 	// 16) — the RFC 1542 §4.1.1 loop-protection drop (#4309).
 	RequestsDroppedMaxHops uint64
 
+	// RequestsUntrustedGiaddrReset counts client requests that arrived on an
+	// UNTRUSTED client-facing interface with a nonzero (client-forged) giaddr
+	// that the relay reset to its own address + re-stamped Option 82 on (#5414,
+	// RFC 3046 §2.1 anti-spoofing). Nonzero means a host on the client segment
+	// tried to spoof a downstream relay's giaddr / Option 82; it is trusted and
+	// preserved only when the group sets `overrides trust-option-82`.
+	RequestsUntrustedGiaddrReset uint64
+
 	// RepliesDroppedUnknownServer counts server replies dropped because their
 	// source IP is NOT one of the configured DHCP servers (#4163). The
 	// server-facing socket is bound (not connected), so it accepts datagrams
@@ -184,6 +192,12 @@ type relaySpec struct {
 	// 0 = unset = the default (defaultMaxHopCount, 16). A change requires a
 	// fresh session, so it participates in equal().
 	maxHopCount int
+	// trustOption82 marks this interface as a TRUSTED relay uplink (#5414,
+	// Junos `overrides trust-option-82`). When false (the default) the
+	// interface is an UNTRUSTED client-facing segment and a nonzero inbound
+	// giaddr is treated as client-forged (overwritten, not preserved). A
+	// change flips the anti-spoofing behavior, so it participates in equal().
+	trustOption82 bool
 }
 
 // equal reports whether two specs would produce an identical relay session.
@@ -192,6 +206,9 @@ func (s relaySpec) equal(o relaySpec) bool {
 		return false
 	}
 	if s.maxHopCount != o.maxHopCount {
+		return false
+	}
+	if s.trustOption82 != o.trustOption82 {
 		return false
 	}
 	if len(s.servers) != len(o.servers) {
@@ -245,6 +262,20 @@ type interfaceRelay struct {
 	// hops field reached maxHopCount (#4309). Observability for a relay loop
 	// or a misconfigured downstream relay chain.
 	requestsDroppedMaxHops atomic.Uint64
+
+	// trustOption82 marks this interface as a TRUSTED relay uplink (#5414).
+	// When false (the default) the interface is UNTRUSTED client-facing and a
+	// nonzero inbound giaddr is treated as client-forged. Resolved from the
+	// group's `overrides trust-option-82`. Set once at start; read-only
+	// thereafter.
+	trustOption82 bool
+
+	// requestsUntrustedGiaddrReset counts client requests that arrived on this
+	// UNTRUSTED interface carrying a nonzero (client-forged) giaddr, which the
+	// relay reset to its own address and re-stamped Option 82 on (#5414, RFC
+	// 3046 §2.1 anti-spoofing). A nonzero value means a host on the client
+	// segment attempted to spoof a downstream relay's identity / Option 82.
+	requestsUntrustedGiaddrReset atomic.Uint64
 
 	// Reply-delivery counters (#2076).
 	repliesL2Unicast           atomic.Uint64
@@ -601,6 +632,7 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 					servers:         serverIPs,
 					alwaysBroadcast: group.AlwaysBroadcast,
 					maxHopCount:     group.MaximumHopCount,
+					trustOption82:   group.TrustOption82,
 				},
 				servers: serverAddrs,
 			}
@@ -680,6 +712,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			spec:            d.spec,
 			alwaysBroadcast: d.spec.alwaysBroadcast,
 			maxHopCount:     resolveMaxHopCount(d.spec.maxHopCount),
+			trustOption82:   d.spec.trustOption82,
 		}
 		m.relays[name] = ir
 		toStart = append(toStart, struct {
@@ -720,19 +753,20 @@ func (m *Manager) Stats() []RelayStats {
 	stats := make([]RelayStats, 0, len(m.relays))
 	for _, ir := range m.relays {
 		stats = append(stats, RelayStats{
-			Interface:                   ir.ifaceName,
-			RequestsRelayed:             ir.requestsRelayed.Load(),
-			RepliesForwarded:            ir.repliesForwarded.Load(),
-			RequestsDroppedBackup:       ir.requestsDroppedBackup.Load(),
-			RequestsDroppedMaxHops:      ir.requestsDroppedMaxHops.Load(),
-			RepliesDroppedUnknownServer: ir.repliesDroppedUnknownServer.Load(),
-			RepliesL2Unicast:            ir.repliesL2Unicast.Load(),
-			RepliesUnicastCiaddr:        ir.repliesUnicastCiaddr.Load(),
-			RepliesBroadcastFlag1:       ir.repliesBroadcastFlag1.Load(),
-			RepliesBroadcastForced:      ir.repliesBroadcastForced.Load(),
-			RepliesBroadcastNoTarget:    ir.repliesBroadcastNoTarget.Load(),
-			RepliesBroadcastL2Fallback:  ir.repliesBroadcastL2Fallback.Load(),
-			RepliesBroadcastNak:         ir.repliesBroadcastNak.Load(),
+			Interface:                    ir.ifaceName,
+			RequestsRelayed:              ir.requestsRelayed.Load(),
+			RepliesForwarded:             ir.repliesForwarded.Load(),
+			RequestsDroppedBackup:        ir.requestsDroppedBackup.Load(),
+			RequestsDroppedMaxHops:       ir.requestsDroppedMaxHops.Load(),
+			RequestsUntrustedGiaddrReset: ir.requestsUntrustedGiaddrReset.Load(),
+			RepliesDroppedUnknownServer:  ir.repliesDroppedUnknownServer.Load(),
+			RepliesL2Unicast:             ir.repliesL2Unicast.Load(),
+			RepliesUnicastCiaddr:         ir.repliesUnicastCiaddr.Load(),
+			RepliesBroadcastFlag1:        ir.repliesBroadcastFlag1.Load(),
+			RepliesBroadcastForced:       ir.repliesBroadcastForced.Load(),
+			RepliesBroadcastNoTarget:     ir.repliesBroadcastNoTarget.Load(),
+			RepliesBroadcastL2Fallback:   ir.repliesBroadcastL2Fallback.Load(),
+			RepliesBroadcastNak:          ir.repliesBroadcastNak.Load(),
 		})
 	}
 	return stats
@@ -975,7 +1009,8 @@ func (m *Manager) runRelaySession(ctx context.Context,
 
 	slog.Info("dhcp-relay: listening",
 		"interface", ifaceName, "giaddr", giaddr, "ifindex", boundIfindex,
-		"always_broadcast", ir.alwaysBroadcast, "raw_l2", l2 != nil)
+		"always_broadcast", ir.alwaysBroadcast, "raw_l2", l2 != nil,
+		"trust_option_82", ir.trustOption82)
 
 	// Both the cancel watcher and the server-response goroutine are tracked by
 	// the WaitGroup so the runner's wg.Wait() is a true join of every spawned
@@ -1149,8 +1184,25 @@ func (m *Manager) runRelaySession(ctx context.Context,
 			// touch the BOOTP hops field (#5071). Overwriting the giaddr makes
 			// the server lease from the wrong pool and reply to the wrong
 			// relay; overwriting Option 82 destroys the downstream circuit-id.
-			// Capture the chained condition BEFORE any mutation below.
-			chained := giaddrIsSet(pkt.GatewayIPAddr)
+			//
+			// #5414 (RFC 3046 §2.1 anti-spoofing): a nonzero giaddr is only a
+			// TRUSTWORTHY downstream-relay stamp when it arrives on a TRUSTED
+			// relay uplink (`overrides trust-option-82`). On the DEFAULT
+			// untrusted client-facing interface a host on the client segment
+			// can forge a nonzero giaddr + a crafted Option 82 to impersonate a
+			// downstream relay and steer server-side pool/policy selection.
+			// There the relay MUST NOT trust it: giaddrIsSet is gated on
+			// trustOption82 so an untrusted forged giaddr falls through to the
+			// first-hop branch below, which overwrites giaddr with our own
+			// address (RFC 951/1542) and re-stamps Option 82 (addOption82 Dels
+			// the forged option first). Capture BOTH conditions BEFORE any
+			// mutation; forgedGiaddrValue snapshots the forged address for the
+			// reset log because the first-hop branch overwrites giaddr. The
+			// counter/log fire in that branch (below), AFTER the hop-limit drop,
+			// so a request dropped for looping is not miscounted as a reset.
+			chained := ir.trustOption82 && giaddrIsSet(pkt.GatewayIPAddr)
+			forgedGiaddr := !ir.trustOption82 && giaddrIsSet(pkt.GatewayIPAddr)
+			forgedGiaddrValue := pkt.GatewayIPAddr
 
 			// Enforce the RFC 1542 §4.1.1 hop limit BEFORE incrementing.
 			// HopCount is uint8: checking after a ++ lets an incoming value
@@ -1178,9 +1230,20 @@ func (m *Manager) runRelaySession(ctx context.Context,
 					"interface", ifaceName,
 					"giaddr", pkt.GatewayIPAddr, "hops", pkt.HopCount)
 			} else {
-				// First hop (inbound giaddr == 0): stamp our interface IP so
-				// the server knows where to reply, and insert Option 82 (Relay
-				// Agent Information) with the circuit-id sub-option.
+				// First hop, OR an untrusted interface with a client-forged
+				// giaddr (#5414): stamp our interface IP so the server knows
+				// where to reply, and insert Option 82 (Relay Agent
+				// Information) with the circuit-id sub-option. addOption82 Dels
+				// any existing (forged) Option 82 first, so a spoofed
+				// circuit-id/remote-id is replaced, not preserved.
+				if forgedGiaddr {
+					ir.requestsUntrustedGiaddrReset.Add(1)
+					slog.Debug("dhcp-relay: untrusted client-forged giaddr reset "+
+						"(RFC 3046 anti-spoofing)",
+						"interface", ifaceName,
+						"client_mac", pkt.ClientHWAddr,
+						"forged_giaddr", forgedGiaddrValue, "src", srcAddr)
+				}
 				pkt.GatewayIPAddr = giaddr
 				addOption82(pkt, ifaceName)
 			}

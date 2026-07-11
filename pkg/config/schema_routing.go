@@ -703,6 +703,11 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 					valueExamples: []string{"4", "16"}, validator: ValidateInteger(1, 16), children: nil},
 				"forward-only":       {desc: "Forward without retaining relay state (accepted-only; matches default — #4309)", children: nil},
 				"relay-agent-option": {desc: "Insert Option 82 relay agent information (accepted-only; always inserted — #4309)", children: nil},
+				// #5414: trust-option-82 marks the group's interfaces as
+				// TRUSTED relay uplinks (RFC 3046 §2.1 anti-spoofing). ENFORCED.
+				// Default (unset) = untrusted client-facing: a client-forged
+				// nonzero giaddr + Option 82 is overwritten, not preserved.
+				"trust-option-82": {desc: "Trust a downstream relay's giaddr + Option 82 on this uplink (RFC 3046 §2.1; default untrusted overwrites — #5414)", children: nil},
 			}},
 		}},
 	}},
