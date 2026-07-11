@@ -1174,7 +1174,7 @@ fn apply_snapshot_rejects_generation_rollback_5169() {
     assert!(
         response
             .error
-            .contains("snapshot generation rollback/reuse rejected"),
+            .contains("snapshot generation rollback rejected"),
         "unexpected error: {}",
         response.error
     );
@@ -1235,12 +1235,16 @@ fn apply_snapshot_rejects_generation_rollback_5169() {
     let _ = std::fs::remove_file(&state_file);
 }
 
-/// #5169: an EXACT-REUSE apply_snapshot (the new (config, fib) pair equals the
-/// last published pair — a duplicate/replayed control message) must be refused.
-/// This is the pure fail-open: an equal pair equality-matches every prior
-/// cache stamp at that generation, reviving all of them.
+/// #5169 (review fold): an EXACT-EQUAL apply_snapshot (the new (config, fib)
+/// pair equals the last published pair) must be ADMITTED, not refused. An equal
+/// pair equality-matches only the CURRENT published pair, whose cache entries
+/// are already valid, so re-publishing it revives NOTHING — refusing it buys no
+/// security and breaks the #4036 "timeout-but-landed" idempotent retry (the
+/// partial-republish Go paths recompute the SAME generation after a timed-out
+/// apply that actually landed and must be ACKed ok, not fail-closed into a
+/// non-converging loop). This mirrors `bump_fib`, which admits an equal fib.
 #[test]
-fn apply_snapshot_rejects_generation_reuse_5169() {
+fn apply_snapshot_admits_generation_reuse_5169() {
     use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
     let state = new_state(ProcessStatus::default());
 
@@ -1256,7 +1260,7 @@ fn apply_snapshot_rejects_generation_reuse_5169() {
         });
         assert!(run_request(state.clone(), request).ok);
     }
-    // Re-apply the identical pair (6, 5): must be refused.
+    // Re-apply the identical pair (6, 5) — the idempotent-retry path: admitted.
     let mut request = req("apply_snapshot");
     request.snapshot = Some(ConfigSnapshot {
         version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
@@ -1266,17 +1270,82 @@ fn apply_snapshot_rejects_generation_reuse_5169() {
         ..ConfigSnapshot::default()
     });
     let response = run_request(state.clone(), request);
-    assert!(!response.ok, "reused-pair apply_snapshot must be rejected");
     assert!(
-        response
-            .error
-            .contains("snapshot generation rollback/reuse rejected"),
-        "unexpected error: {}",
+        response.ok,
+        "an exact-equal re-apply (idempotent retry) must be admitted: {}",
         response.error
     );
     let guard = state.lock().expect("state");
     assert_eq!(guard.status.last_snapshot_generation, 6);
     assert_eq!(guard.status.last_fib_generation, 5);
+    assert_eq!(guard.snapshot.as_ref().map(|s| s.generation), Some(6));
+}
+
+/// #5169 (review fold): a FIB ROLLBACK under a reused config (config == cur,
+/// fib < cur_fib) must be REFUSED. This is the second rollback axis — the fib
+/// half of the pair rolling back re-publishes a superseded pair whose stale
+/// flow-cache entries would be revived, exactly the fail-open on the fib
+/// dimension (the full-apply analogue of the #3767 H5 bump_fib rollback).
+///
+/// RED-on-revert: neutralize the guard and the (6, 6) rollback publishes over
+/// the (6, 7) baseline — the assertions below flip.
+#[test]
+fn apply_snapshot_rejects_fib_rollback_5169() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus::default());
+
+    // Baseline (config=6, fib=5).
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 6,
+            fib_generation: 5,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request(state.clone(), request).ok);
+    }
+    // Fib advances 5 -> 7 (config reused at 6): admitted.
+    {
+        let mut request = req("apply_snapshot");
+        request.snapshot = Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+            generation: 6,
+            fib_generation: 7,
+            generated_at: chrono::Utc::now(),
+            ..ConfigSnapshot::default()
+        });
+        assert!(run_request(state.clone(), request).ok);
+    }
+    // Fib rolls back 7 -> 6 under the reused config 6: must be refused.
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 6,
+        fib_generation: 6,
+        generated_at: chrono::Utc::now(),
+        ..ConfigSnapshot::default()
+    });
+    let response = run_request(state.clone(), request);
+    assert!(!response.ok, "a fib rollback under a reused config must be rejected");
+    assert!(
+        response
+            .error
+            .contains("snapshot generation rollback rejected"),
+        "unexpected error: {}",
+        response.error
+    );
+    let guard = state.lock().expect("state");
+    assert_eq!(
+        guard.status.last_snapshot_generation, 6,
+        "rejected fib rollback keeps the published config generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 7,
+        "rejected fib rollback must not lower last_fib_generation"
+    );
+    assert_eq!(guard.snapshot.as_ref().map(|s| s.fib_generation), Some(7));
 }
 
 /// #5169: a strictly-monotonic apply_snapshot whose CONFIG generation advances

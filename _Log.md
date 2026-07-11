@@ -1,3 +1,35 @@
+## 2026-07-11 — #5169 review fold: admit exact-equal generation re-apply (#4036 idempotent retry)
+- **Timestamp**: 2026-07-11 (fix/5169-apply-snapshot-gen-monotonicity, rev-5604 fold)
+- **Action**: Hostile review (rev-5604, MERGE-NEEDS-MINOR) found the exact-equal
+  refusal fail-closes the #4036 "timeout-but-landed" idempotent retry: the
+  partial-republish Go paths (Compile, PublishRouteOverlaySnapshot,
+  retryDeferredWorkerArmLocked) commit `m.generation` only on Go-observed
+  success and do NOT consult `lastStatus.LastSnapshotGeneration`, so a
+  timed-out-but-landed apply of gen G leaves `m.generation` at G-1 and the retry
+  re-sends the IDENTICAL (G, fib) pair — refusing it → non-converging loop.
+  Refusing exact-equal also buys ZERO security: an equal pair equality-matches
+  only the CURRENT published pair, whose cache entries are already valid, so it
+  revives nothing (revival requires re-publishing a SUPERSEDED strictly-less
+  pair). Changed the fib disjunct from `>` to `>=` (guard
+  `server/handlers/snapshot.rs`): admit iff `generation > cur` OR (`generation
+  == cur && fib_generation >= cur_fib`). Now ADMITS exact-equal + config-advance
+  + fib-advance; still REFUSES both rollback axes — config rollback
+  (`generation < cur`) AND fib rollback under a reused config (`generation ==
+  cur && fib_generation < cur_fib`). This is the exact `<`-not-`<=` semantics
+  `bump_fib` already uses. Error string updated ("... rollback rejected: (c,f) <
+  current"). Flipped `apply_snapshot_rejects_generation_reuse_5169` →
+  `apply_snapshot_admits_generation_reuse_5169` (exact-equal now ok=true); added
+  `apply_snapshot_rejects_fib_rollback_5169` (config==cur, fib<cur → refused);
+  kept the config-rollback, config-advance, and fib-only-advance tests. Updated
+  the doc note (admit-exact-equal, both rollback axes).
+- **File(s)**: userspace-dp/src/server/handlers/snapshot.rs (`>` → `>=` + comment
+  + error string), userspace-dp/src/server/tests.rs (reuse test flipped to admit,
+  fib-rollback-refused test added), docs/flow-cache-simplification.md
+- **Validation**: `cargo build` clean; full `cargo test --release` green
+  (CARGO_EXIT=0); 5 `_5169` tests 5x flake-free; RED-on-revert confirmed — with
+  the guard disabled BOTH rollback tests (config + fib) FAIL, the three admit
+  tests still pass.
+
 ## 2026-07-11 — #5169 userspace-dp/snapshot: monotonicity-guard the full apply_snapshot generation
 - **Timestamp**: 2026-07-11 (fix/5169-apply-snapshot-gen-monotonicity)
 - **Action**: Added a pair-monotonicity gate to the FULL `apply_snapshot`

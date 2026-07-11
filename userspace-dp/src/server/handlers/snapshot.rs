@@ -45,14 +45,30 @@ pub(super) fn apply(
     // fib_generation from the monotone shim FIB counter (`readFIBGeneration`,
     // only ever ++). A full apply strictly advances config (fib carried
     // forward), a route-only overlay advances fib with config reused (that path
-    // is `bump_fib`). So the legitimate transition for the PUBLISHED pair is a
-    // LEXICOGRAPHIC strict increase: (generation, fib_generation) must be
-    // strictly greater than the currently-published (last_snapshot_generation,
-    // last_fib_generation). That ADMITS a config advance (any fib — a strictly
-    // greater config was, by the global monotonicity this guard enforces, never
-    // published, so no cache entry can equality-match it) AND a same-config fib
-    // advance (the route-only overlay); it REFUSES only a pair that equals or
-    // precedes the published pair — the reuse/rollback fail-open.
+    // is `bump_fib`). So the guard REFUSES only a STRICTLY-LESS (superseded)
+    // pair — one whose config rolls back (`generation < cur`) OR whose fib rolls
+    // back under a reused config (`generation == cur && fib_generation <
+    // cur_fib`) — and ADMITS everything else:
+    //   * a config advance (any fib — a strictly greater config was, by the
+    //     global monotonicity this guard enforces, never published, so no cache
+    //     entry can equality-match it),
+    //   * a same-config fib advance (the route-only overlay), and
+    //   * an EXACT-EQUAL re-apply (`generation == cur && fib_generation ==
+    //     cur_fib`).
+    // Exact-equal is admitted because it revives NOTHING: an equal pair
+    // equality-matches only the CURRENT published pair, whose cache entries are
+    // already valid, so re-publishing it changes no validity. The revival
+    // fail-open requires re-publishing a SUPERSEDED (strictly-less) pair, which
+    // the `<` refusal still catches. Admitting exact-equal also restores the
+    // #4036 "timeout-but-landed" IDEMPOTENT RETRY: the partial-republish Go
+    // paths (Compile, PublishRouteOverlaySnapshot, retryDeferredWorkerArmLocked)
+    // commit `m.generation` only on Go-observed success and do NOT consult
+    // `lastStatus.LastSnapshotGeneration`, so a timeout-but-landed apply of gen
+    // G leaves `m.generation` at G-1 and the retry re-sends the IDENTICAL
+    // (G, fib) pair — which must be ACKed ok, not fail-closed into a
+    // non-converging loop. This mirrors `bump_fib`, which refuses a
+    // STRICTLY-less fib and admits an equal one
+    // (`Coordinator::bump_fib_generation`, `<` not `<=`).
     //
     // Compare against the last PUBLISHED pair in `guard.status`, not the afxdp
     // ValidationState: config_generation has no coordinator accessor (only fib
@@ -69,18 +85,18 @@ pub(super) fn apply(
         let cur_fib_generation = guard.status.last_fib_generation;
         let monotonic = snapshot.generation > cur_generation
             || (snapshot.generation == cur_generation
-                && snapshot.fib_generation > cur_fib_generation);
+                && snapshot.fib_generation >= cur_fib_generation);
         if !monotonic {
             response.ok = false;
             response.error = format!(
-                "snapshot generation rollback/reuse rejected: ({}, {}) <= current ({}, {})",
+                "snapshot generation rollback rejected: ({}, {}) < current ({}, {})",
                 snapshot.generation,
                 snapshot.fib_generation,
                 cur_generation,
                 cur_fib_generation
             );
             eprintln!(
-                "CTRL_REQ: apply_snapshot rejected (generation rollback/reuse): ({}, {}) <= current ({}, {})",
+                "CTRL_REQ: apply_snapshot rejected (generation rollback): ({}, {}) < current ({}, {})",
                 snapshot.generation,
                 snapshot.fib_generation,
                 cur_generation,
