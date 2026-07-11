@@ -1,3 +1,34 @@
+## 2026-07-11 — #5169 userspace-dp/snapshot: monotonicity-guard the full apply_snapshot generation
+- **Timestamp**: 2026-07-11 (fix/5169-apply-snapshot-gen-monotonicity)
+- **Action**: Added a pair-monotonicity gate to the FULL `apply_snapshot`
+  handler, mirroring the #3767 H5 rollback guard on `bump_fib`. The full path
+  published the incoming `(generation, fib_generation)` pair VERBATIM (into
+  `status.last_snapshot_generation`/`last_fib_generation` and `ValidationState`)
+  with NO monotonicity check. Flow-cache validation is EQUALITY based on the
+  pair (`flow_cache.rs` lookup), so a reused/rolled-back pair equality-matches
+  prior cache stamps and revives a lazily-unevicted cached ALLOW a later
+  generation already invalidated — a fail-OPEN. The guard refuses fail-CLOSED
+  (before any mutation/preflight/side-effect) any pair that is not a
+  LEXICOGRAPHIC strict increase over the last PUBLISHED pair in `guard.status`:
+  admit iff `generation > cur` OR (`generation == cur && fib_generation >
+  cur_fib`). Admits a config advance (any fib) AND a route-only fib-only advance
+  (config reused); refuses only equal-or-preceding pairs. Compares against
+  `guard.status` (not `ValidationState`: config_generation has no coordinator
+  accessor, and disarmed applies advance `guard.status` but not
+  `ValidationState`). Gated on `guard.snapshot.is_some()` so the first apply is
+  never falsely refused. Documented in `docs/flow-cache-simplification.md`
+  (new #5169 section after the #3767 gating section).
+- **File(s)**: userspace-dp/src/server/handlers/snapshot.rs (guard),
+  userspace-dp/src/server/tests.rs (4 new tests:
+  `apply_snapshot_rejects_generation_rollback_5169` [RED-on-revert],
+  `apply_snapshot_rejects_generation_reuse_5169`,
+  `apply_snapshot_monotonic_config_advance_applies_5169`,
+  `apply_snapshot_fib_only_advance_admitted_5169`),
+  docs/flow-cache-simplification.md
+- **Validation**: `cargo build` clean; full `cargo test --release` green; 4 new
+  tests 5x flake-free; RED-on-revert confirmed (disabling the gate FAILs both
+  refusal tests, positive tests still pass).
+
 ## 2026-07-11 — #5363 dataplane/verify: stale-pin remediation for live-pin ABI mismatch
 - **Timestamp**: 2026-07-11 (fix/5363-stalepin-remediation)
 - **Action**: `validateUserspaceShimLivePins` (pkg/dataplane/loader_userspace_shim.go)

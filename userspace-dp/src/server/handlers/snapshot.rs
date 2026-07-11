@@ -30,6 +30,65 @@ pub(super) fn apply(
         );
         return;
     }
+    // #5169: monotonicity gate for the FULL apply_snapshot path, mirroring the
+    // #3767 H5 rollback guard on `bump_fib` below. Flow-cache validation is
+    // EQUALITY based on the (config_generation, fib_generation) PAIR — an entry
+    // is a HIT only when its stamped pair equals the currently-published pair
+    // (afxdp/flow_cache.rs `lookup`; see `stale_config_generation_causes_miss`).
+    // So re-publishing a pair that a later apply already superseded makes the
+    // cache entries that later generation logically invalidated MATCH again,
+    // reviving a stale permit decision (a lazily-unevicted cached ALLOW) after
+    // the config/route that authorized it was withdrawn — a fail-OPEN.
+    //
+    // The Go control plane assigns config_generation from a monotone commit
+    // counter (`Manager.bumpGeneration`, only ever ++, never resets) and
+    // fib_generation from the monotone shim FIB counter (`readFIBGeneration`,
+    // only ever ++). A full apply strictly advances config (fib carried
+    // forward), a route-only overlay advances fib with config reused (that path
+    // is `bump_fib`). So the legitimate transition for the PUBLISHED pair is a
+    // LEXICOGRAPHIC strict increase: (generation, fib_generation) must be
+    // strictly greater than the currently-published (last_snapshot_generation,
+    // last_fib_generation). That ADMITS a config advance (any fib — a strictly
+    // greater config was, by the global monotonicity this guard enforces, never
+    // published, so no cache entry can equality-match it) AND a same-config fib
+    // advance (the route-only overlay); it REFUSES only a pair that equals or
+    // precedes the published pair — the reuse/rollback fail-open.
+    //
+    // Compare against the last PUBLISHED pair in `guard.status`, not the afxdp
+    // ValidationState: config_generation has no coordinator accessor (only fib
+    // does), and a disarmed apply advances `guard.status` but NOT
+    // ValidationState — `guard.status` is the authoritative published pair the
+    // armed flow-cache's ValidationState is derived from, so guard and cache
+    // agree. Gate on a prior published snapshot: the first apply
+    // (`guard.snapshot` == None) has no baseline and no cache entries to revive,
+    // so it always applies (matching `bump_fib` admitting the first bump against
+    // generation 0). Refuse fail-CLOSED before ANY guard mutation / preflight /
+    // side effect, mirroring the #3766/#3789 capture-restore legs below.
+    if guard.snapshot.is_some() {
+        let cur_generation = guard.status.last_snapshot_generation;
+        let cur_fib_generation = guard.status.last_fib_generation;
+        let monotonic = snapshot.generation > cur_generation
+            || (snapshot.generation == cur_generation
+                && snapshot.fib_generation > cur_fib_generation);
+        if !monotonic {
+            response.ok = false;
+            response.error = format!(
+                "snapshot generation rollback/reuse rejected: ({}, {}) <= current ({}, {})",
+                snapshot.generation,
+                snapshot.fib_generation,
+                cur_generation,
+                cur_fib_generation
+            );
+            eprintln!(
+                "CTRL_REQ: apply_snapshot rejected (generation rollback/reuse): ({}, {}) <= current ({}, {})",
+                snapshot.generation,
+                snapshot.fib_generation,
+                cur_generation,
+                cur_fib_generation
+            );
+            return;
+        }
+    }
     // #1606 (AGY r2 finding 4.1): preflight policy-state validation
     // BEFORE any guard.status mutation. If the snapshot has
     // duplicate / zero / unknown book IDs, reject WITHOUT touching
