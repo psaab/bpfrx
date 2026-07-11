@@ -45964,6 +45964,37 @@ top.
   cmd/xpfd/upgrade.go, docs/in-place-upgrade.md,
   pkg/upgrade/cutover_cluster_gate_indeterminate_5573_test.go, _Log.md
 
+- **Timestamp**: 2026-07-11
+  **Action**: #5572 — add a non-first-fragment (l4_present=false) discriminator
+  to the shared policy simulator `policymatch.Query` and reproduce the
+  dataplane's #4569 fragment-associated deny. Before this the simulator had no
+  fragment dimension: a non-first TCP/UDP fragment could only be supplied as
+  ports=0, which `Match` evaluated as a real port-0 packet — it skipped an
+  earlier port-bearing deny and reported PERMIT while the dataplane applied the
+  #4569 deny (an oracle-vs-firewall divergence on incident-response traffic).
+  Added `Query.NonFirstFragment`; threaded `l4Present` into
+  matchApp/matchSingleApp (port + icmp-type terms fail closed regardless of
+  value, including a `0-1023` range); ported the #4569 skipped-deny tracking
+  (`isSkippedFragDeny`/`hasL4ConstrainedTerm`, mirrors
+  rule_is_skipped_frag_ambiguous_deny/has_l4_constrained_term) into the transit
+  tiers with a permit→deny override attributed to the enforcing deny
+  (`Result.FragmentAssociatedDeny` + `FragmentDenyNote`). Threaded through every
+  surface: valueless `non-first-fragment` CLI selector (ParseSelectorArgs → all
+  four CLI surfaces), gRPC MatchPolicies proto field `non_first_fragment` +
+  response `fragment_associated_deny`/`fragment_deny_note`, gRPC `test-policy:`
+  bridge `frag=1`, REST `non_first_fragment` param. RED-on-revert proven
+  (fragment reports permit-all when the discriminator is reverted). Gates:
+  go build ./... + go test policymatch/cmd-cli/grpcapi/api/cli green; gofmt -w;
+  make proto regen (minimal 3-field diff).
+  **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/README.md,
+  proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_cluster.go, pkg/grpcapi/server_show_firewall.go,
+  pkg/api/security.go, pkg/api/types.go, pkg/cli/cli_request_testcmd.go,
+  pkg/cli/cli_show_security.go, cmd/cli/show_security.go, cmd/cli/main.go,
+  docs/junos-cli-reference.md, pkg/policymatch/fragment_5572_test.go,
+  pkg/api/security_matchpolicies_fragment_5572_test.go,
+  pkg/grpcapi/server_matchpolicies_fragment_5572_test.go,
+  pkg/grpcapi/server_show_testpolicy_fragment_5572_test.go, _Log.md
 - **Timestamp**: 2026-07-11 (fix/5578-policy-session-invalidation-errors)
   **Action**: #5578 propagate policy-session-invalidation failures instead of
   swallowing them to a log line. `clearSessionsForPolicyIDs` and its three
@@ -46040,3 +46071,21 @@ top.
   Updated pkg/ddns/README.md size-bound contract. RED-on-revert verified.
   **File(s)**: pkg/ddns/state.go, pkg/ddns/state_readbound_5571_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5572 review fold (rev-5590 MINOR) — fragment-associated deny is
+  ALWAYS Deny, never reject. `fragDenyResult` now forces
+  `r.Action = config.PolicyDeny` after building the matched result. A non-first
+  fragment has no L4 header, so the dataplane cannot send a RST/ICMP — it can
+  only silently DROP — and the Rust `frag_associated_deny_result` hardcodes
+  `PolicyAction::Deny`. `isSkippedFragDeny` still accepts a skipped REJECT (a
+  reject shadows the fragment identically to a deny), but the reported label is
+  normalized to deny; a concrete L4 reject match still reports reject. Both
+  verdicts are DROPs, so the #5572 false-permit is not re-introduced — this only
+  corrects the deny-vs-reject label parity. Fixed the FragmentAssociatedDeny
+  docstring + README fragment section (was "Action is deny/reject" — wrong).
+  Added fail-on-revert reject-shadow test (RED-on-revert proven: removing the
+  force reports Action=reject). Gates: go build ./... + go test -race
+  policymatch/cmd-cli/grpcapi/api green; gofmt -w.
+  **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/README.md,
+  pkg/policymatch/fragment_5572_test.go, _Log.md

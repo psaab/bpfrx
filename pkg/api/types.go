@@ -667,6 +667,18 @@ type MatchPoliciesResult struct {
 	RouteDropBeforePolicy bool   `json:"route_drop_before_policy,omitempty"`
 	RouteDropClass        string `json:"route_drop_class,omitempty"`
 	RouteDropNote         string `json:"route_drop_note,omitempty"`
+	// FragmentAssociatedDeny is true when the query was a non-first IP fragment
+	// (non_first_fragment param) whose PERMIT was OVERRIDDEN to an overlapping
+	// port-bearing DENY, reproducing the dataplane's #4569 fragment-associated
+	// deny (#5572). When set, Matched is true and the result is attributed to the
+	// ENFORCING deny (PolicyName / PolicyID / RuleID / Action). FragmentDenyNote
+	// carries the SSOT operator advisory (policymatch.FragmentDenyNote) so the
+	// REST answer explains the over-drop identically to the CLI + gRPC surfaces.
+	// ADVISORY, like RouteDropNote. Omitted for every non-fragment verdict and
+	// for a fragment that a real deny matched directly or that permits with no
+	// overlapping deny.
+	FragmentAssociatedDeny bool   `json:"fragment_associated_deny,omitempty"`
+	FragmentDenyNote       string `json:"fragment_deny_note,omitempty"`
 }
 
 // MatchPoliciesHostInbound is the REST projection of the host-inbound-traffic

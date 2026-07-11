@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -209,7 +210,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	var fromZone, toZone, srcIP, dstIP, proto string
 	var srcPort, dstPort int
 	var icmpType, icmpCode *uint8
-	var srcPortErr, portErr, protoErr, icmpTypeErr, icmpCodeErr, parseErr error
+	var nonFirstFrag bool
+	var srcPortErr, portErr, protoErr, icmpTypeErr, icmpCodeErr, fragErr, parseErr error
 	// #3696: fail CLOSED on malformed selector grammar, the server-boundary
 	// sibling of the strict CLI parser (policymatch.ParseSelectorArgs). The old
 	// `if len(parts) != 2 { continue }` silently DROPPED any comma segment
@@ -290,6 +292,12 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 				icmpType, icmpTypeErr = policymatch.ParseICMPValue(parts[1])
 			case "iccode":
 				icmpCode, icmpCodeErr = policymatch.ParseICMPValue(parts[1])
+			case "frag":
+				// #5572: non-first-fragment flag (l4_present == false). The remote
+				// CLI `test policy` emits `frag=1` for the `non-first-fragment`
+				// selector. Parse as a bool; a malformed value errors like a bad
+				// port rather than silently degrading to a normal-packet query.
+				nonFirstFrag, fragErr = strconv.ParseBool(parts[1])
 			default:
 				// #3696: an unknown selector key (e.g. `prot=tcp`, a plausible
 				// operator abbreviation of `proto`) must not be silently ignored,
@@ -322,6 +330,8 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		fmt.Fprintf(buf, "invalid icmp-type: %v\n", icmpTypeErr)
 	case icmpCodeErr != nil:
 		fmt.Fprintf(buf, "invalid icmp-code: %v\n", icmpCodeErr)
+	case fragErr != nil:
+		fmt.Fprintf(buf, "invalid frag: %v\n", fragErr)
 	case srcIP != "" && net.ParseIP(srcIP) == nil:
 		// A non-empty but malformed src would otherwise parse to nil and be
 		// treated as a wildcard, yielding a false-positive policy match
@@ -347,16 +357,19 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			overlay = s.feedOverlayFn()
 		}
 		res := policymatch.Match(cfg, policymatch.Query{
-			FromZone:    fromZone,
-			ToZone:      toZone,
-			SrcIP:       net.ParseIP(srcIP),
-			DstIP:       net.ParseIP(dstIP),
-			Protocol:    proto,
-			SrcPort:     srcPort,
-			DstPort:     dstPort,
-			ICMPType:    icmpType,
-			ICMPCode:    icmpCode,
-			FeedOverlay: overlay,
+			FromZone: fromZone,
+			ToZone:   toZone,
+			SrcIP:    net.ParseIP(srcIP),
+			DstIP:    net.ParseIP(dstIP),
+			Protocol: proto,
+			SrcPort:  srcPort,
+			DstPort:  dstPort,
+			ICMPType: icmpType,
+			ICMPCode: icmpCode,
+			// #5572: non-first-fragment (l4_present == false) reproduces the
+			// #4569 fragment-associated deny; false is a normal L4 packet.
+			NonFirstFragment: nonFirstFrag,
+			FeedOverlay:      overlay,
 			// #3104: skip scheduler-inactive policies like the runtime does, so
 			// the `test policy` diagnostic falls through to the next active rule
 			// / default-policy, agreeing with the dataplane.
@@ -397,11 +410,20 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 				fmt.Fprintf(buf, "  Description: %s\n", res.Description)
 			}
 			fmt.Fprintf(buf, "  Action:    %s\n", policymatch.ActionString(res.Action))
+			// #5572: a non-first fragment whose permit was overridden to this
+			// overlapping port-bearing deny — explain the over-drop.
+			if note := res.FragmentDenyNote(); note != "" {
+				fmt.Fprintf(buf, "  %s\n", note)
+			}
 		case res.Matched:
 			fmt.Fprintf(buf, "Policy match:\n")
 			fmt.Fprintf(buf, "  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
 			fmt.Fprintf(buf, "  Policy:    %s\n", res.PolicyName)
 			fmt.Fprintf(buf, "  Action:    %s\n", policymatch.ActionString(res.Action))
+			// #5572: fragment-associated deny advisory (see global arm).
+			if note := res.FragmentDenyNote(); note != "" {
+				fmt.Fprintf(buf, "  %s\n", note)
+			}
 		default:
 			// No zone-pair or global policy matched: report the configured
 			// default-policy, NOT a hard-coded "deny" (#3103). When the
