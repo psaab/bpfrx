@@ -45,7 +45,17 @@ func (f *reconcileFakeLinkOps) LinkByName(name string) (netlink.Link, error) {
 	if l, ok := f.links[name]; ok {
 		return l, nil
 	}
-	return nil, errors.New("link not found")
+	// Return the SAME type real *netlink.Handle.LinkByName returns on absence
+	// (netlink.LinkNotFoundError), so routing's isLinkNotFound (pkg/routing/
+	// vrf.go — errors.As against netlink.LinkNotFoundError) recognizes it and
+	// the create path falls through to LinkAdd. A plain errors.New("link not
+	// found") is NOT recognized after #5499 tightened Apply to distinguish a
+	// genuine absence from a transient lookup error, so it was misclassified as
+	// transient and the injected LinkAdd failure never reached (#5504). The
+	// embedded error field is unexported, so this can only be the zero value;
+	// that is safe here because no path formats/prints a recognized not-found
+	// error (isLinkNotFound uses errors.As, which never calls Error()).
+	return nil, netlink.LinkNotFoundError{}
 }
 
 func (f *reconcileFakeLinkOps) LinkAdd(l netlink.Link) error {
