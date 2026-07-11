@@ -35,6 +35,21 @@ sibling files (same package, so unexported helpers stay reachable):
   `data-plane`.
 - `cli_request_system.go` — `request system reboot|halt|power-off|zeroize`
   and `software` / `configuration` / `dynamic-dns`.
+  - **`zeroize` erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
+    (#5554).** `zeroizeConfigRoot` resolves the wipe target from
+    `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME
+    file the store loads from and persists the `.configdb` SSOT + `master.key`
+    / numbered text rollback slots / `.config.journal` to — and threads
+    `filepath.Dir/Base` of it into the shared `configstore.FactoryResetConfigDir`
+    /`FactoryResetArchiveDir` primitives (`zeroizeConfigState`). The interactive
+    CLI runs in-process with the daemon and shares its store, so this is the
+    local twin of the gRPC `runZeroize`/`zeroizeConfigRoot` fix (#5280): a daemon
+    started with a non-default `-config` (e.g. `/srv/xpf/site.conf`) erases
+    `/srv/xpf`, not `/etc/xpf`. Resolution is fail-CLOSED — an undeterminable
+    store / config path returns an error rather than wiping the wrong path (or
+    nothing) while reporting a clean factory reset. The pre-fix wipe hardcoded
+    `/etc/xpf` and left the real root's `.configdb`/`master.key`/TLS material/
+    rollback slots on disk.
 - `cli_request_security.go` — `request security ipsec|policies|wireguard`.
 
 The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
