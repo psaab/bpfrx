@@ -1810,6 +1810,22 @@ compiler reads via `routeFilterTrailingToken`. Proven by
 `TestPolicyTermMultiMatch_Hierarchical_2642`
 (`compiler_policy_term_multimatch_2642_test.go`).
 
+The two `route-filter` slots are validated **positionally** (#5576) via a
+`keyValidatorPos` (the position-aware sibling of `keyValidator`, see "Typed
+KEY slots" below): arg 0 (the prefix slot) must parse as a CIDR and arg 1
+(the match-type slot) must be one of `exact`/`longer`/`orlonger`/`upto`/
+`prefix-length-range`/`through`. Before #5576 the key validator was
+position-AGNOSTIC — it accepted the UNION of CIDRs and match-type keywords in
+EITHER slot, so `route-filter longer exact` committed with the keyword
+`longer` in the CIDR slot. The FRR renderer's malformed-prefix belt
+(`net.ParseCIDR("longer")` fails → `renderRouteFilterEntry` emits no
+prefix-list line) then produced an EMPTY prefix-list while the route-map
+retained its `match ip address prefix-list` reference — a **match-none**
+policy that silently dropped every route the term was authored to accept (a
+false-deny). Proven by `TestSchemaValidate_RouteFilter_PositionAware`
+(`schema_validate_route_filter_test.go`) and
+`TestRouteFilterMatchNoneFalseDeny_5576` (`pkg/frr`).
+
 ## Repeated definition blocks merge (prefix-list, community)
 
 A named policy-options DEFINITION can be authored across multiple separate
@@ -2111,7 +2127,14 @@ Rules:
   instead: the walker validates the identity arg token(s) in both the
   packed-Keys and the nested instance-name shapes (both of which
   `namedInstances` compiles), and `?` completion surfaces the key
-  placeholder + examples at the empty identity slot.
+  placeholder + examples at the empty identity slot. For a **multi-arg key
+  slot whose positions carry DISTINCT grammars** (`route-filter <prefix>
+  <match-type>`, args:2), set `keyValidatorPos` (the position-aware sibling of
+  `keyValidator`) instead: the walker passes each token's 0-based arg index
+  so slot 0 and slot 1 can be validated with different rules, closing the
+  #5576 "keyword accepted in the CIDR slot → match-none false-deny" hole. A
+  node sets EITHER `keyValidator` OR `keyValidatorPos`; both are honored in
+  the packed-Keys path AND the peeled nested-name path (`validateKeySlot`).
 - **Multi value-tail leaves accept the block-list spelling.** A
   `multi && children == nil` typed leaf is compiled from BOTH the packed
   Keys (`name-server 1.1.1.1`, ranges with the `to` separator) and the

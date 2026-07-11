@@ -165,6 +165,22 @@ type schemaNode struct {
 	keyValueDesc     string        // one-line key-slot description for `?` help
 	keyValueExamples []string      // illustrative key values surfaced in `?` help
 	keyValidator     LeafValidator // commit-check validator for identity arg tokens
+
+	// keyValidatorPos is the POSITION-AWARE alternative to keyValidator
+	// (#5576). When set, the walker validates each identity arg token with
+	// its 0-based arg index instead of the position-AGNOSTIC keyValidator,
+	// so a multi-arg key slot (args >= 2) can enforce a DISTINCT grammar
+	// per position. A node sets EITHER keyValidator OR keyValidatorPos,
+	// never both. route-filter (`from route-filter <prefix> <match-type>`,
+	// args:2) uses it: arg 0 (the prefix slot) must be a CIDR and arg 1
+	// (the match-type slot) must be a supported match-type keyword. The
+	// prior position-agnostic keyValidator accepted the union of CIDRs and
+	// match-type keywords in EITHER slot, so `route-filter longer exact`
+	// committed with the match keyword `longer` in the CIDR slot; the FRR
+	// renderer's malformed-prefix belt then emitted no prefix-list entry
+	// but kept the route-map match reference, turning an authored accept
+	// into an operational match-none (a silent false-deny).
+	keyValidatorPos PositionalKeyValidator
 }
 
 // isTypedLeaf reports whether the node carries typed-value metadata

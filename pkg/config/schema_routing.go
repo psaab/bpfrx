@@ -190,7 +190,7 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				// arg lands as a fourth packed key via the multi value-tail
 				// absorber, matching the brace AST the compiler already reads.
 				"prefix-list":  {desc: "Prefix list", args: 1, multi: true, placeholder: "<list-name>", children: nil},
-				"route-filter": {desc: "Route filter", args: 2, multi: true, placeholder: "<prefix>", keyValidator: ValidateRouteFilterArg, children: nil},
+				"route-filter": {desc: "Route filter", args: 2, multi: true, placeholder: "<prefix>", keyValidatorPos: ValidateRouteFilterArgPositional, children: nil},
 				"community":    {desc: "Community", args: 1, multi: true, placeholder: "<community>", children: nil},
 				"as-path":      {desc: "AS path", args: 1, multi: true, placeholder: "<name>", children: nil},
 			}},
