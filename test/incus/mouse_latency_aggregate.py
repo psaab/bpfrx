@@ -347,6 +347,25 @@ def render_markdown(summaries: Dict[CellKey, dict], verdict: dict) -> str:
     return "\n".join(lines)
 
 
+def exit_status_for_verdict(verdict: str) -> int:
+    """Map a gate verdict to a process exit status.
+
+    0 = PASS (gate satisfied), 1 = measured FAIL (gate violated),
+    2 = insufficient / undetermined evidence (no confident verdict).
+
+    A measured FAIL MUST exit non-zero so CI treats it as a failure.
+    The prior ``return 0 if verdict in ("PASS", "FAIL") else 2`` painted a
+    real FAIL green (C175-HC-029) — a latency regression that violated the
+    gate read as success in CI.
+    """
+    if verdict == "PASS":
+        return 0
+    if verdict == "FAIL":
+        return 1
+    # INSUFFICIENT-DATA and any unexpected value: undetermined, not a pass.
+    return 2
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", required=True)
@@ -386,7 +405,7 @@ def main() -> int:
         )
 
     print(render_markdown(summaries, verdict))
-    return 0 if verdict["verdict"] in ("PASS", "FAIL") else 2
+    return exit_status_for_verdict(verdict["verdict"])
 
 
 if __name__ == "__main__":

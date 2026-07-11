@@ -199,6 +199,70 @@ class FairnessMultiSampleTest(unittest.TestCase):
         self.assertEqual(summary["aggregate_mbps"]["min"], 900.0)
         self.assertEqual(summary["aggregate_mbps"]["max"], 1100.0)
 
+    def test_summary_fails_when_sample_exit_code_nonzero_despite_pass_json(self) -> None:
+        # C175-HC-084 fail-on-revert: the sub-harness exited 1 (measured
+        # FAIL) but printed a PASS verdict object. The aggregate MUST be
+        # FAIL — the process exit status wins over the JSON verdict.
+        summary = fairness_multi_sample.summarize(
+            [
+                {
+                    "sample": 1,
+                    "verdict": "PASS",
+                    "observed_cov": 0.10,
+                    "cstruct": 0.50,
+                    "gap": -0.40,
+                    "exit_code": 0,
+                },
+                {
+                    "sample": 2,
+                    "verdict": "PASS",
+                    "observed_cov": 0.11,
+                    "cstruct": 0.50,
+                    "gap": -0.39,
+                    "exit_code": 1,
+                },
+            ],
+            max_mean_gap=0.05,
+            max_run_gap=0.05,
+            max_mean_cov=None,
+            max_stdev_cov=None,
+            max_run_cov=None,
+        )
+        self.assertEqual(summary["verdict"], "FAIL")
+        self.assertTrue(
+            any("non-zero harness exit" in r for r in summary["failure_reasons"]),
+            summary["failure_reasons"],
+        )
+
+    def test_summary_passes_when_all_exit_codes_zero(self) -> None:
+        # Guard the positive path: PASS verdicts + exit_code 0 aggregate PASS.
+        summary = fairness_multi_sample.summarize(
+            [
+                {
+                    "sample": 1,
+                    "verdict": "PASS",
+                    "observed_cov": 0.10,
+                    "cstruct": 0.50,
+                    "gap": -0.40,
+                    "exit_code": 0,
+                },
+                {
+                    "sample": 2,
+                    "verdict": "PASS",
+                    "observed_cov": 0.11,
+                    "cstruct": 0.50,
+                    "gap": -0.39,
+                    "exit_code": 0,
+                },
+            ],
+            max_mean_gap=0.05,
+            max_run_gap=0.05,
+            max_mean_cov=None,
+            max_stdev_cov=None,
+            max_run_cov=None,
+        )
+        self.assertEqual(summary["verdict"], "PASS")
+
     def test_summary_fails_gap_thresholds(self) -> None:
         summary = fairness_multi_sample.summarize(
             [

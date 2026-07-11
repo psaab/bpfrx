@@ -45661,6 +45661,78 @@ top.
   tests_native_gre_ecn.rs, tests_nat_rewrite.rs, tests_ports_live_forward.rs,
   tests_segment_tcp.rs, tests_ttl_descriptor_dscp.rs,
   tests_fragment_term_extra.rs, tests_mss_inject_inspect.rs, _Log.md
+## 2026-07-10 — #4907 perf-tooling evidence-integrity cohort
+- **Timestamp**: 2026-07-10
+- **Action**: HC-029 — mouse_latency_aggregate FAIL must exit non-zero (add
+  exit_status_for_verdict: PASS=0, FAIL=1, else=2) + fail-on-revert test
+- **File(s)**: test/incus/mouse_latency_aggregate.py,
+  test/incus/mouse_latency_aggregate_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-084 — fairness_multi_sample summarize() now fails a sample
+  whose sub-harness exit_code != 0 even if its JSON verdict says PASS
+  (exit status is authoritative) + fail-on-revert test
+- **File(s)**: test/incus/fairness_multi_sample.py,
+  test/incus/fairness_multi_sample_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-026 — step2 reducer closes off-CPU intervals at schedule-in
+  (sched_switch next_pid=worker), parses next_pid; wakeup no longer closes.
+  Involuntary preemption (prev_state=R, no wakeup) is now measured.
+  Rewrote synthetic + invariant tests to kernel-realistic switch-in fixtures;
+  added 3 regression tests.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-reduce_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-092 — reducer stamps block_span_ns; classifier computes
+  duty-cycle over the actual summed window (fallback 60s for legacy JSONL)
+  instead of a fixed 60s. Added window tests + diag window_ns.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-classify.py,
+  test/incus/step2-sched-switch-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-070 — reducer main() HALTs (exit 2) on zero-event perf
+  (drift-halt still wins); classifier emits INSUFFICIENT (exit 2) on the
+  all-zero/all-WARN no-evidence shape instead of a definitive OUT exit 0.
+  Updated drift-warning test to a non-empty capture; added empty-perf +
+  insufficient-evidence tests.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-reduce_test.py,
+  test/incus/step2-sched-switch-classify.py,
+  test/incus/step2-sched-switch-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-132 — step1-histogram-classify tracks failed_cells; --only-cell
+  returns non-zero if the target cell produced no hist-blocks; full run returns
+  2 when no valid cells (kills "k_D1 = 0 of 0" exit 0) and 1 on missing/corrupt
+  cells. Added --only-cell missing-target fail-on-revert test.
+- **File(s)**: test/incus/step1-histogram-classify.py,
+  test/incus/step1-histogram-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-128 — rate-spread analyzer validates exact-16 streams +
+  positive finite sender bps (RateSpreadError), and main() hard-fails on any
+  missing requested cell instead of WARN+continue. Added --expected-streams.
+  New test file with fail-on-revert partial/missing cases.
+- **File(s)**: test/incus/step1-rate-spread-analysis.py,
+  test/incus/step1-rate-spread-analysis_test.py (new)
+- **Timestamp**: 2026-07-10
+- **Action**: HC-130 — step1-rss-multinomial simulate() is now a generator
+  (O(1) memory); tail_probabilities streams + counts trials and raises on
+  empty. Deterministic-seed behavior preserved. New test file.
+- **File(s)**: test/incus/step1-rss-multinomial.py,
+  test/incus/step1-rss-multinomial_test.py (new)
+- **Timestamp**: 2026-07-10
+- **Action**: HC-083 — RG 1 Hz poller now writes a POLL_FAILED sentinel per
+  failed/empty tick; cmd_rg_state_flapped returns 2 (undetermined) on any
+  POLL_FAILED marker or --expected-samples shortfall when no drift is seen
+  (drift still wins). Added 3 orchestrate tests.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/test-mouse-latency.sh,
+  test/incus/mouse_latency_orchestrate_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-072 — cold-path-flooder bounded cohort now enumerates a
+  disjoint per-worker slice sequentially (worker_slice + decompose_tuple_index
+  helpers) so first-pass packets are genuine installs (no birthday collisions,
+  no cross-worker overlap). Unbounded keeps random draws. Summary emits
+  tuple_space (fresh-install budget), version bumped 2->3. 4 cargo tests.
+- **File(s)**: test/incus/cold-path-flooder/src/main.rs
 - **Timestamp**: 2026-07-10
 - **Action**: #5280 zeroize wipes the CONFIGURED config root, not a hardcoded
   /etc/xpf. `performZeroizeWipe` was `func() error` calling
