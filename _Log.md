@@ -45598,3 +45598,21 @@ top.
   proven (monkeypatched pre-fix copy -> overwrite-refused test FAILs).
 - **File(s)**: scripts/deploy/xpf-deploy.py,
   scripts/deploy/test_xpf_deploy_disk.py, docs/distribution.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #4832 test-coverage — add (*CLI).testRouting longest-prefix
+  route-lookup tests. New file pkg/cli/cli_request_testrouting_4832_test.go
+  drives the REAL routing.Manager via the exported test seam
+  routing.NewManagerWithRouteListerForTest (route-read domain backed by an
+  in-package fakeRouteLister satisfying the unexported routeLister
+  structurally — all methods exported), captures testRouting's stdout, and
+  asserts which route is selected. Table-driven LPM coverage: v4 /32⊃/24⊃/16⊃
+  /8⊃default and v6 /128⊃/64⊃/32⊃default (most-specific wins per query),
+  already-CIDR input (skips host padding), no-match, VRF `instance` path reads
+  the VRF table not GetRoutes (+ VRF-not-found stays fatal), the #5125
+  partial-family warning path, and the nil-manager / missing-destination
+  guards. TEST-ONLY: no production change.
+  Validation: `GOCACHE=/tmp/gocache-4832 GOTMPDIR=/tmp go test ./pkg/cli/...`
+  green; RED-on-revert proven (flipping `ones > bestLen` to pick the shortest
+  prefix fails the selection assertions; reverted, production file clean).
+- **File(s)**: pkg/cli/cli_request_testrouting_4832_test.go, _Log.md
