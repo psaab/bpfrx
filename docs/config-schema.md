@@ -97,34 +97,40 @@ The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 `load`/...) plus the retained `set system dataplane` description overlay.
 
-### firewall-filter term rule-expansion bound (#5456)
+### firewall-filter term rule-expansion count overflow (#5456)
 
-`validateFilterTermExpansionBoundStrict` (`compiler_validate_strict_filter.go`,
-gated in `runUniformGates`) hard-rejects a firewall-filter term whose rule
-cross-product — (literal source-addresses + every source-prefix-list prefix) ×
+This is a `uint32`-overflow fix plus an **advisory warning** — NOT a strict
+commit gate. `config.FilterTermExpansionCount` returns the per-term counter-slot
+**stride** (the #3459 SSOT the retired-eBPF filter-counter readers walk): the
+cross-product (literal source-addresses + every source-prefix-list prefix) ×
 (literal destination-addresses + every destination-prefix-list prefix) ×
-destination-ports × source-ports — exceeds `MaxFilterTermExpansion` (1<<20 =
-1,048,576, in `firewall_filter_expand.go`).
+destination-ports × source-ports. It was computed as `int` products and cast
+straight to `uint32` with no overflow check, so a term whose product exceeds 2^32
+(e.g. a 5000-prefix source list × a 5000-prefix destination list × 100
+dest-ports × 100 src-ports = 2.5e11) **wrapped** to a small wrong stride — which,
+**on the retired-eBPF per-rule counter path only**, would drift a later term onto
+a neighbour's counter slots.
 
-That cross-product is the per-term counter-slot **stride**
-(`config.FilterTermExpansionCount`, the #3459 SSOT every counter reader walks)
-AND the size of the materialized rule set (`pkg/dataplane.expandFilterTerm`).
-Before this gate the count was computed as `int` products and cast straight to
-`uint32` with no overflow check, so a term whose product exceeds 2^32 (e.g. a
-5000-prefix source list × a 5000-prefix destination list × 100 dest-ports × 100
-src-ports = 2.5e11) **wrapped** to a small wrong stride — `show firewall filter`
-/ the Prometheus collector then read into a neighbouring term's counter slots and
-mis-attributed the hits (a silent-truncation cousin of #3459). The same unbounded
-product is a commit-time memory/CPU-exhaustion surface (a config-driven DoS). The
-count is now computed in overflow-checked `uint64` (`FilterTermExpansionCount64`,
-`math/bits.Mul64`) and the `uint32` stride **clamps** to `MaxFilterTermExpansion`
-rather than wrapping; `expandFilterTerm` caps its materialized slice at the same
-bound, so the drift-guard invariant (count == `len(expandFilterTerm)`) holds for
-an over-bound term too. Strict on commit / commit-check (hard reject naming the
-term and its expansion); lenient on load / peer-sync
-(`opts.lenientFirewallRefs`, warn — an already-persisted or peer-synced config
-still boots per #1960, with the clamp keeping the stride bounded). Distinct from
-#3459, which fixed the stride's *layout* SSOT, not its overflow.
+The fix computes the product in overflow-checked `uint64`
+(`FilterTermExpansionCount64`, `math/bits.Mul64`) and **clamps** the `uint32`
+stride to `MaxFilterTermExpansion` (1<<20 = 1,048,576, in
+`firewall_filter_expand.go`) instead of wrapping; `pkg/dataplane.expandFilterTerm`
+(retired-eBPF compiler) caps its materialized slice at the same bound, so the
+drift-guard invariant (count == `len(expandFilterTerm)`) holds for an over-bound
+term too. The wrap can no longer occur.
+
+**Why no hard reject.** The cross-product and its stride are retired-eBPF-path
+artifacts. The **live userspace dataplane** enforces a filter term natively —
+prefix-**set** membership (`ResolveFilterPrefixListAddrs`) with **name-keyed**
+per-term counters (`FirewallFilterTermCounterKey`) — never materializes the
+cross-product, and is immune to stride drift. A term referencing two ~1500-entry
+prefix-lists (2.25M cross-product) is handled trivially by the live runtime, so
+rejecting it at commit would false-reject a legitimate, enforceable config.
+Instead `warnFilterTermExpansionOverBound` (`compiler_validate_strict_filter.go`,
+called unconditionally in `runUniformGates`) appends an advisory that per-rule
+`show firewall filter` counts on the retired-eBPF path (unused on this build)
+would be clamped/inexact for such a term. It never blocks commit or load (#1960).
+Distinct from #3459, which fixed the stride's *layout* SSOT, not its overflow.
 
 ### `class-of-service forwarding-classes queue` range (#4594)
 

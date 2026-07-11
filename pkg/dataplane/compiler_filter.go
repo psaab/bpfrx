@@ -608,14 +608,14 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 	}
 
 	// #5456: bound the materialized cross-product to config.MaxFilterTermExpansion
-	// — the same cap the strict commit gate (validateFilterTermExpansionBoundStrict)
-	// enforces and the same cap config.FilterTermExpansionCount clamps its stride
-	// to. A committed config can never reach this bound (commit rejects an
-	// over-cap term); it fires only on the tolerant load / peer-sync path (#1960),
-	// where it keeps the allocation bounded instead of attempting the unbounded
-	// (e.g. 2.5e11-entry) cross-product a wrapped uint32 count used to hide.
-	// Keeping the len here == the clamped FilterTermExpansionCount preserves the
-	// #3459 drift-guard invariant for an over-bound term too.
+	// — the same bound config.FilterTermExpansionCount clamps its uint32 stride
+	// to. This is the RETIRED-eBPF filter compiler (the live userspace dataplane
+	// never materializes a cross-product; it stores prefix sets matched by
+	// membership), so this cap only bounds this dead-path allocation and keeps
+	// len(rules) == the clamped FilterTermExpansionCount, preserving the #3459
+	// drift-guard invariant for an over-bound term. Without it a term whose count
+	// used to wrap (e.g. 2.5e11 entries) would attempt an unbounded slice alloc
+	// here. The caller additionally truncates at MaxFilterRules (512).
 	var rules []FilterRule
 expand:
 	for _, src := range srcAddrs {

@@ -5,36 +5,42 @@ import (
 	"math/bits"
 )
 
-// MaxFilterTermExpansion caps the number of dataplane filter rules a single
-// firewall-filter term may expand into (its src×dst×dstPort×srcPort
-// cross-product). A term that exceeds it is REJECTED at the strict commit gate
-// (validateFilterTermExpansionBoundStrict) rather than installed.
+// MaxFilterTermExpansion is the representability bound of the per-term
+// counter-slot STRIDE that config.FilterTermExpansionCount returns as a uint32.
+// It is NOT a policy/feature limit and it does NOT bound the LIVE dataplane —
+// it is the clamp threshold that keeps the uint32 stride from wrapping (#5456).
 //
-// Two problems motivate the cap (#5456):
+// Reachability (why this is a dead-path bound, not a live one):
 //
-//   - Correctness: the expansion count is the per-term counter-slot STRIDE
-//     every counter reader walks (see FilterTermExpansionCount). Before the
-//     cap the product was cast straight to uint32, so a cross-product past
-//     2^32 (e.g. a 5000-prefix source list × a 5000-prefix destination list ×
-//     100 dest-ports × 100 src-ports = 2.5e11) WRAPPED to a small wrong value.
-//     A wrapped stride makes `show firewall filter` / the Prometheus collector
-//     read into a neighbouring term's counter slots and mis-attribute hits
-//     (the #3459 drift class, but driven by silent truncation rather than a
-//     count/layout mismatch).
+//   - The LIVE userspace dataplane never materializes a term's cross-product.
+//     Its filter lowering (pkg/dataplane/userspace ResolveFilterPrefixListAddrs)
+//     stores prefix SETS matched by membership, and its per-term counters are
+//     NAME-keyed (FirewallFilterTermCounterKey{Family,FilterName,TermName}) —
+//     immune to any stride. A term referencing two 1500-entry prefix-lists
+//     (2.25M cross-product) is enforced natively at negligible cost.
+//   - The cross-product (and this stride) live ONLY on the RETIRED-eBPF path:
+//     pkg/dataplane.expandFilterTerm materializes one FilterRule per entry and
+//     writes a per-rule eBPF counter map; FilterTermExpansionCount strides that
+//     map for `show firewall filter` / the Prometheus collector. That Manager is
+//     never instantiated on the live build (NewDataPlane returns
+//     ErrEBPFBackendRetired), and the readers skip the map when it is absent
+//     (hasMap == false), so the stride is unused on the userspace runtime.
 //
-//   - Commit-time DoS: the same unbounded product drives the actual term
-//     expansion (pkg/dataplane.expandFilterTerm materializes one FilterRule
-//     per cross-product entry; the per-rule counter-slot reader iterates the
-//     stride). A config-driven 2.5e11-entry cross-product is a
-//     memory/CPU-exhaustion attack surface at commit.
+// The bug this bound fixes is purely the SILENT uint32 TRUNCATION: the old
+// `uint32(nSrc*nDst*nDstPorts*nSrcPorts)` cast wrapped a cross-product past 2^32
+// to a small wrong stride, which — on the retired-eBPF counter path only — would
+// drift a later term onto a neighbour's counter slots. Clamping the uint32
+// stride to this bound (well under 2^32) makes the wrap impossible. The same
+// bound caps expandFilterTerm's materialized slice so the #3459 drift-guard
+// invariant (count == len(expandFilterTerm)) still holds for an over-bound term,
+// and bounds that retired-path allocation.
 //
-// The value (1<<20 = 1,048,576) is far beyond any legitimate single-term
-// policy — a real firewall filter references a handful of prefixes and ports,
-// and the retired-eBPF dataplane rule table is only MaxFilterRules (512)
-// entries total — yet it stays well under 2^32 so the uint32 stride can never
-// wrap. It is a resource bound, not a feature limit: a term that legitimately
-// needs more rules should be split.
-const MaxFilterTermExpansion = 1 << 20 // 1,048,576 dataplane rules per term
+// Because the harm is retired-path-only, an over-bound term is NOT rejected at
+// commit — it is COMMITTED (the live dataplane enforces it) with an advisory
+// warning (warnFilterTermExpansionOverBound). The value (1<<20 = 1,048,576) is
+// far above any term whose per-rule eBPF counters an operator might realistically
+// inspect, yet well under 2^32.
+const MaxFilterTermExpansion = 1 << 20 // 1,048,576 — uint32 stride clamp threshold
 
 // FilterTermExpansionCount returns the number of dataplane filter rules a
 // single firewall-filter term expands into: the cross-product
@@ -44,13 +50,16 @@ const MaxFilterTermExpansion = 1 << 20 // 1,048,576 dataplane rules per term
 // ("any").
 //
 // This is the SINGLE SOURCE OF TRUTH for the per-term counter-slot stride used
-// by every counter reader — CLI `show firewall filter`, the gRPC text mirror,
-// and the Prometheus xpf_filter_hits_total collector. A reader sums `count`
-// consecutive slots from the term's RuleStart offset and advances by the same
-// `count`, so the next term reads its OWN slots rather than a neighbour's
-// (#3459). It lives here, in the config package, because it is pure
-// config-field arithmetic with no dataplane dependency — all readers already
-// import config, and it keeps the eBPF-retirement import boundary clean.
+// by the RETIRED-eBPF filter-counter readers — CLI `show firewall filter`, the
+// gRPC text mirror, and the Prometheus xpf_filter_hits_total collector when the
+// eBPF filter map is present. A reader sums `count` consecutive slots from the
+// term's RuleStart offset and advances by the same `count`, so the next term
+// reads its OWN slots rather than a neighbour's (#3459). On the LIVE userspace
+// build the eBPF filter map is absent (hasMap == false) and per-term counters
+// are name-keyed, so this stride is unused there. It lives here, in the config
+// package, because it is pure config-field arithmetic with no dataplane
+// dependency — the readers already import config, and it keeps the
+// eBPF-retirement import boundary clean.
 //
 // It counts ALL prefix-list prefixes regardless of the `except` modifier,
 // because the dataplane expansion (pkg/dataplane.expandFilterTerm) emits a
@@ -58,17 +67,13 @@ const MaxFilterTermExpansion = 1 << 20 // 1,048,576 dataplane rules per term
 // the stride and drift the running offset. The drift-guard test
 // TestFilterTermExpansionCountMatchesExpand pins this == len(expandFilterTerm).
 //
-// #5456: the product is computed in uint64 (FilterTermExpansionCount64,
-// overflow-checked) and NEVER cast through a wrapping uint32. A committed
-// config can never carry a term whose product exceeds MaxFilterTermExpansion —
-// the strict commit gate rejects it. This function is reached with an
-// over-bound term only on the tolerant load / peer-sync path (an already-
-// persisted or peer-synced config — #1960 no-brick), where it CLAMPS the
-// stride to MaxFilterTermExpansion rather than silently wrapping. The clamp is
-// consistent with expandFilterTerm, which caps its materialized rule slice at
-// the same bound, so the drift-guard invariant (count == len(expandFilterTerm))
-// holds even for an over-bound term. The normal (in-bound) case is unchanged
-// bit-for-bit: the exact product is returned.
+// #5456: the product is computed in overflow-checked uint64
+// (FilterTermExpansionCount64) and NEVER cast through a wrapping uint32. When
+// the exact product exceeds MaxFilterTermExpansion the returned stride CLAMPS to
+// that bound rather than wrapping — the clamp is consistent with expandFilterTerm
+// (which caps its materialized slice at the same bound), so the drift-guard
+// invariant holds for an over-bound term too. The normal (in-bound) case is
+// unchanged bit-for-bit: the exact product is returned.
 func FilterTermExpansionCount(term *FirewallFilterTerm, prefixLists map[string]*PrefixList) uint32 {
 	c := FilterTermExpansionCount64(term, prefixLists)
 	if c > MaxFilterTermExpansion {
@@ -80,14 +85,14 @@ func FilterTermExpansionCount(term *FirewallFilterTerm, prefixLists map[string]*
 // FilterTermExpansionCount64 returns the exact src×dst×dstPort×srcPort
 // cross-product of a firewall-filter term as a uint64, each factor clamped to a
 // minimum of 1 ("any"). It is the overflow-safe core of FilterTermExpansionCount
-// and the value the strict commit gate (validateFilterTermExpansionBoundStrict)
-// compares against MaxFilterTermExpansion.
+// and the value warnFilterTermExpansionOverBound compares against
+// MaxFilterTermExpansion.
 //
 // Every multiply is checked (math/bits.Mul64): a product that would overflow
 // uint64 saturates to math.MaxUint64 rather than wrapping. Overflow requires a
 // pathological config far past MaxFilterTermExpansion, so the saturated value
-// still lands the term squarely on the reject side of the cap — it never
-// under-reports an over-bound term back down into the accepted range.
+// still lands the term above the bound — it never under-reports an over-bound
+// term back down into the in-bound range.
 func FilterTermExpansionCount64(term *FirewallFilterTerm, prefixLists map[string]*PrefixList) uint64 {
 	nSrc := uint64(len(term.SourceAddresses))
 	for _, ref := range term.SourcePrefixLists {

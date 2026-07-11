@@ -1446,26 +1446,20 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
-	// #5456: firewall-filter term rule-expansion bound. A term whose
+	// #5456: firewall-filter term rule-expansion advisory. A term whose
 	// source×destination×dest-port×src-port cross-product (prefix-list prefixes
-	// folded into src/dst) exceeds MaxFilterTermExpansion silently wrapped the
-	// uint32 counter-slot stride (mis-attributing hits onto a neighbouring
-	// term's slots) and drove an unbounded commit-time term expansion (a
-	// config-driven memory/CPU DoS). Strict on commit / commit-check (hard
-	// reject so the over-bound term is operator-visible); lenient on load /
-	// peer-sync (warn so an already-persisted or peer-synced config still boots
-	// — #1960; FilterTermExpansionCount / expandFilterTerm then CLAMP to the cap
-	// rather than wrapping). Runs on the fully-compiled *Config so the
-	// prefix-list maps are populated regardless of authoring order. Mirrors the
-	// prefix-list reference gate above.
-	if err := validateFilterTermExpansionBoundStrict(cfg); err != nil {
-		if opts.lenientFirewallRefs {
-			cfg.Warnings = append(cfg.Warnings,
-				fmt.Sprintf("firewall filter term expansion (downgraded to warning on tolerant path): %v", err))
-		} else {
-			return err
-		}
-	}
+	// folded into src/dst) exceeds MaxFilterTermExpansion is COMMITTED, not
+	// rejected: the live userspace dataplane enforces it natively (prefix-set
+	// membership + name-keyed per-term counters) and never materializes the
+	// cross-product, so rejecting would false-reject a legitimate config. The
+	// silent uint32 truncation this issue fixes is already closed by
+	// FilterTermExpansionCount's checked-uint64 clamp; this advisory only flags
+	// that per-rule `show firewall filter` counts on the RETIRED-eBPF counter
+	// path (unused on this build) would be clamped/inexact for such a term. Runs
+	// on the fully-compiled *Config so the prefix-list maps are populated
+	// regardless of authoring order. Emitted on BOTH the strict commit and the
+	// tolerant load / peer-sync paths (it never blocks either — #1960 no-brick).
+	warnFilterTermExpansionOverBound(cfg)
 
 	// #2416: NAT `match source-address-name <book-entry>` cross-reference. A
 	// source / destination NAT rule naming an address-book entry not defined
