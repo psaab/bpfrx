@@ -1,3 +1,26 @@
+## 2026-07-10 — #5077 submit-latency classifier K3 monotonicity (I14) mirror
+- **Timestamp**: 2026-07-10 (fix/5077-classifier-submit-monotonicity)
+- **Action**: Mirror the #827 kick-side K3 cross-snapshot monotonicity guard
+  onto the submit side of the step1 histogram classifier. The submit delta
+  loop normalized whenever `count_delta > 0` without checking `buckets_delta
+  < 0` or cumulative-count monotonicity, so a counter RESET (daemon restart,
+  wrap) — total count 10000->12000 while a low-frequency bucket goes
+  1000->0 — emitted NEGATIVE bucket deltas and fed a non-probability shape
+  (negative bucket fractions) into the D1/D2 permutation stats: a false
+  PASS in the perf gate. Added the I14 guard (submit-side analog of K3):
+  pre-delta cross-snapshot monotonicity on tx_submit_latency_count / _sum_ns,
+  tx_packets, and every submit histogram bucket; any non-monotonic cumulative
+  value H-STOPs the cell instead of classifying. Updated `compute_blocks`
+  docstring to document the I14 monotonicity contract. Added 5 tests (count/
+  sum_ns/tx_packets/hist-bucket backwards + the exact reset-and-recover
+  scenario, plus a positive monotonic-still-classifies pin).
+  Validation: `python3 -m py_compile` clean; `pytest
+  step1-histogram-classify_test.py` 16 passed; RED-on-revert proven — the 4
+  I14 negative tests all "DID NOT RAISE" against the origin/master pre-fix
+  source, positive test still passes.
+- **File(s)**: test/incus/step1-histogram-classify.py,
+  test/incus/step1-histogram-classify_test.py, _Log.md
+
 ## 2026-07-10 — #5283 SNMPv3 EngineID per-device uniqueness (cross-clone USM auth-bypass fix)
 - **Timestamp**: 2026-07-10 (fix/5283-snmp-engineid-unique)
 - **Action**: Fix #5283 cross-device USM auth bypass. buildEngineID/initEngine
@@ -45554,3 +45577,24 @@ top.
   `go test -race ./pkg/daemon/... ./pkg/grpcapi/...` green; gofmt clean.
 - **File(s)**: pkg/daemon/daemon_ipmon.go, pkg/daemon/daemon_ipmon_test.go,
   pkg/daemon/README.md, _Log.md
+- **Timestamp**: 2026-07-10
+- **Action**: #5043 — refuse in-place overwrite of a libvirt golden qcow2 that
+  has dependent overlays. `fetch --install-libvirt` did
+  `shutil.copyfile(srcq, golden)` straight over the stable alias
+  `/var/lib/libvirt/images/{image}.qcow2` — an IMMUTABLE shared backing store
+  (per-VM overlays are `qemu-img create -b <golden>`), so a re-fetch over an
+  in-use golden shifted the backing bytes under every overlay and corrupted
+  both HA nodes' disks. Added `_qcow2_backing_file()` (parses `qemu-img info
+  --output=json`) and `_dependent_overlays()` (scans sibling `*.qcow2` for
+  backers of the golden); `_install_libvirt_golden()` now fails closed with a
+  clear operator message (destroy dependents, or install under a fresh
+  `--alias`) when the golden exists AND has dependents. First install and a
+  re-fetch with no dependents still copy. Added 5 tests to
+  test_xpf_deploy_disk.py (RED on revert: the overwrite-refused test loses its
+  SystemExit when the guard is removed). Documented the golden-immutability
+  contract in docs/distribution.md.
+  Validation: `python3 -m py_compile scripts/deploy/xpf-deploy.py` clean;
+  `bash scripts/run-selftests.sh` green (38 passed, 0 failed); RED-on-revert
+  proven (monkeypatched pre-fix copy -> overwrite-refused test FAILs).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_disk.py, docs/distribution.md, _Log.md

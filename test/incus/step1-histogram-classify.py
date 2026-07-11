@@ -199,14 +199,20 @@ def compute_blocks(snaps: list[dict]) -> list[dict]:
 
     I13 is enforced inside `sum_per_binding_hist` on each raw snapshot
     BEFORE any delta is taken, so a compensating corruption across
-    snapshots cannot sneak past a delta-only check.  Here we only
-    compute arithmetic deltas on already-validated aggregates.
+    snapshots cannot sneak past a delta-only check.  I14 (below) then
+    enforces cross-snapshot monotonicity on the cumulative submit
+    counters + histogram — the submit-side analog of the #827 K3 kick
+    guard — so a counter RESET (daemon restart, wrap) cannot produce a
+    negative bucket delta that escapes into the classified shape.  The
+    per-block loop then computes arithmetic deltas on already-validated,
+    monotonic aggregates.
 
     #827 P3 extension: also aggregates kick counters per snapshot via
     `sum_per_binding_kick` (which enforces K0 + K1) and cross-snapshot
     monotonicity (K3) pre-delta. K2 is enforced below alongside the
-    submit-side §9 guard. Step1 is the sole writer of the per-block
-    `tx_kick_*_delta` fields consumed by `step3-tx-kick-classify.py`.
+    submit-side §9 guard, and I14 mirrors K3 for the submit side. Step1
+    is the sole writer of the per-block `tx_kick_*_delta` fields consumed
+    by `step3-tx-kick-classify.py`.
     """
     aggregated = [sum_per_binding_hist(s) for s in snaps]
     kick_aggregated = [sum_per_binding_kick(s, i) for i, s in enumerate(snaps)]
@@ -252,6 +258,44 @@ def compute_blocks(snaps: list[dict]) -> list[dict]:
             bad = int(np.argmin(bucket_diff))
             raise ValueError(
                 f"K3 violation: non-monotonic tx_kick_latency_hist[{bad}] "
+                f"between snap[{i - 1}]={int(h_prev[bad])} and "
+                f"snap[{i}]={int(h_cur[bad])}"
+            )
+    # #5077 I14 — submit-side cross-snapshot monotonicity, the direct analog
+    # of the #827 K3 kick guard. `aggregated` carries the cumulative submit
+    # counters (tx_submit_latency_count / _sum_ns, tx_packets) and the
+    # cumulative 16-bucket submit histogram. A counter RESET (daemon restart,
+    # wrap) can move the total count 10000->12000 while a low-frequency bucket
+    # drops 1000->0, so the per-block `buckets_delta` below would go NEGATIVE
+    # and feed a non-probability `shape` (negative bucket fractions) into the
+    # D1/D2 permutation stats — a false PASS. Enforced pre-delta so a
+    # reset-and-recover cell H-STOPs instead of classifying, exactly as K3
+    # does on the kick side. Before #5077 the submit delta loop only checked
+    # `count_delta > 0`, never `buckets_delta < 0` or cumulative-count
+    # monotonicity, so a reset silently emitted negative deltas.
+    for i in range(1, len(aggregated)):
+        h_prev, c_prev, s_prev, txp_prev = aggregated[i - 1]
+        h_cur, c_cur, s_cur, txp_cur = aggregated[i]
+        if c_cur < c_prev:
+            raise ValueError(
+                f"I14 violation: non-monotonic tx_submit_latency_count "
+                f"between snap[{i - 1}]={c_prev} and snap[{i}]={c_cur}"
+            )
+        if s_cur < s_prev:
+            raise ValueError(
+                f"I14 violation: non-monotonic tx_submit_latency_sum_ns "
+                f"between snap[{i - 1}]={s_prev} and snap[{i}]={s_cur}"
+            )
+        if txp_cur < txp_prev:
+            raise ValueError(
+                f"I14 violation: non-monotonic tx_packets "
+                f"between snap[{i - 1}]={txp_prev} and snap[{i}]={txp_cur}"
+            )
+        bucket_diff = h_cur - h_prev
+        if np.any(bucket_diff < 0):
+            bad = int(np.argmin(bucket_diff))
+            raise ValueError(
+                f"I14 violation: non-monotonic tx_submit_latency_hist[{bad}] "
                 f"between snap[{i - 1}]={int(h_prev[bad])} and "
                 f"snap[{i}]={int(h_cur[bad])}"
             )
