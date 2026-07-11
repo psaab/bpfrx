@@ -100,6 +100,73 @@ func TestDDNSNonCredentialedPlaintextAccepted(t *testing.T) {
 	}
 }
 
+// #5471: a generic backend whose url-template embeds a LITERAL "user:secret@"
+// userinfo in the authority (no typed username/password, no %u/%p specifier)
+// carries the credential just as surely as the %u/%p form. It must classify as
+// credentialed so the http-vs-https gate rejects a plaintext http:// template.
+// RED-on-revert: dropping the ddnsTemplateAuthorityHasUserinfo clause from
+// ddnsBackendCarriesCredentials makes this compile clean — the leak passes
+// commit.
+func TestDDNSGenericLiteralUserinfoPlaintextRejected(t *testing.T) {
+	for _, tmpl := range []string{
+		"http://user:secret@host.example/upd?ip=%i", // user:pass literal
+		"http://alice@host.example/upd?ip=%i",       // user-only literal
+		"http://user:secret@%h/upd?ip=%i",           // host is a %h specifier
+	} {
+		t.Run(tmpl, func(t *testing.T) {
+			tree := buildTree(t, []string{
+				"set system services dynamic-dns provider p backend generic",
+				`set system services dynamic-dns provider p url-template "` + tmpl + `"`,
+			})
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("generic http:// template with literal userinfo %q compiled "+
+					"without error — plaintext credential leak passes commit (#5471)", tmpl)
+			}
+			if !strings.Contains(err.Error(), "https://") || !strings.Contains(err.Error(), "provider \"p\"") {
+				t.Fatalf("error should name the provider and require https, got: %v", err)
+			}
+		})
+	}
+}
+
+// #5471: the SAME literal-userinfo template over https:// is encrypted and must
+// compile — the gate flags only a plaintext (non-https) endpoint, so the
+// credential travels under TLS. Guards against over-rejecting an https literal
+// userinfo config.
+func TestDDNSGenericLiteralUserinfoHTTPSAccepted(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider p backend generic",
+		`set system services dynamic-dns provider p url-template "https://user:secret@host.example/upd?ip=%i"`,
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("generic https:// template with literal userinfo should compile, got: %v", err)
+	}
+}
+
+// #5471: a bare '@' in the PATH or QUERY (no authority userinfo) is NOT a
+// credential and must not be misclassified — an http:// template with no real
+// userinfo still compiles. Mirrors the authority-bounded scan in RedactURL:
+// the '@' after the first '/' or '?' is past the authority boundary.
+func TestDDNSGenericAtInPathQueryNotMisclassified(t *testing.T) {
+	for _, tmpl := range []string{
+		"http://host.example/p@th?ip=%i", // '@' in the path
+		"http://host.example/upd?x=a@b",  // '@' in the query
+		"http://@host.example/upd?ip=%i", // empty userinfo (bare '@')
+	} {
+		t.Run(tmpl, func(t *testing.T) {
+			tree := buildTree(t, []string{
+				"set system services dynamic-dns provider p backend generic",
+				`set system services dynamic-dns provider p url-template "` + tmpl + `"`,
+			})
+			if _, err := CompileConfig(tree); err != nil {
+				t.Fatalf("generic http:// template %q has no authority userinfo and "+
+					"must not be misclassified as credentialed, got: %v", tmpl, err)
+			}
+		})
+	}
+}
+
 // The lenient (tolerant load / peer-sync) path WARNS instead of rejecting a
 // credentialed plaintext endpoint so an already-persisted config an older
 // binary accepted still boots (#1960).
