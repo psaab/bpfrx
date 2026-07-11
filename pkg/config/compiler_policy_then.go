@@ -72,6 +72,37 @@ import "fmt"
 // rejected.
 var supportedPolicyThenPermitChildren = map[string]bool{}
 
+// policyUnsupportedThenPermitModifiers returns the unsupported `then permit`
+// modifier tokens a policy carries — at most one per `then permit` action node
+// (matching the strict gate's report-first-per-node behavior). It is the single
+// source of truth shared by the #3114 strict gate (validatePolicyThenPermitStrict)
+// and compilePolicy's #5575 fail-closed LenientContentDropped flag, so the
+// reject gate and the runtime poison decision never diverge on which permits
+// carry a silently-dropped inspection/service-chain modifier.
+//
+// A bare `then permit` (a `permit` node with no modifier tokens) is fully
+// supported and contributes nothing. ALL `then permit` nodes across ALL
+// `then {}` blocks are inspected (policyThenActionNodes): a flat-set
+// `set ... then permit` followed by `set ... then permit application-services X`
+// produces TWO separate `permit` nodes (the #3377 two-node split), and #3842
+// adds the DUPLICATE inner `then {}` block case. collapsedThenActionTokens
+// flattens each node's modifier tokens across all three parser groupings
+// (flat-onto-permit, collapsed-child, nested). The supported permit-modifier set
+// is empty (supportedPolicyThenPermitChildren), so any token is unsupported.
+func policyUnsupportedThenPermitModifiers(polNode *Node) []string {
+	var out []string
+	for _, permitNode := range policyThenActionNodes(polNode, "permit") {
+		for _, tok := range collapsedThenActionTokens(permitNode) {
+			if supportedPolicyThenPermitChildren[tok] {
+				continue
+			}
+			out = append(out, tok)
+			break
+		}
+	}
+	return out
+}
+
 // validatePolicyThenPermitStrict walks the `security policies` subtree of
 // the group-expanded AST and rejects any policy whose `then permit` action
 // arm carries a child the compiler does not enforce (see file header).
@@ -98,29 +129,9 @@ func validatePolicyThenPermitStrict(nodes []*Node, lenient bool) ([]string, erro
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
-		// A bare `then permit` (a `permit` node with no modifier tokens) is
-		// fully supported. Only `then permit <modifier>` carries an
-		// unsupported modifier. ALL `then permit` nodes across ALL `then {}`
-		// blocks are inspected (policyThenActionNodes): a flat-set
-		// `set ... then permit` followed by `set ... then permit
-		// application-services X` produces TWO separate `permit` nodes (the
-		// #3377 two-node split), and #3842 adds the DUPLICATE inner `then {}`
-		// block case (load merge/override appends a second `then` child) — a
-		// FindChild-first gate saw only the first then block / bare node and
-		// missed the unsupported modifier on the second. collapsedThenAction-
-		// Tokens flattens each node's modifier tokens across all three parser
-		// groupings (flat-onto-permit, collapsed-child, nested). The supported
-		// permit-modifier set is empty (supportedPolicyThenPermitChildren), so
-		// any token is unsupported; report the first per offending node.
-		for _, permitNode := range policyThenActionNodes(polNode, "permit") {
-			for _, tok := range collapsedThenActionTokens(permitNode) {
-				if supportedPolicyThenPermitChildren[tok] {
-					continue
-				}
-				if err := emit(scope, policyName, tok); err != nil {
-					return err
-				}
-				break
+		for _, tok := range policyUnsupportedThenPermitModifiers(polNode) {
+			if err := emit(scope, policyName, tok); err != nil {
+				return err
 			}
 		}
 		return nil

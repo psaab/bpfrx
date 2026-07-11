@@ -75,7 +75,7 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 		// "global { policy ... }" - global policies applied to all zone pairs
 		if child.Name() == "global" {
 			for _, polInst := range namedInstances(child.FindChildren("policy")) {
-				pol := compilePolicy(polInst)
+				pol := compilePolicy(polInst, true)
 				sec.GlobalPolicies = append(sec.GlobalPolicies, pol)
 			}
 			continue
@@ -111,7 +111,7 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 				}
 
 				for _, polInst := range namedInstances(zp.policyNode.FindChildren("policy")) {
-					zpp.Policies = append(zpp.Policies, compilePolicy(polInst))
+					zpp.Policies = append(zpp.Policies, compilePolicy(polInst, false))
 				}
 
 				sec.Policies = append(sec.Policies, zpp)
@@ -202,11 +202,14 @@ func policyThenActionNodes(polNode *Node, action string) []*Node {
 	return out
 }
 
-// compilePolicy extracts a Policy from a named policy instance.
+// compilePolicy extracts a Policy from a named policy instance. isGlobal marks
+// a `security policies global` policy (vs a zone-pair policy) so the #5575
+// unsupported-match-leaf detection honors the global-only from-zone/to-zone
+// match context (#3148) exactly as validatePolicyMatchLeavesStrict does.
 func compilePolicy(polInst struct {
 	name string
 	node *Node
-}) *Policy {
+}, isGlobal bool) *Policy {
 	pol := &Policy{Name: polInst.name}
 
 	// #3842: accumulate across ALL `match {}` blocks (policyMatchChildren) —
@@ -368,6 +371,35 @@ func compilePolicy(polInst struct {
 	// nil (never populated).
 	pol.Match.FromZones = sortDedupZones(pol.Match.FromZones)
 	pol.Match.ToZones = sortDedupZones(pol.Match.ToZones)
+
+	// #5575: fail-CLOSED on the tolerant load / peer-sync path. A policy the
+	// #3044 / #3113 / #3114 strict gates would REJECT (a missing required match
+	// dimension, an unsupported `match` leaf, or an unsupported `then permit`
+	// modifier) is downgraded to a WARNING by CompileConfigLenient — but the
+	// compiler then SILENTLY DROPS the offending constraint: a missing dimension
+	// leaves the corresponding match slice empty, an unsupported match leaf /
+	// then-permit modifier is never read. The userspace matcher reads an empty
+	// dimension as match-ANY, so the leniently-loaded policy silently widens to
+	// a permit BROADER than configured (a fail-open on the persisted-load /
+	// HA-sync path). Record the invalidation on the typed Policy so the
+	// userspace snapshot builder can poison the rule with the __unsupported__
+	// sentinel (never-match) instead of publishing the widened permit.
+	//
+	// This uses the SAME per-policy predicates the three strict gates use
+	// (single source of truth), so the flag is set for EXACTLY the policies a
+	// strict commit would reject. On the strict path those policies never reach
+	// compilePolicy — runPreWalkGates hard-rejects them first — so a clean
+	// strict-committed policy always leaves the flag false and its snapshot is
+	// byte-identical to before. The distinction between an INTENTIONAL wildcard
+	// (`match application any` → a non-empty ["any"] slice → match-any, flag
+	// false) and a DROPPED / MISSING constraint (empty slice, flag true) is made
+	// here on the AST: policyMissingRequiredMatchDimensions treats an omitted
+	// leaf differently from an explicit `any`.
+	if len(policyMissingRequiredMatchDimensions(polInst.node)) > 0 ||
+		len(policyUnsupportedMatchLeafFindings(polInst.node, isGlobal)) > 0 ||
+		len(policyUnsupportedThenPermitModifiers(polInst.node)) > 0 {
+		pol.LenientContentDropped = true
+	}
 
 	return pol
 }

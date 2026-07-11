@@ -132,7 +132,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           },
@@ -165,7 +166,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -1379,7 +1381,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           },
@@ -1412,7 +1415,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -2625,7 +2629,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           },
@@ -2658,7 +2663,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -3871,7 +3877,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           },
@@ -3904,7 +3911,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -5118,7 +5126,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           },
@@ -5151,7 +5160,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -6364,7 +6374,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           },
@@ -6397,7 +6408,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -7593,7 +7605,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -8558,7 +8571,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -9522,7 +9536,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -10486,7 +10501,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -11451,7 +11467,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -12415,7 +12432,8 @@
                 },
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": false
               }
             ]
           }
@@ -14113,7 +14131,8 @@
                 "Log": null,
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": true
               }
             ]
           }
@@ -14443,7 +14462,8 @@
                 "Log": null,
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": true
               }
             ]
           }
@@ -14773,7 +14793,8 @@
                 "Log": null,
                 "Count": false,
                 "SchedulerName": "",
-                "UnknownChildren": null
+                "UnknownChildren": null,
+                "LenientContentDropped": true
               }
             ]
           }
