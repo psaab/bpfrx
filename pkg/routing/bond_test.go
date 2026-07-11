@@ -94,17 +94,45 @@ func (f *fakeBondLinkOps) LinkSetMaster(member, _ netlink.Link) error {
 
 func (f *fakeBondLinkOps) LinkSetNoMaster(netlink.Link) error        { return nil }
 func (f *fakeBondLinkOps) LinkSetMTU(netlink.Link, int) error        { return nil }
-func (f *fakeBondLinkOps) LinkList() ([]netlink.Link, error)         { return nil, nil }
 func (f *fakeBondLinkOps) AddrAdd(netlink.Link, *netlink.Addr) error { return nil }
 func (f *fakeBondLinkOps) AddrDel(netlink.Link, *netlink.Addr) error { return nil }
 func (f *fakeBondLinkOps) AddrList(netlink.Link, int) ([]netlink.Addr, error) {
 	return nil, nil
 }
 
+// LinkList returns every seeded link so bondManager.observedMembers can
+// enumerate a bond's enslaved members by MasterIndex (#5261).
+func (f *fakeBondLinkOps) LinkList() ([]netlink.Link, error) {
+	links := make([]netlink.Link, 0, len(f.links))
+	for _, l := range f.links {
+		links = append(links, l)
+	}
+	return links, nil
+}
+
 // seedMember pre-populates a member link so LinkByName(linuxName) in the
 // enslave loop succeeds and the test reaches LinkSetMaster.
 func (f *fakeBondLinkOps) seedMember(name string) {
 	f.links[name] = &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name}}
+}
+
+// seedBond pre-populates an already-present kernel bond with a non-zero
+// index so observedMembers can key member enslavement off it (a real bond
+// never has index 0; index 0 makes observedMembers fall back). Models the
+// daemon-restart adopt case where the bond outlived in-memory tracking.
+func (f *fakeBondLinkOps) seedBond(name string, index int) {
+	f.links[name] = &netlink.Bond{
+		LinkAttrs: netlink.LinkAttrs{Name: name, Index: index},
+	}
+}
+
+// seedEnslavedMember pre-populates a member link already enslaved to the
+// bond whose kernel index is masterIndex (MasterIndex set), so
+// observedMembers reports it as part of the realized member set.
+func (f *fakeBondLinkOps) seedEnslavedMember(name string, masterIndex int) {
+	f.links[name] = &netlink.Dummy{
+		LinkAttrs: netlink.LinkAttrs{Name: name, MasterIndex: masterIndex},
+	}
 }
 
 func bondFabricConfig(name string, members ...string) *config.InterfaceConfig {
@@ -347,5 +375,141 @@ func TestBondApplyDeletesRemovedBond(t *testing.T) {
 	}
 	if _, ok := b.bonds["bond0"]; !ok {
 		t.Fatalf("bond0 dropped from tracking despite being unchanged: %+v", b.bonds)
+	}
+}
+
+// TestBondAdoptPartialMemberSetNotTrackedAsComplete is the #5261 RED-on-revert
+// guard. A daemon restart adopts a kernel bond that was realized with a
+// PARTIAL member set (one member was absent at realization time — a #4823 soft
+// error). The adopt path must NOT record the full desired signature (which
+// would make every future reconcile see "unchanged" and KEEP the partial bond
+// forever); it must track the ACTUAL realized member set so a later reconcile
+// completes the enslavement once the missing member appears. Reverting the fix
+// tracks the full desired sig → the partial bond is KEEP'd forever (RED here on
+// both the tracked-sig assertion AND the completion assertion).
+func TestBondAdoptPartialMemberSetNotTrackedAsComplete(t *testing.T) {
+	ops := newFakeBondLinkOps()
+	ops.seedBond("bond0", 10)
+	ops.seedEnslavedMember("ge-0-0-1", 10) // realized member
+	// ge-0-0-2 is absent from the kernel — the partial realization.
+	b := &bondManager{ops: ops}
+
+	cfg := []*config.InterfaceConfig{bondFabricConfig("bond0", "ge-0-0-1", "ge-0-0-2")}
+	full := bondSigOf(cfg[0])
+
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("first Apply() (adopt) = %v, want nil", err)
+	}
+	// Adopt must not flap the good member: no LinkDel/LinkAdd, and the absent
+	// member cannot be enslaved yet (soft error), so no LinkSetMaster either.
+	if len(ops.delCalls) != 0 || len(ops.addCalls) != 0 {
+		t.Fatalf("adopt flapped the bond: delCalls=%v addCalls=%v", ops.delCalls, ops.addCalls)
+	}
+	got, ok := b.bonds["bond0"]
+	if !ok {
+		t.Fatalf("bond0 not tracked after adopt: %+v", b.bonds)
+	}
+	if got == full {
+		t.Fatalf("partial adopt tracked the FULL desired sig %+v — a subsequent "+
+			"reconcile will KEEP the partial bond forever (#5261)", got)
+	}
+	if got.members != "ge-0-0-1" {
+		t.Fatalf("adopt tracked members=%q, want %q (only the realized member)",
+			got.members, "ge-0-0-1")
+	}
+
+	// The missing member now appears in the kernel. The next reconcile must
+	// detect the tracked/desired mismatch and complete the enslavement.
+	ops.reset()
+	ops.seedMember("ge-0-0-2")
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("second Apply() (member appeared) = %v, want nil", err)
+	}
+	if !contains(ops.masterCalls, "ge-0-0-2") {
+		t.Fatalf("missing member ge-0-0-2 was NOT enslaved on the follow-up "+
+			"reconcile: masterCalls=%v", ops.masterCalls)
+	}
+	if got := b.bonds["bond0"]; got != full {
+		t.Fatalf("after completion b.bonds[bond0]=%+v, want full desired %+v", got, full)
+	}
+}
+
+// TestBondAdoptPartialCompletesImmediatelyWhenMemberPresent covers the common
+// restart case where the previously-absent member has since appeared in the
+// kernel (the enumeration race resolved across the restart). The adopt path
+// must enslave the now-present member in place — without an intervening
+// recreate — and track the full desired sig, and it must NOT re-enslave the
+// member that was already attached (#5259 no-flap for the good member). A
+// subsequent identical reconcile is then a clean KEEP.
+func TestBondAdoptPartialCompletesImmediatelyWhenMemberPresent(t *testing.T) {
+	ops := newFakeBondLinkOps()
+	ops.seedBond("bond0", 10)
+	ops.seedEnslavedMember("ge-0-0-1", 10) // already enslaved
+	ops.seedMember("ge-0-0-2")             // present in kernel but NOT yet enslaved
+	b := &bondManager{ops: ops}
+
+	cfg := []*config.InterfaceConfig{bondFabricConfig("bond0", "ge-0-0-1", "ge-0-0-2")}
+	full := bondSigOf(cfg[0])
+
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("Apply() (adopt+complete) = %v, want nil", err)
+	}
+	if len(ops.delCalls) != 0 || len(ops.addCalls) != 0 {
+		t.Fatalf("adopt+complete recreated the bond: delCalls=%v addCalls=%v",
+			ops.delCalls, ops.addCalls)
+	}
+	if !contains(ops.masterCalls, "ge-0-0-2") {
+		t.Fatalf("present member ge-0-0-2 was NOT enslaved at adopt: masterCalls=%v", ops.masterCalls)
+	}
+	if contains(ops.masterCalls, "ge-0-0-1") {
+		t.Fatalf("already-enslaved member ge-0-0-1 was re-enslaved (flap): masterCalls=%v", ops.masterCalls)
+	}
+	if got := b.bonds["bond0"]; got != full {
+		t.Fatalf("after in-place completion b.bonds[bond0]=%+v, want full desired %+v", got, full)
+	}
+
+	// Healed: the next identical reconcile is a pure KEEP (no ops at all).
+	ops.reset()
+	// Reflect the enslavement the fake does not model automatically so the
+	// re-adopt sees a complete member set.
+	ops.seedEnslavedMember("ge-0-0-2", 10)
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("third Apply() = %v, want nil", err)
+	}
+	if len(ops.delCalls) != 0 || len(ops.addCalls) != 0 || len(ops.masterCalls) != 0 {
+		t.Fatalf("healed bond flapped on KEEP: delCalls=%v addCalls=%v masterCalls=%v",
+			ops.delCalls, ops.addCalls, ops.masterCalls)
+	}
+}
+
+// TestBondAdoptCompleteMemberSetNoFlap is the #5259 no-flap guarantee for the
+// adopt path: a daemon restart that adopts a FULLY-realized kernel bond (every
+// desired member already enslaved) must track the full desired sig and only
+// bring the bond up — zero LinkDel, zero LinkAdd, zero LinkSetMaster. The
+// partial-member verification must NOT tear down or re-enslave a good bond.
+func TestBondAdoptCompleteMemberSetNoFlap(t *testing.T) {
+	ops := newFakeBondLinkOps()
+	ops.seedBond("bond0", 10)
+	ops.seedEnslavedMember("ge-0-0-1", 10)
+	ops.seedEnslavedMember("ge-0-0-2", 10)
+	b := &bondManager{ops: ops}
+
+	cfg := []*config.InterfaceConfig{bondFabricConfig("bond0", "ge-0-0-1", "ge-0-0-2")}
+	full := bondSigOf(cfg[0])
+
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("Apply() (adopt complete) = %v, want nil", err)
+	}
+	if len(ops.delCalls) != 0 {
+		t.Fatalf("fully-realized adopt issued LinkDel(s) %v — flapped a good bond", ops.delCalls)
+	}
+	if len(ops.addCalls) != 0 {
+		t.Fatalf("fully-realized adopt issued LinkAdd(s) %v — rebuilt a good bond", ops.addCalls)
+	}
+	if len(ops.masterCalls) != 0 {
+		t.Fatalf("fully-realized adopt re-enslaved member(s) %v — flapped a good bond", ops.masterCalls)
+	}
+	if got := b.bonds["bond0"]; got != full {
+		t.Fatalf("adopt tracked %+v, want full desired %+v", got, full)
 	}
 }

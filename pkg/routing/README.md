@@ -120,7 +120,16 @@ set) against the tracked set instead of clearing all and rebuilding:
   policy-only commit no longer flaps the LAG (`LinkDel`→`LinkAdd`→
   re-enslave→LACP re-converge, traffic loss on the bond);
 - **create** a newly-desired bond (also adopts a kernel bond that
-  outlived in-memory tracking, e.g. across a daemon restart);
+  outlived in-memory tracking, e.g. across a daemon restart). The adopt
+  path enumerates the bond's **actual** enslaved member set (`LinkList`
+  by `MasterIndex`) and compares it to the desired set: a fully-realized
+  bond is tracked under the full desired sig and only brought up (no
+  flap, #5259); a bond realized with a **partial** member set (a member
+  absent at realization time — the #4823 soft error) has the missing
+  members enslaved in place if they have since appeared, and is tracked
+  under its **realized** sig — so a partial adopt is never recorded as
+  fully-realized, and the next reconcile completes (or recreates) it
+  instead of KEEP-ing a partial bond forever (#5261);
 - **recreate** (delete+create) a bond whose signature changed — a genuine
   member/mode/MTU change; the mode and enslavement cannot be changed in
   place while members are attached;
