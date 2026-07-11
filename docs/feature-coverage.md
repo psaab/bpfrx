@@ -245,6 +245,11 @@ the userspace dataplane admission boundary is in
   outside the allowlist is dropped (longest-prefix match, `restrict` denies; a
   community without `clients` is allow-all). Enforced in the agent v2c path
   (`pkg/snmp/agent.go` `handleV2cPacket` → `SNMPCommunity.AllowsSource`).
+  Same-name `community <c>` blocks MERGE (#5472): two hierarchical
+  `community public { ... }` siblings accumulate their `clients`/authorization
+  into one entry before the immutable client-prefix cache is built, so a later
+  duplicate with NO `clients` cannot overwrite an earlier block and silently
+  erase its allowlist (an empty allowlist reads as allow-all → fail-open).
 - **RPM probes**, dynamic address feeds.
 - **Dataplane buffer utilization** (`show system buffers`): AF_XDP
   UMEM/TX-ring capacity, CoS queued-byte capacity, helper-published
