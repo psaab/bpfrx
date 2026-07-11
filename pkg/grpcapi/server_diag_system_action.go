@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -83,6 +84,31 @@ var scheduleStopDaemon = func() {
 	}()
 }
 
+// zeroizeConfigRoot resolves the CONFIGURED config root the factory-reset wipe
+// must erase — the directory and base name of the store's `-config` path
+// (configstore.Store.ConfigPath), the SAME path the daemon loads config from and
+// persists the .configdb SSOT / rollback slots / journal to (#5280). Deriving it
+// from the store (rather than a hardcoded /etc/xpf) guarantees the wipe targets
+// exactly the root the running daemon uses: a daemon started with
+// `-config /srv/xpf/site.conf` erases /srv/xpf, not /etc/xpf.
+//
+// Fail CLOSED: if the store is absent or carries no config path we CANNOT know
+// which root holds the prior tenant's secrets, so we return an error rather than
+// silently wiping the wrong/nothing (which would report a clean reset while
+// secrets survive). In production the daemon always wires a store built from a
+// non-empty `-config` path (daemon.New / configstore.New), so this guard only
+// trips in a degenerate build.
+func (s *Server) zeroizeConfigRoot() (configDir, configBase string, err error) {
+	if s.store == nil {
+		return "", "", fmt.Errorf("zeroize: config store unavailable; cannot determine configured config root to erase")
+	}
+	p := s.store.ConfigPath()
+	if p == "" {
+		return "", "", fmt.Errorf("zeroize: config store has no config path; cannot determine configured config root to erase")
+	}
+	return filepath.Dir(p), filepath.Base(p), nil
+}
+
 // runZeroize erases on-disk state for a factory reset. It routes through the
 // daemon-owned apply gate (ZeroizeFn) when wired (#5281): the daemon acquires
 // its apply semaphore, enters the terminal reset generation, and runs the
@@ -91,11 +117,20 @@ var scheduleStopDaemon = func() {
 // nil (NoDataplane / a bare unit-test Server with no daemon), it falls back to
 // an ungated direct wipe — the pre-#5281 behavior — which is acceptable because
 // there is no running reconcile loop to race in that build.
+//
+// The wipe target is the CONFIGURED config root (zeroizeConfigRoot), not a
+// hardcoded /etc/xpf (#5280). Resolution happens BEFORE the gate so a root we
+// cannot determine fails closed without entering the terminal reset generation.
 func (s *Server) runZeroize(ctx context.Context) error {
-	if s.zeroizeFn != nil {
-		return s.zeroizeFn(ctx, performZeroizeWipe)
+	configDir, configBase, err := s.zeroizeConfigRoot()
+	if err != nil {
+		return err
 	}
-	return performZeroizeWipe()
+	wipe := func() error { return performZeroizeWipe(configDir, configBase) }
+	if s.zeroizeFn != nil {
+		return s.zeroizeFn(ctx, wipe)
+	}
+	return wipe()
 }
 
 func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {

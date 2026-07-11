@@ -36,7 +36,7 @@ func TestZeroizeGoesThroughGateAndStopsDaemon(t *testing.T) {
 	// sequence is gate → wipe → stop (never stop-before-wipe, never a bypassed
 	// gate).
 	var seq []string
-	performZeroizeWipe = func() error { seq = append(seq, "wipe"); return nil }
+	performZeroizeWipe = func(_, _ string) error { seq = append(seq, "wipe"); return nil }
 	scheduleStopDaemon = func() { seq = append(seq, "stop") }
 
 	var gateWipeArg func() error
@@ -45,8 +45,9 @@ func TestZeroizeGoesThroughGateAndStopsDaemon(t *testing.T) {
 	s := &Server{
 		store: store,
 		// The gate fake records that the handler routed through it, captures the
-		// wipe closure the handler passed (must be performZeroizeWipe), and runs
-		// it — exactly as the real daemon factoryReset does under applySem.
+		// wipe closure the handler passed (which must, when run, invoke
+		// performZeroizeWipe), and runs it — exactly as the real daemon
+		// factoryReset does under applySem.
 		zeroizeFn: func(_ context.Context, wipe func() error) error {
 			seq = append(seq, "gate")
 			gateWipeArg = wipe
@@ -62,13 +63,13 @@ func TestZeroizeGoesThroughGateAndStopsDaemon(t *testing.T) {
 		t.Fatalf("SystemAction(zeroize) returned empty response: %+v", resp)
 	}
 
-	// The wipe ran through the gate (not directly): the handler passed
-	// performZeroizeWipe into ZeroizeFn.
+	// The wipe ran through the gate (not directly): the handler passed a wipe
+	// closure into ZeroizeFn. Since #5280 the handler wraps performZeroizeWipe in
+	// a closure that binds the CONFIGURED config root, so we no longer assert
+	// pointer identity — the "wipe" entry in seq below proves the gate's closure
+	// invoked performZeroizeWipe.
 	if gateWipeArg == nil {
 		t.Fatal("zeroize did not route the wipe through the apply gate (ZeroizeFn)")
-	}
-	if reflect.ValueOf(gateWipeArg).Pointer() != reflect.ValueOf(performZeroizeWipe).Pointer() {
-		t.Fatal("zeroize passed a different wipe closure to the gate than performZeroizeWipe")
 	}
 
 	// Exact sequence: gate first, wipe under it, daemon stop last.
@@ -90,7 +91,7 @@ func TestZeroizeFailClosedDoesNotStopDaemon(t *testing.T) {
 	})
 
 	wantErr := errors.New("configdb not fully erased")
-	performZeroizeWipe = func() error { return wantErr }
+	performZeroizeWipe = func(_, _ string) error { return wantErr }
 	var stopped bool
 	scheduleStopDaemon = func() { stopped = true }
 
@@ -130,7 +131,7 @@ func TestZeroizeFallsBackToDirectWipeWithoutGate(t *testing.T) {
 	})
 
 	var wiped, stopped bool
-	performZeroizeWipe = func() error { wiped = true; return nil }
+	performZeroizeWipe = func(_, _ string) error { wiped = true; return nil }
 	scheduleStopDaemon = func() { stopped = true }
 
 	dir := t.TempDir()

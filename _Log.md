@@ -45661,3 +45661,40 @@ top.
   tests_native_gre_ecn.rs, tests_nat_rewrite.rs, tests_ports_live_forward.rs,
   tests_segment_tcp.rs, tests_ttl_descriptor_dscp.rs,
   tests_fragment_term_extra.rs, tests_mss_inject_inspect.rs, _Log.md
+- **Timestamp**: 2026-07-10
+- **Action**: #5280 zeroize wipes the CONFIGURED config root, not a hardcoded
+  /etc/xpf. `performZeroizeWipe` was `func() error` calling
+  `zeroizeConfigDir(defaultConfigDir="/etc/xpf", defaultConfigBase="xpf.conf")`
+  — a daemon started with a non-default `-config` (e.g. /srv/xpf/site.conf)
+  wiped /etc/xpf while the real .configdb SSOT + master.key, rollback slots and
+  journal survived under the actual root: a false-success factory reset that
+  retained the prior tenant's secrets. Fix: added
+  `configstore.Store.ConfigPath()` (returns the store's immutable `-config`
+  filePath — same path xpfd loads/persists config from), parameterized
+  `performZeroizeWipe(configDir, configBase)`, and resolved the root in
+  `runZeroize` via a new `zeroizeConfigRoot()` that derives
+  filepath.Dir/Base of `s.store.ConfigPath()`. Fail-CLOSED: an undeterminable
+  root (nil store / empty path) returns an error BEFORE the apply gate, never
+  wiping the wrong path or nothing. Only the config-root leg is parameterized;
+  rendered-config/login/archive/BPF/networkd legs stay at fixed system paths.
+  #5281's gate → wipe → stop + fail-closed behavior preserved. Updated the
+  #5281 gate test (dropped now-stale pointer-identity assert; the closure now
+  wraps performZeroizeWipe to bind the root) and the other perZeroizeWipe fakes
+  to the new signature. New RED-on-revert test
+  zeroize_configured_root_5280_test.go: (1) targets the CONFIGURED root not
+  /etc/xpf, (2) fails closed with no config root. Doc: pkg/grpcapi/README.md
+  zeroize-root contract.
+  Validation: `GOCACHE=/tmp/gocache-5280 GOTMPDIR=/tmp go build ./...` +
+  `go test -race ./pkg/grpcapi/... ./pkg/configstore/...` green. RED-on-revert
+  proven: reverting runZeroize to pass defaultConfigDir/Base makes both new
+  tests fail (wiped "/etc/xpf" not the temp root; reported clean reset with no
+  root); restored, all green. NOTE: the CLI `request system zeroize` path
+  (pkg/cli/cli_request_system.go:80 `configDir := "/etc/xpf"`) has the SAME
+  hardcoded-root shape — a SEPARATE defect out of #5280's grpcapi scope, to be
+  filed as a follow-up issue.
+- **File(s)**: pkg/configstore/store.go, pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/server_diag_system_action.go, pkg/grpcapi/README.md,
+  pkg/grpcapi/zeroize_configured_root_5280_test.go,
+  pkg/grpcapi/zeroize_gate_stop_5281_test.go,
+  pkg/grpcapi/system_action_journal_4108_test.go,
+  pkg/grpcapi/zeroize_configdb_4576_test.go, _Log.md

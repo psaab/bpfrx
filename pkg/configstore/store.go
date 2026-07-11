@@ -226,6 +226,22 @@ func New(filePath string) (*Store, error) {
 	}, nil
 }
 
+// ConfigPath returns the absolute path of the primary config file this Store
+// loads from and persists to — the daemon's `-config` path (New's filePath).
+// Its DIRECTORY is the configuration ROOT that holds the on-disk state a factory
+// reset must erase: the `.configdb` SSOT + master.key (built at
+// filepath.Join(filepath.Dir(filePath), ".configdb")), the numbered text
+// rollback slots (`<base>.N`), and the audit journal
+// (filepath.Join(filepath.Dir(filePath), ".config.journal")). The grpcapi
+// zeroize handler reads it so the wipe targets the ACTUAL configured root rather
+// than a hardcoded /etc/xpf (#5280): a daemon started with
+// `-config /srv/xpf/site.conf` must have /srv/xpf erased, not /etc/xpf. filePath
+// is set once by New and never mutated, so this needs no lock. Empty only on a
+// zero-value Store never constructed via New.
+func (s *Store) ConfigPath() string {
+	return s.filePath
+}
+
 // SetConfigDBWriterVersion sets the xpf build version stamped into the
 // config-DB compatibility-envelope header on write (#1917 increment B).
 // Call once at startup before any Commit/Save; the daemon's single init
