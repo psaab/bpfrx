@@ -108,6 +108,19 @@ dropping the predicate (which would widen the inspected set):
   the entire session table on both HA nodes. The remote `cli` clear parser
   (`cmd/cli/clear.go`) already rejected them; the local interactive CLI
   now matches (`parseClearSessionFilter`, `pkg/cli/session_filter.go`).
+- **`clear security policies hit-count` is global-only and rejects
+  trailing selectors (#5570).** The backend `clear-policy-counters`
+  action carries no zone or policy selector, so the command resets
+  EVERY policy hit counter. The remote `cli` parser
+  (`cmd/cli/clear.go`) requires EXACT arity: `clear security policies
+  hit-count` with no trailing token clears all; any trailing token
+  (e.g. `... from-zone trust`, `... policy <name>`) is **rejected**
+  with an error and issues no clear. This is the same fail-closed
+  invariant as `clear security flow session` — an operator who types a
+  scope believing the clear is scoped must get an error, never a silent
+  global wipe that destroys policy evidence. Per-scope hit-count
+  clearing is not a supported feature; adding it would require a typed
+  RPC with explicit selectors.
 - Direct gRPC `GetSessions` (`pkg/grpcapi/server_sessions.go`) validates
   the `protocol` token and rejects a negative `offset` (centrally in
   `GetSessions`, covering both the cursor and legacy paths); both return

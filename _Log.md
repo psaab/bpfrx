@@ -1,3 +1,21 @@
+## 2026-07-11 — #5570 clear security policies hit-count arity fail-closed
+- **Timestamp**: 2026-07-11 (fix/5570-clear-hitcount-arity)
+- **Action**: `cmd/cli/clear.go` `case "policies"` recognized only the first
+  two tokens (`len(args) >= 2 && args[1] == "hit-count"`) and issued the
+  UNSCOPED global `clear-policy-counters` while ignoring any trailing
+  selector, so `clear security policies hit-count from-zone trust` returned
+  success and wiped EVERY policy hit counter — a destructive-command
+  fail-closed violation. Now requires EXACT arity: the bare two-token form
+  clears all (documented global behavior); ANY trailing token is REJECTED
+  with a usage/selector error and issues no clear. Added a fail-on-revert
+  test (RED-on-revert proven: buggy version returns nil + issues the global
+  clear for the trailing-token form). Documented the invariant in the CLI
+  reference alongside the #5066 `clear security flow session` note. go build
+  ./... + go test ./cmd/cli/... ./pkg/grpcapi/... ./pkg/cli/... green; gofmt
+  clean.
+- **File(s)**: cmd/cli/clear.go, cmd/cli/clear_policies_hitcount_5570_test.go,
+  docs/junos-cli-reference.md, _Log.md
+
 ## 2026-07-11 — #5554 CLI `request system zeroize` configured-root resolution
 - **Timestamp**: 2026-07-11 (fix/5554-cli-zeroize-configured-root)
 - **Action**: The interactive-CLI `request system zeroize` handler hardcoded

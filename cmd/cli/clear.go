@@ -190,17 +190,31 @@ func (c *ctl) handleClearSecurity(args []string) error {
 		return nil
 
 	case "policies":
-		if len(args) >= 2 && args[1] == "hit-count" {
-			resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
-				Action: "clear-policy-counters",
-			})
-			if err != nil {
-				return fmt.Errorf("%v", err)
-			}
-			fmt.Println(resp.Message)
-			return nil
+		// Fail CLOSED for this destructive command. `clear security
+		// policies hit-count` resets EVERY policy hit counter globally —
+		// the backend `clear-policy-counters` action carries no zone or
+		// policy selector. Any trailing token (e.g. `... from-zone
+		// trust`) means the operator intended a SCOPED clear the command
+		// cannot honor; silently issuing the global wipe would erase
+		// counters they meant to keep and destroy policy evidence during
+		// incident response. So require EXACT arity and reject any
+		// trailing selector instead of clearing all (#5570).
+		if len(args) < 2 || args[1] != "hit-count" {
+			return fmt.Errorf("usage: clear security policies hit-count")
 		}
-		return fmt.Errorf("usage: clear security policies hit-count")
+		if len(args) > 2 {
+			return fmt.Errorf("unknown/unsupported selector %q for "+
+				"clear security policies hit-count; per-scope clear is not "+
+				"supported (this command clears ALL policy hit counters)", args[2])
+		}
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+			Action: "clear-policy-counters",
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
 
 	case "counters":
 		_, err := c.client.ClearCounters(c.ctx(), &pb.ClearCountersRequest{})
