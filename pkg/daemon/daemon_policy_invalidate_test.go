@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -273,6 +274,11 @@ type policyInvalTestDP struct {
 	// its entries — models a dataplane iterator that fails partway, exercising
 	// the enumerate-error path in clearSessionsForPolicyIDs (Copilot #4320).
 	iterErr error
+	// delErr, when non-nil, is returned by BatchDeleteSessions/V6 WITHOUT
+	// deleting anything — models a dataplane batch-delete that fails, so the
+	// MATCHED sessions stay INSTALLED. Exercises the delete-error propagation
+	// path in clearSessionsForPolicyIDs (#5578 stale-authorization gap).
+	delErr error
 }
 
 func (d *policyInvalTestDP) Start(context.Context) error { return nil }
@@ -314,6 +320,11 @@ func (d *policyInvalTestDP) BatchIterateSessionsV6(fn func(dataplane.SessionKeyV
 }
 
 func (d *policyInvalTestDP) BatchDeleteSessions(keys []dataplane.SessionKey) (int, error) {
+	if d.delErr != nil {
+		// Model a failed batch delete: nothing is removed, so the matched
+		// sessions stay installed under their now-stale authorization.
+		return 0, d.delErr
+	}
 	n := 0
 	for _, k := range keys {
 		if _, ok := d.v4[k]; ok {
@@ -325,6 +336,9 @@ func (d *policyInvalTestDP) BatchDeleteSessions(keys []dataplane.SessionKey) (in
 }
 
 func (d *policyInvalTestDP) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6) (int, error) {
+	if d.delErr != nil {
+		return 0, d.delErr
+	}
 	n := 0
 	for _, k := range keys {
 		if _, ok := d.v6[k]; ok {
@@ -337,3 +351,128 @@ func (d *policyInvalTestDP) BatchDeleteSessionsV6(keys []dataplane.SessionKeyV6)
 
 func (d *policyInvalTestDP) DeleteDNATEntry(dataplane.DNATKey) error     { return nil }
 func (d *policyInvalTestDP) DeleteDNATEntryV6(dataplane.DNATKeyV6) error { return nil }
+
+// deletedPolicyInvalFixture builds an old/new config pair that DELETES p-web
+// (id 1) plus a fake DP whose v4 + v6 session tables each hold one session
+// admitted by that deleted policy — the setup the #5578 error-propagation
+// tests reuse. p-first (id 0) and p-ssh (id 2) survive so the clear set is the
+// single non-overloaded deleted id {1}.
+func deletedPolicyInvalFixture() (oldCfg, newCfg *config.Config, dp *policyInvalTestDP, webSess dataplane.SessionKey, webSessV6 dataplane.SessionKeyV6) {
+	oldCfg = twoPolicyConfig([]string{"p-first", "p-web", "p-ssh"}, nil)
+	newCfg = twoPolicyConfig([]string{"p-first", "p-ssh"}, nil)
+	webID := dpuserspace.PolicyIDsByStableKey(oldCfg)["trust->untrust/p-web"]
+
+	webSess = dataplane.SessionKey{
+		SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2},
+		SrcPort: 40001, DstPort: 80, Protocol: 6,
+	}
+	webSessV6 = dataplane.SessionKeyV6{
+		SrcIP: [16]byte{0x20, 0x01, 15: 0x01}, DstIP: [16]byte{0x20, 0x01, 15: 0x02},
+		SrcPort: 40003, DstPort: 80, Protocol: 6,
+	}
+	dp = &policyInvalTestDP{
+		v4: map[dataplane.SessionKey]dataplane.SessionValue{
+			webSess: {State: dataplane.SessStateEstablished, PolicyID: webID},
+		},
+		v6: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{
+			webSessV6: {State: dataplane.SessStateEstablished, PolicyID: webID},
+		},
+	}
+	return oldCfg, newCfg, dp, webSess, webSessV6
+}
+
+// TestClearSessionsForPolicyIDsEnumerateErrorPropagates is the #5578
+// RED-on-revert for a failed session-table ENUMERATE: a partial ForEachV4/V6
+// iteration leaves unvisited sessions of the deleted policy in the live table.
+// The helper must RETURN that error (wrapping the injected iterator error), not
+// reduce it to a slog line. RED on revert: with the void/slog-only helper there
+// is no return value to assert, so the compile fails / the error is lost.
+func TestClearSessionsForPolicyIDsEnumerateErrorPropagates(t *testing.T) {
+	oldCfg, newCfg, dp, _, _ := deletedPolicyInvalFixture()
+	errBoom := errors.New("v4 iterator exploded")
+	dp.iterErr = errBoom
+
+	d := &Daemon{dp: dp}
+
+	err := d.clearSessionsForDeletedPolicies(oldCfg, newCfg)
+	if err == nil {
+		t.Fatal("clearSessionsForDeletedPolicies swallowed a session-table enumerate error; " +
+			"a partial invalidation must be RETURNED so the commit can surface the stale-authorization gap (#5578)")
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("returned error %v does not wrap the injected iterator error", err)
+	}
+
+	// The combined helper the commit/sync/rollback callers use must also
+	// propagate it (errors.Join threads every wrapper's error through).
+	if joined := d.clearSessionsForPolicyChanges(oldCfg, newCfg); !errors.Is(joined, errBoom) {
+		t.Fatalf("clearSessionsForPolicyChanges dropped the enumerate error: %v", joined)
+	}
+}
+
+// TestClearSessionsForPolicyIDsDeleteErrorPropagates is the #5578 RED-on-revert
+// for a failed batch DELETE: the matched sessions of the deleted policy stay
+// INSTALLED (stale authorization) yet the pre-fix helper reduced the failure to
+// a slog.Warn. The helper must RETURN the error AND the sessions must remain in
+// the table — proving the security gap (traffic the new policy should deny keeps
+// forwarding) is now observable to the caller, not silently swallowed.
+func TestClearSessionsForPolicyIDsDeleteErrorPropagates(t *testing.T) {
+	oldCfg, newCfg, dp, webSess, webSessV6 := deletedPolicyInvalFixture()
+	errBoom := errors.New("batch delete failed")
+	dp.delErr = errBoom
+
+	d := &Daemon{dp: dp}
+
+	err := d.clearSessionsForDeletedPolicies(oldCfg, newCfg)
+	if err == nil {
+		t.Fatal("clearSessionsForDeletedPolicies swallowed a batch-delete failure; the matched " +
+			"sessions stay installed under stale authorization and the commit must see the error (#5578)")
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("returned error %v does not wrap the injected delete error", err)
+	}
+	// The stale-authorization gap: the delete failed, so the sessions the new
+	// policy should have revoked are still forwarding.
+	if _, ok := dp.v4[webSess]; !ok {
+		t.Error("precondition: v4 session should still be present after a failed delete (models stale authorization)")
+	}
+	if _, ok := dp.v6[webSessV6]; !ok {
+		t.Error("precondition: v6 session should still be present after a failed delete (models stale authorization)")
+	}
+}
+
+// TestApplyAndSyncCommittedSurfacesInvalidationError proves the CALLER surfaces
+// the propagated error (#5578): a successful config apply whose post-apply
+// policy-session invalidation fails must return a non-nil commit error while
+// still committing the config (mark-and-continue, mirroring the non-fatal
+// applyErr path). RED on revert: dropping the errors.Join(applyErr, clearErr) in
+// applyAndSyncCommitted (or reverting the helper to void) makes this return nil.
+func TestApplyAndSyncCommittedSurfacesInvalidationError(t *testing.T) {
+	oldActive, compiled, dp, _, _ := deletedPolicyInvalFixture()
+	errBoom := errors.New("batch delete failed")
+	dp.delErr = errBoom
+
+	d := &Daemon{
+		dp: dp,
+		// Bypass the heavy reconcile: the apply "succeeds" so the post-apply
+		// invalidation runs and its error is the only thing under test.
+		applyBodyForTest: func(*config.Config) {},
+		applyErrForTest:  nil,
+	}
+
+	// syncPeer=false: no cluster wiring needed; the peer push is orthogonal.
+	got, err := d.applyAndSyncCommitted(oldActive, compiled, false)
+	if err == nil {
+		t.Fatal("applyAndSyncCommitted returned nil error despite a failed policy session " +
+			"invalidation; the stale-authorization gap was swallowed (#5578)")
+	}
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("commit error %v does not carry the invalidation failure", err)
+	}
+	// Mark-and-continue: the config is still committed + active (returned),
+	// mirroring how a non-fatal applyErr is surfaced alongside compiled.
+	if got != compiled {
+		t.Fatalf("applyAndSyncCommitted returned config %p, want the committed config %p "+
+			"(a non-fatal invalidation error must not drop the commit)", got, compiled)
+	}
+}

@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -110,8 +112,14 @@ func deletedPolicyRuntimeIDs(oldCfg, newCfg *config.Config) map[uint32]struct{} 
 //
 // Caller must hold d.applySem (all commit/sync/rollback call sites do), so this
 // cannot race a concurrent apply that would reprogram the policy-ID namespace.
-func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) {
-	d.clearSessionsForPolicyIDs(
+//
+// Returns a non-nil error when the invalidation was PARTIAL (a session-table
+// enumerate or batch-delete failed): some sessions of the deleted policy may
+// keep forwarding under the now-revoked authorization, so the caller MUST join
+// this into the commit/sync/rollback result rather than let it be lost to a log
+// line (#5578).
+func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) error {
+	return d.clearSessionsForPolicyIDs(
 		deletedPolicyRuntimeIDs(oldCfg, newCfg),
 		dataplane.DeleteReasonPolicyDeleted,
 		"deleted",
@@ -145,11 +153,15 @@ func (d *Daemon) clearSessionsForDeletedPolicies(oldCfg, newCfg *config.Config) 
 // NOT implemented here — this clears only the policies whose own match/action
 // text changed. `policy-rematch extensive` stays tracked as a follow-up
 // (compiler_validate_warn.go advisory).
-func (d *Daemon) clearSessionsForModifiedPolicies(oldCfg, newCfg *config.Config) {
+//
+// Returns a non-nil error on a PARTIAL invalidation (enumerate/delete failure)
+// so the caller can surface the stale-authorization gap; see
+// clearSessionsForDeletedPolicies (#5578).
+func (d *Daemon) clearSessionsForModifiedPolicies(oldCfg, newCfg *config.Config) error {
 	now := time.Now()
 	oldSched := d.policySchedulerActiveStateForApplyLocked(oldCfg, now)
 	newSched := d.policySchedulerActiveStateForApplyLocked(newCfg, now)
-	d.clearSessionsForPolicyIDs(
+	return d.clearSessionsForPolicyIDs(
 		changedPolicyRuntimeIDs(oldCfg, newCfg, oldSched, newSched),
 		dataplane.DeleteReasonPolicyModified,
 		"modified (policy-rematch)",
@@ -205,21 +217,44 @@ func defaultPolicyChanged(oldCfg, newCfg *config.Config) (changed, unconditional
 // DefaultPolicySentinelID). Sweeping the sentinel is therefore safe and precise.
 //
 // Caller must hold d.applySem (all commit/sync/rollback call sites do).
-func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Config) {
+//
+// Returns a non-nil error on a PARTIAL invalidation (enumerate/delete failure)
+// so the caller can surface the stale-authorization gap; see
+// clearSessionsForDeletedPolicies (#5578).
+func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Config) error {
 	changed, unconditional := defaultPolicyChanged(oldCfg, newCfg)
 	if !changed {
-		return
+		return nil
 	}
 	if !unconditional && (newCfg == nil || !newCfg.Security.PolicyRematch) {
 		// Log-only flip without policy-rematch: leave live default-permit
 		// sessions to log per their install-time intent (Junos re-evaluates
 		// in-progress sessions only under policy-rematch).
-		return
+		return nil
 	}
-	d.clearSessionsForPolicyIDs(
+	return d.clearSessionsForPolicyIDs(
 		map[uint32]struct{}{dataplane.DefaultPolicySentinelID: {}},
 		dataplane.DeleteReasonDefaultPolicyChanged,
 		"default-policy changed",
+	)
+}
+
+// clearSessionsForPolicyChanges runs the three commit-time session
+// invalidations — the deletion-clear (#4234), the modified-policy re-eval
+// (policy-rematch), and the default-policy change clear (#4342) — in order and
+// JOINS their errors so a caller can surface a PARTIAL invalidation in one
+// place (#5578). errors.Join evaluates all three arguments, so every clear is
+// attempted even if an earlier one fails; a non-nil return means at least one
+// clear could not fully drop its target sessions, so some traffic may keep
+// forwarding under stale authorization after a tightening/deleting commit.
+// Returns nil when every clear was a no-op or fully succeeded.
+//
+// Caller must hold d.applySem (all commit/sync/rollback call sites do).
+func (d *Daemon) clearSessionsForPolicyChanges(oldCfg, newCfg *config.Config) error {
+	return errors.Join(
+		d.clearSessionsForDeletedPolicies(oldCfg, newCfg),
+		d.clearSessionsForModifiedPolicies(oldCfg, newCfg),
+		d.clearSessionsForDefaultPolicyChange(oldCfg, newCfg),
 	)
 }
 
@@ -234,14 +269,27 @@ func (d *Daemon) clearSessionsForDefaultPolicyChange(oldCfg, newCfg *config.Conf
 //
 // Caller must hold d.applySem (all commit/sync/rollback call sites do), so this
 // cannot race a concurrent apply that would reprogram the policy-ID namespace.
-func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason dataplane.DeleteReason, what string) {
+//
+// Error contract (#5578): the return value AGGREGATES every enumerate and
+// batch-delete failure (errors.Join). A non-nil return means the invalidation
+// was PARTIAL — a failed ForEachV4/V6 iteration leaves UNVISITED sessions in the
+// live table, and a failed DeleteBatchKnownV4/V6 leaves MATCHED sessions
+// INSTALLED — so traffic the new policy should now DENY may keep forwarding
+// under the old session's stale authorization. The slog.Error/Warn lines are
+// kept for operator diagnostics, but the error is ALSO returned so the caller
+// can join it into the commit/sync/rollback result instead of the security gap
+// being silently swallowed. Both families are always attempted before the error
+// is returned (a partial clear is strictly better than none). Returns nil when
+// there was nothing to do (no ids / no dataplane / no matching sessions) or the
+// clear fully succeeded.
+func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason dataplane.DeleteReason, what string) error {
 	if d.dp == nil || len(ids) == 0 {
-		return
+		return nil
 	}
 
 	store := d.dp.Sessions()
 	if store == nil {
-		return
+		return nil
 	}
 	// Whether to propagate the local deletes to the HA peer. Mirrors the GC
 	// delete callback (daemon_run.go): only a node that is primary for some RG
@@ -280,18 +328,29 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		}
 		return true
 	})
+	// errs accumulates every enumerate/delete failure so the caller can join it
+	// into the commit/sync/rollback result (#5578) — the failure is no longer
+	// lost to a log line while the commit reports success with stale authorized
+	// sessions still forwarding.
+	var errs []error
 	if v4EnumErr != nil || v6EnumErr != nil {
 		slog.Error("policy session invalidation: session-table enumerate failed; clear is PARTIAL — some sessions of changed policies may keep forwarding",
 			"change", what, "reason", reason, "policies", len(ids),
 			"v4_err", v4EnumErr, "v6_err", v6EnumErr,
 			"v4_matched", len(v4Entries), "v6_matched", len(v6Entries))
+		if v4EnumErr != nil {
+			errs = append(errs, fmt.Errorf("policy session invalidation (%s): v4 enumerate: %w", what, v4EnumErr))
+		}
+		if v6EnumErr != nil {
+			errs = append(errs, fmt.Errorf("policy session invalidation (%s): v6 enumerate: %w", what, v6EnumErr))
+		}
 		// Fall through to clear what we DID enumerate — a partial clear is
 		// strictly better than none — but the error log above ensures the
 		// partial state is visible and the success line below is skipped.
 	}
 
 	if len(v4Entries) == 0 && len(v6Entries) == 0 {
-		return
+		return errors.Join(errs...)
 	}
 
 	v4Cleared := 0
@@ -299,6 +358,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		if n, err := store.DeleteBatchKnownV4(v4Entries, reason); err != nil {
 			slog.Warn("policy session invalidation: v4 clear failed",
 				"reason", reason, "policies", len(ids), "matched", len(v4Entries), "err", err)
+			errs = append(errs, fmt.Errorf("policy session invalidation (%s): v4 delete: %w", what, err))
 		} else {
 			v4Cleared = n
 		}
@@ -314,6 +374,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 		if n, err := store.DeleteBatchKnownV6(v6Entries, reason); err != nil {
 			slog.Warn("policy session invalidation: v6 clear failed",
 				"reason", reason, "policies", len(ids), "matched", len(v6Entries), "err", err)
+			errs = append(errs, fmt.Errorf("policy session invalidation (%s): v6 delete: %w", what, err))
 		} else {
 			v6Cleared = n
 		}
@@ -329,7 +390,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 	// enumerate failed: the counts describe only what we managed to gather, so an
 	// Info "cleared" line would misreport a partial clear as complete (the Error
 	// line above already recorded it).
-	if v4EnumErr == nil && v6EnumErr == nil {
+	if v4EnumErr == nil && v6EnumErr == nil && len(errs) == 0 {
 		slog.Info("cleared sessions of changed policies at commit",
 			"change", what,
 			"policies", len(ids),
@@ -337,6 +398,7 @@ func (d *Daemon) clearSessionsForPolicyIDs(ids map[uint32]struct{}, reason datap
 			"v6_cleared", v6Cleared,
 			"ha_sync", syncPeer)
 	}
+	return errors.Join(errs...)
 }
 
 // changedPolicyRuntimeIDs returns the OLD numeric runtime IDs of policies that

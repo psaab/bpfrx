@@ -45906,3 +45906,32 @@ top.
   **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
   cmd/xpfd/upgrade.go, docs/in-place-upgrade.md,
   pkg/upgrade/cutover_cluster_gate_indeterminate_5573_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11 (fix/5578-policy-session-invalidation-errors)
+  **Action**: #5578 propagate policy-session-invalidation failures instead of
+  swallowing them to a log line. `clearSessionsForPolicyIDs` and its three
+  wrappers (`clearSessionsForDeletedPolicies`,
+  `clearSessionsForModifiedPolicies`, `clearSessionsForDefaultPolicyChange`)
+  changed from `void` to returning an aggregated `error` (errors.Join of the
+  ForEachV4/V6 enumerate errors + DeleteBatchKnownV4/V6 delete errors; both
+  families always attempted first — a partial clear beats none). A partial
+  invalidation is a stale-authorization gap: a failed enumerate leaves
+  unvisited sessions and a failed batch-delete leaves matched sessions
+  INSTALLED, so traffic the new policy should DENY keeps forwarding on old
+  session state while the commit reported success. Added a combined helper
+  `clearSessionsForPolicyChanges` that runs all three and joins. Callers now
+  surface it: `applyAndSyncCommitted` joins it into the returned commit error
+  alongside the non-fatal applyErr (mark-and-continue — config stays committed
+  + still syncs to the peer, mirroring the surrounding apply-step discipline);
+  `syncAndApply` returns it to `handleConfigSync`; the void confirm-timeout
+  rollback (`executeConfirmedRollback`) logs it loudly (no return path — mirrors
+  the applyConfigLocked slog.Error above it). slog.Error/Warn diagnostics kept.
+  New fail-on-revert tests inject ForEach + batch-delete errors via the
+  dataplane fake and assert the wrapper AND the caller RETURN the wrapped
+  error (and, for the delete case, that the matched sessions remain installed
+  = the observable stale-authorization gap). RED-on-revert proven: semantic
+  swallow at the core (return nil) + caller ignoring the return → all three new
+  tests FAIL. go build ./... + go test ./pkg/daemon/... green; gofmt clean.
+  Updated docs/feature-gaps.md Policy-Rematch row with the #5578 error contract.
+  **File(s)**: pkg/daemon/daemon_policy_invalidate.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_policy_invalidate_test.go, docs/feature-gaps.md, _Log.md
