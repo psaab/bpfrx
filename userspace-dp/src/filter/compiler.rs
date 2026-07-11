@@ -924,13 +924,26 @@ fn parse_term(
         // #2544: this term falls through (applies modifiers, continues to the
         // next term) when it carries no terminating action. The Go control
         // plane sets next_term for both the explicit `then next term` and the
-        // modifier-only case. We OR in `snap.action.is_empty()` as a belt-and-
-        // suspenders guard so an older Go control plane that omits next_term but
-        // sends an empty-action modifier-only term still falls through instead
-        // of terminating as Accept. A routing-instance (PBR) term takes its own
-        // routing decision and is NOT a fall-through even with an empty action.
-        continue_term: (snap.next_term || snap.action.is_empty())
-            && snap.routing_instance.is_empty(),
+        // modifier-only case. A term with an empty action falls through; a
+        // routing-instance (PBR) term takes its own routing decision and is
+        // NOT a fall-through even with an empty action.
+        //
+        // #5142 (fail-CLOSED): a term that carries a REAL terminating action
+        // (accept/reject/discard) MUST terminate and apply that action, EVEN IF
+        // next_term is also set. `then discard; next term;` is a contradiction:
+        // the deny is a terminal, and a fall-through bit must NEVER suppress it
+        // (vSRX filter semantics). Before #5142 this read `(snap.next_term ||
+        // snap.action.is_empty()) && routing_instance.is_empty()`, so a
+        // discard/reject term carrying next_term=true fell through and left the
+        // `FilterResult::default()` implicit Accept in place — the deny was
+        // silently dropped (fail-OPEN). The Go commit gate
+        // (validateFilterTerminalConflictStrict) now rejects that contradiction,
+        // but the tolerant peer-sync path could still deliver one, so the
+        // runtime fails closed on its own: fall through ONLY when the action is
+        // empty. An empty action stays a fall-through whether or not next_term
+        // was set (belt-and-suspenders for an older Go control plane that omits
+        // next_term but sends a modifier-only term).
+        continue_term: snap.action.is_empty() && snap.routing_instance.is_empty(),
         count: snap.count.clone(),
         has_count: !snap.count.is_empty(),
         log: snap.log,
