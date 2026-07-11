@@ -1,6 +1,48 @@
 # #5278 — Server-side per-principal auth/authz for the loopback gRPC control plane
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** v2 — Claude SMR r1 addressed; Codex + AGY infra-blocked (retries pending), NOT yet 3-way converged
+
+## v2 revisions (addressing Claude SMR r1 — see claude-smr-plan-r1.md)
+
+- **F1 (premise fix):** The in-process interactive CLI is NOT exempt — it
+  self-dials gRPC (`pkg/cli/session_filter.go:438,518`, `cli_clear.go:354`,
+  `cli_show_chassis.go:122` all `pb.NewBpfrxServiceClient(conn)`). Corrected
+  model: the console CLI runs in the daemon as **root (uid 0)** and authenticates
+  as uid 0 → super-user → PermAll under SO_PEERCRED — full access BY
+  authenticating, not by bypass. **Implementation MUST resolve the in-process
+  conn type:** if the console CLI dials the real socket, SO_PEERCRED applies
+  (peer=root); if it uses an in-memory bufconn, the interceptor needs an explicit
+  in-process AuthInfo trust tag set on that path. Verify at implementation.
+- **F2 (flag-day scope):** The transport cut is bigger than "cmd/cli + tests" —
+  route EVERY `pb.NewBpfrxServiceClient` dial site in pkg/cli AND cmd/cli through
+  ONE shared dial helper, and change the transport (TCP 50051 → `unix:///run/xpf/grpc.sock`)
+  in that single helper. Enumerate all dial sites (grep `NewBpfrxServiceClient`).
+- **F3 (open-Q4 closed):** Shared class→perm evaluator lives in **pkg/config**
+  (already holds `Perm*` + `compiler_system.go:913` class→perm + `LoginClass.MappedPermissions`;
+  pkg/grpcapi already imports pkg/config — no cycle). Only the method→required-perm
+  table is new, server-side in pkg/grpcapi.
+- **F4 (scope — :8080 sibling):** The REST :8080 `config/set|load|commit`
+  endpoints are the SAME bypass on a second surface — filed as **#5561**. #5278
+  is explicitly the **gRPC leg**; #5561 is the HTTP leg; they close together.
+- **F5 (mechanism):** SO_PEERCRED via a `credentials.TransportCredentials` whose
+  `ServerHandshake(conn)` type-asserts `*net.UnixConn`, reads
+  `unix.GetsockoptUcred(fd, SOL_SOCKET, SO_PEERCRED)` (fd via `SyscallConn().Control`,
+  not `.File()`), returns an AuthInfo carrying `*unix.Ucred`; interceptor reads
+  `peer.FromContext(ctx).AuthInfo`.
+- **F6:** fail-closed default = strictest kept; the enumerate-service-descriptor
+  test FAILS on any unmapped method (prevents silent incompleteness either way).
+
+**Reviewer status:** Claude SMR r1 = PLAN-NEEDS-MINOR (addressed above). Codex
+plan-review dispatch was LOST (companion job did not persist — known
+long-session Codex-state-loss); AGY companion is infra-broken (both invocations
+failed). Convergence needs a clean Codex + AGY pass — retries pending. The v2
+plan is materially complete and self-reviewed; a future session (or the user)
+can drive the external convergence, or `/engineer` against v2 with the
+single-reviewer caveat noted.
+
+---
+
+**Status (v1 origin):** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
 **Issue:** #5278 (codex-review-178 A8-b3-F1). Severity: High (privilege escalation / RBAC bypass).
 **Base:** origin/master `0ab8a90a8`.
 
