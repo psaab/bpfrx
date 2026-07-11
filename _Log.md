@@ -45439,3 +45439,23 @@ top.
 - **Timestamp**: 2026-07-10
 - **Action**: Fix #4984 (split from the #4884 interface-identity cohort, sub-defect B). The `show interfaces` family mixed name spellings for the SAME interface: summary + terse print the authored Junos name (`ge-0/0/2`), but the netlink-driven `detail` / `extensive` / `statistics` paths walked kernel netdevs and printed the Linux dash-form name (`ge-0-0-2`) as the interface identity. `detail` / `extensive` also keyed the zone + description joins by the authored name yet looked them up by the kernel name, so both were silently blank, and an authored-form filter (`show interfaces ge-0/0/2 detail`) reported "not found". Established one canonical model: the authored Junos name is the display identity across every variant; kernel names are used only for lookups. Added shared helpers in cli_show_interfaces_shared.go — `kernelToAuthoredMap` (config `LinuxIfName` reverse map: kernel netdev -> authored name), `authoredName` (resolve with kernel-name fallback for unmanaged devices), and `ifaceFilterMatches` (accept either spelling as the `<name>` filter). Routed detail/extensive/statistics display + zone/description joins + filter through the authored form (zone joins re-keyed by authored BASE name via `baseIfName`). Fixed the summary path's per-unit address lookup to resolve to the kernel VLAN sub-device (`config.LinuxIfName(physName)` + `.vlan-id`) instead of the authored `ge-0/0/2.50` — the authored form failed `net.InterfaceByName` and fell back to the parent, printing the parent's addresses under the sub-unit. Display-only change; no interface-management logic touched. `show interfaces queue` (CoS runtime snapshot, show_services_cos.go) is out of scope. RED-on-revert PROVEN: stashing the five source edits makes all four new tests FAIL (kernel identity printed / zone+desc joins blank / authored filter not found). Gates: `go build ./...` + `go test ./pkg/cli/...` green; gofmt clean.
 - **File(s)**: pkg/cli/cli_show_interfaces.go, pkg/cli/cli_show_interfaces_detail.go, pkg/cli/cli_show_interfaces_extensive.go, pkg/cli/cli_show_interfaces_stats.go, pkg/cli/cli_show_interfaces_shared.go, pkg/cli/cli_show_interfaces_identity_4984_test.go, docs/junos-cli-reference.md, _Log.md
+## 2026-07-10 — #5470 xpf-deploy --lease-ttl positive-value validation
+- **Timestamp**: 2026-07-10
+- **Action**: Fixed unconstrained `type=int` on both `--lease-ttl` parsers
+  (kernel-roll + image-roll) in scripts/deploy/xpf-deploy.py. Added a shared
+  `positive_int()` argparse `type=` callable that rejects 0/negative/non-int at
+  parse time (raises argparse.ArgumentTypeError → usage error + exit 2, BEFORE
+  any remote/deploy action). A non-positive TTL made `_acquire_lease` render
+  `expires_at = now + ttl` with the strict `now < expires` guard treating the
+  lease as already-expired the instant it is written — the cross-orchestrator
+  roll mutex never held, so two drivers could drain opposite HA nodes into a
+  no-primary outage. Rejects rather than silently clamps (fail-closed). Added
+  scripts/deploy/test_xpf_deploy_lease_ttl.py (10 cases): pure `positive_int`
+  accept/reject + end-to-end parser wiring for both roll subcommands
+  (reject 0/negative w/ exit 2 and handler-not-called; accept positive w/
+  parsed lease_ttl; default 1800 unchanged). RED-on-revert PROVEN: reverting
+  either arm to `type=int` fails the 3 reject tests (SystemExit not raised).
+  Updated docs/in-place-upgrade.md with the `--lease-ttl` positivity contract.
+  Validation: `python3 -m py_compile` clean; `bash scripts/run-selftests.sh`
+  green (37 passed, 0 failed, includes the new test).
+- **File(s)**: scripts/deploy/xpf-deploy.py, scripts/deploy/test_xpf_deploy_lease_ttl.py, docs/in-place-upgrade.md, _Log.md
