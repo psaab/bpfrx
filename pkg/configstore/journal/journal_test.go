@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -787,6 +788,201 @@ func TestConcurrentLogTail(t *testing.T) {
 				t.Fatalf("duplicate entry %q during concurrent rotation", e.Detail)
 			}
 			seen[e.Detail] = true
+		}
+	}
+}
+
+// TestTailNotBlockedByLogFsync (#4829) is the headline invariant: a
+// Tail() concurrent with a Log() that is parked in fsync must return
+// promptly, NOT stall for the fsync duration. The #4829 design holds j.mu
+// only for the buffered write + rotation and releases it before f.Sync;
+// Tail takes the same j.mu and so must not wait behind the fsync.
+// RED-on-revert: move f.Sync back under j.mu (the pre-#4829 body) and
+// this test fails — Tail blocks ~fsyncHold.
+func TestTailNotBlockedByLogFsync(t *testing.T) {
+	j := testJournal(t)
+
+	// Seed one entry with the default fast sync so the file exists and
+	// Tail has real content to read.
+	mustLog(t, j, &Entry{Action: "commit", Detail: "seed"})
+
+	// Install a slow fsync: the next Log parks in f.Sync for fsyncHold.
+	// syncEntered fires the instant the fsync begins — by which point,
+	// under the #4829 design, j.mu is already released.
+	const fsyncHold = 750 * time.Millisecond
+	var once sync.Once
+	syncEntered := make(chan struct{})
+	j.syncFile = func(f *os.File) error {
+		once.Do(func() { close(syncEntered) })
+		time.Sleep(fsyncHold)
+		return f.Sync()
+	}
+
+	logDone := make(chan error, 1)
+	go func() { logDone <- j.Log(&Entry{Action: "commit", Detail: "slow"}) }()
+
+	select {
+	case <-syncEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Log never reached fsync")
+	}
+
+	start := time.Now()
+	got, err := j.Tail(50)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Tail: %v", err)
+	}
+	if elapsed > fsyncHold/2 {
+		t.Fatalf("Tail blocked %v behind Log's in-progress fsync (want prompt); "+
+			"j.mu is held across fsync — #4829 regressed", elapsed)
+	}
+	// Write happens under j.mu BEFORE the fsync, so by the time the fsync
+	// is running both entries are fully in the page cache and visible to a
+	// reader — durability (fsync) is decoupled from visibility (the
+	// write). Neither may be torn.
+	for _, e := range got {
+		if e.Action == "" {
+			t.Fatalf("torn/partial entry observed during concurrent Log: %+v", e)
+		}
+	}
+	if len(got) != 2 || got[0].Detail != "seed" || got[1].Detail != "slow" {
+		t.Fatalf("Tail concurrent with in-flight fsync did not see both complete entries: %+v", got)
+	}
+
+	if err := <-logDone; err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+}
+
+// TestConcurrentLogTailNoTornOrError (#4829): many writers appending
+// while many readers Tail concurrently must never surface a read error, a
+// torn/partial/garbage entry, or a duplicate within a single Tail
+// snapshot. Exercises the write-under-lock / fsync-outside-lock split
+// under -race. RED-on-revert of the torn-tail newline framing or the
+// parse-or-skip guard would let a partial record through here.
+func TestConcurrentLogTailNoTornOrError(t *testing.T) {
+	j := testJournal(t, WithMaxSegmentBytes(4096), WithMaxSegments(3))
+
+	const writers = 4
+	const perWriter = 250
+
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	for r := 0; r < 3; r++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				got, err := j.Tail(50)
+				if err != nil {
+					t.Errorf("Tail: %v", err)
+					return
+				}
+				seen := map[string]bool{}
+				for _, e := range got {
+					if e.Action == "" || !strings.HasPrefix(e.Detail, "w") {
+						t.Errorf("torn/garbage entry from concurrent read: %+v", e)
+						return
+					}
+					if seen[e.Detail] {
+						t.Errorf("duplicate %q within one Tail snapshot", e.Detail)
+						return
+					}
+					seen[e.Detail] = true
+				}
+			}
+		}()
+	}
+
+	var writersWG sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		writersWG.Add(1)
+		go func(w int) {
+			defer writersWG.Done()
+			for i := 0; i < perWriter; i++ {
+				if err := j.Log(&Entry{Action: "commit", Detail: fmt.Sprintf("w%d-%05d", w, i)}); err != nil {
+					t.Errorf("Log: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+	writersWG.Wait()
+	close(stop)
+	readers.Wait()
+}
+
+// TestRotationDuringSlowFsync (#4829): rotation correctness must hold when
+// the fsync runs outside j.mu. With a small segment (forced rotations)
+// and a deliberately slow fsync, concurrent Tails must still see complete,
+// non-duplicated entries, and the final retained window must be
+// contiguous and end at the newest entry.
+func TestRotationDuringSlowFsync(t *testing.T) {
+	j := testJournal(t, WithMaxSegmentBytes(400), WithMaxSegments(2))
+	// Rotation happens under j.mu; the fsync after it. A non-zero fsync
+	// delay widens the window in which a reader can race a mid-flight
+	// durability op.
+	j.syncFile = func(f *os.File) error {
+		time.Sleep(2 * time.Millisecond)
+		return f.Sync()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			if err := j.Log(&Entry{Action: "commit", Detail: fmt.Sprintf("c%05d", i)}); err != nil {
+				t.Errorf("Log: %v", err)
+				return
+			}
+		}
+	}()
+
+loop:
+	for {
+		select {
+		case <-done:
+			break loop
+		default:
+		}
+		got, err := j.Tail(20)
+		if err != nil {
+			t.Fatalf("Tail during rotation+slow-fsync: %v", err)
+		}
+		seen := map[string]bool{}
+		for _, e := range got {
+			if e.Action == "" {
+				t.Fatalf("torn entry during rotation+slow-fsync: %+v", e)
+			}
+			if seen[e.Detail] {
+				t.Fatalf("duplicate %q during concurrent rotation", e.Detail)
+			}
+			seen[e.Detail] = true
+		}
+	}
+
+	all, err := j.Tail(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) == 0 {
+		t.Fatal("no entries survived")
+	}
+	if all[len(all)-1].Detail != "c00299" {
+		t.Fatalf("newest entry missing: %q", all[len(all)-1].Detail)
+	}
+	for i := 1; i < len(all); i++ {
+		var prev, cur int
+		fmt.Sscanf(all[i-1].Detail, "c%d", &prev)
+		fmt.Sscanf(all[i].Detail, "c%d", &cur)
+		if cur != prev+1 {
+			t.Fatalf("retained window not contiguous: %q then %q", all[i-1].Detail, all[i].Detail)
 		}
 	}
 }
