@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -252,15 +253,32 @@ var (
 	}
 )
 
-// zeroizeLookupUID returns the current numeric UID for name by parsing
-// zeroizePasswdPath directly (cgo-free, mirroring pkg/daemon.lookupUID). It
-// returns (uid, true) on success and (0, false) if the file is unreadable, the
-// account is absent, or the UID field does not parse — the "not our account"
-// disposition that suppresses a userdel.
-func zeroizeLookupUID(name string) (int, bool) {
-	data, err := os.ReadFile(zeroizePasswdPath)
-	if err != nil {
-		return 0, false
+// zeroizeLookupUIDErr resolves the CURRENT numeric UID for name by parsing
+// zeroizePasswdPath directly (cgo-free, mirroring pkg/daemon.lookupUIDGIDErr,
+// #5493). It distinguishes the THREE outcomes a fail-CLOSED factory reset must
+// tell apart — the whole point of #5496:
+//
+//   - (uid, true,  nil): name found and its UID parsed — the live account.
+//   - (0,   false, nil): passwd READ OK, name genuinely ABSENT — a real
+//     out-of-band userdel. This is the ONLY outcome that proves the account is
+//     gone and therefore safe to forget (drop the marker).
+//   - (0,   false, err): passwd could NOT be read (transient mount / permission
+//     / I/O error) OR its UID field FOR name is malformed. The identity
+//     database is UNKNOWN, NOT proven absent.
+//
+// The err return is what lets zeroizeLoginAccounts fail CLOSED. The prior
+// two-state helper collapsed "unreadable / malformed" into the same
+// (0, false) as "genuinely absent", so an unreadable /etc/passwd or a garbled
+// UID looked like proof the account was gone: the wipe then erased the only
+// provenance marker and reported a clean reset while a live xpf-provisioned
+// PASSWORD account (and its marker-less, no-longer-rediscoverable credential)
+// survived — the #5496 fail-open. A malformed UID for the EXACT name is
+// reported as an error (unknown), never as genuine absence. This mirrors the
+// #5493/#5500 lookupUIDGIDErr split at the factory-reset locus.
+func zeroizeLookupUIDErr(name string) (uid int, found bool, err error) {
+	data, rerr := os.ReadFile(zeroizePasswdPath)
+	if rerr != nil {
+		return 0, false, rerr
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if line == "" {
@@ -271,14 +289,14 @@ func zeroizeLookupUID(name string) (int, bool) {
 			continue
 		}
 		if fields[0] == name {
-			uid, err := strconv.Atoi(fields[2])
-			if err != nil {
-				return 0, false
+			u, aerr := strconv.Atoi(fields[2])
+			if aerr != nil {
+				return 0, false, fmt.Errorf("zeroize: unparseable uid for %q in %s", name, zeroizePasswdPath)
 			}
-			return uid, true
+			return u, true, nil
 		}
 	}
-	return 0, false
+	return 0, false, nil
 }
 
 // zeroizeLoginAccounts tears down the OS LOGIN accounts xpf provisioned as part
@@ -310,6 +328,20 @@ func zeroizeLookupUID(name string) (int, bool) {
 //     a different UID (marker mismatch) is left alone — exactly the #1944
 //     leave-then-rejoin vs recreate distinction, so the wipe can never nuke the
 //     wrong account or strand access.
+//
+// Ownership uncertainty FAILS CLOSED (#5496). Deciding "is this the account xpf
+// provisioned?" needs TWO reads: the live UID (/etc/passwd, zeroizeLookupUIDErr)
+// and the recorded UID (provenance marker, readProvisionedMarkerUID). If EITHER
+// cannot be resolved — /etc/passwd unreadable, a malformed UID, or an
+// unreadable/unparseable marker — the account's ownership is UNKNOWN, NOT proven
+// absent. The teardown then makes NO destructive change, RETAINS the marker
+// (durable evidence for a safe retry), and SURFACES the error so
+// performZeroizeWipe reports the reset incomplete. The prior code conflated an
+// unresolved read/parse with proof-of-absence (curOK=false → "already gone")
+// or with a stale marker, erasing the marker and returning nil while a live
+// PASSWORD account survived un-rediscoverable — the fail-open this closes. A
+// proven UID-mismatch is likewise reported (unresolved) and its marker retained,
+// absent an explicit durable stale-marker policy.
 //
 // authorized_keys is removed BEFORE userdel so the SSH-key login vector dies
 // even if userdel later fails; the marker is retained on a userdel FAILURE so a
@@ -358,20 +390,55 @@ func zeroizeLoginAccounts() error {
 		name := e.Name() // marker filename == account name (Base'd on write)
 		markerFile := filepath.Join(zeroizeProvisionedUsersDir, name)
 
-		recordedUID, uidErr := readProvisionedMarkerUID(markerFile)
-		curUID, curOK := zeroizeLookupUID(name)
+		recordedUID, markerErr := readProvisionedMarkerUID(markerFile)
+		curUID, curFound, lookupErr := zeroizeLookupUIDErr(name)
 		keysFile := filepath.Join(zeroizeHomeBase, name, ".ssh", "authorized_keys")
 
 		removeMarker := true
 		switch {
-		case !curOK:
-			// Account already absent from /etc/passwd — it cannot authenticate.
-			// Best-effort clean up any orphaned key residue; nothing to userdel.
+		case lookupErr != nil:
+			// /etc/passwd is unreadable, OR its UID field for this account is
+			// malformed: the identity database is UNKNOWN. We CANNOT prove the
+			// account is gone or resolve its live UID, so this is ownership
+			// uncertainty, not proof of absence. FAIL CLOSED (#5496): surface
+			// the error (so performZeroizeWipe reports the reset INCOMPLETE),
+			// make NO destructive change, and RETAIN the marker so a retry can
+			// re-attempt once passwd is readable again. Conflating this with
+			// genuine absence would erase the only provenance marker and leave a
+			// live xpf credential un-rediscoverable — the fail-open this closes.
+			slog.Error("zeroize: cannot resolve login account UID from passwd; retaining marker, reset incomplete",
+				"user", name, "err", lookupErr)
+			fail(lookupErr)
+			removeMarker = false
+		case markerErr != nil:
+			// The provenance marker itself is unreadable/unparseable: we cannot
+			// resolve OUR recorded UID, so we cannot decide whether the live
+			// account is the one xpf provisioned. Same ownership uncertainty →
+			// FAIL CLOSED (#5496): surface the error, no userdel, and RETAIN the
+			// marker. Erasing it would destroy the only durable evidence needed
+			// for a safe retry and could strand a live xpf credential unrecorded.
+			slog.Error("zeroize: cannot read provenance marker; retaining marker, reset incomplete",
+				"user", name, "err", markerErr)
+			fail(markerErr)
+			removeMarker = false
+		case !curFound:
+			// passwd READ OK and the account is genuinely ABSENT — a real
+			// out-of-band userdel; it cannot authenticate. Best-effort clean up
+			// any orphaned key residue; nothing to userdel; drop the stale marker.
 			fail(os.Remove(keysFile))
-		case uidErr != nil || curUID != recordedUID:
-			// Corrupt marker OR out-of-band recreate (UID changed): NOT the
-			// account xpf provisioned. Never userdel or touch its home — the
-			// current owner is someone else. Drop our stale marker only.
+		case curUID != recordedUID:
+			// Proven UID-mismatch: the live account under this name has a
+			// DIFFERENT UID than the one xpf provisioned — an out-of-band
+			// userdel+recreate. The current account belongs to someone else, so
+			// NEVER userdel it or touch its home (the #1944 leave-then-rejoin vs
+			// recreate distinction). But absent an explicit, durable stale-marker
+			// policy we also refuse to silently erase our marker and report a
+			// clean reset: surface the UNRESOLVED condition and RETAIN the marker
+			// so the anomaly is re-examined on a retry, not buried (#5496).
+			slog.Warn("zeroize: provisioned marker UID mismatch (account recreated out of band); left untouched, reset incomplete",
+				"user", name, "markerUID", recordedUID, "liveUID", curUID)
+			fail(fmt.Errorf("zeroize: login account %q live UID %d != provenance marker UID %d (out-of-band recreate); left untouched", name, curUID, recordedUID))
+			removeMarker = false
 		default:
 			// curUID == recordedUID → the exact account xpf provisioned. Kill
 			// the SSH-key vector first (survives a userdel failure), then remove
@@ -398,8 +465,10 @@ func zeroizeLoginAccounts() error {
 
 // readProvisionedMarkerUID reads a provenance marker file and returns the UID
 // it records (pkg/daemon.markProvisioned writes the account's UID as decimal
-// text). A read or parse error yields the "not our account" disposition in
-// zeroizeLoginAccounts (no userdel).
+// text). A read or parse error is OWNERSHIP UNCERTAINTY: zeroizeLoginAccounts
+// FAILS CLOSED on it (#5496) — no userdel, the marker is retained, and the
+// error is surfaced so the reset is reported incomplete. It is never treated as
+// proof the marker is stale (which would silently erase it).
 func readProvisionedMarkerUID(path string) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

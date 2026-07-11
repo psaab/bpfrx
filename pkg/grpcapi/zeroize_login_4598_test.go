@@ -48,8 +48,10 @@ func setZeroizeLoginPaths(t *testing.T, provDir, sudoersDir, homeBase, passwdPat
 // /etc/shadow hashes (via userdel), SSH authorized_keys, and
 // /etc/sudoers.d/xpf-* grants — so a re-tenanted device does not grant the
 // prior tenant interactive login + passwordless sudo. It must do so
-// marker-aware: a non-xpf operator/system account, a UID-mismatch out-of-band
-// recreate, and operator-authored sudoers drop-ins are ALL left untouched.
+// marker-aware: a non-xpf operator/system account and operator-authored sudoers
+// drop-ins are left untouched. (The UID-mismatch out-of-band recreate and the
+// #5496 fail-closed uncertainty paths have their own tests, below and in
+// zeroize_login_failclosed_5496_test.go.)
 //
 // RED on revert: before this fix performZeroizeWipe tore down no OS accounts
 // (applySystemLogin runs only inside the boot-time apply, which a post-zeroize
@@ -65,47 +67,37 @@ func TestZeroizeLoginAccountsRemovesProvisionedNotOthers(t *testing.T) {
 	passwdPath := filepath.Join(root, "passwd")
 
 	// /etc/passwd: root + a system account + an operator's OWN account (no
-	// marker) + the xpf-provisioned "alice" (UID matches its marker) + "stale"
-	// whose live UID (2001) DIFFERS from its marker (2000) — an out-of-band
-	// userdel+recreate that must NOT be nuked.
+	// marker) + the xpf-provisioned "alice" (UID matches its marker).
 	mustWriteFile(t, passwdPath, []byte(
 		"root:x:0:0:root:/root:/bin/bash\n"+
 			"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"+
 			"operator:x:1000:1000:operator:/home/operator:/bin/bash\n"+
-			"alice:x:1001:1001:alice:/home/alice:/bin/bash\n"+
-			"stale:x:2001:2001:stale:/home/stale:/bin/bash\n"))
+			"alice:x:1001:1001:alice:/home/alice:/bin/bash\n"))
 
 	// Provenance markers (content = UID at provision time). "ghost" has a
 	// marker but no /etc/passwd entry (already removed out of band).
 	aliceMarker := filepath.Join(provDir, "alice")
-	staleMarker := filepath.Join(provDir, "stale")
 	ghostMarker := filepath.Join(provDir, "ghost")
 	mustWriteFile(t, aliceMarker, []byte("1001"))
-	mustWriteFile(t, staleMarker, []byte("2000")) // != live UID 2001 → not ours
 	mustWriteFile(t, ghostMarker, []byte("3000"))
 
-	// sudoers.d: three xpf-<user> grants (all removed by the namespace sweep) +
+	// sudoers.d: two xpf-<user> grants (both removed by the namespace sweep) +
 	// one operator/system drop-in without the prefix (must survive).
 	xpfAliceSudo := filepath.Join(sudoersDir, "xpf-alice")
-	xpfStaleSudo := filepath.Join(sudoersDir, "xpf-stale")
 	xpfGhostSudo := filepath.Join(sudoersDir, "xpf-ghost")
 	operatorSudo := filepath.Join(sudoersDir, "90-cloud-init-users")
 	mustWriteFile(t, xpfAliceSudo, []byte("alice ALL=(ALL) NOPASSWD: ALL\n"))
-	mustWriteFile(t, xpfStaleSudo, []byte("stale ALL=(ALL) NOPASSWD: ALL\n"))
 	mustWriteFile(t, xpfGhostSudo, []byte("ghost ALL=(ALL) NOPASSWD: ALL\n"))
 	mustWriteFile(t, operatorSudo, []byte("operator ALL=(ALL) ALL\n"))
 
 	// authorized_keys: alice (xpf → removed), ghost (gone → residue removed),
-	// operator (own account, no marker → MUST survive), stale (not ours → MUST
-	// survive: its home belongs to the recreated account).
+	// operator (own account, no marker → MUST survive).
 	aliceKeys := filepath.Join(homeBase, "alice", ".ssh", "authorized_keys")
 	ghostKeys := filepath.Join(homeBase, "ghost", ".ssh", "authorized_keys")
 	operatorKeys := filepath.Join(homeBase, "operator", ".ssh", "authorized_keys")
-	staleKeys := filepath.Join(homeBase, "stale", ".ssh", "authorized_keys")
 	mustWriteFile(t, aliceKeys, []byte("ssh-ed25519 AAAAxpf alice\n"))
 	mustWriteFile(t, ghostKeys, []byte("ssh-ed25519 AAAAghost ghost\n"))
 	mustWriteFile(t, operatorKeys, []byte("ssh-ed25519 AAAAop operator\n"))
-	mustWriteFile(t, staleKeys, []byte("ssh-ed25519 AAAAnew newowner\n"))
 
 	deleted := setZeroizeLoginPaths(t, provDir, sudoersDir, homeBase, passwdPath)
 
@@ -124,15 +116,12 @@ func TestZeroizeLoginAccountsRemovesProvisionedNotOthers(t *testing.T) {
 	assertAbsent(t, aliceKeys)
 	assertAbsent(t, ghostKeys)
 	assertAbsent(t, xpfAliceSudo)
-	assertAbsent(t, xpfStaleSudo)
 	assertAbsent(t, xpfGhostSudo)
 	assertAbsent(t, aliceMarker)
-	assertAbsent(t, staleMarker)
 	assertAbsent(t, ghostMarker)
 
 	// Safety property: NON-xpf accounts + operator sudoers are untouched.
 	assertPresent(t, operatorKeys) // operator's own account (no marker)
-	assertPresent(t, staleKeys)    // UID-mismatch recreate (not ours)
 	assertPresent(t, operatorSudo) // operator/system drop-in (no xpf- prefix)
 
 	// The empty marker directory is cleaned up.
