@@ -45882,3 +45882,27 @@ top.
   test ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
   **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
   pkg/cli/peer_sessions_total_5034_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5573 fail-CLOSED HA-safety gate — `ClusterNodeIDPresent` now
+  classifies the cluster-identity marker into a tri-state instead of mapping
+  every `os.Stat` error to "standalone-absent". Signature changed from
+  `bool` to `(bool, error)`: `(true,nil)` present/clustered, `(false,nil)`
+  ONLY for `os.IsNotExist`/ENOENT (genuinely standalone → proceed),
+  `(false,err)` for every other stat failure (EACCES/EIO/ESTALE/LSM/mount
+  fault → INDETERMINATE). Both standalone-cut gates — the CLI
+  belt-and-suspenders check (cmd/xpfd/upgrade.go) and the privileged
+  `Runner.Run` cutover gate (pkg/upgrade/cutover.go) — now FAIL CLOSED on
+  indeterminate membership (`refuse-standalone-cut-indeterminate-cluster-
+  membership`, unit NOT stopped) rather than proceeding to the uncoordinated
+  STOP->FLIP->START path. Added a `statNodeID` os.Stat seam for injectable
+  non-root failure tests. New tests: tri-state classifier (EACCES/EIO/ESTALE)
+  + integration fail-closed via r.Run + ENOENT-still-proceeds no-regression;
+  RED-on-revert proven (revert to `return err==nil` → both new tests fail).
+  Updated docs/in-place-upgrade.md #5284 section with the #5573 fail-closed
+  contract. go build ./... + go test ./pkg/upgrade/... ./cmd/xpfd/... green;
+  gofmt clean. Error-classification only; no failover-timing/VRRP/session-sync
+  state-machine change.
+  **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
+  cmd/xpfd/upgrade.go, docs/in-place-upgrade.md,
+  pkg/upgrade/cutover_cluster_gate_indeterminate_5573_test.go, _Log.md

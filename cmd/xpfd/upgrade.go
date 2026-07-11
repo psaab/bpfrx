@@ -64,7 +64,23 @@ func runUpgradeSubcommand(args []string) {
 	// Runner.Run (the final privileged boundary, which also catches the
 	// postinst / recovery-doc callers), but rejecting here gives the operator
 	// the earliest, clearest message and never even builds the Runner.
-	if upgrade.ClusterNodeIDPresent(cfg.NodeIDPath) {
+	present, cerr := upgrade.ClusterNodeIDPresent(cfg.NodeIDPath)
+	if cerr != nil {
+		// #5573: the cluster-identity marker exists-check failed with a
+		// non-ENOENT error (EACCES/EIO/ESTALE/LSM denial/mount fault). Fail
+		// CLOSED rather than assume standalone — an unreadable marker on a real
+		// HA node must not be misread as "standalone" and let the uncoordinated
+		// STOP->FLIP->START cut blackhole the node. The authoritative gate in
+		// Runner.Run also fails closed on this, but rejecting here gives the
+		// operator the earliest, clearest message and never builds the Runner.
+		fmt.Fprintf(os.Stderr, "upgrade: refusing an UNCOORDINATED standalone cut: cannot "+
+			"determine cluster membership (%v). Assuming standalone when the "+
+			"cluster-identity marker (%s) is unreadable could blackhole a real HA "+
+			"node. Resolve the marker lookup failure, or run `xpfd upgrade --rolling` "+
+			"for a coordinated per-node drain, then retry\n", cerr, upgrade.DefaultNodeIDFile)
+		os.Exit(1)
+	}
+	if present {
 		fmt.Fprintf(os.Stderr, "upgrade: refusing an UNCOORDINATED standalone cut on a "+
 			"cluster member (%s present); the standalone STOP->FLIP->START flow does "+
 			"NOT drain to the peer and would blackhole traffic if the peer is not "+

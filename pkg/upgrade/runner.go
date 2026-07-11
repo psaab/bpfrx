@@ -190,23 +190,54 @@ func NewRunner(cfg Config) (*Runner, error) {
 
 func (r *Runner) logf(format string, args ...any) { r.cfg.Logf(format, args...) }
 
-// ClusterNodeIDPresent reports whether the install-time-stable cluster
-// identity marker at path exists (#5284). PRESENCE — not content — is the
-// HA signal (mirrors pkg/daemon hasNodeIDFile; pkg/upgrade cannot import
-// pkg/daemon without an import cycle, so the stat is duplicated). An empty
-// path falls back to DefaultNodeIDFile so the CLI belt-and-suspenders check
-// and the Run gate agree even when the caller left Config.NodeIDPath unset.
-func ClusterNodeIDPresent(path string) bool {
+// statNodeID is the os.Stat seam used to classify the cluster-identity marker.
+// A package var so a test can inject a NON-ENOENT lookup failure (EACCES/EIO/
+// ESTALE/LSM/mount fault) and prove both standalone-cut safety gates fail
+// CLOSED (#5573) without depending on running as non-root — root bypasses DAC,
+// so a mode-000 directory would not reproduce the marker-unreadable case under
+// the CI's root test uid.
+var statNodeID = os.Stat
+
+// ClusterNodeIDPresent classifies the install-time-stable cluster-identity
+// marker at path into the HA-membership tri-state that BOTH standalone-cut
+// safety gates consume (#5284, #5573):
+//
+//	(true,  nil)  marker present   -> node is HA-managed (clustered)
+//	(false, nil)  marker ENOENT    -> genuinely standalone (safe to cut)
+//	(false, err)  any other error  -> INDETERMINATE membership; the caller MUST
+//	                                  fail CLOSED.
+//
+// PRESENCE — not content — is the HA signal (mirrors pkg/daemon hasNodeIDFile;
+// pkg/upgrade cannot import pkg/daemon without an import cycle, so the stat is
+// duplicated). An empty path falls back to DefaultNodeIDFile so the CLI
+// belt-and-suspenders check and the Run gate agree even when the caller left
+// Config.NodeIDPath unset.
+//
+// #5573 fail-closed contract: ONLY os.IsNotExist (ENOENT) collapses to
+// "standalone, proceed". EVERY other os.Stat failure (EACCES/EIO/ESTALE/LSM
+// denial/mount fault) is PROPAGATED, not swallowed as absent. The pre-fix
+// predicate returned `err == nil` for every error, so an unreadable marker on
+// a real HA node was misread as "standalone" and let an uncoordinated
+// STOP->FLIP->START cut proceed without proving the peer owns every RG — which
+// the gate's own threat statement says can blackhole traffic. Treating an
+// indeterminate lookup as absent is the fail-OPEN bug; propagating it lets the
+// caller refuse.
+func ClusterNodeIDPresent(path string) (bool, error) {
 	if path == "" {
 		path = DefaultNodeIDFile
 	}
-	_, err := os.Stat(path)
-	return err == nil
+	if _, err := statNodeID(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot determine cluster membership: stat %s: %w", path, err)
+	}
+	return true, nil
 }
 
-// clusterNodeIDPresent reports whether THIS runner's configured cluster
-// identity marker is present.
-func (r *Runner) clusterNodeIDPresent() bool {
+// clusterNodeIDPresent classifies THIS runner's configured cluster-identity
+// marker (see ClusterNodeIDPresent for the tri-state contract).
+func (r *Runner) clusterNodeIDPresent() (bool, error) {
 	return ClusterNodeIDPresent(r.cfg.NodeIDPath)
 }
 
