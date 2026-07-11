@@ -314,6 +314,10 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			}
 		}
 	}
+	// #5579: resolve the ingress-interface validation once (cfg==nil returns nil,
+	// so this is safe before the cfg==nil case; the switch surfaces it only after
+	// the cfg / grammar / zone checks below).
+	ingressErr := dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, ingressIface)
 	switch {
 	case cfg == nil:
 		buf.WriteString("No active configuration\n")
@@ -345,11 +349,12 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		fmt.Fprintf(buf, "invalid src %q\n", srcIP)
 	case dstIP != "" && net.ParseIP(dstIP) == nil:
 		fmt.Fprintf(buf, "invalid dst %q\n", dstIP)
-	case dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, ingressIface) != nil:
-		// #5579: an unknown / zone-mismatched / lifeline ingress-interface fails
-		// the query closed, so the host-inbound classifier is only scoped to a real
-		// interface of the queried zone (parity with the REST/gRPC/local surfaces).
-		fmt.Fprintf(buf, "%v\n", dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, ingressIface))
+	case ingressErr != nil:
+		// #5579: an unknown / zone-mismatched / lifeline / bare-physical
+		// ingress-interface fails the query closed, so the host-inbound classifier
+		// is only scoped to a real logical-unit interface of the queried zone
+		// (parity with the REST/gRPC/local surfaces).
+		fmt.Fprintf(buf, "%v\n", ingressErr)
 	default:
 		// #3103: route the gRPC `test policy` diagnostic through the single
 		// shared simulator (pkg/policymatch) so it agrees with the runtime

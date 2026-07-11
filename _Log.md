@@ -46184,3 +46184,26 @@ top.
   pkg/api/security_matchpolicies_ingress_iface_5579_test.go,
   pkg/cli/cli_show_security.go, pkg/cli/cli_request_testcmd.go,
   cmd/cli/show_security.go, cmd/cli/main.go, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-11 (#5579 review fold — bare-physical ingress-interface)
+- **Action**: Folded the #5595 hostile-review MINOR (bare-physical ref
+  namespace gap). ResolveHostInboundIngressInterface ACCEPTED a bare-physical
+  ingress-interface ref (e.g. `reth0`) while ClassifyHostInboundForInterface
+  keys the effective host-inbound set on the LOGICAL-UNIT ref
+  (buildInterfaceHostInboundMap[ifaceRef]); a unit-authored override lands only
+  on the `reth0.50` key, so a bare-physical ref silently dropped it → FALSE-DENY
+  (reth0 -> "denied" while reth0.50 -> token-admit ssh). Reconciled the
+  namespace by REJECTING a bare-physical ref that carries one-or-more units,
+  naming a representative logical unit in the fail-closed error (a unit-less
+  physical with only a physical-level override is still keyed correctly and is
+  not rejected). Added smallestUnitNumber helper. Deduped the gRPC test-policy
+  bridge double ResolveHostInboundIngressInterface call (compute ingressErr
+  once). Added Test_5579_ResolveIngressInterfaceRejectsBarePhysical with
+  RED-on-revert proof (revert reject -> reth0 accepted -> classifier false-deny;
+  test catches it). Gates: go build ./... + go test -race
+  (policymatch/api/grpcapi/cmd-cli/dataplane) green except the pre-existing
+  flaky TestEventStreamDataplaneEventBeforeCallbackQueuesUntilCallback
+  (fails at base too); gofmt clean.
+- **File(s)**: pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go,
+  pkg/grpcapi/server_show_firewall.go, _Log.md

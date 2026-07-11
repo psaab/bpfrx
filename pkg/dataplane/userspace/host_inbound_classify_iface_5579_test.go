@@ -163,6 +163,40 @@ func Test_5579_ResolveIngressInterfaceRejectsLifeline(t *testing.T) {
 	}
 }
 
+// Test_5579_ResolveIngressInterfaceRejectsBarePhysical guards the review fold: a
+// bare-PHYSICAL ingress-interface ref (e.g. `reth0`, whose unit reth0.50 admits
+// ssh) must be REJECTED, because the classifier keys the effective host-inbound
+// set on the LOGICAL-UNIT ref — a bare physical would silently drop the
+// unit-authored override and report a FALSE-DENY. The validator's accepted
+// namespace must equal what the classifier keys on.
+//
+// RED-on-revert: drop the bare-physical reject and `reth0` is accepted, then
+// ClassifyHostInboundForInterface(cfg, "wan", "reth0", ...) keys on the physical
+// ref (no unit-level override) and returns HostInboundDenied — a false-deny that
+// disagrees with reth0.50's token-admit. Both assertions below then fail.
+func Test_5579_ResolveIngressInterfaceRejectsBarePhysical(t *testing.T) {
+	cfg := hostInboundCfg3362() // reth0 has unit 50 (ssh override); reth1 has unit 0.
+
+	err := ResolveHostInboundIngressInterface(cfg, "wan", "reth0")
+	if err == nil {
+		t.Fatal("bare-physical reth0 accepted, want reject (classifier keys on the logical unit)")
+	}
+	if !strings.Contains(err.Error(), "reth0.50") {
+		t.Errorf("bare-physical reject error = %q, want it to name the logical unit reth0.50", err)
+	}
+
+	// The false-deny the reject prevents: the physical ref, if classified, drops
+	// the unit-authored ssh override and denies, while the logical unit admits.
+	physical := ClassifyHostInboundForInterface(cfg, "wan", "reth0", hi5579TCP, true, 22, nil, "ip")
+	unit := ClassifyHostInboundForInterface(cfg, "wan", "reth0.50", hi5579TCP, true, 22, nil, "ip")
+	if unit.Status != HostInboundTokenAdmit || unit.Token != "ssh" {
+		t.Errorf("reth0.50 = %v/%q, want token-admit/ssh", unit.Status, unit.Token)
+	}
+	if physical.Status == unit.Status && physical.Token == unit.Token {
+		t.Errorf("physical reth0 classify (%v/%q) matched the unit — the namespace gap that the reject guards is gone; the reject is the load-bearing fix", physical.Status, physical.Token)
+	}
+}
+
 func ifaceInGroup(ifaces []string, want string) bool {
 	for _, i := range ifaces {
 		if i == want {

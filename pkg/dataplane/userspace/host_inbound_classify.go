@@ -311,6 +311,24 @@ func ResolveHostInboundIngressInterface(cfg *config.Config, fromZone, ifaceRef s
 	if hostInboundLifelineInterface(ifaceRef, hostInboundLifelineSet(cfg)) {
 		return fmt.Errorf("ingress-interface %q is a management/cluster lifeline (fxp0/em0/fab*); its host traffic is served unconditionally and is not subject to per-interface host-inbound classification", ifaceRef)
 	}
+	// The classifier (ClassifyHostInboundForInterface) keys the effective
+	// host-inbound token set on the LOGICAL-UNIT ref via
+	// buildInterfaceHostInboundMap(cfg)[ifaceRef]. A bare-PHYSICAL ref (e.g.
+	// `reth0` / `ge-0/0/0`) is NOT that key: a UNIT-authored override
+	// (`set ... interfaces reth0.50 host-inbound-traffic ...`) lands on the
+	// `reth0.50` key, never on the physical `reth0` key, so classifying the
+	// physical ref would SILENTLY DROP the override and report a FALSE-DENY that
+	// disagrees with the true per-unit posture (#5579 review). Keep the validator's
+	// accepted namespace identical to what the classifier keys on: require a
+	// logical-unit ref, rejecting a bare physical that carries one-or-more units
+	// and pointing the operator at the unit form. (A unit-less physical carrying
+	// only a physical-level override is keyed correctly on the physical key, so it
+	// is not rejected here — it falls through to the zone-membership check.)
+	if !strings.Contains(ifaceRef, ".") {
+		if ic := cfg.Interfaces.Interfaces[ifaceRef]; ic != nil && len(ic.Units) > 0 {
+			return fmt.Errorf("ingress-interface %q is a physical interface; specify the logical unit, e.g. %s.%d", ifaceRef, ifaceRef, smallestUnitNumber(ic.Units))
+		}
+	}
 	zone := buildInterfaceZoneMap(cfg)[ifaceRef]
 	if zone == "" {
 		return fmt.Errorf("unknown ingress-interface %q (not assigned to any security zone)", ifaceRef)
@@ -319,6 +337,23 @@ func ResolveHostInboundIngressInterface(cfg *config.Config, fromZone, ifaceRef s
 		return fmt.Errorf("ingress-interface %q is in zone %q, not from-zone %q", ifaceRef, zone, fromZone)
 	}
 	return nil
+}
+
+// smallestUnitNumber returns the lowest configured unit number of an interface,
+// used to name a representative logical unit in the bare-physical reject message
+// so the operator can copy a ready-to-use ref. Units is never empty at the call
+// site.
+func smallestUnitNumber(units map[int]*config.InterfaceUnit) int {
+	min := -1
+	for u := range units {
+		if min == -1 || u < min {
+			min = u
+		}
+	}
+	if min == -1 {
+		return 0
+	}
+	return min
 }
 
 // viewsForZone returns the host-inbound effective views for the given ingress
