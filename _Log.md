@@ -45787,3 +45787,24 @@ top.
   pkg/grpcapi/server_diag_monitor.go,
   pkg/grpcapi/server_diag_monitor_proxy_5497_test.go, pkg/grpcapi/README.md,
   _Log.md
+
+## 2026-07-10 — ddns: tokenize multi-word ok-response (#5557 / claude-review-003 A10)
+- **Timestamp**: 2026-07-10 (fix/ddns-multiword-okresponse)
+- **Action**: Fix a functional DDNS bug in the generic templated backend. A
+  configured multi-WORD `ok-response` (e.g. `good nochg`) was stored as a
+  SINGLE space-containing element `ok = []string{strings.ToLower(s)}`, but
+  matchesGenericOK does WHOLE-TOKEN matching (#2838): a success token must
+  equal a trimmed response line or be the leading whitespace-delimited field
+  of a line. A space-joined element has a dead first-field path (a first field
+  never contains a space) and can only match a line that is EXACTLY
+  "good nochg", so a dyndns2-shape "good nochg <ip>" body — or a bare "nochg"
+  line — was never recognized: every update treated as failed → error spam +
+  backoff → DNS goes stale. Changed to `ok = strings.Fields(strings.ToLower(s))`
+  so each configured word becomes a matchable whole token (the single-token
+  shape of defaultGenericOKTokens). ANY-token (OR) matcher semantics unchanged.
+  Added TestGenericMultiWordOKResponseTokenized (RED-on-revert verified: shape
+  + end-to-end dyndns2/bare-word success cases fail on the old single-element
+  code; single-word no-regression + default-set-untouched asserted). Updated
+  pkg/ddns/README.md ok-response wording.
+- **File(s)**: pkg/ddns/backend_generic.go, pkg/ddns/backend_http_test.go,
+  pkg/ddns/README.md, _Log.md
