@@ -1112,11 +1112,14 @@ func (b *clearBatchV4) collect(key dataplane.SessionKey, val dataplane.SessionVa
 func (b *clearBatchV4) deleteAll(s *Server, agg *clearErrors) int {
 	deleted := 0
 	for _, key := range b.fwd {
-		if err := s.dp.DeleteSession(key); err != nil {
-			agg.add("v4 forward delete", err)
-		} else {
+		err := s.dp.DeleteSession(key)
+		if err == nil {
 			deleted++
+			continue
 		}
+		// A forward key already gone is benign here (GC race / anchor-restart
+		// re-collect — see addExceptNotFound): not our delete, not a failure.
+		agg.addExceptNotFound("v4 forward delete", err)
 	}
 	for _, key := range b.rev {
 		agg.addExceptNotFound("v4 reverse delete", s.dp.DeleteSession(key))
@@ -1274,11 +1277,13 @@ func (b *clearBatchV6) collect(key dataplane.SessionKeyV6, val dataplane.Session
 func (b *clearBatchV6) deleteAll(s *Server, agg *clearErrors) int {
 	deleted := 0
 	for _, key := range b.fwd {
-		if err := s.dp.DeleteSessionV6(key); err != nil {
-			agg.add("v6 forward delete", err)
-		} else {
+		err := s.dp.DeleteSessionV6(key)
+		if err == nil {
 			deleted++
+			continue
 		}
+		// Already-gone forward key is benign here (see clearBatchV4.deleteAll).
+		agg.addExceptNotFound("v6 forward delete", err)
 	}
 	for _, key := range b.rev {
 		agg.addExceptNotFound("v6 reverse delete", s.dp.DeleteSessionV6(key))
@@ -1424,10 +1429,22 @@ func (s *Server) peerNodeIDForMsg() int {
 // deletes, and the HA peer-clear RPC each report independently so an
 // operator sees the FULL failure picture instead of a bare success
 // (#2468). nil errors (the common case) are ignored.
+//
+// The failure-STRING buffer is bounded to clearErrorsPartsCap entries with a
+// trailing "…and N more" summary (#5531 review): a filtered clear over a
+// multi-million-entry table could, in a degenerate cause (e.g. a GC race that
+// re-collects and re-deletes keys), otherwise accumulate O(matches) failure
+// strings — a residual unbounded-memory path this fix exists to close. count
+// stays exact (a cheap int) so Failures is still honest; only the string slice
+// is capped.
 type clearErrors struct {
-	count int
-	parts []string
+	count    int
+	parts    []string
+	overflow int // failures beyond clearErrorsPartsCap, summarized as a count
 }
+
+// clearErrorsPartsCap bounds the number of distinct failure strings retained.
+const clearErrorsPartsCap = 64
 
 // add records a failed sub-operation. nil errors are no-ops.
 func (e *clearErrors) add(op string, err error) {
@@ -1435,7 +1452,11 @@ func (e *clearErrors) add(op string, err error) {
 		return
 	}
 	e.count++
-	e.parts = append(e.parts, fmt.Sprintf("%s: %v", op, err))
+	if len(e.parts) < clearErrorsPartsCap {
+		e.parts = append(e.parts, fmt.Sprintf("%s: %v", op, err))
+	} else {
+		e.overflow++
+	}
 }
 
 // addExceptNotFound is add() for delete operations whose target key is
@@ -1447,9 +1468,12 @@ func (e *clearErrors) add(op string, err error) {
 // a benign idempotent not-found, NOT a clear failure — counting it would
 // make a fully-successful NAT'd-session clear spuriously report
 // Failures>0 (#2468). Any OTHER delete error (EIO/EINVAL/...) is a real
-// failure and is aggregated. The forward delete uses add() unchanged: a
-// forward key came from iteration, so a not-found there is a genuine
-// anomaly worth reporting.
+// failure and is aggregated. The bounded filtered clear (#5454/#5531) routes
+// its FORWARD delete through this path too: an enumerated forward key can be
+// legitimately gone by delete time — the GC reaped it, or a restart-from-
+// bucket-0 after a GC-deleted anchor re-collected a key a prior chunk already
+// deleted — and treating that as a failure would both inflate Failures and,
+// at O(matches) re-deletes, regrow the failure-string buffer this fix bounds.
 func (e *clearErrors) addExceptNotFound(op string, err error) {
 	if err == nil || dataplane.IsKeyNotFound(err) {
 		return
@@ -1457,9 +1481,14 @@ func (e *clearErrors) addExceptNotFound(op string, err error) {
 	e.add(op, err)
 }
 
-// summary returns a single-line description of all accumulated failures.
+// summary returns a single-line description of all accumulated failures,
+// bounded to clearErrorsPartsCap distinct entries plus a trailing overflow
+// count so the string can never grow O(matches).
 func (e *clearErrors) summary() string {
-	return strings.Join(e.parts, "; ")
+	if e.overflow == 0 {
+		return strings.Join(e.parts, "; ")
+	}
+	return fmt.Sprintf("%s; …and %d more", strings.Join(e.parts, "; "), e.overflow)
 }
 
 // apply records the accumulated failure count and summary on the

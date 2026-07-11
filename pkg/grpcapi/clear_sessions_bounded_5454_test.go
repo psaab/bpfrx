@@ -18,6 +18,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -104,6 +105,11 @@ type boundedClearDP struct {
 	v4 map[dataplane.SessionKey]dataplane.SessionValue
 	v6 map[dataplane.SessionKeyV6]dataplane.SessionValueV6
 
+	// fwdNotFound models a GC race: a forward key collected during iteration
+	// returns ErrKeyNotExist by delete time (it is left in the map so the
+	// cursor still advances, mimicking "reaped just before deleteAll").
+	fwdNotFound bool
+
 	deletedDNATv4 int
 	deletedDNATv6 int
 }
@@ -131,15 +137,23 @@ func (d *boundedClearDP) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, f
 }
 
 func (d *boundedClearDP) DeleteSession(key dataplane.SessionKey) error {
-	if _, ok := d.v4[key]; !ok {
+	val, ok := d.v4[key]
+	if !ok {
 		return ebpf.ErrKeyNotExist
+	}
+	if d.fwdNotFound && val.IsReverse == 0 {
+		return ebpf.ErrKeyNotExist // forward key reaped by GC before delete
 	}
 	delete(d.v4, key)
 	return nil
 }
 
 func (d *boundedClearDP) DeleteSessionV6(key dataplane.SessionKeyV6) error {
-	if _, ok := d.v6[key]; !ok {
+	val, ok := d.v6[key]
+	if !ok {
+		return ebpf.ErrKeyNotExist
+	}
+	if d.fwdNotFound && val.IsReverse == 0 {
 		return ebpf.ErrKeyNotExist
 	}
 	delete(d.v6, key)
@@ -316,5 +330,59 @@ func TestClearSessionsFilteredContextCancel(t *testing.T) {
 	// run to completion.
 	if len(dp.v4) == 0 {
 		t.Fatalf("all v4 sessions cleared despite mid-clear cancel — not prompt")
+	}
+}
+
+// TestClearSessionsFilteredForwardNotFoundBenign covers the #5531 review MINOR:
+// a forward key that is already gone at delete time (GC reaped it, or a
+// restart-from-bucket-0 after a GC-deleted anchor re-collected a prior chunk's
+// key) must be BENIGN — not a spurious Failure, and not a re-delete that
+// regrows the failure-string buffer this fix bounds. RED-on-revert: routing the
+// forward delete back through add() (instead of addExceptNotFound) reports
+// Failures>0 for the reaped keys.
+func TestClearSessionsFilteredForwardNotFoundBenign(t *testing.T) {
+	const n = 50
+	origBatch := clearFilteredBatch
+	clearFilteredBatch = 8
+	t.Cleanup(func() { clearFilteredBatch = origBatch })
+
+	dp := seedBoundedClearDP(n)
+	dp.fwdNotFound = true // every collected forward key is already gone at delete time
+	s := newBoundedClearServer(t, dp)
+
+	resp, err := s.ClearSessions(context.Background(), &pb.ClearSessionsRequest{Protocol: "tcp"})
+	if err != nil {
+		t.Fatalf("ClearSessions RPC error: %v", err)
+	}
+	if resp.Failures != 0 {
+		t.Fatalf("forward ErrKeyNotExist inflated Failures=%d summary=%q, want 0 (benign #5531)", resp.Failures, resp.FailureSummary)
+	}
+	// The forward keys were reaped by GC, not by us -> not counted as cleared.
+	if resp.Ipv4Cleared != 0 || resp.Ipv6Cleared != 0 {
+		t.Fatalf("Ipv4Cleared=%d Ipv6Cleared=%d, want 0/0 (forward keys already gone)", resp.Ipv4Cleared, resp.Ipv6Cleared)
+	}
+	if resp.FailureSummary != "" {
+		t.Fatalf("FailureSummary=%q, want empty (no failures)", resp.FailureSummary)
+	}
+}
+
+// TestClearErrorsPartsBounded proves the failure-string buffer stays O(cap)
+// regardless of how many failures accumulate (#5531 review): count is exact but
+// parts is capped with a trailing overflow summary. RED-on-revert: without the
+// cap, parts grows to the full failure count.
+func TestClearErrorsPartsBounded(t *testing.T) {
+	var e clearErrors
+	const total = 500
+	for i := 0; i < total; i++ {
+		e.add("v4 forward delete", fmt.Errorf("EBUSY inst %d", i))
+	}
+	if e.count != total {
+		t.Fatalf("count=%d, want %d (honest total must stay exact)", e.count, total)
+	}
+	if len(e.parts) > clearErrorsPartsCap {
+		t.Fatalf("failure-string buffer grew to %d entries, want <= %d (unbounded regrowth #5531)", len(e.parts), clearErrorsPartsCap)
+	}
+	if want := total - clearErrorsPartsCap; !strings.Contains(e.summary(), fmt.Sprintf("…and %d more", want)) {
+		t.Fatalf("summary missing bounded-overflow marker: %q", e.summary())
 	}
 }
