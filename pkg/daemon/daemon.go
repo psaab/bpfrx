@@ -294,15 +294,19 @@ type Daemon struct {
 	// privileged socket (#3967, #5110).
 	snmpServe func(ctx context.Context, agent *snmp.Agent, ready chan<- error)
 	// snmpBootsPath overrides the SNMPv3 engineBoots persistence path passed
-	// to snmp.NewAgentWithBootsPath. Empty ⇒ the package default. Tests inject
+	// to snmp.NewAgentWithPaths. Empty ⇒ the package default. Tests inject
 	// a temp path so a reconcile-triggered start does not touch /var/lib/xpf
 	// (#3967).
-	snmpBootsPath   string
-	lldpMgr         *lldp.Manager
-	lldpApplied     *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
-	lldpApplyInit   bool             // true once reconcileLLDP has run at least once
-	scheduler       *scheduler.Scheduler
-	schedulerCancel context.CancelFunc
+	snmpBootsPath string
+	// snmpEngineIDPath overrides the per-device EngineID component persistence
+	// path (#5283). Empty ⇒ the package default. Tests inject a temp path so a
+	// reconcile-triggered start does not touch /var/lib/xpf.
+	snmpEngineIDPath string
+	lldpMgr          *lldp.Manager
+	lldpApplied      *lldp.LLDPConfig // last effective LLDP config Apply()'d (#2372 diff-guard); nil = stopped
+	lldpApplyInit    bool             // true once reconcileLLDP has run at least once
+	scheduler        *scheduler.Scheduler
+	schedulerCancel  context.CancelFunc
 	// schedulerWg tracks every policy-scheduler Run() goroutine generation so
 	// daemon shutdown can join it after cancelling, and schedulerStopped
 	// latches on shutdown so no new generation is started after the join

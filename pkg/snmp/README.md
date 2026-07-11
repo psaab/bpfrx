@@ -224,38 +224,78 @@ requires of an authoritative engine:
 
 ### Authoritative EngineID derivation (RFC 3411 §5)
 
-`initEngine` derives the authoritative SNMPv3 `snmpEngineID` from the OS
-hostname via `buildEngineID`. RFC 3411 constrains `SnmpEngineID` to **5..32
-octets**; an EngineID outside that range is rejected by compliant managers,
-which breaks every v3 discovery, USM key localization, auth check, and response
-encoding that keys off the agent's identity (v2c is unaffected). The EngineID
-must also be **deterministic and stable across restarts** — a manager caches
-`(engineBoots, engineTime)` and localizes its USM keys against it.
+`initEngine` derives the authoritative SNMPv3 `snmpEngineID` from the OS hostname
+**and a per-device unique component** via `buildEngineID`. RFC 3411 constrains
+`SnmpEngineID` to **5..32 octets** AND requires it to be **unique** per
+authoritative engine (unique, not secret). Both properties matter:
 
-The layout is a 5-octet enterprise prefix (`0x80 0x00 0x01 0x86 0xa3` — the
-variable-length format flag over private enterprise `0x000186a3`) + a one-octet
-format selector + a payload:
+- **Length (5..32 octets)** — an EngineID outside the range is rejected by
+  compliant managers, breaking every v3 discovery, USM key localization, auth
+  check, and response encoding that keys off the agent's identity (v2c is
+  unaffected). This is the #4917/#5264 cap.
+- **Uniqueness (per-device)** — USM localizes each user's auth/priv keys against
+  the EngineID, so two engines with the **same** EngineID derive **byte-identical
+  localized keys**. An authenticated SNMPv3 request captured from firewall A is
+  then accepted by firewall B (same username/password): cross-device telemetry
+  disclosure / auth bypass (**#5283**).
 
-- **Short hostname** (`len(hostname) <= 26`, so header + hostname `<= 32`):
-  the text form `prefix || 0x04 || hostname`, where `0x04` is RFC 3411
-  "administratively assigned text". This is **bit-identical to the pre-#4917
-  construction**, so every already-deployed appliance keeps the exact EngineID
-  its USM keys and manager caches were localized against — the migration is a
-  no-op on the short path.
-- **Long hostname** (`> 26` octets): the text form would exceed 32 octets and
-  be an **invalid EngineID** (the #4917 bug — the historical code appended the
-  full unbounded hostname). It is replaced by a deterministic hashed identity
-  `prefix || 0x05 || sha256(hostname)[:26]`, exactly 32 octets. `0x05`
-  ("administratively assigned octets") honestly labels the binary hash payload
-  (`0x04` would mislabel it as text). SHA-256 over the **full** hostname keeps
-  it deterministic (same hostname → same EngineID every boot; no randomness, no
-  timestamp) and collision-resistant (distinct long hostnames → distinct
-  EngineIDs). A one-time `slog.Info` at init records the substitution so the
-  operator sees why the EngineID is not the plain hostname.
+The historical construction derived the entire EngineID from a fixed prefix +
+`os.Hostname()` only. It had no per-device component, so two same-hostname
+**clones** (HA pair, factory default, lab image, config restore) derived
+identical EngineIDs and identical USM keys — #4917/#5264 only capped the length,
+they did not add uniqueness.
 
-The result is 5..32 octets for every input, including the empty hostname
-(6 octets) and multi-kilobyte hostnames (32 octets). Golden-vector and
-RED-on-revert coverage lives in `engineid_4917_test.go`.
+**Construction (always 32 octets):**
+
+```
+prefix(5) || 0x05 || sha256(deviceID || 0x00 || hostname)[:26]
+```
+
+- `prefix` is the 5-octet enterprise header (`0x80 0x00 0x01 0x86 0xa3`).
+- `0x05` ("administratively assigned octets") honestly labels the binary SHA-256
+  payload.
+- The result is **exactly 32 octets for every input** (empty or multi-kilobyte
+  hostname alike), so the #4917/#5264 length cap always holds.
+- A `0x00` separator between `deviceID` and `hostname` prevents boundary-shift
+  aliasing.
+
+**Per-device component (`deviceComponent`)** combines two independent per-device
+sources so a clone must defeat BOTH to collide:
+
+1. **Persisted crypto/rand** — a 16-byte value generated ONCE and persisted at
+   `/var/lib/xpf/snmp-engine-id` (hex text, `0600`), reused on every subsequent
+   boot. This is the primary source: stable across reboots of the same device,
+   unique per appliance. On read-corruption / RNG / persist failure it is
+   regenerated or skipped (never an un-persisted value served as if stable).
+2. **`/etc/machine-id`** — folded in as defense in depth. `virt-sysprep` resets
+   machine-id per-appliance at image bake, so even a mistakenly-cloned
+   persisted file still yields a distinct component (different machine-id →
+   different EngineID).
+
+If **every** source fails (no persistable random AND no machine-id — the
+catastrophic path), the EngineID degrades to the pre-#5283 hostname-only
+identity and `initEngine` logs a `slog.Warn` that it is not clone-unique.
+
+**Clone/bake requirement:** the persisted `/var/lib/xpf/snmp-engine-id` file
+MUST NOT be copied identically into cloned appliances or a golden image — that
+would re-establish the collision. It is treated exactly like `/etc/machine-id`:
+`scripts/image/bake.py` removes it (and `snmp-engineboots`) during
+`virt-sysprep` so each appliance regenerates a fresh one on first boot. The
+machine-id fold-in is the backstop if that removal is ever missed.
+
+**Transition:** on an existing appliance upgrading, the EngineID changes ONCE
+(hostname-derived → device-unique). Existing SNMPv3 managers re-discover the
+EngineID on their next poll (a one-time, standard USM discovery — acceptable for
+a security fix). `(engineBoots, engineTime)` monotonicity is unaffected: the
+boots counter is keyed by its own persisted file, not by the EngineID bytes.
+
+**Follow-up (out of scope here):** binding the USM replay window to the
+destination IP is additional defense-in-depth; the unique EngineID alone closes
+the cross-clone bypass because A's localized keys no longer equal B's.
+
+RED-on-revert and length-cap coverage lives in `engineid_4917_test.go`; the
+per-device uniqueness / reboot-stability / USM-key-divergence coverage lives in
+`engineid_5283_test.go`.
 
 ## Live reconfigure (commit-time reconcile)
 

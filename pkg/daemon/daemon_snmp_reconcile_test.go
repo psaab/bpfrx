@@ -164,15 +164,16 @@ func newSNMPReconcileDaemon(t *testing.T, serve func(context.Context, *snmp.Agen
 	t.Helper()
 	installFakeNetworkctl(t)
 	d := &Daemon{
-		applySem:      semaphore.NewWeighted(1),
-		dp:            &runtimeOnlyApplyTestDP{},
-		vrrpMgr:       vrrp.NewManager(),
-		store:         newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
-		opts:          Options{NoDataplane: true},
-		daemonCtx:     context.Background(),
-		snmpBootReady: true,
-		snmpServe:     serve,
-		snmpBootsPath: filepath.Join(t.TempDir(), "engineboots"),
+		applySem:         semaphore.NewWeighted(1),
+		dp:               &runtimeOnlyApplyTestDP{},
+		vrrpMgr:          vrrp.NewManager(),
+		store:            newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		opts:             Options{NoDataplane: true},
+		daemonCtx:        context.Background(),
+		snmpBootReady:    true,
+		snmpServe:        serve,
+		snmpBootsPath:    filepath.Join(t.TempDir(), "engineboots"),
+		snmpEngineIDPath: filepath.Join(t.TempDir(), "snmp-engine-id"),
 		// Keep the link-state monitor hermetic: return an established
 		// subscription that streams nothing and exits on ctx cancel, and an
 		// empty link list for the boot seed.

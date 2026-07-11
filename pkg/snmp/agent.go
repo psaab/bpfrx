@@ -2,8 +2,10 @@ package snmp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -81,6 +83,35 @@ const (
 // longer validates (the boots value advanced). /var/lib/xpf is the persistent
 // runtime-state root shared with the other xpf subsystems.
 const defaultEngineBootsPath = "/var/lib/xpf/snmp-engineboots"
+
+// defaultEngineIDPath is the on-disk location of the persisted per-device random
+// EngineID component (#5283). A 16-byte crypto/rand value is generated ONCE on
+// first agent init and reused on every subsequent boot, so the derived SNMPv3
+// EngineID is stable across reboots of THE SAME appliance yet unique per
+// appliance. This closes the cross-clone USM auth bypass: without a per-device
+// component, two same-hostname clones (HA pair, factory-default, lab, restore)
+// derived byte-identical EngineIDs, hence byte-identical localized USM keys,
+// hence firewall B accepted an authenticated SNMPv3 request captured from A.
+//
+// IMPORTANT (clone/bake): this file MUST NOT be copied identically into cloned
+// appliances or a golden image — that would re-establish the collision it
+// exists to prevent. It is treated like /etc/machine-id: the image bake
+// (scripts/image/bake.py) removes it during virt-sysprep so each appliance
+// regenerates a fresh one on first boot, and /etc/machine-id is additionally
+// folded into the component (see deviceComponent) as defense in depth so even a
+// mistakenly-copied file still yields distinct EngineIDs across clones.
+const defaultEngineIDPath = "/var/lib/xpf/snmp-engine-id"
+
+// machineIDPath is the systemd per-device identity. virt-sysprep resets it
+// per-appliance at image bake, so it differs on every cloned appliance. It is
+// folded into the EngineID device component as defense in depth against a
+// mistakenly-cloned defaultEngineIDPath file.
+const machineIDPath = "/etc/machine-id"
+
+// deviceComponentLen is the size (octets) of the persisted per-device random
+// EngineID component. 128 bits is far beyond birthday-collision range for any
+// realistic appliance fleet.
+const deviceComponentLen = 16
 
 // tagCounter32 is the ASN.1 application tag for Counter32.
 const tagCounter32 = 0x41
@@ -175,6 +206,13 @@ type Agent struct {
 	// cycle. Set before initEngine runs (NewAgent / NewAgentWithBootsPath).
 	engineBootsPath string
 
+	// engineIDPath is the persistence seam for the per-device random EngineID
+	// component (#5283). Empty means defaultEngineIDPath; tests inject a temp
+	// file to drive the generate/persist/reuse cycle and to prove two agents
+	// with DIFFERENT persisted components derive DIFFERENT EngineIDs (the
+	// anti-clone property). Set before initEngine runs.
+	engineIDPath string
+
 	// cfgMu guards the live authorization/identity configuration (cfg) and
 	// the derived USM user table (v3Users). The request-serving goroutine
 	// reads both under RLock; UpdateConfig swaps both under Lock so a commit
@@ -254,23 +292,36 @@ const trapQueueDepth = 256
 // NewAgent creates a new SNMP agent with the given configuration. The
 // SNMPv3 engineBoots counter is loaded from defaultEngineBootsPath,
 // incremented, and persisted so (engineBoots, engineTime) advances
-// monotonically across daemon restarts (RFC 3414).
+// monotonically across daemon restarts (RFC 3414). The per-device EngineID
+// component is loaded/generated at defaultEngineIDPath (#5283).
 func NewAgent(cfg *config.SNMPConfig) *Agent {
-	return NewAgentWithBootsPath(cfg, defaultEngineBootsPath)
+	return NewAgentWithPaths(cfg, defaultEngineBootsPath, defaultEngineIDPath)
 }
 
 // NewAgentWithBootsPath is NewAgent with an explicit engineBoots persistence
-// path. It is the seam used by tests to drive the load/increment/persist
-// cycle against a temp file; production code uses NewAgent. An empty path
-// falls back to defaultEngineBootsPath.
+// path and the default per-device EngineID component path. Retained for
+// existing callers/tests that only need to redirect the boots counter.
 func NewAgentWithBootsPath(cfg *config.SNMPConfig, bootsPath string) *Agent {
+	return NewAgentWithPaths(cfg, bootsPath, defaultEngineIDPath)
+}
+
+// NewAgentWithPaths is NewAgent with explicit persistence paths for the
+// engineBoots counter and the per-device EngineID component. It is the seam
+// tests use to drive both the boots load/increment/persist cycle and the
+// EngineID component generate/persist/reuse cycle against temp files without
+// touching /var/lib/xpf. An empty path falls back to the respective default.
+func NewAgentWithPaths(cfg *config.SNMPConfig, bootsPath, engineIDPath string) *Agent {
 	if bootsPath == "" {
 		bootsPath = defaultEngineBootsPath
+	}
+	if engineIDPath == "" {
+		engineIDPath = defaultEngineIDPath
 	}
 	a := &Agent{
 		cfg:             cfg,
 		startTime:       time.Now(),
 		engineBootsPath: bootsPath,
+		engineIDPath:    engineIDPath,
 		trapSender:      sendTrap,
 	}
 	a.initEngine()
@@ -325,69 +376,68 @@ func (a *Agent) hasV3Users() bool {
 
 // SNMPv3 authoritative EngineID construction (RFC 3411 §5).
 //
-// RFC 3411 constrains SnmpEngineID to 5..32 octets. An EngineID outside that
-// range is rejected by standards-compliant managers, which breaks every
-// SNMPv3 discovery, USM key localization, auth check, and response encoding
-// that depends on the agent's identity (v2c is unaffected). The historical
-// construction (a 6-octet header followed by the FULL, unbounded OS hostname)
-// silently produced an INVALID >32-octet EngineID for any hostname longer than
-// 26 bytes (#4917).
+// RFC 3411 constrains SnmpEngineID to 5..32 octets AND requires it to be UNIQUE
+// per authoritative engine (unique, not secret). An EngineID outside the length
+// range is rejected by standards-compliant managers; a NON-unique EngineID is a
+// security hole, because USM localizes each user's auth/priv keys against it —
+// two engines with the same EngineID derive byte-identical localized keys, so an
+// authenticated SNMPv3 request captured from one is accepted by the other
+// (cross-device telemetry disclosure / auth bypass, #5283).
+//
+// The historical construction derived the ENTIRE EngineID from a fixed prefix +
+// os.Hostname() (short: prefix||hostname; long: sha256(hostname)[:26]). It had
+// no per-device component, so two same-hostname CLONES (HA pair, factory
+// default, lab image, config restore) derived IDENTICAL EngineIDs and hence
+// identical USM keys (#4917/#5264 only capped the length, they did not add
+// uniqueness). The construction now folds a per-device unique component (a
+// persisted crypto/rand value + /etc/machine-id, see deviceComponent) into the
+// hash so clones diverge, while staying inside the 5..32-octet cap.
 const (
 	// snmpEngineIDMaxLen is the RFC 3411 SnmpEngineID upper bound (octets).
 	snmpEngineIDMaxLen = 32
 
-	// engineIDFormatText (RFC 3411 §5, format 3 "administratively assigned
-	// text") labels the payload as TEXT. Kept for the short-hostname form so
-	// the EngineID stays bit-identical to the pre-#4917 construction and
-	// already-localized USM keys / manager caches on deployed appliances
-	// remain valid.
-	engineIDFormatText = 0x04
-
 	// engineIDFormatOctets (RFC 3411 §5, format 4 "administratively assigned
-	// octets") labels the payload as OCTETS. Used for the hashed long-hostname
-	// form so the format octet honestly describes a binary (non-text) SHA-256
-	// payload — 0x04 would mislabel the hash as text.
+	// octets") labels the payload as OCTETS — a binary (non-text) SHA-256
+	// digest. 0x04 (text) would mislabel the hash as text.
 	engineIDFormatOctets = 0x05
 )
 
 // engineIDPrefix is the 5-octet enterprise header: the RFC 3411 variable-length
 // format flag (high bit 0x80 set on the first octet) over private enterprise
-// number 0x000186a3. The sixth octet — the format selector — is appended per
-// form (text vs octets) by buildEngineID. Read-only after init; buildEngineID
-// copies it (append from a fresh backing array) and never mutates it.
+// number 0x000186a3. The sixth octet — the format selector — is appended by
+// buildEngineID. Read-only after init; buildEngineID copies it (append from a
+// fresh backing array) and never mutates it.
 var engineIDPrefix = []byte{0x80, 0x00, 0x01, 0x86, 0xa3}
 
-// buildEngineID derives a deterministic, RFC 3411-valid (5..32 octet)
-// authoritative SNMPv3 EngineID from the OS hostname. The EngineID must be
-// stable across restarts because a manager caches our (engineBoots, engineTime)
-// and localizes its USM keys against it.
+// buildEngineID derives the authoritative SNMPv3 EngineID from the OS hostname
+// AND a per-device unique component (#5283). The EngineID must be:
 //
-//   - Short hostname (header + hostname <= 32 octets, i.e. len(hostname) <= 26):
-//     the historical TEXT form engineIDPrefix || 0x04 || hostname, returned
-//     BIT-IDENTICAL to the pre-#4917 construction. This is the migration guard:
-//     every currently-working appliance keeps the exact EngineID it localized
-//     its keys against, so no manager cache or USM key is invalidated.
-//   - Long hostname (> 26 octets): the text form would exceed 32 octets and be
-//     an INVALID EngineID (rejected by compliant managers — the #4917 bug). It
-//     is replaced by a deterministic hashed identity engineIDPrefix || 0x05 ||
-//     sha256(hostname)[:26], exactly 32 octets. SHA-256 over the FULL hostname
-//     is deterministic (same hostname -> same EngineID every boot, no
-//     randomness/timestamp) and collision-resistant (distinct long hostnames ->
-//     distinct EngineIDs). The 0x05 (octets) format honestly labels the binary
-//     payload.
+//   - RFC 3411-valid (5..32 octets): the result is ALWAYS exactly 32 octets —
+//     engineIDPrefix(5) || 0x05 (octets) || sha256(deviceID || 0x00 || hostname)[:26]
+//     — so the #4917/#5264 length cap holds for every input, empty or
+//     multi-kilobyte hostname alike.
+//   - stable across restarts of the SAME device: SHA-256 over a fixed
+//     (deviceID, hostname) pair is deterministic (no randomness/timestamp at
+//     build time — the randomness lives in the PERSISTED deviceID), so a manager
+//     that cached our (engineBoots, engineTime) and localized its keys keeps
+//     working over a restart.
+//   - UNIQUE per device: deviceID is a per-appliance value (persisted random +
+//     machine-id). Two clones with the same hostname derive DIFFERENT deviceIDs,
+//     hence different EngineIDs, hence different localized USM keys — A's
+//     authenticated packet no longer validates against B (the #5283 bypass is
+//     closed). A 0x00 separator between deviceID and hostname prevents any
+//     boundary-shift aliasing.
 //
-// The result is 5..32 octets for ALL inputs, including empty (6 octets) and
-// multi-kilobyte (32 octets) hostnames.
-func buildEngineID(hostname string) []byte {
-	headerLen := len(engineIDPrefix) + 1 // enterprise prefix + one format octet
-	if len(hostname) <= snmpEngineIDMaxLen-headerLen {
-		id := make([]byte, 0, headerLen+len(hostname))
-		id = append(id, engineIDPrefix...)
-		id = append(id, engineIDFormatText)
-		id = append(id, hostname...)
-		return id
-	}
-	sum := sha256.Sum256([]byte(hostname))
+// A nil/empty deviceID (only the catastrophic all-sources-failed path) degrades
+// to the pre-#5283 hostname-only identity — deterministic but NOT clone-unique;
+// initEngine logs that case.
+func buildEngineID(hostname string, deviceID []byte) []byte {
+	h := sha256.New()
+	h.Write(deviceID)
+	h.Write([]byte{0x00}) // domain separator: deviceID | hostname
+	h.Write([]byte(hostname))
+	sum := h.Sum(nil)
+	headerLen := len(engineIDPrefix) + 1      // enterprise prefix + one format octet
 	hashLen := snmpEngineIDMaxLen - headerLen // 26 -> total exactly 32 octets
 	id := make([]byte, 0, snmpEngineIDMaxLen)
 	id = append(id, engineIDPrefix...)
@@ -396,26 +446,103 @@ func buildEngineID(hostname string) []byte {
 	return id
 }
 
-// initEngine generates a deterministic, RFC 3411-bounded engine ID from the
-// hostname (see buildEngineID). A hostname longer than 26 octets no longer
-// yields an invalid >32-octet EngineID (#4917); the hashed identity is used
-// instead, and the substitution is logged once so the operator sees why the
-// EngineID is not the plain hostname.
+// initEngine derives the RFC 3411-bounded, per-device-unique engine ID from the
+// hostname and the per-device component (see buildEngineID / deviceComponent),
+// then loads/increments the engineBoots counter.
 func (a *Agent) initEngine() {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "xpf"
 	}
-	a.engineID = buildEngineID(hostname)
-	if len(hostname) > snmpEngineIDMaxLen-(len(engineIDPrefix)+1) {
-		// One-time state event (allowed by the logging rules — not in a loop):
-		// the text EngineID would exceed the RFC 3411 32-octet cap, so a stable
-		// hashed identity is used. This is the startup signal the #4917 issue
-		// noted was missing.
-		slog.Info("SNMP: hostname exceeds the RFC 3411 32-octet text EngineID cap; using a stable hashed SNMPv3 EngineID",
-			"hostname_len", len(hostname), "engineid_len", len(a.engineID))
+	deviceID := a.deviceComponent()
+	if len(deviceID) == 0 {
+		// One-time state event (not in a loop): every per-device identity source
+		// failed, so the EngineID falls back to hostname-only and is NOT unique
+		// across same-hostname clones. Surface it so the operator can provision
+		// persistent state / a machine-id.
+		slog.Warn("SNMP: no per-device EngineID component available; EngineID is derived from hostname only and is NOT unique across clones",
+			"engineid_path", a.engineIDPath)
 	}
+	a.engineID = buildEngineID(hostname, deviceID)
 	a.engineBoots = a.loadAndIncrementEngineBoots()
+}
+
+// deviceComponent returns the per-device unique EngineID component (#5283).
+//
+// It combines two independent per-device sources so a clone must defeat BOTH to
+// collide:
+//
+//  1. a 16-byte crypto/rand value persisted at a.engineIDPath, generated ONCE
+//     and reused on every boot (primary — stable per device, unique per
+//     appliance);
+//  2. /etc/machine-id, which virt-sysprep resets per-appliance at image bake
+//     (defense in depth — even a mistakenly-cloned persisted file yields a
+//     distinct component because machine-id differs).
+//
+// The returned slice is empty ONLY when the persisted random cannot be created
+// AND no machine-id exists — the catastrophic path initEngine logs.
+func (a *Agent) deviceComponent() []byte {
+	var comp []byte
+	if rnd := a.loadOrCreatePersistedComponent(); len(rnd) > 0 {
+		comp = append(comp, rnd...)
+	}
+	if mid := readMachineID(); len(mid) > 0 {
+		comp = append(comp, mid...)
+	}
+	return comp
+}
+
+// loadOrCreatePersistedComponent returns the persisted per-device random
+// component, generating and durably persisting it (0600) on first use. It
+// returns the component only when it is durably on disk (stable across
+// reboots); on any read-corruption, RNG, or persist failure it returns nil so
+// deviceComponent falls back to /etc/machine-id rather than serving an
+// un-persisted value that would change every boot (churning manager caches).
+func (a *Agent) loadOrCreatePersistedComponent() []byte {
+	path := a.engineIDPath
+	if path == "" {
+		path = defaultEngineIDPath
+	}
+	// Reuse an existing component -> stable EngineID across reboots.
+	if data, err := os.ReadFile(path); err == nil {
+		if b, derr := hex.DecodeString(strings.TrimSpace(string(data))); derr == nil && len(b) == deviceComponentLen {
+			return b
+		}
+		slog.Warn("SNMP: persisted EngineID component malformed, regenerating", "path", path)
+	} else if !os.IsNotExist(err) {
+		slog.Warn("SNMP: EngineID component read error, regenerating", "path", path, "err", err)
+	}
+	// Generate once, persist atomically with 0600 (need not be secret, but keep
+	// it consistent and not world-readable).
+	buf := make([]byte, deviceComponentLen)
+	if _, err := rand.Read(buf); err != nil {
+		slog.Warn("SNMP: EngineID component RNG failed, falling back to machine-id", "err", err)
+		return nil
+	}
+	encoded := []byte(hex.EncodeToString(buf) + "\n")
+	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0o755); err != nil {
+		slog.Warn("SNMP: EngineID component dir create failed, falling back to machine-id", "path", path, "err", err)
+		return nil
+	}
+	if err := fsatomic.WriteFileDurable(path, encoded, 0o600); err != nil {
+		slog.Warn("SNMP: EngineID component persist failed, falling back to machine-id", "path", path, "err", err)
+		return nil
+	}
+	return buf
+}
+
+// readMachineID reads /etc/machine-id and decodes it to raw bytes. An empty
+// (uninitialized first-boot) or unparseable value is treated as absent (nil).
+func readMachineID() []byte {
+	data, err := os.ReadFile(machineIDPath)
+	if err != nil {
+		return nil
+	}
+	b, err := hex.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // loadAndIncrementEngineBoots reads the persisted engineBoots counter, returns
