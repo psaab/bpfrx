@@ -80,6 +80,36 @@ var requiredPolicyMatchLeaves = []string{
 	"application",
 }
 
+// policyMissingRequiredMatchDimensions returns the Junos-mandatory match
+// dimensions (source-address, destination-address, application) ABSENT from a
+// policy node's UNION of `match {}` blocks, in declaration order; an empty
+// result means every required dimension is present. It is the single source of
+// truth shared by the #3044 strict gate (validatePolicyRequiredMatchStrict) and
+// compilePolicy's #5575 fail-closed LenientContentDropped flag, so the reject
+// gate and the runtime poison decision can never diverge on which policies omit
+// a dimension.
+//
+// #3842: it unions the dimensions across EVERY `match {}` block
+// (policyMatchChildren), not just the first via FindChild. Junos merges
+// duplicate match blocks, so a policy whose required dimensions are split
+// across two blocks (e.g. source/destination-address in one, application in a
+// load-merged second) is complete once merged — a FindChild-first read saw only
+// the first block and would either spuriously flag a complete policy or,
+// symmetrically, let a widened one through depending on block order.
+func policyMissingRequiredMatchDimensions(polNode *Node) []string {
+	present := map[string]bool{}
+	for _, m := range policyMatchChildren(polNode) {
+		present[m.Name()] = true
+	}
+	var missing []string
+	for _, req := range requiredPolicyMatchLeaves {
+		if !present[req] {
+			missing = append(missing, req)
+		}
+	}
+	return missing
+}
+
 // validatePolicyRequiredMatchStrict walks the `security policies` subtree of
 // the group-expanded AST and rejects any policy whose `match` clause omits a
 // required dimension (source-address, destination-address, application) or
@@ -106,24 +136,7 @@ func validatePolicyRequiredMatchStrict(nodes []*Node, lenient bool) ([]string, e
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
-		// #3842: union the dimensions across EVERY `match {}` block
-		// (policyMatchChildren), not just the first via FindChild. Junos merges
-		// duplicate match blocks, so a policy whose required dimensions are
-		// split across two blocks (e.g. source/destination-address in one,
-		// application in a load-merged second) is complete once merged — a
-		// FindChild-first read saw only the first block and would either
-		// spuriously reject a complete policy or, symmetrically, let a widened
-		// one through depending on which block came first.
-		present := map[string]bool{}
-		for _, m := range policyMatchChildren(polNode) {
-			present[m.Name()] = true
-		}
-		var missing []string
-		for _, req := range requiredPolicyMatchLeaves {
-			if !present[req] {
-				missing = append(missing, req)
-			}
-		}
+		missing := policyMissingRequiredMatchDimensions(polNode)
 		if len(missing) == 0 {
 			return nil
 		}
