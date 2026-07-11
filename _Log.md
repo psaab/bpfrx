@@ -45623,3 +45623,9 @@ top.
   exit_status_for_verdict: PASS=0, FAIL=1, else=2) + fail-on-revert test
 - **File(s)**: test/incus/mouse_latency_aggregate.py,
   test/incus/mouse_latency_aggregate_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-084 — fairness_multi_sample summarize() now fails a sample
+  whose sub-harness exit_code != 0 even if its JSON verdict says PASS
+  (exit status is authoritative) + fail-on-revert test
+- **File(s)**: test/incus/fairness_multi_sample.py,
+  test/incus/fairness_multi_sample_test.py
