@@ -860,6 +860,32 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		}
 	}
 
+	// #5518: compute the renderable BGP neighbor set ONCE and drive every
+	// neighbor-referencing render loop from it. A neighbor authored/loaded
+	// without a peer-as keeps a zero PeerAS; AS 0 is reserved (RFC 7607) and
+	// FRR/vtysh rejects `remote-as 0`, so the declaration loop below must skip
+	// it (the #2963 fail-closed guard). Commit-time validation
+	// (validateBGPNeighborPeerASStrict, pkg/config) rejects remote-as-0 on
+	// commit/commit-check, but the tolerant load / peer-sync path downgrades it
+	// to a warning, so a leniently-loaded remote-as-0 neighbor can reach the
+	// renderer. The declaration guard alone is not enough: the address-family
+	// activation loop and the BFD accumulator ALSO iterate the neighbors, and
+	// emitting `neighbor <ip> activate` / a route-map / `neighbor <ip> bfd` /
+	// a `bfd` peer for a neighbor that was never declared makes vtysh reject
+	// the WHOLE managed section — a single remote-as-0 neighbor would brick the
+	// frr-reload for every valid peer on the box. Building the set once here
+	// guarantees the three loops can never diverge on which neighbors render.
+	var validNeighbors []*config.BGPNeighbor
+	if bgp != nil {
+		validNeighbors = make([]*config.BGPNeighbor, 0, len(bgp.Neighbors))
+		for _, n := range bgp.Neighbors {
+			if n.PeerAS == 0 {
+				continue
+			}
+			validNeighbors = append(validNeighbors, n)
+		}
+	}
+
 	if bgp != nil && bgp.LocalAS > 0 {
 		fmt.Fprintf(&b, "router bgp %d%s\n", bgp.LocalAS, vrfSuffix)
 		if validRouterID(bgp.RouterID) {
@@ -899,19 +925,11 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			}
 			fmt.Fprintf(&b, " bgp dampening %d %d %d %d\n", hl, reuse, suppress, maxSup)
 		}
-		for _, n := range bgp.Neighbors {
-			// Defense-in-depth (#2963): never emit `remote-as 0`. peer-as is
-			// optional in the parser/compiler, so a neighbor authored without
-			// one keeps a zero PeerAS. AS 0 is reserved (RFC 7607) and FRR/vtysh
-			// rejects `remote-as 0`, failing the whole frr-reload. Commit-time
-			// validation (validateBGPNeighborPeerASStrict, pkg/config) rejects
-			// this on commit/commit-check; on the tolerant load/peer-sync path
-			// it is downgraded to a warning, so this render guard keeps a
-			// leniently-loaded remote-as-0 neighbor out of frr.conf entirely
-			// rather than bricking the reload for every other peer.
-			if n.PeerAS == 0 {
-				continue
-			}
+		// validNeighbors excludes remote-as-0 neighbors (#2963/#5518). Every
+		// neighbor-referencing loop below (AF activation, BFD accumulator)
+		// iterates the SAME slice so an undeclared neighbor is never activated
+		// or attached to BFD — see the validNeighbors construction above.
+		for _, n := range validNeighbors {
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			// Per-peering local-as (#4286): present a different AS than the
 			// router's own to this peer.
@@ -1053,7 +1071,11 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// activates those under ipv4 unicast), so route them into the
 		// ipv4 set in that case.
 		var inet4Neighbors, inet6Neighbors []*config.BGPNeighbor
-		for _, n := range bgp.Neighbors {
+		// Classify only renderable (declared) neighbors (#5518). A remote-as-0
+		// neighbor excluded from the declaration loop above must NOT be
+		// activated here — vtysh rejects `neighbor <ip> activate` for a
+		// neighbor with no `remote-as`, failing the whole managed section.
+		for _, n := range validNeighbors {
 			// A neighbor lands in the ipv4 (default) AF when it explicitly
 			// declares family inet, OR when a peer-level policy must reach it
 			// and it has not been pinned to inet6: a global export/import
@@ -1288,7 +1310,11 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 	// deferred to bfdSection.render() — either here (local fallback) or by
 	// the manager for the consolidated global block (#2550).
 	if bgp != nil {
-		for _, n := range bgp.Neighbors {
+		// Accumulate BFD peers only for renderable (declared) neighbors
+		// (#5518). A remote-as-0 neighbor skipped by the declaration loop must
+		// not emit a `bfd` peer either — validNeighbors is the shared
+		// exclusion set.
+		for _, n := range validNeighbors {
 			if n.BFD {
 				bfd.addPeer(bfdPeer{
 					address:    n.Address,

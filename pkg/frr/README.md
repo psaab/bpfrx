@@ -262,7 +262,23 @@ also carries operator content:
   SKIPS a neighbor with `PeerAS == 0` entirely, so AS 0 never reaches
   frr.conf for a config that arrives via the lenient path (an older-binary
   persisted config or a peer-synced one) — keeping the rest of the reload
-  alive instead of bricking it for every other peer.
+  alive instead of bricking it for every other peer. **All three
+  neighbor-referencing render loops agree on that exclusion (#5518).**
+  `generateProtocols` computes a single `validNeighbors` slice (`PeerAS != 0`)
+  ONCE and drives the `neighbor <addr> remote-as`/`update-source`/`timers`/…
+  DECLARATION loop, the address-family ACTIVATION loop
+  (`inet4Neighbors`/`inet6Neighbors` → `neighbor <addr> activate` +
+  `route-map … in/out`), AND the BFD peer accumulator (`bfd { peer <addr> }`)
+  from it. Before #5518 only the declaration loop carried the guard: a
+  remote-as-0 neighbor was kept out of the declaration yet STILL emitted
+  `activate` / route-map / `neighbor <addr> bfd` / a `bfd` peer — and vtysh
+  rejects an `activate`/`bfd`/`peer` for a neighbor that was never declared,
+  so a single lenient remote-as-0 neighbor bricked the managed `frr-reload`
+  for every valid BGP peer. Unifying on `validNeighbors` makes the three loops
+  structurally unable to diverge. (The route-map DEFINITION collectors
+  `collectBGPRouteMapPolicies`/`bgpEffectiveChains` still iterate all
+  neighbors — they emit no `neighbor <addr>` line, only route-map objects, so
+  an unreferenced definition for a skipped neighbor is harmless valid config.)
 - **OSPF/OSPFv3 interface adjacency timers + DR priority (#4285).** The
   per-interface `hello-interval`, `dead-interval`, `retransmit-interval`, and
   `priority` leaves (schema + `OSPFInterface`/`OSPFv3Interface` structs +
