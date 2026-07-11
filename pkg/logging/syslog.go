@@ -176,9 +176,42 @@ func NewSyslogClientWithSource(host string, port int, sourceAddr string) (*Syslo
 	return NewSyslogClientTransport(host, port, sourceAddr, "udp", nil)
 }
 
+// ErrUnsupportedTransport is returned when a syslog client is asked to use a
+// transport token the dialer cannot honor. It exists so the runtime refuses to
+// silently downgrade an unknown/typo'd transport to plaintext UDP. The strict
+// commit schema (`security log stream <s> transport protocol`, enum
+// udp|tcp|tls, #2008) rejects bad tokens at a normal commit, but the tolerant
+// persisted / HA-synced load path does not — so a typo or a newer transport
+// value could reach NewSyslogClientTransport with a token that dial()'s old
+// default arm mapped to UDP, sending security/audit records in plaintext while
+// config and status still name a non-UDP transport (#5581). Callers use
+// errors.Is to distinguish this fail-closed configuration error from a
+// transient dial failure.
+var ErrUnsupportedTransport = errors.New("syslog: unsupported transport protocol")
+
+// supportedTransport reports whether protocol is a transport the dialer can
+// actually establish. Empty is NOT accepted here: NewSyslogClientTransport
+// normalizes "" to "udp" (the documented default) BEFORE validation, so an
+// empty token never reaches this check; a caller building a client another way
+// must pass an explicit token.
+func supportedTransport(protocol string) bool {
+	switch protocol {
+	case "udp", "tcp", "tls":
+		return true
+	default:
+		return false
+	}
+}
+
 // NewSyslogClientTransport creates a syslog client with the specified transport
 // protocol ("udp", "tcp", or "tls"). For TLS, a *tls.Config is used; if nil,
 // system CA roots are used.
+//
+// An unknown/unsupported transport token is REJECTED here (returns
+// (nil, ErrUnsupportedTransport)) instead of silently falling back to UDP.
+// Empty is the documented UDP default and is normalized to "udp" before this
+// check. This is the runtime fail-closed guard for the tolerant persisted /
+// HA-synced load path that bypasses the strict commit enum (#5581).
 //
 // A TCP/TLS receiver that is unreachable at construction (down at config-apply
 // or boot) does NOT fail the stream (#3351). The returned client is usable but
@@ -193,6 +226,13 @@ func NewSyslogClientWithSource(host string, port int, sourceAddr string) (*Syslo
 func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string, tlsCfg *tls.Config) (*SyslogClient, error) {
 	if protocol == "" {
 		protocol = "udp"
+	}
+	// Fail closed on an unknown transport instead of dial()'s old default-to-UDP
+	// path: a security-log stream configured (or persisted / HA-synced) with a
+	// typo'd or unsupported transport must NOT silently ship audit records in
+	// plaintext UDP while config/status still name a non-UDP transport (#5581).
+	if !supportedTransport(protocol) {
+		return nil, fmt.Errorf("%w %q", ErrUnsupportedTransport, protocol)
 	}
 	remoteAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	hostname, _ := os.Hostname()
@@ -259,14 +299,24 @@ func NewSyslogClientWithConn(conn net.Conn, protocol string) *SyslogClient {
 }
 
 // dial establishes a connection based on the configured protocol.
+//
+// An unknown protocol fails closed here (returns ErrUnsupportedTransport)
+// rather than falling back to UDP. NewSyslogClientTransport already rejects
+// bad tokens, so in production s.protocol is always udp/tcp/tls; this is
+// defense-in-depth for any client built another way (and for the reconnect
+// path) so an unrecognized transport can never silently downgrade a
+// stream/secure syslog to plaintext UDP (#5581). "" is treated as UDP for
+// parity with the constructors, which default an empty token to UDP.
 func (s *SyslogClient) dial() (net.Conn, error) {
 	switch s.protocol {
 	case "tcp":
 		return s.dialTCP()
 	case "tls":
 		return s.dialTLS()
-	default:
+	case "udp", "":
 		return s.dialUDP()
+	default:
+		return nil, fmt.Errorf("%w %q", ErrUnsupportedTransport, s.protocol)
 	}
 }
 
