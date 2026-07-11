@@ -74,13 +74,14 @@ type fakeLinkOps struct {
 	addrs map[string][]netlink.Addr
 
 	// Recorded ops.
-	setUpLinks []netlink.Link
-	addrLinks  []netlink.Link
-	delNames   []string
-	addCount   int // cumulative successful LinkAdd calls
-	noMaster   []string
-	mtuSet     map[string][]int
-	addrDels   map[string][]string
+	setUpLinks  []netlink.Link
+	addrLinks   []netlink.Link
+	delNames    []string
+	addCount    int // cumulative successful LinkAdd calls
+	addAttempts int // cumulative LinkAdd calls attempted (success OR failure)
+	noMaster    []string
+	mtuSet      map[string][]int
+	addrDels    map[string][]string
 }
 
 func newFakeLinkOps() *fakeLinkOps {
@@ -119,6 +120,7 @@ func (f *fakeLinkOps) LinkByName(name string) (netlink.Link, error) {
 }
 
 func (f *fakeLinkOps) LinkAdd(l netlink.Link) error {
+	f.addAttempts++
 	if err, ok := f.addFail[l.Attrs().Name]; ok {
 		// Genuine (non-EEXIST) create failure: the link is NOT recorded.
 		return err

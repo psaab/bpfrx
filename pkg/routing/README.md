@@ -79,6 +79,34 @@ stale-`if_id` delete that fails skips the recreate this cycle (avoids an
 `EEXIST` `LinkAdd`) and surfaces the error, matching the #5119 bond
 changed-signature path.
 
+**Only a genuine not-found may create or delete-gone (#5461 / #5495).**
+Both the create/adopt lookup in `Apply` and the lookup in `deleteLocked`
+used to treat **any** `LinkByName` error as "interface not present",
+conflating a transient/lookup failure (`EBUSY`, `EINVAL`, timeout, netlink
+transport) with genuine absence — the same class distinction the tunnel
+path already draws (see the WireGuard/tunnel removal notes below and
+`isLinkNotFound` in `vrf.go`).
+
+- **#5461 (create path):** on a transient lookup error for an xfrmi that
+  actually **exists**, `Apply` fell through to `LinkAdd` → `EEXIST` → a
+  spurious fail-closed commit error, leaving the interface
+  desired-but-untracked. `Apply` now only falls through to `LinkAdd` when
+  the lookup error is a genuine not-found (`isLinkNotFound`); a transient
+  error is **not** treated as absence — the entry is left tracked (retain
+  ownership) and the real lookup error is surfaced so the commit fails
+  closed on the genuine cause and the next reconcile retries.
+- **#5495 (delete path):** `deleteLocked` took the "already gone" branch
+  (drop tracking + return `nil`) on any `LinkByName` error, so a transient
+  error silently **orphaned** a live kernel xfrmi (and stale
+  routing/security state) while reporting convergence — a later `Apply`
+  then had no removed-desired entry to drive cleanup. `deleteLocked` now
+  drops tracking + reports gone **only** on a genuine not-found; a
+  transient error retains the tracking entry and surfaces the error (this
+  also covers the full-tunnel `Clear`/`clearLocked` path, which keeps the
+  retained entry rather than nil-ing the map). The #4901 hardening only
+  covered a failed `LinkDel` **after** a successful lookup; this closes the
+  predating `LinkByName`-error branch.
+
 ### Bond (fabric/ae LAG) reconcile (#5119)
 
 `bondManager.Apply` is called by `pkg/daemon` on **every** config commit
