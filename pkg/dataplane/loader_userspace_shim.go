@@ -31,6 +31,11 @@ const (
 	userspaceBindingsMapName           = "userspace_bindings"
 	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"
 	userspaceShimCompatibilityDNATName = "dnat_table"
+	// userspaceShimCompatibilityDNATV6Name is the IPv6 reverse-NAT steering
+	// table. Like dnat_table it is BOTH declared by the shim ELF and replaced at
+	// load (opts.MapReplacements["dnat_table_v6"]); #5484 pulls it into the same
+	// ABI arms dnat_table already had.
+	userspaceShimCompatibilityDNATV6Name = "dnat_table_v6"
 	// userspaceFallbackStatsMapName is the internal mixed-version compatibility
 	// name for the degraded-path counter map (operator surface:
 	// degraded_path_counters). #4113 changed its BPF type from Array to
@@ -201,11 +206,37 @@ func validateUserspaceShimSpecWith(userspaceSpec *ebpf.CollectionSpec, readPin u
 			"dnat_table flags drift: embedded=%d, expected BPF_F_NO_PREALLOC (userspace shim compatibility map). %s",
 			ms.Flags, userspaceShimGenerateRemediation,
 		)
-	} else if err := validateDNATExpectedABI(ms); err != nil {
+	} else if err := validateSharedMapExpectedABI(ms, userspaceShimCompatibilityDNATName); err != nil {
 		return err
 	}
-	// #5307: compare the embedded shim's map ABI against the RUNNING daemon's
-	// live pins so ErrMapIncompatible is caught pre-stop, not post-stop.
+	// #5484: dnat_table_v6 is declared by the shim AND replaced at load, exactly
+	// like dnat_table, but was omitted from every expected-shape arm — so an
+	// embedded v6 DNAT ABI drift was invisible on a fresh node (no live pin to
+	// compare against). Validate its embedded shape against the Go SSOT
+	// (userspaceShimSharedMapSpecs). Guarded on presence rather than mandatory so
+	// a synthetic/partial spec that omits the v6 table still exercises the other
+	// arms; the real embedded shim always declares dnat_table_v6 (#2406). The
+	// running-daemon case is covered by the live-pin arm below, which now
+	// includes dnat_table_v6 in its ABI-checked set.
+	if ms, ok := userspaceSpec.Maps[userspaceShimCompatibilityDNATV6Name]; ok {
+		if ms.MaxEntries != userspaceShimMaxSessions {
+			return fmt.Errorf(
+				"dnat_table_v6 max_entries drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
+				ms.MaxEntries, userspaceShimMaxSessions, userspaceShimGenerateRemediation,
+			)
+		}
+		if ms.Flags&unix.BPF_F_NO_PREALLOC == 0 {
+			return fmt.Errorf(
+				"dnat_table_v6 flags drift: embedded=%d, expected BPF_F_NO_PREALLOC (userspace shim compatibility map). %s",
+				ms.Flags, userspaceShimGenerateRemediation,
+			)
+		}
+		if err := validateSharedMapExpectedABI(ms, userspaceShimCompatibilityDNATV6Name); err != nil {
+			return err
+		}
+	}
+	// #5307/#5484: compare the embedded shim's map ABI against the RUNNING
+	// daemon's live pins so ErrMapIncompatible is caught pre-stop, not post-stop.
 	return validateUserspaceShimLivePins(userspaceSpec, readPin)
 }
 
@@ -254,34 +285,37 @@ func userspaceMapABIDiff(embedded, ref userspaceMapABI) string {
 	return ""
 }
 
-// validateDNATExpectedABI checks the embedded dnat_table against the Go-side
-// single source of truth (userspaceShimSharedMapSpecs) for the ABI fields
-// cilium/ebpf compares beyond MaxEntries/Flags already asserted by the caller:
-// Type, KeySize, ValueSize. This catches an embedded-vs-Go ABI drift even on a
-// fresh node that has no live pin to compare against (#5307 expected-value arm).
-// Only dnat_table has a Go-side expected shape here; the other pinned shim maps
-// are Rust-defined and are guarded by the live-pin comparison.
-func validateDNATExpectedABI(embedded *ebpf.MapSpec) error {
-	want := sharedShimMapSpecByName(userspaceShimCompatibilityDNATName)
+// validateSharedMapExpectedABI checks an embedded shim map (named by `name`)
+// against the Go-side single source of truth (userspaceShimSharedMapSpecs) for
+// the ABI fields cilium/ebpf compares beyond MaxEntries/Flags already asserted
+// by the caller: Type, KeySize, ValueSize. This catches an embedded-vs-Go ABI
+// drift even on a fresh node that has no live pin to compare against (#5307
+// expected-value arm; #5484 generalized so the v6 DNAT steering table gets the
+// same fresh-node protection as v4). Only maps with a Go-side expected shape
+// (dnat_table / dnat_table_v6) are validated here; the other pinned shim maps
+// are Rust-defined and are guarded by the live-pin comparison. A name with no
+// Go SSOT spec returns nil (nothing to compare against).
+func validateSharedMapExpectedABI(embedded *ebpf.MapSpec, name string) error {
+	want := sharedShimMapSpecByName(name)
 	if want == nil {
 		return nil
 	}
 	if embedded.Type != want.Type {
 		return fmt.Errorf(
-			"dnat_table type drift: embedded=%s, expected=%s (userspace shim compatibility map). %s",
-			embedded.Type, want.Type, userspaceShimGenerateRemediation,
+			"%s type drift: embedded=%s, expected=%s (userspace shim compatibility map). %s",
+			name, embedded.Type, want.Type, userspaceShimGenerateRemediation,
 		)
 	}
 	if embedded.KeySize != want.KeySize {
 		return fmt.Errorf(
-			"dnat_table key_size drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
-			embedded.KeySize, want.KeySize, userspaceShimGenerateRemediation,
+			"%s key_size drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
+			name, embedded.KeySize, want.KeySize, userspaceShimGenerateRemediation,
 		)
 	}
 	if embedded.ValueSize != want.ValueSize {
 		return fmt.Errorf(
-			"dnat_table value_size drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
-			embedded.ValueSize, want.ValueSize, userspaceShimGenerateRemediation,
+			"%s value_size drift: embedded=%d, expected=%d (userspace shim compatibility map). %s",
+			name, embedded.ValueSize, want.ValueSize, userspaceShimGenerateRemediation,
 		)
 	}
 	return nil
@@ -296,20 +330,44 @@ func sharedShimMapSpecByName(name string) *ebpf.MapSpec {
 	return nil
 }
 
-// userspaceABICheckedPinnedMaps is the set of PinByName shim maps whose live
-// pin must be ABI-compatible with the new shim before the collection load. It
-// is userspacePinnedShimMaps() minus the DISPOSABLE counter map
-// (userspace_fallback_stats): that map is deliberately reset on an intended
-// shape change by reconcileDisposableCollectionPin (#4113), so ABI-checking it
-// here would re-brick the very upgrade that reconcile was written to unblock.
+// userspaceABICheckedPinnedMaps is the full set of maps whose live pin must be
+// ABI-compatible with the new dataplane before the collection load — the ONE
+// production replacement inventory the #5484 fix consolidates. It is the union
+// of:
+//
+//   - the shim-declared PinByName maps (userspacePinnedShimMaps), which the
+//     shim ELF creates+pins via the collection load; and
+//   - the Go-created shared maps (userspaceShimSharedMapSpecs), which the Go
+//     loader creates+pins itself (loadUserspaceShimSharedMaps) and, for some,
+//     hands to the shim via MapReplacements.
+//
+// The pre-#5484 inventory covered only the first group, so state-bearing shared
+// maps the shim does NOT declare — sessions_v6, the HA maps (rg_active,
+// ha_watchdog, session_id_gen), and the per-CPU counter maps — were never
+// pre-flighted. An incompatible live pin for one of those passed the deploy
+// gate and then failed ErrMapIncompatible in loadUserspaceShimSharedMaps AFTER
+// the old daemon was stopped, stranding the node fail-closed (#5484). Adding
+// them here catches the drift pre-stop while the old dataplane still forwards.
+//
+// The DISPOSABLE counter map (userspace_fallback_stats) is excluded: it is
+// deliberately reset on an intended shape change by
+// reconcileDisposableCollectionPin (#4113), so ABI-checking it here would
+// re-brick the very upgrade that reconcile was written to unblock.
 func userspaceABICheckedPinnedMaps() []string {
-	names := userspacePinnedShimMaps()
-	out := make([]string, 0, len(names))
-	for _, n := range names {
-		if n == userspaceFallbackStatsMapName {
-			continue
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(userspacePinnedShimMaps())+len(userspaceShimSharedMapSpecs()))
+	add := func(n string) {
+		if n == userspaceFallbackStatsMapName || seen[n] {
+			return
 		}
+		seen[n] = true
 		out = append(out, n)
+	}
+	for _, n := range userspacePinnedShimMaps() {
+		add(n)
+	}
+	for _, s := range userspaceShimSharedMapSpecs() {
+		add(s.Name)
 	}
 	return out
 }
@@ -322,16 +380,25 @@ func userspaceABICheckedPinnedMaps() []string {
 // instead of bricking the node after the old daemon has been stopped (#5307).
 //
 // A map with no pin yet (fresh node / first load) is skipped, so this never
-// produces a false failure on a clean node. A map absent from the new shim is
-// skipped, since PinByName never loads it.
+// produces a false failure on a clean node. A map the new dataplane does not
+// create/pin at all (neither shim-declared nor a Go shared map) is skipped,
+// since nothing would ever fail ErrMapIncompatible for it.
+//
+// The reference shape is resolved per map by abiCheckedRefSpec: the embedded
+// shim's own MapSpec for a shim-declared map (dnat_table, dnat_table_v6, the
+// userspace_* maps), else the Go-side SSOT spec for a shared map the loader
+// creates itself (sessions_v6, the HA/counter family). Both are spec-derived
+// (userspaceMapABIDiff(mapABIFromSpec(ref), live)) — never a hardcoded live
+// shape — so a healthy deploy where live pin == the shape that created it
+// yields no diff and only a real cross-version ABI break is caught (#5484).
 func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin userspacePinnedMapABIReader) error {
 	if readPin == nil {
 		return nil
 	}
 	for _, name := range userspaceABICheckedPinnedMaps() {
-		ms, ok := userspaceSpec.Maps[name]
-		if !ok {
-			continue // absent from the new shim: PinByName never loads it
+		ref := abiCheckedRefSpec(userspaceSpec, name)
+		if ref == nil {
+			continue // new dataplane never creates/pins it: no ErrMapIncompatible risk
 		}
 		pinPath := filepath.Join(bpfPinPath, name)
 		live, exists, err := readPin(pinPath)
@@ -341,7 +408,7 @@ func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin u
 		if !exists {
 			continue // fresh node / first load: nothing pinned yet
 		}
-		if diff := userspaceMapABIDiff(mapABIFromSpec(ms), live); diff != "" {
+		if diff := userspaceMapABIDiff(mapABIFromSpec(ref), live); diff != "" {
 			return fmt.Errorf(
 				"userspace shim map %s is ABI-incompatible with the live pinned map at %s: %s. "+
 					"Loading the new dataplane would fail with ErrMapIncompatible AFTER the running "+
@@ -352,6 +419,21 @@ func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin u
 		}
 	}
 	return nil
+}
+
+// abiCheckedRefSpec resolves the authoritative ABI reference shape for a
+// live-pin comparison. A shim-declared map is compared against the embedded
+// shim's own MapSpec (the shape the collection load would pin by name); a
+// Go-created shared map the shim does NOT declare is compared against the Go
+// SSOT spec (userspaceShimSharedMapSpecs), the shape loadUserspaceShimSharedMaps
+// creates+pins it with. Returns nil when neither owns the name, so the caller
+// skips it — the new dataplane never loads such a map, so it can never fail
+// ErrMapIncompatible (fail-safe).
+func abiCheckedRefSpec(userspaceSpec *ebpf.CollectionSpec, name string) *ebpf.MapSpec {
+	if ms, ok := userspaceSpec.Maps[name]; ok {
+		return ms
+	}
+	return sharedShimMapSpecByName(name)
 }
 
 // userspacePinnedMapABIReader reads the ABI-relevant shape of a live pinned map
@@ -404,6 +486,12 @@ func userspaceIngressIfacesMaxEntriesDriftError(got uint32) error {
 func userspacePinnedShimMaps() []string {
 	return []string{
 		"dnat_table",
+		// #5484: dnat_table_v6 is the IPv6 twin of dnat_table — declared by the
+		// shim ELF and replaced at load (MapReplacements["dnat_table_v6"]) — but
+		// was omitted from this inventory, so the live-pin ABI arm never checked
+		// it. Listed here for parity with dnat_table (both replaced maps are
+		// re-pinned idempotently via userspaceRequiredShimPins).
+		"dnat_table_v6",
 		"userspace_ctrl",
 		"userspace_bindings",
 		"userspace_ingress_ifaces",

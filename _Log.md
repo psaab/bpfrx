@@ -1,3 +1,30 @@
+## 2026-07-11 — #5484 dataplane/shim: ABI-check all required pins incl v6 + HA maps in live-pin preflight
+- **Timestamp**: 2026-07-11 (fix/5484-livepin-abi-inventory)
+- **Action**: `userspaceABICheckedPinnedMaps` (pkg/dataplane/loader_userspace_shim.go)
+  returned `userspacePinnedShimMaps()` minus the disposable
+  `userspace_fallback_stats`, OMITTING the Go-created/replaced shared maps
+  declared in `userspaceShimSharedMapSpecs` — `sessions_v6`, `dnat_table_v6`, and
+  the HA / per-CPU maps (`rg_active`, `ha_watchdog`, `session_id_gen`, the
+  `*_counters`). So `validateUserspaceShimLivePins` never ABI-checked them: an
+  incompatible v6/HA-map shim passed the deploy pre-flight, then failed
+  `ErrMapIncompatible` in `loadUserspaceShimSharedMaps` AFTER the old daemon was
+  stopped, stranding the node fail-closed. Part 1: rebuilt
+  `userspaceABICheckedPinnedMaps` as the deduplicated UNION of both required-pin
+  sources (`userspacePinnedShimMaps` + `userspaceShimSharedMapSpecs` names) minus
+  fallback stats, aligning the ABI-checked set with the required-pins set
+  `userspaceRequiredShimPins` already iterates for existence. Fail-safe by
+  construction: `validateUserspaceShimLivePins` skips maps the shim doesn't embed
+  and maps with no live pin, and diffs SPEC-derived shapes, so a healthy deploy
+  (live-pin == embedded == Go-created) yields NO diff — only a real ABI break is
+  caught. Part 2: generalized `validateDNATExpectedABI` → `validateSharedMapExpectedABI(embedded, name)`
+  and wired a `dnat_table_v6` expected-shape arm into `validateUserspaceShimSpecWith`
+  next to the v4 arm (guarded on the embedded spec declaring the v6 table), so a
+  fresh-node embedded v6 DNAT drift is caught even with no live pin. Updated
+  pkg/dataplane/README.md ABI-check section (no longer "PinByName maps only" /
+  "dnat_table only"). Added tests + verified RED-on-revert.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+  pkg/dataplane/livepin_abi_inventory_5484_test.go, pkg/dataplane/README.md, _Log.md
+
 ## 2026-07-11 — #5544 snmp/v3: prefix DES privacy salt with engineBoots (RFC 3414 §8.1.1.1)
 - **Timestamp**: 2026-07-11 (fix/5544-snmp-des-salt-boots)
 - **Action**: `encryptPDU` (pkg/snmp/v3.go) allocated an 8-byte monotonic-counter
