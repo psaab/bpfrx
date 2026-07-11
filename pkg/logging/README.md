@@ -201,6 +201,28 @@ connectionless and exempt:
   audit logs to a deleted receiver once it recovered.
   `EventReader.SyslogClientCount()` exposes the installed count for that
   teardown assertion.
+- **Unknown transport fails CLOSED — no silent plaintext-UDP downgrade
+  (#5581).** `NewSyslogClientTransport` accepts only the empty default
+  (→ `udp`), `udp`, `tcp`, and `tls`; any other token (a typo like
+  `tls-typo`, a newer/unsupported value, wrong case) returns
+  `(nil, ErrUnsupportedTransport)`. Previously the constructor accepted
+  any token and `dial()`'s `default` arm mapped every unrecognized value
+  to `dialUDP()`, so a security-log stream configured with a bad
+  transport shipped audit records as **plaintext UDP** while config and
+  status still named a non-UDP transport. The strict commit schema
+  (`security log stream <s> transport protocol`, enum `udp|tcp|tls`,
+  #2008) already refutes bad tokens at a normal commit, but the tolerant
+  persisted / HA-synced load path does not — so this runtime guard is the
+  fail-closed backstop for a token that never passed a current strict
+  commit. `dial()` also fails closed on an unrecognized `s.protocol`
+  (defense-in-depth for the reconnect path) instead of downgrading to
+  UDP. The daemon (`applySyslogConfig`) hits the existing `client==nil`
+  branch, logs `failed to create syslog client` with the bad token, and
+  installs NO client — the operator sees a visible apply error rather
+  than a stream that silently forwards nowhere-secure. This differs from
+  the #3351 lazy-connect case: a down-at-apply TCP/TLS receiver returns a
+  *non-nil* reconnecting client (transient reachability), whereas an
+  unknown transport is a *configuration* error that yields a nil client.
 - **Daemon syslog-apply CLOSES superseded clients (#3579).**
   `applySyslogConfig` (pkg/daemon) rebuilds every `SyslogClient` from
   config on each apply, so the prior set is always fully superseded

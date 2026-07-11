@@ -1,3 +1,26 @@
+## 2026-07-11 — #5581 syslog unknown transport fails closed (no plaintext-UDP downgrade)
+- **Timestamp**: 2026-07-11 (fix/5581-logging-unknown-transport)
+- **Action**: `NewSyslogClientTransport` (pkg/logging/syslog.go) accepted any
+  transport token and `dial()`'s `default` arm mapped every unrecognized value
+  to `dialUDP()`, so a security-log stream configured (or persisted / HA-synced)
+  with a typo'd / unsupported transport shipped audit records as plaintext UDP
+  while config/status still named a non-UDP transport (#5581, security
+  fail-open). Added `ErrUnsupportedTransport` + `supportedTransport()`; the
+  constructor now returns `(nil, ErrUnsupportedTransport)` for any token that is
+  not empty(→udp)/udp/tcp/tls, and `dial()` fails closed on an unknown
+  `s.protocol` (defense-in-depth for the reconnect path). The daemon's existing
+  `client==nil` branch skips the stream with a visible `failed to create syslog
+  client` warning — no plaintext client installed. Runtime backstop for the
+  tolerant load path that bypasses the strict #2008 commit enum.
+- **File(s)**: pkg/logging/syslog.go, pkg/logging/README.md,
+  pkg/logging/syslog_unknown_transport_5581_test.go (new),
+  pkg/daemon/syslog_unknown_transport_5581_test.go (new)
+- **Validation**: `go build ./...`; `go test ./pkg/logging/... ./pkg/config/...
+  ./pkg/daemon/...` green. RED-on-revert proven at both the logging (constructor
+  returns a usable plaintext-UDP client; dial() returns a live UDP conn) and
+  daemon (`SyslogClientCount`==1, INFO "syslog stream configured protocol=
+  tls-typo") levels. `gofmt -w` on touched files.
+
 ## 2026-07-11 — #5570 clear security policies hit-count arity fail-closed
 - **Timestamp**: 2026-07-11 (fix/5570-clear-hitcount-arity)
 - **Action**: `cmd/cli/clear.go` `case "policies"` recognized only the first
