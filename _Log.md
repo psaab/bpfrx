@@ -45434,3 +45434,24 @@ top.
 - **Timestamp**: 2026-07-10
 - **Action**: Test-coverage-only (no production change). Added pkg/cli/chrony_test.go — a table-driven test for printChronyTracking (pkg/cli/chrony.go), the `chronyc tracking` output parser behind `show system ntp status`, which had zero unit coverage. Captures stdout via the existing captureStdout helper and asserts the rendered Junos-style block. Cases: fully-synchronised block (exact 12-line match over all 11 rendered fields in fixed order, plus omission checks that chronyc's Residual freq / Skew and the Skew value do NOT leak); unsynchronised block (Leap status "Not synchronised" verbatim); unusual leap status ("Insert second"); malformed lines with no " : " separator ignored + leading-separator empty-key line skipped by the idx>0 guard; duplicated key keeps last value (map overwrite); empty input renders only the header. Verified non-tautological: mutating the Leap-status lookup key in chrony.go turns the test RED; revert → GREEN. No production bug found — parser behaves correctly for all fed inputs (the line[idx+3:] slice is not out-of-bounds, as the issue notes). Validation: `go test ./pkg/cli/...` green; gofmt clean.
 - **File(s)**: pkg/cli/chrony_test.go, _Log.md
+
+## 2026-07-10 — #5470 xpf-deploy --lease-ttl positive-value validation
+- **Timestamp**: 2026-07-10
+- **Action**: Fixed unconstrained `type=int` on both `--lease-ttl` parsers
+  (kernel-roll + image-roll) in scripts/deploy/xpf-deploy.py. Added a shared
+  `positive_int()` argparse `type=` callable that rejects 0/negative/non-int at
+  parse time (raises argparse.ArgumentTypeError → usage error + exit 2, BEFORE
+  any remote/deploy action). A non-positive TTL made `_acquire_lease` render
+  `expires_at = now + ttl` with the strict `now < expires` guard treating the
+  lease as already-expired the instant it is written — the cross-orchestrator
+  roll mutex never held, so two drivers could drain opposite HA nodes into a
+  no-primary outage. Rejects rather than silently clamps (fail-closed). Added
+  scripts/deploy/test_xpf_deploy_lease_ttl.py (10 cases): pure `positive_int`
+  accept/reject + end-to-end parser wiring for both roll subcommands
+  (reject 0/negative w/ exit 2 and handler-not-called; accept positive w/
+  parsed lease_ttl; default 1800 unchanged). RED-on-revert PROVEN: reverting
+  either arm to `type=int` fails the 3 reject tests (SystemExit not raised).
+  Updated docs/in-place-upgrade.md with the `--lease-ttl` positivity contract.
+  Validation: `python3 -m py_compile` clean; `bash scripts/run-selftests.sh`
+  green (37 passed, 0 failed, includes the new test).
+- **File(s)**: scripts/deploy/xpf-deploy.py, scripts/deploy/test_xpf_deploy_lease_ttl.py, docs/in-place-upgrade.md, _Log.md

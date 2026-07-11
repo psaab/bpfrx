@@ -752,6 +752,18 @@ until `status` reports `promoted=<ver>` AND `uname -r` matches, then
 A reverted node boots the OLD kernel and reports `promoted!=<ver>` → the
 driver STOPS and never touches the peer (never-both-down).
 
+The reservation lease TTL is `--lease-ttl <seconds>` (default 1800). It
+MUST be a strictly-positive integer: the lease deadline is rendered as
+`expires_at = now + ttl` and the acquire guard is a strict `now <
+expires`, so a non-positive TTL yields a lease that is already expired
+the instant it is written — the cross-orchestrator mutex never holds and
+two independent drivers could each take a node's flock in turn and drain
+OPPOSITE nodes into a no-primary outage. The parser rejects `0`/negative
+at argument time (exit 2) rather than silently clamping; size the TTL to
+comfortably exceed the whole roll (`--boot-deadline` plus drain/rejoin
+margins). The same `--lease-ttl` contract applies to `image-roll`
+(#5470).
+
 The poll decides "the node rebooted" from an AFFIRMATIVE signal only — a
 CHANGED `boot_id` (`/proc/sys/kernel/random/boot_id`, recorded pre-arm) or the
 candidate kernel actually running — never from an empty status read (#4905-A).
