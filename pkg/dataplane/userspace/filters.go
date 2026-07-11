@@ -110,9 +110,9 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		// dataplane with NO address constraint (fail-open for accept/PBR,
 		// fail-closed for discard/reject — either way wrong).
 		srcAddrs, srcExcept, srcConstrained := resolvePrefixListAddrs(
-			term.SourceAddresses, term.SourcePrefixLists, cfg, filterName, term.Name, "source")
+			term.SourceAddresses, term.SourcePrefixLists, cfg, filterName, term.Name, "source", term.Action)
 		dstAddrs, dstExcept, dstConstrained := resolvePrefixListAddrs(
-			term.DestAddresses, term.DestPrefixLists, cfg, filterName, term.Name, "destination")
+			term.DestAddresses, term.DestPrefixLists, cfg, filterName, term.Name, "destination", term.Action)
 		snap.SourceAddresses = srcAddrs
 		snap.DestAddresses = dstAddrs
 		snap.SourceExcept = srcExcept
@@ -374,17 +374,22 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 // because the reference still makes the direction `constrained`, the matcher
 // fails closed (positive) / match-all (except) per the empty-set semantics
 // above rather than collapsing to match-any.
+//
+// `action` is the term's terminating action ("accept"/"discard"/"reject"/"").
+// It only affects the #5225 action-aware fail-closed lowering of an UNRESOLVED
+// positive prefix-list ref combined with an `except` ref (see
+// ResolveFilterPrefixListAddrs); every other shape is action-independent.
 func resolvePrefixListAddrs(
 	literal []string,
 	refs []config.PrefixListRef,
 	cfg *config.Config,
-	filterName, termName, direction string,
+	filterName, termName, direction, action string,
 ) (addrs []string, except bool, constrained bool) {
 	var prefixLists map[string]*config.PrefixList
 	if cfg != nil {
 		prefixLists = cfg.PolicyOptions.PrefixLists
 	}
-	return ResolveFilterPrefixListAddrs(literal, refs, prefixLists, filterName, termName, direction)
+	return ResolveFilterPrefixListAddrs(literal, refs, prefixLists, filterName, termName, direction, action)
 }
 
 // filterAddrIsReal mirrors the Rust matcher's addr_is_real (userspace-dp
@@ -435,6 +440,21 @@ func portsHaveReal(ports []string) bool {
 	return false
 }
 
+// firewallFilterActionDenies reports whether a firewall-filter term's terminating
+// action DROPS the packet — Junos `discard` (silent drop) or `reject` (drop with
+// an ICMP/TCP-RST notification). It gates the #5225 action-aware fail-closed
+// lowering of an UNRESOLVED positive prefix-list ref combined with an `except`
+// ref (ResolveFilterPrefixListAddrs): a deny term fails closed by matching ALL
+// (drop broadly, so a later permit cannot leak the traffic the deny was written
+// to stop); every other action — `accept`, a routing-instance (PBR) redirect, or
+// a modifier-only fall-through (Action == "") — fails closed by matching NOTHING,
+// because an unresolvable positive scope must never be admitted, redirected, or
+// counted as a match. The action strings match FirewallFilterTerm.Action /
+// FirewallTermSnapshot.Action ("accept"/"discard"/"reject"/"").
+func firewallFilterActionDenies(action string) bool {
+	return action == "discard" || action == "reject"
+}
+
 // ResolveFilterPrefixListAddrs is the SHARED single source of truth for lowering
 // a firewall-filter term's source/destination address + prefix-list scope into
 // the (addrs, except, constrained) triple the matcher consumes. It is exported so
@@ -443,11 +463,16 @@ func portsHaveReal(ports []string) bool {
 // mixed term, and `any`-as-no-constraint — instead of a divergent raw string
 // concatenation (#3433). resolvePrefixListAddrs delegates here; see the doc on
 // resolvePrefixListAddrs for the full empty-set / except / mixed semantics.
+// `action` is the term's terminating action ("accept"/"discard"/"reject"/"").
+// It participates in exactly ONE decision: the #5225 action-aware fail-closed
+// lowering of an UNRESOLVED positive prefix-list ref combined with an `except`
+// ref (see the compose gate below). Every other shape is action-independent, so
+// callers that do not care (or lack an action) may pass "".
 func ResolveFilterPrefixListAddrs(
 	literal []string,
 	refs []config.PrefixListRef,
 	prefixLists map[string]*config.PrefixList,
-	filterName, termName, direction string,
+	filterName, termName, direction, action string,
 ) (addrs []string, except bool, constrained bool) {
 	// Drop the no-constraint placeholders ("any" / empty) from the literal list
 	// BEFORE deciding `constrained` so a bare `from source-address any` is
@@ -484,6 +509,14 @@ func ResolveFilterPrefixListAddrs(
 	var exceptPrefixes []string
 	hasExcept := false
 	hasPositiveRef := false
+	// hasUnresolvedPositiveRef records that a PLAIN (non-except) prefix-list ref
+	// failed to resolve (pl == nil) on the tolerant path. It is distinct from
+	// hasPositiveRef (a RESOLVED positive ref): an unresolved positive ref
+	// contributes no prefixes to `positive`, so the direction can LOOK match-any
+	// (empty positive) while the operator actually scoped it to a specific,
+	// now-unresolvable set. The #5225 compose gate uses this to refuse the
+	// "any except X" widening for that direction. (#5225)
+	hasUnresolvedPositiveRef := false
 
 	for _, ref := range refs {
 		pl := prefixLists[ref.Name]
@@ -505,14 +538,27 @@ func ResolveFilterPrefixListAddrs(
 			// matched no packet and traffic fell through to a later permit), a
 			// fail-OPEN for the deny it was written to enforce. Recording
 			// hasExcept keeps the empty except set matching broadly (fail
-			// CLOSED). A positive ref stays unrecorded: an unresolved positive
-			// scope correctly lowers to (nil, false, true) = match NOTHING, which
-			// is already fail-closed for positive membership.
+			// CLOSED). A positive ref contributes no prefixes: an unresolved
+			// positive scope with NO accompanying except correctly lowers to
+			// (nil, false, true) = match NOTHING, already fail-closed for positive
+			// membership.
+			//
+			// #5225: record an unresolved POSITIVE ref so the compose gate below
+			// can tell a genuine match-any positive (`0.0.0.0/0`, empty literal)
+			// apart from a positive set that is empty ONLY because a positive ref
+			// did not resolve. Without this the ref's absence from `positive` let
+			// addrsAllMatchAny return true and the `hasExcept` set (recorded above
+			// or by a sibling except ref) fired the "any except X" compose, which
+			// lowered the direction to match-ALL. For an `accept` term that is
+			// admit-ALL = fail-OPEN — the term admitted every packet instead of the
+			// intended (unresolvable, so empty) set.
 			slog.Warn("firewall filter prefix-list reference unresolved",
 				"filter", filterName, "term", termName, "direction", direction,
 				"prefix-list", ref.Name)
 			if ref.Except {
 				hasExcept = true
+			} else {
+				hasUnresolvedPositiveRef = true
 			}
 			continue
 		}
@@ -543,6 +589,26 @@ func ResolveFilterPrefixListAddrs(
 	// and only reaches here on the lenient path, where positive-wins keeps it
 	// fail-safe.
 	if hasExcept && !hasPositiveRef && addrsAllMatchAny(positive) {
+		// #5225: an UNRESOLVED positive prefix-list ref makes `positive` empty
+		// WITHOUT the operator having written the match-any universe — the empty
+		// set here is "a specific scope that did not resolve", NOT "any". The
+		// #4338 "any except X" compose (invert the empty positive to match-ALL)
+		// must NOT apply to it. Fail closed BY ACTION so the term never widens
+		// past the operator's (now unresolvable) intent:
+		//   - accept (and every non-deny terminating / fall-through / PBR action):
+		//     match NOTHING. Admitting, redirecting, or counting an unresolvable
+		//     positive set is fail-OPEN. Pre-#5225 this composed to match-ALL =
+		//     ADMIT every packet — the reported defect.
+		//   - discard/reject: match ALL (the sole-`except` complement, unchanged
+		//     from the #4338/#5097 path) so the deny still drops broadly; a deny
+		//     that matched nothing would fall through to a later permit term =
+		//     fail-OPEN for the deny it was written to enforce (the #5097 concern).
+		// Only the unresolved-positive-ref case is action-gated; a genuine
+		// match-any positive (no unresolved positive ref) keeps the #4338/#5097
+		// match-ALL compose verbatim for all actions.
+		if hasUnresolvedPositiveRef && !firewallFilterActionDenies(action) {
+			return nil, false, true
+		}
 		return exceptPrefixes, true, true
 	}
 

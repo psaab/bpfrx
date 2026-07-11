@@ -31,7 +31,7 @@ func TestResolvePrefixListAddrsMixedPositiveExceptFailsSafe_3359(t *testing.T) {
 	addrs, except, constrained := resolvePrefixListAddrs(
 		[]string{"10.0.0.0/8"},
 		[]config.PrefixListRef{{Name: "trusted", Except: true}},
-		cfg, "f", "t", "source",
+		cfg, "f", "t", "source", "accept",
 	)
 
 	if except {
@@ -64,7 +64,7 @@ func TestResolvePrefixListAddrsCleanExceptUnchanged_3359(t *testing.T) {
 	addrs, except, constrained := resolvePrefixListAddrs(
 		nil,
 		[]config.PrefixListRef{{Name: "trusted", Except: true}},
-		cfg, "f", "t", "source",
+		cfg, "f", "t", "source", "accept",
 	)
 	if !except {
 		t.Fatalf("clean except case must resolve except=true, got false")

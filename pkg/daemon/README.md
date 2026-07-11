@@ -611,8 +611,19 @@ never lock an operator out of a remote box it manages.
   EXCEPT scope is match-all (no predicate); a non-empty except is the nft
   negated set `saddr != { ... }`; and a leniently-loaded MIXED positive+except
   in one direction is positive-wins (the except side is dropped, never folded —
-  mirroring `resolvePrefixListAddrs`, hard-rejected at commit by #3359). A
-  malformed or wrong-family literal is also an operator-visible commit error
+  mirroring `resolvePrefixListAddrs`, hard-rejected at commit by #3359). An
+  UNRESOLVED positive prefix-list ref combined with an `except` ref (both refs
+  unresolved, no resolved positive scope — reachable only on the tolerant /
+  peer-sync path, rejected twice at strict commit) is lowered ACTION-AWARE and
+  fail-CLOSED (#5225): the empty positive is NOT the match-any universe (it is a
+  specific scope that did not resolve), so the #4338 "any except X" compose is
+  refused — an `accept`/PBR/modifier term matches NOTHING (never admit an
+  unresolvable set; pre-#5225 it composed to match-ALL = admit every packet,
+  fail-OPEN), while a `discard`/`reject` term keeps match-ALL so the deny still
+  drops broadly (a deny that matched nothing would fall through to a later
+  permit — the #5097 concern). Because the lo0 mirror threads `term.Action`
+  through the shared resolver, its predicate matches the userspace verdict for
+  this shape too. A malformed or wrong-family literal is also an operator-visible commit error
   (`validateFilterAddressLiteralsStrict`, lenient-downgraded on the peer-sync /
   load path — #1960 no-brick). Pinned by `TestNftRuleFromTermAddressSemantics3433`,
   `TestNftRuleFromTermWrongFamilyMatchesNothing`, and (config side)

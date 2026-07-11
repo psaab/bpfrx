@@ -46,7 +46,7 @@ func TestResolvePrefixListAddrsUnresolvedSoleExceptFailsClosed_5097(t *testing.T
 			addrs, except, constrained := resolvePrefixListAddrs(
 				tc.literal,
 				[]config.PrefixListRef{{Name: tc.refName, Except: true}},
-				cfg, "f", "t", tc.direction,
+				cfg, "f", "t", tc.direction, "accept",
 			)
 			if !constrained {
 				t.Fatalf("an unresolved except reference must stay constrained "+
@@ -75,7 +75,7 @@ func TestResolvePrefixListAddrsMatchAnyPlusUnresolvedExceptFailsClosed_5097(t *t
 	addrs, except, constrained := resolvePrefixListAddrs(
 		[]string{"0.0.0.0/0"},
 		[]config.PrefixListRef{{Name: "undefined", Except: true}},
-		cfg, "f", "t", "source",
+		cfg, "f", "t", "source", "accept",
 	)
 	if !except || !constrained {
 		t.Fatalf("match-any + unresolved except must compose to except=true, "+
@@ -100,7 +100,7 @@ func TestResolvePrefixListAddrsSpecificPlusUnresolvedExceptStaysPositiveWins_509
 	addrs, except, constrained := resolvePrefixListAddrs(
 		[]string{"10.0.0.0/8"},
 		[]config.PrefixListRef{{Name: "undefined", Except: true}},
-		cfg, "f", "t", "source",
+		cfg, "f", "t", "source", "accept",
 	)
 	if except {
 		t.Fatalf("specific positive + unresolved except must NOT compose "+
