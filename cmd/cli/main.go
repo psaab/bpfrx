@@ -654,6 +654,12 @@ func (c *ctl) testPolicy(args []string) error {
 	if icmpCode != nil {
 		topic += ",iccode=" + strconv.Itoa(int(*icmpCode))
 	}
+	// #5572: forward the non-first-fragment (l4_present == false) selector to the
+	// gRPC test-policy bridge so the remote `test policy` reproduces the #4569
+	// fragment-associated deny.
+	if sel.NonFirstFragment {
+		topic += ",frag=1"
+	}
 	return c.showText(topic)
 }
 

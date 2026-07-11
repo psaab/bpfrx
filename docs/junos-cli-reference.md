@@ -972,8 +972,29 @@ and `test policy from-zone <z> to-zone <z> [...]` (both local and remote CLI).
 The 5-tuple policy simulator answers "which policy does this flow match?" over
 the same precedence the dataplane enforces. Selectors: `source-ip`,
 `destination-ip`, `source-port`, `destination-port`, `protocol <name|number>`,
-`icmp-type`, `icmp-code`. `from-zone` and `to-zone` are required; an OMITTED
-selector matches any.
+`icmp-type`, `icmp-code`, and the valueless `non-first-fragment` (#5572).
+`from-zone` and `to-zone` are required; an OMITTED selector matches any.
+
+**Non-first fragment simulation (#5572).** The valueless `non-first-fragment`
+selector evaluates the query as a NON-FIRST IP fragment — the dataplane's
+flowless / no-L4 packet shape (`l4_present == false`). A non-first TCP/UDP
+fragment carries the datagram's payload after the IP header, not an L4 header,
+so it has no ports; the simulator then reproduces the dataplane's #4569
+fragment-associated deny: a port-bearing DENY the FIRST fragment (with real
+ports) would hit denies the non-first fragment too, even though a plain
+omitted-port query on the same tuple would fall through to a later permit.
+Without this selector a fragment could only be expressed as `... source-port 0
+destination-port 0`, which the simulator matched as a real port-0 packet and
+reported PERMIT while the live firewall dropped it — the exact operator lie
+#5572 removes. Example: `show security match-policies from-zone trust to-zone
+untrust source-ip 10.1.2.3 protocol tcp non-first-fragment` reports the enforcing
+deny plus a `fragment-associated deny advisory:` line. The selector threads
+through every surface (local + remote `show security match-policies` / `test
+policy`, the gRPC `MatchPolicies` RPC `non_first_fragment` field, the gRPC
+`test-policy:` bridge `frag=1` token, and the REST `non_first_fragment` query
+parameter). A protocol-only / `application any` deny still matches the fragment
+directly; a deny for a DIFFERENT protocol, or one whose source/destination
+address does not overlap the fragment, leaves it on the forward path.
 
 **Strict selector validation (#3696).** All four CLI surfaces (local + remote
 `show security match-policies` / `test policy`) and the gRPC `ShowText`
