@@ -38,6 +38,17 @@ func (d *recordingClearGRPCDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6,
 	return nil
 }
 
+// Cursor iterators for the #5454 filtered-clear path (the embedded
+// *dataplane.Manager would otherwise promote empty-map iterators).
+func (d *recordingClearGRPCDP) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	iterateV4From(d.v4Sessions, cursor, fn)
+	return nil
+}
+
+func (d *recordingClearGRPCDP) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return nil
+}
+
 func (d *recordingClearGRPCDP) DeleteSession(key dataplane.SessionKey) error {
 	d.deletedV4 = append(d.deletedV4, key)
 	if d.missingV4[key] {

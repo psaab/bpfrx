@@ -49,6 +49,20 @@ func (d *clearFaultGRPCDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, dat
 	return d.iterV6Err
 }
 
+// IterateSessionsFrom / IterateSessionsV6From model the cursor iterator the
+// #5454 filtered-clear path uses. Without them the embedded *dataplane.Manager
+// promotes a real (empty-map) cursor iterator that would silently iterate
+// nothing. They route through the in-memory sessions and preserve the injected
+// iterator errors.
+func (d *clearFaultGRPCDP) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	iterateV4From(d.v4Sessions, cursor, fn)
+	return d.iterErr
+}
+
+func (d *clearFaultGRPCDP) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	return d.iterV6Err
+}
+
 func (d *clearFaultGRPCDP) DeleteSession(key dataplane.SessionKey) error {
 	if _, isForward := d.v4Sessions[key]; isForward {
 		return d.fwdDelErr
