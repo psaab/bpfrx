@@ -317,9 +317,17 @@ func (c *CLI) showInterfaces(args []string) error {
 
 		// Show each logical unit
 		for _, li := range group {
-			lookupName := physName
+			// The display identity stays authored ("ge-0/0/0.<unit>"), but the
+			// kernel-address lookup below needs the Linux dash-form netdev name,
+			// and a VLAN-tagged unit's addresses live on the ".<vlan-id>"
+			// sub-device. Passing the authored "ge-0/0/0.50" to
+			// net.InterfaceByName failed the lookup and fell back to the parent,
+			// printing the parent's addresses under the sub-unit (#4984 / #4884
+			// sub-defect B). Resolve to the kernel name like the terse path does.
+			kernelBase := config.LinuxIfName(physName)
+			lookupName := kernelBase
 			if li.vlanID > 0 {
-				lookupName = fmt.Sprintf("%s.%d", physName, li.vlanID)
+				lookupName = fmt.Sprintf("%s.%d", kernelBase, li.vlanID)
 			}
 
 			fmt.Printf("\n  Logical interface %s.%d", physName, li.unitNum)

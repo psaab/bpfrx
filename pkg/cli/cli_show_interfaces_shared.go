@@ -50,6 +50,48 @@ func baseIfName(name string) string {
 	return name
 }
 
+// kernelToAuthoredMap builds a kernel-ifname -> authored-Junos-name reverse map
+// from the active config. The netlink-driven detail / extensive / statistics
+// presenters walk kernel netdevs ("ge-0-0-2"), but every `show interfaces`
+// variant must render the SAME authored identity ("ge-0/0/2") the summary and
+// terse paths already use, so the operator never sees one interface under two
+// spellings (#4984). A managed interface maps to its config (authored) name; an
+// unmanaged netdev is absent from the map and callers fall back to the kernel
+// name unchanged (see authoredName).
+func kernelToAuthoredMap(cfg *config.Config) map[string]string {
+	m := make(map[string]string)
+	if cfg == nil {
+		return m
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #5068: tolerant/HA-sync path may carry a nil value
+			continue
+		}
+		m[config.LinuxIfName(ifc.Name)] = ifc.Name
+	}
+	return m
+}
+
+// authoredName resolves a kernel ifname to its authored Junos name via the
+// reverse map, returning the kernel name unchanged for an unmanaged device.
+func authoredName(kernelToAuthored map[string]string, kernelName string) string {
+	if a, ok := kernelToAuthored[kernelName]; ok {
+		return a
+	}
+	return kernelName
+}
+
+// ifaceFilterMatches reports whether an operator-supplied `show interfaces
+// <name> detail|extensive` filter selects a netdev. It accepts EITHER the
+// authored Junos name ("ge-0/0/2") or the kernel dash-form name ("ge-0-0-2")
+// so the two spellings are interchangeable on the command line and an authored
+// filter no longer reports "not found" against a kernel-named netdev (#4984).
+func ifaceFilterMatches(filter, kernelName, authored string) bool {
+	return filter == kernelName ||
+		filter == authored ||
+		config.LinuxIfName(filter) == kernelName
+}
+
 // rethMemberAttrs returns the netlink attributes of a reth's physical member,
 // best-effort. ok is false when the member device is absent (peer-owned or a
 // test host) so callers render from config alone (#4328).

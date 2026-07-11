@@ -752,6 +752,18 @@ until `status` reports `promoted=<ver>` AND `uname -r` matches, then
 A reverted node boots the OLD kernel and reports `promoted!=<ver>` → the
 driver STOPS and never touches the peer (never-both-down).
 
+The reservation lease TTL is `--lease-ttl <seconds>` (default 1800). It
+MUST be a strictly-positive integer: the lease deadline is rendered as
+`expires_at = now + ttl` and the acquire guard is a strict `now <
+expires`, so a non-positive TTL yields a lease that is already expired
+the instant it is written — the cross-orchestrator mutex never holds and
+two independent drivers could each take a node's flock in turn and drain
+OPPOSITE nodes into a no-primary outage. The parser rejects `0`/negative
+at argument time (exit 2) rather than silently clamping; size the TTL to
+comfortably exceed the whole roll (`--boot-deadline` plus drain/rejoin
+margins). The same `--lease-ttl` contract applies to `image-roll`
+(#5470).
+
 The poll decides "the node rebooted" from an AFFIRMATIVE signal only — a
 CHANGED `boot_id` (`/proc/sys/kernel/random/boot_id`, recorded pre-arm) or the
 candidate kernel actually running — never from an empty status read (#4905-A).
@@ -906,9 +918,32 @@ node from a new baked image ONE AT A TIME (built on the existing per-node
    mechanics stay environment-specific). The node boots the new base,
    factory-bootstraps its config DB from the day-0 text, verifies the
    dataplane.
-4. **poll** until it is back (xpfd answers `protocol-versions`), then
-   **rejoin** + confirm sync BEFORE touching node[1] (never-both-down;
-   the INC-2 `rejoin` verb). Repeat for node[1].
+4. **poll** until it is back **as the EXPECTED node on the EXPECTED
+   build**, then **rejoin** + confirm sync BEFORE touching node[1]
+   (never-both-down; the INC-2 `rejoin` verb). Repeat for node[1].
+
+   **Identity + version gate (#5075).** "Back" is NOT merely "some xpfd
+   answers `protocol-versions`". Before #5075 the poll accepted ANY
+   responding xpfd (a non-empty `xpf-version`), so a `--recreate-hook`
+   that relaunched the OLD image, a stale alias, or the WRONG node-id
+   satisfied it — the driver rejoined the wrong/old node and rolled the
+   peer onto unintended/mixed software, a **silent deploy-integrity
+   failure**. The poll now requires the responding daemon to be BOTH:
+   - the **expected build** — its live `xpf-version` EXACTLY equals the
+     AUTHENTICATED manifest's `xpf-version` (the same signed
+     `xpf-<ver>.manifest` bytes the mixed-base gate reads, so no extra
+     trust input is introduced), AND
+   - the **expected node** — its `/etc/xpf/node-id` (the marker xpfd
+     itself keys HA identity on) equals the cluster node-id the deploy
+     assigned this node (`--node0-id` / `--node1-id`).
+
+   The existing retry/timeout is preserved (keep polling until the gate
+   passes or `--boot-deadline` elapses), but a responding-but-wrong daemon
+   is **fail-closed**: the roll ERRORS with the never-both-down leases
+   HELD (the peer stays primary, the half-rolled pair is left for the
+   operator to investigate) instead of silently proceeding. Covered by
+   `scripts/deploy/test_xpf_deploy_image_roll_identity.py` (RED on revert:
+   the old node / wrong node-id is accepted and the roll completes).
 
 When draining node[1] (the SECOND node), its peer is the already-rolled
 NEW image, so the drain's exact-equality HA precheck is relaxed with
