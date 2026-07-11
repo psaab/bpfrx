@@ -45668,3 +45668,9 @@ top.
   New test file with fail-on-revert partial/missing cases.
 - **File(s)**: test/incus/step1-rate-spread-analysis.py,
   test/incus/step1-rate-spread-analysis_test.py (new)
+- **Timestamp**: 2026-07-10
+- **Action**: HC-130 — step1-rss-multinomial simulate() is now a generator
+  (O(1) memory); tail_probabilities streams + counts trials and raises on
+  empty. Deterministic-seed behavior preserved. New test file.
+- **File(s)**: test/incus/step1-rss-multinomial.py,
+  test/incus/step1-rss-multinomial_test.py (new)
