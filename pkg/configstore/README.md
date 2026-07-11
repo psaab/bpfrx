@@ -390,8 +390,16 @@ per-path:
   (the pre-#5197 code discarded it), so a non-durable wipe is never
   reported as a clean factory reset. All routes go through the
   `rbRemove`/`rbSyncDir` seams so a dropped sync fails a test RED. The
-  gRPC `zeroizeConfigDir` mirror in `pkg/grpcapi` carries the same
-  barriers (its own `zeroizeSyncDir` seam).
+  top-level sweep also removes fsatomic crash-leaked write temps
+  (`.<base>.tmp-*`, #5475) — a daemon killed between `fsatomic`'s
+  `CreateTemp` and its rename leaves a temp holding the full cleartext
+  config text it was mid-writing (xpf.conf / rescue.conf / a rollback
+  slot). `fsatomic` self-heals such a temp on the next write to that
+  base (`NewDB` sweeps the same `.*.tmp-*` glob inside `.configdb`), but
+  a factory reset + reboot means there is no next write, so an unswept
+  top-level temp — and its secrets — would survive. The gRPC
+  `zeroizeConfigDir` mirror in `pkg/grpcapi` carries the same barriers
+  (its own `zeroizeSyncDir` seam) and the same `.<base>.tmp-*` sweep.
 - **`FactoryResetArchiveDir` — local config-archive erasure (#5186).**
   `zeroize` must remove EVERY on-box generation of config secrets. The
   config archive (`<archive-dir>/config-*.conf`, 0600 full-config-text
