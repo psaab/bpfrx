@@ -45616,3 +45616,24 @@ top.
   green; RED-on-revert proven (flipping `ones > bestLen` to pick the shortest
   prefix fails the selection assertions; reverted, production file clean).
 - **File(s)**: pkg/cli/cli_request_testrouting_4832_test.go, _Log.md
+
+## #4840 — split afxdp/tests.rs + frame/tests.rs catch-alls (test code-motion)
+
+- **Timestamp**: 2026-07-10
+- **Action**: Split the 14,038-LOC `afxdp/tests.rs` catch-all into a shared
+  support module plus 11 cohesive per-subsystem sibling test modules, all
+  declared `#[cfg(test)] #[path=...]` from `afxdp/mod.rs` (same parent module,
+  so `super::*` still resolves to production items). Pure code motion: every
+  `#[test]` fn moved verbatim; the 71 non-test helper fns moved verbatim into
+  `tests_support.rs` with visibility widened to `pub(super)` and imported via
+  `use super::tests_support::*`. Verified with a fn-body extraction diff (all
+  275 top-level fns byte-identical modulo the `pub(super)` prefix) and a full
+  `cargo test --release` run (3909 passed / 0 failed / 2 ignored — identical to
+  pre-split baseline; test-binary warning count unchanged at 129).
+- **File(s)**: userspace-dp/src/afxdp/mod.rs (deleted `mod tests;`, added 12
+  sibling `#[path]` decls), removed userspace-dp/src/afxdp/tests.rs, added
+  tests_support.rs, tests_bind_forward.rs, tests_icmp_te.rs,
+  tests_icmp_reject_reversal.rs, tests_embedded_poll_filter.rs,
+  tests_slow_path_disposition.rs, tests_txn_flow_cache.rs, tests_nat64_tunnel.rs,
+  tests_gre_local_delivery.rs, tests_decap_dnat_table.rs,
+  tests_policy_inbound_nat.rs, tests_fragment.rs, _Log.md
