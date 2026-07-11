@@ -26,8 +26,24 @@ import (
 )
 
 const (
-	bpfPinPath                         = "/sys/fs/bpf/xpf"
-	userspaceShimGenerateRemediation   = "Re-run `make generate-userspace-xdp`."
+	bpfPinPath                       = "/sys/fs/bpf/xpf"
+	userspaceShimGenerateRemediation = "Re-run `make generate-userspace-xdp`."
+	// userspaceShimStalePinRemediation is the remediation for a LIVE-PIN ABI
+	// mismatch (validateUserspaceShimLivePins): the running daemon's pinned map
+	// predates this build's shim-map ABI. That is NOT an embedded-vs-Go SSOT
+	// drift — the embedded shim is the intended deploy target and is not broken
+	// — so `make generate` is the WRONG action. A rolling deploy cannot cross a
+	// shim-map ABI change because the new map can only be pinned after the stale
+	// pin is released; the fix is a full dataplane reload. This is the exact
+	// scenario that blocks a cluster stuck on an old cpumap=16 pin vs an
+	// embedded cpumap=256 shim (#5363).
+	userspaceShimStalePinRemediation = "The RUNNING daemon's pinned map predates " +
+		"this build's shim-map ABI. A rolling deploy CANNOT cross a shim-map ABI " +
+		"change: the new map can only be pinned after the stale pin is released. " +
+		"Do a FULL dataplane reload (stop xpfd so the old pin is released, then " +
+		"start it to load the new shim), accepting brief downtime — do NOT `make " +
+		"generate` (the embedded shim is the intended target, not broken). See " +
+		"pkg/dataplane/README.md (#1864)."
 	userspaceBindingsMapName           = "userspace_bindings"
 	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"
 	userspaceShimCompatibilityDNATName = "dnat_table"
@@ -414,7 +430,7 @@ func validateUserspaceShimLivePins(userspaceSpec *ebpf.CollectionSpec, readPin u
 					"Loading the new dataplane would fail with ErrMapIncompatible AFTER the running "+
 					"daemon is stopped, stranding the node fail-closed; refusing so the current "+
 					"dataplane keeps forwarding. %s",
-				name, pinPath, diff, userspaceShimGenerateRemediation,
+				name, pinPath, diff, userspaceShimStalePinRemediation,
 			)
 		}
 	}

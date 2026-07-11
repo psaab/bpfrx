@@ -114,6 +114,25 @@ Guard layers (`build-userspace-xdp.sh`):
    `reconcileDisposableCollectionPin` resets it on an intended shape
    change (#4113), so ABI-checking it here would re-brick that upgrade.
 
+   **Remediation message split (#5363):** the two ABI arms print
+   *different* operator guidance because they diagnose different faults.
+   An **embedded-vs-Go-SSOT drift** (`validateUserspaceShimSpecWith`
+   expected-shape arms + `validateSharedMapExpectedABI` +
+   the `userspace_bindings`/`userspace_ingress_ifaces` drift errors) means
+   the embedded shim binary drifted from its Go-side source contract, so
+   it prints `userspaceShimGenerateRemediation` — "Re-run `make
+   generate-userspace-xdp`." A **live-pin mismatch**
+   (`validateUserspaceShimLivePins`) is the OPPOSITE situation: it compares
+   this build's embedded shim against the RUNNING (old) daemon's pinned
+   map, so the pin is ALWAYS the stale side — in the upgrade direction
+   (embedded `MaxEntries` > pinned, e.g. the `userspace_cpumap` 16→256
+   bump) AND in a downgrade. The embedded shim is the intended, un-broken
+   target, so `make generate` is the WRONG action; instead it prints
+   `userspaceShimStalePinRemediation`, directing a FULL dataplane reload
+   (stop xpfd so the old pin is released, then start it to load the new
+   shim). A rolling deploy cannot cross a shim-map ABI change because the
+   new map can only be pinned after the stale pin is released.
+
    **Residual (documented, not caught here):** a *same-size* Go/Rust
    value **field reorder** — identical `KeySize`/`ValueSize`/`Type`/
    `Flags` but a different field layout — is invisible to this
