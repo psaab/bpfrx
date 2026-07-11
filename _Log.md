@@ -45961,3 +45961,79 @@ top.
   pkg/api/security_matchpolicies_fragment_5572_test.go,
   pkg/grpcapi/server_matchpolicies_fragment_5572_test.go,
   pkg/grpcapi/server_show_testpolicy_fragment_5572_test.go, _Log.md
+- **Timestamp**: 2026-07-11 (fix/5578-policy-session-invalidation-errors)
+  **Action**: #5578 propagate policy-session-invalidation failures instead of
+  swallowing them to a log line. `clearSessionsForPolicyIDs` and its three
+  wrappers (`clearSessionsForDeletedPolicies`,
+  `clearSessionsForModifiedPolicies`, `clearSessionsForDefaultPolicyChange`)
+  changed from `void` to returning an aggregated `error` (errors.Join of the
+  ForEachV4/V6 enumerate errors + DeleteBatchKnownV4/V6 delete errors; both
+  families always attempted first — a partial clear beats none). A partial
+  invalidation is a stale-authorization gap: a failed enumerate leaves
+  unvisited sessions and a failed batch-delete leaves matched sessions
+  INSTALLED, so traffic the new policy should DENY keeps forwarding on old
+  session state while the commit reported success. Added a combined helper
+  `clearSessionsForPolicyChanges` that runs all three and joins. Callers now
+  surface it: `applyAndSyncCommitted` joins it into the returned commit error
+  alongside the non-fatal applyErr (mark-and-continue — config stays committed
+  + still syncs to the peer, mirroring the surrounding apply-step discipline);
+  `syncAndApply` returns it to `handleConfigSync`; the void confirm-timeout
+  rollback (`executeConfirmedRollback`) logs it loudly (no return path — mirrors
+  the applyConfigLocked slog.Error above it). slog.Error/Warn diagnostics kept.
+  New fail-on-revert tests inject ForEach + batch-delete errors via the
+  dataplane fake and assert the wrapper AND the caller RETURN the wrapped
+  error (and, for the delete case, that the matched sessions remain installed
+  = the observable stale-authorization gap). RED-on-revert proven: semantic
+  swallow at the core (return nil) + caller ignoring the return → all three new
+  tests FAIL. go build ./... + go test ./pkg/daemon/... green; gofmt clean.
+  Updated docs/feature-gaps.md Policy-Rematch row with the #5578 error contract.
+  **File(s)**: pkg/daemon/daemon_policy_invalidate.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_policy_invalidate_test.go, docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-07-11
+  **Action**: #5575 fix — lenient policy compilation no longer publishes a
+  missing/dropped match constraint as a wildcard permit (permit-widening on
+  lenient/HA load). `CompileConfigLenient` downgrades the #3044 missing-match /
+  #3113 unsupported-match-leaf / #3114 unsupported-then-permit rejects to
+  warnings but `compilePolicy` then dropped the constraint, leaving the
+  dimension EMPTY → the userspace matcher read empty as match-ANY → a permit
+  broader than configured (fail-open). Extracted the three per-policy predicates
+  the strict gates use into shared SSOT helpers
+  (`policyMissingRequiredMatchDimensions`, `policyUnsupportedMatchLeafFindings`,
+  `policyUnsupportedThenPermitModifiers`); `compilePolicy` (now taking
+  `isGlobal`) sets a new `Policy.LenientContentDropped` flag for exactly the
+  policies a strict commit would reject; `buildOneRuleSnapshot` poisons such a
+  rule with the `__unsupported__` application sentinel → Rust integrity preflight
+  rejects the WHOLE snapshot (previous-good retained / fresh-boot default-deny),
+  action-agnostic fail-CLOSED. Preserves the intentional-empty (explicit `any`)
+  case (non-empty slice → match-any, flag false). Go-only (reuses the existing
+  #2124/#3261 sentinel; no Rust change). Regenerated golden_4406 baseline (new
+  typed field; only `strict-violations/lenient` policy p1 flags true). Added
+  config-layer + userspace end-to-end fail-on-revert tests; proved RED-on-revert
+  by neutralizing the snapshot poison. Updated pkg/config/README.md (new #5575
+  section) + field/helper/const doc comments. Gates: go build ./... green;
+  go test ./pkg/config/... ./pkg/dataplane/... ./pkg/policymatch/... ./pkg/api/...
+  ./pkg/grpcapi/... ./pkg/configstore/... ./pkg/cluster/... ./cmd/cli/... green;
+  go vet clean; gofmt clean.
+  **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_policy.go,
+  pkg/config/compiler_policy_missing_match.go,
+  pkg/config/compiler_policy_match.go, pkg/config/compiler_policy_then.go,
+  pkg/config/README.md, pkg/config/testdata/golden_4406.json,
+  pkg/config/lenient_permit_widening_5575_test.go,
+  pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/policies_lower.go,
+  pkg/dataplane/userspace/lenient_permit_widening_5575_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5571 — bound the DDNS ownership-state read before loading it all
+  into memory (CWE-770). Added `readBoundedStateFile` (os.Stat pre-check +
+  io.LimitReader(maxDDNSStateBytes+1) sentinel) and the derived cap constants
+  `maxDDNSStateRecords`/`maxDDNSStateRecordBytes`/`maxDDNSStateBytes` (~128 MiB)
+  plus the `errDDNSStateTooLarge` sentinel (wraps errDDNSStateCorrupt) so an
+  over-bound file engages the existing fail-closed quarantine + durable
+  `.degraded` marker posture. `loadDDNSState` now reads via the bounded helper.
+  Added fail-on-revert tests (sparse oversized file rejected by the size bound;
+  end-to-end degrade/quarantine; normal file still loads; missing = not-exist).
+  Updated pkg/ddns/README.md size-bound contract. RED-on-revert verified.
+  **File(s)**: pkg/ddns/state.go, pkg/ddns/state_readbound_5571_test.go,
+  pkg/ddns/README.md, _Log.md
