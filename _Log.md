@@ -45661,3 +45661,10 @@ top.
   cells. Added --only-cell missing-target fail-on-revert test.
 - **File(s)**: test/incus/step1-histogram-classify.py,
   test/incus/step1-histogram-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-128 — rate-spread analyzer validates exact-16 streams +
+  positive finite sender bps (RateSpreadError), and main() hard-fails on any
+  missing requested cell instead of WARN+continue. Added --expected-streams.
+  New test file with fail-on-revert partial/missing cases.
+- **File(s)**: test/incus/step1-rate-spread-analysis.py,
+  test/incus/step1-rate-spread-analysis_test.py (new)

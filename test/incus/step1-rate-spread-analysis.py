@@ -48,16 +48,50 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-def load_per_flow_rates(path: Path) -> List[float]:
+DEFAULT_STREAMS = 16
+
+
+class RateSpreadError(Exception):
+    """A cell's iperf3 JSON is incomplete/malformed for spread analysis."""
+
+
+def load_per_flow_rates(
+    path: Path, expected_streams: int | None = DEFAULT_STREAMS
+) -> List[float]:
+    """Extract per-flow sender rates, validating input completeness.
+
+    C175-HC-128: the prior loader silently dropped any stream whose
+    sender.bits_per_second was missing/zero and never checked the stream
+    count. A cell that captured only a couple of valid streams (a
+    truncated or partly-failed iperf3 run) still produced a max/min ratio
+    that fed the Verdict-B threshold Y — a threshold derived from partial
+    evidence. Require exactly `expected_streams` streams (16 by default),
+    each with a positive finite sender rate; anything else raises so the
+    caller fails loud instead of computing Y from a fragment.
+    """
     with path.open() as f:
         data = json.load(f)
     streams = data.get("end", {}).get("streams", [])
+    if expected_streams is not None and len(streams) != expected_streams:
+        raise RateSpreadError(
+            f"{path.name}: expected {expected_streams} streams, "
+            f"found {len(streams)}"
+        )
     rates: List[float] = []
-    for s in streams:
+    for i, s in enumerate(streams):
         sender = s.get("sender") or {}
         bps = sender.get("bits_per_second")
-        if bps and bps > 0:
-            rates.append(float(bps))
+        if (
+            isinstance(bps, bool)
+            or not isinstance(bps, (int, float))
+            or not math.isfinite(bps)
+            or bps <= 0
+        ):
+            raise RateSpreadError(
+                f"{path.name}: stream {i} has invalid "
+                f"sender.bits_per_second={bps!r}"
+            )
+        rates.append(float(bps))
     return rates
 
 
@@ -99,6 +133,16 @@ def main(argv: List[str] | None = None) -> int:
     )
     p.add_argument("--floor-ratio", type=float, default=0.5)
     p.add_argument(
+        "--expected-streams",
+        type=int,
+        default=DEFAULT_STREAMS,
+        help=(
+            "Exact per-cell iperf3 stream count to require (default 16). "
+            "A cell with a different count is rejected as partial evidence. "
+            "Pass 0 to disable the exact-count check."
+        ),
+    )
+    p.add_argument(
         "--bootstrap-trials",
         type=int,
         default=10000,
@@ -125,15 +169,33 @@ def main(argv: List[str] | None = None) -> int:
     print(f"# Slow-start floor: < {args.floor_ratio}x median dropped before min()")
     print()
 
+    # C175-HC-128: every requested cell must be present. Silently
+    # skipping a missing cell let Y be derived from whichever cells
+    # happened to exist (as few as two), i.e. from partial evidence.
+    expected_streams = args.expected_streams if args.expected_streams > 0 else None
+    missing = [
+        name
+        for name in args.cells
+        if not (args.evidence_dir / f"{name}.json").is_file()
+    ]
+    if missing:
+        print(
+            f"error: missing cell file(s): {missing} in {args.evidence_dir}; "
+            "refusing to derive Y from partial evidence",
+            file=sys.stderr,
+        )
+        return 2
+
     print(f"{'cell':<12}  {'n':>3}  {'max_gbps':>10}  "
           f"{'min_gbps':>10}  {'ratio':>7}")
     ratios: List[float] = []
     for name in args.cells:
         path = args.evidence_dir / f"{name}.json"
-        if not path.is_file():
-            print(f"# WARN: missing {path}", file=sys.stderr)
-            continue
-        rates = load_per_flow_rates(path)
+        try:
+            rates = load_per_flow_rates(path, expected_streams=expected_streams)
+        except RateSpreadError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         ratio, mx, mn, n = cell_spread(rates)
         print(f"{name:<12}  {n:>3}  {mx/1e9:>10.4f}  {mn/1e9:>10.4f}  {ratio:>7.4f}")
         ratios.append(ratio)
