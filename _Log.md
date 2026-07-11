@@ -45637,3 +45637,10 @@ top.
   added 3 regression tests.
 - **File(s)**: test/incus/step2-sched-switch-reduce.py,
   test/incus/step2-sched-switch-reduce_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-092 — reducer stamps block_span_ns; classifier computes
+  duty-cycle over the actual summed window (fallback 60s for legacy JSONL)
+  instead of a fixed 60s. Added window tests + diag window_ns.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-classify.py,
+  test/incus/step2-sched-switch-classify_test.py

@@ -530,6 +530,12 @@ def reduce_events(
             "voluntary_3to6": vol,
             "involuntary_3to6": invol,
             "stat_runtime_check": stat_runtime_check,
+            # C175-HC-092: stamp the actual span of this block so the
+            # classifier computes duty-cycle against the real capture
+            # window (sum of block spans) instead of a hard-coded 60 s.
+            # Blocks may legitimately be [1, 30] s (see load_boundaries_ns),
+            # so 12 blocks can span far more or less than 60 s.
+            "block_span_ns": block_duration_ns,
         }
         # HIGH-2: stamp every emitted line with the drift-halt sentinel
         # so the classifier can emit SUSPECT without a separate marker.

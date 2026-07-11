@@ -287,7 +287,22 @@ def main(argv: list[str] | None = None) -> int:
 
     rho, pvalue = spearman_rho(T_D1, [float(x) for x in off_times])
 
-    duty_cycle_pct = 100.0 * sum(off_times) / NOMINAL_WINDOW_NS
+    # C175-HC-092: divide off-CPU time by the ACTUAL capture window, not a
+    # fixed 60 s. The reducer accepts [1, 30] s snapshot blocks, so 12
+    # blocks can span 12-360 s; dividing by a hard-coded 60 s flipped the
+    # IN/OUT duty verdict purely on collection cadence. When every block
+    # carries `block_span_ns` (current reducer output) sum them for the
+    # true window; fall back to the 60 s nominal only for legacy JSONL
+    # that predates the field.
+    block_spans = [b.get("block_span_ns") for b in off_cpu_blocks]
+    if off_cpu_blocks and all(
+        isinstance(s, (int, float)) and s > 0 for s in block_spans
+    ):
+        window_ns = float(sum(block_spans))
+    else:
+        window_ns = float(NOMINAL_WINDOW_NS)
+
+    duty_cycle_pct = 100.0 * sum(off_times) / window_ns
 
     verdict, reason = verdict_from(rho, duty_cycle_pct, suspect_reason)
 
@@ -348,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         "duty_in_pct": DUTY_IN_PCT,
         "duty_out_pct": DUTY_OUT_PCT,
         "nominal_window_ns": NOMINAL_WINDOW_NS,
+        "window_ns": window_ns,
     }
     # Sibling files: <report>.md -> <report>.meta.json + <report>.diag.json.
     meta_path = args.out.parent / (args.out.stem + ".meta.json")

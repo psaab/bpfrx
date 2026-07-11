@@ -74,11 +74,14 @@ def _off_cpu_blocks(
     off_times: list[int],
     stat: list[str] | None = None,
     vol_of: float = 0.5,
+    block_span_ns: int | None = None,
 ) -> list[dict]:
     """Synthesize 12 off-cpu reducer dicts.
 
     `stat[b]` is "PASS" or "WARN"; defaults to all PASS.  The off time
     is placed entirely in bucket 3 (so the reducer invariant holds).
+    When `block_span_ns` is given each block carries it (C175-HC-092
+    real-window duty); otherwise the field is omitted (legacy JSONL).
     """
     assert len(off_times) == 12
     if stat is None:
@@ -89,16 +92,17 @@ def _off_cpu_blocks(
         buckets[3] = t
         vol = int(t * vol_of)
         invol = t - vol
-        out.append(
-            {
-                "b": b,
-                "buckets": buckets,
-                "off_cpu_time_3to6": t,
-                "voluntary_3to6": vol,
-                "involuntary_3to6": invol,
-                "stat_runtime_check": stat[b],
-            }
-        )
+        blk = {
+            "b": b,
+            "buckets": buckets,
+            "off_cpu_time_3to6": t,
+            "voluntary_3to6": vol,
+            "involuntary_3to6": invol,
+            "stat_runtime_check": stat[b],
+        }
+        if block_span_ns is not None:
+            blk["block_span_ns"] = block_span_ns
+        out.append(blk)
     return out
 
 
@@ -221,6 +225,37 @@ class TestClassifyVerdicts(unittest.TestCase):
         self.assertGreater(rho, 0.3)
         self.assertLess(rho, 0.8)
         self.assertEqual(meta["verdict"], "INCONCLUSIVE")
+
+
+class TestClassifyDutyWindow(unittest.TestCase):
+    """C175-HC-092: duty-cycle uses the actual capture window."""
+
+    def test_duty_uses_summed_block_span_not_fixed_60s(self):
+        # Total off-CPU = 0.6 s. Blocks are 7 s each -> 84 s window ->
+        # duty = 0.6 / 84 = 0.714 %.  Against the old fixed 60 s
+        # denominator it would read 0.6 / 60 = 1.0 %.  The two land on
+        # opposite sides of the 1.0 % IN/OUT threshold, so the real
+        # window MUST be used.
+        off_times = [50_000_000 for _ in range(12)]  # 12 * 50 ms = 0.6 s
+        shape_vals = [float(b + 1) for b in range(12)]
+        hist = _hist_blocks_with_shape3to6(shape_vals)
+        off = _off_cpu_blocks(off_times, block_span_ns=7_000_000_000)
+        rc, meta, diag = _run_classifier_with_diag(hist, off)
+        self.assertEqual(rc, 0)
+        # 84 s window -> ~0.714 %, NOT the 1.0 % a fixed 60 s would give.
+        self.assertAlmostEqual(meta["duty_cycle_pct"], 100.0 * 0.6 / 84.0, places=4)
+        self.assertLess(meta["duty_cycle_pct"], 1.0)
+        self.assertEqual(diag["window_ns"], 84_000_000_000)
+
+    def test_missing_block_span_falls_back_to_nominal_60s(self):
+        # Legacy JSONL without block_span_ns keeps the 60 s nominal window.
+        off_times = [50_000_000 for _ in range(12)]  # 0.6 s
+        shape_vals = [float(b + 1) for b in range(12)]
+        hist = _hist_blocks_with_shape3to6(shape_vals)
+        off = _off_cpu_blocks(off_times)  # no block_span_ns
+        rc, meta = _run_classifier(hist, off)
+        self.assertEqual(rc, 0)
+        self.assertAlmostEqual(meta["duty_cycle_pct"], 100.0 * 0.6 / 60.0, places=4)
 
 
 class TestClassifyMetaSchema(unittest.TestCase):
