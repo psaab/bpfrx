@@ -64,13 +64,20 @@ Regression coverage: `pkg/config/parser_recursion_dos_hb164_test.go`,
   `setSchema` typed-leaf gate cannot express. The firewall-filter
   `from tcp-flags` enforceability check rejects an expression the
   conjunctive dataplane matcher cannot represent — disjunction (`|`), a
-  negated group (`!(...)`), an unknown flag, a dangling negation, or a
-  contradictory required/forbidden pair (#3076/#4714) — via
-  `ParseTCPFlagsExpression` (`tcp_flags.go`). Before this gate such an
-  expression committed cleanly and the constraint was silently dropped on
-  the wire (the term matched regardless of flags — a fail-open hole); a
-  representable expression such as `syn & !ack` is parsed into
-  required-bits + forbidden-bits masks and carried to the dataplane.
+  negated group (`!(...)`), an unknown flag, a dangling negation, a
+  contradictory required/forbidden pair (#3076/#4714), or an
+  operator-only / empty-operand / dangling-`&` expression that sets no
+  flag bits (`"&"`, `"()"`, a leading/trailing/duplicated `&` such as
+  `"syn &"` or `"syn && ack"`, #5455) — via `ParseTCPFlagsExpression`
+  (`tcp_flags.go`). A NON-EMPTY value that parses to no flag bits (or that
+  silently drops a dangling `&`) is distinct from a legitimately-ABSENT
+  value (empty / whitespace, which stays `ok=false` with no error, i.e.
+  "no tcp-flags constraint"): the former must ERROR, the latter must not.
+  Before this gate such an expression committed cleanly and the constraint
+  was silently dropped on the wire (the term matched regardless of flags —
+  a fail-open hole); a representable expression such as `syn & !ack` is
+  parsed into required-bits + forbidden-bits masks and carried to the
+  dataplane.
   **#4953:** this reject (and the class-of-service numeric DSCP/PCP
   code-point range reject #2447) moved OUT of the section compilers
   (`compileFirewall` / `compileClassOfService`, which the P4 dispatch
