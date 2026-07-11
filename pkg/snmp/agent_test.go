@@ -3,6 +3,7 @@ package snmp
 import (
 	"crypto/md5"
 	"crypto/sha1"
+	"path/filepath"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -642,16 +643,20 @@ func TestV3UserDisplay(t *testing.T) {
 }
 
 func TestEngineIDGeneration(t *testing.T) {
-	a := NewAgent(&config.SNMPConfig{})
+	// #5283: the EngineID is now always the 32-octet hashed form
+	// prefix(5) || 0x05 || sha256(deviceID || 0x00 || hostname)[:26]. Use a
+	// tempdir persistence path so the test does not touch /var/lib/xpf.
+	a := newAgentWithEngineIDPath(t, &config.SNMPConfig{}, filepath.Join(t.TempDir(), "dev"))
 	if a.engineID == nil {
 		t.Fatal("engineID is nil")
 	}
-	if len(a.engineID) < 6 {
-		t.Errorf("engineID too short: %d bytes", len(a.engineID))
+	if len(a.engineID) != snmpEngineIDMaxLen {
+		t.Errorf("engineID length = %d, want %d", len(a.engineID), snmpEngineIDMaxLen)
 	}
-	// First 5 bytes should be fixed prefix, 6th byte should be 0x04 (text format).
-	if a.engineID[5] != 0x04 {
-		t.Errorf("engineID format byte = %d, want 4", a.engineID[5])
+	// First 5 bytes are the fixed enterprise prefix; the 6th byte is the octets
+	// format selector 0x05 (the binary SHA-256 payload).
+	if a.engineID[5] != engineIDFormatOctets {
+		t.Errorf("engineID format byte = %d, want %d (octets)", a.engineID[5], engineIDFormatOctets)
 	}
 }
 

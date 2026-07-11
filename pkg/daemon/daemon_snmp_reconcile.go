@@ -363,7 +363,7 @@ func (d *Daemon) reconcileSNMP(cfg *config.Config) bool {
 // recorded "applied", no-oping every subsequent identical commit.
 func (d *Daemon) startSNMPLocked(cfg *config.Config) error {
 	ctx, cancel := context.WithCancel(d.daemonCtx)
-	agent := snmp.NewAgentWithBootsPath(cfg.System.SNMP, d.snmpBootsPath)
+	agent := snmp.NewAgentWithPaths(cfg.System.SNMP, d.snmpBootsPath, d.snmpEngineIDPath)
 	agent.SetIfDataFn(buildSNMPIfData)
 
 	// The serve seam binds UDP/161 and then serves for the lifetime of ctx. It

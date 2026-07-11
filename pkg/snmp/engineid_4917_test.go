@@ -7,109 +7,87 @@ import (
 	"testing"
 )
 
-// TestBuildEngineID_GoldenShortHost pins the EXACT byte sequence a short
-// (<=26 octet) hostname must produce: the historical text form
-// prefix(5) || 0x04 || hostname. This is the #4917 migration guard — it goes
-// RED if the short path is ever changed, because changing it would invalidate
-// every already-localized USM key and manager cache on deployed appliances.
-func TestBuildEngineID_GoldenShortHost(t *testing.T) {
-	const host = "fw1.example.net" // 15 octets, well under the 26-octet cap
-	want := []byte{
-		0x80, 0x00, 0x01, 0x86, 0xa3, // enterprise prefix
-		0x04, // format: administratively assigned text
-		'f', 'w', '1', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'n', 'e', 't',
-	}
-	got := buildEngineID(host)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("buildEngineID(%q) = % x, want % x", host, got, want)
-	}
-	if len(got) < 5 || len(got) > snmpEngineIDMaxLen {
-		t.Fatalf("golden EngineID length %d out of RFC 3411 range 5..32", len(got))
-	}
+// #4917/#5264 are the RFC 3411 length-cap guards. #5283 changed the EngineID
+// construction to fold a per-device component into a mandatory SHA-256 hash, so
+// the historical short-hostname TEXT form no longer exists (every EngineID is
+// now the 32-octet hashed form). These tests keep the length-cap RED-on-revert
+// intent: whatever the construction, the result must stay within 5..32 octets
+// for ALL hostnames, empty or multi-kilobyte.
+
+// engineHash mirrors buildEngineID's payload for assertions:
+// prefix(5) || 0x05 || sha256(deviceID || 0x00 || hostname)[:26].
+func engineHash(deviceID []byte, hostname string) []byte {
+	h := sha256.New()
+	h.Write(deviceID)
+	h.Write([]byte{0x00})
+	h.Write([]byte(hostname))
+	sum := h.Sum(nil)
+	want := append(append([]byte{}, engineIDPrefix...), engineIDFormatOctets)
+	return append(want, sum[:snmpEngineIDMaxLen-6]...)
 }
 
-// TestBuildEngineID_Boundary26 verifies the largest hostname that still fits
-// the text form: 26 octets -> header(6) + 26 = 32 octets, still 0x04 text form.
-func TestBuildEngineID_Boundary26(t *testing.T) {
-	host := strings.Repeat("a", 26)
-	got := buildEngineID(host)
+// TestBuildEngineID_AlwaysHashed32 verifies the new (#5283) construction: every
+// EngineID is exactly 32 octets — prefix(5) || 0x05 || sha256(...)[:26] — for a
+// short hostname, so the length cap holds and the format octet honestly labels
+// the binary digest.
+func TestBuildEngineID_AlwaysHashed32(t *testing.T) {
+	const host = "fw1.example.net" // 15 octets, would have been the text form pre-#5283
+	dev := []byte{0xaa, 0xbb, 0xcc, 0xdd}
+	got := buildEngineID(host, dev)
 	if len(got) != snmpEngineIDMaxLen {
-		t.Fatalf("26-octet hostname: EngineID length %d, want %d", len(got), snmpEngineIDMaxLen)
+		t.Fatalf("EngineID length %d, want exactly %d", len(got), snmpEngineIDMaxLen)
 	}
-	if got[5] != engineIDFormatText {
-		t.Fatalf("26-octet hostname: format octet 0x%02x, want text 0x%02x", got[5], engineIDFormatText)
+	if !bytes.Equal(got[:5], engineIDPrefix) {
+		t.Fatalf("prefix % x, want % x", got[:5], engineIDPrefix)
 	}
-	// Still the plain-text form: prefix || 0x04 || hostname.
-	want := append(append(append([]byte{}, engineIDPrefix...), engineIDFormatText), []byte(host)...)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("26-octet hostname: EngineID % x, want text form % x", got, want)
+	if got[5] != engineIDFormatOctets {
+		t.Fatalf("format octet 0x%02x, want octets 0x%02x", got[5], engineIDFormatOctets)
+	}
+	if !bytes.Equal(got, engineHash(dev, host)) {
+		t.Fatalf("EngineID % x != expected hashed form % x", got, engineHash(dev, host))
 	}
 }
 
-// TestBuildEngineID_HashedLongHosts covers every >26-octet case. These
-// assertions go RED if buildEngineID is reverted to the unbounded
-// `prefix(6) || hostname` append: a 27-octet hostname then yields 33 octets and
-// the len <= 32 check below fails; a 64-octet hostname yields 70 octets, etc.
-func TestBuildEngineID_HashedLongHosts(t *testing.T) {
-	for _, n := range []int{27, 64, 300, 4096} {
+// TestBuildEngineID_LengthCapAllHosts covers empty, boundary, and long
+// hostnames. This is the #4917/#5264 RED-on-revert assertion: reverting to the
+// unbounded `prefix || hostname` append makes a 300/4096-octet hostname exceed
+// 32 octets and fail the len check.
+func TestBuildEngineID_LengthCapAllHosts(t *testing.T) {
+	dev := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}
+	for _, n := range []int{0, 1, 15, 26, 27, 64, 300, 4096} {
 		host := strings.Repeat("h", n)
-		got := buildEngineID(host)
-
-		// RFC 3411 bound: 5..32 octets. len > 32 is exactly the #4917 bug and
-		// is the RED-on-revert assertion.
+		got := buildEngineID(host, dev)
 		if len(got) < 5 || len(got) > snmpEngineIDMaxLen {
-			t.Fatalf("hostname len %d: EngineID length %d out of RFC 3411 range 5..32 (revert regression)", n, len(got))
+			t.Fatalf("hostname len %d: EngineID length %d out of RFC 3411 range 5..32", n, len(got))
 		}
 		if len(got) != snmpEngineIDMaxLen {
 			t.Fatalf("hostname len %d: hashed EngineID length %d, want exactly %d", n, len(got), snmpEngineIDMaxLen)
 		}
-		// Hashed form: prefix || 0x05 (octets) || sha256(hostname)[:26].
-		if !bytes.Equal(got[:5], engineIDPrefix) {
-			t.Fatalf("hostname len %d: prefix % x, want % x", n, got[:5], engineIDPrefix)
-		}
-		if got[5] != engineIDFormatOctets {
-			t.Fatalf("hostname len %d: format octet 0x%02x, want octets 0x%02x", n, got[5], engineIDFormatOctets)
-		}
-		sum := sha256.Sum256([]byte(host))
-		if !bytes.Equal(got[6:], sum[:snmpEngineIDMaxLen-6]) {
-			t.Fatalf("hostname len %d: payload is not sha256(hostname)[:26]", n)
-		}
 	}
 }
 
-// TestBuildEngineID_EmptyAndShortBounds verifies the lower bound holds for the
-// empty and single-octet hostnames (>= 5 octets, still text form).
-func TestBuildEngineID_EmptyAndShortBounds(t *testing.T) {
-	for _, host := range []string{"", "x"} {
-		got := buildEngineID(host)
-		if len(got) < 5 || len(got) > snmpEngineIDMaxLen {
-			t.Fatalf("hostname %q: EngineID length %d out of RFC 3411 range 5..32", host, len(got))
-		}
-		if got[5] != engineIDFormatText {
-			t.Fatalf("hostname %q: format octet 0x%02x, want text 0x%02x", host, got[5], engineIDFormatText)
-		}
-	}
-}
-
-// TestBuildEngineID_LongHostUniqueness verifies two distinct long hostnames
-// produce distinct EngineIDs (SHA-256 collision resistance), so different
-// appliances that both exceed the cap are not aliased to one identity.
-func TestBuildEngineID_LongHostUniqueness(t *testing.T) {
-	a := buildEngineID(strings.Repeat("a", 40) + "-node-alpha")
-	b := buildEngineID(strings.Repeat("a", 40) + "-node-bravo")
+// TestBuildEngineID_HostnameUniqueness verifies two distinct hostnames with the
+// SAME device component produce distinct EngineIDs (SHA-256 collision
+// resistance).
+func TestBuildEngineID_HostnameUniqueness(t *testing.T) {
+	dev := []byte{0x11, 0x22, 0x33}
+	a := buildEngineID("node-alpha.example.net", dev)
+	b := buildEngineID("node-bravo.example.net", dev)
 	if bytes.Equal(a, b) {
-		t.Fatal("distinct long hostnames produced identical EngineIDs")
+		t.Fatal("distinct hostnames produced identical EngineIDs")
 	}
 }
 
-// TestBuildEngineID_Deterministic verifies the same long hostname yields the
-// same EngineID on every call (stable across restarts: no randomness, no
-// timestamp).
+// TestBuildEngineID_Deterministic verifies a fixed (hostname, deviceID) pair
+// yields the same EngineID on every call (stable across restarts: no
+// randomness, no timestamp at build time — randomness lives in the persisted
+// deviceID).
 func TestBuildEngineID_Deterministic(t *testing.T) {
 	host := strings.Repeat("determinism-check.", 20) // ~360 octets
-	first := buildEngineID(host)
-	second := buildEngineID(host)
+	dev := []byte{0xde, 0xad, 0xbe, 0xef}
+	first := buildEngineID(host, dev)
+	second := buildEngineID(host, dev)
 	if !bytes.Equal(first, second) {
-		t.Fatal("buildEngineID is not deterministic for a fixed hostname")
+		t.Fatal("buildEngineID is not deterministic for a fixed (hostname, deviceID)")
 	}
 }

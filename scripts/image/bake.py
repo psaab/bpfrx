@@ -639,8 +639,16 @@ def main():
         run(["virt-sysprep", "-a", work_qcow, "--quiet", "--enable",
              "machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,"
              "package-manager-cache,backup-files,passwd-backups,utmp",
+             # #5283: strip the persisted per-device SNMPv3 EngineID component
+             # (and the engineBoots counter) so the golden image never ships an
+             # identical per-device identity across clones. Like /etc/machine-id
+             # (reset by the enabled virt-sysprep machine-id op above), each
+             # appliance regenerates a fresh EngineID component on first boot;
+             # otherwise every clone would derive byte-identical localized USM
+             # keys and accept each other's authenticated SNMPv3 requests.
              "--run-command", "rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf "
              "/etc/xpf/.day0-config-applied /etc/xpf/.root-grown "
+             "/var/lib/xpf/snmp-engine-id /var/lib/xpf/snmp-engineboots "
              "/var/lib/systemd/random-seed "
              "/var/lib/apt/lists/* 2>/dev/null || true"])
 

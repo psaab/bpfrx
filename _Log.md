@@ -1,3 +1,34 @@
+## 2026-07-10 — #5283 SNMPv3 EngineID per-device uniqueness (cross-clone USM auth-bypass fix)
+- **Timestamp**: 2026-07-10 (fix/5283-snmp-engineid-unique)
+- **Action**: Fix #5283 cross-device USM auth bypass. buildEngineID/initEngine
+  derived the ENTIRE SNMPv3 EngineID from a fixed prefix + os.Hostname() with NO
+  per-device component, so two same-hostname CLONES (HA pair, factory default,
+  lab image, config restore) derived byte-identical EngineIDs → byte-identical
+  localized USM keys (USM localizes auth/priv keys against the EngineID) → an
+  authenticated SNMPv3 GET captured from firewall A was ACCEPTED by firewall B
+  (#4917/#5264 only capped the LENGTH, not uniqueness). Now buildEngineID folds a
+  per-device unique component into a mandatory 32-octet hash:
+  `prefix(5) || 0x05 || sha256(deviceID || 0x00 || hostname)[:26]`. deviceID =
+  a 16-byte crypto/rand value persisted ONCE at /var/lib/xpf/snmp-engine-id (hex,
+  0600, atomic; stable across reboots, unique per appliance) COMBINED with
+  /etc/machine-id (virt-sysprep resets it per-appliance at bake) as defense in
+  depth, so a clone must defeat BOTH to collide. All-sources-failed degrades to
+  hostname-only with a slog.Warn. Length cap (5..32) preserved for every input.
+  New NewAgentWithPaths(cfg, bootsPath, engineIDPath) seam; daemon passes
+  d.snmpEngineIDPath. bake.py virt-sysprep now strips snmp-engine-id +
+  snmp-engineboots so the golden image never ships an identical per-device
+  identity. Transition: EngineID changes ONCE on upgrade (hostname→device-unique);
+  managers re-discover (one-time, acceptable for a security fix); engineBoots
+  monotonicity unaffected (keyed by its own file). RED-on-revert proven: reverting
+  buildEngineID to hostname-only makes TestEngineID_CloneUniqueness +
+  TestEngineID_USMKeysDivergeAcrossClones collide (identical EngineID + identical
+  localized auth keys). Replay-window destination-IP binding noted as
+  out-of-scope defense-in-depth follow-up. Full pkg/snmp + pkg/daemon suites green.
+- **File(s)**: pkg/snmp/agent.go, pkg/snmp/engineid_5283_test.go,
+  pkg/snmp/engineid_4917_test.go, pkg/snmp/agent_test.go, pkg/snmp/README.md,
+  pkg/daemon/daemon.go, pkg/daemon/daemon_snmp_reconcile.go,
+  pkg/daemon/daemon_snmp_reconcile_test.go, scripts/image/bake.py, _Log.md
+
 ## 2026-07-10 — pkg/api,pkg/routing: render reject route disposition (#5410)
 
 - **Timestamp**: 2026-07-10 (fix/5410-reject-route-display)
