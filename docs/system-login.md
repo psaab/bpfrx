@@ -491,6 +491,16 @@ The path is scoped and fail-closed:
 - A marker whose UID no longer matches the live account (deleted +
   recreated out of band with a different UID) is treated as **not ours**:
   the account is left intact and only the stale marker is cleaned.
+- On a `/etc/passwd` **read** error the marker is **retained** and the
+  deprovision is skipped, so the next apply retries (#5493). A transient
+  mount/permission/I/O failure reading the identity database is
+  **unknown**, not proof the account is gone — only a *readable* passwd
+  that does **not** contain the name is the genuine out-of-band `userdel`
+  that legitimately drops the marker. Distinguishing the two is what keeps
+  a read hiccup from permanently abandoning a removed user's still-live
+  password and keys: once passwd is readable again the marker would be
+  gone, so the account would never be enumerated (or revoked) again. This
+  mirrors the `/etc/shadow` fail-closed rule below.
 - On a `/etc/shadow` read error, a `chpasswd` failure, or an
   `authorized_keys` removal failure, the marker is **retained** so the
   next apply retries — a credential is never forgotten while it may still
