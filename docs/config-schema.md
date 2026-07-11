@@ -1434,12 +1434,35 @@ The single parse authority is now `parseCanonicalPort`
 decimal digits and is used by every commit-time port-spec parser —
 `validatePortSpec` (application `source-port` / `destination-port`),
 `resolveSinglePort` (firewall-filter port leaves), `parseDNATPortList` (NAT
-`match destination-port`), and `validateDNATPoolStrict` (destination-NAT pool
-`port`). The Rust `parse_port_spec` was tightened in lock-step (`parse_port_u16`
-rejects the sign) so all three parsers agree. Fail-on-revert:
+`match destination-port`), `validateDNATPoolStrict` (destination-NAT pool
+`port`), and — since #5457 — `parseSourcePoolPortRange` (source-NAT pool `port
+[range]`). The Rust `parse_port_spec` was tightened in lock-step
+(`parse_port_u16` rejects the sign) so all three parsers agree. Fail-on-revert:
 `TestSignedPortRejectedAtCommit_3606` / `TestParseCanonicalPort_3606`
 (`pkg/config/compiler_signed_port_3606_test.go`) and
 `parse_port_spec_rejects_signed_3606` (`userspace-dp/src/policy_tests.rs`).
+
+**Source-NAT pool `port [range]` fail-closed (#5457).** Before #5457 the
+source-pool port endpoints were parsed with `strconv.Atoi` and returned
+`ok=true` with no value-range or order check, so `port range low -1 high 99999`
+became `(-1, 99999)` and `low 5000 high 100` became the inverted `(5000, 100)`.
+A non-zero out-of-range/reversed value was still caught downstream (the strict
+gate `validateSourceNATPoolStrict` and the snapshot builder both read the
+STAMPED value), but a `0`-valued endpoint slipped through the parser as the
+"unconfigured" sentinel and silently widened to the default `1024-65535` PAT
+range. `parseSourcePoolPortRange` now validates each endpoint via
+`ParseCanonicalUint` + `1..65535` + non-decreasing order and FAILS CLOSED
+(`ok=false`) on any violation, so the bad value is never stamped into
+`PortLow`/`PortHigh`. The "configured-but-invalid" fact is preserved in
+`NATPool.PortRangeInvalidSpec`, which `validateSourceNATPoolStrict` hard-rejects
+at commit (downgraded to a warning on the tolerant load / peer-sync path) and
+which the snapshot builder (`sourceNATPoolPortRange`) reads to mark the pool
+UNUSABLE — the leniently-loaded bad range installs nothing rather than
+PAT-translating over a range the operator did not configure. Fail-on-revert:
+`TestParseSourcePoolPortRange_5457` / `TestSourceNATPoolPortRangeFailClosed_5457`
+(`pkg/config/compiler_nat_source_pool_port_5457_test.go`) and
+`TestSourceNATSnapshotInvalidPortRangeUnusable_5457`
+(`pkg/dataplane/userspace/nat_source_pool_port_5457_test.go`).
 
 The `system domain-search` and `system name-server` readers
 (`compileSystem`, `compiler_system.go`) are also contract-compliant via

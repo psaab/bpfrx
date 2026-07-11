@@ -186,17 +186,38 @@ func compileNAT64(node *Node, sec *SecurityConfig) error {
 //     this shape was accepted, so the Junos `port range <low> to <high>` was
 //     silently dropped and the pool defaulted to 1024-65535 PAT.
 //
-// A reversed (low > high) or out-of-range value parses successfully here (it is
-// carried into PortLow/PortHigh); the strict commit gate
-// (validateSourceNATPoolStrict) hard-rejects it so the operator sees the error
-// rather than the rule dropping at runtime. ok is false only when no numeric low
-// could be read (garbage tokens), leaving PortLow/PortHigh at their default.
+// Every endpoint is validated as a CANONICAL port in 1..65535 via
+// ParseCanonicalUint (which rejects a leading sign, surrounding whitespace, a
+// non-numeric token, and int overflow — the same primitive the DNAT and appid
+// port parsers use) and the range must be non-decreasing (low <= high). ok is
+// FALSE on ANY violation — a non-numeric / non-canonical token, an endpoint
+// outside 1..65535 (0 included), or a reversed range — so the malformed value
+// is NEVER stamped into PortLow/PortHigh (#5457). The caller records the raw
+// offending spec in PortRangeInvalidSpec so the strict commit gate
+// (validateSourceNATPoolStrict) hard-rejects it (operator-visible) AND the
+// snapshot builder marks the pool unusable on the tolerant load / peer-sync
+// path, rather than silently defaulting a bad range to 1024-65535 PAT.
+//
+// Before #5457 the endpoints were read with strconv.Atoi and returned ok=true
+// even for a negative low ("port range low -1 high 99999" -> (-1, 99999, true))
+// or a reversed range ("low 5000 high 100" -> (5000, 100, true)). Only the
+// downstream strict gate caught the non-zero cases (the stamped bad value), and
+// a 0-valued endpoint slipped through the parser as the "unconfigured" sentinel
+// and silently widened to the default PAT range.
 func parseSourcePoolPortRange(toks []string) (low, high int, ok bool) {
+	// parsePort validates a single token as a canonical port in 1..65535.
+	parsePort := func(s string) (int, bool) {
+		n, err := ParseCanonicalUint(s)
+		if err != nil || n < 1 || n > 65535 {
+			return 0, false
+		}
+		return n, true
+	}
 	// Legacy explicit-keyword shape: low <lo> high <hi>.
 	if len(toks) >= 4 && toks[0] == "low" && toks[2] == "high" {
-		lo, err1 := strconv.Atoi(toks[1])
-		hi, err2 := strconv.Atoi(toks[3])
-		if err1 != nil || err2 != nil {
+		lo, ok1 := parsePort(toks[1])
+		hi, ok2 := parsePort(toks[3])
+		if !ok1 || !ok2 || lo > hi {
 			return 0, 0, false
 		}
 		return lo, hi, true
@@ -205,17 +226,20 @@ func parseSourcePoolPortRange(toks []string) (low, high int, ok bool) {
 	if len(toks) == 0 {
 		return 0, 0, false
 	}
-	lo, err := strconv.Atoi(toks[0])
-	if err != nil {
+	lo, ok1 := parsePort(toks[0])
+	if !ok1 {
 		return 0, 0, false
 	}
 	hi := lo
 	if len(toks) >= 3 && toks[1] == "to" {
-		v, err2 := strconv.Atoi(toks[2])
-		if err2 != nil {
+		v, ok2 := parsePort(toks[2])
+		if !ok2 {
 			return 0, 0, false
 		}
 		hi = v
+	}
+	if lo > hi {
+		return 0, 0, false
 	}
 	return lo, hi, true
 }
@@ -324,24 +348,36 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 					return pool.Deterministic
 				}
 
+				// setPortRange stamps a validated [lo,hi] source-port range onto
+				// the pool. A malformed range (parseSourcePoolPortRange ok=false:
+				// a non-canonical token, an endpoint outside 1..65535 including 0,
+				// or a reversed low>high) is NEVER stamped — it records the raw
+				// spec in PortRangeInvalidSpec so the strict commit gate
+				// hard-rejects (operator-visible) and the snapshot builder marks
+				// the pool unusable on the tolerant load / peer-sync path, rather
+				// than silently defaulting the bad range to 1024-65535 PAT (#5457).
+				setPortRange := func(toks []string) {
+					if lo, hi, ok := parseSourcePoolPortRange(toks); ok {
+						pool.PortLow = lo
+						pool.PortHigh = hi
+					} else {
+						pool.PortRangeInvalidSpec = strings.Join(toks, " ")
+					}
+				}
+
 				// Port range / single value — flat leaf shapes
 				// (Keys=["port","range",...]/["port",N]/["port",
 				// "no-translation"]). #3906: `range` accepts both the Junos
 				// wire shape `<low> to <high>` and the legacy `low <lo> high
 				// <hi>` shape; `no-translation` preserves the source port.
 				if len(prop.Keys) >= 3 && prop.Keys[1] == "range" {
-					if lo, hi, ok := parseSourcePoolPortRange(prop.Keys[2:]); ok {
-						pool.PortLow = lo
-						pool.PortHigh = hi
-					}
+					setPortRange(prop.Keys[2:])
 				} else if len(prop.Keys) == 2 && prop.Keys[1] != "range" &&
 					prop.Keys[1] != "deterministic" &&
 					prop.Keys[1] != "no-translation" {
-					// "port N" single value.
-					if n, err := strconv.Atoi(prop.Keys[1]); err == nil {
-						pool.PortLow = n
-						pool.PortHigh = n
-					}
+					// "port N" single value — validated as a 1..65535 port via the
+					// shared parser (a single token is the [N,N] range shape).
+					setPortRange(prop.Keys[1:])
 				}
 				// no-translation may ride along on the flat-leaf keys
 				// (Keys=["port","no-translation"]).
@@ -363,22 +399,17 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						// range <low> to <high> | range low <lo> high <hi>
 						// (#3906). pc.Keys[1:] is the token slice after the
 						// `range` keyword.
-						if lo, hi, ok := parseSourcePoolPortRange(pc.Keys[1:]); ok {
-							pool.PortLow = lo
-							pool.PortHigh = hi
-						}
+						setPortRange(pc.Keys[1:])
 					case "no-translation":
 						pool.PortNoTranslation = true
 					case "deterministic":
 						applyDeterministicChildren(ensureDet(), pc)
 					default:
 						// Bare numeric child: `port N` grouped under a
-						// modeled container becomes port { N }.
+						// modeled container becomes port { N }. Validated as a
+						// 1..65535 port via the shared parser.
 						if pc.IsLeaf && len(pc.Keys) == 1 {
-							if n, err := strconv.Atoi(pc.Keys[0]); err == nil {
-								pool.PortLow = n
-								pool.PortHigh = n
-							}
+							setPortRange(pc.Keys)
 						}
 					}
 				}
