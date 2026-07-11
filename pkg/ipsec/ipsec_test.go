@@ -1170,7 +1170,7 @@ func TestGenerateConfig_JunosObfuscatedPSK(t *testing.T) {
 			"tun": {Gateway: "10.0.0.1", PSK: "$9$SpRrMLYgaZDirexdwgUDzFn9uO1RhlKW"},
 		},
 	}
-	got, err := m.renderConfig(cfg)
+	got, _, err := m.renderConfig(cfg)
 	if err != nil {
 		t.Fatalf("renderConfig() error = %v", err)
 	}
@@ -1644,7 +1644,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "corp-gw", PSK: "k"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}
@@ -1668,7 +1668,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "typo-gw", PSK: "k"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v (skip should not error)", err)
 		}
@@ -1693,7 +1693,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "bare-gw", PSK: "k"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}
@@ -1711,7 +1711,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "vpnpeer", PSK: "k"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}
@@ -1726,7 +1726,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "198.51.100.9", PSK: "k"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}
@@ -1741,7 +1741,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "peer.example.com", PSK: "k"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}
@@ -1756,7 +1756,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"tun": {Gateway: "", PSK: "k", BindInterface: "st0.0"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}
@@ -1782,7 +1782,7 @@ func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
 				"bad":  {Gateway: "missing-gw", PSK: "k2"},
 			},
 		}
-		got, err := m.renderConfig(cfg)
+		got, _, err := m.renderConfig(cfg)
 		if err != nil {
 			t.Fatalf("renderConfig() error = %v", err)
 		}

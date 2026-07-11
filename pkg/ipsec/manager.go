@@ -95,20 +95,35 @@ func NewWithConfigDir(dir string) *Manager {
 
 // Apply generates swanctl config and reloads strongSwan.
 //
-// swanctl --load-all only UNLOADS the config of a connection the operator
-// deleted; it does NOT terminate that connection's already-established
-// IKE/child SAs, so a removed VPN keeps forwarding until rekey/lifetime
-// expiry (#3941). Apply therefore diffs the previous applied connection set
-// against the new one and, after the reload has unloaded the removed
-// connections, actively terminates their live SAs (terminateRemovedConns).
+// swanctl --load-all only UNLOADS the config of a connection that is no
+// longer present in the rendered config; it does NOT terminate that
+// connection's already-established IKE/child SAs, so a dropped VPN keeps
+// forwarding until rekey/lifetime expiry (#3941). Apply therefore diffs the
+// previous LOADED connection set against the set renderConfig actually
+// emitted and, after the reload has unloaded the departed connections,
+// actively terminates their live SAs (terminateRemovedConns).
+//
+// The diff keys off the RENDERED set, not the raw VPN map keys (#5494). A VPN
+// that is still present in the config but became UNRENDERABLE on the tolerant
+// load / peer-sync path — an unresolvable gateway reference (#2074), a broken
+// ike-policy chain (#2270), or a `protocol ah` proposal with no ESP render
+// path (#4298) — is OMITTED from the render, so its connection is neither
+// loaded nor validated by swanctl. Continuing to forward under that
+// connection's now-unloaded (stale) selectors/credentials is a security
+// fail-open, so such a VPN is treated as a removal and its child SA is torn
+// down. This is the fail-closed invariant: after a SUCCESSFUL apply, every
+// forwarding child SA must correspond to a connection that was actually
+// rendered and loaded, or be actively terminated.
 func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
-	newNames := vpnConnNameSet(ipsecCfg)
-
+	// loadedNames is the set of connections swanctl actually loaded on this
+	// apply. For the render path it is renderConfig's exact emitted set; for
+	// the empty-config clear path nothing is loaded, so it stays nil.
+	var loadedNames map[string]bool
 	var applyErr error
 	if ipsecCfg == nil || len(ipsecCfg.VPNs) == 0 {
 		applyErr = m.clearConfig()
 	} else {
-		applyErr = m.applyConfig(ipsecCfg)
+		loadedNames, applyErr = m.applyConfig(ipsecCfg)
 	}
 
 	// #4898: state promotion and SA teardown are gated on reload SUCCESS. On a
@@ -118,18 +133,22 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 	// prevConnNames unchanged lets the next successful Apply/Clear recompute the
 	// diff and retry the teardown; advancing it here (the old ordering) would
 	// forget which connections are still loaded and disrupt a still-effective
-	// tunnel while reporting success.
+	// tunnel while reporting success. A render-side hard error (a non-skip
+	// failure, e.g. an unknown auth method) surfaces here the same way and
+	// tears nothing down.
 	if applyErr != nil {
 		return applyErr
 	}
 
-	// Reload succeeded: atomically advance prevConnNames to the applied set and
-	// tear down the live SAs of the connections the operator DELETED. Their
-	// config is now unloaded, so a straggler SA cannot be re-initiated from a
-	// still-loaded connection while we tear it down. Terminate is idempotent:
-	// a removed VPN with no active SA is a clean no-op (no --terminate is
-	// issued because it never shows up in --list-sas).
-	removed := m.promoteConnNames(newNames)
+	// Reload succeeded: atomically advance prevConnNames to the set that was
+	// actually loaded and tear down the live SAs of the connections that
+	// departed the loaded set — whether the operator DELETED them or they fell
+	// out of the render as unrenderable (#5494). Their config is now unloaded,
+	// so a straggler SA cannot be re-initiated from a still-loaded connection
+	// while we tear it down. Terminate is idempotent: a departed VPN with no
+	// active SA is a clean no-op (no --terminate is issued because it never
+	// shows up in --list-sas).
+	removed := m.promoteConnNames(loadedNames)
 	m.terminateRemovedConns(removed)
 	return nil
 }
@@ -149,31 +168,36 @@ func (m *Manager) Clear() error {
 }
 
 // applyConfig renders + atomically writes the swanctl snippet and reloads.
-func (m *Manager) applyConfig(ipsecCfg *config.IPsecConfig) error {
-	cfg, err := m.renderConfig(ipsecCfg)
+// On success it returns the exact set of connection names renderConfig
+// emitted into the loaded config (#5494) — the authoritative "what is loaded"
+// set Apply diffs against prevConnNames to decide which stale SAs to tear
+// down. On any error (render hard error, write failure, reload failure) it
+// returns a nil set so Apply's error path leaves prevConnNames untouched.
+func (m *Manager) applyConfig(ipsecCfg *config.IPsecConfig) (map[string]bool, error) {
+	cfg, rendered, err := m.renderConfig(ipsecCfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if err := os.MkdirAll(m.configDir, 0755); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
+		return nil, fmt.Errorf("create config dir: %w", err)
 	}
 
 	// AtomicGeneratedConfig (#1894): regenerated on every apply — a
 	// torn file must never reach the strongSwan parser, but fsync is
 	// deliberately skipped on this hot apply path.
 	if err := fsatomic.WriteFileAtomic(m.configPath, []byte(cfg), 0600); err != nil {
-		return fmt.Errorf("write config: %w", err)
+		return nil, fmt.Errorf("write config: %w", err)
 	}
 
 	slog.Info("swanctl config written", "path", m.configPath)
 
 	if err := m.reload(); err != nil {
 		slog.Warn("swanctl reload failed", "err", err)
-		return err
+		return nil, err
 	}
 
-	return nil
+	return rendered, nil
 }
 
 // clearConfig removes the xpf snippet and reloads strongSwan.
@@ -200,26 +224,18 @@ func (m *Manager) reload() error {
 	return nil
 }
 
-// vpnConnNameSet returns the set of swanctl connection names (sanitized VPN
-// names, matching what renderConfig writes and what swanctl reports in
-// --list-sas) for every VPN in ipsecCfg. A nil config / empty VPN map yields
-// an empty set.
-func vpnConnNameSet(ipsecCfg *config.IPsecConfig) map[string]bool {
-	if ipsecCfg == nil || len(ipsecCfg.VPNs) == 0 {
-		return nil
-	}
-	names := make(map[string]bool, len(ipsecCfg.VPNs))
-	for name := range ipsecCfg.VPNs {
-		names[sanitizeSwanctlValue(name)] = true
-	}
-	return names
-}
-
-// promoteConnNames records newNames as the current applied connection set and
-// returns the connections that were present before but are gone now — the
-// ones an operator DELETED. The diff keys off the VPN name (map key), not
-// renderability, so a VPN that merely became unrenderable (a broken gateway
-// reference) is NOT treated as removed and keeps its SAs.
+// promoteConnNames records newNames — the set of connections that were
+// actually RENDERED+LOADED on this apply — as the current loaded connection
+// set and returns the connections that were loaded before but are gone now.
+// A prior connection is "gone" if the operator DELETED its VPN OR the VPN is
+// still configured but dropped out of the render as unrenderable (#5494):
+// either way strongSwan is no longer enforcing that connection, so a live
+// child SA still forwarding under its stale selectors/credentials is a
+// fail-open and must be torn down. The diff keys off the RENDERED set, not
+// the raw VPN map keys, precisely so an unrenderable-but-still-configured VPN
+// is caught — the security-over-availability posture this project chose for
+// an IPsec appliance (an unrenderable VPN is already non-functional for
+// rekey/new-SA, so keeping its stale SA buys no real availability).
 //
 // #4898: this is called ONLY after a successful reload, so prevConnNames always
 // reflects the last config strongSwan actually loaded — never a config whose

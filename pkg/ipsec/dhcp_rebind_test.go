@@ -123,7 +123,7 @@ func TestPrepareConfigReResolvesDHCPLocalAddress(t *testing.T) {
 // error.
 func (m *Manager) renderMust(t *testing.T, prepared *config.IPsecConfig) string {
 	t.Helper()
-	got, err := m.renderConfig(prepared)
+	got, _, err := m.renderConfig(prepared)
 	if err != nil {
 		t.Fatalf("renderConfig: %v", err)
 	}
