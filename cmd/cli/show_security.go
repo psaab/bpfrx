@@ -451,6 +451,10 @@ func (c *ctl) showMatchPolicies(args []string) error {
 		// discriminator so the typed MatchPolicies RPC reproduces the #4569
 		// fragment-associated deny; false is a normal L4 packet.
 		NonFirstFragment: sel.NonFirstFragment,
+		// #5579: forward the ingress-interface selector so the daemon scopes the
+		// host-inbound classifier to one interface's effective view (the server
+		// validates zone membership + lifeline reject). "" = zone-scoped.
+		IngressInterface: sel.IngressInterface,
 	}
 	if sel.ICMPType != nil {
 		u := uint32(*sel.ICMPType)

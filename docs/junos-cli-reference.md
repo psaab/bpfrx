@@ -972,8 +972,41 @@ and `test policy from-zone <z> to-zone <z> [...]` (both local and remote CLI).
 The 5-tuple policy simulator answers "which policy does this flow match?" over
 the same precedence the dataplane enforces. Selectors: `source-ip`,
 `destination-ip`, `source-port`, `destination-port`, `protocol <name|number>`,
-`icmp-type`, `icmp-code`, and the valueless `non-first-fragment` (#5572).
-`from-zone` and `to-zone` are required; an OMITTED selector matches any.
+`icmp-type`, `icmp-code`, `ingress-interface` (#5579), and the valueless
+`non-first-fragment` (#5572). `from-zone` and `to-zone` are required; an OMITTED
+selector matches any.
+
+**Per-interface host-inbound scoping (#5579).** A security zone can carry
+MULTIPLE per-interface `host-inbound-traffic` effective views (#3362) — e.g. SSH
+exposed on one unit of a zone and default-denied on a sibling. For a `to-zone
+junos-host` query the host-inbound classifier used to OR every view in the zone
+and report on the FIRST admitting view, so it certified a zone-wide
+`token-admit`/permit even for a packet entering the sibling interface the runtime
+DENIES — a false-admission diagnosis. Two changes remove it:
+
+- `ingress-interface <if>` scopes the host-inbound classification to ONE
+  interface's EFFECTIVE view (zone-level ∪ that interface's override), so the
+  reported admission is that interface's TRUE posture (admit vs deny), not a
+  zone-wide fold. The ref must name an interface assigned to `from-zone`; an
+  unknown, zone-mismatched, or management/cluster lifeline (fxp0/em0/fab*) ref is
+  rejected fail-closed (the lifeline is served unconditionally, so a
+  per-interface verdict would itself be false). Example: `show security
+  match-policies from-zone trust to-zone junos-host protocol tcp destination-port
+  22 ingress-interface ge-0/0/1.0` reports the sibling's `denied`, not the
+  zone-wide `token-admit ssh`.
+- WITHOUT the selector, a zone-scoped query whose per-interface views DISAGREE now
+  reports `ambiguous` (naming the differing interface groups and directing the
+  operator at `ingress-interface`) instead of OR-ing them into a first-admit that
+  lies for the denying interfaces. A zone with no per-interface override yields a
+  single view, so it is unchanged.
+
+The selector threads through every surface: local + remote `show security
+match-policies` / `test policy`, the gRPC `MatchPolicies` RPC `ingress_interface`
+field (proto field 11), the gRPC `test-policy:` bridge `iif=` token, and the REST
+`match-policies` `ingress_interface` query parameter. The classifier reads the
+same host-inbound SSOT the kernel-nft builder renders from, so a scoped verdict
+cannot drift from the port the box actually opens. The gRPC/REST host-inbound
+status gains an `ambiguous` value (`HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS`).
 
 **Non-first fragment simulation (#5572).** The valueless `non-first-fragment`
 selector evaluates the query as a NON-FIRST IP fragment — the dataplane's

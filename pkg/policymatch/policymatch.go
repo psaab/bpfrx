@@ -208,6 +208,8 @@ const matchPoliciesUsageTail = ` from-zone <zone> to-zone <zone>
        [source-port <0-65535>] [destination-port <0-65535>]
        [protocol <name|number>]   tcp, udp, icmp, icmp6, gre, esp, ospf, ... or 0-255
        [icmp-type <0-255>] [icmp-code <0-255>]
+       [ingress-interface <if>]   scope host-inbound (to-zone junos-host) to one
+                                  interface's effective host-inbound view
        [non-first-fragment]       simulate a non-first IP fragment (no L4 header)
        from-zone and to-zone are required; an omitted selector matches any.
        an unknown selector, or a selector given without a value, is an error
@@ -244,6 +246,21 @@ type Query struct {
 	Protocol string // "tcp", "udp", "89", "ospf", ... ("" = unspecified)
 	SrcPort  int
 	DstPort  int
+
+	// IngressInterface scopes a `to-zone junos-host` query's host-inbound
+	// admission to ONE ingress interface's effective host-inbound view (#5579).
+	// A zone can carry multiple per-interface host-inbound effective views
+	// (#3362); without this selector the classifier reports HostInboundAmbiguous
+	// when they disagree. With it, the classifier evaluates ONLY this interface's
+	// effective view (zone-level ∪ per-interface override), so an operator can
+	// certify one interface's TRUE host-inbound posture (admit vs deny) instead of
+	// a zone-wide fold. The ref must name an interface assigned to FromZone; a
+	// caller validates it via dataplane/userspace.ResolveHostInboundIngressInterface
+	// before building the Query, so an invalid ref never reaches here. "" =
+	// unspecified (zone-scoped classification, unchanged for every existing
+	// caller). It affects ONLY the host-inbound classifier annotation, never the
+	// transit/host policy match verdict.
+	IngressInterface string
 
 	// ICMPType / ICMPCode carry the query packet's ICMP/ICMPv6 type and code
 	// (#3284). They mirror the dataplane's per-packet `packet_icmp` tuple
@@ -350,6 +367,13 @@ type SelectorArgs struct {
 	DstPort  int    // 0 = unspecified
 	ICMPType *uint8 // nil = unspecified
 	ICMPCode *uint8 // nil = unspecified
+
+	// IngressInterface scopes a `to-zone junos-host` host-inbound query to one
+	// ingress interface's effective host-inbound view (#5579). "" = unspecified
+	// (zone-scoped classification). The parser accepts any non-empty token; the
+	// ref is validated against the live config (zone membership, lifeline reject)
+	// at the surface that has cfg, not here.
+	IngressInterface string
 
 	// NonFirstFragment is the #5572 non-first-fragment / no-L4 discriminator.
 	// false (default) = a normal L4-present packet, unchanged for every existing
@@ -492,6 +516,19 @@ func ParseSelectorArgs(args []string) (SelectorArgs, error) {
 				return SelectorArgs{}, err
 			}
 			s.Protocol = v
+		case "ingress-interface":
+			// #5579: the ingress interface whose EFFECTIVE host-inbound view a
+			// `to-zone junos-host` query is classified against. Value-taking and
+			// duplicate-checked like every other selector; the token is a free-form
+			// interface ref (e.g. `ge-0/0/0.0`) validated against the live config at
+			// the surface that has cfg (zone membership + lifeline reject), so no
+			// per-value validation happens here beyond the shared present-but-empty
+			// / duplicate guards in takeValue.
+			v, err := takeValue(&i, "ingress-interface")
+			if err != nil {
+				return SelectorArgs{}, err
+			}
+			s.IngressInterface = v
 		case "icmp-type":
 			v, err := takeValue(&i, "icmp-type")
 			if err != nil {
@@ -547,6 +584,7 @@ func (s SelectorArgs) Query() Query {
 		ICMPType:         s.ICMPType,
 		ICMPCode:         s.ICMPCode,
 		NonFirstFragment: s.NonFirstFragment,
+		IngressInterface: s.IngressInterface,
 	}
 }
 
@@ -1201,6 +1239,16 @@ func hostInboundAdmission(cfg *config.Config, q Query) *dpuserspace.HostInboundA
 		family = ipFamily(q.DstIP)
 	case q.SrcIP != nil:
 		family = ipFamily(q.SrcIP)
+	}
+	// #5579: when the query names an ingress interface, scope the host-inbound
+	// classification to THAT interface's effective view (admit vs deny for the
+	// interface, not a zone-wide first-admit fold). The ref is validated against
+	// the config at the operator surface before the Query is built. Without the
+	// selector, the zone-scoped classifier reports HostInboundAmbiguous if the
+	// zone's per-interface views disagree.
+	if q.IngressInterface != "" {
+		adm := dpuserspace.ClassifyHostInboundForInterface(cfg, q.FromZone, q.IngressInterface, proto, hasProto, q.DstPort, q.ICMPType, family)
+		return &adm
 	}
 	adm := dpuserspace.ClassifyHostInbound(cfg, q.FromZone, proto, hasProto, q.DstPort, q.ICMPType, family)
 	return &adm

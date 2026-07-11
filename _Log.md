@@ -46150,6 +46150,64 @@ top.
 - **File(s)**: pkg/api/types.go, pkg/api/security.go,
   pkg/api/security_policy_counter_availability_5580_test.go, _Log.md
 
+- **Timestamp**: 2026-07-11 (#5579 api match-policies ingress-interface selector)
+- **Action**: Added an `ingress-interface` selector to the match-policies
+  policy simulator so a `to-zone junos-host` host-inbound query can be scoped to
+  ONE interface's effective host-inbound view instead of the zone-wide
+  first-admit fold (the #5579 false-admission). Refactored the host-inbound
+  classifier: `ClassifyHostInbound` now classifies each per-interface effective
+  view independently and reports the new `HostInboundAmbiguous` status when the
+  views disagree (instead of OR-ing to a first-admit); added
+  `ClassifyHostInboundForInterface` (scopes to one interface's effective token
+  set) and `ResolveHostInboundIngressInterface` (fail-closed validator:
+  rejects unknown / zone-mismatched / lifeline refs). Threaded the selector
+  through `policymatch.Query`/`SelectorArgs`/`ParseSelectorArgs`, the REST
+  `ingress_interface` query param (+ selector allowlist), the gRPC
+  `MatchPolicies` proto field 11 + `HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS`
+  enum (regenerated bindings), the gRPC `test-policy:` `iif=` bridge token, and
+  the local + remote CLI `show security match-policies` / `test policy`
+  surfaces. Added RED-on-revert tests (classifier + REST + gRPC): mixed zone
+  with an ssh override on one unit and a default-deny sibling; ingress-iface=B
+  reports DENY, ingress-iface=A admits, unqualified reports ambiguous.
+  Updated MatchPoliciesUsage help + docs/junos-cli-reference.md. Gates:
+  go build ./... + go test (policymatch/api/grpcapi/cli/cmd-cli + userspace
+  host-inbound) green; gofmt clean. (Pre-existing flaky
+  TestEventStreamDataplaneEventBeforeCallbackQueuesUntilCallback fails at base
+  4a1ca4e32 too — unrelated.)
+- **File(s)**: pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go,
+  pkg/policymatch/policymatch.go, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_matchpolicies_ingress_iface_5579_test.go,
+  pkg/api/security.go,
+  pkg/api/security_matchpolicies_ingress_iface_5579_test.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request_testcmd.go,
+  cmd/cli/show_security.go, cmd/cli/main.go, docs/junos-cli-reference.md, _Log.md
+
+- **Timestamp**: 2026-07-11 (#5579 review fold — bare-physical ingress-interface)
+- **Action**: Folded the #5595 hostile-review MINOR (bare-physical ref
+  namespace gap). ResolveHostInboundIngressInterface ACCEPTED a bare-physical
+  ingress-interface ref (e.g. `reth0`) while ClassifyHostInboundForInterface
+  keys the effective host-inbound set on the LOGICAL-UNIT ref
+  (buildInterfaceHostInboundMap[ifaceRef]); a unit-authored override lands only
+  on the `reth0.50` key, so a bare-physical ref silently dropped it → FALSE-DENY
+  (reth0 -> "denied" while reth0.50 -> token-admit ssh). Reconciled the
+  namespace by REJECTING a bare-physical ref that carries one-or-more units,
+  naming a representative logical unit in the fail-closed error (a unit-less
+  physical with only a physical-level override is still keyed correctly and is
+  not rejected). Added smallestUnitNumber helper. Deduped the gRPC test-policy
+  bridge double ResolveHostInboundIngressInterface call (compute ingressErr
+  once). Added Test_5579_ResolveIngressInterfaceRejectsBarePhysical with
+  RED-on-revert proof (revert reject -> reth0 accepted -> classifier false-deny;
+  test catches it). Gates: go build ./... + go test -race
+  (policymatch/api/grpcapi/cmd-cli/dataplane) green except the pre-existing
+  flaky TestEventStreamDataplaneEventBeforeCallbackQueuesUntilCallback
+  (fails at base too); gofmt clean.
+- **File(s)**: pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go,
+  pkg/grpcapi/server_show_firewall.go, _Log.md
+
 ## #5582 host-inbound WireGuard listen-port admission
 - **Timestamp**: 2026-07-11T10:33:04Z
 - **Action**: Add automatic dynamic host-inbound admission for the configured WireGuard UDP listen port(s) so a fresh passive (responder-only) handshake to a restricted zoned address is admitted (was dropped by the per-zone catch-all). Chose an automatic dynamic exception tied to config.WireGuardListenPorts() over a static system-services token (WG port is operator-configured, does not fit the static token->port SSOT). Emitted as a single coarse `udp dport <wg-port(s)> accept` on the input hook, placed after the #4146/#5565 fine junos-host DROP subchain.

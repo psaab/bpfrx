@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/policymatch"
 	"github.com/psaab/xpf/pkg/routing"
 )
@@ -71,6 +72,14 @@ func (c *CLI) testPolicy(args []string) error {
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
+	// #5579: validate the optional ingress-interface selector against the live
+	// config (zone membership + lifeline reject) so the host-inbound classifier is
+	// scoped only to a real interface of the queried zone, failing closed on an
+	// unknown / zone-mismatched / lifeline ref exactly like the other surfaces.
+	if err := dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, sel.IngressInterface); err != nil {
+		return err
+	}
+
 	// #3042: delegate to the single shared simulator (exact zone-pair ->
 	// wildcard-zone tiers (#3090) -> scoped global (#3148) -> default-policy).
 	// The pre-#3042 loop hard-coded "Default deny" (ignoring default-policy
@@ -94,6 +103,9 @@ func (c *CLI) testPolicy(args []string) error {
 		// #5572: a non-first IP fragment (no L4 header) reproduces the #4569
 		// fragment-associated deny; false is a normal L4-present packet.
 		NonFirstFragment: nonFirstFrag,
+		// #5579: scope the host-inbound classifier to this ingress interface's
+		// effective view (validated above). "" = zone-scoped, unchanged.
+		IngressInterface: sel.IngressInterface,
 		FeedOverlay:      c.feedOverlay(),
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
