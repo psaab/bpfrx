@@ -270,8 +270,21 @@ or strand access:
 
 - An **operator's own account** (created out of band, no xpf marker) is never
   iterated — its keys, sudoers, and login stay intact.
-- **`root` and system accounts** have no marker and are never touched — the
-  console/root lifeline survives the wipe (critical on bare metal).
+- **System accounts** (and an **unmanaged-root** appliance's `root`) have no
+  marker and are never iterated — untouched by the teardown.
+- **`root` on a managed-root appliance IS revoked (#5520).** Since #5276 the
+  daemon writes a genuine provenance marker for `root`
+  (`markProvisioned("root", 0)`), so `root` reaches the teardown. It must NOT
+  take the generic path — root's `authorized_keys` is at **`/root/.ssh`**, not
+  `/home/root/.ssh` (which the generic path would miss, leaving the prior
+  tenant's root SSH key live), and **`userdel -r root` fails on UID 0** and can
+  abort the whole reset. So `root` is special-cased and revoked **in place**
+  (`zeroizeRootLoginAccount`): remove `/root/.ssh/authorized_keys` **and** lock
+  the root password (`passwd -l root`), **never** `userdel`. Fail-closed like
+  the rest — the marker is retained and the reset reported incomplete unless
+  both revocations succeed. A factory reset MUST revoke root; a
+  decommissioned/RMA'd appliance that kept prior-operator root login would be a
+  false factory reset.
 - An **out-of-band `userdel`+recreate** with a different UID (marker UID ≠ live
   UID) is left alone — the current owner is someone else, exactly the #1944
   leave-then-rejoin-vs-recreate distinction. Since #5496 this mismatch is also
