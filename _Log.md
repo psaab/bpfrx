@@ -45682,3 +45682,10 @@ top.
 - **File(s)**: test/incus/mouse_latency_orchestrate.py,
   test/incus/test-mouse-latency.sh,
   test/incus/mouse_latency_orchestrate_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-072 — cold-path-flooder bounded cohort now enumerates a
+  disjoint per-worker slice sequentially (worker_slice + decompose_tuple_index
+  helpers) so first-pass packets are genuine installs (no birthday collisions,
+  no cross-worker overlap). Unbounded keeps random draws. Summary emits
+  tuple_space (fresh-install budget), version bumped 2->3. 4 cargo tests.
+- **File(s)**: test/incus/cold-path-flooder/src/main.rs
