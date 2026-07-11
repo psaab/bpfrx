@@ -46207,3 +46207,9 @@ top.
 - **File(s)**: pkg/dataplane/userspace/host_inbound_classify.go,
   pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go,
   pkg/grpcapi/server_show_firewall.go, _Log.md
+
+## #5582 host-inbound WireGuard listen-port admission
+- **Timestamp**: 2026-07-11T10:33:04Z
+- **Action**: Add automatic dynamic host-inbound admission for the configured WireGuard UDP listen port(s) so a fresh passive (responder-only) handshake to a restricted zoned address is admitted (was dropped by the per-zone catch-all). Chose an automatic dynamic exception tied to config.WireGuardListenPorts() over a static system-services token (WG port is operator-configured, does not fit the static token->port SSOT). Emitted as a single coarse `udp dport <wg-port(s)> accept` on the input hook, placed after the #4146/#5565 fine junos-host DROP subchain.
+- **File(s)**: pkg/config/wireguard_ports.go (new: (*Config).WireGuardListenPorts), pkg/daemon/daemon_nft.go (emitHostInboundWireGuardAccept + renderWireGuardPortSpec + buildHostInboundFilterPayload 5th param + call site), pkg/config/wireguard_listen_ports_5582_test.go (new), pkg/daemon/host_inbound_wireguard_5582_test.go (new, RED-on-revert + live-nft parse), docs/wireguard-interop.md, docs/host-inbound-service-matrix.md; updated existing buildHostInboundFilterPayload test call sites (host_inbound_nft_test.go, host_inbound_unzoned_4420_test.go, host_inbound_per_iface_3362_test.go, host_inbound_junos_host_4146_test.go, nft_chain_priority_test.go).
+- **Validation**: go build ./... green; go vet + go test ./pkg/config/... ./pkg/daemon/... green; RED-on-revert proven (neutered emit -> TestHostInboundFilterAdmitsWireGuardListenPort fails); live nft -c parse of single-port and set forms clean.
