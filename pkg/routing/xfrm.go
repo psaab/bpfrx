@@ -164,7 +164,24 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		// "already exists, reuse" path (#1706, #2546) — taken when the
 		// interface is unchanged (commit no-op) or survived a daemon
 		// restart that lost in-memory tracking but not the kernel link.
-		if link, err := x.ops.LinkByName(ifName); err == nil {
+		link, err := x.ops.LinkByName(ifName)
+		if err != nil && !isLinkNotFound(err) {
+			// #5461: a transient/lookup error (EBUSY, EINVAL, netlink
+			// transport) is NOT proof the xfrmi is absent. Falling through to
+			// the LinkAdd create path on a device that actually EXISTS would
+			// hit EEXIST and fail the commit closed with a misleading error,
+			// leaving the interface desired-but-untracked. Retain ownership
+			// (a tracked name is already in x.xfrmis and is deliberately left
+			// untouched here), surface the real lookup error so the commit
+			// fails closed on the genuine cause, and let the next reconcile
+			// retry. Mirrors reconcileVRFs' transient-lookup retention
+			// (vrf.go). Only a genuine not-found falls through to create.
+			slog.Warn("xfrmi lookup failed; not creating, retaining for retry",
+				"name", ifName, "if_id", ifID, "tracked", tracked, "err", err)
+			errs = append(errs, fmt.Errorf("lookup xfrmi %s: %w", ifName, err))
+			continue
+		}
+		if err == nil {
 			// Verify the adopted kernel link's ACTUAL if_id matches the
 			// desired one before re-tracking it. A kernel xfrmi with the
 			// same NAME but a stale Ifid (e.g. a daemon restart after the
@@ -223,7 +240,7 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			continue
 		}
 
-		link, err := x.ops.LinkByName(ifName)
+		link, err = x.ops.LinkByName(ifName)
 		if err != nil {
 			slog.Warn("failed to find xfrmi after creation",
 				"name", ifName, "err", err)
@@ -276,15 +293,31 @@ func (x *xfrmManager) clearLocked() error {
 }
 
 // deleteLocked removes a single tracked xfrmi by name and drops it from
-// tracking. Caller must hold mu. A link already gone from the kernel is
-// treated as success (the entry is still untracked). It returns a non-nil
+// tracking. Caller must hold mu. A link genuinely gone from the kernel is
+// treated as success (the entry is dropped from tracking). It returns a non-nil
 // error when the netlink LinkDel fails, in which case the name is RETAINED in
 // tracking (#4901) so the next reconcile retries instead of orphaning the link.
+//
+// #5495: only a GENUINE not-found (link-not-found errno) may drop tracking +
+// report gone. The former code took the "already gone" branch on ANY LinkByName
+// error — a transient/lookup failure (EBUSY, timeout, netlink transport) was
+// conflated with genuine absence, so it deleted tracking and returned nil-gone
+// while the xfrmi was still live in the kernel. A later Apply then had no
+// removed-desired entry to drive cleanup, silently ORPHANING the interface (and
+// leaving stale routing/security state) while reporting convergence. On a
+// transient error we now RETAIN the entry and surface the error so the caller
+// aggregates it (fail-closed) and the next reconcile retries. Mirrors
+// reconcileVRFs' transient-lookup retention (vrf.go).
 func (x *xfrmManager) deleteLocked(name string) error {
 	link, err := x.ops.LinkByName(name)
 	if err != nil {
-		delete(x.xfrmis, name)
-		return nil // already gone
+		if isLinkNotFound(err) {
+			delete(x.xfrmis, name)
+			return nil // genuinely gone
+		}
+		slog.Warn("xfrmi lookup failed during delete; retaining tracking for retry",
+			"name", name, "err", err)
+		return fmt.Errorf("lookup xfrmi %s for delete: %w", name, err)
 	}
 	if err := x.ops.LinkDel(link); err != nil {
 		// #4901: a failed LinkDel leaves the xfrmi in the kernel. Retain
