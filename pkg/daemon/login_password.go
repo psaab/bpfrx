@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -113,19 +114,34 @@ func currentShadowHash(name string) (string, bool) {
 	return "", false
 }
 
-// lookupUIDGID returns the numeric UID and GID for name by parsing
-// /etc/passwd directly (cgo-free, consistent with currentShadowHash —
-// the codebase deliberately avoids os/user to stay free of cgo/nsswitch).
-// /etc/passwd field 2 is the UID, field 3 is the primary GID. Returns
-// (uid, gid, true) on success, (0, 0, false) if absent or unparseable.
+// lookupUIDGIDErr parses /etc/passwd for name, distinguishing the THREE
+// outcomes a fail-closed caller must tell apart. /etc/passwd field 2 is the
+// UID, field 3 is the primary GID. It is cgo-free (consistent with
+// currentShadowHash — the codebase deliberately avoids os/user to stay free
+// of cgo/nsswitch):
 //
-// fsatomic.WithOwner uses this so a DurableState authorized_keys write
-// installs the file already owned by the target user/group at rename
-// time — no post-rename chown race that could leave root-owned keys.
-func lookupUIDGID(name string) (uid, gid int, ok bool) {
-	data, err := os.ReadFile(passwdPath)
-	if err != nil {
-		return 0, 0, false
+//   - (uid, gid, true,  nil): name found.
+//   - (0,   0,   false, nil): passwd READ OK, name genuinely ABSENT — a real
+//     out-of-band userdel. This is the only outcome that proves the account
+//     is gone.
+//   - (0,   0,   false, err): passwd could NOT be read/parsed — a transient
+//     mount/permission/I/O error, or a malformed entry FOR name. The identity
+//     database is UNKNOWN, NOT proven absent.
+//
+// The err return is what lets a fail-CLOSED caller (deprovisionLoginUser,
+// #5493) tell a genuine account deletion from a transient /etc/passwd read
+// failure. lookupUID/lookupUIDGID collapse both negatives into ok=false,
+// which is safe for callers that merely skip-and-retry on the next apply, but
+// is a fail-OPEN hazard for deprovisionLoginUser: there a read error would be
+// indistinguishable from deletion, so the caller would drop the provenance
+// marker and abandon revocation of a removed user's still-live credentials
+// once passwd became readable again. A malformed entry for the EXACT name is
+// reported as an error (unknown), never as genuine absence — never abandon
+// revocation on a corrupt identity DB.
+func lookupUIDGIDErr(name string) (uid, gid int, found bool, err error) {
+	data, rerr := os.ReadFile(passwdPath)
+	if rerr != nil {
+		return 0, 0, false, rerr
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if line == "" {
@@ -139,12 +155,28 @@ func lookupUIDGID(name string) (uid, gid int, ok bool) {
 			u, uerr := strconv.Atoi(fields[2])
 			g, gerr := strconv.Atoi(fields[3])
 			if uerr != nil || gerr != nil {
-				return 0, 0, false
+				return 0, 0, false, fmt.Errorf("passwd: unparseable uid/gid for %q", name)
 			}
-			return u, g, true
+			return u, g, true, nil
 		}
 	}
-	return 0, 0, false
+	return 0, 0, false, nil
+}
+
+// lookupUIDGID returns the numeric UID and GID for name by parsing
+// /etc/passwd directly. It returns (uid, gid, true) on success, (0, 0, false)
+// if absent OR unreadable OR unparseable — the two-state convenience contract
+// kept for callers that skip-and-retry on any negative (a transient read
+// error simply defers their work to the next apply, retaining state). Callers
+// that must NOT treat "unreadable" as "absent" use lookupUIDGIDErr /
+// lookupUIDErr instead.
+//
+// fsatomic.WithOwner uses this so a DurableState authorized_keys write
+// installs the file already owned by the target user/group at rename
+// time — no post-rename chown race that could leave root-owned keys.
+func lookupUIDGID(name string) (uid, gid int, ok bool) {
+	u, g, found, err := lookupUIDGIDErr(name)
+	return u, g, found && err == nil
 }
 
 // lookupUID returns the numeric UID for name (the GID-less convenience
@@ -152,6 +184,15 @@ func lookupUIDGID(name string) (uid, gid int, ok bool) {
 func lookupUID(name string) (int, bool) {
 	uid, _, ok := lookupUIDGID(name)
 	return uid, ok
+}
+
+// lookupUIDErr is the 3-state, error-returning counterpart of lookupUID for
+// fail-CLOSED callers that must distinguish a transient /etc/passwd read
+// failure (unknown → retain state, retry) from a genuine account absence
+// (proven gone → safe to forget). See lookupUIDGIDErr. #5493.
+func lookupUIDErr(name string) (uid int, found bool, err error) {
+	u, _, found, err := lookupUIDGIDErr(name)
+	return u, found, err
 }
 
 // markerPath returns the provenance marker file path for name. names are
@@ -294,11 +335,26 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) {
 // retries, and it never removes a credential it did not first verify as
 // xpf-owned. #5128.
 func (d *Daemon) deprovisionLoginUser(name string) {
-	curUID, uidOK := lookupUID(name)
-	if !uidOK {
-		// The account is already gone from the host (out-of-band userdel).
-		// There is nothing to revoke; drop the stale marker so we stop
-		// revisiting it every apply.
+	curUID, found, err := lookupUIDErr(name)
+	if err != nil {
+		// /etc/passwd could not be READ (transient mount/permission/I/O
+		// error) — the identity database is UNKNOWN, NOT proof the account is
+		// gone. Fail CLOSED: keep the provenance marker and revocation intent,
+		// retry next apply. Dropping the marker here — as the old lookupUID
+		// bool contract silently did on any read error — would PERMANENTLY
+		// abandon revocation: once passwd is readable again the account is no
+		// longer enumerated (marker gone), so the removed user's password and
+		// keys would stay live forever (#5493). This mirrors the
+		// currentShadowHash fail-closed discipline below: identity-database
+		// uncertainty is "unknown → retry", never "absent → abandon".
+		slog.Warn("skipping removed-user deprovision: cannot read passwd",
+			"user", name, "err", err)
+		return // keep marker; retry next apply
+	}
+	if !found {
+		// passwd READ OK and name genuinely ABSENT — a real out-of-band
+		// userdel. There is nothing to revoke; drop the stale marker so we
+		// stop revisiting it every apply.
 		_ = os.Remove(markerPath(name))
 		return
 	}
