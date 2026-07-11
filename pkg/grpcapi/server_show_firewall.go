@@ -207,7 +207,7 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 
 func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
 	params := strings.TrimPrefix(req.Topic, "test-policy:")
-	var fromZone, toZone, srcIP, dstIP, proto string
+	var fromZone, toZone, srcIP, dstIP, proto, ingressIface string
 	var srcPort, dstPort int
 	var icmpType, icmpCode *uint8
 	var nonFirstFrag bool
@@ -298,6 +298,12 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 				// selector. Parse as a bool; a malformed value errors like a bad
 				// port rather than silently degrading to a normal-packet query.
 				nonFirstFrag, fragErr = strconv.ParseBool(parts[1])
+			case "iif":
+				// #5579: ingress-interface selector — the remote CLI `test policy`
+				// emits `iif=<ref>` for the `ingress-interface` selector. The ref is
+				// validated against the live config (zone membership + lifeline
+				// reject) below, before evaluation.
+				ingressIface = parts[1]
 			default:
 				// #3696: an unknown selector key (e.g. `prot=tcp`, a plausible
 				// operator abbreviation of `proto`) must not be silently ignored,
@@ -339,6 +345,11 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		fmt.Fprintf(buf, "invalid src %q\n", srcIP)
 	case dstIP != "" && net.ParseIP(dstIP) == nil:
 		fmt.Fprintf(buf, "invalid dst %q\n", dstIP)
+	case dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, ingressIface) != nil:
+		// #5579: an unknown / zone-mismatched / lifeline ingress-interface fails
+		// the query closed, so the host-inbound classifier is only scoped to a real
+		// interface of the queried zone (parity with the REST/gRPC/local surfaces).
+		fmt.Fprintf(buf, "%v\n", dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, ingressIface))
 	default:
 		// #3103: route the gRPC `test policy` diagnostic through the single
 		// shared simulator (pkg/policymatch) so it agrees with the runtime
@@ -369,6 +380,9 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 			// #5572: non-first-fragment (l4_present == false) reproduces the
 			// #4569 fragment-associated deny; false is a normal L4 packet.
 			NonFirstFragment: nonFirstFrag,
+			// #5579: scope the host-inbound classifier to this ingress interface's
+			// effective view (validated above). "" = zone-scoped, unchanged.
+			IngressInterface: ingressIface,
 			FeedOverlay:      overlay,
 			// #3104: skip scheduler-inactive policies like the runtime does, so
 			// the `test policy` diagnostic falls through to the next active rule

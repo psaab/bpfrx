@@ -660,6 +660,13 @@ func (c *ctl) testPolicy(args []string) error {
 	if sel.NonFirstFragment {
 		topic += ",frag=1"
 	}
+	// #5579: forward the ingress-interface selector so the gRPC test-policy bridge
+	// scopes the host-inbound classifier to one interface's effective view. An
+	// interface ref (e.g. ge-0/0/0.0) never contains a comma or equals, so it
+	// round-trips through the delimiter-based topic; the server validates it.
+	if sel.IngressInterface != "" {
+		topic += ",iif=" + sel.IngressInterface
+	}
 	return c.showText(topic)
 }
 

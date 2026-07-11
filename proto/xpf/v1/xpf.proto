@@ -756,6 +756,18 @@ message MatchPoliciesRequest {
   // fabricated port-0 permit. false (default) = a normal L4-present packet, so
   // an existing client is unchanged.
   bool non_first_fragment = 10;
+  // ingress_interface scopes a `to-zone junos-host` host-inbound query to ONE
+  // ingress interface's effective host-inbound view (#5579). A zone can carry
+  // multiple per-interface host-inbound views (#3362); without this selector the
+  // classifier reports "ambiguous" when they disagree. With it, only this
+  // interface's effective view (zone-level ∪ per-interface override) is
+  // classified, so an operator can certify one interface's TRUE host-inbound
+  // posture (admit vs deny) instead of a zone-wide first-admit fold. The ref must
+  // name an interface assigned to from_zone; an unknown / zone-mismatched /
+  // lifeline ref is InvalidArgument. "" (default) = zone-scoped, so an existing
+  // client is unchanged. It affects ONLY the host_inbound annotation, never the
+  // policy match verdict.
+  string ingress_interface = 11;
 }
 message MatchPoliciesResponse {
   string policy_name = 1;
@@ -937,6 +949,13 @@ enum HostInboundAdmissionStatus {
   // The ingress zone's host-inbound-traffic admits nothing matching this tuple
   // — the box drops the packet (Junos default-deny).
   HOST_INBOUND_ADMISSION_STATUS_DENIED = 4;
+  // The ingress zone carries MULTIPLE distinct per-interface host-inbound
+  // effective views (#3362) that classify this tuple DIFFERENTLY — one interface
+  // admits it, another denies it (#5579). A zone-scoped query cannot answer for
+  // the whole zone without lying for the sibling interfaces; the differing
+  // interface groups are named in `description`. Supply ingress_interface to get
+  // one interface's true admission.
+  HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS = 5;
 }
 
 // HostInboundAdmission is the structured host-inbound-traffic classifier verdict

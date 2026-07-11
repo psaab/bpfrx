@@ -210,6 +210,16 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		return nil, status.Errorf(codes.InvalidArgument, "invalid icmp-code: %v", err)
 	}
 
+	// #5579: validate the optional ingress-interface selector against the live
+	// config — it must name an interface assigned to from_zone, and must not be a
+	// management/cluster lifeline (served unconditionally). An unknown /
+	// zone-mismatched / lifeline ref is a fail-closed InvalidArgument, mirroring
+	// the src_ip / port / protocol validators above, so the host-inbound
+	// classifier is only ever scoped to a real interface of the queried zone.
+	if err := dpuserspace.ResolveHostInboundIngressInterface(cfg, req.FromZone, req.IngressInterface); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
 	// #3042: delegate to the single shared simulator so gRPC agrees with the
 	// runtime evaluator (exact zone-pair -> wildcard-zone tiers (#3090) ->
 	// scoped global (#3148) -> default-policy, predefined + nested-app-set +
@@ -235,6 +245,9 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		// reproduces the #4569 fragment-associated deny. false (default) is a
 		// normal L4-present packet, so an existing client is unchanged.
 		NonFirstFragment: req.NonFirstFragment,
+		// #5579: scope the host-inbound classifier to this ingress interface's
+		// effective view (validated above). "" = zone-scoped, unchanged.
+		IngressInterface: req.IngressInterface,
 		FeedOverlay:      overlay,
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
@@ -406,6 +419,8 @@ func hostInboundStatusToProto(s dpuserspace.HostInboundStatus) pb.HostInboundAdm
 		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_TOKEN_ADMIT
 	case dpuserspace.HostInboundDenied:
 		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_DENIED
+	case dpuserspace.HostInboundAmbiguous:
+		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS
 	default:
 		return pb.HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_NOT_COMPUTED
 	}

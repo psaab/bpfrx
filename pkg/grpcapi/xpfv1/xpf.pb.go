@@ -203,6 +203,13 @@ const (
 	// The ingress zone's host-inbound-traffic admits nothing matching this tuple
 	// — the box drops the packet (Junos default-deny).
 	HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_DENIED HostInboundAdmissionStatus = 4
+	// The ingress zone carries MULTIPLE distinct per-interface host-inbound
+	// effective views (#3362) that classify this tuple DIFFERENTLY — one interface
+	// admits it, another denies it (#5579). A zone-scoped query cannot answer for
+	// the whole zone without lying for the sibling interfaces; the differing
+	// interface groups are named in `description`. Supply ingress_interface to get
+	// one interface's true admission.
+	HostInboundAdmissionStatus_HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS HostInboundAdmissionStatus = 5
 )
 
 // Enum value maps for HostInboundAdmissionStatus.
@@ -213,6 +220,7 @@ var (
 		2: "HOST_INBOUND_ADMISSION_STATUS_GLOBAL_ACCEPT",
 		3: "HOST_INBOUND_ADMISSION_STATUS_TOKEN_ADMIT",
 		4: "HOST_INBOUND_ADMISSION_STATUS_DENIED",
+		5: "HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS",
 	}
 	HostInboundAdmissionStatus_value = map[string]int32{
 		"HOST_INBOUND_ADMISSION_STATUS_NOT_COMPUTED":  0,
@@ -220,6 +228,7 @@ var (
 		"HOST_INBOUND_ADMISSION_STATUS_GLOBAL_ACCEPT": 2,
 		"HOST_INBOUND_ADMISSION_STATUS_TOKEN_ADMIT":   3,
 		"HOST_INBOUND_ADMISSION_STATUS_DENIED":        4,
+		"HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS":     5,
 	}
 )
 
@@ -6581,6 +6590,18 @@ type MatchPoliciesRequest struct {
 	// fabricated port-0 permit. false (default) = a normal L4-present packet, so
 	// an existing client is unchanged.
 	NonFirstFragment bool `protobuf:"varint,10,opt,name=non_first_fragment,json=nonFirstFragment,proto3" json:"non_first_fragment,omitempty"`
+	// ingress_interface scopes a `to-zone junos-host` host-inbound query to ONE
+	// ingress interface's effective host-inbound view (#5579). A zone can carry
+	// multiple per-interface host-inbound views (#3362); without this selector the
+	// classifier reports "ambiguous" when they disagree. With it, only this
+	// interface's effective view (zone-level ∪ per-interface override) is
+	// classified, so an operator can certify one interface's TRUE host-inbound
+	// posture (admit vs deny) instead of a zone-wide first-admit fold. The ref must
+	// name an interface assigned to from_zone; an unknown / zone-mismatched /
+	// lifeline ref is InvalidArgument. "" (default) = zone-scoped, so an existing
+	// client is unchanged. It affects ONLY the host_inbound annotation, never the
+	// policy match verdict.
+	IngressInterface string `protobuf:"bytes,11,opt,name=ingress_interface,json=ingressInterface,proto3" json:"ingress_interface,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -6683,6 +6704,13 @@ func (x *MatchPoliciesRequest) GetNonFirstFragment() bool {
 		return x.NonFirstFragment
 	}
 	return false
+}
+
+func (x *MatchPoliciesRequest) GetIngressInterface() string {
+	if x != nil {
+		return x.IngressInterface
+	}
+	return ""
 }
 
 type MatchPoliciesResponse struct {
@@ -8684,7 +8712,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\x1a\n" +
 	"\bpriority\x18\x04 \x01(\x05R\bpriority\x12+\n" +
 	"\x11virtual_addresses\x18\x05 \x03(\tR\x10virtualAddresses\x12\x18\n" +
-	"\apreempt\x18\x06 \x01(\bR\apreempt\"\x86\x03\n" +
+	"\apreempt\x18\x06 \x01(\bR\apreempt\"\xb3\x03\n" +
 	"\x14MatchPoliciesRequest\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x1b\n" +
@@ -8697,7 +8725,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\ticmp_type\x18\b \x01(\rH\x00R\bicmpType\x88\x01\x01\x12 \n" +
 	"\ticmp_code\x18\t \x01(\rH\x01R\bicmpCode\x88\x01\x01\x12,\n" +
 	"\x12non_first_fragment\x18\n" +
-	" \x01(\bR\x10nonFirstFragmentB\f\n" +
+	" \x01(\bR\x10nonFirstFragment\x12+\n" +
+	"\x11ingress_interface\x18\v \x01(\tR\x10ingressInterfaceB\f\n" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
@@ -8830,13 +8859,14 @@ const file_xpf_proto_rawDesc = "" +
 	"&MONITOR_INTERFACE_SUMMARY_MODE_PACKETS\x10\x01\x12(\n" +
 	"$MONITOR_INTERFACE_SUMMARY_MODE_BYTES\x10\x02\x12(\n" +
 	"$MONITOR_INTERFACE_SUMMARY_MODE_DELTA\x10\x03\x12'\n" +
-	"#MONITOR_INTERFACE_SUMMARY_MODE_RATE\x10\x04*\x87\x02\n" +
+	"#MONITOR_INTERFACE_SUMMARY_MODE_RATE\x10\x04*\xb4\x02\n" +
 	"\x1aHostInboundAdmissionStatus\x12.\n" +
 	"*HOST_INBOUND_ADMISSION_STATUS_NOT_COMPUTED\x10\x00\x12/\n" +
 	"+HOST_INBOUND_ADMISSION_STATUS_INDETERMINATE\x10\x01\x12/\n" +
 	"+HOST_INBOUND_ADMISSION_STATUS_GLOBAL_ACCEPT\x10\x02\x12-\n" +
 	")HOST_INBOUND_ADMISSION_STATUS_TOKEN_ADMIT\x10\x03\x12(\n" +
-	"$HOST_INBOUND_ADMISSION_STATUS_DENIED\x10\x04*\x97\x01\n" +
+	"$HOST_INBOUND_ADMISSION_STATUS_DENIED\x10\x04\x12+\n" +
+	"'HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS\x10\x05*\x97\x01\n" +
 	"\x0fPeerFetchStatus\x12!\n" +
 	"\x1dPEER_FETCH_STATUS_UNSPECIFIED\x10\x00\x12$\n" +
 	" PEER_FETCH_STATUS_NOT_APPLICABLE\x10\x01\x12\x18\n" +

@@ -46133,3 +46133,38 @@ top.
   flag false. Gates: go build ./... + go test ./pkg/api/... green; gofmt -w.
 - **File(s)**: pkg/api/types.go, pkg/api/security.go,
   pkg/api/security_policy_counter_availability_5580_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11 (#5579 api match-policies ingress-interface selector)
+- **Action**: Added an `ingress-interface` selector to the match-policies
+  policy simulator so a `to-zone junos-host` host-inbound query can be scoped to
+  ONE interface's effective host-inbound view instead of the zone-wide
+  first-admit fold (the #5579 false-admission). Refactored the host-inbound
+  classifier: `ClassifyHostInbound` now classifies each per-interface effective
+  view independently and reports the new `HostInboundAmbiguous` status when the
+  views disagree (instead of OR-ing to a first-admit); added
+  `ClassifyHostInboundForInterface` (scopes to one interface's effective token
+  set) and `ResolveHostInboundIngressInterface` (fail-closed validator:
+  rejects unknown / zone-mismatched / lifeline refs). Threaded the selector
+  through `policymatch.Query`/`SelectorArgs`/`ParseSelectorArgs`, the REST
+  `ingress_interface` query param (+ selector allowlist), the gRPC
+  `MatchPolicies` proto field 11 + `HOST_INBOUND_ADMISSION_STATUS_AMBIGUOUS`
+  enum (regenerated bindings), the gRPC `test-policy:` `iif=` bridge token, and
+  the local + remote CLI `show security match-policies` / `test policy`
+  surfaces. Added RED-on-revert tests (classifier + REST + gRPC): mixed zone
+  with an ssh override on one unit and a default-deny sibling; ingress-iface=B
+  reports DENY, ingress-iface=A admits, unqualified reports ambiguous.
+  Updated MatchPoliciesUsage help + docs/junos-cli-reference.md. Gates:
+  go build ./... + go test (policymatch/api/grpcapi/cli/cmd-cli + userspace
+  host-inbound) green; gofmt clean. (Pre-existing flaky
+  TestEventStreamDataplaneEventBeforeCallbackQueuesUntilCallback fails at base
+  4a1ca4e32 too — unrelated.)
+- **File(s)**: pkg/dataplane/userspace/host_inbound_classify.go,
+  pkg/dataplane/userspace/host_inbound_classify_iface_5579_test.go,
+  pkg/policymatch/policymatch.go, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/xpf.pb.go, pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_show_firewall.go,
+  pkg/grpcapi/server_matchpolicies_ingress_iface_5579_test.go,
+  pkg/api/security.go,
+  pkg/api/security_matchpolicies_ingress_iface_5579_test.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_request_testcmd.go,
+  cmd/cli/show_security.go, cmd/cli/main.go, docs/junos-cli-reference.md, _Log.md

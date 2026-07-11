@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -26,12 +27,19 @@ import (
 // (#3171): ESP/AH raw data plane, ICMP error/PMTUD, and the IPv6 ND set.
 //
 // Faithful to the enforcement paths (plan §5): a zone can carry MULTIPLE
-// per-interface effective views (#3362) — the query has no ingress interface, so
-// admission is reported if ANY view for the ingress zone admits the tuple.
-// Post-#3405 a configured zone with no host-inbound-traffic stanza default-DENIES
-// (its view carries empty token sets), so "unmatched host policy" does NOT imply
-// delivery. Lifeline interfaces (fxp0/em0/fab*) are excluded from the views and
-// so are never classified here (their host traffic is served unconditionally).
+// per-interface effective views (#3362). A zone-scoped query (no ingress
+// interface) classifies EACH view independently and reports HostInboundAmbiguous
+// when they DISAGREE (one interface admits, a sibling default-denies) rather than
+// OR-ing them into a zone-wide first-admit that lies for the denying interfaces
+// (#5579); when the views agree — the common single-view case — it reports that
+// shared verdict. An ingress-interface-scoped query
+// (ClassifyHostInboundForInterface) evaluates ONLY that interface's effective
+// view, so an operator can certify one interface's TRUE posture. Post-#3405 a
+// configured zone with no host-inbound-traffic stanza default-DENIES (its view
+// carries empty token sets), so "unmatched host policy" does NOT imply delivery.
+// Lifeline interfaces (fxp0/em0/fab*) are excluded from the views and so are
+// never classified here (their host traffic is served unconditionally); the
+// ingress-interface selector rejects a lifeline ref for the same reason.
 
 // HostInboundStatus classifies how the ingress zone's host-inbound-traffic
 // admission gate treats a host-bound query tuple (#3627 B1a). It is presence-safe
@@ -57,6 +65,15 @@ const (
 	// HostInboundDenied: the ingress zone's host-inbound-traffic admits nothing
 	// matching this tuple — the box drops the packet (Junos default-deny).
 	HostInboundDenied
+	// HostInboundAmbiguous: the ingress zone carries MULTIPLE distinct effective
+	// host-inbound views (per-interface overrides, #3362) that would classify
+	// this tuple DIFFERENTLY — one interface admits it, another denies it (#5579).
+	// A zone-scoped query cannot answer for the whole zone without lying for the
+	// sibling interfaces, so the classifier reports ambiguity and names the
+	// differing interface groups (Ambiguous) instead of OR-ing them into a
+	// zone-wide first-admit. Supply an ingress-interface selector to get one
+	// interface's true admission.
+	HostInboundAmbiguous
 )
 
 func (s HostInboundStatus) String() string {
@@ -69,6 +86,8 @@ func (s HostInboundStatus) String() string {
 		return "token-admit"
 	case HostInboundDenied:
 		return "denied"
+	case HostInboundAmbiguous:
+		return "ambiguous"
 	default:
 		return "not-computed"
 	}
@@ -84,6 +103,27 @@ type HostInboundAdmission struct {
 	// Kind is the stanza the token belongs to: "system-services" or "protocols".
 	// Set only for HostInboundTokenAdmit.
 	Kind string
+	// Ambiguous carries, for Status == HostInboundAmbiguous, the per-effective-view
+	// verdicts that DISAGREE for this tuple (#5579) — one group of interfaces
+	// admits it, another denies it. It lets the operator see WHICH interfaces have
+	// which posture without re-querying each, and directs them to the
+	// ingress-interface selector for the interface-scoped truth. Empty for every
+	// other status.
+	Ambiguous []HostInboundViewVerdict
+}
+
+// HostInboundViewVerdict is one distinct per-interface host-inbound verdict in a
+// zone that has divergent per-interface effective views (#5579). It pairs the
+// interfaces sharing an effective host-inbound token set with the admission that
+// set produces for the query tuple.
+type HostInboundViewVerdict struct {
+	// Interfaces are the interface refs whose effective host-inbound token set
+	// yields this verdict (may be empty for the zone-default view that no
+	// addressed interface fell into). Sorted.
+	Interfaces []string
+	Status     HostInboundStatus
+	Token      string
+	Kind       string
 }
 
 // Describe renders the operator-facing one-line explanation of the admission,
@@ -102,6 +142,18 @@ func (a HostInboundAdmission) Describe() string {
 		return "DENIED by host-inbound-traffic — no system-service/protocol admits this tuple, so the box drops it"
 	case HostInboundIndeterminate:
 		return "indeterminate — specify protocol (and destination-port or icmp-type) to identify the admitting host-inbound-traffic token"
+	case HostInboundAmbiguous:
+		var parts []string
+		for _, g := range a.Ambiguous {
+			scope := "zone-default"
+			if len(g.Interfaces) > 0 {
+				scope = strings.Join(g.Interfaces, ", ")
+			}
+			parts = append(parts, fmt.Sprintf("[%s] %s", scope,
+				HostInboundAdmission{Status: g.Status, Token: g.Token, Kind: g.Kind}.Describe()))
+		}
+		return "AMBIGUOUS — per-interface host-inbound-traffic posture differs across this zone's interfaces; " +
+			"specify ingress-interface to get one interface's true admission: " + strings.Join(parts, "; ")
 	default:
 		return ""
 	}
@@ -120,15 +172,87 @@ func ClassifyHostInbound(cfg *config.Config, fromZone string, proto uint8, hasPr
 	}
 
 	views := viewsForZone(cfg, fromZone)
+	if len(views) == 0 {
+		// An undefined / unconfigured ingress zone has no effective view; classify
+		// against an empty view so an isolated global-accept (ESP/AH, ICMP error,
+		// IPv6 ND) or an indeterminate/denied verdict is reported exactly as
+		// before the #5579 per-view refactor.
+		return classifyOneView(ZoneHostInboundView{Zone: fromZone}, proto, hasProto, dstPort, icmpType, family)
+	}
 
+	// #5579: classify EACH effective view independently and only fold them into a
+	// single verdict when they AGREE. A zone with no per-interface override yields
+	// exactly one view (pre-#3362 shape), so the common case is byte-identical to
+	// the historical first-admit behavior. When a mixed zone's views DISAGREE
+	// (one interface admits, a sibling default-denies), report HostInboundAmbiguous
+	// with the differing interface groups rather than OR-ing them into a zone-wide
+	// first-admit that lies for the denying interfaces — the false-admission #5579
+	// removes. Supply an ingress-interface selector to resolve one interface.
+	first := classifyOneView(views[0], proto, hasProto, dstPort, icmpType, family)
+	groups := []HostInboundViewVerdict{verdictFor(views[0], first)}
+	agree := true
+	for _, v := range views[1:] {
+		a := classifyOneView(v, proto, hasProto, dstPort, icmpType, family)
+		groups = append(groups, verdictFor(v, a))
+		if a.Status != first.Status || a.Token != first.Token || a.Kind != first.Kind {
+			agree = false
+		}
+	}
+	if agree {
+		return first
+	}
+	return HostInboundAdmission{Status: HostInboundAmbiguous, Ambiguous: groups}
+}
+
+// verdictFor pairs a view's interfaces with the admission it produced (#5579).
+func verdictFor(v ZoneHostInboundView, a HostInboundAdmission) HostInboundViewVerdict {
+	return HostInboundViewVerdict{
+		Interfaces: v.Interfaces,
+		Status:     a.Status,
+		Token:      a.Token,
+		Kind:       a.Kind,
+	}
+}
+
+// ClassifyHostInboundForInterface classifies the host-inbound admission for a
+// SINGLE ingress interface's EFFECTIVE host-inbound view (#5579). Unlike
+// ClassifyHostInbound — which folds every view in the zone with a first-admit OR
+// — it evaluates ONLY ifaceRef's effective token set (zone-level ∪ the
+// per-interface override, #3362, with the same physical→unit inheritance the
+// enforcement view builder uses), so a mixed zone reports the interface's TRUE
+// posture (admit vs deny) instead of a zone-wide first-admit fold. ifaceRef is
+// expected to be a caller-validated interface assigned to fromZone (see
+// ResolveHostInboundIngressInterface); an unresolved zone/interface yields
+// HostInboundNotComputed defensively.
+func ClassifyHostInboundForInterface(cfg *config.Config, fromZone, ifaceRef string, proto uint8, hasProto bool, dstPort int, icmpType *uint8, family string) HostInboundAdmission {
+	if cfg == nil || fromZone == "" || ifaceRef == "" {
+		return HostInboundAdmission{Status: HostInboundNotComputed}
+	}
+	zone := cfg.Security.Zones[fromZone]
+	if zone == nil {
+		return HostInboundAdmission{Status: HostInboundNotComputed}
+	}
+	// Resolve THIS interface's effective host-inbound token set with the same SSOT
+	// the enforcement view builder uses (unionHostInboundTokens over the zone-level
+	// stanza and the per-interface override, physical→unit inheritance included),
+	// then classify that single view.
+	svc, prot := unionHostInboundTokens(zone.HostInboundTraffic, buildInterfaceHostInboundMap(cfg)[ifaceRef])
+	v := ZoneHostInboundView{Zone: fromZone, Interfaces: []string{ifaceRef}, SystemServices: svc, Protocols: prot}
+	return classifyOneView(v, proto, hasProto, dstPort, icmpType, family)
+}
+
+// classifyOneView classifies a host-bound query tuple against a SINGLE effective
+// host-inbound view — the shared per-view core of ClassifyHostInbound and
+// ClassifyHostInboundForInterface (#5579). It mirrors the original whole-zone
+// ordering (full-admit → global pre-accept → indeterminate short-circuits →
+// per-view token admit → default-deny) scoped to one view's token set.
+func classifyOneView(v ZoneHostInboundView, proto uint8, hasProto bool, dstPort int, icmpType *uint8, family string) HostInboundAdmission {
 	// Full-admit (`system-services all` / `any-service`) admits everything,
 	// independent of the tuple — report it even when the tuple is otherwise
 	// indeterminate.
-	for _, v := range views {
-		for _, s := range v.SystemServices {
-			if config.HostInboundFullAdmitService(s) {
-				return HostInboundAdmission{Status: HostInboundTokenAdmit, Token: s, Kind: "system-services"}
-			}
+	for _, s := range v.SystemServices {
+		if config.HostInboundFullAdmitService(s) {
+			return HostInboundAdmission{Status: HostInboundTokenAdmit, Token: s, Kind: "system-services"}
 		}
 	}
 
@@ -153,16 +277,48 @@ func ClassifyHostInbound(cfg *config.Config, fromZone string, proto uint8, hasPr
 	if family == "" {
 		fams = []string{"ip", "ip6"}
 	}
-	for _, v := range views {
-		for _, fam := range fams {
-			if tok, kind, ok := hostInboundViewAdmit(v, proto, dstPort, icmpType, fam); ok {
-				return HostInboundAdmission{Status: HostInboundTokenAdmit, Token: tok, Kind: kind}
-			}
+	for _, fam := range fams {
+		if tok, kind, ok := hostInboundViewAdmit(v, proto, dstPort, icmpType, fam); ok {
+			return HostInboundAdmission{Status: HostInboundTokenAdmit, Token: tok, Kind: kind}
 		}
 	}
 	// The zone is configured (post-#3405 every configured zone enforces) and
-	// nothing admits — default-deny.
+	// nothing in this view admits — default-deny.
 	return HostInboundAdmission{Status: HostInboundDenied}
+}
+
+// ResolveHostInboundIngressInterface validates an ingress-interface selector
+// (#5579) for a host-bound match-policies query: the ref must name an interface
+// assigned to fromZone. It is the SSOT reject used by every operator surface
+// (REST / gRPC / local CLI) so an unknown, zone-mismatched, or lifeline ref
+// fails the query CLOSED with a clear error instead of silently degrading to the
+// zone-wide fold. An empty ref (selector omitted) is not an error. cfg must be
+// non-nil (callers skip validation during the no-config boot window, which
+// returns the default-deny verdict regardless of any interface).
+//
+// A management/cluster lifeline interface (fxp0 / em0 / fab*) is rejected: its
+// host traffic is served UNCONDITIONALLY (excluded from the host-inbound deny),
+// so per-interface host-inbound classification does not describe it — reporting a
+// token/deny verdict for a lifeline would be a fresh false answer. The error
+// tells the operator the lifeline is always served.
+func ResolveHostInboundIngressInterface(cfg *config.Config, fromZone, ifaceRef string) error {
+	if ifaceRef == "" {
+		return nil
+	}
+	if cfg == nil {
+		return nil
+	}
+	if hostInboundLifelineInterface(ifaceRef, hostInboundLifelineSet(cfg)) {
+		return fmt.Errorf("ingress-interface %q is a management/cluster lifeline (fxp0/em0/fab*); its host traffic is served unconditionally and is not subject to per-interface host-inbound classification", ifaceRef)
+	}
+	zone := buildInterfaceZoneMap(cfg)[ifaceRef]
+	if zone == "" {
+		return fmt.Errorf("unknown ingress-interface %q (not assigned to any security zone)", ifaceRef)
+	}
+	if zone != fromZone {
+		return fmt.Errorf("ingress-interface %q is in zone %q, not from-zone %q", ifaceRef, zone, fromZone)
+	}
+	return nil
 }
 
 // viewsForZone returns the host-inbound effective views for the given ingress

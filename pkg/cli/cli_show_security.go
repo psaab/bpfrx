@@ -381,6 +381,14 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 
+	// #5579: validate the optional ingress-interface selector against the live
+	// config (zone membership + lifeline reject) so the host-inbound classifier is
+	// scoped only to a real interface of the queried zone, failing closed on an
+	// unknown / zone-mismatched / lifeline ref exactly like the REST/gRPC surfaces.
+	if err := dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, sel.IngressInterface); err != nil {
+		return err
+	}
+
 	// #3042: delegate to the single shared simulator so the CLI agrees with
 	// the runtime evaluator. The pre-#3042 loop scanned only zone-pair
 	// policies (never globals), hard-coded "default deny" (ignoring
@@ -404,6 +412,9 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 		// #5572: a non-first IP fragment (no L4 header) reproduces the #4569
 		// fragment-associated deny; false is a normal L4-present packet.
 		NonFirstFragment: nonFirstFrag,
+		// #5579: scope the host-inbound classifier to this ingress interface's
+		// effective view (validated above). "" = zone-scoped, unchanged.
+		IngressInterface: sel.IngressInterface,
 		FeedOverlay:      c.feedOverlay(),
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.

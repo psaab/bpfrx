@@ -1,0 +1,173 @@
+package userspace
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+)
+
+// host_inbound_classify_iface_5579_test.go guards the #5579 per-interface
+// host-inbound classification: the match-policies host-inbound classifier used to
+// OR every effective view in a zone and return on the FIRST admitting view, so a
+// MIXED zone (one interface with an ssh override, a sibling default-deny) reported
+// a zone-wide token-admit even for the sibling interface the runtime denies. The
+// classifier now (a) reports HostInboundAmbiguous for an unqualified zone-scoped
+// query when the per-interface views disagree, and (b) classifies ONLY the named
+// interface's effective view when an ingress interface is supplied.
+
+const (
+	hi5579TCP = uint8(6)
+)
+
+// Test_5579_ZoneScopedMixedZoneIsAmbiguous asserts an UNQUALIFIED (no ingress
+// interface) host-inbound classification of a mixed zone reports ambiguity rather
+// than folding the divergent per-interface views into a zone-wide first-admit.
+//
+// hostInboundCfg3362() builds a `wan` zone where reth0.50 admits ssh (override)
+// and reth1.0 default-denies (no override, no zone-level stanza). A tcp/22 query
+// therefore admits on reth0.50 and denies on reth1.0.
+//
+// RED-on-revert: revert ClassifyHostInbound to the pre-#5579 first-admit fold
+// (return on the first admitting view) and this query returns HostInboundTokenAdmit
+// ("ssh") — the false zone-wide admission — instead of HostInboundAmbiguous, so
+// the status assertion below fails.
+func Test_5579_ZoneScopedMixedZoneIsAmbiguous(t *testing.T) {
+	cfg := hostInboundCfg3362()
+
+	got := ClassifyHostInbound(cfg, "wan", hi5579TCP, true, 22, nil, "ip")
+	if got.Status != HostInboundAmbiguous {
+		t.Fatalf("zone-scoped tcp/22 status = %v, want ambiguous (reth0.50 admits ssh, reth1.0 denies)", got.Status)
+	}
+	// The ambiguity report must name BOTH divergent interface groups so the
+	// operator sees which admits and which denies.
+	if len(got.Ambiguous) < 2 {
+		t.Fatalf("ambiguous groups = %d, want >= 2 (the admit + deny views)", len(got.Ambiguous))
+	}
+	var sawAdmit, sawDeny bool
+	for _, g := range got.Ambiguous {
+		switch g.Status {
+		case HostInboundTokenAdmit:
+			if g.Token == "ssh" && ifaceInGroup(g.Interfaces, "reth0.50") {
+				sawAdmit = true
+			}
+		case HostInboundDenied:
+			if ifaceInGroup(g.Interfaces, "reth1.0") {
+				sawDeny = true
+			}
+		}
+	}
+	if !sawAdmit {
+		t.Errorf("ambiguous groups %+v missing the reth0.50 ssh token-admit", got.Ambiguous)
+	}
+	if !sawDeny {
+		t.Errorf("ambiguous groups %+v missing the reth1.0 deny", got.Ambiguous)
+	}
+	// Describe() must direct the operator at the ingress-interface selector.
+	if d := got.Describe(); !strings.Contains(d, "ingress-interface") {
+		t.Errorf("ambiguous Describe() = %q, want it to mention ingress-interface", d)
+	}
+}
+
+// Test_5579_IngressInterfaceScopesToTruePosture is the core fail-on-revert: a
+// query scoped to a SPECIFIC ingress interface reports THAT interface's true
+// host-inbound posture — admit for the ssh-override interface, DENY for the
+// sibling — not the zone-wide first-admit fold.
+//
+// RED-on-revert: revert ClassifyHostInboundForInterface to delegate to the
+// zone-wide ClassifyHostInbound (first-admit OR across all views) and the reth1.0
+// query folds to the zone's ssh admit — HostInboundTokenAdmit instead of
+// HostInboundDenied — so the deny assertion fails.
+func Test_5579_IngressInterfaceScopesToTruePosture(t *testing.T) {
+	cfg := hostInboundCfg3362()
+
+	admit := ClassifyHostInboundForInterface(cfg, "wan", "reth0.50", hi5579TCP, true, 22, nil, "ip")
+	if admit.Status != HostInboundTokenAdmit || admit.Token != "ssh" {
+		t.Errorf("reth0.50 tcp/22 = %v/%q, want token-admit/ssh", admit.Status, admit.Token)
+	}
+
+	deny := ClassifyHostInboundForInterface(cfg, "wan", "reth1.0", hi5579TCP, true, 22, nil, "ip")
+	if deny.Status != HostInboundDenied {
+		t.Errorf("reth1.0 tcp/22 = %v, want denied (sibling has no host-inbound override, default-deny)", deny.Status)
+	}
+}
+
+// Test_5579_IngressInterfaceUnionWithZoneLevel asserts the interface-scoped
+// classifier honors the zone-level ∪ per-interface UNION (Junos additive
+// semantics): a zone-level `ping` plus reth0.50's `ssh` override admits ssh on
+// reth0.50, while reth1.0 admits only the zone-level ping and denies ssh.
+func Test_5579_IngressInterfaceUnionWithZoneLevel(t *testing.T) {
+	cfg := hostInboundCfg3362()
+	cfg.Security.Zones["wan"].HostInboundTraffic = &config.HostInboundTraffic{SystemServices: []string{"ping"}}
+
+	// reth1.0 admits the zone-level ping (icmp echo type 8) but denies ssh.
+	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth1.0", uint8(1), true, 0, u8ptr(8), "ip"); a.Status != HostInboundTokenAdmit || a.Token != "ping" {
+		t.Errorf("reth1.0 icmp echo = %v/%q, want token-admit/ping (zone-level)", a.Status, a.Token)
+	}
+	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth1.0", hi5579TCP, true, 22, nil, "ip"); a.Status != HostInboundDenied {
+		t.Errorf("reth1.0 tcp/22 = %v, want denied (ssh only on reth0.50)", a.Status)
+	}
+	// reth0.50 admits ssh (override) AND ping (zone-level union).
+	if a := ClassifyHostInboundForInterface(cfg, "wan", "reth0.50", hi5579TCP, true, 22, nil, "ip"); a.Status != HostInboundTokenAdmit || a.Token != "ssh" {
+		t.Errorf("reth0.50 tcp/22 = %v/%q, want token-admit/ssh", a.Status, a.Token)
+	}
+}
+
+// Test_5579_ResolveIngressInterfaceValidation guards the fail-closed selector
+// validator: an unknown interface, a zone-mismatched interface, and a
+// management/cluster lifeline are all rejected; a real interface of the queried
+// zone and an empty (omitted) selector pass.
+func Test_5579_ResolveIngressInterfaceValidation(t *testing.T) {
+	cfg := hostInboundCfg3362()
+
+	if err := ResolveHostInboundIngressInterface(cfg, "wan", "reth0.50"); err != nil {
+		t.Errorf("valid reth0.50 rejected: %v", err)
+	}
+	if err := ResolveHostInboundIngressInterface(cfg, "wan", ""); err != nil {
+		t.Errorf("empty (omitted) selector rejected: %v", err)
+	}
+	if err := ResolveHostInboundIngressInterface(cfg, "wan", "ge-9/9/9.9"); err == nil {
+		t.Error("unknown interface accepted, want reject")
+	}
+
+	// Zone-mismatch: add a second zone owning a different interface.
+	cfg.Interfaces.Interfaces["reth2"] = &config.InterfaceConfig{Name: "reth2", Units: map[int]*config.InterfaceUnit{
+		0: {Number: 0, Addresses: []string{"10.0.99.1/24"}},
+	}}
+	cfg.Security.Zones["lan"] = &config.ZoneConfig{Name: "lan", Interfaces: []string{"reth2.0"}}
+	if err := ResolveHostInboundIngressInterface(cfg, "wan", "reth2.0"); err == nil {
+		t.Error("zone-mismatched reth2.0 (in lan) accepted for from-zone wan, want reject")
+	}
+}
+
+// Test_5579_ResolveIngressInterfaceRejectsLifeline asserts a management/cluster
+// lifeline (fxp0) is rejected — its host traffic is served unconditionally, so a
+// per-interface host-inbound verdict would be a fresh false answer.
+func Test_5579_ResolveIngressInterfaceRejectsLifeline(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"fxp0": {Name: "fxp0", Units: map[int]*config.InterfaceUnit{
+			0: {Number: 0, Addresses: []string{"10.0.0.2/24"}},
+		}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"mgmt": {Name: "mgmt", Interfaces: []string{"fxp0.0"},
+			HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}}},
+	}
+	err := ResolveHostInboundIngressInterface(cfg, "mgmt", "fxp0.0")
+	if err == nil {
+		t.Fatal("lifeline fxp0.0 accepted, want reject (served unconditionally)")
+	}
+	if !strings.Contains(err.Error(), "lifeline") {
+		t.Errorf("lifeline reject error = %q, want it to mention lifeline", err)
+	}
+}
+
+func ifaceInGroup(ifaces []string, want string) bool {
+	for _, i := range ifaces {
+		if i == want {
+			return true
+		}
+	}
+	return false
+}

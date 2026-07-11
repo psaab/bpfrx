@@ -561,6 +561,12 @@ var matchPoliciesSelectorKeys = []string{
 	// #5572: non-first-fragment (l4_present == false) discriminator. A boolean
 	// param ("true"/"1"/"false"/"0"/absent); absent = a normal L4 packet.
 	"non_first_fragment",
+	// #5579: ingress-interface selector — scopes a `to-zone junos-host`
+	// host-inbound query to ONE interface's effective host-inbound view (admit vs
+	// deny) instead of the zone-wide first-admit fold. A free-form interface ref
+	// validated against the live config (zone membership + lifeline reject);
+	// absent = zone-scoped classification.
+	"ingress_interface",
 }
 
 // isMatchPoliciesSelector reports whether key is a recognized match-policies
@@ -742,6 +748,19 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// #5579: validate the optional ingress-interface selector against the live
+	// config — it must name an interface assigned to from_zone and must not be a
+	// management/cluster lifeline (served unconditionally). An unknown /
+	// zone-mismatched / lifeline ref is a fail-closed 400, mirroring the src_ip /
+	// port / protocol validators above, so the host-inbound classifier is only
+	// ever scoped to a real interface of the queried zone. Reached after cfg !=
+	// nil so zone membership is resolvable.
+	ingressIface := q.Get("ingress_interface")
+	if err := dpuserspace.ResolveHostInboundIngressInterface(cfg, fromZone, ingressIface); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// #3042: delegate to the single shared simulator so REST agrees with the
 	// runtime evaluator (exact zone-pair -> wildcard-zone tiers (#3090) ->
 	// scoped global (#3148) -> default-policy, predefined + nested-app-set +
@@ -782,6 +801,9 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		ICMPType:         icmpType,
 		ICMPCode:         icmpCode,
 		NonFirstFragment: nonFirstFrag,
+		// #5579: scope the host-inbound classifier to this ingress interface's
+		// effective view (validated above). "" = zone-scoped, unchanged.
+		IngressInterface: ingressIface,
 		FeedOverlay:      overlay,
 		PolicyInactiveFn: inactiveFn,
 	})
