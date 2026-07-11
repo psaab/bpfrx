@@ -212,6 +212,28 @@ func (m *Manager) IsLocalPrimary(rgID int) bool {
 	return false
 }
 
+// IsPeerPrimary reports whether the PEER node is primary for the given RG,
+// per the last heartbeat-advertised peer group state. It returns false when the
+// peer is not alive, the RG is unknown to the peer, or the peer is in any
+// non-primary state (secondary, secondary-hold, election, disabled, lost).
+//
+// MonitorInterface uses this to proxy a locally-present RETH ONLY when the peer
+// actually OWNS the RG. Proxying merely because the LOCAL node is not primary
+// lets two non-primary nodes (both-secondary / election / sync-hold) forward
+// the request to each other in an A->B->A loop that storms
+// connections/streams/goroutines (#5497).
+func (m *Manager) IsPeerPrimary(rgID int) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.peerAlive {
+		return false
+	}
+	if pg, ok := m.peerGroups[rgID]; ok {
+		return pg.State == StatePrimary
+	}
+	return false
+}
+
 // IsLocalPrimaryAny returns true if this node is primary for any RG.
 func (m *Manager) IsLocalPrimaryAny() bool {
 	m.mu.RLock()

@@ -45654,3 +45654,20 @@ top.
   pkg/grpcapi/zeroize_gate_stop_5281_test.go,
   pkg/grpcapi/system_action_journal_4108_test.go,
   pkg/grpcapi/zeroize_configdb_4576_test.go, _Log.md
+
+- **Timestamp**: 2026-07-10
+  **Action**: #5497 fix — bound MonitorInterface peer proxy to a single hop.
+  Added `cluster.Manager.IsPeerPrimary(rg)` (heartbeat-advertised peer RG
+  ownership; false when peer not alive). Rewrote the MonitorInterface proxy
+  trigger into a pure `decideMonitorProxy` helper: proxies a locally-present
+  RETH ONLY when `!IsLocalPrimary(rg) && IsPeerPrimary(rg)` (not merely
+  `!IsLocalPrimary`), and stamps/checks the `xpf-no-peer` hop marker so a
+  request already forwarded from the peer is served locally and never
+  re-proxied. Closes the both-secondary/election/hold A→B→A recursion that
+  stormed connections/streams/goroutines. Added grpcapi decision + marker
+  tests (RED-on-revert for both guards) and a cluster IsPeerPrimary test.
+  Updated pkg/grpcapi/README.md with the one-hop-bound contract.
+  **File(s)**: pkg/cluster/group_state.go, pkg/cluster/peer_primary_5497_test.go,
+  pkg/grpcapi/server_diag_monitor.go,
+  pkg/grpcapi/server_diag_monitor_proxy_5497_test.go, pkg/grpcapi/README.md,
+  _Log.md

@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/psaab/xpf/pkg/monitoriface"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -308,6 +310,80 @@ func interfaceAliasSet(cfg *config.Config, name string) map[string]bool {
 	return nil
 }
 
+// monitorNoPeerMarker is the gRPC metadata key stamped on a MonitorInterface
+// request that has already been forwarded to the cluster peer. A request
+// carrying it is served LOCALLY and never re-proxied — the strict one-hop
+// forwarding bound that closes the #5497 A->B->A recursion. It reuses the
+// chassis-forwarding proxy's convention (server_show_cluster_text.go).
+const monitorNoPeerMarker = "xpf-no-peer"
+
+// monitorRequestForwardedFromPeer reports whether the inbound MonitorInterface
+// request already carries the no-peer hop marker (i.e. the peer forwarded it to
+// us). The marker only ever SUPPRESSES a second proxy hop, so a client cannot
+// spoof it to reach data it could not otherwise reach — the worst it can do is
+// force a would-be proxy to serve locally / report not-found.
+func monitorRequestForwardedFromPeer(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+	return len(md.Get(monitorNoPeerMarker)) > 0
+}
+
+// monitorClusterState is the slice of the cluster manager the MonitorInterface
+// proxy decision needs. *cluster.Manager satisfies it; tests supply a fake so
+// the #5497 hop-bound / peer-ownership logic is exercised without a live
+// cluster or a network dial.
+type monitorClusterState interface {
+	IsLocalPrimary(rg int) bool
+	IsPeerPrimary(rg int) bool
+}
+
+// monitorProxyAction is the outcome of the MonitorInterface single-interface
+// proxy decision.
+type monitorProxyAction int
+
+const (
+	monitorServeLocal  monitorProxyAction = iota // read counters on this node
+	monitorProxyToPeer                           // forward one hop to the peer
+	monitorNotFound                              // interface exists on neither side
+)
+
+// decideMonitorProxy decides how a single-interface MonitorInterface request is
+// handled on a cluster node, enforcing the #5497 invariant that one management
+// stream consumes O(1) resources with a strict one-hop forwarding bound.
+//
+//   - alreadyProxied: the request arrived carrying the no-peer hop marker, i.e.
+//     the peer forwarded it to us. It is served locally and NEVER re-proxied — a
+//     second hop is the A->B->A recursion that storms
+//     connections/streams/goroutines.
+//   - existsLocally: the resolved kernel interface exists on this node.
+//   - isPeerMember: the interface is a peer node's physical member (its FPC slot
+//     maps to the peer, or it is only named in the peer's RG monitors) so it can
+//     only be read on the peer.
+//   - isReth / rg: a locally-present RETH may be MASTER on the peer. It is
+//     proxied ONLY when the peer actually OWNS the RG (peer primary) while this
+//     node does not (local not primary). During both-secondary / election /
+//     sync-hold / disabled / peer-lost NEITHER node is primary, so it is served
+//     locally instead of proxied — the old `!IsLocalPrimary` test proxied in all
+//     those states and, absent a hop marker, looped (#5497).
+func decideMonitorProxy(alreadyProxied, existsLocally, isPeerMember, isReth bool, rg int, cl monitorClusterState) monitorProxyAction {
+	if !existsLocally {
+		// Interface is not on this node. Forward to the peer only if it owns
+		// the physical member AND we were not already forwarded — otherwise do
+		// not bounce it back; report not-found so the loop cannot form.
+		if isPeerMember && !alreadyProxied {
+			return monitorProxyToPeer
+		}
+		return monitorNotFound
+	}
+	if isReth && !alreadyProxied && rg > 0 && cl != nil &&
+		!cl.IsLocalPrimary(rg) && cl.IsPeerPrimary(rg) {
+		return monitorProxyToPeer
+	}
+	return monitorServeLocal
+}
+
 // MonitorInterface streams pre-formatted interface statistics frames.
 func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.ServerStreamingServer[pb.MonitorInterfaceResponse]) error {
 	cfg := s.store.ActiveConfig()
@@ -373,25 +449,30 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 		singleDisplayName = req.InterfaceName
 		singleKernelName = monitoriface.ResolvePhysicalParent(resolveToKernel(req.InterfaceName))
 
-		// Check if interface should be proxied to the cluster peer.
-		needProxy := false
-		if _, err := net.InterfaceByName(singleKernelName); err != nil {
-			// Interface doesn't exist locally. Check if it's a peer's physical member.
-			if isPeerInterface(req.InterfaceName) {
-				needProxy = true
-			} else {
-				return status.Errorf(codes.NotFound, "interface %s not found", req.InterfaceName)
-			}
-		} else if isRethName(req.InterfaceName) {
-			// RETH exists locally but may be MASTER on the peer node.
-			if rg := rethRG(req.InterfaceName); rg > 0 && s.cluster != nil && !s.cluster.IsLocalPrimary(rg) {
-				needProxy = true
-			}
+		// Decide whether to serve locally, proxy one hop to the peer, or report
+		// not-found. A request already forwarded from the peer (no-peer marker)
+		// is never re-proxied, and a locally-present RETH is proxied only when
+		// the peer actually owns the RG — together these bound the forwarding
+		// to a single hop and close the #5497 A->B->A recursion.
+		_, ifErr := net.InterfaceByName(singleKernelName)
+		var cl monitorClusterState
+		if s.cluster != nil {
+			cl = s.cluster
 		}
-
-		if needProxy {
+		switch decideMonitorProxy(
+			monitorRequestForwardedFromPeer(stream.Context()),
+			ifErr == nil,
+			isPeerInterface(req.InterfaceName),
+			isRethName(req.InterfaceName),
+			rethRG(req.InterfaceName),
+			cl,
+		) {
+		case monitorProxyToPeer:
 			return s.proxyMonitorInterface(req, stream)
+		case monitorNotFound:
+			return status.Errorf(codes.NotFound, "interface %s not found", req.InterfaceName)
 		}
+		// monitorServeLocal: fall through and read local counters below.
 	}
 
 	summaryInterfaces := func() ([]string, map[string]string) {
@@ -482,7 +563,10 @@ func (s *Server) proxyMonitorInterface(req *pb.MonitorInterfaceRequest, stream g
 	}
 	defer conn.Close()
 
-	ctx := stream.Context()
+	// Stamp the no-peer hop marker so the peer serves this request LOCALLY and
+	// never proxies it back to us — the strict one-hop bound that closes the
+	// #5497 A->B->A recursion (mirrors the chassis-forwarding proxy).
+	ctx := metadata.AppendToOutgoingContext(stream.Context(), monitorNoPeerMarker, "1")
 
 	client := pb.NewBpfrxServiceClient(conn)
 	peerStream, err := client.MonitorInterface(ctx, req)
