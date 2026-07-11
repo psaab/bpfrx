@@ -695,13 +695,21 @@ func emitJunosHostDenyProgram(rules *[]string, p dpuserspace.JunosHostProgram) {
 		if p.CoarseAdmitsIKE {
 			// The coarse gate admits IKE (udp 500/4500) from any source, and the
 			// userspace IPsec passthrough reinjects it before the fine policy, so
-			// the fine drop must not swallow it.
-			*rules = append(*rules, "    iifname "+iif+" udp dport { 500, 4500 } accept")
+			// the fine drop must not swallow it. #5565: scope the shield to the
+			// SPECIFIC netdevs whose effective per-interface host-inbound set admits
+			// IKE (IKEExemptNetdevs), NOT the whole zone iifname set — a per-
+			// interface `ike` override must not leak to a sibling interface. A
+			// zone-level `ike` yields the full IngressIfnames set (zone-wide).
+			ikeIif := nftIifnameSet(p.IKEExemptNetdevs)
+			*rules = append(*rules, "    iifname "+ikeIif+" udp dport { 500, 4500 } accept")
 		}
 		if p.CoarseIdentResets {
-			// The zone's effective coarse verdict for TCP/113 is a RST (ident-reset
-			// set AND not all/any-service); preserve it ahead of the silent drop.
-			*rules = append(*rules, "    iifname "+iif+" tcp dport 113 reject with tcp reset")
+			// The effective coarse verdict for TCP/113 is a RST (ident-reset set AND
+			// not all/any-service); preserve it ahead of the silent drop. #5565:
+			// scope to IdentResetNetdevs (the interfaces that configured
+			// ident-reset), never the whole zone.
+			identIif := nftIifnameSet(p.IdentResetNetdevs)
+			*rules = append(*rules, "    iifname "+identIif+" tcp dport 113 reject with tcp reset")
 		}
 	}
 	for _, r := range p.RulesV4 {
