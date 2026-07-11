@@ -13,6 +13,10 @@ tab completion. The wire schema is `proto/xpf/v1`.
 - `NewServer(addr string, cfg Config) *Server` — `server.go`.
 - `Run(ctx context.Context) error` — `server.go`. Starts the listener
   and blocks until the context is cancelled.
+- `RunFabricListener(ctx, addr, vrfDevice)` — `server.go`. Supervises the
+  network-exposed peer-proxy listener (see trust boundary below). Blocks
+  until ctx is cancelled; the caller starts it **once** and the retry
+  supervision is internal (#5047).
 - Tab completion: `Complete` RPC, backed by `pkg/cmdtree`.
 
 ## Trust boundary (loopback-only, #5035)
@@ -29,6 +33,23 @@ auth mode that unlocks a non-loopback bind here: the intentionally
 network-exposed gRPC surface is the **separate** fabric listener
 (`RunFabricListener`), which authenticates (#4107) and allowlists (#4122)
 every call.
+
+### Fabric-listener supervision (#5047)
+
+`RunFabricListener` is a supervised loop, not a one-shot. A transient
+bind failure or a later `Serve` fault used to be **terminal** — the
+listener returned/blocked forever and the peer-proxy surface (monitor,
+peer-show, proxied-failover) was permanently lost until the whole
+cluster-comms lifecycle restarted, with no fallback on a single-fabric
+deployment. It now re-binds and re-serves on any fault with a bounded
+exponential backoff (100 ms → 5 s cap, reset after a `Serve` that stayed
+up ≥ 30 s) while ctx is live, so a persistent bind failure keeps retrying
+at the cap without spinning. The expected graceful-shutdown signals
+(ctx cancel, `grpc.ErrServerStopped`) exit cleanly and are never retried,
+and neither the supervisor nor its `Serve` worker outlives ctx. Per-bind
+up/down health is published via `FabricListenerUp(addr)` /
+`FabricListenerHealth()` and logged at Info/Warn on transitions (retry
+ticks are Debug).
 
 ## Callers
 

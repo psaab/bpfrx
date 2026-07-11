@@ -3,11 +3,13 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -173,6 +175,13 @@ type Server struct {
 	// tokenless fabric RPC is rejected (a downgrade to cleartext once both
 	// nodes are keyed is an attack), not treated as a key-rollout grace case.
 	fabricPeerAuthSeen atomic.Bool
+	// fabricListenerMu guards fabricListenerUp (#5047). The fabric-listener
+	// supervisor records per-address up/down health so a status surface (or the
+	// caller) can observe whether the network-exposed peer-proxy gRPC surface is
+	// currently serving. Keyed by bind address because a dual-fabric deployment
+	// runs two supervisors (fab0 + fab1) against one Server.
+	fabricListenerMu sync.Mutex
+	fabricListenerUp map[string]bool
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
@@ -336,19 +345,21 @@ func (s *Server) Run(ctx context.Context) error {
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.UnaryInterceptor(s.configLockInterceptor),
 	)
+	slog.Info("gRPC server listening", "addr", s.addr)
 	return s.serveUntilDone(ctx, srv, lis)
 }
 
 // serveUntilDone registers the service on srv, serves lis, and on ctx
 // cancellation stops srv with a bounded graceful shutdown (stopGRPCServer). It
 // is split out of Run so the shutdown path can be exercised over an in-memory
-// listener in tests.
+// listener in tests. The caller logs the "listening" transition (Run for the
+// loopback listener, superviseFabricListener for the fabric listener) so the
+// logged address is accurate for each listener; serveUntilDone stays quiet.
 func (s *Server) serveUntilDone(ctx context.Context, srv *grpc.Server, lis net.Listener) error {
 	pb.RegisterBpfrxServiceServer(srv, s)
 
 	errCh := make(chan error, 1)
 	go func() {
-		slog.Info("gRPC server listening", "addr", s.addr)
 		if err := srv.Serve(lis); err != nil {
 			errCh <- err
 		}
@@ -365,9 +376,60 @@ func (s *Server) serveUntilDone(ctx context.Context, srv *grpc.Server, lis net.L
 	return nil
 }
 
-// RunFabricListener starts an additional gRPC listener on the fabric IP
-// so the cluster peer can proxy monitor requests. Blocks until ctx is cancelled.
-// vrfDevice may be empty for default VRF, or e.g. "vrf-mgmt".
+// Fabric-listener supervisor tuning (#5047). A transient bind or serve fault on
+// the fabric listener used to be TERMINAL: a failed lc.Listen returned outright
+// and the Serve goroutine only warned, so the caller (which starts the listener
+// exactly once) permanently lost the network-exposed peer-proxy gRPC surface
+// (monitor / peer-show / proxied-failover) until the whole cluster-comms
+// lifecycle restarted. Single-fabric deployments had no fallback. The supervisor
+// now retries a fault with a bounded exponential backoff while ctx is live.
+const (
+	// fabricListenerBackoffBase is the first retry delay after a fault.
+	fabricListenerBackoffBase = 100 * time.Millisecond
+	// fabricListenerBackoffMax caps the backoff so a persistent bind failure
+	// keeps retrying at a bounded interval (no permanent give-up) without
+	// spinning.
+	fabricListenerBackoffMax = 5 * time.Second
+	// fabricListenerHealthyServe is how long a Serve must stay up before the
+	// supervisor treats it as a healthy session and resets the backoff to base.
+	// A Serve that faults sooner keeps the backoff growing so a rapid
+	// listen/serve flap does not reset to a tight retry.
+	fabricListenerHealthyServe = 30 * time.Second
+)
+
+// fabricSupervisorConfig carries the fabric-listener supervisor seams (#5047).
+// Production wires listen to the SO_REUSEADDR/REUSEPORT/SO_BINDTODEVICE
+// ListenConfig and serve to buildFabricServer + serveUntilDone; tests inject a
+// transient/persistent listen failure or a serve fault without a real socket.
+type fabricSupervisorConfig struct {
+	backoffBase  time.Duration
+	backoffMax   time.Duration
+	healthyServe time.Duration
+	// listen creates a fresh listener bound to the fabric address.
+	listen func(ctx context.Context) (net.Listener, error)
+	// serve serves the fabric gRPC service on lis until it faults or ctx is
+	// cancelled. It returns nil on a clean ctx-cancel shutdown and the serve
+	// error otherwise (a genuine fault the supervisor should retry).
+	serve func(ctx context.Context, lis net.Listener) error
+}
+
+// RunFabricListener supervises an additional gRPC listener on the fabric IP so
+// the cluster peer can proxy monitor / show / failover requests. It blocks
+// until ctx is cancelled; the caller starts it exactly once and the retry
+// supervision is INTERNAL (#5047). vrfDevice may be empty for the default VRF,
+// or e.g. "vrf-mgmt".
+//
+// #4122 + #4107: the fabric listener is the ONLY network-exposed gRPC surface
+// (the loopback Run() listener binds 127.0.0.1). Two interceptor layers protect
+// it, both absent from the loopback listener (127.0.0.1 is the trusted local
+// surface, full service):
+//  1. fabricAuth* (#4107) AUTHENTICATES the caller with the control-link PSK
+//     (HMAC token in metadata) so an unauthenticated host on the shared control
+//     segment cannot invoke ANY fabric RPC. Runs FIRST.
+//  2. fabricAllowlist* (#4122) AUTHORIZES only the read/monitor/failover RPCs
+//     the peer legitimately proxies; destructive RPCs (Commit/Delete/Rollback,
+//     SystemAction{zeroize,reboot,halt,power-off}) are rejected with
+//     PermissionDenied and never reach a handler.
 func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) {
 	lc := net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -382,39 +444,144 @@ func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) 
 			return err
 		},
 	}
-	lis, err := lc.Listen(ctx, "tcp", addr)
-	if err != nil {
-		slog.Warn("gRPC fabric listener failed", "addr", addr, "vrf", vrfDevice, "err", err)
-		return
-	}
+	s.superviseFabricListener(ctx, addr, vrfDevice, fabricSupervisorConfig{
+		backoffBase:  fabricListenerBackoffBase,
+		backoffMax:   fabricListenerBackoffMax,
+		healthyServe: fabricListenerHealthyServe,
+		listen: func(ctx context.Context) (net.Listener, error) {
+			return lc.Listen(ctx, "tcp", addr)
+		},
+		serve: func(ctx context.Context, lis net.Listener) error {
+			return s.serveUntilDone(ctx, s.buildFabricServer(), lis)
+		},
+	})
+}
 
-	// #4122 + #4107: the fabric listener is the ONLY network-exposed gRPC
-	// surface (the loopback Run() listener binds 127.0.0.1). Two interceptor
-	// layers protect it, both absent from the loopback listener (127.0.0.1 is
-	// the trusted local surface, full service):
-	//   1. fabricAuth* (#4107) AUTHENTICATES the caller with the control-link
-	//      PSK (HMAC token in metadata) so an unauthenticated host on the
-	//      shared control segment cannot invoke ANY fabric RPC. Runs FIRST.
-	//   2. fabricAllowlist* (#4122) AUTHORIZES only the read/monitor/failover
-	//      RPCs the peer legitimately proxies; destructive RPCs
-	//      (Commit/Delete/Rollback, SystemAction{zeroize,reboot,halt,power-off})
-	//      are rejected with PermissionDenied and never reach a handler.
-	srv := grpc.NewServer(
+// buildFabricServer constructs the fabric gRPC server with the #4107 auth +
+// #4122 allowlist interceptor chains. serveUntilDone registers the service, so
+// this only builds the server (mirrors Run()'s split).
+func (s *Server) buildFabricServer() *grpc.Server {
+	return grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxRecvMsgSize),
 		grpc.ChainUnaryInterceptor(s.fabricAuthUnaryInterceptor, s.fabricAllowlistUnaryInterceptor, s.configLockInterceptor),
 		grpc.ChainStreamInterceptor(s.fabricAuthStreamInterceptor, s.fabricAllowlistStreamInterceptor),
 	)
-	pb.RegisterBpfrxServiceServer(srv, s)
+}
 
-	go func() {
-		slog.Info("gRPC fabric listener started", "addr", addr, "vrf", vrfDevice)
-		if err := srv.Serve(lis); err != nil {
-			slog.Warn("gRPC fabric listener error", "err", err)
+// superviseFabricListener is the fabric-listener supervision loop (#5047). It
+// runs while ctx is live: bind a listener, serve it, and on a fault (bind
+// failure OR a Serve error that is NOT the expected graceful shutdown) retry
+// after a bounded exponential backoff. It resets the backoff to base after a
+// Serve that stayed up at least cfg.healthyServe, so a persistent bind failure
+// keeps retrying at cfg.backoffMax (no spin, no permanent give-up) while a rare
+// one-off fault recovers quickly. It exits cleanly — no error-retry — on ctx
+// cancellation or the expected grpc.ErrServerStopped. Per-address up/down
+// health is published (setFabricListenerUp) and transitions are logged at
+// Info/Warn; per-retry ticks stay at Debug.
+func (s *Server) superviseFabricListener(ctx context.Context, addr, vrfDevice string, cfg fabricSupervisorConfig) {
+	defer s.setFabricListenerUp(addr, false) // ensure health reads down once the supervisor exits
+	backoff := cfg.backoffBase
+	for {
+		if ctx.Err() != nil {
+			return
 		}
-	}()
+		lis, err := cfg.listen(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("gRPC fabric listener bind failed; will retry",
+				"addr", addr, "vrf", vrfDevice, "backoff", backoff, "err", err)
+			if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
+				return
+			}
+			continue
+		}
 
-	<-ctx.Done()
-	stopGRPCServer(srv, grpcStopTimeout)
+		if s.setFabricListenerUp(addr, true) {
+			slog.Info("gRPC fabric listener up", "addr", addr, "vrf", vrfDevice)
+		}
+		start := time.Now()
+		serveErr := cfg.serve(ctx, lis)
+		s.setFabricListenerUp(addr, false)
+
+		// Expected graceful shutdown: ctx cancelled (serveUntilDone returns nil)
+		// or the server was intentionally stopped. Exit cleanly, no retry.
+		if ctx.Err() != nil || serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped) {
+			slog.Info("gRPC fabric listener stopped", "addr", addr, "vrf", vrfDevice)
+			return
+		}
+
+		// Genuine serve fault. A session that stayed up long enough is treated
+		// as healthy, so the next fault retries from base instead of the
+		// grown-out cap.
+		if time.Since(start) >= cfg.healthyServe {
+			backoff = cfg.backoffBase
+		}
+		slog.Warn("gRPC fabric listener serve fault; will retry",
+			"addr", addr, "vrf", vrfDevice, "backoff", backoff, "err", serveErr)
+		if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
+			return
+		}
+	}
+}
+
+// sleepFabricBackoff waits out the current backoff (or ctx cancel), then doubles
+// it up to backoffMax for the next fault. It returns false if ctx was cancelled
+// during the wait (the caller must exit) and true if the wait elapsed. The
+// per-tick wait is logged at Debug so a persistent bind failure does not flood
+// Info (logging rules: transitions at Info/Warn, ticks at Debug).
+func sleepFabricBackoff(ctx context.Context, backoff *time.Duration, backoffMax time.Duration) bool {
+	d := *backoff
+	next := d * 2
+	if next > backoffMax {
+		next = backoffMax
+	}
+	*backoff = next
+	slog.Debug("gRPC fabric listener backoff wait", "delay", d)
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// setFabricListenerUp records the fabric listener's up/down health for addr and
+// reports whether the state CHANGED, so the caller logs a transition exactly
+// once (#5047). A status surface can read the published state via
+// FabricListenerUp / FabricListenerHealth.
+func (s *Server) setFabricListenerUp(addr string, up bool) (changed bool) {
+	s.fabricListenerMu.Lock()
+	defer s.fabricListenerMu.Unlock()
+	if s.fabricListenerUp == nil {
+		s.fabricListenerUp = make(map[string]bool)
+	}
+	prev, existed := s.fabricListenerUp[addr]
+	changed = !existed || prev != up
+	s.fabricListenerUp[addr] = up
+	return changed
+}
+
+// FabricListenerUp reports whether the fabric listener bound to addr is
+// currently serving (#5047). It returns false for an unknown address (never
+// started, or torn down).
+func (s *Server) FabricListenerUp(addr string) bool {
+	s.fabricListenerMu.Lock()
+	defer s.fabricListenerMu.Unlock()
+	return s.fabricListenerUp[addr]
+}
+
+// FabricListenerHealth returns a snapshot of every supervised fabric listener's
+// up/down state, keyed by bind address (#5047), for a status/CLI surface.
+func (s *Server) FabricListenerHealth() map[string]bool {
+	s.fabricListenerMu.Lock()
+	defer s.fabricListenerMu.Unlock()
+	out := make(map[string]bool, len(s.fabricListenerUp))
+	for addr, up := range s.fabricListenerUp {
+		out[addr] = up
+	}
+	return out
 }
 
 // fabricAllowedUnaryMethods is the fail-closed allowlist (#4122) of unary RPCs
