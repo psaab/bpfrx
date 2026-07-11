@@ -493,6 +493,23 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 //     parseApplicationTerms records the offending leaf names on
 //     Application.DuplicateTermLeaves.
 //
+//   - #5574 conflicting duplicate DIRECT scalar leaf: the direct-body analogue of
+//     the term case above. A single-valued DIRECT leaf (protocol /
+//     destination-port / source-port / inactivity-timeout / timeout / icmp-type /
+//     icmp-code / alg) repeated with a CONFLICTING value directly on the
+//     application body (protocol tcp; protocol udp; destination-port 22;
+//     destination-port 53) was assigned straight into a single typed field, so
+//     the repeat was last-writer-wins — only the FINAL value was enforced, so a
+//     deny referencing the app covered FEWER protocol/port combinations than
+//     authored and could fall through to a permit / default-permit (a fail-open
+//     under-match). This is reachable via a hierarchical config load / paste, an
+//     apply-groups merge, or a peer-synced serialized config (flat-set SetPath
+//     collapses a single-value leaf to the last value before the compiler runs).
+//     compileApplications records the offending leaf names on
+//     Application.DuplicateDirectLeaves. Unlike the term case, `protocol` IS
+//     tracked (the direct body has no multi-protocol syntax). An idempotent
+//     same-value repeat is accepted.
+//
 // Strict on the commit / commit-check path; the call site (compiler.go,
 // lenientApplicationSpecs) downgrades a returned error to a warning on the
 // tolerant load / peer-sync path so an already-persisted or older-peer-synced
@@ -525,17 +542,32 @@ func validateApplicationStructureStrict(cfg *Config) error {
 		sort.Strings(names)
 		for _, name := range names {
 			app := cfg.Applications.Applications[name]
-			if app == nil || len(app.DuplicateTermLeaves) == 0 {
+			if app == nil {
 				continue
 			}
-			return fmt.Errorf(
-				"application %q: conflicting duplicate %q inside `term`; a single-valued "+
-					"term leaf (destination-port / source-port / inactivity-timeout / "+
-					"timeout / alg) may carry only one value — a repeat with a different "+
-					"value is last-writer-wins and silently overrides the earlier one by "+
-					"token order (use repeated `protocol` only for an intentional "+
-					"multi-protocol term)",
-				name, app.DuplicateTermLeaves[0])
+			if len(app.DuplicateTermLeaves) > 0 {
+				return fmt.Errorf(
+					"application %q: conflicting duplicate %q inside `term`; a single-valued "+
+						"term leaf (destination-port / source-port / inactivity-timeout / "+
+						"timeout / alg) may carry only one value — a repeat with a different "+
+						"value is last-writer-wins and silently overrides the earlier one by "+
+						"token order (use repeated `protocol` only for an intentional "+
+						"multi-protocol term)",
+					name, app.DuplicateTermLeaves[0])
+			}
+			// #5574 conflicting duplicate DIRECT scalar leaf.
+			if len(app.DuplicateDirectLeaves) > 0 {
+				return fmt.Errorf(
+					"application %q: conflicting duplicate %q; a single-valued application "+
+						"leaf (protocol / destination-port / source-port / inactivity-timeout / "+
+						"timeout / icmp-type / icmp-code / alg) may be set only once — a repeat "+
+						"with a different value is last-writer-wins and silently keeps only the "+
+						"LAST value by definition order, so a deny referencing this application "+
+						"covers fewer protocol/port combinations than authored and can fall "+
+						"through to a permit (split conflicting values into separate `term` "+
+						"sub-blocks or separate applications)",
+					name, app.DuplicateDirectLeaves[0])
+			}
 		}
 	}
 	return nil

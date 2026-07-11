@@ -58,21 +58,67 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		// count — it is metadata propagated onto every generated term, not a match
 		// constraint.
 		hasDirectBody := false
+		// #5574: value-aware conflict tracking for the DIRECT (scalar) match body,
+		// mirroring the inline-term duplicate detection in parseApplicationTerms
+		// (dstPortSet / srcPortSet / algSet / timeoutSet -> DuplicateTermLeaves). A
+		// direct application stores each scalar leaf into a SINGLE typed field, so
+		// two conflicting sibling leaves (protocol tcp; protocol udp;
+		// destination-port 22; destination-port 53) were last-writer-wins — only
+		// the FINAL value was enforced, with no commit error, so a deny referencing
+		// the app under-matched. Track each scalar leaf's first assigned value and
+		// record a CONFLICTING repeat (a differing value that silently discards the
+		// earlier one) on app.DuplicateDirectLeaves for the strict structure gate.
+		// An idempotent same-value repeat is harmless and accepted. Unlike the
+		// inline-term path, `protocol` IS tracked — the direct body has no
+		// multi-protocol syntax, so a second protocol overwrites rather than adding
+		// a term. The comparison uses the SAME effective form each field is stored
+		// in (resolved ports, parsed timeouts/icmp, normalized protocol) so an
+		// alias restate (icmp / junos-icmp-all) is not a false conflict.
+		var dupDirectLeaves []string
+		var (
+			protoSet, dstSet, srcSet, algSet, timeoutSet bool
+			itypeSet, icodeSet                           bool
+			protoVal, dstVal, srcVal, algVal             string
+			timeoutVal                                   int
+			itypeVal, icodeVal                           uint8
+		)
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "protocol":
-				app.Protocol = nodeVal(prop)
 				hasDirectBody = true
+				v := nodeVal(prop)
+				if protoSet && normalizeProtocol(v) != normalizeProtocol(protoVal) {
+					dupDirectLeaves = append(dupDirectLeaves, "protocol")
+				}
+				protoSet, protoVal = true, v
+				app.Protocol = v
 			case "destination-port":
-				app.DestinationPort = resolveAppPort(nodeVal(prop))
 				hasDirectBody = true
+				v := resolveAppPort(nodeVal(prop))
+				if dstSet && v != dstVal {
+					dupDirectLeaves = append(dupDirectLeaves, "destination-port")
+				}
+				dstSet, dstVal = true, v
+				app.DestinationPort = v
 			case "source-port":
-				app.SourcePort = resolveAppPort(nodeVal(prop))
 				hasDirectBody = true
+				v := resolveAppPort(nodeVal(prop))
+				if srcSet && v != srcVal {
+					dupDirectLeaves = append(dupDirectLeaves, "source-port")
+				}
+				srcSet, srcVal = true, v
+				app.SourcePort = v
 			case "inactivity-timeout", "timeout":
 				hasDirectBody = true
 				if v := nodeVal(prop); v != "" {
 					if n, ok := parseAppTimeout(v); ok {
+						// inactivity-timeout / timeout are ALIASES for the same
+						// field: both set to the same number is idempotent, a
+						// different number is a conflict. Record the keyword used.
+						if timeoutSet && n != timeoutVal {
+							dupDirectLeaves = append(dupDirectLeaves, prop.Name())
+						}
+						timeoutSet, timeoutVal = true, n
 						app.InactivityTimeout = n
 					} else {
 						// #3320: a non-numeric / out-of-range / unit-suffixed
@@ -94,6 +140,10 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				hasDirectBody = true
 				if v := nodeVal(prop); v != "" {
 					if t, ok := parseICMPTypeCode(v); ok {
+						if itypeSet && *t != itypeVal {
+							dupDirectLeaves = append(dupDirectLeaves, "icmp-type")
+						}
+						itypeSet, itypeVal = true, *t
 						app.ICMPType = t
 					} else {
 						app.UnknownICMP = append(app.UnknownICMP, v)
@@ -103,14 +153,23 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				hasDirectBody = true
 				if v := nodeVal(prop); v != "" {
 					if c, ok := parseICMPTypeCode(v); ok {
+						if icodeSet && *c != icodeVal {
+							dupDirectLeaves = append(dupDirectLeaves, "icmp-code")
+						}
+						icodeSet, icodeVal = true, *c
 						app.ICMPCode = c
 					} else {
 						app.UnknownICMP = append(app.UnknownICMP, v)
 					}
 				}
 			case "alg":
-				app.ALG = nodeVal(prop)
 				hasDirectBody = true
+				v := nodeVal(prop)
+				if algSet && v != algVal {
+					dupDirectLeaves = append(dupDirectLeaves, "alg")
+				}
+				algSet, algVal = true, v
+				app.ALG = v
 			case "description":
 				app.Description = nodeVal(prop)
 			case "term":
@@ -143,6 +202,12 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 				app.ICMPType = t
 			}
 		}
+
+		// #5574: carry any conflicting direct-scalar leaves onto the app for the
+		// strict structure gate. It only matters on the pure-direct store path
+		// below (`else`); a term-bearing app discards this struct, and a mixed
+		// direct+term app is already rejected by MixedDirectTermApps.
+		app.DuplicateDirectLeaves = dupDirectLeaves
 
 		if len(terms) > 0 {
 			// #3366: an application that mixes a direct match body with `term`

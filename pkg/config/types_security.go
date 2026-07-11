@@ -1193,6 +1193,29 @@ type Application struct {
 	// hard-rejects the first one on the strict commit path / warns on the tolerant
 	// load / peer-sync path (#3366).
 	DuplicateTermLeaves []string
+	// DuplicateDirectLeaves records the names of single-valued (scalar) DIRECT
+	// match leaves (protocol / destination-port / source-port / inactivity-timeout
+	// / timeout / icmp-type / icmp-code / alg) that appeared MORE THAN ONCE with a
+	// CONFLICTING (different) value directly on one `applications application
+	// <name>` body — the direct-body analogue of DuplicateTermLeaves. The direct
+	// scalar loop in compileApplications assigns each leaf straight into a SINGLE
+	// typed field, so a repeated conflicting leaf (protocol tcp; protocol udp;
+	// destination-port 22; destination-port 53) was last-writer-wins: only the
+	// FINAL value was enforced with no commit error, so a deny referencing the
+	// application covered FEWER protocol/port combinations than authored and could
+	// fall through to a permit / default-permit (a fail-open under-match). This is
+	// reachable whenever the AST carries duplicate sibling leaves — a hierarchical
+	// config load / paste, an apply-groups merge, or a peer-synced serialized
+	// config; flat-set `SetPath` collapses a single-value leaf to the last value
+	// before the compiler runs, so it cannot reproduce the drop. An idempotent
+	// same-value repeat is NOT recorded. Unlike DuplicateTermLeaves, `protocol` IS
+	// tracked here — the direct body has no multi-protocol syntax (Application.Protocol
+	// is a single field), so a second protocol silently overwrites rather than
+	// adding a term. Mirroring DuplicateTermLeaves, the offending leaf name is
+	// recorded and the deferred gate (validateApplicationStructureStrict)
+	// hard-rejects the first one on the strict commit path / warns on the tolerant
+	// load / peer-sync path (#5574).
+	DuplicateDirectLeaves []string
 }
 
 // IPsecConfig holds IPsec VPN configuration.

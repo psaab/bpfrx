@@ -1,3 +1,37 @@
+## 2026-07-11 — #5574 config compiler: reject conflicting direct-scalar application leaves
+- **Timestamp**: 2026-07-11 (fix/5574-app-scalar-conflict-reject)
+- **Action**: `compileApplications` (pkg/config/compiler_applications.go)
+  assigned each DIRECT scalar leaf (protocol / destination-port / source-port /
+  inactivity-timeout / timeout / icmp-type / icmp-code / alg) straight into one
+  typed field with no value-aware duplicate tracking, so repeated CONFLICTING
+  sibling leaves (protocol tcp; protocol udp; destination-port 22;
+  destination-port 53) were last-writer-wins — only the LAST value was enforced,
+  committing cleanly under strict validation. A deny referencing the app then
+  covered fewer protocol/port combinations than authored and could fall through
+  to a permit / default-permit (fail-open under-match, #5574). Added value-aware
+  conflict tracking mirroring the inline-`term` model (`DuplicateTermLeaves`):
+  each scalar leaf's first assigned value is tracked and a differing repeat is
+  recorded on the new `Application.DuplicateDirectLeaves`;
+  `validateApplicationStructureStrict` hard-rejects the first one (strict on
+  commit / commit-check, lenient-warn on the tolerant load / HA peer-sync path).
+  Unlike the term path, `protocol` IS tracked (direct body has no multi-protocol
+  syntax); idempotent same-value restate, timeout alias-same-value, and
+  normalize-equal protocol aliases (icmp / junos-icmp-all) are accepted.
+  Reachable via hierarchical config load / paste / peer-sync / apply-groups
+  (flat-set SetPath replaces a standalone single-value leaf, but a combined-leaf
+  flat line reproduces the `protocol` case — the golden corpus appA). Golden
+  baseline (golden_4406.json) regenerated: additive DuplicateDirectLeaves field
+  everywhere + appA protocol-conflict now flagged on the lenient cells.
+- **Validation**: RED-on-revert proven (stash the 3 source files → all
+  reject/warning tests fail; accept cases stay green). `go build ./...` +
+  `go test ./pkg/config/...` green; appid / policymatch / userspace / configstore
+  consumer packages green.
+- **File(s)**: pkg/config/compiler_applications.go,
+  pkg/config/compiler_validate_strict_application.go,
+  pkg/config/types_security.go, pkg/config/testdata/golden_4406.json,
+  pkg/config/compiler_application_direct_conflict_5574_test.go,
+  docs/config-schema.md, _Log.md
+
 ## 2026-07-11 — #5581 syslog unknown transport fails closed (no plaintext-UDP downgrade)
 - **Timestamp**: 2026-07-11 (fix/5581-logging-unknown-transport)
 - **Action**: `NewSyslogClientTransport` (pkg/logging/syslog.go) accepted any

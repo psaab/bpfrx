@@ -5827,6 +5827,59 @@ description+term and direct-only / term-only accepted; conflicting duplicate
 leaf rejected per leaf; repeated-protocol multi-protocol term accepted; lenient
 path downgrades to a warning).
 
+### #5574 — conflicting duplicate DIRECT scalar leaf (the direct-body analogue of #3366)
+
+The #3366 duplicate-scalar detection above covered only the inline `term` path.
+The **direct** (scalar) match body had the identical hole: `compileApplications`
+assigns each direct leaf straight into a SINGLE typed field
+(`app.Protocol = nodeVal(prop)`, `app.DestinationPort = resolveAppPort(...)`,
+...) while iterating sibling leaves, with no value-aware duplicate tracking. So a
+direct application carrying repeated CONFLICTING scalars —
+`application X { protocol tcp; protocol udp; destination-port 22;
+destination-port 53; }` (also `source-port` / `inactivity-timeout` / `timeout` /
+`icmp-type` / `icmp-code` / `alg`) — committed cleanly under strict validation
+but enforced **only the last value** (`protocol udp destination-port 53`). A deny
+referencing that application then covered FEWER protocol/port combinations than
+authored, so `tcp/22` fell through to a later permit / `default-policy
+permit-all` (a fail-open under-match). `validateApplicationStructureStrict`
+checked mixed direct+term (#3366) and the term-only duplicate marker, but had no
+direct-body duplicate marker.
+
+`compileApplications` now tracks each direct scalar leaf's first assigned value
+and records a CONFLICTING repeat (a second occurrence with a DIFFERENT effective
+value) on `Application.DuplicateDirectLeaves`; the same
+`validateApplicationStructureStrict` gate hard-rejects the first one, naming the
+leaf. Details matching the #3366 term model:
+
+- **`protocol` IS tracked here** (it is EXCLUDED in the term path). The direct
+  body has no multi-protocol syntax — `Application.Protocol` is a single field, so
+  a second `protocol` silently overwrites rather than minting a per-protocol term.
+- **Value-aware, not value-blind.** An IDEMPOTENT same-value restate
+  (`protocol tcp; protocol tcp`, `destination-port 22; destination-port 22`, the
+  `inactivity-timeout 1800` + `timeout 1800` alias pair, or an alias that
+  normalizes to the same protocol such as `icmp` / `junos-icmp-all`) is harmless
+  and COMMITS — only a differing repeat is rejected. Ports are compared in their
+  resolved form and timeouts/icmp in their parsed form, matching the field each
+  is stored in.
+- **Only reachable via the hierarchical AST shape.** The direct scalar leaves are
+  `args:1, children:nil, non-multi` in `setSchema`, so `tree.SetPath` REPLACES a
+  single-value leaf (last-wins) — two flat `set` lines collapse to ONE node
+  before the compiler runs. The duplicate-sibling shape this gate catches comes
+  from a hierarchical config file / `load` / paste, an apply-groups merge, or a
+  peer-synced serialized config, all of which preserve both siblings. Regression
+  tests therefore parse hierarchically (`hierTree`), a deliberate deviation from
+  the flat-set-only testing convention (which governs flat-set token grouping,
+  not a drop flat-set structurally cannot carry).
+
+Scope, strictness, and lenient downgrade are identical to the #3366 checks it
+sits beside (ALL user apps; strict on commit / commit-check, `cfg.Warnings`
+downgrade on the tolerant load / HA peer-sync path via `lenientApplicationSpecs`,
+#1960 no-brick). Regression coverage:
+`pkg/config/compiler_application_direct_conflict_5574_test.go` (each scalar leaf
+rejected; referenced deny under-match rejected + keep-last characterization;
+unreferenced rejected; idempotent restate / alias-normalized / single-valued
+accepted; lenient path downgrades to a warning — each RED on revert).
+
 ### #2226 — rib-group `import-rib` undefined-reference validation
 
 `routing-options rib-groups <group> import-rib <rib>` was unvalidated: an
