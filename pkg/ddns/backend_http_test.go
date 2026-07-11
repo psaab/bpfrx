@@ -364,6 +364,125 @@ func TestGenericOKTokenMatch(t *testing.T) {
 	}
 }
 
+// TestGenericMultiWordOKResponseTokenized is the #5557 (claude-review-003 A10)
+// FAIL-ON-REVERT guard. A multi-WORD ok-response must be split into whole
+// TOKENS, not stored as one space-containing element. matchesGenericOK does
+// whole-token matching (#2838): a success token must equal a trimmed response
+// line, or be the leading whitespace-delimited field of a line — the matcher
+// never sees a token as a raw substring. A single element carrying an embedded
+// space (e.g. "good nochg") therefore has a DEAD first-field path (a first
+// field never contains a space) and can only match a line that is EXACTLY
+// "good nochg", so a dyndns2-shape "good nochg <ip>" body — or a bare "nochg"
+// line — is never recognized, every update is treated as failed, and the client
+// error-spams + backs off while DNS goes stale. Tokenizing on whitespace makes
+// each configured word a matchable whole token (the single-token shape of
+// defaultGenericOKTokens). Reverting the fix to
+// `ok = []string{strings.ToLower(s)}` turns the multi-word success cases below
+// into failures, which fails this test.
+func TestGenericMultiWordOKResponseTokenized(t *testing.T) {
+	// Shape: the configured ok-response tokenizes into whole words (extra/leading
+	// whitespace collapsed), matching the single-token defaultGenericOKTokens
+	// shape. The reverted code stores the single element ["good nochg"].
+	b, err := newGenericBackend(&config.DDNSProvider{
+		Name: "g", Backend: "generic",
+		URLTemplate: "http://example.net/u?h=%h&i=%i",
+		OKResponse:  "  good   nochg  ",
+	}, nil)
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v", err)
+	}
+	if got := strings.Join(b.okTokens, ","); got != "good,nochg" {
+		t.Fatalf("multi-word ok-response must tokenize to whole tokens, got okTokens=%q want %q "+
+			"(revert stores one space-joined element)", got, "good,nochg")
+	}
+
+	// End-to-end: with ok-response "good nochg", each configured word is an
+	// independently matchable whole token. Every case here FAILS on revert
+	// because ["good nochg"] matches none of these bodies.
+	multiCases := []struct {
+		name string
+		body string
+	}{
+		{"dyndns2-shape leading word + ip", "good nochg 198.51.100.7\n"},
+		{"bare second word", "nochg\n"},
+		{"bare first word", "good\n"},
+	}
+	for _, tc := range multiCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			bb, err := newGenericBackend(&config.DDNSProvider{
+				Name: "g", Backend: "generic",
+				URLTemplate: srv.URL + "/u?h=%h&i=%i",
+				OKResponse:  "good nochg",
+			}, nil)
+			if err != nil {
+				t.Fatalf("newGenericBackend: %v", err)
+			}
+			if err := bb.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "198.51.100.7")); err != nil {
+				t.Fatalf("body %q with multi-word ok-response %q must be SUCCESS, got error: %v "+
+					"(revert regression #5557)", tc.body, "good nochg", err)
+			}
+		})
+	}
+
+	// Negative: a body that matches NEITHER configured word is still a FAILURE —
+	// the fix widens matching to each word, it does not accept everything.
+	negSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("error: bad request\n"))
+	}))
+	defer negSrv.Close()
+	nb, err := newGenericBackend(&config.DDNSProvider{
+		Name: "g", Backend: "generic",
+		URLTemplate: negSrv.URL + "/u?h=%h&i=%i",
+		OKResponse:  "good nochg",
+	}, nil)
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v", err)
+	}
+	if err := nb.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "198.51.100.7")); err == nil {
+		t.Fatal("a body matching none of the configured ok tokens must be a FAILURE")
+	}
+
+	// No regression: a single-word ok-response still tokenizes to one token and
+	// matches its exact success body end-to-end.
+	swSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("success\n"))
+	}))
+	defer swSrv.Close()
+	sb, err := newGenericBackend(&config.DDNSProvider{
+		Name: "g", Backend: "generic",
+		URLTemplate: swSrv.URL + "/u?h=%h&i=%i",
+		OKResponse:  "success",
+	}, nil)
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v", err)
+	}
+	if got := strings.Join(sb.okTokens, ","); got != "success" {
+		t.Fatalf("single-word ok-response must stay one token, got okTokens=%q", got)
+	}
+	if err := sb.UpsertLease(context.Background(), hostRecord(t, "h.example.net", "198.51.100.7")); err != nil {
+		t.Fatalf("single-word ok-response %q vs body \"success\" must be SUCCESS, got error: %v", "success", err)
+	}
+
+	// The default token set is untouched when no ok-response is configured.
+	db, err := newGenericBackend(&config.DDNSProvider{
+		Name: "g", Backend: "generic",
+		URLTemplate: "http://example.net/u?h=%h&i=%i",
+	}, nil)
+	if err != nil {
+		t.Fatalf("newGenericBackend: %v", err)
+	}
+	if got, want := strings.Join(db.okTokens, ","), strings.Join(defaultGenericOKTokens, ","); got != want {
+		t.Fatalf("default ok-token set must be unchanged when no ok-response is set: got %q want %q", got, want)
+	}
+	if got, want := strings.Join(defaultGenericOKTokens, ","), "good,nochg,ok,true,updated"; got != want {
+		t.Fatalf("defaultGenericOKTokens shape changed: got %q want %q", got, want)
+	}
+}
+
 // TestMatchesGenericOKUnit exercises the matcher directly, including the
 // dyndns2-shared default tokens (good/nochg) that the generic default set must
 // continue to accept, and confirms substring-only hits are rejected.
