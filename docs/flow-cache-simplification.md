@@ -552,6 +552,76 @@ the last accepted value), and `bump_fib_generation_persists_bumped_generation`
 (M2 — fail-on-revert; the persisted state a restart boots from carries the
 bumped generation).
 
+## apply_snapshot generation monotonicity (#5169)
+
+The #3767 H5 gate covered only the lightweight `bump_fib` verb. The FULL
+`apply_snapshot` handler (`server/handlers/snapshot.rs::apply`) published the
+incoming `(generation, fib_generation)` pair VERBATIM into
+`status.last_snapshot_generation` / `status.last_fib_generation` (and, on the
+armed legs, into `ValidationState` via `refresh_runtime_snapshot` / reconcile)
+with NO monotonicity gate. Because flow-cache validation is equality based on
+the WHOLE pair (`entry.stamp.config_generation != lookup.config_generation ||
+entry.stamp.fib_generation != lookup.fib_generation` in `flow_cache.rs`), a
+REUSED / ROLLED-BACK pair equal to a prior published pair makes the cache
+entries that a later generation logically invalidated MATCH validation again —
+reviving a lazily-unevicted cached ALLOW after the config/route that authorized
+it was withdrawn. That is a fail-OPEN, the exact defect #3767 H5 closed for
+`bump_fib`, left open on the full path.
+
+- **Pair-monotonicity gate (#5169).** The handler now refuses a full apply
+  whose `(generation, fib_generation)` pair is STRICTLY LESS than (rolls back
+  below) the currently-published `(last_snapshot_generation,
+  last_fib_generation)` pair: admit iff `generation > cur_generation` OR
+  (`generation == cur_generation` AND `fib_generation >= cur_fib_generation`).
+  The Go control plane assigns `generation` from a monotone commit counter
+  (`Manager.bumpGeneration`, only ever ++, never resets) and `fib_generation`
+  from the monotone shim FIB counter (`readFIBGeneration`), so this admits every
+  legitimate transition — a full apply advancing config (any fib; a strictly
+  greater config value was, under this same guard, never published, so no
+  stamped entry can equality-match it), a route-only overlay advancing fib with
+  config reused, AND an EXACT-EQUAL re-apply — and refuses only a SUPERSEDED
+  (strictly-less) pair: a config rollback (`generation < cur`) or a fib rollback
+  under a reused config (`generation == cur && fib_generation < cur_fib`). Both
+  are the revival fail-open. Exact-equal is admitted because it revives nothing
+  (an equal pair equality-matches only the CURRENT published pair, whose cache
+  entries are already valid), and refusing it would break the #4036
+  "timeout-but-landed" IDEMPOTENT RETRY: the partial-republish Go paths
+  (`Compile`, `PublishRouteOverlaySnapshot`, `retryDeferredWorkerArmLocked`)
+  commit `m.generation` only on Go-observed success and do not consult
+  `lastStatus.LastSnapshotGeneration`, so a timed-out-but-landed apply of gen G
+  leaves `m.generation` at G-1 and the retry re-sends the IDENTICAL (G, fib)
+  pair, which must be ACKed ok rather than fail-closed into a non-converging
+  loop. This is the exact `<`-not-`<=` semantics `bump_fib` already uses
+  (`Coordinator::bump_fib_generation` refuses a strictly-less fib, admits an
+  equal one). The check compares against the last PUBLISHED pair in
+  `guard.status` (not `ValidationState`: `config_generation` has no coordinator
+  accessor and a disarmed apply advances `guard.status` but not
+  `ValidationState`; `guard.status` is the authoritative published pair the
+  armed flow-cache's `ValidationState` is derived from, so guard and cache
+  agree). It is gated on a prior published snapshot (`guard.snapshot.is_some()`)
+  so the first apply — no baseline, no cache entries to revive — always applies,
+  matching `bump_fib` admitting the first bump against generation 0. Refusal is
+  fail-CLOSED before any guard mutation, integrity preflight, or side effect:
+  `ok = false`, nothing advances, nothing persists — the live prior forwarding /
+  generation / flow-cache stay untouched (mirroring the #3766 / #3789
+  capture-restore legs). The coordinator's `refresh_runtime_snapshot` /
+  reconcile still assign `self.validation` directly and remain intentionally
+  ungated at the coordinator layer; the monotonicity invariant for the full path
+  is now enforced ONE layer up, at the handler.
+
+Validation (`server/tests.rs`): `apply_snapshot_rejects_generation_rollback_5169`
+(fail-on-revert; a strictly-less CONFIG rollback is refused — published pair,
+stored snapshot, and persisted state all stay at the last accepted generation;
+asserts the flow-cache revival is prevented because the published pair never
+rolls back to the stale entry's stamp), `apply_snapshot_rejects_fib_rollback_5169`
+(fail-on-revert; the second rollback axis — a strictly-less FIB under a reused
+config is refused), `apply_snapshot_admits_generation_reuse_5169` (an exact-equal
+re-apply is ADMITTED — the #4036 idempotent-retry path),
+`apply_snapshot_monotonic_config_advance_applies_5169` (a config advance still
+applies), and `apply_snapshot_fib_only_advance_admitted_5169` (a fib-only advance
+with config reused is admitted, guarding against an over-strict gate that would
+break route-only overlays).
+
 ## Recommended Next Step
 
 Implement Phase 1 next:
