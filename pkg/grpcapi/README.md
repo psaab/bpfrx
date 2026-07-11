@@ -110,6 +110,24 @@ contract.
   action-journal write still happens BEFORE the wipe. `ZeroizeFn` is nil
   only in a NoDataplane / no-daemon build, where the handler falls back to
   an ungated direct wipe (there is no running reconcile loop to race).
+- **Zeroize erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
+  (#5280).** `runZeroize` resolves the config root from
+  `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME
+  file the store loads from and persists the `.configdb` SSOT / rollback
+  slots / `.config.journal` to — and threads `filepath.Dir/Base` of it into
+  the `performZeroizeWipe(configDir, configBase)` primitive. A daemon
+  started with a non-default `-config` (e.g. `/srv/xpf/site.conf`) therefore
+  erases `/srv/xpf`, not `/etc/xpf`; the pre-fix wipe hardcoded `/etc/xpf`
+  and left the real root's secrets on disk while reporting a clean reset.
+  Resolution runs BEFORE the apply gate and is fail-CLOSED: if the store /
+  config path is undeterminable, `runZeroize` returns an error (surfaced as
+  `Internal`) rather than wiping the wrong path or nothing — it never
+  enters the terminal reset generation on an unknown root. Only the
+  config-root leg is parameterized; the rendered-config (frr/swanctl/kea),
+  login-account, config-archive, BPF-pin and networkd legs live at fixed
+  system paths independent of `-config`. `defaultConfigDir` /
+  `defaultConfigBase` remain only as the documented standard-appliance
+  default and the RED-on-revert reference, not as the wipe target.
 - Tab completion (`Complete` RPC) and `?` help come from `pkg/cmdtree` —
   add commands there once and they show up in every CLI surface.
 - Session show and clear share ONE matcher: `ClearSessions` builds the

@@ -24,10 +24,14 @@ import (
 // mutate it.
 var zeroizeSyncDir = fsatomic.SyncDir
 
-// defaultConfigDir / defaultConfigBase mirror the daemon's config-path default
-// (cmd/xpfd `-config /etc/xpf/xpf.conf`, pkg/daemon). performZeroizeWipe erases
-// the fixed appliance paths; a non-default `-config` location is out of scope
-// (the pre-#4576 wipe already assumed /etc/xpf).
+// defaultConfigDir / defaultConfigBase are the STANDARD-APPLIANCE config root
+// (cmd/xpfd `-config /etc/xpf/xpf.conf`, pkg/daemon.New's default). They are the
+// values the store's ConfigPath resolves to in the default deployment, NOT a
+// hardcoded wipe target: performZeroizeWipe now takes the configured root
+// (filepath.Dir/Base of configstore.Store.ConfigPath) so a daemon started with a
+// non-default `-config` (e.g. /srv/xpf/site.conf) erases THAT root, not /etc/xpf
+// (#5280). They remain as the documented default and the RED-on-revert reference
+// (a reverted hardcoded wipe would target defaultConfigDir).
 const (
 	defaultConfigDir  = "/etc/xpf"
 	defaultConfigBase = "xpf.conf"
@@ -671,13 +675,24 @@ func readProvisionedMarkerUID(path string) (int, error) {
 // secrets, provisioned login accounts, BPF pins, and managed networkd files
 // (factory reset). It is a package var so a test can drive the `zeroize`
 // SystemAction verb (to assert the #4108 F8 journal wiring) WITHOUT wiping a
-// real /etc/xpf on the developer/appliance box. It returns a non-nil error when
-// a security-critical erasure did not fully complete (#4576/#4585/#4598).
-var performZeroizeWipe = func() error {
+// real config root on the developer/appliance box. It returns a non-nil error
+// when a security-critical erasure did not fully complete (#4576/#4585/#4598).
+//
+// configDir/configBase are the CONFIGURED config root — the directory and base
+// name of the store's `-config` path (configstore.Store.ConfigPath), threaded in
+// by runZeroize (#5280). Erasing a hardcoded /etc/xpf while the daemon actually
+// loads/persists config elsewhere (a non-default `-config`, e.g.
+// /srv/xpf/site.conf) would leave the real .configdb SSOT + master.key, rollback
+// slots and journal — the prior tenant's secrets — intact under the real root
+// while reporting a clean factory reset. Only the config-root leg is
+// parameterized: the rendered-config (frr/swanctl/kea), login-account,
+// config-archive, BPF-pin and networkd legs live at fixed system paths
+// independent of `-config` and stay as-is.
+var performZeroizeWipe = func(configDir, configBase string) error {
 	// Config state FIRST — the security-critical erasure. A failure here can
 	// leave prior-tenant config/secrets on disk, so it is surfaced to the
 	// caller (#4576).
-	err := zeroizeConfigDir(defaultConfigDir, defaultConfigBase)
+	err := zeroizeConfigDir(configDir, configBase)
 
 	// Rendered service configs (#4585): also security-critical — routing-auth
 	// keys in a world-readable frr.conf, IKE PSKs, Kea configs. A post-zeroize
