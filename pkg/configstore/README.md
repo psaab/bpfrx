@@ -347,6 +347,33 @@ per-path:
   a crash in the microseconds between the `writeActive` syscall and the
   `confirm.json` write leaves no `confirm.json` — vastly smaller than
   the whole multi-minute window this closes.
+- **`confirm.json` removal is ordered AFTER the resolving write is
+  durable (#5473).** Resolving a pending window is a **degrade-not-fail**
+  operation at three loci — the timeout auto-rollback (`PromoteRollback`),
+  boot recovery (`recoverPendingConfirmLocked`), and an HA config-sync that
+  supersedes the window (`SyncApply`): each promotes the replacement config
+  in memory and then runs an active-config write that MAY fail (Option B —
+  the in-memory revert/apply is the safety property and always stands). The
+  removal of `confirm.json` is the **crash-recovery-lifecycle** transition
+  and must not happen until that replacement is DURABLE. Before this fix all
+  three unconditionally deleted `confirm.json` even when the write FAILED:
+  on-disk `active.json` was still the pre-rollback config `C`, and the record
+  that would re-drive the rollback to the target `A` was gone — so a crash
+  before the degraded-persist retry healed booted `C` (the exact config
+  `commit confirmed` was meant to revert) with NO recovery record. Now the
+  removal is gated on the write: on SUCCESS `confirm.json` is removed exactly
+  as before (durable transition, idempotent on the microsecond crash window);
+  on FAILURE it is RETAINED and its removal is DEFERRED
+  (`confirmResolvePendingPersist`) until the replacement lands durably — the
+  persist-retry heal or any superseding commit/sync finalizes it via
+  `clearConfirmResolutionPendingLocked`. Fail-closed: a crash while the write
+  is un-healed boots into a state that RE-RUNS the rollback to `A` (the
+  persisted deadline having passed) rather than stranding `C`. `SyncApply`
+  cancels the timer with `cancelPendingConfirmTimerLocked` (the timer-half of
+  `clearPendingConfirmLocked`) precisely so `confirm.json` removal can be
+  ordered after its degrade-not-fail write. Distinct from #4864 (which made
+  the delete itself dir-fsync-durable): #4864 fixes HOW the record is deleted,
+  #5473 fixes WHEN.
 - **Durable deletes match durable writes (#5197).** A delete of a
   secret-bearing artifact fsyncs its parent directory so the removal is
   durable, mirroring the `fsatomic.WriteFileDurable` its writer used — a
