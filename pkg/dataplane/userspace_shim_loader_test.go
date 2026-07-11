@@ -254,10 +254,17 @@ func TestValidateUserspaceShimSpecLivePinABI(t *testing.T) {
 			if err == nil {
 				t.Fatalf("want ABI mismatch on %s, got nil (would brick post-stop after ErrMapIncompatible)", tt.wantMap)
 			}
-			for _, want := range []string{tt.wantMap, tt.wantField, "ABI-incompatible", userspaceShimGenerateRemediation} {
+			// #5363: a live-pin mismatch is a STALE-PIN case (the running
+			// daemon's pin predates this build's shim ABI), so the remediation
+			// must be the full-reload guidance, NOT `make generate` — the
+			// embedded shim is the intended target, not broken.
+			for _, want := range []string{tt.wantMap, tt.wantField, "ABI-incompatible", userspaceShimStalePinRemediation} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("err = %v, want substring %q", err, want)
 				}
+			}
+			if strings.Contains(err.Error(), "make generate-userspace-xdp") {
+				t.Fatalf("err = %v, live-pin mismatch must NOT tell the operator to rebuild the shim", err)
 			}
 		})
 	}

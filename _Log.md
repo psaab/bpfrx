@@ -1,3 +1,35 @@
+## 2026-07-11 — #5363 dataplane/verify: stale-pin remediation for live-pin ABI mismatch
+- **Timestamp**: 2026-07-11 (fix/5363-stalepin-remediation)
+- **Action**: `validateUserspaceShimLivePins` (pkg/dataplane/loader_userspace_shim.go)
+  appended the FIXED `userspaceShimGenerateRemediation` ("Re-run `make
+  generate-userspace-xdp`.") on a live-pin ABI mismatch. That is MISLEADING for
+  the live-pin case: the live pin is the OLD daemon's map and the embedded shim is
+  the intended, un-broken deploy target — telling the operator to rebuild the shim
+  is wrong; the fix is a full dataplane reload so the stale pin is released and the
+  new map ABI can be pinned. This is the exact scenario blocking a real cluster
+  (`userspace_cpumap` embedded=256 vs pinned=16). Added constant
+  `userspaceShimStalePinRemediation` (full-reload guidance) and switched the
+  live-pin mismatch branch to it — the ONLY behavioral change site. The live-pin
+  check inherently compares "new build's shim" vs "old daemon's pin", so the pin
+  is ALWAYS the stale side, in BOTH the upgrade direction (embedded MaxEntries >
+  pinned) AND a downgrade — the fix is direction-INDEPENDENT (no >-vs-<
+  heuristic). Left the embedded-vs-Go-SSOT drift sites
+  (`validateUserspaceShimSpecWith` expected-shape arms,
+  `validateSharedMapExpectedABI`, the bindings/ingress-ifaces drift errors) on
+  `userspaceShimGenerateRemediation` — a mismatch there means the embedded shim
+  drifted from its Go contract, which IS a `make generate` situation. Updated the
+  two existing live-pin tests (userspace_shim_loader_test.go,
+  livepin_abi_inventory_5484_test.go) to expect the stale-pin remediation, added
+  stalepin_remediation_5363_test.go (cpumap up/down + dnat_table live-pin → stale
+  remediation; SSOT-drift → keeps make-generate), updated pkg/dataplane/README.md
+  ABI-check section with the remediation split. Verified RED-on-revert (live-pin
+  tests fail with the old constant; the SSOT-drift test stays green, proving the
+  drift sites are unchanged). Diagnostic-message-only — no cluster smoke needed.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go,
+  pkg/dataplane/userspace_shim_loader_test.go,
+  pkg/dataplane/livepin_abi_inventory_5484_test.go, pkg/dataplane/README.md, _Log.md
+
 ## 2026-07-11 — #5484 dataplane/shim: ABI-check all required pins incl v6 + HA maps in live-pin preflight
 - **Timestamp**: 2026-07-11 (fix/5484-livepin-abi-inventory)
 - **Action**: `userspaceABICheckedPinnedMaps` (pkg/dataplane/loader_userspace_shim.go)
