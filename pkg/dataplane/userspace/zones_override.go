@@ -87,7 +87,11 @@ func mergeHostInboundTraffic(a, b *config.HostInboundTraffic) *config.HostInboun
 // unit ref:
 //   - A ref naming a logical unit (contains ".") is the MOST specific override.
 //     It maps ONLY itself — never a sibling unit — and is MERGED (unioned) onto
-//     whatever physical-inherited set already sits on that unit key.
+//     whatever physical-inherited set already sits on that unit key, BUT only
+//     when THIS zone is the unit's authoritative owner (#5489 quarantine — a
+//     unit-level override on a zone that lost ownership must not leak its tokens
+//     into the winning zone's effective set on the lenient multi-owner warn
+//     path). This mirrors the physical branch's #3720 cross-zone guard below.
 //   - A ref naming a physical interface (no unit suffix) expands to each of its
 //     configured units (mirroring buildInterfaceZoneMap), but NOT onto a unit
 //     resolved to a DIFFERENT zone (#3720 M01 quarantine — a physical override
@@ -131,6 +135,19 @@ func buildInterfaceHostInboundMap(cfg *config.Config) map[string]*config.HostInb
 				continue
 			}
 			if strings.Contains(ref, ".") {
+				// #5489: a unit-level override must come ONLY from the unit's
+				// authoritative zone owner. buildInterfaceZoneMap resolves the
+				// owner as the first sorted zone that claims the unit; on a
+				// tolerated duplicate ownership (lenient load / peer-sync retains
+				// two zones both claiming the same reth0.100) this loop visits
+				// BOTH zones, so without a guard the losing zone's tokens (e.g.
+				// SSH) would union into out[ref] and bleed into the winning zone's
+				// InterfaceSnapshot / ZoneHostInboundView. Quarantine the leak with
+				// the SAME predicate the physical-expansion branch uses (#3720
+				// M01): skip when a DIFFERENT zone owns this unit.
+				if z := zoneByIface[ref]; z != "" && z != zn {
+					continue
+				}
 				// Logical unit ref: the most specific override. Merge (union) it
 				// onto any physical-inherited set already on this unit key. Because
 				// refs are walked sorted and a bare physical ref sorts before its

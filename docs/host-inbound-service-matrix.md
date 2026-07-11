@@ -389,12 +389,26 @@ silently shadowed the more-specific unit ref (fail-open, admitting a service the
 unit did not open, or fail-closed, denying one it did). The fix MERGES (unions)
 the two levels instead.
 
-**Cross-zone quarantine (#3720 M01).** The physical→unit expansion does NOT
-apply a physical override to a unit that resolves to a **different** zone. On the
-lenient / peer-synced load path an ownership conflict is downgraded to a warning
-(`compiler_validate_strict.go`), so a physical `ifN` override owned by zone
-trust could otherwise leak its tokens onto `ifN.M` owned by zone guest. The
-expansion skips any unit whose resolved zone differs from the override's zone.
+**Cross-zone quarantine (#3720 M01, #5489).** A host-inbound override must
+contribute to a unit's effective set ONLY from the unit's authoritative zone
+owner. On the lenient / peer-synced load path an ownership conflict is downgraded
+to a warning (`compiler_validate_strict.go`) and `buildInterfaceZoneMap` resolves
+the owner as the **first sorted zone** that claims the unit, so two zones can
+both name the same `ifN.M` while only one owns it. Both branches of
+`buildInterfaceHostInboundMap` (`pkg/dataplane/userspace/zones_override.go`)
+enforce the owner predicate `zoneByIface[ref] == zn`:
+
+- **physical→unit expansion (#3720 M01)** does NOT apply a physical `ifN`
+  override owned by zone trust onto `ifN.M` owned by zone guest — it skips any
+  unit whose resolved zone differs from the override's zone.
+- **exact unit-level ref (#5489)** does NOT merge a `ifN.M` override authored by
+  a **non-owner** zone into `out["ifN.M"]`. Before #5489 the exact-unit branch
+  unioned every zone's override unconditionally, so a losing zone's admission
+  token (e.g. `ssh`) bled into the winning zone's `InterfaceSnapshot` /
+  `ZoneHostInboundView` — a cross-zone host-inbound admission escalation. The
+  quarantine mirrors the physical branch exactly (same `z != "" && z != zn`
+  predicate, same skip), so a unit's effective tokens come only from its
+  authoritative owner. Single-owner (non-conflict) configs are unchanged.
 
 **Presentation parity (#3720 H05).** `ZoneConfig.InterfaceHostInboundEffective`
 (`pkg/config/host_inbound_view.go`) — used by `show interfaces <unit>`, `show
