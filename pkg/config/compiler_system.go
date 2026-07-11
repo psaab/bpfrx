@@ -1234,32 +1234,34 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 		case "community":
 			commName := nodeVal(child)
 			if commName != "" {
-				comm := &SNMPCommunity{Name: commName}
 				commChildren := child.Children
 				if len(child.Keys) < 2 && len(child.Children) > 0 {
 					commChildren = child.Children[0].Children
 				}
+				// Parse THIS block's authorization + clients into locals first.
+				// A same-name sibling block is then MERGED into any existing
+				// entry rather than overwriting it (#5472), so a later block
+				// cannot silently drop an earlier block's source-IP allowlist.
+				var blockAuth string
+				var blockClients []SNMPClient
 				for _, prop := range commChildren {
 					switch prop.Name() {
 					case "authorization":
-						comm.Authorization = nodeVal(prop)
+						blockAuth = nodeVal(prop)
 					case "clients":
 						// #4289: Junos `clients` source-IP allowlist.
 						// parseSNMPClients handles both AST shapes and the
 						// per-entry `restrict` modifier. Accumulate so a
 						// clients block split across load-merge / flat-set
 						// replays is not dropped.
-						comm.Clients = append(comm.Clients, parseSNMPClients(prop)...)
+						blockClients = append(blockClients, parseSNMPClients(prop)...)
 					}
 				}
 				// Flat form: community public authorization read-only
 				for i := 2; i < len(child.Keys)-1; i++ {
 					if child.Keys[i] == "authorization" {
-						comm.Authorization = child.Keys[i+1]
+						blockAuth = child.Keys[i+1]
 					}
-				}
-				if comm.Authorization == "" {
-					comm.Authorization = "read-only"
 				}
 				// #4834: reject/warn on an unparseable `clients` entry before
 				// it reaches compileClientNets. See validateSNMPClients for
@@ -1267,21 +1269,53 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				// catches a mistyped "restrict" keyword, which otherwise
 				// silently detaches from the preceding prefix and turns a
 				// deny-except entry into an unrestricted allow (fail-open).
-				clientWarnings, err := validateSNMPClients(comm.Clients, lenient)
+				// Validate only THIS block's new entries: on the merge path an
+				// earlier block's entries were already validated (and, strict,
+				// would have aborted), so re-validating the accumulated list
+				// would double-report the same warning.
+				clientWarnings, err := validateSNMPClients(blockClients, lenient)
 				if err != nil {
 					return err
 				}
 				if cfg != nil {
 					cfg.Warnings = append(cfg.Warnings, clientWarnings...)
 				}
-				// #4711: pre-parse the `clients` prefixes once now that
-				// comm.Clients is finalized, so AllowsSource does an
+				// #5472: same-name `community` blocks MERGE into one entry
+				// instead of a plain map overwrite. Junos treats two
+				// `community public { ... }` siblings as a single configuration
+				// node; the old `Communities[name] = comm` overwrite let a later
+				// duplicate with NO `clients` replace an earlier block that had
+				// an allowlist — and AllowsSource reads an empty allowlist as
+				// allow-all, so the source-IP restriction was silently erased
+				// (security fail-open: any source could then query the
+				// community). Accumulating the allowlist keeps the restriction
+				// on BOTH the strict commit and the lenient load / HA
+				// config-sync paths (a warn-and-keep-last-writer gate would
+				// still open the community on the lenient path).
+				comm := snmp.Communities[commName]
+				if comm == nil {
+					comm = &SNMPCommunity{Name: commName}
+					snmp.Communities[commName] = comm
+				}
+				comm.Clients = append(comm.Clients, blockClients...)
+				// A later block updates the authorization only when it
+				// explicitly states one; an omitted authorization must NOT
+				// clear a value an earlier block established (do not let an
+				// empty duplicate downgrade read-write back to the read-only
+				// default).
+				if blockAuth != "" {
+					comm.Authorization = blockAuth
+				}
+				if comm.Authorization == "" {
+					comm.Authorization = "read-only"
+				}
+				// #4711: (re)build the allocation-free client-prefix cache from
+				// the now-merged Clients, so AllowsSource does an
 				// allocation-free match per incoming v2c packet instead of
 				// re-parsing every prefix on every packet. Runs here, before
 				// the config is published to the SNMP agent, so the cache is
 				// set with no concurrent readers.
 				comm.clientNets = compileClientNets(comm.Clients)
-				snmp.Communities[comm.Name] = comm
 			}
 		case "trap-group":
 			tgName := nodeVal(child)
