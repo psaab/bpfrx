@@ -190,6 +190,22 @@ error-surfacing discipline):
   xpf-owned snippet; it is removed outright.
 - **`/etc/kea/kea-dhcp{4,6}.conf`** — xpf owns these whole files; removed outright.
 
+Beyond those exact paths, each rendered directory (`/etc/frr`,
+`/etc/swanctl/conf.d`, `/etc/kea`) is **swept for crash-leaked `fsatomic` write
+temps** (`.<base>.tmp-<rand>`, #5509) — the rendered-config sibling of the
+`/etc/xpf` sweep (#5475). All three renders are written via `pkg/fsatomic`
+(`frr.WriteFileDurable`, `ipsec.WriteFileAtomic`, `dhcpserver.WriteFileAtomic`),
+which drops a `.<base>.tmp-<rand>` temp holding the **full cleartext render**
+(routing-auth keys, IKE PSKs, Kea credentials) before its atomic rename. A
+daemon hard-killed mid-write leaves that temp behind; `fsatomic` self-heals a
+leaked temp on the *next* write to that base, but a factory reset + reboot has no
+next write, so an exact-path-only removal (`StripManagedSectionFile` /
+`os.Remove`) would let the temp — and its secrets — survive to the next tenant.
+The sweep is scoped to those xpf-owned rendered directories, matches only the
+narrow temp shape (so a legitimate service config or operator snippet in the same
+directory is untouched), and treats an absent/unmanaged directory as a clean
+no-op.
+
 This must be done by the wipe itself, not deferred to the reconcile on the
 completing reboot: a post-zeroize boot has **no committed config**, so the
 daemon enters **#1922 bootstrap mode** (or, on an HA node, a normal boot with a
