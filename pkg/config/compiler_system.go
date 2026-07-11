@@ -1341,10 +1341,18 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 						// v1-only receiver drops.
 						tg.Version = nodeVal(prop)
 					case "categories":
-						// Accepted trap-group leaf (schema-declared). Not
-						// consumed by the link-trap runtime today; recognized
-						// here so a valid key does not trip the unknown-key
-						// rejection below.
+						// #5522: retain the configured trap categories so the
+						// runtime can enforce the filter. `categories` is a
+						// schema `multi: true` leaf, so the bracketed/flat-set
+						// list collapses onto the leaf Keys and/or its children
+						// (the #2419 dual-shape) — read BOTH via
+						// firewallMatchValues. A trap-group with NO categories
+						// stanza leaves this nil, which pkg/snmp/traps.go treats
+						// as "all categories" (the Junos default). Before this
+						// the key was recognized but DISCARDED, so a group
+						// scoped to exclude `link` still received every
+						// linkUp/linkDown notification (filter bypass).
+						tg.Categories = append(tg.Categories, firewallMatchValues(prop)...)
 					default:
 						// #2990: a typoed child key (e.g. `tragets`) would
 						// otherwise be silently dropped, committing a trap

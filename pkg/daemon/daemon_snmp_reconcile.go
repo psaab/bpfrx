@@ -115,6 +115,20 @@ func snmpConfigHash(cfg *config.Config) uint64 {
 			for _, t := range targets {
 				write(t)
 			}
+			// #5522: the trap-group `categories` filter is a live dispatch
+			// input enforced by pkg/snmp groupWantsCategory. A day-2 edit that
+			// changes ONLY the category scope (same name + version + targets)
+			// must NOT hash equal, or reconcile takes the idempotent no-op path
+			// and the running agent keeps sending traps in the removed category
+			// while the commit reports success. Sort so a reordered-but-
+			// equivalent list still hashes equal (dispatch is set membership,
+			// order-insensitive).
+			write("categories")
+			cats := append([]string(nil), tg.Categories...)
+			sort.Strings(cats)
+			for _, c := range cats {
+				write(c)
+			}
 		}
 	}
 

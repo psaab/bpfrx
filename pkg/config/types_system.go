@@ -586,6 +586,16 @@ type SNMPTrapGroup struct {
 	// semantics); the emitter honors it in pkg/snmp/traps.go so a
 	// `version v1` group is not silently sent as v2c (#3948).
 	Version string
+	// Categories scopes which trap categories this group receives (Junos
+	// `snmp trap-group <g> categories <cat>`). A group lists the categories it
+	// WANTS; a notification is dispatched to the group only if the trap's
+	// category is in this list. An empty/nil slice means the group receives
+	// EVERY category — the Junos default for a trap-group with no `categories`
+	// stanza. Enforced in pkg/snmp/traps.go via groupWantsCategory (#5522);
+	// without this the configured category filter was parsed but discarded, so
+	// a group scoped to exclude a category (e.g. `link`) still received every
+	// linkUp/linkDown notification (a silent filter bypass).
+	Categories []string
 }
 
 // SNMPv3User defines an SNMPv3 USM user with authentication and privacy.

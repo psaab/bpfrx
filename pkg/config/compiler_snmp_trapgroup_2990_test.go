@@ -202,3 +202,66 @@ func TestSNMPTrapGroup_BracketedTargets(t *testing.T) {
 		t.Fatalf("bracketed targets = %v, want 3 entries", tg)
 	}
 }
+
+// TestSNMPTrapGroup_CategoriesCarried is the config->struct half of the #5522
+// fix: a trap-group `categories` scope must land on SNMPTrapGroup.Categories so
+// pkg/snmp can enforce the filter. Before the fix the compiler recognized
+// `categories` only to dodge the unknown-key rejection but DROPPED its value,
+// so a group scoped to exclude a category still received every notification (a
+// silent filter bypass). Reverting the `tg.Categories = append(...)` line
+// leaves Categories nil here and fails these assertions.
+func TestSNMPTrapGroup_CategoriesCarried(t *testing.T) {
+	t.Run("single", func(t *testing.T) {
+		cfg, err := compileSNMPLines(t, []string{
+			"set snmp trap-group g1 targets 10.0.0.10",
+			"set snmp trap-group g1 categories link",
+		})
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		tg := cfg.System.SNMP.TrapGroups["g1"]
+		if tg == nil {
+			t.Fatal("trap-group 'g1' missing from compiled config")
+		}
+		if len(tg.Categories) != 1 || tg.Categories[0] != "link" {
+			t.Fatalf("Categories = %v, want [link]", tg.Categories)
+		}
+	})
+
+	t.Run("bracketed", func(t *testing.T) {
+		cfg, err := compileSNMPLines(t, []string{
+			"set snmp trap-group g1 targets 10.0.0.10",
+			"set snmp trap-group g1 categories [ link configuration ]",
+		})
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		tg := cfg.System.SNMP.TrapGroups["g1"]
+		if tg == nil {
+			t.Fatal("trap-group 'g1' missing from compiled config")
+		}
+		if len(tg.Categories) != 2 || tg.Categories[0] != "link" || tg.Categories[1] != "configuration" {
+			t.Fatalf("Categories = %v, want [link configuration]", tg.Categories)
+		}
+	})
+}
+
+// TestSNMPTrapGroup_CategoriesUnspecifiedEmpty confirms an unspecified
+// categories scope stays nil in the typed config; pkg/snmp treats nil as "all
+// categories" (the Junos default — an existing config without a categories
+// stanza must keep receiving every trap) (#5522).
+func TestSNMPTrapGroup_CategoriesUnspecifiedEmpty(t *testing.T) {
+	cfg, err := compileSNMPLines(t, []string{
+		"set snmp trap-group g1 targets 10.0.0.10",
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	tg := cfg.System.SNMP.TrapGroups["g1"]
+	if tg == nil {
+		t.Fatal("trap-group 'g1' missing from compiled config")
+	}
+	if len(tg.Categories) != 0 {
+		t.Fatalf("Categories = %v, want empty (unspecified = all)", tg.Categories)
+	}
+}

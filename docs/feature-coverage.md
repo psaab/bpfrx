@@ -250,6 +250,14 @@ the userspace dataplane admission boundary is in
   into one entry before the immutable client-prefix cache is built, so a later
   duplicate with NO `clients` cannot overwrite an earlier block and silently
   erase its allowlist (an empty allowlist reads as allow-all → fail-open).
+  Trap-group `categories` ENFORCED (#5522): `snmp trap-group <g> categories
+  [ <cat> ]` scopes which notification categories a group receives — a link
+  up/down trap (category `link`) is dispatched to a group only if the group
+  lists `link` (or has no `categories` stanza = all categories, the Junos
+  default). Enforced in `pkg/snmp/traps.go` `groupWantsCategory`
+  (`sendLinkTraps` dispatch gate). Before #5522 the compiler recognized
+  `categories` but DISCARDED it, so a group scoped to exclude a category still
+  received every trap (a silent filter bypass; concrete instance under #4313).
 - **RPM probes**, dynamic address feeds.
 - **Dataplane buffer utilization** (`show system buffers`): AF_XDP
   UMEM/TX-ring capacity, CoS queued-byte capacity, helper-published
