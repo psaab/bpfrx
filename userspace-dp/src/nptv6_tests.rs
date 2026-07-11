@@ -77,7 +77,7 @@ fn inbound_translation_48() {
         external_prefix: "2001:db8:1::/48".to_string(),
     }]);
     let mut dst: Ipv6Addr = "2001:db8:1:abcd::1".parse().unwrap();
-    assert!(state.translate_inbound(&mut dst));
+    assert!(state.translate_inbound(&mut dst, ""));
     // Prefix should be fd00:1::
     let words = ipv6_to_words(&dst);
     assert_eq!(words[0], 0xfd00);
@@ -99,7 +99,7 @@ fn outbound_translation_48() {
         external_prefix: "2001:db8:1::/48".to_string(),
     }]);
     let mut src: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
-    assert!(state.translate_outbound(&mut src));
+    assert!(state.translate_outbound(&mut src, ""));
     let words = ipv6_to_words(&src);
     assert_eq!(words[0], 0x2001);
     assert_eq!(words[1], 0x0db8);
@@ -124,14 +124,14 @@ fn round_trip_48() {
     let mut addr = original;
 
     // Outbound: internal -> external
-    assert!(state.translate_outbound(&mut addr));
+    assert!(state.translate_outbound(&mut addr, ""));
     let words = ipv6_to_words(&addr);
     assert_eq!(words[0], 0x2001);
     assert_eq!(words[1], 0x0db8);
     assert_eq!(words[2], 0x0001);
 
     // Inbound: external -> internal
-    assert!(state.translate_inbound(&mut addr));
+    assert!(state.translate_inbound(&mut addr, ""));
     assert_eq!(
         addr, original,
         "round-trip should preserve original address"
@@ -149,14 +149,14 @@ fn round_trip_64() {
     let original: Ipv6Addr = "fd00:1:2:3:abcd:ef01:2345:6789".parse().unwrap();
     let mut addr = original;
 
-    assert!(state.translate_outbound(&mut addr));
+    assert!(state.translate_outbound(&mut addr, ""));
     let words = ipv6_to_words(&addr);
     assert_eq!(words[0], 0x2001);
     assert_eq!(words[1], 0x0db8);
     assert_eq!(words[2], 0x0001);
     assert_eq!(words[3], 0x0002);
 
-    assert!(state.translate_inbound(&mut addr));
+    assert!(state.translate_inbound(&mut addr, ""));
     assert_eq!(
         addr, original,
         "round-trip should preserve original address"
@@ -179,7 +179,7 @@ fn checksum_neutrality() {
     let orig_sum = ones_complement_sum(&orig_words);
 
     let mut translated = original;
-    assert!(state.translate_outbound(&mut translated));
+    assert!(state.translate_outbound(&mut translated, ""));
     let xlat_words = ipv6_to_words(&translated);
     let xlat_sum = ones_complement_sum(&xlat_words);
 
@@ -204,7 +204,7 @@ fn checksum_neutrality_64() {
     let orig_sum = ones_complement_sum(&orig_words);
 
     let mut translated = original;
-    assert!(state.translate_outbound(&mut translated));
+    assert!(state.translate_outbound(&mut translated, ""));
     let xlat_words = ipv6_to_words(&translated);
     let xlat_sum = ones_complement_sum(&xlat_words);
 
@@ -264,12 +264,12 @@ fn no_match_returns_false() {
     // Address that doesn't match either prefix.
     let mut addr: Ipv6Addr = "2001:db8:2:abcd::1".parse().unwrap();
     let original = addr;
-    assert!(!state.translate_inbound(&mut addr));
+    assert!(!state.translate_inbound(&mut addr, ""));
     assert_eq!(addr, original, "non-matching address should be unchanged");
 
     let mut addr2: Ipv6Addr = "fd00:2:0:abcd::1".parse().unwrap();
     let original2 = addr2;
-    assert!(!state.translate_outbound(&mut addr2));
+    assert!(!state.translate_outbound(&mut addr2, ""));
     assert_eq!(addr2, original2);
 }
 
@@ -278,8 +278,8 @@ fn empty_state() {
     let state = Nptv6State::from_snapshots(&[]);
     assert!(state.is_empty());
     let mut addr: Ipv6Addr = "2001:db8:1::1".parse().unwrap();
-    assert!(!state.translate_inbound(&mut addr));
-    assert!(!state.translate_outbound(&mut addr));
+    assert!(!state.translate_inbound(&mut addr, ""));
+    assert!(!state.translate_outbound(&mut addr, ""));
 }
 
 #[test]
@@ -516,9 +516,12 @@ fn real_world_prefixes() {
         external_prefix: "2602:fd41:0070::/48".to_string(),
     }]);
 
+    // #5176: this rule is scoped `from zone untrust`, so translation fires only
+    // for the matching zone (see nptv6_zone_scope_gates_inbound for the
+    // fail-on-revert of the negative case).
     // Inbound: external dst -> internal dst
     let mut dst: Ipv6Addr = "2602:fd41:70:100::1".parse().unwrap();
-    assert!(state.translate_inbound(&mut dst));
+    assert!(state.translate_inbound(&mut dst, "untrust"));
     let words = ipv6_to_words(&dst);
     assert_eq!(words[0], 0xfd35);
     assert_eq!(words[1], 0x1940);
@@ -527,8 +530,8 @@ fn real_world_prefixes() {
     // Round-trip
     let original_src: Ipv6Addr = "fd35:1940:27:200::42".parse().unwrap();
     let mut src = original_src;
-    assert!(state.translate_outbound(&mut src));
-    assert!(state.translate_inbound(&mut src));
+    assert!(state.translate_outbound(&mut src, "untrust"));
+    assert!(state.translate_inbound(&mut src, "untrust"));
     assert_eq!(src, original_src);
 }
 
@@ -553,8 +556,8 @@ fn multiple_addresses_same_prefix() {
     ] {
         let original: Ipv6Addr = addr_str.parse().unwrap();
         let mut addr = original;
-        assert!(state.translate_outbound(&mut addr));
-        assert!(state.translate_inbound(&mut addr));
+        assert!(state.translate_outbound(&mut addr, ""));
+        assert!(state.translate_inbound(&mut addr, ""));
         assert_eq!(addr, original, "round-trip failed for {original}");
     }
 }
@@ -662,7 +665,7 @@ fn checksum_neutral_0xffff_host_word_survives_outbound() {
     }]);
     // word[3] = 0xffff (the adjustment word for a /48).
     let mut src: Ipv6Addr = "2001:db8:1:ffff::1".parse().unwrap();
-    assert!(state.translate_outbound(&mut src));
+    assert!(state.translate_outbound(&mut src, ""));
     let words = ipv6_to_words(&src);
     // Prefix swapped to external.
     assert_eq!(words[0], 0x2001);
@@ -689,8 +692,8 @@ fn checksum_neutral_0xffff_and_0x0000_hosts_stay_distinct() {
     }]);
     let mut host_ffff: Ipv6Addr = "2001:db8:1:ffff::1".parse().unwrap();
     let mut host_0000: Ipv6Addr = "2001:db8:1:0:0:0:0:1".parse().unwrap();
-    assert!(state.translate_outbound(&mut host_ffff));
-    assert!(state.translate_outbound(&mut host_0000));
+    assert!(state.translate_outbound(&mut host_ffff, ""));
+    assert!(state.translate_outbound(&mut host_0000, ""));
     assert_ne!(
         host_ffff, host_0000,
         "the 0xFFFF host must not collapse onto the 0x0000 host (the #3233 collision)"
@@ -717,13 +720,13 @@ fn checksum_neutral_round_trip_preserves_0xffff_host() {
     ] {
         let original: Ipv6Addr = addr_str.parse().unwrap();
         let mut addr = original;
-        assert!(state.translate_outbound(&mut addr));
-        assert!(state.translate_inbound(&mut addr));
+        assert!(state.translate_outbound(&mut addr, ""));
+        assert!(state.translate_inbound(&mut addr, ""));
         assert_eq!(addr, original, "checksum-neutral round-trip failed for {original}");
     }
     // Inbound on an external dst with a 0xFFFF host word also survives.
     let mut dst: Ipv6Addr = "2001:1:db8:ffff::9".parse().unwrap();
-    assert!(state.translate_inbound(&mut dst));
+    assert!(state.translate_inbound(&mut dst, ""));
     let words = ipv6_to_words(&dst);
     assert_eq!(words[0], 0x2001);
     assert_eq!(words[1], 0x0db8);
@@ -745,7 +748,7 @@ fn checksum_neutral_pair_is_checksum_neutral_without_fixup() {
     let original: Ipv6Addr = "2001:db8:1:ffff::42".parse().unwrap();
     let orig_sum = ones_complement_sum(&ipv6_to_words(&original));
     let mut translated = original;
-    assert!(state.translate_outbound(&mut translated));
+    assert!(state.translate_outbound(&mut translated, ""));
     let xlat_sum = ones_complement_sum(&ipv6_to_words(&translated));
     assert_eq!(
         orig_sum, xlat_sum,
@@ -773,8 +776,137 @@ fn general_case_still_folds_0xffff_to_0x0000() {
     // Outbound on a host whose word[3] folds to 0xFFFF still becomes 0x0000 and
     // is never left at 0xFFFF (the RFC 6296 convention for the general case).
     let mut src: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
-    assert!(state.translate_outbound(&mut src));
+    assert!(state.translate_outbound(&mut src, ""));
     assert_ne!(ipv6_to_words(&src)[3], 0xFFFF, "adjusted word must never be 0xFFFF");
+}
+
+// #5176 fail-on-revert: a static-NAT rule-set scoped `from zone untrust` must
+// translate NPTv6 INBOUND traffic ONLY when it ingresses on zone untrust. A
+// same-prefix packet arriving from a DIFFERENT zone (trust) must be left
+// UNTRANSLATED — otherwise the scoped rule translates+routes traffic from every
+// zone (the #5176 security-domain crossing). Neutralize the gate — make
+// `Nptv6Rule::zone_matches` return `true` unconditionally, or drop the
+// `rule.zone_matches(...)` conjunct in `translate_inbound` (nptv6.rs) — and the
+// wrong-zone `assert!(!translated)` below goes RED.
+#[test]
+fn nptv6_zone_scope_gates_inbound_5176() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "scoped-untrust".to_string(),
+        from_zone: "untrust".to_string(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    }]);
+
+    // In-scope ingress zone -> translated to the internal prefix.
+    let mut dst_untrust: Ipv6Addr = "2001:db8:1:abcd::1".parse().unwrap();
+    assert!(
+        state.translate_inbound(&mut dst_untrust, "untrust"),
+        "in-scope ingress zone must translate"
+    );
+    assert_eq!(ipv6_to_words(&dst_untrust)[0], 0xfd00);
+
+    // Out-of-scope ingress zone, SAME prefix -> NOT translated, unchanged.
+    let orig: Ipv6Addr = "2001:db8:1:abcd::1".parse().unwrap();
+    let mut dst_trust = orig;
+    assert!(
+        !state.translate_inbound(&mut dst_trust, "trust"),
+        "out-of-scope ingress zone must NOT translate (security-domain crossing)"
+    );
+    assert_eq!(dst_trust, orig, "wrong-zone packet must be left unmodified");
+}
+
+// #5176 fail-on-revert: outbound SOURCE translation is gated by the EGRESS
+// zone. A rule scoped `from zone untrust` rewrites the source only for traffic
+// leaving via untrust; a same-prefix flow egressing another zone (trust) is
+// left untouched. Same neutralization as above -> the wrong-zone
+// `assert!(!translated)` goes RED.
+#[test]
+fn nptv6_zone_scope_gates_outbound_5176() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "scoped-untrust".to_string(),
+        from_zone: "untrust".to_string(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    }]);
+
+    // In-scope egress zone -> translated to the external prefix.
+    let mut src_untrust: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
+    assert!(
+        state.translate_outbound(&mut src_untrust, "untrust"),
+        "in-scope egress zone must translate"
+    );
+    assert_eq!(ipv6_to_words(&src_untrust)[0], 0x2001);
+
+    // Out-of-scope egress zone, SAME prefix -> untouched.
+    let orig: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
+    let mut src_trust = orig;
+    assert!(
+        !state.translate_outbound(&mut src_trust, "trust"),
+        "out-of-scope egress zone must NOT translate"
+    );
+    assert_eq!(src_trust, orig);
+}
+
+// #5176 fail-on-revert: two rules sharing the same INTERNAL prefix but scoped to
+// DIFFERENT non-empty zones (mapping to different external prefixes) are
+// legitimate per-zone split-horizon NAT — no single packet matches both, so
+// first-match resolution stays deterministic per zone. They MUST build. Before
+// the #5176 zone partition of the overlap check the identical internal prefix
+// tripped `Nptv6OverlappingPrefix` and the whole snapshot was rejected; revert
+// the `&& zones_conflict(...)` guard in `find_overlap` (or make `zones_conflict`
+// always return `true`) and this `.expect(...)` panics RED.
+#[test]
+fn nptv6_split_horizon_same_prefix_distinct_zones_admitted_5176() {
+    let state = Nptv6State::try_from_snapshots(&[
+        Nptv6RuleSnapshot {
+            name: "via-untrust".to_string(),
+            from_zone: "untrust".to_string(),
+            internal_prefix: "fd00:1::/48".to_string(),
+            external_prefix: "2001:db8:1::/48".to_string(),
+        },
+        Nptv6RuleSnapshot {
+            name: "via-trust".to_string(),
+            from_zone: "trust".to_string(),
+            internal_prefix: "fd00:1::/48".to_string(),
+            external_prefix: "2001:db8:2::/48".to_string(),
+        },
+    ])
+    .expect("same-prefix rules scoped to distinct zones must build (split-horizon)");
+    assert_eq!(state.outbound.len(), 2);
+    assert_eq!(state.inbound.len(), 2);
+
+    // Each egress zone resolves to its OWN external prefix — deterministic.
+    let mut via_untrust: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
+    assert!(state.translate_outbound(&mut via_untrust, "untrust"));
+    let wu = ipv6_to_words(&via_untrust);
+    assert_eq!((wu[0], wu[1], wu[2]), (0x2001, 0x0db8, 0x0001));
+
+    let mut via_trust: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
+    assert!(state.translate_outbound(&mut via_trust, "trust"));
+    let wt = ipv6_to_words(&via_trust);
+    assert_eq!((wt[0], wt[1], wt[2]), (0x2001, 0x0db8, 0x0002));
+}
+
+// #5176 no-regression: an EMPTY `from_zone` is a wildcard that matches EVERY
+// zone, preserving pre-#5176 behavior for unscoped static-NAT rule-sets. Stays
+// GREEN under the gate neutralization (it is the wildcard branch).
+#[test]
+fn nptv6_wildcard_from_zone_matches_any_zone_5176() {
+    let state = Nptv6State::from_snapshots(&[Nptv6RuleSnapshot {
+        name: "wildcard".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    }]);
+    // Matches an arbitrary zone name...
+    let mut a: Ipv6Addr = "2001:db8:1:abcd::1".parse().unwrap();
+    assert!(state.translate_inbound(&mut a, "any-zone-name"));
+    // ...and the empty zone.
+    let mut b: Ipv6Addr = "2001:db8:1:abcd::1".parse().unwrap();
+    assert!(state.translate_inbound(&mut b, ""));
+    // Outbound wildcard likewise matches any egress zone.
+    let mut c: Ipv6Addr = "fd00:1:0:abcd::1".parse().unwrap();
+    assert!(state.translate_outbound(&mut c, "whatever"));
 }
 
 /// Compute ones-complement sum of 8 words (for checksum neutrality test).

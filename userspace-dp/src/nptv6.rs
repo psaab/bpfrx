@@ -50,6 +50,22 @@
 //!   translation identity depend purely on rule order. `try_from_snapshots`
 //!   rejects an overlapping pair so resolution stays deterministic. The Go
 //!   commit-time gate (#2241) is primary; this is the helper-boundary backstop.
+//!   **#5176 zone partitioning:** the overlap is checked only between rules
+//!   whose static-NAT rule-set `from_zone` scopes can BOTH match a single
+//!   packet (either scope empty = wildcard, or the two scopes equal). Two
+//!   same-prefix rules with DIFFERENT non-empty `from_zone`s are legitimate
+//!   per-zone split-horizon (no packet matches both), so they are admitted —
+//!   they are not an order-dependent overlap.
+//! * **Match ONLY within the rule-set zone scope (#5176, security).**
+//!   A static-NAT rule-set is scoped by `from zone` (Go `rs.FromZone`, carried
+//!   on [`Nptv6Rule::from_zone`]). An NPTv6 rule matches a packet ONLY when its
+//!   `from_zone` is empty (wildcard) OR equals the packet's relevant security
+//!   zone — the INGRESS zone for [`Nptv6State::translate_inbound`] and the
+//!   EGRESS zone for [`Nptv6State::translate_outbound`]. Before #5176 both
+//!   lookups selected purely by prefix, so a rule scoped `from zone untrust`
+//!   translated (and thus routed) NPTv6 traffic sourced from EVERY zone — a
+//!   security-domain crossing — and the overlap gate wrongly rejected
+//!   legitimate per-zone split-horizon.
 
 use crate::Nptv6RuleSnapshot;
 use crate::policy::SnapshotIntegrityError;
@@ -58,6 +74,12 @@ use std::net::Ipv6Addr;
 /// A parsed NPTv6 rule with precomputed adjustment.
 #[derive(Clone, Debug)]
 pub(crate) struct Nptv6Rule {
+    /// #5176: the static-NAT rule-set `from zone` scope (Go `rs.FromZone`,
+    /// serialized on the snapshot as `from_zone`). Empty = wildcard (matches
+    /// any zone). A rule matches a packet only when this is empty or equals the
+    /// packet's relevant security zone (ingress for inbound, egress for
+    /// outbound) — see [`Nptv6Rule::zone_matches`].
+    pub(crate) from_zone: String,
     /// Prefix words to write into the address (3 for /48, 4 for /64).
     pub(crate) internal_prefix: [u16; 4],
     pub(crate) external_prefix: [u16; 4],
@@ -65,6 +87,17 @@ pub(crate) struct Nptv6Rule {
     pub(crate) adjustment: u16,
     /// Number of prefix words to rewrite: 3 for /48, 4 for /64.
     pub(crate) prefix_words: usize,
+}
+
+impl Nptv6Rule {
+    /// #5176: does this rule's `from_zone` scope admit a packet whose relevant
+    /// security zone is `zone`? An empty `from_zone` is a wildcard that matches
+    /// any zone; otherwise the zone must match exactly. The caller supplies the
+    /// ingress zone for inbound translation and the egress zone for outbound.
+    #[inline]
+    fn zone_matches(&self, zone: &str) -> bool {
+        self.from_zone.is_empty() || self.from_zone == zone
+    }
 }
 
 /// Aggregated NPTv6 state built from config snapshots.
@@ -224,9 +257,13 @@ impl Nptv6State {
         snaps: &[Nptv6RuleSnapshot],
     ) -> Result<Self, SnapshotIntegrityError> {
         let mut state = Nptv6State::default();
-        // Track (prefix, prefix_words, rule_name) to reject overlaps (#2241).
-        let mut internal_seen: Vec<([u16; 4], usize, String)> = Vec::with_capacity(snaps.len());
-        let mut external_seen: Vec<([u16; 4], usize, String)> = Vec::with_capacity(snaps.len());
+        // Track (prefix, prefix_words, rule_name, from_zone) to reject overlaps
+        // (#2241), partitioned by zone scope (#5176): only rules whose zone
+        // scopes can both match a single packet count as an overlap.
+        let mut internal_seen: Vec<([u16; 4], usize, String, String)> =
+            Vec::with_capacity(snaps.len());
+        let mut external_seen: Vec<([u16; 4], usize, String, String)> =
+            Vec::with_capacity(snaps.len());
         for snap in snaps {
             let (internal_prefix, iwords) = match parse_prefix(&snap.internal_prefix) {
                 Some(v) => v,
@@ -265,9 +302,12 @@ impl Nptv6State {
             // #2241: reject overlapping prefixes in either direction so the
             // first-match dataplane resolution stays deterministic. Outbound
             // matches on the internal prefix; inbound matches on the external
-            // prefix; check each independently.
+            // prefix; check each independently. #5176: two rules only conflict
+            // when their `from_zone` scopes can both match one packet — a
+            // same-prefix pair with different non-empty zones is legitimate
+            // per-zone split-horizon, not an order-dependent overlap.
             if let Some(prev) =
-                find_overlap(&internal_seen, &internal_prefix, iwords)
+                find_overlap(&internal_seen, &internal_prefix, iwords, &snap.from_zone)
             {
                 return Err(SnapshotIntegrityError::Nptv6OverlappingPrefix {
                     first_rule: prev,
@@ -276,7 +316,7 @@ impl Nptv6State {
                 });
             }
             if let Some(prev) =
-                find_overlap(&external_seen, &external_prefix, ewords)
+                find_overlap(&external_seen, &external_prefix, ewords, &snap.from_zone)
             {
                 return Err(SnapshotIntegrityError::Nptv6OverlappingPrefix {
                     first_rule: prev,
@@ -284,12 +324,23 @@ impl Nptv6State {
                     direction: "inbound (external)",
                 });
             }
-            internal_seen.push((internal_prefix, iwords, snap.name.clone()));
-            external_seen.push((external_prefix, ewords, snap.name.clone()));
+            internal_seen.push((
+                internal_prefix,
+                iwords,
+                snap.name.clone(),
+                snap.from_zone.clone(),
+            ));
+            external_seen.push((
+                external_prefix,
+                ewords,
+                snap.name.clone(),
+                snap.from_zone.clone(),
+            ));
 
             let adjustment = compute_adjustment(&internal_prefix, &external_prefix, iwords);
 
             let rule = Nptv6Rule {
+                from_zone: snap.from_zone.clone(),
                 internal_prefix,
                 external_prefix,
                 adjustment,
@@ -318,10 +369,17 @@ impl Nptv6State {
     /// Translate an inbound packet's destination address.
     /// If `dst` matches an external prefix, rewrites it in-place to the
     /// internal prefix and returns `true`.
-    pub(crate) fn translate_inbound(&self, dst: &mut Ipv6Addr) -> bool {
+    ///
+    /// #5176: `ingress_zone` is the packet's ingress security zone. A rule
+    /// matches only when its `from_zone` scope is empty (wildcard) or equals
+    /// `ingress_zone` — a rule scoped `from zone X` must NOT translate traffic
+    /// arriving from a different zone (security-domain crossing).
+    pub(crate) fn translate_inbound(&self, dst: &mut Ipv6Addr, ingress_zone: &str) -> bool {
         let mut words = ipv6_to_words(dst);
         for rule in &self.inbound {
-            if prefix_matches(&words, &rule.external_prefix, rule.prefix_words) {
+            if rule.zone_matches(ingress_zone)
+                && prefix_matches(&words, &rule.external_prefix, rule.prefix_words)
+            {
                 // Rewrite prefix words to internal prefix.
                 for i in 0..rule.prefix_words {
                     words[i] = rule.internal_prefix[i];
@@ -346,10 +404,18 @@ impl Nptv6State {
     /// Translate an outbound packet's source address.
     /// If `src` matches an internal prefix, rewrites it in-place to the
     /// external prefix and returns `true`.
-    pub(crate) fn translate_outbound(&self, src: &mut Ipv6Addr) -> bool {
+    ///
+    /// #5176: `egress_zone` is the packet's egress security zone. A rule
+    /// matches only when its `from_zone` scope is empty (wildcard) or equals
+    /// `egress_zone` — a rule scoped `from zone X` must NOT translate the
+    /// source of traffic leaving via a different zone (security-domain
+    /// crossing).
+    pub(crate) fn translate_outbound(&self, src: &mut Ipv6Addr, egress_zone: &str) -> bool {
         let mut words = ipv6_to_words(src);
         for rule in &self.outbound {
-            if prefix_matches(&words, &rule.internal_prefix, rule.prefix_words) {
+            if rule.zone_matches(egress_zone)
+                && prefix_matches(&words, &rule.internal_prefix, rule.prefix_words)
+            {
                 // Rewrite prefix words to external prefix.
                 for i in 0..rule.prefix_words {
                     words[i] = rule.external_prefix[i];
@@ -411,18 +477,35 @@ fn prefix_matches(addr_words: &[u16; 8], prefix: &[u16; 4], prefix_words: usize)
 /// a /48 nesting a /64 (the case that makes first-match resolution
 /// order-dependent). Each direction (internal for outbound, external for
 /// inbound) is checked independently by the caller.
+///
+/// #5176: an overlap is only order-dependent when the two rules' `from_zone`
+/// scopes can BOTH match a single packet — [`zones_conflict`]. A same-prefix
+/// pair scoped to two different non-empty zones is legitimate per-zone
+/// split-horizon (no packet matches both), so it is NOT reported as an overlap.
 fn find_overlap(
-    seen: &[([u16; 4], usize, String)],
+    seen: &[([u16; 4], usize, String, String)],
     candidate: &[u16; 4],
     candidate_words: usize,
+    candidate_zone: &str,
 ) -> Option<String> {
-    for (prefix, words, name) in seen {
+    for (prefix, words, name, from_zone) in seen {
         let common = candidate_words.min(*words);
-        if candidate[..common] == prefix[..common] {
+        if candidate[..common] == prefix[..common]
+            && zones_conflict(candidate_zone, from_zone)
+        {
             return Some(name.clone());
         }
     }
     None
+}
+
+/// #5176: can two static-NAT `from_zone` scopes both match a single packet? A
+/// packet carries exactly one relevant zone, so two rules conflict only when
+/// either scope is a wildcard (empty) or both name the same zone. Two distinct
+/// non-empty zones are disjoint — legitimate split-horizon.
+#[inline]
+fn zones_conflict(a: &str, b: &str) -> bool {
+    a.is_empty() || b.is_empty() || a == b
 }
 
 #[cfg(test)]

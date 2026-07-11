@@ -23,8 +23,25 @@ pub(in crate::afxdp::icmp_embed) fn match_outer_v6(
     // parser. Preserves the wire-vs-translated asymmetry that the
     // forward-NAT reverse_key (uses wire) and the shared_reverse_key
     // (uses translated) depend on. Mirrors icmp_embed.rs:358-360.
+    //
+    // #5176: the reverse translation is zone-scoped like every NPTv6 lookup.
+    // This ICMP error reverses an OUTBOUND source translation, whose rule was
+    // scoped by the original flow's egress zone; the error returns ingressing
+    // on that same external interface, so gate on THIS packet's ingress zone
+    // (the inbound-direction zone per the #5176 invariant). A wildcard rule
+    // (empty `from_zone`) still matches regardless.
+    let ingress_zone = ctx
+        .forwarding
+        .ifindex_to_zone_id
+        .get(&(meta.ingress_ifindex as i32))
+        .and_then(|id| ctx.forwarding.zone_id_to_name.get(id))
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let mut emb_src_lookup_v6 = hdr.src_wire;
-    let _nptv6_reverse = ctx.forwarding.nptv6.translate_inbound(&mut emb_src_lookup_v6);
+    let _nptv6_reverse = ctx
+        .forwarding
+        .nptv6
+        .translate_inbound(&mut emb_src_lookup_v6, ingress_zone);
     let emb_src_lookup = IpAddr::V6(emb_src_lookup_v6);
 
     let embedded_key = SessionKey {
