@@ -338,7 +338,7 @@ func (s *Server) GetVRRPStatus(_ context.Context, _ *pb.GetVRRPStatusRequest) (*
 			runtimeStates = s.vrrpMgr.States()
 		}
 		for _, inst := range instances {
-			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+			key := vrrp.StateKey(inst.Interface, inst.GroupID, inst.Family)
 			state := "INIT"
 			if s, ok := runtimeStates[key]; ok {
 				state = s

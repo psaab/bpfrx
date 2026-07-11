@@ -1,7 +1,6 @@
 package api
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -24,7 +23,7 @@ func (s *Server) vrrpHandler(w http.ResponseWriter, _ *http.Request) {
 			if addrs == nil {
 				addrs = []string{}
 			}
-			key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+			key := vrrp.StateKey(inst.Interface, inst.GroupID, inst.Family)
 			state := "INIT"
 			if st, ok := states[key]; ok {
 				state = st

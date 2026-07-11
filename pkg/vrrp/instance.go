@@ -67,6 +67,7 @@ func (s VRRPState) String() string {
 // VRRPEvent is emitted when a VRRP instance changes state.
 type VRRPEvent struct {
 	Interface string
+	Family    string
 	GroupID   int
 	State     VRRPState
 	VIPs      []string
@@ -389,23 +390,48 @@ func (vi *vrrpInstance) reresolveLocalAddrs() {
 
 // openSocket creates the per-instance raw socket bound to the interface.
 func (vi *vrrpInstance) openSocket() error {
-	isVLAN := strings.Contains(vi.cfg.Interface, ".")
+	return vi.openSocketWith(openPerInterfaceSocket, openAfPacketReceiver, openIPv6Socket)
+}
 
-	rawConn, conn, err := openPerInterfaceSocket(vi.cfg.Interface, vi.iface, isVLAN)
-	if err != nil {
-		return err
+// openSocketWith is the dependency-injected implementation used by
+// openSocket. Keeping the seams call-scoped (rather than mutable package
+// globals) lets tests prove family-specific socket selection and rollback
+// without introducing cross-test races.
+func (vi *vrrpInstance) openSocketWith(
+	openIPv4 func(string, *net.Interface, bool) (*ipv4.RawConn, net.PacketConn, error),
+	openAFPacket func(int) (int, error),
+	openIPv6 func(string, *net.Interface, bool) (net.PacketConn, int, error),
+) error {
+	isVLAN := strings.Contains(vi.cfg.Interface, ".")
+	hasIPv4VIPs, hasIPv6VIPs := vi.vipFamilies()
+	// A group without a parseable VIP is invalid at the config boundary, but
+	// preserve the historical socket choice for direct/test callers while
+	// honoring an explicit inet6 identity.
+	if !hasIPv4VIPs && !hasIPv6VIPs {
+		hasIPv6VIPs = vi.cfg.Family == "inet6"
+		hasIPv4VIPs = !hasIPv6VIPs
 	}
-	vi.conn = conn
-	vi.rawConn = rawConn
+
+	// Open only the protocol sockets this election domain needs. Before #5083
+	// an IPv6-only instance still required an IPv4 raw socket, so a host with a
+	// working IPv6 VRRP stack but unavailable IPv4 raw socket could never start.
+	if hasIPv4VIPs {
+		rawConn, conn, err := openIPv4(vi.cfg.Interface, vi.iface, isVLAN)
+		if err != nil {
+			return err
+		}
+		vi.conn = conn
+		vi.rawConn = rawConn
+	}
 
 	// Open AF_PACKET socket for receiving VRRP packets.
 	// Raw IP sockets (proto 112) don't reliably receive multicast in
 	// generic XDP mode — AF_PACKET taps fire before generic XDP in the
 	// kernel's receive path, so they always see the packet regardless
 	// of XDP processing. The raw IP socket is kept for sending only.
-	fd, err := openAfPacketReceiver(vi.iface.Index)
+	fd, err := openAFPacket(vi.iface.Index)
 	if err != nil {
-		slog.Warn("vrrp: af_packet open failed, raw socket only",
+		slog.Warn("vrrp: af_packet open failed, protocol raw-socket fallback only",
 			"key", vi.key(), "err", err)
 	} else {
 		vi.afPacketFD = fd
@@ -417,16 +443,6 @@ func (vi *vrrpInstance) openSocket() error {
 	// We must skip VIP addresses because during split-brain both nodes
 	// have the VIP — using it as source would cause the peer to filter
 	// our adverts as "self-sent" (matching its own VIP).
-	hasIPv6VIPs := false
-	for _, vip := range vi.cfg.VirtualAddresses {
-		addr := vip
-		if idx := strings.Index(addr, "/"); idx >= 0 {
-			addr = addr[:idx]
-		}
-		if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
-			hasIPv6VIPs = true
-		}
-	}
 	// Resolve our IPv4 + (deterministic, lowest) link-local IPv6 advert
 	// source from the interface's current addresses. The manager addr-watcher
 	// re-runs reresolveLocalAddrs on every address change so a source flushed
@@ -436,21 +452,25 @@ func (vi *vrrpInstance) openSocket() error {
 
 	// Open IPv6 raw socket if any VIPs are IPv6.
 	if hasIPv6VIPs {
-		v6Conn, v6FD, err := openIPv6Socket(vi.cfg.Interface, vi.iface, isVLAN)
+		v6Conn, v6FD, err := openIPv6(vi.cfg.Interface, vi.iface, isVLAN)
 		if err != nil {
-			slog.Warn("vrrp: ipv6 socket open failed, IPv6 adverts disabled",
-				"key", vi.key(), "err", err)
-		} else {
-			vi.ipv6Conn = v6Conn
-			vi.ipv6FD = v6FD
-			// Wrap the raw IPConn so we can attach an IPV6_PKTINFO
-			// control message on every advert. The control message pins
-			// the outer IPv6 source to the checksum source (#2644).
-			p6 := ipv6.NewPacketConn(v6Conn)
-			vi.ipv6Send = func(data []byte, cm *ipv6.ControlMessage, dst net.Addr) error {
-				_, werr := p6.WriteTo(data, cm, dst)
-				return werr
-			}
+			// A configured family is an indivisible readiness contract. Publishing
+			// the instance after a warning-only IPv6 failure made the manager and
+			// HA gates report it running even though it could never advertise that
+			// family. Release any already-open IPv4/AF_PACKET resources and fail
+			// the manager's build-before-teardown proof instead.
+			vi.closeSockets()
+			return fmt.Errorf("open IPv6 VRRP socket: %w", err)
+		}
+		vi.ipv6Conn = v6Conn
+		vi.ipv6FD = v6FD
+		// Wrap the raw IPConn so we can attach an IPV6_PKTINFO control message
+		// on every advert. The control message pins the outer IPv6 source to the
+		// checksum source (#2644).
+		p6 := ipv6.NewPacketConn(v6Conn)
+		vi.ipv6Send = func(data []byte, cm *ipv6.ControlMessage, dst net.Addr) error {
+			_, werr := p6.WriteTo(data, cm, dst)
+			return werr
 		}
 	}
 
@@ -458,7 +478,7 @@ func (vi *vrrpInstance) openSocket() error {
 }
 
 func (vi *vrrpInstance) key() string {
-	return fmt.Sprintf("VI_%s_%d", vi.cfg.Interface, vi.cfg.GroupID)
+	return StateKey(vi.cfg.Interface, vi.cfg.GroupID, vi.cfg.Family)
 }
 
 // updateConfig updates priority, preempt, and interface-tracking config
@@ -1029,16 +1049,17 @@ func (vi *vrrpInstance) run() {
 	if vi.afPacketFD >= 0 {
 		go vi.receiverAfPacket()
 	} else {
-		go vi.receiver()
-		// The IPv4-only raw socket fallback cannot receive IPv6 VRRP.
-		// Start a separate IPv6 receiver if we have an IPv6 socket.
+		// Start one raw receiver per configured family. A family-specific
+		// generic instance must never feed the other family's adverts into its
+		// state machine; an empty-family RETH instance has both sockets and keeps
+		// the historical dual-stack behavior.
+		if vi.rawConn != nil {
+			go vi.receiver()
+		}
 		if vi.ipv6Conn != nil {
 			slog.Warn("vrrp: af_packet unavailable, using separate IPv6 raw socket fallback",
 				"key", vi.key())
 			go vi.receiverIPv6()
-		} else if vi.getLocalIPv6() != nil {
-			slog.Warn("vrrp: af_packet unavailable and no IPv6 socket — IPv6 VRRP reception disabled",
-				"key", vi.key())
 		}
 	}
 
@@ -1256,12 +1277,7 @@ func (vi *vrrpInstance) receiver() {
 			continue
 		}
 
-		select {
-		case vi.rxCh <- pkt:
-			vi.rxReceived.Add(1)
-		default:
-			vi.warnRXDrop()
-		}
+		vi.enqueuePacket(pkt, false)
 	}
 }
 
@@ -1368,12 +1384,7 @@ func (vi *vrrpInstance) receiverIPv6() {
 			continue
 		}
 
-		select {
-		case vi.rxCh <- pkt:
-			vi.rxReceived.Add(1)
-		default:
-			vi.warnRXDrop()
-		}
+		vi.enqueuePacket(pkt, true)
 	}
 }
 
@@ -1472,12 +1483,7 @@ func (vi *vrrpInstance) parseAfPacketIPv4(buf []byte, n, ethHeaderLen int) {
 		return
 	}
 
-	select {
-	case vi.rxCh <- pkt:
-		vi.rxReceived.Add(1)
-	default:
-		vi.warnRXDrop()
-	}
+	vi.enqueuePacket(pkt, false)
 }
 
 // parseAfPacketIPv6 parses an IPv6 VRRP packet from a raw Ethernet frame.
@@ -1533,6 +1539,18 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 		return
 	}
 
+	vi.enqueuePacket(pkt, true)
+}
+
+// enqueuePacket is the single admission point shared by all raw and
+// AF_PACKET receivers. Family-tagged generic instances accept only their own
+// election domain; empty-family RETH instances intentionally accept both.
+// Keeping this check at the leaf closes cross-family bleed for every current
+// transport and for future receiver refactors that use this helper.
+func (vi *vrrpInstance) enqueuePacket(pkt *VRRPPacket, isIPv6 bool) {
+	if (vi.cfg.Family == "inet" && isIPv6) || (vi.cfg.Family == "inet6" && !isIPv6) {
+		return
+	}
 	select {
 	case vi.rxCh <- pkt:
 		vi.rxReceived.Add(1)
@@ -1830,16 +1848,28 @@ func (vi *vrrpInstance) resolveEqualPriorityMaster(pkt *VRRPPacket, masterDownTi
 // cfg.VirtualAddresses is immutable per instance (VIP changes rebuild the
 // instance), so no lock is needed — same rationale as vipAddrSet.
 func (vi *vrrpInstance) hasIPv4VIP() bool {
+	hasIPv4, _ := vi.vipFamilies()
+	return hasIPv4
+}
+
+// vipFamilies reports which IP families have at least one parseable virtual
+// address. Instance VIPs are immutable after construction, so callers may use
+// it without locking.
+func (vi *vrrpInstance) vipFamilies() (hasIPv4, hasIPv6 bool) {
 	for _, vip := range vi.cfg.VirtualAddresses {
 		addr := vip
 		if idx := strings.Index(addr, "/"); idx >= 0 {
 			addr = addr[:idx]
 		}
-		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
-			return true
+		if ip := net.ParseIP(addr); ip != nil {
+			if ip.To4() != nil {
+				hasIPv4 = true
+			} else {
+				hasIPv6 = true
+			}
 		}
 	}
-	return false
+	return hasIPv4, hasIPv6
 }
 
 // becomeMaster transitions to Master state: add VIPs, send advert, emit event,
@@ -1888,6 +1918,7 @@ func (vi *vrrpInstance) becomeBackup(masterDownTimer, advertTimer *time.Timer) {
 func (vi *vrrpInstance) emitEvent() {
 	evt := VRRPEvent{
 		Interface: vi.cfg.Interface,
+		Family:    vi.cfg.Family,
 		GroupID:   vi.cfg.GroupID,
 		State:     vi.getState(),
 		VIPs:      vi.cfg.VirtualAddresses,
@@ -2401,7 +2432,23 @@ func (vi *vrrpInstance) warnRXDrop() {
 func (vi *vrrpInstance) stop() {
 	close(vi.stopCh)
 
-	// Close sockets to unblock any blocking recvmsg in receiver().
+	// Close descriptors to unblock receiver syscalls, but keep the pointer/fd
+	// fields stable for the retired instance's lifetime. The receiver goroutines
+	// are not separately joined; clearing these fields would race receiver()'s
+	// vi.conn and receiverAfPacket()'s vi.afPacketFD reads.
+	vi.closeSocketDescriptors()
+	<-vi.stopped
+}
+
+// closeSockets releases and clears all per-instance descriptors before run()
+// starts. It is used by the openSocket failure path, where stop() cannot be
+// called because no goroutine will ever close stopped.
+func (vi *vrrpInstance) closeSockets() {
+	vi.closeSocketDescriptors()
+	vi.clearSocketRefs()
+}
+
+func (vi *vrrpInstance) closeSocketDescriptors() {
 	if vi.conn != nil {
 		vi.conn.Close()
 	}
@@ -2410,8 +2457,14 @@ func (vi *vrrpInstance) stop() {
 	}
 	if vi.afPacketFD >= 0 {
 		unix.Close(vi.afPacketFD)
-		vi.afPacketFD = -1
 	}
+}
 
-	<-vi.stopped
+func (vi *vrrpInstance) clearSocketRefs() {
+	vi.conn = nil
+	vi.rawConn = nil
+	vi.ipv6Conn = nil
+	vi.ipv6FD = -1
+	vi.ipv6Send = nil
+	vi.afPacketFD = -1
 }

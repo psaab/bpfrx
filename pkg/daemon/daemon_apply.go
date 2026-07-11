@@ -1988,11 +1988,13 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 // non-abort dataplane-apply failure that must fail the commit while the OLD
 // policy stays live); routeLeakErr is the #5696 route-leak snapshot
 // republish/FIB-bump failure (also head-produced, threaded in like ifaceErr);
-// lo0Err/hostInboundErr originate in step 9.5 below. The returned errors.Join
-// preserves the exact operand order the inline tail used
-// (#1778/#2987/#4433/#5310/#5679/#5696).
+// vrrpErr originates in step 8 below when runtime identity validation rejects
+// the desired set; lo0Err/hostInboundErr originate in step 9.5. The returned
+// errors.Join preserves the explicit operand order
+// (#1778/#2987/#4433/#5083/#5310/#5679/#5696).
 func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
+	var vrrpErr error
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
 		localPri := d.cluster.LocalPriorities()
@@ -2000,6 +2002,10 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	}
 	if err := d.vrrpMgr.UpdateInstances(vrrpInstances); err != nil {
 		slog.Warn("failed to update VRRP instances", "err", err)
+		// Identity/family validation is a fail-closed runtime gate. Returning a
+		// successful commit while the manager retained the old instance set
+		// would claim HA coverage for a family/segment that is not running.
+		vrrpErr = fmt.Errorf("update VRRP instances: %w", err)
 	}
 
 	// 9. Apply system DNS and NTP configuration.
@@ -2251,7 +2257,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	// #1778 + #2987 + #4433 + #5310 + #5679 + #5696: deferred reconcile failures —
+	// #1778 + #2987 + #4433 + #5083 + #5310 + #5679 + #5696: deferred reconcile failures —
 	// every reconcile step above has run; surface the networkd write failure, the
 	// ordinary (non-abort) dataplane-apply failure (#5679 — the new policy is
 	// NOT on the wire, the old one still is), the Kea restart/stop failure, the
@@ -2262,7 +2268,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, vrrpErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

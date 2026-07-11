@@ -302,6 +302,68 @@ source cannot put a valid same-family advert on the wire (`sendPacket` errors),
 so the peer never receives an advert from it and only one side steps down; the
 source re-resolves on the advert-send path and a healthy node re-elects cleanly.
 
+## Instance identity — kernel name + family key (#5083)
+
+`CollectInstances` (the generic, interface-level collector) must produce a
+**kernel** interface name and a family-tagged identity, or instances get
+silently dropped:
+
+- **Kernel name** — the collector resolves each `Instance.Interface` to the
+  Linux netdev via the SSOT `cfg.ResolveKernelIfName("<ifName>.<unit>")`. It
+  previously stored the raw Junos name (`ge-0/0/0`) with no unit, so the
+  manager's `net.InterfaceByName("ge-0/0/0")` failed and **no instance was
+  ever built** for a slash-named interface. `ResolveKernelIfName` translates
+  the slash form, applies reth resolution, and appends the unit's VLAN tag /
+  unit-number suffix, so a VLAN sub-interface `ge-0/0/0.100` maps to the
+  netdev `ge-0-0-0.100` and a non-zero unit gets its own device. This is the
+  same SSOT resolver used by the DHCP / ip-monitoring name derivations, not a
+  hand-rolled slash→dash substitution (which mishandles reth/unit).
+- **Family in the key** — the manager `instanceKey` is
+  `{iface, groupID, family}`. A **dual-stack** generic group configures an
+  IPv4 `vrrp-group` under a `family inet` address AND an IPv6 `vrrp-group`
+  under a `family inet6` address with the **same** VRID; `parseVRRPGroups`
+  keys them separately (by address CIDR) so `CollectInstances` emits **one
+  Instance per family**. These are two independent VRRP protocol instances
+  (distinct multicast groups / adverts). Without `family` in the key they
+  collided on `(interface, VRID)` and `UpdateInstances` last-wins **dropped a
+  family**. The unit needs no separate key field — it is already encoded in the
+  resolved kernel name (VLAN suffix / unit number), so two units sharing a VRID
+  yield distinct `iface` values on their own.
+- **Family is an election-domain boundary** — every raw-IP and AF_PACKET
+  receive path converges on one admission helper. An `inet` instance rejects
+  IPv6 adverts and an `inet6` instance rejects IPv4 adverts before they enter
+  its state machine; only the historical empty-family RETH instance admits
+  both. This is required when two generic instances share interface+VRID:
+  identity-only map separation is insufficient if one family's advert can
+  still reset or transition the other family's timers/state.
+- **Socket readiness is complete or absent** — an IPv6-only instance opens no
+  IPv4 raw socket, and any required IPv4/IPv6 socket failure rejects the new
+  instance through the manager's build-before-teardown proof. In particular,
+  an IPv6 socket failure is no longer warning-only: the manager cannot publish
+  a nominally running `inet6` instance that is unable to advertise.
+- **Collisions fail closed** — collection order is deterministic, and
+  `UpdateInstances` rejects duplicate `{kernel interface, VRID, family}`
+  identities before changing the live set or publishing desired interfaces.
+  It also rejects an empty-family RETH instance sharing interface+VRID with a
+  generic family: the RETH state machine consumes both wire families and would
+  overlap either generic election despite having a different map key.
+  The apply tail propagates that rejection as a commit error rather than
+  accepting whichever map entry happened to win iteration order.
+- **RETH is different** — `CollectRethInstances` deliberately leaves `Family`
+  empty and puts a sub-interface's mixed v4+v6 VIPs on **one** instance (see the
+  #4376 tie-break above), so RETH keys stay byte-identical to before. The
+  `Family` split is a generic-collector concept only.
+- **Display key** — `StateKey(iface, groupID, family)` is the single source of
+  truth for the `VI_<iface>_<vrid>[_<family>]` string that `Manager.States()` /
+  `RXDropStats()` index by and that `pkg/api` / `pkg/grpcapi` / `pkg/cli`
+  reconstruct from a collected `Instance`. Empty family keeps the historical
+  `VI_<iface>_<vrid>` form; a dual-stack instance appends `_inet` / `_inet6` so
+  the two families never collide in those maps.
+- **Event identity stays complete** — `VRRPEvent` and `InstanceStates` carry
+  `Family`. Cluster ownership paths accept only empty-family implicit RETH
+  events/instances, so a valid standalone generic VRID in the numeric
+  `100+RG` range cannot be mistaken for a chassis-cluster redundancy group.
+
 Regression coverage: `TestHandleMasterRx_DualStack_DisagreeingOrderings_ConvergeOneMaster`
 (both converge to one master), `..._DualStack_IgnoresV6Advert`,
 `..._V6Only_TieBreaksOnLinkLocal`, `..._NilLocal_DoesNotStayMaster` in

@@ -3,6 +3,7 @@ package vrrp
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 
@@ -25,7 +26,17 @@ const (
 
 // Instance describes a single VRRP instance.
 type Instance struct {
-	Interface         string
+	Interface string
+	// Family is the address family this instance advertises: "inet" (IPv4) or
+	// "inet6" (IPv6). It is part of the manager instance identity (#5083) so a
+	// dual-stack VRRP group — an IPv4 and an IPv6 group sharing one unit AND one
+	// VRID — yields TWO distinct instances instead of colliding on
+	// (interface, VRID) and silently dropping a family (last-wins). The generic
+	// collector (CollectInstances) sets it per Junos family address; the RETH
+	// collector (CollectRethInstances) deliberately leaves it empty because a
+	// RETH sub-interface carries mixed v4+v6 VIPs on ONE instance that
+	// family-detects each VIP at advert time.
+	Family            string
 	GroupID           int
 	Priority          int
 	Preempt           bool
@@ -46,11 +57,45 @@ func CollectInstances(cfg *config.Config) []*Instance {
 		return nil
 	}
 	var instances []*Instance
-	for ifName, ifc := range cfg.Interfaces.Interfaces {
-		for _, unit := range ifc.Units {
-			for _, vg := range unit.VRRPGroups {
+	for _, ifName := range sortedIfNames(cfg) {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil {
+				continue
+			}
+			// Resolve the CONFIGURED interface+unit to its KERNEL device name
+			// via the SSOT resolver (#5083). Storing the raw Junos name
+			// (ge-0/0/0) with no unit — as this collector did before — made the
+			// manager's net.InterfaceByName("ge-0/0/0") fail so NO instance was
+			// ever built for a slash-named interface, and two units sharing a
+			// VRID both stored the bare base name and collided on the manager
+			// key. ResolveKernelIfName translates the slash form, applies reth
+			// resolution, and appends the unit's VLAN tag / unit-number suffix so
+			// a VLAN sub-interface (ge-0/0/0.100 → ge-0-0-0.100) and a
+			// non-zero unit map to the exact netdev InterfaceByName expects.
+			kernelIf := cfg.ResolveKernelIfName(fmt.Sprintf("%s.%d", ifName, unitNum))
+			groupKeys := make([]string, 0, len(unit.VRRPGroups))
+			for vgKey := range unit.VRRPGroups {
+				groupKeys = append(groupKeys, vgKey)
+			}
+			sort.Strings(groupKeys)
+			for _, vgKey := range groupKeys {
+				vg := unit.VRRPGroups[vgKey]
+				if vg == nil {
+					continue
+				}
 				inst := &Instance{
-					Interface:         ifName,
+					Interface:         kernelIf,
+					Family:            vrrpGroupFamily(vg.VirtualAddresses, vgKey),
 					GroupID:           vg.ID,
 					Priority:          vg.Priority,
 					Preempt:           vg.Preempt,
@@ -253,6 +298,58 @@ func RethVIPsForRG(cfg *config.Config, rgID int) map[string][]string {
 		}
 	}
 	return result
+}
+
+// StateKey builds the map key that Manager.States() / RXDropStats() index a
+// running instance's state under, and that the display consumers (pkg/api,
+// pkg/grpcapi, pkg/cli) reconstruct from a collected Instance to correlate it
+// with that state. It is the single source of truth for the format so the two
+// sides can never drift (#5083). A dual-stack generic VRRP group produces two
+// instances that share (interface, VRID) and differ ONLY by family, so family
+// is part of the key. RETH alone leaves Family empty and keeps the historical
+// "VI_<iface>_<vrid>" form; every generic instance carries inet/inet6.
+func StateKey(iface string, groupID int, family string) string {
+	if family == "" {
+		return fmt.Sprintf("VI_%s_%d", iface, groupID)
+	}
+	return fmt.Sprintf("VI_%s_%d_%s", iface, groupID, family)
+}
+
+// vrrpGroupFamily returns the address family ("inet" or "inet6") of a VRRP
+// group. parseVRRPGroups keys each group "<address-CIDR>_grp<id>", so the
+// address the group hangs off is the authoritative family even on a lenient
+// load containing a malformed/cross-family VIP. Hand-built Config values may
+// not carry that key shape, so the first parseable VIP is the compatibility
+// fallback. Defaults to "inet" only when neither source is parseable.
+func vrrpGroupFamily(vips []string, groupKey string) string {
+	if i := strings.LastIndex(groupKey, "_grp"); i > 0 {
+		if fam := familyOfAddrs([]string{groupKey[:i]}); fam != "" {
+			return fam
+		}
+	}
+	if fam := familyOfAddrs(vips); fam != "" {
+		return fam
+	}
+	return "inet"
+}
+
+// familyOfAddrs reports the family of the first parseable address in addrs
+// ("inet" for IPv4, "inet6" for IPv6), stripping any /prefix suffix. Returns ""
+// when none parse.
+func familyOfAddrs(addrs []string) string {
+	for _, a := range addrs {
+		s := a
+		if idx := strings.Index(s, "/"); idx >= 0 {
+			s = s[:idx]
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			if ip.To4() != nil {
+				return "inet"
+			}
+			return "inet6"
+		}
+	}
+	return ""
 }
 
 // sortedIfNames returns sorted interface names from config for deterministic iteration.
