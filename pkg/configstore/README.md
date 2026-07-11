@@ -207,6 +207,21 @@ inline archive-site passwords).
   fields dropped — an EMPTY tree — booting a committed-empty config (loss of
   policy) instead of failing closed. This restores at the inner layer the same
   no-empty-load-on-unknown property the outer envelope provides.
+- **Non-object top-level body fails closed (#5474).** After the envelope is
+  stripped and any AES-GCM ciphertext decrypted, `readTreeMeta` requires the
+  final plaintext ConfigTree body to be a JSON OBJECT (`requireJSONObject`)
+  BEFORE decoding it into `*ConfigTree`. This closes a fail-OPEN gap: Go's
+  `json.Unmarshal([]byte("null"), &ConfigTree{})` returns NO error and leaves
+  the tree at its zero value, so a legacy/plaintext (or enveloped-but-
+  unencrypted) active body of literal `null` used to decode to a semantically
+  EMPTY config and `Store.Load` would compile+boot it normally — the firewall
+  coming up with policy ABSENT instead of failing closed. Top-level arrays and
+  scalars already error against the struct target, but `null` is syntactically
+  valid and decodes to zero policy; the object gate rejects all three uniformly
+  with an error `Store.Load` tags `ErrConfigDBUnreadable`. The valid empty
+  config `{}` is preserved as valid, and well-formed populated objects plus the
+  encrypted-envelope path (whose inner body always marshals from a struct to an
+  object) decode byte-for-byte as before.
 - **GCM AAD binding (A4-05) — deliberately NOT changed.** `Seal`/`Open` pass
   a nil additional-authenticated-data argument. Binding the envelope header
   (PRF/salt) as AAD is textbook defense-in-depth, but the scheme already
@@ -665,9 +680,10 @@ persistence failures on every persist path;
 `errors.Is`:
 
 - **`ErrConfigDBUnreadable` (#1917 D1)** — a PRESENT `active.json` whose
-  bytes cannot be read (JSON parse error, decrypt failure, or a too-new
-  compatibility envelope). The daemon FAILS CLOSED by exiting `Run`, so an
-  unreadable/too-new DB is never overwritten by a blind bootstrap.
+  bytes cannot be read (JSON parse error, decrypt failure, a too-new
+  compatibility envelope, or a top-level body that is not a JSON object —
+  `null`/array/scalar, #5474). The daemon FAILS CLOSED by exiting `Run`, so an
+  unreadable/too-new/non-object DB is never overwritten by a blind bootstrap.
 - **`ErrConfigCompile` (#1960)** — a PRESENT `active.json` that read+parsed
   fine but no longer COMPILES, even through the tolerant `compileTreeLenient`
   path (e.g. a committed config whose referenced apply-group was later
