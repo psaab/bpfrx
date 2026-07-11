@@ -607,11 +607,24 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		srcPorts = []string{""} // "any"
 	}
 
+	// #5456: bound the materialized cross-product to config.MaxFilterTermExpansion
+	// — the same bound config.FilterTermExpansionCount clamps its uint32 stride
+	// to. This is the RETIRED-eBPF filter compiler (the live userspace dataplane
+	// never materializes a cross-product; it stores prefix sets matched by
+	// membership), so this cap only bounds this dead-path allocation and keeps
+	// len(rules) == the clamped FilterTermExpansionCount, preserving the #3459
+	// drift-guard invariant for an over-bound term. Without it a term whose count
+	// used to wrap (e.g. 2.5e11 entries) would attempt an unbounded slice alloc
+	// here. The caller additionally truncates at MaxFilterRules (512).
 	var rules []FilterRule
+expand:
 	for _, src := range srcAddrs {
 		for _, dst := range dstAddrs {
 			for _, dp := range dstPorts {
 				for _, sp := range srcPorts {
+					if len(rules) >= config.MaxFilterTermExpansion {
+						break expand
+					}
 					rule := base
 					if src.cidr != "" {
 						rule.MatchFlags |= FilterMatchSrcAddr

@@ -765,6 +765,70 @@ func validateFilterActionsStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// warnFilterTermExpansionOverBound appends an ADVISORY warning (never a hard
+// reject) for each firewall-filter term whose rule cross-product — (literal
+// source addresses + every source-prefix-list prefix) × (literal destination
+// addresses + every destination-prefix-list prefix) × destination-ports ×
+// source-ports — exceeds MaxFilterTermExpansion (#5456).
+//
+// This is deliberately NOT a strict commit gate. The cross-product and its
+// uint32 counter-slot stride are RETIRED-eBPF-path artifacts: the LIVE userspace
+// dataplane enforces the term natively (prefix-set membership, name-keyed
+// per-term counters — FirewallFilterTermCounterKey), never materializes the
+// cross-product, and is immune to stride drift. A term referencing, say, two
+// 1500-entry prefix-lists (2.25M cross-product) is handled trivially by the live
+// runtime, so REJECTING it at commit would false-reject a legitimate,
+// enforceable config. The real defect #5456 fixes is the silent uint32
+// truncation, already closed by FilterTermExpansionCount computing the product
+// in checked uint64 and CLAMPING the stride (and expandFilterTerm's materialized
+// slice) to MaxFilterTermExpansion — the wrap can no longer occur.
+//
+// The warning exists only to tell the operator that, ON THE RETIRED-eBPF
+// per-rule counter path (unused on this build), such a term's per-rule
+// `show firewall filter` counts would be clamped and therefore inexact. Both
+// families are walked, sorted by filter name then by the term's position, so the
+// warnings are emitted deterministically (Go map order is randomized).
+func warnFilterTermExpansionOverBound(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	prefixLists := cfg.PolicyOptions.PrefixLists
+	emit := func(family string, filters map[string]*FirewallFilter) {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				count := FilterTermExpansionCount64(term, prefixLists)
+				if count > MaxFilterTermExpansion {
+					cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+						"firewall family %s filter %q term %q expands to %d match "+
+							"combinations (source-addresses+prefixes × destination-"+
+							"addresses+prefixes × destination-ports × source-ports), "+
+							"above the %d per-term counter-stride bound; the userspace "+
+							"dataplane enforces this term natively (prefix-set membership, "+
+							"name-keyed counter) so it is COMMITTED, but per-rule "+
+							"`show firewall filter` counts on the retired-eBPF counter "+
+							"path would be clamped/inexact — split the term if you rely "+
+							"on per-rule firewall counters",
+						family, name, term.Name, count, MaxFilterTermExpansion))
+				}
+			}
+		}
+	}
+	emit("inet", cfg.Firewall.FiltersInet)
+	emit("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFilterMatchValuesStrict hard-rejects any firewall-filter term that
 // carries a SYMBOLIC match value (icmp-type / icmp-code name or a named port)
 // the compiler could not resolve to a number — #3205 (agy-070 #07/#08).
