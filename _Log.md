@@ -45616,3 +45616,10 @@ top.
   green; RED-on-revert proven (flipping `ones > bestLen` to pick the shortest
   prefix fails the selection assertions; reverted, production file clean).
 - **File(s)**: pkg/cli/cli_request_testrouting_4832_test.go, _Log.md
+
+## 2026-07-10 — #4907 perf-tooling evidence-integrity cohort
+- **Timestamp**: 2026-07-10
+- **Action**: HC-029 — mouse_latency_aggregate FAIL must exit non-zero (add
+  exit_status_for_verdict: PASS=0, FAIL=1, else=2) + fail-on-revert test
+- **File(s)**: test/incus/mouse_latency_aggregate.py,
+  test/incus/mouse_latency_aggregate_test.py

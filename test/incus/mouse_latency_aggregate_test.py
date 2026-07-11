@@ -5,6 +5,7 @@ import unittest
 
 from mouse_latency_aggregate import (
     decide,
+    exit_status_for_verdict,
     has_invalid_marker,
     load_cell_reps,
     median_rep_by_percentile,
@@ -238,6 +239,27 @@ class DecideTests(unittest.TestCase):
         v = decide({(0, 10): idle, (128, 10): loaded})
         self.assertEqual(v["verdict"], "INSUFFICIENT-DATA")
         self.assertIn("probe config mismatch", v["reason"])
+
+
+class ExitStatusForVerdictTests(unittest.TestCase):
+    """C175-HC-029: a measured FAIL must exit non-zero, not 0.
+
+    Fail-on-revert guard: the pre-fix ``return 0 if verdict in
+    ("PASS", "FAIL") else 2`` returned 0 for FAIL, so this asserts 1.
+    """
+
+    def test_pass_is_zero(self):
+        self.assertEqual(exit_status_for_verdict("PASS"), 0)
+
+    def test_fail_is_nonzero(self):
+        self.assertEqual(exit_status_for_verdict("FAIL"), 1)
+        self.assertNotEqual(exit_status_for_verdict("FAIL"), 0)
+
+    def test_insufficient_is_two(self):
+        self.assertEqual(exit_status_for_verdict("INSUFFICIENT-DATA"), 2)
+
+    def test_unknown_verdict_is_not_a_pass(self):
+        self.assertNotEqual(exit_status_for_verdict("SOMETHING-ELSE"), 0)
 
 
 class LoadCellRepsInvalidMarkerTests(unittest.TestCase):
