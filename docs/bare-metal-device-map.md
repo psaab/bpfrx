@@ -171,6 +171,29 @@ the present hardware while you are still connected:
 - `commit confirmed` validates BOTH the candidate AND the rollback target
   (the config restored on timeout), so a confirmed-commit timeout reverts to
   a known-safe config and applies it unconditionally (no split-brain).
+- **The pre-flight fails CLOSED on an unreadable NIC inventory (#5490).** If
+  the present-NIC scan (a cold-path sysfs/netlink read) fails, the commit is
+  **rejected** — the strand-management safety check cannot run, so the commit
+  is refused rather than accepted unvalidated. (Earlier this was a
+  skip-with-warning that silently accepted the commit; a candidate that moved
+  the live management NIC to a non-management name was then applied verbatim at
+  next boot — a durable lockout the confirmed-commit rollback could not undo,
+  because its rollback target was never validated either.) Re-commit once the
+  hardware inventory is readable. The #1922 lifeline guards the *live* mgmt NIC
+  but does not veto an explicit mapped rename, so it is not a substitute for
+  this gate. The same fail-closed applies to `bootstrapFromFile`: an unreadable
+  inventory leaves the daemon in the lifeline-safe bootstrap state (console +
+  fxp0 DHCP) rather than committing an unvalidated map — strictly safer than
+  coming up with an unchecked device-map.
+
+The **boot-time mapped rename re-runs the strand detector (#5490)**: before
+`enumerateAndRenameMapped` applies any mapped rename it re-validates the active
+map against the present hardware and, if the map would strand management,
+**refuses to rename** (retaining the current interface naming so management
+stays reachable) and logs loudly. This is the backstop for a candidate that was
+already committed to the store before this gate existed (or accepted under the
+old fail-open commit path): the unsafe binding is caught at the boot where it
+would first be applied, not after it has locked the operator out.
 
 The SAME pre-flight now runs on the **day-0 / bootstrap paths** (#4183):
 

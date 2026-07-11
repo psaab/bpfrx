@@ -166,6 +166,32 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 	if err != nil {
 		return fmt.Errorf("enumerate NICs: %w", err)
 	}
+	// #5490 boot-time re-check: re-run the strand-management detector against
+	// the now-readable hardware BEFORE performing ANY mapped rename. This closes
+	// the "already-committed candidate strands at next boot" gap — a candidate
+	// accepted at commit time (committed before this fix, or accepted under the
+	// old fail-open commit path when commit-time enumeration transiently failed)
+	// would otherwise perform its now-readable UNSAFE binding here without any
+	// re-validation, causing a durable management lockout that the #1922 lifeline
+	// does not veto (it does not block an explicit mapped rename in phase 2).
+	// If the map would strand management, FAIL CLOSED: retain the current
+	// interface naming (management stays reachable under its present name) and
+	// return an error so the one-shot retry marker is preserved and boot/config-
+	// arrival sites surface it loudly. The rename never runs, so no .link is
+	// written and no NIC is moved. The check is skipped only when there is no
+	// protected set to strand (len==0 — non-production; every real boot passes a
+	// non-empty set from resolveProtectedInterfaces), which keeps the strand
+	// detector's "empty protected == nothing to protect" contract intact.
+	if len(protected) > 0 {
+		lifelineName, _ := resolveLifelineCurrentName()
+		if reason := deviceMapStrandsManagement(cfg, nics, protected, lifelineName); reason != "" {
+			slog.Error("device-map: REFUSING to apply mapped interface renames at boot — the active "+
+				"device-map would strand management on next boot. Retaining the current interface "+
+				"naming so management stays reachable; fix the device-map and re-commit.",
+				"reason", reason)
+			return fmt.Errorf("device-map boot rename refused (fail-closed, #5490): %s", reason)
+		}
+	}
 	// renameErrs accumulates every phase-2/3 rename and phase-4 reload failure
 	// so the function fails (not launders) while still completing every phase.
 	var renameErrs []error
@@ -472,10 +498,23 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 	}
 	nics, err := enumeratePresentNICsFn()
 	if err != nil {
-		// Cannot enumerate hardware — do not block the commit on a
-		// transient sysfs error; the #1922 lifeline is the backstop.
-		slog.Warn("device-map pre-flight: NIC enumeration failed; skipping (lifeline still protects mgmt)", "err", err)
-		return nil
+		// #5490 FAIL CLOSED. A transient sysfs/netlink enumeration error means
+		// the strand-management safety check CANNOT run. The old behavior
+		// (slog.Warn + return nil) laundered an unvalidated device-map to a
+		// SUCCESSFUL commit: a candidate that moves the live management NIC to a
+		// non-management name (without assigning another NIC a protected name)
+		// was accepted here and then applied VERBATIM at next boot by
+		// enumerateAndRenameMapped — a durable management lockout that even a
+		// confirmed-commit rollback could not undo (its rollback target was
+		// never validated either). The #1922 lifeline guards the LIVE mgmt NIC
+		// but does NOT veto an explicit mapped rename in phase 2, so it is not a
+		// substitute for this check. Reject the commit while the operator is
+		// still connected rather than risk the lockout. Enumeration is a
+		// cold-path scan (no forwarding cost), so failing closed here is cheap.
+		return fmt.Errorf("device-map commit rejected: cannot read the present NIC inventory "+
+			"to validate that the device-map will not strand management on next boot (%w); "+
+			"refusing the commit rather than risk a durable management lockout — retry once the "+
+			"hardware inventory is readable", err)
 	}
 	// The lifeline NIC's CURRENT kernel name, resolved by its persisted
 	// IDENTITY — correct even before the rename (Codex HIGH-2).
