@@ -2,6 +2,7 @@
 package configstore
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -290,6 +291,30 @@ func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
 		return nil, true, fmt.Errorf("decrypt %s: %w", path, err)
 	}
 
+	// Reject a body whose top-level JSON is not an OBJECT (#5474 fail-open).
+	// Go's json.Unmarshal([]byte("null"), &ConfigTree{}) returns NO error and
+	// leaves the tree at its zero value — a semantically EMPTY config. A
+	// legacy/plaintext (or enveloped-but-unencrypted) active body of literal
+	// `null` would therefore decode to an empty tree and Store.Load would
+	// compile+boot it normally, so the firewall comes up with policy ABSENT
+	// (fail-open) instead of failing closed. Syntactically-invalid bodies and
+	// top-level arrays/scalars already error against the struct target, but
+	// `null` is syntactically valid and decodes to zero policy — this is the
+	// specific gap. Authoritative persisted state must REJECT malformed/partial
+	// top-level JSON, so require a JSON object here.
+	//
+	// data is the FINAL plaintext ConfigTree body: the #1917 envelope has been
+	// stripped and any AES-GCM ciphertext decrypted, so this frames the check
+	// exactly where a plaintext ConfigTree JSON is about to be decoded. The
+	// encrypted-envelope path is unaffected (its inner body always marshals
+	// from a struct to an object), the valid empty config `{}` still passes,
+	// and well-formed populated objects decode byte-for-byte as before.
+	// Store.Load tags the returned error with ErrConfigDBUnreadable, so a null/
+	// array/scalar DB becomes a fatal fail-closed boot, not a blind bootstrap.
+	if err := requireJSONObject(data); err != nil {
+		return nil, true, fmt.Errorf("parse %s: %w", path, err)
+	}
+
 	tree := &config.ConfigTree{}
 	if err := json.Unmarshal(data, tree); err != nil {
 		return nil, true, fmt.Errorf("parse %s: %w", path, err)
@@ -314,6 +339,34 @@ func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
 			"path", path, "issue", "#4579")
 	}
 	return tree, committed, nil
+}
+
+// requireJSONObject rejects a persisted config body whose top-level JSON is
+// not an OBJECT ("{...}"). It closes the #5474 fail-open gap: a top-level
+// `null` decodes into *ConfigTree without error (zero value = empty config),
+// and a top-level array or scalar, while already rejected by the struct
+// target's own decode, is caught here first with an intention-revealing error.
+// The valid empty config `{}` passes. The check inspects only the leading
+// non-whitespace byte (JSON insignificant whitespace is space/tab/CR/LF); the
+// subsequent json.Unmarshal still fully validates object well-formedness.
+func requireJSONObject(data []byte) error {
+	trimmed := bytes.TrimLeft(data, " \t\r\n")
+	if len(trimmed) == 0 {
+		return fmt.Errorf("config body is empty, not a JSON object")
+	}
+	if trimmed[0] != '{' {
+		// Surface a short prefix so a `null`/array/scalar body is identifiable
+		// in the fail-closed boot log without dumping a large or secret-bearing
+		// body.
+		snippet := trimmed
+		if len(snippet) > 16 {
+			snippet = snippet[:16]
+		}
+		return fmt.Errorf("config body is not a JSON object (top-level starts with %q); "+
+			"a null/array/scalar body decodes to an EMPTY config and would boot with "+
+			"policy absent (fail-open) — refusing", string(snippet))
+	}
+	return nil
 }
 
 // writeTree persists a config tree to a JSON file durably (#1894,

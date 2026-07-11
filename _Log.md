@@ -45325,3 +45325,8 @@ top.
 - **Timestamp**: 2026-07-10
 - **Action**: Extract testable top-level dispatch seam (classifyCommand) + upgrade->kernel route seam (upgradeArgsSelectKernel), add dispatch tests. Behavior-preserving; main() output byte-identical (verified vs origin/master binary across 11 dispatch paths).
 - **File(s)**: cmd/xpfd/main.go, cmd/xpfd/upgrade.go, cmd/xpfd/dispatch_test.go, cmd/xpfd/README.md
+
+## 2026-07-10 — #5474 configstore null-decode fail-open fix
+- **Timestamp**: 2026-07-10
+- **Action**: Fix #5474 fail-open on boot. readTreeMeta now requires a top-level JSON OBJECT (requireJSONObject) before decoding into *ConfigTree, so a legacy/plaintext or enveloped-but-unencrypted active body of literal `null` (which json.Unmarshal decodes to a zero-value/empty tree with no error) is rejected → Store.Load tags ErrConfigDBUnreadable → fail closed instead of booting policy-absent. `{}` and populated objects preserved; encrypted-envelope path unaffected (inner body always an object). Added regression test (RED-on-revert proven: `null` decodes empty on origin/master). Updated README.
+- **File(s)**: pkg/configstore/db.go, pkg/configstore/configstore_null_decode_5474_test.go, pkg/configstore/README.md
