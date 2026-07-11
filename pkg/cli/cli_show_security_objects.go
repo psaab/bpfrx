@@ -237,7 +237,10 @@ func (c *CLI) showDynamicAddress() error {
 		}
 		fmt.Printf("  Feed Server: %s\n", name)
 		if fs.URL != "" {
-			fmt.Printf("    URL: %s\n", fs.URL)
+			// Redact embedded basic-auth userinfo / query-string token before
+			// printing to the on-box console — the credentialed feed URL would
+			// otherwise land in terminal scrollback / support bundles (#5521).
+			fmt.Printf("    URL: %s\n", config.RedactURL(fs.URL))
 		}
 		if fs.FeedName != "" {
 			fmt.Printf("    Feed name: %s\n", fs.FeedName)
