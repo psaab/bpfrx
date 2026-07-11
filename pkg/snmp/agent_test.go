@@ -664,11 +664,12 @@ func TestDESEncryptDecrypt(t *testing.T) {
 	// Need a 16-byte key (8 for DES + 8 for preIV).
 	key := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	plaintext := []byte("hello world test") // 16 bytes (multiple of 8)
-	enc, pp, err := encryptDES(key, plaintext)
+	salt := testPrivSalt()
+	enc, err := encryptDES(key, plaintext, salt)
 	if err != nil || enc == nil {
 		t.Fatalf("encryptDES failed: %v", err)
 	}
-	dec := decryptDES(key, pp, enc)
+	dec := decryptDES(key, salt, enc)
 	if dec == nil {
 		t.Fatal("decryptDES returned nil")
 	}
@@ -683,11 +684,12 @@ func TestAES128EncryptDecrypt(t *testing.T) {
 		key[i] = byte(i + 1)
 	}
 	plaintext := []byte("test data for aes encryption roundtrip")
-	enc, pp, err := encryptAES128(key, plaintext, 1, 100)
+	salt := testPrivSalt()
+	enc, err := encryptAES128(key, plaintext, salt, 1, 100)
 	if err != nil || enc == nil {
 		t.Fatalf("encryptAES128 failed: %v", err)
 	}
-	dec := decryptAES128(key, pp, enc, 1, 100)
+	dec := decryptAES128(key, salt, enc, 1, 100)
 	if dec == nil {
 		t.Fatal("decryptAES128 returned nil")
 	}

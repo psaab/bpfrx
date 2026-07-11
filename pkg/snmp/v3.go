@@ -772,14 +772,47 @@ func decryptAES128(privKey, privParams, data []byte, boots, time int) []byte {
 	return plaintext
 }
 
-// randRead is the entropy source for the SNMPv3 per-message privacy salt. It is
-// a package variable so tests can inject an RNG failure and assert the encrypt
-// path fails closed. It defaults to crypto/rand.Read. RFC 3414 §8.2.1 requires
-// the privacy salt (msgPrivacyParameters) to be unpredictable: an all-zero or
-// otherwise deterministic salt makes the CBC/CFB IV predictable or reused, which
-// breaks the semantic security of the encrypted scopedPDU. Every salt path MUST
-// check this error and fail closed rather than proceed with a zero salt.
+// randRead is the entropy source that SEEDS the SNMPv3 privacy salt counter
+// (Agent.nextPrivSalt) once, at first use. It is a package variable so tests can
+// inject an RNG failure and assert the encrypt path fails closed. It defaults to
+// crypto/rand.Read. RFC 3826 §3.3 requires the salt counter to start from an
+// arbitrary boot-time value; a good seed makes that start unpredictable so the
+// derived cipher IVs are not predictable from message one. Per RFC 3826 the
+// counter is then INCREMENTED (not re-drawn) for each message, so randRead is
+// consulted only for the seed — the salt path MUST fail closed if that seed draw
+// fails (no unpredictable start ⇒ refuse to emit a PDU, RFC 3414 §8.2.1).
 var randRead = rand.Read
+
+// nextPrivSalt returns the next 8-octet SNMPv3 privacy salt
+// (msgPrivacyParameters) as a big-endian monotonic counter value. The counter is
+// seeded ONCE from crypto/rand (via the randRead seam) at first use — an
+// arbitrary boot-time starting point per RFC 3826 §3.3 — and incremented
+// atomically thereafter, so every salt within an engine boot is distinct and no
+// cipher IV is reused (RFC 3826 §3.1.2.1 AES, RFC 3414 §8.1.1.1 DES). It fails
+// closed if the one-time seed draw cannot obtain entropy: without a good seed
+// there is no unpredictable start, so encryptPDU drops the response rather than
+// emit a predictable salt (RFC 3414 §8.2.1). Once seeded, a later RNG outage does
+// NOT block encryption — fresh entropy per message is neither required nor drawn,
+// exactly the RFC 3826 counter model. Safe for concurrent callers: the seed runs
+// under privSaltMu once, and each allocation is a single atomic increment.
+func (a *Agent) nextPrivSalt() ([]byte, error) {
+	if !a.privSaltSeeded.Load() {
+		a.privSaltMu.Lock()
+		if !a.privSaltSeeded.Load() {
+			var seed [8]byte
+			if _, err := randRead(seed[:]); err != nil {
+				a.privSaltMu.Unlock()
+				return nil, fmt.Errorf("snmpv3: seed privacy salt counter: %w", err)
+			}
+			a.privSalt.Store(binary.BigEndian.Uint64(seed[:]))
+			a.privSaltSeeded.Store(true)
+		}
+		a.privSaltMu.Unlock()
+	}
+	salt := make([]byte, 8)
+	binary.BigEndian.PutUint64(salt, a.privSalt.Add(1))
+	return salt, nil
+}
 
 // encryptPDU encrypts a scopedPDU using the user's privacy key. It returns an
 // error (rather than silently downgrading) when a securely-encrypted PDU cannot
@@ -789,36 +822,51 @@ func (a *Agent) encryptPDU(user *usmUser, scopedPDU []byte) ([]byte, []byte, err
 	if user.privKey == nil {
 		return nil, nil, fmt.Errorf("snmpv3: user %q has no privacy key", user.name)
 	}
+	// Allocate a unique per-message privacy salt from the monotonic counter
+	// (RFC 3826 §3.3 / RFC 3414 §8.1.1.1). Fails closed if the one-time seed
+	// draw could not obtain entropy — the caller drops the response rather than
+	// emit a predictable salt (RFC 3414 §8.2.1).
+	salt, err := a.nextPrivSalt()
+	if err != nil {
+		return nil, nil, err
+	}
 	switch user.privProto {
 	case "des":
-		return encryptDES(user.privKey, scopedPDU)
+		enc, err := encryptDES(user.privKey, scopedPDU, salt)
+		if err != nil {
+			return nil, nil, err
+		}
+		return enc, salt, nil
 	case "aes128":
-		return encryptAES128(user.privKey, scopedPDU, a.engineBoots, a.engineTime())
+		enc, err := encryptAES128(user.privKey, scopedPDU, salt, a.engineBoots, a.engineTime())
+		if err != nil {
+			return nil, nil, err
+		}
+		return enc, salt, nil
 	default:
 		return nil, nil, fmt.Errorf("snmpv3: unsupported privacy protocol %q", user.privProto)
 	}
 }
 
-// encryptDES encrypts data using DES-CBC per RFC 3414 section 8. It fails closed
-// on an RNG error: the DES IV is the pre-IV salt XOR the per-message
-// privParams, so an all-zero privParams (the silent result of an unchecked
-// rand.Read failure) collapses the IV to a deterministic function of the
-// long-term privKey, leaking repeated-plaintext-prefix structure across
-// messages (RFC 3414 §8.2.1). On an RNG failure return the error so no PDU is
-// sent with a predictable IV.
-func encryptDES(privKey, data []byte) ([]byte, []byte, error) {
+// encryptDES encrypts data using DES-CBC per RFC 3414 §8.1.1.1. The caller
+// supplies the 8-octet privacy salt (msgPrivacyParameters); the CBC IV is the
+// key-derived pre-IV XORed with that salt. RFC 3414 §8.1.1.1 requires the salt
+// to differ for each message within an engineBoots domain — the agent allocates
+// it from a monotonic counter (Agent.nextPrivSalt), guaranteeing a distinct IV
+// per message so DES-CBC never repeats first-block structure (RFC 3414 §8.2.1).
+// The salt is returned to the wire unchanged as privParams by the caller.
+func encryptDES(privKey, data, salt []byte) ([]byte, error) {
 	if len(privKey) < 16 {
-		return nil, nil, fmt.Errorf("snmpv3: DES privacy key too short: %d bytes", len(privKey))
+		return nil, fmt.Errorf("snmpv3: DES privacy key too short: %d bytes", len(privKey))
+	}
+	if len(salt) != 8 {
+		return nil, fmt.Errorf("snmpv3: DES privacy salt must be 8 bytes, got %d", len(salt))
 	}
 	desKey := privKey[:8]
 	preIV := privKey[8:16]
-	privParams := make([]byte, 8)
-	if _, err := randRead(privParams); err != nil {
-		return nil, nil, fmt.Errorf("snmpv3: DES privacy salt: %w", err)
-	}
 	iv := make([]byte, 8)
 	for i := range iv {
-		iv[i] = preIV[i] ^ privParams[i]
+		iv[i] = preIV[i] ^ salt[i]
 	}
 	// Pad to DES block size.
 	if pad := 8 - (len(data) % 8); pad < 8 {
@@ -826,38 +874,38 @@ func encryptDES(privKey, data []byte) ([]byte, []byte, error) {
 	}
 	block, err := des.NewCipher(desKey)
 	if err != nil {
-		return nil, nil, fmt.Errorf("snmpv3: DES cipher init: %w", err)
+		return nil, fmt.Errorf("snmpv3: DES cipher init: %w", err)
 	}
 	encrypted := make([]byte, len(data))
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(encrypted, data)
-	return encrypted, privParams, nil
+	return encrypted, nil
 }
 
-// encryptAES128 encrypts data using AES-128-CFB per RFC 3826. It fails closed on
-// an RNG error: the last 8 IV bytes are the per-message privParams salt, so an
-// all-zero privParams (the silent result of an unchecked rand.Read failure)
-// makes the full IV constant for every message in the same (boots,time) second,
-// which is CFB IV reuse under a fixed key (RFC 3414 §8.2.1). On an RNG failure
-// return the error so no PDU is sent with a reused IV.
-func encryptAES128(privKey, data []byte, boots, time int) ([]byte, []byte, error) {
+// encryptAES128 encrypts data using AES-128-CFB per RFC 3826 §3.1.2.1. The
+// caller supplies the 8-octet privacy salt; the 128-bit IV is
+// boots(4) || time(4) || salt(8). RFC 3826 §3.3 requires the salt to change for
+// each message — the agent allocates it from a monotonic counter
+// (Agent.nextPrivSalt) so the low 64 IV bits never repeat within a (boots,time),
+// avoiding CFB IV reuse (which would leak plaintext XORs, RFC 3414 §8.2.1). The
+// salt is returned to the wire unchanged as privParams by the caller.
+func encryptAES128(privKey, data, salt []byte, boots, time int) ([]byte, error) {
 	if len(privKey) < 16 {
-		return nil, nil, fmt.Errorf("snmpv3: AES128 privacy key too short: %d bytes", len(privKey))
+		return nil, fmt.Errorf("snmpv3: AES128 privacy key too short: %d bytes", len(privKey))
 	}
-	privParams := make([]byte, 8)
-	if _, err := randRead(privParams); err != nil {
-		return nil, nil, fmt.Errorf("snmpv3: AES128 privacy salt: %w", err)
+	if len(salt) != 8 {
+		return nil, fmt.Errorf("snmpv3: AES128 privacy salt must be 8 bytes, got %d", len(salt))
 	}
 	iv := make([]byte, 16)
 	binary.BigEndian.PutUint32(iv[0:4], uint32(boots))
 	binary.BigEndian.PutUint32(iv[4:8], uint32(time))
-	copy(iv[8:16], privParams)
+	copy(iv[8:16], salt)
 	block, err := aes.NewCipher(privKey[:16])
 	if err != nil {
-		return nil, nil, fmt.Errorf("snmpv3: AES128 cipher init: %w", err)
+		return nil, fmt.Errorf("snmpv3: AES128 cipher init: %w", err)
 	}
 	encrypted := make([]byte, len(data))
 	cipher.NewCFBEncrypter(block, iv).XORKeyStream(encrypted, data)
-	return encrypted, privParams, nil
+	return encrypted, nil
 }
 
 // computeAuth computes the HMAC for a v3 message (with auth params zeroed in the message).

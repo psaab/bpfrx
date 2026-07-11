@@ -108,8 +108,9 @@ func buildV3AuthPrivAESRequest(t *testing.T, userName string, engineID, authKey,
 	scopedBody = append(scopedBody, berEncodeTLV(pduGetRequest, pduBody)...)
 	scopedPDU := berEncodeTLV(tagSequence, scopedBody)
 
-	// Encrypt as a manager would: IV from ivBoots/ivTime.
-	enc, privParams, err := encryptAES128(privKey, scopedPDU, ivBoots, ivTime)
+	// Encrypt as a manager would: IV from ivBoots/ivTime, unique salt supplied.
+	privParams := testPrivSalt()
+	enc, err := encryptAES128(privKey, scopedPDU, privParams, ivBoots, ivTime)
 	if err != nil || enc == nil {
 		t.Fatalf("encryptAES128 failed building request: %v", err)
 	}
@@ -230,7 +231,8 @@ func TestAESDecryptIV_WrongIVFailsDecrypt(t *testing.T) {
 	}
 	plaintext := []byte("scopedPDU bytes that must survive a correct IV only")
 
-	enc, pp, err := encryptAES128(key, plaintext, 5, 1000)
+	pp := testPrivSalt()
+	enc, err := encryptAES128(key, plaintext, pp, 5, 1000)
 	if err != nil || enc == nil {
 		t.Fatalf("encryptAES128 failed: %v", err)
 	}

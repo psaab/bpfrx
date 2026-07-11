@@ -23,7 +23,8 @@ func buildV3PrivOnlyRequest(t *testing.T, userName string, engineID, privKey []b
 	scopedBody = append(scopedBody, berEncodeTLV(pduGetRequest, pduBody)...)
 	scopedPDU := berEncodeTLV(tagSequence, scopedBody)
 
-	enc, privParams, err := encryptAES128(privKey, scopedPDU, boots, reqTime)
+	privParams := testPrivSalt()
+	enc, err := encryptAES128(privKey, scopedPDU, privParams, boots, reqTime)
 	if err != nil || enc == nil {
 		t.Fatalf("encryptAES128 failed building noAuthPriv request: %v", err)
 	}
