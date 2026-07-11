@@ -21,8 +21,12 @@ package configstore
 import (
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // forceConfirmDeadlinePast rewrites the persisted confirm.json deadline into the
@@ -316,5 +320,221 @@ func TestSyncApply_PersistSuccessRemovesConfirmRecord_5473(t *testing.T) {
 	}
 	if rec, err := s.db.ReadConfirm(); err != nil || rec != nil {
 		t.Fatalf("a durable sync supersede must remove confirm.json: rec=%v err=%v", rec, err)
+	}
+}
+
+// writeMode selects the injected active-write behavior for the compound
+// post-rename tests below.
+const (
+	writeModePlainFail  = 0 // pre-rename style failure: no disk write, plain error
+	writeModePostRename = 1 // post-rename dir-fsync failure: content lands, typed error
+	writeModeHeal       = 2 // healthy durable write
+)
+
+// modalWriteActive returns a writeActive seam whose behavior is switched at
+// runtime via mode. writeModePostRename writes the tree durably (the rename
+// landed) then reports the typed *fsatomic.PostRenameSyncError so the commit
+// paths take the CONVERGE branch, matching postRenameFailingWriteActive.
+func modalWriteActive(s *Store, mode *atomic.Int32) func(*config.ConfigTree) error {
+	return func(tree *config.ConfigTree) error {
+		switch mode.Load() {
+		case writeModePlainFail:
+			return errDiskFull
+		case writeModePostRename:
+			if err := s.db.WriteActive(tree); err != nil {
+				return err
+			}
+			return &fsatomic.PostRenameSyncError{Path: "active.json", Err: errPostRenameDirFsync}
+		default:
+			return s.db.WriteActive(tree)
+		}
+	}
+}
+
+// TestCommitConfirmed_PostRenameConverge_ClearsStaleDeferredRemoval_5473 pins the
+// #5503-review gap: the post-rename CONVERGE branches of CommitWithDescription /
+// CommitConfirmed promote a new active config but (before the fix) did NOT reset
+// confirmResolvePendingPersist. The compound sequence:
+//
+//	(a) commit-confirmed C times out and the rollback write FAILS
+//	    -> confirmResolvePendingPersist=true, confirm.json is a STALE record (A);
+//	(b) a NEW commit-confirmed E's write hits a POST-RENAME failure -> converge,
+//	    promote E, arm E's FRESH window, write E's confirm.json;
+//	(c) the persist-retry loop heals -> clearConfirmResolutionPendingLocked().
+//
+// Without the fix the stale flag survives (b), so the heal in (c) deletes E's
+// OWN fresh commit-confirmed record — a crash before E's timer fires then loses
+// the #4577 hatch for E permanently. With the fix, (b) finalizes the stale
+// removal and clears the flag, so the heal is a no-op and E's record survives.
+func TestCommitConfirmed_PostRenameConverge_ClearsStaleDeferredRemoval_5473(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+
+	s := newTestStoreAt(t, path)
+	commitBaseline(t, s) // confirmed base A: trust only
+	baseSet := s.ShowActiveSet()
+
+	// Fast retry so the heal in (c) lands quickly.
+	s.SetPersistRetryBackoffForTesting(time.Millisecond, 4*time.Millisecond)
+
+	var mode atomic.Int32
+	mode.Store(writeModeHeal) // healthy through the first commit-confirmed
+	s.SetWriteActiveForTesting(modalWriteActive(s, &mode))
+
+	// Pending confirmed commit C with rollback target A.
+	if err := s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed C: %v", err)
+	}
+	genC := s.ConfirmGenForTesting()
+
+	// (a) C times out; the rollback write FAILS (plain) -> flag set, stale record.
+	mode.Store(writeModePlainFail)
+	s.InvokeRollbackTimerForTesting(genC)
+	s.mu.Lock()
+	flagAfterA := s.confirmResolvePendingPersist
+	s.mu.Unlock()
+	if !flagAfterA {
+		t.Fatal("(a) a failed rollback write must set confirmResolvePendingPersist")
+	}
+	if rec, err := s.db.ReadConfirm(); err != nil || rec == nil {
+		t.Fatalf("(a) stale confirm.json must be retained after the failed rollback: rec=%v err=%v", rec, err)
+	}
+	if got := s.ShowActiveSet(); got != baseSet {
+		t.Fatalf("(a) rollback must revert active to A in memory:\nwant %s\ngot %s", baseSet, got)
+	}
+
+	// (b) a NEW commit-confirmed E whose write hits a POST-RENAME failure.
+	if err := s.SetFromInput("interfaces eth2 unit 0 family inet address 10.2.0.1/24"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if err := s.SetFromInput("security zones security-zone dmz interfaces eth2.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	mode.Store(writeModePostRename)
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("(b) post-rename CommitConfirmed E must converge, not fail: %v", err)
+	}
+
+	// The fresh window E must be live and its record on disk.
+	if !s.IsConfirmPending() {
+		t.Error("(b) E's fresh commit-confirmed window must be armed")
+	}
+	if !strings.Contains(s.ShowActiveSet(), "dmz") {
+		t.Error("(b) E must be promoted to active")
+	}
+	if rec, err := s.db.ReadConfirm(); err != nil || rec == nil {
+		t.Fatalf("(b) E's fresh confirm.json must exist: rec=%v err=%v", rec, err)
+	}
+	// #5473/#5503 core: the post-rename converge must have finalized the STALE
+	// deferred removal — otherwise the heal in (c) deletes E's own record.
+	s.mu.Lock()
+	flagAfterB := s.confirmResolvePendingPersist
+	s.mu.Unlock()
+	if flagAfterB {
+		t.Error("(b) post-rename converge must reset confirmResolvePendingPersist so the " +
+			"persist-retry heal does not delete E's fresh commit-confirmed record (#5503 review gap)")
+	}
+
+	// (c) heal: the persist-retry loop lands E durably. E's record must SURVIVE.
+	mode.Store(writeModeHeal)
+	waitForCondition(t, "degraded flag to clear", func() bool {
+		return !s.ConfigPersistDegraded()
+	})
+	if rec, err := s.db.ReadConfirm(); err != nil || rec == nil {
+		t.Fatalf("(c) E's fresh confirm.json must SURVIVE the persist-retry heal: rec=%v err=%v "+
+			"(the heal deleted a live window's record — #5503 review gap)", rec, err)
+	}
+
+	// End-to-end: a fresh boot re-arms E's live window (the #4577 hatch for E is
+	// intact) and keeps E active.
+	s2 := newTestStoreAt(t, path)
+	if err := s2.Load(); err != nil {
+		t.Fatalf("boot Load: %v", err)
+	}
+	if !s2.IsConfirmPending() {
+		t.Error("boot must re-arm E's still-open commit-confirmed window")
+	}
+	if !strings.Contains(s2.ShowActiveSet(), "dmz") {
+		t.Error("boot must keep E active while its window is open")
+	}
+}
+
+// TestCommit_PostRenameConverge_RemovesStaleDeferredRemoval_5473 is the plain-commit
+// analogue: a plain commit D whose write hits a post-rename failure converges
+// (D is visible on disk) and supersedes a stale from-rollback window. The
+// post-rename converge branch must remove the stale confirm.json so a crash
+// before the retry re-fsyncs D does not revert the just-committed D back to A.
+func TestCommit_PostRenameConverge_RemovesStaleDeferredRemoval_5473(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+
+	s := newTestStoreAt(t, path)
+	commitBaseline(t, s) // A: trust only
+	baseSet := s.ShowActiveSet()
+	s.SetPersistRetryBackoffForTesting(time.Hour, time.Hour) // keep the async loop dormant
+
+	var mode atomic.Int32
+	mode.Store(writeModeHeal)
+	s.SetWriteActiveForTesting(modalWriteActive(s, &mode))
+
+	// Pending confirmed commit C, then time it out with a failed rollback write.
+	if err := s.SetFromInput("interfaces eth1 unit 0 family inet address 10.1.0.1/24"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed C: %v", err)
+	}
+	genC := s.ConfirmGenForTesting()
+	mode.Store(writeModePlainFail)
+	s.InvokeRollbackTimerForTesting(genC)
+	s.mu.Lock()
+	staleFlag := s.confirmResolvePendingPersist
+	s.mu.Unlock()
+	if !staleFlag {
+		t.Fatal("failed rollback write must leave a stale deferred-removal flag")
+	}
+
+	// A plain commit D whose write hits a post-rename failure.
+	if err := s.SetFromInput("interfaces eth2 unit 0 family inet address 10.2.0.1/24"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if err := s.SetFromInput("security zones security-zone dmz interfaces eth2.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	mode.Store(writeModePostRename)
+	if _, err := s.CommitWithDescription("D"); err != nil {
+		t.Fatalf("post-rename plain commit D must converge, not fail: %v", err)
+	}
+
+	// D is visible on disk and superseded the stale window: the stale confirm.json
+	// must be gone and the flag reset, so a crash cannot revert D back to A.
+	s.mu.Lock()
+	flagAfterD := s.confirmResolvePendingPersist
+	s.mu.Unlock()
+	if flagAfterD {
+		t.Error("post-rename plain commit must reset confirmResolvePendingPersist")
+	}
+	if rec, err := s.db.ReadConfirm(); err != nil || rec != nil {
+		t.Fatalf("post-rename plain commit must remove the stale confirm.json: rec=%v err=%v "+
+			"(a lingering PrevTree=A record would revert the just-committed D on a crash — #5503 review gap)", rec, err)
+	}
+
+	// A fresh boot loads D with NO pending rollback (D stands, not reverted to A).
+	s2 := newTestStoreAt(t, path)
+	if err := s2.Load(); err != nil {
+		t.Fatalf("boot Load: %v", err)
+	}
+	if s2.IsConfirmPending() {
+		t.Error("no pending window must survive the plain commit")
+	}
+	if got := s2.ShowActiveSet(); !strings.Contains(got, "dmz") || got == baseSet {
+		t.Fatalf("boot must load the committed D (with dmz), not revert to A:\ngot %s", got)
 	}
 }

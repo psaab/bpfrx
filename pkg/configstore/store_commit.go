@@ -152,6 +152,16 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		s.everCommitted = true
 		s.persistMarkerCommitted = true
 		s.noteActivePersistFailureLocked("commit_postrename", err)
+		// #5473: this commit's config C is VISIBLE on disk (post-rename: the
+		// rename landed, only the dir-fsync is uncertain) and supersedes any
+		// commit-confirmed window whose earlier resolution write failed. Finalize
+		// the deferred (retained) confirm.json removal now — symmetric with the
+		// success branch. Without this the stale flag persists into the degraded
+		// retry, whose heal would then delete a LATER-armed window's fresh record
+		// (or, for a plain commit, a stale PrevTree=A record lingers and a crash
+		// reverts this just-committed C back to A). No-op unless a removal was
+		// deferred.
+		s.clearConfirmResolutionPendingLocked()
 	} else {
 		s.persistDegraded = false       // disk now holds the current config
 		s.everCommitted = true          // #1922 step-0: a real commit has succeeded
@@ -324,6 +334,15 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		s.everCommitted = true
 		s.persistMarkerCommitted = true
 		s.noteActivePersistFailureLocked("commit_confirmed_postrename", err)
+		// #5473: E's config is VISIBLE on disk (post-rename converge) and a fresh
+		// window is about to be armed below (writeConfirmState). Finalize any
+		// confirm.json removal deferred by an earlier failed resolution write
+		// HERE — before the fresh window is written — so the stale flag does not
+		// survive to make the degraded retry's heal delete E's OWN fresh record.
+		// Symmetric with the success branch (removes STALE record; the fresh one
+		// is written afterward by writeConfirmState). No-op unless a removal was
+		// deferred.
+		s.clearConfirmResolutionPendingLocked()
 	} else {
 		s.persistDegraded = false // disk now holds the current config
 		// #1922 step-0: a commit confirmed persists the candidate as the
