@@ -533,6 +533,9 @@ func hostInboundToREST(a *dpuserspace.HostInboundAdmission) *MatchPoliciesHostIn
 var matchPoliciesSelectorKeys = []string{
 	"from_zone", "to_zone", "src_ip", "dst_ip",
 	"src_port", "dst_port", "protocol", "icmp_type", "icmp_code",
+	// #5572: non-first-fragment (l4_present == false) discriminator. A boolean
+	// param ("true"/"1"/"false"/"0"/absent); absent = a normal L4 packet.
+	"non_first_fragment",
 }
 
 // isMatchPoliciesSelector reports whether key is a recognized match-policies
@@ -678,6 +681,20 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid icmp_code: "+err.Error())
 		return
 	}
+	// #5572: the non-first-fragment (l4_present == false) discriminator. A
+	// malformed value must NOT silently become the normal-packet default — that
+	// would answer a DIFFERENT question than asked on a security-verification
+	// endpoint — so a non-empty value that is not a canonical bool is a 400. An
+	// empty/absent value is the unchanged normal L4-present packet.
+	nonFirstFrag := false
+	if v := r.URL.Query().Get("non_first_fragment"); v != "" {
+		parsed, perr := strconv.ParseBool(v)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid non_first_fragment %q", v))
+			return
+		}
+		nonFirstFrag = parsed
+	}
 
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
@@ -739,6 +756,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		DstPort:          dstPort,
 		ICMPType:         icmpType,
 		ICMPCode:         icmpCode,
+		NonFirstFragment: nonFirstFrag,
 		FeedOverlay:      overlay,
 		PolicyInactiveFn: inactiveFn,
 	})
@@ -846,6 +864,12 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		RouteDropBeforePolicy: res.RouteDropBeforePolicy,
 		RouteDropClass:        res.RouteDropClass,
 		RouteDropNote:         res.RouteDropNote(),
+		// #5572: a non-first fragment whose permit was overridden to this
+		// overlapping port-bearing deny — the result is attributed to the
+		// enforcing deny above; carry the advisory so the REST answer explains
+		// the over-drop identically to the CLI + gRPC surfaces.
+		FragmentAssociatedDeny: res.FragmentAssociatedDeny,
+		FragmentDenyNote:       res.FragmentDenyNote(),
 	})
 }
 

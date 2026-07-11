@@ -395,15 +395,18 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// node's Keys (e.g. the 10.0.1.10/24 in `address 10.0.1.10/24 {
 	// primary; }`). Only the declared arg span is validated — a compound
 	// sub-token is a keyword, not a value, and tokens past the identity
-	// are ignored per the compiler-faithful contract.
-	if childSchema.keyValidator != nil {
+	// are ignored per the compiler-faithful contract. A POSITION-AWARE
+	// keyValidatorPos (#5576, route-filter) takes precedence and receives
+	// each token's 0-based arg index so a multi-arg slot can enforce a
+	// distinct grammar per position (prefix slot vs match-type slot).
+	if childSchema.keyValidatorPos != nil || childSchema.keyValidator != nil {
 		argEnd := declaredKeyTokens
 		if argEnd > len(node.Keys) {
 			argEnd = len(node.Keys)
 		}
 		keyPath := append(append([]string(nil), path...), keyword)
-		for _, tok := range node.Keys[1:argEnd] {
-			if err := childSchema.keyValidator(tok, vc.config()); err != nil {
+		for argIdx, tok := range node.Keys[1:argEnd] {
+			if err := validateKeySlot(childSchema, argIdx, tok, vc); err != nil {
 				return typedLeafInvalidErrorf(keyPath, tok, err)
 			}
 		}
@@ -424,8 +427,13 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 
 	missingArgs := declaredKeyTokens - consumed
 	if missingArgs > 0 && !childSchema.compoundKey {
+		// The already-consumed identity tokens are Keys[1:consumed]; the
+		// name levels peeled below supply args starting at 0-based index
+		// consumed-1 (arg 0 == Keys[1]). Thread that base so a
+		// position-aware keyValidatorPos sees the correct slot (#5576).
+		baseArgIdx := consumed - 1
 		for _, c := range node.Children {
-			if err := walkInstanceChildren(c, childSchema, missingArgs, newPath, vc, childClosed); err != nil {
+			if err := walkInstanceChildren(c, childSchema, missingArgs, baseArgIdx, newPath, vc, childClosed); err != nil {
 				return err
 			}
 		}
@@ -442,7 +450,7 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 // Keys; the leaves are the node's CHILDREN. Any extra tokens packed into the
 // instance node's Keys beyond the name are ignored (the compiler does not
 // compile them; see walkSchemaNode's container comment, Codex r7).
-func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int, path []string, vc *walkContext, closed bool) error {
+func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining, baseArgIdx int, path []string, vc *walkContext, closed bool) error {
 	if node == nil || len(node.Keys) == 0 {
 		return nil
 	}
@@ -452,10 +460,12 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	}
 	// Typed KEY slot (#1319 PR 3): the peeled tokens ARE the instance
 	// name the compiler reads (namedInstances handles this nested shape
-	// too), so a key-typed container validates them here as well.
-	if containerSchema.keyValidator != nil {
-		for _, tok := range node.Keys[:consume] {
-			if err := containerSchema.keyValidator(tok, vc.config()); err != nil {
+	// too), so a key-typed container validates them here as well. A
+	// position-aware keyValidatorPos (#5576) takes precedence; baseArgIdx
+	// is the 0-based arg index of node.Keys[0] in this peel.
+	if containerSchema.keyValidatorPos != nil || containerSchema.keyValidator != nil {
+		for i, tok := range node.Keys[:consume] {
+			if err := validateKeySlot(containerSchema, baseArgIdx+i, tok, vc); err != nil {
 				return typedLeafInvalidErrorf(path, tok, err)
 			}
 		}
@@ -466,7 +476,7 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 		// inherited unchanged: containerSchema.closedWorld was already folded
 		// into it by the caller in walkSchemaNode (#4313).
 		for _, c := range node.Children {
-			if err := walkInstanceChildren(c, containerSchema, stillMissing, newPath, vc, closed); err != nil {
+			if err := walkInstanceChildren(c, containerSchema, stillMissing, baseArgIdx+consume, newPath, vc, closed); err != nil {
 				return err
 			}
 		}
@@ -475,6 +485,19 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	// Name fully consumed. The instance's leaves are its block children;
 	// any leftover Keys past the name are not compiled and are ignored.
 	return walkSchemaChildren(node.Children, containerSchema, newPath, vc, closed)
+}
+
+// validateKeySlot runs a named-instance container's identity-arg
+// validator on one token. It prefers the POSITION-AWARE keyValidatorPos
+// (#5576) — passing argIdx, the token's 0-based position within the
+// node's declared arg span — and falls back to the position-agnostic
+// keyValidator when only that is set. A node sets at most one of the two;
+// callers invoke this only when at least one is non-nil.
+func validateKeySlot(schema *schemaNode, argIdx int, tok string, vc *walkContext) error {
+	if schema.keyValidatorPos != nil {
+		return schema.keyValidatorPos(argIdx, tok, vc.config())
+	}
+	return schema.keyValidator(tok, vc.config())
 }
 
 // validateModifierChild validates one AST child of a typed leaf (e.g.

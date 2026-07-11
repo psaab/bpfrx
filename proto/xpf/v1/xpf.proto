@@ -749,6 +749,13 @@ message MatchPoliciesRequest {
   // type/code 0 (ICMP type 0 = echo-reply).
   optional uint32 icmp_type = 8;
   optional uint32 icmp_code = 9;
+  // non_first_fragment marks the query as a NON-FIRST IP fragment (#5572) — the
+  // flowless / no-L4 packet shape the dataplane calls l4_present == false. The
+  // simulator then reproduces the #4569 fragment-associated deny (a port-bearing
+  // deny the first fragment would hit denies the fragment too) instead of a
+  // fabricated port-0 permit. false (default) = a normal L4-present packet, so
+  // an existing client is unchanged.
+  bool non_first_fragment = 10;
 }
 message MatchPoliciesResponse {
   string policy_name = 1;
@@ -891,6 +898,19 @@ message MatchPoliciesResponse {
   bool route_drop_before_policy = 22;
   string route_drop_class = 23;
   string route_drop_note = 24;
+  // #5572: fragment_associated_deny is true when the query was a non-first IP
+  // fragment (non_first_fragment in the request) whose PERMIT was OVERRIDDEN to
+  // an overlapping port-bearing DENY, reproducing the dataplane's #4569
+  // fragment-associated deny. When set, `matched` is true and the response is
+  // attributed to the ENFORCING deny (policy_name / policy_id / rule_id /
+  // action). fragment_deny_note carries the SSOT operator advisory string
+  // (policymatch.FragmentDenyNote) so gRPC / remote-CLI clients explain the
+  // over-drop identically to the local CLI + REST surfaces. ADVISORY, like
+  // route_drop_note — it does not change the verdict beyond the deny override.
+  // Omitted (false / empty) for every non-fragment verdict and for a fragment
+  // that a real deny matched directly or that permits with no overlapping deny.
+  bool fragment_associated_deny = 25;
+  string fragment_deny_note = 26;
 }
 
 // HostInboundAdmissionStatus classifies how the ingress zone's

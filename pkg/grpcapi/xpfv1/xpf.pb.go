@@ -6572,10 +6572,17 @@ type MatchPoliciesRequest struct {
 	// simulator can distinguish "unspecified" (a type-constrained app term then
 	// fails closed, mirroring the dataplane's packet_icmp = None) from a valid
 	// type/code 0 (ICMP type 0 = echo-reply).
-	IcmpType      *uint32 `protobuf:"varint,8,opt,name=icmp_type,json=icmpType,proto3,oneof" json:"icmp_type,omitempty"`
-	IcmpCode      *uint32 `protobuf:"varint,9,opt,name=icmp_code,json=icmpCode,proto3,oneof" json:"icmp_code,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	IcmpType *uint32 `protobuf:"varint,8,opt,name=icmp_type,json=icmpType,proto3,oneof" json:"icmp_type,omitempty"`
+	IcmpCode *uint32 `protobuf:"varint,9,opt,name=icmp_code,json=icmpCode,proto3,oneof" json:"icmp_code,omitempty"`
+	// non_first_fragment marks the query as a NON-FIRST IP fragment (#5572) — the
+	// flowless / no-L4 packet shape the dataplane calls l4_present == false. The
+	// simulator then reproduces the #4569 fragment-associated deny (a port-bearing
+	// deny the first fragment would hit denies the fragment too) instead of a
+	// fabricated port-0 permit. false (default) = a normal L4-present packet, so
+	// an existing client is unchanged.
+	NonFirstFragment bool `protobuf:"varint,10,opt,name=non_first_fragment,json=nonFirstFragment,proto3" json:"non_first_fragment,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesRequest) Reset() {
@@ -6669,6 +6676,13 @@ func (x *MatchPoliciesRequest) GetIcmpCode() uint32 {
 		return *x.IcmpCode
 	}
 	return 0
+}
+
+func (x *MatchPoliciesRequest) GetNonFirstFragment() bool {
+	if x != nil {
+		return x.NonFirstFragment
+	}
+	return false
 }
 
 type MatchPoliciesResponse struct {
@@ -6813,8 +6827,21 @@ type MatchPoliciesResponse struct {
 	RouteDropBeforePolicy bool   `protobuf:"varint,22,opt,name=route_drop_before_policy,json=routeDropBeforePolicy,proto3" json:"route_drop_before_policy,omitempty"`
 	RouteDropClass        string `protobuf:"bytes,23,opt,name=route_drop_class,json=routeDropClass,proto3" json:"route_drop_class,omitempty"`
 	RouteDropNote         string `protobuf:"bytes,24,opt,name=route_drop_note,json=routeDropNote,proto3" json:"route_drop_note,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// #5572: fragment_associated_deny is true when the query was a non-first IP
+	// fragment (non_first_fragment in the request) whose PERMIT was OVERRIDDEN to
+	// an overlapping port-bearing DENY, reproducing the dataplane's #4569
+	// fragment-associated deny. When set, `matched` is true and the response is
+	// attributed to the ENFORCING deny (policy_name / policy_id / rule_id /
+	// action). fragment_deny_note carries the SSOT operator advisory string
+	// (policymatch.FragmentDenyNote) so gRPC / remote-CLI clients explain the
+	// over-drop identically to the local CLI + REST surfaces. ADVISORY, like
+	// route_drop_note — it does not change the verdict beyond the deny override.
+	// Omitted (false / empty) for every non-fragment verdict and for a fragment
+	// that a real deny matched directly or that permits with no overlapping deny.
+	FragmentAssociatedDeny bool   `protobuf:"varint,25,opt,name=fragment_associated_deny,json=fragmentAssociatedDeny,proto3" json:"fragment_associated_deny,omitempty"`
+	FragmentDenyNote       string `protobuf:"bytes,26,opt,name=fragment_deny_note,json=fragmentDenyNote,proto3" json:"fragment_deny_note,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *MatchPoliciesResponse) Reset() {
@@ -7011,6 +7038,20 @@ func (x *MatchPoliciesResponse) GetRouteDropClass() string {
 func (x *MatchPoliciesResponse) GetRouteDropNote() string {
 	if x != nil {
 		return x.RouteDropNote
+	}
+	return ""
+}
+
+func (x *MatchPoliciesResponse) GetFragmentAssociatedDeny() bool {
+	if x != nil {
+		return x.FragmentAssociatedDeny
+	}
+	return false
+}
+
+func (x *MatchPoliciesResponse) GetFragmentDenyNote() string {
+	if x != nil {
+		return x.FragmentDenyNote
 	}
 	return ""
 }
@@ -8643,7 +8684,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05state\x18\x03 \x01(\tR\x05state\x12\x1a\n" +
 	"\bpriority\x18\x04 \x01(\x05R\bpriority\x12+\n" +
 	"\x11virtual_addresses\x18\x05 \x03(\tR\x10virtualAddresses\x12\x18\n" +
-	"\apreempt\x18\x06 \x01(\bR\apreempt\"\xd8\x02\n" +
+	"\apreempt\x18\x06 \x01(\bR\apreempt\"\x86\x03\n" +
 	"\x14MatchPoliciesRequest\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x1b\n" +
@@ -8654,11 +8695,13 @@ const file_xpf_proto_rawDesc = "" +
 	"\vsource_port\x18\a \x01(\x05R\n" +
 	"sourcePort\x12 \n" +
 	"\ticmp_type\x18\b \x01(\rH\x00R\bicmpType\x88\x01\x01\x12 \n" +
-	"\ticmp_code\x18\t \x01(\rH\x01R\bicmpCode\x88\x01\x01B\f\n" +
+	"\ticmp_code\x18\t \x01(\rH\x01R\bicmpCode\x88\x01\x01\x12,\n" +
+	"\x12non_first_fragment\x18\n" +
+	" \x01(\bR\x10nonFirstFragmentB\f\n" +
 	"\n" +
 	"_icmp_typeB\f\n" +
 	"\n" +
-	"_icmp_code\"\xd6\a\n" +
+	"_icmp_code\"\xbe\b\n" +
 	"\x15MatchPoliciesResponse\x12\x1f\n" +
 	"\vpolicy_name\x18\x01 \x01(\tR\n" +
 	"policyName\x12\x16\n" +
@@ -8685,7 +8728,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\fhost_inbound\x18\x15 \x01(\v2\x1c.xpf.v1.HostInboundAdmissionR\vhostInbound\x127\n" +
 	"\x18route_drop_before_policy\x18\x16 \x01(\bR\x15routeDropBeforePolicy\x12(\n" +
 	"\x10route_drop_class\x18\x17 \x01(\tR\x0erouteDropClass\x12&\n" +
-	"\x0froute_drop_note\x18\x18 \x01(\tR\rrouteDropNoteB\f\n" +
+	"\x0froute_drop_note\x18\x18 \x01(\tR\rrouteDropNote\x128\n" +
+	"\x18fragment_associated_deny\x18\x19 \x01(\bR\x16fragmentAssociatedDeny\x12,\n" +
+	"\x12fragment_deny_note\x18\x1a \x01(\tR\x10fragmentDenyNoteB\f\n" +
 	"\n" +
 	"_policy_id\"\x9e\x01\n" +
 	"\x14HostInboundAdmission\x12:\n" +

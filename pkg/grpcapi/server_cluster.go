@@ -221,16 +221,21 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		overlay = s.feedOverlayFn()
 	}
 	res := policymatch.Match(cfg, policymatch.Query{
-		FromZone:    req.FromZone,
-		ToZone:      req.ToZone,
-		SrcIP:       parsedSrc,
-		DstIP:       parsedDst,
-		Protocol:    req.Protocol,
-		SrcPort:     int(req.SourcePort),
-		DstPort:     int(req.DestinationPort),
-		ICMPType:    icmpType,
-		ICMPCode:    icmpCode,
-		FeedOverlay: overlay,
+		FromZone: req.FromZone,
+		ToZone:   req.ToZone,
+		SrcIP:    parsedSrc,
+		DstIP:    parsedDst,
+		Protocol: req.Protocol,
+		SrcPort:  int(req.SourcePort),
+		DstPort:  int(req.DestinationPort),
+		ICMPType: icmpType,
+		ICMPCode: icmpCode,
+		// #5572: a non-first IP fragment (no L4 header) is the flowless packet
+		// shape the dataplane calls l4_present == false; the simulator then
+		// reproduces the #4569 fragment-associated deny. false (default) is a
+		// normal L4-present packet, so an existing client is unchanged.
+		NonFirstFragment: req.NonFirstFragment,
+		FeedOverlay:      overlay,
 		// #3104: skip scheduler-inactive policies like the runtime does, so the
 		// simulator falls through to the next active rule / default-policy.
 		PolicyInactiveFn: s.policyInactiveFn(),
@@ -343,6 +348,12 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		RouteDropBeforePolicy: res.RouteDropBeforePolicy,
 		RouteDropClass:        res.RouteDropClass,
 		RouteDropNote:         res.RouteDropNote(),
+		// #5572: a non-first fragment whose permit was overridden to an
+		// overlapping port-bearing deny carries the advisory so a gRPC client
+		// explains the over-drop identically to the CLI + REST surfaces. The
+		// response is already attributed to the enforcing deny above.
+		FragmentAssociatedDeny: res.FragmentAssociatedDeny,
+		FragmentDenyNote:       res.FragmentDenyNote(),
 	}, nil
 }
 
