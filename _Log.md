@@ -45788,6 +45788,29 @@ top.
   pkg/grpcapi/server_diag_monitor_proxy_5497_test.go, pkg/grpcapi/README.md,
   _Log.md
 
+- **Timestamp**: 2026-07-10
+  **Action**: #5034 (C175-HC-073 remainder) — return a REAL filtered session
+  total from gRPC instead of the `-1` sentinel PR #5033 papered over in the
+  CLI. Rewrote `setSessionsTotal` (pkg/grpcapi/server_sessions.go): filtered
+  queries now do a count-only scan (`IterateSessions`/`…V6` + `matchV4/V6`,
+  no enrichment/allocation, forward-only) instead of setting `Total=-1`;
+  unfiltered still uses the lightweight `SessionCount()`. It returns an error
+  so a partial count-scan fails the RPC (`Internal`, #2469 discipline); the
+  three cursor-path call sites now propagate it. Updated the proto doc comment
+  on `GetSessionsResponse.total` and regenerated the Go bindings with the
+  repo-pinned toolchain (protoc 3.21.12 / protoc-gen-go v1.36.11 /
+  protoc-gen-go-grpc v1.6.1) — comment-only .pb.go delta, NO field added. CLI
+  renders the real total via a new `peerSessionsTotal` helper (removes the
+  #5033 `len(Sessions)` fallback, which undercounts a capped result).
+  Documented the `total` counter-semantics contract in pkg/grpcapi/README.md.
+  RED-on-revert verified for both the server (Total=-1 reappears) and CLI
+  (renders len()=2 not the real 4). Deferred (own larger design / other
+  packages): C175-HC-073 peer-summary filter, HC-063 alarms, HC-077 DNAT
+  pool-name, HC-082 owning-RG, HC-122 dhcprelay, HC-125 LLDP.
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_filtered_total_5034_test.go,
+  pkg/grpcapi/README.md, pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/peer_sessions_total_5034_test.go, _Log.md
 ## 2026-07-10 — ddns: tokenize multi-word ok-response (#5557 / claude-review-003 A10)
 - **Timestamp**: 2026-07-10 (fix/ddns-multiword-okresponse)
 - **Action**: Fix a functional DDNS bug in the generic templated backend. A
@@ -45808,3 +45831,19 @@ top.
   pkg/ddns/README.md ok-response wording.
 - **File(s)**: pkg/ddns/backend_generic.go, pkg/ddns/backend_http_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5034 review fold (rev-5559 MERGE-NEEDS-MINOR) — restore the
+  -1-sentinel fallback in `peerSessionsTotal` for mixed-version clusters.
+  Removing the #5033 `Total<0 -> len(Sessions)` guard assumed the server
+  never emits -1, but a PEER is a separate binary: during ISSU / rolling
+  upgrade a new cli querying an OLD (pre-#5034) peer gets Total=-1 for a
+  filtered query and would render "Total sessions: -1", re-exposing the
+  #4908/#5033 display bug in the upgrade window. `peerSessionsTotal` now
+  returns Total only when `>= 0`, else falls back to `len(Sessions)` as
+  #5033 did (dead branch once both nodes run #5034+). Added
+  `TestPeerSessionsTotalMixedVersionFallback` (RED-on-revert: drop the guard
+  -> renders raw -1). Updated the render-site comment. go build ./... + go
+  test ./pkg/grpcapi/... ./pkg/cli/... green; gofmt clean.
+  **File(s)**: pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/peer_sessions_total_5034_test.go, _Log.md

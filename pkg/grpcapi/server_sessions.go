@@ -173,7 +173,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 				Sessions:      all,
 				NextPageToken: encodePageTokenV4(lastV4Key),
 			}
-			s.setSessionsTotal(resp, filter)
+			if err := s.setSessionsTotal(resp, filter); err != nil {
+				return nil, err
+			}
 			s.setSessionsNodeID(resp)
 			s.fetchPeerSessions(ctx, req, resp)
 			return resp, nil
@@ -218,7 +220,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 				Sessions:      all,
 				NextPageToken: encodePageTokenV6(lastV6Key),
 			}
-			s.setSessionsTotal(resp, filter)
+			if err := s.setSessionsTotal(resp, filter); err != nil {
+				return nil, err
+			}
 			s.setSessionsNodeID(resp)
 			s.fetchPeerSessions(ctx, req, resp)
 			return resp, nil
@@ -233,23 +237,55 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 		Sessions: all,
 		// NextPageToken is empty — no more data.
 	}
-	s.setSessionsTotal(resp, filter)
+	if err := s.setSessionsTotal(resp, filter); err != nil {
+		return nil, err
+	}
 	s.setSessionsNodeID(resp)
 	s.fetchPeerSessions(ctx, req, resp)
 	return resp, nil
 }
 
-// setSessionsTotal sets the Total field on the response.
-// When no filters are active, use the lightweight SessionCount() to avoid
-// a full-table enrichment scan.  With filters, total is set to -1
-// (unknown) since computing it would require a full scan.
-func (s *Server) setSessionsTotal(resp *pb.GetSessionsResponse, f *sessionFilter) {
-	if f.hasFilters {
-		resp.Total = -1 // filtered total is unknown without full scan
-		return
+// setSessionsTotal sets the Total field on the response to the exact count
+// of filter-matching sessions.
+//
+// With no filters active, the lightweight SessionCount() avoids a scan (it
+// counts forward map entries directly). With filters active, a count-only
+// scan — no reverse-entry merge, no app resolution, no allocation — yields
+// the REAL filtered total instead of the -1 sentinel the cursor path used
+// to return (#5034 / C175-HC-073). matchV4/matchV6 already skip reverse
+// entries, so the count is forward-only, matching both SessionCount() and
+// the legacy path's idx total. A filtered session view — including a
+// cluster peer's session detail — now reports a meaningful "Total
+// sessions" count rather than a negative sentinel.
+//
+// An iterator error is propagated (codes.Internal) so a partial count
+// fails the RPC rather than surfacing as a successful under-count, matching
+// the #2469 discipline for the page-iteration scans above.
+func (s *Server) setSessionsTotal(resp *pb.GetSessionsResponse, f *sessionFilter) error {
+	if !f.hasFilters {
+		v4, v6 := s.dp.SessionCount()
+		resp.Total = int32(v4 + v6)
+		return nil
 	}
-	v4, v6 := s.dp.SessionCount()
-	resp.Total = int32(v4 + v6)
+	total := 0
+	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if f.matchV4(key, val) {
+			total++
+		}
+		return true
+	}); err != nil {
+		return status.Errorf(codes.Internal, "v4 session count: %v", err)
+	}
+	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if f.matchV6(key, val) {
+			total++
+		}
+		return true
+	}); err != nil {
+		return status.Errorf(codes.Internal, "v6 session count: %v", err)
+	}
+	resp.Total = int32(total)
+	return nil
 }
 
 func (s *Server) setSessionsNodeID(resp *pb.GetSessionsResponse) {

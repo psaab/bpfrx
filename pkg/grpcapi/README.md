@@ -139,6 +139,18 @@ contract.
   `source-nat-pool` filter matches the TRANSLATED source
   (`SessFlagSNAT` + `NATSrcIP` in the pool's address set via
   `config.SourceNATPoolNets`).
+- `GetSessionsResponse.total` is the EXACT count of filter-matching
+  (forward-only) sessions — never the old `-1` sentinel (#5034 /
+  C175-HC-073). `setSessionsTotal` uses the lightweight `SessionCount()`
+  when unfiltered and a count-only scan (`IterateSessions`/`…V6` +
+  `matchV4`/`matchV6`, no enrichment/allocation) when filtered, matching the
+  legacy path's `idx` total. Both `matchV4`/`matchV6` and `SessionCount`
+  skip reverse entries, so `total` counts unique forward sessions, not raw
+  map entries. It is the whole-table total, independent of the returned
+  page's size (`len(sessions)` undercounts once a page/limit caps the
+  result), so a consumer — including a cluster peer's session detail —
+  renders a meaningful "Total sessions". A count-scan iterator error fails
+  the RPC (`Internal`) rather than reporting a partial under-count (#2469).
 - `MatchPolicies` is a THIN adapter over the single shared policy simulator
   `pkg/policymatch` (#3042) — the same matcher the REST `/security/match`
   handler and the CLI `show security match-policies` / `test policy` commands

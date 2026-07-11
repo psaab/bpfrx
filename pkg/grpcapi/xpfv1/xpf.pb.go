@@ -2866,7 +2866,7 @@ func (x *GetSessionsRequest) GetSourceNatPool() string {
 
 type GetSessionsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Total         int32                  `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"` // exact count when unfiltered; -1 when filters active (avoids full scan)
+	Total         int32                  `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"` // exact count of filter-matching (forward-only) sessions; unfiltered uses the lightweight session count (#5034 — was -1 sentinel when filtered)
 	Limit         int32                  `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
 	Offset        int32                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Sessions      []*SessionEntry        `protobuf:"bytes,4,rep,name=sessions,proto3" json:"sessions,omitempty"`

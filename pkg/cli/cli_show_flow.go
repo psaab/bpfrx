@@ -731,16 +731,14 @@ func (c *CLI) showFlowSession(args []string) error {
 					fmt.Println()
 				}
 			}
-			// #4908 (C175-HC-073): the peer returns Total=-1 as a sentinel when
-			// a filter is active (it skips the full scan). Printing the raw
-			// sentinel showed "Total sessions: -1"; fall back to the number of
-			// sessions actually returned so a filtered command reports a
-			// meaningful count instead of a negative sentinel.
-			peerTotal := peerResp.Total
-			if peerTotal < 0 {
-				peerTotal = int32(len(peerResp.Sessions))
-			}
-			fmt.Printf("Total sessions: %d\n", peerTotal)
+			// #5034 (C175-HC-073): a current peer's GetSessions returns a REAL
+			// filtered total in Total — an exact count-only scan of
+			// filter-matching sessions, no longer the -1 sentinel — so it is
+			// rendered directly (Total is the true count; len(Sessions)
+			// undercounts once the peer's result is capped at limit 10000).
+			// peerSessionsTotal retains the -1-sentinel->len fallback for a
+			// pre-#5034 peer during a mixed-version ISSU window.
+			fmt.Printf("Total sessions: %d\n", peerSessionsTotal(peerResp))
 		}
 	}
 	return nil

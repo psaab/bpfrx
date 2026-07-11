@@ -481,6 +481,32 @@ func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
 	return resp
 }
 
+// peerSessionsTotal returns the "Total sessions" count to render for a
+// peer session-detail response.
+//
+// A CURRENT server (#5034 / C175-HC-073) returns the REAL filtered total in
+// Total — an exact forward-only count of filter-matching sessions — which
+// is rendered directly. It is deliberately preferred over len(resp.Sessions):
+// the peer caps its returned list (limit 10000), so len() undercounts a
+// large filtered set, whereas Total is the true count.
+//
+// The -1-sentinel fallback is RETAINED for mixed-version clusters (ISSU /
+// rolling upgrade): a peer is a SEPARATE binary, and a pre-#5034 peer still
+// emits Total=-1 for a filtered query. Rendering that raw would re-expose
+// the #4908/#5033 "Total sessions: -1" display bug during the upgrade
+// window, so a negative Total falls back to the returned-count exactly as
+// #5033 did. Once both nodes run #5034+, Total is always non-negative and
+// this branch is dead.
+func peerSessionsTotal(resp *pb.GetSessionsResponse) int32 {
+	if resp == nil {
+		return 0
+	}
+	if t := resp.GetTotal(); t >= 0 {
+		return t
+	}
+	return int32(len(resp.GetSessions()))
+}
+
 // fetchPeerSessionSummary dials the cluster peer's gRPC and returns its session summary.
 func (c *CLI) fetchPeerSessionSummary() *pb.GetSessionSummaryResponse {
 	conn := c.dialPeer()

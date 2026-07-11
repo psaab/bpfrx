@@ -380,7 +380,7 @@ message GetSessionsRequest {
   string source_nat_pool = 16;    // filter by source NAT pool name (translated source in pool)
 }
 message GetSessionsResponse {
-  int32 total = 1;                  // exact count when unfiltered; -1 when filters active (avoids full scan)
+  int32 total = 1;                  // exact count of filter-matching (forward-only) sessions; unfiltered uses the lightweight session count (#5034 — was -1 sentinel when filtered)
   int32 limit = 2;
   int32 offset = 3;
   repeated SessionEntry sessions = 4;
