@@ -330,28 +330,28 @@ func (d *Daemon) applyAndSyncCommitted(oldActive, compiled *config.Config, syncP
 		// no live forwarding state to invalidate.
 		return nil, applyErr
 	}
-	// #4234 Junos-default deletion-clear: the config is committed + active and
-	// the dataplane armed, so any session admitted by a now-deleted policy must
-	// stop forwarding immediately (and be dropped on the standby too) rather than
-	// linger until idle timeout. Runs under d.applySem (the caller holds it),
-	// after the dataplane apply so the new policy set is already live.
-	d.clearSessionsForDeletedPolicies(oldActive, compiled)
-	// #4234 modified-policy re-eval: when `policy-rematch` is set, also drop
-	// sessions of a surviving policy whose match/action changed so the tightened
-	// policy re-evaluates live traffic (no-op unless policy-rematch is set).
-	d.clearSessionsForModifiedPolicies(oldActive, compiled)
-	// #4342 default-policy re-eval: a change to the implicit default-policy
-	// (permit<->deny/reject, always on; or a session-log flip under policy-
-	// rematch) must drop the existing default-PERMIT sessions (sentinel id) so
-	// they stop forwarding with stale intent.
-	d.clearSessionsForDefaultPolicyChange(oldActive, compiled)
+	// #4234 Junos-default deletion-clear + modified-policy re-eval + #4342
+	// default-policy re-eval: the config is committed + active and the dataplane
+	// armed, so any session admitted by a now-deleted/tightened/default-changed
+	// policy must stop forwarding immediately (and be dropped on the standby too)
+	// rather than linger until idle timeout. Runs under d.applySem (the caller
+	// holds it), after the dataplane apply so the new policy set is already live.
+	//
+	// #5578: a PARTIAL invalidation (enumerate/delete failure) is a stale-
+	// authorization gap — traffic the new policy should DENY may keep forwarding
+	// on old session state. Join it into the returned error alongside the non-
+	// fatal apply error (mark-and-continue: the config stays committed + active
+	// and still syncs to the peer, but the operator sees the failure and can
+	// re-commit). Matches how applyErr's non-fatal best-effort subsystem errors
+	// are surfaced here rather than aborting the commit.
+	clearErr := d.clearSessionsForPolicyChanges(oldActive, compiled)
 	// Committed + active locally with the dataplane armed. A non-fatal
 	// best-effort subsystem error must NOT skip the peer sync (#4034): the
 	// standby has to receive the committed config or the nodes diverge.
 	if syncPeer {
 		d.pushCommittedConfigToPeer()
 	}
-	return compiled, applyErr
+	return compiled, errors.Join(applyErr, clearErr)
 }
 
 // applyErrSkipsPeerSync reports whether an applyConfigLocked error means the
@@ -421,13 +421,17 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 	if err != nil {
 		return nil, err
 	}
+	var clearErr error
 	if compiled != nil {
 		if err := d.applyConfigLocked(d.applyCancelCtx(), compiled); err != nil {
 			return nil, err
 		}
-		d.clearSessionsForDeletedPolicies(oldActive, compiled)
-		d.clearSessionsForModifiedPolicies(oldActive, compiled)
-		d.clearSessionsForDefaultPolicyChange(oldActive, compiled)
+		// #5578: surface a PARTIAL session invalidation to handleConfigSync
+		// (which logs it and returns it up the sync-recv path) so a peer-pushed
+		// policy deletion/tightening that could not fully drop this node's synced
+		// sessions is not silently swallowed. A non-fatal partial clear does not
+		// abort the (already-promoted) sync — it is joined into the return only.
+		clearErr = d.clearSessionsForPolicyChanges(oldActive, compiled)
 		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
 		// (a): passive gate + loud health alarm). The active node's strict
 		// commit can only validate ITS OWN hardware (R-8), so a synced
@@ -441,7 +445,7 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		// documented end-state follow-up.)
 		d.deviceMapPassiveAdmissionAlarm(compiled)
 	}
-	return compiled, nil
+	return compiled, clearErr
 }
 
 // deviceMapPassiveAdmissionAlarm raises a loud, never-silent HA-health alarm
@@ -587,9 +591,16 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	if err := d.applyConfigLocked(context.Background(), prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
-	d.clearSessionsForDeletedPolicies(oldActive, prevCfg)
-	d.clearSessionsForModifiedPolicies(oldActive, prevCfg)
-	d.clearSessionsForDefaultPolicyChange(oldActive, prevCfg)
+	// #5578: this is a background timer callback with no return path, so mirror
+	// the applyConfigLocked handling above — a PARTIAL session invalidation
+	// (enumerate/delete failure) is surfaced via a loud slog.Error rather than
+	// being lost. The helper now RETURNS the error so the two returning call
+	// sites (commit + peer-sync) join it into their result; here the log is the
+	// only available surface.
+	if err := d.clearSessionsForPolicyChanges(oldActive, prevCfg); err != nil {
+		slog.Error("commit confirmed auto-rollback: policy session invalidation was PARTIAL; "+
+			"some rolled-back-policy sessions may keep forwarding under stale authorization", "err", err)
+	}
 	// #3868: RE-SYNC the rolled-back config (C1) to the cluster peer. The
 	// standby already received the unconfirmed config (C2) via config-sync
 	// SyncApply, which arms NO confirm timer, so it holds C2 as its PERMANENT

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"sort"
@@ -26,6 +27,16 @@ import (
 var (
 	errDDNSStateCorrupt            = errors.New("ddns: ownership state file is corrupt")
 	errDDNSStateUnsupportedVersion = errors.New("ddns: ownership state file has an unsupported version")
+	// errDDNSStateTooLarge classifies an ownership file whose on-disk size
+	// exceeds maxDDNSStateBytes (#5571, CWE-770 unbounded resource consumption).
+	// It WRAPS errDDNSStateCorrupt so an over-bound file engages the EXACT
+	// fail-closed posture the loader already uses for an unparseable/bad-version
+	// file (quarantine aside + durable degraded marker via loadStateOrDegrade) —
+	// an oversized/corrupt canonical file is no more trustworthy than a malformed
+	// one. Keeping it a DISTINCT sentinel (matched separately with errors.Is) lets
+	// a test prove the read was refused by the SIZE bound BEFORE buffering the
+	// whole file, not merely by a JSON parse error after a full read.
+	errDDNSStateTooLarge = fmt.Errorf("ddns: ownership state file exceeds the maximum size: %w", errDDNSStateCorrupt)
 )
 
 // state.go (moved verbatim from pkg/dhcpserver/ddns_state.go in #2691 P1a):
@@ -334,6 +345,79 @@ type ddnsStateFile struct {
 
 const ddnsStateVersion = 1
 
+// The read bound below (#5571, CWE-770) caps how much of the durable ownership
+// file loadDDNSState will pull into memory BEFORE any JSON/version/semantic
+// validation runs. Without it a single os.ReadFile of a very large canonical
+// file — left by a prior crash, filesystem corruption, an administrative
+// restore, or a future producer defect — drives input-proportional heap growth,
+// GC pressure, or OOM during daemon STARTUP, exactly when the control plane must
+// recover, and BEFORE the fail-closed corruption posture can engage. The bound
+// is DERIVED (not a magic number) from the legitimate maximum ownership state:
+//
+//   maxDDNSStateBytes = maxDDNSStateRecords * maxDDNSStateRecordBytes + envelope
+//
+// so a legitimate store always loads while an oversized/corrupt one is refused
+// before it is buffered whole.
+
+// maxDDNSStateRecords is the generous legitimate ceiling on ownership records.
+// The store carries at most one record per DDNS-published DHCP lease (Surface B)
+// plus a handful of per-interface router records (Surface A), so its record
+// count tracks the DHCP lease count. 65,536 is one ENTIRE /16 subnet fully
+// leased with a DDNS record for every lease — already far beyond any realistic
+// vSRX-class DDNS deployment (production stores hold tens to low thousands). It
+// is the record-count anchor for the byte bound below, not an enforced count cap.
+const maxDDNSStateRecords = 1 << 16 // 65,536
+
+// maxDDNSStateRecordBytes is the generous per-record ceiling on the pretty-
+// printed (2-space-indented, the save() format) JSON of one ownedRecord. A
+// worst-case record with every optional field at its protocol maximum — FQDN
+// 253, PTR name ~255, DUID-hex client-id ~260, identity/subnet/owner-id, a
+// nested scope carrying its own 253-octet FQDN, the backend fingerprint — plus
+// all JSON keys and indentation serializes to ~1.5 KiB; 2 KiB carries ~33%
+// headroom so no legitimate record is ever over-counted.
+const maxDDNSStateRecordBytes = 2 << 10 // 2 KiB
+
+// maxDDNSStateBytes is the hard cap on the ownership file loadDDNSState will read
+// into memory (#5571). It is maxDDNSStateRecords * maxDDNSStateRecordBytes plus a
+// small envelope for the "version" field, the JSON array brackets, and top-level
+// indentation. A file larger than this cannot be a legitimate store, so it is
+// refused (classified errDDNSStateTooLarge -> fail-closed corrupt) before being
+// buffered — converting an unbounded, input-proportional allocation into a
+// bounded, constant one.
+const maxDDNSStateBytes = maxDDNSStateRecords*maxDDNSStateRecordBytes + 4<<10 // 128 MiB + 4 KiB
+
+// readBoundedStateFile reads the ownership store at path but REFUSES to buffer
+// more than maxDDNSStateBytes (#5571, CWE-770). It opens the file and stats it
+// first, rejecting an over-bound size BEFORE any allocation (so an arbitrarily
+// large — GiB/TiB — corrupt file costs one stat, not a full read). It then reads
+// through io.LimitReader(f, maxDDNSStateBytes+1) with a sentinel byte so a file
+// that GREW after the stat, or whose stat size is unreliable (a pipe / special
+// file), still cannot be buffered past the cap. An over-bound file returns an
+// error wrapping errDDNSStateTooLarge (which wraps errDDNSStateCorrupt) so the
+// caller fails closed and quarantines it exactly like an unparseable store. A
+// not-exist error is returned verbatim (wrapping os.ErrNotExist) so the caller
+// treats a missing file as a clean first-run empty store.
+func readBoundedStateFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err // includes os.ErrNotExist, classified by the caller
+	}
+	defer f.Close()
+	if fi, serr := f.Stat(); serr == nil && fi.Size() > maxDDNSStateBytes {
+		return nil, fmt.Errorf("ddns state %s size %d exceeds max %d bytes: %w",
+			path, fi.Size(), maxDDNSStateBytes, errDDNSStateTooLarge)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxDDNSStateBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxDDNSStateBytes {
+		return nil, fmt.Errorf("ddns state %s exceeds max %d bytes: %w",
+			path, maxDDNSStateBytes, errDDNSStateTooLarge)
+	}
+	return data, nil
+}
+
 // loadDDNSState reads the ownership store from path. A missing file yields an
 // empty store (first run, error nil). A CORRUPT or UNKNOWN-VERSION file is
 // FAIL-CLOSED (#2650): the returned store is empty, but the returned error is
@@ -355,12 +439,28 @@ const ddnsStateVersion = 1
 // one — but it is NOT classified corrupt/unsupported (no quarantine: the bytes
 // may be fine and re-readable, so do not move the file out from under a transient
 // fault).
+//
+// The read is BOUNDED (#5571, CWE-770): an ownership file larger than
+// maxDDNSStateBytes is refused BEFORE it is buffered whole (via
+// readBoundedStateFile: an os.Stat pre-check plus an io.LimitReader sentinel) so
+// a very large / corrupt canonical file cannot drive input-proportional heap
+// growth or OOM during startup. Over-bound is classified errDDNSStateTooLarge —
+// which wraps errDDNSStateCorrupt — so it engages the SAME fail-closed quarantine
+// posture as an unparseable file.
 func loadDDNSState(path string) (*ddnsState, error) {
 	s := &ddnsState{path: path, records: map[string]ownedRecord{}}
-	data, err := os.ReadFile(path)
+	data, err := readBoundedStateFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return s, nil
+		}
+		// An over-bound file is classified corrupt (errDDNSStateTooLarge wraps
+		// errDDNSStateCorrupt) so the manager fails closed and quarantines it,
+		// exactly like an unparseable store — a huge/corrupt canonical file is no
+		// more trustworthy than a malformed one and must never be buffered whole
+		// or acted on. Return it unwrapped so the classification survives.
+		if errors.Is(err, errDDNSStateCorrupt) {
+			return s, err
 		}
 		return s, fmt.Errorf("read ddns state %s: %w", path, err)
 	}

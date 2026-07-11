@@ -16,7 +16,7 @@ moved with its assertions intact.
 | File | Contents |
 |------|----------|
 | `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `dhcidSharedWithOther` (#2700 shared-DHCID guard), `Stats` (incl. `PTRPendingNow`, #2708), `OwnedRecordView(s)`, the `errDDNSNoBackendToWithdraw` keep-ownership sentinel (#2699), the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
-| `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. Also the fail-closed load classifiers `errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion` + `quarantineBadState` (#2650) + the durable `<path>.degraded` marker helpers `readDegradedMarker` / `writeDegradedMarker` (#4873) that keep the fail-closed posture across restart. |
+| `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. Also the fail-closed load classifiers `errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion` + `quarantineBadState` (#2650) + the durable `<path>.degraded` marker helpers `readDegradedMarker` / `writeDegradedMarker` (#4873) that keep the fail-closed posture across restart. The load is SIZE-BOUNDED via `readBoundedStateFile` (`os.Stat` pre-check + `io.LimitReader` sentinel) against the derived `maxDDNSStateBytes` cap; an over-bound file is classified `errDDNSStateTooLarge` (wraps `errDDNSStateCorrupt`) so it fails closed like a corrupt file (#5571, CWE-770). |
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
 | `hostname.go` | Deterministic hostname → DNS-label normalization (pure) — moved from `dhcpserver/ddns_hostname.go`. |
@@ -301,6 +301,24 @@ no change in those packages:
     WITHOUT persisting, so the stale RR was uncleanable and oscillated across
     restart; that drop path now also persists (`state.save()`) as defense in
     depth so it can never re-oscillate.
+  - **The load is SIZE-BOUNDED before any allocation (#5571, CWE-770).**
+    `loadDDNSState` no longer `os.ReadFile`s the whole file before validating it.
+    A very large canonical file — left by a prior crash, filesystem corruption,
+    an administrative restore, or a future producer defect — would otherwise drive
+    input-proportional heap growth / GC pressure / OOM during daemon STARTUP,
+    exactly when the control plane must recover and BEFORE the fail-closed posture
+    can engage. `readBoundedStateFile` opens and `os.Stat`s the file, rejecting an
+    over-bound size before any read (so an arbitrarily large corrupt file costs one
+    stat, not a full read), then reads through `io.LimitReader(f, maxDDNSStateBytes+1)`
+    with a sentinel byte so a file that grew after the stat, or whose stat size is
+    unreliable, still cannot be buffered past the cap. The cap is DERIVED, not a
+    magic number: `maxDDNSStateBytes = maxDDNSStateRecords (65,536 — one full /16
+    fully leased, far beyond any realistic deployment) * maxDDNSStateRecordBytes
+    (2 KiB — a worst-case pretty-printed record with every optional field at its
+    protocol maximum, ~33% headroom) + a small JSON envelope` ≈ 128 MiB. An
+    over-bound file is classified `errDDNSStateTooLarge` (which WRAPS
+    `errDDNSStateCorrupt`), so it engages the SAME quarantine + durable
+    `.degraded` marker posture as an unparseable/bad-version file.
   - **The fail-closed posture is DURABLE across restart (#4873).** Quarantine
     renames the corrupt canonical file away, so a naive reload on the next boot
     would find no file, load an EMPTY store with a nil error, and NOT degrade —
