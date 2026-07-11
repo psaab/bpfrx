@@ -52,10 +52,19 @@ var tcpFlagBits = map[string]uint8{
 //     "! & ack") — the '!' would otherwise be silently dropped, weakening the
 //     term (#4714, fail-open); reject it so the operator's intent is never
 //     silently lost
+//   - a '&' conjunction with no flag operand on one side, i.e. a leading,
+//     trailing, or duplicated separator (e.g. "&", "syn &", "& ack",
+//     "syn && ack"), and any non-empty expression that sets no flag bits at all
+//     (e.g. "&", "()") — such an operator-only / empty-operand expression would
+//     otherwise return "no constraint" (or silently drop the dangling '&') and
+//     the term would match EVERY TCP segment (#5455, fail-open widening of a
+//     security filter); reject it so a malformed value never commits
 //
 // An input that carries no flag at all (empty / whitespace only) returns
 // ok=false with no error: the caller leaves the wire field nil, i.e. no
-// tcp-flags constraint.
+// tcp-flags constraint. This "absent" case is distinct from a NON-EMPTY value
+// that parses to no flag bits (rejected above): the former is "operator wrote
+// nothing", the latter is "operator wrote something malformed".
 func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool, err error) {
 	expr := strings.TrimSpace(strings.Join(parts, " "))
 	if expr == "" {
@@ -89,6 +98,15 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 	// group, yields a disjunction that the conjunctive matcher cannot enforce —
 	// reject it (fail-closed) instead of dropping the constraint.
 	pendingNeg := false
+	// segHasFlag tracks whether the current '&'-delimited segment has yet
+	// contributed a flag operand. A conjunction separator ('&') is binary: it
+	// requires a flag operand on BOTH sides. A '&' reached while the current
+	// segment is still empty is a leading or duplicated separator (e.g. "& ack",
+	// "syn && ack"); the trailing check after the loop catches a segment left
+	// empty at the end (e.g. "&", "syn &"). Either way the operator wrote a '&'
+	// with no flag operand — reject it so the malformed value never commits and
+	// silently matches all TCP (#5455, fail-open).
+	segHasFlag := false
 	for _, t := range toks {
 		switch t {
 		case "&":
@@ -100,7 +118,14 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 				return 0, 0, false, fmt.Errorf(
 					"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
 			}
+			// A '&' with no flag operand to its left is a leading or duplicated
+			// separator (e.g. "& ack", "syn && ack") — reject it (#5455).
+			if !segHasFlag {
+				return 0, 0, false, fmt.Errorf(
+					"tcp-flags %q: \"&\" conjunction with no flag operand", expr)
+			}
 			pendingNeg = false
+			segHasFlag = false
 			continue
 		case "|":
 			return 0, 0, false, fmt.Errorf(
@@ -125,6 +150,7 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 			required |= bit
 		}
 		pendingNeg = false
+		segHasFlag = true
 	}
 
 	// A negation left pending after the last token is a dangling '!' with no
@@ -136,12 +162,30 @@ func ParseTCPFlagsExpression(parts []string) (required, forbidden uint8, ok bool
 			"tcp-flags %q: dangling negation \"!\" with no flag operand", expr)
 	}
 
+	// The final '&'-delimited segment must also carry a flag operand. A segment
+	// left empty at the end is a trailing '&' (e.g. "syn &"), a whole expression
+	// that is operator-only (e.g. "&"), or an empty-operand group (e.g. "()").
+	// Each sets no flag bits for that segment, so accepting it would silently
+	// drop the constraint and match every TCP segment (#5455, fail-open). This
+	// is the NON-EMPTY-but-no-flag-bits case that must ERROR, distinct from the
+	// legitimately-absent (expr == "") case handled above which returns "no
+	// constraint" with no error.
+	if !segHasFlag {
+		return 0, 0, false, fmt.Errorf(
+			"tcp-flags %q: expression has no flag operand (operator-only, empty operand, or trailing \"&\")", expr)
+	}
+
 	if required&forbidden != 0 {
 		return 0, 0, false, fmt.Errorf(
 			"tcp-flags %q: a flag is both required and forbidden (the term can never match)", expr)
 	}
+	// segHasFlag implies at least one bit was set, so required|forbidden != 0
+	// here — the historical "required == 0 && forbidden == 0 → no constraint"
+	// fall-through is unreachable for a non-empty expression. Guard it as a
+	// fail-closed backstop rather than silently returning match-all (#5455).
 	if required == 0 && forbidden == 0 {
-		return 0, 0, false, nil
+		return 0, 0, false, fmt.Errorf(
+			"tcp-flags %q: expression sets no flag bits", expr)
 	}
 	return required, forbidden, true, nil
 }

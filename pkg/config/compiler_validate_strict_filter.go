@@ -81,11 +81,16 @@ func validateFirewallPolicerReferencesStrict(cfg *Config) error {
 // validateFirewallTCPFlagsStrict hard-rejects a firewall-filter term whose
 // `from tcp-flags <expr>` the conjunctive dataplane matcher cannot enforce —
 // a disjunction (`ack | rst`), a negated parenthesized group (a disjunction by
-// De Morgan), an unknown flag token, a dangling negation, or a
-// self-contradictory required/forbidden pair (#3076 / #4714). Without a reject
-// such an expression committed cleanly and the constraint was silently dropped
-// on the wire — the term matched regardless of flags (fail-OPEN, a dropped
-// security constraint).
+// De Morgan), an unknown flag token, a dangling negation, a
+// self-contradictory required/forbidden pair (#3076 / #4714), or an
+// operator-only / empty-operand / dangling-`&` expression that sets no flag
+// bits (`&`, `()`, `syn &`, `syn && ack`, #5455). Without a reject such an
+// expression committed cleanly and the constraint was silently dropped on the
+// wire — the term matched regardless of flags (fail-OPEN, a dropped security
+// constraint). The gate keys off `ParseTCPFlagsExpression` returning err!=nil;
+// the `len(term.TCPFlags) == 0` guard below skips a legitimately-ABSENT value
+// (no tcp-flags configured), which is NOT the same as a present-but-malformed
+// value that parses to no flag bits.
 //
 // #4953: this gate is the strict/tolerant home of the #3076 reject that used
 // to live inline in compileFirewall (where it could not be mode-gated — the
