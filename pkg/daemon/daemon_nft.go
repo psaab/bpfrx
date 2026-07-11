@@ -1315,7 +1315,7 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	// the term matches NOTHING (Junos empty-positive set) — skip the whole rule so
 	// the kernel mirror neither over-matches (fail-open) nor emits unloadable nft.
 	srcAddrs, srcExcept, srcConstrained := dpuserspace.ResolveFilterPrefixListAddrs(
-		term.SourceAddresses, term.SourcePrefixLists, prefixLists, "", term.Name, "source")
+		term.SourceAddresses, term.SourcePrefixLists, prefixLists, "", term.Name, "source", term.Action)
 	srcPred, srcMatchesNothing := nftAddrPredicate("saddr", family, srcAddrs, srcExcept, srcConstrained)
 	if srcMatchesNothing {
 		return nil
@@ -1325,7 +1325,7 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	}
 
 	dstAddrs, dstExcept, dstConstrained := dpuserspace.ResolveFilterPrefixListAddrs(
-		term.DestAddresses, term.DestPrefixLists, prefixLists, "", term.Name, "destination")
+		term.DestAddresses, term.DestPrefixLists, prefixLists, "", term.Name, "destination", term.Action)
 	dstPred, dstMatchesNothing := nftAddrPredicate("daddr", family, dstAddrs, dstExcept, dstConstrained)
 	if dstMatchesNothing {
 		return nil

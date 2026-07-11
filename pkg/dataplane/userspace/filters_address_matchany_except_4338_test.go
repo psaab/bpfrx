@@ -28,7 +28,7 @@ func TestResolvePrefixListAddrsMatchAnyExceptComposes_4338(t *testing.T) {
 	addrs, except, constrained := resolvePrefixListAddrs(
 		[]string{"0.0.0.0/0"},
 		[]config.PrefixListRef{{Name: "mgmt", Except: true}},
-		cfg, "f", "t", "source",
+		cfg, "f", "t", "source", "accept",
 	)
 
 	if !except {
@@ -59,7 +59,7 @@ func TestResolvePrefixListAddrsMatchAnyExceptComposesV6_4338(t *testing.T) {
 	addrs, except, constrained := resolvePrefixListAddrs(
 		[]string{"::/0"},
 		[]config.PrefixListRef{{Name: "mgmt6", Except: true}},
-		cfg, "f6", "t", "source",
+		cfg, "f6", "t", "source", "accept",
 	)
 	if !except || !constrained {
 		t.Fatalf("::/0 + except must compose to except=true, constrained=true; got except=%v constrained=%v addrs=%v",
@@ -83,7 +83,7 @@ func TestResolvePrefixListAddrsSpecificPlusExceptStaysPositiveWins_4338(t *testi
 	addrs, except, _ := resolvePrefixListAddrs(
 		[]string{"0.0.0.0/0", "10.0.0.0/8"},
 		[]config.PrefixListRef{{Name: "mgmt", Except: true}},
-		cfg, "f", "t", "source",
+		cfg, "f", "t", "source", "accept",
 	)
 	if except {
 		t.Fatalf("match-any + SPECIFIC positive + except must NOT compose (positive-wins), got except=true addrs=%v", addrs)
