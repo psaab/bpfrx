@@ -15,7 +15,9 @@ the apply path pays no fsync (the file is regenerated on every apply).
   `/etc/swanctl/conf.d`.
 - `Apply(ipsecCfg *config.IPsecConfig) error` — `manager.go`. Generate
   config and reload strongSwan, then terminate the live SAs of any
-  connection deleted since the last Apply (#3941). **The returned error is
+  connection that departed the rendered/loaded set since the last Apply —
+  whether the operator DELETED it (#3941) or it became UNRENDERABLE and was
+  omitted from the render (#5494). **The returned error is
   load-bearing (#4433):** a render/write/`swanctl --load-all` failure leaves
   the previously-loaded strongSwan config (the OLD tunnels) active, so the
   commit path (`daemon_apply.go` step 6) MUST surface this error rather than
@@ -85,24 +87,41 @@ all files stay in `package ipsec`, so the public API is unchanged.
   config but leaves its already-established IKE/child SAs installed — the
   deleted tunnel keeps forwarding until rekey/lifetime expiry (a security
   gap: a VPN removed for a compromised peer / decommissioned site stays
-  up). `Apply` therefore remembers the previous applied connection-name
-  set (`prevConnNames`, sanitized VPN map keys) and on each apply diffs it
-  against the new set. `Apply`/`Clear` reload FIRST and only on reload
-  success advance `prevConnNames` and tear down removed SAs
-  (`promoteConnNames`, #4898) — so the removed conn is unloaded and cannot
+  up). `Apply` therefore remembers the previous LOADED connection-name
+  set (`prevConnNames`) and on each apply diffs it against the set
+  `renderConfig` actually emitted. `Apply`/`Clear` reload FIRST and only on
+  reload success advance `prevConnNames` and tear down departed SAs
+  (`promoteConnNames`, #4898) — so the departed conn is unloaded and cannot
   re-initiate before teardown, and a failed reload leaves the old set intact
   rather than forgetting a still-loaded connection or disrupting a
   still-effective tunnel. `terminateRemovedConns` then queries live SAs and
-  issues `swanctl --terminate --ike <conn>` only for a removed conn that
+  issues `swanctl --terminate --ike <conn>` only for a departed conn that
   actually has a live SA — so deleting a VPN that was never up is a clean
   no-op. If the live-SA query fails, it falls back to an unconditional
-  (idempotent) terminate. The diff keys off the VPN NAME, not renderability,
-  so a VPN that merely became unrenderable (a broken gateway reference) is not
-  treated as deleted and keeps its SAs. Modified/added connections are
-  untouched — only removals are torn down. All swanctl shell-outs route
-  through the `sc` seam so the diff→terminate path is unit-tested against
-  recording doubles (`delete_terminate_3941_test.go`,
-  `manager_reload_ordering_4898_test.go`).
+  (idempotent) terminate. Modified/added connections are untouched — only
+  departures are torn down. All swanctl shell-outs route through the `sc`
+  seam so the diff→terminate path is unit-tested against recording doubles
+  (`delete_terminate_3941_test.go`, `manager_reload_ordering_4898_test.go`).
+
+- **The diff keys off the RENDERED set, not the raw VPN name (#5494 —
+  FLIPS the prior #3941 name-keyed behavior).** `renderConfig` returns the
+  EXACT set of connection names it emitted; `Apply` diffs THAT. A VPN that
+  is still present in the config but dropped out of the render as
+  UNRENDERABLE on the tolerant persisted / peer-synced load path — an
+  unresolvable gateway reference (#2074), a broken ike-policy chain (#2270),
+  or a `protocol ah` proposal with no ESP render path (#4298) — is neither
+  loaded nor validated by `swanctl --load-all`, yet the reload SUCCEEDS.
+  Under the old name-keyed diff its live child SA kept forwarding under
+  now-unloaded (stale) selectors/credentials while the apply reported
+  convergence — a security fail-open. Such a VPN is now treated as a
+  departure and its SA is torn down. This deliberately trades a sliver of
+  availability for security: a transiently-unrenderable VPN's SA is torn
+  until its config becomes renderable again, but an unrenderable VPN is
+  already non-functional for rekey / new-SA establishment, so keeping a
+  stale authorized SA is a hole, not a real availability win. The #4898
+  reload-success gate is preserved (a FAILED reload still tears nothing —
+  the old config is still effective) and #3941 genuine-deletion teardown is
+  unchanged. Covered by `unrenderable_terminate_5494_test.go`.
 - **SA-status parsing must match the real `swanctl --list-sas` layout
   (#3937).** `GetSAStatus` shells out to `swanctl --list-sas` and feeds the
   stdout to `parseSAOutput`. The real strongSwan output is

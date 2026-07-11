@@ -25,11 +25,23 @@ type childSelector struct {
 }
 
 func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
-	cfg, _ := m.renderConfig(ipsecCfg)
+	cfg, _, _ := m.renderConfig(ipsecCfg)
 	return cfg
 }
 
-func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
+// renderConfig renders the swanctl snippet and returns the EXACT set of
+// swanctl connection names it actually emitted (the sanitized VPN names
+// written into the connections{} block). A VPN present in ipsecCfg.VPNs but
+// OMITTED from the render — a skip class: an unrenderable gateway reference
+// (#2074), an unresolved ike-policy chain (#2270), or a `protocol ah`
+// proposal with no ESP render path (#4298) — is NOT in the returned set even
+// though renderConfig still returns success. Apply diffs THIS rendered set
+// (not the raw VPN map keys) so a previously-loaded connection that dropped
+// out of the render is treated as a removal and its stale child SA is torn
+// down (#5494). Returning the rendered set is the single source of truth for
+// "what is actually loaded", so the skip logic here can never drift from the
+// teardown diff in promoteConnNames.
+func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, map[string]bool, error) {
 	var b strings.Builder
 
 	b.WriteString("# xpf managed config - do not edit\n\n")
@@ -38,6 +50,12 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	// (#2074) so the secrets loop below emits no orphan ike-<name> secret
 	// for a connection that was never written.
 	skipped := make(map[string]bool)
+
+	// rendered accumulates the sanitized connection name of every VPN that
+	// survives the skip checks and is emitted into connections{}. This is
+	// the authoritative "loaded connection set" Apply diffs against
+	// prevConnNames (#5494).
+	rendered := make(map[string]bool)
 
 	// Connections
 	b.WriteString("connections {\n")
@@ -85,7 +103,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 					"vpn", name, "ike_policy", gw.IKEPolicy)
 				continue
 			}
-			return "", fmt.Errorf("vpn %s: %w", name, err)
+			return "", nil, fmt.Errorf("vpn %s: %w", name, err)
 		}
 
 		// #4298 (V-2): a proposal with `protocol ah` (Authentication Header)
@@ -106,6 +124,12 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 				"vpn", name, "ipsec_policy", vpn.IPsecPolicy)
 			continue
 		}
+
+		// This VPN passed every skip check, so it is emitted into the
+		// loaded config. Record its sanitized connection name in the
+		// rendered set (#5494) — the same key swanctl reports in
+		// --list-sas and that promoteConnNames diffs for teardown.
+		rendered[sanitizeSwanctlValue(name)] = true
 
 		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
 		espProposals, espLifetime := resolveESPSettings(ipsecCfg, vpn)
@@ -277,7 +301,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 		if secret != "" {
 			decoded, err := normalizePSK(secret)
 			if err != nil {
-				return "", fmt.Errorf("vpn %s: %w", name, err)
+				return "", nil, fmt.Errorf("vpn %s: %w", name, err)
 			}
 			fmt.Fprintf(&b, "  ike-%s {\n", sanitizeSwanctlValue(name))
 			// sanitizeSwanctlValue strips control chars (#1798); the
@@ -300,7 +324,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	}
 	b.WriteString("}\n")
 
-	return b.String(), nil
+	return b.String(), rendered, nil
 }
 
 // resolveRemoteAddr resolves the swanctl remote_addrs value (a real IP /
