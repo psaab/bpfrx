@@ -445,6 +445,39 @@ bracket/repeated lists lost every prefix after the first (M02).
   the non-scoped / test wrappers pass `None` (source gate skipped), the
   production scoped callers pass `Some(..)`.
 
+### Static-NAT invalid `match destination-port` fails closed (#5101)
+
+The static-NAT typed `match destination-port` / `mapped-port` leaves are
+range-checked 1..65535 at strict commit (§13; `validateNATMatchDestinationPort
+Strict` / `validateNATHostMaskStrict`, `compiler_validate_strict_nat.go`), but
+the compiler stores the raw `int` and the lenient load / peer-sync path (#1960)
+can still carry an out-of-range value into `buildStaticNATSnapshots`
+(`nat_static.go`). The snapshot port slot is a `uint16` whose ONLY "no port"
+value is `0`, and the Rust side (`static_nat.rs`, `(0, _) => (None, None)`)
+reads `0` as the **whole-address** wildcard — a 1:1 mapping that exposes EVERY
+port of the external address.
+
+`clampPort` previously coerced an out-of-range port to `0`, conflating "port
+ABSENT" (a valid, common whole-address 1:1 shape) with "port PRESENT but
+invalid". A persisted / peer-synced `match destination-port 70000` therefore
+collapsed to whole-address — a fail-OPEN broadening, the exact opposite of the
+"fails CLOSED" the code claimed (the static-NAT analog of the §13 H12 wildcard
+hole for SNAT/DNAT).
+
+The fix keeps the absent-vs-invalid distinction:
+
+- `staticNATPortOutOfRange(p)` = `p != 0 && (p < 1 || p > 65535)` — the same
+  predicate the strict commit gate uses. `0` (absent / match-any) is NOT out of
+  range and is left untouched.
+- `buildStaticNATSnapshots` drops any rule whose `MatchDestinationPort` OR
+  `MappedPort` is present-but-out-of-range and emits an operator-visible
+  `slog.Warn` (symmetric with the source-NAT unusable-pool and #3435
+  source-address lenient-path guards). An invalid port therefore never reaches
+  `clampPort`/the Rust `(0, _)` whole-address path — the rule fails CLOSED (no
+  translation, no exposure) instead of widening to whole-address.
+- Genuine-absent (`0` → whole-address 1:1) and valid in-range ports are
+  unchanged. No wire change (Go-only); `protocol_wire_v1.json` unaffected.
+
 ## 11. Multiple destination-addresses (#2395)
 
 Junos DNAT `match destination-address [ A B C ]` publishes the SAME
