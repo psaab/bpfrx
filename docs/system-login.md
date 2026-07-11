@@ -233,6 +233,21 @@ too (`zeroizeLoginAccounts`, same error-surfacing discipline):
   if `userdel` fails; on a `userdel` failure the marker is **retained** so a
   retried `zeroize` re-attempts, and the failure is surfaced (the device is not
   reported safe to re-tenant while a live account remains).
+- **Ownership uncertainty fails CLOSED (#5496).** Deciding "is this the account
+  xpf provisioned?" needs two reads — the live UID (`/etc/passwd`) and the
+  recorded UID (the marker). If **either** cannot be resolved — `/etc/passwd`
+  unreadable, a **malformed UID**, or an **unreadable/unparseable marker** —
+  ownership is **UNKNOWN, not proven absent**. The teardown then makes **no**
+  destructive change, **retains** the marker (durable evidence for a safe
+  retry), and **surfaces** the error so the reset is reported **incomplete**.
+  The earlier code conflated an unresolved read/parse with proof-of-absence (or
+  a stale marker), erasing the marker and returning a clean result while a live
+  xpf-provisioned **password** account survived — now un-rediscoverable because
+  its retry marker was destroyed. A **proven UID-mismatch** is likewise reported
+  (unresolved) and its marker retained, absent an explicit durable stale-marker
+  policy. This is the factory-reset sibling of the day-2 login fail-closed rule
+  (#5493) — the same `lookupUIDGIDErr` three-state discipline at a distinct
+  locus.
 
 **Never-touch safety invariant.** The teardown must never nuke a non-xpf account
 or strand access:
@@ -243,7 +258,9 @@ or strand access:
   console/root lifeline survives the wipe (critical on bare metal).
 - An **out-of-band `userdel`+recreate** with a different UID (marker UID ≠ live
   UID) is left alone — the current owner is someone else, exactly the #1944
-  leave-then-rejoin-vs-recreate distinction.
+  leave-then-rejoin-vs-recreate distinction. Since #5496 this mismatch is also
+  **reported** and its marker **retained** (rather than silently erased with a
+  clean-reset report), so the anomaly is re-examined on a retry.
 
 **Local config-archive erasure (#5186).** The three erasures above cover the
 config SSOT/rollback/journal state, the rendered service configs, and the login
