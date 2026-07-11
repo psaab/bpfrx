@@ -135,7 +135,7 @@ fi
 
 # ── 3. python unittest self-tests (image / deploy / scripts root) ──
 hdr "python self-tests"
-for t in scripts/image/test_*.py scripts/deploy/test_*.py scripts/test_*.py; do
+for t in scripts/image/test_*.py scripts/dist/test_*.py scripts/deploy/test_*.py scripts/test_*.py; do
 	[ -f "$t" ] || continue
 	run_py "$t"
 done

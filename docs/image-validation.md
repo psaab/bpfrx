@@ -42,6 +42,22 @@ sg kvm -c 'python3 scripts/image/bake.py --skip-validate'
 Artifacts land in `dist/`: `xpf-<ver>.qcow2`, `xpf-<ver>.incus-metadata.tar.gz`,
 `SHA256SUMS`, `xpf-<ver>.manifest`. Verify: `(cd dist && sha256sum -c SHA256SUMS)`.
 
+**Base-image trust anchor (#4904 B).** The Ubuntu cloud image is fetched from a
+mirror and authenticated against a repo-PINNED SHA256 (`PINNED_BASE_SHA256` in
+`bake.py`, Canonical-GPG-verified) — NOT just the `SHA256SUMS` fetched from the
+same mirror endpoint (which authenticates nothing against a compromised mirror).
+A pin mismatch aborts the bake. An UNPINNED release (e.g. an `XPF_BASE_RELEASE`
+override or `XPF_UBUNTU_AUTODISCOVER=1` with no matching pin) is refused unless
+you set `XPF_ALLOW_UNPINNED_BASE=1` (a non-publishable dev bake) or supply a
+reviewed `XPF_BASE_SHA256=<digest>`. The authenticated base digest + source URL
++ `base_image_pinned` flag are bound into the signed `xpf-<ver>.manifest`.
+
+**`--skip-validate` is marked non-publishable (#4904 A).** A `--skip-validate`
+bake still signs, but the signed `xpf-<ver>.manifest` records `validated: false`
+(a full bake records `validated: true`). `scripts/dist/publish.py` refuses any
+image whose provenance is not `validated: true`, so an unvalidated dev/emergency
+image can never carry a release signature past the fail-closed publish boundary.
+
 ---
 
 ## Tier 1 — automated first-boot gate (`validate.py`)

@@ -11,7 +11,7 @@ Mechanism for a signed, hosted appliance distribution. Spec:
 | `sign.py` | minisign sign/verify + per-version manifest helpers (shared by bake/validate/deploy/publish) |
 | `build-apt-repo.sh` | builds a flat signed apt repo (default) or reprepro (opt-in) |
 | `install.sh` | Tailscale-style one-command installer (validate-all-inputs → keyring + apt source + install, with cleanup-on-failure). Ships with `%%…%%` markers baked at publish time. |
-| `publish.py` | fail-closed publish gate + `XPF_PUBLISH_CMD` dispatch. `stamp-installer` bakes the real archive key + apt base URL + channel into `install.sh` (substitute-then-sign); the gate REQUIRES a stamped+signed `install.sh` unless `--no-installer`. |
+| `publish.py` | fail-closed publish gate + `XPF_PUBLISH_CMD` dispatch. `stamp-installer` bakes the real archive key + apt base URL + channel into `install.sh` (substitute-then-sign); the gate REQUIRES a stamped+signed `install.sh` unless `--no-installer`. Also REQUIRES each image's signed `xpf-<ver>.manifest` provenance to say `validated: true` (#4904 A — a `--skip-validate` bake is refused). When an upload will happen it snapshots the tree into a private immutable staging dir and gates+dispatches ONLY that snapshot (#4904 C — the bytes gated are the bytes uploaded, closing a TOCTOU where a concurrent writer swapped an artifact/installer after the gate). |
 | `xpf-image.pub.placeholder` | PLACEHOLDER minisign public key (see below) |
 | `xpf-archive-keyring.asc.placeholder` | PLACEHOLDER OpenPGP apt archive key (see below) |
 

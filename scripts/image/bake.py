@@ -16,8 +16,10 @@ image to provision it) and exports it for both hypervisors:
                                           (only when XPF_SIGN_SECKEY is set)
 
 Pipeline: build the xpf .deb (`make deb`; no `make generate` — embeds the
-#1864 tracked shim) -> discover + SHA256-verify the latest Ubuntu cloud
-image (XPF_BASE_RELEASE pins) -> virt-resize root into a work disk ->
+#1864 tracked shim) -> discover + fetch the Ubuntu cloud image and
+authenticate it against the repo-PINNED SHA256 (a trust anchor NOT under
+the mirror's control; #4904 B — a same-endpoint checksum alone is not an
+authenticator) -> virt-resize root into a work disk ->
 virt-customize (runtime packages, linux-generic >= 6.18 with the full
 driver set, purge cloud-init/snapd/stale kernels, HOLD the kernel so apt
 cannot move the verifier floor (#1930), networkd, init_on_alloc=0,
@@ -177,6 +179,75 @@ def ensure_memlock():
 # XPF_UBUNTU_AUTODISCOVER=1 opts back into mirror-latest discovery.
 PINNED_BASE_RELEASE = "26.04"
 
+# #4904 B — supply-chain trust anchor for the Ubuntu base image. The image AND
+# its SHA256SUMS are fetched from the SAME configurable mirror endpoint
+# (base_url), so a same-endpoint checksum authenticates nothing against a
+# compromised/custom mirror or a TLS/DNS/CA compromise: the mirror can serve
+# matching malicious bytes+hash, and XPF would then sign the result with its
+# RELEASE key. The fix pins the expected base-image SHA256 in REVIEWED repo
+# metadata — a TRUST ANCHOR the mirror does not control — and verifies the
+# downloaded image against it (like the #1943 PINNED_BASE_RELEASE policy).
+#
+# Provenance of each pin: authored by fetching Canonical's SHA256SUMS +
+# SHA256SUMS.gpg from cloud-images.ubuntu.com and verifying the detached GPG
+# signature against Canonical's UEC Image Automatic Signing Key
+# (fingerprint D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81) — NOT trusting the
+# checksum on its own. A Canonical respin (new point image) changes the digest;
+# bumping the pin is then a DELIBERATE, REVIEWED commit (re-verify the GPG
+# signature first), exactly like a PINNED_BASE_RELEASE bump. Keyed by the same
+# release string discover_base_release() returns.
+PINNED_BASE_SHA256 = {
+    # ubuntu-26.04-server-cloudimg-amd64.img — Canonical-GPG-verified
+    # (UEC signing key D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81).
+    "26.04": "3ee4f67f322abb2d1d1f0fffc957f7411404ad6635dd35b026c8ff05ac6e534c",
+}
+
+
+def resolve_base_pin(rel):
+    """Return the pinned base-image SHA256 (the trust anchor) for release `rel`,
+    or None if unpinned. XPF_BASE_SHA256 is a reviewed one-off override (e.g. a
+    point respin between reviewed PINNED_BASE_SHA256 bumps, or an
+    XPF_BASE_RELEASE override) and wins over the repo constant."""
+    env = os.environ.get("XPF_BASE_SHA256")
+    if env:
+        return env.strip().lower()
+    pin = PINNED_BASE_SHA256.get(rel)
+    return pin.strip().lower() if pin else None
+
+
+def authenticate_base_digest(rel, actual):
+    """#4904 B: authenticate the downloaded base image against the repo-pinned
+    digest (a trust anchor NOT under the mirror's control). Returns True when
+    the digest matched a pin (authenticated), False when the base is unpinned
+    but the operator explicitly allowed it (XPF_ALLOW_UNPINNED_BASE=1, a
+    non-publishable dev bake). Aborts (die -> non-zero) on a pin MISMATCH or on
+    an unpinned base without that explicit escape hatch — a same-endpoint
+    checksum is never a sufficient authenticator on its own."""
+    pin = resolve_base_pin(rel)
+    if pin:
+        if actual.strip().lower() != pin:
+            die(f"base image digest {actual} does NOT match the pinned digest "
+                f"{pin} for Ubuntu {rel} — the mirror served bytes a reviewed "
+                "trust anchor does not vouch for. Refusing to bake a signed "
+                "image from an unauthenticated base (a compromised/wrong mirror, "
+                "or a stale pin after a Canonical respin: re-verify Canonical's "
+                "GPG-signed SHA256SUMS and bump PINNED_BASE_SHA256 via a "
+                "reviewed commit).")
+        return True
+    if os.environ.get("XPF_ALLOW_UNPINNED_BASE") == "1":
+        print(f"WARNING: no pinned SHA256 for Ubuntu {rel} — the base image is "
+              "authenticated ONLY by a checksum from the SAME mirror endpoint, "
+              "which is NOT a trust anchor. This image is NOT publishable as a "
+              f"release. Add PINNED_BASE_SHA256[{rel!r}] (Canonical-GPG-verified) "
+              "via a reviewed commit to authenticate it.", file=sys.stderr)
+        return False
+    die(f"no pinned base-image SHA256 for Ubuntu {rel} (PINNED_BASE_SHA256 has "
+        "no entry and XPF_BASE_SHA256 is unset). The base would be authenticated "
+        "only by a checksum from the SAME mirror endpoint as the image — not a "
+        "trust anchor. Pin it (Canonical-GPG-verified) via a reviewed commit, "
+        "set XPF_BASE_SHA256=<digest>, or pass XPF_ALLOW_UNPINNED_BASE=1 for a "
+        "non-publishable dev bake.")
+
 
 def discover_base_release():
     if os.environ.get("XPF_BASE_RELEASE"):
@@ -231,8 +302,19 @@ def fetch_base(cache_dir, work_dir):
     if expected != actual:
         os.remove(cached)
         die("base image SHA256 mismatch (cache removed — re-run)")
-    info("base image checksum verified.")
-    return rel, base_url, img, cached, actual
+    # The same-endpoint SHA256SUMS above only catches transport corruption — it
+    # is fetched from the SAME mirror as the image, so it is NOT an authenticator
+    # against a malicious mirror. #4904 B: authenticate the bytes against the
+    # repo-pinned digest (a trust anchor the mirror does not control). A mismatch
+    # (or an unpinned base without XPF_ALLOW_UNPINNED_BASE=1) aborts BEFORE the
+    # image is ever customized/signed.
+    pinned = authenticate_base_digest(rel, actual)
+    if pinned:
+        info("base image checksum verified + matches the pinned digest "
+             "(trust anchor).")
+    else:
+        info("base image checksum verified (UNPINNED base — not publishable).")
+    return rel, base_url, img, cached, actual, pinned
 
 
 def virt_customize(work_qcow, xpf_deb):
@@ -475,7 +557,8 @@ def validation_gate_step(skip_validate, qcow_out, meta_out):
     Aborts the bake (via die(), exit non-zero) if the gate FAILS, so a
     validation failure stops BEFORE signing (#4017). --skip-validate
     downgrades to a loud warning and skips the gate — the resulting
-    artifacts are marked non-publishable.
+    artifacts are marked non-publishable by the signed `validated: false`
+    provenance field in the manifest (#4904 A), which publish.py refuses.
     """
     if skip_validate:
         print("WARNING: --skip-validate — artifacts have NOT passed the in-guest "
@@ -537,6 +620,38 @@ def finalize_artifacts(*, validate_step, sign_step):
     """
     validate_step()
     sign_step()
+
+
+def build_manifest_text(*, ver, commit, base_url, base_img, rel, base_sha,
+                        base_pinned, validated, bake_date, kernel,
+                        proto_lines=""):
+    """Assemble the xpf-<ver>.manifest sidecar text (key: value lines).
+
+    Pure + unit-testable so the supply-chain PROVENANCE fields are asserted
+    without a full bake:
+      - `validated` (#4904 A): true only when the in-guest verify-dataplane gate
+        runs (a --skip-validate bake binds false). The publish gate REQUIRES
+        validated: true, so a signed-but-unvalidated dev/emergency image is no
+        longer indistinguishable from a release.
+      - `base_image_pinned` (#4904 B): whether the Ubuntu base was authenticated
+        against the repo-pinned trust-anchor digest (bound alongside the base
+        digest + source URL already recorded here).
+
+    The sidecar is covered by the signed xpf-<ver>.SHA256SUMS (#5042), so these
+    fields are authenticated once the manifest signature verifies.
+    """
+    return (
+        f"version: {ver}\n"
+        f"git_commit: {commit}\n"
+        f"base_image: {base_url}/{base_img}\n"
+        f"base_release: {rel}\n"
+        f"base_image_sha256: {base_sha}\n"
+        f"base_image_pinned: {'true' if base_pinned else 'false'}\n"
+        f"validated: {'true' if validated else 'false'}\n"
+        f"bake_date: {bake_date}\n"
+        f"bake_host_kernel: {kernel}\n"
+        + proto_lines
+    )
 
 
 def main():
@@ -615,7 +730,8 @@ def main():
                   "(in-guest gate still enforces).", file=sys.stderr)
 
         # 2. base
-        rel, base_url, base_img, cached, base_sha = fetch_base(cache_dir, work)
+        rel, base_url, base_img, cached, base_sha, base_pinned = fetch_base(
+            cache_dir, work)
 
         # 3. resize
         disk = os.environ.get("XPF_IMAGE_DISK_SIZE", "8G")
@@ -715,12 +831,16 @@ def main():
 
         manifest = os.path.join(a.out, f"xpf-{ver}.manifest")
         with open(manifest, "w") as f:
-            f.write(f"version: {ver}\ngit_commit: {commit}\n"
-                    f"base_image: {base_url}/{base_img}\nbase_release: {rel}\n"
-                    f"base_image_sha256: {base_sha}\n"
-                    f"bake_date: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"bake_host_kernel: {os.uname().release}\n"
-                    + proto_lines)
+            # #4904 A+B: bind the validated-provenance flag and the base-image
+            # pin-provenance flag into the sidecar (covered by the signed
+            # SHA256SUMS below). A --skip-validate bake records validated:false,
+            # which publish.py's fail-closed gate refuses.
+            f.write(build_manifest_text(
+                ver=ver, commit=commit, base_url=base_url, base_img=base_img,
+                rel=rel, base_sha=base_sha, base_pinned=base_pinned,
+                validated=not a.skip_validate,
+                bake_date=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                kernel=os.uname().release, proto_lines=proto_lines))
         info(f"manifest: {manifest}")
 
         # Per-version, version-named checksum manifest (#1924 §5.1): each bake

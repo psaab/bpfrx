@@ -51,9 +51,16 @@ META="$OUT/xpf-$VER.incus-metadata.tar.gz"
 head -c 4096 /dev/urandom > "$QCOW"
 head -c 1024 /dev/urandom > "$META"
 MANIFEST="$OUT/xpf-$VER.SHA256SUMS"
+# #4904 A: the signed provenance sidecar (xpf-<ver>.manifest). Real bakes bind
+# `validated: true|false` here and cover it with the signed SHA256SUMS (#5042);
+# publish.py's gate_provenance REQUIRES validated: true. Model that in the
+# baseline signed set so the positive publish cases below exercise the real
+# shape (validated:false is exercised as a negative in section 8i).
+SIDECAR="$OUT/xpf-$VER.manifest"
+printf 'version: %s\nbase_image_pinned: true\nvalidated: true\n' "$VER" > "$SIDECAR"
 XPF_IMAGE_PUBKEY="$WORK/img.pub" \
   $PY "$DIST/sign.py" sign-manifest --manifest "$MANIFEST" \
-      --seckey "$WORK/img.sec" --comment "selftest" "$QCOW" "$META" >/dev/null
+      --seckey "$WORK/img.sec" --comment "selftest" "$QCOW" "$META" "$SIDECAR" >/dev/null
 [ -f "$MANIFEST.minisig" ] && ok "manifest signed" || bad "manifest not signed"
 
 verify() {  # verify <file> with pubkey; prints OK/err, returns rc
@@ -200,7 +207,7 @@ fi
 
 # Orphan image artifact NOT covered by any manifest (Codex-r2-1).
 PGO="$WORK/pgorphan"; mkdir -p "$PGO"
-cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$PGO/"
+cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$PGO/"
 head -c 64 /dev/urandom > "$PGO/xpf-9.9.9.qcow2"   # orphan, no manifest covers it
 if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
      --dist "$PGO" --channel stable --no-apt >/dev/null 2>&1; then
@@ -211,7 +218,7 @@ fi
 
 # Symlink under the image publish root (Codex-r4).
 PGS="$WORK/pgsym"; mkdir -p "$PGS"
-cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$PGS/"
+cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$PGS/"
 ln -s /etc/passwd "$PGS/sneaky.qcow2"
 if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
      --dist "$PGS" --channel stable --no-apt >/dev/null 2>&1; then
@@ -390,7 +397,7 @@ fi
 # ── 8. publish gate: install.sh mandatory + stamped + signed ────────────────
 info "8. publish gate — install.sh mandatory, stamped, signed"
 GD="$WORK/gate"; mkdir -p "$GD"
-cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$GD/"
+cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$GD/"
 XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
     --channel stable --version "$VER" --dist "$GD" >/dev/null 2>&1
 # 8a. install.sh MISSING -> refuse (mandatory).
@@ -451,7 +458,7 @@ fi
 # ── 8g. HB165 H-5: default-deny sweep refuses a stray non-image file ────────
 info "8g. publish default-deny sweep refuses a stray file under dist/ (HB165 H-5)"
 GOOD="$WORK/hb165"; mkdir -p "$GOOD"
-cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$GOOD/"
+cp "$QCOW" "$META" "$SIDECAR" "$MANIFEST" "$MANIFEST.minisig" "$GOOD/"
 XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
     --channel stable --version "$VER" --dist "$GOOD" >/dev/null 2>&1
 $PY "$DIST/publish.py" stamp-installer --out "$GOOD/install.sh" \
@@ -500,6 +507,45 @@ if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
     ok "publish passes when the edge latest.json is properly signed (H-13)"
 else
     bad "publish MUST pass a signed edge latest.json but FAILED (H-13)"
+fi
+
+# ── 8i. #4904 A: publish REFUSES a --skip-validate (validated:false) image ──
+info "8i. publish provenance gate — validated:false is refused"
+PROV="$WORK/prov"; mkdir -p "$PROV"
+cp "$QCOW" "$META" "$PROV/"
+# A signed image set that is byte-shape-identical to a release but whose signed
+# provenance sidecar says validated:false (a --skip-validate bake).
+printf 'version: %s\nbase_image_pinned: true\nvalidated: false\n' "$VER" \
+    > "$PROV/xpf-$VER.manifest"
+XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/sign.py" sign-manifest \
+    --manifest "$PROV/xpf-$VER.SHA256SUMS" --seckey "$WORK/img.sec" \
+    --comment "selftest-skipvalidate" "$PROV/xpf-$VER.qcow2" \
+    "$PROV/xpf-$VER.incus-metadata.tar.gz" "$PROV/xpf-$VER.manifest" >/dev/null
+XPF_SIGN_SECKEY="$WORK/img.sec" $PY "$DIST/publish.py" make-latest \
+    --channel stable --version "$VER" --dist "$PROV" >/dev/null 2>&1
+$PY "$DIST/publish.py" stamp-installer --out "$PROV/install.sh" \
+    --archive-key "$AKEY" --apt-base-url "https://dl.selftest.invalid/apt" \
+    --channel stable >/dev/null 2>&1
+minisign -S -W -s "$WORK/img.sec" -m "$PROV/install.sh" \
+    -x "$PROV/install.sh.minisig" >/dev/null 2>&1
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$PROV" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse a validated:false image but PASSED (#4904 A)"
+else
+    ok "publish refuses a validated:false (--skip-validate) image (#4904 A)"
+fi
+# Positive control: flip validated -> true, re-sign the same set -> PASSES.
+printf 'version: %s\nbase_image_pinned: true\nvalidated: true\n' "$VER" \
+    > "$PROV/xpf-$VER.manifest"
+XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/sign.py" sign-manifest \
+    --manifest "$PROV/xpf-$VER.SHA256SUMS" --seckey "$WORK/img.sec" \
+    --comment "selftest-validated" "$PROV/xpf-$VER.qcow2" \
+    "$PROV/xpf-$VER.incus-metadata.tar.gz" "$PROV/xpf-$VER.manifest" >/dev/null
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$PROV" --channel stable --no-apt >/dev/null 2>&1; then
+    ok "publish passes the same set once validated:true (#4904 A control)"
+else
+    bad "publish MUST pass a validated:true image but FAILED (#4904 A control)"
 fi
 
 # ── 9. install.sh H-16: validate-before-mutate + cleanup-on-failure ─────────
