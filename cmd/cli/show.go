@@ -49,35 +49,17 @@ func (c *ctl) handleShow(args []string) error {
 						return c.showText("chassis-cluster-information")
 					case "statistics":
 						return c.showText("chassis-cluster-statistics")
-					case "control-plane":
-						if len(args) >= 4 && args[3] == "statistics" {
-							return c.showText("chassis-cluster-control-plane-statistics")
+					case "control-plane", "data-plane", "ip-monitoring", "fabric":
+						// #5459: an UNRECOGNIZED sub-arg must surface a
+						// usage error, not silently render the default
+						// view (mirrors the strict #1827 `show services
+						// ip-monitoring` handler). A bare subsystem with
+						// no sub-arg keeps its historical default view.
+						topic, filter, err := clusterSubsystemView(args[2], args[3:])
+						if err != nil {
+							return err
 						}
-						return c.showText("chassis-cluster-control-plane-statistics")
-					case "data-plane":
-						if len(args) >= 4 {
-							switch args[3] {
-							case "statistics":
-								return c.showText("chassis-cluster-data-plane-statistics")
-							case "interfaces":
-								return c.showText("chassis-cluster-data-plane-interfaces")
-							case "fairness":
-								return c.showText("chassis-cluster-data-plane-fairness")
-							case "flows":
-								return c.showTextFiltered("chassis-cluster-data-plane-flows", strings.Join(args[4:], " "))
-							}
-						}
-						return c.showText("chassis-cluster-data-plane-statistics")
-					case "ip-monitoring":
-						if len(args) >= 4 && args[3] == "status" {
-							return c.showText("chassis-cluster-ip-monitoring-status")
-						}
-						return c.showText("chassis-cluster-ip-monitoring-status")
-					case "fabric":
-						if len(args) >= 4 && args[3] == "statistics" {
-							return c.showText("chassis-cluster-fabric-statistics")
-						}
-						return c.showText("chassis-cluster-fabric-statistics")
+						return c.showTextFiltered(topic, filter)
 					}
 				}
 				return c.showText("chassis-cluster")
@@ -455,6 +437,56 @@ func (c *ctl) handleConfigShow(args []string) error {
 	}
 	fmt.Print(resp.Output)
 	return nil
+}
+
+// clusterSubsystemView maps a `show chassis cluster <sub> [arg ...]` request to
+// the text-proxy topic (and optional filter) to render. sub is the subsystem
+// token (args[2]); rest is everything after it (args[3:]).
+//
+// #5459 (typo suppression): historically each subsystem case fell back to its
+// default view for ANY value of rest[0], so an operator typo like
+// `show chassis cluster control-plane foobaz` rendered control-plane statistics
+// and exited 0. This mirrors the strict #1827 `show services ip-monitoring`
+// handler instead: a bare subsystem (len(rest)==0) keeps its historical default
+// view, but a present-but-unrecognized token returns a usage error naming the
+// valid subcommands. The recognized paths render exactly the same topic/filter
+// as before. An empty filter is equivalent to showText (showText delegates to
+// showTextFiltered with "").
+func clusterSubsystemView(sub string, rest []string) (topic, filter string, err error) {
+	switch sub {
+	case "control-plane":
+		if len(rest) > 0 && rest[0] != "statistics" {
+			return "", "", fmt.Errorf("unknown control-plane target: %s (expected `statistics`)", rest[0])
+		}
+		return "chassis-cluster-control-plane-statistics", "", nil
+	case "data-plane":
+		if len(rest) > 0 {
+			switch rest[0] {
+			case "statistics":
+				return "chassis-cluster-data-plane-statistics", "", nil
+			case "interfaces":
+				return "chassis-cluster-data-plane-interfaces", "", nil
+			case "fairness":
+				return "chassis-cluster-data-plane-fairness", "", nil
+			case "flows":
+				return "chassis-cluster-data-plane-flows", strings.Join(rest[1:], " "), nil
+			default:
+				return "", "", fmt.Errorf("unknown data-plane target: %s (expected `statistics`, `interfaces`, `fairness`, or `flows`)", rest[0])
+			}
+		}
+		return "chassis-cluster-data-plane-statistics", "", nil
+	case "ip-monitoring":
+		if len(rest) > 0 && rest[0] != "status" {
+			return "", "", fmt.Errorf("unknown ip-monitoring target: %s (expected `status`)", rest[0])
+		}
+		return "chassis-cluster-ip-monitoring-status", "", nil
+	case "fabric":
+		if len(rest) > 0 && rest[0] != "statistics" {
+			return "", "", fmt.Errorf("unknown fabric target: %s (expected `statistics`)", rest[0])
+		}
+		return "chassis-cluster-fabric-statistics", "", nil
+	}
+	return "", "", fmt.Errorf("unknown cluster subsystem: %s", sub)
 }
 
 func (c *ctl) showText(topic string) error {
