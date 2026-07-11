@@ -807,6 +807,23 @@ type NATPool struct {
 	PortRaw  string `json:"-"`
 	PortLow  int    // source pool port range low (default 1024)
 	PortHigh int    // source pool port range high (default 65535)
+	// PortRangeInvalidSpec records that an explicit source-pool `port [range]`
+	// leaf was configured but its value violated the port invariant — a
+	// non-canonical token, an endpoint outside 1..65535 (0 included), or a
+	// reversed low>high range (#5457). parseSourcePoolPortRange fails closed
+	// (ok=false) on such input, so the bad value is NEVER stamped into
+	// PortLow/PortHigh (they keep the 1024/65535 default); this field preserves
+	// the raw offending spec so validateSourceNATPoolStrict hard-rejects at
+	// commit (operator-visible) and the snapshot builder (sourceNATPoolPortRange)
+	// marks the pool unusable on the tolerant load / peer-sync path — never
+	// silently installing the defaulted range the operator did not ask for.
+	// Before #5457 the endpoints were parsed with strconv.Atoi and stamped
+	// verbatim: a non-zero out-of-range/reversed range was caught downstream, but
+	// a 0-valued endpoint slipped through as the "unconfigured" sentinel and
+	// silently widened to the default PAT range. "" means no port leaf, or a
+	// valid range. `json:"-"`: a compile-time parse artifact recomputed on every
+	// compile, never serialized to the helper (like PortRaw above).
+	PortRangeInvalidSpec string `json:"-"`
 	// PortNoTranslation records the source-pool `port no-translation` modifier
 	// (#3906). When true the pool translates the source ADDRESS but PRESERVES
 	// the original source port (Junos 1:1 source-port behaviour) — the

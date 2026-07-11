@@ -488,6 +488,14 @@ func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
 	if pool == nil {
 		return 0, 0, false
 	}
+	// #5457: an explicitly-configured but invalid port range (rejected by
+	// parseSourcePoolPortRange; PortLow/PortHigh left at the default) must NOT
+	// silently install the defaulted 1024-65535 range on the tolerant load /
+	// peer-sync path. Mark the pool unusable so it installs nothing rather than
+	// translating over a range the operator did not configure.
+	if pool.PortRangeInvalidSpec != "" {
+		return 0, 0, false
+	}
 	low := pool.PortLow
 	if low == 0 {
 		low = 1024

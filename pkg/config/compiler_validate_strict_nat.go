@@ -527,6 +527,14 @@ func validateDNATPoolStrict(cfg *Config) error {
 // preserves the source port and ignores the range entirely, so its (defaulted)
 // range is not an error.
 //
+// #5457: parseSourcePoolPortRange now FAILS CLOSED on a non-canonical token, an
+// endpoint outside 1..65535 (0 included), or a reversed range — it leaves
+// PortLow/PortHigh at the default and records the raw spec in
+// PortRangeInvalidSpec. That marker (checked first below) is the primary reject
+// signal; the stamped low/high checks remain as a backstop. This closes the
+// pre-#5457 residual where a 0-valued endpoint escaped as the "unconfigured"
+// sentinel and silently widened to the default PAT range.
+//
 // Strict on commit / commit-check (hard-reject so the bad value is operator-
 // visible); the compiler downgrades this to a warning on the tolerant load /
 // peer-sync path (#1960 no-brick) — the snapshot builder independently fails
@@ -549,9 +557,30 @@ func validateSourceNATPoolStrict(cfg *Config) error {
 		if pool == nil {
 			continue
 		}
+		// #5457: an explicit `port [range]` leaf whose value the parser rejected
+		// (a non-canonical token, an endpoint outside 1..65535 including 0, or a
+		// reversed range). parseSourcePoolPortRange failed closed and left
+		// PortLow/PortHigh at their default, recording the raw offending spec
+		// here — so this is the ONLY signal a bad range survives. Hard-reject
+		// (downgraded to a warning on the tolerant path) so the operator sees the
+		// bad value instead of the pool silently PAT-translating over the
+		// defaulted 1024-65535 range; the snapshot builder independently marks the
+		// pool unusable when this is set.
+		if pool.PortRangeInvalidSpec != "" {
+			return fmt.Errorf(
+				"source-nat pool %q: port range %q is invalid; source-pool ports "+
+					"must be 1-65535 and the range non-decreasing — the rule would "+
+					"commit but the dataplane marks the pool unusable and drops it at "+
+					"runtime, silently stopping translation",
+				name, pool.PortRangeInvalidSpec)
+		}
 		// Only validate an EXPLICITLY configured range. No `port` leaf leaves
 		// PortLow/PortHigh at 0 (defaulted to 1024/65535 downstream) — the
-		// legitimate default-PAT mode, untouched.
+		// legitimate default-PAT mode, untouched. These stamped-value checks are
+		// a belt-and-suspenders backstop: after #5457 parseSourcePoolPortRange
+		// never stamps an out-of-range/reversed value (it sets
+		// PortRangeInvalidSpec above instead), so they guard only a future path
+		// that writes PortLow/PortHigh directly.
 		low := pool.PortLow
 		high := pool.PortHigh
 		if low == 0 && high == 0 {
