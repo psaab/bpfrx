@@ -209,6 +209,23 @@ func isFsatomicTemp(name string) bool {
 //   - kea4/kea6 (/etc/kea/kea-dhcp{4,6}.conf): xpf owns these whole files, so
 //     they are removed outright.
 //
+// In ADDITION to the exact-path removals above, each rendered-config DIRECTORY
+// is swept for crash-leaked fsatomic write temps (".<base>.tmp-<rand>",
+// isFsatomicTemp), the rendered-config sibling of the #5475 configDir sweep
+// (#5509). frr.conf (frr.WriteFileDurable), the swanctl PSK snippet
+// (ipsec.WriteFileAtomic), and the Kea configs (dhcpserver.WriteFileAtomic) are
+// ALL written via pkg/fsatomic, which drops a ".<base>.tmp-<rand>" temp holding
+// the FULL cleartext render (BGP-MD5/OSPF/IS-IS routing-auth keys, IKE PSKs,
+// Kea credentials) before its atomic rename. A daemon hard-killed mid-write
+// leaves that temp behind; fsatomic self-heals a leaked temp on the NEXT write
+// to that base, but a factory reset + reboot means there is no next write, so
+// the temp — and its cleartext secrets — would otherwise SURVIVE the reset by
+// EXACT PATH (StripManagedSectionFile / os.Remove never touch the temp name).
+// The sweep covers ONLY the directories xpf writes these renders into
+// (dir(frrConf), dir(swanctlSnippet), dir(kea4/kea6) — deduplicated), matches
+// ONLY the narrow fsatomic temp shape, and treats an absent/unmanaged directory
+// as a no-op — it never reaches into unrelated system directories.
+//
 // WHY the wipe must erase these DIRECTLY rather than lean on the completing
 // reboot: a post-zeroize boot has NO committed config, so the daemon enters
 // #1922 bootstrap mode (or, on an HA node, a normal boot with a nil active
@@ -239,7 +256,47 @@ func zeroizeRenderedConfigs(frrConf, swanctlSnippet, kea4, kea6 string) error {
 	fail(os.Remove(swanctlSnippet))
 	fail(os.Remove(kea4))
 	fail(os.Remove(kea6))
+
+	// Sweep crash-leaked fsatomic write temps (#5509). The exact-path removals
+	// above miss a ".<base>.tmp-<rand>" temp a hard-killed daemon left mid-write
+	// — each temp still holds the full cleartext render. Sweep every directory
+	// xpf writes these renders into (deduplicated: kea4/kea6 share /etc/kea).
+	swept := make(map[string]bool)
+	for _, dir := range []string{
+		filepath.Dir(frrConf),
+		filepath.Dir(swanctlSnippet),
+		filepath.Dir(kea4),
+		filepath.Dir(kea6),
+	} {
+		if swept[dir] {
+			continue
+		}
+		swept[dir] = true
+		sweepFsatomicTemps(dir, fail)
+	}
 	return firstErr
+}
+
+// sweepFsatomicTemps removes crash-leaked fsatomic write temps
+// (".<base>.tmp-<rand>", isFsatomicTemp) from a single rendered-config directory
+// (#5509). It ReadDirs dir and os.Remove's only entries whose name matches the
+// narrow fsatomic temp shape, so a legitimate config file or unrelated dotfile
+// in the same directory is left untouched. An absent/unmanaged directory is a
+// clean no-op: ReadDir yields os.ErrNotExist, which fail() excludes, so a
+// directory the appliance does not run (no FRR / strongSwan / Kea installed)
+// never errors the whole zeroize. A real ReadDir error IS surfaced via fail so
+// a silently-incomplete sweep is not reported as a clean factory reset.
+func sweepFsatomicTemps(dir string, fail func(error)) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		fail(err)
+		return
+	}
+	for _, e := range entries {
+		if name := e.Name(); isFsatomicTemp(name) {
+			fail(os.Remove(filepath.Join(dir, name)))
+		}
+	}
 }
 
 // zeroize login-account teardown paths (#4598). These mirror the production
