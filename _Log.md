@@ -45644,3 +45644,13 @@ top.
 - **File(s)**: test/incus/step2-sched-switch-reduce.py,
   test/incus/step2-sched-switch-classify.py,
   test/incus/step2-sched-switch-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-070 — reducer main() HALTs (exit 2) on zero-event perf
+  (drift-halt still wins); classifier emits INSUFFICIENT (exit 2) on the
+  all-zero/all-WARN no-evidence shape instead of a definitive OUT exit 0.
+  Updated drift-warning test to a non-empty capture; added empty-perf +
+  insufficient-evidence tests.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-reduce_test.py,
+  test/incus/step2-sched-switch-classify.py,
+  test/incus/step2-sched-switch-classify_test.py

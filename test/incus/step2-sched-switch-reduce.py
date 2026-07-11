@@ -640,7 +640,17 @@ def main(argv: list[str] | None = None) -> int:
         print("HALT: --worker-tids produced empty set", file=sys.stderr)
         return 2
 
-    events = parse_perf_script(args.perf_script)
+    # C175-HC-070: count sched events as they stream so an empty or
+    # truncated perf capture (zero events) cannot be reduced to 12
+    # all-zero blocks and read downstream as a definitive scheduler OUT.
+    event_count = [0]
+
+    def _counting(gen):
+        for e in gen:
+            event_count[0] += 1
+            yield e
+
+    events = _counting(parse_perf_script(args.perf_script))
     reduce_events(
         events=events,
         boundaries_ns=boundaries_ns,
@@ -649,7 +659,21 @@ def main(argv: list[str] | None = None) -> int:
         mono_wall_offset_ns=args.mono_wall_offset_ns,
         suspect_reason=suspect_reason,
     )
-    return EXIT_DRIFT_HALT if drift_halt else 0
+    if drift_halt:
+        # Drift halt already emitted suspect-stamped forensics; its exit
+        # code takes precedence over the emptiness check.
+        return EXIT_DRIFT_HALT
+    if event_count[0] == 0:
+        print(
+            "HALT: perf script produced zero sched events "
+            f"({args.perf_script}); the capture is empty or truncated. "
+            "Refusing to certify a scheduler histogram from no data — a "
+            "definitive OUT here would rule the scheduler out from a "
+            "measurement that never happened.",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

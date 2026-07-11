@@ -258,6 +258,33 @@ class TestClassifyDutyWindow(unittest.TestCase):
         self.assertAlmostEqual(meta["duty_cycle_pct"], 100.0 * 0.6 / 60.0, places=4)
 
 
+class TestClassifyInsufficientEvidence(unittest.TestCase):
+    """C175-HC-070: no-evidence input is INSUFFICIENT, not a definitive OUT."""
+
+    def test_all_zero_blocks_are_insufficient_not_out(self):
+        # Mirror empty-reducer output: every bucket 0, every
+        # stat_runtime_check WARN. Fail-on-revert: the pre-fix classifier
+        # computed duty 0 < 1% -> OUT, exit 0.
+        off_times = [0] * 12
+        shape_vals = [0.0] * 12
+        hist = _hist_blocks_with_shape3to6(shape_vals)
+        off = _off_cpu_blocks(off_times, stat=["WARN"] * 12)
+        rc, meta = _run_classifier(hist, off)
+        self.assertEqual(rc, 2)
+        self.assertEqual(meta["verdict"], "INSUFFICIENT")
+
+    def test_legit_low_duty_with_runtime_passes_still_out(self):
+        # A real capture with some passing stat_runtime blocks and small
+        # off-CPU is a genuine OUT (not insufficient) and stays exit 0.
+        off_times = [1_000_000 for _ in range(12)]  # tiny but non-zero
+        shape_vals = [float(b + 1) for b in range(12)]
+        hist = _hist_blocks_with_shape3to6(shape_vals)
+        off = _off_cpu_blocks(off_times, stat=["PASS"] * 12)
+        rc, meta = _run_classifier(hist, off)
+        self.assertEqual(rc, 0)
+        self.assertEqual(meta["verdict"], "OUT")
+
+
 class TestClassifyMetaSchema(unittest.TestCase):
     def test_meta_json_schema(self):
         """LOW-5 R4: top-level keys are EXACTLY the plan §3.1 step 11

@@ -623,6 +623,54 @@ class TestReducerEmpty(unittest.TestCase):
             self.assertEqual(obj["stat_runtime_check"], "WARN")
 
 
+class TestReducerEmptyPerfHalts(unittest.TestCase):
+    """C175-HC-070: an empty/truncated perf capture must fail loud."""
+
+    def test_reducer_halts_on_empty_perf(self):
+        """main() returns non-zero when the perf script has zero events.
+
+        Fail-on-revert: the pre-fix main() always returned 0 (or 5 on
+        drift), so an empty capture emitted 12 all-zero blocks and exited
+        0 — the classifier then ruled the scheduler definitively OUT from
+        a measurement that never happened.
+        """
+        cold = {"_sample_ts": "1000000000"}
+        cold_path = _write_inline(json.dumps(cold), ".json")
+        warm_lines = [
+            json.dumps({"_sample_ts": str(1000000000 + (i + 1) * 5)})
+            for i in range(12)
+        ]
+        samples_path = _write_inline("\n".join(warm_lines) + "\n", ".jsonl")
+        perf_path = _write_inline("", ".txt")  # empty capture
+        step1_start_ns = 1_000_000_000 * 1_000_000_000
+        perf_start_ns = step1_start_ns  # zero drift -> not a drift halt
+
+        real_stderr = sys.stderr
+        real_stdout = sys.stdout
+        cap_err = io.StringIO()
+        cap_out = io.StringIO()
+        try:
+            sys.stderr = cap_err
+            sys.stdout = cap_out
+            rc = R.main(
+                [
+                    "--perf-script", str(perf_path),
+                    "--step1-cold", str(cold_path),
+                    "--step1-samples", str(samples_path),
+                    "--worker-tids", "1",
+                    "--perf-start-ns", str(perf_start_ns),
+                ]
+            )
+        finally:
+            sys.stderr = real_stderr
+            sys.stdout = real_stdout
+            cold_path.unlink()
+            samples_path.unlink()
+            perf_path.unlink()
+        self.assertEqual(rc, 2, f"expected exit 2 on empty perf, got {rc}")
+        self.assertIn("zero sched events", cap_err.getvalue())
+
+
 class TestReducerInvariant(unittest.TestCase):
     def test_reducer_invariant_sum_buckets_3to6(self):
         """V3: sum(buckets[3:7]) == off_cpu_time_3to6 on every block.
@@ -687,7 +735,14 @@ class TestReducerDrift(unittest.TestCase):
                 json.dumps({"_sample_ts": str(1000000000 + (i + 1) * 5)})
             )
         samples_path = _write_inline("\n".join(warm_lines) + "\n", ".jsonl")
-        perf_path = _write_inline("", ".txt")
+        # One valid sched event so the capture is non-empty (the empty
+        # capture path is exercised by test_reducer_halts_on_empty_perf).
+        perf_line = (
+            "xpf 1 [000] 1000000001.000000000: sched:sched_switch: "
+            "prev_comm=xpf prev_pid=1 prev_prio=120 prev_state=S ==> "
+            "next_comm=y next_pid=0 next_prio=120\n"
+        )
+        perf_path = _write_inline(perf_line, ".txt")
         step1_start_ns = 1_000_000_000 * 1_000_000_000
         perf_start_ns = step1_start_ns + 2_000_000_000  # +2 s
 

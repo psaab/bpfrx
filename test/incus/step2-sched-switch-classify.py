@@ -17,6 +17,11 @@ T3 verdict (per plan §3.3):
     rho <= 0.3  or   duty_cycle_pct <  1.0   -> OUT
     else                                     -> INCONCLUSIVE
 
+No-evidence guard (C175-HC-070): an empty/truncated perf capture reduces to
+12 all-zero blocks; that is classified INSUFFICIENT (exit 2), never a
+definitive OUT.  Exit status: INSUFFICIENT -> 2; IN/OUT/INCONCLUSIVE/SUSPECT
+-> 0.
+
 Writes:
     --out                                  markdown report
     <out>.meta.json (sibling)              machine-readable summary
@@ -306,6 +311,27 @@ def main(argv: list[str] | None = None) -> int:
 
     verdict, reason = verdict_from(rho, duty_cycle_pct, suspect_reason)
 
+    # C175-HC-070: an empty/truncated perf capture reduces to 12 all-zero
+    # blocks — every bucket 0 and every stat_runtime_check WARN (zero
+    # runtime vs a non-zero expected). Classifying that as a definitive
+    # OUT (duty 0 < 1%) rules the scheduler out from a measurement that
+    # never happened. Detect the no-evidence shape and emit INSUFFICIENT
+    # with a non-zero exit instead. A real capture always has either
+    # non-zero off-CPU buckets or at least one passing stat_runtime block.
+    no_off_cpu = all(
+        sum(int(x) for x in b.get("buckets", [])) == 0 for b in off_cpu_blocks
+    )
+    no_runtime = all(
+        b.get("stat_runtime_check") == "WARN" for b in off_cpu_blocks
+    )
+    if suspect_reason is None and no_off_cpu and no_runtime:
+        verdict = "INSUFFICIENT"
+        reason = (
+            "no scheduler evidence: all 12 blocks have zero off-CPU buckets "
+            "and no passing stat_runtime accounting — the perf capture was "
+            "empty or truncated; refusing a definitive OUT"
+        )
+
     voluntary_total = sum(int(b.get("voluntary_3to6", 0)) for b in off_cpu_blocks)
     involuntary_total = sum(
         int(b.get("involuntary_3to6", 0)) for b in off_cpu_blocks
@@ -377,7 +403,10 @@ def main(argv: list[str] | None = None) -> int:
         + (f" suspect_reason={suspect_reason}" if suspect_reason else ""),
         file=sys.stderr,
     )
-    return 0
+    # C175-HC-070: INSUFFICIENT (no measurement) must exit non-zero so a
+    # missing/truncated capture cannot pass as a definitive verdict. IN /
+    # OUT / INCONCLUSIVE / SUSPECT keep their historical exit-0 semantics.
+    return 2 if verdict == "INSUFFICIENT" else 0
 
 
 if __name__ == "__main__":
