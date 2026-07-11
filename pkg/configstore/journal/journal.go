@@ -109,6 +109,14 @@ const (
 // do NOT hold the configstore Store.mu, and without internal locking a
 // reader that opens the current segment while Log rotates it to ".1"
 // would read the same inode under both names and duplicate entries.
+//
+// Lock discipline (#4829): j.mu guards the SEGMENT STATE (rotation, the
+// current-file inode, the buffered append), NOT the per-write fsync.
+// Log holds j.mu only for rotation + open + the buffered f.Write, then
+// RELEASES it before the synchronous f.Sync/SyncDir. A concurrent Tail
+// takes the same j.mu, so it is still serialized against rotation (no
+// duplicate inode) and against the write itself (no torn read), but it
+// no longer blocks for the writer's fsync duration.
 type Journal struct {
 	mu              sync.Mutex
 	path            string
@@ -117,6 +125,11 @@ type Journal struct {
 	// migrated guards the one-time permission-repair pass (#5188) so it
 	// runs once on first use, under j.mu, and is a no-op thereafter.
 	migrated bool
+	// syncFile fsyncs a fully-written segment for durability. It is a
+	// field only so tests can inject a slow/blocking fsync and prove Tail
+	// does not stall behind it (#4829); production always uses
+	// (*os.File).Sync. Called with j.mu RELEASED.
+	syncFile func(*os.File) error
 }
 
 // Option configures a Journal.
@@ -142,6 +155,7 @@ func New(path string, opts ...Option) *Journal {
 		path:            path,
 		maxSegmentBytes: DefaultMaxSegmentBytes,
 		maxSegments:     DefaultMaxSegments,
+		syncFile:        (*os.File).Sync,
 	}
 	for _, o := range opts {
 		o(j)
@@ -220,12 +234,25 @@ func chmodOwnerOnly(path string) {
 // only audit record now that config payloads live in rollback storage,
 // and appends are operator-paced); segment creation and rotation get a
 // directory fsync so the namespace change survives power loss too.
+//
+// Lock discipline (#4829): j.mu is held ONLY for the segment-state
+// mutation — rotation, open, the torn-tail check, and the buffered
+// f.Write — inside appendLocked. The durability step (f.Sync and, on
+// create/rotate, SyncDir) runs with j.mu RELEASED, because fsync
+// provides durability, NOT visibility: the record's bytes are already in
+// the page cache once f.Write returns. A concurrent Tail takes the same
+// j.mu, so it observes the segment namespace either before appendLocked
+// acquires the lock or after it releases the lock — never mid-rotation
+// (no duplicate inode) and never mid-write (no torn read) — yet it no
+// longer stalls for the writer's fsync (hundreds of ms on a busy disk).
+// Durability is unchanged: Log returns success only after f.Sync (and,
+// when the namespace changed, SyncDir) succeed.
+//
+// Concurrent Log callers serialize on the fast in-lock write via
+// appendLocked, then fsync in parallel with j.mu released; O_APPEND makes
+// each write land atomically at EOF, and every writer fsyncs its own fd,
+// so durability holds regardless of interleaving.
 func (j *Journal) Log(entry *Entry) error {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	j.migratePermsLocked()
-
 	if entry.Timestamp.IsZero() {
 		entry.Timestamp = time.Now()
 	}
@@ -238,13 +265,51 @@ func (j *Journal) Log(entry *Entry) error {
 		return fmt.Errorf("marshal journal entry: %w", err)
 	}
 
-	rotated, err := j.maybeRotateLocked()
+	f, created, rotated, err := j.appendLocked(data)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	created := false
-	if _, err := os.Stat(j.path); os.IsNotExist(err) {
+	// Durability with j.mu RELEASED (see the method doc). Do NOT move
+	// these back under the lock: that reintroduces #4829, where a Tail
+	// reader blocks for the writer's entire fsync duration.
+	sync := j.syncFile
+	if sync == nil {
+		sync = (*os.File).Sync
+	}
+	if err := sync(f); err != nil {
+		return fmt.Errorf("sync journal: %w", err)
+	}
+	if created || rotated {
+		if err := fsatomic.SyncDir(filepath.Dir(j.path)); err != nil {
+			return fmt.Errorf("sync journal dir: %w", err)
+		}
+	}
+	return nil
+}
+
+// appendLocked runs the lock-held part of Log: the one-time permission
+// repair, rotation when the current segment is over threshold, opening
+// the current segment, the torn-tail self-heal, and the buffered write of
+// the newline-framed record. It returns the still-open file (the caller
+// fsyncs it with j.mu released) plus whether the segment was created or
+// rotated (both need a directory fsync). j.mu is held for the whole body,
+// so the buffered f.Write completes and is visible in the page cache
+// before the lock is released — any concurrent Tail that then acquires
+// j.mu sees a complete record, never a torn one.
+func (j *Journal) appendLocked(data []byte) (f *os.File, created, rotated bool, err error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	j.migratePermsLocked()
+
+	rotated, err = j.maybeRotateLocked()
+	if err != nil {
+		return nil, false, false, err
+	}
+
+	if _, statErr := os.Stat(j.path); os.IsNotExist(statErr) {
 		created = true
 	}
 
@@ -264,38 +329,30 @@ func (j *Journal) Log(entry *Entry) error {
 	// arg only applies when O_CREATE actually creates the file; on an
 	// EXISTING inode O_APPEND ignores it, so migratePermsLocked() above
 	// is what tightens an upgraded 0644 journal (#5188).
-	f, err := os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
+	f, err = os.OpenFile(j.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("open journal: %w", err)
+		return nil, false, false, fmt.Errorf("open journal: %w", err)
 	}
-	defer f.Close()
 
 	// Torn-tail self-heal: a crash between a previous write and its
 	// fsync can leave a partial final line. Starting this record on a
 	// fresh line confines the damage to that one record (which the
 	// tail reader's parse-or-skip rule already drops).
 	buf := make([]byte, 0, len(data)+2)
-	if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
+	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > 0 {
 		last := make([]byte, 1)
-		if _, err := f.ReadAt(last, fi.Size()-1); err == nil && last[0] != '\n' {
+		if _, readErr := f.ReadAt(last, fi.Size()-1); readErr == nil && last[0] != '\n' {
 			buf = append(buf, '\n')
 		}
 	}
 	buf = append(buf, data...)
 	buf = append(buf, '\n')
 
-	if _, err := f.Write(buf); err != nil {
-		return fmt.Errorf("write journal entry: %w", err)
+	if _, writeErr := f.Write(buf); writeErr != nil {
+		f.Close()
+		return nil, false, false, fmt.Errorf("write journal entry: %w", writeErr)
 	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("sync journal: %w", err)
-	}
-	if created || rotated {
-		if err := fsatomic.SyncDir(filepath.Dir(j.path)); err != nil {
-			return fmt.Errorf("sync journal dir: %w", err)
-		}
-	}
-	return nil
+	return f, created, rotated, nil
 }
 
 // maybeRotateLocked rotates the current segment when it is at or over
