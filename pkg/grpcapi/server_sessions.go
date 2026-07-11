@@ -1030,88 +1030,17 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 
 	var agg clearErrors
 
-	// Clear matching IPv4 sessions
-	v4Deleted := 0
-	var v4Keys []dataplane.SessionKey
-	var v4RevKeys []dataplane.SessionKey
-	var snatDNATKeys []dataplane.DNATKey
-	// Enumeration failure must be surfaced: a partial scan means the
-	// clear silently misses sessions the operator asked to remove.
-	agg.add("v4 iterate", s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-		if !filter.matchV4(key, val) {
-			return true
-		}
-		v4Keys = append(v4Keys, key)
-		// The reverse companion is installed keyed on val.ReverseKey
-		// (the TRANSLATED tuple for NAT'd sessions — session_store.go
-		// PutClusterSyncedV4 / manager_ha.go), NOT a naive src/dst swap
-		// of the forward key. For a non-NAT session the two coincide;
-		// for a NAT'd session a naive swap would leave the real reverse
-		// entry behind (#2733). A zero ReverseKey (Protocol==0) means no
-		// reverse companion was installed (the needsReverse gate).
-		if val.ReverseKey.Protocol != 0 {
-			v4RevKeys = append(v4RevKeys, val.ReverseKey)
-		}
-		if val.Flags&dataplane.SessFlagSNAT != 0 &&
-			val.Flags&dataplane.SessFlagStaticNAT == 0 {
-			// Companion dnat_table key must match the write-side encoding
-			// (#2406: host-order port) or the delete silently misses.
-			snatDNATKeys = append(snatDNATKeys, dataplane.DNATKeyForSessionV4(key, val))
-		}
-		return true
-	}))
-
-	for _, key := range v4Keys {
-		if err := s.dp.DeleteSession(key); err != nil {
-			agg.add("v4 forward delete", err)
-		} else {
-			v4Deleted++
-		}
-	}
-	for _, key := range v4RevKeys {
-		agg.addExceptNotFound("v4 reverse delete", s.dp.DeleteSession(key))
-	}
-	for _, dk := range snatDNATKeys {
-		agg.addExceptNotFound("v4 DNAT companion delete", s.dp.DeleteDNATEntry(dk))
-	}
-
-	// Clear matching IPv6 sessions
-	v6Deleted := 0
-	var v6Keys []dataplane.SessionKeyV6
-	var v6RevKeys []dataplane.SessionKeyV6
-	var snatDNATKeysV6 []dataplane.DNATKeyV6
-	agg.add("v6 iterate", s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if !filter.matchV6(key, val) {
-			return true
-		}
-		v6Keys = append(v6Keys, key)
-		// Reverse companion at the TRANSLATED tuple val.ReverseKey, not a
-		// naive swap (see V4 above, #2733). Zero ReverseKey => no companion.
-		if val.ReverseKey.Protocol != 0 {
-			v6RevKeys = append(v6RevKeys, val.ReverseKey)
-		}
-		if val.Flags&dataplane.SessFlagSNAT != 0 &&
-			val.Flags&dataplane.SessFlagStaticNAT == 0 {
-			// Companion dnat_table_v6 key must match the write-side encoding
-			// (#2406: host-order port) or the delete silently misses.
-			snatDNATKeysV6 = append(snatDNATKeysV6, dataplane.DNATKeyForSessionV6(key, val))
-		}
-		return true
-	}))
-
-	for _, key := range v6Keys {
-		if err := s.dp.DeleteSessionV6(key); err != nil {
-			agg.add("v6 forward delete", err)
-		} else {
-			v6Deleted++
-		}
-	}
-	for _, key := range v6RevKeys {
-		agg.addExceptNotFound("v6 reverse delete", s.dp.DeleteSessionV6(key))
-	}
-	for _, dk := range snatDNATKeysV6 {
-		agg.addExceptNotFound("v6 DNAT companion delete", s.dp.DeleteDNATEntryV6(dk))
-	}
+	// Clear matching IPv4 + IPv6 sessions with a BOUNDED handler working set
+	// (#5454). The pre-#5454 path materialized EVERY matching forward key,
+	// reverse companion, and DNAT companion into unbounded slices before the
+	// first delete — O(N) handler-goroutine allocation where N is up to the
+	// full (multi-million entry) session table. ClearSessions is fabric-
+	// reachable (fabricAllowedUnaryMethods), so a PSK-holding peer could
+	// trigger a broad filtered clear that retained hundreds of MB and stalled
+	// the control-plane GC / OOM-killed the daemon. The helpers below hold at
+	// most O(clearFilteredBatch) keys regardless of how many sessions match.
+	v4Deleted := s.clearFilteredSessionsV4(ctx, filter, &agg)
+	v6Deleted := s.clearFilteredSessionsV6(ctx, filter, &agg)
 
 	if !forwarded {
 		agg.add("peer clear", s.clearPeerSessions(req))
@@ -1122,6 +1051,330 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	}
 	agg.apply(resp)
 	return resp, nil
+}
+
+// clearFilteredBatch bounds the number of matching session keys the filtered
+// ClearSessions path holds in the handler goroutine at once (#5454). The
+// session table can hold millions of entries; the pre-#5454 path collected
+// every match (forward + reverse + DNAT keys) before deleting, an O(matches)
+// allocation a fabric-reachable caller could weaponize. Collection now stops at
+// this many forward keys, deletes that chunk, and resumes, so peak key-slice
+// memory is O(clearFilteredBatch), not O(matches). It is a var (not const) so a
+// test can shrink it to exercise the multi-chunk path with a small table.
+var clearFilteredBatch = 1024
+
+// clearFilteredBatchObserver, when non-nil, is invoked once per collected key
+// chunk with len(chunk) (the forward-key count). It is a test-only seam that
+// lets a unit test assert the filtered clear collects keys in bounded chunks
+// instead of one N-sized slice (#5454). A revert to the collect-all-then-delete
+// path reports a single len==matches chunk, so the bounded-working-set
+// assertion goes RED. Production leaves it nil.
+var clearFilteredBatchObserver func(chunkLen int)
+
+// clearBatchV4 accumulates one bounded chunk of matching v4 session keys plus
+// each matched session's reverse and DNAT companion keys, then deletes them.
+type clearBatchV4 struct {
+	fwd  []dataplane.SessionKey
+	rev  []dataplane.SessionKey
+	dnat []dataplane.DNATKey
+}
+
+func (b *clearBatchV4) reset() {
+	b.fwd = b.fwd[:0]
+	b.rev = b.rev[:0]
+	b.dnat = b.dnat[:0]
+}
+
+// collect appends a matched session's forward key plus its reverse and DNAT
+// companions, mirroring the exact key construction the pre-#5454 inline path
+// used: the reverse companion is keyed on the TRANSLATED tuple val.ReverseKey
+// (NOT a naive src/dst swap — #2733), skipped when ReverseKey.Protocol == 0
+// (no companion installed); the DNAT companion key uses the write-side host-
+// order encoding (#2406) and only for dynamic (non-static) SNAT sessions.
+// Returns true once the forward chunk has reached clearFilteredBatch.
+func (b *clearBatchV4) collect(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	b.fwd = append(b.fwd, key)
+	if val.ReverseKey.Protocol != 0 {
+		b.rev = append(b.rev, val.ReverseKey)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 &&
+		val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		b.dnat = append(b.dnat, dataplane.DNATKeyForSessionV4(key, val))
+	}
+	return len(b.fwd) >= clearFilteredBatch
+}
+
+// deleteAll deletes the collected forward keys (counting successes), reverse
+// companions, and DNAT companions, aggregating failures exactly as the
+// pre-#5454 inline path did (a benign ErrKeyNotExist on the computed reverse /
+// DNAT companion of a NAT'd session is not a failure — #2468). Returns the
+// number of forward sessions successfully deleted.
+func (b *clearBatchV4) deleteAll(s *Server, agg *clearErrors) int {
+	deleted := 0
+	for _, key := range b.fwd {
+		if err := s.dp.DeleteSession(key); err != nil {
+			agg.add("v4 forward delete", err)
+		} else {
+			deleted++
+		}
+	}
+	for _, key := range b.rev {
+		agg.addExceptNotFound("v4 reverse delete", s.dp.DeleteSession(key))
+	}
+	for _, dk := range b.dnat {
+		agg.addExceptNotFound("v4 DNAT companion delete", s.dp.DeleteDNATEntry(dk))
+	}
+	return deleted
+}
+
+// clearFilteredSessionsV4 deletes every v4 session matching filter, plus each
+// matched session's reverse and DNAT companion, while holding at most
+// O(clearFilteredBatch) keys in the handler goroutine (#5454). It returns the
+// number of forward sessions deleted and records sub-operation failures on agg.
+//
+// Iterate-delete safety: the session table is a cilium/ebpf HASH map. Deleting
+// the just-returned key from inside a live Map.Iterate() is UNSAFE — the next
+// BPF_MAP_GET_NEXT_KEY on the now-absent key restarts iteration from the first
+// bucket (kernel htab_map_get_next_key), so the iterator can repeat keys, skip
+// keys, or abort with ErrIterationAborted (see cilium/ebpf MapIterator.Next).
+// We therefore never delete during a live iterate: we collect a bounded chunk
+// of matching keys and delete it only AFTER the iterate call returns.
+//
+// To keep the whole clear a single O(N) forward pass — rather than the O(N^2)
+// a per-chunk fresh re-scan would cost when a filter matches a large fraction
+// of a multi-million-entry table, which would trade the memory DoS for a CPU-
+// stall DoS able to starve the HA watchdog (#4719) — we resume via
+// IterateSessionsFrom from a LIVE anchor: the last key of the previous chunk is
+// deliberately left undeleted so the cursor anchored on it stays valid, and it
+// is deleted one round later once the cursor has advanced past it. A dataplane
+// without cursor iteration (test/edge only — production's LegacyDataPlaneAdapter
+// always implements it, compile-asserted in pkg/dataplane/userspace) falls back
+// to a bounded fresh-rescan.
+func (s *Server) clearFilteredSessionsV4(ctx context.Context, filter *sessionFilter, agg *clearErrors) int {
+	iterDP, ok := s.dp.(sessionCursorIterator)
+	if !ok {
+		return s.clearFilteredSessionsV4Rescan(ctx, filter, agg)
+	}
+	deleted := 0
+	var a, b clearBatchV4
+	cur, prev := &a, &b
+	prevValid := false // prev holds the previous chunk, deferred for delete
+	var cursor *dataplane.SessionKey
+	for {
+		if ctx.Err() != nil {
+			if prevValid {
+				deleted += prev.deleteAll(s, agg)
+			}
+			agg.add("v4 clear canceled", ctx.Err())
+			return deleted
+		}
+		cur.reset()
+		examined := 0
+		canceled := false
+		iterErr := iterDP.IterateSessionsFrom(cursor, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			examined++
+			if examined&0x3ff == 0 && ctx.Err() != nil {
+				canceled = true
+				return false // long non-matching run: stop promptly on cancel
+			}
+			if !filter.matchV4(key, val) {
+				return true
+			}
+			return !cur.collect(key, val) // stop once the chunk is full
+		})
+		agg.add("v4 iterate", iterErr)
+		if clearFilteredBatchObserver != nil {
+			clearFilteredBatchObserver(len(cur.fwd))
+		}
+		// The previous chunk's anchor stayed live through this iterate (we
+		// resumed from it), so it is safe to delete now that the call returned.
+		if prevValid {
+			deleted += prev.deleteAll(s, agg)
+			prevValid = false
+		}
+		full := len(cur.fwd) >= clearFilteredBatch && iterErr == nil && !canceled
+		if !full {
+			deleted += cur.deleteAll(s, agg)
+			if canceled {
+				agg.add("v4 clear canceled", ctx.Err())
+			}
+			return deleted
+		}
+		// Carry this chunk (including its last key, the anchor) to the next
+		// round; resume from the anchor, left undeleted so the cursor stays
+		// valid. Ping-pong the two buffers so peak memory is O(chunk).
+		anchor := cur.fwd[len(cur.fwd)-1]
+		cursor = &anchor
+		cur, prev = prev, cur
+		prevValid = true
+	}
+}
+
+// clearFilteredSessionsV4Rescan is the bounded fallback for a dataplane that
+// does not implement cursor iteration (test/edge only). It collects up to
+// clearFilteredBatch matching keys via a fresh full iterate (stopping before
+// any delete, so no delete-during-iterate), deletes that chunk, then re-scans:
+// because every collected key was deleted, a fresh scan returns the next chunk,
+// so the loop converges while holding only O(chunk) keys.
+func (s *Server) clearFilteredSessionsV4Rescan(ctx context.Context, filter *sessionFilter, agg *clearErrors) int {
+	deleted := 0
+	var b clearBatchV4
+	for {
+		if ctx.Err() != nil {
+			agg.add("v4 clear canceled", ctx.Err())
+			return deleted
+		}
+		b.reset()
+		iterErr := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if !filter.matchV4(key, val) {
+				return true
+			}
+			return !b.collect(key, val)
+		})
+		agg.add("v4 iterate", iterErr)
+		if clearFilteredBatchObserver != nil {
+			clearFilteredBatchObserver(len(b.fwd))
+		}
+		if len(b.fwd) == 0 {
+			return deleted
+		}
+		deleted += b.deleteAll(s, agg)
+		// A short chunk (or an iterate error) means the scan reached the end.
+		if len(b.fwd) < clearFilteredBatch || iterErr != nil {
+			return deleted
+		}
+	}
+}
+
+// clearBatchV6 is the IPv6 analogue of clearBatchV4.
+type clearBatchV6 struct {
+	fwd  []dataplane.SessionKeyV6
+	rev  []dataplane.SessionKeyV6
+	dnat []dataplane.DNATKeyV6
+}
+
+func (b *clearBatchV6) reset() {
+	b.fwd = b.fwd[:0]
+	b.rev = b.rev[:0]
+	b.dnat = b.dnat[:0]
+}
+
+func (b *clearBatchV6) collect(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	b.fwd = append(b.fwd, key)
+	if val.ReverseKey.Protocol != 0 {
+		b.rev = append(b.rev, val.ReverseKey)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 &&
+		val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		b.dnat = append(b.dnat, dataplane.DNATKeyForSessionV6(key, val))
+	}
+	return len(b.fwd) >= clearFilteredBatch
+}
+
+func (b *clearBatchV6) deleteAll(s *Server, agg *clearErrors) int {
+	deleted := 0
+	for _, key := range b.fwd {
+		if err := s.dp.DeleteSessionV6(key); err != nil {
+			agg.add("v6 forward delete", err)
+		} else {
+			deleted++
+		}
+	}
+	for _, key := range b.rev {
+		agg.addExceptNotFound("v6 reverse delete", s.dp.DeleteSessionV6(key))
+	}
+	for _, dk := range b.dnat {
+		agg.addExceptNotFound("v6 DNAT companion delete", s.dp.DeleteDNATEntryV6(dk))
+	}
+	return deleted
+}
+
+// clearFilteredSessionsV6 is the IPv6 analogue of clearFilteredSessionsV4; see
+// that function for the iterate-delete-safety and bounded-cursor rationale.
+func (s *Server) clearFilteredSessionsV6(ctx context.Context, filter *sessionFilter, agg *clearErrors) int {
+	iterDP, ok := s.dp.(sessionCursorIterator)
+	if !ok {
+		return s.clearFilteredSessionsV6Rescan(ctx, filter, agg)
+	}
+	deleted := 0
+	var a, b clearBatchV6
+	cur, prev := &a, &b
+	prevValid := false
+	var cursor *dataplane.SessionKeyV6
+	for {
+		if ctx.Err() != nil {
+			if prevValid {
+				deleted += prev.deleteAll(s, agg)
+			}
+			agg.add("v6 clear canceled", ctx.Err())
+			return deleted
+		}
+		cur.reset()
+		examined := 0
+		canceled := false
+		iterErr := iterDP.IterateSessionsV6From(cursor, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			examined++
+			if examined&0x3ff == 0 && ctx.Err() != nil {
+				canceled = true
+				return false
+			}
+			if !filter.matchV6(key, val) {
+				return true
+			}
+			return !cur.collect(key, val)
+		})
+		agg.add("v6 iterate", iterErr)
+		if clearFilteredBatchObserver != nil {
+			clearFilteredBatchObserver(len(cur.fwd))
+		}
+		if prevValid {
+			deleted += prev.deleteAll(s, agg)
+			prevValid = false
+		}
+		full := len(cur.fwd) >= clearFilteredBatch && iterErr == nil && !canceled
+		if !full {
+			deleted += cur.deleteAll(s, agg)
+			if canceled {
+				agg.add("v6 clear canceled", ctx.Err())
+			}
+			return deleted
+		}
+		anchor := cur.fwd[len(cur.fwd)-1]
+		cursor = &anchor
+		cur, prev = prev, cur
+		prevValid = true
+	}
+}
+
+// clearFilteredSessionsV6Rescan is the bounded fallback analogue of
+// clearFilteredSessionsV4Rescan.
+func (s *Server) clearFilteredSessionsV6Rescan(ctx context.Context, filter *sessionFilter, agg *clearErrors) int {
+	deleted := 0
+	var b clearBatchV6
+	for {
+		if ctx.Err() != nil {
+			agg.add("v6 clear canceled", ctx.Err())
+			return deleted
+		}
+		b.reset()
+		iterErr := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if !filter.matchV6(key, val) {
+				return true
+			}
+			return !b.collect(key, val)
+		})
+		agg.add("v6 iterate", iterErr)
+		if clearFilteredBatchObserver != nil {
+			clearFilteredBatchObserver(len(b.fwd))
+		}
+		if len(b.fwd) == 0 {
+			return deleted
+		}
+		deleted += b.deleteAll(s, agg)
+		if len(b.fwd) < clearFilteredBatch || iterErr != nil {
+			return deleted
+		}
+	}
 }
 
 // clearPeerSessions forwards a ClearSessions request to the cluster peer.
