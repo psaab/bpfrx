@@ -1457,26 +1457,51 @@ func validateFilterTerminalConflictStrict(cfg *Config) error {
 				continue
 			}
 			for _, term := range filter.Terms {
-				if term == nil || len(term.TerminalActions) < 2 {
+				if term == nil {
 					continue
 				}
-				// Collect distinct terminals in first-seen order so the error
-				// is stable and reads in the order the operator wrote them.
-				seen := make(map[string]bool, len(term.TerminalActions))
-				distinct := make([]string, 0, len(term.TerminalActions))
-				for _, a := range term.TerminalActions {
-					if !seen[a] {
-						seen[a] = true
-						distinct = append(distinct, a)
+				// #4375: reject MORE THAN ONE distinct terminating action.
+				if len(term.TerminalActions) >= 2 {
+					// Collect distinct terminals in first-seen order so the
+					// error is stable and reads in the order the operator
+					// wrote them.
+					seen := make(map[string]bool, len(term.TerminalActions))
+					distinct := make([]string, 0, len(term.TerminalActions))
+					for _, a := range term.TerminalActions {
+						if !seen[a] {
+							seen[a] = true
+							distinct = append(distinct, a)
+						}
+					}
+					if len(distinct) > 1 {
+						return fmt.Errorf(
+							"firewall family %s filter %q term %q: conflicting "+
+								"terminating actions %s — a term may have at most one "+
+								"terminating action (accept/reject/discard are mutually "+
+								"exclusive)",
+							family, name, term.Name, strings.Join(distinct, " and "))
 					}
 				}
-				if len(distinct) > 1 {
+				// #5142 (security, fail-CLOSED): a SINGLE terminating action
+				// (discard/reject/accept) co-located with `then next term` is a
+				// contradiction — the terminal must apply its action, but
+				// next-term asks to fall through. A fall-through bit must NEVER
+				// suppress a parsed terminal (vSRX filter semantics). Before
+				// #5142 the loop skipped every term with fewer than two
+				// terminals, so `then discard; then next term;` committed and
+				// (on the runtime) fell through, leaving the implicit Accept in
+				// place — the deny was silently dropped (fail-OPEN). Reject the
+				// contradiction here, naming the filter+term. A modifier-only
+				// next-term term (no terminating action) is a VALID fall-through
+				// (#2544/#3427) and is left untouched.
+				if term.NextTerm && len(term.TerminalActions) > 0 {
 					return fmt.Errorf(
-						"firewall family %s filter %q term %q: conflicting "+
-							"terminating actions %s — a term may have at most one "+
-							"terminating action (accept/reject/discard are mutually "+
-							"exclusive)",
-						family, name, term.Name, strings.Join(distinct, " and "))
+						"firewall family %s filter %q term %q: terminating "+
+							"action %q cannot be combined with `then next term` — "+
+							"a terminating action (accept/reject/discard) always "+
+							"terminates and must not fall through to the next term "+
+							"(remove one)",
+						family, name, term.Name, term.TerminalActions[0])
 				}
 			}
 		}

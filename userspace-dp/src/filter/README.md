@@ -128,6 +128,26 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   matched count term (the earlier fall-through count terms were silently
   under-counted on the cached path only).
 
+  **Terminal + next_term is fail-CLOSED (#5142, security).** A term with
+  a REAL terminating action (`discard`/`reject`/`accept`) MUST terminate
+  and apply that action — a `next_term` / fall-through bit must NEVER
+  suppress it (vSRX filter semantics). The Go commit gate
+  (`validateFilterTerminalConflictStrict`) now hard-rejects `then discard;
+  then next term;` (a single terminal co-located with next-term), so the
+  contradiction never reaches a snapshot through a commit. Belt-and-
+  suspenders, the Rust compiler computes `continue_term :=
+  snap.action.is_empty() && routing_instance.is_empty()` — a term FALLS
+  THROUGH only when it carries no terminating action, so even a
+  mixed-version peer-sync snapshot that sets `next_term` on a
+  discard/reject term still TERMINATES (applies the deny). Before #5142
+  the compiler read `(snap.next_term || snap.action.is_empty()) &&
+  routing_instance.is_empty()`, so a discard/reject term carrying
+  `next_term=true` fell through and left the `FilterResult::default()`
+  implicit Accept in place — the deny was silently dropped (fail-OPEN).
+  A modifier-only next-term term (empty action) still falls through, and
+  a routing-instance (PBR) term is unchanged. Distinct from #4375 (two
+  DISTINCT terminals) and #2544 (empty-action modifier-only next-term).
+
   The same accumulate-all-fall-through-terms contract applies to
   three-color policers via `CachedThreeColorPolicers`. Every matched
   fall-through term's `then policer` runtime is folded into the cached

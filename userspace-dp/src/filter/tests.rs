@@ -6830,6 +6830,197 @@ fn fallthrough_tx_selection_applies_forwarding_class_then_discards() {
 }
 
 // ---------------------------------------------------------------------------
+// #5142 (security, filter fail-open): a term carrying a REAL terminating action
+// (discard/reject/accept) AND next_term=true is a contradiction. The runtime
+// must FAIL CLOSED — the terminating deny MUST apply, the fall-through bit must
+// NEVER suppress it (vSRX filter semantics). The Go commit gate rejects the
+// contradiction, but the tolerant peer-sync path could still deliver such a
+// snapshot, so the compiler treats a nonempty action as terminating regardless
+// of next_term (continue_term := action.is_empty() && routing_instance.empty).
+//
+// FAIL-ON-REVERT: restore `continue_term: (snap.next_term ||
+// snap.action.is_empty()) && snap.routing_instance.is_empty()` and the
+// discard/reject asserts below go RED — the term falls through and the implicit
+// default Accept survives (fail-OPEN).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn terminal_discard_with_next_term_still_discards_5142() {
+    // A single term: `then discard` AND next_term=true (the #5142 contradiction
+    // a mixed-version peer could deliver). The deny MUST apply — the fall-through
+    // bit must not suppress it. There is no later term, so a fall-through would
+    // return the implicit default Accept (the fail-OPEN bug).
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "deny".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["80".into()],
+                action: "discard".into(),
+                next_term: true, // contradiction: terminal + fall-through
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // The compiler must NOT mark a term with a real terminal action as a
+    // fall-through, even though next_term is set.
+    let filter = state.filters.get("inet:deny").expect("filter");
+    assert!(
+        !filter.terms[0].continue_term,
+        "a term with a terminal action must terminate, not fall through (#5142)"
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:deny",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "discard+next_term must apply the deny, not fall through to implicit Accept (#5142)"
+    );
+}
+
+#[test]
+fn terminal_reject_with_next_term_still_rejects_5142() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "deny".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["80".into()],
+                action: "reject".into(),
+                next_term: true,
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:deny",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Reject,
+        "reject+next_term must apply the deny, not fall through (#5142)"
+    );
+}
+
+#[test]
+fn terminal_discard_with_next_term_beats_later_accept_5142() {
+    // A discard+next_term term ahead of an `accept` term for the same 5-tuple:
+    // the fail-OPEN bug would fall through term0 and ACCEPT at term1. Fail-closed
+    // the discard terminates at term0.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "order".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "drop-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "discard".into(),
+                    next_term: true,
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "accept-all".into(),
+                    protocols: vec!["tcp".into()],
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:order",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Discard);
+}
+
+#[test]
+fn modifier_only_next_term_still_falls_through_5142() {
+    // The valid #2544/#3427 case must be UNCHANGED by the #5142 fix: a
+    // modifier-only term (empty action) with next_term=true falls through and a
+    // later discard term applies.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "mo".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "count-next".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(), // modifier-only — no terminal
+                    next_term: true,
+                    count: "mo-hits".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "drop-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let filter = state.filters.get("inet:mo").expect("filter");
+    assert!(
+        filter.terms[0].continue_term,
+        "modifier-only next-term term must still fall through (#2544/#3427)"
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:mo",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "modifier-only next-term must fall through to the later discard"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #2573: the cached TX-selection path must record EVERY matched `then count`
 // term, not just the last. With #2544 fall-through a single packet can match
 // two count terms on the same flow-cache key; the old single-Arc slot kept only
