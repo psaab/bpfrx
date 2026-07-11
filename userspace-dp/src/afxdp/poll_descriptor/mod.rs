@@ -1593,7 +1593,15 @@ pub(super) fn poll_binding_process_descriptor(
                         // prefix translation (RFC 6296) -- no L4 checksum update.
                         let nptv6_inbound = if pre_routing_dnat.is_none() {
                             if let IpAddr::V6(mut dst_v6) = resolution_target {
-                                if worker_ctx.forwarding.nptv6.translate_inbound(&mut dst_v6) {
+                                // #5176: gate NPTv6 inbound on the packet's
+                                // INGRESS zone so a rule-set scoped `from zone X`
+                                // never translates traffic arriving from another
+                                // zone (security-domain crossing).
+                                if worker_ctx
+                                    .forwarding
+                                    .nptv6
+                                    .translate_inbound(&mut dst_v6, ingress_zone_name)
+                                {
                                     Some(dst_v6)
                                 } else {
                                     None
@@ -2819,13 +2827,16 @@ pub(super) fn poll_binding_process_descriptor(
                                     // the NPTv6 source rewrite is checksum-neutral by
                                     // RFC 6296 (see afxdp::checksum / frame::apply_nat_ipv6),
                                     // so only the DNAT destination delta is folded into the
-                                    // L4 checksum.
+                                    // L4 checksum. #5176: gate on the EGRESS zone
+                                    // (`to_zone`) so a rule-set scoped `from zone X`
+                                    // never rewrites the source of traffic leaving
+                                    // via another zone (security-domain crossing).
                                     let nptv6_snat =
                                         if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
                                             if worker_ctx
                                                 .forwarding
                                                 .nptv6
-                                                .translate_outbound(&mut src_v6)
+                                                .translate_outbound(&mut src_v6, to_zone)
                                             {
                                                 Some(NatDecision {
                                                     rewrite_src: Some(IpAddr::V6(src_v6)),
@@ -5026,12 +5037,15 @@ pub(super) fn poll_binding_process_descriptor(
                                     // (rewrite_dst): NPTv6 rewrites the source, DNAT
                                     // the destination; both are merged. The NPTv6
                                     // source rewrite is checksum-neutral (RFC 6296).
+                                    // #5176: gate on the EGRESS zone (`to_zone`) so
+                                    // a rule-set scoped `from zone X` never rewrites
+                                    // the source of traffic leaving via another zone.
                                     let nptv6_snat =
                                         if let IpAddr::V6(mut src_v6) = nat_match_flow.src_ip {
                                             if worker_ctx
                                                 .forwarding
                                                 .nptv6
-                                                .translate_outbound(&mut src_v6)
+                                                .translate_outbound(&mut src_v6, to_zone)
                                             {
                                                 Some(NatDecision {
                                                     rewrite_src: Some(IpAddr::V6(src_v6)),
