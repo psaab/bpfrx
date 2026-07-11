@@ -1,3 +1,20 @@
+## 2026-07-11 — #5554 CLI `request system zeroize` configured-root resolution
+- **Timestamp**: 2026-07-11 (fix/5554-cli-zeroize-configured-root)
+- **Action**: The interactive-CLI `request system zeroize` handler hardcoded
+  `configDir := "/etc/xpf"` (+ `"xpf.conf"` base) for the factory-reset wipe.
+  On a daemon started with a non-default `-config` root, that wiped the WRONG
+  directory and LEFT the real `.configdb`/`master.key`/TLS material/rollback
+  slots on disk — the local-CLI twin of #5280 (gRPC path, fixed by #5552).
+  Resolved the wipe target from `c.store.ConfigPath()` (`filepath.Dir/Base`),
+  fail-CLOSED if store/path undeterminable, mirroring grpcapi
+  `(*Server).zeroizeConfigRoot`. Extracted `zeroizeConfigRoot()` +
+  `zeroizeConfigState()` on `*CLI`; handler now calls the latter before the
+  BPF-pin/networkd/systemctl-stop cleanup. Added a fail-on-revert test
+  (resolver + fail-closed + end-to-end wipe of a seeded temp root); verified
+  RED-on-revert. Updated `pkg/cli/README.md` with the zeroize-root contract.
+- **File(s)**: pkg/cli/cli_request_system.go,
+  pkg/cli/cli_zeroize_configured_root_5554_test.go, pkg/cli/README.md
+
 ## 2026-07-10 — #5077 submit-latency classifier K3 monotonicity (I14) mirror
 - **Timestamp**: 2026-07-10 (fix/5077-classifier-submit-monotonicity)
 - **Action**: Mirror the #827 kick-side K3 cross-snapshot monotonicity guard

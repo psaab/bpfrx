@@ -70,28 +70,15 @@ func (c *CLI) handleRequestSystem(args []string) error {
 			return nil
 		}
 
-		// Securely erase the config-DB SSOT + master.key + audit journal +
-		// rollback history (#4858). The pre-fix wipe removed only top-level
-		// .conf / rollback* files and LEFT .configdb/{active,candidate,
-		// rollback.N}.json + master.key + .config.journal behind, so the daemon
-		// reloaded the "erased" config and secrets on the next boot (a false
-		// factory reset). Route through the shared configstore primitive and
-		// refuse to report success if the erasure did not complete.
-		configDir := "/etc/xpf"
-		if err := configstore.FactoryResetConfigDir(configDir, "xpf.conf"); err != nil {
-			return fmt.Errorf("zeroize: configuration state not fully erased: %w", err)
-		}
-
-		// Erase the local config archive (#5186): /var/lib/xpf/archive holds
-		// 0600 config-<ts>.conf snapshots — full config TEXT with cleartext
-		// secret leaves (PSK/keys/community). The pre-#5186 zeroize left it
-		// behind, so a prior tenant's secrets survived a factory reset.
-		// Ownership-guarded to the xpf-owned default path (a custom, remote, or
-		// compliance archive destination is skipped with a warning, never
-		// blindly deleted). Routes through the same shared configstore primitive
-		// as the gRPC factory-reset path so both wipe exactly the same archive.
-		if err := configstore.FactoryResetArchiveDir(configstore.DefaultArchiveDir); err != nil {
-			return fmt.Errorf("zeroize: config archive not fully erased: %w", err)
+		// Erase the config-DB SSOT + master.key + audit journal + rollback
+		// history + local config archive at the CONFIGURED config root, failing
+		// closed if that root cannot be determined (#5554). The pre-fix wipe
+		// hardcoded /etc/xpf, so a daemon started with a non-default `-config`
+		// root wiped the WRONG directory and LEFT the real .configdb / master.key
+		// / TLS material / rollback slots on disk — the same secret-retention
+		// hole #5280 fixed on the gRPC path.
+		if err := c.zeroizeConfigState(); err != nil {
+			return err
 		}
 
 		// Remove BPF pins (no secret material)
@@ -103,12 +90,6 @@ func (c *CLI) handleRequestSystem(args []string) error {
 			if strings.HasPrefix(f.Name(), "10-xpf-") {
 				os.Remove("/etc/systemd/network/" + f.Name())
 			}
-		}
-
-		// Verify the config DB SSOT is gone before reporting success — a
-		// zeroize that leaves it behind must not print "erased".
-		if _, err := os.Stat(filepath.Join(configDir, ".configdb")); !os.IsNotExist(err) {
-			return fmt.Errorf("zeroize: config DB still present after wipe (stat err=%v)", err)
 		}
 
 		// Stop the daemon so it releases interface/dataplane state; the reboot
@@ -131,6 +112,71 @@ func (c *CLI) handleRequestSystem(args []string) error {
 	default:
 		return fmt.Errorf("unknown request system command: %s", args[0])
 	}
+}
+
+// zeroizeConfigRoot resolves the CONFIGURED config root the CLI factory-reset
+// wipe must erase — the directory and base name of the store's `-config` path
+// (configstore.Store.ConfigPath), the SAME path the daemon loads config from
+// and persists the .configdb SSOT / master.key / numbered text rollback slots /
+// audit journal to. This is the local-CLI twin of grpcapi (*Server).
+// zeroizeConfigRoot (#5280): the interactive CLI runs in-process with the daemon
+// and shares its store, so it resolves the root the same way instead of
+// hardcoding /etc/xpf (#5554) — a daemon started with `-config /srv/xpf/site.conf`
+// then erases /srv/xpf, not /etc/xpf.
+//
+// Fail CLOSED: if the store is absent or carries no config path we cannot know
+// which root holds the prior tenant's secrets, so return an error rather than
+// wiping the wrong directory (or nothing) while reporting a clean factory reset.
+func (c *CLI) zeroizeConfigRoot() (configDir, configBase string, err error) {
+	if c.store == nil {
+		return "", "", fmt.Errorf("zeroize: config store unavailable; cannot determine configured config root to erase")
+	}
+	p := c.store.ConfigPath()
+	if p == "" {
+		return "", "", fmt.Errorf("zeroize: config store has no config path; cannot determine configured config root to erase")
+	}
+	return filepath.Dir(p), filepath.Base(p), nil
+}
+
+// zeroizeConfigState erases the on-disk configuration STATE for a factory reset:
+// the config-DB SSOT + master.key + numbered text rollback slots + audit journal
+// under the CONFIGURED config root, plus the local config archive. It resolves
+// the wipe target from the store (not a hardcoded /etc/xpf, #5554) and routes
+// through the shared configstore primitives (FactoryResetConfigDir /
+// FactoryResetArchiveDir) so the CLI and the gRPC path erase exactly the same
+// artifacts, refusing to report success if the config DB SSOT survives.
+func (c *CLI) zeroizeConfigState() error {
+	configDir, configBase, err := c.zeroizeConfigRoot()
+	if err != nil {
+		return err
+	}
+
+	// Securely erase the config-DB SSOT + master.key + audit journal + rollback
+	// history (#4858). The pre-fix wipe removed only top-level .conf / rollback*
+	// files and LEFT .configdb/{active,candidate,rollback.N}.json + master.key +
+	// .config.journal behind, so the daemon reloaded the "erased" config and
+	// secrets on the next boot (a false factory reset).
+	if err := configstore.FactoryResetConfigDir(configDir, configBase); err != nil {
+		return fmt.Errorf("zeroize: configuration state not fully erased: %w", err)
+	}
+
+	// Erase the local config archive (#5186): /var/lib/xpf/archive holds 0600
+	// config-<ts>.conf snapshots — full config TEXT with cleartext secret leaves
+	// (PSK/keys/community). Ownership-guarded to the xpf-owned default path (a
+	// custom, remote, or compliance archive destination is skipped with a
+	// warning, never blindly deleted). Routes through the same shared configstore
+	// primitive as the gRPC factory-reset path so both wipe exactly the same
+	// archive.
+	if err := configstore.FactoryResetArchiveDir(configstore.DefaultArchiveDir); err != nil {
+		return fmt.Errorf("zeroize: config archive not fully erased: %w", err)
+	}
+
+	// Verify the config DB SSOT is gone before reporting success — a zeroize that
+	// leaves it behind must not print "erased".
+	if _, err := os.Stat(filepath.Join(configDir, ".configdb")); !os.IsNotExist(err) {
+		return fmt.Errorf("zeroize: config DB still present after wipe (stat err=%v)", err)
+	}
+	return nil
 }
 
 // handleRequestSystemDynamicDNS implements `request system dynamic-dns
