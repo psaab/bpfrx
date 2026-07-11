@@ -36,10 +36,19 @@ type JunosHostProgram struct {
 	RulesV6 []config.JunosHostDenyRule
 	// CoarseAdmitsIKE / CoarseIdentResets / HasApplicationAnyDeny drive the
 	// daemon's fine-eligible-L4 exemption rules ahead of an `application any`
-	// drop (§6.6).
+	// drop (§6.6). CoarseAdmitsIKE / CoarseIdentResets are true iff the
+	// corresponding netdev subset below is non-empty.
 	CoarseAdmitsIKE       bool
 	CoarseIdentResets     bool
 	HasApplicationAnyDeny bool
+	// IKEExemptNetdevs / IdentResetNetdevs are the SUBSET of IngressIfnames whose
+	// effective per-interface host-inbound set admits IKE / RSTs ident (#5565).
+	// The daemon scopes the IKE / ident exemption shield to these netdevs, so a
+	// per-interface `ike`/`ident-reset` override never widens to a sibling
+	// interface in the same zone. A zone-level exception yields the full
+	// IngressIfnames set (zone-wide, no regression). Sorted subsets.
+	IKEExemptNetdevs  []string
+	IdentResetNetdevs []string
 }
 
 // BuildJunosHostPrograms returns the per-ingress-zone junos-host DENY programs
@@ -79,6 +88,8 @@ func BuildJunosHostPrograms(cfg *config.Config) []JunosHostProgram {
 			CoarseAdmitsIKE:       p.CoarseAdmitsIKE,
 			CoarseIdentResets:     p.CoarseIdentResets,
 			HasApplicationAnyDeny: p.HasApplicationAnyDeny,
+			IKEExemptNetdevs:      p.IKEExemptNetdevs,
+			IdentResetNetdevs:     p.IdentResetNetdevs,
 		})
 	}
 	return out
