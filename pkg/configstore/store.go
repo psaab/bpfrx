@@ -115,6 +115,20 @@ type Store struct {
 	// Every successful committed write resets it to true.
 	persistMarkerCommitted bool
 
+	// confirmResolvePendingPersist records that a commit-confirmed window was
+	// RESOLVED in memory (timeout auto-rollback, boot recovery, or an HA
+	// config-sync that superseded it) but the resolving active-config write
+	// FAILED, so confirm.json — the crash-recovery record that re-drives the
+	// rollback/replacement to its target — must NOT be removed yet (#5473).
+	// The durable-transition invariant: the recovery record survives until the
+	// replacement config is DURABLE on disk, so a crash before the degraded
+	// retry heals boots into a state that RE-RUNS the rollback rather than
+	// stranding the pre-rollback config with no record. Cleared (and confirm.json
+	// removed) by the next durable active write — the persist-retry heal or any
+	// superseding commit/sync — via clearConfirmResolutionPendingLocked. Default
+	// false; only the degrade-not-fail resolution paths set it.
+	confirmResolvePendingPersist bool
+
 	// Commit confirmed state. confirmGen is a generation token
 	// guarding the auto-rollback callback against staleness: a timer
 	// that has already fired and is blocked on s.mu when a nested
@@ -567,7 +581,17 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	// callback no-ops in PromoteRollback. This runs with the in-memory
 	// promotion (Option B: the apply stands even if the disk write below
 	// fails), matching SyncApply's degrade-not-fail contract.
-	if s.clearPendingConfirmLocked() {
+	//
+	// #5473: cancel the timer here but DO NOT remove confirm.json yet — order
+	// its removal AFTER the writeActive below so the crash-recovery record is
+	// dropped only once the synced (replacement) config is durable. If the
+	// degrade-not-fail write fails and we had removed confirm.json up front, a
+	// crash before the retry heals would boot the pre-sync config with no
+	// record; the re-armed rollback would then be lost. cancelPending returns
+	// true iff a window was actually pending, so confirm.json is touched only
+	// when there was one to resolve.
+	syncSupersededConfirm := s.cancelPendingConfirmTimerLocked()
+	if syncSupersededConfirm {
 		slog.Info("HA config-sync apply confirmed a pending commit-confirmed window")
 	}
 
@@ -589,8 +613,25 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	s.persistMarkerCommitted = true
 	if err := s.writeActive(s.active); err != nil {
 		s.noteActivePersistFailureLocked("config_sync", err)
+		// #5473: the synced config that supersedes the pending confirm window
+		// is NOT durable. Keep confirm.json and defer its removal until the
+		// retry lands the synced config durably — a crash before then boots
+		// into a state where the persisted rollback still fires.
+		if syncSupersededConfirm {
+			s.confirmResolvePendingPersist = true
+		}
 	} else {
 		s.persistDegraded = false
+		// The synced config is durable. Drop the confirm.json this sync
+		// superseded now that the replacement is on disk.
+		if syncSupersededConfirm {
+			s.removeConfirmState()
+		}
+		// Also finalize any removal deferred by an EARLIER failed resolution
+		// write (e.g. a prior rollback whose persist failed): the synced config
+		// is durable, so that stale window is definitively superseded too.
+		// No-op unless such a removal was pending.
+		s.clearConfirmResolutionPendingLocked()
 	}
 
 	s.journalLog(&JournalEntry{

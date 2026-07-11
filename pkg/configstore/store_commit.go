@@ -152,10 +152,26 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		s.everCommitted = true
 		s.persistMarkerCommitted = true
 		s.noteActivePersistFailureLocked("commit_postrename", err)
+		// #5473: this commit's config C is VISIBLE on disk (post-rename: the
+		// rename landed, only the dir-fsync is uncertain) and supersedes any
+		// commit-confirmed window whose earlier resolution write failed. Finalize
+		// the deferred (retained) confirm.json removal now — symmetric with the
+		// success branch. Without this the stale flag persists into the degraded
+		// retry, whose heal would then delete a LATER-armed window's fresh record
+		// (or, for a plain commit, a stale PrevTree=A record lingers and a crash
+		// reverts this just-committed C back to A). No-op unless a removal was
+		// deferred.
+		s.clearConfirmResolutionPendingLocked()
 	} else {
 		s.persistDegraded = false       // disk now holds the current config
 		s.everCommitted = true          // #1922 step-0: a real commit has succeeded
 		s.persistMarkerCommitted = true // #1922: degraded-retry writes committed=1
+		// #5473: this commit's config is now durable and supersedes any
+		// commit-confirmed window whose earlier resolution write failed. Drop
+		// the deferred (retained) confirm.json so a reboot does not re-drive a
+		// stale rollback that this commit has replaced. No-op unless a removal
+		// was deferred.
+		s.clearConfirmResolutionPendingLocked()
 	}
 
 	// Push current active to history with description
@@ -318,6 +334,15 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		s.everCommitted = true
 		s.persistMarkerCommitted = true
 		s.noteActivePersistFailureLocked("commit_confirmed_postrename", err)
+		// #5473: E's config is VISIBLE on disk (post-rename converge) and a fresh
+		// window is about to be armed below (writeConfirmState). Finalize any
+		// confirm.json removal deferred by an earlier failed resolution write
+		// HERE — before the fresh window is written — so the stale flag does not
+		// survive to make the degraded retry's heal delete E's OWN fresh record.
+		// Symmetric with the success branch (removes STALE record; the fresh one
+		// is written afterward by writeConfirmState). No-op unless a removal was
+		// deferred.
+		s.clearConfirmResolutionPendingLocked()
 	} else {
 		s.persistDegraded = false // disk now holds the current config
 		// #1922 step-0: a commit confirmed persists the candidate as the
@@ -327,6 +352,12 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		// rollback path (prevCfg==nil) re-writes the never-committed marker.
 		s.everCommitted = true
 		s.persistMarkerCommitted = true
+		// #5473: this commit's config is durable. Drop any confirm.json whose
+		// removal was deferred by an earlier failed resolution write before the
+		// fresh window below re-arms and re-writes it (clearConfirmResolution
+		// removes the STALE record; writeConfirmState writes the NEW one). No-op
+		// unless a removal was deferred.
+		s.clearConfirmResolutionPendingLocked()
 	}
 
 	if s.confirmTimer != nil {
@@ -417,6 +448,24 @@ func (s *Store) removeConfirmState() {
 	}
 }
 
+// clearConfirmResolutionPendingLocked finalizes a #5473 DEFERRED confirm.json
+// removal: it drops the crash-recovery record once the replacement config is
+// durable on disk. A commit-confirmed window that was resolved in memory
+// (timeout auto-rollback, boot recovery, or an HA config-sync supersede) but
+// whose resolving active write FAILED keeps confirm.json (fail-closed) and
+// marks the removal pending via confirmResolvePendingPersist. This is called
+// from every path that lands a DURABLE active-config write — the persist-retry
+// heal and every superseding commit/sync — so the retained record is dropped
+// exactly when the replacement it was guarding becomes durable, never before.
+// No-op unless a removal was deferred. Caller holds s.mu (write lock).
+func (s *Store) clearConfirmResolutionPendingLocked() {
+	if !s.confirmResolvePendingPersist {
+		return
+	}
+	s.confirmResolvePendingPersist = false
+	s.removeConfirmState()
+}
+
 // clearPendingConfirmLocked cancels an armed commit-confirmed rollback
 // timer and discards its rollback target, treating whatever the caller is
 // about to promote (a plain commit, an HA config-sync apply, or the
@@ -437,6 +486,40 @@ func (s *Store) removeConfirmState() {
 // original rollback target — so this only fires on a PLAIN commit / sync /
 // explicit confirm, never on a confirmed→confirmed re-arm.
 func (s *Store) clearPendingConfirmLocked() bool {
+	if !s.cancelPendingConfirmTimerLocked() {
+		return false
+	}
+	// #4577: the pending confirm is now confirmed (plain commit / HA sync /
+	// explicit confirm / demotion) — drop the persisted crash-recovery state
+	// so a later restart does not resurrect a stale rollback window. A nested
+	// confirmed re-arm does NOT pass through here (it re-writes confirm.json
+	// with the extended deadline in CommitConfirmed), so this only fires on a
+	// genuine confirmation.
+	//
+	// #5473: the callers that reach here have ALREADY made the confirming
+	// config durable (CommitWithDescription/CommitConfirmed persist-before-
+	// promote; ConfirmCommit/ConfirmPendingOnDemotion do not replace the active
+	// config at all), so removing confirm.json now is the durable transition.
+	// The degrade-not-fail sync path does NOT use this helper — it cancels the
+	// timer with cancelPendingConfirmTimerLocked and orders confirm.json removal
+	// AFTER its (possibly failing) write.
+	s.removeConfirmState()
+	return true
+}
+
+// cancelPendingConfirmTimerLocked cancels an armed commit-confirmed rollback
+// timer and discards its in-memory rollback target WITHOUT touching the
+// persisted confirm.json. Returns true iff a timer was armed. This is the
+// timer-half of clearPendingConfirmLocked; a caller that resolves the window
+// with a DEGRADE-NOT-FAIL active write (SyncApply) uses this so confirm.json
+// removal can be ordered AFTER the replacement write is durable (#5473) rather
+// than removed up front and lost if that write fails. Caller holds s.mu.
+//
+// The confirmGen bump is load-bearing (#1817): time.Timer.Stop() cannot un-fire
+// a callback that has already started and is blocked on s.mu. Bumping the
+// generation makes that already-fired-but-blocked callback a no-op in
+// PromoteRollback (gen mismatch).
+func (s *Store) cancelPendingConfirmTimerLocked() bool {
 	if s.confirmTimer == nil {
 		return false
 	}
@@ -445,13 +528,6 @@ func (s *Store) clearPendingConfirmLocked() bool {
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
 	s.confirmPrevCfg = nil
-	// #4577: the pending confirm is now confirmed (plain commit / HA sync /
-	// explicit confirm / demotion) — drop the persisted crash-recovery state
-	// so a later restart does not resurrect a stale rollback window. A nested
-	// confirmed re-arm does NOT pass through here (it re-writes confirm.json
-	// with the extended deadline in CommitConfirmed), so this only fires on a
-	// genuine confirmation.
-	s.removeConfirmState()
 	return true
 }
 
@@ -623,19 +699,29 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 		s.persistMarkerCommitted = true
 		perr = s.writeActive(s.active)
 	}
+	// #5473: model confirm.json removal as a DURABLE transition. The record is
+	// the crash-recovery intent that re-drives this rollback to the target
+	// (confirmPrevTree). It may be removed ONLY once that target is durable on
+	// disk — i.e. only when the writeActive above SUCCEEDED.
 	if perr != nil {
+		// The rollback to the target is NOT durable (disk still holds the
+		// pre-rollback config). Removing confirm.json here would delete the only
+		// record that would re-drive the rollback on the next boot: a crash
+		// before the degraded retry heals would then boot the pre-rollback
+		// config with NO recovery record (the #5473 crash-window loss). Instead
+		// keep confirm.json and defer its removal until the retry lands the
+		// rollback target durably (clearConfirmResolutionPendingLocked).
 		s.noteActivePersistFailureLocked("auto_rollback", perr)
+		s.confirmResolvePendingPersist = true
 	} else {
+		// The rollback target is durable — drop the crash-recovery record now.
+		// #4577: idempotent on the residual crash window between the successful
+		// writeActive above and this remove (a Load recovery re-runs the
+		// now-no-op rollback to the already-persisted target).
 		s.persistDegraded = false
+		s.confirmResolvePendingPersist = false
+		s.removeConfirmState()
 	}
-
-	// #4577: the confirm window is resolved (rolled back) — drop the persisted
-	// crash-recovery state so a restart does not re-arm/re-roll a completed
-	// window. Idempotent: a crash between the writeActive above and this
-	// remove leaves a confirm.json whose deadline has passed and whose
-	// rollback target equals the now-persisted active, so a Load recovery
-	// re-runs the rollback as a no-op.
-	s.removeConfirmState()
 
 	// Log to journal
 	s.journalLog(&JournalEntry{

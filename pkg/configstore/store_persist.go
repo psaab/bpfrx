@@ -174,15 +174,26 @@ func (s *Store) recoverPendingConfirmLocked() {
 			s.everCommitted = true
 			perr = s.writeActive(prevTree)
 		}
+		// #5473: confirm.json removal is a DURABLE transition. Remove the
+		// crash-recovery record ONLY when the boot rollback to prevTree is
+		// durable (writeActive above SUCCEEDED). On failure keep it — the
+		// degrade-not-fail retry re-drives the rollback, and if the daemon
+		// crashes again first, the NEXT boot re-reads confirm.json (deadline
+		// still past) and reverts to prevTree again. Removing it here on a
+		// failed write would boot the un-reverted config with no record.
 		if perr != nil {
 			s.noteActivePersistFailureLocked("confirm_recovery_rollback", perr)
+			s.confirmResolvePendingPersist = true
 		} else {
 			s.persistDegraded = false
+			s.confirmResolvePendingPersist = false
 		}
 		if s.candidate != nil {
 			s.candidate = s.active.Clone()
 		}
-		s.removeConfirmState()
+		if perr == nil {
+			s.removeConfirmState()
+		}
 		s.journalLog(&JournalEntry{
 			Action:     "auto_rollback",
 			Detail:     "commit-confirmed window expired during daemon downtime; reverted on boot (#4577)",
@@ -381,6 +392,13 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		if err == nil {
 			s.persistDegraded = false
 			s.persistRetryActive = false
+			// #5473: the active config is now durable. If a commit-confirmed
+			// resolution (rollback / boot recovery / sync supersede) deferred its
+			// confirm.json removal because the resolving write failed, that
+			// replacement target is exactly what just landed durably — drop the
+			// crash-recovery record now so a later boot does not re-drive a
+			// completed rollback. No-op unless a removal was deferred.
+			s.clearConfirmResolutionPendingLocked()
 			s.journalLog(&JournalEntry{
 				Action: "persist_recovered",
 				Detail: "active config persisted after earlier write failure",
