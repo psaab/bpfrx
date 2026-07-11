@@ -90,6 +90,33 @@ def die(msg):
     sys.exit(f"ERROR: {msg}")
 
 
+def positive_int(value):
+    """argparse ``type=`` callable: parse a STRICTLY-positive integer (> 0).
+
+    Rejects 0 / negative (and non-integer) input at parse time — argparse maps a
+    raised ``ArgumentTypeError`` to a usage error with a clear message and exit
+    code 2, BEFORE any remote/deploy action runs. We reject rather than silently
+    clamp: a bad operator input fails closed.
+
+    This guards ``--lease-ttl`` (#5470). ``_acquire_lease`` renders the roll
+    lease deadline as ``expires_at = now + ttl`` and the acquire guard is a
+    strict ``now < expires``, so a non-positive TTL yields a lease that is
+    already expired the instant it is written. The cross-orchestrator
+    kernel/image-roll mutex then never actually holds, and two independent
+    drivers could each take a node's flock in turn and drain OPPOSITE HA nodes
+    into a no-primary forwarding outage. The TTL must be a positive integer of
+    seconds; operators should size it to comfortably exceed the whole roll
+    (``--boot-deadline`` plus drain/rejoin margins, default 1800s)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"'{value}' is not an integer")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive integer of seconds (> 0), got {n}")
+    return n
+
+
 # ── identifier / path-containment safety (#4905-B) ────────────────────
 # The appliance `name` and `image` are interpolated straight into filesystem
 # paths that this tool WRITES and REMOVES (often via sudo): the day-0 ISO in
@@ -1966,9 +1993,10 @@ def main():
                          help="cluster node-id of the FIRST --node (default 0)")
         sub.add_argument("--node1-id", type=int, default=1,
                          help="cluster node-id of the SECOND --node (default 1)")
-        sub.add_argument("--lease-ttl", type=int, default=1800,
-                         help="kernel-roll lease TTL seconds (suppresses the "
-                              "node's local self-recovery during the roll)")
+        sub.add_argument("--lease-ttl", type=positive_int, default=1800,
+                         help="kernel-roll lease TTL seconds (must be > 0; "
+                              "suppresses the node's local self-recovery during "
+                              "the roll)")
         sub.add_argument("--boot-deadline", type=int, default=600,
                          help="seconds to wait for a node to boot + promote the "
                               "candidate before STOPPING the roll")
@@ -2003,9 +2031,10 @@ def main():
                          help="cluster node-id of the FIRST --node (default 0)")
         sub.add_argument("--node1-id", type=int, default=1,
                          help="cluster node-id of the SECOND --node (default 1)")
-        sub.add_argument("--lease-ttl", type=int, default=1800,
-                         help="image-roll lease TTL seconds (cross-orchestrator "
-                              "mutex; also suppresses the node's self-recovery)")
+        sub.add_argument("--lease-ttl", type=positive_int, default=1800,
+                         help="image-roll lease TTL seconds (must be > 0; "
+                              "cross-orchestrator mutex; also suppresses the "
+                              "node's self-recovery)")
         sub.add_argument("--drain-deadline", type=int, default=30,
                          help="seconds to confirm the drain/rejoin predicate")
         sub.add_argument("--boot-deadline", type=int, default=600,
