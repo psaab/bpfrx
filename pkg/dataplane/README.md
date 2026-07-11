@@ -83,25 +83,36 @@ Guard layers (`build-userspace-xdp.sh`):
    REJECT refuses the deploy with the old dataplane still forwarding.
 
    The shared `validateUserspaceShimSpec` gate this runs also performs
-   an **ABI compatibility check** (#5307): for every PinByName shim map
+   an **ABI compatibility check** (#5307): for every required pinned map
    it compares the embedded shim's `Type`, `KeySize`, `ValueSize`,
    `MaxEntries`, and `Flags` — the exact fields cilium/ebpf's
    `MapSpec.Compatible` flags with `ErrMapIncompatible` at load —
-   against BOTH the Go-side expected shape (dnat_table only, from
-   `userspaceShimSharedMapSpecs`) AND the RUNNING daemon's **live
+   against BOTH the Go-side expected shape (dnat_table and dnat_table_v6,
+   from `userspaceShimSharedMapSpecs`) AND the RUNNING daemon's **live
    pinned maps** (read-only via `ebpf.LoadPinnedMap` + shape
-   accessors). Because this runs while the old daemon is still up (its
-   pins live), an ABI-incompatible map is caught HERE and the deploy is
-   refused — instead of the pre-#5307 behavior where a green pre-flight
-   let the deploy proceed, the old daemon was stopped, and the new
-   daemon's `NewCollectionWithOptions` then failed `ErrMapIncompatible`,
-   stranding the node fail-closed (config-only). A map with no pin yet
-   (fresh node / first load) skips the live-pin arm — only the
-   expected-value checks apply, so a clean node never false-fails. The
-   disposable counter map `userspace_fallback_stats` is intentionally
-   excluded: `reconcileDisposableCollectionPin` resets it on an
-   intended shape change (#4113), so ABI-checking it here would re-brick
-   that upgrade.
+   accessors). The ABI-checked inventory (`userspaceABICheckedPinnedMaps`)
+   is the UNION of the shim-declared PinByName maps
+   (`userspacePinnedShimMaps`) AND the Go-created/replaced shared maps
+   (`userspaceShimSharedMapSpecs`) — deduplicated — matching the
+   required-pins set (`userspaceRequiredShimPins`). Before #5484 it
+   covered only the PinByName group, so state-bearing shared maps the
+   shim does NOT declare — `sessions_v6`, `dnat_table_v6`, and the HA /
+   per-CPU maps (`rg_active`, `ha_watchdog`, `session_id_gen`, the
+   `*_counters`) — were never pre-flighted: an incompatible live pin for
+   one of them passed a green pre-flight and then failed
+   `ErrMapIncompatible` in `loadUserspaceShimSharedMaps` AFTER the old
+   daemon was stopped, stranding the node. Because this runs while the
+   old daemon is still up (its pins live), an ABI-incompatible map is
+   now caught HERE and the deploy is refused — instead of the pre-#5307
+   behavior where a green pre-flight let the deploy proceed, the old
+   daemon was stopped, and the new daemon's `NewCollectionWithOptions`
+   (or the shared-map load) then failed `ErrMapIncompatible`, stranding
+   the node fail-closed (config-only). A map with no pin yet (fresh
+   node / first load) skips the live-pin arm — only the expected-value
+   checks apply, so a clean node never false-fails. The disposable
+   counter map `userspace_fallback_stats` is intentionally excluded:
+   `reconcileDisposableCollectionPin` resets it on an intended shape
+   change (#4113), so ABI-checking it here would re-brick that upgrade.
 
    **Residual (documented, not caught here):** a *same-size* Go/Rust
    value **field reorder** — identical `KeySize`/`ValueSize`/`Type`/
