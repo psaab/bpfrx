@@ -111,9 +111,24 @@ type JunosHostDenyProgram struct {
 	RulesV4 []JunosHostDenyRule
 	RulesV6 []JunosHostDenyRule
 	// CoarseAdmitsIKE / CoarseIdentResets drive the daemon's fine-eligible-L4
-	// exemption rules ahead of an `application any` drop (§6.6).
+	// exemption rules ahead of an `application any` drop (§6.6). They are true
+	// iff at least one ingress netdev in the zone admits the exemption
+	// (len(IKEExemptNetdevs) / len(IdentResetNetdevs) > 0) — NOT a zone-wide
+	// union of every per-interface override (#5565).
 	CoarseAdmitsIKE   bool
 	CoarseIdentResets bool
+	// IKEExemptNetdevs / IdentResetNetdevs are the SUBSET of IngressNetdevs whose
+	// EFFECTIVE per-interface host-inbound set admits IKE (udp 500/4500) /
+	// answers TCP/113 with a RST (#5565). The daemon scopes the IKE / ident
+	// exemption shield to these netdevs instead of the whole zone iifname set, so
+	// a per-INTERFACE `ike` / `ident-reset` override is never widened to a sibling
+	// interface in the same zone that did not configure it. A genuinely
+	// zone-level exception (authored on the zone's own host-inbound-traffic)
+	// admits on every interface, so its subset equals IngressNetdevs and the
+	// shield stays zone-wide (no regression). Sorted; each a subset of
+	// IngressNetdevs.
+	IKEExemptNetdevs  []string
+	IdentResetNetdevs []string
 	// HasApplicationAnyDeny is true when the program contains a rendered
 	// `application any` drop, so the daemon knows to emit the IKE/ident exemption
 	// shields ahead of it.
@@ -223,11 +238,22 @@ func BuildJunosHostDenyProjection(cfg *Config) JunosHostDenyProjection {
 			// as a `saddr !=` subtraction — the whole program is un-representable
 			// (§5.1). junosHostProjectProgram reports this via ok=false.
 			var ok bool
-			prog, ok = junosHostProjectProgram(zoneName, ifaceRefs, terms, zone)
+			prog, ok = junosHostProjectProgram(zoneName, ifaceRefs, terms)
 			if !ok {
 				representable = false
 			}
 			prog.IngressNetdevs = netdevs
+			// #5565: scope the fine-eligible-L4 (IKE / ident) exemption to the
+			// SPECIFIC netdevs whose effective per-interface host-inbound set
+			// admits it, NOT the whole zone. A per-interface `ike`/`ident-reset`
+			// override then shields only the interface that configured it; a
+			// zone-level exception still covers every netdev (its subset equals
+			// netdevs). The CoarseAdmits* bits follow the subsets so the daemon
+			// never emits a shield with no scope.
+			prog.IKEExemptNetdevs, prog.IdentResetNetdevs =
+				junosHostZoneExemptNetdevs(cfg, zoneName, zone, netdevs)
+			prog.CoarseAdmitsIKE = len(prog.IKEExemptNetdevs) > 0
+			prog.CoarseIdentResets = len(prog.IdentResetNetdevs) > 0
 		}
 		// Bookkeeping for the warning.
 		for _, t := range terms {
@@ -363,13 +389,11 @@ func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[stri
 // cross-dimension permit/deny subtraction that cannot be cleanly rendered (a
 // narrow-application or source-excluded permit ahead of a deny) — the whole
 // program is then un-representable and the caller warns (§5.1).
-func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostTerm, zc *ZoneConfig) (JunosHostDenyProgram, bool) {
+func junosHostProjectProgram(zone string, ifaceRefs []string, terms []junosHostTerm) (JunosHostDenyProgram, bool) {
 	prog := JunosHostDenyProgram{
-		Zone:              zone,
-		InterfaceRefs:     ifaceRefs,
-		Representable:     true,
-		CoarseAdmitsIKE:   zoneCoarseAdmitsIKE(zc),
-		CoarseIdentResets: zoneCoarseIdentResets(zc),
+		Zone:          zone,
+		InterfaceRefs: ifaceRefs,
+		Representable: true,
 	}
 	// Accumulated earlier-permit source sets (per family) that carve later
 	// denies via `saddr !=`. A permit that permits ALL sources shadows every
@@ -822,13 +846,10 @@ func junosHostParsePorts(spec string) ([]PortRange, bool) {
 	return out, true
 }
 
-// zoneCoarseAdmitsIKE reports whether the zone's coarse host-inbound gate admits
-// IKE/NAT-T (udp 500/4500) — the `ike`/`ipsec` token or a full admit.
-func zoneCoarseAdmitsIKE(zc *ZoneConfig) bool {
-	if zc == nil {
-		return false
-	}
-	svc := zoneEffectiveSystemServices(zc)
+// junosHostSvcAdmitsIKE reports whether an EFFECTIVE per-interface host-inbound
+// system-services set coarse-admits IKE/NAT-T (udp 500/4500) — the `ike`/`ipsec`
+// token or a full admit.
+func junosHostSvcAdmitsIKE(svc []string) bool {
 	for _, s := range svc {
 		if s == "ike" || s == "ipsec" || HostInboundFullAdmitService(s) {
 			return true
@@ -837,49 +858,113 @@ func zoneCoarseAdmitsIKE(zc *ZoneConfig) bool {
 	return false
 }
 
-// zoneCoarseIdentResets reports whether the zone's effective coarse verdict for
-// TCP/113 is a RST: `ident-reset` present AND the zone is not fully open (a
-// full-admit zone accepts 113, so ident-reset is shadowed — 113 stays
-// fine-eligible, §6.6 / Codex r4).
-func zoneCoarseIdentResets(zc *ZoneConfig) bool {
-	if zc == nil {
-		return false
+// junosHostZoneExemptNetdevs returns the subset of `netdevs` (a zone's rendered
+// ingress iifname scope from JunosHostZoneIngressNetdevs) whose EFFECTIVE
+// per-interface host-inbound set admits IKE (udp 500/4500) and, separately, the
+// subset that answers TCP/113 with a RST (ident-reset). It is the #5565 fix for
+// the earlier zone-wide projection, which unioned every per-interface override
+// into a single bit and widened a per-interface `ike`/`ident-reset` exception to
+// every interface in the zone.
+//
+// A netdev admits IKE / RSTs ident if ANY interface ref whose host-bound traffic
+// arrives on it (its own logical unit, or — for a VLAN subunit riding a physical
+// parent — the parent) admits it. The union mirrors the coarse host-inbound gate
+// (which keys on the interface's effective set, InterfaceHostInboundEffective) so
+// the shield never false-denies a configured per-interface override, while a
+// sibling interface that configured no exception is left out of the subset. A
+// genuinely zone-level exception (authored on the zone's own
+// host-inbound-traffic) is folded into every interface's effective set, so its
+// subset equals `netdevs` and the shield stays zone-wide.
+//
+// The netdev→ref row walk mirrors JunosHostZoneIngressNetdevs exactly (physical
+// row + one row per unit, plus the physical parent for a VLAN subunit) so the
+// two agree on which ref feeds which netdev; results are filtered to `netdevs`
+// so a cross-zone-ambiguous parent excluded from the iifname scope is never
+// shielded.
+func junosHostZoneExemptNetdevs(cfg *Config, zoneName string, zone *ZoneConfig, netdevs []string) (ikeNetdevs, identNetdevs []string) {
+	if cfg == nil || zone == nil || len(netdevs) == 0 {
+		return nil, nil
 	}
-	svc := zoneEffectiveSystemServices(zc)
-	hasIdent := false
-	for _, s := range svc {
-		if HostInboundFullAdmitService(s) {
-			return false
-		}
-		if s == "ident-reset" {
-			hasIdent = true
-		}
+	keep := make(map[string]bool, len(netdevs))
+	for _, nd := range netdevs {
+		keep[nd] = true
 	}
-	return hasIdent
-}
-
-// zoneEffectiveSystemServices returns the zone-level system-services union with
-// every per-interface override (the coarse-admit set that governs exemptions).
-func zoneEffectiveSystemServices(zc *ZoneConfig) []string {
-	seen := map[string]bool{}
-	var out []string
-	add := func(list []string) {
-		for _, s := range list {
-			if s != "" && !seen[s] {
-				seen[s] = true
-				out = append(out, s)
+	// Per-netdev accumulation of the effective coarse verdict across every
+	// interface ref whose host-bound traffic arrives on it.
+	type verdict struct{ ike, ident, fullAdmit bool }
+	byNetdev := make(map[string]*verdict, len(netdevs))
+	note := func(nd, ref string) {
+		if nd == "" || !keep[nd] {
+			return
+		}
+		svc, _, _ := zone.InterfaceHostInboundEffective(ref)
+		v := byNetdev[nd]
+		if v == nil {
+			v = &verdict{}
+			byNetdev[nd] = v
+		}
+		if junosHostSvcAdmitsIKE(svc) {
+			v.ike = true
+		}
+		for _, s := range svc {
+			if HostInboundFullAdmitService(s) {
+				v.fullAdmit = true
+			}
+			if s == "ident-reset" {
+				v.ident = true
 			}
 		}
 	}
-	if zc.HostInboundTraffic != nil {
-		add(zc.HostInboundTraffic.SystemServices)
-	}
-	for _, ov := range zc.InterfaceHostInbound {
-		if ov != nil {
-			add(ov.SystemServices)
+	zoneByIface := junosHostZoneByInterface(cfg)
+	addRow := func(name, own, parent string, vlan int) {
+		if zoneByIface[name] != zoneName {
+			return
+		}
+		note(own, name)
+		if vlan != 0 && parent != "" {
+			note(parent, name)
 		}
 	}
-	return out
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for n := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, n)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		iface := cfg.Interfaces.Interfaces[ifName]
+		if iface == nil {
+			continue
+		}
+		addRow(ifName, junosHostLinuxName(cfg, ifName, nil), "", 0)
+		unitNums := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			unitNums = append(unitNums, u)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := iface.Units[un]
+			if unit == nil {
+				continue
+			}
+			unitName := fmt.Sprintf("%s.%d", ifName, un)
+			addRow(unitName, junosHostLinuxName(cfg, ifName, unit),
+				junosHostLinuxName(cfg, ifName, nil), unit.VlanID)
+		}
+	}
+	// Emit subsets in the sorted netdevs order for a deterministic iifname set.
+	for _, nd := range netdevs {
+		v := byNetdev[nd]
+		if v == nil {
+			continue
+		}
+		if v.ike {
+			ikeNetdevs = append(ikeNetdevs, nd)
+		}
+		if v.ident && !v.fullAdmit {
+			identNetdevs = append(identNetdevs, nd)
+		}
+	}
+	return ikeNetdevs, identNetdevs
 }
 
 // JunosHostZoneIngressNetdevs returns, per security zone, the sorted set of

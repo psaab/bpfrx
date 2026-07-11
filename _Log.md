@@ -46040,3 +46040,20 @@ top.
   Updated pkg/ddns/README.md size-bound contract. RED-on-revert verified.
   **File(s)**: pkg/ddns/state.go, pkg/ddns/state_readbound_5571_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5565 host-inbound — scope the fine junos-host IKE/ident
+  exemption shield to the SPECIFIC interfaces that configured it, not the
+  whole zone. Previously a per-interface `ike`/`ident-reset` override was
+  unioned into a single zone-wide `CoarseAdmitsIKE`/`CoarseIdentResets` bit
+  and emitted across the zone's whole iifname set, falsely admitting IKE /
+  RSTing ident on sibling interfaces. Added `IKEExemptNetdevs`/
+  `IdentResetNetdevs` (subsets of IngressNetdevs) computed per effective
+  interface view; the daemon scopes each shield to its subset. Zone-level
+  exceptions still cover every interface (subset == IngressNetdevs). The
+  zone-wide `application any` DROP is unchanged. Added RED-on-revert daemon
+  tests + updated docs/host-inbound-service-matrix.md.
+  **File(s)**: pkg/config/junos_host_deny.go,
+  pkg/dataplane/userspace/junos_host_deny.go, pkg/daemon/daemon_nft.go,
+  pkg/daemon/host_inbound_junos_host_iface_scope_5565_test.go,
+  docs/host-inbound-service-matrix.md, _Log.md

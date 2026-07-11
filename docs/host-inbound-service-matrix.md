@@ -620,9 +620,26 @@ helper never sees it, so a helper crash cannot lock management out).
   BEFORE the ND/PMTUD accepts and the residual full established accept, so a denied
   source's NEW *and* original-direction-established inbound (including its
   ND/PMTUD) are dropped — matching Rust's per-hit re-eval/teardown. ESP/AH (proto
-  50/51) are always exempt; IKE 500/4500 is shielded when the zone coarse-admits
-  `ike`; ident-reset TCP/113 keeps its RST when the zone's effective coarse verdict
-  is the RST (ident-reset set AND not `all`/`any-service`).
+  50/51) are always exempt; IKE 500/4500 is shielded when the ingress interface
+  coarse-admits `ike`; ident-reset TCP/113 keeps its RST when the interface's
+  effective coarse verdict is the RST (ident-reset set AND not `all`/`any-service`).
+  - **Per-interface scope of the IKE / ident shield (#5565).** The shield is
+    scoped to the SPECIFIC netdevs whose EFFECTIVE per-interface host-inbound set
+    (`InterfaceHostInboundEffective`, zone-level ∪ interface override) admits the
+    exemption — `JunosHostDenyProgram.IKEExemptNetdevs` / `IdentResetNetdevs`,
+    each a subset of the program's `IngressNetdevs`. A per-INTERFACE `ike` /
+    `ident-reset` override therefore shields only the interface(s) that configured
+    it (`iifname "<that-netdev>" ...`), never the whole zone iifname set — a
+    least-privilege override on one interface is not widened to a sibling that did
+    not configure it. A genuinely ZONE-LEVEL exception (authored on the zone's own
+    `host-inbound-traffic`) is folded into every interface's effective set, so its
+    subset equals `IngressNetdevs` and the shield stays zone-wide (no regression).
+    The zone-wide `application any` DROP itself is unaffected — the deny is a zone
+    policy and still scopes by the full zone iifname set; only the ACCEPT/RST
+    exemption ahead of it is narrowed. Before #5565 the shield used a single
+    zone-wide `CoarseAdmitsIKE` / `CoarseIdentResets` bit derived by unioning
+    every per-interface override, so one interface's `ike` falsely admitted IKE
+    on every interface in the zone.
   - **Operator note — exempt tuples survive an `application any` deny.** On an
     **IKE-admitting** zone, `from-zone Z to-zone junos-host { match source-address
     BAD; match application any; then deny; }` does **NOT** stop BAD's IKE / IPsec
