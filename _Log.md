@@ -45521,3 +45521,36 @@ top.
 - **File(s)**: scripts/deploy/xpf-deploy.py,
   scripts/deploy/test_xpf_deploy_image_roll_identity.py,
   docs/in-place-upgrade.md, _Log.md
+
+## 2026-07-10 — #5281 review fold: gate ip-monitoring route-overlay actuator
+- **Timestamp**: 2026-07-10
+- **Action**: SECURITY (rev-5548 MERGE-NEEDS-MINOR fold). The initial #5281
+  fix gated the daemon_apply.go writers + ipsecApplyForLeaseChange on
+  isResetting(), but the ip-monitoring route-overlay actuator
+  (actuateRouteOverlayLocked, pkg/daemon/daemon_ipmon.go) was NOT gated. It
+  acquires applySem and does a FULL re-render of /etc/frr/frr.conf
+  (d.applyFRRConfig(d.assembleFRRConfig(...))) from the in-memory ActiveConfig.
+  In the ~1s wipe->stop window (or graceful-shutdown drain), a probe flap with
+  `services ip-monitoring` configured + a dirty overlay would acquire the
+  just-released applySem, read the still-resident config, and RE-WRITE frr.conf
+  — re-materializing the ERASED BGP-MD5/OSPF/IS-IS routing-auth keys into a
+  world-readable file that SURVIVES the post-zeroize reboot, defeating the wipe.
+  Added `if d.isResetting() { return false }` at the top of
+  actuateRouteOverlayLocked (the frr.conf render chokepoint; returns false so
+  the engine stays dirty — the daemon is being wiped/stopped so the retry never
+  fires), matching the isResetting gates in daemon_apply.go.
+  Audited the other ungated applySem acquirers: only ip-monitoring (frr.conf)
+  and the DHCP-lease IPsec rebind (swanctl PSK, already gated via
+  ipsecApplyForLeaseChange) re-render an erased secret. DNS writes
+  /etc/resolv.conf (not wiped), proxy-ARP writes nft, the policy scheduler +
+  NAT-pool alarm touch dataplane/in-memory state, and the host-tunables restore
+  must run on shutdown — none re-render wiped state, so they stay ungated.
+- **Tests**: pkg/daemon/daemon_ipmon_test.go — TestActuateRouteOverlaySkipsWhenResetting
+  asserts actuateRouteOverlayLocked is a no-op (returns false, RecordingExecutor
+  ReloadCalls==0 so frr.conf is NOT re-rendered, no dp publish/bump) when
+  isResetting() is true. RED-on-revert verified: removing the gate → the actuator
+  renders frr.conf (ReloadCalls=1) + publishes → test FAILS.
+- **Validation**: `GOCACHE=/tmp/gocache-5281 GOTMPDIR=/tmp go build ./...` green;
+  `go test -race ./pkg/daemon/... ./pkg/grpcapi/...` green; gofmt clean.
+- **File(s)**: pkg/daemon/daemon_ipmon.go, pkg/daemon/daemon_ipmon_test.go,
+  pkg/daemon/README.md, _Log.md

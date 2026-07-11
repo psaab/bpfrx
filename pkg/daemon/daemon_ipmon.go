@@ -267,6 +267,20 @@ func (d *Daemon) actuateRouteOverlay(ctx context.Context) bool {
 // userspace snapshot are left in a consistent, converged state; a false
 // return signals the engine to keep the state dirty and retry (#3757).
 func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) bool {
+	// #5281: refuse to actuate once a factory reset has entered the terminal
+	// reset generation. This actuator re-renders /etc/frr/frr.conf (the WORLD-
+	// readable file that carries the xpf-managed BGP-MD5 / OSPF / IS-IS routing-
+	// auth keys) from the still-resident in-memory ActiveConfig. In the ~1s
+	// wipe→stop window (or the graceful-shutdown drain) an ip-monitoring sweep
+	// triggered by a probe flap would otherwise acquire the just-released
+	// applySem and re-materialize the ERASED routing-auth keys into a file that
+	// SURVIVES the post-zeroize reboot — defeating the wipe. Return false so the
+	// ipmon engine keeps the state dirty (no half-actuation); the daemon is
+	// being wiped/stopped, so the retry never fires.
+	if d.isResetting() {
+		return false
+	}
+
 	overlay := d.ipmonActiveOverlay()
 
 	// 1. Re-render FRR through the shared constructor. A HARD FRR reload
