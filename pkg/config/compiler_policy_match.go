@@ -159,6 +159,70 @@ var swallowedStructuralMatchTokens = map[string]bool{
 	"to-zone":   true,
 }
 
+// policyMatchLeafFinding describes one unsupported / swallowed policy `match`
+// leaf violation (#3113/#3142/#3673). For a plain unsupported leaf (or an
+// unsupported keyword collapsed onto a multi-value leaf's tail), swallowed is
+// false and leaf names the offending leaf/keyword. For a #3673 structural
+// keyword absorbed as an operand, swallowed is true, leaf names the multi-value
+// leaf that absorbed it, and tok names the reserved keyword.
+type policyMatchLeafFinding struct {
+	swallowed bool
+	leaf      string
+	tok       string
+}
+
+// policyUnsupportedMatchLeafFindings returns every unsupported / swallowed
+// `match` leaf violation in a policy node's UNION of `match {}` blocks, in
+// declaration order. It is the single source of truth shared by the #3113
+// strict gate (validatePolicyMatchLeavesStrict) and compilePolicy's #5575
+// fail-closed LenientContentDropped flag: the strict gate turns each finding
+// into a reject/warning while compilePolicy only needs to know a policy has ANY
+// finding (so its dropped-leaf-widened match compiles fail-closed). Sharing one
+// walk keeps the reject gate and the runtime poison decision from diverging on
+// the #3142 collapsed-tail and #3673 swallowed-keyword escapes.
+//
+// #3842: inspects EVERY `match {}` block (policyMatchChildren), not just the
+// first via FindChild — a duplicate inner match block (load merge/override
+// appends a second `match` child) is compiled by compilePolicy and can carry an
+// unsupported leaf.
+func policyUnsupportedMatchLeafFindings(polNode *Node, isGlobal bool) []policyMatchLeafFinding {
+	var out []policyMatchLeafFinding
+	for _, m := range policyMatchChildren(polNode) {
+		leaf := m.Name()
+		// #3148: from-zone/to-zone are supported match context for a global
+		// policy only; under a zone-pair policy they fall through to the
+		// unsupported finding below.
+		if isGlobal && globalOnlyPolicyMatchLeaves[leaf] {
+			continue
+		}
+		if supportedPolicyMatchLeaves[leaf] {
+			// #3142: a multi:true match leaf (application/source-address/
+			// destination-address) absorbs trailing non-sibling tokens onto its
+			// own node (Keys[1:] + child sub-nodes — the #2419 collapse). An
+			// unsupported match-leaf keyword written after the supported leaf's
+			// value lands in this tail, invisible to a direct-child scan. Flag
+			// any known unsupported match-leaf keyword found in the collapsed
+			// tail (a real value is never one of these keywords, so legit
+			// `application [ junos-http junos-https ]` is not over-flagged).
+			for _, tok := range firewallMatchValues(m) {
+				if unsupportedPolicyMatchLeaves[tok] {
+					out = append(out, policyMatchLeafFinding{leaf: tok})
+				}
+				// #3673: from-zone/to-zone are not zone-pair match siblings, so
+				// they collapse onto this multi-value leaf's tail and are
+				// consumed as bogus application/address operands. Flag them as a
+				// reserved keyword masquerading as a value.
+				if swallowedStructuralMatchTokens[tok] {
+					out = append(out, policyMatchLeafFinding{swallowed: true, leaf: leaf, tok: tok})
+				}
+			}
+			continue
+		}
+		out = append(out, policyMatchLeafFinding{leaf: leaf})
+	}
+	return out
+}
+
 // validatePolicyMatchLeavesStrict walks the `security policies` subtree of
 // the group-expanded AST and rejects any policy whose `match` clause
 // carries a leaf the compiler does not enforce (see file header). Covers
@@ -207,51 +271,14 @@ func validatePolicyMatchLeavesStrict(nodes []*Node, lenient bool) ([]string, err
 	}
 
 	checkPolicy := func(scope, policyName string, polNode *Node, isGlobal bool) error {
-		// #3842: inspect EVERY `match {}` block (policyMatchChildren), not just
-		// the first via FindChild. A duplicate inner match block (load merge/
-		// override appends a second `match` child) is compiled by compilePolicy
-		// and can carry an unsupported leaf; a FindChild-first walk here never
-		// validated it, so the second block's leaf was silently dropped and the
-		// policy widened with a clean commit.
-		for _, m := range policyMatchChildren(polNode) {
-			leaf := m.Name()
-			// #3148: from-zone/to-zone are supported match context for a
-			// global policy only; under a zone-pair policy they fall through
-			// to the unsupported reject below.
-			if isGlobal && globalOnlyPolicyMatchLeaves[leaf] {
-				continue
-			}
-			if supportedPolicyMatchLeaves[leaf] {
-				// #3142: a multi:true match leaf (application/source-address/
-				// destination-address) absorbs trailing non-sibling tokens
-				// onto its own node (Keys[1:] + child sub-nodes — the #2419
-				// collapse). An unsupported match-leaf keyword written after
-				// the supported leaf's value lands in this tail, invisible to
-				// the direct-child scan above. Re-apply the reject to any
-				// known unsupported match-leaf keyword found in the collapsed
-				// tail (a real value is never one of these keywords, so legit
-				// `application [ junos-http junos-https ]` is not over-rejected).
-				for _, tok := range firewallMatchValues(m) {
-					if unsupportedPolicyMatchLeaves[tok] {
-						if err := emit(scope, policyName, tok); err != nil {
-							return err
-						}
-					}
-					// #3673: from-zone/to-zone are not zone-pair match siblings,
-					// so they collapse onto this multi-value leaf's tail and are
-					// consumed as bogus application/address operands. Reject them
-					// as a reserved keyword masquerading as a value — the sibling
-					// of the #3142 unsupported-leaf tail escape for the
-					// zone-context tokens.
-					if swallowedStructuralMatchTokens[tok] {
-						if err := emitSwallowed(scope, policyName, leaf, tok); err != nil {
-							return err
-						}
-					}
+		for _, f := range policyUnsupportedMatchLeafFindings(polNode, isGlobal) {
+			if f.swallowed {
+				if err := emitSwallowed(scope, policyName, f.leaf, f.tok); err != nil {
+					return err
 				}
 				continue
 			}
-			if err := emit(scope, policyName, leaf); err != nil {
+			if err := emit(scope, policyName, f.leaf); err != nil {
 				return err
 			}
 		}

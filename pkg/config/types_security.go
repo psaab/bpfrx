@@ -386,6 +386,30 @@ type Policy struct {
 	// emit an accepted-but-inert / probable-typo advisory. Recorded in config
 	// order so the warning is deterministic.
 	UnknownChildren []string
+	// LenientContentDropped marks a policy the TOLERANT compile path
+	// (CompileConfigLenient / CompileConfigForNodeLenient) accepted only by
+	// DOWNGRADING a hard reject to a warning for a match / then-permit
+	// constraint the compiler then SILENTLY DROPPED — a MISSING required match
+	// dimension (#3044), an UNSUPPORTED `match` leaf (#3113, incl. the #3142
+	// collapsed-tail and #3673 swallowed-keyword escapes), or an UNSUPPORTED
+	// `then permit` modifier (#3114). In each case the dropped constraint
+	// leaves the corresponding dimension EMPTY / the permit UNCONDITIONAL, and
+	// the userspace matcher reads an empty dimension as match-ANY — a permit
+	// BROADER than the operator configured (a security fail-OPEN on the
+	// persisted-load / peer-sync path, #5575). The strict commit path
+	// hard-rejects all three before compilePolicy runs, so this flag is only
+	// ever set on the tolerant load / peer-sync path; a clean strict-committed
+	// policy always leaves it false (byte-identical snapshots).
+	//
+	// compilePolicy derives it (never the raw AST / wire), so it is recomputed
+	// identically on both HA peers and needs no serialization. The userspace
+	// snapshot builder (buildOneRuleSnapshot) poisons such a policy with the
+	// __unsupported__ application sentinel so the Rust integrity preflight
+	// rejects the WHOLE snapshot (previous-good retained; fresh-boot
+	// default-deny) — an action-agnostic fail-CLOSED that turns the widened
+	// permit (and a symmetric over-broad deny) into never-match instead of
+	// match-any.
+	LenientContentDropped bool
 }
 
 // PolicyMatch defines what traffic a policy matches.

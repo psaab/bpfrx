@@ -45906,3 +45906,38 @@ top.
   **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/cutover.go,
   cmd/xpfd/upgrade.go, docs/in-place-upgrade.md,
   pkg/upgrade/cutover_cluster_gate_indeterminate_5573_test.go, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5575 fix — lenient policy compilation no longer publishes a
+  missing/dropped match constraint as a wildcard permit (permit-widening on
+  lenient/HA load). `CompileConfigLenient` downgrades the #3044 missing-match /
+  #3113 unsupported-match-leaf / #3114 unsupported-then-permit rejects to
+  warnings but `compilePolicy` then dropped the constraint, leaving the
+  dimension EMPTY → the userspace matcher read empty as match-ANY → a permit
+  broader than configured (fail-open). Extracted the three per-policy predicates
+  the strict gates use into shared SSOT helpers
+  (`policyMissingRequiredMatchDimensions`, `policyUnsupportedMatchLeafFindings`,
+  `policyUnsupportedThenPermitModifiers`); `compilePolicy` (now taking
+  `isGlobal`) sets a new `Policy.LenientContentDropped` flag for exactly the
+  policies a strict commit would reject; `buildOneRuleSnapshot` poisons such a
+  rule with the `__unsupported__` application sentinel → Rust integrity preflight
+  rejects the WHOLE snapshot (previous-good retained / fresh-boot default-deny),
+  action-agnostic fail-CLOSED. Preserves the intentional-empty (explicit `any`)
+  case (non-empty slice → match-any, flag false). Go-only (reuses the existing
+  #2124/#3261 sentinel; no Rust change). Regenerated golden_4406 baseline (new
+  typed field; only `strict-violations/lenient` policy p1 flags true). Added
+  config-layer + userspace end-to-end fail-on-revert tests; proved RED-on-revert
+  by neutralizing the snapshot poison. Updated pkg/config/README.md (new #5575
+  section) + field/helper/const doc comments. Gates: go build ./... green;
+  go test ./pkg/config/... ./pkg/dataplane/... ./pkg/policymatch/... ./pkg/api/...
+  ./pkg/grpcapi/... ./pkg/configstore/... ./pkg/cluster/... ./cmd/cli/... green;
+  go vet clean; gofmt clean.
+  **File(s)**: pkg/config/types_security.go,
+  pkg/config/compiler_security_policy.go,
+  pkg/config/compiler_policy_missing_match.go,
+  pkg/config/compiler_policy_match.go, pkg/config/compiler_policy_then.go,
+  pkg/config/README.md, pkg/config/testdata/golden_4406.json,
+  pkg/config/lenient_permit_widening_5575_test.go,
+  pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/policies_lower.go,
+  pkg/dataplane/userspace/lenient_permit_widening_5575_test.go, _Log.md
