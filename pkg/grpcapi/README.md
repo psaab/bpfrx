@@ -270,6 +270,23 @@ contract.
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
+- **MonitorInterface peer proxy — one-hop bound (#5497).** For a RETH (or
+  a peer-owned physical member) `MonitorInterface` may forward the stream
+  to the cluster peer (`proxyMonitorInterface` → `dialPeer`). Two invariants
+  keep this to a single hop, so one management stream stays O(1) in
+  server/client resources: (1) it proxies a locally-present RETH ONLY when
+  the peer ACTUALLY owns the RG — `!IsLocalPrimary(rg) && IsPeerPrimary(rg)`
+  (`decideMonitorProxy`), never merely because the local node is not primary;
+  during both-secondary / election / sync-hold / disabled / peer-lost NEITHER
+  node is primary, so it serves locally instead. (2) The proxy stamps the
+  `xpf-no-peer` hop marker on the outgoing context (the chassis-forwarding
+  convention); a request arriving WITH that marker is served locally / reported
+  not-found and NEVER re-proxied. Before #5497 the trigger was `!IsLocalPrimary`
+  alone with no marker, so two non-primary nodes proxied to each other in an
+  A→B→A loop that stormed connections/streams/goroutines. `IsPeerPrimary` lives
+  on `cluster.Manager` (reads the heartbeat-advertised peer RG state; false when
+  the peer is not alive). The marker only ever SUPPRESSES a second hop, so it
+  cannot be spoofed to reach data a client could not otherwise reach.
 - **Bounded shutdown (#4910).** Both listeners stop through
   `stopGRPCServer` (`server.go`): `GracefulStop` runs in a goroutine and,
   if active RPCs have not finished within `grpcStopTimeout`, `Stop()`
