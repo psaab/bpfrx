@@ -79,6 +79,30 @@ func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
 	return b.String()
 }
 
+// staticRouteRendersFIB reports whether generateStaticRouteInTable will emit
+// at least one FRR FIB line for sr. It is the single source of truth for
+// "does this static route install a route", shared by
+// generateStaticRouteInTable's zero-next-hop early return and by
+// renderDHCPDefaults' DHCP-default suppression (#5519) so the two can never
+// disagree. It mirrors generateStaticRouteInTable's emit structure exactly:
+//   - a next-table route is realized by an `ip rule` in the routing package,
+//     not FRR, so it renders no FRR FIB line here;
+//   - a discard/reject route renders a negative (Null0/reject) route;
+//   - otherwise a route renders one line per next-hop, so it needs >= 1.
+//
+// A zero-next-hop, non-discard route (e.g. the last ECMP next-hop of a static
+// default was deleted, #3872) renders nothing. Before #5519, renderDHCPDefaults
+// treated ANY 0.0.0.0/0 static route as suppressing the DHCP-learned default,
+// so such a route rendered no FIB entry yet still masked the DHCP fallback —
+// leaving NO default route at all (WAN / management remote lockout). Deriving
+// suppression from renderability closes that gap.
+func staticRouteRendersFIB(sr *config.StaticRoute) bool {
+	if sr.NextTable != "" {
+		return false
+	}
+	return sr.Discard || sr.Reject || len(sr.NextHops) > 0
+}
+
 // generateStaticRoute produces FRR static route commands.
 // Multiple next-hops produce one line each (FRR creates ECMP).
 // Routes with NextTable are handled via ip rule (policy routing), not FRR.
@@ -136,8 +160,12 @@ func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName str
 	// delete-side). Render NOTHING rather than a Null0 blackhole: silently
 	// blackholing traffic that would otherwise fall through to a default /
 	// more-specific route is a fail-wide. (An explicit `discard`/`reject`
-	// above still renders its negative-route line.)
-	if len(sr.NextHops) == 0 {
+	// above still renders its negative-route line.) Gated through the shared
+	// staticRouteRendersFIB predicate: at this point NextTable is empty and
+	// discard/reject are already handled above, so this reduces exactly to
+	// len(sr.NextHops) == 0 — but routing it through the predicate keeps this
+	// emit test and renderDHCPDefaults' suppression test from drifting (#5519).
+	if !staticRouteRendersFIB(sr) {
 		return ""
 	}
 
@@ -221,27 +249,40 @@ func renderGenerateRoutes(b *strings.Builder, fc *FullConfig) {
 // default route (option-3 gateway or the option-121 0.0.0.0/0 entry) plus
 // any RFC 3442 classless static routes (option 121 / legacy 249), each
 // carried on its DHCPRoute with a non-empty Destination. The default route
-// is suppressed when an explicit static default route exists for the same
-// address family so the management interface's DHCP gateway doesn't compete
-// with configured routes; classless static routes are more-specific and are
-// never suppressed by a static default. Both families bind the route to the
-// originating interface when the lease records one (dr.Interface != ""), so
-// that in multi-WAN / shared-gateway-IP deployments the kernel can pick the
-// correct egress instead of leaving an ambiguous gateway-only default.
+// is suppressed when a static default route of the same address family
+// actually RENDERS a FIB entry (staticRouteRendersFIB) so the management
+// interface's DHCP gateway doesn't compete with configured routes; a static
+// 0.0.0.0/0 (or ::/0) stanza that renders nothing — a zero-next-hop,
+// non-discard default (#3872) — does NOT suppress the DHCP fallback, else no
+// default route is installed at all (#5519, remote lockout). Classless static
+// routes are more-specific and are never suppressed by a static default. Both
+// families bind the route to the originating interface when the lease records
+// one (dr.Interface != ""), so that in multi-WAN / shared-gateway-IP
+// deployments the kernel can pick the correct egress instead of leaving an
+// ambiguous gateway-only default.
 func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 	if len(fc.DHCPRoutes) == 0 {
 		return
 	}
+	// Suppression is derived from the static default's ACTUAL renderability, not
+	// merely the presence of a 0.0.0.0/0 (or ::/0) stanza (#5519). A static
+	// default that renders NO FIB entry — a zero-next-hop, non-discard route
+	// left behind after the last ECMP next-hop was deleted (#3872) — must NOT
+	// suppress the DHCP-learned fallback: otherwise the config installs no
+	// default route at all (WAN / management remote lockout). Only a static
+	// default that actually renders a FIB entry (has next-hop(s) or is an
+	// explicit discard/reject) suppresses the DHCP default, matching the
+	// pre-#5519 behavior for those cases exactly.
 	hasV4Default := false
 	for _, sr := range fc.StaticRoutes {
-		if sr.Destination == "0.0.0.0/0" {
+		if sr.Destination == "0.0.0.0/0" && staticRouteRendersFIB(sr) {
 			hasV4Default = true
 			break
 		}
 	}
 	hasV6Default := false
 	for _, sr := range fc.Inet6StaticRoutes {
-		if sr.Destination == "::/0" {
+		if sr.Destination == "::/0" && staticRouteRendersFIB(sr) {
 			hasV6Default = true
 			break
 		}
