@@ -45654,3 +45654,10 @@ top.
   test/incus/step2-sched-switch-reduce_test.py,
   test/incus/step2-sched-switch-classify.py,
   test/incus/step2-sched-switch-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-132 — step1-histogram-classify tracks failed_cells; --only-cell
+  returns non-zero if the target cell produced no hist-blocks; full run returns
+  2 when no valid cells (kills "k_D1 = 0 of 0" exit 0) and 1 on missing/corrupt
+  cells. Added --only-cell missing-target fail-on-revert test.
+- **File(s)**: test/incus/step1-histogram-classify.py,
+  test/incus/step1-histogram-classify_test.py
