@@ -6,10 +6,39 @@ import (
 	"math/rand"
 	"net"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// SNMP trap categories (Junos `snmp trap-group <g> categories <cat>`). A
+// notification is dispatched to a trap-group only if the group is scoped to the
+// notification's category (or has no category scope = all). Link up/down traps
+// are tagged snmpCategoryLink; future category-tagged traps reuse the same
+// groupWantsCategory guard with their own category constant.
+const snmpCategoryLink = "link"
+
+// groupWantsCategory reports whether trap-group tg should receive a
+// notification tagged with category cat. A group with NO categories configured
+// receives EVERY category — the Junos default for a trap-group without a
+// `categories` stanza. A group scoped to specific categories receives only
+// those, so a group that omits (excludes) cat is skipped. Comparison is
+// case-insensitive to match the schema's free-form category tokens (#5522).
+func groupWantsCategory(tg *config.SNMPTrapGroup, cat string) bool {
+	if tg == nil {
+		return false
+	}
+	if len(tg.Categories) == 0 {
+		return true // no scope = all categories (Junos default)
+	}
+	for _, c := range tg.Categories {
+		if strings.EqualFold(strings.TrimSpace(c), cat) {
+			return true
+		}
+	}
+	return false
+}
 
 // SNMPv2-Trap PDU type (context-specific, constructed, tag 7).
 const pduSNMPv2Trap = 0xa7
@@ -266,6 +295,15 @@ func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
 	// deterministic (sorted) order so log output and dispatch ordering are
 	// stable across runs.
 	for _, tg := range sortedTrapGroups(cfg) {
+		// #5522: enforce the trap-group category filter. A link trap is in the
+		// "link" category; a group scoped to exclude link (e.g. `categories
+		// [configuration]`) must NOT receive it. A group with no `categories`
+		// stanza receives all categories (Junos default), so groupWantsCategory
+		// returns true for it. Without this gate the configured filter was
+		// silently inert — the discarded-Categories filter bypass.
+		if !groupWantsCategory(tg, snmpCategoryLink) {
+			continue
+		}
 		pkts := a.buildLinkTrapsForVersion(community, tg.Version, linkUp, ifindex, ifname)
 		for _, target := range tg.Targets {
 			for _, pkt := range pkts {
