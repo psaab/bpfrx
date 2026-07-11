@@ -676,3 +676,66 @@ cluster + perf + `make test-failover` before merge). Until Increment 2
 lands, only the first configured WG listen port is steered, so a second
 tunnel on a different port will not receive inbound transport packets.
 Design of record: `docs/research/1434-multi-tunnel-wireguard/plan.md`.
+
+## Host-inbound admission of the WG listen port (#5582)
+
+The shim steers local-destination UDP on the configured WG listen port to
+the kernel (`wg_steer_to_kernel`, `userspace-xdp/src/lib.rs`) so the
+userspace WireGuard control socket receives the outer transport. But the
+kernel input path is also guarded by the host-inbound nftables chain
+(`inet xpf_hostinbound`, `pkg/daemon/daemon_nft.go`): on a **restricted**
+security zone (a zone with a `host-inbound-traffic` set that does not open
+the WG port, or no stanza at all — Junos default-deny) the per-zone
+catch-all silently DROPs everything not explicitly admitted.
+
+A returning packet for an xpf-**initiated** handshake is `ct state
+established` and passes, which is why interop where xpf dials out first
+succeeded. But a **fresh passive (responder-only) handshake** — the
+supported "external peer initiates, xpf listens" config — is conntrack
+`NEW`: it misses the service accepts and hits the catch-all drop, so a
+responder-only listener on a restricted zoned address could never come up
+after boot / conntrack expiry.
+
+**Fix (#5582): a dynamic, automatic host-inbound admission tied to the
+configured listen port(s) — not a static `system-services` token.** When
+any WG tunnel is configured, `buildHostInboundFilterPayload` emits a
+single coarse `udp dport <configured-wg-port(s)> accept` on the input
+hook (`emitHostInboundWireGuardAccept`). Rationale:
+
+- **Automatic, not a manual token.** The shim *already* steers the port
+  unconditionally; requiring the operator to separately open it would let
+  the shim steer a packet the kernel then drops. A configured WireGuard
+  listener therefore *implies* host admission of exactly its listen port.
+- **Dynamic port, so no static SSOT token.** WireGuard's port is
+  operator-configured, so it does not fit the static token→port SSOT
+  (`config.HostInboundServiceMatch`, e.g. `ssh`→22) that the nft mirror
+  and the Rust classifier render from; a `system-services wireguard`
+  token would need a fake fixed port and would break the token-parity
+  tests. The port set is the compile-time SSOT
+  `config.WireGuardListenPorts()` (all configured WG tunnels).
+- **Scoped to the shim's steering, not widened.** The rule is a single
+  global accept, but the nft `input` hook only ever sees host-destined
+  packets, so a bare `udp dport <port>` admits the WG port to **every
+  firewall-local address** — exactly the shim's `is_local_destination`
+  scope — while transit/forward UDP (which traverses the `forward` hook,
+  never this chain) is untouched, so transit/DNAT UDP on the WG port is
+  never shunted around policy. Only the WG port is opened; every other
+  host-bound service stays under the per-zone default-deny.
+- **Composes with the #5565 per-interface host-inbound scoping.** With a
+  `to-zone junos-host` DENY program present, the WG accept is placed
+  AFTER the fine iifname-scoped DROP subchain, so an explicit operator
+  junos-host deny of a WG source still wins; it is a coarse admit like
+  the ND/PMTUD accepts.
+
+**Runtime-vs-config nuance:** the admission uses the CONFIGURED listen
+port (the compile-time SSOT), which is also what the shim packs into the
+ctrl block, so kernel filter and shim steering agree. The shim's
+single-port WG-RX steering (S2a) only steers the FIRST configured port
+today (see "Multi-tunnel status" above); the host-inbound filter admits
+ALL configured WG ports, so a second-tunnel rule is currently a no-op at
+the kernel (nothing steers that port up) but is correct-in-intent and
+ready for the deferred multi-tunnel steering (#1434 Increment 2).
+
+Fail-on-revert guards: `TestHostInboundFilterAdmitsWireGuardListenPort`
+and `TestHostInboundFilterWireGuardPayloadParses` (`pkg/daemon`),
+`TestWireGuardListenPorts_5582` (`pkg/config`).

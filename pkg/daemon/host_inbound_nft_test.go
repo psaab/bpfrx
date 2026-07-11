@@ -81,7 +81,7 @@ func hostInboundTestConfig() *config.Config {
 func TestHostInboundFilterAcceptsListedDeniesRest(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	mustContain := []string{
 		"table inet xpf_hostinbound",
@@ -131,7 +131,7 @@ func TestHostInboundFilterAcceptsListedDeniesRest(t *testing.T) {
 func TestHostInboundFilterDropRulesCounted(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	for _, fam := range []struct{ family, addr string }{
 		{"ip", "172.16.50.8"},
@@ -187,7 +187,7 @@ func TestHostInboundFilterDropRulesCounted(t *testing.T) {
 func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	espAH := "meta l4proto { 50, 51 } accept"
 	if !strings.Contains(payload, espAH) {
@@ -254,7 +254,7 @@ func TestHostInboundFilterExemptsIPsecAndV6Errors(t *testing.T) {
 func TestHostInboundFilterNoStanzaDefaultDeny(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// lan's reth1 address must now be scoped by a catch-all drop.
 	wantDrop := hiDrop("ip", "10.0.61.1", "lan")
@@ -276,7 +276,7 @@ func TestHostInboundFilterNoStanzaDefaultDeny(t *testing.T) {
 func TestHostInboundFilterLifelineNeverDenied(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// em0's address (cluster control plane) must never be denied/scoped, even
 	// though the control zone declares a host-inbound stanza.
@@ -308,7 +308,7 @@ func TestHostInboundFilterAllOpensZoneNoDeny(t *testing.T) {
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 	if !strings.Contains(payload, "ip daddr 10.1.1.1 accept") {
 		t.Errorf("`all` zone must accept everything to its addr:\n%s", payload)
 	}
@@ -339,7 +339,7 @@ func TestHostInboundFilterProtocolsAllScopedToRouting(t *testing.T) {
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// Routing protocols must be accepted: ospf (proto 89), bgp (tcp/179),
 	// vrrp (proto 112).
@@ -393,7 +393,7 @@ func TestHostInboundFilterExplicitSshStillAdmitted(t *testing.T) {
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	if !strings.Contains(payload, "ip daddr 10.3.3.1 tcp dport 22 accept") {
 		t.Errorf("system-services ssh must accept tcp/22:\n%s", payload)
@@ -430,7 +430,7 @@ func TestHostInboundFilterFamilyAware(t *testing.T) {
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// v4-only tokens accepted under ip, dual-family ssh under both.
 	mustContain := []string{
@@ -499,7 +499,7 @@ func TestHostInboundFilterConfiguredControlInterfaceLifeline(t *testing.T) {
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// fxp1's control-link address must NEVER appear (accept or drop): it is the
 	// configured cluster control-interface and so a lifeline (#3277).
@@ -679,7 +679,7 @@ func identResetTestConfig() *config.Config {
 func TestHostInboundFilterIdentResetEmitsReset(t *testing.T) {
 	cfg := identResetTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// The ident-reset rule must be a reject-with-tcp-reset on TCP/113, per family.
 	mustContain := []string{
@@ -742,7 +742,7 @@ func TestHostInboundFilterAllSuppressesIdentReset(t *testing.T) {
 		},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	if !strings.Contains(payload, "ip daddr 10.1.1.1 accept") {
 		t.Errorf("`all` zone must accept everything to its addr:\n%s", payload)
@@ -815,7 +815,7 @@ func TestHostInboundFilterIdentResetPayloadParses(t *testing.T) {
 		HostInboundTraffic: &config.HostInboundTraffic{SystemServices: []string{"ssh"}},
 	}
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// Sanity: the raw payload must still carry the #3310 reject rule and the
 	// #3361 named-counter declaration — otherwise the parse check is vacuous.
@@ -860,7 +860,7 @@ func TestHostInboundFilterIdentResetPayloadParses(t *testing.T) {
 func TestHostInboundFilterCounterDeclarationUnquoted(t *testing.T) {
 	cfg := hostInboundTestConfig()
 	views := buildAndCheckViews(t, cfg)
-	payload := buildHostInboundFilterPayload(views, nil, nil, nil)
+	payload := buildHostInboundFilterPayload(views, nil, nil, nil, nil)
 
 	// No QUOTED counter declaration may appear (a reference is `counter name
 	// "<n>"`, never `counter "<n>" {`).
