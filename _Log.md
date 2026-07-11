@@ -45787,3 +45787,27 @@ top.
   pkg/grpcapi/server_diag_monitor.go,
   pkg/grpcapi/server_diag_monitor_proxy_5497_test.go, pkg/grpcapi/README.md,
   _Log.md
+
+- **Timestamp**: 2026-07-10
+  **Action**: #5034 (C175-HC-073 remainder) — return a REAL filtered session
+  total from gRPC instead of the `-1` sentinel PR #5033 papered over in the
+  CLI. Rewrote `setSessionsTotal` (pkg/grpcapi/server_sessions.go): filtered
+  queries now do a count-only scan (`IterateSessions`/`…V6` + `matchV4/V6`,
+  no enrichment/allocation, forward-only) instead of setting `Total=-1`;
+  unfiltered still uses the lightweight `SessionCount()`. It returns an error
+  so a partial count-scan fails the RPC (`Internal`, #2469 discipline); the
+  three cursor-path call sites now propagate it. Updated the proto doc comment
+  on `GetSessionsResponse.total` and regenerated the Go bindings with the
+  repo-pinned toolchain (protoc 3.21.12 / protoc-gen-go v1.36.11 /
+  protoc-gen-go-grpc v1.6.1) — comment-only .pb.go delta, NO field added. CLI
+  renders the real total via a new `peerSessionsTotal` helper (removes the
+  #5033 `len(Sessions)` fallback, which undercounts a capped result).
+  Documented the `total` counter-semantics contract in pkg/grpcapi/README.md.
+  RED-on-revert verified for both the server (Total=-1 reappears) and CLI
+  (renders len()=2 not the real 4). Deferred (own larger design / other
+  packages): C175-HC-073 peer-summary filter, HC-063 alarms, HC-077 DNAT
+  pool-name, HC-082 owning-RG, HC-122 dhcprelay, HC-125 LLDP.
+  **File(s)**: proto/xpf/v1/xpf.proto, pkg/grpcapi/xpfv1/xpf.pb.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_filtered_total_5034_test.go,
+  pkg/grpcapi/README.md, pkg/cli/session_filter.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/peer_sessions_total_5034_test.go, _Log.md
