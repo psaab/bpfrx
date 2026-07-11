@@ -117,7 +117,9 @@ def bucket_index_for_ns(ns: int) -> int:
 # We only need:
 #   - the event name (sched_switch / sched_wakeup / sched_stat_runtime)
 #   - the timestamp (float seconds, absolute unix wall-clock — see below)
-#   - for sched_switch: prev_pid, prev_state
+#   - for sched_switch: prev_pid, prev_state, next_pid (next_pid closes a
+#     worker's off-CPU interval at schedule-in; prev_pid opens one at
+#     schedule-out — see C175-HC-026 in reduce_events)
 #   - for sched_wakeup: the target pid (field `pid=`, not `target_cpu=`)
 #   - for sched_stat_runtime: the tid (column 2) and `runtime=<ns>`
 #
@@ -157,6 +159,7 @@ LINE_HEADER_RE = re.compile(
 # Field pulls from `rest`.
 SWITCH_PREV_PID_RE = re.compile(r"\bprev_pid=(\d+)\b")
 SWITCH_PREV_STATE_RE = re.compile(r"\bprev_state=(\S+)")
+SWITCH_NEXT_PID_RE = re.compile(r"\bnext_pid=(\d+)\b")
 WAKEUP_PID_RE = re.compile(r"\bpid=(\d+)\b")
 STAT_RUNTIME_NS_RE = re.compile(r"\bruntime=(\d+)\b")
 
@@ -198,10 +201,13 @@ def parse_perf_script(path: Path) -> Iterator[tuple[str, int, int, dict]]:
             if event == "sched:sched_switch":
                 pm = SWITCH_PREV_PID_RE.search(rest)
                 sm = SWITCH_PREV_STATE_RE.search(rest)
+                nm = SWITCH_NEXT_PID_RE.search(rest)
                 if pm:
                     fields["prev_pid"] = int(pm.group(1))
                 if sm:
                     fields["prev_state"] = sm.group(1)
+                if nm:
+                    fields["next_pid"] = int(nm.group(1))
             elif event == "sched:sched_wakeup":
                 wm = WAKEUP_PID_RE.search(rest)
                 if wm:
@@ -417,40 +423,63 @@ def reduce_events(
         if event == "sched:sched_switch":
             prev_pid = fields.get("prev_pid")
             prev_state = fields.get("prev_state", "")
+            next_pid = fields.get("next_pid")
+            # C175-HC-026: an off-CPU interval ends when the worker is
+            # scheduled back IN (sched_switch with next_pid=worker), NOT
+            # at sched_wakeup.  A worker preempted while still runnable
+            # (prev_state=R) never sleeps, so the kernel emits no
+            # sched_wakeup for it; closing intervals on wakeup meant that
+            # interval was never closed and involuntary preemption time
+            # was silently dropped — the exact signature this harness is
+            # meant to measure.  Closing on schedule-in captures both
+            # voluntary sleeps (woken, then scheduled) and involuntary
+            # preemptions (runnable the whole time, later rescheduled).
+            if next_pid in worker_tids and next_pid in off_start_ns:
+                t_off = off_start_ns[next_pid]
+                delta_ns = t_event_wall_ns - t_off
+                state = off_state.get(next_pid, "")
+                # Defensive: the outer monotonicity guard already rejects
+                # rewound timestamps, so a schedule-in earlier than its
+                # own schedule-out should be unreachable under ordered
+                # perf input.
+                if delta_ns < 0:
+                    msg = (
+                        f"negative off-CPU delta for tid={next_pid} "
+                        f"(t_off={t_off}, t_in={t_event_wall_ns}); skipped"
+                    )
+                    warnings.append(msg)
+                    print(f"WARN: {msg}", file=warn_stream)
+                    off_start_ns.pop(next_pid, None)
+                    off_state.pop(next_pid, None)
+                else:
+                    b = block_for_timestamp(t_off, boundaries_ns)
+                    if 0 <= b < N_BLOCKS:
+                        bi = bucket_index_for_ns(delta_ns)
+                        buckets_by_block[b][bi] += delta_ns
+                        total_off_cpu_by_block[b] += delta_ns
+                        # prev_state captured at switch-OUT classifies the
+                        # interval: startswith("R") -> involuntary.
+                        if state.startswith("R"):
+                            if D1_LO <= bi <= D1_HI:
+                                involuntary_by_block[b] += delta_ns
+                        else:
+                            if D1_LO <= bi <= D1_HI:
+                                voluntary_by_block[b] += delta_ns
+                    off_start_ns.pop(next_pid, None)
+                    off_state.pop(next_pid, None)
+            # A worker being scheduled OUT opens a new off-CPU interval,
+            # tagged with its exit state (S/D/... = voluntary, R/R+ =
+            # involuntary preemption).
             if prev_pid in worker_tids:
                 off_start_ns[prev_pid] = t_event_wall_ns
                 off_state[prev_pid] = prev_state
         elif event == "sched:sched_wakeup":
-            pid = fields.get("pid")
-            if pid in worker_tids and pid in off_start_ns:
-                t_off = off_start_ns[pid]
-                delta_ns = t_event_wall_ns - t_off
-                state = off_state.get(pid, "")
-                # Monotonicity check per §3.2 / test case 4.
-                if delta_ns < 0:
-                    msg = (
-                        f"negative off-CPU delta for tid={pid} "
-                        f"(t_off={t_off}, t_wake={t_event_wall_ns}); skipped"
-                    )
-                    warnings.append(msg)
-                    print(f"WARN: {msg}", file=warn_stream)
-                    off_start_ns.pop(pid, None)
-                    off_state.pop(pid, None)
-                    continue
-                b = block_for_timestamp(t_off, boundaries_ns)
-                if 0 <= b < N_BLOCKS:
-                    bi = bucket_index_for_ns(delta_ns)
-                    buckets_by_block[b][bi] += delta_ns
-                    total_off_cpu_by_block[b] += delta_ns
-                    # prev_state classification: startswith("R") -> involuntary
-                    if state.startswith("R"):
-                        if D1_LO <= bi <= D1_HI:
-                            involuntary_by_block[b] += delta_ns
-                    else:
-                        if D1_LO <= bi <= D1_HI:
-                            voluntary_by_block[b] += delta_ns
-                off_start_ns.pop(pid, None)
-                off_state.pop(pid, None)
+            # Wakeup marks a task runnable but NOT yet on-CPU.  The off-CPU
+            # interval is closed at schedule-in (handled above), so a
+            # wakeup no longer ends it.  Retained as a consumed tracepoint
+            # (wake->schedule-in is run-queue latency) but it does not
+            # affect off-CPU duration accounting.
+            pass
         elif event == "sched:sched_stat_runtime":
             rn = fields.get("runtime_ns", 0)
             if tid in worker_tids:

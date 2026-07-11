@@ -45629,3 +45629,11 @@ top.
   (exit status is authoritative) + fail-on-revert test
 - **File(s)**: test/incus/fairness_multi_sample.py,
   test/incus/fairness_multi_sample_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-026 — step2 reducer closes off-CPU intervals at schedule-in
+  (sched_switch next_pid=worker), parses next_pid; wakeup no longer closes.
+  Involuntary preemption (prev_state=R, no wakeup) is now measured.
+  Rewrote synthetic + invariant tests to kernel-realistic switch-in fixtures;
+  added 3 regression tests.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-reduce_test.py
