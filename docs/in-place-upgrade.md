@@ -918,9 +918,32 @@ node from a new baked image ONE AT A TIME (built on the existing per-node
    mechanics stay environment-specific). The node boots the new base,
    factory-bootstraps its config DB from the day-0 text, verifies the
    dataplane.
-4. **poll** until it is back (xpfd answers `protocol-versions`), then
-   **rejoin** + confirm sync BEFORE touching node[1] (never-both-down;
-   the INC-2 `rejoin` verb). Repeat for node[1].
+4. **poll** until it is back **as the EXPECTED node on the EXPECTED
+   build**, then **rejoin** + confirm sync BEFORE touching node[1]
+   (never-both-down; the INC-2 `rejoin` verb). Repeat for node[1].
+
+   **Identity + version gate (#5075).** "Back" is NOT merely "some xpfd
+   answers `protocol-versions`". Before #5075 the poll accepted ANY
+   responding xpfd (a non-empty `xpf-version`), so a `--recreate-hook`
+   that relaunched the OLD image, a stale alias, or the WRONG node-id
+   satisfied it — the driver rejoined the wrong/old node and rolled the
+   peer onto unintended/mixed software, a **silent deploy-integrity
+   failure**. The poll now requires the responding daemon to be BOTH:
+   - the **expected build** — its live `xpf-version` EXACTLY equals the
+     AUTHENTICATED manifest's `xpf-version` (the same signed
+     `xpf-<ver>.manifest` bytes the mixed-base gate reads, so no extra
+     trust input is introduced), AND
+   - the **expected node** — its `/etc/xpf/node-id` (the marker xpfd
+     itself keys HA identity on) equals the cluster node-id the deploy
+     assigned this node (`--node0-id` / `--node1-id`).
+
+   The existing retry/timeout is preserved (keep polling until the gate
+   passes or `--boot-deadline` elapses), but a responding-but-wrong daemon
+   is **fail-closed**: the roll ERRORS with the never-both-down leases
+   HELD (the peer stays primary, the half-rolled pair is left for the
+   operator to investigate) instead of silently proceeding. Covered by
+   `scripts/deploy/test_xpf_deploy_image_roll_identity.py` (RED on revert:
+   the old node / wrong node-id is accepted and the roll completes).
 
 When draining node[1] (the SECOND node), its peer is the already-rolled
 NEW image, so the drain's exact-equality HA precheck is relaxed with
