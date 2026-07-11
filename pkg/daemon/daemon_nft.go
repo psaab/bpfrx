@@ -1368,16 +1368,39 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	// disjunctive set, not the Junos conjunction, and forbidden flags are not
 	// representable that way at all. Reuse the commit-validated parser to get
 	// the required/forbidden masks and emit the canonical
-	// `tcp flags & (mentioned-mask) == required` form. A parse error is
-	// unreachable for a committed config (compileFirewall rejects
-	// unrepresentable expressions), but if one slips through we drop the
-	// constraint with a warning rather than emit garbage that fails the whole
-	// ruleset open — mirroring the userspace lowering in
-	// pkg/dataplane/userspace/filters.go.
+	// `tcp flags & (mentioned-mask) == required` form.
+	//
+	// #5512: an UNREPRESENTABLE expression (a `|` disjunction, a De-Morgan
+	// negated group, an unknown flag, a dangling `!`, a `&` with no operand)
+	// cannot reach here from a normal commit — compileFirewall plus the #5455
+	// strict gate reject it. It CAN reach here from the LENIENT load path (peer
+	// session-sync, a #1960 fail-closed load-downgrade, a mixed-version
+	// snapshot), which admits the term with only a warning. The pre-#5512 code
+	// then DROPPED the tcp-flags predicate with a warning and emitted the term's
+	// configured verdict — WIDENING it: an `accept` term meant to admit only a
+	// specific flag combination (`syn & !ack`) now admitted EVERY TCP segment it
+	// scoped. On the PRIMARY host-inbound path (the XDP shim shunts host traffic
+	// to the kernel before userspace-dp, so this nft chain is the enforcement
+	// point — see the Disposition comment below) that is a control-plane
+	// fail-OPEN.
+	//
+	// The userspace lo0 evaluator fails the SAME input CLOSED: the snapshot
+	// builder sets TCPFlagsUnparseable (pkg/dataplane/userspace/filters.go) and
+	// the Rust filter compiler raises SnapshotIntegrityError::
+	// UnrepresentableFilterTCPFlags (userspace-dp/src/filter/compiler.rs),
+	// refusing the term rather than admitting it permissively. Mirror that
+	// direction here — but per-TERM: we must NOT reject the whole ruleset, since
+	// nft loads the lo0 table atomically and a rejected table leaves NO host
+	// filter = fail-OPEN (the exact trap the comma-join syntax error hit before
+	// this file was hardened). Record the unrepresentable expression and fail
+	// THIS term closed below (drop its scoped traffic) instead of appending a
+	// flag predicate.
+	tcpFlagsFailClosed := false
 	if len(term.TCPFlags) > 0 {
 		if required, forbidden, ok, err := config.ParseTCPFlagsExpression(term.TCPFlags); err != nil {
-			slog.Warn("dropping unrepresentable tcp-flags expression from lo0 filter term",
+			slog.Warn("lo0 kernel nftables mirror: unrepresentable tcp-flags expression, failing term CLOSED (drop) to match userspace (snapshot/version drift)",
 				"term", term.Name, "tcp_flags", term.TCPFlags, "error", err)
+			tcpFlagsFailClosed = true
 		} else if ok {
 			parts = append(parts, nftTCPFlagsMatch(required, forbidden))
 		}
@@ -1450,6 +1473,32 @@ func nftRulesFromTerm(term *config.FirewallFilterTerm, family string, prefixList
 	}
 	match := strings.Join(parts, " ")
 	modStr := strings.Join(mods, " ")
+
+	// #5512: fail-closed override for an unrepresentable tcp-flags expression.
+	// We could not render the flag narrowing, so emitting the term's normal
+	// verdict would WIDEN it (an accept-term would admit every TCP segment it
+	// scoped). Deny the term's scoped traffic instead — a per-term terminating
+	// `drop` that mirrors the userspace fail-closed direction (see the tcp-flags
+	// comment above) without failing the whole ruleset. This overrides the
+	// term's configured action for ALL dispositions: an accept-term's traffic is
+	// denied; a discard-term already drops; a reject-term's deny becomes a silent
+	// drop; a fall-through / routing-instance (PBR) term terminates as a drop
+	// rather than continuing (or accepting) permissively.
+	//
+	// Scope the drop to TCP with `meta l4proto 6`. A tcp-flags constraint only
+	// ever matches TCP in the userspace matcher (per_packet_l4_matches returns
+	// false for a non-TCP protocol, userspace-dp/src/filter/engine/matching.rs),
+	// so "everything the term would have matched" is a subset of TCP; the guard
+	// makes the drop a precise mirror instead of an over-broad one, and — when
+	// the term carried no other predicate (tcp-flags was its only match) —
+	// prevents a bare `drop` from denying ALL host-inbound traffic. The guard is
+	// redundant-but-valid nft when the term already constrains l4proto to TCP,
+	// and family-agnostic (`meta l4proto` works in both the ip and ip6 pass, like
+	// the reject lowering below). The honored log/count modifiers ride the rule
+	// so the fail-closed drops stay observable.
+	if tcpFlagsFailClosed {
+		return []string{joinNftFields(match, "meta l4proto 6", modStr, "drop")}
+	}
 
 	// Fall-through (#3427): a term with NO terminating action (explicit `then
 	// next term` or a modifier-only term) APPLIES its modifiers and continues to

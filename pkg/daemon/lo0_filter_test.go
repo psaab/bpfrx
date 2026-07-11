@@ -863,6 +863,177 @@ func TestNftRuleFromTermTCPFlags(t *testing.T) {
 	}
 }
 
+// TestNftRuleFromTermTCPFlagsUnrepresentableFailsClosed pins #5512: an
+// UNREPRESENTABLE tcp-flags expression on an lo0 filter term (a `|` disjunction,
+// an unknown flag, a dangling `!`, a `&` with no operand) must FAIL the term
+// CLOSED — a terminating `drop` of the term's scoped traffic — NOT drop the
+// tcp-flags constraint and emit the term's configured verdict (which, for an
+// accept-term, WIDENS it to admit every TCP segment the term scoped).
+//
+// The nft lo0 chain is the PRIMARY enforcement for host-bound traffic (the XDP
+// shim shunts it to the kernel before userspace-dp), so a widen here is a real
+// control-plane fail-OPEN. The userspace evaluator fails the SAME input CLOSED:
+// pkg/dataplane/userspace/filters.go sets TCPFlagsUnparseable and the Rust
+// filter compiler raises SnapshotIntegrityError::UnrepresentableFilterTCPFlags
+// (userspace-dp/src/filter/compiler.rs). This test mirrors that direction.
+//
+// An unrepresentable expression cannot arrive through the CLI commit path
+// (compileFirewall + the #5455 strict gate reject it), but a tolerant load /
+// peer session-sync / mixed-version snapshot can carry one directly.
+//
+// RED on revert: restore the pre-#5512 arm (slog.Warn + drop the constraint,
+// then fall through to the verdict) and the accept-term rows go from
+// `... drop` to `... accept` — the widen this issue tracks.
+func TestNftRuleFromTermTCPFlagsUnrepresentableFailsClosed(t *testing.T) {
+	prefixLists := map[string]*config.PrefixList{}
+
+	// Every one of these is rejected by ParseTCPFlagsExpression.
+	unrepresentable := [][]string{
+		{"syn", "|", "ack"},                // disjunction
+		{"ack", "|", "rst"},                // disjunction
+		{"bogus"},                          // unknown flag
+		{"syn", "&", "!"},                  // dangling negation
+		{"&"},                              // operator-only, no operand
+		{"!", "(", "syn", "&", "ack", ")"}, // De-Morgan negated group
+	}
+
+	// An accept-term with an unrepresentable tcp-flags must DENY its scoped
+	// traffic (drop), never admit all TCP. The drop is TCP-scoped via
+	// `meta l4proto 6` because a tcp-flags constraint only ever matches TCP in
+	// the userspace matcher; the term here also carries `protocol tcp`, so the
+	// l4proto guard is present once from the protocol lowering and once from the
+	// fail-closed scope (redundant-but-valid nft).
+	for _, flags := range unrepresentable {
+		term := &config.FirewallFilterTerm{
+			Name:      "admit-flagged",
+			Protocols: []string{"tcp"},
+			TCPFlags:  flags,
+			Action:    "accept",
+		}
+		rule := nftRule(t, term, "ip", prefixLists)
+		if !strings.HasSuffix(rule, " drop") {
+			t.Errorf("accept-term with unrepresentable tcp-flags %v must fail CLOSED to drop, got: %s", flags, rule)
+		}
+		if strings.Contains(rule, "accept") {
+			t.Errorf("accept-term with unrepresentable tcp-flags %v WIDENED to admit (fail-open, #5512): %s", flags, rule)
+		}
+		// The drop must be TCP-scoped, not a bare `drop`.
+		if !strings.Contains(rule, "meta l4proto 6") {
+			t.Errorf("fail-closed drop for %v must be TCP-scoped (meta l4proto 6): %s", flags, rule)
+		}
+	}
+
+	// A tcp-flags-ONLY term (no other predicate) must NOT lower to a bare `drop`
+	// that denies ALL host-inbound traffic — the `meta l4proto 6` guard confines
+	// the fail-closed drop to TCP, mirroring the userspace TCP-gated matcher.
+	only := &config.FirewallFilterTerm{
+		Name:     "flags-only",
+		TCPFlags: []string{"syn", "|", "ack"},
+		Action:   "accept",
+	}
+	if rule := nftRule(t, only, "ip", prefixLists); rule != "meta l4proto 6 drop" {
+		t.Errorf("tcp-flags-only unrepresentable term: got %q, want %q (TCP-scoped drop, not bare drop)", rule, "meta l4proto 6 drop")
+	}
+
+	// A discard-term is already a deny; the unrepresentable flag makes it drop
+	// its (broader) scoped set — unchanged direction (still fail-closed).
+	discard := &config.FirewallFilterTerm{
+		Name:      "deny-flagged",
+		Protocols: []string{"tcp"},
+		TCPFlags:  []string{"bogus"},
+		Action:    "discard",
+	}
+	if rule := nftRule(t, discard, "ip", prefixLists); rule != "meta l4proto 6 meta l4proto 6 drop" {
+		t.Errorf("discard-term with unrepresentable tcp-flags: got %q, want a TCP-scoped drop", rule)
+	}
+
+	// A reject-term (normally the TCP-RST + ICMP pair) collapses to a single
+	// fail-closed drop — it must NOT admit, and must be exactly one rule.
+	reject := nftRulesFromTerm(&config.FirewallFilterTerm{
+		Name:      "reject-flagged",
+		Protocols: []string{"tcp"},
+		TCPFlags:  []string{"syn", "|", "ack"},
+		Action:    "reject",
+	}, "ip", prefixLists)
+	if len(reject) != 1 || !strings.HasSuffix(reject[0], " drop") || strings.Contains(reject[0], "accept") {
+		t.Errorf("reject-term with unrepresentable tcp-flags must fail closed to a single drop, got: %v", reject)
+	}
+
+	// The honored `then count` modifier still rides the fail-closed drop so the
+	// drops stay observable.
+	counted := &config.FirewallFilterTerm{
+		Name:      "counted-flagged",
+		Protocols: []string{"tcp"},
+		TCPFlags:  []string{"syn", "|", "ack"},
+		Count:     "badflags",
+		Action:    "accept",
+	}
+	rule := nftRule(t, counted, "ip", prefixLists)
+	if !strings.Contains(rule, `counter name "xpflo0_badflags"`) || !strings.HasSuffix(rule, " drop") {
+		t.Errorf("counted fail-closed term must carry the named counter and drop: %s", rule)
+	}
+
+	// A REPRESENTABLE tcp-flags term is unaffected — it still emits the canonical
+	// masked-equality match with the term's real verdict (no fail-closed drop).
+	valid := &config.FirewallFilterTerm{
+		Name:      "good-flags",
+		Protocols: []string{"tcp"},
+		TCPFlags:  []string{"syn", "&", "!ack"},
+		Action:    "accept",
+	}
+	if rule := nftRule(t, valid, "ip", prefixLists); rule != "meta l4proto 6 tcp flags & (syn | ack) == syn accept" {
+		t.Errorf("representable tcp-flags term must be unchanged, got: %s", rule)
+	}
+}
+
+// TestLo0FilterPayloadUnrepresentableTCPFlagsParses proves the #5512 fail-closed
+// emission is VALID nft: a full lo0 payload carrying a term with an
+// unrepresentable tcp-flags expression must parse under `nft -c -f -` (no syntax
+// error), so the fix never fails the whole atomically-loaded ruleset (which
+// would leave the host filter fail-OPEN — the trap the pre-#3231 comma-join hit).
+func TestLo0FilterPayloadUnrepresentableTCPFlagsParses(t *testing.T) {
+	nftPath, err := exec.LookPath("nft")
+	if err != nil {
+		t.Skip("nft not in PATH")
+	}
+
+	cfg := &config.Config{}
+	cfg.System.Lo0FilterInputV4 = "mgmt-lockdown"
+	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+		"mgmt-lockdown": {
+			Name: "mgmt-lockdown",
+			Terms: []*config.FirewallFilterTerm{
+				{
+					Name:      "admit-flagged",
+					Protocols: []string{"tcp"},
+					TCPFlags:  []string{"syn", "|", "ack"}, // unrepresentable
+					Count:     "badflags",
+					Action:    "accept",
+				},
+				{Name: "deny-rest", Protocols: []string{"tcp"}, Action: "discard"},
+			},
+		},
+	}
+	payload := buildLo0FilterPayload(cfg, cfg.System.Lo0FilterInputV4, "")
+
+	// The fail-closed emission must be present and must be a drop (never accept).
+	if !strings.Contains(payload, "meta l4proto 6") || !strings.Contains(payload, "drop") {
+		t.Fatalf("payload missing the fail-closed drop for the unrepresentable term:\n%s", payload)
+	}
+
+	cmd := exec.Command(nftPath, "-c", "-f", "-")
+	cmd.Stdin = strings.NewReader(payload)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return // parsed (and, as root, check-applied) cleanly
+	}
+	combined := string(out)
+	if strings.Contains(combined, "syntax error") {
+		t.Fatalf("nft -c rejected the #5512 fail-closed payload with a syntax error:\n%s\npayload:\n%s", combined, payload)
+	}
+	t.Logf("nft -c parsed the payload; non-syntax error (expected without CAP_NET_ADMIN): %v\n%s", err, combined)
+}
+
 // TestNftRuleFromTermPortExcept covers the #3231 fix for dropped port-except
 // matches (071-08). source-port-except / destination-port-except must emit the
 // nft negated form; before the fix they were silently ignored, so a discard

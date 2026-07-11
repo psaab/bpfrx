@@ -631,10 +631,39 @@ never lock an operator out of a remote box it manages.
   nft-safe and matches the SAME protocol / code point as userspace. An
   unresolvable token cannot reach a committed config (the commit gate rejects
   it); on the lenient path an unresolvable protocol is dropped with a warning
-  (mirroring the tcp-flags lowering) and an unresolvable DSCP token falls back
-  to its lower-cased form. Pinned by `TestNftRuleFromTermProtocolAliases`,
-  `TestNftRuleFromTermProtocolMultiAliasSet`, `TestNftRuleFromTermDSCP`, and
-  `TestNftRuleFromTermDSCPNamesAndCase`.
+  and an unresolvable DSCP token falls back to its lower-cased form. Pinned by
+  `TestNftRuleFromTermProtocolAliases`, `TestNftRuleFromTermProtocolMultiAliasSet`,
+  `TestNftRuleFromTermDSCP`, and `TestNftRuleFromTermDSCPNamesAndCase`.
+
+  **TCP-flags lowering fails CLOSED on an unrepresentable expression (#5512):**
+  a representable `tcp-flags` value lowers through the commit-validated
+  `config.ParseTCPFlagsExpression` to the canonical masked-equality form
+  (`meta l4proto 6 tcp flags & (syn | ack) == syn`, #3231). An UNREPRESENTABLE
+  expression — a `|` disjunction, a De-Morgan negated group, an unknown flag, a
+  dangling `!`, a `&` with no operand — cannot reach a committed config
+  (`compileFirewall` + the #5455 strict gate reject it), but the LENIENT load
+  path (peer session-sync, a #1960 fail-closed load-downgrade, a mixed-version
+  snapshot) admits the term with only a warning. The pre-#5512 mirror then
+  DROPPED the tcp-flags predicate and emitted the term's configured verdict,
+  WIDENING it: an `accept` term meant to admit only a specific flag combination
+  (`syn & !ack`) admitted EVERY TCP segment it scoped — a control-plane
+  fail-OPEN on the PRIMARY host-inbound path. `nftRulesFromTerm` now fails the
+  term CLOSED instead: it emits a per-TERM terminating `drop` of the term's
+  scoped traffic (`<match> meta l4proto 6 drop`) regardless of the term's
+  configured action, so an `accept` term's traffic is DENIED, a `discard`/`reject`
+  term still denies, and a fall-through / routing-instance term terminates as a
+  drop rather than continuing permissively. This mirrors the userspace direction
+  (`filters.go` sets `TCPFlagsUnparseable` and the Rust filter compiler raises
+  `SnapshotIntegrityError::UnrepresentableFilterTCPFlags`), but per-TERM: the fix
+  must NOT reject the whole atomically-loaded lo0 table (that leaves NO host
+  filter = fail-OPEN, the trap the pre-#3231 comma-join hit). The `meta l4proto 6`
+  guard scopes the drop to TCP (a tcp-flags constraint only ever matches TCP in
+  the userspace matcher `per_packet_l4_matches`), so a tcp-flags-ONLY term does
+  not lower to a bare `drop` that would deny ALL host-inbound traffic. Pinned by
+  `TestNftRuleFromTermTCPFlagsUnrepresentableFailsClosed` (RED-on-revert: the
+  reverted arm emits `meta l4proto 6 accept`, the widen) and
+  `TestLo0FilterPayloadUnrepresentableTCPFlagsParses` (the emission parses under
+  `nft -c -f -`, proving it never fails the whole ruleset).
 - host-inbound-traffic (`security zones <z> host-inbound-traffic`) is the
   PRIMARY kernel enforcement for host-bound traffic to a firewall interface IP
   / VRRP VIP (SSH, ping, OSPF/BGP to the box — #3070). Such traffic is shunted
