@@ -3490,6 +3490,86 @@ fn validate_snapshot_buildable_matches_reconcile_5171() {
     );
 }
 
+/// #5171 rev-5605 fold: `validate_snapshot_buildable` must NOT mutate the
+/// live published `coord.forwarding.zone_counter_store`. Leg 3's forwarding
+/// build carries the zone-counter store forward from `previous`, and that
+/// store's `Clone` SHARES the inner `Arc<Mutex>` — so a build that passed
+/// `Some(&coord.forwarding)` would `.reconcile(retain)` the LIVE store IN
+/// PLACE, dropping cumulative per-zone totals for any zone absent from the
+/// candidate snapshot (a mutation of the live `show security zones` / REST /
+/// Prometheus surface that fires even when validation ultimately rejects and
+/// that the fail-closed restore cannot undo). The fix passes `previous =
+/// None`, so the discarded validation build gets a FRESH store and touches
+/// nothing live.
+///
+/// Fail-on-revert: reverting `validate_forwarding_buildable` to `previous =
+/// Some(&coord.forwarding)` prunes zone B (absent from the candidate) from
+/// the live store → the `after.contains(B)` assertion FAILS.
+#[test]
+fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
+    use crate::afxdp::zone_counters::{
+        flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,
+    };
+    const ZONE_A: u16 = 100;
+    const ZONE_B: u16 = 200;
+
+    let coord = Coordinator::new();
+    // Seed the LIVE forwarding zone-counter store with cumulative totals for
+    // zones A and B, as steady-state forwarded traffic would.
+    let seed_map = ZoneCounterSlotMap::build(&[ZONE_A, ZONE_B]);
+    record_zone_traffic(&seed_map, ZONE_A, ZONE_B, 1000);
+    record_zone_traffic(&seed_map, ZONE_B, ZONE_A, 500);
+    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &seed_map);
+    let before: std::collections::HashSet<u16> = coord
+        .forwarding
+        .zone_counter_store
+        .snapshot()
+        .into_iter()
+        .map(|r| r.zone_id)
+        .collect();
+    assert!(
+        before.contains(&ZONE_A) && before.contains(&ZONE_B),
+        "precondition: live store must carry both zones, got {before:?}"
+    );
+
+    // A buildable candidate that configures ONLY zone A (drops B). Mandatory
+    // pins open so validation reaches Leg 3's forwarding build and its
+    // zone-counter reconcile.
+    let candidate = ConfigSnapshot {
+        generation: 2,
+        map_pins: crate::protocol::snapshot::MapPins {
+            xsk: format!("{TEST_MAP_PIN_OK}xsk"),
+            heartbeat: format!("{TEST_MAP_PIN_OK}heartbeat"),
+            sessions: format!("{TEST_MAP_PIN_OK}sessions"),
+            ..Default::default()
+        },
+        zones: vec![crate::protocol::snapshot::ZoneSnapshot {
+            name: "A".to_string(),
+            id: ZONE_A,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(
+        coord.validate_snapshot_buildable(Some(&candidate)).is_ok(),
+        "the single-zone candidate must be buildable"
+    );
+
+    // The live store must be UNTOUCHED — zone B's totals survive even though
+    // the candidate does not configure zone B.
+    let after: std::collections::HashSet<u16> = coord
+        .forwarding
+        .zone_counter_store
+        .snapshot()
+        .into_iter()
+        .map(|r| r.zone_id)
+        .collect();
+    assert!(
+        after.contains(&ZONE_A) && after.contains(&ZONE_B),
+        "validate_snapshot_buildable must NOT prune the live zone-counter store; got {after:?} (zone B dropped = the rev-5605 leak)"
+    );
+}
+
 /// #3402: a FRESH-BOOT snapshot ships its zones AND a concrete-zone policy in
 /// the SAME atomic ConfigSnapshot, with the coordinator's live forwarding zone
 /// table still EMPTY (populate_zones(snapshot) runs only later inside

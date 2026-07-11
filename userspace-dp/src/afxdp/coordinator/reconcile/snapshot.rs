@@ -328,21 +328,39 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
 /// identical non-buildable snapshots (invalid interface address, CoS queue,
 /// NPTv6 rule, ...) with no drift — but with SCRATCH policy + NAT counter
 /// stores so a rejected snapshot leaks no per-rule counter handles into the
-/// LIVE stores, and reading the prior `coord.forwarding` as the build's
-/// "previous" arg exactly as the real build does. The built state is
-/// discarded; only its Ok/Err verdict is returned. `WgEngine::new` (invoked
-/// inside the build for a WG endpoint) is a pure constructor — no socket
-/// bind, no thread spawn — so the discarded build has no observable side
-/// effect.
+/// LIVE stores. The built state is discarded; only its Ok/Err verdict is
+/// returned. `WgEngine::new` (invoked inside the build for a WG endpoint) is
+/// a pure constructor — no socket bind, no thread spawn — so the discarded
+/// build has no observable side effect.
+///
+/// `previous = None` is DELIBERATE (rev-5605 review fold): the real
+/// `build_reconcile_forwarding` passes `Some(&coord.forwarding)` for
+/// carry-over (NAT/source-NAT allocator reuse, cold-path slot retention,
+/// zone-counter totals). But `ForwardingState::zone_counter_store` is a
+/// `Clone`-shares-the-inner-`Arc<Mutex>` store, and the build does
+/// `state.zone_counter_store = previous.zone_counter_store.clone();
+/// state.zone_counter_store.reconcile(&configured)` — an in-place `retain`
+/// UNDER THE SHARED LOCK. With `Some(&coord.forwarding)` a VALIDATION build
+/// would prune the LIVE, published `coord.forwarding.zone_counter_store`,
+/// dropping cumulative per-zone traffic totals for any zone absent from the
+/// candidate snapshot — a mutation of the live observability surface
+/// (`show security zones` / REST / Prometheus) that fires even when
+/// validation later REJECTS, and that the fail-closed restore cannot undo.
+/// `None` gives the discarded build FRESH default counter stores, so it
+/// touches no live state. Verdict PARITY with reconcile is preserved: NONE
+/// of the fallible integrity legs (duplicate-zone-id, tunnel TTL, interface
+/// address, egress, route family/preference, neighbor family, NPTv6, filter
+/// unresolvable-token, CoS queue-id) reads `previous` for its accept/reject
+/// decision — every one faults on snapshot CONTENT only; `previous` feeds
+/// carry-over exclusively, which is irrelevant for a discarded build.
 pub(super) fn validate_forwarding_buildable(
-    coord: &Coordinator,
     snapshot: &ConfigSnapshot,
 ) -> Result<(), super::ReconcileError> {
     build_forwarding_state_with_policy_counters_and_previous(
         snapshot,
         &crate::policy::PolicyCounterStore::default(),
         &crate::nat::NatCounterStore::default(),
-        Some(&coord.forwarding),
+        None,
     )
     .map(|_| ())
     .map_err(super::ReconcileError::Integrity)

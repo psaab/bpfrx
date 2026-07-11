@@ -135,9 +135,14 @@ impl Coordinator {
     ///
     /// Side-effect-free by construction: the map-pin leg opens each pin then
     /// drops the FD; the build leg uses SCRATCH policy + NAT counter stores
-    /// (no `Arc` handle leak into the live stores on a rejected snapshot) and
-    /// only reads the prior `self.forwarding`; `WgEngine::new` (invoked
-    /// inside the build) is a pure constructor. A `None` snapshot
+    /// (no `Arc` handle leak into the live stores on a rejected snapshot) AND
+    /// passes `previous = None` so it never carries over — hence never mutates
+    /// — the live `self.forwarding` zone-counter store (a `Clone`-shares-Arc
+    /// store whose carry-over `reconcile(retain)` would otherwise prune the
+    /// published per-zone totals; see `validate_forwarding_buildable`, rev-5605
+    /// fold); `WgEngine::new` (invoked inside the build) is a pure constructor.
+    /// Verdict parity with `reconcile` is preserved: no fallible integrity leg
+    /// reads `previous` for its accept/reject decision. A `None` snapshot
     /// (config-cleared / shutdown) is trivially buildable — an intentional
     /// teardown — matching `reconcile`'s `no_snapshot` leg.
     pub(crate) fn validate_snapshot_buildable(
@@ -153,8 +158,10 @@ impl Coordinator {
         snapshot::validate_map_pins(snapshot)?;
         // Leg 3: full forwarding-build integrity (#2484) — the non-policy
         // faults (invalid interface address, CoS queue, NPTv6 rule, ...)
-        // reachable only inside the full build.
-        snapshot::validate_forwarding_buildable(self, snapshot)
+        // reachable only inside the full build. `previous = None` inside
+        // (rev-5605 fold) so the discarded build never prunes the live
+        // zone-counter store; verdict parity with reconcile is preserved.
+        snapshot::validate_forwarding_buildable(snapshot)
     }
 
     /// Reconcile the coordinator state against an optional config
