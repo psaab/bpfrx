@@ -6,7 +6,10 @@ artifact in the publish set is properly signed:
 
   (a) each image manifest (xpf-<ver>.SHA256SUMS) has a verifying .minisig
       against the pinned image pubkey, AND the qcow2/metadata it lists are
-      present and hash-match;
+      present and hash-match, AND its signed xpf-<ver>.manifest provenance
+      sidecar says `validated: true` (#4904 A — a --skip-validate bake binds
+      validated:false and is REFUSED: an unvalidated dev/emergency image must
+      never carry a release signature past this fail-closed boundary);
   (b) the apt InRelease verifies against the archive pubkey (when an apt tree
       is being published);
   (c) install.sh is PRESENT (required by default — the Tier-A one-liner URL
@@ -21,6 +24,12 @@ artifact in the publish set is properly signed:
 
 The bake may be fail-OPEN (a dev bake without a key still produces artifacts),
 but PUBLISH is fail-CLOSED — an unsigned dev bake can never reach the channel.
+
+To close a TOCTOU window (#4904 C), when an upload will actually happen the
+whole tree is first copied into a PRIVATE immutable staging snapshot; the gate
+hashes and the backend uploads the SAME snapshot bytes, so a concurrent writer
+replacing an artifact/sidecar/install.sh after the gate cannot swap the
+uploaded content.
 
 After the gate passes, dispatch the operator's backend exactly once per URL:
 
@@ -526,6 +535,64 @@ def gate_images(dist, require_installer=True):
     return versions, pub
 
 
+def _parse_manifest_fields(text):
+    """Parse a bake `.manifest` sidecar (key: value lines) into a dict, keys
+    verbatim. Mirrors scripts/deploy/xpf-deploy.py:_parse_image_manifest_versions
+    but keeps underscores so `validated` / `base_image_pinned` read directly."""
+    d = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        d[k.strip()] = v.strip()
+    return d
+
+
+def gate_provenance(dist, versions, pub):
+    """#4904 A: refuse to publish an image set that did not pass the in-guest
+    verify-dataplane validation gate.
+
+    A --skip-validate bake still produces a fully signed manifest/signature set
+    that is byte-shape-indistinguishable from a validated release, so the
+    fail-closed publish gate would happily ship a dev/emergency image that never
+    booted or verified the dataplane. bake.py now binds a signed `validated:
+    true|false` provenance field into the xpf-<ver>.manifest sidecar (covered by
+    the signed xpf-<ver>.SHA256SUMS, #5042); this gate REQUIRES validated: true.
+
+    Fail-CLOSED: every version MUST carry a provenance sidecar that is (a) listed
+    in — and hash-matches — the signed manifest, and (b) says validated: true.
+    A missing sidecar, an unsigned/mismatched sidecar, or validated != true all
+    refuse the publish."""
+    for ver, sums in sorted(versions.items()):
+        sig = sums + ".minisig"
+        sidecar = os.path.join(dist, f"xpf-{ver}.manifest")
+        if not os.path.isfile(sidecar):
+            die(f"image set {ver} has no provenance sidecar xpf-{ver}.manifest "
+                f"in {dist} — cannot confirm it passed the in-guest "
+                "verify-dataplane gate. Refusing to publish (the sidecar is "
+                "written + signed by scripts/image/bake.py; re-bake).")
+        try:
+            # Verify the sidecar against the SIGNED checksum manifest and read
+            # the VERIFIED bytes (TOCTOU-safe) — the same primitive the deployer
+            # mixed-base gate uses (#5042). Fails closed if the sidecar is not
+            # covered by the signed manifest or its hash does not match.
+            data = sign.verify_listed_artifact_bytes(sidecar, sums, sig, pub)
+        except sign.SignError as e:
+            die(f"provenance sidecar xpf-{ver}.manifest failed verify against "
+                f"the signed manifest {os.path.basename(sums)}: {e}")
+        fields = _parse_manifest_fields(data.decode("utf-8", "replace"))
+        validated = fields.get("validated")
+        if validated != "true":
+            die(f"image set {ver} provenance says validated={validated!r} (not "
+                "'true') — this bake did NOT pass the in-guest verify-dataplane "
+                "gate (built with --skip-validate, or an older bake predating "
+                "the #4904 provenance field). Refusing to publish an "
+                "UNVALIDATED image with a release signature. Re-bake WITHOUT "
+                "--skip-validate.")
+        info(f"image set {ver}: provenance validated=true")
+
+
 def _gate_one_latest(dist, channel, pub, require_present):
     """Verify one channel's signed latest.json. `require_present`, when not
     None, is the set of versions the pointer's `version` MUST name (the target
@@ -692,6 +759,59 @@ def make_latest(dist, channel, version):
     info(f"wrote + signed {latest} -> {version}")
 
 
+def _fsync_tree(root):
+    """fsync every regular file and directory under `root` so the snapshot's
+    bytes are durable before dispatch (the backend may run in a separate
+    process that reopens the files)."""
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            if os.path.islink(p):
+                continue
+            try:
+                fd = os.open(p, os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        try:
+            dfd = os.open(dirpath, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+def _snapshot_dist(dist):
+    """#4904 C (TOCTOU): copy the publish tree into a PRIVATE 0700 staging dir
+    and fsync it, returning (staging_root, snapshot_dir).
+
+    gate_images hashes artifacts + verifies install.sh against the live `dist`
+    tree and returns keeping NO snapshot/lock; dispatch then hands the SAME
+    mutable path to the backend, which REOPENS the files. A concurrent
+    bake/cleanup/writer can replace an artifact, sidecar, or the Tier-A
+    install.sh AFTER the gate but BEFORE the backend reads it, so a gate-pass log
+    accompanies DIFFERENT uploaded bytes (including an unsigned installer).
+    Snapshotting first — then gating AND dispatching ONLY the snapshot — makes
+    the bytes gated the exact bytes uploaded.
+
+    Symlinks are copied AS symlinks (symlinks=True) so the gate's symlink
+    refusal still fires on them, rather than silently dereferencing a link into
+    a real file that would ride along unseen."""
+    import shutil as _sh
+    import tempfile as _tf
+    staging = _tf.mkdtemp(prefix="xpf-publish-snap-")
+    os.chmod(staging, 0o700)
+    snap = os.path.join(staging, "dist")
+    _sh.copytree(dist, snap, symlinks=True)
+    _fsync_tree(snap)
+    return staging, snap
+
+
 def dispatch(cmd, local_dir, base_url, dry):
     info(f"publish: {cmd} {local_dir} {base_url}")
     if dry:
@@ -757,29 +877,49 @@ def main(argv):
             "Drop --no-apt (gate apt too), or move dist/apt out of the publish "
             "root.")
 
-    # ── fail-closed gate ──
-    if not a.no_image:
-        versions, pub = gate_images(dist, require_installer=not a.no_installer)
-        gate_latest(dist, a.channel, versions, pub)
-    if not a.no_apt:
-        gate_apt(dist, a.channel)
-
     pubcmd = os.environ.get("XPF_PUBLISH_CMD")
-    if not pubcmd:
-        info("gate PASSED. XPF_PUBLISH_CMD unset — nothing uploaded. Set it to "
-             "the backend shim ($CMD <local-dir> <dest-base-url>) to publish.")
-        return 0
+    # #4904 C: when we will actually upload, snapshot the tree into a private
+    # immutable staging dir FIRST, then gate + dispatch ONLY the snapshot, so a
+    # concurrent writer cannot swap the uploaded bytes out from under a
+    # gate-pass. A gate-only / --dry-run run uploads nothing, so it gates the
+    # live tree directly (no full copy — the qcow2 set can be multi-GB).
+    will_dispatch = bool(pubcmd) and not a.dry_run
+    staging = None
+    try:
+        gate_dir = dist
+        if will_dispatch:
+            staging, gate_dir = _snapshot_dist(dist)
 
-    if not a.no_image:
-        img_url = os.environ.get("XPF_IMAGE_BASE_URL") or die(
-            "XPF_IMAGE_BASE_URL required to publish the image tree.")
-        dispatch(pubcmd, dist, img_url, a.dry_run)
-    if not a.no_apt:
-        apt_url = os.environ.get("XPF_APT_BASE_URL") or die(
-            "XPF_APT_BASE_URL required to publish the apt tree.")
-        dispatch(pubcmd, os.path.join(dist, "apt"), apt_url, a.dry_run)
-    info("publish complete.")
-    return 0
+        # ── fail-closed gate (against the immutable snapshot when dispatching) ──
+        if not a.no_image:
+            versions, pub = gate_images(gate_dir,
+                                        require_installer=not a.no_installer)
+            gate_provenance(gate_dir, versions, pub)
+            gate_latest(gate_dir, a.channel, versions, pub)
+        if not a.no_apt:
+            gate_apt(gate_dir, a.channel)
+
+        if not pubcmd:
+            info("gate PASSED. XPF_PUBLISH_CMD unset — nothing uploaded. Set it "
+                 "to the backend shim ($CMD <local-dir> <dest-base-url>) to "
+                 "publish.")
+            return 0
+
+        # Dispatch the SNAPSHOT (gate_dir), never the mutable `dist`.
+        if not a.no_image:
+            img_url = os.environ.get("XPF_IMAGE_BASE_URL") or die(
+                "XPF_IMAGE_BASE_URL required to publish the image tree.")
+            dispatch(pubcmd, gate_dir, img_url, a.dry_run)
+        if not a.no_apt:
+            apt_url = os.environ.get("XPF_APT_BASE_URL") or die(
+                "XPF_APT_BASE_URL required to publish the apt tree.")
+            dispatch(pubcmd, os.path.join(gate_dir, "apt"), apt_url, a.dry_run)
+        info("publish complete.")
+        return 0
+    finally:
+        if staging:
+            import shutil as _sh
+            _sh.rmtree(staging, ignore_errors=True)
 
 
 if __name__ == "__main__":
