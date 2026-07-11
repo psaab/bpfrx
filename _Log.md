@@ -46509,3 +46509,7 @@ top.
 - **Timestamp**: 2026-07-11 (parent inline, roster full — no agent lane)
   - **Action**: #5102 — DNAT `match application any` now lowers to unconstrained (match-any-application), mirroring SNAT's buildSourceNATAppTerms "any"/empty short-circuit, instead of the #3434 never-match sentinel that silently disabled a valid strict-commit-accepted rule. Only the `appConfigured` predicate changed; the resolve loop is untouched (a real app alongside "any" is preserved; a typo / defined-but-empty app-set still fails closed). Fail-on-revert test + #3434 no-regression verified.
   - **File(s)**: pkg/dataplane/userspace/nat_destination.go, pkg/dataplane/userspace/nat_dnat_app_any_5102_test.go
+
+- **Timestamp**: 2026-07-11 (parent inline, roster full)
+  - **Action**: #4906 HC-001 (Critical) — guard the AF_XDP reproducer fork()/kill() against a host-wide SIGKILL. Unchecked fork() then unconditional kill(child,9): on fork()==-1 (RLIMIT_NPROC / PID exhaustion) child==-1 and kill(-1,SIGKILL) signals every process the root caller may signal (firewall daemon + host). Added an `if (child < 0)` warn-and-continue after fork and guarded every kill/waitpid with `if (child > 0)` in both reproducers. Test-tooling only; gcc -fsyntax-only clean. Remaining #4906 cohort defects (HC-025 /tmp symlink, XDP replace-detach, uninitialized-counter PASS, frame-recycle/shared-UMEM coverage) need the agent lane + runtime verification — issue kept open.
+  - **File(s)**: test/xsk-repro/libbpf_xsk_test.c, test/xsk-repro/libbpf_xsk_shared_test.c
