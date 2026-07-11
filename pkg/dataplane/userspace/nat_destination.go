@@ -263,7 +263,35 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// `match application [ a b ]` into the union of its terms (match
 			// ANY). Pre-#3431 only the first application was read and the rest
 			// silently dropped, narrowing the rule.
-			appConfigured := len(rule.Match.ApplicationList()) > 0
+			// #5102: mirror buildSourceNATAppTerms — a sole "any"/empty
+			// application is UNCONSTRAINED (match any application), not a
+			// configured-but-unresolvable app. SNAT collapses "any"/"" to no
+			// constraint; DNAT must too, otherwise `match application any`
+			// resolves to zero terms and the appConfigured branch below emits
+			// the #3434 never-match sentinel that silently disables a valid,
+			// strict-commit-accepted rule. A REAL reference (non-"any",
+			// non-empty) still counts as configured, so a typo / dangling ref /
+			// defined-but-empty application-set still fails CLOSED (#3434) via
+			// that branch. A real app alongside "any" is kept — the resolve
+			// loop below skips the unresolvable "any" and adds the real terms.
+			// #5102: mirror buildSourceNATAppTerms — a sole "any"/empty
+			// application is UNCONSTRAINED (match any application), not a
+			// configured-but-unresolvable app. SNAT collapses "any"/"" to no
+			// constraint; DNAT must too, otherwise `match application any`
+			// resolves to zero terms and the appConfigured branch below emits
+			// the #3434 never-match sentinel that silently disables a valid,
+			// strict-commit-accepted rule. A REAL reference (non-"any",
+			// non-empty) still counts as configured, so a typo / dangling ref /
+			// defined-but-empty application-set still fails CLOSED (#3434) via
+			// that branch. A real app alongside "any" is kept — the resolve
+			// loop below skips the unresolvable "any" and adds the real terms.
+			appConfigured := false
+			for _, appName := range rule.Match.ApplicationList() {
+				if appName != "" && appName != "any" {
+					appConfigured = true
+					break
+				}
+			}
 			if appConfigured {
 				userApps := cfg.Applications.Applications
 				for _, appName := range rule.Match.ApplicationList() {
