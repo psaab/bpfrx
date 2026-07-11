@@ -256,6 +256,46 @@ pub(super) fn apply(
     } else {
         let defer_workers = snapshot.defer_workers;
         if defer_workers {
+            // #5171: a deferred-activation apply (RETH MAC pending) still
+            // ACKs + PERSISTS the snapshot as the boot baseline, but before
+            // this change it did so WITHOUT running the mandatory-map +
+            // forwarding integrity build that the non-defer reconcile path
+            // runs (reconcile_status_bindings -> afxdp.reconcile). So a
+            // NON-buildable config — bad interface address / CoS queue /
+            // NAT64 / NPTv6 rule, or a MISSING/UNOPENABLE mandatory BPF map
+            // pin — was acked ok=true and persisted as the boot baseline,
+            // only to fail-OPEN at the later deferred bring-up (whose
+            // re-apply/rebind failures are warning-only). The disarmed defer
+            // apply cannot borrow reconcile_status_bindings for this: with
+            // forwarding not yet armed (arming follows the deferred worker
+            // bring-up) it takes the disarmed STOP path (afxdp.stop() +
+            // Ok(())) — a teardown with no integrity build; and when armed it
+            // would spawn workers, violating the defer contract. So run the
+            // SAME pre-teardown integrity legs directly (policy preflight +
+            // mandatory-map openability + full forwarding build), BEFORE the
+            // side-effecting tunnel/WG prunes and the guard.snapshot swap,
+            // and fail CLOSED on error. This adds integrity VALIDATION, not
+            // activation — the worker spawn stays deferred below.
+            if let Err(err) = guard.afxdp.validate_snapshot_buildable(Some(&snapshot)) {
+                // Mirror the #3766/#3789 same-plan capture-restore legs:
+                // restore the status-reporting fields bumped at the top of
+                // `apply`, report ok=false, and do NOT persist. Validation
+                // runs BEFORE the guard.snapshot swap and BEFORE any prune,
+                // so the prior snapshot stays the boot baseline untouched and
+                // nothing was side-effected on the rejected snapshot — only
+                // the status generation/capabilities bump is unwound here.
+                guard.status.last_snapshot_generation = prev_last_snapshot_generation;
+                guard.status.last_fib_generation = prev_last_fib_generation;
+                guard.status.last_snapshot_at = prev_last_snapshot_at;
+                guard.status.capabilities = prev_capabilities;
+                response.ok = false;
+                response.error = format!("snapshot integrity error: {}", err);
+                eprintln!(
+                    "CTRL_REQ: apply_snapshot defer_workers rejected (integrity build): {} — keeping previous state",
+                    err
+                );
+                return;
+            }
             // #1866 Change 2b (D4): the defer branch stores the snapshot
             // WITHOUT reconciling, leaving the coordinator's forwarding
             // (and so its WG desired set) stale until the deferred

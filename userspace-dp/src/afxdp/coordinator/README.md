@@ -91,6 +91,30 @@ Differences that matter (#1881):
 - `defer_workers=true` on `apply_snapshot` skips spawn until the next
   reconcile (used during RETH MAC programming so workers don't bind
   to an interface that's about to drop and re-add its MAC).
+- **A deferred apply still runs the pre-teardown integrity build before
+  ack/persist (#5171).** `defer_workers=true` skips the worker spawn but
+  the snapshot is still ACKed + persisted as the boot baseline, so it must
+  be fully BUILDABLE with all mandatory resources first. The disarmed
+  defer path cannot borrow `reconcile` for this (with forwarding not yet
+  armed, `reconcile_status_bindings` takes the disarmed STOP path — a
+  teardown with no integrity build; when armed it would spawn workers,
+  violating the defer contract). `Coordinator::validate_snapshot_buildable`
+  (`reconcile/mod.rs`) factors out the SAME three pre-teardown legs
+  `reconcile` runs — policy preflight (`preflight_policy_state`, shared
+  verbatim), mandatory + present-optional map-pin openability
+  (`validate_map_pins`), and the full forwarding build
+  (`validate_forwarding_buildable`) — as a side-effect-free `&self` check
+  (map FDs opened then dropped; scratch policy/NAT counter stores so a
+  rejected snapshot leaks no handles; no teardown, no spawn, no binding
+  mutation, no `last_reconcile_stage` write). The defer `apply_snapshot`
+  handler runs it BEFORE the tunnel/WG prunes and the `guard.snapshot`
+  swap and fails closed on error (restore the bumped status generation,
+  `ok=false`, no persist). A parity test locks that validate and reconcile
+  reject the identical non-buildable snapshot (no drift). Pre-#5171 the
+  defer path skipped the build entirely, so a non-buildable config (bad
+  interface address / CoS queue / NAT64 / NPTv6 rule, or a
+  MISSING/UNOPENABLE mandatory map pin) was acked `ok=true` and persisted,
+  only to fail-OPEN at the later deferred bring-up.
 - **Same-plan refresh is a fail-closed atomic swap (#3766).** The
   same-plan `apply_snapshot` leg (binding plan unchanged) runs
   `refresh_runtime_snapshot{,_disarmed}` instead of a full reconcile.

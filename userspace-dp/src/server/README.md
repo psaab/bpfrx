@@ -188,7 +188,27 @@ queues. See PR #1243's kill record for why i40e doesn't reshape.
   still bound on its old queue.
 - `defer_workers=true` requests skip the worker spawn until the next
   reconcile. Used during RETH MAC programming so workers don't bind to
-  an interface that's about to drop and re-add its MAC.
+  an interface that's about to drop and re-add its MAC. **The deferred
+  apply still runs the pre-teardown integrity build before ack/persist
+  (#5171).** Although the spawn is deferred, the snapshot is still ACKed +
+  persisted as the boot baseline, so it must be fully buildable with all
+  mandatory resources. The defer branch of `handlers/snapshot.rs` calls
+  `guard.afxdp.validate_snapshot_buildable(Some(&snapshot))` — the SAME
+  policy preflight + mandatory-map openability + full forwarding build
+  that `reconcile` runs, factored out side-effect-free — BEFORE the
+  side-effecting tunnel/WG prunes and the `guard.snapshot` swap, and fails
+  closed on error (restore the bumped status generation/capabilities,
+  `ok=false`, no persist), exactly mirroring the #3766/#3789 same-plan
+  capture-restore legs. It cannot reuse `reconcile_status_bindings`: with
+  forwarding not yet armed (arming follows the deferred bring-up) that
+  takes the disarmed STOP path (a teardown with no integrity build), and
+  when armed it would spawn workers — both wrong for a deferred apply.
+  Pre-#5171 the defer path skipped this build, so a non-buildable config
+  (bad interface address / CoS queue / NAT64 / NPTv6 rule, or a
+  MISSING/UNOPENABLE mandatory map pin) was acked `ok=true` and persisted
+  as the boot baseline, only to fail-OPEN at the later deferred bring-up
+  (whose re-apply/rebind failures are warning-only) — a fail-open on a
+  security appliance.
 - Session installs run on a **dedicated** session-install socket
   (`derive_session_socket_path` next to the control socket), so they
   do not share the control-channel queue with status poll, HA sync,

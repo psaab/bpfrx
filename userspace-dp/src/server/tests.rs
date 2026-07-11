@@ -1114,6 +1114,172 @@ fn apply_snapshot_same_plan_needs_reconcile_build_failure_rejects_and_keeps_prio
     );
 }
 
+// --- apply_snapshot deferred-activation integrity build (#5171) ---------
+
+/// #5171 fail-closed DEFERRED apply — MISSING MANDATORY MAP PIN: a
+/// `defer_workers=true` apply skips worker bring-up (RETH MAC pending) but
+/// still ACKs + persists the snapshot as the boot baseline. Before #5171 it
+/// did so WITHOUT the mandatory-map + forwarding integrity build the
+/// non-defer reconcile path runs, so a snapshot with NO xsk map pin was
+/// acked ok=true and persisted, only to fail-OPEN at the later deferred
+/// bring-up. The new `validate_snapshot_buildable` gate rejects it up front.
+///
+/// The helper is DISARMED (forwarding_armed=false), the realistic deferred
+/// state — arming follows the deferred worker bring-up. This proves the gate
+/// runs independent of arm state (a disarmed defer apply cannot borrow
+/// reconcile_status_bindings, which would take the disarmed stop path with
+/// no integrity build).
+///
+/// RED-on-revert: without the validate call the defer branch prunes, swaps
+/// the snapshot in, replans, skips the spawn, refreshes, and sets
+/// persist_state — acking ok=true and persisting the non-buildable config.
+/// Every assertion below flips.
+#[test]
+fn apply_snapshot_defer_workers_missing_map_pin_fails_closed_5171() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    // Disarmed helper (the realistic deferred state). No prior snapshot.
+    let state = new_state(ProcessStatus::default());
+
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 5,
+        fib_generation: 5,
+        generated_at: chrono::Utc::now(),
+        capabilities: forwarding_caps(),
+        // map_pins default -> empty xsk -> mandatory-map integrity failure.
+        interfaces: vec![tunnel_iface_3789("10.0.0.1/24")], // config itself valid
+        defer_workers: true,
+        ..ConfigSnapshot::default()
+    });
+
+    let response = run_request(state.clone(), request);
+    assert!(
+        !response.ok,
+        "a deferred apply of a config with a MISSING mandatory map pin must fail closed"
+    );
+    assert!(
+        response.error.contains("missing_xsk_pin"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    let guard = state.lock().expect("state");
+    assert!(
+        guard.snapshot.is_none(),
+        "rejected deferred snapshot must not be stored as the boot baseline"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 0,
+        "rejected deferred apply must not bump last_snapshot_generation"
+    );
+    assert_eq!(
+        guard.status.last_fib_generation, 0,
+        "rejected deferred apply must not bump last_fib_generation"
+    );
+}
+
+/// #5171 fail-closed DEFERRED apply — FORWARDING-BUILD INTEGRITY FAULT: a
+/// `defer_workers=true` apply whose mandatory pins all open but whose full
+/// forwarding build FAILS (here an unparseable interface address) must fail
+/// closed too — the build fault the pre-#5171 defer path never surfaced.
+///
+/// RED-on-revert: as above, without the gate the defer branch acks ok=true
+/// and persists the non-buildable config.
+#[test]
+fn apply_snapshot_defer_workers_forwarding_integrity_fails_closed_5171() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    let state = new_state(ProcessStatus::default());
+
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 7,
+        fib_generation: 7,
+        generated_at: chrono::Utc::now(),
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(), // all mandatory pins open
+        interfaces: vec![tunnel_iface_3789("10.0.0.0/33")], // unparseable addr
+        defer_workers: true,
+        ..ConfigSnapshot::default()
+    });
+
+    let response = run_request(state.clone(), request);
+    assert!(
+        !response.ok,
+        "a deferred apply whose forwarding build fails must fail closed"
+    );
+    assert!(
+        response.error.contains("snapshot integrity error"),
+        "unexpected error: {}",
+        response.error
+    );
+
+    let guard = state.lock().expect("state");
+    assert!(
+        guard.snapshot.is_none(),
+        "rejected deferred snapshot must not be stored as the boot baseline"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 0,
+        "rejected deferred apply must not bump last_snapshot_generation"
+    );
+}
+
+/// #5171 defer semantics preserved: a `defer_workers=true` apply of a
+/// fully-BUILDABLE config (all mandatory pins open, valid addresses) still
+/// applies + persists + ACKs ok=true, and STILL does NOT spawn workers
+/// (`debug_reconcile_calls` stays 0). The gate adds integrity VALIDATION,
+/// not activation.
+#[test]
+fn apply_snapshot_defer_workers_valid_config_applies_without_spawning_5171() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    let state = new_state(ProcessStatus::default());
+
+    let mut request = req("apply_snapshot");
+    request.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 4,
+        fib_generation: 4,
+        generated_at: chrono::Utc::now(),
+        capabilities: forwarding_caps(),
+        map_pins: ok_map_pins(),
+        interfaces: vec![tunnel_iface_3789("10.0.0.1/24")], // valid, buildable
+        defer_workers: true,
+        ..ConfigSnapshot::default()
+    });
+
+    let response = run_request(state.clone(), request);
+    assert!(
+        response.ok,
+        "a deferred apply of a fully-buildable config must succeed: {}",
+        response.error
+    );
+    let status = response.status.expect("status response");
+    assert_eq!(
+        status.debug_reconcile_calls, 0,
+        "the deferred apply must NOT run the worker-spawning reconcile"
+    );
+
+    let guard = state.lock().expect("state");
+    assert_eq!(
+        guard.snapshot.as_ref().map(|s| s.generation),
+        Some(4),
+        "the buildable deferred snapshot must be stored as the boot baseline"
+    );
+    assert!(
+        guard.snapshot.as_ref().is_some_and(|s| s.defer_workers),
+        "the stored deferred snapshot keeps defer_workers set"
+    );
+    assert_eq!(
+        guard.status.last_snapshot_generation, 4,
+        "the accepted deferred apply advances last_snapshot_generation"
+    );
+}
+
 // --- apply_snapshot generation monotonicity (#5169) ---------------------
 
 /// #5169 fail-CLOSED: a ROLLED-BACK apply_snapshot generation must be refused.
