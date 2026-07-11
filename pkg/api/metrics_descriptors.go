@@ -731,6 +731,16 @@ func newCollector(srv *Server) *xpfCollector {
 				"behind a held config lock.",
 			nil, nil,
 		),
+		eventStreamSubscriberDropped: prometheus.NewDesc(
+			"xpf_event_stream_subscriber_dropped_total",
+			"Total security/audit event records dropped by the EventBuffer "+
+				"fan-out because a subscriber's channel was full (#5064). A "+
+				"slow REST-SSE / gRPC event-stream / CLI-monitor consumer sheds "+
+				"records non-blocking; a nonzero, climbing value means a live "+
+				"forensic stream is gapped. Subscribers also see the gap in-band "+
+				"via the record's monotonic BufSeq and an Overrun flag.",
+			nil, nil,
+		),
 		feedSecondsSinceSuccess: prometheus.NewDesc(
 			"xpf_feed_seconds_since_last_success",
 			"Seconds since a dynamic-address feed last fetched successfully. "+

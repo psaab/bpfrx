@@ -30,7 +30,22 @@ reports.
   untrusted surface; the cap mirrors `metricsMaxInFlight` (#4162). The cap
   counts ALL subscribers uniformly (trusted `Subscribe` callers included),
   so the trusted set (few, operator-driven) shrinks the untrusted headroom
-  but is never itself rejected. `Close()` unsubscribes AND closes `C`
+  but is never itself rejected. The fan-out is intentionally lossy but
+  OBSERVABLE (#5064): every record `Add` publishes is stamped with the
+  buffer's monotonic `BufSeq` (from 1, strictly increasing per buffer — the
+  SAME value stored in the ring, so a live stream and a `Latest()` snapshot
+  agree), and a subscriber whose channel is full is skipped rather than
+  blocking `Add`. When that happens the drop is counted per-subscriber
+  (`Subscription.Dropped()`) and in aggregate (`EventBuffer.DroppedTotal()`,
+  exported as `xpf_event_stream_subscriber_dropped_total`), and the NEXT
+  record delivered to that subscriber carries `Overrun=true`. A consumer
+  therefore detects loss three ways: a `BufSeq` discontinuity pinpointing
+  which records were shed, the in-band `Overrun` flag, and the monotonic drop
+  counters — so a gapped forensic stream can never be mistaken for a complete
+  one. `BufSeq` is 0 and `Overrun` is false on records that never went
+  through `Add` (a bare `EventRecord` literal or `DecodeRawEventRecord`),
+  distinct from `EventSeq` (the reader-scoped per-event ordinal, #4915).
+  `Close()` unsubscribes AND closes `C`
   (#3384): a consumer ranging over `C` until it closes terminates rather
   than blocking forever. The unsubscribe runs first under the fan-out write
   lock (so a concurrent `Add` can never send on the closed channel) and
