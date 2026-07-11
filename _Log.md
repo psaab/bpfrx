@@ -45475,3 +45475,25 @@ top.
 - **File(s)**: scripts/deploy/xpf-deploy.py,
   scripts/deploy/test_xpf_deploy_image_roll_identity.py,
   docs/in-place-upgrade.md, _Log.md
+
+- **Timestamp**: 2026-07-10
+- **Action**: #5043 — refuse in-place overwrite of a libvirt golden qcow2 that
+  has dependent overlays. `fetch --install-libvirt` did
+  `shutil.copyfile(srcq, golden)` straight over the stable alias
+  `/var/lib/libvirt/images/{image}.qcow2` — an IMMUTABLE shared backing store
+  (per-VM overlays are `qemu-img create -b <golden>`), so a re-fetch over an
+  in-use golden shifted the backing bytes under every overlay and corrupted
+  both HA nodes' disks. Added `_qcow2_backing_file()` (parses `qemu-img info
+  --output=json`) and `_dependent_overlays()` (scans sibling `*.qcow2` for
+  backers of the golden); `_install_libvirt_golden()` now fails closed with a
+  clear operator message (destroy dependents, or install under a fresh
+  `--alias`) when the golden exists AND has dependents. First install and a
+  re-fetch with no dependents still copy. Added 5 tests to
+  test_xpf_deploy_disk.py (RED on revert: the overwrite-refused test loses its
+  SystemExit when the guard is removed). Documented the golden-immutability
+  contract in docs/distribution.md.
+  Validation: `python3 -m py_compile scripts/deploy/xpf-deploy.py` clean;
+  `bash scripts/run-selftests.sh` green (38 passed, 0 failed); RED-on-revert
+  proven (monkeypatched pre-fix copy -> overwrite-refused test FAILs).
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  scripts/deploy/test_xpf_deploy_disk.py, docs/distribution.md, _Log.md

@@ -671,11 +671,90 @@ def libvirt_overlay_path(name):
     return contained_join(LIBVIRT_IMAGES, f"{name}.qcow2", "per-VM overlay")
 
 
+def _qcow2_backing_file(path):
+    """Absolute (realpath) backing-file of a qcow2 image, or None.
+
+    Parses `qemu-img info --output=json` and returns the resolved
+    `full-backing-filename` (falling back to `backing-filename`), or None when
+    the image has no backing file, is unreadable, or qemu-img is absent.
+    qemu-img is a hard dependency of the libvirt overlay-create path
+    (`libvirt_disk` -> `qemu-img create`), so its absence means this tool
+    never created an overlay here — treating "unknown" as "no backing" is
+    therefore safe for the overwrite guard below (#5043)."""
+    try:
+        r = subprocess.run(["qemu-img", "info", "--output=json", path],
+                           capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        info = json.loads(r.stdout)
+    except (ValueError, TypeError):
+        return None
+    bf = info.get("full-backing-filename") or info.get("backing-filename")
+    return os.path.realpath(bf) if bf else None
+
+
+def _dependent_overlays(golden):
+    """Per-VM overlay qcow2 files in the golden's directory that back onto it.
+
+    `libvirt_disk` creates each VM's overlay as `qemu-img create -b <golden>`,
+    so the overlay depends on the golden's bytes being IMMUTABLE. Overwriting
+    the golden in place shifts the backing bytes under every one of these
+    overlays and corrupts them (#5043) — commonly BOTH HA nodes at once, since
+    a cluster pair shares one golden. Scans sibling `*.qcow2` files and returns
+    the sorted absolute paths whose backing file resolves to `golden` (empty
+    when none, or when the images dir is missing/unreadable)."""
+    golden_real = os.path.realpath(golden)
+    imgdir = os.path.dirname(golden_real)
+    deps = []
+    try:
+        entries = sorted(os.listdir(imgdir))
+    except OSError:
+        return deps
+    for entry in entries:
+        if not entry.endswith(".qcow2"):
+            continue
+        cand = os.path.join(imgdir, entry)
+        if os.path.realpath(cand) == golden_real:
+            continue  # the golden is not its own overlay
+        if not os.path.isfile(cand):
+            continue
+        if _qcow2_backing_file(cand) == golden_real:
+            deps.append(os.path.abspath(cand))
+    return deps
+
+
 def _install_libvirt_golden(srcq, image):
     """Install a verified qcow2 to the libvirt golden path deploy reads
     (fable-165 H-30). Falls back to `sudo install` when the images dir is
-    root-owned (the common case). Returns the destination path."""
+    root-owned (the common case). Returns the destination path.
+
+    Golden-immutability contract (#5043): the golden is a SHARED read-only
+    backing store — every per-VM overlay is `qemu-img create -b <golden>` and
+    depends on its bytes NEVER changing. Overwriting it in place while overlays
+    back onto it shifts the backing bytes under live/created overlays and
+    corrupts EVERY one (both HA nodes commonly share one golden — a single
+    re-fetch would poison both disks). First install (no golden yet) and a
+    legitimate re-fetch with no dependent overlays are safe; the dangerous
+    in-place overwrite of an in-use golden fails closed with a clear operator
+    message."""
     golden = libvirt_golden_path(image)
+    if os.path.isfile(golden):
+        deps = _dependent_overlays(golden)
+        if deps:
+            listing = "\n    - ".join(deps)
+            die(f"refusing to overwrite golden {golden} in place: "
+                f"{len(deps)} per-VM overlay(s) back onto it and would be "
+                f"corrupted (the qcow2 backing bytes would shift under a live "
+                f"disk — HA-pair disk corruption, #5043):\n    - {listing}\n"
+                f"  Fix by EITHER destroying the dependent VM(s) first "
+                f"(xpf-deploy.py --hypervisor libvirt destroy <appliance.yaml> "
+                f"for each), OR installing the new image under a fresh tag so "
+                f"existing overlays keep their immutable backing "
+                f"(fetch --install-libvirt --alias <new-name>, then reference "
+                f"image: <new-name> in the deploy YAML).")
     print(f"==> installing verified qcow2 -> {golden} (libvirt golden)")
     try:
         os.makedirs(os.path.dirname(golden), exist_ok=True)
