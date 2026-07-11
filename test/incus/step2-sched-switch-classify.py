@@ -17,6 +17,11 @@ T3 verdict (per plan §3.3):
     rho <= 0.3  or   duty_cycle_pct <  1.0   -> OUT
     else                                     -> INCONCLUSIVE
 
+No-evidence guard (C175-HC-070): an empty/truncated perf capture reduces to
+12 all-zero blocks; that is classified INSUFFICIENT (exit 2), never a
+definitive OUT.  Exit status: INSUFFICIENT -> 2; IN/OUT/INCONCLUSIVE/SUSPECT
+-> 0.
+
 Writes:
     --out                                  markdown report
     <out>.meta.json (sibling)              machine-readable summary
@@ -287,9 +292,45 @@ def main(argv: list[str] | None = None) -> int:
 
     rho, pvalue = spearman_rho(T_D1, [float(x) for x in off_times])
 
-    duty_cycle_pct = 100.0 * sum(off_times) / NOMINAL_WINDOW_NS
+    # C175-HC-092: divide off-CPU time by the ACTUAL capture window, not a
+    # fixed 60 s. The reducer accepts [1, 30] s snapshot blocks, so 12
+    # blocks can span 12-360 s; dividing by a hard-coded 60 s flipped the
+    # IN/OUT duty verdict purely on collection cadence. When every block
+    # carries `block_span_ns` (current reducer output) sum them for the
+    # true window; fall back to the 60 s nominal only for legacy JSONL
+    # that predates the field.
+    block_spans = [b.get("block_span_ns") for b in off_cpu_blocks]
+    if off_cpu_blocks and all(
+        isinstance(s, (int, float)) and s > 0 for s in block_spans
+    ):
+        window_ns = float(sum(block_spans))
+    else:
+        window_ns = float(NOMINAL_WINDOW_NS)
+
+    duty_cycle_pct = 100.0 * sum(off_times) / window_ns
 
     verdict, reason = verdict_from(rho, duty_cycle_pct, suspect_reason)
+
+    # C175-HC-070: an empty/truncated perf capture reduces to 12 all-zero
+    # blocks — every bucket 0 and every stat_runtime_check WARN (zero
+    # runtime vs a non-zero expected). Classifying that as a definitive
+    # OUT (duty 0 < 1%) rules the scheduler out from a measurement that
+    # never happened. Detect the no-evidence shape and emit INSUFFICIENT
+    # with a non-zero exit instead. A real capture always has either
+    # non-zero off-CPU buckets or at least one passing stat_runtime block.
+    no_off_cpu = all(
+        sum(int(x) for x in b.get("buckets", [])) == 0 for b in off_cpu_blocks
+    )
+    no_runtime = all(
+        b.get("stat_runtime_check") == "WARN" for b in off_cpu_blocks
+    )
+    if suspect_reason is None and no_off_cpu and no_runtime:
+        verdict = "INSUFFICIENT"
+        reason = (
+            "no scheduler evidence: all 12 blocks have zero off-CPU buckets "
+            "and no passing stat_runtime accounting — the perf capture was "
+            "empty or truncated; refusing a definitive OUT"
+        )
 
     voluntary_total = sum(int(b.get("voluntary_3to6", 0)) for b in off_cpu_blocks)
     involuntary_total = sum(
@@ -348,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
         "duty_in_pct": DUTY_IN_PCT,
         "duty_out_pct": DUTY_OUT_PCT,
         "nominal_window_ns": NOMINAL_WINDOW_NS,
+        "window_ns": window_ns,
     }
     # Sibling files: <report>.md -> <report>.meta.json + <report>.diag.json.
     meta_path = args.out.parent / (args.out.stem + ".meta.json")
@@ -361,7 +403,10 @@ def main(argv: list[str] | None = None) -> int:
         + (f" suspect_reason={suspect_reason}" if suspect_reason else ""),
         file=sys.stderr,
     )
-    return 0
+    # C175-HC-070: INSUFFICIENT (no measurement) must exit non-zero so a
+    # missing/truncated capture cannot pass as a definitive verdict. IN /
+    # OUT / INCONCLUSIVE / SUSPECT keep their historical exit-0 semantics.
+    return 2 if verdict == "INSUFFICIENT" else 0
 
 
 if __name__ == "__main__":

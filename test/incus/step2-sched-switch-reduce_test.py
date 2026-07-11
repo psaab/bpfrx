@@ -162,14 +162,23 @@ def _make_boundaries(start_s: int = 1_000_000_000) -> list[int]:
 
 class TestReducerSynthetic(unittest.TestCase):
     def test_reducer_synthetic_three_switches_two_durations(self):
-        """§3.4 test case 3.
+        """§3.4 test case 3 (C175-HC-026: closed at schedule-in).
 
-        Two (switch, wake) pairs at t=1.000008 s (prev_state=S, 8 us,
-        voluntary) and t=2.500032 s (prev_state=R, 32 us, involuntary)
-        relative to STEP1_START.  Both land in block b=0.
+        Two off-CPU intervals in block 0, each opened by a sched_switch
+        that moves the worker OFF-CPU and closed by a later sched_switch
+        that moves it back ON-CPU (next_pid=worker):
+
+          * voluntary: switch-out prev_state=S at +1.000000 s, scheduled
+            back in at +1.000008 s -> 8 us off-CPU (bucket 3).  A
+            sched_wakeup fires in between; it is informational and does
+            NOT close the interval.
+          * involuntary: switch-out prev_state=R at +2.500000 s (the
+            worker stays runnable — the kernel emits NO wakeup for a
+            preempted-runnable task), scheduled back in at +2.500032 s
+            -> 32 us off-CPU (bucket 5).
 
         HIGH-3: perf timestamps are absolute unix wall-clock ns
-        (perf-record uses `-k CLOCK_REALTIME`); reducer applies them
+        (perf-record uses `-k CLOCK_REALTIME`); the reducer applies them
         directly to `block_for_timestamp()` with no PERF_START_NS
         offsetting.  So the perf_ts values here are `step1_start_ns +
         <offset>`, not bare offsets.
@@ -188,39 +197,47 @@ class TestReducerSynthetic(unittest.TestCase):
         perf_start_ns = step1_start_ns  # zero drift
 
         events = [
-            # First switch: tid goes off-CPU at wall = step1_start + 1.000008 s
+            # Voluntary sleep: worker switched OUT (S) at +1.000000 s.
             (
                 "sched:sched_switch",
                 tid,
+                step1_start_ns + 1_000_000_000,
+                {"prev_pid": tid, "prev_state": "S", "next_pid": 0},
+            ),
+            # Wakeup 4 us later — informational; does NOT close the interval.
+            (
+                "sched:sched_wakeup",
+                tid,
+                step1_start_ns + 1_000_004_000,
+                {"pid": tid},
+            ),
+            # Worker scheduled back IN 8 us after switch-out -> 8 us off-CPU.
+            (
+                "sched:sched_switch",
+                0,
                 step1_start_ns + 1_000_008_000,
-                {"prev_pid": tid, "prev_state": "S"},
+                {"prev_pid": 0, "prev_state": "R", "next_pid": tid},
             ),
-            # Wake 8 us later.
-            (
-                "sched:sched_wakeup",
-                tid,
-                step1_start_ns + 1_000_016_000,
-                {"pid": tid},
-            ),
-            # Second switch at +2.500032 s with prev_state=R (involuntary).
+            # Involuntary preemption: switched OUT (R) at +2.500000 s.  No
+            # wakeup follows — a runnable-preempted task never sleeps.
             (
                 "sched:sched_switch",
                 tid,
-                step1_start_ns + 2_500_032_000,
-                {"prev_pid": tid, "prev_state": "R"},
+                step1_start_ns + 2_500_000_000,
+                {"prev_pid": tid, "prev_state": "R", "next_pid": 0},
             ),
-            # Wake 32 us later.
+            # Worker scheduled back IN 32 us later -> 32 us off-CPU (invol).
             (
-                "sched:sched_wakeup",
-                tid,
-                step1_start_ns + 2_500_064_000,
-                {"pid": tid},
+                "sched:sched_switch",
+                0,
+                step1_start_ns + 2_500_032_000,
+                {"prev_pid": 0, "prev_state": "R", "next_pid": tid},
             ),
             # A stat_runtime event in block 0 — enough runtime to pass the
             # ±1% accounting check.  Expected on-CPU for this block:
             #   block_duration = 5 s
             #   n_workers = 1
-            #   total_off_cpu = 40000 ns (the two wakeups above)
+            #   total_off_cpu = 40000 ns (the two intervals above)
             #   expected_on_cpu = 5e9 - 40000 ≈ 5e9
             # We feed 5e9 exactly so rel_err = 40000/5e9 ≈ 8e-6 << 1%.
             (
@@ -265,6 +282,100 @@ class TestReducerSynthetic(unittest.TestCase):
             self.assertEqual(sum(bi["buckets"]), 0)
             self.assertEqual(bi["off_cpu_time_3to6"], 0)
             self.assertEqual(bi["stat_runtime_check"], "WARN")
+
+
+class TestReducerScheduleInClose(unittest.TestCase):
+    """C175-HC-026: off-CPU intervals close at schedule-in, not wakeup."""
+
+    def test_involuntary_preemption_without_wakeup_is_measured(self):
+        """A runnable-preempted worker (prev_state=R, NO wakeup) that is
+        later rescheduled must have its off-CPU interval measured.
+
+        Fail-on-revert: the pre-fix reducer closed intervals on
+        sched_wakeup.  A preempted-runnable task emits no wakeup, so its
+        interval was never closed and involuntary_3to6 stayed 0 — the
+        exact signal this harness exists to detect went silently
+        unmeasured.
+        """
+        boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
+        tid = 4242
+        worker_tids = {tid}
+        events = [
+            # Preempted while runnable at +1.000000 s (block 0). No wakeup.
+            ("sched:sched_switch", tid, step1_start_ns + 1_000_000_000,
+             {"prev_pid": tid, "prev_state": "R", "next_pid": 0}),
+            # Rescheduled 16 us later -> 16 us off-CPU (bucket 4, in D1).
+            ("sched:sched_switch", 0, step1_start_ns + 1_000_016_000,
+             {"prev_pid": 0, "prev_state": "R", "next_pid": tid}),
+        ]
+        buf = io.StringIO()
+        warn = io.StringIO()
+        warnings = R.reduce_events(
+            events=events,
+            boundaries_ns=boundaries,
+            worker_tids=worker_tids,
+            perf_start_ns=step1_start_ns,
+            out_stream=buf,
+            warn_stream=warn,
+        )
+        self.assertEqual(warnings, [], f"unexpected warnings: {warnings}")
+        b0 = json.loads(buf.getvalue().strip().split("\n")[0])
+        self.assertEqual(b0["buckets"][4], 16000)
+        self.assertEqual(b0["off_cpu_time_3to6"], 16000)
+        self.assertEqual(b0["involuntary_3to6"], 16000)
+        self.assertEqual(b0["voluntary_3to6"], 0)
+
+    def test_wakeup_alone_does_not_close_interval(self):
+        """A wakeup with NO following schedule-in must not accumulate.
+
+        Fail-on-revert: the pre-fix reducer treated sched_wakeup as the
+        interval end, so a switch-out + wakeup (no schedule-in) closed
+        and accumulated off-CPU time. Under schedule-in semantics the
+        interval stays open (unclosed) and nothing is accumulated.
+        """
+        boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
+        tid = 55
+        worker_tids = {tid}
+        events = [
+            ("sched:sched_switch", tid, step1_start_ns + 1_000_000_000,
+             {"prev_pid": tid, "prev_state": "S", "next_pid": 0}),
+            # Wakeup 8 us later, but the worker is never scheduled back in.
+            ("sched:sched_wakeup", tid, step1_start_ns + 1_000_008_000,
+             {"pid": tid}),
+        ]
+        buf = io.StringIO()
+        warn = io.StringIO()
+        warnings = R.reduce_events(
+            events=events,
+            boundaries_ns=boundaries,
+            worker_tids=worker_tids,
+            perf_start_ns=step1_start_ns,
+            out_stream=buf,
+            warn_stream=warn,
+        )
+        self.assertEqual(warnings, [])
+        blocks = [json.loads(l) for l in buf.getvalue().strip().split("\n")]
+        self.assertEqual(sum(sum(b["buckets"]) for b in blocks), 0)
+        self.assertEqual(sum(b["off_cpu_time_3to6"] for b in blocks), 0)
+
+    def test_parser_extracts_next_pid(self):
+        """The perf-script parser must surface next_pid for sched_switch."""
+        txt = (
+            "xpf-userspace-w 12345 [003] 1234.567890123: "
+            "sched:sched_switch: prev_comm=xpf-userspace-w prev_pid=12345 "
+            "prev_prio=120 prev_state=R ==> next_comm=other next_pid=678 "
+            "next_prio=120\n"
+        )
+        path = _write_inline(txt, ".txt")
+        try:
+            events = list(R.parse_perf_script(path))
+        finally:
+            path.unlink()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][3]["prev_pid"], 12345)
+        self.assertEqual(events[0][3]["next_pid"], 678)
 
 
 class TestReducerOutOfOrder(unittest.TestCase):
@@ -512,6 +623,54 @@ class TestReducerEmpty(unittest.TestCase):
             self.assertEqual(obj["stat_runtime_check"], "WARN")
 
 
+class TestReducerEmptyPerfHalts(unittest.TestCase):
+    """C175-HC-070: an empty/truncated perf capture must fail loud."""
+
+    def test_reducer_halts_on_empty_perf(self):
+        """main() returns non-zero when the perf script has zero events.
+
+        Fail-on-revert: the pre-fix main() always returned 0 (or 5 on
+        drift), so an empty capture emitted 12 all-zero blocks and exited
+        0 — the classifier then ruled the scheduler definitively OUT from
+        a measurement that never happened.
+        """
+        cold = {"_sample_ts": "1000000000"}
+        cold_path = _write_inline(json.dumps(cold), ".json")
+        warm_lines = [
+            json.dumps({"_sample_ts": str(1000000000 + (i + 1) * 5)})
+            for i in range(12)
+        ]
+        samples_path = _write_inline("\n".join(warm_lines) + "\n", ".jsonl")
+        perf_path = _write_inline("", ".txt")  # empty capture
+        step1_start_ns = 1_000_000_000 * 1_000_000_000
+        perf_start_ns = step1_start_ns  # zero drift -> not a drift halt
+
+        real_stderr = sys.stderr
+        real_stdout = sys.stdout
+        cap_err = io.StringIO()
+        cap_out = io.StringIO()
+        try:
+            sys.stderr = cap_err
+            sys.stdout = cap_out
+            rc = R.main(
+                [
+                    "--perf-script", str(perf_path),
+                    "--step1-cold", str(cold_path),
+                    "--step1-samples", str(samples_path),
+                    "--worker-tids", "1",
+                    "--perf-start-ns", str(perf_start_ns),
+                ]
+            )
+        finally:
+            sys.stderr = real_stderr
+            sys.stdout = real_stdout
+            cold_path.unlink()
+            samples_path.unlink()
+            perf_path.unlink()
+        self.assertEqual(rc, 2, f"expected exit 2 on empty perf, got {rc}")
+        self.assertIn("zero sched events", cap_err.getvalue())
+
+
 class TestReducerInvariant(unittest.TestCase):
     def test_reducer_invariant_sum_buckets_3to6(self):
         """V3: sum(buckets[3:7]) == off_cpu_time_3to6 on every block.
@@ -535,12 +694,15 @@ class TestReducerInvariant(unittest.TestCase):
         for b in range(12):
             off_ts = boundaries[b] + 1_000_000_000
             d = durations[b % len(durations)]
+            # Switch OUT (opens interval) then switch IN (next_pid=tid,
+            # closes interval d ns later) — C175-HC-026 schedule-in close.
             events.append(
                 ("sched:sched_switch", tid, off_ts,
-                 {"prev_pid": tid, "prev_state": "S"})
+                 {"prev_pid": tid, "prev_state": "S", "next_pid": 0})
             )
             events.append(
-                ("sched:sched_wakeup", tid, off_ts + d, {"pid": tid})
+                ("sched:sched_switch", 0, off_ts + d,
+                 {"prev_pid": 0, "prev_state": "R", "next_pid": tid})
             )
 
         buf = io.StringIO()
@@ -573,7 +735,14 @@ class TestReducerDrift(unittest.TestCase):
                 json.dumps({"_sample_ts": str(1000000000 + (i + 1) * 5)})
             )
         samples_path = _write_inline("\n".join(warm_lines) + "\n", ".jsonl")
-        perf_path = _write_inline("", ".txt")
+        # One valid sched event so the capture is non-empty (the empty
+        # capture path is exercised by test_reducer_halts_on_empty_perf).
+        perf_line = (
+            "xpf 1 [000] 1000000001.000000000: sched:sched_switch: "
+            "prev_comm=xpf prev_pid=1 prev_prio=120 prev_state=S ==> "
+            "next_comm=y next_pid=0 next_prio=120\n"
+        )
+        perf_path = _write_inline(perf_line, ".txt")
         step1_start_ns = 1_000_000_000 * 1_000_000_000
         perf_start_ns = step1_start_ns + 2_000_000_000  # +2 s
 

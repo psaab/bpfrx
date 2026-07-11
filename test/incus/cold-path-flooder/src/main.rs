@@ -1048,6 +1048,46 @@ struct WorkerCtx {
     warmup_baseline: Arc<AtomicU64>,
 }
 
+/// Total number of unique 5-tuples a run can generate, given the span
+/// arguments. u64 is wide enough for the unbounded default (4.29e9).
+fn tuple_space(args: &Args) -> u64 {
+    (args.src_ip_span as u64)
+        * (args.src_port_span as u64)
+        * (args.dst_port_span as u64)
+}
+
+/// C175-HC-072: the half-open tuple-index slice `[base, end)` that
+/// worker `thread_id` of `threads` owns. Slices partition `[0, space)`
+/// exactly (floor division; `base_0 = 0`, `base_threads = space`), so no
+/// two workers ever emit the same bounded tuple — the cross-worker
+/// collision source under the old shared-random scheme.
+fn worker_slice(thread_id: u32, threads: u32, space: u64) -> (u64, u64) {
+    let n = threads.max(1) as u64;
+    let t = thread_id as u64;
+    (t * space / n, (t + 1) * space / n)
+}
+
+/// C175-HC-072: decompose a monotonic tuple index into its
+/// (src_ip_off, src_port_v, dst_port_v) components. Enumerating indices
+/// `base..end` visits every distinct tuple in a worker's slice exactly
+/// once before wrapping, so the first pass installs a fresh session per
+/// packet (a genuine cache_miss -> install -> replicate) instead of the
+/// birthday-colliding random draws that measured warm hits. Spans are
+/// validated >= 1 (see validate()), so the divisions never trap.
+fn decompose_tuple_index(
+    idx: u64,
+    src_port_span: u32,
+    dst_port_span: u32,
+) -> (u32, u32, u32) {
+    let dsp = dst_port_span as u64;
+    let ssp = src_port_span as u64;
+    let dst_port_v = (idx % dsp) as u32;
+    let tmp = idx / dsp;
+    let src_port_v = (tmp % ssp) as u32;
+    let src_ip_off = (tmp / ssp) as u32;
+    (src_ip_off, src_port_v, dst_port_v)
+}
+
 /// Per-worker hot loop. Publishes per-batch deltas into self.stats
 /// via fetch_add(Relaxed). Returns Ok on graceful shutdown; the
 /// first fatal error (EPERM/EACCES from sendmmsg, pin failure) is
@@ -1078,6 +1118,19 @@ fn worker_loop(args: &Args, mut ctx: WorkerCtx) {
     let mut prng = Xorshift64(ctx.seed);
     let mut warmup_baseline_published = false;
 
+    // C175-HC-072: in bounded (diagnostic) mode this worker enumerates a
+    // disjoint slice of the tuple space sequentially, so every packet in
+    // the first pass over its slice is a genuinely new 5-tuple (real
+    // session install), not a birthday-colliding random draw that lands
+    // on an already-installed session. Unbounded mode keeps random draws
+    // over its ~4.3 B space (session table fills in ~26 ms by design and
+    // the rest measures the policy-eval cold path). ip_id stays random in
+    // both modes — it is not part of the session key.
+    let bounded = !args.cohort_unbounded;
+    let (slice_base, slice_end) =
+        worker_slice(ctx.thread_id, args.threads, tuple_space(args));
+    let mut seq_idx = slice_base;
+
     loop {
         // Shutdown check at top of each batch (#1615 plan-v4 §3.9).
         if ctx.shutdown_flag.load(Ordering::Relaxed) {
@@ -1097,14 +1150,31 @@ fn worker_loop(args: &Args, mut ctx: WorkerCtx) {
             warmup_baseline_published = true;
         }
 
-        // Refill all batch slots with fresh PRNG values.
+        // Refill all batch slots with fresh tuples.
         for slot in ctx.ring.slots.iter_mut() {
             let s = prng.next();
-            let src_ip_off = (s as u32) % args.src_ip_span;
-            let src_port_v = (((s >> 16) as u32) % args.src_port_span) as u16;
-            let src_port = args.src_port_base.wrapping_add(src_port_v);
-            let dst_port_v = (((s >> 32) as u32) % args.dst_port_span) as u16;
-            let dst_port = args.dst_port_base.wrapping_add(dst_port_v);
+            let (src_ip_off, src_port_v, dst_port_v) = if bounded {
+                // Sequential non-repeating sweep of this worker's slice.
+                let (ip_off, sp_v, dp_v) = decompose_tuple_index(
+                    seq_idx, args.src_port_span, args.dst_port_span,
+                );
+                seq_idx += 1;
+                // Wrap at the slice end so reuse is deterministic and only
+                // begins after a full pass (an honest table refill), never
+                // the birthday collisions of shared random draws.
+                if seq_idx >= slice_end {
+                    seq_idx = slice_base;
+                }
+                (ip_off, sp_v, dp_v)
+            } else {
+                (
+                    (s as u32) % args.src_ip_span,
+                    (s >> 16) as u32 % args.src_port_span,
+                    (s >> 32) as u32 % args.dst_port_span,
+                )
+            };
+            let src_port = args.src_port_base.wrapping_add(src_port_v as u16);
+            let dst_port = args.dst_port_base.wrapping_add(dst_port_v as u16);
             let src_ip = args.src_ip_base.wrapping_add(src_ip_off);
             let ip_id = (s >> 48) as u16;
             slot.fill_packet(src_ip, ip_id, src_port, dst_port);
@@ -1199,9 +1269,10 @@ fn emit_summary(args: &Args, agg: &RunStats, per_thread: &[RunStats]) {
     per_thread_json.push(']');
 
     println!(
-        "{{\"version\":2,\
+        "{{\"version\":3,\
          \"threads\":{},\
          \"cohort\":\"{}\",\
+         \"tuple_space\":{},\
          \"duration_secs\":{},\
          \"warmup_secs\":{},\
          \"frame_bytes\":{},\
@@ -1226,6 +1297,7 @@ fn emit_summary(args: &Args, agg: &RunStats, per_thread: &[RunStats]) {
          \"clock_source\":\"monotonic\"}}",
         args.threads,
         if args.cohort_unbounded { "unbounded" } else { "bounded" },
+        tuple_space(args),
         args.duration.as_secs(),
         args.warmup.as_secs(),
         args.frame_bytes,
@@ -1603,6 +1675,76 @@ mod tests {
             no_cpu_pin: false,
             allow_oversubscribe: false,
         }
+    }
+
+    // --- C175-HC-072: bounded cohort sequential enumeration ---------------
+
+    #[test]
+    fn hc072_tuple_space_matches_spans() {
+        let mut a = build_default_args();
+        a.src_ip_span = BOUNDED_SRC_IP_SPAN;
+        a.src_port_span = BOUNDED_SRC_PORT_SPAN;
+        a.dst_port_span = BOUNDED_DST_PORT_SPAN;
+        assert_eq!(tuple_space(&a), 131_072);
+    }
+
+    #[test]
+    fn hc072_worker_slices_partition_space_disjointly() {
+        let space = 131_072u64;
+        for threads in [1u32, 3, 4, 6, 7, 64] {
+            let mut prev_end = 0u64;
+            let mut covered = 0u64;
+            for t in 0..threads {
+                let (base, end) = worker_slice(t, threads, space);
+                assert_eq!(base, prev_end, "threads={threads}: slice {t} gap/overlap");
+                assert!(end >= base);
+                covered += end - base;
+                prev_end = end;
+            }
+            assert_eq!(prev_end, space, "threads={threads}: did not reach space");
+            assert_eq!(covered, space, "threads={threads}: coverage != space");
+        }
+    }
+
+    #[test]
+    fn hc072_bounded_enumeration_first_pass_is_distinct() {
+        // One worker sweeping the whole bounded space visits every 5-tuple
+        // exactly once — a clean table fill, zero collisions. The old
+        // random draws hit birthday collisions long before 131_072 draws.
+        let space = 131_072u64;
+        let (base, end) = worker_slice(0, 1, space);
+        assert_eq!((base, end), (0, space));
+        let mut seen = std::collections::HashSet::with_capacity(space as usize);
+        for idx in base..end {
+            let t = decompose_tuple_index(
+                idx, BOUNDED_SRC_PORT_SPAN, BOUNDED_DST_PORT_SPAN,
+            );
+            assert!(t.0 < BOUNDED_SRC_IP_SPAN);
+            assert!(t.1 < BOUNDED_SRC_PORT_SPAN);
+            assert!(t.2 < BOUNDED_DST_PORT_SPAN);
+            assert!(seen.insert(t), "duplicate tuple at idx {idx}: {t:?}");
+        }
+        assert_eq!(seen.len() as u64, space);
+    }
+
+    #[test]
+    fn hc072_bounded_multiworker_tuples_globally_distinct() {
+        // Across 4 workers each sweeping its slice once, the union is the
+        // whole space with no cross-worker overlap (the shared-random
+        // scheme let two workers emit the same tuple).
+        let space = 131_072u64;
+        let threads = 4u32;
+        let mut seen = std::collections::HashSet::with_capacity(space as usize);
+        for t in 0..threads {
+            let (base, end) = worker_slice(t, threads, space);
+            for idx in base..end {
+                let tup = decompose_tuple_index(
+                    idx, BOUNDED_SRC_PORT_SPAN, BOUNDED_DST_PORT_SPAN,
+                );
+                assert!(seen.insert(tup), "cross-worker duplicate at idx {idx}");
+            }
+        }
+        assert_eq!(seen.len() as u64, space);
     }
 
     #[test]

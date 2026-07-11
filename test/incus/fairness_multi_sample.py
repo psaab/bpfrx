@@ -181,6 +181,21 @@ def summarize(
     failing_samples = [s["sample"] for s in samples if s.get("verdict") != "PASS"]
     if failing_samples:
         failure_reasons.append(f"sample verdicts failed: {failing_samples}")
+    # C175-HC-084: the sub-harness process exit code is the authoritative
+    # per-sample pass/fail signal. A sample whose harness exited non-zero
+    # is a measured FAIL even if the emitted JSON claims verdict=PASS
+    # (exit status and verdict object disagree — trust the exit status).
+    # Without this, a run that exited 1 after printing a final PASS object
+    # aggregated to PASS, painting a real failure green.
+    bad_exit_samples = [
+        s["sample"]
+        for s in samples
+        if isinstance(s.get("exit_code"), int) and s.get("exit_code") != 0
+    ]
+    if bad_exit_samples:
+        failure_reasons.append(
+            f"samples with non-zero harness exit: {bad_exit_samples}"
+        )
     if mean_gap > max_mean_gap:
         failure_reasons.append(
             f"mean gap {mean_gap:.6f} exceeds threshold {max_mean_gap:.6f}"
