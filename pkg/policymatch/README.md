@@ -464,8 +464,17 @@ override EXACTLY:
 - if the walk then lands on a PERMIT — a matched permit OR a default-permit —
   `matchOr` / the default arm OVERRIDE it to that deny
   (`Result.FragmentAssociatedDeny`, attributed to the enforcing policy so
-  `PolicyName`/`PolicyID`/`RuleID`/`Action` name the real deny), and
+  `PolicyName`/`PolicyID`/`RuleID` name the real rule), and
   `Result.FragmentDenyNote()` renders the SSOT over-drop advisory.
+
+`Result.Action` on a fragment-associated verdict is ALWAYS `config.PolicyDeny`,
+never `reject`, even when the shadowing rule is a `reject`. A non-first fragment
+has no L4 header, so the dataplane cannot emit a RST/ICMP — it can only silently
+DROP — and `frag_associated_deny_result` hardcodes `PolicyAction::Deny` to match
+(`isSkippedFragDeny` still accepts a `reject` because a reject shadows the
+fragment identically to a deny; only the reported label is normalized to deny).
+Both verdicts are DROPs, so the #5572 false-permit is not re-introduced — this
+only keeps the deny-vs-reject label in parity with the wire.
 
 Scoped narrowly, mirroring the dataplane: a fragment a real (protocol-only /
 `any`) deny matches directly is a normal deny (not flagged as an override); a

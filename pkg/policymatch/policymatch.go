@@ -716,10 +716,14 @@ type Result struct {
 	// FragmentAssociatedDeny is true when this verdict is a #5572 non-first
 	// fragment whose PERMIT (matched or default) was OVERRIDDEN to the DENY it
 	// skipped, reproducing the dataplane's #4569 fragment-associated deny. When
-	// set, the Result is attributed to the DENY policy (PolicyName / PolicyID /
-	// RuleID / Action name the enforcing deny), Matched is true, and Action is
-	// deny/reject. It is set ONLY for a Query with NonFirstFragment == true whose
-	// transit walk would otherwise have permitted; a fragment that a real
+	// set, the Result is attributed to the enforcing policy's IDENTITY (PolicyName
+	// / PolicyID / RuleID name the shadowing rule) and Matched is true, but Action
+	// is ALWAYS config.PolicyDeny — never reject, even when the skipped rule is a
+	// `reject`. A non-first fragment has no L4 header, so the dataplane cannot send
+	// a RST/ICMP: it can only silently DROP, and the Rust
+	// frag_associated_deny_result hardcodes PolicyAction::Deny to match (see
+	// fragDenyResult). It is set ONLY for a Query with NonFirstFragment == true
+	// whose transit walk would otherwise have permitted; a fragment that a real
 	// (protocol-only / `any`) deny matched directly, or that permits with no
 	// overlapping skipped deny, does not carry it. Callers surface FragmentDenyNote
 	// so an operator reads WHY the fragment is denied (the security-over-
@@ -1881,11 +1885,23 @@ type fragDenyCandidate struct {
 }
 
 // fragDenyResult builds the #5572 fragment-associated deny verdict from a skipped
-// candidate: the DENY policy's full matchedResult, flagged FragmentAssociatedDeny
-// so callers render FragmentDenyNote. Action is the deny/reject the policy
-// carries, mirroring the dataplane's frag_associated_deny_result attribution.
+// candidate: the DENY policy's full matchedResult (identity — PolicyName /
+// PolicyID / RuleID / scope), flagged FragmentAssociatedDeny so callers render
+// FragmentDenyNote.
+//
+// Action is FORCED to config.PolicyDeny — never the reject the skipped rule may
+// carry. A non-first fragment has no L4 header, so the dataplane cannot emit a
+// RST/ICMP: it can only SILENTLY DROP the fragment. The Rust
+// frag_associated_deny_result hardcodes PolicyAction::Deny for exactly this
+// reason, so a skipped REJECT (isSkippedFragDeny accepts PolicyReject, since a
+// reject shadows the fragment identically to a deny) still yields a Deny label
+// here. Reporting reject would tell the operator a RST/ICMP is sent when the
+// firewall silently drops — a simulator/dataplane label divergence. Both verdicts
+// are DROPs, so the #5572 false-permit is not re-introduced; this only corrects
+// the deny-vs-reject label.
 func fragDenyResult(ids map[[2]uint32]uint32, c fragDenyCandidate) Result {
 	r := matchedResult(ids, c.pol, c.global, c.fromZone, c.toZone, c.setIdx, c.sliceIdx)
+	r.Action = config.PolicyDeny
 	r.FragmentAssociatedDeny = true
 	return r
 }

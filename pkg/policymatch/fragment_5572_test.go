@@ -286,6 +286,86 @@ func TestNonFirstFragmentDefaultPermitOverridden(t *testing.T) {
 	}
 }
 
+// TestNonFirstFragmentSkippedRejectReportedAsDeny is the reject→deny parity pin
+// (#5572 review fold). A non-first fragment that SKIPS a port-bearing REJECT
+// (isSkippedFragDeny accepts PolicyReject — a reject shadows the fragment
+// identically to a deny) and then lands on `permit any` must be reported with
+// Action=DENY, NOT reject. A non-first fragment has no L4 header, so the
+// dataplane cannot emit a RST/ICMP — it can only silently DROP — and the Rust
+// frag_associated_deny_result hardcodes PolicyAction::Deny. Reporting reject
+// would tell the operator a RST/ICMP is sent when the firewall silently drops.
+//
+// FAIL-ON-REVERT: drop the `r.Action = config.PolicyDeny` force in fragDenyResult
+// and the verdict inherits the rule's PolicyReject action, flipping this red
+// (Action=reject), catching the simulator/dataplane label divergence.
+func TestNonFirstFragmentSkippedRejectReportedAsDeny(t *testing.T) {
+	sec := config.SecurityConfig{
+		DefaultPolicy: config.PolicyDeny,
+		Zones:         zones("trust", "untrust"),
+		AddressBook: &config.AddressBook{
+			Addresses: map[string]*config.Address{
+				"trust-net": {Name: "trust-net", Value: "10.0.0.0/8"},
+			},
+		},
+		Policies: []*config.ZonePairPolicies{
+			{
+				FromZone: "trust", ToZone: "untrust",
+				Policies: []*config.Policy{
+					{
+						Name:   "reject-https",
+						Action: config.PolicyReject, // a REJECT, not a plain deny
+						Match: config.PolicyMatch{
+							SourceAddresses:      []string{"trust-net"},
+							DestinationAddresses: []string{"any"},
+							Applications:         []string{"junos-https"},
+						},
+					},
+					{
+						Name:   "permit-all",
+						Action: config.PolicyPermit,
+						Match: config.PolicyMatch{
+							SourceAddresses:      []string{"any"},
+							DestinationAddresses: []string{"any"},
+							Applications:         []string{"any"},
+						},
+					},
+				},
+			},
+		},
+	}
+	cfg := cfgWith(sec, config.ApplicationsConfig{})
+
+	res := Match(cfg, Query{
+		FromZone: "trust", ToZone: "untrust",
+		SrcIP: net.ParseIP("10.1.2.3"), DstIP: net.ParseIP("203.0.113.9"),
+		Protocol: "tcp", NonFirstFragment: true,
+	})
+	if !res.Matched || !res.FragmentAssociatedDeny {
+		t.Fatalf("fragment must inherit the overlapping port-bearing reject as an override; got %+v", res)
+	}
+	// Identity still names the enforcing rule.
+	if res.PolicyName != "reject-https" {
+		t.Fatalf("fragment verdict must name the enforcing rule reject-https; got %q", res.PolicyName)
+	}
+	// But the ACTION is normalized to deny — a fragment cannot be rejected
+	// (no L4 header → no RST/ICMP), matching the dataplane's hardcoded Deny.
+	if res.Action != config.PolicyDeny {
+		t.Fatalf("a fragment-associated verdict for a skipped REJECT must report Action=deny "+
+			"(no L4 header → silent drop, not RST/ICMP); got Action=%v", res.Action)
+	}
+	// The positive control: a concrete TCP/443 packet still REJECTS directly
+	// (the reject label is preserved for a real L4 match — only the fragment
+	// override normalizes to deny).
+	direct := Match(cfg, Query{
+		FromZone: "trust", ToZone: "untrust",
+		SrcIP: net.ParseIP("10.1.2.3"), DstIP: net.ParseIP("203.0.113.9"),
+		Protocol: "tcp", DstPort: 443,
+	})
+	if !direct.Matched || direct.Action != config.PolicyReject || direct.FragmentAssociatedDeny {
+		t.Fatalf("a concrete L4 reject must still report reject (not normalized); got %+v", direct)
+	}
+}
+
 // TestParseSelectorArgsNonFirstFragmentFlag pins the CLI selector plumbing: the
 // valueless `non-first-fragment` token sets SelectorArgs.NonFirstFragment and
 // threads into Query, and a duplicate is rejected (fail-closed, #3709 posture).

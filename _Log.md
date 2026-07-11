@@ -46037,3 +46037,21 @@ top.
   Updated pkg/ddns/README.md size-bound contract. RED-on-revert verified.
   **File(s)**: pkg/ddns/state.go, pkg/ddns/state_readbound_5571_test.go,
   pkg/ddns/README.md, _Log.md
+
+- **Timestamp**: 2026-07-11
+  **Action**: #5572 review fold (rev-5590 MINOR) — fragment-associated deny is
+  ALWAYS Deny, never reject. `fragDenyResult` now forces
+  `r.Action = config.PolicyDeny` after building the matched result. A non-first
+  fragment has no L4 header, so the dataplane cannot send a RST/ICMP — it can
+  only silently DROP — and the Rust `frag_associated_deny_result` hardcodes
+  `PolicyAction::Deny`. `isSkippedFragDeny` still accepts a skipped REJECT (a
+  reject shadows the fragment identically to a deny), but the reported label is
+  normalized to deny; a concrete L4 reject match still reports reject. Both
+  verdicts are DROPs, so the #5572 false-permit is not re-introduced — this only
+  corrects the deny-vs-reject label parity. Fixed the FragmentAssociatedDeny
+  docstring + README fragment section (was "Action is deny/reject" — wrong).
+  Added fail-on-revert reject-shadow test (RED-on-revert proven: removing the
+  force reports Action=reject). Gates: go build ./... + go test -race
+  policymatch/cmd-cli/grpcapi/api green; gofmt -w.
+  **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/README.md,
+  pkg/policymatch/fragment_5572_test.go, _Log.md
