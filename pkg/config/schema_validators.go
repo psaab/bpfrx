@@ -27,6 +27,16 @@ import (
 // import cycle.
 type LeafValidator func(raw string, cfg *Config) error
 
+// PositionalKeyValidator is the POSITION-AWARE variant of LeafValidator
+// used for a named-instance key slot with more than one identity arg
+// (#5576). The walker passes the 0-based arg index of each identity
+// token so a node whose args are POSITIONAL (each slot has a distinct
+// grammar) can validate them per-position instead of accepting the
+// union in every slot. route-filter (`from route-filter <prefix>
+// <match-type>`) is the motivating case: arg 0 must be a CIDR and arg 1
+// must be a supported match-type keyword.
+type PositionalKeyValidator func(argIdx int, raw string, cfg *Config) error
+
 // validateEnum returns a closure that accepts only one of the listed
 // names (case-sensitive, exact match).
 func ValidateEnum(allowed []string) LeafValidator {

@@ -46072,6 +46072,27 @@ top.
   **File(s)**: pkg/ddns/state.go, pkg/ddns/state_readbound_5571_test.go,
   pkg/ddns/README.md, _Log.md
 
+- **Timestamp**: 2026-07-11 02:55
+  **Action**: #5576 — route-filter validator made POSITION-AWARE. The args:2
+  `from route-filter <prefix> <match-type>` key validator was
+  position-agnostic (accepted the union of CIDRs and match-type keywords in
+  either slot), so `route-filter longer exact` committed with the keyword
+  `longer` in the CIDR slot; the FRR renderer's malformed-prefix belt then
+  emitted no prefix-list entry but kept the route-map match → a match-none
+  policy (silent false-deny). Added `PositionalKeyValidator` type +
+  `keyValidatorPos` schemaNode field + `validateKeySlot` walker helper
+  (both the packed-Keys and peeled nested-name paths thread the 0-based arg
+  index). Replaced `ValidateRouteFilterArg` with
+  `ValidateRouteFilterArgPositional` (slot 0 = CIDR, slot 1 = match-type
+  keyword). Added fail-on-revert tests (config + frr) and doc updates.
+  RED-on-revert verified (position-agnostic revert → swapped/keyword-in-CIDR
+  forms commit clean → test fails). Gates: build + vet + config/frr/
+  configstore/cmdtree tests green.
+  **File(s)**: pkg/config/schema.go, pkg/config/schema_walk.go,
+  pkg/config/schema_validators.go, pkg/config/schema_validators_routing.go,
+  pkg/config/schema_routing.go, pkg/config/schema_validate_route_filter_test.go,
+  pkg/frr/policy_render.go, pkg/frr/policy_route_filter_matchnone_5576_test.go,
+  docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-07-11
   **Action**: #5572 review fold (rev-5590 MINOR) — fragment-associated deny is
   ALWAYS Deny, never reject. `fragDenyResult` now forces

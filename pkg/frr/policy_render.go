@@ -1357,13 +1357,15 @@ func renderRouteFilterEntry(b *strings.Builder, plName string, idx int, rf *conf
 	// line. Set by the #2103 max-length "longer" guard and the #2105
 	// malformed-prefix belt below.
 	skipEntry := false
-	// #2105 render-side belt-and-suspenders: a malformed prefix must
-	// NEVER reach an FRR line. The commit-time keyValidator
-	// (ValidateRouteFilterArg) rejects these on the strict path, but the
-	// lenient-on-load path (Store.Load / SyncApply, #1960) can still feed
-	// a stored pre-gate garbage prefix to the renderer. Use the SAME
-	// net.ParseCIDR check as the commit validator so the belt's coverage
-	// matches it exactly.
+	// #2105/#5576 render-side belt-and-suspenders: a malformed prefix must
+	// NEVER reach an FRR line. The commit-time key validator
+	// (ValidateRouteFilterArgPositional) rejects these on the strict path
+	// — including a match-type keyword mistakenly placed in the prefix
+	// slot (`route-filter longer exact`, #5576) — but the lenient-on-load
+	// path (Store.Load / SyncApply, #1960) can still feed a stored
+	// pre-gate garbage prefix to the renderer. Use the SAME net.ParseCIDR
+	// check as the commit validator so the belt's coverage matches it
+	// exactly.
 	if _, _, err := net.ParseCIDR(rf.Prefix); err != nil {
 		skipEntry = true
 	}
