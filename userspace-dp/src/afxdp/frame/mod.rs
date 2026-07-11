@@ -1730,9 +1730,38 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
     (ip_ok, l4_ok)
 }
 
+// frame/tests.rs (8.3k-LOC catch-all) was split into cohesive per-subsystem
+// sibling test modules plus a shared support module in #4840. Pure test
+// code-motion; each file reaches production items through `super::*` and
+// shared fixtures through `super::super::test_fixtures::*`, identical to the
+// pre-split single module.
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "tests_support.rs"]
+mod tests_support;
+#[cfg(test)]
+#[path = "tests_parse_forward_pbr.rs"]
+mod tests_parse_forward_pbr;
+#[cfg(test)]
+#[path = "tests_native_gre_ecn.rs"]
+mod tests_native_gre_ecn;
+#[cfg(test)]
+#[path = "tests_nat_rewrite.rs"]
+mod tests_nat_rewrite;
+#[cfg(test)]
+#[path = "tests_ports_live_forward.rs"]
+mod tests_ports_live_forward;
+#[cfg(test)]
+#[path = "tests_segment_tcp.rs"]
+mod tests_segment_tcp;
+#[cfg(test)]
+#[path = "tests_ttl_descriptor_dscp.rs"]
+mod tests_ttl_descriptor_dscp;
+#[cfg(test)]
+#[path = "tests_fragment_term_extra.rs"]
+mod tests_fragment_term_extra;
+#[cfg(test)]
+#[path = "tests_mss_inject_inspect.rs"]
+mod tests_mss_inject_inspect;
 
 // #1824: proptest property harness (parse no-panic/bounds, NAT
 // round-trip + descriptor-vs-generic differential, TSO reassembly).

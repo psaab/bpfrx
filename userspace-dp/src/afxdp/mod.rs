@@ -444,9 +444,46 @@ const fn tx_frame_capacity() -> usize {
 
 #[path = "coordinator/mod.rs"]
 mod coordinator;
+// afxdp/tests.rs (14k-LOC catch-all) was split into cohesive per-subsystem
+// sibling test modules plus a shared support module in #4840. Pure test
+// code-motion; each file carries the union use-block and reaches production
+// items through `super::*`, identical to the pre-split single module.
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
+#[path = "tests_support.rs"]
+mod tests_support;
+#[cfg(test)]
+#[path = "tests_bind_forward.rs"]
+mod tests_bind_forward;
+#[cfg(test)]
+#[path = "tests_icmp_te.rs"]
+mod tests_icmp_te;
+#[cfg(test)]
+#[path = "tests_icmp_reject_reversal.rs"]
+mod tests_icmp_reject_reversal;
+#[cfg(test)]
+#[path = "tests_embedded_poll_filter.rs"]
+mod tests_embedded_poll_filter;
+#[cfg(test)]
+#[path = "tests_slow_path_disposition.rs"]
+mod tests_slow_path_disposition;
+#[cfg(test)]
+#[path = "tests_txn_flow_cache.rs"]
+mod tests_txn_flow_cache;
+#[cfg(test)]
+#[path = "tests_nat64_tunnel.rs"]
+mod tests_nat64_tunnel;
+#[cfg(test)]
+#[path = "tests_gre_local_delivery.rs"]
+mod tests_gre_local_delivery;
+#[cfg(test)]
+#[path = "tests_decap_dnat_table.rs"]
+mod tests_decap_dnat_table;
+#[cfg(test)]
+#[path = "tests_policy_inbound_nat.rs"]
+mod tests_policy_inbound_nat;
+#[cfg(test)]
+#[path = "tests_fragment.rs"]
+mod tests_fragment;
 #[path = "worker/mod.rs"]
 mod worker;
 // #1807: shared poison-recovery helpers (lock_recover /
