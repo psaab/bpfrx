@@ -201,6 +201,24 @@ type PolicyRule struct {
 	Count        bool     `json:"count"`
 	HitPackets   uint64   `json:"hit_packets"`
 	HitBytes     uint64   `json:"hit_bytes"`
+	// HitCountersUnavailable marks HitPackets/HitBytes as NOT authoritative
+	// because the rule is counter-ELIGIBLE (system-wide `policy-stats` on, or
+	// this rule carries `then count`) but there is no runtime counter source:
+	// the userspace dataplane is UNLOADED (config-only / degraded boot), so the
+	// handler never built its per-policy counter reader and the fields stay 0
+	// without reflecting real traffic (#5580). Mirrors the
+	// InterfaceStats.Unavailable (#3464) /
+	// GlobalStats.HostInboundKernelDeniesUnavailable (#3681) idiom and the
+	// #3345 "counter-unavailable != zero" contract: a monitoring consumer must
+	// be able to tell a real idle 0 (rule matched no traffic) from "counter
+	// source absent". Omitted (false) when the counters read successfully AND
+	// when the rule is NOT counter-enabled (no `then count` with policy-stats
+	// off) — that rule is legitimately no-counter, signalled by Count=false,
+	// which is DISTINCT from counter-enabled-but-source-unavailable. A loaded
+	// read FAILURE is still surfaced fail-loud as HTTP 500 (#3408), never as
+	// this in-body flag. Old consumers keep reading the numeric fields
+	// unchanged; new consumers check this flag before trusting a 0.
+	HitCountersUnavailable bool `json:"hit_counters_unavailable,omitempty"`
 	// MatchFromZone / MatchToZone carry the optional from-zone/to-zone
 	// match context of a scoped GLOBAL policy (#3148, #3286). The global
 	// PolicyInfo group still reports from_zone="*"/to_zone="*" (all-zones
