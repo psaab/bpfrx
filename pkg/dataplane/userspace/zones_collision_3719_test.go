@@ -244,6 +244,218 @@ func TestBuildSnapshotDropsDanglingGlobalMatchZone(t *testing.T) {
 	}
 }
 
+// TestQuarantinePrunesScopedGlobalMemberNotWholeRule (#5577, fail-open): a scoped
+// global DENY whose match-zone SET carries several zones must keep protecting the
+// members that did NOT collide. A deny scoped from [z174, z214] where only z214 is
+// quarantined must SURVIVE, pruned to [z174] — NOT be dropped wholesale. Dropping
+// the whole rule is fail-open: z174 traffic would no longer hit the deny and would
+// reach a later/default permit while the snapshot publishes successfully.
+//
+// RED-on-revert: with the old any-member-drops-whole-rule logic the deny is
+// dropped entirely, so the g-deny-scoped assertion (deny survives for z174) fails.
+func TestQuarantinePrunesScopedGlobalMemberNotWholeRule(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	snap := &ConfigSnapshot{
+		Zones: []ZoneSnapshot{
+			{Name: "untrust", ID: config.StableZoneID("untrust")},
+			{Name: "z174", ID: config.StableZoneID("z174")},
+			{Name: "z214", ID: config.StableZoneID("z214")},
+		},
+		Policies: []PolicyRuleSnapshot{
+			// A multi-zone scoped global deny: from {z174, z214} to {untrust}.
+			// Only z214 collides; the deny must survive scoped to {z174}.
+			{
+				Name: "g-deny-scoped", FromZone: "junos-global", ToZone: "junos-global",
+				Action:         "deny",
+				MatchFromZones: []string{"z174", "z214"},
+				MatchFromZone:  "z174",
+				MatchToZones:   []string{"untrust"},
+				MatchToZone:    "untrust",
+			},
+			// A middle-member collision: [untrust, z214, z174] -> [untrust, z174].
+			{
+				Name: "g-deny-middle", FromZone: "junos-global", ToZone: "junos-global",
+				Action:         "deny",
+				MatchFromZones: []string{"untrust", "z214", "z174"},
+				MatchFromZone:  "untrust",
+			},
+			// The to-side carries the collision: from {untrust} to {z174, z214}.
+			{
+				Name: "g-deny-to", FromZone: "junos-global", ToZone: "junos-global",
+				Action:         "deny",
+				MatchFromZones: []string{"untrust"},
+				MatchFromZone:  "untrust",
+				MatchToZones:   []string{"z174", "z214"},
+				MatchToZone:    "z174",
+			},
+			// EVERY match member collides -> the scope can no longer be honored;
+			// leaving it empty would broaden to all zones (fail-open), so DROP.
+			{
+				Name: "g-deny-all-quarantined", FromZone: "junos-global", ToZone: "junos-global",
+				Action:         "deny",
+				MatchFromZones: []string{"z214"},
+				MatchFromZone:  "z214",
+			},
+		},
+	}
+
+	quarantineCollidingZones(snap)
+
+	published := map[string]bool{}
+	for _, z := range snap.Zones {
+		published[z.Name] = true
+	}
+	byName := map[string]PolicyRuleSnapshot{}
+	for _, p := range snap.Policies {
+		byName[p.Name] = p
+		// No surviving rule may reference the quarantined zone in ANY zone slot —
+		// singular or plural — else the Rust preflight bricks the whole snapshot.
+		slots := append([]string{p.FromZone, p.ToZone, p.MatchFromZone, p.MatchToZone},
+			append(append([]string{}, p.MatchFromZones...), p.MatchToZones...)...)
+		for _, z := range slots {
+			if z == "" || z == "junos-global" {
+				continue
+			}
+			if !published[z] {
+				t.Fatalf("policy %q keeps dangling zone %q absent from published zones", p.Name, z)
+			}
+		}
+	}
+
+	// The core fail-open guard: the multi-zone deny SURVIVES, scoped to z174.
+	g, ok := byName["g-deny-scoped"]
+	if !ok {
+		t.Fatalf("multi-zone scoped global deny was dropped — fail-open: z174 traffic no longer hits the deny (#5577)")
+	}
+	if got := g.effectiveMatchFromZones(); len(got) != 1 || got[0] != "z174" {
+		t.Fatalf("g-deny-scoped from-scope = %v, want [z174] (z214 pruned)", got)
+	}
+	if g.MatchFromZone != "z174" {
+		t.Fatalf("g-deny-scoped singular MatchFromZone = %q, want z174 (regenerated from surviving set)", g.MatchFromZone)
+	}
+	if got := g.effectiveMatchToZones(); len(got) != 1 || got[0] != "untrust" {
+		t.Fatalf("g-deny-scoped to-scope = %v, want [untrust] (untouched)", got)
+	}
+
+	// Middle-member prune retains order of the survivors.
+	m, ok := byName["g-deny-middle"]
+	if !ok {
+		t.Fatalf("g-deny-middle was dropped, want pruned survivors")
+	}
+	if got := m.effectiveMatchFromZones(); len(got) != 2 || got[0] != "untrust" || got[1] != "z174" {
+		t.Fatalf("g-deny-middle from-scope = %v, want [untrust z174]", got)
+	}
+
+	// To-side collision pruned; from-side untouched.
+	t2, ok := byName["g-deny-to"]
+	if !ok {
+		t.Fatalf("g-deny-to was dropped, want to-side pruned to [z174]")
+	}
+	if got := t2.effectiveMatchToZones(); len(got) != 1 || got[0] != "z174" {
+		t.Fatalf("g-deny-to to-scope = %v, want [z174]", got)
+	}
+	if t2.MatchToZone != "z174" {
+		t.Fatalf("g-deny-to singular MatchToZone = %q, want z174", t2.MatchToZone)
+	}
+
+	// A rule whose every match member collided is dropped (would else broaden).
+	if _, ok := byName["g-deny-all-quarantined"]; ok {
+		t.Fatalf("scoped global whose ALL match members collided survived — would broaden to all zones (fail-open)")
+	}
+}
+
+// TestQuarantineDropsZonePairEndpointStillDrops guards the OTHER direction of the
+// #5577 distinction: a NON-scoped zone-pair rule whose singular FromZone/ToZone is
+// quarantined is STRUCTURALLY unapplicable and must STILL be dropped (unchanged
+// behavior — pruning does not apply to a required singular endpoint).
+func TestQuarantineDropsZonePairEndpointStillDrops(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	snap := &ConfigSnapshot{
+		Zones: []ZoneSnapshot{
+			{Name: "untrust", ID: config.StableZoneID("untrust")},
+			{Name: "z174", ID: config.StableZoneID("z174")},
+			{Name: "z214", ID: config.StableZoneID("z214")},
+		},
+		Policies: []PolicyRuleSnapshot{
+			{Name: "zp-from-quarantined", FromZone: "z214", ToZone: "untrust", Action: "deny"},
+			{Name: "zp-to-quarantined", FromZone: "untrust", ToZone: "z214", Action: "deny"},
+			{Name: "zp-survivor", FromZone: "z174", ToZone: "untrust", Action: "deny"},
+		},
+	}
+	quarantineCollidingZones(snap)
+	kept := map[string]bool{}
+	for _, p := range snap.Policies {
+		kept[p.Name] = true
+	}
+	if kept["zp-from-quarantined"] || kept["zp-to-quarantined"] {
+		t.Fatalf("zone-pair rule with a quarantined endpoint survived: %v", kept)
+	}
+	if !kept["zp-survivor"] {
+		t.Fatalf("zone-pair survivor rule was wrongly dropped: %v", kept)
+	}
+}
+
+// TestBuildSnapshotPrunesScopedGlobalMemberFromRealPath drives the REAL publish
+// path (buildSnapshot) end-to-end: a config with a StableZoneID collision AND a
+// scoped global DENY whose `match from-zone [z174 z214]` includes both the
+// survivor and the quarantined zone must publish a deny that SURVIVES scoped to
+// [z174] and references no unpublished zone. RED-on-revert: the old whole-rule
+// drop removes the deny entirely, so the "deny present, scoped to z174" assertion
+// fails and z174 traffic would fall through to the default permit.
+func TestBuildSnapshotPrunesScopedGlobalMemberFromRealPath(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"untrust": {Name: "untrust"},
+		"z174":    {Name: "z174"},
+		"z214":    {Name: "z214"},
+	}
+	cfg.Security.GlobalPolicies = []*config.Policy{
+		{
+			Name: "g-multi-deny",
+			Match: config.PolicyMatch{
+				FromZones:    []string{"z174", "z214"},
+				ToZones:      []string{"untrust"},
+				Applications: []string{"any"},
+			},
+			Action: config.PolicyDeny,
+		},
+	}
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 0, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	published := map[string]bool{}
+	for _, z := range snap.Zones {
+		published[z.Name] = true
+	}
+	var deny *PolicyRuleSnapshot
+	for i := range snap.Policies {
+		p := &snap.Policies[i]
+		if p.Name == "g-multi-deny" {
+			deny = p
+		}
+		for _, z := range append([]string{p.FromZone, p.ToZone, p.MatchFromZone, p.MatchToZone},
+			append(append([]string{}, p.MatchFromZones...), p.MatchToZones...)...) {
+			if z == "" || z == "junos-global" {
+				continue
+			}
+			if !published[z] {
+				t.Fatalf("published policy %q references unpublished zone %q — Rust preflight would brick", p.Name, z)
+			}
+		}
+	}
+	if deny == nil {
+		t.Fatalf("multi-zone scoped global deny was dropped from the built snapshot — fail-open (#5577)")
+	}
+	if got := deny.effectiveMatchFromZones(); len(got) != 1 || got[0] != "z174" {
+		t.Fatalf("built deny from-scope = %v, want [z174] (z214 pruned, deny survives for z174)", got)
+	}
+}
+
 // TestBuildSnapshotNoCollisionPublishesAll: the common case is untouched — an
 // ordinary distinct-folding zone set publishes every zone and records no
 // collision (no false positive).
