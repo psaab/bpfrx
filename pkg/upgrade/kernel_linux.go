@@ -332,6 +332,14 @@ func buildInstallArgs(pkgs []string, anyInstalled bool) []string {
 }
 
 func (s *realKernelSystem) WriteSlotSelector(slot, unameR string) error {
+	// The uname string is embedded verbatim in a double-quoted GRUB directive
+	// below (`set xpf_slot_kernel="vmlinuz-<unameR>"`). A `"`, backslash, or
+	// newline in it would inject arbitrary GRUB commands and corrupt the boot
+	// selector. Validate to the kernel-version charset and fail CLOSED — never
+	// write a selector built from an unvalidated segment (#5452).
+	if err := ValidateKernelSegment("kernel uname", unameR); err != nil {
+		return fmt.Errorf("write slot selector: %w", err)
+	}
 	dir := s.rooted(filepath.Join("/boot/efi/EFI", slot))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create slot selector dir %s: %w", dir, err)
@@ -603,6 +611,17 @@ func (s *realKernelSystem) DisarmWatchdog() error {
 }
 
 func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVersion string) error {
+	// Fail CLOSED on an unsafe candidate segment BEFORE any purge, glob, or
+	// delete (#5452). candidateVersion feeds `apt-get purge linux-image-<ver>`
+	// (a "*" would purge EVERY kernel package), filepath.Glob("/boot/*-"+ver)
+	// whose matches are handed to os.RemoveAll (a "*" globs "/boot/*-*",
+	// matching every dashed /boot file -> wipes all kernels/initrds/config),
+	// and os.RemoveAll("/lib/modules/"+ver) (a ".." traverses to "/lib"). Never
+	// run a filesystem delete keyed by an unvalidated version. knownGoodUnameR
+	// is validated by WriteSlotSelector before it reaches the GRUB script.
+	if err := ValidateKernelSegment("kernel candidate version", candidateVersion); err != nil {
+		return fmt.Errorf("kernel-upgrade prune: %w", err)
+	}
 	// Restore the inactive slot's boot selector to the KNOWN-GOOD kernel FIRST.
 	// This is the load-bearing safety step and it is independent of the package
 	// cleanup below: whatever happens to the candidate's packages, the slot

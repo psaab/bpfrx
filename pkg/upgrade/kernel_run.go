@@ -78,6 +78,17 @@ func (r *KernelRunner) Arm(candidateVersion string) error {
 	if candidateVersion == "" {
 		return fmt.Errorf("kernel-upgrade: candidate version is required")
 	}
+	// Fail CLOSED on an unsafe candidate segment before ANY mutation (#5452).
+	// The version flows raw into a /boot glob + os.RemoveAll, a /lib/modules
+	// os.RemoveAll, `apt-get purge linux-image-<ver>`, and the GRUB
+	// slot-selector script — so a "*" would glob every dashed /boot file into
+	// RemoveAll (arbitrary /boot deletion -> unbootable host), a ".." would
+	// traverse the modules delete, and a quote/newline would inject GRUB
+	// directives. Reject anything outside the kernel-version charset here so an
+	// invalid segment never reaches those sites.
+	if err := ValidateKernelSegment("kernel candidate version", candidateVersion); err != nil {
+		return fmt.Errorf("kernel-upgrade: %w", err)
+	}
 	j, err := r.loadKernelJournal()
 	if err != nil {
 		return err

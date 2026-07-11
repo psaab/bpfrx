@@ -49,6 +49,26 @@ Codex implemented pkg/upgrade/kernel_linux.go against the KernelSystem interface
   seam signature `pkgInstalledFn func(pkg string) (bool, error)` lets a test
   inject a query error; the #5428 tests prove RED-on-revert (files swept
   without the fix).
+- Kernel version / uname safe-segment validation (#5452, HIGH security). The
+  candidate version and the running `uname -r` string were used RAW in
+  `filepath.Glob("/boot/*-"+ver)` -> `os.RemoveAll`, in
+  `os.RemoveAll("/lib/modules/"+ver)`, in `apt-get purge linux-image-<ver>`,
+  and in the GRUB slot-selector Sprintf — with no charset check. A
+  `candidateVersion="*"` globbed `/boot/*-*` (every dashed /boot file) into
+  RemoveAll (arbitrary /boot deletion -> unbootable) and purged
+  `linux-image-*` (every kernel package); a `".."` traversed the modules
+  RemoveAll (`/lib/modules/..` == `/lib`); a `"`/newline in the uname string
+  injected GRUB directives. `ValidateKernelSegment` (pkg/upgrade/version.go)
+  now allows ONLY the kernel-version charset `[A-Za-z0-9._+~-]`, non-empty, no
+  leading `-`, no `..` — STRICTER than `ValidateVersionSegment` (which permits
+  glob metachars, quotes, and `:`, all safe as a plain path segment but not in
+  a glob/GRUB context). It is enforced fail-CLOSED at three sites:
+  `KernelRunner.Arm` (rejects a bad candidate up front, before any mutation),
+  `WriteSlotSelector` (validates the uname before the GRUB Sprintf — covers
+  both the candidate and the known-good restore path), and `PruneInactiveSlot`
+  (validates the candidate before the purge/glob/delete). Tests prove
+  RED-on-revert (`*`/`..`/quote delete or inject without the call-site
+  validation).
 
 Build/test: go build ./... OK; go vet ./pkg/upgrade OK; 17 kernel tests + the
 existing #1917 tests green.
