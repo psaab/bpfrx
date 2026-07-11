@@ -231,7 +231,15 @@ int main(int argc, char **argv)
 
     /* Start background traffic: ping own IP */
     pid_t child = fork();
-    if (child == 0) {
+    if (child < 0) {
+        /* #4906 HC-001: fork() failed (RLIMIT_NPROC / PID exhaustion / memory
+         * pressure). Do NOT fall into the unguarded kill(child, 9) at cleanup
+         * below — with child == -1 that is kill(-1, SIGKILL), which as root
+         * signals every process the caller may signal (the firewall daemon and
+         * the host). Warn and run without background traffic; the guarded
+         * cleanup skips the kill for child <= 0. */
+        perror("fork (background traffic)");
+    } else if (child == 0) {
         /* Child: send pings to self */
         char ifarg[64];
         snprintf(ifarg, sizeof(ifarg), "-I%s", iface);
@@ -271,8 +279,13 @@ int main(int argc, char **argv)
     destroy_xsk(&info, map_fd, queue);
 
 cleanup:
-    kill(child, 9);
-    waitpid(child, NULL, 0);
+    /* #4906 HC-001: only signal a real child. On fork() failure child < 0 and
+     * an unguarded kill(child, 9) becomes kill(-1, SIGKILL) — a host-wide
+     * SIGKILL when run as root. Guard on child > 0. */
+    if (child > 0) {
+        kill(child, 9);
+        waitpid(child, NULL, 0);
+    }
     bpf_xdp_attach(ifindex, -1, 0, NULL);
     printf("  XDP detached\n");
 

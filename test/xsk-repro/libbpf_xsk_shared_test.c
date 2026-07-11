@@ -267,7 +267,13 @@ int main(int argc, char **argv)
 
     /* Start traffic */
     pid_t child = fork();
-    if (child == 0) {
+    if (child < 0) {
+        /* #4906 HC-001: fork() failed. Do NOT fall into the unguarded
+         * kill(child, 9) below — with child == -1 that is kill(-1, SIGKILL),
+         * a host-wide SIGKILL as root. Warn and run without background
+         * traffic; the guarded kill skips for child <= 0. */
+        perror("fork (background traffic)");
+    } else if (child == 0) {
         char ifarg[64];
         snprintf(ifarg, sizeof(ifarg), "-I%s", iface);
         execlp("ping", "ping", ifarg, "-i", "0.1", "-c", "50", "-q",
@@ -280,8 +286,12 @@ int main(int argc, char **argv)
         iface, queue, secondary_iface, secondary_queue, map_fd, use_copy, umem,
         &umem_fill, &umem_comp, umem_area);
 
-    kill(child, 9);
-    waitpid(child, NULL, 0);
+    /* #4906 HC-001: only signal a real child — guard against kill(-1, SIGKILL)
+     * on a fork() failure (child < 0). */
+    if (child > 0) {
+        kill(child, 9);
+        waitpid(child, NULL, 0);
+    }
 
     /* Detach */
     bpf_xdp_attach(ifindex, -1, 0, NULL);
