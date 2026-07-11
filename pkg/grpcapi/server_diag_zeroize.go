@@ -332,11 +332,94 @@ var (
 	// entries, and its home tree (-r). It is a seam so tests can record the
 	// removal without touching real accounts. context.Background(): a client
 	// disconnect must not abort a confirmed factory reset (mirrors runTimeout's
-	// power-action rationale).
+	// power-action rationale). NEVER call this for the root account / UID 0:
+	// userdel -r root fails (you cannot delete the running superuser) and can
+	// ABORT the whole reset — root is revoked in place instead (#5520,
+	// zeroizeRootLoginAccount).
 	zeroizeUserdel = func(name string) ([]byte, error) {
 		return combinedOutputTimeout(context.Background(), "userdel", "-r", name)
 	}
+	// zeroizeRootSSHDir is the root account's .ssh directory. Root's home is
+	// /root, NOT /home/root, so its authorized_keys lives at
+	// /root/.ssh/authorized_keys — the generic /home/<name>/.ssh teardown MISSES
+	// it entirely (#5520). Mirrors pkg/daemon.rootSSHDir (not importable — the
+	// pkg/daemon → pkg/grpcapi import cycle, the same reason the other login
+	// paths are duplicated here). Package var only so a test can point the root
+	// revocation at a throwaway tree.
+	zeroizeRootSSHDir = "/root/.ssh"
+	// zeroizeLockRootPassword locks the root account password (passwd -l root
+	// prefixes the shadow field with "!", disabling password/console root login)
+	// as part of a factory reset. `passwd -l` is the same lock effect the #1944
+	// day-2 reconciler applies via `chpasswd -e` with "<name>:!"; the request
+	// path here has no stdin exec helper, so the equivalent argv-only `passwd -l`
+	// is used. It is a seam so a test can record the lock without touching the
+	// real root credential. context.Background(): a client disconnect must not
+	// abort a confirmed factory reset (mirrors zeroizeUserdel).
+	zeroizeLockRootPassword = func() ([]byte, error) {
+		return combinedOutputTimeout(context.Background(), "passwd", "-l", "root")
+	}
 )
+
+// zeroizeRootAuthorizedKeysPath returns the xpf-managed ROOT authorized_keys
+// file — /root/.ssh/authorized_keys, NOT /home/root/.ssh (#5520). applyRootAuth
+// (pkg/daemon) writes root's SSH keys there wholesale, so the whole file is
+// xpf-owned. Mirrors pkg/daemon.rootAuthorizedKeysPath.
+func zeroizeRootAuthorizedKeysPath() string {
+	return filepath.Join(zeroizeRootSSHDir, "authorized_keys")
+}
+
+// zeroizeRootLoginAccount revokes ROOT login as part of a factory reset,
+// special-cased away from the generic /home/<name> + userdel-r teardown (#5520).
+//
+// On a MANAGED-ROOT appliance the daemon writes a genuine provenance marker for
+// root (markProvisioned("root", 0), applyRootAuth in daemon_system.go), so root
+// is enumerated by zeroizeLoginAccounts just like a provisioned non-root user.
+// But the generic teardown is wrong for root two ways, and both defeat the
+// factory reset:
+//   - Root's authorized_keys is at /root/.ssh, NOT /home/root/.ssh, so the
+//     generic keysFile (filepath.Join(zeroizeHomeBase, "root", ...)) points at a
+//     path that does not exist and the prior tenant's ROOT SSH key SURVIVES a
+//     "successful" reset — a decommissioned/RMA'd/resold appliance keeps prior-
+//     operator root login, the worst re-tenant leak.
+//   - `userdel -r root` deletes UID 0; it fails/is refused (you cannot delete
+//     the running superuser) and — surfaced as the first error — can abort the
+//     whole reset. Root is the appliance's own superuser, never a disposable
+//     provisioned account, so it is revoked IN PLACE, never deleted.
+//
+// Revocation kills both root login vectors: remove /root/.ssh/authorized_keys
+// (key-based login) and lock the root password (passwd -l root — console/
+// password login). No userdel. The SSH-key removal runs FIRST so that vector
+// dies even if the password lock later fails (mirrors the generic path's
+// keys-before-userdel ordering).
+//
+// Fail CLOSED (#5496/#5493 discipline): if EITHER revocation fails, surface the
+// error (so performZeroizeWipe reports the reset INCOMPLETE) and RETAIN the
+// provenance marker so a retried zeroize re-attempts. The marker is dropped
+// (removeMarker=true) only when BOTH revocations succeeded — an already-absent
+// authorized_keys (os.ErrNotExist) is the goal, not a failure, and does not
+// block marker removal.
+func zeroizeRootLoginAccount(fail func(error)) (removeMarker bool) {
+	removeMarker = true
+	// Kill the SSH-key vector first (survives a password-lock failure). An
+	// already-absent file is the desired end state, not an error.
+	keysFile := zeroizeRootAuthorizedKeysPath()
+	if err := os.Remove(keysFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Error("zeroize: failed to remove root authorized_keys; retaining marker, reset incomplete",
+			"file", keysFile, "err", err)
+		fail(err)
+		removeMarker = false
+	}
+	// Lock the root password so console/password root login is revoked too.
+	if out, err := zeroizeLockRootPassword(); err != nil {
+		slog.Error("zeroize: failed to lock root password; retaining marker, reset incomplete",
+			"err", err, "output", strings.TrimSpace(string(out)))
+		fail(err)
+		removeMarker = false
+	} else {
+		slog.Info("zeroize: revoked root login (authorized_keys removed, password locked)")
+	}
+	return removeMarker
+}
 
 // zeroizeLookupUIDErr resolves the CURRENT numeric UID for name by parsing
 // zeroizePasswdPath directly (cgo-free, mirroring pkg/daemon.lookupUIDGIDErr,
@@ -409,10 +492,17 @@ func zeroizeLookupUIDErr(name string) (uid int, found bool, err error) {
 //   - Users: a userdel fires ONLY for an account that has a provenance marker
 //     AND whose CURRENT /etc/passwd UID still equals the marker's recorded UID.
 //     An operator's own account (no marker) is never iterated; a system account
-//     or root (no marker) is never touched; an out-of-band userdel+recreate with
-//     a different UID (marker mismatch) is left alone — exactly the #1944
+//     (no marker) is never touched; an out-of-band userdel+recreate with a
+//     different UID (marker mismatch) is left alone — exactly the #1944
 //     leave-then-rejoin vs recreate distinction, so the wipe can never nuke the
 //     wrong account or strand access.
+//   - root: a MANAGED-ROOT appliance writes a real marker for root
+//     (markProvisioned("root", 0), applyRootAuth), so root IS enumerated here —
+//     but it is special-cased away from the userdel path (#5520): its keys live
+//     at /root/.ssh (not /home/root) and userdel -r root fails on UID 0. It is
+//     revoked IN PLACE (remove /root/.ssh/authorized_keys + lock the password),
+//     never deleted. See zeroizeRootLoginAccount. A root with NO marker
+//     (unmanaged-root appliance) is not enumerated and stays untouched.
 //
 // Ownership uncertainty FAILS CLOSED (#5496). Deciding "is this the account xpf
 // provisioned?" needs TWO reads: the live UID (/etc/passwd, zeroizeLookupUIDErr)
@@ -474,6 +564,21 @@ func zeroizeLoginAccounts() error {
 		}
 		name := e.Name() // marker filename == account name (Base'd on write)
 		markerFile := filepath.Join(zeroizeProvisionedUsersDir, name)
+
+		if name == "root" {
+			// Root is the appliance's own superuser, not a disposable
+			// provisioned account. On a managed-root appliance it carries a real
+			// marker (markProvisioned("root", 0)), so it reaches this loop — but
+			// the generic /home/<name> + userdel-r path is wrong for it: root's
+			// keys live at /root/.ssh (not /home/root) and userdel -r root fails
+			// on UID 0 and can abort the reset (#5520). Revoke it IN PLACE
+			// (remove /root/.ssh/authorized_keys + lock the password); drop the
+			// marker only when the revocation fully succeeded (fail-closed).
+			if zeroizeRootLoginAccount(fail) {
+				fail(os.Remove(markerFile))
+			}
+			continue
+		}
 
 		recordedUID, markerErr := readProvisionedMarkerUID(markerFile)
 		curUID, curFound, lookupErr := zeroizeLookupUIDErr(name)
