@@ -269,6 +269,31 @@ cannot occur.
   does not reorder unrelated policies. Locked by
   `TestSupersede_PreservesFIFOPlacesNewAtTail` (fail-on-revert: a prepend lands
   the new action at index 0 and the test goes RED).
+- **Producer serialization — no capacity theft (#5062):** `HandleEvent`
+  evaluates under `e.mu` but RELEASES it before `enqueue`, so many RPM-probe
+  goroutines run `enqueue` concurrently. `supersede()` DRAINS the accepted
+  actions into a private slice (opening slots) and then re-enqueues the
+  survivors; without a producer lock a SECOND concurrent producer — via
+  `enqueue`'s fast-path send OR its own `supersede` — could take a drain-freed
+  slot between the drain and the re-enqueue, forcing `supersede`'s refill
+  `default` branch to DROP a survivor (an already-accepted action for a DIFFERENT
+  policy), losing it and its FIFO position (miscounted `queue_full`). ALL
+  producer-side queue mutation now runs under a dedicated `enqueueMu` held across
+  the WHOLE `enqueue` (fast-path send AND the `supersede` drain+refill), so the
+  drain→re-enqueue is atomic w.r.t. other producers: the only concurrent actor
+  left is the consumer (`actionWorker`), which only REMOVES items, so a
+  drain-freed slot is never re-filled by anyone but `supersede` itself and every
+  survivor is preserved exactly once, in FIFO order. `enqueueMu` is a
+  producer-only leaf lock — never held while `e.mu` is held (`enqueue` runs after
+  `evaluateEvent` released `e.mu`), and the consumer path (`staleReason` /
+  `armCooldown`, which take `e.mu`) never takes `enqueueMu` — so there is no
+  lock-ordering cycle and no deadlock (every channel op under `enqueueMu` is a
+  non-blocking select-with-default). This is DISTINCT from #2869, which fixed
+  same-policy ordering, not concurrent capacity theft. Locked by
+  `TestSupersede_ConcurrentProducersConserveSurvivors` (concurrent barrier) and
+  `TestSupersede_DrainStealWindowIsClosed` (deterministic drain→steal→drop
+  window via the `afterDrainFn` seam) — both fail-on-revert if `enqueueMu` is
+  removed (a survivor is dropped).
 - A non-lock error (bad apply / CommitCheck reject) is a permanent failure: no
   retry, bumps `xpf_event_actions_rejected_total`.
 

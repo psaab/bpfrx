@@ -247,6 +247,31 @@ type Engine struct {
 	stopCh    chan struct{}
 	startOnce sync.Once
 
+	// enqueueMu serializes ALL producer-side queue mutation (#5062). HandleEvent
+	// releases e.mu (evaluateEvent returns) BEFORE it enqueues, so many RPM-probe
+	// goroutines run enqueue concurrently. When the bounded queue is full, enqueue
+	// falls into supersede, which DRAINS the accepted actions into a private slice
+	// (opening slots) and then best-effort re-enqueues the survivors. Without a
+	// producer lock a SECOND concurrent producer — via enqueue's fast-path send OR
+	// its own supersede — takes those drain-freed slots between the drain and the
+	// re-enqueue, so supersede's refill `default` branch DROPS a survivor (an
+	// already-accepted action for a DIFFERENT policy), losing it and its FIFO
+	// position (miscounted droppedQueueFull). Holding enqueueMu across the WHOLE
+	// enqueue (fast-path send AND the supersede drain+refill) makes the
+	// drain->re-enqueue atomic w.r.t. other producers: the only concurrent actor
+	// left is the consumer (actionWorker), which only REMOVES items, so a
+	// drain-freed slot can never be re-filled by anyone but supersede itself and a
+	// survivor is preserved exactly once, in FIFO order.
+	//
+	// Lock ordering (no cycle, no deadlock): enqueueMu is a producer-only LEAF
+	// lock. It is NEVER held while e.mu is held (enqueue runs after evaluateEvent
+	// has released e.mu), and the consumer/worker path (runAction -> staleReason /
+	// armCooldown, which take e.mu) NEVER takes enqueueMu — the two locks are
+	// never nested in either order. Every channel op performed under enqueueMu is
+	// a non-blocking select-with-default, and the consumer never holds enqueueMu,
+	// so the queue always drains and no producer can block indefinitely.
+	enqueueMu sync.Mutex
+
 	// lifeCtx is the engine-lifetime context threaded into the remediation
 	// commit (#2868). It is cancelled by Close() at the same time stopCh is
 	// closed, so a remediation commit in flight at daemon shutdown (which
@@ -268,6 +293,15 @@ type Engine struct {
 
 	// Injectable clock for tests; nil means time.Now.
 	nowFn func() time.Time
+
+	// afterDrainFn is a test-only seam (#5062). When non-nil, supersede invokes
+	// it exactly at the drain->re-enqueue boundary (after the queue has been
+	// drained into the private survivor slice, before the survivors are
+	// re-enqueued) so a test can deterministically drive a concurrent producer
+	// into the freed slots and assert the fix serializes it. nil in production —
+	// supersede is not a hot path (it fires only on a full-queue overflow), so a
+	// single nil-check is negligible.
+	afterDrainFn func()
 
 	// Injectable retry-backoff timer for tests; nil means newRetryTimer
 	// (backed by time.NewTimer). Returns the fire channel plus a stop func
@@ -505,7 +539,8 @@ func policySemanticRevision(pol *config.EventPolicy) string {
 // the validated actions onto the single worker (#2139/#2157). The actual
 // configure/commit happens off this caller goroutine on the worker, so many
 // probe goroutines may call HandleEvent concurrently without racing on the
-// config lock.
+// config lock. Concurrent enqueues are serialized by enqueueMu so a full-queue
+// supersede cannot lose an already-accepted action to a racing producer (#5062).
 func (e *Engine) HandleEvent(ev rpm.Event) {
 	e.startOnce.Do(e.startWorker)
 	triggered := e.evaluateEvent(ev)
@@ -587,7 +622,15 @@ func (e *Engine) Stats() Stats {
 // one pending action per policy. If the queue is full of OTHER policies'
 // actions, the new action is dropped (counted) rather than blocking the caller
 // goroutine (#2157 bounded queue).
+//
+// The whole body runs under enqueueMu (#5062) so concurrent producers cannot
+// interleave: the fast-path send below and supersede's drain+refill must be
+// atomic w.r.t. one another, otherwise a second producer could take a slot
+// supersede freed while draining and force supersede to drop an already-accepted
+// survivor. See the enqueueMu field comment for the lock-ordering rationale.
 func (e *Engine) enqueue(a plannedAction) {
+	e.enqueueMu.Lock()
+	defer e.enqueueMu.Unlock()
 	select {
 	case e.actions <- a:
 		e.counters.queueDepth.Add(1)
@@ -596,7 +639,8 @@ func (e *Engine) enqueue(a plannedAction) {
 	default:
 		// Queue full. Try to supersede a same-policy action by draining and
 		// re-enqueuing, dropping any older same-policy entry. Best-effort,
-		// non-blocking.
+		// non-blocking. Runs under enqueueMu so the drain-freed slots are never
+		// visible to another producer (#5062).
 		if e.supersede(a) {
 			return
 		}
@@ -607,9 +651,15 @@ func (e *Engine) enqueue(a plannedAction) {
 }
 
 // supersede non-blockingly rebuilds the queue, replacing any existing
-// same-policy action with a, and returns true if a was placed. It drains at
-// most the current buffered entries to avoid an unbounded loop under
-// concurrent producers.
+// same-policy action with a, and returns true if a was placed.
+//
+// CALLER MUST HOLD enqueueMu (#5062). That is what makes the drain->re-enqueue
+// atomic w.r.t. other producers: while this runs, no other enqueue/supersede can
+// take a slot the drain just freed, so every surviving other-policy action is
+// re-enqueued exactly once in FIFO order (a survivor can never be dropped). The
+// only concurrent actor is the consumer (actionWorker), which just REMOVES
+// items, so the drain sees at most the buffered entries and the loop is bounded
+// with no need to guard against a producer refilling underneath it.
 func (e *Engine) supersede(a plannedAction) bool {
 	drained := make([]plannedAction, 0, actionQueueDepth)
 	replaced := false
@@ -629,6 +679,13 @@ func (e *Engine) supersede(a plannedAction) bool {
 		}
 	}
 refill:
+	// Test-only seam (#5062): the drain->re-enqueue boundary. In production this
+	// is nil. A concurrency test sets it to drive a second producer into the
+	// freed slots here and prove enqueueMu serializes it (the survivors are
+	// preserved regardless of what the injected producer does).
+	if e.afterDrainFn != nil {
+		e.afterDrainFn()
+	}
 	// Re-enqueue the surviving other-policy actions in their original FIFO
 	// order, then place the new (superseding) action at the TAIL (#2869).
 	// Prepending `a` would jump it ahead of every already-queued action of
