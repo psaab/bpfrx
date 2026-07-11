@@ -1372,23 +1372,33 @@ func validateNAT64PrefixStrict(cfg *Config, lenient bool) ([]string, error) {
 		if rs == nil || rs.Prefix == "" {
 			continue
 		}
-		// Mirror Nat64State::try_from_snapshots (userspace-dp/src/nat64.rs)
-		// EXACTLY. Split on '/' (Rust `split('/')`); a trailing junk field
-		// after the mask is ignored by both sides, so we index [0] and [1] and
-		// disregard the rest rather than SplitN'ing the mask.
+		// Mirror the Rust loader Nat64State::from_snapshots
+		// (userspace-dp/src/nat64.rs) EXACTLY. It splits on '/' (`split('/')`)
+		// and requires EXACTLY two parts — `<ipv6>/96`: `if parts.len() != 2 {
+		// ...; continue }` SKIPS any rule whose prefix does not split into
+		// exactly two slash-separated parts (pinned by the Rust
+		// `extra_slash_prefix_skips_rule` test). So a trailing extra slash
+		// ("64:ff9b::/96/garbage" → three parts) is NOT ignored by the runtime —
+		// the whole rule is silently dropped from the forwarding snapshot. If we
+		// accepted it here (the pre-#5517 `len(parts) >= 2` loose split, which
+		// indexed [0]/[1] and disregarded the rest), commit would SUCCEED but the
+		// NAT64 rule would never install: a silent IPv6→IPv4 blackhole with no
+		// error. Require exactly two parts so the commit gate rejects precisely
+		// what the runtime skips (#5517).
 		parts := strings.Split(rs.Prefix, "/")
 		// The token after the first '/' must parse as a decimal /96. A missing
-		// mask (no '/'), an empty mask, a non-numeric mask, or any length other
-		// than 96 is rejected — only /96 is supported by the translator.
+		// mask (no '/'), an empty mask, a non-numeric mask, an EXTRA '/' segment
+		// (more than two parts), or any length other than 96 is rejected — only
+		// an exact `<ipv6>/96` is supported by the translator.
 		mask96 := false
-		if len(parts) >= 2 {
+		if len(parts) == 2 {
 			if m, err := strconv.ParseUint(parts[1], 10, 8); err == nil && m == 96 {
 				mask96 = true
 			}
 		}
 		if !mask96 {
 			if err := emit(fmt.Sprintf(
-				"security nat nat64 rule-set %q prefix %q must be an IPv6 prefix of length /96 (RFC 6052: the well-known 64:ff9b::/96 or a /96 network-specific prefix); any other length or a missing/garbage mask is rejected by the dataplane, which aborts the entire forwarding rebuild",
+				"security nat nat64 rule-set %q prefix %q must be an IPv6 prefix of length /96 (RFC 6052: the well-known 64:ff9b::/96 or a /96 network-specific prefix); any other length, a missing/garbage mask, or an extra '/' segment is rejected by the dataplane, which aborts the entire forwarding rebuild",
 				rs.Name, rs.Prefix)); err != nil {
 				return nil, err
 			}
