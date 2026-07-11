@@ -32,7 +32,7 @@ import argparse
 import random
 import sys
 from collections import Counter
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
 
 def simulate(
@@ -41,8 +41,17 @@ def simulate(
     n_workers: int,
     seed: int,
     probs: Sequence[float] | None = None,
-) -> List[Tuple[int, int]]:
-    """Return list of (max_count, min_count) per trial.
+) -> Iterator[Tuple[int, int]]:
+    """Yield (max_count, min_count) per trial, streaming (O(1) memory).
+
+    C175-HC-130: the prior implementation appended one (max, min) tuple
+    per trial into a list and returned it, so a 10^7-trial run held ~10M
+    tuples (hundreds of MB, and GB-scale for larger runs) even though the
+    downstream statistics need only O(1) sufficient counters. This is a
+    generator: each trial is produced and consumed one at a time, so
+    tail_probabilities aggregates in constant memory and a large run can
+    no longer OOM CI. The RNG is created once and advanced in trial
+    order, so the deterministic-seed contract is preserved.
 
     If ``probs`` is None, workers are drawn uniformly (fair RSS).
     Otherwise ``probs`` is a sequence of length ``n_workers`` that
@@ -65,7 +74,6 @@ def simulate(
     else:
         cum = None
 
-    out: List[Tuple[int, int]] = []
     for _ in range(trials):
         counts = [0] * n_workers
         for _f in range(n_flows):
@@ -77,19 +85,26 @@ def simulate(
                 while w < n_workers - 1 and u > cum[w]:
                     w += 1
             counts[w] += 1
-        out.append((max(counts), min(counts)))
-    return out
+        yield (max(counts), min(counts))
 
 
-def tail_probabilities(samples: List[Tuple[int, int]], n_flows: int) -> Dict[str, float]:
-    """Compute the FP tails the plan references plus union events."""
-    total = len(samples)
+def tail_probabilities(
+    samples: Iterable[Tuple[int, int]], n_flows: int
+) -> Dict[str, float]:
+    """Compute the FP tails the plan references plus union events.
+
+    Consumes ``samples`` as a stream, counting trials as it goes so a
+    generator (see ``simulate``) can be aggregated without materializing
+    every trial (C175-HC-130).
+    """
+    total = 0
     max_counter: Counter[int] = Counter()
     min_counter: Counter[int] = Counter()
     union_8_or_0 = 0
     union_9_or_0 = 0
     union_7_or_1 = 0
     for mx, mn in samples:
+        total += 1
         max_counter[mx] += 1
         min_counter[mn] += 1
         if mx >= 8 or mn <= 0:
@@ -98,6 +113,9 @@ def tail_probabilities(samples: List[Tuple[int, int]], n_flows: int) -> Dict[str
             union_9_or_0 += 1
         if mx >= 7 or mn <= 1:
             union_7_or_1 += 1
+
+    if total == 0:
+        raise ValueError("no trials to aggregate")
 
     def ge(counter: Counter[int], threshold: int) -> float:
         return sum(c for k, c in counter.items() if k >= threshold) / total

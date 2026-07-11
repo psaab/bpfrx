@@ -446,6 +446,36 @@ def test_i14_monotonic_submit_still_classifies():
         assert all(x >= 0.0 for x in blk["shape"]), blk["shape"]
 
 
+# ------------------------------------------------- 28 (C175-HC-132) ---
+def test_only_cell_missing_target_returns_nonzero(tmp_path, monkeypatch):
+    """--only-cell on a missing/failed cell must NOT exit 0.
+
+    Fail-on-revert: the pre-fix main() only WARN'd on a missing target
+    cell dir and still returned 0 in --only-cell mode, so step2's
+    single-cell reduction ran against a cell that produced no
+    hist-blocks.jsonl and the failure read as success.
+    """
+    import sys as _sys
+
+    root = tmp_path / "evidence"
+    root.mkdir()
+    cell = "with-cos/p5201-fwd"  # a valid POOL_BY_CELL key; dir absent
+    assert cell in step1.POOL_BY_CELL
+    monkeypatch.setattr(
+        _sys,
+        "argv",
+        [
+            "step1-histogram-classify.py",
+            "--evidence-root",
+            str(root),
+            "--only-cell",
+            cell,
+        ],
+    )
+    rc = step1.main()
+    assert rc != 0
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

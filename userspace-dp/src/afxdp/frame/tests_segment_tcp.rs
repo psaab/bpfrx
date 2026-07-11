@@ -1,0 +1,943 @@
+// TSO segmentation of forwarded TCP frames (SNAT/VLAN/GRE/TTL) and authoritative forward-port selection.
+//
+// Split out of afxdp/frame/tests.rs (#4840) as a sibling `#[path]` test
+// module loaded from afxdp/frame/mod.rs. Pure code motion: every #[test]
+// fn is moved verbatim; shared test-support helpers live in
+// afxdp/frame/tests_support.rs.
+#![allow(unused_imports)]
+
+use super::super::test_fixtures::*;
+use super::*;
+use crate::event_stream::DataplaneEventRateLimitConfig;
+use crate::event_stream::codec::DataplaneEventKind;
+use crate::test_zone_ids::*;
+use crate::{FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot};
+use super::tests_support::*;
+
+#[test]
+fn segment_forwarded_tcp_frames_splits_ipv6_snat_payload_by_mtu() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let src_port = 54688u16;
+    let dst_port = 5201u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    let tcp_payload_len = 4096usize;
+    let plen = (20 + tcp_payload_len) as u16;
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        PROTO_TCP,
+        64,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, // seq
+        0x08, 0xf0, 0x5a, 0xc6, // ack
+        0x50, 0x18, 0x00, 0x40, // data offset/flags/window
+        0x00, 0x00, 0x00, 0x00, // checksum/urgent
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let mut area = MmapArea::new(8192).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: 54688,
+        flow_dst_port: 5201,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: None,
+            primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+        },
+    );
+
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((src_port, dst_port)),
+    )
+    .expect("segmented");
+    assert!(segments.len() > 1);
+    let mut expected_seq = 0x3196c832u32;
+    let mut total_payload = 0usize;
+    for (idx, seg) in segments.iter().enumerate() {
+        assert!(seg.len() <= 18 + 1500);
+        assert_eq!(tcp_ports_ipv6(&seg[18..]), (54688, 5201));
+        assert!(tcp_checksum_ok_ipv6(&seg[18..]));
+        let tcp = &seg[18 + 40..];
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        assert_eq!(seq, expected_seq);
+        let seg_payload = seg.len() - 18 - 40 - 20;
+        total_payload += seg_payload;
+        expected_seq = expected_seq.wrapping_add(seg_payload as u32);
+        if idx + 1 != segments.len() {
+            assert_eq!(tcp[13] & TCP_FLAG_PSH, 0);
+        }
+    }
+    assert_eq!(total_payload, tcp_payload_len);
+}
+
+
+#[test]
+fn segment_forwarded_tcp_frames_repairs_ipv6_tcp_ports_when_metadata_disagrees() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let src_port = 38276u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 4096usize;
+    let plen = (20 + tcp_payload_len) as u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        PROTO_TCP,
+        64,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00,
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let mut area = MmapArea::new(8192).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: 1025,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: None,
+            primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+        },
+    );
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((src_port, dst_port)),
+    )
+    .expect("segmented");
+    assert!(segments.len() > 1);
+    for seg in &segments {
+        assert_eq!(tcp_ports_ipv6(&seg[18..]), (src_port, dst_port));
+        assert!(tcp_checksum_ok_ipv6(&seg[18..]));
+    }
+}
+
+
+#[test]
+fn segment_forwarded_tcp_frames_prefers_expected_ipv6_ports_over_wrong_live_ports() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let src_port = 42566u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 4096usize;
+    let plen = (20 + tcp_payload_len) as u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        PROTO_TCP,
+        64,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00,
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let mut area = MmapArea::new(8192).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: 1042,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: None,
+            primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+        },
+    );
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((1042, dst_port)),
+    )
+    .expect("segmented");
+    assert!(segments.len() > 1);
+    for seg in &segments {
+        assert_eq!(tcp_ports_ipv6(&seg[18..]), (1042, dst_port));
+        assert!(tcp_checksum_ok_ipv6(&seg[18..]));
+    }
+}
+
+
+#[test]
+fn segment_forwarded_tcp_frames_repairs_wrong_ipv6_frame_ports_from_expected_tuple() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let expected_src_port = 36394u16;
+    let wrong_src_port = 1025u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 4096usize;
+    let plen = (20 + tcp_payload_len) as u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        PROTO_TCP,
+        64,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00,
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let mut area = MmapArea::new(8192).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_addr: src_ip.octets(),
+        flow_dst_addr: dst_ip.octets(),
+        flow_src_port: expected_src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: None,
+            primary_v6: Some("2001:559:8585:80::8".parse().unwrap()),
+        },
+    );
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((expected_src_port, dst_port)),
+    )
+    .expect("segmented");
+    assert!(segments.len() > 1);
+    for seg in &segments {
+        assert_eq!(tcp_ports_ipv6(&seg[18..]), (expected_src_port, dst_port));
+        assert!(tcp_checksum_ok_ipv6(&seg[18..]));
+    }
+}
+
+
+#[test]
+fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let expected_src_port = 55068u16;
+    let wrong_src_port = 1041u16;
+    let dst_port = 5201u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+    ]);
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_addr: src_ip.octets(),
+        flow_dst_addr: dst_ip.octets(),
+        flow_src_port: expected_src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let flow = SessionFlow {
+        src_ip: IpAddr::V6(src_ip),
+        dst_ip: IpAddr::V6(dst_ip),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V6(src_ip),
+            dst_ip: IpAddr::V6(dst_ip),
+            src_port: expected_src_port,
+            dst_port,
+        },
+    };
+
+    assert_eq!(
+        authoritative_forward_ports(&frame, meta, Some(&flow)),
+        Some((expected_src_port, dst_port))
+    );
+}
+
+
+#[test]
+fn authoritative_forward_ports_prefers_frame_tuple_over_metadata_when_flow_missing() {
+    let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let frame_src_port = 1041u16;
+    let meta_src_port = 55068u16;
+    let dst_port = 5201u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&frame_src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+    ]);
+    let ip_csum = checksum16(&frame[14..34]);
+    frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let mut flow_src_addr = [0u8; 16];
+    flow_src_addr[..4].copy_from_slice(&src_ip.octets());
+    let mut flow_dst_addr = [0u8; 16];
+    flow_dst_addr[..4].copy_from_slice(&dst_ip.octets());
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        flow_src_addr,
+        flow_dst_addr,
+        flow_src_port: meta_src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+
+    // Live frame ports preferred over metadata (flow > frame > meta)
+    assert_eq!(
+        authoritative_forward_ports(&frame, meta, None),
+        Some((frame_src_port, dst_port))
+    );
+}
+
+
+#[test]
+fn authoritative_forward_ports_falls_back_to_live_frame_ports_when_metadata_missing() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let src_port = 55068u16;
+    let dst_port = 5201u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_UDP, 64]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x14, 0x00, 0x00]);
+    frame.extend_from_slice(b"userspace-udp");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_UDP).expect("udp sum");
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+
+    assert_eq!(
+        authoritative_forward_ports(&frame, meta, None),
+        Some((src_port, dst_port))
+    );
+}
+
+
+#[test]
+fn parse_session_flow_prefers_metadata_tuple_when_frame_ports_mismatch() {
+    let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let expected_src_port = 55068u16;
+    let wrong_src_port = 1041u16;
+    let dst_port = 5201u16;
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 64]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+    ]);
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        flow_src_addr: src_ip.octets(),
+        flow_dst_addr: dst_ip.octets(),
+        flow_src_port: expected_src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let flow = parse_session_flow(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+    )
+    .expect("flow");
+    assert_eq!(flow.forward_key.src_port, expected_src_port);
+    assert_eq!(flow.forward_key.dst_port, dst_port);
+}
+
+
+#[test]
+fn segment_forwarded_tcp_frames_keeps_ipv4_tcp_ports_after_vlan_snat() {
+    let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+    let src_port = 47308u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 30_408usize;
+    let tcp_header_len = 32usize;
+    let total_len = (20 + tcp_header_len + tcp_payload_len) as u16;
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45,
+        0x00,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0xd1,
+        0x43,
+        0x40,
+        0x00,
+        64,
+        PROTO_TCP,
+        0x00,
+        0x00,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x52, 0x04, 0xc1, 0xa3, // seq
+        0x73, 0x7f, 0x63, 0x1c, // ack
+        0x80, 0x10, 0x00, 0x3f, // data offset/flags/window
+        0x00, 0x00, 0x00, 0x00, // checksum/urgent
+        0x01, 0x01, 0x08, 0x0a, // TCP timestamp option
+        0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let mut area = MmapArea::new(65_536).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: 1041,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x01, 0x00]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            ..NatDecision::default()
+        },
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 80,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x16, 0x01, 0x00],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+            primary_v6: None,
+        },
+    );
+
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &forwarding,
+        Some((src_port, dst_port)),
+    )
+    .expect("segmented");
+    assert!(segments.len() > 1);
+    let mut total_payload = 0usize;
+    let mut expected_seq = 0x5204c1a3u32;
+    for seg in &segments {
+        assert!(seg.len() <= 18 + 1500);
+        let tcp = &seg[18 + 20..];
+        assert_eq!(
+            (
+                u16::from_be_bytes([tcp[0], tcp[1]]),
+                u16::from_be_bytes([tcp[2], tcp[3]])
+            ),
+            (src_port, dst_port)
+        );
+        assert!(tcp_checksum_ok_ipv4(&seg[18..]));
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        assert_eq!(seq, expected_seq);
+        let seg_payload = seg.len() - 18 - 20 - tcp_header_len;
+        total_payload += seg_payload;
+        expected_seq = expected_seq.wrapping_add(seg_payload as u32);
+    }
+    assert_eq!(total_payload, tcp_payload_len);
+}
+
+
+#[test]
+fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
+    let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(10, 255, 192, 41);
+    let snat_ip = Ipv4Addr::new(10, 255, 192, 42);
+    let src_port = 47308u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 30_408usize;
+    let tcp_header_len = 32usize;
+    let total_len = (20 + tcp_header_len + tcp_payload_len) as u16;
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45,
+        0x00,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0xd1,
+        0x43,
+        0x40,
+        0x00,
+        64,
+        PROTO_TCP,
+        0x00,
+        0x00,
+    ]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x52, 0x04, 0xc1, 0xa3, 0x73, 0x7f, 0x63, 0x1c, 0x80, 0x10, 0x00, 0x3f, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x08, 0x0a, 0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let mut area = MmapArea::new(65_536).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: 1041,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let decision = SessionDecision {
+        resolution: lookup_forwarding_resolution_v4(&state, None, dst_ip, "sfmix.inet.0", 0, true, None),
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(snat_ip)),
+            ..NatDecision::default()
+        },
+    };
+
+    let segments = segment_forwarded_tcp_frames(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        &state,
+        Some((src_port, dst_port)),
+    )
+    .expect("segmented native gre");
+    assert!(segments.len() > 1);
+    let outer_eth_len = 18usize;
+    let outer_ip_len = 40usize;
+    let gre_len = 4usize;
+    let transport_mtu = 1500usize;
+    let inner_start = outer_eth_len + outer_ip_len + gre_len;
+    let mut total_payload = 0usize;
+    let mut expected_seq = 0x5204c1a3u32;
+    for seg in &segments {
+        assert!(seg.len() >= outer_eth_len);
+        assert!(
+            seg.len() - outer_eth_len <= transport_mtu,
+            "native GRE segment exceeds transport MTU: {}",
+            seg.len() - outer_eth_len
+        );
+        assert_eq!(&seg[16..18], &[0x86, 0xdd]);
+        assert_eq!(seg[24], PROTO_GRE);
+        let inner = &seg[inner_start..];
+        assert_eq!(&inner[12..16], &snat_ip.octets());
+        assert_eq!(&inner[16..20], &dst_ip.octets());
+        assert!(tcp_checksum_ok_ipv4(inner));
+        let tcp = &inner[20..];
+        assert_eq!(
+            (
+                u16::from_be_bytes([tcp[0], tcp[1]]),
+                u16::from_be_bytes([tcp[2], tcp[3]])
+            ),
+            (src_port, dst_port)
+        );
+        let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+        assert_eq!(seq, expected_seq);
+        let seg_payload = inner.len() - 20 - tcp_header_len;
+        total_payload += seg_payload;
+        expected_seq = expected_seq.wrapping_add(seg_payload as u32);
+    }
+    assert_eq!(total_payload, tcp_payload_len);
+}
+
+// --- #2077: TCP-segmentation TTL/hop-limit gate v4/v6 symmetry ---
+//
+// The TTL==1 drop in the segmentation builders must be gated on
+// NOT-fabric-ingress, matching every other forwarding path
+// (build/ipv4.rs, build/ipv6.rs, frame/mod.rs, rewrite/ipv4.rs,
+// rewrite/ipv6.rs). A fabric-ingress segment (FABRIC_INGRESS_FLAG =
+// 0x80 in meta_flags) was already decremented by the peer chassis at
+// its real ingress; the fabric crossing is an internal cross-chassis
+// redirect, not an IP hop, so neither the decrement NOR the drop
+// applies. Before the fix the IPv4 builder dropped UNCONDITIONALLY on
+// TTL <= 1 while IPv6 was correctly gated — a fabric-ingress oversized
+// IPv4 TCP segment with TTL==1 was wrongly dropped.
+

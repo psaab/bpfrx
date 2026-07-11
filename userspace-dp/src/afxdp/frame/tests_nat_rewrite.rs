@@ -1,0 +1,1267 @@
+// SYN-cookie SYN-ACK/RST builders, apply-NAT checksum/GRE/ESP handling, reverse-SNAT L3 extraction, and in-place VLAN/ICMP/NAT64 frame rewrites.
+//
+// Split out of afxdp/frame/tests.rs (#4840) as a sibling `#[path]` test
+// module loaded from afxdp/frame/mod.rs. Pure code motion: every #[test]
+// fn is moved verbatim; shared test-support helpers live in
+// afxdp/frame/tests_support.rs.
+#![allow(unused_imports)]
+
+use super::super::test_fixtures::*;
+use super::*;
+use crate::event_stream::DataplaneEventRateLimitConfig;
+use crate::event_stream::codec::DataplaneEventKind;
+use crate::test_zone_ids::*;
+use crate::{FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot};
+use super::tests_support::*;
+
+#[test]
+fn syn_cookie_syn_ack_builder_swaps_tuple_and_preserves_vlan() {
+    let client = Ipv4Addr::new(192, 0, 2, 10);
+    let server = Ipv4Addr::new(198, 51, 100, 20);
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        80,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+    ]);
+    frame.extend_from_slice(&client.octets());
+    frame.extend_from_slice(&server.octets());
+    let ip_csum = checksum16(&frame[18..38]);
+    frame[28..30].copy_from_slice(&ip_csum.to_be_bytes());
+    frame.extend_from_slice(&49152u16.to_be_bytes());
+    frame.extend_from_slice(&443u16.to_be_bytes());
+    frame.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.extend_from_slice(&[0x50, TCP_FLAG_SYN, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let out =
+        build_syn_cookie_syn_ack_frame(&frame, 0xaabb_ccdd, 1460).expect("syn-cookie syn-ack");
+
+    assert_eq!(&out[0..6], &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    assert_eq!(&out[6..12], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    assert_eq!(&out[12..18], &frame[12..18]);
+    assert_eq!(&out[30..34], &server.octets());
+    assert_eq!(&out[34..38], &client.octets());
+    assert_eq!(u16::from_be_bytes([out[20], out[21]]), 44);
+    assert_eq!(u16::from_be_bytes([out[38], out[39]]), 443);
+    assert_eq!(u16::from_be_bytes([out[40], out[41]]), 49152);
+    assert_eq!(
+        u32::from_be_bytes([out[42], out[43], out[44], out[45]]),
+        0xaabb_ccdd
+    );
+    assert_eq!(
+        u32::from_be_bytes([out[46], out[47], out[48], out[49]]),
+        0x0102_0305
+    );
+    assert_eq!(out[50] >> 4, 6);
+    assert_eq!(out[51], TCP_FLAG_SYN | 0x10);
+    assert_eq!(&out[58..62], &[2, 4, 0x05, 0xb4]);
+    assert_eq!(checksum16(&out[18..38]), 0);
+    assert!(tcp_checksum_ok_ipv4(&out[18..]));
+}
+
+
+#[test]
+fn syn_cookie_ipv4_syn_ack_builder_pads_to_ethernet_minimum() {
+    let client = Ipv4Addr::new(192, 0, 2, 10);
+    let server = Ipv4Addr::new(198, 51, 100, 20);
+    let frame = build_ipv4_tcp_frame(client, server, 49152, 443, 0x0102_0304, 0, TCP_FLAG_SYN);
+
+    let out =
+        build_syn_cookie_syn_ack_frame(&frame, 0xaabb_ccdd, 1460).expect("syn-cookie syn-ack");
+
+    assert_eq!(out.len(), 60);
+    assert_eq!(u16::from_be_bytes([out[16], out[17]]), 44);
+    assert_eq!(&out[54..58], &[2, 4, 0x05, 0xb4]);
+    assert_eq!(&out[58..60], &[0, 0]);
+    assert_eq!(checksum16(&out[14..34]), 0);
+    assert!(tcp_checksum_ok_ipv4(&out[14..]));
+}
+
+
+#[test]
+fn syn_cookie_ipv4_rst_builder_pads_to_ethernet_minimum() {
+    let client = Ipv4Addr::new(192, 0, 2, 10);
+    let server = Ipv4Addr::new(198, 51, 100, 20);
+    let frame = build_ipv4_tcp_frame(client, server, 49152, 443, 0x1111_2222, 0x3333_4444, 0x10);
+
+    let out = build_syn_cookie_ack_rst_frame(&frame).expect("syn-cookie rst");
+
+    assert_eq!(out.len(), 60);
+    assert_eq!(u16::from_be_bytes([out[16], out[17]]), 40);
+    assert_eq!(
+        u32::from_be_bytes([out[38], out[39], out[40], out[41]]),
+        0x3333_4444
+    );
+    assert_eq!(
+        u32::from_be_bytes([out[42], out[43], out[44], out[45]]),
+        0x1111_2223
+    );
+    assert_eq!(out[47], TCP_FLAG_RST | 0x10);
+    assert_eq!(&out[48..50], &[0, 0]);
+    assert_eq!(&out[54..60], &[0, 0, 0, 0, 0, 0]);
+    assert_eq!(checksum16(&out[14..34]), 0);
+    assert!(tcp_checksum_ok_ipv4(&out[14..]));
+}
+
+
+#[test]
+fn syn_cookie_vlan_ipv4_rst_builder_pads_to_ethernet_minimum() {
+    let client = Ipv4Addr::new(192, 0, 2, 10);
+    let server = Ipv4Addr::new(198, 51, 100, 20);
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        80,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+    ]);
+    frame.extend_from_slice(&client.octets());
+    frame.extend_from_slice(&server.octets());
+    let ip_csum = checksum16(&frame[18..38]);
+    frame[28..30].copy_from_slice(&ip_csum.to_be_bytes());
+    frame.extend_from_slice(&49152u16.to_be_bytes());
+    frame.extend_from_slice(&443u16.to_be_bytes());
+    frame.extend_from_slice(&0x1111_2222u32.to_be_bytes());
+    frame.extend_from_slice(&0x3333_4444u32.to_be_bytes());
+    frame.extend_from_slice(&[0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let out = build_syn_cookie_ack_rst_frame(&frame).expect("syn-cookie rst");
+
+    assert_eq!(out.len(), 60);
+    assert_eq!(&out[12..18], &frame[12..18]);
+    assert_eq!(u16::from_be_bytes([out[20], out[21]]), 40);
+    assert_eq!(
+        u32::from_be_bytes([out[42], out[43], out[44], out[45]]),
+        0x3333_4444
+    );
+    assert_eq!(
+        u32::from_be_bytes([out[46], out[47], out[48], out[49]]),
+        0x1111_2223
+    );
+    assert_eq!(out[51], TCP_FLAG_RST | 0x10);
+    assert_eq!(&out[52..54], &[0, 0]);
+    assert_eq!(&out[58..60], &[0, 0]);
+    assert_eq!(checksum16(&out[18..38]), 0);
+    assert!(tcp_checksum_ok_ipv4(&out[18..]));
+}
+
+
+#[test]
+fn syn_cookie_ack_rst_builder_uses_received_ack_as_rst_seq() {
+    let client = Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 10);
+    let server = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 20);
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x02],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&20u16.to_be_bytes());
+    frame.push(PROTO_TCP);
+    frame.push(64);
+    frame.extend_from_slice(&client.octets());
+    frame.extend_from_slice(&server.octets());
+    frame.extend_from_slice(&49152u16.to_be_bytes());
+    frame.extend_from_slice(&443u16.to_be_bytes());
+    frame.extend_from_slice(&0x1111_2222u32.to_be_bytes());
+    frame.extend_from_slice(&0x3333_4444u32.to_be_bytes());
+    frame.extend_from_slice(&[0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
+
+    let out = build_syn_cookie_ack_rst_frame(&frame).expect("syn-cookie rst");
+
+    assert_eq!(&out[0..6], &[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    assert_eq!(&out[6..12], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    assert_eq!(&out[22..38], &server.octets());
+    assert_eq!(&out[38..54], &client.octets());
+    assert_eq!(u16::from_be_bytes([out[18], out[19]]), 20);
+    assert_eq!(u16::from_be_bytes([out[54], out[55]]), 443);
+    assert_eq!(u16::from_be_bytes([out[56], out[57]]), 49152);
+    assert_eq!(
+        u32::from_be_bytes([out[58], out[59], out[60], out[61]]),
+        0x3333_4444
+    );
+    assert_eq!(
+        u32::from_be_bytes([out[62], out[63], out[64], out[65]]),
+        0x1111_2223
+    );
+    assert_eq!(out[67], TCP_FLAG_RST | 0x10);
+    assert_eq!(&out[68..70], &[0, 0]);
+    assert!(tcp_checksum_ok_ipv6(&out[14..]));
+}
+
+
+#[test]
+fn apply_nat_ipv4_recomputes_tcp_checksum() {
+    let mut packet = vec![
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
+    ];
+    let ip_sum = checksum16(&packet[..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut packet, 20, PROTO_TCP, false).expect("initial tcp sum");
+    assert!(tcp_checksum_ok_ipv4(&packet));
+
+    apply_nat_ipv4(
+        &mut packet,
+        PROTO_TCP,
+        NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        },
+        false,
+    )
+    .expect("apply nat");
+
+    assert_eq!(&packet[12..16], &[172, 16, 80, 8]);
+    assert!(tcp_checksum_ok_ipv4(&packet));
+}
+
+
+// #3111 FAIL-ON-REVERT: the generic NAT rewriter must NOT write an L4
+// "port" for a port-less protocol. apply_nat_ipv4 is fed a NatDecision
+// that (as a buggy pool allocator would) carries rewrite_src_port =
+// Some(_) for a GRE packet. The TCP|UDP gate in apply_nat_port_rewrite
+// must suppress the port write so the first two bytes of the GRE header
+// (flags/version) survive; only the source IP is translated. Reverting
+// that gate writes 0xBEEF over the GRE flags -> RED.
+#[test]
+fn apply_nat_ipv4_gre_preserves_l4_header() {
+    let mut packet = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, crate::ip_proto::PROTO_GRE, 0x00, 0x00,
+        10, 0, 1, 100, 8, 8, 8, 8,
+        // GRE header: flags/version, protocol-type, then key.
+        0x30, 0x01, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef,
+    ];
+    let ip_sum = checksum16(&packet[..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+
+    apply_nat_ipv4(
+        &mut packet,
+        crate::ip_proto::PROTO_GRE,
+        NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            rewrite_src_port: Some(0xBEEF),
+            ..NatDecision::default()
+        },
+        false,
+    )
+    .expect("apply nat");
+
+    // Source IP translated, destination untouched.
+    assert_eq!(&packet[12..16], &[203, 0, 113, 1]);
+    assert_eq!(&packet[16..20], &[8, 8, 8, 8]);
+    // GRE flags/version (first 2 L4 bytes) PRESERVED.
+    assert_eq!(
+        &packet[20..22],
+        &[0x30, 0x01],
+        "GRE header must not be overwritten by a NAT port"
+    );
+}
+
+
+// #3111 FAIL-ON-REVERT: same gate, ESP (proto 50). A port write at the L4
+// offset would land on the ESP SPI high half. The whole SPI must survive;
+// only the source IP is translated.
+#[test]
+fn apply_nat_ipv4_esp_preserves_spi() {
+    let mut packet = vec![
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, crate::ip_proto::PROTO_ESP, 0x00, 0x00,
+        10, 0, 1, 100, 8, 8, 8, 8,
+        // ESP header: SPI (4B) + sequence (4B).
+        0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x01,
+    ];
+    let ip_sum = checksum16(&packet[..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+
+    apply_nat_ipv4(
+        &mut packet,
+        crate::ip_proto::PROTO_ESP,
+        NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+            rewrite_src_port: Some(0xBEEF),
+            ..NatDecision::default()
+        },
+        false,
+    )
+    .expect("apply nat");
+
+    assert_eq!(&packet[12..16], &[203, 0, 113, 1]);
+    assert_eq!(
+        &packet[20..24],
+        &[0xAA, 0xBB, 0xCC, 0xDD],
+        "ESP SPI must not be overwritten by a NAT port"
+    );
+}
+
+
+#[test]
+fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v4() {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        [0x02, 0xbf, 0x72, 0x00, 0x50, 0x08],
+        80,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 63, PROTO_TCP, 0x00, 0x00, 172, 16, 80,
+        200, 172, 16, 80, 8, 0x14, 0x51, 0x9c, 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a',
+        b't', b'a',
+    ]);
+    let ip_sum = checksum16(&frame[18..38]);
+    frame[28] = (ip_sum >> 8) as u8;
+    frame[29] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 18,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+    let packet = extract_l3_packet_with_nat(
+        &frame,
+        meta,
+        NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+            ..NatDecision::default()
+        },
+    )
+    .expect("slow-path packet");
+    assert_eq!(&packet[12..16], &[172, 16, 80, 200]);
+    assert_eq!(&packet[16..20], &[10, 0, 61, 102]);
+    assert!(tcp_checksum_ok_ipv4(&packet));
+}
+
+
+#[test]
+fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v6() {
+    let src_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap();
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        80,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x20, PROTO_TCP, 63]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&[
+        0x14, 0x51, 0x95, 0x2c, 0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x10, 0x00,
+        0x40, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e',
+        b's', b't',
+    ]);
+    recompute_l4_checksum_ipv6(&mut frame[18..], 40, PROTO_TCP).expect("tcp sum");
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 18,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+    let packet = extract_l3_packet_with_nat(
+        &frame,
+        meta,
+        NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some(IpAddr::V6("2001:559:8585:ef00::102".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    )
+    .expect("slow-path packet");
+    assert_eq!(
+        Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap()),
+        src_ip
+    );
+    assert_eq!(
+        Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap()),
+        "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap()
+    );
+    assert!(tcp_checksum_ok_ipv6(&packet));
+}
+
+
+#[test]
+fn build_forwarded_frame_keeps_tcp_checksum_valid_after_snat() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x0800,
+    );
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
+    ]);
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+    let out = build_forwarded_frame(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+                ..NatDecision::default()
+            },
+        },
+        &state,
+        None,
+    )
+    .expect("forwarded frame");
+
+    assert_eq!(&out[30..34], &[172, 16, 80, 8]);
+    assert_eq!(out[26], 63);
+    assert!(tcp_checksum_ok_ipv4(&out[18..]));
+}
+
+
+#[test]
+fn rewrite_forwarded_frame_in_place_keeps_icmpv6_checksum_valid_after_snat() {
+    let src_ip = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x08, PROTO_ICMPV6, 64]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&[128, 0, 0, 0, 0x12, 0x34, 0x00, 0x01]);
+    let sum = checksum16_ipv6(src_ip, dst_ip, PROTO_ICMPV6, &frame[54..]);
+    frame[56] = (sum >> 8) as u8;
+    frame[57] = sum as u8;
+
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:559:8585:80::8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+    let rewrite_result = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        false,
+        None,
+    )
+    .expect("in-place v6 forward");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
+    assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+    assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]);
+    assert_eq!(out[25], 63);
+    assert_eq!(
+        Ipv6Addr::from(<[u8; 16]>::try_from(&out[26..42]).unwrap()),
+        "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap()
+    );
+    assert!(icmpv6_checksum_ok(&out[18..]));
+}
+
+
+#[test]
+fn rewrite_forwarded_frame_in_place_pushes_vlan_by_shifting_tx_descriptor() {
+    let frame = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(10, 0, 1, 1),
+        Ipv4Addr::new(172, 16, 80, 200),
+        64,
+    );
+    let rx_addr = 256usize;
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(rx_addr, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let rewrite_result = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: rx_addr as u64,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &l2_rewrite_test_decision(80),
+        false,
+        None,
+    )
+    .expect("vlan push");
+
+    assert_eq!(rewrite_result.offset, (rx_addr - 4) as u64);
+    assert_eq!(rewrite_result.len, frame.len() as u32 + 4);
+    assert_eq!(
+        rewrite_result.l2_rewrite,
+        InPlaceL2Rewrite::VlanPushDescriptor
+    );
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
+    assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+    assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]);
+    assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
+    assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 80);
+    assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x0800);
+    assert_eq!(out[18], 0x45);
+    assert_eq!(
+        area.slice(rx_addr + 14, 1).expect("ip-at-original-address")[0],
+        0x45
+    );
+}
+
+
+#[test]
+fn rewrite_forwarded_frame_in_place_pops_vlan_by_shifting_tx_descriptor() {
+    let frame = build_icmp_echo_frame_v4_vlan(
+        Ipv4Addr::new(10, 0, 1, 1),
+        Ipv4Addr::new(172, 16, 80, 200),
+        64,
+        80,
+    );
+    let rx_addr = 256usize;
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(rx_addr, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 18,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let rewrite_result = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: rx_addr as u64,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &l2_rewrite_test_decision(0),
+        false,
+        None,
+    )
+    .expect("vlan pop");
+
+    assert_eq!(rewrite_result.offset, (rx_addr + 4) as u64);
+    assert_eq!(rewrite_result.len, frame.len() as u32 - 4);
+    assert_eq!(
+        rewrite_result.l2_rewrite,
+        InPlaceL2Rewrite::VlanPopDescriptor
+    );
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
+    assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+    assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]);
+    assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
+    assert_eq!(out[14], 0x45);
+    assert_eq!(
+        area.slice(rx_addr + 18, 1).expect("ip-at-original-address")[0],
+        0x45
+    );
+}
+
+
+#[test]
+fn rewrite_forwarded_frame_in_place_pushes_vlan_with_memmove_without_headroom() {
+    let frame = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(10, 0, 1, 1),
+        Ipv4Addr::new(172, 16, 80, 200),
+        64,
+    );
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let rewrite_result = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &l2_rewrite_test_decision(80),
+        false,
+        None,
+    )
+    .expect("vlan push fallback");
+
+    assert_eq!(rewrite_result.offset, 0);
+    assert_eq!(
+        rewrite_result.l2_rewrite,
+        InPlaceL2Rewrite::VlanPushMemmoveNoHeadroom
+    );
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
+    assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
+    assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x0800);
+    assert_eq!(out[18], 0x45);
+}
+
+
+#[test]
+fn rewrite_forwarded_frame_in_place_keeps_icmpv6_echo_identifier_and_sequence() {
+    let src_ip = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();
+    let dst_ip = "2607:f8b0:4005:814::200e".parse::<Ipv6Addr>().unwrap();
+    let echo_id = 0x3e0f;
+    let echo_seq = 0x80e9;
+
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+    frame.extend_from_slice(&[0x60, 0x07, 0x9f, 0x9c, 0x00, 0x18, PROTO_ICMPV6, 2]);
+    frame.extend_from_slice(&src_ip.octets());
+    frame.extend_from_slice(&dst_ip.octets());
+    frame.extend_from_slice(&[
+        128,
+        0,
+        0,
+        0,
+        (echo_id >> 8) as u8,
+        echo_id as u8,
+        (echo_seq >> 8) as u8,
+        echo_seq as u8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    let sum = checksum16_ipv6(src_ip, dst_ip, PROTO_ICMPV6, &frame[54..]);
+    frame[56] = (sum >> 8) as u8;
+    frame[57] = sum as u8;
+
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .expect("slice")
+        .copy_from_slice(&frame);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        flow_src_port: echo_id,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst_ip)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6("2001:559:8585:50::8".parse().unwrap())),
+            ..NatDecision::default()
+        },
+    };
+
+    let rewrite_result = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &decision,
+        false,
+        None,
+    )
+    .expect("in-place v6 echo forward");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
+
+    let packet = &out[18..];
+    assert_eq!(packet[40], 128);
+    assert_eq!(packet[41], 0);
+    assert_eq!(u16::from_be_bytes([packet[44], packet[45]]), echo_id);
+    assert_eq!(u16::from_be_bytes([packet[46], packet[47]]), echo_seq);
+    assert!(icmpv6_checksum_ok(packet));
+}
+
+
+// #4074 FAIL-ON-REVERT (RFC 5508 §3.1): pool SNAT translates the ICMP Query
+// Identifier on the wire and repairs the ICMP checksum — forward (orig ->
+// translated) on egress and reverse (translated -> orig) on the reply.
+// Reverting `apply_nat_icmp_identifier_rewrite` leaves the identifier AND the
+// checksum untouched, turning the translated-id and checksum assertions RED.
+#[test]
+fn rewrite_forwarded_frame_in_place_translates_icmpv4_echo_identifier() {
+    let host = Ipv4Addr::new(10, 0, 1, 100);
+    let target = Ipv4Addr::new(8, 8, 8, 8);
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let orig_id: u16 = 0x1234;
+    let translated_id: u16 = 40001;
+    // `flow_src_port` carries the packet's on-wire ICMP identifier (the parser
+    // fills it); `restore_l4_tuple_from_meta` uses it, so it must match the
+    // frame — orig id on the request, translated id on the reply.
+    let meta_for = |flow_src_port: u16| UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        flow_src_port,
+        ..UserspaceDpMeta::default()
+    };
+    let meta = meta_for(orig_id);
+
+    // Forward: host -> target, echo request. SNAT src to pool + translate id.
+    let frame = build_icmp_frame_v4(host, target, 64, 8, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(pool)),
+        rewrite_src_port: Some(translated_id),
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(fwd_nat),
+        false,
+        None,
+    )
+    .expect("fwd rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("fwd out");
+    // eth 14 + ip 20 => icmp at 34; type@34, identifier@38..40.
+    assert_eq!(out[34], 8, "still an echo request");
+    assert_eq!(&out[26..30], &pool.octets(), "src translated to pool");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        translated_id,
+        "identifier translated on the wire",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "ICMPv4 checksum valid after id rewrite",
+    );
+
+    // Reverse: reply target -> pool carries the translated id; un-NAT restores
+    // the original id and dst. Use the real NatDecision::reverse inversion.
+    let reply = build_icmp_frame_v4(target, pool, 64, 0, translated_id);
+    let mut rarea = MmapArea::new(4096).expect("mmap");
+    rarea
+        .slice_mut(0, reply.len())
+        .unwrap()
+        .copy_from_slice(&reply);
+    let rev_nat = fwd_nat.reverse(IpAddr::V4(host), IpAddr::V4(target), orig_id, 0);
+    let rres = rewrite_forwarded_frame_in_place(
+        &rarea,
+        XdpDesc {
+            addr: 0,
+            len: reply.len() as u32,
+            options: 0,
+        },
+        meta_for(translated_id),
+        &icmp_test_decision(rev_nat),
+        false,
+        None,
+    )
+    .expect("rev rewrite");
+    let rout = rarea
+        .slice(rres.offset as usize, rres.len as usize)
+        .expect("rev out");
+    assert_eq!(rout[34], 0, "still an echo reply");
+    assert_eq!(&rout[30..34], &host.octets(), "dst un-NAT'd to the host");
+    assert_eq!(
+        u16::from_be_bytes([rout[38], rout[39]]),
+        orig_id,
+        "identifier restored to the original on the reply",
+    );
+    assert_eq!(
+        checksum16(&rout[34..]),
+        0,
+        "ICMPv4 checksum valid after reverse id rewrite",
+    );
+}
+
+
+#[test]
+fn nat64_4381_forward_frame_translates_l4_source_port() {
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap(); // ::8.8.8.8
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let orig_sport = 5000u16;
+    let translated = 40001u16;
+
+    let frame = build_ipv6_tcp_syn_with_mss(client, synthetic, orig_sport, 443, 1460);
+    let decision = icmp_test_decision(Nat64State::forward_decision(pool, server, translated));
+    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false)
+        .expect("forward NAT64 frame");
+
+    // Output is IPv4 (eth 14 + ip 20 => L4 at 34); src IP @26..30, TCP src
+    // port @34..36, dst port @36..38.
+    assert_eq!(&out[26..30], &pool.octets(), "src IP translated to pool");
+    assert_eq!(&out[30..34], &server.octets(), "dst IP is the real server");
+    assert_eq!(
+        u16::from_be_bytes([out[34], out[35]]),
+        translated,
+        "#4381: L4 source port rewritten to the unique translated port"
+    );
+    assert_eq!(
+        u16::from_be_bytes([out[36], out[37]]),
+        443,
+        "destination port unchanged"
+    );
+    // The TCP checksum after the incremental port+address delta equals a full
+    // recompute (one's-complement exactness).
+    let mut recomputed = out.clone();
+    recompute_l4_checksum_ipv4(&mut recomputed[14..], 20, PROTO_TCP, false).expect("v4 sum");
+    assert_eq!(
+        &out[50..52],
+        &recomputed[50..52],
+        "TCP checksum valid after forward port translation"
+    );
+}
+
+
+#[test]
+fn nat64_2562_forward_nonfirst_fragment_frame_translates_l3_only() {
+    // #2562: build_nat64_forwarded_frame must L3-translate a NON-first v6
+    // fragment (no L4 header) using the association-carried decision, instead of
+    // dropping it. Frame = eth(14) + v6(40) + Fragment Header(8) + payload.
+    let client: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap(); // ::8.8.8.8
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let ident: u32 = 0x0001_2345;
+    let payload: &[u8] = &[0x5Au8; 24];
+
+    let mut frame = vec![0u8; 14 + 40 + 8 + payload.len()];
+    // Ethernet: dst/src MAC arbitrary, ethertype IPv6.
+    frame[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+    // IPv6 header.
+    frame[14] = 0x60;
+    let v6_payload_len = (8 + payload.len()) as u16;
+    frame[18..20].copy_from_slice(&v6_payload_len.to_be_bytes());
+    frame[20] = 44; // next header = Fragment
+    frame[21] = 64; // hop limit
+    frame[22..38].copy_from_slice(&client.octets());
+    frame[38..54].copy_from_slice(&synthetic.octets());
+    // Fragment Header (offset 100 units => non-first, MF=0).
+    frame[54] = PROTO_UDP; // next header
+    let word: u16 = (100u16 << 3) | 0;
+    frame[56..58].copy_from_slice(&word.to_be_bytes());
+    frame[58..62].copy_from_slice(&ident.to_be_bytes());
+    frame[62..].copy_from_slice(payload);
+
+    let decision = icmp_test_decision(Nat64State::forward_decision(pool, server, 40001));
+    let out = build_nat64_forwarded_frame(&frame, nat64_forward_meta(), &decision, None, false)
+        .expect("#2562: non-first v6 fragment L3-translates, not dropped");
+
+    // Output is eth(14) + IPv4(20) + payload; NO L4 rewrite.
+    assert_eq!(out[14] >> 4, 4, "output is IPv4");
+    assert_eq!(&out[26..30], &pool.octets(), "inherited SNAT source");
+    assert_eq!(&out[30..34], &server.octets(), "inherited v4 destination");
+    // v4 ident = low 16 of the v6 ident; offset preserved; MF=0; DF=0.
+    assert_eq!(
+        u16::from_be_bytes([out[18], out[19]]),
+        (ident & 0xFFFF) as u16
+    );
+    let fw = u16::from_be_bytes([out[20], out[21]]);
+    assert_eq!(fw & 0x1FFF, 100, "fragment offset preserved");
+    assert_eq!(fw & 0x2000, 0, "MF=0 (last fragment)");
+    assert_eq!(fw & 0x4000, 0, "DF cleared");
+    // Payload copied verbatim.
+    assert_eq!(&out[34..], payload, "payload verbatim, no L4 touch");
+}
+
+
+#[test]
+fn nat64_4381_reverse_frame_restores_each_clients_original_port() {
+    // Two clients behind ONE pool address, distinct translated ports; each
+    // reply must restore its OWN original client port (no cross-talk).
+    let pool = Ipv4Addr::new(203, 0, 113, 1);
+    let server = Ipv4Addr::new(8, 8, 8, 8);
+    let synthetic: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let cases: [(Ipv6Addr, u16, u16); 2] = [
+        ("2001:db8::1".parse().unwrap(), 5000, 40001),
+        ("2001:db8::2".parse().unwrap(), 5000, 40002),
+    ];
+    for (client, orig_sport, translated) in cases {
+        // Reply: server:443 -> pool:translated (what the server replied to).
+        let reply = build_ipv4_tcp_frame(
+            server,
+            pool,
+            443,
+            translated,
+            1,
+            1,
+            crate::tcp_flags::TCP_ACK,
+        );
+        // Reverse decision = forward decision inverted (as poll_descriptor does).
+        let fwd = Nat64State::forward_decision(pool, server, translated);
+        let rev = fwd.reverse(IpAddr::V6(client), IpAddr::V6(synthetic), orig_sport, 443);
+        let decision = icmp_test_decision(rev);
+        let info = Nat64ReverseInfo {
+            orig_src_v6: client,
+            orig_dst_v6: synthetic,
+        };
+        let out = build_nat64_forwarded_frame(
+            &reply,
+            nat64_reverse_meta(),
+            &decision,
+            Some(&info),
+            false,
+        )
+        .expect("reverse NAT64 frame");
+
+        // Output is IPv6 (eth 14 + ip 40 => L4 at 54); dst IP @38..54, TCP
+        // src port @54..56, dst port @56..58.
+        assert_eq!(
+            &out[38..54],
+            &client.octets(),
+            "reply delivered to the correct original client"
+        );
+        assert_eq!(
+            u16::from_be_bytes([out[54], out[55]]),
+            443,
+            "source (server) port unchanged"
+        );
+        assert_eq!(
+            u16::from_be_bytes([out[56], out[57]]),
+            orig_sport,
+            "#4381: reply dst port restored to THIS client's original source port"
+        );
+        // Checksum valid after the reverse (dst-port + address) delta.
+        let mut recomputed = out.clone();
+        recompute_l4_checksum_ipv6(&mut recomputed[14..], 40, PROTO_TCP).expect("v6 sum");
+        assert_eq!(
+            &out[70..72],
+            &recomputed[70..72],
+            "TCP checksum valid after reverse port restoration"
+        );
+    }
+}
+
+
+#[test]
+fn rewrite_forwarded_frame_in_place_translates_icmpv6_echo_identifier() {
+    let host = "2001:559:8585:ef00::100".parse::<Ipv6Addr>().unwrap();
+    let target = "2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap();
+    let pool = "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap();
+    let orig_id: u16 = 0x3e0f;
+    let translated_id: u16 = 40002;
+    // `flow_src_port` mirrors the packet's on-wire ICMPv6 identifier so
+    // `restore_l4_tuple_from_meta` is a no-op and MY incremental checksum
+    // adjustment (not a full recompute) is what the test validates.
+    let meta_for = |flow_src_port: u16| UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        flow_src_port,
+        ..UserspaceDpMeta::default()
+    };
+    let meta = meta_for(orig_id);
+
+    // Forward: host -> target, echo request (128). SNAT src + translate id.
+    let frame = build_icmpv6_echo_frame(host, target, 64, 128, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    let fwd_nat = NatDecision {
+        rewrite_src: Some(IpAddr::V6(pool)),
+        rewrite_src_port: Some(translated_id),
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(fwd_nat),
+        false,
+        None,
+    )
+    .expect("fwd v6 rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("fwd v6 out");
+    // eth 14 + ipv6 40 => icmp at 54; type@54, identifier@58..60.
+    assert_eq!(out[54], 128, "still an echo request");
+    assert_eq!(&out[22..38], &pool.octets(), "src translated to pool");
+    assert_eq!(
+        u16::from_be_bytes([out[58], out[59]]),
+        translated_id,
+        "identifier translated on the wire",
+    );
+    assert!(
+        icmpv6_checksum_ok(&out[14..]),
+        "ICMPv6 checksum valid after id rewrite",
+    );
+
+    // Reverse: reply target -> pool with the translated id; un-NAT restores it.
+    let reply = build_icmpv6_echo_frame(target, pool, 64, 129, translated_id);
+    let mut rarea = MmapArea::new(4096).expect("mmap");
+    rarea
+        .slice_mut(0, reply.len())
+        .unwrap()
+        .copy_from_slice(&reply);
+    let rev_nat = fwd_nat.reverse(IpAddr::V6(host), IpAddr::V6(target), orig_id, 0);
+    let rres = rewrite_forwarded_frame_in_place(
+        &rarea,
+        XdpDesc {
+            addr: 0,
+            len: reply.len() as u32,
+            options: 0,
+        },
+        meta_for(translated_id),
+        &icmp_test_decision(rev_nat),
+        false,
+        None,
+    )
+    .expect("rev v6 rewrite");
+    let rout = rarea
+        .slice(rres.offset as usize, rres.len as usize)
+        .expect("rev v6 out");
+    assert_eq!(rout[54], 129, "still an echo reply");
+    assert_eq!(&rout[38..54], &host.octets(), "dst un-NAT'd to the host");
+    assert_eq!(
+        u16::from_be_bytes([rout[58], rout[59]]),
+        orig_id,
+        "identifier restored to the original on the reply",
+    );
+    assert!(
+        icmpv6_checksum_ok(&rout[14..]),
+        "ICMPv6 checksum valid after reverse id rewrite",
+    );
+}
+
+
+// #4074: end-to-end — a DNAT'd ICMP echo (address-only, `rewrite_dst` set,
+// `rewrite_dst_port` None, which is what the gated DNAT lookup now produces for
+// a port-less protocol) must PRESERVE the ICMP Query Identifier and leave the
+// checksum valid. This is the wire-level counterpart to the decision-layer test
+// `dnat_pooled_port_does_not_translate_icmp_identifier`: the gate keeps
+// `rewrite_dst_port` None, so `apply_nat_icmp_identifier_rewrite` no-ops here.
+#[test]
+fn rewrite_forwarded_frame_in_place_dnat_preserves_icmpv4_identifier() {
+    let client = Ipv4Addr::new(198, 51, 100, 1);
+    let public = Ipv4Addr::new(203, 0, 113, 10);
+    let internal = Ipv4Addr::new(10, 0, 0, 5);
+    let orig_id: u16 = 0x1234;
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        flow_src_port: orig_id,
+        ..UserspaceDpMeta::default()
+    };
+    let frame = build_icmp_frame_v4(client, public, 64, 8, orig_id);
+    let mut area = MmapArea::new(4096).expect("mmap");
+    area.slice_mut(0, frame.len())
+        .unwrap()
+        .copy_from_slice(&frame);
+    // Address-only DNAT decision (the gated lookup's output for ICMP).
+    let dnat = NatDecision {
+        rewrite_dst: Some(IpAddr::V4(internal)),
+        rewrite_dst_port: None,
+        ..NatDecision::default()
+    };
+    let res = rewrite_forwarded_frame_in_place(
+        &area,
+        XdpDesc {
+            addr: 0,
+            len: frame.len() as u32,
+            options: 0,
+        },
+        meta,
+        &icmp_test_decision(dnat),
+        false,
+        None,
+    )
+    .expect("dnat rewrite");
+    let out = area
+        .slice(res.offset as usize, res.len as usize)
+        .expect("dnat out");
+    assert_eq!(&out[30..34], &internal.octets(), "dst translated by DNAT");
+    assert_eq!(
+        u16::from_be_bytes([out[38], out[39]]),
+        orig_id,
+        "ICMP identifier PRESERVED through address-only DNAT",
+    );
+    assert_eq!(
+        checksum16(&out[34..]),
+        0,
+        "ICMPv4 checksum valid (identifier untouched)",
+    );
+}
+

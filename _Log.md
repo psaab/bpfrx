@@ -45617,6 +45617,122 @@ top.
   prefix fails the selection assertions; reverted, production file clean).
 - **File(s)**: pkg/cli/cli_request_testrouting_4832_test.go, _Log.md
 
+## #4840 — split afxdp/tests.rs + frame/tests.rs catch-alls (test code-motion)
+
+- **Timestamp**: 2026-07-10
+- **Action**: Split the 14,038-LOC `afxdp/tests.rs` catch-all into a shared
+  support module plus 11 cohesive per-subsystem sibling test modules, all
+  declared `#[cfg(test)] #[path=...]` from `afxdp/mod.rs` (same parent module,
+  so `super::*` still resolves to production items). Pure code motion: every
+  `#[test]` fn moved verbatim; the 71 non-test helper fns moved verbatim into
+  `tests_support.rs` with visibility widened to `pub(super)` and imported via
+  `use super::tests_support::*`. Verified with a fn-body extraction diff (all
+  275 top-level fns byte-identical modulo the `pub(super)` prefix) and a full
+  `cargo test --release` run (3909 passed / 0 failed / 2 ignored — identical to
+  pre-split baseline; test-binary warning count unchanged at 129).
+- **File(s)**: userspace-dp/src/afxdp/mod.rs (deleted `mod tests;`, added 12
+  sibling `#[path]` decls), removed userspace-dp/src/afxdp/tests.rs, added
+  tests_support.rs, tests_bind_forward.rs, tests_icmp_te.rs,
+  tests_icmp_reject_reversal.rs, tests_embedded_poll_filter.rs,
+  tests_slow_path_disposition.rs, tests_txn_flow_cache.rs, tests_nat64_tunnel.rs,
+  tests_gre_local_delivery.rs, tests_decap_dnat_table.rs,
+  tests_policy_inbound_nat.rs, tests_fragment.rs, _Log.md
+
+## #4840 — split afxdp/frame/tests.rs catch-all (test code-motion)
+
+- **Timestamp**: 2026-07-10
+- **Action**: Split the 8,539-LOC `afxdp/frame/tests.rs` catch-all into a
+  shared support module plus 8 cohesive per-subsystem sibling test modules,
+  declared `#[cfg(test)] #[path=...]` from `afxdp/frame/mod.rs`. Same parent
+  module, so `super::*` (frame) and `super::super::test_fixtures::*` (afxdp)
+  still resolve. Pure code motion: every `#[test]` fn moved verbatim; the 40
+  helper fns + 1 module-level `const` (FLEX_SLACK_MARKER) moved verbatim into
+  `tests_support.rs` with visibility widened to `pub(super)`, imported via
+  `use super::tests_support::*`. Verified with an item-body extraction diff
+  (all 179 top-level items byte-identical modulo `pub(super)`) and a full
+  `cargo test --release` run (3909/0/2, identical to baseline; warning counts
+  unchanged at 167 bin / 129 test). A single unrelated pre-existing timing
+  flake (`event_stream::...::stalled_consumer_does_not_grow_backlog_...`,
+  fails 1/20 even in isolation, in an untouched file) is the only failure ever
+  observed.
+- **File(s)**: userspace-dp/src/afxdp/frame/mod.rs (deleted `mod tests;`, added
+  9 sibling `#[path]` decls), removed userspace-dp/src/afxdp/frame/tests.rs,
+  added frame/tests_support.rs, tests_parse_forward_pbr.rs,
+  tests_native_gre_ecn.rs, tests_nat_rewrite.rs, tests_ports_live_forward.rs,
+  tests_segment_tcp.rs, tests_ttl_descriptor_dscp.rs,
+  tests_fragment_term_extra.rs, tests_mss_inject_inspect.rs, _Log.md
+## 2026-07-10 — #4907 perf-tooling evidence-integrity cohort
+- **Timestamp**: 2026-07-10
+- **Action**: HC-029 — mouse_latency_aggregate FAIL must exit non-zero (add
+  exit_status_for_verdict: PASS=0, FAIL=1, else=2) + fail-on-revert test
+- **File(s)**: test/incus/mouse_latency_aggregate.py,
+  test/incus/mouse_latency_aggregate_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-084 — fairness_multi_sample summarize() now fails a sample
+  whose sub-harness exit_code != 0 even if its JSON verdict says PASS
+  (exit status is authoritative) + fail-on-revert test
+- **File(s)**: test/incus/fairness_multi_sample.py,
+  test/incus/fairness_multi_sample_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-026 — step2 reducer closes off-CPU intervals at schedule-in
+  (sched_switch next_pid=worker), parses next_pid; wakeup no longer closes.
+  Involuntary preemption (prev_state=R, no wakeup) is now measured.
+  Rewrote synthetic + invariant tests to kernel-realistic switch-in fixtures;
+  added 3 regression tests.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-reduce_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-092 — reducer stamps block_span_ns; classifier computes
+  duty-cycle over the actual summed window (fallback 60s for legacy JSONL)
+  instead of a fixed 60s. Added window tests + diag window_ns.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-classify.py,
+  test/incus/step2-sched-switch-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-070 — reducer main() HALTs (exit 2) on zero-event perf
+  (drift-halt still wins); classifier emits INSUFFICIENT (exit 2) on the
+  all-zero/all-WARN no-evidence shape instead of a definitive OUT exit 0.
+  Updated drift-warning test to a non-empty capture; added empty-perf +
+  insufficient-evidence tests.
+- **File(s)**: test/incus/step2-sched-switch-reduce.py,
+  test/incus/step2-sched-switch-reduce_test.py,
+  test/incus/step2-sched-switch-classify.py,
+  test/incus/step2-sched-switch-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-132 — step1-histogram-classify tracks failed_cells; --only-cell
+  returns non-zero if the target cell produced no hist-blocks; full run returns
+  2 when no valid cells (kills "k_D1 = 0 of 0" exit 0) and 1 on missing/corrupt
+  cells. Added --only-cell missing-target fail-on-revert test.
+- **File(s)**: test/incus/step1-histogram-classify.py,
+  test/incus/step1-histogram-classify_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-128 — rate-spread analyzer validates exact-16 streams +
+  positive finite sender bps (RateSpreadError), and main() hard-fails on any
+  missing requested cell instead of WARN+continue. Added --expected-streams.
+  New test file with fail-on-revert partial/missing cases.
+- **File(s)**: test/incus/step1-rate-spread-analysis.py,
+  test/incus/step1-rate-spread-analysis_test.py (new)
+- **Timestamp**: 2026-07-10
+- **Action**: HC-130 — step1-rss-multinomial simulate() is now a generator
+  (O(1) memory); tail_probabilities streams + counts trials and raises on
+  empty. Deterministic-seed behavior preserved. New test file.
+- **File(s)**: test/incus/step1-rss-multinomial.py,
+  test/incus/step1-rss-multinomial_test.py (new)
+- **Timestamp**: 2026-07-10
+- **Action**: HC-083 — RG 1 Hz poller now writes a POLL_FAILED sentinel per
+  failed/empty tick; cmd_rg_state_flapped returns 2 (undetermined) on any
+  POLL_FAILED marker or --expected-samples shortfall when no drift is seen
+  (drift still wins). Added 3 orchestrate tests.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/test-mouse-latency.sh,
+  test/incus/mouse_latency_orchestrate_test.py
+- **Timestamp**: 2026-07-10
+- **Action**: HC-072 — cold-path-flooder bounded cohort now enumerates a
+  disjoint per-worker slice sequentially (worker_slice + decompose_tuple_index
+  helpers) so first-pass packets are genuine installs (no birthday collisions,
+  no cross-worker overlap). Unbounded keeps random draws. Summary emits
+  tuple_space (fresh-install budget), version bumped 2->3. 4 cargo tests.
+- **File(s)**: test/incus/cold-path-flooder/src/main.rs
 - **Timestamp**: 2026-07-10
 - **Action**: #5280 zeroize wipes the CONFIGURED config root, not a hardcoded
   /etc/xpf. `performZeroizeWipe` was `func() error` calling

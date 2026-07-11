@@ -524,16 +524,19 @@ def main() -> int:
         cell_iter = list(POOL_BY_CELL.items())
 
     summary_rows = []
+    failed_cells: list[str] = []
     for rel_dir, pool in cell_iter:
         cell_dir = args.evidence_root / rel_dir
         if not cell_dir.is_dir():
-            print(f"WARN: cell dir missing {cell_dir}", file=sys.stderr)
+            print(f"ERROR: cell dir missing {cell_dir}", file=sys.stderr)
+            failed_cells.append(rel_dir)
             continue
         try:
             snaps = load_snapshots(cell_dir)
             blocks = compute_blocks(snaps)
         except Exception as e:
             print(f"ERROR: cell {rel_dir} failed: {e}", file=sys.stderr)
+            failed_cells.append(rel_dir)
             continue
 
         with (cell_dir / "hist-blocks.jsonl").open("w") as f:
@@ -578,6 +581,18 @@ def main() -> int:
 
     if args.only_cell is not None:
         # #821 §3.6: --only-cell skips summary-table.csv.
+        # C175-HC-132: a missing/corrupt target cell previously WARN'd and
+        # still returned 0, so step2's `--only-cell` reduction ran against
+        # a cell that produced no hist-blocks and the failure read as
+        # success. Fail loud when the requested cell did not classify.
+        if failed_cells:
+            print(
+                f"ERROR: --only-cell {args.only_cell!r} did not produce "
+                "hist-blocks (cell missing or failed to load/compute); "
+                "not a successful run",
+                file=sys.stderr,
+            )
+            return 1
         return 0
 
     if summary_rows:
@@ -596,6 +611,27 @@ def main() -> int:
     k_D2 = sum(1 for r in valid if r["D2_fire"])
     print(f"k_D1 = {k_D1} of {len(valid)}  (gate: k_v >= 2)")
     print(f"k_D2 = {k_D2} of {len(valid)}  (gate: k_v >= 2)")
+
+    # C175-HC-132: with every cell missing/corrupt, `valid` is empty and
+    # the gate printed a hollow "k_D1 = 0 of 0" then exited 0 — a false
+    # step-1 success (no fires) from zero measurement. Fail loud instead:
+    # an empty valid set cannot evaluate the k_v >= 2 gate, and any
+    # missing/corrupt cell means the gate ran on partial evidence.
+    if not valid:
+        print(
+            "ERROR: no valid (non-suspect) cells classified — cannot "
+            "evaluate the k_v >= 2 gate; insufficient evidence",
+            file=sys.stderr,
+        )
+        return 2
+    if failed_cells:
+        print(
+            f"ERROR: {len(failed_cells)} cell(s) missing/corrupt "
+            f"({failed_cells}); the k_v gate was evaluated on partial "
+            "evidence — not a clean pass",
+            file=sys.stderr,
+        )
+        return 1
 
     return 0
 
