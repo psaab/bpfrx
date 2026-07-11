@@ -58,3 +58,50 @@ func ValidateVersionSegment(ver string) error {
 	}
 	return nil
 }
+
+// ValidateKernelSegment rejects any kernel version / `uname -r` string that is
+// not a safe segment for the kernel A/B channel's filesystem and GRUB uses
+// (#5452). It is STRICTER than ValidateVersionSegment because the kernel path
+// consumes the string in two additional injection-prone contexts that the
+// binary-cut path does not:
+//
+//   - a glob + delete: filepath.Glob(rooted("/boot/*-"+ver)) feeds every match
+//     to os.RemoveAll, and os.RemoveAll(rooted("/lib/modules/"+ver)) deletes a
+//     module tree. A glob metacharacter (`*`, `?`, `[`, `]`) in ver widens the
+//     pattern — candidateVersion="*" globs "/boot/*-*", matching EVERY dashed
+//     /boot file, so RemoveAll wipes all kernels/initrds/config and bricks the
+//     host. It also feeds `apt-get purge linux-image-<ver>`, where "*" purges
+//     every kernel package. And ".." (even with no "/") traverses:
+//     filepath.Join("/lib/modules", "..") == "/lib".
+//   - a generated GRUB script: WriteSlotSelector Sprintf's ver into a
+//     double-quoted directive `set xpf_slot_kernel="vmlinuz-<ver>"`. A `"`,
+//     backslash, or newline injects arbitrary GRUB commands and breaks the
+//     boot selector.
+//
+// ValidateVersionSegment permits `*`, `?`, `[`, `]`, `"`, `\`, and `:` (all
+// legal in a Debian package version and harmless as a plain path segment), so
+// it is NOT sufficient here. A real `uname -r` is alphanumerics plus `.`, `-`,
+// `+`, `~`, `_` (e.g. "6.18.0-xpf1-amd64"), so this validator allows ONLY that
+// charset, is non-empty, rejects a leading `-` (would parse as an apt/efi
+// option) and any ".." (traversal), and fails CLOSED on anything else.
+func ValidateKernelSegment(what, seg string) error {
+	if seg == "" {
+		return fmt.Errorf("%s is empty", what)
+	}
+	if strings.HasPrefix(seg, "-") {
+		return fmt.Errorf("%s %q has a leading '-' (parses as a command option)", what, seg)
+	}
+	if strings.Contains(seg, "..") {
+		return fmt.Errorf("%s %q contains \"..\" (path traversal)", what, seg)
+	}
+	for _, r := range seg {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.' || r == '_' || r == '+' || r == '~' || r == '-':
+		default:
+			return fmt.Errorf("%s %q contains an invalid character %q "+
+				"(allowed: A-Za-z0-9 . _ + ~ -)", what, seg, r)
+		}
+	}
+	return nil
+}
