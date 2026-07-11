@@ -45458,6 +45458,48 @@ top.
 - **Action**: Test-coverage-only (no production change). Added pkg/cli/chrony_test.go — a table-driven test for printChronyTracking (pkg/cli/chrony.go), the `chronyc tracking` output parser behind `show system ntp status`, which had zero unit coverage. Captures stdout via the existing captureStdout helper and asserts the rendered Junos-style block. Cases: fully-synchronised block (exact 12-line match over all 11 rendered fields in fixed order, plus omission checks that chronyc's Residual freq / Skew and the Skew value do NOT leak); unsynchronised block (Leap status "Not synchronised" verbatim); unusual leap status ("Insert second"); malformed lines with no " : " separator ignored + leading-separator empty-key line skipped by the idx>0 guard; duplicated key keeps last value (map overwrite); empty input renders only the header. Verified non-tautological: mutating the Leap-status lookup key in chrony.go turns the test RED; revert → GREEN. No production bug found — parser behaves correctly for all fed inputs (the line[idx+3:] slice is not out-of-bounds, as the issue notes). Validation: `go test ./pkg/cli/...` green; gofmt clean.
 - **File(s)**: pkg/cli/chrony_test.go, _Log.md
 
+## 2026-07-10 — #5281 grpcapi zeroize goes through the apply gate and stops xpfd
+- **Timestamp**: 2026-07-10
+- **Action**: SECURITY. Fixed the gRPC `SystemAction{zeroize}` factory reset,
+  which called package-level `performZeroizeWipe` directly with no lifecycle
+  coordination and never stopped xpfd — so after a "successful" zeroize the
+  still-running daemon held the pre-wipe in-memory ActiveConfig and the next
+  reconcile / commit / HA-sync re-rendered the erased secrets (frr.conf /
+  swanctl PSKs / Kea / login accounts) and re-created the `.configdb` SSOT.
+  New daemon-owned `factoryReset` (pkg/daemon/daemon_apply.go), wired as
+  `grpcapi.Config.ZeroizeFn` (pkg/daemon/daemon_run.go), acquires the SAME
+  `applySem` commit/apply/HA-sync serialize on (draining any in-flight apply),
+  enters a TERMINAL reset generation (`d.resetting`) BEFORE the wipe, runs the
+  wipe under the gate, and on success leaves the generation set (the handler
+  stops xpfd moments later). Config writers now short-circuit on
+  `errDaemonResetting`: commitAndApply / commitConfirmedAndApply / syncAndApply
+  reject before persisting; executeConfirmedRollback skips; applyConfigLocked
+  refuses (defense-in-depth); ipsecApplyForLeaseChange refuses (periodic swanctl
+  PSK re-render). The grpcapi handler routes the wipe through `s.zeroizeFn`
+  (falling back to a direct wipe only when nil), and on a fully-successful wipe
+  schedules `scheduleStopDaemon` (`systemctl stop xpfd` after a 1s grace,
+  mirroring the local `request system zeroize` CLI). Sequence is strictly
+  gate → wipe → stop, fail-CLOSED: a wipe that does not complete returns
+  Internal and does NOT stop the daemon. #4108 action-journal write preserved
+  (before the wipe); existing RPC path unchanged otherwise. Sibling issues
+  #5280 (wrong-root) / #5278 (per-principal auth) intentionally out of scope —
+  no overlapping edits (this touches the gate/stop lifecycle, not the wipe roots
+  or auth).
+- **Tests**: pkg/grpcapi/zeroize_gate_stop_5281_test.go (gate→wipe→stop order,
+  fail-closed no-stop, no-gate fallback — RED on revert to the direct-wipe
+  handler: gate bypassed + no stop → FAIL, verified); updated
+  system_action_journal_4108_test.go to neutralize the new scheduleStopDaemon
+  seam; pkg/daemon/factory_reset_5281_test.go (gate-first acquire, terminal
+  reset generation on success, gate released, commit/HA-sync/reconcile/ipsec
+  rejected during reset, fail-closed clears the generation).
+- **Validation**: `GOCACHE=/tmp/gocache-5281 GOTMPDIR=/tmp go build ./...` green;
+  `go test -race ./pkg/grpcapi/... ./pkg/daemon/...` green; gofmt clean.
+- **File(s)**: pkg/grpcapi/server.go, pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/system_action_journal_4108_test.go,
+  pkg/grpcapi/zeroize_gate_stop_5281_test.go, pkg/grpcapi/README.md,
+  pkg/daemon/daemon.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_ipsec_rebind.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/factory_reset_5281_test.go, pkg/daemon/README.md, _Log.md
 ## 2026-07-10 — #4984 show interfaces: consistent authored/logical/kernel name identity
 - **Timestamp**: 2026-07-10
 - **Action**: Fix #4984 (split from the #4884 interface-identity cohort, sub-defect B). The `show interfaces` family mixed name spellings for the SAME interface: summary + terse print the authored Junos name (`ge-0/0/2`), but the netlink-driven `detail` / `extensive` / `statistics` paths walked kernel netdevs and printed the Linux dash-form name (`ge-0-0-2`) as the interface identity. `detail` / `extensive` also keyed the zone + description joins by the authored name yet looked them up by the kernel name, so both were silently blank, and an authored-form filter (`show interfaces ge-0/0/2 detail`) reported "not found". Established one canonical model: the authored Junos name is the display identity across every variant; kernel names are used only for lookups. Added shared helpers in cli_show_interfaces_shared.go — `kernelToAuthoredMap` (config `LinuxIfName` reverse map: kernel netdev -> authored name), `authoredName` (resolve with kernel-name fallback for unmanaged devices), and `ifaceFilterMatches` (accept either spelling as the `<name>` filter). Routed detail/extensive/statistics display + zone/description joins + filter through the authored form (zone joins re-keyed by authored BASE name via `baseIfName`). Fixed the summary path's per-unit address lookup to resolve to the kernel VLAN sub-device (`config.LinuxIfName(physName)` + `.vlan-id`) instead of the authored `ge-0/0/2.50` — the authored form failed `net.InterfaceByName` and fell back to the parent, printing the parent's addresses under the sub-unit. Display-only change; no interface-management logic touched. `show interfaces queue` (CoS runtime snapshot, show_services_cos.go) is out of scope. RED-on-revert PROVEN: stashing the five source edits makes all four new tests FAIL (kernel identity printed / zone+desc joins blank / authored filter not found). Gates: `go build ./...` + `go test ./pkg/cli/...` green; gofmt clean.
@@ -45503,6 +45545,38 @@ top.
   scripts/deploy/test_xpf_deploy_image_roll_identity.py,
   docs/in-place-upgrade.md, _Log.md
 
+## 2026-07-10 — #5281 review fold: gate ip-monitoring route-overlay actuator
+- **Timestamp**: 2026-07-10
+- **Action**: SECURITY (rev-5548 MERGE-NEEDS-MINOR fold). The initial #5281
+  fix gated the daemon_apply.go writers + ipsecApplyForLeaseChange on
+  isResetting(), but the ip-monitoring route-overlay actuator
+  (actuateRouteOverlayLocked, pkg/daemon/daemon_ipmon.go) was NOT gated. It
+  acquires applySem and does a FULL re-render of /etc/frr/frr.conf
+  (d.applyFRRConfig(d.assembleFRRConfig(...))) from the in-memory ActiveConfig.
+  In the ~1s wipe->stop window (or graceful-shutdown drain), a probe flap with
+  `services ip-monitoring` configured + a dirty overlay would acquire the
+  just-released applySem, read the still-resident config, and RE-WRITE frr.conf
+  — re-materializing the ERASED BGP-MD5/OSPF/IS-IS routing-auth keys into a
+  world-readable file that SURVIVES the post-zeroize reboot, defeating the wipe.
+  Added `if d.isResetting() { return false }` at the top of
+  actuateRouteOverlayLocked (the frr.conf render chokepoint; returns false so
+  the engine stays dirty — the daemon is being wiped/stopped so the retry never
+  fires), matching the isResetting gates in daemon_apply.go.
+  Audited the other ungated applySem acquirers: only ip-monitoring (frr.conf)
+  and the DHCP-lease IPsec rebind (swanctl PSK, already gated via
+  ipsecApplyForLeaseChange) re-render an erased secret. DNS writes
+  /etc/resolv.conf (not wiped), proxy-ARP writes nft, the policy scheduler +
+  NAT-pool alarm touch dataplane/in-memory state, and the host-tunables restore
+  must run on shutdown — none re-render wiped state, so they stay ungated.
+- **Tests**: pkg/daemon/daemon_ipmon_test.go — TestActuateRouteOverlaySkipsWhenResetting
+  asserts actuateRouteOverlayLocked is a no-op (returns false, RecordingExecutor
+  ReloadCalls==0 so frr.conf is NOT re-rendered, no dp publish/bump) when
+  isResetting() is true. RED-on-revert verified: removing the gate → the actuator
+  renders frr.conf (ReloadCalls=1) + publishes → test FAILS.
+- **Validation**: `GOCACHE=/tmp/gocache-5281 GOTMPDIR=/tmp go build ./...` green;
+  `go test -race ./pkg/daemon/... ./pkg/grpcapi/...` green; gofmt clean.
+- **File(s)**: pkg/daemon/daemon_ipmon.go, pkg/daemon/daemon_ipmon_test.go,
+  pkg/daemon/README.md, _Log.md
 - **Timestamp**: 2026-07-10
 - **Action**: #5043 — refuse in-place overwrite of a libvirt golden qcow2 that
   has dependent overlays. `fetch --install-libvirt` did

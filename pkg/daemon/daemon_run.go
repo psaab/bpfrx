@@ -1076,9 +1076,14 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 		CommitConfirmedFn: func(ctx context.Context, minutes int) (*config.Config, error) {
 			return d.commitConfirmedAndApply(ctx, minutes, true)
 		},
-		VRRPMgr: d.vrrpMgr,
-		RAMgr:   d.ra,
-		Version: d.opts.Version,
+		// #5281: a gRPC zeroize runs the wipe under the SAME apply gate as
+		// commit/sync and enters a terminal reset generation so no concurrent
+		// or later config writer re-creates the erased state before the daemon
+		// stops. The grpcapi handler passes its performZeroizeWipe primitive.
+		ZeroizeFn: d.factoryReset,
+		VRRPMgr:   d.vrrpMgr,
+		RAMgr:     d.ra,
+		Version:   d.opts.Version,
 		FabricPeerAddrFn: func() []string {
 			var addrs []string
 			if d.syncPeerAddr != "" {
