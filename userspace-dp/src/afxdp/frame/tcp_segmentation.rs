@@ -73,7 +73,20 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
     if l3 >= frame.len() {
         return None;
     }
-    let payload = &frame[l3..];
+    // #5141: the datagram's authoritative end is the IP header's declared
+    // length (IPv4 total_len / IPv6 40 + payload_len), CLAMPED to the backing
+    // slice by `declared_l3_end`. Slicing the full `&frame[l3..]` backing
+    // instead promotes trailing Ethernet slack / attacker-appended bytes into
+    // freshly checksummed segments carrying valid IP lengths — bytes that were
+    // never datagram content injected into a valid TCP stream. Every read
+    // below (MTU admission, TCP header parse, data slice, per-segment copy
+    // loop) is bounded by this clamped `payload`. A declaration that does not
+    // even cover the IP+TCP headers leaves `payload` shorter than the header
+    // bounds checks require, so it fails closed (returns None → not segmented).
+    let Some(l3_end) = declared_l3_end(frame, l3, meta.addr_family) else {
+        return None;
+    };
+    let payload = &frame[l3..l3_end];
     if payload.len() <= mtu {
         return None;
     }
@@ -965,6 +978,258 @@ mod mode_aware_segmentation_tests {
                 "segment {idx} TCP checksum must verify to zero (per-segment recompute)"
             );
         }
+    }
+
+    // ------- (d) #5141 IP-declared-length clamp ---------------------
+    //
+    // Segmentation must slice the TCP payload from the IP-DECLARED datagram
+    // (IPv4 total_len / IPv6 40+payload_len), NOT the raw backing buffer.
+    // Trailing Ethernet slack / attacker-appended bytes beyond the declared
+    // end are not datagram content and must never be chunked into fresh
+    // segments carrying valid IP lengths and TCP checksums (bytes injected
+    // into a valid checksummed stream). These tests build frames whose IP
+    // header declares FEWER bytes than the backing buffer and assert:
+    //   - no slack byte (0xEE) appears in any emitted segment's TCP payload;
+    //   - the total emitted TCP payload equals the DECLARED data length;
+    //   - a declaration too short to even hold the IP+TCP headers is NOT
+    //     segmented (fail closed).
+    // All three go RED on a revert of the `declared_l3_end` clamp: the
+    // pre-fix builder sliced `&frame[l3..]` and promoted the slack.
+
+    const SLACK_MARKER: u8 = 0xEE;
+    const DATA_FILL: u8 = 0x41;
+
+    /// Build an L2 IPv4/TCP frame that declares `declared_data` bytes of TCP
+    /// payload via `total_len` but carries `slack` extra bytes (filled with
+    /// `SLACK_MARKER`) appended AFTER the declared datagram end. The declared
+    /// payload is filled with `DATA_FILL`, disjoint from `SLACK_MARKER`, so a
+    /// promoted slack byte is detectable in an emitted segment.
+    fn ipv4_tcp_frame_with_slack(declared_data: usize, slack: usize) -> Vec<u8> {
+        let src_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let dst_ip = Ipv4Addr::new(10, 0, 0, 9);
+        let tcp_header_len = 20usize;
+        let total_len = (20 + tcp_header_len + declared_data) as u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [0x02, 0xbf, 0x72, 0x00, 0x50, 0x08],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45,
+            0x00,
+            (total_len >> 8) as u8,
+            total_len as u8,
+            0x00,
+            0x01,
+            0x40,
+            0x00,
+            64,
+            PROTO_TCP,
+            0x00,
+            0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        // src_port, dst_port
+        frame.extend_from_slice(&40000u16.to_be_bytes());
+        frame.extend_from_slice(&5201u16.to_be_bytes());
+        // seq, ack, data-offset (5<<4), flags (ACK), window, csum, urg.
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x00, 0x3f, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        frame.extend(std::iter::repeat(DATA_FILL).take(declared_data));
+        frame.extend(std::iter::repeat(SLACK_MARKER).take(slack));
+        // Fix the IP header checksum over the 20-byte header (the segmenter
+        // recomputes per segment, but a well-formed input is more realistic).
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        frame
+    }
+
+    /// IPv6 counterpart: declare `declared_data` TCP payload bytes via the
+    /// fixed-header `payload_len` (= tcp_header + declared_data) but append
+    /// `slack` SLACK_MARKER bytes past the declared datagram end.
+    fn ipv6_tcp_frame_with_slack(declared_data: usize, slack: usize) -> Vec<u8> {
+        let tcp_header_len = 20usize;
+        let payload_len = (tcp_header_len + declared_data) as u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [0x02, 0xbf, 0x72, 0x00, 0x50, 0x08],
+            0,
+            0x86dd,
+        );
+        // IPv6 fixed header (40 bytes).
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // ver/tc/flow
+        frame.extend_from_slice(&payload_len.to_be_bytes()); // payload_len
+        frame.push(PROTO_TCP); // next header
+        frame.push(64); // hop limit
+        // src addr 2001:db8::5, dst addr 2001:db8::9
+        let mut src = [0u8; 16];
+        src[0] = 0x20;
+        src[1] = 0x01;
+        src[2] = 0x0d;
+        src[3] = 0xb8;
+        src[15] = 0x05;
+        let mut dst = src;
+        dst[15] = 0x09;
+        frame.extend_from_slice(&src);
+        frame.extend_from_slice(&dst);
+        // TCP header (20 bytes): ports, seq, ack, data-offset(5<<4), flags ACK.
+        frame.extend_from_slice(&40000u16.to_be_bytes());
+        frame.extend_from_slice(&5201u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x00, 0x3f, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        frame.extend(std::iter::repeat(DATA_FILL).take(declared_data));
+        frame.extend(std::iter::repeat(SLACK_MARKER).take(slack));
+        frame
+    }
+
+    fn meta_v6() -> ForwardPacketMeta {
+        ForwardPacketMeta {
+            l3_offset: 14,
+            l4_offset: 54,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_TCP,
+            ..ForwardPacketMeta::default()
+        }
+    }
+
+    /// Slice the TCP payload out of a plain (eth+IP+TCP, no VLAN, no tunnel)
+    /// emitted segment for either family. `frame_out` is sized exactly to the
+    /// datagram, so the payload runs to the end of the segment.
+    fn segment_tcp_payload(seg: &[u8], v6: bool) -> &[u8] {
+        let eth = 14usize;
+        let ip_len = if v6 {
+            40
+        } else {
+            ((seg[eth] & 0x0f) as usize) * 4
+        };
+        let tcp_off = eth + ip_len;
+        let tcp_hdr = ((seg[tcp_off + 12] >> 4) as usize) * 4;
+        &seg[tcp_off + tcp_hdr..]
+    }
+
+    #[test]
+    fn ipv4_segmentation_ignores_trailing_slack_beyond_total_len() {
+        // Declared datagram: 20 (IP) + 20 (TCP) + 1400 (data) = 1440 > MTU
+        // 1280, so it MUST segment — but only the 1400 declared bytes. 600
+        // trailing SLACK_MARKER bytes sit past total_len and must be dropped.
+        let mtu = 1280usize;
+        let declared_data = 1400usize;
+        let slack = 600usize;
+        let mut state = ForwardingState::default();
+        state.egress.insert(EGRESS_IFINDEX, egress_iface(mtu));
+        let decision = SessionDecision {
+            resolution: plain_resolution(),
+            nat: NatDecision::default(),
+        };
+        let frame = ipv4_tcp_frame_with_slack(declared_data, slack);
+        let segments = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta_v4(),
+            &decision,
+            &state,
+            false,
+            None,
+        )
+        .expect("declared 1440 > 1280 MTU must segment");
+        assert!(segments.len() >= 2, "1440 over 1280 MTU splits");
+        let mut total_payload = 0usize;
+        for (idx, seg) in segments.iter().enumerate() {
+            let payload = segment_tcp_payload(seg, false);
+            total_payload += payload.len();
+            assert!(
+                !payload.contains(&SLACK_MARKER),
+                "segment {idx} promoted trailing slack (0xEE) into TCP payload"
+            );
+        }
+        assert_eq!(
+            total_payload, declared_data,
+            "emitted TCP payload must equal the IP-declared data, not the backing slack"
+        );
+    }
+
+    #[test]
+    fn ipv6_segmentation_ignores_trailing_slack_beyond_payload_len() {
+        // Declared datagram: 40 (IP) + 20 (TCP) + 1400 (data) = 1460 > MTU
+        // 1280. 600 trailing SLACK_MARKER bytes past payload_len must drop.
+        let mtu = 1280usize;
+        let declared_data = 1400usize;
+        let slack = 600usize;
+        let mut state = ForwardingState::default();
+        state.egress.insert(EGRESS_IFINDEX, egress_iface(mtu));
+        let decision = SessionDecision {
+            resolution: plain_resolution(),
+            nat: NatDecision::default(),
+        };
+        let frame = ipv6_tcp_frame_with_slack(declared_data, slack);
+        let segments = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta_v6(),
+            &decision,
+            &state,
+            false,
+            None,
+        )
+        .expect("declared 1460 > 1280 MTU must segment");
+        assert!(segments.len() >= 2, "1460 over 1280 MTU splits");
+        let mut total_payload = 0usize;
+        for (idx, seg) in segments.iter().enumerate() {
+            let payload = segment_tcp_payload(seg, true);
+            total_payload += payload.len();
+            assert!(
+                !payload.contains(&SLACK_MARKER),
+                "v6 segment {idx} promoted trailing slack (0xEE) into TCP payload"
+            );
+        }
+        assert_eq!(
+            total_payload, declared_data,
+            "v6 emitted TCP payload must equal the IP-declared data, not backing slack"
+        );
+    }
+
+    #[test]
+    fn ipv4_segmentation_rejects_declaration_shorter_than_headers() {
+        // A large backing buffer (1400 data bytes past L3, well over the MTU)
+        // but a lying-short total_len that declares only 30 bytes — fewer than
+        // the 40 required for the IP+TCP headers. The datagram is a runt; it
+        // must NOT be segmented (fail closed), so none of the 1400 backing
+        // bytes are promoted into fresh checksummed segments.
+        let mtu = 1280usize;
+        let mut state = ForwardingState::default();
+        state.egress.insert(EGRESS_IFINDEX, egress_iface(mtu));
+        let decision = SessionDecision {
+            resolution: plain_resolution(),
+            nat: NatDecision::default(),
+        };
+        // 1400 backing data bytes, but overwrite total_len to a runt 30.
+        let mut frame = ipv4_tcp_frame_with_slack(1400, 0);
+        let runt_total_len: u16 = 30;
+        frame[16] = (runt_total_len >> 8) as u8;
+        frame[17] = runt_total_len as u8;
+        let out = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta_v4(),
+            &decision,
+            &state,
+            false,
+            None,
+        );
+        assert!(
+            out.is_none(),
+            "a declaration shorter than the IP+TCP headers must fail closed (not segment)"
+        );
     }
 
     // ------- decap helper -------------------------------------------

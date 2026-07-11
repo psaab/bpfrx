@@ -35,7 +35,14 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
     if l3 >= frame.len() {
         return None;
     }
-    let payload = &frame[l3..];
+    // #5141: clamp to the IP-declared datagram end (declared_l3_end) so
+    // trailing Ethernet slack / attacker-appended bytes are never chunked
+    // into fresh checksummed segments. This is the TX local-owner fast-path
+    // twin of the frame/tcp_segmentation.rs copy path; see that file for the
+    // full rationale. All downstream reads are bounded by the clamped
+    // `payload`, and a sub-header declaration fails closed (returns None).
+    let l3_end = declared_l3_end(frame, l3, meta.addr_family)?;
+    let payload = &frame[l3..l3_end];
     if payload.len() <= mtu {
         return None;
     }

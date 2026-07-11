@@ -74,7 +74,7 @@ pub(super) use inspect::{
     parse_zone_encoded_fabric_ingress, parse_zone_encoded_fabric_ingress_from_frame,
 };
 pub(in crate::afxdp) use inspect::{
-    authoritative_forward_ports, decode_frame_summary, dest_is_directed_broadcast,
+    authoritative_forward_ports, decode_frame_summary, declared_l3_end, dest_is_directed_broadcast,
     dest_is_multicast_or_broadcast, forward_tuple_mismatch_reason, ipv4_is_any_fragment,
     ipv4_is_non_first_fragment, ipv6_ext_chain_over_limit, ipv6_is_any_fragment,
     ipv6_is_non_first_fragment, is_any_fragment,

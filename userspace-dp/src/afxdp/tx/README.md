@@ -19,7 +19,7 @@ writer to synchronize against.
 | `drain.rs` | Per-tick drain dispatch + queue-bound / pending-queue helpers. Owns the `COS_GUARANTEE_QUANTUM_*` and `COS_GUARANTEE_VISIT_NS` constants. |
 | `rings.rs` | XSK kernel-ring discipline: completion drain, fill submit, RX/TX kernel wake. |
 | `stats.rs` | Per-frame counters and submit-latency histogram bucketing. The sidecar `&mut [u64]` is non-atomic since it's owner-only. |
-| `tcp_segmentation.rs` | TCP segmentation for forwarded frames (extracted in PR #1199). `#[cold]` — segmentation is the slow path; line-rate flows don't enter it. |
+| `tcp_segmentation.rs` | TCP segmentation for forwarded frames (extracted in PR #1199). `#[cold]` — segmentation is the slow path; line-rate flows don't enter it. **#5141:** the local-owner fast-path twin of `frame/tcp_segmentation.rs` — it clamps the segmentable payload to the IP-declared datagram end (`declared_l3_end`, IPv4 `total_len` / IPv6 `40 + payload_len`) instead of the raw `&frame[l3..]` backing, so trailing Ethernet slack / appended bytes are never chunked into fresh checksummed segments. Kept byte-identical to the copy-path twin; the admission gate `forwarded_tcp_may_need_segmentation` in `dispatch/mod.rs` clamps the same way. |
 | `transmit.rs` | XSK TX-ring submit + per-frame recycle. Owns `transmit_batch`, `transmit_prepared_queue`, shared-UMEM-aware prepared recycle helpers, and the `TxError` enum. |
 | `test_support.rs` | Test helpers for the per-file unit tests. |
 

@@ -1,3 +1,40 @@
+## 2026-07-11 — #5141 (security): clamp TCP segmentation to the IP-declared datagram length
+- **Timestamp**: 2026-07-11 (fix/5141-tcpseg-iplen-clamp)
+- **Action**: TCP segmentation sliced the segmentable payload from the full
+  backing suffix `&frame[l3..]` with NO clamp to the IP header's declared
+  length; the admission gate compared `frame.len() - l3 > mtu` on the BACKING
+  length. Trailing Ethernet slack / attacker-appended bytes past IPv4
+  `total_len` / IPv6 `payload_len` were chunked into fresh segments that
+  received valid IP lengths and freshly recomputed TCP checksums — attacker
+  bytes injected into a valid checksummed stream. FIX: reuse the existing
+  `inspect::declared_l3_end` (#2361; IPv4 `l3+total_len`, IPv6 `l3+40+payload_len`,
+  each clamped to the backing) in BOTH segmentation twins
+  (`frame/tcp_segmentation.rs` copy path + `tx/tcp_segmentation.rs` local-owner
+  fast path) — slice `payload = &frame[l3..declared_l3_end]` so the MTU
+  admission, TCP header parse, data slice, and per-segment copy loop are all
+  bounded by the declared end. A declaration too short to cover the IP+TCP
+  headers leaves `payload` shorter than the header bounds checks require, so it
+  fails closed (not segmented). The `tx/dispatch.rs` admission predicate
+  `forwarded_tcp_may_need_segmentation` clamps identically
+  (`declared_l3_end - l3 > mtu`) to keep admission and builders in lockstep.
+  Re-exported `declared_l3_end` from `frame/mod.rs` so both twins and dispatch
+  reach it.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs (clamp + 3
+  fail-on-revert tests + fixtures), userspace-dp/src/afxdp/tx/tcp_segmentation.rs
+  (clamp), userspace-dp/src/afxdp/tx/dispatch/mod.rs (admission clamp),
+  userspace-dp/src/afxdp/frame/mod.rs (re-export declared_l3_end),
+  userspace-dp/src/afxdp/frame/README.md, userspace-dp/src/afxdp/tx/README.md,
+  _Log.md
+- **Validation**: `cargo build` green; FULL `cargo test --release` green.
+  RED-on-revert proven: neutralizing the frame-twin clamp to `&frame[l3..]`
+  makes all three new tests FAIL —
+  `ipv4_segmentation_ignores_trailing_slack_beyond_total_len`,
+  `ipv6_segmentation_ignores_trailing_slack_beyond_payload_len`,
+  `ipv4_segmentation_rejects_declaration_shorter_than_headers` — and restoring
+  the clamp makes them PASS. iperf smoke deferred (unit-test-covered
+  correctness clamp; loss cluster is shim-ABI-walled). Not merged (team-lead
+  re-verifies + merges).
+
 ## 2026-07-11 — #5169 review fold: admit exact-equal generation re-apply (#4036 idempotent retry)
 - **Timestamp**: 2026-07-11 (fix/5169-apply-snapshot-gen-monotonicity, rev-5604 fold)
 - **Action**: Hostile review (rev-5604, MERGE-NEEDS-MINOR) found the exact-equal

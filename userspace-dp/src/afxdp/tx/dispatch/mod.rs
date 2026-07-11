@@ -1498,7 +1498,19 @@ fn forwarded_tcp_may_need_segmentation(
     if is_non_first_fragment(&frame[l3..], meta.addr_family) {
         return false;
     }
-    frame.len().saturating_sub(l3) > mtu
+    // #5141: admit on the IP-DECLARED datagram length, not the raw backing
+    // length. `frame.len() - l3` counts trailing Ethernet slack / appended
+    // bytes that the segmentation builders now clamp away via
+    // `declared_l3_end`. Admitting on the backing length would flag a
+    // within-MTU datagram that merely carries slack as "needs segmentation",
+    // and the builder would then clamp and refuse — a wasted admission plus a
+    // spurious `tcp_segmentation_miss`. Keep this gate in lockstep with the
+    // builders: segment only when the declared datagram itself exceeds the
+    // egress MTU. A truncated/unknown-family L3 header fails closed (no seg).
+    let Some(l3_end) = declared_l3_end(frame, l3, meta.addr_family) else {
+        return false;
+    };
+    l3_end.saturating_sub(l3) > mtu
 }
 
 #[cfg(test)]
