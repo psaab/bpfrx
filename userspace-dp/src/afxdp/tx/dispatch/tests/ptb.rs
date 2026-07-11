@@ -159,6 +159,9 @@ fn run_ptb_dispatch_with_forwarding(
 
 #[test]
 fn oversized_forward_emits_ptb_and_drops_original() {
+    // #5567: emits a PTB — serialise over the shared PacketTooBig bucket so a
+    // concurrent drainer test cannot empty it mid-assertion.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let (bindings, _dbg, reasons) = run_ptb_dispatch(1400);
 
     // PTB enqueued back out the INGRESS binding (slot 0).
@@ -283,6 +286,9 @@ fn forwarding_for_ptb_with_output_term(
 /// enqueued and this assertion fails.
 #[test]
 fn ptb_dropped_by_egress_output_filter_discard() {
+    // #5567: the PTB must be built + pass the token before the output-filter
+    // classify runs, so this drop-attribution test needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let (bindings, _dbg, counters, reasons) =
         run_ptb_dispatch_with_forwarding(forwarding_for_ptb_with_output_term(
             1400,
@@ -319,6 +325,8 @@ fn ptb_dropped_by_egress_output_filter_discard() {
 /// Exceeded `ignores_trigger_matching_output_filter` test.
 #[test]
 fn ptb_ignores_trigger_matching_output_filter() {
+    // #5567: emits a PTB (Some) — needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let (bindings, _dbg, counters, _reasons) =
         run_ptb_dispatch_with_forwarding(forwarding_for_ptb_with_output_term(
             1400,
@@ -345,6 +353,8 @@ fn ptb_ignores_trigger_matching_output_filter() {
 /// `dscp_rewrite: None` makes the asserted rewrite disappear.
 #[test]
 fn ptb_dscp_rewrite_comes_from_classifier_not_none() {
+    // #5567: emits a PTB (Some) — needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let (bindings, _dbg, counters, _reasons) =
         run_ptb_dispatch_with_forwarding(forwarding_for_ptb_with_output_term(
             1400,
@@ -391,4 +401,113 @@ fn ptb_parse_failure_fails_closed_with_parse_error_verdict() {
     );
     assert_eq!(verdict.cos_queue_id, None);
     assert_eq!(verdict.dscp_rewrite, None);
+}
+
+/// #5567 HEADLINE fail-on-revert (PTB sibling of the TE test): a flood of
+/// reply-ELIGIBLE-but-UNBUILDABLE Packet-Too-Big triggers — an oversized-DF
+/// frame whose ingress interface has NO egress object, so `build_frag_needed_v4`
+/// returns None — must NOT consume a PacketTooBig token. Pre-#5567 the token
+/// was spent before the build, so such a flood drained the shared per-reason
+/// bucket and starved buildable PMTUD on another interface (cross-interface
+/// false-deny DoS).
+///
+/// Proof (mirrors the reject path's #3656 H11): pin the PacketTooBig bucket
+/// EMPTY at a far-future epoch (zero refill at the call site's real clock),
+/// then drive the dispatch with a forwarding that FIRES the egress-MTU
+/// decision (egress 80, small MTU) but has NO egress entry for the ingress
+/// interface (ifindex 11), so the PTB is unbuildable. On the fixed code the
+/// build returns None and short-circuits BEFORE `allow_generated_error`, so
+/// the empty bucket is untouched. On a revert the empty-bucket deny bumps the
+/// rate-limited counter → RED. The oversized original is still dropped
+/// (`egress_mtu_exceeded`) — the trigger disposition is unchanged.
+#[test]
+fn ptb_unbuildable_missing_egress_does_not_drain_token_5567() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+        rate_limited_count, reset_bucket_for_test,
+    };
+    let _g = global_bucket_test_lock();
+    let far_future = u64::MAX / 2;
+    reset_bucket_for_test(GeneratedErrorReason::PacketTooBig, far_future);
+    while allow_generated_error_at(GeneratedErrorReason::PacketTooBig, far_future, 1000, 1000) {}
+    let before = rate_limited_count(GeneratedErrorReason::PacketTooBig);
+
+    // `test_forwarding_with_egress_mtu` inserts egress ONLY for the forward
+    // target (ifindex 80); there is NO egress for the ingress interface
+    // (ifindex 11), so `build_frag_needed_v4` returns None: reply-eligible
+    // (the decision fires EmitPacketTooBig) but UNBUILDABLE.
+    let (bindings, _dbg, _counters, reasons) =
+        run_ptb_dispatch_with_forwarding(test_forwarding_with_egress_mtu(1400));
+
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        0,
+        "an unbuildable PTB (no egress for the ingress ifindex) enqueues nothing"
+    );
+    // Trigger disposition unchanged: the oversized original is still dropped.
+    assert!(
+        reasons.iter().any(|r| r == "egress_mtu_exceeded"),
+        "the oversized original must still be dropped: {reasons:?}"
+    );
+    assert_eq!(bindings[1].tx_pipeline.pending_tx_local.len(), 0);
+    assert_eq!(bindings[1].tx_pipeline.pending_tx_prepared.len(), 0);
+    assert_eq!(ingress_recycled_count(&bindings[0]), 1);
+    assert_eq!(
+        rate_limited_count(GeneratedErrorReason::PacketTooBig),
+        before,
+        "unbuildable PTB attempts must NOT touch the shared PacketTooBig token \
+         bucket (pre-#5567 they drained it and starved buildable replies)"
+    );
+    // Restore a full bucket so sibling emission tests are unaffected.
+    reset_bucket_for_test(GeneratedErrorReason::PacketTooBig, 0);
+}
+
+/// #5567 PTB sibling: a BUILDABLE Packet-Too-Big is still rate-limited when the
+/// token is exhausted (rate-limiting preserved), and a buildable PTB under a
+/// full bucket is emitted while consuming a token (the rate-limited counter
+/// does not move on success). The oversized original is dropped in every case.
+#[test]
+fn ptb_buildable_respects_and_consumes_token_5567() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+        rate_limited_count, reset_bucket_for_test,
+    };
+    let _g = global_bucket_test_lock();
+
+    // (1) Exhausted bucket: a BUILDABLE PTB is suppressed and the counter bumps.
+    let far_future = u64::MAX / 2;
+    reset_bucket_for_test(GeneratedErrorReason::PacketTooBig, far_future);
+    while allow_generated_error_at(GeneratedErrorReason::PacketTooBig, far_future, 1000, 1000) {}
+    let before_rl = rate_limited_count(GeneratedErrorReason::PacketTooBig);
+    let (bindings, _dbg, _counters, reasons) =
+        run_ptb_dispatch_with_forwarding(forwarding_for_ptb(1400));
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        0,
+        "a buildable PTB must still be suppressed when the token is exhausted"
+    );
+    assert!(
+        rate_limited_count(GeneratedErrorReason::PacketTooBig) > before_rl,
+        "a rate-limited (buildable) PTB must bump the observable PacketTooBig counter"
+    );
+    assert!(reasons.iter().any(|r| r == "egress_mtu_exceeded"));
+    assert_eq!(ingress_recycled_count(&bindings[0]), 1);
+
+    // (2) Full bucket: the buildable PTB is emitted; the counter does not move.
+    reset_bucket_for_test(GeneratedErrorReason::PacketTooBig, 0);
+    let before_rl = rate_limited_count(GeneratedErrorReason::PacketTooBig);
+    let (bindings, _dbg, _counters, reasons) =
+        run_ptb_dispatch_with_forwarding(forwarding_for_ptb(1400));
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        1,
+        "a buildable PTB under a full bucket must be emitted"
+    );
+    assert_eq!(
+        rate_limited_count(GeneratedErrorReason::PacketTooBig),
+        before_rl,
+        "a successful PTB consumes a token but must not bump the rate-limited counter"
+    );
+    assert!(reasons.iter().any(|r| r == "egress_mtu_exceeded"));
+    reset_bucket_for_test(GeneratedErrorReason::PacketTooBig, 0);
 }

@@ -118,6 +118,9 @@ fn packet_ttl_would_expire_identifies_v4_and_v6() {
 
 #[test]
 fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
+    // #5567: this emission test depends on a non-empty TimeExceeded bucket;
+    // serialise with the drainer tests over the shared global bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
     let frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 1);
@@ -201,6 +204,9 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
 /// never consulted).
 #[test]
 fn build_local_time_exceeded_request_classifies_generated_icmp_on_egress() {
+    // #5567: the reply must be built + pass the token before the output-filter
+    // classify runs, so this drop-attribution test needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
     // The TRIGGER is a UDP flow (proto 17) — proving the egress filter keys
@@ -290,6 +296,8 @@ fn build_local_time_exceeded_request_classifies_generated_icmp_on_egress() {
 /// is classified by its OWN (ICMP) tuple, not the trigger's (UDP).
 #[test]
 fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
+    // #5567: asserts the reply IS built (Some) — needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
     let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client_ip, dst_ip, 1);
@@ -379,6 +387,9 @@ fn build_local_time_exceeded_request_ignores_trigger_matching_output_filter() {
 /// builder returns `Some`, and the `request.is_none()` assert fails RED.
 #[test]
 fn build_local_time_exceeded_request_classifies_on_logical_egress_3026() {
+    // #5567: the reply must be built + pass the token before the output-filter
+    // classify runs, so this drop-attribution test needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
     // TRIGGER is a UDP flow; the generated reply is ICMP (proven elsewhere).
@@ -680,6 +691,8 @@ fn build_local_time_exceeded_v6_quotes_original_packet() {
 /// locally generated Time Exceeded (the suppression gate must NOT fire).
 #[test]
 fn time_exceeded_emitted_for_unicast_udp() {
+    // #5567: asserts the reply IS built (Some) — needs a non-empty bucket.
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
     let client = Ipv4Addr::new(10, 0, 61, 102);
     let server = Ipv4Addr::new(1, 1, 1, 1);
     let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
@@ -957,5 +970,166 @@ fn time_exceeded_suppressed_for_bad_source_v6() {
         !te_request_built(&frame, meta),
         "TE call site must suppress a multicast IPv6 source"
     );
+}
+
+
+// --- #5567 token-after-feasibility tests ---
+
+/// #5567 HEADLINE fail-on-revert: a flood of reply-ELIGIBLE-but-UNBUILDABLE
+/// Time Exceeded triggers (a valid TTL=1 unicast frame whose ingress ifindex
+/// has NO egress object, so the reply cannot be built) must NOT consume a
+/// TimeExceeded rate-limit token. Pre-#5567 the token was spent BEFORE the
+/// egress lookup + build, so each unbuildable attempt drained the shared
+/// per-reason bucket — starving a buildable PMTUD/traceroute reply on ANOTHER
+/// interface (the cross-interface false-deny DoS).
+///
+/// Proof shape (mirrors the reject path's #3656 H11
+/// `unreplyable_reject_does_not_drain_bucket`): pin the TimeExceeded bucket
+/// EMPTY at a far-future epoch so the call site's smaller real
+/// `monotonic_nanos()` yields zero refill and the bucket stays empty across
+/// the calls, then drive N unbuildable attempts. On the fixed code the build
+/// returns None BEFORE `allow_generated_error`, so the empty bucket is never
+/// touched and its rate-limited counter does not move. On a revert (token
+/// before feasibility) each attempt denies against the empty bucket and bumps
+/// the counter → RED. Each attempt also returns None (drop) — the trigger
+/// disposition is unchanged.
+#[test]
+fn te_unbuildable_missing_egress_does_not_drain_token_5567() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+        rate_limited_count, reset_bucket_for_test,
+    };
+    let _g = global_bucket_test_lock();
+    let far_future = u64::MAX / 2;
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, far_future);
+    while allow_generated_error_at(GeneratedErrorReason::TimeExceeded, far_future, 1000, 1000) {}
+    let before = rate_limited_count(GeneratedErrorReason::TimeExceeded);
+
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
+    let meta = ttl_meta_v4();
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    // `ForwardingState::default()` has NO egress for the ingress ifindex (5),
+    // so the v4 builder returns None: the reply is reply-eligible (it passes
+    // the RFC suppression gate + the TTL check) but UNBUILDABLE.
+    let forwarding = ForwardingState::default();
+    let flow = icmp_suppress_flow_v4(client, server);
+    for _ in 0..16 {
+        let mut counters = BatchCounters::default();
+        let req = build_local_time_exceeded_request(
+            &frame,
+            desc,
+            meta,
+            &icmp_suppress_ident(),
+            &flow,
+            &forwarding,
+            &Arc::new(ShardedNeighborMap::new()),
+            &BTreeMap::new(),
+            0,
+            &mut counters,
+        );
+        assert!(
+            req.is_none(),
+            "an unbuildable TE (no egress for the ingress ifindex) must drop the trigger"
+        );
+    }
+    assert_eq!(
+        rate_limited_count(GeneratedErrorReason::TimeExceeded),
+        before,
+        "unbuildable TE attempts must NOT touch the shared TimeExceeded token \
+         bucket (pre-#5567 they drained it and starved buildable replies)"
+    );
+    // Restore a full bucket so sibling emission tests are unaffected.
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, 0);
+}
+
+
+/// #5567: a BUILDABLE Time Exceeded is still rate-limited when the token is
+/// exhausted (rate-limiting preserved), and a normal buildable reply under a
+/// full bucket is emitted while consuming a token (the rate-limited counter
+/// does not move on success). Together with
+/// `te_unbuildable_missing_egress_does_not_drain_token_5567` this pins the
+/// full disposition matrix: unbuildable → drop (no token), buildable+deny →
+/// drop (token consumed), buildable+allow → reply (token consumed).
+#[test]
+fn te_buildable_respects_and_consumes_token_5567() {
+    use crate::afxdp::icmp_ratelimit::{
+        GeneratedErrorReason, allow_generated_error_at, global_bucket_test_lock,
+        rate_limited_count, reset_bucket_for_test,
+    };
+    let _g = global_bucket_test_lock();
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
+    let meta = ttl_meta_v4();
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    // Egress present for the ingress ifindex (5) → the reply is buildable.
+    let forwarding = icmp_suppress_forwarding();
+    let flow = icmp_suppress_flow_v4(client, server);
+
+    // (1) Exhausted bucket: a BUILDABLE reply is suppressed (rate-limited), the
+    // trigger is dropped, and the observable rate-limited counter advances.
+    let far_future = u64::MAX / 2;
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, far_future);
+    while allow_generated_error_at(GeneratedErrorReason::TimeExceeded, far_future, 1000, 1000) {}
+    let before_rl = rate_limited_count(GeneratedErrorReason::TimeExceeded);
+    let mut counters = BatchCounters::default();
+    let req = build_local_time_exceeded_request(
+        &frame,
+        desc,
+        meta,
+        &icmp_suppress_ident(),
+        &flow,
+        &forwarding,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+        &mut counters,
+    );
+    assert!(
+        req.is_none(),
+        "a buildable TE must still be suppressed when the token is exhausted (rate-limiting preserved)"
+    );
+    assert!(
+        rate_limited_count(GeneratedErrorReason::TimeExceeded) > before_rl,
+        "a rate-limited (buildable) TE must bump the observable TimeExceeded counter"
+    );
+
+    // (2) Full bucket: the buildable reply is emitted and consumes a token —
+    // the rate-limited counter does NOT move on a successful emission.
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, 0);
+    let before_rl = rate_limited_count(GeneratedErrorReason::TimeExceeded);
+    let mut counters = BatchCounters::default();
+    let req = build_local_time_exceeded_request(
+        &frame,
+        desc,
+        meta,
+        &icmp_suppress_ident(),
+        &flow,
+        &forwarding,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+        &mut counters,
+    );
+    assert!(
+        req.is_some(),
+        "a buildable TE under a full bucket must be emitted"
+    );
+    assert_eq!(
+        rate_limited_count(GeneratedErrorReason::TimeExceeded),
+        before_rl,
+        "a successful TE consumes a token but must not bump the rate-limited counter"
+    );
+    reset_bucket_for_test(GeneratedErrorReason::TimeExceeded, 0);
 }
 
