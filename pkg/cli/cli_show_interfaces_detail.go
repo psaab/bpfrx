@@ -20,10 +20,16 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 		return links[i].Attrs().Name < links[j].Attrs().Name
 	})
 
-	// Build zone + description lookup from active config
+	// Build zone + description lookup from active config, keyed by the AUTHORED
+	// Junos name (#4984). The netlink walk below yields kernel dash-form names,
+	// so kernelToAuthored maps them back to the authored identity; the zone /
+	// description maps are keyed by that authored form (zone bindings are
+	// logical refs like "ge-0/0/9.0" — strip the unit to a base key) so the
+	// joins actually match instead of being silently blanked.
 	ifZoneMap := make(map[string]string)
 	ifDescMap := make(map[string]string)
 	cfg := c.store.ActiveConfig()
+	kernelToAuthored := kernelToAuthoredMap(cfg)
 	// #4328: reth resolution — a bondless reth has no kernel netdev, so the
 	// netlink walk below never emits it. Build the shared maps so a reth
 	// aggregate is synthesized from config and its physical members are
@@ -36,7 +42,7 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 				continue
 			}
 			for _, ifName := range z.Interfaces {
-				ifZoneMap[ifName] = z.Name
+				ifZoneMap[baseIfName(ifName)] = z.Name
 			}
 		}
 		for _, ifc := range cfg.Interfaces.Interfaces {
@@ -55,7 +61,10 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 		if attrs.Name == "lo" {
 			continue
 		}
-		if filterName != "" && attrs.Name != filterName {
+		// Render the authored Junos identity (ge-0/0/2), not the kernel netdev
+		// name (ge-0-0-2), and accept either spelling as the filter (#4984).
+		dispName := authoredName(kernelToAuthored, attrs.Name)
+		if filterName != "" && !ifaceFilterMatches(filterName, attrs.Name, dispName) {
 			continue
 		}
 		found = true
@@ -70,8 +79,8 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 		if operUp {
 			linkStr = "Up"
 		}
-		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
-		if desc, ok := ifDescMap[attrs.Name]; ok {
+		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", dispName, adminStr, linkStr)
+		if desc, ok := ifDescMap[dispName]; ok {
 			fmt.Printf("  Description: %s\n", desc)
 		}
 		fmt.Printf("  Interface index: %d, SNMP ifIndex: %d\n", attrs.Index, attrs.Index)
@@ -94,7 +103,7 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 		if len(attrs.HardwareAddr) > 0 {
 			fmt.Printf("  Current address: %s\n", attrs.HardwareAddr)
 		}
-		if zone, ok := ifZoneMap[attrs.Name]; ok {
+		if zone, ok := ifZoneMap[dispName]; ok {
 			fmt.Printf("  Security zone: %s\n", zone)
 		}
 
@@ -112,7 +121,7 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 		if attrs.RawFlags&0x1000 != 0 { // IFF_MULTICAST
 			flags = append(flags, "MULTICAST")
 		}
-		fmt.Printf("  Logical interface %s.0\n", attrs.Name)
+		fmt.Printf("  Logical interface %s.0\n", dispName)
 		if len(flags) > 0 {
 			fmt.Printf("    Flags: %s\n", strings.Join(flags, " "))
 		}
@@ -123,7 +132,7 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 			fmt.Printf("    Redundant-ethernet: member of %s\n", rethName)
 			for _, ru := range cfg.RethShowUnits(rethName) {
 				fmt.Printf("    Logical interface %s.%d --> aenet %s.%d\n",
-					attrs.Name, ru.Unit, rethName, ru.Unit)
+					dispName, ru.Unit, rethName, ru.Unit)
 			}
 		}
 

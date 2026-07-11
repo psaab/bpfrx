@@ -1818,6 +1818,24 @@ Physical interface: reth0, Enabled, Physical link is Up
   other variants reported `Not present` / empty / `not found`. All four
   surfaces (summary, detail, extensive, terse) now build the same reth maps via
   `config.RethShowMaps` (CLI + gRPC) so they cannot drift again.
+- **Canonical name identity (#4984):** every `show interfaces` variant renders
+  the **authored Junos name** (`ge-0/0/0`, logical `ge-0/0/0.N`) as the
+  interface identity — never the Linux kernel netdev name (`ge-0-0-0`). The
+  kernel name is an implementation detail used only for lookups. The
+  netlink-driven `detail` / `extensive` / `statistics` presenters previously
+  printed the kernel dash-form name as the identity (and keyed the zone /
+  description joins by the authored name but looked them up by the kernel name,
+  so both were silently blank; an authored-form filter reported `not found`).
+  They now resolve each kernel netdev back to its authored name via a shared
+  `kernelToAuthoredMap` (`config.LinuxIfName` reverse map from the active
+  config), key the zone / description joins by that authored form, and accept
+  **either** spelling as the `<name>` filter (`ifaceFilterMatches`). The summary
+  path additionally resolves each logical unit's address lookup to the kernel
+  VLAN sub-device (`ge-0-0-0.<vlan-id>`) instead of the authored name, so a
+  VLAN unit no longer falls back to the parent and prints the parent's addresses
+  under the sub-unit (was #4884 sub-defect B). `show interfaces queue` is a
+  separate CoS runtime-snapshot surface (`pkg/cli/show_services_cos.go`) and is
+  out of scope here.
 
 ---
 

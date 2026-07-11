@@ -19,6 +19,12 @@ func (c *CLI) showInterfacesStatistics() error {
 		return links[i].Attrs().Name < links[j].Attrs().Name
 	})
 
+	// Render the authored Junos identity (ge-0/0/2) rather than the kernel
+	// netdev name (ge-0-0-2), consistent with the summary / terse / detail /
+	// extensive paths (#4984). The prefix filters below still operate on the
+	// kernel name.
+	kernelToAuthored := kernelToAuthoredMap(c.store.ActiveConfig())
+
 	fmt.Printf("%-16s %15s %15s %15s %15s %10s %10s\n",
 		"Interface", "Input packets", "Input bytes", "Output packets", "Output bytes", "In errors", "Out errors")
 
@@ -33,8 +39,8 @@ func (c *CLI) showInterfacesStatistics() error {
 			continue
 		}
 		fmt.Printf("%-16s %15d %15d %15d %15d %10d %10d\n",
-			name, stats.RxPackets, stats.RxBytes, stats.TxPackets, stats.TxBytes,
-			stats.RxErrors, stats.TxErrors)
+			authoredName(kernelToAuthored, name), stats.RxPackets, stats.RxBytes,
+			stats.TxPackets, stats.TxBytes, stats.RxErrors, stats.TxErrors)
 	}
 	return nil
 }

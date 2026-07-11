@@ -27,11 +27,15 @@ func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
 		return links[i].Attrs().Name < links[j].Attrs().Name
 	})
 
-	// Build zone lookup from active config
+	// Build zone lookup from active config, keyed by the AUTHORED Junos name
+	// (#4984) — the netlink walk yields kernel dash-form names, so kernelToAuthored
+	// maps them back and the joins key by the authored form (zone bindings are
+	// logical refs, so strip the unit to a base key) instead of silently blanking.
 	ifZoneMap := make(map[string]string)
 	ifDescMap := make(map[string]string)
 	ifCfgMap := make(map[string]*config.InterfaceConfig)
 	cfg := c.store.ActiveConfig()
+	kernelToAuthored := kernelToAuthoredMap(cfg)
 	// #4328: reth resolution — synthesize bondless reth aggregates (no kernel
 	// netdev) and annotate physical members with their aenet aggregation.
 	var rethMaps config.RethShowMaps
@@ -42,7 +46,7 @@ func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
 				continue
 			}
 			for _, ifName := range z.Interfaces {
-				ifZoneMap[ifName] = z.Name
+				ifZoneMap[baseIfName(ifName)] = z.Name
 			}
 		}
 		for _, ifc := range cfg.Interfaces.Interfaces {
@@ -62,7 +66,10 @@ func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
 		if attrs.Name == "lo" {
 			continue
 		}
-		if filterName != "" && attrs.Name != filterName {
+		// Render the authored Junos identity (ge-0/0/2), not the kernel netdev
+		// name (ge-0-0-2), and accept either spelling as the filter (#4984).
+		dispName := authoredName(kernelToAuthored, attrs.Name)
+		if filterName != "" && !ifaceFilterMatches(filterName, attrs.Name, dispName) {
 			continue
 		}
 		found = true
@@ -78,11 +85,11 @@ func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
 		if operUp {
 			linkStr = "Up"
 		}
-		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
-		if desc, ok := ifDescMap[attrs.Name]; ok {
+		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", dispName, adminStr, linkStr)
+		if desc, ok := ifDescMap[dispName]; ok {
 			fmt.Printf("  Description: %s\n", desc)
 		}
-		if zone, ok := ifZoneMap[attrs.Name]; ok {
+		if zone, ok := ifZoneMap[dispName]; ok {
 			fmt.Printf("  Security zone: %s\n", zone)
 		}
 		// #4328: annotate a physical reth member with its aenet aggregation.
@@ -90,10 +97,10 @@ func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
 			fmt.Printf("  Redundant-ethernet: member of %s\n", rethName)
 			for _, ru := range cfg.RethShowUnits(rethName) {
 				fmt.Printf("  Logical interface %s.%d --> aenet %s.%d\n",
-					attrs.Name, ru.Unit, rethName, ru.Unit)
+					dispName, ru.Unit, rethName, ru.Unit)
 			}
 		}
-		if ifCfg, ok := ifCfgMap[attrs.Name]; ok {
+		if ifCfg, ok := ifCfgMap[dispName]; ok {
 			if ifCfg.Speed != "" {
 				fmt.Printf("  Configured speed: %s\n", ifCfg.Speed)
 			}
