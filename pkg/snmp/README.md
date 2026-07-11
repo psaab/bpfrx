@@ -179,18 +179,34 @@ sender learned about us via discovery, not our local clock at receive time.
 - DES (`decryptDES`/`encryptDES`, RFC 3414 §8) derives its IV from `privParams`
   XOR the pre-IV salt alone, so boots/time do not enter the DES IV.
 
-**Privacy salt fails closed on RNG error (RFC 3414 §8.2.1, #5453).** The
-per-message privacy salt (`msgPrivacyParameters`) MUST be unpredictable: an
-all-zero salt makes the DES IV a deterministic function of the long-term
-`privKey` (repeated-plaintext-prefix leakage) and makes the AES-128-CFB IV
-constant within a `(boots,time)` second (CFB IV reuse). The salt is generated
-through the injectable `randRead` seam (defaults to `crypto/rand.Read`).
-`encryptDES`/`encryptAES128` **check the `randRead` error** and return it rather
-than proceeding with a zero salt; `encryptPDU` propagates it, and
+**Privacy salt is a monotonic counter, unique per engine boot (RFC 3826 §3.3,
+RFC 3414 §8.1.1.1, #5032).** The privacy salt (`msgPrivacyParameters`) MUST be
+UNIQUE per `(engineBoots, privKey)` so the derived cipher IV never repeats within
+an engine boot — an AES-128-CFB IV repeat leaks the XOR of two plaintexts, and a
+DES-CBC IV repeat (IV = key-derived pre-IV XOR salt) repeats first-block
+structure. Drawing an *independent* random salt per message (the pre-#5032
+behavior) gives only birthday-bound uniqueness. Instead `Agent.nextPrivSalt`
+allocates the salt from a **monotonic 64-bit counter**: seeded ONCE from
+`crypto/rand` (via the injectable `randRead` seam) at first use — an arbitrary
+boot-time start per RFC 3826 §3.3 — and incremented atomically for each
+encryption. `encryptPDU` calls `nextPrivSalt`, threads the returned salt into
+`encryptDES`/`encryptAES128` as the IV/pre-IV input, and echoes it back as the
+on-the-wire `privParams`. `engineBoots` (immutable per boot, monotonic across
+restarts) scopes the counter to the boot: a restart re-randomizes the start and
+advances the AES IV's boots field, so IVs stay unique across reboots too. The
+counter increment is an atomic operation, so concurrent response and trap
+encryption never draw the same salt.
+
+**Fails closed on RNG error at seed time (RFC 3414 §8.2.1, #5453).** The counter
+seed MUST come from good entropy so the starting point is unpredictable. If the
+one-time seed draw fails (getrandom `EAGAIN` at early boot, a FIPS module error),
+`nextPrivSalt` returns an error, `encryptPDU` propagates it, and
 `buildV3Response` **fails closed** — it drops the response (returns `nil`, so no
-datagram is written) instead of downgrading to a plaintext or zero-salt PDU.
-An RNG failure (getrandom `EAGAIN` at early boot, a FIPS module error) therefore
-yields *no reply* to an `authPriv` request, never an insecurely encrypted one.
+datagram is written) rather than emit a PDU built from a zero/predictable salt.
+An RNG failure therefore yields *no reply* to an `authPriv` request, never an
+insecurely encrypted one. Because RFC 3826 consults the RNG only for the seed
+(not per message), a later RNG outage does not block encryption once the counter
+is seeded — fresh entropy per message is neither required nor drawn.
 
 ### engineBoots persistence
 

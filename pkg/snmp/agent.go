@@ -224,6 +224,25 @@ type Agent struct {
 	cfg     *config.SNMPConfig  // authorization + sysContact/Location/Description
 	v3Users map[string]*usmUser // SNMPv3 USM users (keyed by name)
 
+	// privSalt is the SNMPv3 privacy salt source (RFC 3826 §3.3 for AES,
+	// RFC 3414 §8.1.1.1 for DES). The msgPrivacyParameters carried with every
+	// encrypted scopedPDU MUST be UNIQUE per (engineBoots, privKey) so the
+	// derived cipher IV never repeats within an engine boot: an IV repeat under
+	// AES-128-CFB leaks the XOR of two plaintexts, and under DES-CBC (IV =
+	// key-derived preIV XOR salt) repeats the first-block structure
+	// (RFC 3414 §8.2.1). Drawing an INDEPENDENT random salt per message (the
+	// pre-#5032 behavior) gives only birthday-bound uniqueness. Instead the salt
+	// is a MONOTONIC 64-bit counter: seeded ONCE from crypto/rand at first use
+	// (an arbitrary boot-time starting point, RFC 3826 §3.3) and incremented
+	// atomically for each encryption, so successive salts within an engine boot
+	// are guaranteed distinct — not merely probably distinct. engineBoots
+	// (immutable per boot, monotonic across restarts) scopes it to the boot, so a
+	// restart re-randomizes the start and advances the AES IV's boots field.
+	// See Agent.nextPrivSalt.
+	privSalt       atomic.Uint64
+	privSaltSeeded atomic.Bool
+	privSaltMu     sync.Mutex // serializes the one-time seed draw
+
 	// Asynchronous trap delivery (#2991). Link-state traps are emitted from
 	// the daemon's netlink link-monitor goroutine; sendTrap does a blocking
 	// net.DialTimeout (and DNS resolution for an FQDN target) that, done

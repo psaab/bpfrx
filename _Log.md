@@ -45382,6 +45382,45 @@ top.
 - **Action**: Fix #5047 control-plane liveness gap: RunFabricListener (pkg/grpcapi/server.go) treated an lc.Listen failure as TERMINAL (return) and its Serve goroutine only slog.Warn'd while the owner blocked on ctx.Done — so a transient bind/device error OR a later Serve fault PERMANENTLY removed the network-exposed peer-proxy gRPC surface (monitor / peer-show / proxied-failover) until the whole cluster-comms lifecycle restarted; single-fabric deployments had no fallback. Rewrote it as a supervisor loop (superviseFabricListener) mirroring the project's monitorFabricState/runFabricStateSubscription pattern: bind → serve → on a fault (bind failure OR a Serve error that is NOT ctx-cancel/grpc.ErrServerStopped) retry after a BOUNDED exponential backoff (100ms base, 5s cap, reset to base after a Serve that stayed up >=30s) while ctx is live — keeps retrying a persistent bind failure at the cap without spinning, never gives up permanently. Expected graceful shutdown (ctx cancel → serveUntilDone returns nil; grpc.ErrServerStopped via errors.Is) exits cleanly, no retry. No goroutine outlives ctx (reuses serveUntilDone's buffered-errCh worker + bounded stopGRPCServer). Extracted buildFabricServer() (the #4107 auth + #4122 allowlist interceptor chains) and the fabricSupervisorConfig listen/serve seams for injection. Published per-bind up/down health via setFabricListenerUp / FabricListenerUp(addr) / FabricListenerHealth() for a status surface; transitions log at Info(up/stopped)/Warn(bind-fail/serve-fault), retry ticks at Debug (logging rules). Caller (daemon_ha_sync.go:582,585) unchanged — signature identical, supervision is internal. Tests (server_fabric_listener_5047_test.go, -race): (a) transient bind failures → REAL serve path (buildFabricServer+serveUntilDone over bufconn) recovers, health down→up; (b) ctx-cancel → supervisor + serve worker exit promptly, no leak, listen called once; (c) grpc.ErrServerStopped (wrapped) → clean exit, NOT retried; (d) persistent bind failure → bounded backoff, retry count under window/cap bound (no spin). RED-on-revert proven: patching the loop back to the pre-#5047 terminal return makes (a) [never comes up] and (d) [only 1 attempt] FAIL. Full pkg/grpcapi + pkg/daemon -race suites green.
 - **File(s)**: pkg/grpcapi/server.go, pkg/grpcapi/server_fabric_listener_5047_test.go, pkg/grpcapi/README.md, _Log.md
 
+## 2026-07-10 — #5032 SNMPv3 privacy salt uniqueness (monotonic counter)
+- **Timestamp**: 2026-07-10
+- **Action**: Fix #5032 (codex-review-177 [A9-b1-F10], Low): SNMPv3 privacy
+  parameters were INDEPENDENT random draws (`rand.Read(privParams)` per call in
+  `encryptDES`/`encryptAES128`) with no per-key uniqueness state, so IV
+  uniqueness was only birthday-bound — RFC 3826 §3.1.2.1/§3.3 (AES) and
+  RFC 3414 §8.1.1.1 (DES) require the salt to be UNIQUE per (engineBoots,key).
+  A DES-CBC IV = pre-IV XOR salt repeat leaks first-block structure; an
+  AES-128-CFB IV = boots||time||salt repeat leaks plaintext XORs. Replaced the
+  per-message random draw with a MONOTONIC 64-bit salt counter
+  (`Agent.nextPrivSalt`, v3.go): seeded ONCE from crypto/rand (via the `randRead`
+  seam) at first use — arbitrary boot-time start per RFC 3826 §3.3 — then
+  incremented atomically (`privSalt atomic.Uint64`) for each encryption, so
+  successive salts within an engine boot are guaranteed distinct, not merely
+  probably distinct. `encryptPDU` allocates the salt and threads it into
+  `encryptDES(privKey,data,salt)` / `encryptAES128(privKey,data,salt,boots,time)`
+  (signatures changed to take the salt explicitly, return just ciphertext+err;
+  caller echoes the salt as wire privParams). Preserved the RFC IV construction
+  (preIV^salt for DES, boots||time||salt for AES) and the #5453 fail-closed
+  guarantee — relocated to the seed: if the one-time seed draw fails,
+  nextPrivSalt errors, encryptPDU propagates, buildV3Response drops the datagram
+  (never a zero/predictable-salt PDU). Thread-safe: one-time seed under
+  `privSaltMu`, each allocation a single atomic increment (concurrent response +
+  trap encryption never collide). engineBoots (immutable per boot, monotonic
+  across restarts) scopes the counter so a reboot re-randomizes the start.
+  Tests: new v3_priv_salt_5032_test.go — TestPrivSaltMonotonicUnique (strict +1
+  monotonic + uniqueness over 100k), TestEncryptPDUDistinctSaltsPerMessage
+  (end-to-end via encryptPDU, +1 monotonic privParams over 2k),
+  TestPrivSaltConcurrentUnique (16×5000 goroutines, all distinct, -race clean).
+  Rewrote v3_rand_failclosed_test.go to assert fail-closed at the new seed layer
+  (TestPrivSalt_RNGFailClosed, TestBuildV3Response_RNGFailClosed with a fresh
+  never-seeded agent) + supplied-salt roundtrip/length-validation. Updated
+  callers in agent_test.go, v3_seclevel_test.go, v3_priv_iv_test.go to the new
+  signature (shared testPrivSalt helper). RED-on-revert PROVEN: patching
+  nextPrivSalt back to an independent random draw makes both monotonic tests FAIL
+  at i=1. `go build ./...` + `go test ./pkg/snmp/...` (and -race subset) green.
+- **File(s)**: pkg/snmp/v3.go, pkg/snmp/agent.go, pkg/snmp/v3_priv_salt_5032_test.go,
+  pkg/snmp/v3_rand_failclosed_test.go, pkg/snmp/agent_test.go,
+  pkg/snmp/v3_seclevel_test.go, pkg/snmp/v3_priv_iv_test.go, pkg/snmp/README.md, _Log.md
 ## 2026-07-10 — #5064 EventBuffer drop-visibility (seq + overrun + metric)
 - **Timestamp**: 2026-07-10
 - **Action**: Fix #5064 forensic-observability gap in the EventBuffer fan-out. `Add` fanned out non-blocking and took `default: // drop if subscriber is slow` on a full subscriber channel with NO counter, NO status, and NO sequence on the delivered record — a slow REST-SSE / gRPC event-stream / CLI-monitor consumer silently lost security/audit records and a forensic reader could not tell a gapped stream from a complete one. Fix adds three independent, in-band loss signals. (1) BufSeq: `Add` now stamps the buffer's monotonic publish sequence (`eb.seq`, from 1) onto every record BEFORE storing/fanning out — the SAME value stored in the ring, so a live subscriber and a `Latest()` snapshot agree; a BufSeq discontinuity between two delivered records pinpoints exactly which records were shed. Distinct from the reader-scoped `EventSeq` (#4915), which is 0 for the direct `Add` callers (health probes, HA replay). (2) Drop counters: per-subscriber `Subscription.dropped` (`atomic.Uint64`, accessor `Dropped()`) and aggregate `EventBuffer.droppedTotal` (accessor `DroppedTotal()`) increment on the drop path — no slog in the per-record path (CLAUDE.md logging rule). (3) Overrun flag: the fan-out arms a per-subscriber `overrun atomic.Bool` on a drop and stamps `EventRecord.Overrun=true` on the next successfully delivered record (per-subscriber copy so it is subscriber-scoped), giving a consumer that is not tracking BufSeq an explicit in-band "you lost records" signal; cleared once delivered. Exported the aggregate as Prometheus `xpf_event_stream_subscriber_dropped_total` (new `xpfCollector.eventStreamSubscriberDropped` desc, Describe+Collect emit guarded by `srv.eventBuf != nil`; declared-but-conditional emit is safe under the pedantic descriptor-coverage canary). Fan-out mutation is race-free (atomics; RLock unchanged). RED-on-revert PROVEN: restoring the old no-op `default` branch + dropping the BufSeq stamp fails `TestEventBufferDropVisibility` (sub.Dropped()=0, want 3). Gates: `go build ./...` green, `go test ./pkg/logging/... ./pkg/api/...` green, `-race` on the new tests green.
