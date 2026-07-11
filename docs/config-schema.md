@@ -4489,12 +4489,24 @@ zone-isolation failure the lenient warning falsely claimed was quarantined.
 by more than one name, keeps the **sorted-first** name (the survivor) and
 quarantines the rest. It is a pure function of the name set, so both HA nodes and
 a cold-booting node agree. The userspace builder's `quarantineCollidingZones`
-(`pkg/dataplane/userspace/zones.go`) applies it to the built snapshot BEFORE
-publish: it **drops** the quarantined `ZoneSnapshot`, **unzones** any interface
-bound to it (`Zone=""` → default-deny, fail closed), and **drops** any policy
-whose from/to zone is quarantined (leaving a dangling policy→zone reference would
+(`pkg/dataplane/userspace/zones_quarantine.go`) applies it to the built snapshot
+BEFORE publish: it **drops** the quarantined `ZoneSnapshot`, **unzones** any
+interface bound to it (`Zone=""` → default-deny, fail closed), and scrubs the
+quarantined zone out of policies (leaving a dangling policy→zone reference would
 trip the Rust `UnresolvableZoneReference` preflight and reject the WHOLE snapshot
-— a brick on a fresh boot). The rest of the config still loads (#1960 no-brick).
+— a brick on a fresh boot). The policy scrub distinguishes two cases (#5577):
+a rule whose **structurally-required** zone is quarantined is **dropped** — the
+singular `FromZone`/`ToZone` of a zone-pair rule, or a scoped-global match side
+left with **no** surviving member after pruning; but a scoped-global policy's
+plural match-zone SET (`MatchFromZones`/`MatchToZones`, #4626 M03) has only the
+colliding member(s) **pruned**, so a multi-zone deny scoped from `[z174, z214]`
+where only `z214` collides **survives** scoped to `[z174]`. Dropping the whole
+rule there would be **fail-open**: surviving-zone (`z174`) traffic would no longer
+hit the deny and would reach a later/default permit while the snapshot publishes
+successfully. After pruning, the singular `MatchFromZone`/`MatchToZone` is
+regenerated from the surviving set (`config.ScopeSingular`) so an old Rust helper
+that reads only the singular field also sees a surviving, non-quarantined zone.
+The rest of the config still loads (#1960 no-brick).
 The id→name reverse maps resolve a colliding id to the survivor deterministically
 (`config.StableZoneIDOwner`; `pkg/cli/apply.go:syslogZoneNameMap`,
 `pkg/dataplane/userspace/manager_ha.go:zoneNameByID`) rather than to whichever
@@ -4506,7 +4518,10 @@ is paged until one zone is renamed. Regression coverage:
 `TestStableZoneIDOwnerReturnsSurvivor`,
 `TestZoneIDCollisionLenientWarningStatesQuarantine`),
 `pkg/dataplane/userspace/zones_collision_3719_test.go`
-(`TestBuildSnapshotQuarantinesCollidingZone` — RED-on-revert), and
+(`TestBuildSnapshotQuarantinesCollidingZone`,
+`TestQuarantinePrunesScopedGlobalMemberNotWholeRule`,
+`TestBuildSnapshotPrunesScopedGlobalMemberFromRealPath` — the #5577
+prune-vs-drop guards, RED-on-revert), and
 `pkg/cli/apply_syslog_zonemap_3704_test.go`
 (`TestSyslogZoneNameMapCollisionResolvesToSurvivor`). A defense-in-depth Rust
 backstop `SnapshotIntegrityError::DuplicateZoneId` (`zones::reject_duplicate_zone_ids`,

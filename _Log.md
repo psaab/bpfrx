@@ -1,3 +1,35 @@
+## 2026-07-11 — #5577 dataplane/userspace: prune quarantined member from scoped-global deny (fail-open fix)
+- **Timestamp**: 2026-07-11 (fix/5577-quarantine-scoped-global-member)
+- **Action**: `quarantineCollidingZones` (pkg/dataplane/userspace/zones_quarantine.go)
+  built `zones := {FromZone, ToZone, MatchFromZone, MatchToZone} + MatchFromZones
+  + MatchToZones` and DROPPED the WHOLE policy if ANY element was quarantined
+  (#4626 M03). For a SCOPED-GLOBAL policy whose match-zone context is a zone SET
+  (plural MatchFromZones/MatchToZones), dropping the whole rule because ONE member
+  collided is FAIL-OPEN: a global deny scoped from `[z174, z214]` where only
+  `z214` collides was dropped ENTIRELY, so surviving-zone (z174) traffic no longer
+  hit the deny and reached a later/default permit while the snapshot published
+  successfully (#5577). Replaced the any-member-drops logic with a prune-vs-drop
+  distinction: (1) a structurally-required zone quarantined -> DROP the rule (a
+  zone-pair singular FromZone/ToZone, or a scoped-global match side with NO
+  surviving member after pruning — leaving it empty would broaden to all zones);
+  (2) a scoped-global's plural match-zone SET has only the colliding member(s)
+  PRUNED and the deny SURVIVES scoped to the survivors. After pruning, the
+  singular MatchFromZone/MatchToZone is regenerated from the surviving set
+  (config.ScopeSingular) so an old Rust helper reading only the singular field
+  never sees the dropped zone. Prune allocates a NEW slice (MatchFromZones aliases
+  the source config's pol.Match slices — no in-place mutation). Go snapshot-builder
+  fix only; no userspace-dp/*.rs change (the Rust build_global_zone_scope already
+  consumes the pruned plural/singular set unchanged).
+- **Validation**: RED-on-revert proven (stash zones_quarantine.go → the two
+  #5577 prune tests fail: the multi-zone deny is dropped, fail-open; the zone-pair
+  drop guard stays green). `go build ./...` + `go test ./pkg/dataplane/userspace/...
+  ./pkg/config/...` green (pre-existing unrelated flake:
+  TestEventStreamDataplaneEventBeforeCallbackQueuesUntilCallback fails on clean
+  origin/master a86cc1351 too). gofmt -w applied.
+- **File(s)**: pkg/dataplane/userspace/zones_quarantine.go,
+  pkg/dataplane/userspace/zones_collision_3719_test.go, docs/config-schema.md,
+  _Log.md
+
 ## 2026-07-11 — #5574 config compiler: reject conflicting direct-scalar application leaves
 - **Timestamp**: 2026-07-11 (fix/5574-app-scalar-conflict-reject)
 - **Action**: `compileApplications` (pkg/config/compiler_applications.go)
