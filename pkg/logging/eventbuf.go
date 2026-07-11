@@ -3,6 +3,7 @@ package logging
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -75,6 +76,27 @@ type EventRecord struct {
 	// session's create with its close. It is 0 on records produced by
 	// DecodeRawEventRecord (which has no reader-scoped counter).
 	EventSeq uint64
+	// BufSeq is the EventBuffer's own publish sequence (#5064). Unlike
+	// EventSeq (reader-scoped, and 0 for the direct Add callers — health
+	// probes, HA event replay), BufSeq is stamped by EventBuffer.Add on
+	// EVERY record that transits the ring, from 1 and strictly monotonic per
+	// buffer. It is the same value stored in the ring, so a live subscriber
+	// and a Latest() snapshot agree. A subscriber detects lost records by a
+	// discontinuity: two consecutively delivered records whose BufSeq differs
+	// by more than 1 means the intervening records were dropped because the
+	// subscriber's channel was full. 0 means the record never went through
+	// Add (a bare EventRecord literal or DecodeRawEventRecord).
+	BufSeq uint64
+	// Overrun is set on the FIRST record delivered to a subscriber after that
+	// subscriber missed one or more records to a full channel (#5064). It
+	// gives a consumer that is not tracking BufSeq an explicit "you lost
+	// records" signal in-band; the exact count is the per-subscription
+	// Dropped() counter. It is per-delivery (subscriber-scoped): the same
+	// underlying event is delivered with Overrun=true only to the subscriber
+	// that gapped, and the flag is cleared once that subscriber receives it.
+	// It is always false on records returned by Latest()/LatestFiltered()
+	// (the ring copy is never overrun-flagged).
+	Overrun bool
 }
 
 // EventBuffer is a thread-safe circular buffer for recent events.
@@ -89,6 +111,13 @@ type EventBuffer struct {
 	subMu   sync.RWMutex
 	subs    map[*Subscription]struct{}
 	maxSubs int // cap on concurrent subscribers (0 = unbounded)
+
+	// droppedTotal counts records lost across ALL subscribers because a
+	// subscriber's channel was full when Add fanned out (#5064). It is the
+	// aggregate drop metric the intentionally-lossy fan-out must expose so a
+	// slow REST-SSE / gRPC / CLI-monitor consumer silently shedding security
+	// records is visible (surfaced as xpf_event_stream_subscriber_dropped_total).
+	droppedTotal atomic.Uint64
 }
 
 // Subscription receives new events from an EventBuffer.
@@ -96,6 +125,16 @@ type Subscription struct {
 	C    chan EventRecord
 	eb   *EventBuffer
 	once sync.Once
+
+	// dropped counts records this specific subscriber lost because its
+	// channel C was full when Add tried to deliver (#5064). Exposed via
+	// Dropped() so the consumer (or a test) can observe its own loss; a
+	// nonzero value means the stream this subscriber saw is gapped.
+	dropped atomic.Uint64
+	// overrun is armed when a delivery to this subscriber is dropped and
+	// disarmed once the next record is delivered carrying EventRecord.Overrun
+	// (#5064). It is the per-subscriber state behind the in-band overrun flag.
+	overrun atomic.Bool
 }
 
 // Close unsubscribes and closes the channel (#3384). It honors the documented
@@ -147,25 +186,68 @@ func NewEventBuffer(size int) *EventBuffer {
 
 // Add appends an event to the buffer, overwriting the oldest if full.
 // Subscribers are notified non-blocking.
+//
+// Every record is stamped with the buffer's monotonic BufSeq before it is
+// stored and fanned out (#5064), so both the ring copy and every delivered
+// copy carry the same sequence. The fan-out is intentionally lossy — a
+// subscriber whose channel is full is skipped rather than blocking Add — but
+// the loss is now observable: the record is counted (per-subscriber Dropped()
+// and the aggregate DroppedTotal()), the next delivery to that subscriber
+// carries Overrun=true, and the BufSeq discontinuity marks exactly which
+// records were shed. A forensic consumer can no longer mistake a gapped
+// stream for a complete one.
 func (eb *EventBuffer) Add(rec EventRecord) {
 	eb.mu.Lock()
+	eb.seq++
+	rec.BufSeq = eb.seq
 	eb.buf[eb.head] = rec
 	eb.head = (eb.head + 1) % eb.size
 	if eb.count < eb.size {
 		eb.count++
 	}
-	eb.seq++
 	eb.mu.Unlock()
 
 	eb.subMu.RLock()
 	for sub := range eb.subs {
+		// Per-subscriber copy: the Overrun flag is subscriber-scoped (only
+		// the subscriber that gapped sees it), and the record must not be
+		// mutated in place while other subscribers still receive it.
+		out := rec
+		if sub.overrun.Load() {
+			out.Overrun = true
+		}
 		select {
-		case sub.C <- rec:
-		default: // drop if subscriber is slow
+		case sub.C <- out:
+			// Delivered. If this record carried the overrun flag, disarm it
+			// so the next delivery is clean — the consumer has now been told
+			// it missed records.
+			if out.Overrun {
+				sub.overrun.Store(false)
+			}
+		default:
+			// Channel full: the record is lost for THIS subscriber. Count it
+			// (per-subscriber + aggregate) and arm the overrun flag so the
+			// next successful delivery signals the gap in-band. The BufSeq
+			// discontinuity marks the loss regardless. #5064.
+			sub.dropped.Add(1)
+			eb.droppedTotal.Add(1)
+			sub.overrun.Store(true)
 		}
 	}
 	eb.subMu.RUnlock()
 }
+
+// DroppedTotal returns the aggregate number of records dropped across all
+// subscribers because a subscriber's channel was full when Add fanned out
+// (#5064). It is monotonic for the life of the buffer and is the aggregate
+// drop metric exported to Prometheus.
+func (eb *EventBuffer) DroppedTotal() uint64 { return eb.droppedTotal.Load() }
+
+// Dropped returns the number of records THIS subscriber lost because its
+// channel was full when Add tried to deliver (#5064). A nonzero value means
+// the stream this subscriber observed is gapped; the gaps are locatable via
+// the BufSeq discontinuities on the records it did receive.
+func (s *Subscription) Dropped() uint64 { return s.dropped.Load() }
 
 // Subscribe returns a Subscription that receives new events.
 // Call Close() on the subscription when done.

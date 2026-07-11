@@ -275,6 +275,15 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, float64(st.QueueDepth))
 	}
 
+	// #5064: aggregate EventBuffer fan-out drops. The security/audit event
+	// stream sheds records non-blocking when a subscriber's channel is full;
+	// this counter makes that otherwise-silent loss visible so a gapped
+	// forensic stream is not mistaken for a complete one.
+	if c.srv.eventBuf != nil {
+		ch <- prometheus.MustNewConstMetric(c.eventStreamSubscriberDropped,
+			prometheus.CounterValue, float64(c.srv.eventBuf.DroppedTotal()))
+	}
+
 	// #1895: currently-failed RPM probe-pin installs. Nonzero means
 	// next-hop-pinned tests are holding state (their uplinks are not
 	// being health-checked) until a pin retry succeeds.
