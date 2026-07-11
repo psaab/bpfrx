@@ -302,6 +302,50 @@ class RGStateFlappedTests(unittest.TestCase):
             poll = _write(t, "rg.txt", "")
             self.assertEqual(orch.cmd_rg_state_flapped(self._make_args(poll)), 2)
 
+    def test_poll_failed_marker_forces_undetermined(self):
+        # C175-HC-083 fail-on-revert: surrounding samples look stable but
+        # a poll FAILED in the gap (POLL_FAILED sentinel). A failover
+        # could hide there, so the result must be undetermined (2), not
+        # stable (1). Before the fix the marker line would have been read
+        # as a differing triple and reported as a (spurious) DRIFT (0).
+        with tempfile.TemporaryDirectory() as t:
+            content = "\n".join([
+                "1000\trg=1\tnode=0\tstate=primary",
+                "1000\trg=1\tnode=1\tstate=secondary",
+                "1500\trg=?\tnode=?\tstate=POLL_FAILED",
+                "2000\trg=1\tnode=0\tstate=primary",
+                "2000\trg=1\tnode=1\tstate=secondary",
+            ]) + "\n"
+            poll = _write(t, "rg.txt", content)
+            self.assertEqual(orch.cmd_rg_state_flapped(self._make_args(poll)), 2)
+
+    def test_real_drift_still_wins_over_poll_failed(self):
+        # A genuine flap is still a DRIFT (0) even if a later poll failed.
+        with tempfile.TemporaryDirectory() as t:
+            content = "\n".join([
+                "1000\trg=1\tnode=0\tstate=primary",
+                "1000\trg=1\tnode=1\tstate=secondary",
+                "2000\trg=1\tnode=0\tstate=secondary",
+                "2000\trg=1\tnode=1\tstate=primary",
+                "3000\trg=?\tnode=?\tstate=POLL_FAILED",
+            ]) + "\n"
+            poll = _write(t, "rg.txt", content)
+            self.assertEqual(orch.cmd_rg_state_flapped(self._make_args(poll)), 0)
+
+    def test_expected_samples_shortfall_returns_2(self):
+        class A:
+            pass
+        a = A()
+        a.expected_samples = 5
+        with tempfile.TemporaryDirectory() as t:
+            content = "\n".join([
+                "1000\trg=1\tnode=0\tstate=primary",
+                "2000\trg=1\tnode=0\tstate=primary",
+            ]) + "\n"
+            a.poll_file = _write(t, "rg.txt", content)
+            # Only 2 of 5 expected samples -> coverage too sparse.
+            self.assertEqual(orch.cmd_rg_state_flapped(a), 2)
+
 
 class CoSFixtureParseTests(unittest.TestCase):
     def test_parses_exact_class_cap_from_scheduler_rate(self):

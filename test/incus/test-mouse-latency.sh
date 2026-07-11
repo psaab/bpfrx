@@ -290,10 +290,23 @@ RG_POLL_FILE="${OUT_DIR}/rg-state-poll.txt"
     end_t=$(($(date +%s) + DURATION + SETTLE_BUDGET + SLACK + 5))
     while [[ $(date +%s) -lt $end_t ]]; do
         ts=$(date +%s%3N)
-        incus_exec "$PRIMARY" cli -c "show chassis cluster status" 2>/dev/null \
-            | python3 "${SCRIPT_DIR}/mouse_latency_orchestrate.py" \
-                  parse-cluster-state "$ts" \
-            >> "$RG_POLL_FILE" 2>/dev/null || true
+        # C175-HC-083: record every tick. A failed cli poll or an empty
+        # parse must leave a POLL_FAILED sentinel so rg-state-flapped can
+        # see the gap (a failover hiding in a dropped poll must not read
+        # as "stable"). The old `... | ... >> file || true` appended
+        # nothing on failure, making the gap invisible.
+        if status_out=$(incus_exec "$PRIMARY" cli -c "show chassis cluster status" 2>/dev/null); then
+            parsed=$(printf '%s\n' "$status_out" \
+                | python3 "${SCRIPT_DIR}/mouse_latency_orchestrate.py" \
+                      parse-cluster-state "$ts" 2>/dev/null || true)
+            if [[ -n "$parsed" ]]; then
+                printf '%s\n' "$parsed" >> "$RG_POLL_FILE"
+            else
+                printf '%s\trg=?\tnode=?\tstate=POLL_FAILED\n' "$ts" >> "$RG_POLL_FILE"
+            fi
+        else
+            printf '%s\trg=?\tnode=?\tstate=POLL_FAILED\n' "$ts" >> "$RG_POLL_FILE"
+        fi
         sleep 1
     done
 ) &

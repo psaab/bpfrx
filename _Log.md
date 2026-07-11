@@ -45674,3 +45674,11 @@ top.
   empty. Deterministic-seed behavior preserved. New test file.
 - **File(s)**: test/incus/step1-rss-multinomial.py,
   test/incus/step1-rss-multinomial_test.py (new)
+- **Timestamp**: 2026-07-10
+- **Action**: HC-083 — RG 1 Hz poller now writes a POLL_FAILED sentinel per
+  failed/empty tick; cmd_rg_state_flapped returns 2 (undetermined) on any
+  POLL_FAILED marker or --expected-samples shortfall when no drift is seen
+  (drift still wins). Added 3 orchestrate tests.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/test-mouse-latency.sh,
+  test/incus/mouse_latency_orchestrate_test.py

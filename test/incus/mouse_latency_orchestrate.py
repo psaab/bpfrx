@@ -619,21 +619,38 @@ def cmd_parse_cluster_state(args: argparse.Namespace) -> int:
     return 0
 
 
+POLL_FAILED_STATE = "state=POLL_FAILED"
+
+
 def cmd_rg_state_flapped(args: argparse.Namespace) -> int:
-    """Exit 0 if state drifted from initial; 1 if stable; 2 if no data.
+    """Exit 0 if state drifted from initial; 1 if stable; 2 if undetermined.
 
     R1 HIGH 5: an empty poll file means the orchestrator never got a
     successful cli sample. Returning 1 ("stable") would silently pass
     a contaminated rep. Return 2 instead so the orchestrator can
     invalidate.
+
+    C175-HC-083: the 1 Hz poller pipes each `cli` sample with `|| true`,
+    so a failed poll (cli error or empty status) appended nothing and the
+    gap was invisible. A failover that happened entirely inside such a
+    gap left the surrounding successful samples looking identical, so the
+    rep passed "stable" even though the RG flapped. The poller now writes
+    a `state=POLL_FAILED` sentinel line for every failed tick; any such
+    marker means a failover-in-gap cannot be ruled out, so a
+    no-drift result becomes undetermined (2), not stable (1). An optional
+    `--expected-samples` floor catches missing ticks even without markers.
     """
     by_ts: "dict[str, set]" = {}
+    failed_ts: "set[str]" = set()
     with open(args.poll_file) as f:
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) != 4:
                 continue
             ts, rg_part, node_part, state_part = parts
+            if state_part == POLL_FAILED_STATE:
+                failed_ts.add(ts)
+                continue
             triple = (rg_part, node_part, state_part)
             by_ts.setdefault(ts, set()).add(triple)
     if not by_ts:
@@ -653,6 +670,24 @@ def cmd_rg_state_flapped(args: argparse.Namespace) -> int:
             for t in initial - triples:
                 print(f"DRIFT at {ts}: disappeared {t}")
             return 0
+    # No drift in the successful samples. But a failover could hide in a
+    # poll gap, so failed ticks or a shortfall vs the expected cadence
+    # make "stable" unprovable — return undetermined instead.
+    if failed_ts:
+        print(
+            f"{len(failed_ts)} RG poll(s) failed (POLL_FAILED); cannot "
+            "certify stable — a failover in the gap cannot be ruled out",
+            file=sys.stderr,
+        )
+        return 2
+    expected_samples = getattr(args, "expected_samples", None)
+    if expected_samples is not None and len(by_ts) < expected_samples:
+        print(
+            f"only {len(by_ts)} of {expected_samples} expected RG samples; "
+            "poll coverage too sparse to certify stable",
+            file=sys.stderr,
+        )
+        return 2
     return 1
 
 
@@ -704,6 +739,18 @@ def main() -> int:
 
     p4 = sub.add_parser("rg-state-flapped")
     p4.add_argument("poll_file")
+    p4.add_argument(
+        "--expected-samples",
+        type=int,
+        default=None,
+        help=(
+            "Minimum number of successful 1 Hz RG samples expected for the "
+            "poll window. If fewer distinct samples were collected, poll "
+            "coverage is too sparse to certify stable and the result is "
+            "undetermined (exit 2). Optional; POLL_FAILED markers already "
+            "force undetermined regardless of this floor."
+        ),
+    )
     p4.set_defaults(func=cmd_rg_state_flapped)
 
     args = parser.parse_args()
