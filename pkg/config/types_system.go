@@ -1077,6 +1077,16 @@ type DHCPRelayGroup struct {
 	// binding), and it always inserts Option 82 (circuit-id).
 	ForwardOnly      bool
 	RelayAgentOption bool
+	// TrustOption82 marks this group's interfaces as TRUSTED relay uplinks
+	// (Junos `overrides trust-option-82`) — the RFC 3046 §2.1 anti-spoofing
+	// trust knob (#5414). ENFORCED. When false (the default) an interface is
+	// an UNTRUSTED client-facing segment: a nonzero inbound giaddr (and any
+	// Option 82) is treated as client-forged and NOT trusted — the relay
+	// overwrites giaddr with its own address and re-stamps Option 82 per RFC
+	// 951/1542 first-hop rules. When true the interface faces a downstream
+	// relay, so an inbound nonzero giaddr + Option 82 is preserved untouched
+	// (the RFC 1542 §4.1 intermediate-relay behavior, #5071).
+	TrustOption82 bool
 }
 
 // SamplingConfig holds sampling instance definitions.

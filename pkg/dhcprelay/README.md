@@ -48,45 +48,67 @@ The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
 real `ciaddr`" UDP-unicast row — the client already owns and ARP-answers for
 its address.
 
-## Relay chaining — giaddr / Option 82 ownership (#5071)
+## Relay chaining — giaddr / Option 82 ownership (#5071, #5414)
 
 The forward loop distinguishes a **first-hop** relay from an **intermediate**
 relay in a chain by inspecting the inbound BOOTREQUEST's `giaddr`
-(`GatewayIPAddr`), per RFC 1542 §4.1.1 / RFC 3046:
+(`GatewayIPAddr`), per RFC 1542 §4.1.1 / RFC 3046. Critically, a non-zero
+`giaddr` is trusted as a genuine downstream-relay stamp **only on a trusted
+relay uplink** (`overrides trust-option-82`, #5414); on the default untrusted
+client-facing interface it is treated as client-forged and overwritten:
 
-| Inbound `giaddr` | `giaddr` action | Option 82 action | `hops` |
-|------------------|-----------------|------------------|--------|
-| `0.0.0.0` (first hop) | **stamp** this relay's interface IP | **insert** `circuit-id` = interface name | increment (after limit check) |
-| non-zero (chained) | **preserve** untouched | **preserve** the downstream option untouched (no `Del`/overwrite) | increment (after limit check) |
+| Interface trust | Inbound `giaddr` | `giaddr` action | Option 82 action | `hops` |
+|-----------------|------------------|-----------------|------------------|--------|
+| any | `0.0.0.0` (first hop) | **stamp** this relay's interface IP | **insert** `circuit-id` = interface name | increment (after limit check) |
+| **untrusted** (default) | non-zero (client-forged) | **overwrite** with this relay's IP | **strip + re-insert** this relay's `circuit-id` | increment (after limit check) |
+| **trusted** (`trust-option-82`) | non-zero (downstream relay) | **preserve** untouched | **preserve** the downstream option untouched (no `Del`/overwrite) | increment (after limit check) |
 
 The **first relay on the client segment owns both fields**: the server selects
 the client's address pool from the `giaddr` it sees and unicasts its
 `OFFER`/`ACK` back to `giaddr:67`, and the original `circuit-id` must survive so
-the operator's per-port Option 82 policy still applies at the server. An
-intermediate relay that overwrote `giaddr` would make the server lease from the
-wrong pool and reply to the wrong relay; overwriting Option 82 would destroy the
-downstream `circuit-id`. So on a chained request this relay changes **only** the
-BOOTP `hops` field.
+the operator's per-port Option 82 policy still applies at the server. On a
+**trusted** uplink an intermediate relay that overwrote `giaddr` would make the
+server lease from the wrong pool and reply to the wrong relay; overwriting
+Option 82 would destroy the downstream `circuit-id`. So on a trusted-chained
+request this relay changes **only** the BOOTP `hops` field.
 
-- The chained condition is captured **before** any mutation
-  (`giaddrIsSet(pkt.GatewayIPAddr)`), so a zero `giaddr` in either the 4-byte or
-  4-in-16 form reads as first-hop.
+### RFC 3046 §2.1 anti-spoofing (#5414)
+
+A DHCP relay listens on a **client-facing** interface, so any host on the client
+segment can broadcast a BOOTREQUEST with a **forged** non-zero `giaddr` and a
+crafted Option 82 to impersonate a downstream relay — steering the server's
+pool/policy selection that keys on `circuit-id`/`remote-id`, or redirecting the
+server's reply. RFC 3046 §2.1 requires the relay **not** to trust relay-agent
+information from an untrusted source. xpf therefore treats an interface as
+**untrusted by default** (matching vSRX): a non-zero inbound `giaddr` is assumed
+client-forged and the relay resets it to its own address + re-stamps Option 82
+(the first-hop path — `addOption82` `Del`s the forged option before inserting).
+Only when the group is explicitly marked `overrides trust-option-82` (the
+interface faces a real downstream relay) is a non-zero `giaddr` + Option 82
+preserved. Each reset is counted in `RequestsUntrustedGiaddrReset` — a non-zero
+value means a client-segment host attempted to spoof a downstream relay's
+identity.
+
+- The `chained` (trusted-preserve) and `forgedGiaddr` (untrusted-reset)
+  conditions are captured **before** any mutation, gated on
+  `ir.trustOption82`; a zero `giaddr` in either the 4-byte or 4-in-16 form reads
+  as first-hop under both. See `TestRunRelay_UntrustedForgedGiaddrOverwritten`
+  (reset) and `TestRunRelay_ChainedPreservesGiaddrAndOption82` (trusted
+  preserve).
 - The RFC 1542 §4.1.1 hop-limit check (`overrides maximum-hop-count`, default
-  16, #4309) runs for **both** paths — it is most load-bearing on a chained
-  ring, where a misconfigured downstream relay loop would otherwise circulate a
-  request forever (`RequestsDroppedMaxHops`).
-- **Reply path.** A chained request's reply is unicast by the server directly to
-  the preserved (downstream) `giaddr:67`, so it does not return through this
-  relay's `giaddr:67`-bound server conn — the intermediate relay handles only the
-  request direction, which is RFC-correct. The reply-path Option 82 strip +
-  `giaddr` clear (below) therefore only fires for first-hop leases this relay
-  actually owns.
-- **Untrusted-client Option 82 policy is out of scope.** Junos models a
-  `trusted`/`untrusted` edge with per-port Option 82 insert/replace/keep/drop
-  actions. xpf has no such config knob today (only `relay-agent-option`,
-  accepted-only), so this fix implements the minimal RFC-correct preservation:
-  first-hop inserts, chained preserves. A future `option-82` trust-policy knob
-  can layer an explicit untrusted-client replace/drop action on top.
+  16, #4309) runs for **all** paths and **before** the reset counter increments,
+  so a looping request dropped for `hops` is not miscounted as a reset — it is
+  most load-bearing on a chained ring, where a misconfigured downstream relay
+  loop would otherwise circulate a request forever (`RequestsDroppedMaxHops`).
+- **Reply path.** A trusted-chained request's reply is unicast by the server
+  directly to the preserved (downstream) `giaddr:67`, so it does not return
+  through this relay's `giaddr:67`-bound server conn — the intermediate relay
+  handles only the request direction, which is RFC-correct. The reply-path
+  Option 82 strip + `giaddr` clear (below) therefore only fires for first-hop
+  (and reset) leases this relay actually owns.
+- **Trust is per relay group.** `trust-option-82` is a group-level override, so
+  it applies to every interface in the group. Put downstream-relay uplinks in a
+  trusted group and client segments in the default (untrusted) group.
 
 ## Reply delivery model (#2076)
 
@@ -237,6 +259,27 @@ set forwarding-options dhcp-relay group <g> overrides relay-agent-option
 - **`relay-agent-option` — accepted-only.** The relay ALWAYS inserts
   Option 82 (`circuit-id`); this knob is accepted and matches the
   default, with the same accepted-only advisory.
+
+### Trust override (#5414)
+
+```
+set forwarding-options dhcp-relay group <g> overrides trust-option-82
+```
+
+- **`trust-option-82` — ENFORCED (RFC 3046 §2.1).** Marks the group's
+  interfaces as **trusted relay uplinks** that face a downstream relay, so
+  an inbound non-zero `giaddr` + Option 82 is preserved (the RFC 1542 §4.1
+  intermediate-relay behavior). When **unset (the default)** the interface
+  is an untrusted client-facing segment: a non-zero `giaddr` is assumed
+  client-forged and the relay overwrites it with its own address +
+  re-stamps Option 82, counting the event in
+  `RelayStats.RequestsUntrustedGiaddrReset`. Compiles to
+  `DHCPRelayGroup.TrustOption82` and flows into `relaySpec.trustOption82`
+  (a change restarts the per-interface relay). All three parse shapes
+  (flat-set, merged-Keys, block form) are covered; the flat-set consumer
+  treats `overrides` as a property boundary so the keyword is not swallowed
+  into the interface list. See the "RFC 3046 §2.1 anti-spoofing" section
+  above.
 
 ### IPv6 / DHCPv6 parity
 
