@@ -1,3 +1,26 @@
+## 2026-07-10 — #5077 submit-latency classifier K3 monotonicity (I14) mirror
+- **Timestamp**: 2026-07-10 (fix/5077-classifier-submit-monotonicity)
+- **Action**: Mirror the #827 kick-side K3 cross-snapshot monotonicity guard
+  onto the submit side of the step1 histogram classifier. The submit delta
+  loop normalized whenever `count_delta > 0` without checking `buckets_delta
+  < 0` or cumulative-count monotonicity, so a counter RESET (daemon restart,
+  wrap) — total count 10000->12000 while a low-frequency bucket goes
+  1000->0 — emitted NEGATIVE bucket deltas and fed a non-probability shape
+  (negative bucket fractions) into the D1/D2 permutation stats: a false
+  PASS in the perf gate. Added the I14 guard (submit-side analog of K3):
+  pre-delta cross-snapshot monotonicity on tx_submit_latency_count / _sum_ns,
+  tx_packets, and every submit histogram bucket; any non-monotonic cumulative
+  value H-STOPs the cell instead of classifying. Updated `compute_blocks`
+  docstring to document the I14 monotonicity contract. Added 5 tests (count/
+  sum_ns/tx_packets/hist-bucket backwards + the exact reset-and-recover
+  scenario, plus a positive monotonic-still-classifies pin).
+  Validation: `python3 -m py_compile` clean; `pytest
+  step1-histogram-classify_test.py` 16 passed; RED-on-revert proven — the 4
+  I14 negative tests all "DID NOT RAISE" against the origin/master pre-fix
+  source, positive test still passes.
+- **File(s)**: test/incus/step1-histogram-classify.py,
+  test/incus/step1-histogram-classify_test.py, _Log.md
+
 ## 2026-07-10 — #5283 SNMPv3 EngineID per-device uniqueness (cross-clone USM auth-bypass fix)
 - **Timestamp**: 2026-07-10 (fix/5283-snmp-engineid-unique)
 - **Action**: Fix #5283 cross-device USM auth bypass. buildEngineID/initEngine

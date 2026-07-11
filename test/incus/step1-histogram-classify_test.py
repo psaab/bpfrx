@@ -313,6 +313,139 @@ def test_kick_delta_fields_emitted_correctly():
         assert len(blk["tx_kick_hist_delta"]) == 16
 
 
+# ------------------------------------------------- 23 (#5077 I14) ------
+def test_i14_submit_count_backwards_caught():
+    """Submit cumulative count goes backwards across snaps → I14 (mirrors K3)."""
+    cumulative = [
+        {
+            "submit_count": 100 * i,
+            "submit_sum_ns": 1000 * i,
+            "tx_packets": 2000 * i,
+            "kick_count": 50 * i,
+            "kick_sum_ns": 10 * i,
+            "kick_retry": i,
+        }
+        for i in range(13)
+    ]
+    cumulative[6]["submit_count"] = 100  # reset below snap 5's 500
+    snaps = make_13_snaps(cumulative)
+    with pytest.raises(ValueError, match="non-monotonic tx_submit_latency_count"):
+        step1.compute_blocks(snaps)
+
+
+# ------------------------------------------------- 24 (#5077 I14) ------
+def test_i14_submit_sum_ns_backwards_caught():
+    cumulative = [
+        {
+            "submit_count": 100 * i,
+            "submit_sum_ns": 1000 * i,
+            "tx_packets": 2000 * i,
+            "kick_count": 50 * i,
+            "kick_sum_ns": 10 * i,
+            "kick_retry": i,
+        }
+        for i in range(13)
+    ]
+    cumulative[6]["submit_sum_ns"] = 100  # reset below prior
+    snaps = make_13_snaps(cumulative)
+    with pytest.raises(ValueError, match="non-monotonic tx_submit_latency_sum_ns"):
+        step1.compute_blocks(snaps)
+
+
+# ------------------------------------------------- 25 (#5077 I14) ------
+def test_i14_tx_packets_backwards_caught():
+    cumulative = [
+        {
+            "submit_count": 100 * i,
+            "submit_sum_ns": 1000 * i,
+            "tx_packets": 2000 * i,
+            "kick_count": 50 * i,
+            "kick_sum_ns": 10 * i,
+            "kick_retry": i,
+        }
+        for i in range(13)
+    ]
+    cumulative[6]["tx_packets"] = 100  # reset below prior
+    snaps = make_13_snaps(cumulative)
+    with pytest.raises(ValueError, match="non-monotonic tx_packets"):
+        step1.compute_blocks(snaps)
+
+
+# ------------------------------------------------- 26 (#5077 I14) ------
+def test_i14_submit_hist_reset_and_recover_caught():
+    """The #5077 core: a counter RESET drives a submit bucket negative.
+
+    A low-frequency bucket drops 600->0 while the total submit count still
+    RISES (6600->7700->8800), exactly the "count 10000->12000 while a bucket
+    goes 1000->0" scenario in the issue. The pre-#5077 delta loop only
+    checked `count_delta > 0`, so it normalized a NEGATIVE bucket delta into
+    a non-probability shape (negative bucket fractions) and classified the
+    cell as non-suspect — a false PASS. I14 must H-STOP instead.
+    """
+    snaps = []
+    for i in range(13):
+        hist = [0] * 16
+        hist[0] = 1000 * i  # high-frequency bucket, cumulative
+        hist[5] = 100 * i  # low-frequency bucket, cumulative
+        count = hist[0] + hist[5]
+        snaps.append(
+            make_snap(
+                [
+                    make_binding(
+                        submit_count=count,
+                        submit_sum_ns=5000 * i,
+                        tx_packets=2000 * i,
+                        submit_hist=hist,
+                        kick_count=500 * i,  # nonzero → no K2 false-trip
+                    )
+                ]
+            )
+        )
+    # Simulate a daemon restart at snap 7: the low-frequency bucket 5 resets
+    # to 0 while total count still rises (bucket 0 absorbs it, keeping count
+    # monotonic and I13 intact so I14's histogram check is what fires).
+    reset = snaps[7]["status"]["per_binding"][0]
+    new_hist = [0] * 16
+    new_hist[0] = reset["tx_submit_latency_count"]  # 7700
+    new_hist[5] = 0  # backwards from snap 6's cumulative 600
+    reset["tx_submit_latency_hist"] = new_hist
+    reset["tx_submit_latency_count"] = sum(new_hist)  # keep I13 (== bucket 0)
+    with pytest.raises(
+        ValueError, match=r"non-monotonic tx_submit_latency_hist\[5\]"
+    ):
+        step1.compute_blocks(snaps)
+
+
+# ------------------------------------------------- 27 (#5077 I14) ------
+def test_i14_monotonic_submit_still_classifies():
+    """Positive path: a clean monotonic submit stream is NOT flagged by I14."""
+    snaps = []
+    for i in range(13):
+        hist = [0] * 16
+        hist[0] = 1000 * i
+        hist[5] = 100 * i
+        count = hist[0] + hist[5]
+        snaps.append(
+            make_snap(
+                [
+                    make_binding(
+                        submit_count=count,
+                        submit_sum_ns=5000 * i,
+                        tx_packets=2000 * i,
+                        submit_hist=hist,
+                        kick_count=500 * i,
+                    )
+                ]
+            )
+        )
+    blocks = step1.compute_blocks(snaps)
+    assert len(blocks) == 12
+    # No negative bucket delta escaped into any classified block.
+    for blk in blocks:
+        assert all(x >= 0 for x in blk["buckets"]), blk["buckets"]
+        assert all(x >= 0.0 for x in blk["shape"]), blk["shape"]
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
