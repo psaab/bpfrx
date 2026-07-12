@@ -1795,6 +1795,24 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5693: next-table target definedness gate. A static route whose
+	// `next-table <target>` names an UNDEFINED routing-instance was accepted
+	// at commit and then silently dropped at apply time (the applier's
+	// tableIDs lookup misses, warns, and skips) — the intended inter-VRF leak
+	// never happened and traffic followed the ingress table's own routes.
+	// Strict on commit / commit-check (hard reject so the typo is operator-
+	// visible); lenient on load / peer-sync (warn — #1960; the applier's !ok
+	// guard keeps a dangling next-table inert). Mirrors
+	// validateRibGroupImportRibReferencesStrict.
+	if err := validateNextTableTargetReferencesStrict(cfg); err != nil {
+		if opts.lenientNextTableRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("next-table target reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2492: RPM test source-address gate. A malformed `source-address`
 	// (non-empty but unparseable) silently degrades the tcp-ping/http-get
 	// probe dialer to a wildcard/kernel-chosen source bind, so the probe

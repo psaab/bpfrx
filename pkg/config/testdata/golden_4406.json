@@ -839,7 +839,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -856,7 +857,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "2602:ffd3:0:2::/64",
@@ -873,7 +875,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -946,7 +949,8 @@
               "Discard": false,
               "Reject": false,
               "Preference": 5,
-              "NextTable": ""
+              "NextTable": "",
+              "NextTableRaw": ""
             }
           ],
           "Inet6StaticRoutes": null,
@@ -2088,7 +2092,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -2105,7 +2110,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "2602:ffd3:0:2::/64",
@@ -2122,7 +2128,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -2195,7 +2202,8 @@
               "Discard": false,
               "Reject": false,
               "Preference": 5,
-              "NextTable": ""
+              "NextTable": "",
+              "NextTableRaw": ""
             }
           ],
           "Inet6StaticRoutes": null,
@@ -3336,7 +3344,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -3353,7 +3362,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "2602:ffd3:0:2::/64",
@@ -3370,7 +3380,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -3443,7 +3454,8 @@
               "Discard": false,
               "Reject": false,
               "Preference": 5,
-              "NextTable": ""
+              "NextTable": "",
+              "NextTableRaw": ""
             }
           ],
           "Inet6StaticRoutes": null,
@@ -4584,7 +4596,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -4601,7 +4614,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "2602:ffd3:0:2::/64",
@@ -4618,7 +4632,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -4691,7 +4706,8 @@
               "Discard": false,
               "Reject": false,
               "Preference": 5,
-              "NextTable": ""
+              "NextTable": "",
+              "NextTableRaw": ""
             }
           ],
           "Inet6StaticRoutes": null,
@@ -5833,7 +5849,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -5850,7 +5867,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "2602:ffd3:0:2::/64",
@@ -5867,7 +5885,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -5940,7 +5959,8 @@
               "Discard": false,
               "Reject": false,
               "Preference": 5,
-              "NextTable": ""
+              "NextTable": "",
+              "NextTableRaw": ""
             }
           ],
           "Inet6StaticRoutes": null,
@@ -7081,7 +7101,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -7098,7 +7119,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "2602:ffd3:0:2::/64",
@@ -7115,7 +7137,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -7188,7 +7211,8 @@
               "Discard": false,
               "Reject": false,
               "Preference": 5,
-              "NextTable": ""
+              "NextTable": "",
+              "NextTableRaw": ""
             }
           ],
           "Inet6StaticRoutes": null,
@@ -8164,7 +8188,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -8181,7 +8206,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -9130,7 +9156,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -9147,7 +9174,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -10095,7 +10123,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -10112,7 +10141,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -11060,7 +11090,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -11077,7 +11108,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -12026,7 +12058,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -12043,7 +12076,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,
@@ -12991,7 +13025,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           },
           {
             "Destination": "::/0",
@@ -13008,7 +13043,8 @@
             "Discard": false,
             "Reject": false,
             "Preference": 5,
-            "NextTable": ""
+            "NextTable": "",
+            "NextTableRaw": ""
           }
         ],
         "Inet6StaticRoutes": null,

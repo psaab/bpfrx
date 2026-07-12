@@ -219,7 +219,13 @@ func TestECMPStaticRoutes(t *testing.T) {
 
 func TestNextTableStaticRoutes(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set routing-options static route 0.0.0.0/0 next-table Comcast-GigabitPro.inet.0", "set routing-options static route 10.1.10.0/24 next-hop 50.247.115.22"}
+	setCommands := []string{
+		// The next-table target routing-instance must be defined or the
+		// #5693 definedness gate rejects the commit.
+		"set routing-instances Comcast-GigabitPro instance-type virtual-router",
+		"set routing-options static route 0.0.0.0/0 next-table Comcast-GigabitPro.inet.0",
+		"set routing-options static route 10.1.10.0/24 next-hop 50.247.115.22",
+	}
 	for _, cmd := range setCommands {
 		fields := strings.Fields(cmd)
 		if err := tree.SetPath(fields[1:]); err != nil {
@@ -250,7 +256,14 @@ func TestNextTableStaticRoutes(t *testing.T) {
 	if len(r1.NextHops) != 1 || r1.NextHops[0].Address != "50.247.115.22" {
 		t.Errorf("route 1 next-hops: %v", r1.NextHops)
 	}
-	hierInput := `routing-options {
+	// The next-table target routing-instance must be defined or the #5693
+	// definedness gate rejects the commit.
+	hierInput := `routing-instances {
+    Comcast-GigabitPro {
+        instance-type virtual-router;
+    }
+}
+routing-options {
     static {
         route 0.0.0.0/0 {
             next-table Comcast-GigabitPro.inet.0;
@@ -2834,7 +2847,15 @@ func TestGlobalInterfaceRoutesRibGroupSetSyntax(t *testing.T) {
 }
 
 func TestIPv6NextTableStaticRoutes(t *testing.T) {
-	lines := []string{"set routing-options rib inet6.0 static route ::/0 next-table Comcast-GigabitPro.inet6.0", "set routing-options rib inet6.0 static route 2001:db8::/32 next-table ATT.inet6.0", "set routing-options static route 0.0.0.0/0 next-table Comcast-GigabitPro.inet.0"}
+	lines := []string{
+		// The next-table target routing-instances must be defined or the
+		// #5693 definedness gate rejects the commit.
+		"set routing-instances Comcast-GigabitPro instance-type virtual-router",
+		"set routing-instances ATT instance-type virtual-router",
+		"set routing-options rib inet6.0 static route ::/0 next-table Comcast-GigabitPro.inet6.0",
+		"set routing-options rib inet6.0 static route 2001:db8::/32 next-table ATT.inet6.0",
+		"set routing-options static route 0.0.0.0/0 next-table Comcast-GigabitPro.inet.0",
+	}
 	tree := &ConfigTree{}
 	for _, line := range lines {
 		cmd, err := ParseSetCommand(line)
