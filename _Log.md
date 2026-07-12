@@ -1,3 +1,29 @@
+## 2026-07-12 — #5712 (bug): in-process CLI commit must preserve the configured syslog transport
+- **Timestamp**: 2026-07-12 (fix/5712-syslog-transport-preserve)
+- **Action**: codex-review-182 M39. The CLI-side reloadSyslog (pkg/cli/apply.go)
+  runs on EVERY local-console commit/rollback (#3704) and calls
+  ReplaceSyslogClients on the event reader SHARED with the daemon, AFTER the
+  daemon's applySyslogConfig already installed the correct clients. reloadSyslog
+  rebuilt every stream as plaintext UDP via NewSyslogClient — a duplicate
+  runtime owner that CLOBBERED a configured TCP/TLS stream back to UDP, silently
+  downgrading structured/secure syslog to plaintext after an in-process commit
+  (transport/confidentiality regression). Root: reloadSyslog used the UDP-only
+  constructor and ignored stream.Transport.Protocol, while the daemon path
+  correctly used NewSyslogClientTransport. Fix: extracted buildSyslogClients in
+  pkg/cli/apply.go that mirrors the daemon's per-stream construction — protocol
+  via NewSyslogClientTransport (default udp), per-stream source-address,
+  facility, #3351 reconnecting-install, severity/category/format — so the
+  duplicate rebuild is IDEMPOTENT with the daemon's build and preserves the
+  configured transport (single runtime owner). Added SyslogClient.Protocol()
+  accessor (pkg/logging/syslog.go) so callers/tests can verify the transport.
+  Localized fix (no ownership restructure); the global source-interface fallback
+  (resolveSourceAddr, pkg/daemon) is not replicated — reloadSyslog never used it,
+  it's orthogonal to the transport bug, and the daemon still applies it. Fail-on-
+  revert proven: reverting buildSyslogClients to NewSyslogClient makes the
+  tcp/tls transport assertions RED (client Protocol()=="udp").
+- **File(s)**: pkg/cli/apply.go, pkg/logging/syslog.go,
+  pkg/cli/syslog_transport_preserve_5712_test.go, pkg/logging/README.md
+
 ## 2026-07-12 — #5699 (bug): reconcile base-vs-unit-0 host-inbound view for one live address
 - **Timestamp**: 2026-07-12 (fix/5699-baseunit0-hostinbound)
 - **Action**: codex-review-182 M22. A non-VLAN unit 0 collapses onto the base

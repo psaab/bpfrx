@@ -223,6 +223,19 @@ connectionless and exempt:
   the #3351 lazy-connect case: a down-at-apply TCP/TLS receiver returns a
   *non-nil* reconnecting client (transient reachability), whereas an
   unknown transport is a *configuration* error that yields a nil client.
+- **In-process CLI commit PRESERVES the configured transport (#5712).**
+  The CLI-side `reloadSyslog` (`pkg/cli/apply.go`) runs on EVERY
+  local-console commit/rollback (#3704) and calls `ReplaceSyslogClients`
+  on the event reader SHARED with the daemon — AFTER the daemon's
+  `applySyslogConfig` already installed the correct clients. It used to
+  rebuild every stream as plaintext UDP via `NewSyslogClient`, a duplicate
+  runtime owner that CLOBBERED a configured TCP/TLS stream back down to
+  UDP, silently downgrading the secure-syslog transport after an
+  in-process commit. `buildSyslogClients` now builds through
+  `NewSyslogClientTransport` with `stream.Transport.Protocol` (carrying the
+  per-stream source-address and facility, and the #3351 reconnecting
+  install), so the rebuild is idempotent with the daemon's build and the
+  configured transport survives regardless of which owner writes last.
 - **Daemon syslog-apply CLOSES superseded clients (#3579).**
   `applySyslogConfig` (pkg/daemon) rebuilds every `SyslogClient` from
   config on each apply, so the prior set is always fully superseded
