@@ -262,6 +262,53 @@ valid-compiles-to-expected-if_id + tolerant-warn + schema-layer reject +
 #2933-non-regression, each RED on revert to the silent `continue` / untyped
 leaf).
 
+### Numeric interface-unit alias collision fail-closed (#5631)
+
+`compileInterfaces` (`compiler_interfaces.go`) keys logical units by their
+numeric value: it iterates `namedInstances(child.FindChildren("unit"))` and
+canonicalizes each RAW spelling through `strconv.Atoi` — but only AFTER the AST
+has already split `unit 00` and `unit 0` into two SEPARATE named instances. The
+two instances then collide on the same `ifc.Units[unitNum]` key with two
+DISAGREEING side effects: `ifc.Units[unitNum] = unit` is **last-writer-wins**
+(the later spelling's firewall filter and addresses replace the earlier unit),
+while the interface-level tunnel-address collection
+(`ifc.Tunnel.Addresses = append(ifc.Tunnel.Addresses, unit.Addresses...)`) is
+**append-only** (it accumulates the addresses of every spelling). The observable
+filter + address ownership therefore flips with config order and a stale tunnel
+address from the spelling that LOST the filter race survives — a fail-open on the
+interface firewall filter, decided by the order two otherwise-equivalent `set`
+lines happen to appear (codex-review-181 M23).
+
+Junos treats a logical unit as an integer identity — `unit 00` and `unit 0` are
+the same unit, and no valid config has two numeric aliases of one unit carrying
+DIFFERENT security state. Rather than pick an arbitrary winner (exactly the
+order-dependent ambiguity that makes this unsafe), the fix REJECTS the aliased
+config at commit so the operator authors a single canonical `unit <n>`:
+
+- **Compiled-config strict gate** — `validateInterfaceUnitAliasCollisionsAST`
+  (`compiler_interface_unit_alias.go`), wired into `runPreWalkGates`
+  (`compiler_prewalk.go`) after `expandInterfaceRanges`. It groups the distinct
+  raw unit spellings under each interface by their canonical `strconv.Atoi`
+  value (mirroring the compiler's own split) and, when two DISTINCT spellings
+  resolve to the same number, hard-rejects on the strict commit / commit-check
+  path naming the interface, the spellings, and the canonical unit — and
+  downgrades to a `cfg.Warnings` entry on the tolerant load / peer-sync path
+  (`lenientInterfaceUnitAliasCollisions`, #1960 fail-closed-on-load class), so an
+  already-persisted or peer-synced config an older binary accepted still boots.
+
+The gate is surgical: a single canonical `unit 0` (the overwhelming common case)
+and distinct unit numbers (`unit 0` + `unit 1`) never trip it, and same-spelling
+flat-set lines merge into one AST node upstream (they are the same unit, not an
+alias) — so non-colliding compilation is bit-identical. A non-numeric unit token
+is skipped (the compiler `continue`s on the identical Atoi error, so it never
+reaches `ifc.Units`). Where a duplicate-spelling config ALSO produces a
+pre-expansion tunnel-endpoint-id collision (#1873), that earlier gate rejects
+first — either way the aliased config is refused, never silently committed.
+Covered by `pkg/config/interface_unit_alias_5631_test.go` (both config orders
+reject identically = order-independent, lenient-warn, non-colliding-commits) and
+the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
+the gate wiring.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
