@@ -1813,6 +1813,26 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5701: route-map sequence-number overflow gate. A policy-statement whose
+	// per-term Cartesian expansion (families x from-prefix-list x from-community
+	// x from-as-path) produces more sequences than the FRR route-map
+	// sequence-number space (1..65535, step 10) renders a `route-map` line past
+	// seq 65535. FRR rejects it (CMD_WARNING_CONFIG_FAILED) and a single failed
+	// line makes the vtysh-batched frr-reload exit non-zero, poisoning the WHOLE
+	// managed-section reload. Strict on commit / commit-check (hard reject so the
+	// oversized policy is operator-visible); lenient on load / peer-sync (warn —
+	// #1960; the renderer's generatePolicyOptions SKIPS an over-ceiling policy so
+	// a leniently-loaded config renders nothing for it rather than poisoning the
+	// reload). Mirrors validateNextTableTargetReferencesStrict.
+	if err := validatePolicyRouteMapSequenceBoundStrict(cfg); err != nil {
+		if opts.lenientPolicyRouteMapSeq {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("route-map sequence bound (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2492: RPM test source-address gate. A malformed `source-address`
 	// (non-empty but unparseable) silently degrades the tcp-ping/http-get
 	// probe dialer to a wildcard/kernel-chosen source bind, so the probe

@@ -941,6 +941,19 @@ type compileOpts struct {
 	// applier's tableIDs !ok guard keeps it inert. Same doctrine as
 	// lenientRibGroupRefs.
 	lenientNextTableRefs bool
+	// lenientPolicyRouteMapSeq (#5701) downgrades the route-map
+	// sequence-number overflow gate (validatePolicyRouteMapSequenceBoundStrict)
+	// from a hard compile error to a cfg.Warnings entry. A policy-statement
+	// whose per-term Cartesian expansion exceeds the FRR route-map
+	// sequence-number ceiling (1..65535, step 10) renders a `route-map` line
+	// past seq 65535 that FRR rejects, poisoning the whole vtysh-batched
+	// frr-reload. The strict commit / commit-check path hard-rejects so the
+	// oversized policy is operator-visible; the tolerant load / peer-sync paths
+	// warn so an already-persisted or peer-synced config still BOOTS (#1960) —
+	// the renderer's generatePolicyOptions SKIPS an over-ceiling policy, so a
+	// leniently-loaded config renders nothing for it rather than poisoning the
+	// reload. Same doctrine as lenientNextTableRefs.
+	lenientPolicyRouteMapSeq bool
 	// lenientDHCPStaticBindings (#2243 review) downgrades the DHCP-server
 	// static (fixed/reserved) host-binding gate (validateDHCPStaticBindingsStrict)
 	// from a hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1868,6 +1881,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientPolicyRouteMapSeq:               true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,
@@ -2216,6 +2230,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientPolicyRouteMapSeq:               true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,
