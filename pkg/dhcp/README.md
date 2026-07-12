@@ -102,6 +102,18 @@ the debounced `onAddressChange` callback when content changed.
   `Lease.v6ServerDUID` fields so a later RENEW can target the original
   server. DHCPv6 stateless mode has no binding, so every refresh stays
   an Information-Request regardless of mode.
+- **Stable client DUID across acquisition and renewal (#5711)**: RFC
+  8415 §11 requires the *client* DUID to be constant for the client's
+  lifetime — the server binds the lease to it, so a RENEW/REBIND under a
+  different DUID is a new client and the lease is not renewed. Both the
+  acquisition modifiers (`buildDHCPv6Modifiers`) and the renew modifiers
+  (`buildDHCPv6RenewModifiers`) now unconditionally attach the persistent
+  `getDUID` client ID. Previously `buildDHCPv6Modifiers` returned no
+  modifiers when the interface had no configured DHCPv6 options, so the
+  bare-acquisition SOLICIT fell back to `dhcpv6.NewSolicit`'s default
+  DUID-LLT (a `GetTime()` timestamp stamped at send) while the renew path
+  presented the persistent DUID-LL — a DUID mismatch that churned the
+  lease on every renewal.
 - **Timeout falls through, NAK abandons (#3956)**: a renew *timeout*
   (no reply) at T1 falls through to the T2 rebind; a second timeout (or
   a failure to apply the renewed address) falls back to full

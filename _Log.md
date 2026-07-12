@@ -47076,3 +47076,12 @@ top.
   semantics. Fail-on-revert proven (predefined-bundle match RED on the user-only
   gate; shadow test not gate-dependent). Diagnostic simulator only (non-enforcement).
 - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/predefined_set_5666_test.go
+
+## 2026-07-12 — #5711 DHCPv6 stable DUID across acquisition/renewal
+- **Timestamp**: 2026-07-12
+- **Action**: Fix DUID mismatch — bare acquisition used library-default DUID-LLT
+  (GetTime per-message) while renewal used persistent getDUID DUID-LL; make
+  buildDHCPv6Modifiers always attach the persistent getDUID client ID (symmetric
+  with buildDHCPv6RenewModifiers). Added fail-on-revert tests.
+- **File(s)**: pkg/dhcp/dhcp.go (Edit), pkg/dhcp/duid_stability_5711_test.go
+  (Write), pkg/dhcp/README.md (Edit)

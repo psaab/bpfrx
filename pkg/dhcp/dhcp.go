@@ -1674,15 +1674,25 @@ func (m *Manager) buildDHCPv6RenewModifiers(ifaceName string, opts *DHCPv6Option
 
 // buildDHCPv6Modifiers constructs DHCPv6 message modifiers from interface options.
 func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []dhcpv6.Modifier {
-	if opts == nil {
-		return nil
-	}
-
 	var mods []dhcpv6.Modifier
 
-	// Use persistent DUID if configured
+	// The client DUID MUST stay stable across every DHCPv6 message for the
+	// lifetime of the client (RFC 8415 §11): the server binds the lease to
+	// the DUID, so the initial SOLICIT/REQUEST and its later RENEW/REBIND
+	// must present byte-identical client IDs. Always attach the persistent
+	// DUID — even when no DHCPv6 options are configured (opts == nil, the
+	// bare-acquisition path). Otherwise dhcpv6.NewSolicit (via RapidSolicit)
+	// falls back to a default DUID-LLT stamped with GetTime() at send, while
+	// the renew path (buildDHCPv6RenewModifiers) always uses the persistent
+	// getDUID (DUID-LL): the two paths present different DUIDs, the server
+	// treats the renewal as a new client, and the original lease is not
+	// renewed (#5711).
 	if duid, err := m.getDUID(ifaceName); err == nil {
 		mods = append(mods, dhcpv6.WithClientID(duid))
+	}
+
+	if opts == nil {
+		return mods
 	}
 
 	// Add IA_PD if requested
