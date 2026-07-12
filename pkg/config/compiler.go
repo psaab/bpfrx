@@ -1671,6 +1671,44 @@ type compileOpts struct {
 	// lenientDNATToScope.
 	lenientNATMixedScope bool
 
+	// lenientNATTerminalAction (#5628, codex-review-181 M16) downgrades the
+	// source/destination NAT terminal-action cardinality gate
+	// (validateNATTerminalActionCardinalityStrict) from a hard compile error to
+	// a cfg.Warnings entry. A NAT rule whose complete `then {}` block carries
+	// ZERO terminal actions (actionless — the snapshot builder installs no
+	// translation, so an intended `off` exemption silently disappears and a
+	// later broader rule is revealed) or TWO+ mutually-exclusive actions inside
+	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
+	// picks one by packed-key / child order, so an exemption can publish as a
+	// translation) was previously accepted. The strict commit / commit-check
+	// path hard-rejects so the malformed rule is operator-visible; the tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
+	// closed-on-load class) — a leniently-loaded actionless rule is inert, and a
+	// contradictory one now records BOTH fields (the else-if→if setter change),
+	// so the Rust dataplane's off-precedence governs its resolution (off wins →
+	// exempt), unifying the hierarchical path with the pre-existing flat-set
+	// both-fields behavior rather than the old Go single-field child-order pick.
+	// Only a malformed rule reaches this — the strict commit path rejects it.
+	// Duplicate `then` CONTAINERS remain #3850 last-wins (the gate counts the
+	// winning block only). Same doctrine as lenientNATMixedScope.
+	lenientNATTerminalAction bool
+	// lenientInterfaceUnitAliasCollisions (#5631, codex-review-181 M23)
+	// downgrades the numeric interface-unit alias reject
+	// (validateInterfaceUnitAliasCollisionsAST) from a hard compile error to a
+	// cfg.Warnings entry. Two distinct unit spellings under one interface that
+	// canonicalize to the same logical unit (e.g. `unit 00` and `unit 0`)
+	// collide on `ifc.Units[unitNum]` with last-writer-wins for the unit
+	// filter but append-only accumulation for the interface tunnel addresses —
+	// so the winning firewall filter and the surviving tunnel addresses depend
+	// on config order (a fail-open on the security filter). The strict commit /
+	// commit-check path hard-rejects so the operator collapses the aliases; the
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted or peer-synced config an older binary accepted still BOOTS
+	// (#1960 fail-closed-on-load class). Same doctrine as
+	// lenientUnsupportedInterfaceStanzas.
+	lenientInterfaceUnitAliasCollisions bool
+
 	// lenientEventWithinTrigger (#3751) downgrades the event-options
 	// within/trigger numeric gate (validateEventOptionsWithinAST) from a hard
 	// compile error to a cfg.Warnings entry. A non-numeric / negative / zero /
@@ -1863,6 +1901,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
+		lenientNATTerminalAction:               true,
+		lenientInterfaceUnitAliasCollisions:    true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
@@ -2208,6 +2248,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
+		lenientNATTerminalAction:               true,
+		lenientInterfaceUnitAliasCollisions:    true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,

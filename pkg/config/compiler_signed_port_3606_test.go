@@ -102,7 +102,13 @@ func TestCanonicalPortStillCompiles_3606(t *testing.T) {
 		{"set applications application a1 protocol tcp", "set applications application a1 destination-port http"},
 		{"set firewall family inet filter f1 term t1 from destination-port 22"},
 		{"set firewall family inet filter f1 term t1 from destination-port 1024-2048"},
-		{"set security nat destination rule-set RS rule R1 match destination-port 8080"},
+		// #5628: a DNAT rule now requires exactly one `then` terminal action;
+		// `then destination-nat off` keeps this a well-formed rule while still
+		// exercising canonical destination-port parsing.
+		{
+			"set security nat destination rule-set RS rule R1 match destination-port 8080",
+			"set security nat destination rule-set RS rule R1 then destination-nat off",
+		},
 		{
 			"set security nat destination pool p1 address 192.168.1.10",
 			"set security nat destination pool p1 port 8080",
