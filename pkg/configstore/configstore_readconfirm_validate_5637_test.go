@@ -27,10 +27,15 @@ import (
 // encrypted framing decrypts to the same degenerate plaintext, so both reach
 // the same decode+validate path.
 //
-// RED-on-revert: without the requireJSONObject gate the `null`/`{}` bodies
-// decode with no error; without the Deadline/PrevTree field checks the
-// impossible-field bodies (deadline-only, prev-tree-only) decode with no error.
-// Reverting either half turns those subtests RED.
+// RED-on-revert: the load-bearing gate is the Deadline/PrevTree field check.
+// `null`, `{}`, deadline-only, and prev-tree-only all decode into a zero- or
+// partial-value confirmRecord with NO json.Unmarshal error, so reverting the
+// field checks makes those subtests return (rec, nil) → RED. The
+// requireJSONObject gate is redundant belt-and-suspenders here (array/scalar
+// bodies already error in json.Unmarshal, and null/`{}` are already caught by
+// the field checks); it only produces a clearer parse error and mirrors the
+// #5474 readTreeMeta hardening, so reverting requireJSONObject alone stays
+// GREEN.
 func TestReadConfirmRejectsDegenerateRecord_5637(t *testing.T) {
 	reject := []struct {
 		name string
