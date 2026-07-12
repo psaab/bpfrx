@@ -28,6 +28,30 @@
   pkg/config/compiler_routing_nexttable_target_5693_test.go,
   pkg/config/parser_routing_test.go, pkg/config/testdata/golden_4406.json,
   docs/rib-group-route-leaking.md
+## 2026-07-12 — #5714 (bug/security): web-mgmt bind resolves Junos ifname to Linux kernel name before InterfaceByName
+- **Timestamp**: 2026-07-12 (fix/5714-webmgmt-ifname)
+- **Action**: codex-review-182 M42. The web-management HTTP/HTTPS bind passed
+  the AUTHORED Junos interface name (e.g. `ge-0/0/0.0`) verbatim to
+  `net.InterfaceByName`, which expects the LINUX kernel ifname (`ge-0-0-0`).
+  The lookup always missed on a renamed interface, so `resolveInterfaceAddr`
+  SILENTLY fell back to loopback (127.0.0.1) with only a `slog.Warn` — web-
+  management was not reachable on the configured interface while the operator
+  believed it was bound there. Fixed in `pkg/daemon/daemon_cluster_bind.go`:
+  `resolveInterfaceAddr` now takes the active `*config.Config` and maps the
+  authored ref to its Linux ifname via `config.ResolveKernelIfName` (the same
+  Junos->Linux mapping networkd/linksetup use) BEFORE the kernel lookup, and
+  on any resolution/lookup failure logs LOUDLY at `slog.Error` (naming the
+  interface + resolved kernel name) instead of a silent Warn. The loopback
+  fallback is retained (a mgmt interface merely not up yet at daemon start must
+  not abort the daemon) but is now loud. The kernel-address lookup is behind a
+  package-var seam (`interfaceAddrsByName`) so the bind resolution is unit-
+  testable. Callers in `resolveAPIBinds` (daemon_run.go) updated to pass cfg.
+  Fail-on-revert proven: authored `ge-0/0/0.0` resolves to the Linux
+  interface's address (10.0.0.5), NOT loopback — dropping the ResolveKernelIfName
+  mapping flips the address test RED; reverting the Error log to Warn flips the
+  loud-failure test RED.
+- **File(s)**: pkg/daemon/daemon_cluster_bind.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/webmgmt_bind_ifname_5714_test.go
 
 ## 2026-07-12 — #5705 (bug/security): bound + clamp tunnel keepalive interval (time.Duration overflow → xpfd panic)
 - **Timestamp**: 2026-07-12 (fix/5705-keepalive-bound)

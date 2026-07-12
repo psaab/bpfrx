@@ -1377,7 +1377,7 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 		wm := cfg.System.Services.WebManagement
 		// Bind HTTP to configured interface
 		if wm.HTTPInterface != "" {
-			bindIP := resolveInterfaceAddr(wm.HTTPInterface, "127.0.0.1")
+			bindIP := resolveInterfaceAddr(cfg, wm.HTTPInterface, "127.0.0.1")
 			// net.JoinHostPort (not string-concat) so an IPv6 interface
 			// address is bracketed ("[2001:db8::1]:8080") — a bare
 			// "2001:db8::1:8080" is unparseable by net.SplitHostPort (the
@@ -1389,7 +1389,7 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 		if wm.HTTPS {
 			httpsBindIP := "127.0.0.1"
 			if wm.HTTPSInterface != "" {
-				httpsBindIP = resolveInterfaceAddr(wm.HTTPSInterface, "127.0.0.1")
+				httpsBindIP = resolveInterfaceAddr(cfg, wm.HTTPSInterface, "127.0.0.1")
 				slog.Info("HTTPS API bound to interface", "interface", wm.HTTPSInterface, "addr", net.JoinHostPort(httpsBindIP, "8443"))
 			}
 			apiCfg.TLS = true
