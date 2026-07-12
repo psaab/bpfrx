@@ -214,12 +214,21 @@ func policyFromConfig(c *config.DHCPDynamicDNSConfig) ddnsPolicy {
 // Stats is the observable counter snapshot surfaced by `show` (and,
 // since increment 2, the Prometheus collector). All counters are monotonic.
 type Stats struct {
-	Enabled       bool
-	Backend       string
-	UpsertOK      uint64
-	UpsertFail    uint64
-	DeleteOK      uint64
-	DeleteFail    uint64
+	Enabled    bool
+	Backend    string
+	UpsertOK   uint64
+	UpsertFail uint64
+	DeleteOK   uint64
+	DeleteFail uint64
+	// DeleteCoowned counts wire deletes SUPPRESSED because the exact wire RR
+	// (same forward name + type + rdata) is still CO-OWNED by another DDNS scope
+	// — e.g. a second redundancy group, or a per-interface and a global binding
+	// resolving the same host to the same address (#5709). The departing scope's
+	// ownership claim is released but the live RR is left in place for the
+	// surviving scope; only the LAST claimant's teardown issues the real wire
+	// delete. A monotonic counter: a non-zero, rising value is normal in
+	// multi-scope deployments and means the cross-scope clobber was prevented.
+	DeleteCoowned uint64
 	SkippedNoName uint64
 	// SkippedNonAddress counts leases skipped because they are not an
 	// address-bearing lease type eligible for host DNS — an IA_PD
@@ -343,6 +352,7 @@ type Manager struct {
 	upsertFail        atomic.Uint64
 	deleteOK          atomic.Uint64
 	deleteFail        atomic.Uint64
+	deleteCoowned     atomic.Uint64 // wire delete skipped: RR still co-owned by another scope (#5709)
 	skippedNoName     atomic.Uint64
 	skippedNonAddress atomic.Uint64 // leases skipped: IA_PD / non-address lease type (#5072)
 	skippedNoBackend  atomic.Uint64 // upsert/delete skipped: no live backend wired
@@ -826,6 +836,45 @@ func (m *Manager) dhcidSharedWithOther(owned ownedRecord) bool {
 	return false
 }
 
+// wireRRSharedWithOther reports whether ANOTHER owned record — a DIFFERENT store
+// key, i.e. a different DDNS scope — publishes the SAME wire resource record as
+// `owned`: the same forward name + type + rdata (canonical FQDN, ForwardType,
+// and textual Address). Two DDNS scopes — e.g. two redundancy groups, or a
+// per-interface binding and a global one — can legitimately resolve the same
+// host to the same address and thus CO-OWN one wire RR; each keeps its own
+// ownership row because the ScopeKey prefix makes the store keys distinct (#2691
+// P1b). The reverse PTR is co-owned too: PTRName derives deterministically from
+// Address and the PTR target is the FQDN, so an equal (FQDN, Address) implies an
+// equal PTR RR — matching the forward tuple captures both directions (#5709).
+//
+// deleteOwnedLocked reconstructs the wire RR from (FQDN, ForwardType, Address)
+// alone, so without this claim accounting one scope's teardown (lease expiry /
+// config removal) would issue a wire DELETE that removes the RR the OTHER scope
+// still legitimately owns and refreshes — silently clobbering a live record
+// (codex-review-182 M36). When a co-owner exists the reconciler releases ONLY
+// the departing scope's ownership claim and leaves the wire RR in place; the
+// surviving scope, as the LAST claimant, issues the real wire delete when it in
+// turn tears down. Address must be non-empty (a lease record's rdata is always
+// its Address) so two rdata-less rows never falsely co-match. Caller holds m.mu.
+func (m *Manager) wireRRSharedWithOther(owned ownedRecord) bool {
+	if owned.Address == "" {
+		return false
+	}
+	ownedKey := ownedRecordKey(owned.scopeOf(), owned.Identity, owned.Address)
+	ownedFQDN := dnsCanonicalFQDN(owned.FQDN)
+	for k, r := range m.state.records {
+		if k == ownedKey {
+			continue
+		}
+		if r.Address == owned.Address &&
+			r.ForwardType == owned.ForwardType &&
+			dnsCanonicalFQDN(r.FQDN) == ownedFQDN {
+			return true
+		}
+	}
+	return false
+}
+
 // parseLeases reads a family's active leases via the injected LeaseParser
 // (#2691 P1a). A nil parser (the spine constructed without a Kea-memfile
 // parser) yields an empty, trusted lease set — identical to a healthy memfile
@@ -1300,6 +1349,26 @@ func (m *Manager) deleteOwnedLocked(ctx context.Context, updater DNSUpdater, own
 		}
 		return nil
 	}
+	// #5709 (codex-review-182 M36): if another owned record — a DIFFERENT DDNS
+	// scope — still CO-OWNS this exact wire RR (same forward name + type +
+	// rdata, hence the same reverse PTR), do NOT issue the wire delete: it would
+	// remove the RR the peer scope still legitimately owns and keeps fresh,
+	// silently clobbering a live record. Release only THIS scope's ownership
+	// claim and leave the wire RR in place; the surviving scope issues the real
+	// delete when it in turn becomes the last claimant. This is the wire-RR
+	// claim accounting the per-scope ownership store was missing. It runs BEFORE
+	// the wire op and independent of the backend (a nop updater must not orphan
+	// a co-owned RR either) — dropping a claim on a still-co-owned RR can never
+	// leak a stale record, so it needs no write-ahead.
+	if m.wireRRSharedWithOther(owned) {
+		slog.Debug("ddns: skipping wire delete — RR still co-owned by another scope; "+
+			"releasing this scope's claim only",
+			"fqdn", owned.FQDN, "type", owned.ForwardType, "address", owned.Address,
+			"scope", owned.scopeOf().scopePrefix())
+		m.state.delete(owned.scopeOf(), owned.Identity, owned.Address)
+		m.deleteCoowned.Add(1)
+		return nil
+	}
 	// Force the stored forward type / PTR name (re-derived above should
 	// match, but the store is authoritative for what was written).
 	rec.ForwardType = owned.ForwardType
@@ -1425,6 +1494,7 @@ func (m *Manager) Stats() Stats {
 		UpsertFail:        m.upsertFail.Load(),
 		DeleteOK:          m.deleteOK.Load(),
 		DeleteFail:        m.deleteFail.Load(),
+		DeleteCoowned:     m.deleteCoowned.Load(),
 		SkippedNoName:     m.skippedNoName.Load(),
 		SkippedNonAddress: m.skippedNonAddress.Load(),
 		SkippedNoBackend:  m.skippedNoBackend.Load(),
