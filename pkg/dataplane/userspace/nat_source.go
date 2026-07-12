@@ -407,7 +407,16 @@ func buildSourceNATAppTerms(cfg *config.Config, appNames []string) []NatAppTermW
 		}
 		if app, found := config.ResolveApplication(appName, userApps); found {
 			addApp(app)
-		} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+		} else if _, isSet := config.ResolveApplicationSet(appName, cfg.Applications.ApplicationSets); isSet {
+			// #5629: resolve the SET through config.ResolveApplicationSet (the
+			// #4102 predefined-set-aware lookup), NOT a bare
+			// cfg.Applications.ApplicationSets membership test which only sees
+			// USER-defined sets. A strict predefined bundle (junos-ms-rpc,
+			// junos-sun-rpc, ...) referenced by a source-NAT rule otherwise
+			// matched neither branch, resolved to zero terms, and failed CLOSED
+			// to natProtoNever (never-match) — the rule silently never
+			// translated. ExpandApplicationSet already falls back to the
+			// predefined set table, so a user-defined set stays bit-identical.
 			if expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications); err == nil {
 				for _, termName := range expanded {
 					if a, ok := config.ResolveApplication(termName, userApps); ok {
