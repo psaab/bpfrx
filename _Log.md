@@ -1,3 +1,29 @@
+## 2026-07-12 — #5726 (bug): commit-time next-hop gateway validation — qualified-next-hop + ECMP list
+- **Timestamp**: 2026-07-12 (fix/5726-nexthop-validation)
+- **Action**: fable-review-175 F-01/F-02. Two fail-open commit-time next-hop
+  gateway validation gaps: (F-01) the `qualified-next-hop <gateway>` schema node
+  carried no keyValidator (unlike `next-hop`), so a typo'd floating-backup
+  gateway committed clean and FRR rendered it verbatim → the backup silently
+  never installed; (F-02) an ECMP `next-hop [ gw1 gw2 ]` collapses onto ONE leaf
+  (Keys=["next-hop", gw1, gw2], #2419) but the shared schema_walk container
+  keyValidator loop validated only the first token (argEnd = 1+args), so 2nd+
+  gateways bypassed ValidateStaticNextHop while the compiler installed them.
+  Fixes: (F-01) added `keyValueType: ValueIPAddress, keyValidator:
+  ValidateStaticNextHop` to the qualified-next-hop node (schema_routing.go),
+  mirroring next-hop; (F-02) in schema_walk.go the container keyValidator loop
+  now special-cases `valueList && keyValidator != nil` (uniquely `next-hop` —
+  the ONLY valueList node in the schema) to validate the WHOLE Keys[1:] gateway
+  run, skipping an `interface <name>` modifier that appears after ≥1 gateway
+  (mirrors the compiler's #3881 keyword-bounded scan; an ifname is not a valid
+  gateway literal). BLAST RADIUS: gated on `valueList` (not `multi`) so the
+  positional `route-filter` multi leaf (keyValidatorPos) is untouched — an
+  initial `multi` gate regressed route-filter's `upto /24` value tail; narrowed
+  to valueList, full pkg/config suite green. Fail-on-revert proven for both
+  halves (drop qualified keyValidator → F-01 RED; restore argEnd span → F-02
+  RED; interface-modifier accept stays green).
+- **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_walk.go,
+  pkg/config/schema_nexthop_validation_5726_test.go, docs/config-schema.md
+
 ## 2026-07-12 — #5714 (bug/security): web-mgmt bind resolves Junos ifname to Linux kernel name before InterfaceByName
 - **Timestamp**: 2026-07-12 (fix/5714-webmgmt-ifname)
 - **Action**: codex-review-182 M42. The web-management HTTP/HTTPS bind passed

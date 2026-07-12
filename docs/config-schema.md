@@ -465,6 +465,23 @@ floating-backup leaf carrying its own per-next-hop preference (#3871): a plain
 `next-hop` list is equal-cost ECMP, a `qualified-next-hop` is a distance-N
 backup.
 
+**Commit-time gateway validation of a value list (#5726).** The container
+keyValidator loop in `schema_walk.go` normally validates only the declared
+identity-arg span (`1 + args` tokens). For a `valueList` leaf that would leave
+every gateway past the first UNVALIDATED — a typo'd ECMP member
+(`next-hop [ 192.168.1.1 1.2.3.999 ]`) then committed clean and FRR silently
+dropped it (fail-open). The loop therefore special-cases `valueList &&
+keyValidator != nil` (only `next-hop`) to run `ValidateStaticNextHop` over the
+WHOLE `Keys[1:]` run, mirroring the compiler's keyword-bounded gateway scan
+(#3881): an `interface <name>` token appearing AFTER at least one gateway is the
+egress modifier and is skipped (an ifname is not a valid gateway literal), while
+a LEADING `interface` token is itself a gateway value. A POSITIONAL multi leaf
+(`route-filter`, `keyValidatorPos` + a per-position grammar and a value tail) is
+NOT a `valueList` and keeps the declared-arg span. `qualified-next-hop` now also
+carries the `ValidateStaticNextHop` keyValidator on its gateway identity arg
+(#5726) — before, a malformed floating-backup gateway committed clean and the
+backup never installed.
+
 **Fully-inline route-keys form drops the `interface` modifier (#3881).** The
 above covers the flat-set and hierarchical-brace shapes, where `next-hop` is
 its own leaf/child node. A THIRD shape exists: the hierarchical route written

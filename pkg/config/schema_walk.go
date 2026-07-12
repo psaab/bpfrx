@@ -400,14 +400,51 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// each token's 0-based arg index so a multi-arg slot can enforce a
 	// distinct grammar per position (prefix slot vs match-type slot).
 	if childSchema.keyValidatorPos != nil || childSchema.keyValidator != nil {
-		argEnd := declaredKeyTokens
-		if argEnd > len(node.Keys) {
-			argEnd = len(node.Keys)
-		}
 		keyPath := append(append([]string(nil), path...), keyword)
-		for argIdx, tok := range node.Keys[1:argEnd] {
-			if err := validateKeySlot(childSchema, argIdx, tok, vc); err != nil {
-				return typedLeafInvalidErrorf(keyPath, tok, err)
+		if childSchema.valueList && childSchema.keyValidator != nil {
+			// #5726: a VALUE-LIST container leaf (only the static-route
+			// `next-hop`: multi + valueList + keyValidator + an `interface`
+			// modifier child) packs its whole homogeneous value LIST onto
+			// Keys beyond the identity: `next-hop [ gw1 gw2 ]` collapses to
+			// Keys=["next-hop", gw1, gw2] (#2419). Validate EVERY packed
+			// gateway, not just the first — the pre-#5726 argEnd=1+args span
+			// left gw2.. UNVALIDATED, so a typo'd ECMP member committed clean
+			// and FRR then silently dropped it (fail-open). Gated on valueList
+			// (NOT multi) so a POSITIONAL multi leaf like `route-filter`
+			// (keyValidatorPos, per-position grammar + a value tail) keeps the
+			// old declared-arg span — the else branch below. Mirror the
+			// compiler's keyword-bounded gateway scan (compiler_routing.go
+			// isRouteInlineKeyword / #3881): a token that names a declared
+			// modifier CHILD (`interface`) AFTER at least one gateway is the
+			// egress modifier — it and its argument are NOT validated as
+			// gateways (an ifname like ge-0/0/0 is not a valid gateway
+			// literal). A LEADING such token is itself a gateway value.
+			valuesSeen := 0
+			for j := 1; j < len(node.Keys); j++ {
+				tok := node.Keys[j]
+				if valuesSeen > 0 && childSchema.children != nil {
+					if _, isModifier := childSchema.children[tok]; isModifier {
+						j++ // skip the modifier keyword AND its value token
+						continue
+					}
+				}
+				if err := validateKeySlot(childSchema, valuesSeen, tok, vc); err != nil {
+					return typedLeafInvalidErrorf(keyPath, tok, err)
+				}
+				valuesSeen++
+			}
+		} else {
+			// Non-multi container: only the declared identity-arg span is a
+			// value slot; tokens past it are keywords/ignored per the
+			// compiler-faithful contract.
+			argEnd := declaredKeyTokens
+			if argEnd > len(node.Keys) {
+				argEnd = len(node.Keys)
+			}
+			for argIdx, tok := range node.Keys[1:argEnd] {
+				if err := validateKeySlot(childSchema, argIdx, tok, vc); err != nil {
+					return typedLeafInvalidErrorf(keyPath, tok, err)
+				}
 			}
 		}
 	}
