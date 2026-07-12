@@ -124,7 +124,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 // manager advances its per-feed published-hash only on a nil return, so a
 // rejected apply leaves publication debt that the next identical refetch
 // retries (rather than committing the content hash and suppressing retry
-// forever, the pre-#5646 bug). The error is still logged by the callback path.
+// forever, the pre-#5646 bug). The returned error is still logged — by
+	// feeds.installSnapshot's reject branch (feeds side), not by this function.
 func (d *Daemon) applyConfigResult(cfg *config.Config) error {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
