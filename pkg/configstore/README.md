@@ -138,7 +138,7 @@ inline archive-site passwords).
   configstore directory. The "master-password" naming is an HKDF
   info string only — it isn't a user-supplied password.
 
-### At-rest crypto hardening notes (#4579 A4-05/A4-06, #4705, #5231)
+### At-rest crypto hardening notes (#4579 A4-05/A4-06, #4705, #5231, #5638)
 
 - **Split `system` stanza resolution (#4705).** "The tree declares a
   master-password" is decided by `masterPasswordPRF`, which scans **every**
@@ -182,9 +182,34 @@ inline archive-site passwords).
   `apply-groups` only *copies* existing leaves, so a PRF active after expansion
   physically exists somewhere under a group body here. The walk is read-only and
   total (nil-safe, never errors on a malformed group) because the write path must
-  not fail. Reusing the compiler's `ExpandGroups` was rejected: it would mutate
-  the tree being persisted and pull `${node}`/undefined-group error handling into
-  that write path, for no security gain.
+  not fail.
+- **Dormant / unsupported PRF isolation (#5638, codex-review-181 M30).**
+  `masterPasswordPRF` now answers TWO separable questions instead of one. **(1)
+  Is encryption required?** — the fail-closed broad scan above
+  (`masterPasswordConfigured`): ANY master-password anywhere (active stanza,
+  applied OR unapplied group, `<*>` wildcard, inactive node) means encrypt.
+  **(2) Which PRF algorithm?** — resolved from the EFFECTIVE/APPLIED scope only
+  (`effectiveMasterPasswordPRF`: strip inactive **then** expand applied groups
+  on a clone, the same semantics the compiler and `schemaValidateExpandedTree`
+  use), accepting **only** a selector `prfHash` supports; otherwise the fixed
+  supported default (`defaultMasterPasswordPRF`, `sha256`). The old resolver
+  conflated the two: its fail-closed superset returned whatever value a dormant
+  subtree carried, so an **unsupported** PRF (`bogus`) hidden in an inactive
+  node or an unapplied group — invisible to the #4578 commit gate, which
+  validates the effective tree — was handed to `prfHash`, which rejects it.
+  On the tolerant HA config-sync / upgrade-load path this made the persistence
+  write fail **deterministically**: the standby promotes the peer tree in
+  memory (Option B), `writeActive` fails, and the singleton retry re-selects the
+  same bad value forever, leaving the node `/health`-503 with its authoritative
+  generation permanently off disk (non-durable across restart). Constraining the
+  ALGORITHM to a supported effective value (default fallback) keeps the DB
+  encrypted while guaranteeing the write only ever receives a value `prfHash`
+  accepts — deterministic and durable across active↔standby. The effective
+  resolution runs on a clone and swallows every apply-groups expansion error
+  (degrading to the default), so the "this write path must not fail" contract —
+  which originally motivated NOT calling `ExpandGroups` here — still holds. A
+  normal single active supported-PRF config takes a zero-allocation fast path
+  and is bit-identical to the pre-#5638 resolver.
 - **Unexpected-plaintext warning (A4-06).** Every write path encrypts the
   body when the tree declares a master-password, so `readTreeMeta` reading
   a config back as *plaintext* while its tree still declares a
