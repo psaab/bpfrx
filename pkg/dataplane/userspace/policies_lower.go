@@ -74,6 +74,22 @@ func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeSt
 		if _, feedBound := feedOverlay[tok]; feedBound {
 			return true
 		}
+		// #5645 residual (codex-182): a DECLARED dynamic-address binding that is
+		// ABSENT from the resolved overlay is UNRESOLVED — at least one of its feed
+		// constituents has no installed snapshot yet (SnapshotForBindings publishes
+		// a binding only when ALL feeds are ready). It must fail CLOSED even when a
+		// STATIC address-book entry of the SAME name exists: otherwise a
+		// `deny <name>` would enforce only the partial static subset and the unready
+		// feed's prefixes would be silently unmatched (a deny fail-OPEN). Returning
+		// false here (before the static nameToID branch) taints the side so
+		// buildOneRuleSnapshot emits the __unsupported_address__ sentinel and the
+		// Rust preflight rejects the whole snapshot (previous-good retained /
+		// fresh-boot default-deny) — the static-alias analogue of the all-unready
+		// omission the daemon's feed overlay already fails closed. Indexing a nil
+		// AddressBindings map is safe (zero value nil).
+		if b := cfg.Security.DynamicAddress.AddressBindings[tok]; b != nil {
+			return false
+		}
 		if _, known := nameToID[tok]; known {
 			return nameRepresentable(cfg.Security.AddressBook, feedOverlay, tok, make(map[string]bool))
 		}

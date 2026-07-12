@@ -473,23 +473,26 @@ func (m *Manager) GetPrefixes(name string) []string {
 // Resolution semantics:
 //   - A binding's FeedNames are unioned (a binding may aggregate several
 //     feeds). Prefixes are deduped across feeds and returned sorted.
-//   - A feed with no installed snapshot (before the first successful fetch, or
-//     after an explicit hold-interval drop) contributes nothing. If NONE of a
-//     binding's feeds has an installed snapshot the binding is UNRESOLVED and
-//     its name is OMITTED from the returned map entirely (#5645) — it is NOT
-//     published as a present-but-empty slice. Publishing an empty slice made
-//     the daemon compile a direct feed-bound name to a match-none address book
-//     row: correct for a PERMIT (permit-none), but a DENY policy referencing
-//     that name then never fired and the traffic it must block was PERMITTED
-//     for the whole pre-first-fetch window (fail-OPEN). Omitting the name
-//     leaves it unresolved, so the policy lowering treats it as
-//     unrepresentable (addrRepresentable -> __unsupported_address__ -> whole-
-//     snapshot preflight reject) and the referencing policy fails CLOSED —
-//     the same action-agnostic contract #3261 gives an empty static book, and
-//     the first-fetch analogue of the #5282 re-fetch window.
-//   - An unknown feed-name (binding references a feed that was never started)
-//     contributes nothing — it is treated the same as an unready feed, so a
-//     binding backed only by unknown names is also omitted (unresolved).
+//   - A binding is ENFORCEABLE only when EVERY one of its feed constituents has
+//     an installed snapshot. If ANY feed is unready — before its first
+//     successful fetch, an unknown/typo'd feed name, or after an explicit
+//     hold-interval drop — the binding is UNRESOLVED and its name is OMITTED
+//     from the returned map entirely (#5645, tightened to all-constituent
+//     readiness by codex-182). Publishing the READY subset of a composite
+//     binding, or a present-but-empty slice for an all-unready one, made the
+//     daemon compile a direct feed-bound name to a PARTIAL / match-none address
+//     book row: correct for a PERMIT (permit-none / permit-subset), but a DENY
+//     policy referencing that name then under-matched (or never fired) and the
+//     traffic it must block was PERMITTED for the whole window until every feed
+//     succeeded (fail-OPEN). Omitting the whole binding leaves the name
+//     unresolved, so the policy lowering treats it as unrepresentable
+//     (addrRepresentable -> __unsupported_address__ -> whole-snapshot preflight
+//     reject) and the referencing policy fails CLOSED — the same action-agnostic
+//     contract #3261 gives an empty static book, and the first-fetch analogue of
+//     the #5282 re-fetch window. The daemon ALSO treats a declared-but-omitted
+//     binding as unrepresentable even when a STATIC address-book alias of the
+//     same name exists (pkg/dataplane/userspace addrRepresentable), so the
+//     static subset cannot resurrect a partial deny.
 //
 // Reading the live last-good snapshot here means a persistent fetch failure
 // keeps enforcing the retained prefixes (the #2050 fail-safe). A persisted
@@ -505,17 +508,32 @@ func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[st
 	defer m.mu.RUnlock()
 	out := make(map[string][]string, len(daCfg.AddressBindings))
 	for name, binding := range daCfg.AddressBindings {
-		if binding == nil {
+		if binding == nil || len(binding.FeedNames) == 0 {
 			continue
 		}
-		// Dedup across the binding's feeds; deep-copy from the live state.
+		// #5645 (tightened to all-constituent readiness by codex-182): a binding
+		// is UNRESOLVED unless EVERY one of its feeds has an installed snapshot. A
+		// ready feed always installs >= 1 prefix (a zero-prefix fetch is rejected
+		// as suspect — see readFeed), so "no installed snapshot" is exactly
+		// len(fs.prefixes) == 0 (before the first successful fetch, an unknown/
+		// typo'd feed name, or after an explicit hold-interval drop) — never a
+		// legitimately-empty successful fetch. If ANY constituent is unready, OMIT
+		// the whole binding: publishing the ready subset (or an all-unready empty
+		// slice) would enforce only a PARTIAL / match-none set, and for a DENY that
+		// under-match is fail-OPEN. Omitting keeps the name UNRESOLVED so the
+		// referencing policy fails CLOSED (see the doc comment). A persisted feed
+		// carried forward across a reconfigure (#5282) still has its last-good
+		// prefixes here, so this never re-opens the re-fetch window.
 		seen := make(map[string]struct{})
 		merged := make([]string, 0)
+		allReady := true
 		for _, feedName := range binding.FeedNames {
 			fs, ok := m.feeds[feedName]
-			if !ok {
-				continue
+			if !ok || len(fs.prefixes) == 0 {
+				allReady = false
+				break
 			}
+			// Dedup across the binding's feeds; deep-copy from the live state.
 			for _, p := range fs.prefixes {
 				if _, dup := seen[p]; dup {
 					continue
@@ -524,21 +542,10 @@ func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[st
 				merged = append(merged, p)
 			}
 		}
-		sort.Strings(merged)
-		// #5645: a binding whose feeds ALL lack an installed snapshot resolves to
-		// no enforceable prefixes. A ready feed always installs >= 1 prefix (a
-		// zero-prefix fetch is rejected as suspect — see readFeed), so
-		// len(merged) == 0 is EXACTLY "no backing feed has an installed snapshot"
-		// (before the first successful fetch, an unknown/typo'd feed name, or after
-		// an explicit hold-interval drop) — never a legitimately-empty successful
-		// fetch. Do NOT publish it as a present-but-empty (match-none) entry: for a
-		// DENY policy match-none is fail-OPEN. Omit the name so it stays UNRESOLVED
-		// and the referencing policy fails CLOSED (see the doc comment). A
-		// persisted feed carried forward across a reconfigure (#5282) still has its
-		// last-good prefixes here, so this never re-opens the re-fetch window.
-		if len(merged) == 0 {
+		if !allReady {
 			continue
 		}
+		sort.Strings(merged)
 		out[name] = merged
 	}
 	return out
