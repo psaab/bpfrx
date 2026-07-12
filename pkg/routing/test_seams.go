@@ -34,6 +34,29 @@ func NewManagerWithLinkOpsForTest(ops linkOps) *Manager {
 	return m
 }
 
+// NewManagerWithRuleOpsForTest builds a *Manager whose policy-routing rule
+// domains (nextTbl, ribGroup, pbr — every domain whose ops field is the narrow
+// ruleOps surface) are backed by the supplied ruleOps instead of a live
+// *netlink.Handle. It exists so tests in dependent packages (e.g. pkg/daemon)
+// can drive applyRoutingRules' ip-rule reconcile — notably the #5642
+// final-rib-group removal, which must STILL run the rib-group clear() so the
+// stale per-prefix leak ip-rule is deleted on the zero-transition — against an
+// in-memory fake (no root, no netlink handle, no host side effects).
+//
+// Only the three rule domains are wired; every other domain is left nil (these
+// tests exercise the rule reconcile only). nlHandle stays nil (Close nil-guards it).
+//
+// Callers pass any value whose method set matches ruleOps (RuleAdd / RuleDel /
+// RuleList — all exported, so a fake defined in another package satisfies it
+// structurally).
+func NewManagerWithRuleOpsForTest(ops ruleOps) *Manager {
+	m := &Manager{}
+	m.nextTbl = &nextTableManager{ops: ops}
+	m.ribGroup = &ribGroupManager{ops: ops}
+	m.pbr = &pbrManager{ops: ops}
+	return m
+}
+
 // NewManagerWithRouteListerForTest builds a *Manager whose route-read domain
 // (routeReader) is backed by the supplied routeLister instead of a live
 // *netlink.Handle. It exists so tests in dependent packages (e.g. pkg/grpcapi)

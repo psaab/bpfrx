@@ -72,6 +72,37 @@ band, and the original `[200, 300)` band. An in-place binary upgrade therefore
 **removes the stale pref-33000 blanket rule** so the box is never left with the
 broken blanket rule alongside the new per-prefix rules.
 
+### Final rib-group removal (zero-transition, #5642)
+
+The daemon's config-apply reconciler (`applyRoutingRules`,
+`pkg/daemon/daemon_apply.go`) calls `ApplyRibGroupRules`
+**unconditionally** — there is no `len(RibGroups) > 0` gate. `ribGroupManager.Apply`
+runs `clear()` **before** its own empty-desired early return, so the transition
+that removes the **final** rib-group (`RoutingOptions.RibGroups` → empty) still
+deletes the previously-installed per-prefix leak ip-rules. A config that never
+carried a rib-group finds nothing in the scanned bands, so `clear()` issues no
+`RuleDel` (no churn).
+
+Before #5642 the `len(RibGroups) > 0` gate skipped the whole block on that
+zero-transition, so the stale Linux `ip rule to <prefix> lookup <table>`
+survived indefinitely. Because the userspace snapshot builder derives its
+`NextTable` leak from the **live** ip-rule table (`buildRouteSnapshots` →
+`netlink.RuleList`), the stale rule also kept republishing into the **userspace
+FIB** — a deleted-VRF leak on both forwarding planes that kernel-forwarded /
+local / route-based-IPsec plaintext could follow, despite a successful commit.
+
+**Snapshot ordering (why the gate fix alone is not enough).** The full dataplane
+apply (`d.dp.ApplyConfig`) runs **before** `applyRoutingRules`, so it builds and
+publishes the userspace route snapshot from the *pre-reconcile* ip-rule table —
+it captures the stale leak. After `applyRoutingRules` deletes the rule, the
+daemon runs a routes-only republish (`reconcileRouteLeakSnapshot`,
+`pkg/daemon/daemon_apply.go`) that rebuilds `buildRouteSnapshots` against the
+now-reconciled kernel rules and publishes the leak-free FIB (bumping the FIB
+generation so established flows re-resolve). It reuses the ip-monitoring
+routes-only publish surface (no `Compile`, no helper restart) and duplicate-skips
+an unchanged route set, so a steady-state commit and a never-had-a-rib-group
+config publish nothing.
+
 ## Fail-loud diagnostics (commit-time warnings)
 
 `config.ValidateConfig` (`validateRibGroupLeakWarnings`) warns — rather than

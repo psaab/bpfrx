@@ -758,6 +758,18 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 
 	d.applyRoutingRules(cfg, commitOverlay)
 
+	// #5642: the full dataplane apply (applyDataplaneAndHACore → d.dp.ApplyConfig)
+	// ran BEFORE applyRoutingRules and built its userspace route snapshot from the
+	// PRE-reconcile kernel ip-rule table (buildRouteSnapshots enumerates the live
+	// ip-rules via netlink.RuleList). On a rib-group / next-table transition —
+	// notably the final rib-group removal handled just above — applyRoutingRules
+	// has now deleted (or added) the synthetic leak ip-rule, so the snapshot
+	// ApplyConfig already published is stale. Rebuild + republish the routes-only
+	// snapshot against the now-reconciled kernel rules so the userspace FIB does
+	// not retain a deleted-VRF inter-VRF leak. A no-op (content-hash duplicate
+	// skip) when the route set did not move.
+	d.reconcileRouteLeakSnapshot(cfg, commitOverlay)
+
 	ipsecErr, dhcpServerErr := d.applyServicesReconcile(cfg)
 
 	// Steps 8–21: tail reconcile dispatches (VRRP, system config, syslog,
@@ -1398,7 +1410,21 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 	// default route. The connected prefixes are derived from the config
 	// addresses on each source instance's member interface units, using the
 	// same derivation the userspace FIB uses for connected routes.
-	if d.routing != nil && len(cfg.RoutingOptions.RibGroups) > 0 {
+	//
+	// #5642: the reconcile runs UNCONDITIONALLY (no `len(RibGroups) > 0`
+	// gate). ribGroupManager.Apply calls clear() BEFORE its own empty-desired
+	// early return, so an EMPTY rib-group set — the transition that removes
+	// the FINAL rib-group — still deletes the previously-installed synthetic
+	// `ip rule to <prefix> lookup <sourceTable>` leak rules. The old gate
+	// skipped the whole block on that zero-transition, so the stale Linux
+	// ip-rule (and, because buildRouteSnapshots derives the userspace
+	// NextTable leak from the live ip-rule table, the stale userspace FIB
+	// entry) kept routing a deleted-VRF prefix into its table indefinitely — a
+	// route-leak that kernel-forwarded / local / route-based-IPsec plaintext
+	// could follow. A config that never had a rib-group finds no rule in the
+	// scanned bands, so clear() issues no RuleDel (no churn); a steady-state
+	// non-empty commit reconciles the exact same set as before.
+	if d.routing != nil {
 		connectedPrefixes := config.RibGroupConnectedPrefixes(cfg)
 		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances, connectedPrefixes); err != nil {
 			slog.Warn("failed to apply rib-group rules", "err", err)
@@ -1423,6 +1449,62 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
 			slog.Warn("failed to apply PBR rules", "err", err)
 		}
+	}
+}
+
+// reconcileRouteLeakSnapshot republishes the userspace route snapshot after
+// applyRoutingRules has reconciled the kernel policy-routing (ip rule) table
+// (#5642). The full dataplane apply (applyDataplaneAndHACore → d.dp.ApplyConfig)
+// runs BEFORE applyRoutingRules and derives its route snapshot from the LIVE
+// kernel ip-rules (buildRouteSnapshots → netlink.RuleList). On an inter-VRF
+// route-leak transition — most importantly the final-rib-group removal that
+// takes RoutingOptions.RibGroups to zero — applyRoutingRules has just deleted
+// (or added) the synthetic `ip rule to <prefix> lookup <table>` leak rule, so
+// the snapshot ApplyConfig already published still mirrors the PRE-reconcile
+// rule table and keeps (or omits) a NextTable leak that no longer matches the
+// kernel. Without this reconcile a removed rib-group's deleted-VRF leak would
+// survive in the userspace FIB indefinitely (until some later apply happened to
+// rebuild it).
+//
+// This reuses the ip-monitoring routes-only publish surface — no Compile, no
+// helper restart — rebuilding buildRouteSnapshots against the now-reconciled
+// kernel rules and, only when the content actually changed, publishing the
+// leak-free FIB and bumping the FIB generation so established flows re-resolve.
+// PublishRouteOverlaySnapshot duplicate-skips an unchanged route set (returns
+// published=false), so a steady-state commit and a config that never carried a
+// rib-group publish nothing and churn nothing. A nil scheduler-state argument
+// keeps the manager's current policy-scheduler view (the one the full apply just
+// published) so the unchanged-content hash matches and the skip fires.
+func (d *Daemon) reconcileRouteLeakSnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry) {
+	if cfg == nil {
+		return
+	}
+	pub, ok := d.dp.(routeOverlayPublisher)
+	if !ok {
+		// Helperless (no userspace dataplane publisher): the kernel ip-rule
+		// reconcile above is the only route-leak consumer and it already ran.
+		return
+	}
+	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, nil)
+	if err != nil {
+		slog.Warn("route-leak snapshot reconcile: routes-only republish failed; the "+
+			"userspace FIB may retain a stale inter-VRF leak until the next apply",
+			"err", err)
+		return
+	}
+	if !published {
+		// Duplicate-skip (route set unchanged) or no published snapshot yet /
+		// helper not running: nothing moved, so do not bump the FIB generation
+		// (would needlessly churn established-flow route caches).
+		return
+	}
+	// Ordering (mirrors the ip-monitoring actuator, #1827 AGY r2-1): bump the
+	// FIB generation ONLY after a real publish so established flows re-resolve
+	// onto the reconciled routes; bumping before/without a publish would leave
+	// flows pinned to the stale leak route.
+	if _, err := pub.BumpFIBGeneration(); err != nil {
+		slog.Warn("route-leak snapshot reconcile: FIB generation bump unconfirmed after "+
+			"republish; established flows may re-resolve on a later sweep", "err", err)
 	}
 }
 
