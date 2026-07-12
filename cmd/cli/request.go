@@ -319,6 +319,18 @@ func (c *ctl) handleRequestProtocols(args []string) error {
 			printRemoteTreeHelp("request protocols ospf:", "request", "protocols", "ospf")
 			return nil
 		}
+		// #5647: `ospf-clear` is a selector-free global reset (vtysh
+		// `clear ip ospf process`). A scoped-looking suffix such as
+		// `... clear neighbor 10.0.0.1` used to be silently dropped and
+		// still reset the WHOLE process. Junos never widens scope
+		// silently, so reject any trailing token BEFORE the RPC rather
+		// than perform an untargeted global mutation.
+		if len(args) > 2 {
+			return fmt.Errorf("request protocols ospf clear does not accept a "+
+				"selector (%q); it resets the entire OSPF process. Re-run "+
+				"without a selector to confirm the global clear",
+				strings.Join(args[2:], " "))
+		}
 		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "ospf-clear",
 		})
@@ -331,6 +343,16 @@ func (c *ctl) handleRequestProtocols(args []string) error {
 		if len(args) < 2 || args[1] != "clear" {
 			printRemoteTreeHelp("request protocols bgp:", "request", "protocols", "bgp")
 			return nil
+		}
+		// #5647: `bgp-clear` soft-clears EVERY BGP session (vtysh
+		// `clear bgp * soft`). Reject a scoped-looking suffix such as
+		// `... clear neighbor 10.0.0.1` instead of silently dropping the
+		// selector and soft-clearing all peers.
+		if len(args) > 2 {
+			return fmt.Errorf("request protocols bgp clear does not accept a "+
+				"selector (%q); it soft-clears every BGP session. Re-run "+
+				"without a selector to confirm the global clear",
+				strings.Join(args[2:], " "))
 		}
 		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "bgp-clear",
@@ -355,6 +377,16 @@ func (c *ctl) handleRequestSecurity(args []string) error {
 		if len(args) < 3 || args[1] != "sa" || args[2] != "clear" {
 			printRemoteTreeHelp("request security ipsec sa:", "request", "security", "ipsec", "sa")
 			return nil
+		}
+		// #5647: `ipsec-sa-clear` terminates EVERY IPsec SA
+		// (TerminateAllSAs). Reject a scoped-looking suffix such as
+		// `... sa clear 42` / `... sa clear tunnel foo` instead of
+		// silently dropping the selector and tearing down all SAs.
+		if len(args) > 3 {
+			return fmt.Errorf("request security ipsec sa clear does not accept a "+
+				"selector (%q); it terminates every IPsec SA. Re-run without a "+
+				"selector to confirm the global clear",
+				strings.Join(args[3:], " "))
 		}
 		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
 			Action: "ipsec-sa-clear",
