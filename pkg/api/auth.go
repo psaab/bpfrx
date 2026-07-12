@@ -86,9 +86,13 @@ func checkAuthorization(auth string, cfg AuthConfig) bool {
 		// guard `username:` (empty password) matches an empty stored secret and
 		// authenticates, an auth bypass on an off-loopback bind. The
 		// constant-time compare above still runs unconditionally, so the
-		// known/unknown-user timing profile from #4157 is preserved (the added
-		// `expected != ""` branch is keyed only on the configured secret, a
-		// deployment constant, not on attacker-controlled request content).
+		// known/unknown-user timing profile from #4157 is preserved. The added
+		// `expected != ""` check is an O(1) length test whose cost does not
+		// vary with the secret's content or length; the attacker-supplied
+		// username does select WHICH configured `expected` is tested, but the
+		// branch reveals only whether that (already `exists`-gated) user has a
+		// non-empty configured secret — never any secret content — so it adds
+		// no request-content-dependent timing signal.
 		return exists && expected != "" && passMatch
 	}
 
