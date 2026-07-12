@@ -2339,7 +2339,15 @@ reserved for whole-dataplane selection where a rewrite shim
   (`pkg/cluster/heartbeat.go`): >255 groups wrap the count byte to 0 and
   desync the wire, an id >255 truncates and collides. That gate runs on
   the compiled `*Config`, NOT through the schema walker, so it does not
-  change the identity-token typing decision above),
+  change the identity-token typing decision above; #5694 further adds
+  `validateChassisClusterIdentitiesAST` — an AST PRE-WALK gate in
+  `runPreWalkGates` (`compiler_chassis_identity.go`) that rejects a
+  MALFORMED `redundancy-group <id>` / RG-scoped `node <id>` token (non-
+  numeric, empty, or negative) at strict commit and warns on tolerant
+  load, because `compileChassis` otherwise Atoi-coerces such a token to 0
+  and silently aliases redundancy-group / node 0. Being an AST walk it
+  covers every shape, INCLUDING the packed one-liner the schema walker
+  bypasses — pinned by `compiler_chassis_identity_5694_test.go`),
   `interface-monitor <if> weight <n>` (tokens pack inline into a
   `children==nil` leaf; typing the weight needs a children map, which
   would flip SetPath grouping), `control-ports` (not compiled), and the
