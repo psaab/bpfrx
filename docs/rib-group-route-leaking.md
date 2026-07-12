@@ -120,6 +120,28 @@ The window warn (`validateRoutingRuleWindowWarnings`) additionally flags a
 config that would leak more than `maxRibGroupLeakRules` (1000) connected
 prefixes.
 
+### Strict rejection — undefined `next-table` target (#5693)
+
+A static route whose `next-table <target>` names a routing-instance that is
+**not defined** in the config is now **hard-rejected at commit**
+(`validateNextTableTargetReferencesStrict`, `compiler_validate_strict_routing.go`).
+Previously the target was unvalidated: the applier
+(`pkg/routing.nextTableManager.Apply`) resolves it through a name→table-id map
+built only from defined instances, so an undefined target missed the lookup,
+logged `next-table references unknown routing instance`, and **silently skipped
+the rule** — the intended inter-VRF leak never happened and matching traffic
+followed the ingress table's own routes (often the WAN default). The gate
+resolves the target with the same `parseNextTableInstance` the applier uses
+(strip the trailing `.inet[6].N` suffix → instance name) so the commit gate and
+the runtime applier stay in lockstep on what resolves (the #2226 rib-group
+doctrine). The error quotes the operator's **raw** `next-table` token
+(`StaticRoute.NextTableRaw`, preserved before the suffix strip) so a
+`Comcst.inet.0` typo is named verbatim. Only the global `inet.0` + `inet6.0`
+static routes are validated — those are exactly the routes `daemon_apply` feeds
+to `ApplyNextTableRules`. Strict on commit / commit-check; downgraded to a
+warning on the tolerant load / peer-sync paths (`opts.lenientNextTableRefs`,
+#1960 no-brick) since the applier keeps a dangling next-table inert.
+
 ## Deferred (Phase 2 and beyond)
 
 - **VRF→VRF import targets** — need `iif`-scoped rules or true route-copy;

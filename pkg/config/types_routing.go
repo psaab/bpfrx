@@ -234,6 +234,13 @@ type StaticRoute struct {
 	Reject     bool
 	Preference int    // route preference (admin distance), default 5
 	NextTable  string // routing instance name for inter-VRF route leaking (e.g. "Comcast.inet.0" → "Comcast")
+	// NextTableRaw preserves the operator's original next-table token
+	// (e.g. "Comcast.inet.0") before parseNextTableInstance strips the
+	// family/index suffix. The commit-time definedness gate
+	// (validateNextTableTargetReferencesStrict) reports this raw token so
+	// the error names exactly what was typed, and the raw grammar is not
+	// lost before validation runs (#5693). Empty when no next-table.
+	NextTableRaw string
 }
 
 // ProtocolsConfig holds dynamic routing protocol configuration.

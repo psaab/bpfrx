@@ -24,6 +24,36 @@
 - **File(s)**: pkg/config/schema_routing.go, pkg/config/schema_walk.go,
   pkg/config/schema_nexthop_validation_5726_test.go, docs/config-schema.md
 
+## 2026-07-12 — #5693 (bug): validate next-table target routing-instance definedness at commit
+- **Timestamp**: 2026-07-12 (fix/5693-nexttable-target-defined)
+- **Action**: codex-review-182 M14. A static route whose `next-table <target>`
+  named an UNDEFINED routing-instance was accepted at commit and then silently
+  dropped at apply time: the applier (pkg/routing.nextTableManager.Apply)
+  resolves the target via a name→table-id map built only from defined
+  instances, missed the lookup, warned, and SKIPPED the rule — the intended
+  inter-VRF leak never happened and matching traffic followed the ingress
+  table's own routes. The raw next-table grammar was also lost before
+  validation (parseNextTableInstance strips the .inet[6].N suffix at compile).
+  Fix: (a) preserve the operator's raw token in a new
+  StaticRoute.NextTableRaw field (populated at both compile sites +
+  same-destination merge); (b) add validateNextTableTargetReferencesStrict
+  (compiler_validate_strict_routing.go) — for each GLOBAL inet.0/inet6.0 static
+  route with a next-table, require the parsed instance to be a defined
+  routing-instance, rejecting with an error that quotes the raw token. Wired in
+  runUniformGates after the rib-group gate; strict on commit/commit-check,
+  downgraded to a warning on tolerant load/peer-sync (opts.lenientNextTableRefs,
+  #1960). Mirrors validateRibGroupImportRibReferencesStrict and keeps the commit
+  gate + runtime applier in lockstep on resolvability (#2226). Fail-on-revert
+  proven: neutering the gate → all reject tests RED. Fixed two pre-existing
+  tests that used undefined targets (TestNextTableStaticRoutes /
+  TestIPv6NextTableStaticRoutes now define the instance) + regenerated
+  golden_4406 baseline (benign: only the new empty NextTableRaw field).
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/compiler_routing_nexttable_target_5693_test.go,
+  pkg/config/parser_routing_test.go, pkg/config/testdata/golden_4406.json,
+  docs/rib-group-route-leaking.md
 ## 2026-07-12 — #5714 (bug/security): web-mgmt bind resolves Junos ifname to Linux kernel name before InterfaceByName
 - **Timestamp**: 2026-07-12 (fix/5714-webmgmt-ifname)
 - **Action**: codex-review-182 M42. The web-management HTTP/HTTPS bind passed

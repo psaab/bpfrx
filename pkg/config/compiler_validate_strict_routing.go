@@ -720,6 +720,78 @@ func ribInstanceFromName(ribName string) (string, bool) {
 	return "", false
 }
 
+// validateNextTableTargetReferencesStrict hard-rejects a static route whose
+// `next-table <target>` names a routing-instance that is NOT defined in the
+// config (a typo, a deleted instance, or an unparseable target). next-table
+// implements inter-VRF route leaking: the applier (pkg/routing.nextTableManager
+// Apply) resolves the target to a kernel table id via a map keyed by
+// routing-instance NAME. An unresolvable target had `tableIDs[...] == !ok`,
+// so the applier logged a `slog.Warn("next-table references unknown routing
+// instance")` and SKIPPED the rule — the leak silently never happened, with no
+// commit-time diagnostic. Traffic that the operator intended to leak into
+// another VRF instead followed the ingress table's own default (often the WAN
+// default route), a silent mis-forward.
+//
+// The gate resolves the target with the SAME parseNextTableInstance the
+// compiler and applier use (strip the trailing .inet[6].N suffix → instance
+// name), then requires that name to be a defined routing-instance. This keeps
+// the commit-time gate and the runtime applier in lockstep on what resolves
+// (the #2226 rib-group doctrine). The error names the RAW next-table token the
+// operator typed (route.NextTableRaw, preserved before the suffix strip, #5693)
+// so a "Comcst.inet.0" typo is quoted verbatim rather than as the stripped
+// "Comcst".
+//
+// Only the GLOBAL inet.0 + inet6.0 static routes are validated — those are
+// exactly the routes daemon_apply feeds to ApplyNextTableRules
+// (daemon_apply.go); next-table on a per-instance static route is never
+// programmed, so validating it would reject a target the applier never
+// resolves. Routes are walked inet.0 then inet6.0 in declaration order so the
+// first-reported error is deterministic.
+//
+// Strict on commit / commit-check (hard reject so the typo is operator-
+// visible); the call site downgrades this to a warning on the tolerant load /
+// peer-sync paths (opts.lenientNextTableRefs) so an already-persisted or peer-
+// synced config carrying a dangling next-table still BOOTS (#1960
+// fail-closed-on-load class) — the applier's tableIDs !ok guard keeps it inert.
+// Mirrors validateRibGroupImportRibReferencesStrict.
+func validateNextTableTargetReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	definedInstance := make(map[string]bool, len(cfg.RoutingInstances))
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil && ri.Name != "" {
+			definedInstance[ri.Name] = true
+		}
+	}
+	routeSets := [][]*StaticRoute{
+		cfg.RoutingOptions.StaticRoutes,
+		cfg.RoutingOptions.Inet6StaticRoutes,
+	}
+	for _, routes := range routeSets {
+		for _, sr := range routes {
+			if sr == nil || sr.NextTable == "" {
+				continue
+			}
+			if definedInstance[sr.NextTable] {
+				continue
+			}
+			raw := sr.NextTableRaw
+			if raw == "" {
+				raw = sr.NextTable
+			}
+			return fmt.Errorf(
+				"routing-options static route %q next-table %q references an "+
+					"undefined routing-instance %q; define `set routing-instances "+
+					"%s instance-type ...` in the same commit or the next-table "+
+					"leak is silently dropped at apply time and matching traffic "+
+					"follows the ingress table's own routes",
+				sr.Destination, raw, sr.NextTable, sr.NextTable)
+		}
+	}
+	return nil
+}
+
 // validateRouteFilterMatchTypesStrict gates the two route-filter match-types
 // that the FRR prefix-list backend cannot render losslessly (#2525):
 //
