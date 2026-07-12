@@ -437,7 +437,9 @@ func newCollector(srv *Server) *xpfCollector {
 
 		// #1387 inc-2: DHCP dynamic-DNS counters. Label cardinality is
 		// CLOSED (plan §4.4 m4): result in {ok,fail}; reason in
-		// {no-name,no-backend,conflict,ptr-notauth} — never a raw rcode.
+		// {no-name,no-backend,conflict,ptr-notauth,ptr-deferred,coowned} —
+		// never a raw rcode. "coowned" (#5709) counts wire deletes suppressed
+		// because the RR is still co-owned by another DDNS scope.
 		dhcpDDNSUpsertsTotal: prometheus.NewDesc(
 			"xpf_dhcp_ddns_upserts_total",
 			"Total DHCP dynamic-DNS forward/reverse record upserts by result.",

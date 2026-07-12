@@ -47130,6 +47130,29 @@ top.
   pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
   pkg/daemon/README.md
 
+- **Timestamp**: 2026-07-12
+- **Action**: #5709 fix (codex-review-182 M36) — prevent a DDNS wire-RR
+  cross-scope clobber. Two DDNS scopes (e.g. two redundancy groups, or a
+  per-interface + global binding) can resolve the same host to the same
+  address and CO-OWN one wire resource record; each keeps a distinct
+  ownership row (ScopeKey prefix) but on the wire there is ONE RR. Because
+  `deleteOwnedLocked` reconstructed the wire RR from {FQDN, ForwardType,
+  Address} alone, one scope's teardown (lease expiry / config removal)
+  issued a wire DELETE that removed the RR the OTHER scope still owned —
+  clobbering a live record. Added `wireRRSharedWithOther(owned)`: when
+  another store row (a different scope) carries the same canonical FQDN +
+  forward type + rdata, `deleteOwnedLocked` SUPPRESSES the wire delete,
+  releases only the departing scope's claim, and leaves the live RR for the
+  surviving scope (reference-count decrement over the claim table; equal
+  {FQDN, Address} implies an equal reverse PTR so both directions are
+  covered). Runs before the wire op and is backend-independent. Counted via
+  `Stats.DeleteCoowned` + `xpf_dhcp_ddns_skipped_total{reason="coowned"}`.
+  Added fail-on-revert test `TestCoOwnedWireRRSurvivesOtherScopeTeardown`
+  (RED proven by neutralizing the guard: RG1 teardown deleted the co-owned
+  RR; GREEN restored). gofmt clean; pkg/ddns + pkg/api suites green.
+- **File(s)**: pkg/ddns/manager.go, pkg/ddns/scope_test.go,
+  pkg/api/metrics_system.go, pkg/api/metrics_descriptors.go,
+  pkg/ddns/README.md
 - **Timestamp**: 2026-07-12 (#5680)
 - **Action**: #5680 fix — route-only publication no longer ACKs an
   old-policy/new-route HYBRID as the applied config. PublishRouteOverlaySnapshot
