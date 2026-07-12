@@ -3,6 +3,7 @@ package userspace
 import (
 	"fmt"
 	"log/slog"
+	"reflect"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -135,6 +136,43 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 		return false, nil
 	}
 
+	// #5680: fail-closed hybrid-ACK guard. A route-only publish rebuilds ONLY
+	// next.Routes (below) and inherits EVERY compiled policy section
+	// (Zones/Policies/NAT/Screens/AddressBooks/...) verbatim from m.lastSnapshot
+	// via `next := *m.lastSnapshot`. Those sections were built by the last full,
+	// Compile-based apply_snapshot from m.lastSnapshot.Config — this path never
+	// re-compiles. If the caller passes a cfg whose POLICY half was never
+	// compiled into that snapshot, stamping next.Config = cfg and calling
+	// markAppliedSnapshotLocked would advance the applied identity
+	// (appliedSnapshot.Config) to a cfg the helper's live policy does NOT match:
+	// an OLD-policy/NEW-route HYBRID ACK'd as the newly applied config.
+	//
+	// This is the #5679 residual: an ordinary d.dp.ApplyConfig failure captures
+	// applyErr and continues (fail-closed but complete) WITHOUT advancing
+	// m.lastSnapshot, while store.Commit has already promoted the NEW cfg. The
+	// tail route-leak republish (reconcileRouteLeakSnapshot) and the
+	// ip-monitoring actuator then call this with the NEW cfg. Refuse the publish
+	// (fail-closed) so the applied identity never advances past the policy the
+	// dataplane actually enforces; the OLD, fully-consistent snapshot stays live
+	// and the caller reconverges once a full apply republishes the policy
+	// (reconcileRouteLeakSnapshot warns; the ipmon actuator stays dirty and
+	// retries). The deferred m.routeOverlay commit above is gated on err == nil,
+	// so a refused publish also leaves the desired-overlay cache at its
+	// last-applied baseline (the #3760 mutate-after-success contract).
+	//
+	// In EVERY legitimate route-only publish cfg IS the applied config: the
+	// ip-monitoring actuator passes store.ActiveConfig() and the route-leak
+	// reconcile passes the just-applied cfg, both pointer-identical to
+	// m.lastSnapshot.Config (ApplyConfig stores the exact object ActiveConfig
+	// returns). The pointer check short-circuits that common fast path; the
+	// content fallback only rejects a genuinely divergent config, never a
+	// distinct-but-equal one.
+	if routeOnlyPublishHybrid(cfg, m.lastSnapshot.Config) {
+		return false, fmt.Errorf("refusing route-only publish: cfg carries an unpublished " +
+			"policy delta the dataplane snapshot does not reflect; publishing would ACK an " +
+			"old-policy/new-route hybrid as the applied config (#5680)")
+	}
+
 	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
 		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 			slog.Warn("userspace: failed to disarm helper after refusing overlay publish",
@@ -194,4 +232,27 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	slog.Info("userspace: route overlay snapshot published",
 		"generation", next.Generation, "overlay_routes", len(desiredOverlay))
 	return true, nil
+}
+
+// routeOnlyPublishHybrid reports whether a route-only publish for cfg would ship
+// an OLD-policy/NEW-route hybrid (#5680). applied is the config whose compiled
+// policy sections the current lastSnapshot carries (m.lastSnapshot.Config, set
+// together at each full Compile-based apply). The publish is a hybrid iff cfg is
+// NOT that config: it re-derives routes from cfg but keeps applied's compiled
+// policy, so ACK'ing cfg as applied would misreport the enforced policy.
+//
+// Nil applied (no established policy identity — e.g. the config-less bootstrap
+// snapshot) is not a hybrid: there is no policy identity to violate. Pointer
+// identity is the common legitimate case and the cheap fast path; the
+// reflect.DeepEqual fallback ensures a distinct-but-content-equal config is
+// accepted (never a false refusal) while a genuinely divergent config is
+// refused.
+func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
+	if applied == nil {
+		return false
+	}
+	if cfg == applied {
+		return false
+	}
+	return !reflect.DeepEqual(cfg, applied)
 }

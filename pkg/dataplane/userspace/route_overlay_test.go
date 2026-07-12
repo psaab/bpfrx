@@ -296,6 +296,137 @@ func TestPublishRouteOverlaySnapshotWithoutHelper(t *testing.T) {
 	}
 }
 
+// TestPublishRouteOverlaySnapshotRefusesPolicyHybrid is the #5680 fail-on-revert
+// regression. A route-only publish rebuilds ONLY the Routes section and inherits
+// every compiled policy section from m.lastSnapshot; it must NOT ACK a cfg whose
+// policy half was never compiled into that snapshot. Otherwise a route-only
+// publish advances the applied identity to an OLD-policy/NEW-route hybrid: the
+// operator is told the new config is live while the dataplane still enforces the
+// old policy.
+//
+// This models the #5679 residual: an ordinary d.dp.ApplyConfig failure captures
+// applyErr and continues WITHOUT advancing m.lastSnapshot, while store.Commit has
+// already promoted the NEW cfg. The tail route-leak republish and the
+// ip-monitoring actuator then call PublishRouteOverlaySnapshot with that NEW cfg.
+//
+// RED-on-revert: delete the routeOnlyPublishHybrid guard in
+// PublishRouteOverlaySnapshot and this test fails three ways — the publish
+// returns published=true with a nil error, m.appliedSnapshot.Config advances to
+// the unpublished cfgB, and the hybrid apply_snapshot is shipped to the helper.
+func TestPublishRouteOverlaySnapshotRefusesPolicyHybrid(t *testing.T) {
+	dir := t.TempDir()
+	controlSock, reqCh := overlayControlServer(t, dir)
+
+	// cfgA is the config the dataplane actually compiled and enforces: a LOOSER
+	// default-policy PERMIT. It is the currently applied policy identity.
+	cfgA := overlayTestConfig()
+	cfgA.Security.DefaultPolicy = config.PolicyPermit
+
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	m.cfg.ControlSocket = controlSock
+	m.generation = 7
+	m.lastSnapshot, _ = buildSnapshot(cfgA, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
+		m.lastSnapshotHash = h
+	}
+	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+	// The helper is enforcing cfgA at generation 7 — establish that applied
+	// identity so we can assert it does not advance.
+	m.appliedSnapshot = appliedSnapshot{Config: cfgA, Generation: 7}
+
+	// cfgB is the NEWLY-committed config whose policy half was NOT compiled into
+	// the dataplane. It TIGHTENS the default policy to DENY (the exact
+	// fail-open-to-stale hazard: a new deny that never reached the wire) and also
+	// moves a route, so a naive route-only publish would ship cfgB's routes on
+	// top of cfgA's PERMIT policy and ACK it as cfgB.
+	cfgB := overlayTestConfig()
+	cfgB.Security.DefaultPolicy = config.PolicyDeny
+	cfgB.RoutingOptions.StaticRoutes = append(cfgB.RoutingOptions.StaticRoutes,
+		&config.StaticRoute{Destination: "10.30.0.0/16", NextHops: []config.NextHopEntry{{Address: "172.16.50.9"}}})
+
+	overlay := []config.RouteOverlayEntry{
+		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
+	}
+
+	published, err := m.PublishRouteOverlaySnapshot(cfgB, overlay, nil)
+	if err == nil {
+		t.Fatal("expected route-only publish to be refused for an unpublished policy delta, got nil error")
+	}
+	if published {
+		t.Fatal("hybrid publish reported published=true")
+	}
+
+	// Core hybrid-ACK assertion: the applied identity must stay at cfgA (the
+	// policy the dataplane actually enforces), NOT advance to the unpublished
+	// cfgB.
+	if m.appliedSnapshot.Config != cfgA {
+		t.Fatalf("applied identity advanced to the unpublished config: appliedSnapshot.Config=%p, want cfgA=%p (hybrid ACK)",
+			m.appliedSnapshot.Config, cfgA)
+	}
+	if m.lastSnapshot == nil || m.lastSnapshot.Config != cfgA {
+		t.Fatalf("lastSnapshot advanced past the enforced policy (hybrid): want Config=cfgA=%p", cfgA)
+	}
+
+	// The hybrid snapshot must never be shipped to the helper.
+	select {
+	case req := <-reqCh:
+		t.Fatalf("hybrid snapshot was shipped to the helper: %+v", req.Type)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// A refused publish must not advance the desired-overlay cache (#3760
+	// mutate-after-success contract): it stays at its nil baseline.
+	if got := m.routeOverlaySnapshot(); len(got) != 0 {
+		t.Fatalf("refused publish advanced the desired-overlay cache: %+v", got)
+	}
+}
+
+// TestPublishRouteOverlaySnapshotAcceptsEqualConfigDistinctPointer guards the
+// #5680 fix against a false refusal: a caller that passes a DISTINCT but
+// content-equal *config.Config (not pointer-identical to m.lastSnapshot.Config)
+// is a legitimate route-only publish and must still succeed. Only a genuine
+// policy divergence is refused.
+func TestPublishRouteOverlaySnapshotAcceptsEqualConfigDistinctPointer(t *testing.T) {
+	dir := t.TempDir()
+	controlSock, reqCh := overlayControlServer(t, dir)
+
+	applied := overlayTestConfig()
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	m.cfg.ControlSocket = controlSock
+	m.generation = 7
+	m.lastSnapshot, _ = buildSnapshot(applied, config.UserspaceConfig{ControlSocket: controlSock}, 7, 0)
+	if h, ok := snapshotContentHash(m.lastSnapshot); ok {
+		m.lastSnapshotHash = h
+	}
+	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+
+	// A separate object with identical content — the fix must accept this.
+	equal := overlayTestConfig()
+	if equal == applied {
+		t.Fatal("test setup: expected distinct config pointers")
+	}
+	overlay := []config.RouteOverlayEntry{
+		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
+	}
+	published, err := m.PublishRouteOverlaySnapshot(equal, overlay, nil)
+	if err != nil {
+		t.Fatalf("content-equal distinct-pointer config was falsely refused: %v", err)
+	}
+	if !published {
+		t.Fatal("content-equal distinct-pointer publish reported published=false")
+	}
+	select {
+	case req := <-reqCh:
+		if req.Type != "apply_snapshot" {
+			t.Fatalf("request = %q, want apply_snapshot", req.Type)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("legitimate publish did not ship an apply_snapshot")
+	}
+}
+
 // overlayControlServerToggle behaves like overlayControlServer but its
 // apply_snapshot handling can be flipped to fail (OK:false) via the
 // returned setter, so a publish failure can be exercised. All requests
