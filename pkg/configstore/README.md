@@ -347,6 +347,29 @@ per-path:
   a crash in the microseconds between the `writeActive` syscall and the
   `confirm.json` write leaves no `confirm.json` — vastly smaller than
   the whole multi-minute window this closes.
+- **A degenerate `confirm.json` is rejected, never treated as a valid
+  pending confirm (#5637, codex-review-181 M29).** `ReadConfirm` now
+  validates the record's shape and fields, mirroring the #5474
+  `readTreeMeta` hardening. Go's `json.Unmarshal` of a top-level `null`
+  (or `{}`) into `*confirmRecord` returns NO error and yields a
+  ZERO-VALUE record — zero `Deadline`, nil `PrevTree`.
+  `recoverPendingConfirmLocked` would then read `time.Now().After(zeroTime)`
+  as TRUE (an "expired" window) and synthesize a rollback to an EMPTY
+  prev tree, silently WIPING the just-loaded active config to
+  policy-absent (fail-OPEN) on boot. `ReadConfirm` therefore (1) rejects a
+  null/array/scalar decrypted body via `requireJSONObject` BEFORE
+  decoding, and (2) rejects a decoded record with a zero `Deadline` or a
+  nil `PrevTree` — an object check alone still accepts `{}`. A
+  legitimately-written record always carries a real future deadline
+  (`time.Now().Add(window)`) and a non-nil `PrevTree`
+  (`confirmPrevTree = s.active.Clone()`, non-nil even for a first commit —
+  `FirstCommit` distinguishes the empty-bootstrap case), so valid records
+  round-trip unchanged. A rejected read is fail-CLOSED:
+  `recoverPendingConfirmLocked` already logs the read error and skips
+  restoration (keeping the loaded active config, never panicking), so a
+  degenerate record can no longer drive a bogus empty rollback. A
+  genuinely ABSENT `confirm.json` is still the no-confirm-pending path
+  (`(nil, nil)`), not an error.
 - **`confirm.json` removal is ordered AFTER the resolving write is
   durable (#5473).** Resolving a pending window is a **degrade-not-fail**
   operation at three loci — the timeout auto-rollback (`PromoteRollback`),
