@@ -47201,3 +47201,21 @@ top.
   doc comment and the pkg/routing/README.md bond-reconcile "keep" bullet.
   **File(s)**: pkg/routing/bond.go (Edit), pkg/routing/bond_test.go (Edit),
   pkg/routing/README.md (Edit), _Log.md (Edit)
+
+- **Timestamp**: 2026-07-12
+  **Action**: #5710 (M37) — force `request system dynamic-dns update` to
+  re-publish UNCHANGED DHCP DDNS (Surface B) records. Added a one-shot
+  `Manager.ForceRefresh()` latch (mirroring SurfaceAManager.ForceRefresh):
+  it is consumed by the next non-degraded ReconcileScoped pass and threaded
+  via `reconcileEnv.force`; in Pass 1 the unchanged-content short-circuit
+  (`recordsEqual` → `d.seen = true`) is skipped under force so Pass 2
+  re-upserts the RR onto the wire. Force does NOT bypass the per-RG HA writer
+  gate. Wired `Daemon.ForceDDNSUpdate(true)` to arm BOTH surfaces' latch
+  (previously it only nudged the DHCP loop → unchanged records stayed
+  skipped, so repairing a drifted/deleted RR was a silent no-op). Added
+  fail-on-revert `TestReconcileForceRepublishesUnchangedRecord` (proved RED
+  with the `!env.force` guard neutralized: forced upserts=[]; GREEN restored)
+  + `TestForceRefreshLatchArmsNextPass` (latch one-shot via ReconcileScoped).
+  **File(s)**: pkg/ddns/manager.go (Edit), pkg/ddns/manager_test.go (Edit),
+  pkg/daemon/daemon_ddns_surface_a.go (Edit), pkg/ddns/README.md (Edit),
+  _Log.md (Edit)

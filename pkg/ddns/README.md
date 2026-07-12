@@ -736,7 +736,19 @@ its OWN learned address — on top of the SAME spine, without forking the engine
     no-force sibling: it only nudges a re-observe pass (publishes solely changed
     records). Both are wired cmdtree → gRPC `SystemAction("dynamic-dns-update" |
     "dynamic-dns-check")` → `Daemon.ForceDDNSUpdate` across the local + remote
-    CLI.
+    CLI. **The force spans BOTH surfaces (#5710 M37):** `ForceDDNSUpdate(true)`
+    arms the same one-shot latch on the DHCP Surface-B engine (`Manager.
+    ForceRefresh` in `manager.go`) as well as Surface A, so the DHCP-lease
+    reconcile re-asserts an UNCHANGED owned record onto the wire instead of the
+    routine change-detection skip swallowing it. Before #5710 the verb only
+    *nudged* the DHCP loop (a re-observe that still short-circuited unchanged
+    records), so an operator forcing an update to repair a drifted / manually-
+    deleted DHCP RR got a no-op while the command reported success. The DHCP
+    force honours the same per-RG HA writer gate (the unchanged-skip relaxation
+    fires only for scopes already admitted into the desired set) and is one-shot
+    (consumed by the next non-degraded pass). Fail-on-revert:
+    `TestReconcileForceRepublishesUnchangedRecord` +
+    `TestForceRefreshLatchArmsNextPass` in `manager_test.go`.
   - **flat error backoff** — on a transient failure a scope backs off
     (30s → cap, default 1h) so a failing provider is not hammered (ban-avoidance).
     The backoff window is tagged with the wire op that armed it (publish vs

@@ -300,6 +300,17 @@ type Manager struct {
 	degraded       bool
 	degradedReason string
 
+	// forceNext is the operator force-now latch (#5710, the DHCP Surface-B half
+	// of `request system dynamic-dns update`). When set, the NEXT non-degraded
+	// reconcile pass re-asserts (re-upserts) every owned record whose desired
+	// wire tuple is UNCHANGED — bypassing the change-detection short-circuit the
+	// routine reconcile uses for efficiency — so an operator can repair a drifted
+	// / manually-deleted wire RR. It does NOT bypass the per-RG HA writer gate
+	// (only the RG owner publishes) and it is one-shot: consumed by the first
+	// pass that actually runs (a degraded pass never publishes, so it does not
+	// consume the latch). Mirrors SurfaceAManager.forceRefresh. Guarded by mu.
+	forceNext bool
+
 	// newUpdater resolves the live DNS-update backend from the policy +
 	// config resolved at the start of each Reconcile (plan §6 fork 1:
 	// resolve-per-Reconcile). When nil (tests that inject a fixed updater,
@@ -568,6 +579,21 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfig) e
 	return m.ReconcileScoped(ctx, cfg, ReconcileOptions{})
 }
 
+// ForceRefresh arms the operator force-now latch (#5710): the NEXT non-degraded
+// reconcile pass re-asserts (re-upserts) every owned DHCP DDNS record onto the
+// wire even when its content is unchanged, bypassing the change-detection skip
+// the routine reconcile uses for efficiency. It is the DHCP Surface-B half of
+// the `request system dynamic-dns update` operator verb (mirroring
+// SurfaceAManager.ForceRefresh). It does NOT bypass the per-RG HA writer gate —
+// only the redundancy-group owner publishes — and it is one-shot (consumed by
+// the first pass that runs), so it forces exactly one publish round. The daemon
+// arms the latch and then nudges an immediate reconcile.
+func (m *Manager) ForceRefresh() {
+	m.mu.Lock()
+	m.forceNext = true
+	m.mu.Unlock()
+}
+
 // reconcileEnv is the per-pass, per-family resolved environment the reconcile
 // algorithm + the upsert/delete helpers consume (#2691 P1b). It carries each
 // family's INDEPENDENT policy + backend (#2663), plus the HA scope gate +
@@ -577,6 +603,10 @@ type reconcileEnv struct {
 	updater [2]DNSUpdater // [0]=v4, [1]=v6 (resolve-per-Reconcile per family)
 	gate    ScopeGate     // per-scope HA writer gate (#2664); nil ⇒ all writable
 	res     ScopeResolver // lease→scope attribution (#2664); nil ⇒ zero scope
+	// force re-asserts every UNCHANGED owned record on this pass (#5710 operator
+	// force-now). It relaxes only the change-detection skip in Pass 1; the per-RG
+	// HA writer gate still governs which scopes may be published.
+	force bool
 }
 
 // famIdx maps an engine family int (4/6) to the [2] env slot.
@@ -691,11 +721,20 @@ func (m *Manager) ReconcileScoped(ctx context.Context, cfg *config.DHCPServerCon
 		return err
 	}
 
+	// Consume the operator force-now latch (#5710) for THIS pass, AFTER the
+	// degraded short-circuit above so a suspended (state-degraded) pass — which
+	// never publishes — does not swallow the force. One-shot: cleared here so it
+	// forces exactly one publish round; the per-RG HA gate below still governs
+	// which scopes are written even under force.
+	force := m.forceNext
+	m.forceNext = false
+
 	env := reconcileEnv{
 		pol:     [2]ddnsPolicy{pol4, pol6},
 		updater: [2]DNSUpdater{m.updater, m.updater},
 		gate:    opts.Gate,
 		res:     opts.Resolver,
+		force:   force,
 	}
 
 	// Resolve each family's live backend from THIS cycle's policy (plan §6
@@ -1023,7 +1062,16 @@ func (m *Manager) reconcileOnceLocked(ctx context.Context, env *reconcileEnv, le
 			// owned (do NOT delete the live forward) but do NOT mark it settled —
 			// fall through so Pass 2 re-runs the upsert and re-attempts the PTR
 			// (the forward re-add is an idempotent no-op).
-			if !owned.PTRPending {
+			//
+			// Operator force-now (#5710): when env.force is set, also leave the
+			// record UNSETTLED so Pass 2 re-upserts it onto the wire even though
+			// the content is unchanged. This lets `request system dynamic-dns
+			// update` repair a drifted / manually-deleted authoritative RR that
+			// the routine change-detection skip would otherwise never re-publish.
+			// The record is still not deleted (it IS wanted and equal), so force
+			// only relaxes the efficiency skip — never the HA gate, which already
+			// dropped gated scopes from `want`.
+			if !owned.PTRPending && !env.force {
 				d.seen = true // fully published; no add needed below
 			}
 			continue
