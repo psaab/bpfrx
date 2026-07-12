@@ -3159,8 +3159,25 @@ reserved for whole-dataplane selection where a rewrite shim
   rewrite, not a `setSchema` change: adding schema children for `member` /
   `member-range` would alter the flat-set grouping the expansion depends
   on, so the construct stays out of the grammar SSOT and is normalized
-  before any typed-leaf walk. Regression coverage:
-  `pkg/config/compiler_interface_range_4027_test.go`.
+  before any typed-leaf walk. **#5675 (multi-root aggregation):** the pass
+  scans EVERY top-level `interfaces` root, not just the first. A
+  hierarchical config can split its interfaces across two sibling
+  `interfaces { }` stanzas (flat-set always merges onto one root, so this
+  shape is hierarchical-only), and `compileSections` dispatches every root
+  — so a `break`-on-first-root scan skipped an interface-range living in a
+  second root, re-minting the phantom `interface-range` interface and
+  dropping that range's members. The pass now collects ranges and
+  member-own config across all `interfaces` roots and replays the expanded
+  members through `SetPath` (which `compileSections` merges with the rest).
+  Regression coverage:
+  `pkg/config/compiler_interface_range_4027_test.go` and
+  `pkg/config/compiler_multi_root_5675_5691_test.go`
+  (`TestInterfaceRangeSecondRootExpands_5675`). The sibling stable-ID
+  collision gates (zone `#3075`, tunnel `#1873`, routing-instance `#3855`)
+  carried the same first-root-only defect for split `security` /
+  `interfaces` / `routing-instances` roots and were fixed the same way
+  (`#5691`, `ConfigTree.FindChildren`-based union across all matching
+  roots).
 - **#3444 (destination-NAT rule-set `to` scope reject):** a Junos
   destination-NAT rule-set has only a `from` clause (zone | interface |
   routing-instance) — DNAT translates the destination on inbound, so there
