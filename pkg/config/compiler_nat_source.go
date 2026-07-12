@@ -730,15 +730,31 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 									rule.Then.PoolName = t.Keys[2]
 								}
 							}
-						} else if t.FindChild("interface") != nil {
-							rule.Then.Type = NATSource
-							rule.Then.Interface = true
-						} else if t.FindChild("off") != nil {
-							rule.Then.Type = NATSource
-							rule.Then.Off = true
-						} else if poolNode := t.FindChild("pool"); poolNode != nil {
-							rule.Then.Type = NATSource
-							rule.Then.PoolName = nodeVal(poolNode)
+						} else {
+							// #5628: read EVERY hierarchical terminal child, not
+							// the first one only (the former `else if` chain
+							// silently picked interface > off > pool by child
+							// order). A well-formed `source-nat { pool P; }` still
+							// sets exactly one field, so this is bit-identical for
+							// a valid single-child block. A CONTRADICTORY
+							// single-node block such as `source-nat { interface;
+							// pool P; }` now sets BOTH fields, so the resolved
+							// NATThen faithfully carries two terminal actions and
+							// validateNATTerminalActionCardinalityStrict rejects it
+							// (strict commit) / warns (tolerant load) instead of
+							// silently reinterpreting it.
+							if t.FindChild("interface") != nil {
+								rule.Then.Type = NATSource
+								rule.Then.Interface = true
+							}
+							if t.FindChild("off") != nil {
+								rule.Then.Type = NATSource
+								rule.Then.Off = true
+							}
+							if poolNode := t.FindChild("pool"); poolNode != nil {
+								rule.Then.Type = NATSource
+								rule.Then.PoolName = nodeVal(poolNode)
+							}
 						}
 					}
 				}

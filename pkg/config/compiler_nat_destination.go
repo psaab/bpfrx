@@ -207,12 +207,23 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 						} else if len(t.Keys) >= 3 && t.Keys[1] == "pool" {
 							rule.Then.Type = NATDestination
 							rule.Then.PoolName = t.Keys[2]
-						} else if poolNode := t.FindChild("pool"); poolNode != nil {
-							rule.Then.Type = NATDestination
-							rule.Then.PoolName = nodeVal(poolNode)
-						} else if t.FindChild("off") != nil {
-							rule.Then.Type = NATDestination
-							rule.Then.Off = true
+						} else {
+							// #5628: read EVERY hierarchical terminal child, not
+							// the first one only (see the source-NAT note). A valid
+							// single-child block (`destination-nat { pool P; }` or
+							// `{ off; }`) is bit-identical; a contradictory
+							// `destination-nat { pool P; off; }` now sets BOTH
+							// fields so validateNATTerminalActionCardinalityStrict
+							// can reject it instead of the compiler silently
+							// picking pool by child order.
+							if poolNode := t.FindChild("pool"); poolNode != nil {
+								rule.Then.Type = NATDestination
+								rule.Then.PoolName = nodeVal(poolNode)
+							}
+							if t.FindChild("off") != nil {
+								rule.Then.Type = NATDestination
+								rule.Then.Off = true
+							}
 						}
 					}
 				}

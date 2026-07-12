@@ -1656,6 +1656,26 @@ type compileOpts struct {
 	// lenientDNATToScope.
 	lenientNATMixedScope bool
 
+	// lenientNATTerminalAction (#5628, codex-review-181 M16) downgrades the
+	// source/destination NAT terminal-action cardinality gate
+	// (validateNATTerminalActionCardinalityStrict) from a hard compile error to
+	// a cfg.Warnings entry. A NAT rule whose complete `then {}` block carries
+	// ZERO terminal actions (actionless — the snapshot builder installs no
+	// translation, so an intended `off` exemption silently disappears and a
+	// later broader rule is revealed) or TWO+ mutually-exclusive actions inside
+	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
+	// picks one by packed-key / child order, so an exemption can publish as a
+	// translation) was previously accepted. The strict commit / commit-check
+	// path hard-rejects so the malformed rule is operator-visible; the tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
+	// closed-on-load class) — a leniently-loaded actionless rule is inert and a
+	// contradictory one keeps the pre-#5628 field-precedence pick, so the
+	// tolerant path is no worse than before the gate. Duplicate `then`
+	// CONTAINERS remain #3850 last-wins (the gate counts the winning block
+	// only). Same doctrine as lenientNATMixedScope.
+	lenientNATTerminalAction bool
+
 	// lenientEventWithinTrigger (#3751) downgrades the event-options
 	// within/trigger numeric gate (validateEventOptionsWithinAST) from a hard
 	// compile error to a cfg.Warnings entry. A non-numeric / negative / zero /
@@ -1847,6 +1867,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
+		lenientNATTerminalAction:               true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
@@ -2119,6 +2140,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
+		lenientNATTerminalAction:               true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,

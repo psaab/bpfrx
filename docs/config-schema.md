@@ -1083,6 +1083,33 @@ false-reject that valid Junos config (the #4191 class). It is a follow-up:
 model the rule-level persistent-nat leaves (or make an accept-with-advisory
 decision) FIRST, then flip.
 
+**Terminal-action CARDINALITY — NAT rule `then` (codex-review-181 M16, #5628).**
+The closed-world keyword audit above validates WHICH keywords may appear under
+`then`, but not HOW MANY translation actions a rule carries. A malformed or
+mixed-version rule could still present a complete `then {}` block with ZERO
+NAT-terminal actions (actionless — the snapshot builder installs no
+translation, so an intended `off` exemption silently disappears and a later
+broader rule is revealed) or TWO+ mutually-exclusive actions (`off` + `pool`,
+`interface` + `pool` — the compiler silently picked one by packed-key / child
+order, so an exemption could publish as a translation). `security nat
+{source,destination} rule … then` must therefore carry EXACTLY ONE NAT-terminal
+action (SNAT: `source-nat` `interface` | `pool <p>` | `off`; DNAT:
+`destination-nat` `pool <p>` | `off`). This is a cross-cutting cardinality rule
+the per-leaf schema walk cannot express, so it lives in the strict-gate family
+as `validateNATTerminalActionCardinalityStrict`
+(`compiler_validate_strict_nat.go`, wired in `runUniformGates`): strict on
+commit / commit-check, lenient (warn — `lenientNATTerminalAction`, #1960
+no-brick) on the tolerant load / peer-sync path. It counts actions WITHIN one
+complete `then` block — duplicate `then` CONTAINERS remain #3850's intentional
+last-wins merge (`compileNAT{Source,Destination}` reset `rule.Then` per block,
+so the count reflects the winning block) and are NOT rejected. The
+`compileNAT{Source,Destination}` hierarchical setters were changed from an
+`else if` chain to independent `if`s so a single-node contradiction
+(`source-nat { interface; pool p; }`) records both fields rather than silently
+picking one. Production tests:
+`compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
+zero/two/valid + #3850 last-wins preservation).
+
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`
 (`schema_security.go`), each after the same leaf-completeness audit — the

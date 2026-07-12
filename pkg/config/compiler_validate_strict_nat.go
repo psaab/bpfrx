@@ -1472,3 +1472,114 @@ func validateStaticNATThenTargetStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// natThenTerminalActionCount returns how many mutually-exclusive NAT-terminal
+// translation actions a resolved NATThen carries: source-nat `interface`,
+// `off`, or a `pool <name>` for source NAT; `off` or a `pool <name>` for
+// destination NAT (destination NAT never sets Interface). Exactly one of these
+// is the well-formed case. Because compileNATSource/compileNATDestination RESET
+// `rule.Then` at the top of each complete `then {}` block (#3850 last-wins),
+// this count reflects only the WINNING (last) block — duplicate `then`
+// CONTAINERS that each carry a single action resolve to one action here, never
+// a false conflict. A count of two only arises when one complete then-block
+// carries contradictory actions (e.g. `off` + `pool`, or a single hierarchical
+// `source-nat { interface; pool P; }` node, which #5628's setter change now
+// records as two set fields rather than silently picking one by child order).
+func natThenTerminalActionCount(then NATThen) int {
+	n := 0
+	if then.Interface {
+		n++
+	}
+	if then.Off {
+		n++
+	}
+	if then.PoolName != "" {
+		n++
+	}
+	return n
+}
+
+// validateNATTerminalActionCardinalityStrict (#5628, codex-review-181 M16)
+// hard-rejects a source- or destination-NAT rule whose complete `then {}` block
+// does not carry EXACTLY ONE NAT-terminal translation action:
+//
+//   - ZERO actions (an actionless rule, or a `then {}` whose only child is not a
+//     recognized source-nat/destination-nat terminal): the rule commits but the
+//     snapshot builder installs no translation, so matching traffic falls
+//     through to a later, broader rule — an intended `off` exemption silently
+//     disappears (the #3844 fail-open class).
+//
+//   - TWO OR MORE actions (contradictory, mutually-exclusive translations such
+//     as `off` + `pool` or `interface` + `pool` inside ONE block): the actions
+//     are mutually exclusive and the compiler would otherwise pick one by
+//     packed-key / child order, so an intended exemption can publish as a
+//     translation (the inverse of the authored action — a security-boundary
+//     decision).
+//
+// This counts actions WITHIN one complete then-block only. Duplicate `then`
+// CONTAINERS are #3850's intentional last-wins merge (compileNAT resets
+// rule.Then per block, so the count reflects the winning block) and are NOT
+// rejected here — a rule with two `then` blocks each naming one action still
+// commits. Strict on commit / commit-check (hard reject so the malformed rule
+// is operator-visible); the caller downgrades to a warning on the tolerant load
+// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick) — a
+// leniently-loaded actionless rule is inert (installs nothing) and a
+// contradictory one keeps the pre-#5628 field-precedence pick, so the tolerant
+// path is no worse than before the gate. Rule-sets are walked in sorted name
+// order for a deterministic first-reported offender.
+func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(kind, actions string, rulesets []*NATRuleSet) error {
+		sorted := append([]*NATRuleSet(nil), rulesets...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i] == nil || sorted[j] == nil {
+				return sorted[i] != nil
+			}
+			return sorted[i].Name < sorted[j].Name
+		})
+		for _, rs := range sorted {
+			if rs == nil {
+				continue
+			}
+			for _, rule := range rs.Rules {
+				if rule == nil {
+					continue
+				}
+				switch n := natThenTerminalActionCount(rule.Then); {
+				case n == 0:
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: `then` carries no translation action "+
+							"(expected exactly one of %s); the rule would commit but installs no "+
+							"translation, so matching traffic falls through to a later broader "+
+							"rule — an intended exemption silently disappears",
+						kind, rs.Name, rule.Name, actions)
+				case n >= 2:
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
+							"translation actions (expected exactly one of %s); the compiler would "+
+							"silently pick one by packed-key/child order, so an intended exemption "+
+							"can publish as a translation. (Duplicate `then` CONTAINERS resolve "+
+							"last-wins per #3850; this rejects contradictory actions inside one "+
+							"block.)",
+						kind, rs.Name, rule.Name, n, actions)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("source",
+		"`source-nat interface`, `source-nat pool <p>`, or `source-nat off`",
+		cfg.Security.NAT.Source); err != nil {
+		return err
+	}
+	if cfg.Security.NAT.Destination != nil {
+		if err := check("destination",
+			"`destination-nat pool <p>` or `destination-nat off`",
+			cfg.Security.NAT.Destination.RuleSets); err != nil {
+			return err
+		}
+	}
+	return nil
+}
