@@ -190,6 +190,37 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 		if snap.Zone == "" || hostInboundLifelineInterface(snap.Name, lifelines) {
 			continue
 		}
+		// #5699: a PHYSICAL (no-unit) snapshot whose unit 0 COLLAPSES onto the
+		// SAME kernel netdev carries the identical live addresses as that unit-0
+		// snapshot — buildLinkSnapshot(base-linux) and buildLinkSnapshot(unit0-
+		// linux) enumerate the same kernel addresses. But the base ref keys them
+		// under overrideByIface[base] (base-level override only), while unit 0
+		// keys them under overrideByIface[base.0] (base ∪ unit-0 override, the
+		// dataplane-additive #3720 resolution). When a per-interface override on
+		// the unit-0 ref makes those two signatures differ, the SINGLE live
+		// address is emitted into TWO views with conflicting admit sets — the
+		// kernel host-inbound chain matches destination address only, so the
+		// verdict is order-dependent (a deterministic false-deny). Unit 0's view
+		// is the authoritative carrier (its merged override matches enforcement),
+		// so skip the base's redundant contribution.
+		//
+		// Gate strictly on the ACTUAL same-netdev collapse, NOT merely
+		// "unit 0 exists": a VLAN unit 0 (VlanID>0) or a tunnel-mapped unit 0
+		// resolves to a DISTINCT netdev (snapshotLinuxName -> "<base>.<vlan>" /
+		// the tunnel name), so base and unit-0 enumerate DISJOINT addresses.
+		// Skipping the base there would DROP the base netdev's own live address
+		// from every host-inbound view — no longer deny-scoped, the kernel input
+		// chain falls through to `policy accept` (FAIL-OPEN). Compare the unit-0
+		// resolved linux name to the base snapshot's linux name so the skip fires
+		// only when they are literally the same kernel device.
+		if !strings.Contains(snap.Name, ".") {
+			if ifc := cfg.Interfaces.Interfaces[snap.Name]; ifc != nil {
+				if u0 := ifc.Units[0]; u0 != nil &&
+					snapshotLinuxName(cfg, snap.Name, ifc, u0) == snap.LinuxName {
+					continue
+				}
+			}
+		}
 		zone := cfg.Security.Zones[snap.Zone]
 		if !configured(zone) {
 			continue

@@ -427,7 +427,12 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 	return config.LinuxIfName(ifName)
 }
 
-func buildLinkSnapshot(linuxName string) (ifindex int, mtu int, hardwareAddr string, addresses []InterfaceAddressSnapshot) {
+// buildLinkSnapshot resolves a kernel interface's live ifindex/MTU/MAC/addresses.
+// It is a package var so the host-inbound view builder (which resolves the base
+// netdev's LIVE addresses through it) is unit-testable without a real kernel
+// interface — the #5699 base-vs-unit-0 double-emission only manifests when the
+// base netdev actually carries the (unit-0-collapsed) live address.
+var buildLinkSnapshot = func(linuxName string) (ifindex int, mtu int, hardwareAddr string, addresses []InterfaceAddressSnapshot) {
 	if linuxName == "" {
 		return 0, 0, "", nil
 	}
