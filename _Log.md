@@ -1,3 +1,28 @@
+## 2026-07-12 — #5702 (bug): mixed-family route-filter split must AND the off-family from-prefix-list predicate
+- **Timestamp**: 2026-07-12 (fix/5702-routefilter-mixedfamily)
+- **Action**: codex-review-182 M27. A policy-statement term whose route-filters
+  mix families (v4 + v6) SPLITS into a per-family v4 sequence and a v6 sequence
+  (#2607). When that term ALSO carried a `from prefix-list` of a single family,
+  the renderer (renderPolicyTermSequences / emitTermBody in
+  pkg/frr/policy_render.go) DROPPED the off-family prefix-list `match` line —
+  guarded emission `if seqFam=="" || (seqFam=="v6"&&matchKW=="ipv6") ||
+  (seqFam=="v4"&&matchKW=="ip")`. That left the off-family sequence with only its
+  route-filter match, silently LOOSENING the term's AND to its route-filter half:
+  a v4 route matching the v4 route-filter matched the term even though the term
+  also required membership in a v6-only prefix-list no v4 route can satisfy — a
+  fail-OPEN policy-semantics change. Fix: always emit the `from prefix-list`
+  match line. In the off-family sequence it names a DIFFERENT FRR match type than
+  the sequence's own `match ip/ipv6 address <route-filter>`, so the two coexist
+  and the sequence AND-NOMATCHes every route of that family — i.e. the off-family
+  half is NON-MATCHING, honoring the AND as an unsatisfiable constraint instead
+  of dropping it. Non-split and on-family cases are byte-identical (the guard was
+  already true there); only the off-family split emission changes. Different-type
+  coexistence, NOT the #2071 same-type collision. Fail-on-revert proven:
+  restoring the guard drops `match ipv6 address prefix-list V6ONLY` from the v4
+  sequence → the two direction tests go RED.
+- **File(s)**: pkg/frr/policy_render.go,
+  pkg/frr/policy_mixedfamily_prefixlist_5702_test.go
+
 ## 2026-07-12 — #5693 (bug): validate next-table target routing-instance definedness at commit
 - **Timestamp**: 2026-07-12 (fix/5693-nexttable-target-defined)
 - **Action**: codex-review-182 M14. A static route whose `next-table <target>`
