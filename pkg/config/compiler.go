@@ -928,6 +928,19 @@ type compileOpts struct {
 	// guard skips the phantom rib and installs no rule, so a leniently-loaded
 	// config is already inert. Same doctrine as lenientRoutingExportRef.
 	lenientRibGroupRefs bool
+	// lenientNextTableRefs (#5693) downgrades the next-table target
+	// definedness gate (validateNextTableTargetReferencesStrict) from a hard
+	// compile error to a cfg.Warnings entry. A static route whose
+	// `next-table <target>` names an undefined routing-instance was previously
+	// unvalidated: the applier resolved the target through a name→table-id map
+	// built only from defined instances, missed, warned, and skipped the rule,
+	// so the inter-VRF leak silently never happened. The strict commit /
+	// commit-check path hard-rejects so the typo is operator-visible; the
+	// tolerant load / peer-sync paths warn so an already-persisted or peer-
+	// synced config carrying a dangling next-table still BOOTS (#1960) — the
+	// applier's tableIDs !ok guard keeps it inert. Same doctrine as
+	// lenientRibGroupRefs.
+	lenientNextTableRefs bool
 	// lenientDHCPStaticBindings (#2243 review) downgrades the DHCP-server
 	// static (fixed/reserved) host-binding gate (validateDHCPStaticBindingsStrict)
 	// from a hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1854,6 +1867,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATMatchApplications:            true,
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
+		lenientNextTableRefs:                   true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,
@@ -2201,6 +2215,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATMatchApplications:            true,
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
+		lenientNextTableRefs:                   true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,

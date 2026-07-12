@@ -200,6 +200,7 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 				case "next-table":
 					if i+1 < len(routeInst.node.Keys) {
 						i++
+						route.NextTableRaw = routeInst.node.Keys[i]
 						route.NextTable = parseNextTableInstance(routeInst.node.Keys[i])
 					}
 				case "qualified-next-hop":
@@ -350,6 +351,7 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 				route.NextHops = append(route.NextHops, nh)
 			case "next-table":
 				if v := nodeVal(prop); v != "" {
+					route.NextTableRaw = v
 					route.NextTable = parseNextTableInstance(v)
 				}
 			}
@@ -370,6 +372,7 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 			}
 			if route.NextTable != "" {
 				existingRoute.NextTable = route.NextTable
+				existingRoute.NextTableRaw = route.NextTableRaw
 			}
 		} else {
 			destIdx[route.Destination] = len(existing)
