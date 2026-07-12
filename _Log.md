@@ -46741,3 +46741,14 @@ top.
 - **Validation**: go build ./...; go test ./pkg/feeds/... ./pkg/dataplane/
   userspace/... ./pkg/daemon/... all green; RED-on-revert confirmed (pre-fix
   hash-gate → fetch#2 calls=1 want 2).
+- **Timestamp**: 2026-07-11
+- **Action**: #5666 — route the operator-side policy simulator's app-set
+  expansion through config.ResolveApplicationSet (predefined-aware, #4102/#5629)
+  so `test policy` / `show security match-policies` / MatchPolicies match a
+  PREDEFINED bundle (junos-ms-rpc etc.) the way the #5629-fixed dataplane does.
+  Both matchApp + appTermL4Constrained gated on the USER-only ApplicationSets
+  map; a predefined bundle resolved to no members → wrong dry-run verdict.
+  Resolve app-first so a user app shadowing a predefined-set name keeps app
+  semantics. Fail-on-revert proven (predefined-bundle match RED on the user-only
+  gate; shadow test not gate-dependent). Diagnostic simulator only (non-enforcement).
+- **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/predefined_set_5666_test.go
