@@ -569,6 +569,16 @@ peer behind a valid route read up forever and the fail-safe
   to admit the daemon gid (or `CAP_NET_RAW`); when it does not, the probe
   is **ProbeUnsupported** and the link is HELD (never torn down — see
   hold-on-unknown).
+- **Interval bound (#5705)**: the configured `keepalive <seconds>` is
+  bounded to `0..32767` at commit-check (`pkg/config`
+  `tunnelSchemaChildren`, `ValidateInteger(0, 32767)`; `0` = disabled)
+  AND clamped at runtime by `clampKeepaliveIntervalSec` before every
+  `time.Duration(sec) * time.Second` multiply (the `keepaliveLoop`
+  ticker and `keepaliveProbeDeadline`). `time.Duration` is int64 ns, so
+  an unbounded value overflowed the multiply, wrapped non-positive, and
+  panicked `time.NewTicker` — a commit-reachable, self-inflicted xpfd
+  crash. The runtime clamp is defense-in-depth for a value that reaches
+  the dataplane un-gated (stale DB, a path bypassing `SchemaValidate`).
 - **Reply match**: `Seq` + a per-probe random **Data-nonce** — NOT the
   ICMP ID. Datagram ("ping") sockets rewrite the outbound id to the
   socket source port, so id is advisory only.
