@@ -47085,3 +47085,47 @@ top.
   with buildDHCPv6RenewModifiers). Added fail-on-revert tests.
 - **File(s)**: pkg/dhcp/dhcp.go (Edit), pkg/dhcp/duid_stability_5711_test.go
   (Write), pkg/dhcp/README.md (Edit)
+- **Timestamp**: 2026-07-12
+- **Action**: Fix #5675/#5691 — AST pre-passes must aggregate across ALL
+  top-level roots, not just the first. `expandInterfaceRanges` (#4027) broke on
+  the first `interfaces` root (phantom re-mint for split roots, #5675); the
+  stable-ID collision gates (zone #3075 / tunnel #1873 / routing-instance #3855)
+  read only the first `security`/`interfaces`/`routing-instances` root (#5691).
+  Added `ConfigTree.FindChildren`; unioned View 1 + Views 2/3 across all roots.
+  Fail-on-revert tests proven RED-on-neuter.
+- **File(s)**: pkg/config/ast.go, pkg/config/compiler_interface_range.go,
+  pkg/config/zoneid.go, pkg/config/tunnelid.go, pkg/config/routinginstanceid.go,
+  pkg/config/compiler_multi_root_5675_5691_test.go, docs/config-schema.md
+- **Timestamp**: 2026-07-12
+- **Action**: #5707 — coalesce the userspace-dataplane Status() control-socket
+  query for the MonitorInterface streaming path. Each open stream polls 1/s and
+  summary mode reads every configured interface each tick, so binding readSnap
+  to the raw s.userspaceDataplaneStatus issued O(interfaces*streams) Status()
+  calls per tick, contending on the shared helper control socket and starving
+  session installs. Added a Server-wide single-flight, short-TTL status cache
+  (monitorStatusCache, 900ms) that fans one query out to all callers within a
+  poll window, collapsing the fan-out to O(1)/tick regardless of interface or
+  subscriber count. Fail-on-revert proven: 6 concurrent streams → 1 Status()
+  call GREEN, 6 calls RED when reverted to the per-stream fetch. Race-clean.
+- **File(s)**: pkg/grpcapi/monitor_status_cache.go,
+  pkg/grpcapi/monitor_status_cache_test.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_diag_monitor.go,
+  pkg/grpcapi/server_diag_monitor_fanout_5707_test.go,
+  pkg/monitoriface/README.md
+
+- **Timestamp**: 2026-07-12 06:35
+- **Action**: #5679 fix — ordinary full dataplane apply failure now FAILS the
+  commit instead of reporting success against stale policy. In
+  applyDataplaneAndHACore the non-abort ApplyConfig error path only recorded a
+  health failure then fell through (applyConfigLocked returned nil → commit OK
+  while the OLD policy stayed live: fail-open-to-stale). Added a fourth named
+  return `applyErr` capturing the ordinary failure, threaded through
+  applyConfigLocked into applyTailReconciles' tail errors.Join (fail-closed but
+  complete; still peer-syncs per #4034; abort-class still early-returns). Added
+  fail-on-revert tests (RED proven with `applyErr = err` neutralized). gofmt +
+  go vet clean; full pkg/daemon suite green.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/apply_failure_failclosed_5679_test.go,
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go,
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
+  pkg/daemon/README.md

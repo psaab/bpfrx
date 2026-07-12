@@ -32,5 +32,14 @@ packets, bytes, delta, rate.
   no scheduling itself.
 - Userspace snapshots require a `StatusReader` callback to the dataplane
   process. With the eBPF backend, the userspace half is empty.
+- The `StatusReader` returns the whole-process status, so `ReadSnapshot`
+  invokes it once per interface. A caller that reads many interfaces per
+  tick — or fans one poll out to many concurrent subscribers — MUST
+  coalesce the `StatusReader` (share one snapshot per tick) or it issues
+  O(interfaces*subscribers) control-socket queries and contends with
+  session installs. `pkg/grpcapi`'s `MonitorInterface` streaming path
+  does this with a shared, short-TTL status cache (#5707); pass that
+  cached reader in as the `StatusReader` rather than a raw per-call
+  `Status()`.
 - VLAN sub-interfaces resolve to their physical parent via
   `ResolvePhysicalParent` so per-NIC summary rows aren't double-counted.

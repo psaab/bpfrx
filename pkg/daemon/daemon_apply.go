@@ -125,7 +125,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 // rejected apply leaves publication debt that the next identical refetch
 // retries (rather than committing the content hash and suppressing retry
 // forever, the pre-#5646 bug). The returned error is still logged — by
-	// feeds.installSnapshot's reject branch (feeds side), not by this function.
+// feeds.installSnapshot's reject branch (feeds side), not by this function.
 func (d *Daemon) applyConfigResult(cfg *config.Config) error {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
@@ -766,7 +766,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// networkd write error for the routing rules + tail reconcile below; an
 	// error (a #2926 context abort or an ApplyConfig compile abort) bails
 	// before the tail.
-	commitOverlay, networkdErr, err := d.applyDataplaneAndHACore(ctx, cfg)
+	commitOverlay, networkdErr, applyErr, err := d.applyDataplaneAndHACore(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -797,10 +797,12 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// RETH-MAC core that stays inline (it threads applyResult / rethMACPending
 	// / the deferred errors). The tail is independent per-subsystem dispatch
 	// reading only cfg (+ nil-guarded managers), so grouping it here is a
-	// behavior-preserving mechanical move. The four head-produced deferred
-	// errors (networkdErr/dhcpServerErr/ipsecErr/ifaceErr) are threaded in; the
-	// helper creates lo0Err/hostInboundErr and returns the six-way errors.Join.
-	return d.applyTailReconciles(cfg, networkdErr, dhcpServerErr, ipsecErr, ifaceErr)
+	// behavior-preserving mechanical move. The five head-produced deferred
+	// errors (networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr) are threaded
+	// in — applyErr is the #5679 ordinary (non-abort) dataplane-apply failure
+	// that must fail the commit without disarming/aborting; the helper creates
+	// lo0Err/hostInboundErr and returns the seven-way errors.Join.
+	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr)
 }
 
 // applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and
@@ -809,17 +811,26 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 // state that the earlier decoupled phases do not touch stays local here —
 // rethMACPending and the deferred-worker-startup flag/defer are self-contained
 // — and the two values the tail still needs are returned: the ip-monitoring
-// commit overlay (fed to applyRoutingRules and the FRR render) and the captured
-// networkd write error (threaded into applyTailReconciles' five-way Join). The
-// three early error returns — the two #2926 context-abort boundaries
-// (ctx.Err() before ApplyConfig and before the FRR reload) and the
-// compileErrorMustAbortApply dataplane abort on an ApplyConfig failure — are
-// preserved; the caller bails without running the routing / service / tail
-// reconciles, exactly as the inline `return err` did. commitOverlay and networkdErr are named
-// returns so the pre-networkd boundaries can return them (nil) before the
-// networkd phase assigns networkdErr. Runs in the same slot, after the
-// fabric-IPVLAN reconcile and before the routing rules.
-func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config) (commitOverlay []config.RouteOverlayEntry, networkdErr error, err error) {
+// commit overlay (fed to applyRoutingRules and the FRR render), the captured
+// networkd write error, and the DEFERRED ordinary dataplane-apply error
+// (#5679) — both threaded into applyTailReconciles' Join. The three early
+// error returns — the two #2926 context-abort boundaries (ctx.Err() before
+// ApplyConfig and before the FRR reload) and the compileErrorMustAbortApply
+// dataplane abort on an ApplyConfig failure — are preserved; the caller bails
+// (via the terminal `err` return) without running the routing / service / tail
+// reconciles, exactly as the inline `return err` did.
+//
+// applyErr (#5679) is DISTINCT from that terminal `err`: an ORDINARY (non-abort
+// -class) ApplyConfig failure does NOT disarm the dataplane — the OLD compiled
+// config stays live and forwarding — so the tail reconciles MUST still run
+// (fail-closed but complete, exactly like networkdErr / ifaceErr). It is
+// returned as a deferred error the caller joins at the tail so the commit
+// reports FAILURE rather than silently succeeding against the stale policy,
+// instead of aborting the rest of the apply. commitOverlay, networkdErr, and
+// applyErr are named returns so the pre-networkd boundaries can return them
+// (nil) before the networkd / apply phases assign them. Runs in the same slot,
+// after the fabric-IPVLAN reconcile and before the routing rules.
+func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config) (commitOverlay []config.RouteOverlayEntry, networkdErr error, applyErr error, err error) {
 	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
 	// If yes, tell the userspace DP to skip initial worker startup during
 	// ApplyConfig(). Workers will be started by NotifyLinkCycle() after MAC
@@ -909,7 +920,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// follows it begin, they run as one unit (no mid-sequence abort) — the
 	// next boundary is before the FRR reload.
 	if err := ctx.Err(); err != nil {
-		return commitOverlay, networkdErr, err
+		return commitOverlay, networkdErr, nil, err
 	}
 
 	// 2. Apply dataplane config through the runtime config sink.
@@ -919,8 +930,22 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		if applyResult, err = d.dp.ApplyConfig(context.Background(), cfg); err != nil {
 			d.recordCompileFailure(err)
 			if compileErrorMustAbortApply(err) {
-				return commitOverlay, networkdErr, err
+				return commitOverlay, networkdErr, nil, err
 			}
+			// #5679: an ORDINARY (non-abort-class) full-apply failure does
+			// NOT disarm the dataplane — d.dp.ApplyConfig leaves the OLD
+			// compiled policy live and forwarding while store.Commit has
+			// already promoted+persisted the NEW config. Left unhandled the
+			// commit reported SUCCESS against stale enforcement (a tightening
+			// commit — e.g. a new deny — appeared applied while the looser old
+			// policy was still on the wire), a fail-open-to-stale on the main
+			// config-apply path. Capture the failure as a DEFERRED commit error
+			// (threaded into the tail Join, fail-closed but complete like
+			// networkdErr / ifaceErr) so the operator sees the commit fail; the
+			// applied config never advanced, so an identical re-commit / the
+			// feed onUpdate retry (#5646, via applyConfigResult) re-applies and
+			// self-heals a transient helper / control-socket error.
+			applyErr = err
 		} else {
 			d.recordCompileSuccess()
 		}
@@ -1204,10 +1229,10 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// store.Commit the store already holds the new config, so this is a clean
 	// "apply the rest on next start" boundary, not a divergence.)
 	if err := ctx.Err(); err != nil {
-		return commitOverlay, networkdErr, err
+		return commitOverlay, networkdErr, nil, err
 	}
 
-	return commitOverlay, networkdErr, nil
+	return commitOverlay, networkdErr, applyErr, nil
 }
 
 // applyServicesReconcile runs the per-service reconcile phases of a config
@@ -1833,11 +1858,13 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 //
 // Error-join contract: the deferred reconcile errors accumulate across the
 // whole apply body but are joined only at this tail (fail-closed — every step
-// still runs). networkdErr/dhcpServerErr/ipsecErr/ifaceErr originate in the head
-// and are threaded in as parameters; lo0Err/hostInboundErr originate in step
-// 9.5 below. The returned errors.Join preserves the exact operand order the
-// inline tail used (#1778/#2987/#4433/#5310).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServerErr, ipsecErr, ifaceErr error) error {
+// still runs). networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr originate in
+// the head and are threaded in as parameters (applyErr is the #5679 ordinary
+// non-abort dataplane-apply failure that must fail the commit while the OLD
+// policy stays live); lo0Err/hostInboundErr originate in step 9.5 below. The
+// returned errors.Join preserves the exact operand order the inline tail used
+// (#1778/#2987/#4433/#5310/#5679).
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
@@ -2097,14 +2124,16 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, dhcpServer
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	// #1778 + #2987 + #4433 + #5310: deferred reconcile failures — every
-	// reconcile step above has run; surface the networkd write failure, the Kea
-	// restart/stop failure, the IPsec render/reload failure, and the
-	// interface-reconcile failure (xfrmi/bond/tunnel/legacy-reth create/up/delete
-	// — #5310) through the commit so a step that left stale or missing
-	// kernel/swanctl state fails the commit (fail-closed) instead of reporting
-	// success. All are joined so none masks the other.
-	return errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr)
+	// #1778 + #2987 + #4433 + #5310 + #5679: deferred reconcile failures — every
+	// reconcile step above has run; surface the networkd write failure, the
+	// ordinary (non-abort) dataplane-apply failure (#5679 — the new policy is
+	// NOT on the wire, the old one still is), the Kea restart/stop failure, the
+	// IPsec render/reload failure, and the interface-reconcile failure
+	// (xfrmi/bond/tunnel/legacy-reth create/up/delete — #5310) through the commit
+	// so a step that left stale or missing kernel/swanctl/dataplane state fails
+	// the commit (fail-closed) instead of reporting success. All are joined so
+	// none masks the other.
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

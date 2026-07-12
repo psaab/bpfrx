@@ -194,6 +194,17 @@ type Server struct {
 	// runs two supervisors (fab0 + fab1) against one Server.
 	fabricListenerMu sync.Mutex
 	fabricListenerUp map[string]bool
+	// monitorStatus coalesces the userspace-dataplane Status() control-socket
+	// query for the MonitorInterface streaming path (#5707). Every open stream
+	// polls once per second and summary mode reads every configured interface
+	// each tick, so without coalescing N interfaces across S concurrent streams
+	// issue O(N*S) Status() calls per tick, contending on the shared helper
+	// control socket and starving session installs. The cache serves one fetched
+	// snapshot to every caller within monitorStatusTTL, collapsing the fan-out to
+	// O(1) queries per tick regardless of interface or subscriber count. Lazily
+	// built by monitorStatusReader; a test may pre-seed it with an injected clock.
+	monitorStatusOnce  sync.Once
+	monitorStatusCache *monitorStatusCache
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
