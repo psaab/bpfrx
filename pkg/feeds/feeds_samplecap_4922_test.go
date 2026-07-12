@@ -188,7 +188,7 @@ func TestInvalidSampleBoundedThroughAllFeeds(t *testing.T) {
 	ts := httptest.NewServer(srv.handler())
 	defer ts.Close()
 
-	m := New(func() {})
+	m := New(func() error { return nil })
 	fs := m.newFeed("huge", ts.URL, time.Hour)
 	m.fetchFeed(context.Background(), fs)
 

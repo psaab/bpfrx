@@ -100,10 +100,20 @@ const httpClientTimeout = 30 * time.Second
 
 // Manager manages dynamic address feed servers and their periodic updates.
 type Manager struct {
-	mu       sync.RWMutex
-	feeds    map[string]*feedState // keyed by feed-name (or feed-server name for single-feed servers)
-	client   *http.Client
-	onUpdate func() // callback when feeds are updated
+	mu     sync.RWMutex
+	feeds  map[string]*feedState // keyed by feed-name (or feed-server name for single-feed servers)
+	client *http.Client
+	// onUpdate is the publish callback invoked when a feed refresh produces
+	// content that must be (re-)applied to the dataplane. It RETURNS the apply
+	// result: a nil return means the content was ACCEPTED (applied), a non-nil
+	// return means the apply was REJECTED (preflight reject, compile failure,
+	// control-socket error, ...). installSnapshot advances its per-feed
+	// publishedHash only on a nil return, so a rejected apply leaves publication
+	// debt that the next identical refetch retries — closing #5646 (the pre-fix
+	// void callback committed the content hash regardless of the apply result,
+	// so an identical refetch saw "unchanged" and the good content sat
+	// un-enforced forever).
+	onUpdate func() error // callback when feeds are updated; returns apply result
 
 	// now is the clock source, overridable in tests for HoldInterval timing.
 	now func() time.Time
@@ -122,6 +132,22 @@ type feedState struct {
 	prefixes    []string
 	hash        [32]byte // sha256 over the canonical join; zero when no snapshot
 	hasSnapshot bool     // true once a good fetch has installed a snapshot
+
+	// publishedHash is the content hash of the snapshot last CONFIRMED applied
+	// to the dataplane — it advances ONLY when the onUpdate publish callback
+	// returns nil (apply ACCEPTED). It is deliberately decoupled from hash (the
+	// hash of the currently-INSTALLED snapshot): installSnapshot always commits
+	// hash to the freshly-fetched content, but fires onUpdate whenever the
+	// fetched content differs from publishedHash — not merely from hash. A
+	// REJECTED apply therefore leaves publishedHash stale, so an identical
+	// refetch still re-fires onUpdate and RETRIES the publish, closing the #5646
+	// publication-debt window (the pre-fix code keyed the retry decision off
+	// hash, which committed before the void callback, so a rejected apply
+	// suppressed every later identical refetch and the good content was never
+	// enforced). hasPublished distinguishes "never successfully published" (zero
+	// publishedHash) from a genuine all-zero digest, mirroring hasSnapshot.
+	publishedHash [32]byte
+	hasPublished  bool
 
 	// Parse-quality of the INSTALLED snapshot (#2993). A feed body may mix
 	// valid + invalid lines: the valid prefixes are installed but the skipped
@@ -144,9 +170,13 @@ type feedState struct {
 }
 
 // New creates a new feed manager.
-// onUpdate is called whenever a feed refresh produces a semantically different
-// prefix set (content change, not merely a count change).
-func New(onUpdate func()) *Manager {
+// onUpdate is called whenever a feed refresh produces content that differs from
+// what was last SUCCESSFULLY applied (not merely a count change, and not merely
+// a difference from the last FETCH). It RETURNS the apply result: a nil return
+// records the content as published (a later identical refetch is suppressed —
+// no thrash), a non-nil return leaves the content unpublished so the next
+// identical refetch retries the apply on the normal refresh cadence (#5646).
+func New(onUpdate func() error) *Manager {
 	return &Manager{
 		feeds: make(map[string]*feedState),
 		client: &http.Client{
@@ -383,6 +413,19 @@ func carryForwardSnapshot(dst, src *feedState) {
 	dst.lastSuccess = src.lastSuccess
 	dst.invalidLines = src.invalidLines
 	dst.invalidSample = append([]string(nil), src.invalidSample...)
+	// Carry the published-hash tracking forward too (#5646). The prior
+	// producer's snapshot is being re-enforced by the SAME applyConfigLocked
+	// that runs this Apply (it reads SnapshotForBindings from the carried
+	// prefixes), so its apply state is inherited: if the predecessor had
+	// successfully published this content, the replacement inherits
+	// publishedHash == hash and does NOT re-fire onUpdate on its first
+	// identical refetch (preserves the #5282 no-thrash contract). If the
+	// predecessor had unpublished publication DEBT (content fetched but its
+	// apply kept being rejected), hasPublished is false here, so the
+	// replacement's first fetch re-fires and retries — the debt is not lost
+	// across a reconfigure.
+	dst.publishedHash = src.publishedHash
+	dst.hasPublished = src.hasPublished
 }
 
 // StopAll cancels all running feed refresh goroutines.
@@ -809,11 +852,30 @@ func hashPrefixes(canon []string) [32]byte {
 }
 
 // installSnapshot replaces the active snapshot with a fresh good fetch, stamps
-// success, clears stale/error state, and fires onUpdate only on a content
-// change (hash differs from the currently installed snapshot).
+// success, clears stale/error state, and (re-)publishes to the dataplane when
+// the fetched content differs from what was last SUCCESSFULLY applied.
+//
+// The publish decision is keyed off publishedHash — the hash last CONFIRMED
+// applied — NOT off the installed-content hash. This is the #5646 fix: the
+// pre-fix code committed the content hash and then fired a VOID onUpdate, so a
+// REJECTED apply (preflight reject #3261/#5645, compile failure, control-socket
+// error) left the hash committed and every later identical refetch saw
+// "unchanged" and skipped onUpdate — the good content sat un-enforced forever
+// (publication debt). onUpdate now returns the apply result: publishedHash
+// advances only on a nil (accepted) return, so a rejected apply leaves the
+// content unpublished and the next identical refetch RE-FIRES onUpdate to retry
+// the apply. The retry fires on the normal refresh cadence (one publish attempt
+// per fetch), never a tight loop.
 func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 	m.mu.Lock()
+	// changed = the installed enforced content differs from the prior install.
+	// Drives the display/degraded logging (a content change), independent of
+	// whether that content has been PUBLISHED.
 	changed := !fs.hasSnapshot || fs.hash != res.hash
+	// needsPublish = the fetched content differs from what was last CONFIRMED
+	// applied. Drives the onUpdate publish/retry. A rejected apply leaves
+	// publishedHash stale, so this stays true on an identical refetch → retry.
+	needsPublish := !fs.hasPublished || fs.publishedHash != res.hash
 	oldCount := len(fs.prefixes)
 	now := m.now()
 	fs.prefixes = res.prefixes
@@ -829,7 +891,7 @@ func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 
 	slog.Info("dynamic-address: feed updated",
 		"name", fs.name, "prefixes", len(res.prefixes), "previous", oldCount,
-		"changed", changed, "invalid_lines", res.invalidLines)
+		"changed", changed, "needs_publish", needsPublish, "invalid_lines", res.invalidLines)
 
 	// A degraded install (some published lines skipped) is loud, but only on a
 	// content change so a persistently-malformed-but-stable feed does not flood
@@ -841,9 +903,32 @@ func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 			"invalid_lines", res.invalidLines, "invalid_sample", res.invalidSample)
 	}
 
-	if changed && m.onUpdate != nil {
-		m.onUpdate()
+	if !needsPublish {
+		// Already applied this exact content — no republish, no thrash.
+		return
 	}
+
+	// Publish to the dataplane. A nil callback (no consumer wired) is treated as
+	// a vacuous success so publishedHash tracks the installed content and a
+	// later identical refetch is still suppressed.
+	var applyErr error
+	if m.onUpdate != nil {
+		applyErr = m.onUpdate()
+	}
+	if applyErr != nil {
+		// Apply REJECTED: do NOT advance publishedHash. The content is installed
+		// (fs.prefixes/fs.hash) and enforced-in-intent, but the dataplane did
+		// not accept it. Leaving publishedHash stale means the next identical
+		// refetch re-fires this path and retries the apply (#5646). This is
+		// publication debt, surfaced loudly but bounded to one retry per fetch.
+		slog.Warn("dynamic-address: feed apply REJECTED — good content not yet enforced (publication debt), will retry on next refresh",
+			"name", fs.name, "prefixes", len(res.prefixes), "err", applyErr)
+		return
+	}
+	m.mu.Lock()
+	fs.publishedHash = res.hash
+	fs.hasPublished = true
+	m.mu.Unlock()
 }
 
 // recordFailure handles a failed fetch under the retain-last-good policy:
@@ -886,6 +971,13 @@ func (m *Manager) recordFailure(fs *feedState, ferr error) {
 			// the degraded markers too (#2993).
 			fs.invalidLines = 0
 			fs.invalidSample = nil
+			// #5646: reset the published-hash tracking. The enforced set is now
+			// empty; if this feed later RECOVERS and refetches its prior content,
+			// installSnapshot must re-fire onUpdate to re-enforce it. Leaving a
+			// stale publishedHash equal to the recovered content would suppress
+			// that re-apply and leave the recovered denylist un-enforced.
+			fs.publishedHash = [32]byte{}
+			fs.hasPublished = false
 			dropped = true
 		}
 	}
@@ -896,7 +988,16 @@ func (m *Manager) recordFailure(fs *feedState, ferr error) {
 		slog.Warn("dynamic-address: hold interval elapsed, dropping stale feed to empty",
 			"name", fs.name, "err", ferr, "hold", fs.holdInterval)
 		if m.onUpdate != nil {
-			m.onUpdate()
+			// The drop-to-empty is a fail-CLOSED transition (a denylist stops
+			// enforcing stale prefixes). If the apply of the now-empty set is
+			// rejected the dataplane keeps enforcing the last-good prefixes —
+			// strictly safer than an empty set — so we only log the rejection;
+			// publishedHash was already reset above so a later recovery
+			// re-publishes regardless.
+			if err := m.onUpdate(); err != nil {
+				slog.Warn("dynamic-address: drop-to-empty apply rejected — dataplane retains last-good set",
+					"name", fs.name, "err", err)
+			}
 		}
 	case enteredStale:
 		// One-time loud warning on entry to the stale state. Subsequent

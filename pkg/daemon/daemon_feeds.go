@@ -23,11 +23,22 @@ func (d *Daemon) ensureFeedManager() {
 	if d.feeds != nil {
 		return
 	}
-	d.feeds = feeds.New(func() {
+	d.feeds = feeds.New(func() error {
 		slog.Info("dynamic-address feed updated, recompiling dataplane")
-		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
-			d.applyConfig(activeCfg)
+		activeCfg := d.store.ActiveConfig()
+		if activeCfg == nil {
+			// No active config to apply the feed content against yet (pre-boot
+			// window). Treat as a vacuous success — there is no policy enforcing
+			// this feed, and the normal commit path re-reads the live feed
+			// snapshot when a config is committed. Returning nil lets the feed
+			// manager record the content as published so it does not spin.
+			return nil
 		}
+		// #5646: return the apply RESULT to the feed manager. A rejected apply
+		// (preflight reject, compile failure, control-socket error) must NOT be
+		// recorded as published, so the next identical feed refetch retries the
+		// apply instead of silently dropping the good content (publication debt).
+		return d.applyConfigResult(activeCfg)
 	})
 }
 

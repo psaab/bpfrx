@@ -46720,3 +46720,24 @@ top.
   match-none = deny fail-open); the resolved-feed test stays green. Restoring ->
   GREEN. Permit-none and the #5282 re-fetch window are unaffected
   (TestFirstFetchSuccessPublishesFeed, TestReFetchWindowStillPublishesLastGood).
+
+## 2026-07-11 — #5646 feeds publication-debt (rejected apply suppresses retry)
+
+- **Timestamp**: 2026-07-11
+- **Action**: Fix installSnapshot committing content hash before the void
+  onUpdate callback → a REJECTED apply suppressed retry of identical content
+  (publication debt / fail-open). Design (a): split published-hash from
+  installed-content hash; onUpdate void→error; publishedHash advances only on a
+  confirmed (nil) apply, so an identical refetch after a rejected apply re-fires
+  and retries on the normal refresh cadence (no thrash on success).
+- **File(s)**: pkg/feeds/feeds.go (Manager.onUpdate func()→func() error,
+  feedState.publishedHash/hasPublished, installSnapshot needsPublish gate,
+  carryForwardSnapshot carry, recordFailure drop-to-empty reset),
+  pkg/daemon/daemon_feeds.go (callback returns applyConfigResult),
+  pkg/daemon/daemon_apply.go (new applyConfigResult error-returning apply),
+  pkg/feeds/feeds_publication_debt_5646_test.go (fail-on-revert, RED proven),
+  pkg/feeds/README.md (Publication-debt retry section + New/change-detection
+  notes), plus mechanical func()→func() error in existing feeds tests.
+- **Validation**: go build ./...; go test ./pkg/feeds/... ./pkg/dataplane/
+  userspace/... ./pkg/daemon/... all green; RED-on-revert confirmed (pre-fix
+  hash-gate → fetch#2 calls=1 want 2).
