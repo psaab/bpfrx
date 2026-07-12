@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/psaab/xpf/pkg/config"
 	"golang.org/x/sys/unix"
 )
 
@@ -14,17 +15,46 @@ func isInteractive() bool {
 	return err == nil
 }
 
-// resolveInterfaceAddr returns the first IPv4 address on the named interface.
-// If the interface is not found or has no IPv4 addresses, it returns fallback.
-func resolveInterfaceAddr(ifname, fallback string) string {
-	iface, err := net.InterfaceByName(ifname)
+// interfaceAddrsByName resolves a LINUX-kernel interface name to its addresses.
+// It is a package var so the web-management bind resolution
+// (resolveInterfaceAddr) is unit-testable without a real kernel interface.
+var interfaceAddrsByName = func(kernelName string) ([]net.Addr, error) {
+	iface, err := net.InterfaceByName(kernelName)
 	if err != nil {
-		slog.Warn("web-management interface not found, using fallback", "interface", ifname, "fallback", fallback)
+		return nil, err
+	}
+	return iface.Addrs()
+}
+
+// resolveInterfaceAddr returns the first IPv4 (then IPv6) address on the
+// interface identified by the AUTHORED Junos ref (e.g. "ge-0/0/0.0"). If the
+// interface cannot be resolved or has no usable address it returns fallback.
+//
+// #5714: the ref is first mapped to its Linux kernel ifname via
+// config.ResolveKernelIfName (the same Junos->Linux mapping networkd/linksetup
+// use) BEFORE the kernel lookup — net.InterfaceByName expects the kernel name
+// (e.g. "ge-0-0-0"), not the Junos name (e.g. "ge-0/0/0"), so passing the
+// authored name verbatim never matched and the bind SILENTLY fell back to
+// loopback, leaving web-management unreachable on the configured interface while
+// the operator believed it was bound there. On any resolution/lookup failure
+// this now logs LOUDLY at ERROR (the bind did NOT land on the configured
+// interface) and returns fallback, so the mgmt API still serves on loopback
+// rather than not at all — a hard error here would strand a mgmt interface that
+// is merely not up yet at daemon start.
+func resolveInterfaceAddr(cfg *config.Config, ifname, fallback string) string {
+	kernelName := ifname
+	if cfg != nil {
+		kernelName = cfg.ResolveKernelIfName(ifname)
+	}
+	addrs, err := interfaceAddrsByName(kernelName)
+	if err != nil {
+		slog.Error("web-management interface not found; NOT bound to configured interface, using loopback fallback",
+			"interface", ifname, "kernel", kernelName, "fallback", fallback, "err", err)
 		return fallback
 	}
-	addrs, err := iface.Addrs()
-	if err != nil || len(addrs) == 0 {
-		slog.Warn("web-management interface has no addresses, using fallback", "interface", ifname, "fallback", fallback)
+	if len(addrs) == 0 {
+		slog.Error("web-management interface has no addresses; NOT bound to configured interface, using loopback fallback",
+			"interface", ifname, "kernel", kernelName, "fallback", fallback)
 		return fallback
 	}
 	for _, a := range addrs {
@@ -46,7 +76,8 @@ func resolveInterfaceAddr(ifname, fallback string) string {
 			return ipNet.IP.String()
 		}
 	}
-	slog.Warn("web-management interface has no usable addresses, using fallback", "interface", ifname, "fallback", fallback)
+	slog.Error("web-management interface has no usable addresses; NOT bound to configured interface, using loopback fallback",
+		"interface", ifname, "kernel", kernelName, "fallback", fallback)
 	return fallback
 }
 
