@@ -142,12 +142,18 @@ func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[strin
 //     → the duplicate-publish gate (snapshotContentHash) lets the refresh
 //     through. This is why the join MUST live in the snapshot builder.
 //
-// An overlay name with no prefixes (startup before first fetch, or an
-// operator-opted hold-interval drop) still produces a (possibly empty) bucket
-// and a nameToID entry, so the policy token is routed as a book reference that
-// matches nothing (fail-closed) rather than a no-match literal — either way it
-// matches nothing, but routing it as a book keeps the wire shape consistent
-// and lets a later refresh populate the same name without re-classifying.
+// An overlay name that IS present but carries no prefixes still produces a
+// (possibly empty) bucket and a nameToID entry, so the policy token routes as a
+// book reference to an empty set (match-none). NOTE (#5645): the daemon's
+// feeds.Manager.SnapshotForBindings no longer EMITS such a present-but-empty
+// entry for an UNREADY feed (before its first successful fetch / after a
+// hold-interval drop) — it OMITS the name so the token is unresolved and the
+// referencing policy fails CLOSED (unrepresentable -> __unsupported_address__
+// -> whole-snapshot reject; see buildPolicySnapshots' addrRepresentable and
+// #3261). Publishing an empty entry was a DENY fail-open (match-none = the deny
+// never fires). This empty-bucket path is therefore now only reachable for a
+// non-daemon caller that hands in an explicit empty slice; it is retained as
+// defensive, no-panic handling, not a live fail-open.
 //
 // When the static AddressBook is nil but a feed overlay is present, the table
 // is still built from the overlay alone (the pre-#2049 early-return only fired

@@ -311,8 +311,10 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 	//
 	// A feed GENUINELY REMOVED from config has no entry in the new plan, so it
 	// gets no replacement and its snapshot is dropped (correct — the operator
-	// removed it). A brand-NEW feed has no prior snapshot and starts empty until
-	// its first fetch (the documented fail-closed cold-start, not a regression).
+	// removed it). A brand-NEW feed has no prior snapshot to carry, so until its
+	// first successful fetch SnapshotForBindings OMITS its binding (#5645) — the
+	// referencing policy then fails CLOSED (unresolved name), not fail-open
+	// match-none. This is the first-fetch analogue of the carry-forward below.
 	old := m.feeds
 	for _, fs := range old {
 		if fs.cancel != nil {
@@ -428,18 +430,30 @@ func (m *Manager) GetPrefixes(name string) []string {
 // Resolution semantics:
 //   - A binding's FeedNames are unioned (a binding may aggregate several
 //     feeds). Prefixes are deduped across feeds and returned sorted.
-//   - A feed with no installed snapshot (before first fetch, or after an
-//     explicit hold-interval drop) contributes nothing; if NONE of a
-//     binding's feeds have prefixes the entry maps to a non-nil empty slice,
-//     so the caller can tell "bound but empty" (fail-closed: matches nothing)
-//     from "not a feed binding" (absent from the map).
+//   - A feed with no installed snapshot (before the first successful fetch, or
+//     after an explicit hold-interval drop) contributes nothing. If NONE of a
+//     binding's feeds has an installed snapshot the binding is UNRESOLVED and
+//     its name is OMITTED from the returned map entirely (#5645) — it is NOT
+//     published as a present-but-empty slice. Publishing an empty slice made
+//     the daemon compile a direct feed-bound name to a match-none address book
+//     row: correct for a PERMIT (permit-none), but a DENY policy referencing
+//     that name then never fired and the traffic it must block was PERMITTED
+//     for the whole pre-first-fetch window (fail-OPEN). Omitting the name
+//     leaves it unresolved, so the policy lowering treats it as
+//     unrepresentable (addrRepresentable -> __unsupported_address__ -> whole-
+//     snapshot preflight reject) and the referencing policy fails CLOSED —
+//     the same action-agnostic contract #3261 gives an empty static book, and
+//     the first-fetch analogue of the #5282 re-fetch window.
 //   - An unknown feed-name (binding references a feed that was never started)
-//     contributes nothing — it is treated the same as an empty feed.
+//     contributes nothing — it is treated the same as an unready feed, so a
+//     binding backed only by unknown names is also omitted (unresolved).
 //
 // Reading the live last-good snapshot here means a persistent fetch failure
-// keeps enforcing the retained prefixes (the #2050 fail-safe), and the
-// startup window before the first fetch enforces an empty set — both are the
-// caller's responsibility to surface; this accessor only joins the data.
+// keeps enforcing the retained prefixes (the #2050 fail-safe). A persisted
+// feed carries its last-good snapshot across a reconfigure (#5282), so it still
+// has prefixes here and is still published — the omission above only fires for
+// a feed with NO prior good fetch. The caller surfaces the enforced set; this
+// accessor only joins the data.
 func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[string][]string {
 	if daCfg == nil || len(daCfg.AddressBindings) == 0 {
 		return nil
@@ -468,6 +482,20 @@ func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[st
 			}
 		}
 		sort.Strings(merged)
+		// #5645: a binding whose feeds ALL lack an installed snapshot resolves to
+		// no enforceable prefixes. A ready feed always installs >= 1 prefix (a
+		// zero-prefix fetch is rejected as suspect — see readFeed), so
+		// len(merged) == 0 is EXACTLY "no backing feed has an installed snapshot"
+		// (before the first successful fetch, an unknown/typo'd feed name, or after
+		// an explicit hold-interval drop) — never a legitimately-empty successful
+		// fetch. Do NOT publish it as a present-but-empty (match-none) entry: for a
+		// DENY policy match-none is fail-OPEN. Omit the name so it stays UNRESOLVED
+		// and the referencing policy fails CLOSED (see the doc comment). A
+		// persisted feed carried forward across a reconfigure (#5282) still has its
+		// last-good prefixes here, so this never re-opens the re-fetch window.
+		if len(merged) == 0 {
+			continue
+		}
 		out[name] = merged
 	}
 	return out

@@ -46689,3 +46689,34 @@ top.
     pkg/appid/catalog_predefined_set_5629_test.go,
     pkg/dataplane/userspace/nat_predefined_set_5629_test.go,
     docs/services-application-identification.md
+
+## 2026-07-11 — #5645 feeds first-fetch deny fail-open (codex-review-181)
+- **Timestamp**: 2026-07-11
+- **Action**: Fix fail-open where a direct feed-bound DENY name published as an
+  empty (match-none) overlay entry BEFORE the first successful fetch — the deny
+  compiled to match-none so denied traffic was PERMITTED for the whole
+  pre-first-fetch window. SnapshotForBindings now OMITS a binding whose feeds
+  all lack an installed snapshot (len(merged)==0), leaving the name UNRESOLVED
+  so the policy lowering fails CLOSED (unrepresentable -> __unsupported_address__
+  -> whole-snapshot preflight reject, the #3261 contract). Integrates with the
+  #5282 re-fetch window: a persisted feed carries its last-good snapshot forward
+  and still resolves to prefixes, so it stays published.
+- **File(s)**: pkg/feeds/feeds.go (SnapshotForBindings omit-unready + docstrings
+  + Apply cold-start comment), pkg/feeds/feeds_firstfetch_failopen_5645_test.go
+  (new fail-on-revert tests), pkg/feeds/feeds_bindings_test.go
+  (TestSnapshotForBindingsEmptyForUnloadedFeed -> ...OmitsUnresolvedFeed),
+  pkg/dataplane/userspace/policies_addrbook.go (buildAddressBookTableWithFeeds
+  doc corrected), pkg/dataplane/userspace/feed_enforcement_test.go
+  (TestEmptyFeedSnapshotYieldsNoPrefixes docstring corrected),
+  pkg/config/compiler_validate_strict_observability.go (unknown-feed posture
+  comment corrected for #5645), pkg/feeds/README.md (#5645 first-fetch
+  fail-closed section + cold-start line).
+- **Validation**: `go build ./...` clean; `go test ./pkg/feeds/...
+  ./pkg/config/... ./pkg/dataplane/userspace/... ./pkg/daemon/...` green; gofmt
+  clean. RED-on-revert proven: reverting the SnapshotForBindings omission guard
+  makes TestSnapshotForBindingsOmitsUnresolvedFeed,
+  TestFirstFetchFailedDenyFeedNotPublishedMatchNone, and
+  TestPermitFeedNoMembersOmittedNotFailOpen FAIL (binding published as
+  match-none = deny fail-open); the resolved-feed test stays green. Restoring ->
+  GREEN. Permit-none and the #5282 re-fetch window are unaffected
+  (TestFirstFetchSuccessPublishesFeed, TestReFetchWindowStillPublishesLastGood).
