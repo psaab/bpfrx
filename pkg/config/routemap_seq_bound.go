@@ -64,6 +64,46 @@ func RouteMapSequenceCount(ps *PolicyStatement) uint64 {
 	return total
 }
 
+// ComposedChainSequenceCount returns the number of FRR route-map TERM sequences
+// the pkg/frr renderer's renderComposedRouteMap emits for an ordered BGP policy
+// CHAIN (an `import`/`export [ A B ... ]` list of length >= 2, #5277): the SUM
+// of RouteMapSequenceCount over the chain's members, TRUNCATED at the first
+// member carrying an explicit terminating policy default action (`then accept`/
+// `then reject` at the policy level → DefaultAction "accept"/"reject"), because
+// renderComposedRouteMap stops composing the chain at that member (later members
+// are unreachable and never rendered).
+//
+// Like the single-policy RouteMapSequenceCount this EXCLUDES the one trailing /
+// terminating default sequence, so the SAME MaxRouteMapSequences ceiling applies
+// — the composed map's highest FRR sequence number is routeMapSeqStep*(count+1).
+// nil / undefined members are skipped, matching renderComposedRouteMap's
+// `if ps == nil { continue }` (the chain is pre-filtered to defined statements).
+// The running sum is saturating so a pathological chain never wraps back into
+// the in-bound range. This is the SSOT the #5732 commit gate
+// (validateBGPComposedChainSequenceBoundStrict) and the renderComposedRouteMap
+// render-side belt BOTH consult, so they can never disagree on what overflows.
+func ComposedChainSequenceCount(pss map[string]*PolicyStatement, chain []string) uint64 {
+	var total uint64
+	for _, name := range chain {
+		ps := pss[name]
+		if ps == nil {
+			continue
+		}
+		n := RouteMapSequenceCount(ps)
+		if total > math.MaxUint64-n {
+			total = math.MaxUint64
+		} else {
+			total += n
+		}
+		// renderComposedRouteMap emits this member's terminating default and
+		// BREAKS — later members are not rendered, so they add no sequences.
+		if ps.DefaultAction == "accept" || ps.DefaultAction == "reject" {
+			break
+		}
+	}
+	return total
+}
+
 // orOneU64 clamps a slice length to a minimum of 1: a missing `from` OR-set
 // still contributes one route-map sequence (the emitVariants "" sentinel).
 func orOneU64(n int) uint64 {

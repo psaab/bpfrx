@@ -1833,6 +1833,24 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5732: composed BGP policy-CHAIN route-map sequence bound — the chain
+	// companion to the per-policy #5701 gate above. renderComposedRouteMap
+	// concatenates an `export`/`import [ A B ... ]` chain (#5277) into ONE
+	// route-map with a running sequence number, so members that each pass the
+	// per-policy gate can still SUM past the FRR ceiling and emit a `route-map`
+	// line past seq 65535 — poisoning the whole frr-reload. Same strict/lenient
+	// doctrine and the SAME MaxRouteMapSequences ceiling; the renderer's
+	// renderComposedRouteMap independently skips an over-ceiling chain on the
+	// tolerant path (shared ComposedChainSequenceCount predicate).
+	if err := validateBGPComposedChainSequenceBoundStrict(cfg); err != nil {
+		if opts.lenientPolicyRouteMapSeq {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("composed route-map chain sequence bound (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2492: RPM test source-address gate. A malformed `source-address`
 	// (non-empty but unparseable) silently degrades the tcp-ping/http-get
 	// probe dialer to a wildcard/kernel-chosen source bind, so the probe
