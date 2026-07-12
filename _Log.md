@@ -46638,6 +46638,33 @@ top.
     pkg/dataplane/userspace/routes_ribgroup_zero_5642_test.go,
     docs/rib-group-route-leaking.md
 
+## 2026-07-11 — #5638: constrain master-password PRF to effective/supported scope (codex-review-181 M30)
+- **Timestamp**: 2026-07-11
+- **Action**: Fixed masterPasswordPRF accepting an inactive/unapplied
+  dormant or unsupported master-password PRF through the tolerant/HA
+  persistence path → deterministic HA non-durability. Split it into two
+  separable questions: (1) is encryption required? — fail-closed broad
+  scan (masterPasswordConfigured), preserving #4705/#5231; (2) which PRF
+  algorithm? — effective/applied scope only (effectiveMasterPasswordPRF:
+  strip inactive + expand applied groups on a clone), accepting only a
+  prfHash-supported selector, else the fixed supported default (sha256).
+  A dormant/unsupported PRF can no longer reach prfHash and
+  deterministically fail writeActive on HA config-sync.
+- **File(s)**: pkg/configstore/crypto.go (masterPasswordPRF rewrite +
+  masterPasswordConfigured/effectiveMasterPasswordPRF/prfSupported helpers +
+  defaultMasterPasswordPRF const), pkg/configstore/masterpw_dormant_prf_5638_test.go
+  (new fail-on-revert tests), pkg/configstore/masterpw_apply_groups_5231_test.go
+  (clarify unapplied-group comment for new effective-scope semantics),
+  pkg/configstore/README.md (crypto hardening note).
+- **Validation**: `go build ./...` clean; `go test ./pkg/configstore/...
+  ./pkg/config/...` green; gofmt clean. RED-on-revert proven: reverting
+  masterPasswordPRF to the pre-fix over-broad superset makes all four new
+  tests FAIL — masterPasswordPRF returns "bogus"/"sha512", WriteActive fails
+  with "unsupported master-password pseudorandom-function \"bogus\"", and
+  SyncApply leaves ConfigPersistDegraded()==true (the exact M30 symptom).
+  Restoring → GREEN. Normal single active supported-PRF config is
+  bit-identical (zero-allocation fast path).
+
 - **Timestamp**: 2026-07-11
   **Action**: #5629 — route predefined application bundles through the shared
     predefined-set-aware resolver on the AppID-disabled catalog + both NAT
