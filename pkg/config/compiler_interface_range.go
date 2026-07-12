@@ -53,52 +53,61 @@ type interfaceRangeDef struct {
 // and leaving the tree byte-identical — when there is no interface-range
 // stanza, so a config without the construct is unaffected.
 func expandInterfaceRanges(tree *ConfigTree) []string {
-	var ifaces *Node
-	for _, n := range tree.Children {
-		if n.Name() == "interfaces" {
-			ifaces = n
-			break
-		}
-	}
-	if ifaces == nil {
+	// #5675: union across EVERY top-level `interfaces` root, not just the first.
+	// A hierarchical config can split its interfaces across two sibling
+	// `interfaces { }` stanzas, and compileSections compiles them all — so if
+	// an interface-range lives in a second root the old first-root-only scan
+	// skipped it, re-minting the #4027 phantom "interface-range" iface and
+	// dropping the range's shared config for its members.
+	ifaceRoots := tree.FindChildren("interfaces")
+	if len(ifaceRoots) == 0 {
 		return nil
 	}
 
-	// Separate interface-range definitions from real interface children.
+	// Separate interface-range definitions from real interface children, across
+	// every interfaces root. keptByRoot holds each root's non-range children so
+	// the strip is deferred until we know a range was actually seen (a config
+	// with no interface-range stays byte-identical — the no-op contract).
 	var ranges []interfaceRangeDef
 	var warnings []string
 	sawRange := false
-	kept := make([]*Node, 0, len(ifaces.Children))
-	for _, child := range ifaces.Children {
-		if child.Name() != "interface-range" {
-			kept = append(kept, child)
-			continue
-		}
-		sawRange = true
-		if len(child.Keys) >= 2 {
-			// Hierarchical: Keys=["interface-range", <name>], children are
-			// the member/config nodes directly.
-			rd, w := parseHierInterfaceRange(child)
-			warnings = append(warnings, w...)
-			if rd != nil {
-				ranges = append(ranges, *rd)
+	keptByRoot := make([][]*Node, len(ifaceRoots))
+	for ri, ifaces := range ifaceRoots {
+		kept := make([]*Node, 0, len(ifaces.Children))
+		for _, child := range ifaces.Children {
+			if child.Name() != "interface-range" {
+				kept = append(kept, child)
+				continue
 			}
-		} else {
-			// Flat-set: Keys=["interface-range"], each child is a leaf whose
-			// Keys[0] is the range name and Keys[1:] the config statement.
-			rds, w := parseFlatInterfaceRanges(child)
-			warnings = append(warnings, w...)
-			ranges = append(ranges, rds...)
+			sawRange = true
+			if len(child.Keys) >= 2 {
+				// Hierarchical: Keys=["interface-range", <name>], children are
+				// the member/config nodes directly.
+				rd, w := parseHierInterfaceRange(child)
+				warnings = append(warnings, w...)
+				if rd != nil {
+					ranges = append(ranges, *rd)
+				}
+			} else {
+				// Flat-set: Keys=["interface-range"], each child is a leaf whose
+				// Keys[0] is the range name and Keys[1:] the config statement.
+				rds, w := parseFlatInterfaceRanges(child)
+				warnings = append(warnings, w...)
+				ranges = append(ranges, rds...)
+			}
 		}
+		keptByRoot[ri] = kept
 	}
 	if !sawRange {
 		// No interface-range stanza present — leave the tree untouched.
 		return nil
 	}
-	// Strip every interface-range node so the range name is never compiled as
-	// a phantom interface, even if the stanza was malformed and yielded no
-	// expandable range.
-	ifaces.Children = kept
+	// Strip every interface-range node (in every root) so the range name is
+	// never compiled as a phantom interface, even if the stanza was malformed
+	// and yielded no expandable range.
+	for ri, ifaces := range ifaceRoots {
+		ifaces.Children = keptByRoot[ri]
+	}
 
 	// Build the ordered, de-duplicated member set and, per member, the
 	// concatenation of every containing range's shared statements (range
@@ -125,22 +134,27 @@ func expandInterfaceRanges(tree *ConfigTree) []string {
 		}
 	}
 
-	// Snapshot and remove each member's existing explicit interface node so
-	// its own statements can be re-applied LAST — SetPath replaces a
-	// single-value leaf (e.g. mtu), so applying shared config first and the
-	// member's own config last gives the member precedence on a conflict
-	// while additive statements (addresses) accumulate.
+	// Snapshot and remove each member's existing explicit interface node (in
+	// every root) so its own statements can be re-applied LAST — SetPath
+	// replaces a single-value leaf (e.g. mtu), so applying shared config first
+	// and the member's own config last gives the member precedence on a
+	// conflict while additive statements (addresses) accumulate. A member whose
+	// own node lives in a different root than its range is still captured
+	// because we sweep every root; SetPath below replays into the first root,
+	// which compileSections merges with the rest.
 	memberOwn := map[string][][]string{}
-	remaining := ifaces.Children[:0]
-	for _, child := range ifaces.Children {
-		name := child.Name()
-		if inRange[name] && !child.IsLeaf {
-			memberOwn[name] = flattenNodesToPaths(child.Children, nil)
-			continue
+	for _, ifaces := range ifaceRoots {
+		remaining := ifaces.Children[:0]
+		for _, child := range ifaces.Children {
+			name := child.Name()
+			if inRange[name] && !child.IsLeaf {
+				memberOwn[name] = append(memberOwn[name], flattenNodesToPaths(child.Children, nil)...)
+				continue
+			}
+			remaining = append(remaining, child)
 		}
-		remaining = append(remaining, child)
+		ifaces.Children = remaining
 	}
-	ifaces.Children = remaining
 
 	for _, m := range memberOrder {
 		for _, p := range memberShared[m] {

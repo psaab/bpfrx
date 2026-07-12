@@ -88,7 +88,12 @@ func emitNodeExpandedZoneNames(tree *ConfigTree, nodeID int, out map[string]stru
 	if err := clone.ExpandGroupsWithVars(vars); err != nil {
 		return
 	}
-	collectZoneNamesAST(clone.FindChild("security"), out)
+	// #5691: union across every top-level `security` root — a split config can
+	// declare zones in a second `security { }` stanza that compileSections still
+	// compiles.
+	for _, sec := range clone.FindChildren("security") {
+		collectZoneNamesAST(sec, out)
+	}
 }
 
 // validateZoneIDCollisionAST checks the UNION of security-zone names across
@@ -120,8 +125,13 @@ func emitNodeExpandedZoneNames(tree *ConfigTree, nodeID int, out map[string]stru
 // is inert on the later-folding zone rather than mis-attributed.
 func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	names := make(map[string]struct{})
-	// View 1 — pre-expansion presence union (main + every groups block).
-	collectZoneNamesAST(tree.FindChild("security"), names)
+	// View 1 — pre-expansion presence union (main + every groups block). Union
+	// across EVERY top-level `security` root (#5691): a split config can declare
+	// zones in a second `security { }` stanza, and compileSections compiles them
+	// all, so a first-root-only scan would miss a collision spanning the roots.
+	for _, sec := range tree.FindChildren("security") {
+		collectZoneNamesAST(sec, names)
+	}
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
 			continue
@@ -131,10 +141,14 @@ func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error
 			// Keys[1]; the children are then the group body. The other shape
 			// nests the group name as a child node.
 			if len(child.Keys) >= 2 {
-				collectZoneNamesAST(child.FindChild("security"), names)
+				for _, sec := range child.FindChildren("security") {
+					collectZoneNamesAST(sec, names)
+				}
 				break
 			}
-			collectZoneNamesAST(group.FindChild("security"), names)
+			for _, sec := range group.FindChildren("security") {
+				collectZoneNamesAST(sec, names)
+			}
 		}
 	}
 	// Views 2/3 — post-expansion zone names for node0 and node1. Both computed
