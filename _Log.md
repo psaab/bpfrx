@@ -23,6 +23,19 @@
   NOT config-layer, NOT the daemon nft emission, NOT cluster/VRRP/failover.
   Fail-on-revert proven (address in 2 conflicting views RED without the skip).
   Full pkg/dataplane/userspace + pkg/config suites green.
+- **Timestamp**: 2026-07-12 (fix/5699 review fold — VLAN unit-0 fail-open)
+- **Action**: PR #5736 review MINOR: the first-cut skip guard fired whenever
+  unit 0 merely EXISTS, but the base↔unit-0 address collapse happens ONLY for a
+  same-netdev unit 0. A VLAN unit 0 (VlanID>0 → Linux <base>.<vlan>) or a
+  tunnel-mapped unit 0 is a DISTINCT netdev, so base and unit-0 enumerate
+  DISJOINT addresses — skipping the base there dropped the base netdev's own
+  live address from all host-inbound views → kernel input falls through to
+  policy accept (FAIL-OPEN). Refined the guard to skip ONLY when
+  snapshotLinuxName(base, unit0) == snapshotLinuxName(base, nil) (the base
+  snapshot's own LinuxName), i.e. base and unit-0 are literally the same kernel
+  device — provably correct for VLAN/tunnel/reth/plain by construction. Added
+  TestHostInboundVlanUnit0KeepsBaseAddress_5699 (base addr stays deny-scoped;
+  RED against the over-firing guard) + TestHostInboundNoUnit0KeepsBase_5699.
 - **File(s)**: pkg/dataplane/userspace/zones_host_inbound.go,
   pkg/dataplane/userspace/interfaces.go,
   pkg/dataplane/userspace/host_inbound_baseunit0_5699_test.go,

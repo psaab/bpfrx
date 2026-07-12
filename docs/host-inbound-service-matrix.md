@@ -435,9 +435,16 @@ opened). The fix skips the base (physical) snapshot's host-inbound address
 contribution when unit 0 is configured: unit 0's snapshot is the authoritative
 carrier (its merged override matches enforcement and `InterfaceHostInboundEffective`),
 so the address resolves to ONE view carrying the additive `zone ∪ physical ∪
-unit-0` admit set. The base snapshot is kept as the sole carrier only when the
-interface has no unit 0 (rare bootstrap / DHCP-on-raw-netdev), so an address is
-never dropped from the deny scope (never fail-open).
+unit-0` admit set. The skip is gated on the ACTUAL same-netdev collapse
+(`snapshotLinuxName(base, unit0) == snapshotLinuxName(base, nil)`), NOT merely
+"unit 0 exists": a VLAN unit 0 (`VlanID > 0` → Linux `<base>.<vlan>`) or a
+tunnel-mapped unit 0 resolves to a DISTINCT netdev, so the base and unit-0
+snapshots enumerate DISJOINT addresses — skipping the base there would drop the
+base netdev's own live address from every view and the kernel input chain would
+fall through to `policy accept` (FAIL-OPEN). The base snapshot is kept as the
+sole carrier both for a VLAN/tunnel unit 0 (distinct netdev) and for an
+interface with no unit 0 at all (rare bootstrap / DHCP-on-raw-netdev), so an
+address is never dropped from the deny scope.
 
 **Gate alignment.** The commit-time duplicate-address gate
 (`buildHostInboundOverrideMapLocal` +
