@@ -1,3 +1,23 @@
+## 2026-07-12 — #5677: direct-host (junos-host) projection resolves application-set before a same-named user application
+- **Timestamp**: 2026-07-12 (fix/5677-directhost-app-first)
+- **Action**: codex-review-182 M11 (High). In the config compiler's DIRECT
+  host-bound (`to-zone junos-host`) DENY projection, `junosHostResolveApplications`
+  consulted the application-SET table (`ResolveApplicationSet`, which also sees
+  the #4102 predefined bundles) BEFORE the user APPLICATION table, so a user
+  application shadowed by a same-named set was mis-resolved to the set — the
+  kernel `xpf_hostinbound` DENY projected the set's member ports, not the
+  operator's application ports. Fixed to app-first: resolve `ResolveApplication`
+  first and only OR-expand as an application-set when the token is NOT an
+  application, mirroring `resolveUserspaceApplicationNames` and the #5629/#5664
+  policy-match / NAT / catalog fixes. Distinct from closed #5629 (policy-match
+  ordering) and open #5671 (memberIsNestedSet nil guard) — this is the
+  direct-host projection site specifically. Fail-on-revert test uses a user
+  `application junos-ms-rpc` (tcp/9999) shadowing the predefined `junos-ms-rpc`
+  bundle (tcp/135 + udp/135): app-first projects tcp/9999 (1 fragment);
+  reverting to set-first projects tcp/135 + udp/135 (2 fragments) → RED. Proven
+  RED-on-revert, GREEN with the fix; full `pkg/config` suite passes.
+- **File(s)**: pkg/config/junos_host_deny.go, pkg/config/junos_host_deny_app_shadow_5677_test.go
+
 ## 2026-07-11 — #5628 (security): NAT rule `then` must carry exactly one terminal translation action
 - **Timestamp**: 2026-07-11 (fix/5628-nat-terminal-action)
 - **Action**: codex-review-181 M16. A source/destination NAT rule's complete
