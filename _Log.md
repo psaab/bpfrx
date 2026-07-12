@@ -46513,3 +46513,7 @@ top.
 - **Timestamp**: 2026-07-11 (parent inline, roster full)
   - **Action**: #4906 HC-001 (Critical) — guard the AF_XDP reproducer fork()/kill() against a host-wide SIGKILL. Unchecked fork() then unconditional kill(child,9): on fork()==-1 (RLIMIT_NPROC / PID exhaustion) child==-1 and kill(-1,SIGKILL) signals every process the root caller may signal (firewall daemon + host). Added an `if (child < 0)` warn-and-continue after fork and guarded every kill/waitpid with `if (child > 0)` in both reproducers. Test-tooling only; gcc -fsyntax-only clean. Remaining #4906 cohort defects (HC-025 /tmp symlink, XDP replace-detach, uninitialized-counter PASS, frame-recycle/shared-UMEM coverage) need the agent lane + runtime verification — issue kept open.
   - **File(s)**: test/xsk-repro/libbpf_xsk_test.c, test/xsk-repro/libbpf_xsk_shared_test.c
+
+- **Timestamp**: 2026-07-11
+- **Action**: Fix parseNextTableInstance dotted-instance truncation (#5632) — strings.Index → strings.LastIndex so a routing-instance name containing ".inet" keeps its full identity; add fail-on-revert unit test.
+- **File(s)**: pkg/config/compiler_routing.go, pkg/config/compiler_routing_nexttable_5632_test.go

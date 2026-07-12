@@ -382,8 +382,16 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 // parseNextTableInstance extracts the routing instance name from a Junos
 // next-table value like "Comcast-GigabitPro.inet.0" → "Comcast-GigabitPro".
 func parseNextTableInstance(table string) string {
-	// Strip .inet.0 or .inet6.0 suffix to get the routing instance name
-	if idx := strings.Index(table, ".inet"); idx > 0 {
+	// Strip the trailing .inet.N / .inet6.N table suffix to get the routing
+	// instance name. A next-table target is always "<instance>.<family>.<index>",
+	// so the family+index separator is the LAST ".inet" occurrence, not the
+	// first. strings.Index truncated a routing-instance NAME that itself
+	// contained ".inet" (an accepted dotted instance, e.g. "a.inet.b" whose
+	// table is "a.inet.b.inet.0") at the embedded ".inet", corrupting the
+	// emitted next-table identity to "a" and misrouting the leak (#5632). Anchor
+	// on the trailing suffix with LastIndex; for a single-".inet" table the two
+	// are identical, so ordinary names are unaffected.
+	if idx := strings.LastIndex(table, ".inet"); idx > 0 {
 		return table[:idx]
 	}
 	return table
