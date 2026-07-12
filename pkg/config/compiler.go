@@ -1656,6 +1656,22 @@ type compileOpts struct {
 	// lenientDNATToScope.
 	lenientNATMixedScope bool
 
+	// lenientInterfaceUnitAliasCollisions (#5631, codex-review-181 M23)
+	// downgrades the numeric interface-unit alias reject
+	// (validateInterfaceUnitAliasCollisionsAST) from a hard compile error to a
+	// cfg.Warnings entry. Two distinct unit spellings under one interface that
+	// canonicalize to the same logical unit (e.g. `unit 00` and `unit 0`)
+	// collide on `ifc.Units[unitNum]` with last-writer-wins for the unit
+	// filter but append-only accumulation for the interface tunnel addresses —
+	// so the winning firewall filter and the surviving tunnel addresses depend
+	// on config order (a fail-open on the security filter). The strict commit /
+	// commit-check path hard-rejects so the operator collapses the aliases; the
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted or peer-synced config an older binary accepted still BOOTS
+	// (#1960 fail-closed-on-load class). Same doctrine as
+	// lenientUnsupportedInterfaceStanzas.
+	lenientInterfaceUnitAliasCollisions bool
+
 	// lenientEventWithinTrigger (#3751) downgrades the event-options
 	// within/trigger numeric gate (validateEventOptionsWithinAST) from a hard
 	// compile error to a cfg.Warnings entry. A non-numeric / negative / zero /
@@ -1847,6 +1863,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
+		lenientInterfaceUnitAliasCollisions:    true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
@@ -2119,6 +2136,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPVirtualAddress:              true,
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
+		lenientInterfaceUnitAliasCollisions:    true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,

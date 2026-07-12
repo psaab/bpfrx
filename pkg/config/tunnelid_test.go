@@ -208,18 +208,23 @@ func TestTunnelEndpointIDUnitLevelLeadingZeroStillCollides(t *testing.T) {
 	}
 }
 
-// #1910 r6 Codex: duplicate spellings of the same unit number must
-// follow the typed compiler's LAST-WINS overwrite
-// (ifc.Units[unitNum] = unit per instance). When `unit 00` carries
-// the tunnel but a later `unit 0` re-declares the unit without one,
-// the compiled unit has no tunnel and the builder emits nothing — the
-// gate must not register the ref (false reject). When the order is
-// reversed the tunnel-carrying instance wins and the collision is
-// real.
-func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
-	// Tunnel on the OVERWRITTEN earlier instance: no endpoint emitted,
-	// so the wg1408.0/wg78.0 collision (both refs would collide if
-	// emitted) must NOT reject the commit.
+// #1910 r6 Codex ORIGINALLY exercised the typed compiler's LAST-WINS
+// overwrite for duplicate spellings of one unit number (`unit 00` then
+// `unit 0` both keying ifc.Units[0]) as it flowed into the
+// tunnel-endpoint-ID collision gate. #5631 (codex-review-181 M23)
+// SUPERSEDES that path: the order-dependent last-wins/append-both
+// resolution was a fail-open on the interface firewall filter, so
+// numeric unit aliases are now REJECTED by
+// validateInterfaceUnitAliasCollisionsAST in runPreWalkGates — BEFORE the
+// tunnel-endpoint-ID gate ever compiles the overwritten unit. Both
+// duplicate-spelling configs below therefore hard-reject at commit with a
+// #5631 unit-alias error rather than reaching the tunnel-ID last-wins
+// logic. The tunnel-endpoint-ID gate's real cross-interface collision
+// coverage lives in the sibling tests (which use DISTINCT unit numbers).
+func TestTunnelEndpointIDDuplicateUnitSpellingRejected5631(t *testing.T) {
+	// Tunnel on the overwritten earlier instance (#1910 case 1) —
+	// duplicate `unit 00` + `unit 0` on wg1408 is now a #5631 alias
+	// rejection, so the config never reaches the tunnel-ID gate.
 	tree := buildTree(t, []string{
 		"set interfaces wg1408 unit 00 tunnel mode wireguard",
 		"set interfaces wg1408 unit 00 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
@@ -229,11 +234,21 @@ func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
 		"set interfaces wg78 unit 0 tunnel wireguard private-key 1111111111111111111111111111111111111111111111111111111111111111",
 		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
-	if _, err := CompileConfig(tree); err != nil {
-		t.Fatalf("CompileConfig rejected a collision on a ref whose tunnel lives only on an overwritten duplicate unit instance: %v", err)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a duplicate numeric unit spelling on wg1408 (unit 00 vs unit 0) — #5631 must reject it")
 	}
-	// Tunnel on the LAST instance: the unit compiles with the tunnel,
-	// the builder emits wg1408.0, and the collision must reject.
+	if !strings.Contains(err.Error(), "#5631") || !strings.Contains(err.Error(), "wg1408") {
+		t.Fatalf("expected a #5631 unit-alias rejection naming wg1408, got: %v", err)
+	}
+
+	// Tunnel on the last (winning) instance (#1910 case 2). Here the
+	// compiled wg1408.0 carries the tunnel, so the PRE-expansion
+	// tunnel-endpoint-ID gate (#1873, upstream of runPreWalkGates)
+	// rejects the wg1408.0/wg78.0 collision first — before the #5631
+	// alias gate is reached. Either way the duplicate-spelling config is
+	// refused at commit (never silently committed with an order-dependent
+	// filter); assert the rejection without pinning which gate fires.
 	tree = buildTree(t, []string{
 		"set interfaces wg1408 unit 00 family inet address 10.70.3.1/30",
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
@@ -241,8 +256,12 @@ func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
 		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
-	if _, err := CompileConfig(tree); err == nil {
-		t.Fatalf("CompileConfig accepted a real collision whose tunnel lives on the last duplicate unit instance (wg1408.0 vs wg78.0)")
+	_, err = CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a duplicate numeric unit spelling on wg1408 (unit 00 vs unit 0) — the commit must be rejected")
+	}
+	if !strings.Contains(err.Error(), "wg1408") {
+		t.Fatalf("expected a rejection naming wg1408, got: %v", err)
 	}
 }
 
