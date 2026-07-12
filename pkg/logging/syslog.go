@@ -273,6 +273,12 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 	return c, nil
 }
 
+// Protocol returns the transport this client was constructed with ("udp",
+// "tcp", or "tls"). Exported so callers/tests can verify the configured
+// transport was honored — e.g. that an in-process CLI commit preserves a
+// TCP/TLS stream instead of downgrading it to plaintext UDP (#5712).
+func (s *SyslogClient) Protocol() string { return s.protocol }
+
 // NewSyslogClientWithConn wraps an already-established net.Conn in a syslog
 // client. No dial is performed: the connection is treated as already up, and
 // protocol governs any later reconnect. It exists so callers — primarily

@@ -57,16 +57,55 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 		return
 	}
 	c.eventReader.SetZoneNames(syslogZoneNameMap(cfg))
+	c.eventReader.ReplaceSyslogClients(buildSyslogClients(cfg))
+}
 
+// buildSyslogClients constructs the syslog client set from the committed
+// config's `security log stream` stanzas. It is the CLI-side, in-process
+// commit/rollback counterpart of the daemon's applySyslogConfig
+// (pkg/daemon/daemon_system.go) and MUST honor the configured transport the
+// same way.
+//
+// #5712: this path runs on EVERY local-console commit/rollback (reloadSyslog,
+// #3704) on the SHARED event reader, AFTER the daemon reconcile already
+// installed the correct clients. It previously reconstructed every stream as
+// plaintext UDP via NewSyslogClient — a duplicate runtime owner that
+// CLOBBERED a configured TCP/TLS stream back down to UDP, silently downgrading
+// the secure-syslog transport after an in-process commit. Building through
+// NewSyslogClientTransport with the stream's configured protocol makes this
+// rebuild PRESERVE the transport (idempotent with the daemon's build), so the
+// single-owner posture holds regardless of which owner writes last. The
+// per-stream source-address and facility are carried too, matching the daemon.
+//
+// A TCP/TLS receiver unreachable at commit returns a usable-but-unconnected
+// client (#3351); it is installed in the reconnecting state rather than
+// dropped, mirroring applySyslogConfig. Only a nil client (UDP construction
+// failure, or an unsupported/typo'd transport rejected fail-closed by #5581)
+// skips the stream.
+func buildSyslogClients(cfg *config.Config) []*logging.SyslogClient {
 	var clients []*logging.SyslogClient
 	for name, stream := range cfg.Security.Log.Streams {
-		client, err := logging.NewSyslogClient(stream.Host, stream.Port)
+		protocol := stream.Transport.Protocol
+		if protocol == "" {
+			protocol = "udp"
+		}
+		// The final *tls.Config is nil — a TLS stream trusts the system CA
+		// roots; a named transport tls-profile is rejected at commit
+		// (validateSecurityLogStreamTLSProfileAST), matching applySyslogConfig.
+		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, stream.SourceAddress, protocol, nil)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: syslog stream %s: %v\n", name, err)
-			continue
+			if client == nil {
+				fmt.Fprintf(os.Stderr, "warning: syslog stream %s (%s): %v\n", name, protocol, err)
+				continue
+			}
+			// #3351: TCP/TLS receiver unreachable at apply — install reconnecting.
+			fmt.Fprintf(os.Stderr, "warning: syslog stream %s (%s) receiver unreachable; installed in reconnecting state: %v\n", name, protocol, err)
 		}
 		if stream.Severity != "" {
 			client.MinSeverity = logging.ParseSeverity(stream.Severity)
+		}
+		if stream.Facility != "" {
+			client.Facility = logging.ParseFacility(stream.Facility)
 		}
 		if stream.Category != "" {
 			client.Categories = logging.ParseCategory(stream.Category)
@@ -81,7 +120,7 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 		}
 		clients = append(clients, client)
 	}
-	c.eventReader.ReplaceSyslogClients(clients)
+	return clients
 }
 
 // applyToDataplane drives the legacy CLI-side apply sequence: tunnel
