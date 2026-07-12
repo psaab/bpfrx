@@ -58,23 +58,22 @@ func TestSnapshotForBindingsUnionsAndDedupsMultipleFeeds(t *testing.T) {
 	}
 }
 
-func TestSnapshotForBindingsEmptyForUnloadedFeed(t *testing.T) {
+func TestSnapshotForBindingsOmitsUnresolvedFeed(t *testing.T) {
 	m := New(nil)
-	// "missing-feed" was never started/fetched; the binding still produces an
-	// entry, but a non-nil empty slice (fail-closed: matches nothing). This is
-	// the documented startup-before-first-fetch / unknown-feed case (#2049).
+	// "missing-feed" was never started/fetched, so the binding resolves to no
+	// enforceable prefixes. #5645: the binding name is OMITTED from the overlay
+	// entirely (unresolved) rather than published as a present-but-empty
+	// (match-none) slice — publishing match-none made a DENY policy referencing
+	// the name fail OPEN before the first fetch. Omitting it leaves the name
+	// unresolved so the policy lowering fails CLOSED (unrepresentable ->
+	// __unsupported_address__ -> whole-snapshot reject). This also covers the
+	// unknown/typo'd-feed case (an unknown name is treated like an unready feed).
 	got := m.SnapshotForBindings(bindingCfg(map[string][]string{
 		"pending": {"missing-feed"},
 	}))
-	prefixes, ok := got["pending"]
-	if !ok {
-		t.Fatalf("a feed-backed binding must be present in the overlay even when empty")
-	}
-	if prefixes == nil {
-		t.Fatalf("empty binding must be a non-nil slice, got nil")
-	}
-	if len(prefixes) != 0 {
-		t.Fatalf("unloaded feed must contribute no prefixes, got %v", prefixes)
+	if _, ok := got["pending"]; ok {
+		t.Fatalf("an unresolved feed-backed binding must be OMITTED from the overlay "+
+			"(fail-closed), not published as match-none; got %v", got)
 	}
 }
 

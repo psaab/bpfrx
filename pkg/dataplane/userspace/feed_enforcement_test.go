@@ -180,11 +180,16 @@ func TestFeedBackedPolicyDestinationRoutesAsBookReference(t *testing.T) {
 	}
 }
 
-// TestEmptyFeedSnapshotYieldsNoPrefixes is the documented empty-feed case
-// (#2049 §3a): an overlay entry with no prefixes (startup before first fetch /
-// operator hold-interval drop) produces a row with no concrete prefixes — the
-// rule matches nothing (fail-closed for an allowlist; the documented
-// operator-opted fail-open for a denylist). No panic, no compile error.
+// TestEmptyFeedSnapshotYieldsNoPrefixes exercises the consumer's DEFENSIVE
+// handling of an explicit present-but-empty overlay entry: it produces a row
+// with no concrete prefixes (a match-none book reference) without panicking or
+// erroring. NOTE (#5645): the daemon no longer PRODUCES this shape for an
+// unready feed — feeds.Manager.SnapshotForBindings OMITS an unresolved feed
+// name so the referencing policy fails CLOSED (see
+// TestFeedBackedPolicyRoutesAsBookReference's no-overlay branch:
+// absent name -> __unsupported_address__ sentinel). This test now only pins the
+// consumer's no-panic behavior for a hand-supplied empty entry, NOT a reachable
+// denylist fail-open.
 func TestEmptyFeedSnapshotYieldsNoPrefixes(t *testing.T) {
 	cfg := feedPolicyCfg("bad-actors", "any")
 	overlay := map[string][]string{

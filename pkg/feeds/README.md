@@ -54,8 +54,9 @@ replaces them (`installSnapshot`). Distinctions:
   carried set installed indefinitely (never reverts to empty — #2050 preserved),
 - **removed feed** (deleted from config) → no plan entry, no replacement, its
   snapshot is dropped (correct — the operator removed it),
-- **brand-new feed** → no prior snapshot, starts empty until its first fetch
-  (the documented fail-closed cold-start, not a regression of an existing feed).
+- **brand-new feed** → no prior snapshot to carry; until its first successful
+  fetch its binding is **omitted** from the enforcement overlay (#5645, below),
+  so a referencing policy fails **closed**, not a match-none fail-open.
 
 The atomic swap on a successful new fetch is unchanged, so the overlay compiler
 never sees a torn prefix set. Retained FAILURE markers (`LastError`/`StaleSince`)
@@ -63,6 +64,32 @@ are intentionally NOT carried: the new endpoint gets a clean slate and the first
 post-Apply fetch re-derives stale state, which also gives an opt-in
 `hold-interval` a fresh window on the new endpoint rather than a partially-elapsed
 one (strictly more conservative for the fail-open guard).
+
+## First-fetch fail-closed — no match-none deny window (#5645)
+
+`#5282` closes the fail-open window on a **reconfigure** (a persisted feed keeps
+its last-good prefixes). `#5645` closes the sibling window on **first fetch**,
+where there is no prior snapshot to keep. Before the fix, `SnapshotForBindings`
+published a binding whose feeds had no installed snapshot as a **present-but-empty**
+slice. The daemon compiled that direct feed-bound name into a **match-none**
+address-book row — correct for a `permit` (permit-none), but a `deny` policy
+referencing the name then **never fired**, so traffic it must block was PERMITTED
+for the whole window until the first fetch succeeded (a firewall **fail-open**).
+A blocked/failed first fetch (`retainForever` has nothing to retain) held that
+window open indefinitely.
+
+`SnapshotForBindings` now **omits** a binding whose feeds all lack an installed
+snapshot (before the first successful fetch, an unknown/typo'd feed name, or
+after a hold-interval drop) rather than publishing an empty slice. A ready feed
+always installs ≥ 1 prefix (a zero-prefix fetch is rejected — see below), so
+"resolves to zero prefixes" is exactly "no backing feed has a snapshot". Leaving
+the name **unresolved** makes the policy lowering treat it as unrepresentable
+(`addrRepresentable` → `__unsupported_address__` → whole-snapshot preflight
+reject), so the referencing policy fails **closed** (previous-good retained /
+fresh-boot default-deny) — the same action-agnostic contract `#3261` gives an
+empty static book. A **persisted** feed carries its last-good snapshot forward
+(`#5282`), so it still resolves to prefixes here and is still published; the
+omission fires only for a feed with no prior good fetch.
 
 ## Refresh correctness & fail-safe behavior (#2050)
 
