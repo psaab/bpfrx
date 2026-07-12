@@ -47153,6 +47153,28 @@ top.
 - **File(s)**: pkg/ddns/manager.go, pkg/ddns/scope_test.go,
   pkg/api/metrics_system.go, pkg/api/metrics_descriptors.go,
   pkg/ddns/README.md
+- **Timestamp**: 2026-07-12 (#5680)
+- **Action**: #5680 fix — route-only publication no longer ACKs an
+  old-policy/new-route HYBRID as the applied config. PublishRouteOverlaySnapshot
+  (manager_overlay.go) rebuilds ONLY next.Routes and inherits every compiled
+  policy section from m.lastSnapshot, then stamped next.Config = cfg +
+  markAppliedSnapshotLocked → advanced the applied identity to cfg even when
+  cfg's policy half was never compiled into the snapshot (the #5679 residual: an
+  ordinary ApplyConfig failure leaves lastSnapshot at the OLD policy while
+  store.Commit promoted the NEW cfg; the tail route-leak republish + ipmon
+  actuator then pass the NEW cfg). Added a fail-closed guard
+  (routeOnlyPublishHybrid): refuse the publish when cfg is not the config
+  lastSnapshot was compiled from (pointer fast-path + reflect.DeepEqual
+  fallback so a distinct-but-equal config is never falsely refused). On refusal
+  the OLD consistent snapshot stays live and the desired-overlay cache stays at
+  baseline (#3760). Added fail-on-revert test (RED proven with the guard
+  neutralized: publish returns nil error + appliedSnapshot advances to cfgB +
+  hybrid shipped to helper) plus a false-refusal guard test. Composes with
+  #5679 (commit already fails via applyErr; this stops the manager's applied
+  identity from lying). gofmt clean; pkg/dataplane/userspace + pkg/daemon green.
+- **File(s)**: pkg/dataplane/userspace/manager_overlay.go,
+  pkg/dataplane/userspace/route_overlay_test.go,
+  docs/rib-group-route-leaking.md, _Log.md
 ## 2026-07-12 — #5711/#5743 test-quality fold (hostile-review)
 - **Timestamp**: 2026-07-12
 - **Action**: Fold two TEST-QUALITY findings from PR #5743 review (production
