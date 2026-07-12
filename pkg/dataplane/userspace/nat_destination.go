@@ -298,7 +298,16 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 					app, found := config.ResolveApplication(appName, userApps)
 					if found {
 						appTerms = append(appTerms, appTermFor(app))
-					} else if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+					} else if _, isSet := config.ResolveApplicationSet(appName, cfg.Applications.ApplicationSets); isSet {
+						// #5629: resolve the SET through the #4102
+						// predefined-set-aware config.ResolveApplicationSet, NOT a
+						// bare cfg.Applications.ApplicationSets membership test
+						// (USER sets only). A strict predefined bundle
+						// (junos-ms-rpc, junos-sun-rpc, ...) referenced by a
+						// destination-NAT rule otherwise resolved to zero terms and
+						// fell through to the #3434 never-match sentinel — the DNAT
+						// rule silently disabled. ExpandApplicationSet falls back to
+						// the predefined table, so a user set stays bit-identical.
 						expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
 						if err == nil {
 							for _, termName := range expanded {
