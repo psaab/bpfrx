@@ -46519,6 +46519,10 @@ top.
 - **File(s)**: pkg/config/compiler_routing.go, pkg/config/compiler_routing_nexttable_5632_test.go
 
 - **Timestamp**: 2026-07-11
+  - **Action**: #5647 (M40, codex-review-181) — reject scoped-looking OSPF/BGP/IPsec `request ... clear` suffixes instead of silently widening to a global reset. `request protocols ospf clear`, `... bgp clear`, and `request security ipsec sa clear` map to selector-FREE global daemon actions (vtysh `clear ip ospf process` / `clear bgp * soft` / strongSwan TerminateAllSAs). A trailing selector token (`... clear neighbor 10.0.0.1`, `... sa clear 42`) was silently dropped while the global reset still ran. Chose option (b) — reject at the CLI before the RPC — because no per-neighbor/per-SA plumbing exists (genuinely global-only actions; option (a) would be a new feature across FRR + strongSwan wiring). Fail-on-revert test proven RED (all 4 scoped cases fall through to global SystemAction when the guards are removed).
+  - **File(s)**: cmd/cli/request.go, cmd/cli/request_scope_5647_test.go, docs/phases.md
+
+- **Timestamp**: 2026-07-11
 - **Action**: Fix #5636 (codex-review-181 M28, High) — a quoted-empty Basic
   secret parsed as a VALID credential on an off-loopback bind (auth bypass).
   Root was BOTH layers: (a) the compiler stored a `password ""` / `api-key ""`
