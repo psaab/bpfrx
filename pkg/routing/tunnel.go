@@ -1638,12 +1638,42 @@ func (t *tunnelManager) startKeepalive(tunnelName, source, remoteAddr string, in
 		"source", source, "remote", remoteAddr, "interval", interval, "retries", maxRetries)
 }
 
+// maxKeepaliveIntervalSec bounds the tunnel keepalive interval before it
+// is multiplied into a time.Duration. time.Duration is int64 nanoseconds,
+// so time.Duration(sec)*time.Second overflows once sec exceeds ~9.2e9;
+// an overflowed product wraps non-positive, and time.NewTicker panics on
+// a non-positive interval, crashing xpfd (#5705). The commit-check schema
+// rejects an out-of-range keepalive at admission (pkg/config
+// tunnelSchemaChildren, ValidateInteger(0, 32767)); this ceiling mirrors
+// that bound as a runtime clamp so an un-gated value (stale DB, a path
+// that bypasses SchemaValidate) still cannot overflow or panic. 32767 s
+// matches the de-facto GRE keepalive ceiling and 32767*1e9 ns is far
+// under the int64 limit.
+const maxKeepaliveIntervalSec = 32767
+
+// clampKeepaliveIntervalSec constrains a keepalive interval to a
+// positive, non-overflowing range [1, maxKeepaliveIntervalSec]. The
+// keepalive loop only starts for intervals > 0, so the min-1 floor is
+// purely defensive against a degenerate non-positive value reaching
+// time.NewTicker (which would panic).
+func clampKeepaliveIntervalSec(sec int) int {
+	if sec < 1 {
+		return 1
+	}
+	if sec > maxKeepaliveIntervalSec {
+		return maxKeepaliveIntervalSec
+	}
+	return sec
+}
+
 // keepaliveProbeDeadline returns the per-probe round-trip budget: a
 // fraction of the interval, capped at 800ms (R5). Keeps the probe well
-// inside the tick so a slow/lost reply cannot overrun the next tick.
+// inside the tick so a slow/lost reply cannot overrun the next tick. The
+// interval is clamped first so a huge value cannot overflow the
+// Duration multiply into a bogus (potentially in-range positive) budget.
 func keepaliveProbeDeadline(intervalSec int) time.Duration {
 	const maxDeadline = 800 * time.Millisecond
-	half := time.Duration(intervalSec) * time.Second / 2
+	half := time.Duration(clampKeepaliveIntervalSec(intervalSec)) * time.Second / 2
 	if half <= 0 || half > maxDeadline {
 		return maxDeadline
 	}
@@ -1669,7 +1699,9 @@ func keepaliveProbeDeadline(intervalSec int) time.Duration {
 //     the transition retries.
 func (t *tunnelManager) keepaliveLoop(ctx context.Context, done chan struct{}, tunnelName string, state *KeepaliveState, prober tunnelProber, gen *atomic.Uint64, startGen uint64) {
 	defer close(done)
-	ticker := time.NewTicker(time.Duration(state.Interval) * time.Second)
+	// Clamp before the Duration multiply: an un-gated / overflowing
+	// interval would wrap non-positive and panic time.NewTicker (#5705).
+	ticker := time.NewTicker(time.Duration(clampKeepaliveIntervalSec(state.Interval)) * time.Second)
 	defer ticker.Stop()
 
 	for {

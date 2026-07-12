@@ -365,8 +365,15 @@ func vrrpGroupSchemaNode(v6 bool) *schemaNode {
 //   - key: compiled via uint32(Atoi) (compiler_interfaces.go:168/:262),
 //     so negatives and values past 2^32-1 silently wrap; the GRE key
 //     wire field (IKey/OKey, tunnel.go:238-239) is exactly 32 bits.
-//   - keepalive / keepalive-retry: deliberately untyped (pass-through
-//     integers consumed by the keepalive prober only when > 0).
+//   - keepalive: typed 0..32767 seconds (0 = disabled). An unbounded
+//     value overflowed time.Duration(sec)*time.Second (int64 ns) at the
+//     runtime probe/ticker multiply and could wrap non-positive →
+//     time.NewTicker panic → xpfd crash (#5705). 32767 s matches the
+//     de-facto GRE keepalive ceiling and is far under the int64-ns
+//     overflow; the runtime also clamps (pkg/routing/tunnel.go
+//     clampKeepaliveIntervalSec) as defense-in-depth.
+//   - keepalive-retry: deliberately untyped (pass-through count consumed
+//     by the keepalive prober only when > 0; never a Duration multiply).
 func tunnelSchemaChildren() map[string]*schemaNode {
 	return map[string]*schemaNode{
 		"source": {
@@ -410,7 +417,16 @@ func tunnelSchemaChildren() map[string]*schemaNode {
 			validator:     ValidateInteger(0, 255),
 			children:      nil,
 		},
-		"keepalive":       {desc: "Keepalive interval", args: 1, placeholder: "<seconds>", children: nil},
+		"keepalive": {
+			desc:          "Keepalive interval",
+			args:          1,
+			placeholder:   "<seconds>",
+			valueType:     ValueInteger,
+			valueDesc:     "Keepalive interval in seconds (0..32767; 0 = disabled). Bounded to keep time.Duration(sec)*time.Second from overflowing int64 ns (#5705)",
+			valueExamples: []string{"0", "10", "30"},
+			validator:     ValidateInteger(0, 32767),
+			children:      nil,
+		},
 		"keepalive-retry": {desc: "Keepalive retry count", args: 1, placeholder: "<number>", children: nil},
 		"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
 			"destination": {desc: "Destination routing instance", args: 1, placeholder: "<name>", children: nil},

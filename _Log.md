@@ -1,3 +1,24 @@
+## 2026-07-12 — #5705 (bug/security): bound + clamp tunnel keepalive interval (time.Duration overflow → xpfd panic)
+- **Timestamp**: 2026-07-12 (fix/5705-keepalive-bound)
+- **Action**: codex-review-182 M31. An unbounded tunnel `keepalive <seconds>`
+  overflowed `time.Duration(sec) * time.Second` (int64 ns) at the runtime
+  probe/ticker multiply; the product wrapped non-positive and `time.NewTicker`
+  panics on a non-positive interval → commit-reachable, self-inflicted xpfd
+  crash. Fixed in BOTH sites: (a) ADMISSION — typed the `keepalive` leaf in
+  `tunnelSchemaChildren()` with `valueType: ValueInteger` +
+  `ValidateInteger(0, 32767)` (0 = disabled; 32767 = de-facto GRE keepalive
+  ceiling, far under int64-ns overflow) so an out-of-range value is rejected at
+  commit-check for both interface-level and unit-level tunnel stanzas; (b)
+  RUNTIME CLAMP — `clampKeepaliveIntervalSec` (`[1, maxKeepaliveIntervalSec]`)
+  applied before the Duration multiply in `keepaliveLoop` (ticker) and
+  `keepaliveProbeDeadline`, defense-in-depth for an un-gated value. Fail-on-
+  revert proven: widening the schema bound → `32768` no longer rejected (config
+  test RED); neutering the clamp → ticker duration wraps to
+  `-8446744073709551616` (routing test RED).
+- **File(s)**: pkg/config/schema_interfaces.go,
+  pkg/config/tunnel_keepalive_bound_5705_test.go, pkg/routing/tunnel.go,
+  pkg/routing/tunnel_keepalive_bound_5705_test.go, pkg/routing/README.md
+
 ## 2026-07-11 — #5628 (security): NAT rule `then` must carry exactly one terminal translation action
 - **Timestamp**: 2026-07-11 (fix/5628-nat-terminal-action)
 - **Action**: codex-review-181 M16. A source/destination NAT rule's complete
