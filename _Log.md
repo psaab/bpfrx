@@ -1,3 +1,27 @@
+## 2026-07-12 — #5694 (bug): reject malformed chassis RG/node identities at commit (alias-to-0)
+- **Timestamp**: 2026-07-12 (fix/5694-chassis-identity-validate)
+- **Action**: codex-review-182 M15. compileChassis parses a
+  `redundancy-group <name>` instance id and a per-RG `node <id>` with
+  strconv.Atoi and, on parse FAILURE, leaves the field at its zero default
+  (`rgID := 0; if n, err := Atoi(name); err == nil { rgID = n }`). A
+  non-numeric identity therefore silently became redundancy-group / node 0,
+  aliasing a valid id 0 and mis-assigning cluster ownership / priority. The
+  sibling validateChassisClusterStrict only sees the COMPILED int (already 0,
+  passes its 0..255 range check), so a new AST PRE-WALK gate
+  (validateChassisClusterIdentitiesAST in compiler_chassis_identity.go, wired
+  into runPreWalkGates) validates the RAW token: a malformed RG/RG-node id is
+  hard-rejected at strict commit / warned on tolerant load+peer-sync
+  (lenientChassisClusterIdentities, #1960). Scope is the two INSTANCE-NAME
+  slots the schema leaves unvalidated; the top-level `cluster node <id>` is
+  already a typed value leaf (ValidateInteger(0,1)). PURE config-layer — no
+  pkg/cluster runtime touch, so no test-failover needed. Fail-on-revert proven
+  (non-numeric + negative RG-node ids RED at commit, lenient warn RED, when the
+  validator is neutered); packed one-liner shape covered. Full pkg/config suite
+  green.
+- **File(s)**: pkg/config/compiler_chassis_identity.go,
+  pkg/config/compiler_chassis_identity_5694_test.go, pkg/config/compiler.go,
+  pkg/config/compiler_prewalk.go, docs/config-schema.md
+
 ## 2026-07-12 — #5732 (bug): bound composed BGP policy-CHAIN route-map sequences (follow-up to #5701)
 - **Timestamp**: 2026-07-12 (fix/5732-composed-chain-seq-bound)
 - **Action**: Follow-up to #5701/#5731 (my own scope note). The #5701 gate bounds

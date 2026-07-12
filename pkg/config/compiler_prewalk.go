@@ -461,6 +461,25 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #5694 (codex-182 M15) chassis-cluster identity gate. compileChassis parses
+	// a `redundancy-group <name>` instance id and a per-RG `node <id>` with
+	// strconv.Atoi and, on parse failure, LEAVES the field at its zero default —
+	// a non-numeric identity silently becomes redundancy-group / node 0,
+	// aliasing a valid id 0 and mis-assigning cluster ownership / priority. The
+	// schema leaves these instance-name slots unvalidated (schema_chassis.go);
+	// the top-level `cluster node <id>` value leaf is already schema-typed.
+	// Strict (commit / commit-check): the first malformed identity hard-rejects
+	// naming the token. Lenient (load / peer-sync): warn so an already-persisted
+	// or peer-synced config an older binary silently accepted still BOOTS
+	// (#1960). Runs on the raw AST because the malformed token has collapsed to
+	// 0 by the time the typed ClusterConfig exists — only the AST distinguishes
+	// a malformed token from a real 0.
+	chassisIdentityWarnings, err := validateChassisClusterIdentitiesAST(
+		tree.Children, opts.lenientChassisClusterIdentities)
+	if err != nil {
+		return nil, err
+	}
+
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)
 	warnings = append(warnings, trackWarnings...)
@@ -487,5 +506,6 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
 	warnings = append(warnings, unitAliasWarnings...)
+	warnings = append(warnings, chassisIdentityWarnings...)
 	return warnings, nil
 }

@@ -371,6 +371,20 @@ type compileOpts struct {
 	// clobbered. Same doctrine as lenientIPsecTrafficSelectors.
 	lenientReservedProposalSetNames bool
 
+	// lenientChassisClusterIdentities (#5694, codex-182 M15) downgrades the
+	// malformed chassis-cluster identity gate
+	// (validateChassisClusterIdentitiesAST) from a hard compile error to a
+	// cfg.Warnings entry on the tolerant load / peer-sync paths. A
+	// `redundancy-group <name>` or per-RG `node <id>` whose raw token is not a
+	// non-negative integer collapses to id 0 in compileChassis (Atoi-then-
+	// default), aliasing redundancy-group / node 0 and silently mis-assigning
+	// cluster ownership. Commit / commit-check stay strict so a new operator
+	// edit is rejected; an already-persisted or peer-synced config an older
+	// binary accepted must still BOOT (warn) per the #1960 fail-closed-on-load
+	// doctrine — compileChassis keeps the stable zero coercion, now flagged.
+	// Same doctrine as lenientReservedProposalSetNames.
+	lenientChassisClusterIdentities bool
+
 	// lenientIPsecProposalProtocol (#4298, V-2) downgrades the IPsec
 	// proposal `protocol ah` reject (validateIPsecProposalProtocolStrict)
 	// from a hard error to a warning on the tolerant load / peer-sync paths.
@@ -1842,6 +1856,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecEndpoints:                  true,
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
+		lenientChassisClusterIdentities:        true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
@@ -2191,6 +2206,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecEndpoints:                  true,
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
+		lenientChassisClusterIdentities:        true,
 		lenientIPsecProposalProtocol:           true,
 		lenientIPsecManualKey:                  true,
 		lenientLogProfileStreamRef:             true,
