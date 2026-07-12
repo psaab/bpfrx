@@ -116,9 +116,16 @@ set (`name→bondSig` — mode, MTU, and the sorted resolved Linux member
 set) against the tracked set instead of clearing all and rebuilding:
 
 - **keep** a bond untouched when it is still desired with an identical
-  `bondSig` — no `LinkDel`/`LinkAdd`/`LinkSetMaster`, so an unrelated
-  policy-only commit no longer flaps the LAG (`LinkDel`→`LinkAdd`→
-  re-enslave→LACP re-converge, traffic loss on the bond);
+  `bondSig` **and its kernel device is still present** — no `LinkDel`/
+  `LinkAdd`/`LinkSetMaster`, so an unrelated policy-only commit no longer
+  flaps the LAG (`LinkDel`→`LinkAdd`→re-enslave→LACP re-converge, traffic
+  loss on the bond). The keep verifies the kernel device via `LinkByName`
+  before declaring convergence: a tracked, still-desired bond that has
+  **vanished** from the kernel (deleted out from under the daemon — an
+  operator `ip link del`, a driver reset, a transient kernel failure) is
+  **not** kept but **recreated** through the create path, rather than
+  reported as falsely converged and left down forever (#5703 /
+  codex-review-182 M29);
 - **create** a newly-desired bond (also adopts a kernel bond that
   outlived in-memory tracking, e.g. across a daemon restart). Both the
   create and adopt paths enumerate the bond's **actual** enslaved member
