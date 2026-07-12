@@ -47142,3 +47142,17 @@ top.
   attached (was asserting len==0, which only held on hosts lacking eth0).
 - **File(s)**: pkg/dhcp/duid_stability_5711_test.go (Edit),
   pkg/dhcp/dhcp_test.go (Edit)
+
+- **Timestamp**: 2026-07-12 07:15
+  **Action**: Fix #5703 (codex-review-182 M29) — a tracked desired bond
+  MISSING from the kernel was treated as "unchanged" by bondManager.Apply's
+  reconcile pass (LinkByName miss → bring-up block skipped → `continue`), so a
+  vanished bond was never recreated (false convergence, persistent outage). The
+  "unchanged" branch now verifies the kernel device is present; if it has
+  vanished it recreates the bond via createLocked (create+enslave, tracking the
+  realized member set) instead of reporting success. Added fail-on-revert test
+  TestBondApplyRecreatesTrackedBondMissingFromKernel (proved RED with the
+  recreate branch neutralized: addCalls=[]; GREEN restored). Updated the Apply
+  doc comment and the pkg/routing/README.md bond-reconcile "keep" bullet.
+  **File(s)**: pkg/routing/bond.go (Edit), pkg/routing/bond_test.go (Edit),
+  pkg/routing/README.md (Edit), _Log.md (Edit)

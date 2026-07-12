@@ -76,10 +76,14 @@ func bondSigOf(ifc *config.InterfaceConfig) bondSig {
 // the fix for #5119, mirroring the #2546 XFRM reconcile:
 //
 //   - KEEP a bond untouched when it is still desired with an identical
-//     signature (mode, MTU, member set) — no LinkDel/LinkAdd/LinkSetMaster,
-//     so an unrelated policy-only commit no longer flaps the LAG (LinkDel→
-//     LinkAdd→re-enslave→LACP re-converge). This was the non-idempotent
-//     anti-pattern #2546 fixed for XFRM but not bonds.
+//     signature (mode, MTU, member set) AND its kernel device is still
+//     present — no LinkDel/LinkAdd/LinkSetMaster, so an unrelated policy-only
+//     commit no longer flaps the LAG (LinkDel→LinkAdd→re-enslave→LACP
+//     re-converge). This was the non-idempotent anti-pattern #2546 fixed for
+//     XFRM but not bonds. If a tracked, still-desired bond has VANISHED from
+//     the kernel (deleted out from under the daemon), the KEEP is NOT taken:
+//     the bond is RECREATED rather than reported as falsely converged
+//     (#5703 / codex-review-182 M29).
 //   - CREATE a bond that is newly desired (also adopts a kernel bond that
 //     outlived in-memory tracking, e.g. across a daemon restart). Both the
 //     create and adopt paths verify the bond's ACTUAL enslaved member set and
@@ -175,7 +179,9 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 		if trackedSig, kept := b.bonds[name]; kept {
 			// Survived the delete pass.
 			if trackedSig == sig {
-				// Unchanged — bring it up idempotently (a no-op on an
+				// Unchanged in the desired config. Verify the kernel device
+				// is actually PRESENT before declaring convergence. If it is
+				// still there, bring it up idempotently (a no-op on an
 				// already-up bond, matching the XFRM keep path); zero
 				// LinkDel/LinkAdd/LinkSetMaster, so no flap.
 				if link, err := b.ops.LinkByName(name); err == nil {
@@ -183,6 +189,22 @@ func (b *bondManager) Apply(interfaces []*config.InterfaceConfig) error {
 						slog.Warn("failed to bring up existing bond", "name", name, "err", err)
 						errs = append(errs, fmt.Errorf("bond %s: bring up existing: %w", name, err))
 					}
+					continue
+				}
+				// The tracked bond has VANISHED from the kernel (deleted out
+				// from under the daemon — an operator `ip link del`, a driver
+				// reset, or a transient kernel failure) yet is still desired
+				// with an identical signature. Treating this as "unchanged"
+				// is false convergence: the reconciler reports success while
+				// the bond stays down forever (#5703 / codex-review-182 M29).
+				// RECREATE it via createLocked, which finds no kernel device
+				// (LinkByName miss) and takes the create+enslave path,
+				// tracking the ACTUAL realized member set (a still-absent
+				// member yields a partial sig for a later in-place completion,
+				// #5261). A create failure is aggregated, not swallowed.
+				slog.Warn("tracked bond missing from kernel; recreating", "name", name)
+				if err := b.createLocked(name, ifcByName[name], sig); err != nil {
+					errs = append(errs, err)
 				}
 				continue
 			}

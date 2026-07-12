@@ -265,6 +265,69 @@ func TestBondApplyContinuesPastOneFailedBond(t *testing.T) {
 	}
 }
 
+// TestBondApplyRecreatesTrackedBondMissingFromKernel is the #5703 /
+// codex-review-182 M29 RED-on-revert guard. A bond that was created and is
+// still desired with an IDENTICAL signature, but whose kernel device has
+// VANISHED (deleted out from under the daemon — an operator `ip link del`, a
+// driver reset, a transient kernel failure), must be RECREATED on the next
+// reconcile. On master the "unchanged" branch verified nothing: LinkByName
+// missed, the bring-up block was skipped, and Apply `continue`d — false
+// convergence, so the bond stayed down forever while the reconciler reported
+// success.
+//
+// RED on revert: with the recreate branch removed, the second Apply issues
+// ZERO LinkAdd for bond0 (the `contains(ops.addCalls, "bond0")` assertion
+// fails) and the member is never re-enslaved.
+func TestBondApplyRecreatesTrackedBondMissingFromKernel(t *testing.T) {
+	ops := newFakeBondLinkOps()
+	ops.seedMember("ge-0-0-1")
+	b := &bondManager{ops: ops}
+
+	cfg := []*config.InterfaceConfig{bondFabricConfig("bond0", "ge-0-0-1")}
+	full := bondSigOf(cfg[0])
+
+	// First Apply creates and tracks the bond.
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("first Apply() = %v, want nil", err)
+	}
+	if !contains(ops.addCalls, "bond0") {
+		t.Fatalf("first Apply did not create bond0: addCalls=%v", ops.addCalls)
+	}
+	if got := b.bonds["bond0"]; got != full {
+		t.Fatalf("after create b.bonds[bond0]=%+v, want full desired %+v", got, full)
+	}
+
+	// The kernel bond disappears out from under the daemon. Its member
+	// detaches (MasterIndex clears) but stays present in the kernel. The
+	// tracked signature is UNCHANGED — this is exactly the false-convergence
+	// case: still desired, identical sig, but no kernel device.
+	delete(ops.links, "bond0")
+	for _, l := range ops.links {
+		l.Attrs().MasterIndex = 0
+	}
+
+	// Re-apply the identical config. The bond MUST be recreated, not treated
+	// as unchanged.
+	ops.reset()
+	if err := b.Apply(cfg); err != nil {
+		t.Fatalf("second Apply() (bond vanished) = %v, want nil", err)
+	}
+	if !contains(ops.addCalls, "bond0") {
+		t.Fatalf("vanished bond0 was NOT recreated — false convergence (#5703/M29): "+
+			"addCalls=%v", ops.addCalls)
+	}
+	if !contains(ops.masterCalls, "ge-0-0-1") {
+		t.Fatalf("recreated bond0 did NOT re-enslave its member ge-0-0-1: masterCalls=%v",
+			ops.masterCalls)
+	}
+	if got := b.bonds["bond0"]; got != full {
+		t.Fatalf("after recreate b.bonds[bond0]=%+v, want full desired %+v", got, full)
+	}
+	if _, ok := ops.links["bond0"]; !ok {
+		t.Fatalf("bond0 kernel device absent after recreate: %+v", ops.links)
+	}
+}
+
 // contains reports whether s appears in xs.
 func contains(xs []string, s string) bool {
 	for _, x := range xs {
