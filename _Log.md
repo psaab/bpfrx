@@ -1,3 +1,30 @@
+## 2026-07-11 — #5628 (security): NAT rule `then` must carry exactly one terminal translation action
+- **Timestamp**: 2026-07-11 (fix/5628-nat-terminal-action)
+- **Action**: codex-review-181 M16. A source/destination NAT rule's complete
+  `then {}` block could carry ZERO NAT-terminal actions (actionless — snapshot
+  builder installs no translation, so an intended `off` exemption silently
+  disappears and a later broader rule is revealed) or TWO+ mutually-exclusive
+  actions (`off`+`pool`, `interface`+`pool` — compiler silently picked one by
+  packed-key/child order, so an exemption could publish as a translation).
+  Added `validateNATTerminalActionCardinalityStrict` (counts the resolved
+  NATThen terminal fields; requires exactly one) wired in `runUniformGates`:
+  strict reject on commit, lenient warn (`lenientNATTerminalAction`, #1960) on
+  tolerant load/peer-sync. Changed the `compileNAT{Source,Destination}`
+  hierarchical setters from `else if` chains to independent `if`s so a
+  single-node contradiction (`source-nat { interface; pool p; }`) records both
+  fields instead of silently picking one. PRESERVES #3850 duplicate-`then`-
+  CONTAINER last-wins (per-block `rule.Then` reset → count reflects the winning
+  block, not a false conflict). Fail-on-revert test proven RED (flat +
+  hierarchical zero/two/valid + #3850 last-wins preservation + lenient warn).
+  Adjusted #3606 canonical-port test to give its DNAT rule a valid terminal
+  action. `go build ./...` + full `go test ./...` green; gofmt clean.
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_nat_destination.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go, pkg/config/compiler.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/config/compiler_signed_port_3606_test.go, docs/config-schema.md
+
 ## 2026-07-11 — #5140 (security): post-GRE-decap ICMP/host-inbound/TTL reads use packet_frame, not outer raw_frame
 - **Timestamp**: 2026-07-11 (fix/5140-gre-decap-packet-frame)
 - **Action**: `stage_native_gre_decap` returns a synthetic inner frame

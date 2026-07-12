@@ -1515,6 +1515,26 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
+	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
+	// rule with ZERO actions installs no translation (an intended `off`
+	// exemption silently disappears, revealing a later broader rule); a rule
+	// with TWO+ mutually-exclusive actions inside one block let the compiler
+	// silently pick one by packed-key/child order (an exemption can publish as a
+	// translation — the inverse of the authored action). Strict on commit /
+	// commit-check (hard reject so the malformed rule is operator-visible);
+	// lenient on load / peer-sync (warn — #1960 no-brick; the dataplane is no
+	// worse than before the gate). Preserves #3850 duplicate-`then`-CONTAINER
+	// last-wins (the count reflects the winning block only).
+	if err := validateNATTerminalActionCardinalityStrict(cfg); err != nil {
+		if opts.lenientNATTerminalAction {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("NAT terminal-action cardinality (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2217 Finding C: firewall-filter `then routing-instance <name>` (FBF)
 	// cross-reference. A term naming a routing-instance not defined under
 	// `routing-instances` compiled cleanly and the dataplane steered matched
