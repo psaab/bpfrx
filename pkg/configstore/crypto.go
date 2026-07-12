@@ -35,72 +35,159 @@ func (db *DB) masterKeyPath() string {
 	return filepath.Join(db.dir, "master.key")
 }
 
+// defaultMasterPasswordPRF is the supported PRF used to key at-rest encryption
+// when encryption is required (a master-password is configured somewhere) but
+// no SUPPORTED effective PRF can be resolved from the applied config — e.g. the
+// encryption belt is triggered only by a dormant (inactive / unapplied-group)
+// master-password, or the effective declaration carries an unsupported selector
+// that slipped past the #4578 commit gate on a tolerant HA/upgrade path. It
+// MUST be a value prfHash accepts so the persistence write never fails
+// deterministically. See masterPasswordPRF (#5638 / codex-review-181 M30).
+const defaultMasterPasswordPRF = "sha256"
+
 // masterPasswordPRF resolves the master-password pseudorandom-function that
-// decides whether the config DB is written encrypted (maybeEncryptTreeJSON)
-// and whether the #4579 A4-06 plaintext-downgrade warning fires (db.go
-// readTreeMeta). It MUST consider every surface that activates encryption at
-// runtime: every top-level `system` stanza (#4705) AND any `master-password`
-// anywhere under a `groups { ... }` block reachable via apply-groups (#5231).
+// keys at-rest encryption (maybeEncryptTreeJSON) and gates the #4579 A4-06
+// plaintext-downgrade warning (db.go readTreeMeta). It answers TWO separable
+// questions — conflating them caused #5638 (codex-review-181 M30):
 //
-// Top-level split stanzas (#4705): the Junos parser does not merge duplicate
-// top-level stanzas — parseStatements appends each `system { ... }` block as
-// its own child, and neither LoadOverride nor SyncApply (both raw
-// NewParser().Parse()) coalesce them. The compiler already treats a split
-// config as one system — compileSections loops over ALL top-level nodes and
-// folds every `system` node into the same cfg.System — so a `master-password`
-// living in a SECOND system stanza is semantically active. A single-first-match
-// tree.FindChild("system") would then miss it and write the whole DB (secrets
-// included) in PLAINTEXT despite encryption being configured.
+//  1. IS ENCRYPTION REQUIRED?  Conservative, fail-closed. ANY master-password
+//     anywhere — an active top-level `system` stanza (#4705), or any
+//     `master-password` under any `groups { ... }` block including an
+//     UNAPPLIED or `<*>`-wildcard group (#5231) — means "encrypt, never leak
+//     plaintext." Over-encrypting a dormant/unapplied master-password is a
+//     harmless false-positive; under-encrypting leaks secrets to disk. This is
+//     masterPasswordConfigured.
 //
-// Groups / apply-groups (#5231): a `master-password` declared inside a
-// `groups { ... }` body and pulled in with `apply-groups <name>` is ACTIVE at
-// runtime — compileConfigWithOpts expands apply-groups (tree.ExpandGroups)
-// BEFORE compileSystem reads master-password (compiler_system.go), so the
-// effective config carries the PRF. But this at-rest write path runs on the
-// UNEXPANDED persisted candidate tree (apply-groups expansion happens only on
-// a compile clone), so the group-declared master-password is INVISIBLE to
-// systemBlocksOf, the encrypt gate returns "", and active.json (IKE PSKs,
-// WireGuard keys, SNMP communities, user secrets) is written PLAINTEXT despite
-// encryption being configured via a group.
+//  2. WHICH PRF ALGORITHM?  Must be a SUPPORTED, DETERMINISTIC selector so the
+//     write path never fails and an active↔standby pair reproduces the same
+//     key. Resolve it from the EFFECTIVE/APPLIED scope only — the same
+//     inactive-strip + apply-groups expansion the compiler applies
+//     (effectiveMasterPasswordPRF) — and accept only a selector prfHash
+//     understands. A dormant or unsupported PRF must NOT reach prfHash.
 //
-// Fail CLOSED — err toward encrypting. The group scan is a RECURSIVE walk of
-// the entire `groups { ... }` subtree that treats ANY `master-password`
-// descendant as encryption-configured, regardless of the intervening node
-// name. It deliberately does NOT require a node literally named `system`
-// between the group and the master-password, because a group's children can be
-// authored under a `<*>` wildcard node whose body Junos merges into the
-// top-level `system` stanza at apply-groups expansion (walkGroupToContext /
-// mergeNodes, ast_groups.go). A literal `system`-only scan MISSES that
-// wildcard shape and leaks plaintext end-to-end (the residual this walk
-// closes). The invariant is now: any master-password anywhere under any
-// `groups` block triggers encryption. This over-encrypts on a defined-but-
-// unapplied group (a harmless FALSE-POSITIVE — encrypting when unnecessary is
-// always safe) and can NEVER FALSE-NEGATIVE relative to runtime: apply-groups
-// only COPIES existing leaves, so any PRF active after expansion physically
-// exists somewhere under a group body here. Reusing the compiler's
-// ExpandGroups would instead mutate the very tree we are about to persist and
-// drag ${node}/undefined-group error handling into a write path that must not
-// fail, for no security gain.
+// Why the split matters (M30): the #4578 commit gate (ValidateMasterPasswordPRF)
+// validates the EFFECTIVE tree (inactive stripped, groups expanded), so an
+// UNSUPPORTED PRF hidden in an inactive node or an unapplied group is never
+// rejected at commit. The old resolver's fail-closed SUPERSET, however, scanned
+// every group regardless of application state and returned that unsupported
+// value. On HA config-sync the standby promotes the peer tree in memory
+// (Option B) and then persists it: masterPasswordPRF returned the dormant
+// `bogus`, prfHash rejected it, writeActive failed, and the singleton retry
+// re-selected `bogus` forever — a DETERMINISTIC, non-transient persistence
+// failure that keeps the node /health-503 and its authoritative generation off
+// disk (non-durable across restart). The fix keeps the encryption belt broad
+// (question 1) but constrains the ALGORITHM to a supported effective value,
+// falling back to defaultMasterPasswordPRF rather than poisoning the write with
+// an unsupported selector. Encryption still happens; only a value prfHash
+// accepts ever reaches it.
+//
+// The effective resolution is error-tolerant (any apply-groups expansion error
+// falls through to the supported default), so the "this write path must not
+// fail" contract that originally motivated NOT calling ExpandGroups here still
+// holds — it runs on a clone and never propagates an error.
 func masterPasswordPRF(tree *config.ConfigTree) string {
 	if tree == nil {
 		return ""
 	}
 
-	// Surface 1: every top-level `system { ... }` stanza (#4705).
-	if prf := masterPasswordPRFInSystems(systemBlocksOf(tree)); prf != "" {
+	// Question 1: is at-rest encryption required at all? Fail-closed broad
+	// scan (dormant/unapplied/wildcard included). Empty means plaintext.
+	if !masterPasswordConfigured(tree) {
+		return ""
+	}
+
+	// Question 2: choose a SUPPORTED, DETERMINISTIC algorithm from the
+	// effective/applied scope. A dormant or unsupported effective value must
+	// not reach prfHash on the persistence write path.
+	if prf := effectiveMasterPasswordPRF(tree); prf != "" && prfSupported(prf) {
 		return prf
 	}
 
+	// Encryption is required but the applied config resolves no supported PRF
+	// (belt triggered by dormant content, or an unsupported effective value):
+	// fall back to a fixed supported selector so the DB is still encrypted and
+	// the write stays durable and deterministic across active↔standby.
+	return defaultMasterPasswordPRF
+}
+
+// masterPasswordConfigured reports whether ANY master-password is present in
+// the tree — the fail-closed "must we encrypt?" decision (#4705 split stanzas +
+// #5231 groups/wildcard). It intentionally does NOT strip inactive nodes or
+// require apply-groups: a master-password that exists anywhere (even dormant)
+// means secrets have been or may be configured, and erring toward encryption is
+// always safe. Read-only and total (nil-safe, never errors) — it runs on the
+// config write path, which must not fail.
+func masterPasswordConfigured(tree *config.ConfigTree) bool {
+	if tree == nil {
+		return false
+	}
+	// Surface 1: every top-level `system { ... }` stanza (#4705).
+	if masterPasswordPRFInSystems(systemBlocksOf(tree)) != "" {
+		return true
+	}
 	// Surface 2: any `master-password` anywhere under any `groups { ... }`
 	// block (#5231) — recursive so it catches a master-password nested under a
 	// `<*>` wildcard (or any other intervening node), not only a literal
 	// `system` child.
 	for _, groupsRoot := range groupsBlocksOf(tree) {
-		if prf := masterPasswordPRFInSubtree(groupsRoot); prf != "" {
-			return prf
+		if masterPasswordPRFInSubtree(groupsRoot) != "" {
+			return true
 		}
 	}
-	return ""
+	return false
+}
+
+// effectiveMasterPasswordPRF resolves the master-password PRF from the
+// EFFECTIVE/APPLIED config only — the value the compiler would activate — so
+// the algorithm chosen for at-rest encryption matches the running config and
+// never comes from a dormant (inactive / unapplied-group) subtree. It mirrors
+// the compile/schema path (schemaValidateExpandedTreeForNode): strip inactive
+// THEN expand applied groups, on a CLONE, then scan the resulting top-level
+// `system` stanzas. Returns "" when no active master-password resolves (the
+// caller then uses the supported default).
+//
+// This runs on the config write path, which MUST NOT fail: it operates on a
+// clone (never the persisted tree) and swallows every apply-groups expansion
+// error (returning ""), so a ${node}/undefined-group condition degrades to the
+// default rather than failing the write.
+func effectiveMasterPasswordPRF(tree *config.ConfigTree) string {
+	if tree == nil {
+		return ""
+	}
+	// Fast path: with no groups to expand and no inactive nodes to strip, the
+	// effective scope is exactly the raw top-level `system` stanzas. Scan
+	// directly with zero extra allocation — this covers every normal active
+	// config, keeping it bit-identical to the pre-#5638 resolver.
+	if len(groupsBlocksOf(tree)) == 0 && !tree.HasInactiveNodes() {
+		return masterPasswordPRFInSystems(systemBlocksOf(tree))
+	}
+	stripped := tree.WithoutInactive()
+	expanded := stripped.Clone()
+	if err := expanded.ExpandGroups(); err != nil {
+		// A cluster ${node} group can only be expanded with the node var; the
+		// write path is node-agnostic and the envelope is self-describing
+		// (decrypt reads env.PRF), so a deterministic node0 substitution is
+		// enough to resolve a supported selector. Any residual error degrades
+		// to "" → the caller's supported default (the write must not fail).
+		if strings.Contains(err.Error(), `undefined group "${node}"`) {
+			vars := map[string]string{"node": "node0"}
+			if err2 := expanded.ExpandGroupsWithVars(vars); err2 != nil {
+				return ""
+			}
+		} else {
+			return ""
+		}
+	}
+	return masterPasswordPRFInSystems(systemBlocksOf(expanded))
+}
+
+// prfSupported reports whether prf is a selector prfHash can key encryption
+// with. It is the single gate that keeps an unsupported PRF — one that slipped
+// past the #4578 commit gate through a tolerant HA/upgrade load — off the
+// deterministic persistence-retry path (#5638).
+func prfSupported(prf string) bool {
+	_, err := prfHash(prf)
+	return err == nil
 }
 
 // masterPasswordPRFInSystems returns the first non-empty master-password

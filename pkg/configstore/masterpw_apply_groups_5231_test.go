@@ -133,6 +133,13 @@ func TestMasterPasswordPRFSurfaces(t *testing.T) {
 
 	// A group that defines master-password but is NOT applied still triggers
 	// encryption (fail-closed superset — a harmless false-positive encrypt).
+	// Post-#5638 the encryption belt still fires (masterPasswordConfigured sees
+	// the group), but the PRF ALGORITHM is now resolved from the EFFECTIVE scope
+	// only: the group is unapplied, so it contributes no effective master-
+	// password and the resolver falls back to the supported default
+	// (defaultMasterPasswordPRF == "sha256"). The value is the same here only
+	// because the group also declared sha256; the point is the DB is encrypted
+	// with a SUPPORTED selector, never a dormant one.
 	unappliedTree, errs := config.NewParser(`groups {
     enc {
         system {
