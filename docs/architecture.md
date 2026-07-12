@@ -228,6 +228,29 @@ editing cmdtree.
     restores the off-loopback bind. HTTPS is covered by the same rule
     (transport encryption without authentication still lets any reachable
     client mutate config).
+  - **Empty api-auth secret is not a credential (#5636).** A quoted-empty
+    Basic password (`api-auth user <n> password ""`) or empty api-key
+    (`api-key ""`) parses as a real credential row. Before the fix the
+    #4047 gate counted it as a valid auth method (so an off-loopback bind
+    was accepted), `daemon_run.go` wired the empty secret into the runtime
+    `AuthConfig`, and the middleware's constant-time compare matched a
+    request presenting `username:` (empty password) or an empty
+    `Bearer `/X-API-Key token — an authentication bypass on an off-loopback
+    bind. This is now closed at three layers: (1) a **commit-time
+    hard-reject** (`validateAPIAuthNoEmptySecretsStrict`,
+    `pkg/config/compiler.go`) refuses any api-auth stanza carrying an empty
+    secret (downgraded to a warning on the tolerant load / peer-sync path so
+    an already-persisted config still boots — #1960), and the #4047 gate's
+    "authenticated" predicate (`apiAuthHasUsableCredential`) now counts only
+    NON-empty credentials; (2) **runtime wiring** (`daemon_run.go`) drops
+    empty passwords / api-keys and leaves `apiCfg.Auth` nil when nothing
+    usable survives, so the part-B clamp still pulls a leniently-loaded
+    off-loopback bind back to loopback; and (3) the **middleware**
+    (`pkg/api/auth.go`) treats an empty configured secret as no valid
+    credential (`checkAuthorization` requires `expected != ""`,
+    `constantTimeAPIKeyMatch` skips an empty configured key) — the
+    constant-time compare still runs unconditionally, so the #4157
+    known/unknown-user timing profile is preserved.
   - **`/metrics` posture (#4162).** The Prometheus endpoint is
     unauthenticated on the loopback default bind — the standard Prometheus
     posture. When `system services web-management http interface <if>`
