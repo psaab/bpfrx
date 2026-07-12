@@ -46619,6 +46619,25 @@ top.
   isPlausibleHostname hardening (validator kept) → the 10.0.0.999 / 1.2.3.4.5
   cases FAIL while structurally-malformed FQDNs stay caught. Restoring → GREEN.
 
+- **Timestamp**: 2026-07-11
+  **Action**: #5642 (codex-review-181 M34, High/security-adjacent) — final
+    rib-group removal left a stale inter-VRF route-leak on both forwarding
+    planes. Part (a): removed the `len(cfg.RoutingOptions.RibGroups) > 0` gate
+    in `applyRoutingRules` step 3c so `ApplyRibGroupRules` runs unconditionally;
+    `ribGroupManager.Apply` runs clear() before its empty-desired early return,
+    so the zero-transition still deletes the stale `ip rule to <prefix> lookup
+    <table>` leak rule (no churn when no rule exists). Part (b): added
+    `reconcileRouteLeakSnapshot` — a routes-only republish after the ip-rule
+    reconcile — so the userspace snapshot (built by the earlier ApplyConfig from
+    the pre-reconcile ip-rule table) is rebuilt leak-free; duplicate-skips when
+    unchanged. Added `routing.NewManagerWithRuleOpsForTest` seam. Fail-on-revert
+    proven: gate revert → stale rule survives (RED); reconcile no-op → publish
+    never fires (RED). Build + pkg/daemon+routing+userspace tests green.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/routing/test_seams.go,
+    pkg/daemon/ribgroup_zero_leak_5642_test.go,
+    pkg/dataplane/userspace/routes_ribgroup_zero_5642_test.go,
+    docs/rib-group-route-leaking.md
+
 ## 2026-07-11 — #5638: constrain master-password PRF to effective/supported scope (codex-review-181 M30)
 - **Timestamp**: 2026-07-11
 - **Action**: Fixed masterPasswordPRF accepting an inactive/unapplied
