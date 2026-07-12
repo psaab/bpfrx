@@ -324,6 +324,21 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientIKEPolicyChainRef bool
 
+	// lenientIPsecEndpoints (#5630) downgrades the IPsec endpoint value gate
+	// (validateIPsecEndpointsStrict) from a hard compile error to a
+	// cfg.Warnings entry on the tolerant load / peer-sync paths. An IKE
+	// gateway `address` / `dynamic hostname` / `local-address`, or a VPN
+	// `local-address`, that is printable but not a usable strongSwan endpoint
+	// (neither a literal IP nor a valid dotted hostname/FQDN — e.g. a
+	// malformed IP octet 10.0.0.999 or a malformed FQDN) is copied verbatim
+	// into swanctl `remote_addrs` / `local_addrs`, where `swanctl --load-all`
+	// rejects or mishandles it — a config that commits but never loads (a
+	// silently broken tunnel). Commit / commit-check hard-reject it so a new
+	// operator edit fails loudly; an already-persisted or peer-synced config
+	// an older binary accepted must still BOOT (warn) per the #1960
+	// fail-closed-on-load doctrine. Same doctrine as lenientIPsecGatewayRefs.
+	lenientIPsecEndpoints bool
+
 	// lenientIPsecTrafficSelectors (#4098) downgrades the IPsec
 	// `traffic-selector local-ip / remote-ip` value gate
 	// (validateIPsecTrafficSelectorsStrict) from a hard compile error to a
@@ -1760,6 +1775,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientCoSForwardingClassQueue:         true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
+		lenientIPsecEndpoints:                  true,
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
 		lenientIPsecProposalProtocol:           true,
@@ -2104,6 +2120,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientCoSForwardingClassQueue:         true,
 		lenientIPsecGatewayRefs:                true,
 		lenientIKEPolicyChainRef:               true,
+		lenientIPsecEndpoints:                  true,
 		lenientIPsecTrafficSelectors:           true,
 		lenientReservedProposalSetNames:        true,
 		lenientIPsecProposalProtocol:           true,

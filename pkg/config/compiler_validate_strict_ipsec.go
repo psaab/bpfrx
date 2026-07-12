@@ -334,3 +334,95 @@ func validateIPsecManualKeyStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// validateIPsecEndpointsStrict (#5630) rejects an IKE gateway or IPsec VPN
+// whose typed endpoint leaves are printable but not a usable strongSwan
+// endpoint — neither a literal IP address nor a syntactically valid dotted
+// hostname/FQDN. compileIKE / compileIPsec copy these leaves verbatim (a
+// one-argument schema slot accepts any single token), and renderConfig
+// (pkg/ipsec/policy.go, resolveRemoteAddr) interpolates them straight into
+// the swanctl `remote_addrs` / `local_addrs` settings. A printable-but-
+// invalid value — a malformed IP octet like 10.0.0.999, or a malformed FQDN
+// — therefore passes strict commit and reaches strongSwan, where
+// `swanctl --load-all` rejects or mishandles the generated connection: a
+// config that commits but never loads is a silently broken tunnel (#5630,
+// codex-review-181 M20 / A3-b01-F002).
+//
+// The four effective endpoint fields are:
+//   - gateway `address`         -> remote_addrs
+//   - gateway `dynamic hostname`-> remote_addrs
+//   - gateway `local-address`   -> local_addrs
+//   - vpn `local-address`       -> local_addrs
+//
+// Each is held to the same IsUsableIPsecEndpoint predicate the gateway
+// cross-reference gate (validateIPsecGatewayReferencesStrict) already
+// applies to an inline vpn.Gateway literal, so every effective endpoint —
+// object field or inline literal — obeys one grammar and cannot drift.
+// Valid IPv4, IPv6, and dotted-FQDN endpoints are preserved; only a value
+// strongSwan itself would reject is caught, so a legitimate hostname or
+// v6 gateway still commits.
+//
+// A gateway whose LocalAddress is empty but derives from external-interface
+// is not checked here: the address is resolved from a live interface at
+// render time, not from operator text. Gateway and VPN names are sorted so
+// a multi-object config reports a deterministic first failure. On the
+// tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientIPsecEndpoints) so a config an older binary
+// persisted, or a peer synced, still boots (#1960 fail-closed-on-load
+// class). Commit / commit-check stay strict. Mirrors
+// validateIPsecGatewayReferencesStrict.
+func validateIPsecEndpointsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ipsec := &cfg.Security.IPsec
+
+	gwNames := make([]string, 0, len(ipsec.Gateways))
+	for name := range ipsec.Gateways {
+		gwNames = append(gwNames, name)
+	}
+	sort.Strings(gwNames)
+	for _, name := range gwNames {
+		gw := ipsec.Gateways[name]
+		if gw == nil {
+			continue
+		}
+		if gw.Address != "" && !IsUsableIPsecEndpoint(gw.Address) {
+			return fmt.Errorf("security ike gateway %q address %q is not a "+
+				"valid IP address or hostname; strongSwan would reject the "+
+				"generated remote_addrs and the tunnel would never load",
+				name, gw.Address)
+		}
+		if gw.DynamicHostname != "" && !IsUsableIPsecEndpoint(gw.DynamicHostname) {
+			return fmt.Errorf("security ike gateway %q dynamic hostname %q is "+
+				"not a valid hostname or IP address; strongSwan would reject "+
+				"the generated remote_addrs and the tunnel would never load",
+				name, gw.DynamicHostname)
+		}
+		if gw.LocalAddress != "" && !IsUsableIPsecEndpoint(gw.LocalAddress) {
+			return fmt.Errorf("security ike gateway %q local-address %q is not "+
+				"a valid IP address or hostname; strongSwan would reject the "+
+				"generated local_addrs and the tunnel would never load",
+				name, gw.LocalAddress)
+		}
+	}
+
+	vpnNames := make([]string, 0, len(ipsec.VPNs))
+	for name := range ipsec.VPNs {
+		vpnNames = append(vpnNames, name)
+	}
+	sort.Strings(vpnNames)
+	for _, name := range vpnNames {
+		vpn := ipsec.VPNs[name]
+		if vpn == nil {
+			continue
+		}
+		if vpn.LocalAddr != "" && !IsUsableIPsecEndpoint(vpn.LocalAddr) {
+			return fmt.Errorf("security ipsec vpn %q local-address %q is not a "+
+				"valid IP address or hostname; strongSwan would reject the "+
+				"generated local_addrs and the tunnel would never load",
+				name, vpn.LocalAddr)
+		}
+	}
+	return nil
+}
