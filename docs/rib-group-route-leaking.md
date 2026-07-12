@@ -103,6 +103,30 @@ routes-only publish surface (no `Compile`, no helper restart) and duplicate-skip
 an unchanged route set, so a steady-state commit and a never-had-a-rib-group
 config publish nothing.
 
+**Hybrid-ACK guard (#5680, composes with #5679).** The routes-only publish
+surface (`Manager.PublishRouteOverlaySnapshot`, `manager_overlay.go`) rebuilds
+**only** the snapshot's `Routes` section and inherits every compiled policy
+section (zones/policies/NAT/screens/address-books) verbatim from
+`m.lastSnapshot` — the sections the last full `Compile`-based apply built from
+`m.lastSnapshot.Config`. If the passed `cfg` carries a **policy** delta that was
+never compiled into that snapshot, stamping `next.Config = cfg` (and the
+`markAppliedSnapshotLocked` that follows) would advance the applied identity to
+an **old-policy/new-route hybrid** — the operator would be told the new config
+is live while the dataplane still enforces the old policy. This is the #5679
+residual: an ordinary `d.dp.ApplyConfig` failure captures `applyErr` and
+continues (fail-closed but complete) **without** advancing `m.lastSnapshot`,
+while `store.Commit` has already promoted the new `cfg`; the tail route-leak
+republish (and the ip-monitoring actuator) then pass that new `cfg`. The publish
+therefore **refuses** (`routeOnlyPublishHybrid`) whenever `cfg` is not the
+config `m.lastSnapshot` was compiled from — pointer-identical in every
+legitimate route-only publish (`store.ActiveConfig()` == the object handed to
+`ApplyConfig`), with a `reflect.DeepEqual` fallback so a distinct-but-equal
+config is never falsely refused. On refusal the old, fully-consistent snapshot
+stays live, the desired-overlay cache stays at its baseline (the #3760
+mutate-after-success contract), and the caller reconverges once a full apply
+republishes the policy (`reconcileRouteLeakSnapshot` warns; the ip-monitoring
+actuator stays dirty and retries).
+
 ## Fail-loud diagnostics (commit-time warnings)
 
 `config.ValidateConfig` (`validateRibGroupLeakWarnings`) warns — rather than
