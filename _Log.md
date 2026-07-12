@@ -47077,6 +47077,14 @@ top.
   gate; shadow test not gate-dependent). Diagnostic simulator only (non-enforcement).
 - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/predefined_set_5666_test.go
 
+## 2026-07-12 — #5711 DHCPv6 stable DUID across acquisition/renewal
+- **Timestamp**: 2026-07-12
+- **Action**: Fix DUID mismatch — bare acquisition used library-default DUID-LLT
+  (GetTime per-message) while renewal used persistent getDUID DUID-LL; make
+  buildDHCPv6Modifiers always attach the persistent getDUID client ID (symmetric
+  with buildDHCPv6RenewModifiers). Added fail-on-revert tests.
+- **File(s)**: pkg/dhcp/dhcp.go (Edit), pkg/dhcp/duid_stability_5711_test.go
+  (Write), pkg/dhcp/README.md (Edit)
 - **Timestamp**: 2026-07-12
 - **Action**: Fix #5675/#5691 — AST pre-passes must aggregate across ALL
   top-level roots, not just the first. `expandInterfaceRanges` (#4027) broke on
@@ -47121,3 +47129,16 @@ top.
   pkg/daemon/device_map_teardown_failclosed_5309_test.go,
   pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
   pkg/daemon/README.md
+
+## 2026-07-12 — #5711/#5743 test-quality fold (hostile-review)
+- **Timestamp**: 2026-07-12
+- **Action**: Fold two TEST-QUALITY findings from PR #5743 review (production
+  fix unchanged). (1) DUID-LLT companion test now seeds a persistent DUID-LLT
+  with Time set one hour in the past so it genuinely flips RED on revert
+  (acquisition default-LLT Time≈now vs renewal persisted-LLT Time=now-3600 →
+  bytes differ by 3600s); verified RED with the fix neutralized. (2) De-fragilized
+  the nil-opts sub-test in TestBuildDHCPv6Modifiers: seed a known DUID so getDUID
+  resolves deterministically from cache and assert exactly one Client-ID DUID is
+  attached (was asserting len==0, which only held on hosts lacking eth0).
+- **File(s)**: pkg/dhcp/duid_stability_5711_test.go (Edit),
+  pkg/dhcp/dhcp_test.go (Edit)
