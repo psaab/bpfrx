@@ -1934,11 +1934,27 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 				// Unknown/empty lists default to IPv4.
 				//
 				// In a SPLIT mixed-route-filter term (seqFam != "") the
-				// prefix-list match is emitted ONLY in the sequence whose
-				// family matches the list, so the off-family sequence does
-				// not pick up a `match ip/ipv6` clause that would AND-NOMATCH
-				// its own family's routes (the #2071 co-resident collision,
-				// avoided by construction here).
+				// `from prefix-list` match is ANDed with this family's
+				// route-filter match. When the referenced list's family is
+				// the OPPOSITE of seqFam, the match line MUST STILL be
+				// emitted: it names a different FRR match type than this
+				// sequence's `match ip/ipv6 address <route-filter>`, so the
+				// two coexist and the sequence AND-NOMATCHes every route of
+				// seqFam's family — exactly the intended Junos semantics
+				// ("(route-filter) AND (off-family prefix-list)" is
+				// unsatisfiable for this family, so the term is non-matching
+				// for it). Dropping the off-family match instead (the pre-#5702
+				// behavior) silently LOOSENED the term to its route-filter half:
+				// a v4 route matching the v4 route-filter matched the term even
+				// though the term also required membership in a v6-only
+				// prefix-list no v4 route can satisfy — a fail-open
+				// policy-semantics change (#5702). Emitting it fail-CLOSES the
+				// off-family sequence, matching the non-split term's behavior
+				// (where both `match ip` and `match ipv6` already co-reside and
+				// AND-NOMATCH). This is a DIFFERENT-type coexistence, NOT the
+				// #2071 same-type collision — a v4 route-filter is `match ip`
+				// and a v6 prefix-list is `match ipv6`, so neither replaces the
+				// other.
 				//
 				// fromPrefixList is ONE entry of a possibly multi-valued
 				// `from prefix-list` set (#2642). Multiple entries match
@@ -1957,9 +1973,7 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 						}
 					}
 				}
-				if seqFam == "" || (seqFam == "v6" && matchKW == "ipv6") || (seqFam == "v4" && matchKW == "ip") {
-					fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
-				}
+				fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
 			}
 
 			// Junos "from protocol [ bgp ospf static ]" matches ANY listed
