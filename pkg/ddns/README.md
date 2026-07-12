@@ -15,7 +15,7 @@ moved with its assertions intact.
 
 | File | Contents |
 |------|----------|
-| `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `dhcidSharedWithOther` (#2700 shared-DHCID guard), `Stats` (incl. `PTRPendingNow`, #2708), `OwnedRecordView(s)`, the `errDDNSNoBackendToWithdraw` keep-ownership sentinel (#2699), the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
+| `manager.go` | `Manager` (the DDNS reconcile engine — moved from `dhcpserver/ddns.go`): `policyFromConfig`, `Reconcile`, `reconcileOnceLocked`, `upsertLocked`/`deleteOwnedLocked`, `withdrawAllLocked`, `ownerWatermark`, `dhcidSharedWithOther` (#2700 shared-DHCID guard), `wireRRSharedWithOther` (#5709 co-owned wire-RR claim guard), `Stats` (incl. `PTRPendingNow`, #2708), `OwnedRecordView(s)`, the `errDDNSNoBackendToWithdraw` keep-ownership sentinel (#2699), the write-ahead durability + never-delete-non-owned boundary. Also the `Lease` record + `LeaseParser` seam. |
 | `state.go` | Ownership state store (`ownedRecord`, `ddnsState`, `loadDDNSState`, durable `save` via `fsatomic.WriteFileDurable`) — moved from `dhcpserver/ddns_state.go`. Also the fail-closed load classifiers `errDDNSStateCorrupt` / `errDDNSStateUnsupportedVersion` + `quarantineBadState` (#2650) + the durable `<path>.degraded` marker helpers `readDegradedMarker` / `writeDegradedMarker` (#4873) that keep the fail-closed posture across restart. The load is SIZE-BOUNDED via `readBoundedStateFile` (`os.Stat` pre-check + `io.LimitReader` sentinel) against the derived `maxDDNSStateBytes` cap; an over-bound file is classified `errDDNSStateTooLarge` (wraps `errDDNSStateCorrupt`) so it fails closed like a corrupt file (#5571, CWE-770). |
 | `backend.go` | `DNSUpdater` interface, `LeaseDNSRecord`, `nopUpdater`, the record + reverse-PTR-name helpers — moved from `dhcpserver/ddns_dns.go`. |
 | `backend_rfc2136.go` | The LIVE RFC 2136 backend (`rfc2136Updater`): exact-RR adds/deletes, TSIG, RFC 4701 DHCID + RFC 4703 replace-owned two-attempt, the `errDDNSConflictRefused` / `errDDNSPTRPending` sentinels — moved from `dhcpserver/ddns_rfc2136.go`. `sendRemoveForward(..., keepDHCID)` keeps a shared DHCID on a partial dual-stack teardown (#2700); `dnsCanonicalFQDN` mirrors the DHCID FQDN canonicalization. |
@@ -446,6 +446,23 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   overlapping cross-RG pools attribute deterministically across passes (the gate
   cannot flap). The daemon also nudges DDNS on a partial demotion
   (`clearRethServicesForRG`) so the gate change takes effect within one pass.
+- **Wire-RR co-ownership claim accounting (#5709, codex-review-182 M36)** —
+  ScopeKey makes two scopes' store rows DISTINCT, but on the wire two scopes can
+  resolve the SAME host to the SAME address and thus publish ONE shared resource
+  record (`h.example.com A 10.0.5.5`). Because `deleteOwnedLocked` reconstructs
+  the wire RR from `{FQDN, ForwardType, Address}` alone, one scope's teardown
+  (lease expiry / config removal) would issue a wire DELETE that removed the RR
+  the OTHER scope still legitimately owns and refreshes — a silent cross-scope
+  clobber. `deleteOwnedLocked` now first calls `wireRRSharedWithOther(owned)`: if
+  ANOTHER store row (a different scope) carries the same canonical FQDN + forward
+  type + rdata, the wire delete is SUPPRESSED, only the departing scope's
+  ownership claim is released, and the live RR is left for the surviving scope.
+  The equal `{FQDN, Address}` also implies an equal reverse PTR, so suppressing
+  the whole `DeleteLease` covers both directions. Only the LAST claimant's
+  teardown issues the real wire delete (a reference-count decrement over the
+  claim table). Suppressions are counted (`Stats.DeleteCoowned`, the
+  `xpf_dhcp_ddns_skipped_total{reason="coowned"}` metric) and covered by
+  `TestCoOwnedWireRRSurvivesOtherScopeTeardown`.
 - **Source / VRF binding (#2665, `backend_bind.go`)** — the per-family
   `source-address` / `destination-interface` / `routing-instance` leaves build a
   custom `net.Dialer` (one `Control` hook: `unix.Bind` for the source IP +

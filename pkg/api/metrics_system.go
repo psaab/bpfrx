@@ -65,6 +65,8 @@ func (c *xpfCollector) collectDDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.SkippedPTRNotAuth), "ptr-notauth")
 	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSSkippedTotal, prometheus.CounterValue,
 		float64(st.PTRDeferred), "ptr-deferred")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.DeleteCoowned), "coowned")
 	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSOwnedRecords, prometheus.GaugeValue,
 		float64(st.OwnedRecords))
 	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSPTRPending, prometheus.GaugeValue,
