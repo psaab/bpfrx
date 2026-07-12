@@ -1,12 +1,14 @@
 package dhcp
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv6"
+	"github.com/insomniacslk/dhcp/iana"
 )
 
 func TestExtractDelegatedPrefixes(t *testing.T) {
@@ -129,9 +131,36 @@ func TestBuildDHCPv6Modifiers(t *testing.T) {
 	}
 
 	t.Run("nil opts", func(t *testing.T) {
+		// Post-#5711 contract: even with no configured DHCPv6 options, the
+		// modifiers MUST carry the persistent Client-ID DUID so acquisition
+		// and renewal present the same identity. Seed a known DUID so getDUID
+		// resolves deterministically from the in-memory cache — independent of
+		// whether an "eth0" happens to exist on the test host (the old
+		// len(mods)==0 assertion only passed because getDUID errored on a host
+		// with no eth0; on a host with one it would have failed).
+		want := &dhcpv6.DUIDLL{
+			HWType:        iana.HWTypeEthernet,
+			LinkLayerAddr: net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
+		}
+		m.duids["eth0"] = want
+		defer delete(m.duids, "eth0")
+
 		mods := m.buildDHCPv6Modifiers("eth0", nil)
-		if len(mods) != 0 {
-			t.Errorf("got %d modifiers, want 0", len(mods))
+
+		msg, err := dhcpv6.NewMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg.MessageType = dhcpv6.MessageTypeSolicit
+		for _, mod := range mods {
+			mod(msg)
+		}
+		got := msg.Options.ClientID()
+		if got == nil {
+			t.Fatal("nil opts must still attach the persistent Client-ID DUID (#5711)")
+		}
+		if !bytes.Equal(got.ToBytes(), want.ToBytes()) {
+			t.Errorf("Client-ID DUID = %x, want %x", got.ToBytes(), want.ToBytes())
 		}
 	})
 
