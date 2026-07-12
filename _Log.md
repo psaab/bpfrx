@@ -1,3 +1,30 @@
+## 2026-07-12 — #5701 (bug): bound route-map Cartesian expansion against the FRR sequence-number ceiling
+- **Timestamp**: 2026-07-12 (fix/5701-routemap-seqnum-bound)
+- **Action**: codex-review-182 M26. The pkg/frr route-map renderer
+  (renderPolicyTermSequences) numbers each emitted term sequence in steps of 10
+  starting at 10, plus one trailing default, so a policy expanding to N term
+  sequences uses a highest FRR route-map sequence number of 10*(N+1). FRR
+  route-map seq is 1..65535; once N > 6552 the render emits a `route-map` line
+  past 65535 that FRR rejects (CMD_WARNING_CONFIG_FAILED), and a single failed
+  line makes the vtysh-batched frr-reload exit non-zero — poisoning the WHOLE
+  managed-section reload. The per-term expansion is the Cartesian product
+  (family-split ×2) × |from prefix-list| × |from community| × |from as-path|,
+  so a large/crafted policy overflows with no guard. Fix: (a) new
+  config.RouteMapSequenceCount SSOT helper (overflow-safe via checkedMulU64,
+  mirrors the renderer's expansion) + config.MaxRouteMapSequences=6552 ceiling
+  (65535/10 - 1) in pkg/config/routemap_seq_bound.go; (b) strict commit gate
+  validatePolicyRouteMapSequenceBoundStrict wired in runUniformGates — rejects
+  an over-ceiling policy at commit/commit-check naming the policy, warns on
+  tolerant load/peer-sync (opts.lenientPolicyRouteMapSeq, #1960); (c) render-side
+  belt — generatePolicyOptions SKIPS an over-ceiling policy (slog.Warn) so a
+  leniently-loaded oversized policy renders nothing rather than poisoning the
+  reload. Mirrors validateNextTableTargetReferencesStrict. Fail-on-revert proven:
+  neutering the gate → the direct-gate + CompileConfig-reject tests go RED.
+- **File(s)**: pkg/config/routemap_seq_bound.go,
+  pkg/config/routemap_seq_bound_5701_test.go, pkg/config/compiler_uniformgates.go,
+  pkg/config/compiler.go, pkg/frr/policy_render.go,
+  pkg/frr/policy_routemap_seqbound_5701_test.go, pkg/frr/README.md
+
 ## 2026-07-12 — #5702 (bug): mixed-family route-filter split must AND the off-family from-prefix-list predicate
 - **Timestamp**: 2026-07-12 (fix/5702-routefilter-mixedfamily)
 - **Action**: codex-review-182 M27. A policy-statement term whose route-filters

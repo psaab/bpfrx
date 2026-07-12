@@ -1770,6 +1770,22 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig, bgpAccep
 	sort.Strings(psNames)
 	for _, name := range psNames {
 		ps := po.PolicyStatements[name]
+		// #5701 render-side belt: a policy whose per-term Cartesian expansion
+		// exceeds the FRR route-map sequence-number ceiling would render a
+		// `route-map <name> <action> <seq>` line past seq 65535, which FRR
+		// rejects (CMD_WARNING_CONFIG_FAILED) — poisoning the WHOLE
+		// vtysh-batched frr-reload, not just this policy. The strict commit gate
+		// (config.validatePolicyRouteMapSequenceBoundStrict) rejects it; this
+		// belt covers the tolerant load / peer-sync / rollback path (#1960)
+		// where that gate only warns: SKIP the oversized policy so the rest of
+		// the managed section still reloads (a dangling `route-map <name> in/out`
+		// FRR resolves to permit-all, but that is strictly better than a poisoned
+		// reload, and the operator has the commit-time diagnostic).
+		if n := config.RouteMapSequenceCount(ps); n > config.MaxRouteMapSequences {
+			slog.Warn("skipping oversized route-map policy: expansion would overflow FRR sequence numbers and poison the reload",
+				"policy", name, "sequences", n, "max", config.MaxRouteMapSequences)
+			continue
+		}
 		// Base route-map: Junos BGP default-accept (#2998) vs the fail-closed
 		// redistribute/forwarding-table default, resolved per use context.
 		b.WriteString(m.renderRouteMapForPolicy(po, name, ps, policyTrailingAction(name, ps, bgpAcceptDefault)))
