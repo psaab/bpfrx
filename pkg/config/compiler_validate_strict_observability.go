@@ -390,14 +390,16 @@ func validateDynamicAddressFeedNameUniquenessStrict(cfg *Config) error {
 // AddressBinding.FeedNames with no cross-reference against the configured
 // feed-servers (compileDynamicAddress in compiler_services.go), and at
 // runtime an unknown feed name contributes nothing: feeds.Manager.
-// SnapshotForBindings skips a feed it never registered and still publishes
-// a non-nil EMPTY prefix set for the binding (feeds.go SnapshotForBindings),
-// so the AF_XDP address book gets a book ID that matches nothing
-// (fail-closed). The runtime fail-closed posture is correct for "feed
-// declared but not yet fetched", but a TYPO in the feed-name is
-// indistinguishable from that and arms a silent match-none book: a
-// feed-backed deny policy referencing the dynamic-address denies nothing,
-// with no commit error. Junos rejects an address-name whose profile
+// SnapshotForBindings OMITS a binding whose feeds have no installed snapshot
+// (an unregistered/unfetched feed name) rather than publishing an empty
+// prefix set (#5645), so the binding name stays UNRESOLVED and the policy
+// lowering compiles it to __unsupported_address__ → whole-snapshot preflight
+// reject → fail-closed (previous-good retained, or fresh-boot default-deny).
+// The runtime fail-closed posture is correct for "feed declared but not yet
+// fetched", but a TYPO in the feed-name is indistinguishable from that at
+// runtime — it too fails closed (the referencing deny is enforced via
+// default-deny, not silently ignored), with no commit error. Junos rejects
+// an address-name whose profile
 // feed-name does not resolve to a declared feed at commit; this gate
 // restores that behavior.
 //
@@ -415,9 +417,10 @@ func validateDynamicAddressFeedNameUniquenessStrict(cfg *Config) error {
 // On the tolerant load / peer-sync paths the call site downgrades this to a
 // warning (opts.lenientDynamicAddressFeedRef) so an already-persisted config
 // (older binaries never validated the reference) or a peer-synced config
-// still boots — the runtime is already fail-closed (match-none) for an
-// unknown feed, so a leniently-loaded typo denies nothing rather than
-// bricking the load (#1960 / #3261 class). Commit / commit-check stay strict
+// still boots — the runtime is already fail-closed for an unknown feed
+// (#5645: the name is omitted → whole-snapshot reject → previous-good /
+// fresh-boot default-deny), so a leniently-loaded typo fails closed rather
+// than bricking the load (#1960 / #3261 class). Commit / commit-check stay strict
 // so the operator's next edit fails loudly. Mirrors
 // validateLogProfileStreamReferencesStrict.
 func validateDynamicAddressFeedReferencesStrict(cfg *Config) error {
