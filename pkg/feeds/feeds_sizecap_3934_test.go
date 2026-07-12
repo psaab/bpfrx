@@ -149,7 +149,7 @@ func (s *oversizeServer) handler() http.HandlerFunc {
 // clobbering the last-good — the retention assertion goes RED.
 func TestFetchFeedOverSizeRetainsLastGood(t *testing.T) {
 	var calls int
-	m := New(func() { calls++ })
+	m := New(func() error { calls++; return nil })
 	srv := &oversizeServer{}
 	ts := httptest.NewServer(srv.handler())
 	defer ts.Close()
@@ -212,7 +212,7 @@ func (s *slowServer) handler() http.HandlerFunc {
 // retain the last-good snapshot, not block the refresh indefinitely. The
 // timeout is overridden to a short value so the test is fast.
 func TestFetchFeedSlowServerTimesOut(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	m.client.Timeout = 150 * time.Millisecond
 
 	srv := &slowServer{delay: 2 * time.Second, body: "203.0.113.0/24\n"}

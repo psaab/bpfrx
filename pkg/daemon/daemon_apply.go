@@ -117,6 +117,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 }
 
+// applyConfigResult applies cfg exactly like applyConfig — under the apply
+// semaphore with a non-cancellable context — but RETURNS the apply error
+// instead of only logging it. The feed onUpdate publication path (#5646) uses
+// the returned result to decide whether the feed content was ACCEPTED: the feed
+// manager advances its per-feed published-hash only on a nil return, so a
+// rejected apply leaves publication debt that the next identical refetch
+// retries (rather than committing the content hash and suppressing retry
+// forever, the pre-#5646 bug). The returned error is still logged — by
+	// feeds.installSnapshot's reject branch (feeds side), not by this function.
+func (d *Daemon) applyConfigResult(cfg *config.Config) error {
+	_ = d.applySem.Acquire(context.Background(), 1)
+	defer d.applySem.Release(1)
+	return d.applyConfigLocked(context.Background(), cfg)
+}
+
 // applyCancelCtx returns the context whose cancellation aborts the heavy apply
 // pipeline (applyConfigLocked) at its coarse step boundaries (#2926). It is the
 // dedicated DAEMON-STOP context (d.applyCancelContext), deliberately NOT the

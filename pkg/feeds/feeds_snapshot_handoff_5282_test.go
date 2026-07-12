@@ -39,7 +39,7 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
 // both the immediate assertion (no snapshot after Apply) and the post-failure
 // assertion (retainForever holds an EMPTY set) turn RED.
 func TestApplyReconfigureFailedFetchRetainsLastGood(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 
 	// 1) Install a deny feed's last-good snapshot from a healthy endpoint.
 	good := &bodyServer{}
@@ -101,7 +101,7 @@ func TestApplyReconfigureFailedFetchRetainsLastGood(t *testing.T) {
 // keeps its carried-forward snapshot. This is the removed-vs-persisted boundary:
 // carry-forward must not resurrect a deleted feed.
 func TestApplyDropsRemovedFeed(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	good := &bodyServer{}
 	good.set("203.0.113.0/24\n", http.StatusOK)
 	ts := httptest.NewServer(good.handler())
@@ -140,7 +140,7 @@ func TestApplyDropsRemovedFeed(t *testing.T) {
 // DIFFERENT set, the new fetch atomically REPLACES the carried-forward snapshot
 // (no stale-union, no torn read) rather than leaving the old prefixes installed.
 func TestApplyReconfigureSuccessfulFetchReplacesSnapshot(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 
 	// Last-good from endpoint A.
 	oldSrv := &bodyServer{}

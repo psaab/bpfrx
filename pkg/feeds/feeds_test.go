@@ -145,7 +145,7 @@ func TestInvalidSampleIsBounded(t *testing.T) {
 // TestMixedFeedDegradedStatus confirms a mixed body installs valid prefixes and
 // surfaces a degraded status with the invalid-line count through AllFeeds.
 func TestMixedFeedDegradedStatus(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	srv := &bodyServer{}
 	srv.set("192.0.2.0/24\nnot-an-ip\n203.0.113.0/24\n", http.StatusOK)
 	ts := httptest.NewServer(srv.handler())
@@ -175,7 +175,7 @@ func TestMixedFeedDegradedStatus(t *testing.T) {
 // TestCleanFeedNotDegraded is the no-behaviour-change guard: an all-valid feed
 // installs fully with zero invalid lines and is NOT marked degraded.
 func TestCleanFeedNotDegraded(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	srv := &bodyServer{}
 	srv.set("192.0.2.0/24\n203.0.113.0/24\n", http.StatusOK)
 	ts := httptest.NewServer(srv.handler())
@@ -202,7 +202,7 @@ func TestCleanFeedNotDegraded(t *testing.T) {
 // TestDegradedClearsAfterCleanRefetch confirms a feed that recovers (provider
 // fixes the body) drops the degraded markers on the next clean install.
 func TestDegradedClearsAfterCleanRefetch(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	srv := &bodyServer{}
 	srv.set("192.0.2.0/24\nbad-line\n", http.StatusOK)
 	ts := httptest.NewServer(srv.handler())
@@ -253,7 +253,7 @@ func TestParseFeedOverlongLineErrors(t *testing.T) {
 // with identical count must fire onUpdate. The old code compared len only.
 func TestSameCountContentChangeFires(t *testing.T) {
 	var calls atomic.Int32
-	m := New(func() { calls.Add(1) })
+	m := New(func() error { calls.Add(1); return nil })
 
 	srv := &bodyServer{}
 	srv.set("192.0.2.0/24\n", http.StatusOK)
@@ -281,7 +281,7 @@ func TestSameCountContentChangeFires(t *testing.T) {
 
 func TestIdenticalContentDoesNotFire(t *testing.T) {
 	var calls atomic.Int32
-	m := New(func() { calls.Add(1) })
+	m := New(func() error { calls.Add(1); return nil })
 
 	srv := &bodyServer{}
 	// Same prefixes in a different order each fetch -> canonical hash identical.
@@ -310,7 +310,7 @@ func TestIdenticalContentDoesNotFire(t *testing.T) {
 // not replace the snapshot and must not stamp lastFetch/lastSuccess.
 func TestErrorRetainsSnapshotNoStamp(t *testing.T) {
 	var calls atomic.Int32
-	m := New(func() { calls.Add(1) })
+	m := New(func() error { calls.Add(1); return nil })
 
 	srv := &bodyServer{}
 	srv.set("192.0.2.0/24\n", http.StatusOK)
@@ -351,7 +351,7 @@ func TestErrorRetainsSnapshotNoStamp(t *testing.T) {
 // HTTP-200 empty body must NOT wipe the enforced set; it is treated as suspect.
 func TestZeroPrefixRetainsLastGood(t *testing.T) {
 	var calls atomic.Int32
-	m := New(func() { calls.Add(1) })
+	m := New(func() error { calls.Add(1); return nil })
 
 	srv := &bodyServer{}
 	srv.set("203.0.113.0/24\n", http.StatusOK)
@@ -397,7 +397,7 @@ func TestResolveHoldInterval(t *testing.T) {
 // (see TestUnsetHoldIntervalRetainsForever) — it requires hold-interval > 0.
 func TestHoldIntervalRetainThenDrop(t *testing.T) {
 	var calls atomic.Int32
-	m := New(func() { calls.Add(1) })
+	m := New(func() error { calls.Add(1); return nil })
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var nowMu sync.Mutex
@@ -480,7 +480,7 @@ func TestHoldIntervalRetainThenDrop(t *testing.T) {
 // after the window elapsed.
 func TestUnsetHoldIntervalRetainsForever(t *testing.T) {
 	var calls atomic.Int32
-	m := New(func() { calls.Add(1) })
+	m := New(func() error { calls.Add(1); return nil })
 
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	var nowMu sync.Mutex
@@ -545,7 +545,7 @@ func TestUnsetHoldIntervalRetainsForever(t *testing.T) {
 // TestStartupNoSnapshotFailClosed targets behavior 5 startup semantics: before
 // any good fetch, a failing feed has no snapshot and GetPrefixes is empty.
 func TestStartupNoSnapshotFailClosed(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	srv := &bodyServer{}
 	srv.set("nope", http.StatusInternalServerError)
 	ts := httptest.NewServer(srv.handler())
@@ -577,7 +577,7 @@ func TestStartupNoSnapshotFailClosed(t *testing.T) {
 
 // TestAllFeedsStatusFields confirms the additive status fields surface.
 func TestAllFeedsStatusFields(t *testing.T) {
-	m := New(func() {})
+	m := New(func() error { return nil })
 	srv := &bodyServer{}
 	srv.set("192.0.2.0/24\n", http.StatusOK)
 	ts := httptest.NewServer(srv.handler())

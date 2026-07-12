@@ -7,7 +7,9 @@ feed servers and triggers config recompile when the resolved set changes
 ## Entry points
 
 - `Manager` — `feeds.go`.
-- `New(updateFn)` — `feeds.go`.
+- `New(updateFn)` — `feeds.go`. `updateFn` is `func() error`: it applies the
+  fetched content to the dataplane and RETURNS the apply result. A rejected
+  apply (non-nil error) is retried on the next identical refetch (#5646, below).
 - `Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)` — `feeds.go`. Reconciles the per-feed refresh goroutines; carries a persisted feed's last-good snapshot forward across the reconfigure (#5282, see below).
 - `GetPrefixes(name)` — `feeds.go`. Returns the current enforced (last-good) snapshot.
 - `StopAll()`, `FeedInfo`, `AllFeeds()` — surfaced to `show security dynamic-address`. `StopAll` is the shutdown path (cancels every producer, empties the map); `Apply` no longer routes through it (#5282).
@@ -91,6 +93,44 @@ empty static book. A **persisted** feed carries its last-good snapshot forward
 (`#5282`), so it still resolves to prefixes here and is still published; the
 omission fires only for a feed with no prior good fetch.
 
+## Publication-debt retry — a rejected apply is retried, not swallowed (#5646)
+
+The `onUpdate` callback drives the daemon to APPLY the fetched feed content to
+the dataplane, and that apply can be **rejected** — a whole-snapshot preflight
+reject (`#3261`/`#5645`), a compile failure, or a transient control-socket
+error. Before `#5646` `installSnapshot` committed the fetched content hash and
+then fired a **void** `onUpdate`, so a rejected apply left the hash committed:
+every later refetch of the (still-good, still-unapplied) **identical** content
+saw "unchanged hash" and **skipped** `onUpdate`. The good content then sat
+un-enforced indefinitely — **publication debt** — because the provider keeps
+serving the same body (hash never changes again) and the default refresh is
+hourly. The intended feed/policy silently failed open until an unrelated commit
+or a genuine content change happened to re-drive the apply.
+
+The fix decouples the **installed-content** hash from the **published** hash:
+
+- `onUpdate` now returns `error` (`func() error`). A nil return means the apply
+  was **accepted**; a non-nil return means it was **rejected**. The production
+  callback (`ensureFeedManager`, `daemon_feeds.go`) returns the result of
+  `applyConfigResult` (an error-returning sibling of `applyConfig`).
+- `feedState.publishedHash` / `hasPublished` track the hash last **confirmed
+  applied**. `installSnapshot` always commits `fs.hash` to the freshly-fetched
+  content (so the display/`#5282`-carry hash stays truthful), but fires
+  `onUpdate` whenever the fetched content differs from `publishedHash` — **not**
+  from `fs.hash`. `publishedHash` advances **only** on a nil (accepted) return.
+- A **rejected** apply therefore leaves `publishedHash` stale, so the next
+  identical refetch re-evaluates `needsPublish == true` and **retries** the
+  apply. The retry fires on the normal refresh cadence — one publish attempt per
+  fetch, never a tight loop.
+- A **successfully-applied** feed has `publishedHash == fs.hash`, so an
+  identical refetch is suppressed (`needsPublish == false`) — **no thrash** and
+  no busy-loop, preserving the `#5282` no-re-fire-on-carry-forward contract
+  (`carryForwardSnapshot` inherits `publishedHash`/`hasPublished`).
+- The **hold-interval drop-to-empty** (`recordFailure`) resets
+  `publishedHash`/`hasPublished`, so a later recovery (refetch of the prior
+  content) re-fires `onUpdate` and re-enforces the recovered set rather than
+  seeing a stale published hash and suppressing the re-apply.
+
 ## Refresh correctness & fail-safe behavior (#2050)
 
 A fetch is treated as **successful** only when the transport read completes
@@ -115,11 +155,14 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
 - **plaintext-http feeds are warned (#3934).** A feed URL using `http://`
   (no transport integrity — a MITM can substitute the body) logs a one-time
   `slog.Warn` at `Apply`. `https` is strongly preferred for any feed source.
-- **content-based change detection.** Prefixes are canonicalized (parsed to
-  masked CIDR / `/32` / `/128`), deduped, sorted, and SHA-256 hashed. The
-  `onUpdate` recompile callback fires only when the hash changes — a same-count
-  content swap (`192.0.2.0/24` -> `198.51.100.0/24`) fires; a reordered but
-  identical set does not.
+- **content-based change detection, keyed off the last *published* set (#5646).**
+  Prefixes are canonicalized (parsed to masked CIDR / `/32` / `/128`), deduped,
+  sorted, and SHA-256 hashed. The `onUpdate` recompile callback fires whenever
+  the fetched content differs from what was last **successfully applied** — a
+  same-count content swap (`192.0.2.0/24` -> `198.51.100.0/24`) fires; a
+  reordered but identical set does not. See "Publication-debt retry" below for
+  why the trigger keys off the *published* hash, not merely the last-fetched
+  hash.
 - **no success stamp on a partial/errored read.** `LastFetch`/`LastSuccess`
   are stamped, and the active snapshot replaced, only on a complete successful
   fetch. A failed fetch records `LastError` and leaves the snapshot untouched.
@@ -203,8 +246,11 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   *scanner-level* error (overlong line / read error) is NOT skipped: it fails
   the whole fetch (retain last-good).
 - A successful fetch always replaces the snapshot and stamps success, but
-  the `onUpdate` recompile fires only when the canonical content hash
-  changes — not on every fetch and not merely on a count change.
+  the `onUpdate` recompile fires only when the canonical content hash differs
+  from the last **successfully-applied** set — not on every fetch, not merely on
+  a count change, and (per #5646) not suppressed by a prior **rejected** apply of
+  the same content (which is retried on the next refetch). See "Publication-debt
+  retry" above.
 - **Feed size vs. the dataplane control-socket cap (#2744 / #3934):** feed
   prefixes are carried inline as CIDR text in the userspace-dp `apply_snapshot`
   (`buildAddressBookTableWithFeeds`, `pkg/dataplane/userspace/policies.go`).
