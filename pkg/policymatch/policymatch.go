@@ -1714,7 +1714,16 @@ func matchApp(cfg *config.Config, apps []string, proto string, srcPort, dstPort 
 		}
 		// Application-set: expand recursively (multi-level) and test each
 		// member application.
-		if _, isSet := cfg.Applications.ApplicationSets[a]; isSet {
+		// #5666: recognize a PREDEFINED application-set bundle (junos-ms-rpc,
+		// junos-sun-rpc, junos-cifs, junos-routing-inbound), not just
+		// user-defined sets — mirror the #5629 dataplane fix so this operator
+		// simulator matches the fixed dataplane. Resolve an application FIRST so
+		// a user application shadowing a predefined-set name keeps application
+		// semantics (matches resolveUserspaceApplicationNames + #5629's
+		// app-first precedence). config.ResolveApplicationSet consults user sets
+		// then the #4102 predefined table.
+		_, isApp := config.ResolveApplication(a, cfg.Applications.Applications)
+		if _, isSet := config.ResolveApplicationSet(a, cfg.Applications.ApplicationSets); !isApp && isSet {
 			members, err := config.ExpandApplicationSet(a, &cfg.Applications)
 			if err != nil {
 				// #3727: an unexpandable application-set is a whole-snapshot
@@ -1881,7 +1890,16 @@ func hasL4ConstrainedTerm(cfg *config.Config, apps []string, proto string) bool 
 			// match-any covers this protocol with an ungated term.
 			return false
 		}
-		if _, isSet := cfg.Applications.ApplicationSets[a]; isSet {
+		// #5666: recognize a PREDEFINED application-set bundle (junos-ms-rpc,
+		// junos-sun-rpc, junos-cifs, junos-routing-inbound), not just
+		// user-defined sets — mirror the #5629 dataplane fix so this operator
+		// simulator matches the fixed dataplane. Resolve an application FIRST so
+		// a user application shadowing a predefined-set name keeps application
+		// semantics (matches resolveUserspaceApplicationNames + #5629's
+		// app-first precedence). config.ResolveApplicationSet consults user sets
+		// then the #4102 predefined table.
+		_, isApp := config.ResolveApplication(a, cfg.Applications.Applications)
+		if _, isSet := config.ResolveApplicationSet(a, cfg.Applications.ApplicationSets); !isApp && isSet {
 			members, err := config.ExpandApplicationSet(a, &cfg.Applications)
 			if err != nil {
 				continue
