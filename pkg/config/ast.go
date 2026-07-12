@@ -136,6 +136,23 @@ func (t *ConfigTree) FindChild(name string) *Node {
 	return nil
 }
 
+// FindChildren returns every top-level child matching name. A Junos config may
+// legitimately carry the SAME top-level stanza more than once (two hierarchical
+// `interfaces { }` / `security { }` / `routing-instances { }` blocks parse into
+// sibling roots), and compileSections dispatches EVERY matching root — so any
+// AST pre-pass that must observe the whole config (the stable-ID collision
+// gates, the interface-range expansion) has to union across all matching roots,
+// not just the first FindChild hit (#5675 / #5691).
+func (t *ConfigTree) FindChildren(name string) []*Node {
+	var result []*Node
+	for _, child := range t.Children {
+		if len(child.Keys) > 0 && child.Keys[0] == name {
+			result = append(result, child)
+		}
+	}
+	return result
+}
+
 // Clone creates a deep copy of the config tree.
 func (t *ConfigTree) Clone() *ConfigTree {
 	if t == nil {

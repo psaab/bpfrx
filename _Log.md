@@ -47076,6 +47076,18 @@ top.
   semantics. Fail-on-revert proven (predefined-bundle match RED on the user-only
   gate; shadow test not gate-dependent). Diagnostic simulator only (non-enforcement).
 - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/predefined_set_5666_test.go
+
+- **Timestamp**: 2026-07-12
+- **Action**: Fix #5675/#5691 — AST pre-passes must aggregate across ALL
+  top-level roots, not just the first. `expandInterfaceRanges` (#4027) broke on
+  the first `interfaces` root (phantom re-mint for split roots, #5675); the
+  stable-ID collision gates (zone #3075 / tunnel #1873 / routing-instance #3855)
+  read only the first `security`/`interfaces`/`routing-instances` root (#5691).
+  Added `ConfigTree.FindChildren`; unioned View 1 + Views 2/3 across all roots.
+  Fail-on-revert tests proven RED-on-neuter.
+- **File(s)**: pkg/config/ast.go, pkg/config/compiler_interface_range.go,
+  pkg/config/zoneid.go, pkg/config/tunnelid.go, pkg/config/routinginstanceid.go,
+  pkg/config/compiler_multi_root_5675_5691_test.go, docs/config-schema.md
 - **Timestamp**: 2026-07-12
 - **Action**: #5707 — coalesce the userspace-dataplane Status() control-socket
   query for the MonitorInterface streaming path. Each open stream polls 1/s and

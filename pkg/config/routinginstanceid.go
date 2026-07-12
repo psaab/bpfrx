@@ -92,7 +92,12 @@ func emitNodeExpandedRoutingInstanceNames(tree *ConfigTree, nodeID int, out map[
 	if err := clone.ExpandGroupsWithVars(vars); err != nil {
 		return
 	}
-	collectRoutingInstanceNamesAST(clone.FindChild("routing-instances"), out)
+	// #5691: union across every top-level `routing-instances` root — a split
+	// config can declare instances in a second stanza that compileSections still
+	// compiles.
+	for _, ri := range clone.FindChildren("routing-instances") {
+		collectRoutingInstanceNamesAST(ri, out)
+	}
 }
 
 // validateRoutingInstanceTableIDCollisionAST checks the UNION of routing-instance
@@ -120,8 +125,13 @@ func emitNodeExpandedRoutingInstanceNames(tree *ConfigTree, nodeID int, out map[
 // so the two never actually share a kernel table.
 func validateRoutingInstanceTableIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	names := make(map[string]struct{})
-	// View 1 — pre-expansion presence union (main + every groups block).
-	collectRoutingInstanceNamesAST(tree.FindChild("routing-instances"), names)
+	// View 1 — pre-expansion presence union (main + every groups block). Union
+	// across EVERY top-level `routing-instances` root (#5691): a split config can
+	// declare instances in a second stanza, and compileSections compiles them
+	// all, so a first-root-only scan would miss a collision spanning the roots.
+	for _, ri := range tree.FindChildren("routing-instances") {
+		collectRoutingInstanceNamesAST(ri, names)
+	}
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
 			continue
@@ -131,10 +141,14 @@ func validateRoutingInstanceTableIDCollisionAST(tree *ConfigTree, lenient bool) 
 			// Keys[1]; the children are then the group body. The other shape
 			// nests the group name as a child node.
 			if len(child.Keys) >= 2 {
-				collectRoutingInstanceNamesAST(child.FindChild("routing-instances"), names)
+				for _, ri := range child.FindChildren("routing-instances") {
+					collectRoutingInstanceNamesAST(ri, names)
+				}
 				break
 			}
-			collectRoutingInstanceNamesAST(group.FindChild("routing-instances"), names)
+			for _, ri := range group.FindChildren("routing-instances") {
+				collectRoutingInstanceNamesAST(ri, names)
+			}
 		}
 	}
 	// Views 2/3 — post-expansion instance names for node0 and node1. Both

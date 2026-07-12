@@ -174,13 +174,21 @@ func emitNodeExpandedTunnelNames(tree *ConfigTree, nodeID int, out map[string]st
 	if err := clone.ExpandGroupsWithVars(vars); err != nil {
 		return
 	}
-	ifacesNode := clone.FindChild("interfaces")
-	if ifacesNode == nil {
+	// #5691: compile EVERY top-level `interfaces` root into one InterfacesConfig
+	// (compileInterfaces merges into the shared map, exactly as compileSections
+	// dispatches each root) so a tunnel split into a second stanza is emitted
+	// here too. A per-root compile error contributes the empty set (non-fatal),
+	// matching the pre-existing doctrine — View 1 above already covers the
+	// pre-expansion union.
+	ifacesNodes := clone.FindChildren("interfaces")
+	if len(ifacesNodes) == 0 {
 		return
 	}
 	ifaces := InterfacesConfig{Interfaces: make(map[string]*InterfaceConfig)}
-	if err := compileInterfaces(ifacesNode, &ifaces); err != nil {
-		return
+	for _, ifacesNode := range ifacesNodes {
+		if err := compileInterfaces(ifacesNode, &ifaces); err != nil {
+			return
+		}
 	}
 	cfg := &Config{Interfaces: ifaces}
 	for _, ep := range EmitTunnelEndpointNames(cfg) {
@@ -238,8 +246,14 @@ func emitNodeExpandedTunnelNames(tree *ConfigTree, nodeID int, out map[string]st
 // buildTunnelEndpointSnapshots).
 func validateTunnelEndpointIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	names := make(map[string]struct{})
-	// View 1 — pre-expansion presence union (UNCHANGED, #1873).
-	collectTunnelEndpointNamesAST(tree.FindChild("interfaces"), names)
+	// View 1 — pre-expansion presence union (#1873). Union across EVERY
+	// top-level `interfaces` root (#5691): a split config can declare tunnel
+	// interfaces in a second `interfaces { }` stanza, and compileSections
+	// compiles them all, so a first-root-only scan would miss a collision
+	// spanning the roots.
+	for _, ifaces := range tree.FindChildren("interfaces") {
+		collectTunnelEndpointNamesAST(ifaces, names)
+	}
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
 			continue
@@ -248,10 +262,14 @@ func validateTunnelEndpointIDCollisionAST(tree *ConfigTree, lenient bool) ([]str
 			// Node{Keys:["groups","node0"]} merges the group name
 			// into Keys[1]; the children are then the group body.
 			if len(child.Keys) >= 2 {
-				collectTunnelEndpointNamesAST(child.FindChild("interfaces"), names)
+				for _, ifaces := range child.FindChildren("interfaces") {
+					collectTunnelEndpointNamesAST(ifaces, names)
+				}
 				break
 			}
-			collectTunnelEndpointNamesAST(group.FindChild("interfaces"), names)
+			for _, ifaces := range group.FindChildren("interfaces") {
+				collectTunnelEndpointNamesAST(ifaces, names)
+			}
 		}
 	}
 	// Views 2/3 — post-expansion emitted names for node0 and node1
