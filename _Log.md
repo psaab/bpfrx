@@ -47076,3 +47076,20 @@ top.
   semantics. Fail-on-revert proven (predefined-bundle match RED on the user-only
   gate; shadow test not gate-dependent). Diagnostic simulator only (non-enforcement).
 - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/predefined_set_5666_test.go
+
+- **Timestamp**: 2026-07-12 06:35
+- **Action**: #5679 fix — ordinary full dataplane apply failure now FAILS the
+  commit instead of reporting success against stale policy. In
+  applyDataplaneAndHACore the non-abort ApplyConfig error path only recorded a
+  health failure then fell through (applyConfigLocked returned nil → commit OK
+  while the OLD policy stayed live: fail-open-to-stale). Added a fourth named
+  return `applyErr` capturing the ordinary failure, threaded through
+  applyConfigLocked into applyTailReconciles' tail errors.Join (fail-closed but
+  complete; still peer-syncs per #4034; abort-class still early-returns). Added
+  fail-on-revert tests (RED proven with `applyErr = err` neutralized). gofmt +
+  go vet clean; full pkg/daemon suite green.
+- **File(s)**: pkg/daemon/daemon_apply.go,
+  pkg/daemon/apply_failure_failclosed_5679_test.go,
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go,
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
+  pkg/daemon/README.md
