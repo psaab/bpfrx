@@ -145,6 +145,20 @@ all files stay in `package ipsec`, so the public API is unchanged.
 - Traffic selectors are auto-derived from the policy source / destination
   prefixes when not given explicitly. Mixing explicit and derived
   selectors is supported but the explicit set wins.
+- **One `local-ip` / `remote-ip` per traffic-selector (#5692).** Each named
+  `traffic-selector` carries exactly ONE `local-ip` and ONE `remote-ip`
+  prefix — express multiple prefixes as separate NAMED traffic-selectors
+  (`effectiveTrafficSelectors` renders each as its own swanctl SA child).
+  Repeated `local-ip` / `remote-ip` leaves under one selector survive the
+  hierarchical / load-merge / HA-config-sync parse path (the flat-set commit
+  path collapses them last-wins in `SetPath`, matching Junos "set replaces"),
+  and the typed compiler (`compiler_ipsec.go`) reads them last-wins too —
+  silently dropping every prefix but the last even though each passes the
+  #4098 value gate. `validateIPsecTrafficSelectorsStrict`
+  (`pkg/config/compiler_ipsec_trafficselector.go`) now REJECTS a duplicate at
+  strict commit / commit-check (lenient-warn on load / peer-sync, #1960) so
+  the truncation is operator-visible instead of a selector that enforces only
+  its last prefix.
 - **DPD (dead-peer detection).** A `dead-peer-detection` stanza on an IKE
   gateway is compiled by `parseDeadPeerDetectionNode` (`pkg/config`
   `compiler_ipsec.go`) into `gw.DPDEnable` + mode/interval/threshold, and

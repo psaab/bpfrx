@@ -1,3 +1,31 @@
+## 2026-07-12 — #5692 (bug): reject duplicate IPsec traffic-selector local-ip/remote-ip leaves
+- **Timestamp**: 2026-07-12 (fix/5692-ipsec-selector-accumulate)
+- **Action**: codex-review-182 M13. Repeated valid `traffic-selector <ts>
+  local-ip`/`remote-ip` leaves under ONE selector pass the #4098 admission gate
+  (each is a well-formed CIDR) but the typed compiler (compiler_ipsec.go
+  traffic-selector loop) reads them last-wins, silently dropping every prefix
+  but the last. Confirmed the AST behavior: the hierarchical / load-merge /
+  HA-config-sync parse path KEEPS the repeated sibling leaves (admission
+  validates all, compile truncates), while the flat-set commit path collapses
+  them last-wins in SetPath (Junos "set replaces" for a single-value leaf — no
+  duplicate ever reaches the compiler). DECISION: REJECT, not accumulate —
+  Junos models each traffic-selector as exactly one local-ip + one remote-ip
+  (schema_security.go documents the LEAF-COMPLETE single-value grammar), and
+  multiple prefixes are the Junos way expressed as separate NAMED
+  traffic-selectors (already accumulated into the map + rendered as separate
+  swanctl children by effectiveTrafficSelectors). Accumulating would invent a
+  non-Junos multi-value local-ip AND diverge flat-set (SetPath-collapsed to
+  last) from hierarchical (accumulated), breaking the dual-AST-identical
+  contract. Extended validateIPsecTrafficSelectorsStrict to count local-ip /
+  remote-ip VALUES per selector (via the same trafficSelectorValues the #4098
+  gate uses) and reject when > 1 — strict commit / commit-check, lenient-warn on
+  load/peer-sync (#1960; the compiler's last-wins keeps a leniently-loaded dup
+  inert, now flagged). Fail-on-revert proven: neutering the value-count reject
+  makes the hierarchical dup tests go RED; flat-set last-wins + multi-named
+  selectors still compile.
+- **File(s)**: pkg/config/compiler_ipsec_trafficselector.go,
+  pkg/config/compiler_ipsec_ts_dup_5692_test.go, pkg/ipsec/README.md
+
 ## 2026-07-12 — #5694 (bug): reject malformed chassis RG/node identities at commit (alias-to-0)
 - **Timestamp**: 2026-07-12 (fix/5694-chassis-identity-validate)
 - **Action**: codex-review-182 M15. compileChassis parses a

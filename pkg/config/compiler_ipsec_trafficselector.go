@@ -6,8 +6,12 @@ import (
 	"strings"
 )
 
-// compiler_ipsec_trafficselector.go carries the #4098 reject-at-commit gate
-// for IPsec `traffic-selector local-ip / remote-ip` values.
+// compiler_ipsec_trafficselector.go carries two reject-at-commit gates for
+// IPsec `traffic-selector local-ip / remote-ip` values, both in
+// validateIPsecTrafficSelectorsStrict: the #4098 swanctl-injection value gate
+// (below) and the #5692 duplicate-selector gate (repeated local-ip / remote-ip
+// leaves under one traffic-selector pass admission but the compiler keeps only
+// the last — see the inline note at the value-count loop).
 //
 // The defect: `security ipsec vpn <name> traffic-selector <ts> local-ip` and
 // `remote-ip` are free-form 1-arg strings (schema_security.go). The IPsec
@@ -78,12 +82,30 @@ func validateIPsecTrafficSelectorsStrict(nodes []*Node, lenient bool) ([]string,
 		return forEachChild(security.Children, "ipsec", func(ipsec *Node) error {
 			for _, vpnInst := range namedInstances(ipsec.FindChildren("vpn")) {
 				for _, tsInst := range namedInstances(vpnInst.node.FindChildren("traffic-selector")) {
+					// #5692: count local-ip / remote-ip VALUES across all such
+					// leaves in the selector. Junos models each as a SINGLE-value
+					// leaf (schema_security.go: the traffic-selector grammar is
+					// exactly one `local-ip <prefix>` and one `remote-ip <prefix>`),
+					// but the hierarchical / load-merge / HA-config-sync parse path
+					// keeps REPEATED sibling leaves (the flat-set path collapses them
+					// last-wins in SetPath). The typed compiler
+					// (compiler_ipsec.go traffic-selector loop) reads them last-wins
+					// too, so every prefix but the last is SILENTLY dropped — even
+					// though each passed this admission gate. Reject so the operator
+					// sees the truncation instead of a selector that enforces only
+					// its last prefix. Multiple prefixes are expressed the Junos way,
+					// as SEPARATE named traffic-selectors (each renders its own
+					// swanctl child — effectiveTrafficSelectors), which are already
+					// accumulated correctly.
+					valueCounts := map[string]int{}
 					for _, leaf := range tsInst.node.Children {
 						leafName := leaf.Name()
 						if leafName != "local-ip" && leafName != "remote-ip" {
 							continue
 						}
-						for _, val := range trafficSelectorValues(leaf) {
+						vals := trafficSelectorValues(leaf)
+						valueCounts[leafName] += len(vals)
+						for _, val := range vals {
 							if reason := trafficSelectorValueReject(val); reason != "" {
 								if err := emit(
 									"security ipsec vpn %q traffic-selector %q %s %q %s "+
@@ -97,6 +119,23 @@ func validateIPsecTrafficSelectorsStrict(nodes []*Node, lenient bool) ([]string,
 								); err != nil {
 									return err
 								}
+							}
+						}
+					}
+					// Deterministic leaf order for the first-error (strict) path.
+					for _, leafName := range []string{"local-ip", "remote-ip"} {
+						if valueCounts[leafName] > 1 {
+							if err := emit(
+								"security ipsec vpn %q traffic-selector %q specifies %d %s "+
+									"prefixes, but Junos allows exactly ONE %s per "+
+									"traffic-selector; the compiler keeps only the LAST and "+
+									"silently drops the earlier prefix(es) even though each "+
+									"passed admission — express multiple prefixes as separate "+
+									"named traffic-selectors (each renders its own SA child), "+
+									"#5692",
+								vpnInst.name, tsInst.name, valueCounts[leafName], leafName, leafName,
+							); err != nil {
+								return err
 							}
 						}
 					}
