@@ -46517,3 +46517,7 @@ top.
 - **Timestamp**: 2026-07-11
 - **Action**: Fix parseNextTableInstance dotted-instance truncation (#5632) — strings.Index → strings.LastIndex so a routing-instance name containing ".inet" keeps its full identity; add fail-on-revert unit test.
 - **File(s)**: pkg/config/compiler_routing.go, pkg/config/compiler_routing_nexttable_5632_test.go
+
+- **Timestamp**: 2026-07-11
+- **Action**: Harden configstore ReadConfirm against degenerate pending-confirm records (#5637, codex-review-181 M29). A plaintext/encrypted `null` or `{}` confirm.json decoded into a zero-value confirmRecord with NO error (zero Deadline, nil PrevTree); recoverPendingConfirmLocked then read time.Now().After(zeroTime) as an "expired" window and synthesized a rollback to an EMPTY prev tree, wiping the just-loaded active config to policy-absent (fail-open) on boot. Added requireJSONObject (rejects null/array/scalar) BEFORE decode, plus zero-Deadline and nil-PrevTree field checks AFTER decode — mirrors the #5474 readTreeMeta hardening. A rejected read is fail-closed (recovery logs + skips restore, keeps loaded active config, no panic). Valid records (real future deadline + non-nil PrevTree, including the first-commit empty-bootstrap case) round-trip unchanged. New fail-on-revert test proven RED-on-revert (null/{}/impossible-field subtests, plaintext + encrypted). README updated.
+- **File(s)**: pkg/configstore/db.go, pkg/configstore/configstore_readconfirm_validate_5637_test.go, pkg/configstore/README.md
