@@ -95,6 +95,24 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5636 empty-api-auth-secret gate. Strict on commit / commit-check
+	// (hard-reject an api-auth stanza with an empty Basic password or empty
+	// api-key — a quoted-empty secret authenticates any request presenting the
+	// empty value, an auth bypass on an off-loopback bind); lenient on load /
+	// peer-sync (warn so an already-persisted config still boots — #1960; the
+	// daemon drops the empty credential at runtime wiring and the middleware
+	// rejects an empty configured secret). Runs BEFORE the #4047 gate so the
+	// precise empty-secret diagnosis wins over the more general "no api-auth"
+	// message when a stanza is present but carries only empty secrets.
+	if err := validateAPIAuthNoEmptySecretsStrict(cfg); err != nil {
+		if opts.lenientWebManagementAuth {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("web-management api-auth (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #4047 web-management REST-auth gate. Strict on commit / commit-check
 	// (hard-reject a web-management config that binds the unauthenticated REST /
 	// config API off-loopback without api-auth — exposing the mutating config

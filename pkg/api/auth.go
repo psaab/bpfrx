@@ -80,7 +80,16 @@ func checkAuthorization(auth string, cfg AuthConfig) bool {
 		// timing gap between a known and an unknown username.
 		expected, exists := cfg.Users[user]
 		passMatch := subtle.ConstantTimeCompare([]byte(pass), []byte(expected)) == 1
-		return exists && passMatch
+		// #5636: an EMPTY configured password is not a valid credential —
+		// reject it regardless of what the request presents. A quoted-empty
+		// api-auth secret can slip through a lenient config load; without this
+		// guard `username:` (empty password) matches an empty stored secret and
+		// authenticates, an auth bypass on an off-loopback bind. The
+		// constant-time compare above still runs unconditionally, so the
+		// known/unknown-user timing profile from #4157 is preserved (the added
+		// `expected != ""` branch is keyed only on the configured secret, a
+		// deployment constant, not on attacker-controlled request content).
+		return exists && expected != "" && passMatch
 	}
 
 	return false
@@ -104,7 +113,12 @@ func constantTimeAPIKeyMatch(cfg AuthConfig, presented string) bool {
 	presentedBytes := []byte(presented)
 	match := 0
 	for key, valid := range cfg.APIKeys {
-		if !valid {
+		// #5636: never match an EMPTY configured api-key. An empty api-key is
+		// not a valid credential — matching it would authenticate a request
+		// presenting an empty Bearer / X-API-Key token. The skip is keyed only
+		// on the configured key set (a deployment constant), so it does not add
+		// a request-dependent timing signal (#4157).
+		if !valid || key == "" {
 			continue
 		}
 		match |= subtle.ConstantTimeCompare(presentedBytes, []byte(key))
