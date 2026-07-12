@@ -1678,6 +1678,21 @@ type compileOpts struct {
 	// Duplicate `then` CONTAINERS remain #3850 last-wins (the gate counts the
 	// winning block only). Same doctrine as lenientNATMixedScope.
 	lenientNATTerminalAction bool
+	// lenientInterfaceUnitAliasCollisions (#5631, codex-review-181 M23)
+	// downgrades the numeric interface-unit alias reject
+	// (validateInterfaceUnitAliasCollisionsAST) from a hard compile error to a
+	// cfg.Warnings entry. Two distinct unit spellings under one interface that
+	// canonicalize to the same logical unit (e.g. `unit 00` and `unit 0`)
+	// collide on `ifc.Units[unitNum]` with last-writer-wins for the unit
+	// filter but append-only accumulation for the interface tunnel addresses —
+	// so the winning firewall filter and the surviving tunnel addresses depend
+	// on config order (a fail-open on the security filter). The strict commit /
+	// commit-check path hard-rejects so the operator collapses the aliases; the
+	// tolerant load / peer-sync paths downgrade to a warning so an already-
+	// persisted or peer-synced config an older binary accepted still BOOTS
+	// (#1960 fail-closed-on-load class). Same doctrine as
+	// lenientUnsupportedInterfaceStanzas.
+	lenientInterfaceUnitAliasCollisions bool
 
 	// lenientEventWithinTrigger (#3751) downgrades the event-options
 	// within/trigger numeric gate (validateEventOptionsWithinAST) from a hard
@@ -1871,6 +1886,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
 		lenientNATTerminalAction:               true,
+		lenientInterfaceUnitAliasCollisions:    true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
@@ -1924,13 +1940,85 @@ func validateWebManagementAuthStrict(cfg *Config) error {
 	if len(binds) == 0 {
 		return nil // loopback bind (default) — safe without auth
 	}
-	authed := wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0)
+	// #5636: an EMPTY Basic password or empty api-key is NOT a valid
+	// credential — a quoted-empty secret (`password ""` / `api-key ""`) parses
+	// as a credential row but authenticates any request that presents the empty
+	// value, so it must not satisfy the off-loopback auth gate. Count only
+	// USABLE (non-empty) credentials here; the daemon runtime wiring
+	// (daemon_run.go) and the API middleware (pkg/api/auth.go) independently
+	// drop/reject empty secrets, and validateAPIAuthNoEmptySecretsStrict rejects
+	// the empty secret outright at strict commit.
+	authed := apiAuthHasUsableCredential(wm.APIAuth)
 	if authed {
 		return nil
 	}
 	return fmt.Errorf(
 		"system services web-management binds the REST/config API off-loopback (%s) without api-auth — the REST API is UNAUTHENTICATED, so an off-loopback bind exposes the mutating config endpoints (set / commit / rollback / system action) to the network; configure `set system services web-management api-auth {user <name> password <pw> | api-key <key>}` or remove the interface binding to keep the API on loopback (#4047)",
 		strings.Join(binds, ", "))
+}
+
+// apiAuthHasUsableCredential reports whether an api-auth stanza carries at
+// least one NON-EMPTY credential: a user with a non-empty password, or a
+// non-empty api-key. An empty Basic password or empty api-key is never a valid
+// credential — wiring it would let a request presenting `username:` (no
+// password) or an empty Bearer/X-API-Key token authenticate — so it must not
+// count as "authenticated" for the off-loopback bind gate (#5636). Mirrors the
+// runtime credential wiring in daemon_run.go and the empty-secret rejection in
+// pkg/api/auth.go.
+func apiAuthHasUsableCredential(a *APIAuthConfig) bool {
+	if a == nil {
+		return false
+	}
+	for _, u := range a.Users {
+		if u != nil && u.Password != "" {
+			return true
+		}
+	}
+	for _, k := range a.APIKeys {
+		if k != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// validateAPIAuthNoEmptySecretsStrict rejects a `system services web-management
+// api-auth` stanza that carries an EMPTY Basic password or an EMPTY api-key. A
+// quoted-empty secret (`password ""` / `api-key ""`) parses as a real
+// credential row: without this gate the compiler stores it, daemon_run.go wires
+// it into the runtime AuthConfig, and the middleware's constant-time compare
+// matches a request that presents the empty value (`username:` with no
+// password, or a `Bearer `/empty X-API-Key token). On an OFF-loopback bind that
+// is an authentication bypass — any reachable client authenticates with an
+// empty secret (#5636, codex-review-181 M28). An empty secret is never a valid
+// credential regardless of bind, so reject it at strict commit / commit-check.
+// Downgraded to a warning on the tolerant load / peer-sync path
+// (lenientWebManagementAuth) so an already-persisted config still BOOTS (#1960);
+// the empty credential is independently dropped at runtime wiring
+// (daemon_run.go) and rejected by the middleware (pkg/api/auth.go), so it never
+// becomes an active credential.
+func validateAPIAuthNoEmptySecretsStrict(cfg *Config) error {
+	if cfg == nil || cfg.System.Services == nil || cfg.System.Services.WebManagement == nil {
+		return nil
+	}
+	wm := cfg.System.Services.WebManagement
+	if wm.APIAuth == nil {
+		return nil
+	}
+	for _, u := range wm.APIAuth.Users {
+		if u != nil && u.Password == "" {
+			return fmt.Errorf(
+				"system services web-management api-auth user %q has an empty password — an empty Basic secret is not a valid credential and would authenticate any request presenting `%s:` with no password (an auth bypass on an off-loopback bind); set a non-empty password or remove the user (#5636)",
+				u.Username, u.Username)
+		}
+	}
+	for _, k := range wm.APIAuth.APIKeys {
+		if k == "" {
+			return fmt.Errorf(
+				"system services web-management api-auth has an empty api-key — an empty api-key is not a valid credential and would authenticate any request presenting an empty Bearer / X-API-Key token (an auth bypass on an off-loopback bind); set a non-empty api-key or remove it (#5636)")
+		}
+	}
+	return nil
 }
 
 func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
@@ -2144,6 +2232,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDNATToScope:                     true,
 		lenientNATMixedScope:                   true,
 		lenientNATTerminalAction:               true,
+		lenientInterfaceUnitAliasCollisions:    true,
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,

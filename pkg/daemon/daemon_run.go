@@ -1401,14 +1401,34 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 				Users:   make(map[string]string),
 				APIKeys: make(map[string]bool),
 			}
+			// #5636: never wire an EMPTY Basic password or empty api-key into
+			// the runtime AuthConfig. A quoted-empty secret parses as a real
+			// credential row but is not a valid credential — wiring it would let
+			// a request presenting `username:` (no password) or an empty
+			// Bearer / X-API-Key token authenticate, an auth bypass on an
+			// off-loopback bind. The commit gate rejects such a config, but an
+			// already-persisted / peer-synced config is lenient-loaded (#1960),
+			// so drop the empty credential here too (defense in depth; the
+			// middleware also rejects an empty configured secret).
 			for _, u := range wm.APIAuth.Users {
-				authCfg.Users[u.Username] = u.Password.Reveal()
+				if pw := u.Password.Reveal(); pw != "" {
+					authCfg.Users[u.Username] = pw
+				}
 			}
 			for _, k := range wm.APIAuth.APIKeys {
-				authCfg.APIKeys[k.Reveal()] = true
+				if key := k.Reveal(); key != "" {
+					authCfg.APIKeys[key] = true
+				}
 			}
-			apiCfg.Auth = authCfg
-			slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))
+			// Only enable auth when at least one USABLE credential survived; an
+			// all-empty api-auth stanza leaves apiCfg.Auth nil so the #4047
+			// runtime clamp still pulls a non-loopback bind back to loopback.
+			if len(authCfg.Users) > 0 || len(authCfg.APIKeys) > 0 {
+				apiCfg.Auth = authCfg
+				slog.Info("HTTP API authentication enabled", "users", len(authCfg.Users), "api_keys", len(authCfg.APIKeys))
+			} else {
+				slog.Warn("HTTP API api-auth configured with only empty secrets; ignoring (no valid credential) — #5636")
+			}
 		}
 	}
 

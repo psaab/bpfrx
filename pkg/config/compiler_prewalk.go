@@ -442,6 +442,25 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 		return nil, err
 	}
 
+	// #5631 (codex-review-181 M23) numeric interface-unit alias gate. Two
+	// distinct unit spellings under one interface that canonicalize to the
+	// same logical unit (`unit 00` and `unit 0`) collide on
+	// `ifc.Units[unitNum]` with last-writer-wins for the unit filter but
+	// append-only accumulation for the interface tunnel addresses — so the
+	// winning firewall filter and the surviving tunnel addresses depend on
+	// config order (a fail-open on the security filter). Runs on the group-
+	// expanded, inactive-pruned tree (apply-groups / interface-range aliases
+	// covered; `inactive:` units ignored) and AFTER expandInterfaceRanges so a
+	// range member's unit alias is seen. Strict (commit / commit-check):
+	// hard-reject naming the interface, spellings, and canonical unit. Lenient
+	// (load / peer-sync): warn so an already-persisted or peer-synced config an
+	// older binary accepted still boots (#1960).
+	unitAliasWarnings, err := validateInterfaceUnitAliasCollisionsAST(
+		tree.Children, opts.lenientInterfaceUnitAliasCollisions)
+	if err != nil {
+		return nil, err
+	}
+
 	var warnings []string
 	warnings = append(warnings, ctrlCharWarnings...)
 	warnings = append(warnings, trackWarnings...)
@@ -467,5 +486,6 @@ func runPreWalkGates(tree *ConfigTree, opts compileOpts) ([]string, error) {
 	warnings = append(warnings, policyMissingMatchWarnings...)
 	warnings = append(warnings, dnatToScopeWarnings...)
 	warnings = append(warnings, natMixedScopeWarnings...)
+	warnings = append(warnings, unitAliasWarnings...)
 	return warnings, nil
 }

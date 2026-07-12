@@ -46552,3 +46552,40 @@ top.
 - **Timestamp**: 2026-07-11
 - **Action**: Harden configstore ReadConfirm against degenerate pending-confirm records (#5637, codex-review-181 M29). A plaintext/encrypted `null` or `{}` confirm.json decoded into a zero-value confirmRecord with NO error (zero Deadline, nil PrevTree); recoverPendingConfirmLocked then read time.Now().After(zeroTime) as an "expired" window and synthesized a rollback to an EMPTY prev tree, wiping the just-loaded active config to policy-absent (fail-open) on boot. Added requireJSONObject (rejects null/array/scalar) BEFORE decode, plus zero-Deadline and nil-PrevTree field checks AFTER decode — mirrors the #5474 readTreeMeta hardening. A rejected read is fail-closed (recovery logs + skips restore, keeps loaded active config, no panic). Valid records (real future deadline + non-nil PrevTree, including the first-commit empty-bootstrap case) round-trip unchanged. New fail-on-revert test proven RED-on-revert (null/{}/impossible-field subtests, plaintext + encrypted). README updated.
 - **File(s)**: pkg/configstore/db.go, pkg/configstore/configstore_readconfirm_validate_5637_test.go, pkg/configstore/README.md
+
+- **Timestamp**: 2026-07-11
+- **Action**: Fix #5636 (codex-review-181 M28, High) — a quoted-empty Basic
+  secret parsed as a VALID credential on an off-loopback bind (auth bypass).
+  Root was BOTH layers: (a) the compiler stored a `password ""` / `api-key ""`
+  as a real credential row AND the #4047 off-loopback gate's "authenticated"
+  predicate counted it (`len(Users)>0`), so the bind committed; the daemon then
+  wired the empty secret into the runtime AuthConfig. (b) the middleware's
+  constant-time compare matched a request presenting `username:` (empty
+  password) or an empty `Bearer `/X-API-Key token. Closed at three layers:
+  (1) compiler — new `validateAPIAuthNoEmptySecretsStrict` hard-rejects any
+  empty api-auth secret at strict commit (warns on the lenient load/peer-sync
+  path, #1960), and the #4047 gate now counts only NON-empty credentials via
+  `apiAuthHasUsableCredential`; (2) daemon_run.go drops empty passwords/api-keys
+  and leaves `apiCfg.Auth` nil when nothing usable survives (so the part-B clamp
+  pulls a leniently-loaded off-loopback bind back to loopback); (3) middleware
+  treats an empty configured secret as no valid credential (`checkAuthorization`
+  requires `expected != ""`, `constantTimeAPIKeyMatch` skips an empty key) — the
+  constant-time compare still runs unconditionally, preserving the #4157 timing
+  profile.
+- **File(s)**: pkg/config/compiler.go (apiAuthHasUsableCredential +
+  validateAPIAuthNoEmptySecretsStrict + #4047 authed predicate),
+  pkg/config/compiler_uniformgates.go (wire the new strict/lenient gate),
+  pkg/daemon/daemon_run.go (drop empty secrets at runtime wiring),
+  pkg/api/auth.go (empty-secret rejection in checkAuthorization +
+  constantTimeAPIKeyMatch), pkg/config/api_auth_empty_secret_5636_test.go,
+  pkg/api/auth_empty_secret_5636_test.go, docs/architecture.md.
+- **Validation**: `go build ./...` clean; `go test ./pkg/api/... ./pkg/config/...
+  ./pkg/daemon/...` green; gofmt clean. RED-on-revert proven at BOTH fix layers:
+  reverting the compiler `authed` count + neutering the strict validator makes
+  all six config tests FAIL (empty secret commits with nil error / no lenient
+  warning); reverting the two middleware guards makes the three api tests FAIL
+  (empty password → 200, empty api-key matched). Restoring each → GREEN.
+
+- **Timestamp**: 2026-07-11
+  - **Action**: #5631 (M23, codex-review-181) — reject numeric interface-unit aliases at commit. compileInterfaces split `unit 00` and `unit 0` into two named instances then canonicalized each via strconv.Atoi AFTER, so they collided on ifc.Units[0] with last-writer-wins for the unit firewall filter but append-only accumulation for the interface-level tunnel addresses — order-dependent filter/address ownership (fail-open on the security filter) with stale tunnel addresses surviving. Chose reject-at-commit (option b): Junos treats a unit as an integer identity and no valid config carries two numeric aliases with different security state, so an arbitrary winner is unsafe. Added validateInterfaceUnitAliasCollisionsAST (strict-reject / lenient-warn AST pre-walk in runPreWalkGates, mirroring validateUnsupportedInterfaceStanzasAST) + lenientInterfaceUnitAliasCollisions opt. Non-colliding units bit-identical. Fail-on-revert tests proven RED (both config orders reject identically = order-independent; lenient-warn). Reconciled the #1910 tunnelid duplicate-spelling test (now #5631-rejected; the pre-expansion #1873 tunnel-id gate rejects the tunnel-on-winning-instance variant first).
+  - **File(s)**: pkg/config/compiler_interface_unit_alias.go, pkg/config/compiler_prewalk.go, pkg/config/compiler.go, pkg/config/interface_unit_alias_5631_test.go, pkg/config/tunnelid_test.go, docs/config-schema.md
