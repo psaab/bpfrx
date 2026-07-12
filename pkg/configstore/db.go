@@ -210,7 +210,25 @@ func (db *DB) WriteConfirm(rec *confirmRecord) error {
 }
 
 // ReadConfirm loads the pending commit-confirmed state, or (nil, nil) if none
-// is persisted (#4577).
+// is persisted (#4577). A GENUINELY ABSENT record is not an error — the
+// no-confirm-pending path returns (nil, nil).
+//
+// A record that is PRESENT but structurally or semantically DEGENERATE is
+// rejected with an error rather than returned as a valid pending confirm
+// (#5637, codex-review-181 M29). This mirrors the #5474 readTreeMeta hardening:
+// json.Unmarshal of a top-level `null` (or `{}`) into *confirmRecord SUCCEEDS
+// and yields a ZERO-VALUE record — Deadline is the zero time and PrevTree is
+// nil. recoverPendingConfirmLocked would then read time.Now().After(zeroTime)
+// as TRUE (an "expired" window) and synthesize a rollback to an EMPTY prev
+// tree, silently WIPING the just-loaded active config to policy-absent
+// (fail-open) on boot; or, inside a live window, re-arm a timer off a bogus
+// deadline. requireJSONObject alone is insufficient — `{}` is a valid object
+// yet carries no usable deadline/target — so both the raw-shape gate AND a
+// decoded field check are required.
+//
+// recoverPendingConfirmLocked already treats a read error as fail-closed (log
+// + skip restore, keep the loaded active config, never panic), so a degenerate
+// record can no longer drive a bogus empty rollback.
 func (db *DB) ReadConfirm() (*confirmRecord, error) {
 	data, err := os.ReadFile(db.confirmPath())
 	if err != nil {
@@ -223,9 +241,32 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decrypt confirm state: %w", err)
 	}
+	// Reject a null/array/scalar top-level body BEFORE decoding: a literal
+	// `null` decodes into a zero-value confirmRecord with NO error (#5637). The
+	// encrypted write path always inner-marshals a struct to an object, so this
+	// only rejects genuinely malformed plaintext/decrypted state, never a
+	// legitimately-written record.
+	if err := requireJSONObject(data); err != nil {
+		return nil, fmt.Errorf("parse confirm state: %w", err)
+	}
 	rec := &confirmRecord{}
 	if err := json.Unmarshal(data, rec); err != nil {
 		return nil, fmt.Errorf("parse confirm state: %w", err)
+	}
+	// A structurally-valid object can still be semantically degenerate — `{}`
+	// decodes with a zero Deadline and a nil PrevTree. A pending confirm without
+	// a deadline is meaningless (the zero time is always "already expired", so
+	// recovery would immediately roll back), and one without a rollback target
+	// would revert to an empty tree. A legitimately-written record ALWAYS has a
+	// real future deadline (time.Now().Add(window)) and a non-nil PrevTree
+	// (confirmPrevTree = s.active.Clone(), non-nil even for a first commit —
+	// FirstCommit distinguishes the empty-bootstrap case), so rejecting these
+	// degenerate shapes never touches a valid record.
+	if rec.Deadline.IsZero() {
+		return nil, fmt.Errorf("parse confirm state: pending commit-confirmed record has no deadline")
+	}
+	if rec.PrevTree == nil {
+		return nil, fmt.Errorf("parse confirm state: pending commit-confirmed record has no rollback target")
 	}
 	return rec, nil
 }
