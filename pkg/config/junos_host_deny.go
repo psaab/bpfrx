@@ -703,8 +703,17 @@ func junosHostResolveApplications(cfg *Config, tokens []string) (l4 []JunosHostD
 			appAny = true
 			continue
 		}
-		// application-set: OR-expand to member applications.
-		if _, isSet := ResolveApplicationSet(tok, cfg.Applications.ApplicationSets); isSet {
+		// #5677: resolve a user/predefined APPLICATION first, so a user
+		// application shadowing a same-named application-set keeps ITS OWN
+		// ports on this direct host-bound projection. Only OR-expand as an
+		// application-set when the token is NOT an application — mirroring the
+		// app-first precedence of resolveUserspaceApplicationNames and the
+		// #5629/#5664 policy-match / NAT / catalog fixes. Consulting the
+		// application-SET table first (the pre-#5677 bug) mis-resolved a
+		// shadowed user application to the set's members, so the kernel
+		// direct-host DENY projected the wrong ports.
+		_, isApp := ResolveApplication(tok, cfg.Applications.Applications)
+		if _, isSet := ResolveApplicationSet(tok, cfg.Applications.ApplicationSets); !isApp && isSet {
 			members, err := ExpandApplicationSet(tok, &cfg.Applications)
 			if err != nil {
 				ok = false
