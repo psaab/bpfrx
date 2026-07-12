@@ -1,3 +1,33 @@
+## 2026-07-12 — #5699 (bug): reconcile base-vs-unit-0 host-inbound view for one live address
+- **Timestamp**: 2026-07-12 (fix/5699-baseunit0-hostinbound)
+- **Action**: codex-review-182 M22. A non-VLAN unit 0 collapses onto the base
+  netdev (ge-0/0/0.0 → Linux ge-0-0-0), so the base-interface snapshot and the
+  unit-0 snapshot enumerate the SAME live kernel address via buildLinkSnapshot.
+  BuildZoneHostInboundViews groups addresses by (zone, effective-token sig); the
+  base ref keys the address under overrideByIface[base] (physical-level override
+  only) while unit 0 keys it under overrideByIface[base.0] (base ∪ unit-0 merged,
+  #3720). A per-interface host-inbound override on the unit-0 ref made the two
+  sigs diverge, emitting the SINGLE live address into TWO views with conflicting
+  admit sets — the kernel host-inbound chain matches destination address only, so
+  the verdict is order-dependent (deterministic false-deny of the service the
+  unit-0 override opened). Fix (pkg/dataplane/userspace/zones_host_inbound.go):
+  skip the base (physical, no-dot) snapshot's host-inbound address contribution
+  when unit 0 is configured — unit 0 is the authoritative carrier (its merged
+  override matches enforcement + InterfaceHostInboundEffective), so the address
+  resolves to ONE view with the additive zone∪physical∪unit-0 set. PRECEDENCE:
+  unit-0 (merged) wins — the Junos-additive answer. Kept base as sole carrier
+  only when no unit 0 exists (never fail-open). Made buildLinkSnapshot a package
+  var (interfaces.go) so the view builder is unit-testable with an injected base
+  address (the conflict only manifests when the base netdev carries the live
+  addr). Scope: pkg/dataplane/userspace (go dataplane manager / view builder) —
+  NOT config-layer, NOT the daemon nft emission, NOT cluster/VRRP/failover.
+  Fail-on-revert proven (address in 2 conflicting views RED without the skip).
+  Full pkg/dataplane/userspace + pkg/config suites green.
+- **File(s)**: pkg/dataplane/userspace/zones_host_inbound.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/host_inbound_baseunit0_5699_test.go,
+  docs/host-inbound-service-matrix.md
+
 ## 2026-07-12 — #5692 (bug): reject duplicate IPsec traffic-selector local-ip/remote-ip leaves
 - **Timestamp**: 2026-07-12 (fix/5692-ipsec-selector-accumulate)
 - **Action**: codex-review-182 M13. Repeated valid `traffic-selector <ts>

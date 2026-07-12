@@ -190,6 +190,30 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 		if snap.Zone == "" || hostInboundLifelineInterface(snap.Name, lifelines) {
 			continue
 		}
+		// #5699: a PHYSICAL (no-unit) snapshot whose interface has a unit 0
+		// carries the SAME live netdev addresses as that unit-0 snapshot — a
+		// non-VLAN unit 0 collapses onto the base netdev (snapshotLinuxName), so
+		// buildLinkSnapshot(base) and buildLinkSnapshot(unit0-linux) enumerate
+		// the identical kernel addresses. But the base ref keys them under
+		// overrideByIface[base] (base-level override only), while unit 0 keys
+		// them under overrideByIface[base.0] (base ∪ unit-0 override, the
+		// dataplane-additive #3720 resolution). When a per-interface override on
+		// the unit-0 ref makes those two signatures differ, the SINGLE live
+		// address is emitted into TWO views with conflicting admit sets — the
+		// kernel host-inbound chain matches destination address only, so the
+		// verdict is order-dependent (a deterministic false-deny). Unit 0's view
+		// is the authoritative carrier (its merged override matches enforcement),
+		// so skip the base's redundant contribution. Only when unit 0 exists: a
+		// physical interface with no unit 0 (rare bootstrap/DHCP-on-raw-netdev)
+		// keeps the base as the sole carrier so its address is still deny-scoped
+		// (never fail-open).
+		if !strings.Contains(snap.Name, ".") {
+			if ifc := cfg.Interfaces.Interfaces[snap.Name]; ifc != nil {
+				if _, hasUnit0 := ifc.Units[0]; hasUnit0 {
+					continue
+				}
+			}
+		}
 		zone := cfg.Security.Zones[snap.Zone]
 		if !configured(zone) {
 			continue

@@ -418,6 +418,27 @@ operator diagnostic agrees with what the dataplane admits. Before #3720 it read
 only the exact ref and reported "no override / default-deny" for a unit that in
 fact inherited a physical override.
 
+**Base-vs-unit-0 single-address reconciliation (#5699).** A non-VLAN unit 0
+collapses onto the base netdev (`ge-0/0/0.0` → Linux `ge-0-0-0`), so the base
+interface snapshot and the unit-0 snapshot (`buildInterfaceSnapshots`) enumerate
+the IDENTICAL live kernel address through `buildLinkSnapshot`. `BuildZoneHostInboundViews`
+groups addresses by `(zone, effective-token signature)`, and the base ref keys
+its copy under `overrideByIface[ifN]` (physical-level override only) while unit 0
+keys the same address under `overrideByIface[ifN.0]` (the base ∪ unit-0 merged
+override above). A per-interface override on the **unit-0** ref therefore made
+the two signatures diverge, emitting the SINGLE live address into TWO
+host-inbound views with conflicting admit sets. Because the kernel
+`xpf_hostinbound` chain matches destination address only (no ingress-interface
+predicate), whichever view's rule block sorts first decides — a deterministic
+false-deny (the base view's narrower set drops a service the unit-0 override
+opened). The fix skips the base (physical) snapshot's host-inbound address
+contribution when unit 0 is configured: unit 0's snapshot is the authoritative
+carrier (its merged override matches enforcement and `InterfaceHostInboundEffective`),
+so the address resolves to ONE view carrying the additive `zone ∪ physical ∪
+unit-0` admit set. The base snapshot is kept as the sole carrier only when the
+interface has no unit 0 (rare bootstrap / DHCP-on-raw-netdev), so an address is
+never dropped from the deny scope (never fail-open).
+
 **Gate alignment.** The commit-time duplicate-address gate
 (`buildHostInboundOverrideMapLocal` +
 `validateDuplicateHostLocalAddressStrict`, `pkg/config/dup_host_local_address.go`)
