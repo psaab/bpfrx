@@ -505,8 +505,15 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	var baselineSingle *monitoriface.Snapshot
 	prevAll := make(map[string]*monitoriface.Snapshot)
 
+	// statusReader is the shared, coalescing Status() reader (#5707). Summary
+	// mode reads every configured interface each tick and every concurrent stream
+	// runs its own ticker, so binding the per-interface, per-stream snapshot read
+	// to the raw s.userspaceDataplaneStatus would issue O(interfaces*streams)
+	// control-socket queries per tick. The Server-wide cache fans one query out
+	// to all callers within a poll window, keeping the load O(1) per tick.
+	statusReader := s.monitorStatusReader()
 	readSnap := func(name string) *monitoriface.Snapshot {
-		snap, err := monitoriface.ReadSnapshot(s.monitorInterfaceDataplane(), s.userspaceDataplaneStatus, name)
+		snap, err := monitoriface.ReadSnapshot(s.monitorInterfaceDataplane(), statusReader, name)
 		if err != nil {
 			return nil
 		}

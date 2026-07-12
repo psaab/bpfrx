@@ -485,8 +485,9 @@ never lock an operator out of a remote box it manages.
   route-based IPs bound to it, carried no traffic (cross-module false
   convergence). It now RETURNS an `errors.Join` of its sub-stage failures;
   `applyConfigLocked` captures it (`ifaceErr`) and threads it into the tail
-  `errors.Join(networkdErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr,
-  ifaceErr)`, so a genuine reconcile failure fails the commit closed. The
+  `errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err,
+  ipsecErr, ifaceErr)` (`applyErr` = the #5679 ordinary dataplane-apply
+  failure, below), so a genuine reconcile failure fails the commit closed. The
   underlying managers keep their idempotency (`xfrmManager.Apply` adopts an
   already-exists link and treats an already-gone delete as success #4901/#5261;
   `bondManager` #4823/#5119), so a benign re-apply still returns `nil` — this is
@@ -497,6 +498,30 @@ never lock an operator out of a remote box it manages.
   the `applyTailReconciles` commit-join wiring proof) plus
   `pkg/routing/xfrm_apply_failclosed_5310_test.go` (the routing-side
   `xfrmManager.Apply` returns-error / tolerates-already-exists half).
+  **Ordinary dataplane-apply fail-closed (#5679, mirroring the above):** the
+  main config-apply's full dataplane push (`applyDataplaneAndHACore` →
+  `d.dp.ApplyConfig`) split its error into two classes but ACTED on only one.
+  A required-protocol-gate error (`compileErrorMustAbortApply`) DISARMS the
+  dataplane and returns early (terminal `err`, commit fails, peer sync skipped).
+  But an ORDINARY (non-abort) apply failure — a control-socket / helper hiccup
+  that leaves the OLD compiled policy live and forwarding — only called
+  `recordCompileFailure` (for `/health`) and then FELL THROUGH: `applyConfigLocked`
+  returned `nil` and the commit reported SUCCESS while `store.Commit` had already
+  promoted the NEW config, so a tightening commit (e.g. a new deny) looked applied
+  while the looser old policy was still on the wire — a fail-open-to-stale on the
+  main config path (the config-commit analog of the feeds publication-debt bug
+  #5646/#5667). The fix captures that ordinary failure as a DEFERRED commit error
+  (`applyErr`, a fourth named return of `applyDataplaneAndHACore`) threaded into
+  the tail `errors.Join`, so the commit reports FAILURE while the rest of the
+  reconciles still run (fail-closed but complete, exactly like `networkdErr` /
+  `ifaceErr`). It is NOT demoted to abort: the dataplane stays armed with the old
+  config, so `applyErrSkipsPeerSync` still returns `false` and the standby
+  converges (#4034); and because the applied identity never advanced, the feed
+  onUpdate retry (`applyConfigResult`, #5646) and any identical re-commit
+  re-apply and self-heal a transient error. Tests:
+  `apply_failure_failclosed_5679_test.go` (ordinary-apply-fails-commit +
+  wraps-injected + does-not-skip-peer-sync fail-on-revert, plus the abort-class
+  still-early-returns + still-skips-peer-sync guard against over-reach).
   **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
