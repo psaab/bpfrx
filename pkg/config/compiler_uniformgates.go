@@ -1080,6 +1080,28 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5630 IPsec endpoint value gate. An IKE gateway `address` /
+	// `dynamic hostname` / `local-address`, or a VPN `local-address`, is
+	// copied verbatim from a one-argument schema slot into swanctl
+	// `remote_addrs` / `local_addrs`. A printable-but-invalid value (a
+	// malformed IP octet like 10.0.0.999, or a malformed FQDN) is neither a
+	// usable IP nor a valid hostname, so `swanctl --load-all` rejects or
+	// mishandles the generated connection — a config that commits but never
+	// loads (a silently broken tunnel). Strict on commit / commit-check (hard
+	// reject so the operator gets a diagnostic); lenient on load / peer-sync
+	// (warn so a pre-fix or peer-synced config still boots — #1960 fail-
+	// closed-on-load class). Runs on the fully-compiled *Config so both ike{}
+	// and ipsec{} gateway definitions are present regardless of stanza
+	// authoring order. Mirrors validateIPsecGatewayReferencesStrict.
+	if err := validateIPsecEndpointsStrict(cfg); err != nil {
+		if opts.lenientIPsecEndpoints {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec endpoint (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2270 IKE (Phase 1) gateway -> ike-policy -> ike-proposal cross-
 	// reference. A gateway that names an ike-policy whose chain does not
 	// resolve (the policy is undefined, or its `proposals` reference

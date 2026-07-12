@@ -677,5 +677,28 @@ func isPlausibleHostname(s string) bool {
 	if s[len(s)-1] == '-' {
 		return false
 	}
+	// RFC 3696 §2 / RFC 1123 §2.1: the rightmost (top-level) label of a
+	// hostname must not be entirely numeric — that is the rule that
+	// disambiguates a hostname from a dotted-decimal IPv4 literal. A botched
+	// IP such as "10.0.0.999" fails net.ParseIP (999 > 255) yet is otherwise
+	// a run of digit-only labels, so without this gate it masquerades as a
+	// "plausible hostname", passes endpoint validation, and then fails to
+	// resolve when strongSwan loads the generated remote_addrs — a config
+	// that commits but never establishes the tunnel (#5630). Reject an
+	// all-numeric last label. A valid IPv4/IPv6 literal is already accepted
+	// by the net.ParseIP branch in IsUsableIPsecEndpoint before this scan is
+	// reached, so real address literals are unaffected.
+	lastDot := strings.LastIndexByte(s, '.')
+	tld := s[lastDot+1:]
+	allNumeric := true
+	for i := 0; i < len(tld); i++ {
+		if tld[i] < '0' || tld[i] > '9' {
+			allNumeric = false
+			break
+		}
+	}
+	if allNumeric {
+		return false
+	}
 	return true
 }

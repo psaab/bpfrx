@@ -46589,3 +46589,32 @@ top.
 - **Timestamp**: 2026-07-11
   - **Action**: #5631 (M23, codex-review-181) — reject numeric interface-unit aliases at commit. compileInterfaces split `unit 00` and `unit 0` into two named instances then canonicalized each via strconv.Atoi AFTER, so they collided on ifc.Units[0] with last-writer-wins for the unit firewall filter but append-only accumulation for the interface-level tunnel addresses — order-dependent filter/address ownership (fail-open on the security filter) with stale tunnel addresses surviving. Chose reject-at-commit (option b): Junos treats a unit as an integer identity and no valid config carries two numeric aliases with different security state, so an arbitrary winner is unsafe. Added validateInterfaceUnitAliasCollisionsAST (strict-reject / lenient-warn AST pre-walk in runPreWalkGates, mirroring validateUnsupportedInterfaceStanzasAST) + lenientInterfaceUnitAliasCollisions opt. Non-colliding units bit-identical. Fail-on-revert tests proven RED (both config orders reject identically = order-independent; lenient-warn). Reconciled the #1910 tunnelid duplicate-spelling test (now #5631-rejected; the pre-expansion #1873 tunnel-id gate rejects the tunnel-on-winning-instance variant first).
   - **File(s)**: pkg/config/compiler_interface_unit_alias.go, pkg/config/compiler_prewalk.go, pkg/config/compiler.go, pkg/config/interface_unit_alias_5631_test.go, pkg/config/tunnelid_test.go, docs/config-schema.md
+
+## #5630 — IPsec typed endpoints bypass IP/FQDN validation (codex-181 M20)
+- **Timestamp**: 2026-07-11
+- **Action**: Add strict-commit validation for every effective IPsec endpoint
+  (IKE gateway address / dynamic hostname / local-address, and VPN
+  local-address). A printable-but-invalid endpoint (a malformed IP octet like
+  10.0.0.999, or a malformed FQDN) used to pass strict commit and be
+  interpolated verbatim into swanctl remote_addrs/local_addrs, where
+  `swanctl --load-all` rejects/mishandles it — a config that commits but never
+  loads (silently broken tunnel). New validateIPsecEndpointsStrict reuses the
+  existing IsUsableIPsecEndpoint predicate (same one #2074 applies to the inline
+  literal); hardened isPlausibleHostname to reject an all-numeric rightmost
+  label (RFC 3696 §2) so a botched IP like 10.0.0.999 no longer masquerades as a
+  hostname. Strict on commit/commit-check, warn on lenient load/peer-sync
+  (lenientIPsecEndpoints, #1960 doctrine). Valid IPv4/IPv6/FQDN endpoints still
+  commit + render.
+- **File(s)**: pkg/config/compiler_validate_strict_ipsec.go
+  (validateIPsecEndpointsStrict), pkg/config/compiler_ipsec.go
+  (isPlausibleHostname all-numeric-TLD gate), pkg/config/compiler.go
+  (lenientIPsecEndpoints opt + set at both tolerant sites),
+  pkg/config/compiler_uniformgates.go (wire strict/lenient gate),
+  pkg/config/compiler_ipsec_endpoint_5630_test.go,
+  pkg/ipsec/endpoint_render_5630_test.go,
+  docs/pr/5630-ipsec-endpoint-validate/plan.md.
+- **Validation**: `go build ./...` clean; `go test ./pkg/config/... ./pkg/ipsec/...`
+  green; gofmt clean. RED-on-revert proven two ways: (A) neutralizing
+  validateIPsecEndpointsStrict → all reject cases FAIL; (B) reverting the
+  isPlausibleHostname hardening (validator kept) → the 10.0.0.999 / 1.2.3.4.5
+  cases FAIL while structurally-malformed FQDNs stay caught. Restoring → GREEN.
