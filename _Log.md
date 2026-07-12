@@ -1,3 +1,34 @@
+## 2026-07-12 — #5732 (bug): bound composed BGP policy-CHAIN route-map sequences (follow-up to #5701)
+- **Timestamp**: 2026-07-12 (fix/5732-composed-chain-seq-bound)
+- **Action**: Follow-up to #5701/#5731 (my own scope note). The #5701 gate bounds
+  each POLICY-STATEMENT to <= 6552 route-map sequences, but
+  renderComposedRouteMap (pkg/frr) concatenates an ordered BGP `export`/`import
+  [ A B ... ]` chain (#5277) into ONE route-map with a RUNNING seq accumulated
+  across all rendered members. Members that each pass the per-policy gate can
+  still SUM past the FRR ceiling → a `route-map` line past seq 65535 → poisons
+  the whole frr-reload (the #5701 overflow, trivially reached by splitting one
+  oversized policy in two). Fix: (a) new SSOT config.ComposedChainSequenceCount
+  (sum of RouteMapSequenceCount over the chain's members, truncated at the first
+  member with an explicit terminating policy default — mirrors
+  renderComposedRouteMap's stop-on-terminate); (b) commit gate
+  validateBGPComposedChainSequenceBoundStrict (pkg/config/routemap_chain_bound.go)
+  resolves every neighbor's effective export/import chain (mirroring
+  bgpNeighborExportChain / filterDefinedPolicies across default + every VRF
+  BGP), rejects an over-MaxRouteMapSequences chain at commit, warns on tolerant
+  load/peer-sync (reuses lenientPolicyRouteMapSeq, #1960); wired in
+  runUniformGates after the per-policy gate (kept for defense in depth); (c)
+  render belt — renderComposedRouteMap consults the SAME
+  config.ComposedChainSequenceCount predicate (lockstep) and renders NOTHING for
+  an over-ceiling chain on the tolerant path (dangling route-map → permit-all,
+  strictly better than a poisoned reload). Fail-on-revert proven: the concrete
+  repro (two export policies each 3600 seq <= 6552, chain [A B] = 7200 > 6552)
+  is REJECTED by CompileConfig; neutering the chain gate → the CompileReject
+  test goes RED (each member still passes the per-policy gate).
+- **File(s)**: pkg/config/routemap_seq_bound.go (+ComposedChainSequenceCount),
+  pkg/config/routemap_chain_bound.go, pkg/config/routemap_chain_bound_5732_test.go,
+  pkg/config/compiler_uniformgates.go, pkg/frr/policy_render.go,
+  pkg/frr/policy_composed_chain_seqbound_5732_test.go, pkg/frr/README.md
+
 ## 2026-07-12 — #5701 (bug): bound route-map Cartesian expansion against the FRR sequence-number ceiling
 - **Timestamp**: 2026-07-12 (fix/5701-routemap-seqnum-bound)
 - **Action**: codex-review-182 M26. The pkg/frr route-map renderer

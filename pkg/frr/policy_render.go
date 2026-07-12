@@ -2301,6 +2301,24 @@ func (m *Manager) renderRouteMapForPolicy(po *config.PolicyOptionsConfig, emitNa
 // prefix-lists are namespaced by composedName+"-"+policyName so a term name
 // reused across policies cannot fuse two prefix-lists.
 func (m *Manager) renderComposedRouteMap(po *config.PolicyOptionsConfig, composedName string, chain []string) string {
+	// #5732 render-side belt: this composed route-map numbers its members'
+	// sequences with ONE running counter, so a chain whose members each pass the
+	// per-policy #5701 bound can still SUM past the FRR ceiling and emit a
+	// `route-map` line past seq 65535 — poisoning the whole vtysh-batched
+	// frr-reload. The strict commit gate
+	// (config.validateBGPComposedChainSequenceBoundStrict) rejects it; this belt
+	// covers the tolerant load / peer-sync / rollback path (#1960) where that
+	// gate only warns: render NOTHING for the oversized chain (its neighbor
+	// `route-map <composedName> out` then dangles → FRR permit-all, strictly
+	// better than a poisoned reload — the same tradeoff generatePolicyOptions
+	// takes for an over-ceiling single policy, #5701). The gate and this belt
+	// consult the SAME config.ComposedChainSequenceCount predicate, so they can
+	// never disagree on what overflows.
+	if n := config.ComposedChainSequenceCount(po.PolicyStatements, chain); n > config.MaxRouteMapSequences {
+		slog.Warn("skipping oversized composed BGP policy-chain route-map: expansion would overflow FRR sequence numbers and poison the reload",
+			"route-map", composedName, "sequences", n, "max", config.MaxRouteMapSequences)
+		return ""
+	}
 	var b strings.Builder
 	seq := 10
 	terminated := false
