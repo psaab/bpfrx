@@ -1523,9 +1523,12 @@ func natThenTerminalActionCount(then NATThen) int {
 // commits. Strict on commit / commit-check (hard reject so the malformed rule
 // is operator-visible); the caller downgrades to a warning on the tolerant load
 // / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick) — a
-// leniently-loaded actionless rule is inert (installs nothing) and a
-// contradictory one keeps the pre-#5628 field-precedence pick, so the tolerant
-// path is no worse than before the gate. Rule-sets are walked in sorted name
+// leniently-loaded actionless rule is inert (installs nothing), and a
+// contradictory one now records BOTH fields (the else-if→if setter change), so
+// the Rust dataplane's off-precedence governs (off wins → exempt) — unifying
+// the hierarchical path with the pre-existing flat-set both-fields behavior
+// rather than the old Go single-field pick; only a malformed rule reaches this
+// path (the strict commit path rejects it). Rule-sets are walked in sorted name
 // order for a deterministic first-reported offender.
 func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	if cfg == nil {

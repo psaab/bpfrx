@@ -1669,11 +1669,14 @@ type compileOpts struct {
 	// path hard-rejects so the malformed rule is operator-visible; the tolerant
 	// load / peer-sync paths downgrade to a warning so an already-persisted or
 	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
-	// closed-on-load class) — a leniently-loaded actionless rule is inert and a
-	// contradictory one keeps the pre-#5628 field-precedence pick, so the
-	// tolerant path is no worse than before the gate. Duplicate `then`
-	// CONTAINERS remain #3850 last-wins (the gate counts the winning block
-	// only). Same doctrine as lenientNATMixedScope.
+	// closed-on-load class) — a leniently-loaded actionless rule is inert, and a
+	// contradictory one now records BOTH fields (the else-if→if setter change),
+	// so the Rust dataplane's off-precedence governs its resolution (off wins →
+	// exempt), unifying the hierarchical path with the pre-existing flat-set
+	// both-fields behavior rather than the old Go single-field child-order pick.
+	// Only a malformed rule reaches this — the strict commit path rejects it.
+	// Duplicate `then` CONTAINERS remain #3850 last-wins (the gate counts the
+	// winning block only). Same doctrine as lenientNATMixedScope.
 	lenientNATTerminalAction bool
 
 	// lenientEventWithinTrigger (#3751) downgrades the event-options
