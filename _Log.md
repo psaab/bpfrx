@@ -46665,6 +46665,31 @@ top.
   Restoring → GREEN. Normal single active supported-PRF config is
   bit-identical (zero-allocation fast path).
 
+- **Timestamp**: 2026-07-11
+  **Action**: #5629 — route predefined application bundles through the shared
+    predefined-set-aware resolver on the AppID-disabled catalog + both NAT
+    builders. `pkg/appid/runtime.go:CatalogNames.addAppRef`, source-NAT
+    `buildSourceNATAppTerms`, and destination-NAT `buildDestinationNATSnapshots`
+    all gated set expansion on a bare `cfg.Applications.ApplicationSets[name]`
+    membership test (user-defined sets ONLY), so a strict predefined bundle
+    (junos-ms-rpc/junos-sun-rpc/junos-cifs/junos-routing-inbound) referenced by
+    a policy or a SNAT/DNAT `match application` was recorded as a bare app name
+    in the catalog and resolved to ZERO NAT terms (SNAT → natProtoNever, DNAT →
+    #3434 never-match sentinel), silently never translating. Fixed all three to
+    resolve app-first (user then predefined) then via `config.ResolveApplication
+    Set` (user then predefined table, #4102), matching the policy path
+    `resolveUserspaceApplicationNames`. Preserved the #5179 nil-user-set
+    fail-closed error (raw user-map membership retained alongside the
+    predefined-aware lookup) and the app-first shadowing precedence. RED-on-
+    revert proven for all 4 bug tests (catalog bare-name + SNAT/DNAT sentinels);
+    2 bit-identical guards (user-set, user-app-shadow) stay green on both sides.
+    Build + pkg/appid + pkg/config + pkg/dataplane/userspace tests green.
+  **File(s)**: pkg/appid/runtime.go, pkg/dataplane/userspace/nat_source.go,
+    pkg/dataplane/userspace/nat_destination.go,
+    pkg/appid/catalog_predefined_set_5629_test.go,
+    pkg/dataplane/userspace/nat_predefined_set_5629_test.go,
+    docs/services-application-identification.md
+
 ## 2026-07-11 — #5645 feeds first-fetch deny fail-open (codex-review-181)
 - **Timestamp**: 2026-07-11
 - **Action**: Fix fail-open where a direct feed-bound DENY name published as an
@@ -46683,7 +46708,9 @@ top.
   pkg/dataplane/userspace/policies_addrbook.go (buildAddressBookTableWithFeeds
   doc corrected), pkg/dataplane/userspace/feed_enforcement_test.go
   (TestEmptyFeedSnapshotYieldsNoPrefixes docstring corrected),
-  pkg/feeds/README.md (#5645 first-fetch fail-closed section + cold-start line).
+  pkg/config/compiler_validate_strict_observability.go (unknown-feed posture
+  comment corrected for #5645), pkg/feeds/README.md (#5645 first-fetch
+  fail-closed section + cold-start line).
 - **Validation**: `go build ./...` clean; `go test ./pkg/feeds/...
   ./pkg/config/... ./pkg/dataplane/userspace/... ./pkg/daemon/...` green; gofmt
   clean. RED-on-revert proven: reverting the SnapshotForBindings omission guard

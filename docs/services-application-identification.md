@@ -331,6 +331,25 @@ runtime effect is the L3/L4 catalog classification above
   parent set also matches applications defined only in a nested
   child set. (Before #2068 the compiler silently dropped nested
   `application-set` members, so such a policy under-matched.)
+  A referenced set is resolved through `config.ResolveApplicationSet`
+  (user-defined sets first, then the built-in `junos-defaults`
+  bundle table `PredefinedApplicationSets` — junos-ms-rpc,
+  junos-sun-rpc, junos-cifs, junos-routing-inbound, #4102).
+  `CatalogNames` (AppID-disabled catalog) and BOTH NAT snapshot
+  builders (`buildSourceNATAppTerms` / `buildDestinationNATSnapshots`,
+  `pkg/dataplane/userspace/nat_source.go` / `nat_destination.go`)
+  go through that same predefined-set-aware lookup, so a strict
+  predefined bundle named in a security policy OR a source/destination
+  NAT `match application` expands to the SAME member applications on
+  every path. (Before #5629 the catalog and the two NAT builders gated
+  set expansion on a bare `cfg.Applications.ApplicationSets[name]` map
+  membership test, which only sees user-defined sets: a predefined
+  bundle was recorded as a bare app name in the catalog and resolved to
+  ZERO terms in NAT — the SNAT rule failed closed to `natProtoNever`
+  and the DNAT rule to the #3434 never-match sentinel, silently never
+  translating. A user application whose name shadows a predefined-set
+  name still wins — the application is resolved first, matching the
+  policy path `resolveUserspaceApplicationNames`.)
 
 These config paths are accepted with NO runtime effect today
 (parse-only):

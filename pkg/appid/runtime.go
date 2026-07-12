@@ -63,7 +63,35 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 		if appName == "" || appName == "any" {
 			return nil
 		}
-		if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+		// Resolve a reference the SAME way the userspace policy path does
+		// (resolveUserspaceApplicationNames, #4102): an application FIRST (user
+		// then predefined), then an application-SET (user then predefined). The
+		// set test MUST go through config.ResolveApplicationSet, which is
+		// predefined-set-aware — a bare cfg.Applications.ApplicationSets map
+		// membership check only sees USER-defined sets, so a strict predefined
+		// bundle (junos-ms-rpc, junos-sun-rpc, junos-cifs,
+		// junos-routing-inbound) referenced by a policy OR a NAT rule was
+		// recorded as if the bundle NAME were itself an application (#5629). The
+		// dataplane catalog then carried a set name with no resolvable
+		// port/proto, diverging from the resolver's member expansion. Resolving
+		// the application first keeps a user application that shadows a
+		// predefined-set name winning (user definitions win, matching the policy
+		// path); an unknown token still falls through to a bare record so the
+		// catalog and the dataplane agree on the reference.
+		if _, isApp := config.ResolveApplication(appName, cfg.Applications.Applications); isApp {
+			names[appName] = struct{}{}
+			return nil
+		}
+		// A present-but-nil USER set slot (#5179: the tolerant-load / peer-sync
+		// path admits a null value) must still be treated as a set reference so
+		// it fails CLOSED with a deterministic ExpandApplicationSet error rather
+		// than being silently recorded as a bare app name. config.Resolve
+		// ApplicationSet SKIPS a nil slot (returns false), so the raw user-map
+		// membership test is kept for that case; ResolveApplicationSet ADDS the
+		// predefined bundle awareness (#5629) a bare membership test misses.
+		_, inUserSetMap := cfg.Applications.ApplicationSets[appName]
+		_, isSet := config.ResolveApplicationSet(appName, cfg.Applications.ApplicationSets)
+		if inUserSetMap || isSet {
 			expanded, err := config.ExpandApplicationSet(appName, &cfg.Applications)
 			if err != nil {
 				return fmt.Errorf("expand application-set %q: %w", appName, err)
