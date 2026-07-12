@@ -47076,3 +47076,19 @@ top.
   semantics. Fail-on-revert proven (predefined-bundle match RED on the user-only
   gate; shadow test not gate-dependent). Diagnostic simulator only (non-enforcement).
 - **File(s)**: pkg/policymatch/policymatch.go, pkg/policymatch/predefined_set_5666_test.go
+- **Timestamp**: 2026-07-12
+- **Action**: #5707 — coalesce the userspace-dataplane Status() control-socket
+  query for the MonitorInterface streaming path. Each open stream polls 1/s and
+  summary mode reads every configured interface each tick, so binding readSnap
+  to the raw s.userspaceDataplaneStatus issued O(interfaces*streams) Status()
+  calls per tick, contending on the shared helper control socket and starving
+  session installs. Added a Server-wide single-flight, short-TTL status cache
+  (monitorStatusCache, 900ms) that fans one query out to all callers within a
+  poll window, collapsing the fan-out to O(1)/tick regardless of interface or
+  subscriber count. Fail-on-revert proven: 6 concurrent streams → 1 Status()
+  call GREEN, 6 calls RED when reverted to the per-stream fetch. Race-clean.
+- **File(s)**: pkg/grpcapi/monitor_status_cache.go,
+  pkg/grpcapi/monitor_status_cache_test.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_diag_monitor.go,
+  pkg/grpcapi/server_diag_monitor_fanout_5707_test.go,
+  pkg/monitoriface/README.md
