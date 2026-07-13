@@ -47991,3 +47991,25 @@ top.
   MAC ...00:0a, want ...00:0b) + TestResendBurstSkipsOnRefreshFailure_5302 RED
   (burst sent 3 stale RAs, want 0); restored GREEN. Live post-failover
   neighbor-repair verify is cluster-shim-ABI-walled → deferred.
+  **Action**: Fix #5784 — `system archival transfer-interval` (config-minutes)
+  was multiplied by time.Minute with no product-side overflow clamp before
+  time.NewTicker (daemon_archive_timer.go runArchiveTimer). Same class as the
+  just-merged #5723/#5705 (config-interval × time.Unit overflows int64-ns → a
+  non-positive Duration → NewTicker panic → xpfd crash), minutes-scoped. Safe
+  at commit (schema ValidateInteger 1..2880); the residual is the lenient
+  Store.Load / peer-sync ingress, whose `interval <= 0` guard inspects the
+  minutes integer NOT the × time.Minute product. Fix: added
+  config.MaxDurationMinutes (= MaxInt64 / time.Minute, mirroring
+  MaxDurationSeconds) and clampArchiveIntervalMinutes (mirroring
+  clampRPMIntervalSeconds), applied before time.NewTicker. Defense-in-depth;
+  schema bound unchanged. Go-only, minimal.
+  **File(s)**: pkg/config/schema_validators.go,
+  pkg/daemon/daemon_archive_timer.go,
+  pkg/daemon/archive_interval_clamp_5784_test.go (new),
+  pkg/daemon/README.md
+  GREEN: `go test ./pkg/daemon/...` + `./pkg/config/...` pass; gofmt clean on
+  touched files; go vet clean; `go build ./...` clean. Fail-on-revert proven:
+  neutering clampArchiveIntervalMinutes to the raw `time.Duration(min) *
+  time.Minute` product turns the pathological cases RED — the products overflow
+  non-positive (e.g. MaxInt64 → -1m0s, 200000000 → -1790762h...) and
+  time.NewTicker panics "non-positive interval for NewTicker"; restored GREEN.

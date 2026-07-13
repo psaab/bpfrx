@@ -183,6 +183,17 @@ const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
 // invert the damping behaviour).
 const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
 
+// MaxDurationMinutes is the minutes analogue of MaxDurationSeconds: the
+// largest minute count that survives `time.Duration(n) * time.Minute`
+// without int64 overflow (math.MaxInt64 / 6e10 = 153722867). Above this,
+// a configured minute knob converts to a non-positive Duration — e.g. the
+// `system archival transfer-interval` timer's time.NewTicker panics on a
+// non-positive interval (#5784, the minutes straggler of the #5705/#5723
+// config-interval × time.Unit overflow class). Used to clamp minute-
+// denominated runtime intervals whose commit-time schema bound the lenient
+// Store.Load / peer-sync ingress can bypass.
+const MaxDurationMinutes = int64(math.MaxInt64) / int64(time.Minute)
+
 // maxWireU16 / maxWireU32 are the inclusive ceilings for typed leaves
 // whose value lands in a Rust u16 / u32 wire field. #1979 Layer B uses
 // these so the commit-time range gate agrees EXACTLY with the build-time
