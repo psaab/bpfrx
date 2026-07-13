@@ -47324,3 +47324,37 @@ top.
   _Log.md (Edit)
   - **Action**: #5671 — add `&& as != nil` guard to memberIsNestedSet (mirror lookupApplicationSet #5179); a tolerant-loaded present-but-nil app-set slot no longer misclassifies a shadowing leaf application as a nested set (false "not found"). Added fail-on-revert test (RED proven with guard neutralized).
   - **File(s)**: pkg/config/predefined.go, pkg/config/predefined_membernestedset_nilguard_5671_test.go
+
+- **Timestamp**: 2026-07-12
+  - **Action**: #5626 — add strict commit gate rejecting a NAT rule whose
+    `then source-nat pool` / `then destination-nat pool` names an UNDEFINED
+    pool. Was warn-only (`ValidateConfig`, compiler_validate_warn.go:443-481),
+    so a dangling-pool NAT rule committed green and then failed the translation
+    closed at runtime in an order-dependent way (SNAT snapshot builder marks the
+    rule `poolUnusable`/`missing_pool`; DNAT builder drops the rule) — silent
+    no-op. New `validateNATPoolReferencesStrict` (compiler_validate_strict_nat.go)
+    walks SNAT (`cfg.Security.NAT.SourcePools`) + DNAT
+    (`cfg.Security.NAT.Destination.Pools`) rule-sets in sorted name order and
+    hard-rejects on the strict commit/commit-check path; downgraded to a warning
+    on the lenient load/peer-sync path via the shared `lenientDestNATAddresses`
+    flag (#1960 no-brick — the snapshot builders fail closed independently).
+    Removed the warn-only loop from ValidateConfig (subsumed, to avoid a
+    duplicate warning on the lenient path), mirroring the #4515
+    zone-interface-defined precedent. Fixed two pre-existing scope-capture
+    subtests (compiler_nat_scope_3079_test.go) that referenced an undefined DNAT
+    pool "P1" — added the pool definition. Updated parser_ast cross-reference
+    test assertion + stale comment. Fail-on-revert
+    `TestNATPoolReferenceUndefinedRejected_5626` /
+    `TestNATPoolReferenceGate_LenientDowngrade_5626` /
+    `TestNATPoolReferenceDefinedAccepted_5626` (both AST shapes, both NAT kinds)
+    — proved RED by neutralizing the gate to `return nil` (all 6 reject subtests
+    failed), GREEN restored. `go test ./pkg/config/... ./pkg/grpcapi/...
+    ./pkg/api/... ./pkg/dataplane/userspace/... ./pkg/configstore/... ./pkg/cli/...`
+    all green.
+  - **File(s)**: pkg/config/compiler_validate_strict_nat.go (Edit),
+    pkg/config/compiler_uniformgates.go (Edit),
+    pkg/config/compiler_validate_warn.go (Edit),
+    pkg/config/parser_ast_test.go (Edit),
+    pkg/config/compiler_nat_scope_3079_test.go (Edit),
+    pkg/config/compiler_nat_pool_ref_5626_test.go (Write),
+    docs/config-schema.md (Edit), _Log.md (Edit)

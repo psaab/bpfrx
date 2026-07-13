@@ -103,6 +103,10 @@ func TestNATRuleSetScopeCommitsAndIsCaptured(t *testing.T) {
 
 	t.Run("destination from interface", func(t *testing.T) {
 		tree := buildNATScopeTree(t,
+			// #5626: the referenced DNAT pool must be defined or the strict
+			// pool-reference gate rejects — this test asserts SCOPE capture, so
+			// define P1 to keep the config well-formed.
+			"set security nat destination pool P1 address 10.0.0.5/32",
 			"set security nat destination rule-set RD from interface ge-0/0/0.0",
 			"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.5/32",
 			"set security nat destination rule-set RD rule R1 then destination-nat pool P1",
@@ -122,6 +126,9 @@ func TestNATRuleSetScopeCommitsAndIsCaptured(t *testing.T) {
 
 	t.Run("destination from routing-instance", func(t *testing.T) {
 		tree := buildNATScopeTree(t,
+			// #5626: define the referenced DNAT pool so the strict pool-reference
+			// gate does not reject; this subtest asserts RI-scope capture.
+			"set security nat destination pool P1 address 10.0.0.5/32",
 			"set security nat destination rule-set RD from routing-instance blue",
 			"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.5/32",
 			"set security nat destination rule-set RD rule R1 then destination-nat pool P1",

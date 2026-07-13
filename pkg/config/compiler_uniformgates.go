@@ -638,6 +638,31 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5626 source/destination-NAT pool-REFERENCE definedness gate. A NAT rule
+	// whose `then ... pool <name>` names a pool NOT defined under `security nat
+	// source/destination pool` committed cleanly (warn-only) and then failed the
+	// translation closed at runtime in an order-dependent way: the SNAT snapshot
+	// builder marks the rule unusable (missing_pool) and the DNAT builder drops
+	// it (pool lookup misses), so matching traffic is silently left untranslated
+	// and falls through to a later rule or the no-NAT default. Strict on commit /
+	// commit-check (hard-reject so the dangling reference is operator-visible);
+	// lenient on load / peer-sync (downgrade to a warning so a config persisted
+	// before this gate existed still boots — #1960 no-brick; the snapshot
+	// builders independently fail CLOSED, installing nothing). Shares the
+	// lenientDestNATAddresses flag (same NAT silent-drop doctrine). This gate
+	// subsumes the warn-only pool-reference loop that previously lived in
+	// ValidateConfig (it would otherwise emit a duplicate warning alongside the
+	// downgraded gate warning on the lenient path). Runs after the pool-value
+	// gates so a bad pool DEFINITION still wins the first-error slot.
+	if err := validateNATPoolReferencesStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("nat pool reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates

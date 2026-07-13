@@ -604,6 +604,84 @@ func validateSourceNATPoolStrict(cfg *Config) error {
 	return nil
 }
 
+// validateNATPoolReferencesStrict (#5626) hard-rejects a source- or
+// destination-NAT rule whose `then ... pool <name>` names a pool that is NOT
+// defined under `security nat source pool <name>` (SNAT) or `security nat
+// destination pool <name>` (DNAT).
+//
+// A rule referencing an undefined pool committed cleanly — the only feedback
+// was a warn-only advisory (formerly ValidateConfig, now subsumed by this
+// gate) — and then behaved incorrectly at runtime in an ORDER-DEPENDENT way.
+// The SNAT snapshot builder (pkg/dataplane/userspace/nat_source.go) marks the
+// rule poolUnusable with reason "missing_pool" and the DNAT builder
+// (nat_destination.go) drops the rule outright (the pool lookup misses), so
+// the requested translation silently never fires and matching traffic falls
+// through to whatever a later rule or the no-NAT default does. The operator
+// got a green commit for a NAT rule that quietly does nothing.
+//
+// Pool-reference resolution mirrors the snapshot builders EXACTLY: an SNAT
+// `then source-nat pool` name must key cfg.Security.NAT.SourcePools; a DNAT
+// `then destination-nat pool` name must key
+// cfg.Security.NAT.Destination.Pools. A rule with no pool reference (`then ...
+// interface`, `then ... off`, or an empty then) carries PoolName == "" and is
+// out of scope. Static NAT (`then static-nat prefix`) takes a literal address,
+// not a pool reference, so it has nothing to resolve here.
+//
+// Strict on commit / commit-check (hard reject naming the NAT kind, rule-set,
+// rule, and the undefined pool); lenient on load / peer-sync (warn — #1960
+// no-brick; the snapshot builders independently fail CLOSED — SNAT marks the
+// rule unusable, DNAT drops it — so a leniently-loaded config that references a
+// dangling pool installs nothing rather than mis-translating). Shares the
+// lenientDestNATAddresses flag (same NAT silent-drop doctrine as the sibling
+// pool-value gates). Rule-sets are walked in sorted name order (source-first,
+// then destination) for a deterministic first-reported offender. Mirrors
+// validateSourceNATPoolStrict / validateNATSourceAddressNameReferencesStrict.
+func validateNATPoolReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(kind string, rulesets []*NATRuleSet, pools map[string]*NATPool) error {
+		sorted := append([]*NATRuleSet(nil), rulesets...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i] == nil || sorted[j] == nil {
+				return sorted[i] != nil
+			}
+			return sorted[i].Name < sorted[j].Name
+		})
+		for _, rs := range sorted {
+			if rs == nil {
+				continue
+			}
+			for _, rule := range rs.Rules {
+				if rule == nil || rule.Then.PoolName == "" {
+					continue
+				}
+				if _, ok := pools[rule.Then.PoolName]; !ok {
+					return fmt.Errorf(
+						"%s-nat rule-set %q rule %q references undefined pool %q; "+
+							"define `security nat %s pool %s ...` in the same commit — "+
+							"otherwise the rule commits but the dataplane fails the "+
+							"translation closed (the pool lookup misses, so the rule is "+
+							"dropped / marked unusable) and matching traffic is silently "+
+							"left untranslated, falling through to a later rule or the "+
+							"no-NAT default",
+						kind, rs.Name, rule.Name, rule.Then.PoolName, kind, rule.Then.PoolName)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("source", cfg.Security.NAT.Source, cfg.Security.NAT.SourcePools); err != nil {
+		return err
+	}
+	if cfg.Security.NAT.Destination != nil {
+		if err := check("destination", cfg.Security.NAT.Destination.RuleSets, cfg.Security.NAT.Destination.Pools); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateNATSourceAddressNameReferencesStrict hard-rejects a source or
 // destination NAT rule whose `match source-address-name <name>` OR `match
 // destination-address-name <name>` (#3229) names an address-book entry that
