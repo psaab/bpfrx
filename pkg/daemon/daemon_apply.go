@@ -768,6 +768,29 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// before the tail.
 	commitOverlay, networkdErr, applyErr, err := d.applyDataplaneAndHACore(ctx, cfg)
 	if err != nil {
+		// #5643 (M35): applyDataplaneAndHACore bailed at a #2926 ctx-cancellation
+		// boundary (C2 before the dataplane apply, or C3 after it) because the
+		// daemon is stopping mid-apply. Store.Commit ALREADY promoted+persisted
+		// this config UPSTREAM of applyConfigLocked, so the durable config has
+		// advanced, and at C3 the Rust dataplane may already enforce it — but the
+		// nft host-authorization + login/credential tail (applyTailReconciles) has
+		// NOT run. Unlike FRR/IPsec/DHCP/RA/VRRP/syslog/exporters, those owners do
+		// NOT converge on the next boot while the daemon stays intentionally
+		// stopped: the kernel xpf_lo0/xpf_hostinbound nft tables and the OS
+		// login/sudo/root-SSH credentials persist on the box independent of xpfd.
+		// Skipping them here would leave the OLD, more-permissive host
+		// authorization live for the entire stop window — a monotonic-revocation
+		// violation (a committed management-access tightening silently deferred by
+		// the cancel). Run just those security-critical owners to completion —
+		// bounded (two nft loads + local credential reconciles, no FRR/netlink
+		// reload) and non-cancellable — against the committed config before
+		// propagating the cancellation. The non-security tail is intentionally
+		// left to next-boot convergence (the #2926 C3 contract).
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if closeoutErr := d.applyHostAuthorizationCloseout(cfg); closeoutErr != nil {
+				return errors.Join(err, closeoutErr)
+			}
+		}
 		return err
 	}
 
@@ -807,6 +830,45 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// #5696 route-leak republish/FIB-bump failure; the helper creates
 	// lo0Err/hostInboundErr and returns the joined errors.
 	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr)
+}
+
+// applyHostAuthorizationCloseout runs ONLY the security-critical host-
+// authorization owners of the apply tail — the kernel nft lo0/host-inbound
+// filters and the OS login/sudo/root-SSH credential reconciles — against cfg. It
+// is the bounded, non-cancellable closeout invoked from applyConfigLocked when
+// an apply is abandoned at a #2926 ctx-cancellation boundary AFTER Store.Commit
+// promoted the config (#5643 / M35).
+//
+// These owners are singled out from the rest of applyTailReconciles because,
+// unlike FRR/IPsec/DHCP/RA/VRRP/syslog/exporters (which the next boot re-renders
+// from the active config, so the #2926 skip converges), they persist on the box
+// independently of xpfd and therefore do NOT converge while the daemon is
+// intentionally stopped: the kernel xpf_lo0/xpf_hostinbound tables keep enforcing
+// whatever generation was last loaded, and a removed login user / revoked sudo
+// grant / re-enabled root SSH stays on disk. Leaving them at the pre-cancel (more
+// permissive) generation after a committed tightening is the monotonic-revocation
+// violation M35 identifies.
+//
+// The steps mirror applyTailReconciles' step 9.5–12 order exactly. Both nft
+// applies fail closed (#3392/#3333) and their errors are returned; the login
+// reconciles are best-effort voids there and stay so here. The whole closeout is
+// bounded (two atomic nft loads + local file reconciles, no FRR/netlink reload),
+// so it is safe to run non-cancellably on the daemon-stop path.
+func (d *Daemon) applyHostAuthorizationCloseout(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// nft host-authorization: kernel PRIMARY enforcement of lo0 input filter +
+	// zone host-inbound (fail-closed).
+	lo0Err := d.applyLo0Filter(cfg)
+	hostInboundErr := d.applyHostInboundFilter(cfg)
+	// login / credential revocation: OS accounts, stale sudo grants, removed
+	// users' password + authorized_keys, and root-login policy.
+	d.applySystemLogin(cfg)
+	d.reconcileSudoers(cfg)
+	d.reconcileAbsentLoginUsers(cfg)
+	d.applySSHConfig(cfg)
+	return errors.Join(lo0Err, hostInboundErr)
 }
 
 // applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and

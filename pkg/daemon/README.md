@@ -379,6 +379,23 @@ never lock an operator out of a remote box it manages.
   converge. The boot / DHCP / feed applies (`applyConfig`) and the
   confirmed-rollback re-apply (`executeConfirmedRollback`) pass a non-cancellable
   `context.Background()` so they always complete.
+  - **Host-authorization closeout on a post-promotion cancel (#5643 / M35).**
+    The "a skipped tail converges on next boot" reasoning holds for
+    FRR/IPsec/DHCP/RA/VRRP/syslog/exporters, but **not** for the nft
+    host-authorization owners (`applyLo0Filter` / `applyHostInboundFilter`, the
+    kernel `xpf_lo0` / `xpf_hostinbound` PRIMARY enforcement) or the OS
+    login/sudo/root-SSH credential reconciles: those persist on the box
+    independent of xpfd and do **not** converge while the daemon stays
+    intentionally stopped. Since `store.Commit` promotes the config UPSTREAM of
+    `applyConfigLocked`, a C2/C3 cancel that skipped the tail would leave the
+    OLD, more-permissive host authorization live for the whole stop window — a
+    monotonic-revocation violation. So when `applyDataplaneAndHACore` returns a
+    ctx-cancellation, `applyConfigLocked` runs a bounded, non-cancellable
+    `applyHostAuthorizationCloseout(cfg)` (the two nft loads + the
+    login/sudo/absent-user/root-SSH reconciles, in tail order) against the
+    committed config before propagating the cancel. `runShutdownSequence` drains
+    `applySem` (bounded by `applyCloseoutDrainTimeout`) after `applyCancel()` so
+    that closeout completes before teardown/exit.
   - **Wiring (the part that makes this actually fire on `systemctl stop`).**
     `applyCancelCtx` deliberately does **not** return `d.daemonCtx`. In
     production `cmd/xpfd` passes `context.Background()` into `Run`, and that

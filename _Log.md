@@ -47620,3 +47620,32 @@ top.
   restored GREEN. Pre-existing failure
   TestUserspaceManagerDoesNotImportReflectOrUnsafe (manager_overlay.go imports
   reflect) reproduces on pristine origin/master — not this change.
+
+- **Timestamp**: 2026-07-12 23:52
+  **Action**: Fix #5643 (codex-review-181 M35) — post-promotion ctx cancellation
+  before the nft/login tail left durable config vs kernel host-authorization
+  skew. Store.Commit promotes+persists the config UPSTREAM of applyConfigLocked;
+  a #2926 C2/C3 daemon-stop cancel returned from applyDataplaneAndHACore before
+  applyTailReconciles, so the nft xpf_lo0/xpf_hostinbound tables and the OS
+  login/sudo/root-SSH credentials stayed at the OLD (more-permissive) generation
+  for the whole intentional-stop window — those owners persist on the box
+  independent of xpfd and, unlike FRR/IPsec/DHCP/RA/syslog, do NOT converge on
+  next boot while stopped (monotonic-revocation violation). Fix: on a
+  ctx-cancellation return from applyDataplaneAndHACore, run a bounded,
+  non-cancellable applyHostAuthorizationCloseout(cfg) — applyLo0Filter +
+  applyHostInboundFilter (fail-closed) then applySystemLogin / reconcileSudoers
+  / reconcileAbsentLoginUsers / applySSHConfig, in tail order — against the
+  committed config before propagating the cancel. Kept shutdown consistent:
+  runShutdownSequence drains applySem (bounded by applyCloseoutDrainTimeout=5s)
+  after applyCancel() so the closeout completes before teardown/exit. Non-
+  security tail left to next-boot convergence (unchanged #2926 C3 contract).
+  Scoped strictly to M35's remediation boundary; no wire/ABI/forwarding/Rust.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/README.md, pkg/daemon/postpromo_ctx_skew_5643_test.go
+  GREEN: `go test ./pkg/daemon/...` passes; gofmt + vet clean; no pre-existing
+  failures. Fail-on-revert: neutralizing the closeout call →
+  TestPostPromotionCancelRunsHostAuthorizationCloseout RED ("nft host-
+  authorization closeout did NOT run after a post-promotion cancel") while the
+  live-apply regression stays green; restored GREEN. Live daemon-stop-race
+  timing verify is lab/VM-bound → deferred (deterministic C3-cancel unit harness
+  covers the invariant).
