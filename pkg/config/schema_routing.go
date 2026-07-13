@@ -711,6 +711,14 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 				"maximum-hop-count": {desc: "Drop relayed requests whose hop count reaches this limit", args: 1, placeholder: "<count>",
 					valueType: ValueInteger, valueDesc: "relay hop limit (RFC 1542 §4.1.1; 1..16)",
 					valueExamples: []string{"4", "16"}, validator: ValidateInteger(1, 16), children: nil},
+				// #5670: per-interface ingress rate limit (packets/second). ENFORCED
+				// — a token bucket bounds the client-facing admit rate so an
+				// untrusted segment cannot CPU-exhaust the relay or amplify a flood
+				// into the upstream servers. Unset = default 100 pps; set high to
+				// effectively disable.
+				"maximum-packet-rate": {desc: "Rate-limit client-facing relay requests (packets/second per interface)", args: 1, placeholder: "<pps>",
+					valueType: ValueInteger, valueDesc: "relay ingress rate limit in pps (default 100)",
+					valueExamples: []string{"100", "500"}, validator: ValidateInteger(1, 1000000), children: nil},
 				"forward-only":       {desc: "Forward without retaining relay state (accepted-only; matches default — #4309)", children: nil},
 				"relay-agent-option": {desc: "Insert Option 82 relay agent information (accepted-only; always inserted — #4309)", children: nil},
 				// #5414: trust-option-82 marks the group's interfaces as

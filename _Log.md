@@ -47361,6 +47361,16 @@ top.
   - **Action**: #5644 (M37) — close the cold-boot host-inbound fail-open. On COLD BOOT both nft tables are absent, so a failed `applyHostInboundFilter` install has no prior table to retain (the atomic `-f -` fail-closed guarantee is day-2 only) and the boot apply only logs+discards the error → host services reachable with no host-inbound default-deny. Added a fail-closed DENY-ALL fence (`installHostInboundColdBootFence` / `buildHostInboundFencePayload`) installed when the real ruleset fails to load and `d.hostInboundEnforced` is still false (cold boot); the commit still fails (drives retry). Lifeline-excluded, no service accepts, no counters. Day-2 failures unchanged (prior table retained, no fence). Added fail-on-revert tests (RED proven with the fence neutralized). Doc: docs/host-inbound-service-matrix.md new "Cold-boot fail-closed install fence (#5644, M37)" section.
   - **File(s)**: pkg/daemon/daemon.go (Edit), pkg/daemon/daemon_nft.go (Edit), pkg/daemon/host_inbound_coldboot_fence_5644_test.go (Write), docs/host-inbound-service-matrix.md (Edit), _Log.md (Edit)
 
+## 2026-07-12 — #5670 DHCP relay per-interface ingress rate limit
+- **Timestamp**: 2026-07-12
+- **Action**: Add per-interface token-bucket rate limit on the DHCP relay
+  ingress path (DoS/amplification hardening). New `overrides
+  maximum-packet-rate <pps>` override (default 100 pps), `RequestsDroppedRateLimit`
+  counter, CLI display + docs. Fail-on-revert tests (deterministic clock seam).
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_ratelimit_5670_test.go,
+  pkg/config/types_system.go, pkg/config/compiler_services.go,
+  pkg/config/schema_routing.go, pkg/config/compiler_dhcp_relay_overrides_test.go,
+  pkg/cli/show_services_dhcp.go, pkg/dhcprelay/README.md, docs/config-schema.md
 - **Timestamp**: 2026-07-12
   - **Action**: #5635 (M27) — EmitTunnelEndpointNames loses per-unit GRE
     key/endpoint/TTL/routing-instance. When an interface carried BOTH an

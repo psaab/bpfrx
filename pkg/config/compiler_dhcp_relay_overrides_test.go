@@ -499,3 +499,117 @@ func TestDHCPRelayOverrides_5414_SchemaCompletion(t *testing.T) {
 		t.Errorf("overrides completion missing trust-option-82; got %v", comps)
 	}
 }
+
+// #5670: `overrides maximum-packet-rate <pps>` is the per-interface DHCP relay
+// ingress rate limit and must compile from the flat-set path to
+// DHCPRelayGroup.MaximumPacketRate. RED-on-revert: without the compiler case
+// the field reads back its zero value (silent drop) and the relay runs
+// unbounded on that segment.
+func TestDHCPRelayOverrides_5670_PacketRate_FlatSet(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set forwarding-options dhcp-relay server-group sg 10.1.1.1",
+		"set forwarding-options dhcp-relay group lan active-server-group sg",
+		"set forwarding-options dhcp-relay group lan interface ge-0/0/0.0",
+		"set forwarding-options dhcp-relay group lan overrides maximum-packet-rate 250",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	g := relayGroup(t, cfg, "lan")
+	if g.MaximumPacketRate != 250 {
+		t.Errorf("MaximumPacketRate = %d, want 250 (flat-set overrides)", g.MaximumPacketRate)
+	}
+	// The interface list must stay clean — the value token must not be swallowed.
+	if len(g.Interfaces) != 1 || g.Interfaces[0] != "ge-0/0/0.0" {
+		t.Errorf("Interfaces = %v, want [ge-0/0/0.0] (packet-rate value swallowed?)", g.Interfaces)
+	}
+}
+
+// Default: absent maximum-packet-rate leaves the field 0 (the compiler's
+// unset), which relay.go resolves to the 100 pps default.
+func TestDHCPRelayOverrides_5670_PacketRate_DefaultUnset(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set forwarding-options dhcp-relay server-group sg 10.1.1.1",
+		"set forwarding-options dhcp-relay group lan active-server-group sg",
+		"set forwarding-options dhcp-relay group lan interface ge-0/0/0.0",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if g := relayGroup(t, cfg, "lan"); g.MaximumPacketRate != 0 {
+		t.Errorf("MaximumPacketRate = %d, want 0 (absent override → resolver default)", g.MaximumPacketRate)
+	}
+}
+
+// Merged-Keys and block forms of maximum-packet-rate must also compile — the
+// same three parse shapes #4309/#5414 cover. The merged-Keys shape exercises
+// the inline override loop's value consumption (the loop must advance past the
+// value token, not treat "250" as an override keyword).
+func TestDHCPRelayOverrides_5670_PacketRate_MergedAndBlock(t *testing.T) {
+	merged := &Node{
+		Keys: []string{"dhcp-relay"},
+		Children: []*Node{
+			{Keys: []string{"server-group", "sg", "10.1.1.1"}, IsLeaf: true},
+			{
+				Keys: []string{
+					"group", "lan",
+					"overrides", "maximum-packet-rate", "250",
+					"interface", "ge-0/0/0.0",
+				},
+				IsLeaf: true,
+			},
+		},
+	}
+	fo := &ForwardingOptionsConfig{}
+	if err := compileDHCPRelay(merged, fo); err != nil {
+		t.Fatalf("compileDHCPRelay (merged): %v", err)
+	}
+	if g := fo.DHCPRelay.Groups["lan"]; g == nil || g.MaximumPacketRate != 250 {
+		t.Errorf("merged-Keys MaximumPacketRate not 250: %+v", g)
+	} else if len(g.Interfaces) != 1 || g.Interfaces[0] != "ge-0/0/0.0" {
+		t.Errorf("merged-Keys Interfaces = %v, want [ge-0/0/0.0] (packet-rate value swallowed?)", g.Interfaces)
+	}
+
+	block := &Node{
+		Keys: []string{"dhcp-relay"},
+		Children: []*Node{
+			{Keys: []string{"server-group", "sg", "10.1.1.1"}, IsLeaf: true},
+			{
+				Keys: []string{"group", "lan"},
+				Children: []*Node{
+					{Keys: []string{"interface", "ge-0/0/0.0"}, IsLeaf: true},
+					{Keys: []string{"overrides"}, Children: []*Node{
+						{Keys: []string{"maximum-packet-rate", "250"}, IsLeaf: true},
+					}},
+				},
+			},
+		},
+	}
+	fo2 := &ForwardingOptionsConfig{}
+	if err := compileDHCPRelay(block, fo2); err != nil {
+		t.Fatalf("compileDHCPRelay (block): %v", err)
+	}
+	if g := fo2.DHCPRelay.Groups["lan"]; g == nil || g.MaximumPacketRate != 250 {
+		t.Errorf("block-form MaximumPacketRate not 250: %+v", g)
+	}
+}
+
+// Structural completion must offer maximum-packet-rate under overrides so an
+// operator can discover the knob via `?`.
+func TestDHCPRelayOverrides_5670_SchemaCompletion(t *testing.T) {
+	comps := CompleteSetPath([]string{
+		"forwarding-options", "dhcp-relay", "group", "lan", "overrides", "",
+	})
+	found := false
+	for _, c := range comps {
+		if c == "maximum-packet-rate" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("overrides completion missing maximum-packet-rate; got %v", comps)
+	}
+}

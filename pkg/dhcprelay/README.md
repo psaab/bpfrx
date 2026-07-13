@@ -184,7 +184,10 @@ RFC 768).
   (#4163)** counts replies dropped because their source IP was not a
   configured server — a non-zero value is a rogue-reply injection attempt (or
   a multi-homed server unicasting from an unlisted source IP); see "Reply
-  source validation" below. `show ... dhcp-relay` prints this breakdown.
+  source validation" below. **`RequestsDroppedRateLimit` (#5670)** counts
+  client-facing datagrams dropped by the per-interface ingress rate limiter — a
+  sustained nonzero value is a flood / amplification attempt (see "Ingress rate
+  limit" below). `show ... dhcp-relay` prints this breakdown.
 
 ## Reply source validation (#4163)
 
@@ -259,6 +262,43 @@ set forwarding-options dhcp-relay group <g> overrides relay-agent-option
 - **`relay-agent-option` — accepted-only.** The relay ALWAYS inserts
   Option 82 (`circuit-id`); this knob is accepted and matches the
   default, with the same accepted-only advisory.
+
+### Ingress rate limit (#5670)
+
+```
+set forwarding-options dhcp-relay group <g> overrides maximum-packet-rate <pps>
+```
+
+- **`maximum-packet-rate` — ENFORCED (DoS hardening).** The relay admits at
+  most this many client-facing datagrams per second **per interface**, via a
+  per-interface token bucket (`tokenBucket` in `relay.go`) checked in the main
+  read loop **before** `dhcpv4.FromBytes`. Without it an untrusted client
+  segment can flood `:67`: each admitted packet costs a variable-length TLV
+  parse, an Option 82 allocation, and a **fan-out send to EVERY configured
+  server** — a 1→N amplification that can also make the real servers rate-limit
+  legitimate clients. The bound is applied at the cheapest point (before the
+  parse) so a flood is dropped without doing the work.
+- **Default 100 pps** when unset (`resolveMaxPacketRate`). DHCP relay traffic is
+  inherently low-rate (a handful of packets per lease, renewals on the order of
+  hours), so 100 pps sustained is generous for legitimate use. The bucket starts
+  **full** with a **2-second burst** (`relayBurstFor` = `2×rate`), so a
+  simultaneous-boot spike up to `2×rate` packets is admitted instantly before
+  the sustained rate throttles a persistent flood. Set a high value
+  (schema range `1..1000000`) to effectively disable the bound on a segment that
+  legitimately needs it.
+- **Counted + throttled log.** Every dropped datagram bumps
+  `RelayStats.RequestsDroppedRateLimit`; the log is warn-once-per-session then
+  `Debug` (never per packet, per the project logging rules). A sustained
+  nonzero counter means the segment is exceeding its pps bound — a flood /
+  amplification attempt or a segment that should raise `maximum-packet-rate`.
+- Compiles to `DHCPRelayGroup.MaximumPacketRate` and flows into
+  `relaySpec.maxPacketRate` (a change resizes the bucket, so it restarts the
+  per-interface relay). All three parse shapes (flat-set, merged-Keys, block
+  form) are covered; the flat-set consumer treats `overrides` as a property
+  boundary so the value token is not swallowed into the interface list. The
+  token-bucket refill semantics are unit-tested deterministically with an
+  injected clock (`TestTokenBucket_BurstThenRefill`); the end-to-end flood-drop
+  is `TestRunRelay_RateLimit_5670` / `TestRunRelay_RateLimit_DefaultBound`.
 
 ### Trust override (#5414)
 

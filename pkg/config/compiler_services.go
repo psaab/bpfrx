@@ -1632,6 +1632,13 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 								g.MaximumHopCount = n
 							}
 						}
+					case "maximum-packet-rate":
+						if i+1 < len(keys) {
+							i++
+							if n, err := strconv.Atoi(keys[i]); err == nil {
+								g.MaximumPacketRate = n
+							}
+						}
 					}
 				}
 			}
@@ -1677,6 +1684,12 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 								g.MaximumHopCount = n
 							}
 						}
+					case "maximum-packet-rate":
+						if v := nodeVal(oc); v != "" {
+							if n, err := strconv.Atoi(v); err == nil {
+								g.MaximumPacketRate = n
+							}
+						}
 					}
 				}
 				for i := 1; i < len(prop.Keys); i++ {
@@ -1694,6 +1707,13 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 							i++
 							if n, err := strconv.Atoi(prop.Keys[i]); err == nil {
 								g.MaximumHopCount = n
+							}
+						}
+					case "maximum-packet-rate":
+						if i+1 < len(prop.Keys) {
+							i++
+							if n, err := strconv.Atoi(prop.Keys[i]); err == nil {
+								g.MaximumPacketRate = n
 							}
 						}
 					}
