@@ -91,6 +91,19 @@ tracker issue #4407 carries the remaining increments.
   `ipsecSANudgeCh` and increment 2's `lastStandbyNeighborRefresh`) — it is the
   one-shot transfer-on-commit upload seam used by `archiveConfig` in
   `daemon_flow.go`, a different mechanism from the periodic timer grouped here.
+  - **Interval overflow bound (#5784).** `transfer-interval` is an
+    operator-settable value in MINUTES, bounded to `[1, 2880]` at commit
+    (`schema_system.go`), so a normal commit cannot overflow
+    `time.Duration(min)*time.Minute` into a non-positive Duration and panic
+    `time.NewTicker` in `runArchiveTimer` (an xpfd crash). The `interval <= 0`
+    guard in `reconcileArchiveTimer` inspects the minutes integer, not the
+    `× time.Minute` product, so a pathological value from the lenient
+    `Store.Load` / peer-sync ingress (which bypasses the strict schema bound)
+    would still reach `NewTicker`. `clampArchiveIntervalMinutes`
+    (`daemon_archive_timer.go`) re-applies a `[1, config.MaxDurationMinutes]`
+    clamp at runtime as defense-in-depth — the minutes-scoped sibling of the
+    #5723 `clampRPMIntervalSeconds` / #5705 keepalive clamps, closing the
+    config-interval × time.Unit overflow class for the minutes straggler.
 - **Increment 4 — host-inbound fail-open / ambiguity previous-apply sets
   (#3698 / #3710 / #3718):** the three flat `map[string]bool` fields
   (`hostInboundAddresslessZones`, `hostInboundAddresslessIfaces`,
