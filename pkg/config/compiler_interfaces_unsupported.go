@@ -84,14 +84,23 @@ import "fmt"
 // mac` identity key (both legitimate uses of these keywords elsewhere)
 // are never touched.
 func validateUnsupportedInterfaceStanzasAST(nodes []*Node, lenient bool) ([]string, error) {
-	var ifaces *Node
+	// #5744: union across EVERY top-level `interfaces` root, not just the first.
+	// A hierarchical config can split its interfaces across two sibling
+	// `interfaces { }` stanzas, and compileSections compiles them all — so an
+	// unsupported / silently-dropped interface stanza living in a SECOND root
+	// was skipped by the old first-root-only scan, the sibling gap PR #5741
+	// closed for the interface-range / stable-ID gates. Flattening every
+	// interfaces root's children into one per-interface pass is equivalent to
+	// nesting a loop over the roots; each stanza is flagged independently.
+	var ifaceChildren []*Node
+	sawInterfaces := false
 	for _, n := range nodes {
 		if n.Name() == "interfaces" {
-			ifaces = n
-			break
+			sawInterfaces = true
+			ifaceChildren = append(ifaceChildren, n.Children...)
 		}
 	}
-	if ifaces == nil {
+	if !sawInterfaces {
 		return nil, nil
 	}
 
@@ -107,7 +116,7 @@ func validateUnsupportedInterfaceStanzasAST(nodes []*Node, lenient bool) ([]stri
 
 	// Each direct child of `interfaces` is a physical/aggregate interface
 	// instance (wildcard name slot).
-	for _, iface := range ifaces.Children {
+	for _, iface := range ifaceChildren {
 		ifName := iface.Name()
 		if ifName == "" {
 			continue
