@@ -47371,3 +47371,22 @@ top.
   pkg/config/types_system.go, pkg/config/compiler_services.go,
   pkg/config/schema_routing.go, pkg/config/compiler_dhcp_relay_overrides_test.go,
   pkg/cli/show_services_dhcp.go, pkg/dhcprelay/README.md, docs/config-schema.md
+- **Timestamp**: 2026-07-12
+  - **Action**: #5635 (M27) — EmitTunnelEndpointNames loses per-unit GRE
+    key/endpoint/TTL/routing-instance. When an interface carried BOTH an
+    interface-level `tunnel` stanza (iface.Tunnel != nil) AND per-unit
+    tunnel stanzas, the non-WireGuard emit loop at
+    pkg/config/tunnelemit.go:101-103 emitted `iface.Tunnel` for EVERY unit,
+    so the per-unit overrides the compiler stored in `unit.Tunnel`
+    (cloneForUnit + unit-level parse) — key, source/destination endpoint,
+    TTL, routing-instance — were dropped from the emitted set the dataplane
+    snapshot builder (buildTunnelEndpointSnapshots) and the commit-time
+    collision gate consume. Fixed to emit each unit's own TunnelConfig when
+    it has a tunnel stanza, falling back to the interface-level tunnel for
+    units without one (unchanged behavior). WireGuard single-lowest-unit
+    pick (#1910) deliberately untouched — GRE-scoped. Added fail-on-revert
+    tests: RED proven with the per-unit branch neutralized (all five fields
+    revert to interface-level values), GREEN restored. Updated the
+    EmitTunnelEndpointNames contract doc comment.
+  - **File(s)**: pkg/config/tunnelemit.go (Edit),
+    pkg/config/tunnelemit_perunit_5635_test.go (Write), _Log.md (Edit)
