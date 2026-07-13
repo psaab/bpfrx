@@ -47647,6 +47647,34 @@ top.
   TestUserspaceManagerDoesNotImportReflectOrUnsafe (manager_overlay.go imports
   reflect) reproduces on pristine origin/master — not this change.
 
+- **Timestamp**: 2026-07-12 23:52
+  **Action**: Fix #5643 (codex-review-181 M35) — post-promotion ctx cancellation
+  before the nft/login tail left durable config vs kernel host-authorization
+  skew. Store.Commit promotes+persists the config UPSTREAM of applyConfigLocked;
+  a #2926 C2/C3 daemon-stop cancel returned from applyDataplaneAndHACore before
+  applyTailReconciles, so the nft xpf_lo0/xpf_hostinbound tables and the OS
+  login/sudo/root-SSH credentials stayed at the OLD (more-permissive) generation
+  for the whole intentional-stop window — those owners persist on the box
+  independent of xpfd and, unlike FRR/IPsec/DHCP/RA/syslog, do NOT converge on
+  next boot while stopped (monotonic-revocation violation). Fix: on a
+  ctx-cancellation return from applyDataplaneAndHACore, run a bounded,
+  non-cancellable applyHostAuthorizationCloseout(cfg) — applyLo0Filter +
+  applyHostInboundFilter (fail-closed) then applySystemLogin / reconcileSudoers
+  / reconcileAbsentLoginUsers / applySSHConfig, in tail order — against the
+  committed config before propagating the cancel. Kept shutdown consistent:
+  runShutdownSequence drains applySem (bounded by applyCloseoutDrainTimeout=5s)
+  after applyCancel() so the closeout completes before teardown/exit. Non-
+  security tail left to next-boot convergence (unchanged #2926 C3 contract).
+  Scoped strictly to M35's remediation boundary; no wire/ABI/forwarding/Rust.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/README.md, pkg/daemon/postpromo_ctx_skew_5643_test.go
+  GREEN: `go test ./pkg/daemon/...` passes; gofmt + vet clean; no pre-existing
+  failures. Fail-on-revert: neutralizing the closeout call →
+  TestPostPromotionCancelRunsHostAuthorizationCloseout RED ("nft host-
+  authorization closeout did NOT run after a post-promotion cancel") while the
+  live-apply regression stays green; restored GREEN. Live daemon-stop-race
+  timing verify is lab/VM-bound → deferred (deterministic C3-cancel unit harness
+  covers the invariant).
 - **Timestamp**: 2026-07-12
   **Action**: #5487 (codex-review-179 A6/C179-084) — standalone HA-state clear
   had no retry/debt. Both non-cluster clear sites in manager_compile.go (~276
@@ -47760,3 +47788,95 @@ top.
   build clean. Fail-on-revert proven: removing the showSessionsTop gate →
   TestGRPCShowSessionsTopConcurrencyBound RED ("err = <nil>, want
   codes.ResourceExhausted"); restored GREEN.
+- **Timestamp**: 2026-07-13 00:20
+  **Action**: #5643 / PR #5776 — folded two hostile-review gaps into the
+  post-promotion host-authorization closeout. Gap A: applyHostAuthorizationCloseout
+  ran tail steps 9.5–12 but STOPPED at applySSHConfig (the sshd PermitRootLogin
+  drop-in only) and OMITTED step 13 applyRootAuth — the sole manager of root's
+  /etc/shadow password + /root/.ssh/authorized_keys — so `delete system
+  root-authentication ssh-keys` + commit + daemon-stop-cancel left the revoked
+  root key live for the stop window. Added d.applyRootAuth(cfg) after
+  applySSHConfig (bounded local file I/O, safe non-cancellable), matching tail
+  order 9.5→13. Gap B: a THIRD post-promotion cancel boundary (C1 in
+  applyVRFReconcile, returned directly at applyConfigLocked before the netlink
+  phase) was NOT wired to the closeout — a daemon-stop cancel landing at C1
+  returned context.Canceled with the closeout skipped. Extracted
+  closeoutHostAuthOnCancel(err, cfg) (runs the closeout only for
+  Canceled/DeadlineExceeded, else returns err unchanged) and call it at BOTH the
+  C1 early-return AND the C2/C3 err-return — behavior identical at C2/C3.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/README.md,
+  pkg/daemon/postpromo_ctx_skew_5643_test.go
+  GREEN: `go test ./pkg/daemon/...` passes; gofmt + vet clean; no pre-existing
+  failures. Fail-on-revert (both gaps): removing d.applyRootAuth from the
+  closeout → TestPostPromotionCancelReconcilesRootAuth + C1 test RED ("chpasswd
+  never invoked"); reverting the C1 return to bare `return err` →
+  TestC1PostPromotionCancelRunsHostAuthorizationCloseout RED ("nft
+  host-authorization closeout did NOT run after a C1 cancel") while C3/Gap-A
+  tests stay green. Root-auth observed privilege-free via the staged fake
+  chpasswd sentinel (writing /root/.ssh needs a root-only chown unprivileged
+  runs cannot do). Restored GREEN.
+- **Timestamp**: 2026-07-13
+  **Action**: Fix #5676 (codex-review-182 M10, High) — address-book `address`
+  and `address-set` names share one untagged namespace, so a plain address
+  silently SHADOWS a same-named address-set at name→prefix resolution
+  (address-first everywhere: dataplane expandBookNameRecursive /
+  nameRepresentability / capabilities, host-inbound junos_host_deny), changing
+  which traffic a permit/deny rule covers with no diagnostic. Fix: new strict
+  gate `validateAddressBookNameCollisionStrict` (+ `resolveAddressBookNameKind`
+  SSOT encoding the deterministic address-first winner + `AddressBookRefKind`)
+  in `compiler_validate_strict_addrbook.go`, wired in `runEarlyStrictAndFolds`
+  right after `validateAddressBookEntryNamesStrict` and BEFORE the zone-local
+  fold (pristine-book ordering — so global vs different-zone names aren't
+  misreported and a real zone-local collision names the clean zone). Strict on
+  commit/commit-check = HARD REJECT (matches vSRX, which forbids the collision);
+  tolerant load/peer-sync = WARN + keep the address-first winner
+  (`lenientAddressBookNameCollision`, #1960 no-brick so a leniently-loaded
+  config forwards exactly as before). Pure pkg/config — no dataplane/Rust/wire
+  change.
+  **File(s)**: pkg/config/compiler_validate_strict_addrbook.go (new),
+  pkg/config/addr_set_namespace_5676_test.go (new),
+  pkg/config/compiler_earlystrict.go, pkg/config/compiler.go,
+  docs/config-schema.md
+  GREEN: `go test ./pkg/config/...` passes (incl. TestEveryStrictCommitGateIsWired
+  canary + golden). gofmt clean on touched files, go vet clean. Fail-on-revert
+  proven: unwiring the `validateAddressBookNameCollisionStrict` dispatch turns
+  the strict-reject (global + both orderings + zone-local) and lenient-warn
+  tests RED — "expected strict commit to reject a same-name address +
+  address-set collision", "lenient compile must record a collision warning";
+  restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: Fix #5627 (codex-review-181 M15 / A3-b00-F02) — the Go
+  strict-commit path validated a source-NAT pool's `port range` but left its
+  ADDRESS members unchecked, so a pool referenced by a pool-mode
+  `then source-nat pool <name>` rule that carried a malformed member
+  (`not-an-ip`, `203.0.113.1/garbage`), an over-capacity prefix (host count >
+  65536 — a `/15`, `10.0.0.0/8`, or a v6 prefix shorter than `/112`), or no
+  addresses at all committed green — then the live Rust allocator
+  (`expand_pool_address`, userspace-dp/src/nat/source.rs) marked the pool
+  InvalidPool/EmptyPool and DROPPED the rule at runtime (a persistent NAT
+  outage visible only after apply). Fix: new strict gate
+  `validateSourceNATPoolAddressGrammarStrict` (+ `MaxSourceNATPoolPrefixHosts`
+  const mirroring MAX_POOL_PREFIX_HOSTS, + `sourceNATPoolAddressReason` helper)
+  in `compiler_validate_strict_nat.go`, wired in `runUniformGates` right after
+  the #5626 reference gate. It iterates ONLY pools a pool-mode rule references
+  (the exact set the dataplane snapshot expands → grammar-EQUIVALENT with live,
+  not Go-stricter), counts hosts off the prefix LENGTH without enumerating, and
+  rejects the same shapes Rust rejects (bare IP via netip.ParseAddr / CIDR via
+  netip.ParsePrefix with host count <= cap; empty referenced pool). `/16`
+  (65536 hosts, at cap) accepted, matching Rust's `count > MAX` comparison.
+  Strict = HARD REJECT; lenient (CompileConfigLenient) = warn-and-load via the
+  shared `lenientDestNATAddresses` flag (#1960 no-brick; snapshot marks pool
+  unusable independently). GO-ONLY — no Rust/cargo touched; the Rust grammar is
+  the authoritative reference the Go gate now mirrors.
+  **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/strict_nat_pool_grammar_5627_test.go (new),
+  docs/config-schema.md
+  GREEN: `go test ./pkg/config/...` passes (incl. TestEveryStrictCommitGateIsWired
+  canary). gofmt clean on touched files, go vet clean. Fail-on-revert proven:
+  unwiring the `validateSourceNATPoolAddressGrammarStrict` dispatch turns all 7
+  reject shapes (malformed-token, malformed-mask, over-cap /8, over-cap /15, v6
+  over-cap /111, empty, mixed) and both lenient-warn cases RED — "expected
+  strict commit to reject pool shape", "lenient compile must record a
+  source-nat pool address warning"; restored GREEN.

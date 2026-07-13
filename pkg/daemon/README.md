@@ -379,6 +379,31 @@ never lock an operator out of a remote box it manages.
   converge. The boot / DHCP / feed applies (`applyConfig`) and the
   confirmed-rollback re-apply (`executeConfirmedRollback`) pass a non-cancellable
   `context.Background()` so they always complete.
+  - **Host-authorization closeout on a post-promotion cancel (#5643 / M35).**
+    The "a skipped tail converges on next boot" reasoning holds for
+    FRR/IPsec/DHCP/RA/VRRP/syslog/exporters, but **not** for the nft
+    host-authorization owners (`applyLo0Filter` / `applyHostInboundFilter`, the
+    kernel `xpf_lo0` / `xpf_hostinbound` PRIMARY enforcement) or the OS
+    login/sudo/root-SSH credential reconciles: those persist on the box
+    independent of xpfd and do **not** converge while the daemon stays
+    intentionally stopped. Since `store.Commit` promotes the config UPSTREAM of
+    `applyConfigLocked`, **every** ctx-cancellation early-return inside it — C1
+    (in `applyVRFReconcile`), C2 (before the dataplane apply), and C3 (before
+    the FRR reload) — is post-promotion, and a cancel that skipped the tail would
+    leave the OLD, more-permissive host authorization live for the whole stop
+    window (a monotonic-revocation violation). So each of those early-returns is
+    funneled through `closeoutHostAuthOnCancel(err, cfg)`, which — only for a
+    `context.Canceled` / `DeadlineExceeded` error — runs a bounded,
+    non-cancellable `applyHostAuthorizationCloseout(cfg)` against the committed
+    config before propagating the cancel. The closeout runs the security-critical
+    owners in tail order (step 9.5–13): the two nft loads, then
+    `applySystemLogin` / `reconcileSudoers` / `reconcileAbsentLoginUsers` /
+    `applySSHConfig`, then **`applyRootAuth`** — the sole manager of root's
+    `/etc/shadow` password and `/root/.ssh/authorized_keys`, without which a
+    committed root-credential revocation would stay unenforced for the stop
+    window. `runShutdownSequence` drains `applySem` (bounded by
+    `applyCloseoutDrainTimeout`) after `applyCancel()` so that closeout completes
+    before teardown/exit.
   - **Wiring (the part that makes this actually fire on `systemctl stop`).**
     `applyCancelCtx` deliberately does **not** return `d.daemonCtx`. In
     production `cmd/xpfd` passes `context.Background()` into `Run`, and that

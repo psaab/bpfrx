@@ -808,6 +808,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return d.runShutdownSequence(&wg, stop, runErr)
 }
 
+// applyCloseoutDrainTimeout bounds how long runShutdownSequence waits for an
+// in-flight, just-cancelled apply to finish its bounded nft/login host-
+// authorization closeout (#5643 / M35) before proceeding to teardown. It must be
+// comfortably under the systemd unit's TimeoutStopSec (20s) so a wedged apply
+// can never stall the whole stop past the drain budget.
+const applyCloseoutDrainTimeout = 5 * time.Second
+
 // runShutdownSequence performs the ordered post-run teardown: abort in-flight
 // apply, stop the signal context, wait background goroutines, then tear down
 // SNMP/flowexport/feeds/RPM/archive/event-engine/ipmon/natpool-alarm/FRR/LLDP,
@@ -828,6 +835,29 @@ func (d *Daemon) runShutdownSequence(wg *sync.WaitGroup, stop func(), runErr err
 	// no applyConfigLocked, so nothing legitimate is aborted here.
 	if d.applyCancel != nil {
 		d.applyCancel()
+
+		// #5643 (M35): the cancel above makes an in-flight promoted apply bail at
+		// its next #2926 boundary, where applyConfigLocked now runs the bounded
+		// nft/login host-authorization closeout so the committed (restrictive)
+		// config is still enforced even though the apply is abandoned. Drain
+		// applySem so that closeout COMPLETES before we tear down / exit —
+		// otherwise the process could stop with the OLD, more-permissive host
+		// authorization still live in the kernel nft tables / on-disk credentials.
+		// applySem is a weight-1 mutex: acquiring it waits for the in-flight apply
+		// (now including its closeout) to release. The closeout is bounded (two
+		// atomic nft loads + local credential reconciles, no FRR/netlink reload),
+		// so this cannot hang on unbounded work; bound it defensively anyway so a
+		// wedged apply cannot block the whole shutdown past the drain budget.
+		if d.applySem != nil {
+			drainCtx, cancelDrain := context.WithTimeout(context.Background(), applyCloseoutDrainTimeout)
+			if err := d.applySem.Acquire(drainCtx, 1); err == nil {
+				d.applySem.Release(1)
+			} else {
+				slog.Warn("shutdown: timed out draining in-flight apply before teardown; "+
+					"host-authorization closeout may be incomplete", "err", err)
+			}
+			cancelDrain()
+		}
 	}
 
 	// Cancel context to stop background goroutines, then wait for them.

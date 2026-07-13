@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -677,6 +678,165 @@ func validateNATPoolReferencesStrict(cfg *Config) error {
 	if cfg.Security.NAT.Destination != nil {
 		if err := check("destination", cfg.Security.NAT.Destination.RuleSets, cfg.Security.NAT.Destination.Pools); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// MaxSourceNATPoolPrefixHosts mirrors the userspace-dp
+// MAX_POOL_PREFIX_HOSTS constant (`userspace-dp/src/nat/source.rs`, #3049):
+// the upper bound on how many host addresses ONE source-NAT pool prefix is
+// expanded into by the Rust SNAT allocator. A pool member CIDR whose host
+// count exceeds this cap (an over-broad `/15`, `/8`, or any v6 prefix shorter
+// than `/112`) makes `expand_pool_address` return false, and the allocator
+// marks the WHOLE pool `InvalidPool`. The Go strict validator uses the same
+// bound so a pool the dataplane cannot honor is rejected at commit, not after
+// apply. A `/16` (exactly 65536 hosts) is at the cap and accepted, matching
+// the Rust `count > MAX_POOL_PREFIX_HOSTS` comparison exactly.
+const MaxSourceNATPoolPrefixHosts = 65536
+
+// sourceNATPoolAddressReason validates one source-NAT pool address member
+// against the live Rust pool grammar (`expand_pool_address`,
+// `userspace-dp/src/nat/source.rs`) and returns a human-readable reason when
+// the member is NOT honorable (ok=false), or ("", true) when it is.
+//
+// The live grammar accepts exactly two shapes:
+//
+//   - a bare IP (no `/`), parsed as a single host; and
+//   - a CIDR (`a.b.c.d/n`), enumerated over its FULL prefix range, valid only
+//     when the host count `1 << (addrbits - n)` does not exceed
+//     MaxSourceNATPoolPrefixHosts.
+//
+// Anything else — an unparseable token (`not-an-ip`), a malformed mask
+// (`203.0.113.1/garbage`), or an over-capacity prefix (`/15`, `10.0.0.0/8`, a
+// v6 prefix shorter than `/112`) — makes the Rust allocator return false for
+// the member and mark the pool `InvalidPool`, so the Go grammar must reject it
+// too. netip.ParsePrefix (like the Rust `IpNet` parse) accepts a non-canonical
+// prefix with host bits set; the runtime masks to the network base, so the Go
+// side counts hosts off the prefix LENGTH exactly as Rust does.
+func sourceNATPoolAddressReason(addr string) (string, bool) {
+	if strings.Contains(addr, "/") {
+		p, err := netip.ParsePrefix(addr)
+		if err != nil {
+			return "is not a valid CIDR (the dataplane cannot expand it and marks the pool unusable)", false
+		}
+		addrBits := 32
+		if p.Addr().Is6() {
+			addrBits = 128
+		}
+		hostBits := addrBits - p.Bits()
+		// Mirror the Rust arithmetic: reject when the enumerated host count
+		// exceeds the cap. The hostBits >= 64 guard both matches the Rust v6
+		// early-out and prevents a 1<<hostBits shift overflow (Go defines an
+		// over-wide shift as 0, which would otherwise UNDER-count and wrongly
+		// accept an astronomically large prefix).
+		if hostBits >= 64 || uint64(1)<<uint(hostBits) > MaxSourceNATPoolPrefixHosts {
+			return fmt.Sprintf(
+				"expands to more than %d host addresses, over the pool cap (the "+
+					"dataplane rejects the prefix and marks the pool unusable)",
+				MaxSourceNATPoolPrefixHosts), false
+		}
+		return "", true
+	}
+	if _, err := netip.ParseAddr(addr); err != nil {
+		return "is not a valid IP address (the dataplane cannot parse it and marks the pool unusable)", false
+	}
+	return "", true
+}
+
+// validateSourceNATPoolAddressGrammarStrict (#5627) hard-rejects a source-NAT
+// pool, REFERENCED by a pool-mode `then source-nat pool <name>` rule, whose
+// address membership the live Rust dataplane cannot honor as configured —
+// closing a commit-vs-apply grammar divergence (codex-review-181 M15 /
+// A3-b00-F02).
+//
+// The prior strict path (validateSourceNATPoolStrict) validated only a pool's
+// `port range`; it left the pool's ADDRESS members completely unchecked. The
+// snapshot builder (pkg/dataplane/userspace/nat_source.go) copies the raw
+// address strings onto the wire, and the Rust allocator
+// (`expand_pool_address` / `parse_source_nat_rules`,
+// `userspace-dp/src/nat/source.rs`) then rejects a malformed member, an
+// over-capacity prefix (host count > MaxSourceNATPoolPrefixHosts), or an empty
+// pool — marking the rule `InvalidPool` / `EmptyPool` and DROPPING it. So a
+// pool referencing `not-an-ip`, `203.0.113.1/garbage`, `10.0.0.0/8`, an
+// over-cap `/15`, or no addresses at all committed green then silently stopped
+// translating after apply: a single bad member poisons an otherwise usable
+// pool, producing a persistent NAT outage visible only at runtime.
+//
+// The gate iterates only pools that a pool-mode source-NAT rule actually
+// references (the exact set the dataplane snapshot expands — an unreferenced
+// pool never reaches the Rust grammar), in sorted rule-set / declaration order
+// for a deterministic first-reported offender. An UNDEFINED reference is
+// validateNATPoolReferencesStrict's (#5626) domain and is skipped here. Host
+// counting is O(pool address entries) with no enumeration — the invariant the
+// audit requires (do not expand up to 65,536 hosts in Go).
+//
+// Strict on commit / commit-check (hard-reject so the un-honorable pool is
+// operator-visible); the call site downgrades this to a warning on the
+// tolerant load / peer-sync path (opts.lenientDestNATAddresses — the shared
+// NAT silent-drop / wrong-translate doctrine, as validateNATPoolReferencesStrict
+// and validateSourceNATPoolStrict use) so an already-persisted or peer-synced
+// config carrying such a pool still BOOTS (#1960 no-brick) — the snapshot
+// builder independently marks the pool unusable, installing nothing rather
+// than translating wrongly. Mirrors validateSourceNATPoolStrict.
+func validateSourceNATPoolAddressGrammarStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	pools := cfg.Security.NAT.SourcePools
+	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Source...)
+	sort.SliceStable(rulesets, func(i, j int) bool {
+		if rulesets[i] == nil || rulesets[j] == nil {
+			return rulesets[i] != nil
+		}
+		return rulesets[i].Name < rulesets[j].Name
+	})
+	seen := make(map[string]bool)
+	for _, rs := range rulesets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.Then.PoolName == "" {
+				continue
+			}
+			name := rule.Then.PoolName
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			pool, ok := pools[name]
+			if !ok || pool == nil {
+				// Undefined reference — validateNATPoolReferencesStrict (#5626).
+				continue
+			}
+			// Mirror the snapshot builder's live address set: the DNAT-compat
+			// single Address (unused by source pools today, but included for
+			// parity) plus the source pool Addresses.
+			var addrs []string
+			if pool.Address != "" {
+				addrs = append(addrs, pool.Address)
+			}
+			addrs = append(addrs, pool.Addresses...)
+			if len(addrs) == 0 {
+				return fmt.Errorf(
+					"source-nat pool %q (referenced by rule-set %q rule %q) has no "+
+						"pool addresses; the rule commits but the dataplane marks the "+
+						"pool unusable (EmptyPool) and drops it at runtime, silently "+
+						"stopping translation",
+					name, rs.Name, rule.Name)
+			}
+			for _, a := range addrs {
+				if reason, ok := sourceNATPoolAddressReason(a); !ok {
+					return fmt.Errorf(
+						"source-nat pool %q (referenced by rule-set %q rule %q): "+
+							"address %q %s; a single malformed or over-capacity member "+
+							"poisons the whole pool — the rule commits but the dataplane "+
+							"marks the pool unusable (InvalidPool) and drops it at runtime, "+
+							"silently stopping translation",
+						name, rs.Name, rule.Name, a, reason)
+				}
+			}
 		}
 	}
 	return nil

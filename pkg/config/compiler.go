@@ -1088,6 +1088,24 @@ type compileOpts struct {
 	// no-brick); the fold's no-clobber guard keeps such a config from silently
 	// overwriting an operator entry. Same doctrine as lenientZoneCount.
 	lenientAddressBookNames bool
+	// lenientAddressBookNameCollision (#5676) downgrades the same-name
+	// `address` + `address-set` collision gate
+	// (validateAddressBookNameCollisionStrict) from a hard compile error to a
+	// cfg.Warnings entry. An address book (global or zone-local) that defines
+	// the SAME name as BOTH a plain `address` and an `address-set` was
+	// previously unvalidated — the two kinds share one operator-visible
+	// namespace but are stored in separate maps, so every name→prefix resolver
+	// (dataplane expandBookNameRecursive, host-inbound junos_host_deny) silently
+	// resolved address-first and the plain address SHADOWED the same-named
+	// address-set, dropping the set's other members and changing which traffic a
+	// permit/deny rule covers. The strict commit / commit-check path
+	// hard-rejects so the ambiguity is operator-visible (Junos forbids the
+	// collision outright); the tolerant load / peer-sync paths warn so an
+	// already-persisted or peer-synced config carrying a pre-existing collision
+	// still BOOTS (#1960) — the runtime keeps the deterministic address-first
+	// winner it already used, so a leniently-loaded config forwards exactly as
+	// before, now flagged. Same doctrine as lenientAddressBookNames.
+	lenientAddressBookNameCollision bool
 	// lenientZoneInterfaceMembership (#3072) downgrades the zone-interface
 	// membership gate (validateZoneInterfaceMembershipStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit / commit-check
@@ -1920,6 +1938,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientZoneIDCollision:                 true,
 		lenientRoutingInstanceTableIDCollision: true,
 		lenientAddressBookNames:                true,
+		lenientAddressBookNameCollision:        true,
 		lenientZoneInterfaceMembership:         true,
 		lenientZoneInterfaceDefined:            true,
 		lenientHostInboundTokens:               true,
@@ -2271,6 +2290,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientZoneIDCollision:                 true,
 		lenientRoutingInstanceTableIDCollision: true,
 		lenientAddressBookNames:                true,
+		lenientAddressBookNameCollision:        true,
 		lenientZoneInterfaceMembership:         true,
 		lenientZoneInterfaceDefined:            true,
 		lenientHostInboundTokens:               true,

@@ -309,6 +309,42 @@ reject identically = order-independent, lenient-warn, non-colliding-commits) and
 the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
 the gate wiring.
 
+### security address-book same-name `address` + `address-set` collision (#5676)
+
+`address` and `address-set` entries share ONE operator-visible namespace (a
+policy `match source-address <name>` / `destination-address <name>` names a
+single token) but are stored in two SEPARATE maps
+(`AddressBook.Addresses` / `AddressBook.AddressSets`). So an operator can author
+`address blocklist 10.0.1.0/24` AND `address-set blocklist { address other; }`
+in the same book with no commit error — and every place a name is resolved to
+prefixes checks `Addresses` before `AddressSets` (**address-first**: the
+dataplane `expandBookNameRecursive` / `nameRepresentability` /
+`capabilities`, and the host-inbound `junos_host_deny` compiler). The plain
+address therefore SILENTLY SHADOWS the same-named address-set: a deny built on
+the SET covers only the single address, so the set's other members leak (an
+under-block) — a security-relevant change to which traffic a rule covers, with
+no diagnostic (codex-review-182 M10, High).
+
+`validateAddressBookNameCollisionStrict` (`compiler_validate_strict_addrbook.go`,
+wired in `runEarlyStrictAndFolds` right after `validateAddressBookEntryNamesStrict`
+and BEFORE the zone-local fold — the same PRISTINE-book ordering constraint, so a
+global `address foo` and a *different* zone's zone-local `address-set foo`
+(genuinely distinct namespaces after the fold) are never misreported, and a real
+zone-local collision names the clean zone). It hard-rejects the collision on the
+strict commit / commit-check path — matching vSRX, which itself forbids a
+same-name `address` + `address-set` in one book (there is no vendor-defined
+precedence to honor). The tolerant load / peer-sync path
+(`opts.lenientAddressBookNameCollision`, #1960 no-brick) downgrades to a
+`cfg.Warnings` entry so an already-persisted or peer-synced config carrying a
+pre-existing collision still BOOTS — and keeps the **deterministic address-first
+winner** the runtime already used (`resolveAddressBookNameKind`, the single
+source of truth), so a leniently-loaded config forwards exactly as before rather
+than silently changing its dispositions on reload. Covered by
+`pkg/config/addr_set_namespace_5676_test.go` (global + zone-local reject,
+both config orderings, lenient-warn, deterministic-winner, namespace-aware
+absent-collision, non-colliding-commits), the strict-reject + lenient-warn cases
+RED on revert of the gate wiring.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
@@ -2907,6 +2943,39 @@ reserved for whole-dataplane selection where a rewrite shim
     `TestNATPoolReferenceUndefinedRejected_5626` /
     `TestNATPoolReferenceGate_LenientDowngrade_5626`
     (`pkg/config/compiler_nat_pool_ref_5626_test.go`).
+  - `security nat source pool <name> address <member>` grammar / cap (#5627) —
+    the companion to #5626: once a source pool is DEFINED and REFERENCED by a
+    pool-mode `then source-nat pool <name>` rule, its ADDRESS members must be
+    honorable by the live Rust allocator. The strict path previously validated
+    only the pool `port range` (#3906/#5457), so a referenced pool carrying a
+    malformed member (`not-an-ip`, `203.0.113.1/garbage`), an over-capacity
+    prefix (host count `1 << (addrbits - prefixlen)` **greater than**
+    `MaxSourceNATPoolPrefixHosts = 65536` — a `/15`, `10.0.0.0/8`, or a v6
+    prefix shorter than `/112`), or **no addresses at all** committed green.
+    The snapshot builder (`nat_source.go`) copies the raw strings onto the wire
+    and the Rust allocator (`expand_pool_address` / `parse_source_nat_rules`,
+    `userspace-dp/src/nat/source.rs`) then returns `false` for the bad member
+    and marks the pool `InvalidPool` / `EmptyPool`, DROPPING the rule at runtime
+    — a persistent NAT outage visible only after apply, where a single bad
+    member poisons an otherwise usable pool.
+    `validateSourceNATPoolAddressGrammarStrict`
+    (`compiler_validate_strict_nat.go`) closes the divergence by rejecting the
+    exact shapes the dataplane rejects: each member must be a bare IP
+    (`netip.ParseAddr`) or a CIDR (`netip.ParsePrefix`, non-canonical allowed,
+    like the Rust `IpNet`) whose host count does not exceed the cap, and a
+    referenced pool must be non-empty. A `/16` (exactly 65536 hosts, at the cap)
+    is accepted, matching the Rust `count > MAX_POOL_PREFIX_HOSTS` comparison.
+    The gate iterates ONLY pools a pool-mode rule references — the exact set the
+    dataplane snapshot expands, so an unreferenced pool (never seen by the Rust
+    grammar) is out of scope and the gate stays grammar-EQUIVALENT with live
+    rather than Go-stricter — in sorted rule-set / declaration order for a
+    deterministic first offender, and counts hosts off the prefix LENGTH without
+    enumerating (O(pool addresses), the audit's no-expansion invariant). It
+    reuses the `lenientDestNATAddresses` downgrade (warn on load / peer-sync,
+    #1960 no-brick; the snapshot builder marks the pool unusable independently).
+    Fail-on-revert: `TestSourceNATPoolBadGrammarRejected` /
+    `TestSourceNATPoolBadGrammarLenientWarns`
+    (`pkg/config/strict_nat_pool_grammar_5627_test.go`).
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix

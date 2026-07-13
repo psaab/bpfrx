@@ -748,7 +748,14 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	}
 
 	if err := d.applyVRFReconcile(ctx, cfg); err != nil {
-		return err
+		// #5643 Gap B: the #2926 C1 boundary lives inside applyVRFReconcile and
+		// returns ctx.Err() before the netlink phase. Store.Commit already
+		// promoted UPSTREAM, so a daemon-stop cancel landing here is post-
+		// promotion too — funnel it through the same host-authorization closeout
+		// as C2/C3 so the committed nft/login/root-auth tightening is enforced
+		// even when the apply is abandoned at the earliest boundary. A genuine
+		// (non-cancellation) VRF reconcile failure returns unchanged.
+		return d.closeoutHostAuthOnCancel(err, cfg)
 	}
 
 	// #5310: capture the interface-reconcile failure (xfrmi/bond/tunnel/legacy-
@@ -768,7 +775,27 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// before the tail.
 	commitOverlay, networkdErr, applyErr, err := d.applyDataplaneAndHACore(ctx, cfg)
 	if err != nil {
-		return err
+		// #5643 (M35): applyDataplaneAndHACore bailed at a #2926 ctx-cancellation
+		// boundary (C2 before the dataplane apply, or C3 after it) because the
+		// daemon is stopping mid-apply. Store.Commit ALREADY promoted+persisted
+		// this config UPSTREAM of applyConfigLocked, so the durable config has
+		// advanced, and at C3 the Rust dataplane may already enforce it — but the
+		// nft host-authorization + login/credential tail (applyTailReconciles) has
+		// NOT run. Unlike FRR/IPsec/DHCP/RA/VRRP/syslog/exporters, those owners do
+		// NOT converge on the next boot while the daemon stays intentionally
+		// stopped: the kernel xpf_lo0/xpf_hostinbound nft tables and the OS
+		// login/sudo/root-SSH/root-authentication credentials persist on the box
+		// independent of xpfd. Skipping them here would leave the OLD, more-
+		// permissive host authorization live for the entire stop window — a
+		// monotonic-revocation violation (a committed management-access tightening
+		// silently deferred by the cancel). closeoutHostAuthOnCancel runs just
+		// those security-critical owners to completion — bounded (two nft loads +
+		// local credential reconciles, no FRR/netlink reload) and non-cancellable
+		// — against the committed config before propagating the cancellation. A
+		// non-cancellation error (an ordinary compile-abort) returns unchanged.
+		// The non-security tail is intentionally left to next-boot convergence
+		// (the #2926 C3 contract).
+		return d.closeoutHostAuthOnCancel(err, cfg)
 	}
 
 	d.applyRoutingRules(cfg, commitOverlay)
@@ -807,6 +834,78 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// #5696 route-leak republish/FIB-bump failure; the helper creates
 	// lo0Err/hostInboundErr and returns the joined errors.
 	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr)
+}
+
+// applyHostAuthorizationCloseout runs ONLY the security-critical host-
+// authorization owners of the apply tail — the kernel nft lo0/host-inbound
+// filters and the OS login/sudo/root-SSH/root-authentication credential
+// reconciles — against cfg. It is the bounded, non-cancellable closeout invoked
+// from applyConfigLocked (via closeoutHostAuthOnCancel) when an apply is
+// abandoned at a #2926 ctx-cancellation boundary AFTER Store.Commit promoted the
+// config (#5643 / M35).
+//
+// These owners are singled out from the rest of applyTailReconciles because,
+// unlike FRR/IPsec/DHCP/RA/VRRP/syslog/exporters (which the next boot re-renders
+// from the active config, so the #2926 skip converges), they persist on the box
+// independently of xpfd and therefore do NOT converge while the daemon is
+// intentionally stopped: the kernel xpf_lo0/xpf_hostinbound tables keep enforcing
+// whatever generation was last loaded, and a removed login user / revoked sudo
+// grant / re-enabled root SSH / stale root password + /root/.ssh/authorized_keys
+// stays on disk. Leaving them at the pre-cancel (more permissive) generation
+// after a committed tightening is the monotonic-revocation violation M35
+// identifies.
+//
+// The steps mirror applyTailReconciles' step 9.5–13 order exactly. Both nft
+// applies fail closed (#3392/#3333) and their errors are returned; the
+// login/credential reconciles (including applyRootAuth, the SOLE manager of
+// root's /etc/shadow password and /root/.ssh/authorized_keys) are best-effort
+// voids there and stay so here. The whole closeout is bounded (two atomic nft
+// loads + local file reconciles, no FRR/netlink reload), so it is safe to run
+// non-cancellably on the daemon-stop path.
+func (d *Daemon) applyHostAuthorizationCloseout(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// nft host-authorization: kernel PRIMARY enforcement of lo0 input filter +
+	// zone host-inbound (fail-closed).
+	lo0Err := d.applyLo0Filter(cfg)
+	hostInboundErr := d.applyHostInboundFilter(cfg)
+	// login / credential revocation: OS accounts, stale sudo grants, removed
+	// users' password + authorized_keys, root-login policy, AND root's own
+	// durable credentials. applySSHConfig only writes the sshd PermitRootLogin
+	// drop-in; applyRootAuth (#5276) is the sole manager of root's /etc/shadow
+	// password and /root/.ssh/authorized_keys, so it MUST run here too — else a
+	// committed `delete system root-authentication ssh-keys` leaves the revoked
+	// root key live for the whole stop window (#5643 Gap A).
+	d.applySystemLogin(cfg)
+	d.reconcileSudoers(cfg)
+	d.reconcileAbsentLoginUsers(cfg)
+	d.applySSHConfig(cfg)
+	d.applyRootAuth(cfg)
+	return errors.Join(lo0Err, hostInboundErr)
+}
+
+// closeoutHostAuthOnCancel wraps a post-promotion apply-abort error so a #2926
+// ctx-cancellation still runs the bounded, non-cancellable host-authorization
+// closeout before the error propagates (#5643 / M35). Store.Commit promotes the
+// config UPSTREAM of applyConfigLocked, so EVERY ctx-cancellation early-return
+// inside applyConfigLocked is post-promotion — C1 (in applyVRFReconcile, before
+// the netlink phase), C2 (before the dataplane apply), and C3 (before the FRR
+// reload) — and each leaves the durable config advanced while the nft/login/
+// root-auth host-authorization tail has not run. For a non-cancellation error it
+// returns err unchanged, and the healthy (uncancelled) path never calls this, so
+// a normal commit's tail is unaffected. Centralizing the guard here keeps all
+// three boundaries wired to the same closeout (#5643 Gap B).
+func (d *Daemon) closeoutHostAuthOnCancel(err error, cfg *config.Config) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if closeoutErr := d.applyHostAuthorizationCloseout(cfg); closeoutErr != nil {
+			return errors.Join(err, closeoutErr)
+		}
+	}
+	return err
 }
 
 // applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and
