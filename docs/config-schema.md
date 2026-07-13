@@ -3043,6 +3043,23 @@ reserved for whole-dataplane selection where a rewrite shim
     `pkg/config/compiler_dhcp_relay_overrides_test.go` (compile flat-set
     + merged-Keys value + block form + advisory) and
     `pkg/dhcprelay/relay_test.go` (`TestRunRelay_ConfiguredMaxHopCount`).
+- **#5670 (DHCP relay ingress rate limit):** added under group `overrides`:
+  - `maximum-packet-rate <pps>` (`ValidateInteger(1, 1000000)`) —
+    **enforced (DoS hardening)**. The relay admits at most this many
+    client-facing datagrams per second per interface, via a per-interface
+    token bucket checked BEFORE `dhcpv4.FromBytes` + the Option-82 fan-out,
+    so an untrusted client segment cannot CPU-exhaust the relay or amplify a
+    flood into the upstream servers (1 client packet → N server packets).
+    Unset = 100 pps default (`resolveMaxPacketRate`); the bucket starts full
+    with a 2-second burst; excess is dropped and counted in
+    `RelayStats.RequestsDroppedRateLimit`. Compiled into
+    `DHCPRelayGroup.MaximumPacketRate` and flows into
+    `relaySpec.maxPacketRate` (a change restarts the per-interface relay).
+    Both AST shapes handled. Coverage:
+    `pkg/config/compiler_dhcp_relay_overrides_test.go` (flat-set + merged +
+    block + completion + default) and `pkg/dhcprelay/relay_ratelimit_5670_test.go`
+    (`TestTokenBucket_BurstThenRefill` deterministic unit + the end-to-end
+    flood-drop `TestRunRelay_RateLimit_5670` / `TestRunRelay_RateLimit_DefaultBound`).
 - **#2008 H7 (security log profile):** declared the `security log
   profile <name>` stanza — `stream-name` (`ValueHintStreamName`
   completion), `default-profile` (presence flag), and

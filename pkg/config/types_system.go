@@ -1087,6 +1087,17 @@ type DHCPRelayGroup struct {
 	// relay, so an inbound nonzero giaddr + Option 82 is preserved untouched
 	// (the RFC 1542 §4.1 intermediate-relay behavior, #5071).
 	TrustOption82 bool
+	// MaximumPacketRate is the per-interface DHCP relay ingress rate limit in
+	// packets per second (#5670, Junos `overrides maximum-packet-rate`).
+	// ENFORCED. The relay admits at most this many client-facing datagrams per
+	// second per interface (a token bucket with a short burst allowance),
+	// dropping the excess before the DHCP parse + Option-82 fan-out so an
+	// untrusted client segment cannot CPU-exhaust the relay or amplify a flood
+	// into the upstream servers (1 client packet → N server packets). 0 = unset
+	// = the default (defaultMaxPacketRate, 100 pps). Set a high value to
+	// effectively disable the bound. Compiled into `relaySpec.maxPacketRate`
+	// (a change restarts the per-interface relay).
+	MaximumPacketRate int
 }
 
 // SamplingConfig holds sampling instance definitions.

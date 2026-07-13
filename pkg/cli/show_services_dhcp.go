@@ -125,6 +125,11 @@ func (c *CLI) showDHCPRelay() error {
 			if g.MaximumHopCount > 0 {
 				overrides = append(overrides, fmt.Sprintf("maximum-hop-count %d", g.MaximumHopCount))
 			}
+			// #5670: per-interface ingress rate limit (pps). Enforced; unset uses
+			// the default (100 pps) — show the effective bound either way.
+			if g.MaximumPacketRate > 0 {
+				overrides = append(overrides, fmt.Sprintf("maximum-packet-rate %d", g.MaximumPacketRate))
+			}
 			if g.ForwardOnly {
 				overrides = append(overrides, "forward-only (accepted-only)")
 			}
@@ -142,9 +147,9 @@ func (c *CLI) showDHCPRelay() error {
 		stats := c.dhcpRelay.Stats()
 		if len(stats) > 0 {
 			fmt.Println("\nRelay statistics:")
-			fmt.Printf("  %-16s %-20s %-20s %s\n", "Interface", "Requests relayed", "Replies forwarded", "Dropped (max-hops)")
+			fmt.Printf("  %-16s %-18s %-18s %-18s %s\n", "Interface", "Requests relayed", "Replies forwarded", "Dropped (max-hops)", "Dropped (rate-limit)")
 			for _, s := range stats {
-				fmt.Printf("  %-16s %-20d %-20d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded, s.RequestsDroppedMaxHops)
+				fmt.Printf("  %-16s %-18d %-18d %-18d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded, s.RequestsDroppedMaxHops, s.RequestsDroppedRateLimit)
 			}
 			// Reply-delivery breakdown (#2076). L2-fallback is the one to
 			// alert on: it means the raw-L2 path failed (CAP_NET_RAW,

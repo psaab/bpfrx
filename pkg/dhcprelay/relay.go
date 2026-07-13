@@ -45,6 +45,84 @@ func resolveMaxHopCount(n int) uint8 {
 	return uint8(n)
 }
 
+// defaultMaxPacketRate is the per-interface DHCP relay ingress rate limit (in
+// packets per second) applied when a group does not configure `overrides
+// maximum-packet-rate` (#5670). DHCP relay traffic is inherently low-rate (a
+// client sends a handful of packets per lease then renews on the order of
+// hours), so a 100 pps sustained bound with a short burst allowance is
+// generous for legitimate use yet caps an untrusted client segment that would
+// otherwise flood the relay — each admitted packet costs a variable-length
+// dhcpv4.FromBytes TLV parse, an Option 82 allocation, and a fan-out send to
+// EVERY configured server (a 1→N amplification into the upstream DHCP servers).
+const defaultMaxPacketRate = 100
+
+// resolveMaxPacketRate maps a configured per-interface packet-rate limit to the
+// value the relay enforces: 0 (unset) or a nonsensical negative falls back to
+// defaultMaxPacketRate. The schema bounds the leaf to 1..1000000, so this only
+// backstops a config that predates the bound (e.g. a loaded active.json).
+func resolveMaxPacketRate(n int) int {
+	if n <= 0 {
+		return defaultMaxPacketRate
+	}
+	return n
+}
+
+// tokenBucket is a simple token-bucket rate limiter for the per-interface relay
+// ingress path (#5670). It is accessed only from the single per-interface main
+// read-loop goroutine, so it carries no internal lock. `now` is an injectable
+// clock (time.Now in production; a fake in tests) so the refill behavior is
+// deterministically testable without sleeping.
+type tokenBucket struct {
+	rate   float64          // tokens added per second (sustained pps)
+	burst  float64          // bucket capacity (max tokens)
+	tokens float64          // current tokens
+	last   time.Time        // last refill timestamp
+	now    func() time.Time // clock seam
+}
+
+// newTokenBucket builds a token bucket admitting `rate` packets/second with a
+// `burst` capacity. It starts FULL so a cold relay tolerates an initial
+// simultaneous-boot burst up to `burst` before throttling to the sustained
+// rate. A nil clock defaults to time.Now.
+func newTokenBucket(rate, burst int, now func() time.Time) *tokenBucket {
+	if now == nil {
+		now = time.Now
+	}
+	return &tokenBucket{
+		rate:   float64(rate),
+		burst:  float64(burst),
+		tokens: float64(burst),
+		last:   now(),
+		now:    now,
+	}
+}
+
+// allow refills the bucket for the elapsed wall-clock time (capped at burst)
+// and consumes one token. It returns true if a token was available (the packet
+// is admitted) or false if the bucket is empty (the packet must be dropped).
+func (b *tokenBucket) allow() bool {
+	now := b.now()
+	if elapsed := now.Sub(b.last).Seconds(); elapsed > 0 {
+		b.tokens += elapsed * b.rate
+		if b.tokens > b.burst {
+			b.tokens = b.burst
+		}
+		b.last = now
+	}
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+// relayBurstFor sizes the token-bucket burst capacity from the sustained rate:
+// two seconds' worth of packets, so a brief simultaneous-boot spike is admitted
+// instantly while the sustained rate still bounds a persistent flood.
+func relayBurstFor(rate int) int {
+	return rate * 2
+}
+
 // readBufSize is the size of the per-loop read buffer for both the
 // client-facing and server-facing UDP sockets.
 //
@@ -145,6 +223,15 @@ type RelayStats struct {
 	// preserved only when the group sets `overrides trust-option-82`.
 	RequestsUntrustedGiaddrReset uint64
 
+	// RequestsDroppedRateLimit counts client-facing datagrams dropped by the
+	// per-interface ingress rate limiter (#5670) BEFORE the DHCP parse. A
+	// sustained nonzero value means this segment is exceeding its configured
+	// (or default 100) pps bound — either a misbehaving/looping client
+	// population or an active flood/amplification attempt. It is the
+	// observability signal for the DoS-hardening token bucket; raise the
+	// group's `overrides maximum-packet-rate` if a legitimate segment trips it.
+	RequestsDroppedRateLimit uint64
+
 	// RepliesDroppedUnknownServer counts server replies dropped because their
 	// source IP is NOT one of the configured DHCP servers (#4163). The
 	// server-facing socket is bound (not connected), so it accepts datagrams
@@ -198,6 +285,11 @@ type relaySpec struct {
 	// giaddr is treated as client-forged (overwritten, not preserved). A
 	// change flips the anti-spoofing behavior, so it participates in equal().
 	trustOption82 bool
+	// maxPacketRate is the per-interface DHCP relay ingress rate limit in
+	// packets per second (#5670). 0 = unset = the default (defaultMaxPacketRate,
+	// 100). A change resizes the token bucket, so it requires a fresh session
+	// and participates in equal().
+	maxPacketRate int
 }
 
 // equal reports whether two specs would produce an identical relay session.
@@ -209,6 +301,9 @@ func (s relaySpec) equal(o relaySpec) bool {
 		return false
 	}
 	if s.trustOption82 != o.trustOption82 {
+		return false
+	}
+	if s.maxPacketRate != o.maxPacketRate {
 		return false
 	}
 	if len(s.servers) != len(o.servers) {
@@ -277,6 +372,18 @@ type interfaceRelay struct {
 	// segment attempted to spoof a downstream relay's identity / Option 82.
 	requestsUntrustedGiaddrReset atomic.Uint64
 
+	// maxPacketRate is the resolved per-interface DHCP relay ingress rate limit
+	// in packets per second (#5670) — the token bucket admits at most this many
+	// client-facing datagrams per second. Resolved from the group's `overrides
+	// maximum-packet-rate` (default 100). Set once at start; read-only
+	// thereafter.
+	maxPacketRate int
+
+	// requestsDroppedRateLimit counts client-facing datagrams dropped by the
+	// per-interface ingress rate limiter (#5670). Observability for a flood /
+	// amplification attempt or a segment exceeding its configured pps bound.
+	requestsDroppedRateLimit atomic.Uint64
+
 	// Reply-delivery counters (#2076).
 	repliesL2Unicast           atomic.Uint64
 	repliesUnicastCiaddr       atomic.Uint64
@@ -335,6 +442,11 @@ type Manager struct {
 	// Both are seams so lifecycle tests drive a deterministic ifindex change.
 	resolveIfindex ifindexResolver
 	ifindexCheck   time.Duration
+
+	// now is the clock seam for the #5670 per-interface ingress rate limiter's
+	// token bucket. Defaulted to time.Now in NewManager; tests inject a fake so
+	// the rate-limit refill behavior is deterministic without sleeping.
+	now func() time.Time
 	// newL2 opens the raw-L2 unicast sender for an interface (#2076). It is
 	// a seam so tests can inject a fake or force open failure. The default
 	// returns (nil, err) → fail-soft to the broadcast path; the production
@@ -403,6 +515,7 @@ func NewManager() *Manager {
 		resolveIfindex: defaultIfindexResolver,
 		ifindexCheck:   ifindexCheckInterval,
 		newL2:          defaultL2SenderFactory,
+		now:            time.Now,
 	}
 }
 
@@ -633,6 +746,7 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 					alwaysBroadcast: group.AlwaysBroadcast,
 					maxHopCount:     group.MaximumHopCount,
 					trustOption82:   group.TrustOption82,
+					maxPacketRate:   group.MaximumPacketRate,
 				},
 				servers: serverAddrs,
 			}
@@ -713,6 +827,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			alwaysBroadcast: d.spec.alwaysBroadcast,
 			maxHopCount:     resolveMaxHopCount(d.spec.maxHopCount),
 			trustOption82:   d.spec.trustOption82,
+			maxPacketRate:   resolveMaxPacketRate(d.spec.maxPacketRate),
 		}
 		m.relays[name] = ir
 		toStart = append(toStart, struct {
@@ -759,6 +874,7 @@ func (m *Manager) Stats() []RelayStats {
 			RequestsDroppedBackup:        ir.requestsDroppedBackup.Load(),
 			RequestsDroppedMaxHops:       ir.requestsDroppedMaxHops.Load(),
 			RequestsUntrustedGiaddrReset: ir.requestsUntrustedGiaddrReset.Load(),
+			RequestsDroppedRateLimit:     ir.requestsDroppedRateLimit.Load(),
 			RepliesDroppedUnknownServer:  ir.repliesDroppedUnknownServer.Load(),
 			RepliesL2Unicast:             ir.repliesL2Unicast.Load(),
 			RepliesUnicastCiaddr:         ir.repliesUnicastCiaddr.Load(),
@@ -1010,7 +1126,7 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	slog.Info("dhcp-relay: listening",
 		"interface", ifaceName, "giaddr", giaddr, "ifindex", boundIfindex,
 		"always_broadcast", ir.alwaysBroadcast, "raw_l2", l2 != nil,
-		"trust_option_82", ir.trustOption82)
+		"trust_option_82", ir.trustOption82, "max_packet_rate_pps", ir.maxPacketRate)
 
 	// Both the cancel watcher and the server-response goroutine are tracked by
 	// the WaitGroup so the runner's wg.Wait() is a true join of every spawned
@@ -1118,6 +1234,16 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	func() {
 		defer cancel()
 		buf := make([]byte, readBufSize)
+		// #5670: per-interface ingress rate limiter. The token bucket admits at
+		// most ir.maxPacketRate client-facing datagrams per second (with a short
+		// burst allowance) so an untrusted client segment cannot flood the relay.
+		// It is owned solely by this single-goroutine read loop, so it needs no
+		// lock; the drop COUNTER on ir is atomic (Stats reads it). warnedRateLimit
+		// throttles the log to warn-once-per-session then Debug (never per packet,
+		// per the project logging rules).
+		rateBucket := newTokenBucket(ir.maxPacketRate,
+			relayBurstFor(ir.maxPacketRate), m.now)
+		warnedRateLimit := false
 		for {
 			n, srcAddr, err := conn.ReadFrom(buf)
 			if err != nil {
@@ -1130,6 +1256,26 @@ func (m *Manager) runRelaySession(ctx context.Context,
 				}
 				slog.Warn("dhcp-relay: read error",
 					"interface", ifaceName, "err", err)
+				continue
+			}
+
+			// #5670: bound the per-interface admit rate BEFORE the (variable-
+			// length TLV) dhcpv4.FromBytes parse and the Option-82 fan-out to
+			// EVERY configured server. Each admitted packet is a CPU cost and a
+			// 1→N amplification into the upstream DHCP servers, so an untrusted
+			// client segment flooding :67 must be throttled at the cheapest point.
+			// Excess is dropped and counted; the log is throttled (warn-once then
+			// Debug) so a sustained flood cannot spam the journal.
+			if !rateBucket.allow() {
+				ir.requestsDroppedRateLimit.Add(1)
+				if !warnedRateLimit {
+					slog.Warn("dhcp-relay: client request rate limit exceeded, dropping excess",
+						"interface", ifaceName, "rate_pps", ir.maxPacketRate, "src", srcAddr)
+					warnedRateLimit = true
+				} else {
+					slog.Debug("dhcp-relay: client request rate limit exceeded, dropping",
+						"interface", ifaceName, "src", srcAddr)
+				}
 				continue
 			}
 
