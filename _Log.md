@@ -47765,3 +47765,39 @@ top.
   tests RED — "expected strict commit to reject a same-name address +
   address-set collision", "lenient compile must record a collision warning";
   restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: Fix #5627 (codex-review-181 M15 / A3-b00-F02) — the Go
+  strict-commit path validated a source-NAT pool's `port range` but left its
+  ADDRESS members unchecked, so a pool referenced by a pool-mode
+  `then source-nat pool <name>` rule that carried a malformed member
+  (`not-an-ip`, `203.0.113.1/garbage`), an over-capacity prefix (host count >
+  65536 — a `/15`, `10.0.0.0/8`, or a v6 prefix shorter than `/112`), or no
+  addresses at all committed green — then the live Rust allocator
+  (`expand_pool_address`, userspace-dp/src/nat/source.rs) marked the pool
+  InvalidPool/EmptyPool and DROPPED the rule at runtime (a persistent NAT
+  outage visible only after apply). Fix: new strict gate
+  `validateSourceNATPoolAddressGrammarStrict` (+ `MaxSourceNATPoolPrefixHosts`
+  const mirroring MAX_POOL_PREFIX_HOSTS, + `sourceNATPoolAddressReason` helper)
+  in `compiler_validate_strict_nat.go`, wired in `runUniformGates` right after
+  the #5626 reference gate. It iterates ONLY pools a pool-mode rule references
+  (the exact set the dataplane snapshot expands → grammar-EQUIVALENT with live,
+  not Go-stricter), counts hosts off the prefix LENGTH without enumerating, and
+  rejects the same shapes Rust rejects (bare IP via netip.ParseAddr / CIDR via
+  netip.ParsePrefix with host count <= cap; empty referenced pool). `/16`
+  (65536 hosts, at cap) accepted, matching Rust's `count > MAX` comparison.
+  Strict = HARD REJECT; lenient (CompileConfigLenient) = warn-and-load via the
+  shared `lenientDestNATAddresses` flag (#1960 no-brick; snapshot marks pool
+  unusable independently). GO-ONLY — no Rust/cargo touched; the Rust grammar is
+  the authoritative reference the Go gate now mirrors.
+  **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates.go,
+  pkg/config/strict_nat_pool_grammar_5627_test.go (new),
+  docs/config-schema.md
+  GREEN: `go test ./pkg/config/...` passes (incl. TestEveryStrictCommitGateIsWired
+  canary). gofmt clean on touched files, go vet clean. Fail-on-revert proven:
+  unwiring the `validateSourceNATPoolAddressGrammarStrict` dispatch turns all 7
+  reject shapes (malformed-token, malformed-mask, over-cap /8, over-cap /15, v6
+  over-cap /111, empty, mixed) and both lenient-warn cases RED — "expected
+  strict commit to reject pool shape", "lenient compile must record a
+  source-nat pool address warning"; restored GREEN.
