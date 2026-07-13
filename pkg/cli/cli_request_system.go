@@ -135,7 +135,17 @@ func (c *CLI) zeroizeConfigRoot() (configDir, configBase string, err error) {
 	if p == "" {
 		return "", "", fmt.Errorf("zeroize: config store has no config path; cannot determine configured config root to erase")
 	}
-	return filepath.Dir(p), filepath.Base(p), nil
+	dir := filepath.Dir(p)
+	// #5684: refuse if the resolved root is a shared/parent/system directory. A
+	// custom -config placed directly in a shared directory (or a directory-shaped
+	// -config, where filepath.Dir climbs to the PARENT) would otherwise turn the
+	// factory reset into a broad deletion of *.conf / .configdb / tls siblings xpf
+	// does not own. Fail CLOSED (the shared FactoryResetConfigDir primitive guards
+	// again, but stopping here gives the earliest, clearest operator error).
+	if err := configstore.ValidateFactoryResetRoot(dir); err != nil {
+		return "", "", err
+	}
+	return dir, filepath.Base(p), nil
 }
 
 // zeroizeConfigState erases the on-disk configuration STATE for a factory reset:

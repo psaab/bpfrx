@@ -105,6 +105,17 @@ const (
 // silently-incomplete zeroize is never reported as a successful factory reset.
 // os.ErrNotExist is not an error here (an already-absent artifact is the goal).
 func zeroizeConfigDir(configDir, configBase string) error {
+	// #5684 defense-in-depth: refuse a shared/parent/system config root before
+	// any glob or RemoveAll. In production runZeroize already validates via
+	// (*Server).zeroizeConfigRoot before performZeroizeWipe reaches here, but
+	// this is the MORE destructive wipe primitive (it RemoveAll's <root>/tls and
+	// <root>/.configdb), so it re-validates itself — the same defense-in-depth the
+	// CLI's configstore.FactoryResetConfigDir applies. Fail CLOSED, removing
+	// NOTHING, rather than trust the caller not to hand it an unowned root.
+	if err := configstore.ValidateFactoryResetRoot(configDir); err != nil {
+		return err
+	}
+
 	var firstErr error
 	fail := func(err error) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
