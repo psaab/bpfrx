@@ -149,3 +149,47 @@ func TestRejoinAndConfirmSuccessUnchanged(t *testing.T) {
 		t.Fatalf("successful rejoin must return nil unchanged; got: %v", err)
 	}
 }
+
+// #5138: peer-alive + sync are GLOBAL predicates — they hold even when a
+// configured RG (e.g. RG>=3) is still held in the ForceSecondary drain after
+// ResetFailover. RejoinAndConfirm must NOT confirm rejoin on those two alone; it
+// must also see LocalRejoinComplete (per-RG eligibility for EVERY configured RG).
+// With a healthy peer + sync but an incomplete per-RG rejoin, the deadline must
+// be MISSED and the error must name the failed local-rejoin check — otherwise the
+// orchestrator would advance to drain the peer while that RG has no primary on
+// either node (a per-RG blackhole). RED-on-revert: dropping the LocalRejoinComplete
+// gate makes RejoinAndConfirm return nil here (peer-alive + sync suffice), failing
+// the assertions below.
+func TestRejoinAndConfirmRefusesHeldRG(t *testing.T) {
+	f := &fakeCluster{peerAlive: true, synced: true, rejoinIncomplete: true}
+	err := RejoinAndConfirm(f, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("rejoin must NOT confirm while a configured RG is still held in the " +
+			"ForceSecondary drain (peer-alive + sync are not sufficient) — never-both-down")
+	}
+	if !strings.Contains(err.Error(), "local-rejoined=false") {
+		t.Fatalf("timeout error must report the per-RG rejoin state; got: %v", err)
+	}
+	if !f.resetCalled {
+		t.Fatal("ResetFailover should still have been attempted")
+	}
+}
+
+// #5138: a persistent per-RG enumeration/transport failure must surface at the
+// deadline (naming the local-rejoin check with its cause), same discipline as the
+// peer-alive/sync surfacing (#4717). RED-on-revert: the discarded-error code drops
+// the local-rejoin cause.
+func TestRejoinAndConfirmSurfacesLocalRejoinError(t *testing.T) {
+	wantCause := errors.New("enumerate configured redundancy groups: gRPC unavailable")
+	f := &fakeCluster{peerAlive: true, synced: true, rejoinErr: wantCause}
+	err := RejoinAndConfirm(f, 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error when LocalRejoinComplete keeps failing")
+	}
+	if !strings.Contains(err.Error(), "local-rejoin error") {
+		t.Fatalf("timeout error must name the failed LocalRejoinComplete check; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), wantCause.Error()) {
+		t.Fatalf("timeout error must surface the underlying LocalRejoinComplete cause; got: %v", err)
+	}
+}

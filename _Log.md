@@ -47424,3 +47424,24 @@ top.
   reverting the guard to `workers > 1 ...` → 4 new tests RED (top-level +
   per-iface workers→1 stale restore, default-table probe-only, 4→1→4
   transition); restored GREEN. gofmt + go vet clean.
+
+- **Timestamp**: 2026-07-12
+- **Action**: #5138 — RejoinAndConfirm now gates on per-RG local eligibility
+  (Part 2). Part 1 ({0,1,2} fail-closed) was already fixed by #5044/PR #5175.
+  Added `RollingCluster.LocalRejoinComplete()`; grpcCluster impl reads the
+  STATUS topic (configured-RG enumeration, fail-closed) + INFORMATION topic
+  (per-RG `Weight: W/255`) and reports rejoined only when EVERY configured RG
+  has a non-zero weight (ForceSecondary zeroes weight; a still-zero RG is still
+  drained). RejoinAndConfirm's poll loop adds `rejoined` to the success
+  predicate and surfaces the last local-rejoin error at the deadline. Fake
+  updated with inverted `rejoinIncomplete` field so existing healthy-cluster
+  tests stay green.
+- **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/cluster_cli.go,
+  pkg/upgrade/kernel_drain.go, pkg/upgrade/rolling_test.go,
+  pkg/upgrade/cluster_cli_test.go, pkg/upgrade/kernel_drain_test.go,
+  docs/in-place-upgrade.md
+- **Validation**: `go test ./pkg/upgrade/` GREEN; full `go build ./...` +
+  `go vet ./pkg/upgrade/` clean; gofmt clean on touched files. Fail-on-revert
+  proven: neutralizing the RejoinAndConfirm gate AND the parser →
+  TestRejoinAndConfirmRefusesHeldRG, TestRejoinAndConfirmSurfacesLocalRejoinError,
+  TestLocalRejoinCompleteFromStatus all RED; restored GREEN.

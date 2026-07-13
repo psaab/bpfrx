@@ -22,6 +22,13 @@ type fakeCluster struct {
 	syncPolls    int
 	forced       bool
 	resetCalled  bool
+	// #5138 per-RG rejoin gate. Default (zero value) reports rejoin COMPLETE
+	// so the many existing healthy-cluster tests keep passing without edits;
+	// a test sets rejoinIncomplete=true to model a configured RG still held in
+	// the ForceSecondary drain after ResetFailover, or rejoinErr for a
+	// persistent enumeration/transport failure surfaced at the deadline.
+	rejoinIncomplete bool
+	rejoinErr        error
 	// #4717 test seams: when set, the predicate returns this error on EVERY
 	// poll (persistent transport failure), so a deadline miss must surface it.
 	peerAliveErr error
@@ -52,6 +59,12 @@ func (f *fakeCluster) DrainComplete() (bool, error) {
 }
 func (f *fakeCluster) ResetFailover() error        { f.resetCalled = true; return nil }
 func (f *fakeCluster) LocalPrimary() (bool, error) { return f.localPri, nil }
+func (f *fakeCluster) LocalRejoinComplete() (bool, error) {
+	if f.rejoinErr != nil {
+		return false, f.rejoinErr
+	}
+	return !f.rejoinIncomplete, nil
+}
 
 func fastRC() RollingConfig {
 	return RollingConfig{

@@ -576,6 +576,98 @@ func parseRGIDs(s string) []int {
 	return out
 }
 
+// LocalRejoinComplete reports whether the local node has left the
+// ForceSecondary drain for EVERY configured redundancy group (#5138). The
+// configured RG set is enumerated fail-closed from the STATUS topic (the same
+// source ResetFailover resets over); per-RG eligibility is read from the
+// INFORMATION topic, whose FormatInformation render carries a "Weight: W/255"
+// line per RG. ForceSecondary sets weight 0 for every RG; ResetFailover
+// restores it via re-election. So a configured RG that still shows weight 0 —
+// or is absent from the local status entirely — is NOT yet rejoined. Both
+// topics are dialed here and the decision is delegated to a pure function so
+// the fail-closed contract is unit-tested without a gRPC dial.
+func (g *grpcCluster) LocalRejoinComplete() (bool, error) {
+	st, stErr := g.statusText()
+	info, infoErr := g.information()
+	return localRejoinCompleteFromStatus(st, stErr, info, infoErr)
+}
+
+// localRejoinCompleteFromStatus decides per-RG rejoin from the rendered STATUS
+// text (s / statusErr — configured-RG enumeration) and INFORMATION text (info /
+// infoErr — per-RG weight). It FAILS CLOSED: a status-enumeration error, an
+// information-fetch error, a configured RG missing from the information render,
+// or a configured RG whose local weight is still 0 (the ForceSecondary drain)
+// all report not-rejoined. Kept pure so RejoinAndConfirm's per-RG gate is
+// exercised over rendered fixtures rather than a live cluster.
+func localRejoinCompleteFromStatus(s string, statusErr error, info string, infoErr error) (bool, error) {
+	rgs, err := configuredRGsFromStatus(s, statusErr)
+	if err != nil {
+		return false, err
+	}
+	if infoErr != nil {
+		return false, fmt.Errorf("read cluster information for per-RG rejoin: %w", infoErr)
+	}
+	weights := parseLocalRGWeights(info)
+	for _, rg := range rgs {
+		w, ok := weights[rg]
+		if !ok {
+			// Configured (per status) but not rendered in the local
+			// information view — cannot confirm eligibility: fail closed.
+			return false, nil
+		}
+		if w <= 0 {
+			// Still held in the ForceSecondary drain (weight 0).
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// parseLocalRGWeights extracts the LOCAL node's per-RG weight from the
+// `show chassis cluster information` (FormatInformation) text. It returns a map
+// rgID -> weight. FormatInformation renders, per group:
+//
+//	Redundancy group N:
+//	  ...
+//	  Weight: W/255 (threshold: 0)
+//
+// The header here is "Redundancy group N:" (a trailing ':' after the ID) —
+// DISTINCT from the STATUS topic's "Redundancy group: N , Failover count: M"
+// (a ':' immediately after "group"), so a status header can never be mistaken
+// for an information header. A malformed/unparseable header resets the current
+// group so a stray Weight line cannot bleed into the previous RG.
+func parseLocalRGWeights(info string) map[int]int {
+	out := map[int]int{}
+	cur := -1
+	for _, line := range strings.Split(info, "\n") {
+		l := strings.TrimSpace(line)
+		ll := strings.ToLower(l)
+		// Information-topic RG header: "redundancy group N:" — require the
+		// space after "group" (the status header has "group:" with no space)
+		// and a trailing ':'.
+		if strings.HasPrefix(ll, "redundancy group ") && strings.HasSuffix(ll, ":") {
+			cur = -1
+			mid := strings.TrimSpace(l[len("redundancy group") : len(l)-1])
+			if n, ok := atoiSafe(mid); ok {
+				cur = n
+			}
+			continue
+		}
+		if cur >= 0 && strings.HasPrefix(ll, "weight:") {
+			// "Weight: W/255 (threshold: 0)" -> W (the digits before '/').
+			rest := strings.TrimSpace(l[len("weight:"):])
+			numTok := rest
+			if i := strings.IndexByte(rest, '/'); i >= 0 {
+				numTok = strings.TrimSpace(rest[:i])
+			}
+			if n, ok := atoiSafe(numTok); ok {
+				out[cur] = n
+			}
+		}
+	}
+	return out
+}
+
 func (g *grpcCluster) LocalPrimary() (bool, error) {
 	s, err := g.information()
 	if err != nil {

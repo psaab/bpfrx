@@ -373,6 +373,109 @@ func TestConfiguredRGsFromStatus_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestParseLocalRGWeights_AgainstRealFormatInformation feeds REAL
+// cluster.Manager.FormatInformation() output through parseLocalRGWeights so a
+// rename of the per-RG "Redundancy group N:" header or the "Weight: W/255" line
+// breaks HERE (a unit test), not in production where it would silently make the
+// #5138 per-RG rejoin gate read every RG as "not rendered" → fail-closed forever
+// (a rejoin that can never confirm). It also proves the parser keys ID -> weight
+// for more than one group, including RG>=3.
+func TestParseLocalRGWeights_AgainstRealFormatInformation(t *testing.T) {
+	m := cluster.NewManager(0, 1)
+	m.UpdateConfig(&config.ClusterConfig{
+		ClusterID: 1,
+		NodeID:    0,
+		RedundancyGroups: []*config.RedundancyGroup{
+			{ID: 0, Preempt: true, NodePriorities: map[int]int{0: 200, 1: 100}},
+			{ID: 3, Preempt: true, NodePriorities: map[int]int{0: 200, 1: 100}},
+		},
+	})
+
+	info := m.FormatInformation()
+	if !strings.Contains(info, "Weight:") {
+		t.Fatalf("FormatInformation() lacks the 'Weight:' line parseLocalRGWeights keys on:\n%s", info)
+	}
+
+	weights := parseLocalRGWeights(info)
+	if len(weights) != 2 {
+		t.Fatalf("parseLocalRGWeights = %v, want 2 groups (0 and 3) from:\n%s", weights, info)
+	}
+	for _, rg := range []int{0, 3} {
+		w, ok := weights[rg]
+		if !ok {
+			t.Fatalf("parseLocalRGWeights missing RG %d: %v\n%s", rg, weights, info)
+		}
+		// A freshly configured (undrained) RG must render a NON-ZERO weight, or
+		// the rejoin gate would never confirm a healthy node.
+		if w <= 0 {
+			t.Errorf("parseLocalRGWeights[%d] = %d, want > 0 for an undrained RG", rg, w)
+		}
+	}
+}
+
+// TestLocalRejoinCompleteFromStatus proves the #5138 fix: rejoin is confirmed
+// ONLY when EVERY configured RG (enumerated fail-closed from the status topic)
+// has left the ForceSecondary drain (non-zero weight in the information topic).
+// A configured RG still at weight 0 — or absent from the local information view
+// — must read as NOT rejoined so RejoinAndConfirm cannot advance the orchestrator
+// to drain the peer while that RG has no primary on either node. RED if the
+// per-RG gate is dropped and rejoin confirms on peer-alive/sync alone.
+func TestLocalRejoinCompleteFromStatus(t *testing.T) {
+	// Status enumerates configured RGs 0, 1, 3 (RG>=3 must be honored).
+	status := strings.Join([]string{
+		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
+		"Redundancy group: 1 , Failover count: 0",
+		"Redundancy group: 3 , Failover count: 0",
+	}, "\n")
+
+	// FormatInformation grammar: "Redundancy group N:" header + "Weight: W/255".
+	infoAllEligible := strings.Join([]string{
+		"Redundancy group 0:",
+		"  Local state: Secondary",
+		"  Weight: 255/255 (threshold: 0)",
+		"Redundancy group 1:",
+		"  Local state: Secondary",
+		"  Weight: 128/255 (threshold: 0)",
+		"Redundancy group 3:",
+		"  Local state: Secondary",
+		"  Weight: 255/255 (threshold: 0)",
+	}, "\n")
+	// RG3 still held in the ForceSecondary drain (weight 0) — the exact #5138
+	// scenario the pre-#5044 {0,1,2} guess would have stranded.
+	infoRG3Held := strings.ReplaceAll(infoAllEligible,
+		"Redundancy group 3:\n  Local state: Secondary\n  Weight: 255/255 (threshold: 0)",
+		"Redundancy group 3:\n  Local state: Secondary\n  Weight: 0/255 (threshold: 0)")
+	// RG3 not rendered in the local information view at all.
+	infoRG3Missing := strings.Join([]string{
+		"Redundancy group 0:",
+		"  Weight: 255/255 (threshold: 0)",
+		"Redundancy group 1:",
+		"  Weight: 255/255 (threshold: 0)",
+	}, "\n")
+
+	if ok, err := localRejoinCompleteFromStatus(status, nil, infoAllEligible, nil); err != nil || !ok {
+		t.Fatalf("all RGs weight>0: got ok=%v err=%v, want ok=true err=nil", ok, err)
+	}
+	if ok, err := localRejoinCompleteFromStatus(status, nil, infoRG3Held, nil); err != nil || ok {
+		t.Fatalf("RG3 held at weight 0: got ok=%v err=%v, want ok=false err=nil "+
+			"(rejoin must NOT confirm while a configured RG is still drained)", ok, err)
+	}
+	if ok, err := localRejoinCompleteFromStatus(status, nil, infoRG3Missing, nil); err != nil || ok {
+		t.Fatalf("RG3 missing from information: got ok=%v err=%v, want ok=false err=nil "+
+			"(cannot confirm eligibility for an unrendered RG — fail closed)", ok, err)
+	}
+	// A status-enumeration failure fails closed with an error (propagated so the
+	// deadline miss surfaces WHY), never a guessed RG set.
+	if ok, err := localRejoinCompleteFromStatus("", errors.New("gRPC unavailable"), infoAllEligible, nil); err == nil || ok {
+		t.Fatalf("status error: got ok=%v err=%v, want ok=false err!=nil", ok, err)
+	}
+	// An information-fetch failure likewise fails closed.
+	if ok, err := localRejoinCompleteFromStatus(status, nil, "", errors.New("gRPC unavailable")); err == nil || ok {
+		t.Fatalf("information error: got ok=%v err=%v, want ok=false err!=nil", ok, err)
+	}
+}
+
 func TestParseHAProtocolCompatible(t *testing.T) {
 	match := "HA protocol version: 1\nPeer HA protocol version: 1\n"
 	mismatch := "HA protocol version: 1\nPeer HA protocol version: 2\n"

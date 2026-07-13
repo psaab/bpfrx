@@ -34,6 +34,18 @@ type RollingCluster interface {
 	// LocalPrimary reports whether the local node currently owns the RGs
 	// (used by the controlled-promotion forward-verify).
 	LocalPrimary() (bool, error)
+	// LocalRejoinComplete reports whether the local node has actually
+	// resumed election eligibility for EVERY configured redundancy group
+	// after ResetFailover — i.e. no configured RG is still held in the
+	// ForceSecondary drain (weight 0). ResetFailover only REQUESTS the reset
+	// per RG; a request that returned nil is not proof the RG left the drain,
+	// and a client that could not enumerate an RG never issued its reset at
+	// all. RejoinAndConfirm gates the "never both down" advance on this
+	// per-RG check so a rejoin can never confirm while some configured RG
+	// (e.g. RG>=3 the pre-#5044 {0,1,2} guess dropped) stays demoted with no
+	// primary on either node (#5138). FAILS CLOSED: an enumeration error or a
+	// configured RG missing from the local status reads as not-yet-rejoined.
+	LocalRejoinComplete() (bool, error)
 }
 
 // RollingConfig tunes the rolling driver timing.
