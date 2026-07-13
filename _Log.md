@@ -47845,6 +47845,33 @@ top.
   address-set collision", "lenient compile must record a collision warning";
   restored GREEN.
 
+- **Timestamp**: 2026-07-13 00:40
+  **Action**: Fix #5723 — config-seconds*time.Second overflow sweep (sibling of
+  #5705/#5722 keepalive crash). Audited the 5 flagged NewTicker/NewTimer/After
+  sites. Only RPM `test-interval`/`probe-interval` were operator-settable AND
+  unbounded at admission (ValidateIntegerMin(1), no upper) → a huge value
+  overflows time.Duration(sec)*time.Second to a non-positive Duration →
+  time.NewTicker panic in runProbeLoop (commit-reachable xpfd crash). Applied
+  the #5705 two-layer fix: (1) admission bound — probe-interval/test-interval
+  validators → ValidateInteger(1, MaxDurationSeconds) (the same
+  overflow-safe ceiling feeds update/hold-interval already use); (2) runtime
+  clamp — clampRPMIntervalSeconds([1, MaxDurationSeconds]) before the multiply
+  in runProbeLoop, defense-in-depth for the lenient HA-sync/Load ingress.
+  Other 4 sites need NO change: LLDP transmit-interval already bounded
+  ValidateInteger(5, 32768); feeds update-interval/hold-interval already
+  ValidateInteger(1, MaxDurationSeconds); daemon_ipsec_rebind + daemon_rpm
+  pin-retry use a test-seam Duration + compile-time-constant fallback with an
+  `interval <= 0` guard (not config-derived).
+  **File(s)**: pkg/config/schema_system.go, pkg/rpm/rpm.go, pkg/rpm/README.md,
+  pkg/config/rpm_interval_bound_5723_test.go,
+  pkg/rpm/rpm_interval_overflow_5723_test.go
+  GREEN: `go test ./pkg/rpm/... ./pkg/lldp/... ./pkg/daemon/... ./pkg/feeds/...
+  ./pkg/config/...` all pass; gofmt + vet clean. Fail-on-revert (both layers):
+  reverting clampRPMIntervalSeconds to a bare multiply →
+  TestClampRPMIntervalSecondsBoundsOverflow_5723 RED
+  ("clampRPMIntervalSeconds(9223372036854775807) = -1s, want positive");
+  reverting the validators to ValidateIntegerMin(1) →
+  TestRPMIntervalSchemaGate_5723 RED (6 huge values accepted). Restored GREEN.
 - **Timestamp**: 2026-07-13
   **Action**: Fix #5627 (codex-review-181 M15 / A3-b00-F02) — the Go
   strict-commit path validated a source-NAT pool's `port range` but left its
