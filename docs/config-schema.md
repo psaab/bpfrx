@@ -5621,9 +5621,15 @@ strict-vs-lenient gates:
   `junos-ms-rpc` = {`junos-ms-rpc-tcp`, `junos-ms-rpc-udp`}, `junos-sun-rpc` =
   {`junos-sun-rpc-tcp`, `junos-sun-rpc-udp`}, `junos-cifs` =
   {`junos-netbios-session`, `junos-smb-session`}, `junos-routing-inbound` =
-  {`junos-bgp`, `junos-rip`, `junos-ldp-tcp`, `junos-ldp-udp`}. Every member is
-  in the `PredefinedApplications` table, so each set expands to >= 1 member and
-  clears the empty-set fail-open gate (#3146). Before #4102 only the
+  {`junos-bgp`, `junos-rip`, `junos-ldp-tcp`, `junos-ldp-udp`}, and (#5634)
+  `junos-sip` = {`junos-sip-udp`, `junos-sip-tcp`} (both destination-port 5060 —
+  SIP signals over UDP by default and TCP since 12.3X48-D25 / 17.3R1). Every
+  member is in the `PredefinedApplications` table, so each set expands to >= 1
+  member and clears the empty-set fail-open gate (#3146). `junos-sip` was the
+  one predefined name MOVED from the application table to the set table:
+  `resolveUserspaceApplicationNames` resolves an application first, so a
+  UDP-only `junos-sip` application would shadow the set and re-drop TCP/5060 —
+  it must be a set only (`predefined_sip_5634_test.go`). Before #4102 only the
   protocol-split members shipped and the bundle names were nowhere, so a stock
   vSRX policy `match application junos-ms-rpc` hard-failed at commit
   (`validatePolicyMatchApplicationsStrict`) and, on the tolerant path, at runtime

@@ -47390,3 +47390,20 @@ top.
     EmitTunnelEndpointNames contract doc comment.
   - **File(s)**: pkg/config/tunnelemit.go (Edit),
     pkg/config/tunnelemit_perunit_5635_test.go (Write), _Log.md (Edit)
+
+## 2026-07-12 — #5634 junos-sip TCP/5060 parity
+
+- **Timestamp**: 2026-07-12
+- **Action**: Model predefined `junos-sip` as a UDP+TCP/5060 application-set
+  (was UDP-only application, dropping TCP/5060 SIP from any referencing policy).
+  Added `junos-sip-udp` (udp/5060) + `junos-sip-tcp` (tcp/5060) to
+  `PredefinedApplications`; removed the UDP-only `junos-sip` application; added
+  `junos-sip` = {junos-sip-udp, junos-sip-tcp} to `PredefinedApplicationSets`
+  (mirrors #4102 junos-ms-rpc). Must be a set only — app-first resolution would
+  otherwise shadow the set and re-drop TCP.
+- **File(s)**: pkg/config/predefined.go, pkg/config/predefined_sip_5634_test.go,
+  pkg/policymatch/predefined_sip_5634_test.go, docs/config-schema.md
+- **Validation**: `go test ./pkg/config/... ./pkg/policymatch/...
+  ./pkg/dataplane/userspace/... ./pkg/appid/...` GREEN; `go build ./...` OK.
+  Fail-on-revert proven: dropping the TCP member → policymatch tcp/5060 SIP
+  falls to default-deny (Matched=false, DefaultUsed=true), RED; restored GREEN.
