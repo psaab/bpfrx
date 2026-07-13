@@ -6035,3 +6035,121 @@ func TestGenerateProtocols_ISISBFDInsideInterfaceBlock(t *testing.T) {
 		t.Errorf("`isis bfd` emitted AFTER the interface `exit` (#2942 regression) — lands in global scope; got:\n%s", got)
 	}
 }
+
+// TestPolicyRouteFilterPrefixListSameFamilyNoCollision locks the #5730 fix: a
+// policy term carrying BOTH an on-family route-filter AND a same-family
+// `from prefix-list` must render the two as DISTINCT FRR match rule types so
+// FRR ANDs them, not as two `match ipv6 address prefix-list` clauses (which
+// collide — FRR's route_map_add_match REPLACES a same-type rule and keeps only
+// the LAST, silently dropping the route-filter constraint and loosening
+// "(route-filter) AND (prefix-list)" to prefix-list-only).
+//
+// The fix renders the from-prefix-list as an ACCESS-LIST match
+// (`match ipv6 address <name>_rf`, a distinct FRR rule type from
+// `match ipv6 address prefix-list`). A v6 route in the prefix-list but OUTSIDE
+// the route-filter range therefore still fails the route-filter's prefix-list
+// clause and does NOT match the term.
+//
+// Fail-on-revert: neutralize the collision branch so the from-prefix-list
+// renders as a second `match ipv6 address prefix-list V6ONLY` — the
+// access-list match / definition assertions fail AND the "must NOT collide"
+// assertion fires.
+func TestPolicyRouteFilterPrefixListSameFamilyNoCollision(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{
+			"V6ONLY": {Name: "V6ONLY", Prefixes: []string{"2001:db8:ffff::/48"}},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"MIX": {
+				Name: "MIX",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:   "t1",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "2001:db8::/32", MatchType: "orlonger"},
+						},
+						PrefixList: []string{"V6ONLY"},
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	// The route-filter's prefix-list match line must still be present.
+	if !strings.Contains(got, "match ipv6 address prefix-list MIX-t1") {
+		t.Errorf("route-filter match line dropped; want %q in:\n%s",
+			"match ipv6 address prefix-list MIX-t1", got)
+	}
+	// The from-prefix-list must render as an ACCESS-LIST match (distinct FRR
+	// rule type) so FRR ANDs it with the route-filter's prefix-list match.
+	if !strings.Contains(got, "match ipv6 address V6ONLY_rf") {
+		t.Errorf("from-prefix-list not rendered as an access-list match; want %q in:\n%s",
+			"match ipv6 address V6ONLY_rf", got)
+	}
+	// Its access-list definition must be emitted (exact-match preserves the
+	// Junos `from prefix-list` exact semantics).
+	wantACL := "ipv6 access-list V6ONLY_rf seq 5 permit 2001:db8:ffff::/48 exact-match"
+	if !strings.Contains(got, wantACL) {
+		t.Errorf("missing access-list definition; want %q in:\n%s", wantACL, got)
+	}
+	// The COLLISION form must NOT appear: a second `match ipv6 address
+	// prefix-list` for the from-prefix-list would let FRR replace the
+	// route-filter clause (the #5730 bug).
+	if strings.Contains(got, "match ipv6 address prefix-list V6ONLY") {
+		t.Errorf("from-prefix-list collided as a second same-type prefix-list match (#5730 regression); got:\n%s", got)
+	}
+	// Exactly ONE `match ipv6 address prefix-list` line — the route-filter's.
+	if n := strings.Count(got, "match ipv6 address prefix-list "); n != 1 {
+		t.Errorf("expected exactly 1 `match ipv6 address prefix-list` line (the route-filter's), got %d:\n%s", n, got)
+	}
+}
+
+// TestPolicyRouteFilterPrefixListOffFamilyUnchanged guards that the #5730 fix
+// does NOT touch the #5702 off-family coexistence: a v4 route-filter co-resident
+// with a v6 `from prefix-list` are ALREADY distinct FRR rule types
+// (`match ip address prefix-list` vs `match ipv6 address prefix-list`), so the
+// from-prefix-list stays a prefix-list match (fail-closed AND — no v4 route can
+// satisfy a v6-only list), never an access-list.
+func TestPolicyRouteFilterPrefixListOffFamilyUnchanged(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{
+			"V6ONLY": {Name: "V6ONLY", Prefixes: []string{"2001:db8:ffff::/48"}},
+		},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"OFF": {
+				Name: "OFF",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:   "t1",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "orlonger"},
+						},
+						PrefixList: []string{"V6ONLY"},
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	if !strings.Contains(got, "match ip address prefix-list OFF-t1") {
+		t.Errorf("v4 route-filter match line missing; got:\n%s", got)
+	}
+	// Off-family from-prefix-list must remain a prefix-list match (#5702),
+	// NOT be converted to an access-list.
+	if !strings.Contains(got, "match ipv6 address prefix-list V6ONLY") {
+		t.Errorf("off-family from-prefix-list must stay a prefix-list match (#5702); got:\n%s", got)
+	}
+	if strings.Contains(got, "V6ONLY_rf") {
+		t.Errorf("off-family from-prefix-list must NOT be converted to an access-list; got:\n%s", got)
+	}
+}

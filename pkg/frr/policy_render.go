@@ -1501,6 +1501,47 @@ func renderRouteFilterEntry(b *strings.Builder, plName string, idx int, rf *conf
 	return true
 }
 
+// renderFromPrefixListACL writes an FRR access-list DEFINITION mirroring the
+// matchKW-family entries of Junos from-prefix-list pl into access-list aclName,
+// so the caller can reference it with a `match ip|ipv6 address <aclName>`
+// clause. It exists to break the #5730 collision: when one route-map sequence
+// carries BOTH a route-filter and a SAME-FAMILY `from prefix-list`, both would
+// otherwise render as `match ip|ipv6 address prefix-list`, and FRR's
+// route_map_add_match REPLACES a same-type rule (keeps the LAST) — silently
+// dropping the route-filter constraint and loosening "(route-filter) AND
+// (prefix-list)" to prefix-list-only (a fail-open policy-semantics change). An
+// access-list match is a DISTINCT FRR rule type (`route_match_ip_address`
+// vs `route_match_ip_address_prefix_list`), so FRR ANDs the two constraints
+// instead of replacing. Entries use `exact-match` to mirror Junos `from
+// prefix-list` (and the prefix-list renderer's bare-permit) exact semantics.
+// Only the matchKW-family entries are emitted, mirroring the single-family
+// match the prefix-list branch derives (a mixed v4+v6 list selects the IPv6
+// matcher — the same #2071 homogeneous-family limitation). An empty family set
+// (or nil list) emits NO definition: the undefined access-list then NOMATCHes
+// every route (fail-closed), matching an undefined prefix-list. The prefix is
+// sanitized as a #4482-style belt against a leniently-loaded stored value.
+// Mirrors renderRouteFilterEntry's inline-definition style: the unindented
+// `access-list` line is emitted into the route-map body builder and processed
+// by FRR at the config node, exactly like the route-filter prefix-lists.
+func renderFromPrefixListACL(b *strings.Builder, aclName, matchKW string, pl *config.PrefixList) {
+	if pl == nil {
+		return
+	}
+	v6 := matchKW == "ipv6"
+	seqn := 5
+	for _, prefix := range pl.Prefixes {
+		if strings.Contains(prefix, ":") != v6 {
+			continue
+		}
+		if v6 {
+			fmt.Fprintf(b, "ipv6 access-list %s seq %d permit %s exact-match\n", aclName, seqn, sanitizeFRRValue(prefix))
+		} else {
+			fmt.Fprintf(b, "access-list %s seq %d permit %s exact-match\n", aclName, seqn, sanitizeFRRValue(prefix))
+		}
+		seqn += 5
+	}
+}
+
 // indexedRouteFilter carries a route-filter together with its ORIGINAL
 // index in the term's route-filter slice so the FRR prefix-list entry
 // seq slot ((idx+1)*5) stays stable when the slice is partitioned by
@@ -1884,6 +1925,15 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 		emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName, fromPrefixList, fromCommunity, fromASPath string) {
 			fmt.Fprintf(&b, "route-map %s %s %d\n", routeMapName, action, seqNum)
 
+			// rfMatchEmitted / rfMatchV6 record whether THIS sequence emitted a
+			// route-filter "match ip|ipv6 address prefix-list" line and its
+			// family, so the from-prefix-list branch below can detect a
+			// same-family, same-type collision (#5730) and render the
+			// from-prefix-list as a DISTINCT-type access-list match instead of a
+			// second (colliding) prefix-list match.
+			rfMatchEmitted := false
+			rfMatchV6 := false
+
 			// Inline prefix-list for this sequence's route-filters.
 			if len(term.RouteFilters) > 0 {
 				// matchV6 selects the address family of the
@@ -1935,6 +1985,8 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 				} else {
 					fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
 				}
+				rfMatchEmitted = true
+				rfMatchV6 = matchV6
 			}
 
 			if fromPrefixList != "" {
@@ -1980,16 +2032,34 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 				// last. OR is therefore expressed by one route-map SEQUENCE
 				// per entry (the dispatch loop below), each carrying the full
 				// term body — exactly the #2607 split structure.
+				fromPL := po.PrefixLists[fromPrefixList]
 				matchKW := "ip"
-				if pl := po.PrefixLists[fromPrefixList]; pl != nil {
-					for _, p := range pl.Prefixes {
+				if fromPL != nil {
+					for _, p := range fromPL.Prefixes {
 						if strings.Contains(p, ":") {
 							matchKW = "ipv6"
 							break
 						}
 					}
 				}
-				fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
+				// #5730: when THIS sequence ALSO emitted a same-family
+				// route-filter "match ip|ipv6 address prefix-list" line, a
+				// second same-type "match ... prefix-list" for the
+				// from-prefix-list COLLIDES — FRR's route_map_add_match REPLACES
+				// a same-type rule (keeps the LAST), silently dropping the
+				// route-filter constraint and loosening "(route-filter) AND
+				// (prefix-list)" to prefix-list-only. Render the from-prefix-list
+				// as an ACCESS-LIST match — a DISTINCT FRR rule type — so FRR
+				// ANDs the two constraints. A DIFFERENT-family route-filter (the
+				// #5702 off-family fail-closed coexistence) is already a distinct
+				// FRR type, so it keeps the prefix-list match unchanged.
+				if rfMatchEmitted && rfMatchV6 == (matchKW == "ipv6") {
+					aclName := fromPrefixList + "_rf"
+					renderFromPrefixListACL(&b, aclName, matchKW, fromPL)
+					fmt.Fprintf(&b, " match %s address %s\n", matchKW, aclName)
+				} else {
+					fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, fromPrefixList)
+				}
 			}
 
 			// Junos "from protocol [ bgp ospf static ]" matches ANY listed
