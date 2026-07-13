@@ -93,7 +93,14 @@ var PredefinedApplications = map[string]*Application{
 	"junos-cvspserver": {Name: "junos-cvspserver", Protocol: "tcp", DestinationPort: "2401"},
 
 	// --- VoIP / signaling ---
-	"junos-sip":     {Name: "junos-sip", Protocol: "udp", DestinationPort: "5060"},
+	// SIP signals over BOTH transports on port 5060 (UDP by default, TCP added
+	// in Junos 12.3X48-D25 / 17.3R1). Real Junos `junos-sip` matches UDP/5060 AND
+	// TCP/5060, so it is modeled as the PredefinedApplicationSet "junos-sip" below
+	// over these two single-protocol members — mirroring the junos-ms-rpc /
+	// junos-sun-rpc TCP+UDP split. The prior UDP-only predefined application
+	// silently dropped TCP/5060 SIP from any policy referencing junos-sip (#5634).
+	"junos-sip-udp": {Name: "junos-sip-udp", Protocol: "udp", DestinationPort: "5060"},
+	"junos-sip-tcp": {Name: "junos-sip-tcp", Protocol: "tcp", DestinationPort: "5060"},
 	"junos-mgcp-ua": {Name: "junos-mgcp-ua", Protocol: "udp", DestinationPort: "2427"},
 	"junos-mgcp-ca": {Name: "junos-mgcp-ca", Protocol: "udp", DestinationPort: "2727"},
 	"junos-h323":    {Name: "junos-h323", Protocol: "tcp", DestinationPort: "1720"},
@@ -182,6 +189,17 @@ var PredefinedApplicationSets = map[string]*ApplicationSet{
 	"junos-routing-inbound": {
 		Name:         "junos-routing-inbound",
 		Applications: []string{"junos-bgp", "junos-rip", "junos-ldp-tcp", "junos-ldp-udp"},
+	},
+	// SIP signaling over both transports: UDP/5060 (default) + TCP/5060 (SIP over
+	// TCP, Junos 12.3X48-D25 / 17.3R1). Junos `junos-sip` matches both; modeling
+	// it as a bundle (rather than the old UDP-only application) closes the
+	// TCP/5060 under-match (#5634). Member order is UDP-first to mirror the Junos
+	// default transport. resolveUserspaceApplicationNames resolves an application
+	// FIRST, so junos-sip MUST NOT remain in PredefinedApplications (an app hit
+	// would shadow this set and re-drop TCP/5060).
+	"junos-sip": {
+		Name:         "junos-sip",
+		Applications: []string{"junos-sip-udp", "junos-sip-tcp"},
 	},
 }
 
