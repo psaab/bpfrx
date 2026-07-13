@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -84,6 +86,136 @@ func TestPostPromotionCancelRunsHostAuthorizationCloseout(t *testing.T) {
 	if nftCalls == 0 {
 		t.Fatalf("nft host-authorization closeout did NOT run after a post-promotion cancel " +
 			"(#5643/M35 skew): durable config committed but kernel nft state left stale")
+	}
+}
+
+// rootAuthCloseoutHash is a well-formed crypt(3) SHA-512 hash distinct from the
+// staged shadow field, so applyRootAuth → reconcileUserPassword takes the apply
+// branch and pipes `root:<hash>` to the (faked) chpasswd — a privilege-free
+// observable that applyRootAuth ran (writing root's authorized_keys instead
+// would need a root-only chown that unprivileged test runs cannot perform).
+const rootAuthCloseoutHash = "$6$xpf5643salt$rootclos" //nolint:gosec // test-only non-secret
+
+// rootAuthCloseoutCfg builds a config whose system root-authentication sets a
+// root encrypted-password, so applyRootAuth (the SOLE manager of root's durable
+// credentials) has observable work in the closeout.
+func rootAuthCloseoutCfg(hash string) *config.Config {
+	cfg := &config.Config{}
+	cfg.System.RootAuthentication = &config.RootAuthConfig{EncryptedPassword: config.Secret(hash)}
+	return cfg
+}
+
+// TestPostPromotionCancelReconcilesRootAuth is the #5643 Gap A fail-on-revert
+// guard: the host-authorization closeout must run applyRootAuth (tail step 13),
+// not stop at applySSHConfig (step 12). applySSHConfig only writes the sshd
+// PermitRootLogin drop-in; applyRootAuth is the SOLE manager of root's
+// /etc/shadow password and /root/.ssh/authorized_keys, so omitting it leaves a
+// committed root-credential change unenforced for the whole stop window.
+//
+// The dp cancels the apply ctx during ApplyConfig (post-promotion, C3); the test
+// asserts applyRootAuth ran by observing chpasswd invoked with the committed
+// root password hash.
+//
+// Fail-on-revert: remove `d.applyRootAuth(cfg)` from applyHostAuthorizationCloseout
+// and chpasswd is never invoked (empty sentinel) — RED.
+func TestPostPromotionCancelReconcilesRootAuth(t *testing.T) {
+	installFakeNetworkctl(t)
+
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+
+	// Redirect /etc/shadow, /etc/passwd, the provenance-marker dir, and
+	// /root/.ssh to a throwaway tree (installs a fake chpasswd on PATH that
+	// records its stdin to `sentinel`). Seed an OLD root hash so the committed
+	// new hash is a genuine change (apply branch → chpasswd).
+	sentinel, _ := stageRootAuthEnv(t, "$6$old5643salt$oldroot")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dp := &postPromoCancelDP{cancel: cancel}
+	d := &Daemon{
+		dp:      dp,
+		vrrpMgr: vrrp.NewManager(),
+		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		opts:    Options{NoDataplane: true},
+	}
+
+	err := d.applyConfigLocked(ctx, rootAuthCloseoutCfg(rootAuthCloseoutHash))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyConfigLocked = %v, want context.Canceled", err)
+	}
+	if !dp.applied {
+		t.Fatalf("dataplane apply did not run: cancel was not post-promotion (C3)")
+	}
+	assertRootAuthApplied(t, sentinel, "#5643 Gap A: root credentials omitted from closeout")
+}
+
+// TestC1PostPromotionCancelRunsHostAuthorizationCloseout is the #5643 Gap B
+// fail-on-revert guard: the C1 boundary (inside applyVRFReconcile, before the
+// netlink phase) is post-promotion too — Store.Commit promotes UPSTREAM of
+// applyConfigLocked — so a daemon-stop cancel landing at C1 must ALSO run the
+// host-authorization closeout, not return context.Canceled bare.
+//
+// A pre-canceled ctx makes applyVRFReconcile bail at C1 before the dataplane
+// apply (dp.applyCalls stays 0, proving the C1 path, distinct from the C2/C3
+// test). The closeout is observed via both the nft calls and applyRootAuth
+// invoking chpasswd with the committed root password.
+//
+// Fail-on-revert: revert the C1 return to a bare `return err` and neither the
+// nft closeout nor applyRootAuth runs — RED.
+func TestC1PostPromotionCancelRunsHostAuthorizationCloseout(t *testing.T) {
+	installFakeNetworkctl(t)
+
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftCalls := 0
+	nftApplyPayload = func(string) ([]byte, error) { nftCalls++; return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { nftCalls++; return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+
+	sentinel, _ := stageRootAuthEnv(t, "$6$old5643salt$oldroot")
+
+	dp := &runtimeOnlyApplyTestDP{}
+	d := &Daemon{
+		dp:      dp,
+		vrrpMgr: vrrp.NewManager(),
+		store:   newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		opts:    Options{NoDataplane: true},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-canceled: applyVRFReconcile bails at C1 before the dataplane apply
+
+	err := d.applyConfigLocked(ctx, rootAuthCloseoutCfg(rootAuthCloseoutHash))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyConfigLocked = %v, want context.Canceled", err)
+	}
+	if dp.applyCalls != 0 {
+		t.Fatalf("dataplane apply ran (applyCalls=%d): the cancel did not bail at C1", dp.applyCalls)
+	}
+	if nftCalls == 0 {
+		t.Fatalf("nft host-authorization closeout did NOT run after a C1 cancel (#5643 Gap B)")
+	}
+	assertRootAuthApplied(t, sentinel, "#5643 Gap B: C1 boundary not funneled through closeout")
+}
+
+// assertRootAuthApplied fails unless the faked chpasswd captured the committed
+// root password hash — the privilege-free proof that applyRootAuth ran in the
+// closeout.
+func assertRootAuthApplied(t *testing.T, sentinel, why string) {
+	t.Helper()
+	got, err := os.ReadFile(sentinel)
+	if err != nil {
+		t.Fatalf("applyRootAuth did NOT run in the closeout (%s): chpasswd never "+
+			"invoked (sentinel read err=%v)", why, err)
+	}
+	if !strings.Contains(string(got), rootAuthCloseoutHash) {
+		t.Fatalf("applyRootAuth did NOT apply the committed root password (%s): "+
+			"chpasswd stdin=%q, want it to contain %q", why, strings.TrimSpace(string(got)), rootAuthCloseoutHash)
 	}
 }
 

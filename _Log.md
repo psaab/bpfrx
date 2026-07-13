@@ -47708,3 +47708,31 @@ top.
   retry (pre-fix absent behavior) turns three tests RED — "retry debt was not
   recorded" (failed clear), "clearHelperHAStateLocked called 0 times, want 1"
   (poll-tick retry x2); restored GREEN.
+
+- **Timestamp**: 2026-07-13 00:20
+  **Action**: #5643 / PR #5776 — folded two hostile-review gaps into the
+  post-promotion host-authorization closeout. Gap A: applyHostAuthorizationCloseout
+  ran tail steps 9.5–12 but STOPPED at applySSHConfig (the sshd PermitRootLogin
+  drop-in only) and OMITTED step 13 applyRootAuth — the sole manager of root's
+  /etc/shadow password + /root/.ssh/authorized_keys — so `delete system
+  root-authentication ssh-keys` + commit + daemon-stop-cancel left the revoked
+  root key live for the stop window. Added d.applyRootAuth(cfg) after
+  applySSHConfig (bounded local file I/O, safe non-cancellable), matching tail
+  order 9.5→13. Gap B: a THIRD post-promotion cancel boundary (C1 in
+  applyVRFReconcile, returned directly at applyConfigLocked before the netlink
+  phase) was NOT wired to the closeout — a daemon-stop cancel landing at C1
+  returned context.Canceled with the closeout skipped. Extracted
+  closeoutHostAuthOnCancel(err, cfg) (runs the closeout only for
+  Canceled/DeadlineExceeded, else returns err unchanged) and call it at BOTH the
+  C1 early-return AND the C2/C3 err-return — behavior identical at C2/C3.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/README.md,
+  pkg/daemon/postpromo_ctx_skew_5643_test.go
+  GREEN: `go test ./pkg/daemon/...` passes; gofmt + vet clean; no pre-existing
+  failures. Fail-on-revert (both gaps): removing d.applyRootAuth from the
+  closeout → TestPostPromotionCancelReconcilesRootAuth + C1 test RED ("chpasswd
+  never invoked"); reverting the C1 return to bare `return err` →
+  TestC1PostPromotionCancelRunsHostAuthorizationCloseout RED ("nft
+  host-authorization closeout did NOT run after a C1 cancel") while C3/Gap-A
+  tests stay green. Root-auth observed privilege-free via the staged fake
+  chpasswd sentinel (writing /root/.ssh needs a root-only chown unprivileged
+  runs cannot do). Restored GREEN.
