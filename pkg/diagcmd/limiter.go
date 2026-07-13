@@ -79,8 +79,9 @@ var DefaultLimiter = NewLimiter(MaxConcurrentDiagnostics)
 
 // MaxConcurrentSessionWalks bounds how many full session-table walks may run
 // at once across EVERY control surface that exposes them — the REST session
-// list/summary/zone-pair endpoints and the gRPC GetSessions/GetSessionSummary
-// RPCs share the single SessionWalkLimiter below (#5708). Each walk holds
+// list/summary/zone-pair endpoints and the gRPC GetSessions/GetSessionSummary/
+// GetZonePairSummary RPCs share the single SessionWalkLimiter below (#5708).
+// Each walk holds
 // per-bucket BPF-map locks across the whole v4+v6 conntrack table while
 // contending with the live dataplane session-sync path, so an unbounded scan
 // flood on ANY surface multiplies that contention. Before #5708 only the REST

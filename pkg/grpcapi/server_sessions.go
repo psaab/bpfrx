@@ -32,7 +32,8 @@ type sessionEgressKey struct {
 }
 
 // sessionWalkLimiter is the aggregate concurrency bound for the gRPC
-// session-scan RPCs (GetSessions list + GetSessionSummary). It aliases the
+// session-scan RPCs (GetSessions list, GetSessionSummary, and
+// GetZonePairSummary). It aliases the
 // process-wide diagcmd.SessionWalkLimiter — the SAME instance the REST
 // session list/summary/zone-pair handlers use (pkg/api/sessions.go) — so a
 // session scan admitted over gRPC and one admitted over REST draw from one
@@ -900,6 +901,21 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+
+	// Admission bound (#5708, codex-review-182 M35): the zone-pair breakdown is
+	// an unconditional full v4+v6 conntrack-table walk (computeZonePairSummary,
+	// same per-bucket BPF-map lock contention as GetSessionSummary). Gate it
+	// through the SAME shared limiter as GetSessions/GetSessionSummary and the
+	// REST scans — the REST zone-pair handler is already gated, so without this
+	// zone-pairs is bounded on REST but unbounded on gRPC. Release on every exit
+	// path via defer; the peer fan-out below dials the peer (which gates its own
+	// walk), so this holds only the local slot.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		return nil, status.Error(codes.ResourceExhausted,
+			"session scan concurrency limit reached; retry shortly")
+	}
+	defer release()
 
 	resp := &pb.GetZonePairSummaryResponse{}
 	if s.cluster != nil {

@@ -47709,3 +47709,29 @@ top.
   GetSessionSummary over-cap and shared-singleton-saturation all return nil
   instead of ResourceExhausted); restored GREEN. Fully unit-verifiable, no
   cluster.
+
+- **Timestamp**: 2026-07-13
+  **Action**: #5708 / PR #5778 follow-up — hostile review (Bar 2) found a MISSED
+  gRPC scan path: GetZonePairSummary (pkg/grpcapi/server_sessions.go) is a
+  registered, client-reachable RPC whose computeZonePairSummary() does an
+  unconditional full v4+v6 IterateSessions/IterateSessionsV6 walk (same
+  BPF-map-lock cost as GetSessionSummary) but was NOT gated by the shared
+  sessionWalkLimiter — while its REST twin (GET
+  /security/sessions/summary/zone-pairs) IS gated, so zone-pairs was bounded on
+  REST but unbounded on gRPC (attacker just calls GetZonePairSummary). Folded
+  the same fail-fast Acquire→ResourceExhausted gate into GetZonePairSummary
+  (matching the two existing sites). Verified the peer path
+  (proxyPeerZonePairSummary) dials the peer with the x-peer-forwarded recursion
+  guard and does NOT re-enter the local handler → no double-acquire / cap-4
+  wedge. Added TestGRPCGetZonePairSummaryConcurrencyBound mirroring the summary
+  test. Updated the enumeration comments in diagcmd/limiter.go,
+  server_sessions.go (gRPC alias), and pkg/api/README.md to include
+  GetZonePairSummary. (ClearSessions REST/gRPC ungated gap is a separate
+  follow-up issue, out of this PR.)
+  **File(s)**: pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/server_sessions_bound_5708_test.go, pkg/diagcmd/limiter.go,
+  pkg/api/README.md
+  GREEN: go test ./pkg/grpcapi/... ./pkg/api/... ./pkg/diagcmd/... all ok;
+  gofmt + go vet + go build clean. Fail-on-revert proven: removing the
+  GetZonePairSummary gate → TestGRPCGetZonePairSummaryConcurrencyBound RED
+  ("err = <nil>, want codes.ResourceExhausted"); restored GREEN.

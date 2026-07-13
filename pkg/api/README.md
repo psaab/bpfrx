@@ -776,12 +776,15 @@ under the daemon's errgroup. Nothing else imports this package.
     shared-limiter cross-endpoint 429 + permit-release, RED-on-revert).
     **#5708 hoists this limiter to `diagcmd.SessionWalkLimiter`** so the SAME
     aggregate budget also covers the gRPC session-scan RPCs
-    (`GetSessions`/`GetSessionSummary`, `pkg/grpcapi/server_sessions.go`), which
-    drive the identical full v4+v6 walk and previously bypassed the REST bound
-    (codex-review-182 M35). A gRPC caller can no longer issue unbounded
-    full-table scans; over-cap gRPC scans return `codes.ResourceExhausted`. A
-    mix of REST + gRPC scrapers cannot collectively exceed
-    `diagcmd.MaxConcurrentSessionWalks`.
+    (`GetSessions`, `GetSessionSummary`, and `GetZonePairSummary` in
+    `pkg/grpcapi/server_sessions.go`), which drive the identical full v4+v6 walk
+    and previously bypassed the REST bound (codex-review-182 M35). The gRPC
+    zone-pair RPC was a particularly clear gap — its REST twin
+    (`GET /security/sessions/summary/zone-pairs`) was already gated, so
+    zone-pairs was bounded on REST but unbounded on gRPC. A gRPC caller can no
+    longer issue unbounded full-table scans; over-cap gRPC scans return
+    `codes.ResourceExhausted`. A mix of REST + gRPC scrapers cannot collectively
+    exceed `diagcmd.MaxConcurrentSessionWalks`.
   - **Bounded Total.** The offset mode's exact `total` previously forced a FULL
     v4+v6 table scan on EVERY 100-row page (O(table) per page, repeated per
     poll) just to count. The walk now caps the count at `sessionCountCap`

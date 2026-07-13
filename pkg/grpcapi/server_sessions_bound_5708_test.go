@@ -105,6 +105,33 @@ func TestGRPCGetSessionSummaryConcurrencyBound(t *testing.T) {
 	}
 }
 
+// (a3) Same admission contract for the zone-pair breakdown scan. The REST twin
+// (GET /security/sessions/summary/zone-pairs) is already gated, so without this
+// zone-pairs would be bounded on REST but an unbounded full-table walk on gRPC.
+func TestGRPCGetZonePairSummaryConcurrencyBound(t *testing.T) {
+	orig := sessionWalkLimiter
+	t.Cleanup(func() { sessionWalkLimiter = orig })
+	sessionWalkLimiter = diagcmd.NewLimiter(1)
+
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		t.Fatalf("failed to pre-acquire the only slot: %v", err)
+	}
+
+	s := newBoundSessionServer(t)
+
+	_, err = s.GetZonePairSummary(context.Background(), &pb.GetZonePairSummaryRequest{})
+	if !isResourceExhausted(err) {
+		release()
+		t.Fatalf("GetZonePairSummary with a full session-walk limiter: err = %v, want codes.ResourceExhausted", err)
+	}
+
+	release()
+	if _, err := s.GetZonePairSummary(context.Background(), &pb.GetZonePairSummaryRequest{}); isResourceExhausted(err) {
+		t.Fatalf("GetZonePairSummary after slot release still ResourceExhausted: %v", err)
+	}
+}
+
 // (c) The gRPC session scans draw from the PROCESS-WIDE diagcmd.SessionWalkLimiter
 // — the SAME instance the REST scans use — so a mix of REST+gRPC scrapers cannot
 // collectively exceed the aggregate budget. Saturating the shared singleton
