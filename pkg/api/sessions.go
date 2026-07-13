@@ -765,6 +765,20 @@ func (s *Server) clearSessionsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Admission bound (#5779): this local-only fallback drives a full-table
+	// chunked clear-all walk (ClearAllSessions), holding per-bucket BPF-map
+	// locks like the read scans. Gate it through the SAME shared limiter;
+	// over-cap gets HTTP 429. The HA-delegated path above is already gated by
+	// the gRPC ClearSessions handler, so gating ONLY this fallback avoids a
+	// double-acquire on one clear. Release on every exit path via defer.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		writeError(w, http.StatusTooManyRequests,
+			"session clear concurrency limit reached; retry shortly")
+		return
+	}
+	defer release()
+
 	v4, v6, err := s.dp.ClearAllSessions()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

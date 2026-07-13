@@ -47909,6 +47909,33 @@ top.
   source-nat pool address warning"; restored GREEN.
 
 - **Timestamp**: 2026-07-13
+  **Action**: #5779 — ClearSessions full-table walks were unbounded on both
+  surfaces (follow-up to #5708/#5778, the session-CLEAR mutation counterpart).
+  Both ClearSessions branches walk the whole v4+v6 conntrack table holding
+  per-bucket BPF-map locks: the clear-all path (ClearAllSessions is a chunked
+  full-table scan+delete via ClearAllSessionsChunked, NOT O(1)) and the
+  filtered path (clearFilteredSessionsV4/V6 — cursor IterateSessionsFrom in
+  production, rescan IterateSessions fallback). Same DoS class as #5708's read
+  scans. Fix: gate the gRPC ClearSessions handler ONCE at entry (after the
+  dp-loaded check) through the shared diagcmd.SessionWalkLimiter → over-cap
+  codes.ResourceExhausted; covers both branches + the peer fan-out with a
+  single slot. Gated the REST clearSessionsHandler's LOCAL-ONLY fallback
+  (s.dp.ClearAllSessions()) → HTTP 429; the HA-delegated REST path is already
+  gated by the gRPC handler it forwards to, so gating only the fallback avoids
+  a double-acquire. No keyed single-session (no-walk) branch exists inside
+  ClearSessions to exempt (DeleteSession is a separate dp op, not a gated RPC).
+  SessionCount/GetStatus/show-buffers NOT touched — that's the separate #5782
+  decision. Updated enumeration comments (diagcmd/limiter.go, server_sessions.go
+  alias, pkg/api/README.md).
+  **File(s)**: pkg/grpcapi/server_sessions.go, pkg/api/sessions.go,
+  pkg/diagcmd/limiter.go, pkg/api/README.md,
+  pkg/grpcapi/server_sessions_clear_bound_5779_test.go,
+  pkg/api/sessions_clear_bound_5779_test.go
+  GREEN: go test ./pkg/grpcapi/... ./pkg/api/... ./pkg/diagcmd/... all ok;
+  gofmt + go vet + go build clean. Fail-on-revert proven: removing both gates →
+  gRPC clear-all/shared-saturation tests RED ("err = <nil>, want
+  ResourceExhausted") + REST clear RED (status 200/cleared, want 429); restored
+  GREEN.
   **Action**: Fix #5744 — two interface AST pre-walks were still
   first-root-only after PR #5741 routed the interface-range expansion +
   stable-ID collision gates through all top-level roots. A hierarchical config
