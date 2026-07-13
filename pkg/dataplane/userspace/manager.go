@@ -207,6 +207,22 @@ type Manager struct {
 	// helper / control-socket error.
 	pendingWorkerArm bool
 
+	// pendingHAStateClear records "clear debt" from a standalone (non-cluster)
+	// HA-state clear whose idempotent empty update_ha_state RPC failed (#5487).
+	// A cluster->standalone reconfig clears the helper's HA groups; if that RPC
+	// hits a transient control-socket error the apply returns an error but the
+	// helper keeps the stale groups while the manager is clusterHA=false. The
+	// status poll's HA sync is gated behind m.clusterHA, so the clear is never
+	// retried and owner_rg_id<=0 forwarding candidates stay HAInactive (transit
+	// drop). The poll tick retries clearHelperHAStateLocked while this is set,
+	// OUTSIDE the clusterHA guard, until the helper reports no groups.
+	pendingHAStateClear bool
+
+	// clearHelperHAStateHook, when non-nil, replaces the update_ha_state RPC in
+	// clearHelperHAStateLocked so tests can inject a transient clear failure
+	// without a control socket (#5487). Production leaves it nil.
+	clearHelperHAStateHook func() error
+
 	lookupUserspaceCtrlForFailClosedHook userspaceCtrlLookupHook
 
 	// disableCtrlMapHook, when non-nil, replaces the bpfShim userspace_ctrl
