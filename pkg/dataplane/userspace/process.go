@@ -209,8 +209,10 @@ func (m *Manager) stopLocked() {
 	// Disable userspace forwarding BEFORE stopping the helper. Without this,
 	// the XDP shim continues redirecting to XSK after the helper exits,
 	// sending packets to dead socket fds. Setting ctrl.enabled=0 makes the
-	// shim pass only proven local/control traffic and drop transit.
-	m.disableUserspaceCtrlLocked()
+	// shim pass only proven local/control traffic and drop transit. If the
+	// disable cannot be verified, the wrapper clears all bindings fail-closed
+	// before the helper shutdown below (#5486).
+	_ = m.disableCtrlBeforeTeardownLocked()
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
 	done := make(chan struct{})
 	go func(cmd *exec.Cmd) {

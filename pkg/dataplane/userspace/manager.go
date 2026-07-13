@@ -209,6 +209,12 @@ type Manager struct {
 
 	lookupUserspaceCtrlForFailClosedHook userspaceCtrlLookupHook
 
+	// disableCtrlMapHook, when non-nil, replaces the bpfShim userspace_ctrl
+	// map in disableUserspaceCtrlLocked so tests can inject Lookup/Update/
+	// readback faults without a privileged BPF map (#5486). Production leaves
+	// it nil.
+	disableCtrlMapHook ctrlMapUpdater
+
 	// addrListForLocalSyncHook, when non-nil, replaces netlink.AddrList in
 	// buildDesiredLocalAddressSets so tests can inject a transient
 	// enumeration failure (#3924). Production leaves it nil.
