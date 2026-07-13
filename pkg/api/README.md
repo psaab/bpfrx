@@ -752,7 +752,8 @@ under the daemon's errgroup. Nothing else imports this package.
   - **Admission bound.** A session list is a full conntrack-table walk that
     contends with the live session-sync path for per-bucket BPF-map locks. The
     handler now acquires a slot from `sessionWalkLimiter`
-    (`diagcmd.NewLimiter(maxConcurrentSessionWalks)` = 4, the SAME fail-fast
+    (an alias of the process-wide `diagcmd.SessionWalkLimiter`, capacity
+    `diagcmd.MaxConcurrentSessionWalks` = 4, the SAME fail-fast
     counting-semaphore idiom the diagnostic ping/traceroute handlers use, #5057)
     BEFORE the walk and the peer fan-out, releasing on every exit path. Over-cap
     requests are rejected immediately with **HTTP 429** (`session list
@@ -773,6 +774,14 @@ under the daemon's errgroup. Nothing else imports this package.
     concurrency limit reached; retry shortly`). Pinned by
     `sessions_aggregation_bound_5433_test.go` (per-handler concurrency bound +
     shared-limiter cross-endpoint 429 + permit-release, RED-on-revert).
+    **#5708 hoists this limiter to `diagcmd.SessionWalkLimiter`** so the SAME
+    aggregate budget also covers the gRPC session-scan RPCs
+    (`GetSessions`/`GetSessionSummary`, `pkg/grpcapi/server_sessions.go`), which
+    drive the identical full v4+v6 walk and previously bypassed the REST bound
+    (codex-review-182 M35). A gRPC caller can no longer issue unbounded
+    full-table scans; over-cap gRPC scans return `codes.ResourceExhausted`. A
+    mix of REST + gRPC scrapers cannot collectively exceed
+    `diagcmd.MaxConcurrentSessionWalks`.
   - **Bounded Total.** The offset mode's exact `total` previously forced a FULL
     v4+v6 table scan on EVERY 100-row page (O(table) per page, repeated per
     poll) just to count. The walk now caps the count at `sessionCountCap`

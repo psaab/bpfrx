@@ -76,3 +76,22 @@ func (l *Limiter) Cap() int { return cap(l.sem) }
 // both surfaces (a diagnostic admitted over REST and one admitted over
 // gRPC draw from the same MaxConcurrentDiagnostics budget).
 var DefaultLimiter = NewLimiter(MaxConcurrentDiagnostics)
+
+// MaxConcurrentSessionWalks bounds how many full session-table walks may run
+// at once across EVERY control surface that exposes them — the REST session
+// list/summary/zone-pair endpoints and the gRPC GetSessions/GetSessionSummary
+// RPCs share the single SessionWalkLimiter below (#5708). Each walk holds
+// per-bucket BPF-map locks across the whole v4+v6 conntrack table while
+// contending with the live dataplane session-sync path, so an unbounded scan
+// flood on ANY surface multiplies that contention. Before #5708 only the REST
+// endpoints were gated; a gRPC caller could issue unbounded full-table scans
+// through the uncovered gRPC surface (codex-review-182 M35). The value mirrors
+// the original REST cap (#5318/#5433).
+const MaxConcurrentSessionWalks = 4
+
+// SessionWalkLimiter is the process-wide session-scan limiter shared by the
+// REST and gRPC session list/summary handlers, so one aggregate cap covers
+// both surfaces: a session scan admitted over REST and one admitted over gRPC
+// draw from the same MaxConcurrentSessionWalks budget, and a mix of REST+gRPC
+// scrapers cannot collectively exceed it. Mirrors DefaultLimiter.
+var SessionWalkLimiter = NewLimiter(MaxConcurrentSessionWalks)

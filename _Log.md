@@ -47680,3 +47680,32 @@ top.
   retry (pre-fix absent behavior) turns three tests RED — "retry debt was not
   recorded" (failed clear), "clearHelperHAStateLocked called 0 times, want 1"
   (poll-tick retry x2); restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: #5708 (codex-review-182 M35) — gRPC session list/summary scans
+  had no shared admission bound. The REST session-scan endpoints gate every
+  full v4+v6 conntrack-table walk through a fixed-capacity semaphore
+  (pkg/api sessionWalkLimiter, #5318/#5433), but the gRPC GetSessions /
+  GetSessionSummary RPCs (pkg/grpcapi/server_sessions.go) walked the same table
+  with NO admission bound — a gRPC caller could issue unbounded full-table
+  scans (each holding per-bucket BPF-map locks against the live session-sync
+  path), bypassing the REST gate = CPU/contention DoS through the uncovered
+  gRPC surface. Fix mirrors the existing shared diagcmd.DefaultLimiter
+  (diagnostics) precedent: hoisted the session-walk limiter to a process-wide
+  diagcmd.SessionWalkLimiter (+ MaxConcurrentSessionWalks=4), repointed
+  pkg/api's sessionWalkLimiter to it, and added a pkg/grpcapi alias gating
+  GetSessions (covers cursor+legacy+peer fan-out) and GetSessionSummary via
+  fail-fast Acquire → codes.ResourceExhausted on over-cap (the gRPC analog of
+  REST's HTTP 429). Now REST+gRPC scrapers draw from ONE aggregate budget and
+  a gRPC caller cannot exceed it. The list result set was already capped
+  (limit/pageSize clamp to 10000). Updated pkg/api/README.md admission-bound
+  section to note the #5708 hoist + gRPC coverage.
+  **File(s)**: pkg/diagcmd/limiter.go, pkg/api/sessions.go, pkg/api/README.md,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/server_sessions_bound_5708_test.go
+  GREEN: go test ./pkg/grpcapi/... ./pkg/api/... ./pkg/diagcmd/... all ok;
+  gofmt + go vet + go build clean. Fail-on-revert proven: removing the gRPC
+  Acquire gates → three admission-bound tests RED (GetSessions /
+  GetSessionSummary over-cap and shared-singleton-saturation all return nil
+  instead of ResourceExhausted); restored GREEN. Fully unit-verifiable, no
+  cluster.

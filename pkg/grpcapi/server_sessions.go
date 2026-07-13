@@ -22,6 +22,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
@@ -30,10 +31,40 @@ type sessionEgressKey struct {
 	vlanID  uint16
 }
 
+// sessionWalkLimiter is the aggregate concurrency bound for the gRPC
+// session-scan RPCs (GetSessions list + GetSessionSummary). It aliases the
+// process-wide diagcmd.SessionWalkLimiter — the SAME instance the REST
+// session list/summary/zone-pair handlers use (pkg/api/sessions.go) — so a
+// session scan admitted over gRPC and one admitted over REST draw from one
+// aggregate MaxConcurrentSessionWalks budget. Before #5708 the gRPC scans had
+// NO admission bound, so a gRPC caller could issue unbounded full v4+v6
+// conntrack-table walks (each holding per-bucket BPF-map locks against the
+// live session-sync path), bypassing the REST gate — a CPU/contention DoS
+// (codex-review-182 M35). Acquire is fail-fast; over-cap gRPC scans return
+// codes.ResourceExhausted (the gRPC analog of the REST HTTP 429, matching the
+// diagnostic ping/traceroute handlers, #5057). A package var so a test can
+// swap in a fresh small-capacity limiter.
+var sessionWalkLimiter = diagcmd.SessionWalkLimiter
+
 func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+
+	// Admission bound (#5708, codex-review-182 M35): GetSessions drives a full
+	// v4+v6 conntrack-table walk (both the cursor and legacy paths below, plus
+	// the peer fan-out) that contends with the live dataplane session-sync path
+	// for per-bucket BPF-map locks. Acquire a slot fail-fast BEFORE the walk so
+	// a concurrent gRPC scrape flood is rejected with ResourceExhausted rather
+	// than each driving its own simultaneous walk. The limiter is SHARED with
+	// the REST session scans, so a mix of REST+gRPC callers cannot collectively
+	// exceed the aggregate bound. Release on every exit path via defer.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		return nil, status.Error(codes.ResourceExhausted,
+			"session scan concurrency limit reached; retry shortly")
+	}
+	defer release()
 
 	// req.Offset is a signed int32; a negative value made the legacy
 	// path's `idx >= offset` test true for the first row (silently
@@ -719,6 +750,18 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+
+	// Admission bound (#5708, codex-review-182 M35): the summary is an
+	// unconditional full v4+v6 conntrack-table walk (same per-bucket BPF-map
+	// lock contention as the list). Gate it through the SAME shared limiter as
+	// GetSessions and the REST scans so a gRPC scrape flood cannot drive
+	// unbounded concurrent walks. Release on every exit path via defer.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		return nil, status.Error(codes.ResourceExhausted,
+			"session scan concurrency limit reached; retry shortly")
+	}
+	defer release()
 
 	resp := &pb.GetSessionSummaryResponse{}
 
