@@ -80,18 +80,34 @@ for the whole window until the first fetch succeeded (a firewall **fail-open**).
 A blocked/failed first fetch (`retainForever` has nothing to retain) held that
 window open indefinitely.
 
-`SnapshotForBindings` now **omits** a binding whose feeds all lack an installed
-snapshot (before the first successful fetch, an unknown/typo'd feed name, or
-after a hold-interval drop) rather than publishing an empty slice. A ready feed
-always installs ≥ 1 prefix (a zero-prefix fetch is rejected — see below), so
-"resolves to zero prefixes" is exactly "no backing feed has a snapshot". Leaving
-the name **unresolved** makes the policy lowering treat it as unrepresentable
-(`addrRepresentable` → `__unsupported_address__` → whole-snapshot preflight
-reject), so the referencing policy fails **closed** (previous-good retained /
-fresh-boot default-deny) — the same action-agnostic contract `#3261` gives an
-empty static book. A **persisted** feed carries its last-good snapshot forward
-(`#5282`), so it still resolves to prefixes here and is still published; the
-omission fires only for a feed with no prior good fetch.
+`SnapshotForBindings` now **omits** a binding unless **every** one of its feeds
+has an installed snapshot. If **any** constituent is unready — before its first
+successful fetch, an unknown/typo'd feed name, or after a hold-interval drop —
+the whole binding is omitted rather than published with the ready subset or an
+empty slice. A ready feed always installs ≥ 1 prefix (a zero-prefix fetch is
+rejected — see below), so "no installed snapshot" is exactly `len(prefixes)==0`.
+Leaving the name **unresolved** makes the policy lowering treat it as
+unrepresentable (`addrRepresentable` → `__unsupported_address__` → whole-snapshot
+preflight reject), so the referencing policy fails **closed** (previous-good
+retained / fresh-boot default-deny) — the same action-agnostic contract `#3261`
+gives an empty static book. A **persisted** feed carries its last-good snapshot
+forward (`#5282`), so it still resolves to prefixes here and is still published;
+the omission fires only for a binding with an unready feed.
+
+**All-constituent readiness + static-alias taint (codex-182 residual).** The
+first cut omitted a binding only when **all** its feeds were unready. Two residual
+partial-deny fail-opens remained: (1) a **composite** binding unioning a ready
+and an unready feed published only the ready subset — the unready feed's prefixes
+were silently unmatched; and (2) when the binding name **also** exists as a
+**static** address-book entry, omitting it from the overlay was not enough —
+`buildAddressBookTableWithFeeds` still built the static name/ID, so a `deny`
+enforced only the static subset. The fix now requires **all** constituents ready
+(case 1), and the userspace `addrRepresentable` treats a **declared**
+dynamic-address binding that is **absent** from the overlay as unresolved →
+unrepresentable → fail-closed **even when a static alias of the same name
+exists** (case 2). Only the referencing security **policy** path is gated this
+way; NAT rules that reference an unready feed still fall back to the static
+subset (out of scope for the deny fail-open this issue names).
 
 ## Publication-debt retry — a rejected apply is retried, not swallowed (#5646)
 
