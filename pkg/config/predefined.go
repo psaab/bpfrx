@@ -293,7 +293,15 @@ func expandAppSet(name string, apps *ApplicationsConfig, depth int) ([]string, e
 // every existing config while enabling nested references to predefined bundles.
 func memberIsNestedSet(memberName string, apps *ApplicationsConfig) bool {
 	if apps.ApplicationSets != nil {
-		if _, ok := apps.ApplicationSets[memberName]; ok {
+		// #5671: mirror lookupApplicationSet's `&& as != nil` guard. The
+		// tolerant-load / peer-sync path (#1960) can admit a present-but-nil
+		// slot (ApplicationSets[memberName] == nil). Treating that slot as a
+		// nested set routed the member to expandAppSet → lookupApplicationSet,
+		// which skips the nil and errors "application-set not found" — instead
+		// of falling through to resolve the member as a leaf application (which
+		// may well exist and shadow the nulled name). Skip the nil slot so the
+		// leaf-application / predefined-set classification below runs.
+		if as, ok := apps.ApplicationSets[memberName]; ok && as != nil {
 			return true
 		}
 	}
