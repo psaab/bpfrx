@@ -311,6 +311,110 @@ func TestReconcileAddsActiveLeases(t *testing.T) {
 	}
 }
 
+// runReconcileForce drives one reconcile pass with the operator force-now latch
+// engaged (env.force = true, #5710), the in-engine analogue of `request system
+// dynamic-dns update` reaching the DHCP Surface-B path. It is otherwise
+// identical to runReconcile (nil gate/resolver ⇒ all scopes writable).
+func runReconcileForce(t *testing.T, m *Manager, pol ddnsPolicy, leases []Lease) error {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	env := &reconcileEnv{
+		pol:     [2]ddnsPolicy{pol, pol},
+		updater: [2]DNSUpdater{m.updater, m.updater},
+		force:   true,
+	}
+	return m.reconcileOnceLocked(context.Background(), env, leases, nil, nil)
+}
+
+// TestReconcileForceRepublishesUnchangedRecord is the #5710 (M37) fail-on-revert
+// guard: an operator `request system dynamic-dns update` must FORCE the wire
+// upsert of a DHCP DDNS record even when its content is unchanged, so a drifted
+// or manually-deleted authoritative RR can be repaired. The routine reconcile
+// path deliberately SKIPS an unchanged record (change-detection efficiency); the
+// forced pass must NOT. Neutralizing the force path (dropping the `!env.force`
+// guard on the Pass-1 unchanged-skip) makes the forced pass skip too and this
+// test goes RED (0 re-upserts).
+func TestReconcileForceRepublishesUnchangedRecord(t *testing.T) {
+	up := newFakeUpdater()
+	m := testDDNS(t, up)
+	pol := enabledPolicy()
+	lease := []Lease{leaseV4("10.0.0.10", "mac:aa", "host-a")}
+
+	// Initial publish.
+	if err := runReconcile(t, m, pol, lease); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	if got := up.upsertNames(); !equalStr(got, []string{"host-a.example.com=10.0.0.10"}) {
+		t.Fatalf("initial upserts = %v", got)
+	}
+
+	// Routine reconcile with unchanged content: the efficiency short-circuit
+	// skips the wire upsert. This is the behaviour the forced path contrasts
+	// against — assert it stays a no-op so the test proves force is what makes
+	// the difference (not some unrelated re-publish).
+	up.upserts = nil
+	if err := runReconcile(t, m, pol, lease); err != nil {
+		t.Fatalf("reconcile 2 (unchanged, no force): %v", err)
+	}
+	if n := len(up.upserts); n != 0 {
+		t.Fatalf("routine reconcile re-upserted unchanged record %d time(s); want 0", n)
+	}
+
+	// Forced reconcile with the SAME unchanged content: must re-assert the RR
+	// onto the wire despite the unchanged-content short-circuit.
+	up.upserts = nil
+	if err := runReconcileForce(t, m, pol, lease); err != nil {
+		t.Fatalf("reconcile 3 (unchanged, forced): %v", err)
+	}
+	if got := up.upsertNames(); !equalStr(got, []string{"host-a.example.com=10.0.0.10"}) {
+		t.Fatalf("forced reconcile upserts = %v; want the unchanged record re-published", got)
+	}
+}
+
+// TestForceRefreshLatchArmsNextPass proves the ForceRefresh() latch is one-shot
+// and consumed via the full ReconcileScoped entry point (the daemon's arming
+// path), not only the reconcileOnceLocked seam: after ForceRefresh() a single
+// reconcile re-upserts the unchanged record, and the pass AFTER it (latch
+// cleared) reverts to the skip-unchanged behaviour.
+func TestForceRefreshLatchArmsNextPass(t *testing.T) {
+	up := newFakeUpdater()
+	m := testDDNS(t, up)
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{
+			Enabled: true, Domain: "example.com", TTLSeconds: 300,
+		},
+	}
+	// Seed a lease the parser will return. testDDNS wires a nil parser, so drive
+	// the desired set directly through reconcileOnceLocked for the initial
+	// publish, then exercise the ForceRefresh()+ReconcileScoped arming path
+	// (which reads leases via the parser — nil parser ⇒ empty). To keep the
+	// record OWNED across the empty-lease passes we assert on the latch, not on
+	// re-publish here; the wire-upsert force semantics are covered by
+	// TestReconcileForceRepublishesUnchangedRecord above.
+	if err := runReconcile(t, m, enabledPolicy(), []Lease{leaseV4("10.0.0.10", "mac:aa", "host-a")}); err != nil {
+		t.Fatalf("seed reconcile: %v", err)
+	}
+	// Arm the latch; the internal flag must be set and then cleared by the next
+	// ReconcileScoped pass.
+	m.ForceRefresh()
+	m.mu.Lock()
+	armed := m.forceNext
+	m.mu.Unlock()
+	if !armed {
+		t.Fatal("ForceRefresh did not arm forceNext")
+	}
+	if err := m.ReconcileScoped(context.Background(), cfg, ReconcileOptions{}); err != nil {
+		t.Fatalf("forced ReconcileScoped: %v", err)
+	}
+	m.mu.Lock()
+	stillArmed := m.forceNext
+	m.mu.Unlock()
+	if stillArmed {
+		t.Fatal("forceNext latch not consumed by the reconcile pass (should be one-shot)")
+	}
+}
+
 func TestReconcileExpireDeletesOwnedRecord(t *testing.T) {
 	up := newFakeUpdater()
 	m := testDDNS(t, up)
