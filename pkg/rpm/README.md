@@ -5,6 +5,17 @@ GET). Tracks RTT and jitter, emits events for the event-options engine,
 fires per-test pass/fail transitions for the ip-monitoring engine, and
 pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
 
+**Interval overflow bound (#5723).** `test-interval` / `probe-interval`
+are operator-settable in seconds and are bounded to `[1,
+config.MaxDurationSeconds]` at commit (`schema_system.go`), so a
+pathological value cannot overflow `time.Duration(sec)*time.Second` into
+a non-positive Duration and panic `time.NewTicker` in `runProbeLoop`
+(a commit-reachable xpfd crash, sibling of the #5705 keepalive
+overflow). `clampRPMIntervalSeconds` (`rpm.go`) re-applies the same
+`[1, MaxDurationSeconds]` clamp at runtime as defense-in-depth for the
+lenient HA-sync / on-disk Load ingress, which only downgrades an
+out-of-range value to a warning.
+
 ## Entry points
 
 - `Manager` — `rpm.go`.

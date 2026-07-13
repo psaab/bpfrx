@@ -47845,6 +47845,33 @@ top.
   address-set collision", "lenient compile must record a collision warning";
   restored GREEN.
 
+- **Timestamp**: 2026-07-13 00:40
+  **Action**: Fix #5723 — config-seconds*time.Second overflow sweep (sibling of
+  #5705/#5722 keepalive crash). Audited the 5 flagged NewTicker/NewTimer/After
+  sites. Only RPM `test-interval`/`probe-interval` were operator-settable AND
+  unbounded at admission (ValidateIntegerMin(1), no upper) → a huge value
+  overflows time.Duration(sec)*time.Second to a non-positive Duration →
+  time.NewTicker panic in runProbeLoop (commit-reachable xpfd crash). Applied
+  the #5705 two-layer fix: (1) admission bound — probe-interval/test-interval
+  validators → ValidateInteger(1, MaxDurationSeconds) (the same
+  overflow-safe ceiling feeds update/hold-interval already use); (2) runtime
+  clamp — clampRPMIntervalSeconds([1, MaxDurationSeconds]) before the multiply
+  in runProbeLoop, defense-in-depth for the lenient HA-sync/Load ingress.
+  Other 4 sites need NO change: LLDP transmit-interval already bounded
+  ValidateInteger(5, 32768); feeds update-interval/hold-interval already
+  ValidateInteger(1, MaxDurationSeconds); daemon_ipsec_rebind + daemon_rpm
+  pin-retry use a test-seam Duration + compile-time-constant fallback with an
+  `interval <= 0` guard (not config-derived).
+  **File(s)**: pkg/config/schema_system.go, pkg/rpm/rpm.go, pkg/rpm/README.md,
+  pkg/config/rpm_interval_bound_5723_test.go,
+  pkg/rpm/rpm_interval_overflow_5723_test.go
+  GREEN: `go test ./pkg/rpm/... ./pkg/lldp/... ./pkg/daemon/... ./pkg/feeds/...
+  ./pkg/config/...` all pass; gofmt + vet clean. Fail-on-revert (both layers):
+  reverting clampRPMIntervalSeconds to a bare multiply →
+  TestClampRPMIntervalSecondsBoundsOverflow_5723 RED
+  ("clampRPMIntervalSeconds(9223372036854775807) = -1s, want positive");
+  reverting the validators to ValidateIntegerMin(1) →
+  TestRPMIntervalSchemaGate_5723 RED (6 huge values accepted). Restored GREEN.
 - **Timestamp**: 2026-07-13
   **Action**: Fix #5627 (codex-review-181 M15 / A3-b00-F02) — the Go
   strict-commit path validated a source-NAT pool's `port range` but left its
@@ -47909,3 +47936,29 @@ top.
   gRPC clear-all/shared-saturation tests RED ("err = <nil>, want
   ResourceExhausted") + REST clear RED (status 200/cleared, want 429); restored
   GREEN.
+  **Action**: Fix #5744 — two interface AST pre-walks were still
+  first-root-only after PR #5741 routed the interface-range expansion +
+  stable-ID collision gates through all top-level roots. A hierarchical config
+  splitting `interfaces { }` across two sibling roots could place a unit-alias
+  collision (validateInterfaceUnitAliasCollisionsAST, #5631) or an
+  unsupported/silently-dropped interface stanza
+  (validateUnsupportedInterfaceStanzasAST, #2008/#2354) in the SECOND root and
+  bypass both validators. Fix: both functions now flatten EVERY `interfaces`
+  root's children into one per-interface pass (mirrors #5741's all-roots
+  union). Correctness: compileInterfaces stores each interface node with
+  whole-interface last-writer-wins (`ifaces.Interfaces[ifName] = ifc`), so a
+  unit-alias collision is always intra-node — flattening across roots detects
+  each node independently, exactly matching what compileInterfaces consumes (no
+  cross-root per-interface aggregation, which would over-flag). Pure pkg/config
+  Go change.
+  **File(s)**: pkg/config/compiler_interface_unit_alias.go,
+  pkg/config/compiler_interfaces_unsupported.go,
+  pkg/config/interface_prewalk_all_roots_5744_test.go (new),
+  docs/config-schema.md
+  GREEN: `go test ./pkg/config/...` passes. gofmt clean on touched files, go
+  vet clean. Fail-on-revert proven: restoring both validators' first-root-only
+  selection turns the three second-root cases RED — "expected strict commit to
+  reject a unit-alias collision in the SECOND interfaces root", "expected
+  strict commit to reject an unsupported `mac` stanza in the SECOND interfaces
+  root", "lenient compile must warn about the second-root unsupported stanza";
+  the single-root no-regression case stayed GREEN; restored GREEN.

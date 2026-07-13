@@ -571,10 +571,17 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 					args:          1,
 					desc:          "Seconds between probes within a test",
 					valueType:     ValueInteger,
-					valueDesc:     "Seconds between probes (>= 1)",
+					valueDesc:     "Seconds between probes (1..MaxDurationSeconds)",
 					valueExamples: []string{"5"},
-					validator:     ValidateIntegerMin(1),
-					children:      nil,
+					// #5723: bound the upper end (not just >= 1) so a
+					// pathological value cannot overflow
+					// time.Duration(sec)*time.Second into a non-positive Duration
+					// at the runtime probe loop (time.NewTicker / time.After panic
+					// / busy-spin) — sibling of the #5705 keepalive crash. Same
+					// MaxDurationSeconds ceiling the feeds update/hold-interval and
+					// other second-valued leaves use.
+					validator: ValidateInteger(1, MaxDurationSeconds),
+					children:  nil,
 				},
 				"probe-count": {
 					args:          1,
@@ -589,10 +596,15 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 					args:          1,
 					desc:          "Seconds between test cycles",
 					valueType:     ValueInteger,
-					valueDesc:     "Seconds between test cycles (>= 1)",
+					valueDesc:     "Seconds between test cycles (1..MaxDurationSeconds)",
 					valueExamples: []string{"30"},
-					validator:     ValidateIntegerMin(1),
-					children:      nil,
+					// #5723: bound the upper end so a pathological value cannot
+					// overflow time.Duration(sec)*time.Second into a non-positive
+					// Duration and panic time.NewTicker in the runtime probe loop
+					// (rpm.go runProbeLoop) — a commit-reachable xpfd crash,
+					// sibling of the #5705 keepalive overflow.
+					validator: ValidateInteger(1, MaxDurationSeconds),
+					children:  nil,
 				},
 				"thresholds": {desc: "Failure thresholds for the test", children: map[string]*schemaNode{
 					"successive-loss": {
