@@ -47582,3 +47582,41 @@ top.
   Pre-existing env failures in the package (applyHelperStatus map-not-loaded,
   XDP-program RX-liveness tests) reproduce identically on pristine
   origin/master cd3ae8973 — not introduced by this change.
+
+- **Timestamp**: 2026-07-12
+  **Action**: #5486 (codex-review-179 A6/C179-083) — disableUserspaceCtrlLocked
+  was void and swallowed ctrl-map Lookup/Update errors before worker/UMEM
+  teardown. On `ctrlMap.Lookup` error it returned silently and it discarded
+  the `ctrlMap.Update` result (`_ =`), so a failed disable left a stale
+  `enabled=1` ctrl row with READY bindings — the XDP shim kept redirecting
+  transit to soon-dead XSK fds until heartbeat expiry (transit outage +
+  UMEM-quiescence ordering violation), while callers
+  (stopLocked/PrepareLinkCycle/DisableAndStopHelper/NotifyLinkCycle) tore down
+  workers regardless. Fix: `disableUserspaceCtrlLocked` now returns error;
+  extracted pure `disableUserspaceCtrl(ctrlMapUpdater)` that on Lookup failure
+  writes a zeroed (Enabled=0) fail-closed row anyway, CHECKS the Update result,
+  and reads back to confirm Enabled==0 (silent no-op is caught). New
+  `disableCtrlBeforeTeardownLocked` wrapper propagates at all 4 call sites: on
+  failure it logs Error and force-clears ALL bindings via a new
+  `clearAllBindingRowsLocked` (reuses the bootstrap zero-all pattern; the
+  bootstrap block now calls the shared helper) so the shim has no READY slot to
+  redirect before teardown. Happy path preserved byte-for-byte (same slog.Info,
+  same fields, nil error, no binding clear). Interface seam (ctrlMapUpdater +
+  disableCtrlMapHook) lets the fault tests run UNPRIVILEGED (no memlock).
+  Operator-facing behavior (ctrl.enabled=0 degraded path) unchanged, so no doc
+  update needed — internal fail-closed robustness only. Final runtime AF_XDP
+  lifecycle verify is lab-bound (deferred).
+  **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/process.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/ctrl_disable_5486_test.go
+  GREEN: full `go test ./pkg/dataplane/userspace/` passes (unprivileged +
+  root); gofmt + `go build ./...` + `go vet` clean. Fail-on-revert proven:
+  neutralizing disableUserspaceCtrl to the old swallow behavior (silent
+  return on Lookup err, discarded Update, no readback) turns all three fault
+  tests RED — Lookup fault ("returned nil on lookup fault, want error"),
+  Update fault on teardown path ("returned nil on update fault, want error"),
+  readback mismatch ("returned nil on readback mismatch, want error");
+  restored GREEN. Pre-existing failure
+  TestUserspaceManagerDoesNotImportReflectOrUnsafe (manager_overlay.go imports
+  reflect) reproduces on pristine origin/master — not this change.
