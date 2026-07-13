@@ -185,7 +185,7 @@ const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
 
 // MaxDurationMinutes is the minutes analogue of MaxDurationSeconds: the
 // largest minute count that survives `time.Duration(n) * time.Minute`
-// without int64 overflow (math.MaxInt64 / 6e10 = 153722867280). Above this,
+// without int64 overflow (math.MaxInt64 / 6e10 = 153722867). Above this,
 // a configured minute knob converts to a non-positive Duration — e.g. the
 // `system archival transfer-interval` timer's time.NewTicker panics on a
 // non-positive interval (#5784, the minutes straggler of the #5705/#5723
