@@ -176,13 +176,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	}
 
 	// Bindings map is now an Array — zero previously-set indices.
-	{
-		var zeroBinding userspaceBindingValue
-		for _, idx := range m.lastBindingIndices {
-			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
-		}
-		m.lastBindingIndices = nil
-	}
+	m.clearAllBindingRowsLocked()
 	// Heartbeat map is now an Array — zero used slots instead of deleting.
 	// Slots with value 0 appear as stale (bpf_ktime_get_ns() >> 0) so the
 	// XDP shim correctly refuses to redirect until userspace begins updating.
@@ -813,6 +807,27 @@ func (m *Manager) clearStaleBindingRowsLocked(bindingsMap *ebpf.Map, newBindingI
 		}
 	}
 	return newBindingIndices
+}
+
+// clearAllBindingRowsLocked zeroes every userspace_bindings row recorded in
+// m.lastBindingIndices and forgets the inventory. It is the fail-closed
+// teardown primitive (#5486): when ctrl-disable cannot be verified before
+// worker/UMEM teardown, this leaves the XDP shim with no READY slot to
+// redirect to, so no packet can reach a soon-dead XSK fd. It mirrors the
+// bootstrap zero-all used by the initial map program. Best-effort: a per-row
+// Update failure on the teardown path is not fatal (the helper is stopping),
+// but the inventory is always niled so a fresh apply re-establishes rows.
+func (m *Manager) clearAllBindingRowsLocked() {
+	bindingsMap := m.bpfShim.Map(mapNameUserspaceBindings)
+	if bindingsMap == nil {
+		m.lastBindingIndices = nil
+		return
+	}
+	var zeroBinding userspaceBindingValue
+	for _, idx := range m.lastBindingIndices {
+		_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
+	}
+	m.lastBindingIndices = nil
 }
 
 // userspaceCounterSnapshot holds cumulative counter totals from the helper,
