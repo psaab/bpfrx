@@ -47276,5 +47276,26 @@ top.
   _Log.md (Edit)
 
 - **Timestamp**: 2026-07-12
+  **Action**: #5647 residual (codex-review-182) — the LOCAL interactive CLI
+  siblings of the remote-CLI clears fixed in #5652 still silently dropped a
+  scoped-looking suffix and performed the selector-free global mutation:
+  `request protocols ospf clear` (vtysh `clear ip ospf process`), `request
+  protocols bgp clear` (vtysh `clear bgp * soft`), and `request security ipsec
+  sa clear` (strongSwan `TerminateAllSAs`). A trailing selector such as
+  `... clear neighbor 10.0.0.1` / `... sa clear 42` was ignored while every
+  OSPF adjacency / BGP session / IPsec SA was reset. Mirrored the #5652 fix:
+  reject the scoped-looking suffix BEFORE the mutation (shared
+  `rejectScopedClear` helper) rather than widen scope silently. The guard runs
+  ahead of the FRR/strongSwan manager-availability gate (moved the nil-manager
+  check into each `clear` case), so a scoped suffix is refused before any
+  global reset. Added fail-on-revert `TestLocalRequestScopedClearRejected_5647`
+  (proved RED by neutralizing the `len(args) > N` guards: scoped suffix falls
+  to the nil-manager gate, no rejection error; GREEN restored) plus
+  `TestLocalRequestUnscopedClearProceeds_5647` (bare clear still reaches the
+  manager gate — guard is selector-specific). `go test ./pkg/cli/...
+  ./pkg/grpcapi/... ./cmd/cli/...` green.
+  **File(s)**: pkg/cli/cli_request.go (Edit), pkg/cli/cli_request_security.go
+  (Edit), pkg/cli/request_scope_5647_test.go (Write), docs/phases.md (Edit),
+  _Log.md (Edit)
   - **Action**: #5671 — add `&& as != nil` guard to memberIsNestedSet (mirror lookupApplicationSet #5179); a tolerant-loaded present-but-nil app-set slot no longer misclassifies a shadowing leaf application as a nested set (false "not found"). Added fail-on-revert test (RED proven with guard neutralized).
   - **File(s)**: pkg/config/predefined.go, pkg/config/predefined_membernestedset_nilguard_5671_test.go

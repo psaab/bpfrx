@@ -21,7 +21,24 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 )
+
+// rejectScopedClear returns the error for a global-only `request ... clear`
+// that was handed a scoped-looking suffix. #5647: the FRR/strongSwan wiring
+// behind these clears has no per-neighbor / per-area / per-SA plumbing, so a
+// trailing selector token (`... clear neighbor 10.0.0.1`, `... sa clear 42`)
+// used to be silently DROPPED while the selector-free global reset still ran —
+// the operator believed the action was scoped but every OSPF adjacency / BGP
+// session / IPsec SA was reset. Mirror the remote CLI (cmd/cli, #5652): reject
+// the suffix before the mutation rather than silently widen scope, because
+// Junos never widens scope silently. cmd is the full command path, effect
+// describes the global action, and extra is the rejected trailing token(s).
+func rejectScopedClear(cmd, effect string, extra []string) error {
+	return fmt.Errorf("%s does not accept a selector (%q); it %s. Re-run "+
+		"without a selector to confirm the global clear",
+		cmd, strings.Join(extra, " "), effect)
+}
 
 func (c *CLI) handleRequest(args []string) error {
 	if len(args) == 0 {
@@ -71,15 +88,22 @@ func (c *CLI) handleRequestProtocols(args []string) error {
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["protocols"].Children))
 		return nil
 	}
-	if c.frr == nil {
-		return fmt.Errorf("FRR manager not available")
-	}
 	switch args[0] {
 	case "ospf":
 		if len(args) < 2 || args[1] != "clear" {
 			fmt.Println("request protocols ospf:")
 			writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["protocols"].Children["ospf"].Children))
 			return nil
+		}
+		// #5647: reject a scoped-looking suffix BEFORE the mutation — the
+		// suffix validation is input-shape checking and precedes the runtime
+		// manager-availability gate.
+		if len(args) > 2 {
+			return rejectScopedClear("request protocols ospf clear",
+				"resets the entire OSPF process", args[2:])
+		}
+		if c.frr == nil {
+			return fmt.Errorf("FRR manager not available")
 		}
 		output, err := c.frr.ExecVtysh("clear ip ospf process")
 		if err != nil {
@@ -95,6 +119,14 @@ func (c *CLI) handleRequestProtocols(args []string) error {
 			fmt.Println("request protocols bgp:")
 			writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["protocols"].Children["bgp"].Children))
 			return nil
+		}
+		// #5647: reject a scoped-looking suffix BEFORE the mutation.
+		if len(args) > 2 {
+			return rejectScopedClear("request protocols bgp clear",
+				"soft-clears every BGP session", args[2:])
+		}
+		if c.frr == nil {
+			return fmt.Errorf("FRR manager not available")
 		}
 		output, err := c.frr.ExecVtysh("clear bgp * soft")
 		if err != nil {

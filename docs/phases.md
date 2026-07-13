@@ -380,9 +380,12 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
 - **BGP neighbor:** `show bgp neighbor <ip>` via FRR vtysh
 - **IPsec SA clear:** `request security ipsec sa clear` terminates all IKE SAs
   (global-only; like `request protocols ospf clear` / `... bgp clear` these
-  reset the whole process and take NO selector. The CLI rejects a
-  scoped-looking suffix — e.g. `... sa clear <id>`, `... ospf clear neighbor
-  <ip>` — instead of silently widening it to a global reset, #5647)
+  reset the whole process and take NO selector. BOTH the remote CLI
+  (`cmd/cli`, #5652) and the local interactive CLI (`pkg/cli`, #5647 residual
+  from codex-review-182) reject a scoped-looking suffix — e.g. `... sa clear
+  <id>`, `... ospf clear neighbor <ip>` — instead of silently widening it to a
+  global reset. The reject runs BEFORE the FRR/strongSwan manager-availability
+  gate, so an unrecognized selector is refused, not dropped, #5647)
 - **NAT counter clear:** `clear security nat statistics` zeros BPF nat_rule_counters
 - **Route summary enhanced:** Per-protocol breakdown (Direct/Local/Static/OSPF/BGP/IS-IS) with inet.0/inet6.0 sections
 - **ICMP type/code in CoS:** Filter terms now show icmp-type/icmp-code instead of "match any"

@@ -20,6 +20,14 @@ func (c *CLI) handleRequestSecurity(args []string) error {
 			writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children["ipsec"].Children["sa"].Children))
 			return nil
 		}
+		// #5647: `ipsec sa clear` terminates EVERY IPsec SA
+		// (TerminateAllSAs). Reject a scoped-looking suffix such as
+		// `... sa clear 42` / `... sa clear tunnel gw-a` BEFORE the mutation
+		// instead of silently dropping the selector and tearing down all SAs.
+		if len(args) > 3 {
+			return rejectScopedClear("request security ipsec sa clear",
+				"terminates every IPsec SA", args[3:])
+		}
 		if c.ipsec == nil {
 			return fmt.Errorf("IPsec manager not available")
 		}
