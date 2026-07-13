@@ -346,14 +346,20 @@ type Daemon struct {
 	// stays a flat Daemon field: it is the standby-side refresh rate limit read
 	// in daemon_health.go, a different mechanism from the periodic-resolution
 	// supervision grouped here.
-	neighborGuards    neighborPeriodicGuards
-	hbSuppressStart   atomic.Int64 // CLOCK_MONOTONIC nanos of first heartbeat suppression; 0 = inactive (#1792)
-	syncPrimeRetryGen atomic.Uint64
-	syncReadyTimerGen atomic.Uint64
-	syncReadyTimerMu  sync.Mutex
-	syncReadyTimer    *time.Timer
-	syncReadyTimeout  time.Duration
-	slogHandler       *logging.SyslogSlogHandler
+	neighborGuards neighborPeriodicGuards
+	// neighborWarmDialer is the socket factory warmNeighborCache uses to trigger
+	// kernel neighbor (ARP/ND) resolution on failover. Nil in production (the
+	// default udpNeighborWarmDialer is used); tests inject a fake to count
+	// sockets and capture probed destinations without touching the network
+	// (#5451).
+	neighborWarmDialer neighborWarmDialer
+	hbSuppressStart    atomic.Int64 // CLOCK_MONOTONIC nanos of first heartbeat suppression; 0 = inactive (#1792)
+	syncPrimeRetryGen  atomic.Uint64
+	syncReadyTimerGen  atomic.Uint64
+	syncReadyTimerMu   sync.Mutex
+	syncReadyTimer     *time.Timer
+	syncReadyTimeout   time.Duration
+	slogHandler        *logging.SyslogSlogHandler
 	// #3932: the flow-traceoptions writer is published through an atomic
 	// pointer read lock-free by a SINGLE stable EventReader callback that
 	// traceCBOnce registers exactly once. Each commit that changes

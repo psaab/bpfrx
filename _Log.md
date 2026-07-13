@@ -47583,6 +47583,32 @@ top.
   XDP-program RX-liveness tests) reproduce identically on pristine
   origin/master cd3ae8973 — not introduced by this change.
 
+- **Timestamp**: 2026-07-12 23:38
+  **Action**: Fix #5451 — warmNeighborCache opened one connected UDP socket per
+  unique session IP with no cap on failover. At CGNAT scale (tens of thousands
+  of unique dsts) that DialTimeout storm exhausted ephemeral ports / file
+  descriptors and stalled failover convergence. Root cause is per-IP socket
+  churn, not simultaneous-open count (the old loop was already sequential
+  dial→write→close), so bounded concurrency would not have helped — replaced
+  the per-IP dial with ONE reusable unconnected datagram socket per address
+  family (net.ListenUDP + WriteToUDPAddrPort per dst). An unconnected send
+  triggers the same kernel neighbor resolution (route lookup →
+  neigh_resolve_output → arp_solicit/ndisc_solicit) as the old connected
+  Write, so every unique IP is still warmed; FD/ephemeral-port high-water mark
+  is now bounded by the constant neighborWarmMaxSockets (=2, one per family),
+  not by session-table size. Sockets are opened lazily per family (none opened
+  for an empty table). Added a minimal injectable seam (neighborWarmDialer /
+  neighborWarmConn) so tests can count sockets + capture probed dsts without
+  touching the network. Warming stays best-effort (a per-probe error does not
+  abort the rest). Did both v4 and v6.
+  **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon.go,
+  pkg/daemon/warmneighbor_bound_5451_test.go
+  GREEN: `go test ./pkg/daemon/...` passes; gofmt + vet clean. Fail-on-revert
+  proven: restoring the open-per-IP loop (through the same seam) →
+  TestWarmNeighborCacheBoundsSocketsAtCGNATScale RED ("opened 1000 sockets for
+  1000 unique IPs; want <= 2"); coverage assertion (all 500+500 IPs warmed)
+  stays green both ways; restored GREEN. Live failover-convergence timing
+  verify is cluster/lab-bound (loss cluster shim-ABI-walled) → deferred.
 - **Timestamp**: 2026-07-12
   **Action**: #5486 (codex-review-179 A6/C179-083) — disableUserspaceCtrlLocked
   was void and swallowed ctrl-map Lookup/Update errors before worker/UMEM
