@@ -788,6 +788,17 @@ under the daemon's errgroup. Nothing else imports this package.
     longer issue unbounded full-table scans; over-cap gRPC scans return
     `codes.ResourceExhausted`. A mix of REST + gRPC scrapers cannot collectively
     exceed `diagcmd.MaxConcurrentSessionWalks`.
+    **#5779 extends the SAME shared bound to the session-CLEAR (mutation)
+    path**, which was the remaining uncovered full-table walk: `ClearAllSessions`
+    is a chunked full-table scan+delete (not O(1)), and the gRPC `ClearSessions`
+    filtered path (`clearFilteredSessionsV4/V6`, cursor or rescan) walks the
+    whole table too. The gRPC `ClearSessions` handler now acquires one shared
+    slot covering both its clear-all and filtered branches (over-cap →
+    `codes.ResourceExhausted`); this REST clear endpoint's local-only fallback
+    (`s.dp.ClearAllSessions()`) acquires the same shared limiter (over-cap →
+    HTTP 429). The HA-delegated REST clear path is gated by the gRPC handler it
+    forwards to, so it is not double-charged. A keyed single-session delete (no
+    walk) is a different operation and is not gated.
   - **Bounded Total.** The offset mode's exact `total` previously forced a FULL
     v4+v6 table scan on EVERY 100-row page (O(table) per page, repeated per
     poll) just to count. The walk now caps the count at `sessionCountCap`
