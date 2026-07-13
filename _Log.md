@@ -47247,3 +47247,7 @@ top.
   **File(s)**: pkg/ddns/manager.go (Edit), pkg/ddns/manager_test.go (Edit),
   pkg/daemon/daemon_ddns_surface_a.go (Edit), pkg/ddns/README.md (Edit),
   _Log.md (Edit)
+
+- **Timestamp**: 2026-07-12
+  - **Action**: #5671 — add `&& as != nil` guard to memberIsNestedSet (mirror lookupApplicationSet #5179); a tolerant-loaded present-but-nil app-set slot no longer misclassifies a shadowing leaf application as a nested set (false "not found"). Added fail-on-revert test (RED proven with guard neutralized).
+  - **File(s)**: pkg/config/predefined.go, pkg/config/predefined_membernestedset_nilguard_5671_test.go
