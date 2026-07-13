@@ -757,16 +757,7 @@ ctrlReady:
 			}
 		}
 	}
-	{
-		var zeroBinding userspaceBindingValue
-		for _, idx := range m.lastBindingIndices {
-			if _, keep := newBindingIndexSet[idx]; keep {
-				continue
-			}
-			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
-		}
-		m.lastBindingIndices = newBindingIndices
-	}
+	m.lastBindingIndices = m.clearStaleBindingRowsLocked(bindingsMap, newBindingIndices, newBindingIndexSet)
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
 		return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, err)
 	}
@@ -790,6 +781,38 @@ ctrlReady:
 
 	m.recordHelperStatusLocked(status)
 	return nil
+}
+
+// clearStaleBindingRowsLocked zeroes userspace_bindings rows that were live on
+// the previous status pass (recorded in m.lastBindingIndices) but are absent
+// from the current pass (newBindingIndexSet). It returns the retry inventory
+// to store back into m.lastBindingIndices.
+//
+// A row whose zeroing Update FAILS is RETAINED in the returned inventory so a
+// later status pass re-attempts the clear (#5697, codex-review-182 M20). The
+// clear loop only rescans indices recorded in m.lastBindingIndices, so if a
+// failed clear dropped the row from the inventory it would never be
+// rediscovered — the stale row would persist in the BPF map indefinitely and
+// the XDP shim would keep steering transit to a slot no longer backed by a
+// live worker. A successful clear removes the row from the inventory (it is
+// not in newBindingIndexSet, so it is not carried forward).
+func (m *Manager) clearStaleBindingRowsLocked(bindingsMap *ebpf.Map, newBindingIndices []uint32, newBindingIndexSet map[uint32]struct{}) []uint32 {
+	var zeroBinding userspaceBindingValue
+	for _, idx := range m.lastBindingIndices {
+		if _, keep := newBindingIndexSet[idx]; keep {
+			continue
+		}
+		if err := bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny); err != nil {
+			slog.Warn("userspace: failed to clear stale binding entry; retaining in retry inventory",
+				"idx", idx, "err", err)
+			if _, seen := newBindingIndexSet[idx]; !seen {
+				newBindingIndexSet[idx] = struct{}{}
+				newBindingIndices = append(newBindingIndices, idx)
+			}
+			continue
+		}
+	}
+	return newBindingIndices
 }
 
 // userspaceCounterSnapshot holds cumulative counter totals from the helper,

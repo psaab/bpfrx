@@ -47537,3 +47537,29 @@ top.
   proven: neutralizing both failure legs (`return nil`) →
   TestRouteLeakReconcileFailsCommitOnPublishError and ...OnBumpError RED
   (returns nil on injected failure); restored GREEN.
+
+- **Timestamp**: 2026-07-12
+  **Action**: #5697 (codex-review-182 M20) — failed stale-binding clears no
+  longer lose the retry inventory. In `applyHelperStatusLocked` the stale
+  userspace_bindings clear discarded the `bindingsMap.Update` result
+  (`_ = ...`) and unconditionally overwrote `m.lastBindingIndices` with only
+  the live bindings, so a clear that FAILED dropped the stale row from the
+  retry inventory — the clear loop only rescans indices in
+  `m.lastBindingIndices`, so the stranded row was never rediscovered and the
+  XDP shim kept steering transit to a slot no longer backed by a live worker.
+  Extracted the clear into `clearStaleBindingRowsLocked`, which RETAINS an idx
+  whose zeroing Update fails (logs slog.Warn, re-adds it to the returned
+  inventory) so a later status pass re-attempts the clear; a successful clear
+  drops the row. Pure refactor of one loop — no operator-facing behavior
+  change beyond the repair-loop now converging, so no operator/state/design
+  doc update needed.
+  **File(s)**: pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/maps_sync_stale_binding_retry_5697_test.go
+  GREEN: new unit tests pass (run as root for BPF map privileges); gofmt +
+  `go build ./...` clean. Fail-on-revert proven: neutralizing the fix
+  (`_ = bindingsMap.Update(...)`, drop on failure) →
+  TestClearStaleBindingRowsRetainsFailedClearInRetryInventory RED
+  ("retry inventory [] missing failed-clear idx 99"); restored GREEN.
+  Pre-existing env failures in the package (applyHelperStatus map-not-loaded,
+  XDP-program RX-liveness tests) reproduce identically on pristine
+  origin/master cd3ae8973 — not introduced by this change.
