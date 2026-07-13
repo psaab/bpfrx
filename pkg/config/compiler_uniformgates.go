@@ -663,6 +663,32 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5627 source-NAT pool ADDRESS-grammar gate. The strict path validated a
+	// source pool's `port range` but left its ADDRESS members unchecked, so a
+	// pool referenced by a pool-mode `then source-nat pool <name>` rule that
+	// carried a malformed member (`not-an-ip`, `203.0.113.1/garbage`), an
+	// over-capacity prefix (host count > MaxSourceNATPoolPrefixHosts — a `/15`,
+	// `10.0.0.0/8`, or a v6 prefix shorter than `/112`), or no addresses at all
+	// committed green — then the live Rust allocator (`expand_pool_address`,
+	// userspace-dp/src/nat/source.rs) marked the pool InvalidPool/EmptyPool and
+	// DROPPED the rule at runtime, a persistent NAT outage visible only after
+	// apply. Reject the same shapes the dataplane rejects so Go and live stay
+	// grammar-equivalent. Strict on commit / commit-check (hard-reject);
+	// lenient on load / peer-sync (downgrade to a warning so a config persisted
+	// before this gate existed still boots — #1960 no-brick; the snapshot
+	// builder independently marks the pool unusable). Shares the
+	// lenientDestNATAddresses flag (same NAT silent-drop / wrong-translate
+	// doctrine as validateNATPoolReferencesStrict). Runs AFTER the pool-reference
+	// gate so an UNDEFINED pool wins the first-error slot.
+	if err := validateSourceNATPoolAddressGrammarStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("source-nat pool address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates
