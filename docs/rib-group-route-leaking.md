@@ -166,6 +166,37 @@ to `ApplyNextTableRules`. Strict on commit / commit-check; downgraded to a
 warning on the tolerant load / peer-sync paths (`opts.lenientNextTableRefs`,
 #1960 no-brick) since the applier keeps a dangling next-table inert.
 
+### Strict rejection — contradictory static-route dispositions (#5633)
+
+A single static-route destination may carry only **one** disposition: a
+forwarding `next-hop` (possibly several, for ECMP), a `next-table` VRF leak,
+`discard` (silent blackhole), or `reject` (ICMP-unreachable drop). Repeated
+same-prefix `set` lines merge into one `StaticRoute` in `compileStaticRoutes`
+(`compiler_routing.go`) — next-hops are **appended** and the terminal /
+`next-table` fields are **sticky** (`discard`/`reject` latch true, `next-table`
+is last-writer-wins). So a config that declared one prefix once as `discard`
+(or `next-table X`) and once with a `next-hop` compiled into ONE route holding
+**both** a blackhole/leak and a forwarding next-hop, and the strict gate
+accepted it. The live snapshot copies every field
+(`pkg/dataplane/userspace/routes.go`) and the Rust forwarder resolves
+**discard > next-table > next-hop**
+(`userspace-dp/src/afxdp/forwarding/mod.rs`), so the stale terminal / leak won
+and a later next-hop meant to **restore ordinary forwarding was silently
+ignored** — a blackhole or a cross-VRF leak the operator never authored.
+
+`validateStaticRouteDispositionConflictStrict`
+(`compiler_validate_strict_routing.go`) now **hard-rejects at commit** any
+compiled route carrying ≥2 of {`next-hop`, `next-table`, `discard`, `reject`}.
+Legitimate ECMP / qualified-next-hop (multiple next-hops = the single
+`next-hop` disposition) still compiles. The gate walks the global `inet.0` +
+`inet6.0` route sets and every routing-instance's route sets (per-instance
+routes flow through the same merge), reporting the first conflict
+deterministically with the offending scope and destination. Strict on commit /
+commit-check; downgraded to a warning on the tolerant load / peer-sync paths
+(`opts.lenientRouteDispositionConflict`, #1960 no-brick) so an already-persisted
+or peer-synced config still boots — the dataplane then resolves the
+deterministic disposition precedence.
+
 ## Deferred (Phase 2 and beyond)
 
 - **VRF→VRF import targets** — need `iif`-scoped rules or true route-copy;
