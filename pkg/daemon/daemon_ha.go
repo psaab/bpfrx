@@ -1307,10 +1307,84 @@ func (d *Daemon) clearRethServices() {
 	}
 }
 
+// neighborWarmProbeTimeout bounds each warmup send. A UDP send to an
+// unconnected socket normally returns immediately (the ARP/ND solicit is
+// queued asynchronously), so this deadline effectively never fires; it is a
+// defensive per-probe bound matching the pre-#5451 per-dial DialTimeout.
+const neighborWarmProbeTimeout = 50 * time.Millisecond
+
+// neighborWarmMaxSockets caps how many datagram sockets warmNeighborCache
+// opens, regardless of session-table size: one reusable unconnected socket per
+// address family (IPv4 + IPv6). Before #5451 the warmup opened one CONNECTED
+// socket per unique session IP — at CGNAT scale (tens of thousands of unique
+// destinations) that burst of DialTimeout calls exhausted ephemeral ports / file
+// descriptors and stalled failover convergence, the worst possible time for a
+// local resource storm. Reusing one unconnected socket per family and sending an
+// unconnected datagram per destination triggers the same kernel neighbor
+// resolution (route lookup → neigh_resolve_output → arp_solicit/ndisc_solicit)
+// while bounding the FD/port high-water mark by this constant.
+const neighborWarmMaxSockets = 2
+
+// neighborWarmDialer opens datagram sockets used by warmNeighborCache to
+// trigger kernel neighbor (ARP/ND) resolution. It is a seam so tests can count
+// sockets opened and capture probed destinations without touching the network
+// (#5451).
+type neighborWarmDialer interface {
+	// open returns one datagram socket for the given network ("udp4"/"udp6").
+	open(network string) (neighborWarmConn, error)
+}
+
+// neighborWarmConn is a single unconnected datagram socket that can probe many
+// destinations. probe sends a byte to dst, which triggers neighbor resolution
+// for that destination's next-hop.
+type neighborWarmConn interface {
+	probe(dst netip.AddrPort) error
+	Close() error
+}
+
+// udpNeighborWarmDialer is the production neighborWarmDialer: it opens a real
+// unconnected UDP socket via net.ListenUDP.
+type udpNeighborWarmDialer struct{}
+
+func (udpNeighborWarmDialer) open(network string) (neighborWarmConn, error) {
+	conn, err := net.ListenUDP(network, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &udpNeighborWarmConn{conn: conn}, nil
+}
+
+type udpNeighborWarmConn struct{ conn *net.UDPConn }
+
+func (c *udpNeighborWarmConn) probe(dst netip.AddrPort) error {
+	// A send is what actually drives ARP/ND: connect() alone only does the
+	// route lookup. One byte to (dst, port 1) on the unconnected socket makes
+	// the kernel call neigh_resolve_output() for the next-hop.
+	_ = c.conn.SetWriteDeadline(time.Now().Add(neighborWarmProbeTimeout))
+	_, err := c.conn.WriteToUDPAddrPort([]byte{0}, dst)
+	return err
+}
+
+func (c *udpNeighborWarmConn) Close() error { return c.conn.Close() }
+
+func (d *Daemon) warmDialer() neighborWarmDialer {
+	if d.neighborWarmDialer != nil {
+		return d.neighborWarmDialer
+	}
+	return udpNeighborWarmDialer{}
+}
+
 // warmNeighborCache iterates synced sessions and sends ARP requests /
 // ICMPv6 Neighbor Solicitations for unique destination IPs. This
 // pre-populates the kernel neighbor cache so that bpf_fib_lookup
 // returns SUCCESS (not NO_NEIGH) for the first packet after failover.
+//
+// It reuses ONE unconnected datagram socket per address family (see
+// neighborWarmMaxSockets) rather than opening a connected socket per unique IP,
+// so the failover-time FD/ephemeral-port high-water mark is bounded by a
+// constant instead of by session-table size (#5451). Every unique IP is still
+// warmed; warming stays best-effort (a per-probe error does not abort the
+// rest).
 func (d *Daemon) warmNeighborCache() {
 	if d.dp == nil {
 		return
@@ -1349,36 +1423,41 @@ func (d *Daemon) warmNeighborCache() {
 		return true
 	})
 
-	// Resolve IPv4 neighbors by sending a UDP packet to trigger kernel ARP.
-	// UDP connect() alone does NOT trigger ARP — only the route lookup is
-	// performed. We must send at least one byte so the kernel actually
-	// calls neigh_resolve_output() → arp_solicit().
+	dialer := d.warmDialer()
+
+	// Resolve IPv4 neighbors by sending a UDP datagram per destination to
+	// trigger kernel ARP. One reusable unconnected socket serves every
+	// destination, so FD/port cost is O(1), not O(unique IPs).
 	count := 0
-	for ip4 := range seen {
-		addr := netip.AddrFrom4(ip4)
-		if !addr.IsGlobalUnicast() || addr.IsPrivate() && addr.IsLoopback() {
-			continue
-		}
-		conn, err := net.DialTimeout("udp4", netip.AddrPortFrom(addr, 1).String(), 50*time.Millisecond)
-		if err == nil {
-			conn.Write([]byte{0}) // triggers ARP resolution
+	if len(seen) > 0 {
+		if conn, err := dialer.open("udp4"); err == nil {
+			for ip4 := range seen {
+				addr := netip.AddrFrom4(ip4)
+				if !addr.IsGlobalUnicast() || addr.IsPrivate() && addr.IsLoopback() {
+					continue
+				}
+				if conn.probe(netip.AddrPortFrom(addr, 1)) == nil {
+					count++
+				}
+			}
 			conn.Close()
-			count++
 		}
 	}
 
-	// Resolve IPv6 neighbors.
+	// Resolve IPv6 neighbors (one reusable unconnected socket).
 	countV6 := 0
-	for ip6 := range seenV6 {
-		addr := netip.AddrFrom16(ip6)
-		if !addr.IsGlobalUnicast() {
-			continue
-		}
-		conn, err := net.DialTimeout("udp6", netip.AddrPortFrom(addr, 1).String(), 50*time.Millisecond)
-		if err == nil {
-			conn.Write([]byte{0}) // triggers NDP resolution
+	if len(seenV6) > 0 {
+		if conn, err := dialer.open("udp6"); err == nil {
+			for ip6 := range seenV6 {
+				addr := netip.AddrFrom16(ip6)
+				if !addr.IsGlobalUnicast() {
+					continue
+				}
+				if conn.probe(netip.AddrPortFrom(addr, 1)) == nil {
+					countV6++
+				}
+			}
 			conn.Close()
-			countV6++
 		}
 	}
 
