@@ -273,7 +273,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		// helper side here too so the standalone state is consistent
 		// regardless of which apply path runs. (Idempotent empty update.)
 		if !m.clusterHA {
-			if err := m.clearHelperHAStateLocked(); err != nil {
+			if err := m.clearHelperHAStateWithDebtLocked(); err != nil {
+				// Debt recorded — the status poll retries the clear until it
+				// succeeds; still surface the error so the apply fails closed.
 				return result, fmt.Errorf("clear userspace HA state (deferred startup): %w", err)
 			}
 		}
@@ -360,12 +362,15 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		if err := m.syncHAStateLocked(); err != nil {
 			return result, fmt.Errorf("publish userspace HA state: %w", err)
 		}
-	} else if err := m.clearHelperHAStateLocked(); err != nil {
+	} else if err := m.clearHelperHAStateWithDebtLocked(); err != nil {
 		// Non-cluster node: ensure neither the manager nor the helper retains
 		// HA groups. seedHAGroupInventoryLocked already cleared m.haGroups
 		// above; this also clears any groups a prior clustered apply pushed to
 		// the helper (cluster->standalone live reconfig), which would otherwise
 		// keep the HAInactive transit-drop gate armed (Codex review #1928 Q3).
+		// On failure a retry debt is recorded (#5487) so the status poll
+		// re-attempts the idempotent clear until the helper reports no groups;
+		// the error is still surfaced so this apply fails closed.
 		return result, fmt.Errorf("clear userspace HA state: %w", err)
 	}
 	if err := m.syncDesiredForwardingStateLocked(); err != nil {

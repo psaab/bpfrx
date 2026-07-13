@@ -76,6 +76,9 @@ func (m *Manager) syncHAStateLocked() error {
 // from the supplied groups, so an empty slice clears it (afxdp/ha.rs). This runs
 // only on snapshot apply for non-cluster nodes (rare), not on the hot path.
 func (m *Manager) clearHelperHAStateLocked() error {
+	if m.clearHelperHAStateHook != nil {
+		return m.clearHelperHAStateHook()
+	}
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
 	}
@@ -90,6 +93,37 @@ func (m *Manager) clearHelperHAStateLocked() error {
 		return err
 	}
 	return m.applyHelperStatusLocked(&status)
+}
+
+// clearHelperHAStateWithDebtLocked runs the idempotent standalone HA-state
+// clear and records a retry debt if it fails (#5487). The apply path still
+// surfaces the error (fail-closed), but the debt lets the status poll retry
+// the clear until it succeeds — a transient control-socket error on a
+// cluster->standalone reconfig must not permanently strand stale helper HA
+// groups (which keep owner_rg_id<=0 transit ForwardCandidates HAInactive). On
+// success the debt is cleared. Both standalone clear sites in the apply path
+// use this instead of the bare clear.
+func (m *Manager) clearHelperHAStateWithDebtLocked() error {
+	if err := m.clearHelperHAStateLocked(); err != nil {
+		m.pendingHAStateClear = true
+		return err
+	}
+	m.pendingHAStateClear = false
+	return nil
+}
+
+// retryPendingHAStateClearLocked settles a stranded standalone HA-state clear
+// debt from the status poll tick. It runs OUTSIDE the m.clusterHA HA-sync guard
+// (that guard is exactly why a standalone clear is never retried), but only
+// while the node is actually standalone: retrying an empty update_ha_state on a
+// clustered node would wipe the live redundancy-group HA state.
+func (m *Manager) retryPendingHAStateClearLocked() {
+	if !m.pendingHAStateClear || m.clusterHA {
+		return
+	}
+	if err := m.clearHelperHAStateWithDebtLocked(); err != nil {
+		slog.Warn("userspace: standalone HA-state clear retry failed; will retry next tick", "err", err)
+	}
 }
 
 // SyncFabricState pushes current fabric snapshots (with fresh peer MACs)
