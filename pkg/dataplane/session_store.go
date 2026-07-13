@@ -462,6 +462,14 @@ func (s dataPlaneSessionStore) DeleteBatchKnownV6(entries []SessionEntryV6, _ De
 	return deleted, nil
 }
 
+// batchDeleteV4 removes keys from the v4 session map in
+// sessionDeleteBatchSize chunks. cilium/ebpf BatchDelete stops at the first
+// missing key and returns (count_before_stop, ErrKeyNotExist); the stopped
+// key sits at index chunkDeleted, so keys[chunkDeleted+1:n] were never
+// attempted. Mirror clearSessionsV4 (pkg/dataplane/maps_session.go): on the
+// not-found error, retry the chunk remainder one key at a time before
+// advancing, so the unattempted tail is not silently dropped (#5448) — a
+// dropped tail leaks stale peer-synced sessions after HA bulk reconcile.
 func (s dataPlaneSessionStore) batchDeleteV4(keys []SessionKey) (int, error) {
 	deleted := 0
 	for len(keys) > 0 {
@@ -469,16 +477,33 @@ func (s dataPlaneSessionStore) batchDeleteV4(keys []SessionKey) (int, error) {
 		if len(keys) < n {
 			n = len(keys)
 		}
-		chunkDeleted, err := s.dp.BatchDeleteSessions(keys[:n])
+		chunk := keys[:n]
+		chunkDeleted, err := s.dp.BatchDeleteSessions(chunk)
+		if chunkDeleted < 0 {
+			chunkDeleted = 0
+		} else if chunkDeleted > len(chunk) {
+			chunkDeleted = len(chunk)
+		}
 		deleted += chunkDeleted
-		if err := ignoreSessionNotFound(err); err != nil {
-			return deleted, err
+		if err != nil {
+			if !sessionNotFound(err) {
+				return deleted, err
+			}
+			// Batch stopped at the first missing key (index chunkDeleted):
+			// that key is already gone, but chunk[chunkDeleted+1:] were never
+			// attempted. Finish the remainder per-key so nothing is dropped.
+			for _, k := range chunk[chunkDeleted:] {
+				if delErr := s.dp.DeleteSession(k); delErr == nil {
+					deleted++
+				}
+			}
 		}
 		keys = keys[n:]
 	}
 	return deleted, nil
 }
 
+// batchDeleteV6 is the IPv6 variant of batchDeleteV4 (#5448).
 func (s dataPlaneSessionStore) batchDeleteV6(keys []SessionKeyV6) (int, error) {
 	deleted := 0
 	for len(keys) > 0 {
@@ -486,10 +511,23 @@ func (s dataPlaneSessionStore) batchDeleteV6(keys []SessionKeyV6) (int, error) {
 		if len(keys) < n {
 			n = len(keys)
 		}
-		chunkDeleted, err := s.dp.BatchDeleteSessionsV6(keys[:n])
+		chunk := keys[:n]
+		chunkDeleted, err := s.dp.BatchDeleteSessionsV6(chunk)
+		if chunkDeleted < 0 {
+			chunkDeleted = 0
+		} else if chunkDeleted > len(chunk) {
+			chunkDeleted = len(chunk)
+		}
 		deleted += chunkDeleted
-		if err := ignoreSessionNotFound(err); err != nil {
-			return deleted, err
+		if err != nil {
+			if !sessionNotFound(err) {
+				return deleted, err
+			}
+			for _, k := range chunk[chunkDeleted:] {
+				if delErr := s.dp.DeleteSessionV6(k); delErr == nil {
+					deleted++
+				}
+			}
 		}
 		keys = keys[n:]
 	}
