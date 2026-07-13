@@ -47360,3 +47360,23 @@ top.
     docs/config-schema.md (Edit), _Log.md (Edit)
   - **Action**: #5644 (M37) — close the cold-boot host-inbound fail-open. On COLD BOOT both nft tables are absent, so a failed `applyHostInboundFilter` install has no prior table to retain (the atomic `-f -` fail-closed guarantee is day-2 only) and the boot apply only logs+discards the error → host services reachable with no host-inbound default-deny. Added a fail-closed DENY-ALL fence (`installHostInboundColdBootFence` / `buildHostInboundFencePayload`) installed when the real ruleset fails to load and `d.hostInboundEnforced` is still false (cold boot); the commit still fails (drives retry). Lifeline-excluded, no service accepts, no counters. Day-2 failures unchanged (prior table retained, no fence). Added fail-on-revert tests (RED proven with the fence neutralized). Doc: docs/host-inbound-service-matrix.md new "Cold-boot fail-closed install fence (#5644, M37)" section.
   - **File(s)**: pkg/daemon/daemon.go (Edit), pkg/daemon/daemon_nft.go (Edit), pkg/daemon/host_inbound_coldboot_fence_5644_test.go (Write), docs/host-inbound-service-matrix.md (Edit), _Log.md (Edit)
+
+- **Timestamp**: 2026-07-12
+  - **Action**: #5635 (M27) — EmitTunnelEndpointNames loses per-unit GRE
+    key/endpoint/TTL/routing-instance. When an interface carried BOTH an
+    interface-level `tunnel` stanza (iface.Tunnel != nil) AND per-unit
+    tunnel stanzas, the non-WireGuard emit loop at
+    pkg/config/tunnelemit.go:101-103 emitted `iface.Tunnel` for EVERY unit,
+    so the per-unit overrides the compiler stored in `unit.Tunnel`
+    (cloneForUnit + unit-level parse) — key, source/destination endpoint,
+    TTL, routing-instance — were dropped from the emitted set the dataplane
+    snapshot builder (buildTunnelEndpointSnapshots) and the commit-time
+    collision gate consume. Fixed to emit each unit's own TunnelConfig when
+    it has a tunnel stanza, falling back to the interface-level tunnel for
+    units without one (unchanged behavior). WireGuard single-lowest-unit
+    pick (#1910) deliberately untouched — GRE-scoped. Added fail-on-revert
+    tests: RED proven with the per-unit branch neutralized (all five fields
+    revert to interface-level values), GREEN restored. Updated the
+    EmitTunnelEndpointNames contract doc comment.
+  - **File(s)**: pkg/config/tunnelemit.go (Edit),
+    pkg/config/tunnelemit_perunit_5635_test.go (Write), _Log.md (Edit)
