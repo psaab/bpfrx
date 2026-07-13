@@ -42,6 +42,30 @@ func realArchiveTicker(d time.Duration) (<-chan time.Time, func()) {
 	return t.C, t.Stop
 }
 
+// clampArchiveIntervalMinutes converts a config-derived `system archival
+// transfer-interval` (minutes) into a POSITIVE, overflow-safe time.Duration
+// for time.NewTicker. transfer-interval is bounded to 1..2880 at commit by the
+// schema (ValidateInteger), so a normal commit never reaches the panic — but a
+// crafted on-disk Store.Load / peer-sync config bypasses that strict bound
+// (the #5723 lenient ingress). The raw-int `interval <= 0` guard in
+// reconcileArchiveTimer inspects the MINUTES integer, not the
+// `× time.Minute` product, so a value above config.MaxDurationMinutes
+// (~1.5e8 min) overflows int64 nanoseconds to a non-positive Duration and
+// time.NewTicker PANICS, crashing xpfd. Clamping the minutes to
+// [1, MaxDurationMinutes] before the multiply keeps the product positive and
+// bounded — defense-in-depth mirroring clampRPMIntervalSeconds (#5723) /
+// clampKeepaliveIntervalSec (#5705), minutes-scoped (#5784). This is the
+// straggler of the #5705/#5723 config-interval × time.Unit overflow class.
+func clampArchiveIntervalMinutes(min int) time.Duration {
+	if min < 1 {
+		return time.Minute
+	}
+	if int64(min) > config.MaxDurationMinutes {
+		return time.Duration(config.MaxDurationMinutes) * time.Minute
+	}
+	return time.Duration(min) * time.Minute
+}
+
 // archiveTimerKey collapses (interval, sites) into a stable string so
 // reconcileArchiveTimer can hash-gate: an unrelated commit that leaves the
 // periodic-archival config untouched must NOT bounce a healthy timer. An empty
@@ -116,7 +140,7 @@ func (d *Daemon) runArchiveTimer(interval int, sites []string, stop <-chan struc
 	if newTicker == nil {
 		newTicker = realArchiveTicker
 	}
-	tickC, tickStop := newTicker(time.Duration(interval) * time.Minute)
+	tickC, tickStop := newTicker(clampArchiveIntervalMinutes(interval))
 	defer tickStop()
 
 	// Secondary shutdown guard: the daemon-stop context (nil at early boot, in
