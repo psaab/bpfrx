@@ -32,9 +32,10 @@ type sessionEgressKey struct {
 }
 
 // sessionWalkLimiter is the aggregate concurrency bound for the gRPC
-// session-scan paths (GetSessions list, GetSessionSummary,
-// GetZonePairSummary, and the ShowText "sessions-top:*" scan in
-// server_show_flow.go). It aliases the
+// session-table walk paths (GetSessions list, GetSessionSummary,
+// GetZonePairSummary, the ShowText "sessions-top:*" scan in
+// server_show_flow.go, and the ClearSessions clear — both its clear-all and
+// filtered full-table walks, #5779). It aliases the
 // process-wide diagcmd.SessionWalkLimiter — the SAME instance the REST
 // session list/summary/zone-pair handlers use (pkg/api/sessions.go) — so a
 // session scan admitted over gRPC and one admitted over REST draw from one
@@ -1057,6 +1058,25 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
+
+	// Admission bound (#5779): ClearSessions drives a full v4+v6 conntrack-table
+	// walk on BOTH branches — the clear-all path (ClearAllSessions is a chunked
+	// full-table scan+delete, not O(1)) and the filtered path
+	// (clearFilteredSessionsV4/V6, cursor or rescan) — each holding per-bucket
+	// BPF-map locks that contend with the live session-sync path. This is the
+	// same DoS class as the #5708 read scans, on the mutation path. Gate the
+	// whole handler through the SAME shared limiter as the read scans; acquire
+	// ONCE here so both branches (and the peer fan-out below) draw a single
+	// slot, and a REST clear that delegates to this RPC is not double-charged.
+	// Over-cap clears get codes.ResourceExhausted. There is no keyed
+	// single-session (no-walk) branch in ClearSessions to exempt. Release on
+	// every exit path via defer.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		return nil, status.Error(codes.ResourceExhausted,
+			"session scan concurrency limit reached; retry shortly")
+	}
+	defer release()
 
 	// Check if this is a forwarded request from a peer (prevent recursion).
 	forwarded := false
