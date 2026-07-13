@@ -47299,3 +47299,7 @@ top.
   _Log.md (Edit)
   - **Action**: #5671 — add `&& as != nil` guard to memberIsNestedSet (mirror lookupApplicationSet #5179); a tolerant-loaded present-but-nil app-set slot no longer misclassifies a shadowing leaf application as a nested set (false "not found"). Added fail-on-revert test (RED proven with guard neutralized).
   - **File(s)**: pkg/config/predefined.go, pkg/config/predefined_membernestedset_nilguard_5671_test.go
+
+- **Timestamp**: 2026-07-12
+  - **Action**: #5644 (M37) — close the cold-boot host-inbound fail-open. On COLD BOOT both nft tables are absent, so a failed `applyHostInboundFilter` install has no prior table to retain (the atomic `-f -` fail-closed guarantee is day-2 only) and the boot apply only logs+discards the error → host services reachable with no host-inbound default-deny. Added a fail-closed DENY-ALL fence (`installHostInboundColdBootFence` / `buildHostInboundFencePayload`) installed when the real ruleset fails to load and `d.hostInboundEnforced` is still false (cold boot); the commit still fails (drives retry). Lifeline-excluded, no service accepts, no counters. Day-2 failures unchanged (prior table retained, no fence). Added fail-on-revert tests (RED proven with the fence neutralized). Doc: docs/host-inbound-service-matrix.md new "Cold-boot fail-closed install fence (#5644, M37)" section.
+  - **File(s)**: pkg/daemon/daemon.go (Edit), pkg/daemon/daemon_nft.go (Edit), pkg/daemon/host_inbound_coldboot_fence_5644_test.go (Write), docs/host-inbound-service-matrix.md (Edit), _Log.md (Edit)

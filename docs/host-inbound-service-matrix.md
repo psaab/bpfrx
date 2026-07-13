@@ -318,6 +318,61 @@ Two observability surfaces consume it:
   visible in a config-only / degraded boot). Alert with e.g.
   `max_over_time(xpf_host_inbound_addressless_zones[1h]) > 0`.
 
+## Cold-boot fail-closed install fence (#5644, M37)
+
+`applyHostInboundFilter` loads the chain with `nft -f -`, which is **atomic**:
+on a load failure the kernel keeps the PREVIOUS `inet xpf_hostinbound` table
+untouched. That is the fail-closed guarantee behind #3333 — a failed day-2
+install retains the prior host-inbound default-deny, so a committed deny that did
+not reach the kernel never silently relaxes enforcement. **But that guarantee is
+day-2 only: on a COLD BOOT both nft tables are absent, so a failed install has no
+prior generation to retain.** The boot apply reaches `applyHostInboundFilter`
+through `applyConfig`, which only **logs and discards** the returned error
+(a boot apply must not brick startup), so a cold-boot install failure would leave
+the host input path with **no** `xpf_hostinbound` chain — every host-bound service
+to a firewall-local address reachable with no host-inbound default-deny
+(fail-open) — while the daemon proceeds to publish host service / VIP / HA-ready.
+
+To close that window, a cold-boot install failure installs a **fail-closed
+DENY-ALL fence** before returning the error:
+
+- `d.hostInboundEnforced` (a `Daemon` atomic bool) records whether a
+  host-inbound table (real ruleset OR fence) has loaded at least once this boot.
+  It is the cold-boot discriminator: on a real-install failure it is **false**
+  only when no table has ever loaded (cold boot, both tables absent); day-2 it is
+  **true**, so the atomic-load retention already covers the failure and NO fence
+  is installed (the prior real table stands — the normal path is bit-unchanged).
+- `installHostInboundColdBootFence` / `buildHostInboundFencePayload`
+  (`daemon_nft.go`) build the fence: the same atomic-replace `xpf_hostinbound`
+  table reduced to the global mandatory admits (`ct established,related`, raw
+  ESP/AH, IPv6 ND, v4/v6 PMTUD+error, the configured WireGuard listen port) and a
+  catch-all `<fam> daddr <addrs> drop` for **every** firewall-local address the
+  real ruleset would scope (the per-zone views + the addressed-but-unzoned set).
+  It carries **no per-service accept and no named counters** — it is strictly the
+  real table with every service ACCEPT removed, so during the fence window even a
+  `system-services all` zone is denied (maximally fail-closed). The address sets
+  are already lifeline-excluded (fxp0 / em0 / fab* and their addresses are
+  subtracted by `BuildZoneHostInboundViews` / `BuildUnzonedHostInboundAddrs`), so
+  the fence can **never** strand management or break HA.
+- The commit still **fails** (`applyHostInboundFilter` returns the wrapped nft
+  error, joined into the commit result) — the fence only closes the exposure; the
+  failed apply is what drives the retry. The next clean commit / re-render (or the
+  DHCP/VIP re-apply that already re-runs this path) replaces the fence with the
+  real ruleset and self-heals.
+- If the fence **also** fails to load (nft itself broken), both errors are joined
+  and an `ERROR`-level `COLD-BOOT FAIL-OPEN GUARD` log fires; `hostInboundEnforced`
+  stays false. That is the irreducible catastrophic case — the daemon has done all
+  it can short of holding forwarding.
+
+Relationship to the addressless window above: at the very first cold-boot apply an
+interface may have no address yet, so both the real ruleset AND the fence scope
+nothing — but with no address there is also no reachable host service, so there is
+no exposure, and the re-render on address-appearance re-runs this path (installing
+the fence if the real apply fails again). This is scoped to the **direct-host nft
+input authority** only; the AF_XDP transit arm / attach readiness is owned
+separately by #5275. Fail-on-revert proofs:
+`pkg/daemon/host_inbound_coldboot_fence_5644_test.go`.
+
 ### Per-interface / per-family refinement (#3710)
 
 The zone-level signal above **collapses**: `AddresslessEnforcingZones` marks a

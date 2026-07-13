@@ -462,6 +462,21 @@ type Daemon struct {
 	// map[string]bool types and are reached as d.hostInboundFailOpen.<field>.
 	hostInboundFailOpen hostInboundFailOpenState
 
+	// hostInboundEnforced records whether a host-inbound enforcement table
+	// (the real ruleset OR the #5644 cold-boot fail-closed fence) has been
+	// successfully installed at least once since this daemon started. It is the
+	// "enforcement established" signal that closes the cold-boot fail-open window
+	// (#5644, M37): on COLD BOOT both nft tables are absent, so a failed
+	// host-inbound install has no prior table to retain (the atomic `-f -` load's
+	// fail-closed guarantee only holds day-2), leaving host-bound services
+	// reachable with no host-inbound default-deny. applyHostInboundFilter reads
+	// this to decide whether a failed install is a cold-boot (false → install a
+	// deny-all fence so host services stay fenced) versus a day-2 failure (true →
+	// the prior table is retained, already fail-closed). Written under applySem in
+	// applyHostInboundFilter; atomic so a publication-readiness reader on another
+	// goroutine sees a consistent value without taking applySem.
+	hostInboundEnforced atomic.Bool
+
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
 	//
