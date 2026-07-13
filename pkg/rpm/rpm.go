@@ -437,9 +437,29 @@ func (m *Manager) Results() []*ProbeResult {
 	return out
 }
 
+// clampRPMIntervalSeconds converts a config-derived RPM interval (seconds) to a
+// positive, non-overflowing time.Duration. A test-interval / probe-interval is
+// bounded to config.MaxDurationSeconds at commit by the schema (#5723), but the
+// lenient HA-sync / on-disk Load ingress only DOWNGRADES an out-of-range value
+// to a warning, so a peer-synced or persisted pathological value can still reach
+// the runtime probe loop. Clamping to [1, MaxDurationSeconds] before the
+// *time.Second multiply keeps time.Duration(sec)*time.Second within int64
+// nanoseconds, so a non-positive Duration can never reach time.NewTicker and
+// panic xpfd — the sibling of the #5705 keepalive overflow. EffectiveTest/
+// ProbeInterval already floor at their defaults, so sec < 1 is defensive.
+func clampRPMIntervalSeconds(sec int) time.Duration {
+	if sec < 1 {
+		return time.Second
+	}
+	if int64(sec) > config.MaxDurationSeconds {
+		return time.Duration(config.MaxDurationSeconds) * time.Second
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func (m *Manager) runProbeLoop(ctx context.Context, probe *config.RPMProbe, test *config.RPMTest, key string) {
-	interval := time.Duration(test.EffectiveTestInterval()) * time.Second
-	probeInterval := time.Duration(test.EffectiveProbeInterval()) * time.Second
+	interval := clampRPMIntervalSeconds(test.EffectiveTestInterval())
+	probeInterval := clampRPMIntervalSeconds(test.EffectiveProbeInterval())
 	probeCount := test.EffectiveProbeCount()
 	threshold := test.EffectiveSuccessiveLossThreshold()
 
