@@ -47680,3 +47680,33 @@ top.
   retry (pre-fix absent behavior) turns three tests RED — "retry debt was not
   recorded" (failed clear), "clearHelperHAStateLocked called 0 times, want 1"
   (poll-tick retry x2); restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: Fix #5676 (codex-review-182 M10, High) — address-book `address`
+  and `address-set` names share one untagged namespace, so a plain address
+  silently SHADOWS a same-named address-set at name→prefix resolution
+  (address-first everywhere: dataplane expandBookNameRecursive /
+  nameRepresentability / capabilities, host-inbound junos_host_deny), changing
+  which traffic a permit/deny rule covers with no diagnostic. Fix: new strict
+  gate `validateAddressBookNameCollisionStrict` (+ `resolveAddressBookNameKind`
+  SSOT encoding the deterministic address-first winner + `AddressBookRefKind`)
+  in `compiler_validate_strict_addrbook.go`, wired in `runEarlyStrictAndFolds`
+  right after `validateAddressBookEntryNamesStrict` and BEFORE the zone-local
+  fold (pristine-book ordering — so global vs different-zone names aren't
+  misreported and a real zone-local collision names the clean zone). Strict on
+  commit/commit-check = HARD REJECT (matches vSRX, which forbids the collision);
+  tolerant load/peer-sync = WARN + keep the address-first winner
+  (`lenientAddressBookNameCollision`, #1960 no-brick so a leniently-loaded
+  config forwards exactly as before). Pure pkg/config — no dataplane/Rust/wire
+  change.
+  **File(s)**: pkg/config/compiler_validate_strict_addrbook.go (new),
+  pkg/config/addr_set_namespace_5676_test.go (new),
+  pkg/config/compiler_earlystrict.go, pkg/config/compiler.go,
+  docs/config-schema.md
+  GREEN: `go test ./pkg/config/...` passes (incl. TestEveryStrictCommitGateIsWired
+  canary + golden). gofmt clean on touched files, go vet clean. Fail-on-revert
+  proven: unwiring the `validateAddressBookNameCollisionStrict` dispatch turns
+  the strict-reject (global + both orderings + zone-local) and lenient-warn
+  tests RED — "expected strict commit to reject a same-name address +
+  address-set collision", "lenient compile must record a collision warning";
+  restored GREEN.
