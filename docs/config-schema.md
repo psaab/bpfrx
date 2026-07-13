@@ -3291,7 +3291,18 @@ reserved for whole-dataplane selection where a rewrite shim
   carried the same first-root-only defect for split `security` /
   `interfaces` / `routing-instances` roots and were fixed the same way
   (`#5691`, `ConfigTree.FindChildren`-based union across all matching
-  roots).
+  roots). **#5744 (the two remaining interface AST pre-walks):** the
+  unit-alias collision gate (`validateInterfaceUnitAliasCollisionsAST`,
+  `#5631`) and the unsupported-stanza gate
+  (`validateUnsupportedInterfaceStanzasAST`, `#2008`/`#2354`) were the last
+  sibling pre-walks still `break`-ing on the first `interfaces` root, so a
+  unit-alias collision or an unsupported/silently-dropped stanza placed in a
+  SECOND `interfaces` root bypassed them. Both now flatten every
+  `interfaces` root's children into one per-interface pass (whole-interface
+  last-writer-wins across roots keeps the collision intra-node, so each
+  interface node is still detected independently, matching
+  `compileInterfaces`). Regression coverage:
+  `pkg/config/interface_prewalk_all_roots_5744_test.go`.
 - **#3444 (destination-NAT rule-set `to` scope reject):** a Junos
   destination-NAT rule-set has only a `from` clause (zone | interface |
   routing-instance) — DNAT translates the destination on inbound, so there

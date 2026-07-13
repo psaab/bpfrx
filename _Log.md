@@ -47907,3 +47907,31 @@ top.
   over-cap /111, empty, mixed) and both lenient-warn cases RED — "expected
   strict commit to reject pool shape", "lenient compile must record a
   source-nat pool address warning"; restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: Fix #5744 — two interface AST pre-walks were still
+  first-root-only after PR #5741 routed the interface-range expansion +
+  stable-ID collision gates through all top-level roots. A hierarchical config
+  splitting `interfaces { }` across two sibling roots could place a unit-alias
+  collision (validateInterfaceUnitAliasCollisionsAST, #5631) or an
+  unsupported/silently-dropped interface stanza
+  (validateUnsupportedInterfaceStanzasAST, #2008/#2354) in the SECOND root and
+  bypass both validators. Fix: both functions now flatten EVERY `interfaces`
+  root's children into one per-interface pass (mirrors #5741's all-roots
+  union). Correctness: compileInterfaces stores each interface node with
+  whole-interface last-writer-wins (`ifaces.Interfaces[ifName] = ifc`), so a
+  unit-alias collision is always intra-node — flattening across roots detects
+  each node independently, exactly matching what compileInterfaces consumes (no
+  cross-root per-interface aggregation, which would over-flag). Pure pkg/config
+  Go change.
+  **File(s)**: pkg/config/compiler_interface_unit_alias.go,
+  pkg/config/compiler_interfaces_unsupported.go,
+  pkg/config/interface_prewalk_all_roots_5744_test.go (new),
+  docs/config-schema.md
+  GREEN: `go test ./pkg/config/...` passes. gofmt clean on touched files, go
+  vet clean. Fail-on-revert proven: restoring both validators' first-root-only
+  selection turns the three second-root cases RED — "expected strict commit to
+  reject a unit-alias collision in the SECOND interfaces root", "expected
+  strict commit to reject an unsupported `mac` stanza in the SECOND interfaces
+  root", "lenient compile must warn about the second-root unsupported stanza";
+  the single-root no-regression case stayed GREEN; restored GREEN.

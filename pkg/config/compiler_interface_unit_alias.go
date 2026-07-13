@@ -73,14 +73,27 @@ import (
 // token is skipped — the compiler `continue`s on the identical Atoi error, so
 // it never reaches `ifc.Units` and cannot collide.
 func validateInterfaceUnitAliasCollisionsAST(nodes []*Node, lenient bool) ([]string, error) {
-	var ifaces *Node
+	// #5744: union across EVERY top-level `interfaces` root, not just the first.
+	// A hierarchical config can split its interfaces across two sibling
+	// `interfaces { }` stanzas, and compileSections compiles them all — so a
+	// unit-alias collision living in a SECOND root was skipped by the old
+	// first-root-only scan, the sibling gap PR #5741 closed for the
+	// interface-range / stable-ID gates (expandInterfaceRanges,
+	// validateZoneIDCollisionAST). Flattening every interfaces root's children
+	// into one per-interface pass is equivalent to nesting a loop over the roots:
+	// compileInterfaces stores each interface node with whole-interface
+	// last-writer-wins (`ifaces.Interfaces[ifName] = ifc`), so the collision is
+	// always intra-node and each interface node is detected independently,
+	// exactly as before.
+	var ifaceChildren []*Node
+	sawInterfaces := false
 	for _, n := range nodes {
 		if n.Name() == "interfaces" {
-			ifaces = n
-			break
+			sawInterfaces = true
+			ifaceChildren = append(ifaceChildren, n.Children...)
 		}
 	}
-	if ifaces == nil {
+	if !sawInterfaces {
 		return nil, nil
 	}
 
@@ -94,7 +107,7 @@ func validateInterfaceUnitAliasCollisionsAST(nodes []*Node, lenient bool) ([]str
 		return nil
 	}
 
-	for _, iface := range ifaces.Children {
+	for _, iface := range ifaceChildren {
 		ifName := iface.Name()
 		if ifName == "" {
 			continue
