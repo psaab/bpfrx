@@ -3,6 +3,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -310,12 +311,136 @@ func (d *Daemon) applyHostInboundFilter(cfg *config.Config) error {
 	nftConf := buildHostInboundFilterPayload(views, unzonedV4, unzonedV6, programs, wgListenPorts)
 	if out, err := nftApplyPayload(nftConf); err != nil {
 		slog.Warn("failed to apply host-inbound filter", "err", err, "output", string(out))
+		// #5644 (M37) cold-boot fail-closed fence. The atomic `-f -` load leaves
+		// the PREVIOUS table untouched on failure, so day-2 a failed install is
+		// already fail-closed (the prior host-inbound default-deny stays in the
+		// kernel). But on COLD BOOT both tables are absent — there is no prior
+		// generation to retain — so a failed install here would leave the host
+		// input path OPEN: host-bound services to firewall-local addresses become
+		// reachable with NO host-inbound default-deny (fail-open), and the boot
+		// apply only logs+discards this error (applyConfig), so the daemon proceeds
+		// to publish host service / VIP / HA-ready over an unenforced input path.
+		// d.hostInboundEnforced is still false only when no real/fence table has
+		// ever loaded this boot (i.e. cold boot), so gate the fence on it: install
+		// a maximally-restrictive deny-all fence (host services DENIED to every
+		// non-lifeline firewall-local address, only mandatory L3 / return traffic
+		// admitted) so enforcement is fail-closed until a clean commit re-renders
+		// the real ruleset. The commit still fails (we return the error), which is
+		// what drives the retry/re-render; the fence only closes the exposure in
+		// the meantime.
+		if !d.hostInboundEnforced.Load() {
+			if fenceErr := d.installHostInboundColdBootFence(views, unzonedV4, unzonedV6, wgListenPorts); fenceErr != nil {
+				return errors.Join(fmt.Errorf("apply host-inbound nftables filter: %w", err), fenceErr)
+			}
+		}
 		return fmt.Errorf("apply host-inbound nftables filter: %w", err)
 	}
+	// A real host-inbound table is now installed: enforcement is established, so a
+	// LATER failed install (day-2) is retained by the atomic load and needs no
+	// fence (#5644).
+	d.hostInboundEnforced.Store(true)
 	slog.Info("host-inbound filter applied", "zones", len(views),
 		"unzoned_deny_v4", len(unzonedV4), "unzoned_deny_v6", len(unzonedV6),
 		"junos_host_deny_programs", len(programs))
 	return nil
+}
+
+// installHostInboundColdBootFence installs the #5644 (M37) cold-boot
+// fail-closed host-inbound fence: a minimal xpf_hostinbound table that DENIES
+// every host-bound service to firewall-local addresses, admitting only the
+// mandatory L3 / return traffic (established/related, raw ESP+AH for
+// host-terminated IPsec, IPv6 ND, v4/v6 PMTUD+error, and the configured
+// WireGuard listen port(s)). It is installed ONLY when the real host-inbound
+// ruleset failed to load and no enforcement table exists yet this boot (cold
+// boot, both tables absent), so a failed install cannot leave the host input
+// path fail-open until the next clean commit.
+//
+// Safety: the fence drops only to the SAME address sets the real ruleset would
+// scope (views + the addressed-but-unzoned set), which are already
+// lifeline-excluded (fxp0/em0/fab* and their addresses are subtracted by
+// BuildZoneHostInboundViews / BuildUnzonedHostInboundAddrs), so the fence can
+// never strand management or break HA — it is strictly the real table with every
+// service ACCEPT removed. It carries no named counters (a fence is transient) so
+// it has fewer moving parts than the real payload and is more likely to load when
+// the real one hit a payload-specific nft error. On success the fence table
+// exists, so d.hostInboundEnforced is set true — a subsequent failed real apply
+// is then retained by the atomic `-f -` load (still fail-closed). On failure (nft
+// itself is broken) the error is returned and joined into the commit result; the
+// caller logs it and the daemon has done all it can short of holding forwarding.
+func (d *Daemon) installHostInboundColdBootFence(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) error {
+	fence := buildHostInboundFencePayload(views, unzonedV4, unzonedV6, wgListenPorts)
+	if out, err := nftApplyPayload(fence); err != nil {
+		slog.Error("COLD-BOOT FAIL-OPEN GUARD: host-inbound install failed AND the fail-closed "+
+			"fence could not be installed; host-bound services may be reachable without "+
+			"host-inbound enforcement until the next successful commit re-renders the ruleset",
+			"err", err, "output", string(out))
+		return fmt.Errorf("install host-inbound cold-boot fail-closed fence: %w", err)
+	}
+	d.hostInboundEnforced.Store(true)
+	slog.Warn("host-inbound install failed at cold boot (no prior table to retain); installed a "+
+		"fail-closed DENY-ALL fence so host-bound services are NOT exposed — the next clean "+
+		"commit replaces it with the real host-inbound ruleset",
+		"fenced_zones", len(views), "fenced_unzoned_v4", len(unzonedV4),
+		"fenced_unzoned_v6", len(unzonedV6))
+	return nil
+}
+
+// buildHostInboundFencePayload assembles the #5644 cold-boot fail-closed fence
+// payload (see installHostInboundColdBootFence). It is the atomic-replace
+// xpf_hostinbound table reduced to: the global mandatory accepts, then a
+// catch-all DROP for every firewall-local address the real ruleset would scope —
+// NO per-service accepts, NO named counters. Split out as a pure function so
+// tests can parse-check the full payload without invoking nft. A syntax error on
+// any line rejects the WHOLE payload (atomic load), so the fence fails
+// closed-as-absent rather than half-applied — exactly like the real builder.
+func buildHostInboundFencePayload(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, wgListenPorts []uint16) string {
+	var rules []string
+	rules = append(rules, "add table inet xpf_hostinbound")
+	rules = append(rules, "delete table inet xpf_hostinbound")
+	rules = append(rules, "table inet xpf_hostinbound {")
+	rules = append(rules, "  chain input {")
+	// Same hook/priority as the real host-inbound chain so the fence occupies the
+	// same evaluation slot (#3364).
+	rules = append(rules, fmt.Sprintf("    type filter hook input priority %d; policy accept;", nftHostInboundPriority))
+	// Mandatory admits — return traffic and core L3 control, NOT a service
+	// exposure (mirrors the real chain's global accepts, counters omitted):
+	rules = append(rules, "    ct state established,related accept")
+	// Raw ESP (50) / AH (51) so the kernel XFRM stack can decrypt host-terminated
+	// IPsec (mirrors the real chain and the userspace passthrough stage).
+	rules = append(rules, "    meta l4proto { 50, 51 } accept")
+	// IPv6 ND + v4/v6 PMTUD/error control messages — mandatory link operation.
+	rules = append(rules, "    icmpv6 type { 1, 2, 3, 4 } accept")
+	rules = append(rules, "    icmpv6 type { 133, 134, 135, 136, 137 } accept")
+	rules = append(rules, "    icmp type { destination-unreachable, time-exceeded, parameter-problem } accept")
+	// The XDP shim steers local-destination UDP on the WG listen port to the
+	// kernel WG socket; admit it so a responder-only tunnel is not black-holed by
+	// the fence (mirrors emitHostInboundWireGuardAccept). No-op when WG is unset.
+	if len(wgListenPorts) > 0 {
+		rules = append(rules, "    udp dport "+renderWireGuardPortSpec(wgListenPorts)+" accept")
+	}
+	// Catch-all DROP for every firewall-local address the real ruleset would scope
+	// — per host-inbound-configured zone (default-deny parity, #3405) and the
+	// addressed-but-unzoned set (#4420 HI-2). These sets are already
+	// lifeline-excluded, so the fence never denies management / cluster-control
+	// traffic. During the fence window even a `system-services all` zone is denied
+	// (maximally fail-closed); the next clean commit restores the real accepts.
+	for _, v := range views {
+		if len(v.V4Addrs) > 0 {
+			rules = append(rules, "    ip daddr "+nftAddrSet(v.V4Addrs)+" drop")
+		}
+		if len(v.V6Addrs) > 0 {
+			rules = append(rules, "    ip6 daddr "+nftAddrSet(v.V6Addrs)+" drop")
+		}
+	}
+	if len(unzonedV4) > 0 {
+		rules = append(rules, "    ip daddr "+nftAddrSet(unzonedV4)+" drop")
+	}
+	if len(unzonedV6) > 0 {
+		rules = append(rules, "    ip6 daddr "+nftAddrSet(unzonedV6)+" drop")
+	}
+	rules = append(rules, "  }")
+	rules = append(rules, "}")
+	return strings.Join(rules, "\n") + "\n"
 }
 
 // hostInboundFailOpenState groups the three previous-apply host-inbound
