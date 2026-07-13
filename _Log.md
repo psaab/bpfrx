@@ -47538,6 +47538,25 @@ top.
   TestRouteLeakReconcileFailsCommitOnPublishError and ...OnBumpError RED
   (returns nil on injected failure); restored GREEN.
 
+- **Timestamp**: 2026-07-12 23:25
+  **Action**: Fix #5448 — batchDeleteV4/V6 dropped the unattempted chunk tail on
+  a missing key. cilium/ebpf BatchDelete stops at the first absent key and
+  returns (count_before_stop, ErrKeyNotExist); the old loop swallowed the error
+  via ignoreSessionNotFound and advanced `keys = keys[n:]`, so
+  chunk[chunkDeleted+1:n] was never retried → stale peer-synced sessions leaked
+  after HA bulk reconcile (ReconcileClusterBulk). Mirrored clearSessionsV4's
+  established per-key fallback: on the not-found error, delete the chunk
+  remainder one key at a time before advancing; genuine (non-not-found) errors
+  still propagate. Fixed both V4 and V6 identically; clamped chunkDeleted to
+  [0,len(chunk)] like the sibling.
+  **File(s)**: pkg/dataplane/session_store.go,
+  pkg/dataplane/session_store_batchdelete_5448_test.go
+  GREEN: `go test ./pkg/dataplane/...` — new tests pass; gofmt + vet clean.
+  Fail-on-revert proven: reverting to the buggy loop → both
+  TestBatchDeleteV{4,6}RetriesTailAfterMissingKey RED (tail keys survive,
+  deleted count 2 not 4); restored GREEN. (Pre-existing, unrelated:
+  TestUserspaceManagerDoesNotImportReflectOrUnsafe fails on pristine
+  origin/master — manager_overlay.go imports reflect; not touched here.)
 - **Timestamp**: 2026-07-12
   **Action**: #5697 (codex-review-182 M20) — failed stale-binding clears no
   longer lose the retry inventory. In `applyHelperStatusLocked` the stale
