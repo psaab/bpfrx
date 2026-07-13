@@ -791,8 +791,18 @@ func (d *Daemon) ForceDDNSUpdate(force bool) (bool, string) {
 			"redundancy group; the redundancy-group owner publishes (no action " +
 			"taken on the backup)"
 	}
-	if force && d.surfaceA.mgr != nil {
-		d.surfaceA.mgr.ForceRefresh()
+	if force {
+		// Arm BOTH engines' force-now latch so the explicit request re-asserts
+		// every owned record onto the wire even when content is unchanged: Surface
+		// A router records AND Surface B DHCP-lease records (#5710 M37 — the DHCP
+		// surface was previously only re-observed, so an unchanged DHCP record was
+		// never re-published and a drifted/deleted wire RR could not be repaired).
+		if d.surfaceA.mgr != nil {
+			d.surfaceA.mgr.ForceRefresh()
+		}
+		if d.ddns != nil {
+			d.ddns.ForceRefresh()
+		}
 	}
 	// Nudge both DDNS reconcile loops immediately (Surface A router records and
 	// the DHCP-lease Surface B path) so the forced/checked pass runs now rather
