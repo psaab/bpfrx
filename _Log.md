@@ -47709,6 +47709,85 @@ top.
   recorded" (failed clear), "clearHelperHAStateLocked called 0 times, want 1"
   (poll-tick retry x2); restored GREEN.
 
+- **Timestamp**: 2026-07-13
+  **Action**: #5708 (codex-review-182 M35) — gRPC session list/summary scans
+  had no shared admission bound. The REST session-scan endpoints gate every
+  full v4+v6 conntrack-table walk through a fixed-capacity semaphore
+  (pkg/api sessionWalkLimiter, #5318/#5433), but the gRPC GetSessions /
+  GetSessionSummary RPCs (pkg/grpcapi/server_sessions.go) walked the same table
+  with NO admission bound — a gRPC caller could issue unbounded full-table
+  scans (each holding per-bucket BPF-map locks against the live session-sync
+  path), bypassing the REST gate = CPU/contention DoS through the uncovered
+  gRPC surface. Fix mirrors the existing shared diagcmd.DefaultLimiter
+  (diagnostics) precedent: hoisted the session-walk limiter to a process-wide
+  diagcmd.SessionWalkLimiter (+ MaxConcurrentSessionWalks=4), repointed
+  pkg/api's sessionWalkLimiter to it, and added a pkg/grpcapi alias gating
+  GetSessions (covers cursor+legacy+peer fan-out) and GetSessionSummary via
+  fail-fast Acquire → codes.ResourceExhausted on over-cap (the gRPC analog of
+  REST's HTTP 429). Now REST+gRPC scrapers draw from ONE aggregate budget and
+  a gRPC caller cannot exceed it. The list result set was already capped
+  (limit/pageSize clamp to 10000). Updated pkg/api/README.md admission-bound
+  section to note the #5708 hoist + gRPC coverage.
+  **File(s)**: pkg/diagcmd/limiter.go, pkg/api/sessions.go, pkg/api/README.md,
+  pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/server_sessions_bound_5708_test.go
+  GREEN: go test ./pkg/grpcapi/... ./pkg/api/... ./pkg/diagcmd/... all ok;
+  gofmt + go vet + go build clean. Fail-on-revert proven: removing the gRPC
+  Acquire gates → three admission-bound tests RED (GetSessions /
+  GetSessionSummary over-cap and shared-singleton-saturation all return nil
+  instead of ResourceExhausted); restored GREEN. Fully unit-verifiable, no
+  cluster.
+
+- **Timestamp**: 2026-07-13
+  **Action**: #5708 / PR #5778 follow-up — hostile review (Bar 2) found a MISSED
+  gRPC scan path: GetZonePairSummary (pkg/grpcapi/server_sessions.go) is a
+  registered, client-reachable RPC whose computeZonePairSummary() does an
+  unconditional full v4+v6 IterateSessions/IterateSessionsV6 walk (same
+  BPF-map-lock cost as GetSessionSummary) but was NOT gated by the shared
+  sessionWalkLimiter — while its REST twin (GET
+  /security/sessions/summary/zone-pairs) IS gated, so zone-pairs was bounded on
+  REST but unbounded on gRPC (attacker just calls GetZonePairSummary). Folded
+  the same fail-fast Acquire→ResourceExhausted gate into GetZonePairSummary
+  (matching the two existing sites). Verified the peer path
+  (proxyPeerZonePairSummary) dials the peer with the x-peer-forwarded recursion
+  guard and does NOT re-enter the local handler → no double-acquire / cap-4
+  wedge. Added TestGRPCGetZonePairSummaryConcurrencyBound mirroring the summary
+  test. Updated the enumeration comments in diagcmd/limiter.go,
+  server_sessions.go (gRPC alias), and pkg/api/README.md to include
+  GetZonePairSummary. (ClearSessions REST/gRPC ungated gap is a separate
+  follow-up issue, out of this PR.)
+  **File(s)**: pkg/grpcapi/server_sessions.go,
+  pkg/grpcapi/server_sessions_bound_5708_test.go, pkg/diagcmd/limiter.go,
+  pkg/api/README.md
+  GREEN: go test ./pkg/grpcapi/... ./pkg/api/... ./pkg/diagcmd/... all ok;
+  gofmt + go vet + go build clean. Fail-on-revert proven: removing the
+  GetZonePairSummary gate → TestGRPCGetZonePairSummaryConcurrencyBound RED
+  ("err = <nil>, want codes.ResourceExhausted"); restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: #5708 / PR #5778 follow-up 2 — re-review's exhaustive sweep found
+  a 4th ungated client-reachable gRPC full-table READ-scan: showSessionsTop
+  (pkg/grpcapi/server_show_flow.go), dispatched from the registered ShowText
+  RPC via Topic "sessions-top:bytes"/"sessions-top:packets". It walks the whole
+  v4+v6 conntrack table (s.dp.IterateSessions/V6, same per-bucket BPF-map lock
+  cost as the gated trio); the #5319 bounded top-K caps only the OUTPUT (K heap
+  survivors), NOT the WALK — so the same unbounded-scan DoS applied. Folded the
+  same fail-fast Acquire→codes.ResourceExhausted gate at the top of
+  showSessionsTop (after the dp-not-loaded check, before the walk); ShowText
+  returns the handler error verbatim so an over-cap scan surfaces as a clean
+  ResourceExhausted. No REST twin exists (grep of pkg/api found no sessions-top
+  endpoint) — gRPC-only; noted in PR/README. Added
+  TestGRPCShowSessionsTopConcurrencyBound (drives the real ShowText dispatch).
+  Updated the enumeration comments (diagcmd/limiter.go, server_sessions.go
+  alias, pkg/api/README.md) to list the ShowText sessions-top scan as gated.
+  ClearSessions stays OUT (that's the #5779 mutation follow-up).
+  **File(s)**: pkg/grpcapi/server_show_flow.go, pkg/grpcapi/server_sessions.go,
+  pkg/diagcmd/limiter.go, pkg/api/README.md,
+  pkg/grpcapi/server_sessions_bound_5708_test.go
+  GREEN: go test ./pkg/grpcapi/... ./pkg/api/... all ok; gofmt + go vet + go
+  build clean. Fail-on-revert proven: removing the showSessionsTop gate →
+  TestGRPCShowSessionsTopConcurrencyBound RED ("err = <nil>, want
+  codes.ResourceExhausted"); restored GREEN.
 - **Timestamp**: 2026-07-13 00:20
   **Action**: #5643 / PR #5776 — folded two hostile-review gaps into the
   post-promotion host-authorization closeout. Gap A: applyHostAuthorizationCloseout

@@ -21,31 +21,21 @@ import (
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
-// maxConcurrentSessionWalks bounds how many full session-table walks may
-// run at once across the session-scan REST endpoints (#5318, #5433): the
-// GET /security/sessions list, GET /security/sessions/summary, and GET
-// /security/sessions/summary/zone-pairs. Each of these walks the whole
-// v4+v6 conntrack table holding per-bucket BPF-map locks, so N concurrent
-// scrapers each drive their own full walk simultaneously — on a
-// multi-million-session firewall that multiplies contention with the live
-// dataplane session-sync path. The cap is deliberately small: legitimate
-// dashboards/automation poll a handful at a time, while a scrape flood must
-// never starve session installs. #5237 already aborts a walk when its own
-// client disconnects; this bounds how many connected clients can walk at
-// once, which the disconnect-abort does not.
-const maxConcurrentSessionWalks = 4
-
 // sessionWalkLimiter is the shared admission gate for the full-table
-// session-scan handlers (list, summary, zone-pairs). It reuses the diagcmd
-// fixed-capacity counting semaphore (the same fail-fast idiom the
-// diagnostic ping/traceroute handlers use, #5057): Acquire is non-blocking,
-// so an over-cap request is rejected immediately with HTTP 429 rather than
-// queued into an unbounded backlog. One shared limiter (not one per
-// endpoint) bounds the AGGREGATE walk concurrency, since all three handlers
-// contend for the same per-bucket BPF-map locks against session-sync
-// (#5433). It is a package var so a test can swap in a fresh small-capacity
-// limiter without mutating process-wide state.
-var sessionWalkLimiter = diagcmd.NewLimiter(maxConcurrentSessionWalks)
+// session-scan handlers (list, summary, zone-pairs). It aliases the
+// process-wide diagcmd.SessionWalkLimiter (capacity
+// diagcmd.MaxConcurrentSessionWalks), the SAME instance the gRPC
+// GetSessions/GetSessionSummary handlers use — so a mix of REST and gRPC
+// scrapers draws from one aggregate budget and a gRPC caller cannot bypass
+// this bound (#5708). It reuses the diagcmd fixed-capacity counting semaphore
+// (the same fail-fast idiom the diagnostic ping/traceroute handlers use,
+// #5057): Acquire is non-blocking, so an over-cap request is rejected
+// immediately with HTTP 429 rather than queued into an unbounded backlog. Each
+// walk holds per-bucket BPF-map locks across the whole v4+v6 conntrack table,
+// contending with the live dataplane session-sync path (#5318, #5433). It is a
+// package var so a test can swap in a fresh small-capacity limiter without
+// mutating the process-wide instance.
+var sessionWalkLimiter = diagcmd.SessionWalkLimiter
 
 // defaultSessionCountCap bounds how many matching sessions the offset list
 // walk counts before it stops and reports Total as an approximate lower
