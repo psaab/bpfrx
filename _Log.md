@@ -1,3 +1,31 @@
+## 2026-07-12 — #5704 (bug): RETH deletion failures must fail the reconcile closed
+- **Timestamp**: 2026-07-12 (fix/5704-reth-delete-failclosed)
+- **Action**: codex-review-182 M30. rethManager.Clear (pkg/routing/reth.go)
+  scanned LinkList for reth* bond devices and LinkDel'd each, but a per-bond
+  LinkDel failure was only logged (slog.Warn) and then swallowed — Clear ALWAYS
+  returned nil. A stale reth* bond that could not be torn down (EBUSY / EPERM /
+  transient netlink error) stayed in the kernel — with potentially stale
+  VIP/MAC ownership — while the daemon and the commit reported a clean teardown
+  (fail-open reported as success). Fix: aggregate the LinkDel errors with
+  errors.Join and return them, mirroring the #4901 xfrm/bond/tunnel Clear fix
+  and the #5310/#5703 fail-closed discipline. The apply pipeline
+  (daemon_apply.go step 1.8) already threads ClearRethInterfaces' return into
+  its errors.Join, so a genuine teardown failure now fails the commit closed.
+  Idempotence preserved: an already-absent reth device is not returned by
+  LinkList, so no LinkDel is attempted and no spurious error is produced; retry
+  is implicit via the next reconcile's re-scan (no ownership map to retain,
+  unlike xfrm/bond/tunnel). Updated the daemon_apply.go step-1.8 comment and
+  pkg/routing/README.md reth.go row to describe the fail-closed behavior. Added
+  pkg/routing/reth_clear_failclosed_5704_test.go (fail-on-revert): reused
+  fakeBondLinkOps (seedBond → real *netlink.Bond, failLinkDel injection) — a
+  failed LinkDel makes Clear return a non-nil error naming the bond; two
+  failures both surface in the joined error; all-success returns nil; an
+  already-gone RETH returns nil with zero LinkDel attempts. Verified RED by
+  neutralizing the fix (swallow → return nil): the two failure-path tests fail,
+  the success/idempotence tests still pass; GREEN restored.
+- **File(s)**: pkg/routing/reth.go, pkg/daemon/daemon_apply.go,
+  pkg/routing/README.md, pkg/routing/reth_clear_failclosed_5704_test.go
+
 ## 2026-07-12 — #5712 (bug): in-process CLI commit must preserve the configured syslog transport
 - **Timestamp**: 2026-07-12 (fix/5712-syslog-transport-preserve)
 - **Action**: codex-review-182 M39. The CLI-side reloadSyslog (pkg/cli/apply.go)
