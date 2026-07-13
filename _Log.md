@@ -1,3 +1,30 @@
+## 2026-07-12 — #5645 (security/bug): composite/static-alias feed readiness must fail closed
+- **Timestamp**: 2026-07-12 (fix/5645-feed-empty-publish)
+- **Action**: codex-review-182 M38 residual (issue reopened after #5665). #5665
+  closed the all-unready first-fetch fail-open by OMITTING a binding whose feeds
+  ALL lacked a snapshot. Two residual partial-deny fail-opens remained: (1) a
+  COMPOSITE binding unioning a ready + an unready feed published only the ready
+  subset (unready feed's deny prefixes silently unmatched); (2) when the binding
+  name ALSO exists as a STATIC address-book entry, overlay omission was not
+  enough — buildAddressBookTableWithFeeds still built the static name/ID, so a
+  `deny <name>` enforced only the static subset. Fix Part 1
+  (pkg/feeds/feeds.go SnapshotForBindings): require ALL feed constituents ready;
+  if ANY is unready (unknown feed, no first fetch, or hold-expired drop) omit the
+  whole binding instead of publishing the partial/empty union. Fix Part 2
+  (pkg/dataplane/userspace/policies_lower.go addrRepresentable): a DECLARED
+  dynamic-address binding ABSENT from the resolved overlay is unresolved →
+  unrepresentable (returns false BEFORE the static nameToID branch), so the
+  __unsupported_address__ sentinel fires and the Rust preflight rejects the whole
+  snapshot (previous-good retained / fresh-boot default-deny) even when a static
+  alias exists. Scope: security POLICY path only (the deny fail-open the issue
+  names); NAT still falls back to the static subset (documented out-of-scope).
+  RED-on-revert proven for both mechanisms; resolved/all-ready companions stay
+  green. Docs: pkg/feeds/README.md first-fetch section updated with the
+  all-constituent readiness + static-alias taint contract.
+- **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_firstfetch_failopen_5645_test.go,
+  pkg/dataplane/userspace/policies_lower.go,
+  pkg/dataplane/userspace/feed_static_alias_failclosed_5645_test.go,
+  pkg/feeds/README.md, _Log.md
 ## 2026-07-12 — #5704 (bug): RETH deletion failures must fail the reconcile closed
 - **Timestamp**: 2026-07-12 (fix/5704-reth-delete-failclosed)
 - **Action**: codex-review-182 M30. rethManager.Clear (pkg/routing/reth.go)
@@ -47270,3 +47297,5 @@ top.
   **File(s)**: pkg/cli/cli_request.go (Edit), pkg/cli/cli_request_security.go
   (Edit), pkg/cli/request_scope_5647_test.go (Write), docs/phases.md (Edit),
   _Log.md (Edit)
+  - **Action**: #5671 — add `&& as != nil` guard to memberIsNestedSet (mirror lookupApplicationSet #5179); a tolerant-loaded present-but-nil app-set slot no longer misclassifies a shadowing leaf application as a nested set (false "not found"). Added fail-on-revert test (RED proven with guard neutralized).
+  - **File(s)**: pkg/config/predefined.go, pkg/config/predefined_membernestedset_nilguard_5671_test.go

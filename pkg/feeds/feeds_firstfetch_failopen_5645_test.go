@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -118,6 +119,85 @@ func TestPermitFeedNoMembersOmittedNotFailOpen(t *testing.T) {
 	if _, published := overlay["allowlist"]; published {
 		t.Fatalf("a permit feed with no members must stay unresolved (omitted), never "+
 			"resolve to a match-any/empty entry; overlay=%v", overlay)
+	}
+}
+
+// TestCompositeBindingPartialReadinessOmitted is the codex-182 residual
+// fail-on-revert for the COMPOSITE case. A binding that unions a READY feed with
+// an UNREADY constituent must be OMITTED entirely — publishing the ready subset
+// enforces only a PARTIAL deny set and silently drops the unready feed's
+// prefixes (fail-OPEN). Covers the report's ready+unready, ready+unknown, and
+// ready+hold-expired acceptance cases. Reverting SnapshotForBindings to require
+// only that SOME feed is ready (the old len(merged) != 0 gate) publishes
+// "denylist" with just feed-ready's prefixes, turning each assertion RED.
+func TestCompositeBindingPartialReadinessOmitted(t *testing.T) {
+	cases := []struct {
+		name string
+		prep func(m *Manager)
+	}{
+		{
+			name: "ready+unready-no-first-fetch",
+			prep: func(m *Manager) {
+				m.installPrefixes("feed-ready", []string{"198.51.100.0/24"})
+				// Registered but never fetched: no installed snapshot.
+				m.newFeed("feed-unready", "http://example.test/unready", retainForever)
+			},
+		},
+		{
+			name: "ready+unknown",
+			prep: func(m *Manager) {
+				m.installPrefixes("feed-ready", []string{"198.51.100.0/24"})
+				// "feed-unready" is never registered at all (typo'd / not started).
+			},
+		},
+		{
+			name: "ready+hold-expired-drop",
+			prep: func(m *Manager) {
+				m.installPrefixes("feed-ready", []string{"198.51.100.0/24"})
+				// A feed that HAD a snapshot but was dropped to empty by a
+				// hold-interval expiry (#2050): registered, prefixes cleared.
+				m.installPrefixes("feed-unready", []string{"203.0.113.0/24"})
+				m.mu.Lock()
+				m.feeds["feed-unready"].prefixes = nil
+				m.feeds["feed-unready"].hasSnapshot = false
+				m.mu.Unlock()
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New(nil)
+			tc.prep(m)
+			overlay := m.SnapshotForBindings(bindingCfg(map[string][]string{
+				"denylist": {"feed-ready", "feed-unready"},
+			}))
+			if got, published := overlay["denylist"]; published {
+				t.Fatalf("fail-open: a composite DENY binding with an unready "+
+					"constituent was published as a PARTIAL set %v; it must be omitted "+
+					"(unresolved -> fail closed) until ALL feeds are ready", got)
+			}
+		})
+	}
+}
+
+// TestCompositeBindingAllReadyPublished is the non-tautological companion: once
+// EVERY constituent is ready, the composite binding IS published with the full
+// deduped union. Proves the omission is scoped to partial readiness and does not
+// suppress a fully-resolved composite feed.
+func TestCompositeBindingAllReadyPublished(t *testing.T) {
+	m := New(nil)
+	m.installPrefixes("feed-a", []string{"198.51.100.0/24"})
+	m.installPrefixes("feed-b", []string{"203.0.113.0/24"})
+	overlay := m.SnapshotForBindings(bindingCfg(map[string][]string{
+		"denylist": {"feed-a", "feed-b"},
+	}))
+	got, published := overlay["denylist"]
+	if !published {
+		t.Fatalf("a fully-ready composite binding must be published; overlay=%v", overlay)
+	}
+	want := []string{"198.51.100.0/24", "203.0.113.0/24"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("composite union = %v, want %v", got, want)
 	}
 }
 
