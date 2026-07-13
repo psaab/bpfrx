@@ -968,6 +968,20 @@ type compileOpts struct {
 	// leniently-loaded config renders nothing for it rather than poisoning the
 	// reload. Same doctrine as lenientNextTableRefs.
 	lenientPolicyRouteMapSeq bool
+	// lenientRouteDispositionConflict (#5633) downgrades the static-route
+	// disposition-conflict gate (validateStaticRouteDispositionConflictStrict)
+	// from a hard compile error to a cfg.Warnings entry. Repeated same-prefix
+	// static-route `set` lines merge into a single StaticRoute
+	// (compileStaticRoutes) with appended next-hops and sticky terminal /
+	// next-table fields, so declaring one prefix as `discard` (or `next-table X`)
+	// AND with a `next-hop` compiled into one route holding both a blackhole /
+	// leak and a forwarding next-hop. The strict commit / commit-check path
+	// hard-rejects so the contradiction is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config still
+	// BOOTS (#1960) — the dataplane resolves the deterministic disposition
+	// precedence (discard > next-table > next-hop). Same doctrine as
+	// lenientNextTableRefs.
+	lenientRouteDispositionConflict bool
 	// lenientDHCPStaticBindings (#2243 review) downgrades the DHCP-server
 	// static (fixed/reserved) host-binding gate (validateDHCPStaticBindingsStrict)
 	// from a hard compile error to a cfg.Warnings entry. The strict commit /
@@ -1897,6 +1911,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
 		lenientPolicyRouteMapSeq:               true,
+		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,
@@ -2247,6 +2262,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
 		lenientPolicyRouteMapSeq:               true,
+		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientPolicyZoneRefs:                  true,

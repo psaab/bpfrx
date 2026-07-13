@@ -1,3 +1,28 @@
+## 2026-07-12 — #5633 (bug/config/routing): reject contradictory duplicate-route dispositions at commit
+- **Timestamp**: 2026-07-12 (fix/5633-dup-route-contradiction)
+- **Action**: codex-review-181 M25 / A3-b02-F03. The static-route merge in
+  `compileStaticRoutes` folds repeated same-destination `set` lines into one
+  StaticRoute (appended next-hops, sticky discard/reject/next-table), so
+  declaring a prefix once as `discard` (or `next-table X`) and once with a
+  `next-hop` compiled into ONE route holding both a blackhole/leak AND a
+  forwarding next-hop — accepted by the strict gate, then silently resolved by
+  the Rust forwarder (discard > next-table > next-hop) so the later next-hop is
+  ignored (a blackhole / cross-VRF leak the operator did not author). Added a
+  commit-time gate `validateStaticRouteDispositionConflictStrict` that rejects a
+  compiled route carrying ≥2 of {next-hop, next-table, discard, reject};
+  legitimate ECMP / qualified-next-hop (multiple next-hops = one disposition)
+  still compiles. Walks global inet.0/inet6.0 + every routing-instance's route
+  sets. Wired into runUniformGates after the #5693 next-table gate; downgraded
+  to a warning on the tolerant load/peer-sync path via new opts flag
+  `lenientRouteDispositionConflict` (#1960 no-brick). Fail-on-revert test
+  (RED proven with the gate neutralized; GREEN restored) covers both AST shapes,
+  both orderings, inet6, per-instance, the legit-multipath accepts, and the
+  lenient downgrade.
+- **File(s)**: pkg/config/compiler_validate_strict_routing.go (Edit),
+  pkg/config/compiler.go (Edit), pkg/config/compiler_uniformgates.go (Edit),
+  pkg/config/compiler_static_route_disposition_conflict_5633_test.go (Write),
+  _Log.md (Edit)
+
 ## 2026-07-12 — #5645 (security/bug): composite/static-alias feed readiness must fail closed
 - **Timestamp**: 2026-07-12 (fix/5645-feed-empty-publish)
 - **Action**: codex-review-182 M38 residual (issue reopened after #5665). #5665

@@ -792,6 +792,111 @@ func validateNextTableTargetReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// staticRouteDispositionConflict names the mutually-exclusive dispositions a
+// single compiled StaticRoute carries. A well-formed static route has exactly
+// ONE of: forwarding next-hop(s), a next-table VRF leak, discard, or reject.
+// Multiple next-hops for one destination are legitimate ECMP / qualified-
+// next-hop (all the single "next-hop" disposition) and are NOT a conflict. The
+// helper returns "" when at most one disposition is present, otherwise a
+// human-readable `a + b`-style list of the ≥2 distinct dispositions found.
+func staticRouteDispositionConflict(sr *StaticRoute) string {
+	if sr == nil {
+		return ""
+	}
+	var found []string
+	if len(sr.NextHops) > 0 {
+		found = append(found, "next-hop")
+	}
+	if sr.NextTable != "" {
+		found = append(found, "next-table")
+	}
+	if sr.Discard {
+		found = append(found, "discard")
+	}
+	if sr.Reject {
+		found = append(found, "reject")
+	}
+	if len(found) < 2 {
+		return ""
+	}
+	return strings.Join(found, " + ")
+}
+
+// validateStaticRouteDispositionConflictStrict hard-rejects a static route that
+// carries MORE THAN ONE mutually-exclusive disposition for a single destination
+// prefix — e.g. `discard` together with a reachable `next-hop`, a `next-table`
+// VRF leak together with a `next-hop`, or `discard` together with `reject`.
+//
+// The compiler merges repeated same-destination static-route blocks (flat "set"
+// syntax emits one block per line) into a single StaticRoute
+// (compileStaticRoutes): next-hops are APPENDED and the terminal / next-table
+// fields are STICKY (discard/reject latch true, next-table/preference are
+// last-writer-wins). A config that declares the SAME prefix once as `discard`
+// (or `next-table X`) and once with a `next-hop` therefore compiled into ONE
+// route holding BOTH a blackhole/leak AND a forwarding next-hop — a
+// contradiction that passed the strict gate. The live snapshot copies every
+// field (pkg/dataplane/userspace/routes.go) and the Rust forwarder resolves
+// discard before next-table before next-hops
+// (userspace-dp/src/afxdp/forwarding/mod.rs), so the stale terminal / leak wins
+// and a later next-hop meant to RESTORE ordinary forwarding is silently ignored
+// — a blackhole or a cross-VRF leak the operator did not author (#5633).
+//
+// Junos permits exactly one action per static route. Rejecting the mix at commit
+// keeps the compiled route unambiguous and the operator informed rather than
+// letting the dataplane pick a precedence the config never expressed. Multiple
+// next-hops for one destination stay legitimate ECMP and do NOT trip this gate.
+//
+// Strict on commit / commit-check (hard reject so the contradiction is
+// operator-visible); the call site downgrades this to a warning on the tolerant
+// load / peer-sync path (opts.lenientRouteDispositionConflict, #1960) so an
+// already-persisted or peer-synced config still BOOTS — the dataplane then
+// resolves the deterministic disposition precedence. Global inet.0/inet6.0 are
+// walked first, then each routing-instance's routes in RoutingInstances order,
+// so the first-reported error is deterministic. Mirrors
+// validateNextTableTargetReferencesStrict.
+func validateStaticRouteDispositionConflictStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(scope string, routes []*StaticRoute) error {
+		for _, sr := range routes {
+			conflict := staticRouteDispositionConflict(sr)
+			if conflict == "" {
+				continue
+			}
+			return fmt.Errorf(
+				"%s %q defines contradictory dispositions (%s) for one "+
+					"destination prefix; a static route may carry only ONE of "+
+					"next-hop, next-table, discard, or reject (repeated "+
+					"same-prefix `set` lines merge into a single route). Split "+
+					"the destinations or keep one disposition — otherwise the "+
+					"dataplane silently resolves the terminal/leak action and "+
+					"ignores the forwarding next-hop",
+				scope, sr.Destination, conflict)
+		}
+		return nil
+	}
+	if err := check("routing-options static route", cfg.RoutingOptions.StaticRoutes); err != nil {
+		return err
+	}
+	if err := check("routing-options static route", cfg.RoutingOptions.Inet6StaticRoutes); err != nil {
+		return err
+	}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instances %s static route", ri.Name)
+		if err := check(scope, ri.StaticRoutes); err != nil {
+			return err
+		}
+		if err := check(scope, ri.Inet6StaticRoutes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validateRouteFilterMatchTypesStrict gates the two route-filter match-types
 // that the FRR prefix-list backend cannot render losslessly (#2525):
 //
