@@ -175,6 +175,28 @@ absence by `generateSelfSignedCertAt` on the next boot). A wipe that cannot
 fully erase this state returns an error rather than reporting a clean factory
 reset.
 
+**Config-root scope guard (#5684).** The wipe target is the daemon's configured
+config root — `filepath.Dir(store.ConfigPath())`, the directory of the `-config`
+path (#5280/#5554), so a non-default `-config /srv/xpf/site.conf` erases
+`/srv/xpf`, not a hardcoded `/etc/xpf`. But `filepath.Dir` on a
+custom/adversarial `-config` can resolve to a directory xpf does not own: a
+config file placed directly in a shared directory (`-config /etc/xpf.conf` →
+`/etc`; `-config /srv/site.conf` → `/srv`) or a directory-shaped `-config`
+(`-config /srv/firewall`, where `filepath.Dir` climbs to the **parent** `/srv`).
+Because the config-state sweep globs `*.conf` / `rollback*` and `RemoveAll`s
+`<root>/.configdb` and `<root>/tls`, an unowned root would turn a factory reset
+into a **broad deletion of sibling files** in that shared/parent directory.
+`configstore.ValidateFactoryResetRoot` closes this: it refuses a config root
+that is non-absolute (a relative/empty `-config` resolves to the daemon's
+working directory) or equal to the filesystem root or a well-known shared/system
+directory (`FactoryResetForbiddenRoots`: `/`, `/etc`, `/srv`, `/home`, `/var`,
+`/usr`, …). The check is lexical on `filepath.Clean` (so a trailing slash and
+`..` traversal normalize first). The default `/etc/xpf` and any dedicated
+subdirectory pass. The guard runs at both resolution points
+(`(*Server).zeroizeConfigRoot`, `(*CLI).zeroizeConfigRoot`) — so a bad root
+fails **closed before any wipe leg runs**, erasing nothing — and again inside the
+shared `FactoryResetConfigDir` primitive as defense-in-depth.
+
 **Rendered service-config erasure (#4585).** The wipe erases that
 SSOT/rollback/journal state directly, but the prior tenant's secrets are ALSO
 rendered into service configs xpfd writes **outside** `/etc/xpf`. `zeroize` now

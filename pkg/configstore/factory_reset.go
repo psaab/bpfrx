@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -91,6 +92,66 @@ func FactoryResetArchiveDir(archiveDir string) error {
 	return firstErr
 }
 
+// FactoryResetForbiddenRoots are directories a factory-reset config-state wipe
+// must NEVER treat as an xpf-owned config root (#5684). FactoryResetConfigDir
+// scans configDir for *.conf / rollback* / journal / numbered-text-rollback /
+// fsatomic-temp artifacts and RemoveAll's <configDir>/.configdb — every removal
+// is bounded to configDir, but configDir itself is derived from
+// filepath.Dir(store.ConfigPath()). A daemon started with a custom `-config`
+// placed DIRECTLY in a shared directory (`-config /etc/xpf.conf` → configDir
+// "/etc"; `-config /srv/site.conf` → "/srv") or pointed at a directory-shaped
+// path (`-config /srv/firewall`, where filepath.Dir climbs to the PARENT
+// "/srv") turns a factory reset into a broad deletion of files xpf does not own
+// — the destructive-scope defect #5684 closes. ValidateFactoryResetRoot rejects
+// these so the reset fails CLOSED (erases NOTHING, reports incomplete) instead
+// of wiping the wrong tree. The default appliance root /etc/xpf and any
+// dedicated subdirectory (/srv/xpf, /opt/xpf/data) are deliberately NOT on the
+// list and pass. It is a var so a test can register a throwaway tree as a shared
+// root (mirroring the DefaultArchiveDir seam); production code must never mutate
+// it.
+var FactoryResetForbiddenRoots = []string{
+	"/",
+	"/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64",
+	"/libx32", "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin",
+	"/srv", "/sys", "/tmp", "/usr", "/usr/local", "/var", "/var/lib",
+	"/var/tmp",
+}
+
+// ValidateFactoryResetRoot reports whether configDir is a plausible xpf-owned
+// config root that a factory reset may erase, returning a descriptive error if
+// it is not (#5684). configDir is filepath.Dir(store.ConfigPath()), so a
+// custom/adversarial `-config` can resolve it to a directory xpf does not own;
+// this is the guard that keeps `zeroize` from broad-deleting an enclosing
+// directory. It rejects:
+//
+//   - a NON-ABSOLUTE path — an empty or relative `-config` resolves
+//     filepath.Dir to "." (the daemon's working directory), never a config root;
+//   - the filesystem root and the well-known shared/system directories in
+//     FactoryResetForbiddenRoots — a `-config` placed directly in a shared
+//     directory (or a directory-shaped `-config`, where filepath.Dir climbs to
+//     the PARENT) would otherwise wipe *.conf / .configdb / tls siblings xpf
+//     does not own.
+//
+// The comparison is lexical on filepath.Clean(configDir), so a trailing slash
+// and `..` traversal (`/etc/xpf/..` → /etc) are normalized before the check.
+// Callers surface the error so the reset erases NOTHING and reports incomplete
+// rather than deleting the wrong tree. The default appliance root /etc/xpf and
+// any dedicated subdirectory pass. This is a purely lexical guard (it does not
+// resolve symlinks); a defense against config-path misconfiguration, not against
+// an operator who symlinks the config root at a shared directory.
+func ValidateFactoryResetRoot(configDir string) error {
+	clean := filepath.Clean(configDir)
+	if !filepath.IsAbs(clean) {
+		return fmt.Errorf("zeroize: refusing to factory-reset non-absolute config root %q: a relative or empty -config path resolves to the daemon working directory, not an xpf config directory", configDir)
+	}
+	for _, forbidden := range FactoryResetForbiddenRoots {
+		if clean == forbidden {
+			return fmt.Errorf("zeroize: refusing to factory-reset shared/system directory %q as a config root: the -config path must live in a directory xpf owns (e.g. /etc/xpf), not directly in a shared directory whose siblings are not xpf's to erase", clean)
+		}
+	}
+	return nil
+}
+
 // FactoryResetConfigDir securely erases the on-disk configuration STATE under
 // configDir as part of a factory reset (#4858). It is the single shared
 // primitive behind `request system zeroize` so the on-box CLI and any RPC
@@ -152,6 +213,15 @@ func FactoryResetArchiveDir(archiveDir string) error {
 // generation of config secrets — is erased by the sibling FactoryResetArchiveDir
 // (#5186), which both the CLI and the gRPC wipe also call.
 func FactoryResetConfigDir(configDir, configBase string) error {
+	// #5684: refuse to wipe a shared/parent/system directory. configDir is
+	// filepath.Dir(store.ConfigPath()); a custom -config placed in (or resolving
+	// to) a shared directory would turn this into a broad deletion of *.conf /
+	// .configdb / tls siblings xpf does not own. Fail CLOSED — surface the error
+	// and remove NOTHING — rather than erase the wrong tree.
+	if err := ValidateFactoryResetRoot(configDir); err != nil {
+		return err
+	}
+
 	var firstErr error
 	fail := func(err error) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
