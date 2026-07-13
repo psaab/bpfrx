@@ -47512,3 +47512,28 @@ top.
   proven: neutralizing the collision branch (`if false && ...`) →
   TestPolicyRouteFilterPrefixListSameFamilyNoCollision RED (two colliding
   `match ipv6 address prefix-list` lines); restored GREEN.
+
+- **Timestamp**: 2026-07-12
+  **Action**: #5696 (M19, a #5642 residual) — fail the commit closed on a
+  route-leak snapshot republish / FIB-invalidation failure instead of logging
+  and forgetting it. `reconcileRouteLeakSnapshot` (the commit-tail routes-only
+  republish that clears a deleted-VRF inter-VRF leak after `applyRoutingRules`,
+  #5642) was VOID and swallowed BOTH failure legs at WARN — a transient
+  `PublishRouteOverlaySnapshot` OR `BumpFIBGeneration` failure only logged and
+  returned, so the commit reported SUCCESS while the userspace FIB kept the
+  exact stale leak #5642 removed. Unlike the ip-monitoring actuator (#3757
+  dirty-retry engine) this commit-tail path has no owner to rediscover a
+  swallowed failure. It now RETURNS an error; `applyConfigLocked` captures it
+  (`routeLeakErr`) and threads it into `applyTailReconciles`' tail
+  `errors.Join(..., ifaceErr, routeLeakErr)` (the #5679/#5310 fail-closed-but-
+  complete pattern). Benign no-ops (helperless, duplicate-skip) return nil and
+  keep the commit successful. Updated the two existing `applyTailReconciles`
+  test call sites for the new param.
+  **File(s)**: pkg/daemon/daemon_apply.go, pkg/daemon/README.md,
+  pkg/daemon/route_leak_snapshot_failclosed_5696_test.go,
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go
+  GREEN: `go test ./pkg/daemon/...` passes; gofmt + build clean. Fail-on-revert
+  proven: neutralizing both failure legs (`return nil`) →
+  TestRouteLeakReconcileFailsCommitOnPublishError and ...OnBumpError RED
+  (returns nil on injected failure); restored GREEN.

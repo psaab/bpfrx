@@ -522,6 +522,27 @@ never lock an operator out of a remote box it manages.
   `apply_failure_failclosed_5679_test.go` (ordinary-apply-fails-commit +
   wraps-injected + does-not-skip-peer-sync fail-on-revert, plus the abort-class
   still-early-returns + still-skips-peer-sync guard against over-reach).
+  **Route-leak snapshot reconcile fail-closed (#5696, a #5642 residual):**
+  `reconcileRouteLeakSnapshot` republishes the routes-only userspace snapshot after
+  `applyRoutingRules` reconciles the kernel ip-rule table on a rib-group / next-table
+  transition, so the userspace FIB does not keep a deleted-VRF inter-VRF leak that
+  the earlier full apply published from the PRE-reconcile rules (#5642). But it was
+  VOID and swallowed BOTH its failure legs at WARN — a transient
+  `PublishRouteOverlaySnapshot` failure OR a `BumpFIBGeneration` failure only logged
+  and returned, so the commit reported SUCCESS while the userspace FIB retained the
+  exact stale leak #5642 removed. Unlike the ip-monitoring actuator (`daemon_ipmon.go`,
+  #3757 dirty-retry), this commit-tail reconcile has NO retry engine to rediscover a
+  swallowed failure — it is logged-and-forgotten. It now RETURNS an `error`;
+  `applyConfigLocked` captures it (`routeLeakErr`) and threads it into the tail
+  `errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr,
+  ifaceErr, routeLeakErr)`, so a genuine republish/FIB-bump failure fails the commit
+  closed (the OLD pre-reconcile snapshot stays live; a re-commit re-runs the
+  reconcile). Benign no-ops — helperless dataplane, or a duplicate-skip because the
+  route set did not move — return `nil` and keep the commit successful (no FIB-bump
+  churn). Tests: `route_leak_snapshot_failclosed_5696_test.go`
+  (publish-fails-commit + bump-fails-commit fail-on-revert, duplicate-skip /
+  helperless / clean-success stay-success, and the `applyTailReconciles` commit-join
+  wiring proof).
   **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
