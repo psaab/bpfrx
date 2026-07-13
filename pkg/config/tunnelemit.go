@@ -35,6 +35,12 @@ type TunnelEndpointName struct {
 //   - it applies the same interface-level-WireGuard single-lowest-unit
 //     pick (#1910): one persistent TUN per interface-level WG tunnel, keyed
 //     by the lowest configured unit ref;
+//   - for a non-WireGuard interface that carries BOTH an interface-level
+//     tunnel and per-unit tunnel stanzas, it emits each unit's OWN
+//     TunnelConfig — key, source/destination endpoint, TTL, and
+//     routing-instance — instead of the interface-level object, so per-unit
+//     GRE/IPIP overrides survive the emit (#5635); a unit with no tunnel
+//     stanza inherits the interface-level tunnel unchanged;
 //   - it formats every ref as the canonical "%s.%d" the builder formats
 //     from the int-keyed Units map (leading-zero / overflow / last-wins
 //     unit canonicalization is already resolved by compileInterfaces when
@@ -99,7 +105,23 @@ func EmitTunnelEndpointNames(cfg *Config) []TunnelEndpointName {
 				continue
 			}
 			for _, unitNum := range unitNums {
-				add(fmt.Sprintf("%s.%d", name, unitNum), iface.Tunnel)
+				// #5635: a unit that carries its OWN tunnel stanza holds
+				// the per-unit GRE/IPIP overrides — key, source/destination
+				// endpoint, TTL, and routing-instance — that the compiler
+				// cloned from the interface-level tunnel and then applied on
+				// top of (compiler_interfaces.go: cloneForUnit + the
+				// unit-level tunnel parse). Emit that per-unit TunnelConfig,
+				// NOT the interface-level object, so the dataplane snapshot
+				// builder (buildTunnelEndpointSnapshots) and the commit-time
+				// collision gate see the unit's real endpoint instead of the
+				// interface-level defaults. A unit with no tunnel stanza
+				// (unit.Tunnel == nil) still inherits the interface-level
+				// tunnel unchanged.
+				tunnel := iface.Tunnel
+				if unit := iface.Units[unitNum]; unit != nil && unit.Tunnel != nil {
+					tunnel = unit.Tunnel
+				}
+				add(fmt.Sprintf("%s.%d", name, unitNum), tunnel)
 			}
 			continue
 		}
