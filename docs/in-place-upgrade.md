@@ -419,9 +419,21 @@ state machines are untouched.
    re-polled until the deadline (NOT a hard abort on the first dial
    error). Only the deadline aborts, surfacing the last observed error;
    the node is then left secondary for the operator to inspect.
-7. `ResetFailover()` to rejoin election; forward-verify is the natural
-   post-promotion check (`make test-failover`) — a passive node
-   structurally cannot forward, so it is never "verified while passive".
+7. `ResetFailover()` to rejoin election, then a **per-RG rejoin confirm**
+   before the driver advances to the peer. `ResetFailover` enumerates the
+   configured RGs FAIL-CLOSED (no `{0,1,2}` guess — #5044) and resets each,
+   but a reset that returned nil is not proof the RG actually left the drain.
+   So `RejoinAndConfirm` additionally gates on `LocalRejoinComplete()`: every
+   configured RG (enumerated from `show chassis cluster status`) must show a
+   non-zero `Weight` in `show chassis cluster information` — `ForceSecondary`
+   zeroes every RG's weight, so a configured RG still at weight 0 (or absent
+   from the local view) reads as STILL DRAINED and the rejoin does not confirm
+   (#5138). Without this, `PeerAlive` + `SyncEstablished` (both GLOBAL) would
+   green-light the rejoin while some RG — e.g. RG≥3 the old guess dropped —
+   stayed demoted, and the driver would drain the peer that still owned it,
+   opening a no-primary window for that group. forward-verify is the natural
+   post-promotion check (`make test-failover`) — a passive node structurally
+   cannot forward, so it is never "verified while passive".
 
 ### `--unit` and the cluster control endpoint (#1983)
 

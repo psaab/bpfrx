@@ -117,8 +117,16 @@ func RejoinAndConfirm(cl RollingCluster, deadline time.Duration) error {
 	if err := cl.ResetFailover(); err != nil {
 		return fmt.Errorf("reset failover: %w", err)
 	}
-	// Confirm the peer is still a healthy member and sync is re-established —
+	// Confirm the peer is still a healthy member, sync is re-established, AND
+	// this node has actually resumed eligibility for EVERY configured RG —
 	// i.e. the cluster is whole again — before declaring the rejoin done.
+	// PeerAlive + SyncEstablished are GLOBAL predicates: they hold even if some
+	// configured RG (e.g. RG>=3 the pre-#5044 {0,1,2} guess dropped) is still
+	// held in the ForceSecondary drain. Without the per-RG gate the orchestrator
+	// would confirm rejoin and advance to drain the PEER while that RG has no
+	// primary on either node — a per-RG blackhole (#5138). LocalRejoinComplete
+	// fails closed on an enumeration error or a still-demoted RG, so the roll
+	// stops here instead.
 	dl := time.Now().Add(deadline)
 	// Retain the last non-nil transport/gRPC error from each predicate so a
 	// deadline miss reports WHY the rejoin never confirmed, not just the
@@ -127,11 +135,12 @@ func RejoinAndConfirm(cl RollingCluster, deadline time.Duration) error {
 	// through syslog to learn it was e.g. a refused gRPC dial while xpfd was
 	// still restarting. Mirrors DrainAndConfirm's timeout, which already wraps
 	// the last DrainComplete error.
-	var lastAErr, lastSErr error
+	var lastAErr, lastSErr, lastRErr error
 	for {
 		alive, aerr := cl.PeerAlive()
 		synced, serr := cl.SyncEstablished()
-		if aerr == nil && serr == nil && alive && synced {
+		rejoined, rerr := cl.LocalRejoinComplete()
+		if aerr == nil && serr == nil && rerr == nil && alive && synced && rejoined {
 			return nil
 		}
 		if aerr != nil {
@@ -140,15 +149,21 @@ func RejoinAndConfirm(cl RollingCluster, deadline time.Duration) error {
 		if serr != nil {
 			lastSErr = serr
 		}
+		if rerr != nil {
+			lastRErr = rerr
+		}
 		if time.Now().After(dl) {
 			base := fmt.Errorf("rejoin not confirmed within %s "+
-				"(peer-alive=%v sync-established=%v)", deadline, alive, synced)
+				"(peer-alive=%v sync-established=%v local-rejoined=%v)", deadline, alive, synced, rejoined)
 			var details []string
 			if lastAErr != nil {
 				details = append(details, fmt.Sprintf("last peer-alive error: %v", lastAErr))
 			}
 			if lastSErr != nil {
 				details = append(details, fmt.Sprintf("last sync-established error: %v", lastSErr))
+			}
+			if lastRErr != nil {
+				details = append(details, fmt.Sprintf("last local-rejoin error: %v", lastRErr))
 			}
 			if len(details) > 0 {
 				return fmt.Errorf("%w; %s", base, strings.Join(details, "; "))
