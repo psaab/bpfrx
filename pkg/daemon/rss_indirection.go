@@ -130,9 +130,14 @@ func (realRSSExecutor) listInterfaces() []string {
 //     also repeated inside applyRSSIndirectionOne as defense in depth.
 //   - enabled == false is a hard kill switch: restore the default
 //     indirection table on every allowlisted mlx5 interface.
-//   - workers == 1 is skipped (single worker benefits from default RSS
-//     spreading across all HW queues / IRQ lines; weight-pinning to a
-//     single queue would serialize the worker on one IRQ — reviewer #L1).
+//   - workers == 1: no weight vector is applied (single worker benefits
+//     from default RSS spreading across all HW queues / IRQ lines;
+//     weight-pinning to a single queue would serialize the worker on one
+//     IRQ — reviewer #L1). BUT the allowlist is still walked so the live
+//     table is probed and reset to default if it carries a stale
+//     concentrated layout left over from a prior workers < queue_count
+//     apply — a day-2 workers→1 reduction must not leave RX hashed onto
+//     the old subset of queues (#5124).
 //   - workers >= queue_count: weight reshaping is skipped (default
 //     table already delivers to every queue), BUT the live table is
 //     probed and reset to default if it carries a stale concentrated
@@ -162,8 +167,16 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 		return
 	}
 	if workers == 1 {
-		slog.Info("linksetup: rss indirection skipped (single worker — keep default RSS)")
-		return
+		// Single worker keeps default RSS: no weight vector is applied
+		// (pinning to queue 0 would serialize the worker on one IRQ).
+		// We do NOT return here — the allowlist loop below still runs so
+		// a stale concentrated table left by a prior workers<queues apply
+		// is probed and restored to the NIC default on a workers→1
+		// reduction (#5124). computeWeightVector(1, queues) returns nil,
+		// so applyRSSIndirectionOne issues at most one `ethtool -x` probe
+		// plus, only when the live table is concentrated, one
+		// `ethtool -X default` restore. A fresh default table is a no-op.
+		slog.Debug("linksetup: rss single worker — keep default RSS, probe for stale concentrated table")
 	}
 	if len(allowed) == 0 {
 		// No userspace-dp bindings derived from config — nothing to
@@ -245,20 +258,26 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 	if weights == nil {
 		slog.Info("linksetup: rss weight reshaping skipped", "iface", iface,
 			"workers", workers, "queues", queues, "reason", reason)
-		// #805: When workers >= queues > 1 we previously left the
-		// indirection table alone. That's correct on a fresh install
-		// (kernel default is round-robin = what we want) but wrong on
-		// the workers<queues → workers>=queues transition, where a
-		// concentrated `[1,...,1,0,...,0]` table written by an earlier
+		// #805/#5124: When no weight vector is applied — either
+		// workers >= queues (#805) OR workers == 1 (#5124) — we
+		// previously left the indirection table alone. That's correct on
+		// a fresh install (kernel default is round-robin = what we want)
+		// but wrong on any transition DOWN from a concentrated table: a
+		// `[1,...,1,0,...,0]` table written by an earlier
 		// applyRSSIndirectionOne for the prior worker count stays live
-		// and starves queues that now host worker-bound AF_XDP sockets.
-		// Inspect the live table; if it isn't the round-robin default,
-		// restore it.
+		// and starves queues that no worker consumes (workers→1: RX stays
+		// hashed onto the old subset even though single-worker policy is
+		// default RSS across all queues; workers>=queues: queues that now
+		// host worker-bound AF_XDP sockets get no traffic). Inspect the
+		// live table; if it isn't the round-robin default, restore it.
 		//
-		// Guard requires queues > 1: with a single-queue NIC there is
-		// no possible concentration to undo (the default and any
-		// "configured" layout both have entry[i] == 0 for every i).
-		if workers > 1 && workers >= queues && queues > 1 {
+		// Guard: queues > 1 (a single-queue NIC has no possible
+		// concentration to undo — default and any "configured" layout
+		// both have entry[i] == 0 for every i), and workers >= 1 (a real
+		// worker configuration where default RSS is the desired state;
+		// workers <= 0 is a non-userspace deploy filtered by the caller,
+		// and restoring its table would be out of scope).
+		if workers >= 1 && queues > 1 {
 			maybeRestoreDefault(iface, queues, execer)
 		}
 		return

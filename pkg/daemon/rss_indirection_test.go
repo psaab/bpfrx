@@ -305,16 +305,70 @@ func TestApplyRSSIndirectionOne_EthtoolMissing_SkipsGracefully(t *testing.T) {
 	}
 }
 
-// Workers == 1 skips at the top level (no sysfs scan, no ethtool).
-func TestApplyRSSIndirection_SingleWorker_Skips(t *testing.T) {
+// #5124 fail-on-revert: workers→1 must NOT early-return at the top level.
+// A prior workers<queues apply left a concentrated table; the single-worker
+// reconcile must walk the allowlist, probe the live table, and restore the
+// NIC default so RX is no longer hashed onto the old subset of queues. With
+// the pre-#5124 `workers == 1 { return }` early return (or a guard that
+// requires workers > 1), no ethtool call fires and this test goes RED.
+func TestApplyRSSIndirection_SingleWorker_StaleTable_RestoresDefault(t *testing.T) {
+	f := &fakeRSSExecutor{
+		ifaces:   []string{"eth0"},
+		drivers:  map[string]string{"eth0": "mlx5_core"},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirection(true, 1, f.ifaces, f)
+
+	if len(f.calls) != 2 {
+		t.Fatalf("workers→1 with stale table: want 2 calls (probe + restore), got %d: %v",
+			len(f.calls), f.calls)
+	}
+	if !reflect.DeepEqual(f.calls[0], []string{"-x", "eth0"}) {
+		t.Errorf("call 0: want `ethtool -x eth0` probe, got %v", f.calls[0])
+	}
+	if !reflect.DeepEqual(f.calls[1], []string{"-X", "eth0", "default"}) {
+		t.Errorf("call 1: want `ethtool -X eth0 default` restore, got %v", f.calls[1])
+	}
+}
+
+// #5124: workers→1 on a NIC whose live table is ALREADY the round-robin
+// default must issue only the probe and NO restore write (idempotent — a
+// fresh single-worker boot must not churn the NIC mid-traffic).
+func TestApplyRSSIndirection_SingleWorker_DefaultTable_ProbeOnly(t *testing.T) {
+	f := &fakeRSSExecutor{
+		ifaces:   []string{"eth0"},
+		drivers:  map[string]string{"eth0": "mlx5_core"},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(defaultTable6q)},
+	}
+	applyRSSIndirection(true, 1, f.ifaces, f)
+
+	if len(f.calls) != 1 {
+		t.Fatalf("workers=1 with default table: want 1 call (probe only), got %d: %v",
+			len(f.calls), f.calls)
+	}
+	if !reflect.DeepEqual(f.calls[0], []string{"-x", "eth0"}) {
+		t.Errorf("call 0: want `ethtool -x eth0` probe, got %v", f.calls[0])
+	}
+	for _, c := range f.calls {
+		if len(c) >= 1 && c[0] == "-X" {
+			t.Errorf("default table → must not invoke -X, got %v", c)
+		}
+	}
+}
+
+// #5124: single-queue NIC has no possible concentration to undo — the
+// queues>1 guard must short-circuit BEFORE any ethtool probe.
+func TestApplyRSSIndirection_SingleWorker_SingleQueue_NoOp(t *testing.T) {
 	f := &fakeRSSExecutor{
 		ifaces:  []string{"eth0"},
 		drivers: map[string]string{"eth0": "mlx5_core"},
-		queues:  map[string]int{"eth0": 4},
+		queues:  map[string]int{"eth0": 1},
 	}
 	applyRSSIndirection(true, 1, f.ifaces, f)
 	if len(f.calls) != 0 {
-		t.Fatalf("workers=1 must issue no ethtool calls, got %v", f.calls)
+		t.Fatalf("workers=1 on single-queue NIC must issue no ethtool calls, got %v", f.calls)
 	}
 }
 
@@ -615,11 +669,13 @@ func TestApplyRSSIndirectionOne_WorkersGreaterEqualQueues_DefaultTable_NoOp(t *t
 	}
 }
 
-// #805 test 4: workers == 1 with stale table — must NOT touch.
-// Single-worker deploys keep default RSS regardless of stale state;
-// "stale" is only meaningful when transitioning from workers<queues
-// where some prior apply wrote concentrated weights.
-func TestApplyRSSIndirectionOne_WorkersIsOne_StaleTable_NotTouched(t *testing.T) {
+// #5124 (was #805 test 4): workers == 1 with a stale concentrated table —
+// must probe and restore the NIC default. Single-worker policy is default
+// RSS across every queue; a concentrated table left by a prior
+// workers<queues apply keeps RX hashed onto the old subset, so the reconcile
+// must undo it. With the fix neutralized (guard requiring workers > 1) this
+// goes RED — no ethtool call fires.
+func TestApplyRSSIndirectionOne_WorkersIsOne_StaleTable_RestoresDefault(t *testing.T) {
 	f := &fakeRSSExecutor{
 		drivers:  map[string]string{"eth0": mlx5Driver},
 		queues:   map[string]int{"eth0": 6},
@@ -627,8 +683,47 @@ func TestApplyRSSIndirectionOne_WorkersIsOne_StaleTable_NotTouched(t *testing.T)
 	}
 	applyRSSIndirectionOne("eth0", 1, f)
 
+	if len(f.calls) != 2 {
+		t.Fatalf("workers=1 stale table: want 2 calls (probe + restore), got %d: %v",
+			len(f.calls), f.calls)
+	}
+	if !reflect.DeepEqual(f.calls[0], []string{"-x", "eth0"}) {
+		t.Errorf("call 0: want probe, got %v", f.calls[0])
+	}
+	if !reflect.DeepEqual(f.calls[1], []string{"-X", "eth0", "default"}) {
+		t.Errorf("call 1: want -X default, got %v", f.calls[1])
+	}
+}
+
+// #5124: workers == 1 with a live table that is ALREADY default — probe
+// only, no restore write (mirrors the workers>=queues default no-op path).
+func TestApplyRSSIndirectionOne_WorkersIsOne_DefaultTable_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(defaultTable6q)},
+	}
+	applyRSSIndirectionOne("eth0", 1, f)
+
+	for _, c := range f.calls {
+		if len(c) >= 1 && c[0] == "-X" {
+			t.Errorf("workers=1 default table → must not invoke -X, got %v", c)
+		}
+	}
+}
+
+// #5124: workers == 1 on a single-queue NIC — the queues>1 guard
+// short-circuits before any probe (no concentration is possible).
+func TestApplyRSSIndirectionOne_WorkersIsOne_SingleQueue_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 1},
+		ethtoolX: map[string][]byte{"eth0": []byte(staleTable6q4w)},
+	}
+	applyRSSIndirectionOne("eth0", 1, f)
+
 	if len(f.calls) != 0 {
-		t.Errorf("workers=1 must issue zero ethtool calls, got %v", f.calls)
+		t.Errorf("workers=1 single-queue NIC → zero ethtool calls, got %v", f.calls)
 	}
 }
 
@@ -767,6 +862,67 @@ func TestApplyRSSIndirectionOne_BootSequence_4then6_RestoresDefault(t *testing.T
 	if !sawRestore {
 		t.Fatalf("step 2 (workers=6): expected -X default restore, got %v",
 			f.calls[step1Calls:])
+	}
+}
+
+// #5124: full 4→1→4 worker-count transition on a 6-queue mlx5 NIC.
+//   - Step 1 (4→concentrated): workers=4 writes [1,1,1,1,0,0].
+//   - Step 2 (workers→1): the reduction must probe the now-stale
+//     concentrated table and restore the round-robin default so RX is no
+//     longer hashed onto queues 0..3 only.
+//   - Step 3 (1→4): workers back to 4 re-writes the concentrated table.
+//
+// The kernel-side table is simulated between steps. With the pre-#5124
+// behavior, Step 2 issues no restore and the stale table survives into
+// Step 3 — Step 2's assertion goes RED.
+func TestApplyRSSIndirectionOne_Transition_4then1then4(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": []byte(defaultTable6q)},
+	}
+
+	// Step 1: workers=4 on a default table → write concentrated weights.
+	applyRSSIndirectionOne("eth0", 4, f)
+	sawWeight := false
+	for _, c := range f.calls {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "weight" {
+			sawWeight = true
+		}
+	}
+	if !sawWeight {
+		t.Fatalf("step 1 (workers=4): expected -X weight write, got %v", f.calls)
+	}
+	// Kernel now holds the concentrated layout.
+	f.ethtoolX["eth0"] = []byte(staleTable6q4w)
+	step1End := len(f.calls)
+
+	// Step 2: workers→1. Must probe + restore the NIC default.
+	applyRSSIndirectionOne("eth0", 1, f)
+	sawRestore := false
+	for _, c := range f.calls[step1End:] {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "default" {
+			sawRestore = true
+		}
+	}
+	if !sawRestore {
+		t.Fatalf("step 2 (workers→1): expected -X default restore of the stale table, got %v",
+			f.calls[step1End:])
+	}
+	// Kernel now holds the round-robin default again.
+	f.ethtoolX["eth0"] = []byte(defaultTable6q)
+	step2End := len(f.calls)
+
+	// Step 3: workers back to 4 → re-write concentrated weights.
+	applyRSSIndirectionOne("eth0", 4, f)
+	sawReWeight := false
+	for _, c := range f.calls[step2End:] {
+		if len(c) >= 3 && c[0] == "-X" && c[2] == "weight" {
+			sawReWeight = true
+		}
+	}
+	if !sawReWeight {
+		t.Fatalf("step 3 (1→4): expected -X weight re-write, got %v", f.calls[step2End:])
 	}
 }
 

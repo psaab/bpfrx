@@ -47407,3 +47407,20 @@ top.
   ./pkg/dataplane/userspace/... ./pkg/appid/...` GREEN; `go build ./...` OK.
   Fail-on-revert proven: dropping the TCP member → policymatch tcp/5060 SIP
   falls to default-deny (Matched=false, DefaultUsed=true), RED; restored GREEN.
+
+## 2026-07-12 — #5124 RSS workers→1 stale indirection table
+- **Timestamp**: 2026-07-12
+- **Action**: Fix daemon/rss: workers→1 transition now probes + restores the
+  NIC default RSS indirection table instead of early-returning, so a stale
+  concentrated `[1,..,1,0,..,0]` table left by a prior workers<queues apply is
+  undone (RX no longer hashed onto the old queue subset). Removed the
+  `workers == 1 { return }` short-circuit in `applyRSSIndirection` (falls
+  through to the allowlist loop) and generalized the restore guard in
+  `applyRSSIndirectionOne` from `workers > 1 && workers >= queues && queues > 1`
+  to `workers >= 1 && queues > 1`. computeWeightVector(1,q) still returns nil
+  (no weight vector applied); the single-worker default-RSS policy is unchanged.
+- **File(s)**: pkg/daemon/rss_indirection.go, pkg/daemon/rss_indirection_test.go
+- **Validation**: `go test ./pkg/daemon/...` GREEN. Fail-on-revert proven:
+  reverting the guard to `workers > 1 ...` → 4 new tests RED (top-level +
+  per-iface workers→1 stale restore, default-table probe-only, 4→1→4
+  transition); restored GREEN. gofmt + go vet clean.
