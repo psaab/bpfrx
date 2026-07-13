@@ -47620,3 +47620,37 @@ top.
   restored GREEN. Pre-existing failure
   TestUserspaceManagerDoesNotImportReflectOrUnsafe (manager_overlay.go imports
   reflect) reproduces on pristine origin/master — not this change.
+
+- **Timestamp**: 2026-07-12
+  **Action**: #5487 (codex-review-179 A6/C179-084) — standalone HA-state clear
+  had no retry/debt. Both non-cluster clear sites in manager_compile.go (~276
+  deferred-startup, ~363 post-apply) did
+  `if err := m.clearHelperHAStateLocked(); err != nil { return ..., err }`. The
+  snapshot is already acknowledged; if that idempotent empty `update_ha_state`
+  RPC hit a transient control-socket error the apply returned an error but the
+  helper kept stale HA groups while the manager is clusterHA=false. The status
+  poll's HA sync is gated behind `m.clusterHA` (process_status.go) and a
+  freshly-started helper hasn't reached ensureStatusLoopLocked, so the clear
+  was NEVER retried → owner_rg_id<=0 forwarding candidates stay HAInactive =
+  standalone transit forwarding outage until an unrelated full apply. Fix
+  (mirrors the existing #5134 pendingWorkerArm debt): added
+  `pendingHAStateClear` debt flag + `clearHelperHAStateWithDebtLocked`
+  (records debt on failure, still returns the error so the apply fails closed;
+  clears debt on success) used at BOTH standalone sites, and
+  `retryPendingHAStateClearLocked` invoked from the poll tick OUTSIDE the
+  clusterHA guard but only while standalone (retrying an empty update while
+  clustered would wipe live RG HA state). Fault-injection seam
+  (clearHelperHAStateHook) makes tests run unprivileged. Operator-facing
+  behavior (standalone ⇒ empty helper ha_state) unchanged — internal
+  convergence robustness — so no doc update needed. Final live
+  standalone-forwarding verify is cluster/lab-bound (deferred).
+  **File(s)**: pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_compile.go,
+  pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/hastate_clear_debt_5487_test.go
+  GREEN: full `go test ./pkg/dataplane/userspace/` passes; gofmt + go vet +
+  `go build ./...` clean. Fail-on-revert proven: neutralizing the debt-set and
+  retry (pre-fix absent behavior) turns three tests RED — "retry debt was not
+  recorded" (failed clear), "clearHelperHAStateLocked called 0 times, want 1"
+  (poll-tick retry x2); restored GREEN.

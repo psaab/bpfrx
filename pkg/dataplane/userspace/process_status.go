@@ -176,6 +176,14 @@ func (m *Manager) statusLoop(ctx context.Context) {
 						slog.Warn("userspace: deferred-worker arm retry failed; will retry", "err", err)
 					}
 				}
+				// #5487: settle a stranded standalone HA-state clear. The
+				// clusterHA-gated HA sync below never retries the empty
+				// update_ha_state on a standalone node, so a transient failure
+				// during a cluster->standalone reconfig would leave stale helper
+				// HA groups that keep owner-RG-0 transit HAInactive (drop). Retry
+				// the idempotent clear here (ungated by clusterHA, but only while
+				// standalone) until it succeeds.
+				m.retryPendingHAStateClearLocked()
 				helperActiveSig := activeHAGroupSignatureSlice(status.HAGroups)
 				if m.clusterHA {
 					_ = m.refreshHAStateFromMapsLocked()
