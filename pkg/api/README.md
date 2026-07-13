@@ -775,10 +775,13 @@ under the daemon's errgroup. Nothing else imports this package.
     `sessions_aggregation_bound_5433_test.go` (per-handler concurrency bound +
     shared-limiter cross-endpoint 429 + permit-release, RED-on-revert).
     **#5708 hoists this limiter to `diagcmd.SessionWalkLimiter`** so the SAME
-    aggregate budget also covers the gRPC session-scan RPCs
+    aggregate budget also covers the gRPC session-scan paths
     (`GetSessions`, `GetSessionSummary`, and `GetZonePairSummary` in
-    `pkg/grpcapi/server_sessions.go`), which drive the identical full v4+v6 walk
-    and previously bypassed the REST bound (codex-review-182 M35). The gRPC
+    `pkg/grpcapi/server_sessions.go`, plus the `ShowText` `sessions-top:*`
+    scan in `server_show_flow.go` — gRPC-only, no REST twin), which drive the
+    identical full v4+v6 walk and previously bypassed the REST bound
+    (codex-review-182 M35). The `sessions-top` scan's #5319 bounded top-K caps
+    only the OUTPUT (K survivors), not the full-table WALK. The gRPC
     zone-pair RPC was a particularly clear gap — its REST twin
     (`GET /security/sessions/summary/zone-pairs`) was already gated, so
     zone-pairs was bounded on REST but unbounded on gRPC. A gRPC caller can no

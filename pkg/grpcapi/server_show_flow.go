@@ -258,6 +258,23 @@ func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.
 		buf.WriteString("Dataplane not loaded\n")
 		return nil
 	}
+
+	// Admission bound (#5708, codex-review-182 M35): the top-K selection is a
+	// full v4+v6 conntrack-table walk (same per-bucket BPF-map lock contention
+	// as GetSessionSummary). The #5319 bounded top-K caps only the OUTPUT (K
+	// survivors), not the WALK, so an unbounded concurrent `show ... top`
+	// scrape flood still multiplies lock contention. Gate it through the SAME
+	// shared limiter as the GetSessions/GetSessionSummary/GetZonePairSummary
+	// RPCs and the REST session scans; an over-cap scan surfaces as
+	// codes.ResourceExhausted (ShowText returns this handler error verbatim).
+	// Release on every exit path via defer.
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		return status.Error(codes.ResourceExhausted,
+			"session scan concurrency limit reached; retry shortly")
+	}
+	defer release()
+
 	sortByBytes := topic == "sessions-top:bytes"
 	sortLabel := "bytes"
 	if !sortByBytes {

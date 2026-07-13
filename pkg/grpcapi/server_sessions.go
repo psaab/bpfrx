@@ -32,8 +32,9 @@ type sessionEgressKey struct {
 }
 
 // sessionWalkLimiter is the aggregate concurrency bound for the gRPC
-// session-scan RPCs (GetSessions list, GetSessionSummary, and
-// GetZonePairSummary). It aliases the
+// session-scan paths (GetSessions list, GetSessionSummary,
+// GetZonePairSummary, and the ShowText "sessions-top:*" scan in
+// server_show_flow.go). It aliases the
 // process-wide diagcmd.SessionWalkLimiter — the SAME instance the REST
 // session list/summary/zone-pair handlers use (pkg/api/sessions.go) — so a
 // session scan admitted over gRPC and one admitted over REST draw from one

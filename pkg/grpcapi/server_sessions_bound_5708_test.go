@@ -132,6 +132,34 @@ func TestGRPCGetZonePairSummaryConcurrencyBound(t *testing.T) {
 	}
 }
 
+// (a4) Same admission contract for the ShowText "sessions-top:*" scan, reached
+// via the registered ShowText RPC. Its #5319 bounded top-K caps only the K
+// survivors in the output heap, not the full-table WALK, so an unbounded
+// concurrent scrape must be gated by the shared limiter like the other scans.
+func TestGRPCShowSessionsTopConcurrencyBound(t *testing.T) {
+	orig := sessionWalkLimiter
+	t.Cleanup(func() { sessionWalkLimiter = orig })
+	sessionWalkLimiter = diagcmd.NewLimiter(1)
+
+	release, err := sessionWalkLimiter.Acquire()
+	if err != nil {
+		t.Fatalf("failed to pre-acquire the only slot: %v", err)
+	}
+
+	s := newBoundSessionServer(t)
+
+	_, err = s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "sessions-top:bytes"})
+	if !isResourceExhausted(err) {
+		release()
+		t.Fatalf("ShowText sessions-top:bytes with a full session-walk limiter: err = %v, want codes.ResourceExhausted", err)
+	}
+
+	release()
+	if _, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "sessions-top:bytes"}); isResourceExhausted(err) {
+		t.Fatalf("ShowText sessions-top:bytes after slot release still ResourceExhausted: %v", err)
+	}
+}
+
 // (c) The gRPC session scans draw from the PROCESS-WIDE diagcmd.SessionWalkLimiter
 // — the SAME instance the REST scans use — so a mix of REST+gRPC scrapers cannot
 // collectively exceed the aggregate budget. Saturating the shared singleton
