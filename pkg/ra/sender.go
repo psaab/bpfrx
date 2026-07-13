@@ -114,6 +114,12 @@ var listenFn = func(iface *net.Interface, addr ndp.Addr) (ndpConn, netip.Addr, e
 // a demoting interface). Defaults to the real implementation.
 var ensureLinkLocalFn = ensureLinkLocal
 
+// interfaceByNameFn re-resolves a *net.Interface (ifindex + hardware address)
+// by name. It backs both listen()'s bind-retry re-read and the pre-burst MAC
+// refresh (#5302). Overridable in tests so a MAC change can be injected without
+// a real netlink round-trip. Defaults to net.InterfaceByName.
+var interfaceByNameFn = net.InterfaceByName
+
 // sender is a per-interface RA sender goroutine.
 //
 // Single-owner contract (#2033, Path A): run() is the SOLE writer/closer of the
@@ -373,7 +379,7 @@ func (s *sender) listen() (ndpConn, netip.Addr, error) {
 			return nil, netip.Addr{}, err
 		case <-t.C:
 		}
-		if iface, e := net.InterfaceByName(s.iface.Name); e == nil {
+		if iface, e := interfaceByNameFn(s.iface.Name); e == nil {
 			s.iface = iface
 		}
 	}
@@ -432,6 +438,35 @@ func (s *sender) requestBurst() {
 // goodbye is owner-emitted on exit (so any in-flight normal RA necessarily
 // PRECEDES it).
 func (s *sender) draining() bool { return s.mode.Load() != int32(modeNone) }
+
+// refreshInterfaceForBurst re-resolves s.iface (ifindex + hardware address) via
+// interfaceByNameFn so a post-link-cycle burst advertises the CURRENT source
+// link-layer address, not the net.Interface value snapshot cached at Start
+// (#5302, codex-review-178 A5-b1-F5). A day-2 RETH/VLAN virtual-MAC change
+// (failover / becomeMaster) reprograms the MAC while the RA config is
+// unchanged, so RA reconciliation keeps this sender and only requests a burst.
+// Without this re-resolve the burst marshals the OLD cached MAC into the SLLA
+// option, and hosts point the router's neighbor entry at a MAC the active node
+// no longer owns — an IPv6 blackhole, the exact opposite of the burst's
+// neighbor-repair intent.
+//
+// Owner-only: it runs in the run() goroutine that is the SOLE writer of s.iface
+// (never concurrent with listen()'s bind-retry re-read, which only runs during
+// openConn before the main loop), so no lock is needed. A successful refresh
+// also freshens the MAC used by subsequent periodic sendRA calls. On failure it
+// returns false and logs; the caller then SKIPS the burst rather than advertise
+// a known-stale SLLA (advertising a stale MAC is worse than sending nothing —
+// host NUD and the next successful refresh recover neighbor state).
+func (s *sender) refreshInterfaceForBurst() bool {
+	iface, err := interfaceByNameFn(s.iface.Name)
+	if err != nil {
+		slog.Warn("ra: failed to refresh interface before burst; skipping burst to avoid advertising a stale source link-layer address",
+			"interface", s.iface.Name, "err", err)
+		return false
+	}
+	s.iface = iface
+	return true
+}
 
 // dead reports whether this sender's owner goroutine resolved its openConn
 // attempt WITHOUT producing a live NDP conn — i.e. the bind gave up after all
@@ -506,7 +541,12 @@ func (s *sender) run() {
 			return
 
 		case <-s.burstCh:
-			s.burstInterruptible()
+			// #5302: re-resolve the interface's current MAC BEFORE the burst so
+			// the SLLA reflects a post-link-cycle virtual-MAC change; skip the
+			// burst on a refresh failure rather than advertise a stale SLLA.
+			if s.refreshInterfaceForBurst() {
+				s.burstInterruptible()
+			}
 
 		case <-advTimer.C:
 			s.sendRA()

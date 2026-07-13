@@ -47962,3 +47962,32 @@ top.
   strict commit to reject an unsupported `mac` stanza in the SECOND interfaces
   root", "lenient compile must warn about the second-root unsupported stanza";
   the single-root no-regression case stayed GREEN; restored GREEN.
+
+- **Timestamp**: 2026-07-13
+  **Action**: #5302 (codex-review-178 A5-b1-F5, vsrx-parity) — RA sender cached
+  net.Interface.HardwareAddr at Start, so a post-RETH/VLAN-virtual-MAC-change
+  ResendBurst advertised a STALE ICMPv6 SLLA. buildRA (sender.go:800) marshals
+  s.iface.HardwareAddr, re-read only inside listen()'s bind-retry. A day-2
+  failover reprograms the virtual MAC while RA config is unchanged → RA
+  reconciliation keeps the sender and only requests a burst (ResendBurst →
+  burstCh) without re-resolving → the burst carries the OLD MAC → hosts point
+  the router's neighbor entry at a MAC the active node no longer owns (IPv6
+  blackhole, opposite of RA's neighbor-repair intent). Fix: added
+  interfaceByNameFn seam (default net.InterfaceByName; also backs listen()'s
+  existing re-read) and refreshInterfaceForBurst() — an OWNER-serialized
+  re-resolve (runs in the run() goroutine that solely owns s.iface, never
+  concurrent with listen()) invoked in the burstCh handler BEFORE
+  burstInterruptible; a successful refresh also freshens subsequent periodic
+  sends. On refresh failure the burst is SKIPPED + slog.Warn (advertising a
+  stale MAC is worse than sending nothing). No daemon_apply.go change needed —
+  the existing ResendBurst trigger (daemon_apply.go:1287, post-NotifyLinkCycle)
+  now refreshes automatically. Updated pkg/ra/README.md ResendBurst contract.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/README.md,
+  pkg/ra/ra_mac_refresh_5302_test.go
+  GREEN: go test ./pkg/ra/... (incl -race on the new tests) passes; gofmt + go
+  vet + go build clean. Fail-on-revert proven: neutralizing the burstCh-handler
+  refresh (unconditional burstInterruptible) →
+  TestResendBurstRefreshesSLLAAfterMACChange_5302 RED (burst kept advertising
+  MAC ...00:0a, want ...00:0b) + TestResendBurstSkipsOnRefreshFailure_5302 RED
+  (burst sent 3 stale RAs, want 0); restored GREEN. Live post-failover
+  neighbor-repair verify is cluster-shim-ABI-walled → deferred.
