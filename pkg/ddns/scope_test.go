@@ -400,3 +400,84 @@ func TestPerRGGatePartialDemotionSteadyState(t *testing.T) {
 		t.Fatalf("RG1 owned record must remain, got %d", ownedByRG(m, 1))
 	}
 }
+
+// TestCoOwnedWireRRSurvivesOtherScopeTeardown is the #5709 (codex-review-182
+// M36) fail-on-revert test: two DDNS scopes (two redundancy groups) resolve the
+// SAME host to the SAME address and thus CO-OWN one wire resource record
+// (shared.example.com A 10.0.5.5). Each scope keeps its OWN ownership row (the
+// ScopeKey prefix makes the store keys distinct), but on the wire there is ONE
+// RR. When scope RG1's lease expires, its teardown must NOT delete the wire RR
+// that scope RG2 still legitimately owns and refreshes.
+//
+// Fail-on-revert: with the pre-fix deleteOwnedLocked (no wireRRSharedWithOther
+// claim accounting) Pass 1 reconstructs shared.example.com A 10.0.5.5 from RG1's
+// expiring owned record and issues a wire DELETE — clobbering RG2's live record.
+// The "no delete for shared.example.com" assertion below catches that
+// regression; neutralize the guard in deleteOwnedLocked and this goes RED.
+//
+// Production analogue: the same fixed hostname/address is served by two DHCP
+// pools attributed to different RGs, or a scope attribution flips across a
+// reconfiguration, so the store transiently holds two scope rows for one wire
+// RR. It is a reconcile-layer test: it asserts on the durable ownership store +
+// the wire delete calls, not on an updater in isolation.
+func TestCoOwnedWireRRSurvivesOtherScopeTeardown(t *testing.T) {
+	up := newFakeUpdater()
+	// Two clients — DIFFERENT identities + scopes — but the SAME published host
+	// and the SAME address → one shared wire RR co-owned by RG1 and RG2.
+	rg1Lease := Lease{Family: 4, Address: "10.0.5.5", Identity: "mac:11", HostName: "shared", SubnetID: "1"}
+	rg2Lease := Lease{Family: 4, Address: "10.0.5.5", Identity: "mac:22", HostName: "shared", SubnetID: "2"}
+	m, src := scopeManagerSrc(t, up, []Lease{rg1Lease, rg2Lease}, nil)
+
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{Enabled: true, Domain: "example.com", TTLSeconds: 300},
+	}
+	resolver := func(l Lease) (ScopeKey, bool) {
+		switch l.Identity {
+		case "mac:11":
+			return ScopeKey{Family: FamilyV4, RGOwner: 1}, true
+		case "mac:22":
+			return ScopeKey{Family: FamilyV4, RGOwner: 2}, true
+		}
+		return ScopeKey{}, false
+	}
+	gateBoth := func(ScopeKey) bool { return true }
+
+	// Phase 1: both scopes publish → the wire RR is co-owned by two store rows.
+	if err := m.ReconcileScoped(context.Background(), cfg,
+		ReconcileOptions{Gate: gateBoth, Resolver: resolver}); err != nil {
+		t.Fatalf("phase 1 reconcile: %v", err)
+	}
+	if ownedByRG(m, 1) != 1 || ownedByRG(m, 2) != 1 {
+		t.Fatalf("phase 1: both scopes must own the co-owned RR: rg1=%d rg2=%d",
+			ownedByRG(m, 1), ownedByRG(m, 2))
+	}
+
+	// Phase 2: RG1's lease EXPIRES (gone from the memfile); RG2's remains and is
+	// still master-owned by this node. RG1's teardown must not touch the wire RR.
+	src.v4 = []Lease{rg2Lease}
+	up.upserts = nil
+	up.deletes = nil
+	if err := m.ReconcileScoped(context.Background(), cfg,
+		ReconcileOptions{Gate: gateBoth, Resolver: resolver}); err != nil {
+		t.Fatalf("phase 2 reconcile: %v", err)
+	}
+
+	// THE ASSERTION (RED pre-fix): no wire delete for the co-owned RR.
+	for _, d := range up.deletes {
+		if d.FQDN == "shared.example.com" {
+			t.Fatalf("RG1 teardown DELETED the co-owned wire RR that RG2 still owns "+
+				"(cross-scope clobber, #5709): %s=%s", d.FQDN, d.Addr)
+		}
+	}
+	// RG1's expired ownership claim is released; RG2's is preserved (RR stays live).
+	if ownedByRG(m, 1) != 0 {
+		t.Fatalf("RG1's expired ownership claim must be released, got %d", ownedByRG(m, 1))
+	}
+	if ownedByRG(m, 2) != 1 {
+		t.Fatalf("RG2's co-owned record must survive RG1's teardown, got %d", ownedByRG(m, 2))
+	}
+	// The suppression is observable (exactly one co-owned wire-delete skip).
+	if got := m.deleteCoowned.Load(); got != 1 {
+		t.Fatalf("expected exactly one co-owned wire-delete suppression, got %d", got)
+	}
+}

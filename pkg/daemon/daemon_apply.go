@@ -1834,9 +1834,9 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 
 	// 1.8. Clean up legacy RETH bond devices from previous binary versions.
 	// VRRP now runs directly on physical member interfaces — no bonds needed.
-	// ClearRethInterfaces returns an error only on a netlink LinkList failure
-	// (the per-bond LinkDel failures are logged internally); surface it so a
-	// stale legacy reth bond left in the kernel fails the commit closed.
+	// ClearRethInterfaces returns an error on a netlink LinkList failure OR on
+	// any per-bond LinkDel failure (aggregated with errors.Join, #5704); surface
+	// it so a stale legacy reth bond left in the kernel fails the commit closed.
 	if err := d.routing.ClearRethInterfaces(); err != nil {
 		slog.Warn("failed to clean up legacy RETH bonds", "err", err)
 		errs = append(errs, fmt.Errorf("clean up legacy RETH bonds: %w", err))

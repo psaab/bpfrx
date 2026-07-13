@@ -25,6 +25,33 @@
   pkg/dataplane/userspace/policies_lower.go,
   pkg/dataplane/userspace/feed_static_alias_failclosed_5645_test.go,
   pkg/feeds/README.md, _Log.md
+## 2026-07-12 — #5704 (bug): RETH deletion failures must fail the reconcile closed
+- **Timestamp**: 2026-07-12 (fix/5704-reth-delete-failclosed)
+- **Action**: codex-review-182 M30. rethManager.Clear (pkg/routing/reth.go)
+  scanned LinkList for reth* bond devices and LinkDel'd each, but a per-bond
+  LinkDel failure was only logged (slog.Warn) and then swallowed — Clear ALWAYS
+  returned nil. A stale reth* bond that could not be torn down (EBUSY / EPERM /
+  transient netlink error) stayed in the kernel — with potentially stale
+  VIP/MAC ownership — while the daemon and the commit reported a clean teardown
+  (fail-open reported as success). Fix: aggregate the LinkDel errors with
+  errors.Join and return them, mirroring the #4901 xfrm/bond/tunnel Clear fix
+  and the #5310/#5703 fail-closed discipline. The apply pipeline
+  (daemon_apply.go step 1.8) already threads ClearRethInterfaces' return into
+  its errors.Join, so a genuine teardown failure now fails the commit closed.
+  Idempotence preserved: an already-absent reth device is not returned by
+  LinkList, so no LinkDel is attempted and no spurious error is produced; retry
+  is implicit via the next reconcile's re-scan (no ownership map to retain,
+  unlike xfrm/bond/tunnel). Updated the daemon_apply.go step-1.8 comment and
+  pkg/routing/README.md reth.go row to describe the fail-closed behavior. Added
+  pkg/routing/reth_clear_failclosed_5704_test.go (fail-on-revert): reused
+  fakeBondLinkOps (seedBond → real *netlink.Bond, failLinkDel injection) — a
+  failed LinkDel makes Clear return a non-nil error naming the bond; two
+  failures both surface in the joined error; all-success returns nil; an
+  already-gone RETH returns nil with zero LinkDel attempts. Verified RED by
+  neutralizing the fix (swallow → return nil): the two failure-path tests fail,
+  the success/idempotence tests still pass; GREEN restored.
+- **File(s)**: pkg/routing/reth.go, pkg/daemon/daemon_apply.go,
+  pkg/routing/README.md, pkg/routing/reth_clear_failclosed_5704_test.go
 
 ## 2026-07-12 — #5712 (bug): in-process CLI commit must preserve the configured syslog transport
 - **Timestamp**: 2026-07-12 (fix/5712-syslog-transport-preserve)
@@ -47158,6 +47185,29 @@ top.
   pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go,
   pkg/daemon/README.md
 
+- **Timestamp**: 2026-07-12
+- **Action**: #5709 fix (codex-review-182 M36) — prevent a DDNS wire-RR
+  cross-scope clobber. Two DDNS scopes (e.g. two redundancy groups, or a
+  per-interface + global binding) can resolve the same host to the same
+  address and CO-OWN one wire resource record; each keeps a distinct
+  ownership row (ScopeKey prefix) but on the wire there is ONE RR. Because
+  `deleteOwnedLocked` reconstructed the wire RR from {FQDN, ForwardType,
+  Address} alone, one scope's teardown (lease expiry / config removal)
+  issued a wire DELETE that removed the RR the OTHER scope still owned —
+  clobbering a live record. Added `wireRRSharedWithOther(owned)`: when
+  another store row (a different scope) carries the same canonical FQDN +
+  forward type + rdata, `deleteOwnedLocked` SUPPRESSES the wire delete,
+  releases only the departing scope's claim, and leaves the live RR for the
+  surviving scope (reference-count decrement over the claim table; equal
+  {FQDN, Address} implies an equal reverse PTR so both directions are
+  covered). Runs before the wire op and is backend-independent. Counted via
+  `Stats.DeleteCoowned` + `xpf_dhcp_ddns_skipped_total{reason="coowned"}`.
+  Added fail-on-revert test `TestCoOwnedWireRRSurvivesOtherScopeTeardown`
+  (RED proven by neutralizing the guard: RG1 teardown deleted the co-owned
+  RR; GREEN restored). gofmt clean; pkg/ddns + pkg/api suites green.
+- **File(s)**: pkg/ddns/manager.go, pkg/ddns/scope_test.go,
+  pkg/api/metrics_system.go, pkg/api/metrics_descriptors.go,
+  pkg/ddns/README.md
 - **Timestamp**: 2026-07-12 (#5680)
 - **Action**: #5680 fix — route-only publication no longer ACKs an
   old-policy/new-route HYBRID as the applied config. PublishRouteOverlaySnapshot
@@ -47192,3 +47242,17 @@ top.
   attached (was asserting len==0, which only held on hosts lacking eth0).
 - **File(s)**: pkg/dhcp/duid_stability_5711_test.go (Edit),
   pkg/dhcp/dhcp_test.go (Edit)
+
+- **Timestamp**: 2026-07-12 07:15
+  **Action**: Fix #5703 (codex-review-182 M29) — a tracked desired bond
+  MISSING from the kernel was treated as "unchanged" by bondManager.Apply's
+  reconcile pass (LinkByName miss → bring-up block skipped → `continue`), so a
+  vanished bond was never recreated (false convergence, persistent outage). The
+  "unchanged" branch now verifies the kernel device is present; if it has
+  vanished it recreates the bond via createLocked (create+enslave, tracking the
+  realized member set) instead of reporting success. Added fail-on-revert test
+  TestBondApplyRecreatesTrackedBondMissingFromKernel (proved RED with the
+  recreate branch neutralized: addCalls=[]; GREEN restored). Updated the Apply
+  doc comment and the pkg/routing/README.md bond-reconcile "keep" bullet.
+  **File(s)**: pkg/routing/bond.go (Edit), pkg/routing/bond_test.go (Edit),
+  pkg/routing/README.md (Edit), _Log.md (Edit)
