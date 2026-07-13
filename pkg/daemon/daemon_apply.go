@@ -782,8 +782,11 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// ApplyConfig already published is stale. Rebuild + republish the routes-only
 	// snapshot against the now-reconciled kernel rules so the userspace FIB does
 	// not retain a deleted-VRF inter-VRF leak. A no-op (content-hash duplicate
-	// skip) when the route set did not move.
-	d.reconcileRouteLeakSnapshot(cfg, commitOverlay)
+	// skip) when the route set did not move. #5696 (M19): a genuine republish /
+	// FIB-bump failure is a DEFERRED error threaded into the tail errors.Join —
+	// this reconcile has no dirty-retry owner, so a swallowed failure would keep
+	// the stale leak on a "successful" commit.
+	routeLeakErr := d.reconcileRouteLeakSnapshot(cfg, commitOverlay)
 
 	ipsecErr, dhcpServerErr := d.applyServicesReconcile(cfg)
 
@@ -800,9 +803,10 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// behavior-preserving mechanical move. The five head-produced deferred
 	// errors (networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr) are threaded
 	// in — applyErr is the #5679 ordinary (non-abort) dataplane-apply failure
-	// that must fail the commit without disarming/aborting; the helper creates
-	// lo0Err/hostInboundErr and returns the seven-way errors.Join.
-	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr)
+	// that must fail the commit without disarming/aborting; routeLeakErr is the
+	// #5696 route-leak republish/FIB-bump failure; the helper creates
+	// lo0Err/hostInboundErr and returns the joined errors.
+	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr)
 }
 
 // applyDataplaneAndHACore runs the ordering-entangled dataplane-apply and
@@ -1515,37 +1519,59 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 // rib-group publish nothing and churn nothing. A nil scheduler-state argument
 // keeps the manager's current policy-scheduler view (the one the full apply just
 // published) so the unchanged-content hash matches and the skip fires.
-func (d *Daemon) reconcileRouteLeakSnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry) {
+//
+// #5696 (M19, a #5642 residual): a genuine route-publication or FIB-invalidation
+// failure returns a DEFERRED error the caller joins into the tail commit-error
+// (fail-closed but complete). This commit-tail reconcile has no dirty-retry
+// engine, so swallowing the failure would leave the userspace FIB with a stale
+// inter-VRF leak — the exact bug #5642 fixed — while reporting a successful
+// commit. Benign no-ops (helperless, duplicate-skip) return nil.
+func (d *Daemon) reconcileRouteLeakSnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry) error {
 	if cfg == nil {
-		return
+		return nil
 	}
 	pub, ok := d.dp.(routeOverlayPublisher)
 	if !ok {
 		// Helperless (no userspace dataplane publisher): the kernel ip-rule
 		// reconcile above is the only route-leak consumer and it already ran.
-		return
+		return nil
 	}
 	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, nil)
 	if err != nil {
+		// #5696 (M19): surface the publish failure as a deferred commit error
+		// instead of swallowing it. This commit-tail reconcile has no dirty-retry
+		// engine (unlike the ip-monitoring actuator), so a swallowed failure would
+		// silently reinstate the exact stale inter-VRF leak #5642 removed while the
+		// commit reports success. The caller joins this into the tail errors.Join
+		// so the commit fails CLOSED — the OLD pre-reconcile snapshot stays live
+		// and a re-commit re-runs the reconcile (#5679/#5310 fail-closed pattern).
 		slog.Warn("route-leak snapshot reconcile: routes-only republish failed; the "+
 			"userspace FIB may retain a stale inter-VRF leak until the next apply",
 			"err", err)
-		return
+		return fmt.Errorf("route-leak snapshot republish: %w", err)
 	}
 	if !published {
 		// Duplicate-skip (route set unchanged) or no published snapshot yet /
 		// helper not running: nothing moved, so do not bump the FIB generation
-		// (would needlessly churn established-flow route caches).
-		return
+		// (would needlessly churn established-flow route caches). Benign no-op —
+		// stays a successful commit.
+		return nil
 	}
 	// Ordering (mirrors the ip-monitoring actuator, #1827 AGY r2-1): bump the
 	// FIB generation ONLY after a real publish so established flows re-resolve
 	// onto the reconciled routes; bumping before/without a publish would leave
 	// flows pinned to the stale leak route.
 	if _, err := pub.BumpFIBGeneration(); err != nil {
+		// #5696 (M19): the leak-free routes ARE on the wire (publish succeeded),
+		// but the FIB generation was not bumped — established flows stay pinned to
+		// the stale leak route. With no retry owner for this commit-tail path a
+		// swallowed bump leaves that inconsistency unrediscovered; fail the commit
+		// closed so a re-commit re-runs the reconcile.
 		slog.Warn("route-leak snapshot reconcile: FIB generation bump unconfirmed after "+
 			"republish; established flows may re-resolve on a later sweep", "err", err)
+		return fmt.Errorf("route-leak snapshot FIB generation bump: %w", err)
 	}
+	return nil
 }
 
 // applyFabricIPVLAN creates the fabric-member IPVLAN overlays (fab0/fab1) for
@@ -1861,10 +1887,12 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 // still runs). networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr originate in
 // the head and are threaded in as parameters (applyErr is the #5679 ordinary
 // non-abort dataplane-apply failure that must fail the commit while the OLD
-// policy stays live); lo0Err/hostInboundErr originate in step 9.5 below. The
-// returned errors.Join preserves the exact operand order the inline tail used
-// (#1778/#2987/#4433/#5310/#5679).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr error) error {
+// policy stays live); routeLeakErr is the #5696 route-leak snapshot
+// republish/FIB-bump failure (also head-produced, threaded in like ifaceErr);
+// lo0Err/hostInboundErr originate in step 9.5 below. The returned errors.Join
+// preserves the exact operand order the inline tail used
+// (#1778/#2987/#4433/#5310/#5679/#5696).
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
@@ -2124,16 +2152,18 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	// #1778 + #2987 + #4433 + #5310 + #5679: deferred reconcile failures — every
-	// reconcile step above has run; surface the networkd write failure, the
+	// #1778 + #2987 + #4433 + #5310 + #5679 + #5696: deferred reconcile failures —
+	// every reconcile step above has run; surface the networkd write failure, the
 	// ordinary (non-abort) dataplane-apply failure (#5679 — the new policy is
 	// NOT on the wire, the old one still is), the Kea restart/stop failure, the
-	// IPsec render/reload failure, and the interface-reconcile failure
-	// (xfrmi/bond/tunnel/legacy-reth create/up/delete — #5310) through the commit
-	// so a step that left stale or missing kernel/swanctl/dataplane state fails
-	// the commit (fail-closed) instead of reporting success. All are joined so
-	// none masks the other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr)
+	// IPsec render/reload failure, the interface-reconcile failure
+	// (xfrmi/bond/tunnel/legacy-reth create/up/delete — #5310), and the route-leak
+	// snapshot republish/FIB-bump failure (#5696 — a stale inter-VRF leak would
+	// otherwise survive on a "successful" commit) through the commit so a step
+	// that left stale or missing kernel/swanctl/dataplane state fails the commit
+	// (fail-closed) instead of reporting success. All are joined so none masks the
+	// other.
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error
