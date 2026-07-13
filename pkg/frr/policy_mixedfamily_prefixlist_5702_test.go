@@ -94,11 +94,32 @@ func TestMixedFamilyRouteFilterFromPrefixList_OffFamilyNonMatching_5702(t *testi
 			"routes; the predicate was dropped (pre-#5702 fail-open):\n%s", v4seq)
 	}
 
-	// Belt: the off-family match appears in BOTH sequences now (v4 AND-NOMATCH
-	// + v6 on-family), where pre-fix it appeared only in the v6 sequence.
-	if n := strings.Count(got, "match ipv6 address prefix-list V6ONLY\n"); n != 2 {
-		t.Errorf("expected the V6ONLY match in both split sequences (v4 AND-NOMATCH + "+
-			"v6), got %d occurrences:\n%s", n, got)
+	// #5730: the V6ONLY predicate ANDs into BOTH split sequences, but the
+	// ON-family (v6) sequence must render it as a DISTINCT FRR rule type
+	// (access-list), NOT a second `match ipv6 address prefix-list` — that would
+	// COLLIDE with the v6 route-filter's own prefix-list match (FRR's
+	// route_map_add_match REPLACES a same-type rule, keeping only the last, so
+	// the v6 route-filter constraint would be silently dropped). Therefore the
+	// prefix-list form of V6ONLY appears ONLY in the off-family v4 sequence
+	// (exactly once); the v6 sequence carries the access-list form.
+	if n := strings.Count(got, "match ipv6 address prefix-list V6ONLY\n"); n != 1 {
+		t.Errorf("expected the V6ONLY prefix-list match ONLY in the off-family v4 "+
+			"sequence (the on-family v6 sequence renders it as an access-list per "+
+			"#5730), got %d occurrences:\n%s", n, got)
+	}
+	// The v6 route-filter sequence ANDs V6ONLY as an access-list (#5730),
+	// coexisting with `match ipv6 address prefix-list MIX-t1_v6` as a distinct
+	// FRR rule type instead of colliding with it.
+	v6seq := routeMapSequenceContaining(got, "MIX", "match ipv6 address prefix-list MIX-t1_v6")
+	if v6seq == "" {
+		t.Fatalf("expected a v6 route-filter sequence in render:\n%s", got)
+	}
+	if !strings.Contains(v6seq, "match ipv6 address V6ONLY_rf\n") {
+		t.Fatalf("v6 sequence must AND the on-family V6ONLY predicate as an "+
+			"access-list (#5730), not a colliding same-type prefix-list match:\n%s", v6seq)
+	}
+	if !strings.Contains(got, "ipv6 access-list V6ONLY_rf seq 5 permit 2001:db8:aaaa::/48 exact-match\n") {
+		t.Fatalf("missing the #5730 access-list definition for the on-family V6ONLY predicate:\n%s", got)
 	}
 }
 

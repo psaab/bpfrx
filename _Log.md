@@ -47491,3 +47491,24 @@ top.
   GREEN; gofmt clean on touched files. Fail-on-revert proven: neutralizing the
   new zeroizeConfigDir guard → TestZeroizeConfigDirRefusesSharedRoot RED
   (seeded siblings deleted, returns nil); restored GREEN.
+
+- **Timestamp**: 2026-07-12
+  **Action**: #5730 — fix on-family route-filter + same-family from-prefix-list
+  FRR match collision (route_map REPLACE silently dropped the route-filter
+  constraint). In renderPolicyTermSequences/emitTermBody, track whether this
+  sequence emitted a route-filter `match ip|ipv6 address prefix-list` line and
+  its family (rfMatchEmitted/rfMatchV6). When a from-prefix-list would emit a
+  SAME-family, same-type prefix-list match, render it instead as an FRR
+  ACCESS-LIST match (`match ip|ipv6 address <name>_rf`, exact-match) — a
+  distinct FRR rule type — so FRR ANDs the two constraints. Off-family (#5702)
+  coexistence is already a distinct type, left unchanged. New helper
+  renderFromPrefixListACL emits the access-list definition inline (same
+  established pattern as renderRouteFilterEntry). Updated the #5702 mixed-family
+  test whose belt assertion encoded the buggy on-family collision (V6ONLY as
+  prefix-list in both sequences → now access-list in the on-family v6 seq).
+  **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/policy_mixedfamily_prefixlist_5702_test.go
+  GREEN: `go test ./pkg/frr/...` passes; gofmt + go vet clean. Fail-on-revert
+  proven: neutralizing the collision branch (`if false && ...`) →
+  TestPolicyRouteFilterPrefixListSameFamilyNoCollision RED (two colliding
+  `match ipv6 address prefix-list` lines); restored GREEN.
