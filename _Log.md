@@ -47472,3 +47472,22 @@ top.
   Fail-on-revert proven: neutralizing ValidateFactoryResetRoot →
   TestValidateFactoryResetRoot (15 rows), TestFactoryResetConfigDirRefusesSharedParent,
   and TestZeroizeRefusesSharedConfigRoot all RED; restored GREEN.
+
+## 2026-07-12 — #5684 follow-up: grpcapi zeroizeConfigDir defense-in-depth (PR #5767 review fold)
+
+- **Timestamp**: 2026-07-12
+- **Action**: Folded one hostile-review finding on PR #5767. The gRPC config-
+  state wipe PRIMITIVE `grpcapi.zeroizeConfigDir` (server_diag_zeroize.go) — the
+  MORE destructive one (RemoveAll's `<root>/tls` + `<root>/.configdb`) — did not
+  itself call `ValidateFactoryResetRoot`, so the #5684 defense-in-depth was
+  one-sided (only the CLI's `configstore.FactoryResetConfigDir` re-validated).
+  No live bypass (only runZeroize→zeroizeConfigRoot reaches it, which validates),
+  but the guarantee + docs were asymmetric. Added the guard as the FIRST
+  statement of `zeroizeConfigDir` (fail-closed before any glob/RemoveAll) and
+  corrected docs/system-login.md to say BOTH primitives re-validate.
+- **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/grpcapi/zeroize_scope_5684_test.go, docs/system-login.md
+- **Validation**: `go test ./pkg/grpcapi/... ./pkg/configstore/... ./pkg/cli/...`
+  GREEN; gofmt clean on touched files. Fail-on-revert proven: neutralizing the
+  new zeroizeConfigDir guard → TestZeroizeConfigDirRefusesSharedRoot RED
+  (seeded siblings deleted, returns nil); restored GREEN.

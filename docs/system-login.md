@@ -194,8 +194,12 @@ directory (`FactoryResetForbiddenRoots`: `/`, `/etc`, `/srv`, `/home`, `/var`,
 `..` traversal normalize first). The default `/etc/xpf` and any dedicated
 subdirectory pass. The guard runs at both resolution points
 (`(*Server).zeroizeConfigRoot`, `(*CLI).zeroizeConfigRoot`) — so a bad root
-fails **closed before any wipe leg runs**, erasing nothing — and again inside the
-shared `FactoryResetConfigDir` primitive as defense-in-depth.
+fails **closed before any wipe leg runs**, erasing nothing — and, as
+defense-in-depth, again inside **each** config-state wipe primitive before it
+touches disk: the CLI's `configstore.FactoryResetConfigDir` and the gRPC
+`grpcapi.zeroizeConfigDir` (the latter is the more destructive one — it
+`RemoveAll`s `<root>/tls` and `<root>/.configdb`), so neither primitive trusts
+its caller to have handed it an xpf-owned root.
 
 **Rendered service-config erasure (#4585).** The wipe erases that
 SSOT/rollback/journal state directly, but the prior tenant's secrets are ALSO
