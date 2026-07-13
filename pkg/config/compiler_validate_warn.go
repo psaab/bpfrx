@@ -440,45 +440,17 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Validate DNAT pool references
-	if dnat := cfg.Security.NAT.Destination; dnat != nil {
-		for _, rs := range dnat.RuleSets {
-			if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
-				continue
-			}
-			for _, rule := range rs.Rules {
-				if rule == nil { // #3494: tolerant/HA-sync path may carry a nil rule
-					continue
-				}
-				if rule.Then.PoolName != "" {
-					if _, ok := dnat.Pools[rule.Then.PoolName]; !ok {
-						warnings = append(warnings, fmt.Sprintf(
-							"destination-nat %q rule %q: pool %q not defined",
-							rs.Name, rule.Name, rule.Then.PoolName))
-					}
-				}
-			}
-		}
-	}
-
-	// Validate SNAT pool references
-	for _, rs := range cfg.Security.NAT.Source {
-		if rs == nil { // #3494: tolerant/HA-sync path may carry a nil rule-set
-			continue
-		}
-		for _, rule := range rs.Rules {
-			if rule == nil { // #3494: tolerant/HA-sync path may carry a nil rule
-				continue
-			}
-			if rule.Then.PoolName != "" {
-				if _, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"source-nat %q rule %q: pool %q not defined",
-						rs.Name, rule.Name, rule.Then.PoolName))
-				}
-			}
-		}
-	}
+	// Source/destination-NAT pool REFERENCES (`then ... pool <name>` naming a
+	// pool not defined under `security nat source/destination pool`) are
+	// validated by the strict commit gate validateNATPoolReferencesStrict
+	// (#5626): hard-reject on commit / commit-check, downgraded to a warning on
+	// the tolerant load / peer-sync path (opts.lenientDestNATAddresses). The
+	// strict gate subsumes the warn-only loop that previously lived here (it
+	// would otherwise emit a duplicate warning alongside the downgraded gate
+	// warning on the lenient path). The snapshot builders independently fail
+	// closed for a dangling pool (SNAT marks the rule unusable, DNAT drops it),
+	// so a leniently-loaded config referencing an undefined pool installs
+	// nothing rather than mis-translating.
 
 	// Zone interface references (`security zones security-zone <z> interfaces
 	// <if>` naming an interface not defined under `interfaces`) are validated by

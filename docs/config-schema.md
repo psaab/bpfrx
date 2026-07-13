@@ -2879,6 +2879,34 @@ reserved for whole-dataplane selection where a rewrite shim
     combinations (the #3303 snapshot tests call the builder directly and
     bypass the strict validator, which is how the over-reject survived for
     the three combinations the #3425 SNAT-source test did not cover).
+  - `security nat source/destination rule-set rule then ... pool <name>`
+    (#5626) — a NAT rule's `then source-nat pool` / `then destination-nat
+    pool` names a pool that MUST be defined under `security nat source pool
+    <name>` / `security nat destination pool <name>`. An undefined reference
+    used to be **warn-only** (`ValidateConfig`): the rule committed and then
+    behaved incorrectly at runtime in an ORDER-DEPENDENT way — the SNAT
+    snapshot builder (`nat_source.go`) marks the rule `poolUnusable`
+    (`missing_pool`) and the DNAT builder (`nat_destination.go`) drops the
+    rule outright (the pool lookup misses), so the requested translation
+    silently never fires and matching traffic falls through to a later rule
+    or the no-NAT default. `validateNATPoolReferencesStrict`
+    (`compiler_validate_strict_nat.go`) now hard-rejects the dangling
+    reference at strict commit / commit-check, naming the NAT kind, rule-set,
+    rule, and the undefined pool; the pool-name resolution mirrors the
+    snapshot builders exactly (`cfg.Security.NAT.SourcePools` for SNAT,
+    `cfg.Security.NAT.Destination.Pools` for DNAT) so commit and apply cannot
+    diverge. A rule with no pool reference (`then ... interface`, `then ...
+    off`, static NAT's literal `prefix`) carries `PoolName == ""` and is out
+    of scope. The gate reuses the `lenientDestNATAddresses` downgrade (warn on
+    load / peer-sync, #1960 no-brick; the snapshot builders fail closed
+    independently, so a leniently-loaded config with a dangling pool installs
+    nothing rather than mis-translating). This gate subsumes the warn-only
+    pool-reference loop that previously lived in `ValidateConfig` (keeping it
+    would emit a duplicate warning alongside the downgraded gate warning on
+    the lenient path). Fail-on-revert:
+    `TestNATPoolReferenceUndefinedRejected_5626` /
+    `TestNATPoolReferenceGate_LenientDowngrade_5626`
+    (`pkg/config/compiler_nat_pool_ref_5626_test.go`).
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix

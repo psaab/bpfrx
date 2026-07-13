@@ -1789,9 +1789,11 @@ security {
 	}
 	// #4515: a zone referencing an undefined interface is now a STRICT commit
 	// reject (validateZoneInterfaceDefinedStrict), downgraded to a warning on
-	// the tolerant load / peer-sync path. Compile leniently so both the
-	// downgraded interface warning and the (still warn-only) SNAT missing-pool
-	// warning surface together, preserving this cross-reference test's intent.
+	// the tolerant load / peer-sync path. #5626: a NAT rule referencing an
+	// undefined pool is likewise now a STRICT commit reject
+	// (validateNATPoolReferencesStrict), downgraded to a warning on the tolerant
+	// path. Compile leniently so both downgraded warnings surface together,
+	// preserving this cross-reference test's intent.
 	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
 		t.Fatalf("CompileConfigLenient: %v", err)
@@ -1801,7 +1803,7 @@ security {
 		if strings.Contains(w, "missing-iface") && strings.Contains(w, "not defined under") {
 			foundIfaceWarn = true
 		}
-		if strings.Contains(w, "missing-pool") && strings.Contains(w, "not defined") {
+		if strings.Contains(w, "missing-pool") && strings.Contains(w, "undefined pool") {
 			foundPoolWarn = true
 		}
 	}
