@@ -309,6 +309,42 @@ reject identically = order-independent, lenient-warn, non-colliding-commits) and
 the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
 the gate wiring.
 
+### security address-book same-name `address` + `address-set` collision (#5676)
+
+`address` and `address-set` entries share ONE operator-visible namespace (a
+policy `match source-address <name>` / `destination-address <name>` names a
+single token) but are stored in two SEPARATE maps
+(`AddressBook.Addresses` / `AddressBook.AddressSets`). So an operator can author
+`address blocklist 10.0.1.0/24` AND `address-set blocklist { address other; }`
+in the same book with no commit error — and every place a name is resolved to
+prefixes checks `Addresses` before `AddressSets` (**address-first**: the
+dataplane `expandBookNameRecursive` / `nameRepresentability` /
+`capabilities`, and the host-inbound `junos_host_deny` compiler). The plain
+address therefore SILENTLY SHADOWS the same-named address-set: a deny built on
+the SET covers only the single address, so the set's other members leak (an
+under-block) — a security-relevant change to which traffic a rule covers, with
+no diagnostic (codex-review-182 M10, High).
+
+`validateAddressBookNameCollisionStrict` (`compiler_validate_strict_addrbook.go`,
+wired in `runEarlyStrictAndFolds` right after `validateAddressBookEntryNamesStrict`
+and BEFORE the zone-local fold — the same PRISTINE-book ordering constraint, so a
+global `address foo` and a *different* zone's zone-local `address-set foo`
+(genuinely distinct namespaces after the fold) are never misreported, and a real
+zone-local collision names the clean zone). It hard-rejects the collision on the
+strict commit / commit-check path — matching vSRX, which itself forbids a
+same-name `address` + `address-set` in one book (there is no vendor-defined
+precedence to honor). The tolerant load / peer-sync path
+(`opts.lenientAddressBookNameCollision`, #1960 no-brick) downgrades to a
+`cfg.Warnings` entry so an already-persisted or peer-synced config carrying a
+pre-existing collision still BOOTS — and keeps the **deterministic address-first
+winner** the runtime already used (`resolveAddressBookNameKind`, the single
+source of truth), so a leniently-loaded config forwards exactly as before rather
+than silently changing its dispositions on reload. Covered by
+`pkg/config/addr_set_namespace_5676_test.go` (global + zone-local reject,
+both config orderings, lenient-warn, deterministic-winner, namespace-aware
+absent-collision, non-colliding-commits), the strict-reject + lenient-warn cases
+RED on revert of the gate wiring.
+
 ## Multi-value leaves and bracketed lists (the dual-AST contract)
 
 A `multi: true` leaf with `children: nil` (e.g. `from protocol`,

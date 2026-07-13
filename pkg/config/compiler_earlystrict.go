@@ -24,6 +24,11 @@ import (
 //     #4340) — MUST run before the zone-local fold injects the `/`-bearing
 //     synthetic names. Strict on commit; downgraded to a warning on the
 //     tolerant lenientAddressBookNames path (#1960 no-brick).
+//     2b. validateAddressBookNameCollisionStrict on the PRISTINE books (#5676) —
+//     rejects a same-name `address` + `address-set` in one book (global or
+//     zone-local). Same pristine-book ordering constraint as (2): runs before
+//     the fold so a global vs a different-zone name are not misreported as a
+//     collision. Strict on commit; downgraded on lenientAddressBookNameCollision.
 //  3. resolveZoneLocalAddressBooks (MUT cfg.Security) — folds zone-local books
 //     into the global book under zone-qualified internal names. Output consumed
 //     non-locally by the P6b policy match-address validators.
@@ -81,6 +86,28 @@ func runEarlyStrictAndFolds(cfg *Config, opts compileOpts) error {
 		if opts.lenientAddressBookNames {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("address-book/zone name (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+	// #5676 — reject a same-name `address` + `address-set` collision within one
+	// address book (global or zone-local). The two kinds share one operator-
+	// visible namespace but land in separate maps, so a plain address silently
+	// shadowed a same-named address-set at name→prefix resolution (address-first
+	// everywhere), changing which traffic a permit/deny rule covers with no
+	// diagnostic. MUST run here, on the PRISTINE books BEFORE the zone-local fold
+	// mints synthetic zone-local/<zone>/<name> names — so a global `address foo`
+	// and a different zone's zone-local `address-set foo` (distinct namespaces
+	// post-fold) are not misreported as a collision, and a real zone-local
+	// collision is named against the clean zone. Strict on commit / commit-check
+	// (hard reject; Junos forbids the collision outright); tolerant load /
+	// peer-sync downgrade to a warning (#1960 no-brick — the runtime keeps the
+	// deterministic address-first winner it already used). Mirrors
+	// validateAddressBookEntryNamesStrict.
+	if err := validateAddressBookNameCollisionStrict(cfg); err != nil {
+		if opts.lenientAddressBookNameCollision {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("address-book name collision (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return err
 		}
