@@ -664,6 +664,24 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 	}
 }
 
+func appendPredefinedApplicationSetCompletions(out []config.SchemaCompletion) []config.SchemaCompletion {
+	emitted := make(map[string]struct{}, len(out)+len(config.PredefinedApplicationSets))
+	for _, candidate := range out {
+		emitted[candidate.Name] = struct{}{}
+	}
+	for name := range config.PredefinedApplicationSets {
+		if _, exists := emitted[name]; exists {
+			continue
+		}
+		out = append(out, config.SchemaCompletion{
+			Name: name,
+			Desc: "predefined application-set",
+		})
+		emitted[name] = struct{}{}
+	}
+	return out
+}
+
 func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
 	if s == nil || s.store == nil {
 		return nil
@@ -708,13 +726,13 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 		for name := range config.PredefinedApplications {
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintAppSetName:
 		var out []config.SchemaCompletion
 		for _, as := range cfg.Applications.ApplicationSets {
 			out = append(out, config.SchemaCompletion{Name: as.Name, Desc: "application-set"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintPoolName:
 		var out []config.SchemaCompletion
 		for name := range cfg.Security.NAT.SourcePools {
@@ -776,7 +794,7 @@ func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.Sc
 		for name := range config.PredefinedApplications {
 			out = append(out, config.SchemaCompletion{Name: name, Desc: "predefined"})
 		}
-		return out
+		return appendPredefinedApplicationSetCompletions(out)
 	case config.ValueHintPolicyName:
 		var policies []*config.Policy
 		for i, tok := range path {
