@@ -47986,3 +47986,48 @@ top.
   time.Minute` product turns the pathological cases RED — the products overflow
   non-positive (e.g. MaxInt64 → -1m0s, 200000000 → -1790762h...) and
   time.NewTicker panics "non-positive interval for NewTicker"; restored GREEN.
+
+- **Timestamp**: 2026-07-13 20:15 PDT
+  **Action**: Fix #5759 — make successful cold-boot host-inbound fallback
+  publication exactly `S'=D`, where `D=V||U4||U6` is computed from the same
+  zone-view and unzoned-address slices rendered into the fallback. The nft
+  transaction completes before Store; a fallback containing an address-scoped
+  DROP stores true, while a successful zero-drop table shell leaves false so a
+  later failed real invocation reaching host authorization can try its own
+  snapshot. The flag remains historical rather than proof of table presence,
+  generation coverage, or atomic kernel/Go publication. Added the exact
+  four-payload addressless-to-addressed proof and independent fresh-daemon IPv4
+  and IPv6 U-only proofs. Full-recompile DHCP classification runs serialized
+  `applyConfig`, but provides another opportunity only when the apply reaches
+  `applyTailReconciles`; a required protocol-gate error returns before that tail
+  with no cancellation closeout. This does not add callback-to-tail integration
+  coverage. #5789 retains generation/new-address ownership, #5790 teardown
+  sticky-state ownership, and #5791 management-only classification ownership.
+  Corrected that contract in `zones_host_inbound.go`, the daemon README, source
+  comments, and the host-inbound service matrix.
+  **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/daemon.go,
+  pkg/daemon/host_inbound_coldboot_fence_5644_test.go,
+  pkg/dataplane/userspace/zones_host_inbound.go, pkg/daemon/README.md,
+  docs/host-inbound-service-matrix.md, _Log.md
+  **Mutation RED**: with successful-fallback Store temporarily unconditional,
+  `go test -count=1 ./pkg/daemon -run
+  'TestColdBootZeroDropFenceRetriesAfterAddressAppears5759$'` failed at
+  `zero-drop fallback must leave state false`; that fatal assertion ended the
+  test before a fourth-payload observation. With the predicate temporarily
+  reduced to `S'=V`, `go test -count=1 ./pkg/daemon -run
+  'TestColdBootFenceUnzonedDropPublishesState5759$'` validated each exact
+  fallback payload, then both `ipv4` and `ipv6` rows failed at `successful
+  U-only fallback must publish true`. Restored `S'=V||U4||U6` before GREEN.
+  **GREEN**: with `TMPDIR`, `GOTMPDIR`, and `GOCACHE` under `/dev/shm`, the
+  required focused daemon fence/DHCP test command passed; `go test -race
+  -count=1 ./pkg/daemon -run
+  'Test(ColdBootZeroDropFenceRetriesAfterAddressAppears5759|ColdBootFenceUnzonedDropPublishesState5759)$'`
+  passed; the required protocol-gate/cancellation-closeout daemon command,
+  userspace view/unzoned-builder command, and DHCP `TestCommitLease` command all
+  passed. `go test -count=1 ./pkg/daemon/...`, `go vet ./pkg/daemon/...
+  ./pkg/dataplane/userspace/...`, and `go build ./...` passed. The first full
+  daemon run used a long `/dev/shm/xpf-5759-gotmp` path and failed only because
+  the event-stream test socket exceeded the Unix path limit (`connect: invalid
+  argument`); the isolated test and full daemon suite both passed after using
+  the shorter pre-created `/dev/shm/g5` path. Required documentation regex
+  guards and `git diff --check` passed.

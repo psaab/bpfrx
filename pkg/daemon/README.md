@@ -803,12 +803,13 @@ never lock an operator out of a remote box it manages.
   (b) RETH VRRP VIPs resolved from config (so the deny is scoped on the backup
   node too, where the VIP is not yet live). SLAAC is not a separate case: xpfd sets
   `IPv6AcceptRA=no` on every managed interface (`pkg/networkd`), so DHCPv6 is the
-  only IPv6 dynamic path and the live snapshot captures it. **Refresh:** the chain
-  is rebuilt on every commit and on every DHCP/DHCPv6 lease change on a dataplane
-  interface (`onDHCPAddressChange` → `dhcpLeaseChangeRequiresRecompile` →
-  `applyConfig` → `applyHostInboundFilter`), so a renewed/flapped lease re-scopes
-  the deny within one reconcile rather than staying fail-open until the next
-  commit. **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
+  only IPv6 dynamic path and the live snapshot captures it. **Refresh:** a
+  DHCP/DHCPv6 lease callback classified for full recompile runs serialized
+  `applyConfig`; the chain receives a second fence/re-render opportunity only if
+  that apply reaches `applyTailReconciles`. A required protocol-gate error can
+  return before that tail, leaving the address for a later applicable successful
+  reconcile. The management-only callback branch is a distinct #5791 limitation.
+  **Lifeline safety:** a zone with NO stanza emits no deny (admit-all);
   management/cluster-control interfaces (fxp0 / em0 / fab*) are excluded from
   the address sets so a host-inbound deny can never strand management or break
   HA; `ct state established,related` and IPv6 ND + v4/v6 PMTUD control messages

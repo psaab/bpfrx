@@ -290,18 +290,20 @@ set, so `BuildZoneHostInboundViews` emits no deny for it and
 `applyHostInboundFilter` scopes nothing. During that window, host-bound packets
 to a freshly-usable address on that interface can reach the kernel input path
 without the intended zone default-deny — a transient fail-open on a security
-boundary. The window **self-heals**: the DHCP lease-change and commit paths
-re-render the chain the moment an address appears (and VRRP VIPs are resolved
-from config, so a VIP-scoped zone is never in the window even on the backup
-node). An address-scoped nft deny cannot be installed without an address, so the
-window itself is accepted as unavoidable; #3698 makes it **observable** rather
+boundary. Address appearance makes the address available to a later snapshot;
+it does not itself prove that host-inbound re-rendered or reached the kernel. A
+later applicable full apply must reach host authorization and complete the nft
+transaction (VRRP VIPs remain resolved from config, so a VIP-scoped zone is not
+addressless even on the backup node). An address-scoped nft deny cannot be
+rendered without an address, so #3698 makes the window **observable** rather
 than silent.
 
 The SSOT for "which configured enforcing zones are currently in the window" is
 `dpuserspace.AddresslessEnforcingZones` (`pkg/dataplane/userspace/zones.go`). It
 reads the scoped/unscoped decision back from `BuildZoneHostInboundViews` — the
-same builder that drives the nft emission — so the signal can never disagree with
-what the daemon enforces. It reports a zone iff it has at least one **non-lifeline**
+same builder that drives the nft payload — so the signal describes the same
+address snapshot, not whether the later nft transaction succeeded. It reports a
+zone iff it has at least one **non-lifeline**
 interface assigned yet resolves no address; zones that are scoped, whose only
 interfaces are management/cluster-control lifelines (fxp0 / em0 / fab*), or that
 have no interfaces are deliberately NOT reported (low-noise).
@@ -310,8 +312,9 @@ Two observability surfaces consume it:
 
 - **State-transition log** (`daemon_nft.go`, `logHostInboundAddresslessTransitions`).
   A `WARN` is logged when a zone ENTERS the window and an `INFO` when it LEAVES
-  (an address appears). It logs only transitions — a zone that stays addressless
-  across repeated commits / DHCP renewals is logged once, not every apply.
+  (an address appears). These transitions describe the snapshot built before nft
+  success and are not installation proof. A zone that stays addressless across
+  repeated commits / DHCP renewals is logged once, not every apply.
 - **Prometheus gauge** `xpf_host_inbound_addressless_zones{zone}` (`pkg/api`).
   Value `1` per zone currently in the window; the series is absent when the zone
   is enforced. Emitted BEFORE the dataplane gate (config-derived, so it stays
@@ -321,27 +324,31 @@ Two observability surfaces consume it:
 ## Cold-boot fail-closed install fence (#5644, M37)
 
 `applyHostInboundFilter` loads the chain with `nft -f -`, which is **atomic**:
-on a load failure the kernel keeps the PREVIOUS `inet xpf_hostinbound` table
-untouched. That is the fail-closed guarantee behind #3333 — a failed day-2
-install retains the prior host-inbound default-deny, so a committed deny that did
-not reach the kernel never silently relaxes enforcement. **But that guarantee is
-day-2 only: on a COLD BOOT both nft tables are absent, so a failed install has no
-prior generation to retain.** The boot apply reaches `applyHostInboundFilter`
-through `applyConfig`, which only **logs and discards** the returned error
+on a load failure the kernel keeps the exact PREVIOUS `inet xpf_hostinbound`
+generation untouched, if one exists. That generation protects only rules and
+destinations already represented in it; it does not cover a newly appeared
+address (#5789). **On a COLD BOOT both nft tables are absent, so a failed install
+has no prior generation to retain.** A boot apply that reaches
+`applyHostInboundFilter` does so through `applyConfig`, which only **logs and
+discards** the returned error
 (a boot apply must not brick startup), so a cold-boot install failure would leave
 the host input path with **no** `xpf_hostinbound` chain — every host-bound service
 to a firewall-local address reachable with no host-inbound default-deny
 (fail-open) — while the daemon proceeds to publish host service / VIP / HA-ready.
 
-To close that window, a cold-boot install failure installs a **fail-closed
-DENY-ALL fence** before returning the error:
+To close that window when the rendered snapshot has addresses, a cold-boot
+install failure attempts a **fail-closed fallback** before returning the error.
+That fallback is DENY-ALL for every address in the snapshot; an addressless
+snapshot produces a zero-drop table shell:
 
-- `d.hostInboundEnforced` (a `Daemon` atomic bool) records whether a
-  host-inbound table (real ruleset OR fence) has loaded at least once this boot.
-  It is the cold-boot discriminator: on a real-install failure it is **false**
-  only when no table has ever loaded (cold boot, both tables absent); day-2 it is
-  **true**, so the atomic-load retention already covers the failure and NO fence
-  is installed (the prior real table stands — the normal path is bit-unchanged).
+- `d.hostInboundEnforced` (a `Daemon` atomic bool) is a process-local historical
+  fallback gate. A successful real load stores true, including a program-only
+  generation; a successful fallback stores true only when that exact fallback
+  contains an address-scoped DROP. Repeated successful zero-drop fallbacks leave
+  false. True proves neither current table presence nor coverage of current
+  addresses: program-only/new-address coverage remains #5789, and sticky true
+  after successful teardown remains #5790. nft completion and the following Go
+  Store are ordered but not one atomic publication.
 - `installHostInboundColdBootFence` / `buildHostInboundFencePayload`
   (`daemon_nft.go`) build the fence: the same atomic-replace `xpf_hostinbound`
   table reduced to the global mandatory admits (`ct established,related`, raw
@@ -354,23 +361,31 @@ DENY-ALL fence** before returning the error:
   are already lifeline-excluded (fxp0 / em0 / fab* and their addresses are
   subtracted by `BuildZoneHostInboundViews` / `BuildUnzonedHostInboundAddrs`), so
   the fence can **never** strand management or break HA.
-- The commit still **fails** (`applyHostInboundFilter` returns the wrapped nft
-  error, joined into the commit result) — the fence only closes the exposure; the
-  failed apply is what drives the retry. The next clean commit / re-render (or the
-  DHCP/VIP re-apply that already re-runs this path) replaces the fence with the
-  real ruleset and self-heals.
+- The requested apply still **fails** (`applyHostInboundFilter` returns the
+  wrapped real nft error, joined with a fallback error when fallback also fails).
+  A later full apply seeing an address gets another fallback opportunity only if
+  it reaches host authorization, the real load fails, and state remains false.
+  There is no host-inbound retry loop.
+- A DHCP/DHCPv6 lease callback classified for full recompile runs serialized
+  `applyConfig`, but classification does not prove host-inbound ran. A required
+  protocol-gate error returns before `applyTailReconciles` and receives no
+  cancellation closeout, leaving retry/re-render to a later applicable successful
+  reconcile that reaches the tail. The management-only classification branch is
+  the separate #5791 limitation.
 - If the fence **also** fails to load (nft itself broken), both errors are joined
   and an `ERROR`-level `COLD-BOOT FAIL-OPEN GUARD` log fires; `hostInboundEnforced`
   stays false. That is the irreducible catastrophic case — the daemon has done all
   it can short of holding forwarding.
 
-Relationship to the addressless window above: at the very first cold-boot apply an
-interface may have no address yet, so both the real ruleset AND the fence scope
-nothing — but with no address there is also no reachable host service, so there is
-no exposure, and the re-render on address-appearance re-runs this path (installing
-the fence if the real apply fails again). This is scoped to the **direct-host nft
-input authority** only; the AF_XDP transit arm / attach readiness is owned
-separately by #5275. Fail-on-revert proofs:
+Relationship to the addressless window above: at the first cold-boot apply an
+interface may have no address yet, so both the real ruleset and fallback can
+contain zero address-scoped DROPs. A successful zero-drop fallback leaves
+`hostInboundEnforced` false. Address appearance alone does not re-run this path;
+a later applicable full apply must reach host authorization, and a failed real
+load while state is false then renders another fallback from that invocation's
+snapshot. This is scoped to the **direct-host nft input authority** only; the
+AF_XDP transit arm / attach readiness is owned separately by #5275.
+Fail-on-revert proofs:
 `pkg/daemon/host_inbound_coldboot_fence_5644_test.go`.
 
 ### Per-interface / per-family refinement (#3710)
@@ -403,8 +418,9 @@ injected into the enforced deny from config regardless of link/lease state, so i
 never opens a per-interface window. Gating on a configured DHCP client (rather
 than "any family with no address") keeps the signal low-noise — an IPv4-only
 interface is **not** flagged as addressless in `inet6`, because it never intends
-to acquire a v6 address. The window self-heals the instant the lease lands, like
-the zone-level signal.
+to acquire a v6 address. A landed lease changes the next address snapshot; nft
+enforcement still depends on a later applicable reconcile reaching host
+authorization and completing its transaction.
 
 Two observability surfaces consume it (mirroring #3698):
 
