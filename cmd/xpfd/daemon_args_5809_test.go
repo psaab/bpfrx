@@ -247,6 +247,49 @@ func TestParseDaemonArgsHelpAndFlagOutput5809(t *testing.T) {
 	}
 }
 
+func TestParseDaemonArgsSemanticOutput5809(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{
+			name: "zero without explicit enable",
+			args: []string{"--cold-path-sample-mask=0"},
+			wantErr: "--cold-path-sample-mask=0 requires explicit " +
+				"--enable-cold-path-1-in-1-sampling (256× CPU cost — " +
+				"bounded-cohort microbench only)",
+		},
+		{
+			name: "non power minus one",
+			args: []string{"--cold-path-sample-mask=2"},
+			wantErr: "--cold-path-sample-mask=0x2: must be a power-of-two " +
+				"minus one (0x1, 0x3, 0x7, 0xff, 0x3ff, ..., 0x7fff_ffff_ffff_ffff) " +
+				"or 0 with --enable-cold-path-1-in-1-sampling. Rejecting " +
+				"u64::MAX as ambiguous.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := parseDaemonArgs(daemonTestName5809, tt.args)
+			if result.kind != daemonResultSemanticError || result.err == nil || result.err.Error() != tt.wantErr {
+				t.Fatalf("semantic result = kind %d, err %q; want %q", result.kind, result.err, tt.wantErr)
+			}
+			if result.flagOutput != "" {
+				t.Fatalf("flagOutput = %q, want empty", result.flagOutput)
+			}
+			var reported bytes.Buffer
+			if code := reportDaemonResult(&reported, result); code != 1 {
+				t.Fatalf("report code = %d, want 1", code)
+			}
+			if got := reported.String(); got != "xpfd: "+tt.wantErr+"\n" {
+				t.Fatalf("reported = %q, want %q", got, "xpfd: "+tt.wantErr+"\n")
+			}
+		})
+	}
+}
+
 func TestParseDaemonArgsRemainders5809(t *testing.T) {
 	tests := []struct {
 		name      string
