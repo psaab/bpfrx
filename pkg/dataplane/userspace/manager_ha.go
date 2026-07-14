@@ -344,17 +344,15 @@ func (m *Manager) takeoverReadyLocked() (bool, []string) {
 		}
 		reasons = append(reasons, reason)
 	}
-	// Gate on the LOCAL event-stream listener being bound — the channel over
-	// which the helper streams post-bootstrap session open/close/update deltas
-	// to the peer. A bind failure (path-too-long, EADDRINUSE, permission) means
-	// this node can never feed a standby its session deltas, so it must not be
-	// advertised takeover-ready even when the control socket, ping, forwarding
-	// arm, and XSK liveness all look healthy (#5273). This gates on the listener
-	// being UP (able to SERVE deltas), NOT on a peer/helper having connected
-	// (IsConnected) — a healthy single node with no peer yet is legitimately
-	// takeover-ready. ensureProcessLocked already fails bring-up when the listener
-	// cannot bind, so a running proc normally has a bound stream; this is the
-	// defense-in-depth gate that keeps the readiness contract explicit.
+	// Gate on the LOCAL event-stream listener being bound — the primary push
+	// channel from the local helper into the daemon's peer-sync pipeline. A bind
+	// failure (path-too-long, EADDRINUSE, permission) must not be accepted as a
+	// healthy startup merely because the slower DrainSessionDeltas polling
+	// fallback exists (#5273). This gates on the listener being UP, not on the
+	// local helper currently being connected (IsConnected): transient stream
+	// disconnects are covered by polling. ensureProcessLocked already fails
+	// bring-up when the listener cannot bind, so a running proc normally has a
+	// bound stream; this defense-in-depth gate keeps that contract explicit.
 	if m.eventStream == nil || !m.eventStream.ListenerBound() {
 		reasons = append(reasons, "userspace event stream listener not bound")
 	}

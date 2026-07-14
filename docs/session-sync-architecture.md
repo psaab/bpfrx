@@ -532,21 +532,24 @@ Resume frames throttle the stream. The DrainRequest / DrainComplete frame pair
 is **reserved and currently dormant** — see below.
 
 The daemon owns the listener; `EventStream.Start` binds it (`net.Listen`) before
-the helper is spawned so the helper can dial immediately. Because this socket is
-the ONLY channel for post-bootstrap session deltas, a bind failure (path too
-long, `EADDRINUSE`, permission, missing directory) fail-closes the whole
-dataplane bring-up: `Start` returns an error, `ensureProcessLocked` aborts before
-launching the helper instead of storing a non-nil-but-dead stream, and takeover
-readiness is denied. `EventStream.ListenerBound()` reports whether the local
-listener is up (the node can *serve* deltas) and is distinct from
-`IsConnected()` (a helper/peer has *dialed in*). Takeover readiness gates on
-`ListenerBound()`, NOT `IsConnected()`, so a healthy node that has not yet had a
-peer connect is still takeover-ready, while a node whose delta channel never
-bound is not (#5273). Before #5273 the `net.Listen` failure was logged and
-swallowed with a void `Start`, so the manager kept the dead stream and takeover
-readiness — which only checked the control socket, ping, forwarding-arm, and XSK
-liveness — advertised a locally-healthy but session-starved node that would leave
-a standby with stale sessions after failover.
+the helper is spawned so the local helper can dial immediately. This socket is
+the primary push channel for post-bootstrap deltas from the helper into the
+daemon's peer-sync pipeline. The daemon also polls `DrainSessionDeltas` while
+the stream is disconnected (the fallback described below), but a listener bind
+failure must not silently make that degraded path the startup baseline. A bind
+failure (path too long, `EADDRINUSE`, permission, missing directory) therefore
+fail-closes dataplane bring-up: `Start` returns an error,
+`ensureProcessLocked` aborts before launching the helper instead of storing a
+non-nil-but-dead stream, and takeover readiness is denied.
+`EventStream.ListenerBound()` reports whether the local listener is up and is
+distinct from `IsConnected()` (the local helper has dialed in). Takeover
+readiness gates on `ListenerBound()`, not `IsConnected()`: transient helper
+disconnects are covered by polling, while a listener that never bound is a
+failed dependency rather than an accepted degraded startup (#5273). Before
+#5273 the `net.Listen` failure was logged and swallowed with a void `Start`, so
+the manager kept the dead stream and takeover readiness — which only checked
+the control socket, ping, forwarding-arm, and XSK liveness — could advertise a
+node without its primary delta stream.
 
 #### DrainRequest fence (#2876, #2920) — RESERVED / DORMANT
 

@@ -52,11 +52,12 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	_ = os.Remove(evtPath)
 	es := NewEventStream(evtPath)
 	esCtx, esCancel := context.WithCancel(context.Background())
-	// The event socket carries every post-bootstrap session delta the helper
-	// streams to the peer. If its listener fails to bind we cannot serve a
-	// standby, so fail the whole bring-up here — BEFORE spawning the helper —
-	// rather than storing a non-nil-but-dead stream that takeoverReadyLocked
-	// would then wave through as healthy (#5273).
+	// The event socket is the primary push path for post-bootstrap session
+	// deltas from the local helper to the daemon. If its listener fails to bind,
+	// fail the whole bring-up here — BEFORE spawning the helper — rather than
+	// silently starting in the slower DrainSessionDeltas polling fallback with a
+	// non-nil-but-dead stream that takeoverReadyLocked would wave through as
+	// healthy (#5273).
 	if err := es.Start(esCtx); err != nil {
 		esCancel()
 		es.Close()

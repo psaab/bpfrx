@@ -167,10 +167,12 @@ func (es *EventStream) dataplaneCallbacks() (func(uint64, []byte), func(uint64, 
 //
 // It returns an error when net.Listen fails (path-too-long, EADDRINUSE,
 // permission, missing directory). The failure is NOT swallowed: the event
-// socket is the ONLY channel over which the helper streams post-bootstrap
-// session open/close/update deltas to the peer, so a bind failure means the
-// node can never serve a standby. The caller must treat a Start error as a
-// failed bring-up rather than storing a non-nil-but-dead stream (#5273).
+// socket is the primary push channel over which the local helper streams
+// post-bootstrap session open/close/update deltas to the daemon. Although the
+// daemon can poll DrainSessionDeltas while the stream is disconnected, a node
+// must not silently start in that degraded fallback state. The caller therefore
+// treats a Start error as a failed bring-up rather than storing a
+// non-nil-but-dead stream (#5273).
 func (es *EventStream) Start(ctx context.Context) error {
 	_ = os.Remove(es.socketPath)
 	ln, err := net.Listen("unix", es.socketPath)
@@ -187,11 +189,12 @@ func (es *EventStream) Start(ctx context.Context) error {
 
 // ListenerBound reports whether the event-stream listener socket successfully
 // bound (net.Listen in Start() succeeded and Close() has not run). It is TRUE
-// as soon as the daemon can SERVE session deltas — independent of whether a
-// helper/peer has yet dialed in (that is IsConnected). HA takeover-readiness
-// gates on ListenerBound, not IsConnected, so a healthy node with no peer
-// connected yet is still takeover-ready while a node whose delta channel never
-// bound is not (#5273).
+// as soon as the daemon can receive the local helper's session deltas,
+// independent of whether that helper has dialed in (that is IsConnected). HA
+// takeover-readiness gates on ListenerBound, not IsConnected: transient stream
+// disconnects use the DrainSessionDeltas polling fallback, while a listener
+// that never bound is a failed dependency rather than an accepted startup
+// state (#5273).
 func (es *EventStream) ListenerBound() bool {
 	return es.listening.Load()
 }

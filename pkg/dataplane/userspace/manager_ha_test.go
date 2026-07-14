@@ -189,14 +189,15 @@ func TestTakeoverReadyAllowsStandbyWithReadyBindingsWithoutLivenessProof(t *test
 
 // TestTakeoverReadyRequiresEventStreamListenerBound is the #5273 regression:
 // takeover-readiness must gate on the LOCAL event-stream listener being bound
-// (the node can serve session deltas), NOT on a peer having connected. A node
-// whose listener failed to bind is session-starved for a standby and must not be
-// advertised takeover-ready; a healthy node with no peer yet must NOT be blocked.
+// (the daemon can accept local-helper session deltas), NOT on the helper having
+// connected. A node whose listener failed to bind must not be advertised
+// takeover-ready. A bound listener with the local helper temporarily disconnected
+// must NOT be blocked because the daemon polls deltas as fallback.
 //
 // RED-on-revert: removing the ListenerBound() gate in takeoverReadyLocked makes
 // the ListenerBindFailed sub-case report ready=true (every other gate passes),
 // while the two ListenerBound sub-cases stay green either way — proving the gate
-// keys on listener-up, not peer-connected.
+// keys on listener-up, not helper-connected.
 func TestTakeoverReadyRequiresEventStreamListenerBound(t *testing.T) {
 	newHealthyManager := func() *Manager {
 		return &Manager{
@@ -229,19 +230,19 @@ func TestTakeoverReadyRequiresEventStreamListenerBound(t *testing.T) {
 		}
 	})
 
-	t.Run("ListenerBoundNoPeer", func(t *testing.T) {
+	t.Run("ListenerBoundHelperDisconnected", func(t *testing.T) {
 		es := boundEventStream(t)
 		if es.IsConnected() {
-			t.Fatal("precondition: no peer should be connected yet")
+			t.Fatal("precondition: local helper should not be connected yet")
 		}
 		m := newHealthyManager()
 		m.eventStream = es
 		if ready, reasons := m.TakeoverReady(); !ready {
-			t.Fatalf("TakeoverReady() = false for a healthy peerless node, want true; reasons=%v", reasons)
+			t.Fatalf("TakeoverReady() = false with the helper disconnected, want true; reasons=%v", reasons)
 		}
 	})
 
-	t.Run("ListenerBoundPeerConnected", func(t *testing.T) {
+	t.Run("ListenerBoundHelperConnected", func(t *testing.T) {
 		es := boundEventStream(t)
 		conn, err := net.Dial("unix", es.socketPath)
 		if err != nil {
@@ -251,14 +252,14 @@ func TestTakeoverReadyRequiresEventStreamListenerBound(t *testing.T) {
 		deadline := time.Now().Add(2 * time.Second)
 		for !es.IsConnected() {
 			if time.Now().After(deadline) {
-				t.Fatal("peer did not connect to event stream")
+				t.Fatal("local helper did not connect to event stream")
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
 		m := newHealthyManager()
 		m.eventStream = es
 		if ready, reasons := m.TakeoverReady(); !ready {
-			t.Fatalf("TakeoverReady() = false with peer connected, want true; reasons=%v", reasons)
+			t.Fatalf("TakeoverReady() = false with helper connected, want true; reasons=%v", reasons)
 		}
 	})
 }
