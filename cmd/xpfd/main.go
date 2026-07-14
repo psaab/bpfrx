@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -45,6 +46,40 @@ const (
 	cmdCheckConfig
 	cmdUnknown
 )
+
+type daemonResultKind uint8
+
+const (
+	daemonResultOK daemonResultKind = iota
+	daemonResultHelp
+	daemonResultFlagError
+	daemonResultRemainderError
+	daemonResultSemanticError
+	daemonResultFactoryError
+	daemonResultRunError
+)
+
+type daemonFlags struct {
+	configFile         string
+	noDataplane        bool
+	apiAddr            string
+	grpcAddr           string
+	debug              bool
+	coldPathSampleMask *uint64
+}
+
+type daemonResult struct {
+	kind       daemonResultKind
+	flags      daemonFlags
+	err        error
+	flagOutput string
+}
+
+type daemonRunner interface {
+	Run(context.Context) error
+}
+
+type daemonFactory func(daemon.Options) (daemonRunner, error)
 
 // classifyCommand maps a full argv (os.Args) to the top-level subcommand it
 // selects, WITHOUT executing any side effects. It is the single source of
@@ -329,11 +364,27 @@ func main() {
 	}
 
 	// cmdDaemon: no recognized subcommand — parse the daemon flags and run.
-	configFile := flag.String("config", "/etc/xpf/xpf.conf", "configuration file path")
-	noDataplane := flag.Bool("no-dataplane", false, "run without a dataplane (config-only mode)")
-	apiAddr := flag.String("api-addr", "127.0.0.1:8080", "HTTP API listen address (empty to disable)")
-	grpcAddr := flag.String("grpc-addr", "127.0.0.1:50051", "gRPC API listen address")
-	debug := flag.Bool("debug", false, "enable debug logging")
+	result := runDaemon(os.Args[0], os.Args[1:], version, os.Stderr, newDaemon)
+	if code := reportDaemonResult(os.Stderr, result); code != 0 {
+		os.Exit(code)
+	}
+}
+
+func parseDaemonArgs(name string, args []string) daemonResult {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	var flagOutput bytes.Buffer
+	fs.SetOutput(&flagOutput)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage of %s:\n", name)
+		fs.PrintDefaults()
+	}
+
+	var flags daemonFlags
+	fs.StringVar(&flags.configFile, "config", "/etc/xpf/xpf.conf", "configuration file path")
+	fs.BoolVar(&flags.noDataplane, "no-dataplane", false, "run without a dataplane (config-only mode)")
+	fs.StringVar(&flags.apiAddr, "api-addr", "127.0.0.1:8080", "HTTP API listen address (empty to disable)")
+	fs.StringVar(&flags.grpcAddr, "grpc-addr", "127.0.0.1:50051", "gRPC API listen address")
+	fs.BoolVar(&flags.debug, "debug", false, "enable debug logging")
 	// #1620: cold-path latency histogram sample mask. Default 0xff
 	// = 1-in-256 sampling. Powers-of-two-minus-one only. For 1-in-1
 	// sampling (256× CPU cost — bounded-cohort microbench only),
@@ -342,17 +393,35 @@ func main() {
 		flagColdPathSampleMask = "cold-path-sample-mask"
 		flagColdPath1in1       = "enable-cold-path-1-in-1-sampling"
 	)
-	coldPathSampleMask := flag.Uint64(flagColdPathSampleMask, 0xff,
+	coldPathSampleMask := fs.Uint64(flagColdPathSampleMask, 0xff,
 		"Cold-path latency histogram sample mask (powers-of-two minus one). "+
 			"Default 0xff = 1-in-256 sampling. Allowed values: 0x1, 0x3, 0x7, "+
 			"0xff, 0x3ff, ..., 0x7fffffffffffffff. For 1-in-1 sampling (256× "+
 			"CPU cost — bounded-cohort microbench only), use "+
 			"--enable-cold-path-1-in-1-sampling.")
-	enableColdPath1in1 := flag.Bool(flagColdPath1in1, false,
+	enableColdPath1in1 := fs.Bool(flagColdPath1in1, false,
 		"Enable 1-in-1 cold-path latency sampling (256× CPU cost). "+
 			"Required for bounded-cohort microbench (#1622); never use in "+
 			"production. Overrides --cold-path-sample-mask to 0.")
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		kind := daemonResultFlagError
+		if errors.Is(err, flag.ErrHelp) {
+			kind = daemonResultHelp
+		}
+		return daemonResult{
+			kind:       kind,
+			err:        err,
+			flagOutput: flagOutput.String(),
+		}
+	}
+	if fs.NArg() != 0 {
+		return daemonResult{
+			kind: daemonResultRemainderError,
+			err: fmt.Errorf("unexpected argument(s) %q; "+
+				"subcommands must be the first argument; usage: %s [daemon flags]",
+				fs.Args(), name),
+		}
+	}
 
 	// #1620: validate the cold-path sample mask. Two-flag scheme per
 	// plan v4 §4.3.
@@ -362,66 +431,106 @@ func main() {
 	}
 	// AGY r3 [MED-2] + Codex r3: reject mask=0 unless explicit 1-in-1.
 	if effectiveMask == 0 && !*enableColdPath1in1 {
-		fmt.Fprintf(os.Stderr,
-			"xpfd: --cold-path-sample-mask=0 requires explicit "+
-				"--enable-cold-path-1-in-1-sampling (256× CPU cost — "+
-				"bounded-cohort microbench only)\n")
-		os.Exit(1)
+		return daemonResult{
+			kind: daemonResultSemanticError,
+			err: errors.New("--cold-path-sample-mask=0 requires explicit " +
+				"--enable-cold-path-1-in-1-sampling (256× CPU cost — " +
+				"bounded-cohort microbench only)"),
+		}
 	}
 	// Codex r2 MED + Codex r3 + AGY r3: validate pow-of-2-minus-1 for
 	// non-zero masks. u64::MAX (next wraps to 0) is rejected.
 	if effectiveMask != 0 {
 		next := effectiveMask + 1 // uint64; Go-defined wrap to 0 if MAX
 		if next == 0 || (effectiveMask&next) != 0 {
-			fmt.Fprintf(os.Stderr,
-				"xpfd: --cold-path-sample-mask=0x%x: must be a power-of-two "+
+			return daemonResult{
+				kind: daemonResultSemanticError,
+				err: fmt.Errorf("--cold-path-sample-mask=0x%x: must be a power-of-two "+
 					"minus one (0x1, 0x3, 0x7, 0xff, 0x3ff, ..., 0x7fff_ffff_ffff_ffff) "+
 					"or 0 with --enable-cold-path-1-in-1-sampling. Rejecting "+
-					"u64::MAX as ambiguous.\n",
-				effectiveMask)
-			os.Exit(1)
+					"u64::MAX as ambiguous.", effectiveMask),
+			}
 		}
 	}
 	// Forward the validated mask to the daemon only when the operator
 	// explicitly provided a cold-path flag. nil means "use the
 	// userspace-dp built-in default" so older daemons that omit the
 	// flag never accidentally serialize 0 and trigger 1-in-1 sampling.
-	var coldPathMaskPtr *uint64
-	flag.Visit(func(f *flag.Flag) {
+	fs.Visit(func(f *flag.Flag) {
 		if f.Name == flagColdPathSampleMask || f.Name == flagColdPath1in1 {
 			m := effectiveMask
-			coldPathMaskPtr = &m
+			flags.coldPathSampleMask = &m
 		}
 	})
 
+	return daemonResult{kind: daemonResultOK, flags: flags}
+}
+
+func runDaemon(
+	name string,
+	args []string,
+	buildVersion string,
+	logOutput io.Writer,
+	factory daemonFactory,
+) daemonResult {
+	result := parseDaemonArgs(name, args)
+	if result.kind != daemonResultOK {
+		return result
+	}
+
 	// Set up structured logging
 	logLevel := slog.LevelInfo
-	if *debug {
+	if result.flags.debug {
 		logLevel = slog.LevelDebug
 	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+	slog.SetDefault(slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{
 		Level: logLevel,
 	})))
 
-	d, err := daemon.New(daemon.Options{
-		ConfigFile:         *configFile,
-		NoDataplane:        *noDataplane,
-		APIAddr:            *apiAddr,
-		GRPCAddr:           *grpcAddr,
-		Version:            version,
-		ColdPathSampleMask: coldPathMaskPtr,
+	runner, err := factory(daemon.Options{
+		ConfigFile:         result.flags.configFile,
+		NoDataplane:        result.flags.noDataplane,
+		APIAddr:            result.flags.apiAddr,
+		GRPCAddr:           result.flags.grpcAddr,
+		Version:            buildVersion,
+		ColdPathSampleMask: result.flags.coldPathSampleMask,
 	})
 	if err != nil {
 		// #1893: fail closed — a daemon that cannot persist config must
 		// not boot pretending otherwise.
-		fmt.Fprintf(os.Stderr, "xpfd: %v\n", err)
-		os.Exit(1)
+		return daemonResult{kind: daemonResultFactoryError, flags: result.flags, err: err}
 	}
 
-	if err := d.Run(context.Background()); err != nil {
-		fmt.Fprintf(os.Stderr, "xpfd: %v\n", err)
-		os.Exit(1)
+	if err := runner.Run(context.Background()); err != nil {
+		return daemonResult{kind: daemonResultRunError, flags: result.flags, err: err}
 	}
+	return result
+}
+
+func reportDaemonResult(w io.Writer, result daemonResult) int {
+	switch result.kind {
+	case daemonResultOK:
+		return 0
+	case daemonResultHelp:
+		_, _ = io.WriteString(w, result.flagOutput)
+		return 0
+	case daemonResultFlagError:
+		_, _ = io.WriteString(w, result.flagOutput)
+		return 2
+	case daemonResultRemainderError,
+		daemonResultSemanticError,
+		daemonResultFactoryError,
+		daemonResultRunError:
+		fmt.Fprintf(w, "xpfd: %v\n", result.err)
+		return 1
+	default:
+		fmt.Fprintf(w, "xpfd: invalid daemon result kind %d\n", result.kind)
+		return 1
+	}
+}
+
+func newDaemon(opts daemon.Options) (daemonRunner, error) {
+	return daemon.New(opts)
 }
 
 // parseCleanupArgs validates the operands of `xpfd cleanup`. The verb takes no
