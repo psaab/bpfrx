@@ -541,6 +541,15 @@ failure (path too long, `EADDRINUSE`, permission, missing directory) therefore
 fail-closes dataplane bring-up: `Start` returns an error,
 `ensureProcessLocked` aborts before launching the helper instead of storing a
 non-nil-but-dead stream, and takeover readiness is denied.
+`Start` first acquires a nonblocking process-lifetime sidecar lock. While it
+owns that lock it checks `/proc/net/unix` and removes an existing filesystem
+socket only when the kernel table proves there is no live owner. This check is
+non-invasive: dialing the old listener would displace its real helper because
+the event stream permits one connection. A live or inconclusive owner is never
+unlinked. `Close` tears down the listener and accepted connection, removes the
+socket only when that `EventStream` owns it, and then releases the lock. This
+makes active-owner collisions fail closed rather than detaching the first
+daemon's pathname.
 `EventStream.ListenerBound()` reports whether the local listener is up and is
 distinct from `IsConnected()` (the local helper has dialed in). Takeover
 readiness gates on `ListenerBound()`, not `IsConnected()`: transient helper

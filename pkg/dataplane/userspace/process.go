@@ -49,7 +49,6 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	if evtPath == "" {
 		evtPath = filepath.Join(filepath.Dir(cfg.ControlSocket), "userspace-dp-events.sock")
 	}
-	_ = os.Remove(evtPath)
 	es := NewEventStream(evtPath)
 	esCtx, esCancel := context.WithCancel(context.Background())
 	// The event socket is the primary push path for post-bootstrap session

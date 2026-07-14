@@ -47990,14 +47990,18 @@ top.
 - **Timestamp**: 2026-07-10
   **Action**: #5273 [HIGH dataplane/HA] pkg/dataplane/userspace: fail closed
   event-stream listener startup and HA takeover readiness. `EventStream.Start`
-  now returns a `net.Listen` error and exposes the local listener lifecycle via
-  `ListenerBound`; `ensureProcessLocked` aborts before helper spawn when the
-  listener cannot bind; and `takeoverReadyLocked` requires the local listener
-  to be bound without requiring the local helper to remain connected. This
+  now returns listener-ownership/bind errors, serializes socket ownership with
+  a process-lifetime sidecar lock, removes only kernel-table-proven stale socket
+  artifacts without dialing/displacing a live helper, and exposes the local
+  listener lifecycle via `ListenerBound`;
+  `ensureProcessLocked` aborts before helper spawn when the listener cannot
+  bind; and `takeoverReadyLocked` requires the local listener to be bound
+  without requiring the local helper to remain connected. This
   prevents a node from silently starting without its primary push stream while
   preserving the existing `DrainSessionDeltas` polling fallback for transient
   disconnects. Fail-on-revert tests cover bind failure, listener lifecycle,
-  and failed/bound-disconnected/bound-connected readiness.
+  competing-owner isolation, stale-socket recovery, and
+  failed/bound-disconnected/bound-connected readiness.
   **File(s)**: pkg/dataplane/userspace/eventstream.go,
   pkg/dataplane/userspace/process.go,
   pkg/dataplane/userspace/manager_ha.go,

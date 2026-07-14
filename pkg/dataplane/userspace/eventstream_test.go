@@ -706,7 +706,7 @@ func TestFrameRoundTrip(t *testing.T) {
 }
 
 // TestEventStreamStartReturnsErrorOnListenFailure verifies that a failed
-// net.Listen surfaces an error from Start() rather than being logged and
+// listener setup surfaces an error from Start() rather than being logged and
 // swallowed, and that ListenerBound() stays false so callers can refuse to
 // treat the stream as healthy (#5273). Binding a socket inside a non-existent
 // directory reliably fails with ENOENT.
@@ -743,6 +743,117 @@ func TestEventStreamListenerBoundReflectsLifecycle(t *testing.T) {
 	if es.ListenerBound() {
 		t.Fatal("ListenerBound() = true after Close, want false")
 	}
+}
+
+// TestEventStreamListenerOwnershipIsFailClosed proves that a competing daemon
+// cannot unlink or replace a live listener. The contender fails on the
+// process-lifetime sidecar lock, and even an explicit Close on that non-owner
+// leaves the first listener reachable. Once the owner closes, the lock is
+// released and the path can be acquired again (#5273).
+func TestEventStreamListenerOwnershipIsFailClosed(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "events.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	owner := NewEventStream(socketPath)
+	if err := owner.Start(ctx); err != nil {
+		t.Fatalf("owner Start: %v", err)
+	}
+	defer owner.Close()
+
+	contender := NewEventStream(socketPath)
+	if err := contender.Start(ctx); err == nil {
+		contender.Close()
+		t.Fatal("contender Start = nil, want ownership error")
+	}
+	contender.Close()
+	if contender.ListenerBound() {
+		t.Fatal("contender ListenerBound = true after rejected Start")
+	}
+
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatalf("owner listener was unlinked by contender cleanup: %v", err)
+	}
+	_ = conn.Close()
+
+	owner.Close()
+	replacement := NewEventStream(socketPath)
+	if err := replacement.Start(ctx); err != nil {
+		t.Fatalf("replacement Start after owner Close: %v", err)
+	}
+	replacement.Close()
+}
+
+// TestEventStreamStartDoesNotDialLegacyLiveOwner covers a mixed-version owner
+// that predates the sidecar lock. Kernel-table inspection must reject its live
+// socket without dialing it: a dial would be accepted as a replacement helper
+// and disconnect the old daemon's real helper connection.
+func TestEventStreamStartDoesNotDialLegacyLiveOwner(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "events.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("legacy listener: %v", err)
+	}
+	defer listener.Close()
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type = %T, want *net.UnixListener", listener)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	contender := NewEventStream(socketPath)
+	if err := contender.Start(ctx); err == nil {
+		contender.Close()
+		t.Fatal("Start against legacy live owner = nil, want ownership error")
+	}
+	contender.Close()
+
+	if err := unixListener.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	conn, err := unixListener.Accept()
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("legacy listener accepted a liveness-probe connection")
+	}
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("legacy Accept error = %v, want timeout with no probe connection", err)
+	}
+	if _, err := os.Lstat(socketPath); err != nil {
+		t.Fatalf("contender removed legacy owner's socket: %v", err)
+	}
+}
+
+// TestEventStreamStartReclaimsProvenStaleSocket keeps crash recovery intact:
+// an orphaned socket inode with no accepting listener is removed only after the
+// ownership lock is held and the kernel socket table proves no live owner.
+func TestEventStreamStartReclaimsProvenStaleSocket(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "events.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("seed stale listener: %v", err)
+	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listener type = %T, want *net.UnixListener", listener)
+	}
+	unixListener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close stale listener: %v", err)
+	}
+	if _, err := os.Lstat(socketPath); err != nil {
+		t.Fatalf("stale socket precondition: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es := NewEventStream(socketPath)
+	if err := es.Start(ctx); err != nil {
+		t.Fatalf("Start with proven stale socket: %v", err)
+	}
+	es.Close()
 }
 
 func TestEventStreamAcceptAndRead(t *testing.T) {
