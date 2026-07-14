@@ -502,32 +502,29 @@ func NewServer(cfg Config) *Server {
 	// System actions
 	mux.HandleFunc("POST /api/v1/system/action", s.systemActionHandler)
 
-	var handler http.Handler = mux
 	// #5055: guard the mutation surface against cross-site credentialed requests
 	// (CSRF via browser-ambient Basic auth). This wraps the mux BEFORE auth so it
 	// applies to every mutation route whether or not auth is configured; a
 	// request that clears auth then hits this guard, so an attacker holding
 	// ambient Basic credentials is still blocked from driving a state change from
 	// a cross-site page. Safe methods and header-key/Bearer clients are unaffected.
-	handler = mutationCrossSiteGuard(handler)
-	if cfg.Auth != nil {
-		// #4162 (auth posture): /metrics is unauthenticated by default, which
-		// is the standard Prometheus posture and safe on the loopback default
-		// bind (127.0.0.1). But when web-management rebinds the HTTP API to a
-		// routable management interface (daemon_run.go resolveInterfaceAddr),
-		// an unauthenticated /metrics becomes remotely reachable. When auth is
-		// configured AND the bind is non-loopback, require credentials for
-		// /metrics too. A routable-interface Prometheus scraper must then
-		// present the configured API key / basic-auth, same as every other
-		// endpoint (documented in docs/architecture.md). /health stays exempt
-		// (it exposes no table walk and no sensitive data).
-		metricsRequireAuth := !isLoopbackBindAddr(cfg.Addr)
-		handler = authMiddleware(*cfg.Auth, metricsRequireAuth, handler)
+	sharedBase := mutationCrossSiteGuard(mux)
+	// #4162: auth policy belongs to the listener that accepted the request.
+	// Keep one mux/collector/CSRF base so HTTP and HTTPS share the scrape
+	// limiter and session-gauge cache, then derive an auth wrapper from each
+	// listener's configured bind independently. Never infer this from r.Host
+	// or the sibling listener: only a literal loopback bind leaves /metrics
+	// open when auth is configured. /health remains exempt in authMiddleware.
+	listenerHandler := func(addr string) http.Handler {
+		if cfg.Auth == nil {
+			return sharedBase
+		}
+		return authMiddleware(*cfg.Auth, !isLoopbackBindAddr(addr), sharedBase)
 	}
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           handler,
+		Handler:           listenerHandler(cfg.Addr),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
@@ -544,7 +541,7 @@ func NewServer(cfg Config) *Server {
 		} else {
 			s.httpsServer = &http.Server{
 				Addr:              cfg.HTTPSAddr,
-				Handler:           handler,
+				Handler:           listenerHandler(cfg.HTTPSAddr),
 				ReadHeaderTimeout: apiReadHeaderTimeout,
 				ReadTimeout:       apiReadTimeout,
 				IdleTimeout:       apiIdleTimeout,
