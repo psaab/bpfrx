@@ -52,7 +52,7 @@ type EventStream struct {
 
 	// listening is TRUE once net.Listen on the event socket succeeded in
 	// Start(), and FALSE again after Close(). It records whether the daemon
-	// can SERVE session deltas to a helper — the local listener is bound —
+	// can ACCEPT session deltas from a helper — the local listener is bound —
 	// which is distinct from `connected` below (a helper has dialed in). HA
 	// takeover-readiness gates on this: a node whose delta channel never bound
 	// must not advertise itself able to feed a standby after failover (#5273).
