@@ -31,22 +31,21 @@ func (r *recordingDaemonRunner5809) Run(ctx context.Context) error {
 }
 
 func daemonUsageGolden5809(name string) string {
-	return fmt.Sprintf(`Usage of %s:
-  -api-addr string
-    	HTTP API listen address (empty to disable) (default "127.0.0.1:8080")
-  -cold-path-sample-mask uint
-    	Cold-path latency histogram sample mask (powers-of-two minus one). Default 0xff = 1-in-256 sampling. Allowed values: 0x1, 0x3, 0x7, 0xff, 0x3ff, ..., 0x7fffffffffffffff. For 1-in-1 sampling (256× CPU cost — bounded-cohort microbench only), use --enable-cold-path-1-in-1-sampling. (default 255)
-  -config string
-    	configuration file path (default "/etc/xpf/xpf.conf")
-  -debug
-    	enable debug logging
-  -enable-cold-path-1-in-1-sampling
-    	Enable 1-in-1 cold-path latency sampling (256× CPU cost). Required for bounded-cohort microbench (#1622); never use in production. Overrides --cold-path-sample-mask to 0.
-  -grpc-addr string
-    	gRPC API listen address (default "127.0.0.1:50051")
-  -no-dataplane
-    	run without a dataplane (config-only mode)
-`, name)
+	return fmt.Sprintf("Usage of %s:\n"+
+		"  -api-addr string\n"+
+		"    \tHTTP API listen address (empty to disable) (default \"127.0.0.1:8080\")\n"+
+		"  -cold-path-sample-mask uint\n"+
+		"    \tCold-path latency histogram sample mask (powers-of-two minus one). Default 0xff = 1-in-256 sampling. Allowed values: 0x1, 0x3, 0x7, 0xff, 0x3ff, ..., 0x7fffffffffffffff. For 1-in-1 sampling (256× CPU cost — bounded-cohort microbench only), use --enable-cold-path-1-in-1-sampling. (default 255)\n"+
+		"  -config string\n"+
+		"    \tconfiguration file path (default \"/etc/xpf/xpf.conf\")\n"+
+		"  -debug\n"+
+		"    \tenable debug logging\n"+
+		"  -enable-cold-path-1-in-1-sampling\n"+
+		"    \tEnable 1-in-1 cold-path latency sampling (256× CPU cost). Required for bounded-cohort microbench (#1622); never use in production. Overrides --cold-path-sample-mask to 0.\n"+
+		"  -grpc-addr string\n"+
+		"    \tgRPC API listen address (default \"127.0.0.1:50051\")\n"+
+		"  -no-dataplane\n"+
+		"    \trun without a dataplane (config-only mode)\n", name)
 }
 
 func TestParseDaemonArgsDefaultsAndFlags5809(t *testing.T) {
@@ -165,12 +164,12 @@ func TestParseDaemonArgsColdPathMatrix5809(t *testing.T) {
 		{name: "explicit false", args: []string{"--enable-cold-path-1-in-1-sampling=false"}, wantKind: daemonResultOK, wantMask: 0xff},
 		{name: "enable", args: []string{"--enable-cold-path-1-in-1-sampling"}, wantKind: daemonResultOK, wantMask: 0},
 		{name: "enable overrides mask", args: []string{"--cold-path-sample-mask=0x3", "--enable-cold-path-1-in-1-sampling"}, wantKind: daemonResultOK, wantMask: 0},
-		{name: "zero requires enable", args: []string{"--cold-path-sample-mask=0"}, wantKind: daemonResultSemanticError, wantError: "requires explicit"},
+		{name: "zero requires enable", args: []string{"--cold-path-sample-mask=0"}, wantKind: daemonResultSemanticError, wantNil: true, wantError: "requires explicit"},
 		{name: "minimum", args: []string{"--cold-path-sample-mask=0x1"}, wantKind: daemonResultOK, wantMask: 1},
 		{name: "maximum accepted", args: []string{"--cold-path-sample-mask=0x7fffffffffffffff"}, wantKind: daemonResultOK, wantMask: 0x7fffffffffffffff},
-		{name: "not power minus one", args: []string{"--cold-path-sample-mask=2"}, wantKind: daemonResultSemanticError, wantError: "power-of-two minus one"},
-		{name: "uint64 max ambiguous", args: []string{"--cold-path-sample-mask=0xffffffffffffffff"}, wantKind: daemonResultSemanticError, wantError: "u64::MAX"},
-		{name: "uint64 overflow", args: []string{"--cold-path-sample-mask=0x10000000000000000"}, wantKind: daemonResultFlagError, wantError: "value out of range"},
+		{name: "not power minus one", args: []string{"--cold-path-sample-mask=2"}, wantKind: daemonResultSemanticError, wantNil: true, wantError: "power-of-two minus one"},
+		{name: "uint64 max ambiguous", args: []string{"--cold-path-sample-mask=0xffffffffffffffff"}, wantKind: daemonResultSemanticError, wantNil: true, wantError: "u64::MAX"},
+		{name: "uint64 overflow", args: []string{"--cold-path-sample-mask=0x10000000000000000"}, wantKind: daemonResultFlagError, wantNil: true, wantError: "value out of range"},
 	}
 
 	for _, tt := range tests {
@@ -178,6 +177,13 @@ func TestParseDaemonArgsColdPathMatrix5809(t *testing.T) {
 			result := parseDaemonArgs(daemonTestName5809, tt.args)
 			if result.kind != tt.wantKind {
 				t.Fatalf("kind = %d, want %d (err %v)", result.kind, tt.wantKind, result.err)
+			}
+			if tt.wantNil {
+				if result.flags.coldPathSampleMask != nil {
+					t.Fatalf("mask = %v, want nil", result.flags.coldPathSampleMask)
+				}
+			} else if result.flags.coldPathSampleMask == nil || *result.flags.coldPathSampleMask != tt.wantMask {
+				t.Fatalf("mask = %v, want %d", result.flags.coldPathSampleMask, tt.wantMask)
 			}
 			if tt.wantError != "" {
 				combined := result.flagOutput
@@ -191,15 +197,6 @@ func TestParseDaemonArgsColdPathMatrix5809(t *testing.T) {
 			}
 			if result.err != nil {
 				t.Fatalf("unexpected error: %v", result.err)
-			}
-			if tt.wantNil {
-				if result.flags.coldPathSampleMask != nil {
-					t.Fatalf("mask = %v, want nil", result.flags.coldPathSampleMask)
-				}
-				return
-			}
-			if result.flags.coldPathSampleMask == nil || *result.flags.coldPathSampleMask != tt.wantMask {
-				t.Fatalf("mask = %v, want %d", result.flags.coldPathSampleMask, tt.wantMask)
 			}
 		})
 	}
@@ -348,10 +345,30 @@ func TestRunDaemonInvalidInputHasNoSideEffects5809(t *testing.T) {
 		args []string
 		kind daemonResultKind
 	}{
-		{name: "help", args: []string{"--help"}, kind: daemonResultHelp},
-		{name: "flag syntax", args: []string{"--debug=maybe"}, kind: daemonResultFlagError},
-		{name: "remainder", args: []string{"--debug", "cleanup"}, kind: daemonResultRemainderError},
-		{name: "semantic", args: []string{"--cold-path-sample-mask=0"}, kind: daemonResultSemanticError},
+		{name: "short help", args: []string{"-h"}, kind: daemonResultHelp},
+		{name: "long help", args: []string{"--help"}, kind: daemonResultHelp},
+		{name: "help before remainder", args: []string{"--help", "cleanup"}, kind: daemonResultHelp},
+		{name: "unknown flag", args: []string{"--unknown"}, kind: daemonResultFlagError},
+		{name: "missing value", args: []string{"--config"}, kind: daemonResultFlagError},
+		{name: "invalid boolean", args: []string{"--debug=maybe"}, kind: daemonResultFlagError},
+		{name: "invalid uint", args: []string{"--cold-path-sample-mask=nope"}, kind: daemonResultFlagError},
+		{name: "uint overflow", args: []string{"--cold-path-sample-mask=0x10000000000000000"}, kind: daemonResultFlagError},
+		{name: "debug cleanup", args: []string{"--debug", "cleanup"}, kind: daemonResultRemainderError},
+		{name: "config version", args: []string{"--config", "/tmp/xpf.conf", "version"}, kind: daemonResultRemainderError},
+		{name: "show system", args: []string{"--no-dataplane", "show", "system"}, kind: daemonResultRemainderError},
+		{name: "unknown plus later flag", args: []string{"unknown", "--debug"}, kind: daemonResultRemainderError},
+		{name: "multiple remainder", args: []string{"one", "two", "three"}, kind: daemonResultRemainderError},
+		{name: "empty remainder", args: []string{""}, kind: daemonResultRemainderError},
+		{name: "space remainder", args: []string{" "}, kind: daemonResultRemainderError},
+		{name: "control remainder", args: []string{"\t\n"}, kind: daemonResultRemainderError},
+		{name: "quote and backslash remainder", args: []string{"a\"b\\c"}, kind: daemonResultRemainderError},
+		{name: "lone dash remainder", args: []string{"-"}, kind: daemonResultRemainderError},
+		{name: "post terminator empty", args: []string{"--", ""}, kind: daemonResultRemainderError},
+		{name: "post terminator dash", args: []string{"--", "-"}, kind: daemonResultRemainderError},
+		{name: "post terminator flag", args: []string{"--", "--debug"}, kind: daemonResultRemainderError},
+		{name: "zero without enable", args: []string{"--cold-path-sample-mask=0"}, kind: daemonResultSemanticError},
+		{name: "non power minus one", args: []string{"--cold-path-sample-mask=2"}, kind: daemonResultSemanticError},
+		{name: "uint64 max ambiguous", args: []string{"--cold-path-sample-mask=0xffffffffffffffff"}, kind: daemonResultSemanticError},
 	}
 
 	for _, tt := range tests {
@@ -359,16 +376,20 @@ func TestRunDaemonInvalidInputHasNoSideEffects5809(t *testing.T) {
 			sentinel := slog.New(slog.NewTextHandler(io.Discard, nil))
 			slog.SetDefault(sentinel)
 			factoryCalls := 0
+			runner := &recordingDaemonRunner5809{}
 			result := runDaemon(daemonTestName5809, tt.args, "test-version", io.Discard,
 				func(daemon.Options) (daemonRunner, error) {
 					factoryCalls++
-					return &recordingDaemonRunner5809{}, nil
+					return runner, nil
 				})
 			if result.kind != tt.kind {
 				t.Fatalf("kind = %d, want %d", result.kind, tt.kind)
 			}
 			if factoryCalls != 0 {
 				t.Fatalf("factory called %d times", factoryCalls)
+			}
+			if runner.calls != 0 {
+				t.Fatalf("runner called %d times", runner.calls)
 			}
 			if slog.Default() != sentinel {
 				t.Fatal("invalid input changed slog.Default")
@@ -457,13 +478,15 @@ func TestRunDaemonFactoryAndRunnerErrors5809(t *testing.T) {
 
 	factoryErr := errors.New("factory failed")
 	factoryCalls := 0
+	factoryRunner := &recordingDaemonRunner5809{}
 	result := runDaemon(daemonTestName5809, nil, "test-version", io.Discard,
 		func(daemon.Options) (daemonRunner, error) {
 			factoryCalls++
-			return nil, factoryErr
+			return factoryRunner, factoryErr
 		})
-	if result.kind != daemonResultFactoryError || !errors.Is(result.err, factoryErr) || factoryCalls != 1 {
-		t.Fatalf("factory result = %+v, calls %d", result, factoryCalls)
+	if result.kind != daemonResultFactoryError || !errors.Is(result.err, factoryErr) ||
+		factoryCalls != 1 || factoryRunner.calls != 0 {
+		t.Fatalf("factory result = %+v, calls %d, runner calls %d", result, factoryCalls, factoryRunner.calls)
 	}
 	var reported bytes.Buffer
 	if code := reportDaemonResult(&reported, result); code != 1 || reported.String() != "xpfd: factory failed\n" {
