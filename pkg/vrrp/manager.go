@@ -26,8 +26,9 @@ import (
 // they would collapse to one map entry and UpdateInstances would silently drop
 // a family (last-wins). The unit is already encoded in iface — the collector
 // stores the resolved KERNEL device name, so a VLAN sub-interface / non-zero
-// unit yields a distinct iface (ge-0-0-0.100) on its own. RETH and single-stack
-// instances leave family empty, so their keys are byte-identical to before.
+// unit yields a distinct iface (ge-0-0-0.100) on its own. Generic instances
+// carry inet/inet6 even when single-stack; implicit RETH instances leave family
+// empty so their keys remain byte-identical to before.
 type instanceKey struct {
 	iface   string
 	groupID int
