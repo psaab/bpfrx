@@ -91,6 +91,34 @@
   pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
   _Log.md (Edit)
 
+## 2026-07-15 — #5846 (bug/security/HIGH): stale-STOPPED upgrade recovery fails closed on restart failure
+- **Timestamp**: 2026-07-15 (fix/5846-stopped-recovery-restart-failclosed)
+- **Action**: In the resume-vs-fresh recovery (pkg/upgrade/cutover.go, Runner.Run),
+  when a stale journal's target A differs from the newly-staged B and its State is
+  STOPPED, recovery restarts the still-current KNOWN-GOOD daemon (the stopped cut
+  never flipped `current`). The pre-fix code only LOGGED a StartUnit failure, then
+  removeAllPartials + reset the journal and PROCEEDED into a fresh cut to B — so
+  the new cut used PreviousVersion (read from `current`) = the version that JUST
+  FAILED TO RESTART as its rollback target while the control plane was DOWN, and
+  the stale-recovery evidence was destroyed. Fix: if StartUnit fails during
+  stale-STOPPED recovery, return the error immediately (fail-closed) — do NOT
+  removeAllPartials, do NOT reset the journal. Preserve the stale journal +
+  partials so an operator or the next-boot re-run retries; a fresh cut proceeds
+  ONLY when the known-good restart succeeds. Scoped strictly to the STOPPED
+  sub-arm; the pure STAGED/PREFLIGHT/COPIED/VERIFIED sub-states (daemon never
+  stopped, live untouched) are unchanged. Mirrors the #5845 rolling.go/
+  kernel_drain.go fail-closed-on-lifecycle-error posture (errors-wrapped %w).
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/upgrade/ clean;
+  go test ./pkg/upgrade/ green. Fail-on-revert: a stale-STOPPED superseded
+  recovery with an injected StartUnit failure ABORTS (returns the error, current
+  stays 1.0.0, no verify/dropin for B, on-disk journal preserved as STOPPED/2.0.0,
+  partial dir preserved); the StartUnit-SUCCESS variant proceeds to the fresh 3.0.0
+  cut unchanged. Reverting to the swallow-and-log form flips the abort test RED
+  (confirmed via overlay).
+- **File(s)**: pkg/upgrade/cutover.go (Edit),
+  pkg/upgrade/stopped_recovery_restart_5846_test.go (Write),
+  docs/in-place-upgrade.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
 - **Action**: Aligned the CLI in-process commit path (reloadSyslog /

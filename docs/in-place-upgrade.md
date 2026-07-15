@@ -64,6 +64,23 @@ journal. The ONLY live-state mutations are STOP and FLIP-then-START;
 PREFLIGHT / COPY / VERIFY are pure and abortable (a failure there leaves
 the running daemon and config untouched).
 
+**Superseded stale cut (a NEWER version was staged before the old cut
+finished).** When the journaled target differs from the newly-staged
+version, the live system is recovered to a consistent state BEFORE a fresh
+cut starts, so the new cut's rollback target (`PreviousVersion`, read from
+`current`) is always a verified-live version. For a stale **STOPPED**
+journal the old cut already stopped the daemon but never flipped `current`,
+so recovery restarts the still-current KNOWN-GOOD daemon. That restart is
+**fail-closed** (#5846): if `StartUnit` FAILS, recovery ABORTS and returns
+the error — it does NOT sweep partials, reset the journal, or begin a fresh
+cut, because doing so would start a new cut whose rollback target is the
+version that JUST FAILED TO RESTART while the control plane is DOWN
+(possible unrecoverable state). The stale journal + partials are PRESERVED
+so an operator or the next-boot re-run retries recovery; a fresh cut
+proceeds only once the known-good daemon is confirmed restarted. This
+mirrors the fail-closed-on-lifecycle-error posture of the rolling/kernel
+drain paths (#5845).
+
 - **PREFLIGHT** — check `/var` free ≥ staged size + config-DB snapshot
   size + margin; GC eligible versions if short; take the pre-upgrade
   config-DB snapshot (`.partial`+rename, never torn) for rollback.
