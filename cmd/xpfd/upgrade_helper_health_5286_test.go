@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ func TestBuildUpgradeSystem_WiresHelperProbe_5286(t *testing.T) {
 	})
 	defer restoreStatus()
 
-	restoreActive := swapUnitActive(func(string) bool { return true })
+	restoreActive := swapUnitActive(func(context.Context, string) (bool, error) { return true, nil })
 	defer restoreActive()
 
 	restoreExe := swapHelperExe(func(int) (string, error) {
@@ -45,8 +46,13 @@ func TestBuildUpgradeSystem_WiresHelperProbe_5286(t *testing.T) {
 	// revert of the Sys wiring to upgrade.NewSystem turns this RED.
 	cfg := newUpgradeConfig(upgradeFlags{unit: "xpfd", versionsDir: versions, configDBDir: t.TempDir()})
 
-	// deadline 0 => exactly one gate evaluation, then fail closed (no sleeps).
-	err := cfg.Sys.HelperHealthy(target, 0)
+	// A small positive deadline gives the gate budget for exactly one evaluation
+	// (the fake status returns instantly), then it fails closed at the deadline.
+	// #5808: the deadline is now AUTHORITATIVE — a zero deadline means "no
+	// budget", so the gate would (correctly) fail immediately WITHOUT consulting
+	// the helper; a tiny positive deadline is what lets the one evaluation (and
+	// thus the control-socket status query) run, which is what this test pins.
+	err := cfg.Sys.HelperHealthy(target, 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("production System must FAIL CLOSED when the helper is up but not forwarding")
 	}
@@ -66,7 +72,7 @@ func TestBuildUpgradeSystem_ArmedForwardingTarget_Healthy(t *testing.T) {
 		return true, true, 777, nil // armed + forwarding
 	})
 	defer restoreStatus()
-	restoreActive := swapUnitActive(func(string) bool { return true })
+	restoreActive := swapUnitActive(func(context.Context, string) (bool, error) { return true, nil })
 	defer restoreActive()
 	restoreExe := swapHelperExe(func(int) (string, error) {
 		return filepath.Join(versions, target, "xpf-userspace-dp"), nil
@@ -95,7 +101,7 @@ func swapHelperExe(f upgrade.HelperExeFunc) func() {
 	return func() { upgradeHelperExe = old }
 }
 
-func swapUnitActive(f func(string) bool) func() {
+func swapUnitActive(f func(context.Context, string) (bool, error)) func() {
 	old := upgradeUnitActive
 	upgradeUnitActive = f
 	return func() { upgradeUnitActive = old }

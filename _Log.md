@@ -48579,6 +48579,27 @@ top.
   **Action**: #5867 review-fold — add TestApplyTailReconcilesSurfacesMgmtRouteError_5867 (deferred-tail-join wiring regression test mirroring #5844) per independent-review MINOR; injects a sentinel as the final applyTailReconciles operand and asserts errors.Is(commitErr, sentinel) so dropping mgmtRouteErr from the tail errors.Join is fail-on-revert-caught. Production unchanged.
   **File(s)**: pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go
 
+## 2026-07-15 — #5808 upgrade deadline-authoritative helper-readiness gate
+
+- **Timestamp**: 2026-07-15
+- **Action**: Make `StartHealthDeadline` authoritative across every blocking
+  op in the post-flip helper-readiness gate so a wedged `systemctl`/DBus or
+  an unresponsive control socket can never strand the cut past the rollback
+  deadline. Unified is-active into ONE ctx-bounded primitive shared by
+  pkg/upgrade and cmd/xpfd.
+- **File(s)**: pkg/upgrade/helper_health.go (ctx.WithTimeout gate, boundByDeadline
+  min-bound, context-aware poll timer, deadlineGateErr wrapping ctx cause,
+  last-genuine-failure preservation), pkg/upgrade/system_linux.go
+  (unitActiveProbeCtx via exec.CommandContext + exported UnitActive; fallback
+  poll ctx-bounded), cmd/xpfd/upgrade.go (UnitActive seam ctx-aware, delegates
+  to shared upgrade.UnitActive), pkg/upgrade/helper_health_5286_test.go +
+  cmd/xpfd/upgrade_helper_health_5286_test.go (seam signature ctx-aware),
+  pkg/upgrade/helper_health_deadline_5808_test.go (NEW — 5 fail-on-revert tests),
+  docs/in-place-upgrade.md (#5808 deadline-authoritative subsection).
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/ ./cmd/xpfd/ clean;
+  go test -race ./pkg/upgrade/ ./cmd/xpfd/ -count=3 GREEN; 3 fail-on-revert
+  overlays proven RED (exec.Command hang, no min-bound=10s, time.Sleep(poll)
+  5s overshoot).
 - **Timestamp**: 2026-07-15
   **Action**: #5835 (configstore: confirmation succeeded after durable confirm-record deletion failed → a restart resurrected a stale rollback and reverted an operator-confirmed config). removeConfirmState was best-effort (LOGGED a DeleteConfirm failure), so a confirmation (plain commit / HA sync / explicit ConfirmCommit / demotion) reported SUCCESS while confirm.json lingered; a restart read the stale record and resurrected its rollback. Fix (4 corrections): (1) removeConfirmState now RETURNS the error — ConfirmCommitAs propagates it (via clearPendingConfirmLocked now returning (bool,error)); the non-returning paths route through a new resolveConfirmRemovalLocked that retains retry debt (new confirmRemoveDegraded field) + starts the shared persist-retry loop (extended to also re-drive the delete) + surfaces DEGRADED health via ConfigPersistDegraded() (now ORs the new flag) and a dedicated ConfirmRemovalDegraded(). (2) DeleteConfirm now reaches the #4864 dir fsync on the ABSENT path (removed the os.IsNotExist short-circuit) so an unlink-succeeded/dir-sync-failed state is not laundered into a false success by an absent-file retry — the flag is the cross-call "sync owed" operation state. (3) confirmRecord gains an additive GuardedHash (sha256 of the unconfirmed active tree Format() at arm/re-arm time, set in writeConfirmState); recoverPendingConfirmLocked ignores a record whose GuardedHash != the loaded active config's (a later commit/confirm advanced active while removal failed) so a stale record can't revert an unrelated confirmed generation — legacy empty-hash records recover as #4577 (cross-upgrade hatch preserved). (4) the in-memory timer/rollback bookkeeping cancel is unchanged (the delete needs only the file path), so nothing is irreversibly lost. Explicit-confirm-with-no-later-commit + immediate crash fails SAFE (reverts on boot), consistent with ConfirmCommit having returned an error. Tests (confirm_durable_resolution_5835_test.go, injected rbRemove/rbSyncDir seams): explicit-confirm-returns-error+debt; dir-fsync-not-laundered-by-absent-retry; plain-commit/config-sync/demotion retain+expose debt then converge (fast-backoff heal); STALE record does not revert a durably-committed generation on boot (headline); nested-confirmed + first-commit generation-binding; -race concurrent retry-vs-reads. Updated the #4864 test that pinned the now-reversed absent-no-dir-sync behavior (renamed TestDeleteConfirmAbsentReachesDirSync). Fail-on-revert verified firsthand: swallow removeConfirmState→4 tests RED; disable GuardedHash check→2 tests RED; restore DeleteConfirm absent short-circuit→2 dir-sync tests RED. go build ./... + go vet ./pkg/configstore/ clean; go test -race ./pkg/configstore/ GREEN (covers timer-callback race + restart-after-injected-failure). Doc: pkg/configstore/README.md new #5835 bullet.
   **File(s)**: pkg/configstore/db.go, pkg/configstore/store.go, pkg/configstore/store_commit.go, pkg/configstore/store_persist.go, pkg/configstore/confirm_durable_resolution_5835_test.go (new), pkg/configstore/confirm_delete_fsync_4864_test.go, pkg/configstore/README.md, _Log.md

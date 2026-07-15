@@ -1,13 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -147,7 +146,7 @@ func buildUpgradeSystem(flags upgradeFlags) upgrade.System {
 		unit = upgrade.DefaultUnit
 	}
 	deps := upgrade.HelperHealthDeps{
-		UnitActive:    func() bool { return upgradeUnitActive(unit) },
+		UnitActive:    func(ctx context.Context) (bool, error) { return upgradeUnitActive(ctx, unit) },
 		Status:        upgradeHelperStatus,
 		HelperExe:     upgradeHelperExe,
 		ControlSocket: upgradeControlSock(flags.configDBDir),
@@ -193,10 +192,13 @@ func defaultUpgradeHelperExe(pid int) (string, error) {
 	return os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
 }
 
-// defaultUpgradeUnitActive reports whether <unit>.service is active.
-func defaultUpgradeUnitActive(unit string) bool {
-	out, _ := exec.Command("systemctl", "is-active", unit+".service").Output()
-	return strings.TrimSpace(string(out)) == "active"
+// defaultUpgradeUnitActive reports whether <unit>.service is active. #5808: it
+// now delegates to the ONE shared, ctx-bounded primitive (upgrade.UnitActive →
+// exec.CommandContext) instead of duplicating an unbounded exec.Command, so
+// cmd/xpfd and pkg/upgrade have identical timeout behavior and a wedged
+// systemctl/DBus is killed at the readiness deadline.
+func defaultUpgradeUnitActive(ctx context.Context, unit string) (bool, error) {
+	return upgrade.UnitActive(ctx, unit)
 }
 
 // defaultUpgradeControlSocket resolves the helper control-socket path from the

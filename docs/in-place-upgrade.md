@@ -180,6 +180,41 @@ forwarding path, so a healthy post-upgrade node MUST have an armed
 forwarding helper — there is no legitimate no-helper case to exempt. A
 not-healthy result flows into the existing rollback path below.
 
+#### `StartHealthDeadline` is AUTHORITATIVE across every blocking op (#5808)
+
+The gate must RETURN by `StartHealthDeadline` no matter which dependency
+wedges — otherwise a hung `systemctl`/DBus or an unresponsive control
+socket strands the post-flip cut PAST the point where an automatic
+rollback (standalone) or an operator-driven fence (HA) is still timely.
+Before #5808 the `systemctl is-active` precondition ran under an
+unbounded `exec.Command`, so a wedged systemd could block the whole gate
+indefinitely.
+
+The probe now bounds **every** blocking call by one `context.WithTimeout`
+of `StartHealthDeadline`:
+
+- **is-active probe** runs under `exec.CommandContext`; a wedged
+  `systemctl` is SIGKILLed at the deadline, not left blocking. This is the
+  single shared primitive `upgrade.UnitActive(ctx, unit)` — the wired
+  `HelperHealthProbe` precondition, the probe-less fallback poll, AND
+  `cmd/xpfd`'s wiring all route through it (one timeout behavior, not two
+  divergent `exec.Command` impls).
+- **control-socket status query** is capped to `min(StatusTimeout,
+  time-remaining-to-deadline)`, so a `StatusTimeout` larger than the
+  deadline can never run the query past it.
+- **poll wait** uses a context-aware timer (`select` on `ctx.Done()` vs
+  the poll timer), so it never overshoots the deadline by a full poll
+  interval.
+
+The gate distinguishes a definitive *not-ready* (retry until the deadline)
+from a deadline/cancellation: a deadline failure wraps the context cause,
+so callers can `errors.Is(err, context.DeadlineExceeded)`. The most-recent
+GENUINE readiness failure (e.g. "helper not forwarding") is retained as
+the diagnostic `last:` cause — a deadline *symptom* (a killed probe, or the
+status query having no remaining budget) does not mask it. Standalone
+auto-rollback and HA fence (`SkipStartHealthRollback`) both trigger
+PROMPTLY at the deadline instead of hanging.
+
 ### Rollback (binary + DB atomic)
 
 Standalone auto-rollback (on an unhealthy post-start helper) and operator
