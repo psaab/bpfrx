@@ -145,7 +145,7 @@ func TestApplyTailReconcilesSurfacesRouteLeakError(t *testing.T) {
 	}
 
 	injected := errors.New("injected: route-leak snapshot republish failed")
-	err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, injected)
+	err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, injected, nil)
 	if err == nil {
 		t.Fatal("applyTailReconciles must surface the route-leak reconcile failure " +
 			"(fail-closed); got nil")

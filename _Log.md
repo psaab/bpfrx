@@ -1,3 +1,35 @@
+## 2026-07-15 — #5844 (bug/security/HIGH): routing-rule reconcile errors fail the commit closed
+- **Timestamp**: 2026-07-15 (fix/5844-routing-rule-reconcile-failclosed)
+- **Action**: `pkg/routing` correctly RETURNS next-table / rib-group / PBR
+  ip-rule reconcile failures, but the daemon call site (`applyRoutingRules`,
+  pkg/daemon/daemon_apply.go) was VOID and LOGGED-and-DROPPED them. So a commit
+  was ACKNOWLEDGED after a partial clear/add left stale-or-missing cross-VRF
+  policy in the kernel — and the immediately-following userspace route snapshot
+  (`reconcileRouteLeakSnapshot`) canonized that partial live kernel state into
+  the FIB. Made `applyRoutingRules` RETURN `errors.Join` of the three kernel
+  reconcile failures (ApplyNextTableRules / ApplyRibGroupRules / ApplyPBRRules),
+  collected while STILL running every rule type after one fails (fail-closed but
+  COMPLETE), keeping the per-error logging. `applyConfigLocked` captures it
+  (`routingRuleErr`) and threads it into the SAME tail `errors.Join` sink the
+  snapshot error uses (new final `applyTailReconciles` param); the snapshot
+  republish still runs first (ordering preserved). Mirrors the #5310 ifaceErr /
+  #5696 routeLeakErr deferred-error pattern. `BuildPBRRules` *build degradation*
+  is deliberately NOT joined — it is a fail-SAFE representability under-steer
+  (unrepresentable-as-ip-rule term dropped to the main table, still enforced by
+  the userspace filter path), not a partial kernel mutation, so fail-closing it
+  would reject configs that commit fine today.
+- **Validation**: gofmt clean; go build ./...; go test ./pkg/daemon/
+  ./pkg/routing/ -count=1 green; go vet ./pkg/daemon/ clean. Fail-on-revert
+  proven via overlay: dropping routingRuleErr from the tail join flips
+  TestApplyTailReconcilesSurfacesRoutingRuleError_5844 RED (commit returns nil
+  despite the injected failure); reverting applyRoutingRules to void breaks
+  compilation of the direct test.
+- **File(s)**: pkg/daemon/daemon_apply.go (Edit),
+  pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go (Write),
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go (Edit, arity),
+  pkg/daemon/route_leak_snapshot_failclosed_5696_test.go (Edit, arity),
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go (Edit, arity),
+  pkg/daemon/README.md (Edit), _Log.md (Edit)
 ## 2026-07-15 — #5833 (bug/audit/security): quarantine SNMP community on malformed clients token (lenient fail-closed)
 - **Timestamp**: 2026-07-15 (fix/5833-snmp-lenient-quarantine)
 - **Action**: #4834 fixed STRICT-commit rejection of malformed SNMP `clients`
@@ -48342,3 +48374,37 @@ top.
   ctx.Err() check flips the abort tests RED (verified: phases ran p1,p2,p3,p4).
 - **Action**: #5854 — hard-reject next-table/rib-group ip-rule window over-subscription at strict commit (was warn-only → silent apply-time truncation → routes claimed but not programmed). Added validateRoutingRuleWindowsStrict (new compiler_validate_strict_routing_rulewindows.go) wired into runUniformGates after the #5693 next-table gate, gated by new opts.lenientRoutingRuleWindows (true in both lenient blocks): strict CompileConfig hard-rejects >100 next-table routes / >1000 rib-group leak prefixes; CompileConfigLenient (Store.Load / SyncApply / peer-sync) still warns-and-loads so grandfathered/peer-synced generations don't fail-closed (#1960). Removed the now-redundant warn-only validateRoutingRuleWindowWarnings + its ValidateConfig call (runUniformGates runs before ValidateConfig, so strict aborts clean; the lenient downgrade is the single warning — no double-warn). Window consts (maxNextTableRules=100, maxRibGroupLeakRules=1000) duplicated in pkg/config with keep-in-sync comment (pkg/config cannot import pkg/routing — cycle). Fail-on-revert tests (gate-unit + compile-path strict-reject + lenient-warn); neutralizing the gate turns all reject AND lenient-warn assertions RED. gofmt/go vet/go build clean; go test ./pkg/config/ ./pkg/routing/ green. Doc: docs/rib-group-route-leaking.md new "Strict rejection — ip-rule window over-subscription (#5854)" section.
 - **File(s)**: pkg/config/compiler_validate_strict_routing_rulewindows.go (new), pkg/config/compiler_uniformgates.go, pkg/config/compiler.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_routing.go, pkg/config/compiler_routing_rules_test.go, docs/rib-group-route-leaking.md
+
+- **Timestamp**: 2026-07-15
+- **Action**: #5845 — rolling-upgrade drain-abort was discarding the ResetFailover (failback) error (`_ = cl.ResetFailover()`) and unconditionally claiming "aborted WITHOUT cutting (node still forwarding)". After ForceSecondary already DEMOTED the node, a FAILED failback can leave it force-secondary with peer takeover unproven — the "still forwarding" claim is then FALSE and both nodes could end up secondary (outage). Fixed rolling.go to capture `resetErr := cl.ResetFailover()`: on failure, return an error surfacing BOTH the drain failure AND the reset failure (errors.Join) and warning the node may be STRANDED DEMOTED / operator attention needed (mirroring the correct sibling kernel_drain.go); on success, keep the existing "still forwarding" message (true then). Extended the rolling_test.go fake with a `resetErr` seam; added TestRolling_DrainTimeoutFailbackFailsStrandedDemoted_5845 (asserts errors.Is(resetErr) surfaces + "STRANDED DEMOTED" present + NOT "still forwarding") and strengthened the failback-SUCCESS test to pin the unchanged "still forwarding" claim. Fail-on-revert verified: reverting to discard-resetErr + still-forwarding message flips the new test RED (rolling_test.go:229), restore → GREEN. gofmt/go vet/go build clean; go test ./pkg/upgrade green. Doc: docs/in-place-upgrade.md step-4 drain-abort updated (still-forwarding only on failback success; stranded-demoted on failure).
+- **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/rolling_test.go, docs/in-place-upgrade.md
+  **Action**: #5852 (bug): RPM lifecycle cancellation (StopAll / config
+  replacement / daemon shutdown) was mis-counted as path loss. When StopAll
+  cancels the shared probe context while runProbe is in flight, runSingleTest
+  treated the resulting context.Canceled (or the socket-timeout that follows a
+  cancel racing a blocking ReadFrom) as an ORDINARY probe failure: incremented
+  TotalSent/SuccFail, advanced the successive-loss threshold, emitted
+  ping_probe_failed, and could cross the loss threshold -> ping_test_failed +
+  fireTransition, so services ip-monitoring could change route preference DURING
+  teardown/reconfigure. Fixed by holding path state NEUTRAL on a lifecycle
+  cancel, mirroring the existing ErrProbeSetup hold: after runProbe, if
+  `ctx.Err() != nil || errors.Is(err, context.Canceled)` the probe RETURNs
+  before any counter/threshold/event/Transition. Discriminator is the SHARED
+  ctx.Err() (the probeCtx is context.WithCancel in Apply, cancelled ONLY by
+  m.cancel()), NOT the returned error type — a genuine probe TIMEOUT is a
+  per-probe socket deadline (icmp SetReadDeadline / TCP dial timeout) that
+  leaves ctx.Err()==nil and MUST still count as real path loss. RETURN (not
+  continue) so no post-loop fireTransition publishes a stale edge once teardown
+  begins. Deferred the optional icmp ReadFrom context-deadline responsiveness
+  tweak (StopAll can still wait up to the 3s socket deadline) as a follow-up —
+  the neutral classification is the load-bearing correctness fix and StopAll's
+  wg.Wait is bounded (<=3s, within TimeoutStopSec=20).
+  **File(s)**: pkg/rpm/rpm.go, pkg/rpm/README.md,
+  pkg/rpm/cancel_neutral_5852_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/rpm/ -count=1` (green);
+  `go vet ./pkg/rpm/` clean. Fail-on-revert: removing the neutral check flips
+  TestRunSingleTestLifecycleCancelIsNeutral5852 RED (cancelled probe advanced
+  TotalSent:1/SuccFail:1/LastStatus:fail) while the genuine-failure +
+  probe-owned-DeadlineExceeded tests stay GREEN (no over-neutralization).
+  (NOTE: the shared GOCACHE=/dev/shm/cache was contaminated by a prior
+  worktree — a fresh cache builds clean; used /dev/shm/cache5852.)
