@@ -201,7 +201,11 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	// callback that already fired and is blocked on s.mu no-ops instead of
 	// reverting. Runs only AFTER the persist+promote succeeded, so a failed
 	// commit leaves the pending confirm fully intact.
-	if s.clearPendingConfirmLocked() {
+	// #5835: a plain commit is non-interactive here (the frontend confirm path
+	// already returned an error to the operator when applicable); a durable
+	// confirm.json-removal failure is retained as retry debt + degraded health
+	// inside clearPendingConfirmLocked and converges autonomously.
+	if cleared, _ := s.clearPendingConfirmLocked(); cleared {
 		slog.Info("plain commit confirmed a pending commit-confirmed window")
 	}
 
@@ -428,7 +432,17 @@ func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Tim
 	if s.db == nil {
 		return
 	}
-	rec := &confirmRecord{Deadline: deadline, PrevTree: prevTree, FirstCommit: firstCommit}
+	rec := &confirmRecord{
+		Deadline:    deadline,
+		PrevTree:    prevTree,
+		FirstCommit: firstCommit,
+		// #5835: bind the record to the unconfirmed config it guards (s.active is
+		// the just-promoted, still-unconfirmed tree at every arm/re-arm site). On
+		// boot recovery a mismatch means a later commit/confirm advanced the
+		// active config while this record's durable removal had failed — the
+		// record is then stale and must not resurrect a rollback.
+		GuardedHash: journalConfigHash(s.active),
+	}
 	if err := s.db.WriteConfirm(rec); err != nil {
 		slog.Warn("failed to persist commit-confirmed state; auto-rollback will not "+
 			"survive a crash within the confirm window", "err", err, "issue", "#4577")
@@ -436,16 +450,78 @@ func (s *Store) writeConfirmState(prevTree *config.ConfigTree, deadline time.Tim
 }
 
 // removeConfirmState deletes the persisted pending commit-confirmed state
-// (#4577). Called whenever a pending confirm is RESOLVED — confirmed (plain
-// commit / HA sync / explicit confirm / demotion) or rolled back (timer
-// fired). Best-effort; caller holds s.mu.
-func (s *Store) removeConfirmState() {
+// (#4577/#5835). Called whenever a pending confirm is RESOLVED — confirmed
+// (plain commit / HA sync / explicit confirm / demotion) or rolled back (timer
+// fired). It now RETURNS the DeleteConfirm error (a durable-removal failure)
+// instead of only logging it, so a caller that can act on it does — an explicit
+// ConfirmCommit surfaces it to the operator; the non-returning resolution paths
+// route it through resolveConfirmRemovalLocked to retain retry debt. A nil DB
+// (embedder without persistence) is a clean no-op. Caller holds s.mu.
+func (s *Store) removeConfirmState() error {
 	if s.db == nil {
-		return
+		return nil
 	}
 	if err := s.db.DeleteConfirm(); err != nil {
-		slog.Warn("failed to remove persisted commit-confirmed state", "err", err, "issue", "#4577")
+		slog.Warn("failed to remove persisted commit-confirmed state", "err", err, "issue", "#5835")
+		return err
 	}
+	return nil
+}
+
+// resolveConfirmRemovalLocked durably removes confirm.json for a RESOLVED
+// pending window and, on failure, RETAINS retry debt: it flips
+// confirmRemoveDegraded (surfaced via ConfigPersistDegraded → /health) and
+// starts the singleton persist-retry loop so the stale record is eventually
+// deleted and health stays degraded until it is (#5835). On success it clears
+// the flag. It returns the removal error so callers that ALSO propagate it (the
+// explicit ConfirmCommit path) can — the non-returning resolution paths (plain
+// commit, HA sync, demotion, timeout rollback, boot recovery) ignore the return
+// and rely on the retained retry debt to converge. Caller holds s.mu.
+func (s *Store) resolveConfirmRemovalLocked(action string) error {
+	if err := s.removeConfirmState(); err != nil {
+		s.noteConfirmRemoveFailureLocked(action, err)
+		return err
+	}
+	s.confirmRemoveDegraded = false
+	return nil
+}
+
+// noteConfirmRemoveFailureLocked records that a resolved window's confirm.json
+// removal failed to become durable and starts the self-healing retry (#5835).
+// It sets confirmRemoveDegraded (the "removal not durable" operation state,
+// surfaced to /health), journals an ERROR, and ensures the singleton retry loop
+// is running so the removal is re-driven with backoff until it lands. Must be
+// called with s.mu held.
+func (s *Store) noteConfirmRemoveFailureLocked(action string, err error) {
+	slog.Error("failed to durably remove the resolved commit-confirmed record; a restart "+
+		"before the background retry heals could resurrect a stale rollback",
+		"action", action, "err", err, "issue", "#5835")
+	s.confirmRemoveDegraded = true
+	s.journalLog(&JournalEntry{
+		Action: "confirm_remove_error",
+		Detail: fmt.Sprintf("%s: durable removal of pending commit-confirmed record failed: %v", action, err),
+	})
+	s.ensurePersistRetryLoopLocked()
+}
+
+// ensurePersistRetryLoopLocked starts the singleton background persist-retry
+// goroutine if one is not already running (#1799/#5835). The loop re-drives
+// both a degraded active-config write AND a degraded confirm.json removal until
+// both are durable. Caller holds s.mu (write lock).
+func (s *Store) ensurePersistRetryLoopLocked() {
+	if s.persistRetryActive {
+		return
+	}
+	s.persistRetryActive = true
+	initial := s.persistRetryInitialBackoff
+	if initial <= 0 {
+		initial = time.Second
+	}
+	maxBackoff := s.persistRetryMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 60 * time.Second
+	}
+	go s.persistRetryLoop(initial, maxBackoff)
 }
 
 // clearConfirmResolutionPendingLocked finalizes a #5473 DEFERRED confirm.json
@@ -463,7 +539,10 @@ func (s *Store) clearConfirmResolutionPendingLocked() {
 		return
 	}
 	s.confirmResolvePendingPersist = false
-	s.removeConfirmState()
+	// #5835: the replacement config is durable, so remove the retained record.
+	// A durable-removal failure here retains retry debt (degraded health +
+	// background retry) rather than being swallowed — the loop re-drives it.
+	s.resolveConfirmRemovalLocked("confirm_resolution_finalize")
 }
 
 // clearPendingConfirmLocked cancels an armed commit-confirmed rollback
@@ -485,9 +564,16 @@ func (s *Store) clearConfirmResolutionPendingLocked() {
 // NOT go through here — it re-arms its own timer and PRESERVES the
 // original rollback target — so this only fires on a PLAIN commit / sync /
 // explicit confirm, never on a confirmed→confirmed re-arm.
-func (s *Store) clearPendingConfirmLocked() bool {
+// It returns (cleared, removeErr): cleared is true iff a pending timer was
+// cancelled; removeErr is the durable confirm.json-removal failure, if any.
+// The removal ALWAYS retains retry debt on failure (degraded health +
+// background retry) regardless of caller, so the stale record converges to
+// deletion; removeErr is returned in addition so an EXPLICIT ConfirmCommit can
+// surface it to the operator (#5835). The non-returning callers (plain commit,
+// demotion) ignore removeErr and rely on the retained retry debt.
+func (s *Store) clearPendingConfirmLocked() (cleared bool, removeErr error) {
 	if !s.cancelPendingConfirmTimerLocked() {
-		return false
+		return false, nil
 	}
 	// #4577: the pending confirm is now confirmed (plain commit / HA sync /
 	// explicit confirm / demotion) — drop the persisted crash-recovery state
@@ -503,8 +589,13 @@ func (s *Store) clearPendingConfirmLocked() bool {
 	// The degrade-not-fail sync path does NOT use this helper — it cancels the
 	// timer with cancelPendingConfirmTimerLocked and orders confirm.json removal
 	// AFTER its (possibly failing) write.
-	s.removeConfirmState()
-	return true
+	//
+	// #5835: a durable-removal failure is no longer swallowed — it retains retry
+	// debt (degraded health + background retry) AND is returned so an explicit
+	// ConfirmCommit surfaces it. Before this fix removeConfirmState was void, so
+	// a confirmation reported success while confirm.json lingered and a restart
+	// resurrected the stale rollback.
+	return true, s.resolveConfirmRemovalLocked("confirm_resolve")
 }
 
 // cancelPendingConfirmTimerLocked cancels an armed commit-confirmed rollback
@@ -545,11 +636,22 @@ func (s *Store) ConfirmCommitAs(sessionID string) error {
 	if err := s.ensureHolderLocked(sessionID); err != nil {
 		return err
 	}
-	if !s.clearPendingConfirmLocked() {
+	cleared, removeErr := s.clearPendingConfirmLocked()
+	if !cleared {
 		return fmt.Errorf("no pending confirmed commit")
 	}
 
 	slog.Info("commit confirmed")
+	// #5835: the timer is cancelled and the config is confirmed IN MEMORY, but
+	// the durable removal of confirm.json failed. Surface it: a restart before
+	// the retained background retry heals could resurrect the stale rollback.
+	// The retry debt + degraded health were already retained inside
+	// clearPendingConfirmLocked; returning the error lets the operator act.
+	if removeErr != nil {
+		return fmt.Errorf("commit confirmed in memory, but durably clearing the pending "+
+			"commit-confirmed record failed (persistence degraded; a restart before the "+
+			"background retry heals may roll back): %w", removeErr)
+	}
 	return nil
 }
 
@@ -575,10 +677,14 @@ func (s *Store) ConfirmPendingOnDemotion() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.clearPendingConfirmLocked() {
+	cleared, _ := s.clearPendingConfirmLocked()
+	if !cleared {
 		return false
 	}
 
+	// #5835: demotion is an event with no operator to return an error to; a
+	// durable-removal failure is already retained as retry debt + degraded
+	// health inside clearPendingConfirmLocked, so it converges autonomously.
 	slog.Info("commit confirmed: confirmed on RG0 demotion (peer holds the synced config)")
 	return true
 }
@@ -720,7 +826,10 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 		// now-no-op rollback to the already-persisted target).
 		s.persistDegraded = false
 		s.confirmResolvePendingPersist = false
-		s.removeConfirmState()
+		// #5835: removal is durable-or-retry — a failed DeleteConfirm retains
+		// retry debt + degraded health rather than being swallowed, so a crash
+		// before the retry heals cannot leave a stale record that re-reverts.
+		s.resolveConfirmRemovalLocked("auto_rollback_remove")
 	}
 
 	// Log to journal
