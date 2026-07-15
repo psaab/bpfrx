@@ -1,3 +1,25 @@
+## 2026-07-15 — #5738 (bug/syslog) commit 1/2: move resolveSourceAddr into pkg/config
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Pure code-motion. The syslog source-interface resolver lived in
+  pkg/daemon (unexported resolveSourceAddr) so the CLI in-process commit path
+  could not reuse it. Moved it verbatim to pkg/config as the exported
+  ResolveSyslogSourceAddr (least-surprising shared home: it is a pure function
+  of a *config.Config, and pkg/config already documents its semantics in
+  ValidateSyslogSourceInterface). Behavior is byte-identical; only the package,
+  name, and receiver-parameter type change. Updated the sole daemon caller
+  (applySyslogConfig) to config.ResolveSyslogSourceAddr, dropped the now-unused
+  strconv import from daemon_system.go, moved the resolver unit tests into
+  pkg/config, and repointed the doc references in schema_validators_logging.go
+  to the new location. No behavior change; sets up commit 2 which teaches the
+  CLI path to use the shared fallback.
+- **Validation**: go build ./pkg/config/ ./pkg/daemon/ clean; go vet clean;
+  moved resolver tests pass in pkg/config; daemon syslog tests still green.
+- **File(s)**: pkg/config/syslog_source.go (Write),
+  pkg/config/syslog_source_test.go (Write),
+  pkg/daemon/daemon_system.go (Edit),
+  pkg/daemon/syslog_source_test.go (git rm),
+  pkg/config/schema_validators_logging.go (Edit), _Log.md (Edit)
+
 ## 2026-07-12 — #5633 (bug/config/routing): reject contradictory duplicate-route dispositions at commit
 - **Timestamp**: 2026-07-12 (fix/5633-dup-route-contradiction)
 - **Action**: codex-review-181 M25 / A3-b02-F03. The static-route merge in
