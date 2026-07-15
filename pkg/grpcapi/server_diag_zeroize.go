@@ -58,13 +58,16 @@ const (
 //   - .configdb/master.key      — the AES-GCM key that decrypts an encrypted DB
 //   - .configdb/                — the SSOT: active.json, candidate.json,
 //     rollback.N.json (Store.Load reloads active.json on next boot)
+//   - <configBase>              — the LIVE config file, matched by EXACT name
+//     (#5768) so a non-".conf" -config base (e.g. site.cfg) is erased too and a
+//     broad `*.conf` glob no longer catches unowned siblings
+//   - rescue.conf               — the rescue config (configstore.RescueConfigBase
+//     / rescuePath): full active-config TEXT with cleartext secret leaves (#4056)
 //   - <configBase>.<N>          — the CANONICAL text rollback slots
 //     (saveRollbackFiles / loadRollbackHistory), full config TEXT with
 //     cleartext secret leaves; loadRollbackHistory reloads them at boot, so
 //     leaving them behind would let the prior tenant's config be rolled back
 //     to — the exact leak #4576 closes
-//   - *.conf                    — the live config + rescue.conf (pre-#4576 set)
-//   - rollback*                 — legacy rollback naming (pre-#4576 set)
 //   - .<base>.tmp-*             — fsatomic crash-leaked write temps (#5475): a
 //     daemon killed between fsatomic's CreateTemp and its rename leaves a
 //     ".<base>.tmp-<rand>" file (pkg/fsatomic createTemp) still holding the FULL
@@ -148,16 +151,30 @@ func zeroizeConfigDir(configDir, configBase string) error {
 	// erase the whole tree explicitly.
 	fail(os.RemoveAll(filepath.Join(configDir, "tls")))
 
-	// Top-level artifacts in a single ReadDir pass.
+	// Top-level artifacts in a single ReadDir pass. #5768: match ONLY names xpf
+	// itself created/tracks — the live config file, the rescue config, the audit
+	// journal (+ rotated segments), the numbered text rollback slots, and fsatomic
+	// crash temps. The pre-#5768 code matched a broad `*.conf` suffix and
+	// `rollback*` prefix; when a custom -config resolved configDir to a shared or
+	// subdir location that slipped past ValidateFactoryResetRoot, those globs
+	// deleted UNOWNED siblings (a neighbor's foo.conf, xpf's own rendered
+	// /etc/frr/frr.conf, an unrelated rollback-notes file). Ownership scoping — not
+	// a bigger denylist — bounds the wipe to xpf's artifacts. The exact live-config
+	// match also erases a non-".conf" -config base the old suffix glob left behind.
+	// configstore writes no top-level `rollback*` file (canonical text slots are
+	// "<configBase>.<N>" via isTextRollbackFile; DB slots live inside .configdb,
+	// RemoveAll'd above), so dropping the legacy `rollback*` prefix loses no owned
+	// artifact. isFsatomicTemp stays a shape match: under-scoping a temp risks
+	// stranding an owned secret-bearing temp (#5475), the worse failure.
 	entries, err := os.ReadDir(configDir)
 	fail(err)
 	for _, f := range entries {
 		name := f.Name()
-		if strings.HasSuffix(name, ".conf") ||
-			strings.HasPrefix(name, "rollback") ||
+		if name == configBase || // the live config file (exact name, any extension)
+			name == configstore.RescueConfigBase || // the rescue config (rescuePath)
 			name == ".config.journal" ||
 			strings.HasPrefix(name, ".config.journal.") ||
-			isTextRollbackFile(name, configBase) ||
+			isTextRollbackFile(name, configBase) || // <configBase>.<N> text slots
 			isFsatomicTemp(name) {
 			fail(os.Remove(filepath.Join(configDir, name)))
 		}

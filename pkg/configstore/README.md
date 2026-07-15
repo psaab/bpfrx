@@ -448,6 +448,22 @@ per-path:
   top-level temp — and its secrets — would survive. The gRPC
   `zeroizeConfigDir` mirror in `pkg/grpcapi` carries the same barriers
   (its own `zeroizeSyncDir` seam) and the same `.<base>.tmp-*` sweep.
+- **Ownership-scoped deletion (#5768).** The top-level sweep matches ONLY
+  the artifacts xpf itself created/tracks — the live config file (by EXACT
+  name, `configBase`, so a non-`.conf` `-config` base like `site.cfg` is
+  erased too), `rescue.conf` (`RescueConfigBase`), `.config.journal[.N]`,
+  the numbered text rollback slots `<configBase>.<N>`, and fsatomic crash
+  temps — NEVER a broad `*.conf` suffix or `rollback*` prefix glob. The old
+  globs deleted UNOWNED siblings when a custom `-config` resolved the config
+  root to a shared directory or a subdir that slipped past the
+  `FactoryResetForbiddenRoots` denylist (`/data/xpf.conf` → wipes `/data/*`;
+  `/etc/frr/x.conf` → deletes xpf's own rendered `frr.conf`). A denylist is
+  inherently incomplete on a wildcard wipe; ownership scoping bounds the
+  deletion to xpf's own files instead, with the denylist kept as
+  defense-in-depth. `FactoryResetConfigDir` (CLI) and the gRPC
+  `zeroizeConfigDir` mirror apply the identical scoped match; the dedicated
+  `<root>/.configdb` and (gRPC-only) `<root>/tls` subdir `RemoveAll`s stay —
+  those are exclusively xpf-owned subdirectories.
 - **`FactoryResetArchiveDir` — local config-archive erasure (#5186).**
   `zeroize` must remove EVERY on-box generation of config secrets. The
   config archive (`<archive-dir>/config-*.conf`, 0600 full-config-text
