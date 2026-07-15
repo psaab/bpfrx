@@ -46,6 +46,9 @@ func (c *CLI) showInterfacesDetail(filterName string) error {
 			}
 		}
 		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil { // #5886: skip present-but-nil InterfaceConfig
+				continue
+			}
 			if ifc == nil { // #5068: tolerant/HA-sync path may carry a nil interface value
 				continue
 			}
@@ -216,7 +219,7 @@ func (c *CLI) showInterfacesRethDetail(cfg *config.Config, maps config.RethShowM
 			hwAddr = attrs.HardwareAddr
 		}
 		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", reth, adminStr, linkStr)
-		if ifc, ok := cfg.Interfaces.Interfaces[reth]; ok && ifc.Description != "" {
+		if ifc, ok := config.LookupInterface(cfg, reth); ok && ifc.Description != "" {
 			fmt.Printf("  Description: %s\n", ifc.Description)
 		}
 		fmt.Printf("  Redundant-ethernet: aggregate over member %s\n", member)
@@ -262,7 +265,7 @@ func (c *CLI) showInterfacesRethDetail(cfg *config.Config, maps config.RethShowM
 				linkStr = "Down"
 			}
 			fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", member, adminStr, linkStr)
-			if ifc, ok := cfg.Interfaces.Interfaces[member]; ok && ifc.Description != "" {
+			if ifc, ok := config.LookupInterface(cfg, member); ok && ifc.Description != "" {
 				fmt.Printf("  Description: %s\n", ifc.Description)
 			}
 			fmt.Printf("  Redundant-ethernet: member of %s\n", reth)

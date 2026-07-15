@@ -64,6 +64,9 @@ func kernelToAuthoredMap(cfg *config.Config) map[string]string {
 		return m
 	}
 	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #5886: skip present-but-nil InterfaceConfig
+			continue
+		}
 		if ifc == nil { // #5068: tolerant/HA-sync path may carry a nil value
 			continue
 		}

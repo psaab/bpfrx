@@ -308,6 +308,9 @@ func interfaceAliasSet(cfg *config.Config, name string) map[string]bool {
 		return nil
 	}
 	for key, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil { // #5886: skip present-but-nil InterfaceConfig
+			continue
+		}
 		aliases := map[string]bool{
 			key:                     true,
 			config.LinuxIfName(key): true,
@@ -424,7 +427,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	// rethRG returns the redundancy group for a RETH interface, or -1.
 	rethRG := func(name string) int {
 		parts := strings.SplitN(name, ".", 2)
-		if ifc, ok := cfg.Interfaces.Interfaces[parts[0]]; ok && ifc.RedundancyGroup > 0 {
+		if ifc, ok := config.LookupInterface(cfg, parts[0]); ok && ifc.RedundancyGroup > 0 {
 			return ifc.RedundancyGroup
 		}
 		return -1

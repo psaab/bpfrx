@@ -31,6 +31,9 @@ func (c *CLI) showInterfacesTerse() error {
 	var units []ifUnit
 
 	for physName, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg == nil { // #5886: skip present-but-nil InterfaceConfig
+			continue
+		}
 		// #5068: skip a present-but-nil interface value (tolerant / HA-sync
 		// path admits it, #3494) rather than dereferencing ifCfg.Units.
 		if ifCfg == nil {
@@ -38,8 +41,11 @@ func (c *CLI) showInterfacesTerse() error {
 		}
 		if rethName, ok := physToReth[physName]; ok {
 			// Physical RETH member: inherit units from RETH parent
-			if rethCfg, ok := cfg.Interfaces.Interfaces[rethName]; ok && rethCfg != nil {
+			if rethCfg, ok := config.LookupInterface(cfg, rethName); ok && rethCfg != nil {
 				for unitNum, unit := range rethCfg.Units {
+					if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+						continue
+					}
 					if unit == nil { // #5068: nil unit value
 						continue
 					}
@@ -48,6 +54,9 @@ func (c *CLI) showInterfacesTerse() error {
 			}
 		} else {
 			for unitNum, unit := range ifCfg.Units {
+				if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+					continue
+				}
 				if unit == nil { // #5068: nil unit value
 					continue
 				}
@@ -94,6 +103,9 @@ func (c *CLI) showInterfacesTerse() error {
 				peerCfg, err := config.CompileConfigForNodeLenient(tree, peerNodeID)
 				if err == nil {
 					for physName, ifCfg := range peerCfg.Interfaces.Interfaces {
+						if ifCfg == nil { // #5886: skip present-but-nil InterfaceConfig
+							continue
+						}
 						// #5068: skip a present-but-nil peer interface value.
 						if ifCfg == nil {
 							continue
@@ -104,8 +116,11 @@ func (c *CLI) showInterfacesTerse() error {
 						peerIfaces[physName] = true
 						if ifCfg.RedundantParent != "" {
 							physToReth[physName] = ifCfg.RedundantParent
-							if rethCfg, ok := peerCfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && rethCfg != nil {
+							if rethCfg, ok := config.LookupInterface(peerCfg, ifCfg.RedundantParent); ok && rethCfg != nil {
 								for unitNum, unit := range rethCfg.Units {
+									if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+										continue
+									}
 									if unit == nil { // #5068: nil unit value
 										continue
 									}
@@ -114,6 +129,9 @@ func (c *CLI) showInterfacesTerse() error {
 							}
 						} else {
 							for unitNum, unit := range ifCfg.Units {
+								if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+									continue
+								}
 								if unit == nil { // #5068: nil unit value
 									continue
 								}
@@ -156,7 +174,7 @@ func (c *CLI) showInterfacesTerse() error {
 			} else {
 				// Local interface: query kernel.
 				// Check config-level disable flag (#5068: nil-safe lookup)
-				if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg != nil && ifCfg.Disable {
+				if ifCfg, ok := config.LookupInterface(cfg, u.physName); ok && ifCfg != nil && ifCfg.Disable {
 					admin = "down"
 				}
 				// For RETH interfaces, get status from physical member
@@ -220,8 +238,8 @@ func (c *CLI) showInterfacesTerse() error {
 		// RETH interface: get addresses from config, status from physical member
 		if physMember, ok := rethToPhys[u.physName]; ok {
 			var v4Addrs, v6Addrs []string
-			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg != nil {
-				if unit, ok := ifCfg.Units[u.unitNum]; ok && unit != nil {
+			if ifCfg, ok := config.LookupInterface(cfg, u.physName); ok && ifCfg != nil {
+				if unit, ok := config.LookupUnit(ifCfg, u.unitNum); ok && unit != nil {
 					for _, addr := range unit.Addresses {
 						ip, _, err := net.ParseCIDR(addr)
 						if err != nil {

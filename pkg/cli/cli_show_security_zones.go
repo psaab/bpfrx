@@ -133,7 +133,7 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 							wantUnit = u
 						}
 					}
-					ifc, ok := cfg.Interfaces.Interfaces[base]
+					ifc, ok := config.LookupInterface(cfg, base)
 					// #5910: `ok` proves KEY presence, not a non-nil value — the
 					// tolerant load / HA config-sync path admits a present-but-nil
 					// InterfaceConfig (#3494/#5068). Guard nil AND walk units via
