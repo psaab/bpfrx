@@ -47964,6 +47964,33 @@ top.
   the single-root no-regression case stayed GREEN; restored GREEN.
 
 - **Timestamp**: 2026-07-13
+  **Action**: #5302 (codex-review-178 A5-b1-F5, vsrx-parity) — RA sender cached
+  net.Interface.HardwareAddr at Start, so a post-RETH/VLAN-virtual-MAC-change
+  ResendBurst advertised a STALE ICMPv6 SLLA. buildRA (sender.go:800) marshals
+  s.iface.HardwareAddr, re-read only inside listen()'s bind-retry. A day-2
+  failover reprograms the virtual MAC while RA config is unchanged → RA
+  reconciliation keeps the sender and only requests a burst (ResendBurst →
+  burstCh) without re-resolving → the burst carries the OLD MAC → hosts point
+  the router's neighbor entry at a MAC the active node no longer owns (IPv6
+  blackhole, opposite of RA's neighbor-repair intent). Fix: added
+  interfaceByNameFn seam (default net.InterfaceByName; also backs listen()'s
+  existing re-read) and refreshInterfaceForBurst() — an OWNER-serialized
+  re-resolve (runs in the run() goroutine that solely owns s.iface, never
+  concurrent with listen()) invoked in the burstCh handler BEFORE
+  burstInterruptible; a successful refresh also freshens subsequent periodic
+  sends. On refresh failure the burst is SKIPPED + slog.Warn (advertising a
+  stale MAC is worse than sending nothing). No daemon_apply.go change needed —
+  the existing ResendBurst trigger (daemon_apply.go:1287, post-NotifyLinkCycle)
+  now refreshes automatically. Updated pkg/ra/README.md ResendBurst contract.
+  **File(s)**: pkg/ra/sender.go, pkg/ra/README.md,
+  pkg/ra/ra_mac_refresh_5302_test.go
+  GREEN: go test ./pkg/ra/... (incl -race on the new tests) passes; gofmt + go
+  vet + go build clean. Fail-on-revert proven: neutralizing the burstCh-handler
+  refresh (unconditional burstInterruptible) →
+  TestResendBurstRefreshesSLLAAfterMACChange_5302 RED (burst kept advertising
+  MAC ...00:0a, want ...00:0b) + TestResendBurstSkipsOnRefreshFailure_5302 RED
+  (burst sent 3 stale RAs, want 0); restored GREEN. Live post-failover
+  neighbor-repair verify is cluster-shim-ABI-walled → deferred.
   **Action**: Fix #5784 — `system archival transfer-interval` (config-minutes)
   was multiplied by time.Minute with no product-side overflow clamp before
   time.NewTicker (daemon_archive_timer.go runArchiveTimer). Same class as the
@@ -48031,3 +48058,36 @@ top.
   argument`); the isolated test and full daemon suite both passed after using
   the shorter pre-created `/dev/shm/g5` path. Required documentation regex
   guards and `git diff --check` passed.
+- **Timestamp**: 2026-07-14 14:15 PDT
+  **Action**: Fix #4162 — make Prometheus metrics authentication listener-owned.
+  `NewServer` now builds the mux, Prometheus collector/limiter, and CSRF guard
+  once, then independently derives each HTTP/HTTPS owner handler from that
+  listener's configured bind. With API auth, only a literal loopback listener
+  leaves `/metrics` open; routable, wildcard, hostname, malformed, and
+  otherwise unprovable binds fail closed. Nil auth returns the unchanged shared
+  base. This preserves the global scrape limiter and session-gauge cache while
+  keeping `/health` exempt. The actual owner-handler matrix covers both mixed
+  listener orientations, Basic/Bearer/API-key credentials, IPv4/IPv6 loopback,
+  wildcard/hostname/malformed failure, auth-wrapped health/non-metrics routes,
+  nil-auth 404 pass-through, and persistence-degraded HTTPS installation.
+  **File(s)**: pkg/api/server.go, pkg/api/auth.go,
+  pkg/api/metrics_auth_gate_4162_test.go, docs/architecture.md, _Log.md
+  **Validation**: `gofmt -w pkg/api/server.go pkg/api/auth.go
+  pkg/api/metrics_auth_gate_4162_test.go`; focused #4162/cache/TLS/lifecycle
+  `go test ./pkg/api -run 'Test(IsLoopbackBindAddr|MetricsAuthGateNonLoopback|NewServerMetricsAuthIsOwnedByEachListener|SessionGaugeCacheWalksOncePerTTL|SessionGaugeCacheRefreshesAfterTTL|SessionGaugeCacheCoalescesConcurrentScrapes|SessionGaugeCacheValuesCorrect|HTTPSInstalledOnPersistFailure|RunClosesSurvivingListenerOnBindFailure|RunGracefulShutdownClosesBothListeners)$' -count=1`; `go test ./pkg/api -count=1`; `go test -race ./pkg/api -count=1`; `go vet ./pkg/api`; `go build ./pkg/api`; `go build ./cmd/xpfd`; all passed. `git diff --check` passed. Residual gaps: none; no true certificate-generation-failure seam exists in the approved scope.
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5302 review fold (MERGE-NEEDS-MINOR): remove the only
+  cross-goroutine `s.iface` read in the RA sender. rsReceiver's RFC 4861
+  §6.1.1 discard log read `s.iface.Name` from its own goroutine while the
+  new `refreshInterfaceForBurst` writes `s.iface` in run() — a formal
+  (value-benign, Name is invariant) data race per the Go memory model.
+  Switch that log to the immutable `s.cfg.Interface` (matches every other
+  log site) so `s.iface` is single-writer / no-other-reader, and correct
+  the ownership comment to state the reader disposition instead of
+  overstating "sole writer ⇒ no lock".
+  **File(s)**: pkg/ra/sender.go, _Log.md
+  **Validation**: `go build ./pkg/ra`; `go test -race ./pkg/ra
+  -run '5302|ResendBurst|RefreshInterface' -count=1` (green); full
+  `go test ./pkg/ra -count=1` re-run below; fail-on-revert of the
+  burstCh refresh still flips the 5302 tests RED.
