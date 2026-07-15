@@ -48629,3 +48629,28 @@ top.
 - **Timestamp**: 2026-07-15
   **Action**: #5890 (SECURITY: interactive-console `request system zeroize` retained tls key + rendered service configs + login accounts). REACHABILITY GATE first: confirmed the console handler (cli_request_system.go:80) calls c.zeroizeConfigState() DIRECTLY as a standalone console command (NOT routed through gRPC/performZeroizeWipe), so the bug is REACHABLE. Divergence confirmed: console (zeroizeConfigState → FactoryResetConfigDir + FactoryResetArchiveDir) erased config DB + archive but OMITTED tls/ (only wiped by gRPC's zeroizeConfigDir RemoveAll(<root>/tls)), rendered configs (zeroizeRenderedConfigs frr/swanctl/kea), and login accounts (zeroizeLoginAccounts shadow/authorized_keys/sudoers.d/xpf-*), while gRPC performZeroizeWipe erases all of them. FIX = OPTION A (delegate, single source of truth) — clean because pkg/cli ALREADY imports pkg/grpcapi (peer.go) with no cycle and performZeroizeWipe is a pure (configDir,configBase) function: exported grpcapi.PerformZeroizeWipe wrapper (keeps the performZeroizeWipe test-seam var); refactored the console into performConsoleZeroize() which resolves+validates the configured root (zeroizeConfigRoot, #5554/#5684, fail-closed) then delegates to grpcapi.PerformZeroizeWipe via a zeroizeFullWipe seam and stops xpfd via a zeroizeStopDaemon seam; DELETED the divergent zeroizeConfigState so it can't be reused. Owned-scope inherited from performZeroizeWipe (#5768) — no over-wipe. Fail-closed: a wipe error is surfaced and the daemon is NOT stopped. Testability: added grpcapi package-var seams for the rendered legs (zeroizeFRRConf/zeroizeSwanctlSnippet/zeroizeKea4Conf/zeroizeKea6Conf) + the non-secret BPF/networkd legs (zeroizeBPFPinDir/zeroizeNetworkdDir) so PerformZeroizeWipe is fully hermetic under test (production paths unchanged). Tests: pkg/grpcapi/zeroize_full_set_5890_test.go TestPerformZeroizeWipeErasesFullSecretSet_5890 — seed a temp root with .configdb/master.key + tls/key.pem + frr-managed-section-secret + swanctl PSK + kea + provisioned login (userdel/authorized_keys/sudoers xpf-*) + archive snapshot, all legs seamed (no real /etc), call PerformZeroizeWipe, assert EVERY secret gone + operator artifacts (FRR operator content, non-xpf sudoers, operator networkd) survive; pkg/cli/console_zeroize_full_wipe_5890_test.go — console delegates to the full wipe, propagates a wipe failure fail-closed (daemon NOT stopped), and fails closed on an undeterminable config root; migrated cli_zeroize_configured_root_5554_test.go's zeroizeConfigState test → performConsoleZeroize with a spy (configured-root revert guard preserved). Fail-on-revert verified firsthand: console reverted to skip the full wipe → 3 cli delegation tests RED; tls/ RemoveAll dropped from zeroizeConfigDir → full-set test RED (tls key survives); both restored GREEN. go build ./... clean; go vet ./pkg/grpcapi/ clean (pkg/cli shows only the pre-existing unrelated cli.go:511 unreachable-code warning — I did not touch cli.go); go test -race ./pkg/cli/ ./pkg/grpcapi/ GREEN (full suites). Docs: pkg/grpcapi/README.md + pkg/cli/README.md zeroize sections updated (console delegates to the shared PerformZeroizeWipe; identical owned-artifact set; fail-closed; hermetic-test seams).
   **File(s)**: pkg/cli/cli_request_system.go, pkg/cli/cli_zeroize_configured_root_5554_test.go, pkg/cli/console_zeroize_full_wipe_5890_test.go (new), pkg/grpcapi/server_diag_zeroize.go, pkg/grpcapi/zeroize_full_set_5890_test.go (new), pkg/grpcapi/README.md, pkg/cli/README.md, _Log.md
+## 2026-07-15 — #5847 two-phase kernel arm (ARMING intent + BootNext readback)
+
+- **Timestamp**: 2026-07-15
+- **Action**: Fix the false-ARMED wedge — the kernel-roll arm persisted ARMED
+  BEFORE SetBootNext, so a crash in the gap left a journal claiming ARMED while
+  the firmware booted known-good and no trial happened, wedging HA self-recovery
+  (Arm refused-forever, self-recovery suppressed failback forever). Implemented
+  the two-phase arm: record ARMING (prepared intent + per-attempt nonce) before
+  any NVRAM mutation; SetBootNext; positively read GetBootNext() back ==
+  inactiveID; only then transition ARMING -> ARMED recording the confirmed
+  BootID. ARMING sits below ARMED in the state order, so Arm re-arms from ARMING,
+  self-recovery does not suppress on ARMING, and IsArmed is true only for the
+  verified ARMED.
+- **File(s)**: pkg/upgrade/kernel.go (KernelStateArming + reorder, journal
+  BootID/ArmNonce/ArmAttempts, GetBootNext interface method), pkg/upgrade/
+  kernel_linux.go (bootNextRE + GetBootNext efibootmgr readback), pkg/upgrade/
+  kernel_run.go (armCandidate two-phase rewrite + newArmNonce), pkg/upgrade/
+  kernel_test.go (fake GetBootNext + seams), pkg/upgrade/
+  kernel_arm_two_phase_5847_test.go (NEW — 4 fail-on-revert tests), docs/
+  in-place-upgrade.md (two-phase arm + BootNext-readback provenance + ARMING vs
+  verified-ARMED self-recovery semantics).
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/ clean; go test
+  -race ./pkg/upgrade/ GREEN; the ARMED-first revert (drop ARMING/readback)
+  proven RED via -overlay on Test 1 (re-arm + self-recovery) and Test 2
+  (readback mismatch), with Test 3 (no-regression) still green.

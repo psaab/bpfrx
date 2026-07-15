@@ -324,27 +324,77 @@ func (r *KernelRunner) armCandidate(j *KernelJournal) error {
 		r.logf("kernel-upgrade arm: WARNING arm watchdog: %v (continuing; BootNext closes the loop)", err)
 	}
 
-	// Journal ARMED *before* arming BootNext (r1 Codex Critical-2): the
-	// reboot-boundary crash hole is "firmware booted the candidate but the
-	// journal still says INSTALLED, so Promote() no-ops". By persisting ARMED
-	// first, any crash after this point leaves a recoverable ARMED journal that
-	// Promote() acts on. The selector + ARMED journal are both harmless without
-	// BootNext (the firmware default is still the known-good slot), so ordering
-	// the durable ARMED write ahead of the one-shot is strictly safe.
-	if err := r.ktransition(j, KernelStateArmed); err != nil {
+	// Two-phase arm (#5847). The previous order persisted ARMED *before* the
+	// NVRAM one-shot on the theory that an ARMED-without-BootNext journal is
+	// harmless. It is NOT: a crash in that gap (or before the best-effort
+	// rollback ran) left a journal claiming ARMED while the firmware still boots
+	// the known-good default and no trial ever happens — a FALSE-ARMED journal.
+	// Arm then refuses-forever (>= ARMED), and self-recovery treats it as a
+	// genuine in-flight trial and suppresses expired-lease failback INDEFINITELY,
+	// so a drained node never rejoins. The two orders are not symmetric — neither
+	// single write is atomic with the NVRAM mutation — so make ARMED authoritative
+	// via a positive readback instead:
+	//
+	//   1. record ARMING (prepared intent) BEFORE the NVRAM mutation, with a
+	//      fresh per-attempt nonce;
+	//   2. SetBootNext(inactiveID);
+	//   3. POSITIVELY read BootNext back == inactiveID (a firmware that dropped
+	//      or partial-wrote the variable must not yield a false-ARMED journal);
+	//   4. only THEN durably transition ARMING -> ARMED, recording the confirmed
+	//      boot id.
+	//
+	// A journal stuck at ARMING is NOT a genuine trial (BootNext unconfirmed):
+	// Arm re-arms from it (ARMING < ARMED, so the >= ARMED refusal does not fire),
+	// and self-recovery does not suppress failback (IsArmed reports true only for
+	// the verified ARMED). armCandidate is idempotent, so a re-arm from ARMING
+	// re-runs cleanly.
+	j.ArmAttempts++
+	j.ArmNonce = r.newArmNonce(j)
+	j.BootID = ""
+	if err := r.ktransition(j, KernelStateArming); err != nil {
 		return err
 	}
 
 	if err := sys.SetBootNext(inactiveID); err != nil {
-		// Roll the journal back to INSTALLED so a retry re-arms cleanly; the
-		// selector is already correct and BootNext was not set, so the box
-		// still boots the known-good default.
-		j.State = KernelStateInstalled
-		_ = r.saveKernelJournal(j)
+		// BootNext was not set; the journal is only ARMING (no verified trial),
+		// so the box still boots the known-good default and a retry re-arms
+		// cleanly. Leave the journal at ARMING (do NOT drop back to INSTALLED):
+		// re-entry resumes the arm, and self-recovery already treats ARMING as
+		// no-trial.
 		return fmt.Errorf("kernel-upgrade arm: efibootmgr --bootnext %s: %w", inactiveID, err)
 	}
 
+	// Positively confirm the firmware accepted the one-shot BEFORE recording the
+	// verified-ARMED journal. If the readback disagrees (firmware silently
+	// dropped / partial-wrote the variable), do NOT advance to ARMED — stay
+	// ARMING and surface the error so no false-ARMED journal is persisted.
+	got, err = sys.GetBootNext()
+	if err != nil {
+		return fmt.Errorf("kernel-upgrade arm: read back BootNext (staying ARMING): %w", err)
+	}
+	if got != inactiveID {
+		return fmt.Errorf("kernel-upgrade arm: BootNext readback = %q, expected inactive slot %s "+
+			"(%s); firmware did not accept the one-shot — refusing to record ARMED (staying ARMING)",
+			got, j.InactiveSlot, inactiveID)
+	}
+
+	// Verified: the firmware WILL boot the candidate next. Record the confirmed
+	// boot id and transition to the genuine (trial-in-flight) ARMED state.
+	j.BootID = inactiveID
+	if err := r.ktransition(j, KernelStateArmed); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// newArmNonce builds a per-attempt arm token (#5847). It combines the system
+// clock with the run's monotonically-increasing attempt counter and the
+// candidate/slot identity so a fresh arm is always distinguishable from a stale
+// journal — the attempt counter guarantees uniqueness across attempts even under
+// a stuck test clock.
+func (r *KernelRunner) newArmNonce(j *KernelJournal) string {
+	return fmt.Sprintf("%d-%d-%s-%s", r.cfg.Sys.Now().UnixNano(), j.ArmAttempts, j.InactiveSlot, j.CandidateVersion)
 }
 
 // Promote runs the POST-REBOOT promotion gate from the candidate boot. It is
