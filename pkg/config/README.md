@@ -222,6 +222,22 @@ still boots but the overwrite is no longer silent. The fix is a GATE, not a
 remapping: `LinuxIfName`'s mapping is unchanged, so every existing
 single-name config compiles exactly as before.
 
+**Present-but-nil interface/unit slots — walk via `RangeInterfaces` /
+`RangeUnits` (#5813).** The tolerant load / HA config-sync path admits a
+present-key/nil-value `InterfaceConfig` (`cfg.Interfaces.Interfaces["ge-0/0/0"]
+= nil`) or `InterfaceUnit` (`ifc.Units[7] = nil`) — same #3494/#5068 no-brick
+tolerance as the policy/zone nil cases above. A raw `for _, ifc := range
+cfg.Interfaces.Interfaces { for _, unit := range ifc.Units { unit.Number … } }`
+nil-derefs on such a slot and panics the in-process daemon during a routine
+read-only presentation (`show security flow session`, gRPC `GetSessions`, REST
+`/sessions`). `RangeInterfaces(cfg, fn)` and `RangeUnits(ifc, fn)`
+(`interfaces_iter.go`) are the shared nil-safe walk: they skip the nil slots (and
+no-op on a nil `cfg`/`ifc`), so every read-only presenter that walks the
+interface tree stays panic-safe with the guard in ONE place. The three session
+egress-interface map builders (CLI `buildSessionEgressIfacesWithLookup`, gRPC
+`buildSessionFilter`, REST `buildSessionView`) all route through them; new
+interface-tree presenters should too rather than reintroducing a raw range.
+
 **Comments (`# ...`, `// ...`, `/* ... */`) and unterminated blocks
 (M-8):** the lexer (`skipWhitespaceAndComments`) skips `#`/`//` line
 comments to end-of-line and `/* */` block comments to their closing
