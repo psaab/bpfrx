@@ -480,13 +480,36 @@ func (c *CLI) handleClearDHCP(args []string) error {
 		return nil
 	}
 
+	// A bare `clear dhcp client-identifier` (no selector) is the intentional
+	// clear-ALL. But a malformed selector must NOT silently degrade to it:
+	// `... interface` (no name), `... interfce ge-0/0/0` (unknown selector),
+	// or a stray trailing token used to skip the scoped branch and fall
+	// through to ClearAllDUIDs(), wiping EVERY DHCPv6 DUID instead of the one
+	// the operator scoped. Validate the selector BEFORE any mutation and
+	// reject a malformed one, mirroring the remote CLI's #4883-E guard
+	// (cmd/cli/clear.go handleClearDHCP) so both parsers reject the same
+	// input the same way (#5896). Validation runs before the c.dhcp==nil
+	// check so bad input always errors, regardless of DHCP client state.
+	var ifName string
+	if len(args) >= 2 {
+		if args[1] != "interface" {
+			return fmt.Errorf("usage: clear dhcp client-identifier [interface <name>]")
+		}
+		if len(args) < 3 || args[2] == "" {
+			return fmt.Errorf("clear dhcp client-identifier: 'interface' requires a name")
+		}
+		if len(args) > 3 {
+			return fmt.Errorf("clear dhcp client-identifier: unexpected argument %q after interface name", args[3])
+		}
+		ifName = args[2]
+	}
+
 	if c.dhcp == nil {
 		fmt.Println("No DHCP clients running")
 		return nil
 	}
 
-	if len(args) >= 3 && args[1] == "interface" {
-		ifName := args[2]
+	if ifName != "" {
 		if err := c.dhcp.ClearDUID(ifName); err != nil {
 			return fmt.Errorf("clear DUID: %w", err)
 		}
