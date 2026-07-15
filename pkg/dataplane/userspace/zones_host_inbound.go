@@ -56,14 +56,17 @@ type ZoneHostInboundView struct {
 // a DHCP-only interface with a live lease yields a NON-empty address set and IS
 // scoped by the deny. (xpfd disables IPv6 RA on every managed interface in
 // pkg/networkd, so DHCPv6 is the only IPv6 dynamic-address path and the same
-// snapshot captures it; SLAAC is not a separate case.) The deny is also
-// re-rendered on every DHCP/DHCPv6 lease change on a dataplane interface
-// (onDHCPAddressChange -> dhcpLeaseChangeRequiresRecompile -> applyConfig ->
-// applyHostInboundFilter), so a renewed/flapped lease re-scopes within one
-// reconcile pass. #3224 was filed on the premise that DHCP addresses fell out
-// of scope (FAIL OPEN); that does not reproduce because the live snapshot has
-// always carried them — see TestBuildZoneHostInboundViewsScopesKernelLearnedAddr,
-// which exercises this real path with a config-absent kernel address.
+// snapshot captures it; SLAAC is not a separate case.) A DHCP/DHCPv6 change
+// classified for full recompile runs serialized applyConfig. This view and its
+// nft deny are re-rendered for that invocation only if the apply reaches
+// applyTailReconciles. A required protocol-gate error can return before that
+// tail, so applyHostInboundFilter does not run and retry/re-render waits for a
+// later applicable successful reconcile that reaches the tail. #5791 separately
+// owns callbacks classified into the management-only branch. #3224 was filed on
+// the premise that DHCP addresses fell out of scope (FAIL OPEN); that does not
+// reproduce because the live snapshot has always carried them — see
+// TestBuildZoneHostInboundViewsScopesKernelLearnedAddr, which exercises this
+// real path with a config-absent kernel address.
 //
 // #3405: a zone that declared NO host-inbound-traffic stanza is NOT omitted —
 // it is treated as an empty stanza and gets a catch-all DROP scoped to its
@@ -71,12 +74,13 @@ type ZoneHostInboundView struct {
 // service/protocol not explicitly permitted). The only no-address case left is a
 // configured zone whose interfaces have neither a static config address nor any
 // live kernel address yet (e.g. a DHCP WAN before its first lease, or a backup
-// node before VIP install): it yields an empty address set, the daemon emits no
-// deny for it, and it self-heals once an address appears because the
-// lease-change / commit paths re-render. That transient fail-open admit window
-// is surfaced to operators by AddresslessEnforcingZones (#3698) — the daemon
-// logs a state-transition warning and exports xpf_host_inbound_addressless_zones
-// while the window is open, so it is no longer silent.
+// node before VIP install): it yields an empty address set and the daemon emits
+// no deny for it. Address appearance makes the address available to a later
+// snapshot; it does not itself prove re-render or nft publication. That
+// transient fail-open admit window is surfaced to operators by
+// AddresslessEnforcingZones (#3698) — the daemon logs a state-transition warning
+// and exports xpf_host_inbound_addressless_zones while the window is open, so it
+// is no longer silent.
 func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
@@ -96,8 +100,9 @@ func BuildZoneHostInboundViews(cfg *config.Config) []ZoneHostInboundView {
 
 	// Each emitted view is a group keyed by (zone, effective-token signature).
 	// Addresses accumulate per group; a group is created lazily on its first
-	// address so a configured-but-address-less interface stays omitted (admit
-	// nothing emitted, self-heals when an address appears) exactly as before.
+	// address so a configured-but-address-less interface stays omitted. A later
+	// snapshot can include an appeared address; this builder does not schedule or
+	// publish the re-render.
 	type group struct {
 		zone   string
 		svc    []string
