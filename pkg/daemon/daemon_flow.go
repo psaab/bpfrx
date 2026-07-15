@@ -85,49 +85,91 @@ func (d *Daemon) collectDHCPRoutes() []frr.DHCPRoute {
 // duplicated here only for the netlink route reconcile below.
 const mgmtVRFTableID = 999
 
-// applyMgmtVRFRoutes reconciles the DHCP-learned routes in the management VRF
-// table (999) against the current management-lease state. Leases on management
-// interfaces (fxp*/fab*/em*) are not owned by FRR — FRR does not manage the
-// management VRF — so their default gateway (option 3, or the option-121
-// 0.0.0.0/0 entry) and RFC 3442 classless static routes (option 121 / legacy
-// 249) are programmed directly via netlink.
+// The management-VRF route reconcile (applyMgmtVRFRoutes / applyMgmtVRFRoutesTo /
+// reconcileMgmtVRFRouteDeletes) programs the DHCP-learned routes for the
+// management VRF table (999). Leases on management interfaces (fxp*/fab*/em*) are
+// not owned by FRR — FRR does not manage the management VRF — so their default
+// gateway (option 3, or the option-121 0.0.0.0/0 entry) and RFC 3442 classless
+// static routes (option 121 / legacy 249) are programmed directly via netlink.
 //
 // This is a full reconcile, not an append-only apply (#5108). Every route xpf
 // installs here is stamped RTPROT_DHCP so it can be distinguished from
 // operator/kernel routes sharing the table. Each apply:
 //
-//  1. Computes the DESIRED route set from the current management leases and
-//     RouteReplaces each one (idempotent add-or-update), recording its
-//     destination key.
-//  2. Lists the xpf-owned (RTPROT_DHCP) routes already in table 999 and
-//     RouteDels any whose destination is no longer desired.
+//  1. RouteReplaces each desired lease route (idempotent add-or-update) and, on
+//     SUCCESS, records the route's FULL identity (destination + gateway + output
+//     link, mgmtRouteAppliedKey) in the `applied` protect-set (#5867).
+//  2. Lists the xpf-owned (RTPROT_DHCP) routes in the table and RouteDels any
+//     whose full identity is NOT in `applied` — a withdrawn route OR a stale
+//     route whose replacement failed.
 //
-// Step 2 runs UNCONDITIONALLY — including when the desired set is empty (the
-// management lease was disabled, or an option-121 route was withdrawn).
-// Early-returning on an empty desired set was the #5108 bug: a withdrawn
-// classless route or a disabled lease left a stale route in table 999 that
-// could blackhole or misdirect management/HA traffic to a prior DHCP router
-// until manual cleanup or reboot. The delete is scoped to RTPROT_DHCP routes
-// so operator-installed routes in the VRF are never touched; ESRCH (already
-// gone) is tolerated, any other RouteDel error is surfaced.
-func (d *Daemon) applyMgmtVRFRoutes() {
+// Step 2 runs UNCONDITIONALLY — including when `applied` is empty (the management
+// lease was disabled, or an option-121 route was withdrawn). Early-returning on
+// an empty set was the #5108 bug (a stale route left in the table could blackhole
+// or misdirect management/HA traffic to a prior DHCP router). Keying the
+// protect-set on the FULL applied identity — and adding a route to it only after
+// its RouteReplace succeeds — is the #5867 fix: a route that keeps its
+// destination but changes gateway/output-interface and then FAILS to replace no
+// longer keeps its stale predecessor protected. The delete is scoped to
+// RTPROT_DHCP so operator routes are never touched; ESRCH (already gone) is
+// tolerated, any other RouteDel error is surfaced into the returned error so the
+// commit fails closed.
+//
+// mgmtRouteProgrammer is the netlink surface applyMgmtVRFRoutesTo needs: resolve
+// interfaces, replace routes, and (via the embedded mgmtRouteReconciler)
+// list+delete for the cleanup pass. *netlink.Handle satisfies it in production;
+// a test injects a fake to drive a RouteReplace failure without a real handle
+// (#5867).
+type mgmtRouteProgrammer interface {
+	LinkByName(name string) (netlink.Link, error)
+	RouteReplace(route *netlink.Route) error
+	mgmtRouteReconciler
+}
+
+// applyMgmtVRFRoutes reconciles the DHCP-learned routes in the management VRF and
+// returns the joined netlink errors so the commit path can fail closed. It is a
+// thin wrapper: it acquires a real netlink handle and delegates the programming +
+// cleanup to applyMgmtVRFRoutesTo (the injectable, unit-tested core).
+func (d *Daemon) applyMgmtVRFRoutes() error {
 	if d.dhcp == nil {
-		return
+		return nil
 	}
 	nlh, err := netlink.NewHandle()
 	if err != nil {
 		slog.Warn("mgmt VRF routes: failed to get netlink handle", "err", err)
-		return
+		return fmt.Errorf("mgmt VRF routes: netlink handle: %w", err)
 	}
 	defer nlh.Close()
+	return d.applyMgmtVRFRoutesTo(nlh, d.dhcp.Leases(), d.mgmtVRFIfaceSet())
+}
 
-	// 1. Program the desired routes and record their destination keys so the
-	//    reconcile pass below knows which xpf-owned routes to keep. When no
-	//    management interface has a route-bearing lease the desired set stays
-	//    empty and the reconcile deletes every xpf-owned route in the table.
-	mgmtSet := d.mgmtVRFIfaceSet()
-	desired := make(map[string]struct{})
-	for _, lease := range d.dhcp.Leases() {
+// applyMgmtVRFRoutesTo programs each management interface's DHCP-learned routes
+// through nlh, then reconciles away every xpf-owned route in the table that is
+// not currently APPLIED. Split out from applyMgmtVRFRoutes so a test can inject a
+// fake programmer + lease set and drive a RouteReplace failure (#5867).
+//
+// #5867 (desired-vs-applied identity): the reconcile protect-set (`applied`) keys
+// on the FULL managed-route identity — destination + gateway + output link index
+// (mgmtRouteAppliedKey) — and a route joins it ONLY AFTER its RouteReplace
+// SUCCEEDS. The pre-#5867 code keyed the protect-set on destination+family alone
+// and inserted the key BEFORE RouteReplace ran, so a route that kept its
+// destination but changed gateway or output interface and then FAILED to replace
+// left the OLD (stale) route in the kernel yet STILL protected from cleanup —
+// management traffic pinned to a stale gateway/interface (possibly a
+// de-authorized tenant path) while the commit reported success. Keying `applied`
+// on the full identity means a stale same-destination route (old gateway/ifindex)
+// matches no applied identity, so the cleanup pass removes it; the RouteReplace
+// error is also returned so the commit fails closed rather than silently
+// acknowledging the stale pin. A SUCCESSFUL gateway change still replaces cleanly
+// (RouteReplace overwrites the same-destination entry) and the new identity is
+// protected — the happy path is unchanged.
+func (d *Daemon) applyMgmtVRFRoutesTo(nlh mgmtRouteProgrammer, leases []*dhcp.Lease, mgmtSet map[string]bool) error {
+	var errs []error
+	// applied records the FULL identity of each route whose RouteReplace SUCCEEDED
+	// (#5867). When no management interface has a route-bearing lease it stays
+	// empty and the reconcile deletes every xpf-owned route in the table.
+	applied := make(map[string]struct{})
+	for _, lease := range leases {
 		if !mgmtSet[lease.Interface] {
 			continue
 		}
@@ -143,6 +185,9 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 		}
 		link, err := nlh.LinkByName(lease.Interface)
 		if err != nil {
+			// A missing interface (renaming churn) is not a route-apply failure;
+			// log and skip. Any stale route for it is left OUT of `applied`, so
+			// the cleanup pass removes it.
 			slog.Warn("mgmt VRF route: interface not found",
 				"interface", lease.Interface, "err", err)
 			continue
@@ -164,11 +209,14 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 				Table:     mgmtVRFTableID,
 				Protocol:  unix.RTPROT_DHCP,
 			}
-			desired[mgmtRouteDstKey(dst, nlFamily)] = struct{}{}
 			if err := nlh.RouteReplace(route); err != nil {
 				slog.Warn("mgmt VRF route: failed to add default route",
 					"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtVRFTableID, "err", err)
+				errs = append(errs, fmt.Errorf("mgmt VRF default route via %s dev %s: %w",
+					lease.Gateway, lease.Interface, err))
 			} else {
+				// #5867: protect ONLY the identity that actually applied.
+				applied[mgmtRouteAppliedKey(dst, nlFamily, route.Gw, route.LinkIndex)] = struct{}{}
 				slog.Info("mgmt VRF default route installed",
 					"interface", lease.Interface, "gw", lease.Gateway, "table", mgmtVRFTableID)
 			}
@@ -187,12 +235,15 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 				Table:     mgmtVRFTableID,
 				Protocol:  unix.RTPROT_DHCP,
 			}
-			desired[mgmtRouteDstKey(dst, nlFamily)] = struct{}{}
 			if err := nlh.RouteReplace(route); err != nil {
 				slog.Warn("mgmt VRF route: failed to add classless route",
 					"interface", lease.Interface, "dst", cr.Destination, "gw", cr.Gateway,
 					"table", mgmtVRFTableID, "err", err)
+				errs = append(errs, fmt.Errorf("mgmt VRF classless route %s via %s dev %s: %w",
+					cr.Destination, cr.Gateway, lease.Interface, err))
 			} else {
+				// #5867: protect ONLY the identity that actually applied.
+				applied[mgmtRouteAppliedKey(dst, nlFamily, route.Gw, route.LinkIndex)] = struct{}{}
 				slog.Info("mgmt VRF classless route installed",
 					"interface", lease.Interface, "dst", cr.Destination, "gw", cr.Gateway,
 					"table", mgmtVRFTableID)
@@ -200,9 +251,13 @@ func (d *Daemon) applyMgmtVRFRoutes() {
 		}
 	}
 
-	// 2. Delete xpf-owned routes in table 999 that are no longer desired.
-	//    Runs even when desired is empty (disabled lease / withdrawn route).
-	d.reconcileMgmtVRFRouteDeletes(nlh, mgmtVRFTableID, desired)
+	// Delete xpf-owned routes in the table whose FULL identity is not in
+	// `applied` — a withdrawn route OR a stale route whose replacement failed
+	// (#5867). Runs even when applied is empty (disabled lease / withdrawn route).
+	if err := d.reconcileMgmtVRFRouteDeletes(nlh, mgmtVRFTableID, applied); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // mgmtRouteReconciler is the minimal netlink surface reconcileMgmtVRFRouteDeletes
@@ -217,7 +272,8 @@ type mgmtRouteReconciler interface {
 // both address families (RouteListFiltered is per-family) scoped to
 // table+protocol so operator/kernel routes are never considered. ESRCH (the
 // route is already gone) is tolerated; any other delete error is surfaced.
-func (d *Daemon) reconcileMgmtVRFRouteDeletes(nlh mgmtRouteReconciler, tableID int, desired map[string]struct{}) {
+func (d *Daemon) reconcileMgmtVRFRouteDeletes(nlh mgmtRouteReconciler, tableID int, applied map[string]struct{}) error {
+	var errs []error
 	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		current, err := nlh.RouteListFiltered(family, &netlink.Route{
 			Table:    tableID,
@@ -228,27 +284,37 @@ func (d *Daemon) reconcileMgmtVRFRouteDeletes(nlh mgmtRouteReconciler, tableID i
 				"family", family, "table", tableID, "err", err)
 			continue
 		}
-		for _, rt := range mgmtVRFRoutesToDelete(current, desired, family) {
+		for _, rt := range mgmtVRFRoutesToDelete(current, applied, family) {
 			rt := rt
 			if err := nlh.RouteDel(&rt); err != nil && !errors.Is(err, unix.ESRCH) {
 				slog.Warn("mgmt VRF route: failed to delete withdrawn route",
 					"dst", rt.Dst, "table", tableID, "err", err)
+				// #5867: a stale route we resolved to remove could NOT be
+				// deleted — surface it so the commit fails closed rather than
+				// acknowledging a management route the reconcile could not clean up.
+				errs = append(errs, fmt.Errorf("mgmt VRF route delete %v: %w", rt.Dst, err))
 			} else {
 				slog.Info("mgmt VRF route withdrawn",
 					"dst", rt.Dst, "table", tableID)
 			}
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // mgmtVRFRoutesToDelete returns the subset of current routes (already scoped to
 // xpf-owned RTPROT_DHCP routes in the management VRF table) whose destination is
 // not present in the desired set. Pure — the reconcile diff is unit-tested here
 // so a regression to the pre-#5108 no-delete behavior fails the test.
-func mgmtVRFRoutesToDelete(current []netlink.Route, desired map[string]struct{}, family int) []netlink.Route {
+func mgmtVRFRoutesToDelete(current []netlink.Route, applied map[string]struct{}, family int) []netlink.Route {
 	var del []netlink.Route
 	for i := range current {
-		if _, ok := desired[mgmtRouteDstKey(current[i].Dst, family)]; !ok {
+		// #5867: match on the FULL identity (destination + gateway + output
+		// link), not the destination alone, so a stale same-destination route
+		// (old gateway/ifindex, left behind by a failed replacement) is NOT
+		// protected and is eligible for cleanup.
+		key := mgmtRouteAppliedKey(current[i].Dst, family, current[i].Gw, current[i].LinkIndex)
+		if _, ok := applied[key]; !ok {
 			del = append(del, current[i])
 		}
 	}
@@ -279,6 +345,24 @@ func mgmtRouteDstKey(dst *net.IPNet, family int) string {
 		ip = v4
 	}
 	return fmt.Sprintf("%s/%d", ip.Mask(dst.Mask).String(), ones)
+}
+
+// mgmtRouteAppliedKey canonicalizes the FULL identity of an xpf-managed VRF route
+// — destination (via mgmtRouteDstKey) PLUS gateway and output link index — into a
+// comparable key (#5867). The cleanup protect-set keys on this full identity, not
+// just the destination, so a route whose replacement FAILED (its stale
+// predecessor — same destination, different gateway/ifindex — still in the
+// kernel) matches no applied identity and is therefore eligible for cleanup.
+// Table and protocol are constant for every managed route (the reconcile list is
+// filtered on them), so they are not part of the discriminating key. The gateway
+// is canonicalized through net.IP.String so a 4- vs 16-byte representation of the
+// same address compares equal.
+func mgmtRouteAppliedKey(dst *net.IPNet, family int, gw net.IP, linkIndex int) string {
+	gwStr := ""
+	if gw != nil {
+		gwStr = gw.String()
+	}
+	return fmt.Sprintf("%s|gw=%s|if=%d", mgmtRouteDstKey(dst, family), gwStr, linkIndex)
 }
 
 // logFinalStats reads and logs global counter summary before shutdown.
