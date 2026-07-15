@@ -1610,14 +1610,31 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 		if buildErr != nil {
 			// #5844: buildErr is DELIBERATELY not joined into the commit-error.
 			// It is a fail-SAFE representability degradation, not a partial
-			// kernel mutation: a filter term that cannot be expressed as an ip
-			// rule (port-except / tcp-flags / icmp / is-fragment / flex /
-			// overflow) is DROPPED to under-steer to the main table, and the
-			// userspace filter path still enforces it. ApplyPBRRules(pbrRules)
+			// kernel mutation. The kernel ip rule (BuildPBRRules) is only a
+			// MIRROR of the userspace FBF steer for SLOW-PATH (XDP_PASS) packets
+			// (rules.go: "the kernel also honors PBR for XDP_PASS'd packets, e.g.
+			// SNAT'd traffic destined for a VRF/GRE tunnel"). The AUTHORITATIVE
+			// fast-path enforcement of a `then routing-instance` term — with the
+			// FULL L4 match the kernel ip rule cannot express (port-except /
+			// tcp-flags / icmp / is-fragment / flex) — is the userspace filter
+			// engine: buildFilterTermSnapshots carries term.RoutingInstance +
+			// the full match into the FirewallTermSnapshot
+			// (pkg/dataplane/userspace/filters.go), and the Rust evaluator sets
+			// acc.routing_instance = term.routing_instance on a full-term match
+			// (userspace-dp/src/filter/engine/eval.rs
+			// evaluate_interface_filter_routing_instance_*). So a term that
+			// cannot be mirrored to an ip rule is DROPPED from the kernel mirror
+			// only; on the fast path it is still steered, and a slow-path packet
+			// UNDER-steers to the main table (the fail-safe direction — never an
+			// address-only OVER-steer / cross-VRF leak, rules.go BuildPBRRules).
+			// The degradation is already observable (this WARN + the #4422
+			// PBRBuildStats degraded gauge), not silent. ApplyPBRRules(pbrRules)
 			// below fully reconciles whatever WAS built (deleting any stale
-			// rule), so no stale-or-missing cross-VRF policy survives — the
-			// #5844 bug class. Fail-closing on buildErr would instead REJECT
-			// configs with such terms that commit fine today, so it stays a
+			// rule), so no stale-or-missing cross-VRF policy survives in the
+			// mirror — the #5844 bug class is the netlink RuleAdd/RuleDel failure
+			// below, not this representability drop. Fail-closing on buildErr
+			// would instead REJECT configs with such terms that commit fine
+			// today AND are enforced on the fast path, so it stays a
 			// warn-and-continue.
 			slog.Warn("PBR rule build degraded; some routing-instance filter terms "+
 				"are not mirrored to the kernel FBF path and fall back to the main "+
