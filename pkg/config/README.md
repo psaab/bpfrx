@@ -255,8 +255,13 @@ read-only presentation (`show security flow session`, gRPC `GetSessions`, REST
 no-op on a nil `cfg`/`ifc`), so every read-only presenter that walks the
 interface tree stays panic-safe with the guard in ONE place. The three session
 egress-interface map builders (CLI `buildSessionEgressIfacesWithLookup`, gRPC
-`buildSessionFilter`, REST `buildSessionView`) all route through them; new
-interface-tree presenters should too rather than reintroducing a raw range.
+`buildSessionFilter`, REST `buildSessionView`) route through them, and #5910
+extended the same walk to the show presenters that the first pass missed —
+`showVLANs` (gRPC `show vlans`) and the `show security zones` detail renderers
+(gRPC `showZonesDetail`, CLI `showZonesDisplay`), where a bare
+`ifc, ok := …Interfaces[name]` proved key presence but not a non-nil value. New
+interface-tree presenters should route through these helpers too rather than
+reintroducing a raw range.
 
 **Comments (`# ...`, `// ...`, `/* ... */`) and unterminated blocks
 (M-8):** the lexer (`skipWhitespaceAndComments`) skips `#`/`//` line
