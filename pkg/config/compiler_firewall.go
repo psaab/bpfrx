@@ -946,6 +946,22 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 			term.IsFragment = true
 		case "flexible-match-range":
 			for _, rangeInst := range namedInstances(child.FindChildren("range")) {
+				// #5823: aggregate EVERY named range across every repeated
+				// flexible-match-range block (this switch arm fires once per
+				// block; namedInstances yields every range within a block).
+				// len(FlexMatchRangeNames) > 1 is the cardinality violation the
+				// strict gate rejects and the lenient path fails closed on. The
+				// pre-#5823 code `break`ed after the first range, silently
+				// dropping the rest (an accept term over-permitted, a
+				// discard/reject over-dropped). Compile the FIRST range into
+				// FlexMatch exactly as before (a single-range term is
+				// byte-identical); later ranges are only COUNTED — the wire is
+				// poisoned to match nothing when the count exceeds one, so
+				// compiling their fields would be dead work.
+				term.FlexMatchRangeNames = append(term.FlexMatchRangeNames, rangeInst.name)
+				if term.FlexMatch != nil {
+					continue
+				}
 				fm := &FlexMatchConfig{MatchStart: "layer-3"}
 				for _, rc := range rangeInst.node.Children {
 					switch rc.Name() {
@@ -1044,7 +1060,10 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm, family string) {
 					}
 				}
 				term.FlexMatch = fm
-				break // only first range supported per term
+				// #5823: do NOT break — the loop continues so every remaining
+				// range is COUNTED in FlexMatchRangeNames (the guard above skips
+				// re-compiling them). The strict gate then rejects a term with
+				// more than one range, and the lenient path fails it closed.
 			}
 		default:
 			// #3307: a `from` match leaf the dataplane does NOT enforce. The

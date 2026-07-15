@@ -1744,6 +1744,49 @@ and break the symmetry in the other direction. Pinned by
 `pkg/config/quotekey_roundtrip_3854_test.go` (`TestQuoteKeyLexerSymmetry3854`,
 `TestFormatParseRoundTrip3854`, `TestFormatParseIdempotent3854`).
 
+### `firewall ... from flexible-match-range` — at most ONE range per term (#5823)
+
+A firewall-filter term may name **at most one** `flexible-match-range range`.
+The userspace matcher (`flex_matches`, `userspace-dp/src/filter/engine/
+matching.rs`) evaluates a single byte-offset window per term; multi-range is a
+Junos-parity gap deliberately left unimplemented (defining the wire encoding +
+hot-path cost is a separate item).
+
+The pre-#5823 compiler (`compileFilterFrom`, `pkg/config/compiler_firewall.go`)
+iterated every named range but `break`ed after the first — silently keeping
+range #1 and dropping the rest. That is a **security fail-open**: an `accept`
+term stopped requiring the dropped ranges' condition (over-permit), and a
+`discard`/`reject` term stopped dropping the traffic they scoped (over-drop),
+with a clean commit.
+
+`compileFilterFrom` now aggregates EVERY named range across ALL repeated
+`flexible-match-range` blocks, both AST shapes (hierarchical + flat-set),
+duplicate names, and `from` group-expanded copies into
+`FirewallFilterTerm.FlexMatchRangeNames` (it still compiles only the first into
+`FlexMatch`, so a single-range term is byte-identical). This follows the
+#3203/#3205/#5832/#5833 strict/lenient discipline:
+
+- **Strict commit / commit-check** (`CompileConfig`): `validateFilterFlexMatchStrict`
+  (`compiler_validate_strict_filter.go`) hard-REJECTS `len(FlexMatchRangeNames) > 1`
+  BEFORE the dataplane apply, naming the family/filter/term and every range.
+- **Lenient load / peer-sync** (`CompileConfigLenient`, #1960 no-brick): the
+  strict error is downgraded to an operator-visible `cfg.Warnings` entry, and the
+  userspace snapshot builder (`buildFilterTermSnapshots`, `pkg/dataplane/
+  userspace/filters.go`) POISONS the term to match NOTHING — it emits a
+  `FlexMatchSnapshot` with the sentinel match-start `unrepresentable-multi-range`
+  (any non-`layer-3`/`layer-4` start lowers to `FlexMatchStart::Unsupported`,
+  whose `flex_matches()` returns `false`), plus a `slog.Warn`. This reuses the
+  existing per-term fail-closed channel — **no** multi-range support is added to
+  the wire/matcher. Silently enforcing only the first range (the pre-fix
+  behavior) would be fail-open.
+
+Pinned by `pkg/config/compiler_flexmatch_cardinality_5823_test.go` (strict
+reject for accept + discard terms; flat-set + group-expansion aggregation;
+lenient mark + warning; single-range unchanged) and
+`pkg/dataplane/userspace/filters_flex_multirange_5823_test.go` (wire poison +
+single-range byte-identical). Removing the aggregation, the strict gate, or the
+wire poison arm turns the matching test RED.
+
 ## Firewall-filter cross-family name collision fail-closed gate (#3884)
 
 Junos namespaces firewall filters **per family**, so `family inet filter blockX`
