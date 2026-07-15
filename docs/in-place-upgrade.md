@@ -410,7 +410,13 @@ state machines are untouched.
 4. **strong drain predicate** — peer owns the RGs, local VRRP BACKUP with
    no VIPs, `rg_active` false, sync clean (NOT merely "weight 0 set" — an
    RG keeps forwarding while VRRP is still MASTER). On timeout: fail back
-   and ABORT WITHOUT cutting (node still forwarding — no harm).
+   (`ResetFailover`) and ABORT WITHOUT cutting. When the failback SUCCEEDS the
+   node resumed forwarding — no harm. But `ForceSecondary` already DEMOTED the
+   node, so a FAILED failback is NOT harmless: the abort surfaces BOTH failures
+   (`errors.Join`) and warns the node may be **stranded demoted** (force-
+   secondary not undone, peer takeover unproven → possible both-nodes-secondary
+   outage) so an operator investigates — it must NOT keep claiming "still
+   forwarding" (#5845, mirroring the kernel-roll drain path `kernel_drain.go`).
 5. single-node cut (auto-rollback disabled).
 6. wait for session sync to re-establish, bounded by `RejoinDeadline`
    (60s default). The cut just restarted xpfd, so the local gRPC socket
