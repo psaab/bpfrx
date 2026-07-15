@@ -48141,3 +48141,36 @@ top.
   -run '5302|ResendBurst|RefreshInterface' -count=1` (green); full
   `go test ./pkg/ra -count=1` re-run below; fail-on-revert of the
   burstCh refresh still flips the 5302 tests RED.
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5768 (bug, security): bound factory-reset (zeroize) deletion
+  to xpf-OWNED artifacts. PR #5767 added the lexical FactoryResetForbiddenRoots
+  denylist, but a denylist is inherently incomplete on a wildcard-glob wipe: a
+  custom -config in an UNLISTED shared dir (/data/xpf.conf -> /data) or a SUBDIR
+  of a listed root (/opt/foo/x.conf -> /opt/foo; /opt denied, /opt/foo passes)
+  slipped past it, and the top-level sweep's broad `*.conf` suffix + `rollback*`
+  prefix globs then deleted UNOWNED siblings (a neighbor's foo.conf, xpf's own
+  rendered /etc/frr/frr.conf, a rollback-notes file). Replaced the two globs in
+  BOTH twin wipe primitives (grpcapi.zeroizeConfigDir, configstore.
+  FactoryResetConfigDir) with EXACT xpf-owned name matches: the live config
+  (name == configBase, any extension), rescue.conf (new shared
+  configstore.RescueConfigBase const, wired into Store.rescuePath), the audit
+  journal + rotated segments, the numbered text rollback slots
+  (<configBase>.<N>), and fsatomic crash temps. Dedicated xpf-owned subdir
+  RemoveAll's (.configdb, gRPC tls) and the isFsatomicTemp shape match are kept
+  (under-scoping a temp would strand an owned secret-bearing temp, #5475 — the
+  worse failure). ValidateFactoryResetRoot denylist retained as
+  defense-in-depth. The exact live-config match also fixes a latent bug: a
+  non-".conf" -config base (site.cfg) previously survived the suffix glob.
+  **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/configstore/factory_reset.go, pkg/configstore/store_persist.go,
+  pkg/configstore/README.md,
+  pkg/grpcapi/zeroize_ownership_5768_test.go,
+  pkg/configstore/factory_reset_ownership_5768_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/grpcapi/ ./pkg/configstore/
+  -count=1` (green); `go vet` clean. New fail-on-revert tests seed a validated
+  config root with owned artifacts + unowned siblings (other.conf, frr.conf,
+  rollback, rollback.bak, an unrelated subdir); after the wipe every owned
+  artifact is erased (no secret-retention regression) and every unowned sibling
+  survives. Restoring the `*.conf`/`rollback*` globs deletes the 4 siblings and
+  flips both tests RED (verified).

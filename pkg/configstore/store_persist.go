@@ -551,9 +551,11 @@ func archiveRemoveErr(path string) error {
 	return nil
 }
 
-// rescuePath returns the path for the rescue configuration file.
+// rescuePath returns the path for the rescue configuration file. The base name
+// is RescueConfigBase (KEEP IN SYNC): the factory-reset wipe's ownership-scoped
+// top-level match (#5768) deletes exactly this name.
 func (s *Store) rescuePath() string {
-	return filepath.Join(filepath.Dir(s.filePath), "rescue.conf")
+	return filepath.Join(filepath.Dir(s.filePath), RescueConfigBase)
 }
 
 // SaveRescueConfig saves the active config as rescue configuration.
