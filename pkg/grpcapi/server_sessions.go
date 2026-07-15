@@ -488,13 +488,17 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 				f.zoneIfaces[zid] = zone.Interfaces[0]
 			}
 		}
-		for ifName, ifc := range f.cfg.Interfaces.Interfaces {
+		// RangeInterfaces/RangeUnits skip present-but-nil InterfaceConfig/
+		// InterfaceUnit slots admitted by the tolerant load / HA config-sync
+		// path (#3494/#5068); a raw range nil-derefs and panics the in-process
+		// daemon during a remote session display (#5813).
+		config.RangeInterfaces(f.cfg, func(ifName string, ifc *config.InterfaceConfig) {
 			resolvedParent := config.LinuxIfName(strings.SplitN(f.cfg.ResolveReth(ifName), ".", 2)[0])
 			parentLink, err := net.InterfaceByName(resolvedParent)
 			if err != nil {
-				continue
+				return
 			}
-			for _, unit := range ifc.Units {
+			config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
 				displayName := ifName
 				if unit.Number != 0 || unit.VlanID != 0 {
 					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
@@ -510,8 +514,8 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 				if _, exists := f.egressIfaces[key]; !exists {
 					f.egressIfaces[key] = displayName
 				}
-			}
-		}
+			})
+		})
 	}
 	return f
 }

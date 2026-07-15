@@ -130,8 +130,13 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 			buf.WriteString("  Interface details:\n")
 			for _, ifName := range zone.Interfaces {
 				fmt.Fprintf(buf, "    %s:\n", ifName)
+				// #5910: `ok` proves KEY presence, not a non-nil value — the
+				// tolerant load / HA config-sync path admits a present-but-nil
+				// InterfaceConfig (#3494/#5068). Walk units via the shared
+				// nil-safe iterator so a nil interface/unit slot is skipped, not
+				// dereferenced (a raw `range ifc.Units` panics the daemon).
 				if ifc, ok := cfg.Interfaces.Interfaces[ifName]; ok {
-					for _, unit := range ifc.Units {
+					config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
 						for _, addr := range unit.Addresses {
 							fmt.Fprintf(buf, "      Address: %s\n", addr)
 						}
@@ -141,7 +146,7 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 						if unit.DHCPv6 {
 							buf.WriteString("      DHCPv6: enabled\n")
 						}
-					}
+					})
 				}
 			}
 		}
