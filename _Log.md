@@ -29,6 +29,35 @@
   pkg/config/compiler_system.go (Edit),
   pkg/config/snmp_clients_4834_test.go (Edit),
   docs/feature-coverage.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5811 (bug/audit/security): global-only clear commands enforce exact arity
+- **Timestamp**: 2026-07-15 (fix/5811-clear-exact-arity)
+- **Action**: Global-only `clear` handlers (whose backend action can ONLY clear
+  everything, no scoped variant) recognized a fixed keyword prefix and silently
+  DISCARDED every trailing token, then issued the unscoped mutation. So a
+  scoped-LOOKING command — `clear arp 192.0.2.10`, `clear ipv6 neighbors
+  interface ge-0-0-0`, `clear interfaces statistics ge-0-0-0`, `clear security
+  nat statistics rule web`, `clear security nat source persistent-nat-table pool
+  p1`, `clear security counters zone untrust`, `clear firewall all filter edge`,
+  `clear system config-lock session 42` — reported success while wiping the
+  ENTIRE cache/counter/table. Added a `requireClearNoScope(cmd, clears, extra)`
+  helper (byte-identical copy in `cmd/cli/clear.go` and `pkg/cli/cli_clear.go`)
+  that REJECTS any trailing operand with an "unexpected argument(s) ...; this
+  command clears X and takes no scope" error BEFORE any mutation. Wired it into
+  every global-only clear on BOTH parsers, restoring arity parity (the in-process
+  `policies hit-count` now matches the remote's #5570 guard). Legit scoped clears
+  (`clear security flow session <filter>`, `clear dhcp client-identifier
+  interface <name>`) are untouched. Follow-up candidate (out of #5811 scope): the
+  in-process `clear dhcp client-identifier` does not mirror the remote's #4883-E
+  malformed-selector guard.
+- **Validation**: gofmt clean; go build ./... + go test ./cmd/cli/ ./pkg/cli/
+  -count=1 green; go vet clean apart from a pre-existing cli.go unreachable-code
+  note in an untouched file. Fail-on-revert proven via overlay: neutralizing
+  requireClearNoScope (discard suffix) flips the reject tests RED on BOTH parsers
+  (no error returned; the dp/RPC mutation runs).
+- **File(s)**: cmd/cli/clear.go (Edit), pkg/cli/cli_clear.go (Edit),
+  cmd/cli/clear_exact_arity_5811_test.go (Write),
+  pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
+  _Log.md (Edit)
 
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
@@ -48242,5 +48271,35 @@ top.
   flips both tests RED (verified).
 
 - **Timestamp**: 2026-07-15
+  **Action**: #5807 (bug, audit, security): capture SIGTERM/SIGINT BEFORE the
+  mutating startup phases. Run() (pkg/daemon/daemon_run.go) loaded/bootstrapped
+  config, renamed interfaces, initialized managers (FRR/IPsec/RPM/cluster/VRRP/
+  DHCP), ran the first applyConfig, and loaded/Start-ed the dataplane, and only
+  THEN installed signal.NotifyContext (old PHASE 4). A SIGTERM (or daemon-mode
+  SIGINT) during phases 1-3 hit the process default action = immediate kill:
+  runShutdownSequence never ran, leaving partially-applied links/routes/FRR/
+  IPsec/DHCP/HA/dataplane state with no fencing. Fixed by capturing signals at
+  the TOP of Run via a new startupSignalContext() helper (same set: interactive
+  = SIGTERM, daemon = SIGTERM+SIGINT), reassigning ctx so it carries through all
+  phases. Wrapped phases 1-4 in a testable seam: runStartupPhases(ctx, phases)
+  checks ctx.Err() at each phase boundary; runStartupOrAbort(ctx, phases,
+  teardown) runs the ordered runShutdownSequence teardown for the initialized
+  subset (already nil-guarded per subsystem) and returns non-zero when a signal
+  cancels mid-startup, while preserving the pre-#5807 defers-only path for a
+  plain phase error (distinguished by ctx.Err(), not error identity). Kept
+  d.daemonCtx as the RAW signal-uncancelled parent for the four long-lived
+  startup runtimes (cluster.Start, watchClusterEvents, startKernelSelfRecovery,
+  dp.Start) — the teardown needs them live — so initManagers /
+  setupDataplaneAndInitialConfig no longer take a ctx param (dp.Start now uses
+  d.daemonCtx, matching the existing bootstrap-exit dp.Start). main.go unchanged
+  (signal captured inside Run).
+  **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/README.md,
+  pkg/daemon/startup_signal_5807_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/daemon/ ./cmd/xpfd/ -count=1`
+  (green); `go vet ./pkg/daemon/ ./cmd/xpfd/` clean. Fail-on-revert tests:
+  cancel between phases → later phases do NOT run + teardown fires with the
+  abort error; plain phase error → no teardown; startupSignalContext returns a
+  cancellable child (Done()!=nil, not Background). Removing the between-phase
+  ctx.Err() check flips the abort tests RED (verified: phases ran p1,p2,p3,p4).
 - **Action**: #5854 — hard-reject next-table/rib-group ip-rule window over-subscription at strict commit (was warn-only → silent apply-time truncation → routes claimed but not programmed). Added validateRoutingRuleWindowsStrict (new compiler_validate_strict_routing_rulewindows.go) wired into runUniformGates after the #5693 next-table gate, gated by new opts.lenientRoutingRuleWindows (true in both lenient blocks): strict CompileConfig hard-rejects >100 next-table routes / >1000 rib-group leak prefixes; CompileConfigLenient (Store.Load / SyncApply / peer-sync) still warns-and-loads so grandfathered/peer-synced generations don't fail-closed (#1960). Removed the now-redundant warn-only validateRoutingRuleWindowWarnings + its ValidateConfig call (runUniformGates runs before ValidateConfig, so strict aborts clean; the lenient downgrade is the single warning — no double-warn). Window consts (maxNextTableRules=100, maxRibGroupLeakRules=1000) duplicated in pkg/config with keep-in-sync comment (pkg/config cannot import pkg/routing — cycle). Fail-on-revert tests (gate-unit + compile-path strict-reject + lenient-warn); neutralizing the gate turns all reject AND lenient-warn assertions RED. gofmt/go vet/go build clean; go test ./pkg/config/ ./pkg/routing/ green. Doc: docs/rib-group-route-leaking.md new "Strict rejection — ip-rule window over-subscription (#5854)" section.
 - **File(s)**: pkg/config/compiler_validate_strict_routing_rulewindows.go (new), pkg/config/compiler_uniformgates.go, pkg/config/compiler.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_routing.go, pkg/config/compiler_routing_rules_test.go, docs/rib-group-route-leaking.md
