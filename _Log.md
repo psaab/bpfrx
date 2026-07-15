@@ -48622,3 +48622,29 @@ top.
   go test -race ./pkg/grpcapi/ GREEN; both raw-walk reverts proven RED via
   -overlay (nil-deref panic caught by recover→t.Fatalf), each revert breaking
   only its own test (independent guards).
+
+## 2026-07-15 — #5847 two-phase kernel arm (ARMING intent + BootNext readback)
+
+- **Timestamp**: 2026-07-15
+- **Action**: Fix the false-ARMED wedge — the kernel-roll arm persisted ARMED
+  BEFORE SetBootNext, so a crash in the gap left a journal claiming ARMED while
+  the firmware booted known-good and no trial happened, wedging HA self-recovery
+  (Arm refused-forever, self-recovery suppressed failback forever). Implemented
+  the two-phase arm: record ARMING (prepared intent + per-attempt nonce) before
+  any NVRAM mutation; SetBootNext; positively read GetBootNext() back ==
+  inactiveID; only then transition ARMING -> ARMED recording the confirmed
+  BootID. ARMING sits below ARMED in the state order, so Arm re-arms from ARMING,
+  self-recovery does not suppress on ARMING, and IsArmed is true only for the
+  verified ARMED.
+- **File(s)**: pkg/upgrade/kernel.go (KernelStateArming + reorder, journal
+  BootID/ArmNonce/ArmAttempts, GetBootNext interface method), pkg/upgrade/
+  kernel_linux.go (bootNextRE + GetBootNext efibootmgr readback), pkg/upgrade/
+  kernel_run.go (armCandidate two-phase rewrite + newArmNonce), pkg/upgrade/
+  kernel_test.go (fake GetBootNext + seams), pkg/upgrade/
+  kernel_arm_two_phase_5847_test.go (NEW — 4 fail-on-revert tests), docs/
+  in-place-upgrade.md (two-phase arm + BootNext-readback provenance + ARMING vs
+  verified-ARMED self-recovery semantics).
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/ clean; go test
+  -race ./pkg/upgrade/ GREEN; the ARMED-first revert (drop ARMING/readback)
+  proven RED via -overlay on Test 1 (re-arm + self-recovery) and Test 2
+  (readback mismatch), with Test 3 (no-regression) still green.
