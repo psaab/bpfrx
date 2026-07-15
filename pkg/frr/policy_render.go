@@ -2033,15 +2033,10 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 				// per entry (the dispatch loop below), each carrying the full
 				// term body — exactly the #2607 split structure.
 				fromPL := po.PrefixLists[fromPrefixList]
-				matchKW := "ip"
-				if fromPL != nil {
-					for _, p := range fromPL.Prefixes {
-						if strings.Contains(p, ":") {
-							matchKW = "ipv6"
-							break
-						}
-					}
-				}
+				// Address family the from-prefix-list renders under. Uses the
+				// shared selector (naming.go) so the route-filter ACL collision
+				// precheck and this renderer never disagree on the family.
+				matchKW := prefixListMatchKW(fromPL)
 				// #5730: when THIS sequence ALSO emitted a same-family
 				// route-filter "match ip|ipv6 address prefix-list" line, a
 				// second same-type "match ... prefix-list" for the
@@ -2054,7 +2049,16 @@ func (m *Manager) renderPolicyTermSequences(po *config.PolicyOptionsConfig, rout
 				// #5702 off-family fail-closed coexistence) is already a distinct
 				// FRR type, so it keeps the prefix-list match unchanged.
 				if rfMatchEmitted && rfMatchV6 == (matchKW == "ipv6") {
-					aclName := fromPrefixList + "_rf"
+					// #5872: a bounded, namespaced, deterministically-hashed
+					// access-list name (routeFilterACLName, naming.go) — NOT the
+					// pre-#5872 `fromPrefixList + "_rf"` concatenation, which had no
+					// length bound (FRR-identifier overflow) and no collision
+					// namespace (two long same-prefix names truncate-collide → FRR
+					// merges the access-lists → silent policy widen/narrow). The
+					// SAME value backs the definition and the reference below, so
+					// they always agree; routeFilterACLNameCollision (wired into
+					// ApplyFull) fails the apply CLOSED on any residual collision.
+					aclName := routeFilterACLName(fromPrefixList, matchKW)
 					renderFromPrefixListACL(&b, aclName, matchKW, fromPL)
 					fmt.Fprintf(&b, " match %s address %s\n", matchKW, aclName)
 				} else {

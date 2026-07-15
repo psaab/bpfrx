@@ -48143,6 +48143,40 @@ top.
   burstCh refresh still flips the 5302 tests RED.
 
 - **Timestamp**: 2026-07-15
+  **Action**: #5872 (bug, audit, security): bound + namespace + collision-check
+  the generated FRR route-policy access-list name. When a route-map sequence
+  carries both a same-family route-filter `match ip|ipv6 address prefix-list`
+  line and a `from prefix-list` match, the renderer materializes the
+  from-prefix-list as an access-list (distinct FRR rule type, #5730). The name
+  was `fromPrefixList + "_rf"` — a bare concatenation of an operator-controlled
+  Junos identifier with no namespace, no byte-length bound, and no collision
+  registry: a long name could exceed FRR's ~128-byte access-list identifier
+  limit (reload rejection) and two long names sharing a >=125-byte prefix could
+  truncate-collide inside FRR to one stored token → two access-lists MERGE →
+  silent routing-policy widen/narrow. Added pkg/frr/naming.go:
+  routeFilterACLName(prefixList, matchKW) = reserved `xpf-rf-` namespace +
+  sanitizeFRRIdent-cleaned bounded readable slice + deterministic SHA-256 suffix
+  over (family, FULL name), total <=96 bytes (margin under 128). Hashing the
+  FULL name defeats truncation-collision; determinism = restart-stable. Same
+  value used for BOTH the access-list definition and the route-map reference
+  (one local var). routeFilterACLNameCollision(po) is a fail-closed commit belt
+  wired into ApplyFull beside redistAliasCollision/bgpComposedChainCollision:
+  rejects a reserved-namespace intrusion or a same-family final-name hash
+  collision (FRR keeps last-good config). prefixListMatchKW is the shared family
+  selector so renderer and precheck never disagree. Scoped to the route-policy
+  ACL surface; other FRR identifiers can adopt the helper as a follow-up.
+  **File(s)**: pkg/frr/naming.go, pkg/frr/policy_render.go, pkg/frr/manager.go,
+  pkg/frr/README.md, pkg/frr/naming_5872_test.go,
+  pkg/frr/frr_test.go, pkg/frr/policy_mixedfamily_prefixlist_5702_test.go,
+  _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/frr/ -count=1` (green);
+  `go vet ./pkg/frr/` clean. New fail-on-revert tests cover bound+namespace,
+  truncation-collision (two 200-char names collapse to one 128-byte token under
+  the old scheme), unicode, IPv4+IPv6 render, restart determinism, and
+  definition==reference. Reverting routeFilterACLName to `fromPrefixList +
+  "_rf"` flips the bound/namespace/truncation-collision/unicode tests RED
+  (verified). Updated 2 pre-existing tests that pinned the old `V6ONLY_rf`
+  literal to the helper output.
   **Action**: #5768 (bug, security): bound factory-reset (zeroize) deletion
   to xpf-OWNED artifacts. PR #5767 added the lexical FactoryResetForbiddenRoots
   denylist, but a denylist is inherently incomplete on a wildcard-glob wipe: a
