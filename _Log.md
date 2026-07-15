@@ -48678,3 +48678,23 @@ top.
 - **Timestamp**: 2026-07-15
   - **Action**: #5824 fold — cross-root policy-statement term compose. Seed the per-call psTermIndex from the persisted ps.Terms so a same-name term across SEPARATE top-level policy-options roots composes onto one PolicyTerm instead of duplicating (a malformed double route-map). Corrects the block-merge comment's cross-root claim. Parent RED-on-revert confirmed (neutralize seed → SameTermAcrossRootsMerges_5824 RED, got [x x]).
   - **File(s)**: pkg/config/compiler_routing.go, pkg/config/compiler_policy_block_merge_5824_test.go
+
+## 2026-07-15 — #5825 scheduler block-merge (mirrors #5824)
+
+- **Timestamp**: 2026-07-15
+- **Action**: compileSchedulers allocated a FRESH SchedulerConfig per named AST
+  instance then unconditionally cfg.Schedulers[name]=sched, so a repeated
+  hierarchical `schedulers scheduler S {}` block (or a second top-level
+  `schedulers {}` root) REPLACED the earlier — every day/window authored earlier
+  vanished (a time-gated policy then active/inactive on the WRONG days). FIX:
+  reuse the existing map entry so distinct weekday windows UNION across
+  blocks/roots (Days map on the reused struct; no separate index needed). Scalars
+  (daily/date/all-day) follow flat-set/Junos-merge last-wins. Removed the
+  unconditional overwrite.
+- **File(s)**: pkg/config/compiler_system.go (reuse-and-merge),
+  pkg/config/compiler_scheduler_block_merge_5825_test.go (NEW 5 tests),
+  docs/config-schema.md (#5825 block-merge subsection).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ clean; go test -race
+  ./pkg/config/ -run Scheduler GREEN; full pkg/config suite GREEN. Fail-on-revert:
+  restoring fresh-alloc+overwrite via -overlay -> the 4 merge tests RED (only the
+  last block's day survives), single-block stays green.
