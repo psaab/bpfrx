@@ -125,6 +125,21 @@ contract.
   action-journal write still happens BEFORE the wipe. `ZeroizeFn` is nil
   only in a NoDataplane / no-daemon build, where the handler falls back to
   an ungated direct wipe (there is no running reconcile loop to race).
+- **The interactive console shares ONE wipe primitive (#5890).** The
+  in-process console `request system zeroize` (`pkg/cli`) previously ran
+  its OWN partial wipe (`zeroizeConfigState`: config DB + archive only),
+  which LEFT `tls/`, the rendered service configs (frr/swanctl/kea), and
+  the provisioned login accounts (shadow/authorized_keys/`sudoers.d/xpf-*`)
+  on disk — secret residue on a re-tenanted device. The console now
+  DELEGATES to the exported `PerformZeroizeWipe(configDir, configBase)` —
+  the SAME primitive `runZeroize` runs — so both paths erase an IDENTICAL
+  single-source-of-truth OWNED-artifact set and cannot diverge again. The
+  console keeps its own root resolution (`cli.zeroizeConfigRoot`, #5554/
+  #5684) and daemon stop; it does NOT take the gRPC apply-gate (it runs
+  in-process and stops xpfd itself). The rendered/BPF/networkd leg targets
+  in `performZeroizeWipe` are package vars so the full primitive is
+  hermetically testable end-to-end (no real `/etc`) — production paths
+  unchanged.
 - **Zeroize erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
   (#5280).** `runZeroize` resolves the config root from
   `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME

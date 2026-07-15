@@ -35,21 +35,23 @@ sibling files (same package, so unexported helpers stay reachable):
   `data-plane`.
 - `cli_request_system.go` — `request system reboot|halt|power-off|zeroize`
   and `software` / `configuration` / `dynamic-dns`.
-  - **`zeroize` erases the CONFIGURED config root, not a hardcoded `/etc/xpf`
-    (#5554).** `zeroizeConfigRoot` resolves the wipe target from
-    `configstore.Store.ConfigPath()` — the daemon's `-config` path, the SAME
-    file the store loads from and persists the `.configdb` SSOT + `master.key`
-    / numbered text rollback slots / `.config.journal` to — and threads
-    `filepath.Dir/Base` of it into the shared `configstore.FactoryResetConfigDir`
-    /`FactoryResetArchiveDir` primitives (`zeroizeConfigState`). The interactive
-    CLI runs in-process with the daemon and shares its store, so this is the
-    local twin of the gRPC `runZeroize`/`zeroizeConfigRoot` fix (#5280): a daemon
-    started with a non-default `-config` (e.g. `/srv/xpf/site.conf`) erases
-    `/srv/xpf`, not `/etc/xpf`. Resolution is fail-CLOSED — an undeterminable
-    store / config path returns an error rather than wiping the wrong path (or
-    nothing) while reporting a clean factory reset. The pre-fix wipe hardcoded
-    `/etc/xpf` and left the real root's `.configdb`/`master.key`/TLS material/
-    rollback slots on disk.
+  - **`zeroize` runs the FULL shared wipe, not a partial config-only one
+    (#5890).** `performConsoleZeroize` resolves+validates the configured
+    config root (`zeroizeConfigRoot`, #5554/#5684 — fail-CLOSED on an
+    undeterminable store/path so it never wipes the wrong directory) and then
+    DELEGATES to the exported `grpcapi.PerformZeroizeWipe(configDir,
+    configBase)` — the SAME primitive the gRPC `runZeroize` runs — before
+    stopping xpfd. Both paths therefore erase an IDENTICAL owned-artifact set
+    (config state + `tls/` + rendered service configs [frr/swanctl/kea] +
+    provisioned login accounts [shadow/authorized_keys/`sudoers.d/xpf-*`] +
+    config archive + BPF pins + networkd) and cannot diverge. Before #5890 the
+    console called only `zeroizeConfigState` (config DB + archive), which LEFT
+    `tls/`, the rendered secrets, and the login accounts on disk — secret
+    residue a re-tenanted device could recover. It is fail-CLOSED: a wipe that
+    does not complete surfaces the error and does NOT stop the daemon (never
+    reboot into a half-wiped, secret-retaining state). The `#5554`/`#5280`
+    configured-root resolution (a non-default `-config` erases its own root,
+    not a hardcoded `/etc/xpf`) is preserved inside `zeroizeConfigRoot`.
 - `cli_request_security.go` — `request security ipsec|policies|wireguard`.
 
 The security-sensitive `--` end-of-options separators in the diagcmd/tcpdump
