@@ -422,6 +422,48 @@ per-path:
   ordered after its degrade-not-fail write. Distinct from #4864 (which made
   the delete itself dir-fsync-durable): #4864 fixes HOW the record is deleted,
   #5473 fixes WHEN.
+- **Confirmation is gated on DURABLE removal of `confirm.json` (#5835).**
+  #4864 made the delete dir-fsync-durable and #5473 ordered it after the
+  resolving write, but the removal itself was still **best-effort**:
+  `removeConfirmState` only LOGGED a `DeleteConfirm` failure. So a
+  confirmation (plain commit / HA sync / explicit `commit`-confirm /
+  demotion) reported SUCCESS while `confirm.json` lingered on disk — a
+  restart then read the stale record and resurrected its rollback,
+  reverting the operator-confirmed config (in HA, re-diverging a confirmed
+  standby). Three corrections close this:
+  - **Removal failure is surfaced/retained, never swallowed.**
+    `removeConfirmState` now RETURNS the error. The EXPLICIT `ConfirmCommit`
+    propagates it to the operator (the confirm took effect in memory but is
+    not durable). The non-returning paths route through
+    `resolveConfirmRemovalLocked`, which retains **retry debt**
+    (`confirmRemoveDegraded`) and starts the singleton persist-retry loop —
+    the SAME loop that heals a degraded active write — so the stale record
+    is re-deleted with backoff until durable. `ConfigPersistDegraded()`
+    (→ /health) is true while the debt stands; `ConfirmRemovalDegraded()`
+    exposes it specifically. The in-memory timer/rollback bookkeeping is
+    cancelled as before (the record delete needs only the file path, not the
+    tree), so nothing is irreversibly lost — the retry re-drives the delete.
+  - **The #4864 dir fsync is reachable on an absent-file RETRY.**
+    `DeleteConfirm` used to `return nil` on `os.IsNotExist` BEFORE the dir
+    fsync. If a prior attempt unlinked the file but its dir fsync FAILED, the
+    dirent removal was not yet durable, yet the absent-file retry reported a
+    false success. It now falls through to the dir fsync even when the file
+    is already absent (idempotent, harmless when it never existed), and keeps
+    returning an error until a fsync succeeds — the `confirmRemoveDegraded`
+    flag is the cross-call operation state distinguishing "never existed /
+    durable" from "unlink succeeded, dir sync owed".
+  - **The record is bound to the config it guards (`GuardedHash`).**
+    `confirm.json` records the sha256 of the unconfirmed active tree's
+    `Format()` at arm time (an additive JSON field). On boot recovery, if
+    the loaded active config no longer matches, a later commit/confirm has
+    advanced the active config while this record's removal had failed — the
+    record is STALE and `recoverPendingConfirmLocked` IGNORES it (no rollback,
+    no re-arm) rather than reverting an unrelated, already-confirmed
+    generation. A legacy record (empty `GuardedHash`, pre-#5835) skips the
+    check and recovers exactly as #4577, preserving the cross-upgrade hatch.
+    A residual case remains by design: an explicit confirm with NO later
+    commit + an immediate crash before the retry heals fails SAFE (reverts on
+    boot) — consistent with `ConfirmCommit` having returned an error.
 - **Durable deletes match durable writes (#5197).** A delete of a
   secret-bearing artifact fsyncs its parent directory so the removal is
   durable, mirroring the `fsatomic.WriteFileDurable` its writer used — a
