@@ -140,3 +140,57 @@ func TestApplyTailReconcilesSurfacesRoutingRuleError_5844(t *testing.T) {
 			"tail errors.Join wiring, got %v", err)
 	}
 }
+
+// TestApplyTailReconcilesSurfacesMgmtRouteError_5867 is the commit-level wiring
+// proof for the #5867 management-VRF route reconcile error. #5867 moved the
+// applyMgmtVRFRoutes call out of applyVRFReconcile (whose error early-aborts and
+// would skip the dataplane apply) into applyConfigLocked as a deferred
+// mgmtRouteErr, threaded as the FINAL applyTailReconciles operand and appended to
+// the tail errors.Join. The root-fix tests (mgmtvrf_route_applied_5867_test.go)
+// exercise applyMgmtVRFRoutesTo directly and therefore do NOT cover the join
+// wiring — so, exactly like #5844's sibling test above, this drives the REAL
+// applyTailReconciles with an injected error in the mgmtRouteErr slot and asserts
+// the returned commit error includes it.
+//
+// FAIL-ON-REVERT: drop mgmtRouteErr from that errors.Join and this goes RED (the
+// apply completes and returns nil despite the mgmt-VRF route reconcile having
+// failed — a failed RouteReplace / stale-route-cleanup error silently dropped
+// from commit truth, the fail-open #5867 closes). The nft seams are stubbed to
+// succeed so the injected mgmtRouteErr is the ONLY operand that can surface.
+func TestApplyTailReconcilesSurfacesMgmtRouteError_5867(t *testing.T) {
+	installFakeNetworkctl(t)
+
+	origApply, origDelete := nftApplyPayload, nftDeleteTable
+	nftApplyPayload = func(string) ([]byte, error) { return nil, nil }
+	nftDeleteTable = func(string, string) ([]byte, error) { return nil, nil }
+	defer func() { nftApplyPayload, nftDeleteTable = origApply, origDelete }()
+
+	d := &Daemon{
+		dp:       &runtimeOnlyApplyTestDP{},
+		networkd: networkd.NewInDir(t.TempDir()),
+		store:    newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
+		vrrpMgr:  vrrp.NewManager(),
+		opts:     Options{NoDataplane: true},
+	}
+
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{0: {Number: 0}}},
+	}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust", Interfaces: []string{"reth0.0"}},
+	}
+
+	injected := errors.New("injected: mgmt-VRF RouteReplace rejected")
+	// mgmtRouteErr is the FINAL applyTailReconciles operand; every other deferred
+	// error is nil so it is the only thing that can surface.
+	err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, injected)
+	if err == nil {
+		t.Fatal("applyTailReconciles must surface the mgmt-VRF route reconcile failure " +
+			"(fail-closed); got nil")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("returned commit error must include the mgmt-VRF route failure via the "+
+			"tail errors.Join wiring, got %v", err)
+	}
+}
