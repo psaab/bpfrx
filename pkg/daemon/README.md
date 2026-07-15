@@ -417,15 +417,39 @@ never lock an operator out of a remote box it manages.
     window. `runShutdownSequence` drains `applySem` (bounded by
     `applyCloseoutDrainTimeout`) after `applyCancel()` so that closeout completes
     before teardown/exit.
+  - **Early signal capture — startup is abortable (#5807).** The shutdown
+    signal context is captured at the **TOP of `Run`** (`startupSignalContext`),
+    BEFORE the mutating startup phases (config load + bootstrap → interface
+    naming → manager init + first `applyConfig` → dataplane load/`Start`). Before
+    #5807 `signal.NotifyContext` was installed only AFTER those phases, so a
+    `SIGTERM` (or daemon-mode `SIGINT`) arriving DURING startup took the process
+    default action — immediate kill, no deferred cleanup — leaving partially
+    applied links / routes / FRR / IPsec / DHCP / HA / dataplane state with none
+    of the fencing steady-state shutdown performs. The phases now run through
+    `runStartupOrAbort` → `runStartupPhases`, which checks the signal context at
+    each phase boundary: a signal mid-startup skips the remaining phases and runs
+    the **same ordered `runShutdownSequence` teardown** for whatever was
+    initialized (every teardown step nil-guards its manager, so a partial init
+    tears down cleanly), then `Run` returns the non-nil abort error instead of
+    proceeding into steady state. A PLAIN phase error (no signal) keeps the
+    pre-#5807 path — return the error, deferred `#5308` loop stops are the
+    cleanup — distinguished from a signal abort by the signal context's state,
+    never the error's identity. The signal set matches the old late install
+    (interactive: `SIGTERM` only, so the CLI keeps `SIGINT` for Ctrl-C; daemon:
+    both). The four long-lived startup runtimes (`cluster.Start`,
+    `watchClusterEvents`, `startKernelSelfRecovery`, `dp.Start`) bind to
+    `d.daemonCtx` (the raw, signal-uncancelled parent), NOT the phase signal
+    context — the teardown needs them live — so `initManagers` /
+    `setupDataplaneAndInitialConfig` no longer take a `ctx` parameter.
   - **Wiring (the part that makes this actually fire on `systemctl stop`).**
     `applyCancelCtx` deliberately does **not** return `d.daemonCtx`. In
     production `cmd/xpfd` passes `context.Background()` into `Run`, and that
     `context.Background()` is what `d.daemonCtx` holds — it is never cancelled
-    (the signal-cancellable context is a *local* `ctx` created later by
-    `signal.NotifyContext`). Returning `d.daemonCtx` would make C1/C2/C3 dead
-    code on a real stop. Instead `Run` creates `d.applyCancelContext` as a
-    **child of the SIGTERM/SIGINT signal context** (right after
-    `signal.NotifyContext`), so a real `systemctl stop xpfd` cancels it, and the
+    (the signal-cancellable context is a *local* `ctx` captured at the TOP of
+    `Run` by `startupSignalContext` → `signal.NotifyContext`, #5807). Returning
+    `d.daemonCtx` would make C1/C2/C3 dead code on a real stop. Instead `Run`
+    creates `d.applyCancelContext` as a **child of the SIGTERM/SIGINT signal
+    context**, so a real `systemctl stop xpfd` cancels it, and the
     next coarse boundary observes `ctx.Err() != nil` and bails. `d.daemonCtx`
     stays the (uncancelled) parent of the long-lived background goroutines —
     flow-export/IPFIX relays, RPM probe-pin retry, the policy scheduler, cluster
