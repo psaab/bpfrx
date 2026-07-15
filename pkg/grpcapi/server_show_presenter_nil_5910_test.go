@@ -6,6 +6,7 @@
 //   - showZonesDetail (this file): `ifc, ok := cfg.Interfaces.Interfaces[name]`
 //     then `range ifc.Units` — `ok` proves KEY presence, not a non-nil value,
 //     so a present-but-nil InterfaceConfig still nil-derefs.
+//
 // Both now walk via config.RangeInterfaces / config.RangeUnits (the shared
 // nil-safe iterators added for #5813). The tolerant load / HA config-sync path
 // admits present-but-nil map values (#3494/#5068), so a routine `show vlans` /

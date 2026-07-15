@@ -95,13 +95,13 @@ func TestCompletionSuffix(t *testing.T) {
 		wantSuffix    string
 		wantOK        bool
 	}{
-		{"filter", "f", "ilter", true},   // normal extension
-		{"flow", "flow", "", true},       // exact match -> empty suffix, ok
-		{"f", "zzzzz", "", false},        // partial longer than name -> guarded
-		{"flow", "fz", "", false},        // same length region but not a prefix
-		{"filter", "show", "", false},    // unrelated, partial<name but no prefix
-		{"", "", "", true},               // both empty
-		{"abc", "", "abc", true},         // empty partial -> whole name
+		{"filter", "f", "ilter", true}, // normal extension
+		{"flow", "flow", "", true},     // exact match -> empty suffix, ok
+		{"f", "zzzzz", "", false},      // partial longer than name -> guarded
+		{"flow", "fz", "", false},      // same length region but not a prefix
+		{"filter", "show", "", false},  // unrelated, partial<name but no prefix
+		{"", "", "", true},             // both empty
+		{"abc", "", "abc", true},       // empty partial -> whole name
 	}
 	for _, tt := range tests {
 		gotSuffix, gotOK := completionSuffix(tt.name, tt.partial)

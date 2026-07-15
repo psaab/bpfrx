@@ -43,3 +43,34 @@ func RangeUnits(ifc *InterfaceConfig, fn func(unitNum int, unit *InterfaceUnit))
 		fn(unitNum, unit)
 	}
 }
+
+// LookupInterface returns cfg's InterfaceConfig for name and true ONLY when the
+// name is present AND its value is non-nil (#5886). It treats a present-but-nil
+// slot (tolerant load / HA config-sync, #3494/#5068) as ABSENT — a read-only
+// presenter that key-checks `if ifc, ok := cfg.Interfaces.Interfaces[name]; ok`
+// then dereferences `ifc` would panic on such a slot; routing the lookup through
+// this helper makes `ok` imply a safe dereference. A nil cfg is (nil, false).
+func LookupInterface(cfg *Config, name string) (*InterfaceConfig, bool) {
+	if cfg == nil {
+		return nil, false
+	}
+	ifc, ok := cfg.Interfaces.Interfaces[name]
+	if !ok || ifc == nil {
+		return nil, false
+	}
+	return ifc, true
+}
+
+// LookupUnit returns ifc's InterfaceUnit for num and true ONLY when the unit is
+// present AND non-nil (#5886) — the unit-level companion to LookupInterface. A
+// nil ifc (or nil unit map) is (nil, false).
+func LookupUnit(ifc *InterfaceConfig, num int) (*InterfaceUnit, bool) {
+	if ifc == nil {
+		return nil, false
+	}
+	unit, ok := ifc.Units[num]
+	if !ok || unit == nil {
+		return nil, false
+	}
+	return unit, true
+}

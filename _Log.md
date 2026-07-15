@@ -48744,3 +48744,17 @@ top.
   ./pkg/config/ -run 'AddressBook|AddressSet|AddrSet' GREEN; full pkg/config GREEN.
   Fail-on-revert: restoring the linear scan makes the scaling test (N=80000) take
   ~20s > 3s budget → RED (vs ~0.08s with the fix); #4706 behavior tests stay green.
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5886 nil interface/unit presenter panic fix. Added shared
+    nil-safe accessors config.LookupInterface / config.LookupUnit (ok implies a
+    safe deref — a present-but-nil InterfaceConfig/InterfaceUnit slot from
+    tolerant load / HA config-sync reads as ABSENT) and routed the gRPC + REST +
+    CLI interface/zone/cluster/completion presenters through them, so a read-only
+    operator RPC no longer panics xpfd on a present-but-nil slot. Canary tests per
+    package assert no-panic; TestLookupInterface_5886 / TestLookupUnit_5886 pin
+    the accessor semantics (RED if the nil-guard is dropped).
+  - **File(s)**: pkg/config/interfaces_iter.go (+ _5886 tests), pkg/api/interfaces.go
+    (+ nil test), pkg/grpcapi/{server_cluster,server_show_interfaces,server_show_zones_text,
+    server_diag_monitor}.go (+ nil test), pkg/cli/{cli_show_interfaces*,cli_show_cluster,
+    cli_show_security_zones,completion,apply,cli_helpers}.go.

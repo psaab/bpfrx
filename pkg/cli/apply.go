@@ -170,10 +170,16 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 	if c.routing != nil {
 		var tunnels []*config.TunnelConfig
 		for _, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil { // #5886: skip present-but-nil InterfaceConfig
+				continue
+			}
 			if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
 				tunnels = append(tunnels, ifc.Tunnel)
 			}
 			for _, unit := range ifc.Units {
+				if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+					continue
+				}
 				if unit.Tunnel != nil {
 					tunnels = append(tunnels, unit.Tunnel)
 				}
@@ -200,10 +206,16 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 		ifaceBandwidths := make(map[string]uint64)
 		ifaceP2P := make(map[string]bool)
 		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil { // #5886: skip present-but-nil InterfaceConfig
+				continue
+			}
 			if ifc.Bandwidth > 0 {
 				ifaceBandwidths[name] = ifc.Bandwidth
 			}
 			for _, unit := range ifc.Units {
+				if unit == nil { // #5886: skip present-but-nil InterfaceUnit
+					continue
+				}
 				if unit.PointToPoint {
 					ifaceP2P[name] = true
 				}

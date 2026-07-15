@@ -75,7 +75,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			HsRxDropsReplayedInit:     45,
 			HsRxCookieUnsupported:     11,
 			// #4094 PR-B initiator cookie-replies consumed (50, off-ladder).
-			HsRxCookieConsumed:        50,
+			HsRxCookieConsumed: 50,
 			// #4094 PR-A responder cookie mechanism (46.. continuing).
 			HsCookieRepliesSent:       46,
 			HsRxUnderLoadNoMac2:       47,

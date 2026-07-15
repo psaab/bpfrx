@@ -135,7 +135,7 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 				// InterfaceConfig (#3494/#5068). Walk units via the shared
 				// nil-safe iterator so a nil interface/unit slot is skipped, not
 				// dereferenced (a raw `range ifc.Units` panics the daemon).
-				if ifc, ok := cfg.Interfaces.Interfaces[ifName]; ok {
+				if ifc, ok := config.LookupInterface(cfg, ifName); ok {
 					config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
 						for _, addr := range unit.Addresses {
 							fmt.Fprintf(buf, "      Address: %s\n", addr)
