@@ -1,3 +1,37 @@
+## 2026-07-15 — #5832 (bug/audit/security): commit-time gate for Linux interface-name collisions
+- **Timestamp**: 2026-07-15 (fix/5832-ifname-collision-gate)
+- **Action**: config.LinuxIfName only does ReplaceAll("/","-") — NOT injective.
+  Distinct authored interface names ge-0/0/0 and ge-0-0-0 canonicalize to the
+  SAME Linux device / ifindex. The Go forwarding snapshot emits BOTH logical
+  rows (each with its own zone / routing-instance / host-inbound / NAT /
+  address / tunnel identity); the Rust forwarding-state builder keys by ifindex
+  and OVERWRITES the earlier row — and since the snapshot is walked in Go's
+  sorted-name order, the lexicographically LATER colliding name deterministically
+  wins, SILENTLY changing the security zone + routing identity of packets on that
+  shared device. No commit gate existed. Added
+  validateInterfaceNameCollisionStrict
+  (compiler_validate_strict_ifname_collision.go) wired into runUniformGates,
+  gated by new opts.lenientIfNameCollision: STRICT CompileConfig (interactive /
+  gRPC commit + commit-check) HARD-REJECTS a config where two distinct authored
+  names canonicalize to the same LinuxIfName (naming both names, the shared
+  device, and the lex-later winner) OR where a canonical name exceeds the kernel
+  IFNAMSIZ limit (15 bytes + NUL). LENIENT CompileConfigLenient /
+  CompileConfigForNodeLenient (Store.Load / SyncApply / peer-sync) downgrades to
+  a single cfg.Warnings entry naming the winner, so a grandfathered / peer-synced
+  collision still boots (#1960 no-brick) but the overwrite is no longer silent.
+  The fix is a GATE, not a remapping — LinuxIfName's mapping is unchanged, so
+  every existing single-name config compiles exactly as before (no false
+  reject; realistic vSRX names are well under 15 bytes and never collide).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config clean;
+  go test ./pkg/config + ./pkg/configstore + ./pkg/dataplane/userspace +
+  ./pkg/daemon green (no existing fixture collides). Fail-on-revert: neutralizing
+  the gate makes the colliding config compile (strict) and the lenient load emit
+  no warning → all three assertions RED; restored → GREEN.
+- **File(s)**: pkg/config/compiler_validate_strict_ifname_collision.go (Write),
+  pkg/config/compiler.go (Edit), pkg/config/compiler_uniformgates.go (Edit),
+  pkg/config/ifname_collision_5832_test.go (Write),
+  pkg/config/README.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5844 (bug/security/HIGH): routing-rule reconcile errors fail the commit closed
 - **Timestamp**: 2026-07-15 (fix/5844-routing-rule-reconcile-failclosed)
 - **Action**: `pkg/routing` correctly RETURNS next-table / rib-group / PBR
@@ -91,6 +125,33 @@
   pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
   _Log.md (Edit)
 
+## 2026-07-15 — #5846 (bug/security/HIGH): stale-STOPPED upgrade recovery fails closed on restart failure
+- **Timestamp**: 2026-07-15 (fix/5846-stopped-recovery-restart-failclosed)
+- **Action**: In the resume-vs-fresh recovery (pkg/upgrade/cutover.go, Runner.Run),
+  when a stale journal's target A differs from the newly-staged B and its State is
+  STOPPED, recovery restarts the still-current KNOWN-GOOD daemon (the stopped cut
+  never flipped `current`). The pre-fix code only LOGGED a StartUnit failure, then
+  removeAllPartials + reset the journal and PROCEEDED into a fresh cut to B — so
+  the new cut used PreviousVersion (read from `current`) = the version that JUST
+  FAILED TO RESTART as its rollback target while the control plane was DOWN, and
+  the stale-recovery evidence was destroyed. Fix: if StartUnit fails during
+  stale-STOPPED recovery, return the error immediately (fail-closed) — do NOT
+  removeAllPartials, do NOT reset the journal. Preserve the stale journal +
+  partials so an operator or the next-boot re-run retries; a fresh cut proceeds
+  ONLY when the known-good restart succeeds. Scoped strictly to the STOPPED
+  sub-arm; the pure STAGED/PREFLIGHT/COPIED/VERIFIED sub-states (daemon never
+  stopped, live untouched) are unchanged. Mirrors the #5845 rolling.go/
+  kernel_drain.go fail-closed-on-lifecycle-error posture (errors-wrapped %w).
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/upgrade/ clean;
+  go test ./pkg/upgrade/ green. Fail-on-revert: a stale-STOPPED superseded
+  recovery with an injected StartUnit failure ABORTS (returns the error, current
+  stays 1.0.0, no verify/dropin for B, on-disk journal preserved as STOPPED/2.0.0,
+  partial dir preserved); the StartUnit-SUCCESS variant proceeds to the fresh 3.0.0
+  cut unchanged. Reverting to the swallow-and-log form flips the abort test RED
+  (confirmed via overlay).
+- **File(s)**: pkg/upgrade/cutover.go (Edit),
+  pkg/upgrade/stopped_recovery_restart_5846_test.go (Write),
+  docs/in-place-upgrade.md (Edit), _Log.md (Edit)
 ## 2026-07-15 — #5853 (bug): event-options action queue dedups early (one-per-policy on every enqueue)
 - **Timestamp**: 2026-07-15 (fix/5853-eventqueue-dedup-early)
 - **Action**: The action queue documents "at most one pending action per policy"
@@ -48448,3 +48509,5 @@ top.
   RED (verified). A successful-gateway-change test guards the happy path (no
   over-cleanup). Note: shared GOCACHE=/dev/shm/cache still yields a phantom
   pkg/config redeclare error from a prior worktree — used a fresh cache.
+- **Action**: #5850 (security) — gRPC MonitorPacketDrop called EventBuffer.Subscribe(256) directly, bypassing the defaultMaxSubscribers=64 admission cap (only TrySubscribe enforces it). The primary gRPC listener is loopback-clamped but UNAUTHENTICATED, so any local process could open an unbounded number of packet-drop streams — each adding a buffered channel AND expanding the synchronous O(N) per-event fan-out — exhausting memory + event-production CPU (a DoS distinct from #4484 L-2, which capped only REST SSE and wrongly treated gRPC as inherently bounded). Fixed server_diag_monitor.go MonitorPacketDrop to use TrySubscribe(256); on nil (cap reached) return status.Error(codes.ResourceExhausted, "too many concurrent event subscribers") BEFORE the defer sub.Close() and before streaming — mirroring the REST SSE 503 (pkg/api/sse.go). No cap/fan-out change — admission gate only; the existing defer sub.Close() (Subscription.Close → unsubscribe) frees the slot on teardown. Tests (new monitor_packet_drop_subscriber_cap_5850_test.go): fill the buffer to cap via TrySubscribe, then MonitorPacketDrop is rejected with ResourceExhausted (TestMonitorPacketDropRejectsOverCap_5850); a stream that tears down frees its slot (TestMonitorPacketDropTeardownFreesSlot_5850, goroutine + ctx cancel). Under-cap streaming is already covered by the existing MonitorPacketDrop match tests (they run against the new TrySubscribe path). Fail-on-revert verified: reverting to Subscribe admits the over-cap stream (returns after the bounded ctx timeout, not ResourceExhausted) → RED; restore → GREEN. gofmt/go vet/go build clean; go test -race ./pkg/grpcapi/ ./pkg/logging/ green. Doc: pkg/logging/README.md subscriber-cap paragraph corrected (request-created gRPC MonitorPacketDrop now uses TrySubscribe, not just REST SSE).
+- **File(s)**: pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/monitor_packet_drop_subscriber_cap_5850_test.go, pkg/logging/README.md
