@@ -121,9 +121,10 @@ func TestRenewalTimers(t *testing.T) {
 			}
 			// For every usable lease the whole schedule must land strictly
 			// before expiry with T1 < T2 — the invariant the fixed floor
-			// violated. (Skip the infinite sentinel: T1+T2 there exceeds
-			// int64 by construction and never actually expires.)
-			if tt.wantOK && tt.leaseTime > 0 && tt.leaseTime < 0xFFFFFFFF*time.Second {
+			// violated. Holds for the infinite sentinel too: T1+T2 is 7/8 of
+			// the sentinel (~3.76e18 ns), below both the lease and int64 (the
+			// divide-first #4526 form never overflows).
+			if tt.wantOK && tt.leaseTime > 0 {
 				t2Abs := t1 + t2
 				if t1 <= 0 {
 					t.Errorf("t1 = %s, must be positive for a %s lease", t1, tt.leaseTime)
