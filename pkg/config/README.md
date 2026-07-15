@@ -259,7 +259,11 @@ egress-interface map builders (CLI `buildSessionEgressIfacesWithLookup`, gRPC
 extended the same walk to the show presenters that the first pass missed —
 `showVLANs` (gRPC `show vlans`) and the `show security zones` detail renderers
 (gRPC `showZonesDetail`, CLI `showZonesDisplay`), where a bare
-`ifc, ok := …Interfaces[name]` proved key presence but not a non-nil value. New
+`ifc, ok := …Interfaces[name]` proved key presence but not a non-nil value.
+#5913 extended it once more to the `show interfaces extensive`/`detail` text
+presenters (gRPC `showInterfacesExtensive`/`showInterfacesDetail`), whose
+config-map builders (`ifCfgMap`/`ifDescMap`) still carried the same raw
+`range cfg.Interfaces.Interfaces` reading `ifc.Name`/`ifc.Description`. New
 interface-tree presenters should route through these helpers too rather than
 reintroducing a raw range.
 
