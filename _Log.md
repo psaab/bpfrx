@@ -1,3 +1,35 @@
+## 2026-07-15 — #5833 (bug/audit/security): quarantine SNMP community on malformed clients token (lenient fail-closed)
+- **Timestamp**: 2026-07-15 (fix/5833-snmp-lenient-quarantine)
+- **Action**: #4834 fixed STRICT-commit rejection of malformed SNMP `clients`
+  tokens but its LENIENT load/peer-sync branch preserved the pre-fix runtime
+  behaviour, which is FAIL-OPEN for the `restrict` typo: `clients 0.0.0.0/0
+  restric` (missing 't') detaches the modifier, so `0.0.0.0/0` survives as an
+  unrestricted allow and compileClientNets silently drops only the bad token —
+  on restart/upgrade/peer-sync the community answers from every IPv4 source.
+  Fix: on the lenient path, when a community's `clients` list carries ANY
+  malformed token, QUARANTINE that community to deny-all instead of keeping the
+  surviving broad allow. validateSNMPClients now also returns a `malformed`
+  flag; compileSNMP records it per-community (sticky across #5472 same-name
+  merge blocks so a later well-formed block cannot reopen it) and overrides the
+  community's clientNets enforcement cache with snmpQuarantineClientNets()
+  (explicit `0.0.0.0/0 restrict` + `::/0 restrict` → AllowsSource denies every
+  source). Only the derived clientNets cache is overridden, NOT comm.Clients
+  (the config surface marshaled to the API / hashed by the SNMP reconcile), so
+  the operator's config text is preserved for display/change-detection; only
+  runtime enforcement is forced closed. The rest of the config (other
+  communities, other stanzas) still loads with a warning. Strict commit path
+  unchanged (still hard-rejects). Well-formed communities are not
+  quarantined (no false positives).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config + go test
+  ./pkg/config green. Fail-on-revert: neutralizing the clientNets override makes
+  the quarantined community allow 8.8.8.8/10.1.2.3/192.168.1.1 → RED; restored →
+  GREEN. New tests assert deny-all + rest-of-config-loads + no-false-quarantine;
+  strict-reject tests unchanged.
+- **File(s)**: pkg/config/snmp_clients.go (Edit),
+  pkg/config/compiler_system.go (Edit),
+  pkg/config/snmp_clients_4834_test.go (Edit),
+  docs/feature-coverage.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
 - **Action**: Aligned the CLI in-process commit path (reloadSyslog /

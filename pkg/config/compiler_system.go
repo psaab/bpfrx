@@ -1223,6 +1223,14 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 		V3Users:     make(map[string]*SNMPv3User),
 	}
 
+	// #5833: communities whose `clients` allowlist carried a malformed token on
+	// the tolerant load / peer-sync path are quarantined to deny-all. Sticky
+	// across same-name merge blocks (#5472): once a community is quarantined a
+	// LATER well-formed block must NOT un-quarantine it (its policy is no longer
+	// trustworthy). Empty on the strict path (a malformed token hard-rejects
+	// before it can be recorded here).
+	quarantinedComms := map[string]bool{}
+
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "location":
@@ -1273,12 +1281,18 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				// earlier block's entries were already validated (and, strict,
 				// would have aborted), so re-validating the accumulated list
 				// would double-report the same warning.
-				clientWarnings, err := validateSNMPClients(blockClients, lenient)
+				clientWarnings, blockMalformed, err := validateSNMPClients(blockClients, lenient)
 				if err != nil {
 					return err
 				}
 				if cfg != nil {
 					cfg.Warnings = append(cfg.Warnings, clientWarnings...)
+				}
+				// #5833: a malformed token on the lenient path quarantines the
+				// community (strict already aborted above). Record it BEFORE the
+				// clientNets build below so the deny-all override wins.
+				if blockMalformed {
+					quarantinedComms[commName] = true
 				}
 				// #5472: same-name `community` blocks MERGE into one entry
 				// instead of a plain map overwrite. Junos treats two
@@ -1316,6 +1330,15 @@ func compileSNMP(node *Node, sys *SystemConfig, cfg *Config, lenient bool) error
 				// the config is published to the SNMP agent, so the cache is
 				// set with no concurrent readers.
 				comm.clientNets = compileClientNets(comm.Clients)
+				// #5833: fail CLOSED for a quarantined community. compileClientNets
+				// above would drop the malformed token and leave the surviving
+				// broad allow live (fail-open); override the enforcement cache with
+				// an explicit deny-all so no source can query this community until
+				// the operator fixes the typo. Sticky across merge blocks, so a
+				// later well-formed block for the same community cannot reopen it.
+				if quarantinedComms[commName] {
+					comm.clientNets = snmpQuarantineClientNets()
+				}
 			}
 		case "trap-group":
 			tgName := nodeVal(child)
