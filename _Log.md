@@ -1,3 +1,66 @@
+## 2026-07-15 — #5844 (bug/security/HIGH): routing-rule reconcile errors fail the commit closed
+- **Timestamp**: 2026-07-15 (fix/5844-routing-rule-reconcile-failclosed)
+- **Action**: `pkg/routing` correctly RETURNS next-table / rib-group / PBR
+  ip-rule reconcile failures, but the daemon call site (`applyRoutingRules`,
+  pkg/daemon/daemon_apply.go) was VOID and LOGGED-and-DROPPED them. So a commit
+  was ACKNOWLEDGED after a partial clear/add left stale-or-missing cross-VRF
+  policy in the kernel — and the immediately-following userspace route snapshot
+  (`reconcileRouteLeakSnapshot`) canonized that partial live kernel state into
+  the FIB. Made `applyRoutingRules` RETURN `errors.Join` of the three kernel
+  reconcile failures (ApplyNextTableRules / ApplyRibGroupRules / ApplyPBRRules),
+  collected while STILL running every rule type after one fails (fail-closed but
+  COMPLETE), keeping the per-error logging. `applyConfigLocked` captures it
+  (`routingRuleErr`) and threads it into the SAME tail `errors.Join` sink the
+  snapshot error uses (new final `applyTailReconciles` param); the snapshot
+  republish still runs first (ordering preserved). Mirrors the #5310 ifaceErr /
+  #5696 routeLeakErr deferred-error pattern. `BuildPBRRules` *build degradation*
+  is deliberately NOT joined — it is a fail-SAFE representability under-steer
+  (unrepresentable-as-ip-rule term dropped to the main table, still enforced by
+  the userspace filter path), not a partial kernel mutation, so fail-closing it
+  would reject configs that commit fine today.
+- **Validation**: gofmt clean; go build ./...; go test ./pkg/daemon/
+  ./pkg/routing/ -count=1 green; go vet ./pkg/daemon/ clean. Fail-on-revert
+  proven via overlay: dropping routingRuleErr from the tail join flips
+  TestApplyTailReconcilesSurfacesRoutingRuleError_5844 RED (commit returns nil
+  despite the injected failure); reverting applyRoutingRules to void breaks
+  compilation of the direct test.
+- **File(s)**: pkg/daemon/daemon_apply.go (Edit),
+  pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go (Write),
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go (Edit, arity),
+  pkg/daemon/route_leak_snapshot_failclosed_5696_test.go (Edit, arity),
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go (Edit, arity),
+  pkg/daemon/README.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5833 (bug/audit/security): quarantine SNMP community on malformed clients token (lenient fail-closed)
+- **Timestamp**: 2026-07-15 (fix/5833-snmp-lenient-quarantine)
+- **Action**: #4834 fixed STRICT-commit rejection of malformed SNMP `clients`
+  tokens but its LENIENT load/peer-sync branch preserved the pre-fix runtime
+  behaviour, which is FAIL-OPEN for the `restrict` typo: `clients 0.0.0.0/0
+  restric` (missing 't') detaches the modifier, so `0.0.0.0/0` survives as an
+  unrestricted allow and compileClientNets silently drops only the bad token —
+  on restart/upgrade/peer-sync the community answers from every IPv4 source.
+  Fix: on the lenient path, when a community's `clients` list carries ANY
+  malformed token, QUARANTINE that community to deny-all instead of keeping the
+  surviving broad allow. validateSNMPClients now also returns a `malformed`
+  flag; compileSNMP records it per-community (sticky across #5472 same-name
+  merge blocks so a later well-formed block cannot reopen it) and overrides the
+  community's clientNets enforcement cache with snmpQuarantineClientNets()
+  (explicit `0.0.0.0/0 restrict` + `::/0 restrict` → AllowsSource denies every
+  source). Only the derived clientNets cache is overridden, NOT comm.Clients
+  (the config surface marshaled to the API / hashed by the SNMP reconcile), so
+  the operator's config text is preserved for display/change-detection; only
+  runtime enforcement is forced closed. The rest of the config (other
+  communities, other stanzas) still loads with a warning. Strict commit path
+  unchanged (still hard-rejects). Well-formed communities are not
+  quarantined (no false positives).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config + go test
+  ./pkg/config green. Fail-on-revert: neutralizing the clientNets override makes
+  the quarantined community allow 8.8.8.8/10.1.2.3/192.168.1.1 → RED; restored →
+  GREEN. New tests assert deny-all + rest-of-config-loads + no-false-quarantine;
+  strict-reject tests unchanged.
+- **File(s)**: pkg/config/snmp_clients.go (Edit),
+  pkg/config/compiler_system.go (Edit),
+  pkg/config/snmp_clients_4834_test.go (Edit),
+  docs/feature-coverage.md (Edit), _Log.md (Edit)
 ## 2026-07-15 — #5811 (bug/audit/security): global-only clear commands enforce exact arity
 - **Timestamp**: 2026-07-15 (fix/5811-clear-exact-arity)
 - **Action**: Global-only `clear` handlers (whose backend action can ONLY clear

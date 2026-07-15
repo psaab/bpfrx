@@ -250,6 +250,14 @@ the userspace dataplane admission boundary is in
   into one entry before the immutable client-prefix cache is built, so a later
   duplicate with NO `clients` cannot overwrite an earlier block and silently
   erase its allowlist (an empty allowlist reads as allow-all → fail-open).
+  A malformed `clients` token is REJECTED at commit (#4834) and, on the tolerant
+  load / peer-sync path, QUARANTINES the affected community to deny-all (#5833):
+  a mistyped `restrict` (e.g. `0.0.0.0/0 restric`) detaches from its prefix and
+  used to leave a surviving unrestricted `0.0.0.0/0` allow, so on
+  restart/upgrade/peer-sync the community answered from every source. The lenient
+  path now compiles that community fail-CLOSED (`snmpQuarantineClientNets` →
+  deny-all) instead of fail-open, while the rest of the config loads with a
+  warning; the strict commit path still rejects it outright.
   Trap-group `categories` ENFORCED (#5522): `snmp trap-group <g> categories
   [ <cat> ]` scopes which notification categories a group receives — a link
   up/down trap (category `link`) is dispatched to a group only if the group
