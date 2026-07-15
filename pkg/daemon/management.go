@@ -38,13 +38,19 @@ import (
 //     RETAINED (fail-closed, not mgmt-down), its fingerprint field is left
 //     unrecorded so the next commit RETRIES the bind (retry debt), and the error
 //     is surfaced.
-//   - AUTH ORDERING on a combined change: the auth snapshot is published only
-//     once every leg is at its desired bind, so the live auth policy always
-//     matches the live binds. An auth-only change publishes immediately. A
-//     combined endpoint+auth change whose bind FAILED defers the auth swap to
-//     the retry — applying next.Auth (which the #4047/#5127 clamp may leave nil
-//     because the DESIRED bind is loopback) to a RETAINED non-loopback listener
-//     would fail OPEN.
+//   - AUTH ORDERING (revocation honored regardless of any rebind outcome): a
+//     credential TIGHTENING (a non-nil auth snapshot — the revoked credential
+//     removed from the set) is published to the live server UP FRONT, before any
+//     leg is touched, so a single commit that BOTH revokes a credential AND
+//     changes a bind that then fails to bind still rejects the revoked credential
+//     on the next request (the persistent listener already enforces it). A
+//     non-nil auth only ADDS a requirement, so it can never fail-open — publishing
+//     it early is unconditionally safe. Removing ALL api-auth (nil) is the one
+//     case deferred to convergence: it is published only once every leg is at its
+//     desired bind, so a non-loopback listener RETAINED by a failed rebind is
+//     never dropped to no-auth (next.Auth == nil is only reachable when the
+//     desired bind is loopback per the #4047/#5127 clamp, so on convergence the
+//     live state is loopback).
 //
 // The reconcile is serialized by mu; the apply path (applyConfigLocked under the
 // apply semaphore) already runs commits one at a time, so a newer generation can
@@ -146,6 +152,21 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		return nil
 	}
 
+	// #5866 revocation-honoring: publish a credential TIGHTENING (a non-nil auth
+	// snapshot — e.g. a revoked credential removed from the set) to the live
+	// server UP FRONT, before any listener leg is touched, so the revocation
+	// takes effect on the persistent listener(s) on the NEXT request REGARDLESS
+	// of any HTTP/HTTPS rebind outcome. A single commit that BOTH revokes a
+	// credential AND changes a bind that then fails to bind must NOT keep the
+	// revoked credential usable on the retained listener. A non-nil auth only
+	// ADDS a requirement — it can never fail-open — so publishing it early is
+	// unconditionally safe. Removing ALL api-auth (nil) is instead deferred to
+	// after the legs converge (below), so a non-loopback listener retained by a
+	// failed rebind is never dropped to no-auth (fail-open).
+	if next.Auth != nil {
+		m.srv.ReplaceAuth(next.Auth)
+	}
+
 	var errs []error
 
 	// HTTP leg: make-before-break rebind ONLY if the HTTP bind changed. Advance
@@ -169,15 +190,19 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		}
 	}
 
-	// Auth: publish only once every leg is at its desired bind (see the type
-	// doc). An auth-only change (no leg change) publishes immediately with no
-	// rebind; a combined change whose bind failed defers the swap to retry.
 	if len(errs) == 0 {
-		m.srv.ReplaceAuth(next.Auth)
+		// Every changed leg converged to its desired bind. If the commit removes
+		// ALL api-auth (nil), publish it now — safe because next.Auth == nil is
+		// only reachable when the desired bind is loopback (#4047/#5127 clamp), so
+		// the live state is loopback. (A non-nil tightening was already published
+		// above.)
+		if next.Auth == nil {
+			m.srv.ReplaceAuth(nil)
+		}
 		return nil
 	}
 	joined := errors.Join(errs...)
-	slog.Warn("web-management listener reconcile incomplete; retaining previous listener(s), deferring auth swap",
+	slog.Warn("web-management listener reconcile incomplete; retaining previous listener(s)",
 		"desired", endpointOf(next).summary(), "err", joined)
 	return fmt.Errorf("web-management reconcile to %s incomplete; retaining previous listener(s): %w",
 		endpointOf(next).summary(), joined)

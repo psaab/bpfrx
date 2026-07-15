@@ -180,13 +180,20 @@ credential revocation is enforced even on an apply that returns early
   next commit retries (retry debt), and log the error. This does not brick an
   otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
   retry).
-- **Auth ordering on a combined change**: the auth snapshot is published only
-  once every leg is at its desired bind, so the live auth policy always matches
-  the live binds. An auth-only change publishes immediately; a combined change
-  whose bind failed defers the auth swap to the retry (applying a possibly-nil-
-  on-loopback auth to a retained non-loopback listener would fail OPEN). The
-  reconcile is serialized by its mutex and the apply semaphore, so a newer
-  generation never completes behind an older one.
+- **Auth ordering — revocation honored regardless of rebind outcome**: a
+  credential TIGHTENING (a non-nil snapshot — the revoked credential removed from
+  the set) is published to the live server UP FRONT, before any leg is touched,
+  so a single commit that BOTH revokes a credential AND changes a bind that then
+  fails to bind still rejects the revoked credential on the next request (the
+  persistent listener already enforces it). A non-nil auth only ADDS a
+  requirement — it can never fail-open — so publishing it early is unconditionally
+  safe. Removing ALL api-auth (nil) is the one case deferred to convergence, so a
+  non-loopback listener retained by a failed rebind is never dropped to no-auth
+  (`next.Auth == nil` is only reachable when the desired bind is loopback per the
+  #4047/#5127 clamp). Pinned by
+  `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`. The reconcile is
+  serialized by its mutex and the apply semaphore, so a newer generation never
+  completes behind an older one.
 
 ## Cluster mode
 

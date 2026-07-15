@@ -383,6 +383,64 @@ func TestMgmtReconcileHTTPChangeKeepsHTTPS_5866(t *testing.T) {
 	}
 }
 
+// #5866 revocation-honoring (the elevated Finding A): a SINGLE commit that BOTH
+// revokes a credential AND changes the HTTPS endpoint to one that FAILS to bind
+// must still reject the revoked credential on the next request — the tightening
+// is published to the persistent HTTP listener UP FRONT, regardless of the HTTPS
+// rebind outcome — while the old HTTPS state is retained with retry debt.
+//
+// FAIL-ON-REVERT: without the up-front ReplaceAuth (publishing auth only after
+// the legs converge), the failed HTTPS rebind leaves the revoked credential in
+// the live snapshot -> the admin-absent assertion FAILS.
+func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	auth := &api.AuthConfig{Users: map[string]string{"admin": "secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", auth)); err != nil {
+		t.Fatalf("initial HTTP+HTTPS start: %v", err)
+	}
+	oldHTTPS := reg.get("10.0.0.1:8443")
+
+	// Bundled commit: revoke admin (new set has only "other") AND move the HTTPS
+	// bind to an address that fails to bind.
+	reg.failAddr["10.0.0.2:8443"] = true
+	revoked := &api.AuthConfig{Users: map[string]string{"other": "pw"}}
+	err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", revoked))
+	if err == nil {
+		t.Fatal("a failed HTTPS rebind must surface an error (retry debt)")
+	}
+
+	// The revocation was honored despite the HTTPS bind failure: the live auth
+	// snapshot no longer contains admin.
+	snap := m.srv.AuthSnapshotForTest()
+	if snap == nil {
+		t.Fatal("live auth snapshot is nil after the revoke reconcile")
+	}
+	if _, ok := snap.Users["admin"]; ok {
+		t.Fatal("revoked credential 'admin' is STILL live after a bundled revoke + failed HTTPS rebind " +
+			"— a revoked credential must be rejected on the next request regardless of the rebind outcome (#5866)")
+	}
+	if _, ok := snap.Users["other"]; !ok {
+		t.Fatal("the tightened credential 'other' is missing from the live auth snapshot")
+	}
+
+	// The old HTTPS listener is retained (fail-closed) and its fingerprint is not
+	// advanced (retry debt).
+	if !oldHTTPS.isOpen() {
+		t.Fatal("the old HTTPS listener was closed on a failed rebind (mgmt HTTPS went down)")
+	}
+	if m.cur.httpsAddr != "10.0.0.1:8443" {
+		t.Fatalf("HTTPS fingerprint = %q, want the retained 10.0.0.1:8443 (retry debt)", m.cur.httpsAddr)
+	}
+	// The HTTP listener was never touched.
+	if hln := reg.get("10.0.0.1:8080"); hln == nil || !hln.isOpen() {
+		t.Fatal("the HTTP listener was disturbed by the HTTPS rebind")
+	}
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
