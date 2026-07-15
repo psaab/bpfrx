@@ -149,6 +149,20 @@ presenter's rendered output is byte-identical:
   because an empty `ClearSessionsRequest` means clear-all to the peer.
   Key ports are network byte order (`ntohs` before comparing) and
   dataplane IPv4 NAT fields decode with NativeEndian (`uint32ToIP`).
+- GLOBAL-ONLY clears (`cli_clear.go`) — commands whose backend action can
+  ONLY clear everything and have no scoped variant (`clear arp`, `clear ipv6
+  neighbors`, `clear interfaces statistics`, `clear system config-lock`,
+  `clear security nat statistics`, `clear security nat source
+  persistent-nat-table`, `clear security counters`, `clear security policies
+  hit-count`, `clear firewall all`) enforce EXACT ARITY via
+  `requireClearNoScope`: a trailing scope-looking operand (e.g. `clear arp
+  192.0.2.10`) is REJECTED before any mutation instead of being silently
+  discarded and clearing everything (#5811, extends the #5570 policy-hit-count
+  fix to the whole global-only set). The remote CLI (`cmd/cli/clear.go`) carries
+  a byte-identical `requireClearNoScope` so both parsers reject the same input
+  the same way. Scoped clears (`clear security flow session <filter>`, `clear
+  dhcp client-identifier interface <name>`) are unaffected — they legitimately
+  take a scope.
 - `show security match-policies` (`showMatchPolicies`) and `test policy`
   (`testPolicy`) are THIN adapters over the single shared policy simulator
   `pkg/policymatch` (#3042) — the same matcher the REST and gRPC surfaces
