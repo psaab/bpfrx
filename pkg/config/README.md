@@ -204,6 +204,24 @@ parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
 
+**Interface-name canonicalization is not injective (#5832).**
+`LinuxIfName` only replaces `/` with `-`, so the DISTINCT authored names
+`ge-0/0/0` and `ge-0-0-0` collapse to the SAME Linux device / ifindex.
+Each authored interface still emits its own forwarding-snapshot row (zone,
+routing-instance, host-inbound, NAT, address, tunnel), but the Rust
+forwarding-state builder keys by ifindex and OVERWRITES the earlier row —
+the lexicographically later name silently wins, hijacking that device's
+security-zone / routing identity. `validateInterfaceNameCollisionStrict`
+(`compiler_validate_strict_ifname_collision.go`, wired into
+`runUniformGates`) hard-REJECTS such a collision — and a canonical name over
+the kernel IFNAMSIZ limit (15 bytes) — on the strict commit / commit-check
+path, naming both authored names, the shared device, and the winner. The
+tolerant load / peer-sync path downgrades to a warning
+(`opts.lenientIfNameCollision`, #1960 no-brick) so a grandfathered config
+still boots but the overwrite is no longer silent. The fix is a GATE, not a
+remapping: `LinuxIfName`'s mapping is unchanged, so every existing
+single-name config compiles exactly as before.
+
 **Comments (`# ...`, `// ...`, `/* ... */`) and unterminated blocks
 (M-8):** the lexer (`skipWhitespaceAndComments`) skips `#`/`//` line
 comments to end-of-line and `/* */` block comments to their closing
