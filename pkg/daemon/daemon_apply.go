@@ -758,6 +758,18 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		return d.closeoutHostAuthOnCancel(err, cfg)
 	}
 
+	// #5867: program the DHCP-learned management-VRF routes and capture the
+	// RouteReplace / cleanup failure as a DEFERRED error. A route whose
+	// destination stayed but whose gateway/output-interface changed and then
+	// failed to replace no longer leaves the stale route protected (the reconcile
+	// keys the protect-set on the full route identity, so the stale route is
+	// cleaned up) — and the failure is threaded into the tail commit-error join
+	// below so the commit fails closed instead of acknowledging a management
+	// route pinned to a stale/de-authorized gateway. Deferred (not fatal here)
+	// exactly like ifaceErr/routeLeakErr/routingRuleErr: the rest of the apply
+	// still runs.
+	mgmtRouteErr := d.applyMgmtVRFRoutes()
+
 	// #5310: capture the interface-reconcile failure (xfrmi/bond/tunnel/legacy-
 	// reth) and thread it into the tail commit-error join so a genuine reconcile
 	// failure (e.g. a route-based VPN's xfrmi that could not be created) fails
@@ -841,7 +853,7 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// next-table/rib-group/PBR ip-rule reconcile failure (a partial kernel
 	// policy-routing clear/add); the helper creates lo0Err/hostInboundErr and
 	// returns the joined errors.
-	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr)
+	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr)
 }
 
 // applyHostAuthorizationCloseout runs ONLY the security-critical host-
@@ -1953,8 +1965,15 @@ func (d *Daemon) applyVRFReconcile(ctx context.Context, cfg *config.Config) erro
 	}
 	d.publishMgmtVRFIfaces(mgmtSet)
 
-	// 0.6. Program default routes in the management VRF for DHCP leases.
-	d.applyMgmtVRFRoutes()
+	// #5867: the DHCP management-VRF route program+reconcile (formerly step 0.6
+	// here) now runs in applyConfigLocked immediately after this reconcile
+	// returns, so its RouteReplace / cleanup error is threaded into the tail
+	// commit-error join (fail-closed but complete) instead of being swallowed at
+	// this early phase. Moving it out of applyVRFReconcile also keeps a stale-
+	// route-pin failure from aborting the whole apply early (it must NOT skip the
+	// dataplane apply). Ordering is unchanged: it still runs after this reconcile
+	// (which publishes the mgmt-interface set it reads) and before the interface/
+	// dataplane reconciles.
 	return nil
 }
 
@@ -2051,7 +2070,7 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 // lo0Err/hostInboundErr originate in step 9.5 below. The returned errors.Join
 // preserves the exact operand order the inline tail used
 // (#1778/#2987/#4433/#5310/#5679/#5696).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr error) error {
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
@@ -2322,7 +2341,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

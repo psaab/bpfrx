@@ -85,7 +85,8 @@ func defaultV4Route() netlink.Route {
 	return netlink.Route{Dst: nil, Table: mgmtVRFTableID, Protocol: unix.RTPROT_DHCP, Family: netlink.FAMILY_V4}
 }
 
-// desiredKey builds a desired-set key the same way applyMgmtVRFRoutes does.
+// desiredKeyV4Default / desiredKeyCIDR build a DESTINATION key (the identity the
+// fake's RouteDel records) so a test can assert WHICH route was deleted.
 func desiredKeyV4Default() string {
 	return mgmtRouteDstKey(&net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}, netlink.FAMILY_V4)
 }
@@ -97,6 +98,24 @@ func desiredKeyCIDR(t *testing.T, cidr string) string {
 		t.Fatalf("ParseCIDR(%q): %v", cidr, err)
 	}
 	return mgmtRouteDstKey(ipnet, netlink.FAMILY_V4)
+}
+
+// appliedKeyV4Default / appliedKeyCIDR build the FULL-identity protect-set key the
+// same way applyMgmtVRFRoutesTo does (#5867). The seeded current routes in these
+// reconcile tests carry no gateway/ifindex (Gw nil, LinkIndex 0), so the applied
+// key matches with an empty gateway and index 0 — the reconcile keeps a desired
+// route and deletes a withdrawn one exactly as before.
+func appliedKeyV4Default() string {
+	return mgmtRouteAppliedKey(&net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}, netlink.FAMILY_V4, nil, 0)
+}
+
+func appliedKeyCIDR(t *testing.T, cidr string) string {
+	t.Helper()
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatalf("ParseCIDR(%q): %v", cidr, err)
+	}
+	return mgmtRouteAppliedKey(ipnet, netlink.FAMILY_V4, nil, 0)
 }
 
 // TestReconcileMgmtVRFRoutes_WithdrawnClasslessDeleted proves that a withdrawn
@@ -112,8 +131,8 @@ func TestReconcileMgmtVRFRoutes_WithdrawnClasslessDeleted(t *testing.T) {
 		},
 	}
 	desired := map[string]struct{}{
-		desiredKeyV4Default():             {},
-		desiredKeyCIDR(t, "10.20.0.0/16"): {},
+		appliedKeyV4Default():             {},
+		appliedKeyCIDR(t, "10.20.0.0/16"): {},
 	}
 
 	var d Daemon
@@ -207,8 +226,8 @@ func TestMgmtVRFRoutesToDelete(t *testing.T) {
 		mustCIDRRoute(t, "192.0.2.0/24"),
 	}
 	desired := map[string]struct{}{
-		desiredKeyV4Default():             {},
-		desiredKeyCIDR(t, "10.20.0.0/16"): {},
+		appliedKeyV4Default():             {},
+		appliedKeyCIDR(t, "10.20.0.0/16"): {},
 	}
 	del := mgmtVRFRoutesToDelete(current, desired, netlink.FAMILY_V4)
 	if len(del) != 1 {

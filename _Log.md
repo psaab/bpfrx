@@ -48471,5 +48471,47 @@ top.
   worktree — a fresh cache builds clean; used /dev/shm/cache5852.)
 
 - **Timestamp**: 2026-07-15
+  **Action**: #5867 (bug, audit, security): failed management-VRF route
+  replacement preserved a stale gateway/ifindex as "desired". applyMgmtVRFRoutes
+  (pkg/daemon/daemon_flow.go) keyed its cleanup protect-set on
+  destination+family ONLY and inserted the key BEFORE RouteReplace succeeded,
+  and dropped the RouteReplace error. So a route that kept its destination but
+  changed gateway/output-interface and then FAILED to replace left the OLD stale
+  route in the kernel yet still protected from cleanup — management traffic
+  pinned to a stale/de-authorized gateway while the commit reported success.
+  Fixed by modeling DESIRED vs APPLIED separately: new mgmtRouteAppliedKey (dst +
+  gateway + link index) keys the protect-set on the FULL route identity, a route
+  is added to it ONLY after RouteReplace SUCCEEDS, and mgmtVRFRoutesToDelete
+  matches kernel routes against that full identity — so a stale same-destination
+  route (old gw/ifindex) is NOT protected and the reconcile deletes it.
+  applyMgmtVRFRoutes now returns the joined RouteReplace + non-ESRCH delete
+  errors; split into a thin wrapper + injectable applyMgmtVRFRoutesTo(nlh,
+  leases, mgmtSet) core (new mgmtRouteProgrammer seam). The error is threaded
+  into commit truth via the DEFERRED tail-join (#5310/#5844 pattern): the call
+  moved out of applyVRFReconcile (whose error early-aborts at daemon_apply.go:750
+  and would skip the dataplane apply) into applyConfigLocked as a deferred
+  mgmtRouteErr local, joined by applyTailReconciles (8th deferred arg) — so a
+  stale-pin failure fails the commit closed without skipping the rest of the
+  apply. The DHCP-callback refresh path (daemon_dhcp.go) logs the error (no
+  commit to fail). Happy path (successful gateway change) supersedes the old
+  route cleanly and protects the new identity — unchanged.
+  **File(s)**: pkg/daemon/daemon_flow.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_dhcp.go, pkg/daemon/mgmtvrf_route_applied_5867_test.go,
+  pkg/daemon/mgmtvrf_route_reconcile_5108_test.go (helper split
+  desiredKey=dest / appliedKey=full-tuple), plus the 4 applyTailReconciles
+  test callers updated for the 9th arg, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/daemon/ -count=1` (green);
+  `go vet ./pkg/daemon/` clean. Fail-on-revert: fake netlink handle drives a
+  same-dest gateway change whose RouteReplace FAILS —
+  TestApplyMgmtVRFRoutes_FailedGatewayChangeCleansStaleRoute_5867 asserts the
+  error is surfaced AND the stale route is deleted; reverting to the dest-only
+  key + insert-before-replace leaves the stale route protected (deleted=[]) →
+  RED (verified). A successful-gateway-change test guards the happy path (no
+  over-cleanup). Note: shared GOCACHE=/dev/shm/cache still yields a phantom
+  pkg/config redeclare error from a prior worktree — used a fresh cache.
 - **Action**: #5850 (security) — gRPC MonitorPacketDrop called EventBuffer.Subscribe(256) directly, bypassing the defaultMaxSubscribers=64 admission cap (only TrySubscribe enforces it). The primary gRPC listener is loopback-clamped but UNAUTHENTICATED, so any local process could open an unbounded number of packet-drop streams — each adding a buffered channel AND expanding the synchronous O(N) per-event fan-out — exhausting memory + event-production CPU (a DoS distinct from #4484 L-2, which capped only REST SSE and wrongly treated gRPC as inherently bounded). Fixed server_diag_monitor.go MonitorPacketDrop to use TrySubscribe(256); on nil (cap reached) return status.Error(codes.ResourceExhausted, "too many concurrent event subscribers") BEFORE the defer sub.Close() and before streaming — mirroring the REST SSE 503 (pkg/api/sse.go). No cap/fan-out change — admission gate only; the existing defer sub.Close() (Subscription.Close → unsubscribe) frees the slot on teardown. Tests (new monitor_packet_drop_subscriber_cap_5850_test.go): fill the buffer to cap via TrySubscribe, then MonitorPacketDrop is rejected with ResourceExhausted (TestMonitorPacketDropRejectsOverCap_5850); a stream that tears down frees its slot (TestMonitorPacketDropTeardownFreesSlot_5850, goroutine + ctx cancel). Under-cap streaming is already covered by the existing MonitorPacketDrop match tests (they run against the new TrySubscribe path). Fail-on-revert verified: reverting to Subscribe admits the over-cap stream (returns after the bounded ctx timeout, not ResourceExhausted) → RED; restore → GREEN. gofmt/go vet/go build clean; go test -race ./pkg/grpcapi/ ./pkg/logging/ green. Doc: pkg/logging/README.md subscriber-cap paragraph corrected (request-created gRPC MonitorPacketDrop now uses TrySubscribe, not just REST SSE).
 - **File(s)**: pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/monitor_packet_drop_subscriber_cap_5850_test.go, pkg/logging/README.md
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5867 review-fold — add TestApplyTailReconcilesSurfacesMgmtRouteError_5867 (deferred-tail-join wiring regression test mirroring #5844) per independent-review MINOR; injects a sentinel as the final applyTailReconciles operand and asserts errors.Is(commitErr, sentinel) so dropping mgmtRouteErr from the tail errors.Join is fail-on-revert-caught. Production unchanged.
+  **File(s)**: pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go
