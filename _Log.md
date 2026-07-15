@@ -48797,3 +48797,20 @@ top.
     pkg/config/compiler.go, pkg/config/compiler_interfaces.go,
     pkg/config/compiler_dispatch.go, pkg/config/tunnelid.go,
     pkg/config/interface_unit_nonnumeric_5829_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5812 remote-CLI config-exit lock-retry. An explicit `exit`/`quit`
+    in remote configuration mode (cmd/cli/shared.go dispatchConfig) discarded the
+    ExitConfigure RPC error and unconditionally cleared local config-mode state, so
+    a transport timeout before the release reached the daemon left the server-side
+    config lock + candidate owned by the session while the client dropped to
+    operational mode believing it released — losing the in-process retry path. Made
+    explicit exit TRANSACTIONAL: check the error; on error surface it + STAY in
+    config mode (configMode/editPath/prompt preserved, Store(false) only on
+    success — the SIGINT goroutine reads configMode concurrently, #5053); on
+    success clear + print as before. The EOF/SIGINT/post-loop teardown path
+    (main.go exitConfigureBounded, best-effort bounded #5053) is deliberately
+    UNCHANGED. Fail-on-revert proven via -overlay (restore discard + unconditional
+    clear → error case silently transitions, tests RED).
+  - **File(s)**: cmd/cli/shared.go, cmd/cli/config_exit_retry_5812_test.go,
+    cmd/cli/README.md

@@ -80,11 +80,25 @@ Both goroutines touch `ctl.configMode`, so it is an `atomic.Bool`
 accessed only via `Load`/`Store` (#5053). A plain `bool` let the SIGINT
 read race the main loop's write; a Ctrl-C landing during a mode
 transition could observe stale state and skip the `ExitConfigure`
-cleanup. The teardown paths that run without a cancellable command
-context (SIGINT, EOF, and the post-loop exit) call `ExitConfigure`
-through `exitConfigureBounded`, whose context is time-bounded
-(`exitConfigureTimeout`) so a wedged daemon cannot hang Ctrl-C cleanup
-or block process exit.
+cleanup.
+
+There are two DISTINCT `ExitConfigure` release contracts:
+
+- **Explicit `exit`/`quit`** (`dispatchConfig`) is TRANSACTIONAL (#5812):
+  it checks the RPC error and only clears local config-mode state
+  (`configMode`/`editPath`/prompt) on SUCCESS. On an error (a transport
+  timeout/disconnect before the release reaches the daemon), the
+  server-side lock + candidate may still be owned by this session, so it
+  surfaces the error and STAYS in configuration mode with the edit path
+  intact — the operator retries `exit` (the RPC is idempotent
+  server-side, so a retry after a response-lost success still succeeds).
+- **Teardown** paths that run without a cancellable command context
+  (SIGINT double-Ctrl-C, EOF/Ctrl-D, and the post-loop exit) call
+  `ExitConfigure` through `exitConfigureBounded` — best-effort, error
+  discarded, time-bounded (`exitConfigureTimeout`) so a wedged daemon
+  cannot hang Ctrl-C cleanup or block process exit. The client is exiting
+  anyway and has no interactive recovery, so a lost release is left to
+  the daemon's disconnect cleanup / lease reclamation.
 
 ## Operational notes
 
