@@ -48335,3 +48335,35 @@ top.
   ctx.Err() check flips the abort tests RED (verified: phases ran p1,p2,p3,p4).
 - **Action**: #5854 — hard-reject next-table/rib-group ip-rule window over-subscription at strict commit (was warn-only → silent apply-time truncation → routes claimed but not programmed). Added validateRoutingRuleWindowsStrict (new compiler_validate_strict_routing_rulewindows.go) wired into runUniformGates after the #5693 next-table gate, gated by new opts.lenientRoutingRuleWindows (true in both lenient blocks): strict CompileConfig hard-rejects >100 next-table routes / >1000 rib-group leak prefixes; CompileConfigLenient (Store.Load / SyncApply / peer-sync) still warns-and-loads so grandfathered/peer-synced generations don't fail-closed (#1960). Removed the now-redundant warn-only validateRoutingRuleWindowWarnings + its ValidateConfig call (runUniformGates runs before ValidateConfig, so strict aborts clean; the lenient downgrade is the single warning — no double-warn). Window consts (maxNextTableRules=100, maxRibGroupLeakRules=1000) duplicated in pkg/config with keep-in-sync comment (pkg/config cannot import pkg/routing — cycle). Fail-on-revert tests (gate-unit + compile-path strict-reject + lenient-warn); neutralizing the gate turns all reject AND lenient-warn assertions RED. gofmt/go vet/go build clean; go test ./pkg/config/ ./pkg/routing/ green. Doc: docs/rib-group-route-leaking.md new "Strict rejection — ip-rule window over-subscription (#5854)" section.
 - **File(s)**: pkg/config/compiler_validate_strict_routing_rulewindows.go (new), pkg/config/compiler_uniformgates.go, pkg/config/compiler.go, pkg/config/compiler_validate_warn.go, pkg/config/compiler_validate_warn_routing.go, pkg/config/compiler_routing_rules_test.go, docs/rib-group-route-leaking.md
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5852 (bug): RPM lifecycle cancellation (StopAll / config
+  replacement / daemon shutdown) was mis-counted as path loss. When StopAll
+  cancels the shared probe context while runProbe is in flight, runSingleTest
+  treated the resulting context.Canceled (or the socket-timeout that follows a
+  cancel racing a blocking ReadFrom) as an ORDINARY probe failure: incremented
+  TotalSent/SuccFail, advanced the successive-loss threshold, emitted
+  ping_probe_failed, and could cross the loss threshold -> ping_test_failed +
+  fireTransition, so services ip-monitoring could change route preference DURING
+  teardown/reconfigure. Fixed by holding path state NEUTRAL on a lifecycle
+  cancel, mirroring the existing ErrProbeSetup hold: after runProbe, if
+  `ctx.Err() != nil || errors.Is(err, context.Canceled)` the probe RETURNs
+  before any counter/threshold/event/Transition. Discriminator is the SHARED
+  ctx.Err() (the probeCtx is context.WithCancel in Apply, cancelled ONLY by
+  m.cancel()), NOT the returned error type — a genuine probe TIMEOUT is a
+  per-probe socket deadline (icmp SetReadDeadline / TCP dial timeout) that
+  leaves ctx.Err()==nil and MUST still count as real path loss. RETURN (not
+  continue) so no post-loop fireTransition publishes a stale edge once teardown
+  begins. Deferred the optional icmp ReadFrom context-deadline responsiveness
+  tweak (StopAll can still wait up to the 3s socket deadline) as a follow-up —
+  the neutral classification is the load-bearing correctness fix and StopAll's
+  wg.Wait is bounded (<=3s, within TimeoutStopSec=20).
+  **File(s)**: pkg/rpm/rpm.go, pkg/rpm/README.md,
+  pkg/rpm/cancel_neutral_5852_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/rpm/ -count=1` (green);
+  `go vet ./pkg/rpm/` clean. Fail-on-revert: removing the neutral check flips
+  TestRunSingleTestLifecycleCancelIsNeutral5852 RED (cancelled probe advanced
+  TotalSent:1/SuccFail:1/LastStatus:fail) while the genuine-failure +
+  probe-owned-DeadlineExceeded tests stay GREEN (no over-neutralization).
+  (NOTE: the shared GOCACHE=/dev/shm/cache was contaminated by a prior
+  worktree — a fresh cache builds clean; used /dev/shm/cache5852.)
