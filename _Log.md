@@ -1,3 +1,53 @@
+## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Aligned the CLI in-process commit path (reloadSyslog /
+  buildSyslogClients, pkg/cli/apply.go) with the daemon's applySyslogConfig on
+  the two remaining non-confidentiality divergences (#5712 covered the
+  security-relevant fields). Because the CLI reload writes LAST on a local
+  commit, these were not self-corrected. Gap 1 (source-interface fallback):
+  buildSyslogClients now resolves the global source-interface via
+  config.ResolveSyslogSourceAddr and uses it when a stream has no per-stream
+  source-address, byte-matching the daemon; previously it passed
+  stream.SourceAddress unconditionally so a source-interface-only stream bound a
+  kernel-chosen source on a local commit. Gap 2 (event mode): reloadSyslog now
+  honors Mode == "event" exactly like the daemon — clear remote clients + install
+  a local writer — and clears stale local writers in stream mode; previously it
+  unconditionally rebuilt remote clients, re-installing the ones the daemon had
+  cleared. Added SyslogClient.SourceAddr() and EventReader.LocalWriterCount()
+  observability accessors (symmetric with Protocol() / SyslogClientCount()) for
+  fail-on-revert assertions. The #5712 transport-idempotence tests remain green.
+- **Validation**: gofmt clean (touched files); go build ./... + go vet
+  (touched pkgs) clean apart from a pre-existing cli.go unreachable-code note in
+  an untouched file; go test ./pkg/cli/ ./pkg/logging/ ./pkg/config/
+  ./pkg/daemon/ green. Fail-on-revert proven RED then restored GREEN for gap 1
+  (source binding empties), gap 2 event-clear (remote count 1), and gap 2
+  stream-writer-clear (writer count 1).
+- **File(s)**: pkg/cli/apply.go (Edit),
+  pkg/cli/syslog_source_iface_parity_5738_test.go (Write),
+  pkg/logging/syslog.go (Edit), pkg/logging/ringbuf.go (Edit), _Log.md (Edit)
+
+## 2026-07-15 — #5738 (bug/syslog) commit 1/2: move resolveSourceAddr into pkg/config
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Pure code-motion. The syslog source-interface resolver lived in
+  pkg/daemon (unexported resolveSourceAddr) so the CLI in-process commit path
+  could not reuse it. Moved it verbatim to pkg/config as the exported
+  ResolveSyslogSourceAddr (least-surprising shared home: it is a pure function
+  of a *config.Config, and pkg/config already documents its semantics in
+  ValidateSyslogSourceInterface). Behavior is byte-identical; only the package,
+  name, and receiver-parameter type change. Updated the sole daemon caller
+  (applySyslogConfig) to config.ResolveSyslogSourceAddr, dropped the now-unused
+  strconv import from daemon_system.go, moved the resolver unit tests into
+  pkg/config, and repointed the doc references in schema_validators_logging.go
+  to the new location. No behavior change; sets up commit 2 which teaches the
+  CLI path to use the shared fallback.
+- **Validation**: go build ./pkg/config/ ./pkg/daemon/ clean; go vet clean;
+  moved resolver tests pass in pkg/config; daemon syslog tests still green.
+- **File(s)**: pkg/config/syslog_source.go (Write),
+  pkg/config/syslog_source_test.go (Write),
+  pkg/daemon/daemon_system.go (Edit),
+  pkg/daemon/syslog_source_test.go (git rm),
+  pkg/config/schema_validators_logging.go (Edit), _Log.md (Edit)
+
 ## 2026-07-12 — #5633 (bug/config/routing): reject contradictory duplicate-route dispositions at commit
 - **Timestamp**: 2026-07-12 (fix/5633-dup-route-contradiction)
 - **Action**: codex-review-181 M25 / A3-b02-F03. The static-route merge in
@@ -48127,3 +48177,34 @@ top.
   "_rf"` flips the bound/namespace/truncation-collision/unicode tests RED
   (verified). Updated 2 pre-existing tests that pinned the old `V6ONLY_rf`
   literal to the helper output.
+  **Action**: #5768 (bug, security): bound factory-reset (zeroize) deletion
+  to xpf-OWNED artifacts. PR #5767 added the lexical FactoryResetForbiddenRoots
+  denylist, but a denylist is inherently incomplete on a wildcard-glob wipe: a
+  custom -config in an UNLISTED shared dir (/data/xpf.conf -> /data) or a SUBDIR
+  of a listed root (/opt/foo/x.conf -> /opt/foo; /opt denied, /opt/foo passes)
+  slipped past it, and the top-level sweep's broad `*.conf` suffix + `rollback*`
+  prefix globs then deleted UNOWNED siblings (a neighbor's foo.conf, xpf's own
+  rendered /etc/frr/frr.conf, a rollback-notes file). Replaced the two globs in
+  BOTH twin wipe primitives (grpcapi.zeroizeConfigDir, configstore.
+  FactoryResetConfigDir) with EXACT xpf-owned name matches: the live config
+  (name == configBase, any extension), rescue.conf (new shared
+  configstore.RescueConfigBase const, wired into Store.rescuePath), the audit
+  journal + rotated segments, the numbered text rollback slots
+  (<configBase>.<N>), and fsatomic crash temps. Dedicated xpf-owned subdir
+  RemoveAll's (.configdb, gRPC tls) and the isFsatomicTemp shape match are kept
+  (under-scoping a temp would strand an owned secret-bearing temp, #5475 — the
+  worse failure). ValidateFactoryResetRoot denylist retained as
+  defense-in-depth. The exact live-config match also fixes a latent bug: a
+  non-".conf" -config base (site.cfg) previously survived the suffix glob.
+  **File(s)**: pkg/grpcapi/server_diag_zeroize.go,
+  pkg/configstore/factory_reset.go, pkg/configstore/store_persist.go,
+  pkg/configstore/README.md,
+  pkg/grpcapi/zeroize_ownership_5768_test.go,
+  pkg/configstore/factory_reset_ownership_5768_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/grpcapi/ ./pkg/configstore/
+  -count=1` (green); `go vet` clean. New fail-on-revert tests seed a validated
+  config root with owned artifacts + unowned siblings (other.conf, frr.conf,
+  rollback, rollback.bak, an unrelated subdir); after the wipe every owned
+  artifact is erased (no secret-retention regression) and every unowned sibling
+  survives. Restoring the `*.conf`/`rollback*` globs deletes the 4 siblings and
+  flips both tests RED (verified).

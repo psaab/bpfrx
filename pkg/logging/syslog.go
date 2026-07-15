@@ -279,6 +279,14 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 // TCP/TLS stream instead of downgrading it to plaintext UDP (#5712).
 func (s *SyslogClient) Protocol() string { return s.protocol }
 
+// SourceAddr returns the source IP this client was constructed to bind its
+// outbound connection to (empty when the kernel chooses the source). Exported
+// so callers/tests can verify the source binding was honored -- e.g. that an
+// in-process CLI commit applies the global `security log source-interface`
+// fallback for a stream with no per-stream source-address, matching the daemon
+// reconcile (#5738).
+func (s *SyslogClient) SourceAddr() string { return s.sourceAddr }
+
 // NewSyslogClientWithConn wraps an already-established net.Conn in a syslog
 // client. No dial is performed: the connection is treated as already up, and
 // protocol governs any later reconnect. It exists so callers — primarily
