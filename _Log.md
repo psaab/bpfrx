@@ -48701,3 +48701,21 @@ top.
   ./pkg/config/ -run Scheduler GREEN; full pkg/config suite GREEN. Fail-on-revert:
   restoring fresh-alloc+overwrite via -overlay -> the 4 merge tests RED (only the
   last block's day survives), single-block stays green.
+
+## 2026-07-15 — #5826 address-set member dedup O(N²) → O(N)
+
+- **Timestamp**: 2026-07-15
+- **Action**: appendUniqueString linearly scanned the full member slice on every
+  append, so parseAddressBookEntries compiled an N-member address set in O(N²).
+  Replaced with a per-address-set O(1) map index (separate maps for direct-address
+  and nested-set members), seeded from existing members, append to the ordered
+  slice only on first-seen miss. Byte-identical output (first-seen order + exact
+  union-by-name dedup); compiler-local (not persisted). Removed appendUniqueString.
+- **File(s)**: pkg/config/compiler_security_addressbook.go (map-backed dedup,
+  appendUniqueString removed), pkg/config/addressset_dedup_5826_test.go (NEW —
+  correctness + namespace-independence + scaling guard + benchmark),
+  docs/bugs.md (#5826 entry + corrected #4706 appendUniqueString reference).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ clean; go test -race
+  ./pkg/config/ -run 'AddressBook|AddressSet|AddrSet' GREEN; full pkg/config GREEN.
+  Fail-on-revert: restoring the linear scan makes the scaling test (N=80000) take
+  ~20s > 3s budget → RED (vs ~0.08s with the fix); #4706 behavior tests stay green.
