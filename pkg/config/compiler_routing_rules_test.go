@@ -10,7 +10,7 @@ import (
 // the main table via an interface-routes rib-group and carries n static
 // connected prefixes on its member interface unit. family selects v4 ("inet")
 // or v6 ("inet6") addresses (and the corresponding rib-group field), so the
-// #3876 per-prefix window warn can be exercised on either family.
+// #3876 per-prefix window gate can be exercised on either family.
 func mkLeakingInstance(n int, family string) *Config {
 	cfg := &Config{}
 	addrs := make([]string, 0, n)
@@ -43,108 +43,164 @@ func mkLeakingInstance(n int, family string) *Config {
 	return cfg
 }
 
-// TestValidateRoutingRuleWindowWarnings covers the commit-time warnings that
-// pair with the applier's fixed next-table / rib-group ip-rule priority
-// windows. The warning fires only when the config exceeds the window the
-// applier can program; at or below the limit it stays silent. The rib-group
-// window is now PER CONNECTED PREFIX (#3876, 1000-rule window).
-func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
-	mkNextTableRoutes := func(n int) []*StaticRoute {
-		routes := make([]*StaticRoute, n)
-		for i := range routes {
-			routes[i] = &StaticRoute{Destination: "10.0.0.0/8", NextTable: "vr"}
-		}
-		return routes
+// mkNextTableCfg builds a *Config with n global static routes that each carry a
+// next-table VRF-leak target, for the direct window-gate unit test. The target
+// value is non-empty (what the applier counts toward its ip-rule window); the
+// gate under test only counts next-table routes and does not resolve the target.
+func mkNextTableCfg(n int) *Config {
+	cfg := &Config{}
+	routes := make([]*StaticRoute, n)
+	for i := range routes {
+		routes[i] = &StaticRoute{Destination: "10.0.0.0/8", NextTable: "vr"}
 	}
+	cfg.RoutingOptions.StaticRoutes = routes
+	return cfg
+}
 
-	t.Run("next-table at limit is silent", func(t *testing.T) {
+// TestRoutingRuleWindowsStrictGate_5854 unit-tests the window over-subscription
+// gate directly: at or below the applier's fixed ip-rule windows (100
+// next-table, 1000 rib-group leak) it passes; above either window it returns an
+// error. It also pins the counting semantics (both static-route lists count;
+// an instance with no rib-group reference does not; a v6-only reference does).
+//
+// FAIL-ON-REVERT: reverting validateRoutingRuleWindowsStrict to always return
+// nil (the pre-#5854 warn-only behaviour) turns the over-limit sub-tests RED.
+func TestRoutingRuleWindowsStrictGate_5854(t *testing.T) {
+	t.Run("next-table at limit passes", func(t *testing.T) {
+		if err := validateRoutingRuleWindowsStrict(mkNextTableCfg(maxNextTableRules)); err != nil {
+			t.Fatalf("%d next-table routes must pass, got %v", maxNextTableRules, err)
+		}
+	})
+
+	t.Run("next-table over limit rejected", func(t *testing.T) {
+		// Split across inet + inet6 to prove both lists count toward the window.
 		cfg := &Config{}
-		cfg.RoutingOptions.StaticRoutes = mkNextTableRoutes(100)
-		got := validateRoutingRuleWindowWarnings(cfg)
-		if len(got) != 0 {
-			t.Fatalf("expected no warning at 100 next-table routes, got %v", got)
+		cfg.RoutingOptions.StaticRoutes = mkNextTableCfg(60).RoutingOptions.StaticRoutes
+		cfg.RoutingOptions.Inet6StaticRoutes = mkNextTableCfg(41).RoutingOptions.StaticRoutes
+		err := validateRoutingRuleWindowsStrict(cfg)
+		if err == nil || !strings.Contains(err.Error(), "next-table") {
+			t.Fatalf("101 next-table routes must be rejected, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "101") {
+			t.Errorf("error should report the combined count 101, got %q", err)
 		}
 	})
 
-	t.Run("next-table over limit warns", func(t *testing.T) {
-		cfg := &Config{}
-		// Split across inet + inet6 to prove both lists are counted.
-		cfg.RoutingOptions.StaticRoutes = mkNextTableRoutes(60)
-		cfg.RoutingOptions.Inet6StaticRoutes = mkNextTableRoutes(41)
-		got := validateRoutingRuleWindowWarnings(cfg)
-		if len(got) == 0 || !strings.Contains(got[0], "next-table") {
-			t.Fatalf("expected a next-table over-limit warning, got %v", got)
-		}
-		if !strings.Contains(got[0], "101") {
-			t.Errorf("warning should report the combined count 101, got %q", got[0])
+	t.Run("rib-group at limit passes", func(t *testing.T) {
+		if err := validateRoutingRuleWindowsStrict(mkLeakingInstance(maxRibGroupLeakRules, "inet")); err != nil {
+			t.Fatalf("%d leaked prefixes must pass, got %v", maxRibGroupLeakRules, err)
 		}
 	})
 
-	t.Run("rib-group at limit is silent", func(t *testing.T) {
-		cfg := mkLeakingInstance(1000, "inet")
-		got := validateRoutingRuleWindowWarnings(cfg)
-		if len(got) != 0 {
-			t.Fatalf("expected no warning at 1000 leaked prefixes, got %v", got)
+	t.Run("rib-group over limit rejected", func(t *testing.T) {
+		err := validateRoutingRuleWindowsStrict(mkLeakingInstance(1001, "inet"))
+		if err == nil || !strings.Contains(err.Error(), "rib-group") {
+			t.Fatalf("1001 leaked prefixes must be rejected, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "1001") {
+			t.Errorf("error should report the prefix count 1001, got %q", err)
 		}
 	})
 
-	t.Run("rib-group over limit warns", func(t *testing.T) {
-		cfg := mkLeakingInstance(1001, "inet")
-		got := validateRoutingRuleWindowWarnings(cfg)
-		if len(got) != 1 || !strings.Contains(got[0], "rib-group") {
-			t.Fatalf("expected a rib-group over-limit warning, got %v", got)
-		}
-		if !strings.Contains(got[0], "1001") {
-			t.Errorf("warning should report the prefix count 1001, got %q", got[0])
-		}
-	})
-
-	t.Run("instances with no rib-group reference are not counted", func(t *testing.T) {
-		// An addressed instance with NO rib-group reference contributes no
-		// leaked prefixes and must not warn.
+	t.Run("instance without rib-group reference not counted", func(t *testing.T) {
 		cfg := mkLeakingInstance(1001, "inet")
 		cfg.RoutingInstances[0].InterfaceRoutesRibGroup = ""
-		got := validateRoutingRuleWindowWarnings(cfg)
-		if len(got) != 0 {
-			t.Fatalf("instances without a rib-group reference must not warn, got %v", got)
+		if err := validateRoutingRuleWindowsStrict(cfg); err != nil {
+			t.Fatalf("an instance without a rib-group reference must not count, got %v", err)
 		}
 	})
 
-	t.Run("v6-only rib-group reference is counted", func(t *testing.T) {
-		cfg := mkLeakingInstance(1001, "inet6")
-		got := validateRoutingRuleWindowWarnings(cfg)
-		if len(got) != 1 || !strings.Contains(got[0], "rib-group") {
-			t.Fatalf("expected a rib-group over-limit warning for v6-only refs, got %v", got)
+	t.Run("v6-only rib-group reference counted", func(t *testing.T) {
+		if err := validateRoutingRuleWindowsStrict(mkLeakingInstance(1001, "inet6")); err == nil {
+			t.Fatal("a v6-only rib-group over-limit must be rejected")
 		}
 	})
 }
 
-// TestValidateConfigSurfacesRoutingRuleWindowWarnings asserts the
-// over-limit warnings actually flow out of the commit-time entry point
-// ValidateConfig, not just the standalone helper. If the wiring in
-// ValidateConfig were dropped, the operator would lose the warning even
-// though the helper-level tests above still pass.
-func TestValidateConfigSurfacesRoutingRuleWindowWarnings(t *testing.T) {
-	cfg := mkLeakingInstance(1001, "inet")
-	for i := 0; i < 101; i++ {
-		cfg.RoutingOptions.StaticRoutes = append(cfg.RoutingOptions.StaticRoutes,
-			&StaticRoute{Destination: "10.0.0.0/8", NextTable: "vr"})
+// nextTableOverLimitSets returns flat `set` commands for 101 next-table static
+// routes (one over the 100-rule window) all pointing at a DEFINED routing-
+// instance, so the #5693 next-table definedness gate passes and the #5854
+// window gate is the one that fires.
+func nextTableOverLimitSets() []string {
+	sets := []string{"set routing-instances vr instance-type virtual-router"}
+	for i := 0; i <= maxNextTableRules; i++ { // 0..100 => 101 distinct routes
+		sets = append(sets, fmt.Sprintf(
+			"set routing-options static route 10.%d.%d.0/24 next-table vr.inet.0", i/256, i%256))
 	}
+	return sets
+}
 
-	warnings := ValidateConfig(cfg)
-	var sawNextTable, sawRibGroup bool
-	for _, w := range warnings {
-		if strings.Contains(w, "next-table") && strings.Contains(w, "ignored at") {
-			sawNextTable = true
+// ribGroupOverLimitSets returns flat `set` commands for a routing-instance
+// whose interface-routes rib-group imports the main table and whose member
+// unit carries 1001 connected prefixes (one over the 1000-rule leak window).
+func ribGroupOverLimitSets() []string {
+	sets := []string{
+		"set routing-instances vr instance-type virtual-router",
+		"set routing-instances vr routing-options interface-routes rib-group inet leak",
+		"set routing-instances vr interface ge-0/0/1.0",
+		"set routing-options rib-groups leak import-rib inet.0",
+	}
+	for i := 0; i <= maxRibGroupLeakRules; i++ { // 0..1000 => 1001 distinct prefixes
+		sets = append(sets, fmt.Sprintf(
+			"set interfaces ge-0/0/1 unit 0 family inet address 10.%d.%d.1/24", i/256, i%256))
+	}
+	return sets
+}
+
+// TestRoutingRuleWindowsStrictReject_5854 proves the #5854 fix end-to-end on the
+// STRICT commit path: a config that over-subscribes either ip-rule window is
+// HARD-REJECTED by CompileConfig instead of committing green and being silently
+// truncated at apply time (routes claimed but not programmed).
+//
+// FAIL-ON-REVERT: removing the validateRoutingRuleWindowsStrict call from
+// runUniformGates (or reverting the gate to a no-op) makes CompileConfig accept
+// the over-limit configs, so these reject assertions fire RED.
+func TestRoutingRuleWindowsStrictReject_5854(t *testing.T) {
+	t.Run("next-table 101 rejected at commit", func(t *testing.T) {
+		tree := flatTreeFromSets(t, nextTableOverLimitSets()...)
+		_, err := CompileConfig(tree)
+		if err == nil || !strings.Contains(err.Error(), "next-table") {
+			t.Fatalf("strict CompileConfig must reject 101 next-table routes, got %v", err)
 		}
-		if strings.Contains(w, "rib-group") && strings.Contains(w, "ignored at") {
-			sawRibGroup = true
+	})
+
+	t.Run("rib-group 1001 rejected at commit", func(t *testing.T) {
+		tree := flatTreeFromSets(t, ribGroupOverLimitSets()...)
+		_, err := CompileConfig(tree)
+		if err == nil || !strings.Contains(err.Error(), "rib-group") {
+			t.Fatalf("strict CompileConfig must reject 1001 rib-group leak prefixes, got %v", err)
 		}
-	}
-	if !sawNextTable {
-		t.Errorf("ValidateConfig did not surface the next-table over-limit warning; got %v", warnings)
-	}
-	if !sawRibGroup {
-		t.Errorf("ValidateConfig did not surface the rib-group over-limit warning; got %v", warnings)
-	}
+	})
+}
+
+// TestRoutingRuleWindowsLenientWarns_5854 proves the strict/tolerant split: the
+// SAME over-limit configs LOAD (never hard-fail) on the tolerant path
+// (CompileConfigLenient) with a downgrade warning, so an already-committed or
+// peer-synced generation that predates this rejection still boots (#1960 — the
+// applier's window hard-cap keeps the excess inert).
+//
+// FAIL-ON-REVERT: dropping opts.lenientRoutingRuleWindows from the lenient opts
+// (or otherwise hard-rejecting in lenient) makes these loads error → RED.
+func TestRoutingRuleWindowsLenientWarns_5854(t *testing.T) {
+	t.Run("next-table 101 loads with a warning", func(t *testing.T) {
+		tree := flatTreeFromSets(t, nextTableOverLimitSets()...)
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("tolerant load must NOT reject 101 next-table routes, got %v", err)
+		}
+		if !hasWarningContaining(cfg.Warnings, "next-table") {
+			t.Fatalf("tolerant load must record a next-table window warning, got %v", cfg.Warnings)
+		}
+	})
+
+	t.Run("rib-group 1001 loads with a warning", func(t *testing.T) {
+		tree := flatTreeFromSets(t, ribGroupOverLimitSets()...)
+		cfg, err := CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("tolerant load must NOT reject 1001 rib-group prefixes, got %v", err)
+		}
+		if !hasWarningContaining(cfg.Warnings, "rib-group") {
+			t.Fatalf("tolerant load must record a rib-group window warning, got %v", cfg.Warnings)
+		}
+	})
 }
