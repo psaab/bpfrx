@@ -254,10 +254,15 @@ the userspace dataplane admission boundary is in
   load / peer-sync path, QUARANTINES the affected community to deny-all (#5833):
   a mistyped `restrict` (e.g. `0.0.0.0/0 restric`) detaches from its prefix and
   used to leave a surviving unrestricted `0.0.0.0/0` allow, so on
-  restart/upgrade/peer-sync the community answered from every source. The lenient
-  path now compiles that community fail-CLOSED (`snmpQuarantineClientNets` →
-  deny-all) instead of fail-open, while the rest of the config loads with a
-  warning; the strict commit path still rejects it outright.
+  restart/upgrade/peer-sync the community answered from every source. A
+  LEADING/orphan `restrict` — `restrict` BEFORE any prefix (`clients restrict
+  0.0.0.0/0`, invalid-Junos ordering) — was likewise silently dropped, leaving
+  the following prefix a plain allow (#5898); `parseSNMPClients` now records that
+  orphan `restrict` as a client entry so it is flagged malformed on the SAME
+  path. The lenient path compiles the affected community fail-CLOSED
+  (`snmpQuarantineClientNets` → deny-all) instead of fail-open, while the rest of
+  the config loads with a warning; the strict commit path rejects it outright,
+  naming the token. A well-formed `<prefix> restrict` is unaffected.
   Trap-group `categories` ENFORCED (#5522): `snmp trap-group <g> categories
   [ <cat> ]` scopes which notification categories a group receives — a link
   up/down trap (category `link`) is dispatched to a group only if the group
