@@ -48609,3 +48609,19 @@ top.
 - **Timestamp**: 2026-07-15
   **Action**: #5855 (dhcpv6: DUID-type change restarts the client but retained the old cached/persisted identity). Reconcile includes DUIDType in the client fingerprint and restarts on change, but getDUID returned the CACHED DUID first, else the PERSISTED DUID, WITHOUT validating that its actual type matched the newly-requested duid-ll/duid-llt mode → the restarted client kept the OLD type indefinitely. FIX (Option 1, atomic rotate — operator-friendly, no explicit clear required): getDUID now normalizes the requested type and reuses a cached/persisted DUID ONLY when actualDUIDType(d)==want; on a mismatch it drops the stale cache, ignores the mismatched persisted DUID, and atomically GENERATES + durably PERSISTS the requested type BEFORE returning it (persist-before-start holds: Reconcile stops+joins the old client, then Start calls getDUID synchronously before the first Solicit). Added actualDUIDType (concrete-type switch on *dhcpv6.DUIDLL/DUIDLLT) + normalizeDUIDType helpers. Reconcile drops m.duids[iface] on a type change (defense-in-depth). PERSISTENCE-FAILURE fail-safe: if the new-type persist fails during a ROTATION (loadErr==nil, a previous identity exists), getDUID RETAINS the previous persisted identity + re-caches it and returns it (old type) with NO error and NO unpersisted new DUID exposed — a partially-rotated DUID-LLT would be ephemeral; the client stays coherent until a later reconcile persists the new one. Cold-start (no prior identity) preserves the #4909 behavior (duid-llt persist failure → error; duid-ll → benign). show/API DUIDs() already reports duid.DUIDType().String() from the resolved DUID (actual active type), not m.duidTypes — verified. Added a package-var write seam duidWriteFile (wraps fsatomic.WriteFileDurable) so a test can inject a persist failure while loadDUID still reads the pre-seeded old DUID. Tests (duid_type_rotate_5855_test.go, fail-on-revert): warm-cache rotate both directions (cache type-check); cold-cache rotate both directions (persisted type-check, + reload asserts the new type is persisted); rotation-persist-failure retains the previous identity (byte-equal, no error, on-disk untouched); DUIDs() reports the ACTIVE type not the configured type; Reconcile invalidates the cached DUID on a type change (runClientForTest no-op). Fail-on-revert verified firsthand: drop the cache type-check → warm-cache RED; drop the persisted type-check → cold+warm RED; remove the rotation fail-safe → persist-failure RED; all restore GREEN. go build ./... + go vet ./pkg/dhcp/ clean; go test -race ./pkg/dhcp/ GREEN. Doc: pkg/dhcp/README.md new #5855 bullet (automatic rotation, persist-before-start, fail-safe, show reports active type).
   **File(s)**: pkg/dhcp/dhcp.go, pkg/dhcp/reconcile.go, pkg/dhcp/duid_type_rotate_5855_test.go (new), pkg/dhcp/README.md, _Log.md
+## 2026-07-15 — #5913 show interfaces extensive/detail nil-guard
+
+- **Timestamp**: 2026-07-15
+- **Action**: Route the config-map-build loops in showInterfacesExtensive
+  (ifCfgMap) and showInterfacesDetail (ifDescMap) through config.RangeInterfaces
+  so a present-but-nil InterfaceConfig slot (tolerant load / HA config-sync) no
+  longer nil-derefs ifc.Name/ifc.Description and panics the daemon. Same
+  #5813/#5910 class, same file #5910 patched.
+- **File(s)**: pkg/grpcapi/server_show_interfaces_text.go (2 loops → RangeInterfaces),
+  pkg/grpcapi/server_show_interfaces_nil_5913_test.go (NEW — 2 fail-on-revert
+  tests driving the real presenters), pkg/config/README.md (nil-safe-iterator
+  guarded-site enumeration extended to the interfaces presenters).
+- **Validation**: go build ./... clean; go vet ./pkg/grpcapi/ clean;
+  go test -race ./pkg/grpcapi/ GREEN; both raw-walk reverts proven RED via
+  -overlay (nil-deref panic caught by recover→t.Fatalf), each revert breaking
+  only its own test (independent guards).
