@@ -603,10 +603,10 @@ and returned `false` **without clearing anything**. The exclusive lock
 then persisted with no live holder, and every subsequent
 `configure` / `configure exclusive` / `configure private` was rejected
 until daemon restart — a single operator running `configure exclusive`
-then disconnecting bricked all future config edits. The disconnect
-auto-release (`configLockInterceptor` in `pkg/grpcapi/server.go`) routes
-through `ExitConfigureSession`, so it silently failed too; matching the
-effective holder restores that stale-holder reclaim on disconnect.
+then disconnecting bricked all future config edits. The connection-close
+auto-release (`configLockStatsHandler`'s `ConnEnd`, `pkg/grpcapi`; #5849)
+routes through `ExitConfigureSession`, so it silently failed too; matching
+the effective holder restores that stale-holder reclaim on disconnect.
 
 `ConfigHolder()` likewise reports the effective holder, so
 `clear system config-lock` / diagnostic output attributes an exclusive
@@ -618,9 +618,11 @@ remains the unconditional operator override.
 
 ### Config lock: idle-lease reaper (#4476)
 
-The gRPC config path auto-releases the lock when a client disconnects
-(`configLockInterceptor` in `pkg/grpcapi/server.go` calls
-`ExitConfigureSession` once `ctx.Err() != nil`). The **REST** config
+The gRPC config path auto-releases the lock when a client's CONNECTION
+ends (`configLockStatsHandler`'s `ConnEnd` in `pkg/grpcapi`, #5849, calls
+`ExitConfigureSession` exactly once — keyed by the connection-scoped id,
+never on per-RPC cancellation, so a cancelled unary no longer discards the
+connection's candidate). The **REST** config
 path has no such hook: `POST /api/v1/config/enter`
 (`configEnterHandler`) takes the global lock with an empty holder, and a
 stateless HTTP client that never calls `/config/exit` leaves it held. On
@@ -727,10 +729,10 @@ it, `Annotate` was the one candidate mutator with no ownership check at all, so
 a non-holder could annotate another session's candidate and refresh the true
 holder's idle lease.) The commit-family RPCs whose mutation runs through a daemon
 callback (`Commit`, `CommitConfirmed`) call the exported `EnsureConfigHolder`
-first. The gRPC handlers thread `peerSessionID(ctx)` — the same identifier
-`EnterConfigureSession` records — into every one of these, so a second remote
-session is rejected with `ErrConfigLockedByOther` (mapped to
-`codes.PermissionDenied`).
+first. The gRPC handlers thread `connSessionID(ctx)` — the connection-scoped id
+(#5849), the same identifier `EnterConfigureSession` records — into every one
+of these, so a second remote session is rejected with `ErrConfigLockedByOther`
+(mapped to `codes.PermissionDenied`).
 
 Two deliberate bypasses keep the internal paths working:
 
@@ -742,8 +744,9 @@ Two deliberate bypasses keep the internal paths working:
 - **A lock with no recorded holder** (`effectiveHolderLocked() == ""`, i.e.
   the internal/local `EnterConfigure()` path) is not owned by any session, so
   a user session is not blocked from it. A remote gRPC caller always carries a
-  non-empty `peerSessionID` and records it on `EnterConfigureSession`, so it
-  cannot manufacture an empty-holder state to slip through.
+  non-empty `connSessionID` (its connection-scoped id, #5849) and records it on
+  `EnterConfigureSession`, so it cannot manufacture an empty-holder state to
+  slip through.
 
 Like `ErrClusterReadOnly`, `ErrConfigLockedByOther` is `errors.Is`-matchable;
 it is transient (the holder commits or exits). The internal `SyncApply` /
