@@ -1,3 +1,37 @@
+## 2026-07-15 — #5832 (bug/audit/security): commit-time gate for Linux interface-name collisions
+- **Timestamp**: 2026-07-15 (fix/5832-ifname-collision-gate)
+- **Action**: config.LinuxIfName only does ReplaceAll("/","-") — NOT injective.
+  Distinct authored interface names ge-0/0/0 and ge-0-0-0 canonicalize to the
+  SAME Linux device / ifindex. The Go forwarding snapshot emits BOTH logical
+  rows (each with its own zone / routing-instance / host-inbound / NAT /
+  address / tunnel identity); the Rust forwarding-state builder keys by ifindex
+  and OVERWRITES the earlier row — and since the snapshot is walked in Go's
+  sorted-name order, the lexicographically LATER colliding name deterministically
+  wins, SILENTLY changing the security zone + routing identity of packets on that
+  shared device. No commit gate existed. Added
+  validateInterfaceNameCollisionStrict
+  (compiler_validate_strict_ifname_collision.go) wired into runUniformGates,
+  gated by new opts.lenientIfNameCollision: STRICT CompileConfig (interactive /
+  gRPC commit + commit-check) HARD-REJECTS a config where two distinct authored
+  names canonicalize to the same LinuxIfName (naming both names, the shared
+  device, and the lex-later winner) OR where a canonical name exceeds the kernel
+  IFNAMSIZ limit (15 bytes + NUL). LENIENT CompileConfigLenient /
+  CompileConfigForNodeLenient (Store.Load / SyncApply / peer-sync) downgrades to
+  a single cfg.Warnings entry naming the winner, so a grandfathered / peer-synced
+  collision still boots (#1960 no-brick) but the overwrite is no longer silent.
+  The fix is a GATE, not a remapping — LinuxIfName's mapping is unchanged, so
+  every existing single-name config compiles exactly as before (no false
+  reject; realistic vSRX names are well under 15 bytes and never collide).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config clean;
+  go test ./pkg/config + ./pkg/configstore + ./pkg/dataplane/userspace +
+  ./pkg/daemon green (no existing fixture collides). Fail-on-revert: neutralizing
+  the gate makes the colliding config compile (strict) and the lenient load emit
+  no warning → all three assertions RED; restored → GREEN.
+- **File(s)**: pkg/config/compiler_validate_strict_ifname_collision.go (Write),
+  pkg/config/compiler.go (Edit), pkg/config/compiler_uniformgates.go (Edit),
+  pkg/config/ifname_collision_5832_test.go (Write),
+  pkg/config/README.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5844 (bug/security/HIGH): routing-rule reconcile errors fail the commit closed
 - **Timestamp**: 2026-07-15 (fix/5844-routing-rule-reconcile-failclosed)
 - **Action**: `pkg/routing` correctly RETURNS next-table / rib-group / PBR
@@ -118,6 +152,44 @@
 - **File(s)**: pkg/upgrade/cutover.go (Edit),
   pkg/upgrade/stopped_recovery_restart_5846_test.go (Write),
   docs/in-place-upgrade.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5853 (bug): event-options action queue dedups early (one-per-policy on every enqueue)
+- **Timestamp**: 2026-07-15 (fix/5853-eventqueue-dedup-early)
+- **Action**: The action queue documents "at most one pending action per policy"
+  (dedup-by-policy) but `enqueue` (pkg/eventengine/engine.go) did an unconditional
+  fast-path channel send and only ran the `supersede` dedup in the full/`default`
+  branch. So while the worker was blocked behind the config lock, a burst from ONE
+  policy filled all 64 slots with redundant duplicates (later discarded by
+  cooldown/staleness) and the NEXT remediation for an UNRELATED policy was dropped
+  queue-full — one flapping policy could starve every other policy. Fix: enqueue
+  now runs `supersede` on EVERY enqueue (removed the fast-path send + default), so
+  a same-policy duplicate REPLACES the queued entry (≤1 slot) instead of taking a
+  new one, leaving slots free for other policies. Reused the already-proven
+  supersede (drain → drop same-policy → refill survivors FIFO + new at tail,
+  #2869) under the producer-only enqueueMu — worker stays lock-free, no new shared
+  state. Counter correctness: the same-policy supersede-drop now increments a new
+  `Superseded` counter (benign dedup — the newer equivalent action still runs)
+  instead of `droppedQueueFull`; droppedQueueFull is reserved for genuine capacity
+  loss (queue full of OTHER policies, unfittable new arrival / lost survivor), so
+  the alert-worthy `xpf_event_actions_dropped_total{reason=queue_full}` metric is
+  no longer inflated by routine bursts. Exposed `xpf_event_actions_superseded_total`
+  in the Prometheus collector.
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/eventengine/
+  ./pkg/api/ clean; go test ./pkg/eventengine/ -race + ./pkg/api/ green.
+  Fail-on-revert: a same-policy burst of exactly actionQueueDepth events occupies
+  1 slot (pre-fix 64) and an unrelated policy still enqueues (pre-fix dropped);
+  reverting enqueue to dedup-only-when-full flips the new
+  TestQueue_SamePolicyBurstDoesNotStarveOthers_5853 + the updated
+  TestQueue_DedupByPolicy (Superseded>=1 / DroppedQueueFull==0 / QueueDepth<=1)
+  RED. The #3750 cooldown-suppresses-queued-duplicate test behavior is preserved
+  (event #1 is in-flight in the worker, so the early dedup finds nothing queued to
+  supersede and #2 still queues) — comment updated.
+- **File(s)**: pkg/eventengine/engine.go (Edit),
+  pkg/eventengine/engine_dedup_early_5853_test.go (Write),
+  pkg/eventengine/engine_integration_test.go (Edit),
+  pkg/eventengine/engine_stale_revalidate_3750_test.go (Edit),
+  pkg/eventengine/README.md (Edit), pkg/api/metrics.go (Edit),
+  pkg/api/metrics_descriptors.go (Edit), pkg/api/metrics_system.go (Edit),
+  _Log.md (Edit)
 
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)

@@ -2039,5 +2039,26 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 		}
 	}
 
+	// #5832: interface canonical-name collision / IFNAMSIZ gate. LinuxIfName
+	// only replaces '/' with '-', so two DISTINCT authored names (ge-0/0/0 and
+	// ge-0-0-0) canonicalize to the same Linux device / ifindex; each still
+	// emits its own logical snapshot row (zone / routing-instance /
+	// host-inbound / NAT), and the Rust forwarding-state builder keys by ifindex
+	// and OVERWRITES the earlier row — the lexicographically later name silently
+	// wins, hijacking that device's security-zone and routing identity. An
+	// over-IFNAMSIZ canonical name is a sibling hazard (the device never gets
+	// created). Strict on commit / commit-check (hard reject so the collision is
+	// operator-visible before it silently reroutes traffic); lenient on load /
+	// peer-sync (warn — #1960; naming the winner makes the overwrite visible so
+	// a grandfathered config still boots without a silent hijack).
+	if err := validateInterfaceNameCollisionStrict(cfg); err != nil {
+		if opts.lenientIfNameCollision {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("interface name collision (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	return nil
 }

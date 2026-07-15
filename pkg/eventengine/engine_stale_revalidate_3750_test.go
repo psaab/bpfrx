@@ -130,11 +130,14 @@ func TestStale_RedefinedPolicyDropsOldBatch_3750(t *testing.T) {
 }
 
 // #3750 H3: the 30s cooldown must gate a QUEUED duplicate. The cooldown is
-// checked at evaluate but armed only on commit, and enqueue dedups only when the
-// queue is FULL — so two events for one policy both queue while the worker is
-// blocked on a held lock. When the lock releases the worker commits the first,
-// arms the cooldown, then must DROP the second (cooldown active) instead of
-// double-committing within the window.
+// checked at evaluate but armed only on commit. The worker dequeues event #1
+// (now retrying under the held lock, so it is IN-FLIGHT and no longer in the
+// channel); event #2 then enqueues — the queue holds no same-policy entry to
+// supersede (#1 is in the worker, not queued), so #2 is queued (this is true
+// both before and after the #5853 early-dedup change: the dedup is against
+// QUEUED entries, and #1 is not one). When the lock releases the worker commits
+// the first, arms the cooldown, then must DROP the second (cooldown active)
+// instead of double-committing within the window.
 //
 // FAIL-ON-REVERT: without the gate the worker commits both queued actions, so
 // Committed==2 and DroppedStale==0, failing the assertions below.
@@ -160,8 +163,9 @@ func TestStale_CooldownSuppressesQueuedDuplicate_3750(t *testing.T) {
 	waitFor(t, "worker retrying action #1", func() bool { return e.Stats().Retried >= 1 })
 
 	// Event #2: evaluateEvent sees the cooldown UNARMED (arm-on-commit, and #1
-	// has not committed), so it enqueues a duplicate. The queue is not full, so
-	// enqueue does NOT dedup it — exactly the H3 setup.
+	// has not committed), so it enqueues a duplicate. #1 is IN-FLIGHT in the
+	// worker (not in the channel), so the early dedup (#5853) finds no same-policy
+	// queued entry to supersede and #2 is queued — exactly the H3 setup.
 	e.HandleEvent(eventFor("ping_test_failed"))
 	waitFor(t, "duplicate queued", func() bool { return e.Stats().QueueDepth >= 1 })
 

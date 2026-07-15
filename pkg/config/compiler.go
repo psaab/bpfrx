@@ -1506,6 +1506,19 @@ type compileOpts struct {
 	// id is bounded, not a wrong-VRID advert. Same doctrine as
 	// lenientVRRPGroupID.
 	lenientRethVRRPGroupID bool
+	// lenientIfNameCollision (#5832) downgrades the interface-name canonical
+	// collision / IFNAMSIZ gate (validateInterfaceNameCollisionStrict) from a
+	// hard compile error to a cfg.Warnings entry. LinuxIfName only replaces '/'
+	// with '-', so two distinct authored names (ge-0/0/0 and ge-0-0-0)
+	// canonicalize to the same Linux device / ifindex; the Rust
+	// forwarding-state builder overwrites the earlier row and the
+	// lexicographically later name silently wins, hijacking that device's
+	// security-zone / routing identity. The strict commit / commit-check path
+	// hard-rejects so the collision is operator-visible; the tolerant load /
+	// peer-sync paths warn (naming the winner) so an already-persisted or
+	// peer-synced config that predates this gate still BOOTS (#1960 no-brick).
+	// Same doctrine as lenientRethVRRPGroupID.
+	lenientIfNameCollision bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name
 	// definition gate (validateReservedZoneNamesStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -1980,6 +1993,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPGroupID:                     true,
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
+		lenientIfNameCollision:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
@@ -2333,6 +2347,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPGroupID:                     true,
 		lenientVRRPGroupPriority:               true,
 		lenientRethVRRPGroupID:                 true,
+		lenientIfNameCollision:                 true,
 		lenientReservedZoneNames:               true,
 		lenientBackupRouterDst:                 true,
 		lenientSecureTunnelBindIface:           true,
