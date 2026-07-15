@@ -57,6 +57,28 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 		return
 	}
 	c.eventReader.SetZoneNames(syslogZoneNameMap(cfg))
+
+	// #5738 gap 2: honor event mode exactly like the daemon's applySyslogConfig.
+	// In event mode the daemon CLEARS remote clients and installs a LOCAL writer;
+	// the previous CLI reload unconditionally rebuilt remote clients from Streams,
+	// so a config with BOTH event-mode AND remote streams re-installed the remote
+	// clients the daemon had cleared (the CLI reload runs LAST on a local commit).
+	if cfg.Security.Log.Mode == "event" {
+		c.eventReader.ReplaceSyslogClients(nil) // close + clear any remote clients
+		lw, err := logging.NewLocalLogWriter(logging.LocalLogConfig{})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to create local log writer: %v\n", err)
+		} else {
+			if cfg.Security.Log.Format != "" {
+				lw.Format = cfg.Security.Log.Format
+			}
+			c.eventReader.ReplaceLocalWriters([]*logging.LocalLogWriter{lw})
+		}
+		return
+	}
+
+	// Stream mode (default): clear local writers, install remote clients.
+	c.eventReader.ReplaceLocalWriters(nil)
 	c.eventReader.ReplaceSyslogClients(buildSyslogClients(cfg))
 }
 
@@ -83,8 +105,23 @@ func (c *CLI) reloadSyslog(cfg *config.Config) {
 // failure, or an unsupported/typo'd transport rejected fail-closed by #5581)
 // skips the stream.
 func buildSyslogClients(cfg *config.Config) []*logging.SyslogClient {
+	// #5738 gap 1: resolve the global `security log source-interface` to an IP,
+	// used as the source binding for any stream that lacks a per-stream
+	// source-address. applySyslogConfig computes and applies this same fallback,
+	// so the previous CLI path (which passed stream.SourceAddress unconditionally)
+	// bound a kernel-chosen source on an in-process commit while the daemon bound
+	// the interface address — a divergence that persists because the CLI reload
+	// writes LAST on a local commit. Mirror the daemon exactly.
+	var globalSourceAddr string
+	if cfg.Security.Log.SourceInterface != "" {
+		globalSourceAddr = config.ResolveSyslogSourceAddr(cfg, cfg.Security.Log.SourceInterface)
+	}
 	var clients []*logging.SyslogClient
 	for name, stream := range cfg.Security.Log.Streams {
+		srcAddr := stream.SourceAddress
+		if srcAddr == "" {
+			srcAddr = globalSourceAddr
+		}
 		protocol := stream.Transport.Protocol
 		if protocol == "" {
 			protocol = "udp"
@@ -92,7 +129,7 @@ func buildSyslogClients(cfg *config.Config) []*logging.SyslogClient {
 		// The final *tls.Config is nil — a TLS stream trusts the system CA
 		// roots; a named transport tls-profile is rejected at commit
 		// (validateSecurityLogStreamTLSProfileAST), matching applySyslogConfig.
-		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, stream.SourceAddress, protocol, nil)
+		client, err := logging.NewSyslogClientTransport(stream.Host, stream.Port, srcAddr, protocol, nil)
 		if err != nil {
 			if client == nil {
 				fmt.Fprintf(os.Stderr, "warning: syslog stream %s (%s): %v\n", name, protocol, err)

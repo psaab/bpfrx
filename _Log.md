@@ -1,3 +1,53 @@
+## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Aligned the CLI in-process commit path (reloadSyslog /
+  buildSyslogClients, pkg/cli/apply.go) with the daemon's applySyslogConfig on
+  the two remaining non-confidentiality divergences (#5712 covered the
+  security-relevant fields). Because the CLI reload writes LAST on a local
+  commit, these were not self-corrected. Gap 1 (source-interface fallback):
+  buildSyslogClients now resolves the global source-interface via
+  config.ResolveSyslogSourceAddr and uses it when a stream has no per-stream
+  source-address, byte-matching the daemon; previously it passed
+  stream.SourceAddress unconditionally so a source-interface-only stream bound a
+  kernel-chosen source on a local commit. Gap 2 (event mode): reloadSyslog now
+  honors Mode == "event" exactly like the daemon — clear remote clients + install
+  a local writer — and clears stale local writers in stream mode; previously it
+  unconditionally rebuilt remote clients, re-installing the ones the daemon had
+  cleared. Added SyslogClient.SourceAddr() and EventReader.LocalWriterCount()
+  observability accessors (symmetric with Protocol() / SyslogClientCount()) for
+  fail-on-revert assertions. The #5712 transport-idempotence tests remain green.
+- **Validation**: gofmt clean (touched files); go build ./... + go vet
+  (touched pkgs) clean apart from a pre-existing cli.go unreachable-code note in
+  an untouched file; go test ./pkg/cli/ ./pkg/logging/ ./pkg/config/
+  ./pkg/daemon/ green. Fail-on-revert proven RED then restored GREEN for gap 1
+  (source binding empties), gap 2 event-clear (remote count 1), and gap 2
+  stream-writer-clear (writer count 1).
+- **File(s)**: pkg/cli/apply.go (Edit),
+  pkg/cli/syslog_source_iface_parity_5738_test.go (Write),
+  pkg/logging/syslog.go (Edit), pkg/logging/ringbuf.go (Edit), _Log.md (Edit)
+
+## 2026-07-15 — #5738 (bug/syslog) commit 1/2: move resolveSourceAddr into pkg/config
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Pure code-motion. The syslog source-interface resolver lived in
+  pkg/daemon (unexported resolveSourceAddr) so the CLI in-process commit path
+  could not reuse it. Moved it verbatim to pkg/config as the exported
+  ResolveSyslogSourceAddr (least-surprising shared home: it is a pure function
+  of a *config.Config, and pkg/config already documents its semantics in
+  ValidateSyslogSourceInterface). Behavior is byte-identical; only the package,
+  name, and receiver-parameter type change. Updated the sole daemon caller
+  (applySyslogConfig) to config.ResolveSyslogSourceAddr, dropped the now-unused
+  strconv import from daemon_system.go, moved the resolver unit tests into
+  pkg/config, and repointed the doc references in schema_validators_logging.go
+  to the new location. No behavior change; sets up commit 2 which teaches the
+  CLI path to use the shared fallback.
+- **Validation**: go build ./pkg/config/ ./pkg/daemon/ clean; go vet clean;
+  moved resolver tests pass in pkg/config; daemon syslog tests still green.
+- **File(s)**: pkg/config/syslog_source.go (Write),
+  pkg/config/syslog_source_test.go (Write),
+  pkg/daemon/daemon_system.go (Edit),
+  pkg/daemon/syslog_source_test.go (git rm),
+  pkg/config/schema_validators_logging.go (Edit), _Log.md (Edit)
+
 ## 2026-07-12 — #5633 (bug/config/routing): reject contradictory duplicate-route dispositions at commit
 - **Timestamp**: 2026-07-12 (fix/5633-dup-route-contradiction)
 - **Action**: codex-review-181 M25 / A3-b02-F03. The static-route merge in
