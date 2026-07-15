@@ -1,3 +1,31 @@
+## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
+- **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
+- **Action**: Aligned the CLI in-process commit path (reloadSyslog /
+  buildSyslogClients, pkg/cli/apply.go) with the daemon's applySyslogConfig on
+  the two remaining non-confidentiality divergences (#5712 covered the
+  security-relevant fields). Because the CLI reload writes LAST on a local
+  commit, these were not self-corrected. Gap 1 (source-interface fallback):
+  buildSyslogClients now resolves the global source-interface via
+  config.ResolveSyslogSourceAddr and uses it when a stream has no per-stream
+  source-address, byte-matching the daemon; previously it passed
+  stream.SourceAddress unconditionally so a source-interface-only stream bound a
+  kernel-chosen source on a local commit. Gap 2 (event mode): reloadSyslog now
+  honors Mode == "event" exactly like the daemon — clear remote clients + install
+  a local writer — and clears stale local writers in stream mode; previously it
+  unconditionally rebuilt remote clients, re-installing the ones the daemon had
+  cleared. Added SyslogClient.SourceAddr() and EventReader.LocalWriterCount()
+  observability accessors (symmetric with Protocol() / SyslogClientCount()) for
+  fail-on-revert assertions. The #5712 transport-idempotence tests remain green.
+- **Validation**: gofmt clean (touched files); go build ./... + go vet
+  (touched pkgs) clean apart from a pre-existing cli.go unreachable-code note in
+  an untouched file; go test ./pkg/cli/ ./pkg/logging/ ./pkg/config/
+  ./pkg/daemon/ green. Fail-on-revert proven RED then restored GREEN for gap 1
+  (source binding empties), gap 2 event-clear (remote count 1), and gap 2
+  stream-writer-clear (writer count 1).
+- **File(s)**: pkg/cli/apply.go (Edit),
+  pkg/cli/syslog_source_iface_parity_5738_test.go (Write),
+  pkg/logging/syslog.go (Edit), pkg/logging/ringbuf.go (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5738 (bug/syslog) commit 1/2: move resolveSourceAddr into pkg/config
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
 - **Action**: Pure code-motion. The syslog source-interface resolver lived in
