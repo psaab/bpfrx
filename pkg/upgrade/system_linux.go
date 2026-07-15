@@ -2,6 +2,8 @@ package upgrade
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -138,16 +140,46 @@ func (s *realSystem) BinaryVersion(bin string) (string, error) {
 		"(want \"xpfd <version> ...\"): %q", bin, trimmed)
 }
 
-// unitActiveProbe reports whether <unit>.service is currently active per
-// `systemctl is-active`. It is a package var so BOTH the is-active-only
-// fallback below AND the wired HelperHealthProbe precondition share ONE seam a
-// test can force. Forcing it is the hinge of the #5286 RED-on-revert: with the
-// process reported ACTIVE but the helper NOT armed+forwarding, HelperHealthy is
-// (wrongly) healthy under the OLD is-active-only path but fails closed under
-// the new gate.
-var unitActiveProbe = func(unit string) bool {
-	out, _ := exec.Command("systemctl", "is-active", unit+".service").Output()
-	return strings.TrimSpace(string(out)) == "active"
+// unitActiveProbeCtx reports whether <unit>.service is active per `systemctl
+// is-active`, BOUNDED by ctx (#5808): a wedged systemctl / hung DBus is KILLED
+// when ctx is canceled (exec.CommandContext) instead of blocking the caller past
+// its deadline. It is the SINGLE production is-active primitive — the
+// is-active-only fallback below, the wired HelperHealthProbe precondition, AND
+// cmd/xpfd's probe (via the exported UnitActive) all route through it, so there
+// is exactly ONE timeout behavior (no more two divergent exec.Command impls).
+//
+// A package var so a test can force it. Forcing it is the hinge of the #5286
+// RED-on-revert (process ACTIVE but helper NOT armed+forwarding is healthy under
+// the OLD is-active-only path, fails closed under the new gate) AND the #5808
+// deadline tests (a fake that blocks until ctx cancels).
+//
+// Return semantics (#5808): (active, nil) is definitive; (false, ctx.Err()) when
+// the deadline/cancel killed the probe (errors.Is-able); (false, err) for a
+// genuine command failure (systemctl missing / DBus error). `systemctl
+// is-active` exits non-zero (3) for inactive/failed/activating and prints the
+// state to stdout — a recognized state under an *exec.ExitError is a DEFINITIVE
+// answer, NOT a command failure.
+var unitActiveProbeCtx = func(ctx context.Context, unit string) (bool, error) {
+	out, err := exec.CommandContext(ctx, "systemctl", "is-active", unit+".service").Output()
+	state := strings.TrimSpace(string(out))
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err() // deadline/cancel killed the probe
+		}
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && state != "" {
+			return state == "active", nil // definitive not-active, not a failure
+		}
+		return false, fmt.Errorf("systemctl is-active %s: %w (output: %q)", unit, err, state)
+	}
+	return state == "active", nil
+}
+
+// UnitActive is the exported, ctx-bounded is-active primitive so cmd/xpfd wires
+// ONE shared impl (through the unitActiveProbeCtx seam) rather than duplicating
+// exec.Command with its own, unbounded timeout behavior (#5808 unification).
+func UnitActive(ctx context.Context, unit string) (bool, error) {
+	return unitActiveProbeCtx(ctx, unit)
 }
 
 func (s *realSystem) HelperHealthy(expectVersion string, deadline time.Duration) error {
@@ -164,15 +196,28 @@ func (s *realSystem) HelperHealthy(expectVersion string, deadline time.Duration)
 	// NewSystemWithHelperHealth (cmd/xpfd) that ADDITIONALLY requires the
 	// dataplane to be armed+forwarding on the target version. This branch
 	// remains only for callers that inject no probe.
-	end := time.Now().Add(deadline)
+	// #5808: bound the whole fallback poll by one context — the is-active probe
+	// (killed if it wedges) and the poll wait — so this weak path also honors the
+	// deadline authoritatively and never strands on a hung systemctl/DBus.
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
 	for {
-		if unitActiveProbe(s.unit) {
+		active, err := unitActiveProbeCtx(ctx, s.unit)
+		if err == nil && active {
 			return nil
 		}
-		if time.Now().After(end) {
-			return fmt.Errorf("unit %s did not become active within %s", s.unit, deadline)
+		if ctx.Err() != nil {
+			return fmt.Errorf("unit %s did not become active within %s (last: %v): %w",
+				s.unit, deadline, err, ctx.Err())
 		}
-		time.Sleep(500 * time.Millisecond)
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("unit %s did not become active within %s (last: %v): %w",
+				s.unit, deadline, err, ctx.Err())
+		case <-timer.C:
+		}
 	}
 }
 

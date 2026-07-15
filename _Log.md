@@ -48546,3 +48546,25 @@ top.
 - **File(s)**: pkg/grpcapi/config_session_lifecycle.go (new), pkg/grpcapi/config_session_lifecycle_5849_test.go (new), pkg/grpcapi/server.go, pkg/grpcapi/server_config.go, pkg/grpcapi/server_fabric_allowlist_4122_test.go, pkg/grpcapi/server_shutdown_monitor_4910_test.go, pkg/grpcapi/README.md, pkg/configstore/README.md
   **Action**: #5867 review-fold — add TestApplyTailReconcilesSurfacesMgmtRouteError_5867 (deferred-tail-join wiring regression test mirroring #5844) per independent-review MINOR; injects a sentinel as the final applyTailReconciles operand and asserts errors.Is(commitErr, sentinel) so dropping mgmtRouteErr from the tail errors.Join is fail-on-revert-caught. Production unchanged.
   **File(s)**: pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go
+
+## 2026-07-15 — #5808 upgrade deadline-authoritative helper-readiness gate
+
+- **Timestamp**: 2026-07-15
+- **Action**: Make `StartHealthDeadline` authoritative across every blocking
+  op in the post-flip helper-readiness gate so a wedged `systemctl`/DBus or
+  an unresponsive control socket can never strand the cut past the rollback
+  deadline. Unified is-active into ONE ctx-bounded primitive shared by
+  pkg/upgrade and cmd/xpfd.
+- **File(s)**: pkg/upgrade/helper_health.go (ctx.WithTimeout gate, boundByDeadline
+  min-bound, context-aware poll timer, deadlineGateErr wrapping ctx cause,
+  last-genuine-failure preservation), pkg/upgrade/system_linux.go
+  (unitActiveProbeCtx via exec.CommandContext + exported UnitActive; fallback
+  poll ctx-bounded), cmd/xpfd/upgrade.go (UnitActive seam ctx-aware, delegates
+  to shared upgrade.UnitActive), pkg/upgrade/helper_health_5286_test.go +
+  cmd/xpfd/upgrade_helper_health_5286_test.go (seam signature ctx-aware),
+  pkg/upgrade/helper_health_deadline_5808_test.go (NEW — 5 fail-on-revert tests),
+  docs/in-place-upgrade.md (#5808 deadline-authoritative subsection).
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/ ./cmd/xpfd/ clean;
+  go test -race ./pkg/upgrade/ ./cmd/xpfd/ -count=3 GREEN; 3 fail-on-revert
+  overlays proven RED (exec.Command hang, no min-bound=10s, time.Sleep(poll)
+  5s overshoot).
