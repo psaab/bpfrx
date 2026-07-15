@@ -38,32 +38,61 @@ import (
 // v4RenewDest, buildV6RenewMessage in renew.go) are pure and
 // unit-tested directly — see renew_test.go.
 
-// renewalTimers computes the two waits of one renewal cycle from a
-// lease duration: t1 is the wait until the renew attempt (50% of the
-// lease time, clamped to a 30s minimum), t2Remaining is the additional
-// wait from T1 to the rebind attempt (87.5% − 50% = 37.5% of the lease
-// time, clamped to a 1s minimum). The remainder is computed as
-// leaseTime/8*3 (divide-before-multiply) rather than the algebraically
-// equal leaseTime*7/8 - leaseTime/2: the latter overflows int64 for a
-// lease above ~41.8yr (MaxInt64/7 ns) — notably the 0xFFFFFFFF-second
-// RFC infinite sentinel — wrapping negative and clamping T2 to 1s
-// (#4526). The divide-first form has no intermediate above the lease
-// itself. For every whole-second lease the two forms are bit-identical
-// (1e9 ns is divisible by 8, so no rounding divergence). The 50%/37.5%
-// split and clamps are unchanged from the pre-#1777 inline code; they
-// are extracted so both families share one definition and tests can pin
-// the clamps.
-func renewalTimers(leaseTime time.Duration) (t1, t2Remaining time.Duration) {
+// renewalTimers computes the two waits of one renewal cycle from a lease
+// duration, following the RFC 2131 §4.4.5 / RFC 8415 §18.2.4 schedule:
+// t1 is the wait until the renew (RENEWING) attempt at 50% of the lease,
+// and t2Remaining is the ADDITIONAL wait from T1 to the rebind
+// (REBINDING) attempt at 87.5% of the lease (87.5% − 50% = 37.5% of the
+// lease). ok reports whether the lease is a usable finite lease; a
+// non-positive leaseTime is invalid and the caller must fail closed into
+// re-acquisition rather than schedule a renewal (see below).
+//
+// No fixed minimum is applied. A fixed 30s T1 / 1s T2 floor previously
+// clamped both waits (#5795): for any finite lease shorter than 60s that
+// pushed T1 past the RFC half-life, and for a lease shorter than 30s it
+// scheduled the renew attempt AT OR AFTER lease expiry — the run loop
+// kept using the address while it waited, so a short-lease WAN could
+// forward on an already-expired binding and then churn into
+// re-acquisition instead of renewing on time. The RFC ratios are
+// themselves proportional to the lease, so they are their own floor: for
+// the smallest lease the wire can express (1 second — DHCP/DHCPv6 lease
+// times are whole seconds) t1 is 500ms and t2Remaining is 375ms, both
+// strictly before expiry, and T1 (50%) < T2 (87.5%) < 100% holds for
+// every positive lease. A non-positive lease is rejected via ok=false
+// instead of being clamped to a manufactured 30s schedule.
+//
+// The remainder is computed as leaseTime/8*3 (divide-before-multiply)
+// rather than the algebraically equal leaseTime*7/8 - leaseTime/2: the
+// latter overflows int64 for a lease above ~41.8yr (MaxInt64/7 ns) —
+// notably the 0xFFFFFFFF-second RFC infinite sentinel — wrapping negative
+// and clamping T2 low (#4526). The divide-first form has no intermediate
+// above the lease itself, so the infinite sentinel yields a sane 3/8
+// remainder. For every whole-second lease the two forms are bit-identical
+// (1e9 ns is divisible by 8, so no rounding divergence). The split is
+// extracted here so both v4/v6 run loops share one definition and tests
+// can pin the schedule.
+func renewalTimers(leaseTime time.Duration) (t1, t2Remaining time.Duration, ok bool) {
+	if leaseTime <= 0 {
+		// RFC 2131 lease time 0 is NOT the infinite sentinel (that is
+		// 0xFFFFFFFF); a zero or negative lifetime is unusable. Signal
+		// invalid so the run loop re-acquires instead of scheduling a
+		// renewal that would fire at or after an already-lapsed lease.
+		return 0, 0, false
+	}
 	t1 = leaseTime / 2
-	if t1 < 30*time.Second {
-		t1 = 30 * time.Second
-	}
 	t2Remaining = leaseTime / 8 * 3
-	if t2Remaining < time.Second {
-		t2Remaining = time.Second
-	}
-	return t1, t2Remaining
+	return t1, t2Remaining, true
 }
+
+// reacquireBackstop paces DHCP re-acquisition after a server grants a
+// lease with a non-positive lifetime (see renewalTimers). Such a lease is
+// unusable, so the run loop abandons the renewal cycle and re-acquires
+// rather than scheduling a renewal past an already-lapsed lease. The wait
+// keeps a misbehaving server that repeatedly grants a 0-second lease from
+// turning re-acquisition into a tight DISCOVER/SOLICIT loop (#5795). It is
+// a re-acquisition pace, not a renewal timer — it never governs a valid
+// lease.
+const reacquireBackstop = 10 * time.Second
 
 // leaseContentChanged reports whether two leases differ in any field a
 // downstream consumer reads (address, gateway, DNS, and the RFC 3442
