@@ -363,7 +363,25 @@ func (r *Runner) Run(opts Options) (err error) {
 				"recovering and starting fresh", stagedVer, j.TargetVersion)
 			if j.State == StateStopped {
 				if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
-					r.logf("upgrade: WARN failed to restart unit after stale-stop recovery: %v", startErr)
+					// #5846: the still-current KNOWN-GOOD daemon (the stopped cut
+					// never flipped `current`) FAILED to restart. Do NOT swallow
+					// this and fall through to a fresh cut: proceeding would
+					// removeAllPartials + reset the journal (destroying the
+					// stale-recovery evidence) and start a NEW cut whose rollback
+					// target (PreviousVersion, read from `current` below) is the very
+					// version that just failed to restart — all while the control
+					// plane is DOWN. Abort fail-closed: PRESERVE the stale journal
+					// and partials so an operator (or the next-boot re-run) retries
+					// recovery, and surface the error. This mirrors the
+					// fail-closed-on-lifecycle-error posture of the sibling drain
+					// paths (#5845 rolling.go / kernel_drain.go). Recovery only
+					// proceeds to the fresh cut once the known-good daemon is
+					// confirmed restarted (StartUnit == nil).
+					return fmt.Errorf("stale-stop recovery: the known-good daemon failed "+
+						"to restart after a superseded stopped cut (journaled target %s); "+
+						"refusing to start a new cut with an unverified rollback target while "+
+						"the control plane is down — preserving the stale journal and partials "+
+						"for recovery: %w", j.TargetVersion, startErr)
 				}
 			}
 			r.removeAllPartials()
