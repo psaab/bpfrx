@@ -830,6 +830,31 @@ treats an unreadable observation as a definite safe state:
   failure (after still attempting the keepalive), and `DisarmWatchdog`
   propagates open/write/close failures (a genuinely-absent device is still
   a clean nil).
+- *Two-phase arm + BootNext readback (#5847).* The arm used to persist the
+  `ARMED` journal BEFORE `efibootmgr --bootnext`, on the theory that an
+  `ARMED`-without-`BootNext` journal is harmless. It is NOT: a crash in
+  that gap (or before the best-effort rollback ran) left a FALSE-ARMED
+  journal — the firmware still boots the known-good default and no trial
+  ever happens, yet `Arm` refused-forever (`>= ARMED`) and self-recovery
+  suppressed expired-lease failback INDEFINITELY (the drained node never
+  rejoined). Neither write order is atomic with the NVRAM mutation, so
+  `ARMED` is now made AUTHORITATIVE via a positive readback:
+  1. record `ARMING` (prepared intent, with a fresh per-attempt nonce)
+     BEFORE any NVRAM mutation;
+  2. `SetBootNext(inactiveID)`;
+  3. positively read `GetBootNext()` back and require it equals the armed
+     inactive-slot id — a firmware that silently dropped or partial-wrote
+     the variable must NOT yield a verified-ARMED journal;
+  4. only THEN durably transition `ARMING -> ARMED`, recording the
+     confirmed `BootID` for boot-provenance.
+
+  `ARMING` sits BELOW `ARMED` in the journal order, so a journal stuck
+  there (readback failed / never ran) lets `Arm` RE-ARM (the `>= ARMED`
+  refusal does not fire; `armCandidate` is idempotent) and does not
+  suppress self-recovery. Only the verified `ARMED` (readback confirmed)
+  counts as a genuine trial. The per-attempt `ArmNonce` (unique across
+  attempts even under a stuck clock) distinguishes a fresh arm from a
+  stale/crashed journal.
 
 In a cluster the roll is driven ONE NODE AT A TIME by the external
 orchestrator (`scripts/deploy/xpf-deploy.py kernel-roll`): drain
@@ -931,10 +956,15 @@ carrying traffic:
    can't silently age the deadline and let the next positive tick rejoin
    immediately.
 3. **Still-armed gate.** Self-recovery refuses to rejoin while the kernel
-   journal is still ARMED even if the lease has expired — a legitimately
-   long-hanging roll (one that outran its lease TTL) is still a trial in
-   flight; the promote/revert oneshot owns the resolution, and the
-   election hold keeps the node secondary meanwhile.
+   journal is at the VERIFIED `ARMED` state even if the lease has expired
+   — a legitimately long-hanging roll (one that outran its lease TTL) is
+   still a trial in flight; the promote/revert oneshot owns the
+   resolution, and the election hold keeps the node secondary meanwhile.
+   This gate is driven by `IsArmed`, which reports true ONLY for the
+   verified `ARMED` state — NOT the `ARMING` prepared-intent state (see
+   the two-phase arm below). A journal stuck at `ARMING` is NOT a genuine
+   trial, so self-recovery does NOT suppress on it and the drained node
+   can rejoin (#5847).
 
 ### Persistence precondition
 

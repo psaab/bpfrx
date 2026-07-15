@@ -33,6 +33,8 @@ type fakeKernelSystem struct {
 
 	bootCurrent       string
 	bootCurrentErr    error
+	getBootNextErr    error  // #5847: force a readback error (stay ARMING)
+	getBootNextRet    string // #5847: override readback (firmware "lied"); "" => mirror bootNext
 	runningErr        error
 	armWatchdogErr    error
 	disarmWatchdogErr error
@@ -122,6 +124,20 @@ func (f *fakeKernelSystem) SetBootNext(id string) error {
 	f.log("bootnext:" + id)
 	f.bootNext = id
 	return nil
+}
+
+// GetBootNext mirrors what SetBootNext stored (firmware accepted the one-shot)
+// unless a test injects getBootNextErr (readback error) or getBootNextRet
+// (firmware silently dropped/partial-wrote the variable → readback disagrees).
+func (f *fakeKernelSystem) GetBootNext() (string, error) {
+	f.log("get-bootnext")
+	if f.getBootNextErr != nil {
+		return "", f.getBootNextErr
+	}
+	if f.getBootNextRet != "" {
+		return f.getBootNextRet, nil
+	}
+	return f.bootNext, nil
 }
 func (f *fakeKernelSystem) ArmWatchdog() error {
 	if f.armWatchdogErr != nil {
