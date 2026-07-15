@@ -141,12 +141,22 @@ func parseSNMPClients(node *Node) []SNMPClient {
 			if t == "" {
 				continue
 			}
-			if t == "restrict" {
-				if len(out) > 0 {
-					out[len(out)-1].Restrict = true
-				}
+			if t == "restrict" && len(out) > 0 {
+				out[len(out)-1].Restrict = true
 				continue
 			}
+			// #5898: a leading/orphan `restrict` (t == "restrict" with no
+			// preceding prefix to modify — an invalid-Junos-ordering typo like
+			// `clients restrict 0.0.0.0/0`) previously fell into the branch above
+			// and was SILENTLY DROPPED, leaving the following prefix a plain
+			// ALLOW — an SNMP community answerable from every source, with nothing
+			// recorded so #5833's quarantine never engaged. Do NOT drop it: record
+			// it AS a client entry. "restrict" is not a valid IP/CIDR, so
+			// validateSNMPClients flags it MALFORMED — strict commit hard-rejects
+			// it (naming the token) and the lenient / peer-sync path QUARANTINES
+			// the community to deny-all (snmpQuarantineClientNets) — fail-closed,
+			// on both paths (the bug was identical on both). A well-formed
+			// `<prefix> restrict` (len(out) > 0) still attaches above, unchanged.
 			out = append(out, SNMPClient{Prefix: t})
 		}
 	}
