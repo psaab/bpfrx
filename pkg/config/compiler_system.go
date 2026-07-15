@@ -1662,7 +1662,25 @@ func compileSchedulers(node *Node, cfg *Config) error {
 	}
 
 	for _, inst := range namedInstances(node.FindChildren("scheduler")) {
-		sched := &SchedulerConfig{Name: inst.name}
+		// #5825: REUSE the existing map entry instead of allocating a fresh
+		// SchedulerConfig per named AST instance. compileSchedulers runs once PER
+		// top-level `schedulers` root (compiler_dispatch.go) and once per named
+		// instance within a root; the pre-fix code built a fresh sched each time
+		// then unconditionally `cfg.Schedulers[name] = sched`, so a later same-name
+		// block/root REPLACED the first — every day/window authored earlier
+		// vanished. A policy time-gated by the scheduler then became active/inactive
+		// on the WRONG days with a clean commit. Flat `set` composes into ONE path,
+		// so hierarchical diverged from flat. Reusing the persisted entry composes
+		// every fragment: the weekday Days map (below) UNIONS distinct days across
+		// blocks/roots (no window lost), and the daily/date scalars follow
+		// flat-set / Junos load-merge last-wins (a repeated leaf replaces — no
+		// "conflict" arises in flat-set, so hierarchical must match). Mirrors the
+		// #5824 policy-statement block-merge.
+		sched := cfg.Schedulers[inst.name]
+		if sched == nil {
+			sched = &SchedulerConfig{Name: inst.name}
+			cfg.Schedulers[inst.name] = sched
+		}
 
 		for _, prop := range inst.node.Children {
 			name := prop.Name()
@@ -1707,8 +1725,9 @@ func compileSchedulers(node *Node, cfg *Config) error {
 				}
 			}
 		}
-
-		cfg.Schedulers[inst.name] = sched
+		// #5825: NO unconditional overwrite here — sched IS the shared map entry,
+		// so this instance's fragments are already composed into any earlier
+		// same-name block/root's days and scalars.
 	}
 	return nil
 }

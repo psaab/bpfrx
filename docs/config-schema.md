@@ -1749,6 +1749,31 @@ unchanged) and the end-to-end render guard
 `pkg/frr/policy_block_merge_5824_test.go` (the early reject term's `deny`
 sequence + route-filter survive into the FRR route-map).
 
+### Repeated scheduler blocks MERGE, not last-win (#5825)
+
+The SAME block-merge rule applies to `schedulers scheduler <name>`. A scheduler
+may be authored across multiple hierarchical blocks (two `scheduler S { ... }`
+braces) or repeated top-level `schedulers { ... }` roots, each a distinct AST
+instance. `compileSchedulers` (`compiler_system.go`) used to allocate a FRESH
+`SchedulerConfig` per instance and do an unconditional `cfg.Schedulers[name] =
+sched`, so a later same-name block REPLACED the first — every day/window authored
+earlier vanished. Flat `set schedulers scheduler S <day> ...` lines compose under
+one path, so the hierarchical and flat spellings diverged, and a security policy
+time-gated by the scheduler became active/inactive on the WRONG days with a clean
+commit.
+
+The loop now REUSES the existing map entry, so distinct weekday windows UNION
+across blocks/roots (the `Days` map lives on the reused struct — no separate index
+is needed, unlike the policy-statement term index, because per-day dedup is the
+map key). The daily/date scalars (`start-time`/`stop-time`/`start-date`/
+`stop-date`, the `daily` window, `all-day`) follow flat-set / Junos load-merge
+LAST-WINS: a repeated leaf replaces, exactly as a second `set` of the same leaf
+does, so no order-dependent divergence from flat is introduced (a "conflict" is
+not representable in flat-set — the last `set` simply wins). Fail-on-revert
+covered by `pkg/config/compiler_scheduler_block_merge_5825_test.go` (two-block day
+merge, hierarchical==flat parity, across-roots merge, daily+weekday compose,
+single-block unchanged).
+
 ### Quoted-value escape round-trip contract (#3854)
 
 When a key or value contains a character that is not a bare Junos identifier
