@@ -235,19 +235,6 @@ func compileAddressBook(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
-// appendUniqueString appends v to list only if it is not already present,
-// preserving first-seen order. Used to UNION address-set members across
-// duplicate same-name stanzas (#4706) so Junos' union-by-name semantics hold
-// without accumulating duplicate member references.
-func appendUniqueString(list []string, v string) []string {
-	for _, existing := range list {
-		if existing == v {
-			return list
-		}
-	}
-	return append(list, v)
-}
-
 // addressSetMemberValues extracts every value carried by an address-set
 // `address` / `address-set` member node, across BOTH parser AST shapes
 // (#2419, #4791 — the address-set-member instance of the same dual-shape
@@ -284,6 +271,43 @@ func addressSetMemberValues(member *Node) []string {
 // security-zone <z>` (#3061) — the entry grammar is identical, only the
 // attachment point differs.
 func parseAddressBookEntries(node *Node, ab *AddressBook) {
+	// #5826: O(1) membership index per address-set, keyed by set name. The old
+	// appendUniqueString linearly scanned the FULL existing member slice on every
+	// append, so a size-valid config with N unique members across repeated
+	// same-name stanzas cost O(N²) string comparisons during commit / boot / HA
+	// config-sync / validation. Each set gets a direct-address set and a
+	// nested-set set (independent namespaces); the ordered slice on the persisted
+	// *AddressSet is still the source of truth for FIRST-SEEN ORDER — a member is
+	// appended to it only on a map MISS, so output order + exact union-by-name
+	// dedup are byte-identical to the linear-scan version, now in O(N). The index
+	// is compiler-local (not persisted / not on the wire).
+	type addrSetIndex struct {
+		addr map[string]struct{} // direct `address` members already appended
+		set  map[string]struct{} // nested `address-set` members already appended
+	}
+	indexes := make(map[string]*addrSetIndex)
+	// indexFor returns the membership index for set `name`, seeding it (once) from
+	// any members `as` already carries — from an earlier same-name block in THIS
+	// node, or a prior parseAddressBookEntries call on the same book (repeated
+	// `address-book` roots union onto the persisted *AddressSet). The seed is
+	// O(existing members), bounded by total member count.
+	indexFor := func(name string, as *AddressSet) *addrSetIndex {
+		idx := indexes[name]
+		if idx == nil {
+			idx = &addrSetIndex{
+				addr: make(map[string]struct{}, len(as.Addresses)),
+				set:  make(map[string]struct{}, len(as.AddressSets)),
+			}
+			for _, a := range as.Addresses {
+				idx.addr[a] = struct{}{}
+			}
+			for _, s := range as.AddressSets {
+				idx.set[s] = struct{}{}
+			}
+			indexes[name] = idx
+		}
+		return idx
+	}
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "address":
@@ -323,15 +347,22 @@ func parseAddressBookEntries(node *Node, ab *AddressBook) {
 					as = &AddressSet{Name: name}
 					ab.AddressSets[name] = as
 				}
+				idx := indexFor(name, as)
 				for _, member := range child.Children {
 					switch member.Name() {
 					case "address":
 						for _, v := range addressSetMemberValues(member) {
-							as.Addresses = appendUniqueString(as.Addresses, v)
+							if _, seen := idx.addr[v]; !seen {
+								idx.addr[v] = struct{}{}
+								as.Addresses = append(as.Addresses, v)
+							}
 						}
 					case "address-set":
 						for _, v := range addressSetMemberValues(member) {
-							as.AddressSets = appendUniqueString(as.AddressSets, v)
+							if _, seen := idx.set[v]; !seen {
+								idx.set[v] = struct{}{}
+								as.AddressSets = append(as.AddressSets, v)
+							}
 						}
 					}
 				}
