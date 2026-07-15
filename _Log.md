@@ -1,3 +1,35 @@
+## 2026-07-15 — #5827 (config/security): cap retained parse diagnostics (heap DoS)
+- **Timestamp**: 2026-07-15 (fix/5827-parse-error-cap)
+- **Action**: The recursive-descent config parser (pkg/config/parser.go) recorded
+  one ParseError per bad token via an UNCAPPED addError — so an all-invalid
+  payload up to the 16 MiB MaxConfigSize pinned ~16 million ParseError structs
+  (each holding a formatted message string) LIVE simultaneously: an unbounded-heap
+  OOM DoS reachable unauthenticated from the localhost gRPC/REST config-load API
+  AND the HA peer config-sync ingress. Fix: added `const maxParseErrors = 64` and
+  capped the RETAINED diagnostic set in addError + a new addErrorf (lazy-format so
+  the fmt.Sprintf call sites don't even allocate past the cap). Past the cap, both
+  count the drop in a saturating `Parser.suppressed` and return without appending;
+  Parse folds the count into ONE deterministic trailing "additional parse errors
+  suppressed (N)" diagnostic → len(errs) bounded to maxParseErrors+1, retained heap
+  O(cap), regardless of input size. The first ≤64 diagnostics keep parse order +
+  line/column. The lexer still drains the whole input O(input) for deterministic
+  termination (only RETENTION is capped) — mirrors the existing depth-cap
+  suppression (skipToBlockClose). ParseSetVerb/ParseSetCommand (flat-set) are
+  already bounded (return on the first bad token) — the shared cap needs no change
+  there. No cancellation/deadline added: input is pre-capped at 16 MiB and the
+  parse is O(input) linear.
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/config/ clean;
+  go test -race ./pkg/config/ (131s — the 16 MiB / 8 MiB DoS regression tests
+  under race instrumentation) + ./pkg/configstore/ GREEN. Fail-on-revert (overlay,
+  uncap addError/addErrorf): the retained-heap-budget test RED (524 MiB retained
+  for an 8 MiB payload vs 64 MiB budget), the mixed-order test RED (len 192 vs
+  ≤65), the depth×token test RED (434 vs ≤65). Existing config tests unaffected
+  (they assert len==0/>0, cap-safe).
+- **File(s)**: pkg/config/parser.go (Edit),
+  pkg/config/parser_error_cap_5827_test.go (Write),
+  pkg/configstore/parse_error_cap_5827_test.go (Write),
+  pkg/config/README.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5832 (bug/audit/security): commit-time gate for Linux interface-name collisions
 - **Timestamp**: 2026-07-15 (fix/5832-ifname-collision-gate)
 - **Action**: config.LinuxIfName only does ReplaceAll("/","-") — NOT injective.
