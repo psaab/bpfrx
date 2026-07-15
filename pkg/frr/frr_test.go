@@ -6045,8 +6045,9 @@ func TestGenerateProtocols_ISISBFDInsideInterfaceBlock(t *testing.T) {
 // "(route-filter) AND (prefix-list)" to prefix-list-only).
 //
 // The fix renders the from-prefix-list as an ACCESS-LIST match
-// (`match ipv6 address <name>_rf`, a distinct FRR rule type from
-// `match ipv6 address prefix-list`). A v6 route in the prefix-list but OUTSIDE
+// (`match ipv6 address <generated ACL name>`, a distinct FRR rule type from
+// `match ipv6 address prefix-list`; the name is the #5872 bounded/namespaced/
+// hashed identifier). A v6 route in the prefix-list but OUTSIDE
 // the route-filter range therefore still fails the route-filter's prefix-list
 // clause and does NOT match the term.
 //
@@ -6086,14 +6087,17 @@ func TestPolicyRouteFilterPrefixListSameFamilyNoCollision(t *testing.T) {
 			"match ipv6 address prefix-list MIX-t1", got)
 	}
 	// The from-prefix-list must render as an ACCESS-LIST match (distinct FRR
-	// rule type) so FRR ANDs it with the route-filter's prefix-list match.
-	if !strings.Contains(got, "match ipv6 address V6ONLY_rf") {
+	// rule type) so FRR ANDs it with the route-filter's prefix-list match. The
+	// access-list name is the #5872 bounded/namespaced/hashed identifier; the
+	// definition and the reference MUST use the identical name (helper output).
+	aclName := routeFilterACLName("V6ONLY", "ipv6")
+	if !strings.Contains(got, "match ipv6 address "+aclName) {
 		t.Errorf("from-prefix-list not rendered as an access-list match; want %q in:\n%s",
-			"match ipv6 address V6ONLY_rf", got)
+			"match ipv6 address "+aclName, got)
 	}
 	// Its access-list definition must be emitted (exact-match preserves the
 	// Junos `from prefix-list` exact semantics).
-	wantACL := "ipv6 access-list V6ONLY_rf seq 5 permit 2001:db8:ffff::/48 exact-match"
+	wantACL := "ipv6 access-list " + aclName + " seq 5 permit 2001:db8:ffff::/48 exact-match"
 	if !strings.Contains(got, wantACL) {
 		t.Errorf("missing access-list definition; want %q in:\n%s", wantACL, got)
 	}
@@ -6149,7 +6153,7 @@ func TestPolicyRouteFilterPrefixListOffFamilyUnchanged(t *testing.T) {
 	if !strings.Contains(got, "match ipv6 address prefix-list V6ONLY") {
 		t.Errorf("off-family from-prefix-list must stay a prefix-list match (#5702); got:\n%s", got)
 	}
-	if strings.Contains(got, "V6ONLY_rf") {
-		t.Errorf("off-family from-prefix-list must NOT be converted to an access-list; got:\n%s", got)
+	if strings.Contains(got, routeFilterACLNamespace) {
+		t.Errorf("off-family from-prefix-list must NOT be converted to an access-list (#5872 generated-ACL namespace present); got:\n%s", got)
 	}
 }

@@ -384,6 +384,16 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		if err := bgpComposedChainCollision(fc); err != nil {
 			return err
 		}
+		// #5872 render-side belt: refuse to render when the route-filter
+		// access-list names xpf generates for a `from prefix-list` materialized
+		// beside a same-family route-filter (renderFromPrefixListACL) would
+		// collide — a reserved-namespace intrusion or a final-name hash collision.
+		// FRR merges same-named access-lists → a silent routing-policy
+		// widen/narrow, so fail the whole apply CLOSED (FRR keeps its last-good
+		// config), mirroring the two collision guards above.
+		if err := routeFilterACLNameCollision(fc.PolicyOptions); err != nil {
+			return err
+		}
 	}
 
 	return m.commitManagedSection(m.buildManagedSection(fc))
