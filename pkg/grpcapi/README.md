@@ -22,10 +22,25 @@ tab completion. The wire schema is `proto/xpf/v1`.
 ## Trust boundary (loopback-only, #5035)
 
 The primary listener started by `Run` installs **no** authentication or
-TLS — only `configLockInterceptor` — so every RPC (including destructive
-`SystemAction` zeroize/reboot/halt/power-off and Commit/Delete/Rollback)
-is inherently trusted. That trust holds only if the listener is
-loopback-bound. `Run` therefore clamps a non-loopback `--grpc-addr`
+TLS — only the connection-scoped config-lock lifecycle owner
+(`configLockStatsHandler`, a gRPC `stats.Handler`; #5849) — so every RPC
+(including destructive `SystemAction` zeroize/reboot/halt/power-off and
+Commit/Delete/Rollback) is inherently trusted. That trust holds only if
+the listener is loopback-bound.
+
+**Config-session identity (#5849).** The config lock / candidate DB is a
+per-CLIENT-CONNECTION resource. Each config RPC keys its session by
+`connSessionID(ctx)` — an **unguessable, connection-scoped id** allocated
+in `configLockStatsHandler.TagConn` (crypto/rand), NOT the reusable peer
+address. The lock is auto-released **exactly once** on `ConnEnd` (a
+per-connection `sync.Once`, plus the store's holder check), never on a
+per-RPC cancellation: a client cancelling one unrelated read, or a request
+deadline expiring, no longer discards the connection's staged candidate or
+steals its lock. Explicit `ExitConfigure` (immediate) and the store's
+bounded idle-lease reclaim (`reclaimStaleLockLocked`, #4476) remain as
+backstops for a connection whose `ConnEnd` notification is lost. The same
+`stats.Handler` is installed on the fabric listener for a uniform lifecycle
+(a no-op there — the fabric allowlist never admits config RPCs). `Run` therefore clamps a non-loopback `--grpc-addr`
 (`0.0.0.0`, a routable address, or the `:port` wildcard) back to a
 same-family loopback (`clampGRPCBindToLoopback`) and warns, mirroring the
 web-management (#4903) and cluster-bind (#4928) doctrine. There is no
