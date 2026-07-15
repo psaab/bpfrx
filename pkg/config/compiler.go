@@ -955,6 +955,21 @@ type compileOpts struct {
 	// applier's tableIDs !ok guard keeps it inert. Same doctrine as
 	// lenientRibGroupRefs.
 	lenientNextTableRefs bool
+	// lenientRoutingRuleWindows (#5854) downgrades the next-table / rib-group
+	// ip-rule window over-subscription gate (validateRoutingRuleWindowsStrict)
+	// from a hard compile error to a cfg.Warnings entry. The runtime applier
+	// programs next-table and interface-routes rib-group leaks into FIXED
+	// priority windows (pkg/routing/rules.go: 100 next-table rules, 1000
+	// rib-group leak rules) and HARD-CAPS at each boundary, silently skipping any
+	// rule past it, so a config that exceeds a window commits green while the
+	// reconciler stops at the limit and returns success — the committed
+	// generation claims routes the kernel never programs (blackhole / asymmetric
+	// routing). The strict commit / commit-check path hard-rejects so the
+	// over-subscription is operator-visible; the tolerant load / peer-sync paths
+	// warn so an already-committed or peer-synced over-limit config still BOOTS
+	// (#1960) — the applier's window hard-cap keeps the excess inert. Same
+	// doctrine as lenientNextTableRefs.
+	lenientRoutingRuleWindows bool
 	// lenientPolicyRouteMapSeq (#5701) downgrades the route-map
 	// sequence-number overflow gate (validatePolicyRouteMapSequenceBoundStrict)
 	// from a hard compile error to a cfg.Warnings entry. A policy-statement
@@ -1928,6 +1943,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientRoutingRuleWindows:              true,
 		lenientPolicyRouteMapSeq:               true,
 		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
@@ -2280,6 +2296,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyMatchAddressSetMembers:    true,
 		lenientRibGroupRefs:                    true,
 		lenientNextTableRefs:                   true,
+		lenientRoutingRuleWindows:              true,
 		lenientPolicyRouteMapSeq:               true,
 		lenientRouteDispositionConflict:        true,
 		lenientDHCPStaticBindings:              true,
