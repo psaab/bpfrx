@@ -138,6 +138,25 @@ func ValidateInteger(min, max int64) LeafValidator {
 	}
 }
 
+// MaxLogicalUnit is the logical `unit <n>` ceiling: Junos accepts a logical
+// unit number of 0 through 16385 and the runtime keys
+// InterfaceConfig.Units by this int (#5829).
+const MaxLogicalUnit = 16385
+
+// ValidateLogicalUnit is the ONE canonical numeric-identity validator for a
+// logical `unit <n>` slot (#5829). A `unit <identity>` slot has no positional
+// key validation, so a non-numeric identity such as `unit tenant` passed
+// schema + commit and the compiler then SILENTLY DISCARDED the whole unit on
+// strconv failure — dropping the unit's addresses, firewall filters, sampling,
+// DHCP/DDNS and tunnel state with no diagnostic (a security fail-open: a
+// unit-level firewall filter commits with no enforcement). Reject the malformed
+// identity at commit instead: non-numeric, negative, integer overflow, and
+// out-of-range [0..MaxLogicalUnit] all fail here. Reuse this on every slot that
+// names an interface unit so the grammar stays consistent across subsystems.
+func ValidateLogicalUnit(raw string, cfg *Config) error {
+	return ValidateInteger(0, MaxLogicalUnit)(raw, cfg)
+}
+
 // validatePercent returns a closure that accepts a real number in
 // [min, max] inclusive. The input must parse as a float.
 func ValidatePercent(min, max float64) LeafValidator {

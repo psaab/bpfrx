@@ -11,13 +11,17 @@ package config
 // changes, ranges derived from what the runtime actually consumes
 // (cited per leaf). The `address` nodes use the typed-KEY-slot
 // feature (keyValidator) because their value is a named-instance
-// identity token, not a leaf value. Deliberately NOT typed:
-// `unit <n>` / `vrrp-group <id>` instance ids (same deferral class
-// as the chassis PR-2 redundancy-group/node ids: garbage ids make
-// the compiler silently drop the instance, but these ids are
-// cross-referenced from other subsystems — e.g. class-of-service
-// `interfaces <if> unit <n>` — and deserve one dedicated pass that
-// types every referencing slot together). NOTE (#4573): the SCHEMA
+// identity token, not a leaf value. The `unit <n>` instance key is
+// ALSO typed now (keyValidator ValidateLogicalUnit, #5829): a
+// non-numeric / negative / overflow / out-of-range unit id made the
+// compiler SILENTLY DROP the whole unit — including its firewall
+// filters (a security fail-open) — so it is rejected at commit here
+// plus defense-in-depth in the compiler. Deliberately still NOT typed:
+// `vrrp-group <id>` instance ids (same deferral class as the chassis
+// PR-2 redundancy-group/node ids: garbage ids make the compiler
+// silently coerce/drop the instance, but these ids are cross-referenced
+// from other subsystems and their range is backstopped by a semantic
+// commit gate — see below). NOTE (#4573): the SCHEMA
 // deferral above is only safe for NON-numeric garbage; an
 // OUT-OF-RANGE NUMERIC `vrrp-group <id>` is bounded by a semantic
 // commit gate on the compiled *Config — `validateVRRPGroupIDStrict`
@@ -83,7 +87,13 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 		"member-interfaces": {desc: "Member interfaces", children: nil},
 	}},
 	"tunnel": {desc: "Tunnel parameters", children: tunnelSchemaChildren()},
-	"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", children: map[string]*schemaNode{
+	// #5829: the unit instance key is a NUMERIC identity token — type it so
+	// `commit`/`commit check` reject a non-numeric / negative / overflow /
+	// out-of-range `unit <n>` naming the bad value, instead of the compiler
+	// silently discarding the unit (and its firewall filters) later. keyValidator
+	// alone gates the identity arg (schema_walk validateKeySlot); valueHint stays
+	// for dynamic unit-number completion.
+	"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", keyValidator: ValidateLogicalUnit, children: map[string]*schemaNode{
 		"description":    {desc: "Text description", args: 1, scalar: true, placeholder: "<text>", children: nil},
 		"point-to-point": {desc: "Point-to-point interface", children: nil},
 		// 802.1Q VID is a 12-bit wire field: 0 is the compiler's

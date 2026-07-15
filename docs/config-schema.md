@@ -300,14 +300,54 @@ The gate is surgical: a single canonical `unit 0` (the overwhelming common case)
 and distinct unit numbers (`unit 0` + `unit 1`) never trip it, and same-spelling
 flat-set lines merge into one AST node upstream (they are the same unit, not an
 alias) — so non-colliding compilation is bit-identical. A non-numeric unit token
-is skipped (the compiler `continue`s on the identical Atoi error, so it never
-reaches `ifc.Units`). Where a duplicate-spelling config ALSO produces a
+is now REJECTED at commit rather than silently skipped (see the #5829 gate
+below). Where a duplicate-spelling config ALSO produces a
 pre-expansion tunnel-endpoint-id collision (#1873), that earlier gate rejects
 first — either way the aliased config is refused, never silently committed.
 Covered by `pkg/config/interface_unit_alias_5631_test.go` (both config orders
 reject identically = order-independent, lenient-warn, non-colliding-commits) and
 the reconciled `tunnelid_test.go` duplicate-spelling case, each RED on revert of
 the gate wiring.
+
+### Non-numeric logical-unit identity fail-closed (#5829)
+
+`interfaces <if> unit <identity>` had NO positional key validation: the `unit`
+schema node deliberately left its instance key untyped (deferred with the
+`vrrp-group <id>` class), and `compileInterfaces` parsed it with `strconv.Atoi`
+and a bare `continue` on error. So a non-numeric identity such as `unit tenant`
+passed schema + commit, and the compiler then **silently discarded the whole
+unit** — its addresses, firewall filters, sampling, DHCP/DDNS and tunnel state
+vanished with no diagnostic. The security bite: a unit-level input/output
+firewall FILTER committed with **no enforcement** (fail-open), the same class as
+the undefined-filter-reference gate.
+
+The fix is fail-CLOSED at two layers, both keyed to one canonical validator
+`ValidateLogicalUnit` (`schema_validators.go`, range `0..MaxLogicalUnit` = 16385
+— non-numeric, negative, integer overflow, and out-of-range all fail):
+
+- **Schema (strict commit/check):** the `unit` node carries
+  `keyValidator: ValidateLogicalUnit`, so `commit`/`commit check`
+  (`SchemaValidate`) reject a malformed identity naming the interface and the
+  raw token, for both the flat-set and hierarchical AST shapes (the shared
+  `validateKeySlot` path, same mechanism as the typed `address <cidr>` key).
+- **Compiler (defense-in-depth, all paths):** `compiler_interfaces.go` returns a
+  hard error instead of the bare `continue`. On the tolerant load / peer-sync
+  paths the `lenientNonNumericUnit` opt (set by `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`) downgrades that to a `cfg.Warnings` entry and
+  **quarantines** the unit — dropped, its children never reattached to another
+  unit — so a config an older binary silently truncated still boots, now with a
+  deterministic warning instead of a silent drop.
+
+Valid numeric units (including the `0` and `16385` boundaries) compile
+bit-identically and reach the typed `ifc.Units` map. RESIDUAL: this pass types
+the `interfaces <if> unit <n>` slot; the cross-subsystem unit-reference grammar
+(class-of-service / security-zone / routing-instance interface references that
+carry a `.unit` suffix) still parses the suffix without this validator and is a
+follow-up (issue #5829 "every unit-reference slot"). Covered by
+`pkg/config/interface_unit_nonnumeric_5829_test.go` (strict reject via both
+gates naming the interface + token, valid-unit-reaches-map, lenient
+warn-and-quarantine), RED on revert of either the `keyValidator` or the compiler
+gate.
 
 ### security address-book same-name `address` + `address-set` collision (#5676)
 
