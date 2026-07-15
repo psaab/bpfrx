@@ -248,7 +248,17 @@ never retried and the stale IPv6 default-router identity lingered on hosts
   shares `Withdraw()`'s path via `collectGracefulWithdrawLocked`.
 - `Withdraw() error` — `ra.go`. Graceful goodbye + stop on every sender.
 - `ResendBurst()` — `ra.go`. Re-sends the startup burst (used after a
-  link cycle) on every active sender, via the owner goroutine.
+  link cycle) on every active sender, via the owner goroutine. The owner
+  RE-RESOLVES the interface's current hardware address (`interfaceByNameFn`,
+  owner-serialized) BEFORE the burst so the ICMPv6 source link-layer address
+  (SLLA) reflects a post-link-cycle RETH/VLAN virtual-MAC change instead of the
+  `net.Interface` value snapshot cached at Start (#5302). A day-2 MAC change
+  leaves the RA config unchanged, so reconciliation keeps the sender and only
+  requests a burst — without the re-resolve the burst would advertise the OLD
+  MAC and point hosts' router neighbor entry at a MAC the active node no longer
+  owns (IPv6 blackhole, the opposite of the burst's repair intent). If the
+  re-resolve fails, the burst is SKIPPED and logged rather than advertising a
+  known-stale SLLA (host NUD + the next successful refresh recover).
 - `WithdrawInterfaces(names []string)` — `ra.go`. Graceful goodbye + stop
   by interface name.
 - `WithdrawOnce(configs []*config.RAInterfaceConfig) []GoodbyeResult` —
