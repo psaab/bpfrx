@@ -1,3 +1,33 @@
+## 2026-07-15 — #5811 (bug/audit/security): global-only clear commands enforce exact arity
+- **Timestamp**: 2026-07-15 (fix/5811-clear-exact-arity)
+- **Action**: Global-only `clear` handlers (whose backend action can ONLY clear
+  everything, no scoped variant) recognized a fixed keyword prefix and silently
+  DISCARDED every trailing token, then issued the unscoped mutation. So a
+  scoped-LOOKING command — `clear arp 192.0.2.10`, `clear ipv6 neighbors
+  interface ge-0-0-0`, `clear interfaces statistics ge-0-0-0`, `clear security
+  nat statistics rule web`, `clear security nat source persistent-nat-table pool
+  p1`, `clear security counters zone untrust`, `clear firewall all filter edge`,
+  `clear system config-lock session 42` — reported success while wiping the
+  ENTIRE cache/counter/table. Added a `requireClearNoScope(cmd, clears, extra)`
+  helper (byte-identical copy in `cmd/cli/clear.go` and `pkg/cli/cli_clear.go`)
+  that REJECTS any trailing operand with an "unexpected argument(s) ...; this
+  command clears X and takes no scope" error BEFORE any mutation. Wired it into
+  every global-only clear on BOTH parsers, restoring arity parity (the in-process
+  `policies hit-count` now matches the remote's #5570 guard). Legit scoped clears
+  (`clear security flow session <filter>`, `clear dhcp client-identifier
+  interface <name>`) are untouched. Follow-up candidate (out of #5811 scope): the
+  in-process `clear dhcp client-identifier` does not mirror the remote's #4883-E
+  malformed-selector guard.
+- **Validation**: gofmt clean; go build ./... + go test ./cmd/cli/ ./pkg/cli/
+  -count=1 green; go vet clean apart from a pre-existing cli.go unreachable-code
+  note in an untouched file. Fail-on-revert proven via overlay: neutralizing
+  requireClearNoScope (discard suffix) flips the reject tests RED on BOTH parsers
+  (no error returned; the dp/RPC mutation runs).
+- **File(s)**: cmd/cli/clear.go (Edit), pkg/cli/cli_clear.go (Edit),
+  cmd/cli/clear_exact_arity_5811_test.go (Write),
+  pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
+  _Log.md (Edit)
+
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
 - **Action**: Aligned the CLI in-process commit path (reloadSyslog /

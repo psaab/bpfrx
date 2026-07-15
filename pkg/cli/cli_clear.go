@@ -15,6 +15,25 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// requireClearNoScope rejects any trailing operand on a GLOBAL-ONLY clear
+// command — one whose backend action can ONLY clear everything and has no
+// scoped variant. Such handlers historically recognized a fixed keyword prefix
+// and silently DISCARDED the remaining tokens, then issued the unscoped
+// mutation, so an operator who typed a scope (e.g. `clear arp 192.0.2.10`) got
+// a success message while the ENTIRE cache/table/counter set was wiped (#5811).
+// Require exact arity instead: return an error naming the stray tokens and
+// stating the command takes no scope, BEFORE any mutation runs. cmd is the full
+// command path shown in the message; clears names what it unconditionally
+// clears. The wording is kept byte-identical to cmd/cli's copy so both CLIs
+// reject the same input the same way.
+func requireClearNoScope(cmd, clears string, extra []string) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	return fmt.Errorf("unexpected argument(s) %v after %q; this command clears %s "+
+		"and takes no scope (per-scope clear is not supported)", extra, cmd, clears)
+}
+
 func (c *CLI) handleClear(args []string) error {
 	clearTree := operationalTree["clear"].Children
 	showHelp := func() {
@@ -28,7 +47,7 @@ func (c *CLI) handleClear(args []string) error {
 
 	switch args[0] {
 	case "arp":
-		return c.handleClearArp()
+		return c.handleClearArp(args[1:])
 	case "ipv6":
 		return c.handleClearIPv6(args[1:])
 	case "security":
@@ -52,6 +71,9 @@ func (c *CLI) handleClearSystem(args []string) error {
 		cmdtree.PrintTreeHelp("clear system:", operationalTree, "clear", "system")
 		return nil
 	}
+	if err := requireClearNoScope("clear system config-lock", "the configuration lock", args[1:]); err != nil {
+		return err
+	}
 	holder, locked := c.store.ConfigHolder()
 	if !locked {
 		fmt.Println("No configuration lock held")
@@ -64,6 +86,9 @@ func (c *CLI) handleClearSystem(args []string) error {
 
 func (c *CLI) handleClearInterfaces(args []string) error {
 	if len(args) >= 1 && args[0] == "statistics" {
+		if err := requireClearNoScope("clear interfaces statistics", "all interface statistics", args[1:]); err != nil {
+			return err
+		}
 		fmt.Println("Interface statistics counters noted")
 		fmt.Println("(kernel counters are cumulative and cannot be reset)")
 		return nil
@@ -72,7 +97,10 @@ func (c *CLI) handleClearInterfaces(args []string) error {
 	return nil
 }
 
-func (c *CLI) handleClearArp() error {
+func (c *CLI) handleClearArp(args []string) error {
+	if err := requireClearNoScope("clear arp", "the ARP cache", args); err != nil {
+		return err
+	}
 	out, err := exec.Command("ip", "-4", "neigh", "flush", "all").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("flush ARP: %s", strings.TrimSpace(string(out)))
@@ -85,6 +113,9 @@ func (c *CLI) handleClearIPv6(args []string) error {
 	if len(args) < 1 || args[0] != "neighbors" {
 		cmdtree.PrintTreeHelp("clear ipv6:", operationalTree, "clear", "ipv6")
 		return nil
+	}
+	if err := requireClearNoScope("clear ipv6 neighbors", "the IPv6 neighbor cache", args[1:]); err != nil {
+		return err
 	}
 	out, err := exec.Command("ip", "-6", "neigh", "flush", "all").CombinedOutput()
 	if err != nil {
@@ -104,9 +135,17 @@ func (c *CLI) handleClearSecurity(args []string) error {
 	switch args[0] {
 	case "nat":
 		if len(args) >= 3 && args[1] == "source" && args[2] == "persistent-nat-table" {
+			if err := requireClearNoScope("clear security nat source persistent-nat-table",
+				"the entire persistent NAT table", args[3:]); err != nil {
+				return err
+			}
 			return c.clearPersistentNAT()
 		}
 		if len(args) >= 2 && args[1] == "statistics" {
+			if err := requireClearNoScope("clear security nat statistics",
+				"all NAT translation statistics", args[2:]); err != nil {
+				return err
+			}
 			if c.dp == nil || !c.dp.IsLoaded() {
 				fmt.Println("dataplane not loaded")
 				return nil
@@ -146,20 +185,27 @@ func (c *CLI) handleClearSecurity(args []string) error {
 		return nil
 
 	case "policies":
-		if len(args) >= 2 && args[1] == "hit-count" {
-			if c.dp == nil || !c.dp.IsLoaded() {
-				fmt.Println("dataplane not loaded")
-				return nil
-			}
-			if err := c.dp.ClearPolicyCounters(); err != nil {
-				return fmt.Errorf("clear policy counters: %w", err)
-			}
-			fmt.Println("policy hit counters cleared")
+		if len(args) < 2 || args[1] != "hit-count" {
+			return fmt.Errorf("usage: clear security policies hit-count")
+		}
+		if err := requireClearNoScope("clear security policies hit-count",
+			"all policy hit counters", args[2:]); err != nil {
+			return err
+		}
+		if c.dp == nil || !c.dp.IsLoaded() {
+			fmt.Println("dataplane not loaded")
 			return nil
 		}
-		return fmt.Errorf("usage: clear security policies hit-count")
+		if err := c.dp.ClearPolicyCounters(); err != nil {
+			return fmt.Errorf("clear policy counters: %w", err)
+		}
+		fmt.Println("policy hit counters cleared")
+		return nil
 
 	case "counters":
+		if err := requireClearNoScope("clear security counters", "all counters", args[1:]); err != nil {
+			return err
+		}
 		if c.dp == nil || !c.dp.IsLoaded() {
 			fmt.Println("dataplane not loaded")
 			return nil
@@ -413,6 +459,9 @@ func (c *CLI) handleClearFirewall(args []string) error {
 	if len(args) < 1 || args[0] != "all" {
 		cmdtree.PrintTreeHelp("clear firewall:", operationalTree, "clear", "firewall")
 		return nil
+	}
+	if err := requireClearNoScope("clear firewall all", "all firewall filter counters", args[1:]); err != nil {
+		return err
 	}
 	if c.dp == nil || !c.dp.IsLoaded() {
 		fmt.Println("Dataplane not loaded")
