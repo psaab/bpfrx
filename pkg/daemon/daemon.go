@@ -267,7 +267,13 @@ type Daemon struct {
 	ipfixReconMu        sync.Mutex
 	ipfixExportErr      error
 	dhcpRelay           *dhcprelay.Manager
-	snmpAgent           *snmp.Agent
+	// mgmt owns the HTTP/HTTPS management-listener lifecycle (#5866): it starts
+	// the listener at boot and, on every day-2 commit, reconciles the live
+	// listener + authentication snapshot against the committed web-management
+	// config (make-before-break rebind on an endpoint change; live auth swap on
+	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
+	mgmt      *managementReconciler
+	snmpAgent *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in

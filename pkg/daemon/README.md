@@ -153,6 +153,50 @@ cluster (deferred to `/triple-review` per #4407, because regrouping it
 touches apply-ordering rather than being inert field motion). These are the
 natural stopping point for the mechanical decomposition.
 
+### Management-listener lifecycle (`managementReconciler`, #5866)
+
+`d.mgmt` (`management.go`) owns the HTTP/HTTPS management-listener lifecycle so a
+day-2 web-management commit actually replaces the live listener and the
+authentication snapshot instead of leaving the boot-time server enforcing the
+old bind/port/TLS/auth until a restart (a revoked credential stayed usable). It
+mirrors `reconcileSNMP`: `reconcileWebManagement` runs EARLY in
+`applyConfigLocked` — before the dataplane apply that can abort — so a committed
+credential revocation is enforced even on an apply that returns early
+(`store.Commit` has already promoted the config). Reconcile discipline:
+
+- **Auth change on an unchanged endpoint** → live `api.Server.ReplaceAuth`
+  (atomic snapshot swap, effective next request, no rebind, no window).
+- **Endpoint change** → reconcile ONLY the listener leg that changed, PER LEG:
+  an HTTP-bind change make-before-break rebinds only the HTTP leg
+  (`api.Server.ReconcileHTTP`); a TLS enable/disable or HTTPS-bind change rebinds
+  only the HTTPS leg (`api.Server.ReconcileHTTPS`) and never touches the live
+  HTTP listener. The whole-server rebuild it replaces re-bound the retained HTTP
+  socket on a TLS enable (`EADDRINUSE`, since `SO_REUSEADDR` ≠ `SO_REUSEPORT`),
+  so a TLS change could never converge without a restart. Each leg is
+  make-before-break inside `api.Server` (new socket serving before the old
+  retires — no unreachable window, no double-bind of an unchanged socket).
+- **Failed leg (re)bind** → **fail-safe**: retain THAT leg's previous listener
+  (fail-closed — not mgmt-down), leave its fingerprint field unrecorded so the
+  next commit retries (retry debt), and log the error. This does not brick an
+  otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
+  retry).
+- **Auth ordering — revocation decoupled from the HTTPS leg**: auth publishes as
+  soon as the HTTP leg is at its desired bind (`httpOK`), INDEPENDENT of the
+  HTTPS-leg outcome — a committed credential revocation must not be blocked by an
+  HTTPS bind failure. When `httpOK` the live HTTP listener is at `next.Addr`,
+  whose #4047/#5127 loopback clamp justified `next.Auth`, so applying it there
+  cannot fail-open; it defers ONLY when the HTTP leg's OWN rebind failed (the
+  retained old bind may not match `next.Auth`'s clamp). A tightening (non-nil)
+  publishes whatever the HTTPS outcome (it only ADDS a requirement). Removing ALL
+  api-auth (nil) additionally requires the live HTTPS to be off/loopback, so a
+  non-loopback HTTPS retained by a failed rebind is never dropped to no-auth.
+  Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
+  (revocation honored across a failing HTTPS rebind) +
+  `TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866` (nil auth NOT
+  applied to a retained non-loopback listener — no fail-open). The reconcile is
+  serialized by its mutex and the apply semaphore, so a newer generation never
+  completes behind an older one.
+
 ## Cluster mode
 
 Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).
