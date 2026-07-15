@@ -48339,3 +48339,33 @@ top.
 - **Timestamp**: 2026-07-15
 - **Action**: #5845 — rolling-upgrade drain-abort was discarding the ResetFailover (failback) error (`_ = cl.ResetFailover()`) and unconditionally claiming "aborted WITHOUT cutting (node still forwarding)". After ForceSecondary already DEMOTED the node, a FAILED failback can leave it force-secondary with peer takeover unproven — the "still forwarding" claim is then FALSE and both nodes could end up secondary (outage). Fixed rolling.go to capture `resetErr := cl.ResetFailover()`: on failure, return an error surfacing BOTH the drain failure AND the reset failure (errors.Join) and warning the node may be STRANDED DEMOTED / operator attention needed (mirroring the correct sibling kernel_drain.go); on success, keep the existing "still forwarding" message (true then). Extended the rolling_test.go fake with a `resetErr` seam; added TestRolling_DrainTimeoutFailbackFailsStrandedDemoted_5845 (asserts errors.Is(resetErr) surfaces + "STRANDED DEMOTED" present + NOT "still forwarding") and strengthened the failback-SUCCESS test to pin the unchanged "still forwarding" claim. Fail-on-revert verified: reverting to discard-resetErr + still-forwarding message flips the new test RED (rolling_test.go:229), restore → GREEN. gofmt/go vet/go build clean; go test ./pkg/upgrade green. Doc: docs/in-place-upgrade.md step-4 drain-abort updated (still-forwarding only on failback success; stranded-demoted on failure).
 - **File(s)**: pkg/upgrade/rolling.go, pkg/upgrade/rolling_test.go, docs/in-place-upgrade.md
+  **Action**: #5852 (bug): RPM lifecycle cancellation (StopAll / config
+  replacement / daemon shutdown) was mis-counted as path loss. When StopAll
+  cancels the shared probe context while runProbe is in flight, runSingleTest
+  treated the resulting context.Canceled (or the socket-timeout that follows a
+  cancel racing a blocking ReadFrom) as an ORDINARY probe failure: incremented
+  TotalSent/SuccFail, advanced the successive-loss threshold, emitted
+  ping_probe_failed, and could cross the loss threshold -> ping_test_failed +
+  fireTransition, so services ip-monitoring could change route preference DURING
+  teardown/reconfigure. Fixed by holding path state NEUTRAL on a lifecycle
+  cancel, mirroring the existing ErrProbeSetup hold: after runProbe, if
+  `ctx.Err() != nil || errors.Is(err, context.Canceled)` the probe RETURNs
+  before any counter/threshold/event/Transition. Discriminator is the SHARED
+  ctx.Err() (the probeCtx is context.WithCancel in Apply, cancelled ONLY by
+  m.cancel()), NOT the returned error type — a genuine probe TIMEOUT is a
+  per-probe socket deadline (icmp SetReadDeadline / TCP dial timeout) that
+  leaves ctx.Err()==nil and MUST still count as real path loss. RETURN (not
+  continue) so no post-loop fireTransition publishes a stale edge once teardown
+  begins. Deferred the optional icmp ReadFrom context-deadline responsiveness
+  tweak (StopAll can still wait up to the 3s socket deadline) as a follow-up —
+  the neutral classification is the load-bearing correctness fix and StopAll's
+  wg.Wait is bounded (<=3s, within TimeoutStopSec=20).
+  **File(s)**: pkg/rpm/rpm.go, pkg/rpm/README.md,
+  pkg/rpm/cancel_neutral_5852_test.go, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/rpm/ -count=1` (green);
+  `go vet ./pkg/rpm/` clean. Fail-on-revert: removing the neutral check flips
+  TestRunSingleTestLifecycleCancelIsNeutral5852 RED (cancelled probe advanced
+  TotalSent:1/SuccFail:1/LastStatus:fail) while the genuine-failure +
+  probe-owned-DeadlineExceeded tests stay GREEN (no over-neutralization).
+  (NOTE: the shared GOCACHE=/dev/shm/cache was contaminated by a prior
+  worktree — a fresh cache builds clean; used /dev/shm/cache5852.)
