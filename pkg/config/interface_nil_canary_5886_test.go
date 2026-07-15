@@ -27,7 +27,14 @@ func TestNoRawInterfaceUnitRangeDerefInPresenters_5886(t *testing.T) {
 	// (a `_` value is deref-free and safe).
 	reRange := regexp.MustCompile(`^\s*for \w+, ([A-Za-z]\w*) := range \w+\.(?:Interfaces\.Interfaces|Units) \{\s*$`)
 
-	dirs := []string{"../grpcapi", "../api", "../cli"}
+	// map-INDEX-then-deref in one condition: `if v, ok := X.Interfaces.Interfaces[k];
+	// ok && v.Field` (or `.Units[k]`). This is the shape #5886/monitor.go:343 hid in
+	// — the range regex above does not catch it. Route the lookup through
+	// config.LookupInterface / LookupUnit (which return ok only for a non-nil slot)
+	// so `ok` implies a safe dereference.
+	reMapIndexDeref := regexp.MustCompile(`:= \w+\.(?:Interfaces\.Interfaces|Units)\[[^\]]*\]; \w+ && \w+\.`)
+
+	dirs := []string{"../grpcapi", "../api", "../cli", "../monitoriface"}
 	var violations []string
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
@@ -45,6 +52,9 @@ func TestNoRawInterfaceUnitRangeDerefInPresenters_5886(t *testing.T) {
 			}
 			lines := strings.Split(string(data), "\n")
 			for i, l := range lines {
+				if reMapIndexDeref.MatchString(l) {
+					violations = append(violations, path+":"+strconv.Itoa(i+1)+": "+strings.TrimSpace(l))
+				}
 				m := reRange.FindStringSubmatch(l)
 				if m == nil {
 					continue

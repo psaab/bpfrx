@@ -48758,3 +48758,17 @@ top.
     (+ nil test), pkg/grpcapi/{server_cluster,server_show_interfaces,server_show_zones_text,
     server_diag_monitor}.go (+ nil test), pkg/cli/{cli_show_interfaces*,cli_show_cluster,
     cli_show_security_zones,completion,apply,cli_helpers}.go.
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5886 review-fold (rev5930 MAJOR). The sweep missed
+    pkg/monitoriface/monitor.go:343 (a separate package) — a raw
+    `cfg.Interfaces.Interfaces[base]; ok && ifc.LocalFabricMember` map-index deref
+    on the read-only CLI `show interfaces` traffic-summary + gRPC MonitorInterface
+    path; a present-but-nil slot panicked xpfd. Routed it through
+    config.LookupInterface. Added a monitoriface nil-slot canary
+    (TestTrafficSummaryInterfacesNilSlotNoPanic_5886; RED-on-revert = panic).
+    Extended the source-scan canary to cover pkg/monitoriface AND the
+    map-INDEX-then-deref shape (`if v,ok:=m[k]; ok && v.F`) the range-only regex
+    missed — verified it now flags monitor.go:348 on revert.
+  - **File(s)**: pkg/monitoriface/monitor.go, pkg/monitoriface/monitor_nil_5886_test.go,
+    pkg/config/interface_nil_canary_5886_test.go
