@@ -48031,3 +48031,19 @@ top.
   **Validation**: `gofmt -w pkg/api/server.go pkg/api/auth.go
   pkg/api/metrics_auth_gate_4162_test.go`; focused #4162/cache/TLS/lifecycle
   `go test ./pkg/api -run 'Test(IsLoopbackBindAddr|MetricsAuthGateNonLoopback|NewServerMetricsAuthIsOwnedByEachListener|SessionGaugeCacheWalksOncePerTTL|SessionGaugeCacheRefreshesAfterTTL|SessionGaugeCacheCoalescesConcurrentScrapes|SessionGaugeCacheValuesCorrect|HTTPSInstalledOnPersistFailure|RunClosesSurvivingListenerOnBindFailure|RunGracefulShutdownClosesBothListeners)$' -count=1`; `go test ./pkg/api -count=1`; `go test -race ./pkg/api -count=1`; `go vet ./pkg/api`; `go build ./pkg/api`; `go build ./cmd/xpfd`; all passed. `git diff --check` passed. Residual gaps: none; no true certificate-generation-failure seam exists in the approved scope.
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5302 review fold (MERGE-NEEDS-MINOR): remove the only
+  cross-goroutine `s.iface` read in the RA sender. rsReceiver's RFC 4861
+  §6.1.1 discard log read `s.iface.Name` from its own goroutine while the
+  new `refreshInterfaceForBurst` writes `s.iface` in run() — a formal
+  (value-benign, Name is invariant) data race per the Go memory model.
+  Switch that log to the immutable `s.cfg.Interface` (matches every other
+  log site) so `s.iface` is single-writer / no-other-reader, and correct
+  the ownership comment to state the reader disposition instead of
+  overstating "sole writer ⇒ no lock".
+  **File(s)**: pkg/ra/sender.go, _Log.md
+  **Validation**: `go build ./pkg/ra`; `go test -race ./pkg/ra
+  -run '5302|ResendBurst|RefreshInterface' -count=1` (green); full
+  `go test ./pkg/ra -count=1` re-run below; fail-on-revert of the
+  burstCh refresh still flips the 5302 tests RED.

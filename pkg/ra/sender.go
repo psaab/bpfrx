@@ -450,9 +450,14 @@ func (s *sender) draining() bool { return s.mode.Load() != int32(modeNone) }
 // no longer owns — an IPv6 blackhole, the exact opposite of the burst's
 // neighbor-repair intent.
 //
-// Owner-only: it runs in the run() goroutine that is the SOLE writer of s.iface
-// (never concurrent with listen()'s bind-retry re-read, which only runs during
-// openConn before the main loop), so no lock is needed. A successful refresh
+// Owner-only WRITE: the write s.iface = iface below runs in the run() goroutine,
+// the sole writer of s.iface (listen()'s bind-retry re-read runs only during
+// openConn before the main loop, never concurrently). The only cross-goroutine
+// READER of s.iface — rsReceiver's RFC 4861 §6.1.1 discard log — now reads the
+// immutable s.cfg.Interface instead, so no lock is needed: s.iface is written by
+// a single goroutine and read by none other. (s.iface.Name is invariant across
+// the write anyway — net.InterfaceByName returns an iface whose Name equals the
+// queried name — so even the prior read was value-benign.) A successful refresh
 // also freshens the MAC used by subsequent periodic sendRA calls. On failure it
 // returns false and logs; the caller then SKIPS the burst rather than advertise
 // a known-stale SLLA (advertising a stale MAC is worse than sending nothing —
@@ -687,7 +692,7 @@ func (s *sender) rsReceiver(ch chan<- netip.Addr) {
 		if !validRSReceive(cm, src) {
 			slog.Debug("ra: discarding Router Solicitation failing RFC 4861 §6.1.1 "+
 				"receive validation (hop-limit != 255 or off-link source)",
-				"interface", s.iface.Name, "src", src)
+				"interface", s.cfg.Interface, "src", src)
 			continue
 		}
 
