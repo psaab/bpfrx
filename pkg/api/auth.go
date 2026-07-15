@@ -24,34 +24,41 @@ type AuthConfig struct {
 // /metrics like every other endpoint (#4162).
 func authMiddleware(cfg AuthConfig, metricsRequireAuth bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// /health is always exempt; /metrics is exempt only when this listener
-		// has a literal loopback bind.
-		if r.URL.Path == "/health" || (r.URL.Path == "/metrics" && !metricsRequireAuth) {
+		if authCheck(cfg, metricsRequireAuth, r) {
 			next.ServeHTTP(w, r)
 			return
 		}
+		writeAuthChallenge(w)
+	})
+}
 
-		// Check Authorization header
-		if auth := r.Header.Get("Authorization"); auth != "" {
-			if checkAuthorization(auth, cfg) {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
+// authCheck reports whether a request is authorized under cfg (or exempt). It is
+// the shared core of the static authMiddleware and the live-swap
+// dynamicAuthMiddleware (#5866), so both enforce identical semantics — the
+// /health + loopback-/metrics exemptions and the #4157/#5636 constant-time,
+// empty-secret-rejecting credential checks.
+func authCheck(cfg AuthConfig, metricsRequireAuth bool, r *http.Request) bool {
+	// /health is always exempt; /metrics is exempt only when this listener has a
+	// literal loopback bind.
+	if r.URL.Path == "/health" || (r.URL.Path == "/metrics" && !metricsRequireAuth) {
+		return true
+	}
+	if auth := r.Header.Get("Authorization"); auth != "" && checkAuthorization(auth, cfg) {
+		return true
+	}
+	if key := r.Header.Get("X-API-Key"); key != "" && constantTimeAPIKeyMatch(cfg, key) {
+		return true
+	}
+	return false
+}
 
-		// Check X-API-Key header
-		if key := r.Header.Get("X-API-Key"); key != "" {
-			if constantTimeAPIKeyMatch(cfg, key) {
-				next.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		w.Header().Set("WWW-Authenticate", `Basic realm="xpf API"`)
-		writeJSON(w, http.StatusUnauthorized, Response{
-			Success: false,
-			Error:   "authentication required",
-		})
+// writeAuthChallenge emits the 401 + WWW-Authenticate response for an
+// unauthorized request.
+func writeAuthChallenge(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="xpf API"`)
+	writeJSON(w, http.StatusUnauthorized, Response{
+		Success: false,
+		Error:   "authentication required",
 	})
 }
 

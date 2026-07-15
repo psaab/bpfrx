@@ -1483,16 +1483,30 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			return d.grpcSrv
 		},
 	}
-	// Resolve interface bindings + api-auth from web-management config, then
-	// apply the #4047/#5127 loopback fail-safe on EVERY path (resolveAPIBinds).
-	d.resolveAPIBinds(&apiCfg, d.store.ActiveConfig())
-	srv := api.NewServer(apiCfg)
+	// #5866: the management HTTP/HTTPS listener is owned by
+	// managementReconciler. apiCfg here carries only the runtime deps; the
+	// reconciler re-derives the bind/port/TLS/auth from each ACTIVE config
+	// (resolveAPIBinds) so it can start the listener now AND, on every day-2
+	// commit, reconcile the live listener + authentication snapshot without a
+	// restart — make-before-break rebind on a bind/port/TLS change, live auth
+	// swap on an unchanged bind. Before #5866 the server was constructed once
+	// here and never reconciled, so a committed bind/TLS/port/auth change (e.g.
+	// a revoked credential) sat inert until a daemon restart.
+	d.mgmt = newManagementReconciler(d, apiCfg)
+	if err := d.mgmt.start(ctx); err != nil {
+		// A boot bind failure is non-fatal (matches the pre-#5866 async
+		// srv.Run error log): the daemon keeps running and the next commit's
+		// reconcileWebManagement retries the bind.
+		slog.Error("HTTP API server initial start failed", "err", err)
+	}
+	// Drain the management serve goroutines on daemon shutdown: ctx cancel
+	// triggers the api.Server bounded 5s graceful drain, and wait() joins every
+	// live + retiring listener goroutine so none leak past Run.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := srv.Run(ctx); err != nil {
-			slog.Error("API server error", "err", err)
-		}
+		<-ctx.Done()
+		d.mgmt.wait()
 	}()
 	slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
 }

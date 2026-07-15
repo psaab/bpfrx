@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -93,15 +94,19 @@ type Config struct {
 	HTTPSAddr string      // HTTPS listen address (empty = no HTTPS)
 	TLS       bool        // enable HTTPS with auto-generated certificate
 	Auth      *AuthConfig // nil = no authentication
-	Store     *configstore.Store
-	DP        apiRuntimeDataPlane
-	EventBuf  *logging.EventBuffer
-	GC        *conntrack.GC
-	Routing   *routing.Manager
-	FRR       *frr.Manager
-	IPsec     *ipsec.Manager
-	DHCP      *dhcp.Manager
-	VRRPMgr   *vrrp.Manager // native VRRP manager
+	// ListenFunc is the listener factory the server binds through (#5866).
+	// nil defaults to net.Listen; a test injects a fake so the
+	// make-before-break listener reconcile is exercised without real ports.
+	ListenFunc func(network, address string) (net.Listener, error)
+	Store      *configstore.Store
+	DP         apiRuntimeDataPlane
+	EventBuf   *logging.EventBuffer
+	GC         *conntrack.GC
+	Routing    *routing.Manager
+	FRR        *frr.Manager
+	IPsec      *ipsec.Manager
+	DHCP       *dhcp.Manager
+	VRRPMgr    *vrrp.Manager // native VRRP manager
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit and applyConfig, so
 	// two concurrent committers can't interleave their commit→apply
@@ -270,8 +275,24 @@ type Config struct {
 
 // Server is the HTTP API server.
 type Server struct {
-	httpServer                       *http.Server
-	httpsServer                      *http.Server
+	httpServer  *http.Server
+	httpsServer *http.Server
+	// auth is the LIVE authentication snapshot, read atomically on EVERY request
+	// by the middleware so a day-2 web-management commit that tightens or revokes
+	// credentials takes effect on the very next request WITHOUT rebinding the
+	// listener or restarting the daemon (#5866). nil = no authentication (the
+	// #4047/#5127 loopback clamp guarantees a nil-auth listener is loopback-only).
+	// ReplaceAuth swaps it; a bind-address/port/TLS change instead goes through a
+	// make-before-break listener rebuild (managementReconciler).
+	auth atomic.Pointer[AuthConfig]
+	// serveDone is closed when the background serve goroutine started by Start
+	// exits (#5866); Wait blocks on it so a swapped-out or shutting-down server's
+	// listeners+goroutines are fully drained before the daemon joins.
+	serveDone chan struct{}
+	// listen is the listener factory (#5866): Config.ListenFunc or net.Listen. A
+	// test injects a fake so the make-before-break reconcile is exercised without
+	// binding real ports.
+	listen                           func(network, address string) (net.Listener, error)
 	store                            *configstore.Store
 	dp                               apiRuntimeDataPlane
 	eventBuf                         *logging.EventBuffer
@@ -392,6 +413,14 @@ func NewServer(cfg Config) *Server {
 		nodeIDFn:                         cfg.NodeIDFn,
 		clusterSessionFn:                 cfg.ClusterSessionFn,
 		startTime:                        time.Now(),
+	}
+	// #5866: seed the live auth snapshot; the middleware reads it atomically per
+	// request so ReplaceAuth can swap credentials without rebinding the listener.
+	s.auth.Store(cfg.Auth)
+	// #5866: the listener factory (Config.ListenFunc or net.Listen).
+	s.listen = cfg.ListenFunc
+	if s.listen == nil {
+		s.listen = net.Listen
 	}
 
 	mux := http.NewServeMux()
@@ -515,11 +544,13 @@ func NewServer(cfg Config) *Server {
 	// listener's configured bind independently. Never infer this from r.Host
 	// or the sibling listener: only a literal loopback bind leaves /metrics
 	// open when auth is configured. /health remains exempt in authMiddleware.
+	// #5866: wrap with a middleware that reads the LIVE auth snapshot (s.auth)
+	// atomically per request, so ReplaceAuth takes effect on the next request
+	// without rebinding. metricsRequireAuth is fixed per listener (its bind
+	// address never changes for a given Server; a bind change goes through the
+	// make-before-break rebuild, not this swap).
 	listenerHandler := func(addr string) http.Handler {
-		if cfg.Auth == nil {
-			return sharedBase
-		}
-		return authMiddleware(*cfg.Auth, !isLoopbackBindAddr(addr), sharedBase)
+		return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), sharedBase)
 	}
 
 	s.httpServer = &http.Server{
@@ -572,24 +603,119 @@ func NewServer(cfg Config) *Server {
 // and left the other serving forever — an orphaned management socket that the
 // daemon wrapper could never reach to shut down.
 func (s *Server) Run(ctx context.Context) error {
-	// Bind synchronously and in a fixed order (HTTP first) so startup fails
-	// atomically before either server accepts a connection.
-	httpLn, err := net.Listen("tcp", s.httpServer.Addr)
+	httpLn, httpsLn, err := s.bindListeners()
 	if err != nil {
-		return fmt.Errorf("api: bind HTTP listener %q: %w", s.httpServer.Addr, err)
+		return err
 	}
+	return s.serveBound(ctx, httpLn, httpsLn)
+}
 
-	var httpsLn net.Listener
+// bindListeners binds the HTTP (and optional HTTPS) listeners SYNCHRONOUSLY, in
+// a fixed order (HTTP first), ALL-OR-NOTHING: a bind failure on either closes
+// whichever already bound and returns an error, so no orphaned socket is left
+// (#5058). It is the make-before-break primitive (#5866) — the caller learns the
+// endpoint is bindable before it retires the previous listener. Binds via
+// s.listen (Config.ListenFunc, default net.Listen) so a test injects a fake
+// factory instead of racing on real ports.
+func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
+	httpLn, err = s.listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("api: bind HTTP listener %q: %w", s.httpServer.Addr, err)
+	}
 	if s.httpsServer != nil {
-		httpsLn, err = net.Listen("tcp", s.httpsServer.Addr)
+		httpsLn, err = s.listen("tcp", s.httpsServer.Addr)
 		if err != nil {
-			// The HTTP listener already bound — close it so a failed
-			// startup leaves no orphaned socket behind (#5058).
+			// The HTTP listener already bound — close it so a failed startup
+			// leaves no orphaned socket behind (#5058).
 			httpLn.Close()
-			return fmt.Errorf("api: bind HTTPS listener %q: %w", s.httpsServer.Addr, err)
+			return nil, nil, fmt.Errorf("api: bind HTTPS listener %q: %w", s.httpsServer.Addr, err)
 		}
 	}
+	return httpLn, httpsLn, nil
+}
 
+// Start binds the listeners synchronously (returning a bind error with nothing
+// left serving) then serves them in the BACKGROUND until ctx is cancelled,
+// returning nil once BOTH listeners are bound (#5866). This is the
+// make-before-break entry point: the managementReconciler binds the new endpoint
+// with Start (knowing it is live) BEFORE cancelling the old server's context, so
+// the management plane is never unreachable. Wait blocks until the background
+// serve goroutine (and its bounded drain) exits.
+func (s *Server) Start(ctx context.Context) error {
+	httpLn, httpsLn, err := s.bindListeners()
+	if err != nil {
+		return err
+	}
+	s.serveDone = make(chan struct{})
+	go func() {
+		defer close(s.serveDone)
+		if err := s.serveBound(ctx, httpLn, httpsLn); err != nil {
+			slog.Error("API server exited with error", "err", err)
+		}
+	}()
+	return nil
+}
+
+// Wait blocks until the background serve goroutine started by Start has fully
+// exited (listeners closed, in-flight requests drained, sibling goroutines
+// joined). It is a no-op if Start was never called.
+func (s *Server) Wait() {
+	if s.serveDone != nil {
+		<-s.serveDone
+	}
+}
+
+// ReplaceAuth atomically swaps the live authentication snapshot (#5866). A day-2
+// web-management commit that enables, tightens, or REVOKES credentials on an
+// UNCHANGED bind calls this: the middleware reads the new snapshot on the next
+// request, so a revoked credential is rejected immediately — no listener bounce,
+// no restart, no window. a==nil disables auth (only reached on a loopback bind;
+// the #4047/#5127 clamp forces a non-loopback no-auth bind through a rebuild).
+func (s *Server) ReplaceAuth(a *AuthConfig) {
+	s.auth.Store(a)
+}
+
+// AuthSnapshotForTest returns the live auth snapshot (#5866). Test-only: it lets
+// a cross-package test (pkg/daemon managementReconciler) assert that a
+// same-endpoint reconcile published the new snapshot in place. Dep-free (no
+// test-only imports leak into the production binary).
+func (s *Server) AuthSnapshotForTest() *AuthConfig { return s.auth.Load() }
+
+// HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
+// server is HTTP-only (#5866). Test-only: lets a cross-package test assert that a
+// TLS-material reconcile rebuilds the listener with a FRESH certificate.
+func (s *Server) HTTPSCertForTest() *tls.Certificate {
+	if s.httpsServer == nil || s.httpsServer.TLSConfig == nil || len(s.httpsServer.TLSConfig.Certificates) == 0 {
+		return nil
+	}
+	return &s.httpsServer.TLSConfig.Certificates[0]
+}
+
+// dynamicAuthMiddleware wraps next with the LIVE auth snapshot (#5866): it reads
+// s.auth atomically per request so a ReplaceAuth swap takes effect immediately.
+// A nil snapshot passes through (no auth) — the loopback clamp guarantees such a
+// listener is loopback-only. It enforces byte-for-byte the same checks as the
+// static authMiddleware via the shared authCheck.
+func (s *Server) dynamicAuthMiddleware(metricsRequireAuth bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := s.auth.Load()
+		if a == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if authCheck(*a, metricsRequireAuth, r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeAuthChallenge(w)
+	})
+}
+
+// serveBound serves already-bound listeners until ctx is cancelled or a listener
+// terminates with an error, then shuts BOTH down under a bounded 5s drain and
+// joins both serve goroutines before returning (#5058 lifecycle, extracted for
+// the #5866 Start/Run split).
+func (s *Server) serveBound(ctx context.Context, httpLn, httpsLn net.Listener) error {
 	// Both listeners are bound. Serve each in its own goroutine; a fatal
 	// Serve error is reported once on the buffered channel.
 	errCh := make(chan error, 2)

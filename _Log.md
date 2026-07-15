@@ -48651,3 +48651,29 @@ top.
   -race ./pkg/upgrade/ GREEN; the ARMED-first revert (drop ARMING/readback)
   proven RED via -overlay on Test 1 (re-arm + self-recovery) and Test 2
   (readback mismatch), with Test 3 (no-regression) still green.
+
+## 2026-07-15 — #5866 day-2 web-management listener + auth reconcile
+
+- **Timestamp**: 2026-07-15
+- **Action**: The HTTP/HTTPS management server was constructed once at startup
+  and never reconciled, so a committed web-management change (bind/port/TLS/auth,
+  e.g. a REVOKED credential) sat inert until a daemon restart. Added a
+  managementReconciler that, on every commit, atomically replaces the live
+  listener + auth snapshot: same-endpoint auth change → live atomic ReplaceAuth
+  (no rebind); endpoint change → make-before-break rebind (bind new before
+  closing old); failed new bind → retain old listener + surface error (fail-safe,
+  retry debt). Wired into applyConfigLocked next to reconcileSNMP (early, before
+  the dataplane apply).
+- **File(s)**: pkg/api/server.go (atomic auth snapshot + dynamicAuthMiddleware +
+  ReplaceAuth + Start/bindListeners/serveBound + ListenFunc seam + AuthSnapshot/
+  HTTPSCert ForTest accessors), pkg/api/auth.go (extract shared authCheck +
+  writeAuthChallenge), pkg/daemon/management.go (NEW — managementReconciler),
+  pkg/daemon/daemon.go (d.mgmt field), pkg/daemon/daemon_run.go (startHTTPServer
+  hands listener lifecycle to the reconciler + shutdown drain), pkg/daemon/
+  daemon_apply.go (reconcileWebManagement call after reconcileSNMP),
+  pkg/api/server_authswap_5866_test.go + pkg/daemon/management_5866_test.go (NEW
+  fail-on-revert tests), pkg/api/README.md + pkg/daemon/README.md (lifecycle).
+- **Validation**: go build ./... clean; go vet ./pkg/daemon/ ./pkg/api/ clean;
+  go test -race ./pkg/api/ ./pkg/daemon/ GREEN. Fail-on-revert overlays proven
+  RED: (A) capture auth once → live-swap test RED (revoked cred still 200);
+  (B) close-old-before-bind-new → coexistence + retain-old tests RED.

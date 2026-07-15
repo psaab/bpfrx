@@ -292,6 +292,29 @@ under the daemon's errgroup. Nothing else imports this package.
   length mismatch (reveals length, not content — acceptable). Pinned by
   `auth_consttime_4157_test.go`, including an AST regression guard that fails
   if any auth path reverts to a bare `cfg.APIKeys[...]` lookup.
+- **Day-2 listener + auth reconcile (#5866).** The management server used to be
+  constructed ONCE at daemon startup and never reconciled, so a committed
+  web-management change (bind address / port / TLS on/off / api-auth) reported
+  success while the process kept enforcing the old policy until a restart —
+  revoked or tightened credentials stayed usable, a bind removal left the API on
+  the old address. Two mechanisms close this:
+  - The authentication snapshot is a live `atomic.Pointer[AuthConfig]` (`s.auth`)
+    read per request by `dynamicAuthMiddleware`; `ReplaceAuth` swaps it, so a
+    revoked/tightened credential is rejected on the NEXT request with no listener
+    bounce and no restart. The `authCheck` core is shared with the static
+    `authMiddleware`, so the swap enforces byte-identical semantics (the #4157
+    constant-time + #5636 empty-secret guards, `/health` + loopback-`/metrics`
+    exemptions).
+  - `Start(ctx)` binds the listeners SYNCHRONOUSLY (returning a bind error with
+    nothing serving) then serves in the background — the make-before-break
+    primitive the daemon's `managementReconciler` (`pkg/daemon/management.go`)
+    uses to bind a NEW endpoint before retiring the old, so a bind/port/TLS
+    change never leaves a window with no management listener and a failed new
+    bind fail-closes to the retained previous listener. `bindListeners` binds via
+    `Config.ListenFunc` (default `net.Listen`) so tests inject a fake factory.
+    Pinned by `server_authswap_5866_test.go` (live auth swap) +
+    `pkg/daemon/management_5866_test.go` (bind change / TLS rebuild / auth swap /
+    bind-failure retain-old).
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

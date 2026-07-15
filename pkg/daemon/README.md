@@ -153,6 +153,29 @@ cluster (deferred to `/triple-review` per #4407, because regrouping it
 touches apply-ordering rather than being inert field motion). These are the
 natural stopping point for the mechanical decomposition.
 
+### Management-listener lifecycle (`managementReconciler`, #5866)
+
+`d.mgmt` (`management.go`) owns the HTTP/HTTPS management-listener lifecycle so a
+day-2 web-management commit actually replaces the live listener and the
+authentication snapshot instead of leaving the boot-time server enforcing the
+old bind/port/TLS/auth until a restart (a revoked credential stayed usable). It
+mirrors `reconcileSNMP`: `reconcileWebManagement` runs EARLY in
+`applyConfigLocked` — before the dataplane apply that can abort — so a committed
+credential revocation is enforced even on an apply that returns early
+(`store.Commit` has already promoted the config). Reconcile discipline:
+
+- **Auth change on an unchanged endpoint** → live `api.Server.ReplaceAuth`
+  (atomic snapshot swap, effective next request, no rebind, no window).
+- **Endpoint change** (bind / port / TLS) → **make-before-break**: bind the new
+  listener via `api.Server.Start` (synchronous bind) FIRST, and only once it is
+  serving cancel the old server's context (bounded 5s graceful drain).
+- **Failed new bind** → **fail-safe**: retain the OLD listener (the previous
+  working state, fail-closed — not mgmt-down), leave the endpoint fingerprint
+  unrecorded so the next commit retries (retry debt), and log the error. This
+  does not brick an otherwise-successful commit (same posture as `reconcileSNMP`
+  bind-failure retry). The reconcile is serialized by its mutex and the apply
+  semaphore, so a newer generation never completes behind an older one.
+
 ## Cluster mode
 
 Detected by the presence of `/etc/xpf/node-id` (contents `0` or `1`).

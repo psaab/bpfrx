@@ -716,6 +716,21 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// owns the first start, which honors config-only / bootstrap suppression.
 	d.reconcileSNMP(cfg)
 
+	// #5866: reconcile the live management HTTP/HTTPS listener + authentication
+	// snapshot against the committed web-management config, for the SAME reason
+	// and with the SAME early placement as reconcileSNMP above. The management
+	// server was constructed once at boot and never reconciled, so a committed
+	// bind/port/TLS/api-auth change (e.g. a REVOKED credential) sat inert until a
+	// daemon restart. Placed before the dataplane apply so a committed
+	// credential revocation is enforced even on an apply that aborts early. A
+	// bind-replacement failure is fail-safe (the old listener is retained) and
+	// only logged as retry debt — like reconcileSNMP it does not brick an
+	// otherwise-successful commit.
+	if err := d.reconcileWebManagement(cfg); err != nil {
+		slog.Warn("web-management listener reconcile did not converge; retrying on next commit",
+			"err", err)
+	}
+
 	// #1922 Item 2 bootstrap exit: the FIRST apply of a non-empty config
 	// (an interface-claiming confirmed commit, or a cluster SyncApply from
 	// the primary) leaves bootstrap mode and runs the one-time startup
