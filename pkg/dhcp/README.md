@@ -88,6 +88,22 @@ Acquisition and renewal share one commit path, `commitLease`
 new address, store the lease (and DHCPv6 delegated prefixes), and fire
 the debounced `onAddressChange` callback when content changed.
 
+- **Renewal timer contract (`renewalTimers`, RFC 2131 §4.4.5 / RFC 8415
+  §18.2.4, #5795)**: T1 (renew) fires at **50%** of the lease and T2
+  (rebind) at **87.5%** — `renewalTimers` returns `t1 = lease/2` and
+  `t2Remaining = 3/8·lease` (the additional wait from T1 to T2). There is
+  **no fixed floor**: the ratios are proportional to the lease, so for
+  every positive lease `T1 (50%) < T2 (87.5%) < expiry`, down to the 1s
+  minimum the wire can express (T1 500ms, T2 875ms). A fixed 30s T1 / 1s
+  T2 floor previously pushed T1 past the RFC half-life for any lease under
+  60s and scheduled the renew **at or after expiry** for a lease under 30s
+  (the run loop kept forwarding on an expired binding, then churned into
+  re-acquisition). A **non-positive** lease time is invalid (`ok=false`) —
+  RFC 2131 lease 0 is not the infinite sentinel (that is `0xFFFFFFFF`,
+  overflow-safe via divide-first, #4526); the run loop **fails closed**,
+  abandoning the cycle and re-acquiring, paced by `reacquireBackstop` so a
+  server that keeps granting a 0-second lease cannot become a tight
+  DISCOVER/SOLICIT loop. v4 and v6 share this one definition.
 - **Successful T1 renew / T2 rebind is committed**, and the run loop
   returns to the T1 wait with timers recomputed from the renewed
   lease. Pre-#1777 the renewal result was dead-assigned and the loop
@@ -154,7 +170,7 @@ the debounced `onAddressChange` callback when content changed.
   acquire→renew→rebind→re-acquire transitions and lease preservation)
   is exercised through the `doV4ExchangeForTest` / `doV6ExchangeForTest`
   / `afterForTest` / `waitLinkLocalForTest` seams (#2994), which replace
-  the real socket exchange and the 30 s T1 wait so a test drives the
+  the real socket exchange and the RFC T1/T2 waits so a test drives the
   real `runDHCPv4` / `runDHCPv6` without traffic — see `renew_test.go`.
   The wire builders (`buildV4RenewRequest`, `v4RenewDest`,
   `buildV6RenewMessage`) are pure and unit-tested directly.

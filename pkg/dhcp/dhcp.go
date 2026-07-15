@@ -928,7 +928,27 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 		// Renewal cycle: stay in this loop while T1 renews / T2 rebinds
 		// keep succeeding; break out only to re-acquire from scratch.
 		for {
-			t1, t2Remaining := renewalTimers(committed.LeaseTime)
+			t1, t2Remaining, ok := renewalTimers(committed.LeaseTime)
+			if !ok {
+				// A non-positive lease time is invalid (RFC 2131 lease 0 is
+				// not the infinite sentinel). The lease is unusable: do not
+				// schedule a renewal that would fire after it has already
+				// lapsed — abandon it and re-acquire, paced by
+				// reacquireBackstop so a server that keeps granting a
+				// 0-second lease does not become a tight loop (#5795).
+				slog.Warn("DHCPv4: non-positive lease time, re-acquiring",
+					"interface", ifaceName, "lease_time", committed.LeaseTime)
+				select {
+				case <-m.after(reacquireBackstop):
+				case <-ctx.Done():
+					m.removeAddress(ifaceName, committed)
+					m.mu.Lock()
+					delete(m.leases, key)
+					m.mu.Unlock()
+					return
+				}
+				break
+			}
 
 			// Wait for T1 (50% of lease time) for renewal
 			select {
@@ -1361,7 +1381,28 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 		// Renewal cycle: stay in this loop while T1 renews / T2 rebinds
 		// keep succeeding; break out only to re-acquire from scratch.
 		for {
-			t1, t2Remaining := renewalTimers(committed.LeaseTime)
+			t1, t2Remaining, ok := renewalTimers(committed.LeaseTime)
+			if !ok {
+				// See runDHCPv4: a non-positive lease time is invalid and
+				// must not schedule a renewal past an already-lapsed lease.
+				// Abandon the cycle and re-acquire, paced by
+				// reacquireBackstop (#5795).
+				slog.Warn("DHCPv6: non-positive lease time, re-acquiring",
+					"interface", ifaceName, "lease_time", committed.LeaseTime)
+				select {
+				case <-m.after(reacquireBackstop):
+				case <-ctx.Done():
+					if committed.Address.IsValid() {
+						m.removeAddress(ifaceName, committed)
+					}
+					m.mu.Lock()
+					delete(m.leases, key)
+					delete(m.delegatedPDs, ifaceName)
+					m.mu.Unlock()
+					return
+				}
+				break
+			}
 
 			// Wait for T1
 			select {
