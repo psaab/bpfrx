@@ -48772,3 +48772,28 @@ top.
     missed — verified it now flags monitor.go:348 on revert.
   - **File(s)**: pkg/monitoriface/monitor.go, pkg/monitoriface/monitor_nil_5886_test.go,
     pkg/config/interface_nil_canary_5886_test.go
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5829 fail-closed non-numeric logical-unit id. `interfaces <if>
+    unit <identity>` had no positional key validation, so `unit tenant` passed
+    schema + commit and compileInterfaces silently DISCARDED the whole unit on
+    strconv failure — a unit-level firewall FILTER committed with no enforcement
+    (fail-open). Added one canonical validator config.ValidateLogicalUnit
+    (0..MaxLogicalUnit=16385: rejects non-numeric, negative, overflow,
+    out-of-range) and gated it at two layers: (1) schema — the `unit` node's
+    instance key now carries keyValidator ValidateLogicalUnit so commit/commit
+    check reject the malformed id naming the interface + token (flat-set +
+    hierarchical); (2) compiler — compiler_interfaces.go returns a hard error
+    instead of the bare continue; the tolerant load / peer-sync path
+    (new lenientNonNumericUnit opt on CompileConfigLenient /
+    CompileConfigForNodeLenient) warns + quarantines the unit instead (no silent
+    drop, no misattribution). Valid numeric units (incl. 0 and 16385) compile
+    bit-identically and reach ifc.Units. tunnelid.go's best-effort endpoint-name
+    union compiles leniently to preserve its pre-fix drop behavior.
+    Fail-on-revert proven via -overlay (revert gate + keyValidator → reject +
+    quarantine tests RED). RESIDUAL noted: cross-subsystem unit-reference slots
+    (CoS/zones/routing `.unit` suffix) still untyped — follow-up.
+  - **File(s)**: pkg/config/schema_validators.go, pkg/config/schema_interfaces.go,
+    pkg/config/compiler.go, pkg/config/compiler_interfaces.go,
+    pkg/config/compiler_dispatch.go, pkg/config/tunnelid.go,
+    pkg/config/interface_unit_nonnumeric_5829_test.go, docs/config-schema.md

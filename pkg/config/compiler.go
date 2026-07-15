@@ -1863,6 +1863,22 @@ type compileOpts struct {
 	// lenientFirewallTCPFlags.
 	lenientCoSNumericCodePoint bool
 
+	// lenientNonNumericUnit (#5829) downgrades the malformed logical-unit
+	// identity gate (a non-numeric / negative / overflow `interfaces <if>
+	// unit <id>`) from a hard compile error to a cfg.Warnings entry with the
+	// offending unit quarantined (skipped, its children NOT reattached to any
+	// other unit). Strict commit / commit-check hard-reject so a unit-level
+	// firewall filter cannot commit and then silently vanish (fail-open). Set
+	// ONLY on the tolerant load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient) so a config an older binary already
+	// persisted — which silently dropped the bad unit — still BOOTS, now with
+	// a deterministic warning instead of a silent drop. Same doctrine as
+	// lenientCoSNumericCodePoint. Like the other lenient gates this is an
+	// AST-level compile decision the read-only SchemaValidate walk cannot make
+	// (and since #1319 PR 2 SchemaValidate violations only warn on tolerant
+	// paths anyway).
+	lenientNonNumericUnit bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2013,6 +2029,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
+		lenientNonNumericUnit:                  true,
 	})
 }
 
@@ -2367,6 +2384,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientEventWithinTrigger:              true,
 		lenientFirewallTCPFlags:                true,
 		lenientCoSNumericCodePoint:             true,
+		lenientNonNumericUnit:                  true,
 	})
 }
 
