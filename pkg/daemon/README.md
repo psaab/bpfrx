@@ -605,6 +605,30 @@ never lock an operator out of a remote box it manages.
   (publish-fails-commit + bump-fails-commit fail-on-revert, duplicate-skip /
   helperless / clean-success stay-success, and the `applyTailReconciles` commit-join
   wiring proof).
+  **Routing-rule reconcile fail-closed (#5844, mirroring #5310/#5696):**
+  `applyRoutingRules` reconciles the kernel policy-routing (`ip rule`) table —
+  next-table (`ApplyNextTableRules`), rib-group (`ApplyRibGroupRules`), and
+  PBR/filter-based-forwarding (`ApplyPBRRules`). Each of those managers already
+  RETURNS a fail-closed error (a partial clear/add leaves stale-or-missing
+  cross-VRF policy in the kernel — `#3731`/`#5118`/`#2273`), but
+  `applyRoutingRules` was VOID and LOGGED-and-DROPPED all three, so a commit was
+  acknowledged after a partial reconcile — and the immediately-following
+  `reconcileRouteLeakSnapshot` then canonized that partial live kernel state into
+  the userspace FIB. It now collects the three errors via `errors.Join` (still
+  running every rule type after one fails — fail-closed but COMPLETE) and RETURNS
+  them; `applyConfigLocked` captures it (`routingRuleErr`) and threads it into the
+  tail `errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err,
+  ipsecErr, ifaceErr, routeLeakErr, routingRuleErr)`, so a partial ip-rule
+  reconcile fails the commit closed. The snapshot republish still runs (ordering
+  preserved: the deferred error does not abort it). `BuildPBRRules` *build
+  degradation* is DELIBERATELY not joined — a filter term that cannot be expressed
+  as an `ip rule` is a fail-SAFE under-steer (dropped to the main table, still
+  enforced by the userspace filter path), a representability warning rather than a
+  partial kernel mutation, so fail-closing it would reject configs that commit
+  fine today. Tests: `routing_rule_reconcile_failclosed_5844_test.go` (direct
+  applyRoutingRules fails-closed-and-complete via a `RuleList`-failing
+  `NewManagerWithRuleOpsForTest` fake, clean-config stays-success, and the
+  `applyTailReconciles` commit-join wiring proof).
   **Per-term disposition mirrors userspace (#3427):** `nftRulesFromTerm` maps a
   term's `then` action to the kernel verdict the SAME way the userspace lo0
   evaluator does (`pkg/dataplane/userspace/filters.go` `NextTerm =
