@@ -48651,3 +48651,27 @@ top.
   -race ./pkg/upgrade/ GREEN; the ARMED-first revert (drop ARMING/readback)
   proven RED via -overlay on Test 1 (re-arm + self-recovery) and Test 2
   (readback mismatch), with Test 3 (no-regression) still green.
+
+## 2026-07-15 — #5824 fold: cross-root policy-statement same-name term dedup
+
+- **Timestamp**: 2026-07-15
+- **Action**: Fold the independent-review MINOR on PR #5922. psTermIndex is a
+  LOCAL var in compilePolicyOptions, which runs once PER top-level policy-options
+  AST root (NewParser appends top-level nodes unmerged). Two separate top-level
+  `policy-options {}` roots each defining `policy-statement R { term x }` reused
+  the persisted ps but got a fresh empty termsByName, so term x was DUPLICATED
+  (malformed double route-map) instead of composing. FIX: seed the fresh
+  termsByName from the persisted ps.Terms when it is first created, so a same-name
+  term composes across roots exactly as within a root. Corrected the block
+  comment's inaccurate cross-root persistence claim.
+- **File(s)**: pkg/config/compiler_routing.go (ps.Terms seed + comment fix),
+  pkg/config/compiler_policy_block_merge_5824_test.go (new
+  TestPolicyStatementSameTermAcrossRootsMerges_5824).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ ./pkg/frr/ clean;
+  go test -race ./pkg/config/ ./pkg/frr/ GREEN (all 5 5824 tests). Fail-on-revert:
+  dropping the ps.Terms seed via -overlay makes ONLY the cross-root test RED
+  (len(R.Terms)==2 duplicate); the 4 within-root tests stay green.
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5824 fold — cross-root policy-statement term compose. Seed the per-call psTermIndex from the persisted ps.Terms so a same-name term across SEPARATE top-level policy-options roots composes onto one PolicyTerm instead of duplicating (a malformed double route-map). Corrects the block-merge comment's cross-root claim. Parent RED-on-revert confirmed (neutralize seed → SameTermAcrossRootsMerges_5824 RED, got [x x]).
+  - **File(s)**: pkg/config/compiler_routing.go, pkg/config/compiler_policy_block_merge_5824_test.go

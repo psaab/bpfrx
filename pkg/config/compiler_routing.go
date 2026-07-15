@@ -646,12 +646,17 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 	// each is a distinct AST instance. Flat `set policy-options policy-statement
 	// NAME ...` lines already COMPOSE under one node via SetPath, so hierarchical
 	// must merge the same way or the two shapes diverge. Reuse the existing map
-	// entry AND a per-policy term index that persists ACROSS instances so later
-	// blocks MERGE into the earlier one: new terms append in first-authored ORDER
+	// entry (po.PolicyStatements, which persists across every instance AND across
+	// repeated policy-options roots) AND a per-policy term index so later blocks
+	// MERGE into the earlier one: new terms append in first-authored ORDER
 	// (routing policy is ordered security/route-control state — an earlier reject
 	// term must not be lost or reordered), and a repeated fragment of the SAME
 	// term composes onto the existing PolicyTerm (route-filters / from / then all
-	// accumulate). Mirrors the prefix-list / community merge loops above (#5824).
+	// accumulate). Within ONE policy-options root the term index (psTermIndex,
+	// below) carries the composition across instances; ACROSS separate top-level
+	// policy-options roots (each a distinct compilePolicyOptions call with a fresh
+	// psTermIndex) the composition is re-seeded from the persisted ps.Terms
+	// (#5824). Mirrors the prefix-list / community merge loops above (#5824).
 	//
 	// The pre-#5824 code created a FRESH PolicyStatement per instance and did an
 	// unconditional `po.PolicyStatements[ps.Name] = ps`, so a second same-name
@@ -670,6 +675,18 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		if termsByName == nil {
 			termsByName = make(map[string]*PolicyTerm)
 			psTermIndex[inst.name] = termsByName
+			// #5824 cross-root: psTermIndex is LOCAL to this compilePolicyOptions
+			// call, but compilePolicyOptions runs once PER top-level policy-options
+			// AST root (NewParser appends top-level nodes without merging). So a
+			// second top-level `policy-options {}` root reuses the persisted `ps`
+			// (from po.PolicyStatements) but gets a FRESH, empty termsByName — a
+			// same-name term in that root would append as a DUPLICATE (a malformed
+			// double route-map sequence in FRR) instead of composing. Seed the fresh
+			// index from ps.Terms so a same-name term composes onto the existing
+			// PolicyTerm across roots, exactly as it already does within a root.
+			for _, t := range ps.Terms {
+				termsByName[t.Name] = t
+			}
 		}
 
 		for _, prop := range inst.node.Children {

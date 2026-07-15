@@ -228,3 +228,88 @@ func TestPolicyStatementSingleBlockUnchanged_5824(t *testing.T) {
 		t.Fatalf("single-block default action = %q, want reject", ps.DefaultAction)
 	}
 }
+
+// twoRootHierarchical: TWO SEPARATE top-level `policy-options {}` roots (not two
+// blocks in one root), each defining term x of policy-statement R — root 1 the
+// from-match, root 2 the then-action. NewParser appends top-level nodes without
+// merging, so compilePolicyOptions runs once PER root with a FRESH psTermIndex.
+const twoRootHierarchical = `policy-options {
+    policy-statement R {
+        term x {
+            from {
+                protocol static;
+            }
+        }
+    }
+}
+policy-options {
+    policy-statement R {
+        term x {
+            then reject;
+        }
+    }
+}
+`
+
+// Cross-root (#5824 fold): a same-name term across SEPARATE top-level
+// policy-options roots must COMPOSE to ONE term, not duplicate. psTermIndex is
+// local to each compilePolicyOptions call, so the second root gets a fresh empty
+// index; without seeding it from the persisted ps.Terms, term x is appended a
+// SECOND time (root-1's fragment on term#0, root-2's on term#1) — FRR then
+// renders a malformed double `route-map R` sequence. It must be ONE composed
+// term, and hierarchical must equal flat-set for this shape.
+//
+// FAIL-ON-REVERT: drop the `for _, t := range ps.Terms { termsByName[t.Name]=t }`
+// seed and len(R.Terms)==2 (duplicate) — this test goes RED.
+func TestPolicyStatementSameTermAcrossRootsMerges_5824(t *testing.T) {
+	tree, err := NewParser(twoRootHierarchical).Parse()
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	cfg, cerr := CompileConfig(tree)
+	if cerr != nil {
+		t.Fatalf("compile: %v", cerr)
+	}
+	ps := cfg.PolicyOptions.PolicyStatements["R"]
+	if ps == nil {
+		t.Fatal("policy-statement R missing from compiled config")
+	}
+	if len(ps.Terms) != 1 {
+		t.Fatalf("a same-name term across SEPARATE top-level policy-options roots must compose "+
+			"to ONE term, got %v (a duplicate renders a malformed double route-map) — #5824 cross-root",
+			termNames(ps))
+	}
+	x := ps.Terms[0]
+	if x.Name != "x" {
+		t.Fatalf("merged term name = %q, want x", x.Name)
+	}
+	if len(x.FromProtocols) != 1 || x.FromProtocols[0] != "static" {
+		t.Fatalf("root-1 from-match must survive the cross-root compose, got %v", x.FromProtocols)
+	}
+	if x.Action != "reject" {
+		t.Fatalf("root-2 then-action must compose onto the SAME term, got %q", x.Action)
+	}
+
+	// Hierarchical (two roots) must equal flat-set (which already composes under
+	// one node via SetPath) for this shape.
+	fTree := buildFilterTree(t,
+		"set policy-options policy-statement R term x from protocol static",
+		"set policy-options policy-statement R term x then reject",
+	)
+	fCfg, ferr := CompileConfig(fTree)
+	if ferr != nil {
+		t.Fatalf("compile flat: %v", ferr)
+	}
+	fps := fCfg.PolicyOptions.PolicyStatements["R"]
+	if fps == nil || len(fps.Terms) != 1 {
+		t.Fatalf("flat-set baseline must be ONE term, got %v", termNames(fps))
+	}
+	if hn, fn := termNames(ps), termNames(fps); len(hn) != len(fn) || hn[0] != fn[0] {
+		t.Fatalf("cross-root hierarchical vs flat term set diverged: %v vs %v", hn, fn)
+	}
+	if ps.Terms[0].Action != fps.Terms[0].Action ||
+		len(ps.Terms[0].FromProtocols) != len(fps.Terms[0].FromProtocols) {
+		t.Fatalf("cross-root hierarchical term diverged from flat: action %q vs %q, from %v vs %v",
+			ps.Terms[0].Action, fps.Terms[0].Action, ps.Terms[0].FromProtocols, fps.Terms[0].FromProtocols)
+	}
+}
