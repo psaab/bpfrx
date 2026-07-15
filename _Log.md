@@ -30,6 +30,66 @@
   pkg/daemon/route_leak_snapshot_failclosed_5696_test.go (Edit, arity),
   pkg/daemon/device_map_teardown_failclosed_5309_test.go (Edit, arity),
   pkg/daemon/README.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5833 (bug/audit/security): quarantine SNMP community on malformed clients token (lenient fail-closed)
+- **Timestamp**: 2026-07-15 (fix/5833-snmp-lenient-quarantine)
+- **Action**: #4834 fixed STRICT-commit rejection of malformed SNMP `clients`
+  tokens but its LENIENT load/peer-sync branch preserved the pre-fix runtime
+  behaviour, which is FAIL-OPEN for the `restrict` typo: `clients 0.0.0.0/0
+  restric` (missing 't') detaches the modifier, so `0.0.0.0/0` survives as an
+  unrestricted allow and compileClientNets silently drops only the bad token —
+  on restart/upgrade/peer-sync the community answers from every IPv4 source.
+  Fix: on the lenient path, when a community's `clients` list carries ANY
+  malformed token, QUARANTINE that community to deny-all instead of keeping the
+  surviving broad allow. validateSNMPClients now also returns a `malformed`
+  flag; compileSNMP records it per-community (sticky across #5472 same-name
+  merge blocks so a later well-formed block cannot reopen it) and overrides the
+  community's clientNets enforcement cache with snmpQuarantineClientNets()
+  (explicit `0.0.0.0/0 restrict` + `::/0 restrict` → AllowsSource denies every
+  source). Only the derived clientNets cache is overridden, NOT comm.Clients
+  (the config surface marshaled to the API / hashed by the SNMP reconcile), so
+  the operator's config text is preserved for display/change-detection; only
+  runtime enforcement is forced closed. The rest of the config (other
+  communities, other stanzas) still loads with a warning. Strict commit path
+  unchanged (still hard-rejects). Well-formed communities are not
+  quarantined (no false positives).
+- **Validation**: gofmt clean; go build ./... + go vet ./pkg/config + go test
+  ./pkg/config green. Fail-on-revert: neutralizing the clientNets override makes
+  the quarantined community allow 8.8.8.8/10.1.2.3/192.168.1.1 → RED; restored →
+  GREEN. New tests assert deny-all + rest-of-config-loads + no-false-quarantine;
+  strict-reject tests unchanged.
+- **File(s)**: pkg/config/snmp_clients.go (Edit),
+  pkg/config/compiler_system.go (Edit),
+  pkg/config/snmp_clients_4834_test.go (Edit),
+  docs/feature-coverage.md (Edit), _Log.md (Edit)
+## 2026-07-15 — #5811 (bug/audit/security): global-only clear commands enforce exact arity
+- **Timestamp**: 2026-07-15 (fix/5811-clear-exact-arity)
+- **Action**: Global-only `clear` handlers (whose backend action can ONLY clear
+  everything, no scoped variant) recognized a fixed keyword prefix and silently
+  DISCARDED every trailing token, then issued the unscoped mutation. So a
+  scoped-LOOKING command — `clear arp 192.0.2.10`, `clear ipv6 neighbors
+  interface ge-0-0-0`, `clear interfaces statistics ge-0-0-0`, `clear security
+  nat statistics rule web`, `clear security nat source persistent-nat-table pool
+  p1`, `clear security counters zone untrust`, `clear firewall all filter edge`,
+  `clear system config-lock session 42` — reported success while wiping the
+  ENTIRE cache/counter/table. Added a `requireClearNoScope(cmd, clears, extra)`
+  helper (byte-identical copy in `cmd/cli/clear.go` and `pkg/cli/cli_clear.go`)
+  that REJECTS any trailing operand with an "unexpected argument(s) ...; this
+  command clears X and takes no scope" error BEFORE any mutation. Wired it into
+  every global-only clear on BOTH parsers, restoring arity parity (the in-process
+  `policies hit-count` now matches the remote's #5570 guard). Legit scoped clears
+  (`clear security flow session <filter>`, `clear dhcp client-identifier
+  interface <name>`) are untouched. Follow-up candidate (out of #5811 scope): the
+  in-process `clear dhcp client-identifier` does not mirror the remote's #4883-E
+  malformed-selector guard.
+- **Validation**: gofmt clean; go build ./... + go test ./cmd/cli/ ./pkg/cli/
+  -count=1 green; go vet clean apart from a pre-existing cli.go unreachable-code
+  note in an untouched file. Fail-on-revert proven via overlay: neutralizing
+  requireClearNoScope (discard suffix) flips the reject tests RED on BOTH parsers
+  (no error returned; the dp/RPC mutation runs).
+- **File(s)**: cmd/cli/clear.go (Edit), pkg/cli/cli_clear.go (Edit),
+  cmd/cli/clear_exact_arity_5811_test.go (Write),
+  pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
+  _Log.md (Edit)
 
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
