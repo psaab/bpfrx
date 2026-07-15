@@ -48473,3 +48473,34 @@ top.
 - **Timestamp**: 2026-07-15
 - **Action**: #5850 (security) — gRPC MonitorPacketDrop called EventBuffer.Subscribe(256) directly, bypassing the defaultMaxSubscribers=64 admission cap (only TrySubscribe enforces it). The primary gRPC listener is loopback-clamped but UNAUTHENTICATED, so any local process could open an unbounded number of packet-drop streams — each adding a buffered channel AND expanding the synchronous O(N) per-event fan-out — exhausting memory + event-production CPU (a DoS distinct from #4484 L-2, which capped only REST SSE and wrongly treated gRPC as inherently bounded). Fixed server_diag_monitor.go MonitorPacketDrop to use TrySubscribe(256); on nil (cap reached) return status.Error(codes.ResourceExhausted, "too many concurrent event subscribers") BEFORE the defer sub.Close() and before streaming — mirroring the REST SSE 503 (pkg/api/sse.go). No cap/fan-out change — admission gate only; the existing defer sub.Close() (Subscription.Close → unsubscribe) frees the slot on teardown. Tests (new monitor_packet_drop_subscriber_cap_5850_test.go): fill the buffer to cap via TrySubscribe, then MonitorPacketDrop is rejected with ResourceExhausted (TestMonitorPacketDropRejectsOverCap_5850); a stream that tears down frees its slot (TestMonitorPacketDropTeardownFreesSlot_5850, goroutine + ctx cancel). Under-cap streaming is already covered by the existing MonitorPacketDrop match tests (they run against the new TrySubscribe path). Fail-on-revert verified: reverting to Subscribe admits the over-cap stream (returns after the bounded ctx timeout, not ResourceExhausted) → RED; restore → GREEN. gofmt/go vet/go build clean; go test -race ./pkg/grpcapi/ ./pkg/logging/ green. Doc: pkg/logging/README.md subscriber-cap paragraph corrected (request-created gRPC MonitorPacketDrop now uses TrySubscribe, not just REST SSE).
 - **File(s)**: pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/monitor_packet_drop_subscriber_cap_5850_test.go, pkg/logging/README.md
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5822 (bug): config AST CopyPath could not resolve an existing
+  non-first same-keyword destination parent (and silently duplicated on
+  collision). CopyPath (pkg/config/ast_edit.go) resolved the destination parent
+  via insertNode (pkg/config/ast.go), whose per-level loop broke on the FIRST
+  child whose first keyword matched (matchNodeKeys returns 1 on a keyword-only
+  partial match) — so `copy ... to policy Z` with siblings [A B Z] descended
+  into policy A, could not find the rest of the dest-parent path, and failed
+  "destination parent ... not found" (or, on a resolvable existing target,
+  silently appended a duplicate). Fixed by routing CopyPath's dest-parent
+  resolution through childrenAtPath (longest-consumed-match) — the SAME resolver
+  RenamePath uses — unifying the two edit paths onto one navigator (the
+  divergence WAS the bug, per the issue). Added a collision guard (reject a copy
+  onto an existing same-identity target with keysEqual, like RenamePath) and
+  made it atomic (resolve parent + collision-check fully, THEN clone+append — a
+  failed copy leaves the tree byte-for-byte unchanged). A missing destination
+  parent (and a missing source) now wraps config.ErrPathNotFound so callers can
+  errors.Is it. Removed the now-dead insertNode helper (its only caller was
+  CopyPath).
+  **File(s)**: pkg/config/ast_edit.go, pkg/config/ast.go,
+  pkg/config/copypath_sibling_5822_test.go,
+  pkg/configstore/copy_sibling_5822_test.go, docs/config-schema.md, _Log.md
+  **Validation**: `go build ./...`; `go vet ./pkg/config/ ./pkg/configstore/`
+  clean; `go test -race ./pkg/config/ ./pkg/configstore/` green. Fail-on-revert:
+  restoring origin/master's ast.go+ast_edit.go (insertNode) flips the new tests
+  RED — non-first (app2/app3) + nested + integration copies error "destination
+  parent ... not found"; collision copy silently succeeds+duplicates;
+  missing-parent error is not ErrPathNotFound-wrapped. first-sibling (app1) is a
+  passing control. (Used a fresh GOCACHE=/dev/shm/cache5822 — shared cache is
+  contaminated.)
