@@ -285,10 +285,23 @@ type Server struct {
 	// ReplaceAuth swaps it; a bind-address/port/TLS change instead goes through a
 	// make-before-break listener rebuild (managementReconciler).
 	auth atomic.Pointer[AuthConfig]
-	// serveDone is closed when the background serve goroutine started by Start
-	// exits (#5866); Wait blocks on it so a swapped-out or shutting-down server's
-	// listeners+goroutines are fully drained before the daemon joins.
-	serveDone chan struct{}
+	// #5866 per-listener lifecycle: the HTTP and HTTPS listeners are managed
+	// INDEPENDENTLY so a day-2 TLS enable/disable or HTTPS-bind change rebinds
+	// ONLY the HTTPS leg while the live HTTP listener keeps serving (and an HTTP
+	// bind change rebinds only the HTTP leg). Rebinding the whole server would
+	// re-bind a socket the retiring server still holds (EADDRINUSE), so a same-
+	// port change could never converge — the bug this replaces. sharedBase is the
+	// pre-auth mux+collector+CSRF handler both legs wrap (per-listener auth gate
+	// via listenerHandler), so the #4162 shared scrape limiter / session cache is
+	// preserved across a rebind. certGen mints a fresh self-signed cert on each
+	// HTTPS (re)bind.
+	sharedBase http.Handler
+	certGen    func() (tls.Certificate, error)
+	lifeMu     sync.Mutex      // guards httpLeg/httpsLeg/rootCtx across reconciles
+	rootCtx    context.Context // daemon lifetime; every leg drains on its cancel
+	wg         sync.WaitGroup  // joins EVERY serve goroutine (live + retiring legs)
+	httpLeg    *listenerLeg    // live HTTP listener leg (nil = not started / HTTP off)
+	httpsLeg   *listenerLeg    // live HTTPS listener leg (nil = HTTPS off)
 	// listen is the listener factory (#5866): Config.ListenFunc or net.Listen. A
 	// test injects a fake so the make-before-break reconcile is exercised without
 	// binding real ports.
@@ -549,13 +562,43 @@ func NewServer(cfg Config) *Server {
 	// without rebinding. metricsRequireAuth is fixed per listener (its bind
 	// address never changes for a given Server; a bind change goes through the
 	// make-before-break rebuild, not this swap).
-	listenerHandler := func(addr string) http.Handler {
-		return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), sharedBase)
+	// #5866: retain the pre-auth base handler + the cert generator so a per-leg
+	// rebind (ReconcileHTTP/ReconcileHTTPS) can rebuild a single listener's
+	// http.Server for a new bind address without disturbing the sibling leg.
+	s.sharedBase = sharedBase
+	s.certGen = generateSelfSignedCert
+
+	if cfg.Addr != "" {
+		s.httpServer = s.buildHTTPServer(cfg.Addr)
 	}
 
-	s.httpServer = &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           listenerHandler(cfg.Addr),
+	// Set up HTTPS server with auto-generated self-signed certificate
+	if cfg.TLS && cfg.HTTPSAddr != "" {
+		if hs, err := s.buildHTTPSServer(cfg.HTTPSAddr); err != nil {
+			slog.Warn("failed to generate self-signed certificate", "err", err)
+		} else {
+			s.httpsServer = hs
+		}
+	}
+
+	return s
+}
+
+// listenerHandler wraps the shared pre-auth base with the per-listener auth gate
+// for a bind address (#4162/#5866): only a literal loopback bind leaves /metrics
+// open when auth is configured. The dynamic middleware reads the live auth
+// snapshot per request, so ReplaceAuth needs no rebind.
+func (s *Server) listenerHandler(addr string) http.Handler {
+	return s.dynamicAuthMiddleware(!isLoopbackBindAddr(addr), s.sharedBase)
+}
+
+// buildHTTPServer constructs a fresh HTTP *http.Server bound-for addr with the
+// per-listener handler (#5866). Used at construction and by a per-leg HTTP
+// rebind.
+func (s *Server) buildHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.listenerHandler(addr),
 		ReadHeaderTimeout: apiReadHeaderTimeout,
 		ReadTimeout:       apiReadTimeout,
 		IdleTimeout:       apiIdleTimeout,
@@ -563,30 +606,29 @@ func NewServer(cfg Config) *Server {
 		// WriteTimeout intentionally unset — see the const block above (SSE
 		// streams + large scrapes must not be severed).
 	}
+}
 
-	// Set up HTTPS server with auto-generated self-signed certificate
-	if cfg.TLS && cfg.HTTPSAddr != "" {
-		tlsCert, err := generateSelfSignedCert()
-		if err != nil {
-			slog.Warn("failed to generate self-signed certificate", "err", err)
-		} else {
-			s.httpsServer = &http.Server{
-				Addr:              cfg.HTTPSAddr,
-				Handler:           listenerHandler(cfg.HTTPSAddr),
-				ReadHeaderTimeout: apiReadHeaderTimeout,
-				ReadTimeout:       apiReadTimeout,
-				IdleTimeout:       apiIdleTimeout,
-				MaxHeaderBytes:    apiMaxHeaderBytes,
-				// WriteTimeout intentionally unset — see the const block above.
-				TLSConfig: &tls.Config{
-					Certificates: []tls.Certificate{tlsCert},
-					MinVersion:   tls.VersionTLS12,
-				},
-			}
-		}
+// buildHTTPSServer constructs a fresh HTTPS *http.Server bound-for addr with a
+// newly generated self-signed certificate (#5866). A cert-generation failure is
+// returned so the caller retains the previous leg (fail-closed).
+func (s *Server) buildHTTPSServer(addr string) (*http.Server, error) {
+	tlsCert, err := s.certGen()
+	if err != nil {
+		return nil, err
 	}
-
-	return s
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.listenerHandler(addr),
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		IdleTimeout:       apiIdleTimeout,
+		MaxHeaderBytes:    apiMaxHeaderBytes,
+		// WriteTimeout intentionally unset — see the const block above.
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		},
+	}, nil
 }
 
 // Run starts the HTTP (and optionally HTTPS) server and blocks until ctx is
@@ -634,36 +676,8 @@ func (s *Server) bindListeners() (httpLn, httpsLn net.Listener, err error) {
 	return httpLn, httpsLn, nil
 }
 
-// Start binds the listeners synchronously (returning a bind error with nothing
-// left serving) then serves them in the BACKGROUND until ctx is cancelled,
-// returning nil once BOTH listeners are bound (#5866). This is the
-// make-before-break entry point: the managementReconciler binds the new endpoint
-// with Start (knowing it is live) BEFORE cancelling the old server's context, so
-// the management plane is never unreachable. Wait blocks until the background
-// serve goroutine (and its bounded drain) exits.
-func (s *Server) Start(ctx context.Context) error {
-	httpLn, httpsLn, err := s.bindListeners()
-	if err != nil {
-		return err
-	}
-	s.serveDone = make(chan struct{})
-	go func() {
-		defer close(s.serveDone)
-		if err := s.serveBound(ctx, httpLn, httpsLn); err != nil {
-			slog.Error("API server exited with error", "err", err)
-		}
-	}()
-	return nil
-}
-
-// Wait blocks until the background serve goroutine started by Start has fully
-// exited (listeners closed, in-flight requests drained, sibling goroutines
-// joined). It is a no-op if Start was never called.
-func (s *Server) Wait() {
-	if s.serveDone != nil {
-		<-s.serveDone
-	}
-}
+// Start / Wait / ReconcileHTTP / ReconcileHTTPS (the per-listener make-before-
+// break lifecycle) live in listener.go (#5866).
 
 // ReplaceAuth atomically swaps the live authentication snapshot (#5866). A day-2
 // web-management commit that enables, tightens, or REVOKES credentials on an
@@ -685,10 +699,18 @@ func (s *Server) AuthSnapshotForTest() *AuthConfig { return s.auth.Load() }
 // server is HTTP-only (#5866). Test-only: lets a cross-package test assert that a
 // TLS-material reconcile rebuilds the listener with a FRESH certificate.
 func (s *Server) HTTPSCertForTest() *tls.Certificate {
-	if s.httpsServer == nil || s.httpsServer.TLSConfig == nil || len(s.httpsServer.TLSConfig.Certificates) == 0 {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	// Read the LIVE HTTPS leg (post-reconcile), not the construction template, so
+	// a TLS-material rebind's fresh cert is observed (#5866).
+	srv := s.httpsServer
+	if s.httpsLeg != nil {
+		srv = s.httpsLeg.srv
+	}
+	if srv == nil || srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
 		return nil
 	}
-	return &s.httpsServer.TLSConfig.Certificates[0]
+	return &srv.TLSConfig.Certificates[0]
 }
 
 // dynamicAuthMiddleware wraps next with the LIVE auth snapshot (#5866): it reads

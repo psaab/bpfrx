@@ -305,16 +305,27 @@ under the daemon's errgroup. Nothing else imports this package.
     `authMiddleware`, so the swap enforces byte-identical semantics (the #4157
     constant-time + #5636 empty-secret guards, `/health` + loopback-`/metrics`
     exemptions).
-  - `Start(ctx)` binds the listeners SYNCHRONOUSLY (returning a bind error with
-    nothing serving) then serves in the background — the make-before-break
-    primitive the daemon's `managementReconciler` (`pkg/daemon/management.go`)
-    uses to bind a NEW endpoint before retiring the old, so a bind/port/TLS
-    change never leaves a window with no management listener and a failed new
-    bind fail-closes to the retained previous listener. `bindListeners` binds via
-    `Config.ListenFunc` (default `net.Listen`) so tests inject a fake factory.
-    Pinned by `server_authswap_5866_test.go` (live auth swap) +
-    `pkg/daemon/management_5866_test.go` (bind change / TLS rebuild / auth swap /
-    bind-failure retain-old).
+  - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
+    make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
+    `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
+    neither touches the sibling. This is the fix for the earlier whole-server
+    rebuild: enabling TLS keeps the HTTP bind, so re-binding the whole server
+    re-bound the still-held HTTP socket and failed `EADDRINUSE` (Go sets
+    `SO_REUSEADDR`, not `SO_REUSEPORT`), and the TLS change could never converge
+    without a restart — the same collision hit an HTTP-addr change that left the
+    HTTPS bind unchanged. Each leg binds the new socket and serves it BEFORE
+    retiring the old (no unreachable window on that plane, no double-bind of an
+    unchanged socket); a bind (or HTTPS cert) failure fail-closes to the retained
+    previous leg. `Start(ctx)` binds HTTP synchronously (fail-closed if it fails)
+    and HTTPS best-effort (a boot HTTPS failure leaves HTTP up, retried next
+    commit). `Wait()` joins every live + retiring leg goroutine on shutdown.
+    Listeners bind via `Config.ListenFunc` (default `net.Listen`) so tests inject
+    a fake factory that models `EADDRINUSE`. Pinned by
+    `server_authswap_5866_test.go` (live auth swap) +
+    `pkg/daemon/management_5866_test.go` (HTTP-bind change, TLS enable/disable/
+    re-enable, HTTPS-bind-only change, HTTP-change-keeps-HTTPS, auth swap,
+    bind-failure retain-old). `Run`/`serveBound` remain the single-lifecycle test
+    entry point.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

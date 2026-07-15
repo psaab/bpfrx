@@ -166,15 +166,27 @@ credential revocation is enforced even on an apply that returns early
 
 - **Auth change on an unchanged endpoint** → live `api.Server.ReplaceAuth`
   (atomic snapshot swap, effective next request, no rebind, no window).
-- **Endpoint change** (bind / port / TLS) → **make-before-break**: bind the new
-  listener via `api.Server.Start` (synchronous bind) FIRST, and only once it is
-  serving cancel the old server's context (bounded 5s graceful drain).
-- **Failed new bind** → **fail-safe**: retain the OLD listener (the previous
-  working state, fail-closed — not mgmt-down), leave the endpoint fingerprint
-  unrecorded so the next commit retries (retry debt), and log the error. This
-  does not brick an otherwise-successful commit (same posture as `reconcileSNMP`
-  bind-failure retry). The reconcile is serialized by its mutex and the apply
-  semaphore, so a newer generation never completes behind an older one.
+- **Endpoint change** → reconcile ONLY the listener leg that changed, PER LEG:
+  an HTTP-bind change make-before-break rebinds only the HTTP leg
+  (`api.Server.ReconcileHTTP`); a TLS enable/disable or HTTPS-bind change rebinds
+  only the HTTPS leg (`api.Server.ReconcileHTTPS`) and never touches the live
+  HTTP listener. The whole-server rebuild it replaces re-bound the retained HTTP
+  socket on a TLS enable (`EADDRINUSE`, since `SO_REUSEADDR` ≠ `SO_REUSEPORT`),
+  so a TLS change could never converge without a restart. Each leg is
+  make-before-break inside `api.Server` (new socket serving before the old
+  retires — no unreachable window, no double-bind of an unchanged socket).
+- **Failed leg (re)bind** → **fail-safe**: retain THAT leg's previous listener
+  (fail-closed — not mgmt-down), leave its fingerprint field unrecorded so the
+  next commit retries (retry debt), and log the error. This does not brick an
+  otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
+  retry).
+- **Auth ordering on a combined change**: the auth snapshot is published only
+  once every leg is at its desired bind, so the live auth policy always matches
+  the live binds. An auth-only change publishes immediately; a combined change
+  whose bind failed defers the auth swap to the retry (applying a possibly-nil-
+  on-loopback auth to a retained non-loopback listener would fail OPEN). The
+  reconcile is serialized by its mutex and the apply semaphore, so a newer
+  generation never completes behind an older one.
 
 ## Cluster mode
 

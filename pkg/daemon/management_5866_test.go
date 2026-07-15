@@ -64,6 +64,15 @@ func (r *fakeReg) listen(network, addr string) (net.Listener, error) {
 	if r.failAddr[addr] {
 		return nil, fmt.Errorf("fake bind refused: %s", addr)
 	}
+	// #5866: model EADDRINUSE. Real net.Listen (Go sets SO_REUSEADDR, NOT
+	// SO_REUSEPORT) rejects a second LISTEN on an addr that is still open. The
+	// old whole-server rebuild re-bound the retained HTTP socket on a TLS enable
+	// and would hit exactly this; the per-listener fix binds ONLY the changed
+	// leg, so it never re-binds a still-open sibling. A closed addr may be
+	// re-bound (enable -> disable -> re-enable on the same HTTPS port).
+	if ln, ok := r.byAddr[addr]; ok && ln.isOpen() {
+		return nil, fmt.Errorf("fake bind: listen tcp %s: bind: address already in use", addr)
+	}
 	priorsOpen := true
 	for a, ln := range r.byAddr {
 		if a != addr && !ln.isOpen() {
@@ -264,6 +273,113 @@ func TestMgmtReconcileBindFailureRetainsOld_5866(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if !old.isOpen() {
 		t.Fatal("the OLD listener closed asynchronously after a failed replacement (#5866)")
+	}
+}
+
+// #5866 per-leg independence: a TLS enable/disable/re-enable rebinds ONLY the
+// HTTPS leg. The live HTTP listener is never re-bound (its socket stays the SAME
+// fakeLn, still open) — under the old whole-server rebuild this re-bound the
+// still-held HTTP socket and the strict fake rejects it with EADDRINUSE.
+func TestMgmtReconcileHTTPSEnableDisableReEnable_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("initial HTTP-only start: %v", err)
+	}
+	httpLn := reg.get("10.0.0.1:8080")
+	if httpLn == nil || !httpLn.isOpen() {
+		t.Fatal("HTTP listener not active")
+	}
+
+	// Enable HTTPS -> only the HTTPS leg binds; HTTP is untouched.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("enable-TLS reconcile must succeed with the per-leg fix (no HTTP re-bind): %v", err)
+	}
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("the live HTTP listener was disturbed by a TLS enable (#5866): it must be the SAME open socket")
+	}
+	if hln := reg.get("10.0.0.1:8443"); hln == nil || !hln.isOpen() {
+		t.Fatal("HTTPS listener not active after enable")
+	}
+
+	// Disable HTTPS -> HTTPS leg retires, HTTP untouched.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+		t.Fatalf("disable-TLS reconcile: %v", err)
+	}
+	waitClosed(t, reg.get("10.0.0.1:8443"))
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("HTTP listener disturbed by a TLS disable (#5866)")
+	}
+
+	// Re-enable HTTPS on the SAME addr (now free) -> binds a fresh HTTPS leg.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("re-enable-TLS reconcile: %v", err)
+	}
+	if hln := reg.get("10.0.0.1:8443"); hln == nil || !hln.isOpen() {
+		t.Fatal("HTTPS listener not active after re-enable on the same port")
+	}
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("HTTP listener disturbed by a TLS re-enable (#5866)")
+	}
+}
+
+// #5866: an HTTPS-bind-ONLY change (HTTP addr + TLS flag unchanged) make-before-
+// break rebinds only the HTTPS leg; the HTTP listener is untouched.
+func TestMgmtReconcileHTTPSBindOnlyChange_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("initial HTTP+HTTPS start: %v", err)
+	}
+	httpLn := reg.get("10.0.0.1:8080")
+	oldHTTPS := reg.get("10.0.0.1:8443")
+
+	// Move ONLY the HTTPS bind. HTTP stays on :8080.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", nil)); err != nil {
+		t.Fatalf("https-bind-only reconcile must succeed (HTTP untouched): %v", err)
+	}
+	if reg.get("10.0.0.1:8080") != httpLn || !httpLn.isOpen() {
+		t.Fatal("the HTTP listener was re-bound by an HTTPS-only change (#5866)")
+	}
+	if newHTTPS := reg.get("10.0.0.2:8443"); newHTTPS == nil || !newHTTPS.isOpen() {
+		t.Fatal("new HTTPS listener not active")
+	}
+	// Make-before-break: the new HTTPS bound while the old HTTPS was still open.
+	if !reg.priorsOpenAtNew["10.0.0.2:8443"] {
+		t.Fatal("new HTTPS bound only after the old closed — not make-before-break (#5866)")
+	}
+	waitClosed(t, oldHTTPS)
+}
+
+// #5866 symmetric case: an HTTP-addr change while HTTPS is present + UNCHANGED
+// rebinds only the HTTP leg. The HTTPS listener is never re-bound (the old
+// whole-server rebuild would re-bind the still-held HTTPS socket -> EADDRINUSE).
+func TestMgmtReconcileHTTPChangeKeepsHTTPS_5866(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("initial HTTP+HTTPS start: %v", err)
+	}
+	httpsLn := reg.get("10.0.0.1:8443")
+
+	// Change ONLY the HTTP bind. HTTPS stays on :8443.
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", true, "10.0.0.1:8443", nil)); err != nil {
+		t.Fatalf("http-only reconcile must succeed without re-binding the unchanged HTTPS socket: %v", err)
+	}
+	if reg.get("10.0.0.1:8443") != httpsLn || !httpsLn.isOpen() {
+		t.Fatal("the HTTPS listener was re-bound by an HTTP-only change (#5866 symmetric collision)")
+	}
+	if newHTTP := reg.get("10.0.0.2:8080"); newHTTP == nil || !newHTTP.isOpen() {
+		t.Fatal("new HTTP listener not active")
 	}
 }
 

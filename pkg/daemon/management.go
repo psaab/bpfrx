@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -18,22 +19,32 @@ import (
 // the process kept enforcing the old policy — revoked/tightened credentials
 // stayed usable, an interface/bind removal left the API on the old address.
 //
-// Reconcile discipline:
+// Reconcile discipline (the listener lifecycle lives in api.Server; #5866):
 //   - AUTH change on an UNCHANGED endpoint: swap the live auth snapshot in place
 //     (api.Server.ReplaceAuth) — the middleware reads it per request, so a
 //     revoked credential is rejected on the NEXT request, no listener bounce, no
 //     restart, no unreachable window.
-//   - ENDPOINT change (bind address / port / TLS on/off / HTTPS bind):
-//     MAKE-BEFORE-BREAK — build+bind the NEW listener FIRST, and only once it is
-//     confirmed serving cancel the OLD server's context (bounded graceful
-//     drain). There is never a window where management is unreachable, and never
-//     a double-bind.
-//   - FAIL-SAFE: if the new listener fails to bind, the OLD listener is RETAINED
-//     (the previous working state — fail-closed, not mgmt-down), the endpoint
-//     fingerprint is left unrecorded so the next commit RETRIES the bind (retry
-//     debt), and the error is surfaced. The auth snapshot swap is applied to the
-//     live listener regardless of any endpoint-rebind outcome, so a credential
-//     revocation is never blocked by an unrelated bind failure.
+//   - ENDPOINT change: reconcile ONLY the listener leg that changed, PER LEG.
+//     An HTTP-bind change make-before-break rebinds only the HTTP leg
+//     (ReconcileHTTP); a TLS enable/disable or HTTPS-bind change rebinds only the
+//     HTTPS leg (ReconcileHTTPS) and NEVER touches the live HTTP listener. This
+//     is the fix for the old whole-server rebuild: enabling TLS keeps the HTTP
+//     bind, so re-binding the whole server re-bound the still-held HTTP socket
+//     (EADDRINUSE) and the change could never converge without a restart. Each
+//     leg is make-before-break within api.Server: the new socket is bound and
+//     serving before the old is retired — no unreachable window, no double-bind
+//     of an unchanged socket.
+//   - FAIL-SAFE: if a leg fails to (re)bind, that leg's PREVIOUS listener is
+//     RETAINED (fail-closed, not mgmt-down), its fingerprint field is left
+//     unrecorded so the next commit RETRIES the bind (retry debt), and the error
+//     is surfaced.
+//   - AUTH ORDERING on a combined change: the auth snapshot is published only
+//     once every leg is at its desired bind, so the live auth policy always
+//     matches the live binds. An auth-only change publishes immediately. A
+//     combined endpoint+auth change whose bind FAILED defers the auth swap to
+//     the retry — applying next.Auth (which the #4047/#5127 clamp may leave nil
+//     because the DESIRED bind is loopback) to a RETAINED non-loopback listener
+//     would fail OPEN.
 //
 // The reconcile is serialized by mu; the apply path (applyConfigLocked under the
 // apply semaphore) already runs commits one at a time, so a newer generation can
@@ -42,16 +53,13 @@ type managementReconciler struct {
 	d *Daemon
 	// baseCfg carries only the runtime dependencies (store, dataplane probe,
 	// managers, callbacks); the bind/port/TLS/auth fields are re-derived from the
-	// active config on every reconcile via desiredLocked, so a removed
-	// web-management stanza correctly reverts to the flag defaults.
+	// active config on every reconcile via desired, so a removed web-management
+	// stanza correctly reverts to the flag defaults.
 	baseCfg api.Config
-	rootCtx context.Context // daemon lifetime; parent of every generation's ctx
 
 	mu     sync.Mutex
-	wg     sync.WaitGroup     // joins every serve goroutine (live + retiring)
-	srv    *api.Server        // current live server (nil until started)
-	cancel context.CancelFunc // cancels the current server's ctx (retires it)
-	cur    mgmtEndpoint       // current endpoint fingerprint
+	srv    *api.Server  // single long-lived server; its HTTP/HTTPS legs reconcile in place (nil until started)
+	cur    mgmtEndpoint // last-CONVERGED per-leg fingerprint (a leg field advances only on that leg's successful reconcile)
 	curSet bool
 }
 
@@ -103,20 +111,17 @@ func (m *managementReconciler) start(ctx context.Context) error {
 }
 
 // startTo starts the initial listener for an explicit desired config. Split from
-// start so a test can seed the live server without a configstore (#5866).
+// start so a test can seed the live server without a configstore (#5866). The
+// server owns its HTTP/HTTPS leg lifecycles keyed to ctx; day-2 changes go
+// through reconcileTo's per-leg calls, not a new server.
 func (m *managementReconciler) startTo(ctx context.Context, next api.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rootCtx = ctx
-
 	srv := api.NewServer(next)
-	cctx, cancel := context.WithCancel(ctx)
-	if err := srv.Start(cctx); err != nil {
-		cancel()
+	if err := srv.Start(ctx); err != nil {
 		return err
 	}
-	m.launchLocked(srv)
-	m.srv, m.cancel, m.cur, m.curSet = srv, cancel, endpointOf(next), true
+	m.srv, m.cur, m.curSet = srv, endpointOf(next), true
 	return nil
 }
 
@@ -141,59 +146,53 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		return nil
 	}
 
-	ep := endpointOf(next)
+	var errs []error
 
-	// Same endpoint -> swap the live auth snapshot in place. A credential
-	// revocation takes effect on the next request with NO listener bounce and NO
-	// unreachable window. Safe on the current endpoint: the per-listener /metrics
-	// gate is derived from the (unchanged) bind address, and dropping auth to nil
-	// is only reachable on a loopback bind (the clamp forces a non-loopback
-	// no-auth bind to change its address, which takes the rebind path instead).
-	if m.curSet && ep == m.cur {
+	// HTTP leg: make-before-break rebind ONLY if the HTTP bind changed. Advance
+	// the converged fingerprint only on success (retry debt on failure).
+	if next.Addr != m.cur.addr {
+		if err := m.srv.ReconcileHTTP(next.Addr); err != nil {
+			errs = append(errs, err)
+		} else {
+			m.cur.addr = next.Addr
+		}
+	}
+
+	// HTTPS leg: enable / disable / rebind ONLY if the HTTPS bind or TLS flag
+	// changed. api.Server.ReconcileHTTPS never touches the live HTTP listener, so
+	// a TLS enable can no longer collide with the retained HTTP socket.
+	if next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr {
+		if err := m.srv.ReconcileHTTPS(next.TLS, next.HTTPSAddr); err != nil {
+			errs = append(errs, err)
+		} else {
+			m.cur.tls, m.cur.httpsAddr = next.TLS, next.HTTPSAddr
+		}
+	}
+
+	// Auth: publish only once every leg is at its desired bind (see the type
+	// doc). An auth-only change (no leg change) publishes immediately with no
+	// rebind; a combined change whose bind failed defers the swap to retry.
+	if len(errs) == 0 {
 		m.srv.ReplaceAuth(next.Auth)
 		return nil
 	}
-
-	// Endpoint changed -> make-before-break: bind the NEW listener before
-	// retiring the old.
-	newSrv := api.NewServer(next)
-	cctx, cancel := context.WithCancel(m.rootCtx)
-	if err := newSrv.Start(cctx); err != nil {
-		cancel()
-		// Fail-safe: the new endpoint did not bind. Keep the OLD listener serving
-		// the previous working state (fail-closed, NOT mgmt-down). Leave m.srv /
-		// m.cur unchanged so the NEXT commit retries the bind (retry debt).
-		slog.Warn("web-management listener replacement failed; retaining previous listener",
-			"desired", ep.summary(), "retained", m.cur.summary(), "err", err)
-		return fmt.Errorf("web-management listener replacement to %s failed; retaining %s: %w",
-			ep.summary(), m.cur.summary(), err)
-	}
-
-	// The new listener is bound and serving. ONLY NOW retire the old one (its
-	// context cancel triggers the api.Server bounded graceful drain) and swap.
-	m.launchLocked(newSrv)
-	oldCancel, oldEP := m.cancel, m.cur
-	m.srv, m.cancel, m.cur = newSrv, cancel, ep
-	oldCancel()
-	slog.Info("web-management listener replaced (make-before-break)",
-		"from", oldEP.summary(), "to", ep.summary())
-	return nil
+	joined := errors.Join(errs...)
+	slog.Warn("web-management listener reconcile incomplete; retaining previous listener(s), deferring auth swap",
+		"desired", endpointOf(next).summary(), "err", joined)
+	return fmt.Errorf("web-management reconcile to %s incomplete; retaining previous listener(s): %w",
+		endpointOf(next).summary(), joined)
 }
 
-// launchLocked registers srv's background serve goroutine on the reconciler's
-// wait group so daemon shutdown joins every live and retiring listener.
-func (m *managementReconciler) launchLocked(srv *api.Server) {
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		srv.Wait()
-	}()
-}
-
-// wait blocks until every serve goroutine (live + retiring) has drained. Called
-// on daemon shutdown after the root ctx is cancelled.
+// wait blocks until every serve goroutine (live + retiring legs) has drained.
+// Called on daemon shutdown after the root ctx is cancelled (which triggers each
+// leg's bounded graceful drain inside api.Server).
 func (m *managementReconciler) wait() {
-	m.wg.Wait()
+	m.mu.Lock()
+	srv := m.srv
+	m.mu.Unlock()
+	if srv != nil {
+		srv.Wait()
+	}
 }
 
 // reconcileWebManagement is the applyConfigLocked entry point (#5866). It
