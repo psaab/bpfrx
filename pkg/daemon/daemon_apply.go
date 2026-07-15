@@ -798,7 +798,13 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 		return d.closeoutHostAuthOnCancel(err, cfg)
 	}
 
-	d.applyRoutingRules(cfg, commitOverlay)
+	// #5844: applyRoutingRules RETURNS the joined next-table / rib-group / PBR
+	// ip-rule reconcile failures (a partial clear/add left stale-or-missing
+	// cross-VRF policy in the kernel). Capture it as a DEFERRED error — the
+	// snapshot republish below still runs (so it is not left stale), and the
+	// failure is threaded into the tail commit-error join so the commit fails
+	// closed instead of being acknowledged after a partial reconcile.
+	routingRuleErr := d.applyRoutingRules(cfg, commitOverlay)
 
 	// #5642: the full dataplane apply (applyDataplaneAndHACore → d.dp.ApplyConfig)
 	// ran BEFORE applyRoutingRules and built its userspace route snapshot from the
@@ -831,9 +837,11 @@ func (d *Daemon) applyConfigLocked(ctx context.Context, cfg *config.Config) erro
 	// errors (networkdErr/applyErr/dhcpServerErr/ipsecErr/ifaceErr) are threaded
 	// in — applyErr is the #5679 ordinary (non-abort) dataplane-apply failure
 	// that must fail the commit without disarming/aborting; routeLeakErr is the
-	// #5696 route-leak republish/FIB-bump failure; the helper creates
-	// lo0Err/hostInboundErr and returns the joined errors.
-	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr)
+	// #5696 route-leak republish/FIB-bump failure; routingRuleErr is the #5844
+	// next-table/rib-group/PBR ip-rule reconcile failure (a partial kernel
+	// policy-routing clear/add); the helper creates lo0Err/hostInboundErr and
+	// returns the joined errors.
+	return d.applyTailReconciles(cfg, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr)
 }
 
 // applyHostAuthorizationCloseout runs ONLY the security-critical host-
@@ -1503,7 +1511,20 @@ func (d *Daemon) applyServicesReconcile(cfg *config.Config) (error, error) {
 // early return. commitOverlay is the ip-monitoring route overlay folded into
 // the FRR assembly. Runs in the same slot, after the dataplane apply / RETH-MAC
 // sequence and before proactive neighbor resolution.
-func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.RouteOverlayEntry) {
+func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.RouteOverlayEntry) error {
+	// #5844: the kernel policy-routing (ip rule) reconciles below —
+	// next-table, rib-group, and PBR/filter-based-forwarding — each already
+	// RETURN a fail-closed error: a partial clear/add leaves stale-or-missing
+	// cross-VRF policy in the kernel, and the immediately-following userspace
+	// route snapshot (reconcileRouteLeakSnapshot) canonizes that partial live
+	// kernel state. The pre-#5844 call site LOGGED and DROPPED those returns, so
+	// a commit was acknowledged after a partial reconcile. Collect them here and
+	// return the joined error to applyConfigLocked, which threads it into the
+	// tail commit-error join. Fail-closed BUT complete: a single rule-type
+	// failure does NOT skip the others — every rule type runs, then the joined
+	// error surfaces (mirroring the #5310 ifaceErr / #5696 routeLeakErr pattern).
+	var routingErrs []error
+
 	// 3. Apply all routes + dynamic protocols via FRR.
 	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
 	// with the ip-monitoring routes-only actuator (#1827) — the full
@@ -1544,6 +1565,7 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 		allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
 		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances); err != nil {
 			slog.Warn("failed to apply next-table rules", "err", err)
+			routingErrs = append(routingErrs, fmt.Errorf("apply next-table rules: %w", err))
 		}
 	}
 
@@ -1571,6 +1593,7 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 		connectedPrefixes := config.RibGroupConnectedPrefixes(cfg)
 		if err := d.routing.ApplyRibGroupRules(cfg.RoutingOptions.RibGroups, cfg.RoutingInstances, connectedPrefixes); err != nil {
 			slog.Warn("failed to apply rib-group rules", "err", err)
+			routingErrs = append(routingErrs, fmt.Errorf("apply rib-group rules: %w", err))
 		}
 	}
 
@@ -1585,14 +1608,34 @@ func (d *Daemon) applyRoutingRules(cfg *config.Config, commitOverlay []config.Ro
 	if d.routing != nil {
 		pbrRules, buildErr := routing.BuildPBRRules(cfg)
 		if buildErr != nil {
+			// #5844: buildErr is DELIBERATELY not joined into the commit-error.
+			// It is a fail-SAFE representability degradation, not a partial
+			// kernel mutation: a filter term that cannot be expressed as an ip
+			// rule (port-except / tcp-flags / icmp / is-fragment / flex /
+			// overflow) is DROPPED to under-steer to the main table, and the
+			// userspace filter path still enforces it. ApplyPBRRules(pbrRules)
+			// below fully reconciles whatever WAS built (deleting any stale
+			// rule), so no stale-or-missing cross-VRF policy survives — the
+			// #5844 bug class. Fail-closing on buildErr would instead REJECT
+			// configs with such terms that commit fine today, so it stays a
+			// warn-and-continue.
 			slog.Warn("PBR rule build degraded; some routing-instance filter terms "+
 				"are not mirrored to the kernel FBF path and fall back to the main "+
 				"table (userspace filter path still enforces them)", "err", buildErr)
 		}
+		// ApplyPBRRules IS a kernel reconcile: a failed clear/add leaves a
+		// half-installed FBF policy in the kernel ip-rule table, so its error is
+		// joined into the commit-error (fail-closed).
 		if err := d.routing.ApplyPBRRules(pbrRules); err != nil {
 			slog.Warn("failed to apply PBR rules", "err", err)
+			routingErrs = append(routingErrs, fmt.Errorf("apply PBR rules: %w", err))
 		}
 	}
+
+	// Fail-closed but COMPLETE: every rule type above ran regardless of an
+	// earlier failure; surface the joined error so a partial ip-rule reconcile
+	// fails the commit instead of being silently acknowledged (#5844).
+	return errors.Join(routingErrs...)
 }
 
 // reconcileRouteLeakSnapshot republishes the userspace route snapshot after
@@ -1991,7 +2034,7 @@ func (d *Daemon) applyInterfaceReconcile(cfg *config.Config) error {
 // lo0Err/hostInboundErr originate in step 9.5 below. The returned errors.Join
 // preserves the exact operand order the inline tail used
 // (#1778/#2987/#4433/#5310/#5679/#5696).
-func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr error) error {
+func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, dhcpServerErr, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr error) error {
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {
@@ -2262,7 +2305,7 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	// that left stale or missing kernel/swanctl/dataplane state fails the commit
 	// (fail-closed) instead of reporting success. All are joined so none masks the
 	// other.
-	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr)
+	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, ipsecErr, ifaceErr, routeLeakErr, routingRuleErr)
 }
 
 // compileErrorMustAbortApply reports whether a dataplane ApplyConfig error

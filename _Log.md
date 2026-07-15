@@ -1,3 +1,36 @@
+## 2026-07-15 — #5844 (bug/security/HIGH): routing-rule reconcile errors fail the commit closed
+- **Timestamp**: 2026-07-15 (fix/5844-routing-rule-reconcile-failclosed)
+- **Action**: `pkg/routing` correctly RETURNS next-table / rib-group / PBR
+  ip-rule reconcile failures, but the daemon call site (`applyRoutingRules`,
+  pkg/daemon/daemon_apply.go) was VOID and LOGGED-and-DROPPED them. So a commit
+  was ACKNOWLEDGED after a partial clear/add left stale-or-missing cross-VRF
+  policy in the kernel — and the immediately-following userspace route snapshot
+  (`reconcileRouteLeakSnapshot`) canonized that partial live kernel state into
+  the FIB. Made `applyRoutingRules` RETURN `errors.Join` of the three kernel
+  reconcile failures (ApplyNextTableRules / ApplyRibGroupRules / ApplyPBRRules),
+  collected while STILL running every rule type after one fails (fail-closed but
+  COMPLETE), keeping the per-error logging. `applyConfigLocked` captures it
+  (`routingRuleErr`) and threads it into the SAME tail `errors.Join` sink the
+  snapshot error uses (new final `applyTailReconciles` param); the snapshot
+  republish still runs first (ordering preserved). Mirrors the #5310 ifaceErr /
+  #5696 routeLeakErr deferred-error pattern. `BuildPBRRules` *build degradation*
+  is deliberately NOT joined — it is a fail-SAFE representability under-steer
+  (unrepresentable-as-ip-rule term dropped to the main table, still enforced by
+  the userspace filter path), not a partial kernel mutation, so fail-closing it
+  would reject configs that commit fine today.
+- **Validation**: gofmt clean; go build ./...; go test ./pkg/daemon/
+  ./pkg/routing/ -count=1 green; go vet ./pkg/daemon/ clean. Fail-on-revert
+  proven via overlay: dropping routingRuleErr from the tail join flips
+  TestApplyTailReconcilesSurfacesRoutingRuleError_5844 RED (commit returns nil
+  despite the injected failure); reverting applyRoutingRules to void breaks
+  compilation of the direct test.
+- **File(s)**: pkg/daemon/daemon_apply.go (Edit),
+  pkg/daemon/routing_rule_reconcile_failclosed_5844_test.go (Write),
+  pkg/daemon/apply_interface_reconcile_failclosed_5310_test.go (Edit, arity),
+  pkg/daemon/route_leak_snapshot_failclosed_5696_test.go (Edit, arity),
+  pkg/daemon/device_map_teardown_failclosed_5309_test.go (Edit, arity),
+  pkg/daemon/README.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
 - **Action**: Aligned the CLI in-process commit path (reloadSyslog /
