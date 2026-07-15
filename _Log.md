@@ -48797,3 +48797,32 @@ top.
     pkg/config/compiler.go, pkg/config/compiler_interfaces.go,
     pkg/config/compiler_dispatch.go, pkg/config/tunnelid.go,
     pkg/config/interface_unit_nonnumeric_5829_test.go, docs/config-schema.md
+
+- **Timestamp**: 2026-07-15
+  - **Action**: #5796 Kea LFC file-set lease read. All three dhcpserver memfile
+    consumers (DDNS `parseActiveLeases4/6`, display `parseLeaseCSV`, HA fallback
+    `readSyncLeasesViaMemfile`) opened ONLY the current `kea-leases{4,6}.csv`,
+    which after Lease File Cleanup starts is just the new append log — the active
+    set spans Kea's LFC file set. A header-only current file right after LFC
+    rotation was read as trusted-empty and the DDNS reconciler would MASS-DELETE
+    every owned A/AAAA/PTR (fail-open). Added ONE shared enumerator
+    `keaLFCLeaseFilePaths` (lease_lfc.go) returning the set in Kea CHRONOLOGICAL
+    order PREVIOUS(.2) -> INPUT(.1) -> CURRENT and refactored both parsers to a
+    per-file helper + accumulator so rows replay through the SAME append-only
+    last-row-wins dedup across files (newer supersedes older; release/expiry
+    tombstones survive). Suffix mapping verified against Kea source
+    memfile_lease_mgr.cc appendSuffix (.1=INPUT, .2=PREVIOUS) — the team-lead's
+    dispatch note had them swapped; the read ORDER (previous, then input, then
+    current) is unchanged. Fail-safe preserved+extended: any existing mangled
+    sibling makes the whole family untrusted; trusted-empty only when all files
+    validate and the merged set is empty; no-LFC steady state (.1/.2 absent) is
+    byte-identical to before. Fail-on-revert proven via -overlay: single-file
+    read -> union/display/fail-closed tests RED; reversed merge order ->
+    order test RED (resurrected released lease). go build ./... + vet +
+    -race dhcpserver/ddns green. RESIDUAL (issue invariants 2/3/8, follow-up):
+    no live lease_cmds socket preference in every consumer, no
+    crash-interrupted-cleanup generation proof, no degraded-source display
+    banner.
+  - **File(s)**: pkg/dhcpserver/lease_lfc.go (new),
+    pkg/dhcpserver/lease_lfc_5796_test.go (new), pkg/dhcpserver/ddns_leases.go,
+    pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/README.md

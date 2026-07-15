@@ -123,13 +123,82 @@ func parseActiveLeases6(path string, now time.Time) ([]ddnsLease, error) {
 	return parseActiveLeases(path, 6, now)
 }
 
+// ddnsLeaseAccum accumulates the append-only, last-row-wins disposition per
+// address ACROSS the Kea LFC file set (#5796). A non-empty ddnsLease.Address is
+// an active lease to publish; a zero value is a tombstone (the last row seen for
+// that address, in chronological file+row order, was inactive/expired). order
+// preserves first-appearance for a stable output.
+type ddnsLeaseAccum struct {
+	latest  map[string]ddnsLease
+	order   []string
+	inOrder map[string]struct{}
+}
+
+func newDDNSLeaseAccum() *ddnsLeaseAccum {
+	return &ddnsLeaseAccum{
+		latest:  map[string]ddnsLease{},
+		inOrder: map[string]struct{}{},
+	}
+}
+
+func (a *ddnsLeaseAccum) note(addr string) {
+	if _, ok := a.inOrder[addr]; !ok {
+		a.inOrder[addr] = struct{}{}
+		a.order = append(a.order, addr)
+	}
+}
+
+// parseActiveLeases reads the Kea memfile lease set for `family` and returns
+// only the active leases. `path` is the CURRENT lease file; #5796: it reads the
+// FULL Kea LFC file set (previous `.2`, input `.1`, current) via
+// keaLFCLeaseFilePaths in chronological order and MERGES them with the same
+// append-only, last-row-wins dedup Kea itself uses, so a lease that currently
+// lives only in the compacted PREVIOUS or INPUT file (e.g. right after LFC
+// rotated a fresh header-only current file) is NOT lost and a header-only
+// current file cannot by itself trigger the destructive DDNS trusted-empty path.
+//
+// The #1387/Codex fail-safe is preserved and EXTENDED across the set: any
+// EXISTING file that is headerless / mangled-header / ragged makes the whole
+// family untrusted (error → Reconcile SKIPS the destructive diff). Trusted-empty
+// (nil, nil) is returned only when every existing file in the set validates AND
+// the merged active set is empty — a genuinely-missing `.1`/`.2`/current file
+// (os.IsNotExist) simply contributes nothing.
 func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, error) {
+	acc := newDDNSLeaseAccum()
+	for _, f := range keaLFCLeaseFilePaths(path) {
+		if err := parseActiveLeasesFileInto(f, family, now, acc); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]ddnsLease, 0, len(acc.order))
+	for _, addr := range acc.order {
+		l, ok := acc.latest[addr]
+		if !ok || l.Address == "" {
+			continue // tombstoned by the FINAL inactive/expired row across the set
+		}
+		out = append(out, l)
+	}
+	if len(out) == 0 {
+		// Trusted-empty: every existing file in the set validated (no error
+		// above) and the merged active set is empty. Return nil (not a
+		// non-nil empty slice) to match the pre-#5796 os.IsNotExist /
+		// header-only trusted-empty contract the DDNS reconciler relies on.
+		return nil, nil
+	}
+	return out, nil
+}
+
+// parseActiveLeasesFileInto parses ONE Kea LFC-set file into acc, applying the
+// per-file fail-safe validation. A genuinely-missing file is skipped (nil
+// error). An EXISTING file that is anomalous (headerless / mangled header /
+// ragged row) returns an error so the whole family is treated as untrusted.
+func parseActiveLeasesFileInto(path string, family int, now time.Time, acc *ddnsLeaseAccum) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil
 		}
-		return nil, err
+		return err
 	}
 	defer f.Close()
 
@@ -138,7 +207,7 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	r.Comment = '#'
 	records, err := r.ReadAll()
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return fmt.Errorf("parse %s: %w", path, err)
 	}
 
 	// Fail-safe (#1387 + Codex r4): the trusted-empty result (nil, nil) is
@@ -163,7 +232,7 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	//      healthy header + no active rows genuinely means "no active
 	//      leases", and clearing owned DNS records is then correct.
 	if len(records) == 0 {
-		return nil, fmt.Errorf("parse %s: Kea %s lease file has no header (anomalous: mid-write or corrupt)",
+		return fmt.Errorf("parse %s: Kea %s lease file has no header (anomalous: mid-write or corrupt)",
 			path, familyLabel(family))
 	}
 
@@ -187,7 +256,7 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	for i, h := range records[0] {
 		key := strings.ToLower(strings.TrimSpace(h))
 		if _, dup := cols[key]; dup {
-			return nil, fmt.Errorf("parse %s: duplicate column %q in Kea %s lease header (ambiguous)",
+			return fmt.Errorf("parse %s: duplicate column %q in Kea %s lease header (ambiguous)",
 				path, key, familyLabel(family))
 		}
 		cols[key] = i
@@ -214,7 +283,7 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("parse %s: missing required column(s) %v in Kea %s lease header",
+		return fmt.Errorf("parse %s: missing required column(s) %v in Kea %s lease header",
 			path, missing, familyLabel(family))
 	}
 
@@ -240,32 +309,25 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	}
 
 	// Header is present AND valid. A file with only a header (zero data rows)
-	// is now a LEGITIMATE trusted zero-lease result — return early before the
-	// per-row loop so a genuinely-empty Kea correctly clears owned records.
+	// is a LEGITIMATE trusted zero-lease contribution — return before the
+	// per-row loop, adding nothing to acc, so a genuinely-empty file in the LFC
+	// set contributes no leases (and, alone, correctly clears owned records).
 	if len(records) < 2 {
-		return nil, nil
+		return nil
 	}
 
 	// Kea appends rows; the LAST row for an address is authoritative (lease
-	// renewal / state change). We keep the last seen row per address and
-	// emit in first-appearance order. The map value carries the row's final
-	// disposition: a non-empty Address is an active lease to publish, an
-	// empty (zero) value is a tombstone (the last row was inactive/expired)
-	// and is filtered from the output. CRITICAL (#1387 MAJOR-3): an active
-	// row must be able to RECLAIM an address that an earlier row tombstoned
-	// (declined/expired/reclaimed then re-allocated), so we recompute the
-	// disposition on every row and ensure the address is recorded in `order`
-	// whenever it first appears, tombstone or not. Output order is stable;
-	// the tombstone filter at emit time is what drops still-inactive ones.
-	latest := map[string]ddnsLease{}
-	order := []string{}
-	inOrder := map[string]struct{}{}
-	noteAddr := func(addr string) {
-		if _, ok := inOrder[addr]; !ok {
-			inOrder[addr] = struct{}{}
-			order = append(order, addr)
-		}
-	}
+	// renewal / state change). We keep the last seen row per address (across
+	// the whole LFC file set, via acc) and emit in first-appearance order. The
+	// map value carries the row's final disposition: a non-empty Address is an
+	// active lease to publish, an empty (zero) value is a tombstone (the last
+	// row was inactive/expired) and is filtered from the output. CRITICAL
+	// (#1387 MAJOR-3): an active row must be able to RECLAIM an address that an
+	// earlier row tombstoned (declined/expired/reclaimed then re-allocated), so
+	// we recompute the disposition on every row and ensure the address is
+	// recorded in acc.order whenever it first appears, tombstone or not. Output
+	// order is stable; the tombstone filter at emit time drops still-inactive
+	// ones.
 	for rowNum, fields := range records[1:] {
 		// Row-conformance (Codex r6): a row too short to supply every
 		// required column cannot be read reliably. Treat the whole family's
@@ -276,14 +338,14 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		// 0-based over the data rows (records[1:]); +2 gives the 1-based file
 		// line number including the header.
 		if len(fields) <= maxRequiredIdx {
-			return nil, fmt.Errorf("parse %s: Kea %s lease row %d has %d field(s), too short for required columns (need > %d; ragged/truncated source)",
+			return fmt.Errorf("parse %s: Kea %s lease row %d has %d field(s), too short for required columns (need > %d; ragged/truncated source)",
 				path, familyLabel(family), rowNum+2, len(fields), maxRequiredIdx)
 		}
 		addr := get(fields, "address")
 		if addr == "" {
 			continue
 		}
-		noteAddr(addr)
+		acc.note(addr)
 
 		// State filter: only "default" (active) rows are publishable;
 		// declined / expired-reclaimed rows must NOT have DNS records.
@@ -293,8 +355,8 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 			if st, e := strconv.Atoi(s); e == nil && st != keaStateDefault {
 				// A non-default state for an address supersedes any earlier
 				// row for it: write a tombstone (the address stays in
-				// `order` so a LATER active row can reclaim it).
-				latest[addr] = ddnsLease{}
+				// acc.order so a LATER active row can reclaim it).
+				acc.latest[addr] = ddnsLease{}
 				continue
 			}
 		}
@@ -309,7 +371,7 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		// stale regardless of state column lag. Tombstone it (a later
 		// active row with a future expire can still reclaim the address).
 		if expire > 0 && now.Unix() >= expire {
-			latest[addr] = ddnsLease{}
+			acc.latest[addr] = ddnsLease{}
 			continue
 		}
 
@@ -347,18 +409,10 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		} else {
 			l.Identity = identity4(get(fields, "client_id"), get(fields, "hwaddr"))
 		}
-		latest[addr] = l
+		acc.latest[addr] = l
 	}
 
-	out := make([]ddnsLease, 0, len(order))
-	for _, addr := range order {
-		l, ok := latest[addr]
-		if !ok || l.Address == "" {
-			continue // tombstoned by the FINAL inactive/expired row
-		}
-		out = append(out, l)
-	}
-	return out, nil
+	return nil
 }
 
 // leaseColumnValue looks up a field by header name, CASE-INSENSITIVELY. It
