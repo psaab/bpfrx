@@ -409,8 +409,13 @@ func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
 			trunk  bool
 		}
 		var entries []vlanEntry
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			for unitNum, unit := range ifc.Units {
+		// #5910: the tolerant load / HA config-sync path admits present-but-nil
+		// InterfaceConfig / InterfaceUnit map values (#3494/#5068). Walk via the
+		// shared nil-safe iterators so a nil slot is skipped, not dereferenced —
+		// a raw `range ifc.Units` / `unit.VlanID` nil-derefs and panics the
+		// in-process daemon during a routine `show vlans`.
+		config.RangeInterfaces(cfg, func(_ string, ifc *config.InterfaceConfig) {
+			config.RangeUnits(ifc, func(unitNum int, unit *config.InterfaceUnit) {
 				if unit.VlanID > 0 || ifc.VlanTagging {
 					entries = append(entries, vlanEntry{
 						iface:  ifc.Name,
@@ -420,8 +425,8 @@ func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
 						trunk:  ifc.VlanTagging,
 					})
 				}
-			}
-		}
+			})
+		})
 		if len(entries) == 0 {
 			buf.WriteString("No VLANs configured\n")
 		} else {

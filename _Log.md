@@ -1,3 +1,35 @@
+## 2026-07-15 — #5827 (config/security): cap retained parse diagnostics (heap DoS)
+- **Timestamp**: 2026-07-15 (fix/5827-parse-error-cap)
+- **Action**: The recursive-descent config parser (pkg/config/parser.go) recorded
+  one ParseError per bad token via an UNCAPPED addError — so an all-invalid
+  payload up to the 16 MiB MaxConfigSize pinned ~16 million ParseError structs
+  (each holding a formatted message string) LIVE simultaneously: an unbounded-heap
+  OOM DoS reachable unauthenticated from the localhost gRPC/REST config-load API
+  AND the HA peer config-sync ingress. Fix: added `const maxParseErrors = 64` and
+  capped the RETAINED diagnostic set in addError + a new addErrorf (lazy-format so
+  the fmt.Sprintf call sites don't even allocate past the cap). Past the cap, both
+  count the drop in a saturating `Parser.suppressed` and return without appending;
+  Parse folds the count into ONE deterministic trailing "additional parse errors
+  suppressed (N)" diagnostic → len(errs) bounded to maxParseErrors+1, retained heap
+  O(cap), regardless of input size. The first ≤64 diagnostics keep parse order +
+  line/column. The lexer still drains the whole input O(input) for deterministic
+  termination (only RETENTION is capped) — mirrors the existing depth-cap
+  suppression (skipToBlockClose). ParseSetVerb/ParseSetCommand (flat-set) are
+  already bounded (return on the first bad token) — the shared cap needs no change
+  there. No cancellation/deadline added: input is pre-capped at 16 MiB and the
+  parse is O(input) linear.
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/config/ clean;
+  go test -race ./pkg/config/ (131s — the 16 MiB / 8 MiB DoS regression tests
+  under race instrumentation) + ./pkg/configstore/ GREEN. Fail-on-revert (overlay,
+  uncap addError/addErrorf): the retained-heap-budget test RED (524 MiB retained
+  for an 8 MiB payload vs 64 MiB budget), the mixed-order test RED (len 192 vs
+  ≤65), the depth×token test RED (434 vs ≤65). Existing config tests unaffected
+  (they assert len==0/>0, cap-safe).
+- **File(s)**: pkg/config/parser.go (Edit),
+  pkg/config/parser_error_cap_5827_test.go (Write),
+  pkg/configstore/parse_error_cap_5827_test.go (Write),
+  pkg/config/README.md (Edit), _Log.md (Edit)
+
 ## 2026-07-15 — #5832 (bug/audit/security): commit-time gate for Linux interface-name collisions
 - **Timestamp**: 2026-07-15 (fix/5832-ifname-collision-gate)
 - **Action**: config.LinuxIfName only does ReplaceAll("/","-") — NOT injective.
@@ -48568,3 +48600,8 @@ top.
   go test -race ./pkg/upgrade/ ./cmd/xpfd/ -count=3 GREEN; 3 fail-on-revert
   overlays proven RED (exec.Command hang, no min-bound=10s, time.Sleep(poll)
   5s overshoot).
+- **Timestamp**: 2026-07-15
+  **Action**: #5835 (configstore: confirmation succeeded after durable confirm-record deletion failed → a restart resurrected a stale rollback and reverted an operator-confirmed config). removeConfirmState was best-effort (LOGGED a DeleteConfirm failure), so a confirmation (plain commit / HA sync / explicit ConfirmCommit / demotion) reported SUCCESS while confirm.json lingered; a restart read the stale record and resurrected its rollback. Fix (4 corrections): (1) removeConfirmState now RETURNS the error — ConfirmCommitAs propagates it (via clearPendingConfirmLocked now returning (bool,error)); the non-returning paths route through a new resolveConfirmRemovalLocked that retains retry debt (new confirmRemoveDegraded field) + starts the shared persist-retry loop (extended to also re-drive the delete) + surfaces DEGRADED health via ConfigPersistDegraded() (now ORs the new flag) and a dedicated ConfirmRemovalDegraded(). (2) DeleteConfirm now reaches the #4864 dir fsync on the ABSENT path (removed the os.IsNotExist short-circuit) so an unlink-succeeded/dir-sync-failed state is not laundered into a false success by an absent-file retry — the flag is the cross-call "sync owed" operation state. (3) confirmRecord gains an additive GuardedHash (sha256 of the unconfirmed active tree Format() at arm/re-arm time, set in writeConfirmState); recoverPendingConfirmLocked ignores a record whose GuardedHash != the loaded active config's (a later commit/confirm advanced active while removal failed) so a stale record can't revert an unrelated confirmed generation — legacy empty-hash records recover as #4577 (cross-upgrade hatch preserved). (4) the in-memory timer/rollback bookkeeping cancel is unchanged (the delete needs only the file path), so nothing is irreversibly lost. Explicit-confirm-with-no-later-commit + immediate crash fails SAFE (reverts on boot), consistent with ConfirmCommit having returned an error. Tests (confirm_durable_resolution_5835_test.go, injected rbRemove/rbSyncDir seams): explicit-confirm-returns-error+debt; dir-fsync-not-laundered-by-absent-retry; plain-commit/config-sync/demotion retain+expose debt then converge (fast-backoff heal); STALE record does not revert a durably-committed generation on boot (headline); nested-confirmed + first-commit generation-binding; -race concurrent retry-vs-reads. Updated the #4864 test that pinned the now-reversed absent-no-dir-sync behavior (renamed TestDeleteConfirmAbsentReachesDirSync). Fail-on-revert verified firsthand: swallow removeConfirmState→4 tests RED; disable GuardedHash check→2 tests RED; restore DeleteConfirm absent short-circuit→2 dir-sync tests RED. go build ./... + go vet ./pkg/configstore/ clean; go test -race ./pkg/configstore/ GREEN (covers timer-callback race + restart-after-injected-failure). Doc: pkg/configstore/README.md new #5835 bullet.
+  **File(s)**: pkg/configstore/db.go, pkg/configstore/store.go, pkg/configstore/store_commit.go, pkg/configstore/store_persist.go, pkg/configstore/confirm_durable_resolution_5835_test.go (new), pkg/configstore/confirm_delete_fsync_4864_test.go, pkg/configstore/README.md, _Log.md
+  **Action**: #5813 (CLI/gRPC/REST session display nil-slot panic) — the tolerant load / HA config-sync path admits present-but-nil InterfaceConfig / InterfaceUnit map values (#3494/#5068). THREE identical session egress-interface map builders walked cfg.Interfaces.Interfaces + ifc.Units with NO nil guard and nil-dereferenced/panicked the in-process daemon on a routine session display: CLI buildSessionEgressIfacesWithLookup (session_display.go), gRPC buildSessionFilter (server_sessions.go), REST buildSessionView (api/sessions.go). CENTRALIZED the tolerant walk into two shared nil-safe iterators in pkg/config — RangeInterfaces (skips nil InterfaceConfig) + RangeUnits (skips nil InterfaceUnit) in new interfaces_iter.go — and migrated all three builders onto them (first-wins ifindex/vlanID ordering preserved). Panic-recovery in CLI.Run NOT added: the nil-guard stands on its own and a shared helper is the durable fix; a blanket recover would mask future presenter bugs. AUDIT of the remote surfaces: the gRPC + REST session/filter builders had the IDENTICAL raw walk (not merely the CLI) — both fixed here; the broader interface-show presenters (terse/detail/extensive/summary/completers) were already guarded by #5068 and are out of scope, but the shared iterators are now available for future migration; interfaceAliasSet (server_diag_monitor.go) was already nil-safe. Tests (fail-on-revert): pkg/config interfaces_iter_5813_test.go (RangeInterfaces/RangeUnits skip nils, nil-receiver no-ops); pkg/cli session_display_nil_5813_test.go (deterministic-lookup seam with nil ifc + nil unit + valid siblings asserting first-wins mapping and nil-slots-omitted; REAL showFlowSession handler driven with fake loaded dp and nil slots on the loopback so the production net.InterfaceByName path reaches the deref; a -race concurrent-publish test — atomic.Pointer swap of fresh tolerant configs vs 8 concurrent read-only presenters); pkg/grpcapi + pkg/api nil-slot builder tests on a loopback-zone store. Fail-on-revert verified firsthand: removing the RangeUnits unit-guard → all four packages RED; removing either nil-interface guard (RangeInterfaces or RangeUnits ifc-guard — intentionally double-layered) → the dedicated pkg/config test RED. go build ./... clean; go vet clean on config/grpcapi/api (pkg/cli shows only the pre-existing cli.go:511 unreachable-code warning, unrelated — byte-identical on origin/master); go test -race green on all four packages. Doc: pkg/config/README.md Gotchas — new "Present-but-nil interface/unit slots" entry pointing at the shared iterators.
+  **File(s)**: pkg/config/interfaces_iter.go, pkg/config/interfaces_iter_5813_test.go, pkg/cli/session_display.go, pkg/cli/session_display_nil_5813_test.go, pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_sessions_nil_5813_test.go, pkg/api/sessions.go, pkg/api/sessions_nil_5813_test.go, pkg/config/README.md, _Log.md
