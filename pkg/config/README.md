@@ -36,6 +36,26 @@ Regression coverage: `pkg/config/parser_recursion_dos_hb164_test.go`,
 `pkg/configstore/config_size_ceiling_hb164_test.go`,
 `pkg/api/config_load_bodycap_hb164_test.go`,
 `pkg/grpcapi/server_recvsize_hb164_test.go`.
+
+**Retained-diagnostic cap is a fourth guard (#5827).** The parser records one
+`ParseError` per bad token; an all-invalid payload (up to `MaxConfigSize`)
+otherwise pins ~16 million `ParseError` structs — each holding a formatted
+message string — LIVE at once, an unbounded-heap OOM DoS reachable from the
+same unauthenticated config-load / HA-sync ingress. `addError`/`addErrorf` now
+cap the RETAINED diagnostic set at `maxParseErrors` (64): past the cap they
+count the drop in `Parser.suppressed` (and skip formatting) instead of
+appending, and `Parse` folds the count into ONE deterministic trailing
+`additional parse errors suppressed (N)` diagnostic — so `len(errs)` is bounded
+to `maxParseErrors+1` and the retained heap to O(cap) regardless of input size.
+The first ≤64 diagnostics keep their parse order + line/column. The lexer still
+drains the whole input O(input) for deterministic termination (only the
+parser's RETENTION is capped), mirroring the `skipToBlockClose` depth-cap
+suppression. `ParseSetVerb`/`ParseSetCommand` (flat-set) are already bounded —
+they return on the FIRST bad token. Do NOT remove the cap. Regression coverage:
+`pkg/config/parser_error_cap_5827_test.go` (16 MiB bound + retained-heap budget
++ ordering + depth×token interaction + `FuzzParseErrorBound_5827`),
+`pkg/configstore/parse_error_cap_5827_test.go` (load-path concise-error /
+no-partial-apply).
 - `ParseSetCommand(input string) ([]string, error)` — `parser.go`.
   Parses one flat-set line into the path components. The caller then
   applies that path with `tree.SetPath()` to build the AST.
