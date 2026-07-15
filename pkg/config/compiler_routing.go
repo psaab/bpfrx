@@ -640,10 +640,37 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 		}
 	}
 
-	// Parse policy-statements
+	// Parse policy-statements. A named policy-statement may be defined across
+	// MULTIPLE separate hierarchical blocks (two `policy-statement NAME { ... }`
+	// braces), repeated `policy-options` roots, or group-expanded fragments —
+	// each is a distinct AST instance. Flat `set policy-options policy-statement
+	// NAME ...` lines already COMPOSE under one node via SetPath, so hierarchical
+	// must merge the same way or the two shapes diverge. Reuse the existing map
+	// entry AND a per-policy term index that persists ACROSS instances so later
+	// blocks MERGE into the earlier one: new terms append in first-authored ORDER
+	// (routing policy is ordered security/route-control state — an earlier reject
+	// term must not be lost or reordered), and a repeated fragment of the SAME
+	// term composes onto the existing PolicyTerm (route-filters / from / then all
+	// accumulate). Mirrors the prefix-list / community merge loops above (#5824).
+	//
+	// The pre-#5824 code created a FRESH PolicyStatement per instance and did an
+	// unconditional `po.PolicyStatements[ps.Name] = ps`, so a second same-name
+	// block silently REPLACED the first — its terms / route-filters / actions /
+	// default action vanished. FRR then received a valid but INCOMPLETE route-map
+	// (a lost reject term over-exports/over-imports; a lost accept term withdraws
+	// reachability) while commit and daemon apply both looked successful.
+	psTermIndex := make(map[string]map[string]*PolicyTerm)
 	for _, inst := range namedInstances(node.FindChildren("policy-statement")) {
-		ps := &PolicyStatement{Name: inst.name}
-		termsByName := make(map[string]*PolicyTerm)
+		ps := po.PolicyStatements[inst.name]
+		if ps == nil {
+			ps = &PolicyStatement{Name: inst.name}
+			po.PolicyStatements[inst.name] = ps
+		}
+		termsByName := psTermIndex[inst.name]
+		if termsByName == nil {
+			termsByName = make(map[string]*PolicyTerm)
+			psTermIndex[inst.name] = termsByName
+		}
 
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
@@ -687,8 +714,9 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 				}
 			}
 		}
-
-		po.PolicyStatements[ps.Name] = ps
+		// #5824: NO unconditional overwrite here — ps is the SHARED map entry, so
+		// this instance's contributions are already merged into any earlier
+		// same-name block's terms/actions in authored order.
 	}
 
 	return nil

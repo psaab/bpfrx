@@ -1719,6 +1719,36 @@ is exactly the repetition). The ordered list lands in `PolicyTerm.ASPathPrepend
 `TestGeneratePolicyOptions_ASPathPrepend` in
 `pkg/frr/policy_as_path_prepend_2892_test.go` (render).
 
+### Repeated policy-statement blocks MERGE, not last-win (#5824)
+
+A single `policy-options policy-statement <name>` may be authored across MULTIPLE
+separate hierarchical blocks (two `policy-statement P { ... }` braces), repeated
+`policy-options` roots, or group-expanded fragments — each is a distinct AST
+instance. `compilePolicyOptions` (`compiler_routing.go`) used to build a FRESH
+`PolicyStatement` per instance and do an unconditional
+`po.PolicyStatements[name] = ps`, so a second same-name block silently REPLACED
+the first — its terms, route-filters, actions, and default action vanished. Flat
+`set policy-options policy-statement P term ...` lines COMPOSE under one node via
+`SetPath`, so the hierarchical and flat spellings of the same policy diverged.
+Routing policy is ORDERED security/route-control state: a lost reject term
+over-exports/over-imports and a lost accept term withdraws reachability, while
+FRR receives a valid-but-incomplete route-map and commit + daemon apply both
+look successful.
+
+The policy-statement loop now mirrors the sibling `prefix-list` (#2641) and
+`community` (#2587) merge loops above: it REUSES the existing map entry AND a
+per-policy term index that persists ACROSS instances, so later blocks MERGE into
+the earlier one — new terms append in first-authored ORDER, and a repeated
+fragment of the SAME term composes onto the existing `PolicyTerm` (from-match /
+route-filters / then-action all accumulate via `parsePolicyTermChildren`). The
+policy-level default `then` composes as flat-set does (last-non-empty wins), so
+the two spellings compile to an identical `PolicyStatement`. Fail-on-revert
+covered by `pkg/config/compiler_policy_block_merge_5824_test.go` (two-block
+merge, hierarchical==flat parity, same-term-across-blocks compose, single-block
+unchanged) and the end-to-end render guard
+`pkg/frr/policy_block_merge_5824_test.go` (the early reject term's `deny`
+sequence + route-filter survive into the FRR route-map).
+
 ### Quoted-value escape round-trip contract (#3854)
 
 When a key or value contains a character that is not a bare Junos identifier
