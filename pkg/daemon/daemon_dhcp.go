@@ -90,7 +90,13 @@ func (d *Daemon) onDHCPAddressChange() {
 			d.applyConfig(activeCfg)
 		} else {
 			slog.Info("DHCP address changed on management-only interface, refreshing management routes")
-			d.applyMgmtVRFRoutes()
+			// #5867: no commit to fail on this DHCP-callback path (it is a
+			// lease-change refresh, not a config commit) — a RouteReplace /
+			// cleanup failure is logged. The stale-route cleanup still applies
+			// (the reconcile removes any route left unapplied).
+			if err := d.applyMgmtVRFRoutes(); err != nil {
+				slog.Warn("mgmt VRF routes: refresh on DHCP lease change had errors", "err", err)
+			}
 			// #1715 (fw0 class): a management-only interface (e.g.
 			// fxp0 DHCPv4) takes this branch and does NOT recompile,
 			// so DNS would never reconcile without this call. Route

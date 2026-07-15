@@ -48408,3 +48408,43 @@ top.
   probe-owned-DeadlineExceeded tests stay GREEN (no over-neutralization).
   (NOTE: the shared GOCACHE=/dev/shm/cache was contaminated by a prior
   worktree — a fresh cache builds clean; used /dev/shm/cache5852.)
+
+- **Timestamp**: 2026-07-15
+  **Action**: #5867 (bug, audit, security): failed management-VRF route
+  replacement preserved a stale gateway/ifindex as "desired". applyMgmtVRFRoutes
+  (pkg/daemon/daemon_flow.go) keyed its cleanup protect-set on
+  destination+family ONLY and inserted the key BEFORE RouteReplace succeeded,
+  and dropped the RouteReplace error. So a route that kept its destination but
+  changed gateway/output-interface and then FAILED to replace left the OLD stale
+  route in the kernel yet still protected from cleanup — management traffic
+  pinned to a stale/de-authorized gateway while the commit reported success.
+  Fixed by modeling DESIRED vs APPLIED separately: new mgmtRouteAppliedKey (dst +
+  gateway + link index) keys the protect-set on the FULL route identity, a route
+  is added to it ONLY after RouteReplace SUCCEEDS, and mgmtVRFRoutesToDelete
+  matches kernel routes against that full identity — so a stale same-destination
+  route (old gw/ifindex) is NOT protected and the reconcile deletes it.
+  applyMgmtVRFRoutes now returns the joined RouteReplace + non-ESRCH delete
+  errors; split into a thin wrapper + injectable applyMgmtVRFRoutesTo(nlh,
+  leases, mgmtSet) core (new mgmtRouteProgrammer seam). The error is threaded
+  into commit truth via the DEFERRED tail-join (#5310/#5844 pattern): the call
+  moved out of applyVRFReconcile (whose error early-aborts at daemon_apply.go:750
+  and would skip the dataplane apply) into applyConfigLocked as a deferred
+  mgmtRouteErr local, joined by applyTailReconciles (8th deferred arg) — so a
+  stale-pin failure fails the commit closed without skipping the rest of the
+  apply. The DHCP-callback refresh path (daemon_dhcp.go) logs the error (no
+  commit to fail). Happy path (successful gateway change) supersedes the old
+  route cleanly and protects the new identity — unchanged.
+  **File(s)**: pkg/daemon/daemon_flow.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_dhcp.go, pkg/daemon/mgmtvrf_route_applied_5867_test.go,
+  pkg/daemon/mgmtvrf_route_reconcile_5108_test.go (helper split
+  desiredKey=dest / appliedKey=full-tuple), plus the 4 applyTailReconciles
+  test callers updated for the 9th arg, _Log.md
+  **Validation**: `go build ./...`; `go test ./pkg/daemon/ -count=1` (green);
+  `go vet ./pkg/daemon/` clean. Fail-on-revert: fake netlink handle drives a
+  same-dest gateway change whose RouteReplace FAILS —
+  TestApplyMgmtVRFRoutes_FailedGatewayChangeCleansStaleRoute_5867 asserts the
+  error is surfaced AND the stale route is deleted; reverting to the dest-only
+  key + insert-before-replace leaves the stale route protected (deleted=[]) →
+  RED (verified). A successful-gateway-change test guards the happy path (no
+  over-cleanup). Note: shared GOCACHE=/dev/shm/cache still yields a phantom
+  pkg/config redeclare error from a prior worktree — used a fresh cache.

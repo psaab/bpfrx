@@ -130,7 +130,7 @@ func TestApplyTailReconcilesSurfacesRoutingRuleError_5844(t *testing.T) {
 	injected := errors.New("injected: next-table ip-rule reconcile failed")
 	// routingRuleErr is the final applyTailReconciles operand; every other
 	// deferred error is nil so it is the only thing that can surface.
-	err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, injected)
+	err := d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, injected, nil)
 	if err == nil {
 		t.Fatal("applyTailReconciles must surface the routing-rule reconcile failure " +
 			"(fail-closed); got nil")
