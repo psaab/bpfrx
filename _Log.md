@@ -48513,6 +48513,35 @@ top.
 - **File(s)**: pkg/grpcapi/server_diag_monitor.go, pkg/grpcapi/monitor_packet_drop_subscriber_cap_5850_test.go, pkg/logging/README.md
 
 - **Timestamp**: 2026-07-15
+  **Action**: #5822 (bug): config AST CopyPath could not resolve an existing
+  non-first same-keyword destination parent (and silently duplicated on
+  collision). CopyPath (pkg/config/ast_edit.go) resolved the destination parent
+  via insertNode (pkg/config/ast.go), whose per-level loop broke on the FIRST
+  child whose first keyword matched (matchNodeKeys returns 1 on a keyword-only
+  partial match) — so `copy ... to policy Z` with siblings [A B Z] descended
+  into policy A, could not find the rest of the dest-parent path, and failed
+  "destination parent ... not found" (or, on a resolvable existing target,
+  silently appended a duplicate). Fixed by routing CopyPath's dest-parent
+  resolution through childrenAtPath (longest-consumed-match) — the SAME resolver
+  RenamePath uses — unifying the two edit paths onto one navigator (the
+  divergence WAS the bug, per the issue). Added a collision guard (reject a copy
+  onto an existing same-identity target with keysEqual, like RenamePath) and
+  made it atomic (resolve parent + collision-check fully, THEN clone+append — a
+  failed copy leaves the tree byte-for-byte unchanged). A missing destination
+  parent (and a missing source) now wraps config.ErrPathNotFound so callers can
+  errors.Is it. Removed the now-dead insertNode helper (its only caller was
+  CopyPath).
+  **File(s)**: pkg/config/ast_edit.go, pkg/config/ast.go,
+  pkg/config/copypath_sibling_5822_test.go,
+  pkg/configstore/copy_sibling_5822_test.go, docs/config-schema.md, _Log.md
+  **Validation**: `go build ./...`; `go vet ./pkg/config/ ./pkg/configstore/`
+  clean; `go test -race ./pkg/config/ ./pkg/configstore/` green. Fail-on-revert:
+  restoring origin/master's ast.go+ast_edit.go (insertNode) flips the new tests
+  RED — non-first (app2/app3) + nested + integration copies error "destination
+  parent ... not found"; collision copy silently succeeds+duplicates;
+  missing-parent error is not ErrPathNotFound-wrapped. first-sibling (app1) is a
+  passing control. (Used a fresh GOCACHE=/dev/shm/cache5822 — shared cache is
+  contaminated.)
 - **Action**: #5849 (security) — gRPC config-lock lifecycle was owned by a per-RPC unary interceptor (configLockInterceptor) that, after every RPC, called ExitConfigureSession (DESTRUCTIVE: candidate=nil, dirty=false, lock released) when ctx.Err()!=nil, keyed by the peer ADDRESS. So per-RPC cancellation (a client Ctrl-C'ing one unrelated read, a request deadline) wiped a connection's staged candidate + released its lock, and a reused peer address could inherit/release an earlier session. Fixed: deleted configLockInterceptor; added configLockStatsHandler (a gRPC stats.Handler) installed on BOTH the loopback and fabric servers — TagConn allocates an unguessable crypto/rand connection id onto the conn context; connSessionID(ctx) reads it (fallback to peer for direct/in-process callers); ConnEnd releases ExitConfigureSession(connID) EXACTLY once (per-conn sync.Once + the store's holder guard), never on per-RPC cancellation. All 9 config-RPC keying sites in server_config.go moved from peerSessionID → connSessionID in lockstep. Explicit ExitConfigure (immediate) + the store idle-lease reclaim (reclaimStaleLockLocked, #4476) retained as backstops. Fabric handler is a no-op (allowlist never admits config RPCs) kept for a uniform contract. Tests (config_session_lifecycle_5849_test.go, bufconn + unit): reconnect-same-addr-cannot-inherit (deterministic headline), stats.Handler releases-exactly-once-on-ConnEnd (+ per-RPC/ConnBegin do NOT release), connSessionID identity (distinct per conn), per-RPC-cancel-does-not-tear-down, explicit-exit-immediate. Fail-on-revert verified firsthand: reverting connSessionID→peerSessionID makes reconnect-inherit RED (conn2 inherits conn1's leaked session because ConnEnd releases connID while RPCs key addr); restore→GREEN. Updated existing TestLoopbackListenerUnaffected (4122) + shutdown test (4910) for the deleted interceptor. gofmt/go vet ./pkg/grpcapi ./pkg/configstore/go build ./... clean; go test -race ./pkg/grpcapi/ ./pkg/configstore/ green. Docs: pkg/grpcapi/README.md + pkg/configstore/README.md config-session identity contract updated (connection-scoped id, ConnEnd release, no per-RPC teardown).
 - **File(s)**: pkg/grpcapi/config_session_lifecycle.go (new), pkg/grpcapi/config_session_lifecycle_5849_test.go (new), pkg/grpcapi/server.go, pkg/grpcapi/server_config.go, pkg/grpcapi/server_fabric_allowlist_4122_test.go, pkg/grpcapi/server_shutdown_monitor_4910_test.go, pkg/grpcapi/README.md, pkg/configstore/README.md
   **Action**: #5867 review-fold — add TestApplyTailReconcilesSurfacesMgmtRouteError_5867 (deferred-tail-join wiring regression test mirroring #5844) per independent-review MINOR; injects a sentinel as the final applyTailReconciles operand and asserts errors.Is(commitErr, sentinel) so dropping mgmtRouteErr from the tail errors.Join is fail-on-revert-caught. Production unchanged.

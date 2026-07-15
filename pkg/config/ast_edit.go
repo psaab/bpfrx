@@ -17,25 +17,63 @@ import (
 // remaining string matchers continue to work during the transition.
 var ErrPathNotFound = errors.New("path not found")
 
-// CopyPath copies a subtree from src to dst path.
-// The destination's last N keys (where N = len(sourceNode.Keys)) replace the source keys.
+// CopyPath copies a subtree from src to dst, replacing the source node's keys
+// with the destination's last N keys (N = len(sourceNode.Keys)).
+//
+// Both the source node and the destination PARENT are resolved by FULL identity
+// via the longest-consumed-match navigator (findNodeWithParent / childrenAtPath) —
+// the SAME resolver RenamePath uses — NOT the first-keyword-match insertNode the
+// pre-#5822 implementation used. insertNode stopped at the FIRST child whose
+// first keyword matched (matchNodeKeys returns a 1-key partial match when the
+// keyword matches but later keys differ), so a copy whose destination parent was
+// a NON-FIRST same-keyword sibling — e.g. `copy ... to policy Z` with siblings
+// [policy A, policy B, policy Z] — descended into `policy A` and inserted the
+// clone under the WRONG subtree (insertion-order dependent). This is the copy-side
+// sibling of the #3982 rename-side fix; keeping two navigators with different
+// ambiguity semantics WAS the bug, so insertNode is removed and both edit paths
+// now share one resolver.
+//
+// Collision + atomicity: a copy whose new identity already exists under the
+// destination parent is REJECTED (not silently merged or duplicated), mirroring
+// RenamePath's collision guard. The destination parent is resolved and the
+// collision checked BEFORE any mutation, and the source is cloned only after both
+// pass, so a failed copy (missing destination parent OR collision) leaves the
+// tree byte-for-byte unchanged. A missing destination parent wraps ErrPathNotFound
+// so callers can classify it with errors.Is.
 func (t *ConfigTree) CopyPath(src, dst []string) error {
 	if len(src) == 0 || len(dst) == 0 {
 		return fmt.Errorf("empty path")
 	}
 	srcNode, _, err := t.findNodeWithParent(src)
 	if err != nil {
-		return fmt.Errorf("source not found: %s", strings.Join(src, " "))
+		return fmt.Errorf("%w: source %s", ErrPathNotFound, strings.Join(src, " "))
 	}
-	cloned := cloneNodes([]*Node{srcNode})[0]
 	nk := len(srcNode.Keys)
 	if len(dst) < nk {
 		return fmt.Errorf("destination path too short")
 	}
-	cloned.Keys = append([]string(nil), dst[len(dst)-nk:]...)
-	// Find the parent for the destination
+	newKeys := append([]string(nil), dst[len(dst)-nk:]...)
 	dstParentPath := dst[:len(dst)-nk]
-	return t.insertNode(dstParentPath, cloned)
+
+	// Resolve the destination parent via the longest-consumed-match navigator so a
+	// non-first same-keyword sibling parent is reached by full identity (#5822).
+	dstParent, err := t.childrenAtPath(dstParentPath)
+	if err != nil {
+		return fmt.Errorf("%w: destination parent %s", ErrPathNotFound, strings.Join(dstParentPath, " "))
+	}
+	// Collision guard: reject a copy onto an existing same-identity target rather
+	// than silently duplicating it. Checked BEFORE any mutation.
+	for _, n := range *dstParent {
+		if keysEqual(n.Keys, newKeys) {
+			return fmt.Errorf("copy target already exists: %s", strings.Join(dst, " "))
+		}
+	}
+	// All checks passed — now (and only now) mutate: clone the source subtree,
+	// stamp the destination keys, and append under the resolved parent.
+	cloned := cloneNodes([]*Node{srcNode})[0]
+	cloned.Keys = newKeys
+	*dstParent = append(*dstParent, cloned)
+	return nil
 }
 
 // RenamePath moves a subtree from src to dst path.

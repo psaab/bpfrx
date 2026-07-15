@@ -634,6 +634,29 @@ append-on-reinsert) was removed. Covered by `TestRenameNonFirstSibling` in
 `A->A2` still works, colliding `B->C` rejected with the tree unchanged, and a
 post-rename `CompileConfig` seeing `[A B2 C]`).
 
+**Copy-side contract: same resolver, same collision rule (#5822).** `copy <src>
+to <dst>` (`CopyPath`, `ast_edit.go`) is the copy-side sibling of the rename fix.
+The pre-#5822 implementation resolved the DESTINATION PARENT through `insertNode`,
+whose per-level loop broke on the FIRST child whose FIRST key matched (the same
+`matchNodeKeys`-returns-`1` keyword-only match) — so a copy whose destination
+parent was a non-first same-keyword sibling (`copy ... to policy Z` with siblings
+`[A B Z]`) descended into `policy A`, could not find the rest of the
+destination-parent path, and failed `destination parent ... not found` (the issue
+title), or — on a resolvable-but-existing target — silently appended a DUPLICATE.
+`CopyPath` now resolves BOTH the source (`findNodeWithParent`) and the destination
+parent (`childrenAtPath`) by full identity — the SAME longest-key-match navigator
+`RenamePath` uses — so the two edit paths no longer carry divergent navigation
+semantics (that divergence WAS the bug). It rejects a copy whose new identity
+already exists under the destination parent (never a silent merge/duplicate), and
+resolves + validates fully BEFORE cloning/appending so a failed copy (missing
+destination parent OR collision) leaves the tree byte-for-byte unchanged; a
+missing destination parent wraps `config.ErrPathNotFound`. The now-dead
+first-keyword-match `insertNode` helper was removed. Covered by
+`copypath_sibling_5822_test.go` (`pkg/config`) — first/middle/last + nested
+multi-key sibling parents, collision-rejected-unchanged, missing-parent sentinel
+— and `copy_sibling_5822_test.go` (`pkg/configstore`, the operational
+`Store.Copy` path).
+
 **`annotate <path> "comment"` resolves through `navigatePath` (#4587).**
 `annotate` attaches a `/* comment */` to the statement at a path, and — like
 `delete`/`deactivate`/`rename` above — the path routinely crosses NAMED /
