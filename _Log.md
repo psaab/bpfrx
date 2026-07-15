@@ -48682,3 +48682,22 @@ top.
 - **Timestamp**: 2026-07-15
   - **Action**: #5795 fix — DHCP renewal-timer RFC schedule. renewalTimers dropped the fixed 30s T1 / 1s T2 floor that pushed T1 past the RFC half-life for leases <60s and scheduled the renew at/after expiry for leases <30s (short-lease WAN forwarded on an expired binding). Now pure RFC 2131: t1=lease/2, t2Remaining=3/8·lease, plus an ok bool — a non-positive lease returns ok=false and both run loops fail closed into re-acquisition (paced by reacquireBackstop) instead of manufacturing a 30s plan. Infinite-sentinel divide-first form (#4526) preserved. Corrected commit_test.go rows that canonized the bug; added 1s/2s/30s/59s/60s + zero/negative/infinite boundary coverage and a strictly-before-expiry invariant. RED-on-revert confirmed: restoring the 30s/1s clamp turns the short-lease rows RED (2s→T2 at 31s vs 2s lease) via -overlay, worktree untouched.
   - **File(s)**: pkg/dhcp/commit.go, pkg/dhcp/dhcp.go, pkg/dhcp/renew.go, pkg/dhcp/commit_test.go, pkg/dhcp/README.md
+## 2026-07-15 — #5825 scheduler block-merge (mirrors #5824)
+
+- **Timestamp**: 2026-07-15
+- **Action**: compileSchedulers allocated a FRESH SchedulerConfig per named AST
+  instance then unconditionally cfg.Schedulers[name]=sched, so a repeated
+  hierarchical `schedulers scheduler S {}` block (or a second top-level
+  `schedulers {}` root) REPLACED the earlier — every day/window authored earlier
+  vanished (a time-gated policy then active/inactive on the WRONG days). FIX:
+  reuse the existing map entry so distinct weekday windows UNION across
+  blocks/roots (Days map on the reused struct; no separate index needed). Scalars
+  (daily/date/all-day) follow flat-set/Junos-merge last-wins. Removed the
+  unconditional overwrite.
+- **File(s)**: pkg/config/compiler_system.go (reuse-and-merge),
+  pkg/config/compiler_scheduler_block_merge_5825_test.go (NEW 5 tests),
+  docs/config-schema.md (#5825 block-merge subsection).
+- **Validation**: go build ./... clean; go vet ./pkg/config/ clean; go test -race
+  ./pkg/config/ -run Scheduler GREEN; full pkg/config suite GREEN. Fail-on-revert:
+  restoring fresh-alloc+overwrite via -overlay -> the 4 merge tests RED (only the
+  last block's day survives), single-block stays green.
