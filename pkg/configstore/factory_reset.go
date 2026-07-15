@@ -28,6 +28,17 @@ import (
 // Production code must never mutate it.
 var DefaultArchiveDir = "/var/lib/xpf/archive"
 
+// RescueConfigBase is the fixed base name of the xpf rescue configuration file
+// the daemon writes alongside the live config (Store.rescuePath ->
+// "<configDir>/rescue.conf"). It is the full active-config TEXT with cleartext
+// secret leaves (IKE PSK, WireGuard keys, SNMP communities, #4056), so a factory
+// reset must erase it. It is a named constant — rather than a bare "rescue.conf"
+// literal scattered across the wipe primitives — so the config-state wipe's
+// ownership-scoped top-level match (#5768) deletes EXACTLY this xpf-owned name
+// instead of a broad `*.conf` glob that also caught unowned siblings. KEEP IN
+// SYNC with Store.rescuePath; the grpcapi wipe mirror references this const.
+const RescueConfigBase = "rescue.conf"
+
 // FactoryResetArchiveDir erases the LOCAL configuration archive as part of a
 // factory reset (#5186) — but ONLY when archiveDir is the xpf-owned default.
 //
@@ -94,10 +105,14 @@ func FactoryResetArchiveDir(archiveDir string) error {
 
 // FactoryResetForbiddenRoots are directories a factory-reset config-state wipe
 // must NEVER treat as an xpf-owned config root (#5684). FactoryResetConfigDir
-// scans configDir for *.conf / rollback* / journal / numbered-text-rollback /
-// fsatomic-temp artifacts and RemoveAll's <configDir>/.configdb — every removal
-// is bounded to configDir, but configDir itself is derived from
-// filepath.Dir(store.ConfigPath()). A daemon started with a custom `-config`
+// erases the xpf-owned config-state artifacts under configDir (the live config,
+// rescue.conf, the audit journal, the numbered text rollback slots, fsatomic
+// temps) and RemoveAll's <configDir>/.configdb. #5768 tightened the top-level
+// match from a broad `*.conf` / `rollback*` glob to those EXACT xpf-owned names
+// so an unowned sibling in the same directory is never deleted; this denylist
+// remains as defense-in-depth against ever entering the wipe on a shared root at
+// all. Every removal is bounded to configDir, but configDir itself is derived
+// from filepath.Dir(store.ConfigPath()). A daemon started with a custom `-config`
 // placed DIRECTLY in a shared directory (`-config /etc/xpf.conf` → configDir
 // "/etc"; `-config /srv/site.conf` → "/srv") or pointed at a directory-shaped
 // path (`-config /srv/firewall`, where filepath.Dir climbs to the PARENT
@@ -177,11 +192,14 @@ func ValidateFactoryResetRoot(configDir string) error {
 //     whole tree must go or the "erased" config is restored.
 //   - .config.journal[.N]   — the JSONL audit journal + rotated segments
 //     (prior-tenant commit history; legacy fat lines may carry full config).
+//   - <configBase>          — the LIVE config file, matched by EXACT name (#5768)
+//     so a non-".conf" -config base (e.g. site.cfg) is erased too, and a broad
+//     `*.conf` glob no longer catches unowned siblings.
+//   - rescue.conf           — the rescue config (RescueConfigBase / rescuePath):
+//     the full active-config TEXT with cleartext secret leaves (#4056).
 //   - <configBase>.<N>      — the canonical text rollback slots (full config
 //     text with cleartext secret leaves; loadRollbackHistory reads them at
 //     boot, so leaving them behind allows a rollback to the prior config).
-//   - *.conf                — the live config + rescue.conf (legacy set).
-//   - rollback*             — legacy rollback naming (pre-DB set).
 //   - .<base>.tmp-*         — fsatomic crash-leaked write temps (#5475): a
 //     daemon killed between fsatomic's CreateTemp and its rename leaves a
 //     ".<base>.tmp-<rand>" file (pkg/fsatomic createTemp) still holding the FULL
@@ -215,9 +233,11 @@ func ValidateFactoryResetRoot(configDir string) error {
 func FactoryResetConfigDir(configDir, configBase string) error {
 	// #5684: refuse to wipe a shared/parent/system directory. configDir is
 	// filepath.Dir(store.ConfigPath()); a custom -config placed in (or resolving
-	// to) a shared directory would turn this into a broad deletion of *.conf /
-	// .configdb / tls siblings xpf does not own. Fail CLOSED — surface the error
-	// and remove NOTHING — rather than erase the wrong tree.
+	// to) a shared directory must never let the reset RemoveAll <configDir>/.configdb
+	// (a dedicated xpf subdir) on a tree xpf does not own. #5768 additionally
+	// scopes the top-level file sweep below to EXACT xpf-owned names (no `*.conf` /
+	// `rollback*` glob), but this guard stays as defense-in-depth: fail CLOSED —
+	// surface the error and remove NOTHING — rather than enter the wipe at all.
 	if err := ValidateFactoryResetRoot(configDir); err != nil {
 		return err
 	}
@@ -247,18 +267,31 @@ func FactoryResetConfigDir(configDir, configBase string) error {
 	// residual key). RemoveAll erases the whole tree and is nil on absent.
 	fail(os.RemoveAll(dbDir))
 
-	// Top-level artifacts in a single ReadDir pass: the live/rescue .conf, the
-	// legacy rollback* files, the audit journal (+ rotated segments), and the
-	// numbered text rollback slots.
+	// Top-level artifacts in a single ReadDir pass. #5768: match ONLY names xpf
+	// itself created/tracks — the live config file, the rescue config, the audit
+	// journal (+ rotated segments), the numbered text rollback slots, and
+	// fsatomic crash temps. The pre-#5768 code matched a broad `*.conf` suffix and
+	// `rollback*` prefix, which — when a custom -config resolved configDir to a
+	// shared or subdir location that slipped past ValidateFactoryResetRoot —
+	// deleted UNOWNED siblings (a neighbor's foo.conf, xpf's own rendered
+	// /etc/frr/frr.conf, an unrelated rollback-notes file). Ownership scoping,
+	// not a bigger denylist, bounds the wipe to xpf's own artifacts. Note the
+	// exact live-config match also erases a non-".conf" -config base (e.g.
+	// site.cfg) the old suffix glob would have LEFT behind. configstore no longer
+	// writes any top-level `rollback*` file: the canonical text rollback slots are
+	// "<configBase>.<N>" (isTextRollbackSlot) and the DB slots live inside
+	// .configdb (RemoveAll'd above), so dropping the legacy `rollback*` prefix
+	// loses no owned artifact. isFsatomicTemp stays a shape match: under-scoping a
+	// temp risks stranding an owned secret-bearing temp (#5475), the worse failure.
 	entries, err := os.ReadDir(configDir)
 	fail(err)
 	for _, f := range entries {
 		name := f.Name()
-		if strings.HasSuffix(name, ".conf") ||
-			strings.HasPrefix(name, "rollback") ||
+		if name == configBase || // the live config file (exact name, any extension)
+			name == RescueConfigBase || // the rescue config (rescuePath)
 			name == ".config.journal" ||
 			strings.HasPrefix(name, ".config.journal.") ||
-			isTextRollbackSlot(name, configBase) ||
+			isTextRollbackSlot(name, configBase) || // <configBase>.<N> text slots
 			isFsatomicTemp(name) {
 			fail(os.Remove(filepath.Join(configDir, name)))
 		}
