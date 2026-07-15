@@ -59,6 +59,45 @@
   pkg/cli/cli_clear_exact_arity_5811_test.go (Write), pkg/cli/README.md (Edit),
   _Log.md (Edit)
 
+## 2026-07-15 — #5853 (bug): event-options action queue dedups early (one-per-policy on every enqueue)
+- **Timestamp**: 2026-07-15 (fix/5853-eventqueue-dedup-early)
+- **Action**: The action queue documents "at most one pending action per policy"
+  (dedup-by-policy) but `enqueue` (pkg/eventengine/engine.go) did an unconditional
+  fast-path channel send and only ran the `supersede` dedup in the full/`default`
+  branch. So while the worker was blocked behind the config lock, a burst from ONE
+  policy filled all 64 slots with redundant duplicates (later discarded by
+  cooldown/staleness) and the NEXT remediation for an UNRELATED policy was dropped
+  queue-full — one flapping policy could starve every other policy. Fix: enqueue
+  now runs `supersede` on EVERY enqueue (removed the fast-path send + default), so
+  a same-policy duplicate REPLACES the queued entry (≤1 slot) instead of taking a
+  new one, leaving slots free for other policies. Reused the already-proven
+  supersede (drain → drop same-policy → refill survivors FIFO + new at tail,
+  #2869) under the producer-only enqueueMu — worker stays lock-free, no new shared
+  state. Counter correctness: the same-policy supersede-drop now increments a new
+  `Superseded` counter (benign dedup — the newer equivalent action still runs)
+  instead of `droppedQueueFull`; droppedQueueFull is reserved for genuine capacity
+  loss (queue full of OTHER policies, unfittable new arrival / lost survivor), so
+  the alert-worthy `xpf_event_actions_dropped_total{reason=queue_full}` metric is
+  no longer inflated by routine bursts. Exposed `xpf_event_actions_superseded_total`
+  in the Prometheus collector.
+- **Validation**: gofmt clean; go build ./...; go vet ./pkg/eventengine/
+  ./pkg/api/ clean; go test ./pkg/eventengine/ -race + ./pkg/api/ green.
+  Fail-on-revert: a same-policy burst of exactly actionQueueDepth events occupies
+  1 slot (pre-fix 64) and an unrelated policy still enqueues (pre-fix dropped);
+  reverting enqueue to dedup-only-when-full flips the new
+  TestQueue_SamePolicyBurstDoesNotStarveOthers_5853 + the updated
+  TestQueue_DedupByPolicy (Superseded>=1 / DroppedQueueFull==0 / QueueDepth<=1)
+  RED. The #3750 cooldown-suppresses-queued-duplicate test behavior is preserved
+  (event #1 is in-flight in the worker, so the early dedup finds nothing queued to
+  supersede and #2 still queues) — comment updated.
+- **File(s)**: pkg/eventengine/engine.go (Edit),
+  pkg/eventengine/engine_dedup_early_5853_test.go (Write),
+  pkg/eventengine/engine_integration_test.go (Edit),
+  pkg/eventengine/engine_stale_revalidate_3750_test.go (Edit),
+  pkg/eventengine/README.md (Edit), pkg/api/metrics.go (Edit),
+  pkg/api/metrics_descriptors.go (Edit), pkg/api/metrics_system.go (Edit),
+  _Log.md (Edit)
+
 ## 2026-07-15 — #5738 (bug/syslog) commit 2/2: CLI reloadSyslog source-iface + event-mode parity
 - **Timestamp**: 2026-07-15 (fix/5738-syslog-source-iface-parity)
 - **Action**: Aligned the CLI in-process commit path (reloadSyslog /

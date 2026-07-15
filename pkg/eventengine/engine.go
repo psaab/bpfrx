@@ -94,7 +94,10 @@ const policyCooldown = 30 * time.Second
 // actionQueueDepth bounds the worker's pending-action channel. Dedup-by-policy
 // (a newer trigger supersedes an older queued one) keeps at most one pending
 // action per policy, so this is also an upper bound on distinct policies with
-// a remediation in flight while the config lock is held.
+// a remediation in flight while the config lock is held. #5853: the dedup runs
+// on EVERY enqueue (not only when the channel is full), so a burst from ONE
+// policy occupies at most ONE slot — it can never fill the queue with redundant
+// duplicates and starve an unrelated policy's remediation into a queue-full drop.
 const actionQueueDepth = 64
 
 // Backoff schedule for a held config lock (#2157). The worker retries an
@@ -114,7 +117,8 @@ type Stats struct {
 	CommittedWithDebt uint64 // subset of Committed that promoted+armed but left a best-effort subsystem in debt (#5063)
 	Rejected          uint64 // actions rejected (bad plan / CommitCheck / commit not promoted)
 	Retried           uint64 // retry attempts after a held config lock
-	DroppedQueueFull  uint64 // actions superseded/evicted because the queue was full
+	DroppedQueueFull  uint64 // actions genuinely dropped: the queue was full of OTHER policies (a distinct policy could not fit, or a survivor was lost) — capacity loss, alert-worthy
+	Superseded        uint64 // same-policy queued actions REPLACED by a newer trigger (benign dedup; nothing lost — the newer equivalent action runs) (#5853)
 	DroppedLockHeld   uint64 // actions dropped after the lock-retry deadline elapsed
 	DroppedStale      uint64 // actions dropped at commit: policy removed/redefined or cooldown active (#3750)
 	AttributesInvalid uint64 // runtime fail-closed: malformed/unknown attributes-match line
@@ -128,6 +132,7 @@ type engineCounters struct {
 	rejected          atomic.Uint64
 	retried           atomic.Uint64
 	droppedQueueFull  atomic.Uint64
+	superseded        atomic.Uint64
 	droppedLockHeld   atomic.Uint64
 	droppedStale      atomic.Uint64
 	attributesInvalid atomic.Uint64
@@ -249,19 +254,18 @@ type Engine struct {
 
 	// enqueueMu serializes ALL producer-side queue mutation (#5062). HandleEvent
 	// releases e.mu (evaluateEvent returns) BEFORE it enqueues, so many RPM-probe
-	// goroutines run enqueue concurrently. When the bounded queue is full, enqueue
-	// falls into supersede, which DRAINS the accepted actions into a private slice
-	// (opening slots) and then best-effort re-enqueues the survivors. Without a
-	// producer lock a SECOND concurrent producer — via enqueue's fast-path send OR
-	// its own supersede — takes those drain-freed slots between the drain and the
-	// re-enqueue, so supersede's refill `default` branch DROPS a survivor (an
-	// already-accepted action for a DIFFERENT policy), losing it and its FIFO
-	// position (miscounted droppedQueueFull). Holding enqueueMu across the WHOLE
-	// enqueue (fast-path send AND the supersede drain+refill) makes the
-	// drain->re-enqueue atomic w.r.t. other producers: the only concurrent actor
-	// left is the consumer (actionWorker), which only REMOVES items, so a
-	// drain-freed slot can never be re-filled by anyone but supersede itself and a
-	// survivor is preserved exactly once, in FIFO order.
+	// goroutines run enqueue concurrently. Every enqueue runs supersede (#5853),
+	// which DRAINS the accepted actions into a private slice (opening slots),
+	// drops any same-policy entry, and then best-effort re-enqueues the survivors.
+	// Without a producer lock a SECOND concurrent producer — via its own supersede
+	// — takes those drain-freed slots between the drain and the re-enqueue, so
+	// supersede's refill `default` branch DROPS a survivor (an already-accepted
+	// action for a DIFFERENT policy), losing it and its FIFO position (miscounted
+	// droppedQueueFull). Holding enqueueMu across the WHOLE enqueue (the supersede
+	// drain+refill) makes the drain->re-enqueue atomic w.r.t. other producers: the
+	// only concurrent actor left is the consumer (actionWorker), which only
+	// REMOVES items, so a drain-freed slot can never be re-filled by anyone but
+	// supersede itself and a survivor is preserved exactly once, in FIFO order.
 	//
 	// Lock ordering (no cycle, no deadlock): enqueueMu is a producer-only LEAF
 	// lock. It is NEVER held while e.mu is held (enqueue runs after evaluateEvent
@@ -609,6 +613,7 @@ func (e *Engine) Stats() Stats {
 		Rejected:          e.counters.rejected.Load(),
 		Retried:           e.counters.retried.Load(),
 		DroppedQueueFull:  e.counters.droppedQueueFull.Load(),
+		Superseded:        e.counters.superseded.Load(),
 		DroppedLockHeld:   e.counters.droppedLockHeld.Load(),
 		DroppedStale:      e.counters.droppedStale.Load(),
 		AttributesInvalid: e.counters.attributesInvalid.Load(),
@@ -623,35 +628,54 @@ func (e *Engine) Stats() Stats {
 // actions, the new action is dropped (counted) rather than blocking the caller
 // goroutine (#2157 bounded queue).
 //
+// #5853: the dedup runs on EVERY enqueue via supersede, not only when the
+// channel is full. The pre-#5853 fast path did an UNCONDITIONAL send first and
+// only deduped in the full/`default` branch, so while the worker was blocked
+// behind the config lock a burst from ONE policy filled all 64 slots with
+// redundant duplicates (later discarded by cooldown/staleness) and the next
+// remediation for an UNRELATED policy was dropped queue-full. Draining and
+// replacing the same-policy entry up front keeps at most one pending action per
+// policy, so a same-policy burst occupies a single slot and leaves the rest free
+// for other policies. supersede is non-blocking (select-with-default drain +
+// refill), so this never blocks the caller even mid-shutdown (e.actions is never
+// closed); a genuine full-of-other-policies queue still drops the new action
+// (counted) via supersede returning false.
+//
 // The whole body runs under enqueueMu (#5062) so concurrent producers cannot
-// interleave: the fast-path send below and supersede's drain+refill must be
-// atomic w.r.t. one another, otherwise a second producer could take a slot
-// supersede freed while draining and force supersede to drop an already-accepted
-// survivor. See the enqueueMu field comment for the lock-ordering rationale.
+// interleave: supersede's drain+refill must be atomic w.r.t. other producers,
+// otherwise a second producer could take a slot supersede freed while draining
+// and force supersede to drop an already-accepted survivor. See the enqueueMu
+// field comment for the lock-ordering rationale.
 func (e *Engine) enqueue(a plannedAction) {
 	e.enqueueMu.Lock()
 	defer e.enqueueMu.Unlock()
+	// Fast exit during shutdown: don't churn the queue for an action the worker
+	// will never apply. supersede would otherwise still succeed (the channel is
+	// unbounded-in-shutdown only in that it is never closed), but there is no
+	// consumer left to drain it.
 	select {
-	case e.actions <- a:
-		e.counters.queueDepth.Add(1)
 	case <-e.stopCh:
-		// Shutting down; drop silently.
+		return
 	default:
-		// Queue full. Try to supersede a same-policy action by draining and
-		// re-enqueuing, dropping any older same-policy entry. Best-effort,
-		// non-blocking. Runs under enqueueMu so the drain-freed slots are never
-		// visible to another producer (#5062).
-		if e.supersede(a) {
-			return
-		}
-		e.counters.droppedQueueFull.Add(1)
-		slog.Warn("event-options: action queue full, dropping remediation",
-			"policy", a.policyName)
 	}
+	if e.supersede(a) {
+		return
+	}
+	// supersede could not place `a`: the queue is full of OTHER policies'
+	// actions and there was no same-policy entry to evict. This is the only
+	// genuine capacity drop (an unrelated policy really did fill the queue).
+	e.counters.droppedQueueFull.Add(1)
+	slog.Warn("event-options: action queue full, dropping remediation",
+		"policy", a.policyName)
 }
 
 // supersede non-blockingly rebuilds the queue, replacing any existing
-// same-policy action with a, and returns true if a was placed.
+// same-policy action with a, and returns true if a was placed. It is the SOLE
+// enqueue path (#5853): every enqueue drains the buffered queue, drops any
+// existing same-policy entry (benign dedup, counted as superseded), re-enqueues
+// the surviving OTHER-policy actions in FIFO order, and places a at the tail. It
+// returns false only when the queue is full of OTHER policies and a could not be
+// placed (a genuine capacity drop the caller counts as droppedQueueFull).
 //
 // CALLER MUST HOLD enqueueMu (#5062). That is what makes the drain->re-enqueue
 // atomic w.r.t. other producers: while this runs, no other enqueue/supersede can
@@ -669,8 +693,14 @@ func (e *Engine) supersede(a plannedAction) bool {
 		case old := <-e.actions:
 			e.counters.queueDepth.Add(-1)
 			if old.policyName == a.policyName {
-				// Drop the stale same-policy action; it is superseded.
-				e.counters.droppedQueueFull.Add(1)
+				// Drop the stale same-policy action; it is superseded by the
+				// newer trigger a. This is a benign dedup — the newer equivalent
+				// action still runs — NOT a capacity loss, so count it as
+				// superseded rather than droppedQueueFull (#5853). Inflating the
+				// alert-worthy queue_full metric on every same-policy burst
+				// (which the early dedup makes routine) would mask real capacity
+				// drops.
+				e.counters.superseded.Add(1)
 				continue
 			}
 			drained = append(drained, old)
