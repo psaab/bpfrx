@@ -604,31 +604,47 @@ func (m *Manager) ClearAllDUIDs() error {
 // a new one as needed. The result is cached in memory and persisted.
 func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
 	m.mu.Lock()
+	want := normalizeDUIDType(m.duidTypes[ifaceName])
 	if d, ok := m.duids[ifaceName]; ok {
-		m.mu.Unlock()
-		return d, nil
+		// #5855: only reuse the cached DUID when its ACTUAL type matches the
+		// requested mode. A `duid-ll`<->`duid-llt` config change restarts the
+		// client but leaves the OLD-type DUID cached; returning it kept the old
+		// identity indefinitely. On a mismatch, drop the stale cache and fall
+		// through to load/regenerate the requested type.
+		if actualDUIDType(d) == want {
+			m.mu.Unlock()
+			return d, nil
+		}
+		delete(m.duids, ifaceName)
 	}
-	duidType := m.duidTypes[ifaceName]
 	m.mu.Unlock()
 
-	// Try loading persisted DUID
-	if d, err := m.loadDUID(ifaceName); err == nil {
+	// Try the persisted DUID — reuse it ONLY when its type matches the requested
+	// mode (#5855). A persisted DUID of the RETIRED type is not reusable, but it
+	// IS retained below as the fail-safe fallback if regenerating the requested
+	// type cannot be persisted.
+	persisted, loadErr := m.loadDUID(ifaceName)
+	if loadErr == nil && actualDUIDType(persisted) == want {
 		m.mu.Lock()
-		m.duids[ifaceName] = d
+		m.duids[ifaceName] = persisted
 		m.mu.Unlock()
 		slog.Info("DHCPv6: loaded persisted DUID",
-			"interface", ifaceName, "duid", d)
-		return d, nil
+			"interface", ifaceName, "duid", persisted)
+		return persisted, nil
+	}
+	if loadErr == nil {
+		slog.Info("DHCPv6: persisted DUID type differs from configured mode; rotating",
+			"interface", ifaceName, "persisted", actualDUIDType(persisted), "want", want)
 	}
 
-	// Generate new DUID
+	// Generate a NEW DUID of the requested type.
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
 		return nil, fmt.Errorf("interface lookup for DUID: %w", err)
 	}
 
 	var duid dhcpv6.DUID
-	switch duidType {
+	switch want {
 	case "duid-llt":
 		// Time-based — stable only via persistence
 		epoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -637,22 +653,39 @@ func (m *Manager) getDUID(ifaceName string) (dhcpv6.DUID, error) {
 			Time:          uint32(time.Since(epoch).Seconds()),
 			LinkLayerAddr: iface.HardwareAddr,
 		}
-	default: // "duid-ll" or empty (default to LL)
+	default: // "duid-ll"
 		duid = &dhcpv6.DUIDLL{
 			HWType:        iana.HWTypeEthernet,
 			LinkLayerAddr: iface.HardwareAddr,
 		}
 	}
 
-	// Persist. A DUID-LLT embeds a generation timestamp, so a DUID-LLT that
-	// never reaches disk is EPHEMERAL: the next restart regenerates a different
-	// Time, the DHCPv6 server sees a brand-new client, and the old lease lingers
-	// (#4909). Surface the persist failure for the time-based DUID instead of
-	// silently handing out an unstable identity. A DUID-LL is a pure function of
-	// the hardware address — byte-identical across restart even if never
-	// persisted — so a persist failure there is benign and only logged.
+	// Persist the NEW identity durably BEFORE it is cached or returned, so the
+	// restarted client never sends an identity that is not on disk (a DUID-LLT
+	// embeds a generation timestamp — an unpersisted one is ephemeral, #4909).
 	if err := m.saveDUID(ifaceName, duid); err != nil {
-		if duidType == "duid-llt" {
+		// #5855 rotation fail-safe: the new-type identity is NOT durable. If a
+		// PREVIOUS identity is persisted (loadErr==nil, i.e. this is a type
+		// rotation), RETAIN it — keep the running client coherent on the OLD
+		// identity and expose NO unpersisted new DUID (a partially-rotated
+		// DUID-LLT would be ephemeral and diverge from disk). getDUID then keeps
+		// returning the old (persisted) type until a later reconcile persists the
+		// new one; show/API reports that actual active type.
+		if loadErr == nil {
+			m.mu.Lock()
+			m.duids[ifaceName] = persisted
+			m.mu.Unlock()
+			slog.Warn("DHCPv6: DUID type rotation persist failed; retaining the previous "+
+				"persisted identity (no unpersisted identity exposed)",
+				"interface", ifaceName, "want", want,
+				"retained", actualDUIDType(persisted), "err", err)
+			return persisted, nil
+		}
+		// Cold start — no prior identity to fall back to. A DUID-LLT that never
+		// reaches disk is ephemeral, so surface the failure (#4909). A DUID-LL is
+		// a pure function of the hardware address — byte-identical across restart
+		// even if never persisted — so a persist failure there is benign.
+		if want == "duid-llt" {
 			return nil, fmt.Errorf("persist DUID-LLT for %s (unstable across restart if not persisted): %w",
 				ifaceName, err)
 		}
@@ -723,6 +756,16 @@ func (m *Manager) loadDUID(ifaceName string) (dhcpv6.DUID, error) {
 	return dhcpv6.DUIDFromBytes(data)
 }
 
+// duidWriteFile persists DUID bytes durably. A package var so a test can inject
+// a persist failure to exercise the #5855 rotation fail-safe (keep the previous
+// identity, expose no unpersisted new DUID) — loadDUID reads through the real
+// filesystem, so an injected write failure leaves a pre-seeded old DUID
+// readable while the new-type write fails deterministically (regardless of the
+// test's uid, unlike an unwritable-dir trick).
+var duidWriteFile = func(path string, data []byte, perm os.FileMode) error {
+	return fsatomic.WriteFileDurable(path, data, perm)
+}
+
 func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
 	path, err := m.duidPath(ifaceName)
 	if err != nil {
@@ -737,7 +780,34 @@ func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
 	// DurableState (#1894): the DUID is the client's stable DHCPv6
 	// identity — losing it to a power cut changes the identity the
 	// server knows us by across reboot (new leases, stale bindings).
-	return fsatomic.WriteFileDurable(path, duid.ToBytes(), 0644)
+	return duidWriteFile(path, duid.ToBytes(), 0644)
+}
+
+// actualDUIDType maps a resolved DUID to the configured type token
+// ("duid-ll" / "duid-llt"), or "" for an unrecognized type. It is how getDUID
+// detects a type ROTATION: a cached or persisted DUID whose REAL type differs
+// from the requested duid-ll/duid-llt mode must be regenerated, not silently
+// reused (#5855). loadDUID returns the concrete *DUIDLL / *DUIDLLT via
+// dhcpv6.DUIDFromBytes, and generation builds the same concrete types, so a
+// concrete-type switch is exhaustive for the modes xpf can configure.
+func actualDUIDType(d dhcpv6.DUID) string {
+	switch d.(type) {
+	case *dhcpv6.DUIDLLT:
+		return "duid-llt"
+	case *dhcpv6.DUIDLL:
+		return "duid-ll"
+	default:
+		return ""
+	}
+}
+
+// normalizeDUIDType resolves the empty config token to the duid-ll default,
+// matching fingerprintV6 and getDUID (#5855).
+func normalizeDUIDType(t string) string {
+	if t == "" {
+		return "duid-ll"
+	}
+	return t
 }
 
 // Leases returns a snapshot of all current DHCP leases.

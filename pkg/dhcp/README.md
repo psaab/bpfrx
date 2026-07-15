@@ -188,6 +188,24 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
     `duid-llt` instead of silently handing out an unstable identity. A `duid-ll`
     is a pure function of the hardware address (byte-identical across restart),
     so its persist failure stays benign (logged, non-fatal).
+  - **A DUID-type change AUTOMATICALLY ROTATES the identity (#5855).** Changing
+    `duid-ll` <-> `duid-llt` restarts the DHCPv6 client (the type is part of the
+    reconcile fingerprint), but the client identity is rotated too — no explicit
+    `clear` is required (Option 1, operator-friendly). `getDUID` treats the
+    configured type + resolved DUID as one lifecycle object: it reuses a cached
+    or persisted DUID ONLY when its actual type (`actualDUIDType`) matches the
+    requested mode, and on a mismatch atomically regenerates the requested type
+    and durably persists it BEFORE the restarted client sends it (persist-before-
+    start holds because `Reconcile` stops the old client, waits for it, then
+    `Start` calls `getDUID` synchronously before the first Solicit). `Reconcile`
+    also drops the cached DUID on a type change so the restarted client can never
+    be handed the retired identity. **Persistence-failure fail-safe:** if the new
+    -type DUID cannot be durably persisted, `getDUID` RETAINS the previous
+    persisted identity and returns it (old type) — it exposes NO unpersisted new
+    DUID (a partially-rotated DUID-LLT would be ephemeral and diverge from disk),
+    and the client stays coherent on the old identity until a later reconcile
+    persists the new one. `show`/API (`DUIDs()`) reports the ACTUAL active DUID
+    type, never the configured-but-not-yet-rotated type.
   - **`ClearAllDUIDs` clears persisted DUIDs and surfaces errors (#4909).** It
     unions the in-memory cache with the `dhcpv6-duid-*` files on disk, so a DUID
     a client has not re-fetched since restart (on disk, absent from the cache)
