@@ -1068,13 +1068,17 @@ func (s *Server) buildSessionView() sessionView {
 		}
 		// FIB ifindex+VLAN -> display name, so a session's egress interface
 		// resolves to the configured unit name (mirrors grpcapi).
-		for ifName, ifc := range v.cfg.Interfaces.Interfaces {
+		// RangeInterfaces/RangeUnits skip present-but-nil InterfaceConfig/
+		// InterfaceUnit slots admitted by the tolerant load / HA config-sync
+		// path (#3494/#5068); a raw range nil-derefs and panics the in-process
+		// daemon during a REST session query (#5813).
+		config.RangeInterfaces(v.cfg, func(ifName string, ifc *config.InterfaceConfig) {
 			resolvedParent := config.LinuxIfName(strings.SplitN(v.cfg.ResolveReth(ifName), ".", 2)[0])
 			parentLink, err := net.InterfaceByName(resolvedParent)
 			if err != nil {
-				continue
+				return
 			}
-			for _, unit := range ifc.Units {
+			config.RangeUnits(ifc, func(_ int, unit *config.InterfaceUnit) {
 				displayName := ifName
 				if unit.Number != 0 || unit.VlanID != 0 {
 					displayName = fmt.Sprintf("%s.%d", ifName, unit.Number)
@@ -1087,8 +1091,8 @@ func (s *Server) buildSessionView() sessionView {
 				if _, exists := v.egressIfaces[key]; !exists {
 					v.egressIfaces[key] = displayName
 				}
-			}
-		}
+			})
+		})
 	}
 	return v
 }
